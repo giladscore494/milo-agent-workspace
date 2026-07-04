@@ -206,3 +206,217 @@ def _remove_repeated_commands(commands: list[ProposedCommand], previous_decision
         for command in decision.get("proposed_commands", []):
             seen[(command.get("command"), command.get("task_key"))] += 1
     return [command for command in commands if seen[(command.command.value, command.task_key)] < 2]
+
+
+class SupervisorMode(StrEnum):
+    SHADOW = "shadow"
+    ACTIVE = "active"
+
+
+class ControlledCommandType(StrEnum):
+    SPAWN_AGENT = "spawn_agent"
+    ASSIGN_TASK = "assign_task"
+    SEND_MESSAGE = "send_message"
+    REQUEST_REVISION = "request_revision"
+    SPLIT_TASK = "split_task"
+    RETRY_TASK = "retry_task"
+    CANCEL_TASK = "cancel_task"
+    ASK_USER = "ask_user"
+    UPDATE_RUN_CONSTRAINT = "update_run_constraint"
+    MARK_CLAIM_REVIEWED = "mark_claim_reviewed"
+    REQUEST_FINAL_BUILD = "request_final_build"
+    FINISH_RUN = "finish_run"
+
+
+class CollaborationType(StrEnum):
+    CLARIFICATION = "clarification"
+    CONFLICT = "conflict"
+    CONTEXT_REQUEST = "context_request"
+    PROPOSED_SUBTASK = "proposed_subtask"
+    ARTIFACT = "artifact"
+
+
+class CommandValidationError(ValueError):
+    pass
+
+
+class AgentTemplate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    key: str
+    responsibility: str = Field(min_length=1)
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    tools: list[str] = Field(default_factory=list)
+    internet_allowed: bool = False
+    token_budget: int = Field(gt=0)
+    search_budget: int = Field(default=0, ge=0)
+    timeout_seconds: int = Field(gt=0)
+    max_retries: int = Field(default=1, ge=0)
+    fallback: str | None = None
+    completion_criteria: list[str] = Field(default_factory=list, min_length=1)
+
+
+APPROVED_AGENT_TEMPLATES: dict[str, AgentTemplate] = {
+    "targeted_gap_filler": AgentTemplate(key="targeted_gap_filler", responsibility="Fill explicitly identified missing catalog fields only.", input_schema={"missing_fields": "list"}, output_schema={"filled_fields": "list", "evidence": "list"}, tools=["catalog_read"], internet_allowed=False, token_budget=4000, timeout_seconds=300, completion_criteria=["Every requested field is filled or marked unavailable with evidence."]),
+    "conflict_resolver": AgentTemplate(key="conflict_resolver", responsibility="Review conflicting claims and recommend a deterministic resolution or needs_review.", input_schema={"conflicts": "list"}, output_schema={"resolutions": "list", "needs_review": "list"}, tools=["catalog_read"], internet_allowed=False, token_budget=3000, timeout_seconds=240, completion_criteria=["Every conflict has a resolution or needs_review reason."]),
+    "failure_retry_worker": AgentTemplate(key="failure_retry_worker", responsibility="Retry a failed narrow task using the original task contract.", input_schema={"failed_task": "object"}, output_schema={"status": "string", "artifact": "object"}, tools=["catalog_read"], internet_allowed=False, token_budget=3000, timeout_seconds=240, completion_criteria=["Retry result preserves original task contract."]),
+    "final_build_verifier": AgentTemplate(key="final_build_verifier", responsibility="Verify final-build prerequisites and evidence contract.", input_schema={"artifacts": "object"}, output_schema={"verification_complete": "boolean", "gaps": "list"}, tools=["catalog_read"], internet_allowed=False, token_budget=2000, timeout_seconds=180, completion_criteria=["Verification is complete and all gaps are listed."]),
+}
+
+
+class SupervisorLimits(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    max_dynamic_agents: int = 3
+    max_active_agents: int = 2
+    max_messages: int = 100
+    max_retries: int = 2
+    max_recursion: int = 2
+    max_decisions: int = 20
+    token_budget: int = 12000
+    search_budget: int = 0
+    run_timeout_seconds: int = 1800
+
+
+class DynamicAgentSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    template: str
+    responsibility: str
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    tool_policy: list[str]
+    internet_allowed: bool
+    token_budget: int
+    search_budget: int
+    timeout_seconds: int
+    max_retries: int
+    fallback: str | None
+    completion_criteria: list[str]
+
+
+class CollaborationRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: CollaborationType
+    sender: str
+    recipient: str
+    task_key: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
+class ControlledCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    command: ControlledCommandType
+    target: str | None = None
+    template: str | None = None
+    task_key: str | None = None
+    goal_reference: str = Field(min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    depends_on: list[str] = Field(default_factory=list)
+    requires_internet: bool = False
+    recursion_depth: int = 0
+
+
+class ControlledRunState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: UUID = Field(default_factory=uuid4)
+    mode: SupervisorMode = SupervisorMode.SHADOW
+    goal: str
+    limits: SupervisorLimits = Field(default_factory=SupervisorLimits)
+    dynamic_agents: dict[str, DynamicAgentSpec] = Field(default_factory=dict)
+    active_agents: list[str] = Field(default_factory=list)
+    completed_tasks: list[str] = Field(default_factory=list)
+    required_tasks: list[str] = Field(default_factory=list)
+    failed_tasks: dict[str, int] = Field(default_factory=dict)
+    task_signatures: list[str] = Field(default_factory=list)
+    messages: list[AgentMessage] = Field(default_factory=list)
+    collaborations: list[CollaborationRecord] = Field(default_factory=list)
+    user_instructions: list[dict[str, Any]] = Field(default_factory=list)
+    audit_log: list[dict[str, Any]] = Field(default_factory=list)
+    open_conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    needs_review: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_contract_met: bool = False
+    verification_complete: bool = False
+    decisions_made: int = 0
+    tokens_used: int = 0
+    searches_used: int = 0
+    internet_authorized: bool = False
+
+
+def spawn_dynamic_agent(template_key: str, task_key: str, responsibility: str | None = None) -> DynamicAgentSpec:
+    template = APPROVED_AGENT_TEMPLATES.get(template_key)
+    if template is None:
+        raise CommandValidationError(f"unapproved agent template: {template_key}")
+    return DynamicAgentSpec(id=task_key, template=template.key, responsibility=responsibility or template.responsibility, input_schema=template.input_schema, output_schema=template.output_schema, tool_policy=template.tools, internet_allowed=template.internet_allowed, token_budget=template.token_budget, search_budget=template.search_budget, timeout_seconds=template.timeout_seconds, max_retries=template.max_retries, fallback=template.fallback, completion_criteria=template.completion_criteria)
+
+
+def validate_controlled_command(command: ControlledCommand, state: ControlledRunState) -> None:
+    if command.command not in ControlledCommandType:
+        raise CommandValidationError("command is not allowed")
+    if state.decisions_made >= state.limits.max_decisions:
+        raise CommandValidationError("decision limit exhausted")
+    if len(state.messages) >= state.limits.max_messages:
+        raise CommandValidationError("message limit exhausted")
+    if command.recursion_depth > state.limits.max_recursion:
+        raise CommandValidationError("recursion depth exceeded")
+    if command.requires_internet and not state.internet_authorized:
+        raise CommandValidationError("internet use requires separate authorization")
+    if command.template and command.template not in APPROVED_AGENT_TEMPLATES:
+        raise CommandValidationError("invalid target/template")
+    if command.target and command.target not in state.dynamic_agents and command.target not in {"supervisor", "user", "final_builder"}:
+        raise CommandValidationError("invalid target/template")
+    if command.goal_reference.lower() not in state.goal.lower() and state.goal.lower() not in command.goal_reference.lower():
+        raise CommandValidationError("task is not related to goal")
+    missing_deps = [dep for dep in command.depends_on if dep not in state.completed_tasks]
+    if missing_deps:
+        raise CommandValidationError(f"dependencies are incomplete: {missing_deps}")
+    signature = f"{command.command.value}:{command.template}:{command.task_key}:{command.payload}"
+    if command.command in {ControlledCommandType.SPAWN_AGENT, ControlledCommandType.ASSIGN_TASK, ControlledCommandType.SPLIT_TASK} and signature in state.task_signatures:
+        raise CommandValidationError("duplicate task rejected")
+    if command.command == ControlledCommandType.SPAWN_AGENT:
+        if not command.template or not command.task_key:
+            raise CommandValidationError("spawn_agent requires template and task_key")
+        template = APPROVED_AGENT_TEMPLATES[command.template]
+        if len(state.dynamic_agents) >= state.limits.max_dynamic_agents or len(state.active_agents) >= state.limits.max_active_agents:
+            raise CommandValidationError("concurrency limit blocks spawn")
+        if state.tokens_used + template.token_budget > state.limits.token_budget or state.searches_used + template.search_budget > state.limits.search_budget:
+            raise CommandValidationError("budget exhausted")
+    if command.command == ControlledCommandType.RETRY_TASK and command.task_key:
+        if state.failed_tasks.get(command.task_key, 0) >= state.limits.max_retries:
+            raise CommandValidationError("retry limit exhausted")
+    if command.command == ControlledCommandType.REQUEST_FINAL_BUILD:
+        incomplete = [task for task in state.required_tasks if task not in state.completed_tasks]
+        unresolved = [c for c in state.open_conflicts if c not in state.needs_review]
+        if incomplete or unresolved or not state.evidence_contract_met or not state.verification_complete:
+            raise CommandValidationError("final-build prerequisites are not met")
+
+
+def execute_controlled_command(command: ControlledCommand, state: ControlledRunState) -> ControlledRunState:
+    validate_controlled_command(command, state)
+    data = state.model_dump()
+    data["decisions_made"] += 1
+    data["task_signatures"].append(f"{command.command.value}:{command.template}:{command.task_key}:{command.payload}")
+    data["audit_log"].append({"command": command.model_dump(mode="json"), "validated_at": datetime.now(UTC).isoformat(), "mode": state.mode.value})
+    if state.mode == SupervisorMode.SHADOW:
+        return ControlledRunState.model_validate(data)
+    if command.command == ControlledCommandType.SPAWN_AGENT:
+        spec = spawn_dynamic_agent(command.template or "", command.task_key or "", command.payload.get("responsibility"))
+        data["dynamic_agents"][spec.id] = spec.model_dump()
+        data["active_agents"].append(spec.id)
+        data["tokens_used"] += spec.token_budget
+        data["searches_used"] += spec.search_budget
+    elif command.command == ControlledCommandType.UPDATE_RUN_CONSTRAINT:
+        data["user_instructions"].append({"type": "user_instruction", "payload": command.payload, "created_at": datetime.now(UTC).isoformat()})
+        data["audit_log"].append({"event": "wake_supervisor", "reason": "user_instruction"})
+    elif command.command == ControlledCommandType.SEND_MESSAGE:
+        data["messages"].append(AgentMessage(run_id=state.run_id, type=MessageType.DECISION, sender="supervisor", recipient=command.target or "supervisor", task_key=command.task_key, payload=command.payload).model_dump())
+    elif command.command == ControlledCommandType.RETRY_TASK and command.task_key:
+        data["failed_tasks"][command.task_key] = data["failed_tasks"].get(command.task_key, 0) + 1
+    return ControlledRunState.model_validate(data)
+
+
+def record_collaboration(state: ControlledRunState, record: CollaborationRecord) -> ControlledRunState:
+    data = state.model_dump()
+    data["collaborations"].append(record.model_dump())
+    data["audit_log"].append({"collaboration": record.model_dump(), "visible_to": "supervisor"})
+    return ControlledRunState.model_validate(data)
