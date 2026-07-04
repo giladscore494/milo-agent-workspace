@@ -1,0 +1,96 @@
+# Current MILO baseline
+
+This document records the existing MILO Streamlit implementation preserved from `MILO-main-original/MILO-main/`, based primarily on `app.py` rather than the older README.
+
+## Project inventory
+
+The authoritative source tree contains a single-file Streamlit vehicle-catalog prototype plus tests and dependency metadata:
+
+- `app.py` — Streamlit UI and complete Kimi/Moonshot swarm pipeline.
+- `README.md` — setup notes and an older architecture description.
+- `requirements.txt` — Python runtime/test dependencies.
+- `test_safe_agent_pipeline.py`, `test_safety_guards.py` — offline tests.
+- `test_websearch.py` — live web-search/API test; do not run automatically.
+
+## Runtime defaults and model settings
+
+The application targets the Israeli vehicle market with defaults of manufacturer `Hyundai`, market `Israel`, and period `2010 to June 2026`. Kimi/Moonshot settings include:
+
+- Base URL: `https://api.moonshot.ai/v1`.
+- Model: `kimi-k2.6`.
+- Search/consolidation temperature constants: `0.6`; `moonshot_chat` enforces a minimum effective temperature of `0.6`.
+- Thinking disabled through `extra_body={"thinking":{"type":"disabled"}}`.
+- Built-in `$web_search` tool for search phases.
+- Maximum tool-call rounds: `15`.
+- Maximum parallel Kimi calls: `2`, enforced with a `BoundedSemaphore`.
+- API concurrency retry delay: `2` seconds.
+- API concurrency max retries: `2`.
+- Token budgets: discovery `1800`, discovery fallback `1200`, technical constants `2500`, technical agent calls `2500` for trims/years and `3000` for the other technical agents, verifier `3500`, optional compact final summary `4500`, and Hebrew summary `1200`.
+- Output safeguards: raw debug previews are capped at `2000` characters and model output larger than `120,000` characters is rejected.
+
+## Actual pipeline architecture
+
+`app.py` implements a six-step flow in the UI, with deterministic Python merge/build stages around Kimi calls.
+
+### Phase 1: three focused discovery agents
+
+Discovery is split across exactly three web-search agents:
+
+1. `current_official_lineup_agent` for current official/importer models.
+2. `historical_used_market_agent` for historical used-market/model-list models.
+3. `ev_hybrid_edge_cases_agent` for EV/hybrid edge cases.
+
+Each discovery prompt requires immediate `$web_search` use, compact JSON only, and no planning text. Discovery results are validated for required keys `agent` and `models`, a non-empty `models` list, and the discovery schema. Extra discovery fields are stripped, model counts are capped per agent, and missing or invalid names fail validation.
+
+### Phase 1 merge: Python discovery merge
+
+The discovery outputs are merged in Python by `merge_discovery_candidates`. It normalizes model names, rejects trim/package names such as `N Line`, deduplicates by normalized key, preserves sources, tracks which agents found each candidate, records failed discovery agents, and sorts candidates deterministically by canonical model name.
+
+### Phase 2: normalizer/deduper
+
+A non-search Kimi normalizer named `normalizer_deduper` cleans the merged candidates. It must return JSON containing `agent`, `canonical_models`, `rejected_items`, and `needs_review`, with a non-empty canonical model list. Validation repairs old `model_he` output into `model_name_he`, ensures source lists exist, and warns if more than 45 canonical models are emitted.
+
+### Phase 3: four technical enrichment agents
+
+Technical enrichment is performed by exactly four focused web-search agents:
+
+1. `trims_years_agent`.
+2. `engines_fuel_power_agent`.
+3. `transmission_drivetrain_performance_agent`.
+4. `dimensions_safety_equipment_agent`.
+
+The technical model chunk size is `4`. Agents run sequentially by design to avoid Kimi organization concurrency failures, but each still uses the same Kimi call semaphore and retry behavior. Each agent receives a compact canonical model chunk and must return compact flat JSON with `agent`, `items`, `missing_data`, and `extra_candidate_models`. The validator rejects generic automotive glossary output, missing make/model responses, overly verbose nested technical structures, extra item keys, too many items per model, and overlong notes/source lists. Fallback prompts are available with smaller token limits when retryable safety errors occur.
+
+### Phase 4: source verifier
+
+The verifier is non-search, receives compact structured data only, and chunks canonical models with verifier model chunk size `6`. `source_verifier` must return JSON keys `agent`, `verified_models`, `rejected_data_points`, and `needs_review`. Validation downgrades foreign/global-source issues to `needs_review` and caps issue text lengths. Chunk results are merged in Python, and verifier failure is allowed to degrade the pipeline into partial output instead of discarding all discovered data.
+
+### Phase 5: deterministic Python final builder
+
+The final catalog is not generated by an LLM. `run_final_builder_phase` calls `build_final_json_python`, which deterministically indexes technical and verifier data by normalized model keys, picks best items by confidence, merges sources without duplicates, computes confidence conservatively, sets verification status/notes, records failed agents, and emits `final_builder_method: python_merge_success`. The status becomes `complete`, `partial_success`, or `failed` based on failed agents, verifier status, technical status, and whether models exist.
+
+### Phase 6: Hebrew summary phase
+
+The final JSON is summarized by a non-search Hebrew Summary Agent. The prompt includes compact metadata such as counts, verification status, failed agents, and pipeline quality. Summary failure is surfaced as a warning and does not change the consolidated JSON.
+
+## Kimi/Moonshot web-search tool-call loop
+
+Search-enabled calls use `WEB_SEARCH_TOOL` with the Moonshot built-in `$web_search`. `moonshot_chat` appends assistant tool-call messages and echoes tool arguments back as tool messages until the model stops, hits length, or reaches the 15-round limit. If a search-enabled call stops within two rounds without any tool message, the code appends an explicit reminder requiring `$web_search` and retries the loop.
+
+## Validation and safety behavior
+
+The baseline includes strict JSON validation, output truncation protection, planning-loop and repetition-loop detection, required-key validation, non-empty-list validation, schema-specific validators, and special handling for partial JSON. `finish_reason == "length"` becomes `MODEL_JSON_TRUNCATED` for unfinished JSON or `MODEL_OUTPUT_TRUNCATED` otherwise. Repeated planning/search narration triggers `MODEL_PLANNING_LOOP` or `MODEL_REPETITION_LOOP`. Responses over the maximum reasonable output size are rejected.
+
+## Fallback, retry, and partial-failure behavior
+
+Retryable model errors include planning/repetition loops, invalid JSON, output truncation, and JSON truncation. When a fallback prompt exists, `run_safe_agent` retries with fallback content and optionally smaller fallback token budgets. Kimi concurrency errors are identified from HTTP 429/rate-limit markers, retried twice with a two-second delay, and converted into `API_CONCURRENCY_LIMIT` payloads if still failing. Technical and verifier chunk merging preserve successful or partial chunks while recording failures. The pipeline aborts only for no successful discovery, normalizer failure, or all technical enrichment failing; verifier and summary failures are allowed to produce partial output.
+
+## README inaccuracies and older architecture descriptions
+
+The README describes an older four-phase architecture that does not match `app.py`:
+
+- README says discovery is one serial web-search agent; `app.py` uses three focused discovery agents.
+- README says enrichment is five parallel web-search agents; `app.py` uses four technical agents and runs them sequentially over chunks to avoid concurrency failures.
+- README says consolidation is one non-search Kimi agent; `app.py` uses Python discovery merge, a Kimi normalizer, a non-search verifier, and a deterministic Python final builder for the final catalog.
+- README labels summary as phase 3; `app.py` presents a six-phase UI ending with Hebrew summary.
+- README does not describe technical chunk size `4`, verifier chunk size `6`, validation guards, fallback prompts, partial-failure continuation, deterministic final building, or the maximum parallel Kimi calls of `2`.
