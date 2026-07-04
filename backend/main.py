@@ -3,7 +3,7 @@ from fastapi import Depends, FastAPI
 from backend.dependencies import get_repository
 from backend.errors import install_error_handlers
 from backend.repository import Repository
-from backend.schemas import Conversation, ConversationCreate, HealthResponse, Project, Run, RunCreate, RunCreated, RunEvent
+from backend.schemas import Conversation, ConversationCreate, HealthResponse, Project, Run, RunCancelRequest, RunCancelResponse, RunCreate, RunCreated, RunEvent
 
 app = FastAPI(title="MILO Agent Workspace API")
 install_error_handlers(app)
@@ -50,3 +50,10 @@ def get_run(run_id: UUID, repo: Repository = Depends(get_repository)) -> dict:
 @app.get("/runs/{run_id}/events", response_model=list[RunEvent])
 def get_run_events(run_id: UUID, repo: Repository = Depends(get_repository)) -> list[dict]:
     return repo.list_run_events(run_id)
+
+
+@app.post("/runs/{run_id}/cancel", response_model=RunCancelResponse)
+def cancel_run(run_id: UUID, request: RunCancelRequest, repo: Repository = Depends(get_repository)) -> RunCancelResponse:
+    run = repo.request_cancellation(run_id, request.reason)
+    repo.append_run_event(run_id, "cancellation_requested", {"message": request.reason or "Cancellation requested", "payload": {"reason": request.reason}})
+    return RunCancelResponse(run_id=run["id"], status=run["status"])

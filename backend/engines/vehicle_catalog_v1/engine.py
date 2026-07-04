@@ -5,9 +5,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from backend.runtime import CancellationRequested
 from . import core
 
 EventSink = Callable[[str, dict[str, Any]], None]
+CheckpointSink = Callable[[str, dict[str, Any]], None]
+CancellationChecker = Callable[[], bool]
+ENGINE_VERSION = "vehicle_catalog_v1.stage3"
 
 
 @dataclass
@@ -23,6 +27,8 @@ class VehicleCatalogEngine:
     model_client_factory: Callable[[str, str], Any] | None = None
     sleep_fn: Callable[[float], None] | None = None
     event_sink: EventSink | None = None
+    checkpoint_sink: CheckpointSink | None = None
+    cancellation_checker: CancellationChecker | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     _previous_client_factory: Any = field(default=None, init=False)
@@ -31,6 +37,25 @@ class VehicleCatalogEngine:
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.event_sink:
             self.event_sink(event_type, payload)
+
+    def _check_cancelled(self, results: dict[str, Any], failed_summaries: list[dict[str, Any]], start: float) -> None:
+        if self.cancellation_checker and self.cancellation_checker():
+            self._checkpoint("cancelled", results, failed_summaries)
+            self._emit("run_cancelled", {"message": "Run cancelled cooperatively"})
+            raise CancellationRequested("RUN_CANCELLED")
+
+    def _checkpoint(self, phase: str, results: dict[str, Any], failed_summaries: list[dict[str, Any]]) -> None:
+        if self.checkpoint_sink:
+            self.checkpoint_sink(phase, {
+                "engine_version": ENGINE_VERSION,
+                "workflow_key": "vehicle_catalog_v1",
+                "phase": phase,
+                "completed_tasks": list(results.keys()),
+                "artifacts": results,
+                "failures": failed_summaries,
+                "token_usage": {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens},
+            })
+        self._emit("checkpoint_saved", {"phase": phase, "message": f"Checkpoint saved after {phase}"})
 
     def _add_tokens(self, result: dict[str, Any]) -> None:
         self.input_tokens += int(result.get("input_tokens", 0) or 0)
@@ -57,29 +82,36 @@ class VehicleCatalogEngine:
         self._install_injections()
         try:
             self._emit("phase_started", {"phase": "discovery"})
+            self._check_cancelled(results, failed_summaries, start)
             discovery_results = core.run_discovery_phase(config.api_key, config.manufacturer, config.market, config.period)
             for r in discovery_results:
                 self._add_tokens(r)
             results["discovery_phase"] = discovery_results
             self._emit("phase_completed", {"phase": "discovery", "results": discovery_results})
+            self._checkpoint("discovery", results, failed_summaries)
             successful_discovery = [r for r in discovery_results if r["status"] == "success"]
             if not successful_discovery:
                 reason = discovery_results[0].get("error") if discovery_results else "NO_DISCOVERY_RESULTS"
                 return self._failed(results, reason, "Discovery failed", start)
 
+            self._check_cancelled(results, failed_summaries, start)
             merged = core.merge_discovery_candidates(discovery_results)
             results["python_discovery_merge"] = merged
+            self._checkpoint("discovery_merge", results, failed_summaries)
 
             self._emit("phase_started", {"phase": "normalizer"})
+            self._check_cancelled(results, failed_summaries, start)
             normalizer = core.run_normalizer_phase(config.api_key, merged)
             self._add_tokens(normalizer)
             results["normalizer_deduper"] = normalizer
             self._emit("phase_completed", {"phase": "normalizer", "result": normalizer})
+            self._checkpoint("normalizer", results, failed_summaries)
             if normalizer["status"] != "success":
                 return self._failed(results, normalizer.get("error", "NORMALIZER_FAILED"), "Normalizer failed", start)
             canonical_models = normalizer["parsed"].get("canonical_models", [])
 
             self._emit("phase_started", {"phase": "technical_enrichment"})
+            self._check_cancelled(results, failed_summaries, start)
             technical_results = core.run_technical_enrichment_phase(config.api_key, config.manufacturer, config.market, config.period, canonical_models)
             technical_clean: dict[str, Any] = {}
             for r in technical_results:
@@ -89,11 +121,16 @@ class VehicleCatalogEngine:
                 else:
                     failed_summaries.append({"agent": r["agent"], "error": r.get("error"), "message": r.get("message", "")})
             results["technical_enrichment_phase"] = technical_results
+            for r in technical_results:
+                event = "chunk_completed" if r.get("status") in {"success", "partial"} else "chunk_failed"
+                self._emit(event, {"phase": "technical_enrichment", "agent": r.get("agent"), "message": f"Technical chunk {r.get('agent')} {r.get('status')}", "result": r})
+                self._checkpoint(f"technical_enrichment:{r.get('agent')}", results, failed_summaries)
             self._emit("phase_completed", {"phase": "technical_enrichment", "results": technical_results})
             if not technical_clean:
                 return self._failed(results, "TECHNICAL_ENRICHMENT_FAILED", "all technical enrichment agents failed", start)
 
             self._emit("phase_started", {"phase": "verification"})
+            self._check_cancelled(results, failed_summaries, start)
             verifier = core.run_verification_phase(config.api_key, normalizer["parsed"], technical_clean, failed_summaries)
             self._add_tokens(verifier)
             results["source_verifier"] = verifier
@@ -108,17 +145,26 @@ class VehicleCatalogEngine:
             else:
                 failed_summaries.append({"agent": "source_verifier", "error": verifier.get("error"), "message": verifier.get("message", "")})
                 verifier_data = {"agent": "source_verifier", "status": "failed", "verified_models": [], "rejected_data_points": [], "needs_review": [{"model": "*", "reason": verifier.get("error")}]} 
+            self._emit("chunk_completed" if verifier.get("status") in {"success", "partial"} else "chunk_failed", {"phase": "verification", "agent": "source_verifier", "message": "Verifier chunk finished", "result": verifier})
             self._emit("phase_completed", {"phase": "verification", "result": verifier})
+            self._checkpoint("verification", results, failed_summaries)
 
+            self._emit("phase_started", {"phase": "final_builder"})
+            self._check_cancelled(results, failed_summaries, start)
             final = core.run_final_builder_phase(config.api_key, normalizer["parsed"], technical_clean, verifier_data, failed_summaries, config.manufacturer, config.market, config.period)
             self._add_tokens(final)
             results["final_builder"] = final
+            self._emit("phase_completed", {"phase": "final_builder", "result": final})
+            self._checkpoint("final_builder", results, failed_summaries)
             if final["status"] != "success":
                 return self._failed(results, final.get("error", "FINAL_BUILDER_FAILED"), "Final builder failed", start)
 
+            self._check_cancelled(results, failed_summaries, start)
             summary = core.run_hebrew_summary_phase(config.api_key, final["parsed"])
             self._add_tokens(summary)
             results["hebrew_summary"] = summary
+            self._emit("phase_completed", {"phase": "summary", "result": summary})
+            self._checkpoint("summary", results, failed_summaries)
             status = final["parsed"].get("status", "success")
             return {"status": status, "result": final["parsed"], "summary": summary.get("parsed", {}).get("summary") if summary.get("status") == "success" else None, "results": results, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens, "elapsed_seconds": time.perf_counter() - start}
         finally:

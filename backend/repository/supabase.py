@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from uuid import UUID
 from supabase import create_client
@@ -15,6 +16,12 @@ class Repository(Protocol):
     def get_run(self, run_id: UUID) -> dict[str, Any]: ...
     def list_run_events(self, run_id: UUID) -> list[dict[str, Any]]: ...
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+    def save_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]: ...
+    def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None: ...
+    def transition_run(self, run_id: UUID, status: str, **fields: Any) -> dict[str, Any]: ...
+    def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
+    def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
+    def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]: ...
     def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]: ...
     def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -68,12 +75,57 @@ class SupabaseRepository:
         return self._many(self.client.table("run_events").select("*").eq("run_id", str(run_id)).order("created_at"))
 
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._single(self.client.table("run_events").insert({"run_id": str(run_id), "event_type": event_type, "payload": payload}).select("*"), "run_event", "new")
+        row = {
+            "run_id": str(run_id),
+            "event_type": event_type,
+            "payload": payload.get("payload", payload),
+            "message": payload.get("message"),
+            "agent": payload.get("agent"),
+            "phase": payload.get("phase"),
+            "progress": payload.get("progress"),
+        }
+        return self._single(self.client.table("run_events").insert(row).select("*"), "run_event", "new")
+
+    def save_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        return self._single(self.client.table("run_checkpoints").insert(checkpoint).select("*"), "run_checkpoint", "new")
+
+    def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None:
+        query = self.client.table("run_checkpoints").select("*").eq("run_id", str(run_id)).order("created_at", desc=True).limit(1)
+        if workflow_key:
+            query = query.eq("workflow_key", workflow_key)
+        rows = self._many(query)
+        return rows[0] if rows else None
+
+    def transition_run(self, run_id: UUID, status: str, **fields: Any) -> dict[str, Any]:
+        payload = {"status": status, **fields}
+        return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
+
+    def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
+        run = self.get_run(run_id)
+        now = datetime.now(UTC)
+        lease_expired = not run.get("lease_expires_at") or datetime.fromisoformat(str(run["lease_expires_at"]).replace("Z", "+00:00")) < now
+        if run["status"] not in {"queued", "waiting", "cancellation_requested"} and not lease_expired:
+            raise AppError("RUN_ALREADY_CLAIMED", "run is already claimed by another worker", 409)
+        attempt = int(run.get("attempt") or 1) + (1 if lease_expired and run.get("worker_id") else 0)
+        expires = (now + timedelta(seconds=lease_seconds)).isoformat()
+        return self.transition_run(run_id, "starting", worker_id=worker_id, lease_expires_at=expires, attempt=attempt, started_at=run.get("started_at") or now.isoformat())
+
+    def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
+        run = self.get_run(run_id)
+        if run.get("worker_id") != worker_id:
+            raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409)
+        now = datetime.now(UTC)
+        expires = (now + timedelta(seconds=lease_seconds)).isoformat()
+        self.client.table("worker_heartbeats").insert({"run_id": str(run_id), "worker_id": worker_id, "attempt": run.get("attempt", 1), "heartbeat_at": now.isoformat(), "lease_expires_at": expires}).execute()
+        return self.transition_run(run_id, run["status"], last_heartbeat_at=now.isoformat(), lease_expires_at=expires)
+
+    def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]:
+        return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=datetime.now(UTC).isoformat(), cancellation_reason=reason)
 
     def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]:
-        payload = {"status": "failed", "error": {"code": code, "message": message}}
+        payload = {"status": "failed", "error": {"code": code, "message": message}, "finished_at": datetime.now(UTC).isoformat()}
         return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
 
     def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]:
-        payload = {"status": "completed", "output": output, "error": None}
+        payload = {"status": "completed", "output": output, "error": None, "finished_at": datetime.now(UTC).isoformat()}
         return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
