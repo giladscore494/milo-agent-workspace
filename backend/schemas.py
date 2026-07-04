@@ -93,3 +93,46 @@ class RunCheckpoint(BaseModel):
     last_event: dict[str, Any] | None = None
     attempt: int = 1
     created_at: datetime | None = None
+
+
+class ProposalCreate(BaseModel):
+    user_request: str = Field(min_length=1)
+    budget_preference: str | None = None
+    force_missing_verifier: bool = False
+    force_bad_internet: bool = False
+
+
+class ProposalRevise(BaseModel):
+    user_request: str = Field(min_length=1)
+    budget_preference: str | None = None
+
+
+class ProposalDecision(BaseModel):
+    reason: str | None = None
+
+
+class WorkflowProposal(BaseModel):
+    id: UUID
+    status: str
+    user_request: str
+    task_spec: dict[str, Any]
+    draft: dict[str, Any]
+    critiques: list[dict[str, Any]] = Field(default_factory=list)
+    estimates: dict[str, Any]
+    repair_count: int = 0
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    approved_at: datetime | None = None
+    rejected_at: datetime | None = None
+
+
+class ProposalProjectCreate(BaseModel):
+    slug: str
+    name: str
+    description: str | None = None
+
+
+class ProposalRunCreate(BaseModel):
+    conversation_id: UUID
+    content: str = Field(min_length=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)

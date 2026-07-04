@@ -24,6 +24,10 @@ class Repository(Protocol):
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]: ...
     def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]: ...
     def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]: ...
+    def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any]) -> dict[str, Any]: ...
+    def get_workflow_proposal(self, proposal_id: UUID) -> dict[str, Any]: ...
+    def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]: ...
+    def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class SupabaseRepository:
@@ -129,3 +133,18 @@ class SupabaseRepository:
     def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]:
         payload = {"status": "completed", "output": output, "error": None, "finished_at": datetime.now(UTC).isoformat()}
         return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
+
+    def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any]) -> dict[str, Any]:
+        payload = {"user_request": user_request, **proposal}
+        return self._single(self.client.table("workflow_proposals").insert(payload).select("*"), "workflow_proposal", "new")
+
+    def get_workflow_proposal(self, proposal_id: UUID) -> dict[str, Any]:
+        return self._single(self.client.table("workflow_proposals").select("*").eq("id", str(proposal_id)).limit(1), "workflow_proposal", str(proposal_id))
+
+    def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]:
+        fields = {**fields, "updated_at": datetime.now(UTC).isoformat()}
+        return self._single(self.client.table("workflow_proposals").update(fields).eq("id", str(proposal_id)).select("*"), "workflow_proposal", str(proposal_id))
+
+    def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any]) -> dict[str, Any]:
+        payload = {"slug": slug, "name": name, "description": description, "workflow_key": "chat_architect_v1", "configuration": {**configuration, "proposal_id": str(proposal_id)}}
+        return self._single(self.client.table("projects").insert(payload).select("*"), "project", "new")
