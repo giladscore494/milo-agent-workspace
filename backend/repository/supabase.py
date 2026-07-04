@@ -16,6 +16,7 @@ class Repository(Protocol):
     def list_run_events(self, run_id: UUID) -> list[dict[str, Any]]: ...
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
     def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]: ...
+    def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class SupabaseRepository:
@@ -71,4 +72,8 @@ class SupabaseRepository:
 
     def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]:
         payload = {"status": "failed", "error": {"code": code, "message": message}}
+        return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
+
+    def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]:
+        payload = {"status": "completed", "output": output, "error": None}
         return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
