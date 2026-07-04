@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import app
-from app import AgentConfig
 
 
 AGENT_KEYS = [
@@ -166,8 +165,10 @@ def test_global_kimi_semaphore_limits_parallel_calls(monkeypatch):
 
     monkeypatch.setattr(app, "OpenAI", FakeClient)
     threads = [threading.Thread(target=app.moonshot_chat, args=("key", [{"role": "user", "content": "hi"}]), kwargs={"temperature": 0.6, "use_web_search": False, "max_tokens": 10}) for _ in range(5)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     assert max_active <= app.MAX_PARALLEL_KIMI_CALLS == 2
 
 
