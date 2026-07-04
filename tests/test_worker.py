@@ -36,7 +36,9 @@ def test_worker_marks_complete_for_valid_partial_result():
     code = execute_run(repo.run_id, repo, FakeEngine())
     assert code == 0
     assert repo.completed[1]["status"] == "partial_success"
-    assert repo.events[0][1] == "ENGINE_COMPLETED"
+    event_types = [event[1] for event in repo.events]
+    assert event_types[0] == "run_started"
+    assert event_types[-1] == "run_partial_success"
 
 
 def test_worker_marks_failed_for_invalid_engine_result():

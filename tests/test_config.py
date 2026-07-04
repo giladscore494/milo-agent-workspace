@@ -9,6 +9,9 @@ def test_config_validation_accepts_required_env_names():
     assert settings.supabase_service_role_key == "secret"
 
 
-def test_config_validation_rejects_missing_required_values():
+def test_config_validation_rejects_missing_required_values(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
     with pytest.raises(ValidationError):
         Settings()
