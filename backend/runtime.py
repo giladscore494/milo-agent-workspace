@@ -27,6 +27,8 @@ EVENT_TYPES = {
     "chunk_started", "chunk_completed", "chunk_failed", "fallback_started", "fallback_completed",
     "checkpoint_saved", "cancellation_requested", "run_completed", "run_partial_success",
     "run_failed", "run_cancelled",
+    "tool_access_requested", "tool_access_granted", "tool_access_denied", "tool_used",
+    "source_recorded", "claim_recorded", "conflict_detected",
 }
 
 class InvalidTransition(ValueError):

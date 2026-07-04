@@ -28,6 +28,12 @@ class Repository(Protocol):
     def get_workflow_proposal(self, proposal_id: UUID) -> dict[str, Any]: ...
     def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]: ...
     def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any]) -> dict[str, Any]: ...
+    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]: ...
+    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]: ...
+    def create_tool_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]: ...
+    def create_source(self, run_id: UUID, source: dict[str, Any]) -> dict[str, Any]: ...
+    def create_claim(self, run_id: UUID, claim: dict[str, Any]) -> dict[str, Any]: ...
+    def create_conflict(self, run_id: UUID, conflict: dict[str, Any]) -> dict[str, Any]: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any]) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any]) -> dict[str, Any]: ...
@@ -182,3 +188,31 @@ class SupabaseRepository:
 
     def list_supervisor_decisions(self, run_id: UUID) -> list[dict[str, Any]]:
         return self._many(self.client.table("supervisor_decisions").select("*").eq("run_id", str(run_id)).order("created_at"))
+
+    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]:
+        payload = {"run_id": str(run_id), **request}
+        return self._single(self.client.table("tool_access_requests").insert(payload).select("*"), "tool_access_request", "new")
+
+    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]:
+        payload = {"run_id": str(run_id), **grant}
+        if payload.get("request_id"):
+            self.client.table("tool_access_requests").update({"status": "granted"}).eq("id", str(payload["request_id"])).execute()
+        return self._single(self.client.table("tool_grants").insert(payload).select("*"), "tool_grant", "new")
+
+    def create_tool_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]:
+        payload = {"run_id": str(run_id), **usage}
+        return self._single(self.client.table("tool_usage").insert(payload).select("*"), "tool_usage", "new")
+
+    def create_source(self, run_id: UUID, source: dict[str, Any]) -> dict[str, Any]:
+        payload = {"run_id": str(run_id), **source}
+        return self._single(self.client.table("sources").insert(payload).select("*"), "source", "new")
+
+    def create_claim(self, run_id: UUID, claim: dict[str, Any]) -> dict[str, Any]:
+        payload = {"run_id": str(run_id), **claim}
+        row = self._single(self.client.table("claims").insert(payload).select("*"), "claim", "new")
+        self.client.table("source_claim_links").insert({"source_id": str(row["source_id"]), "claim_id": str(row["id"])}).execute()
+        return row
+
+    def create_conflict(self, run_id: UUID, conflict: dict[str, Any]) -> dict[str, Any]:
+        payload = {"run_id": str(run_id), **conflict}
+        return self._single(self.client.table("conflicts").insert(payload).select("*"), "conflict", "new")

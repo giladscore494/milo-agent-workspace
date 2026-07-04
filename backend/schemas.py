@@ -136,3 +136,64 @@ class ProposalRunCreate(BaseModel):
     conversation_id: UUID
     content: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolAccessRequestCreate(BaseModel):
+    agent: str
+    tool: str
+    reason: str
+    scope: dict[str, Any] = Field(default_factory=dict)
+    requested_limits: dict[str, Any] = Field(default_factory=dict)
+    trigger: dict[str, Any] | None = None
+
+class ToolGrantCreate(BaseModel):
+    request_id: UUID | None = None
+    agent: str
+    tool: str
+    max_searches: int
+    max_rounds: int
+    domains: list[str] | None = None
+    expires_at: datetime
+    approver_policy: str
+
+class ToolUsageCreate(BaseModel):
+    grant_id: UUID
+    agent: str
+    tool: str
+    operation: str
+    query: str | None = None
+    url: str | None = None
+    status: str = "succeeded"
+    error: dict[str, Any] | None = None
+
+class SourceCreate(BaseModel):
+    agent: str
+    url: str
+    title: str
+    domain: str
+    source_type: str
+    source_strength: str
+    source_date: str | None = None
+    query: str
+    tool_operation: str
+
+class ClaimCreate(BaseModel):
+    entity_key: str
+    field_key: str
+    value: Any
+    unit: str | None = None
+    time_scope: dict[str, Any] = Field(default_factory=dict)
+    geography: str | None = None
+    market: str | None = None
+    source_id: UUID
+    source_strength: str
+    confidence: float
+    agent: str
+    status: str = "active"
+
+class ConflictCreate(BaseModel):
+    entity_key: str
+    field_key: str
+    claim_ids: list[UUID]
+    outcome: str = "unresolved_needs_review"
+    rationale: str | None = None
