@@ -1,0 +1,135 @@
+name: Deploy Supabase Migrations
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "supabase/migrations/**"
+      - "scripts/check_migrations.py"
+      - ".github/workflows/deploy-supabase-migrations.yml"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Migration execution mode"
+        required: true
+        default: "dry-run"
+        type: choice
+        options:
+          - dry-run
+          - apply
+      confirmation:
+        description: "For apply mode type: APPLY_PRODUCTION_MIGRATIONS"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-production-migrations
+  cancel-in-progress: false
+
+jobs:
+  deploy-supabase-migrations:
+    name: Deploy Supabase Migrations
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+      SUPABASE_MIGRATIONS_AUTO_APPLY: ${{ vars.SUPABASE_MIGRATIONS_AUTO_APPLY }}
+      SAFE_FAILURE_MESSAGE: >-
+        The production schema may already contain objects that are not recorded in Supabase migration history.
+        No migrations were applied. Compare the remote schema and migration history with migrations 001–006
+        before deciding whether a one-time migration history reconciliation is required.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate repository migrations
+        run: python scripts/check_migrations.py
+
+      - name: Validate manual apply confirmation
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'apply' && inputs.confirmation != 'APPLY_PRODUCTION_MIGRATIONS' }}
+        run: |
+          echo "Manual apply requires confirmation exactly: APPLY_PRODUCTION_MIGRATIONS"
+          echo "No production migrations were applied."
+          exit 1
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.31.8
+
+      - name: Verify required Supabase secrets are configured
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in SUPABASE_ACCESS_TOKEN SUPABASE_DB_PASSWORD SUPABASE_PROJECT_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "Required secret ${name} is not configured or is empty."
+              missing=1
+            else
+              echo "Required secret ${name} is configured."
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Link production Supabase project
+        shell: bash
+        run: |
+          set -euo pipefail
+          supabase link --project-ref "$SUPABASE_PROJECT_ID"
+
+      - name: Display remote migration history
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! supabase migration list; then
+            echo "$SAFE_FAILURE_MESSAGE"
+            exit 1
+          fi
+
+      - name: Run mandatory production dry-run preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! supabase db push --linked --dry-run; then
+            echo "$SAFE_FAILURE_MESSAGE"
+            exit 1
+          fi
+
+      - name: Report push dry-run-only bootstrap state
+        if: ${{ github.event_name == 'push' && vars.SUPABASE_MIGRATIONS_AUTO_APPLY != 'true' }}
+        run: echo "Preflight completed. Automatic production migration apply is disabled."
+
+      - name: Report manual dry-run completion
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run' }}
+        run: echo "Manual dry-run completed. No production migrations were applied."
+
+      - name: Apply production migrations
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'apply' && inputs.confirmation == 'APPLY_PRODUCTION_MIGRATIONS') || (github.event_name == 'push' && vars.SUPABASE_MIGRATIONS_AUTO_APPLY == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          supabase db push --linked
+
+      - name: Display remote migration history after apply
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'apply' && inputs.confirmation == 'APPLY_PRODUCTION_MIGRATIONS') || (github.event_name == 'push' && vars.SUPABASE_MIGRATIONS_AUTO_APPLY == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! supabase migration list; then
+            echo "$SAFE_FAILURE_MESSAGE"
+            exit 1
+          fi
