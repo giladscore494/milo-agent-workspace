@@ -41,6 +41,12 @@ class Run(BaseModel):
     id: UUID
     conversation_id: UUID
     status: str
+    attempt: int = 1
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    cancellation_requested_at: datetime | None = None
+    cancellation_reason: str | None = None
     input: dict[str, Any] | None = None
     output: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
@@ -52,10 +58,38 @@ class RunEvent(BaseModel):
     id: UUID
     run_id: UUID
     event_type: str
+    message: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    agent: str | None = None
+    phase: str | None = None
+    progress: dict[str, Any] | None = None
     created_at: datetime | None = None
 
 
 class RunCreated(BaseModel):
     run_id: UUID
     status: str
+
+
+class RunCancelRequest(BaseModel):
+    reason: str | None = None
+
+
+class RunCancelResponse(BaseModel):
+    run_id: UUID
+    status: str
+
+
+class RunCheckpoint(BaseModel):
+    id: UUID
+    run_id: UUID
+    engine_version: str
+    workflow_key: str
+    phase: str
+    completed_tasks: list[str] = Field(default_factory=list)
+    artifacts: dict[str, Any] = Field(default_factory=dict)
+    failures: list[dict[str, Any]] = Field(default_factory=list)
+    token_usage: dict[str, int] = Field(default_factory=dict)
+    last_event: dict[str, Any] | None = None
+    attempt: int = 1
+    created_at: datetime | None = None
