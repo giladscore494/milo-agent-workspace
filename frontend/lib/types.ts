@@ -1,0 +1,11 @@
+export type UUID = string;
+export type InternetPolicy = 'forbidden'|'allowed'|'required'|'conditional'|'requested'|'approved'|'denied'|'active';
+export type Project = { id: UUID; slug: string; name: string; description?: string; workflow_key: string };
+export type Conversation = { id: UUID; project_id: UUID; title?: string };
+export type Run = { id: UUID; conversation_id: UUID; status: string; started_at?: string; finished_at?: string; output?: Record<string, unknown>; error?: Record<string, unknown> };
+export type RunEvent = { id: UUID; run_id: UUID; event_type: string; message?: string; payload?: any; agent?: string; phase?: string; progress?: Record<string, any>; created_at?: string };
+export type AgentState = { name: string; responsibility: string; status: string; progress: number; currentTask?: string; internet: InternetPolicy; internetReason?: string; domains?: string[]; quota?: string; searchesUsed: number; sources: SourceRecord[]; startedAt?: string; finishedAt?: string; tokens: number; cost: number; retries: number; fallbacks: string[] };
+export type SourceRecord = { id: string; title: string; domain: string; url?: string; source_type: string; source_strength: string; source_date?: string; retrieved_at?: string; claims?: string[]; agent?: string; query?: string; tool_operation?: string };
+export type ConflictRecord = { id: string; entity_key: string; field_key: string; outcome: string; rationale?: string };
+export type WorkspaceState = { run?: Run; events: RunEvent[]; lastEventId?: string; agents: Record<string, AgentState>; sources: SourceRecord[]; claims: any[]; conflicts: ConflictRecord[]; currentPhase: string; progress: number; tokens: number; cost: number; supervisor: string[]; validationErrors: any[]; checkpoints: any[]; rawErrors: any[] };
+export type Proposal = { id: UUID; status: string; user_request: string; draft: any; task_spec: any; estimates: any; critiques: any[] };

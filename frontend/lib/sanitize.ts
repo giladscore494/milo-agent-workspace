@@ -1,0 +1,3 @@
+export function safeText(value: unknown): string { return String(value ?? '').replace(/[<>]/g, c => ({'<':'‹','>':'›'}[c]!)); }
+export function safeUrl(value?: string): string | undefined { if (!value) return undefined; try { const url = new URL(value); return ['http:', 'https:'].includes(url.protocol) ? url.toString() : undefined; } catch { return undefined; } }
+export function redactSecrets(value: unknown): unknown { const text = JSON.stringify(value, null, 2); return JSON.parse(text.replace(/(service[_-]?role|kimi|moonshot|api[_-]?key|authorization|secret)("?\s*[:=]\s*"?)[^",\n}]+/gi, '$1$2[REDACTED]').replace(/sk-[A-Za-z0-9_-]{8,}/g, '[REDACTED]')); }
