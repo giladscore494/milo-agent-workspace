@@ -35,13 +35,19 @@ jobs:
         run: docker build -f Dockerfile.worker -t milo-agent-worker:ci .
       - name: Install frontend dependencies
         working-directory: frontend
-        run: npm install --no-audit --no-fund
+        run: npm ci
+      - name: Frontend production build
+        working-directory: frontend
+        run: npm run build
       - name: Frontend type check
         working-directory: frontend
         run: npx tsc --noEmit
       - name: Frontend tests
         working-directory: frontend
         run: npm test -- --run
+      - name: Frontend static UI check
+        working-directory: frontend
+        run: npm run test:static
       - name: Frontend secret bundle check
         working-directory: frontend
         run: npm run test:secrets
