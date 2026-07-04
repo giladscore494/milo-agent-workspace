@@ -1,0 +1,84 @@
+from uuid import UUID, uuid4
+import pytest
+from fastapi.testclient import TestClient
+from backend.dependencies import get_repository
+from backend.errors import AppError, NotFoundError
+from backend.main import app
+
+
+class FakeRepo:
+    def __init__(self, fail=False):
+        self.project_id = uuid4()
+        self.conversation_id = uuid4()
+        self.message_id = uuid4()
+        self.run_id = uuid4()
+        self.fail = fail
+
+    def _fail(self):
+        if self.fail:
+            raise AppError("REPOSITORY_ERROR", "mock failure", 502)
+
+    def list_projects(self):
+        self._fail(); return [self.project()]
+    def project(self):
+        return {"id": self.project_id, "slug": "milo-vehicle-catalog", "name": "MILO Vehicle Catalog", "workflow_key": "vehicle_catalog_v1", "configuration": {}}
+    def get_project(self, project_id):
+        self._fail()
+        if UUID(str(project_id)) != self.project_id: raise NotFoundError("project", str(project_id))
+        return self.project()
+    def create_conversation(self, project_id, title):
+        self.get_project(project_id); return {"id": self.conversation_id, "project_id": self.project_id, "title": title}
+    def get_conversation(self, conversation_id):
+        self._fail()
+        if UUID(str(conversation_id)) != self.conversation_id: raise NotFoundError("conversation", str(conversation_id))
+        return {"id": self.conversation_id, "project_id": self.project_id, "title": "t"}
+    def create_user_message(self, conversation_id, content, metadata):
+        self.get_conversation(conversation_id); return {"id": self.message_id, "conversation_id": conversation_id, "role": "user", "content": content, "metadata": metadata}
+    def create_queued_run(self, conversation_id, user_message_id, content, metadata):
+        return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}}
+    def get_run(self, run_id):
+        self._fail(); return {"id": run_id, "conversation_id": self.conversation_id, "status": "queued"}
+    def list_run_events(self, run_id):
+        self._fail(); return []
+
+
+@pytest.fixture
+def repo():
+    fake = FakeRepo()
+    app.dependency_overrides[get_repository] = lambda: fake
+    yield fake
+    app.dependency_overrides.clear()
+
+
+def test_health():
+    assert TestClient(app).get("/health").json() == {"status": "ok"}
+
+
+def test_project_retrieval(repo):
+    client = TestClient(app)
+    response = client.get(f"/projects/{repo.project_id}")
+    assert response.status_code == 200
+    assert response.json()["slug"] == "milo-vehicle-catalog"
+
+
+def test_conversation_creation(repo):
+    response = TestClient(app).post(f"/projects/{repo.project_id}/conversations", json={"title": "New"})
+    assert response.status_code == 201
+    assert response.json()["project_id"] == str(repo.project_id)
+
+
+def test_queued_run_creation_returns_immediately(repo):
+    response = TestClient(app).post(f"/conversations/{repo.conversation_id}/runs", json={"content": "Build catalog"})
+    assert response.status_code == 202
+    assert response.json() == {"run_id": str(repo.run_id), "status": "queued"}
+
+
+def test_repository_failures_are_structured():
+    fake = FakeRepo(fail=True)
+    app.dependency_overrides[get_repository] = lambda: fake
+    try:
+        response = TestClient(app).get("/projects")
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "REPOSITORY_ERROR"
+    finally:
+        app.dependency_overrides.clear()
