@@ -8,6 +8,16 @@ class Settings(BaseSettings):
     supabase_service_role_key: str = Field(alias="SUPABASE_SERVICE_ROLE_KEY", min_length=1)
     api_title: str = "MILO Agent Workspace API"
     environment: str = Field(default="local", alias="ENVIRONMENT")
+    allowed_cors_origins: str = Field(default="http://localhost:3000", alias="ALLOWED_CORS_ORIGINS")
+    job_launcher: str = Field(default="disabled", alias="JOB_LAUNCHER")
+    gcp_project_id: str = Field(default="big-cabinet-457321-t7", alias="GCP_PROJECT_ID")
+    gcp_region: str = Field(default="us-central1", alias="GCP_REGION")
+    cloud_run_worker_job: str = Field(default="milo-agent-worker", alias="CLOUD_RUN_WORKER_JOB")
+    rate_limit_per_minute: int = Field(default=60, alias="RATE_LIMIT_PER_MINUTE")
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [origin.strip() for origin in self.allowed_cors_origins.split(",") if origin.strip()]
 
     model_config = SettingsConfigDict(env_file=None, extra="ignore", populate_by_name=True)
 

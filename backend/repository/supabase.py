@@ -34,6 +34,7 @@ class Repository(Protocol):
     def create_source(self, run_id: UUID, source: dict[str, Any]) -> dict[str, Any]: ...
     def create_claim(self, run_id: UUID, claim: dict[str, Any]) -> dict[str, Any]: ...
     def create_conflict(self, run_id: UUID, conflict: dict[str, Any]) -> dict[str, Any]: ...
+    def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any]) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any]) -> dict[str, Any]: ...
@@ -80,7 +81,11 @@ class SupabaseRepository:
         return self._single(self.client.table("messages").insert(payload).select("*"), "message", "new")
 
     def create_queued_run(self, conversation_id: UUID, user_message_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]:
-        payload = {"conversation_id": str(conversation_id), "status": "queued", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}}
+        idempotency_key = metadata.get("idempotency_key") or metadata.get("proposal_id") or str(user_message_id)
+        payload = {"conversation_id": str(conversation_id), "status": "queued", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}, "idempotency_key": idempotency_key}
+        existing = self._many(self.client.table("runs").select("*").eq("conversation_id", str(conversation_id)).eq("idempotency_key", idempotency_key).in_("status", ["queued", "starting", "running", "waiting", "cancellation_requested"]).limit(1))
+        if existing:
+            return existing[0]
         return self._single(self.client.table("runs").insert(payload).select("*"), "run", "new")
 
     def get_run(self, run_id: UUID) -> dict[str, Any]:
@@ -216,3 +221,7 @@ class SupabaseRepository:
     def create_conflict(self, run_id: UUID, conflict: dict[str, Any]) -> dict[str, Any]:
         payload = {"run_id": str(run_id), **conflict}
         return self._single(self.client.table("conflicts").insert(payload).select("*"), "conflict", "new")
+
+    def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]:
+        payload = {"run_id": str(run_id), "launcher": invocation.get("mode"), "execution_name": invocation.get("execution"), "payload": invocation}
+        return self._single(self.client.table("run_invocations").insert(payload).select("*"), "run_invocation", "new")
