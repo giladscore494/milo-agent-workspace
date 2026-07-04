@@ -25,6 +25,7 @@ from backend.schemas import (
     RunCreated,
     RunEvent,
     WorkflowProposal,
+    ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
 )
 from backend.workflow_proposals import compile_proposal, ensure_approved
 
@@ -130,3 +131,41 @@ def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, r
     message = repo.create_user_message(request.conversation_id, request.content, metadata)
     run = repo.create_queued_run(request.conversation_id, UUID(str(message["id"])), request.content, metadata)
     return RunCreated(run_id=run["id"], status=run["status"])
+
+
+@app.post("/runs/{run_id}/tool-access-requests", status_code=201)
+def create_tool_access_request(run_id: UUID, request: ToolAccessRequestCreate, repo: Repository = Depends(get_repository)) -> dict:
+    row = repo.create_tool_access_request(run_id, request.model_dump())
+    repo.append_run_event(run_id, "tool_access_requested", {"message": f"{request.agent} requested {request.tool}", "agent": request.agent, "payload": row})
+    return row
+
+@app.post("/runs/{run_id}/tool-grants", status_code=201)
+def create_tool_grant(run_id: UUID, request: ToolGrantCreate, repo: Repository = Depends(get_repository)) -> dict:
+    payload = request.model_dump()
+    row = repo.create_tool_grant(run_id, payload)
+    repo.append_run_event(run_id, "tool_access_granted", {"message": f"{request.tool} granted to {request.agent}", "agent": request.agent, "payload": row})
+    return row
+
+@app.post("/runs/{run_id}/tool-usage", status_code=201)
+def create_tool_usage(run_id: UUID, request: ToolUsageCreate, repo: Repository = Depends(get_repository)) -> dict:
+    row = repo.create_tool_usage(run_id, request.model_dump())
+    repo.append_run_event(run_id, "tool_used", {"message": f"{request.agent} used {request.tool}", "agent": request.agent, "payload": row})
+    return row
+
+@app.post("/runs/{run_id}/sources", status_code=201)
+def create_source(run_id: UUID, request: SourceCreate, repo: Repository = Depends(get_repository)) -> dict:
+    row = repo.create_source(run_id, request.model_dump())
+    repo.append_run_event(run_id, "source_recorded", {"message": request.title, "agent": request.agent, "payload": row})
+    return row
+
+@app.post("/runs/{run_id}/claims", status_code=201)
+def create_claim(run_id: UUID, request: ClaimCreate, repo: Repository = Depends(get_repository)) -> dict:
+    row = repo.create_claim(run_id, request.model_dump())
+    repo.append_run_event(run_id, "claim_recorded", {"message": f"{request.entity_key}.{request.field_key}", "agent": request.agent, "payload": row})
+    return row
+
+@app.post("/runs/{run_id}/conflicts", status_code=201)
+def create_conflict(run_id: UUID, request: ConflictCreate, repo: Repository = Depends(get_repository)) -> dict:
+    row = repo.create_conflict(run_id, request.model_dump())
+    repo.append_run_event(run_id, "conflict_detected", {"message": f"{request.entity_key}.{request.field_key}", "payload": row})
+    return row
