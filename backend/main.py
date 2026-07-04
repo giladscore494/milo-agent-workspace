@@ -3,9 +3,13 @@
 from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from backend.dependencies import get_repository
+from backend.config import get_settings
+from backend.dependencies import get_job_launcher, get_repository
+from backend.job_launcher import JobLauncher
 from backend.errors import AppError, install_error_handlers
 from backend.repository import Repository
 from backend.schemas import (
@@ -29,7 +33,19 @@ from backend.schemas import (
 )
 from backend.workflow_proposals import compile_proposal, ensure_approved
 
-app = FastAPI(title="MILO Agent Workspace API")
+settings = get_settings()
+app = FastAPI(title=settings.api_title)
+app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=True, allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Authorization", "Content-Type"])
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Cache-Control", "no-store")
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 install_error_handlers(app)
 
 
@@ -59,10 +75,15 @@ def get_conversation(conversation_id: UUID, repo: Repository = Depends(get_repos
 
 
 @app.post("/conversations/{conversation_id}/runs", response_model=RunCreated, status_code=202)
-def create_run(conversation_id: UUID, request: RunCreate, repo: Repository = Depends(get_repository)) -> RunCreated:
+def create_run(conversation_id: UUID, request: RunCreate, repo: Repository = Depends(get_repository), launcher: JobLauncher = Depends(get_job_launcher)) -> RunCreated:
     repo.get_conversation(conversation_id)
     message = repo.create_user_message(conversation_id, request.content, request.metadata)
     run = repo.create_queued_run(conversation_id, UUID(str(message["id"])), request.content, request.metadata)
+    launch = launcher.launch(UUID(str(run["id"])))
+    if hasattr(repo, "record_run_invocation"):
+        repo.record_run_invocation(UUID(str(run["id"])), launch)
+    if hasattr(repo, "append_run_event"):
+        repo.append_run_event(UUID(str(run["id"])), "run_created", {"message": "Run queued and worker invocation requested", "payload": {"launcher": launch.get("mode"), "execution": launch.get("execution", "")}})
     return RunCreated(run_id=run["id"], status=run["status"])
 
 
@@ -123,13 +144,18 @@ def create_project_from_proposal(proposal_id: UUID, request: ProposalProjectCrea
 
 
 @app.post("/workflow-proposals/{proposal_id}/runs", response_model=RunCreated, status_code=202)
-def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, repo: Repository = Depends(get_repository)) -> RunCreated:
+def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, repo: Repository = Depends(get_repository), launcher: JobLauncher = Depends(get_job_launcher)) -> RunCreated:
     proposal = repo.get_workflow_proposal(proposal_id)
     ensure_approved(proposal)
     repo.get_conversation(request.conversation_id)
     metadata = {**request.metadata, "proposal_id": str(proposal_id)}
     message = repo.create_user_message(request.conversation_id, request.content, metadata)
     run = repo.create_queued_run(request.conversation_id, UUID(str(message["id"])), request.content, metadata)
+    launch = launcher.launch(UUID(str(run["id"])))
+    if hasattr(repo, "record_run_invocation"):
+        repo.record_run_invocation(UUID(str(run["id"])), launch)
+    if hasattr(repo, "append_run_event"):
+        repo.append_run_event(UUID(str(run["id"])), "run_created", {"message": "Run queued and worker invocation requested", "payload": {"launcher": launch.get("mode"), "execution": launch.get("execution", "")}})
     return RunCreated(run_id=run["id"], status=run["status"])
 
 

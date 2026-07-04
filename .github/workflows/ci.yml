@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  offline-checks:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: https://example.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
+      JOB_LAUNCHER: disabled
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Backend offline tests
+        run: pytest -q tests --ignore=MILO-main-original/MILO-main/test_websearch.py
+      - name: Migration syntax smoke check
+        run: python scripts/check_migrations.py
+      - name: Secret scan
+        run: python scripts/secret_scan.py
+      - name: Docker build API
+        run: docker build -f Dockerfile.api -t milo-agent-api:ci .
+      - name: Docker build worker
+        run: docker build -f Dockerfile.worker -t milo-agent-worker:ci .
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install --no-audit --no-fund
+      - name: Frontend type check
+        working-directory: frontend
+        run: npx tsc --noEmit
+      - name: Frontend tests
+        working-directory: frontend
+        run: npm test -- --run
+      - name: Frontend secret bundle check
+        working-directory: frontend
+        run: npm run test:secrets
