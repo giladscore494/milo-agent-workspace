@@ -29,6 +29,12 @@ class Repository(Protocol):
     def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]: ...
     def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any]) -> dict[str, Any]: ...
 
+    def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any]) -> dict[str, Any]: ...
+    def create_agent_message(self, message: dict[str, Any]) -> dict[str, Any]: ...
+    def list_unread_agent_messages(self, run_id: UUID, recipient: str = "supervisor") -> list[dict[str, Any]]: ...
+    def create_supervisor_decision(self, run_id: UUID, decision: dict[str, Any]) -> dict[str, Any]: ...
+    def list_supervisor_decisions(self, run_id: UUID) -> list[dict[str, Any]]: ...
+
 
 class SupabaseRepository:
     def __init__(self, settings: Settings):
@@ -148,3 +154,31 @@ class SupabaseRepository:
     def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any]) -> dict[str, Any]:
         payload = {"slug": slug, "name": name, "description": description, "workflow_key": "chat_architect_v1", "configuration": {**configuration, "proposal_id": str(proposal_id)}}
         return self._single(self.client.table("projects").insert(payload).select("*"), "project", "new")
+
+    def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any]) -> dict[str, Any]:
+        payload = {"run_id": str(run_id), **blackboard, "updated_at": datetime.now(UTC).isoformat()}
+        return self._single(self.client.table("run_blackboards").upsert(payload, on_conflict="run_id").select("*"), "run_blackboard", str(run_id))
+
+    def create_agent_message(self, message: dict[str, Any]) -> dict[str, Any]:
+        payload = {
+            "id": str(message.get("id")) if message.get("id") else None,
+            "run_id": str(message["run_id"]),
+            "message_type": message["type"],
+            "sender": message["sender"],
+            "recipient": message["recipient"],
+            "task_key": message.get("task_key"),
+            "payload": message.get("payload", {}),
+            "read_at": message.get("read_at"),
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
+        return self._single(self.client.table("agent_messages").insert(payload).select("*"), "agent_message", "new")
+
+    def list_unread_agent_messages(self, run_id: UUID, recipient: str = "supervisor") -> list[dict[str, Any]]:
+        return self._many(self.client.table("agent_messages").select("*").eq("run_id", str(run_id)).eq("recipient", recipient).is_("read_at", "null").order("created_at"))
+
+    def create_supervisor_decision(self, run_id: UUID, decision: dict[str, Any]) -> dict[str, Any]:
+        payload = {"run_id": str(run_id), "mode": "shadow", **decision}
+        return self._single(self.client.table("supervisor_decisions").insert(payload).select("*"), "supervisor_decision", "new")
+
+    def list_supervisor_decisions(self, run_id: UUID) -> list[dict[str, Any]]:
+        return self._many(self.client.table("supervisor_decisions").select("*").eq("run_id", str(run_id)).order("created_at"))
