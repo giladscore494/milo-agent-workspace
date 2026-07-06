@@ -31,8 +31,13 @@ No table is dropped, no row is deleted, and no ID is converted. These legacy col
 
 ### ID types
 
-- Message IDs remain `bigint`: production `messages.id` is a bigint primary key with existing rows, and converting the key would rewrite or discard existing IDs. The backend now passes message IDs through without UUID conversion and stores their string form inside the run `input` JSON.
-- Run IDs remain `uuid`: production `runs.id` is already `uuid`, every new table from `002`–`006` references `runs(id) uuid`, and the backend generates and parses run IDs as UUIDs.
+- Message IDs remain `bigint`: production `messages.id` is a bigint identity primary key with existing rows, and converting the key would rewrite or discard existing IDs. The backend now passes message IDs through without UUID conversion and stores their string form inside the run `input` JSON.
+- Run-event IDs remain `bigint`: production `run_events.id` is also a bigint identity primary key. The API response model (`backend.schemas.RunEvent.id`) now types this field as `int` instead of `UUID`, and the frontend `RunEvent.id` type is `number`. No run-event ID is converted or rewritten.
+- Run IDs and conversation IDs remain `uuid`: production `runs.id` and `conversations.id` are already `uuid`, every new table from `002`–`006` references `runs(id) uuid`, and the backend generates and parses run IDs and conversation IDs as UUIDs. Only `messages.id` and `run_events.id` are bigint.
+
+### Fixture correction note
+
+An earlier draft of `tests/fixtures/legacy_baseline.sql` in this change was described as an exact reproduction of the confirmed production schema but was not: it declared `run_events.id` as `uuid` instead of `bigint`, omitted the pre-existing `run_events.event_type text not null` column, used the wrong `messages.sender_role` CHECK list (missing `tool`), used the wrong foreign-key delete behavior on `messages.conversation_id`/`messages.run_id`, and omitted `conversations.updated_at`, exact `NOT NULL`/default values, and row-level security. The fixture has since been corrected to match the confirmed production schema column-for-column, and `tests/test_migrations_postgres.py::test_fixture_still_declares_run_events_id_bigint_and_event_type` guards against this regressing.
 
 ### Post-merge dry-run and manual apply process
 

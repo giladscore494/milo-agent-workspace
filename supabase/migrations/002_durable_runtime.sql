@@ -2,9 +2,11 @@
 --
 -- Includes legacy baseline reconciliation for public.runs and
 -- public.run_events, which exist in production with a pre-migration shape
--- (user_prompt/result/error_message on runs; agent_name and an integer
--- progress column on run_events). Legacy columns and their data are
--- preserved; only shapes required by the current backend are added.
+-- (user_prompt/result/error_message on runs; a bigint identity id,
+-- event_type, agent_name, and an integer progress column on run_events).
+-- Legacy columns and their data are preserved; only shapes required by the
+-- current backend are added. run_events.id remains bigint; it is never
+-- converted to uuid.
 
 alter table public.runs add column if not exists attempt integer not null default 1;
 alter table public.runs add column if not exists started_at timestamptz;
@@ -141,6 +143,10 @@ begin
 end $$;
 
 -- agent_name is the legacy attribution column and is intentionally kept.
+-- event_type and message already exist in the confirmed production
+-- baseline (id remains its existing bigint identity); these two lines are
+-- defensive no-ops there and only add the columns in environments where
+-- they are missing.
 alter table public.run_events add column if not exists event_type text;
 alter table public.run_events add column if not exists message text;
 alter table public.run_events add column if not exists agent text;

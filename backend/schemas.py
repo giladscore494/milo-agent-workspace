@@ -55,7 +55,7 @@ class Run(BaseModel):
 
 
 class RunEvent(BaseModel):
-    id: UUID
+    id: int  # production run_events.id is bigint; run_id (below) remains UUID
     run_id: UUID
     event_type: str
     message: str | None = None
