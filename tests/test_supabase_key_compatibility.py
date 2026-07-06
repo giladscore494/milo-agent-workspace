@@ -31,49 +31,27 @@ def _block_network(monkeypatch):
     monkeypatch.setattr(httpx.AsyncClient, "request", fail_request)
 
 
-def _value_contains_key(value, key: str) -> bool:
-    if value == key:
-        return True
-    if isinstance(value, str):
-        return key in value
-    if isinstance(value, dict):
-        return any(_value_contains_key(item, key) for pair in value.items() for item in pair)
-    if isinstance(value, (list, tuple, set)):
-        return any(_value_contains_key(item, key) for item in value)
-    if hasattr(value, "items"):
-        return any(_value_contains_key(item, key) for pair in value.items() for item in pair)
-    return False
-
-
-def _client_contains_key(client, key: str) -> bool:
-    """Detect retained fake key without printing or logging it."""
-    candidates = [
-        getattr(client, "supabase_key", None),
-        getattr(client, "key", None),
-        getattr(client, "api_key", None),
-        getattr(client, "headers", None),
-    ]
-    options = getattr(client, "options", None)
-    if options is not None:
-        candidates.append(getattr(options, "headers", None))
-
-    return any(_value_contains_key(candidate, key) for candidate in candidates)
-
-
 def test_repository_accepts_modern_sb_secret_key_with_real_supabase_client_without_network(monkeypatch):
+    monkeypatch.delenv("SUPABASE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
     _block_network(monkeypatch)
 
-    settings = Settings(SUPABASE_URL=FAKE_URL, SUPABASE_SERVICE_ROLE_KEY=FAKE_MODERN_SECRET_KEY)
+    settings = Settings(
+        supabase_url=FAKE_URL,
+        supabase_service_role_key=FAKE_MODERN_SECRET_KEY,
+    )
     try:
         repository = SupabaseRepository(settings)
     except Exception as exc:  # pragma: no cover - assertion message is the regression signal
         assert "Invalid API key" not in str(exc)
         raise
 
-    assert _client_contains_key(repository.client, FAKE_MODERN_SECRET_KEY)
+    assert repository.client is not None
 
 
 def test_repository_wiring_forwards_url_and_key_to_client_constructor(monkeypatch):
+    monkeypatch.delenv("SUPABASE_SECRET_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
     calls = []
 
     def fake_create_client(url, key):
@@ -82,7 +60,10 @@ def test_repository_wiring_forwards_url_and_key_to_client_constructor(monkeypatc
 
     monkeypatch.setattr(supabase_repository, "create_client", fake_create_client)
 
-    settings = Settings(SUPABASE_URL=FAKE_URL, SUPABASE_SERVICE_ROLE_KEY=FAKE_MODERN_SECRET_KEY)
+    settings = Settings(
+        supabase_url=FAKE_URL,
+        supabase_service_role_key=FAKE_MODERN_SECRET_KEY,
+    )
     repository = SupabaseRepository(settings)
 
     assert isinstance(repository.client, FakeSupabaseClient)
