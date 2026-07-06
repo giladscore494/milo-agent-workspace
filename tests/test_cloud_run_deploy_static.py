@@ -53,3 +53,9 @@ def test_check_mode_exits_before_build_deploy_iam_or_worker_execution():
     assert "add-iam-policy-binding" not in check_block
     assert "gcloud run jobs execute" not in SCRIPT
     assert "POST /runs" not in SCRIPT
+
+
+def test_supabase_secret_manager_mapping_preserves_service_role_env_contract():
+    assert "SUPABASE_SECRET_KEY" in SCRIPT
+    assert "SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest" in SCRIPT
+    assert "gcloud secrets versions access" not in SCRIPT

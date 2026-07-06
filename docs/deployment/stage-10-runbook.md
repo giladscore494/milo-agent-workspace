@@ -9,7 +9,7 @@ This repository now treats the browser as a control plane only: the API persists
 - Artifact Registry repository: `milo-agent`
 - Cloud Run service: `milo-agent-api`
 - Cloud Run job: `milo-agent-worker`
-- Secret Manager references only: `KIMI_API_KEY`, `SUPABASE_URL`, `SUPABASE_SECRET_KEY`
+- Secret Manager references only: `KIMI_API_KEY`, `SUPABASE_URL`, `SUPABASE_SECRET_KEY` (modern `sb_secret_` server-side key)
 - Frontend: Vercel Next.js project with `NEXT_PUBLIC_API_URL` pointing to the authenticated API gateway/proxy URL.
 
 ## Security and IAM
@@ -30,7 +30,7 @@ Keep the Cloud Run API private (`--no-allow-unauthenticated`). Grant invoker onl
 4. Run `scripts/deploy/cloud-run.sh` from an authenticated Google Cloud shell or CI identity.
 5. Configure Vercel environment variables:
    - `NEXT_PUBLIC_API_URL`: public backend URL/proxy URL only.
-   - Never expose `SUPABASE_SECRET_KEY`, `KIMI_API_KEY`, or service role values to client bundles.
+   - Never expose `SUPABASE_SECRET_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `KIMI_API_KEY`, or service role values to client bundles. Do not re-enable legacy JWT Supabase service-role keys; keep the modern server-side key only in Secret Manager and mapped into private Cloud Run services/jobs.
 
 ## Cost controls
 

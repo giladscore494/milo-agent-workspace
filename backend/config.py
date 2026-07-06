@@ -1,11 +1,14 @@
 from functools import lru_cache
-from pydantic import Field, HttpUrl
+from pydantic import AliasChoices, Field, HttpUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     supabase_url: HttpUrl = Field(alias="SUPABASE_URL")
-    supabase_service_role_key: str = Field(alias="SUPABASE_SERVICE_ROLE_KEY", min_length=1)
+    supabase_service_role_key: str = Field(
+        validation_alias=AliasChoices("SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY"),
+        min_length=1,
+    )
     api_title: str = "MILO Agent Workspace API"
     environment: str = Field(default="local", alias="ENVIRONMENT")
     allowed_cors_origins: str = Field(default="http://localhost:3000", alias="ALLOWED_CORS_ORIGINS")
