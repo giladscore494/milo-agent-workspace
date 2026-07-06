@@ -1,6 +1,45 @@
 -- Stage 1 project workspace foundation. Safe to rerun; never deletes data.
+--
+-- Baseline note: this migration set upgrades a confirmed legacy production
+-- schema that already contains public.conversations, public.messages,
+-- public.runs, and public.run_events with an empty migration history.
+-- Reconciliation blocks below adapt the legacy shapes in place without
+-- deleting rows or dropping columns.
 
 create extension if not exists pgcrypto;
+
+-- Legacy baseline reconciliation: production messages were created with a
+-- "sender_role" column, while the backend reads and writes "role".
+do $$
+declare
+  has_sender_role boolean;
+  has_role boolean;
+begin
+  select exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'messages' and column_name = 'sender_role'
+  ) into has_sender_role;
+  select exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'messages' and column_name = 'role'
+  ) into has_role;
+
+  if has_sender_role and not has_role then
+    -- Rename preserves all data, NOT NULL, and any CHECK constraint on the
+    -- column: PostgreSQL rewrites constraint expressions to the new name.
+    alter table public.messages rename column sender_role to role;
+  elsif has_sender_role and has_role then
+    -- Partial state: backfill role from sender_role, then make role the
+    -- authoritative NOT NULL column. sender_role is kept (nullable) so no
+    -- data is discarded and new inserts no longer need to supply it.
+    update public.messages set role = sender_role where role is null;
+    alter table public.messages alter column sender_role drop not null;
+    if not exists (select 1 from public.messages where role is null) then
+      alter table public.messages alter column role set not null;
+    end if;
+  end if;
+  -- If only "role" exists the table already matches the backend; no action.
+end $$;
 
 create table if not exists public.projects (
   id uuid primary key default gen_random_uuid(),
@@ -27,6 +66,8 @@ on conflict (slug) do update set
   workflow_key = excluded.workflow_key,
   configuration = excluded.configuration,
   updated_at = now();
+
+alter table public.conversations add column if not exists title text;
 
 alter table public.conversations add column if not exists project_id uuid;
 
