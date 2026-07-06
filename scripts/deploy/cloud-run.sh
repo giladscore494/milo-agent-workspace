@@ -13,6 +13,7 @@ API_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:$SHORT_SHA"
 WORKER_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/worker:$SHORT_SHA"
 REQUIRED_APIS=(run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com)
 REQUIRED_SECRETS=(KIMI_API_KEY SUPABASE_URL SUPABASE_SECRET_KEY)
+ENV_VAR_DELIMITER="@"
 
 fail() {
   echo "ERROR: $*" >&2
@@ -35,6 +36,9 @@ require_allowed_cors_origins() {
     fi
     if [[ "$origin" == "*" ]]; then
       fail "ALLOWED_CORS_ORIGINS must not contain '*'. Use explicit origins only."
+    fi
+    if [[ "$origin" == *"$ENV_VAR_DELIMITER"* ]]; then
+      fail "ALLOWED_CORS_ORIGINS must not contain the gcloud env-var delimiter '$ENV_VAR_DELIMITER'."
     fi
   done
 }
@@ -99,7 +103,7 @@ if [[ "$DEPLOY_MODE" == "check" ]]; then
   exit 0
 fi
 
-# DEPLOY_MODE=apply is the only mode that builds, deploys, and grants the narrow Cloud Run invoker binding.
+# DEPLOY_MODE=apply is the only mode that builds, deploys, and grants the narrow Cloud Run jobs executor-with-overrides binding.
 gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --config scripts/deploy/cloudbuild-worker.yaml --substitutions "_WORKER_IMAGE=$WORKER_IMAGE" .
 gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --config scripts/deploy/cloudbuild-api.yaml --substitutions "_API_IMAGE=$API_IMAGE" .
 
@@ -109,11 +113,11 @@ gcloud run jobs deploy "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" 
   --set-secrets SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest,KIMI_API_KEY=KIMI_API_KEY:latest
 
 gcloud run jobs add-iam-policy-binding "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" \
-  --member "serviceAccount:$SERVICE_ACCOUNT" --role roles/run.invoker >/dev/null
+  --member "serviceAccount:$SERVICE_ACCOUNT" --role roles/run.jobsExecutorWithOverrides >/dev/null
 
 gcloud run deploy "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" --image "$API_IMAGE" \
   --service-account "$SERVICE_ACCOUNT" --no-allow-unauthenticated --port 8080 --cpu 1 --memory 1Gi --timeout 300 --max-instances 10 \
-  --set-env-vars ENVIRONMENT=production,JOB_LAUNCHER=cloud_run,GCP_PROJECT_ID="$PROJECT_ID",GCP_REGION="$REGION",CLOUD_RUN_WORKER_JOB="$WORKER_JOB",ALLOWED_CORS_ORIGINS="$ALLOWED_CORS_ORIGINS" \
+  --set-env-vars "^${ENV_VAR_DELIMITER}^ENVIRONMENT=production${ENV_VAR_DELIMITER}JOB_LAUNCHER=cloud_run${ENV_VAR_DELIMITER}GCP_PROJECT_ID=$PROJECT_ID${ENV_VAR_DELIMITER}GCP_REGION=$REGION${ENV_VAR_DELIMITER}CLOUD_RUN_WORKER_JOB=$WORKER_JOB${ENV_VAR_DELIMITER}ALLOWED_CORS_ORIGINS=$ALLOWED_CORS_ORIGINS" \
   --set-secrets SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest,KIMI_API_KEY=KIMI_API_KEY:latest
 
 service_url=$(gcloud run services describe "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')
