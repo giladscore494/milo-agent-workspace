@@ -11,7 +11,7 @@ type RunEventRealtimePayload = {
 export function useRunRealtime(runId?: string) {
   const [state, dispatch] = useReducer(reduceRunEvent, initialWorkspaceState);
   const [mode, setMode] = useState<'realtime'|'polling'|'idle'>('idle');
-  const last = useRef<string | undefined>();
+  const last = useRef<number | undefined>();
   useEffect(() => { last.current = state.lastEventId; }, [state.lastEventId]);
   useEffect(() => {
     if (!runId) return;

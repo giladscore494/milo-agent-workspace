@@ -78,7 +78,7 @@ def get_conversation(conversation_id: UUID, repo: Repository = Depends(get_repos
 def create_run(conversation_id: UUID, request: RunCreate, repo: Repository = Depends(get_repository), launcher: JobLauncher = Depends(get_job_launcher)) -> RunCreated:
     repo.get_conversation(conversation_id)
     message = repo.create_user_message(conversation_id, request.content, request.metadata)
-    run = repo.create_queued_run(conversation_id, UUID(str(message["id"])), request.content, request.metadata)
+    run = repo.create_queued_run(conversation_id, message["id"], request.content, request.metadata)
     launch = launcher.launch(UUID(str(run["id"])))
     if hasattr(repo, "record_run_invocation"):
         repo.record_run_invocation(UUID(str(run["id"])), launch)
@@ -150,7 +150,7 @@ def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, r
     repo.get_conversation(request.conversation_id)
     metadata = {**request.metadata, "proposal_id": str(proposal_id)}
     message = repo.create_user_message(request.conversation_id, request.content, metadata)
-    run = repo.create_queued_run(request.conversation_id, UUID(str(message["id"])), request.content, metadata)
+    run = repo.create_queued_run(request.conversation_id, message["id"], request.content, metadata)
     launch = launcher.launch(UUID(str(run["id"])))
     if hasattr(repo, "record_run_invocation"):
         repo.record_run_invocation(UUID(str(run["id"])), launch)

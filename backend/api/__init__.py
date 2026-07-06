@@ -61,7 +61,7 @@ def get_conversation(conversation_id: UUID, repo: Repository = Depends(get_repos
 def create_run(conversation_id: UUID, request: RunCreate, repo: Repository = Depends(get_repository)) -> RunCreated:
     repo.get_conversation(conversation_id)
     message = repo.create_user_message(conversation_id, request.content, request.metadata)
-    run = repo.create_queued_run(conversation_id, UUID(str(message["id"])), request.content, request.metadata)
+    run = repo.create_queued_run(conversation_id, message["id"], request.content, request.metadata)
     return RunCreated(run_id=run["id"], status=run["status"])
 
 
@@ -128,5 +128,5 @@ def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, r
     repo.get_conversation(request.conversation_id)
     metadata = {**request.metadata, "proposal_id": str(proposal_id)}
     message = repo.create_user_message(request.conversation_id, request.content, metadata)
-    run = repo.create_queued_run(request.conversation_id, UUID(str(message["id"])), request.content, metadata)
+    run = repo.create_queued_run(request.conversation_id, message["id"], request.content, metadata)
     return RunCreated(run_id=run["id"], status=run["status"])

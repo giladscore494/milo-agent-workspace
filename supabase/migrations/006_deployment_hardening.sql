@@ -16,6 +16,9 @@ create table if not exists public.run_invocations (
 create index if not exists run_invocations_run_idx on public.run_invocations(run_id, created_at desc);
 alter table public.run_invocations enable row level security;
 
+-- Depends on runs.updated_at, runs.worker_id, runs.last_heartbeat_at, and
+-- runs.lease_expires_at, all guaranteed by migration 002 (including on the
+-- legacy baseline, where 002 adds and backfills updated_at).
 create or replace view public.stuck_runs as
 select id, conversation_id, status, worker_id, last_heartbeat_at, lease_expires_at, updated_at
 from public.runs

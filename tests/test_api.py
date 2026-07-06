@@ -35,6 +35,7 @@ class FakeRepo:
     def create_user_message(self, conversation_id, content, metadata):
         self.get_conversation(conversation_id); return {"id": self.message_id, "conversation_id": conversation_id, "role": "user", "content": content, "metadata": metadata}
     def create_queued_run(self, conversation_id, user_message_id, content, metadata):
+        self.queued_message_id = user_message_id
         return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}}
     def get_run(self, run_id):
         self._fail(); return {"id": run_id, "conversation_id": self.conversation_id, "status": "queued"}
@@ -71,6 +72,22 @@ def test_queued_run_creation_returns_immediately(repo):
     response = TestClient(app).post(f"/conversations/{repo.conversation_id}/runs", json={"content": "Build catalog"})
     assert response.status_code == 202
     assert response.json() == {"run_id": str(repo.run_id), "status": "queued"}
+
+
+def test_run_creation_accepts_bigint_message_id(repo):
+    repo.message_id = 1  # production messages.id is bigint
+    response = TestClient(app).post(f"/conversations/{repo.conversation_id}/runs", json={"content": "Build catalog"})
+    assert response.status_code == 202
+    assert repo.queued_message_id == 1
+    assert UUID(response.json()["run_id"]) == repo.run_id  # run ids remain UUID
+
+
+def test_run_creation_accepts_uuid_like_message_id(repo):
+    repo.message_id = str(uuid4())
+    response = TestClient(app).post(f"/conversations/{repo.conversation_id}/runs", json={"content": "Build catalog"})
+    assert response.status_code == 202
+    assert repo.queued_message_id == repo.message_id
+    assert UUID(response.json()["run_id"]) == repo.run_id
 
 
 def test_repository_failures_are_structured():
