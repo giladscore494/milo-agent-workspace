@@ -1,10 +1,23 @@
 """Executable migration compatibility test against ephemeral PostgreSQL.
 
-Applies the exact confirmed legacy production baseline
-(tests/fixtures/legacy_baseline.sql), seeds legacy rows, runs migrations
-001-006 in order, and asserts that data is preserved and the schema matches
-what the backend requires. Migrations are then re-applied to prove they are
-rerun-safe.
+This module has two distinct kinds of tests, and they must not be confused:
+
+1. Confirmed production-baseline tests (`pre_migration_db`, `db` fixtures):
+   apply the exact confirmed legacy production baseline
+   (tests/fixtures/legacy_baseline.sql, including its confirmed constraint
+   names, foreign-key delete behavior, and indexes) with only seed data that
+   the confirmed production `runs_status_check` actually permits. These
+   prove real production data survives migrations 001-006 unmodified, and
+   that the fixture matches the confirmed schema property-for-property.
+
+2. Synthetic defensive edge-case tests (`synthetic_invalid_status_db`
+   fixture): start from the same confirmed baseline but then deliberately
+   drop the confirmed `runs_status_check` and insert a status value that
+   could never exist under that confirmed constraint, purely to exercise
+   migration 002's defensive NOT VALID handling for hypothetical historical
+   anomalies. This is explicitly labeled synthetic in every fixture,
+   docstring, and test name below and must never be read as describing
+   real production state.
 
 The whole module is skipped (not silently passed) when no PostgreSQL server
 binaries are available, so a skip can never be mistaken for executable
@@ -24,6 +37,8 @@ MIGRATIONS = sorted((REPO_ROOT / "supabase" / "migrations").glob("*.sql"))
 BASELINE = REPO_ROOT / "tests" / "fixtures" / "legacy_baseline.sql"
 PG_BIN_CANDIDATES = ["/usr/lib/postgresql/16/bin", "/usr/lib/postgresql/15/bin", ""]
 PG_PORT = "54991"
+PRE_MIGRATION_PG_PORT = "54992"
+SYNTHETIC_PG_PORT = "54993"
 
 
 def _find_pg_bin() -> str | None:
@@ -43,8 +58,9 @@ class EphemeralPostgres:
     must be able to traverse every parent directory.
     """
 
-    def __init__(self, pg_bin: str):
+    def __init__(self, pg_bin: str, port: str = PG_PORT):
         self.pg_bin = pg_bin
+        self.port = port
         self.as_postgres_user = os.geteuid() == 0
         self.dir = tempfile.mkdtemp(prefix="milo-pgmig-", dir="/tmp")
         os.chmod(self.dir, 0o755)
@@ -66,7 +82,7 @@ class EphemeralPostgres:
         subprocess.run(
             self._server_cmd(
                 f"{pg_ctl} -D {self.dir}/data -l {self.dir}/log -w "
-                f"-o '-k {self.dir} -p {PG_PORT} -c listen_addresses=' start"
+                f"-o '-k {self.dir} -p {self.port} -c listen_addresses=' start"
             ),
             check=True, capture_output=True,
         )
@@ -76,8 +92,15 @@ class EphemeralPostgres:
         subprocess.run(self._server_cmd(f"{pg_ctl} -D {self.dir}/data -m immediate stop"), capture_output=True)
         shutil.rmtree(self.dir, ignore_errors=True)
 
+    def create_database(self, name: str = "milo") -> None:
+        subprocess.run(
+            ["psql", "-h", self.dir, "-p", self.port, "-U", "postgres", "-d", "postgres",
+             "-X", "-q", "-c", f"create database {name}"],
+            check=True, capture_output=True,
+        )
+
     def psql(self, sql: str | None = None, file: Path | None = None) -> str:
-        cmd = ["psql", "-h", self.dir, "-p", PG_PORT, "-U", "postgres", "-d", "milo",
+        cmd = ["psql", "-h", self.dir, "-p", self.port, "-U", "postgres", "-d", "milo",
                "-v", "ON_ERROR_STOP=1", "-X", "-q", "-t", "-A"]
         if file is not None:
             cmd += ["-f", str(file)]
@@ -89,19 +112,46 @@ class EphemeralPostgres:
         return result.stdout.strip()
 
 
-@pytest.fixture(scope="module")
-def db():
+def _require_pg_bin() -> str:
     pg_bin = _find_pg_bin()
     if pg_bin is None or shutil.which("psql") is None:
         pytest.skip("PostgreSQL server binaries not available; executable migration validation skipped")
-    server = EphemeralPostgres(pg_bin)
+    return pg_bin
+
+
+@pytest.fixture(scope="module")
+def pre_migration_db():
+    """Confirmed production baseline, seeded, with NO migrations applied.
+
+    Used only to assert what production looks like *before* 001-006 ever
+    run: the confirmed runs_status_check/runs_progress_check constraints,
+    the confirmed ON DELETE CASCADE foreign key, and that the confirmed
+    constraint genuinely rejects statuses outside the confirmed enum.
+    """
+    server = EphemeralPostgres(_require_pg_bin(), port=PRE_MIGRATION_PG_PORT)
     server.start()
     try:
-        subprocess.run(
-            ["psql", "-h", server.dir, "-p", PG_PORT, "-U", "postgres", "-d", "postgres",
-             "-X", "-q", "-c", "create database milo"],
-            check=True, capture_output=True,
-        )
+        server.create_database()
+        server.psql(file=BASELINE)
+        server.psql(sql=SEED_LEGACY_ROWS)
+        yield server
+    finally:
+        server.stop()
+
+
+@pytest.fixture(scope="module")
+def db():
+    """Confirmed production baseline, seeded, with migrations 001-006
+    applied. Used for all post-migration assertions, including that the
+    confirmed baseline's own properties (FK cascade, progress check) survive
+    migration, and that the confirmed legacy seed data needs no defensive
+    NOT VALID exemption because it already satisfies the expanded status
+    constraint migration 002 installs.
+    """
+    server = EphemeralPostgres(_require_pg_bin(), port=PG_PORT)
+    server.start()
+    try:
+        server.create_database()
         server.psql(file=BASELINE)
         server.psql(sql=SEED_LEGACY_ROWS)
         for migration in MIGRATIONS:
@@ -111,6 +161,47 @@ def db():
         server.stop()
 
 
+@pytest.fixture(scope="module")
+def synthetic_invalid_status_db():
+    """SYNTHETIC DEFENSIVE FIXTURE -- NOT PART OF THE CONFIRMED PRODUCTION
+    BASELINE.
+
+    Confirmed production always enforces runs_status_check, so a row with
+    an unconfirmed status value can never actually exist there. This fixture
+    starts from the confirmed baseline but then deliberately drops that
+    confirmed constraint and inserts a status value outside every confirmed
+    or migrated enum, purely to exercise migration 002's defensive NOT VALID
+    handling for a hypothetical historical anomaly. Nothing asserted against
+    this fixture describes real production state.
+    """
+    server = EphemeralPostgres(_require_pg_bin(), port=SYNTHETIC_PG_PORT)
+    server.start()
+    try:
+        server.create_database()
+        server.psql(file=BASELINE)
+        server.psql(
+            "insert into public.conversations (id, title) values "
+            "('99999999-9999-9999-9999-999999999999', 'synthetic conversation')"
+        )
+        # Synthetic-only: the confirmed constraint is dropped so a row with
+        # an unconfirmed status can be inserted. Real production never
+        # allows this state.
+        server.psql("alter table public.runs drop constraint runs_status_check")
+        server.psql(
+            "insert into public.runs (id, conversation_id, user_prompt, status, progress) values "
+            "('88888888-8888-8888-8888-888888888888', '99999999-9999-9999-9999-999999999999', "
+            "'synthetic prompt', 'synthetic_unconfirmed_status', 0)"
+        )
+        for migration in MIGRATIONS:
+            server.psql(file=migration)
+        yield server
+    finally:
+        server.stop()
+
+
+# Every status value here ('completed', 'failed') is permitted by the
+# confirmed production runs_status_check -- this seed represents data that
+# could genuinely exist in production today, not a synthetic edge case.
 SEED_LEGACY_ROWS = """
 insert into public.conversations (id, title) values
   ('11111111-1111-1111-1111-111111111111', 'legacy conversation');
@@ -118,7 +209,7 @@ insert into public.runs (id, conversation_id, user_prompt, status, current_phase
   ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111',
    'legacy prompt', 'completed', 'summary', 100, '{"models": []}'::jsonb, null),
   ('33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111',
-   'legacy failed prompt', 'legacy_error_state', 'fetch', 40, null, 'legacy failure text');
+   'legacy failed prompt', 'failed', 'fetch', 40, null, 'legacy failure text');
 insert into public.messages (conversation_id, run_id, sender_role, content) values
   ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 'user', 'legacy user message'),
   ('11111111-1111-1111-1111-111111111111', null, 'assistant', 'legacy assistant message');
@@ -205,14 +296,113 @@ def test_runs_updated_at_trigger_fires_on_update(db):
     assert after >= before
 
 
-def test_runs_status_check_rejects_new_invalid_status_but_keeps_legacy_rows(db):
+def test_runs_status_check_rejects_new_invalid_status_and_stays_fully_validated(db):
+    """With the confirmed baseline's own legacy data (all statuses already
+    inside the expanded set migration 002 installs), the replaced
+    runs_status_check needs no NOT VALID exemption at all: it validates
+    cleanly against real production-shaped data. Contrast with
+    test_synthetic_migration_leaves_status_check_not_valid_for_unconfirmed_status
+    below, where an unconfirmed status forces the NOT VALID fallback."""
     assert db.psql(
         "select status from public.runs where id = '33333333-3333-3333-3333-333333333333'"
-    ) == "legacy_error_state"
+    ) == "failed"
+    assert db.psql(
+        "select convalidated from pg_constraint where conname = 'runs_status_check'"
+    ) == "t"
     with pytest.raises(AssertionError, match="runs_status_check"):
         db.psql(
             "insert into public.runs (conversation_id, status, input) values "
             "('11111111-1111-1111-1111-111111111111', 'made_up_status', '{}'::jsonb)"
+        )
+
+
+def test_pre_migration_runs_conversation_fk_is_cascade(pre_migration_db):
+    row = pre_migration_db.psql(
+        "select confdeltype from pg_constraint "
+        "where conrelid = 'public.runs'::regclass and contype = 'f' "
+        "and confrelid = 'public.conversations'::regclass"
+    )
+    assert row == "c"  # 'c' = ON DELETE CASCADE
+
+
+def test_pre_migration_runs_progress_and_status_checks_exist(pre_migration_db):
+    names = pre_migration_db.psql(
+        "select conname from pg_constraint where conrelid = 'public.runs'::regclass and contype = 'c' order by conname"
+    ).splitlines()
+    assert "runs_progress_check" in names
+    assert "runs_status_check" in names
+
+
+def test_pre_migration_confirmed_status_check_rejects_unconfirmed_status(pre_migration_db):
+    """Proves the confirmed production constraint is real and enforced,
+    which is exactly why a row with an unconfirmed status cannot exist in
+    production without first being dropped (see the synthetic fixture)."""
+    with pytest.raises(AssertionError, match="runs_status_check"):
+        pre_migration_db.psql(
+            "insert into public.runs (conversation_id, status, user_prompt) values "
+            "('11111111-1111-1111-1111-111111111111', 'legacy_error_state', 'x')"
+        )
+
+
+def test_pre_migration_confirmed_seed_rows_present(pre_migration_db):
+    assert pre_migration_db.psql("select count(*) from public.runs") == "2"
+    assert pre_migration_db.psql("select count(*) from public.messages") == "2"
+
+
+def test_runs_conversation_fk_cascade_survives_migration(db):
+    row = db.psql(
+        "select confdeltype from pg_constraint "
+        "where conrelid = 'public.runs'::regclass and contype = 'f' "
+        "and confrelid = 'public.conversations'::regclass"
+    )
+    assert row == "c"
+
+
+def test_runs_progress_check_survives_migration(db):
+    assert db.psql(
+        "select conname from pg_constraint where conrelid = 'public.runs'::regclass and conname = 'runs_progress_check'"
+    ) == "runs_progress_check"
+    with pytest.raises(AssertionError, match="runs_progress_check"):
+        db.psql(
+            "insert into public.runs (conversation_id, status, progress, input) values "
+            "('11111111-1111-1111-1111-111111111111', 'queued', 250, '{}'::jsonb)"
+        )
+
+
+def test_confirmed_non_primary_indexes_all_present(db):
+    expected = {
+        "messages_conversation_id_created_at_idx",
+        "run_events_run_id_created_at_idx",
+        "runs_conversation_id_idx",
+        "runs_status_idx",
+    }
+    found = set(db.psql(
+        "select indexname from pg_indexes where schemaname = 'public' "
+        "and indexname in ("
+        "'messages_conversation_id_created_at_idx',"
+        "'run_events_run_id_created_at_idx',"
+        "'runs_conversation_id_idx',"
+        "'runs_status_idx')"
+    ).splitlines())
+    assert found == expected
+
+
+def test_synthetic_migration_leaves_status_check_not_valid_for_unconfirmed_status(synthetic_invalid_status_db):
+    """SYNTHETIC DEFENSIVE TEST -- not part of the confirmed production
+    baseline (see synthetic_invalid_status_db fixture docstring). Confirms
+    migration 002 does not fail outright when a hypothetical historical row
+    holds a status outside every confirmed or migrated enum, and that the
+    row's data is preserved rather than discarded."""
+    assert synthetic_invalid_status_db.psql(
+        "select status from public.runs where id = '88888888-8888-8888-8888-888888888888'"
+    ) == "synthetic_unconfirmed_status"
+    assert synthetic_invalid_status_db.psql(
+        "select convalidated from pg_constraint where conname = 'runs_status_check'"
+    ) == "f"  # NOT VALID: the synthetic row does not satisfy the expanded constraint
+    with pytest.raises(AssertionError, match="runs_status_check"):
+        synthetic_invalid_status_db.psql(
+            "insert into public.runs (conversation_id, status, input) values "
+            "('99999999-9999-9999-9999-999999999999', 'still_not_a_real_status', '{}'::jsonb)"
         )
 
 
@@ -321,3 +511,13 @@ def test_migrations_are_rerun_safe(db):
         "select data_type from information_schema.columns "
         "where table_schema='public' and table_name='run_events' and column_name='id'"
     ) == "bigint"
+    assert db.psql(
+        "select confdeltype from pg_constraint "
+        "where conrelid = 'public.runs'::regclass and contype = 'f' "
+        "and confrelid = 'public.conversations'::regclass"
+    ) == "c"
+    assert db.psql(
+        "select count(*) from pg_indexes where schemaname = 'public' and indexname in ("
+        "'messages_conversation_id_created_at_idx','run_events_run_id_created_at_idx',"
+        "'runs_conversation_id_idx','runs_status_idx')"
+    ) == "4"

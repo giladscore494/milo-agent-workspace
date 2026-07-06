@@ -35,9 +35,21 @@ No table is dropped, no row is deleted, and no ID is converted. These legacy col
 - Run-event IDs remain `bigint`: production `run_events.id` is also a bigint identity primary key. The API response model (`backend.schemas.RunEvent.id`) now types this field as `int` instead of `UUID`, and the frontend `RunEvent.id` type is `number`. No run-event ID is converted or rewritten.
 - Run IDs and conversation IDs remain `uuid`: production `runs.id` and `conversations.id` are already `uuid`, every new table from `002`–`006` references `runs(id) uuid`, and the backend generates and parses run IDs and conversation IDs as UUIDs. Only `messages.id` and `run_events.id` are bigint.
 
-### Fixture correction note
+### Fixture correction history
 
-An earlier draft of `tests/fixtures/legacy_baseline.sql` in this change was described as an exact reproduction of the confirmed production schema but was not: it declared `run_events.id` as `uuid` instead of `bigint`, omitted the pre-existing `run_events.event_type text not null` column, used the wrong `messages.sender_role` CHECK list (missing `tool`), used the wrong foreign-key delete behavior on `messages.conversation_id`/`messages.run_id`, and omitted `conversations.updated_at`, exact `NOT NULL`/default values, and row-level security. The fixture has since been corrected to match the confirmed production schema column-for-column, and `tests/test_migrations_postgres.py::test_fixture_still_declares_run_events_id_bigint_and_event_type` guards against this regressing.
+Two earlier drafts of `tests/fixtures/legacy_baseline.sql` in this change were described as an exact reproduction of the confirmed production schema but were not:
+
+- Draft 1 declared `run_events.id` as `uuid` instead of `bigint`, omitted the pre-existing `run_events.event_type text not null` column, used the wrong `messages.sender_role` CHECK list (missing `tool`), used the wrong foreign-key delete behavior on `messages.conversation_id`/`messages.run_id`, and omitted `conversations.updated_at`, exact `NOT NULL`/default values, and row-level security.
+- Draft 2 fixed the above but still omitted `ON DELETE CASCADE` on `runs.conversation_id`, the confirmed `runs_progress_check` and `runs_status_check` constraints (by name), and the four confirmed non-primary indexes (`messages_conversation_id_created_at_idx`, `run_events_run_id_created_at_idx`, `runs_conversation_id_idx`, `runs_status_idx`). Its seed data also included a `runs.status` value (`legacy_error_state`) that the confirmed `runs_status_check` does not actually permit, so it was not representative of real production data.
+
+The fixture now matches the confirmed production schema column-for-column, constraint-for-constraint, index-for-index, and its seed data uses only status values the confirmed `runs_status_check` allows. `tests/test_migrations_postgres.py::test_fixture_still_declares_run_events_id_bigint_and_event_type` guards the run_events shape against regressing.
+
+### Confirmed baseline vs. synthetic defensive testing
+
+`tests/test_migrations_postgres.py` draws a hard line between two kinds of tests:
+
+- **Confirmed production-baseline tests** (`pre_migration_db`, `db` fixtures) apply the exact confirmed schema, including its real constraint names and indexes, and seed only data the confirmed `runs_status_check` genuinely permits. These prove migrations 001–006 upgrade real production data safely.
+- **Synthetic defensive edge-case tests** (`synthetic_invalid_status_db` fixture) start from that same confirmed baseline but then deliberately drop the confirmed `runs_status_check` and insert a status value that could never exist under it, purely to exercise migration 002's defensive `NOT VALID` handling for a hypothetical historical anomaly. Every fixture, docstring, and test name in that path is labeled `SYNTHETIC` and must never be read as describing real production state. Migration 002's `NOT VALID`-then-`VALIDATE` handling is kept specifically for this hypothetical case, even though the confirmed baseline's own data never triggers it.
 
 ### Post-merge dry-run and manual apply process
 
