@@ -21,3 +21,6 @@ coverage/
 *gcp-key*.json
 *google-key*.json
 *supabase-secret*.json
+
+.vite/
+*.tsbuildinfo
