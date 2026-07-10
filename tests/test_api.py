@@ -1,7 +1,7 @@
 from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
-from backend.dependencies import get_repository
+from backend.dependencies import get_job_launcher, get_repository
 from backend.errors import AppError, NotFoundError
 from backend.main import app
 
@@ -14,6 +14,9 @@ class FakeRepo:
         self.run_id = uuid4()
         self.user_id = uuid4()
         self.fail = fail
+        self.created_runs = 0
+        self.cancelled_runs = 0
+        self.tool_grants = 0
 
     def _fail(self):
         if self.fail:
@@ -36,18 +39,39 @@ class FakeRepo:
     def create_user_message(self, conversation_id, content, metadata):
         self.get_conversation(conversation_id); return {"id": self.message_id, "conversation_id": conversation_id, "role": "user", "content": content, "metadata": metadata}
     def create_queued_run(self, conversation_id, user_message_id, content, metadata):
+        self.created_runs += 1
         self.queued_message_id = user_message_id
         return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}}
     def get_run(self, run_id):
         self._fail(); return {"id": run_id, "conversation_id": self.conversation_id, "status": "queued"}
     def list_run_events(self, run_id):
         self._fail(); return []
+    def request_cancellation(self, run_id, reason=None):
+        self.cancelled_runs += 1; return {"id": run_id, "status": "cancellation_requested"}
+    def append_run_event(self, *args, **kwargs):
+        return {"id": 1}
+    def create_tool_grant(self, run_id, grant):
+        self.tool_grants += 1; return {"id": str(uuid4()), "run_id": run_id, **grant}
+
+
+class FakeLauncher:
+    def __init__(self):
+        self.launched = []
+    def launch(self, run_id):
+        self.launched.append(run_id)
+        return {"mode": "test", "execution": "test"}
 
 
 @pytest.fixture
-def repo():
+def repo(monkeypatch):
     fake = FakeRepo()
+    launcher = FakeLauncher()
+    monkeypatch.delenv("MILO_ENABLE_RUN_CREATION", raising=False)
+    monkeypatch.delenv("MILO_ENABLE_PROPOSAL_MUTATIONS", raising=False)
+    monkeypatch.delenv("MILO_ENABLE_EXECUTION_CONTROL", raising=False)
     app.dependency_overrides[get_repository] = lambda: fake
+    app.dependency_overrides[get_job_launcher] = lambda: launcher
+    fake.launcher = launcher
     yield fake
     app.dependency_overrides.clear()
 
@@ -69,26 +93,24 @@ def test_conversation_creation(repo):
     assert response.json()["project_id"] == str(repo.project_id)
 
 
-def test_queued_run_creation_returns_immediately(repo):
+def test_run_creation_disabled_by_default_does_not_queue_or_launch(repo):
     response = TestClient(app).post(f"/conversations/{repo.conversation_id}/runs", json={"content": "Build catalog"})
-    assert response.status_code == 202
-    assert response.json() == {"run_id": str(repo.run_id), "status": "queued"}
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "EXECUTION_SURFACE_DISABLED"
+    assert repo.created_runs == 0
+    assert repo.launcher.launched == []
 
 
-def test_run_creation_accepts_bigint_message_id(repo):
-    repo.message_id = 1  # production messages.id is bigint
-    response = TestClient(app).post(f"/conversations/{repo.conversation_id}/runs", json={"content": "Build catalog"})
-    assert response.status_code == 202
-    assert repo.queued_message_id == 1
-    assert UUID(response.json()["run_id"]) == repo.run_id  # run ids remain UUID
+def test_run_cancellation_disabled_by_default_does_not_mutate(repo):
+    response = TestClient(app).post(f"/runs/{repo.run_id}/cancel", json={"reason": "stop"})
+    assert response.status_code == 403
+    assert repo.cancelled_runs == 0
 
 
-def test_run_creation_accepts_uuid_like_message_id(repo):
-    repo.message_id = str(uuid4())
-    response = TestClient(app).post(f"/conversations/{repo.conversation_id}/runs", json={"content": "Build catalog"})
-    assert response.status_code == 202
-    assert repo.queued_message_id == repo.message_id
-    assert UUID(response.json()["run_id"]) == repo.run_id
+def test_tool_grant_disabled_by_default_does_not_grant(repo):
+    response = TestClient(app).post(f"/runs/{repo.run_id}/tool-grants", json={"agent": "a", "tool": "web", "granted_by": "u"})
+    assert response.status_code == 403
+    assert repo.tool_grants == 0
 
 
 def test_repository_failures_are_structured():
