@@ -96,6 +96,7 @@ class RunCheckpoint(BaseModel):
 
 
 class ProposalCreate(BaseModel):
+    project_id: UUID
     user_request: str = Field(min_length=1)
     budget_preference: str | None = None
     force_missing_verifier: bool = False
@@ -115,6 +116,8 @@ class WorkflowProposal(BaseModel):
     id: UUID
     status: str
     user_request: str
+    created_by: UUID | None = None
+    project_id: UUID | None = None
     task_spec: dict[str, Any]
     draft: dict[str, Any]
     critiques: list[dict[str, Any]] = Field(default_factory=list)

@@ -621,3 +621,166 @@ def test_authenticated_role_has_no_mutation_grants_on_projects(db):
         "order by privilege_type"
     ).splitlines()
     assert grants == ["SELECT"]
+
+
+# --- migration 008 (workflow proposal ownership) executable validation ---
+
+PROPOSAL_MEMBER_USER = "aaaaaaaa-0000-4000-8000-000000000011"
+PROPOSAL_OUTSIDER_USER = "aaaaaaaa-0000-4000-8000-000000000012"
+PROPOSAL_PROJECT = "bbbbbbbb-0000-4000-8000-000000000011"
+LEGACY_PROPOSAL = "cccccccc-0000-4000-8000-000000000001"
+OWNED_PROPOSAL = "cccccccc-0000-4000-8000-000000000002"
+OWNERSHIP_PG_PORT = "54994"
+
+
+@pytest.fixture(scope="module")
+def ownership_db():
+    """Confirmed baseline + migrations, with a legacy proposal inserted
+    BEFORE migration 008 runs, then 008 applied twice (idempotency), then
+    an ownership fixture seeded through the trusted service path."""
+    server = EphemeralPostgres(_require_pg_bin(), port=OWNERSHIP_PG_PORT)
+    server.start()
+    try:
+        server.create_database()
+        server.psql(file=BASELINE)
+        server.psql(sql=SEED_LEGACY_ROWS)
+        server.psql(sql=SUPABASE_AUTH_SHIM)
+        migration_008 = next(m for m in MIGRATIONS if m.name.startswith("008"))
+        for migration in MIGRATIONS:
+            if migration.name.startswith("008"):
+                # Seed a proposal exactly as production holds it today,
+                # before ownership columns exist.
+                server.psql(
+                    f"insert into public.workflow_proposals (id, status, user_request) "
+                    f"values ('{LEGACY_PROPOSAL}', 'approved', 'legacy proposal request')"
+                )
+            server.psql(file=migration)
+        # Repeated application must be a no-op, not an error.
+        server.psql(file=migration_008)
+        server.psql(
+            f"insert into auth.users (id) values ('{PROPOSAL_MEMBER_USER}'), ('{PROPOSAL_OUTSIDER_USER}') on conflict do nothing; "
+            f"insert into public.projects (id, slug, name, workflow_key) values "
+            f"('{PROPOSAL_PROJECT}', 'proposal-scope', 'Proposal Scope', 'vehicle_catalog_v1') on conflict (id) do nothing; "
+            f"insert into public.project_members (project_id, user_id, role) values "
+            f"('{PROPOSAL_PROJECT}', '{PROPOSAL_MEMBER_USER}', 'owner') on conflict do nothing; "
+            f"insert into public.workflow_proposals (id, status, user_request, created_by, project_id) "
+            f"values ('{OWNED_PROPOSAL}', 'approved', 'owned proposal request', "
+            f"'{PROPOSAL_MEMBER_USER}', '{PROPOSAL_PROJECT}')"
+        )
+        yield server
+    finally:
+        server.stop()
+
+
+def test_008_adds_ownership_columns_with_expected_types(ownership_db):
+    rows = ownership_db.psql(
+        "select column_name, data_type, is_nullable from information_schema.columns "
+        "where table_schema='public' and table_name='workflow_proposals' "
+        "and column_name in ('created_by','project_id') order by column_name"
+    ).splitlines()
+    assert rows == ["created_by|uuid|YES", "project_id|uuid|YES"]
+
+
+def test_008_adds_foreign_keys_and_indexes(ownership_db):
+    fks = ownership_db.psql(
+        "select confrelid::regclass::text from pg_constraint "
+        "where conrelid='public.workflow_proposals'::regclass and contype='f' "
+        "order by 1"
+    ).splitlines()
+    assert fks == ["auth.users", "projects"]
+    indexes = ownership_db.psql(
+        "select indexname from pg_indexes where schemaname='public' and tablename='workflow_proposals' "
+        "and indexname in ('workflow_proposals_created_by_idx','workflow_proposals_project_id_idx') order by 1"
+    ).splitlines()
+    assert indexes == ["workflow_proposals_created_by_idx", "workflow_proposals_project_id_idx"]
+
+
+def test_008_preserves_legacy_proposal_rows_without_assigning_ownership(ownership_db):
+    row = ownership_db.psql(
+        f"select status, user_request, created_by is null, project_id is null "
+        f"from public.workflow_proposals where id='{LEGACY_PROPOSAL}'"
+    )
+    assert row == "approved|legacy proposal request|t|t"
+
+
+def test_008_is_rerun_safe_and_keeps_row_count(ownership_db):
+    assert ownership_db.psql("select count(*) from public.workflow_proposals") == "2"
+    migration_008 = next(m for m in MIGRATIONS if m.name.startswith("008"))
+    ownership_db.psql(file=migration_008)
+    assert ownership_db.psql("select count(*) from public.workflow_proposals") == "2"
+
+
+def test_008_rls_member_and_creator_can_read_owned_proposal(ownership_db):
+    assert _as_authenticated(
+        ownership_db, PROPOSAL_MEMBER_USER,
+        f"select count(*) from public.workflow_proposals where id='{OWNED_PROPOSAL}'"
+    ) == "1"
+
+
+def test_008_rls_non_member_cannot_read_or_update_owned_proposal(ownership_db):
+    assert _as_authenticated(
+        ownership_db, PROPOSAL_OUTSIDER_USER,
+        "select count(*) from public.workflow_proposals"
+    ) == "0"
+    _as_authenticated(
+        ownership_db, PROPOSAL_OUTSIDER_USER,
+        f"update public.workflow_proposals set user_request='hijacked' where id='{OWNED_PROPOSAL}'"
+    )
+    assert ownership_db.psql(
+        f"select user_request from public.workflow_proposals where id='{OWNED_PROPOSAL}'"
+    ) == "owned proposal request"
+
+
+def test_008_rls_legacy_unowned_proposal_is_invisible_to_authenticated(ownership_db):
+    for user in (PROPOSAL_MEMBER_USER, PROPOSAL_OUTSIDER_USER):
+        assert _as_authenticated(
+            ownership_db, user,
+            f"select count(*) from public.workflow_proposals where id='{LEGACY_PROPOSAL}'"
+        ) == "0"
+    assert _as_authenticated(ownership_db, None, "select count(*) from public.workflow_proposals") == "0"
+
+
+def test_008_rls_insert_requires_creator_identity_and_membership(ownership_db):
+    inserted = _as_authenticated(
+        ownership_db, PROPOSAL_MEMBER_USER,
+        f"insert into public.workflow_proposals (status, user_request, created_by, project_id) "
+        f"values ('approved', 'member insert', '{PROPOSAL_MEMBER_USER}', '{PROPOSAL_PROJECT}') returning id"
+    )
+    assert inserted
+    with pytest.raises(AssertionError, match="row-level security"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_OUTSIDER_USER,
+            f"insert into public.workflow_proposals (status, user_request, created_by, project_id) "
+            f"values ('approved', 'outsider insert', '{PROPOSAL_OUTSIDER_USER}', '{PROPOSAL_PROJECT}')"
+        )
+    with pytest.raises(AssertionError, match="row-level security"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_MEMBER_USER,
+            f"insert into public.workflow_proposals (status, user_request, created_by, project_id) "
+            f"values ('approved', 'spoofed creator', '{PROPOSAL_OUTSIDER_USER}', '{PROPOSAL_PROJECT}')"
+        )
+
+
+def test_008_service_path_retains_full_visibility(ownership_db):
+    # The trusted service path (table owner / service_role) bypasses RLS and
+    # keeps maintenance access to legacy rows.
+    assert int(ownership_db.psql("select count(*) from public.workflow_proposals")) >= 2
+
+
+def test_008_member_can_update_owned_proposal(ownership_db):
+    _as_authenticated(
+        ownership_db, PROPOSAL_MEMBER_USER,
+        f"update public.workflow_proposals set repair_count = repair_count + 1 where id='{OWNED_PROPOSAL}'"
+    )
+    assert ownership_db.psql(
+        f"select repair_count from public.workflow_proposals where id='{OWNED_PROPOSAL}'"
+    ) == "1"
+
+
+def test_008_authenticated_grants_are_least_privilege(ownership_db):
+    grants = ownership_db.psql(
+        "select privilege_type from information_schema.role_table_grants "
+        "where grantee='authenticated' and table_schema='public' and table_name='workflow_proposals' "
+        "order by privilege_type"
+    ).splitlines()
+    assert grants == ["INSERT", "SELECT", "UPDATE"]

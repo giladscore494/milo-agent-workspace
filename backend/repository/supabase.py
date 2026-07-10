@@ -24,10 +24,10 @@ class Repository(Protocol):
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]: ...
     def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]: ...
     def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]: ...
-    def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any]) -> dict[str, Any]: ...
-    def get_workflow_proposal(self, proposal_id: UUID) -> dict[str, Any]: ...
+    def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any], project_id: UUID | None = None, created_by: UUID | None = None) -> dict[str, Any]: ...
+    def get_workflow_proposal(self, proposal_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]: ...
-    def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any]) -> dict[str, Any]: ...
+    def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any], created_by: UUID | None = None) -> dict[str, Any]: ...
     def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]: ...
     def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]: ...
     def create_tool_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]: ...
@@ -165,20 +165,35 @@ class SupabaseRepository:
         payload = {"status": "completed", "output": output, "error": None, "finished_at": datetime.now(UTC).isoformat()}
         return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
 
-    def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any]) -> dict[str, Any]:
+    def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any], project_id: UUID | None = None, created_by: UUID | None = None) -> dict[str, Any]:
         payload = {"user_request": user_request, **proposal}
+        if project_id is not None:
+            payload["project_id"] = str(project_id)
+        if created_by is not None:
+            payload["created_by"] = str(created_by)
         return self._single(self.client.table("workflow_proposals").insert(payload).select("*"), "workflow_proposal", "new")
 
-    def get_workflow_proposal(self, proposal_id: UUID) -> dict[str, Any]:
-        return self._single(self.client.table("workflow_proposals").select("*").eq("id", str(proposal_id)).limit(1), "workflow_proposal", str(proposal_id))
+    def get_workflow_proposal(self, proposal_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
+        query = self.client.table("workflow_proposals").select("*").eq("id", str(proposal_id)).limit(1)
+        if user_id is not None:
+            # Browser-facing reads require ownership: a project relationship
+            # plus membership. Legacy proposals with NULL project_id never
+            # match the inner join, so they 404 for every browser user.
+            query = self.client.table("workflow_proposals").select("*, projects!inner(project_members!inner(user_id))").eq("id", str(proposal_id)).eq("projects.project_members.user_id", str(user_id)).limit(1)
+        return self._single(query, "workflow_proposal", str(proposal_id))
 
     def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]:
         fields = {**fields, "updated_at": datetime.now(UTC).isoformat()}
         return self._single(self.client.table("workflow_proposals").update(fields).eq("id", str(proposal_id)).select("*"), "workflow_proposal", str(proposal_id))
 
-    def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any]) -> dict[str, Any]:
+    def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any], created_by: UUID | None = None) -> dict[str, Any]:
         payload = {"slug": slug, "name": name, "description": description, "workflow_key": "chat_architect_v1", "configuration": {**configuration, "proposal_id": str(proposal_id)}}
-        return self._single(self.client.table("projects").insert(payload).select("*"), "project", "new")
+        project = self._single(self.client.table("projects").insert(payload).select("*"), "project", "new")
+        if created_by is not None:
+            # The authenticated creator becomes the initial owner so the new
+            # project is reachable through membership-scoped reads.
+            self._single(self.client.table("project_members").upsert({"project_id": str(project["id"]), "user_id": str(created_by), "role": "owner"}, on_conflict="project_id,user_id").select("*"), "project_member", str(created_by))
+        return project
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any]) -> dict[str, Any]:
         payload = {"run_id": str(run_id), **blackboard, "updated_at": datetime.now(UTC).isoformat()}

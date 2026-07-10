@@ -12,16 +12,17 @@ without a separately approved execution stage:
 
 - ``MILO_ENABLE_RUN_CREATION``       gates queued-run creation.
 - ``MILO_ENABLE_PROPOSAL_MUTATIONS`` gates workflow-proposal writes.
-- ``MILO_ENABLE_EXECUTION_CONTROL``  gates run cancellation and the internal
-  worker mutation surfaces (tool access requests/grants/usage, sources,
-  claims, conflicts). These worker surfaces additionally require a
-  service-to-service authorization model (for example verified Cloud Run
-  service identity) before they may ever be enabled; the flag alone is not
-  sufficient for production.
+- ``MILO_ENABLE_RUN_CANCELLATION``   gates browser-user run cancellation,
+  which is membership-authorized like every other browser run route.
+- ``MILO_ENABLE_EXECUTION_CONTROL``  gates the internal worker mutation
+  surfaces (tool access requests/grants/usage, sources, claims, conflicts).
+  These worker surfaces additionally require a service-to-service
+  authorization model (for example verified Cloud Run service identity),
+  which is intentionally deferred to a later stage; the flag alone is not
+  sufficient for production and must stay off until that model exists.
 - ``MILO_ENABLE_PROPOSAL_READS``     gates ``GET /workflow-proposals/{id}``,
-  which has no ownership relationship in the current schema (the
-  ``workflow_proposals`` table carries no ``created_by`` user or project
-  foreign key), so it cannot be membership-scoped yet and stays disabled.
+  which is membership-scoped since migration 008 but stays default-off like
+  every execution surface.
 """
 
 import os
@@ -39,7 +40,8 @@ SURFACE_RULES: tuple[tuple[str, str, re.Pattern[str], str], ...] = (
     ("POST", "MILO_ENABLE_RUN_CREATION", re.compile(rf"^/workflow-proposals/{_SEGMENT}/runs/?$"), "workflow proposal run creation"),
     ("POST", "MILO_ENABLE_PROPOSAL_MUTATIONS", re.compile(r"^/workflow-proposals/?$"), "workflow proposal creation"),
     ("POST", "MILO_ENABLE_PROPOSAL_MUTATIONS", re.compile(rf"^/workflow-proposals/{_SEGMENT}/(approve|reject|revise|project)/?$"), "workflow proposal mutation"),
-    ("POST", "MILO_ENABLE_EXECUTION_CONTROL", re.compile(rf"^/runs/{_SEGMENT}/(cancel|tool-access-requests|tool-grants|tool-usage|sources|claims|conflicts)/?$"), "run execution control"),
+    ("POST", "MILO_ENABLE_RUN_CANCELLATION", re.compile(rf"^/runs/{_SEGMENT}/cancel/?$"), "run cancellation"),
+    ("POST", "MILO_ENABLE_EXECUTION_CONTROL", re.compile(rf"^/runs/{_SEGMENT}/(tool-access-requests|tool-grants|tool-usage|sources|claims|conflicts)/?$"), "run execution control"),
     ("GET", "MILO_ENABLE_PROPOSAL_READS", re.compile(rf"^/workflow-proposals/{_SEGMENT}/?$"), "workflow proposal read"),
 )
 

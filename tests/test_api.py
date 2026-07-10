@@ -66,15 +66,15 @@ class FakeRepo:
         self.cancelled_runs += 1; return {"id": run_id, "status": "cancellation_requested"}
     def append_run_event(self, *args, **kwargs):
         self.appended_events += 1; return {"id": 1}
-    def create_workflow_proposal(self, user_request, proposal):
-        self.proposal_creations += 1; return {"id": self.proposal_id, "status": "approved", "user_request": user_request, **proposal}
-    def get_workflow_proposal(self, proposal_id):
+    def create_workflow_proposal(self, user_request, proposal, project_id=None, created_by=None):
+        self.proposal_creations += 1; return {"id": self.proposal_id, "status": "approved", "user_request": user_request, "project_id": project_id, "created_by": created_by, **proposal}
+    def get_workflow_proposal(self, proposal_id, user_id=None):
         self._fail()
-        if UUID(str(proposal_id)) != self.proposal_id: raise NotFoundError("workflow_proposal", str(proposal_id))
-        return {"id": self.proposal_id, "status": "approved", "user_request": "r", "task_spec": {}, "draft": {}, "estimates": {}, "approved_at": datetime.now(UTC).isoformat()}
+        if (user_id is not None and user_id != self.user_id) or UUID(str(proposal_id)) != self.proposal_id: raise NotFoundError("workflow_proposal", str(proposal_id))
+        return {"id": self.proposal_id, "status": "approved", "user_request": "r", "task_spec": {}, "draft": {}, "estimates": {}, "approved_at": datetime.now(UTC).isoformat(), "project_id": self.project_id, "created_by": self.user_id}
     def update_workflow_proposal(self, proposal_id, fields):
         self.proposal_updates += 1; return {**self.get_workflow_proposal(proposal_id), **fields}
-    def create_project_from_proposal(self, proposal_id, slug, name, description, configuration):
+    def create_project_from_proposal(self, proposal_id, slug, name, description, configuration, created_by=None):
         self.projects_from_proposals += 1; return {"id": uuid4(), "slug": slug, "name": name, "workflow_key": "chat_architect_v1", "configuration": configuration}
     def create_tool_access_request(self, run_id, request):
         self.tool_access_requests += 1; return {"id": str(uuid4()), "run_id": run_id, **request}
@@ -113,7 +113,7 @@ class FakeLauncher:
         return {"mode": "test", "execution": "test"}
 
 
-EXECUTION_FLAGS = ["MILO_ENABLE_RUN_CREATION", "MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PROPOSAL_READS"]
+EXECUTION_FLAGS = ["MILO_ENABLE_RUN_CREATION", "MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_RUN_CANCELLATION", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PROPOSAL_READS"]
 
 
 @pytest.fixture

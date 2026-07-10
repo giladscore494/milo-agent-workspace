@@ -61,6 +61,23 @@ def require_stage_enabled(flag: str, surface: str) -> None:
         raise AppError("EXECUTION_SURFACE_DISABLED", f"{surface} is disabled", 403)
 
 
+def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: AuthenticatedUser, conversation_id: UUID, content: str, metadata: dict) -> RunCreated:
+    """Create the user message + queued run and request a worker launch.
+
+    Callers must have already authorized the authenticated user against the
+    conversation's project membership; no mutation happens before that.
+    """
+    metadata = {**metadata, "requested_by": str(user.user_id)}
+    message = repo.create_user_message(conversation_id, content, metadata)
+    run = repo.create_queued_run(conversation_id, message["id"], content, metadata)
+    launch = launcher.launch(UUID(str(run["id"])))
+    if hasattr(repo, "record_run_invocation"):
+        repo.record_run_invocation(UUID(str(run["id"])), launch)
+    if hasattr(repo, "append_run_event"):
+        repo.append_run_event(UUID(str(run["id"])), "run_created", {"message": "Run queued and worker invocation requested", "payload": {"launcher": launch.get("mode"), "execution": launch.get("execution", "")}})
+    return RunCreated(run_id=run["id"], status=run["status"])
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse()
@@ -87,17 +104,11 @@ def get_conversation(conversation_id: UUID, user: AuthenticatedUser = Depends(ge
 
 
 @app.post("/conversations/{conversation_id}/runs", response_model=RunCreated, status_code=202)
-def create_run(conversation_id: UUID, request: RunCreate, repo: Repository = Depends(get_repository), launcher: JobLauncher = Depends(get_job_launcher)) -> RunCreated:
+def create_run(conversation_id: UUID, request: RunCreate, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), launcher: JobLauncher = Depends(get_job_launcher)) -> RunCreated:
     require_stage_enabled("MILO_ENABLE_RUN_CREATION", "conversation run creation")
-    repo.get_conversation(conversation_id)
-    message = repo.create_user_message(conversation_id, request.content, request.metadata)
-    run = repo.create_queued_run(conversation_id, message["id"], request.content, request.metadata)
-    launch = launcher.launch(UUID(str(run["id"])))
-    if hasattr(repo, "record_run_invocation"):
-        repo.record_run_invocation(UUID(str(run["id"])), launch)
-    if hasattr(repo, "append_run_event"):
-        repo.append_run_event(UUID(str(run["id"])), "run_created", {"message": "Run queued and worker invocation requested", "payload": {"launcher": launch.get("mode"), "execution": launch.get("execution", "")}})
-    return RunCreated(run_id=run["id"], status=run["status"])
+    # Membership authorization must precede every mutation and the launch.
+    repo.get_conversation(conversation_id, user.user_id)
+    return _create_and_launch_run(repo, launcher, user, conversation_id, request.content, request.metadata)
 
 
 @app.get("/runs/{run_id}", response_model=Run)
@@ -111,75 +122,73 @@ def get_run_events(run_id: UUID, user: AuthenticatedUser = Depends(get_authentic
 
 
 @app.post("/runs/{run_id}/cancel", response_model=RunCancelResponse)
-def cancel_run(run_id: UUID, request: RunCancelRequest, repo: Repository = Depends(get_repository)) -> RunCancelResponse:
-    require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "run cancellation")
+def cancel_run(run_id: UUID, request: RunCancelRequest, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> RunCancelResponse:
+    require_stage_enabled("MILO_ENABLE_RUN_CANCELLATION", "run cancellation")
+    # Membership authorization before any mutation; 404 for non-members.
+    repo.get_run(run_id, user_id=user.user_id)
     run = repo.request_cancellation(run_id, request.reason)
-    repo.append_run_event(run_id, "cancellation_requested", {"message": request.reason or "Cancellation requested", "payload": {"reason": request.reason}})
+    repo.append_run_event(run_id, "cancellation_requested", {"message": request.reason or "Cancellation requested", "payload": {"reason": request.reason, "requested_by": str(user.user_id)}})
     return RunCancelResponse(run_id=run["id"], status=run["status"])
 
 
 @app.post("/workflow-proposals", response_model=WorkflowProposal, status_code=201)
-def create_workflow_proposal(request: ProposalCreate, repo: Repository = Depends(get_repository)) -> dict:
+def create_workflow_proposal(request: ProposalCreate, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_PROPOSAL_MUTATIONS", "workflow proposal creation")
+    # Membership authorization before the proposal row is created.
+    repo.get_project(request.project_id, user.user_id)
     proposal = compile_proposal(request.user_request, request.budget_preference, request.force_missing_verifier, request.force_bad_internet)
-    return repo.create_workflow_proposal(request.user_request, proposal)
+    return repo.create_workflow_proposal(request.user_request, proposal, project_id=request.project_id, created_by=user.user_id)
 
 
 @app.get("/workflow-proposals/{proposal_id}", response_model=WorkflowProposal)
-def get_workflow_proposal(proposal_id: UUID, repo: Repository = Depends(get_repository)) -> dict:
-    # workflow_proposals has no created_by/project relationship yet, so this
-    # read cannot be membership-scoped and stays disabled by default.
+def get_workflow_proposal(proposal_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    # Membership-scoped since migration 008; legacy proposals without
+    # ownership return 404 for every browser identity. The surface flag
+    # stays default-off like every other execution surface.
     require_stage_enabled("MILO_ENABLE_PROPOSAL_READS", "workflow proposal read")
-    return repo.get_workflow_proposal(proposal_id)
+    return repo.get_workflow_proposal(proposal_id, user_id=user.user_id)
 
 
 @app.post("/workflow-proposals/{proposal_id}/approve", response_model=WorkflowProposal)
-def approve_workflow_proposal(proposal_id: UUID, request: ProposalDecision, repo: Repository = Depends(get_repository)) -> dict:
+def approve_workflow_proposal(proposal_id: UUID, request: ProposalDecision, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_PROPOSAL_MUTATIONS", "workflow proposal approval")
-    proposal = repo.get_workflow_proposal(proposal_id)
+    proposal = repo.get_workflow_proposal(proposal_id, user_id=user.user_id)
     if proposal["status"] != "approved":
         raise AppError("PROPOSAL_NOT_APPROVABLE", "only critic-approved proposals can be approved", 409)
     return repo.update_workflow_proposal(proposal_id, {"approved_at": datetime.now(UTC).isoformat(), "rejected_at": None})
 
 
 @app.post("/workflow-proposals/{proposal_id}/reject", response_model=WorkflowProposal)
-def reject_workflow_proposal(proposal_id: UUID, request: ProposalDecision, repo: Repository = Depends(get_repository)) -> dict:
+def reject_workflow_proposal(proposal_id: UUID, request: ProposalDecision, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_PROPOSAL_MUTATIONS", "workflow proposal rejection")
-    repo.get_workflow_proposal(proposal_id)
+    repo.get_workflow_proposal(proposal_id, user_id=user.user_id)
     return repo.update_workflow_proposal(proposal_id, {"status": "rejected", "rejected_at": datetime.now(UTC).isoformat(), "approved_at": None})
 
 
 @app.post("/workflow-proposals/{proposal_id}/revise", response_model=WorkflowProposal)
-def revise_workflow_proposal(proposal_id: UUID, request: ProposalRevise, repo: Repository = Depends(get_repository)) -> dict:
+def revise_workflow_proposal(proposal_id: UUID, request: ProposalRevise, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_PROPOSAL_MUTATIONS", "workflow proposal revision")
-    repo.get_workflow_proposal(proposal_id)
+    repo.get_workflow_proposal(proposal_id, user_id=user.user_id)
     proposal = compile_proposal(request.user_request, request.budget_preference)
     return repo.update_workflow_proposal(proposal_id, {"user_request": request.user_request, **proposal})
 
 
 @app.post("/workflow-proposals/{proposal_id}/project", response_model=Project, status_code=201)
-def create_project_from_proposal(proposal_id: UUID, request: ProposalProjectCreate, repo: Repository = Depends(get_repository)) -> dict:
+def create_project_from_proposal(proposal_id: UUID, request: ProposalProjectCreate, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_PROPOSAL_MUTATIONS", "workflow proposal project creation")
-    proposal = repo.get_workflow_proposal(proposal_id)
+    proposal = repo.get_workflow_proposal(proposal_id, user_id=user.user_id)
     ensure_approved(proposal)
-    return repo.create_project_from_proposal(proposal_id, request.slug, request.name, request.description, {"proposal": proposal})
+    return repo.create_project_from_proposal(proposal_id, request.slug, request.name, request.description, {"proposal": proposal}, created_by=user.user_id)
 
 
 @app.post("/workflow-proposals/{proposal_id}/runs", response_model=RunCreated, status_code=202)
-def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, repo: Repository = Depends(get_repository), launcher: JobLauncher = Depends(get_job_launcher)) -> RunCreated:
+def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), launcher: JobLauncher = Depends(get_job_launcher)) -> RunCreated:
     require_stage_enabled("MILO_ENABLE_RUN_CREATION", "workflow proposal run creation")
-    proposal = repo.get_workflow_proposal(proposal_id)
+    proposal = repo.get_workflow_proposal(proposal_id, user_id=user.user_id)
     ensure_approved(proposal)
-    repo.get_conversation(request.conversation_id)
+    repo.get_conversation(request.conversation_id, user.user_id)
     metadata = {**request.metadata, "proposal_id": str(proposal_id)}
-    message = repo.create_user_message(request.conversation_id, request.content, metadata)
-    run = repo.create_queued_run(request.conversation_id, message["id"], request.content, metadata)
-    launch = launcher.launch(UUID(str(run["id"])))
-    if hasattr(repo, "record_run_invocation"):
-        repo.record_run_invocation(UUID(str(run["id"])), launch)
-    if hasattr(repo, "append_run_event"):
-        repo.append_run_event(UUID(str(run["id"])), "run_created", {"message": "Run queued and worker invocation requested", "payload": {"launcher": launch.get("mode"), "execution": launch.get("execution", "")}})
-    return RunCreated(run_id=run["id"], status=run["status"])
+    return _create_and_launch_run(repo, launcher, user, request.conversation_id, request.content, metadata)
 
 
 @app.post("/runs/{run_id}/tool-access-requests", status_code=201)
