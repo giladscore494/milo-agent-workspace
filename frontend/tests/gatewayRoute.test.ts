@@ -82,6 +82,33 @@ describe('private API gateway route', () => {
     expect(mocks.getCloudRunIdToken).not.toHaveBeenCalled();
   });
 
+  it('blocks non-allowlisted routes without contacting Cloud Run', async () => {
+    const RUN_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const response = await GET(new NextRequest(`https://x/api/gateway/runs/${RUN_ID}`, { method: 'GET' }), { params: Promise.resolve({ path: ['runs', RUN_ID] }) });
+    expect(response.status).toBe(403);
+    expect(mocks.getCloudRunIdToken).not.toHaveBeenCalled();
+    expect(mocks.getCloudRunServiceUrl).not.toHaveBeenCalled();
+  });
+
+  it('returns 429 with a Retry-After header when the per-instance limit is hit', async () => {
+    process.env.GATEWAY_RATE_LIMIT_REQUESTS = '1';
+    try {
+      const make = () => GET(
+        new NextRequest('https://x/api/gateway/health', { method: 'GET', headers: { 'x-forwarded-for': '198.51.100.77' } }),
+        { params: Promise.resolve({ path: ['health'] }) },
+      );
+      mocks.getCloudRunServiceUrl.mockReturnValue('https://cloudrun.example');
+      mocks.getCloudRunIdToken.mockResolvedValue('google-id-token');
+      global.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ status: 'ok' }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      expect((await make()).status).toBe(200);
+      const limited = await make();
+      expect(limited.status).toBe(429);
+      expect(Number(limited.headers.get('retry-after'))).toBeGreaterThanOrEqual(1);
+    } finally {
+      delete process.env.GATEWAY_RATE_LIMIT_REQUESTS;
+    }
+  });
+
   it('derives identity from Supabase token and ignores browser identity headers', async () => {
     mocks.getCloudRunServiceUrl.mockReturnValue('https://cloudrun.example');
     mocks.getCloudRunIdToken.mockResolvedValue('google-id-token');

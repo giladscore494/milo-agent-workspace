@@ -1,7 +1,6 @@
 """API package namespace."""
 
 from datetime import UTC, datetime
-import os
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
@@ -11,6 +10,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from backend.config import get_settings
 from backend.auth import AuthenticatedUser, get_authenticated_user
 from backend.dependencies import get_job_launcher, get_repository
+from backend.execution_guard import ExecutionSurfaceGuardMiddleware, is_stage_enabled
 from backend.job_launcher import JobLauncher
 from backend.errors import AppError, install_error_handlers
 from backend.repository import Repository
@@ -37,6 +37,9 @@ from backend.workflow_proposals import compile_proposal, ensure_approved
 
 settings = get_settings()
 app = FastAPI(title=settings.api_title)
+# Added first so it sits innermost of the middleware stack while still running
+# before routing and request-body validation for every request.
+app.add_middleware(ExecutionSurfaceGuardMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origin_list, allow_credentials=True, allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Authorization", "Content-Type"])
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -51,8 +54,10 @@ app.add_middleware(SecurityHeadersMiddleware)
 install_error_handlers(app)
 
 
+# Defense-in-depth assertion; ExecutionSurfaceGuardMiddleware is the
+# authoritative guard and already rejects disabled surfaces before validation.
 def require_stage_enabled(flag: str, surface: str) -> None:
-    if os.getenv(flag, "").strip().lower() not in {"1", "true", "yes", "on"}:
+    if not is_stage_enabled(flag):
         raise AppError("EXECUTION_SURFACE_DISABLED", f"{surface} is disabled", 403)
 
 
@@ -96,13 +101,13 @@ def create_run(conversation_id: UUID, request: RunCreate, repo: Repository = Dep
 
 
 @app.get("/runs/{run_id}", response_model=Run)
-def get_run(run_id: UUID, repo: Repository = Depends(get_repository)) -> dict:
-    return repo.get_run(run_id)
+def get_run(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return repo.get_run(run_id, user_id=user.user_id)
 
 
 @app.get("/runs/{run_id}/events", response_model=list[RunEvent])
-def get_run_events(run_id: UUID, repo: Repository = Depends(get_repository)) -> list[dict]:
-    return repo.list_run_events(run_id)
+def get_run_events(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> list[dict]:
+    return repo.list_run_events(run_id, user_id=user.user_id)
 
 
 @app.post("/runs/{run_id}/cancel", response_model=RunCancelResponse)
@@ -122,6 +127,9 @@ def create_workflow_proposal(request: ProposalCreate, repo: Repository = Depends
 
 @app.get("/workflow-proposals/{proposal_id}", response_model=WorkflowProposal)
 def get_workflow_proposal(proposal_id: UUID, repo: Repository = Depends(get_repository)) -> dict:
+    # workflow_proposals has no created_by/project relationship yet, so this
+    # read cannot be membership-scoped and stays disabled by default.
+    require_stage_enabled("MILO_ENABLE_PROPOSAL_READS", "workflow proposal read")
     return repo.get_workflow_proposal(proposal_id)
 
 

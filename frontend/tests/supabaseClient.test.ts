@@ -36,7 +36,7 @@ describe('Supabase browser auth client helpers', () => {
   });
 
   it('treats expired sessions as unauthenticated', async () => {
-    const expired = { access_token: 'old', expires_at: Math.floor(Date.now() / 1000) - 1 };
+    const expired = { access_token: 'old', expires_at: Math.floor(Date.now() / 1000) - 1 } as any;
     setSupabaseClientForTests(client(expired) as any);
     expect(isSessionExpired(expired)).toBe(true);
     await expect(getCurrentAccessToken()).resolves.toBeUndefined();

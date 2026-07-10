@@ -1,5 +1,5 @@
 import { getCurrentAccessToken } from './supabaseClient';
-import { Project, Proposal, Run, RunEvent } from './types';
+import { Conversation, Project, Proposal, Run, RunEvent } from './types';
 
 const API = '/api/gateway';
 const DISABLED_MESSAGE =
@@ -41,7 +41,7 @@ export const api = {
   projects: () => request<Project[]>('/projects'),
 
   createConversation: (projectId: string, title?: string) =>
-    request(`/projects/${projectId}/conversations`, {
+    request<Conversation>(`/projects/${projectId}/conversations`, {
       method: 'POST',
       body: JSON.stringify({ title }),
     }),

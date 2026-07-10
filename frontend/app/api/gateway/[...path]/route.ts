@@ -37,8 +37,12 @@ async function proxyRequest(
     );
   }
 
-  if (!checkGatewayRateLimit(request.headers.get('x-forwarded-for'))) {
-    return Response.json({ error: 'Too many requests.' }, { status: 429 });
+  const rate = checkGatewayRateLimit(request.headers.get('x-forwarded-for'));
+  if (!rate.allowed) {
+    return Response.json(
+      { error: 'Too many requests.' },
+      { status: 429, headers: { 'retry-after': String(rate.retryAfterSeconds) } },
+    );
   }
 
   if (!isGatewayRequestAllowed(method, backendPath)) {
