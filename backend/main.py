@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.config import get_settings
+from backend.auth import AuthenticatedUser, get_authenticated_user
 from backend.dependencies import get_job_launcher, get_repository
 from backend.job_launcher import JobLauncher
 from backend.errors import AppError, install_error_handlers
@@ -55,23 +56,23 @@ def health() -> HealthResponse:
 
 
 @app.get("/projects", response_model=list[Project])
-def list_projects(repo: Repository = Depends(get_repository)) -> list[dict]:
-    return repo.list_projects()
+def list_projects(user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> list[dict]:
+    return repo.list_projects(user.user_id)
 
 
 @app.get("/projects/{project_id}", response_model=Project)
-def get_project(project_id: UUID, repo: Repository = Depends(get_repository)) -> dict:
-    return repo.get_project(project_id)
+def get_project(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return repo.get_project(project_id, user.user_id)
 
 
 @app.post("/projects/{project_id}/conversations", response_model=Conversation, status_code=201)
-def create_conversation(project_id: UUID, request: ConversationCreate, repo: Repository = Depends(get_repository)) -> dict:
-    return repo.create_conversation(project_id, request.title)
+def create_conversation(project_id: UUID, request: ConversationCreate, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return repo.create_conversation(project_id, request.title, user.user_id)
 
 
 @app.get("/conversations/{conversation_id}", response_model=Conversation)
-def get_conversation(conversation_id: UUID, repo: Repository = Depends(get_repository)) -> dict:
-    return repo.get_conversation(conversation_id)
+def get_conversation(conversation_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return repo.get_conversation(conversation_id, user.user_id)
 
 
 @app.post("/conversations/{conversation_id}/runs", response_model=RunCreated, status_code=202)

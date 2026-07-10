@@ -7,10 +7,10 @@ from backend.errors import AppError, NotFoundError
 
 
 class Repository(Protocol):
-    def list_projects(self) -> list[dict[str, Any]]: ...
-    def get_project(self, project_id: UUID) -> dict[str, Any]: ...
-    def create_conversation(self, project_id: UUID, title: str | None) -> dict[str, Any]: ...
-    def get_conversation(self, conversation_id: UUID) -> dict[str, Any]: ...
+    def list_projects(self, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
+    def get_project(self, project_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
+    def create_conversation(self, project_id: UUID, title: str | None, user_id: UUID | None = None) -> dict[str, Any]: ...
+    def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
     def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
     def get_run(self, run_id: UUID) -> dict[str, Any]: ...
@@ -62,18 +62,26 @@ class SupabaseRepository:
         except Exception as exc:
             raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
 
-    def list_projects(self) -> list[dict[str, Any]]:
-        return self._many(self.client.table("projects").select("*").order("created_at"))
+    def list_projects(self, user_id: UUID | None = None) -> list[dict[str, Any]]:
+        if user_id is None:
+            return self._many(self.client.table("projects").select("*").order("created_at"))
+        return self._many(self.client.table("projects").select("*, project_members!inner(user_id)").eq("project_members.user_id", str(user_id)).order("created_at"))
 
-    def get_project(self, project_id: UUID) -> dict[str, Any]:
-        return self._single(self.client.table("projects").select("*").eq("id", str(project_id)).limit(1), "project", str(project_id))
+    def get_project(self, project_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
+        query = self.client.table("projects").select("*").eq("id", str(project_id)).limit(1)
+        if user_id is not None:
+            query = self.client.table("projects").select("*, project_members!inner(user_id)").eq("id", str(project_id)).eq("project_members.user_id", str(user_id)).limit(1)
+        return self._single(query, "project", str(project_id))
 
-    def create_conversation(self, project_id: UUID, title: str | None) -> dict[str, Any]:
-        self.get_project(project_id)
+    def create_conversation(self, project_id: UUID, title: str | None, user_id: UUID | None = None) -> dict[str, Any]:
+        self.get_project(project_id, user_id)
         return self._single(self.client.table("conversations").insert({"project_id": str(project_id), "title": title}).select("*"), "conversation", "new")
 
-    def get_conversation(self, conversation_id: UUID) -> dict[str, Any]:
-        return self._single(self.client.table("conversations").select("*").eq("id", str(conversation_id)).limit(1), "conversation", str(conversation_id))
+    def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
+        query = self.client.table("conversations").select("*").eq("id", str(conversation_id)).limit(1)
+        if user_id is not None:
+            query = self.client.table("conversations").select("*, projects!inner(project_members!inner(user_id))").eq("id", str(conversation_id)).eq("projects.project_members.user_id", str(user_id)).limit(1)
+        return self._single(query, "conversation", str(conversation_id))
 
     def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]:
         self.get_conversation(conversation_id)

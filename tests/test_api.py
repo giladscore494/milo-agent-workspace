@@ -12,25 +12,26 @@ class FakeRepo:
         self.conversation_id = uuid4()
         self.message_id = uuid4()
         self.run_id = uuid4()
+        self.user_id = uuid4()
         self.fail = fail
 
     def _fail(self):
         if self.fail:
             raise AppError("REPOSITORY_ERROR", "mock failure", 502)
 
-    def list_projects(self):
-        self._fail(); return [self.project()]
+    def list_projects(self, user_id=None):
+        self._fail(); return [self.project()] if user_id == self.user_id else []
     def project(self):
         return {"id": self.project_id, "slug": "milo-vehicle-catalog", "name": "MILO Vehicle Catalog", "workflow_key": "vehicle_catalog_v1", "configuration": {}}
-    def get_project(self, project_id):
+    def get_project(self, project_id, user_id=None):
         self._fail()
-        if UUID(str(project_id)) != self.project_id: raise NotFoundError("project", str(project_id))
+        if (user_id is not None and user_id != self.user_id) or UUID(str(project_id)) != self.project_id: raise NotFoundError("project", str(project_id))
         return self.project()
-    def create_conversation(self, project_id, title):
-        self.get_project(project_id); return {"id": self.conversation_id, "project_id": self.project_id, "title": title}
-    def get_conversation(self, conversation_id):
+    def create_conversation(self, project_id, title, user_id=None):
+        self.get_project(project_id, user_id); return {"id": self.conversation_id, "project_id": self.project_id, "title": title}
+    def get_conversation(self, conversation_id, user_id=None):
         self._fail()
-        if UUID(str(conversation_id)) != self.conversation_id: raise NotFoundError("conversation", str(conversation_id))
+        if (user_id is not None and user_id != self.user_id) or UUID(str(conversation_id)) != self.conversation_id: raise NotFoundError("conversation", str(conversation_id))
         return {"id": self.conversation_id, "project_id": self.project_id, "title": "t"}
     def create_user_message(self, conversation_id, content, metadata):
         self.get_conversation(conversation_id); return {"id": self.message_id, "conversation_id": conversation_id, "role": "user", "content": content, "metadata": metadata}
@@ -57,13 +58,13 @@ def test_health():
 
 def test_project_retrieval(repo):
     client = TestClient(app)
-    response = client.get(f"/projects/{repo.project_id}")
+    response = client.get(f"/projects/{repo.project_id}", headers={"x-milo-auth-user-id": str(repo.user_id)})
     assert response.status_code == 200
     assert response.json()["slug"] == "milo-vehicle-catalog"
 
 
 def test_conversation_creation(repo):
-    response = TestClient(app).post(f"/projects/{repo.project_id}/conversations", json={"title": "New"})
+    response = TestClient(app).post(f"/projects/{repo.project_id}/conversations", json={"title": "New"}, headers={"x-milo-auth-user-id": str(repo.user_id)})
     assert response.status_code == 201
     assert response.json()["project_id"] == str(repo.project_id)
 
@@ -94,8 +95,20 @@ def test_repository_failures_are_structured():
     fake = FakeRepo(fail=True)
     app.dependency_overrides[get_repository] = lambda: fake
     try:
-        response = TestClient(app).get("/projects")
+        response = TestClient(app).get("/projects", headers={"x-milo-auth-user-id": str(fake.user_id)})
         assert response.status_code == 502
         assert response.json()["error"]["code"] == "REPOSITORY_ERROR"
     finally:
         app.dependency_overrides.clear()
+
+
+def test_unauthenticated_project_access_returns_401(repo):
+    response = TestClient(app).get(f"/projects/{repo.project_id}")
+    assert response.status_code == 401
+
+
+def test_user_without_membership_cannot_access_project_or_conversation(repo):
+    other = str(uuid4())
+    client = TestClient(app)
+    assert client.get(f"/projects/{repo.project_id}", headers={"x-milo-auth-user-id": other}).status_code == 404
+    assert client.get(f"/conversations/{repo.conversation_id}", headers={"x-milo-auth-user-id": other}).status_code == 404

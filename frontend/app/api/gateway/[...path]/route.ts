@@ -8,6 +8,8 @@ import {
   isGatewayRequestAllowed,
   isRunCreationRequest,
 } from '@/lib/server/gatewayPolicy';
+import { checkGatewayRateLimit } from '@/lib/server/rateLimit';
+import { GatewayAuthError, validateSupabaseAccessToken } from '@/lib/server/supabaseAuth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -35,6 +37,10 @@ async function proxyRequest(
     );
   }
 
+  if (!checkGatewayRateLimit(request.headers.get('x-forwarded-for') ?? 'anonymous')) {
+    return Response.json({ error: 'Too many requests.' }, { status: 429 });
+  }
+
   if (!isGatewayRequestAllowed(method, backendPath)) {
     return Response.json(
       {
@@ -45,6 +51,9 @@ async function proxyRequest(
   }
 
   try {
+    const user = backendPath === '/health'
+      ? undefined
+      : await validateSupabaseAccessToken(request.headers.get('authorization'));
     const serviceUrl = getCloudRunServiceUrl();
     const idToken = await getCloudRunIdToken();
     const targetUrl = new URL(backendPath, `${serviceUrl}/`);
@@ -57,6 +66,11 @@ async function proxyRequest(
       authorization: `Bearer ${idToken}`,
       accept: request.headers.get('accept') ?? 'application/json',
     });
+
+    if (user) {
+      headers.set('x-milo-auth-user-id', user.id);
+      if (user.email) headers.set('x-milo-auth-user-email', user.email);
+    }
 
     let body: string | undefined;
 
@@ -93,6 +107,10 @@ async function proxyRequest(
       headers: responseHeaders,
     });
   } catch (error) {
+    if (error instanceof GatewayAuthError) {
+      return Response.json({ error: error.message }, { status: error.status });
+    }
+
     console.error('Private API gateway request failed', error);
 
     return Response.json(
