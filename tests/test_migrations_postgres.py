@@ -154,6 +154,7 @@ def db():
         server.create_database()
         server.psql(file=BASELINE)
         server.psql(sql=SEED_LEGACY_ROWS)
+        server.psql(sql=SUPABASE_AUTH_SHIM)
         for migration in MIGRATIONS:
             server.psql(file=migration)
         yield server
@@ -179,6 +180,7 @@ def synthetic_invalid_status_db():
     try:
         server.create_database()
         server.psql(file=BASELINE)
+        server.psql(sql=SUPABASE_AUTH_SHIM)
         server.psql(
             "insert into public.conversations (id, title) values "
             "('99999999-9999-9999-9999-999999999999', 'synthetic conversation')"
@@ -202,6 +204,15 @@ def synthetic_invalid_status_db():
 # Every status value here ('completed', 'failed') is permitted by the
 # confirmed production runs_status_check -- this seed represents data that
 # could genuinely exist in production today, not a synthetic edge case.
+SUPABASE_AUTH_SHIM = """
+create schema if not exists auth;
+create table if not exists auth.users (id uuid primary key);
+create or replace function auth.uid() returns uuid language sql stable as $$
+  select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid
+$$;
+create role authenticated;
+"""
+
 SEED_LEGACY_ROWS = """
 insert into public.conversations (id, title) values
   ('11111111-1111-1111-1111-111111111111', 'legacy conversation');
@@ -521,3 +532,92 @@ def test_migrations_are_rerun_safe(db):
         "'messages_conversation_id_created_at_idx','run_events_run_id_created_at_idx',"
         "'runs_conversation_id_idx','runs_status_idx')"
     ) == "4"
+
+
+# --- migration 007 (project_members + RLS) executable validation ---
+
+MEMBER_USER = "aaaaaaaa-0000-4000-8000-000000000001"
+OUTSIDER_USER = "aaaaaaaa-0000-4000-8000-000000000002"
+MEMBER_PROJECT = "bbbbbbbb-0000-4000-8000-000000000001"
+ORPHAN_PROJECT = "bbbbbbbb-0000-4000-8000-000000000002"
+
+
+def _as_authenticated(db, user_id: str | None, sql: str) -> str:
+    claim = user_id or ""
+    return db.psql(
+        f"select set_config('request.jwt.claim.sub', '{claim}', false); "
+        "set role authenticated; "
+        f"{sql}"
+    ).splitlines()[-1]
+
+
+def _seed_membership_fixture(db) -> None:
+    db.psql(
+        f"insert into auth.users (id) values ('{MEMBER_USER}'), ('{OUTSIDER_USER}') on conflict do nothing; "
+        f"insert into public.projects (id, slug, name, workflow_key) values "
+        f"('{MEMBER_PROJECT}', 'membership-scope', 'Membership Scope', 'vehicle_catalog_v1'), "
+        f"('{ORPHAN_PROJECT}', 'membership-orphan', 'Membership Orphan', 'vehicle_catalog_v1') "
+        "on conflict (id) do nothing; "
+        f"insert into public.project_members (project_id, user_id, role) values "
+        f"('{MEMBER_PROJECT}', '{MEMBER_USER}', 'owner') on conflict do nothing"
+    )
+
+
+def test_project_members_table_rls_and_policies_exist(db):
+    assert db.psql(
+        "select count(*) from information_schema.tables "
+        "where table_schema='public' and table_name='project_members'"
+    ) == "1"
+    rls_enabled = db.psql(
+        "select relname from pg_class where relnamespace='public'::regnamespace "
+        "and relname in ('projects','conversations','messages','runs','run_events','project_members') "
+        "and relrowsecurity order by relname"
+    ).splitlines()
+    assert rls_enabled == ["conversations", "messages", "project_members", "projects", "run_events", "runs"]
+    assert int(db.psql(
+        "select count(*) from pg_policies where schemaname='public' and tablename in "
+        "('projects','conversations','messages','runs','run_events','project_members')"
+    )) >= 7
+
+
+def test_project_members_rejects_unknown_role(db):
+    _seed_membership_fixture(db)
+    with pytest.raises(AssertionError, match="project_members_role_check"):
+        db.psql(
+            f"insert into public.project_members (project_id, user_id, role) "
+            f"values ('{MEMBER_PROJECT}', '{OUTSIDER_USER}', 'superadmin')"
+        )
+
+
+def test_membership_scopes_authenticated_project_reads(db):
+    _seed_membership_fixture(db)
+    member_rows = _as_authenticated(
+        db, MEMBER_USER, "select count(*) from public.projects"
+    )
+    assert member_rows == "1"
+    assert _as_authenticated(
+        db, MEMBER_USER,
+        f"select count(*) from public.projects where id = '{ORPHAN_PROJECT}'"
+    ) == "0"
+    assert _as_authenticated(db, OUTSIDER_USER, "select count(*) from public.projects") == "0"
+    assert _as_authenticated(db, None, "select count(*) from public.projects") == "0"
+
+
+def test_projects_without_members_stay_invisible_but_intact(db):
+    _seed_membership_fixture(db)
+    # The seeded legacy/baseline projects have no members: invisible to the
+    # authenticated role, still present for the trusted service path.
+    assert int(db.psql("select count(*) from public.projects")) >= 2
+    assert _as_authenticated(
+        db, MEMBER_USER,
+        f"select count(*) from public.projects where id = '{MEMBER_PROJECT}'"
+    ) == "1"
+
+
+def test_authenticated_role_has_no_mutation_grants_on_projects(db):
+    grants = db.psql(
+        "select privilege_type from information_schema.role_table_grants "
+        "where grantee='authenticated' and table_schema='public' and table_name='projects' "
+        "order by privilege_type"
+    ).splitlines()
+    assert grants == ["SELECT"]

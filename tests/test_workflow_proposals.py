@@ -48,8 +48,10 @@ class ProposalRepo:
 
 
 @pytest.fixture
-def repo():
+def repo(monkeypatch):
     fake = ProposalRepo()
+    monkeypatch.delenv("MILO_ENABLE_RUN_CREATION", raising=False)
+    monkeypatch.delenv("MILO_ENABLE_PROPOSAL_MUTATIONS", raising=False)
     app.dependency_overrides[get_repository] = lambda: fake
     yield fake
     app.dependency_overrides.clear()
@@ -90,28 +92,29 @@ def test_bad_internet_classification_hits_repair_cap():
     assert "wrong internet policy" in proposal["critiques"][-1]["findings"]
 
 
-def test_approval_gates_project_and_run_start(repo):
+def test_proposal_mutations_and_run_start_disabled_by_default(repo):
     client = TestClient(app)
-    created = client.post("/workflow-proposals", json={"user_request": "Create a current report with citations about charging networks"})
-    assert created.status_code == 201
-    proposal_id = created.json()["id"]
+    proposal_id = repo.create_workflow_proposal("seed", compile_proposal("Create a current report with citations about charging networks"))["id"]
 
-    blocked_project = client.post(f"/workflow-proposals/{proposal_id}/project", json={"slug": "x", "name": "X"})
-    blocked_run = client.post(f"/workflow-proposals/{proposal_id}/runs", json={"conversation_id": str(repo.conversation_id), "content": "start"})
-    assert blocked_project.status_code == 409
-    assert blocked_run.status_code == 409
+    created = client.post("/workflow-proposals", json={"user_request": "Create a current report with citations about charging networks"})
+    approved = client.post(f"/workflow-proposals/{proposal_id}/approve", json={})
+    revised = client.post(f"/workflow-proposals/{proposal_id}/revise", json={"user_request": "Create a current cited report about freight brokers"})
+    project = client.post(f"/workflow-proposals/{proposal_id}/project", json={"slug": "x", "name": "X"})
+    run = client.post(f"/workflow-proposals/{proposal_id}/runs", json={"conversation_id": str(repo.conversation_id), "content": "start"})
+
+    assert created.status_code == 403
+    assert approved.status_code == 403
+    assert revised.status_code == 403
+    assert project.status_code == 403
+    assert run.status_code == 403
     assert repo.runs == []
 
-    approved = client.post(f"/workflow-proposals/{proposal_id}/approve", json={})
-    assert approved.status_code == 200
-    started = client.post(f"/workflow-proposals/{proposal_id}/runs", json={"conversation_id": str(repo.conversation_id), "content": "start"})
-    assert started.status_code == 202
-    assert repo.runs == [{"proposal_id": proposal_id}]
 
-
-def test_revise_recompiles_and_persists_critiques(repo):
+def test_proposal_stage_can_be_enabled_explicitly(repo, monkeypatch):
+    monkeypatch.setenv("MILO_ENABLE_PROPOSAL_MUTATIONS", "true")
     client = TestClient(app)
     created = client.post("/workflow-proposals", json={"user_request": "Do something"})
+    assert created.status_code == 201
     proposal_id = created.json()["id"]
     revised = client.post(f"/workflow-proposals/{proposal_id}/revise", json={"user_request": "Create a current cited report about freight brokers"})
     assert revised.status_code == 200

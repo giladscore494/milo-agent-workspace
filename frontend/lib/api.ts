@@ -1,4 +1,5 @@
-import { Project, Proposal, Run, RunEvent } from './types';
+import { getCurrentAccessToken } from './supabaseClient';
+import { Conversation, Project, Proposal, Run, RunEvent } from './types';
 
 const API = '/api/gateway';
 const DISABLED_MESSAGE =
@@ -10,11 +11,17 @@ export const clientConfig = {
   supabaseAnonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
 };
 
+async function authHeaders(): Promise<HeadersInit> {
+  const token = await getCurrentAccessToken();
+  return token ? { authorization: `Bearer ${token}` } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API}${path}`, {
     ...init,
     headers: {
       'content-type': 'application/json',
+      ...(await authHeaders()),
       ...(init?.headers ?? {}),
     },
   });
@@ -34,7 +41,7 @@ export const api = {
   projects: () => request<Project[]>('/projects'),
 
   createConversation: (projectId: string, title?: string) =>
-    request(`/projects/${projectId}/conversations`, {
+    request<Conversation>(`/projects/${projectId}/conversations`, {
       method: 'POST',
       body: JSON.stringify({ title }),
     }),
@@ -65,17 +72,3 @@ export const api = {
   cancel: (_id: string, _reason?: string) =>
     disabledRequest<unknown>(),
 };
-
-export async function supabaseBrowser(): Promise<any | undefined> {
-  if (!clientConfig.supabaseUrl || !clientConfig.supabaseAnonKey) {
-    return undefined;
-  }
-
-  const loader = new Function('m', 'return import(m)');
-  const module = await loader('@supabase/supabase-js').catch(() => undefined);
-
-  return module?.createClient(
-    clientConfig.supabaseUrl,
-    clientConfig.supabaseAnonKey,
-  );
-}

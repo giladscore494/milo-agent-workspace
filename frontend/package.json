@@ -1,4 +1,8 @@
 {
+  "packageManager": "npm@10.9.7",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -7,6 +11,7 @@
     "test:static": "node scripts/static-ui-check.mjs"
   },
   "dependencies": {
+    "@supabase/supabase-js": "2.50.0",
     "@vercel/oidc": "^3.8.0",
     "google-auth-library": "^10.9.0",
     "next": "^15.5.20",
