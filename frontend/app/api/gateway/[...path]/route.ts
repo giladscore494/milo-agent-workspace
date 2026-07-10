@@ -37,7 +37,7 @@ async function proxyRequest(
     );
   }
 
-  if (!checkGatewayRateLimit(request.headers.get('x-forwarded-for') ?? 'anonymous')) {
+  if (!checkGatewayRateLimit(request.headers.get('x-forwarded-for'))) {
     return Response.json({ error: 'Too many requests.' }, { status: 429 });
   }
 

@@ -154,6 +154,7 @@ def db():
         server.create_database()
         server.psql(file=BASELINE)
         server.psql(sql=SEED_LEGACY_ROWS)
+        server.psql(sql=SUPABASE_AUTH_SHIM)
         for migration in MIGRATIONS:
             server.psql(file=migration)
         yield server
@@ -179,6 +180,7 @@ def synthetic_invalid_status_db():
     try:
         server.create_database()
         server.psql(file=BASELINE)
+        server.psql(sql=SUPABASE_AUTH_SHIM)
         server.psql(
             "insert into public.conversations (id, title) values "
             "('99999999-9999-9999-9999-999999999999', 'synthetic conversation')"
@@ -202,6 +204,15 @@ def synthetic_invalid_status_db():
 # Every status value here ('completed', 'failed') is permitted by the
 # confirmed production runs_status_check -- this seed represents data that
 # could genuinely exist in production today, not a synthetic edge case.
+SUPABASE_AUTH_SHIM = """
+create schema if not exists auth;
+create table if not exists auth.users (id uuid primary key);
+create or replace function auth.uid() returns uuid language sql stable as $$
+  select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid
+$$;
+create role authenticated;
+"""
+
 SEED_LEGACY_ROWS = """
 insert into public.conversations (id, title) values
   ('11111111-1111-1111-1111-111111111111', 'legacy conversation');

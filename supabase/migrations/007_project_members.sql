@@ -59,3 +59,13 @@ begin
     create policy "members can read run events" on public.run_events for select to authenticated using (exists (select 1 from public.runs r join public.conversations c on c.id = r.conversation_id join public.project_members pm on pm.project_id = c.project_id where r.id = run_events.run_id and pm.user_id = auth.uid()));
   end if;
 end $$;
+
+-- Least-privilege grants for browser-facing authenticated role. RLS policies
+-- above still constrain every row; service_role continues to bypass RLS for
+-- trusted backend maintenance paths.
+grant select on public.project_members to authenticated;
+grant select on public.projects to authenticated;
+grant select, insert on public.conversations to authenticated;
+grant select on public.messages to authenticated;
+grant select on public.runs to authenticated;
+grant select on public.run_events to authenticated;

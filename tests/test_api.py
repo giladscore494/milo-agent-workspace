@@ -112,3 +112,10 @@ def test_user_without_membership_cannot_access_project_or_conversation(repo):
     client = TestClient(app)
     assert client.get(f"/projects/{repo.project_id}", headers={"x-milo-auth-user-id": other}).status_code == 404
     assert client.get(f"/conversations/{repo.conversation_id}", headers={"x-milo-auth-user-id": other}).status_code == 404
+
+
+def test_compat_api_entrypoint_uses_protected_app(repo):
+    from backend.api import app as compat_app
+
+    response = TestClient(compat_app).get(f"/projects/{repo.project_id}")
+    assert response.status_code == 401

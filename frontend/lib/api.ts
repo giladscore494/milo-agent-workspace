@@ -1,3 +1,4 @@
+import { getCurrentAccessToken } from './supabaseClient';
 import { Project, Proposal, Run, RunEvent } from './types';
 
 const API = '/api/gateway';
@@ -11,8 +12,7 @@ export const clientConfig = {
 };
 
 async function authHeaders(): Promise<HeadersInit> {
-  const session = getStoredSession();
-  const token = session?.access_token;
+  const token = await getCurrentAccessToken();
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 
@@ -72,47 +72,3 @@ export const api = {
   cancel: (_id: string, _reason?: string) =>
     disabledRequest<unknown>(),
 };
-
-export async function supabaseBrowser(): Promise<any | undefined> {
-  if (!clientConfig.supabaseUrl || !clientConfig.supabaseAnonKey) {
-    return undefined;
-  }
-
-  const loader = new Function('m', 'return import(m)');
-  const module = await loader('@supabase/supabase-js').catch(() => undefined);
-
-  return module?.createClient(
-    clientConfig.supabaseUrl,
-    clientConfig.supabaseAnonKey,
-  );
-}
-
-const SESSION_KEY = 'milo.supabase.session';
-
-export function getStoredSession(): any | undefined {
-  if (typeof window === 'undefined') return undefined;
-  const raw = window.localStorage.getItem(SESSION_KEY);
-  return raw ? JSON.parse(raw) : undefined;
-}
-
-export async function signInWithPassword(email: string, password: string): Promise<any> {
-  if (!clientConfig.supabaseUrl || !clientConfig.supabaseAnonKey) {
-    throw new Error('Supabase auth is not configured.');
-  }
-  const response = await fetch(`${clientConfig.supabaseUrl.replace(/\/$/, '')}/auth/v1/token?grant_type=password`, {
-    method: 'POST',
-    headers: {
-      apikey: clientConfig.supabaseAnonKey,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({ email, password }),
-  });
-  if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
-  const session = await response.json();
-  window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-  return session;
-}
-
-export function signOut(): void {
-  if (typeof window !== 'undefined') window.localStorage.removeItem(SESSION_KEY);
-}
