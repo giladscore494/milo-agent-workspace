@@ -68,6 +68,35 @@ SUPABASE_SECRET_KEY: roles/secretmanager.secretAccessor for the runtime service 
 
 `roles/run.invoker` is insufficient for this implementation because it includes `run.jobs.run` but not `run.jobs.runWithOverrides`. Do not grant Owner, Editor, Cloud Run Admin, or project-wide Secret Manager access for this deployment.
 
+## Worker service-to-service authentication (manual IAM + env configuration)
+
+The internal worker mutation routes (`/runs/{id}/tool-*`, `/runs/{id}/sources|claims|conflicts`, `/internal/runs/{id}/events|complete|fail`) require a Google-signed OIDC identity token in the `X-Milo-Worker-Token` header, verified by `backend/worker_auth.py` (signature, issuer, audience, expiration, verified service-account email, explicit allowlist). Browser identity headers are never consulted on these routes and `MILO_ENABLE_EXECUTION_CONTROL` alone never authorizes a call. The boundary fails closed (HTTP 503) until both env values below are configured.
+
+Manual operator configuration (documented only — **no IAM change is applied by this repository**):
+
+```text
+1. Create a dedicated worker service account (do not reuse the API runtime SA):
+   gcloud iam service-accounts create milo-worker --display-name="MILO worker job"
+
+2. Run the worker job as that service account (worker job deploy flag):
+   --service-account=milo-worker@<PROJECT_ID>.iam.gserviceaccount.com
+
+3. Allow the worker SA to call the private API service (service-scoped, not project-wide):
+   gcloud run services add-iam-policy-binding milo-agent-api \
+     --member=serviceAccount:milo-worker@<PROJECT_ID>.iam.gserviceaccount.com \
+     --role=roles/run.invoker --region=<REGION>
+
+4. Configure the API service environment:
+   MILO_WORKER_AUDIENCE=<https URL of the milo-agent-api Cloud Run service>
+   MILO_APPROVED_WORKER_IDENTITIES=milo-worker@<PROJECT_ID>.iam.gserviceaccount.com
+
+5. The worker mints its token from the metadata server (no key files):
+   GET http://metadata/computeMetadata/v1/instance/service-accounts/default/identity?audience=<MILO_WORKER_AUDIENCE>
+   and sends it as X-Milo-Worker-Token.
+```
+
+Both env values are empty by default, so worker mutations stay unusable until an operator configures them deliberately.
+
 ## Supabase server-side key policy
 
 The backend supports Supabase's modern server-side secret API keys with the `sb_secret_` prefix through the pinned official `supabase==2.27.2` Python client. Keep the production Secret Manager secret named `SUPABASE_SECRET_KEY` populated with the modern server-side key, and keep the Cloud Run mapping compatible with the existing deployment script: `SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest`. The application also accepts `SUPABASE_SECRET_KEY` directly for local and future runtime configurations, while preserving `SUPABASE_SERVICE_ROLE_KEY` as a backward-compatible alias.

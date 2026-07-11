@@ -32,7 +32,10 @@ from backend.schemas import (
     RunEvent,
     WorkflowProposal,
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
+    WorkerRunCompleteRequest, WorkerRunEventCreate, WorkerRunFailRequest,
 )
+from backend.runtime import EVENT_TYPES
+from backend.worker_auth import WorkerIdentity, get_verified_worker
 from backend.workflow_proposals import compile_proposal, ensure_approved
 
 settings = get_settings()
@@ -191,15 +194,21 @@ def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, u
     return _create_and_launch_run(repo, launcher, user, request.conversation_id, request.content, metadata)
 
 
+# --- Internal worker mutation surfaces -------------------------------------
+# These routes use the service-to-service worker identity boundary
+# (backend/worker_auth.py) and never browser-user authentication. The
+# execution flag gates the surface, but a verified, allowlisted worker
+# identity is always required in addition: the flag alone never authorizes.
+
 @app.post("/runs/{run_id}/tool-access-requests", status_code=201)
-def create_tool_access_request(run_id: UUID, request: ToolAccessRequestCreate, repo: Repository = Depends(get_repository)) -> dict:
+def create_tool_access_request(run_id: UUID, request: ToolAccessRequestCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "tool access requests")
     row = repo.create_tool_access_request(run_id, request.model_dump())
     repo.append_run_event(run_id, "tool_access_requested", {"message": f"{request.agent} requested {request.tool}", "agent": request.agent, "payload": row})
     return row
 
 @app.post("/runs/{run_id}/tool-grants", status_code=201)
-def create_tool_grant(run_id: UUID, request: ToolGrantCreate, repo: Repository = Depends(get_repository)) -> dict:
+def create_tool_grant(run_id: UUID, request: ToolGrantCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "tool grants")
     payload = request.model_dump()
     row = repo.create_tool_grant(run_id, payload)
@@ -207,29 +216,53 @@ def create_tool_grant(run_id: UUID, request: ToolGrantCreate, repo: Repository =
     return row
 
 @app.post("/runs/{run_id}/tool-usage", status_code=201)
-def create_tool_usage(run_id: UUID, request: ToolUsageCreate, repo: Repository = Depends(get_repository)) -> dict:
+def create_tool_usage(run_id: UUID, request: ToolUsageCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "tool usage")
     row = repo.create_tool_usage(run_id, request.model_dump())
     repo.append_run_event(run_id, "tool_used", {"message": f"{request.agent} used {request.tool}", "agent": request.agent, "payload": row})
     return row
 
 @app.post("/runs/{run_id}/sources", status_code=201)
-def create_source(run_id: UUID, request: SourceCreate, repo: Repository = Depends(get_repository)) -> dict:
+def create_source(run_id: UUID, request: SourceCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "source recording")
     row = repo.create_source(run_id, request.model_dump())
     repo.append_run_event(run_id, "source_recorded", {"message": request.title, "agent": request.agent, "payload": row})
     return row
 
 @app.post("/runs/{run_id}/claims", status_code=201)
-def create_claim(run_id: UUID, request: ClaimCreate, repo: Repository = Depends(get_repository)) -> dict:
+def create_claim(run_id: UUID, request: ClaimCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "claim recording")
     row = repo.create_claim(run_id, request.model_dump())
     repo.append_run_event(run_id, "claim_recorded", {"message": f"{request.entity_key}.{request.field_key}", "agent": request.agent, "payload": row})
     return row
 
 @app.post("/runs/{run_id}/conflicts", status_code=201)
-def create_conflict(run_id: UUID, request: ConflictCreate, repo: Repository = Depends(get_repository)) -> dict:
+def create_conflict(run_id: UUID, request: ConflictCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "conflict recording")
     row = repo.create_conflict(run_id, request.model_dump())
     repo.append_run_event(run_id, "conflict_detected", {"message": f"{request.entity_key}.{request.field_key}", "payload": row})
     return row
+
+
+@app.post("/internal/runs/{run_id}/events", status_code=201)
+def create_worker_run_event(run_id: UUID, request: WorkerRunEventCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
+    require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "worker run events")
+    if request.event_type not in EVENT_TYPES:
+        raise AppError("UNKNOWN_EVENT_TYPE", f"unknown event type {request.event_type}", 422)
+    return repo.append_run_event(run_id, request.event_type, {"message": request.message, "agent": request.agent, "phase": request.phase, "progress": request.progress, "payload": {**request.payload, "worker_identity": worker.service_account_email}})
+
+
+@app.post("/internal/runs/{run_id}/complete")
+def complete_run_from_worker(run_id: UUID, request: WorkerRunCompleteRequest, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
+    require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "worker run completion")
+    run = repo.mark_run_complete(run_id, request.output)
+    repo.append_run_event(run_id, "run_completed", {"message": "Run completed by worker", "payload": {"worker_identity": worker.service_account_email}})
+    return run
+
+
+@app.post("/internal/runs/{run_id}/fail")
+def fail_run_from_worker(run_id: UUID, request: WorkerRunFailRequest, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
+    require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "worker run failure")
+    run = repo.mark_run_failed(run_id, request.code, request.message)
+    repo.append_run_event(run_id, "run_failed", {"message": request.message, "payload": {"code": request.code, "worker_identity": worker.service_account_email}})
+    return run

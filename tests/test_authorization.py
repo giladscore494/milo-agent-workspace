@@ -130,6 +130,31 @@ def test_cross_user_cancellation_does_not_mutate(repo):
     assert repo.appended_events == 0
 
 
+def test_worker_surfaces_reject_browser_users_even_with_flags_enabled(repo):
+    # Even a legitimate project member must never write through the internal
+    # worker mutation surfaces with browser identity headers. Worker auth is
+    # deliberately unconfigured here, so the boundary fails closed (503);
+    # tests/test_worker_auth.py covers the configured rejection paths.
+    c = client()
+    for path, body in (
+        ("tool-access-requests", {"agent": "a", "tool": "web_search", "reason": "r"}),
+        ("tool-usage", {"grant_id": str(uuid4()), "agent": "a", "tool": "web_search", "operation": "search"}),
+        ("sources", {"agent": "a", "url": "https://example.com", "title": "t", "domain": "example.com", "source_type": "web", "source_strength": "high", "query": "q", "tool_operation": "search"}),
+        ("claims", {"entity_key": "e", "field_key": "f", "value": 1, "source_id": str(uuid4()), "source_strength": "high", "confidence": 0.9, "agent": "a"}),
+        ("conflicts", {"entity_key": "e", "field_key": "f", "claim_ids": [str(uuid4())]}),
+    ):
+        response = c.post(f"/runs/{repo.run_id}/{path}", json=body, headers=member_headers(repo))
+        assert response.status_code in {401, 403, 503}, path
+    for path, body in (
+        ("events", {"event_type": "agent_progress", "message": "m"}),
+        ("complete", {"output": {}}),
+        ("fail", {"code": "X", "message": "m"}),
+    ):
+        response = c.post(f"/internal/runs/{repo.run_id}/{path}", json=body, headers=member_headers(repo))
+        assert response.status_code in {401, 403, 503}, path
+    repo.assert_no_mutations()
+
+
 def test_stranger_sees_empty_project_list_not_other_users_projects(repo):
     response = client().get("/projects", headers=stranger_headers())
     assert response.status_code == 200

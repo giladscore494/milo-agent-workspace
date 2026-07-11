@@ -200,3 +200,21 @@ class ConflictCreate(BaseModel):
     claim_ids: list[UUID]
     outcome: str = "unresolved_needs_review"
     rationale: str | None = None
+
+
+class WorkerRunEventCreate(BaseModel):
+    event_type: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    agent: str | None = None
+    phase: str | None = None
+    progress: dict[str, Any] | None = None
+
+
+class WorkerRunCompleteRequest(BaseModel):
+    output: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkerRunFailRequest(BaseModel):
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)

@@ -29,6 +29,8 @@ class FakeRepo:
         self.claims = 0
         self.conflicts = 0
         self.appended_events = 0
+        self.completed_runs = 0
+        self.failed_runs = 0
 
     def _fail(self):
         if self.fail:
@@ -88,6 +90,10 @@ class FakeRepo:
         self.claims += 1; return {"id": str(uuid4()), "run_id": run_id, **claim}
     def create_conflict(self, run_id, conflict):
         self.conflicts += 1; return {"id": str(uuid4()), "run_id": run_id, **conflict}
+    def mark_run_complete(self, run_id, output):
+        self.completed_runs += 1; return {"id": run_id, "conversation_id": self.conversation_id, "status": "completed", "output": output}
+    def mark_run_failed(self, run_id, code, message):
+        self.failed_runs += 1; return {"id": run_id, "conversation_id": self.conversation_id, "status": "failed", "error": {"code": code, "message": message}}
 
     def assert_no_mutations(self):
         assert self.created_messages == 0
@@ -103,6 +109,8 @@ class FakeRepo:
         assert self.claims == 0
         assert self.conflicts == 0
         assert self.appended_events == 0
+        assert self.completed_runs == 0
+        assert self.failed_runs == 0
 
 
 class FakeLauncher:

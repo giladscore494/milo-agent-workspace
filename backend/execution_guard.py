@@ -42,6 +42,7 @@ SURFACE_RULES: tuple[tuple[str, str, re.Pattern[str], str], ...] = (
     ("POST", "MILO_ENABLE_PROPOSAL_MUTATIONS", re.compile(rf"^/workflow-proposals/{_SEGMENT}/(approve|reject|revise|project)/?$"), "workflow proposal mutation"),
     ("POST", "MILO_ENABLE_RUN_CANCELLATION", re.compile(rf"^/runs/{_SEGMENT}/cancel/?$"), "run cancellation"),
     ("POST", "MILO_ENABLE_EXECUTION_CONTROL", re.compile(rf"^/runs/{_SEGMENT}/(tool-access-requests|tool-grants|tool-usage|sources|claims|conflicts)/?$"), "run execution control"),
+    ("POST", "MILO_ENABLE_EXECUTION_CONTROL", re.compile(rf"^/internal/runs/{_SEGMENT}/(events|complete|fail)/?$"), "worker run mutation"),
     ("GET", "MILO_ENABLE_PROPOSAL_READS", re.compile(rf"^/workflow-proposals/{_SEGMENT}/?$"), "workflow proposal read"),
 )
 
