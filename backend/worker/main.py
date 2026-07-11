@@ -80,6 +80,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Budget configuration incomplete; refusing paid execution", payload={"code": "BUDGET_CONFIG_INVALID", "missing": missing}))
         repo.mark_run_failed(run_id, "BUDGET_CONFIG_INVALID", f"mandatory budget settings missing: {missing}")
         return 1
+    # Provider credentials are worker-only (env/Secret Manager). Paid
+    # execution fails closed when the key is absent; the key value itself is
+    # never logged, persisted or echoed into events.
+    from backend.engines.vehicle_catalog_v1.adapter import worker_provider_api_key
+
+    if paid_execution_enabled() and not worker_provider_api_key():
+        sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider API key not configured for this worker; refusing paid execution", payload={"code": "PROVIDER_KEY_MISSING"}))
+        repo.mark_run_failed(run_id, "PROVIDER_KEY_MISSING", "worker provider API key (KIMI_API_KEY/MOONSHOT_API_KEY) is not configured")
+        return 1
 
     def emit_budget_event(event_type, payload):
         sink.emit(RunEventRecord(run_id=run_id, type=event_type, message=payload.get("message", event_type), payload=payload.get("payload", payload)))
@@ -89,15 +98,41 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         if hasattr(repo, "update_run_usage"):
             repo.update_run_usage(run_id, usage)
 
+    def holds_lease():
+        current = repo.get_run(run_id)
+        return not current.get("worker_id") or current.get("worker_id") == worker_id
+
+    def record_ledger(entry):
+        if hasattr(repo, "append_usage_ledger"):
+            repo.append_usage_ledger({
+                "run_id": str(run_id),
+                "user_id": run.get("requested_by"),
+                "provider": "moonshot",
+                "model": "kimi",
+                **entry,
+            })
+
     tracker = budget_tracker or BudgetTracker(
         budget_config,
         cancellation_checker=is_cancelled,
         event_emitter=emit_budget_event,
         usage_recorder=record_usage,
+        ledger_recorder=record_ledger,
+        lease_checker=holds_lease,
+        daily_user_cost_provider=(lambda: repo.sum_daily_ledger_cost(user_id=run.get("requested_by"))) if hasattr(repo, "sum_daily_ledger_cost") and run.get("requested_by") else None,
+        daily_project_cost_provider=(lambda: repo.sum_daily_ledger_cost(run_id=str(run_id))) if hasattr(repo, "sum_daily_ledger_cost") else None,
     )
+
+    def forward_event(t, p):
+        sink.emit(RunEventRecord(run_id=run_id, type=t, message=p.get("message", t), payload=p, phase=p.get("phase"), agent=p.get("agent"), progress=p.get("progress")))
+        shadow_observe(t, p)
+        if t == "agent_started":
+            # Connect the declared agent-step limit to the real engine.
+            tracker.record_agent_step()
+
     selected_engine = engine or VehicleCatalogV1Adapter(
         model_client_factory=build_guarded_client_factory(tracker),
-        event_sink=lambda t, p: (sink.emit(RunEventRecord(run_id=run_id, type=t, message=p.get("message", t), payload=p, phase=p.get("phase"), agent=p.get("agent"), progress=p.get("progress"))), shadow_observe(t, p)),
+        event_sink=forward_event,
         checkpoint_sink=save_checkpoint,
         cancellation_checker=is_cancelled,
     )

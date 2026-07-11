@@ -320,3 +320,169 @@ def test_worker_refuses_paid_execution_without_mandatory_budget(monkeypatch):
     assert exit_code == 1
     assert repo.failed == ["BUDGET_CONFIG_INVALID"]
     monkeypatch.delenv("MILO_ENABLE_PAID_EXECUTION", raising=False)
+
+
+# --- corrective audit: hard pre-call reservation semantics -------------------
+
+def test_reserve_clamps_max_tokens_to_remaining_allowance():
+    tracker = make_tracker(max_output_tokens_per_run=100, estimated_cost_per_call=0.0)
+    inner = MockClient()
+    guarded = GuardedModelClient(inner, tracker)
+    # First call: usage records 30 output tokens (MockUsage.completion_tokens).
+    guarded.chat.completions.create(model="mock", messages=[{"content": "x" * 40}], max_tokens=500)
+    # Requested 500 but only 100 were available at reservation time.
+    allowed = tracker.reserve_call(10, 500)
+    assert allowed == 100 - 30  # remaining after the first call's actuals
+    tracker.settle_call(10, allowed, 0, 0)
+
+
+def test_reservation_rejects_call_with_no_remaining_output_budget():
+    tracker = make_tracker(max_output_tokens_per_run=25, estimated_cost_per_call=0.0)
+    inner = MockClient()
+    guarded = GuardedModelClient(inner, tracker)
+    guarded.chat.completions.create(model="mock", messages=[], max_tokens=25)  # settles 30 actual
+    with pytest.raises(BudgetExceeded) as exc:
+        guarded.chat.completions.create(model="mock", messages=[], max_tokens=25)
+    assert exc.value.code == "OUTPUT_TOKEN_LIMIT_REACHED"
+    assert inner.chat.completions.calls == 1  # second call never reached the adapter
+
+
+def test_pre_call_input_estimate_blocks_oversized_prompt_before_the_call():
+    tracker = make_tracker(max_input_tokens_per_run=10, estimated_cost_per_call=0.0)
+    inner = MockClient()
+    guarded = GuardedModelClient(inner, tracker)
+    with pytest.raises(BudgetExceeded) as exc:
+        guarded.chat.completions.create(model="mock", messages=[{"content": "x" * 400}])
+    assert exc.value.code == "INPUT_TOKEN_LIMIT_REACHED"
+    assert inner.chat.completions.calls == 0  # rejected BEFORE any call
+
+
+def test_concurrent_reservations_cannot_both_take_the_last_call():
+    import threading
+
+    tracker = make_tracker(max_model_calls_per_run=1, estimated_cost_per_call=0.0)
+    results = []
+
+    def attempt():
+        try:
+            tracker.reserve_call(1, 10)
+            results.append("ok")
+        except BudgetExceeded:
+            results.append("rejected")
+
+    threads = [threading.Thread(target=attempt) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results.count("ok") == 1
+    assert results.count("rejected") == 7
+
+
+def test_concurrent_reservations_cannot_both_take_the_last_tokens():
+    import threading
+
+    tracker = make_tracker(max_total_tokens_per_run=100, estimated_cost_per_call=0.0)
+    results = []
+
+    def attempt():
+        try:
+            allowed = tracker.reserve_call(10, 80)
+            results.append(("ok", allowed))
+        except BudgetExceeded:
+            results.append(("rejected", None))
+
+    threads = [threading.Thread(target=attempt) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    granted = sum(a or 0 for kind, a in results if kind == "ok")
+    reserved_inputs = sum(10 for kind, _ in results if kind == "ok")
+    assert granted + reserved_inputs <= 100, results
+
+
+def test_ledger_records_reservations_settlements_and_rejections():
+    entries = []
+    tracker = make_tracker(max_model_calls_per_run=1, estimated_cost_per_call=0.0)
+    tracker.ledger_recorder = entries.append
+    allowed = tracker.reserve_call(5, 50)
+    tracker.settle_call(5, allowed, 100, 20)
+    with pytest.raises(BudgetExceeded):
+        tracker.reserve_call(5, 50)
+    decisions = [e["decision"] for e in entries]
+    assert decisions == ["reserved", "settled", "rejected"]
+    assert entries[-1]["rejection_reason"] == "MODEL_CALL_LIMIT_REACHED"
+
+
+def test_lost_worker_lease_blocks_the_next_call():
+    tracker = make_tracker(max_model_calls_per_run=10)
+    tracker.lease_checker = lambda: False
+    with pytest.raises(BudgetExceeded) as exc:
+        tracker.reserve_call(1, 10)
+    assert exc.value.code == "WORKER_LEASE_LOST"
+
+
+def test_provider_key_only_from_worker_environment(monkeypatch):
+    from backend.engines.vehicle_catalog_v1.adapter import worker_provider_api_key
+
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    assert worker_provider_api_key() == ""
+    monkeypatch.setenv("MOONSHOT_API_KEY", "test-worker-only-key")
+    assert worker_provider_api_key() == "test-worker-only-key"
+
+
+def test_run_input_api_key_is_ignored(monkeypatch):
+    from backend.engines.vehicle_catalog_v1.adapter import VehicleCatalogV1Adapter
+
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "env-key-wins")
+    captured = {}
+
+    class SpyEngine:
+        def run(self, config):
+            captured["api_key"] = config.api_key
+            return {"status": "failed", "error": {"code": "SPY", "message": "spy"}}
+
+    adapter = VehicleCatalogV1Adapter()
+    adapter.engine = SpyEngine()
+    adapter.run({"input": {"api_key": "attacker-supplied-key", "content": "x"}})
+    assert captured["api_key"] == "env-key-wins"
+
+
+def test_worker_refuses_paid_execution_without_provider_key(monkeypatch):
+    from backend.worker.main import execute_run
+
+    class MiniRepo:
+        def __init__(self):
+            self.failed = []
+            self.run = {"id": str(uuid4()), "status": "queued", "input": {"content": "x"}, "attempt": 1}
+
+        def claim_run(self, run_id, worker_id, lease_seconds=300):
+            return dict(self.run)
+
+        def get_run(self, run_id, user_id=None):
+            return dict(self.run)
+
+        def append_run_event(self, run_id, event_type, payload):
+            return {"id": 1}
+
+        def mark_run_failed(self, run_id, code, message, worker_id=None):
+            self.failed.append(code)
+            return dict(self.run, status="failed")
+
+        def latest_checkpoint(self, run_id, workflow_key=None):
+            return None
+
+    monkeypatch.setenv("MILO_ENABLE_PAID_EXECUTION", "true")
+    monkeypatch.setenv("MILO_MAX_MODEL_CALLS_PER_RUN", "10")
+    monkeypatch.setenv("MILO_MAX_TOTAL_TOKENS_PER_RUN", "1000")
+    monkeypatch.setenv("MILO_MAX_ESTIMATED_COST_PER_RUN", "1")
+    monkeypatch.setenv("MILO_MAX_RUN_DURATION_SECONDS", "60")
+    monkeypatch.setenv("MILO_MAX_RETRIES", "1")
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    repo = MiniRepo()
+    assert execute_run(uuid4(), repo) == 1
+    assert repo.failed == ["PROVIDER_KEY_MISSING"]

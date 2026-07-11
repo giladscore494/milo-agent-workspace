@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from . import core
 from .engine import VehicleCatalogEngine, VehicleCatalogRunConfig
+
+
+def worker_provider_api_key() -> str:
+    """Provider credentials come ONLY from worker-scoped environment
+    variables (populated by Secret Manager mappings in production). Run
+    input, browser requests, messages, metadata and database payloads are
+    never a credential source."""
+    return (os.getenv("KIMI_API_KEY") or os.getenv("MOONSHOT_API_KEY") or "").strip()
 
 
 class VehicleCatalogV1Adapter:
@@ -15,7 +24,7 @@ class VehicleCatalogV1Adapter:
     def run(self, run: dict[str, Any]) -> dict[str, Any]:
         run_input = run.get("input", {}) or {}
         config = VehicleCatalogRunConfig(
-            api_key=run_input.get("api_key", ""),
+            api_key=worker_provider_api_key(),
             manufacturer=run_input.get("manufacturer", run_input.get("make", core.DEFAULT_MANUFACTURER)),
             market=run_input.get("market", core.DEFAULT_MARKET),
             period=run_input.get("period", core.DEFAULT_PERIOD),
