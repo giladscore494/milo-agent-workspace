@@ -5,7 +5,7 @@ import time
 from typing import Any
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
-from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, build_guarded_client_factory, paid_execution_enabled
+from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, paid_execution_enabled
 from backend.config import get_settings
 from backend.errors import AppError
 from backend.repository import Repository, SupabaseRepository
@@ -38,7 +38,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         if not hasattr(repo, "heartbeat"):
             return True
         try:
-            repo.heartbeat(run_id, worker_id, lease_seconds=lease_seconds)
+            repo.heartbeat(run_id, worker_id, lease_seconds=lease_seconds, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
             return True
         except Exception:
             lease_lost.set()
@@ -65,7 +65,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         if run.get("status") == "cancellation_requested":
             sink.emit(RunEventRecord(run_id=run_id, type="run_cancelled", message="Run cancelled before worker execution", payload={"code": "RUN_CANCELLED_BEFORE_START"}))
             if hasattr(repo, "transition_run"):
-                repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, finished_at=datetime.now(UTC).isoformat())
+                repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), lease_token=run.get("lease_token"), finished_at=datetime.now(UTC).isoformat())
             return 0
         shadow_blackboard = initial_blackboard(str((run.get("input") or {}).get("content") or "MILO vehicle catalog run"))
 
@@ -82,7 +82,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     previous = repo.list_supervisor_decisions(run_id) if hasattr(repo, "list_supervisor_decisions") else []
                     decision = make_shadow_decision(SupervisorInput(goal=shadow_blackboard.goal, compiled_workflow=shadow_blackboard.approved_plan, blackboard=shadow_blackboard, unread_messages=[message] if message else [], open_conflicts=shadow_blackboard.claims_conflict_summaries, budget=shadow_blackboard.remaining_budget), previous_decisions=previous)
                     report = build_evaluation_report(decision, [event_type])
-                    repo.create_supervisor_decision(run_id, {"input": {"goal": shadow_blackboard.goal, "compiled_workflow": shadow_blackboard.approved_plan}, "assessment": decision.assessment, "proposed_commands": [c.model_dump(mode="json") for c in decision.proposed_commands], "next_wake_condition": decision.next_wake_condition.model_dump(mode="json"), "rationale_summary": decision.rationale_summary, "evaluation_report": report.model_dump(mode="json")})
+                repo.create_supervisor_decision(run_id, {"input": {"goal": shadow_blackboard.goal, "compiled_workflow": shadow_blackboard.approved_plan}, "assessment": decision.assessment, "proposed_commands": [c.model_dump(mode="json") for c in decision.proposed_commands], "next_wake_condition": decision.next_wake_condition.model_dump(mode="json"), "rationale_summary": decision.rationale_summary, "evaluation_report": report.model_dump(mode="json")})
             except Exception as exc:
                 sink.emit(RunEventRecord(run_id=run_id, type="agent_failed", message="Supervisor shadow observation failed without altering execution", payload={"code": "SUPERVISOR_SHADOW_FAILED", "message": str(exc)}))
 
@@ -101,12 +101,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 repo.mark_run_complete(run_id, result, worker_id=worker_id)
                 return 0
         if hasattr(repo, "transition_run"):
-            repo.transition_run(run_id, "running", expected_worker_id=worker_id, started_at=run.get("started_at") or datetime.now(UTC).isoformat())
+                repo.transition_run(run_id, "running", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), lease_token=run.get("lease_token"), started_at=run.get("started_at") or datetime.now(UTC).isoformat())
         if hasattr(repo, "heartbeat"):
-            repo.heartbeat(run_id, worker_id, lease_seconds=lease_seconds)
+            repo.heartbeat(run_id, worker_id, lease_seconds=lease_seconds, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
         def save_checkpoint(_phase, checkpoint):
             if hasattr(repo, "save_checkpoint"):
-                checkpoint = {**checkpoint, "run_id": str(run_id), "attempt": run.get("attempt", 1)}
+                checkpoint = {**checkpoint, "run_id": str(run_id), "worker_id": worker_id, "attempt": run.get("attempt", 1), "lease_token": run.get("lease_token")}
                 repo.save_checkpoint(checkpoint)
                 shadow_observe("checkpoint_saved", checkpoint)
         def is_cancelled():
@@ -181,6 +181,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             daily_project_cost_provider=(lambda: repo.sum_daily_ledger_cost(project_id=str(ledger_project_id))) if hasattr(repo, "sum_daily_ledger_cost") and ledger_project_id else None,
             daily_user_reserver=(lambda amount, call_seq: repo.reserve_model_call_budget(run_id, call_seq, run.get("requested_by"), str(ledger_project_id) if ledger_project_id else None, amount, budget_config.daily_user_budget, budget_config.daily_project_budget)) if hasattr(repo, "reserve_model_call_budget") and (run.get("requested_by") or ledger_project_id) and (budget_config.daily_user_budget or budget_config.daily_project_budget) else None,
             daily_project_reserver=None,
+            daily_settler=(lambda reservation, actual_cost, status, reason: repo.settle_model_call_budget(reservation.id if isinstance(reservation, ModelCallReservation) else str(reservation), actual_cost, status, reason)) if hasattr(repo, "settle_model_call_budget") else None,
         )
 
         def forward_event(t, p):
@@ -216,25 +217,25 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             sink.emit(RunEventRecord(run_id=run_id, type="run_cancelled", message="Run cancelled", payload={}))
             shadow_observe("run_cancelled", {})
             if hasattr(repo, "transition_run"):
-                repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, finished_at=datetime.now(UTC).isoformat())
+                repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), lease_token=run.get("lease_token"), finished_at=datetime.now(UTC).isoformat())
             return 0
         except BudgetExceeded as exc:
             if hasattr(repo, "transition_run"):
-                repo.transition_run(run_id, exc.terminal_status, expected_worker_id=worker_id, error={"code": exc.code, "message": exc.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+                repo.transition_run(run_id, exc.terminal_status, expected_worker_id=worker_id, expected_attempt=run.get("attempt"), lease_token=run.get("lease_token"), error={"code": exc.code, "message": exc.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
             return 1
         if tracker.stop is not None:
             # The engine absorbed per-agent failures, but a hard limit tripped:
             # never report success and record the terminal budget status.
             stop = tracker.stop
             if hasattr(repo, "transition_run"):
-                repo.transition_run(run_id, stop.terminal_status, expected_worker_id=worker_id, error={"code": stop.code, "message": stop.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+                repo.transition_run(run_id, stop.terminal_status, expected_worker_id=worker_id, expected_attempt=run.get("attempt"), lease_token=run.get("lease_token"), error={"code": stop.code, "message": stop.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
             return 1
         if result.get("status") in {"complete", "partial_success", "success"} or (result.get("status") != "failed" and result.get("result")):
             status = "partial_success" if result.get("status") == "partial_success" else "completed"
             sink.emit(RunEventRecord(run_id=run_id, type="run_partial_success" if status == "partial_success" else "run_completed", message=f"Run {status}", payload={"status": result.get("status")}))
             shadow_observe("run_partial_success" if status == "partial_success" else "run_completed", {"status": result.get("status")})
             if hasattr(repo, "transition_run") and status == "partial_success":
-                repo.transition_run(run_id, "partial_success", expected_worker_id=worker_id, output=result, error=None, finished_at=datetime.now(UTC).isoformat())
+                repo.transition_run(run_id, "partial_success", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), lease_token=run.get("lease_token"), output=result, error=None, finished_at=datetime.now(UTC).isoformat())
             else:
                 repo.mark_run_complete(run_id, result, worker_id=worker_id)
             return 0

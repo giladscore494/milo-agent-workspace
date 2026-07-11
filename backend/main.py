@@ -102,6 +102,7 @@ def _safe_run_response(run: dict) -> dict:
     safe["launch_error_class"] = SAFE_LAUNCH_ERROR_CLASSES.get(launch_state)
     safe["launch_reconciliation_required"] = launch_state == "launch_unknown"
     safe.pop("launch_error", None)
+    safe.pop("lease_token", None)
     return safe
 
 

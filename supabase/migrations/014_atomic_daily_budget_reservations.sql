@@ -46,6 +46,7 @@ begin
 end;
 $$;
 
+
 create or replace function public.reserve_daily_project_budget(
   p_run_id uuid,
   p_project_id uuid,
@@ -84,3 +85,24 @@ begin
   return v_row;
 end;
 $$;
+
+
+comment on function public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text)
+  is 'Deprecated: production workers use reserve_model_call_budget from migration 015 for canonical user/project atomic reservations.';
+comment on function public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text)
+  is 'Deprecated: production workers use reserve_model_call_budget from migration 015 for canonical user/project atomic reservations.';
+
+revoke execute on function public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text) from public;
+revoke execute on function public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text) from public;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    revoke execute on function public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text) from authenticated;
+    revoke execute on function public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text) from authenticated;
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    revoke execute on function public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text) from service_role;
+    revoke execute on function public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text) from service_role;
+  end if;
+end $$;

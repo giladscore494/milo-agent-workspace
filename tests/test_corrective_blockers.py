@@ -23,8 +23,11 @@ class CompleteEngine:
 def test_cancelled_before_start_emits_no_run_started_or_engine_call(monkeypatch):
     monkeypatch.setenv("MILO_WORKER_HEARTBEAT_INTERVAL_SECONDS", "1")
     repo = MemoryRepository()
+    project_id = uuid4()
+    repo.seed_project(str(project_id), "cancel-fixture", "Cancel fixture", [])
+    conversation = repo.create_conversation(project_id, "Cancel fixture")
     run_id = uuid4()
-    conversation_id = uuid4()
+    conversation_id = conversation["id"]
     repo.runs[str(run_id)] = {"id": str(run_id), "conversation_id": str(conversation_id), "status": "cancellation_requested", "input": {"content": "x"}, "attempt": 1}
     engine = CompleteEngine()
     assert execute_run(run_id, repo, engine=engine) == 0
