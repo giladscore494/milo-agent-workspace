@@ -35,6 +35,7 @@ class Conversation(BaseModel):
 class RunCreate(BaseModel):
     content: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class Run(BaseModel):
@@ -139,6 +140,7 @@ class ProposalRunCreate(BaseModel):
     conversation_id: UUID
     content: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
 
 
 class ToolAccessRequestCreate(BaseModel):

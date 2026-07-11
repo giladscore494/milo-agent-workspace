@@ -4,6 +4,7 @@ from uuid import UUID
 from supabase import create_client
 from backend.config import Settings
 from backend.errors import AppError, NotFoundError
+from backend.runtime import RUN_STATES, InvalidTransition, validate_transition
 
 
 class Repository(Protocol):
@@ -12,7 +13,9 @@ class Repository(Protocol):
     def create_conversation(self, project_id: UUID, title: str | None, user_id: UUID | None = None) -> dict[str, Any]: ...
     def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
-    def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
+    def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]: ...
+    def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None: ...
+    def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]: ...
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
@@ -88,14 +91,52 @@ class SupabaseRepository:
         payload = {"conversation_id": str(conversation_id), "role": "user", "content": content, "metadata": metadata}
         return self._single(self.client.table("messages").insert(payload).select("*"), "message", "new")
 
-    def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]:
         # Production messages.id is bigint; run input stores its string form.
-        idempotency_key = metadata.get("idempotency_key") or metadata.get("proposal_id") or str(user_message_id)
-        payload = {"conversation_id": str(conversation_id), "status": "queued", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}, "idempotency_key": idempotency_key}
-        existing = self._many(self.client.table("runs").select("*").eq("conversation_id", str(conversation_id)).eq("idempotency_key", idempotency_key).in_("status", ["queued", "starting", "running", "waiting", "cancellation_requested"]).limit(1))
-        if existing:
-            return existing[0]
-        return self._single(self.client.table("runs").insert(payload).select("*"), "run", "new")
+        key = idempotency_key or metadata.get("idempotency_key") or metadata.get("proposal_id") or str(user_message_id)
+        payload = {
+            "conversation_id": str(conversation_id),
+            "status": "queued",
+            "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata},
+            "idempotency_key": key,
+            "launch_state": "pending",
+        }
+        if requested_by is not None:
+            payload["requested_by"] = str(requested_by)
+        if request_fingerprint is not None:
+            payload["request_fingerprint"] = request_fingerprint
+        if requested_by is not None and idempotency_key:
+            existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
+            if existing is not None:
+                return existing
+        try:
+            return self._single(self.client.table("runs").insert(payload).select("*"), "run", "new")
+        except AppError as exc:
+            # Unique (conversation, requested_by, idempotency_key) index may
+            # reject a concurrent duplicate; return the winner instead.
+            if requested_by is not None and idempotency_key and ("23505" in exc.message or "duplicate" in exc.message.lower()):
+                existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
+                if existing is not None:
+                    return existing
+            raise
+
+    def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None:
+        rows = self._many(
+            self.client.table("runs").select("*")
+            .eq("conversation_id", str(conversation_id))
+            .eq("requested_by", str(user_id))
+            .eq("idempotency_key", idempotency_key)
+            .limit(1)
+        )
+        return rows[0] if rows else None
+
+    def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"launch_state": state}
+        if state == "launched":
+            payload["launched_at"] = datetime.now(UTC).isoformat()
+        if error is not None:
+            payload["launch_error"] = error
+        return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
 
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
         query = self.client.table("runs").select("*").eq("id", str(run_id)).limit(1)
@@ -132,6 +173,15 @@ class SupabaseRepository:
         return rows[0] if rows else None
 
     def transition_run(self, run_id: UUID, status: str, **fields: Any) -> dict[str, Any]:
+        current = str(self.get_run(run_id).get("status", ""))
+        # Same-status updates (heartbeats, metadata refresh) are no-op
+        # transitions; unknown legacy statuses bypass validation so legacy
+        # production rows can still be repaired through the service path.
+        if status != current and current in RUN_STATES:
+            try:
+                validate_transition(current, status)
+            except InvalidTransition as exc:
+                raise AppError("INVALID_RUN_TRANSITION", str(exc), 409) from exc
         payload = {"status": status, **fields}
         return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
 
@@ -139,11 +189,14 @@ class SupabaseRepository:
         run = self.get_run(run_id)
         now = datetime.now(UTC)
         lease_expired = not run.get("lease_expires_at") or datetime.fromisoformat(str(run["lease_expires_at"]).replace("Z", "+00:00")) < now
-        if run["status"] not in {"queued", "waiting", "cancellation_requested"} and not lease_expired:
+        if run["status"] not in {"queued", "launching", "waiting", "cancellation_requested"} and not lease_expired:
             raise AppError("RUN_ALREADY_CLAIMED", "run is already claimed by another worker", 409)
         attempt = int(run.get("attempt") or 1) + (1 if lease_expired and run.get("worker_id") else 0)
         expires = (now + timedelta(seconds=lease_seconds)).isoformat()
-        return self.transition_run(run_id, "starting", worker_id=worker_id, lease_expires_at=expires, attempt=attempt, started_at=run.get("started_at") or now.isoformat())
+        # A cancellation requested before the claim must stay visible so the
+        # engine's cancellation checker aborts before doing any work.
+        target_status = run["status"] if run["status"] == "cancellation_requested" else "starting"
+        return self.transition_run(run_id, target_status, worker_id=worker_id, lease_expires_at=expires, attempt=attempt, started_at=run.get("started_at") or now.isoformat())
 
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
         run = self.get_run(run_id)
@@ -158,12 +211,10 @@ class SupabaseRepository:
         return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=datetime.now(UTC).isoformat(), cancellation_reason=reason)
 
     def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]:
-        payload = {"status": "failed", "error": {"code": code, "message": message}, "finished_at": datetime.now(UTC).isoformat()}
-        return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
+        return self.transition_run(run_id, "failed", error={"code": code, "message": message}, finished_at=datetime.now(UTC).isoformat())
 
     def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]:
-        payload = {"status": "completed", "output": output, "error": None, "finished_at": datetime.now(UTC).isoformat()}
-        return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
+        return self.transition_run(run_id, "completed", output=output, error=None, finished_at=datetime.now(UTC).isoformat())
 
     def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any], project_id: UUID | None = None, created_by: UUID | None = None) -> dict[str, Any]:
         payload = {"user_request": user_request, **proposal}

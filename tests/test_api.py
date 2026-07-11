@@ -54,10 +54,15 @@ class FakeRepo:
         self.get_conversation(conversation_id)
         self.created_messages += 1
         return {"id": self.message_id, "conversation_id": conversation_id, "role": "user", "content": content, "metadata": metadata}
-    def create_queued_run(self, conversation_id, user_message_id, content, metadata):
+    def create_queued_run(self, conversation_id, user_message_id, content, metadata, **kwargs):
         self.created_runs += 1
         self.queued_message_id = user_message_id
-        return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}}
+        return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued", "launch_state": "pending", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}, **{k: str(v) for k, v in kwargs.items() if v is not None}}
+    def find_run_by_idempotency(self, conversation_id, user_id, idempotency_key):
+        return None
+    def set_launch_state(self, run_id, state, error=None):
+        self.launch_states = getattr(self, "launch_states", []) + [state]
+        return {"id": run_id, "launch_state": state}
     def get_run(self, run_id, user_id=None):
         self._fail()
         if (user_id is not None and user_id != self.user_id) or UUID(str(run_id)) != self.run_id: raise NotFoundError("run", str(run_id))

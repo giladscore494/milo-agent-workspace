@@ -54,9 +54,9 @@ class ProposalRepo:
     def create_user_message(self, conversation_id, content, metadata):
         return {"id": self.message_id, "conversation_id": conversation_id, "role": "user", "content": content, "metadata": metadata}
 
-    def create_queued_run(self, conversation_id, user_message_id, content, metadata):
+    def create_queued_run(self, conversation_id, user_message_id, content, metadata, **kwargs):
         self.runs.append(metadata)
-        return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued"}
+        return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued", "launch_state": "pending"}
 
 
 @pytest.fixture

@@ -784,3 +784,69 @@ def test_008_authenticated_grants_are_least_privilege(ownership_db):
         "order by privilege_type"
     ).splitlines()
     assert grants == ["INSERT", "SELECT", "UPDATE"]
+
+
+# --- migration 009 (run idempotency + lifecycle) executable validation ---
+
+def test_009_adds_idempotency_and_launch_columns(db):
+    rows = db.psql(
+        "select column_name from information_schema.columns "
+        "where table_schema='public' and table_name='runs' and column_name in "
+        "('requested_by','request_fingerprint','launch_state','launched_at','launch_error') order by 1"
+    ).splitlines()
+    assert rows == ["launch_error", "launch_state", "launched_at", "request_fingerprint", "requested_by"]
+
+
+def test_009_legacy_runs_keep_default_launch_state_and_null_ownership(db):
+    assert db.psql(
+        "select count(*) from public.runs where id in "
+        "('22222222-2222-2222-2222-222222222222','33333333-3333-3333-3333-333333333333') "
+        "and launch_state = 'none' and requested_by is null and idempotency_key is null"
+    ) == "2"
+
+
+def test_009_expanded_status_values_are_accepted(db):
+    for status in ("launching", "timed_out", "budget_exhausted"):
+        run_id = db.psql(
+            f"insert into public.runs (conversation_id, status, input) values "
+            f"('11111111-1111-1111-1111-111111111111', '{status}', '{{}}'::jsonb) returning id"
+        )
+        assert run_id
+    with pytest.raises(AssertionError, match="runs_status_check"):
+        db.psql(
+            "insert into public.runs (conversation_id, status, input) values "
+            "('11111111-1111-1111-1111-111111111111', 'not_a_state', '{}'::jsonb)"
+        )
+
+
+def test_009_launch_state_check_rejects_unknown_values(db):
+    with pytest.raises(AssertionError, match="runs_launch_state_check"):
+        db.psql(
+            "insert into public.runs (conversation_id, status, input, launch_state) values "
+            "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb, 'bogus')"
+        )
+
+
+def test_009_idempotency_unique_index_blocks_duplicates_per_user(db):
+    _seed_membership_fixture(db)
+    db.psql(
+        f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
+        f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{MEMBER_USER}', 'idem-dup-1')"
+    )
+    with pytest.raises(AssertionError, match="runs_user_conversation_idempotency_uidx"):
+        db.psql(
+            f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
+            f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{MEMBER_USER}', 'idem-dup-1')"
+        )
+    # A different user may reuse the same key in the same conversation.
+    db.psql(
+        f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
+        f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{OUTSIDER_USER}', 'idem-dup-1')"
+    )
+
+
+def test_009_is_rerun_safe(db):
+    migration_009 = next(m for m in MIGRATIONS if m.name.startswith("009"))
+    before = db.psql("select count(*) from public.runs")
+    db.psql(file=migration_009)
+    assert db.psql("select count(*) from public.runs") == before

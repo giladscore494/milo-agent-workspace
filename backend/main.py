@@ -1,5 +1,7 @@
 """API package namespace."""
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -34,7 +36,7 @@ from backend.schemas import (
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
     WorkerRunCompleteRequest, WorkerRunEventCreate, WorkerRunFailRequest,
 )
-from backend.runtime import EVENT_TYPES
+from backend.runtime import EVENT_TYPES, TERMINAL_STATES
 from backend.worker_auth import WorkerIdentity, get_verified_worker
 from backend.workflow_proposals import compile_proposal, ensure_approved
 
@@ -64,20 +66,66 @@ def require_stage_enabled(flag: str, surface: str) -> None:
         raise AppError("EXECUTION_SURFACE_DISABLED", f"{surface} is disabled", 403)
 
 
-def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: AuthenticatedUser, conversation_id: UUID, content: str, metadata: dict) -> RunCreated:
+def _request_fingerprint(content: str, metadata: dict) -> str:
+    canonical = json.dumps({"content": content, "metadata": metadata}, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: AuthenticatedUser, conversation_id: UUID, content: str, metadata: dict, idempotency_key: str | None = None) -> RunCreated:
     """Create the user message + queued run and request a worker launch.
 
     Callers must have already authorized the authenticated user against the
     conversation's project membership; no mutation happens before that.
+
+    Idempotency: the key is scoped to (authenticated user, conversation).
+    A replay with the same key and payload returns the original run without
+    a second launch; the same key with a different payload is a 409. A run
+    whose previous launch attempt failed (launch_state == 'launch_failed'
+    while still queued) is safely relaunched instead of duplicated.
     """
-    metadata = {**metadata, "requested_by": str(user.user_id)}
-    message = repo.create_user_message(conversation_id, content, metadata)
-    run = repo.create_queued_run(conversation_id, message["id"], content, metadata)
-    launch = launcher.launch(UUID(str(run["id"])))
+    fingerprint = _request_fingerprint(content, metadata)
+    run = None
+    if idempotency_key and hasattr(repo, "find_run_by_idempotency"):
+        existing = repo.find_run_by_idempotency(conversation_id, user.user_id, idempotency_key)
+        if existing is not None:
+            if existing.get("request_fingerprint") not in (None, fingerprint):
+                raise AppError("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409)
+            if existing.get("status") != "queued" or existing.get("launch_state") != "launch_failed":
+                # Original run is authoritative: no new message, no new run,
+                # and never a second worker launch for the same request.
+                return RunCreated(run_id=existing["id"], status=existing["status"])
+            run = existing  # recoverable failed launch: retry launch only
+    if run is None:
+        metadata = {**metadata, "requested_by": str(user.user_id)}
+        if idempotency_key:
+            metadata["idempotency_key"] = idempotency_key
+        message = repo.create_user_message(conversation_id, content, metadata)
+        run = repo.create_queued_run(conversation_id, message["id"], content, metadata, requested_by=user.user_id, idempotency_key=idempotency_key, request_fingerprint=fingerprint)
+    run_id = UUID(str(run["id"]))
+    if run.get("status") not in (None, "queued"):
+        # Cancelled-before-launch or an already-progressed duplicate: never launch.
+        return RunCreated(run_id=run["id"], status=run["status"])
+    if run.get("launch_state") in {"launching", "launched"}:
+        # A concurrent request already owns the launch.
+        return RunCreated(run_id=run["id"], status=run["status"])
+    if hasattr(repo, "set_launch_state"):
+        repo.set_launch_state(run_id, "launching")
+    try:
+        launch = launcher.launch(run_id)
+    except Exception as exc:
+        # Leave a clear recoverable state: the run stays queued with
+        # launch_state=launch_failed and can be retried with the same key.
+        if hasattr(repo, "set_launch_state"):
+            repo.set_launch_state(run_id, "launch_failed", error={"message": str(exc)[:500]})
+        if hasattr(repo, "append_run_event"):
+            repo.append_run_event(run_id, "launch_failed", {"message": "Worker launch failed; run remains queued and the request can be retried", "payload": {"recoverable": True}})
+        raise AppError("JOB_LAUNCH_FAILED", "worker launch failed; the run remains queued and can be retried with the same idempotency key", 502) from exc
     if hasattr(repo, "record_run_invocation"):
-        repo.record_run_invocation(UUID(str(run["id"])), launch)
+        repo.record_run_invocation(run_id, launch)
+    if hasattr(repo, "set_launch_state"):
+        repo.set_launch_state(run_id, "launched")
     if hasattr(repo, "append_run_event"):
-        repo.append_run_event(UUID(str(run["id"])), "run_created", {"message": "Run queued and worker invocation requested", "payload": {"launcher": launch.get("mode"), "execution": launch.get("execution", "")}})
+        repo.append_run_event(run_id, "run_created", {"message": "Run queued and worker invocation requested", "payload": {"launcher": launch.get("mode"), "execution": launch.get("execution", "")}})
     return RunCreated(run_id=run["id"], status=run["status"])
 
 
@@ -111,7 +159,7 @@ def create_run(conversation_id: UUID, request: RunCreate, user: AuthenticatedUse
     require_stage_enabled("MILO_ENABLE_RUN_CREATION", "conversation run creation")
     # Membership authorization must precede every mutation and the launch.
     repo.get_conversation(conversation_id, user.user_id)
-    return _create_and_launch_run(repo, launcher, user, conversation_id, request.content, request.metadata)
+    return _create_and_launch_run(repo, launcher, user, conversation_id, request.content, request.metadata, request.idempotency_key)
 
 
 @app.get("/runs/{run_id}", response_model=Run)
@@ -128,7 +176,13 @@ def get_run_events(run_id: UUID, user: AuthenticatedUser = Depends(get_authentic
 def cancel_run(run_id: UUID, request: RunCancelRequest, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> RunCancelResponse:
     require_stage_enabled("MILO_ENABLE_RUN_CANCELLATION", "run cancellation")
     # Membership authorization before any mutation; 404 for non-members.
-    repo.get_run(run_id, user_id=user.user_id)
+    run = repo.get_run(run_id, user_id=user.user_id)
+    status = str(run.get("status", ""))
+    if status in {"cancellation_requested", "cancelled"}:
+        # Idempotent replay: no duplicate cancellation record or event.
+        return RunCancelResponse(run_id=run["id"], status=status)
+    if status in TERMINAL_STATES:
+        raise AppError("RUN_ALREADY_FINISHED", f"run is already {status} and cannot be cancelled", 409)
     run = repo.request_cancellation(run_id, request.reason)
     repo.append_run_event(run_id, "cancellation_requested", {"message": request.reason or "Cancellation requested", "payload": {"reason": request.reason, "requested_by": str(user.user_id)}})
     return RunCancelResponse(run_id=run["id"], status=run["status"])
@@ -191,7 +245,7 @@ def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, u
     ensure_approved(proposal)
     repo.get_conversation(request.conversation_id, user.user_id)
     metadata = {**request.metadata, "proposal_id": str(proposal_id)}
-    return _create_and_launch_run(repo, launcher, user, request.conversation_id, request.content, metadata)
+    return _create_and_launch_run(repo, launcher, user, request.conversation_id, request.content, metadata, request.idempotency_key)
 
 
 # --- Internal worker mutation surfaces -------------------------------------
