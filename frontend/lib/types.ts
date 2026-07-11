@@ -2,7 +2,8 @@ export type UUID = string;
 export type InternetPolicy = 'forbidden'|'allowed'|'required'|'conditional'|'requested'|'approved'|'denied'|'active';
 export type Project = { id: UUID; slug: string; name: string; description?: string; workflow_key: string };
 export type Conversation = { id: UUID; project_id: UUID; title?: string };
-export type Run = { id: UUID; conversation_id: UUID; status: string; started_at?: string; finished_at?: string; output?: Record<string, unknown>; error?: Record<string, unknown> };
+export type LaunchState = 'pending'|'launching'|'launched'|'launch_failed'|'launch_unknown';
+export type Run = { id: UUID; conversation_id: UUID; status: string; started_at?: string; finished_at?: string; output?: Record<string, unknown>; error?: Record<string, unknown>; launch_state?: LaunchState; launch_error_class?: string; launch_reconciliation_required?: boolean };
 // run_events.id is production bigint (not UUID); run_id remains UUID.
 export type RunEvent = { id: number; run_id: UUID; event_type: string; message?: string; payload?: any; agent?: string; phase?: string; progress?: Record<string, any>; created_at?: string };
 export type AgentState = { name: string; responsibility: string; status: string; progress: number; currentTask?: string; internet: InternetPolicy; internetReason?: string; domains?: string[]; quota?: string; searchesUsed: number; sources: SourceRecord[]; startedAt?: string; finishedAt?: string; tokens: number; cost: number; retries: number; fallbacks: string[] };

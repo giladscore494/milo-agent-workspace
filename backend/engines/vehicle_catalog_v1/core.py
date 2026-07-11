@@ -25,6 +25,12 @@ MAX_PARALLEL_KIMI_CALLS = 2
 KIMI_CONCURRENCY_SEMAPHORE = BoundedSemaphore(MAX_PARALLEL_KIMI_CALLS)
 MODEL_CLIENT_FACTORY = None
 SLEEP_FN = time.sleep
+# Optional orchestration callbacks installed by the worker adapter.  They are
+# deliberately no-ops by default so the extracted legacy engine can still run
+# standalone, but production workers use them as the central place to account
+# for real agent/model steps and retry/fallback attempts.
+AGENT_STEP_CALLBACK = None
+RETRY_CALLBACK = None
 API_CONCURRENCY_RETRY_DELAY_SECONDS = 2
 API_CONCURRENCY_MAX_RETRIES = 2
 MAX_DISCOVERY_TOKENS = 1800
@@ -905,6 +911,8 @@ def run_safe_agent(
 ) -> Dict[str, Any]:
     if not max_tokens:
         raise ValueError("run_safe_agent requires max_tokens")
+    if AGENT_STEP_CALLBACK is not None:
+        AGENT_STEP_CALLBACK(agent_name, phase_name)
 
     def attempt(messages: List[Dict[str, Any]], phase: str, token_limit: int) -> Dict[str, Any]:
         attempts = 0
@@ -914,6 +922,8 @@ def run_safe_agent(
             except Exception as exc:  # noqa: BLE001 - API errors must be classified for UI/tests.
                 if is_kimi_concurrency_error(exc):
                     if attempts < API_CONCURRENCY_MAX_RETRIES:
+                        if RETRY_CALLBACK is not None:
+                            RETRY_CALLBACK(agent_name, phase, "provider_concurrency_retry")
                         attempts += 1
                         SLEEP_FN(API_CONCURRENCY_RETRY_DELAY_SECONDS)
                         continue
@@ -927,6 +937,10 @@ def run_safe_agent(
         return safe_agent_result(agent_name, phase_name, raw, api_retry_count=raw.get("api_retry_count", API_CONCURRENCY_MAX_RETRIES), allow_partial=allow_partial)
     checked = validate_model_response(raw, require_json=response_format is not None, validator=validator, required_keys=required_top_keys, non_empty_lists=non_empty_lists)
     if checked.get("_error") in RETRYABLE_ERRORS and fallback_prompt is not None:
+        if RETRY_CALLBACK is not None:
+            RETRY_CALLBACK(agent_name, phase_name, checked.get("_error") or "fallback_retry")
+        if AGENT_STEP_CALLBACK is not None:
+            AGENT_STEP_CALLBACK(agent_name, f"{phase_name}_fallback")
         fallback_raw = attempt(fallback_prompt, f"{phase_name}_fallback", fallback_max_tokens or max_tokens)
         if fallback_raw.get("_error") == "API_CONCURRENCY_LIMIT":
             return safe_agent_result(agent_name, phase_name, fallback_raw, api_retry_count=fallback_raw.get("api_retry_count", API_CONCURRENCY_MAX_RETRIES), allow_partial=allow_partial)

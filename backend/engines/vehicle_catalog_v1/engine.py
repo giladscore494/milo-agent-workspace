@@ -29,10 +29,14 @@ class VehicleCatalogEngine:
     event_sink: EventSink | None = None
     checkpoint_sink: CheckpointSink | None = None
     cancellation_checker: CancellationChecker | None = None
+    agent_step_callback: Callable[[str, str], None] | None = None
+    retry_callback: Callable[[str, str, str], None] | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     _previous_client_factory: Any = field(default=None, init=False)
     _previous_sleep_fn: Any = field(default=None, init=False)
+    _previous_agent_step_callback: Any = field(default=None, init=False)
+    _previous_retry_callback: Any = field(default=None, init=False)
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.event_sink:
@@ -64,14 +68,20 @@ class VehicleCatalogEngine:
     def _install_injections(self) -> None:
         self._previous_client_factory = core.MODEL_CLIENT_FACTORY
         self._previous_sleep_fn = core.SLEEP_FN
+        self._previous_agent_step_callback = core.AGENT_STEP_CALLBACK
+        self._previous_retry_callback = core.RETRY_CALLBACK
         if self.model_client_factory is not None:
             core.MODEL_CLIENT_FACTORY = self.model_client_factory
         if self.sleep_fn is not None:
             core.SLEEP_FN = self.sleep_fn
+        core.AGENT_STEP_CALLBACK = self.agent_step_callback
+        core.RETRY_CALLBACK = self.retry_callback
 
     def _restore_injections(self) -> None:
         core.MODEL_CLIENT_FACTORY = self._previous_client_factory
         core.SLEEP_FN = self._previous_sleep_fn
+        core.AGENT_STEP_CALLBACK = self._previous_agent_step_callback
+        core.RETRY_CALLBACK = self._previous_retry_callback
 
     def run(self, config: VehicleCatalogRunConfig) -> dict[str, Any]:
         start = time.perf_counter()

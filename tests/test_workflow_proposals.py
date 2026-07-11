@@ -112,7 +112,7 @@ def test_proposal_mutations_and_run_start_disabled_by_default(repo):
     approved = client.post(f"/workflow-proposals/{proposal_id}/approve", json={})
     revised = client.post(f"/workflow-proposals/{proposal_id}/revise", json={"user_request": "Create a current cited report about freight brokers"})
     project = client.post(f"/workflow-proposals/{proposal_id}/project", json={"slug": "x", "name": "X"})
-    run = client.post(f"/workflow-proposals/{proposal_id}/runs", json={"conversation_id": str(repo.conversation_id), "content": "start"})
+    run = client.post(f"/workflow-proposals/{proposal_id}/runs", json={"conversation_id": str(repo.conversation_id), "content": "start", "idempotency_key": "proposal-disabled-0001"})
 
     assert created.status_code == 403
     assert approved.status_code == 403
