@@ -108,6 +108,11 @@ async function proxyRequest(
 
     const headers = new Headers({
       authorization: `Bearer ${idToken}`,
+      // The backend verifies this Google-signed token (signature, issuer,
+      // audience, expiry, allowlisted gateway identity) before trusting
+      // any x-milo-auth-* header. Browser-supplied values of these headers
+      // never reach upstream: this Headers object is built from scratch.
+      'x-milo-gateway-token': idToken,
       accept: request.headers.get('accept') ?? 'application/json',
     });
 

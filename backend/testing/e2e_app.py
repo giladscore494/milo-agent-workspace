@@ -26,6 +26,7 @@ from uuid import UUID
 
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker
 from backend.dependencies import get_job_launcher, get_repository
+from backend.gateway_auth import get_gateway_token_verifier
 from backend.main import app
 from backend.testing.memory_repository import MemoryRepository
 from backend.worker_auth import get_token_verifier
@@ -38,6 +39,7 @@ PROJECT_BETA = "bbbbbbbb-1111-4111-8111-000000000002"
 
 APPROVED_WORKER_SA = "e2e-worker@example-project.iam.gserviceaccount.com"
 UNAPPROVED_WORKER_SA = "e2e-intruder@example-project.iam.gserviceaccount.com"
+APPROVED_GATEWAY_SA = "e2e-gateway@example-project.iam.gserviceaccount.com"
 
 
 def build_repository() -> MemoryRepository:
@@ -50,7 +52,12 @@ def build_repository() -> MemoryRepository:
 
 
 class E2ETokenVerifier:
-    """Deterministic stand-in for Google ID token verification."""
+    """Deterministic stand-in for Google ID token verification.
+
+    Serves both boundaries; separation is still enforced by the production
+    allowlist checks (a worker token on a browser route fails the gateway
+    allowlist and vice versa).
+    """
 
     def verify(self, token: str, audience: str) -> dict[str, Any]:
         claims = {
@@ -63,6 +70,8 @@ class E2ETokenVerifier:
             return {**claims, "email": APPROVED_WORKER_SA}
         if token == "e2e-unapproved-worker-token":
             return {**claims, "email": UNAPPROVED_WORKER_SA}
+        if token == "e2e-local-gateway-token":
+            return {**claims, "email": APPROVED_GATEWAY_SA}
         raise ValueError("Could not verify token signature")
 
 
@@ -147,6 +156,7 @@ class InProcessFakeWorkerLauncher:
 _repo = build_repository()
 app.dependency_overrides[get_repository] = lambda: _repo
 app.dependency_overrides[get_token_verifier] = lambda: E2ETokenVerifier()
+app.dependency_overrides[get_gateway_token_verifier] = lambda: E2ETokenVerifier()
 if os.getenv("MILO_E2E_INPROCESS_WORKER", "").lower() == "true":
     _launcher = InProcessFakeWorkerLauncher(_repo)
     app.dependency_overrides[get_job_launcher] = lambda: _launcher

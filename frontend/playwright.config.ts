@@ -34,6 +34,11 @@ const backendEnv = {
   SUPABASE_URL: 'https://example.supabase.co',
   SUPABASE_SERVICE_ROLE_KEY: 'e2e-offline-placeholder',
   JOB_LAUNCHER: 'disabled',
+  // Gateway identity verification is ON in both stacks: the Next.js
+  // gateway presents its (mock-verified) service token, and identity
+  // headers are never trusted bare.
+  MILO_GATEWAY_AUDIENCE: 'http://e2e-milo-api.internal',
+  MILO_APPROVED_GATEWAY_IDENTITIES: 'e2e-gateway@example-project.iam.gserviceaccount.com',
 };
 
 export default defineConfig({
