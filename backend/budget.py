@@ -303,7 +303,7 @@ class BudgetTracker:
                 "reserved",
                 reserved_input_tokens=estimated_input_tokens,
                 reserved_output_tokens=(allowed_output or 0) if requested_max_tokens is not None else 0,
-                estimated_cost=round(self.estimated_cost, 6),
+                estimated_cost=round(cfg.estimated_cost_per_call, 6),
             )
             return allowed_output
 
@@ -327,7 +327,6 @@ class BudgetTracker:
                 actual_input_tokens=int(input_tokens or 0),
                 actual_output_tokens=int(output_tokens or 0),
                 actual_cost=float(cost) if cost else None,
-                estimated_cost=round(self.estimated_cost, 6),
             )
             if self.usage_recorder:
                 self.usage_recorder(self.snapshot())

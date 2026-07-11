@@ -486,3 +486,16 @@ def test_worker_refuses_paid_execution_without_provider_key(monkeypatch):
     repo = MiniRepo()
     assert execute_run(uuid4(), repo) == 1
     assert repo.failed == ["PROVIDER_KEY_MISSING"]
+
+
+def test_daily_ledger_cost_prefers_settled_actuals(monkeypatch):
+    from backend.testing.memory_repository import MemoryRepository
+
+    repo = MemoryRepository()
+    run_id = "11111111-2222-4333-8444-555555555555"
+    user = "aaaaaaaa-1111-4111-8111-000000000001"
+    repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 1, "decision": "reserved", "estimated_cost": 0.05})
+    repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 1, "decision": "settled", "actual_cost": 0.02})
+    repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 2, "decision": "reserved", "estimated_cost": 0.05})
+    assert repo.sum_daily_ledger_cost(user_id=user) == pytest.approx(0.07)
+    assert repo.sum_daily_ledger_cost(user_id="someone-else") == 0.0

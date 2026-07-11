@@ -201,6 +201,37 @@ class SupabaseRepository:
     def update_run_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]:
         return self._single(self.client.table("runs").update({"usage": usage}).eq("id", str(run_id)).select("*"), "run", str(run_id))
 
+    LEDGER_FIELDS = (
+        "run_id", "project_id", "user_id", "provider", "model", "call_seq", "decision",
+        "rejection_reason", "reserved_input_tokens", "reserved_output_tokens",
+        "actual_input_tokens", "actual_output_tokens", "estimated_cost", "actual_cost",
+    )
+
+    def append_usage_ledger(self, entry: dict[str, Any]) -> dict[str, Any]:
+        payload = {key: entry[key] for key in self.LEDGER_FIELDS if entry.get(key) is not None}
+        return self._single(self.client.table("run_usage_ledger").insert(payload).select("*"), "run_usage_ledger", "new")
+
+    def sum_daily_ledger_cost(self, user_id: str | None = None, project_id: str | None = None, run_id: str | None = None, hours: int = 24) -> float:
+        """Conservative daily spend: per call, the settled actual cost when
+        recorded, otherwise the reserved estimate."""
+        since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+        query = self.client.table("run_usage_ledger").select("run_id, call_seq, decision, estimated_cost, actual_cost").gte("created_at", since).limit(2000)
+        if user_id:
+            query = query.eq("user_id", str(user_id))
+        if project_id:
+            query = query.eq("project_id", str(project_id))
+        if run_id:
+            query = query.eq("run_id", str(run_id))
+        rows = self._many(query)
+        per_call: dict[tuple, float] = {}
+        for row in rows:
+            key = (str(row.get("run_id")), row.get("call_seq"))
+            if row.get("decision") == "settled" and row.get("actual_cost") is not None:
+                per_call[key] = float(row["actual_cost"])
+            elif row.get("decision") == "reserved":
+                per_call.setdefault(key, float(row.get("estimated_cost") or 0.0))
+        return round(sum(per_call.values()), 6)
+
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
         query = self.client.table("runs").select("*").eq("id", str(run_id)).limit(1)
         if user_id is not None:

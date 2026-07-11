@@ -217,6 +217,30 @@ class MemoryRepository:
         run["usage"] = usage
         return dict(run)
 
+    def append_usage_ledger(self, entry: dict[str, Any]) -> dict[str, Any]:
+        row = {"id": len(getattr(self, "usage_ledger", [])) + 1, "created_at": _now(), **entry}
+        if not hasattr(self, "usage_ledger"):
+            self.usage_ledger = []
+        self.usage_ledger.append(row)
+        return dict(row)
+
+    def sum_daily_ledger_cost(self, user_id: str | None = None, project_id: str | None = None, run_id: str | None = None, hours: int = 24) -> float:
+        rows = getattr(self, "usage_ledger", [])
+        per_call: dict[tuple, float] = {}
+        for row in rows:
+            if user_id and str(row.get("user_id")) != str(user_id):
+                continue
+            if project_id and str(row.get("project_id")) != str(project_id):
+                continue
+            if run_id and str(row.get("run_id")) != str(run_id):
+                continue
+            key = (str(row.get("run_id")), row.get("call_seq"))
+            if row.get("decision") == "settled" and row.get("actual_cost") is not None:
+                per_call[key] = float(row["actual_cost"])
+            elif row.get("decision") == "reserved":
+                per_call.setdefault(key, float(row.get("estimated_cost") or 0.0))
+        return round(sum(per_call.values()), 6)
+
     def count_active_runs_for_user(self, user_id: UUID) -> int:
         active = {"queued", "launching", "starting", "running", "waiting", "cancellation_requested"}
         return sum(1 for run in self.runs.values() if run.get("requested_by") == str(user_id) and run["status"] in active)

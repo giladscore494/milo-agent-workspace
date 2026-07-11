@@ -102,10 +102,18 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         current = repo.get_run(run_id)
         return not current.get("worker_id") or current.get("worker_id") == worker_id
 
+    ledger_project_id = None
+    try:
+        if run.get("conversation_id"):
+            ledger_project_id = repo.get_conversation(run["conversation_id"]).get("project_id")
+    except Exception:
+        ledger_project_id = None
+
     def record_ledger(entry):
         if hasattr(repo, "append_usage_ledger"):
             repo.append_usage_ledger({
                 "run_id": str(run_id),
+                "project_id": str(ledger_project_id) if ledger_project_id else None,
                 "user_id": run.get("requested_by"),
                 "provider": "moonshot",
                 "model": "kimi",
@@ -120,7 +128,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         ledger_recorder=record_ledger,
         lease_checker=holds_lease,
         daily_user_cost_provider=(lambda: repo.sum_daily_ledger_cost(user_id=run.get("requested_by"))) if hasattr(repo, "sum_daily_ledger_cost") and run.get("requested_by") else None,
-        daily_project_cost_provider=(lambda: repo.sum_daily_ledger_cost(run_id=str(run_id))) if hasattr(repo, "sum_daily_ledger_cost") else None,
+        daily_project_cost_provider=(lambda: repo.sum_daily_ledger_cost(project_id=str(ledger_project_id))) if hasattr(repo, "sum_daily_ledger_cost") and ledger_project_id else None,
     )
 
     def forward_event(t, p):

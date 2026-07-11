@@ -1160,3 +1160,82 @@ def test_012_authenticated_cannot_execute_run_functions(ownership_db):
     _seed_atomic_fixture(ownership_db)
     with pytest.raises(AssertionError, match="permission denied"):
         _as_authenticated(ownership_db, PROPOSAL_MEMBER_USER, _create_run_sql("sneaky-key"))
+
+
+# --- migration 013 (append-only usage ledger) executable validation ---
+
+def test_013_ledger_table_shape_and_decimal_costs(db):
+    assert db.psql(
+        "select data_type, numeric_precision, numeric_scale from information_schema.columns "
+        "where table_schema='public' and table_name='run_usage_ledger' and column_name='estimated_cost'"
+    ) == "numeric|12|6"
+    assert db.psql(
+        "select data_type from information_schema.columns "
+        "where table_schema='public' and table_name='run_usage_ledger' and column_name='actual_cost'"
+    ) == "numeric"
+
+
+def test_013_ledger_appends_and_is_append_only(db):
+    run_id = db.psql(
+        "insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+    )
+    entry_id = db.psql(
+        f"insert into public.run_usage_ledger (run_id, provider, model, call_seq, decision, reserved_input_tokens, reserved_output_tokens, estimated_cost) "
+        f"values ('{run_id}', 'moonshot', 'kimi', 1, 'reserved', 120, 500, 0.050000) returning id"
+    )
+    assert entry_id
+    with pytest.raises(AssertionError, match="append-only"):
+        db.psql(f"update public.run_usage_ledger set actual_cost = 0 where id = {entry_id}")
+    with pytest.raises(AssertionError, match="append-only"):
+        db.psql(f"delete from public.run_usage_ledger where id = {entry_id}")
+
+
+def test_013_ledger_rejects_unknown_decision(db):
+    run_id = db.psql(
+        "insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+    )
+    with pytest.raises(AssertionError, match="decision"):
+        db.psql(
+            f"insert into public.run_usage_ledger (run_id, decision) values ('{run_id}', 'bogus')"
+        )
+
+
+def test_013_ledger_denies_authenticated_access(db):
+    assert db.psql(
+        "select count(*) from information_schema.role_table_grants "
+        "where grantee='authenticated' and table_name='run_usage_ledger'"
+    ) == "0"
+
+
+def test_013_daily_cost_query_uses_settled_actuals_over_reserved_estimates(db):
+    user = "aaaaaaaa-0000-4000-8000-000000000031"
+    db.psql(f"insert into auth.users (id) values ('{user}') on conflict do nothing")
+    run_id = db.psql(
+        "insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+    )
+    db.psql(
+        f"insert into public.run_usage_ledger (run_id, user_id, call_seq, decision, estimated_cost) values "
+        f"('{run_id}', '{user}', 1, 'reserved', 0.05), ('{run_id}', '{user}', 2, 'reserved', 0.05)"
+    )
+    db.psql(
+        f"insert into public.run_usage_ledger (run_id, user_id, call_seq, decision, actual_cost) values "
+        f"('{run_id}', '{user}', 1, 'settled', 0.02)"
+    )
+    # call 1 settled at 0.02; call 2 still reserved at 0.05 => 0.07
+    total = db.psql(
+        "select round(sum(cost), 6) from ("
+        "  select distinct on (run_id, call_seq) coalesce(actual_cost, estimated_cost) as cost "
+        f"  from public.run_usage_ledger where user_id='{user}' and created_at > now() - interval '24 hours' "
+        "  order by run_id, call_seq, (decision='settled') desc, id desc"
+        ") settled_first"
+    )
+    assert total == "0.070000"
+
+
+def test_013_is_rerun_safe(db):
+    migration_013 = next(m for m in MIGRATIONS if m.name.startswith("013"))
+    db.psql(file=migration_013)
+    assert db.psql("select count(*) from pg_trigger where tgname='run_usage_ledger_append_only'") == "1"
