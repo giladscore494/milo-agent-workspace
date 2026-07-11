@@ -783,7 +783,16 @@ def test_008_authenticated_grants_are_least_privilege(ownership_db):
         "where grantee='authenticated' and table_schema='public' and table_name='workflow_proposals' "
         "order by privilege_type"
     ).splitlines()
-    assert grants == ["INSERT", "SELECT", "UPDATE"]
+    # UPDATE is column-scoped only (no table-level update grant).
+    assert grants == ["INSERT", "SELECT"]
+    update_columns = ownership_db.psql(
+        "select column_name from information_schema.column_privileges "
+        "where grantee='authenticated' and table_schema='public' and table_name='workflow_proposals' "
+        "and privilege_type='UPDATE' order by column_name"
+    ).splitlines()
+    assert "created_by" not in update_columns
+    assert "project_id" not in update_columns
+    assert "user_request" in update_columns
 
 
 # --- migration 009 (run idempotency + lifecycle) executable validation ---
@@ -868,3 +877,69 @@ def test_010_is_rerun_safe(db):
     migration_010 = next(m for m in MIGRATIONS if m.name.startswith("010"))
     db.psql(file=migration_010)
     assert db.psql("select count(*) from public.runs where usage is null") == "0"
+
+
+# --- migration 011 (protected ownership + atomic project creation) ---
+
+def test_011_authenticated_cannot_update_ownership_columns(ownership_db):
+    with pytest.raises(AssertionError, match="permission denied"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_MEMBER_USER,
+            f"update public.workflow_proposals set created_by='{PROPOSAL_OUTSIDER_USER}' where id='{OWNED_PROPOSAL}'"
+        )
+    with pytest.raises(AssertionError, match="permission denied"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_MEMBER_USER,
+            f"update public.workflow_proposals set project_id=null where id='{OWNED_PROPOSAL}'"
+        )
+    # Non-ownership columns stay updatable for members.
+    _as_authenticated(
+        ownership_db, PROPOSAL_MEMBER_USER,
+        f"update public.workflow_proposals set user_request='member edit ok' where id='{OWNED_PROPOSAL}'"
+    )
+    assert ownership_db.psql(
+        f"select created_by::text, user_request from public.workflow_proposals where id='{OWNED_PROPOSAL}'"
+    ) == f"{PROPOSAL_MEMBER_USER}|member edit ok"
+
+
+def test_011_project_creation_with_owner_is_atomic(ownership_db):
+    before = ownership_db.psql("select count(*) from public.projects")
+    row = ownership_db.psql(
+        "select id from public.create_project_from_proposal_with_owner("
+        f"'{OWNED_PROPOSAL}', 'atomic-proj', 'Atomic Proj', null, '{{}}'::jsonb, '{PROPOSAL_MEMBER_USER}')"
+    )
+    assert row
+    assert int(ownership_db.psql("select count(*) from public.projects")) == int(before) + 1
+    assert ownership_db.psql(
+        f"select role from public.project_members pm join public.projects p on p.id = pm.project_id "
+        f"where p.slug='atomic-proj' and pm.user_id='{PROPOSAL_MEMBER_USER}'"
+    ) == "owner"
+
+
+def test_011_no_orphan_project_when_membership_insert_fails(ownership_db):
+    before = ownership_db.psql("select count(*) from public.projects")
+    with pytest.raises(AssertionError, match="foreign key|violates"):
+        ownership_db.psql(
+            "select public.create_project_from_proposal_with_owner("
+            f"'{OWNED_PROPOSAL}', 'orphan-proj', 'Orphan Proj', null, '{{}}'::jsonb, "
+            "'99999999-9999-4999-8999-999999999999')"  # not a real auth.users id
+        )
+    assert ownership_db.psql("select count(*) from public.projects") == before
+    assert ownership_db.psql("select count(*) from public.projects where slug='orphan-proj'") == "0"
+
+
+def test_011_authenticated_cannot_execute_project_creation_function(ownership_db):
+    with pytest.raises(AssertionError, match="permission denied"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_MEMBER_USER,
+            "select public.create_project_from_proposal_with_owner("
+            f"'{OWNED_PROPOSAL}', 'sneaky-proj', 'Sneaky', null, '{{}}'::jsonb, '{PROPOSAL_MEMBER_USER}')"
+        )
+
+
+def test_011_is_rerun_safe(ownership_db):
+    migration_011 = next(m for m in MIGRATIONS if m.name.startswith("011"))
+    ownership_db.psql(file=migration_011)
+    assert ownership_db.psql(
+        "select count(*) from pg_proc where proname='create_project_from_proposal_with_owner'"
+    ) == "1"

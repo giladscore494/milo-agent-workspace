@@ -30,6 +30,9 @@ def test_proposal_ownership_migration_documents_operator_backfill_with_real_ids(
 
 def test_proposal_ownership_migration_enables_rls_and_least_privilege():
     assert "alter table public.workflow_proposals enable row level security" in MIGRATION
-    assert "grant select, insert, update on public.workflow_proposals to authenticated" in MIGRATION
+    assert "grant select, insert on public.workflow_proposals to authenticated" in MIGRATION
+    # UPDATE is column-scoped and must never include the ownership fields.
+    assert "grant update (status, user_request" in MIGRATION
+    assert "grant update (created_by" not in MIGRATION
     assert "delete on public.workflow_proposals" not in MIGRATION
     assert "created_by = auth.uid()" in MIGRATION

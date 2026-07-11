@@ -84,5 +84,10 @@ begin
 end $$;
 
 -- Least-privilege grants for the browser-facing authenticated role; RLS
--- policies above still constrain every row. No delete grant is issued.
-grant select, insert, update on public.workflow_proposals to authenticated;
+-- policies above still constrain every row. No delete grant is issued, and
+-- the UPDATE grant is column-scoped so ownership fields (created_by,
+-- project_id) can never be modified by browser identities.
+grant select, insert on public.workflow_proposals to authenticated;
+grant update (status, user_request, task_spec, draft, critiques, estimates,
+              repair_count, approved_at, rejected_at, updated_at)
+  on public.workflow_proposals to authenticated;

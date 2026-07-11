@@ -262,13 +262,24 @@ class SupabaseRepository:
         return self._single(self.client.table("workflow_proposals").update(fields).eq("id", str(proposal_id)).select("*"), "workflow_proposal", str(proposal_id))
 
     def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any], created_by: UUID | None = None) -> dict[str, Any]:
-        payload = {"slug": slug, "name": name, "description": description, "workflow_key": "chat_architect_v1", "configuration": {**configuration, "proposal_id": str(proposal_id)}}
-        project = self._single(self.client.table("projects").insert(payload).select("*"), "project", "new")
-        if created_by is not None:
-            # The authenticated creator becomes the initial owner so the new
-            # project is reachable through membership-scoped reads.
-            self._single(self.client.table("project_members").upsert({"project_id": str(project["id"]), "user_id": str(created_by), "role": "owner"}, on_conflict="project_id,user_id").select("*"), "project_member", str(created_by))
-        return project
+        # Atomic: the project row and the initial owner membership commit in
+        # one transaction (migration 011); no orphan project can remain if
+        # the membership insert fails.
+        try:
+            response = self.client.rpc("create_project_from_proposal_with_owner", {
+                "p_proposal_id": str(proposal_id),
+                "p_slug": slug,
+                "p_name": name,
+                "p_description": description,
+                "p_configuration": configuration,
+                "p_owner": str(created_by) if created_by is not None else None,
+            }).execute()
+        except Exception as exc:  # Supabase boundary only
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        data = response.data
+        if not data:
+            raise AppError("REPOSITORY_ERROR", "project creation returned no row", 502)
+        return data[0] if isinstance(data, list) else data
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any]) -> dict[str, Any]:
         payload = {"run_id": str(run_id), **blackboard, "updated_at": datetime.now(UTC).isoformat()}
