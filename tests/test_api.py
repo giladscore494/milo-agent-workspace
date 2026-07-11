@@ -67,8 +67,10 @@ class FakeRepo:
         self._fail()
         if (user_id is not None and user_id != self.user_id) or UUID(str(run_id)) != self.run_id: raise NotFoundError("run", str(run_id))
         return {"id": run_id, "conversation_id": self.conversation_id, "status": "queued"}
-    def list_run_events(self, run_id, user_id=None):
+    def list_run_events(self, run_id, user_id=None, after_event_id=None):
         self.get_run(run_id, user_id); return []
+    def list_conversations(self, project_id):
+        return [{"id": self.conversation_id, "project_id": self.project_id, "title": "t"}]
     def request_cancellation(self, run_id, reason=None):
         self.cancelled_runs += 1; return {"id": run_id, "status": "cancellation_requested"}
     def append_run_event(self, *args, **kwargs):

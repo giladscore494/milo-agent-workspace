@@ -11,6 +11,7 @@ class Repository(Protocol):
     def list_projects(self, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
     def get_project(self, project_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def create_conversation(self, project_id: UUID, title: str | None, user_id: UUID | None = None) -> dict[str, Any]: ...
+    def list_conversations(self, project_id: UUID) -> list[dict[str, Any]]: ...
     def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
     def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]: ...
@@ -82,6 +83,10 @@ class SupabaseRepository:
     def create_conversation(self, project_id: UUID, title: str | None, user_id: UUID | None = None) -> dict[str, Any]:
         self.get_project(project_id, user_id)
         return self._single(self.client.table("conversations").insert({"project_id": str(project_id), "title": title}).select("*"), "conversation", "new")
+
+    def list_conversations(self, project_id: UUID) -> list[dict[str, Any]]:
+        # Callers must have already verified project membership.
+        return self._many(self.client.table("conversations").select("*").eq("project_id", str(project_id)).order("created_at", desc=True).limit(200))
 
     def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
         query = self.client.table("conversations").select("*").eq("id", str(conversation_id)).limit(1)
@@ -162,9 +167,12 @@ class SupabaseRepository:
             query = self.client.table("runs").select("*, conversations!inner(projects!inner(project_members!inner(user_id)))").eq("id", str(run_id)).eq("conversations.projects.project_members.user_id", str(user_id)).limit(1)
         return self._single(query, "run", str(run_id))
 
-    def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]:
+    def list_run_events(self, run_id: UUID, user_id: UUID | None = None, after_event_id: int | None = None) -> list[dict[str, Any]]:
         self.get_run(run_id, user_id)
-        return self._many(self.client.table("run_events").select("*").eq("run_id", str(run_id)).order("created_at"))
+        query = self.client.table("run_events").select("*").eq("run_id", str(run_id))
+        if after_event_id is not None:
+            query = query.gt("id", after_event_id)
+        return self._many(query.order("id").limit(500))
 
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         row = {

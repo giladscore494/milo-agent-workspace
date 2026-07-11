@@ -80,7 +80,7 @@ class StatefulRepo:
             raise NotFoundError("run", str(run_id))
         return dict(run)
 
-    def list_run_events(self, run_id, user_id=None):
+    def list_run_events(self, run_id, user_id=None, after_event_id=None):
         self.get_run(run_id, user_id)
         return [e for e in self.events if str(e["run_id"]) == str(run_id)]
 

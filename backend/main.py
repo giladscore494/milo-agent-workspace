@@ -162,6 +162,12 @@ def get_project(project_id: UUID, user: AuthenticatedUser = Depends(get_authenti
     return repo.get_project(project_id, user.user_id)
 
 
+@app.get("/projects/{project_id}/conversations", response_model=list[Conversation])
+def list_conversations(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> list[dict]:
+    repo.get_project(project_id, user.user_id)
+    return repo.list_conversations(project_id)
+
+
 @app.post("/projects/{project_id}/conversations", response_model=Conversation, status_code=201)
 def create_conversation(project_id: UUID, request: ConversationCreate, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
     return repo.create_conversation(project_id, request.title, user.user_id)
@@ -186,8 +192,8 @@ def get_run(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_us
 
 
 @app.get("/runs/{run_id}/events", response_model=list[RunEvent])
-def get_run_events(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> list[dict]:
-    return repo.list_run_events(run_id, user_id=user.user_id)
+def get_run_events(run_id: UUID, after_event_id: int | None = None, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> list[dict]:
+    return repo.list_run_events(run_id, user_id=user.user_id, after_event_id=after_event_id)
 
 
 @app.post("/runs/{run_id}/cancel", response_model=RunCancelResponse)

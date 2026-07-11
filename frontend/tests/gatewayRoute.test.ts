@@ -84,10 +84,17 @@ describe('private API gateway route', () => {
 
   it('blocks non-allowlisted routes without contacting Cloud Run', async () => {
     const RUN_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
-    const response = await GET(new NextRequest(`https://x/api/gateway/runs/${RUN_ID}`, { method: 'GET' }), { params: Promise.resolve({ path: ['runs', RUN_ID] }) });
+    const response = await POST(new NextRequest(`https://x/api/gateway/runs/${RUN_ID}/tool-grants`, { method: 'POST' }), { params: Promise.resolve({ path: ['runs', RUN_ID, 'tool-grants'] }) });
     expect(response.status).toBe(403);
     expect(mocks.getCloudRunIdToken).not.toHaveBeenCalled();
     expect(mocks.getCloudRunServiceUrl).not.toHaveBeenCalled();
+  });
+
+  it('requires authentication for run polling reads before contacting Cloud Run', async () => {
+    const RUN_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const response = await GET(new NextRequest(`https://x/api/gateway/runs/${RUN_ID}`, { method: 'GET' }), { params: Promise.resolve({ path: ['runs', RUN_ID] }) });
+    expect(response.status).toBe(401);
+    expect(mocks.getCloudRunIdToken).not.toHaveBeenCalled();
   });
 
   it('returns 429 with a Retry-After header when the unauthenticated IP limit is hit', async () => {
