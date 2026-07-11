@@ -92,8 +92,20 @@ any authenticated caller of the private API could write execution records.
 - Cloud Run gateway settings already in use by the deployment
   (`CLOUD_RUN_SERVICE_URL` and the OIDC/service-account configuration used by
   `lib/server/cloudRunAuth.ts`).
-- Optional: `GATEWAY_RATE_LIMIT_REQUESTS`, `GATEWAY_RATE_LIMIT_WINDOW_MS`
-  (finite positive numbers; invalid values fall back to 60 requests / 60 s).
+- `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` — shared rate-limit
+  store (values entered manually; never committed). Required in production:
+  without them, mutation categories (run creation, cancellation) fail
+  closed and only the documented read-only fail-safe path stays available.
+- Optional per-category overrides (finite positive numbers; invalid values
+  fall back to safe defaults): `GATEWAY_RATE_LIMIT_UNAUTH_REQUESTS`,
+  `GATEWAY_RATE_LIMIT_AUTH_PRESSURE_REQUESTS`,
+  `GATEWAY_RATE_LIMIT_AUTHENTICATED_REQUESTS`,
+  `GATEWAY_RATE_LIMIT_POLLING_REQUESTS`,
+  `GATEWAY_RATE_LIMIT_RUN_CREATION_REQUESTS`,
+  `GATEWAY_RATE_LIMIT_CANCELLATION_REQUESTS` (plus matching `_WINDOW_MS`).
+  Backend equivalents: `MILO_RATE_LIMIT_RUN_CREATION_USER`,
+  `MILO_RATE_LIMIT_RUN_CREATION_PROJECT`, `MILO_RATE_LIMIT_CANCELLATION`,
+  `MILO_RATE_LIMIT_WORKER_MUTATIONS`.
 
 No secret values belong in this document or in any `NEXT_PUBLIC_*` variable.
 

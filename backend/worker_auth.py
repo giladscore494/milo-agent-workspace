@@ -111,4 +111,9 @@ def get_verified_worker(
     x_milo_worker_token: str | None = Header(default=None),
     verifier: TokenVerifier = Depends(get_token_verifier),
 ) -> WorkerIdentity:
-    return verify_worker_token(x_milo_worker_token, verifier)
+    identity = verify_worker_token(x_milo_worker_token, verifier)
+    # Per-service-identity pressure limit on worker mutation routes.
+    from backend.rate_limit import enforce_rate_limit
+
+    enforce_rate_limit("worker_mutations", identity.service_account_email)
+    return identity

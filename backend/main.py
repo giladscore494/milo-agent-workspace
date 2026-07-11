@@ -37,6 +37,7 @@ from backend.schemas import (
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
     WorkerRunCompleteRequest, WorkerRunEventCreate, WorkerRunFailRequest,
 )
+from backend.rate_limit import enforce_rate_limit
 from backend.runtime import EVENT_TYPES, TERMINAL_STATES
 from backend.worker_auth import WorkerIdentity, get_verified_worker
 from backend.workflow_proposals import compile_proposal, ensure_approved
@@ -97,6 +98,8 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
     whose previous launch attempt failed (launch_state == 'launch_failed'
     while still queued) is safely relaunched instead of duplicated.
     """
+    enforce_rate_limit("run_creation_user", str(user.user_id))
+    enforce_rate_limit("run_creation_project", str(conversation_id))
     fingerprint = _request_fingerprint(content, metadata)
     run = None
     if idempotency_key and hasattr(repo, "find_run_by_idempotency"):
@@ -190,6 +193,7 @@ def get_run_events(run_id: UUID, user: AuthenticatedUser = Depends(get_authentic
 @app.post("/runs/{run_id}/cancel", response_model=RunCancelResponse)
 def cancel_run(run_id: UUID, request: RunCancelRequest, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> RunCancelResponse:
     require_stage_enabled("MILO_ENABLE_RUN_CANCELLATION", "run cancellation")
+    enforce_rate_limit("cancellation", str(user.user_id))
     # Membership authorization before any mutation; 404 for non-members.
     run = repo.get_run(run_id, user_id=user.user_id)
     status = str(run.get("status", ""))
