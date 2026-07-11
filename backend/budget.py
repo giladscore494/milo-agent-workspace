@@ -139,6 +139,7 @@ EventEmitter = Callable[[str, dict[str, Any]], None]
 UsageRecorder = Callable[[dict[str, Any]], None]
 LedgerRecorder = Callable[[dict[str, Any]], None]
 CostProvider = Callable[[], float]
+DailyReservation = Callable[[float], None]
 
 # Conservative chars-per-token heuristic for pre-call input estimation.
 CHARS_PER_TOKEN = 4
@@ -161,6 +162,8 @@ class BudgetTracker:
     ledger_recorder: LedgerRecorder | None = None
     daily_user_cost_provider: CostProvider | None = None
     daily_project_cost_provider: CostProvider | None = None
+    daily_user_reserver: DailyReservation | None = None
+    daily_project_reserver: DailyReservation | None = None
     lease_checker: Callable[[], bool] | None = None
     clock: Callable[[], float] = time.monotonic
     kill_switch: Callable[[], bool] = staticmethod(paid_execution_enabled)
@@ -286,6 +289,10 @@ class BudgetTracker:
                 raise self._reject("DAILY_USER_BUDGET_REACHED", "daily user budget exhausted", "budget_exhausted", "budget_exhausted")
             if cfg.daily_project_budget is not None and self.daily_project_cost_provider is not None and self.daily_project_cost_provider() >= cfg.daily_project_budget:
                 raise self._reject("DAILY_PROJECT_BUDGET_REACHED", "daily project budget exhausted", "budget_exhausted", "budget_exhausted")
+            if cfg.daily_user_budget is not None and self.daily_user_reserver is not None:
+                self.daily_user_reserver(cfg.estimated_cost_per_call)
+            if cfg.daily_project_budget is not None and self.daily_project_reserver is not None:
+                self.daily_project_reserver(cfg.estimated_cost_per_call)
             allowed_output = remaining_output
             if requested_max_tokens is not None:
                 allowed_output = requested_max_tokens if allowed_output is None else min(allowed_output, requested_max_tokens)
@@ -328,6 +335,18 @@ class BudgetTracker:
                 actual_output_tokens=int(output_tokens or 0),
                 actual_cost=float(cost) if cost else None,
             )
+            if cfg.max_input_tokens_per_run is not None and self.input_tokens > cfg.max_input_tokens_per_run:
+                self._ledger("overage", rejection_reason="INPUT_TOKEN_LIMIT_EXCEEDED")
+                raise self._stop("INPUT_TOKEN_LIMIT_EXCEEDED", "actual input token limit exceeded", "token_limit_reached", "budget_exhausted")
+            if cfg.max_output_tokens_per_run is not None and self.output_tokens > cfg.max_output_tokens_per_run:
+                self._ledger("overage", rejection_reason="OUTPUT_TOKEN_LIMIT_EXCEEDED")
+                raise self._stop("OUTPUT_TOKEN_LIMIT_EXCEEDED", "actual output token limit exceeded", "token_limit_reached", "budget_exhausted")
+            if cfg.max_total_tokens_per_run is not None and (self.input_tokens + self.output_tokens) > cfg.max_total_tokens_per_run:
+                self._ledger("overage", rejection_reason="TOTAL_TOKEN_LIMIT_EXCEEDED")
+                raise self._stop("TOTAL_TOKEN_LIMIT_EXCEEDED", "actual total token limit exceeded", "token_limit_reached", "budget_exhausted")
+            if cfg.max_cost_per_run is not None and self.actual_cost > cfg.max_cost_per_run:
+                self._ledger("overage", rejection_reason="COST_LIMIT_EXCEEDED")
+                raise self._stop("COST_LIMIT_EXCEEDED", "actual cost limit exceeded", "budget_exhausted", "budget_exhausted")
             if self.usage_recorder:
                 self.usage_recorder(self.snapshot())
 
@@ -373,11 +392,18 @@ class _GuardedCompletions:
             self._tracker.record_retry()
             raise
         usage = getattr(response, "usage", None)
+        provider_cost = getattr(usage, "cost", None) or getattr(usage, "total_cost", None) or getattr(response, "cost", None)
+        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        output_tokens = getattr(usage, "completion_tokens", 0) or 0
+        if provider_cost is None:
+            from backend.model_pricing import calculate_model_cost
+            provider_cost = calculate_model_cost(kwargs.get("model", ""), input_tokens, output_tokens)
         self._tracker.settle_call(
             reserved_input_tokens=estimated_input,
             reserved_output_tokens=reserved_output,
-            input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-            output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=float(provider_cost or 0),
         )
         return response
 

@@ -2,7 +2,7 @@
 
 - **Branch:** `claude/production-readiness-j0hhni`
 - **PR:** #26 (single PR; not merged)
-- **Head SHA:** tip of this branch (the `audit:` commit); updated every run
+- **Head SHA:** ae38454fe4a8a14e83db36d1a946295a47dd6968
 
 ## Phase status
 
@@ -11,16 +11,24 @@
 | 1 | Proposal ownership + browser-route authorization | CORRECTED (audit fixes applied) |
 | 2 | Worker service-to-service authentication | CORRECTED (gateway/worker separation added) |
 | 3 | Idempotent run creation + lifecycle | CORRECTED (transaction-safe + atomic launch/lease) |
-| 4 | Budget, cost and resource limits | CORRECTED (hard pre-call reservation + ledger) |
+| 4 | Budget, cost and resource limits | CORRECTED (actual cost settlement + post-call overage checks + atomic daily budget RPCs added) |
 | 5 | Shared-store rate limiting | CORRECTED (project keys + trusted IP) |
 | 6 | Frontend execution UI + polling | CORRECTED (run-state isolation) |
 | 7 | Playwright E2E suite | CORRECTED (identity + isolation coverage; 31 tests) |
-| 8 | Production configuration validation | CORRECTED (gateway auth, identity separation, test-adapter bans) |
+| 8 | Production configuration validation | CORRECTED (gateway auth required by default; insecure dev identity is explicit and production-forbidden) |
 | 9 | Migration and operator tooling | NOT STARTED |
 | 10 | Deployment and rollback preparation | NOT STARTED |
 | 11 | Final documentation | NOT STARTED |
 
 ## Corrections applied in the Phases 1–8 corrective audit
+
+Corrective commits added in this run:
+
+- `e45404e` `fix: maintain and enforce active worker leases`
+- `6fa8426` `fix: enforce actual usage and persistent daily budgets`
+- `ed84a34` `fix: require gateway auth by default`
+- `ae38454` `audit: close phases one through eight blockers`
+
 
 1. **Trusted gateway identity** (`fix: authenticate trusted browser gateway identity`)
    — `backend/gateway_auth.py` verifies a Google-signed `X-Milo-Gateway-Token`
@@ -78,25 +86,27 @@
 - `010` run usage aggregate
 - `011` proposal ownership protection + atomic project creation (NEW)
 - `012` atomic run operations: create_message_and_run, launch_unknown, claim_run_lease (NEW)
-- `013` append-only usage ledger (NEW)
+- `013` append-only usage ledger
+- `014` atomic daily user/project budget reservation RPCs (NEW)
 
 All additive/idempotent/data-preserving; none applied to production.
 
 ## Exact test results (this corrective run, local)
 
-- `pytest -q tests --ignore=MILO-main-original/MILO-main/test_websearch.py`
-  with `MILO_REQUIRE_PG_TESTS=1`: **382 passed, 0 failed, 0 skipped**
-  (includes the ephemeral-PostgreSQL suite: 82 executable migration,
-  RLS and concurrency tests).
-- `python scripts/check_migrations.py` — passed.
-- `python scripts/secret_scan.py` — passed.
-- `python scripts/check_unsafe_defaults.py` — passed.
-- Frontend: `tsc --noEmit` clean; `vitest` **60 passed**; `next build`
-  succeeded; `test:static` and `test:secrets` passed.
-- Playwright E2E: **31 passed** (13 disabled-stack, 18 enabled-stack),
-  0 failed, 0 skipped.
-- Docker builds: **not runnable in this sandbox** (no Docker daemon);
-  built by the CI `offline-checks` job on the pushed head.
+- `python scripts/check_migrations.py` — **passed** (`migration check passed (static text validation only)`).
+- `python scripts/secret_scan.py` — **passed** (`secret scan passed`).
+- `python scripts/check_unsafe_defaults.py` — **passed** (`unsafe default check passed`).
+- `python -m py_compile backend/*.py backend/repository/*.py backend/testing/*.py backend/worker/*.py` — **passed**.
+- `MILO_REQUIRE_PG_TESTS=1 pytest -q tests --ignore=MILO-main-original/MILO-main/test_websearch.py` — **failed during collection** before tests could run: 14 collection errors, 0 passed, 0 skipped. The sandbox lacks backend dependencies (`fastapi`, `pydantic_settings`, `postgrest`) and `pip install -r backend/requirements.txt` failed because the package index tunnel returned 403. PostgreSQL skip count: unavailable because collection did not reach test execution.
+- Frontend `cd frontend && npm ci` — **passed** with Node version warnings (`required node 22.x`, current `v24.15.0`).
+- Frontend `npx tsc --noEmit` — **passed**.
+- Frontend `npm test -- --run` — **passed**, 9 files / 60 tests passed, 0 failed, 0 skipped.
+- Frontend `npm run build` — **passed**.
+- Frontend `npm run test:static` — **passed**.
+- Frontend `npm run test:secrets` — **passed**.
+- Frontend `npx playwright test` — **failed before tests ran** because the Python E2E web server could not import `pydantic_settings`; 0 passed, 0 skipped.
+- Docker builds — **not run**: Docker is unavailable locally (`docker: command not found`).
+- CI result — not available from this sandbox; remote push/PR update was not possible because no git remote is configured.
 
 ## Unresolved risks
 
