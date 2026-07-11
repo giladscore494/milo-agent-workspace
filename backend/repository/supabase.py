@@ -27,7 +27,7 @@ class Repository(Protocol):
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
     def save_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]: ...
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None: ...
-    def transition_run(self, run_id: UUID, status: str, **fields: Any) -> dict[str, Any]: ...
+    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]: ...
     def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]: ...
@@ -314,7 +314,7 @@ class SupabaseRepository:
         rows = self._many(query)
         return rows[0] if rows else None
 
-    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
+    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
         current = str(self.get_run(run_id).get("status", ""))
         # Same-status updates (heartbeats, metadata refresh) are no-op
         # transitions; unknown legacy statuses bypass validation so legacy
@@ -339,8 +339,8 @@ class SupabaseRepository:
             query = query.gt("lease_expires_at", datetime.now(UTC).isoformat())
         if expected_attempt is not None:
             query = query.eq("attempt", expected_attempt)
-        if lease_token is not None:
-            query = query.eq("lease_token", lease_token)
+        if expected_lease_token is not None:
+            query = query.eq("lease_token", expected_lease_token)
         try:
             rows = query.select("*").execute().data or []
         except Exception as exc:

@@ -193,12 +193,12 @@ class MemoryRepository:
         if (expected_worker_id is not None or expected_attempt is not None or lease_token is not None) and run.get("lease_expires_at") and run["lease_expires_at"] <= _now():
             raise AppError("RUN_TRANSITION_CONFLICT", "run lease has expired", 409)
 
-    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
+    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
         with self.lock:
             run = self.runs.get(str(run_id))
             if run is None:
                 raise NotFoundError("run", str(run_id))
-            self._assert_active_lease(run, expected_worker_id, expected_attempt, lease_token)
+            self._assert_active_lease(run, expected_worker_id, expected_attempt, expected_lease_token)
             current = run["status"]
             if status != current and current in RUN_STATES:
                 try:
