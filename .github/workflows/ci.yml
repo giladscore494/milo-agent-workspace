@@ -54,6 +54,38 @@ jobs:
         working-directory: frontend
         run: npm run test:secrets
 
+  postgres-checks:
+    # Real ephemeral PostgreSQL validation of every migration and every
+    # concurrency/security property. MILO_REQUIRE_PG_TESTS turns any
+    # missing-binary skip into a hard failure, so this job can never pass
+    # without actually executing the suite.
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: https://example.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
+      JOB_LAUNCHER: disabled
+      MILO_REQUIRE_PG_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PostgreSQL server binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Executable migration + concurrency + RLS suite (skips forbidden)
+        run: |
+          pytest -rs tests/test_migrations_postgres.py | tee pg-test-output.txt
+          if grep -qE "SKIPPED|skipped" pg-test-output.txt; then
+            echo "PostgreSQL tests were skipped; failing the job."
+            exit 1
+          fi
+      - name: Migration static check
+        run: python scripts/check_migrations.py
+
   e2e:
     runs-on: ubuntu-latest
     env:

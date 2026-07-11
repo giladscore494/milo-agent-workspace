@@ -115,6 +115,10 @@ class EphemeralPostgres:
 def _require_pg_bin() -> str:
     pg_bin = _find_pg_bin()
     if pg_bin is None or shutil.which("psql") is None:
+        if os.getenv("MILO_REQUIRE_PG_TESTS", "").strip().lower() in {"1", "true", "yes", "on"}:
+            # The dedicated CI job MUST run these tests; a silent skip would
+            # let unverified migrations look green.
+            pytest.fail("MILO_REQUIRE_PG_TESTS is set but PostgreSQL server binaries are unavailable; the executable migration suite is mandatory here")
         pytest.skip("PostgreSQL server binaries not available; executable migration validation skipped")
     return pg_bin
 
