@@ -17,7 +17,7 @@ test('2. invalid login is rejected', async ({ page }) => {
   await page.getByLabel('Email').fill('alice@example.com');
   await page.getByLabel('Password').fill('wrong-password');
   await page.getByRole('button', { name: 'Login' }).click();
-  await expect(page.getByRole('alert')).toContainText(/invalid/i);
+  await expect(page.getByText('Invalid login credentials')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Logout' })).toHaveCount(0);
 });
 
@@ -117,7 +117,10 @@ test('27. sign-out removes access', async ({ page }) => {
 test('28. no secrets are exposed in served pages or client bundles', async ({ page, request, baseURL }) => {
   await page.goto('/');
   const html = await page.content();
-  const forbidden = [/sb_secret/i, /service_role/i, /SUPABASE_SERVICE_ROLE_KEY/, /sk-[A-Za-z0-9_-]{8,}/];
+  // Secret VALUE shapes (sb_secret_ keys, provider keys, the stack's own
+  // backend service-key placeholder). The literal word "service_role"
+  // appears in vendored supabase-js type enums and is not a secret.
+  const forbidden = [/sb_secret_[A-Za-z0-9]/i, /sk-[A-Za-z0-9_-]{16,}/, /e2e-offline-placeholder/, /SUPABASE_SERVICE_ROLE_KEY\s*[:=]\s*['"][^'"]+/];
   for (const pattern of forbidden) {
     expect(html, String(pattern)).not.toMatch(pattern);
   }

@@ -20,6 +20,14 @@ const sharedFrontendEnv = {
   NEXT_PUBLIC_SUPABASE_ANON_KEY: 'e2e-anon-key',
   CLOUD_RUN_AUTH_MODE: 'e2e-test',
   NEXT_TELEMETRY_DISABLED: '1',
+  // Every E2E request comes from 127.0.0.1, so the per-IP/per-user gateway
+  // limits must be raised for the suite (they are separately unit-tested).
+  GATEWAY_RATE_LIMIT_UNAUTH_REQUESTS: '1000',
+  GATEWAY_RATE_LIMIT_AUTH_PRESSURE_REQUESTS: '2000',
+  GATEWAY_RATE_LIMIT_AUTHENTICATED_REQUESTS: '2000',
+  GATEWAY_RATE_LIMIT_POLLING_REQUESTS: '2000',
+  GATEWAY_RATE_LIMIT_RUN_CREATION_REQUESTS: '200',
+  GATEWAY_RATE_LIMIT_CANCELLATION_REQUESTS: '200',
 };
 
 const backendEnv = {

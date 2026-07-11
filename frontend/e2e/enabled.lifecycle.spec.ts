@@ -46,7 +46,7 @@ test('10. cross-user proposal access is denied', async ({ request, baseURL }) =>
 test('12+13. run creation succeeds; double-click produces exactly one run', async ({ page }) => {
   await loginViaUi(page, 'alice');
   await page.getByText('Alpha Research').click();
-  await page.getByLabel('Conversation title').fill('double-click run');
+  await page.getByLabel('Conversation title').fill('convo-doubleclick');
   await page.getByRole('button', { name: 'New conversation' }).click();
   await expect(page.getByText(/ID .* • project/)).toBeVisible();
   await page.getByLabel('Task content').fill('produce the final report');
@@ -130,7 +130,7 @@ test('19. a valid mocked worker identity can write authorized events', async ({ 
 test('20+26. polling reconstructs run state and renders final output', async ({ page }) => {
   await loginViaUi(page, 'alice');
   await page.getByText('Alpha Research').click();
-  await page.getByLabel('Conversation title').fill('polling run');
+  await page.getByLabel('Conversation title').fill('convo-polling');
   await page.getByRole('button', { name: 'New conversation' }).click();
   await page.getByLabel('Task content').fill('produce the final report');
   await page.getByRole('button', { name: 'Send task' }).click();
@@ -143,7 +143,7 @@ test('20+26. polling reconstructs run state and renders final output', async ({ 
 test('21. a refresh reconnects to the same run', async ({ page }) => {
   await loginViaUi(page, 'alice');
   await page.getByText('Alpha Research').click();
-  await page.getByLabel('Conversation title').fill('refresh run');
+  await page.getByLabel('Conversation title').fill('convo-refresh');
   await page.getByRole('button', { name: 'New conversation' }).click();
   await page.getByLabel('Task content').fill('slow crawl please');
   await page.getByRole('button', { name: 'Send task' }).click();
@@ -156,14 +156,14 @@ test('21. a refresh reconnects to the same run', async ({ page }) => {
   await page.reload();
   await expect(page.getByRole('button', { name: 'Logout' })).toBeVisible();
   await page.getByText('Alpha Research').click();
-  await page.getByText('refresh run').click();
+  await page.getByText('convo-refresh').click();
   await expect(page.getByText(runIdBefore!)).toBeVisible();
 });
 
 test('22. cancellation succeeds and reaches a terminal cancelled state', async ({ page }) => {
   await loginViaUi(page, 'alice');
   await page.getByText('Alpha Research').click();
-  await page.getByLabel('Conversation title').fill('cancel run');
+  await page.getByLabel('Conversation title').fill('convo-cancel');
   await page.getByRole('button', { name: 'New conversation' }).click();
   await page.getByLabel('Task content').fill('slow crawl please');
   await page.getByRole('button', { name: 'Send task' }).click();
@@ -177,7 +177,7 @@ test('22. cancellation succeeds and reaches a terminal cancelled state', async (
 test('23. budget exhaustion stops execution', async ({ page }) => {
   await loginViaUi(page, 'alice');
   await page.getByText('Alpha Research').click();
-  await page.getByLabel('Conversation title').fill('budget run');
+  await page.getByLabel('Conversation title').fill('convo-budget');
   await page.getByRole('button', { name: 'New conversation' }).click();
   await page.getByLabel('Task content').fill('exhaust budget now');
   await page.getByRole('button', { name: 'Send task' }).click();
@@ -188,7 +188,7 @@ test('23. budget exhaustion stops execution', async ({ page }) => {
 test('24. timeout stops execution', async ({ page }) => {
   await loginViaUi(page, 'alice');
   await page.getByText('Alpha Research').click();
-  await page.getByLabel('Conversation title').fill('timeout run');
+  await page.getByLabel('Conversation title').fill('convo-timeout');
   await page.getByRole('button', { name: 'New conversation' }).click();
   await page.getByLabel('Task content').fill('simulate a timeout');
   await page.getByRole('button', { name: 'Send task' }).click();
@@ -199,7 +199,7 @@ test('24. timeout stops execution', async ({ page }) => {
 test('25. worker failure displays a safe error', async ({ page }) => {
   await loginViaUi(page, 'alice');
   await page.getByText('Alpha Research').click();
-  await page.getByLabel('Conversation title').fill('failure run');
+  await page.getByLabel('Conversation title').fill('convo-failure');
   await page.getByRole('button', { name: 'New conversation' }).click();
   await page.getByLabel('Task content').fill('please fail cleanly');
   await page.getByRole('button', { name: 'Send task' }).click();

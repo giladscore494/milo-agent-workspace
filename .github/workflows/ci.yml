@@ -51,3 +51,30 @@ jobs:
       - name: Frontend secret bundle check
         working-directory: frontend
         run: npm run test:secrets
+
+  e2e:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: https://example.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
+      JOB_LAUNCHER: disabled
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Install Playwright browser
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Run isolated E2E suite (mocked auth, worker and model adapters)
+        working-directory: frontend
+        run: npx playwright test
+
