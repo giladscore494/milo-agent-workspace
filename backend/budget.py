@@ -335,6 +335,8 @@ class BudgetTracker:
                 actual_output_tokens=int(output_tokens or 0),
                 actual_cost=float(cost) if cost else None,
             )
+            if self.usage_recorder:
+                self.usage_recorder(self.snapshot())
             if cfg.max_input_tokens_per_run is not None and self.input_tokens > cfg.max_input_tokens_per_run:
                 self._ledger("overage", rejection_reason="INPUT_TOKEN_LIMIT_EXCEEDED")
                 raise self._stop("INPUT_TOKEN_LIMIT_EXCEEDED", "actual input token limit exceeded", "token_limit_reached", "budget_exhausted")
@@ -347,8 +349,6 @@ class BudgetTracker:
             if cfg.max_cost_per_run is not None and self.actual_cost > cfg.max_cost_per_run:
                 self._ledger("overage", rejection_reason="COST_LIMIT_EXCEEDED")
                 raise self._stop("COST_LIMIT_EXCEEDED", "actual cost limit exceeded", "budget_exhausted", "budget_exhausted")
-            if self.usage_recorder:
-                self.usage_recorder(self.snapshot())
 
     def before_call(self) -> None:
         """Backwards-compatible gate without token estimation."""

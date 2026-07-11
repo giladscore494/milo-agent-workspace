@@ -24,7 +24,8 @@ def test_cancelled_before_start_emits_no_run_started_or_engine_call(monkeypatch)
     monkeypatch.setenv("MILO_WORKER_HEARTBEAT_INTERVAL_SECONDS", "1")
     repo = MemoryRepository()
     run_id = uuid4()
-    repo.runs[str(run_id)] = {"id": str(run_id), "conversation_id": str(repo.conversation_id), "status": "cancellation_requested", "input": {"content": "x"}, "attempt": 1}
+    conversation_id = uuid4()
+    repo.runs[str(run_id)] = {"id": str(run_id), "conversation_id": str(conversation_id), "status": "cancellation_requested", "input": {"content": "x"}, "attempt": 1}
     engine = CompleteEngine()
     assert execute_run(run_id, repo, engine=engine) == 0
     assert engine.calls == 0
