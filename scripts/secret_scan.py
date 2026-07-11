@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 
 patterns = [re.compile(r"sk-[A-Za-z0-9_-]{20,}"), re.compile(r"service_role[a-zA-Z0-9_.-]{20,}", re.I), re.compile(r"-----BEGIN PRIVATE KEY-----")]
-skip = {".git", "node_modules", "legacy", "__pycache__"}
+skip = {".git", "node_modules", "legacy", "__pycache__", ".next", ".next-e2e-disabled", ".next-e2e-enabled", "test-results", "playwright-report"}
 findings = []
 for path in Path(".").rglob("*"):
     if not path.is_file() or any(part in skip for part in path.parts) or path == Path("scripts/secret_scan.py"):

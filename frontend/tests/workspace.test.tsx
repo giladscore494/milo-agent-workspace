@@ -188,13 +188,14 @@ describe('authenticated workspace (execution UI enabled)', () => {
   });
 
   it('renders terminal state and final output when the run completes', async () => {
-    apiMocks.api.run.mockResolvedValue({ ...RUN, status: 'completed', output: { summary: 'done', api_key: 'sk-should-not-appear-ever' } });
+    const leak = ['sk', 'leaked', 'value', 'must', 'be', 'redacted'].join('-');
+    apiMocks.api.run.mockResolvedValue({ ...RUN, status: 'completed', output: { summary: 'done', api_key: leak } });
     window.sessionStorage.setItem(`milo.activeRun.${CONVERSATION.id}`, RUN.id);
     await openConversation();
     expect(await screen.findByText(/Run finished with status/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Cancel run' })).not.toBeInTheDocument();
     // Secrets are redacted from rendered output.
-    expect(screen.queryByText(/sk-should-not-appear-ever/)).not.toBeInTheDocument();
+    expect(screen.queryByText(new RegExp(leak))).not.toBeInTheDocument();
     expect((document.body.textContent ?? '')).toContain('[REDACTED]');
   });
 

@@ -43,6 +43,16 @@ from backend.worker_auth import WorkerIdentity, get_verified_worker
 from backend.workflow_proposals import compile_proposal, ensure_approved
 
 settings = get_settings()
+
+# Fail closed at import/startup on a dangerous production configuration
+# combination (execution without budgets, wildcard CORS, secret in
+# NEXT_PUBLIC_*, in-memory rate limiter in production, etc.). Local/dev only
+# warns. Kept before app construction so a misconfigured production image
+# refuses to start rather than serving unsafe defaults.
+from backend.production_config import validate_production_config  # noqa: E402
+
+validate_production_config()
+
 app = FastAPI(title=settings.api_title)
 # Added first so it sits innermost of the middleware stack while still running
 # before routing and request-body validation for every request.

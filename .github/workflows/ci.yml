@@ -29,6 +29,8 @@ jobs:
         run: python scripts/check_migrations.py
       - name: Secret scan
         run: python scripts/secret_scan.py
+      - name: Unsafe default / execution-flag scan
+        run: python scripts/check_unsafe_defaults.py
       - name: Docker build API
         run: docker build -f Dockerfile.api -t milo-agent-api:ci .
       - name: Docker build worker
