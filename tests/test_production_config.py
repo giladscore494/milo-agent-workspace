@@ -17,6 +17,8 @@ BASE_PROD = {
     "ALLOWED_CORS_ORIGINS": "https://app.example.com",
     "UPSTASH_REDIS_REST_URL": "https://redis.example",
     "UPSTASH_REDIS_REST_TOKEN": "token",
+    "MILO_GATEWAY_AUDIENCE": "https://milo-api.example.internal",
+    "MILO_APPROVED_GATEWAY_IDENTITIES": "gateway@example.iam.gserviceaccount.com",
 }
 
 
@@ -108,3 +110,31 @@ def test_all_execution_flags_default_off_in_repo_config():
     # The scanner is the enforcement; this asserts the intent explicitly.
     result = subprocess.run([sys.executable, "scripts/check_unsafe_defaults.py"], cwd=REPO, capture_output=True, text=True)
     assert "all execution flags default-off" in result.stdout
+
+
+def test_production_requires_gateway_identity_configuration():
+    env = {k: v for k, v in BASE_PROD.items() if not k.startswith("MILO_GATEWAY") and not k.startswith("MILO_APPROVED_GATEWAY")}
+    report = validate(env)
+    assert "GATEWAY_AUTH_MISSING" in codes(report)
+    assert not report.ok()
+
+
+def test_shared_gateway_and_worker_identity_is_rejected():
+    env = {
+        **BASE_PROD,
+        "MILO_APPROVED_WORKER_IDENTITIES": "gateway@example.iam.gserviceaccount.com",
+    }
+    report = validate(env)
+    assert "SHARED_GATEWAY_WORKER_IDENTITY" in codes(report)
+
+
+def test_test_adapters_are_rejected_in_production():
+    report = validate({**BASE_PROD, "CLOUD_RUN_AUTH_MODE": "e2e-test"})
+    assert "TEST_ADAPTER_IN_PRODUCTION" in codes(report)
+    report2 = validate({**BASE_PROD, "MILO_E2E_INPROCESS_WORKER": "true"})
+    assert "TEST_ADAPTER_IN_PRODUCTION" in codes(report2)
+
+
+def test_release_scripts_are_not_exempt_from_unsafe_default_scanning():
+    text = Path(REPO / "scripts" / "check_unsafe_defaults.py").read_text()
+    assert "scripts/release/" not in text.split("ALLOWED_PREFIXES")[1].split(")")[0]

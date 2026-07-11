@@ -123,6 +123,27 @@ def validate(env: dict[str, str] | None = None) -> ConfigReport:
         if not (env.get("MILO_APPROVED_WORKER_IDENTITIES") or "").strip():
             (error if production else warn)("WORKER_ALLOWLIST_EMPTY", "worker mutations enabled without MILO_APPROVED_WORKER_IDENTITIES")
 
+    # 5b. Browser routes require verified gateway identity in production.
+    gateway_audience = (env.get("MILO_GATEWAY_AUDIENCE") or "").strip()
+    gateway_identities = {i.strip().lower() for i in (env.get("MILO_APPROVED_GATEWAY_IDENTITIES") or "").split(",") if i.strip()}
+    worker_identities = {i.strip().lower() for i in (env.get("MILO_APPROVED_WORKER_IDENTITIES") or "").split(",") if i.strip()}
+    if production and (not gateway_audience or not gateway_identities):
+        error("GATEWAY_AUTH_MISSING", "production requires MILO_GATEWAY_AUDIENCE and a non-empty MILO_APPROVED_GATEWAY_IDENTITIES; browser identity headers are never trusted bare")
+
+    # 5c. Gateway and worker identities must be strictly separated: a shared
+    # service account (or a shared audience) would let the worker mint
+    # browser identities or vice versa.
+    overlap = gateway_identities & worker_identities
+    if overlap:
+        error("SHARED_GATEWAY_WORKER_IDENTITY", f"identities approved for both gateway and worker roles: {', '.join(sorted(overlap))}")
+
+    # 5d. Test adapters may never reach production configuration.
+    if production:
+        if (env.get("CLOUD_RUN_AUTH_MODE") or "").strip().lower() == "e2e-test":
+            error("TEST_ADAPTER_IN_PRODUCTION", "CLOUD_RUN_AUTH_MODE=e2e-test is a test-only escape and is forbidden in production")
+        if _flag(env, "MILO_E2E_INPROCESS_WORKER"):
+            error("TEST_ADAPTER_IN_PRODUCTION", "MILO_E2E_INPROCESS_WORKER is a test-only adapter and is forbidden in production")
+
     # 6. Public execution UI cannot imply backend run creation.
     public_ui = _flag(env, "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI")
     if public_ui and not execution_enabled:

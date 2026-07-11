@@ -26,10 +26,16 @@ EXECUTION_FLAGS = [
     "MILO_ENABLE_PAID_EXECUTION",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
     "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI",
+    # Test-only adapters must never be switched on outside the isolated
+    # E2E stacks.
+    "MILO_E2E_INPROCESS_WORKER",
 ]
 
+TEST_ADAPTER_RE = re.compile(r"CLOUD_RUN_AUTH_MODE\s*[:=]\s*['\"]?e2e-test", re.I)
+
 # Files/dirs that are allowed to enable flags because they are test-only
-# isolated stacks, never a deployment surface.
+# isolated stacks, never a deployment surface. Release/operator scripts are
+# deliberately NOT exempted: they must stay subject to these checks.
 ALLOWED_PREFIXES = (
     "frontend/e2e/",
     "frontend/playwright.config.ts",
@@ -38,7 +44,6 @@ ALLOWED_PREFIXES = (
     "frontend/tests/",
     "scripts/check_unsafe_defaults.py",
     "docs/",
-    "scripts/release/",
 )
 
 # Config/deploy surfaces we care about most; everything tracked is scanned,
@@ -73,6 +78,10 @@ def main() -> int:
             problems.append(f"{rel}: NEXT_PUBLIC_* assigned secret-looking material")
         if _is_allowed(rel):
             continue
+        # The implementation and its validator legitimately name the value.
+        enforcement_files = {"frontend/lib/server/cloudRunAuth.ts", "backend/production_config.py"}
+        if rel not in enforcement_files and TEST_ADAPTER_RE.search(text):
+            problems.append(f"{rel}: test-only CLOUD_RUN_AUTH_MODE=e2e-test configured outside the isolated E2E stack")
         for flag, pattern in ENABLE_RE.items():
             for match in pattern.finditer(text):
                 line = text[: match.start()].count("\n") + 1

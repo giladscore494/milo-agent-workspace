@@ -103,8 +103,32 @@ The backend supports Supabase's modern server-side secret API keys with the `sb_
 
 Do not re-enable, restore, or depend on legacy JWT service-role API keys. Server-side Supabase keys must remain only in Google Secret Manager or equivalent protected backend secret stores; never commit them, print them, place them in frontend configuration, or send them to browser bundles. The frontend may use only public Supabase configuration such as an anon or publishable key, and must never receive `SUPABASE_SECRET_KEY` or `SUPABASE_SERVICE_ROLE_KEY`.
 
-## Frontend security gap
+## Trusted browser gateway (implemented)
 
-The frontend currently calls `NEXT_PUBLIC_API_URL` directly from the browser. The production Cloud Run API is intentionally private, so Vercel must not be pointed directly at the private Cloud Run service URL.
+The browser never calls the private Cloud Run API directly. The Next.js
+server-side gateway (`/api/gateway/[...path]`):
 
-Before browser end-to-end production use, implement a secure authenticated gateway or server-side proxy that can authenticate users and call the private Cloud Run API from a trusted server identity. Do not make the Cloud Run API unauthenticated merely to make the frontend work.
+1. validates the Supabase access token against `GET {SUPABASE_URL}/auth/v1/user`;
+2. discards every browser-supplied internal header and regenerates
+   `x-milo-auth-user-id` / `x-milo-auth-user-email` from the validated user;
+3. obtains a Google-signed ID token for the Cloud Run audience and sends it
+   both as the Cloud Run `Authorization` bearer and as
+   `X-Milo-Gateway-Token`.
+
+The backend (`backend/gateway_auth.py`) verifies `X-Milo-Gateway-Token`
+(signature, issuer, audience, expiration, verified service-account email,
+explicit allowlist) BEFORE trusting any identity header — reaching the
+private service is never sufficient. Manual configuration on the API
+service (no IAM change is applied by this repository):
+
+```text
+MILO_GATEWAY_AUDIENCE=<https URL of the milo-agent-api Cloud Run service>
+MILO_APPROVED_GATEWAY_IDENTITIES=<the Vercel gateway's Google service account email>
+```
+
+The gateway service account must be distinct from the worker service
+account: shared identities are rejected by
+`backend/production_config.py`, worker identities cannot mint browser
+users, and gateway identities cannot call worker mutation routes.
+Production fails closed (503) when gateway auth is unconfigured. Do not
+make the Cloud Run API unauthenticated merely to make the frontend work.

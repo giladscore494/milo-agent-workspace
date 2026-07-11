@@ -20,14 +20,19 @@ Next.js gateway  /api/gateway/[...path]   (server-side only)
      contacts Cloud Run.
   4. Strip/ignore all browser-supplied x-milo-* headers; regenerate
      x-milo-auth-user-id / x-milo-auth-user-email from the validated user only.
-  5. Fetch a Google Cloud Run ID token; upstream Authorization carries only
-     that ID token.
+  5. Fetch a Google Cloud Run ID token; upstream Authorization carries that
+     ID token and the same token is presented as X-Milo-Gateway-Token.
   ▼
 FastAPI backend (private Cloud Run service)
   1. ExecutionSurfaceGuardMiddleware rejects disabled execution surfaces
      (403 EXECUTION_SURFACE_DISABLED) before routing and body validation.
-  2. Browser-facing routes require the internal identity headers and verify
-     project membership through the repository (project_members).
+  2. backend/gateway_auth.py verifies X-Milo-Gateway-Token (signature,
+     issuer, audience MILO_GATEWAY_AUDIENCE, expiry, verified email in
+     MILO_APPROVED_GATEWAY_IDENTITIES) BEFORE any identity header is
+     trusted; production fails closed when unconfigured. Worker and
+     gateway identities are strictly separated.
+  3. Browser-facing routes then verify project membership through the
+     repository (project_members).
   ▼
 Supabase Postgres (service-role key; RLS is defense in depth for the
 authenticated role once migration 007 is applied)
@@ -168,12 +173,15 @@ delete). It is additive, idempotent and data-preserving:
 
 ## Known limitations / deferred items
 
-- **Rate limiter** is per warm serverless instance and in-memory (bounded
-  map, stale-bucket expiry, Retry-After). It is a fail-safe, not a global
-  quota. Upstash/Redis or another shared store is required before broad
-  public access.
-- **Realtime/polling for runs is disabled**; the run console is a static
-  read-only shell until an authenticated Realtime channel is designed.
+- **Rate limiter** uses the shared Upstash Redis store in production (the
+  in-memory store remains only as the documented read-path fail-safe and
+  for tests); mutation categories fail closed when the shared store is
+  missing or unreachable. Production startup validation rejects a missing
+  shared store outright.
+- **Run polling is implemented** (authenticated incremental reads with
+  backoff, dedup and run-switch isolation); Supabase Realtime remains
+  intentionally disabled until it can join with the same authenticated
+  browser session.
 - **Worker mutation routes** need service-to-service auth (above); that
   authentication model and all later production-readiness phases
   (idempotent execution lifecycle, budget/cost caps, shared-store rate
