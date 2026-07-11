@@ -14,9 +14,9 @@ class WorkerRepo:
         return {"id": run_id, "status": "queued", "input": {}}
     def append_run_event(self, run_id, event_type, payload):
         self.events.append((run_id, event_type, payload)); return {"id": uuid4(), "run_id": run_id, "event_type": event_type, "payload": payload}
-    def mark_run_failed(self, run_id, code, message):
+    def mark_run_failed(self, run_id, code, message, worker_id=None):
         self.failed = (run_id, code, message); return {"id": run_id, "status": "failed", "error": {"code": code, "message": message}}
-    def mark_run_complete(self, run_id, output):
+    def mark_run_complete(self, run_id, output, worker_id=None):
         self.completed = (run_id, output); return {"id": run_id, "status": "completed", "output": output}
 
 

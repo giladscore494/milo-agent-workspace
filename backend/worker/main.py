@@ -57,7 +57,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             result = {"status": final.get("status", "success"), "result": final, "summary": (artifacts.get("hebrew_summary") or {}).get("parsed", {}).get("summary"), "results": artifacts, **(latest_checkpoint.get("token_usage") or {})}
             sink.emit(RunEventRecord(run_id=run_id, type="run_completed", message="Run completed from checkpoint", payload={"checkpoint_id": str(latest_checkpoint.get("id", ""))}))
             shadow_observe("run_completed", {"checkpoint_id": str(latest_checkpoint.get("id", ""))})
-            repo.mark_run_complete(run_id, result)
+            repo.mark_run_complete(run_id, result, worker_id=worker_id)
             return 0
     if hasattr(repo, "transition_run"):
         repo.transition_run(run_id, "running", started_at=run.get("started_at") or datetime.now(UTC).isoformat())
@@ -107,34 +107,34 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         sink.emit(RunEventRecord(run_id=run_id, type="run_cancelled", message="Run cancelled", payload={}))
         shadow_observe("run_cancelled", {})
         if hasattr(repo, "transition_run"):
-            repo.transition_run(run_id, "cancelled", finished_at=datetime.now(UTC).isoformat())
+            repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, finished_at=datetime.now(UTC).isoformat())
         return 0
     except BudgetExceeded as exc:
         if hasattr(repo, "transition_run"):
-            repo.transition_run(run_id, exc.terminal_status, error={"code": exc.code, "message": exc.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+            repo.transition_run(run_id, exc.terminal_status, expected_worker_id=worker_id, error={"code": exc.code, "message": exc.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
         return 1
     if tracker.stop is not None:
         # The engine absorbed per-agent failures, but a hard limit tripped:
         # never report success and record the terminal budget status.
         stop = tracker.stop
         if hasattr(repo, "transition_run"):
-            repo.transition_run(run_id, stop.terminal_status, error={"code": stop.code, "message": stop.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+            repo.transition_run(run_id, stop.terminal_status, expected_worker_id=worker_id, error={"code": stop.code, "message": stop.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
         return 1
     if result.get("status") in {"complete", "partial_success", "success"} or (result.get("status") != "failed" and result.get("result")):
         status = "partial_success" if result.get("status") == "partial_success" else "completed"
         sink.emit(RunEventRecord(run_id=run_id, type="run_partial_success" if status == "partial_success" else "run_completed", message=f"Run {status}", payload={"status": result.get("status")}))
         shadow_observe("run_partial_success" if status == "partial_success" else "run_completed", {"status": result.get("status")})
         if hasattr(repo, "transition_run") and status == "partial_success":
-            repo.transition_run(run_id, "partial_success", output=result, error=None, finished_at=datetime.now(UTC).isoformat())
+            repo.transition_run(run_id, "partial_success", expected_worker_id=worker_id, output=result, error=None, finished_at=datetime.now(UTC).isoformat())
         else:
-            repo.mark_run_complete(run_id, result)
+            repo.mark_run_complete(run_id, result, worker_id=worker_id)
         return 0
     error = result.get("error", {}) if isinstance(result, dict) else {}
     code = error.get("code", "ENGINE_FAILED")
     message = error.get("message", "vehicle_catalog_v1 engine failed")
     sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message=message, payload={"code": code}))
     shadow_observe("run_failed", {"code": code})
-    repo.mark_run_failed(run_id, code, message)
+    repo.mark_run_failed(run_id, code, message, worker_id=worker_id)
     return 1
 
 

@@ -116,6 +116,31 @@ class MemoryRepository:
                 return dict(run)
         return None
 
+    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]:
+        # Mirrors migration 012: replay lookup, admission and both writes
+        # under one lock, so the E2E stack exercises the atomic contract.
+        with self.lock:
+            if idempotency_key:
+                existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
+                if existing is not None:
+                    return {"run": existing, "created": False}
+            if max_user_active is not None and self.count_active_runs_for_user(requested_by) >= max_user_active:
+                raise AppError("USER_CONCURRENCY_LIMIT", "too many active runs for this user", 429)
+            project_id = self._conversation_project(conversation_id)
+            if max_project_active is not None and self.count_active_runs_for_project(project_id) >= max_project_active:
+                raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429)
+            message = self.create_user_message(conversation_id, content, metadata)
+            run = self.create_queued_run(conversation_id, message["id"], content, metadata, requested_by=requested_by, idempotency_key=idempotency_key, request_fingerprint=request_fingerprint)
+            return {"run": run, "created": True}
+
+    def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None:
+        with self.lock:
+            run = self.runs.get(str(run_id))
+            if run is None or run["status"] != "queued" or run.get("launch_state") not in {"pending", "launch_failed"}:
+                return None
+            run["launch_state"] = "launching"
+            return dict(run)
+
     def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]:
         run = self.runs[str(run_id)]
         run["launch_state"] = state
@@ -157,11 +182,13 @@ class MemoryRepository:
             self.run_events.append(event)
             return dict(event)
 
-    def transition_run(self, run_id: UUID, status: str, **fields: Any) -> dict[str, Any]:
+    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, **fields: Any) -> dict[str, Any]:
         with self.lock:
             run = self.runs.get(str(run_id))
             if run is None:
                 raise NotFoundError("run", str(run_id))
+            if expected_worker_id is not None and run.get("worker_id") != expected_worker_id:
+                raise AppError("RUN_TRANSITION_CONFLICT", "run lease is no longer held", 409)
             current = run["status"]
             if status != current and current in RUN_STATES:
                 try:
@@ -174,11 +201,11 @@ class MemoryRepository:
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]:
         return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=_now(), cancellation_reason=reason)
 
-    def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]:
-        return self.transition_run(run_id, "failed", error={"code": code, "message": message}, finished_at=_now())
+    def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None) -> dict[str, Any]:
+        return self.transition_run(run_id, "failed", expected_worker_id=worker_id, error={"code": code, "message": message}, finished_at=_now())
 
-    def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]:
-        return self.transition_run(run_id, "completed", output=output, error=None, finished_at=_now())
+    def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None) -> dict[str, Any]:
+        return self.transition_run(run_id, "completed", expected_worker_id=worker_id, output=output, error=None, finished_at=_now())
 
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]:
         row = {"id": str(uuid4()), "run_id": str(run_id), **invocation}

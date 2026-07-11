@@ -14,7 +14,7 @@ from backend.config import get_settings
 from backend.auth import AuthenticatedUser, get_authenticated_user
 from backend.dependencies import get_job_launcher, get_repository
 from backend.execution_guard import ExecutionSurfaceGuardMiddleware, is_stage_enabled
-from backend.job_launcher import JobLauncher
+from backend.job_launcher import JobLauncher, JobLaunchUncertain
 from backend.errors import AppError, install_error_handlers
 from backend.repository import Repository
 from backend.schemas import (
@@ -109,40 +109,68 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
     while still queued) is safely relaunched instead of duplicated.
     """
     enforce_rate_limit("run_creation_user", str(user.user_id))
-    enforce_rate_limit("run_creation_project", str(conversation_id))
+    project_id = repo.get_conversation(conversation_id).get("project_id")
+    enforce_rate_limit("run_creation_project", str(project_id or conversation_id))
     fingerprint = _request_fingerprint(content, metadata)
+    config = BudgetConfig.from_env()
     run = None
     if idempotency_key and hasattr(repo, "find_run_by_idempotency"):
         existing = repo.find_run_by_idempotency(conversation_id, user.user_id, idempotency_key)
         if existing is not None:
             if existing.get("request_fingerprint") not in (None, fingerprint):
                 raise AppError("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409)
-            if existing.get("status") != "queued" or existing.get("launch_state") != "launch_failed":
-                # Original run is authoritative: no new message, no new run,
-                # and never a second worker launch for the same request.
-                return RunCreated(run_id=existing["id"], status=existing["status"])
-            run = existing  # recoverable failed launch: retry launch only
+            run = existing
     if run is None:
-        _enforce_concurrency_limits(repo, user, conversation_id)
         metadata = {**metadata, "requested_by": str(user.user_id)}
         if idempotency_key:
             metadata["idempotency_key"] = idempotency_key
-        message = repo.create_user_message(conversation_id, content, metadata)
-        run = repo.create_queued_run(conversation_id, message["id"], content, metadata, requested_by=user.user_id, idempotency_key=idempotency_key, request_fingerprint=fingerprint)
+        if hasattr(repo, "create_message_and_run"):
+            # Transaction-safe path (migration 012): idempotent replay,
+            # concurrency admission and message+run creation are atomic.
+            result = repo.create_message_and_run(conversation_id, content, metadata, user.user_id, idempotency_key, fingerprint, config.max_concurrent_runs_per_user, config.max_concurrent_runs_per_project)
+            run = result["run"]
+            if not result.get("created", True) and run.get("request_fingerprint") not in (None, fingerprint):
+                raise AppError("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409)
+        else:
+            # Legacy two-step path for simple test fakes only.
+            _enforce_concurrency_limits(repo, user, conversation_id)
+            message = repo.create_user_message(conversation_id, content, metadata)
+            run = repo.create_queued_run(conversation_id, message["id"], content, metadata, requested_by=user.user_id, idempotency_key=idempotency_key, request_fingerprint=fingerprint)
     run_id = UUID(str(run["id"]))
     if run.get("status") not in (None, "queued"):
         # Cancelled-before-launch or an already-progressed duplicate: never launch.
         return RunCreated(run_id=run["id"], status=run["status"])
-    if run.get("launch_state") in {"launching", "launched"}:
-        # A concurrent request already owns the launch.
+    if run.get("launch_state") == "launch_unknown":
+        # Uncertain launch outcome: an execution may already be running, so
+        # never trigger a second one automatically. Reconciliation is manual
+        # or via worker lease expiry.
         return RunCreated(run_id=run["id"], status=run["status"])
-    if hasattr(repo, "set_launch_state"):
+    # Atomic launch ownership: exactly one request wins the CAS and calls
+    # JobLauncher.launch(); concurrent replays observe launching/launched
+    # and return the existing run without launching again.
+    if hasattr(repo, "try_acquire_launch"):
+        acquired = repo.try_acquire_launch(run_id)
+        if acquired is None:
+            current = repo.get_run(run_id)
+            return RunCreated(run_id=current["id"], status=current["status"])
+        run = acquired
+    elif hasattr(repo, "set_launch_state"):
+        if run.get("launch_state") in {"launching", "launched"}:
+            return RunCreated(run_id=run["id"], status=run["status"])
         repo.set_launch_state(run_id, "launching")
     try:
         launch = launcher.launch(run_id)
+    except JobLaunchUncertain as exc:
+        # Park for reconciliation: never auto-relaunch after an uncertain
+        # response, because a worker may already be executing this run.
+        if hasattr(repo, "set_launch_state"):
+            repo.set_launch_state(run_id, "launch_unknown", error={"message": str(exc)[:500]})
+        if hasattr(repo, "append_run_event"):
+            repo.append_run_event(run_id, "launch_failed", {"message": "Worker launch outcome unknown; run parked for reconciliation", "payload": {"recoverable": False, "reconciliation_required": True}})
+        raise AppError("JOB_LAUNCH_UNKNOWN", "worker launch outcome is unknown; the run is parked for reconciliation and will not be launched twice", 502) from exc
     except Exception as exc:
-        # Leave a clear recoverable state: the run stays queued with
-        # launch_state=launch_failed and can be retried with the same key.
+        # Definite failure: leave a clear recoverable state; a retry with the
+        # same idempotency key re-acquires launch ownership via the CAS.
         if hasattr(repo, "set_launch_state"):
             repo.set_launch_state(run_id, "launch_failed", error={"message": str(exc)[:500]})
         if hasattr(repo, "append_run_event"):

@@ -15,8 +15,10 @@ class Repository(Protocol):
     def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
     def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]: ...
+    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]: ...
     def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None: ...
     def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]: ...
+    def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None: ...
     def count_active_runs_for_user(self, user_id: UUID) -> int: ...
     def count_active_runs_for_project(self, project_id: UUID) -> int: ...
     def update_run_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]: ...
@@ -138,6 +140,46 @@ class SupabaseRepository:
         )
         return rows[0] if rows else None
 
+    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]:
+        """Transactionally create the user message + queued run (migration
+        012): idempotent replay, concurrency admission and both inserts
+        happen in ONE database transaction under advisory locks."""
+        try:
+            response = self.client.rpc("create_message_and_run", {
+                "p_conversation_id": str(conversation_id),
+                "p_content": content,
+                "p_metadata": metadata,
+                "p_requested_by": str(requested_by),
+                "p_idempotency_key": idempotency_key,
+                "p_request_fingerprint": request_fingerprint,
+                "p_max_user_active": max_user_active,
+                "p_max_project_active": max_project_active,
+            }).execute()
+        except Exception as exc:
+            message = str(exc)
+            if "USER_CONCURRENCY_LIMIT" in message:
+                raise AppError("USER_CONCURRENCY_LIMIT", "too many active runs for this user", 429) from exc
+            if "PROJECT_CONCURRENCY_LIMIT" in message:
+                raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429) from exc
+            if "CONVERSATION_NOT_FOUND" in message:
+                raise NotFoundError("conversation", str(conversation_id)) from exc
+            raise AppError("REPOSITORY_ERROR", message, 502) from exc
+        data = response.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not data or "run" not in data:
+            raise AppError("REPOSITORY_ERROR", "run creation returned no row", 502)
+        return data
+
+    def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None:
+        """Atomic compare-and-set on launch ownership: only one caller can
+        move pending/launch_failed -> launching for a queued run."""
+        try:
+            rows = self.client.table("runs").update({"launch_state": "launching"}).eq("id", str(run_id)).eq("status", "queued").in_("launch_state", ["pending", "launch_failed"]).select("*").execute().data or []
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        return rows[0] if rows else None
+
     def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"launch_state": state}
         if state == "launched":
@@ -196,49 +238,76 @@ class SupabaseRepository:
         rows = self._many(query)
         return rows[0] if rows else None
 
-    def transition_run(self, run_id: UUID, status: str, **fields: Any) -> dict[str, Any]:
+    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, **fields: Any) -> dict[str, Any]:
         current = str(self.get_run(run_id).get("status", ""))
         # Same-status updates (heartbeats, metadata refresh) are no-op
         # transitions; unknown legacy statuses bypass validation so legacy
         # production rows can still be repaired through the service path.
-        if status != current and current in RUN_STATES:
+        transitioning = status != current and current in RUN_STATES
+        if transitioning:
             try:
                 validate_transition(current, status)
             except InvalidTransition as exc:
                 raise AppError("INVALID_RUN_TRANSITION", str(exc), 409) from exc
         payload = {"status": status, **fields}
-        return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
+        query = self.client.table("runs").update(payload).eq("id", str(run_id))
+        if transitioning:
+            # Compare-and-set on the observed status: a concurrent transition
+            # (e.g. a newer worker writing a terminal result) makes this
+            # update match zero rows instead of silently overwriting it.
+            query = query.eq("status", current)
+        if expected_worker_id is not None:
+            # Stale workers whose lease was reclaimed cannot overwrite the
+            # newer holder's state.
+            query = query.eq("worker_id", expected_worker_id)
+        try:
+            rows = query.select("*").execute().data or []
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        if not rows:
+            raise AppError("RUN_TRANSITION_CONFLICT", "run was modified concurrently or the lease is no longer held", 409)
+        return rows[0] if isinstance(rows, list) else rows
 
     def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
-        run = self.get_run(run_id)
-        now = datetime.now(UTC)
-        lease_expired = not run.get("lease_expires_at") or datetime.fromisoformat(str(run["lease_expires_at"]).replace("Z", "+00:00")) < now
-        if run["status"] not in {"queued", "launching", "waiting", "cancellation_requested"} and not lease_expired:
+        """Atomic lease claim via migration 012's single-statement CAS."""
+        try:
+            response = self.client.rpc("claim_run_lease", {
+                "p_run_id": str(run_id),
+                "p_worker_id": worker_id,
+                "p_lease_seconds": lease_seconds,
+            }).execute()
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        rows = response.data or []
+        if not rows:
+            # Either the run does not exist or the lease is held/finished.
+            self.get_run(run_id)  # raises 404 when missing
             raise AppError("RUN_ALREADY_CLAIMED", "run is already claimed by another worker", 409)
-        attempt = int(run.get("attempt") or 1) + (1 if lease_expired and run.get("worker_id") else 0)
-        expires = (now + timedelta(seconds=lease_seconds)).isoformat()
-        # A cancellation requested before the claim must stay visible so the
-        # engine's cancellation checker aborts before doing any work.
-        target_status = run["status"] if run["status"] == "cancellation_requested" else "starting"
-        return self.transition_run(run_id, target_status, worker_id=worker_id, lease_expires_at=expires, attempt=attempt, started_at=run.get("started_at") or now.isoformat())
+        return rows[0] if isinstance(rows, list) else rows
 
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
-        run = self.get_run(run_id)
-        if run.get("worker_id") != worker_id:
-            raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409)
         now = datetime.now(UTC)
         expires = (now + timedelta(seconds=lease_seconds)).isoformat()
+        # Atomic ownership check: the lease only extends when this worker
+        # still holds it.
+        try:
+            rows = self.client.table("runs").update({"last_heartbeat_at": now.isoformat(), "lease_expires_at": expires}).eq("id", str(run_id)).eq("worker_id", worker_id).select("*").execute().data or []
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        if not rows:
+            raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409)
+        run = rows[0]
         self.client.table("worker_heartbeats").insert({"run_id": str(run_id), "worker_id": worker_id, "attempt": run.get("attempt", 1), "heartbeat_at": now.isoformat(), "lease_expires_at": expires}).execute()
-        return self.transition_run(run_id, run["status"], last_heartbeat_at=now.isoformat(), lease_expires_at=expires)
+        return run
 
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]:
         return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=datetime.now(UTC).isoformat(), cancellation_reason=reason)
 
-    def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]:
-        return self.transition_run(run_id, "failed", error={"code": code, "message": message}, finished_at=datetime.now(UTC).isoformat())
+    def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None) -> dict[str, Any]:
+        return self.transition_run(run_id, "failed", expected_worker_id=worker_id, error={"code": code, "message": message}, finished_at=datetime.now(UTC).isoformat())
 
-    def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]:
-        return self.transition_run(run_id, "completed", output=output, error=None, finished_at=datetime.now(UTC).isoformat())
+    def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None) -> dict[str, Any]:
+        return self.transition_run(run_id, "completed", expected_worker_id=worker_id, output=output, error=None, finished_at=datetime.now(UTC).isoformat())
 
     def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any], project_id: UUID | None = None, created_by: UUID | None = None) -> dict[str, Any]:
         payload = {"user_request": user_request, **proposal}

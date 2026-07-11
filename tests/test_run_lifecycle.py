@@ -324,3 +324,41 @@ def test_invalid_transitions_raise(current, new):
 ])
 def test_supported_transitions_are_valid(current, new):
     validate_transition(current, new)
+
+
+def test_uncertain_launch_parks_run_and_never_relaunches(env):
+    from backend.job_launcher import JobLaunchUncertain
+
+    repo, launcher = env
+
+    class UncertainOnce:
+        def __init__(self):
+            self.calls = 0
+
+        def launch(self, run_id):
+            self.calls += 1
+            raise JobLaunchUncertain("timeout after send")
+
+    uncertain = UncertainOnce()
+    app.dependency_overrides[get_job_launcher] = lambda: uncertain
+    first = create_run(repo)
+    assert first.status_code == 502
+    assert first.json()["error"]["code"] == "JOB_LAUNCH_UNKNOWN"
+    run = next(iter(repo.runs.values()))
+    assert run["launch_state"] == "launch_unknown"
+    assert run["status"] == "queued"
+    # A replay with the same idempotency key must NOT trigger a second
+    # launch attempt: the outcome is unknown and reconciliation is manual.
+    replay = create_run(repo)
+    assert replay.status_code == 202
+    assert uncertain.calls == 1
+    assert len(repo.runs) == 1
+
+
+def test_definite_launch_failure_stays_retryable_unlike_uncertain(env):
+    repo, launcher = env
+    launcher.failures = 1
+    failed = create_run(repo)
+    assert failed.status_code == 502
+    assert failed.json()["error"]["code"] == "JOB_LAUNCH_FAILED"
+    assert next(iter(repo.runs.values()))["launch_state"] == "launch_failed"

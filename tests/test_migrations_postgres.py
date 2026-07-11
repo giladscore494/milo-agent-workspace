@@ -943,3 +943,220 @@ def test_011_is_rerun_safe(ownership_db):
     assert ownership_db.psql(
         "select count(*) from pg_proc where proname='create_project_from_proposal_with_owner'"
     ) == "1"
+
+
+# --- migration 012 (atomic run operations) executable validation ---
+
+ATOMIC_PROJECT = "bbbbbbbb-0000-4000-8000-000000000021"
+ATOMIC_CONVERSATION = "dddddddd-0000-4000-8000-000000000001"
+
+
+def _seed_atomic_fixture(db) -> None:
+    db.psql(
+        f"insert into auth.users (id) values ('{PROPOSAL_MEMBER_USER}') on conflict do nothing; "
+        f"insert into public.projects (id, slug, name, workflow_key) values "
+        f"('{ATOMIC_PROJECT}', 'atomic-scope', 'Atomic Scope', 'vehicle_catalog_v1') on conflict (id) do nothing; "
+        f"insert into public.conversations (id, project_id, title) values "
+        f"('{ATOMIC_CONVERSATION}', '{ATOMIC_PROJECT}', 'atomic conversation') on conflict (id) do nothing"
+    )
+
+
+def _create_run_sql(key: str, content: str = "concurrent content", max_user: str = "null", max_project: str = "null") -> str:
+    return (
+        "select public.create_message_and_run("
+        f"'{ATOMIC_CONVERSATION}', '{content}', '{{}}'::jsonb, '{PROPOSAL_MEMBER_USER}', "
+        f"'{key}', 'fp-{key}', {max_user}, {max_project})"
+    )
+
+
+def test_012_concurrent_same_key_creates_exactly_one_message_and_run(ownership_db):
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    key = "concurrent-key-1"
+
+    def attempt(_):
+        try:
+            return ("ok", ownership_db.psql(_create_run_sql(key)))
+        except AssertionError as exc:
+            return ("err", str(exc))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(attempt, range(8)))
+    assert all(kind == "ok" for kind, _ in results), results
+    created_flags = ["'created': True" in out or '"created": true' in out for _, out in results]
+    assert sum(created_flags) == 1, results
+    assert ownership_db.psql(
+        f"select count(*) from public.runs where idempotency_key='{key}'"
+    ) == "1"
+    assert ownership_db.psql(
+        f"select count(*) from public.messages where conversation_id='{ATOMIC_CONVERSATION}' "
+        f"and content='concurrent content'"
+    ) == "1"
+
+
+def test_012_concurrent_admission_never_exceeds_user_cap(ownership_db):
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    ownership_db.psql(
+        f"update public.runs set status='completed' where requested_by='{PROPOSAL_MEMBER_USER}' "
+        "and status in ('queued','launching','starting','running','waiting','cancellation_requested')"
+    )
+
+    def attempt(i):
+        try:
+            ownership_db.psql(_create_run_sql(f"admission-key-{i}", content=f"admission {i}", max_user="2"))
+            return "ok"
+        except AssertionError as exc:
+            assert "USER_CONCURRENCY_LIMIT" in str(exc)
+            return "limited"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(attempt, range(6)))
+    assert results.count("ok") == 2, results
+    assert results.count("limited") == 4, results
+    active = ownership_db.psql(
+        f"select count(*) from public.runs where requested_by='{PROPOSAL_MEMBER_USER}' and status='queued'"
+    )
+    assert active == "2"
+
+
+def test_012_message_rolls_back_when_run_insert_fails(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    messages_before = ownership_db.psql("select count(*) from public.messages")
+    runs_before = ownership_db.psql("select count(*) from public.runs")
+    # Deterministically fail the second insert (the run) with a temporary
+    # check constraint, proving the message insert rolls back with it.
+    ownership_db.psql(
+        "alter table public.runs add constraint test_block_rollback_fp "
+        "check (request_fingerprint is distinct from 'fp-rollback-key')"
+    )
+    try:
+        with pytest.raises(AssertionError, match="test_block_rollback_fp"):
+            ownership_db.psql(_create_run_sql("rollback-key", content="rollback content"))
+    finally:
+        ownership_db.psql("alter table public.runs drop constraint test_block_rollback_fp")
+    assert ownership_db.psql("select count(*) from public.messages") == messages_before
+    assert ownership_db.psql("select count(*) from public.runs") == runs_before
+    assert ownership_db.psql(
+        "select count(*) from public.messages where content='rollback content'"
+    ) == "0"
+
+
+def test_012_launch_state_check_includes_launch_unknown(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'launch_unknown') returning id"
+    )
+    assert run_id
+
+
+def test_012_launch_cas_only_one_winner(ownership_db):
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'pending') returning id"
+    )
+
+    def attempt(_):
+        return ownership_db.psql(
+            f"update public.runs set launch_state='launching' "
+            f"where id='{run_id}' and status='queued' and launch_state in ('pending','launch_failed') "
+            "returning id"
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(attempt, range(6)))
+    winners = [r for r in results if r.strip()]
+    assert len(winners) == 1, results
+
+
+def test_012_lease_claim_single_holder_under_concurrency(ownership_db):
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+    )
+
+    def claim(i):
+        return ownership_db.psql(
+            f"select worker_id from public.claim_run_lease('{run_id}', 'worker-{i}', 300)"
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(claim, range(6)))
+    winners = [r for r in results if r.strip()]
+    assert len(winners) == 1, results
+    assert ownership_db.psql(f"select status from public.runs where id='{run_id}'") == "starting"
+    assert ownership_db.psql(f"select attempt from public.runs where id='{run_id}'") == "1"
+
+
+def test_012_expired_lease_is_reclaimable_with_incremented_attempt(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+    )
+    assert ownership_db.psql(f"select worker_id from public.claim_run_lease('{run_id}', 'worker-old', 300)") == "worker-old"
+    # A second worker cannot claim while the lease is fresh.
+    assert ownership_db.psql(f"select worker_id from public.claim_run_lease('{run_id}', 'worker-new', 300)") == ""
+    ownership_db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+    row = ownership_db.psql(f"select worker_id, attempt from public.claim_run_lease('{run_id}', 'worker-new', 300)")
+    assert row == "worker-new|2"
+
+
+def test_012_stale_worker_cannot_overwrite_newer_result(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+    )
+    ownership_db.psql(f"select public.claim_run_lease('{run_id}', 'worker-old', 300)")
+    ownership_db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+    ownership_db.psql(f"select public.claim_run_lease('{run_id}', 'worker-new', 300)")
+    # The stale worker's conditional terminal write matches zero rows.
+    stale_write = ownership_db.psql(
+        f"update public.runs set status='failed' where id='{run_id}' and worker_id='worker-old' returning id"
+    )
+    assert stale_write.strip() == ""
+    # The new holder completes; the terminal result is protected afterwards.
+    ownership_db.psql(
+        f"update public.runs set status='running' where id='{run_id}' and worker_id='worker-new'"
+    )
+    ownership_db.psql(
+        f"update public.runs set status='completed' where id='{run_id}' and worker_id='worker-new' and status='running'"
+    )
+    late_stale = ownership_db.psql(
+        f"update public.runs set status='failed' where id='{run_id}' and worker_id='worker-old' and status='running' returning id"
+    )
+    assert late_stale.strip() == ""
+    assert ownership_db.psql(f"select status from public.runs where id='{run_id}'") == "completed"
+
+
+def test_012_cancellation_stays_visible_through_lease_claim(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'cancellation_requested', '{{}}'::jsonb) returning id"
+    )
+    claimed = ownership_db.psql(f"select status from public.claim_run_lease('{run_id}', 'worker-c', 300)")
+    assert claimed == "cancellation_requested"
+
+
+def test_012_is_rerun_safe(ownership_db):
+    migration_012 = next(m for m in MIGRATIONS if m.name.startswith("012"))
+    ownership_db.psql(file=migration_012)
+    assert ownership_db.psql("select count(*) from pg_proc where proname='create_message_and_run'") == "1"
+    assert ownership_db.psql("select count(*) from pg_proc where proname='claim_run_lease'") == "1"
+
+
+def test_012_authenticated_cannot_execute_run_functions(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    with pytest.raises(AssertionError, match="permission denied"):
+        _as_authenticated(ownership_db, PROPOSAL_MEMBER_USER, _create_run_sql("sneaky-key"))
