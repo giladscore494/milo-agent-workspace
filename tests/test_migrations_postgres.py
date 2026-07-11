@@ -850,3 +850,21 @@ def test_009_is_rerun_safe(db):
     before = db.psql("select count(*) from public.runs")
     db.psql(file=migration_009)
     assert db.psql("select count(*) from public.runs") == before
+
+
+# --- migration 010 (run usage accounting) executable validation ---
+
+def test_010_adds_usage_column_with_empty_default(db):
+    assert db.psql(
+        "select data_type from information_schema.columns "
+        "where table_schema='public' and table_name='runs' and column_name='usage'"
+    ) == "jsonb"
+    assert db.psql(
+        "select count(*) from public.runs where id='22222222-2222-2222-2222-222222222222' and usage = '{}'::jsonb"
+    ) == "1"
+
+
+def test_010_is_rerun_safe(db):
+    migration_010 = next(m for m in MIGRATIONS if m.name.startswith("010"))
+    db.psql(file=migration_010)
+    assert db.psql("select count(*) from public.runs where usage is null") == "0"

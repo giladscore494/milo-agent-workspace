@@ -3,6 +3,7 @@ import os
 from typing import Any
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
+from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, build_guarded_client_factory, paid_execution_enabled
 from backend.config import get_settings
 from backend.errors import AppError
 from backend.repository import Repository, SupabaseRepository
@@ -18,7 +19,7 @@ def resolve_run_id(cli_run_id: str | None) -> UUID:
     return UUID(value)
 
 
-def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None) -> int:
+def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, budget_tracker: "BudgetTracker | None" = None) -> int:
     worker_id = os.getenv("WORKER_ID", f"worker-{uuid4()}")
     if hasattr(repo, "claim_run"):
         run = repo.claim_run(run_id, worker_id)
@@ -69,7 +70,33 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None) ->
             shadow_observe("checkpoint_saved", checkpoint)
     def is_cancelled():
         return repo.get_run(run_id).get("status") == "cancellation_requested"
+
+    # Hard budget/cost gate. Fail closed: paid execution requires both the
+    # global kill switch and complete mandatory budget configuration; the
+    # tracker also blocks every call while MILO_ENABLE_PAID_EXECUTION is off.
+    budget_config = BudgetConfig.from_env()
+    if paid_execution_enabled() and budget_config.missing_mandatory():
+        missing = ", ".join(budget_config.missing_mandatory())
+        sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Budget configuration incomplete; refusing paid execution", payload={"code": "BUDGET_CONFIG_INVALID", "missing": missing}))
+        repo.mark_run_failed(run_id, "BUDGET_CONFIG_INVALID", f"mandatory budget settings missing: {missing}")
+        return 1
+
+    def emit_budget_event(event_type, payload):
+        sink.emit(RunEventRecord(run_id=run_id, type=event_type, message=payload.get("message", event_type), payload=payload.get("payload", payload)))
+        shadow_observe(event_type, payload)
+
+    def record_usage(usage):
+        if hasattr(repo, "update_run_usage"):
+            repo.update_run_usage(run_id, usage)
+
+    tracker = budget_tracker or BudgetTracker(
+        budget_config,
+        cancellation_checker=is_cancelled,
+        event_emitter=emit_budget_event,
+        usage_recorder=record_usage,
+    )
     selected_engine = engine or VehicleCatalogV1Adapter(
+        model_client_factory=build_guarded_client_factory(tracker),
         event_sink=lambda t, p: (sink.emit(RunEventRecord(run_id=run_id, type=t, message=p.get("message", t), payload=p, phase=p.get("phase"), agent=p.get("agent"), progress=p.get("progress"))), shadow_observe(t, p)),
         checkpoint_sink=save_checkpoint,
         cancellation_checker=is_cancelled,
@@ -82,6 +109,17 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None) ->
         if hasattr(repo, "transition_run"):
             repo.transition_run(run_id, "cancelled", finished_at=datetime.now(UTC).isoformat())
         return 0
+    except BudgetExceeded as exc:
+        if hasattr(repo, "transition_run"):
+            repo.transition_run(run_id, exc.terminal_status, error={"code": exc.code, "message": exc.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+        return 1
+    if tracker.stop is not None:
+        # The engine absorbed per-agent failures, but a hard limit tripped:
+        # never report success and record the terminal budget status.
+        stop = tracker.stop
+        if hasattr(repo, "transition_run"):
+            repo.transition_run(run_id, stop.terminal_status, error={"code": stop.code, "message": stop.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+        return 1
     if result.get("status") in {"complete", "partial_success", "success"} or (result.get("status") != "failed" and result.get("result")):
         status = "partial_success" if result.get("status") == "partial_success" else "completed"
         sink.emit(RunEventRecord(run_id=run_id, type="run_partial_success" if status == "partial_success" else "run_completed", message=f"Run {status}", payload={"status": result.get("status")}))

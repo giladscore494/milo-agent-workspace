@@ -9,6 +9,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from backend.budget import BudgetConfig
 from backend.config import get_settings
 from backend.auth import AuthenticatedUser, get_authenticated_user
 from backend.dependencies import get_job_launcher, get_repository
@@ -71,6 +72,19 @@ def _request_fingerprint(content: str, metadata: dict) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _enforce_concurrency_limits(repo: Repository, user: AuthenticatedUser, conversation_id: UUID) -> None:
+    """Server-side concurrency caps, applied before any run row is created."""
+    config = BudgetConfig.from_env()
+    if config.max_concurrent_runs_per_user is not None and hasattr(repo, "count_active_runs_for_user"):
+        if repo.count_active_runs_for_user(user.user_id) >= config.max_concurrent_runs_per_user:
+            raise AppError("USER_CONCURRENCY_LIMIT", "too many active runs for this user", 429)
+    if config.max_concurrent_runs_per_project is not None and hasattr(repo, "count_active_runs_for_project"):
+        conversation = repo.get_conversation(conversation_id)
+        project_id = conversation.get("project_id")
+        if project_id and repo.count_active_runs_for_project(project_id) >= config.max_concurrent_runs_per_project:
+            raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429)
+
+
 def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: AuthenticatedUser, conversation_id: UUID, content: str, metadata: dict, idempotency_key: str | None = None) -> RunCreated:
     """Create the user message + queued run and request a worker launch.
 
@@ -96,6 +110,7 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
                 return RunCreated(run_id=existing["id"], status=existing["status"])
             run = existing  # recoverable failed launch: retry launch only
     if run is None:
+        _enforce_concurrency_limits(repo, user, conversation_id)
         metadata = {**metadata, "requested_by": str(user.user_id)}
         if idempotency_key:
             metadata["idempotency_key"] = idempotency_key

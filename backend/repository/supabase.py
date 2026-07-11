@@ -16,6 +16,9 @@ class Repository(Protocol):
     def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]: ...
     def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None: ...
     def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]: ...
+    def count_active_runs_for_user(self, user_id: UUID) -> int: ...
+    def count_active_runs_for_project(self, project_id: UUID) -> int: ...
+    def update_run_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]: ...
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
@@ -137,6 +140,19 @@ class SupabaseRepository:
         if error is not None:
             payload["launch_error"] = error
         return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
+
+    ACTIVE_RUN_STATES = ("queued", "launching", "starting", "running", "waiting", "cancellation_requested")
+
+    def count_active_runs_for_user(self, user_id: UUID) -> int:
+        rows = self._many(self.client.table("runs").select("id").eq("requested_by", str(user_id)).in_("status", list(self.ACTIVE_RUN_STATES)).limit(1000))
+        return len(rows)
+
+    def count_active_runs_for_project(self, project_id: UUID) -> int:
+        rows = self._many(self.client.table("runs").select("id, conversations!inner(project_id)").eq("conversations.project_id", str(project_id)).in_("status", list(self.ACTIVE_RUN_STATES)).limit(1000))
+        return len(rows)
+
+    def update_run_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]:
+        return self._single(self.client.table("runs").update({"usage": usage}).eq("id", str(run_id)).select("*"), "run", str(run_id))
 
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
         query = self.client.table("runs").select("*").eq("id", str(run_id)).limit(1)
