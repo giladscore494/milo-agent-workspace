@@ -154,3 +154,36 @@ def test_worker_route_rate_limits_by_service_identity(monkeypatch):
         assert limited.headers.get("retry-after")
     finally:
         app.dependency_overrides.clear()
+
+
+def test_project_rate_limit_uses_project_id_not_conversation_id(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from backend.dependencies import get_job_launcher, get_repository
+    from backend.main import app
+    from backend.testing.memory_repository import MemoryRepository
+    from tests.test_api import FakeLauncher
+
+    repo = MemoryRepository()
+    user = "aaaaaaaa-1111-4111-8111-000000000001"
+    project = "bbbbbbbb-1111-4111-8111-000000000031"
+    repo.seed_user(user)
+    repo.seed_project(project, "limit-scope", "Limit Scope", [user])
+    convo_a = repo.create_conversation(project, "a")["id"]
+    convo_b = repo.create_conversation(project, "b")["id"]
+
+    monkeypatch.setenv("MILO_ENABLE_RUN_CREATION", "true")
+    monkeypatch.setenv("MILO_RATE_LIMIT_RUN_CREATION_PROJECT", "1")
+    monkeypatch.setenv("MILO_RATE_LIMIT_RUN_CREATION_USER", "100")
+    app.dependency_overrides[get_repository] = lambda: repo
+    app.dependency_overrides[get_job_launcher] = lambda: FakeLauncher()
+    try:
+        client = TestClient(app)
+        headers = {"x-milo-auth-user-id": user}
+        first = client.post(f"/conversations/{convo_a}/runs", json={"content": "go", "idempotency_key": "proj-key-000001"}, headers=headers)
+        assert first.status_code == 202
+        # A DIFFERENT conversation in the SAME project shares the limit.
+        second = client.post(f"/conversations/{convo_b}/runs", json={"content": "go", "idempotency_key": "proj-key-000002"}, headers=headers)
+        assert second.status_code == 429
+    finally:
+        app.dependency_overrides.clear()

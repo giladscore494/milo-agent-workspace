@@ -11,7 +11,7 @@ import {
 import {
   RateLimitCategory,
   checkRateLimit,
-  normalizeForwardedIp,
+  getTrustedClientIp,
 } from '@/lib/server/rateLimit';
 import { GatewayAuthError, validateSupabaseAccessToken } from '@/lib/server/supabaseAuth';
 
@@ -67,7 +67,7 @@ async function proxyRequest(
     );
   }
 
-  const clientIp = normalizeForwardedIp(request.headers.get('x-forwarded-for'));
+  const clientIp = getTrustedClientIp(request.headers);
   const preAuthCategory: RateLimitCategory = request.headers.get('authorization')
     ? 'auth_pressure'
     : 'unauthenticated';

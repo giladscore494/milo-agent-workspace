@@ -55,12 +55,39 @@ function readPositiveNumber(name: string, fallback: number): number {
   return value;
 }
 
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+const IPV6_RE = /^[0-9a-f]{0,4}(:[0-9a-f]{0,4}){1,7}$/;
+
+function isValidIp(candidate: string): boolean {
+  const v4 = candidate.match(IPV4_RE);
+  if (v4) return v4.slice(1).every((octet) => Number(octet) <= 255);
+  return IPV6_RE.test(candidate) && candidate.includes(':');
+}
+
 export function normalizeForwardedIp(value: string | null): string {
   const first = value?.split(',')[0]?.trim().toLowerCase() ?? '';
-  // Loose IPv4/IPv6 shape check; anything else collapses to one bucket so
-  // header garbage cannot create unbounded key cardinality.
-  if (!/^[0-9a-f:.\[\]]{3,45}$/.test(first)) return 'invalid-ip';
+  // Strict IPv4/IPv6 validation; anything else collapses to one shared
+  // bucket so header garbage cannot create unbounded key cardinality or
+  // bypass the limiter with unique junk values.
+  if (!first || first.length > 45 || !isValidIp(first)) return 'invalid-ip';
   return first;
+}
+
+/**
+ * Trusted client IP derivation. On Vercel, `x-real-ip` and
+ * `x-vercel-forwarded-for` are set by the platform and cannot be spoofed
+ * by the browser; `x-forwarded-for` is normalized by the platform as well
+ * but is the weakest signal, so it is only the final fallback. All values
+ * pass strict IP validation and invalid input collapses to one bucket.
+ */
+export function getTrustedClientIp(headers: {
+  get(name: string): string | null;
+}): string {
+  for (const name of ['x-real-ip', 'x-vercel-forwarded-for', 'x-forwarded-for']) {
+    const candidate = normalizeForwardedIp(headers.get(name));
+    if (candidate !== 'invalid-ip') return candidate;
+  }
+  return 'invalid-ip';
 }
 
 export type RateLimitDecision = {

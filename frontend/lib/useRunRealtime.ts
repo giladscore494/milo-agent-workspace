@@ -18,9 +18,17 @@ const MAX_BACKOFF_MS = 30_000;
 
 export type PollingMode = 'idle' | 'polling' | 'reconnecting' | 'terminal';
 
-type RunAction = { kind: 'event'; event: RunEvent } | { kind: 'run'; run: Run };
+type RunAction =
+  | { kind: 'event'; event: RunEvent }
+  | { kind: 'run'; run: Run }
+  | { kind: 'reset' };
 
 function workspaceReducer(state: WorkspaceState, action: RunAction): WorkspaceState {
+  if (action.kind === 'reset') {
+    // Full isolation between runs: events, agents, sources, claims,
+    // conflicts, errors, cost and token totals all restart from zero.
+    return initialWorkspaceState;
+  }
   if (action.kind === 'run') {
     return { ...state, run: action.run, currentPhase: TERMINAL_RUN_STATES.has(action.run.status) ? action.run.status : state.currentPhase };
   }
@@ -53,18 +61,23 @@ export function useRunRealtime(runId?: string) {
   const failures = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout>>();
   const stopped = useRef(false);
+  // Monotonic generation: bumps whenever the active run (or user/session)
+  // changes, so a late response from run A can never mutate run B's state.
+  const generation = useRef(0);
 
   useEffect(() => {
     lastEventId.current = state.lastEventId;
   }, [state.lastEventId]);
 
-  const poll = useCallback(async (id: string) => {
+  const poll = useCallback(async (id: string, myGeneration: number) => {
     if (inFlight.current || stopped.current) return;
     inFlight.current = true;
     try {
       const run = await api.run(id);
+      if (generation.current !== myGeneration) return; // stale response
       dispatch({ kind: 'run', run });
       const events = await api.events(id, lastEventId.current);
+      if (generation.current !== myGeneration) return; // stale response
       for (const event of events) dispatch({ kind: 'event', event });
       failures.current = 0;
       if (TERMINAL_RUN_STATES.has(run.status)) {
@@ -74,6 +87,7 @@ export function useRunRealtime(runId?: string) {
         setMode('polling');
       }
     } catch {
+      if (generation.current !== myGeneration) return;
       failures.current += 1;
       setMode('reconnecting');
     } finally {
@@ -82,20 +96,27 @@ export function useRunRealtime(runId?: string) {
   }, []);
 
   useEffect(() => {
+    // Every run switch starts from a clean slate and invalidates any
+    // in-flight request from the previous run.
+    generation.current += 1;
+    const myGeneration = generation.current;
+    dispatch({ kind: 'reset' });
+    stopped.current = false;
+    failures.current = 0;
+    lastEventId.current = undefined;
+    inFlight.current = false;
+
     if (!runId) {
       setMode('idle');
       return;
     }
-    stopped.current = false;
-    failures.current = 0;
-    lastEventId.current = undefined;
     setMode('polling');
 
     let cancelled = false;
     const tick = async () => {
-      if (cancelled || stopped.current) return;
-      await poll(runId);
-      if (cancelled || stopped.current) return;
+      if (cancelled || stopped.current || generation.current !== myGeneration) return;
+      await poll(runId, myGeneration);
+      if (cancelled || stopped.current || generation.current !== myGeneration) return;
       const backoff = Math.min(
         BASE_INTERVAL_MS * 2 ** failures.current,
         MAX_BACKOFF_MS,
