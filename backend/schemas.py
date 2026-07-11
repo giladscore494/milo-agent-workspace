@@ -35,7 +35,7 @@ class Conversation(BaseModel):
 class RunCreate(BaseModel):
     content: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+    idempotency_key: str = Field(min_length=8, max_length=128)
 
 
 class Run(BaseModel):
@@ -51,6 +51,9 @@ class Run(BaseModel):
     input: dict[str, Any] | None = None
     output: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
+    launch_state: str | None = None
+    launch_error_class: str | None = None
+    launch_reconciliation_required: bool = False
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -140,7 +143,7 @@ class ProposalRunCreate(BaseModel):
     conversation_id: UUID
     content: str = Field(min_length=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+    idempotency_key: str = Field(min_length=8, max_length=128)
 
 
 class ToolAccessRequestCreate(BaseModel):

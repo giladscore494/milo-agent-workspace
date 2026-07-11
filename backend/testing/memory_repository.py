@@ -189,6 +189,8 @@ class MemoryRepository:
                 raise NotFoundError("run", str(run_id))
             if expected_worker_id is not None and run.get("worker_id") != expected_worker_id:
                 raise AppError("RUN_TRANSITION_CONFLICT", "run lease is no longer held", 409)
+            if expected_worker_id is not None and run.get("lease_expires_at") and run["lease_expires_at"] <= _now():
+                raise AppError("RUN_TRANSITION_CONFLICT", "run lease has expired", 409)
             current = run["status"]
             if status != current and current in RUN_STATES:
                 try:
@@ -289,10 +291,17 @@ class MemoryRepository:
     def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
         run = self.get_run(run_id)
         target = run["status"] if run["status"] == "cancellation_requested" else "starting"
-        return self.transition_run(run_id, target, worker_id=worker_id, started_at=run.get("started_at") or _now())
+        from datetime import datetime, UTC, timedelta
+        return self.transition_run(run_id, target, worker_id=worker_id, started_at=run.get("started_at") or _now(), lease_expires_at=(datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat())
 
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
-        return self.get_run(run_id)
+        from datetime import datetime, UTC, timedelta
+        run = self.get_run(run_id)
+        if run.get("worker_id") != worker_id or (run.get("lease_expires_at") and run["lease_expires_at"] <= _now()):
+            raise AppError("RUN_LEASE_LOST", "run lease is held by another worker or expired", 409)
+        run["last_heartbeat_at"] = _now()
+        run["lease_expires_at"] = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
+        return dict(run)
 
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None:
         return None

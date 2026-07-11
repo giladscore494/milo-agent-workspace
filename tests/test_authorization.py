@@ -42,13 +42,13 @@ def stranger_headers():
 
 BROWSER_MUTATION_REQUESTS = [
     ("POST", "/projects/{project_id}/conversations", {"title": "t"}),
-    ("POST", "/conversations/{conversation_id}/runs", {"content": "go"}),
+    ("POST", "/conversations/{conversation_id}/runs", {"content": "go", "idempotency_key": "auth-test-run-0001"}),
     ("POST", "/workflow-proposals", {"user_request": "Create a current cited report", "project_id": "{project_id}"}),
     ("POST", "/workflow-proposals/{proposal_id}/approve", {}),
     ("POST", "/workflow-proposals/{proposal_id}/reject", {}),
     ("POST", "/workflow-proposals/{proposal_id}/revise", {"user_request": "Create another current cited report"}),
     ("POST", "/workflow-proposals/{proposal_id}/project", {"slug": "s", "name": "N"}),
-    ("POST", "/workflow-proposals/{proposal_id}/runs", {"conversation_id": "{conversation_id}", "content": "go"}),
+    ("POST", "/workflow-proposals/{proposal_id}/runs", {"conversation_id": "{conversation_id}", "content": "go", "idempotency_key": "auth-proposal-run-0001"}),
     ("POST", "/runs/{run_id}/cancel", {"reason": "stop"}),
 ]
 
@@ -102,7 +102,7 @@ def test_email_header_alone_never_authenticates(repo):
 
 
 def test_member_can_create_run_and_launch_happens_once(repo):
-    response = client().post(f"/conversations/{repo.conversation_id}/runs", json={"content": "go"}, headers=member_headers(repo))
+    response = client().post(f"/conversations/{repo.conversation_id}/runs", json={"content": "go", "idempotency_key": "auth-test-run-0002"}, headers=member_headers(repo))
     assert response.status_code == 202
     assert repo.created_messages == 1
     assert repo.created_runs == 1
@@ -110,7 +110,7 @@ def test_member_can_create_run_and_launch_happens_once(repo):
 
 
 def test_cross_user_run_creation_never_reaches_launcher(repo):
-    response = client().post(f"/conversations/{repo.conversation_id}/runs", json={"content": "go"}, headers=stranger_headers())
+    response = client().post(f"/conversations/{repo.conversation_id}/runs", json={"content": "go", "idempotency_key": "auth-test-run-0003"}, headers=stranger_headers())
     assert response.status_code == 404
     assert repo.created_messages == 0
     assert repo.created_runs == 0

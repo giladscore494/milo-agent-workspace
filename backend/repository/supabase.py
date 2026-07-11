@@ -232,6 +232,51 @@ class SupabaseRepository:
                 per_call.setdefault(key, float(row.get("estimated_cost") or 0.0))
         return round(sum(per_call.values()), 6)
 
+    def reserve_daily_user_budget(self, run_id: UUID, user_id: str, amount: float, daily_limit: float) -> dict[str, Any]:
+        row = self.client.rpc("reserve_daily_user_budget", {
+            "p_run_id": str(run_id), "p_user_id": str(user_id),
+            "p_amount": amount, "p_daily_limit": daily_limit,
+        }).execute().data
+        row = row[0] if isinstance(row, list) else row
+        if row and row.get("decision") == "rejected":
+            raise AppError("DAILY_USER_BUDGET_REACHED", "daily user budget exhausted", 429)
+        return row
+
+    def reserve_daily_project_budget(self, run_id: UUID, project_id: str, amount: float, daily_limit: float) -> dict[str, Any]:
+        row = self.client.rpc("reserve_daily_project_budget", {
+            "p_run_id": str(run_id), "p_project_id": str(project_id),
+            "p_amount": amount, "p_daily_limit": daily_limit,
+        }).execute().data
+        row = row[0] if isinstance(row, list) else row
+        if row and row.get("decision") == "rejected":
+            raise AppError("DAILY_PROJECT_BUDGET_REACHED", "daily project budget exhausted", 429)
+        return row
+
+    def reserve_model_call_budget(self, run_id: UUID, call_seq: int, user_id: str | None, project_id: str | None, amount: float, daily_user_limit: float | None, daily_project_limit: float | None) -> dict[str, Any]:
+        row = self.client.rpc("reserve_model_call_budget", {
+            "p_run_id": str(run_id),
+            "p_call_seq": int(call_seq),
+            "p_user_id": str(user_id) if user_id else None,
+            "p_project_id": str(project_id) if project_id else None,
+            "p_estimated_cost": amount,
+            "p_daily_user_limit": daily_user_limit,
+            "p_daily_project_limit": daily_project_limit,
+        }).execute().data
+        row = row[0] if isinstance(row, list) else row
+        if row and row.get("status") == "rejected":
+            reason = row.get("rejection_reason") or "DAILY_BUDGET_REACHED"
+            raise AppError(reason, "daily budget exhausted", 429)
+        return row
+
+    def settle_model_call_budget(self, reservation_id: str, actual_cost: float, status: str = "settled", rejection_reason: str | None = None) -> dict[str, Any]:
+        row = self.client.rpc("settle_model_call_budget", {
+            "p_reservation_id": str(reservation_id),
+            "p_actual_cost": actual_cost,
+            "p_status": status,
+            "p_rejection_reason": rejection_reason,
+        }).execute().data
+        return row[0] if isinstance(row, list) else row
+
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
         query = self.client.table("runs").select("*").eq("id", str(run_id)).limit(1)
         if user_id is not None:
@@ -289,8 +334,9 @@ class SupabaseRepository:
             query = query.eq("status", current)
         if expected_worker_id is not None:
             # Stale workers whose lease was reclaimed cannot overwrite the
-            # newer holder's state.
+            # newer holder's state. Lease expiry is part of ownership.
             query = query.eq("worker_id", expected_worker_id)
+            query = query.gt("lease_expires_at", datetime.now(UTC).isoformat())
         try:
             rows = query.select("*").execute().data or []
         except Exception as exc:
@@ -322,7 +368,7 @@ class SupabaseRepository:
         # Atomic ownership check: the lease only extends when this worker
         # still holds it.
         try:
-            rows = self.client.table("runs").update({"last_heartbeat_at": now.isoformat(), "lease_expires_at": expires}).eq("id", str(run_id)).eq("worker_id", worker_id).select("*").execute().data or []
+            rows = self.client.table("runs").update({"last_heartbeat_at": now.isoformat(), "lease_expires_at": expires}).eq("id", str(run_id)).eq("worker_id", worker_id).gt("lease_expires_at", now.isoformat()).in_("status", ["starting", "running", "cancellation_requested"]).select("*").execute().data or []
         except Exception as exc:
             raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
         if not rows:
