@@ -24,3 +24,6 @@ coverage/
 
 .vite/
 *.tsbuildinfo
+.next-e2e-*/
+frontend/test-results/
+frontend/playwright-report/

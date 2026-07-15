@@ -6,20 +6,25 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 RUN_STATES = {
-    "queued", "starting", "running", "waiting", "completed", "partial_success", "failed",
-    "cancellation_requested", "cancelled",
+    "queued", "launching", "starting", "running", "waiting", "completed", "partial_success",
+    "failed", "cancellation_requested", "cancelled", "timed_out", "budget_exhausted",
 }
-TERMINAL_STATES = {"completed", "partial_success", "failed", "cancelled"}
+TERMINAL_STATES = {"completed", "partial_success", "failed", "cancelled", "timed_out", "budget_exhausted"}
 VALID_TRANSITIONS: dict[str, set[str]] = {
-    "queued": {"starting", "cancellation_requested", "failed"},
-    "starting": {"running", "waiting", "cancellation_requested", "failed"},
-    "running": {"waiting", "completed", "partial_success", "failed", "cancellation_requested"},
-    "waiting": {"running", "failed", "cancellation_requested"},
+    "queued": {"launching", "starting", "cancellation_requested", "failed"},
+    "launching": {"queued", "starting", "running", "cancellation_requested", "failed"},
+    # completed/partial_success from starting covers the checkpoint fast
+    # path, where a resumed run finishes without re-entering running.
+    "starting": {"running", "waiting", "completed", "partial_success", "cancellation_requested", "failed", "timed_out"},
+    "running": {"waiting", "completed", "partial_success", "failed", "cancellation_requested", "timed_out", "budget_exhausted"},
+    "waiting": {"running", "failed", "cancellation_requested", "timed_out", "budget_exhausted"},
     "cancellation_requested": {"cancelled", "failed"},
     "completed": set(),
     "partial_success": set(),
     "failed": set(),
     "cancelled": set(),
+    "timed_out": set(),
+    "budget_exhausted": set(),
 }
 EVENT_TYPES = {
     "run_created", "run_started", "run_resumed", "phase_started", "phase_completed",
@@ -29,6 +34,9 @@ EVENT_TYPES = {
     "run_failed", "run_cancelled",
     "tool_access_requested", "tool_access_granted", "tool_access_denied", "tool_used",
     "source_recorded", "claim_recorded", "conflict_detected",
+    "launch_requested", "launch_failed", "run_requeued",
+    "budget_warning", "budget_exhausted", "token_limit_reached", "run_timed_out",
+    "retry_limit_reached", "kill_switch_activated",
 }
 
 class InvalidTransition(ValueError):

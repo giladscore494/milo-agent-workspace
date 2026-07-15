@@ -3,6 +3,7 @@ import os
 from typing import Any
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
+from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, build_guarded_client_factory, paid_execution_enabled
 from backend.config import get_settings
 from backend.errors import AppError
 from backend.repository import Repository, SupabaseRepository
@@ -18,7 +19,7 @@ def resolve_run_id(cli_run_id: str | None) -> UUID:
     return UUID(value)
 
 
-def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None) -> int:
+def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, budget_tracker: "BudgetTracker | None" = None) -> int:
     worker_id = os.getenv("WORKER_ID", f"worker-{uuid4()}")
     if hasattr(repo, "claim_run"):
         run = repo.claim_run(run_id, worker_id)
@@ -56,7 +57,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None) ->
             result = {"status": final.get("status", "success"), "result": final, "summary": (artifacts.get("hebrew_summary") or {}).get("parsed", {}).get("summary"), "results": artifacts, **(latest_checkpoint.get("token_usage") or {})}
             sink.emit(RunEventRecord(run_id=run_id, type="run_completed", message="Run completed from checkpoint", payload={"checkpoint_id": str(latest_checkpoint.get("id", ""))}))
             shadow_observe("run_completed", {"checkpoint_id": str(latest_checkpoint.get("id", ""))})
-            repo.mark_run_complete(run_id, result)
+            repo.mark_run_complete(run_id, result, worker_id=worker_id)
             return 0
     if hasattr(repo, "transition_run"):
         repo.transition_run(run_id, "running", started_at=run.get("started_at") or datetime.now(UTC).isoformat())
@@ -69,8 +70,77 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None) ->
             shadow_observe("checkpoint_saved", checkpoint)
     def is_cancelled():
         return repo.get_run(run_id).get("status") == "cancellation_requested"
+
+    # Hard budget/cost gate. Fail closed: paid execution requires both the
+    # global kill switch and complete mandatory budget configuration; the
+    # tracker also blocks every call while MILO_ENABLE_PAID_EXECUTION is off.
+    budget_config = BudgetConfig.from_env()
+    if paid_execution_enabled() and budget_config.missing_mandatory():
+        missing = ", ".join(budget_config.missing_mandatory())
+        sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Budget configuration incomplete; refusing paid execution", payload={"code": "BUDGET_CONFIG_INVALID", "missing": missing}))
+        repo.mark_run_failed(run_id, "BUDGET_CONFIG_INVALID", f"mandatory budget settings missing: {missing}")
+        return 1
+    # Provider credentials are worker-only (env/Secret Manager). Paid
+    # execution fails closed when the key is absent; the key value itself is
+    # never logged, persisted or echoed into events.
+    from backend.engines.vehicle_catalog_v1.adapter import worker_provider_api_key
+
+    if paid_execution_enabled() and not worker_provider_api_key():
+        sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider API key not configured for this worker; refusing paid execution", payload={"code": "PROVIDER_KEY_MISSING"}))
+        repo.mark_run_failed(run_id, "PROVIDER_KEY_MISSING", "worker provider API key (KIMI_API_KEY/MOONSHOT_API_KEY) is not configured")
+        return 1
+
+    def emit_budget_event(event_type, payload):
+        sink.emit(RunEventRecord(run_id=run_id, type=event_type, message=payload.get("message", event_type), payload=payload.get("payload", payload)))
+        shadow_observe(event_type, payload)
+
+    def record_usage(usage):
+        if hasattr(repo, "update_run_usage"):
+            repo.update_run_usage(run_id, usage)
+
+    def holds_lease():
+        current = repo.get_run(run_id)
+        return not current.get("worker_id") or current.get("worker_id") == worker_id
+
+    ledger_project_id = None
+    try:
+        if run.get("conversation_id"):
+            ledger_project_id = repo.get_conversation(run["conversation_id"]).get("project_id")
+    except Exception:
+        ledger_project_id = None
+
+    def record_ledger(entry):
+        if hasattr(repo, "append_usage_ledger"):
+            repo.append_usage_ledger({
+                "run_id": str(run_id),
+                "project_id": str(ledger_project_id) if ledger_project_id else None,
+                "user_id": run.get("requested_by"),
+                "provider": "moonshot",
+                "model": "kimi",
+                **entry,
+            })
+
+    tracker = budget_tracker or BudgetTracker(
+        budget_config,
+        cancellation_checker=is_cancelled,
+        event_emitter=emit_budget_event,
+        usage_recorder=record_usage,
+        ledger_recorder=record_ledger,
+        lease_checker=holds_lease,
+        daily_user_cost_provider=(lambda: repo.sum_daily_ledger_cost(user_id=run.get("requested_by"))) if hasattr(repo, "sum_daily_ledger_cost") and run.get("requested_by") else None,
+        daily_project_cost_provider=(lambda: repo.sum_daily_ledger_cost(project_id=str(ledger_project_id))) if hasattr(repo, "sum_daily_ledger_cost") and ledger_project_id else None,
+    )
+
+    def forward_event(t, p):
+        sink.emit(RunEventRecord(run_id=run_id, type=t, message=p.get("message", t), payload=p, phase=p.get("phase"), agent=p.get("agent"), progress=p.get("progress")))
+        shadow_observe(t, p)
+        if t == "agent_started":
+            # Connect the declared agent-step limit to the real engine.
+            tracker.record_agent_step()
+
     selected_engine = engine or VehicleCatalogV1Adapter(
-        event_sink=lambda t, p: (sink.emit(RunEventRecord(run_id=run_id, type=t, message=p.get("message", t), payload=p, phase=p.get("phase"), agent=p.get("agent"), progress=p.get("progress"))), shadow_observe(t, p)),
+        model_client_factory=build_guarded_client_factory(tracker),
+        event_sink=forward_event,
         checkpoint_sink=save_checkpoint,
         cancellation_checker=is_cancelled,
     )
@@ -80,23 +150,34 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None) ->
         sink.emit(RunEventRecord(run_id=run_id, type="run_cancelled", message="Run cancelled", payload={}))
         shadow_observe("run_cancelled", {})
         if hasattr(repo, "transition_run"):
-            repo.transition_run(run_id, "cancelled", finished_at=datetime.now(UTC).isoformat())
+            repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, finished_at=datetime.now(UTC).isoformat())
         return 0
+    except BudgetExceeded as exc:
+        if hasattr(repo, "transition_run"):
+            repo.transition_run(run_id, exc.terminal_status, expected_worker_id=worker_id, error={"code": exc.code, "message": exc.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+        return 1
+    if tracker.stop is not None:
+        # The engine absorbed per-agent failures, but a hard limit tripped:
+        # never report success and record the terminal budget status.
+        stop = tracker.stop
+        if hasattr(repo, "transition_run"):
+            repo.transition_run(run_id, stop.terminal_status, expected_worker_id=worker_id, error={"code": stop.code, "message": stop.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+        return 1
     if result.get("status") in {"complete", "partial_success", "success"} or (result.get("status") != "failed" and result.get("result")):
         status = "partial_success" if result.get("status") == "partial_success" else "completed"
         sink.emit(RunEventRecord(run_id=run_id, type="run_partial_success" if status == "partial_success" else "run_completed", message=f"Run {status}", payload={"status": result.get("status")}))
         shadow_observe("run_partial_success" if status == "partial_success" else "run_completed", {"status": result.get("status")})
         if hasattr(repo, "transition_run") and status == "partial_success":
-            repo.transition_run(run_id, "partial_success", output=result, error=None, finished_at=datetime.now(UTC).isoformat())
+            repo.transition_run(run_id, "partial_success", expected_worker_id=worker_id, output=result, error=None, finished_at=datetime.now(UTC).isoformat())
         else:
-            repo.mark_run_complete(run_id, result)
+            repo.mark_run_complete(run_id, result, worker_id=worker_id)
         return 0
     error = result.get("error", {}) if isinstance(result, dict) else {}
     code = error.get("code", "ENGINE_FAILED")
     message = error.get("message", "vehicle_catalog_v1 engine failed")
     sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message=message, payload={"code": code}))
     shadow_observe("run_failed", {"code": code})
-    repo.mark_run_failed(run_id, code, message)
+    repo.mark_run_failed(run_id, code, message, worker_id=worker_id)
     return 1
 
 

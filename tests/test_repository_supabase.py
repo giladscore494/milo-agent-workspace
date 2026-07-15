@@ -114,6 +114,7 @@ def test_create_queued_run_accepts_uuid_message_id(repo):
 
 def test_mark_run_complete_writes_output_column(repo):
     run_id = uuid4()
+    repo.client.select_data["runs"] = [{"id": str(run_id), "status": "running"}]
     repo.mark_run_complete(run_id, {"models": []})
     table, payload = repo.client.updated[0]
     assert table == "runs"
@@ -124,7 +125,9 @@ def test_mark_run_complete_writes_output_column(repo):
 
 
 def test_mark_run_failed_writes_error_column(repo):
-    repo.mark_run_failed(uuid4(), "ENGINE_FAILED", "boom")
+    run_id = uuid4()
+    repo.client.select_data["runs"] = [{"id": str(run_id), "status": "running"}]
+    repo.mark_run_failed(run_id, "ENGINE_FAILED", "boom")
     table, payload = repo.client.updated[0]
     assert table == "runs"
     assert payload["error"] == {"code": "ENGINE_FAILED", "message": "boom"}

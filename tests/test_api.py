@@ -29,6 +29,8 @@ class FakeRepo:
         self.claims = 0
         self.conflicts = 0
         self.appended_events = 0
+        self.completed_runs = 0
+        self.failed_runs = 0
 
     def _fail(self):
         if self.fail:
@@ -52,29 +54,36 @@ class FakeRepo:
         self.get_conversation(conversation_id)
         self.created_messages += 1
         return {"id": self.message_id, "conversation_id": conversation_id, "role": "user", "content": content, "metadata": metadata}
-    def create_queued_run(self, conversation_id, user_message_id, content, metadata):
+    def create_queued_run(self, conversation_id, user_message_id, content, metadata, **kwargs):
         self.created_runs += 1
         self.queued_message_id = user_message_id
-        return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}}
+        return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued", "launch_state": "pending", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}, **{k: str(v) for k, v in kwargs.items() if v is not None}}
+    def find_run_by_idempotency(self, conversation_id, user_id, idempotency_key):
+        return None
+    def set_launch_state(self, run_id, state, error=None):
+        self.launch_states = getattr(self, "launch_states", []) + [state]
+        return {"id": run_id, "launch_state": state}
     def get_run(self, run_id, user_id=None):
         self._fail()
         if (user_id is not None and user_id != self.user_id) or UUID(str(run_id)) != self.run_id: raise NotFoundError("run", str(run_id))
         return {"id": run_id, "conversation_id": self.conversation_id, "status": "queued"}
-    def list_run_events(self, run_id, user_id=None):
+    def list_run_events(self, run_id, user_id=None, after_event_id=None):
         self.get_run(run_id, user_id); return []
+    def list_conversations(self, project_id):
+        return [{"id": self.conversation_id, "project_id": self.project_id, "title": "t"}]
     def request_cancellation(self, run_id, reason=None):
         self.cancelled_runs += 1; return {"id": run_id, "status": "cancellation_requested"}
     def append_run_event(self, *args, **kwargs):
         self.appended_events += 1; return {"id": 1}
-    def create_workflow_proposal(self, user_request, proposal):
-        self.proposal_creations += 1; return {"id": self.proposal_id, "status": "approved", "user_request": user_request, **proposal}
-    def get_workflow_proposal(self, proposal_id):
+    def create_workflow_proposal(self, user_request, proposal, project_id=None, created_by=None):
+        self.proposal_creations += 1; return {"id": self.proposal_id, "status": "approved", "user_request": user_request, "project_id": project_id, "created_by": created_by, **proposal}
+    def get_workflow_proposal(self, proposal_id, user_id=None):
         self._fail()
-        if UUID(str(proposal_id)) != self.proposal_id: raise NotFoundError("workflow_proposal", str(proposal_id))
-        return {"id": self.proposal_id, "status": "approved", "user_request": "r", "task_spec": {}, "draft": {}, "estimates": {}, "approved_at": datetime.now(UTC).isoformat()}
+        if (user_id is not None and user_id != self.user_id) or UUID(str(proposal_id)) != self.proposal_id: raise NotFoundError("workflow_proposal", str(proposal_id))
+        return {"id": self.proposal_id, "status": "approved", "user_request": "r", "task_spec": {}, "draft": {}, "estimates": {}, "approved_at": datetime.now(UTC).isoformat(), "project_id": self.project_id, "created_by": self.user_id}
     def update_workflow_proposal(self, proposal_id, fields):
         self.proposal_updates += 1; return {**self.get_workflow_proposal(proposal_id), **fields}
-    def create_project_from_proposal(self, proposal_id, slug, name, description, configuration):
+    def create_project_from_proposal(self, proposal_id, slug, name, description, configuration, created_by=None):
         self.projects_from_proposals += 1; return {"id": uuid4(), "slug": slug, "name": name, "workflow_key": "chat_architect_v1", "configuration": configuration}
     def create_tool_access_request(self, run_id, request):
         self.tool_access_requests += 1; return {"id": str(uuid4()), "run_id": run_id, **request}
@@ -88,6 +97,10 @@ class FakeRepo:
         self.claims += 1; return {"id": str(uuid4()), "run_id": run_id, **claim}
     def create_conflict(self, run_id, conflict):
         self.conflicts += 1; return {"id": str(uuid4()), "run_id": run_id, **conflict}
+    def mark_run_complete(self, run_id, output):
+        self.completed_runs += 1; return {"id": run_id, "conversation_id": self.conversation_id, "status": "completed", "output": output}
+    def mark_run_failed(self, run_id, code, message):
+        self.failed_runs += 1; return {"id": run_id, "conversation_id": self.conversation_id, "status": "failed", "error": {"code": code, "message": message}}
 
     def assert_no_mutations(self):
         assert self.created_messages == 0
@@ -103,6 +116,8 @@ class FakeRepo:
         assert self.claims == 0
         assert self.conflicts == 0
         assert self.appended_events == 0
+        assert self.completed_runs == 0
+        assert self.failed_runs == 0
 
 
 class FakeLauncher:
@@ -113,7 +128,7 @@ class FakeLauncher:
         return {"mode": "test", "execution": "test"}
 
 
-EXECUTION_FLAGS = ["MILO_ENABLE_RUN_CREATION", "MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PROPOSAL_READS"]
+EXECUTION_FLAGS = ["MILO_ENABLE_RUN_CREATION", "MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_RUN_CANCELLATION", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PROPOSAL_READS"]
 
 
 @pytest.fixture

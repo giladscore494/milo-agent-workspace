@@ -18,7 +18,21 @@ export function getCloudRunServiceUrl(): string {
   return requireEnvironmentVariable('CLOUD_RUN_API_URL').replace(/\/+$/, '');
 }
 
+function isIsolatedE2eMode(): boolean {
+  // Explicit test-only escape for the isolated E2E stack, where the
+  // "Cloud Run" upstream is a local mock and no Google credentials exist.
+  // Hard-disabled in production builds regardless of the variable.
+  return (
+    process.env.CLOUD_RUN_AUTH_MODE === 'e2e-test' &&
+    process.env.NODE_ENV !== 'production' &&
+    (process.env.VERCEL_ENV ?? '') !== 'production'
+  );
+}
+
 export async function getCloudRunIdToken(): Promise<string> {
+  if (isIsolatedE2eMode()) {
+    return 'e2e-local-gateway-token';
+  }
   const projectNumber = requireEnvironmentVariable('GCP_PROJECT_NUMBER');
   const poolId = requireEnvironmentVariable(
     'GCP_WORKLOAD_IDENTITY_POOL_ID',

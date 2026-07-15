@@ -7,6 +7,7 @@ class AppError(Exception):
         self.code = code
         self.message = message
         self.status_code = status_code
+        self.headers: dict[str, str] | None = None
         super().__init__(message)
 
 
@@ -18,4 +19,4 @@ class NotFoundError(AppError):
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:  # noqa: ARG001
-        return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}})
+        return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}}, headers=exc.headers)

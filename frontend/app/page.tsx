@@ -1,15 +1,46 @@
 'use client';
-import { useCallback, useEffect, useState } from 'react';
-import { api } from '@/lib/api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ApiError, api, executionUiEnabled, newIdempotencyKey } from '@/lib/api';
 import { getCurrentSession, onAuthStateChange, signInWithSupabase, signOutFromSupabase, SupabaseSession } from '@/lib/supabaseClient';
 import { initialWorkspaceState } from '@/lib/runReducer';
-import { AgentState, Conversation, InternetPolicy, Project } from '@/lib/types';
+import { useRunRealtime } from '@/lib/useRunRealtime';
+import { AgentState, Conversation, InternetPolicy, Project, Proposal } from '@/lib/types';
 import { redactSecrets, safeText } from '@/lib/sanitize';
 
 const internetLabels: InternetPolicy[] = ['forbidden','allowed','required','conditional','requested','approved','denied','active'];
-const HARDENING_NOTE = 'Workflow proposal, run, retry, resume, cancel, worker, Kimi and tool-grant controls are disabled during the auth hardening stage.';
+const HARDENING_NOTE = 'Execution controls are hidden: the execution UI flag is off. Backend execution flags and authorization stay authoritative either way.';
+const TERMINAL_STATES = new Set(['completed','partial_success','failed','cancelled','timed_out','budget_exhausted']);
+
+function activeRunStorageKey(conversationId: string): string {
+  return `milo.activeRun.${conversationId}`;
+}
+
+function readStoredRunId(conversationId?: string): string | undefined {
+  if (!conversationId || typeof window === 'undefined') return undefined;
+  try {
+    return window.sessionStorage.getItem(activeRunStorageKey(conversationId)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function storeRunId(conversationId: string, runId?: string) {
+  if (typeof window === 'undefined') return;
+  try {
+    if (runId) window.sessionStorage.setItem(activeRunStorageKey(conversationId), runId);
+    else window.sessionStorage.removeItem(activeRunStorageKey(conversationId));
+  } catch {
+    // Storage may be unavailable (private mode); polling still works in-page.
+  }
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  if (error instanceof ApiError) return `${error.message} (${error.code})`;
+  return error instanceof Error ? error.message : fallback;
+}
 
 export default function WorkspacePage() {
+  const executionUi = executionUiEnabled();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -21,16 +52,31 @@ export default function WorkspacePage() {
   const [selectedProject, setSelectedProject] = useState<Project>();
 
   const [conversationTitle, setConversationTitle] = useState('');
-  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>();
   const [activeConversation, setActiveConversation] = useState<Conversation>();
   const [conversationError, setConversationError] = useState('');
   const [creatingConversation, setCreatingConversation] = useState(false);
 
+  const [proposalRequest, setProposalRequest] = useState('');
+  const [proposal, setProposal] = useState<Proposal>();
+  const [proposalError, setProposalError] = useState('');
+  const [proposalBusy, setProposalBusy] = useState(false);
+
+  const [taskContent, setTaskContent] = useState('');
+  const [runError, setRunError] = useState('');
+  const [submittingRun, setSubmittingRun] = useState(false);
+  const [activeRunId, setActiveRunId] = useState<string>();
+  const idempotencyKey = useRef<string>();
+
+  const [cancelReason, setCancelReason] = useState('');
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
+  const [cancelError, setCancelError] = useState('');
+
   const [tab, setTab] = useState('Agents');
-  // No run can be started while execution surfaces are disabled, so the run
-  // console renders the empty reducer state instead of subscribing anywhere.
-  const state = initialWorkspaceState;
+  const { state, mode } = useRunRealtime(executionUi ? activeRunId : undefined);
   const agents = Object.values(state.agents);
+  const runStatus = state.run?.status;
+  const runIsTerminal = !!runStatus && TERMINAL_STATES.has(runStatus);
 
   useEffect(() => {
     let mounted = true;
@@ -46,7 +92,7 @@ export default function WorkspacePage() {
       .then(setProjects)
       .catch(error => {
         setProjects([]);
-        setProjectsError(error instanceof Error ? error.message : 'Failed to load projects.');
+        setProjectsError(errorMessage(error, 'Failed to load projects.'));
       });
   }, []);
 
@@ -55,12 +101,25 @@ export default function WorkspacePage() {
       setProjects(undefined);
       setProjectsError('');
       setSelectedProject(undefined);
-      setConversations([]);
+      setConversations(undefined);
       setActiveConversation(undefined);
+      setActiveRunId(undefined);
+      setProposal(undefined);
       return;
     }
     loadProjects();
   }, [session, loadProjects]);
+
+  const loadConversations = useCallback((project: Project) => {
+    setConversations(undefined);
+    setConversationError('');
+    api.conversations(project.id)
+      .then(setConversations)
+      .catch(error => {
+        setConversations([]);
+        setConversationError(errorMessage(error, 'Failed to load conversations.'));
+      });
+  }, []);
 
   async function login() {
     setAuthError('');
@@ -80,8 +139,20 @@ export default function WorkspacePage() {
 
   function selectProject(project: Project) {
     setSelectedProject(project);
+    setActiveConversation(undefined);
+    setActiveRunId(undefined);
+    setProposal(undefined);
     setConversationError('');
     setMobileOpen(false);
+    loadConversations(project);
+  }
+
+  function selectConversation(conversation: Conversation) {
+    setActiveConversation(conversation);
+    setRunError('');
+    setCancelError('');
+    // Reopen an existing run after refresh or navigation.
+    setActiveRunId(readStoredRunId(conversation.id));
   }
 
   async function createConversation() {
@@ -90,13 +161,84 @@ export default function WorkspacePage() {
     setCreatingConversation(true);
     try {
       const conversation = await api.createConversation(selectedProject.id, conversationTitle.trim() || undefined);
-      setConversations(previous => [conversation, ...previous]);
-      setActiveConversation(conversation);
+      setConversations(previous => [conversation, ...(previous ?? [])]);
+      selectConversation(conversation);
       setConversationTitle('');
     } catch (error) {
-      setConversationError(error instanceof Error ? error.message : 'Failed to create the conversation.');
+      setConversationError(errorMessage(error, 'Failed to create the conversation.'));
     } finally {
       setCreatingConversation(false);
+    }
+  }
+
+  async function generateProposal() {
+    if (!selectedProject || proposalBusy || !proposalRequest.trim()) return;
+    setProposalBusy(true);
+    setProposalError('');
+    try {
+      setProposal(await api.createProposal(selectedProject.id, proposalRequest.trim()));
+    } catch (error) {
+      setProposalError(errorMessage(error, 'Proposal creation failed.'));
+    } finally {
+      setProposalBusy(false);
+    }
+  }
+
+  async function decideProposal(decision: 'approve' | 'reject') {
+    if (!proposal || proposalBusy) return;
+    setProposalBusy(true);
+    setProposalError('');
+    try {
+      setProposal(await api.decideProposal(proposal.id, decision));
+    } catch (error) {
+      setProposalError(errorMessage(error, `Proposal ${decision} failed.`));
+    } finally {
+      setProposalBusy(false);
+    }
+  }
+
+  async function reviseProposal() {
+    if (!proposal || proposalBusy || !proposalRequest.trim()) return;
+    setProposalBusy(true);
+    setProposalError('');
+    try {
+      setProposal(await api.reviseProposal(proposal.id, proposalRequest.trim()));
+    } catch (error) {
+      setProposalError(errorMessage(error, 'Proposal revision failed.'));
+    } finally {
+      setProposalBusy(false);
+    }
+  }
+
+  async function startRun() {
+    if (!activeConversation || submittingRun || !taskContent.trim()) return;
+    setSubmittingRun(true);
+    setRunError('');
+    // One key per logical submission: a retry after failure reuses it, so
+    // the backend returns the original run instead of creating a duplicate.
+    idempotencyKey.current ??= newIdempotencyKey();
+    try {
+      const created = await api.startRun(activeConversation.id, taskContent.trim(), idempotencyKey.current);
+      idempotencyKey.current = undefined;
+      storeRunId(activeConversation.id, created.run_id);
+      setActiveRunId(created.run_id);
+      setTaskContent('');
+    } catch (error) {
+      setRunError(errorMessage(error, 'Run creation failed.'));
+    } finally {
+      setSubmittingRun(false);
+    }
+  }
+
+  async function confirmCancelRun() {
+    if (!activeRunId) return;
+    setCancelError('');
+    try {
+      await api.cancel(activeRunId, cancelReason.trim() || undefined);
+      setConfirmingCancel(false);
+      setCancelReason('');
+    } catch (error) {
+      setCancelError(errorMessage(error, 'Cancellation failed.'));
     }
   }
 
@@ -104,7 +246,7 @@ export default function WorkspacePage() {
   if (!session) return (
     <main className="auth-only">
       <h1>MILO</h1>
-      <p>Sign in to access the authenticated workspace. Run, proposal, worker, Kimi, event and cancellation controls are disabled during auth hardening.</p>
+      <p>Sign in to access the authenticated workspace.</p>
       <input aria-label="Email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email"/>
       <input aria-label="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password"/>
       <button onClick={login}>Login</button>
@@ -113,13 +255,14 @@ export default function WorkspacePage() {
   );
 
   const projectsLoading = projects === undefined;
+  const conversationsLoading = selectedProject !== undefined && conversations === undefined;
 
   return (
     <main className="shell">
       <section className="auth-panel">
         <b>{session.user?.email ?? 'Authenticated'}</b>
         <button onClick={logout}>Logout</button>
-        <small>{HARDENING_NOTE}</small>
+        {!executionUi && <small>{HARDENING_NOTE}</small>}
       </section>
       <button className="mobile-menu" onClick={() => setMobileOpen(true)}>☰ Workspace</button>
       <aside className={`sidebar ${mobileOpen ? 'open' : ''}`}>
@@ -139,9 +282,11 @@ export default function WorkspacePage() {
         </section>
         <section>
           <h2>Conversations</h2>
-          {conversations.length === 0 && <p>{selectedProject ? 'No conversations yet in this session.' : 'Select a project to start a conversation.'}</p>}
-          {conversations.map(conversation => (
-            <button key={conversation.id} className={`nav-card ${activeConversation?.id === conversation.id ? 'active' : ''}`} onClick={() => setActiveConversation(conversation)}>
+          {conversationsLoading && <p>Loading conversations…</p>}
+          {!selectedProject && <p>Select a project to start a conversation.</p>}
+          {selectedProject && !conversationsLoading && (conversations?.length ?? 0) === 0 && <p>No conversations yet in this project.</p>}
+          {(conversations ?? []).map(conversation => (
+            <button key={conversation.id} className={`nav-card ${activeConversation?.id === conversation.id ? 'active' : ''}`} onClick={() => selectConversation(conversation)}>
               <span>{safeText(conversation.title || 'Untitled conversation')}</span>
             </button>
           ))}
@@ -153,7 +298,7 @@ export default function WorkspacePage() {
             <p className="eyebrow">Backend-authoritative agent workspace</p>
             <h2>{selectedProject ? safeText(selectedProject.name) : 'Select a project to begin'}</h2>
           </div>
-          <span className="badge idle">read-only • execution disabled</span>
+          <span className="badge idle">{executionUi ? `execution UI enabled • backend flags authoritative` : 'read-only • execution disabled'}</span>
         </header>
         <div className="messages">
           {selectedProject ? (
@@ -174,17 +319,86 @@ export default function WorkspacePage() {
               <small>ID {safeText(activeConversation.id)} • project {safeText(activeConversation.project_id)}</small>
             </article>
           )}
-          <article className="proposal">
-            <h3>Workflow proposal</h3>
-            <p>{HARDENING_NOTE}</p>
-          </article>
-          <article className="run-card">
-            <h3>Live run</h3>
-            <p>No active run. Run creation and execution control are disabled until a separately approved execution stage.</p>
-          </article>
+
+          {executionUi && selectedProject ? (
+            <article className="proposal">
+              <h3>Workflow proposal</h3>
+              <textarea aria-label="Proposal request" value={proposalRequest} onChange={e => setProposalRequest(e.target.value)} placeholder="Describe the workflow you need…"/>
+              <div className="grid">
+                <button className="primary" onClick={generateProposal} disabled={proposalBusy || !proposalRequest.trim()}>{proposalBusy ? 'Working…' : 'Generate proposal'}</button>
+                {proposal && <button onClick={reviseProposal} disabled={proposalBusy || !proposalRequest.trim()}>Revise with new request</button>}
+              </div>
+              {proposalError && <p role="alert">{safeText(proposalError)}</p>}
+              {proposal && (
+                <div>
+                  <p><span className={`badge ${proposal.status}`}>{safeText(proposal.status)}</span></p>
+                  <p>{safeText(proposal.user_request)}</p>
+                  {(proposal.draft?.agents ?? []).map((agent: any) => (
+                    <p key={agent.key ?? agent.role}>
+                      <b>{safeText(agent.role ?? agent.key)}</b>{' '}
+                      <InternetBadge policy={(agent.internet_policy ?? 'conditional') as InternetPolicy} reason={agent.internet_reason}/>
+                    </p>
+                  ))}
+                  <pre>{JSON.stringify(redactSecrets({ steps: proposal.draft?.workflow ?? proposal.draft?.steps ?? [], budget: proposal.estimates, critiques: proposal.critiques }), null, 2)}</pre>
+                  <div className="grid">
+                    <button className="primary" onClick={() => decideProposal('approve')} disabled={proposalBusy || proposal.status !== 'approved'}>Approve</button>
+                    <button onClick={() => decideProposal('reject')} disabled={proposalBusy}>Reject</button>
+                  </div>
+                </div>
+              )}
+            </article>
+          ) : (
+            <article className="proposal">
+              <h3>Workflow proposal</h3>
+              <p>{HARDENING_NOTE}</p>
+            </article>
+          )}
+
+          {executionUi && activeConversation ? (
+            <article className="run-card">
+              <h3>Run</h3>
+              <textarea aria-label="Task content" value={taskContent} onChange={e => setTaskContent(e.target.value)} placeholder="Describe the task for this run…"/>
+              <button className="primary" onClick={startRun} disabled={submittingRun || !taskContent.trim()}>{submittingRun ? 'Sending…' : 'Send task'}</button>
+              {runError && <p role="alert">{safeText(runError)}</p>}
+              {activeRunId && (
+                <dl>
+                  <dt>Run</dt><dd>{safeText(activeRunId)}</dd>
+                  <dt>Status</dt><dd>{safeText(runStatus ?? 'loading…')}</dd>
+                  <dt>Phase</dt><dd>{safeText(state.currentPhase)}</dd>
+                  <dt>Connection</dt><dd>{mode === 'reconnecting' ? 'reconnecting…' : mode}</dd>
+                </dl>
+              )}
+              {activeRunId && !runIsTerminal && !confirmingCancel && (
+                <button onClick={() => setConfirmingCancel(true)}>Cancel run</button>
+              )}
+              {activeRunId && confirmingCancel && (
+                <div>
+                  <input aria-label="Cancellation reason" value={cancelReason} onChange={e => setCancelReason(e.target.value)} placeholder="Reason (optional)"/>
+                  <button className="primary" onClick={confirmCancelRun}>Confirm cancellation</button>
+                  <button onClick={() => setConfirmingCancel(false)}>Keep running</button>
+                </div>
+              )}
+              {cancelError && <p role="alert">{safeText(cancelError)}</p>}
+              {runIsTerminal && <p>Run finished with status <b>{safeText(runStatus)}</b>.</p>}
+            </article>
+          ) : (
+            <article className="run-card">
+              <h3>Live run</h3>
+              <p>{executionUi ? 'Select or create a conversation to start a run.' : 'No active run. Run creation and execution control are disabled until a separately approved execution stage.'}</p>
+            </article>
+          )}
+
           <article className="message assistant">
             <b>Live event stream</b>
-            <p>No events. Realtime and polling stay disabled while execution surfaces are off.</p>
+            {state.events.length === 0 && <p>{executionUi ? 'No events yet.' : 'No events. Realtime and polling stay disabled while execution surfaces are off.'}</p>}
+            {state.events.slice(-50).map(event => (
+              <div className="event" key={event.id}>
+                <small>{safeText(event.event_type)}</small>
+                <span>{safeText(event.agent ?? '')}</span>
+                <small>{safeText(event.phase ?? '')}</small>
+                <p>{safeText(event.message ?? '')}</p>
+              </div>
+            ))}
           </article>
           <article className="artifacts">
             <b>Final artifacts</b>
@@ -201,15 +415,21 @@ export default function WorkspacePage() {
 }
 
 function InternetBadge({ policy, reason }: { policy: InternetPolicy; reason?: string }) {
-  return <span className={`internet ${policy}`}>{policy} internet — {reason || 'policy visible'}</span>;
+  return <span className={`internet ${policy}`}>{policy} internet — {safeText(reason || 'policy visible')}</span>;
 }
 
 function Inspector({ tab, agents, state }: { tab: string; agents: AgentState[]; state: typeof initialWorkspaceState }) {
-  if (tab === 'Agents') return <>{agents.length === 0 && <p>No agents are running.</p>}{internetLabels.map(p => <InternetBadge key={p} policy={p}/>)}</>;
-  if (tab === 'Workflow') return <p>No workflow activity. Runs are disabled during the auth hardening stage.</p>;
-  if (tab === 'Sources') return <p>No sources recorded.</p>;
-  if (tab === 'Claims') return <pre>{JSON.stringify(state.claims, null, 2)}</pre>;
-  if (tab === 'Conflicts') return <pre>{JSON.stringify(state.conflicts, null, 2)}</pre>;
-  if (tab === 'Costs') return <pre>{JSON.stringify({ tokens: state.tokens, cost: state.cost }, null, 2)}</pre>;
-  return <pre>{JSON.stringify(redactSecrets({ events: state.events, checkpoints: state.checkpoints, validationErrors: state.validationErrors, rawErrors: state.rawErrors }), null, 2)}</pre>;
+  if (tab === 'Agents') return <>{agents.length === 0 && <p>No agents are running.</p>}{agents.map(agent => (
+    <div className="agent-card" key={agent.name}>
+      <b>{safeText(agent.name)}</b> <span className={`badge ${agent.status}`}>{safeText(agent.status)}</span>
+      <p>{safeText(agent.currentTask ?? agent.responsibility)}</p>
+      <InternetBadge policy={agent.internet} reason={agent.internetReason}/>
+    </div>
+  ))}{agents.length === 0 && internetLabels.map(p => <InternetBadge key={p} policy={p}/>)}</>;
+  if (tab === 'Workflow') return state.events.length === 0 ? <p>No workflow activity yet.</p> : <pre>{JSON.stringify(redactSecrets({ phase: state.currentPhase, progress: state.progress, checkpoints: state.checkpoints.length }), null, 2)}</pre>;
+  if (tab === 'Sources') return state.sources.length === 0 ? <p>No sources recorded.</p> : <>{state.sources.map(source => <div className="source" key={source.id}><b>{safeText(source.title)}</b><small> {safeText(source.domain)} • {safeText(source.source_strength)}</small></div>)}</>;
+  if (tab === 'Claims') return <pre>{JSON.stringify(redactSecrets(state.claims), null, 2)}</pre>;
+  if (tab === 'Conflicts') return <pre>{JSON.stringify(redactSecrets(state.conflicts), null, 2)}</pre>;
+  if (tab === 'Costs') return <pre>{JSON.stringify({ tokens: state.tokens, cost: state.cost, usage: redactSecrets((state.run as any)?.usage ?? {}) }, null, 2)}</pre>;
+  return <pre>{JSON.stringify(redactSecrets({ events: state.events.length, checkpoints: state.checkpoints, validationErrors: state.validationErrors, rawErrors: state.rawErrors }), null, 2)}</pre>;
 }

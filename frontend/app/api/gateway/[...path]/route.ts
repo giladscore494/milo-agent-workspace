@@ -8,7 +8,11 @@ import {
   isGatewayRequestAllowed,
   isRunCreationRequest,
 } from '@/lib/server/gatewayPolicy';
-import { checkGatewayRateLimit } from '@/lib/server/rateLimit';
+import {
+  RateLimitCategory,
+  checkRateLimit,
+  getTrustedClientIp,
+} from '@/lib/server/rateLimit';
 import { GatewayAuthError, validateSupabaseAccessToken } from '@/lib/server/supabaseAuth';
 
 export const runtime = 'nodejs';
@@ -19,6 +23,32 @@ type RouteContext = {
     path: string[];
   }>;
 };
+
+function categorizeAuthenticatedRequest(
+  method: string,
+  backendPath: string,
+): RateLimitCategory {
+  if (method === 'POST' && /\/runs$/.test(backendPath)) return 'run_creation';
+  if (method === 'POST' && /\/cancel$/.test(backendPath)) return 'cancellation';
+  if (method === 'GET' && /^\/runs\//.test(backendPath)) return 'polling';
+  return 'authenticated';
+}
+
+function rateLimitResponse(decision: {
+  retryAfterSeconds: number;
+  unavailable: boolean;
+}): Response {
+  if (decision.unavailable) {
+    return Response.json(
+      { error: 'Shared rate limiter unavailable; request refused.' },
+      { status: 503, headers: { 'retry-after': String(decision.retryAfterSeconds) } },
+    );
+  }
+  return Response.json(
+    { error: 'Too many requests.' },
+    { status: 429, headers: { 'retry-after': String(decision.retryAfterSeconds) } },
+  );
+}
 
 async function proxyRequest(
   request: NextRequest,
@@ -37,12 +67,13 @@ async function proxyRequest(
     );
   }
 
-  const rate = checkGatewayRateLimit(request.headers.get('x-forwarded-for'));
-  if (!rate.allowed) {
-    return Response.json(
-      { error: 'Too many requests.' },
-      { status: 429, headers: { 'retry-after': String(rate.retryAfterSeconds) } },
-    );
+  const clientIp = getTrustedClientIp(request.headers);
+  const preAuthCategory: RateLimitCategory = request.headers.get('authorization')
+    ? 'auth_pressure'
+    : 'unauthenticated';
+  const preAuthLimit = await checkRateLimit(preAuthCategory, clientIp);
+  if (!preAuthLimit.allowed) {
+    return rateLimitResponse(preAuthLimit);
   }
 
   if (!isGatewayRequestAllowed(method, backendPath)) {
@@ -58,6 +89,15 @@ async function proxyRequest(
     const user = backendPath === '/health'
       ? undefined
       : await validateSupabaseAccessToken(request.headers.get('authorization'));
+
+    if (user) {
+      const category = categorizeAuthenticatedRequest(method, backendPath);
+      const userLimit = await checkRateLimit(category, `user:${user.id}`);
+      if (!userLimit.allowed) {
+        return rateLimitResponse(userLimit);
+      }
+    }
+
     const serviceUrl = getCloudRunServiceUrl();
     const idToken = await getCloudRunIdToken();
     const targetUrl = new URL(backendPath, `${serviceUrl}/`);
@@ -68,6 +108,11 @@ async function proxyRequest(
 
     const headers = new Headers({
       authorization: `Bearer ${idToken}`,
+      // The backend verifies this Google-signed token (signature, issuer,
+      // audience, expiry, allowlisted gateway identity) before trusting
+      // any x-milo-auth-* header. Browser-supplied values of these headers
+      // never reach upstream: this Headers object is built from scratch.
+      'x-milo-gateway-token': idToken,
       accept: request.headers.get('accept') ?? 'application/json',
     });
 

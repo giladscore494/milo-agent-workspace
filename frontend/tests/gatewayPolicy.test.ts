@@ -53,11 +53,15 @@ describe('gateway policy', () => {
     expect(isGatewayRequestAllowed('POST', proposalRunPath)).toBe(false);
   });
 
-  it('blocks all run, workflow and internal worker routes', () => {
-    expect(isGatewayRequestAllowed('GET', `/runs/${RUN_ID}`)).toBe(false);
+  it('allows the authorized run read endpoints needed for polling', () => {
+    expect(isGatewayRequestAllowed('GET', `/runs/${RUN_ID}`)).toBe(true);
+    expect(isGatewayRequestAllowed('GET', `/runs/${RUN_ID}/events`)).toBe(true);
     expect(
-      isGatewayRequestAllowed('GET', `/runs/${RUN_ID}/events`),
-    ).toBe(false);
+      isGatewayRequestAllowed('GET', `/projects/${PROJECT_ID}/conversations`),
+    ).toBe(true);
+  });
+
+  it('blocks execution and internal worker routes by default', () => {
     expect(
       isGatewayRequestAllowed('POST', `/runs/${RUN_ID}/cancel`),
     ).toBe(false);
@@ -68,5 +72,34 @@ describe('gateway policy', () => {
       ),
     ).toBe(false);
     expect(isGatewayRequestAllowed('POST', '/workflow-proposals')).toBe(false);
+    expect(
+      isGatewayRequestAllowed('POST', `/internal/runs/${RUN_ID}/events`),
+    ).toBe(false);
+  });
+
+  it('opens execution routes only under the explicit server flag', () => {
+    process.env.GATEWAY_ALLOW_EXECUTION_ROUTES = 'true';
+    try {
+      expect(
+        isGatewayRequestAllowed('POST', `/conversations/${CONVERSATION_ID}/runs`),
+      ).toBe(true);
+      expect(isGatewayRequestAllowed('POST', '/workflow-proposals')).toBe(true);
+      expect(
+        isGatewayRequestAllowed('POST', `/workflow-proposals/${PROPOSAL_ID}/approve`),
+      ).toBe(true);
+      expect(
+        isGatewayRequestAllowed('POST', `/runs/${RUN_ID}/cancel`),
+      ).toBe(true);
+      expect(isRunCreationRequest('POST', `/conversations/${CONVERSATION_ID}/runs`)).toBe(false);
+      // Worker routes stay blocked even with the flag on.
+      expect(
+        isGatewayRequestAllowed('POST', `/runs/${RUN_ID}/tool-grants`),
+      ).toBe(false);
+      expect(
+        isGatewayRequestAllowed('POST', `/internal/runs/${RUN_ID}/complete`),
+      ).toBe(false);
+    } finally {
+      delete process.env.GATEWAY_ALLOW_EXECUTION_ROUTES;
+    }
   });
 });

@@ -2,8 +2,6 @@ import { getCurrentAccessToken } from './supabaseClient';
 import { Conversation, Project, Proposal, Run, RunEvent } from './types';
 
 const API = '/api/gateway';
-const DISABLED_MESSAGE =
-  'This operation is disabled until the private gateway safety review is complete.';
 
 export const clientConfig = {
   apiBaseUrl: API,
@@ -11,7 +9,29 @@ export const clientConfig = {
   supabaseAnonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
 };
 
+/**
+ * The execution UI flag only controls what the browser renders; it is never
+ * a security boundary. The gateway allowlist and the backend execution
+ * flags plus membership authorization remain authoritative.
+ */
+export function executionUiEnabled(): boolean {
+  return (process.env.NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI ?? '')
+    .trim()
+    .toLowerCase() === 'true';
+}
+
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
 async function authHeaders(): Promise<HeadersInit> {
+  // Read the token per request so Supabase session refreshes are picked up.
   const token = await getCurrentAccessToken();
   return token ? { authorization: `Bearer ${token}` } : {};
 }
@@ -27,18 +47,30 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!response.ok) {
-    throw new Error(`${response.status} ${await response.text()}`);
+    let code = `HTTP_${response.status}`;
+    let message = `Request failed with status ${response.status}.`;
+    try {
+      const body = await response.json();
+      code = body?.error?.code ?? code;
+      message = body?.error?.message ?? body?.error ?? message;
+    } catch {
+      // Non-JSON error bodies are never surfaced raw to the UI.
+    }
+    throw new ApiError(response.status, code, String(message));
   }
 
   return response.json() as Promise<T>;
 }
 
-function disabledRequest<T>(): Promise<T> {
-  return Promise.reject(new Error(DISABLED_MESSAGE));
+export function newIdempotencyKey(): string {
+  return `ui-${crypto.randomUUID()}`;
 }
 
 export const api = {
   projects: () => request<Project[]>('/projects'),
+
+  conversations: (projectId: string) =>
+    request<Conversation[]>(`/projects/${projectId}/conversations`),
 
   createConversation: (projectId: string, title?: string) =>
     request<Conversation>(`/projects/${projectId}/conversations`, {
@@ -46,29 +78,56 @@ export const api = {
       body: JSON.stringify({ title }),
     }),
 
-  createProposal: (_userRequest: string) =>
-    disabledRequest<Proposal>(),
+  createProposal: (projectId: string, userRequest: string) =>
+    request<Proposal>('/workflow-proposals', {
+      method: 'POST',
+      body: JSON.stringify({ project_id: projectId, user_request: userRequest }),
+    }),
 
-  decideProposal: (
-    _id: string,
-    _decision: 'approve' | 'reject',
-    _reason?: string,
-  ) => disabledRequest<Proposal>(),
+  proposal: (id: string) => request<Proposal>(`/workflow-proposals/${id}`),
 
-  reviseProposal: (_id: string, _userRequest: string) =>
-    disabledRequest<Proposal>(),
+  decideProposal: (id: string, decision: 'approve' | 'reject', reason?: string) =>
+    request<Proposal>(`/workflow-proposals/${id}/${decision}`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+
+  reviseProposal: (id: string, userRequest: string) =>
+    request<Proposal>(`/workflow-proposals/${id}/revise`, {
+      method: 'POST',
+      body: JSON.stringify({ user_request: userRequest }),
+    }),
 
   startRun: (
-    _conversationId: string,
-    _content: string,
-    _metadata = {},
-  ) => disabledRequest<{ run_id: string; status: string }>(),
+    conversationId: string,
+    content: string,
+    idempotencyKey: string,
+    metadata: Record<string, unknown> = {},
+  ) =>
+    request<{ run_id: string; status: string }>(
+      `/conversations/${conversationId}/runs`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          content,
+          metadata,
+          idempotency_key: idempotencyKey,
+        }),
+      },
+    ),
 
-  run: (_id: string) => disabledRequest<Run>(),
+  run: (id: string) => request<Run>(`/runs/${id}`),
 
-  events: (_id: string, _after?: number) =>
-    disabledRequest<RunEvent[]>(),
+  events: (id: string, after?: number) =>
+    request<RunEvent[]>(
+      after === undefined
+        ? `/runs/${id}/events`
+        : `/runs/${id}/events?after_event_id=${encodeURIComponent(after)}`,
+    ),
 
-  cancel: (_id: string, _reason?: string) =>
-    disabledRequest<unknown>(),
+  cancel: (id: string, reason?: string) =>
+    request<{ run_id: string; status: string }>(`/runs/${id}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
 };

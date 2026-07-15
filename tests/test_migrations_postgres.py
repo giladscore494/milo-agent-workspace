@@ -115,6 +115,10 @@ class EphemeralPostgres:
 def _require_pg_bin() -> str:
     pg_bin = _find_pg_bin()
     if pg_bin is None or shutil.which("psql") is None:
+        if os.getenv("MILO_REQUIRE_PG_TESTS", "").strip().lower() in {"1", "true", "yes", "on"}:
+            # The dedicated CI job MUST run these tests; a silent skip would
+            # let unverified migrations look green.
+            pytest.fail("MILO_REQUIRE_PG_TESTS is set but PostgreSQL server binaries are unavailable; the executable migration suite is mandatory here")
         pytest.skip("PostgreSQL server binaries not available; executable migration validation skipped")
     return pg_bin
 
@@ -621,3 +625,621 @@ def test_authenticated_role_has_no_mutation_grants_on_projects(db):
         "order by privilege_type"
     ).splitlines()
     assert grants == ["SELECT"]
+
+
+# --- migration 008 (workflow proposal ownership) executable validation ---
+
+PROPOSAL_MEMBER_USER = "aaaaaaaa-0000-4000-8000-000000000011"
+PROPOSAL_OUTSIDER_USER = "aaaaaaaa-0000-4000-8000-000000000012"
+PROPOSAL_PROJECT = "bbbbbbbb-0000-4000-8000-000000000011"
+LEGACY_PROPOSAL = "cccccccc-0000-4000-8000-000000000001"
+OWNED_PROPOSAL = "cccccccc-0000-4000-8000-000000000002"
+OWNERSHIP_PG_PORT = "54994"
+
+
+@pytest.fixture(scope="module")
+def ownership_db():
+    """Confirmed baseline + migrations, with a legacy proposal inserted
+    BEFORE migration 008 runs, then 008 applied twice (idempotency), then
+    an ownership fixture seeded through the trusted service path."""
+    server = EphemeralPostgres(_require_pg_bin(), port=OWNERSHIP_PG_PORT)
+    server.start()
+    try:
+        server.create_database()
+        server.psql(file=BASELINE)
+        server.psql(sql=SEED_LEGACY_ROWS)
+        server.psql(sql=SUPABASE_AUTH_SHIM)
+        migration_008 = next(m for m in MIGRATIONS if m.name.startswith("008"))
+        for migration in MIGRATIONS:
+            if migration.name.startswith("008"):
+                # Seed a proposal exactly as production holds it today,
+                # before ownership columns exist.
+                server.psql(
+                    f"insert into public.workflow_proposals (id, status, user_request) "
+                    f"values ('{LEGACY_PROPOSAL}', 'approved', 'legacy proposal request')"
+                )
+            server.psql(file=migration)
+        # Repeated application must be a no-op, not an error.
+        server.psql(file=migration_008)
+        server.psql(
+            f"insert into auth.users (id) values ('{PROPOSAL_MEMBER_USER}'), ('{PROPOSAL_OUTSIDER_USER}') on conflict do nothing; "
+            f"insert into public.projects (id, slug, name, workflow_key) values "
+            f"('{PROPOSAL_PROJECT}', 'proposal-scope', 'Proposal Scope', 'vehicle_catalog_v1') on conflict (id) do nothing; "
+            f"insert into public.project_members (project_id, user_id, role) values "
+            f"('{PROPOSAL_PROJECT}', '{PROPOSAL_MEMBER_USER}', 'owner') on conflict do nothing; "
+            f"insert into public.workflow_proposals (id, status, user_request, created_by, project_id) "
+            f"values ('{OWNED_PROPOSAL}', 'approved', 'owned proposal request', "
+            f"'{PROPOSAL_MEMBER_USER}', '{PROPOSAL_PROJECT}')"
+        )
+        yield server
+    finally:
+        server.stop()
+
+
+def test_008_adds_ownership_columns_with_expected_types(ownership_db):
+    rows = ownership_db.psql(
+        "select column_name, data_type, is_nullable from information_schema.columns "
+        "where table_schema='public' and table_name='workflow_proposals' "
+        "and column_name in ('created_by','project_id') order by column_name"
+    ).splitlines()
+    assert rows == ["created_by|uuid|YES", "project_id|uuid|YES"]
+
+
+def test_008_adds_foreign_keys_and_indexes(ownership_db):
+    fks = ownership_db.psql(
+        "select confrelid::regclass::text from pg_constraint "
+        "where conrelid='public.workflow_proposals'::regclass and contype='f' "
+        "order by 1"
+    ).splitlines()
+    assert fks == ["auth.users", "projects"]
+    indexes = ownership_db.psql(
+        "select indexname from pg_indexes where schemaname='public' and tablename='workflow_proposals' "
+        "and indexname in ('workflow_proposals_created_by_idx','workflow_proposals_project_id_idx') order by 1"
+    ).splitlines()
+    assert indexes == ["workflow_proposals_created_by_idx", "workflow_proposals_project_id_idx"]
+
+
+def test_008_preserves_legacy_proposal_rows_without_assigning_ownership(ownership_db):
+    row = ownership_db.psql(
+        f"select status, user_request, created_by is null, project_id is null "
+        f"from public.workflow_proposals where id='{LEGACY_PROPOSAL}'"
+    )
+    assert row == "approved|legacy proposal request|t|t"
+
+
+def test_008_is_rerun_safe_and_keeps_row_count(ownership_db):
+    assert ownership_db.psql("select count(*) from public.workflow_proposals") == "2"
+    migration_008 = next(m for m in MIGRATIONS if m.name.startswith("008"))
+    ownership_db.psql(file=migration_008)
+    assert ownership_db.psql("select count(*) from public.workflow_proposals") == "2"
+
+
+def test_008_rls_member_and_creator_can_read_owned_proposal(ownership_db):
+    assert _as_authenticated(
+        ownership_db, PROPOSAL_MEMBER_USER,
+        f"select count(*) from public.workflow_proposals where id='{OWNED_PROPOSAL}'"
+    ) == "1"
+
+
+def test_008_rls_non_member_cannot_read_or_update_owned_proposal(ownership_db):
+    assert _as_authenticated(
+        ownership_db, PROPOSAL_OUTSIDER_USER,
+        "select count(*) from public.workflow_proposals"
+    ) == "0"
+    _as_authenticated(
+        ownership_db, PROPOSAL_OUTSIDER_USER,
+        f"update public.workflow_proposals set user_request='hijacked' where id='{OWNED_PROPOSAL}'"
+    )
+    assert ownership_db.psql(
+        f"select user_request from public.workflow_proposals where id='{OWNED_PROPOSAL}'"
+    ) == "owned proposal request"
+
+
+def test_008_rls_legacy_unowned_proposal_is_invisible_to_authenticated(ownership_db):
+    for user in (PROPOSAL_MEMBER_USER, PROPOSAL_OUTSIDER_USER):
+        assert _as_authenticated(
+            ownership_db, user,
+            f"select count(*) from public.workflow_proposals where id='{LEGACY_PROPOSAL}'"
+        ) == "0"
+    assert _as_authenticated(ownership_db, None, "select count(*) from public.workflow_proposals") == "0"
+
+
+def test_008_rls_insert_requires_creator_identity_and_membership(ownership_db):
+    inserted = _as_authenticated(
+        ownership_db, PROPOSAL_MEMBER_USER,
+        f"insert into public.workflow_proposals (status, user_request, created_by, project_id) "
+        f"values ('approved', 'member insert', '{PROPOSAL_MEMBER_USER}', '{PROPOSAL_PROJECT}') returning id"
+    )
+    assert inserted
+    with pytest.raises(AssertionError, match="row-level security"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_OUTSIDER_USER,
+            f"insert into public.workflow_proposals (status, user_request, created_by, project_id) "
+            f"values ('approved', 'outsider insert', '{PROPOSAL_OUTSIDER_USER}', '{PROPOSAL_PROJECT}')"
+        )
+    with pytest.raises(AssertionError, match="row-level security"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_MEMBER_USER,
+            f"insert into public.workflow_proposals (status, user_request, created_by, project_id) "
+            f"values ('approved', 'spoofed creator', '{PROPOSAL_OUTSIDER_USER}', '{PROPOSAL_PROJECT}')"
+        )
+
+
+def test_008_service_path_retains_full_visibility(ownership_db):
+    # The trusted service path (table owner / service_role) bypasses RLS and
+    # keeps maintenance access to legacy rows.
+    assert int(ownership_db.psql("select count(*) from public.workflow_proposals")) >= 2
+
+
+def test_008_member_can_update_owned_proposal(ownership_db):
+    _as_authenticated(
+        ownership_db, PROPOSAL_MEMBER_USER,
+        f"update public.workflow_proposals set repair_count = repair_count + 1 where id='{OWNED_PROPOSAL}'"
+    )
+    assert ownership_db.psql(
+        f"select repair_count from public.workflow_proposals where id='{OWNED_PROPOSAL}'"
+    ) == "1"
+
+
+def test_008_authenticated_grants_are_least_privilege(ownership_db):
+    grants = ownership_db.psql(
+        "select privilege_type from information_schema.role_table_grants "
+        "where grantee='authenticated' and table_schema='public' and table_name='workflow_proposals' "
+        "order by privilege_type"
+    ).splitlines()
+    # UPDATE is column-scoped only (no table-level update grant).
+    assert grants == ["INSERT", "SELECT"]
+    update_columns = ownership_db.psql(
+        "select column_name from information_schema.column_privileges "
+        "where grantee='authenticated' and table_schema='public' and table_name='workflow_proposals' "
+        "and privilege_type='UPDATE' order by column_name"
+    ).splitlines()
+    assert "created_by" not in update_columns
+    assert "project_id" not in update_columns
+    assert "user_request" in update_columns
+
+
+# --- migration 009 (run idempotency + lifecycle) executable validation ---
+
+def test_009_adds_idempotency_and_launch_columns(db):
+    rows = db.psql(
+        "select column_name from information_schema.columns "
+        "where table_schema='public' and table_name='runs' and column_name in "
+        "('requested_by','request_fingerprint','launch_state','launched_at','launch_error') order by 1"
+    ).splitlines()
+    assert rows == ["launch_error", "launch_state", "launched_at", "request_fingerprint", "requested_by"]
+
+
+def test_009_legacy_runs_keep_default_launch_state_and_null_ownership(db):
+    assert db.psql(
+        "select count(*) from public.runs where id in "
+        "('22222222-2222-2222-2222-222222222222','33333333-3333-3333-3333-333333333333') "
+        "and launch_state = 'none' and requested_by is null and idempotency_key is null"
+    ) == "2"
+
+
+def test_009_expanded_status_values_are_accepted(db):
+    for status in ("launching", "timed_out", "budget_exhausted"):
+        run_id = db.psql(
+            f"insert into public.runs (conversation_id, status, input) values "
+            f"('11111111-1111-1111-1111-111111111111', '{status}', '{{}}'::jsonb) returning id"
+        )
+        assert run_id
+    with pytest.raises(AssertionError, match="runs_status_check"):
+        db.psql(
+            "insert into public.runs (conversation_id, status, input) values "
+            "('11111111-1111-1111-1111-111111111111', 'not_a_state', '{}'::jsonb)"
+        )
+
+
+def test_009_launch_state_check_rejects_unknown_values(db):
+    with pytest.raises(AssertionError, match="runs_launch_state_check"):
+        db.psql(
+            "insert into public.runs (conversation_id, status, input, launch_state) values "
+            "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb, 'bogus')"
+        )
+
+
+def test_009_idempotency_unique_index_blocks_duplicates_per_user(db):
+    _seed_membership_fixture(db)
+    db.psql(
+        f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
+        f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{MEMBER_USER}', 'idem-dup-1')"
+    )
+    with pytest.raises(AssertionError, match="runs_user_conversation_idempotency_uidx"):
+        db.psql(
+            f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
+            f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{MEMBER_USER}', 'idem-dup-1')"
+        )
+    # A different user may reuse the same key in the same conversation.
+    db.psql(
+        f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
+        f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{OUTSIDER_USER}', 'idem-dup-1')"
+    )
+
+
+def test_009_is_rerun_safe(db):
+    migration_009 = next(m for m in MIGRATIONS if m.name.startswith("009"))
+    before = db.psql("select count(*) from public.runs")
+    db.psql(file=migration_009)
+    assert db.psql("select count(*) from public.runs") == before
+
+
+# --- migration 010 (run usage accounting) executable validation ---
+
+def test_010_adds_usage_column_with_empty_default(db):
+    assert db.psql(
+        "select data_type from information_schema.columns "
+        "where table_schema='public' and table_name='runs' and column_name='usage'"
+    ) == "jsonb"
+    assert db.psql(
+        "select count(*) from public.runs where id='22222222-2222-2222-2222-222222222222' and usage = '{}'::jsonb"
+    ) == "1"
+
+
+def test_010_is_rerun_safe(db):
+    migration_010 = next(m for m in MIGRATIONS if m.name.startswith("010"))
+    db.psql(file=migration_010)
+    assert db.psql("select count(*) from public.runs where usage is null") == "0"
+
+
+# --- migration 011 (protected ownership + atomic project creation) ---
+
+def test_011_authenticated_cannot_update_ownership_columns(ownership_db):
+    with pytest.raises(AssertionError, match="permission denied"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_MEMBER_USER,
+            f"update public.workflow_proposals set created_by='{PROPOSAL_OUTSIDER_USER}' where id='{OWNED_PROPOSAL}'"
+        )
+    with pytest.raises(AssertionError, match="permission denied"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_MEMBER_USER,
+            f"update public.workflow_proposals set project_id=null where id='{OWNED_PROPOSAL}'"
+        )
+    # Non-ownership columns stay updatable for members.
+    _as_authenticated(
+        ownership_db, PROPOSAL_MEMBER_USER,
+        f"update public.workflow_proposals set user_request='member edit ok' where id='{OWNED_PROPOSAL}'"
+    )
+    assert ownership_db.psql(
+        f"select created_by::text, user_request from public.workflow_proposals where id='{OWNED_PROPOSAL}'"
+    ) == f"{PROPOSAL_MEMBER_USER}|member edit ok"
+
+
+def test_011_project_creation_with_owner_is_atomic(ownership_db):
+    before = ownership_db.psql("select count(*) from public.projects")
+    row = ownership_db.psql(
+        "select id from public.create_project_from_proposal_with_owner("
+        f"'{OWNED_PROPOSAL}', 'atomic-proj', 'Atomic Proj', null, '{{}}'::jsonb, '{PROPOSAL_MEMBER_USER}')"
+    )
+    assert row
+    assert int(ownership_db.psql("select count(*) from public.projects")) == int(before) + 1
+    assert ownership_db.psql(
+        f"select role from public.project_members pm join public.projects p on p.id = pm.project_id "
+        f"where p.slug='atomic-proj' and pm.user_id='{PROPOSAL_MEMBER_USER}'"
+    ) == "owner"
+
+
+def test_011_no_orphan_project_when_membership_insert_fails(ownership_db):
+    before = ownership_db.psql("select count(*) from public.projects")
+    with pytest.raises(AssertionError, match="foreign key|violates"):
+        ownership_db.psql(
+            "select public.create_project_from_proposal_with_owner("
+            f"'{OWNED_PROPOSAL}', 'orphan-proj', 'Orphan Proj', null, '{{}}'::jsonb, "
+            "'99999999-9999-4999-8999-999999999999')"  # not a real auth.users id
+        )
+    assert ownership_db.psql("select count(*) from public.projects") == before
+    assert ownership_db.psql("select count(*) from public.projects where slug='orphan-proj'") == "0"
+
+
+def test_011_authenticated_cannot_execute_project_creation_function(ownership_db):
+    with pytest.raises(AssertionError, match="permission denied"):
+        _as_authenticated(
+            ownership_db, PROPOSAL_MEMBER_USER,
+            "select public.create_project_from_proposal_with_owner("
+            f"'{OWNED_PROPOSAL}', 'sneaky-proj', 'Sneaky', null, '{{}}'::jsonb, '{PROPOSAL_MEMBER_USER}')"
+        )
+
+
+def test_011_is_rerun_safe(ownership_db):
+    migration_011 = next(m for m in MIGRATIONS if m.name.startswith("011"))
+    ownership_db.psql(file=migration_011)
+    assert ownership_db.psql(
+        "select count(*) from pg_proc where proname='create_project_from_proposal_with_owner'"
+    ) == "1"
+
+
+# --- migration 012 (atomic run operations) executable validation ---
+
+ATOMIC_PROJECT = "bbbbbbbb-0000-4000-8000-000000000021"
+ATOMIC_CONVERSATION = "dddddddd-0000-4000-8000-000000000001"
+
+
+def _seed_atomic_fixture(db) -> None:
+    db.psql(
+        f"insert into auth.users (id) values ('{PROPOSAL_MEMBER_USER}') on conflict do nothing; "
+        f"insert into public.projects (id, slug, name, workflow_key) values "
+        f"('{ATOMIC_PROJECT}', 'atomic-scope', 'Atomic Scope', 'vehicle_catalog_v1') on conflict (id) do nothing; "
+        f"insert into public.conversations (id, project_id, title) values "
+        f"('{ATOMIC_CONVERSATION}', '{ATOMIC_PROJECT}', 'atomic conversation') on conflict (id) do nothing"
+    )
+
+
+def _create_run_sql(key: str, content: str = "concurrent content", max_user: str = "null", max_project: str = "null") -> str:
+    return (
+        "select public.create_message_and_run("
+        f"'{ATOMIC_CONVERSATION}', '{content}', '{{}}'::jsonb, '{PROPOSAL_MEMBER_USER}', "
+        f"'{key}', 'fp-{key}', {max_user}, {max_project})"
+    )
+
+
+def test_012_concurrent_same_key_creates_exactly_one_message_and_run(ownership_db):
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    key = "concurrent-key-1"
+
+    def attempt(_):
+        try:
+            return ("ok", ownership_db.psql(_create_run_sql(key)))
+        except AssertionError as exc:
+            return ("err", str(exc))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(attempt, range(8)))
+    assert all(kind == "ok" for kind, _ in results), results
+    created_flags = ["'created': True" in out or '"created": true' in out for _, out in results]
+    assert sum(created_flags) == 1, results
+    assert ownership_db.psql(
+        f"select count(*) from public.runs where idempotency_key='{key}'"
+    ) == "1"
+    assert ownership_db.psql(
+        f"select count(*) from public.messages where conversation_id='{ATOMIC_CONVERSATION}' "
+        f"and content='concurrent content'"
+    ) == "1"
+
+
+def test_012_concurrent_admission_never_exceeds_user_cap(ownership_db):
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    ownership_db.psql(
+        f"update public.runs set status='completed' where requested_by='{PROPOSAL_MEMBER_USER}' "
+        "and status in ('queued','launching','starting','running','waiting','cancellation_requested')"
+    )
+
+    def attempt(i):
+        try:
+            ownership_db.psql(_create_run_sql(f"admission-key-{i}", content=f"admission {i}", max_user="2"))
+            return "ok"
+        except AssertionError as exc:
+            assert "USER_CONCURRENCY_LIMIT" in str(exc)
+            return "limited"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(attempt, range(6)))
+    assert results.count("ok") == 2, results
+    assert results.count("limited") == 4, results
+    active = ownership_db.psql(
+        f"select count(*) from public.runs where requested_by='{PROPOSAL_MEMBER_USER}' and status='queued'"
+    )
+    assert active == "2"
+
+
+def test_012_message_rolls_back_when_run_insert_fails(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    messages_before = ownership_db.psql("select count(*) from public.messages")
+    runs_before = ownership_db.psql("select count(*) from public.runs")
+    # Deterministically fail the second insert (the run) with a temporary
+    # check constraint, proving the message insert rolls back with it.
+    ownership_db.psql(
+        "alter table public.runs add constraint test_block_rollback_fp "
+        "check (request_fingerprint is distinct from 'fp-rollback-key')"
+    )
+    try:
+        with pytest.raises(AssertionError, match="test_block_rollback_fp"):
+            ownership_db.psql(_create_run_sql("rollback-key", content="rollback content"))
+    finally:
+        ownership_db.psql("alter table public.runs drop constraint test_block_rollback_fp")
+    assert ownership_db.psql("select count(*) from public.messages") == messages_before
+    assert ownership_db.psql("select count(*) from public.runs") == runs_before
+    assert ownership_db.psql(
+        "select count(*) from public.messages where content='rollback content'"
+    ) == "0"
+
+
+def test_012_launch_state_check_includes_launch_unknown(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'launch_unknown') returning id"
+    )
+    assert run_id
+
+
+def test_012_launch_cas_only_one_winner(ownership_db):
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'pending') returning id"
+    )
+
+    def attempt(_):
+        return ownership_db.psql(
+            f"update public.runs set launch_state='launching' "
+            f"where id='{run_id}' and status='queued' and launch_state in ('pending','launch_failed') "
+            "returning id"
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(attempt, range(6)))
+    winners = [r for r in results if r.strip()]
+    assert len(winners) == 1, results
+
+
+def test_012_lease_claim_single_holder_under_concurrency(ownership_db):
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+    )
+
+    def claim(i):
+        return ownership_db.psql(
+            f"select worker_id from public.claim_run_lease('{run_id}', 'worker-{i}', 300)"
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(claim, range(6)))
+    winners = [r for r in results if r.strip()]
+    assert len(winners) == 1, results
+    assert ownership_db.psql(f"select status from public.runs where id='{run_id}'") == "starting"
+    assert ownership_db.psql(f"select attempt from public.runs where id='{run_id}'") == "1"
+
+
+def test_012_expired_lease_is_reclaimable_with_incremented_attempt(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+    )
+    assert ownership_db.psql(f"select worker_id from public.claim_run_lease('{run_id}', 'worker-old', 300)") == "worker-old"
+    # A second worker cannot claim while the lease is fresh.
+    assert ownership_db.psql(f"select worker_id from public.claim_run_lease('{run_id}', 'worker-new', 300)") == ""
+    ownership_db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+    row = ownership_db.psql(f"select worker_id, attempt from public.claim_run_lease('{run_id}', 'worker-new', 300)")
+    assert row == "worker-new|2"
+
+
+def test_012_stale_worker_cannot_overwrite_newer_result(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+    )
+    ownership_db.psql(f"select public.claim_run_lease('{run_id}', 'worker-old', 300)")
+    ownership_db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+    ownership_db.psql(f"select public.claim_run_lease('{run_id}', 'worker-new', 300)")
+    # The stale worker's conditional terminal write matches zero rows.
+    stale_write = ownership_db.psql(
+        f"update public.runs set status='failed' where id='{run_id}' and worker_id='worker-old' returning id"
+    )
+    assert stale_write.strip() == ""
+    # The new holder completes; the terminal result is protected afterwards.
+    ownership_db.psql(
+        f"update public.runs set status='running' where id='{run_id}' and worker_id='worker-new'"
+    )
+    ownership_db.psql(
+        f"update public.runs set status='completed' where id='{run_id}' and worker_id='worker-new' and status='running'"
+    )
+    late_stale = ownership_db.psql(
+        f"update public.runs set status='failed' where id='{run_id}' and worker_id='worker-old' and status='running' returning id"
+    )
+    assert late_stale.strip() == ""
+    assert ownership_db.psql(f"select status from public.runs where id='{run_id}'") == "completed"
+
+
+def test_012_cancellation_stays_visible_through_lease_claim(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'cancellation_requested', '{{}}'::jsonb) returning id"
+    )
+    claimed = ownership_db.psql(f"select status from public.claim_run_lease('{run_id}', 'worker-c', 300)")
+    assert claimed == "cancellation_requested"
+
+
+def test_012_is_rerun_safe(ownership_db):
+    migration_012 = next(m for m in MIGRATIONS if m.name.startswith("012"))
+    ownership_db.psql(file=migration_012)
+    assert ownership_db.psql("select count(*) from pg_proc where proname='create_message_and_run'") == "1"
+    assert ownership_db.psql("select count(*) from pg_proc where proname='claim_run_lease'") == "1"
+
+
+def test_012_authenticated_cannot_execute_run_functions(ownership_db):
+    _seed_atomic_fixture(ownership_db)
+    with pytest.raises(AssertionError, match="permission denied"):
+        _as_authenticated(ownership_db, PROPOSAL_MEMBER_USER, _create_run_sql("sneaky-key"))
+
+
+# --- migration 013 (append-only usage ledger) executable validation ---
+
+def test_013_ledger_table_shape_and_decimal_costs(db):
+    assert db.psql(
+        "select data_type, numeric_precision, numeric_scale from information_schema.columns "
+        "where table_schema='public' and table_name='run_usage_ledger' and column_name='estimated_cost'"
+    ) == "numeric|12|6"
+    assert db.psql(
+        "select data_type from information_schema.columns "
+        "where table_schema='public' and table_name='run_usage_ledger' and column_name='actual_cost'"
+    ) == "numeric"
+
+
+def test_013_ledger_appends_and_is_append_only(db):
+    run_id = db.psql(
+        "insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+    )
+    entry_id = db.psql(
+        f"insert into public.run_usage_ledger (run_id, provider, model, call_seq, decision, reserved_input_tokens, reserved_output_tokens, estimated_cost) "
+        f"values ('{run_id}', 'moonshot', 'kimi', 1, 'reserved', 120, 500, 0.050000) returning id"
+    )
+    assert entry_id
+    with pytest.raises(AssertionError, match="append-only"):
+        db.psql(f"update public.run_usage_ledger set actual_cost = 0 where id = {entry_id}")
+    with pytest.raises(AssertionError, match="append-only"):
+        db.psql(f"delete from public.run_usage_ledger where id = {entry_id}")
+
+
+def test_013_ledger_rejects_unknown_decision(db):
+    run_id = db.psql(
+        "insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+    )
+    with pytest.raises(AssertionError, match="decision"):
+        db.psql(
+            f"insert into public.run_usage_ledger (run_id, decision) values ('{run_id}', 'bogus')"
+        )
+
+
+def test_013_ledger_denies_authenticated_access(db):
+    assert db.psql(
+        "select count(*) from information_schema.role_table_grants "
+        "where grantee='authenticated' and table_name='run_usage_ledger'"
+    ) == "0"
+
+
+def test_013_daily_cost_query_uses_settled_actuals_over_reserved_estimates(db):
+    user = "aaaaaaaa-0000-4000-8000-000000000031"
+    db.psql(f"insert into auth.users (id) values ('{user}') on conflict do nothing")
+    run_id = db.psql(
+        "insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+    )
+    db.psql(
+        f"insert into public.run_usage_ledger (run_id, user_id, call_seq, decision, estimated_cost) values "
+        f"('{run_id}', '{user}', 1, 'reserved', 0.05), ('{run_id}', '{user}', 2, 'reserved', 0.05)"
+    )
+    db.psql(
+        f"insert into public.run_usage_ledger (run_id, user_id, call_seq, decision, actual_cost) values "
+        f"('{run_id}', '{user}', 1, 'settled', 0.02)"
+    )
+    # call 1 settled at 0.02; call 2 still reserved at 0.05 => 0.07
+    total = db.psql(
+        "select round(sum(cost), 6) from ("
+        "  select distinct on (run_id, call_seq) coalesce(actual_cost, estimated_cost) as cost "
+        f"  from public.run_usage_ledger where user_id='{user}' and created_at > now() - interval '24 hours' "
+        "  order by run_id, call_seq, (decision='settled') desc, id desc"
+        ") settled_first"
+    )
+    assert total == "0.070000"
+
+
+def test_013_is_rerun_safe(db):
+    migration_013 = next(m for m in MIGRATIONS if m.name.startswith("013"))
+    db.psql(file=migration_013)
+    assert db.psql("select count(*) from pg_trigger where tgname='run_usage_ledger_append_only'") == "1"

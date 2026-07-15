@@ -8,7 +8,8 @@
     "build": "next build",
     "test": "vitest run",
     "test:secrets": "node scripts/no-secret-bundle-check.mjs",
-    "test:static": "node scripts/static-ui-check.mjs"
+    "test:static": "node scripts/static-ui-check.mjs",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.50.0",
@@ -19,6 +20,7 @@
     "react-dom": "^18.3.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@testing-library/jest-dom": "^6.4.0",
     "@testing-library/react": "^15.0.0",
     "@types/node": "^20.14.0",

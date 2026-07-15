@@ -52,6 +52,13 @@ REQUIRED_PER_FILE = {
         "updated_at",
         "stuck_runs",
     ],
+    "009_run_idempotency_lifecycle.sql": [
+        # additive idempotency/lifecycle columns; status check stays defensive
+        "add column if not exists requested_by",
+        "add column if not exists launch_state",
+        "create unique index if not exists runs_user_conversation_idempotency_uidx",
+        "not valid",
+    ],
 }
 
 FORBIDDEN_EVERYWHERE = [
