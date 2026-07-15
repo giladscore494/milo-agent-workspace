@@ -27,18 +27,29 @@
   construction of `milo-production.yaml`, service accounts, Secret Manager
   resources and per-secret IAM, Vercel production variables, Upstash metadata
   and Cloud Run identity assignments. Default mode is `--plan` (read-only).
+- **Adopts existing production state.** Default secret resource names are the
+  operator's existing Secret Manager resources (`SUPABASE_URL`,
+  `SUPABASE_SECRET_KEY`, `KIMI_API_KEY`, `UPSTASH_REDIS_REST_TOKEN`); secrets
+  are inspected (states `REUSE_ENABLED` / `EXISTS_NO_ENABLED_VERSION` /
+  `MISSING` / `INSPECTION_ERROR`) and adopted without prompting or re-creating
+  when an enabled version exists. Existing Vercel production variables are
+  reused (REUSE/CREATE/UPDATE classification). The GitHub workflow no longer
+  requires duplicating Supabase/provider values as GitHub secrets.
 - **Guarded apply** creates the distinct API/worker/gateway service accounts
-  (never keys), creates Secret Manager resources and adds versions only from
-  hidden input with per-secret accessor grants, discovers/creates a dedicated
-  Upstash production Redis (token stored in Secret Manager, never printed),
-  configures Vercel production variables after fail-closed identity proof,
-  sets the Cloud Run API/worker runtime identities (worker job **never
-  executed**), generates the manifest from live state, and runs the full
-  read-only audit requiring consolidated blocked = 0.
+  (never keys), adopts/creates Secret Manager resources with per-secret
+  accessor grants, discovers/creates a dedicated Upstash production Redis
+  (token stored in Secret Manager, never printed), **configures the live Cloud
+  Run API/worker env vars + Secret Manager references** (flags false, budgets
+  nonzero, `JOB_LAUNCHER=disabled`; worker job **never executed**), sets Vercel
+  managed vars idempotently, verifies/adopts the Vercel→GCP Workload Identity
+  Federation chain and binds `roles/run.invoker`, and runs a **live-inspecting**
+  audit that requires consolidated blocked = 0 (never trusting the generated
+  manifest alone). `--deploy-vercel` was removed (the bootstrap never deploys).
 - **Also added:** `.github/workflows/bootstrap-production.yml`
   (`workflow_dispatch` only, `production` environment, Workload Identity
-  Federation, redacted artifacts only), `tests/test_bootstrap_production.py`
-  (29 strict tests), and `docs/production-readiness/BOOTSTRAP.md`.
+  Federation, redacted artifacts only), `scripts/release/verify_live_config.py`,
+  `tests/test_bootstrap_production.py` (31 strict tests), and
+  `docs/production-readiness/BOOTSTRAP.md`.
 - **No production mutation or deployment was performed** during
   implementation or testing; all cloud calls in tests are strictly mocked and
   Upstash is served by a mock fixture.

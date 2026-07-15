@@ -5,6 +5,13 @@ name: Bootstrap Production
 # explicit typed confirmation input AND GitHub Environment `production`
 # approval, authenticates to Google Cloud through Workload Identity Federation
 # (no service-account JSON keys), and uploads only redacted reports.
+#
+# The bootstrap ADOPTS the operator's EXISTING Secret Manager resources
+# (SUPABASE_URL, SUPABASE_SECRET_KEY, KIMI_API_KEY, UPSTASH_REDIS_REST_TOKEN).
+# It therefore does NOT require those Supabase/provider values to be duplicated
+# as GitHub Environment secrets — GCP runtime services reference Secret Manager
+# directly. Only the Upstash management credentials and Vercel token (which are
+# NOT in Secret Manager) are supplied as GitHub secrets.
 on:
   workflow_dispatch:
     inputs:
@@ -20,11 +27,6 @@ on:
         description: "For apply mode, type exactly: I_UNDERSTAND_THIS_CHANGES_PRODUCTION"
         required: false
         type: string
-      deploy_vercel:
-        description: "Deploy Vercel too (still requires apply + confirmation). Default false."
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -41,7 +43,6 @@ jobs:
     environment: production
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -50,7 +51,6 @@ jobs:
         if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
         uses: google-github-actions/auth@v2
         with:
-          # WIF only — never a service-account key.
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}
 
@@ -61,9 +61,8 @@ jobs:
       - name: Run bootstrap plan (read-only)
         shell: bash
         env:
-          # Secret INPUT is passed by env-var NAME only; values come from the
-          # `production` environment's secrets and are never echoed.
-          MILO_SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Only NON-Secret-Manager management creds are supplied. Supabase /
+          # provider values are ADOPTED from Secret Manager and never passed.
           MILO_UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
           MILO_UPSTASH_APIKEY: ${{ secrets.UPSTASH_API_KEY }}
           MILO_VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -73,11 +72,11 @@ jobs:
           bash scripts/release/bootstrap-production.sh --plan \
             --output-directory "${RUNNER_TEMP}/bootstrap-out" \
             --expected-account "${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}" \
-            --supabase-key-env MILO_SUPABASE_KEY \
+            ${WIF_POOL:+--wif-pool "$WIF_POOL"} ${WIF_PROVIDER:+--wif-provider "$WIF_PROVIDER"} \
             --upstash-email-env MILO_UPSTASH_EMAIL \
             --upstash-apikey-env MILO_UPSTASH_APIKEY \
             --vercel-token-env MILO_VERCEL_TOKEN
-
+        # Resource-name overrides / WIF ids may be supplied as plain repo vars.
       - name: Upload redacted plan reports (never secret files)
         uses: actions/upload-artifact@v4
         with:
@@ -102,7 +101,6 @@ jobs:
           exit 1
 
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -120,30 +118,26 @@ jobs:
         shell: bash
         env:
           MILO_OPERATOR_ACK: I_UNDERSTAND_THIS_CHANGES_PRODUCTION
-          MILO_SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          MILO_PROVIDER_KEY: ${{ secrets.PROVIDER_API_KEY }}
+          # No SUPABASE_SERVICE_ROLE_KEY / PROVIDER_API_KEY here: those already
+          # exist in Google Secret Manager and are adopted, not duplicated.
           MILO_UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
           MILO_UPSTASH_APIKEY: ${{ secrets.UPSTASH_API_KEY }}
           MILO_VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          WIF_POOL: ${{ vars.GCP_WORKLOAD_IDENTITY_POOL_ID }}
+          WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/bootstrap-out"
-          deploy_flag=""
-          if [ "${{ github.event.inputs.deploy_vercel }}" = "true" ]; then
-            deploy_flag="--deploy-vercel"
-          fi
           bash scripts/release/bootstrap-production.sh --apply \
             --environment production \
             --confirm-production-change \
             --release-sha "${GITHUB_SHA}" \
             --output-directory "${RUNNER_TEMP}/bootstrap-out" \
             --expected-account "${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}" \
-            --supabase-key-env MILO_SUPABASE_KEY \
-            --provider-key-env MILO_PROVIDER_KEY \
+            ${WIF_POOL:+--wif-pool "$WIF_POOL"} ${WIF_PROVIDER:+--wif-provider "$WIF_PROVIDER"} \
             --upstash-email-env MILO_UPSTASH_EMAIL \
             --upstash-apikey-env MILO_UPSTASH_APIKEY \
-            --vercel-token-env MILO_VERCEL_TOKEN \
-            ${deploy_flag}
+            --vercel-token-env MILO_VERCEL_TOKEN
 
       - name: Upload redacted apply reports (never secret files)
         if: ${{ always() }}
