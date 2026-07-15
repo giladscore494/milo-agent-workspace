@@ -70,5 +70,6 @@ was never exercised outside mocked tests.
 | --- | --- |
 | PR | #31 into `claude/production-readiness-j0hhni` |
 | Audited code head | `004325e671defe5bb591e7dde22a4b132c56446d` (the eight Phases 9–11 commits) |
-| Remote head SHA | the status-record commit on top of the audited head — see PR #31's head; it changes only documentation |
-| CI (offline-checks / postgres-checks / e2e / Lint & Test) | recorded as green in the closing commit once GitHub checks complete on PR #31 |
+| CI-verified head | `a5258ef804bc959b42e57e045a16f288697f2211` — all checks green (2026-07-15): offline-checks ✅, postgres-checks ✅, e2e ✅, Lint & Test ✅, Vercel Preview ✅ |
+| Remote head SHA | this closing status commit atop the CI-verified head (documentation only; CI reruns on it before merge) |
+| CI (offline-checks / postgres-checks / e2e / Lint & Test) | all green at the CI-verified head; run 29442696451 |
