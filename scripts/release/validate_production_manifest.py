@@ -134,6 +134,59 @@ def get(data: dict, *path):
     return cur
 
 
+# Logical secret consumer -> the manifest identity that must hold access.
+CONSUMER_IDENTITY = {
+    "api": ("identities", "api_service_account"),
+    "worker": ("identities", "worker_service_account"),
+    "gateway": ("identities", "gateway_identity"),
+}
+
+
+def _is_placeholder_value(value) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return True
+    v = value.strip()
+    return bool(PLACEHOLDER_RE.match(v)) or "changeme" in v.lower() or "placeholder" in v.lower()
+
+
+def emit_secret_consumers(data: dict) -> list[str]:
+    """Map each fully-specified secret to `name=email[,email]` expectations.
+
+    Only secrets whose resource name AND every consumer's mapped
+    service-account email are concrete (non-placeholder) are emitted, so the
+    placeholder template yields nothing and can never be mistaken for a real
+    Secret Manager verification.
+    """
+    lines: list[str] = []
+    secrets = get(data, "secrets")
+    if not isinstance(secrets, dict):
+        return lines
+    for _label, entry in secrets.items():
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        consumers = entry.get("consumers")
+        if _is_placeholder_value(name):
+            continue
+        if not isinstance(consumers, list) or not consumers:
+            continue
+        emails: list[str] = []
+        ok = True
+        for consumer in consumers:
+            path = CONSUMER_IDENTITY.get(consumer)
+            if path is None:
+                ok = False
+                break
+            email = get(data, *path)
+            if _is_placeholder_value(email):
+                ok = False
+                break
+            emails.append(email)
+        if ok and emails:
+            lines.append(f"{name}={','.join(emails)}")
+    return lines
+
+
 def validate(data: dict, mode: str) -> list[str]:
     errors: list[str] = []
 
@@ -233,6 +286,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--mode", choices=["plan", "apply"], default="plan")
+    parser.add_argument(
+        "--emit-secret-consumers",
+        action="store_true",
+        help=(
+            "Print `name=email[,email]` Secret Manager expectations derived "
+            "from the manifest (concrete entries only) and exit; used by "
+            "production-readiness.sh to drive check-secret-metadata.sh."
+        ),
+    )
     args = parser.parse_args()
 
     path = Path(args.manifest)
@@ -244,6 +306,11 @@ def main() -> int:
     except (ValueError, json.JSONDecodeError) as exc:
         print(f"BLOCKED manifest parse error: {exc}", file=sys.stderr)
         return 1
+
+    if args.emit_secret_consumers:
+        for line in emit_secret_consumers(data):
+            print(line)
+        return 0
 
     errors = validate(data, args.mode)
     if errors:

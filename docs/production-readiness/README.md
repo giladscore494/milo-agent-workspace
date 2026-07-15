@@ -32,6 +32,19 @@ Operator tooling lives in `scripts/release/` (read-only by default; see
 manifest template is `config/production.example.yaml`, validated by
 `scripts/release/validate_production_manifest.py`.
 
+> **Corrective pass (real Cloud Shell audit).** A follow-up corrective PR
+> hardened this tooling against real Cloud Run / Vercel / Supabase / Redis
+> behavior after a live read-only Cloud Shell inspection exposed defects the
+> earlier mocked CI did not catch (wrong Cloud Run **Job** service-account
+> path, unsupported Vercel CLI syntax, a mutation "success" that changed zero
+> rows, a bare 401 accepted as execution-disabled proof, an inaccurate
+> aggregate total, and Secret Manager checks that ran without concrete
+> expectations). The tooling is now `COMPLETED_IN_CODE`, but **external
+> production state is only ever confirmed by running the authenticated
+> read-only audit against the real project** — the tooling never claims a
+> service was verified when only repository wiring was checked. See
+> [STATUS.md](STATUS.md) and [FINAL_ACCEPTANCE.md](FINAL_ACCEPTANCE.md).
+
 ## Completion classifications
 
 Every major item in this documentation set is classified as exactly one of:

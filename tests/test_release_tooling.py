@@ -81,17 +81,25 @@ for ((i=0; i<${#args[@]}; i++)); do
     http*|https*) url="${args[$i]}";;
   esac
 done
-[[ -n "$out" && "$out" != "/dev/null" ]] && : > "$out"
 code=200
+body=""
 if [[ "$method" == "POST" ]]; then
   case "$url" in
+    */runs) code=403; body='{"error":"Run creation is disabled by the gateway safety policy."}';;
+    */cancel) code=403; body='{"error":"cancellation disabled"}';;
     */internal/*) code=403;;
-    */runs) code=403;;
-    */cancel) code=403;;
     *) code=403;;
+  esac
+elif [[ "$method" == "GET" ]]; then
+  case "$url" in
+    */health) code=200; body='{"status":"ok"}';;
+    */conversations/*) code=200; body='{"id":"conversation","title":"smoke"}';;
   esac
 fi
 if [[ "$url" == */projects* && "$url" == *cccccccc* ]]; then code=404; fi
+if [[ -n "$out" && "$out" != "/dev/null" ]]; then
+  if [[ -n "$body" ]]; then printf '%s' "$body" > "$out"; else : > "$out"; fi
+fi
 printf '%s' "$code"
 """,
     )
@@ -487,10 +495,30 @@ def test_execution_disabled_smoke_passes_on_mock(mock_bin, tmp_path):
         "https://mock-gateway.invalid",
         "--env-file",
         str(env_file),
+        "--user-token-env",
+        "SMOKE_TOKEN",
+        "--conversation-id",
+        UUID_A,
         mock_bin=mock_bin,
+        env={"SMOKE_TOKEN": "valid-user-token"},
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "run creation is refused" in result.stdout
+    assert "[PASS] run-creation-blocked" in result.stdout
+
+
+def test_execution_disabled_smoke_without_token_is_not_pass(mock_bin, tmp_path):
+    """A missing authenticated token must NOT yield a run-creation PASS."""
+    env_file = _env_file(tmp_path)
+    result = run_script(
+        "smoke-test-execution-disabled.sh",
+        "--base-url",
+        "https://mock-gateway.invalid",
+        "--env-file",
+        str(env_file),
+        mock_bin=mock_bin,
+    )
+    assert "[PASS] run-creation-blocked" not in result.stdout
+    assert "[MANUAL] run-creation-blocked" in result.stdout
 
 
 def test_read_only_smoke_worker_route_rejected_on_mock(mock_bin):

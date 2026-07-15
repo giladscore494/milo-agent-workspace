@@ -71,7 +71,7 @@ use a wildcard principal; all of these connections are
 - **Read-only verification:**
 
       gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \
-        --format 'value(spec.template.template.spec.serviceAccountName)'
+        --format 'value(spec.template.spec.template.spec.serviceAccountName)'
       gcloud secrets get-iam-policy <SUPABASE_SERVICE_KEY_SECRET_NAME> --project <GCP_PROJECT_ID>
 
 - **Mutation template:** `gcloud secrets add-iam-policy-binding … --member
@@ -136,6 +136,19 @@ no long-lived Google key anywhere in the flow; do not introduce one.
       curl -s <PRODUCTION_VERCEL_URL>/api/gateway/health          # expect 200
       # direct browser rejection (bypassing the gateway):
       curl -s -o /dev/null -w '%{http_code}\n' <CLOUD_RUN_API_URL>/health   # expect 401/403
+      # server env-var NAMES only (values never read); identity is fail-closed:
+      scripts/release/check-vercel-config.sh --project <VERCEL_PROJECT_NAME> \
+        --vercel-cwd frontend --token-env VERCEL_TOKEN
+
+  `check-vercel-config.sh` proves the linked Vercel project identity **before**
+  inspecting any variable: it reads `projectId`/`orgId` from
+  `frontend/.vercel/project.json`, resolves the project with `vercel project
+  inspect <name>`, and requires the resolved project ID (and team/org where the
+  CLI reports it) to match the linked file. A missing/malformed link file, a
+  failed inspection, a resolved ID that differs, or an org that differs are all
+  `BLOCKED` — a human-readable banner alone is never accepted. It lists only
+  variable NAMES (never values) and never runs `vercel link`, deploy, promote,
+  or any env mutation.
 
 - **Revocation / rollback:** remove the identity from
   `MILO_APPROVED_GATEWAY_IDENTITIES` (immediate), remove the
@@ -197,6 +210,17 @@ no long-lived Google key anywhere in the flow; do not introduce one.
 Rules: no project-wide accessor grant (BLOCKED by
 `check-secret-metadata.sh`); no owner/editor roles; every grant at the
 individual secret level; verification is always metadata-only.
+
+`check-secret-metadata.sh` parses the IAM policy **structurally** and only
+counts members of the exact `roles/secretmanager.secretAccessor` binding: a
+service account that appears only under `viewer`/`admin`/metadata roles never
+satisfies (or pollutes) consumer validation. It also distinguishes a genuine
+`NOT_FOUND` (BLOCKED: missing secret / no enabled version) from a
+permission/API failure (MANUAL: inspection could not be performed) — a failed
+`gcloud` call is never reported as "secret missing", "no enabled version", or
+a silently-passed consumer check. The same not-found-vs-permission distinction
+applies to `check-gcp-resources.sh` for Artifact Registry describe, service
+account describe, and the project IAM policy.
 
 ## Connection 6 — API and worker → Redis
 

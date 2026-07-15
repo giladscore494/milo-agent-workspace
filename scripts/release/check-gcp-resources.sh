@@ -121,26 +121,51 @@ else
   done
 fi
 
-# Artifact Registry.
+milo_tmpdir_init
+
+# Artifact Registry. Only a clean not-found means "missing"; a permission/API
+# failure is an inspection failure, never "repository missing".
 if [[ -n "${REPOSITORY}" && -n "${REGION}" ]]; then
-  if gcloud artifacts repositories describe "${REPOSITORY}" --location "${REGION}" --project "${EXPECTED_PROJECT}" --format 'value(name)' > /dev/null 2>&1; then
+  ar_err="${_MILO_TMPDIR}/artifact-registry.err"
+  ar_status=0
+  gcloud artifacts repositories describe "${REPOSITORY}" --location "${REGION}" --project "${EXPECTED_PROJECT}" --format 'value(name)' > /dev/null 2> "${ar_err}" || ar_status=$?
+  if [[ "${ar_status}" -eq 0 ]]; then
     record_check PASS "artifact-registry:${REPOSITORY}" "repository exists in ${REGION}"
-  else
+  elif grep -qiE 'not.?found|does not exist|was not found' "${ar_err}"; then
     record_check BLOCKED "artifact-registry:${REPOSITORY}" "repository not found in ${REGION} (manual creation required; this tool never creates resources)"
+  else
+    record_check MANUAL "artifact-registry:${REPOSITORY}" "could not inspect the repository (permission/API/network error, not a clean 'not found'); verify manually"
   fi
 else
   record_check MANUAL "artifact-registry" "supply --repository and --region to verify the Artifact Registry repository"
 fi
 
 # Cloud Run API service metadata.
+# The Knative-style v1 export (gcloud run services describe --format json)
+# stores the runtime identity at spec.template.spec.serviceAccountName.
 if [[ -n "${API_SERVICE}" && -n "${REGION}" ]]; then
-  svc_meta="$(gcloud run services describe "${API_SERVICE}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format 'value(spec.template.spec.serviceAccountName)' 2> /dev/null || true)"
-  if [[ -z "${svc_meta}" ]]; then
-    record_check WARN "cloud-run:api" "service ${API_SERVICE} not found in ${REGION}; expected before first deployment, BLOCKING afterwards"
+  svc_err="${_MILO_TMPDIR}/api-service.err"
+  svc_status=0
+  svc_json="$(gcloud run services describe "${API_SERVICE}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format json 2> "${svc_err}")" || svc_status=$?
+  if [[ "${svc_status}" -ne 0 ]]; then
+    if grep -qiE 'not.?found|does not exist|cannot find' "${svc_err}"; then
+      record_check WARN "cloud-run:api" "service ${API_SERVICE} not found in ${REGION}; expected before first deployment, BLOCKING afterwards"
+    else
+      record_check MANUAL "cloud-run:api" "could not describe API service ${API_SERVICE} (permission or API error, not a clean 'not found'); verify manually"
+    fi
+  elif ! json_is_valid "${svc_json}"; then
+    record_check MANUAL "cloud-run:api" "API service description was not valid JSON (missing python3 parser?); verify manually"
   else
-    record_check PASS "cloud-run:api" "service ${API_SERVICE} exists (runtime service account: ${svc_meta})"
-    if [[ -n "${API_SA}" && "${svc_meta}" != "${API_SA}" ]]; then
-      record_check BLOCKED "cloud-run:api-sa" "API service runs as '${svc_meta}', expected '${API_SA}'"
+    svc_sa="$(json_field "${svc_json}" 'spec.template.spec.serviceAccountName')"
+    if [[ -z "${svc_sa}" ]]; then
+      record_check BLOCKED "cloud-run:api-sa-explicit" "API service ${API_SERVICE} has no explicit runtime service account; it would fall back to the default Compute Engine service account. Set --service-account <API_SERVICE_ACCOUNT_EMAIL>."
+    else
+      record_check PASS "cloud-run:api" "service ${API_SERVICE} exists (runtime service account: ${svc_sa})"
+      if [[ -n "${API_SA}" && "${svc_sa}" != "${API_SA}" ]]; then
+        record_check BLOCKED "cloud-run:api-sa" "API service runs as '${svc_sa}', expected '${API_SA}'"
+      elif [[ -n "${API_SA}" ]]; then
+        record_check PASS "cloud-run:api-sa" "API service runtime service account matches the expected manifest value"
+      fi
     fi
     # Unauthenticated invoker must not be granted.
     api_policy="$(gcloud run services get-iam-policy "${API_SERVICE}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format json 2> /dev/null || true)"
@@ -159,44 +184,80 @@ else
 fi
 
 # Cloud Run worker job metadata (never executed).
+# A Cloud Run *Job* nests one more Execution level than a Service. The
+# Knative-style v1 export (gcloud run jobs describe --format json) stores the
+# runtime identity at spec.template.spec.template.spec.serviceAccountName
+# (ExecutionTemplateSpec -> ExecutionSpec -> TaskTemplateSpec -> TaskSpec).
+# The previous spec.template.template.spec.serviceAccountName path was wrong
+# (it dropped the ExecutionSpec level) and always resolved to empty, which was
+# then misreported as "job not found".
 if [[ -n "${WORKER_JOB}" && -n "${REGION}" ]]; then
-  job_sa="$(gcloud run jobs describe "${WORKER_JOB}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format 'value(spec.template.template.spec.serviceAccountName)' 2> /dev/null || true)"
-  if [[ -z "${job_sa}" ]]; then
-    record_check WARN "cloud-run:worker-job" "job ${WORKER_JOB} not found in ${REGION}; expected before first deployment, BLOCKING afterwards"
-  else
-    record_check PASS "cloud-run:worker-job" "job ${WORKER_JOB} exists (runtime service account: ${job_sa}); this tool never executes it"
-    if [[ -n "${WORKER_SA}" && "${job_sa}" != "${WORKER_SA}" ]]; then
-      record_check BLOCKED "cloud-run:worker-sa" "worker job runs as '${job_sa}', expected '${WORKER_SA}'"
+  job_err="${_MILO_TMPDIR}/worker-job.err"
+  job_status=0
+  job_json="$(gcloud run jobs describe "${WORKER_JOB}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format json 2> "${job_err}")" || job_status=$?
+  if [[ "${job_status}" -ne 0 ]]; then
+    if grep -qiE 'not.?found|does not exist|cannot find' "${job_err}"; then
+      record_check WARN "cloud-run:worker-job" "job ${WORKER_JOB} not found in ${REGION}; expected before first deployment, BLOCKING afterwards"
+    else
+      record_check MANUAL "cloud-run:worker-job" "could not describe worker job ${WORKER_JOB} (permission or API error, not a clean 'not found'); verify manually"
     fi
-    if [[ -n "${API_SA}" && "${job_sa}" == "${API_SA}" ]]; then
-      record_check BLOCKED "cloud-run:shared-identity" "worker job shares the API runtime service account; identities must be separate"
+  elif ! json_is_valid "${job_json}"; then
+    record_check MANUAL "cloud-run:worker-job" "worker job description was not valid JSON (missing python3 parser?); verify manually"
+  else
+    record_check PASS "cloud-run:worker-job" "job ${WORKER_JOB} exists; this tool never executes it"
+    job_sa="$(json_field "${job_json}" 'spec.template.spec.template.spec.serviceAccountName')"
+    if [[ -z "${job_sa}" ]]; then
+      # Exists but no explicit SA: blocking. The worker must never silently
+      # inherit the default Compute Engine service account.
+      record_check BLOCKED "cloud-run:worker-sa-explicit" "worker job ${WORKER_JOB} exists but has NO explicit service account; it would silently run as the default Compute Engine service account. Set --service-account <WORKER_SERVICE_ACCOUNT_EMAIL> on the job."
+    else
+      record_check PASS "cloud-run:worker-sa-explicit" "worker job has an explicit runtime service account: ${job_sa}"
+      if [[ -n "${WORKER_SA}" && "${job_sa}" != "${WORKER_SA}" ]]; then
+        record_check BLOCKED "cloud-run:worker-sa" "worker job runs as '${job_sa}', expected '${WORKER_SA}'"
+      elif [[ -n "${WORKER_SA}" ]]; then
+        record_check PASS "cloud-run:worker-sa" "worker job runtime service account matches the expected manifest value"
+      fi
+      if [[ -n "${API_SA}" && "${job_sa}" == "${API_SA}" ]]; then
+        record_check BLOCKED "cloud-run:shared-identity" "worker job shares the API runtime service account; identities must be separate"
+      fi
     fi
   fi
 else
   record_check MANUAL "cloud-run:worker-job" "supply --worker-job and --region to verify the Cloud Run worker job"
 fi
 
-# Service accounts.
+# Service accounts. A permission/API failure must not masquerade as
+# "service account not found".
 for sa in "${API_SA}" "${WORKER_SA}"; do
   [[ -z "${sa}" ]] && continue
-  if gcloud iam service-accounts describe "${sa}" --project "${EXPECTED_PROJECT}" --format 'value(email)' > /dev/null 2>&1; then
+  sa_err="${_MILO_TMPDIR}/sa-${sa//[^a-zA-Z0-9]/_}.err"
+  sa_status=0
+  gcloud iam service-accounts describe "${sa}" --project "${EXPECTED_PROJECT}" --format 'value(email)' > /dev/null 2> "${sa_err}" || sa_status=$?
+  if [[ "${sa_status}" -eq 0 ]]; then
     record_check PASS "service-account:${sa}" "exists"
-  else
+  elif grep -qiE 'not.?found|does not exist|was not found|unknown service account' "${sa_err}"; then
     record_check BLOCKED "service-account:${sa}" "service account not found (manual creation required; this tool never creates identities)"
+  else
+    record_check MANUAL "service-account:${sa}" "could not inspect the service account (permission/API/network error, not a clean 'not found'); verify manually"
   fi
 done
 
-# Project-level IAM red flags.
-policy="$(gcloud projects get-iam-policy "${EXPECTED_PROJECT}" --format json 2> /dev/null || true)"
-if [[ -z "${policy}" ]]; then
-  record_check MANUAL "iam:project-policy" "could not read project IAM policy; verify manually that no owner/editor or project-wide secretAccessor grants exist for runtime identities"
+# Project-level IAM red flags. An unreadable policy is an explicit MANUAL, not
+# a silent skip; the accessor check is parsed structurally by exact role.
+iam_err="${_MILO_TMPDIR}/project-iam.err"
+iam_status=0
+policy="$(gcloud projects get-iam-policy "${EXPECTED_PROJECT}" --format json 2> "${iam_err}")" || iam_status=$?
+if [[ "${iam_status}" -ne 0 ]]; then
+  record_check MANUAL "iam:project-policy" "could not read project IAM policy (permission/API error); manually verify no owner/editor or project-wide secretAccessor grants exist for runtime identities"
+elif ! json_is_valid "${policy}"; then
+  record_check MANUAL "iam:project-policy" "project IAM policy was not valid JSON; verify manually that no owner/editor or project-wide secretAccessor grants exist"
 else
   for role in roles/owner roles/editor; do
-    if grep -q "\"${role}\"" <<< "${policy}"; then
+    if [[ -n "$(iam_role_members "${policy}" "${role}")" ]]; then
       record_check WARN "iam:${role}" "project has ${role} bindings; runtime and CI identities must never hold owner/editor"
     fi
   done
-  if grep -q '"roles/secretmanager.secretAccessor"' <<< "${policy}"; then
+  if [[ -n "$(iam_role_members "${policy}" "roles/secretmanager.secretAccessor")" ]]; then
     record_check BLOCKED "iam:broad-secret-accessor" "project-wide Secret Manager accessor grant found; secret access must be granted per-secret only"
   else
     record_check PASS "iam:no-broad-secret-accessor" "no project-wide Secret Manager accessor grant"
