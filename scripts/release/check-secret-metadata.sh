@@ -19,9 +19,12 @@ Read-only. Never accesses secret VALUES — names, versions and IAM only.
 Options:
   --expected-project <id>   Exact Google Cloud project ID (required for
                             remote inspection).
-  --secret <name=consumer>  Expected secret and its sole consuming service
-                            account (repeatable), e.g.
-                            --secret milo-supabase-service-key=api-sa@p.iam.gserviceaccount.com
+  --secret <name=consumer[,consumer]>
+                            Expected secret and its intended consuming service
+                            account(s), comma-separated (repeatable), e.g.
+                            --secret milo-supabase-key=api-sa@p.iam.gserviceaccount.com,worker-sa@p.iam.gserviceaccount.com
+                            Every listed consumer must be bound at the secret
+                            level; any other accessor is flagged.
   --json-output <path>      Write a machine-readable JSON report.
   --help                    Show this help.
 EOF
@@ -66,40 +69,87 @@ if [[ -z "${existing}" ]]; then
 fi
 
 if [[ "${#SECRET_SPECS[@]}" -eq 0 ]]; then
-  record_check MANUAL "secrets:expected" "no --secret expectations supplied; provide name=consumer pairs to verify per-secret access"
+  # No expectations supplied means NO Secret Manager verification is possible.
+  # Never let this be mistaken for a passing audit.
+  record_check MANUAL "secrets:expected" "no --secret expectations supplied; provide name=consumer[,consumer] pairs (typically derived from a completed manifest) to verify per-secret access. No Secret Manager verification was performed."
+fi
+
+# Project-wide Secret Manager accessor is a red flag regardless of any
+# individual secret: access must be granted per-secret only.
+project_policy="$(gcloud projects get-iam-policy "${EXPECTED_PROJECT}" --format json 2> /dev/null || true)"
+if [[ -n "${project_policy}" ]]; then
+  if grep -q '"roles/secretmanager.secretAccessor"' <<< "${project_policy}"; then
+    record_check BLOCKED "secrets:project-wide-accessor" "project-wide roles/secretmanager.secretAccessor grant found; Secret Manager access must be granted per-secret only, never project-wide"
+  else
+    record_check PASS "secrets:project-wide-accessor" "no project-wide Secret Manager accessor grant"
+  fi
 fi
 
 for spec in "${SECRET_SPECS[@]}"; do
   name="${spec%%=*}"
-  consumer="${spec#*=}"
-  if [[ -z "${name}" || -z "${consumer}" || "${name}" == "${spec}" ]]; then
-    record_check BLOCKED "secret:spec" "malformed --secret specification (expected name=consumer): ${spec}"
+  consumers_csv="${spec#*=}"
+  if [[ -z "${name}" || -z "${consumers_csv}" || "${name}" == "${spec}" ]]; then
+    record_check BLOCKED "secret:spec" "malformed --secret specification (expected name=consumer[,consumer]): ${spec}"
     continue
   fi
   require_value "secret:name:${name}" "${name}" || continue
-  require_value "secret:consumer:${name}" "${consumer}" || continue
-  if [[ -n "${existing}" ]] && ! grep -q "secrets/${name}$\|^${name}$" <<< "${existing}"; then
+  # Split and validate the intended consumer list.
+  IFS=',' read -r -a consumers <<< "${consumers_csv}"
+  consumer_bad=0
+  for consumer in "${consumers[@]}"; do
+    require_value "secret:consumer:${name}" "${consumer}" || consumer_bad=1
+  done
+  [[ "${consumer_bad}" -eq 1 ]] && continue
+
+  if [[ -z "${existing}" ]]; then
+    # Could not list secrets: existence is UNCONFIRMED. Never claim a PASS
+    # here — that would be a false "resource present" result.
+    record_check MANUAL "secret:${name}" "could not list secrets to confirm '${name}' exists; verify existence manually (value never read)"
+  elif ! grep -q "secrets/${name}$\|^${name}$" <<< "${existing}"; then
     record_check BLOCKED "secret:${name}" "secret name not found in project (manual creation required; this tool never creates secrets)"
     continue
+  else
+    record_check PASS "secret:${name}" "secret exists (value never read)"
   fi
-  record_check PASS "secret:${name}" "secret exists (value never read)"
+
+  # Enabled versions must exist (payloads are never accessed).
+  enabled_versions="$(gcloud secrets versions list "${name}" --project "${EXPECTED_PROJECT}" --filter 'state=enabled' --format 'value(name)' 2> /dev/null || true)"
+  if [[ -z "${enabled_versions}" ]]; then
+    record_check BLOCKED "secret:${name}:version" "secret has no enabled version (a consumer cannot resolve :latest); add an enabled version (payload never inspected here)"
+  else
+    record_check PASS "secret:${name}:version" "at least one enabled version exists (payload never read)"
+  fi
+
   policy="$(gcloud secrets get-iam-policy "${name}" --project "${EXPECTED_PROJECT}" --format json 2> /dev/null || true)"
   if [[ -z "${policy}" ]]; then
-    record_check MANUAL "secret:${name}:iam" "could not read secret IAM policy; verify manually that only ${consumer} holds roles/secretmanager.secretAccessor"
+    record_check MANUAL "secret:${name}:iam" "could not read secret IAM policy; verify manually that only the intended consumers hold roles/secretmanager.secretAccessor"
     continue
   fi
-  if grep -q "serviceAccount:${consumer}" <<< "${policy}"; then
-    record_check PASS "secret:${name}:consumer" "expected consumer ${consumer} is bound at secret level"
-  else
-    record_check WARN "secret:${name}:consumer" "expected consumer ${consumer} is not yet bound (manual grant required at SECRET level, never project-wide)"
-  fi
   if grep -q '"allUsers"\|"allAuthenticatedUsers"' <<< "${policy}"; then
-    record_check BLOCKED "secret:${name}:wildcard" "secret IAM policy contains a wildcard principal"
+    record_check BLOCKED "secret:${name}:wildcard" "secret IAM policy contains a wildcard principal (allUsers/allAuthenticatedUsers)"
   fi
-  # Any accessor other than the declared consumer is a finding.
-  extra="$(grep -o 'serviceAccount:[^"]*' <<< "${policy}" | sort -u | grep -v "serviceAccount:${consumer}" || true)"
-  if [[ -n "${extra}" ]]; then
-    record_check WARN "secret:${name}:extra-accessors" "additional identities bound on this secret: ${extra//$'\n'/, } — confirm each is intentional"
+  # Every intended consumer must be bound at the secret level.
+  for consumer in "${consumers[@]}"; do
+    if grep -q "serviceAccount:${consumer}" <<< "${policy}"; then
+      record_check PASS "secret:${name}:consumer:${consumer}" "intended consumer ${consumer} is bound at secret level"
+    else
+      record_check BLOCKED "secret:${name}:consumer:${consumer}" "intended consumer ${consumer} is NOT bound at secret level (grant roles/secretmanager.secretAccessor at the SECRET level, never project-wide)"
+    fi
+  done
+  # Any service-account accessor NOT in the intended set is unexpected.
+  bound="$(grep -o 'serviceAccount:[^"]*' <<< "${policy}" | sort -u || true)"
+  if [[ -n "${bound}" ]]; then
+    while IFS= read -r principal; do
+      [[ -z "${principal}" ]] && continue
+      sa="${principal#serviceAccount:}"
+      is_expected=0
+      for consumer in "${consumers[@]}"; do
+        [[ "${sa}" == "${consumer}" ]] && is_expected=1 && break
+      done
+      if [[ "${is_expected}" -eq 0 ]]; then
+        record_check WARN "secret:${name}:extra-accessor" "accessor ${sa} is bound on secret ${name} but is not an intended consumer — confirm it is intentional or remove it"
+      fi
+    done <<< "${bound}"
   fi
 done
 

@@ -26,7 +26,12 @@ Consolidated classification of every major item. Classifications:
 | Polling + optional Realtime | COMPLETED_IN_CODE | ARCHITECTURE.md |
 | Production configuration validation (fail-closed) | COMPLETED_IN_CODE | ENVIRONMENT_MATRIX.md |
 | Migrations 001–015 (additive, idempotent, tested) | COMPLETED_IN_CODE | MIGRATIONS.md |
-| Operator tooling (`scripts/release/`, read-only default) | COMPLETED_IN_CODE | README.md |
+| Operator tooling (`scripts/release/`, read-only default) | COMPLETED_IN_CODE (corrected against real Cloud Shell audit) | README.md |
+| Cloud Run **Job** service-account inspection (correct describe path, structured JSON) | COMPLETED_IN_CODE | `check-gcp-resources.sh`, `tests/test_release_tooling_cli.py` |
+| Vercel production env inspection (supported CLI syntax, names only) | COMPLETED_IN_CODE | `check-vercel-config.sh` |
+| launch_unknown reconciliation (RETURNING, one-row, audit-after-success) | COMPLETED_IN_CODE | `reconcile-launch-unknown.sh` |
+| Authenticated execution-disabled smoke test | COMPLETED_IN_CODE | `smoke-test-execution-disabled.sh` |
+| Consolidated readiness aggregate (true nested totals) | COMPLETED_IN_CODE | `aggregate_reports.py` |
 | Membership/proposal backfill generators | COMPLETED_IN_CODE (generation) | MIGRATIONS.md |
 | Deployment/rollback command plans, IAM matrix | COMPLETED_IN_CODE (plans) | DEPLOYMENT.md, ROLLBACK.md |
 | Release manifest + schema validation | COMPLETED_IN_CODE | `config/production.example.yaml` |
@@ -43,7 +48,24 @@ Consolidated classification of every major item. Classifications:
 | Automated launch_unknown reconciliation | INTENTIONALLY_DEFERRED | below |
 | Supabase Realtime as primary event channel | INTENTIONALLY_DEFERRED | below |
 
-No item is currently `BLOCKED`.
+## Operator-tooling status and the honest meaning of "not BLOCKED"
+
+The Phase 9–11 operator tooling was found to contain real defects during a
+live read-only Google Cloud Shell inspection that the mocked CI suite did not
+catch. Those defects (Cloud Run **Job** SA path, Vercel CLI syntax, zero-row
+mutation "success", 401-as-execution-disabled proof, inaccurate aggregate
+totals, Secret Manager checks without concrete expectations) are corrected in
+the corrective PR recorded in [STATUS.md](STATUS.md) and covered by new strict
+CLI regression tests (`tests/test_release_tooling_cli.py`).
+
+No **code** item is `BLOCKED` after that corrective pass. This is **not** a
+statement that the live production environment passed: every external service
+above remains `REQUIRES_MANUAL_OPERATOR_CONFIGURATION` and is only confirmed
+by running the authenticated read-only audit against the real project.
+**Production deployment itself remains BLOCKED** until the corrective PR is
+merged and a real read-only audit report is produced from authenticated
+operator tooling. This document never claims an external service was verified
+when only repository wiring was checked.
 
 ## Manual items — required details
 

@@ -21,13 +21,24 @@ syntactically valid but intentionally rejected request: the gateway safety
 policy must refuse it BEFORE any backend, worker, provider, or budget
 side effect can occur.
 
+A real run-creation posture assertion requires an AUTHENTICATED test user
+(--user-token-env with a populated variable) and a test conversation owned
+by that user (--conversation-id). A bare 401 without a supplied token does
+NOT prove that execution routes are disabled for authenticated users, so it
+is never accepted as a PASS.
+
 Options:
   --base-url <url>            Gateway base URL (mock in CI; explicit
                               operator-supplied URL in production mode).
   --env-file <path>           NAME=VALUE metadata proving flag posture
                               (validated with check-production-config.sh
                               semantics for execution flags).
-  --user-token-env <NAME>     Env var holding a test user token.
+  --user-token-env <NAME>     Env var holding a VALID authenticated test user
+                              token (value never printed). Required to assert
+                              the run-creation posture.
+  --conversation-id <uuid>    Test conversation owned by the test user, used
+                              to build a schema-valid run-creation request.
+                              Required to assert the run-creation posture.
   --run-id <uuid>             Existing run id for the idempotent-cancellation
                               probe (only meaningful where cancellation is
                               enabled by the staged state; otherwise the
@@ -39,12 +50,13 @@ Options:
 EOF
 }
 
-JSON_OUTPUT="" BASE_URL="" ENV_FILE="" USER_TOKEN_ENV="" RUN_ID="" DB_URL_ENV=""
+JSON_OUTPUT="" BASE_URL="" ENV_FILE="" USER_TOKEN_ENV="" CONVERSATION_ID="" RUN_ID="" DB_URL_ENV=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base-url) BASE_URL="${2:?}"; shift 2 ;;
     --env-file) ENV_FILE="${2:?}"; shift 2 ;;
     --user-token-env) USER_TOKEN_ENV="${2:?}"; shift 2 ;;
+    --conversation-id) CONVERSATION_ID="${2:?}"; shift 2 ;;
     --run-id) RUN_ID="${2:?}"; shift 2 ;;
     --database-url-env) DB_URL_ENV="${2:?}"; shift 2 ;;
     --json-output) JSON_OUTPUT="${2:?}"; shift 2 ;;
@@ -87,9 +99,9 @@ fi
 
 GATEWAY="${BASE_URL%/}/api/gateway"
 
-req_code() { # METHOD PATH [BODY]
-  local method="$1" path="$2" body="${3:-}"
-  local -a args=(-s -o /dev/null -w '%{http_code}' --max-time 20 -X "${method}")
+req_code() { # METHOD PATH [BODY] [BODY_OUT]
+  local method="$1" path="$2" body="${3:-}" out="${4:-/dev/null}"
+  local -a args=(-s -o "${out}" -w '%{http_code}' --max-time 20 -X "${method}")
   if [[ -n "${USER_TOKEN_ENV}" && -n "${!USER_TOKEN_ENV:-}" ]]; then
     args+=(-H "Authorization: Bearer ${!USER_TOKEN_ENV}")
   fi
@@ -99,14 +111,44 @@ req_code() { # METHOD PATH [BODY]
   curl "${args[@]}" "${GATEWAY}${path}" || printf '000'
 }
 
-# 2. Run creation must be blocked (gateway safety policy: 403 before any
-# backend/worker/provider/budget side effect).
-zero_uuid="00000000-0000-0000-0000-000000000000"
-code="$(req_code POST "/conversations/${zero_uuid}/runs" '{"idempotency_key":"smoke-disabled-0001"}')"
-if [[ "${code}" == "403" || "${code}" == "401" ]]; then
-  record_check PASS "run-creation-blocked" "run creation is refused by the staged gateway policy (HTTP ${code}); no worker, provider or budget side effect can occur"
+# 2. Run creation must be blocked for an AUTHENTICATED user.
+#
+# The proof only holds if we present a valid authenticated test user AND a
+# schema-valid run-creation request against a conversation that user owns,
+# and then observe the execution-disabled response (HTTP 403 carrying the
+# application's execution-disabled classification). A 401 (auth failure) or a
+# missing token proves nothing about the posture for authenticated users, and
+# a 2xx means execution is NOT disabled.
+milo_tmpdir_init
+if [[ -z "${USER_TOKEN_ENV}" || -z "${!USER_TOKEN_ENV:-}" ]]; then
+  record_check MANUAL "run-creation-blocked" "no populated --user-token-env supplied; the authenticated run-creation posture cannot be proven (a bare 401 is not proof). Provide a valid authenticated test user token to assert PASS."
+elif [[ -z "${CONVERSATION_ID}" ]]; then
+  record_check MANUAL "run-creation-blocked" "no --conversation-id supplied; a schema-valid run-creation request requires a test conversation owned by the test user. Cannot assert PASS."
+elif ! is_uuid "${CONVERSATION_ID}"; then
+  record_check BLOCKED "run-creation-blocked" "malformed --conversation-id (must be a UUID); refusing to assert the run-creation posture from an invalid request"
 else
-  record_check BLOCKED "run-creation-blocked" "expected HTTP 403 (or 401 unauthenticated), got ${code}; the execution-disabled posture is not proven"
+  body_file="${_MILO_TMPDIR}/run-creation-body"
+  # Schema-valid RunCreate body: content (min length 1) + idempotency_key
+  # (8..128 chars). metadata defaults to {}. The request is intentionally
+  # well-formed so a rejection can only come from the execution-disabled
+  # policy, never from input validation.
+  create_body='{"content":"execution-disabled smoke probe","idempotency_key":"smoke-disabled-0001"}'
+  code="$(req_code POST "/conversations/${CONVERSATION_ID}/runs" "${create_body}" "${body_file}")"
+  body_text="$(cat "${body_file}" 2> /dev/null || true)"
+  if [[ "${code}" == "403" ]]; then
+    # Require the execution-disabled classification, not just any 403.
+    if grep -qiE 'EXECUTION_SURFACE_DISABLED|disabled by the gateway safety policy|run creation is disabled|is disabled' <<< "${body_text}"; then
+      record_check PASS "run-creation-blocked" "authenticated run creation was refused with HTTP 403 and the expected execution-disabled classification; no worker, provider or budget side effect can occur"
+    else
+      record_check BLOCKED "run-creation-blocked" "authenticated run creation returned HTTP 403 but the body did not carry the expected execution-disabled classification (EXECUTION_SURFACE_DISABLED / gateway safety policy); posture not proven"
+    fi
+  elif [[ "${code}" == "401" ]]; then
+    record_check BLOCKED "run-creation-blocked" "authentication failed (HTTP 401) with the supplied token; a generic auth failure does NOT prove the execution-disabled posture. Supply a valid authenticated test user token."
+  elif [[ "${code}" == "200" || "${code}" == "201" || "${code}" == "202" ]]; then
+    record_check BLOCKED "run-creation-blocked" "authenticated run creation SUCCEEDED (HTTP ${code}); execution is NOT disabled — a run may have been created. This is a critical posture failure."
+  else
+    record_check BLOCKED "run-creation-blocked" "unexpected response to authenticated run creation (HTTP ${code}); the execution-disabled posture is not proven"
+  fi
 fi
 
 # 3. Read-only UI backing routes must remain functional.
@@ -164,5 +206,5 @@ fi
 
 record_check MANUAL "no-worker-invocation" "verify externally that no Cloud Run worker job execution occurred: gcloud run jobs executions list --job <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> (expect no new executions)"
 
-printf '\nThis smoke test verified the execution-disabled posture: run creation blocked, reads functional, no secret returned, no reservation created; worker-job stillness is verified via the listed manual command.\n'
+printf '\nRun-creation posture is PASS only when an authenticated user + test conversation produced an HTTP 403 with the execution-disabled classification; otherwise it is reported MANUAL/BLOCKED above. Reads-functional, no-secret-returned and no-budget-reservation are asserted independently; worker-job stillness is verified via the listed manual command.\n'
 finish_checks "smoke-test-execution-disabled" "${JSON_OUTPUT}"

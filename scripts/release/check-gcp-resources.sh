@@ -132,15 +132,34 @@ else
   record_check MANUAL "artifact-registry" "supply --repository and --region to verify the Artifact Registry repository"
 fi
 
+milo_tmpdir_init
+
 # Cloud Run API service metadata.
+# The Knative-style v1 export (gcloud run services describe --format json)
+# stores the runtime identity at spec.template.spec.serviceAccountName.
 if [[ -n "${API_SERVICE}" && -n "${REGION}" ]]; then
-  svc_meta="$(gcloud run services describe "${API_SERVICE}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format 'value(spec.template.spec.serviceAccountName)' 2> /dev/null || true)"
-  if [[ -z "${svc_meta}" ]]; then
-    record_check WARN "cloud-run:api" "service ${API_SERVICE} not found in ${REGION}; expected before first deployment, BLOCKING afterwards"
+  svc_err="${_MILO_TMPDIR}/api-service.err"
+  svc_status=0
+  svc_json="$(gcloud run services describe "${API_SERVICE}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format json 2> "${svc_err}")" || svc_status=$?
+  if [[ "${svc_status}" -ne 0 ]]; then
+    if grep -qiE 'not.?found|does not exist|cannot find' "${svc_err}"; then
+      record_check WARN "cloud-run:api" "service ${API_SERVICE} not found in ${REGION}; expected before first deployment, BLOCKING afterwards"
+    else
+      record_check MANUAL "cloud-run:api" "could not describe API service ${API_SERVICE} (permission or API error, not a clean 'not found'); verify manually"
+    fi
+  elif ! json_is_valid "${svc_json}"; then
+    record_check MANUAL "cloud-run:api" "API service description was not valid JSON (missing python3 parser?); verify manually"
   else
-    record_check PASS "cloud-run:api" "service ${API_SERVICE} exists (runtime service account: ${svc_meta})"
-    if [[ -n "${API_SA}" && "${svc_meta}" != "${API_SA}" ]]; then
-      record_check BLOCKED "cloud-run:api-sa" "API service runs as '${svc_meta}', expected '${API_SA}'"
+    svc_sa="$(json_field "${svc_json}" 'spec.template.spec.serviceAccountName')"
+    if [[ -z "${svc_sa}" ]]; then
+      record_check BLOCKED "cloud-run:api-sa-explicit" "API service ${API_SERVICE} has no explicit runtime service account; it would fall back to the default Compute Engine service account. Set --service-account <API_SERVICE_ACCOUNT_EMAIL>."
+    else
+      record_check PASS "cloud-run:api" "service ${API_SERVICE} exists (runtime service account: ${svc_sa})"
+      if [[ -n "${API_SA}" && "${svc_sa}" != "${API_SA}" ]]; then
+        record_check BLOCKED "cloud-run:api-sa" "API service runs as '${svc_sa}', expected '${API_SA}'"
+      elif [[ -n "${API_SA}" ]]; then
+        record_check PASS "cloud-run:api-sa" "API service runtime service account matches the expected manifest value"
+      fi
     fi
     # Unauthenticated invoker must not be granted.
     api_policy="$(gcloud run services get-iam-policy "${API_SERVICE}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format json 2> /dev/null || true)"
@@ -159,17 +178,42 @@ else
 fi
 
 # Cloud Run worker job metadata (never executed).
+# A Cloud Run *Job* nests one more Execution level than a Service. The
+# Knative-style v1 export (gcloud run jobs describe --format json) stores the
+# runtime identity at spec.template.spec.template.spec.serviceAccountName
+# (ExecutionTemplateSpec -> ExecutionSpec -> TaskTemplateSpec -> TaskSpec).
+# The previous spec.template.template.spec.serviceAccountName path was wrong
+# (it dropped the ExecutionSpec level) and always resolved to empty, which was
+# then misreported as "job not found".
 if [[ -n "${WORKER_JOB}" && -n "${REGION}" ]]; then
-  job_sa="$(gcloud run jobs describe "${WORKER_JOB}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format 'value(spec.template.template.spec.serviceAccountName)' 2> /dev/null || true)"
-  if [[ -z "${job_sa}" ]]; then
-    record_check WARN "cloud-run:worker-job" "job ${WORKER_JOB} not found in ${REGION}; expected before first deployment, BLOCKING afterwards"
-  else
-    record_check PASS "cloud-run:worker-job" "job ${WORKER_JOB} exists (runtime service account: ${job_sa}); this tool never executes it"
-    if [[ -n "${WORKER_SA}" && "${job_sa}" != "${WORKER_SA}" ]]; then
-      record_check BLOCKED "cloud-run:worker-sa" "worker job runs as '${job_sa}', expected '${WORKER_SA}'"
+  job_err="${_MILO_TMPDIR}/worker-job.err"
+  job_status=0
+  job_json="$(gcloud run jobs describe "${WORKER_JOB}" --region "${REGION}" --project "${EXPECTED_PROJECT}" --format json 2> "${job_err}")" || job_status=$?
+  if [[ "${job_status}" -ne 0 ]]; then
+    if grep -qiE 'not.?found|does not exist|cannot find' "${job_err}"; then
+      record_check WARN "cloud-run:worker-job" "job ${WORKER_JOB} not found in ${REGION}; expected before first deployment, BLOCKING afterwards"
+    else
+      record_check MANUAL "cloud-run:worker-job" "could not describe worker job ${WORKER_JOB} (permission or API error, not a clean 'not found'); verify manually"
     fi
-    if [[ -n "${API_SA}" && "${job_sa}" == "${API_SA}" ]]; then
-      record_check BLOCKED "cloud-run:shared-identity" "worker job shares the API runtime service account; identities must be separate"
+  elif ! json_is_valid "${job_json}"; then
+    record_check MANUAL "cloud-run:worker-job" "worker job description was not valid JSON (missing python3 parser?); verify manually"
+  else
+    record_check PASS "cloud-run:worker-job" "job ${WORKER_JOB} exists; this tool never executes it"
+    job_sa="$(json_field "${job_json}" 'spec.template.spec.template.spec.serviceAccountName')"
+    if [[ -z "${job_sa}" ]]; then
+      # Exists but no explicit SA: blocking. The worker must never silently
+      # inherit the default Compute Engine service account.
+      record_check BLOCKED "cloud-run:worker-sa-explicit" "worker job ${WORKER_JOB} exists but has NO explicit service account; it would silently run as the default Compute Engine service account. Set --service-account <WORKER_SERVICE_ACCOUNT_EMAIL> on the job."
+    else
+      record_check PASS "cloud-run:worker-sa-explicit" "worker job has an explicit runtime service account: ${job_sa}"
+      if [[ -n "${WORKER_SA}" && "${job_sa}" != "${WORKER_SA}" ]]; then
+        record_check BLOCKED "cloud-run:worker-sa" "worker job runs as '${job_sa}', expected '${WORKER_SA}'"
+      elif [[ -n "${WORKER_SA}" ]]; then
+        record_check PASS "cloud-run:worker-sa" "worker job runtime service account matches the expected manifest value"
+      fi
+      if [[ -n "${API_SA}" && "${job_sa}" == "${API_SA}" ]]; then
+        record_check BLOCKED "cloud-run:shared-identity" "worker job shares the API runtime service account; identities must be separate"
+      fi
     fi
   fi
 else

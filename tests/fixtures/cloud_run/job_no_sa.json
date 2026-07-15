@@ -1,0 +1,49 @@
+{
+  "apiVersion": "run.googleapis.com/v1",
+  "kind": "Job",
+  "metadata": {
+    "name": "milo-worker",
+    "namespace": "123456789012",
+    "labels": {
+      "cloud.googleapis.com/location": "us-central1"
+    }
+  },
+  "spec": {
+    "template": {
+      "metadata": {
+        "labels": {
+          "run.googleapis.com/startupProbeType": "Default"
+        }
+      },
+      "spec": {
+        "parallelism": 1,
+        "taskCount": 1,
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "image": "us-central1-docker.pkg.dev/milo-prod/milo/milo-worker:0123456789abcdef0123456789abcdef01234567",
+                "env": [
+                  {
+                    "name": "ENVIRONMENT",
+                    "value": "production"
+                  }
+                ]
+              }
+            ],
+            "maxRetries": 0,
+            "timeoutSeconds": "3600"
+          }
+        }
+      }
+    }
+  },
+  "status": {
+    "conditions": [
+      {
+        "type": "Ready",
+        "status": "True"
+      }
+    ]
+  }
+}

@@ -94,7 +94,7 @@ is no enable-all or disable-all script by design; each flag is explicit.
       --image <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-worker:${SHA}
     # do NOT execute the job to "test" the rollback.
     gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \\
-      --format 'value(spec.template.template.spec.serviceAccountName)'   # verify SA + secret mappings
+      --format 'value(spec.template.spec.template.spec.serviceAccountName)'   # verify SA + secret mappings
     gcloud run jobs executions list --job <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION>
     # already-running executions: let leases expire or cancel the runs via the
     # API cancellation path; stale workers are rejected by lease-token checks.

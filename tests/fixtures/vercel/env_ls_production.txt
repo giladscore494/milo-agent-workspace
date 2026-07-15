@@ -1,0 +1,13 @@
+Vercel CLI 34.0.0
+> Environment Variables found in Project milo-frontend [312ms]
+
+  name                                      value       environments      created
+  CLOUD_RUN_API_URL                         Encrypted   Production        5d ago
+  GCP_PROJECT_NUMBER                        Encrypted   Production        5d ago
+  GCP_WORKLOAD_IDENTITY_POOL_ID             Encrypted   Production        5d ago
+  GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID    Encrypted   Production        5d ago
+  GCP_SERVICE_ACCOUNT_EMAIL                 Encrypted   Production        5d ago
+  UPSTASH_REDIS_REST_URL                    Encrypted   Production        5d ago
+  UPSTASH_REDIS_REST_TOKEN                  Encrypted   Production        5d ago
+  NEXT_PUBLIC_SUPABASE_URL                  Encrypted   Production        5d ago
+  NEXT_PUBLIC_SUPABASE_ANON_KEY             Encrypted   Production        5d ago

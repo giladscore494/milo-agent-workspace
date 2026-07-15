@@ -23,15 +23,28 @@ the assertion.
 ## Execution-disabled smoke test — `COMPLETED_IN_CODE`
 
 `scripts/release/smoke-test-execution-disabled.sh --base-url <url>
---env-file <metadata> …`
+--env-file <metadata> --user-token-env <NAME> --conversation-id <uuid> …`
 
 Proves the production-like deployment stays safe while execution is
-disabled: paid-execution flag off (metadata); run creation blocked by the
-staged gateway policy (403 before any side effect); read-only surface
-functional; no secret material in responses; cancellation behavior stable
-per the staged state; no new model-call budget reservation (optional
-read-only DB assertion); plus the exact manual command proving no Cloud
-Run worker job execution occurred.
+disabled: paid-execution flag off (metadata); **authenticated** run
+creation blocked (HTTP 403 carrying the execution-disabled application
+classification — `EXECUTION_SURFACE_DISABLED` / the gateway safety-policy
+message); read-only surface functional; no secret material in responses;
+cancellation behavior stable per the staged state; no new model-call budget
+reservation (optional read-only DB assertion); plus the exact manual
+command proving no Cloud Run worker job execution occurred.
+
+The run-creation posture is reported `PASS` **only** when a valid
+authenticated test user (`--user-token-env` with a populated variable) and a
+test conversation owned by that user (`--conversation-id`) produce the
+expected authenticated 403. A missing token, an empty token, or a bare
+unauthenticated 401 is reported `MANUAL`/`BLOCKED`, never `PASS`: a generic
+authentication failure does not prove that execution is disabled for
+authenticated users. An authenticated 2xx is a critical `BLOCKED` finding
+(execution is not actually disabled). The request body is a schema-valid
+`RunCreate` so that any rejection can only come from the execution-disabled
+policy, not from input validation — and the probe still creates no run,
+triggers no worker, calls no provider and reserves no budget.
 
 ## Exact smoke-test order (Stage A)
 
@@ -43,8 +56,11 @@ Run worker job execution occurred.
 ## CI usage
 
 CI exercises both scripts against a local mock HTTP endpoint (mocked
-`curl` in `tests/test_release_tooling.py`) — real production mode always
-requires explicit operator-supplied URLs and identities. The isolated
+`curl` in `tests/test_release_tooling.py` and the strict mocks in
+`tests/test_release_tooling_cli.py`, which distinguish an unauthenticated
+401 from an authenticated execution-disabled 403 and reject any authenticated
+2xx) — real production mode always requires explicit operator-supplied URLs
+and identities. The isolated
 Playwright E2E suite (`frontend/e2e`, mocked auth/worker/provider with
 gateway verification active and paid execution disabled) covers the
 browser-level equivalents: authenticated read flow, unauthorized

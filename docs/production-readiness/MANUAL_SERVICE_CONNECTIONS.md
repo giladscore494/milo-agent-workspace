@@ -71,7 +71,7 @@ use a wildcard principal; all of these connections are
 - **Read-only verification:**
 
       gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \
-        --format 'value(spec.template.template.spec.serviceAccountName)'
+        --format 'value(spec.template.spec.template.spec.serviceAccountName)'
       gcloud secrets get-iam-policy <SUPABASE_SERVICE_KEY_SECRET_NAME> --project <GCP_PROJECT_ID>
 
 - **Mutation template:** `gcloud secrets add-iam-policy-binding … --member

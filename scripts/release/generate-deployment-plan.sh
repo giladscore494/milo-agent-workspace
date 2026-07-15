@@ -132,7 +132,7 @@ per docs/production-readiness/MIGRATIONS.md before continuing.
 ## 6. Verify worker job configuration WITHOUT executing it
 
     gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
-      --format 'value(spec.template.template.spec.serviceAccountName, spec.template.template.spec.containers[0].image)'
+      --format 'value(spec.template.spec.template.spec.serviceAccountName, spec.template.spec.template.spec.containers[0].image)'
     gcloud run jobs executions list --job <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION>   # expect: no new executions
 
 ## 7. Deploy or update the PRIVATE Cloud Run API

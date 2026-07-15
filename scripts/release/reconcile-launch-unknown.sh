@@ -167,27 +167,135 @@ if [[ "${APPLY_MODE}" -eq 1 ]]; then
     finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
     exit $?
   fi
-  case "${RESOLUTION}" in
-    confirmed-launched)
-      sql="update public.runs set launch_state = 'launched' where id = '${RUN_ID}'::uuid and launch_state = 'launch_unknown';" ;;
-    confirmed-not-launched)
-      sql="update public.runs set launch_state = 'launch_failed' where id = '${RUN_ID}'::uuid and launch_state = 'launch_unknown';" ;;
-    requeue)
-      sql="update public.runs set launch_state = 'pending' where id = '${RUN_ID}'::uuid and launch_state = 'launch_failed';" ;;
-  esac
-  printf '\nAction plan (idempotent; guarded by current launch_state):\n  %s\n' "${sql}"
-  write_audit_record "${AUDIT_FILE}" "reconcile-launch-unknown" "resolution=${RESOLUTION} run=${RUN_ID}"
+  # psql must exist BEFORE anything is written — never write an audit record
+  # for a mutation that could not even be attempted.
   if ! tool_available psql; then
-    record_check BLOCKED "apply:psql" "psql unavailable; apply aborted before any mutation"
+    record_check BLOCKED "apply:psql" "psql unavailable; apply aborted before any mutation and before any audit record"
     finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
     exit $?
   fi
-  affected="$(psql -X -A -t -v ON_ERROR_STOP=1 "${!DB_URL_ENV}" -c "${sql} select 1;" > /dev/null 2>&1 && printf 'ok' || printf 'failed')"
-  if [[ "${affected}" == "ok" ]]; then
-    record_check PASS "apply:${RESOLUTION}" "resolution applied for run ${RUN_ID} (idempotent; re-running is a no-op)"
-  else
-    record_check BLOCKED "apply:${RESOLUTION}" "mutation failed; state unchanged"
+  db_url="${!DB_URL_ENV}"
+  milo_tmpdir_init
+
+  # Map each resolution to its required current launch_state, the guarded
+  # target state, and whether the run's status/lease also gate the change.
+  required_launch_state="" target_launch_state="" require_queued_status=0 require_no_lease=0
+  case "${RESOLUTION}" in
+    confirmed-launched)
+      required_launch_state="launch_unknown"; target_launch_state="launched" ;;
+    confirmed-not-launched)
+      required_launch_state="launch_unknown"; target_launch_state="launch_failed" ;;
+    requeue)
+      # Requeue is only ever valid from an explicitly failed launch, and only
+      # while the run is still queued with no active worker lease. It returns
+      # the run to the safe 'pending' launch state; it never launches the
+      # worker. launch_unknown is NEVER auto-relaunched (that path is blocked
+      # below because its required_launch_state is launch_failed, not
+      # launch_unknown).
+      required_launch_state="launch_failed"; target_launch_state="pending"
+      require_queued_status=1; require_no_lease=1 ;;
+  esac
+
+  # 1) Read current state (read-only). A DB error here is BLOCKED and no
+  #    mutation is attempted.
+  read_err="${_MILO_TMPDIR}/reconcile-read.err"
+  read_sql="select launch_state || '|' || status || '|' || (case when lease_token is not null and lease_expires_at is not null and lease_expires_at > now() then 'active' else 'none' end) from public.runs where id = '${RUN_ID}'::uuid;"
+  read_status=0
+  read_out="$(psql -X -A -t -v ON_ERROR_STOP=1 "${db_url}" -c "${read_sql}" 2> "${read_err}")" || read_status=$?
+  if [[ "${read_status}" -ne 0 ]]; then
+    record_check BLOCKED "apply:db" "database read failed before any mutation (connection string never printed); no audit record written"
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
   fi
+  read_out="$(printf '%s' "${read_out}" | tr -d '[:space:]')"
+  if [[ -z "${read_out}" ]]; then
+    record_check BLOCKED "apply:run-missing" "run ${RUN_ID} not found; zero matching rows, no mutation performed, no audit record written"
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
+  fi
+  cur_launch="${read_out%%|*}"
+  rest="${read_out#*|}"
+  cur_status="${rest%%|*}"
+  cur_lease="${rest##*|}"
+
+  # 2) Idempotency: if the run is already in the target state, this is a safe
+  #    no-op — never a fresh "mutation applied" PASS and never a new audit
+  #    record.
+  if [[ "${cur_launch}" == "${target_launch_state}" ]]; then
+    record_check NOT_APPLICABLE "apply:${RESOLUTION}" "run ${RUN_ID} is already in launch_state '${target_launch_state}'; idempotent no-op (no mutation, no audit record)"
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
+  fi
+
+  # 3) State guards — fail closed on any invalid precondition.
+  if [[ "${cur_launch}" != "${required_launch_state}" ]]; then
+    record_check BLOCKED "apply:state" "run ${RUN_ID} has launch_state '${cur_launch}'; '${RESOLUTION}' requires '${required_launch_state}'. No mutation performed, no audit record written."
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
+  fi
+  if [[ "${require_queued_status}" -eq 1 && "${cur_status}" != "queued" ]]; then
+    record_check BLOCKED "apply:status" "run ${RUN_ID} status is '${cur_status}'; requeue only operates on a still-'queued' run and must never touch completed/failed/cancelled/progressed runs. No mutation performed."
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
+  fi
+  if [[ "${require_no_lease}" -eq 1 && "${cur_lease}" == "active" ]]; then
+    record_check BLOCKED "apply:lease" "run ${RUN_ID} holds an active worker lease; requeue refuses to act while a worker may still be executing. No mutation performed."
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
+  fi
+
+  # 4) Guarded mutation with RETURNING. The data-modifying CTE performs the
+  #    UPDATE; the outer select reports the affected row count plus the
+  #    resulting state. The WHERE clause re-checks every guard atomically so a
+  #    state change between the read and the write cannot slip through.
+  lease_guard=""
+  [[ "${require_no_lease}" -eq 1 ]] && lease_guard=" and (lease_token is null or lease_expires_at is null or lease_expires_at <= now())"
+  status_guard=""
+  [[ "${require_queued_status}" -eq 1 ]] && status_guard=" and status = 'queued'"
+  update_sql="with upd as (update public.runs set launch_state = '${target_launch_state}' where id = '${RUN_ID}'::uuid and launch_state = '${required_launch_state}'${status_guard}${lease_guard} returning launch_state, status) select count(*) || '|' || coalesce(max(launch_state), '') || '|' || coalesce(max(status), '') from upd;"
+  printf '\nMutation (guarded UPDATE ... RETURNING; exactly one row required):\n  %s\n' "${update_sql}"
+  upd_err="${_MILO_TMPDIR}/reconcile-update.err"
+  upd_status=0
+  upd_out="$(psql -X -A -t -v ON_ERROR_STOP=1 "${db_url}" -c "${update_sql}" 2> "${upd_err}")" || upd_status=$?
+  if [[ "${upd_status}" -ne 0 ]]; then
+    record_check BLOCKED "apply:db" "the guarded UPDATE failed (database error); state unchanged, no audit record written"
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
+  fi
+  upd_out="$(printf '%s' "${upd_out}" | tr -d '[:space:]')"
+  affected="${upd_out%%|*}"
+  rest2="${upd_out#*|}"
+  new_launch="${rest2%%|*}"
+  new_status="${rest2##*|}"
+  case "${affected}" in
+    1) : ;;
+    0)
+      record_check BLOCKED "apply:${RESOLUTION}" "zero rows updated (a concurrent change no longer satisfies the guard); state unchanged, no audit record written"
+      finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+      exit $?
+      ;;
+    *)
+      record_check BLOCKED "apply:${RESOLUTION}" "unexpected affected-row count '${affected}' (a UUID primary key must match at most one row); failing closed, no audit record written"
+      finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+      exit $?
+      ;;
+  esac
+
+  # 5) Validate the resulting state before recording success.
+  if [[ "${new_launch}" != "${target_launch_state}" ]]; then
+    record_check BLOCKED "apply:${RESOLUTION}" "post-update launch_state is '${new_launch}', expected '${target_launch_state}'; failing closed, no audit record written"
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
+  fi
+
+  # 6) Only now — guards passed, mutation succeeded, exactly one row, state
+  #    validated — write the secret-free audit record.
+  audit_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  umask 077
+  printf '%s script=reconcile-launch-unknown run=%s resolution=%s prev_launch_state=%s new_launch_state=%s run_status=%s operator=%s project=%s sha=%s\n' \
+    "${audit_ts}" "${RUN_ID}" "${RESOLUTION}" "${cur_launch}" "${new_launch}" "${new_status}" \
+    "${EXPECTED_ACCOUNT}" "${EXPECTED_PROJECT}" "$(git_head_sha)" >> "${AUDIT_FILE}"
+  record_check PASS "apply:${RESOLUTION}" "run ${RUN_ID}: exactly one row updated ${cur_launch} -> ${new_launch} (status ${new_status}); audit appended to ${AUDIT_FILE}"
 fi
 
 finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
