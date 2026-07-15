@@ -18,8 +18,10 @@
 ## Production bootstrap automation (new)
 
 - **Feature branch:** `claude/bootstrap-production-oneshot`
-- **PR:** targets `claude/production-readiness-j0hhni` (does **not** target
-  `main`; not merged).
+- **PR:**
+  [#34](https://github.com/giladscore494/milo-agent-workspace/pull/34)
+  (base: `claude/production-readiness-j0hhni`; does **not** target `main`;
+  not merged).
 - **What:** `scripts/release/bootstrap-production.sh` — a nearly one-command
   `--plan` / `--apply` / `--audit-only` bootstrap that replaces the manual
   construction of `milo-production.yaml`, service accounts, Secret Manager
