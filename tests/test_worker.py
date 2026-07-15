@@ -73,8 +73,29 @@ def test_worker_marks_complete_for_valid_partial_result():
     event_types = [event[1] for event in repo.events]
     assert event_types[0] == "run_started"
     assert event_types[-1] == "run_partial_success"
-    assert "agent_failed" not in event_types
+    assert "supervisor_shadow_failed" not in event_types
     assert "run_failed" not in event_types
+    assert "agent_failed" not in event_types
+
+
+def test_worker_shadow_failure_is_observable_without_false_run_failure():
+    class FailingSupervisorRepo(WorkerRepo):
+        def create_supervisor_decision(self, run_id, decision):
+            raise RuntimeError("supervisor decision storage unavailable")
+    class FakeEngine:
+        workflow_key = "vehicle_catalog_v1"
+        def run(self, run):
+            return {"status": "partial_success", "result": {"models": []}}
+    repo = FailingSupervisorRepo()
+    code = execute_run(repo.run_id, repo, FakeEngine())
+    assert code == 0
+    assert repo.partial[1]["status"] == "partial_success"
+    event_types = [event[1] for event in repo.events]
+    assert event_types[0] == "run_started"
+    assert "run_partial_success" in event_types
+    assert "supervisor_shadow_failed" in event_types
+    assert "run_failed" not in event_types
+    assert "agent_failed" not in event_types
 
 
 def test_worker_marks_failed_for_invalid_engine_result():
