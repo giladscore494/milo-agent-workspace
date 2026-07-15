@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -23,8 +24,11 @@ class CompleteEngine:
 def test_cancelled_before_start_emits_no_run_started_or_engine_call(monkeypatch):
     monkeypatch.setenv("MILO_WORKER_HEARTBEAT_INTERVAL_SECONDS", "1")
     repo = MemoryRepository()
+    project_id = uuid4()
+    repo.seed_project(str(project_id), "cancel-fixture", "Cancel fixture", [])
+    conversation = repo.create_conversation(project_id, "Cancel fixture")
     run_id = uuid4()
-    conversation_id = uuid4()
+    conversation_id = conversation["id"]
     repo.runs[str(run_id)] = {"id": str(run_id), "conversation_id": str(conversation_id), "status": "cancellation_requested", "input": {"content": "x"}, "attempt": 1}
     engine = CompleteEngine()
     assert execute_run(run_id, repo, engine=engine) == 0
@@ -32,6 +36,50 @@ def test_cancelled_before_start_emits_no_run_started_or_engine_call(monkeypatch)
     assert repo.runs[str(run_id)]["status"] == "cancelled"
     assert [e["event_type"] for e in repo.run_events].count("run_cancelled") == 1
     assert "run_started" not in [e["event_type"] for e in repo.run_events]
+
+
+def _seed_memory_run(status="queued"):
+    repo = MemoryRepository()
+    project_id = uuid4()
+    repo.seed_project(str(project_id), "lease-fixture", "Lease fixture", [])
+    conversation = repo.create_conversation(project_id, "Lease fixture")
+    run_id = uuid4()
+    repo.runs[str(run_id)] = {"id": str(run_id), "conversation_id": conversation["id"], "status": status, "input": {"content": "x"}, "attempt": 1}
+    return repo, run_id
+
+
+def test_memory_repository_first_claim_assigns_token_and_guards_mutations():
+    repo, run_id = _seed_memory_run("queued")
+    claimed = repo.claim_run(run_id, "worker-a", lease_seconds=300)
+    assert claimed["worker_id"] == "worker-a"
+    assert claimed["attempt"] == 1
+    assert claimed["lease_token"]
+    assert repo.runs[str(run_id)]["lease_token"] == claimed["lease_token"]
+    repo.heartbeat(run_id, "worker-a", attempt=claimed["attempt"], lease_token=claimed["lease_token"])
+    with pytest.raises(AppError, match="lease token"):
+        repo.heartbeat(run_id, "worker-a", attempt=claimed["attempt"], lease_token="wrong-token")
+    with pytest.raises(AppError, match="lease token"):
+        repo.transition_run(run_id, "running", expected_worker_id="worker-a", expected_attempt=claimed["attempt"], expected_lease_token="wrong-token")
+
+
+def test_memory_repository_can_claim_cancellation_requested_run():
+    repo, run_id = _seed_memory_run("cancellation_requested")
+    claimed = repo.claim_run(run_id, "worker-a", lease_seconds=300)
+    assert claimed["status"] == "cancellation_requested"
+    assert claimed["lease_token"]
+
+
+def test_memory_repository_reclaim_increments_attempt_and_invalidates_old_token():
+    repo, run_id = _seed_memory_run("queued")
+    first = repo.claim_run(run_id, "worker-a", lease_seconds=300)
+    repo.runs[str(run_id)]["lease_expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    reclaimed = repo.claim_run(run_id, "worker-b", lease_seconds=300)
+    assert reclaimed["worker_id"] == "worker-b"
+    assert reclaimed["attempt"] == first["attempt"] + 1
+    assert reclaimed["lease_token"] and reclaimed["lease_token"] != first["lease_token"]
+    with pytest.raises(AppError):
+        repo.transition_run(run_id, "running", expected_worker_id="worker-a", expected_attempt=first["attempt"], expected_lease_token=first["lease_token"])
+    repo.transition_run(run_id, "running", expected_worker_id="worker-b", expected_attempt=reclaimed["attempt"], expected_lease_token=reclaimed["lease_token"])
 
 
 def test_actual_cost_calculated_and_settled(monkeypatch):

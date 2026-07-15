@@ -27,7 +27,7 @@ class Repository(Protocol):
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
     def save_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]: ...
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None: ...
-    def transition_run(self, run_id: UUID, status: str, **fields: Any) -> dict[str, Any]: ...
+    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]: ...
     def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]: ...
@@ -314,7 +314,7 @@ class SupabaseRepository:
         rows = self._many(query)
         return rows[0] if rows else None
 
-    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, **fields: Any) -> dict[str, Any]:
+    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
         current = str(self.get_run(run_id).get("status", ""))
         # Same-status updates (heartbeats, metadata refresh) are no-op
         # transitions; unknown legacy statuses bypass validation so legacy
@@ -337,6 +337,10 @@ class SupabaseRepository:
             # newer holder's state. Lease expiry is part of ownership.
             query = query.eq("worker_id", expected_worker_id)
             query = query.gt("lease_expires_at", datetime.now(UTC).isoformat())
+        if expected_attempt is not None:
+            query = query.eq("attempt", expected_attempt)
+        if expected_lease_token is not None:
+            query = query.eq("lease_token", expected_lease_token)
         try:
             rows = query.select("*").execute().data or []
         except Exception as exc:
@@ -362,13 +366,18 @@ class SupabaseRepository:
             raise AppError("RUN_ALREADY_CLAIMED", "run is already claimed by another worker", 409)
         return rows[0] if isinstance(rows, list) else rows
 
-    def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
+    def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         now = datetime.now(UTC)
         expires = (now + timedelta(seconds=lease_seconds)).isoformat()
         # Atomic ownership check: the lease only extends when this worker
         # still holds it.
         try:
-            rows = self.client.table("runs").update({"last_heartbeat_at": now.isoformat(), "lease_expires_at": expires}).eq("id", str(run_id)).eq("worker_id", worker_id).gt("lease_expires_at", now.isoformat()).in_("status", ["starting", "running", "cancellation_requested"]).select("*").execute().data or []
+            query = self.client.table("runs").update({"last_heartbeat_at": now.isoformat(), "lease_expires_at": expires}).eq("id", str(run_id)).eq("worker_id", worker_id).gt("lease_expires_at", now.isoformat()).in_("status", ["starting", "running", "cancellation_requested"])
+            if attempt is not None:
+                query = query.eq("attempt", attempt)
+            if lease_token is not None:
+                query = query.eq("lease_token", lease_token)
+            rows = query.select("*").execute().data or []
         except Exception as exc:
             raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
         if not rows:

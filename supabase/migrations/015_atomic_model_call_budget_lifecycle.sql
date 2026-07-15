@@ -138,9 +138,21 @@ begin
 end;
 $$;
 
-revoke execute on function public.model_call_budget_committed(uuid, uuid, date) from public, authenticated;
-revoke execute on function public.reserve_model_call_budget(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text) from public, authenticated;
-revoke execute on function public.settle_model_call_budget(uuid, numeric, text, text) from public, authenticated;
-grant execute on function public.model_call_budget_committed(uuid, uuid, date) to service_role;
-grant execute on function public.reserve_model_call_budget(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text) to service_role;
-grant execute on function public.settle_model_call_budget(uuid, numeric, text, text) to service_role;
+revoke execute on function public.model_call_budget_committed(uuid, uuid, date) from public;
+revoke execute on function public.reserve_model_call_budget(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text) from public;
+revoke execute on function public.settle_model_call_budget(uuid, numeric, text, text) from public;
+
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    revoke execute on function public.model_call_budget_committed(uuid, uuid, date) from authenticated;
+    revoke execute on function public.reserve_model_call_budget(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text) from authenticated;
+    revoke execute on function public.settle_model_call_budget(uuid, numeric, text, text) from authenticated;
+  end if;
+
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    grant execute on function public.model_call_budget_committed(uuid, uuid, date) to service_role;
+    grant execute on function public.reserve_model_call_budget(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text) to service_role;
+    grant execute on function public.settle_model_call_budget(uuid, numeric, text, text) to service_role;
+  end if;
+end $$;
