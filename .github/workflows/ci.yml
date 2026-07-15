@@ -31,6 +31,15 @@ jobs:
         run: python scripts/secret_scan.py
       - name: Unsafe default / execution-flag scan
         run: python scripts/check_unsafe_defaults.py
+      - name: ShellCheck release/operator scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -x -S warning scripts/release/*.sh scripts/release/lib/common.sh
+      - name: Release manifest schema validation
+        run: python scripts/release/validate_production_manifest.py --manifest config/production.example.yaml --mode plan
+      - name: Read-only production readiness audit (proves no external calls / no mutation in CI)
+        run: bash scripts/release/production-readiness.sh
       - name: Docker build API
         run: docker build -f Dockerfile.api -t milo-agent-api:ci .
       - name: Docker build worker
