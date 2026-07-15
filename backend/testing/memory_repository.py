@@ -9,6 +9,7 @@ production entrypoints.
 from __future__ import annotations
 
 import threading
+import secrets
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -182,13 +183,22 @@ class MemoryRepository:
             self.run_events.append(event)
             return dict(event)
 
-    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, **fields: Any) -> dict[str, Any]:
+    def _assert_active_lease(self, run: dict[str, Any], expected_worker_id: str | None = None, expected_attempt: int | None = None, lease_token: str | None = None) -> None:
+        if expected_worker_id is not None and run.get("worker_id") != expected_worker_id:
+            raise AppError("RUN_TRANSITION_CONFLICT", "run lease is no longer held", 409)
+        if expected_attempt is not None and int(run.get("attempt") or 0) != int(expected_attempt):
+            raise AppError("RUN_TRANSITION_CONFLICT", "run attempt is no longer active", 409)
+        if lease_token is not None and run.get("lease_token") != lease_token:
+            raise AppError("RUN_TRANSITION_CONFLICT", "run lease token is no longer active", 409)
+        if (expected_worker_id is not None or expected_attempt is not None or lease_token is not None) and run.get("lease_expires_at") and run["lease_expires_at"] <= _now():
+            raise AppError("RUN_TRANSITION_CONFLICT", "run lease has expired", 409)
+
+    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
         with self.lock:
             run = self.runs.get(str(run_id))
             if run is None:
                 raise NotFoundError("run", str(run_id))
-            if expected_worker_id is not None and run.get("worker_id") != expected_worker_id:
-                raise AppError("RUN_TRANSITION_CONFLICT", "run lease is no longer held", 409)
+            self._assert_active_lease(run, expected_worker_id, expected_attempt, expected_lease_token)
             current = run["status"]
             if status != current and current in RUN_STATES:
                 try:
@@ -289,17 +299,53 @@ class MemoryRepository:
     def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
         run = self.get_run(run_id)
         target = run["status"] if run["status"] == "cancellation_requested" else "starting"
-        return self.transition_run(run_id, target, worker_id=worker_id, started_at=run.get("started_at") or _now())
+        from datetime import datetime, UTC, timedelta
+        attempt = int(run.get("attempt") or 1)
+        if run.get("worker_id") and run.get("worker_id") != worker_id:
+            attempt += 1
+        return self.transition_run(run_id, target, worker_id=worker_id, attempt=attempt, lease_token=secrets.token_urlsafe(32), started_at=run.get("started_at") or _now(), lease_expires_at=(datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat())
 
-    def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
-        return self.get_run(run_id)
+    def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        from datetime import datetime, UTC, timedelta
+        run = self.get_run(run_id)
+        self._assert_active_lease(run, worker_id, attempt, lease_token)
+        run["last_heartbeat_at"] = _now()
+        run["lease_expires_at"] = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
+        return dict(run)
 
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None:
         return None
 
     def save_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        run_id = checkpoint.get("run_id")
+        if run_id:
+            run = self.runs[str(run_id)]
+            self._assert_active_lease(run, checkpoint.get("worker_id"), checkpoint.get("attempt"), checkpoint.get("lease_token"))
         self.checkpoints.append(checkpoint)
         return dict(checkpoint)
+
+    def reserve_model_call_budget(self, run_id: UUID, call_seq: int, user_id: str | None, project_id: str | None, amount: float, daily_user_limit: float | None, daily_project_limit: float | None) -> dict[str, Any]:
+        with self.lock:
+            user_spend = self.sum_daily_ledger_cost(user_id=user_id) if user_id else 0.0
+            project_spend = self.sum_daily_ledger_cost(project_id=project_id) if project_id else 0.0
+            status, reason = "reserved", None
+            if user_id and daily_user_limit is not None and user_spend + amount > daily_user_limit:
+                status, reason = "rejected", "DAILY_USER_BUDGET_REACHED"
+            elif project_id and daily_project_limit is not None and project_spend + amount > daily_project_limit:
+                status, reason = "rejected", "DAILY_PROJECT_BUDGET_REACHED"
+            return self.append_usage_ledger({"run_id": str(run_id), "call_seq": call_seq, "user_id": user_id, "project_id": project_id, "decision": status, "status": status, "estimated_cost": amount, "rejection_reason": reason})
+
+    def settle_model_call_budget(self, reservation_id: str, actual_cost: float, status: str = "settled", rejection_reason: str | None = None) -> dict[str, Any]:
+        with self.lock:
+            for row in getattr(self, "usage_ledger", []):
+                if str(row.get("id")) == str(reservation_id):
+                    if row.get("settled"):
+                        raise AppError("BUDGET_RESERVATION_SETTLED", "reservation already settled", 409)
+                    row["settled"] = True
+                    settled = {**row, "id": len(self.usage_ledger) + 1, "decision": status, "status": status, "actual_cost": actual_cost, "rejection_reason": rejection_reason}
+                    self.usage_ledger.append(settled)
+                    return dict(settled)
+            raise NotFoundError("model_call_budget_reservation", reservation_id)
 
     def _tool_row(self, run_id: UUID, payload: dict[str, Any]) -> dict[str, Any]:
         row = {"id": str(uuid4()), "run_id": str(run_id), **payload}

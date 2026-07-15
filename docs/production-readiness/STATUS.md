@@ -1,121 +1,76 @@
 # Production readiness — persistent status
 
-- **Branch:** `claude/production-readiness-j0hhni`
-- **PR:** #26 (single PR; not merged)
-- **Head SHA:** tip of this branch (the `audit:` commit); updated every run
+- **Current child branch:** `codex/child-fix-phases-1-8` (local sandbox branch; remote push unavailable here because no `origin` remote is configured).
+- **Child PR:** not created from this sandbox; required base is `codex/fix-remaining-blockers-in-phases-18-g2320x` (PR #28 head branch).
+- **Base branch:** `codex/fix-remaining-blockers-in-phases-18-g2320x`.
+- **Actual local head SHA:** see `git rev-parse HEAD` for this checkout.
+- **Remote head SHA / CI:** not verified in this sandbox because the checkout has no configured GitHub remote.
 
 ## Phase status
 
 | Phase | Area | Status |
 | --- | --- | --- |
-| 1 | Proposal ownership + browser-route authorization | CORRECTED (audit fixes applied) |
-| 2 | Worker service-to-service authentication | CORRECTED (gateway/worker separation added) |
-| 3 | Idempotent run creation + lifecycle | CORRECTED (transaction-safe + atomic launch/lease) |
-| 4 | Budget, cost and resource limits | CORRECTED (hard pre-call reservation + ledger) |
-| 5 | Shared-store rate limiting | CORRECTED (project keys + trusted IP) |
-| 6 | Frontend execution UI + polling | CORRECTED (run-state isolation) |
-| 7 | Playwright E2E suite | CORRECTED (identity + isolation coverage; 31 tests) |
-| 8 | Production configuration validation | CORRECTED (gateway auth, identity separation, test-adapter bans) |
+| 1 | Proposal ownership + browser-route authorization | CORRECTIVE WORK IN PROGRESS; not marked green until child PR CI passes |
+| 2 | Worker service-to-service authentication | CORRECTIVE WORK IN PROGRESS; active lease token hardening added locally |
+| 3 | Idempotent run creation + lifecycle | CORRECTIVE WORK IN PROGRESS; cancellation fixture repaired locally |
+| 4 | Budget, cost and resource limits | CORRECTIVE WORK IN PROGRESS; canonical reservation settlement path added locally |
+| 5 | Shared-store rate limiting | CORRECTIVE WORK IN PROGRESS; existing security posture preserved |
+| 6 | Frontend execution UI + polling | CORRECTIVE WORK IN PROGRESS; existing launch-state exposure preserved |
+| 7 | Playwright E2E suite | NOT VERIFIED LOCALLY in this sandbox |
+| 8 | Production configuration validation | CORRECTIVE WORK IN PROGRESS; existing validation preserved |
 | 9 | Migration and operator tooling | NOT STARTED |
 | 10 | Deployment and rollback preparation | NOT STARTED |
 | 11 | Final documentation | NOT STARTED |
 
-## Corrections applied in the Phases 1–8 corrective audit
+## Current corrective scope
 
-1. **Trusted gateway identity** (`fix: authenticate trusted browser gateway identity`)
-   — `backend/gateway_auth.py` verifies a Google-signed `X-Milo-Gateway-Token`
-   (signature/issuer/audience/expiry/verified email/allowlist;
-   `MILO_GATEWAY_AUDIENCE` + `MILO_APPROVED_GATEWAY_IDENTITIES`, separate
-   from worker auth) before any `x-milo-auth-*` header is trusted.
-   Production fails closed when unconfigured. Worker identities cannot
-   impersonate browser users; gateway identities cannot call worker routes.
-2. **Protected proposal ownership + atomic project creation**
-   — column-scoped UPDATE grants exclude `created_by`/`project_id`;
-   `create_project_from_proposal_with_owner()` commits project + owner
-   membership in one transaction (no orphan projects). Migration 011.
-3. **Atomic run creation/admission** — `create_message_and_run()` (migration
-   012) creates the user message + run with idempotent replay and
-   per-user/per-project admission under advisory locks in one transaction;
-   proven with real concurrent PostgreSQL sessions.
-4. **Atomic launch ownership** — compare-and-set to `launching`; exactly one
-   launcher call per run; uncertain launch responses park the run as
-   `launch_unknown` and are never auto-relaunched; definite failures stay
-   retryable.
-5. **Atomic worker lease** — `claim_run_lease()` single-statement CAS; one
-   active holder, expiry reclaim with attempt increment, heartbeat
-   ownership, stale-worker writes blocked by `expected_worker_id` + status
-   CAS; cancellation stays visible through claims.
-6. **Worker-only provider credentials** — API key read only from
-   `KIMI_API_KEY`/`MOONSHOT_API_KEY` worker env; run-input keys provably
-   ignored; paid execution fails closed without a key.
-7. **Hard pre-call budgets** — thread-safe `reserve_call()` checks kill
-   switch, lease, cancellation, time, calls, agent steps, retries,
-   estimated input tokens, remaining input/output/total tokens (incl.
-   in-flight reservations), estimated/actual cost and daily budgets BEFORE
-   the call; clamps `max_tokens`; concurrent calls cannot double-spend.
-8. **Usage ledger** — append-only `run_usage_ledger` (migration 013) with
-   decimal-safe costs, per-decision rows, DB trigger forbidding
-   update/delete for every role; daily user/project budget queries prefer
-   settled actuals.
-9. **Project rate-limit key** — run creation limits by real project id.
-10. **Trusted client IP** — platform-set headers preferred; strict IP
-    validation; malformed values collapse to one bucket.
-11. **Frontend run isolation** — reducer reset + generation guard on run
-    switch/sign-out; late responses from a previous run are dropped; all
-    six terminal states stop polling.
-12. **E2E identity coverage** — 31 tests across two stacks, both running
-    with real gateway verification (no bare header trust anywhere in E2E).
-13. **Guaranteed PostgreSQL CI** — dedicated `postgres-checks` job with
-    `MILO_REQUIRE_PG_TESTS=1` (missing binaries fail, any skip fails).
-14. **Config/static safety** — production rejects missing gateway auth,
-    shared gateway/worker identities and test adapters; `scripts/release/`
-    is no longer exempt from unsafe-default scanning.
+This child corrective change set targets the remaining Phases 1–8 blockers on top of PR #28 only. It does not start Phases 9–11 and does not retarget `main`, the Claude branch, PR #26, or PR #27.
+
+Implemented locally in this checkout:
+
+1. Migration `015` now uses portable guarded grants: `PUBLIC` is always revoked, `authenticated` is revoked only when present, and `service_role` is granted only when present.
+2. The PostgreSQL Supabase auth shim creates realistic `anon`, `authenticated`, and `service_role` roles idempotently.
+3. Migration `014` legacy daily-budget RPCs are documented as deprecated and have execute privileges revoked so production has one canonical model-call reservation lifecycle.
+4. Worker lease claims now include an execution nonce (`lease_token`) in the run row, and repository mutation paths accept worker id, attempt, and lease-token guards.
+5. Browser-safe run responses remove `lease_token` while continuing to expose `launch_state`, `launch_error_class`, and `launch_reconciliation_required`.
+6. The guarded budget client stores the canonical reservation id in a private in-memory `ModelCallReservation`, settles successful calls, releases failed provider calls, rejects missing reservation ids, and fails closed on settlement failure.
+7. The cancellation-before-start test fixture now builds a valid project → conversation → run graph instead of referencing a nonexistent conversation.
 
 ## Migrations
 
-- `008` proposal ownership (+ column-scoped update grant correction)
-- `009` run idempotency + lifecycle columns
-- `010` run usage aggregate
-- `011` proposal ownership protection + atomic project creation (NEW)
-- `012` atomic run operations: create_message_and_run, launch_unknown, claim_run_lease (NEW)
-- `013` append-only usage ledger (NEW)
+- `008` proposal ownership.
+- `009` run idempotency + lifecycle columns.
+- `010` run usage aggregate.
+- `011` proposal ownership protection + atomic project creation.
+- `012` atomic run operations: `create_message_and_run`, launch CAS, `launch_unknown`, `claim_run_lease`, and `lease_token` ownership nonce.
+- `013` append-only usage ledger.
+- `014` deprecated legacy daily budget RPCs with execution revoked.
+- `015` canonical model-call budget reservation/settlement lifecycle with portable least-privilege grants.
 
-All additive/idempotent/data-preserving; none applied to production.
+All migrations remain intended to be additive, idempotent, and data preserving; production application is not performed by this status document.
 
-## Exact test results (this corrective run, local)
+## Exact local validation from this sandbox
 
-- `pytest -q tests --ignore=MILO-main-original/MILO-main/test_websearch.py`
-  with `MILO_REQUIRE_PG_TESTS=1`: **382 passed, 0 failed, 0 skipped**
-  (includes the ephemeral-PostgreSQL suite: 82 executable migration,
-  RLS and concurrency tests).
-- `python scripts/check_migrations.py` — passed.
-- `python scripts/secret_scan.py` — passed.
-- `python scripts/check_unsafe_defaults.py` — passed.
-- Frontend: `tsc --noEmit` clean; `vitest` **60 passed**; `next build`
-  succeeded; `test:static` and `test:secrets` passed.
-- Playwright E2E: **31 passed** (13 disabled-stack, 18 enabled-stack),
-  0 failed, 0 skipped.
-- Docker builds: **not runnable in this sandbox** (no Docker daemon);
-  built by the CI `offline-checks` job on the pushed head.
+- `pytest -q tests/test_migrations_postgres.py` — **passed with skips**: 1 passed, 70 skipped. PostgreSQL skip count: 70 (PostgreSQL server binaries unavailable without `MILO_REQUIRE_PG_TESTS`).
+- `MILO_REQUIRE_PG_TESTS=1 pytest -q tests/test_migrations_postgres.py` — **failed due to environment**: PostgreSQL server binaries unavailable; 70 setup errors, 1 passed, 0 skips. This is an environment limitation, not a green PostgreSQL result.
+- `pytest -q tests/test_corrective_blockers.py tests/test_budget.py tests/test_worker.py tests/test_run_lifecycle.py tests/test_api.py tests/test_authorization.py tests/test_gateway_auth.py tests/test_workflow_proposals.py` — **failed during collection due to environment**: `ModuleNotFoundError: No module named 'fastapi'`; 8 collection errors.
+- `python -m pip install -r backend/requirements.txt -q` — **failed due to environment/network**: package index tunnel returned `403 Forbidden` for FastAPI.
+- `python scripts/check_migrations.py` — **passed**: `migration check passed (static text validation only)`.
+- `python -m py_compile backend/*.py backend/repository/*.py backend/testing/*.py backend/worker/*.py` — **passed**.
 
-## Unresolved risks
+## CI and Docker
 
-- `launch_unknown` reconciliation is manual by design (operator tooling
-  arrives in Phase 9); such runs are never auto-relaunched.
-- The `authenticated` DB role retains legacy-era table grants from
-  migration 007 (reads scoped by RLS); the backend itself uses the service
-  role. Revisit during Phase 9/10 review.
-- Daily-budget aggregation reads up to 2000 ledger rows per check; fine at
-  current scale, revisit before broad access.
-- Docker builds and the new CI jobs are validated by CI, not locally.
+- GitHub Actions: not verified from this sandbox; no GitHub remote is configured in the checkout.
+- Docker builds: not run in this sandbox.
+- Required child PR checks must still be verified on the pushed child branch before Phases 1–8 can be called fully corrected.
+
+## Remaining risks
+
+- Required PostgreSQL tests have not executed locally with zero skips because PostgreSQL server binaries are unavailable here.
+- Backend and E2E tests have not executed locally because Python dependencies are unavailable and package installation is blocked by the environment.
+- CI status, remote head SHA, child PR number, and final remote commit list must be filled in after the child branch is pushed and GitHub checks complete.
+- Launch reconciliation for `launch_unknown` remains an operator process until later-phase tooling.
 
 ## Execution-safety confirmation
 
-All execution flags remain **default-off**. No deployment, IAM mutation,
-production migration apply, secret read/write, real Cloud Run worker
-execution or paid model API call occurred in this run.
-
-## Next task
-
-**Phase 9 — Migration and operator tooling** (next run). Phases 9–11 are
-not complete and not started.
+All execution flags remain default-off. No production deployment, IAM mutation, production migration application, secret read/write, real Cloud Run worker execution, or paid model API call occurred in this local corrective pass.

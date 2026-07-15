@@ -189,7 +189,7 @@ def test_run_creation_disabled_creates_no_message_run_or_launch(repo):
 
 
 def test_proposal_run_creation_disabled_creates_no_message_run_or_launch(repo):
-    body = {"conversation_id": str(repo.conversation_id), "content": "Go"}
+    body = {"conversation_id": str(repo.conversation_id), "content": "Go", "idempotency_key": "proposal-disabled-0002"}
     response = TestClient(app).post(f"/workflow-proposals/{repo.proposal_id}/runs", json=body)
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "EXECUTION_SURFACE_DISABLED"

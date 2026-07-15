@@ -83,6 +83,29 @@ def _request_fingerprint(content: str, metadata: dict) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+SAFE_LAUNCH_ERROR_CLASSES = {
+    "launch_failed": "worker_launch_failed",
+    "launch_unknown": "worker_launch_unknown",
+}
+
+
+def _safe_run_response(run: dict) -> dict:
+    """Return a browser-safe run shape.
+
+    Launch exception messages are operational data and may include provider,
+    platform or stack details. Browser responses only expose a finite
+    classification and whether operator reconciliation is required.
+    """
+    launch_state = run.get("launch_state") or "pending"
+    safe = dict(run)
+    safe["launch_state"] = launch_state
+    safe["launch_error_class"] = SAFE_LAUNCH_ERROR_CLASSES.get(launch_state)
+    safe["launch_reconciliation_required"] = launch_state == "launch_unknown"
+    safe.pop("launch_error", None)
+    safe.pop("lease_token", None)
+    return safe
+
+
 def _enforce_concurrency_limits(repo: Repository, user: AuthenticatedUser, conversation_id: UUID) -> None:
     """Server-side concurrency caps, applied before any run row is created."""
     config = BudgetConfig.from_env()
@@ -226,7 +249,7 @@ def create_run(conversation_id: UUID, request: RunCreate, user: AuthenticatedUse
 
 @app.get("/runs/{run_id}", response_model=Run)
 def get_run(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
-    return repo.get_run(run_id, user_id=user.user_id)
+    return _safe_run_response(repo.get_run(run_id, user_id=user.user_id))
 
 
 @app.get("/runs/{run_id}/events", response_model=list[RunEvent])

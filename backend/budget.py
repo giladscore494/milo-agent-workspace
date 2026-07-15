@@ -139,6 +139,17 @@ EventEmitter = Callable[[str, dict[str, Any]], None]
 UsageRecorder = Callable[[dict[str, Any]], None]
 LedgerRecorder = Callable[[dict[str, Any]], None]
 CostProvider = Callable[[], float]
+@dataclass(frozen=True)
+class ModelCallReservation:
+    """Private in-memory handle for a canonical database budget reservation."""
+
+    id: str
+    call_seq: int
+    estimated_cost: float
+
+
+DailyReservation = Callable[[float, int], ModelCallReservation | str | dict[str, Any] | None]
+DailySettlement = Callable[[ModelCallReservation, float, str, str | None], Any]
 
 # Conservative chars-per-token heuristic for pre-call input estimation.
 CHARS_PER_TOKEN = 4
@@ -161,6 +172,9 @@ class BudgetTracker:
     ledger_recorder: LedgerRecorder | None = None
     daily_user_cost_provider: CostProvider | None = None
     daily_project_cost_provider: CostProvider | None = None
+    daily_user_reserver: DailyReservation | None = None
+    daily_project_reserver: DailyReservation | None = None
+    daily_settler: DailySettlement | None = None
     lease_checker: Callable[[], bool] | None = None
     clock: Callable[[], float] = time.monotonic
     kill_switch: Callable[[], bool] = staticmethod(paid_execution_enabled)
@@ -178,6 +192,7 @@ class BudgetTracker:
     _started_at: float = field(default=None, init=False)  # type: ignore[assignment]
     _warned: set = field(default_factory=set, init=False)
     _lock: Any = field(default=None, init=False)
+    _reservations: dict[int, ModelCallReservation] = field(default_factory=dict, init=False)
 
     def __post_init__(self):
         import threading
@@ -227,6 +242,19 @@ class BudgetTracker:
     def _reject(self, code: str, message: str, event_type: str, terminal_status: str) -> BudgetExceeded:
         self._ledger("rejected", rejection_reason=code)
         return self._stop(code, message, event_type, terminal_status)
+
+    def _normalize_reservation(self, raw: ModelCallReservation | str | dict[str, Any] | None, call_seq: int, estimated_cost: float) -> ModelCallReservation:
+        if isinstance(raw, ModelCallReservation):
+            return raw
+        if isinstance(raw, str) and raw:
+            return ModelCallReservation(raw, call_seq, estimated_cost)
+        if isinstance(raw, dict):
+            if raw.get("status") == "rejected":
+                raise self._reject(str(raw.get("rejection_reason") or "DAILY_BUDGET_REACHED"), "daily model-call budget exhausted", "budget_exhausted", "budget_exhausted")
+            rid = raw.get("id") or raw.get("reservation_id")
+            if rid:
+                return ModelCallReservation(str(rid), int(raw.get("call_seq") or call_seq), float(raw.get("estimated_cost") or estimated_cost))
+        raise self._reject("BUDGET_RESERVATION_MISSING", "model-call budget reservation did not return an id", "budget_exhausted", "failed")
 
     # -- the hard gate --------------------------------------------------------
     def reserve_call(self, estimated_input_tokens: int = 0, requested_max_tokens: int | None = None) -> int | None:
@@ -286,6 +314,12 @@ class BudgetTracker:
                 raise self._reject("DAILY_USER_BUDGET_REACHED", "daily user budget exhausted", "budget_exhausted", "budget_exhausted")
             if cfg.daily_project_budget is not None and self.daily_project_cost_provider is not None and self.daily_project_cost_provider() >= cfg.daily_project_budget:
                 raise self._reject("DAILY_PROJECT_BUDGET_REACHED", "daily project budget exhausted", "budget_exhausted", "budget_exhausted")
+            next_call_seq = self.model_calls + 1
+            reservation: ModelCallReservation | None = None
+            if cfg.daily_user_budget is not None and self.daily_user_reserver is not None:
+                reservation = self._normalize_reservation(self.daily_user_reserver(cfg.estimated_cost_per_call, next_call_seq), next_call_seq, cfg.estimated_cost_per_call)
+            if cfg.daily_project_budget is not None and self.daily_project_reserver is not None:
+                reservation = self._normalize_reservation(self.daily_project_reserver(cfg.estimated_cost_per_call, next_call_seq), next_call_seq, cfg.estimated_cost_per_call)
             allowed_output = remaining_output
             if requested_max_tokens is not None:
                 allowed_output = requested_max_tokens if allowed_output is None else min(allowed_output, requested_max_tokens)
@@ -299,6 +333,8 @@ class BudgetTracker:
             self.reserved_input_tokens += estimated_input_tokens
             if requested_max_tokens is not None and allowed_output is not None:
                 self.reserved_output_tokens += allowed_output
+            if reservation is not None:
+                self._reservations[next_call_seq] = reservation
             self._ledger(
                 "reserved",
                 reserved_input_tokens=estimated_input_tokens,
@@ -307,16 +343,24 @@ class BudgetTracker:
             )
             return allowed_output
 
-    def settle_call(self, reserved_input_tokens: int = 0, reserved_output_tokens: int | None = None, input_tokens: int = 0, output_tokens: int = 0, cost: float | None = None) -> None:
+    def settle_call(self, reserved_input_tokens: int = 0, reserved_output_tokens: int | None = None, input_tokens: int = 0, output_tokens: int = 0, cost: float | None = None, status: str = "settled", rejection_reason: str | None = None) -> None:
         """Release the reservation and record actual usage after a call."""
         with self._lock:
+            reservation = self._reservations.pop(self.model_calls, None)
+            actual_cost = float(cost) if cost else 0.0
+            if reservation is not None and self.daily_settler is not None:
+                try:
+                    self.daily_settler(reservation, actual_cost, status, rejection_reason)
+                except Exception as exc:
+                    self._reservations[self.model_calls] = reservation
+                    raise self._stop("BUDGET_SETTLEMENT_FAILED", "model-call budget settlement failed", "budget_exhausted", "failed") from exc
             self.reserved_input_tokens = max(0, self.reserved_input_tokens - max(0, int(reserved_input_tokens or 0)))
             if reserved_output_tokens:
                 self.reserved_output_tokens = max(0, self.reserved_output_tokens - int(reserved_output_tokens))
             self.input_tokens += max(0, int(input_tokens or 0))
             self.output_tokens += max(0, int(output_tokens or 0))
             if cost is not None and cost > 0:
-                self.actual_cost += float(cost)
+                self.actual_cost += actual_cost
             cfg = self.config
             self._warn_if_close("model_calls", self.model_calls, cfg.max_model_calls_per_run)
             self._warn_if_close("total_tokens", self.input_tokens + self.output_tokens, cfg.max_total_tokens_per_run)
@@ -326,10 +370,22 @@ class BudgetTracker:
                 "settled",
                 actual_input_tokens=int(input_tokens or 0),
                 actual_output_tokens=int(output_tokens or 0),
-                actual_cost=float(cost) if cost else None,
+                actual_cost=actual_cost if cost else None,
             )
             if self.usage_recorder:
                 self.usage_recorder(self.snapshot())
+            if cfg.max_input_tokens_per_run is not None and self.input_tokens > cfg.max_input_tokens_per_run:
+                self._ledger("overage", rejection_reason="INPUT_TOKEN_LIMIT_EXCEEDED")
+                raise self._stop("INPUT_TOKEN_LIMIT_EXCEEDED", "actual input token limit exceeded", "token_limit_reached", "budget_exhausted")
+            if cfg.max_output_tokens_per_run is not None and self.output_tokens > cfg.max_output_tokens_per_run:
+                self._ledger("overage", rejection_reason="OUTPUT_TOKEN_LIMIT_EXCEEDED")
+                raise self._stop("OUTPUT_TOKEN_LIMIT_EXCEEDED", "actual output token limit exceeded", "token_limit_reached", "budget_exhausted")
+            if cfg.max_total_tokens_per_run is not None and (self.input_tokens + self.output_tokens) > cfg.max_total_tokens_per_run:
+                self._ledger("overage", rejection_reason="TOTAL_TOKEN_LIMIT_EXCEEDED")
+                raise self._stop("TOTAL_TOKEN_LIMIT_EXCEEDED", "actual total token limit exceeded", "token_limit_reached", "budget_exhausted")
+            if cfg.max_cost_per_run is not None and self.actual_cost > cfg.max_cost_per_run:
+                self._ledger("overage", rejection_reason="COST_LIMIT_EXCEEDED")
+                raise self._stop("COST_LIMIT_EXCEEDED", "actual cost limit exceeded", "budget_exhausted", "budget_exhausted")
 
     def before_call(self) -> None:
         """Backwards-compatible gate without token estimation."""
@@ -369,15 +425,22 @@ class _GuardedCompletions:
         try:
             response = self._inner.create(**kwargs)
         except Exception:
-            self._tracker.settle_call(estimated_input, reserved_output, 0, 0)
+            self._tracker.settle_call(estimated_input, reserved_output, 0, 0, 0.0, status="released", rejection_reason="PROVIDER_EXCEPTION")
             self._tracker.record_retry()
             raise
         usage = getattr(response, "usage", None)
+        provider_cost = getattr(usage, "cost", None) or getattr(usage, "total_cost", None) or getattr(response, "cost", None)
+        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
+        output_tokens = getattr(usage, "completion_tokens", 0) or 0
+        if provider_cost is None:
+            from backend.model_pricing import calculate_model_cost
+            provider_cost = calculate_model_cost(kwargs.get("model", ""), input_tokens, output_tokens)
         self._tracker.settle_call(
             reserved_input_tokens=estimated_input,
             reserved_output_tokens=reserved_output,
-            input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-            output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost=float(provider_cost or 0),
         )
         return response
 

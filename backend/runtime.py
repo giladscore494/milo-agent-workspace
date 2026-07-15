@@ -37,6 +37,7 @@ EVENT_TYPES = {
     "launch_requested", "launch_failed", "run_requeued",
     "budget_warning", "budget_exhausted", "token_limit_reached", "run_timed_out",
     "retry_limit_reached", "kill_switch_activated",
+    "supervisor_shadow_failed",
 }
 
 class InvalidTransition(ValueError):

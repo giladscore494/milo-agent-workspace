@@ -129,6 +129,8 @@ def validate(env: dict[str, str] | None = None) -> ConfigReport:
     worker_identities = {i.strip().lower() for i in (env.get("MILO_APPROVED_WORKER_IDENTITIES") or "").split(",") if i.strip()}
     if production and (not gateway_audience or not gateway_identities):
         error("GATEWAY_AUTH_MISSING", "production requires MILO_GATEWAY_AUDIENCE and a non-empty MILO_APPROVED_GATEWAY_IDENTITIES; browser identity headers are never trusted bare")
+    if production and _flag(env, "MILO_ALLOW_INSECURE_DEV_IDENTITY"):
+        error("INSECURE_DEV_IDENTITY_IN_PRODUCTION", "MILO_ALLOW_INSECURE_DEV_IDENTITY is test/local-only and forbidden in production")
 
     # 5c. Gateway and worker identities must be strictly separated: a shared
     # service account (or a shared audience) would let the worker mint

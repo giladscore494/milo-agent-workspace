@@ -154,10 +154,21 @@ def test_partial_configuration_fails_closed(repo, monkeypatch):
 def test_production_without_gateway_auth_fails_closed(repo, monkeypatch):
     monkeypatch.delenv("MILO_GATEWAY_AUDIENCE", raising=False)
     monkeypatch.delenv("MILO_APPROVED_GATEWAY_IDENTITIES", raising=False)
+    monkeypatch.delenv("MILO_ALLOW_INSECURE_DEV_IDENTITY", raising=False)
     monkeypatch.setenv("ENVIRONMENT", "production")
     response = client().get("/projects", headers=identity_headers(repo))
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "GATEWAY_AUTH_NOT_CONFIGURED"
+
+
+def test_production_with_insecure_dev_identity_opt_in_is_forbidden(repo, monkeypatch):
+    monkeypatch.delenv("MILO_GATEWAY_AUDIENCE", raising=False)
+    monkeypatch.delenv("MILO_APPROVED_GATEWAY_IDENTITIES", raising=False)
+    monkeypatch.setenv("MILO_ALLOW_INSECURE_DEV_IDENTITY", "true")
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    response = client().get("/projects", headers=identity_headers(repo))
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "INSECURE_DEV_IDENTITY_FORBIDDEN"
 
 
 def test_missing_identity_header_with_valid_gateway_is_still_401(repo):
