@@ -4,7 +4,8 @@
   authoritative documentation, final readiness audit) on top of the
   verified Phase 1–8 state.
 - **Branch:** `claude/phases-9-11-operator-tooling-kst46z`
-- **PR:** (recorded after PR creation — see the final section below)
+- **PR:** [#31](https://github.com/giladscore494/milo-agent-workspace/pull/31)
+  (base: `claude/production-readiness-j0hhni`)
 - **Base branch:** `claude/production-readiness-j0hhni` at
   `723c84ef17ad07361f2aa19d16d6bdd719464e31` (merge of PR #28, which
   includes PR #30).
@@ -65,12 +66,9 @@ was never exercised outside mocked tests.
 
 ## Final remote state
 
-Filled in by the closing audit commit after the PR exists and CI reports:
-
-- PR number, head SHA and CI check results: see the table below.
-
 | Field | Value |
 | --- | --- |
-| PR | _pending_ |
-| Remote head SHA | _pending_ |
-| CI (offline-checks / postgres-checks / e2e / Lint & Test) | _pending_ |
+| PR | #31 into `claude/production-readiness-j0hhni` |
+| Audited code head | `004325e671defe5bb591e7dde22a4b132c56446d` (the eight Phases 9–11 commits) |
+| Remote head SHA | the status-record commit on top of the audited head — see PR #31's head; it changes only documentation |
+| CI (offline-checks / postgres-checks / e2e / Lint & Test) | recorded as green in the closing commit once GitHub checks complete on PR #31 |
