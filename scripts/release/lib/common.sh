@@ -249,6 +249,38 @@ json_is_valid() {
   printf '%s' "${json}" | python3 -c 'import json,sys; json.load(sys.stdin)' > /dev/null 2>&1
 }
 
+# iam_role_members JSON ROLE — print the members bound to EXACTLY the given
+# role in a Google IAM policy, one per line (e.g. serviceAccount:x@y,
+# allUsers). Members from other roles are never included, so accessor checks
+# can never be satisfied (or polluted) by a viewer/admin/metadata binding.
+# Returns 3 on invalid JSON, 2 when no parser is available.
+iam_role_members() {
+  local json="$1" role="$2"
+  if ! tool_available python3; then
+    return 2
+  fi
+  IAM_TARGET_ROLE="${role}" python3 - "$json" << 'PY'
+import json
+import os
+import sys
+
+target = os.environ["IAM_TARGET_ROLE"]
+try:
+    policy = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(3)
+
+members = []
+for binding in (policy.get("bindings") or []):
+    if isinstance(binding, dict) and binding.get("role") == target:
+        for member in (binding.get("members") or []):
+            if isinstance(member, str) and member not in members:
+                members.append(member)
+for member in members:
+    print(member)
+PY
+}
+
 # require_tool NAME PURPOSE — records MANUAL when the tool is unavailable.
 require_tool() {
   local name="$1" purpose="${2:-required tooling}"

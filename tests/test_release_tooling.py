@@ -90,6 +90,11 @@ if [[ "$method" == "POST" ]]; then
     */internal/*) code=403;;
     *) code=403;;
   esac
+elif [[ "$method" == "GET" ]]; then
+  case "$url" in
+    */health) code=200; body='{"status":"ok"}';;
+    */conversations/*) code=200; body='{"id":"conversation","title":"smoke"}';;
+  esac
 fi
 if [[ "$url" == */projects* && "$url" == *cccccccc* ]]; then code=404; fi
 if [[ -n "$out" && "$out" != "/dev/null" ]]; then

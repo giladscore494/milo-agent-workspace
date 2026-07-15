@@ -23,9 +23,11 @@ side effect can occur.
 
 A real run-creation posture assertion requires an AUTHENTICATED test user
 (--user-token-env with a populated variable) and a test conversation owned
-by that user (--conversation-id). A bare 401 without a supplied token does
-NOT prove that execution routes are disabled for authenticated users, so it
-is never accepted as a PASS.
+by that user (--conversation-id). Because the gateway refuses run creation
+BEFORE it validates the token, the script FIRST performs an authenticated
+read (GET /conversations/<id>) and requires HTTP 200 to prove token validity
+and ownership; only then does it send the run-creation request. A bare 401
+(or any non-200 read) is never accepted as a PASS.
 
 Options:
   --base-url <url>            Gateway base URL (mock in CI; explicit
@@ -111,43 +113,91 @@ req_code() { # METHOD PATH [BODY] [BODY_OUT]
   curl "${args[@]}" "${GATEWAY}${path}" || printf '000'
 }
 
-# 2. Run creation must be blocked for an AUTHENTICATED user.
+# http_probe METHOD PATH BODY_OUT [BODY]
+# Sets PROBE_CODE (HTTP status, "000" on transport failure) and PROBE_CURL_RC
+# (curl's own exit status) so callers can distinguish a transport/network
+# failure from an HTTP error. The response body is written to BODY_OUT.
+PROBE_CODE="" PROBE_CURL_RC=0
+http_probe() {
+  local method="$1" path="$2" out="$3" body="${4:-}"
+  local -a args=(-s -o "${out}" -w '%{http_code}' --max-time 20 -X "${method}")
+  if [[ -n "${USER_TOKEN_ENV}" && -n "${!USER_TOKEN_ENV:-}" ]]; then
+    args+=(-H "Authorization: Bearer ${!USER_TOKEN_ENV}")
+  fi
+  if [[ -n "${body}" ]]; then
+    args+=(-H 'content-type: application/json' -d "${body}")
+  fi
+  : > "${out}"
+  PROBE_CURL_RC=0
+  PROBE_CODE="$(curl "${args[@]}" "${GATEWAY}${path}")" || PROBE_CURL_RC=$?
+  if [[ -z "${PROBE_CODE}" ]]; then
+    PROBE_CODE="000"
+  fi
+  return 0
+}
+
+# 2. Run creation must be blocked for an AUTHENTICATED, OWNING user.
 #
-# The proof only holds if we present a valid authenticated test user AND a
-# schema-valid run-creation request against a conversation that user owns,
-# and then observe the execution-disabled response (HTTP 403 carrying the
-# application's execution-disabled classification). A 401 (auth failure) or a
-# missing token proves nothing about the posture for authenticated users, and
-# a 2xx means execution is NOT disabled.
+# The gateway refuses run creation with HTTP 403 BEFORE it validates the
+# Supabase token, so a random non-empty token would also receive that 403.
+# To make the run-creation probe meaningful we FIRST prove authentication and
+# ownership with a read the gateway only answers 200 for a valid token that
+# owns the conversation:
+#
+#     GET /api/gateway/conversations/<conversation-id>  (expect 200)
+#
+# Only after that authenticated read succeeds do we send the schema-valid
+# run-creation request and require the execution-disabled 403.
 milo_tmpdir_init
+run_creation_precondition_met=0
 if [[ -z "${USER_TOKEN_ENV}" || -z "${!USER_TOKEN_ENV:-}" ]]; then
   record_check MANUAL "run-creation-blocked" "no populated --user-token-env supplied; the authenticated run-creation posture cannot be proven (a bare 401 is not proof). Provide a valid authenticated test user token to assert PASS."
 elif [[ -z "${CONVERSATION_ID}" ]]; then
   record_check MANUAL "run-creation-blocked" "no --conversation-id supplied; a schema-valid run-creation request requires a test conversation owned by the test user. Cannot assert PASS."
 elif ! is_uuid "${CONVERSATION_ID}"; then
-  record_check BLOCKED "run-creation-blocked" "malformed --conversation-id (must be a UUID); refusing to assert the run-creation posture from an invalid request"
+  record_check BLOCKED "run-creation-blocked" "malformed --conversation-id (must be a UUID); refusing to assert the run-creation posture from an invalid request (no HTTP request sent)"
 else
-  body_file="${_MILO_TMPDIR}/run-creation-body"
-  # Schema-valid RunCreate body: content (min length 1) + idempotency_key
-  # (8..128 chars). metadata defaults to {}. The request is intentionally
-  # well-formed so a rejection can only come from the execution-disabled
-  # policy, never from input validation.
-  create_body='{"content":"execution-disabled smoke probe","idempotency_key":"smoke-disabled-0001"}'
-  code="$(req_code POST "/conversations/${CONVERSATION_ID}/runs" "${create_body}" "${body_file}")"
-  body_text="$(cat "${body_file}" 2> /dev/null || true)"
-  if [[ "${code}" == "403" ]]; then
-    # Require the execution-disabled classification, not just any 403.
-    if grep -qiE 'EXECUTION_SURFACE_DISABLED|disabled by the gateway safety policy|run creation is disabled|is disabled' <<< "${body_text}"; then
-      record_check PASS "run-creation-blocked" "authenticated run creation was refused with HTTP 403 and the expected execution-disabled classification; no worker, provider or budget side effect can occur"
-    else
-      record_check BLOCKED "run-creation-blocked" "authenticated run creation returned HTTP 403 but the body did not carry the expected execution-disabled classification (EXECUTION_SURFACE_DISABLED / gateway safety policy); posture not proven"
-    fi
-  elif [[ "${code}" == "401" ]]; then
-    record_check BLOCKED "run-creation-blocked" "authentication failed (HTTP 401) with the supplied token; a generic auth failure does NOT prove the execution-disabled posture. Supply a valid authenticated test user token."
-  elif [[ "${code}" == "200" || "${code}" == "201" || "${code}" == "202" ]]; then
-    record_check BLOCKED "run-creation-blocked" "authenticated run creation SUCCEEDED (HTTP ${code}); execution is NOT disabled — a run may have been created. This is a critical posture failure."
+  # 2a. Authenticated ownership/read precondition.
+  read_body="${_MILO_TMPDIR}/conversation-read-body"
+  http_probe GET "/conversations/${CONVERSATION_ID}" "${read_body}"
+  if [[ "${PROBE_CURL_RC}" -ne 0 ]]; then
+    record_check BLOCKED "auth-precondition" "the authenticated conversation read could not be performed (curl transport error); authentication/ownership not proven, run creation not attempted"
+  elif [[ "${PROBE_CODE}" == "200" ]]; then
+    record_check PASS "auth-precondition" "authenticated conversation read returned HTTP 200 for the supplied token and conversation; token validity and ownership are proven before the run-creation probe"
+    run_creation_precondition_met=1
+  elif [[ "${PROBE_CODE}" == "401" ]]; then
+    record_check BLOCKED "auth-precondition" "authenticated conversation read returned HTTP 401; the supplied token is invalid or expired. Run creation NOT attempted."
+  elif [[ "${PROBE_CODE}" == "403" || "${PROBE_CODE}" == "404" ]]; then
+    record_check BLOCKED "auth-precondition" "authenticated conversation read returned HTTP ${PROBE_CODE}; the conversation is not owned by / accessible to the test user. Run creation NOT attempted."
   else
-    record_check BLOCKED "run-creation-blocked" "unexpected response to authenticated run creation (HTTP ${code}); the execution-disabled posture is not proven"
+    record_check BLOCKED "auth-precondition" "authenticated conversation read returned HTTP ${PROBE_CODE}; the authentication/ownership prerequisite is not proven. Run creation NOT attempted."
+  fi
+
+  # 2b. Run-creation-disabled probe (only after the read proved auth+ownership).
+  if [[ "${run_creation_precondition_met}" -eq 1 ]]; then
+    body_file="${_MILO_TMPDIR}/run-creation-body"
+    # Schema-valid RunCreate body: content (min length 1) + idempotency_key
+    # (8..128 chars). metadata defaults to {}. The request is intentionally
+    # well-formed so a rejection can only come from the execution-disabled
+    # policy, never from input validation.
+    create_body='{"content":"execution-disabled smoke probe","idempotency_key":"smoke-disabled-0001"}'
+    http_probe POST "/conversations/${CONVERSATION_ID}/runs" "${body_file}" "${create_body}"
+    code="${PROBE_CODE}"
+    body_text="$(cat "${body_file}" 2> /dev/null || true)"
+    if [[ "${code}" == "403" ]]; then
+      # Require the execution-disabled classification, not just any 403.
+      if grep -qiE 'EXECUTION_SURFACE_DISABLED|disabled by the gateway safety policy|run creation is disabled|is disabled' <<< "${body_text}"; then
+        record_check PASS "run-creation-blocked" "authenticated (proven) run creation was refused with HTTP 403 and the expected execution-disabled classification; no worker, provider or budget side effect can occur"
+      else
+        record_check BLOCKED "run-creation-blocked" "run creation returned HTTP 403 but the body did not carry the expected execution-disabled classification (EXECUTION_SURFACE_DISABLED / gateway safety policy); a generic 403 is not sufficient"
+      fi
+    elif [[ "${code}" == "401" ]]; then
+      record_check BLOCKED "run-creation-blocked" "run creation returned HTTP 401 even though the conversation read authenticated; posture not proven"
+    elif [[ "${code}" == "200" || "${code}" == "201" || "${code}" == "202" ]]; then
+      record_check BLOCKED "run-creation-blocked" "authenticated run creation SUCCEEDED (HTTP ${code}); execution is NOT disabled — a run may have been created. This is a critical posture failure."
+    else
+      record_check BLOCKED "run-creation-blocked" "unexpected response to authenticated run creation (HTTP ${code}); the execution-disabled posture is not proven"
+    fi
   fi
 fi
 
@@ -160,15 +210,22 @@ else
 fi
 
 # 4. No secret is returned by the health surface.
-if tool_available curl; then
-  milo_tmpdir_init
-  body_file="${_MILO_TMPDIR}/health-body"
-  curl -s --max-time 20 "${GATEWAY}/health" -o "${body_file}" || true
-  if grep -qiE 'service_role|api[_-]?key|bearer|password|secret' "${body_file}" 2> /dev/null; then
-    record_check BLOCKED "no-secret-returned" "health response contains secret-looking material"
-  else
-    record_check PASS "no-secret-returned" "health response contains no secret-looking material"
-  fi
+#
+# A PASS here must mean "we actually received a 200 health body and it was
+# clean" — never "the request failed / returned nothing, so we found no
+# secret". Capture the curl exit status and HTTP status explicitly.
+health_body="${_MILO_TMPDIR}/health-body"
+http_probe GET "/health" "${health_body}"
+if [[ "${PROBE_CURL_RC}" -ne 0 ]]; then
+  record_check BLOCKED "no-secret-returned" "the health request failed (curl transport error); cannot assert the response is secret-free"
+elif [[ "${PROBE_CODE}" != "200" ]]; then
+  record_check BLOCKED "no-secret-returned" "health returned HTTP ${PROBE_CODE}; cannot assert a clean secret-free body from a non-200 response"
+elif [[ ! -s "${health_body}" ]]; then
+  record_check BLOCKED "no-secret-returned" "health returned HTTP 200 but an empty body; cannot assert it is secret-free"
+elif grep -qiE 'service_role|api[_-]?key|bearer|password|secret' "${health_body}"; then
+  record_check BLOCKED "no-secret-returned" "health response contains secret-looking material"
+else
+  record_check PASS "no-secret-returned" "health response is HTTP 200 with a non-empty, secret-free body"
 fi
 
 # 5. Cancellation idempotency (only where the staged state enables it).
@@ -206,5 +263,5 @@ fi
 
 record_check MANUAL "no-worker-invocation" "verify externally that no Cloud Run worker job execution occurred: gcloud run jobs executions list --job <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> (expect no new executions)"
 
-printf '\nRun-creation posture is PASS only when an authenticated user + test conversation produced an HTTP 403 with the execution-disabled classification; otherwise it is reported MANUAL/BLOCKED above. Reads-functional, no-secret-returned and no-budget-reservation are asserted independently; worker-job stillness is verified via the listed manual command.\n'
+printf '\nRun-creation posture is PASS only when an authenticated conversation read returned HTTP 200 (proving token validity + ownership) AND the subsequent run-creation request returned HTTP 403 with the execution-disabled classification; otherwise it is reported MANUAL/BLOCKED above. Reads-functional, no-secret-returned (requires a real 200 body) and no-budget-reservation are asserted independently; worker-job stillness is verified via the listed manual command.\n'
 finish_checks "smoke-test-execution-disabled" "${JSON_OUTPUT}"

@@ -34,17 +34,34 @@ cancellation behavior stable per the staged state; no new model-call budget
 reservation (optional read-only DB assertion); plus the exact manual
 command proving no Cloud Run worker job execution occurred.
 
-The run-creation posture is reported `PASS` **only** when a valid
-authenticated test user (`--user-token-env` with a populated variable) and a
-test conversation owned by that user (`--conversation-id`) produce the
-expected authenticated 403. A missing token, an empty token, or a bare
-unauthenticated 401 is reported `MANUAL`/`BLOCKED`, never `PASS`: a generic
-authentication failure does not prove that execution is disabled for
-authenticated users. An authenticated 2xx is a critical `BLOCKED` finding
-(execution is not actually disabled). The request body is a schema-valid
-`RunCreate` so that any rejection can only come from the execution-disabled
-policy, not from input validation — and the probe still creates no run,
+Because the gateway refuses run creation with HTTP 403 **before** it
+validates the Supabase token, a non-empty but bogus token would also receive
+that 403. The script therefore first performs an **authenticated ownership
+read** — `GET /api/gateway/conversations/<conversation-id>` — and requires
+HTTP `200` (proving the token is valid AND owns the conversation) before it
+even sends the run-creation request:
+
+- read `200` → authentication + ownership proven; continue to the
+  run-creation probe;
+- read `401` → `BLOCKED` (invalid/expired token); run creation **not**
+  attempted;
+- read `403`/`404` → `BLOCKED` (conversation not owned/accessible); run
+  creation **not** attempted;
+- any other read status → `BLOCKED` (prerequisite not proven);
+- missing token or conversation id → `MANUAL` (never `PASS`).
+
+Only after the read proves auth+ownership does the run-creation posture get
+evaluated. It is reported `PASS` **only** when the subsequent schema-valid
+`RunCreate` returns HTTP `403` carrying the execution-disabled classification
+(`EXECUTION_SURFACE_DISABLED` / the gateway safety-policy message). A generic
+`403` is not sufficient; an authenticated `2xx` is a critical `BLOCKED`
+(execution is not actually disabled). The probe still creates no run,
 triggers no worker, calls no provider and reserves no budget.
+
+The `no-secret-returned` health check is likewise fail-closed: it requires a
+successful `curl`, HTTP `200`, and a non-empty body before scanning for
+secret-looking material. A transport failure, a non-200 status, or an empty
+body is `BLOCKED`, never a false `PASS`.
 
 ## Exact smoke-test order (Stage A)
 

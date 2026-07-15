@@ -63,9 +63,21 @@ if [[ "${active_project}" != "${EXPECTED_PROJECT}" ]]; then
   exit $?
 fi
 
-existing="$(gcloud secrets list --project "${EXPECTED_PROJECT}" --format 'value(name)' 2> /dev/null || true)"
-if [[ -z "${existing}" ]]; then
-  record_check MANUAL "secrets:list" "could not list secrets (missing permission or none exist); verify names manually"
+milo_tmpdir_init
+
+# List secrets. A permission/API failure must NOT be conflated with "no
+# secrets exist" — capture the exit status and stderr separately.
+list_err="${_MILO_TMPDIR}/secrets-list.err"
+list_status=0
+existing_readable=1
+existing="$(gcloud secrets list --project "${EXPECTED_PROJECT}" --format 'value(name)' 2> "${list_err}")" || list_status=$?
+if [[ "${list_status}" -ne 0 ]]; then
+  existing_readable=0
+  if grep -qiE 'permission|forbidden|denied|not authorized|unauthenticated|has not been used|is disabled|SERVICE_DISABLED' "${list_err}"; then
+    record_check MANUAL "secrets:list" "could not list secrets (permission/API error, NOT 'no secrets'); verify names manually (value never read)"
+  else
+    record_check MANUAL "secrets:list" "could not list secrets (inspection error); verify names manually (value never read)"
+  fi
 fi
 
 if [[ "${#SECRET_SPECS[@]}" -eq 0 ]]; then
@@ -75,11 +87,20 @@ if [[ "${#SECRET_SPECS[@]}" -eq 0 ]]; then
 fi
 
 # Project-wide Secret Manager accessor is a red flag regardless of any
-# individual secret: access must be granted per-secret only.
-project_policy="$(gcloud projects get-iam-policy "${EXPECTED_PROJECT}" --format json 2> /dev/null || true)"
-if [[ -n "${project_policy}" ]]; then
-  if grep -q '"roles/secretmanager.secretAccessor"' <<< "${project_policy}"; then
-    record_check BLOCKED "secrets:project-wide-accessor" "project-wide roles/secretmanager.secretAccessor grant found; Secret Manager access must be granted per-secret only, never project-wide"
+# individual secret: access must be granted per-secret only. Parse the policy
+# structurally and only consider the accessor role; an unreadable policy is an
+# explicit MANUAL, never a silent skip.
+proj_err="${_MILO_TMPDIR}/project-iam.err"
+proj_status=0
+project_policy="$(gcloud projects get-iam-policy "${EXPECTED_PROJECT}" --format json 2> "${proj_err}")" || proj_status=$?
+if [[ "${proj_status}" -ne 0 ]]; then
+  record_check MANUAL "secrets:project-wide-accessor" "could not read project IAM policy (permission/API error); manually verify no project-wide roles/secretmanager.secretAccessor grant exists"
+elif ! json_is_valid "${project_policy}"; then
+  record_check MANUAL "secrets:project-wide-accessor" "project IAM policy was not valid JSON; verify manually that no project-wide roles/secretmanager.secretAccessor grant exists"
+else
+  proj_accessors="$(iam_role_members "${project_policy}" "roles/secretmanager.secretAccessor")"
+  if [[ -n "${proj_accessors}" ]]; then
+    record_check BLOCKED "secrets:project-wide-accessor" "project-wide roles/secretmanager.secretAccessor grant found (members: ${proj_accessors//$'\n'/, }); Secret Manager access must be granted per-secret only, never project-wide"
   else
     record_check PASS "secrets:project-wide-accessor" "no project-wide Secret Manager accessor grant"
   fi
@@ -101,56 +122,85 @@ for spec in "${SECRET_SPECS[@]}"; do
   done
   [[ "${consumer_bad}" -eq 1 ]] && continue
 
-  if [[ -z "${existing}" ]]; then
-    # Could not list secrets: existence is UNCONFIRMED. Never claim a PASS
-    # here — that would be a false "resource present" result.
-    record_check MANUAL "secret:${name}" "could not list secrets to confirm '${name}' exists; verify existence manually (value never read)"
-  elif ! grep -q "secrets/${name}$\|^${name}$" <<< "${existing}"; then
+  if [[ "${existing_readable}" -eq 0 ]]; then
+    # Could not list secrets (permission/API error): existence is UNCONFIRMED.
+    # Never claim a PASS or a "missing" here.
+    record_check MANUAL "secret:${name}" "could not confirm '${name}' exists because the secrets list was unreadable (permission/API error); verify existence manually (value never read)"
+  elif grep -q "secrets/${name}$\|^${name}$" <<< "${existing}"; then
+    record_check PASS "secret:${name}" "secret exists (value never read)"
+  else
+    # The list succeeded and the name is genuinely absent.
     record_check BLOCKED "secret:${name}" "secret name not found in project (manual creation required; this tool never creates secrets)"
     continue
-  else
-    record_check PASS "secret:${name}" "secret exists (value never read)"
   fi
 
-  # Enabled versions must exist (payloads are never accessed).
-  enabled_versions="$(gcloud secrets versions list "${name}" --project "${EXPECTED_PROJECT}" --filter 'state=enabled' --format 'value(name)' 2> /dev/null || true)"
-  if [[ -z "${enabled_versions}" ]]; then
+  # Enabled versions must exist. Distinguish "command succeeded, zero enabled
+  # versions" (BLOCKED) from "command failed" (MANUAL) — never claim "no
+  # enabled version" from a failed command.
+  ver_err="${_MILO_TMPDIR}/secret-versions.err"
+  ver_status=0
+  enabled_versions="$(gcloud secrets versions list "${name}" --project "${EXPECTED_PROJECT}" --filter 'state=enabled' --format 'value(name)' 2> "${ver_err}")" || ver_status=$?
+  if [[ "${ver_status}" -ne 0 ]]; then
+    if grep -qiE 'not.?found|does not exist' "${ver_err}"; then
+      record_check BLOCKED "secret:${name}:version" "secret not found when listing versions (manual creation required)"
+    else
+      record_check MANUAL "secret:${name}:version" "could not list secret versions (permission/API error, not a clean 'not found'); verify manually that an enabled version exists (payload never read)"
+    fi
+  elif [[ -z "${enabled_versions}" ]]; then
     record_check BLOCKED "secret:${name}:version" "secret has no enabled version (a consumer cannot resolve :latest); add an enabled version (payload never inspected here)"
   else
     record_check PASS "secret:${name}:version" "at least one enabled version exists (payload never read)"
   fi
 
-  policy="$(gcloud secrets get-iam-policy "${name}" --project "${EXPECTED_PROJECT}" --format json 2> /dev/null || true)"
-  if [[ -z "${policy}" ]]; then
-    record_check MANUAL "secret:${name}:iam" "could not read secret IAM policy; verify manually that only the intended consumers hold roles/secretmanager.secretAccessor"
+  # Per-secret IAM. Consumer validation requires a successfully read AND parsed
+  # policy — never PASS/BLOCK a consumer from an unreadable or malformed policy.
+  iam_err="${_MILO_TMPDIR}/secret-iam.err"
+  iam_status=0
+  policy="$(gcloud secrets get-iam-policy "${name}" --project "${EXPECTED_PROJECT}" --format json 2> "${iam_err}")" || iam_status=$?
+  if [[ "${iam_status}" -ne 0 ]]; then
+    record_check MANUAL "secret:${name}:iam" "could not read secret IAM policy (permission/API error); cannot validate consumers (never assumed present or absent)"
     continue
   fi
-  if grep -q '"allUsers"\|"allAuthenticatedUsers"' <<< "${policy}"; then
-    record_check BLOCKED "secret:${name}:wildcard" "secret IAM policy contains a wildcard principal (allUsers/allAuthenticatedUsers)"
+  if ! json_is_valid "${policy}"; then
+    record_check MANUAL "secret:${name}:iam" "secret IAM policy was not valid JSON; cannot validate consumers (never PASS without a parsed policy)"
+    continue
   fi
-  # Every intended consumer must be bound at the secret level.
+
+  # Consider ONLY members of the exact secret-accessor role. A service account
+  # that appears only under viewer/admin/metadata roles must not satisfy — or
+  # pollute — accessor validation.
+  accessor_members="$(iam_role_members "${policy}" "roles/secretmanager.secretAccessor")"
+
+  # Wildcard principal in the accessor binding.
+  if grep -qxE 'allUsers|allAuthenticatedUsers' <<< "${accessor_members}"; then
+    record_check BLOCKED "secret:${name}:wildcard" "secret grants roles/secretmanager.secretAccessor to a wildcard principal (allUsers/allAuthenticatedUsers)"
+  fi
+
+  # Every intended consumer must hold the accessor role (exact member match).
   for consumer in "${consumers[@]}"; do
-    if grep -q "serviceAccount:${consumer}" <<< "${policy}"; then
-      record_check PASS "secret:${name}:consumer:${consumer}" "intended consumer ${consumer} is bound at secret level"
+    if grep -qxF "serviceAccount:${consumer}" <<< "${accessor_members}"; then
+      record_check PASS "secret:${name}:consumer:${consumer}" "intended consumer ${consumer} holds roles/secretmanager.secretAccessor at the secret level"
     else
-      record_check BLOCKED "secret:${name}:consumer:${consumer}" "intended consumer ${consumer} is NOT bound at secret level (grant roles/secretmanager.secretAccessor at the SECRET level, never project-wide)"
+      record_check BLOCKED "secret:${name}:consumer:${consumer}" "intended consumer ${consumer} does NOT hold roles/secretmanager.secretAccessor on this secret (a binding under any other role does not count)"
     fi
   done
-  # Any service-account accessor NOT in the intended set is unexpected.
-  bound="$(grep -o 'serviceAccount:[^"]*' <<< "${policy}" | sort -u || true)"
-  if [[ -n "${bound}" ]]; then
-    while IFS= read -r principal; do
-      [[ -z "${principal}" ]] && continue
-      sa="${principal#serviceAccount:}"
-      is_expected=0
-      for consumer in "${consumers[@]}"; do
-        [[ "${sa}" == "${consumer}" ]] && is_expected=1 && break
-      done
-      if [[ "${is_expected}" -eq 0 ]]; then
-        record_check WARN "secret:${name}:extra-accessor" "accessor ${sa} is bound on secret ${name} but is not an intended consumer — confirm it is intentional or remove it"
-      fi
-    done <<< "${bound}"
-  fi
+
+  # Any service-account holding the accessor role but NOT in the intended set
+  # is an unexpected accessor. Members under other roles are ignored here.
+  while IFS= read -r member; do
+    [[ -z "${member}" ]] && continue
+    case "${member}" in
+      serviceAccount:*) sa="${member#serviceAccount:}" ;;
+      *) continue ;;
+    esac
+    is_expected=0
+    for consumer in "${consumers[@]}"; do
+      [[ "${sa}" == "${consumer}" ]] && is_expected=1 && break
+    done
+    if [[ "${is_expected}" -eq 0 ]]; then
+      record_check WARN "secret:${name}:extra-accessor" "accessor ${sa} holds roles/secretmanager.secretAccessor on secret ${name} but is not an intended consumer — confirm it is intentional or remove it"
+    fi
+  done <<< "${accessor_members}"
 done
 
 finish_checks "check-secret-metadata" "${JSON_OUTPUT}"

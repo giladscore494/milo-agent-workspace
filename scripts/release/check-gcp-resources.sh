@@ -121,18 +121,24 @@ else
   done
 fi
 
-# Artifact Registry.
+milo_tmpdir_init
+
+# Artifact Registry. Only a clean not-found means "missing"; a permission/API
+# failure is an inspection failure, never "repository missing".
 if [[ -n "${REPOSITORY}" && -n "${REGION}" ]]; then
-  if gcloud artifacts repositories describe "${REPOSITORY}" --location "${REGION}" --project "${EXPECTED_PROJECT}" --format 'value(name)' > /dev/null 2>&1; then
+  ar_err="${_MILO_TMPDIR}/artifact-registry.err"
+  ar_status=0
+  gcloud artifacts repositories describe "${REPOSITORY}" --location "${REGION}" --project "${EXPECTED_PROJECT}" --format 'value(name)' > /dev/null 2> "${ar_err}" || ar_status=$?
+  if [[ "${ar_status}" -eq 0 ]]; then
     record_check PASS "artifact-registry:${REPOSITORY}" "repository exists in ${REGION}"
-  else
+  elif grep -qiE 'not.?found|does not exist|was not found' "${ar_err}"; then
     record_check BLOCKED "artifact-registry:${REPOSITORY}" "repository not found in ${REGION} (manual creation required; this tool never creates resources)"
+  else
+    record_check MANUAL "artifact-registry:${REPOSITORY}" "could not inspect the repository (permission/API/network error, not a clean 'not found'); verify manually"
   fi
 else
   record_check MANUAL "artifact-registry" "supply --repository and --region to verify the Artifact Registry repository"
 fi
-
-milo_tmpdir_init
 
 # Cloud Run API service metadata.
 # The Knative-style v1 export (gcloud run services describe --format json)
@@ -220,27 +226,38 @@ else
   record_check MANUAL "cloud-run:worker-job" "supply --worker-job and --region to verify the Cloud Run worker job"
 fi
 
-# Service accounts.
+# Service accounts. A permission/API failure must not masquerade as
+# "service account not found".
 for sa in "${API_SA}" "${WORKER_SA}"; do
   [[ -z "${sa}" ]] && continue
-  if gcloud iam service-accounts describe "${sa}" --project "${EXPECTED_PROJECT}" --format 'value(email)' > /dev/null 2>&1; then
+  sa_err="${_MILO_TMPDIR}/sa-${sa//[^a-zA-Z0-9]/_}.err"
+  sa_status=0
+  gcloud iam service-accounts describe "${sa}" --project "${EXPECTED_PROJECT}" --format 'value(email)' > /dev/null 2> "${sa_err}" || sa_status=$?
+  if [[ "${sa_status}" -eq 0 ]]; then
     record_check PASS "service-account:${sa}" "exists"
-  else
+  elif grep -qiE 'not.?found|does not exist|was not found|unknown service account' "${sa_err}"; then
     record_check BLOCKED "service-account:${sa}" "service account not found (manual creation required; this tool never creates identities)"
+  else
+    record_check MANUAL "service-account:${sa}" "could not inspect the service account (permission/API/network error, not a clean 'not found'); verify manually"
   fi
 done
 
-# Project-level IAM red flags.
-policy="$(gcloud projects get-iam-policy "${EXPECTED_PROJECT}" --format json 2> /dev/null || true)"
-if [[ -z "${policy}" ]]; then
-  record_check MANUAL "iam:project-policy" "could not read project IAM policy; verify manually that no owner/editor or project-wide secretAccessor grants exist for runtime identities"
+# Project-level IAM red flags. An unreadable policy is an explicit MANUAL, not
+# a silent skip; the accessor check is parsed structurally by exact role.
+iam_err="${_MILO_TMPDIR}/project-iam.err"
+iam_status=0
+policy="$(gcloud projects get-iam-policy "${EXPECTED_PROJECT}" --format json 2> "${iam_err}")" || iam_status=$?
+if [[ "${iam_status}" -ne 0 ]]; then
+  record_check MANUAL "iam:project-policy" "could not read project IAM policy (permission/API error); manually verify no owner/editor or project-wide secretAccessor grants exist for runtime identities"
+elif ! json_is_valid "${policy}"; then
+  record_check MANUAL "iam:project-policy" "project IAM policy was not valid JSON; verify manually that no owner/editor or project-wide secretAccessor grants exist"
 else
   for role in roles/owner roles/editor; do
-    if grep -q "\"${role}\"" <<< "${policy}"; then
+    if [[ -n "$(iam_role_members "${policy}" "${role}")" ]]; then
       record_check WARN "iam:${role}" "project has ${role} bindings; runtime and CI identities must never hold owner/editor"
     fi
   done
-  if grep -q '"roles/secretmanager.secretAccessor"' <<< "${policy}"; then
+  if [[ -n "$(iam_role_members "${policy}" "roles/secretmanager.secretAccessor")" ]]; then
     record_check BLOCKED "iam:broad-secret-accessor" "project-wide Secret Manager accessor grant found; secret access must be granted per-secret only"
   else
     record_check PASS "iam:no-broad-secret-accessor" "no project-wide Secret Manager accessor grant"

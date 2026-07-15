@@ -130,8 +130,13 @@ reason to relaunch):
 3. Requeue after operator verification (only after resolution 2):
    $0 --run-id ${rid} --resolution requeue --apply ... (same guards)
 
-4. Leave unresolved (explicitly documented decision; no mutation):
-   $0 --run-id ${rid} --resolution leave-unresolved
+4. Leave unresolved (explicitly documented operator decision; no database
+   mutation, but the SAME operator identity guard is required so the audit
+   record is trustworthy; a read-only --database-url-env optionally
+   revalidates the run is still launch_unknown):
+   $0 --run-id ${rid} --resolution leave-unresolved --apply --environment production \\
+     --expected-project <GCP_PROJECT_ID> --expected-account <OPERATOR_EMAIL> \\
+     --expected-sha <FULL_RELEASE_SHA> --confirm-production-change [--database-url-env <RO_DB_URL_ENV>]
 
 EOF
 
@@ -140,21 +145,19 @@ EOF
 # ---------------------------------------------------------------------------
 if [[ "${APPLY_MODE}" -eq 1 ]]; then
   case "${RESOLUTION}" in
-    confirmed-launched|confirmed-not-launched|requeue) ;;
-    leave-unresolved)
-      record_check PASS "resolution" "leave-unresolved requires no mutation; decision recorded in audit file"
-      write_audit_record "${AUDIT_FILE}" "reconcile-launch-unknown" "leave-unresolved run=${RUN_ID:-unspecified}"
-      finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
-      exit $?
-      ;;
+    confirmed-launched|confirmed-not-launched|requeue|leave-unresolved) ;;
     *)
       record_check BLOCKED "resolution" "--apply requires --resolution (confirmed-launched | confirmed-not-launched | requeue | leave-unresolved)"
       finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
       exit $?
       ;;
   esac
+  # An explicit run id and the full operator identity guard are required for
+  # EVERY apply-mode decision, including leave-unresolved: it is a recorded
+  # operator decision even though it mutates nothing. No record is written if
+  # the guard fails.
   if [[ -z "${RUN_ID}" ]]; then
-    record_check BLOCKED "apply:run-id" "--apply requires an explicit --run-id; bulk mutation is not supported"
+    record_check BLOCKED "apply:run-id" "--apply requires an explicit --run-id; bulk mutation is not supported and an unidentified decision is never recorded"
     finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
     exit $?
   fi
@@ -162,6 +165,53 @@ if [[ "${APPLY_MODE}" -eq 1 ]]; then
     finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
     exit $?
   fi
+
+  # leave-unresolved: no database mutation, so it does NOT require a writable
+  # connection. It still requires the operator identity guard above, and it
+  # optionally revalidates the live state read-only when a DB URL is supplied.
+  if [[ "${RESOLUTION}" == "leave-unresolved" ]]; then
+    db_verified="not-verified(no-db-url)"
+    if [[ -n "${DB_URL_ENV}" && -n "${!DB_URL_ENV:-}" ]]; then
+      if ! tool_available psql; then
+        record_check MANUAL "leave-unresolved:db" "psql unavailable; live launch_state was NOT revalidated (decision still recorded with db_verified=psql-unavailable)"
+        db_verified="not-verified(psql-unavailable)"
+      else
+        milo_tmpdir_init
+        lu_err="${_MILO_TMPDIR}/leave-read.err"
+        lu_status=0
+        lu_state="$(psql -X -A -t -v ON_ERROR_STOP=1 "${!DB_URL_ENV}" -c "select launch_state from public.runs where id = '${RUN_ID}'::uuid;" 2> "${lu_err}")" || lu_status=$?
+        if [[ "${lu_status}" -ne 0 ]]; then
+          record_check BLOCKED "leave-unresolved:db" "read-only revalidation failed (database error); no decision recorded"
+          finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+          exit $?
+        fi
+        lu_state="$(printf '%s' "${lu_state}" | tr -d '[:space:]')"
+        if [[ -z "${lu_state}" ]]; then
+          record_check BLOCKED "leave-unresolved:db" "run ${RUN_ID} not found; refusing to record a leave-unresolved decision for a non-existent run"
+          finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+          exit $?
+        fi
+        if [[ "${lu_state}" != "launch_unknown" ]]; then
+          record_check BLOCKED "leave-unresolved:db" "run ${RUN_ID} launch_state is '${lu_state}', not 'launch_unknown'; leave-unresolved only applies to an unresolved run. No decision recorded."
+          finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+          exit $?
+        fi
+        db_verified="verified-launch_unknown"
+      fi
+    fi
+    # Write the decision record ONLY after the guard (and any DB revalidation)
+    # passed. Repeated leave-unresolved decisions each append one audit line —
+    # the record is an operator decision log, not a database mutation.
+    audit_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    umask 077
+    printf '%s script=reconcile-launch-unknown run=%s resolution=leave-unresolved operator=%s project=%s expected_sha=%s git_sha=%s db_verified=%s\n' \
+      "${audit_ts}" "${RUN_ID}" "${EXPECTED_ACCOUNT}" "${EXPECTED_PROJECT}" "${EXPECTED_SHA}" "$(git_head_sha)" "${db_verified}" >> "${AUDIT_FILE}"
+    record_check PASS "resolution" "leave-unresolved decision recorded for run ${RUN_ID} (no database mutation; db_verified=${db_verified})"
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
+  fi
+
+  # Mutation resolutions require a writable connection and psql.
   if [[ -z "${DB_URL_ENV}" || -z "${!DB_URL_ENV:-}" ]]; then
     record_check BLOCKED "apply:connection" "--database-url-env with a populated variable is required in apply mode"
     finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"

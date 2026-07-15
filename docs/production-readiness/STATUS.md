@@ -10,9 +10,52 @@
 - **Base:** `claude/production-readiness-j0hhni` at
   `2df9e74a910ec47d30910933f3bf2837237392f9` (the merge commit of PR #31,
   "Phases 9–11 operator tooling …").
-- **Corrective head SHA:** `77b7ee525bf4b0560b8a61c57c8f8d2af79236b9`
-  (this STATUS update commits atop it; CI reruns on the final head before any
-  merge decision).
+- **Corrective head SHA (round 1):** `77b7ee525bf4b0560b8a61c57c8f8d2af79236b9`.
+- **Corrective head SHA (round 2, final-review blockers):** committed atop
+  round 1 on the same branch/PR (see the follow-up commit; CI reruns on the
+  final head before any merge decision).
+
+## Round 2 — six final-review blockers corrected
+
+A second review of the corrective PR surfaced six more production-audit
+correctness blockers, all now fixed on the same PR #33 branch (tooling, tests
+and docs only — no production mutation):
+
+1. **Execution-disabled smoke test did not prove authentication.** The gateway
+   returns the run-creation 403 before validating the token, so a random
+   non-empty token still got the expected 403. The script now first performs
+   an authenticated read `GET /conversations/<id>` and requires HTTP 200
+   (token valid + owns the conversation) before the run-creation probe;
+   401→BLOCKED (invalid token), 403/404→BLOCKED (not owned), missing→MANUAL.
+   The curl mock now judges token validity by the token VALUE, not header
+   presence.
+2. **Secret Manager consumer checks ignored the IAM role.** Consumer/extra/
+   wildcard checks now parse the policy structurally (`iam_role_members`) and
+   only consider members of the exact `roles/secretmanager.secretAccessor`
+   binding; an SA under viewer/admin/metadata roles never satisfies or
+   pollutes accessor validation.
+3. **Vercel project identity was not fail-closed.** Identity is now proven by
+   reading `projectId`/`orgId` from `.vercel/project.json` and matching them
+   against `vercel project inspect`; a missing/malformed link file, failed
+   inspection, differing project ID, or differing org is BLOCKED (not a WARN),
+   before any variable is inspected.
+4. **Missing vs permission/API failures conflated.** Artifact Registry
+   describe, service-account describe, secret versions list, secret listing,
+   and project/secret IAM policy reads now capture stdout+stderr+exit and only
+   classify a clean NOT_FOUND as "missing"; permission/API/network failures are
+   MANUAL/BLOCKED inspection failures, never a false "resource missing" / "no
+   enabled version" / silently-passed consumer check.
+5. **`leave-unresolved` bypassed the operator guard.** It now requires an
+   explicit run id and the full `apply_guard` identity checks (it needs no
+   writable DB), optionally revalidates read-only that the run is still
+   `launch_unknown`, and writes the enriched audit record only after the guard
+   passes.
+6. **`no-secret-returned` health check could false-PASS.** It now requires a
+   successful curl, HTTP 200, and a non-empty body before scanning; a
+   transport failure, non-200, or empty body is BLOCKED.
+
+These are covered by new strict tests in `tests/test_release_tooling_cli.py`
+(now 83 tests) plus new fixtures.
 
 ## What was wrong (found only by the real read-only Cloud Shell audit)
 
@@ -54,8 +97,9 @@ Cloud Shell inspection surfaced these defects, all now corrected:
 ## Corrective validation (this checkout)
 
 - `pytest -q tests --ignore=MILO-main-original/MILO-main/test_websearch.py`
-  — **468 passed** (includes the 29 permissive release-tooling tests and the
-  44 new strict CLI regression tests in `tests/test_release_tooling_cli.py`).
+  — **507 passed** (includes the 29 permissive release-tooling tests and the
+  83 strict CLI regression tests in `tests/test_release_tooling_cli.py`, which
+  now cover the round-2 blockers as well).
 - `MILO_REQUIRE_PG_TESTS=1 pytest -q tests/test_migrations_postgres.py`
   — **71 passed, 0 skipped** (real ephemeral PostgreSQL).
 - `python scripts/check_migrations.py` — passed.

@@ -32,6 +32,12 @@ Consolidated classification of every major item. Classifications:
 | launch_unknown reconciliation (RETURNING, one-row, audit-after-success) | COMPLETED_IN_CODE | `reconcile-launch-unknown.sh` |
 | Authenticated execution-disabled smoke test | COMPLETED_IN_CODE | `smoke-test-execution-disabled.sh` |
 | Consolidated readiness aggregate (true nested totals) | COMPLETED_IN_CODE | `aggregate_reports.py` |
+| Authenticated ownership read before run-creation probe | COMPLETED_IN_CODE | `smoke-test-execution-disabled.sh` |
+| Secret Manager consumer validation by exact accessor role | COMPLETED_IN_CODE | `check-secret-metadata.sh`, `lib/common.sh` (`iam_role_members`) |
+| Vercel project identity fail-closed (ID/org vs `.vercel/project.json`) | COMPLETED_IN_CODE | `check-vercel-config.sh` |
+| GCP not-found vs permission/API failure classification | COMPLETED_IN_CODE | `check-gcp-resources.sh`, `check-secret-metadata.sh` |
+| Guarded `leave-unresolved` operator decision (identity guard + optional read-only revalidation) | COMPLETED_IN_CODE | `reconcile-launch-unknown.sh` |
+| Fail-closed `no-secret-returned` health check | COMPLETED_IN_CODE | `smoke-test-execution-disabled.sh` |
 | Membership/proposal backfill generators | COMPLETED_IN_CODE (generation) | MIGRATIONS.md |
 | Deployment/rollback command plans, IAM matrix | COMPLETED_IN_CODE (plans) | DEPLOYMENT.md, ROLLBACK.md |
 | Release manifest + schema validation | COMPLETED_IN_CODE | `config/production.example.yaml` |

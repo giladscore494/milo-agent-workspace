@@ -18,12 +18,16 @@ Usage: check-vercel-config.sh [options]
 Read-only. Never deploys and never prints environment-variable values.
 
 Remote inspection uses only supported Vercel CLI syntax:
+  vercel whoami [--scope <team>] [--token <token>]
+  vercel project inspect <project> [--scope <team>] [--token <token>]
   vercel env ls production [--scope <team>] [--token <token>]
 It reads variable NAMES only (the `vercel env ls` value column is always
 masked as "Encrypted"; this tool never even parses that column) and it
 operates against the project LINKED in the inspected directory. Project
-identity is confirmed against --project from the command's own banner so a
-different project is never inspected by accident.
+identity is FAIL-CLOSED: the resolved project ID (and org/team where the CLI
+reports it) from `vercel project inspect` must match the linked
+.vercel/project.json before any variable is inspected; a banner regex alone is
+never sufficient.
 
 Options:
   --project <name>      Exact Vercel project name expected to be linked in
@@ -107,10 +111,23 @@ remote_vercel_inspection() {
 
   # Project identity comes from the linked directory, never from an invented
   # per-command flag. Refuse to inspect an unlinked directory (that would
-  # silently target the wrong — or no — project).
+  # silently target the wrong — or no — project). The local identity source is
+  # .vercel/project.json (projectId + orgId).
   local link_file="${VERCEL_CWD}/.vercel/project.json"
   if [[ ! -f "${link_file}" ]]; then
     record_check BLOCKED "vercel:link" "no linked Vercel project in ${VERCEL_CWD} (.vercel/project.json missing). Prerequisite: run 'vercel link --project ${PROJECT}' in that directory first; this tool refuses to inspect an unlinked project."
+    return 0
+  fi
+  local link_json linked_project_id linked_org_id
+  link_json="$(cat "${link_file}" 2> /dev/null || true)"
+  if ! json_is_valid "${link_json}"; then
+    record_check BLOCKED "vercel:link" "linked project file ${link_file} is not valid JSON; cannot prove project identity (fail closed)."
+    return 0
+  fi
+  linked_project_id="$(json_field "${link_json}" projectId)"
+  linked_org_id="$(json_field "${link_json}" orgId)"
+  if [[ -z "${linked_project_id}" ]]; then
+    record_check BLOCKED "vercel:link" "linked project file ${link_file} has no projectId; cannot prove project identity (fail closed)."
     return 0
   fi
 
@@ -138,6 +155,40 @@ remote_vercel_inspection() {
   fi
   record_check PASS "vercel:auth" "authenticated Vercel session (account scope confirmed; identity value not printed)"
 
+  # Prove the linked project identity against Vercel with a read-only project
+  # inspection. Fail CLOSED: variable checks only run once the resolved project
+  # ID matches the linked .vercel/project.json (and the org/team where the CLI
+  # reports it). A banner regex alone is never sufficient.
+  local inspect_out="${_MILO_TMPDIR}/vercel-project-inspect"
+  local inspect_status=0
+  ( cd "${VERCEL_CWD}" && vercel project inspect "${PROJECT}" "${base_args[@]}" ) > "${inspect_out}" 2>&1 || inspect_status=$?
+  if [[ "${inspect_status}" -ne 0 ]]; then
+    if grep -qiE 'not authorized|forbidden|permission|access denied' "${inspect_out}"; then
+      record_check BLOCKED "vercel:project-identity" "'vercel project inspect ${PROJECT}' was denied (exit ${inspect_status}); the token/scope lacks access. Identity not proven (fail closed)."
+    elif grep -qiE 'not found|does not exist|no such project|could not find' "${inspect_out}"; then
+      record_check BLOCKED "vercel:project-identity" "'vercel project inspect ${PROJECT}' reported the project was not found (exit ${inspect_status}); identity not proven (fail closed)."
+    else
+      record_check BLOCKED "vercel:project-identity" "'vercel project inspect ${PROJECT}' failed (exit ${inspect_status}); identity not proven (fail closed)."
+    fi
+    return 0
+  fi
+  local resolved_project_id resolved_org_id
+  resolved_project_id="$(grep -oE 'prj_[A-Za-z0-9_-]+' "${inspect_out}" | head -n1 || true)"
+  resolved_org_id="$(grep -oE 'team_[A-Za-z0-9_-]+' "${inspect_out}" | head -n1 || true)"
+  if [[ -z "${resolved_project_id}" ]]; then
+    record_check BLOCKED "vercel:project-identity" "could not resolve a project ID from 'vercel project inspect ${PROJECT}' output; identity not proven (fail closed)."
+    return 0
+  fi
+  if [[ "${resolved_project_id}" != "${linked_project_id}" ]]; then
+    record_check BLOCKED "vercel:project-identity" "resolved project ID '${resolved_project_id}' does not match the linked .vercel/project.json projectId '${linked_project_id}'; refusing to inspect a different project."
+    return 0
+  fi
+  if [[ -n "${resolved_org_id}" && -n "${linked_org_id}" && "${resolved_org_id}" != "${linked_org_id}" ]]; then
+    record_check BLOCKED "vercel:project-identity" "resolved org/team '${resolved_org_id}' does not match the linked orgId '${linked_org_id}'; refusing to inspect a project under a different team."
+    return 0
+  fi
+  record_check PASS "vercel:project-identity" "linked project identity proven: projectId ${linked_project_id} matches 'vercel project inspect ${PROJECT}'${resolved_org_id:+ (org ${resolved_org_id})}"
+
   # Supported invocation: `vercel env ls production`. Inspect the PRODUCTION
   # environment specifically. Capture the exit status and output; never
   # discard the exit status and reinterpret failure as an empty result.
@@ -155,22 +206,17 @@ remote_vercel_inspection() {
     return 0
   fi
 
-  # Confirm project identity from the command's own banner so a different
-  # project can never be inspected by accident. Modern Vercel prints a line
-  # such as "> Environment Variables found in Project <name>" or
-  # "found for <team>/<project>".
+  # Secondary guard: identity is already proven above via project inspect vs
+  # .vercel/project.json. If the env-ls banner ALSO names a project, it must
+  # agree; a disagreeing banner is a hard failure. A missing banner is fine —
+  # it never downgrades the proven identity.
   local banner_project=""
   banner_project="$(grep -iE 'environment variables found' "${env_out}" \
     | sed -nE 's/.*[Pp]roject[[:space:]]+"?([A-Za-z0-9._-]+)"?.*/\1/p;s#.*found for[[:space:]]+[A-Za-z0-9._-]+/([A-Za-z0-9._-]+).*#\1#p' \
-    | head -n1)"
+    | head -n1 || true)"
   if [[ -n "${banner_project}" && "${banner_project}" != "${PROJECT}" ]]; then
     record_check BLOCKED "vercel:wrong-project" "'vercel env ls' reported project '${banner_project}' but --project '${PROJECT}' was expected; refusing to inspect a different project."
     return 0
-  fi
-  if [[ -n "${banner_project}" ]]; then
-    record_check PASS "vercel:project" "linked project identity confirmed as '${PROJECT}'"
-  else
-    record_check WARN "vercel:project" "could not confirm the project name from CLI output; verify manually that '${VERCEL_CWD}' is linked to '${PROJECT}'"
   fi
 
   # Parse variable NAMES only. Env-var names are the leading column and match
