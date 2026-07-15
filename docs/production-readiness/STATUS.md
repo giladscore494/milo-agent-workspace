@@ -15,6 +15,32 @@
   round 1 on the same branch/PR (see the follow-up commit; CI reruns on the
   final head before any merge decision).
 
+## Production bootstrap automation (new)
+
+- **Feature branch:** `claude/bootstrap-production-oneshot`
+- **PR:** targets `claude/production-readiness-j0hhni` (does **not** target
+  `main`; not merged).
+- **What:** `scripts/release/bootstrap-production.sh` — a nearly one-command
+  `--plan` / `--apply` / `--audit-only` bootstrap that replaces the manual
+  construction of `milo-production.yaml`, service accounts, Secret Manager
+  resources and per-secret IAM, Vercel production variables, Upstash metadata
+  and Cloud Run identity assignments. Default mode is `--plan` (read-only).
+- **Guarded apply** creates the distinct API/worker/gateway service accounts
+  (never keys), creates Secret Manager resources and adds versions only from
+  hidden input with per-secret accessor grants, discovers/creates a dedicated
+  Upstash production Redis (token stored in Secret Manager, never printed),
+  configures Vercel production variables after fail-closed identity proof,
+  sets the Cloud Run API/worker runtime identities (worker job **never
+  executed**), generates the manifest from live state, and runs the full
+  read-only audit requiring consolidated blocked = 0.
+- **Also added:** `.github/workflows/bootstrap-production.yml`
+  (`workflow_dispatch` only, `production` environment, Workload Identity
+  Federation, redacted artifacts only), `tests/test_bootstrap_production.py`
+  (29 strict tests), and `docs/production-readiness/BOOTSTRAP.md`.
+- **No production mutation or deployment was performed** during
+  implementation or testing; all cloud calls in tests are strictly mocked and
+  Upstash is served by a mock fixture.
+
 ## Round 2 — six final-review blockers corrected
 
 A second review of the corrective PR surfaced six more production-audit

@@ -19,6 +19,7 @@ this set wins and the older document carries an archive banner.
 | [ENVIRONMENT_MATRIX.md](ENVIRONMENT_MATRIX.md) | Every production variable, classified |
 | [MIGRATIONS.md](MIGRATIONS.md) | Migration order, states, backfills |
 | [MANUAL_SERVICE_CONNECTIONS.md](MANUAL_SERVICE_CONNECTIONS.md) | The nine external service connections |
+| [BOOTSTRAP.md](BOOTSTRAP.md) | One-command production bootstrap and audit (`bootstrap-production.sh`) |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Immutable images, deployment order, IAM matrix |
 | [STAGED_ACTIVATION.md](STAGED_ACTIVATION.md) | Stages A–D activation runbook |
 | [SMOKE_TESTING.md](SMOKE_TESTING.md) | Read-only and execution-disabled smoke tests |

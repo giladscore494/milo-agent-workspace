@@ -1,0 +1,157 @@
+name: Bootstrap Production
+
+# Manually triggered ONLY. Never runs on push or pull_request. The plan job is
+# always available and fully read-only. The apply job additionally requires an
+# explicit typed confirmation input AND GitHub Environment `production`
+# approval, authenticates to Google Cloud through Workload Identity Federation
+# (no service-account JSON keys), and uploads only redacted reports.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Bootstrap mode"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - plan
+          - apply
+      apply_confirmation:
+        description: "For apply mode, type exactly: I_UNDERSTAND_THIS_CHANGES_PRODUCTION"
+        required: false
+        type: string
+      deploy_vercel:
+        description: "Deploy Vercel too (still requires apply + confirmation). Default false."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write   # required for Workload Identity Federation (OIDC)
+
+concurrency:
+  group: bootstrap-production
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan (read-only)
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          # WIF only — never a service-account key.
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}
+
+      - name: Set up gcloud
+        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Run bootstrap plan (read-only)
+        shell: bash
+        env:
+          # Secret INPUT is passed by env-var NAME only; values come from the
+          # `production` environment's secrets and are never echoed.
+          MILO_SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MILO_UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
+          MILO_UPSTASH_APIKEY: ${{ secrets.UPSTASH_API_KEY }}
+          MILO_VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bootstrap-out"
+          bash scripts/release/bootstrap-production.sh --plan \
+            --output-directory "${RUNNER_TEMP}/bootstrap-out" \
+            --expected-account "${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}" \
+            --supabase-key-env MILO_SUPABASE_KEY \
+            --upstash-email-env MILO_UPSTASH_EMAIL \
+            --upstash-apikey-env MILO_UPSTASH_APIKEY \
+            --vercel-token-env MILO_VERCEL_TOKEN
+
+      - name: Upload redacted plan reports (never secret files)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-plan-reports
+          path: |
+            ${{ runner.temp }}/bootstrap-out/bootstrap-plan.json
+            ${{ runner.temp }}/bootstrap-out/readiness.json
+            ${{ runner.temp }}/bootstrap-out/readiness.log
+          if-no-files-found: warn
+
+  apply:
+    name: Apply (guarded)
+    if: ${{ github.event.inputs.mode == 'apply' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate apply confirmation
+        if: ${{ github.event.inputs.apply_confirmation != 'I_UNDERSTAND_THIS_CHANGES_PRODUCTION' }}
+        run: |
+          echo "Apply requires apply_confirmation == I_UNDERSTAND_THIS_CHANGES_PRODUCTION."
+          echo "No production changes were made."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Run guarded bootstrap apply
+        shell: bash
+        env:
+          MILO_OPERATOR_ACK: I_UNDERSTAND_THIS_CHANGES_PRODUCTION
+          MILO_SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          MILO_PROVIDER_KEY: ${{ secrets.PROVIDER_API_KEY }}
+          MILO_UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
+          MILO_UPSTASH_APIKEY: ${{ secrets.UPSTASH_API_KEY }}
+          MILO_VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bootstrap-out"
+          deploy_flag=""
+          if [ "${{ github.event.inputs.deploy_vercel }}" = "true" ]; then
+            deploy_flag="--deploy-vercel"
+          fi
+          bash scripts/release/bootstrap-production.sh --apply \
+            --environment production \
+            --confirm-production-change \
+            --release-sha "${GITHUB_SHA}" \
+            --output-directory "${RUNNER_TEMP}/bootstrap-out" \
+            --expected-account "${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}" \
+            --supabase-key-env MILO_SUPABASE_KEY \
+            --provider-key-env MILO_PROVIDER_KEY \
+            --upstash-email-env MILO_UPSTASH_EMAIL \
+            --upstash-apikey-env MILO_UPSTASH_APIKEY \
+            --vercel-token-env MILO_VERCEL_TOKEN \
+            ${deploy_flag}
+
+      - name: Upload redacted apply reports (never secret files)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-apply-reports
+          path: |
+            ${{ runner.temp }}/bootstrap-out/bootstrap-apply.json
+            ${{ runner.temp }}/bootstrap-out/readiness.json
+            ${{ runner.temp }}/bootstrap-out/readiness.log
+          if-no-files-found: warn
