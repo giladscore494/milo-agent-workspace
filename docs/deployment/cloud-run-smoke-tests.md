@@ -1,3 +1,5 @@
+> **ARCHIVED (historical).** This document predates Phases 1–11 and may contain stale claims (e.g. in-memory rate limiting, pre-gateway auth, earlier migration coverage). The authoritative, current documentation is [`docs/production-readiness/`](../production-readiness/README.md). Where this file contradicts that set, that set wins.
+
 # Private Cloud Run smoke tests
 
 These smoke tests are manual and read-only. They assume the Cloud Run API remains private and that the operator has an identity authorized to invoke the service.

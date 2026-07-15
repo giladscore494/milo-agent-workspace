@@ -1,3 +1,5 @@
+> **ARCHIVED (historical).** This document predates Phases 1–11 and may contain stale claims (e.g. in-memory rate limiting, pre-gateway auth, earlier migration coverage). The authoritative, current documentation is [`docs/production-readiness/`](../production-readiness/README.md). Where this file contradicts that set, that set wins.
+
 # Stage 10 production deployment and rollback runbook
 
 This repository now treats the browser as a control plane only: the API persists a queued run, invokes a private Cloud Run Job with `RUN_ID`, and returns immediately. The worker claims the durable run, heartbeats its lease, resumes from checkpoints, writes events/messages/tasks, and marks final status.
