@@ -4,12 +4,15 @@
   a live read-only Google Cloud Shell inspection exposed production-operator
   defects that the mocked Phase 9–11 CI did not catch.
 - **Corrective branch:** `claude/fix-operator-tooling-audit-ry0s6f`
-- **Corrective PR:** #__PR__ (base: `claude/production-readiness-j0hhni`;
-  does **not** target `main`).
+- **Corrective PR:**
+  [#33](https://github.com/giladscore494/milo-agent-workspace/pull/33)
+  (base: `claude/production-readiness-j0hhni`; does **not** target `main`).
 - **Base:** `claude/production-readiness-j0hhni` at
   `2df9e74a910ec47d30910933f3bf2837237392f9` (the merge commit of PR #31,
   "Phases 9–11 operator tooling …").
-- **Corrective head SHA:** `__HEAD_SHA__`.
+- **Corrective head SHA:** `77b7ee525bf4b0560b8a61c57c8f8d2af79236b9`
+  (this STATUS update commits atop it; CI reruns on the final head before any
+  merge decision).
 
 ## What was wrong (found only by the real read-only Cloud Shell audit)
 
