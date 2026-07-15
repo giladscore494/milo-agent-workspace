@@ -1,3 +1,5 @@
+> **ARCHIVED (historical).** This document predates Phases 1–11 and may contain stale claims (e.g. in-memory rate limiting, pre-gateway auth, earlier migration coverage). The authoritative, current documentation is [`docs/production-readiness/`](../production-readiness/README.md). Where this file contradicts that set, that set wins.
+
 # Cloud Run production deployment notes
 
 This document describes the production Cloud Run deployment flow and the remaining frontend gateway requirement. It is intentionally operational documentation only; do not deploy from automated agent environments.
