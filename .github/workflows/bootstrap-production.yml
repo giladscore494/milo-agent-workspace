@@ -3,15 +3,22 @@ name: Bootstrap Production
 # Manually triggered ONLY. Never runs on push or pull_request. The plan job is
 # always available and fully read-only. The apply job additionally requires an
 # explicit typed confirmation input AND GitHub Environment `production`
-# approval, authenticates to Google Cloud through Workload Identity Federation
-# (no service-account JSON keys), and uploads only redacted reports.
+# approval.
 #
-# The bootstrap ADOPTS the operator's EXISTING Secret Manager resources
-# (SUPABASE_URL, SUPABASE_SECRET_KEY, KIMI_API_KEY, UPSTASH_REDIS_REST_TOKEN).
-# It therefore does NOT require those Supabase/provider values to be duplicated
-# as GitHub Environment secrets — GCP runtime services reference Secret Manager
-# directly. Only the Upstash management credentials and Vercel token (which are
-# NOT in Secret Manager) are supplied as GitHub secrets.
+# Two DISTINCT trust chains, kept clearly separate:
+#   * GitHub Actions -> GCP  : authenticates THIS workflow (Workload Identity
+#     Federation; no service-account keys). Vars: GITHUB_WIF_PROVIDER_RESOURCE,
+#     GITHUB_BOOTSTRAP_OPERATOR_SA.
+#   * Vercel -> GCP          : the production gateway's federation, verified by
+#     the bootstrap. Vars: VERCEL_WIF_* (pool/provider/issuer/audience/
+#     attribute-condition/principal-set).
+#
+# The bootstrap ADOPTS the operator's existing Secret Manager resources
+# (SUPABASE_URL, SUPABASE_SECRET_KEY, KIMI_API_KEY, UPSTASH_REDIS_REST_TOKEN);
+# those Supabase/provider values are never duplicated as GitHub secrets. Vercel
+# identity uses the supported CI mechanism (VERCEL_TOKEN / VERCEL_ORG_ID /
+# VERCEL_PROJECT_ID in the environment) — no committed .vercel/project.json,
+# and the token is never on the command line.
 on:
   workflow_dispatch:
     inputs:
@@ -30,11 +37,16 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # required for Workload Identity Federation (OIDC)
+  id-token: write   # required for GitHub -> GCP Workload Identity Federation
 
 concurrency:
   group: bootstrap-production
   cancel-in-progress: false
+
+env:
+  # Vercel CLI is pinned to an EXACT numeric version (never @latest). This
+  # version supports `vercel env update` (used for idempotent in-place updates).
+  VERCEL_CLI_VERSION: "39.3.0"
 
 jobs:
   plan:
@@ -46,37 +58,56 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install pinned Vercel CLI
+        run: npm install -g "vercel@${VERCEL_CLI_VERSION}"
 
       - name: Authenticate to Google Cloud via Workload Identity Federation
-        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+        if: ${{ vars.GITHUB_WIF_PROVIDER_RESOURCE != '' }}
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}
-
+          workload_identity_provider: ${{ vars.GITHUB_WIF_PROVIDER_RESOURCE }}
+          service_account: ${{ vars.GITHUB_BOOTSTRAP_OPERATOR_SA }}
       - name: Set up gcloud
-        if: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' }}
+        if: ${{ vars.GITHUB_WIF_PROVIDER_RESOURCE != '' }}
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Run bootstrap plan (read-only)
         shell: bash
         env:
-          # Only NON-Secret-Manager management creds are supplied. Supabase /
-          # provider values are ADOPTED from Secret Manager and never passed.
+          # Only NON-Secret-Manager management creds. Vercel identity via env.
           MILO_UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
           MILO_UPSTASH_APIKEY: ${{ secrets.UPSTASH_API_KEY }}
-          MILO_VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          VERCEL_WIF_POOL_ID: ${{ vars.VERCEL_WIF_POOL_ID }}
+          VERCEL_WIF_PROVIDER_ID: ${{ vars.VERCEL_WIF_PROVIDER_ID }}
+          VERCEL_WIF_ISSUER: ${{ vars.VERCEL_WIF_ISSUER }}
+          VERCEL_WIF_ALLOWED_AUDIENCE: ${{ vars.VERCEL_WIF_ALLOWED_AUDIENCE }}
+          VERCEL_WIF_ATTRIBUTE_CONDITION: ${{ vars.VERCEL_WIF_ATTRIBUTE_CONDITION }}
+          VERCEL_WIF_PRINCIPAL_SET: ${{ vars.VERCEL_WIF_PRINCIPAL_SET }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/bootstrap-out"
+          # VERCEL_TOKEN reaches the bootstrap by NAME only (never argv).
+          wif_args=()
+          [[ -n "${VERCEL_WIF_POOL_ID:-}" ]] && wif_args+=(--wif-pool "${VERCEL_WIF_POOL_ID}")
+          [[ -n "${VERCEL_WIF_PROVIDER_ID:-}" ]] && wif_args+=(--wif-provider "${VERCEL_WIF_PROVIDER_ID}")
+          [[ -n "${VERCEL_WIF_ISSUER:-}" ]] && wif_args+=(--wif-issuer "${VERCEL_WIF_ISSUER}")
+          [[ -n "${VERCEL_WIF_ALLOWED_AUDIENCE:-}" ]] && wif_args+=(--wif-audience "${VERCEL_WIF_ALLOWED_AUDIENCE}")
+          [[ -n "${VERCEL_WIF_ATTRIBUTE_CONDITION:-}" ]] && wif_args+=(--wif-attribute-condition "${VERCEL_WIF_ATTRIBUTE_CONDITION}")
+          [[ -n "${VERCEL_WIF_PRINCIPAL_SET:-}" ]] && wif_args+=(--wif-principal-set "${VERCEL_WIF_PRINCIPAL_SET}")
           bash scripts/release/bootstrap-production.sh --plan \
             --output-directory "${RUNNER_TEMP}/bootstrap-out" \
-            --expected-account "${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}" \
-            ${WIF_POOL:+--wif-pool "$WIF_POOL"} ${WIF_PROVIDER:+--wif-provider "$WIF_PROVIDER"} \
+            --expected-account "${{ vars.GITHUB_BOOTSTRAP_OPERATOR_SA }}" \
+            --vercel-token-env VERCEL_TOKEN \
             --upstash-email-env MILO_UPSTASH_EMAIL \
             --upstash-apikey-env MILO_UPSTASH_APIKEY \
-            --vercel-token-env MILO_VERCEL_TOKEN
-        # Resource-name overrides / WIF ids may be supplied as plain repo vars.
+            "${wif_args[@]}"
+
       - name: Upload redacted plan reports (never secret files)
         uses: actions/upload-artifact@v4
         with:
@@ -104,13 +135,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install pinned Vercel CLI
+        run: npm install -g "vercel@${VERCEL_CLI_VERSION}"
 
       - name: Authenticate to Google Cloud via Workload Identity Federation
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}
-
+          workload_identity_provider: ${{ vars.GITHUB_WIF_PROVIDER_RESOURCE }}
+          service_account: ${{ vars.GITHUB_BOOTSTRAP_OPERATOR_SA }}
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2
 
@@ -118,26 +153,38 @@ jobs:
         shell: bash
         env:
           MILO_OPERATOR_ACK: I_UNDERSTAND_THIS_CHANGES_PRODUCTION
-          # No SUPABASE_SERVICE_ROLE_KEY / PROVIDER_API_KEY here: those already
-          # exist in Google Secret Manager and are adopted, not duplicated.
+          # No SUPABASE_SERVICE_ROLE_KEY / PROVIDER_API_KEY: adopted from GSM.
           MILO_UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
           MILO_UPSTASH_APIKEY: ${{ secrets.UPSTASH_API_KEY }}
-          MILO_VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          WIF_POOL: ${{ vars.GCP_WORKLOAD_IDENTITY_POOL_ID }}
-          WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          VERCEL_WIF_POOL_ID: ${{ vars.VERCEL_WIF_POOL_ID }}
+          VERCEL_WIF_PROVIDER_ID: ${{ vars.VERCEL_WIF_PROVIDER_ID }}
+          VERCEL_WIF_ISSUER: ${{ vars.VERCEL_WIF_ISSUER }}
+          VERCEL_WIF_ALLOWED_AUDIENCE: ${{ vars.VERCEL_WIF_ALLOWED_AUDIENCE }}
+          VERCEL_WIF_ATTRIBUTE_CONDITION: ${{ vars.VERCEL_WIF_ATTRIBUTE_CONDITION }}
+          VERCEL_WIF_PRINCIPAL_SET: ${{ vars.VERCEL_WIF_PRINCIPAL_SET }}
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/bootstrap-out"
+          wif_args=()
+          [[ -n "${VERCEL_WIF_POOL_ID:-}" ]] && wif_args+=(--wif-pool "${VERCEL_WIF_POOL_ID}")
+          [[ -n "${VERCEL_WIF_PROVIDER_ID:-}" ]] && wif_args+=(--wif-provider "${VERCEL_WIF_PROVIDER_ID}")
+          [[ -n "${VERCEL_WIF_ISSUER:-}" ]] && wif_args+=(--wif-issuer "${VERCEL_WIF_ISSUER}")
+          [[ -n "${VERCEL_WIF_ALLOWED_AUDIENCE:-}" ]] && wif_args+=(--wif-audience "${VERCEL_WIF_ALLOWED_AUDIENCE}")
+          [[ -n "${VERCEL_WIF_ATTRIBUTE_CONDITION:-}" ]] && wif_args+=(--wif-attribute-condition "${VERCEL_WIF_ATTRIBUTE_CONDITION}")
+          [[ -n "${VERCEL_WIF_PRINCIPAL_SET:-}" ]] && wif_args+=(--wif-principal-set "${VERCEL_WIF_PRINCIPAL_SET}")
           bash scripts/release/bootstrap-production.sh --apply \
             --environment production \
             --confirm-production-change \
             --release-sha "${GITHUB_SHA}" \
             --output-directory "${RUNNER_TEMP}/bootstrap-out" \
-            --expected-account "${{ vars.GCP_BOOTSTRAP_OPERATOR_SA }}" \
-            ${WIF_POOL:+--wif-pool "$WIF_POOL"} ${WIF_PROVIDER:+--wif-provider "$WIF_PROVIDER"} \
+            --expected-account "${{ vars.GITHUB_BOOTSTRAP_OPERATOR_SA }}" \
+            --vercel-token-env VERCEL_TOKEN \
             --upstash-email-env MILO_UPSTASH_EMAIL \
             --upstash-apikey-env MILO_UPSTASH_APIKEY \
-            --vercel-token-env MILO_VERCEL_TOKEN
+            "${wif_args[@]}"
 
       - name: Upload redacted apply reports (never secret files)
         if: ${{ always() }}

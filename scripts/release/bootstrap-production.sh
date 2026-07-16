@@ -59,6 +59,12 @@ DEF_SECRET_SUPABASE_KEY="SUPABASE_SECRET_KEY"
 DEF_SECRET_PROVIDER="KIMI_API_KEY"
 DEF_SECRET_REDIS="UPSTASH_REDIS_REST_TOKEN"
 
+# Upstash production database defaults (official Developer API contract).
+DEF_UPSTASH_DB_NAME="milo-production"
+DEF_UPSTASH_PLATFORM="gcp"
+DEF_UPSTASH_PRIMARY_REGION="us-central1"
+DEF_UPSTASH_PLAN="payg"      # explicit safe plan; eviction disabled; TLS on
+
 # Stage-A budget caps (nonzero). Conservative defaults; override with flags.
 DEF_BUDGET_MAX_COST_PER_RUN="0.50"
 DEF_BUDGET_DAILY_USER="2"
@@ -152,7 +158,16 @@ SECRET_NAME_SUPABASE_URL="${DEF_SECRET_SUPABASE_URL}"
 SECRET_NAME_SUPABASE_KEY="${DEF_SECRET_SUPABASE_KEY}"
 SECRET_NAME_PROVIDER="${DEF_SECRET_PROVIDER}"
 SECRET_NAME_REDIS="${DEF_SECRET_REDIS}"
-WIF_POOL="" WIF_PROVIDER=""
+# Vercel -> GCP gateway federation chain (distinct from the GitHub -> GCP
+# bootstrap-auth chain, which lives only in the workflow env). Exact expected
+# values, verified live; the principalSet is never guessed.
+WIF_POOL="" WIF_PROVIDER="" WIF_ISSUER="" WIF_AUDIENCE="" WIF_ATTRIBUTE_CONDITION="" WIF_PRINCIPAL_SET=""
+# Vercel project identity comes from exact IDs (supported CI mechanism), not a
+# committed .vercel/project.json. Values may also come from the environment.
+VERCEL_PROJECT_ID="${VERCEL_PROJECT_ID:-}" VERCEL_ORG_ID="${VERCEL_ORG_ID:-}"
+# Upstash selection / create parameters.
+UPSTASH_DB_NAME="${DEF_UPSTASH_DB_NAME}" UPSTASH_DB_ID="" UPSTASH_PLATFORM="${DEF_UPSTASH_PLATFORM}"
+UPSTASH_PRIMARY_REGION="${DEF_UPSTASH_PRIMARY_REGION}"
 SUPABASE_URL_ENV="" SUPABASE_KEY_ENV="" PROVIDER_KEY_ENV="" UPSTASH_EMAIL_ENV="" UPSTASH_APIKEY_ENV=""
 VERCEL_TOKEN_ENV="" DATABASE_URL_ENV="" PROMPT_SECRETS=0
 APPLY_MODE=0 APPLY_ENVIRONMENT="" CONFIRM_PRODUCTION_CHANGE=0
@@ -185,6 +200,16 @@ while [[ $# -gt 0 ]]; do
     --redis-token-secret) SECRET_NAME_REDIS="${2:?}"; shift 2 ;;
     --wif-pool) WIF_POOL="${2:?}"; shift 2 ;;
     --wif-provider) WIF_PROVIDER="${2:?}"; shift 2 ;;
+    --wif-issuer) WIF_ISSUER="${2:?}"; shift 2 ;;
+    --wif-audience) WIF_AUDIENCE="${2:?}"; shift 2 ;;
+    --wif-attribute-condition) WIF_ATTRIBUTE_CONDITION="${2:?}"; shift 2 ;;
+    --wif-principal-set) WIF_PRINCIPAL_SET="${2:?}"; shift 2 ;;
+    --vercel-project-id) VERCEL_PROJECT_ID="${2:?}"; shift 2 ;;
+    --vercel-org-id) VERCEL_ORG_ID="${2:?}"; shift 2 ;;
+    --upstash-database-name) UPSTASH_DB_NAME="${2:?}"; shift 2 ;;
+    --upstash-database-id) UPSTASH_DB_ID="${2:?}"; shift 2 ;;
+    --upstash-platform) UPSTASH_PLATFORM="${2:?}"; shift 2 ;;
+    --upstash-primary-region) UPSTASH_PRIMARY_REGION="${2:?}"; shift 2 ;;
     --supabase-url-env) SUPABASE_URL_ENV="${2:?}"; shift 2 ;;
     --supabase-key-env) SUPABASE_KEY_ENV="${2:?}"; shift 2 ;;
     --provider-key-env) PROVIDER_KEY_ENV="${2:?}"; shift 2 ;;
@@ -481,11 +506,15 @@ gcp_configure_api() {
     "MILO_APPROVED_WORKER_IDENTITIES=${WORKER_SA}"
   )
   [[ -n "${UPSTASH_REST_URL}" ]] && env_pairs+=("UPSTASH_REDIS_REST_URL=${UPSTASH_REST_URL}")
+  # Non-secret Redis consistency metadata for the audit.
+  [[ -n "${REDIS_DB_ID}" ]] && env_pairs+=("MILO_REDIS_DB_ID=${REDIS_DB_ID}")
+  [[ -n "${REDIS_TOKEN_FINGERPRINT}" ]] && env_pairs+=("MILO_REDIS_TOKEN_FINGERPRINT=${REDIS_TOKEN_FINGERPRINT}")
+  [[ -n "${REDIS_SECRET_VERSION}" ]] && env_pairs+=("MILO_REDIS_SECRET_VERSION=${REDIS_SECRET_VERSION}")
   local secrets_spec
   secrets_spec="$(join_by , \
     "SUPABASE_URL=${SECRET_NAME_SUPABASE_URL}:latest" \
     "SUPABASE_SECRET_KEY=${SECRET_NAME_SUPABASE_KEY}:latest" \
-    "UPSTASH_REDIS_REST_TOKEN=${SECRET_NAME_REDIS}:latest")"
+    "UPSTASH_REDIS_REST_TOKEN=${SECRET_NAME_REDIS}:${REDIS_SECRET_VERSION:-latest}")"
   local env_spec; env_spec="$(join_by , "${env_pairs[@]}")"
   local err rc=0
   err="$(gcloud run services update "${API_SERVICE}" --project "${EXPECTED_PROJECT}" --region "${REGION}" \
@@ -515,12 +544,15 @@ gcp_configure_worker() {
     "MILO_APPROVED_WORKER_IDENTITIES=${WORKER_SA}"
   )
   [[ -n "${UPSTASH_REST_URL}" ]] && env_pairs+=("UPSTASH_REDIS_REST_URL=${UPSTASH_REST_URL}")
+  [[ -n "${REDIS_DB_ID}" ]] && env_pairs+=("MILO_REDIS_DB_ID=${REDIS_DB_ID}")
+  [[ -n "${REDIS_TOKEN_FINGERPRINT}" ]] && env_pairs+=("MILO_REDIS_TOKEN_FINGERPRINT=${REDIS_TOKEN_FINGERPRINT}")
+  [[ -n "${REDIS_SECRET_VERSION}" ]] && env_pairs+=("MILO_REDIS_SECRET_VERSION=${REDIS_SECRET_VERSION}")
   local secrets_spec
   secrets_spec="$(join_by , \
     "SUPABASE_URL=${SECRET_NAME_SUPABASE_URL}:latest" \
     "SUPABASE_SECRET_KEY=${SECRET_NAME_SUPABASE_KEY}:latest" \
     "KIMI_API_KEY=${SECRET_NAME_PROVIDER}:latest" \
-    "UPSTASH_REDIS_REST_TOKEN=${SECRET_NAME_REDIS}:latest")"
+    "UPSTASH_REDIS_REST_TOKEN=${SECRET_NAME_REDIS}:${REDIS_SECRET_VERSION:-latest}")"
   local env_spec; env_spec="$(join_by , "${env_pairs[@]}")"
   local err rc=0
   err="$(gcloud run jobs update "${WORKER_JOB}" --project "${EXPECTED_PROJECT}" --region "${REGION}" \
@@ -540,62 +572,90 @@ gcp_configure_worker() {
   recovery_step "grant run.jobs.update and re-run --apply"; mark_failed; return 1
 }
 
-# gcp_verify_federation — verify/adopt the Vercel->GCP Workload Identity chain.
+# gcp_verify_federation — EXACT verification of the Vercel->GCP Workload
+# Identity chain. All of pool/provider/issuer/audience/attribute-condition/
+# principal-set must be supplied together; a partial set is BLOCKED (never a
+# guessed principalSet). run.invoker (gateway SA on the API service) is
+# verified/bound independently because its member is unambiguous.
 gcp_verify_federation() {
-  if [[ -z "${WIF_POOL}" || -z "${WIF_PROVIDER}" ]]; then
-    record_check MANUAL "wif" "supply --wif-pool and --wif-provider to verify/adopt the Vercel->GCP Workload Identity Federation chain (pool, provider, issuer, audience, gateway binding, run.invoker)"
+  local supplied=0
+  for v in "${WIF_POOL}" "${WIF_PROVIDER}" "${WIF_ISSUER}" "${WIF_AUDIENCE}" "${WIF_ATTRIBUTE_CONDITION}" "${WIF_PRINCIPAL_SET}"; do
+    [[ -n "${v}" ]] && supplied=$((supplied + 1))
+  done
+  if [[ "${supplied}" -eq 0 ]]; then
+    record_check MANUAL "wif" "supply the Vercel gateway federation inputs (--wif-pool/--wif-provider/--wif-issuer/--wif-audience/--wif-attribute-condition/--wif-principal-set) to verify the chain; not verified means NOT ready"
+    gcp_ensure_run_invoker
     return 0
   fi
+  if [[ "${supplied}" -lt 6 ]]; then
+    record_check BLOCKED "wif:partial" "partial Vercel WIF configuration supplied (${supplied}/6); all of pool/provider/issuer/audience/attribute-condition/principal-set are required together (the principalSet is never guessed)"
+    gcp_ensure_run_invoker
+    return 0
+  fi
+
+  milo_tmpdir_init
   local perr rc=0
   perr="$(gcloud iam workload-identity-pools describe "${WIF_POOL}" --project "${EXPECTED_PROJECT}" --location global --format 'value(name)' 2>&1 1> /dev/null)" || rc=$?
   if [[ "${rc}" -ne 0 ]]; then
-    if grep -qiE 'not.?found|does not exist' <<< "${perr}"; then record_check BLOCKED "wif:pool" "Workload Identity Pool ${WIF_POOL} not found; create it under the apply guard or supply the correct id"
+    if grep -qiE 'not.?found|does not exist' <<< "${perr}"; then record_check BLOCKED "wif:pool" "Workload Identity Pool ${WIF_POOL} not found"
     else record_check MANUAL "wif:pool" "could not inspect WIF pool ${WIF_POOL} (permission/API error); verify manually"; fi
   else
-    record_check PASS "wif:pool" "adopted existing Workload Identity Pool ${WIF_POOL}"
+    record_check PASS "wif:pool" "Workload Identity Pool ${WIF_POOL} exists"
   fi
-  local prc=0 pjson
-  pjson="$(gcloud iam workload-identity-pools providers describe "${WIF_PROVIDER}" --project "${EXPECTED_PROJECT}" --location global --workload-identity-pool "${WIF_POOL}" --format json 2> /dev/null)" || prc=$?
-  if [[ "${prc}" -ne 0 ]] || ! json_is_valid "${pjson}"; then
-    record_check MANUAL "wif:provider" "could not inspect WIF provider ${WIF_PROVIDER}; verify issuer/audience/attribute-condition manually"
-  else
-    local issuer; issuer="$(json_field "${pjson}" 'oidc.issuerUri')"
-    if [[ -n "${issuer}" ]]; then record_check PASS "wif:provider" "adopted WIF provider ${WIF_PROVIDER} (issuer present)"
-    else record_check WARN "wif:provider" "WIF provider ${WIF_PROVIDER} has no OIDC issuer URI; verify the federation configuration"; fi
-  fi
-  # Gateway SA must hold a workloadIdentityUser binding (member principalSet is
-  # provider-specific and cannot be safely synthesized here — verify only).
-  local grc=0 gpolicy
-  gpolicy="$(gcloud iam service-accounts get-iam-policy "${GATEWAY_SA}" --project "${EXPECTED_PROJECT}" --format json 2> /dev/null)" || grc=$?
-  if [[ "${grc}" -ne 0 ]] || ! json_is_valid "${gpolicy}"; then
-    record_check MANUAL "wif:gateway-binding" "could not read the gateway SA IAM policy; verify the roles/iam.workloadIdentityUser binding manually"
-  elif [[ -n "$(iam_role_members "${gpolicy}" "roles/iam.workloadIdentityUser")" ]]; then
-    record_check PASS "wif:gateway-binding" "gateway SA holds roles/iam.workloadIdentityUser (federation binding present)"
-  else
-    record_check BLOCKED "wif:gateway-binding" "gateway SA ${GATEWAY_SA} has no roles/iam.workloadIdentityUser binding; bind the Vercel principalSet manually (member is provider-specific)"
-    recovery_step "gcloud iam service-accounts add-iam-policy-binding ${GATEWAY_SA} --role roles/iam.workloadIdentityUser --member principalSet://iam.googleapis.com/<pool>/<attribute> (provider-specific)"
-  fi
-  # run.invoker for the gateway SA on the API service (this member IS safe to
-  # construct: exactly the gateway SA, never allUsers).
+
+  local pjson gjson rjson
+  pjson="$(gcloud iam workload-identity-pools providers describe "${WIF_PROVIDER}" --project "${EXPECTED_PROJECT}" --location global --workload-identity-pool "${WIF_POOL}" --format json 2> /dev/null || true)"
+  gjson="$(gcloud iam service-accounts get-iam-policy "${GATEWAY_SA}" --project "${EXPECTED_PROJECT}" --format json 2> /dev/null || true)"
+  rjson="$(gcloud run services get-iam-policy "${API_SERVICE}" --project "${EXPECTED_PROJECT}" --region "${REGION}" --format json 2> /dev/null || true)"
+  json_is_valid "${pjson}" || pjson=""
+  json_is_valid "${gjson}" || gjson=""
+  json_is_valid "${rjson}" || rjson=""
+  if [[ -z "${pjson}" ]]; then record_check MANUAL "wif:provider" "could not inspect WIF provider ${WIF_PROVIDER}; verify issuer/audience/attribute-condition manually"; fi
+  if [[ -z "${gjson}" ]]; then record_check MANUAL "wif:gateway-binding" "could not read the gateway SA IAM policy; verify the workloadIdentityUser principalSet manually"; fi
+
+  local status name detail
+  while IFS='|' read -r status name detail; do
+    [[ -z "${status}" ]] && continue
+    record_check "${status}" "${name}" "${detail}"
+    [[ "${status}" == "BLOCKED" ]] && mark_failed
+  done < <(python3 "${SCRIPT_DIR}/verify_wif.py" \
+    --provider-json "${pjson}" --gateway-policy-json "${gjson}" \
+    --expected-issuer "${WIF_ISSUER}" --expected-audience "${WIF_AUDIENCE}" \
+    --expected-attribute-condition "${WIF_ATTRIBUTE_CONDITION}" \
+    --expected-principal-set "${WIF_PRINCIPAL_SET}" --gateway-sa "${GATEWAY_SA}" 2> /dev/null)
+
+  # Bind/verify run.invoker (member is unambiguous: exactly the gateway SA).
   gcp_ensure_run_invoker
   return 0
 }
 
+# gcp_ensure_run_invoker — the API service must grant run.invoker to EXACTLY
+# the gateway SA: no allUsers/allAuthenticatedUsers, no unrelated members.
 gcp_ensure_run_invoker() {
-  local rc=0 policy
+  local rc=0 policy members expected="serviceAccount:${GATEWAY_SA}"
   policy="$(gcloud run services get-iam-policy "${API_SERVICE}" --project "${EXPECTED_PROJECT}" --region "${REGION}" --format json 2> /dev/null)" || rc=$?
-  if [[ "${rc}" -eq 0 ]] && json_is_valid "${policy}" && grep -qxF "serviceAccount:${GATEWAY_SA}" <<< "$(iam_role_members "${policy}" "roles/run.invoker")"; then
-    record_check PASS "wif:run-invoker" "gateway SA already holds roles/run.invoker on ${API_SERVICE} (adopted)"
-    return 0
+  if [[ "${rc}" -eq 0 ]] && json_is_valid "${policy}"; then
+    members="$(iam_role_members "${policy}" "roles/run.invoker")"
+    if grep -qxE 'allUsers|allAuthenticatedUsers' <<< "${members}"; then
+      record_check BLOCKED "wif:run-invoker" "API service grants run.invoker to a broad principal (allUsers/allAuthenticatedUsers); it must stay private"; mark_failed; return 1
+    fi
+    local extra; extra="$(grep -vxF "${expected}" <<< "${members}" | grep -c . || true)"
+    if grep -qxF "${expected}" <<< "${members}" && [[ "${extra}" -eq 0 ]]; then
+      record_check PASS "wif:run-invoker" "run.invoker on ${API_SERVICE} is exactly the gateway SA (adopted; no broad/unrelated members)"
+      return 0
+    fi
+    if [[ -n "${members}" && "${extra}" -gt 0 ]]; then
+      record_check BLOCKED "wif:run-invoker" "run.invoker on ${API_SERVICE} contains unrelated member(s) besides the gateway SA; refusing to claim readiness"; mark_failed; return 1
+    fi
   fi
   if [[ "${MODE}" != "apply" ]]; then
-    record_check WARN "wif:run-invoker" "gateway SA does not (yet) hold roles/run.invoker on ${API_SERVICE}; apply will bind it (gateway SA only, never allUsers)"
-    plan_action "bind roles/run.invoker on ${API_SERVICE} to the gateway SA ${GATEWAY_SA}"
+    record_check WARN "wif:run-invoker" "gateway SA does not (yet) hold roles/run.invoker on ${API_SERVICE}; apply will bind exactly it (never allUsers)"
+    plan_action "bind roles/run.invoker on ${API_SERVICE} to exactly the gateway SA ${GATEWAY_SA}"
     return 0
   fi
   if gcloud run services add-iam-policy-binding "${API_SERVICE}" --project "${EXPECTED_PROJECT}" --region "${REGION}" \
-      --member "serviceAccount:${GATEWAY_SA}" --role roles/run.invoker 1> /dev/null 2>&1; then
-    applied_action "bound roles/run.invoker on ${API_SERVICE} to gateway SA ${GATEWAY_SA} (never allUsers)"
+      --member "${expected}" --role roles/run.invoker 1> /dev/null 2>&1; then
+    applied_action "bound roles/run.invoker on ${API_SERVICE} to exactly gateway SA ${GATEWAY_SA} (never allUsers)"
     record_check PASS "wif:run-invoker" "gateway SA now holds roles/run.invoker on ${API_SERVICE}"
     return 0
   fi
@@ -612,7 +672,10 @@ gcp_apply() {
   gcp_adopt_secret "supabase-url" "${SECRET_NAME_SUPABASE_URL}" SECRET_SUPABASE_URL || true
   gcp_adopt_secret "supabase-key" "${SECRET_NAME_SUPABASE_KEY}" SECRET_SUPABASE_KEY || true
   gcp_adopt_secret "provider-key" "${SECRET_NAME_PROVIDER}" SECRET_PROVIDER || true
-  gcp_adopt_secret "redis-token" "${SECRET_NAME_REDIS}" SECRET_UPSTASH_REST_TOKEN || true
+  # The Redis token is a cross-provider consistency transaction, not a generic
+  # adopt: reconcile the selected Upstash token against the live Secret Manager
+  # version and pin the EXACT numeric version.
+  redis_reconcile || true
 
   # Per-secret accessor grants for the single intended consumers only.
   gcp_grant_secret_accessor "${SECRET_NAME_SUPABASE_URL}" "${API_SA}" || true
@@ -651,24 +714,21 @@ upstash_api() {
   printf '%s' "${out%$'\n'*}"
 }
 
-_upstash_pick_prod_db() { # JSON -> id\nendpoint (production, not dev/test)
-  UPSTASH_JSON="$1" python3 - << 'PY' 2> /dev/null || true
-import json, os
-try:
-    dbs = json.loads(os.environ["UPSTASH_JSON"])
-except Exception:
-    raise SystemExit(0)
-if isinstance(dbs, dict):
-    dbs = dbs.get("databases", dbs.get("data", []))
-for db in dbs if isinstance(dbs, list) else []:
-    name = str(db.get("database_name") or db.get("name") or "").lower()
-    if not name or any(t in name for t in ("dev", "test", "staging", "preview")):
-        continue
-    if "prod" in name or "milo" in name:
-        print(str(db.get("database_id") or db.get("id") or ""))
-        print(str(db.get("endpoint") or ""))
-        break
-PY
+# upstash_select LIST_JSON -> prints SELECT|<id> / CREATE| / BLOCKED|reason
+_upstash_select() {
+  python3 "${SCRIPT_DIR}/upstash_select.py" --mode select --json "$1" \
+    --expected-name "${UPSTASH_DB_NAME}" --database-id "${UPSTASH_DB_ID}"
+}
+# _upstash_validate DETAIL_JSON -> prints OK|<canonical_url> / BLOCKED|reason
+_upstash_validate() {
+  python3 "${SCRIPT_DIR}/upstash_select.py" --mode validate --json "$1" \
+    --expected-name "${UPSTASH_DB_NAME}" --expected-platform "${UPSTASH_PLATFORM}" \
+    --expected-region "${UPSTASH_PRIMARY_REGION}"
+}
+# _upstash_create_body — official Developer API contract (global database).
+_upstash_create_body() {
+  printf '{"database_name":"%s","platform":"%s","primary_region":"%s","tls":true,"eviction":false,"plan":"%s"}' \
+    "${UPSTASH_DB_NAME}" "${UPSTASH_PLATFORM}" "${UPSTASH_PRIMARY_REGION}" "${DEF_UPSTASH_PLAN}"
 }
 
 upstash_inspect() {
@@ -685,94 +745,201 @@ upstash_inspect() {
     return 0
   fi
   json_is_valid "${list}" || { record_check MANUAL "upstash:list" "Upstash listing was not valid JSON; verify manually"; return 0; }
-  local match; match="$(_upstash_pick_prod_db "${list}")"
-  if [[ -z "${match}" ]]; then
-    record_check WARN "upstash:discover" "no dedicated production Redis database found; apply will create one (never shared with dev/test)"
-    plan_action "create dedicated Upstash production Redis database; store its REST token in Secret Manager (${SECRET_NAME_REDIS}); write only the non-secret REST URL to metadata"
-    return 0
-  fi
-  UPSTASH_REST_URL="https://$(sed -n '2p' <<< "${match}")"
-  record_check PASS "upstash:discover" "found dedicated production Redis database '$(sed -n '1p' <<< "${match}")' (not shared with dev/test); REST URL captured, token never printed"
+  local sel; sel="$(_upstash_select "${list}")"
+  case "${sel%%|*}" in
+    SELECT) record_check PASS "upstash:discover" "exactly one production Redis database selected by ${UPSTASH_DB_ID:+id }${UPSTASH_DB_ID:-name ${UPSTASH_DB_NAME}} (id ${sel#*|}); token never printed" ;;
+    CREATE) record_check WARN "upstash:discover" "no database exactly named '${UPSTASH_DB_NAME}' exists; apply will CREATE one (platform=${UPSTASH_PLATFORM}, primary_region=${UPSTASH_PRIMARY_REGION})"; plan_action "create Upstash production Redis '${UPSTASH_DB_NAME}' and reconcile its token into Secret Manager (pinned version) + Cloud Run + Vercel" ;;
+    BLOCKED) record_check BLOCKED "upstash:discover" "Upstash selection is ambiguous/invalid: ${sel#*|}" ;;
+  esac
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Redis credential transaction (B5). After selecting exactly one Upstash
+# database, capture its metadata, compute a NON-REVERSIBLE token fingerprint in
+# memory, compare it against the live Secret Manager version (reading ONLY the
+# Redis payload, never printing/serializing it), add a new version only when it
+# differs, and pin the EXACT numeric version into Cloud Run. The token is never
+# rotated on a repeated apply when it already matches.
+# ---------------------------------------------------------------------------
+REDIS_SECRET_VERSION=""      # exact numeric Secret Manager version to pin
+REDIS_TOKEN_FINGERPRINT=""   # sha256 prefix; non-secret, safe to expose
+REDIS_DB_ID=""               # selected Upstash database id (non-secret)
+REDIS_LEDGER=()
+redis_ledger() { REDIS_LEDGER+=("$1"); }
+
+# _fingerprint reads a value on stdin and prints a 16-hex sha256 prefix. The
+# value never appears in argv, stdout (only the digest) or on disk.
+_fingerprint() { python3 -c 'import sys,hashlib;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:16])'; }
+
 upstash_apply() {
   if ! upstash_creds_present; then
-    record_check MANUAL "upstash" "no Upstash management credentials; production Redis URL/token remain MANUAL unless the Redis token secret is already present in Secret Manager (adopted)"
+    record_check MANUAL "upstash" "no Upstash management credentials; the Redis token is reconciled from the existing Secret Manager version only (no rotation, no management access)"
     return 0
   fi
   if ! tool_available curl; then record_check MANUAL "upstash" "curl unavailable; skipping Upstash automation (manual)"; return 0; fi
   milo_tmpdir_init
-  local code_file="${_MILO_TMPDIR}/upstash.code" list db_id="" db_endpoint=""
+  local code_file="${_MILO_TMPDIR}/upstash.code" list
   list="$(upstash_api GET /redis/databases "" "${code_file}")"
   if [[ "$(cat "${code_file}")" != "200" ]]; then
     record_check BLOCKED "upstash:list" "Upstash listing failed (HTTP $(cat "${code_file}")); NOT treated as 'no database'. No database created."
     recovery_step "fix Upstash management credentials/network and re-run --apply (idempotent discovery)"; mark_failed; return 1
   fi
-  local found; found="$(_upstash_pick_prod_db "${list}")"
-  db_id="$(sed -n '1p' <<< "${found}")"; db_endpoint="$(sed -n '2p' <<< "${found}")"
-  if [[ -z "${db_id}" ]]; then
-    local create_resp; create_resp="$(upstash_api POST /redis/database '{"name":"milo-production","region":"global","primary_region":"us-east-1","tls":true}' "${code_file}")"
-    if [[ "$(cat "${code_file}")" != "200" ]]; then
-      record_check BLOCKED "upstash:create" "failed to create production Redis database (HTTP $(cat "${code_file}"))"; recovery_step "create the Upstash production database manually or fix credentials and re-run --apply"; mark_failed; return 1
-    fi
-    db_id="$(UPSTASH_JSON="${create_resp}" python3 -c 'import json,os;d=json.loads(os.environ["UPSTASH_JSON"]);print(d.get("database_id") or d.get("id") or "")' 2> /dev/null || true)"
-    db_endpoint="$(UPSTASH_JSON="${create_resp}" python3 -c 'import json,os;d=json.loads(os.environ["UPSTASH_JSON"]);print(d.get("endpoint") or "")' 2> /dev/null || true)"
-    applied_action "created dedicated Upstash production Redis database (id captured; token never printed)"
-  else
-    applied_action "reusing existing dedicated production Redis database (idempotent; not shared with dev/test)"
-  fi
+  local sel; sel="$(_upstash_select "${list}")" db_id=""
+  case "${sel%%|*}" in
+    BLOCKED) record_check BLOCKED "upstash:select" "refusing to proceed: ${sel#*|}"; recovery_step "resolve the ambiguous/invalid Upstash selection (use --upstash-database-id) and re-run --apply"; mark_failed; return 1 ;;
+    SELECT) db_id="${sel#*|}"; applied_action "selected exactly one production Redis database (id captured)"; redis_ledger "selected id=${db_id}" ;;
+    CREATE)
+      local create_resp; create_resp="$(upstash_api POST /redis/database "$(_upstash_create_body)" "${code_file}")"
+      if [[ "$(cat "${code_file}")" != "200" ]]; then
+        record_check BLOCKED "upstash:create" "failed to create production Redis database (HTTP $(cat "${code_file}"))"; recovery_step "create the Upstash production database manually or fix credentials and re-run --apply"; mark_failed; return 1
+      fi
+      db_id="$(UPSTASH_JSON="${create_resp}" python3 -c 'import json,os;d=json.loads(os.environ["UPSTASH_JSON"]);print(d.get("database_id") or d.get("id") or "")' 2> /dev/null || true)"
+      [[ -z "${db_id}" ]] && { record_check BLOCKED "upstash:create" "create response did not contain a database id (unexpected API response shape)"; mark_failed; return 1; }
+      applied_action "created production Redis database (id captured; token never printed)"; redis_ledger "created id=${db_id}" ;;
+  esac
+
+  # Read the exact database detail, validate it (state/tls/platform/region) and
+  # normalize the canonical REST URL.
   local detail; detail="$(upstash_api GET "/redis/database/${db_id}" "" "${code_file}")"
   if [[ "$(cat "${code_file}")" != "200" ]]; then record_check BLOCKED "upstash:detail" "failed to read Redis database details (HTTP $(cat "${code_file}"))"; mark_failed; return 1; fi
+  local val; val="$(_upstash_validate "${detail}")"
+  if [[ "${val%%|*}" != "OK" ]]; then record_check BLOCKED "upstash:validate" "selected Redis database rejected: ${val#*|}"; recovery_step "fix the Upstash database to be an active, TLS-enabled ${UPSTASH_PLATFORM}/${UPSTASH_PRIMARY_REGION} production database and re-run --apply"; mark_failed; return 1; fi
+  UPSTASH_REST_URL="${val#*|}"
+  REDIS_DB_ID="${db_id}"
   SECRET_UPSTASH_REST_TOKEN="$(UPSTASH_JSON="${detail}" python3 -c 'import json,os;d=json.loads(os.environ["UPSTASH_JSON"]);print(d.get("rest_token") or "")' 2> /dev/null || true)"
-  local endpoint; endpoint="$(UPSTASH_JSON="${detail}" python3 -c 'import json,os;d=json.loads(os.environ["UPSTASH_JSON"]);print(d.get("endpoint") or "")' 2> /dev/null || true)"
-  [[ -n "${endpoint}" ]] && db_endpoint="${endpoint}"
-  UPSTASH_REST_URL="https://${db_endpoint}"
   if [[ -z "${SECRET_UPSTASH_REST_TOKEN}" ]]; then record_check BLOCKED "upstash:token" "could not retrieve the Redis REST token (value never printed)"; mark_failed; return 1; fi
-  record_check PASS "upstash:token" "Redis REST token retrieved securely (never printed); stored only in Secret Manager"
-  record_check PASS "upstash:url" "Redis REST URL captured: ${UPSTASH_REST_URL} (non-secret)"
+  REDIS_TOKEN_FINGERPRINT="$(printf '%s' "${SECRET_UPSTASH_REST_TOKEN}" | _fingerprint)"
+  record_check PASS "upstash:token" "Redis REST token retrieved securely (never printed; fingerprint ${REDIS_TOKEN_FINGERPRINT})"
+  record_check PASS "upstash:url" "canonical Redis REST URL: ${UPSTASH_REST_URL} (non-secret)"
+  return 0
+}
+
+# _redis_enabled_version — print the newest enabled version NUMBER, or '' when
+# there is none, or 'ERROR' on a permission/API failure (never conflated).
+_redis_enabled_version() {
+  local err rc=0 out
+  err="${_MILO_TMPDIR}/redis-ver.err"
+  out="$(gcloud secrets versions list "${SECRET_NAME_REDIS}" --project "${EXPECTED_PROJECT}" \
+    --filter 'state=enabled' --sort-by '~createTime' --limit 1 --format 'value(name)' 2> "${err}")" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then printf 'ERROR'; return 0; fi
+  out="${out##*/}"; out="$(printf '%s' "${out}" | tr -d '[:space:]')"
+  printf '%s' "${out}"
+}
+
+# redis_reconcile — coherent Redis credential transaction (B5). Pins the EXACT
+# numeric Secret Manager version consumed by Cloud Run and proves it matches
+# the selected Upstash token via an in-memory fingerprint. Reads ONLY the Redis
+# secret payload (never Supabase/Kimi), never prints/serializes/argv-passes it.
+redis_reconcile() {
+  milo_tmpdir_init
+  local state; state="$(secret_inspect "${SECRET_NAME_REDIS}")"
+  if [[ "${state}" == "INSPECTION_ERROR" ]]; then
+    record_check BLOCKED "redis:reconcile" "could not inspect Redis secret ${SECRET_NAME_REDIS} (permission/API error); refusing to rotate or pin blindly"
+    recovery_step "resolve Secret Manager permissions for ${SECRET_NAME_REDIS} and re-run --apply"; mark_failed; return 1
+  fi
+  if [[ "${state}" == "MISSING" ]]; then
+    if [[ -z "${SECRET_UPSTASH_REST_TOKEN}" ]]; then
+      record_check MANUAL "redis:reconcile" "Redis secret ${SECRET_NAME_REDIS} is missing and no selected token is available (no Upstash management access); cannot create/pin. No mutation."
+      return 0
+    fi
+    if ! gcloud secrets create "${SECRET_NAME_REDIS}" --project "${EXPECTED_PROJECT}" --replication-policy automatic 1> /dev/null 2>&1; then
+      [[ "$(secret_inspect "${SECRET_NAME_REDIS}")" == "MISSING" ]] && { record_check BLOCKED "redis:reconcile" "failed to create Redis secret ${SECRET_NAME_REDIS}"; mark_failed; return 1; }
+    else
+      applied_action "created Redis Secret Manager resource ${SECRET_NAME_REDIS}"; redis_ledger "secret-created"
+    fi
+  fi
+
+  local cur_ver cur_fp=""
+  cur_ver="$(_redis_enabled_version)"
+  if [[ "${cur_ver}" == "ERROR" ]]; then
+    record_check BLOCKED "redis:reconcile" "could not list Redis secret versions (permission/API error); refusing to pin (never treated as 'no version')"; mark_failed; return 1
+  fi
+  if [[ -n "${cur_ver}" ]]; then
+    # Read ONLY the Redis payload for the in-memory fingerprint comparison.
+    local payload arc=0
+    payload="$(gcloud secrets versions access "${cur_ver}" --secret "${SECRET_NAME_REDIS}" --project "${EXPECTED_PROJECT}" 2> /dev/null)" || arc=$?
+    if [[ "${arc}" -eq 0 ]]; then cur_fp="$(printf '%s' "${payload}" | _fingerprint)"; fi
+    payload=""   # drop the secret from memory promptly
+  fi
+
+  if [[ -n "${SECRET_UPSTASH_REST_TOKEN}" ]]; then
+    if [[ -n "${cur_ver}" && -n "${cur_fp}" && "${cur_fp}" == "${REDIS_TOKEN_FINGERPRINT}" ]]; then
+      REDIS_SECRET_VERSION="${cur_ver}"
+      record_check PASS "redis:reconcile" "Secret Manager already holds the selected token (fingerprint match); pinning version ${cur_ver}, NO rotation (idempotent)"
+      redis_ledger "secret-manager matched version=${cur_ver}"
+    else
+      local newpath="" narc=0
+      newpath="$(printf '%s' "${SECRET_UPSTASH_REST_TOKEN}" | gcloud secrets versions add "${SECRET_NAME_REDIS}" --project "${EXPECTED_PROJECT}" --data-file=- --format 'value(name)' 2> /dev/null)" || narc=$?
+      if [[ "${narc}" -ne 0 || -z "${newpath}" ]]; then
+        record_check BLOCKED "redis:reconcile" "failed to add a new Redis Secret Manager version"; recovery_step "grant secretmanager.versions.add and re-run --apply (safe to rerun; idempotent on token match)"; mark_failed; return 1
+      fi
+      REDIS_SECRET_VERSION="${newpath##*/}"
+      applied_action "added Redis Secret Manager version ${REDIS_SECRET_VERSION} for the selected token (fingerprint changed; payload never printed)"
+      record_check PASS "redis:reconcile" "reconciled Redis token into Secret Manager version ${REDIS_SECRET_VERSION} (pinned into Cloud Run)"
+      redis_ledger "secret-manager updated version=${REDIS_SECRET_VERSION}"
+    fi
+  else
+    # No management access (e.g. --audit-only): adopt the existing version for
+    # pinning; the token is never rotated and the fingerprint comes from the
+    # in-memory read of the existing version.
+    if [[ -n "${cur_ver}" ]]; then
+      REDIS_SECRET_VERSION="${cur_ver}"
+      [[ -z "${REDIS_TOKEN_FINGERPRINT}" ]] && REDIS_TOKEN_FINGERPRINT="${cur_fp}"
+      record_check PASS "redis:reconcile" "adopted existing Redis Secret Manager version ${cur_ver} (no management access; token not rotated)"
+      redis_ledger "secret-manager adopted version=${cur_ver}"
+    else
+      record_check BLOCKED "redis:reconcile" "no enabled Redis Secret Manager version and no selected token to create one; cannot pin a Redis version"
+      recovery_step "supply Upstash management credentials, or add an enabled version to ${SECRET_NAME_REDIS}, then re-run"; mark_failed; return 1
+    fi
+  fi
   return 0
 }
 
 # ===========================================================================
 # Vercel automation (adopt existing vars; idempotent update for owned vars).
 # ===========================================================================
-VERCEL_CWD_DEFAULT="${MILO_BOOTSTRAP_VERCEL_CWD:-${REPO_ROOT}/frontend}"
 _vercel_prereq() {
   local name="$1" detail="$2"
   if [[ "${MODE}" == "apply" ]]; then record_check BLOCKED "${name}" "${detail}"; else record_check MANUAL "${name}" "${detail}"; fi
 }
-vercel_base_args() {
-  local -a a=()
-  [[ -n "${VERCEL_SCOPE}" ]] && a+=(--scope "${VERCEL_SCOPE}")
-  [[ -n "${SECRET_VERCEL_TOKEN}" ]] && a+=(--token "${SECRET_VERCEL_TOKEN}")
-  [[ "${#a[@]}" -gt 0 ]] && printf '%s\n' "${a[@]}"
-  return 0
+# _vercel — run the Vercel CLI with the SUPPORTED CI identity mechanism:
+# VERCEL_TOKEN / VERCEL_ORG_ID / VERCEL_PROJECT_ID are exported into the
+# subprocess ENVIRONMENT only (never passed as argv, so the token can never
+# appear in the process table or logs). No committed .vercel/project.json is
+# required. --scope (team) is a non-secret flag and may be passed.
+_vercel() {
+  ( [[ -n "${SECRET_VERCEL_TOKEN}" ]] && export VERCEL_TOKEN="${SECRET_VERCEL_TOKEN}"
+    [[ -n "${VERCEL_ORG_ID}" ]] && export VERCEL_ORG_ID="${VERCEL_ORG_ID}"
+    [[ -n "${VERCEL_PROJECT_ID}" ]] && export VERCEL_PROJECT_ID="${VERCEL_PROJECT_ID}"
+    local -a s=(); [[ -n "${VERCEL_SCOPE}" ]] && s+=(--scope "${VERCEL_SCOPE}")
+    vercel "$@" "${s[@]+"${s[@]}"}" )
 }
 vercel_prove_identity() {
-  local cwd="${VERCEL_CWD_DEFAULT}"
   if ! tool_available vercel; then record_check MANUAL "vercel" "vercel CLI unavailable; configure the Vercel project manually (names only, never values)"; return 1; fi
-  local link_file="${cwd}/.vercel/project.json"
-  if [[ ! -f "${link_file}" ]]; then
-    _vercel_prereq "vercel:link" "no linked Vercel project in ${cwd} (.vercel/project.json missing); run 'vercel link --project ${VERCEL_PROJECT}' first before apply. Refusing to touch an unlinked project."
+  # Exact identity comes from the operator-supplied IDs (no .vercel file). All
+  # three — project ID, org ID and project name — must be present and proven.
+  if [[ -z "${VERCEL_PROJECT_ID}" || -z "${VERCEL_ORG_ID}" ]]; then
+    _vercel_prereq "vercel:identity-inputs" "VERCEL_PROJECT_ID and VERCEL_ORG_ID are required (env or --vercel-project-id/--vercel-org-id); a committed .vercel/project.json is NOT used. Fail closed before any write."
     return 1
   fi
-  local link_json linked_pid linked_org
-  link_json="$(cat "${link_file}" 2> /dev/null || true)"
-  json_is_valid "${link_json}" || { record_check BLOCKED "vercel:link" "linked project file is not valid JSON; cannot prove identity (fail closed)"; return 1; }
-  linked_pid="$(json_field "${link_json}" projectId)"; linked_org="$(json_field "${link_json}" orgId)"
-  [[ -z "${linked_pid}" ]] && { record_check BLOCKED "vercel:link" "linked project file has no projectId; cannot prove identity (fail closed)"; return 1; }
-  local -a base; mapfile -t base < <(vercel_base_args)
+  if [[ -z "${SECRET_VERCEL_TOKEN}" ]]; then
+    _vercel_prereq "vercel:token" "no Vercel token available (set VERCEL_TOKEN via --vercel-token-env); the token is never passed on the CLI. Fail closed."
+    return 1
+  fi
+  require_value "vercel:project-id" "${VERCEL_PROJECT_ID}" > /dev/null 2>&1 || { record_check BLOCKED "vercel:project-id" "VERCEL_PROJECT_ID is a placeholder/empty"; return 1; }
   milo_tmpdir_init
   local inspect_out="${_MILO_TMPDIR}/vercel-inspect" rc=0
-  ( cd "${cwd}" && vercel project inspect "${VERCEL_PROJECT}" "${base[@]+"${base[@]}"}" ) > "${inspect_out}" 2>&1 || rc=$?
+  _vercel project inspect "${VERCEL_PROJECT}" > "${inspect_out}" 2>&1 || rc=$?
   if [[ "${rc}" -ne 0 ]]; then _vercel_prereq "vercel:project-identity" "'vercel project inspect ${VERCEL_PROJECT}' failed (exit ${rc}); identity not proven (fail closed before any write)"; return 1; fi
-  local rpid rorg
+  local rpid rorg rname
   rpid="$(grep -oE 'prj_[A-Za-z0-9_-]+' "${inspect_out}" | head -n1 || true)"
   rorg="$(grep -oE 'team_[A-Za-z0-9_-]+' "${inspect_out}" | head -n1 || true)"
-  if [[ -z "${rpid}" || "${rpid}" != "${linked_pid}" ]]; then record_check BLOCKED "vercel:project-identity" "resolved project ID '${rpid}' does not match linked projectId '${linked_pid}'; refusing to touch a different project"; return 1; fi
-  if [[ -n "${rorg}" && -n "${linked_org}" && "${rorg}" != "${linked_org}" ]]; then record_check BLOCKED "vercel:project-identity" "resolved org '${rorg}' does not match linked org '${linked_org}'; refusing cross-team access"; return 1; fi
-  record_check PASS "vercel:project-identity" "linked project identity proven (projectId ${linked_pid}); safe to configure"
+  rname="$(sed -nE 's/.*[Pp]roject[[:space:]]+[Nn]ame[[:space:]]+"?([A-Za-z0-9._-]+)"?.*/\1/p' "${inspect_out}" | head -n1 || true)"
+  if [[ -z "${rpid}" || "${rpid}" != "${VERCEL_PROJECT_ID}" ]]; then record_check BLOCKED "vercel:project-identity" "resolved project ID '${rpid}' does not equal expected VERCEL_PROJECT_ID '${VERCEL_PROJECT_ID}'; refusing to touch a different project"; return 1; fi
+  if [[ -z "${rorg}" || "${rorg}" != "${VERCEL_ORG_ID}" ]]; then record_check BLOCKED "vercel:project-identity" "resolved org/team '${rorg}' does not equal expected VERCEL_ORG_ID '${VERCEL_ORG_ID}'; refusing cross-team access"; return 1; fi
+  if [[ -n "${rname}" && "${rname}" != "${VERCEL_PROJECT}" ]]; then record_check BLOCKED "vercel:project-identity" "resolved project name '${rname}' does not equal expected '${VERCEL_PROJECT}'; refusing to touch a different project"; return 1; fi
+  record_check PASS "vercel:project-identity" "project identity proven exactly (id ${rpid}, org ${rorg}, name ${VERCEL_PROJECT}); safe to configure"
   return 0
 }
 
@@ -787,37 +954,40 @@ VERCEL_REUSE_VARS=(
 VERCEL_FORBIDDEN_VARS=(SUPABASE_SERVICE_ROLE_KEY SUPABASE_SECRET_KEY KIMI_API_KEY MOONSHOT_API_KEY)
 
 _vercel_env_names() { # -> existing production variable NAMES (one per line)
-  local cwd="${VERCEL_CWD_DEFAULT}"; local -a base; mapfile -t base < <(vercel_base_args)
   milo_tmpdir_init
   local out="${_MILO_TMPDIR}/vercel-env-ls" rc=0
-  ( cd "${cwd}" && vercel env ls production "${base[@]+"${base[@]}"}" ) > "${out}" 2>&1 || rc=$?
+  _vercel env ls production > "${out}" 2>&1 || rc=$?
   [[ "${rc}" -ne 0 ]] && { printf '__VERCEL_ENV_LS_FAILED__'; return 0; }
   awk '{print $1}' "${out}" | grep -E '^[A-Z][A-Z0-9_]*$' || true
 }
 
 vercel_plan_vars() {
-  record_check NOT_APPLICABLE "vercel:managed" "apply will REUSE existing production variables and set only the managed vars: GATEWAY_ALLOW_EXECUTION_ROUTES=false, NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI=false, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN"
+  record_check NOT_APPLICABLE "vercel:managed" "apply will REUSE existing production variables and set only the managed vars: GATEWAY_ALLOW_EXECUTION_ROUTES=false, NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI=false, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, plus non-secret Redis consistency metadata"
   record_check NOT_APPLICABLE "vercel:forbidden-vars" "provider keys and Supabase server credentials are NEVER configured in Vercel"
-  plan_action "verify existing Vercel production vars are present (reuse); set only the four managed vars"
+  plan_action "verify existing Vercel production vars are present (reuse); set only the managed vars via 'vercel env update' (in-place, no remove-and-add)"
 }
 
-# vercel_env_upsert NAME VALUE PRESENT — real idempotent path: if the variable
-# already exists, remove then re-add (Vercel CLI has no in-place update);
-# otherwise add. Only ever used for the small set of managed vars.
+# vercel_env_upsert NAME VALUE PRESENT — real idempotent path using the
+# supported in-place `vercel env update` when the variable already exists (never
+# remove-then-add, which would leave a window with no value); `vercel env add`
+# only when the variable is genuinely absent. The value is fed on STDIN so it
+# never appears in argv.
 vercel_env_upsert() {
-  local name="$1" value="$2" present="$3" cwd="${VERCEL_CWD_DEFAULT}"
-  local -a base; mapfile -t base < <(vercel_base_args)
+  local name="$1" value="$2" present="$3"
   if [[ "${present}" == "1" ]]; then
-    if ! ( cd "${cwd}" && vercel env rm "${name}" production --yes "${base[@]+"${base[@]}"}" ) 1> /dev/null 2>&1; then
-      record_check BLOCKED "vercel:var:${name}" "failed to remove the existing ${name} before update"; recovery_step "update ${name} manually in Vercel production"; mark_failed; return 1
+    if ( printf '%s' "${value}" | _vercel env update "${name}" production --yes ) 1> /dev/null 2>&1; then
+      applied_action "UPDATED Vercel production var ${name} in place (value via stdin; never echoed)"
+      record_check PASS "vercel:var:${name}" "updated in production (in-place UPDATE; value never printed)"
+      return 0
     fi
+    record_check BLOCKED "vercel:var:${name}" "in-place 'vercel env update ${name}' failed; the existing value is preserved"; recovery_step "update ${name} manually in Vercel production, or fix token/identity and re-run"; mark_failed; return 1
   fi
-  if ( cd "${cwd}" && printf '%s' "${value}" | vercel env add "${name}" production "${base[@]+"${base[@]}"}" ) 1> /dev/null 2>&1; then
-    applied_action "$( [[ "${present}" == "1" ]] && printf 'UPDATED' || printf 'CREATED') Vercel production var ${name} (value via stdin; sensitive values never echoed)"
-    record_check PASS "vercel:var:${name}" "configured in production ($( [[ "${present}" == "1" ]] && printf 'UPDATE' || printf 'CREATE'); value never printed)"
+  if ( printf '%s' "${value}" | _vercel env add "${name}" production ) 1> /dev/null 2>&1; then
+    applied_action "CREATED Vercel production var ${name} (value via stdin; never echoed)"
+    record_check PASS "vercel:var:${name}" "created in production (value never printed)"
     return 0
   fi
-  record_check BLOCKED "vercel:var:${name}" "failed to set ${name} in Vercel production"; recovery_step "set ${name} manually in Vercel production, or fix token/scope and re-run"; mark_failed; return 1
+  record_check BLOCKED "vercel:var:${name}" "failed to add ${name} in Vercel production"; recovery_step "set ${name} manually in Vercel production, or fix token/identity and re-run"; mark_failed; return 1
 }
 
 vercel_apply() {
@@ -853,8 +1023,15 @@ vercel_apply() {
   if [[ -n "${SECRET_UPSTASH_REST_TOKEN}" ]]; then
     present=$(grep -qx UPSTASH_REDIS_REST_TOKEN <<< "${names}" && echo 1 || echo 0)
     vercel_env_upsert UPSTASH_REDIS_REST_TOKEN "${SECRET_UPSTASH_REST_TOKEN}" "${present}"
+    redis_ledger "vercel token updated"
   else
     record_check MANUAL "vercel:var:UPSTASH_REDIS_REST_TOKEN" "no Redis REST token available this run; set UPSTASH_REDIS_REST_TOKEN manually via stdin (never on the CLI)"
+  fi
+  # Non-secret Redis consistency metadata (fingerprint is non-reversible), so
+  # the audit can prove Vercel and GCP reference the SAME Redis credential.
+  if [[ -n "${REDIS_TOKEN_FINGERPRINT}" ]]; then
+    present=$(grep -qx MILO_REDIS_TOKEN_FINGERPRINT <<< "${names}" && echo 1 || echo 0)
+    vercel_env_upsert MILO_REDIS_TOKEN_FINGERPRINT "${REDIS_TOKEN_FINGERPRINT}" "${present}"
   fi
   record_check NOT_APPLICABLE "vercel:no-server-secrets" "no provider key or Supabase server credential was configured in Vercel"
   return 0
@@ -961,6 +1138,10 @@ generate_metadata() {
     printf 'SUPABASE_SERVICE_KEY_SECRET_NAME=%s\n' "${SECRET_NAME_SUPABASE_KEY}"
     printf 'PROVIDER_KEY_SECRET_NAME=%s\n' "${SECRET_NAME_PROVIDER}"
     printf 'REDIS_TOKEN_SECRET_NAME=%s\n' "${SECRET_NAME_REDIS}"
+    # Non-secret Redis consistency metadata (fingerprint is non-reversible).
+    [[ -n "${REDIS_DB_ID}" ]] && printf 'MILO_REDIS_DB_ID=%s\n' "${REDIS_DB_ID}"
+    [[ -n "${REDIS_TOKEN_FINGERPRINT}" ]] && printf 'MILO_REDIS_TOKEN_FINGERPRINT=%s\n' "${REDIS_TOKEN_FINGERPRINT}"
+    [[ -n "${REDIS_SECRET_VERSION}" ]] && printf 'MILO_REDIS_SECRET_VERSION=%s\n' "${REDIS_SECRET_VERSION}"
   } > "${dest}"
   chmod 600 "${dest}"
   record_check PASS "metadata:generated" "non-secret metadata written to ${dest}"
@@ -991,6 +1172,7 @@ write_bootstrap_report() {
     printf '  "expected_project": "%s",\n' "$(json_escape "${EXPECTED_PROJECT}")"
     printf '  "planned_actions": [\n'; _json_array "${PLANNED_ACTIONS[@]+"${PLANNED_ACTIONS[@]}"}"; printf '  ],\n'
     printf '  "applied_actions": [\n'; _json_array "${APPLIED_ACTIONS[@]+"${APPLIED_ACTIONS[@]}"}"; printf '  ],\n'
+    printf '  "redis_reconciliation_ledger": [\n'; _json_array "${REDIS_LEDGER[@]+"${REDIS_LEDGER[@]}"}"; printf '  ],\n'
     printf '  "recovery_steps": [\n'; _json_array "${RECOVERY_STEPS[@]+"${RECOVERY_STEPS[@]}"}"; printf '  ]\n'
     printf '}\n'
   } > "${tmp}"
@@ -1018,7 +1200,16 @@ verify_live_config() {
   [[ "${svc_rc}" -ne 0 ]] && printf '{}' > "${svc_json}"
   [[ "${job_rc}" -ne 0 ]] && printf '{}' > "${job_json}"
 
-  local line status name detail
+  # The EXACT Redis version Cloud Run must pin. In apply it comes from the
+  # reconcile transaction; in --audit-only derive it from the live enabled
+  # Secret Manager version (control-plane read; never the payload).
+  local redis_version="${REDIS_SECRET_VERSION}"
+  if [[ -z "${redis_version}" ]]; then
+    local v; v="$(_redis_enabled_version)"
+    [[ "${v}" != "ERROR" && -n "${v}" ]] && redis_version="${v}"
+  fi
+
+  local status name detail
   while IFS='|' read -r status name detail; do
     [[ -z "${status}" ]] && continue
     record_check "${status}" "${name}" "${detail}"
@@ -1026,10 +1217,60 @@ verify_live_config() {
   done < <(python3 "${SCRIPT_DIR}/verify_live_config.py" \
     --service-json "${svc_json}" --job-json "${job_json}" \
     --expected-api-sa "${API_SA}" --expected-worker-sa "${WORKER_SA}" \
+    --expected-gateway-sa "${GATEWAY_SA}" \
+    --expected-environment production \
+    --expected-production-origin "${PRODUCTION_ORIGIN}" \
+    --expected-api-url "$(api_url)" \
     --supabase-url-secret "${SECRET_NAME_SUPABASE_URL}" \
     --supabase-key-secret "${SECRET_NAME_SUPABASE_KEY}" \
     --provider-secret "${SECRET_NAME_PROVIDER}" \
-    --redis-secret "${SECRET_NAME_REDIS}" 2> /dev/null)
+    --redis-secret "${SECRET_NAME_REDIS}" \
+    --redis-secret-version "${redis_version}" \
+    ${UPSTASH_REST_URL:+--expected-redis-url "${UPSTASH_REST_URL}"} 2> /dev/null)
+  return 0
+}
+
+# verify_vercel_live — EXACT non-secret value verification of the live Vercel
+# production environment (kill switches, GCP wiring, Redis URL) plus an
+# in-memory Redis token fingerprint check, via check-vercel-config.sh using the
+# env-based identity (no committed .vercel; token never in argv).
+verify_vercel_live() {
+  if ! tool_available vercel; then record_check MANUAL "audit:vercel-values" "vercel CLI unavailable; verify exact Vercel production values manually (never print them)"; return 0; fi
+  if [[ -z "${VERCEL_PROJECT_ID}" || -z "${VERCEL_ORG_ID}" || -z "${SECRET_VERCEL_TOKEN}" ]]; then
+    record_check MANUAL "audit:vercel-values" "VERCEL_PROJECT_ID/VERCEL_ORG_ID/token not all present; exact Vercel value verification skipped (NOT counted as ready)"
+    return 0
+  fi
+  milo_tmpdir_init
+  local supa_url="https://${SUPABASE_REF}.supabase.co" report="${_MILO_TMPDIR}/vercel-values.json"
+  local -a a=(--project "${VERCEL_PROJECT}" --project-id "${VERCEL_PROJECT_ID}" --org-id "${VERCEL_ORG_ID}"
+    --expect "GATEWAY_ALLOW_EXECUTION_ROUTES=false"
+    --expect "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI=false"
+    --expect "CLOUD_RUN_API_URL=$(api_url)"
+    --expect "GCP_PROJECT_NUMBER=${DEF_PROJECT_NUMBER}"
+    --expect "GCP_SERVICE_ACCOUNT_EMAIL=${GATEWAY_SA}"
+    --expect "NEXT_PUBLIC_SUPABASE_URL=${supa_url}"
+    --json-output "${report}")
+  [[ -n "${VERCEL_SCOPE}" ]] && a+=(--scope "${VERCEL_SCOPE}")
+  [[ -n "${UPSTASH_REST_URL}" ]] && a+=(--expect "UPSTASH_REDIS_REST_URL=${UPSTASH_REST_URL}")
+  [[ -n "${REDIS_TOKEN_FINGERPRINT}" ]] && a+=(--expect-fingerprint "UPSTASH_REDIS_REST_TOKEN=${REDIS_TOKEN_FINGERPRINT}")
+  local rc=0
+  ( export VERCEL_TOKEN="${SECRET_VERCEL_TOKEN}" VERCEL_ORG_ID="${VERCEL_ORG_ID}" VERCEL_PROJECT_ID="${VERCEL_PROJECT_ID}"
+    bash "${SCRIPT_DIR}/check-vercel-config.sh" "${a[@]}" ) > /dev/null 2>&1 || rc=$?
+  if tool_available python3 && [[ -f "${report}" ]]; then
+    local status name detail
+    while IFS='|' read -r status name detail; do
+      [[ -z "${status}" ]] && continue
+      case "${name}" in vercel:value:*|vercel:fingerprint:*|vercel:project-identity)
+        record_check "${status}" "audit:${name}" "${detail}"
+        [[ "${status}" == "BLOCKED" ]] && mark_failed ;;
+      esac
+    done < <(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+for c in d.get("checks",[]):
+    print("%s|%s|%s"%(c.get("status",""),c.get("name",""),c.get("detail","")))' "${report}" 2> /dev/null)
+  elif [[ "${rc}" -ne 0 ]]; then
+    record_check BLOCKED "audit:vercel-values" "exact Vercel value verification reported blocking findings"; mark_failed
+  fi
   return 0
 }
 
@@ -1049,6 +1290,9 @@ run_final_audit() {
   # flags, budgets, identities). This — not the manifest — is what determines
   # whether the live services are correctly configured.
   verify_live_config
+  # EXACT non-secret Vercel value verification (kill switches, GCP wiring, Redis
+  # URL) + in-memory Redis fingerprint consistency (Vercel vs GCP).
+  verify_vercel_live
 
   local -a ra=(--manifest "${MANIFEST_PATH:-${REPO_ROOT}/config/production.example.yaml}"
     --expected-project "${EXPECTED_PROJECT}" --region "${REGION}"
@@ -1093,8 +1337,7 @@ case "${MODE}" in
     gcp_inspect
     upstash_inspect
     if vercel_prove_identity; then vercel_plan_vars; fi
-    gcp_verify_federation_plan() { [[ -n "${WIF_POOL}" && -n "${WIF_PROVIDER}" ]] && gcp_preflight > /dev/null 2>&1 && gcp_verify_federation || record_check MANUAL "wif" "supply --wif-pool/--wif-provider (and gcloud access) to verify the Vercel->GCP federation chain"; }
-    gcp_verify_federation_plan
+    if gcp_preflight > /dev/null 2>&1; then gcp_verify_federation; else record_check MANUAL "wif" "gcloud unavailable / wrong project; supply gcloud access and the Vercel WIF inputs to verify the federation chain"; fi
     generate_manifest
     generate_metadata
     write_bootstrap_report "${OUTPUT_DIR}/bootstrap-plan.json" "plan" "planned"

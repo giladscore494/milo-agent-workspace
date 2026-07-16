@@ -81,15 +81,71 @@ Cloud Run services reference Secret Manager directly.
 - Generates the manifest + non-secret metadata, plus `bootstrap-plan.json` /
   `bootstrap-apply.json` in a **private operator directory outside the worktree**.
 
-## The audit inspects LIVE configuration
+## The audit inspects LIVE configuration — with EXACT values
 
 After apply (and in `--audit-only`) the tool inspects the **live** Cloud Run
-service/job describe output and verifies every required env var, Secret Manager
-reference, execution flag (`false`), budget cap (nonzero), `JOB_LAUNCHER`, and
-the runtime identities — then runs the consolidated read-only
-`production-readiness.sh`. **`blocked = 0` is never claimed on the basis of the
-self-generated manifest**: if the live configuration differs from the intended
-state, the audit fails.
+service/job describe output and verifies every value **exactly**, not just for
+presence (`verify_live_config.py`):
+
+- `ENVIRONMENT` == `production`, `JOB_LAUNCHER` == `disabled`,
+  `GATEWAY_ALLOW_EXECUTION_ROUTES` == `false`;
+- `ALLOWED_CORS_ORIGINS` normalizes to exactly the approved origin set;
+- `MILO_GATEWAY_AUDIENCE` / `MILO_WORKER_AUDIENCE` == the exact Cloud Run API
+  URL; the gateway/worker identity allowlists contain exactly the expected SA;
+- every execution flag is a **plain** env var equal to exactly `false` (a
+  missing/empty/`0`/`no`/`off`/secret-reference value is BLOCKED);
+- every budget is a plain numeric env var strictly `> 0` (and within a Stage-A
+  maximum);
+- each secret reference points at the exact expected resource, and the **Redis**
+  reference pins the **exact numeric version** (never `latest`).
+
+The live **Vercel** production environment is verified with exact non-secret
+value checks and an in-memory Redis-token **fingerprint** comparison via
+`vercel env run -e production` (the raw value is never printed), and the
+**Vercel→GCP federation** chain is verified exactly (issuer, allowed audience
+set, attribute mapping/condition, gateway `workloadIdentityUser` principalSet,
+and `run.invoker` == exactly the gateway SA — broad principals rejected).
+
+Then it runs the consolidated read-only `production-readiness.sh`.
+**`blocked = 0` is never claimed on the basis of the self-generated manifest**:
+if any live value differs from the intended state, the audit fails.
+
+## Runnable from a clean checkout / Cloud Shell
+
+Vercel identity uses the supported CI mechanism — `VERCEL_TOKEN`,
+`VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` in the **environment** (or
+`--vercel-project-id` / `--vercel-org-id`) — so **no committed
+`.vercel/project.json` is required** and the token is **never** passed on the
+command line. Exact project **id**, **org id** and **name** are all proven
+before any Vercel write. Existing variables are updated in place with
+`vercel env update` (never remove-then-add). The GitHub workflow installs
+Node.js and a **pinned** Vercel CLI version (never `@latest`).
+
+## Upstash (official Developer API contract)
+
+The production database is selected by **exact** id (`--upstash-database-id`,
+the source of truth) or **exact, case-sensitive** name (default
+`milo-production`) — never a substring; more than one exact match is BLOCKED,
+and names indicating dev/test/staging/preview/backup/old/archive are rejected.
+Creation uses `database_name` / `platform` (`gcp`) / `primary_region`
+(`us-central1`) / `tls` / `eviction:false` / an explicit plan. The REST URL is
+produced by one canonical normalization (slug, hostname or https URL; malformed
+endpoints rejected). The selected database is validated as active + TLS-enabled
++ correct platform/region before use.
+
+## Redis credential transaction
+
+After selecting exactly one database, the tool captures its id / canonical URL /
+token, computes a **non-reversible fingerprint** in memory, and compares it with
+the currently active Redis **Secret Manager** version (reading only the Redis
+payload, never printing it). It adds a new enabled version **only** when the
+token differs (no rotation when it already matches), pins the **exact numeric
+version** into Cloud Run, updates Vercel with the same token, and records a
+reconciliation **ledger** (selected → Secret Manager → Vercel → Cloud Run). A
+failure after a partial update returns non-zero with a recovery plan and is safe
+to rerun. `--audit-only` needs no management key or application secret payloads:
+it verifies consistency via the pinned version and the in-memory fingerprint,
+returning BLOCKED when exact consistency cannot be proven.
 
 ## Credentials the human still supplies (one-time)
 

@@ -45,12 +45,21 @@ EOF
 }
 
 JSON_OUTPUT="" PROJECT="" SCOPE="" TOKEN_ENV="" VERCEL_CWD=""
+# Env-based identity (supported CI mechanism; no committed .vercel needed).
+EXPECT_PROJECT_ID="${VERCEL_PROJECT_ID:-}" EXPECT_ORG_ID="${VERCEL_ORG_ID:-}"
+# Exact non-secret value expectations (NAME=VALUE) and secret fingerprint
+# expectations (NAME=FINGERPRINT), verified in-memory via `vercel env run`.
+EXPECT_VALUES=() EXPECT_FINGERPRINTS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) PROJECT="${2:?}"; shift 2 ;;
+    --project-id) EXPECT_PROJECT_ID="${2:?}"; shift 2 ;;
+    --org-id) EXPECT_ORG_ID="${2:?}"; shift 2 ;;
     --scope) SCOPE="${2:?}"; shift 2 ;;
     --token-env) TOKEN_ENV="${2:?}"; shift 2 ;;
     --vercel-cwd) VERCEL_CWD="${2:?}"; shift 2 ;;
+    --expect) EXPECT_VALUES+=("${2:?}"); shift 2 ;;
+    --expect-fingerprint) EXPECT_FINGERPRINTS+=("${2:?}"); shift 2 ;;
     --json-output) JSON_OUTPUT="${2:?}"; shift 2 ;;
     --help) usage; exit 0 ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 64 ;;
@@ -109,25 +118,30 @@ remote_vercel_inspection() {
   fi
   require_value "vercel:project-name" "${PROJECT}" || return 0
 
-  # Project identity comes from the linked directory, never from an invented
-  # per-command flag. Refuse to inspect an unlinked directory (that would
-  # silently target the wrong — or no — project). The local identity source is
-  # .vercel/project.json (projectId + orgId).
+  # Project identity: prefer the supported CI mechanism (VERCEL_PROJECT_ID /
+  # VERCEL_ORG_ID in the environment or via --project-id/--org-id), which needs
+  # NO committed .vercel/project.json and works from a clean checkout. Fall
+  # back to a linked .vercel/project.json when the env IDs are absent.
   local link_file="${VERCEL_CWD}/.vercel/project.json"
-  if [[ ! -f "${link_file}" ]]; then
-    record_check BLOCKED "vercel:link" "no linked Vercel project in ${VERCEL_CWD} (.vercel/project.json missing). Prerequisite: run 'vercel link --project ${PROJECT}' in that directory first; this tool refuses to inspect an unlinked project."
-    return 0
-  fi
-  local link_json linked_project_id linked_org_id
-  link_json="$(cat "${link_file}" 2> /dev/null || true)"
-  if ! json_is_valid "${link_json}"; then
-    record_check BLOCKED "vercel:link" "linked project file ${link_file} is not valid JSON; cannot prove project identity (fail closed)."
-    return 0
-  fi
-  linked_project_id="$(json_field "${link_json}" projectId)"
-  linked_org_id="$(json_field "${link_json}" orgId)"
-  if [[ -z "${linked_project_id}" ]]; then
-    record_check BLOCKED "vercel:link" "linked project file ${link_file} has no projectId; cannot prove project identity (fail closed)."
+  local linked_project_id linked_org_id
+  if [[ -n "${EXPECT_PROJECT_ID}" && -n "${EXPECT_ORG_ID}" ]]; then
+    linked_project_id="${EXPECT_PROJECT_ID}"
+    linked_org_id="${EXPECT_ORG_ID}"
+  elif [[ -f "${link_file}" ]]; then
+    local link_json
+    link_json="$(cat "${link_file}" 2> /dev/null || true)"
+    if ! json_is_valid "${link_json}"; then
+      record_check BLOCKED "vercel:link" "linked project file ${link_file} is not valid JSON; cannot prove project identity (fail closed)."
+      return 0
+    fi
+    linked_project_id="$(json_field "${link_json}" projectId)"
+    linked_org_id="$(json_field "${link_json}" orgId)"
+    if [[ -z "${linked_project_id}" ]]; then
+      record_check BLOCKED "vercel:link" "linked project file ${link_file} has no projectId; cannot prove project identity (fail closed)."
+      return 0
+    fi
+  else
+    record_check BLOCKED "vercel:link" "no Vercel project identity: set VERCEL_PROJECT_ID + VERCEL_ORG_ID (or --project-id/--org-id), or link ${VERCEL_CWD} with a .vercel/project.json. This tool refuses to inspect an unproven project."
     return 0
   fi
 
@@ -246,6 +260,29 @@ remote_vercel_inspection() {
   if [[ "${forbidden_found}" -eq 0 ]]; then
     record_check PASS "vercel:forbidden" "no worker/service-role credential name present in the Vercel environment"
   fi
+
+  # Exact NON-SECRET value verification, in-memory via `vercel env run -e
+  # production`: the injected verifier reads the production value and emits ONLY
+  # MATCH/MISMATCH (or a fingerprint) — the raw value is never printed,
+  # persisted or placed in argv, and no application code is invoked or deployed.
+  local spec vname vval out
+  for spec in "${EXPECT_VALUES[@]+"${EXPECT_VALUES[@]}"}"; do
+    vname="${spec%%=*}"; vval="${spec#*=}"
+    out="$( ( cd "${VERCEL_CWD}" && vercel env run -e production "${base_args[@]}" -- sh -c "test \"\$${vname}\" = \"${vval}\" && echo MATCH || echo MISMATCH" ) 2> /dev/null | tail -n1 || true )"
+    case "${out}" in
+      MATCH) record_check PASS "vercel:value:${vname}" "exact production value verified in-memory (value never printed)" ;;
+      MISMATCH) record_check BLOCKED "vercel:value:${vname}" "production value does not equal the approved value (value never printed)" ;;
+      *) record_check MANUAL "vercel:value:${vname}" "could not verify the production value in-memory (vercel env run unavailable?); verify manually without printing the value" ;;
+    esac
+  done
+  for spec in "${EXPECT_FINGERPRINTS[@]+"${EXPECT_FINGERPRINTS[@]}"}"; do
+    vname="${spec%%=*}"; vval="${spec#*=}"
+    out="$( ( cd "${VERCEL_CWD}" && vercel env run -e production "${base_args[@]}" -- sh -c "printf %s \"\$${vname}\" | sha256sum | cut -c1-16" ) 2> /dev/null | tail -n1 || true )"
+    if [[ -z "${out}" ]]; then record_check MANUAL "vercel:fingerprint:${vname}" "could not compute the in-memory fingerprint (vercel env run unavailable?); verify Redis consistency manually"
+    elif [[ "${out}" == "${vval}" ]]; then record_check PASS "vercel:fingerprint:${vname}" "Vercel value fingerprint matches the expected GCP fingerprint (token never printed)"
+    else record_check BLOCKED "vercel:fingerprint:${vname}" "Vercel value fingerprint does NOT match the expected fingerprint; Vercel and GCP reference different Redis credentials"
+    fi
+  done
 }
 
 remote_vercel_inspection
