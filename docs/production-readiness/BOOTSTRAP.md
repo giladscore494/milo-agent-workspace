@@ -38,6 +38,12 @@ scripts/release/bootstrap-production.sh --audit-only \
 
 Default mode (no flag) is `--plan` and is fully read-only.
 
+`--release-sha` is the deprecated operator flag spelling kept for
+compatibility: the value it carries is the **bootstrap reconciliation
+identity**, recorded and audited everywhere as `MILO_BOOTSTRAP_SHA` (it is not
+application image proof; image identity is verified separately by deployment
+tooling).
+
 ## Adoption, not duplication
 
 The default Secret Manager **resource names are the operator's existing ones**,
@@ -344,7 +350,15 @@ optionally downloads that artifact by the apply run's id (`metadata_run_id`
 input) and runs the complete fail-closed audit with **no mutations** —
 dispatch it from the same release ref as the apply, because the audit binds to
 the bootstrap reconciliation SHA; without a metadata run id it falls back to the credentialed
-deep audit, and with neither evidence source the audit is BLOCKED. Both jobs install the Vercel CLI at the exact version in
+deep audit, and with neither evidence source the audit is BLOCKED.
+**Artifact provenance is verified before the download**: the artifact is never
+trusted merely because it has the expected filename — the named run must be a
+*successful*, `workflow_dispatch`-triggered run of *this repository's*
+bootstrap-production workflow whose head SHA equals the audited commit
+(checked via the Actions API under the job's `actions: read` permission);
+anything else is refused before the file is fetched, and the bootstrap still
+re-validates the file content and the live state as an independent second
+layer. Both jobs install the Vercel CLI at the exact version in
 `scripts/release/VERCEL_CLI_VERSION` and run a **contract preflight** against
 the real CLI (`tests/test_contract_vercel_cli.py`) and — when the Upstash
 secrets are configured — a read-only `GET` contract check against the real
