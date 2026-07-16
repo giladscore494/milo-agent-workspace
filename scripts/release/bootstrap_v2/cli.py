@@ -1648,7 +1648,11 @@ class LocalGuardAdapter:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bootstrap-production-v2",
-        description="MILO transactional production bootstrap v2",
+        description=(
+            "MILO transactional production bootstrap v2. "
+            "Usage: bootstrap-production-v2.sh --mode plan|apply|audit "
+            "--bootstrap-sha <full-sha> --output-dir <private-dir> [options]"
+        ),
     )
     parser.add_argument("--mode", choices=[m.value for m in Mode], required=True)
     parser.add_argument("--bootstrap-sha", required=True)
