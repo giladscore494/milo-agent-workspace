@@ -22,8 +22,10 @@ import re
 import sys
 
 REJECT_TOKENS = ("dev", "test", "staging", "preview", "backup", "old", "archive")
-_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$")
+# The only documented Upstash REST endpoint host shape: <labels>.upstash.io.
+_UPSTASH_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*\.upstash\.io$")
 _SLUG_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$")
+_VALID_STATES = ("active", "running", "enabled")
 
 
 def _db_list(obj):
@@ -49,22 +51,28 @@ def _rejected(name: str) -> bool:
 def canonical_rest_url(endpoint: str, rest_url_field: str = "") -> str:
     """Return the canonical https REST URL, or '' when the input is malformed.
 
-    Accepts an explicit REST URL field, a full hostname, or a bare slug
-    (normalized to <slug>.upstash.io). Non-https schemes and junk are rejected.
+    Fail-closed: accepts ONLY a documented Upstash REST host (`*.upstash.io`) or
+    a bare slug (normalized to `<slug>.upstash.io`). Any other host, a non-https
+    scheme, or an endpoint carrying userinfo, a port, a path, a query string or
+    a fragment is rejected.
     """
     for candidate in (rest_url_field.strip(), endpoint.strip()):
         if not candidate:
             continue
         val = candidate
         if val.startswith("http://"):
-            return ""  # TLS is mandatory; http is rejected
-        if val.startswith("https://"):
-            host = val[len("https://"):].strip("/")
-            return f"https://{host}" if _HOST_RE.match(host) else ""
-        if "." in val:
-            return f"https://{val}" if _HOST_RE.match(val) else ""
-        # bare slug -> canonical Upstash host
-        return f"https://{val}.upstash.io" if _SLUG_RE.match(val) else ""
+            return ""  # TLS is mandatory
+        rest = val[len("https://"):] if val.startswith("https://") else val
+        # Reject anything beyond a bare host: userinfo (@), port (:), path (/),
+        # query (?), fragment (#) or whitespace.
+        if any(c in rest for c in "@:/?# \t"):
+            return ""
+        host = rest.strip(".")
+        if _UPSTASH_HOST_RE.match(host):
+            return f"https://{host}"
+        if _SLUG_RE.match(host):
+            return f"https://{host}.upstash.io"
+        return ""
     return ""
 
 
@@ -104,21 +112,35 @@ def do_validate(detail_json: str, expected_name: str, expected_platform: str,
         return f"BLOCKED|database name '{name}' indicates a non-production database"
     if expected_name and name != expected_name:
         return f"BLOCKED|database name '{name}' does not exactly equal expected '{expected_name}'"
-    state = str(db.get("state") or db.get("database_state") or "").lower()
-    if state and state not in ("active", "running", "enabled"):
+
+    # Fail-closed on missing/null metadata: state, tls, platform and region MUST
+    # be present and correct.
+    raw_state = db.get("state", db.get("database_state"))
+    if raw_state is None:
+        return "BLOCKED|database detail is missing the 'state' field"
+    state = str(raw_state).lower()
+    if state not in _VALID_STATES:
         return f"BLOCKED|database state is '{state}', not active"
-    tls = db.get("tls")
-    if tls is False:
-        return "BLOCKED|database TLS is disabled; TLS is mandatory"
-    platform = str(db.get("platform") or db.get("database_type") or "").lower()
-    if expected_platform and platform and platform != expected_platform.lower():
-        return f"BLOCKED|database platform '{platform}' does not equal expected '{expected_platform}'"
-    region = str(db.get("primary_region") or db.get("region") or "").lower()
-    if expected_region and region and region not in (expected_region.lower(), "global"):
+
+    if db.get("tls") is not True:
+        return "BLOCKED|database 'tls' is missing or not exactly true; TLS is mandatory"
+
+    raw_platform = db.get("platform", db.get("database_type"))
+    if raw_platform is None or not str(raw_platform).strip():
+        return "BLOCKED|database detail is missing the 'platform' field"
+    if expected_platform and str(raw_platform).lower() != expected_platform.lower():
+        return f"BLOCKED|database platform '{raw_platform}' does not equal expected '{expected_platform}'"
+
+    raw_region = db.get("primary_region", db.get("region"))
+    if raw_region is None or not str(raw_region).strip():
+        return "BLOCKED|database detail is missing the primary region field"
+    region = str(raw_region).lower()
+    if expected_region and region not in (expected_region.lower(), "global"):
         return f"BLOCKED|database primary region '{region}' does not equal expected '{expected_region}'"
+
     url = canonical_rest_url(str(db.get("endpoint") or ""), str(db.get("rest_url") or db.get("rest_endpoint") or ""))
     if not url:
-        return "BLOCKED|could not normalize a canonical https REST URL from the database endpoint (malformed)"
+        return "BLOCKED|could not normalize a canonical https *.upstash.io REST URL from the database endpoint (malformed/foreign host)"
     return f"OK|{url}"
 
 

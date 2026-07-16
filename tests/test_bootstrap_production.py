@@ -55,6 +55,7 @@ WIF_PROVIDER = "vercel"
 WIF_ISSUER = "https://oidc.vercel.com/milo-team"
 WIF_AUDIENCE = "https://vercel.com/milo-team"
 WIF_COND = "assertion.aud == 'milo'"
+WIF_MAPPING = json.dumps({"google.subject": "assertion.sub", "attribute.aud": "assertion.aud"})
 WIF_PRINCIPAL = "principalSet://iam.googleapis.com/projects/641579813332/locations/global/workloadIdentityPools/milo-pool/attribute.aud/milo"
 
 # Live Cloud Run describe fixtures (correct).
@@ -108,7 +109,7 @@ def worker_job_json(*, plain_over=None, secret_over=None, drop=None, sa=WORKER_S
 
 PROVIDER_JSON_OK = json.dumps({
     "oidc": {"issuerUri": WIF_ISSUER, "allowedAudiences": [WIF_AUDIENCE]},
-    "attributeMapping": {"google.subject": "assertion.sub"},
+    "attributeMapping": {"google.subject": "assertion.sub", "attribute.aud": "assertion.aud"},
     "attributeCondition": WIF_COND,
 })
 GATEWAY_POLICY_OK = json.dumps({"bindings": [{"role": "roles/iam.workloadIdentityUser", "members": [WIF_PRINCIPAL]}]})
@@ -315,7 +316,8 @@ def _apply_args(out, sha, wif=False):
     ]
     if wif:
         a += ["--wif-pool", WIF_POOL, "--wif-provider", WIF_PROVIDER, "--wif-issuer", WIF_ISSUER,
-              "--wif-audience", WIF_AUDIENCE, "--wif-attribute-condition", WIF_COND, "--wif-principal-set", WIF_PRINCIPAL]
+              "--wif-audience", WIF_AUDIENCE, "--wif-attribute-condition", WIF_COND,
+              "--wif-attribute-mapping", WIF_MAPPING, "--wif-principal-set", WIF_PRINCIPAL]
     return a
 
 
@@ -755,3 +757,179 @@ def test_generated_manifest_apply_valid(strict_bin, tmp_path):
                           "--manifest", str(out / "milo-production.yaml"), "--mode", "apply"],
                          capture_output=True, text=True)
     assert val.returncode == 0, val.stdout + val.stderr
+
+
+# ===========================================================================
+# C1 — Vercel token never in argv (check-vercel-config.sh)
+# ===========================================================================
+
+def test_check_vercel_config_never_uses_token_argv(strict_bin, tmp_path):
+    # Direct invocation with the token-rejecting vercel mock; a --token argv
+    # would trip MOCK-FORBIDDEN. The token travels only via the environment.
+    report = tmp_path / "cvc.json"
+    run_env = dict(os.environ)
+    run_env["PATH"] = f"{strict_bin.bin_dir}:{run_env['PATH']}"
+    run_env["MOCK_LOG"] = str(strict_bin.log)
+    run_env.update({"MOCK_VERCEL_ENV_NAMES": VERCEL_REUSE, "MOCK_VERCEL_INSPECT_ID": VPID,
+                    "MOCK_VERCEL_INSPECT_ORG": VORG, "VTOK": VERCEL_TOKEN_SECRET})
+    result = subprocess.run(
+        ["bash", str(RELEASE / "check-vercel-config.sh"), "--project", "milo-agent-workspace",
+         "--project-id", VPID, "--org-id", VORG, "--token-env", "VTOK", "--json-output", str(report)],
+        capture_output=True, text=True, env=run_env, cwd=REPO, timeout=60)
+    assert "MOCK-FORBIDDEN" not in (result.stdout + result.stderr)
+    log = read_log(strict_bin)
+    for ln in log.splitlines():
+        if ln.startswith("vercel "):
+            assert "--token" not in ln, f"token leaked into argv: {ln}"
+    assert VERCEL_TOKEN_SECRET not in read_log(strict_bin)
+    assert "[PASS] vercel:project-identity" in result.stdout
+
+
+# ===========================================================================
+# C2 — audit-only is a complete fail-closed audit
+# ===========================================================================
+
+def _audit_only(strict_bin, tmp_path, *, wif=False, **over):
+    out = _out(tmp_path)
+    svc, jb = _write_fixtures(tmp_path, api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}),
+                              worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}))
+    args = ["--audit-only", "--output-directory", str(out), "--expected-project", PROJECT,
+            "--expected-account", OPERATOR, "--release-sha", FULL_SHA, "--rollback-sha", FULL_SHA,
+            "--region", REGION, "--repository", "milo-agent",
+            "--api-service", "milo-agent-api", "--worker-job", "milo-agent-worker",
+            "--api-sa", API_SA, "--worker-sa", WORKER_SA, "--gateway-sa", GATEWAY_SA,
+            "--supabase-project-ref", "vvhtaqgkgkalpfcbuvag", "--production-origin", ORIGIN,
+            "--vercel-project", "milo-agent-workspace", "--vercel-project-id", VPID, "--vercel-org-id", VORG,
+            "--vercel-token-env", "VERCEL_TOK", "--upstash-email-env", "UP_EMAIL", "--upstash-apikey-env", "UP_APIKEY"]
+    if wif:
+        args += ["--wif-pool", WIF_POOL, "--wif-provider", WIF_PROVIDER, "--wif-issuer", WIF_ISSUER,
+                 "--wif-audience", WIF_AUDIENCE, "--wif-attribute-condition", WIF_COND,
+                 "--wif-attribute-mapping", WIF_MAPPING, "--wif-principal-set", WIF_PRINCIPAL]
+    env = {"MOCK_GCLOUD_PROJECT": PROJECT, "MOCK_GCLOUD_ACCOUNT": OPERATOR,
+           "MOCK_SERVICE_JSON": str(svc), "MOCK_JOB_JSON": str(jb),
+           "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES, "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES,
+           "MOCK_REDIS_ENABLED_VERSION": "3", "MOCK_REDIS_SM_PAYLOAD": UPSTASH_REST_TOKEN_SECRET,
+           "MOCK_UPSTASH_DBS": DEFAULT_DBS, "MOCK_UPSTASH_DETAIL": DEFAULT_DETAIL, "MOCK_UPSTASH_REST_TOKEN": UPSTASH_REST_TOKEN_SECRET,
+           "MOCK_VERCEL_ENV_NAMES": VERCEL_REUSE, "MOCK_VERCEL_INSPECT_ID": VPID, "MOCK_VERCEL_INSPECT_ORG": VORG,
+           "MOCK_VERCEL_ENVRUN": "MATCH", "MOCK_VERCEL_FP": REDIS_FP,
+           "MOCK_WIF_PROVIDER_JSON": PROVIDER_JSON_OK, "MOCK_WIF_GATEWAY_POLICY": GATEWAY_POLICY_OK, "MOCK_RUN_INVOKER_POLICY": RUN_POLICY_OK,
+           "UP_EMAIL": "ops@milo.test", "UP_APIKEY": UPSTASH_APIKEY_SECRET, "VERCEL_TOK": VERCEL_TOKEN_SECRET}
+    env.update(over)
+    return strict_bin(*args, env=env), out
+
+
+def test_audit_only_blocks_without_wif_evidence(strict_bin, tmp_path):
+    result, _ = _audit_only(strict_bin, tmp_path, wif=False)
+    assert result.returncode != 0
+    assert "[BLOCKED] wif" in result.stdout
+    # no mutation performed in audit-only
+    log = read_log(strict_bin)
+    for verb in ("run services update", "secrets versions add", "env add", "env update"):
+        assert verb not in log
+
+
+def test_audit_only_proves_wif_and_redis_with_full_evidence(strict_bin, tmp_path):
+    result, _ = _audit_only(strict_bin, tmp_path, wif=True)
+    assert "[PASS] wif:issuer" in result.stdout
+    assert "[PASS] wif:attribute-mapping" in result.stdout
+    assert "[PASS] wif:run-invoker" in result.stdout
+    assert "[PASS] redis:reconcile" in result.stdout
+    assert "[PASS] audit:vercel:fingerprint:UPSTASH_REDIS_REST_TOKEN" in result.stdout
+    log = read_log(strict_bin)
+    for verb in ("run services update", "secrets versions add", "env add", "env update", "secrets create"):
+        assert verb not in log, f"audit-only mutated: {verb}"
+
+
+def test_audit_only_redis_mismatch_blocks(strict_bin, tmp_path):
+    # Upstash token differs from the active Secret Manager version -> BLOCKED,
+    # and audit-only never rotates.
+    result, _ = _audit_only(strict_bin, tmp_path, wif=True, MOCK_REDIS_SM_PAYLOAD="a-stale-token")
+    assert result.returncode != 0
+    assert "[BLOCKED] redis:reconcile" in result.stdout
+    assert "secrets versions add" not in read_log(strict_bin)
+
+
+# ===========================================================================
+# C3 — Redis-dependent mutations are gated
+# ===========================================================================
+
+def test_redis_reconcile_failure_blocks_cloud_run_and_vercel(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path, MOCK_SECRET_VERSION_ERROR=S_REDIS)
+    assert result.returncode != 0
+    assert "[BLOCKED] redis:reconcile" in result.stdout
+    assert "[BLOCKED] gcp:redis-gate" in result.stdout
+    log = read_log(strict_bin)
+    # No Cloud Run config and no Redis Vercel var updates after the failure.
+    assert "run services update" not in log and "run jobs update" not in log
+    assert "env add UPSTASH_REDIS_REST_TOKEN" not in log and "env update UPSTASH_REDIS_REST_TOKEN" not in log
+
+
+def test_cloud_run_pins_no_latest_fallback(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path)
+    log = read_log(strict_bin)
+    for ln in log.splitlines():
+        if "run services update" in ln or "run jobs update" in ln:
+            assert f"UPSTASH_REDIS_REST_TOKEN={S_REDIS}:latest" not in ln
+            assert f"UPSTASH_REDIS_REST_TOKEN={S_REDIS}:" in ln  # pinned numeric
+    assert result is not None
+
+
+# ===========================================================================
+# C4 — exact WIF attributeMapping
+# ===========================================================================
+
+@pytest.mark.parametrize("mapping,expect_detail", [
+    (json.dumps({"google.subject": "WRONG"}), "wrong-expression"),
+    (json.dumps({"attribute.aud": "assertion.aud"}), "missing"),
+    (json.dumps({"google.subject": "assertion.sub", "attribute.aud": "assertion.aud", "attribute.extra": "x"}), "extra"),
+])
+def test_wif_attribute_mapping_mismatch_blocks(strict_bin, tmp_path, mapping, expect_detail):
+    provider = json.dumps({"oidc": {"issuerUri": WIF_ISSUER, "allowedAudiences": [WIF_AUDIENCE]},
+                           "attributeMapping": json.loads(mapping), "attributeCondition": WIF_COND})
+    result, _ = _apply(strict_bin, tmp_path, wif=True, MOCK_WIF_PROVIDER_JSON=provider)
+    assert result.returncode != 0
+    line = [l for l in result.stdout.splitlines() if "[BLOCKED] wif:attribute-mapping" in l]
+    assert line, result.stdout
+    assert expect_detail in line[0]
+
+
+# ===========================================================================
+# C5 — Upstash validation fail-closed
+# ===========================================================================
+
+@pytest.mark.parametrize("detail", [
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "tls": True, "platform": "gcp", "primary_region": "us-central1", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing state
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "platform": "gcp", "primary_region": "us-central1", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing tls
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "primary_region": "us-central1", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing platform
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "platform": "gcp", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing region
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "platform": "gcp", "primary_region": "us-central1", "endpoint": "evil.example.com", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # foreign host
+])
+def test_upstash_validation_fail_closed(strict_bin, tmp_path, detail):
+    result, _ = _apply(strict_bin, tmp_path, MOCK_UPSTASH_DETAIL=detail)
+    assert result.returncode != 0
+    assert "[BLOCKED] upstash:validate" in result.stdout
+
+
+# ===========================================================================
+# C6 — mandatory exact Vercel verify + non-finite budgets
+# ===========================================================================
+
+def test_vercel_env_run_failure_blocks_in_apply(strict_bin, tmp_path):
+    # env run returns unexpected output -> BLOCKED (never MANUAL) in apply.
+    result, _ = _apply(strict_bin, tmp_path, MOCK_VERCEL_ENVRUN="UNEXPECTED_OUTPUT")
+    assert result.returncode != 0
+    assert "[BLOCKED] audit:vercel:value:GATEWAY_ALLOW_EXECUTION_ROUTES" in result.stdout
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity", "inf"])
+def test_non_finite_budget_blocks(strict_bin, tmp_path, bad):
+    result, _ = _apply(strict_bin, tmp_path, service=api_service_json(plain_over={"MILO_MAX_COST_PER_RUN": bad}))
+    assert result.returncode != 0
+    assert "[BLOCKED] live:api:budget:MILO_MAX_COST_PER_RUN" in result.stdout
+
+
+def test_workflow_plan_job_gated_on_mode():
+    import yaml
+    wf = yaml.safe_load((REPO / ".github/workflows/bootstrap-production.yml").read_text())
+    assert wf["jobs"]["plan"]["if"] == "${{ github.event.inputs.mode == 'plan' }}"
+    assert wf["jobs"]["apply"]["if"] == "${{ github.event.inputs.mode == 'apply' }}"

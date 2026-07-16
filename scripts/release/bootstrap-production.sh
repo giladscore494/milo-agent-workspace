@@ -162,6 +162,7 @@ SECRET_NAME_REDIS="${DEF_SECRET_REDIS}"
 # bootstrap-auth chain, which lives only in the workflow env). Exact expected
 # values, verified live; the principalSet is never guessed.
 WIF_POOL="" WIF_PROVIDER="" WIF_ISSUER="" WIF_AUDIENCE="" WIF_ATTRIBUTE_CONDITION="" WIF_PRINCIPAL_SET=""
+WIF_ATTRIBUTE_MAPPING=""   # complete expected attributeMapping as a JSON object
 # Vercel project identity comes from exact IDs (supported CI mechanism), not a
 # committed .vercel/project.json. Values may also come from the environment.
 VERCEL_PROJECT_ID="${VERCEL_PROJECT_ID:-}" VERCEL_ORG_ID="${VERCEL_ORG_ID:-}"
@@ -203,6 +204,7 @@ while [[ $# -gt 0 ]]; do
     --wif-issuer) WIF_ISSUER="${2:?}"; shift 2 ;;
     --wif-audience) WIF_AUDIENCE="${2:?}"; shift 2 ;;
     --wif-attribute-condition) WIF_ATTRIBUTE_CONDITION="${2:?}"; shift 2 ;;
+    --wif-attribute-mapping) WIF_ATTRIBUTE_MAPPING="${2:?}"; shift 2 ;;
     --wif-principal-set) WIF_PRINCIPAL_SET="${2:?}"; shift 2 ;;
     --vercel-project-id) VERCEL_PROJECT_ID="${2:?}"; shift 2 ;;
     --vercel-org-id) VERCEL_ORG_ID="${2:?}"; shift 2 ;;
@@ -292,6 +294,16 @@ plan_action() { PLANNED_ACTIONS+=("$1"); printf '  PLAN: %s\n' "$(redact_line "$
 applied_action() { APPLIED_ACTIONS+=("$1"); printf '  DONE: %s\n' "$(redact_line "$1")"; }
 recovery_step() { RECOVERY_STEPS+=("$1"); }
 mark_failed() { BOOTSTRAP_FAILED=1; }
+
+# In plan mode a missing verification INPUT degrades to MANUAL (informational);
+# in apply/audit-only, unproven critical evidence is a fail-closed BLOCKED that
+# marks the run failed (readiness is never claimed from a MANUAL finding).
+evidence_missing() { # NAME DETAIL
+  if [[ "${MODE}" == "plan" ]]; then record_check MANUAL "$1" "$2"; else record_check BLOCKED "$1" "$2"; mark_failed; fi
+}
+# redis_ready — true only when reconciliation proved an EXACT positive numeric
+# Secret Manager version to pin (never a :latest fallback).
+redis_ready() { [[ "${REDIS_SECRET_VERSION}" =~ ^[1-9][0-9]*$ ]]; }
 
 # ---------------------------------------------------------------------------
 # gcloud read-only inspection helpers. Each distinguishes a clean "not found"
@@ -514,7 +526,7 @@ gcp_configure_api() {
   secrets_spec="$(join_by , \
     "SUPABASE_URL=${SECRET_NAME_SUPABASE_URL}:latest" \
     "SUPABASE_SECRET_KEY=${SECRET_NAME_SUPABASE_KEY}:latest" \
-    "UPSTASH_REDIS_REST_TOKEN=${SECRET_NAME_REDIS}:${REDIS_SECRET_VERSION:-latest}")"
+    "UPSTASH_REDIS_REST_TOKEN=${SECRET_NAME_REDIS}:${REDIS_SECRET_VERSION}")"
   local env_spec; env_spec="$(join_by , "${env_pairs[@]}")"
   local err rc=0
   err="$(gcloud run services update "${API_SERVICE}" --project "${EXPECTED_PROJECT}" --region "${REGION}" \
@@ -552,7 +564,7 @@ gcp_configure_worker() {
     "SUPABASE_URL=${SECRET_NAME_SUPABASE_URL}:latest" \
     "SUPABASE_SECRET_KEY=${SECRET_NAME_SUPABASE_KEY}:latest" \
     "KIMI_API_KEY=${SECRET_NAME_PROVIDER}:latest" \
-    "UPSTASH_REDIS_REST_TOKEN=${SECRET_NAME_REDIS}:${REDIS_SECRET_VERSION:-latest}")"
+    "UPSTASH_REDIS_REST_TOKEN=${SECRET_NAME_REDIS}:${REDIS_SECRET_VERSION}")"
   local env_spec; env_spec="$(join_by , "${env_pairs[@]}")"
   local err rc=0
   err="$(gcloud run jobs update "${WORKER_JOB}" --project "${EXPECTED_PROJECT}" --region "${REGION}" \
@@ -579,16 +591,17 @@ gcp_configure_worker() {
 # verified/bound independently because its member is unambiguous.
 gcp_verify_federation() {
   local supplied=0
-  for v in "${WIF_POOL}" "${WIF_PROVIDER}" "${WIF_ISSUER}" "${WIF_AUDIENCE}" "${WIF_ATTRIBUTE_CONDITION}" "${WIF_PRINCIPAL_SET}"; do
+  for v in "${WIF_POOL}" "${WIF_PROVIDER}" "${WIF_ISSUER}" "${WIF_AUDIENCE}" "${WIF_ATTRIBUTE_CONDITION}" "${WIF_ATTRIBUTE_MAPPING}" "${WIF_PRINCIPAL_SET}"; do
     [[ -n "${v}" ]] && supplied=$((supplied + 1))
   done
   if [[ "${supplied}" -eq 0 ]]; then
-    record_check MANUAL "wif" "supply the Vercel gateway federation inputs (--wif-pool/--wif-provider/--wif-issuer/--wif-audience/--wif-attribute-condition/--wif-principal-set) to verify the chain; not verified means NOT ready"
+    evidence_missing "wif" "supply the Vercel gateway federation inputs (--wif-pool/--wif-provider/--wif-issuer/--wif-audience/--wif-attribute-condition/--wif-attribute-mapping/--wif-principal-set) to verify the chain; not verified means NOT ready"
     gcp_ensure_run_invoker
     return 0
   fi
-  if [[ "${supplied}" -lt 6 ]]; then
-    record_check BLOCKED "wif:partial" "partial Vercel WIF configuration supplied (${supplied}/6); all of pool/provider/issuer/audience/attribute-condition/principal-set are required together (the principalSet is never guessed)"
+  if [[ "${supplied}" -lt 7 ]]; then
+    record_check BLOCKED "wif:partial" "partial Vercel WIF configuration supplied (${supplied}/7); all of pool/provider/issuer/audience/attribute-condition/attribute-mapping/principal-set are required together (the principalSet is never guessed)"
+    mark_failed
     gcp_ensure_run_invoker
     return 0
   fi
@@ -610,8 +623,10 @@ gcp_verify_federation() {
   json_is_valid "${pjson}" || pjson=""
   json_is_valid "${gjson}" || gjson=""
   json_is_valid "${rjson}" || rjson=""
-  if [[ -z "${pjson}" ]]; then record_check MANUAL "wif:provider" "could not inspect WIF provider ${WIF_PROVIDER}; verify issuer/audience/attribute-condition manually"; fi
-  if [[ -z "${gjson}" ]]; then record_check MANUAL "wif:gateway-binding" "could not read the gateway SA IAM policy; verify the workloadIdentityUser principalSet manually"; fi
+  # An unreadable provider/gateway policy is UNPROVEN evidence: fail closed in
+  # apply/audit-only (never a soft MANUAL that could count toward readiness).
+  if [[ -z "${pjson}" ]]; then evidence_missing "wif:provider" "could not inspect WIF provider ${WIF_PROVIDER}; issuer/audience/attribute-mapping/condition NOT proven"; fi
+  if [[ -z "${gjson}" ]]; then evidence_missing "wif:gateway-binding" "could not read the gateway SA IAM policy; workloadIdentityUser principalSet NOT proven"; fi
 
   local status name detail
   while IFS='|' read -r status name detail; do
@@ -622,6 +637,7 @@ gcp_verify_federation() {
     --provider-json "${pjson}" --gateway-policy-json "${gjson}" \
     --expected-issuer "${WIF_ISSUER}" --expected-audience "${WIF_AUDIENCE}" \
     --expected-attribute-condition "${WIF_ATTRIBUTE_CONDITION}" \
+    --expected-attribute-mapping "${WIF_ATTRIBUTE_MAPPING}" \
     --expected-principal-set "${WIF_PRINCIPAL_SET}" --gateway-sa "${GATEWAY_SA}" 2> /dev/null)
 
   # Bind/verify run.invoker (member is unambiguous: exactly the gateway SA).
@@ -647,6 +663,9 @@ gcp_ensure_run_invoker() {
     if [[ -n "${members}" && "${extra}" -gt 0 ]]; then
       record_check BLOCKED "wif:run-invoker" "run.invoker on ${API_SERVICE} contains unrelated member(s) besides the gateway SA; refusing to claim readiness"; mark_failed; return 1
     fi
+  fi
+  if [[ "${MODE}" == "audit-only" ]]; then
+    record_check BLOCKED "wif:run-invoker" "gateway SA does not hold roles/run.invoker on ${API_SERVICE}; the gateway cannot reach the private API (audit cannot bind it)"; mark_failed; return 1
   fi
   if [[ "${MODE}" != "apply" ]]; then
     record_check WARN "wif:run-invoker" "gateway SA does not (yet) hold roles/run.invoker on ${API_SERVICE}; apply will bind exactly it (never allUsers)"
@@ -686,8 +705,17 @@ gcp_apply() {
   gcp_grant_secret_accessor "${SECRET_NAME_REDIS}" "${API_SA}" || true
   gcp_grant_secret_accessor "${SECRET_NAME_REDIS}" "${WORKER_SA}" || true
 
-  gcp_configure_worker || true
-  gcp_configure_api || true
+  # Cloud Run configuration references the Redis secret at an EXACT pinned
+  # version. If reconciliation did not prove a positive numeric version, refuse
+  # to touch Cloud Run at all — the existing Redis wiring is left unchanged.
+  if redis_ready; then
+    gcp_configure_worker || true
+    gcp_configure_api || true
+  else
+    record_check BLOCKED "gcp:redis-gate" "Redis reconciliation did not produce a proven positive numeric Secret Manager version; refusing to update Cloud Run (existing Redis wiring left unchanged)"
+    recovery_step "resolve the Redis reconciliation failure, then re-run --apply (idempotent; leaves wiring unchanged on failure)"
+    mark_failed
+  fi
   gcp_verify_federation || true
   return 0
 }
@@ -790,6 +818,9 @@ upstash_apply() {
     BLOCKED) record_check BLOCKED "upstash:select" "refusing to proceed: ${sel#*|}"; recovery_step "resolve the ambiguous/invalid Upstash selection (use --upstash-database-id) and re-run --apply"; mark_failed; return 1 ;;
     SELECT) db_id="${sel#*|}"; applied_action "selected exactly one production Redis database (id captured)"; redis_ledger "selected id=${db_id}" ;;
     CREATE)
+      if [[ "${MODE}" == "audit-only" ]]; then
+        record_check BLOCKED "upstash:select" "no database exactly named '${UPSTASH_DB_NAME}' exists; --audit-only never creates one. Redis consistency cannot be proven."; mark_failed; return 1
+      fi
       local create_resp; create_resp="$(upstash_api POST /redis/database "$(_upstash_create_body)" "${code_file}")"
       if [[ "$(cat "${code_file}")" != "200" ]]; then
         record_check BLOCKED "upstash:create" "failed to create production Redis database (HTTP $(cat "${code_file}"))"; recovery_step "create the Upstash production database manually or fix credentials and re-run --apply"; mark_failed; return 1
@@ -839,6 +870,9 @@ redis_reconcile() {
     recovery_step "resolve Secret Manager permissions for ${SECRET_NAME_REDIS} and re-run --apply"; mark_failed; return 1
   fi
   if [[ "${state}" == "MISSING" ]]; then
+    if [[ "${MODE}" == "audit-only" ]]; then
+      record_check BLOCKED "redis:reconcile" "Redis secret ${SECRET_NAME_REDIS} is missing; --audit-only never creates it. Redis consistency cannot be proven."; mark_failed; return 1
+    fi
     if [[ -z "${SECRET_UPSTASH_REST_TOKEN}" ]]; then
       record_check MANUAL "redis:reconcile" "Redis secret ${SECRET_NAME_REDIS} is missing and no selected token is available (no Upstash management access); cannot create/pin. No mutation."
       return 0
@@ -868,6 +902,8 @@ redis_reconcile() {
       REDIS_SECRET_VERSION="${cur_ver}"
       record_check PASS "redis:reconcile" "Secret Manager already holds the selected token (fingerprint match); pinning version ${cur_ver}, NO rotation (idempotent)"
       redis_ledger "secret-manager matched version=${cur_ver}"
+    elif [[ "${MODE}" == "audit-only" ]]; then
+      record_check BLOCKED "redis:reconcile" "the selected Upstash token does NOT match the active Redis Secret Manager version (fingerprint mismatch); --audit-only never rotates. Redis consistency is BROKEN."; mark_failed; return 1
     else
       local newpath="" narc=0
       newpath="$(printf '%s' "${SECRET_UPSTASH_REST_TOKEN}" | gcloud secrets versions add "${SECRET_NAME_REDIS}" --project "${EXPECTED_PROJECT}" --data-file=- --format 'value(name)' 2> /dev/null)" || narc=$?
@@ -1014,24 +1050,20 @@ vercel_apply() {
   vercel_env_upsert GATEWAY_ALLOW_EXECUTION_ROUTES "false" "${present}"
   present=$(grep -qx NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI <<< "${names}" && echo 1 || echo 0)
   vercel_env_upsert NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI "false" "${present}"
-  if [[ -n "${UPSTASH_REST_URL}" ]]; then
+  # 3b) Redis-related Vercel vars are updated ONLY when Redis reconciliation
+  # proved an exact pinned version AND we hold the selected token; otherwise the
+  # existing Redis wiring is left unchanged (no partial cross-provider update).
+  if redis_ready && [[ -n "${UPSTASH_REST_URL}" && -n "${SECRET_UPSTASH_REST_TOKEN}" ]]; then
     present=$(grep -qx UPSTASH_REDIS_REST_URL <<< "${names}" && echo 1 || echo 0)
     vercel_env_upsert UPSTASH_REDIS_REST_URL "${UPSTASH_REST_URL}" "${present}"
-  else
-    record_check MANUAL "vercel:var:UPSTASH_REDIS_REST_URL" "no discovered Redis REST URL; set UPSTASH_REDIS_REST_URL manually (or supply Upstash credentials)"
-  fi
-  if [[ -n "${SECRET_UPSTASH_REST_TOKEN}" ]]; then
     present=$(grep -qx UPSTASH_REDIS_REST_TOKEN <<< "${names}" && echo 1 || echo 0)
     vercel_env_upsert UPSTASH_REDIS_REST_TOKEN "${SECRET_UPSTASH_REST_TOKEN}" "${present}"
     redis_ledger "vercel token updated"
-  else
-    record_check MANUAL "vercel:var:UPSTASH_REDIS_REST_TOKEN" "no Redis REST token available this run; set UPSTASH_REDIS_REST_TOKEN manually via stdin (never on the CLI)"
-  fi
-  # Non-secret Redis consistency metadata (fingerprint is non-reversible), so
-  # the audit can prove Vercel and GCP reference the SAME Redis credential.
-  if [[ -n "${REDIS_TOKEN_FINGERPRINT}" ]]; then
     present=$(grep -qx MILO_REDIS_TOKEN_FINGERPRINT <<< "${names}" && echo 1 || echo 0)
     vercel_env_upsert MILO_REDIS_TOKEN_FINGERPRINT "${REDIS_TOKEN_FINGERPRINT}" "${present}"
+  else
+    record_check BLOCKED "vercel:redis-gate" "Redis reconciliation did not prove a pinned version + selected token; refusing to update Redis-related Vercel variables (existing values left unchanged)"
+    mark_failed
   fi
   record_check NOT_APPLICABLE "vercel:no-server-secrets" "no provider key or Supabase server credential was configured in Vercel"
   return 0
@@ -1235,14 +1267,17 @@ verify_live_config() {
 # in-memory Redis token fingerprint check, via check-vercel-config.sh using the
 # env-based identity (no committed .vercel; token never in argv).
 verify_vercel_live() {
-  if ! tool_available vercel; then record_check MANUAL "audit:vercel-values" "vercel CLI unavailable; verify exact Vercel production values manually (never print them)"; return 0; fi
+  if ! tool_available vercel; then evidence_missing "audit:vercel-values" "vercel CLI unavailable; exact Vercel production values NOT proven"; return 0; fi
   if [[ -z "${VERCEL_PROJECT_ID}" || -z "${VERCEL_ORG_ID}" || -z "${SECRET_VERCEL_TOKEN}" ]]; then
-    record_check MANUAL "audit:vercel-values" "VERCEL_PROJECT_ID/VERCEL_ORG_ID/token not all present; exact Vercel value verification skipped (NOT counted as ready)"
+    evidence_missing "audit:vercel-values" "VERCEL_PROJECT_ID/VERCEL_ORG_ID/token not all present; exact Vercel value verification could not run (NOT counted as ready)"
     return 0
   fi
   milo_tmpdir_init
   local supa_url="https://${SUPABASE_REF}.supabase.co" report="${_MILO_TMPDIR}/vercel-values.json"
+  # --strict-values makes an unprovable exact value a BLOCKED (never MANUAL) in
+  # apply/audit-only, so readiness requires positive proof.
   local -a a=(--project "${VERCEL_PROJECT}" --project-id "${VERCEL_PROJECT_ID}" --org-id "${VERCEL_ORG_ID}"
+    --strict-values
     --expect "GATEWAY_ALLOW_EXECUTION_ROUTES=false"
     --expect "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI=false"
     --expect "CLOUD_RUN_API_URL=$(api_url)"
@@ -1347,6 +1382,17 @@ case "${MODE}" in
     ;;
 
   audit-only)
+    # A complete fail-closed audit: prove WIF, the selected Upstash database and
+    # Redis URL/token consistency (in-memory fingerprints only), and the live
+    # Cloud Run / Vercel configuration. Every mutation path is guarded read-only
+    # in audit-only; unproven critical evidence is BLOCKED, never MANUAL.
+    if gcp_preflight > /dev/null 2>&1; then
+      upstash_apply || true          # read-only in audit-only (never creates)
+      redis_reconcile || true        # read-only in audit-only (never rotates)
+      gcp_verify_federation || true  # exact WIF; read-only in audit-only
+    else
+      evidence_missing "audit:gcp" "gcloud unavailable or wrong active project; live GCP/WIF/Redis evidence could not be gathered"
+    fi
     generate_manifest
     generate_metadata
     run_final_audit

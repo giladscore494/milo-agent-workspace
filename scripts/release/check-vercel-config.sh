@@ -49,7 +49,7 @@ JSON_OUTPUT="" PROJECT="" SCOPE="" TOKEN_ENV="" VERCEL_CWD=""
 EXPECT_PROJECT_ID="${VERCEL_PROJECT_ID:-}" EXPECT_ORG_ID="${VERCEL_ORG_ID:-}"
 # Exact non-secret value expectations (NAME=VALUE) and secret fingerprint
 # expectations (NAME=FINGERPRINT), verified in-memory via `vercel env run`.
-EXPECT_VALUES=() EXPECT_FINGERPRINTS=()
+EXPECT_VALUES=() EXPECT_FINGERPRINTS=() STRICT_VALUES=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) PROJECT="${2:?}"; shift 2 ;;
@@ -60,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --vercel-cwd) VERCEL_CWD="${2:?}"; shift 2 ;;
     --expect) EXPECT_VALUES+=("${2:?}"); shift 2 ;;
     --expect-fingerprint) EXPECT_FINGERPRINTS+=("${2:?}"); shift 2 ;;
+    --strict-values) STRICT_VALUES=1; shift ;;
     --json-output) JSON_OUTPUT="${2:?}"; shift 2 ;;
     --help) usage; exit 0 ;;
     *) printf 'unknown argument: %s\n' "$1" >&2; usage >&2; exit 64 ;;
@@ -145,8 +146,9 @@ remote_vercel_inspection() {
     return 0
   fi
 
-  # Resolve the token without ever printing it.
-  local token=""
+  # Resolve the token WITHOUT ever placing it in argv: it is exported into the
+  # Vercel CLI subprocess environment (VERCEL_TOKEN) only. --token is never used.
+  local token="${VERCEL_TOKEN:-}"
   if [[ -n "${TOKEN_ENV}" ]]; then
     token="${!TOKEN_ENV:-}"
     if [[ -z "${token}" ]]; then
@@ -155,14 +157,21 @@ remote_vercel_inspection() {
     fi
   fi
 
-  local -a base_args=()
-  [[ -n "${SCOPE}" ]] && base_args+=(--scope "${SCOPE}")
-  [[ -n "${token}" ]] && base_args+=(--token "${token}")
+  local -a scope_args=()
+  [[ -n "${SCOPE}" ]] && scope_args+=(--scope "${SCOPE}")
+  # _cvc_vercel — run the Vercel CLI with the token / project id / org id in the
+  # ENVIRONMENT only (never argv). --scope (a non-secret team) is the only flag.
+  _cvc_vercel() {
+    ( [[ -n "${token}" ]] && export VERCEL_TOKEN="${token}"
+      [[ -n "${EXPECT_PROJECT_ID}" ]] && export VERCEL_PROJECT_ID="${EXPECT_PROJECT_ID}"
+      [[ -n "${EXPECT_ORG_ID}" ]] && export VERCEL_ORG_ID="${EXPECT_ORG_ID}"
+      cd "${VERCEL_CWD}" && vercel "$@" "${scope_args[@]+"${scope_args[@]}"}" )
+  }
 
   milo_tmpdir_init
   local who_out="${_MILO_TMPDIR}/vercel-whoami"
   local who_status=0
-  ( cd "${VERCEL_CWD}" && vercel whoami "${base_args[@]}" ) > "${who_out}" 2>&1 || who_status=$?
+  _cvc_vercel whoami > "${who_out}" 2>&1 || who_status=$?
   if [[ "${who_status}" -ne 0 ]]; then
     record_check BLOCKED "vercel:auth" "Vercel authentication failed (whoami exit ${who_status}). Prerequisite: run 'vercel login' or supply a valid token via --token-env. This is NOT treated as an empty environment."
     return 0
@@ -175,7 +184,7 @@ remote_vercel_inspection() {
   # reports it). A banner regex alone is never sufficient.
   local inspect_out="${_MILO_TMPDIR}/vercel-project-inspect"
   local inspect_status=0
-  ( cd "${VERCEL_CWD}" && vercel project inspect "${PROJECT}" "${base_args[@]}" ) > "${inspect_out}" 2>&1 || inspect_status=$?
+  _cvc_vercel project inspect "${PROJECT}" > "${inspect_out}" 2>&1 || inspect_status=$?
   if [[ "${inspect_status}" -ne 0 ]]; then
     if grep -qiE 'not authorized|forbidden|permission|access denied' "${inspect_out}"; then
       record_check BLOCKED "vercel:project-identity" "'vercel project inspect ${PROJECT}' was denied (exit ${inspect_status}); the token/scope lacks access. Identity not proven (fail closed)."
@@ -208,7 +217,7 @@ remote_vercel_inspection() {
   # discard the exit status and reinterpret failure as an empty result.
   local env_out="${_MILO_TMPDIR}/vercel-env-ls"
   local env_status=0
-  ( cd "${VERCEL_CWD}" && vercel env ls production "${base_args[@]}" ) > "${env_out}" 2>&1 || env_status=$?
+  _cvc_vercel env ls production > "${env_out}" 2>&1 || env_status=$?
   if [[ "${env_status}" -ne 0 ]]; then
     if grep -qiE 'not authorized|forbidden|permission|access denied' "${env_out}"; then
       record_check BLOCKED "vercel:env-list" "listing production environment variables was denied (exit ${env_status}); the token/scope lacks access to project '${PROJECT}'."
@@ -265,20 +274,24 @@ remote_vercel_inspection() {
   # production`: the injected verifier reads the production value and emits ONLY
   # MATCH/MISMATCH (or a fingerprint) — the raw value is never printed,
   # persisted or placed in argv, and no application code is invoked or deployed.
+  # In --strict-values mode (used by apply/audit-only) a verifier that cannot
+  # produce MATCH/MISMATCH (unexpected/empty output) is BLOCKED, never MANUAL:
+  # unproven exact values must not count toward readiness.
+  local unproven="MANUAL"; [[ "${STRICT_VALUES}" -eq 1 ]] && unproven="BLOCKED"
   local spec vname vval out
   for spec in "${EXPECT_VALUES[@]+"${EXPECT_VALUES[@]}"}"; do
     vname="${spec%%=*}"; vval="${spec#*=}"
-    out="$( ( cd "${VERCEL_CWD}" && vercel env run -e production "${base_args[@]}" -- sh -c "test \"\$${vname}\" = \"${vval}\" && echo MATCH || echo MISMATCH" ) 2> /dev/null | tail -n1 || true )"
+    out="$( _cvc_vercel env run -e production -- sh -c "test \"\$${vname}\" = \"${vval}\" && echo MATCH || echo MISMATCH" 2> /dev/null | tail -n1 || true )"
     case "${out}" in
       MATCH) record_check PASS "vercel:value:${vname}" "exact production value verified in-memory (value never printed)" ;;
       MISMATCH) record_check BLOCKED "vercel:value:${vname}" "production value does not equal the approved value (value never printed)" ;;
-      *) record_check MANUAL "vercel:value:${vname}" "could not verify the production value in-memory (vercel env run unavailable?); verify manually without printing the value" ;;
+      *) record_check "${unproven}" "vercel:value:${vname}" "could not verify the production value in-memory ('vercel env run' failed or returned unexpected output); ${unproven} (never counted as verified)" ;;
     esac
   done
   for spec in "${EXPECT_FINGERPRINTS[@]+"${EXPECT_FINGERPRINTS[@]}"}"; do
     vname="${spec%%=*}"; vval="${spec#*=}"
-    out="$( ( cd "${VERCEL_CWD}" && vercel env run -e production "${base_args[@]}" -- sh -c "printf %s \"\$${vname}\" | sha256sum | cut -c1-16" ) 2> /dev/null | tail -n1 || true )"
-    if [[ -z "${out}" ]]; then record_check MANUAL "vercel:fingerprint:${vname}" "could not compute the in-memory fingerprint (vercel env run unavailable?); verify Redis consistency manually"
+    out="$( _cvc_vercel env run -e production -- sh -c "printf %s \"\$${vname}\" | sha256sum | cut -c1-16" 2> /dev/null | tail -n1 || true )"
+    if [[ ! "${out}" =~ ^[0-9a-f]{16}$ ]]; then record_check "${unproven}" "vercel:fingerprint:${vname}" "could not compute a valid in-memory fingerprint ('vercel env run' failed or returned unexpected output); ${unproven} (Redis consistency NOT proven)"
     elif [[ "${out}" == "${vval}" ]]; then record_check PASS "vercel:fingerprint:${vname}" "Vercel value fingerprint matches the expected GCP fingerprint (token never printed)"
     else record_check BLOCKED "vercel:fingerprint:${vname}" "Vercel value fingerprint does NOT match the expected fingerprint; Vercel and GCP reference different Redis credentials"
     fi

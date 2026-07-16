@@ -51,7 +51,7 @@ def _members(policy: dict, role: str) -> list:
 BROAD = {"allUsers", "allAuthenticatedUsers"}
 
 
-def check_provider(pjson: str, issuer: str, audience: str, condition: str) -> None:
+def check_provider(pjson: str, issuer: str, audience: str, condition: str, mapping_json: str) -> None:
     prov = _load(pjson)
     if not isinstance(prov, dict):
         emit("BLOCKED", "wif:provider", "could not parse WIF provider description (fail closed)")
@@ -70,16 +70,26 @@ def check_provider(pjson: str, issuer: str, audience: str, condition: str) -> No
     else:
         emit("PASS", "wif:audience", "allowed audience set matches exactly")
 
-    mapping = prov.get("attributeMapping") or {}
-    if "google.subject" not in mapping:
-        emit("BLOCKED", "wif:attribute-mapping", "required attribute mapping 'google.subject' is missing")
+    # EXACT attribute-mapping comparison: the full dictionary must equal the
+    # expected mapping (same keys, same expressions, no missing, no extras).
+    got_mapping = prov.get("attributeMapping")
+    got_mapping = got_mapping if isinstance(got_mapping, dict) else {}
+    try:
+        want_mapping = json.loads(mapping_json) if mapping_json else None
+    except Exception:
+        want_mapping = None
+    if not isinstance(want_mapping, dict) or not want_mapping:
+        emit("BLOCKED", "wif:attribute-mapping", "no expected attributeMapping supplied; cannot prove the mapping (fail closed)")
     else:
-        # Any mapping key that is not google.* or attribute.* is suspicious.
-        bad = [k for k in mapping if not (k.startswith("google.") or k.startswith("attribute."))]
-        if bad:
-            emit("BLOCKED", "wif:attribute-mapping", f"unexpected attribute mapping key(s): {bad}")
+        got_norm = {str(k): str(v) for k, v in got_mapping.items()}
+        want_norm = {str(k): str(v) for k, v in want_mapping.items()}
+        missing = sorted(set(want_norm) - set(got_norm))
+        extra = sorted(set(got_norm) - set(want_norm))
+        wrong = sorted(k for k in want_norm if k in got_norm and got_norm[k] != want_norm[k])
+        if missing or extra or wrong:
+            emit("BLOCKED", "wif:attribute-mapping", f"attributeMapping mismatch — missing {missing}, extra {extra}, wrong-expression {wrong}")
         else:
-            emit("PASS", "wif:attribute-mapping", "required attribute mapping present and no unsafe keys")
+            emit("PASS", "wif:attribute-mapping", "attributeMapping matches the expected mapping exactly (keys + expressions, no extras)")
 
     got_cond = _norm_condition(str(prov.get("attributeCondition") or ""))
     if not got_cond:
@@ -131,11 +141,13 @@ def main() -> int:
     p.add_argument("--expected-issuer", default="")
     p.add_argument("--expected-audience", default="")
     p.add_argument("--expected-attribute-condition", default="")
+    p.add_argument("--expected-attribute-mapping", default="")
     p.add_argument("--expected-principal-set", default="")
     p.add_argument("--gateway-sa", required=True)
     args = p.parse_args()
     if args.provider_json:
-        check_provider(args.provider_json, args.expected_issuer, args.expected_audience, args.expected_attribute_condition)
+        check_provider(args.provider_json, args.expected_issuer, args.expected_audience,
+                       args.expected_attribute_condition, args.expected_attribute_mapping)
     if args.gateway_policy_json:
         check_gateway_binding(args.gateway_policy_json, args.expected_principal_set)
     if args.run_policy_json:

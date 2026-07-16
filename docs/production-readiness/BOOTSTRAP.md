@@ -101,10 +101,18 @@ presence (`verify_live_config.py`):
 
 The live **Vercel** production environment is verified with exact non-secret
 value checks and an in-memory Redis-token **fingerprint** comparison via
-`vercel env run -e production` (the raw value is never printed), and the
+`vercel env run -e production` (the raw value is never printed; in apply/audit
+mode a verifier that cannot return MATCH/MISMATCH is BLOCKED, never MANUAL), and
+budgets that are non-finite (`NaN`/`Infinity`) are rejected. The
+`check-vercel-config.sh` inspector never passes the token on the command line —
+it is exported as `VERCEL_TOKEN` in the environment only. The
 **Vercel→GCP federation** chain is verified exactly (issuer, allowed audience
-set, attribute mapping/condition, gateway `workloadIdentityUser` principalSet,
-and `run.invoker` == exactly the gateway SA — broad principals rejected).
+set, the **complete** `attributeMapping` dictionary — same keys and expressions,
+no missing and no extra mappings — attribute condition, gateway
+`workloadIdentityUser` principalSet, and `run.invoker` == exactly the gateway SA
+— broad principals rejected). All seven WIF inputs (pool, provider, issuer,
+audience, attribute-condition, attribute-mapping, principal-set) are required
+together; a partial set is BLOCKED and the principalSet is never guessed.
 
 Then it runs the consolidated read-only `production-readiness.sh`.
 **`blocked = 0` is never claimed on the basis of the self-generated manifest**:
@@ -129,9 +137,33 @@ the source of truth) or **exact, case-sensitive** name (default
 and names indicating dev/test/staging/preview/backup/old/archive are rejected.
 Creation uses `database_name` / `platform` (`gcp`) / `primary_region`
 (`us-central1`) / `tls` / `eviction:false` / an explicit plan. The REST URL is
-produced by one canonical normalization (slug, hostname or https URL; malformed
-endpoints rejected). The selected database is validated as active + TLS-enabled
-+ correct platform/region before use.
+produced by one canonical normalization that accepts **only** a documented
+`*.upstash.io` host (or a slug normalized to one); a foreign host, a path,
+query string, userinfo or port is rejected. Validation is fail-closed: the
+database detail must explicitly carry a valid `state`, `tls == true`, the
+expected `platform` and the expected primary region — missing/null metadata is
+BLOCKED.
+
+## `--audit-only` is a complete fail-closed audit
+
+`--audit-only` never mutates anything (it refuses to create an Upstash
+database, create a secret, add a secret version, rotate a token, or configure
+Cloud Run/Vercel), yet it proves the full posture: exact WIF, the selected
+Upstash database + Redis URL/token consistency (when management credentials are
+supplied), the cross-provider Redis fingerprint (Upstash ⇄ Secret Manager ⇄
+Cloud Run ⇄ Vercel, in-memory only), and the exact live Cloud Run / Vercel
+values. **Missing WIF, Vercel or Redis-consistency evidence is BLOCKED in
+`--audit-only` (and `--apply`), never MANUAL** — MANUAL degradation is allowed
+only in `--plan`. Audit success therefore requires every critical group to be
+positively proven; it is never granted on the strength of MANUAL findings.
+
+## Redis-dependent mutations are gated
+
+Cloud Run and the Redis-related Vercel variables are updated **only** after
+reconciliation proves an exact positive numeric Secret Manager version — there
+is no `:latest` fallback. If reconciliation fails or cannot prove a version,
+the bootstrap refuses to touch Cloud Run or the Redis Vercel variables and
+leaves the existing wiring **unchanged**, returning a recovery plan.
 
 ## Redis credential transaction
 

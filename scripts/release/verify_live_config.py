@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -149,6 +150,9 @@ def check_budget(label: str, plain: dict, secret_ref: dict, budget: str) -> None
         num = float(raw)
     except ValueError:
         emit("BLOCKED", f"live:{label}:budget:{budget}", f"{budget}='{raw}' is not numeric")
+        return
+    if not math.isfinite(num):
+        emit("BLOCKED", f"live:{label}:budget:{budget}", f"{budget}='{raw}' is not a finite number (NaN/Infinity rejected)")
         return
     if num <= 0:
         emit("BLOCKED", f"live:{label}:budget:{budget}", f"{budget}={raw} must be strictly greater than zero")

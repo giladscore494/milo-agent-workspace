@@ -54,6 +54,35 @@
   implementation or testing; all cloud calls in tests are strictly mocked and
   Upstash is served by a mock fixture.
 
+## Bootstrap hardening round — audit-only + fail-closed corrections
+
+On top of the exact-value hardening, a further review round tightened
+`bootstrap-production.sh` and its helpers (tooling/tests/docs only; no
+production mutation):
+
+- `check-vercel-config.sh` never passes `--token` on the command line — the
+  token is exported as `VERCEL_TOKEN` in the subprocess environment only; the
+  mock rejects any `--token` argv.
+- `--audit-only` is now a complete fail-closed audit: it runs exact WIF
+  verification, the Upstash/Redis consistency check (when management creds are
+  supplied), and an in-memory cross-provider Redis fingerprint comparison, and
+  it is read-only (never creates a database/secret/version, never rotates, never
+  configures Cloud Run/Vercel). Missing WIF/Vercel/Redis-consistency evidence is
+  BLOCKED (MANUAL only in `--plan`).
+- Redis-dependent mutations are gated: Cloud Run and Redis Vercel variables are
+  updated only after reconciliation proves an exact positive numeric Secret
+  Manager version (no `:latest` fallback); partial failure leaves the existing
+  Redis wiring unchanged.
+- WIF `attributeMapping` is compared as the complete dictionary (expressions +
+  no missing/extra); all seven WIF inputs are required together.
+- Upstash validation is fail-closed on missing/null `state`/`tls`/`platform`/
+  `region` and restricts endpoints to documented `*.upstash.io` hosts (no path/
+  query/userinfo/foreign host).
+- Exact Vercel value/fingerprint verification is mandatory in apply/audit-only
+  (`--strict-values`): an unprovable value is BLOCKED, not MANUAL.
+- Small fixes: the workflow plan job runs only when `mode == plan`; non-finite
+  budgets (`NaN`/`Infinity`) are rejected via `math.isfinite`.
+
 ## Round 2 — six final-review blockers corrected
 
 A second review of the corrective PR surfaced six more production-audit

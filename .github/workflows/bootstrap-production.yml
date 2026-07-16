@@ -51,6 +51,7 @@ env:
 jobs:
   plan:
     name: Plan (read-only)
+    if: ${{ github.event.inputs.mode == 'plan' }}
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -88,6 +89,7 @@ jobs:
           VERCEL_WIF_ISSUER: ${{ vars.VERCEL_WIF_ISSUER }}
           VERCEL_WIF_ALLOWED_AUDIENCE: ${{ vars.VERCEL_WIF_ALLOWED_AUDIENCE }}
           VERCEL_WIF_ATTRIBUTE_CONDITION: ${{ vars.VERCEL_WIF_ATTRIBUTE_CONDITION }}
+          VERCEL_WIF_ATTRIBUTE_MAPPING: ${{ vars.VERCEL_WIF_ATTRIBUTE_MAPPING }}
           VERCEL_WIF_PRINCIPAL_SET: ${{ vars.VERCEL_WIF_PRINCIPAL_SET }}
         run: |
           set -euo pipefail
@@ -99,6 +101,7 @@ jobs:
           [[ -n "${VERCEL_WIF_ISSUER:-}" ]] && wif_args+=(--wif-issuer "${VERCEL_WIF_ISSUER}")
           [[ -n "${VERCEL_WIF_ALLOWED_AUDIENCE:-}" ]] && wif_args+=(--wif-audience "${VERCEL_WIF_ALLOWED_AUDIENCE}")
           [[ -n "${VERCEL_WIF_ATTRIBUTE_CONDITION:-}" ]] && wif_args+=(--wif-attribute-condition "${VERCEL_WIF_ATTRIBUTE_CONDITION}")
+          [[ -n "${VERCEL_WIF_ATTRIBUTE_MAPPING:-}" ]] && wif_args+=(--wif-attribute-mapping "${VERCEL_WIF_ATTRIBUTE_MAPPING}")
           [[ -n "${VERCEL_WIF_PRINCIPAL_SET:-}" ]] && wif_args+=(--wif-principal-set "${VERCEL_WIF_PRINCIPAL_SET}")
           bash scripts/release/bootstrap-production.sh --plan \
             --output-directory "${RUNNER_TEMP}/bootstrap-out" \
@@ -164,6 +167,7 @@ jobs:
           VERCEL_WIF_ISSUER: ${{ vars.VERCEL_WIF_ISSUER }}
           VERCEL_WIF_ALLOWED_AUDIENCE: ${{ vars.VERCEL_WIF_ALLOWED_AUDIENCE }}
           VERCEL_WIF_ATTRIBUTE_CONDITION: ${{ vars.VERCEL_WIF_ATTRIBUTE_CONDITION }}
+          VERCEL_WIF_ATTRIBUTE_MAPPING: ${{ vars.VERCEL_WIF_ATTRIBUTE_MAPPING }}
           VERCEL_WIF_PRINCIPAL_SET: ${{ vars.VERCEL_WIF_PRINCIPAL_SET }}
         run: |
           set -euo pipefail
@@ -174,6 +178,7 @@ jobs:
           [[ -n "${VERCEL_WIF_ISSUER:-}" ]] && wif_args+=(--wif-issuer "${VERCEL_WIF_ISSUER}")
           [[ -n "${VERCEL_WIF_ALLOWED_AUDIENCE:-}" ]] && wif_args+=(--wif-audience "${VERCEL_WIF_ALLOWED_AUDIENCE}")
           [[ -n "${VERCEL_WIF_ATTRIBUTE_CONDITION:-}" ]] && wif_args+=(--wif-attribute-condition "${VERCEL_WIF_ATTRIBUTE_CONDITION}")
+          [[ -n "${VERCEL_WIF_ATTRIBUTE_MAPPING:-}" ]] && wif_args+=(--wif-attribute-mapping "${VERCEL_WIF_ATTRIBUTE_MAPPING}")
           [[ -n "${VERCEL_WIF_PRINCIPAL_SET:-}" ]] && wif_args+=(--wif-principal-set "${VERCEL_WIF_PRINCIPAL_SET}")
           bash scripts/release/bootstrap-production.sh --apply \
             --environment production \
