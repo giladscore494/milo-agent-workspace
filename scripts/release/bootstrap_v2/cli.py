@@ -628,15 +628,19 @@ class BootstrapEngine:
                 )
             )
             out.redis_identity = identity
-        elif self.mode is not Mode.PLAN and out.selected_db is None:
+        elif out.selected_db is None:
+            # Not blocking here: Stage A may legitimately create the database
+            # in this run. Stages D/E block themselves when the identity is
+            # still unavailable, and the final audit reports residual drift.
             out.findings.append(
                 self._finding(
                     "REDIS_IDENTITY_UNAVAILABLE",
-                    "no coherent redis identity yet (database absent); a rerun "
-                    "after creation will adopt it",
+                    "no coherent redis identity yet (database absent); after "
+                    "stage A creates it, a rerun adopts it for cloud run and "
+                    "vercel configuration",
                     stage,
-                    severity=Severity.WARN,
-                    requires_manual=True,
+                    severity=Severity.INFO,
+                    critical=False,
                 )
             )
 
@@ -679,10 +683,16 @@ class BootstrapEngine:
         self._stage_verifications.append(record)
         return verified
 
-    def _stage_result(self, stage: Stage, findings: tuple[Finding, ...] = ()) -> StageResult:
+    def _stage_result(
+        self,
+        stage: Stage,
+        findings: tuple[Finding, ...] = (),
+        reads: tuple[ReadOperation, ...] = (),
+    ) -> StageResult:
         result = StageResult(
             stage=stage,
             findings=findings,
+            reads=reads,
             mutations=self.ledger.records(),
             verifications=tuple(self._stage_verifications),
         )
@@ -1042,9 +1052,13 @@ class BootstrapEngine:
             return False
         exact = iam_validators.verify_exact_policy(new_policy, role, members, stage)
         findings.extend(exact)
+        observed_members: tuple[str, ...] = ()
+        for binding in new_policy.bindings:
+            if binding.role == role and not binding.condition_expression:
+                observed_members = binding.members
         observed = {
             "role": role,
-            "members": sorted(members) if not exact else ["drift"],
+            "members": sorted(observed_members),
             "condition": "",
         }
         if not self._verify_post_write(op, state_digest(observed)):
@@ -1326,7 +1340,10 @@ class BootstrapEngine:
                             stage,
                         )
                     )
-        self._complete(self._stage_result(stage, tuple(findings)), stage)
+        self._complete(
+            self._stage_result(stage, tuple(findings), reads=tuple(audit.reads)),
+            stage,
+        )
         return audit
 
     def _commit_metadata(self, discovery: DiscoveryOutput) -> None:
@@ -1507,7 +1524,9 @@ class BootstrapEngine:
         self.gate = MutationGate(self.plan, self.ledger)
         self._complete(
             StageResult(
-                stage=Stage.APPLY_AUTHORIZED, findings=tuple(auth_findings)
+                stage=Stage.APPLY_AUTHORIZED,
+                findings=tuple(auth_findings),
+                reads=tuple(rediscovery.reads),
             ),
             Stage.APPLY_AUTHORIZED,
         )
