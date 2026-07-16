@@ -1,0 +1,15 @@
+{
+  "_comment": "Template only. Replace every <...> placeholder with REAL identifiers taken from production data. The generator rejects placeholders, malformed UUIDs, duplicate rows, duplicate owners, and projects without an owner. Never invent a user or project.",
+  "memberships": [
+    {
+      "project_id": "<REAL_PROJECT_UUID>",
+      "user_id": "<REAL_OWNER_USER_UUID>",
+      "role": "owner"
+    },
+    {
+      "project_id": "<REAL_PROJECT_UUID>",
+      "user_id": "<REAL_MEMBER_USER_UUID>",
+      "role": "member"
+    }
+  ]
+}

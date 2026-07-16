@@ -19,13 +19,14 @@ from backend.main import app
 from backend.runtime import CancellationRequested
 
 
-def make_tracker(monkeypatch=None, enabled=True, cancellation=None, events=None, usage=None, clock=None, **cfg):
+def make_tracker(monkeypatch=None, enabled=True, cancellation=None, events=None, usage=None, ledger=None, clock=None, **cfg):
     config = BudgetConfig(**cfg)
     tracker = BudgetTracker(
         config,
         cancellation_checker=cancellation,
         event_emitter=(lambda t, p: events.append((t, p))) if events is not None else None,
         usage_recorder=(lambda snap: usage.append(snap)) if usage is not None else None,
+        ledger_recorder=(lambda entry: ledger.append(entry)) if ledger is not None else None,
         kill_switch=lambda: enabled,
     )
     if clock is not None:
@@ -74,20 +75,31 @@ def test_model_call_limit_stops_further_calls():
 
 
 @pytest.mark.parametrize("field,limit,usage,code", [
-    ("max_input_tokens_per_run", 100, (150, 0), "INPUT_TOKEN_LIMIT_REACHED"),
-    ("max_output_tokens_per_run", 100, (0, 150), "OUTPUT_TOKEN_LIMIT_REACHED"),
-    ("max_total_tokens_per_run", 100, (60, 60), "TOTAL_TOKEN_LIMIT_REACHED"),
+    ("max_input_tokens_per_run", 100, (150, 0), "INPUT_TOKEN_LIMIT_EXCEEDED"),
+    ("max_output_tokens_per_run", 100, (0, 150), "OUTPUT_TOKEN_LIMIT_EXCEEDED"),
+    ("max_total_tokens_per_run", 100, (60, 60), "TOTAL_TOKEN_LIMIT_EXCEEDED"),
 ])
 def test_token_limits_stop_further_calls(field, limit, usage, code):
     events = []
-    tracker = make_tracker(events=events, **{field: limit})
+    ledger = []
+    recorded_usage = []
+    tracker = make_tracker(events=events, ledger=ledger, usage=recorded_usage, **{field: limit})
     tracker.before_call()
-    tracker.after_call(*usage)
     with pytest.raises(BudgetExceeded) as exc:
-        tracker.before_call()
+        tracker.after_call(*usage)
     assert exc.value.code == code
     assert exc.value.event_type == "token_limit_reached"
+    assert tracker.stop is not None
     assert tracker.model_calls == 1
+    assert tracker.input_tokens == usage[0]
+    assert tracker.output_tokens == usage[1]
+    assert recorded_usage and recorded_usage[-1]["input_tokens"] == usage[0]
+    assert recorded_usage[-1]["output_tokens"] == usage[1]
+    assert any(entry.get("decision") == "overage" and entry.get("rejection_reason") == code for entry in ledger)
+    assert any(t == "token_limit_reached" for t, _ in events)
+    with pytest.raises(BudgetExceeded) as later:
+        tracker.before_call()
+    assert later.value.code == code
 
 
 def test_estimated_cost_budget_blocks_next_call():
@@ -103,10 +115,14 @@ def test_estimated_cost_budget_blocks_next_call():
 def test_actual_recorded_cost_blocks_next_call():
     tracker = make_tracker(max_cost_per_run=1.0, estimated_cost_per_call=0.0)
     tracker.before_call()
-    tracker.after_call(1, 1, cost=1.5)
     with pytest.raises(BudgetExceeded) as exc:
+        tracker.after_call(1, 1, cost=1.5)
+    assert exc.value.code == "COST_LIMIT_EXCEEDED"
+    assert tracker.actual_cost == pytest.approx(1.5)
+    assert tracker.stop is not None
+    with pytest.raises(BudgetExceeded) as later:
         tracker.before_call()
-    assert exc.value.code == "COST_LIMIT_REACHED"
+    assert later.value.code == "COST_LIMIT_EXCEEDED"
 
 
 def test_duration_limit_times_out():
@@ -336,14 +352,18 @@ def test_reserve_clamps_max_tokens_to_remaining_allowance():
     tracker.settle_call(10, allowed, 0, 0)
 
 
-def test_reservation_rejects_call_with_no_remaining_output_budget():
+def test_reservation_immediately_rejects_actual_output_overage_and_blocks_next_call():
     tracker = make_tracker(max_output_tokens_per_run=25, estimated_cost_per_call=0.0)
     inner = MockClient()
     guarded = GuardedModelClient(inner, tracker)
-    guarded.chat.completions.create(model="mock", messages=[], max_tokens=25)  # settles 30 actual
     with pytest.raises(BudgetExceeded) as exc:
+        guarded.chat.completions.create(model="mock", messages=[], max_tokens=25)  # settles 30 actual
+    assert exc.value.code == "OUTPUT_TOKEN_LIMIT_EXCEEDED"
+    assert inner.chat.completions.calls == 1
+    assert tracker.stop is not None
+    with pytest.raises(BudgetExceeded) as later:
         guarded.chat.completions.create(model="mock", messages=[], max_tokens=25)
-    assert exc.value.code == "OUTPUT_TOKEN_LIMIT_REACHED"
+    assert later.value.code == "OUTPUT_TOKEN_LIMIT_EXCEEDED"
     assert inner.chat.completions.calls == 1  # second call never reached the adapter
 
 

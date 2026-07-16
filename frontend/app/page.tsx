@@ -76,6 +76,8 @@ export default function WorkspacePage() {
   const { state, mode } = useRunRealtime(executionUi ? activeRunId : undefined);
   const agents = Object.values(state.agents);
   const runStatus = state.run?.status;
+  const launchState = state.run?.launch_state;
+  const launchReconciliationRequired = state.run?.launch_reconciliation_required;
   const runIsTerminal = !!runStatus && TERMINAL_STATES.has(runStatus);
 
   useEffect(() => {
@@ -380,6 +382,12 @@ export default function WorkspacePage() {
               )}
               {cancelError && <p role="alert">{safeText(cancelError)}</p>}
               {runIsTerminal && <p>Run finished with status <b>{safeText(runStatus)}</b>.</p>}
+              {launchState && (
+                <p>
+                  Launch state <b>{safeText(launchState)}</b>
+                  {launchReconciliationRequired ? ' — reconciliation required.' : '.'}
+                </p>
+              )}
             </article>
           ) : (
             <article className="run-card">

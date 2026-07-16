@@ -1,121 +1,150 @@
 # Production readiness — persistent status
 
-- **Branch:** `claude/production-readiness-j0hhni`
-- **PR:** #26 (single PR; not merged)
-- **Head SHA:** tip of this branch (the `audit:` commit); updated every run
+- **Scope:** Corrective pass on the Phase 9–11 operator/release tooling after
+  a live read-only Google Cloud Shell inspection exposed production-operator
+  defects that the mocked Phase 9–11 CI did not catch.
+- **Corrective branch:** `claude/fix-operator-tooling-audit-ry0s6f`
+- **Corrective PR:**
+  [#33](https://github.com/giladscore494/milo-agent-workspace/pull/33)
+  (base: `claude/production-readiness-j0hhni`; does **not** target `main`).
+- **Base:** `claude/production-readiness-j0hhni` at
+  `2df9e74a910ec47d30910933f3bf2837237392f9` (the merge commit of PR #31,
+  "Phases 9–11 operator tooling …").
+- **Corrective head SHA (round 1):** `77b7ee525bf4b0560b8a61c57c8f8d2af79236b9`.
+- **Corrective head SHA (round 2, final-review blockers):** committed atop
+  round 1 on the same branch/PR (see the follow-up commit; CI reruns on the
+  final head before any merge decision).
 
-## Phase status
+## Round 2 — six final-review blockers corrected
 
-| Phase | Area | Status |
-| --- | --- | --- |
-| 1 | Proposal ownership + browser-route authorization | CORRECTED (audit fixes applied) |
-| 2 | Worker service-to-service authentication | CORRECTED (gateway/worker separation added) |
-| 3 | Idempotent run creation + lifecycle | CORRECTED (transaction-safe + atomic launch/lease) |
-| 4 | Budget, cost and resource limits | CORRECTED (hard pre-call reservation + ledger) |
-| 5 | Shared-store rate limiting | CORRECTED (project keys + trusted IP) |
-| 6 | Frontend execution UI + polling | CORRECTED (run-state isolation) |
-| 7 | Playwright E2E suite | CORRECTED (identity + isolation coverage; 31 tests) |
-| 8 | Production configuration validation | CORRECTED (gateway auth, identity separation, test-adapter bans) |
-| 9 | Migration and operator tooling | NOT STARTED |
-| 10 | Deployment and rollback preparation | NOT STARTED |
-| 11 | Final documentation | NOT STARTED |
+A second review of the corrective PR surfaced six more production-audit
+correctness blockers, all now fixed on the same PR #33 branch (tooling, tests
+and docs only — no production mutation):
 
-## Corrections applied in the Phases 1–8 corrective audit
+1. **Execution-disabled smoke test did not prove authentication.** The gateway
+   returns the run-creation 403 before validating the token, so a random
+   non-empty token still got the expected 403. The script now first performs
+   an authenticated read `GET /conversations/<id>` and requires HTTP 200
+   (token valid + owns the conversation) before the run-creation probe;
+   401→BLOCKED (invalid token), 403/404→BLOCKED (not owned), missing→MANUAL.
+   The curl mock now judges token validity by the token VALUE, not header
+   presence.
+2. **Secret Manager consumer checks ignored the IAM role.** Consumer/extra/
+   wildcard checks now parse the policy structurally (`iam_role_members`) and
+   only consider members of the exact `roles/secretmanager.secretAccessor`
+   binding; an SA under viewer/admin/metadata roles never satisfies or
+   pollutes accessor validation.
+3. **Vercel project identity was not fail-closed.** Identity is now proven by
+   reading `projectId`/`orgId` from `.vercel/project.json` and matching them
+   against `vercel project inspect`; a missing/malformed link file, failed
+   inspection, differing project ID, or differing org is BLOCKED (not a WARN),
+   before any variable is inspected.
+4. **Missing vs permission/API failures conflated.** Artifact Registry
+   describe, service-account describe, secret versions list, secret listing,
+   and project/secret IAM policy reads now capture stdout+stderr+exit and only
+   classify a clean NOT_FOUND as "missing"; permission/API/network failures are
+   MANUAL/BLOCKED inspection failures, never a false "resource missing" / "no
+   enabled version" / silently-passed consumer check.
+5. **`leave-unresolved` bypassed the operator guard.** It now requires an
+   explicit run id and the full `apply_guard` identity checks (it needs no
+   writable DB), optionally revalidates read-only that the run is still
+   `launch_unknown`, and writes the enriched audit record only after the guard
+   passes.
+6. **`no-secret-returned` health check could false-PASS.** It now requires a
+   successful curl, HTTP 200, and a non-empty body before scanning; a
+   transport failure, non-200, or empty body is BLOCKED.
 
-1. **Trusted gateway identity** (`fix: authenticate trusted browser gateway identity`)
-   — `backend/gateway_auth.py` verifies a Google-signed `X-Milo-Gateway-Token`
-   (signature/issuer/audience/expiry/verified email/allowlist;
-   `MILO_GATEWAY_AUDIENCE` + `MILO_APPROVED_GATEWAY_IDENTITIES`, separate
-   from worker auth) before any `x-milo-auth-*` header is trusted.
-   Production fails closed when unconfigured. Worker identities cannot
-   impersonate browser users; gateway identities cannot call worker routes.
-2. **Protected proposal ownership + atomic project creation**
-   — column-scoped UPDATE grants exclude `created_by`/`project_id`;
-   `create_project_from_proposal_with_owner()` commits project + owner
-   membership in one transaction (no orphan projects). Migration 011.
-3. **Atomic run creation/admission** — `create_message_and_run()` (migration
-   012) creates the user message + run with idempotent replay and
-   per-user/per-project admission under advisory locks in one transaction;
-   proven with real concurrent PostgreSQL sessions.
-4. **Atomic launch ownership** — compare-and-set to `launching`; exactly one
-   launcher call per run; uncertain launch responses park the run as
-   `launch_unknown` and are never auto-relaunched; definite failures stay
-   retryable.
-5. **Atomic worker lease** — `claim_run_lease()` single-statement CAS; one
-   active holder, expiry reclaim with attempt increment, heartbeat
-   ownership, stale-worker writes blocked by `expected_worker_id` + status
-   CAS; cancellation stays visible through claims.
-6. **Worker-only provider credentials** — API key read only from
-   `KIMI_API_KEY`/`MOONSHOT_API_KEY` worker env; run-input keys provably
-   ignored; paid execution fails closed without a key.
-7. **Hard pre-call budgets** — thread-safe `reserve_call()` checks kill
-   switch, lease, cancellation, time, calls, agent steps, retries,
-   estimated input tokens, remaining input/output/total tokens (incl.
-   in-flight reservations), estimated/actual cost and daily budgets BEFORE
-   the call; clamps `max_tokens`; concurrent calls cannot double-spend.
-8. **Usage ledger** — append-only `run_usage_ledger` (migration 013) with
-   decimal-safe costs, per-decision rows, DB trigger forbidding
-   update/delete for every role; daily user/project budget queries prefer
-   settled actuals.
-9. **Project rate-limit key** — run creation limits by real project id.
-10. **Trusted client IP** — platform-set headers preferred; strict IP
-    validation; malformed values collapse to one bucket.
-11. **Frontend run isolation** — reducer reset + generation guard on run
-    switch/sign-out; late responses from a previous run are dropped; all
-    six terminal states stop polling.
-12. **E2E identity coverage** — 31 tests across two stacks, both running
-    with real gateway verification (no bare header trust anywhere in E2E).
-13. **Guaranteed PostgreSQL CI** — dedicated `postgres-checks` job with
-    `MILO_REQUIRE_PG_TESTS=1` (missing binaries fail, any skip fails).
-14. **Config/static safety** — production rejects missing gateway auth,
-    shared gateway/worker identities and test adapters; `scripts/release/`
-    is no longer exempt from unsafe-default scanning.
+These are covered by new strict tests in `tests/test_release_tooling_cli.py`
+(now 83 tests) plus new fixtures.
 
-## Migrations
+## What was wrong (found only by the real read-only Cloud Shell audit)
 
-- `008` proposal ownership (+ column-scoped update grant correction)
-- `009` run idempotency + lifecycle columns
-- `010` run usage aggregate
-- `011` proposal ownership protection + atomic project creation (NEW)
-- `012` atomic run operations: create_message_and_run, launch_unknown, claim_run_lease (NEW)
-- `013` append-only usage ledger (NEW)
+The Phase 9–11 CI was green because its mocks were too permissive. A real
+Cloud Shell inspection surfaced these defects, all now corrected:
 
-All additive/idempotent/data-preserving; none applied to production.
+1. **Cloud Run Job service-account path** — the checker and generated
+   verification commands read `spec.template.template.spec.serviceAccountName`,
+   which is wrong for a Cloud Run **Job** (missing the ExecutionSpec level).
+   It always resolved empty and a real existing job was misreported as "job
+   not found". Corrected to `spec.template.spec.template.spec.serviceAccountName`
+   via structured `--format json` parsing, and an existing job with **no**
+   explicit SA is now a blocking finding (it must not silently use the default
+   Compute Engine service account).
+2. **Vercel CLI** — used the unsupported `vercel env ls production
+   --scope-project`. Replaced with supported syntax operating on the linked
+   project, names-only parsing, and explicit classification of auth failure /
+   unlinked / wrong project / empty environment (never `2>/dev/null || true`).
+3. **launch_unknown reconciliation** — wrote the audit record before the
+   mutation and treated a successful `psql` process as success even when the
+   `UPDATE` changed zero rows. Now uses `UPDATE … RETURNING`, requires exactly
+   one affected row, enforces state/status/lease guards, and writes the audit
+   record only after a validated one-row success.
+4. **Execution-disabled smoke test** — accepted a bare 401 as proof. Now
+   requires an authenticated user + owned conversation and an execution-disabled
+   403 with the application classification; any authenticated 2xx is BLOCKED.
+5. **Secret Manager** — the orchestrator invoked the checker with no expected
+   secrets/consumers. It now derives `name=consumer` expectations from the
+   manifest (mapping api/worker/gateway to the exact SA emails) and never
+   claims verification when no concrete expectations exist.
+6. **Aggregate report** — top-level totals did not sum nested findings. A
+   dedicated aggregator now produces true consolidated totals, a
+   `blocking_findings` list, a de-duplicated `manual_actions_remaining` list,
+   valid JSON even when a sub-audit fails, and a nonzero exit when blocked > 0.
+7. **Redis** — the orchestrator gained `--redis-expected-environment` and
+   `--redis-allow-network`, and the report states whether Redis was statically
+   checked, live-probed, not probed, inaccessible, or incorrectly shared.
 
-## Exact test results (this corrective run, local)
+## Corrective validation (this checkout)
 
 - `pytest -q tests --ignore=MILO-main-original/MILO-main/test_websearch.py`
-  with `MILO_REQUIRE_PG_TESTS=1`: **382 passed, 0 failed, 0 skipped**
-  (includes the ephemeral-PostgreSQL suite: 82 executable migration,
-  RLS and concurrency tests).
+  — **507 passed** (includes the 29 permissive release-tooling tests and the
+  83 strict CLI regression tests in `tests/test_release_tooling_cli.py`, which
+  now cover the round-2 blockers as well).
+- `MILO_REQUIRE_PG_TESTS=1 pytest -q tests/test_migrations_postgres.py`
+  — **71 passed, 0 skipped** (real ephemeral PostgreSQL).
 - `python scripts/check_migrations.py` — passed.
 - `python scripts/secret_scan.py` — passed.
 - `python scripts/check_unsafe_defaults.py` — passed.
-- Frontend: `tsc --noEmit` clean; `vitest` **60 passed**; `next build`
-  succeeded; `test:static` and `test:secrets` passed.
-- Playwright E2E: **31 passed** (13 disabled-stack, 18 enabled-stack),
-  0 failed, 0 skipped.
-- Docker builds: **not runnable in this sandbox** (no Docker daemon);
-  built by the CI `offline-checks` job on the pushed head.
-
-## Unresolved risks
-
-- `launch_unknown` reconciliation is manual by design (operator tooling
-  arrives in Phase 9); such runs are never auto-relaunched.
-- The `authenticated` DB role retains legacy-era table grants from
-  migration 007 (reads scoped by RLS); the backend itself uses the service
-  role. Revisit during Phase 9/10 review.
-- Daily-budget aggregation reads up to 2000 ledger rows per check; fine at
-  current scale, revisit before broad access.
-- Docker builds and the new CI jobs are validated by CI, not locally.
+- `shellcheck -x -S warning -P scripts/release scripts/release/*.sh
+  scripts/release/lib/common.sh` — clean.
+- `python3 scripts/release/validate_production_manifest.py --manifest
+  config/production.example.yaml --mode plan` — passed.
+- Frontend: `npm ci` OK; `npx tsc --noEmit` OK; `npm test -- --run` —
+  **60 passed**; `npm run build` OK; `npm run test:static` OK;
+  `npm run test:secrets` OK.
+- Docker image builds (`Dockerfile.api`, `Dockerfile.worker`): not runnable in
+  this sandbox (no Docker daemon); built and verified by the `offline-checks`
+  CI job. No Dockerfile changed in this PR.
+- Isolated Playwright E2E: enforced by the `e2e` CI job (mocked
+  auth/worker/provider); no frontend runtime changed in this PR.
 
 ## Execution-safety confirmation
 
-All execution flags remain **default-off**. No deployment, IAM mutation,
-production migration apply, secret read/write, real Cloud Run worker
-execution or paid model API call occurred in this run.
+This corrective PR changes **tooling, tests and documentation only**. No
+production deployment, IAM change, Secret Manager change, production
+migration, backfill, Redis mutation, worker execution, or paid provider call
+occurred. Every operator script still defaults to check/plan/dry-run; mutation
+still requires the full protected apply mode, exercised only against mocks.
 
-## Next task
+## Deployment posture
 
-**Phase 9 — Migration and operator tooling** (next run). Phases 9–11 are
-not complete and not started.
+**Production deployment remains BLOCKED** until this corrective PR is merged
+into `claude/production-readiness-j0hhni` **and** a real read-only audit report
+is produced from authenticated operator tooling against the live project:
+
+    scripts/release/production-readiness.sh \
+      --json-output readiness.json \
+      --manifest <COMPLETED_OPERATOR_MANIFEST> \
+      --env-file <APPROVED_ENV_METADATA> \
+      --expected-project <GCP_PROJECT_ID> \
+      --expected-account "$(gcloud config get-value account)" \
+      --region <GCP_REGION> --repository <ARTIFACT_REGISTRY_REPOSITORY> \
+      --api-service <CLOUD_RUN_API_SERVICE> --worker-job <CLOUD_RUN_WORKER_JOB> \
+      --api-sa <API_SERVICE_ACCOUNT_EMAIL> --worker-sa <WORKER_SERVICE_ACCOUNT_EMAIL> \
+      --vercel-project <VERCEL_PROJECT_NAME> \
+      --database-url-env MILO_READONLY_DB_URL \
+      --redis-expected-environment production
+
+No document in this set claims the live production environment passed; that
+statement may only be made after the command above produces a report with zero
+consolidated blocking findings.

@@ -1,0 +1,10 @@
+{
+  "_comment": "Template only. Replace every <...> placeholder with REAL identifiers taken from production data. The generator rejects placeholders, malformed UUIDs, orphan proposals (missing owner or project) and conflicting owners. Never invent an identity.",
+  "proposals": [
+    {
+      "proposal_id": "<REAL_PROPOSAL_UUID>",
+      "created_by": "<REAL_USER_UUID>",
+      "project_id": "<REAL_PROJECT_UUID>"
+    }
+  ]
+}

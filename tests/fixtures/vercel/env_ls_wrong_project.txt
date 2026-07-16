@@ -1,0 +1,5 @@
+Vercel CLI 34.0.0
+> Environment Variables found in Project some-other-project [301ms]
+
+  name                                      value       environments      created
+  CLOUD_RUN_API_URL                         Encrypted   Production        5d ago

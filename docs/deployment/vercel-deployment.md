@@ -1,3 +1,5 @@
+> **ARCHIVED (historical).** This document predates Phases 1–11 and may contain stale claims (e.g. in-memory rate limiting, pre-gateway auth, earlier migration coverage). The authoritative, current documentation is [`docs/production-readiness/`](../production-readiness/README.md). Where this file contradicts that set, that set wins.
+
 # Vercel frontend deployment
 
 The production frontend is a Next.js application in `frontend/`. Keep Vercel configured as a normal Next.js project; do not configure it as a static `public` directory deployment and do not set a custom output directory.

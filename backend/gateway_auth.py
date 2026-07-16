@@ -23,11 +23,10 @@ Modes:
 
 - configured (either variable set): verification is REQUIRED; both
   variables must be present, otherwise every request fails closed (503).
-- unconfigured + production: fail closed (503) — production may never fall
-  back to bare header trust.
-- unconfigured + non-production: development/test mode; header identity is
-  accepted so isolated unit tests and local stacks work. The E2E stacks
-  configure real (mock-verified) gateway auth instead of relying on this.
+- unconfigured: fail closed (503) by default.
+- unconfigured + ``MILO_ALLOW_INSECURE_DEV_IDENTITY=true`` + non-production:
+  explicit development/test mode; header identity is accepted for isolated
+  local stacks only. The opt-in is forbidden in production.
 
 A worker identity cannot impersonate a browser user: worker tokens carry
 the worker audience and a worker service account, so they fail the
@@ -86,15 +85,21 @@ def _is_production() -> bool:
     return os.getenv("ENVIRONMENT", "local").strip().lower() == "production"
 
 
+def insecure_dev_identity_allowed() -> bool:
+    return os.getenv("MILO_ALLOW_INSECURE_DEV_IDENTITY", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def verify_gateway_token(token: str | None, verifier: TokenVerifier) -> GatewayIdentity | None:
     """Verify the gateway service token; returns None only in explicit
     non-production development mode with gateway auth unconfigured."""
     audience = os.getenv("MILO_GATEWAY_AUDIENCE", "").strip()
     approved = _approved_gateway_identities()
     if not audience and not approved:
-        if _is_production():
-            raise AppError("GATEWAY_AUTH_NOT_CONFIGURED", "trusted gateway authentication is not configured", 503)
-        return None  # documented non-production development mode
+        if insecure_dev_identity_allowed():
+            if _is_production():
+                raise AppError("INSECURE_DEV_IDENTITY_FORBIDDEN", "insecure development identity headers are forbidden in production", 503)
+            return None  # explicit local/test opt-in only
+        raise AppError("GATEWAY_AUTH_NOT_CONFIGURED", "trusted gateway authentication is not configured", 503)
     if not audience or not approved:
         # Partial configuration is always a hard failure: never guess.
         raise AppError("GATEWAY_AUTH_NOT_CONFIGURED", "trusted gateway authentication is not fully configured", 503)

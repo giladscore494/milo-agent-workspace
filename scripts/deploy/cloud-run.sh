@@ -12,7 +12,7 @@ SHORT_SHA=$(git rev-parse --short HEAD)
 API_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:$SHORT_SHA"
 WORKER_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/worker:$SHORT_SHA"
 REQUIRED_APIS=(run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com)
-REQUIRED_SECRETS=(KIMI_API_KEY SUPABASE_URL SUPABASE_SECRET_KEY)
+REQUIRED_SECRETS=(KIMI_API_KEY SUPABASE_URL SUPABASE_SECRET_KEY UPSTASH_REDIS_REST_URL UPSTASH_REDIS_REST_TOKEN)
 ENV_VAR_DELIMITER="@"
 
 fail() {
@@ -110,7 +110,7 @@ gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --config scripts
 gcloud run jobs deploy "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" --image "$WORKER_IMAGE" \
   --service-account "$SERVICE_ACCOUNT" --cpu 2 --memory 2Gi --task-timeout 3600 --max-retries 1 --parallelism 1 --tasks 1 \
   --set-env-vars ENVIRONMENT=production,GCP_PROJECT_ID="$PROJECT_ID",GCP_REGION="$REGION" \
-  --set-secrets SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest,KIMI_API_KEY=KIMI_API_KEY:latest
+  --set-secrets SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest,KIMI_API_KEY=KIMI_API_KEY:latest,UPSTASH_REDIS_REST_URL=UPSTASH_REDIS_REST_URL:latest,UPSTASH_REDIS_REST_TOKEN=UPSTASH_REDIS_REST_TOKEN:latest
 
 gcloud run jobs add-iam-policy-binding "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" \
   --member "serviceAccount:$SERVICE_ACCOUNT" --role roles/run.jobsExecutorWithOverrides >/dev/null
@@ -118,7 +118,7 @@ gcloud run jobs add-iam-policy-binding "$WORKER_JOB" --project "$PROJECT_ID" --r
 gcloud run deploy "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" --image "$API_IMAGE" \
   --service-account "$SERVICE_ACCOUNT" --no-allow-unauthenticated --port 8080 --cpu 1 --memory 1Gi --timeout 300 --max-instances 10 \
   --set-env-vars "^${ENV_VAR_DELIMITER}^ENVIRONMENT=production${ENV_VAR_DELIMITER}JOB_LAUNCHER=cloud_run${ENV_VAR_DELIMITER}GCP_PROJECT_ID=$PROJECT_ID${ENV_VAR_DELIMITER}GCP_REGION=$REGION${ENV_VAR_DELIMITER}CLOUD_RUN_WORKER_JOB=$WORKER_JOB${ENV_VAR_DELIMITER}ALLOWED_CORS_ORIGINS=$ALLOWED_CORS_ORIGINS" \
-  --set-secrets SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest,KIMI_API_KEY=KIMI_API_KEY:latest
+  --set-secrets SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest,KIMI_API_KEY=KIMI_API_KEY:latest,UPSTASH_REDIS_REST_URL=UPSTASH_REDIS_REST_URL:latest,UPSTASH_REDIS_REST_TOKEN=UPSTASH_REDIS_REST_TOKEN:latest
 
 service_url=$(gcloud run services describe "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')
 echo "API service URL: $service_url"

@@ -1,0 +1,78 @@
+# MILO production release configuration manifest — TEMPLATE.
+#
+# Non-secret metadata only: names, identifiers and flags. NEVER put a
+# secret value, credential, token or key in this file. Secret entries below
+# are Secret Manager RESOURCE NAMES, not values.
+#
+# Copy to a private operator location, replace every <PLACEHOLDER>, and
+# validate with:
+#   python3 scripts/release/validate_production_manifest.py --manifest <copy> --mode plan
+# Apply-mode validation (used by generators before any mutation-capable
+# operation) additionally rejects placeholders:
+#   python3 scripts/release/validate_production_manifest.py --manifest <copy> --mode apply
+
+gcp:
+  project_id: "<GCP_PROJECT_ID>"
+  region: "<GCP_REGION>"
+  artifact_registry_repository: "<ARTIFACT_REGISTRY_REPOSITORY>"
+  cloud_run_api_service: "<CLOUD_RUN_API_SERVICE>"
+  cloud_run_worker_job: "<CLOUD_RUN_WORKER_JOB>"
+
+identities:
+  api_service_account: "<API_SERVICE_ACCOUNT_EMAIL>"
+  worker_service_account: "<WORKER_SERVICE_ACCOUNT_EMAIL>"
+  gateway_identity: "<GATEWAY_IDENTITY_EMAIL>"
+  deploy_operator: "<OPERATOR_EMAIL>"
+
+supabase:
+  project_ref: "<SUPABASE_PROJECT_REF>"
+
+vercel:
+  project_name: "<VERCEL_PROJECT_NAME>"
+
+redis:
+  logical_environment: "production"
+
+cors:
+  # Explicit browser origins only. Wildcards are rejected by validation.
+  allowed_origins:
+    - "<PRODUCTION_VERCEL_ORIGIN>"
+
+release:
+  # Full 40-character immutable commit SHA. Mutable tags are rejected.
+  sha: "<RELEASE_SHA>"
+  # Last known-good release SHA used as the rollback target.
+  rollback_sha: "<PREVIOUS_RELEASE_SHA>"
+
+# Environment-variable NAMES that carry budget caps (values are configured
+# on the Cloud Run services, not here).
+budgets:
+  - MILO_MAX_COST_PER_RUN
+  - MILO_DAILY_USER_BUDGET
+  - MILO_DAILY_PROJECT_BUDGET
+  - MILO_MAX_MODEL_CALLS_PER_RUN
+  - MILO_MAX_TOTAL_TOKENS_PER_RUN
+  - MILO_MAX_RUN_DURATION_SECONDS
+
+# Execution flags with their required Stage A values. Validation rejects a
+# manifest that turns any of these on during Stage A.
+execution_flags:
+  MILO_ENABLE_RUN_CREATION: false
+  MILO_ENABLE_PROPOSAL_MUTATIONS: false
+  MILO_ENABLE_PROPOSAL_READS: false
+  MILO_ENABLE_RUN_CANCELLATION: false
+  MILO_ENABLE_EXECUTION_CONTROL: false
+  MILO_ENABLE_PAID_EXECUTION: false
+  GATEWAY_ALLOW_EXECUTION_ROUTES: false
+
+# Secret Manager RESOURCE NAMES (never values) and their sole consumers.
+secrets:
+  supabase_service_key:
+    name: "<SUPABASE_SERVICE_KEY_SECRET_NAME>"
+    consumers: ["api", "worker"]
+  provider_api_key:
+    name: "<PROVIDER_KEY_SECRET_NAME>"
+    consumers: ["worker"]
+  redis_rest_token:
+    name: "<REDIS_TOKEN_SECRET_NAME>"
+    consumers: ["api", "worker"]

@@ -98,6 +98,8 @@ revoke execute on function public.create_message_and_run(uuid, text, jsonb, uuid
 --    one caller can hold an unexpired lease; expired leases are reclaimable
 --    with an incremented attempt; a pre-claim cancellation request stays
 --    visible (status is preserved). Returns no row when the lease is held.
+alter table public.runs add column if not exists lease_token text;
+
 create or replace function public.claim_run_lease(
   p_run_id uuid,
   p_worker_id text,
@@ -114,6 +116,7 @@ as $$
       else coalesce(attempt, 1)
     end,
     worker_id = p_worker_id,
+    lease_token = encode(gen_random_bytes(32), 'hex'),
     lease_expires_at = now() + make_interval(secs => p_lease_seconds),
     started_at = coalesce(started_at, now()),
     updated_at = now()
