@@ -1661,6 +1661,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--upstash-database-id", default="")
     parser.add_argument("--approved-plan-digest", default="")
     parser.add_argument(
+        "--trusted-ref",
+        default="claude/production-readiness-j0hhni",
+        help="the only ref apply mode accepts as local HEAD",
+    )
+    parser.add_argument(
         "--confirm-production-change",
         action="store_true",
         help="required for apply mode alongside MILO_OPERATOR_ACK",
@@ -1687,6 +1692,7 @@ def main(argv: list[str] | None = None) -> int:
         supabase_project_ref=args.supabase_project_ref,
         production_origin=args.production_origin,
         upstash_database_id=args.upstash_database_id,
+        trusted_ref=args.trusted_ref,
         operator_ack=os.environ.get("MILO_OPERATOR_ACK", ""),
     )
 

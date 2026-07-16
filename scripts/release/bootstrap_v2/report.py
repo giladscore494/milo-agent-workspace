@@ -16,7 +16,9 @@ from pathlib import Path
 from .model import RunResult
 
 _REDACT_PATTERNS = (
-    re.compile(r"(?i)\b(token|secret|password|credential|apikey|api_key)\s*[=:]\s*\S+"),
+    re.compile(
+        r"(?i)\w*(?:token|secret|password|credential|api_?key)\w*\s*[=:]\s*\S+"
+    ),
     re.compile(r"(?i)bearer\s+[a-z0-9._-]+"),
     re.compile(r"https://[^/\s:@]+:[^@\s]+@"),
 )

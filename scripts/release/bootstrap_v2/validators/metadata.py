@@ -44,6 +44,7 @@ _SECRET_LOOKING_ALLOWED: frozenset[str] = frozenset(
         "REDIS_TOKEN_SECRET_NAME",
         "SUPABASE_URL_SECRET_NAME",
         "MILO_REDIS_TOKEN_FINGERPRINT",
+        "MILO_REDIS_SECRET_VERSION",
     }
 )
 

@@ -141,24 +141,24 @@ def parse_cloud_run_v1(
 
     if not isinstance(payload, dict):
         return None
-    spec = payload.get("spec", {})
+    spec = payload.get("spec")
     if not isinstance(spec, dict):
         return None
-    template = spec.get("template", {})
+    template = spec.get("template")
     if not isinstance(template, dict):
         return None
-    inner = template.get("spec", {})
+    inner = template.get("spec")
     if not isinstance(inner, dict):
         return None
     if is_job:
-        inner_template = inner.get("template", {})
+        inner_template = inner.get("template")
         if not isinstance(inner_template, dict):
             return None
-        inner = inner_template.get("spec", {})
+        inner = inner_template.get("spec")
         if not isinstance(inner, dict):
             return None
-    containers_raw = inner.get("containers", [])
-    if not isinstance(containers_raw, list):
+    containers_raw = inner.get("containers")
+    if not isinstance(containers_raw, list) or not containers_raw:
         return None
     containers: list[CloudRunContainerState] = []
     for entry in containers_raw:

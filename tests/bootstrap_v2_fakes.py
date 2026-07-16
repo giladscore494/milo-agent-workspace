@@ -89,16 +89,33 @@ class CallLog:
     def __init__(self) -> None:
         self.records: list[CallRecord] = []
         self._seq = 0
+        self.counts: dict[str, int] = {}
 
     def record(self, provider: str, kind: str, operation: str, resource: str) -> int:
         self._seq += 1
         self.records.append(
             CallRecord(self._seq, provider, kind, operation, resource)
         )
+        self.counts[operation] = self.counts.get(operation, 0) + 1
         return self._seq
 
     def writes(self) -> list[CallRecord]:
         return [r for r in self.records if r.kind == "write"]
+
+
+def resolve_fault(faults: dict[str, str], log: CallLog, label: str) -> str | None:
+    """Resolve a fault for this invocation of ``label``.
+
+    Plain key ``label`` fires on every call; ``label#N`` fires only on the
+    N-th call of that label (1-based), enabling e.g. final-audit-only read
+    failures.
+    """
+
+    if label in faults:
+        return faults[label]
+    call_number = log.counts.get(label, 0)
+    counted = f"{label}#{call_number}"
+    return faults.get(counted)
 
 
 def make_config(**overrides) -> BootstrapConfig:
@@ -240,7 +257,7 @@ class FakeUpstash:
         self.faults = dict(faults or {})
 
     def _fault(self, label: str) -> ProbeOutcome | None:
-        mode = self.faults.get(label)
+        mode = resolve_fault(self.faults, self.log, label)
         if mode in _FAULT_OUTCOMES:
             return _FAULT_OUTCOMES[mode]
         return None
@@ -329,7 +346,7 @@ class FakeGcp:
         self.faults = dict(faults or {})
 
     def _fault_probe(self, label: str) -> GcpProbe | None:
-        mode = self.faults.get(label)
+        mode = resolve_fault(self.faults, self.log, label)
         if mode in _FAULT_OUTCOMES:
             return GcpProbe(outcome=_FAULT_OUTCOMES[mode], detail="injected fault")
         return None
@@ -619,7 +636,7 @@ class FakeVercel:
         self.faults = dict(faults or {})
 
     def _fault(self, label: str) -> ProbeOutcome | None:
-        mode = self.faults.get(label)
+        mode = resolve_fault(self.faults, self.log, label)
         if mode in _FAULT_OUTCOMES:
             return _FAULT_OUTCOMES[mode]
         return None
@@ -801,7 +818,12 @@ def make_happy_world(
     worker = make_cloud_run_state(
         config, is_job=True, redis_version=redis_version, plain_overrides=worker_overrides
     )
-    api = make_cloud_run_state(config, is_job=False, redis_version=redis_version)
+    api_overrides = {}
+    if drift.get("api_flag_true"):
+        api_overrides["MILO_ENABLE_RUN_CREATION"] = "true"
+    api = make_cloud_run_state(
+        config, is_job=False, redis_version=redis_version, plain_overrides=api_overrides
+    )
 
     gcp = FakeGcp(
         log=log,
@@ -850,6 +872,24 @@ def make_happy_world(
         upstash=FakeUpstash(log, databases, tokens, faults=upstash_faults),
         vercel=vercel,
     )
+
+
+#: Every write label the fakes can emit. Tests assert against this set so a
+#: newly added write cannot silently escape the fault matrix.
+ALL_WRITE_LABELS: frozenset[str] = frozenset(
+    {
+        "create_database",
+        "create_service_account",
+        "create_secret",
+        "add_secret_version",
+        "set_secret_iam",
+        "set_gateway_wif_iam",
+        "set_run_invoker_iam",
+        "update_run_job",
+        "update_run_service",
+        "set_env_var",
+    }
+)
 
 
 def make_engine(world: FakeWorld, mode, output_dir: Path, **kwargs):
