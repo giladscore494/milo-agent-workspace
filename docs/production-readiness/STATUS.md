@@ -111,12 +111,13 @@ no production mutation):
    tests prove a hostile caller environment neither reaches the CLI subprocess
    nor flips a MISMATCH.
 3. **Audit-only contract is now explicit.** `--audit-only` requires exactly
-   one Redis evidence source: `--audit-metadata` (PREFERRED zero-secret audit
+   one Redis evidence source: `--audit-metadata` (metadata-assisted audit
    against the stored non-secret metadata; file validated fail-closed and live
-   Secret Manager version + in-memory fingerprint must match it) or Upstash
-   management credentials (credentialed deep audit, GET-only); with neither,
-   `audit:contract` is BLOCKED — never a silent degrade. Tests cover metadata
-   validity, absence, malformation and live mismatch.
+   Secret Manager version + in-memory fingerprint must match it — see the
+   truthful-contract round below for the exact credential requirements) or
+   Upstash management credentials (credentialed deep audit, GET-only); with
+   neither, `audit:contract` is BLOCKED — never a silent degrade. Tests cover
+   metadata validity, absence, malformation and live mismatch.
 4. **Upstash validator expected undocumented response fields.** `platform` is
    a create-REQUEST parameter that the API never returns, so every real
    response would have been false-BLOCKED. The validator now uses ONLY
@@ -151,6 +152,83 @@ workflow YAML validates. No real GCP / Vercel / Upstash / Supabase / Redis /
 provider resource was accessed or mutated: the only real external calls were
 `vercel --version` / `--help` against a locally installed CLI (read-only,
 no login, no deploy).
+
+## Bootstrap truthful-contract round — metadata trust + operational audit
+
+A further review of PR #34 (head `289e3597`) surfaced five blockers about the
+honesty and operational robustness of the audit path. All are fixed on the
+same branch (tooling, tests, workflow and docs only; no production mutation):
+
+1. **The audit contract is stated truthfully.** The former "zero-secret" name
+   was wrong: the metadata path reads the pinned Redis Secret Manager payload
+   (once, in memory, for the fingerprint proof) and requires a Vercel token.
+   It is now the **metadata-assisted CREDENTIALED audit** everywhere (script
+   contract, findings, usage, docs, tests), with the required credentials
+   documented explicitly: gcloud (control-plane + one
+   `secretmanager.versions.access` read) and the Vercel token; NO Upstash
+   management credential.
+2. **Metadata is trustworthy.** `milo-production.metadata.env` now carries
+   `MILO_METADATA_SCHEMA_VERSION=2`, `MILO_BOOTSTRAP_STATUS=applied`,
+   `MILO_ENVIRONMENT`, the full `MILO_RELEASE_SHA`, `GCP_PROJECT_ID`, a
+   `MILO_METADATA_GENERATED_AT` reconciliation timestamp and the Redis
+   identity fields. It is written ONLY by `--apply`, AFTER the final live
+   audit, and ONLY on full success; a partial failure deletes any candidate
+   file and records `metadata:withheld`; plan/audit-only never write it. The
+   audit BLOCKS on: non-`applied` status, missing/short/mismatching release
+   SHA, wrong project, wrong environment, missing/unparseable/future/stale
+   timestamp (`--audit-metadata-max-age-hours`, default 720), and any
+   missing/malformed Redis field.
+3. **Database identity is verified against live state.** The guarded apply
+   writes `MILO_RELEASE_SHA` (alongside the existing `MILO_REDIS_DB_ID` /
+   `MILO_REDIS_TOKEN_FINGERPRINT` / `MILO_REDIS_SECRET_VERSION`) into the
+   live Cloud Run env; `verify_live_config.py` now verifies db id,
+   fingerprint, pinned version and release SHA EXACTLY on both the API
+   service and the worker job, and the Vercel audit verifies the managed
+   `MILO_REDIS_TOKEN_FINGERPRINT` variable plus the token fingerprint
+   itself. Regression tests prove a wrong database id (stored or live)
+   blocks the audit.
+4. **Metadata is preserved operationally.** The apply job uploads the
+   successful metadata as the durable `bootstrap-production-metadata`
+   artifact, gated on `success()` (and the bootstrap itself never leaves the
+   file behind on failure, so failed metadata can never be uploaded). A new
+   `audit-only` workflow mode downloads that artifact by apply-run id and
+   runs the complete fail-closed audit with no mutations.
+5. **IAM inspection failures block BEFORE mutation.** In
+   `gcp_ensure_run_invoker`, a failed/denied/malformed initial policy read is
+   BLOCKED (apply/audit-only) before `add-iam-policy-binding` is ever issued;
+   the post-mutation re-read and exact-member verification are kept. Tests
+   cover permission failure, API failure and malformed JSON, proving no
+   mutation command is issued.
+
+A fresh end-to-end adversarial scan of the whole PR (beyond the listed
+blockers) surfaced four additional issues, all fixed in the same round:
+the audit-only workflow job lacked the `actions: read` permission required
+for the cross-run artifact download (would fail only in the real GitHub
+runtime, not in tests); `generate_metadata` was not atomic (a crash mid-write
+could leave a partial file already stamped `applied` — now mktemp + mv);
+the apply success gate now also requires a zero global BLOCKED count (not
+only the internal failure flag) before writing metadata or claiming success;
+and `gcp_grant_secret_accessor` gained the same fail-closed PRE-mutation
+policy read as `run.invoker` (unreadable/malformed/broad pre-state → BLOCKED
+with no binding issued), with regression tests for all reachable cases.
+
+**Validation of this round (this checkout):**
+`tests/test_bootstrap_production.py` — **159 passed** (39 new tests: metadata
+provenance/staleness/binding, live Redis/release identity drift, IAM
+pre-mutation blocks, workflow gating). Bootstrap + release tooling —
+**271 passed**. Full backend
+(`pytest -q tests --ignore=MILO-main-original/MILO-main/test_websearch.py`)
+— **682 passed, 6 skipped** (exactly the opt-in real-CLI / live-Upstash
+contract tests, which passed against the real `vercel@56.2.1` with
+`MILO_REQUIRE_VERCEL_CLI_CONTRACT=1` — 7 passed). PostgreSQL suite
+(`MILO_REQUIRE_PG_TESTS=1`) — **71 passed, 0 skipped**. Frontend —
+`tsc --noEmit` clean, vitest **60 passed**, static + secret checks pass.
+Isolated Playwright E2E — **31 passed** (full suite; the sandbox browser
+was bridged to the pinned Playwright version). `shellcheck -x -S warning`
+clean; secret scan / unsafe-default scan / migration check pass; read-only
+`production-readiness.sh` passes; workflow YAML validates. No real GCP /
+Vercel / Upstash / Supabase / Redis / provider resource was accessed or
+mutated.
 
 ## Round 2 — six final-review blockers corrected
 

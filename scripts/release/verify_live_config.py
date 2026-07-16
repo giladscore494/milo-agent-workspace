@@ -197,7 +197,24 @@ def main() -> int:
     p.add_argument("--redis-secret", required=True)
     p.add_argument("--redis-secret-version", default="", help="exact numeric Redis secret version to require (never latest)")
     p.add_argument("--expected-redis-url", default="")
+    # Non-secret live identity metadata (written by the guarded apply); each
+    # expectation is enforced EXACTLY on both the API service and the worker
+    # job whenever it is supplied.
+    p.add_argument("--expected-redis-db-id", default="")
+    p.add_argument("--expected-redis-fingerprint", default="")
+    p.add_argument("--expected-redis-version", default="", help="expected MILO_REDIS_SECRET_VERSION plain env value")
+    p.add_argument("--expected-release-sha", default="", help="expected MILO_RELEASE_SHA plain env value (release binding)")
     args = p.parse_args()
+
+    def check_identity_metadata(label: str, plain: dict) -> None:
+        if args.expected_redis_db_id:
+            check_exact_plain(label, plain, "MILO_REDIS_DB_ID", args.expected_redis_db_id)
+        if args.expected_redis_fingerprint:
+            check_exact_plain(label, plain, "MILO_REDIS_TOKEN_FINGERPRINT", args.expected_redis_fingerprint)
+        if args.expected_redis_version:
+            check_exact_plain(label, plain, "MILO_REDIS_SECRET_VERSION", args.expected_redis_version)
+        if args.expected_release_sha:
+            check_exact_plain(label, plain, "MILO_RELEASE_SHA", args.expected_release_sha)
 
     def load(path: str):
         try:
@@ -227,6 +244,7 @@ def main() -> int:
         check_exact_plain("api", plain, "GATEWAY_ALLOW_EXECUTION_ROUTES", "false")
         if args.expected_redis_url:
             check_exact_plain("api", plain, "UPSTASH_REDIS_REST_URL", args.expected_redis_url)
+        check_identity_metadata("api", plain)
         for flag in EXECUTION_FLAGS:
             check_flag_false("api", plain, secret_ref, flag)
         for budget in BUDGETS:
@@ -250,6 +268,7 @@ def main() -> int:
         check_exact_set("worker", plain, "MILO_APPROVED_WORKER_IDENTITIES", args.expected_worker_sa)
         if args.expected_redis_url:
             check_exact_plain("worker", plain, "UPSTASH_REDIS_REST_URL", args.expected_redis_url)
+        check_identity_metadata("worker", plain)
         for flag in EXECUTION_FLAGS:
             check_flag_false("worker", plain, secret_ref, flag)
         for budget in BUDGETS:

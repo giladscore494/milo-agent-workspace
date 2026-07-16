@@ -79,7 +79,9 @@ def api_service_json(*, plain_over=None, secret_over=None, drop=None, sa=API_SA)
     plain = {"ENVIRONMENT": "production", "ALLOWED_CORS_ORIGINS": ORIGIN, "JOB_LAUNCHER": "disabled",
              "GATEWAY_ALLOW_EXECUTION_ROUTES": "false", "MILO_GATEWAY_AUDIENCE": API_URL,
              "MILO_APPROVED_GATEWAY_IDENTITIES": GATEWAY_SA, "MILO_APPROVED_WORKER_IDENTITIES": WORKER_SA,
-             "UPSTASH_REDIS_REST_URL": REDIS_URL}
+             "UPSTASH_REDIS_REST_URL": REDIS_URL,
+             "MILO_RELEASE_SHA": FULL_SHA, "MILO_REDIS_DB_ID": "db_prod_1",
+             "MILO_REDIS_TOKEN_FINGERPRINT": REDIS_FP, "MILO_REDIS_SECRET_VERSION": REDIS_VER}
     plain.update(_FLAGS); plain.update(_BUDGETS)
     refs = {"SUPABASE_URL": (S_SUPA_URL, "latest"), "SUPABASE_SECRET_KEY": (S_SUPA_KEY, "latest"),
             "UPSTASH_REDIS_REST_TOKEN": (S_REDIS, REDIS_VER)}
@@ -94,7 +96,9 @@ def api_service_json(*, plain_over=None, secret_over=None, drop=None, sa=API_SA)
 
 def worker_job_json(*, plain_over=None, secret_over=None, drop=None, sa=WORKER_SA):
     plain = {"ENVIRONMENT": "production", "MILO_WORKER_AUDIENCE": API_URL,
-             "MILO_APPROVED_WORKER_IDENTITIES": WORKER_SA, "UPSTASH_REDIS_REST_URL": REDIS_URL}
+             "MILO_APPROVED_WORKER_IDENTITIES": WORKER_SA, "UPSTASH_REDIS_REST_URL": REDIS_URL,
+             "MILO_RELEASE_SHA": FULL_SHA, "MILO_REDIS_DB_ID": "db_prod_1",
+             "MILO_REDIS_TOKEN_FINGERPRINT": REDIS_FP, "MILO_REDIS_SECRET_VERSION": REDIS_VER}
     plain.update(_FLAGS); plain.update(_BUDGETS)
     refs = {"SUPABASE_URL": (S_SUPA_URL, "latest"), "SUPABASE_SECRET_KEY": (S_SUPA_KEY, "latest"),
             "KIMI_API_KEY": (S_PROVIDER, "latest"), "UPSTASH_REDIS_REST_TOKEN": (S_REDIS, REDIS_VER)}
@@ -163,6 +167,10 @@ case "$all" in
     fi;;
   *"secrets add-iam-policy-binding"*) exit 0;;
   *"secrets get-iam-policy"*)
+    case "${MOCK_SECRET_POLICY:-}" in
+      __DENIED__) printf 'ERROR: PERMISSION_DENIED: caller lacks secretmanager.secrets.getIamPolicy\n' >&2; exit 1;;
+      __APIERROR__) printf 'ERROR: INTERNAL: backend error\n' >&2; exit 1;;
+    esac
     if [[ -n "${MOCK_SECRET_POLICY:-}" ]]; then
       printf '%s\n' "${MOCK_SECRET_POLICY}"
     else
@@ -177,6 +185,11 @@ case "$all" in
   *"run services describe"*) [[ -n "${MOCK_SERVICE_JSON:-}" ]] && cat "$MOCK_SERVICE_JSON" || printf '{}';;
   *"run jobs describe"*) [[ -n "${MOCK_JOB_JSON:-}" ]] && cat "$MOCK_JOB_JSON" || printf '{}';;
   *"run services get-iam-policy"*)
+    # Failure sentinels: the initial policy read can be denied or fail.
+    case "${MOCK_RUN_INVOKER_POLICY:-}" in
+      __DENIED__) printf 'ERROR: PERMISSION_DENIED: caller lacks run.services.getIamPolicy\n' >&2; exit 1;;
+      __APIERROR__) printf 'ERROR: INTERNAL: backend error\n' >&2; exit 1;;
+    esac
     # Simulate a mutated live policy: once the bind was issued, return the
     # AFTER policy (when configured) so re-verification reads post-mutation state.
     if [[ -n "${MOCK_RUN_INVOKER_POLICY_AFTER:-}" ]] && grep -q "run services add-iam-policy-binding" "$MOCK_LOG" 2> /dev/null; then
@@ -347,6 +360,27 @@ def _write_fixtures(tmp_path, service, job):
     return svc, jb
 
 
+def _fixture_spec(desc):
+    spec = desc["spec"]["template"]["spec"]
+    return spec if "containers" in spec else spec["template"]["spec"]
+
+
+def _fixture_plain_get(desc, name):
+    for entry in _fixture_spec(desc)["containers"][0].get("env", []):
+        if entry.get("name") == name and "value" in entry:
+            return entry["value"]
+    return None
+
+
+def _fixture_set_plain(desc, name, value):
+    env = _fixture_spec(desc)["containers"][0].setdefault("env", [])
+    for entry in env:
+        if entry.get("name") == name and "value" in entry:
+            entry["value"] = value
+            return
+    env.append({"name": name, "value": value})
+
+
 def _apply_args(out, sha, wif=False):
     a = [
         "--apply", "--environment", "production", "--confirm-production-change",
@@ -367,14 +401,24 @@ def _apply_args(out, sha, wif=False):
     return a
 
 
-def _env(tmp_path, service=None, job=None, **over):
-    svc, jb = _write_fixtures(tmp_path, service or api_service_json(), job or worker_job_json())
+def _env(tmp_path, service=None, job=None, release_sha=None, **over):
+    service = service or api_service_json()
+    job = job or worker_job_json()
+    # Bind the live fixtures to the actual audited release SHA — but never
+    # clobber a fixture a test deliberately customized (drift tests).
+    if release_sha:
+        for desc in (service, job):
+            if _fixture_plain_get(desc, "MILO_RELEASE_SHA") == FULL_SHA:
+                _fixture_set_plain(desc, "MILO_RELEASE_SHA", release_sha)
+    svc, jb = _write_fixtures(tmp_path, service, job)
     e = {
         "MILO_OPERATOR_ACK": ACK, "MOCK_GCLOUD_ACCOUNT": OPERATOR, "MOCK_GCLOUD_PROJECT": PROJECT,
         "MOCK_SERVICE_JSON": str(svc), "MOCK_JOB_JSON": str(jb),
         "MOCK_UPSTASH_DBS": DEFAULT_DBS, "MOCK_UPSTASH_DETAIL": DEFAULT_DETAIL,
         "MOCK_UPSTASH_REST_TOKEN": UPSTASH_REST_TOKEN_SECRET,
         "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES, "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES,
+        "MOCK_EXISTING_SAS": f"{API_SA},{WORKER_SA},{GATEWAY_SA}",
+        "MOCK_SECRETS_LIST": f"{S_SUPA_URL}\n{S_SUPA_KEY}\n{S_PROVIDER}\n{S_REDIS}\n",
         "MOCK_REDIS_ENABLED_VERSION": REDIS_VER, "MOCK_REDIS_SM_PAYLOAD": UPSTASH_REST_TOKEN_SECRET,
         "MOCK_SECRET_ACCESSOR_MEMBERS": f"serviceAccount:{API_SA} serviceAccount:{WORKER_SA}",
         "MOCK_VERCEL_ENV_NAMES": VERCEL_REUSE, "MOCK_VERCEL_INSPECT_ID": VPID, "MOCK_VERCEL_INSPECT_ORG": VORG,
@@ -391,7 +435,7 @@ def _apply(strict_bin, tmp_path, *, service=None, job=None, wif=False, **over):
     repo, head = _git_repo(tmp_path)
     out = _out(tmp_path)
     args = _apply_args(out, head, wif=wif)
-    return strict_bin(*args, env=_env(tmp_path, service, job, **over), cwd=repo), out
+    return strict_bin(*args, env=_env(tmp_path, service, job, release_sha=head, **over), cwd=repo), out
 
 
 # ===========================================================================
@@ -428,7 +472,7 @@ def test_vercel_missing_identity_inputs_blocks_apply(strict_bin, tmp_path):
     repo, head = _git_repo(tmp_path)
     out = _out(tmp_path)
     args = [a for a in _apply_args(out, head) if a not in ("--vercel-project-id", VPID, "--vercel-org-id", VORG)]
-    result = strict_bin(*args, env=_env(tmp_path), cwd=repo)
+    result = strict_bin(*args, env=_env(tmp_path, release_sha=head), cwd=repo)
     assert result.returncode != 0
     assert "[BLOCKED] vercel:identity-inputs" in result.stdout
     assert "env add" not in mutation_log(strict_bin) and "env update" not in mutation_log(strict_bin)
@@ -594,7 +638,7 @@ def test_upstash_explicit_id_source_of_truth(strict_bin, tmp_path):
     repo, head = _git_repo(tmp_path)
     out = _out(tmp_path)
     args = _apply_args(out, head) + ["--upstash-database-id", "db_prod_1"]
-    result = strict_bin(*args, env=_env(tmp_path, MOCK_UPSTASH_DBS=dbs), cwd=repo)
+    result = strict_bin(*args, env=_env(tmp_path, release_sha=head, MOCK_UPSTASH_DBS=dbs), cwd=repo)
     assert "selected exactly one production Redis" in result.stdout or "[PASS] upstash:token" in result.stdout
 
 
@@ -602,7 +646,7 @@ def test_upstash_nonexistent_id_blocks(strict_bin, tmp_path):
     repo, head = _git_repo(tmp_path)
     out = _out(tmp_path)
     args = _apply_args(out, head) + ["--upstash-database-id", "nope"]
-    result = strict_bin(*args, env=_env(tmp_path, MOCK_UPSTASH_DBS="[]"), cwd=repo)
+    result = strict_bin(*args, env=_env(tmp_path, release_sha=head, MOCK_UPSTASH_DBS="[]"), cwd=repo)
     assert "[BLOCKED] upstash:select" in result.stdout
 
 
@@ -621,8 +665,8 @@ def test_upstash_only_creates_when_no_exact_match(strict_bin, tmp_path):
 def test_redis_pins_exact_version_and_no_rotation_on_match(strict_bin, tmp_path):
     # SM already holds the selected token (payload == upstash token) at version 3.
     result, _ = _apply(strict_bin, tmp_path, MOCK_REDIS_SM_PAYLOAD=UPSTASH_REST_TOKEN_SECRET, MOCK_REDIS_ENABLED_VERSION="3",
-                       service=api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}),
-                       job=worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}))
+                       service=api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}, plain_over={"MILO_REDIS_SECRET_VERSION": "3"}),
+                       job=worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}, plain_over={"MILO_REDIS_SECRET_VERSION": "3"}))
     assert "no rotation" in result.stdout.lower() or "NO rotation" in result.stdout
     log = read_log(strict_bin)
     assert "secrets versions add" not in log  # fingerprint matched -> no rotation
@@ -668,7 +712,7 @@ def test_wif_partial_config_blocks(strict_bin, tmp_path):
     repo, head = _git_repo(tmp_path)
     out = _out(tmp_path)
     args = _apply_args(out, head) + ["--wif-pool", WIF_POOL, "--wif-provider", WIF_PROVIDER]  # only 2 of 6
-    result = strict_bin(*args, env=_env(tmp_path), cwd=repo)
+    result = strict_bin(*args, env=_env(tmp_path, release_sha=head), cwd=repo)
     assert "[BLOCKED] wif:partial" in result.stdout
 
 
@@ -704,7 +748,7 @@ def test_guard_dirty_worktree_blocks(strict_bin, tmp_path):
     repo, head = _git_repo(tmp_path)
     (repo / "d.txt").write_text("x")
     out = _out(tmp_path)
-    result = strict_bin(*_apply_args(out, head), env=_env(tmp_path), cwd=repo)
+    result = strict_bin(*_apply_args(out, head), env=_env(tmp_path, release_sha=head), cwd=repo)
     assert result.returncode != 0
     assert "dirty Git worktree" in result.stdout
 
@@ -714,7 +758,7 @@ def test_shared_identity_blocked_before_mutation(strict_bin, tmp_path):
     out = _out(tmp_path)
     args = _apply_args(out, head)
     args[args.index("--worker-sa") + 1] = API_SA
-    result = strict_bin(*args, env=_env(tmp_path), cwd=repo)
+    result = strict_bin(*args, env=_env(tmp_path, release_sha=head), cwd=repo)
     assert result.returncode != 0
     assert "[BLOCKED] identity:api-worker" in result.stdout
     assert "iam service-accounts create" not in read_log(strict_bin)
@@ -782,8 +826,8 @@ def test_final_aggregation_consistent(strict_bin, tmp_path):
 
 def test_audit_only_read_only(strict_bin, tmp_path):
     out = _out(tmp_path)
-    svc, jb = _write_fixtures(tmp_path, api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}),
-                              worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}))
+    svc, jb = _write_fixtures(tmp_path, api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}, plain_over={"MILO_REDIS_SECRET_VERSION": "3"}),
+                              worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}, plain_over={"MILO_REDIS_SECRET_VERSION": "3"}))
     result = strict_bin("--audit-only", "--output-directory", str(out), "--expected-project", PROJECT,
                         "--expected-account", OPERATOR, "--release-sha", FULL_SHA, "--rollback-sha", FULL_SHA,
                         env={"MOCK_GCLOUD_PROJECT": PROJECT, "MOCK_GCLOUD_ACCOUNT": OPERATOR,
@@ -842,8 +886,8 @@ def test_check_vercel_config_never_uses_token_argv(strict_bin, tmp_path):
 
 def _audit_only(strict_bin, tmp_path, *, wif=False, **over):
     out = _out(tmp_path)
-    svc, jb = _write_fixtures(tmp_path, api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}),
-                              worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}))
+    svc, jb = _write_fixtures(tmp_path, api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}, plain_over={"MILO_REDIS_SECRET_VERSION": "3"}),
+                              worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}, plain_over={"MILO_REDIS_SECRET_VERSION": "3"}))
     args = ["--audit-only", "--output-directory", str(out), "--expected-project", PROJECT,
             "--expected-account", OPERATOR, "--release-sha", FULL_SHA, "--rollback-sha", FULL_SHA,
             "--region", REGION, "--repository", "milo-agent",
@@ -1115,12 +1159,25 @@ def test_env_run_refuses_passthrough_identity_names(strict_bin, tmp_path):
 
 
 # ===========================================================================
-# D3 — explicit fail-closed audit-only contract (zero-secret metadata path)
+# D3 — explicit fail-closed audit-only contract (metadata-assisted path)
 # ===========================================================================
 
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _metadata_file(tmp_path, *, db_id="db_prod_1", fp=REDIS_FP, ver="3",
-                   url="https://prod-1.upstash.io", drop=()):
+                   url="https://prod-1.upstash.io", status="applied",
+                   release_sha=FULL_SHA, project=PROJECT, environment="production",
+                   generated_at=None, drop=()):
     lines = {
+        "MILO_METADATA_SCHEMA_VERSION": "2",
+        "MILO_BOOTSTRAP_STATUS": status,
+        "MILO_ENVIRONMENT": environment,
+        "MILO_RELEASE_SHA": release_sha,
+        "MILO_METADATA_GENERATED_AT": generated_at or _now_iso(),
+        "GCP_PROJECT_ID": project,
         "MILO_REDIS_DB_ID": db_id,
         "MILO_REDIS_TOKEN_FINGERPRINT": fp,
         "MILO_REDIS_SECRET_VERSION": ver,
@@ -1132,11 +1189,12 @@ def _metadata_file(tmp_path, *, db_id="db_prod_1", fp=REDIS_FP, ver="3",
     return md
 
 
-def _audit_zero_secret(strict_bin, tmp_path, metadata_path, **over):
-    """audit-only WITHOUT Upstash management credentials, metadata-driven."""
+def _audit_metadata(strict_bin, tmp_path, metadata_path, extra_args=None, **over):
+    """audit-only WITHOUT Upstash management credentials, metadata-driven
+    (metadata-assisted credentialed audit: gcloud + Vercel token only)."""
     out = _out(tmp_path)
-    svc, jb = _write_fixtures(tmp_path, api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}),
-                              worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}))
+    svc, jb = _write_fixtures(tmp_path, api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}, plain_over={"MILO_REDIS_SECRET_VERSION": "3"}),
+                              worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}, plain_over={"MILO_REDIS_SECRET_VERSION": "3"}))
     args = ["--audit-only", "--output-directory", str(out), "--expected-project", PROJECT,
             "--expected-account", OPERATOR, "--release-sha", FULL_SHA, "--rollback-sha", FULL_SHA,
             "--region", REGION, "--repository", "milo-agent",
@@ -1150,6 +1208,8 @@ def _audit_zero_secret(strict_bin, tmp_path, metadata_path, **over):
             "--wif-attribute-mapping", WIF_MAPPING, "--wif-principal-set", WIF_PRINCIPAL]
     if metadata_path is not None:
         args += ["--audit-metadata", str(metadata_path)]
+    if extra_args:
+        args += list(extra_args)
     env = {"MOCK_GCLOUD_PROJECT": PROJECT, "MOCK_GCLOUD_ACCOUNT": OPERATOR,
            "MOCK_SERVICE_JSON": str(svc), "MOCK_JOB_JSON": str(jb),
            "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES, "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES,
@@ -1162,29 +1222,29 @@ def _audit_zero_secret(strict_bin, tmp_path, metadata_path, **over):
     return strict_bin(*args, env=env), out
 
 
-def test_audit_contract_zero_secret_metadata_passes(strict_bin, tmp_path):
+def test_audit_contract_metadata_assisted_passes(strict_bin, tmp_path):
     md = _metadata_file(tmp_path)
-    result, _ = _audit_zero_secret(strict_bin, tmp_path, md)
+    result, _ = _audit_metadata(strict_bin, tmp_path, md)
     assert "[PASS] audit:contract" in result.stdout
     assert "[PASS] audit:metadata" in result.stdout
     assert "[PASS] redis:audit" in result.stdout
     log = mutation_log(strict_bin)
-    # zero-secret: no Upstash management API call, no mutation of any kind.
+    # no Upstash management API call, no mutation of any kind.
     assert "curl " not in log
     for verb in ("secrets versions add", "secrets create", "run services update",
                  "run jobs update", "env add", "env update", "iam service-accounts create"):
-        assert verb not in log, f"zero-secret audit mutated: {verb}"
+        assert verb not in log, f"metadata-assisted audit mutated: {verb}"
 
 
 def test_audit_contract_neither_source_blocks(strict_bin, tmp_path):
-    result, _ = _audit_zero_secret(strict_bin, tmp_path, None)
+    result, _ = _audit_metadata(strict_bin, tmp_path, None)
     assert result.returncode != 0
     assert "[BLOCKED] audit:contract" in result.stdout
     assert "curl " not in mutation_log(strict_bin)
 
 
 def test_audit_metadata_missing_file_blocks(strict_bin, tmp_path):
-    result, _ = _audit_zero_secret(strict_bin, tmp_path, tmp_path / "nope.env")
+    result, _ = _audit_metadata(strict_bin, tmp_path, tmp_path / "nope.env")
     assert result.returncode != 0
     assert "[BLOCKED] audit:metadata" in result.stdout
 
@@ -1198,17 +1258,73 @@ def test_audit_metadata_missing_file_blocks(strict_bin, tmp_path):
     dict(ver="latest"),
     dict(ver="0"),
     dict(url="https://evil.example.com"),
+    # Provenance / binding / freshness (fail closed on every violation):
+    dict(status="partial-failure"),
+    dict(status="planned"),
+    dict(drop=("MILO_BOOTSTRAP_STATUS",)),
+    dict(release_sha="e" * 40),                 # a different release
+    dict(release_sha="not-a-full-sha"),
+    dict(drop=("MILO_RELEASE_SHA",)),
+    dict(project="some-other-project"),
+    dict(drop=("GCP_PROJECT_ID",)),
+    dict(environment="staging"),
+    dict(drop=("MILO_ENVIRONMENT",)),
+    dict(generated_at="2020-01-01T00:00:00Z"),  # stale (older than max age)
+    dict(generated_at="2999-01-01T00:00:00Z"),  # future timestamp
+    dict(generated_at="not-a-timestamp"),
+    dict(drop=("MILO_METADATA_GENERATED_AT",)),
 ])
 def test_audit_metadata_invalid_blocks(strict_bin, tmp_path, mutation):
     md = _metadata_file(tmp_path, **mutation)
-    result, _ = _audit_zero_secret(strict_bin, tmp_path, md)
+    result, _ = _audit_metadata(strict_bin, tmp_path, md)
     assert result.returncode != 0
     assert "[BLOCKED] audit:metadata" in result.stdout
 
 
+def test_audit_metadata_requires_release_sha_argument(strict_bin, tmp_path):
+    # The audit is release-bound: without --release-sha the metadata path is
+    # BLOCKED (never audited unbound).
+    md = _metadata_file(tmp_path)
+    out = _out(tmp_path)
+    result = strict_bin("--audit-only", "--audit-metadata", str(md),
+                        "--output-directory", str(out), "--expected-project", PROJECT,
+                        env={"MOCK_GCLOUD_PROJECT": PROJECT,
+                             "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES,
+                             "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES,
+                             "MOCK_REDIS_ENABLED_VERSION": "3",
+                             "MOCK_REDIS_SM_PAYLOAD": UPSTASH_REST_TOKEN_SECRET})
+    assert result.returncode != 0
+    assert "[BLOCKED] audit:metadata" in result.stdout
+    assert "--release-sha is required" in result.stdout
+
+
+def test_audit_metadata_wrong_db_id_blocks_against_live(strict_bin, tmp_path):
+    # Blocker regression: a well-formed metadata file whose database ID does
+    # not match the LIVE Cloud Run identity metadata must block the audit.
+    md = _metadata_file(tmp_path, db_id="db_wrong_identity")
+    result, _ = _audit_metadata(strict_bin, tmp_path, md)
+    assert result.returncode != 0
+    assert "[BLOCKED] live:api:MILO_REDIS_DB_ID" in result.stdout
+    assert "[BLOCKED] live:worker:MILO_REDIS_DB_ID" in result.stdout
+
+
+def test_audit_metadata_max_age_flag_controls_staleness(strict_bin, tmp_path):
+    from datetime import datetime, timedelta, timezone
+    two_days_ago = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    md = _metadata_file(tmp_path, generated_at=two_days_ago)
+    # Within the default 720h window: loads fine.
+    result, _ = _audit_metadata(strict_bin, tmp_path, md)
+    assert "[PASS] audit:metadata" in result.stdout
+    # With a 24h window the same metadata is stale: BLOCKED.
+    result2, _ = _audit_metadata(strict_bin, tmp_path, md,
+                                 extra_args=["--audit-metadata-max-age-hours", "24"])
+    assert result2.returncode != 0
+    assert "STALE" in result2.stdout
+
+
 def test_audit_metadata_live_version_mismatch_blocks(strict_bin, tmp_path):
     md = _metadata_file(tmp_path, ver="3")
-    result, _ = _audit_zero_secret(strict_bin, tmp_path, md, MOCK_REDIS_ENABLED_VERSION="7")
+    result, _ = _audit_metadata(strict_bin, tmp_path, md, MOCK_REDIS_ENABLED_VERSION="7")
     assert result.returncode != 0
     assert "[BLOCKED] redis:audit" in result.stdout
     assert "secrets versions add" not in mutation_log(strict_bin)
@@ -1216,7 +1332,7 @@ def test_audit_metadata_live_version_mismatch_blocks(strict_bin, tmp_path):
 
 def test_audit_metadata_live_fingerprint_mismatch_blocks(strict_bin, tmp_path):
     md = _metadata_file(tmp_path)
-    result, _ = _audit_zero_secret(strict_bin, tmp_path, md, MOCK_REDIS_SM_PAYLOAD="a-rotated-token")
+    result, _ = _audit_metadata(strict_bin, tmp_path, md, MOCK_REDIS_SM_PAYLOAD="a-rotated-token")
     assert result.returncode != 0
     assert "[BLOCKED] redis:audit" in result.stdout
 
@@ -1304,9 +1420,209 @@ def test_secret_accessor_mutation_not_effective_blocks(strict_bin, tmp_path):
     assert line and "did not take effect" in line[0], result.stdout
 
 
-def test_secret_accessor_broad_principal_blocks(strict_bin, tmp_path):
+def test_secret_accessor_broad_principal_blocks_without_mutation(strict_bin, tmp_path):
+    # A pre-existing broad principal is detected on the PRE-mutation read:
+    # the policy must be repaired first, and no binding is ever added to it.
     broad = json.dumps({"bindings": [{"role": "roles/secretmanager.secretAccessor",
                                       "members": [f"serviceAccount:{API_SA}", "allUsers"]}]})
     result, _ = _apply(strict_bin, tmp_path, MOCK_SECRET_POLICY=broad)
     assert result.returncode != 0
     assert f"[BLOCKED] gcp:accessor:{S_SUPA_URL}:{API_SA}" in result.stdout
+    assert "secrets add-iam-policy-binding" not in read_log(strict_bin)
+
+
+@pytest.mark.parametrize("bad_policy", [
+    "__DENIED__",              # permission failure on the initial read
+    "__APIERROR__",            # API/backend failure on the initial read
+    "this is { not json",      # malformed policy JSON
+])
+def test_secret_accessor_unreadable_policy_blocks_before_mutation(strict_bin, tmp_path, bad_policy):
+    result, _ = _apply(strict_bin, tmp_path, MOCK_SECRET_POLICY=bad_policy)
+    assert result.returncode != 0
+    line = [ln for ln in result.stdout.splitlines()
+            if f"[BLOCKED] gcp:accessor:{S_SUPA_URL}:{API_SA}" in ln]
+    assert line and "no IAM mutation is issued" in line[0], result.stdout
+    assert "secrets add-iam-policy-binding" not in read_log(strict_bin), (
+        "an IAM mutation was issued although the secret IAM state was unreadable")
+
+
+# ===========================================================================
+# E1 — trustworthy metadata lifecycle (written only after full success)
+# ===========================================================================
+
+def test_metadata_withheld_on_partial_failure(strict_bin, tmp_path):
+    result, out = _apply(strict_bin, tmp_path, MOCK_UPSTASH_LIST_FAIL="1")
+    assert result.returncode != 0
+    assert not (out / "milo-production.metadata.env").exists(), (
+        "audit-grade metadata must never exist after a partial failure")
+    assert "metadata:withheld" in result.stdout
+
+
+def test_metadata_written_only_after_full_success(strict_bin, tmp_path):
+    # Model the fully-converged production state (managed Vercel vars present).
+    names = (VERCEL_REUSE + " GATEWAY_ALLOW_EXECUTION_ROUTES NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI"
+             " UPSTASH_REDIS_REST_URL UPSTASH_REDIS_REST_TOKEN MILO_REDIS_TOKEN_FINGERPRINT")
+    result, out = _apply(strict_bin, tmp_path, wif=True, MOCK_VERCEL_ENV_NAMES=names)
+    assert result.returncode == 0, result.stdout + result.stderr
+    md_path = out / "milo-production.metadata.env"
+    assert md_path.exists()
+    md = md_path.read_text()
+    report = json.loads((out / "bootstrap-apply.json").read_text())
+    assert report["status"] == "applied"
+    # Release-bound, project/environment-bound, timestamped, status applied.
+    assert f"MILO_RELEASE_SHA={report['head_sha']}" in md
+    assert "MILO_BOOTSTRAP_STATUS=applied" in md
+    assert "MILO_ENVIRONMENT=production" in md
+    assert f"GCP_PROJECT_ID={PROJECT}" in md
+    assert "MILO_METADATA_GENERATED_AT=" in md
+    assert "MILO_REDIS_DB_ID=db_prod_1" in md
+    assert f"MILO_REDIS_TOKEN_FINGERPRINT={REDIS_FP}" in md
+    assert f"MILO_REDIS_SECRET_VERSION={REDIS_VER}" in md
+    assert "UPSTASH_REDIS_REST_URL=https://prod-1.upstash.io" in md
+    # And it round-trips through the audit it was made for.
+    result2, _ = _audit_metadata(strict_bin, tmp_path, md_path,
+                                 extra_args=["--release-sha", report["head_sha"]])
+    # NB: _audit_metadata passes its own --release-sha FULL_SHA first; the
+    # later flag wins in the parser, binding the audit to the applied release.
+    assert "[PASS] audit:metadata" in result2.stdout
+
+
+def test_plan_never_writes_audit_metadata(strict_bin, tmp_path):
+    out = _out(tmp_path)
+    result = strict_bin("--output-directory", str(out), "--expected-project", PROJECT,
+                        "--api-sa", API_SA, "--worker-sa", WORKER_SA, "--gateway-sa", GATEWAY_SA,
+                        env={"MOCK_GCLOUD_PROJECT": PROJECT, "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES,
+                             "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES})
+    assert "[PASS] mode — bootstrap mode: plan" in result.stdout
+    assert not (out / "milo-production.metadata.env").exists(), (
+        "plan output must never look like audit-grade metadata")
+
+
+def test_audit_only_never_writes_audit_metadata(strict_bin, tmp_path):
+    _result, out = _audit_only(strict_bin, tmp_path, wif=True)
+    assert not (out / "milo-production.metadata.env").exists()
+
+
+# ===========================================================================
+# E2 — live Redis/release identity verification (Cloud Run control plane)
+# ===========================================================================
+
+def test_apply_configures_release_sha_on_cloud_run(strict_bin, tmp_path):
+    _result, out = _apply(strict_bin, tmp_path)
+    report = json.loads((out / "bootstrap-apply.json").read_text())
+    log = read_log(strict_bin)
+    api_upd = [ln for ln in log.splitlines() if "run services update" in ln][0]
+    job_upd = [ln for ln in log.splitlines() if "run jobs update" in ln][0]
+    assert f"MILO_RELEASE_SHA={report['head_sha']}" in api_upd
+    assert f"MILO_RELEASE_SHA={report['head_sha']}" in job_upd
+
+
+@pytest.mark.parametrize("drift,expect", [
+    (dict(plain_over={"MILO_REDIS_DB_ID": "db_other"}), "live:api:MILO_REDIS_DB_ID"),
+    (dict(drop=["MILO_REDIS_DB_ID"]), "live:api:MILO_REDIS_DB_ID"),
+    (dict(plain_over={"MILO_REDIS_TOKEN_FINGERPRINT": "deadbeefdeadbeef"}), "live:api:MILO_REDIS_TOKEN_FINGERPRINT"),
+    (dict(plain_over={"MILO_REDIS_SECRET_VERSION": "999"}), "live:api:MILO_REDIS_SECRET_VERSION"),
+    (dict(plain_over={"MILO_RELEASE_SHA": "f" * 40}), "live:api:MILO_RELEASE_SHA"),
+    (dict(drop=["MILO_RELEASE_SHA"]), "live:api:MILO_RELEASE_SHA"),
+])
+def test_live_identity_drift_blocks_apply(strict_bin, tmp_path, drift, expect):
+    result, _ = _apply(strict_bin, tmp_path, service=api_service_json(**drift))
+    assert result.returncode != 0
+    assert f"[BLOCKED] {expect}" in result.stdout
+
+
+def test_live_identity_drift_blocks_audit_only(strict_bin, tmp_path):
+    # Credentialed deep audit: the selected Upstash db id must equal the live
+    # Cloud Run identity metadata.
+    result, _ = _audit_only(strict_bin, tmp_path, wif=True,
+                            MOCK_UPSTASH_DBS=json.dumps([{"database_name": "milo-production",
+                                                          "database_id": "db_live_mismatch"}]),
+                            MOCK_UPSTASH_DETAIL=json.dumps({
+                                "database_id": "db_live_mismatch", "database_name": "milo-production",
+                                "endpoint": "prod-1.upstash.io", "state": "active", "tls": True,
+                                "region": "global", "primary_region": "us-central1",
+                                "rest_token": UPSTASH_REST_TOKEN_SECRET}))
+    assert result.returncode != 0
+    assert "[BLOCKED] live:api:MILO_REDIS_DB_ID" in result.stdout
+
+
+def test_vercel_expects_fingerprint_variable(strict_bin, tmp_path):
+    _result, _out_dir = _apply(strict_bin, tmp_path)
+    log = read_log(strict_bin)
+    # The audit verifies the managed non-secret fingerprint variable in Vercel
+    # via the isolated env-run path (check-vercel-config --expect).
+    assert "envrun-sees MILO_REDIS_TOKEN_FINGERPRINT=unset" in log
+
+
+# ===========================================================================
+# E3 — IAM inspection failures block BEFORE any mutation
+# ===========================================================================
+
+@pytest.mark.parametrize("bad_policy", [
+    "__DENIED__",              # permission failure on the initial read
+    "__APIERROR__",            # API/backend failure on the initial read
+    "this is { not json",      # malformed policy JSON
+])
+def test_run_invoker_unreadable_policy_blocks_before_mutation(strict_bin, tmp_path, bad_policy):
+    result, _ = _apply(strict_bin, tmp_path, wif=True, MOCK_RUN_INVOKER_POLICY=bad_policy)
+    assert result.returncode != 0
+    line = [ln for ln in result.stdout.splitlines() if "[BLOCKED] wif:run-invoker" in ln]
+    assert line and "no IAM mutation is issued" in line[0], result.stdout
+    assert "run services add-iam-policy-binding" not in read_log(strict_bin), (
+        "an IAM mutation was issued although the current IAM state was unreadable")
+
+
+def test_run_invoker_unreadable_policy_manual_in_plan(strict_bin, tmp_path):
+    out = _out(tmp_path)
+    result = strict_bin("--output-directory", str(out), "--expected-project", PROJECT,
+                        "--api-sa", API_SA, "--worker-sa", WORKER_SA, "--gateway-sa", GATEWAY_SA,
+                        env={"MOCK_GCLOUD_PROJECT": PROJECT, "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES,
+                             "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES,
+                             "MOCK_RUN_INVOKER_POLICY": "__DENIED__"})
+    assert "[MANUAL] wif:run-invoker" in result.stdout
+    assert "run services add-iam-policy-binding" not in read_log(strict_bin)
+
+
+# ===========================================================================
+# E4 — workflow: metadata preservation + operational audit-only job
+# ===========================================================================
+
+def _load_workflow():
+    import yaml
+    wf = yaml.safe_load((REPO / ".github/workflows/bootstrap-production.yml").read_text())
+    triggers = wf.get("on", wf.get(True))
+    return wf, triggers
+
+
+def test_workflow_audit_only_job_is_gated_and_read_only():
+    wf, triggers = _load_workflow()
+    assert "audit-only" in triggers["workflow_dispatch"]["inputs"]["mode"]["options"]
+    audit = wf["jobs"]["audit"]
+    assert audit["if"] == "${{ github.event.inputs.mode == 'audit-only' }}"
+    run_steps = [s for s in audit["steps"] if "bootstrap-production.sh" in s.get("run", "")]
+    assert len(run_steps) == 1
+    assert "--audit-only" in run_steps[0]["run"]
+    assert "--apply" not in run_steps[0]["run"]
+    assert "--confirm-production-change" not in run_steps[0]["run"]
+    # It can consume the preserved metadata artifact from a successful apply.
+    downloads = [s for s in audit["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact")]
+    assert downloads and downloads[0]["with"]["name"] == "bootstrap-production-metadata"
+    assert downloads[0]["if"] == "${{ github.event.inputs.metadata_run_id != '' }}"
+    # Cross-run artifact download requires actions:read — without a job-level
+    # permission grant the workflow-level block (contents/id-token only)
+    # would make the download fail in the real GitHub Actions runtime.
+    assert audit["permissions"]["actions"] == "read"
+    assert downloads[0]["with"]["github-token"], "cross-run download needs an explicit token"
+
+
+def test_workflow_preserves_metadata_only_on_success():
+    wf, _triggers = _load_workflow()
+    steps = wf["jobs"]["apply"]["steps"]
+    uploads = [s for s in steps
+               if str(s.get("uses", "")).startswith("actions/upload-artifact")
+               and s.get("with", {}).get("name") == "bootstrap-production-metadata"]
+    assert len(uploads) == 1
+    md = uploads[0]
+    assert md["if"] == "${{ success() }}", "metadata must never be uploaded from a failed/partial apply"
+    assert md["with"]["if-no-files-found"] == "error"
+    assert "milo-production.metadata.env" in md["with"]["path"]
