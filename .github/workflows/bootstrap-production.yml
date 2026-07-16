@@ -308,6 +308,39 @@ jobs:
           test -n "${UPSTASH_EMAIL:-}" && test -n "${UPSTASH_API_KEY:-}"
           python -m pytest -q tests/test_contract_vercel_cli.py tests/test_contract_upstash_api.py
 
+      # PROVENANCE GATE: a metadata artifact is never trusted merely because
+      # it has the expected filename. Before the download, the named run must
+      # be proven (via the Actions API, actions:read) to be a SUCCESSFUL,
+      # workflow_dispatch-triggered run of THIS repository's
+      # bootstrap-production workflow whose head SHA equals the commit being
+      # audited. Only the apply job of this workflow ever uploads the
+      # bootstrap-production-metadata artifact, and only on full success —
+      # so these checks bind the artifact to a successful apply of this exact
+      # release. The bootstrap then re-validates the file content and the
+      # live state (fail closed) as an independent second layer.
+      - name: Verify metadata artifact provenance (workflow, success, repository, SHA)
+        if: ${{ github.event.inputs.metadata_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          METADATA_RUN_ID: ${{ github.event.inputs.metadata_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "${METADATA_RUN_ID}" =~ ^[0-9]+$ ]] || { echo "BLOCKED: metadata_run_id must be a numeric workflow run id"; exit 1; }
+          run_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${METADATA_RUN_ID}")"
+          wf_path="$(jq -r '.path // ""' <<< "${run_json}")"
+          conclusion="$(jq -r '.conclusion // ""' <<< "${run_json}")"
+          run_repo="$(jq -r '.repository.full_name // ""' <<< "${run_json}")"
+          head_repo="$(jq -r '.head_repository.full_name // ""' <<< "${run_json}")"
+          head_sha="$(jq -r '.head_sha // ""' <<< "${run_json}")"
+          run_event="$(jq -r '.event // ""' <<< "${run_json}")"
+          [[ "${wf_path}" == ".github/workflows/bootstrap-production.yml" ]] || { echo "BLOCKED: run ${METADATA_RUN_ID} belongs to workflow '${wf_path}', not the bootstrap-production workflow"; exit 1; }
+          [[ "${conclusion}" == "success" ]] || { echo "BLOCKED: run ${METADATA_RUN_ID} conclusion is '${conclusion}', not success (metadata from a failed or partial apply is never trusted)"; exit 1; }
+          [[ "${run_repo}" == "${GITHUB_REPOSITORY}" ]] || { echo "BLOCKED: run ${METADATA_RUN_ID} belongs to repository '${run_repo}', not ${GITHUB_REPOSITORY}"; exit 1; }
+          [[ "${head_repo}" == "${GITHUB_REPOSITORY}" ]] || { echo "BLOCKED: run ${METADATA_RUN_ID} head repository is '${head_repo}' (fork), not ${GITHUB_REPOSITORY}"; exit 1; }
+          [[ "${run_event}" == "workflow_dispatch" ]] || { echo "BLOCKED: run ${METADATA_RUN_ID} event is '${run_event}', not workflow_dispatch (the guarded apply is dispatch-only)"; exit 1; }
+          [[ "${head_sha}" == "${GITHUB_SHA}" ]] || { echo "BLOCKED: run ${METADATA_RUN_ID} head SHA ${head_sha} does not equal the audited ${GITHUB_SHA}; dispatch the audit from the SAME release ref as the apply"; exit 1; }
+          echo "Provenance verified: successful bootstrap-production run ${METADATA_RUN_ID} of ${GITHUB_REPOSITORY}@${head_sha}"
+
       # Fetch the durable metadata preserved by the successful apply run
       # (metadata_run_id). Optional: without it, the credentialed deep audit
       # runs instead — and with NEITHER metadata nor Upstash secrets, the

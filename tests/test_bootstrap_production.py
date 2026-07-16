@@ -823,6 +823,26 @@ def test_shared_identity_blocked_before_mutation(strict_bin, tmp_path):
     assert "iam service-accounts create" not in read_log(strict_bin)
 
 
+def test_unrelated_blocking_finding_prevents_upstash_create(strict_bin, tmp_path):
+    # Global pre-mutation boundary: with an unrelated blocking finding (shared
+    # identities) AND an empty Upstash account (a create would otherwise be
+    # planned), the run must stop BEFORE the first mutation — no Upstash
+    # management call of any kind, and above all no POST create.
+    repo, head = _git_repo(tmp_path)
+    out = _out(tmp_path)
+    args = _apply_args(out, head)
+    args[args.index("--worker-sa") + 1] = API_SA
+    result = strict_bin(*args, env=_env(tmp_path, release_sha=head, MOCK_UPSTASH_DBS="[]"), cwd=repo)
+    assert result.returncode != 0
+    assert "[BLOCKED] identity:api-worker" in result.stdout
+    log = read_log(strict_bin)
+    assert "curl " not in log, "a pre-existing blocking finding must prevent every Upstash call"
+    for verb in ("iam service-accounts create", "secrets create", "secrets versions add",
+                 "run services update", "run jobs update", "add-iam-policy-binding",
+                 "env add", "env update"):
+        assert verb not in log, f"a pre-existing blocking finding must prevent mutation: {verb}"
+
+
 def test_no_keys_no_worker_exec(strict_bin, tmp_path):
     _apply(strict_bin, tmp_path)
     log = read_log(strict_bin)
@@ -992,6 +1012,48 @@ def test_audit_only_proves_wif_and_redis_with_full_evidence(strict_bin, tmp_path
     log = mutation_log(strict_bin)
     for verb in ("run services update", "secrets versions add", "env add", "env update", "secrets create"):
         assert verb not in log, f"audit-only mutated: {verb}"
+
+
+def test_deep_audit_upstash_requests_are_get_only(strict_bin, tmp_path):
+    # Strict deep-audit contract: the live Upstash state IS read, but only
+    # with GET requests — never POST/PUT/PATCH/DELETE.
+    result, _ = _audit_only(strict_bin, tmp_path, wif=True)
+    assert "[PASS] audit:contract" in result.stdout
+    curl_lines = [ln for ln in read_log(strict_bin).splitlines() if ln.startswith("curl ")]
+    assert curl_lines, "the credentialed deep audit must actually read the live Upstash state"
+    for ln in curl_lines:
+        assert "-X GET" in ln, f"deep audit issued a non-GET Upstash request: {ln}"
+        for verb in ("POST", "PUT", "PATCH", "DELETE"):
+            assert verb not in ln, f"deep audit issued a mutating Upstash request: {ln}"
+
+
+def test_audit_only_never_creates_missing_database(strict_bin, tmp_path):
+    # Deep audit with an empty Upstash account: the missing production
+    # database must be BLOCKED, never created.
+    result, _ = _audit_only(strict_bin, tmp_path, wif=True, MOCK_UPSTASH_DBS="[]")
+    assert result.returncode != 0
+    assert "[BLOCKED] upstash:select" in result.stdout
+    assert "never creates" in result.stdout
+    log = read_log(strict_bin)
+    assert not [ln for ln in log.splitlines() if ln.startswith("curl ") and "POST" in ln], \
+        "audit-only must never POST to the Upstash management API"
+
+
+def test_metadata_audit_never_uses_upstash_credentials_even_if_supplied(strict_bin, tmp_path):
+    # Credentials must never cross into the wrong audit path: when
+    # --audit-metadata selects the metadata-assisted audit, supplied Upstash
+    # management credentials are ignored — no management API call of any kind.
+    md = _metadata_file(tmp_path)
+    result, _ = _audit_metadata(
+        strict_bin, tmp_path, md,
+        extra_args=["--upstash-email-env", "UP_EMAIL", "--upstash-apikey-env", "UP_APIKEY"],
+        UP_EMAIL="ops@milo.test", UP_APIKEY=UPSTASH_APIKEY_SECRET,
+        MOCK_UPSTASH_DBS=DEFAULT_DBS, MOCK_UPSTASH_DETAIL=DEFAULT_DETAIL)
+    assert "[PASS] audit:contract" in result.stdout
+    assert "metadata-assisted" in result.stdout
+    assert "curl " not in read_log(strict_bin), \
+        "the metadata-assisted audit must never call the Upstash management API, even with credentials supplied"
+    assert UPSTASH_APIKEY_SECRET not in result.stdout + result.stderr
 
 
 def test_audit_only_redis_mismatch_blocks(strict_bin, tmp_path):
@@ -1712,6 +1774,33 @@ def test_workflow_audit_only_job_is_gated_and_read_only():
     # would make the download fail in the real GitHub Actions runtime.
     assert audit["permissions"]["actions"] == "read"
     assert downloads[0]["with"]["github-token"], "cross-run download needs an explicit token"
+
+
+def test_workflow_audit_verifies_metadata_artifact_provenance():
+    # A metadata artifact must never be trusted solely because it carries the
+    # expected filename: before the download, the named run must be proven to
+    # be a successful, dispatch-triggered run of THIS repository's
+    # bootstrap-production workflow at the audited commit.
+    wf, _triggers = _load_workflow()
+    steps = wf["jobs"]["audit"]["steps"]
+    prov = [s for s in steps if "provenance" in str(s.get("name", "")).lower()]
+    assert len(prov) == 1, "exactly one provenance verification step is required"
+    step = prov[0]
+    assert step["if"] == "${{ github.event.inputs.metadata_run_id != '' }}"
+    run = step["run"]
+    assert "^[0-9]+$" in run, "metadata_run_id must be validated as numeric"
+    assert ".github/workflows/bootstrap-production.yml" in run, "must pin the expected workflow file"
+    assert '"success"' in run, "must require a successful run conclusion"
+    assert "GITHUB_REPOSITORY" in run, "must bind the run to this repository"
+    assert "head_repository" in run, "must reject fork-owned head repositories"
+    assert "GITHUB_SHA" in run, "must bind the run head SHA to the audited commit"
+    assert "workflow_dispatch" in run, "must require the dispatch-only trigger"
+    # The gate must run strictly BEFORE the artifact download.
+    download_idx = next(i for i, s in enumerate(steps)
+                        if str(s.get("uses", "")).startswith("actions/download-artifact"))
+    assert steps.index(step) < download_idx, "provenance must be verified before the artifact is downloaded"
+    # And the API call must be authorized by the job's actions:read permission.
+    assert wf["jobs"]["audit"]["permissions"]["actions"] == "read"
 
 
 def test_workflow_preserves_metadata_only_on_success():

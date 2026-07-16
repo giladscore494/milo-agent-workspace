@@ -117,7 +117,11 @@ Resource / identity options (all revalidated at runtime):
   --vercel-scope <team>         Vercel team/account scope.
   --supabase-project-ref <ref>  Supabase project ref.
   --production-origin <url>     Production browser origin (CORS).
-  --release-sha <full-sha>      Full 40-char release SHA (apply: == HEAD).
+  --release-sha <full-sha>      Full 40-char bootstrap commit SHA (apply: ==
+                                HEAD). Recorded and audited as
+                                MILO_BOOTSTRAP_SHA; the flag name is the
+                                deprecated operator spelling, kept for
+                                compatibility.
   --rollback-sha <full-sha>     Previous known-good release SHA.
   --output-directory <path>     PRIVATE operator output dir (OUTSIDE the
                                 worktree). Default: ${MILO_BOOTSTRAP_OUTPUT_DIR}
@@ -945,6 +949,15 @@ upstash_apply() {
     CREATE)
       if [[ "${MODE}" == "audit-only" ]]; then
         record_check BLOCKED "upstash:select" "no database exactly named '${UPSTASH_DB_NAME}' exists; --audit-only never creates one. Redis consistency cannot be proven."; mark_failed; return 1
+      fi
+      # GLOBAL PRE-MUTATION GATE: creating the Upstash database is the FIRST
+      # external mutation an apply can perform. It must never run while ANY
+      # blocking finding — even one unrelated to Upstash — is already
+      # recorded. Today every earlier blocking path exits before this point;
+      # this gate makes the invariant explicit and survives reordering.
+      if [[ "${BOOTSTRAP_FAILED}" -eq 1 || "${_MILO_BLOCKED_COUNT}" -gt 0 ]]; then
+        record_check BLOCKED "upstash:create-gate" "refusing to create the production Redis database: ${_MILO_BLOCKED_COUNT} blocking finding(s) already recorded before the first mutation (global pre-mutation gate; nothing was created)"
+        mark_failed; return 1
       fi
       local create_resp; create_resp="$(upstash_api POST /redis/database "$(_upstash_create_body)" "${code_file}")"
       if [[ "$(cat "${code_file}")" != "200" ]]; then
@@ -1838,7 +1851,10 @@ case "${MODE}" in
     if [[ "${BOOTSTRAP_FAILED}" -eq 1 || "${_MILO_BLOCKED_COUNT}" -gt 0 ]]; then
       record_check BLOCKED "apply:pre-mutation-gate" "Upstash/Redis source selection is blocked or incomplete; refusing every downstream mutation (Secret Manager reconciliation, Cloud Run, Vercel and metadata are left untouched)"
       rm -f "${OUTPUT_DIR}/milo-production.metadata.env"
+      record_check NOT_APPLICABLE "metadata:withheld" "audit-grade metadata NOT generated: the apply did not fully succeed (metadata is written only after a fully successful apply + final audit)"
       write_bootstrap_report "${OUTPUT_DIR}/bootstrap-apply.json" "apply" "partial-failure"
+      printf '\nAPPLY INCOMPLETE — partial failure. See recovery_steps in %s/bootstrap-apply.json. Re-running --apply is idempotent.\n' "${OUTPUT_DIR}"
+      record_check BLOCKED "apply:result" "bootstrap did not fully succeed; a clear recovery plan was written and full success is NOT claimed"
       finish_checks "bootstrap-production" "${JSON_OUTPUT}"; exit 1
     fi
     gcp_apply || true

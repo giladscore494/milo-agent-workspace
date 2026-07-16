@@ -230,6 +230,38 @@ clean; secret scan / unsafe-default scan / migration check pass; read-only
 Vercel / Upstash / Supabase / Redis / provider resource was accessed or
 mutated.
 
+## Stabilization round — post-merge regression fix + adversarial hardening
+
+Merging PR #35 into the PR #34 branch introduced one CI regression and a
+clean-room adversarial review of the merged result produced three
+defense-in-depth hardenings (tooling, workflow, tests and docs only; no
+production access):
+
+1. **Regression fixed (the `offline-checks` failure).** The early
+   `apply:pre-mutation-gate` exit added by PR #35 deleted any candidate
+   metadata file but did not record the `metadata:withheld` finding (nor the
+   `APPLY INCOMPLETE` operator message / `apply:result` finding) that the
+   ordinary partial-failure path records, so
+   `test_metadata_withheld_on_partial_failure` failed. The early gate now
+   reports the identical partial-failure contract; the test was not weakened.
+2. **Explicit global pre-mutation gate.** Creating the Upstash database is
+   the first external mutation an apply can perform. Today every earlier
+   blocking path exits before that point (proven by regression tests); the
+   create path now additionally refuses to POST while any blocking finding is
+   already recorded, so the invariant survives future reordering
+   (`upstash:create-gate`).
+3. **Metadata artifact provenance.** The audit-only workflow no longer trusts
+   a downloaded artifact merely because it has the expected filename: before
+   the download, the `metadata_run_id` run must be a successful,
+   `workflow_dispatch`-triggered run of this repository's
+   bootstrap-production workflow whose head SHA equals the audited commit
+   (Actions API under `actions: read`). The bootstrap's content validation
+   and mandatory live-state verification remain as independent layers.
+4. **Audit-mode separation proven.** New regression tests prove the deep
+   audit issues only `GET` Upstash requests and never creates a missing
+   database, and that the metadata-assisted audit never calls the Upstash
+   management API even when management credentials are (wrongly) supplied.
+
 ## Round 2 — six final-review blockers corrected
 
 A second review of the corrective PR surfaced six more production-audit
