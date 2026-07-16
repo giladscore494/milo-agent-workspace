@@ -140,6 +140,7 @@ case "$all" in
   *"iam workload-identity-pools providers describe"*) printf '%s\n' "${MOCK_WIF_PROVIDER_JSON:-$empty_json}";;
   *"iam workload-identity-pools describe"*)
     [[ "${MOCK_WIF_POOL:-present}" == "missing" ]] && { printf 'ERROR: NOT_FOUND: pool\n' >&2; exit 1; }
+    [[ "${MOCK_WIF_POOL:-present}" == "error" ]] && { printf 'ERROR: PERMISSION_DENIED\n' >&2; exit 1; }
     printf 'projects/p/locations/global/workloadIdentityPools/pool\n';;
   *"secrets describe"*)
     s="${args[2]:-}"
@@ -161,14 +162,28 @@ case "$all" in
       in_list "$s" "${MOCK_SECRETS_WITH_VERSIONS:-}" && printf '1\n' || printf ''
     fi;;
   *"secrets add-iam-policy-binding"*) exit 0;;
-  *"secrets get-iam-policy"*) printf '%s\n' "${MOCK_SECRET_POLICY:-$empty_pol}";;
+  *"secrets get-iam-policy"*)
+    if [[ -n "${MOCK_SECRET_POLICY:-}" ]]; then
+      printf '%s\n' "${MOCK_SECRET_POLICY}"
+    else
+      m=""
+      for x in ${MOCK_SECRET_ACCESSOR_MEMBERS:-}; do m="${m:+$m,}\"$x\""; done
+      printf '{"bindings":[{"role":"roles/secretmanager.secretAccessor","members":[%s]}]}\n' "$m"
+    fi;;
   *"secrets list"*) printf '%s' "${MOCK_SECRETS_LIST-}";;
   *"run services update"*) [[ "${MOCK_API_SVC:-present}" == "missing" ]] && { printf 'ERROR: NOT_FOUND\n' >&2; exit 1; }; exit 0;;
   *"run jobs update"*) [[ "${MOCK_WORKER_JOB:-present}" == "missing" ]] && { printf 'ERROR: NOT_FOUND\n' >&2; exit 1; }; exit 0;;
   *"run services add-iam-policy-binding"*) exit 0;;
   *"run services describe"*) [[ -n "${MOCK_SERVICE_JSON:-}" ]] && cat "$MOCK_SERVICE_JSON" || printf '{}';;
   *"run jobs describe"*) [[ -n "${MOCK_JOB_JSON:-}" ]] && cat "$MOCK_JOB_JSON" || printf '{}';;
-  *"run services get-iam-policy"*) printf '%s\n' "${MOCK_RUN_INVOKER_POLICY:-$empty_pol}";;
+  *"run services get-iam-policy"*)
+    # Simulate a mutated live policy: once the bind was issued, return the
+    # AFTER policy (when configured) so re-verification reads post-mutation state.
+    if [[ -n "${MOCK_RUN_INVOKER_POLICY_AFTER:-}" ]] && grep -q "run services add-iam-policy-binding" "$MOCK_LOG" 2> /dev/null; then
+      printf '%s\n' "${MOCK_RUN_INVOKER_POLICY_AFTER}"
+    else
+      printf '%s\n' "${MOCK_RUN_INVOKER_POLICY:-$empty_pol}"
+    fi;;
   *"run jobs get-iam-policy"*) printf '{"bindings":[]}\n';;
   *"services list"*) printf 'run.googleapis.com\nartifactregistry.googleapis.com\nsecretmanager.googleapis.com\niamcredentials.googleapis.com\nsts.googleapis.com\n';;
   *"artifacts repositories describe"*) printf 'projects/p/locations/r/repositories/milo-agent\n';;
@@ -186,6 +201,16 @@ case "$all" in
     printf 'MOCK-FORBIDDEN vercel: %s\n' "$all" >&2; exit 97;;
 esac
 case "$all" in
+  "--version")
+    printf 'Vercel CLI %s\n%s\n' "${MOCK_VERCEL_VERSION:-56.2.1}" "${MOCK_VERCEL_VERSION:-56.2.1}";;
+  "env --help")
+    if [[ -n "${MOCK_VERCEL_ENV_HELP:-}" ]]; then printf '%s\n' "${MOCK_VERCEL_ENV_HELP}"
+    else printf '  add     name [environment]\n  list    [environment]\n  pull    [filename]\n  remove  name [environment]\n  run     command\n  update  name [environment]\n'; fi
+    exit 0;;
+  "env run --help")
+    printf '%s\n' "${MOCK_VERCEL_ENVRUN_HELP:--e,  --environment <TARGET>}"; exit 0;;
+  "env update --help")
+    printf '%s\n' "${MOCK_VERCEL_ENVUPDATE_HELP:--y,  --yes}"; exit 0;;
   whoami*) printf '%s\n' "${MOCK_VERCEL_USER:-milo-team}";;
   "project inspect"*)
     [[ "${MOCK_VERCEL_INSPECT:-ok}" == "fail" ]] && { printf 'Error: not authorized\n' >&2; exit 1; }
@@ -197,6 +222,18 @@ case "$all" in
   "env add"*) cat > /dev/null; exit 0;;
   "env update"*) cat > /dev/null; exit 0;;
   "env run"*)
+    # Isolation canary: record whether the variable under verification is
+    # visible in THIS subprocess environment. The real CLI overlays its own
+    # process environment over the downloaded production records, so the
+    # invoker must have scrubbed the name; "set" here means a caller-side
+    # override could have forged the verification result.
+    if [[ -n "${MILO_VERIFY_NAME:-}" ]]; then
+      if [[ -n "$(eval "printf '%s' \"\${${MILO_VERIFY_NAME}+x}\"")" ]]; then
+        printf 'envrun-sees %s=set\n' "$MILO_VERIFY_NAME" >> "$MOCK_LOG"
+      else
+        printf 'envrun-sees %s=unset\n' "$MILO_VERIFY_NAME" >> "$MOCK_LOG"
+      fi
+    fi
     case "$all" in
       *sha256sum*) printf '%s\n' "${MOCK_VERCEL_FP:-nofp}";;
       *) printf '%s\n' "${MOCK_VERCEL_ENVRUN:-MATCH}";;
@@ -233,8 +270,11 @@ esac
 MOCKS = {"gcloud": GCLOUD_MOCK, "vercel": VERCEL_MOCK, "curl": CURL_MOCK}
 
 VERCEL_REUSE = "CLOUD_RUN_API_URL GCP_PROJECT_NUMBER GCP_WORKLOAD_IDENTITY_POOL_ID GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID GCP_SERVICE_ACCOUNT_EMAIL NEXT_PUBLIC_SUPABASE_URL NEXT_PUBLIC_SUPABASE_ANON_KEY"
+# Documented Upstash database object shape: database_id/database_name/region
+# (+ primary_region for global)/state/tls/endpoint/rest_token. `platform` is a
+# create-REQUEST parameter and never appears in a response.
 DEFAULT_DETAIL = json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "endpoint": "prod-1.upstash.io",
-                             "state": "active", "tls": True, "platform": "gcp", "primary_region": "us-central1",
+                             "state": "active", "tls": True, "region": "global", "primary_region": "us-central1",
                              "rest_token": UPSTASH_REST_TOKEN_SECRET})
 DEFAULT_DBS = json.dumps([{"database_name": "milo-production", "database_id": "db_prod_1", "endpoint": "prod-1.upstash.io"}])
 
@@ -269,6 +309,12 @@ def strict_bin(tmp_path: Path):
 
 def read_log(run):
     return run.log.read_text()
+
+
+def mutation_log(run):
+    """Log lines excluding read-only --help/--version capability probes."""
+    return "\n".join(ln for ln in read_log(run).splitlines()
+                     if "--help" not in ln and "--version" not in ln)
 
 
 def assert_no_mock_errors(result):
@@ -330,6 +376,7 @@ def _env(tmp_path, service=None, job=None, **over):
         "MOCK_UPSTASH_REST_TOKEN": UPSTASH_REST_TOKEN_SECRET,
         "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES, "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES,
         "MOCK_REDIS_ENABLED_VERSION": REDIS_VER, "MOCK_REDIS_SM_PAYLOAD": UPSTASH_REST_TOKEN_SECRET,
+        "MOCK_SECRET_ACCESSOR_MEMBERS": f"serviceAccount:{API_SA} serviceAccount:{WORKER_SA}",
         "MOCK_VERCEL_ENV_NAMES": VERCEL_REUSE, "MOCK_VERCEL_INSPECT_ID": VPID, "MOCK_VERCEL_INSPECT_ORG": VORG,
         "MOCK_VERCEL_ENVRUN": "MATCH", "MOCK_VERCEL_FP": REDIS_FP,
         "MOCK_WIF_PROVIDER_JSON": PROVIDER_JSON_OK, "MOCK_WIF_GATEWAY_POLICY": GATEWAY_POLICY_OK, "MOCK_RUN_INVOKER_POLICY": RUN_POLICY_OK,
@@ -358,7 +405,7 @@ def test_default_mode_plan_read_only(strict_bin, tmp_path):
                         env={"MOCK_GCLOUD_PROJECT": PROJECT, "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES,
                              "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES})
     assert "[PASS] mode — bootstrap mode: plan" in result.stdout
-    log = read_log(strict_bin)
+    log = mutation_log(strict_bin)
     for verb in ("iam service-accounts create", "secrets create", "secrets versions add",
                  "run services update", "run jobs update", "env add", "env update"):
         assert verb not in log
@@ -384,25 +431,25 @@ def test_vercel_missing_identity_inputs_blocks_apply(strict_bin, tmp_path):
     result = strict_bin(*args, env=_env(tmp_path), cwd=repo)
     assert result.returncode != 0
     assert "[BLOCKED] vercel:identity-inputs" in result.stdout
-    assert "env add" not in read_log(strict_bin) and "env update" not in read_log(strict_bin)
+    assert "env add" not in mutation_log(strict_bin) and "env update" not in mutation_log(strict_bin)
 
 
 def test_vercel_wrong_project_id_blocks_before_writes(strict_bin, tmp_path):
     result, _ = _apply(strict_bin, tmp_path, MOCK_VERCEL_INSPECT_ID="prj_OTHER")
     assert "[BLOCKED] vercel:project-identity" in result.stdout
-    assert "env add" not in read_log(strict_bin) and "env update" not in read_log(strict_bin)
+    assert "env add" not in mutation_log(strict_bin) and "env update" not in mutation_log(strict_bin)
 
 
 def test_vercel_wrong_org_blocks_before_writes(strict_bin, tmp_path):
     result, _ = _apply(strict_bin, tmp_path, MOCK_VERCEL_INSPECT_ORG="team_intruder")
     assert "[BLOCKED] vercel:project-identity" in result.stdout
-    assert "env add" not in read_log(strict_bin)
+    assert "env add" not in mutation_log(strict_bin)
 
 
 def test_vercel_wrong_name_blocks_before_writes(strict_bin, tmp_path):
     result, _ = _apply(strict_bin, tmp_path, MOCK_VERCEL_INSPECT_NAME="some-other-project")
     assert "[BLOCKED] vercel:project-identity" in result.stdout
-    assert "env add" not in read_log(strict_bin)
+    assert "env add" not in mutation_log(strict_bin)
 
 
 def test_vercel_existing_var_uses_env_update_not_remove_add(strict_bin, tmp_path):
@@ -510,7 +557,7 @@ def test_upstash_create_request_uses_official_fields(strict_bin, tmp_path):
 
 def test_upstash_endpoint_slug_normalized(strict_bin, tmp_path):
     detail = json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "endpoint": "informed-mongoose-123",
-                         "state": "active", "tls": True, "platform": "gcp", "primary_region": "us-central1", "rest_token": UPSTASH_REST_TOKEN_SECRET})
+                         "state": "active", "tls": True, "region": "global", "primary_region": "us-central1", "rest_token": UPSTASH_REST_TOKEN_SECRET})
     result, _ = _apply(strict_bin, tmp_path, MOCK_UPSTASH_DETAIL=detail,
                        service=api_service_json(plain_over={"UPSTASH_REDIS_REST_URL": "https://informed-mongoose-123.upstash.io"}),
                        job=worker_job_json(plain_over={"UPSTASH_REDIS_REST_URL": "https://informed-mongoose-123.upstash.io"}))
@@ -519,14 +566,14 @@ def test_upstash_endpoint_slug_normalized(strict_bin, tmp_path):
 
 def test_upstash_malformed_endpoint_blocks(strict_bin, tmp_path):
     detail = json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "endpoint": "bad host!!",
-                         "state": "active", "tls": True, "rest_token": UPSTASH_REST_TOKEN_SECRET})
+                         "state": "active", "tls": True, "region": "us-central1", "rest_token": UPSTASH_REST_TOKEN_SECRET})
     result, _ = _apply(strict_bin, tmp_path, MOCK_UPSTASH_DETAIL=detail)
     assert "[BLOCKED] upstash:validate" in result.stdout
 
 
 def test_upstash_suspended_db_blocks(strict_bin, tmp_path):
     detail = json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "endpoint": "h.upstash.io",
-                         "state": "suspended", "tls": True, "rest_token": UPSTASH_REST_TOKEN_SECRET})
+                         "state": "suspended", "tls": True, "region": "us-central1", "rest_token": UPSTASH_REST_TOKEN_SECRET})
     result, _ = _apply(strict_bin, tmp_path, MOCK_UPSTASH_DETAIL=detail)
     assert "[BLOCKED] upstash:validate" in result.stdout
 
@@ -743,10 +790,14 @@ def test_audit_only_read_only(strict_bin, tmp_path):
                              "MOCK_SERVICE_JSON": str(svc), "MOCK_JOB_JSON": str(jb),
                              "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES, "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES,
                              "MOCK_REDIS_ENABLED_VERSION": "3", "MOCK_REDIS_SM_PAYLOAD": UPSTASH_REST_TOKEN_SECRET})
-    log = read_log(strict_bin)
+    log = mutation_log(strict_bin)
     for verb in ("iam service-accounts create", "secrets create", "secrets versions add",
                  "run services update", "run jobs update", "env add", "env update", "curl "):
         assert verb not in log, f"audit-only mutation/mgmt call: {verb}"
+    # Without stored metadata AND without management credentials the audit
+    # contract is explicit and fail-closed (never a silent degrade).
+    assert "[BLOCKED] audit:contract" in result.stdout
+    assert result.returncode != 0
     assert (out / "readiness.json").exists()
     assert "run services describe milo-agent-api" in log
 
@@ -823,7 +874,7 @@ def test_audit_only_blocks_without_wif_evidence(strict_bin, tmp_path):
     assert result.returncode != 0
     assert "[BLOCKED] wif" in result.stdout
     # no mutation performed in audit-only
-    log = read_log(strict_bin)
+    log = mutation_log(strict_bin)
     for verb in ("run services update", "secrets versions add", "env add", "env update"):
         assert verb not in log
 
@@ -835,7 +886,7 @@ def test_audit_only_proves_wif_and_redis_with_full_evidence(strict_bin, tmp_path
     assert "[PASS] wif:run-invoker" in result.stdout
     assert "[PASS] redis:reconcile" in result.stdout
     assert "[PASS] audit:vercel:fingerprint:UPSTASH_REDIS_REST_TOKEN" in result.stdout
-    log = read_log(strict_bin)
+    log = mutation_log(strict_bin)
     for verb in ("run services update", "secrets versions add", "env add", "env update", "secrets create"):
         assert verb not in log, f"audit-only mutated: {verb}"
 
@@ -898,16 +949,26 @@ def test_wif_attribute_mapping_mismatch_blocks(strict_bin, tmp_path, mapping, ex
 # ===========================================================================
 
 @pytest.mark.parametrize("detail", [
-    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "tls": True, "platform": "gcp", "primary_region": "us-central1", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing state
-    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "platform": "gcp", "primary_region": "us-central1", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing tls
-    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "primary_region": "us-central1", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing platform
-    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "platform": "gcp", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing region
-    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "platform": "gcp", "primary_region": "us-central1", "endpoint": "evil.example.com", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # foreign host
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "tls": True, "region": "us-central1", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing state
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "region": "us-central1", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing tls
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # missing region
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "region": "global", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # global without primary_region
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "region": "eu-central-1", "endpoint": "h.upstash.io", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # wrong region
+    json.dumps({"database_id": "db_prod_1", "database_name": "milo-production", "state": "active", "tls": True, "region": "global", "primary_region": "us-central1", "endpoint": "evil.example.com", "rest_token": UPSTASH_REST_TOKEN_SECRET}),  # foreign host
 ])
 def test_upstash_validation_fail_closed(strict_bin, tmp_path, detail):
     result, _ = _apply(strict_bin, tmp_path, MOCK_UPSTASH_DETAIL=detail)
     assert result.returncode != 0
     assert "[BLOCKED] upstash:validate" in result.stdout
+
+
+def test_upstash_documented_response_without_platform_passes(strict_bin, tmp_path):
+    # The documented get_database response has NO `platform` field (it is a
+    # create-request-only parameter); a real response must never be blocked
+    # for lacking it.
+    result, _ = _apply(strict_bin, tmp_path)  # DEFAULT_DETAIL has no platform
+    assert "[BLOCKED] upstash:validate" not in result.stdout
+    assert "[PASS] upstash:url" in result.stdout
 
 
 # ===========================================================================
@@ -933,3 +994,319 @@ def test_workflow_plan_job_gated_on_mode():
     wf = yaml.safe_load((REPO / ".github/workflows/bootstrap-production.yml").read_text())
     assert wf["jobs"]["plan"]["if"] == "${{ github.event.inputs.mode == 'plan' }}"
     assert wf["jobs"]["apply"]["if"] == "${{ github.event.inputs.mode == 'apply' }}"
+
+
+def test_workflow_installs_pin_and_runs_contract_preflight():
+    text = (REPO / ".github/workflows/bootstrap-production.yml").read_text()
+    assert "scripts/release/VERCEL_CLI_VERSION" in text  # single source of truth
+    assert "39.3.0" not in text  # the broken pin (no env update/run) is gone
+    assert "test_contract_vercel_cli.py" in text
+    assert "test_contract_upstash_api.py" in text
+    assert "MILO_REQUIRE_VERCEL_CLI_CONTRACT" in text
+
+
+# ===========================================================================
+# D1 — Vercel CLI capability preflight (fail closed before any mutation)
+# ===========================================================================
+
+def test_vercel_cli_preflight_passes_and_reports_version(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path)
+    assert "[PASS] vercel:cli-version" in result.stdout
+    log = read_log(strict_bin)
+    assert "vercel --version" in log
+    assert "vercel env --help" in log
+
+
+def test_vercel_cli_nonnumeric_version_blocks_before_mutations(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path, MOCK_VERCEL_VERSION="canary-20260101")
+    assert result.returncode != 0
+    assert "[BLOCKED] vercel:cli-contract" in result.stdout
+    log = mutation_log(strict_bin)
+    assert "env add" not in log and "env update" not in log
+
+
+def test_vercel_cli_missing_update_subcommand_blocks_before_mutations(strict_bin, tmp_path):
+    crippled = "  add     name [environment]\n  list    [environment]\n  pull    [filename]\n  remove  name [environment]\n  run     command\n"
+    result, _ = _apply(strict_bin, tmp_path, MOCK_VERCEL_ENV_HELP=crippled)
+    assert result.returncode != 0
+    assert "[BLOCKED] vercel:cli-contract" in result.stdout
+    log = mutation_log(strict_bin)
+    assert "env add" not in log and "env update" not in log
+
+
+def test_vercel_cli_missing_env_run_environment_blocks(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path, MOCK_VERCEL_ENVRUN_HELP="no environment flag here")
+    assert result.returncode != 0
+    assert "[BLOCKED] vercel:cli-contract" in result.stdout
+    assert "env add" not in mutation_log(strict_bin)
+
+
+def test_vercel_cli_contract_failure_blocks_audit_only(strict_bin, tmp_path):
+    # A broken CLI must surface as BLOCKED in the audit too — the exact Vercel
+    # value verification silently not running must never count as ready.
+    result, _ = _audit_only(strict_bin, tmp_path, wif=True, MOCK_VERCEL_VERSION="canary-x")
+    assert result.returncode != 0
+    assert "[BLOCKED] audit:vercel:cli-contract" in result.stdout
+
+
+def test_vercel_cli_contract_failure_is_manual_in_plan(strict_bin, tmp_path):
+    out = _out(tmp_path)
+    result = strict_bin("--output-directory", str(out), "--expected-project", PROJECT,
+                        "--api-sa", API_SA, "--worker-sa", WORKER_SA, "--gateway-sa", GATEWAY_SA,
+                        env={"MOCK_GCLOUD_PROJECT": PROJECT, "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES,
+                             "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES,
+                             "MOCK_VERCEL_VERSION": "canary-20260101"})
+    assert "[MANUAL] vercel:cli-contract" in result.stdout
+
+
+# ===========================================================================
+# D2 — env-run verification is isolated from local env and .env overrides
+# ===========================================================================
+
+def test_env_run_isolated_from_caller_environment_override(strict_bin, tmp_path):
+    # A polluted caller environment tries to shadow the production value of a
+    # verified kill switch. The isolated invocation must scrub it: the CLI
+    # subprocess must NOT see the caller's value, and the verdict must come
+    # from the (mocked) production records.
+    result, _ = _apply(strict_bin, tmp_path,
+                       GATEWAY_ALLOW_EXECUTION_ROUTES="true")  # hostile local override
+    log = read_log(strict_bin)
+    assert "envrun-sees GATEWAY_ALLOW_EXECUTION_ROUTES=unset" in log, (
+        "the caller-side override leaked into the `vercel env run` subprocess")
+    assert "[PASS] audit:vercel:value:GATEWAY_ALLOW_EXECUTION_ROUTES" in result.stdout
+
+
+def test_env_run_override_cannot_forge_a_match(strict_bin, tmp_path):
+    # Production (mock) reports MISMATCH; a caller-side override must not be
+    # able to turn that into a MATCH.
+    result, _ = _apply(strict_bin, tmp_path, MOCK_VERCEL_ENVRUN="MISMATCH",
+                       GATEWAY_ALLOW_EXECUTION_ROUTES="false")
+    assert result.returncode != 0
+    assert "[BLOCKED] audit:vercel:value:GATEWAY_ALLOW_EXECUTION_ROUTES" in result.stdout
+
+
+def test_env_run_uses_isolated_empty_cwd(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path)
+    envrun_lines = [ln for ln in read_log(strict_bin).splitlines()
+                    if ln.startswith("vercel env run") and "--help" not in ln]
+    assert envrun_lines, "expected isolated env run invocations"
+    for ln in envrun_lines:
+        assert "-e production" in ln  # production-only records
+        assert "--cwd" in ln          # never the checkout (no .env overlay)
+        assert str(REPO) not in ln
+    assert result is not None
+
+
+def test_env_run_refuses_passthrough_identity_names(strict_bin, tmp_path):
+    # Names the CLI needs from the environment can never be proven via env run.
+    report = tmp_path / "cvc.json"
+    run_env = dict(os.environ)
+    run_env["PATH"] = f"{strict_bin.bin_dir}:{run_env['PATH']}"
+    run_env["MOCK_LOG"] = str(strict_bin.log)
+    run_env.update({"MOCK_VERCEL_ENV_NAMES": VERCEL_REUSE, "MOCK_VERCEL_INSPECT_ID": VPID,
+                    "MOCK_VERCEL_INSPECT_ORG": VORG, "VTOK": VERCEL_TOKEN_SECRET})
+    result = subprocess.run(
+        ["bash", str(RELEASE / "check-vercel-config.sh"), "--project", "milo-agent-workspace",
+         "--project-id", VPID, "--org-id", VORG, "--token-env", "VTOK", "--strict-values",
+         "--expect", "VERCEL_TOKEN=whatever", "--json-output", str(report)],
+        capture_output=True, text=True, env=run_env, cwd=REPO, timeout=60)
+    assert "[BLOCKED] vercel:value:VERCEL_TOKEN" in result.stdout
+    assert "cannot be isolated" in result.stdout
+
+
+# ===========================================================================
+# D3 — explicit fail-closed audit-only contract (zero-secret metadata path)
+# ===========================================================================
+
+def _metadata_file(tmp_path, *, db_id="db_prod_1", fp=REDIS_FP, ver="3",
+                   url="https://prod-1.upstash.io", drop=()):
+    lines = {
+        "MILO_REDIS_DB_ID": db_id,
+        "MILO_REDIS_TOKEN_FINGERPRINT": fp,
+        "MILO_REDIS_SECRET_VERSION": ver,
+        "UPSTASH_REDIS_REST_URL": url,
+    }
+    md = tmp_path / "stored.metadata.env"
+    md.write_text("# GENERATED non-secret production metadata. NO secret values.\n" +
+                  "".join(f"{k}={v}\n" for k, v in lines.items() if k not in drop))
+    return md
+
+
+def _audit_zero_secret(strict_bin, tmp_path, metadata_path, **over):
+    """audit-only WITHOUT Upstash management credentials, metadata-driven."""
+    out = _out(tmp_path)
+    svc, jb = _write_fixtures(tmp_path, api_service_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}),
+                              worker_job_json(secret_over={"UPSTASH_REDIS_REST_TOKEN": (S_REDIS, "3")}))
+    args = ["--audit-only", "--output-directory", str(out), "--expected-project", PROJECT,
+            "--expected-account", OPERATOR, "--release-sha", FULL_SHA, "--rollback-sha", FULL_SHA,
+            "--region", REGION, "--repository", "milo-agent",
+            "--api-service", "milo-agent-api", "--worker-job", "milo-agent-worker",
+            "--api-sa", API_SA, "--worker-sa", WORKER_SA, "--gateway-sa", GATEWAY_SA,
+            "--supabase-project-ref", "vvhtaqgkgkalpfcbuvag", "--production-origin", ORIGIN,
+            "--vercel-project", "milo-agent-workspace", "--vercel-project-id", VPID, "--vercel-org-id", VORG,
+            "--vercel-token-env", "VERCEL_TOK",
+            "--wif-pool", WIF_POOL, "--wif-provider", WIF_PROVIDER, "--wif-issuer", WIF_ISSUER,
+            "--wif-audience", WIF_AUDIENCE, "--wif-attribute-condition", WIF_COND,
+            "--wif-attribute-mapping", WIF_MAPPING, "--wif-principal-set", WIF_PRINCIPAL]
+    if metadata_path is not None:
+        args += ["--audit-metadata", str(metadata_path)]
+    env = {"MOCK_GCLOUD_PROJECT": PROJECT, "MOCK_GCLOUD_ACCOUNT": OPERATOR,
+           "MOCK_SERVICE_JSON": str(svc), "MOCK_JOB_JSON": str(jb),
+           "MOCK_EXISTING_SECRETS": ALL_SECRET_NAMES, "MOCK_SECRETS_WITH_VERSIONS": ALL_SECRET_NAMES,
+           "MOCK_REDIS_ENABLED_VERSION": "3", "MOCK_REDIS_SM_PAYLOAD": UPSTASH_REST_TOKEN_SECRET,
+           "MOCK_VERCEL_ENV_NAMES": VERCEL_REUSE, "MOCK_VERCEL_INSPECT_ID": VPID, "MOCK_VERCEL_INSPECT_ORG": VORG,
+           "MOCK_VERCEL_ENVRUN": "MATCH", "MOCK_VERCEL_FP": REDIS_FP,
+           "MOCK_WIF_PROVIDER_JSON": PROVIDER_JSON_OK, "MOCK_WIF_GATEWAY_POLICY": GATEWAY_POLICY_OK, "MOCK_RUN_INVOKER_POLICY": RUN_POLICY_OK,
+           "VERCEL_TOK": VERCEL_TOKEN_SECRET}
+    env.update(over)
+    return strict_bin(*args, env=env), out
+
+
+def test_audit_contract_zero_secret_metadata_passes(strict_bin, tmp_path):
+    md = _metadata_file(tmp_path)
+    result, _ = _audit_zero_secret(strict_bin, tmp_path, md)
+    assert "[PASS] audit:contract" in result.stdout
+    assert "[PASS] audit:metadata" in result.stdout
+    assert "[PASS] redis:audit" in result.stdout
+    log = mutation_log(strict_bin)
+    # zero-secret: no Upstash management API call, no mutation of any kind.
+    assert "curl " not in log
+    for verb in ("secrets versions add", "secrets create", "run services update",
+                 "run jobs update", "env add", "env update", "iam service-accounts create"):
+        assert verb not in log, f"zero-secret audit mutated: {verb}"
+
+
+def test_audit_contract_neither_source_blocks(strict_bin, tmp_path):
+    result, _ = _audit_zero_secret(strict_bin, tmp_path, None)
+    assert result.returncode != 0
+    assert "[BLOCKED] audit:contract" in result.stdout
+    assert "curl " not in mutation_log(strict_bin)
+
+
+def test_audit_metadata_missing_file_blocks(strict_bin, tmp_path):
+    result, _ = _audit_zero_secret(strict_bin, tmp_path, tmp_path / "nope.env")
+    assert result.returncode != 0
+    assert "[BLOCKED] audit:metadata" in result.stdout
+
+
+@pytest.mark.parametrize("mutation", [
+    dict(drop=("MILO_REDIS_SECRET_VERSION",)),
+    dict(drop=("MILO_REDIS_TOKEN_FINGERPRINT",)),
+    dict(drop=("MILO_REDIS_DB_ID",)),
+    dict(drop=("UPSTASH_REDIS_REST_URL",)),
+    dict(fp="not-a-fingerprint"),
+    dict(ver="latest"),
+    dict(ver="0"),
+    dict(url="https://evil.example.com"),
+])
+def test_audit_metadata_invalid_blocks(strict_bin, tmp_path, mutation):
+    md = _metadata_file(tmp_path, **mutation)
+    result, _ = _audit_zero_secret(strict_bin, tmp_path, md)
+    assert result.returncode != 0
+    assert "[BLOCKED] audit:metadata" in result.stdout
+
+
+def test_audit_metadata_live_version_mismatch_blocks(strict_bin, tmp_path):
+    md = _metadata_file(tmp_path, ver="3")
+    result, _ = _audit_zero_secret(strict_bin, tmp_path, md, MOCK_REDIS_ENABLED_VERSION="7")
+    assert result.returncode != 0
+    assert "[BLOCKED] redis:audit" in result.stdout
+    assert "secrets versions add" not in mutation_log(strict_bin)
+
+
+def test_audit_metadata_live_fingerprint_mismatch_blocks(strict_bin, tmp_path):
+    md = _metadata_file(tmp_path)
+    result, _ = _audit_zero_secret(strict_bin, tmp_path, md, MOCK_REDIS_SM_PAYLOAD="a-rotated-token")
+    assert result.returncode != 0
+    assert "[BLOCKED] redis:audit" in result.stdout
+
+
+def test_audit_metadata_rejected_outside_audit_only(strict_bin, tmp_path):
+    out = _out(tmp_path)
+    result = strict_bin("--plan", "--audit-metadata", str(_metadata_file(tmp_path)),
+                        "--output-directory", str(out))
+    assert result.returncode != 0
+    assert "only valid with --audit-only" in result.stderr
+
+
+# ===========================================================================
+# D4 — WIF inspection failures are evidence_missing (fail closed)
+# ===========================================================================
+
+def test_wif_pool_permission_error_blocks_in_apply(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path, wif=True, MOCK_WIF_POOL="error")
+    assert result.returncode != 0
+    line = [ln for ln in result.stdout.splitlines() if "[BLOCKED] wif:pool" in ln]
+    assert line, result.stdout
+    assert "NOT proven" in line[0]
+
+
+def test_wif_pool_permission_error_blocks_in_audit_only(strict_bin, tmp_path):
+    result, _ = _audit_only(strict_bin, tmp_path, wif=True, MOCK_WIF_POOL="error")
+    assert result.returncode != 0
+    assert "[BLOCKED] wif:pool" in result.stdout
+
+
+def test_wif_provider_unreadable_blocks_in_apply(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path, wif=True, MOCK_WIF_PROVIDER_JSON="not-json-at-all")
+    assert result.returncode != 0
+    assert "[BLOCKED] wif:provider" in result.stdout
+
+
+# ===========================================================================
+# D5 — IAM re-verification after mutation (re-read the live policy)
+# ===========================================================================
+
+def test_run_invoker_bind_is_reverified_after_mutation(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path, wif=True,
+                       MOCK_RUN_INVOKER_POLICY='{"bindings":[]}',
+                       MOCK_RUN_INVOKER_POLICY_AFTER=RUN_POLICY_OK)
+    log = read_log(strict_bin)
+    assert "run services add-iam-policy-binding" in log
+    line = [ln for ln in result.stdout.splitlines() if "[PASS] wif:run-invoker" in ln]
+    assert line and "re-verified" in line[0], result.stdout
+
+
+def test_run_invoker_bind_not_effective_blocks(strict_bin, tmp_path):
+    # The bind succeeds but the re-read policy still lacks the gateway SA:
+    # the mutation did not take effect and readiness must be refused.
+    result, _ = _apply(strict_bin, tmp_path, wif=True,
+                       MOCK_RUN_INVOKER_POLICY='{"bindings":[]}',
+                       MOCK_RUN_INVOKER_POLICY_AFTER='{"bindings":[]}')
+    assert result.returncode != 0
+    line = [ln for ln in result.stdout.splitlines() if "[BLOCKED] wif:run-invoker" in ln]
+    assert line and "did not take effect" in line[0], result.stdout
+
+
+def test_run_invoker_broad_principal_after_bind_blocks(strict_bin, tmp_path):
+    broad = json.dumps({"bindings": [{"role": "roles/run.invoker",
+                                      "members": [f"serviceAccount:{GATEWAY_SA}", "allUsers"]}]})
+    result, _ = _apply(strict_bin, tmp_path, wif=True,
+                       MOCK_RUN_INVOKER_POLICY='{"bindings":[]}',
+                       MOCK_RUN_INVOKER_POLICY_AFTER=broad)
+    assert result.returncode != 0
+    assert "[BLOCKED] wif:run-invoker" in result.stdout
+
+
+def test_secret_accessor_grants_are_reverified(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path)
+    line = [ln for ln in result.stdout.splitlines()
+            if f"[PASS] gcp:accessor:{S_SUPA_URL}:{API_SA}" in ln]
+    assert line and "re-verified" in line[0], result.stdout
+
+
+def test_secret_accessor_mutation_not_effective_blocks(strict_bin, tmp_path):
+    # add-iam-policy-binding "succeeds" but the re-read policy has no binding.
+    result, _ = _apply(strict_bin, tmp_path, MOCK_SECRET_POLICY='{"bindings":[]}')
+    assert result.returncode != 0
+    line = [ln for ln in result.stdout.splitlines()
+            if f"[BLOCKED] gcp:accessor:{S_SUPA_URL}:{API_SA}" in ln]
+    assert line and "did not take effect" in line[0], result.stdout
+
+
+def test_secret_accessor_broad_principal_blocks(strict_bin, tmp_path):
+    broad = json.dumps({"bindings": [{"role": "roles/secretmanager.secretAccessor",
+                                      "members": [f"serviceAccount:{API_SA}", "allUsers"]}]})
+    result, _ = _apply(strict_bin, tmp_path, MOCK_SECRET_POLICY=broad)
+    assert result.returncode != 0
+    assert f"[BLOCKED] gcp:accessor:{S_SUPA_URL}:{API_SA}" in result.stdout

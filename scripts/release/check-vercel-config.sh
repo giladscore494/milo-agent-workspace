@@ -117,6 +117,18 @@ remote_vercel_inspection() {
     record_check MANUAL "vercel:cli" "vercel CLI unavailable; verify project '${PROJECT}' manually in the Vercel dashboard (variable names only, never values)"
     return 0
   fi
+  # Capability preflight (see vercel_cli_contract): the installed CLI must be
+  # an exact numeric release and support env ls/add/update/run --environment
+  # BEFORE anything is inspected or verified. In --strict-values mode an
+  # incompatible CLI is BLOCKED so it can never count toward readiness.
+  local cli_contract
+  cli_contract="$(vercel_cli_contract)"
+  if [[ "${cli_contract%%|*}" != "OK" ]]; then
+    local cli_sev="MANUAL"; [[ "${STRICT_VALUES}" -eq 1 ]] && cli_sev="BLOCKED"
+    record_check "${cli_sev}" "vercel:cli-contract" "${cli_contract#*|}; refusing to inspect/verify with an incompatible CLI (install the pinned version from scripts/release/VERCEL_CLI_VERSION)"
+    return 0
+  fi
+  record_check PASS "vercel:cli-contract" "vercel CLI ${cli_contract#*|} is an exact numeric release supporting env ls/add/update and env run --environment"
   require_value "vercel:project-name" "${PROJECT}" || return 0
 
   # Project identity: prefer the supported CI mechanism (VERCEL_PROJECT_ID /
@@ -274,25 +286,75 @@ remote_vercel_inspection() {
   # production`: the injected verifier reads the production value and emits ONLY
   # MATCH/MISMATCH (or a fingerprint) — the raw value is never printed,
   # persisted or placed in argv, and no application code is invoked or deployed.
+  #
+  # ISOLATION (mandatory): `vercel env run` overlays local .env files and the
+  # parent process environment OVER the downloaded production records, so an
+  # unisolated run would let a local override forge a MATCH for a wrong
+  # production value. Therefore every verification runs:
+  #   * from a freshly-created, guaranteed-EMPTY private directory (--cwd), so
+  #     no .env*/vercel.json overlay can exist;
+  #   * with the verified variable explicitly SCRUBBED from the subprocess
+  #     environment (env -u NAME), so the parent environment cannot shadow the
+  #     production record of the name under test;
+  #   * with the name/expected value delivered via dedicated MILO_VERIFY_*
+  #     variables (never interpolated into the shell command).
+  # Names the CLI itself needs from the environment can never be proven this
+  # way and are refused outright.
+  #
   # In --strict-values mode (used by apply/audit-only) a verifier that cannot
   # produce MATCH/MISMATCH (unexpected/empty output) is BLOCKED, never MANUAL:
   # unproven exact values must not count toward readiness.
   local unproven="MANUAL"; [[ "${STRICT_VALUES}" -eq 1 ]] && unproven="BLOCKED"
+  if [[ $(( ${#EXPECT_VALUES[@]} + ${#EXPECT_FINGERPRINTS[@]} )) -eq 0 ]]; then
+    return 0
+  fi
+  local envrun_cwd="${_MILO_TMPDIR}/envrun-isolated"
+  mkdir -p "${envrun_cwd}"
+  chmod 700 "${envrun_cwd}"
+  if [[ -n "$(find "${envrun_cwd}" -mindepth 1 -print -quit 2> /dev/null)" ]]; then
+    record_check BLOCKED "vercel:isolation" "the private env-run directory is unexpectedly non-empty; isolation from local .env files cannot be guaranteed (fail closed)"
+    return 0
+  fi
+  # Variables that must reach the CLI subprocess for identity/verification and
+  # therefore can never have their production value proven by this mechanism.
+  local passthrough=" VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID MILO_VERIFY_NAME MILO_VERIFY_EXPECTED PATH HOME "
+  # _cvc_vercel_envrun NAME EXPECTED COMPARATOR — isolated production-only run.
+  _cvc_vercel_envrun() {
+    local vname="$1" expected="$2" comparator="$3"
+    ( [[ -n "${token}" ]] && export VERCEL_TOKEN="${token}"
+      [[ -n "${EXPECT_PROJECT_ID}" ]] && export VERCEL_PROJECT_ID="${EXPECT_PROJECT_ID}"
+      [[ -n "${EXPECT_ORG_ID}" ]] && export VERCEL_ORG_ID="${EXPECT_ORG_ID}"
+      export MILO_VERIFY_NAME="${vname}" MILO_VERIFY_EXPECTED="${expected}"
+      env -u "${vname}" vercel env run -e production --cwd "${envrun_cwd}" \
+        "${scope_args[@]+"${scope_args[@]}"}" -- sh -c "${comparator}" )
+  }
+  # Fixed comparator strings: the verified name and the expected value travel
+  # ONLY via MILO_VERIFY_* environment variables (no shell interpolation).
+  local cmp_match='actual="$(printenv "$MILO_VERIFY_NAME" || true)"; [ "$actual" = "$MILO_VERIFY_EXPECTED" ] && echo MATCH || echo MISMATCH'
+  local cmp_fp='printf %s "$(printenv "$MILO_VERIFY_NAME" || true)" | sha256sum | cut -c1-16'
   local spec vname vval out
   for spec in "${EXPECT_VALUES[@]+"${EXPECT_VALUES[@]}"}"; do
     vname="${spec%%=*}"; vval="${spec#*=}"
-    out="$( _cvc_vercel env run -e production -- sh -c "test \"\$${vname}\" = \"${vval}\" && echo MATCH || echo MISMATCH" 2> /dev/null | tail -n1 || true )"
+    if [[ "${passthrough}" == *" ${vname} "* ]]; then
+      record_check "${unproven}" "vercel:value:${vname}" "'${vname}' is a CLI identity/verifier passthrough variable and cannot be isolated; its production value is never provable via 'vercel env run' (${unproven})"
+      continue
+    fi
+    out="$( _cvc_vercel_envrun "${vname}" "${vval}" "${cmp_match}" 2> /dev/null | tail -n1 || true )"
     case "${out}" in
-      MATCH) record_check PASS "vercel:value:${vname}" "exact production value verified in-memory (value never printed)" ;;
+      MATCH) record_check PASS "vercel:value:${vname}" "exact production value verified in-memory, isolated from local env/.env overrides (value never printed)" ;;
       MISMATCH) record_check BLOCKED "vercel:value:${vname}" "production value does not equal the approved value (value never printed)" ;;
       *) record_check "${unproven}" "vercel:value:${vname}" "could not verify the production value in-memory ('vercel env run' failed or returned unexpected output); ${unproven} (never counted as verified)" ;;
     esac
   done
   for spec in "${EXPECT_FINGERPRINTS[@]+"${EXPECT_FINGERPRINTS[@]}"}"; do
     vname="${spec%%=*}"; vval="${spec#*=}"
-    out="$( _cvc_vercel env run -e production -- sh -c "printf %s \"\$${vname}\" | sha256sum | cut -c1-16" 2> /dev/null | tail -n1 || true )"
+    if [[ "${passthrough}" == *" ${vname} "* ]]; then
+      record_check "${unproven}" "vercel:fingerprint:${vname}" "'${vname}' is a CLI identity/verifier passthrough variable and cannot be isolated; its production fingerprint is never provable via 'vercel env run' (${unproven})"
+      continue
+    fi
+    out="$( _cvc_vercel_envrun "${vname}" "${vval}" "${cmp_fp}" 2> /dev/null | tail -n1 || true )"
     if [[ ! "${out}" =~ ^[0-9a-f]{16}$ ]]; then record_check "${unproven}" "vercel:fingerprint:${vname}" "could not compute a valid in-memory fingerprint ('vercel env run' failed or returned unexpected output); ${unproven} (Redis consistency NOT proven)"
-    elif [[ "${out}" == "${vval}" ]]; then record_check PASS "vercel:fingerprint:${vname}" "Vercel value fingerprint matches the expected GCP fingerprint (token never printed)"
+    elif [[ "${out}" == "${vval}" ]]; then record_check PASS "vercel:fingerprint:${vname}" "Vercel value fingerprint matches the expected GCP fingerprint (isolated from local overrides; token never printed)"
     else record_check BLOCKED "vercel:fingerprint:${vname}" "Vercel value fingerprint does NOT match the expected fingerprint; Vercel and GCP reference different Redis credentials"
     fi
   done

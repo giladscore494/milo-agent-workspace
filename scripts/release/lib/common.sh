@@ -182,6 +182,47 @@ tool_available() {
 }
 
 # ---------------------------------------------------------------------------
+# Vercel CLI contract
+# ---------------------------------------------------------------------------
+# vercel_cli_contract — prove the `vercel` CLI on PATH is an exact numeric
+# release that supports every subcommand the release tooling invokes:
+# `env ls/add/pull/remove`, in-place `env update --yes` (value on stdin) and
+# `env run --environment` (production-only in-memory value verification).
+# Only `--version` and `--help` are executed: no network call, no deploy, no
+# mutation. Prints `OK|<version>` or `FAIL|<reason>` on stdout; the caller
+# decides severity (fail closed before any mutation in apply/audit modes).
+vercel_cli_contract() {
+  if ! tool_available vercel; then
+    printf 'FAIL|vercel CLI is not on PATH'
+    return 0
+  fi
+  local ver help_env help_run help_update sub
+  ver="$(vercel --version 2>&1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+  if [[ -z "${ver}" ]]; then
+    printf 'FAIL|vercel --version did not report an exact numeric x.y.z release (canary/dev/tag builds are rejected)'
+    return 0
+  fi
+  help_env="$(vercel env --help 2>&1 || true)"
+  for sub in add list pull remove run update; do
+    if ! grep -qE "^[[:space:]]*${sub}[[:space:]]" <<< "${help_env}"; then
+      printf 'FAIL|vercel %s does not support the env %s subcommand' "${ver}" "${sub}"
+      return 0
+    fi
+  done
+  help_run="$(vercel env run --help 2>&1 || true)"
+  if ! grep -q -- '--environment' <<< "${help_run}"; then
+    printf 'FAIL|vercel %s env run does not support --environment; production-only value verification is impossible' "${ver}"
+    return 0
+  fi
+  help_update="$(vercel env update --help 2>&1 || true)"
+  if ! grep -q -- '--yes' <<< "${help_update}"; then
+    printf 'FAIL|vercel %s env update does not support --yes (non-interactive in-place update)' "${ver}"
+    return 0
+  fi
+  printf 'OK|%s' "${ver}"
+}
+
+# ---------------------------------------------------------------------------
 # structured JSON extraction
 # ---------------------------------------------------------------------------
 # json_field JSON DOTTED_PATH — extract a scalar/subtree from JSON using a

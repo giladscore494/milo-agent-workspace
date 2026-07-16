@@ -83,6 +83,75 @@ production mutation):
 - Small fixes: the workflow plan job runs only when `mode == plan`; non-finite
   budgets (`NaN`/`Infinity`) are rejected via `math.isfinite`.
 
+## Bootstrap contract round — real-CLI/API compatibility + audit contract
+
+A further review of PR #34 found that the bootstrap could pass its mocked
+tests while being incompatible with the REAL pinned CLIs/APIs. All six
+blockers are fixed on the same branch (tooling, tests, workflow and docs only;
+no production mutation):
+
+1. **Vercel CLI pin was incompatible.** `vercel@39.3.0` has no `env update`
+   and no `env run` (verified against the real CLI: its `env` subcommands are
+   only add/list/pull/remove). The pin now lives in
+   `scripts/release/VERCEL_CLI_VERSION` (single source of truth) and is
+   **56.2.1**, verified against the real binary to support `env ls/add`,
+   in-place `env update --yes` (stdin value) and `env run --environment`. A
+   `vercel_cli_contract` preflight (version must be exact numeric x.y.z;
+   required subcommands/flags must exist; `--version`/`--help` only, never a
+   deploy) runs before ANY Vercel mutation or verification and is BLOCKED in
+   apply/audit-only on failure. CI installs the pin and runs
+   `tests/test_contract_vercel_cli.py` against the real CLI.
+2. **`vercel env run` verification could be forged by local overrides.** The
+   real CLI overlays local `.env` files and the parent process environment
+   over the downloaded production records. Verification now runs from a
+   freshly-created EMPTY private `--cwd` (no `.env` overlay possible) with the
+   verified name scrubbed from the subprocess environment (`env -u NAME`) and
+   the name/expected value passed only via dedicated verifier variables;
+   CLI-identity passthrough names are refused outright. Override-scenario
+   tests prove a hostile caller environment neither reaches the CLI subprocess
+   nor flips a MISMATCH.
+3. **Audit-only contract is now explicit.** `--audit-only` requires exactly
+   one Redis evidence source: `--audit-metadata` (PREFERRED zero-secret audit
+   against the stored non-secret metadata; file validated fail-closed and live
+   Secret Manager version + in-memory fingerprint must match it) or Upstash
+   management credentials (credentialed deep audit, GET-only); with neither,
+   `audit:contract` is BLOCKED — never a silent degrade. Tests cover metadata
+   validity, absence, malformation and live mismatch.
+4. **Upstash validator expected undocumented response fields.** `platform` is
+   a create-REQUEST parameter that the API never returns, so every real
+   response would have been false-BLOCKED. The validator now uses ONLY
+   documented response fields (`database_id`/`database_name`/`state`/`tls`/
+   `region`/`primary_region`/`endpoint`/`rest_token`), accepts the documented
+   list shape (bare JSON array), drops undocumented aliases, and
+   `tests/test_contract_upstash_api.py` pins the parser to the documented
+   schema (plus an opt-in strictly read-only GET against the real API).
+5. **WIF inspection is fail-closed via `evidence_missing`.** A permission/API
+   failure inspecting the WIF pool (and unavailable live-config/Vercel
+   evidence) is now BLOCKED in apply/audit-only (MANUAL only in plan), with
+   tests for permission/API failures in both modes.
+6. **IAM mutations are re-verified.** After `run.invoker` and per-secret
+   accessor bindings, the live policy is re-read and must contain the exact
+   expected binding (no broad principals, no unrelated run.invoker members);
+   a mutation that did not take effect, cannot be re-read, or coexists with a
+   broad principal is BLOCKED. Stateful mocks return distinct before/after
+   policies to prove the re-read.
+
+**Validation of this round (this checkout):**
+`tests/test_bootstrap_production.py` — **120 passed** (36 new tests for the
+six blockers). Full backend + release tooling
+(`pytest -q tests --ignore=MILO-main-original/MILO-main/test_websearch.py`)
+— **643 passed, 6 skipped** (the 6 skips are exactly the opt-in real-CLI /
+live-Upstash contract tests, which additionally passed against the real
+`vercel@56.2.1` binary with `MILO_REQUIRE_VERCEL_CLI_CONTRACT=1` — **7
+passed**; offline contract tests **16 passed**). PostgreSQL suite
+(`MILO_REQUIRE_PG_TESTS=1`) — **71 passed, 0 skipped**. `shellcheck -x -S
+warning` clean; `secret_scan.py` / `check_unsafe_defaults.py` /
+`check_migrations.py` pass; read-only `production-readiness.sh` passes;
+workflow YAML validates. No real GCP / Vercel / Upstash / Supabase / Redis /
+provider resource was accessed or mutated: the only real external calls were
+`vercel --version` / `--help` against a locally installed CLI (read-only,
+no login, no deploy).
+
 ## Round 2 — six final-review blockers corrected
 
 A second review of the corrective PR surfaced six more production-audit

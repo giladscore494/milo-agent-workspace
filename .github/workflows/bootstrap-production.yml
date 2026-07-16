@@ -43,10 +43,11 @@ concurrency:
   group: bootstrap-production
   cancel-in-progress: false
 
-env:
-  # Vercel CLI is pinned to an EXACT numeric version (never @latest). This
-  # version supports `vercel env update` (used for idempotent in-place updates).
-  VERCEL_CLI_VERSION: "39.3.0"
+# The Vercel CLI is pinned to the EXACT numeric version recorded in
+# scripts/release/VERCEL_CLI_VERSION (single source of truth; never @latest).
+# That version is verified IN CI against the REAL CLI before any bootstrap
+# step: it must support `env ls/add`, in-place `env update --yes` and
+# `env run --environment` (contract tests; help/version only, never a deploy).
 
 jobs:
   plan:
@@ -62,8 +63,24 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Install pinned Vercel CLI
-        run: npm install -g "vercel@${VERCEL_CLI_VERSION}"
+      - name: Install pinned Vercel CLI (from scripts/release/VERCEL_CLI_VERSION)
+        run: |
+          set -euo pipefail
+          VERCEL_CLI_VERSION="$(tr -d '[:space:]' < scripts/release/VERCEL_CLI_VERSION)"
+          echo "VERCEL_CLI_VERSION=${VERCEL_CLI_VERSION}" >> "${GITHUB_ENV}"
+          npm install -g "vercel@${VERCEL_CLI_VERSION}"
+      - name: Contract preflight — real Vercel CLI + Upstash API (read-only; no deploy, no mutation)
+        env:
+          MILO_REQUIRE_VERCEL_CLI_CONTRACT: "1"
+          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
+          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pytest
+          if [[ -n "${UPSTASH_EMAIL:-}" && -n "${UPSTASH_API_KEY:-}" ]]; then
+            export MILO_REQUIRE_UPSTASH_CONTRACT=1
+          fi
+          python -m pytest -q tests/test_contract_vercel_cli.py tests/test_contract_upstash_api.py
 
       - name: Authenticate to Google Cloud via Workload Identity Federation
         if: ${{ vars.GITHUB_WIF_PROVIDER_RESOURCE != '' }}
@@ -141,8 +158,24 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Install pinned Vercel CLI
-        run: npm install -g "vercel@${VERCEL_CLI_VERSION}"
+      - name: Install pinned Vercel CLI (from scripts/release/VERCEL_CLI_VERSION)
+        run: |
+          set -euo pipefail
+          VERCEL_CLI_VERSION="$(tr -d '[:space:]' < scripts/release/VERCEL_CLI_VERSION)"
+          echo "VERCEL_CLI_VERSION=${VERCEL_CLI_VERSION}" >> "${GITHUB_ENV}"
+          npm install -g "vercel@${VERCEL_CLI_VERSION}"
+      - name: Contract preflight — real Vercel CLI + Upstash API (read-only; no deploy, no mutation)
+        env:
+          MILO_REQUIRE_VERCEL_CLI_CONTRACT: "1"
+          UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
+          UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pytest
+          if [[ -n "${UPSTASH_EMAIL:-}" && -n "${UPSTASH_API_KEY:-}" ]]; then
+            export MILO_REQUIRE_UPSTASH_CONTRACT=1
+          fi
+          python -m pytest -q tests/test_contract_vercel_cli.py tests/test_contract_upstash_api.py
 
       - name: Authenticate to Google Cloud via Workload Identity Federation
         uses: google-github-actions/auth@v2

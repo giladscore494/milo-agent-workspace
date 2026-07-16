@@ -122,6 +122,17 @@ case "$all" in
   *deploy*|*"env add"*|*"env rm"*|*"env remove"*|*promote*|*link*|*"--prod"*)
     printf 'MOCK-FORBIDDEN vercel mutation/deploy: %s\n' "$all" >&2; exit 97;;
 esac
+# Capability-preflight probes (--version/--help only; read-only by contract).
+case "$all" in
+  "--version")
+    printf 'Vercel CLI %s\n%s\n' "${MOCK_VERCEL_VERSION:-56.2.1}" "${MOCK_VERCEL_VERSION:-56.2.1}"; exit 0;;
+  "env --help")
+    printf '  add     name [environment]\n  list    [environment]\n  pull    [filename]\n  remove  name [environment]\n  run     command\n  update  name [environment]\n'; exit 0;;
+  "env run --help")
+    printf -- '-e,  --environment <TARGET>\n'; exit 0;;
+  "env update --help")
+    printf -- '-y,  --yes\n'; exit 0;;
+esac
 case "$all" in
   *"--scope-project"*|*"--environment"*)
     printf 'Error: unknown or unsupported option in: %s\n' "$all" >&2; exit 1;;
