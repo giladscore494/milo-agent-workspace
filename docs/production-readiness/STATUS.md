@@ -169,7 +169,7 @@ same branch (tooling, tests, workflow and docs only; no production mutation):
    management credential.
 2. **Metadata is trustworthy.** `milo-production.metadata.env` now carries
    `MILO_METADATA_SCHEMA_VERSION=2`, `MILO_BOOTSTRAP_STATUS=applied`,
-   `MILO_ENVIRONMENT`, the full `MILO_RELEASE_SHA`, `GCP_PROJECT_ID`, a
+   `MILO_ENVIRONMENT`, the full `MILO_BOOTSTRAP_SHA`, `GCP_PROJECT_ID`, a
    `MILO_METADATA_GENERATED_AT` reconciliation timestamp and the Redis
    identity fields. It is written ONLY by `--apply`, AFTER the final live
    audit, and ONLY on full success; a partial failure deletes any candidate
@@ -179,10 +179,10 @@ same branch (tooling, tests, workflow and docs only; no production mutation):
    timestamp (`--audit-metadata-max-age-hours`, default 720), and any
    missing/malformed Redis field.
 3. **Database identity is verified against live state.** The guarded apply
-   writes `MILO_RELEASE_SHA` (alongside the existing `MILO_REDIS_DB_ID` /
+   writes `MILO_BOOTSTRAP_SHA` (alongside the existing `MILO_REDIS_DB_ID` /
    `MILO_REDIS_TOKEN_FINGERPRINT` / `MILO_REDIS_SECRET_VERSION`) into the
    live Cloud Run env; `verify_live_config.py` now verifies db id,
-   fingerprint, pinned version and release SHA EXACTLY on both the API
+   fingerprint, pinned version and bootstrap SHA EXACTLY on both the API
    service and the worker job, and the Vercel audit verifies the managed
    `MILO_REDIS_TOKEN_FINGERPRINT` variable plus the token fingerprint
    itself. Regression tests prove a wrong database id (stored or live)

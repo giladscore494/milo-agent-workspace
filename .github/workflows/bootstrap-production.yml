@@ -286,17 +286,26 @@ jobs:
           VERCEL_CLI_VERSION="$(tr -d '[:space:]' < scripts/release/VERCEL_CLI_VERSION)"
           echo "VERCEL_CLI_VERSION=${VERCEL_CLI_VERSION}" >> "${GITHUB_ENV}"
           npm install -g "vercel@${VERCEL_CLI_VERSION}"
-      - name: Contract preflight — real Vercel CLI + Upstash API (read-only; no deploy, no mutation)
+      - name: Contract preflight — real Vercel CLI (metadata audit; no Upstash secrets)
+        if: ${{ github.event.inputs.metadata_run_id != '' }}
         env:
           MILO_REQUIRE_VERCEL_CLI_CONTRACT: "1"
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pytest
+          python -m pytest -q tests/test_contract_vercel_cli.py
+
+      - name: Contract preflight — real Vercel CLI + Upstash API (deep audit GET-only)
+        if: ${{ github.event.inputs.metadata_run_id == '' }}
+        env:
+          MILO_REQUIRE_VERCEL_CLI_CONTRACT: "1"
+          MILO_REQUIRE_UPSTASH_CONTRACT: "1"
           UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
           UPSTASH_API_KEY: ${{ secrets.UPSTASH_API_KEY }}
         run: |
           set -euo pipefail
           python -m pip install --quiet pytest
-          if [[ -n "${UPSTASH_EMAIL:-}" && -n "${UPSTASH_API_KEY:-}" ]]; then
-            export MILO_REQUIRE_UPSTASH_CONTRACT=1
-          fi
+          test -n "${UPSTASH_EMAIL:-}" && test -n "${UPSTASH_API_KEY:-}"
           python -m pytest -q tests/test_contract_vercel_cli.py tests/test_contract_upstash_api.py
 
       # Fetch the durable metadata preserved by the successful apply run
@@ -322,12 +331,11 @@ jobs:
         if: ${{ vars.GITHUB_WIF_PROVIDER_RESOURCE != '' }}
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Run fail-closed audit (no mutations of any kind)
+      - name: Run fail-closed metadata audit (no Upstash credentials, no mutations)
+        if: ${{ github.event.inputs.metadata_run_id != '' }}
         shell: bash
         env:
           METADATA_RUN_ID: ${{ github.event.inputs.metadata_run_id }}
-          MILO_UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
-          MILO_UPSTASH_APIKEY: ${{ secrets.UPSTASH_API_KEY }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
@@ -358,9 +366,44 @@ jobs:
             --output-directory "${RUNNER_TEMP}/bootstrap-out" \
             --expected-account "${{ vars.GITHUB_BOOTSTRAP_OPERATOR_SA }}" \
             --vercel-token-env VERCEL_TOKEN \
+            "${metadata_args[@]+"${metadata_args[@]}"}" \
+            "${wif_args[@]+"${wif_args[@]}"}"
+
+      - name: Run fail-closed deep audit (Upstash GET-only, no mutations)
+        if: ${{ github.event.inputs.metadata_run_id == '' }}
+        shell: bash
+        env:
+          MILO_UPSTASH_EMAIL: ${{ secrets.UPSTASH_EMAIL }}
+          MILO_UPSTASH_APIKEY: ${{ secrets.UPSTASH_API_KEY }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          VERCEL_WIF_POOL_ID: ${{ vars.VERCEL_WIF_POOL_ID }}
+          VERCEL_WIF_PROVIDER_ID: ${{ vars.VERCEL_WIF_PROVIDER_ID }}
+          VERCEL_WIF_ISSUER: ${{ vars.VERCEL_WIF_ISSUER }}
+          VERCEL_WIF_ALLOWED_AUDIENCE: ${{ vars.VERCEL_WIF_ALLOWED_AUDIENCE }}
+          VERCEL_WIF_ATTRIBUTE_CONDITION: ${{ vars.VERCEL_WIF_ATTRIBUTE_CONDITION }}
+          VERCEL_WIF_ATTRIBUTE_MAPPING: ${{ vars.VERCEL_WIF_ATTRIBUTE_MAPPING }}
+          VERCEL_WIF_PRINCIPAL_SET: ${{ vars.VERCEL_WIF_PRINCIPAL_SET }}
+        run: |
+          set -euo pipefail
+          test -n "${MILO_UPSTASH_EMAIL:-}" && test -n "${MILO_UPSTASH_APIKEY:-}"
+          mkdir -p "${RUNNER_TEMP}/bootstrap-out"
+          wif_args=()
+          [[ -n "${VERCEL_WIF_POOL_ID:-}" ]] && wif_args+=(--wif-pool "${VERCEL_WIF_POOL_ID}")
+          [[ -n "${VERCEL_WIF_PROVIDER_ID:-}" ]] && wif_args+=(--wif-provider "${VERCEL_WIF_PROVIDER_ID}")
+          [[ -n "${VERCEL_WIF_ISSUER:-}" ]] && wif_args+=(--wif-issuer "${VERCEL_WIF_ISSUER}")
+          [[ -n "${VERCEL_WIF_ALLOWED_AUDIENCE:-}" ]] && wif_args+=(--wif-audience "${VERCEL_WIF_ALLOWED_AUDIENCE}")
+          [[ -n "${VERCEL_WIF_ATTRIBUTE_CONDITION:-}" ]] && wif_args+=(--wif-attribute-condition "${VERCEL_WIF_ATTRIBUTE_CONDITION}")
+          [[ -n "${VERCEL_WIF_ATTRIBUTE_MAPPING:-}" ]] && wif_args+=(--wif-attribute-mapping "${VERCEL_WIF_ATTRIBUTE_MAPPING}")
+          [[ -n "${VERCEL_WIF_PRINCIPAL_SET:-}" ]] && wif_args+=(--wif-principal-set "${VERCEL_WIF_PRINCIPAL_SET}")
+          bash scripts/release/bootstrap-production.sh --audit-only \
+            --release-sha "${GITHUB_SHA}" \
+            --output-directory "${RUNNER_TEMP}/bootstrap-out" \
+            --expected-account "${{ vars.GITHUB_BOOTSTRAP_OPERATOR_SA }}" \
+            --vercel-token-env VERCEL_TOKEN \
             --upstash-email-env MILO_UPSTASH_EMAIL \
             --upstash-apikey-env MILO_UPSTASH_APIKEY \
-            "${metadata_args[@]+"${metadata_args[@]}"}" \
             "${wif_args[@]+"${wif_args[@]}"}"
 
       - name: Upload redacted audit reports (never secret files)
