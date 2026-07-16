@@ -183,6 +183,11 @@ class BootstrapConfig:
     """
 
     bootstrap_sha: str
+    gcp_project_number: str = ""
+    repository: str = "giladscore494/milo-agent-workspace"
+    trusted_ref: str = "claude/production-readiness-j0hhni"
+    supabase_project_ref: str = ""
+    production_origin: str = ""
     gcp_project_id: str = "big-cabinet-457321-t7"
     gcp_region: str = "us-central1"
     cloud_run_api_service: str = "milo-agent-api"
@@ -236,6 +241,10 @@ class BootstrapConfig:
                 problems.append(f"{spec.name} contains a placeholder value")
         if self.environment != "production":
             problems.append("environment must be exactly 'production'")
+        if self.gcp_project_number and not self.gcp_project_number.isdigit():
+            problems.append("gcp_project_number must be numeric")
+        if "/" not in self.repository:
+            problems.append("repository must be owner/name")
         if not self.cloud_run_api_url.startswith("https://"):
             problems.append("cloud_run_api_url must be https")
         if not self.wif_issuer.startswith("https://oidc.vercel.com/"):

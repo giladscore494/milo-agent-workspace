@@ -78,6 +78,7 @@ class DiscoveredWorld:
     secrets: tuple[tuple[str, Observed], ...]
     secret_iam: tuple[tuple[str, Observed], ...]
     wif: Observed
+    gateway_sa_iam: Observed
     run_invoker_iam: Observed
     worker_job: Observed
     api_service: Observed
@@ -464,6 +465,56 @@ def build_plan(config: BootstrapConfig, world: DiscoveredWorld) -> MutationPlan:
                     ),
                 )
             )
+
+    world.gateway_sa_iam.require_decisive("gateway service account iam policy")
+    gateway_state = world.gateway_sa_iam.state
+    desired_wif_members = (
+        (
+            "principalSet://iam.googleapis.com/projects/"
+            f"{config.gcp_project_number}/locations/global/workloadIdentityPools/"
+            f"{config.wif_pool_id}/attribute.project/{config.vercel_project_id}"
+        ),
+    )
+    current_wif_members: tuple[str, ...] = ()
+    if isinstance(gateway_state, IamPolicyState):
+        for binding in gateway_state.bindings:
+            if (
+                binding.role == "roles/iam.workloadIdentityUser"
+                and not binding.condition_expression
+            ):
+                current_wif_members = binding.members
+    if tuple(sorted(current_wif_members)) != tuple(sorted(desired_wif_members)):
+        resource = ResourceIdentity(
+            provider=Provider.GCP,
+            kind="service_account_iam_policy",
+            name=config.gateway_service_account,
+            scope=config.gcp_project_id,
+        )
+        desired = {
+            "role": "roles/iam.workloadIdentityUser",
+            "members": sorted(desired_wif_members),
+            "condition": "",
+        }
+        operations.append(
+            MutationOperation(
+                sequence=_next_sequence(seq),
+                provider=Provider.GCP,
+                operation_type=OperationType.GCP_SET_WIF_IAM,
+                resource=resource,
+                expected_pre_state_digest=state_digest(
+                    {"members": sorted(current_wif_members)}
+                ),
+                intended_post_state_digest=state_digest(desired),
+                reason="gateway workloadIdentityUser principal set differs from intended",
+                idempotency_key=f"{OperationType.GCP_SET_WIF_IAM.value}:{resource.key()}",
+                can_incur_cost=False,
+                has_safe_compensation=True,
+                post_write_read=PostWriteRead(
+                    description="reread gateway sa iam policy and compare exactly",
+                    expected_post_state_digest=state_digest(desired),
+                ),
+            )
+        )
 
     world.run_invoker_iam.require_decisive("cloud run invoker policy")
     invoker_state = world.run_invoker_iam.state
