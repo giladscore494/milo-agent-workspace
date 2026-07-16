@@ -80,7 +80,7 @@ def api_service_json(*, plain_over=None, secret_over=None, drop=None, sa=API_SA)
              "GATEWAY_ALLOW_EXECUTION_ROUTES": "false", "MILO_GATEWAY_AUDIENCE": API_URL,
              "MILO_APPROVED_GATEWAY_IDENTITIES": GATEWAY_SA, "MILO_APPROVED_WORKER_IDENTITIES": WORKER_SA,
              "UPSTASH_REDIS_REST_URL": REDIS_URL,
-             "MILO_RELEASE_SHA": FULL_SHA, "MILO_REDIS_DB_ID": "db_prod_1",
+             "MILO_BOOTSTRAP_SHA": FULL_SHA, "MILO_REDIS_DB_ID": "db_prod_1",
              "MILO_REDIS_TOKEN_FINGERPRINT": REDIS_FP, "MILO_REDIS_SECRET_VERSION": REDIS_VER}
     plain.update(_FLAGS); plain.update(_BUDGETS)
     refs = {"SUPABASE_URL": (S_SUPA_URL, "latest"), "SUPABASE_SECRET_KEY": (S_SUPA_KEY, "latest"),
@@ -97,7 +97,7 @@ def api_service_json(*, plain_over=None, secret_over=None, drop=None, sa=API_SA)
 def worker_job_json(*, plain_over=None, secret_over=None, drop=None, sa=WORKER_SA):
     plain = {"ENVIRONMENT": "production", "MILO_WORKER_AUDIENCE": API_URL,
              "MILO_APPROVED_WORKER_IDENTITIES": WORKER_SA, "UPSTASH_REDIS_REST_URL": REDIS_URL,
-             "MILO_RELEASE_SHA": FULL_SHA, "MILO_REDIS_DB_ID": "db_prod_1",
+             "MILO_BOOTSTRAP_SHA": FULL_SHA, "MILO_REDIS_DB_ID": "db_prod_1",
              "MILO_REDIS_TOKEN_FINGERPRINT": REDIS_FP, "MILO_REDIS_SECRET_VERSION": REDIS_VER}
     plain.update(_FLAGS); plain.update(_BUDGETS)
     refs = {"SUPABASE_URL": (S_SUPA_URL, "latest"), "SUPABASE_SECRET_KEY": (S_SUPA_KEY, "latest"),
@@ -153,7 +153,14 @@ case "$all" in
     printf 'ERROR: NOT_FOUND: Secret [%s] not found\n' "$s" >&2; exit 1;;
   *"secrets create"*) exit 0;;
   *"secrets versions access"*)
-    printf '%s' "${MOCK_REDIS_SM_PAYLOAD-$MOCK_UPSTASH_REST_TOKEN}";;
+    case "${MOCK_REDIS_ACCESS_MODE:-ok}" in
+      denied) printf 'ERROR: PERMISSION_DENIED: secretmanager.versions.access denied
+' >&2; exit 1;;
+      api) printf 'ERROR: INTERNAL: backend error
+' >&2; exit 1;;
+      empty) printf '';;
+      *) printf '%s' "${MOCK_REDIS_SM_PAYLOAD-$MOCK_UPSTASH_REST_TOKEN}";;
+    esac;;
   *"secrets versions add"*)
     cat > /dev/null
     printf 'projects/p/secrets/x/versions/%s\n' "${MOCK_REDIS_ADD_VERSION:-4}";;
@@ -404,12 +411,12 @@ def _apply_args(out, sha, wif=False):
 def _env(tmp_path, service=None, job=None, release_sha=None, **over):
     service = service or api_service_json()
     job = job or worker_job_json()
-    # Bind the live fixtures to the actual audited release SHA — but never
+    # Bind the live fixtures to the actual audited bootstrap SHA — but never
     # clobber a fixture a test deliberately customized (drift tests).
     if release_sha:
         for desc in (service, job):
-            if _fixture_plain_get(desc, "MILO_RELEASE_SHA") == FULL_SHA:
-                _fixture_set_plain(desc, "MILO_RELEASE_SHA", release_sha)
+            if _fixture_plain_get(desc, "MILO_BOOTSTRAP_SHA") == FULL_SHA:
+                _fixture_set_plain(desc, "MILO_BOOTSTRAP_SHA", release_sha)
     svc, jb = _write_fixtures(tmp_path, service, job)
     e = {
         "MILO_OPERATOR_ACK": ACK, "MOCK_GCLOUD_ACCOUNT": OPERATOR, "MOCK_GCLOUD_PROJECT": PROJECT,
@@ -642,6 +649,42 @@ def test_upstash_explicit_id_source_of_truth(strict_bin, tmp_path):
     assert "selected exactly one production Redis" in result.stdout or "[PASS] upstash:token" in result.stdout
 
 
+
+
+def test_upstash_detail_matching_selected_id_passes(strict_bin, tmp_path):
+    result, _ = _apply(strict_bin, tmp_path)
+    assert "[PASS] upstash:url" in result.stdout
+    assert "[BLOCKED] upstash:validate" not in result.stdout
+
+
+@pytest.mark.parametrize("detail", [
+    json.dumps({"database_id": "db_other", "database_name": "milo-production", "endpoint": "prod-1.upstash.io", "state": "active", "tls": True, "region": "global", "primary_region": "us-central1", "rest_token": UPSTASH_REST_TOKEN_SECRET}),
+    json.dumps({"database_name": "milo-production", "endpoint": "prod-1.upstash.io", "state": "active", "tls": True, "region": "global", "primary_region": "us-central1", "rest_token": UPSTASH_REST_TOKEN_SECRET}),
+])
+def test_upstash_detail_id_mismatch_or_missing_blocks_before_mutation(strict_bin, tmp_path, detail):
+    result, out = _apply(strict_bin, tmp_path, MOCK_UPSTASH_DETAIL=detail)
+    assert result.returncode != 0
+    assert "[BLOCKED] upstash:validate" in result.stdout
+    log = read_log(strict_bin)
+    for forbidden in ("secrets versions add", "run services update", "run jobs update", "env add", "env update"):
+        assert forbidden not in log
+    assert not (out / "milo-production.metadata.env").exists()
+
+
+def test_upstash_explicit_requested_id_differing_from_detail_id_blocks(strict_bin, tmp_path):
+    detail = json.dumps({"database_id": "db_other", "database_name": "milo-production", "endpoint": "prod-1.upstash.io", "state": "active", "tls": True, "region": "global", "primary_region": "us-central1", "rest_token": UPSTASH_REST_TOKEN_SECRET})
+    repo, head = _git_repo(tmp_path)
+    out = _out(tmp_path)
+    args = _apply_args(out, head) + ["--upstash-database-id", "db_prod_1"]
+    result = strict_bin(*args, env=_env(tmp_path, release_sha=head, MOCK_UPSTASH_DETAIL=detail), cwd=repo)
+    assert result.returncode != 0
+    assert "[BLOCKED] upstash:validate" in result.stdout
+    log = read_log(strict_bin)
+    assert "secrets versions add" not in log
+    assert "run services update" not in log
+    assert "env update" not in log
+
+
 def test_upstash_nonexistent_id_blocks(strict_bin, tmp_path):
     repo, head = _git_repo(tmp_path)
     out = _out(tmp_path)
@@ -695,6 +738,22 @@ def test_redis_ledger_present_in_report(strict_bin, tmp_path):
 def test_redis_secret_version_error_not_no_version(strict_bin, tmp_path):
     result, _ = _apply(strict_bin, tmp_path, MOCK_SECRET_VERSION_ERROR=S_REDIS)
     assert "[BLOCKED] redis:reconcile" in result.stdout
+
+
+@pytest.mark.parametrize("mode", ["denied", "api", "empty"])
+def test_redis_payload_read_failure_blocks_before_any_rotation_or_downstream_mutation(strict_bin, tmp_path, mode):
+    result, out = _apply(strict_bin, tmp_path, MOCK_REDIS_ACCESS_MODE=mode)
+    assert result.returncode != 0
+    assert "[BLOCKED] redis:reconcile" in result.stdout
+    log = read_log(strict_bin)
+    for forbidden in ("secrets versions add", "run services update", "run jobs update"):
+        assert forbidden not in log, f"payload-read failure must not allow {forbidden}"
+    mutation_lines = [ln for ln in log.splitlines() if "vercel env add" in ln or "vercel env update" in ln]
+    for forbidden_name in ("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN", "MILO_REDIS_TOKEN_FINGERPRINT"):
+        assert not any(forbidden_name in ln for ln in mutation_lines), f"payload-read failure must not mutate Vercel {forbidden_name}"
+    assert not (out / "milo-production.metadata.env").exists()
+    assert "metadata:generated" not in result.stdout
+    assert "APPLY COMPLETE" not in result.stdout
 
 
 # ===========================================================================
@@ -1175,7 +1234,7 @@ def _metadata_file(tmp_path, *, db_id="db_prod_1", fp=REDIS_FP, ver="3",
         "MILO_METADATA_SCHEMA_VERSION": "2",
         "MILO_BOOTSTRAP_STATUS": status,
         "MILO_ENVIRONMENT": environment,
-        "MILO_RELEASE_SHA": release_sha,
+        "MILO_BOOTSTRAP_SHA": release_sha,
         "MILO_METADATA_GENERATED_AT": generated_at or _now_iso(),
         "GCP_PROJECT_ID": project,
         "MILO_REDIS_DB_ID": db_id,
@@ -1264,7 +1323,7 @@ def test_audit_metadata_missing_file_blocks(strict_bin, tmp_path):
     dict(drop=("MILO_BOOTSTRAP_STATUS",)),
     dict(release_sha="e" * 40),                 # a different release
     dict(release_sha="not-a-full-sha"),
-    dict(drop=("MILO_RELEASE_SHA",)),
+    dict(drop=("MILO_BOOTSTRAP_SHA",)),
     dict(project="some-other-project"),
     dict(drop=("GCP_PROJECT_ID",)),
     dict(environment="staging"),
@@ -1281,8 +1340,38 @@ def test_audit_metadata_invalid_blocks(strict_bin, tmp_path, mutation):
     assert "[BLOCKED] audit:metadata" in result.stdout
 
 
+
+
+@pytest.mark.parametrize("extra_line", [
+    "MILO_METADATA_SCHEMA_VERSION=1\n",
+    "MILO_METADATA_SCHEMA_VERSION=3\n",
+    "MILO_METADATA_SCHEMA_VERSION=two\n",
+])
+def test_audit_metadata_schema_version_must_be_exactly_two(strict_bin, tmp_path, extra_line):
+    md = _metadata_file(tmp_path)
+    text = md.read_text().replace("MILO_METADATA_SCHEMA_VERSION=2\n", extra_line)
+    md.write_text(text)
+    result, _ = _audit_metadata(strict_bin, tmp_path, md)
+    assert result.returncode != 0
+    assert "[BLOCKED] audit:metadata" in result.stdout
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda text: text + "MILO_REDIS_DB_ID=db_prod_1\n",
+    lambda text: text.replace("MILO_METADATA_SCHEMA_VERSION=2\n", ""),
+    lambda text: text + "MALFORMED_LINE_WITHOUT_EQUALS\n",
+    lambda text: text.replace("MILO_REDIS_DB_ID=db_prod_1\n", "MILO_REDIS_DB_ID= db_prod_1 \n"),
+])
+def test_audit_metadata_strict_parser_rejects_duplicates_missing_malformed_and_normalized_values(strict_bin, tmp_path, mutate):
+    md = _metadata_file(tmp_path)
+    md.write_text(mutate(md.read_text()))
+    result, _ = _audit_metadata(strict_bin, tmp_path, md)
+    assert result.returncode != 0
+    assert "[BLOCKED] audit:metadata" in result.stdout
+
+
 def test_audit_metadata_requires_release_sha_argument(strict_bin, tmp_path):
-    # The audit is release-bound: without --release-sha the metadata path is
+    # The audit is bootstrap-bound: without --release-sha the metadata path is
     # BLOCKED (never audited unbound).
     md = _metadata_file(tmp_path)
     out = _out(tmp_path)
@@ -1470,7 +1559,7 @@ def test_metadata_written_only_after_full_success(strict_bin, tmp_path):
     report = json.loads((out / "bootstrap-apply.json").read_text())
     assert report["status"] == "applied"
     # Release-bound, project/environment-bound, timestamped, status applied.
-    assert f"MILO_RELEASE_SHA={report['head_sha']}" in md
+    assert f"MILO_BOOTSTRAP_SHA={report['head_sha']}" in md
     assert "MILO_BOOTSTRAP_STATUS=applied" in md
     assert "MILO_ENVIRONMENT=production" in md
     assert f"GCP_PROJECT_ID={PROJECT}" in md
@@ -1513,8 +1602,8 @@ def test_apply_configures_release_sha_on_cloud_run(strict_bin, tmp_path):
     log = read_log(strict_bin)
     api_upd = [ln for ln in log.splitlines() if "run services update" in ln][0]
     job_upd = [ln for ln in log.splitlines() if "run jobs update" in ln][0]
-    assert f"MILO_RELEASE_SHA={report['head_sha']}" in api_upd
-    assert f"MILO_RELEASE_SHA={report['head_sha']}" in job_upd
+    assert f"MILO_BOOTSTRAP_SHA={report['head_sha']}" in api_upd
+    assert f"MILO_BOOTSTRAP_SHA={report['head_sha']}" in job_upd
 
 
 @pytest.mark.parametrize("drift,expect", [
@@ -1522,8 +1611,8 @@ def test_apply_configures_release_sha_on_cloud_run(strict_bin, tmp_path):
     (dict(drop=["MILO_REDIS_DB_ID"]), "live:api:MILO_REDIS_DB_ID"),
     (dict(plain_over={"MILO_REDIS_TOKEN_FINGERPRINT": "deadbeefdeadbeef"}), "live:api:MILO_REDIS_TOKEN_FINGERPRINT"),
     (dict(plain_over={"MILO_REDIS_SECRET_VERSION": "999"}), "live:api:MILO_REDIS_SECRET_VERSION"),
-    (dict(plain_over={"MILO_RELEASE_SHA": "f" * 40}), "live:api:MILO_RELEASE_SHA"),
-    (dict(drop=["MILO_RELEASE_SHA"]), "live:api:MILO_RELEASE_SHA"),
+    (dict(plain_over={"MILO_BOOTSTRAP_SHA": "f" * 40}), "live:api:MILO_BOOTSTRAP_SHA"),
+    (dict(drop=["MILO_BOOTSTRAP_SHA"]), "live:api:MILO_BOOTSTRAP_SHA"),
 ])
 def test_live_identity_drift_blocks_apply(strict_bin, tmp_path, drift, expect):
     result, _ = _apply(strict_bin, tmp_path, service=api_service_json(**drift))
@@ -1600,10 +1689,20 @@ def test_workflow_audit_only_job_is_gated_and_read_only():
     audit = wf["jobs"]["audit"]
     assert audit["if"] == "${{ github.event.inputs.mode == 'audit-only' }}"
     run_steps = [s for s in audit["steps"] if "bootstrap-production.sh" in s.get("run", "")]
-    assert len(run_steps) == 1
-    assert "--audit-only" in run_steps[0]["run"]
-    assert "--apply" not in run_steps[0]["run"]
-    assert "--confirm-production-change" not in run_steps[0]["run"]
+    assert len(run_steps) == 2
+    for step in run_steps:
+        assert "--audit-only" in step["run"]
+        assert "--apply" not in step["run"]
+        assert "--confirm-production-change" not in step["run"]
+    metadata_steps = [s for s in run_steps if "metadata audit" in s["name"]]
+    deep_steps = [s for s in run_steps if "deep audit" in s["name"]]
+    assert len(metadata_steps) == len(deep_steps) == 1
+    assert metadata_steps[0]["if"] == "${{ github.event.inputs.metadata_run_id != '' }}"
+    assert deep_steps[0]["if"] == "${{ github.event.inputs.metadata_run_id == '' }}"
+    assert "--upstash-email-env" not in metadata_steps[0]["run"]
+    assert "--upstash-apikey-env" not in metadata_steps[0]["run"]
+    assert "--upstash-email-env" in deep_steps[0]["run"]
+    assert "--upstash-apikey-env" in deep_steps[0]["run"]
     # It can consume the preserved metadata artifact from a successful apply.
     downloads = [s for s in audit["steps"] if str(s.get("uses", "")).startswith("actions/download-artifact")]
     assert downloads and downloads[0]["with"]["name"] == "bootstrap-production-metadata"
@@ -1626,3 +1725,27 @@ def test_workflow_preserves_metadata_only_on_success():
     assert md["if"] == "${{ success() }}", "metadata must never be uploaded from a failed/partial apply"
     assert md["with"]["if-no-files-found"] == "error"
     assert "milo-production.metadata.env" in md["with"]["path"]
+
+
+def test_workflow_metadata_audit_step_contains_no_upstash_secret_references():
+    text = (REPO / ".github/workflows/bootstrap-production.yml").read_text()
+    start = text.index("Run fail-closed metadata audit")
+    end = text.index("Run fail-closed deep audit", start)
+    block = text[start:end]
+    assert "UPSTASH_EMAIL" not in block
+    assert "UPSTASH_API" not in block
+    assert "upstash-email-env" not in block
+    assert "upstash-apikey-env" not in block
+    assert "test_contract_upstash_api.py" not in block
+
+
+def test_workflow_deep_audit_requires_upstash_credentials_and_no_metadata_args():
+    text = (REPO / ".github/workflows/bootstrap-production.yml").read_text()
+    start = text.index("Run fail-closed deep audit")
+    end = text.index("Upload redacted audit reports", start)
+    block = text[start:end]
+    assert "test -n \"${MILO_UPSTASH_EMAIL:-}\"" in block
+    assert "test -n \"${MILO_UPSTASH_APIKEY:-}\"" in block
+    assert "--upstash-email-env MILO_UPSTASH_EMAIL" in block
+    assert "--upstash-apikey-env MILO_UPSTASH_APIKEY" in block
+    assert "--audit-metadata" not in block

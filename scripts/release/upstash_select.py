@@ -113,13 +113,18 @@ def do_select(list_json: str, expected_name: str, db_id: str) -> str:
     return f"SELECT|{selected}"
 
 
-def do_validate(detail_json: str, expected_name: str, expected_region: str) -> str:
+def do_validate(detail_json: str, expected_name: str, expected_region: str, selected_id: str = "") -> str:
     try:
         db = json.loads(detail_json)
     except Exception:
         return "BLOCKED|database detail was not valid JSON"
     if not isinstance(db, dict):
         return "BLOCKED|unexpected database detail shape"
+    detail_id = _id_of(db)
+    if not detail_id:
+        return "BLOCKED|database detail is missing the documented 'database_id' field"
+    if selected_id and detail_id != selected_id:
+        return f"BLOCKED|database detail id '{detail_id}' does not exactly equal selected id '{selected_id}'"
     name = _name_of(db)
     if not name:
         return "BLOCKED|database detail is missing the documented 'database_name' field"
@@ -167,11 +172,12 @@ def main() -> int:
     p.add_argument("--expected-name", default="milo-production")
     p.add_argument("--database-id", default="")
     p.add_argument("--expected-region", default="us-central1")
+    p.add_argument("--selected-id", default="")
     args = p.parse_args()
     if args.mode == "select":
         print(do_select(args.json, args.expected_name, args.database_id))
     else:
-        print(do_validate(args.json, args.expected_name, args.expected_region))
+        print(do_validate(args.json, args.expected_name, args.expected_region, args.selected_id))
     return 0
 
 

@@ -203,7 +203,7 @@ def main() -> int:
     p.add_argument("--expected-redis-db-id", default="")
     p.add_argument("--expected-redis-fingerprint", default="")
     p.add_argument("--expected-redis-version", default="", help="expected MILO_REDIS_SECRET_VERSION plain env value")
-    p.add_argument("--expected-release-sha", default="", help="expected MILO_RELEASE_SHA plain env value (release binding)")
+    p.add_argument("--expected-release-sha", default="", help="expected MILO_BOOTSTRAP_SHA plain env value (bootstrap reconciliation binding)")
     args = p.parse_args()
 
     def check_identity_metadata(label: str, plain: dict) -> None:
@@ -214,7 +214,7 @@ def main() -> int:
         if args.expected_redis_version:
             check_exact_plain(label, plain, "MILO_REDIS_SECRET_VERSION", args.expected_redis_version)
         if args.expected_release_sha:
-            check_exact_plain(label, plain, "MILO_RELEASE_SHA", args.expected_release_sha)
+            check_exact_plain(label, plain, "MILO_BOOTSTRAP_SHA", args.expected_release_sha)
 
     def load(path: str):
         try:

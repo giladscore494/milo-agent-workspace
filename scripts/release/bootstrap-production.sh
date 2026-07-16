@@ -272,8 +272,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# The apply guard in common.sh reads EXPECTED_SHA. The release SHA IS the
-# expected checked-out commit for a production apply.
+# The apply guard in common.sh reads EXPECTED_SHA. --release-sha remains
+# the existing operator flag name, but MILO_BOOTSTRAP_SHA records only the
+# checked-out bootstrap commit that reconciled configuration; application
+# image identity is verified separately by deployment tooling.
 EXPECTED_SHA="${RELEASE_SHA}"
 
 # --audit-metadata is part of the audit-only contract exclusively.
@@ -601,10 +603,10 @@ gcp_configure_api() {
     "MILO_APPROVED_WORKER_IDENTITIES=${WORKER_SA}"
   )
   [[ -n "${UPSTASH_REST_URL}" ]] && env_pairs+=("UPSTASH_REDIS_REST_URL=${UPSTASH_REST_URL}")
-  # Non-secret release/Redis consistency metadata for the audit (release
-  # binding: the audit later requires the live MILO_RELEASE_SHA to equal the
-  # audited --release-sha and the stored metadata SHA).
-  [[ -n "${RELEASE_SHA}" ]] && env_pairs+=("MILO_RELEASE_SHA=${RELEASE_SHA}")
+  # Non-secret bootstrap/Redis consistency metadata for the audit.
+  # MILO_BOOTSTRAP_SHA identifies the bootstrap commit that reconciled
+  # configuration; it is not application image proof.
+  [[ -n "${RELEASE_SHA}" ]] && env_pairs+=("MILO_BOOTSTRAP_SHA=${RELEASE_SHA}")
   [[ -n "${REDIS_DB_ID}" ]] && env_pairs+=("MILO_REDIS_DB_ID=${REDIS_DB_ID}")
   [[ -n "${REDIS_TOKEN_FINGERPRINT}" ]] && env_pairs+=("MILO_REDIS_TOKEN_FINGERPRINT=${REDIS_TOKEN_FINGERPRINT}")
   [[ -n "${REDIS_SECRET_VERSION}" ]] && env_pairs+=("MILO_REDIS_SECRET_VERSION=${REDIS_SECRET_VERSION}")
@@ -642,7 +644,7 @@ gcp_configure_worker() {
     "MILO_APPROVED_WORKER_IDENTITIES=${WORKER_SA}"
   )
   [[ -n "${UPSTASH_REST_URL}" ]] && env_pairs+=("UPSTASH_REDIS_REST_URL=${UPSTASH_REST_URL}")
-  [[ -n "${RELEASE_SHA}" ]] && env_pairs+=("MILO_RELEASE_SHA=${RELEASE_SHA}")
+  [[ -n "${RELEASE_SHA}" ]] && env_pairs+=("MILO_BOOTSTRAP_SHA=${RELEASE_SHA}")
   [[ -n "${REDIS_DB_ID}" ]] && env_pairs+=("MILO_REDIS_DB_ID=${REDIS_DB_ID}")
   [[ -n "${REDIS_TOKEN_FINGERPRINT}" ]] && env_pairs+=("MILO_REDIS_TOKEN_FINGERPRINT=${REDIS_TOKEN_FINGERPRINT}")
   [[ -n "${REDIS_SECRET_VERSION}" ]] && env_pairs+=("MILO_REDIS_SECRET_VERSION=${REDIS_SECRET_VERSION}")
@@ -873,7 +875,8 @@ _upstash_select() {
 _upstash_validate() {
   python3 "${SCRIPT_DIR}/upstash_select.py" --mode validate --json "$1" \
     --expected-name "${UPSTASH_DB_NAME}" \
-    --expected-region "${UPSTASH_PRIMARY_REGION}"
+    --expected-region "${UPSTASH_PRIMARY_REGION}" \
+    --selected-id "$2"
 }
 # _upstash_create_body — official Developer API contract (global database).
 _upstash_create_body() {
@@ -956,7 +959,7 @@ upstash_apply() {
   # normalize the canonical REST URL.
   local detail; detail="$(upstash_api GET "/redis/database/${db_id}" "" "${code_file}")"
   if [[ "$(cat "${code_file}")" != "200" ]]; then record_check BLOCKED "upstash:detail" "failed to read Redis database details (HTTP $(cat "${code_file}"))"; mark_failed; return 1; fi
-  local val; val="$(_upstash_validate "${detail}")"
+  local val; val="$(_upstash_validate "${detail}" "${db_id}")"
   if [[ "${val%%|*}" != "OK" ]]; then record_check BLOCKED "upstash:validate" "selected Redis database rejected: ${val#*|}"; recovery_step "fix the Upstash database to be an active, TLS-enabled ${UPSTASH_PLATFORM}/${UPSTASH_PRIMARY_REGION} production database and re-run --apply"; mark_failed; return 1; fi
   UPSTASH_REST_URL="${val#*|}"
   REDIS_DB_ID="${db_id}"
@@ -1013,9 +1016,24 @@ redis_reconcile() {
   fi
   if [[ -n "${cur_ver}" ]]; then
     # Read ONLY the Redis payload for the in-memory fingerprint comparison.
+    # Distinguish exactly: no enabled version (cur_ver empty) vs enabled
+    # version read successfully vs enabled version exists but payload access or
+    # payload shape failed. The last case is BLOCKED before any rotation or
+    # downstream mutation; unreadable can never be treated as a mismatch.
     local payload arc=0
     payload="$(gcloud secrets versions access "${cur_ver}" --secret "${SECRET_NAME_REDIS}" --project "${EXPECTED_PROJECT}" 2> /dev/null)" || arc=$?
-    if [[ "${arc}" -eq 0 ]]; then cur_fp="$(printf '%s' "${payload}" | _fingerprint)"; fi
+    if [[ "${arc}" -ne 0 ]]; then
+      payload=""
+      record_check BLOCKED "redis:reconcile" "enabled Redis Secret Manager version ${cur_ver} exists, but its payload could not be read for fingerprinting; refusing to rotate, pin, update Cloud Run, update Vercel, or generate metadata (fail closed)"
+      recovery_step "grant secretmanager.versions.access for ${SECRET_NAME_REDIS} version ${cur_ver}, then re-run --apply"
+      mark_failed; return 1
+    fi
+    if [[ -z "${payload}" ]]; then
+      record_check BLOCKED "redis:reconcile" "enabled Redis Secret Manager version ${cur_ver} returned an empty payload; refusing to treat empty parser output as a valid credential or rotate blindly"
+      recovery_step "repair ${SECRET_NAME_REDIS} with a valid enabled Redis REST token, then re-run --apply"
+      mark_failed; return 1
+    fi
+    cur_fp="$(printf '%s' "${payload}" | _fingerprint)"
     payload=""   # drop the secret from memory promptly
   fi
 
@@ -1058,7 +1076,7 @@ redis_reconcile() {
 # Audit-only contract (metadata-assisted credentialed path).
 # audit_metadata_load validates the stored NON-SECRET metadata file generated
 # by the last FULLY SUCCESSFUL apply; any missing, empty, malformed, stale,
-# wrong-release, wrong-project or non-applied-status key is BLOCKED (fail
+# wrong-bootstrap-sha, wrong-project or non-applied-status key is BLOCKED (fail
 # closed, no fallback). redis_audit_metadata then proves the LIVE Secret
 # Manager state against the stored pin: newest enabled version must equal the
 # stored version and its in-memory fingerprint must equal the stored
@@ -1066,15 +1084,83 @@ redis_reconcile() {
 # the operator's gcloud credentials). Strictly read-only.
 # ---------------------------------------------------------------------------
 AUDIT_MD_VERSION=""
+
+audit_metadata_parse() { # PATH -> strict KEY=VALUE lines for required keys
+  python3 - "$1" <<'PYIN'
+import re, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+critical = {
+    "MILO_METADATA_SCHEMA_VERSION", "MILO_BOOTSTRAP_STATUS", "MILO_ENVIRONMENT",
+    "MILO_BOOTSTRAP_SHA", "MILO_METADATA_GENERATED_AT", "GCP_PROJECT_ID",
+    "MILO_REDIS_DB_ID", "MILO_REDIS_TOKEN_FINGERPRINT", "MILO_REDIS_SECRET_VERSION",
+    "UPSTASH_REDIS_REST_URL",
+}
+seen = {}
+try:
+    lines = path.read_text(encoding="utf-8").splitlines()
+except Exception as exc:
+    print(f"ERROR|metadata unreadable: {exc}")
+    sys.exit(0)
+key_re = re.compile(r"^[A-Z0-9_]+$")
+for idx, line in enumerate(lines, 1):
+    if not line or line.startswith("#"):
+        continue
+    if any((ord(ch) < 32 and ch not in "\t") or ord(ch) == 127 for ch in line):
+        print(f"ERROR|line {idx} contains an embedded control character")
+        sys.exit(0)
+    if "=" not in line:
+        print(f"ERROR|line {idx} is malformed (missing '=')")
+        sys.exit(0)
+    key, value = line.split("=", 1)
+    if not key_re.fullmatch(key):
+        print(f"ERROR|line {idx} has malformed key")
+        sys.exit(0)
+    if key in seen:
+        sev = "security-critical " if key in critical else ""
+        print(f"ERROR|duplicate {sev}metadata key {key}")
+        sys.exit(0)
+    if value != value.strip():
+        print(f"ERROR|metadata key {key} changes after whitespace normalization")
+        sys.exit(0)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        print(f"ERROR|metadata key {key} contains an embedded control character")
+        sys.exit(0)
+    seen[key] = value
+schema = seen.get("MILO_METADATA_SCHEMA_VERSION")
+if schema is None:
+    print("ERROR|missing MILO_METADATA_SCHEMA_VERSION")
+    sys.exit(0)
+if schema != "2":
+    print(f"ERROR|unsupported MILO_METADATA_SCHEMA_VERSION '{schema}' (required exactly 2)")
+    sys.exit(0)
+for key in sorted(critical):
+    if key not in seen:
+        print(f"ERROR|missing required metadata key {key}")
+        sys.exit(0)
+print("OK")
+for key in sorted(seen):
+    print(f"{key}={seen[key]}")
+PYIN
+}
+
 audit_metadata_load() {
   if [[ ! -f "${AUDIT_METADATA}" || ! -r "${AUDIT_METADATA}" ]]; then
     record_check BLOCKED "audit:metadata" "--audit-metadata file '${AUDIT_METADATA}' is missing or unreadable; the metadata-assisted audit cannot run (fail closed)"
     mark_failed; return 1
   fi
-  local md_db_id md_fp md_ver md_url md_status md_sha md_project md_env md_ts
-  _md_get() { sed -n "s/^$1=//p" "${AUDIT_METADATA}" | head -n1 | tr -d '[:space:]'; }
+  local md_db_id md_fp md_ver md_url md_status md_sha md_project md_env md_ts parsed first
+  parsed="$(audit_metadata_parse "${AUDIT_METADATA}")"
+  first="$(printf '%s
+' "${parsed}" | head -n1)"
+  if [[ "${first}" != "OK" ]]; then
+    record_check BLOCKED "audit:metadata" "strict metadata schema validation failed: ${first#ERROR|}"
+    mark_failed; return 1
+  fi
+  _md_get() { printf '%s
+' "${parsed}" | sed -n "s/^$1=//p"; }
   md_status="$(_md_get MILO_BOOTSTRAP_STATUS)"
-  md_sha="$(_md_get MILO_RELEASE_SHA)"
+  md_sha="$(_md_get MILO_BOOTSTRAP_SHA)"
   md_project="$(_md_get GCP_PROJECT_ID)"
   md_env="$(_md_get MILO_ENVIRONMENT)"
   md_ts="$(_md_get MILO_METADATA_GENERATED_AT)"
@@ -1090,13 +1176,13 @@ audit_metadata_load() {
   # Release binding: the stored SHA must be a full SHA and equal the release
   # under audit.
   if [[ ! "${md_sha}" =~ ^[0-9a-f]{40}$ ]]; then
-    record_check BLOCKED "audit:metadata" "stored MILO_RELEASE_SHA is missing or not a full 40-character SHA; unbound metadata is never audit-valid (fail closed)"; mark_failed; return 1
+    record_check BLOCKED "audit:metadata" "stored MILO_BOOTSTRAP_SHA is missing or not a full 40-character SHA; unbound metadata is never audit-valid (fail closed)"; mark_failed; return 1
   fi
   if [[ -z "${RELEASE_SHA}" ]]; then
     record_check BLOCKED "audit:metadata" "--release-sha is required with --audit-metadata so the audit is bound to a release (fail closed)"; mark_failed; return 1
   fi
   if [[ "${md_sha}" != "${RELEASE_SHA}" ]]; then
-    record_check BLOCKED "audit:metadata" "stored release SHA does not equal the audited --release-sha; the metadata belongs to a different release (fail closed)"; mark_failed; return 1
+    record_check BLOCKED "audit:metadata" "stored bootstrap SHA does not equal the audited --release-sha; the metadata belongs to a different bootstrap reconciliation (fail closed)"; mark_failed; return 1
   fi
   # Project + environment binding.
   if [[ "${md_project}" != "${EXPECTED_PROJECT}" ]]; then
@@ -1433,7 +1519,7 @@ generate_metadata() {
     printf 'MILO_METADATA_SCHEMA_VERSION=2\n'
     printf 'MILO_BOOTSTRAP_STATUS=applied\n'
     printf 'MILO_ENVIRONMENT=production\n'
-    printf 'MILO_RELEASE_SHA=%s\n' "${RELEASE_SHA}"
+    printf 'MILO_BOOTSTRAP_SHA=%s\n' "${RELEASE_SHA}"
     printf 'MILO_METADATA_GENERATED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'GCP_PROJECT_ID=%s\n' "${EXPECTED_PROJECT}"
     printf 'GCP_PROJECT_NUMBER=%s\n' "${DEF_PROJECT_NUMBER}"
@@ -1458,7 +1544,7 @@ generate_metadata() {
     [[ -n "${REDIS_SECRET_VERSION}" ]] && printf 'MILO_REDIS_SECRET_VERSION=%s\n' "${REDIS_SECRET_VERSION}"
   } > "${tmp}"
   mv "${tmp}" "${dest}"
-  record_check PASS "metadata:generated" "release-bound non-secret metadata written to ${dest} (status applied; only after a fully successful apply + final audit)"
+  record_check PASS "metadata:generated" "bootstrap-bound non-secret metadata written to ${dest} (status applied; only after a fully successful apply + final audit)"
 }
 
 # ===========================================================================
@@ -1749,6 +1835,12 @@ case "${MODE}" in
     # Guard passed. Idempotent bootstrap. Upstash discovery runs first so the
     # Redis token/URL can be captured for secret storage + Cloud Run + Vercel.
     upstash_apply || true
+    if [[ "${BOOTSTRAP_FAILED}" -eq 1 || "${_MILO_BLOCKED_COUNT}" -gt 0 ]]; then
+      record_check BLOCKED "apply:pre-mutation-gate" "Upstash/Redis source selection is blocked or incomplete; refusing every downstream mutation (Secret Manager reconciliation, Cloud Run, Vercel and metadata are left untouched)"
+      rm -f "${OUTPUT_DIR}/milo-production.metadata.env"
+      write_bootstrap_report "${OUTPUT_DIR}/bootstrap-apply.json" "apply" "partial-failure"
+      finish_checks "bootstrap-production" "${JSON_OUTPUT}"; exit 1
+    fi
     gcp_apply || true
     vercel_apply || true
 
