@@ -22,14 +22,6 @@ def bindings_for_role(
     return tuple(b for b in policy.bindings if b.role == role)
 
 
-def binding_equal(binding: IamBinding, role: str, members: tuple[str, ...], condition_expression: str = "") -> bool:
-    return (
-        binding.role == role
-        and tuple(sorted(binding.members)) == tuple(sorted(members))
-        and binding.condition_expression == condition_expression
-    )
-
-
 def find_forbidden_principals(policy: IamPolicyState, stage: Stage) -> tuple[Finding, ...]:
     findings: list[Finding] = []
     for binding in policy.bindings:

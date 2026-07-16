@@ -8,12 +8,13 @@ this adapter, by construction.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
+
+from ..validators.redis import fingerprint_sha256
 
 from ..model import (
     OperationType,
@@ -67,8 +68,7 @@ class EnvProbe:
     env_vars: tuple[VercelEnvVarState, ...] = ()
 
 
-def _fingerprint(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+_fingerprint = fingerprint_sha256
 
 
 def _classify_status(status: int, allow_not_found: bool) -> ProbeOutcome | None:
@@ -177,7 +177,13 @@ class VercelAdapter:
                     outcome=ProbeOutcome.MALFORMED_OUTPUT, detail="env entry missing key"
                 )
             target = entry.get("target", [])
-            targets = tuple(str(t) for t in target) if isinstance(target, list) else ()
+            if isinstance(target, str):
+                # Vercel returns a bare string for single-target variables.
+                targets: tuple[str, ...] = (target,)
+            elif isinstance(target, list):
+                targets = tuple(str(t) for t in target)
+            else:
+                targets = ()
             value = entry.get("value", "")
             fingerprint = _fingerprint(value) if isinstance(value, str) and value else ""
             env_vars.append(

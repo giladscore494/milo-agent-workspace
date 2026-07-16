@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import re
 import stat
-import tempfile
 from pathlib import Path
 
 from ..model import Finding, MetadataV3, METADATA_V3_KEYS, Severity, Stage
@@ -52,6 +51,17 @@ MAX_VALUE_LENGTH = 512
 MAX_FILE_SIZE = 64 * 1024
 
 _ALLOWED_KEYS = frozenset(METADATA_V3_KEYS)
+
+# The closed schema is the real key gate; the secret-looking heuristic is
+# defense in depth for parsing external text. Fail at import time if a
+# schema key would trip the heuristic without being allowlisted, so schema
+# evolution can never make the parser reject its own valid metadata.
+for _key in METADATA_V3_KEYS:
+    if _SECRET_LOOKING_RE.search(_key) and _key not in _SECRET_LOOKING_ALLOWED:
+        raise AssertionError(
+            f"metadata schema key {_key} matches the secret-looking heuristic "
+            "but is not allowlisted; update _SECRET_LOOKING_ALLOWED"
+        )
 
 
 def _blocked(code: str, message: str) -> Finding:
@@ -202,26 +212,8 @@ def write_metadata_atomically(metadata: MetadataV3, output_dir: Path) -> Path:
             + "; ".join(f.message for f in findings)
         )
 
-    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(output_dir, 0o700)
-    final_path = output_dir / "bootstrap-metadata-v3.env"
+    from ..report import atomic_private_write
 
-    fd, tmp_name = tempfile.mkstemp(dir=output_dir, prefix=".metadata-", suffix=".tmp")
-    tmp_path = Path(tmp_name)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(render_metadata(metadata))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, final_path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-    dir_fd = os.open(output_dir, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-    return final_path
+    return atomic_private_write(
+        output_dir, "bootstrap-metadata-v3.env", render_metadata(metadata)
+    )

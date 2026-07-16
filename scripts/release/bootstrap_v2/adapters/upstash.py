@@ -9,7 +9,6 @@ and arbitrary selection do not exist in this adapter.
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import urllib.error
 import urllib.request
@@ -23,6 +22,7 @@ from ..model import (
     UpstashDatabaseState,
 )
 from ..subprocess_runner import MutationGate, SecretRegistry
+from ..validators.redis import fingerprint_sha256
 
 API_BASE = "https://api.upstash.com"
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -86,12 +86,15 @@ def _parse_database(entry: object) -> UpstashDatabaseState | None:
     if not database_id or not name:
         return None
     endpoint = entry.get("endpoint", "")
-    tls = entry.get("tls", False)
+    tls = entry.get("tls")
+    if not isinstance(tls, bool):
+        # An undocumented TLS shape is malformed output, never coerced.
+        return None
     return UpstashDatabaseState(
         database_id=database_id,
         name=name,
         state=str(entry.get("state", "")),
-        tls=bool(tls) if isinstance(tls, bool) else False,
+        tls=tls,
         region=str(entry.get("region", "") or entry.get("primary_region", "")),
         endpoint=str(endpoint),
         rest_url=f"https://{endpoint}" if endpoint else "",
@@ -202,9 +205,7 @@ class UpstashAdapter:
                     region=state.region,
                     endpoint=state.endpoint,
                     rest_url=state.rest_url,
-                    token_fingerprint_sha256=hashlib.sha256(
-                        rest_token.encode("utf-8")
-                    ).hexdigest(),
+                    token_fingerprint_sha256=fingerprint_sha256(rest_token),
                 )
         return ProbeResult(outcome=ProbeOutcome.PRESENT, databases=(state,)), rest_token
 

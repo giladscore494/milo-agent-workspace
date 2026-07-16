@@ -123,6 +123,11 @@ class MutationGate:
 
     def __init__(self, plan: MutationPlan | None, ledger: MutationLedger) -> None:
         self._plan = plan
+        self._declared: dict[str, MutationOperation] = (
+            {op.idempotency_key: op for op in plan.operations}
+            if plan is not None
+            else {}
+        )
         self._ledger = ledger
         self._closed = False
 
@@ -148,12 +153,7 @@ class MutationGate:
             raise MutationAfterBlockError(
                 f"mutation {idempotency_key} attempted after the run was blocked"
             )
-        declared = None
-        if self._plan is not None:
-            for op in self._plan.operations:
-                if op.idempotency_key == idempotency_key:
-                    declared = op
-                    break
+        declared = self._declared.get(idempotency_key)
         if declared is None:
             self._ledger.append(
                 MutationRecord(

@@ -133,23 +133,37 @@ class Finding:
         return self.requires_manual or self.unknown
 
 
+class NonDecisiveEvidenceError(Exception):
+    """Raised when planning or verification is attempted from evidence that
+    is not decisively PRESENT or CLEANLY_ABSENT, or that is stale."""
+
+
 @dataclass(frozen=True, slots=True)
 class Evidence:
     """One classified observation of external state.
 
-    ``observed_json`` is the canonical JSON of the observed payload (empty
-    string when nothing was observed). Evidence is immutable; staleness is
-    decided by re-running discovery, never by editing evidence.
+    This is the single evidence carrier used by discovery and the planner
+    (the planner re-exports it as ``Observed``). ``state`` holds the typed
+    discovered-state object when one was parsed. Evidence is immutable;
+    staleness is decided by re-running discovery, never by editing evidence.
     """
 
-    source: str
     outcome: ProbeOutcome
+    state: object | None = None
+    source: str = ""
     resource: ResourceIdentity | None = None
     observed_json: str = ""
     stale: bool = False
 
     def is_usable(self) -> bool:
         return self.outcome in DECISIVE_OUTCOMES and not self.stale
+
+    def require_decisive(self, what: str) -> None:
+        if not self.is_usable():
+            reason = "stale" if self.stale else self.outcome.value
+            raise NonDecisiveEvidenceError(
+                f"cannot plan from non-decisive evidence for {what}: {reason}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,6 +344,10 @@ class SecretState:
     exists: bool
     enabled_versions: tuple[str, ...] = ()
     latest_enabled_version: str = ""
+    #: Highest version number that has EVER existed (enabled, disabled or
+    #: destroyed). GCP numbers versions sequentially, so the next version a
+    #: successful add will create is exactly ``highest_version + 1``.
+    highest_version: str = ""
     payload_fingerprint_sha256: str = ""
 
 

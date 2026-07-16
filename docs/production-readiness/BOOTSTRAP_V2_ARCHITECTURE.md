@@ -258,12 +258,17 @@ GCP auth genuinely happens, `actions: read` only for provenance retrieval);
 never uses `pull_request_target`; exposes no production secrets to PR jobs;
 serializes apply runs; never lets audit cancel apply; pins all third-party
 actions to immutable full commit SHAs with human version comments; and
-strictly validates all inputs. Artifact provenance verifies trusted workflow
-identity, code/ref, release ref, apply mode, successful conclusion, expected
-repository, non-fork source, exact head SHA, plan digest, unique / non-
-expired / expected-size artifact, safe extraction, exactly one regular
-metadata file, no symlinks, and no extra files. The provenance verifier is
-never controlled solely by the candidate workflow code it validates.
+strictly validates all inputs. The bootstrap produces the metadata artifact;
+`adapters/github_provenance.py` is the verifier that any downstream consumer
+(for example the deploy pipeline) must invoke before trusting that artifact.
+It verifies trusted workflow identity, code/ref, release ref, apply mode,
+successful conclusion, expected repository, non-fork source, exact head SHA,
+plan digest, unique / non-expired / expected-size artifact, safe extraction,
+exactly one regular metadata file, no symlinks, and no extra files. The
+provenance verifier is never controlled solely by the candidate workflow
+code it validates. It is exercised by the test suite today; wiring it into a
+consuming workflow is a documented obligation of that workflow, not of the
+bootstrap.
 
 ## 11. Credential and secret handling
 

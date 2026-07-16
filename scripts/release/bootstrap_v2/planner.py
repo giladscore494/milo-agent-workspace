@@ -18,11 +18,12 @@ from dataclasses import dataclass
 from .model import (
     CloudRunEnvVar,
     CloudRunResourceState,
-    DECISIVE_OUTCOMES,
+    Evidence,
     IamPolicyState,
     Mode,
     MutationOperation,
     MutationPlan,
+    NonDecisiveEvidenceError,
     OperationType,
     PostWriteRead,
     ProbeOutcome,
@@ -30,10 +31,7 @@ from .model import (
     RedisIdentity,
     ResourceIdentity,
     SecretState,
-    UpstashDatabaseState,
     VercelEnvVarState,
-    VercelProjectState,
-    WifState,
 )
 from .policy import (
     API_SECRET_REFS,
@@ -46,27 +44,15 @@ from .policy import (
     VERCEL_MANAGED_VARS,
     WORKER_SECRET_REFS,
 )
+from .validators.redis import fingerprint_sha256
+from .validators.wif import expected_principal_set
 
 ABSENT_DIGEST = "absent"
 
-
-class PlannerEvidenceError(Exception):
-    """Raised when planning is attempted from non-decisive evidence."""
-
-
-@dataclass(frozen=True, slots=True)
-class Observed:
-    """One discovery observation: a classified outcome plus typed state."""
-
-    outcome: ProbeOutcome
-    state: object | None = None
-
-    def require_decisive(self, what: str) -> None:
-        if self.outcome not in DECISIVE_OUTCOMES:
-            raise PlannerEvidenceError(
-                f"cannot plan from non-decisive evidence for {what}: "
-                f"{self.outcome.value}"
-            )
+#: The planner's evidence type IS the domain Evidence model; ``Observed`` is
+#: the historical local name. One type, one decisiveness gate.
+Observed = Evidence
+PlannerEvidenceError = NonDecisiveEvidenceError
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,15 +131,18 @@ def plan_digest(plan: MutationPlan) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _upstash_state_payload(state: UpstashDatabaseState) -> dict[str, object]:
+def upstash_verification_payload(
+    name: str, tls: bool, region: str, state: str
+) -> dict[str, object]:
+    """The single payload shape both the planner (intended digest) and the
+    engine's post-create verification (observed digest) must use. The engine
+    feeds it ONLY from reread live state, never from configuration."""
+
     return {
-        "database_id": state.database_id,
-        "name": state.name,
-        "state": state.state,
-        "tls": state.tls,
-        "region": state.region,
-        "endpoint": state.endpoint,
-        "rest_url": state.rest_url,
+        "name": name,
+        "tls": tls,
+        "region": region,
+        "state": "active" if state.lower() == "active" else state,
     }
 
 
@@ -183,6 +172,7 @@ def desired_cloud_run_env(
     config: BootstrapConfig,
     redis: RedisIdentity,
     secret_refs: dict[str, str],
+    secret_versions: dict[str, str] | None = None,
 ) -> tuple[CloudRunEnvVar, ...]:
     """Derive the intended env set for one Cloud Run resource.
 
@@ -215,6 +205,7 @@ def desired_cloud_run_env(
     managed["MILO_REDIS_SECRET_VERSION"] = CloudRunEnvVar(
         name="MILO_REDIS_SECRET_VERSION", value=redis.enabled_secret_version
     )
+    versions = secret_versions or {}
     for env_name, secret_name in secret_refs.items():
         if secret_name in NUMERIC_PIN_REQUIRED_SECRETS:
             managed[env_name] = CloudRunEnvVar(
@@ -223,6 +214,9 @@ def desired_cloud_run_env(
                 secret_version=redis.enabled_secret_version,
             )
         else:
+            # Adopt the existing exact numeric pin; when the reference is
+            # missing (or not numerically pinned) use the secret's discovered
+            # latest enabled version. Never fabricate a version number.
             observed_var = next(
                 (
                     var
@@ -232,15 +226,19 @@ def desired_cloud_run_env(
                 ),
                 None,
             )
-            observed_version = (
-                observed_var.secret_version
-                if observed_var is not None and observed_var.secret_version
-                else "1"
-            )
+            if observed_var is not None and observed_var.secret_version.isdigit():
+                version = observed_var.secret_version
+            else:
+                version = versions.get(secret_name, "")
+                if not version.isdigit():
+                    raise PlannerEvidenceError(
+                        f"secret {secret_name} has no enabled version to adopt "
+                        f"for {env_name}; add a version manually and rerun"
+                    )
             managed[env_name] = CloudRunEnvVar(
                 name=env_name,
                 secret_name=secret_name,
-                secret_version=observed_version,
+                secret_version=version,
             )
 
     preserved: dict[str, CloudRunEnvVar] = {}
@@ -286,12 +284,12 @@ def build_plan(config: BootstrapConfig, world: DiscoveredWorld) -> MutationPlan:
             name=config.upstash_database_name,
             scope="upstash",
         )
-        desired = {
-            "name": config.upstash_database_name,
-            "tls": True,
-            "region": config.gcp_region,
-            "state": "active",
-        }
+        desired = upstash_verification_payload(
+            name=config.upstash_database_name,
+            tls=True,
+            region=config.gcp_region,
+            state="active",
+        )
         operations.append(
             MutationOperation(
                 sequence=_next_sequence(seq),
@@ -469,10 +467,8 @@ def build_plan(config: BootstrapConfig, world: DiscoveredWorld) -> MutationPlan:
     world.gateway_sa_iam.require_decisive("gateway service account iam policy")
     gateway_state = world.gateway_sa_iam.state
     desired_wif_members = (
-        (
-            "principalSet://iam.googleapis.com/projects/"
-            f"{config.gcp_project_number}/locations/global/workloadIdentityPools/"
-            f"{config.wif_pool_id}/attribute.project/{config.vercel_project_id}"
+        expected_principal_set(
+            config.gcp_project_number, config.wif_pool_id, config.vercel_project_id
         ),
     )
     current_wif_members: tuple[str, ...] = ()
@@ -558,6 +554,11 @@ def build_plan(config: BootstrapConfig, world: DiscoveredWorld) -> MutationPlan:
         )
 
     # ---- Stage D: Cloud Run (worker job first, then API service) -----------
+    discovered_secret_versions = {
+        name: observed.state.latest_enabled_version
+        for name, observed in world.secrets
+        if isinstance(observed.state, SecretState)
+    }
     if world.redis_identity is not None:
         for kind, observed, secret_refs, name in (
             ("worker_job", world.worker_job, WORKER_SECRET_REFS, config.cloud_run_worker_job),
@@ -573,7 +574,11 @@ def build_plan(config: BootstrapConfig, world: DiscoveredWorld) -> MutationPlan:
                 else config.api_service_account
             )
             desired_env = desired_cloud_run_env(
-                state, config, world.redis_identity, secret_refs
+                state,
+                config,
+                world.redis_identity,
+                secret_refs,
+                discovered_secret_versions,
             )
             desired_payload = _cloud_run_payload(desired_sa, desired_env)
             if len(state.containers) != 1:
@@ -617,6 +622,15 @@ def build_plan(config: BootstrapConfig, world: DiscoveredWorld) -> MutationPlan:
     # ---- Stage E: Vercel ----------------------------------------------------
     world.vercel_project.require_decisive("vercel project")
     if world.redis_identity is not None:
+        # Discovery emits one observation per managed variable whenever the
+        # inventory read succeeded (CLEANLY_ABSENT for missing vars). An
+        # empty inventory therefore means the read failed: refuse to treat
+        # it as absence.
+        if not world.vercel_env:
+            raise PlannerEvidenceError(
+                "vercel env inventory unavailable; a failed read is never "
+                "treated as absence"
+            )
         observed_env = dict(world.vercel_env)
         desired_values: dict[str, str] = {
             "GATEWAY_ALLOW_EXECUTION_ROUTES": _fingerprint("false"),
@@ -688,5 +702,4 @@ def _intended_secret_accessors(
     return consumers.get(secret_name, ())
 
 
-def _fingerprint(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+_fingerprint = fingerprint_sha256

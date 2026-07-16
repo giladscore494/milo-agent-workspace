@@ -308,6 +308,8 @@ class FakeUpstash:
             return ProbeResult(outcome=ProbeOutcome.PRESENT, databases=(state,)), DB_ID
         if mode == "apply_wrong_state":
             state = replace(state, tls=False)
+        if mode == "apply_wrong_region":
+            state = replace(state, region="eu-west-1")
         self.databases[DB_ID] = state
         self.tokens[DB_ID] = token
         gate.record_execution(operation, succeeded=True)
@@ -496,17 +498,19 @@ class FakeGcp:
 
     def add_secret_version(self, gate, key, resource, name, payload):
         def apply_fn(wrong: bool) -> None:
+            # Real GCP numbers versions sequentially across ALL states
+            # (enabled, disabled, destroyed): the next version is
+            # highest_version + 1, never latest_enabled + 1.
             current = self.secrets[name]
             next_version = str(
-                int(current.latest_enabled_version) + 1
-                if current.latest_enabled_version
-                else 1
+                int(current.highest_version) + 1 if current.highest_version else 1
             )
             self.secrets[name] = SecretState(
                 name=name,
                 exists=True,
                 enabled_versions=current.enabled_versions + (next_version,),
                 latest_enabled_version=next_version,
+                highest_version=next_version,
             )
             self.payloads[(name, next_version)] = (
                 "wrong-payload" if wrong else payload
@@ -739,6 +743,7 @@ def make_happy_world(
             exists=True,
             enabled_versions=("7",) if name == "UPSTASH_REDIS_REST_TOKEN" else ("1",),
             latest_enabled_version="7" if name == "UPSTASH_REDIS_REST_TOKEN" else "1",
+            highest_version="7" if name == "UPSTASH_REDIS_REST_TOKEN" else "1",
         )
         for name in SECRET_MANAGER_RESOURCE_NAMES
     }

@@ -127,24 +127,40 @@ def render_human_summary(result: RunResult) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_json_report(result: RunResult, output_dir: Path) -> Path:
-    """Atomically write the JSON report (0600) inside a private directory."""
+def atomic_private_write(output_dir: Path, filename: str, content: str) -> Path:
+    """The single atomic-private-write primitive for every local artifact.
+
+    0700 directory, 0600 fsynced temp file, atomic rename, directory fsync,
+    temp cleanup on any failure.
+    """
 
     output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(output_dir, 0o700)
-    final_path = output_dir / "bootstrap-v2-report.json"
-    payload = json.dumps(run_result_to_dict(result), indent=2, sort_keys=True)
+    final_path = output_dir / filename
 
-    fd, tmp_name = tempfile.mkstemp(dir=output_dir, prefix=".report-", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=output_dir, prefix=".artifact-", suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload + "\n")
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, final_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+
+    dir_fd = os.open(output_dir, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     return final_path
+
+
+def write_json_report(result: RunResult, output_dir: Path) -> Path:
+    """Atomically write the JSON report (0600) inside a private directory."""
+
+    payload = json.dumps(run_result_to_dict(result), indent=2, sort_keys=True)
+    return atomic_private_write(output_dir, "bootstrap-v2-report.json", payload + "\n")

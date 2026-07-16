@@ -97,6 +97,7 @@ def stage_clean_reasons(
                 f" {finding.code}: {finding.message}"
             )
 
+    declared_keys = frozen_plan.operation_keys() if frozen_plan is not None else None
     for record in stage_result.mutations:
         if not record.declared:
             reasons.append(
@@ -104,7 +105,7 @@ def stage_clean_reasons(
             )
         if record.executed and not record.succeeded:
             reasons.append(f"mutation failed: {record.idempotency_key}")
-        if frozen_plan is not None and record.idempotency_key not in frozen_plan.operation_keys():
+        if declared_keys is not None and record.idempotency_key not in declared_keys:
             reasons.append(
                 f"mutation absent from frozen plan: {record.idempotency_key}"
             )

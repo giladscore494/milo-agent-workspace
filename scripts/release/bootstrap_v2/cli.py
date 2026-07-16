@@ -11,7 +11,9 @@ for the run; recovery is a fresh run with fresh discovery.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
+import signal
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -49,11 +51,13 @@ from .planner import (
     Observed,
     PlannerEvidenceError,
     _cloud_run_payload,
+    _intended_secret_accessors,
     build_plan,
     desired_cloud_run_env,
     plan_digest,
     plan_to_canonical_json,
     state_digest,
+    upstash_verification_payload,
 )
 from .policy import (
     API_SECRET_REFS,
@@ -68,6 +72,7 @@ from .policy import (
     WORKER_SECRET_REFS,
     LEGACY_RUNTIME_IDENTITY_PATTERN,
 )
+from .report import redact as redact_text
 from .report import render_human_summary, write_json_report
 from .result import build_run_result
 from .state_machine import BootstrapStateMachine, StageBlocked
@@ -356,9 +361,19 @@ class BootstrapEngine:
             secret_observed.append((name, Observed(outcome=probe.outcome, state=secret_state)))
 
         # ---- GCP: redis token payload fingerprint -------------------------
+        # When a new version must be added, the version it will get is
+        # determined by the highest version number that has EVER existed
+        # (GCP numbers versions sequentially across enabled/disabled/
+        # destroyed states), and stage B verifies the prediction exactly
+        # after the write.
         version_addition_required = False
         enabled_version = ""
         redis_secret = out.secret_states.get("UPSTASH_REDIS_REST_TOKEN")
+
+        def _next_version(secret: SecretState) -> str:
+            highest = secret.highest_version
+            return str(int(highest) + 1) if highest.isdigit() else "1"
+
         if redis_secret is not None and redis_secret.latest_enabled_version:
             payload_probe, payload = self.gcp.access_secret_payload(
                 "UPSTASH_REDIS_REST_TOKEN", redis_secret.latest_enabled_version
@@ -375,12 +390,10 @@ class BootstrapEngine:
                     enabled_version = redis_secret.latest_enabled_version
                 else:
                     version_addition_required = True
-                    enabled_version = str(
-                        int(redis_secret.latest_enabled_version) + 1
-                    )
+                    enabled_version = _next_version(redis_secret)
         elif redis_secret is not None and out.selected_db:
             version_addition_required = True
-            enabled_version = "1"
+            enabled_version = _next_version(redis_secret)
         elif redis_secret is None and out.selected_db:
             # Secret cleanly absent: plan will create it and add version 1.
             version_addition_required = True
@@ -415,9 +428,16 @@ class BootstrapEngine:
             Provider.GCP, "get run.invoker iam policy", invoker_probe.outcome, out
         )
         out.invoker_policy = invoker_policy
+        invoker_allows_unauthenticated = False
         if invoker_policy is not None:
             out.findings.extend(
                 iam_validators.find_forbidden_principals(invoker_policy, stage)
+            )
+            invoker_allows_unauthenticated = any(
+                member in ("allUsers", "allAuthenticatedUsers")
+                for binding in invoker_policy.bindings
+                if binding.role == "roles/run.invoker"
+                for member in binding.members
             )
 
         # ---- GCP: WIF --------------------------------------------------------
@@ -458,6 +478,11 @@ class BootstrapEngine:
             service_probe.outcome,
             out,
         )
+        if api_state is not None and invoker_allows_unauthenticated:
+            # The v1 export cannot express unauthenticated access; it is a
+            # property of the run.invoker policy. Derive it here so the
+            # container-level validator sees the real posture.
+            api_state = dataclasses.replace(api_state, allows_unauthenticated=True)
         out.api_state = api_state
 
         for label, probe_outcome, run_state, expected_sa, refs in (
@@ -745,7 +770,7 @@ class BootstrapEngine:
                     )
                 )
             else:
-                detail_probe, _token = self.upstash.get_database(created_id)
+                detail_probe, reread_token = self.upstash.get_database(created_id)
                 self._read_seq += 1
                 self.reads.append(
                     ReadOperation(
@@ -785,12 +810,23 @@ class BootstrapEngine:
                         stage,
                     )
                     findings.extend(detail_findings)
-                    observed_payload = {
-                        "name": detail.name,
-                        "tls": detail.tls,
-                        "region": self.config.gcp_region,
-                        "state": "active" if detail.state.lower() == "active" else detail.state,
-                    }
+                    if not reread_token:
+                        findings.append(
+                            self._finding(
+                                "UPSTASH_POST_CREATE_TOKEN_MISSING",
+                                f"created database {created_id} returned no rest "
+                                "token on reread; token presence unverified",
+                                stage,
+                            )
+                        )
+                    # Observed payload is fed ONLY from the reread live state
+                    # (including the actual region), never from configuration.
+                    observed_payload = upstash_verification_payload(
+                        name=detail.name,
+                        tls=detail.tls,
+                        region=detail.region,
+                        state=detail.state,
+                    )
                     if not self._verify_post_write(op, state_digest(observed_payload)):
                         findings.append(
                             self._finding(
@@ -932,6 +968,31 @@ class BootstrapEngine:
                         )
                     )
                     break
+                expected_pin = (
+                    discovery.redis_identity.enabled_secret_version
+                    if discovery.redis_identity is not None
+                    else ""
+                )
+                if (
+                    expected_pin
+                    and secret_state.latest_enabled_version != expected_pin
+                ):
+                    self._verify_post_write(
+                        op,
+                        f"version:{secret_state.latest_enabled_version}",
+                        "actual new version differs from the planned pin",
+                    )
+                    findings.append(
+                        self._finding(
+                            "SECRET_VERSION_NUMBER_MISMATCH",
+                            "the new secret version is "
+                            f"{secret_state.latest_enabled_version}, but the "
+                            f"frozen plan pinned {expected_pin}; stopping before "
+                            "any consumer is configured against a wrong version",
+                            stage,
+                        )
+                    )
+                    break
                 payload_probe, payload = self.gcp.access_secret_payload(
                     op.resource.name, secret_state.latest_enabled_version
                 )
@@ -974,7 +1035,7 @@ class BootstrapEngine:
                     )
                 )
                 return False
-            members = _intended_secret_accessors_engine(name, cfg)
+            members = _intended_secret_accessors(name, cfg)
             outcome, detail = self.gcp.set_secret_iam(
                 self.gate, op.idempotency_key, op.resource, name, policy, members
             )
@@ -1142,7 +1203,16 @@ class BootstrapEngine:
                     )
                 )
                 break
-            desired_env = desired_cloud_run_env(observed_state, cfg, redis, refs)
+            desired_env = desired_cloud_run_env(
+                observed_state,
+                cfg,
+                redis,
+                refs,
+                {
+                    name: state.latest_enabled_version
+                    for name, state in discovery.secret_states.items()
+                },
+            )
             set_env = {
                 var.name: var.value for var in desired_env if not var.is_secret_ref()
             }
@@ -1350,7 +1420,23 @@ class BootstrapEngine:
         stage = Stage.METADATA_COMMITTED
         cfg = self.config
         redis = discovery.redis_identity
-        assert redis is not None
+        if redis is None:
+            self.metadata_status = MetadataStatus.WITHHELD
+            self._complete(
+                self._stage_result(
+                    stage,
+                    (
+                        self._finding(
+                            "METADATA_INPUT_UNAVAILABLE",
+                            "no coherent redis identity at metadata time; "
+                            "metadata withheld",
+                            stage,
+                        ),
+                    ),
+                ),
+                stage,
+            )
+            return
         metadata = MetadataV3(
             MILO_METADATA_SCHEMA_VERSION=metadata_validators.SCHEMA_VERSION,
             MILO_BOOTSTRAP_STATUS="applied",
@@ -1411,7 +1497,11 @@ class BootstrapEngine:
     def run(self) -> RunResult:
         try:
             return self._run_inner()
-        except (StageBlocked, UndeclaredMutationError, MutationAfterBlockError, PlannerEvidenceError) as exc:
+        except Exception as exc:  # noqa: BLE001 - the exit code and report
+            # MUST derive from the single RunResult even for unexpected
+            # failures (SecretInArgvError, adapter bugs, assertion errors).
+            # KeyboardInterrupt/SystemExit stay untouched so signal-driven
+            # cleanup still propagates.
             if self.gate is not None:
                 self.gate.close()
             if not self.machine.blocked and self.machine.current is not Stage.COMPLETE:
@@ -1421,13 +1511,29 @@ class BootstrapEngine:
                     self.findings.append(
                         self._finding("STAGE_BLOCKED", reason, exc.stage)
                     )
-            else:
+            elif isinstance(
+                exc,
+                (UndeclaredMutationError, MutationAfterBlockError, PlannerEvidenceError),
+            ):
                 self.findings.append(
                     self._finding(
                         "RUN_ABORTED", str(exc), self.machine.last_completed_stage()
                     )
                 )
-            if self.mode is Mode.APPLY and self.ledger.executed_count():
+            else:
+                self.findings.append(
+                    self._finding(
+                        "RUN_ABORTED_UNEXPECTED",
+                        f"unexpected {exc.__class__.__name__}: "
+                        f"{redact_text(str(exc))}",
+                        self.machine.last_completed_stage(),
+                    )
+                )
+            if (
+                self.mode is Mode.APPLY
+                and self.ledger.executed_count()
+                and not self.recovery_steps
+            ):
                 self.recovery_steps.append(
                     RecoveryStep(
                         order=len(self.recovery_steps) + 1,
@@ -1568,14 +1674,6 @@ class BootstrapEngine:
         )
 
 
-def _intended_secret_accessors_engine(
-    secret_name: str, config: BootstrapConfig
-) -> tuple[str, ...]:
-    from .planner import _intended_secret_accessors
-
-    return _intended_secret_accessors(secret_name, config)
-
-
 # ---------------------------------------------------------------------------
 # Local guard adapter (real implementation)
 # ---------------------------------------------------------------------------
@@ -1678,6 +1776,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # SIGTERM (e.g. a cancelled CI job) must run the same finally-based
+    # cleanup as normal exits: convert it to SystemExit.
+    signal.signal(signal.SIGTERM, lambda _sig, _frame: sys.exit(143))
+
     args = build_arg_parser().parse_args(argv)
     mode = Mode(args.mode)
 

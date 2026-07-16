@@ -55,6 +55,20 @@ from tests.bootstrap_v2_fakes import (  # noqa: E402
 
 CONFIG = make_config()
 
+#: Explicit per-variable absence: the inventory read succeeded but the
+#: managed variables are not set. (An empty tuple means the read failed and
+#: is rejected by the planner.)
+ABSENT_VERCEL_ENV = tuple(
+    (key, Observed(outcome=ProbeOutcome.CLEANLY_ABSENT))
+    for key in (
+        "GATEWAY_ALLOW_EXECUTION_ROUTES",
+        "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI",
+        "UPSTASH_REDIS_REST_URL",
+        "UPSTASH_REDIS_REST_TOKEN",
+        "MILO_REDIS_TOKEN_FINGERPRINT",
+    )
+)
+
 
 def make_redis_identity(version: str = "7") -> RedisIdentity:
     return RedisIdentity(
@@ -330,7 +344,7 @@ def test_stage_ordering_upstash_before_gcp_before_iam_before_run_before_vercel()
                 etag="e",
             ),
         ),
-        vercel_env=(),
+        vercel_env=ABSENT_VERCEL_ENV,
     )
     plan = build_plan(CONFIG, world)
     kinds = [op.operation_type for op in plan.operations]
@@ -380,7 +394,7 @@ def test_desired_env_removes_deprecated_and_forces_flags_false():
 
 def test_plan_json_contains_no_secret_values():
     world = make_world(
-        vercel_env=(),  # forces vercel writes including the token
+        vercel_env=ABSENT_VERCEL_ENV,  # forces vercel writes including the token
     )
     plan = build_plan(CONFIG, world)
     text = plan_to_canonical_json(plan)

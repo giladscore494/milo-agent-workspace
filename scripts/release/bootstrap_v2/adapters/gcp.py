@@ -250,10 +250,14 @@ class GcpAdapter:
         )
         if probe.outcome is not ProbeOutcome.PRESENT:
             return probe, None
+        # List ALL versions (enabled, disabled, destroyed): GCP numbers
+        # versions sequentially across every state, so the highest number
+        # that ever existed — not the highest enabled one — determines what
+        # a future add will create.
         versions_probe = self._read_json(
             (
                 "gcloud", "secrets", "versions", "list", name,
-                "--project", self._project, "--filter", "state=ENABLED",
+                "--project", self._project,
                 "--format", "json",
             )
         )
@@ -268,7 +272,8 @@ class GcpAdapter:
                 ),
                 None,
             )
-        versions: list[str] = []
+        enabled: list[str] = []
+        all_numbers: list[int] = []
         for entry in payload:
             if not isinstance(entry, dict):
                 return (
@@ -278,14 +283,18 @@ class GcpAdapter:
                     ),
                     None,
                 )
-            full_name = str(entry.get("name", ""))
-            versions.append(full_name.rsplit("/", 1)[-1])
-        numeric = sorted((v for v in versions if v.isdigit()), key=int)
+            version = str(entry.get("name", "")).rsplit("/", 1)[-1]
+            if version.isdigit():
+                all_numbers.append(int(version))
+            if str(entry.get("state", "")).upper() == "ENABLED" and version.isdigit():
+                enabled.append(version)
+        enabled.sort(key=int)
         return probe, SecretState(
             name=name,
             exists=True,
-            enabled_versions=tuple(versions),
-            latest_enabled_version=numeric[-1] if numeric else "",
+            enabled_versions=tuple(enabled),
+            latest_enabled_version=enabled[-1] if enabled else "",
+            highest_version=str(max(all_numbers)) if all_numbers else "",
         )
 
     def access_secret_payload(self, name: str, version: str) -> tuple[GcpProbe, str]:

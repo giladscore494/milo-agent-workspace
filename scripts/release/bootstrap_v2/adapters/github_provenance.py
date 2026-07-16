@@ -1,9 +1,16 @@
-"""Artifact provenance verification.
+"""Artifact provenance verification (library for artifact consumers).
 
 An artifact is never trusted from filename and numeric run ID alone, and
 the verifier is never controlled solely by the candidate workflow code it
 validates: every trusted expectation arrives from the caller's pinned
 configuration, not from the artifact or the run under inspection.
+
+The bootstrap engine PRODUCES the metadata artifact; it does not consume
+it. This module is the verifier that any downstream workflow (for example
+the deploy pipeline) must invoke before trusting a bootstrap metadata
+artifact. Until that pipeline is wired, the checks here are exercised by
+tests/test_bootstrap_v2_adapters.py and no executable path skips them —
+because no executable path consumes artifacts yet.
 """
 
 from __future__ import annotations
