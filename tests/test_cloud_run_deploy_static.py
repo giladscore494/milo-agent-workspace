@@ -59,3 +59,68 @@ def test_supabase_secret_manager_mapping_preserves_service_role_env_contract():
     assert "SUPABASE_SECRET_KEY" in SCRIPT
     assert "SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest" in SCRIPT
     assert "gcloud secrets versions access" not in SCRIPT
+
+
+API_SA = "milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
+WORKER_SA = "milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
+
+
+def _worker_deploy_block():
+    start = SCRIPT.index("gcloud run jobs deploy")
+    end = SCRIPT.index("gcloud run jobs add-iam-policy-binding")
+    return SCRIPT[start:end]
+
+
+def _iam_binding_block():
+    start = SCRIPT.index("gcloud run jobs add-iam-policy-binding")
+    end = SCRIPT.index("gcloud run deploy")
+    return SCRIPT[start:end]
+
+
+def _api_deploy_block():
+    start = SCRIPT.index("gcloud run deploy")
+    return SCRIPT[start:]
+
+
+def test_api_and_worker_service_accounts_default_to_distinct_identities():
+    assert f"API_SERVICE_ACCOUNT=${{API_SERVICE_ACCOUNT:-{API_SA}}}" in SCRIPT
+    assert f"WORKER_SERVICE_ACCOUNT=${{WORKER_SERVICE_ACCOUNT:-{WORKER_SA}}}" in SCRIPT
+    assert API_SA != WORKER_SA
+    # The legacy single-identity variable must be gone.
+    assert "SERVICE_ACCOUNT=${SERVICE_ACCOUNT:-" not in SCRIPT
+
+
+def test_preflight_fails_when_identities_are_equal_and_verifies_both_exist():
+    assert '[[ "$API_SERVICE_ACCOUNT" == "$WORKER_SERVICE_ACCOUNT" ]]' in SCRIPT
+    assert "must be distinct identities" in SCRIPT
+    assert 'gcloud iam service-accounts describe "$API_SERVICE_ACCOUNT"' in SCRIPT
+    assert 'gcloud iam service-accounts describe "$WORKER_SERVICE_ACCOUNT"' in SCRIPT
+
+
+def test_worker_job_deploys_with_worker_identity():
+    block = _worker_deploy_block()
+    assert '--service-account "$WORKER_SERVICE_ACCOUNT"' in block
+    assert '--service-account "$API_SERVICE_ACCOUNT"' not in block
+
+
+def test_api_service_deploys_with_api_identity():
+    block = _api_deploy_block()
+    assert '--service-account "$API_SERVICE_ACCOUNT"' in block
+    assert '--service-account "$WORKER_SERVICE_ACCOUNT"' not in block
+
+
+def test_launcher_permission_is_granted_to_api_identity_not_worker():
+    block = _iam_binding_block()
+    assert "--role roles/run.jobsExecutorWithOverrides" in block
+    assert '--member "serviceAccount:$API_SERVICE_ACCOUNT"' in block
+    assert '--member "serviceAccount:$WORKER_SERVICE_ACCOUNT"' not in block
+
+
+def test_api_deployment_does_not_reference_kimi_api_key():
+    block = _api_deploy_block()
+    assert "KIMI_API_KEY" not in block
+
+
+def test_worker_job_still_references_kimi_api_key():
+    block = _worker_deploy_block()
+    assert "KIMI_API_KEY=KIMI_API_KEY:latest" in block
