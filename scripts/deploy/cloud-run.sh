@@ -7,6 +7,7 @@ REPOSITORY=${REPOSITORY:-milo-agent}
 API_SERVICE_ACCOUNT=${API_SERVICE_ACCOUNT:-milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com}
 WORKER_SERVICE_ACCOUNT=${WORKER_SERVICE_ACCOUNT:-milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com}
 DEPLOY_MODE=${DEPLOY_MODE:-check}
+JOB_LAUNCHER_MODE=${JOB_LAUNCHER_MODE:-disabled}
 API_SERVICE=${API_SERVICE:-milo-agent-api}
 WORKER_JOB=${WORKER_JOB:-milo-agent-worker}
 SHORT_SHA=$(git rev-parse --short HEAD)
@@ -84,6 +85,7 @@ preflight() {
 print_targets() {
   cat <<TARGETS
 Deployment mode: $DEPLOY_MODE
+Job launcher mode: $JOB_LAUNCHER_MODE
 Project: $PROJECT_ID
 Region: $REGION
 Artifact Registry repository: $REPOSITORY
@@ -104,8 +106,17 @@ case "$DEPLOY_MODE" in
   *) fail "DEPLOY_MODE must be 'check' or 'apply'. Default is 'check'." ;;
 esac
 
+case "$JOB_LAUNCHER_MODE" in
+  disabled|cloud_run) ;;
+  *) fail "JOB_LAUNCHER_MODE must be 'disabled' or 'cloud_run'. Default is 'disabled'." ;;
+esac
+
 preflight
 print_targets
+
+if [[ "$DEPLOY_MODE" == "apply" && "$JOB_LAUNCHER_MODE" == "cloud_run" ]]; then
+  echo "WARNING: JOB_LAUNCHER_MODE=cloud_run — the API will be deployed with the Cloud Run job launcher ENABLED. This is an explicit operator override of the safe default (disabled)." >&2
+fi
 
 if [[ "$DEPLOY_MODE" == "check" ]]; then
   echo "Check mode complete: prerequisites validated. No build, deploy, IAM change, worker execution, or paid API call was performed."
@@ -127,7 +138,7 @@ gcloud run jobs add-iam-policy-binding "$WORKER_JOB" --project "$PROJECT_ID" --r
 
 gcloud run deploy "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" --image "$API_IMAGE" \
   --service-account "$API_SERVICE_ACCOUNT" --no-allow-unauthenticated --port 8080 --cpu 1 --memory 1Gi --timeout 300 --max-instances 10 \
-  --set-env-vars "^${ENV_VAR_DELIMITER}^ENVIRONMENT=production${ENV_VAR_DELIMITER}JOB_LAUNCHER=cloud_run${ENV_VAR_DELIMITER}GCP_PROJECT_ID=$PROJECT_ID${ENV_VAR_DELIMITER}GCP_REGION=$REGION${ENV_VAR_DELIMITER}CLOUD_RUN_WORKER_JOB=$WORKER_JOB${ENV_VAR_DELIMITER}ALLOWED_CORS_ORIGINS=$ALLOWED_CORS_ORIGINS" \
+  --set-env-vars "^${ENV_VAR_DELIMITER}^ENVIRONMENT=production${ENV_VAR_DELIMITER}JOB_LAUNCHER=$JOB_LAUNCHER_MODE${ENV_VAR_DELIMITER}GCP_PROJECT_ID=$PROJECT_ID${ENV_VAR_DELIMITER}GCP_REGION=$REGION${ENV_VAR_DELIMITER}CLOUD_RUN_WORKER_JOB=$WORKER_JOB${ENV_VAR_DELIMITER}ALLOWED_CORS_ORIGINS=$ALLOWED_CORS_ORIGINS" \
   --set-secrets SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest,UPSTASH_REDIS_REST_URL=UPSTASH_REDIS_REST_URL:latest,UPSTASH_REDIS_REST_TOKEN=UPSTASH_REDIS_REST_TOKEN:latest
 
 service_url=$(gcloud run services describe "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')

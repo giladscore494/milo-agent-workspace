@@ -124,3 +124,41 @@ def test_api_deployment_does_not_reference_kimi_api_key():
 def test_worker_job_still_references_kimi_api_key():
     block = _worker_deploy_block()
     assert "KIMI_API_KEY=KIMI_API_KEY:latest" in block
+
+
+def test_job_launcher_mode_defaults_to_disabled():
+    assert "JOB_LAUNCHER_MODE=${JOB_LAUNCHER_MODE:-disabled}" in SCRIPT
+
+
+def test_job_launcher_mode_fails_closed_on_invalid_values():
+    # Only the two allowed values may pass validation; anything else must fail.
+    assert 'case "$JOB_LAUNCHER_MODE" in' in SCRIPT
+    assert "  disabled|cloud_run) ;;" in SCRIPT
+    assert "JOB_LAUNCHER_MODE must be 'disabled' or 'cloud_run'. Default is 'disabled'." in SCRIPT
+    # The validation must run before the API deploy that consumes the value.
+    validation_index = SCRIPT.index('case "$JOB_LAUNCHER_MODE" in')
+    api_deploy_index = SCRIPT.index("gcloud run deploy")
+    assert validation_index < api_deploy_index
+
+
+def test_api_deployment_uses_job_launcher_mode_not_hardcoded_cloud_run():
+    block = _api_deploy_block()
+    assert "JOB_LAUNCHER=$JOB_LAUNCHER_MODE" in block
+    assert "JOB_LAUNCHER=cloud_run" not in block
+
+
+def test_cloud_run_requires_explicit_operator_override():
+    # cloud_run is never the default: it appears only via the configurable
+    # variable and the apply-mode override warning, never as the shipped value.
+    assert "JOB_LAUNCHER_MODE=${JOB_LAUNCHER_MODE:-cloud_run}" not in SCRIPT
+    assert "JOB_LAUNCHER_MODE=${JOB_LAUNCHER_MODE:-disabled}" in SCRIPT
+    # An explicit override to cloud_run in apply mode emits a visible warning.
+    assert '[[ "$DEPLOY_MODE" == "apply" && "$JOB_LAUNCHER_MODE" == "cloud_run" ]]' in SCRIPT
+    assert "explicit operator override" in SCRIPT
+
+
+def test_job_launcher_mode_is_printed_in_targets():
+    targets_start = SCRIPT.index("cat <<TARGETS")
+    targets_end = SCRIPT.index("TARGETS", targets_start + len("cat <<TARGETS"))
+    targets_block = SCRIPT[targets_start:targets_end]
+    assert "Job launcher mode: $JOB_LAUNCHER_MODE" in targets_block
