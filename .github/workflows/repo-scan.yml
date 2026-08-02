@@ -25,7 +25,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install ruff pytest
+          # ruff is pinned: MILO-main-original is an immutable reference
+          # snapshot, so the linter must stay fixed rather than the code
+          # chasing new default rules. Ruff 0.16 widened its default rule
+          # set (UP006/UP045/I001/RUF012/EXE001), turning this job red with
+          # no source change. Bump deliberately, with the snapshot review
+          # that implies.
+          pip install ruff==0.15.22 pytest
 
       - name: Lint (ruff)
         run: ruff check .
