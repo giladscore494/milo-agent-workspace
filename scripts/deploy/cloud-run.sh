@@ -310,7 +310,9 @@ for entry in container.get("env") or []:
     name = entry.get("name") or ""
     ref = ((entry.get("valueFrom") or {}).get("secretKeyRef") or {})
     if ref:
-        print("secret\t%s\t%s:%s" % (name, ref.get("secret") or "", ref.get("key") or ""))
+        secret_name = ref.get("secret") or ref.get("name") or ""
+        secret_version = ref.get("version") or ref.get("key") or ""
+        print("secret\t%s\t%s:%s" % (name, secret_name, secret_version))
     else:
         print("env\t%s" % name)
         if name in allow_values:
