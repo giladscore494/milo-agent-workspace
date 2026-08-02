@@ -14,7 +14,9 @@ This document describes the production Cloud Run deployment flow and the remaini
 4. Grant the runtime service account `roles/run.jobsExecutorWithOverrides` on only the `milo-agent-worker` Cloud Run job so the API can launch the worker with a `RUN_ID` execution override.
 5. Deploy the private API service with `--no-allow-unauthenticated` and print only the final service URL.
 
-The script uses the Git commit short SHA in both image names and does not rely on mutable `latest` tags.
+The script tags both images with the **full 40-character Git commit SHA** (`git rev-parse HEAD`, validated against `^[0-9a-f]{40}$`) and does not rely on mutable `latest` tags or ambiguous short SHAs.
+
+Environment variables and secrets are applied with `--update-env-vars` / `--update-secrets`, never the destructive `--set-*` forms, so production variables the release does not own are preserved. See [`docs/production-readiness/DEPLOYMENT.md`](../production-readiness/DEPLOYMENT.md) for the authoritative description of the update mode, the Stage A flag posture and the post-deployment verification.
 
 ## Safe modes
 
