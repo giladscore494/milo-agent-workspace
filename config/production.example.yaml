@@ -67,12 +67,21 @@ execution_flags:
 
 # Secret Manager RESOURCE NAMES (never values) and their sole consumers.
 secrets:
+  supabase_url:
+    name: "<SUPABASE_URL_SECRET_NAME>"
+    consumers: ["api", "worker"]
   supabase_service_key:
     name: "<SUPABASE_SERVICE_KEY_SECRET_NAME>"
     consumers: ["api", "worker"]
+  # Bound to NOTHING during Stage A — the deployment tools refuse to emit a
+  # command that binds it. An operator introduces it to the worker job only,
+  # as an explicit Stage C action.
   provider_api_key:
     name: "<PROVIDER_KEY_SECRET_NAME>"
     consumers: ["worker"]
+  redis_rest_url:
+    name: "<REDIS_URL_SECRET_NAME>"
+    consumers: ["api", "worker"]
   redis_rest_token:
     name: "<REDIS_TOKEN_SECRET_NAME>"
     consumers: ["api", "worker"]
