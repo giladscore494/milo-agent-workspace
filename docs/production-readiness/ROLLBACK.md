@@ -35,7 +35,7 @@ each step is explicit and auditable.
 1. execution flags off first (above); 2. `gcloud run revisions list
 --service <CLOUD_RUN_API_SERVICE> --region <GCP_REGION>` — identify the
 previous revision; 3. verify its image digest equals
-`milo-api:<PREVIOUS_SHA>`; 4. `gcloud run services update-traffic …
+`api:<PREVIOUS_SHA>`; 4. `gcloud run services update-traffic …
 --to-revisions <PREVIOUS_REVISION>=100` — move traffic explicitly;
 5. verify private IAM (no `allUsers`); 6. verify health through the
 gateway; 7. **preserve the failed revision** for investigation — do not
@@ -45,7 +45,7 @@ delete it.
 
 1. stop new launches (`JOB_LAUNCHER=disabled`); 2. disable run creation;
 3. `gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --image
-…/milo-worker:<PREVIOUS_SHA>` — previous immutable image; 4. do **not**
+…/worker:<PREVIOUS_SHA>` — previous immutable image; 4. do **not**
 execute the job to test; 5. verify service account and secret mappings
 (`jobs describe`); 6. already-running executions: cancel their runs
 through the API path or let leases expire — stale workers are rejected by

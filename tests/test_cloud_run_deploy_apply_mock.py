@@ -10,8 +10,10 @@ These tests fail if a deployment would:
 - use the destructive ``--set-env-vars`` / ``--set-secrets`` behaviour (proved
   by asserting the flags used AND by failing when a pre-existing binding
   disappears);
-- omit a required Stage A variable or leave an execution flag on;
-- expose ``KIMI_API_KEY`` to the API service;
+- omit a required Stage A variable (including the gateway identity pair) or
+  leave an execution flag on;
+- bind a provider key to the API service or the worker job during Stage A;
+- silently repoint a secret binding at a different secret or version;
 - run the API before the worker job, or execute the worker at all.
 """
 
@@ -37,6 +39,9 @@ WORKER_JOB = "milo-agent-worker"
 API_SA = "milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
 WORKER_SA = "milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
 DIGEST = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+GATEWAY_AUDIENCE = "https://milo-agent-api.mock.run.app"
+GATEWAY_IDENTITIES = "milo-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"
+PROVIDER_KEYS = ("KIMI_API_KEY", "MOONSHOT_API_KEY")
 
 EXECUTION_FLAGS = (
     "MILO_ENABLE_RUN_CREATION",
@@ -146,6 +151,8 @@ def api_service_doc() -> dict:
         env_entry("GCP_REGION", REGION),
         env_entry("CLOUD_RUN_WORKER_JOB", WORKER_JOB),
         env_entry("ALLOWED_CORS_ORIGINS", "https://app.example.test"),
+        env_entry("MILO_GATEWAY_AUDIENCE", GATEWAY_AUDIENCE),
+        env_entry("MILO_APPROVED_GATEWAY_IDENTITIES", GATEWAY_IDENTITIES),
         *stage_a_flag_entries(),
         secret_entry("SUPABASE_URL", "SUPABASE_URL"),
         secret_entry("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SECRET_KEY"),
@@ -173,7 +180,6 @@ def worker_job_doc() -> dict:
         *stage_a_flag_entries(),
         secret_entry("SUPABASE_URL", "SUPABASE_URL"),
         secret_entry("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SECRET_KEY"),
-        secret_entry("KIMI_API_KEY", "KIMI_API_KEY"),
         secret_entry("UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_URL"),
         secret_entry("UPSTASH_REDIS_REST_TOKEN", "UPSTASH_REDIS_REST_TOKEN"),
     ]
@@ -247,6 +253,8 @@ class Deployment:
                 "REPOSITORY": REPOSITORY,
                 "DEPLOY_MODE": "apply",
                 "ALLOWED_CORS_ORIGINS": "https://app.example.test,https://admin.example.test",
+                "MILO_GATEWAY_AUDIENCE": GATEWAY_AUDIENCE,
+                "MILO_APPROVED_GATEWAY_IDENTITIES": GATEWAY_IDENTITIES,
             }
         )
         env.update(env_overrides)
@@ -336,6 +344,8 @@ def test_stage_a_variables_are_sent_with_every_execution_flag_false(deployment):
         f"GCP_REGION={REGION}",
         f"CLOUD_RUN_WORKER_JOB={WORKER_JOB}",
         "ALLOWED_CORS_ORIGINS=https://app.example.test,https://admin.example.test",
+        f"MILO_GATEWAY_AUDIENCE={GATEWAY_AUDIENCE}",
+        f"MILO_APPROVED_GATEWAY_IDENTITIES={GATEWAY_IDENTITIES}",
     ):
         assert required in api_deploy
     for flag in EXECUTION_FLAGS:
@@ -348,14 +358,30 @@ def test_stage_a_variables_are_sent_with_every_execution_flag_false(deployment):
 def test_comma_separated_cors_origins_survive_as_one_value(deployment):
     assert deployment.run().returncode == 0
     api_deploy = deployment.command("run deploy ")
-    assert "^@^" in api_deploy
+    assert "^;^" in api_deploy
     assert "https://app.example.test,https://admin.example.test" in api_deploy
 
 
-def test_provider_key_is_sent_to_the_worker_only(deployment):
+def test_stage_a_binds_no_provider_key_to_either_resource(deployment):
+    """Stage A makes no provider call, so no runtime gets a spendable key."""
     assert deployment.run().returncode == 0
-    assert "KIMI_API_KEY=KIMI_API_KEY:latest" in deployment.command("run jobs deploy")
-    assert "KIMI_API_KEY" not in deployment.command("run deploy ")
+    for command in (deployment.command("run jobs deploy"), deployment.command("run deploy ")):
+        for key in PROVIDER_KEYS:
+            assert key not in command
+
+
+def test_api_and_worker_receive_the_same_supabase_and_upstash_bindings(deployment):
+    assert deployment.run().returncode == 0
+    api = deployment.command("run deploy ")
+    worker = deployment.command("run jobs deploy")
+    for binding in (
+        "SUPABASE_URL=SUPABASE_URL:latest",
+        "SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest",
+        "UPSTASH_REDIS_REST_URL=UPSTASH_REDIS_REST_URL:latest",
+        "UPSTASH_REDIS_REST_TOKEN=UPSTASH_REDIS_REST_TOKEN:latest",
+    ):
+        assert binding in api, f"API is missing {binding}"
+        assert binding in worker, f"worker is missing {binding}"
 
 
 def test_separate_service_accounts_are_used_for_api_and_worker(deployment):
@@ -378,7 +404,7 @@ def test_verification_reports_sha_identity_env_names_secrets_and_privacy(deploym
     assert "SUPABASE_SERVICE_ROLE_KEY->SUPABASE_SECRET_KEY:latest" in out
     assert "IAM: private (no allUsers / allAuthenticatedUsers)" in out
     assert "worker executions: 0 (unchanged; deployment executed nothing)" in out
-    assert "secret 'KIMI_API_KEY' absent: OK" in out
+    assert out.count("provider keys absent (KIMI_API_KEY MOONSHOT_API_KEY): OK") == 2
     # Secret VALUES are never read or printed.
     assert "secrets versions access" not in "\n".join(deployment.invocations())
 
@@ -390,11 +416,11 @@ def test_verification_reports_sha_identity_env_names_secrets_and_privacy(deploym
 
 def test_deployment_fails_when_a_pre_existing_env_var_is_dropped(deployment):
     """A destructive --set-env-vars would erase unrelated production config."""
-    _container_env(deployment.service_before).append(env_entry("MILO_GATEWAY_AUDIENCE", "https://x"))
+    _container_env(deployment.service_before).append(env_entry("MILO_WORKER_AUDIENCE", "https://x"))
     result = deployment.run()
     assert result.returncode != 0
     assert "lost pre-existing environment/secret bindings" in result.stderr
-    assert "env MILO_GATEWAY_AUDIENCE" in result.stderr
+    assert "env MILO_WORKER_AUDIENCE was removed" in result.stderr
 
 
 def test_deployment_fails_when_a_pre_existing_secret_binding_is_dropped(deployment):
@@ -402,14 +428,33 @@ def test_deployment_fails_when_a_pre_existing_secret_binding_is_dropped(deployme
     result = deployment.run()
     assert result.returncode != 0
     assert "lost pre-existing environment/secret bindings" in result.stderr
-    assert "secret EXTRA_SECRET" in result.stderr
+    assert "secret EXTRA_SECRET (EXTRA_SECRET:latest) was removed" in result.stderr
 
 
-def test_deployment_fails_when_the_provider_key_reaches_the_api(deployment):
+def test_deployment_fails_when_a_provider_key_reaches_the_api(deployment):
     _container_env(deployment.service_after).append(secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
     result = deployment.run()
     assert result.returncode != 0
-    assert "must not be bound to secret 'KIMI_API_KEY'" in result.stderr
+    assert "carries provider key 'KIMI_API_KEY'" in result.stderr
+    assert "Stage A binds no provider key to any runtime" in result.stderr
+
+
+def test_deployment_fails_when_a_provider_key_reaches_the_worker(deployment):
+    """Stage A binds no provider key to the worker either, not just the API."""
+    for doc in (deployment.job_before, deployment.job_after):
+        _container_env(doc).append(secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "carries provider key 'KIMI_API_KEY'" in result.stderr
+
+
+def test_deployment_fails_when_a_provider_key_is_a_plain_environment_value(deployment):
+    """A key pasted in as a literal is as reachable as a secret binding."""
+    for doc in (deployment.job_before, deployment.job_after):
+        _container_env(doc).append(env_entry("MOONSHOT_API_KEY", "sk-not-a-real-key"))
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "carries provider key 'MOONSHOT_API_KEY'" in result.stderr
 
 
 def test_deployment_fails_when_an_execution_flag_is_enabled(deployment):
@@ -440,11 +485,24 @@ def test_deployment_fails_when_a_required_stage_a_variable_is_missing(deployment
 
 def test_deployment_fails_when_a_required_secret_reference_is_missing(deployment):
     env = _container_env(deployment.job_after)
-    env[:] = [entry for entry in env if entry.get("name") != "KIMI_API_KEY"]
+    env[:] = [entry for entry in env if entry.get("name") != "UPSTASH_REDIS_REST_TOKEN"]
     deployment.job_before = copy.deepcopy(deployment.job_after)
     result = deployment.run()
     assert result.returncode != 0
-    assert "missing the expected secret reference 'KIMI_API_KEY=KIMI_API_KEY:latest'" in result.stderr
+    assert (
+        "missing the expected secret reference "
+        "'UPSTASH_REDIS_REST_TOKEN=UPSTASH_REDIS_REST_TOKEN:latest'"
+    ) in result.stderr
+
+
+def test_deployment_fails_when_a_required_gateway_variable_is_missing(deployment):
+    env = _container_env(deployment.service_after)
+    env[:] = [entry for entry in env if entry.get("name") != "MILO_APPROVED_GATEWAY_IDENTITIES"]
+    result = deployment.run()
+    assert result.returncode != 0
+    assert (
+        "missing required environment variable 'MILO_APPROVED_GATEWAY_IDENTITIES'"
+    ) in result.stderr
 
 
 def test_deployment_fails_when_the_running_image_is_not_the_release_sha(deployment):
@@ -475,6 +533,134 @@ def test_deployment_fails_when_a_worker_execution_appears(deployment):
     result = deployment.run()
     assert result.returncode != 0
     assert "Worker job executions changed during deployment" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# a secret binding that is REMAPPED rather than removed
+# ---------------------------------------------------------------------------
+
+
+def _rebind(doc: dict, env_name: str, secret: str, version: str = "latest") -> None:
+    for entry in _container_env(doc):
+        if entry.get("name") == env_name:
+            entry["valueFrom"] = {"secretKeyRef": {"secret": secret, "key": version}}
+            return
+    raise AssertionError(f"{env_name} is not bound in the fixture")
+
+
+def test_deployment_fails_when_a_secret_is_repointed_at_a_different_secret(deployment):
+    """The variable name survives; what the runtime reads does not.
+
+    A name-only comparison would call this preserved, so the check compares
+    the full binding identity: environment name plus secret and version.
+    """
+    _container_env(deployment.service_before).append(
+        secret_entry("LEGACY_TOKEN", "LEGACY_TOKEN_SECRET")
+    )
+    _container_env(deployment.service_after).append(
+        secret_entry("LEGACY_TOKEN", "SOMEONE_ELSES_SECRET")
+    )
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "lost pre-existing environment/secret bindings" in result.stderr
+    assert (
+        "secret LEGACY_TOKEN was REMAPPED from LEGACY_TOKEN_SECRET:latest "
+        "to SOMEONE_ELSES_SECRET:latest"
+    ) in result.stderr
+
+
+def test_deployment_fails_when_a_secret_version_is_changed(deployment):
+    """Pinned version -> latest is a silent content change, not a no-op."""
+    _rebind(deployment.job_before, "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SECRET_KEY", "7")
+    result = deployment.run()
+    assert result.returncode != 0
+    assert (
+        "secret SUPABASE_SERVICE_ROLE_KEY was REMAPPED from SUPABASE_SECRET_KEY:7 "
+        "to SUPABASE_SECRET_KEY:latest"
+    ) in result.stderr
+
+
+def test_unchanged_bindings_are_reported_as_preserved(deployment):
+    result = deployment.run()
+    assert result.returncode == 0
+    assert (
+        "preserved bindings: OK (no pre-existing env var dropped, "
+        "no secret reference removed or remapped)"
+    ) in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# gateway identity is a Stage A prerequisite, checked before anything runs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"MILO_GATEWAY_AUDIENCE": ""}, "MILO_GATEWAY_AUDIENCE must be set"),
+        ({"MILO_APPROVED_GATEWAY_IDENTITIES": ""}, "MILO_APPROVED_GATEWAY_IDENTITIES must list"),
+        (
+            {"MILO_APPROVED_GATEWAY_IDENTITIES": "not-an-email"},
+            "is not a service account email",
+        ),
+        (
+            {"MILO_APPROVED_GATEWAY_IDENTITIES": "".join(["*"])},
+            "MILO_APPROVED_GATEWAY_IDENTITIES must not contain",
+        ),
+    ],
+)
+def test_missing_or_invalid_gateway_identity_config_fails_preflight(
+    deployment, overrides, expected
+):
+    result = deployment.run(**overrides)
+    assert result.returncode != 0
+    assert expected in result.stderr
+    # Preflight fails before anything is built or deployed.
+    assert "builds submit" not in "\n".join(deployment.invocations())
+
+
+def test_deployment_fails_when_the_deployed_gateway_audience_is_not_the_approved_one(
+    deployment,
+):
+    """Presence alone would pass on a stale audience left from an old release."""
+    for entry in _container_env(deployment.service_after):
+        if entry.get("name") == "MILO_GATEWAY_AUDIENCE":
+            entry["value"] = "https://stale-audience.example.test"
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "MILO_GATEWAY_AUDIENCE='https://stale-audience.example.test'" in result.stderr
+    assert "instead of the approved" in result.stderr
+
+
+def test_deployment_fails_when_the_deployed_identity_allowlist_is_empty(deployment):
+    for entry in _container_env(deployment.service_after):
+        if entry.get("name") == "MILO_APPROVED_GATEWAY_IDENTITIES":
+            entry["value"] = ""
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "no caller would be verifiable" in result.stderr
+
+
+def test_verification_reports_the_gateway_identity_it_confirmed(deployment):
+    result = deployment.run()
+    assert result.returncode == 0
+    assert (
+        f"gateway identity: audience={GATEWAY_AUDIENCE}, approved={GATEWAY_IDENTITIES}"
+    ) in result.stdout
+
+
+def test_multiple_gateway_identities_survive_as_one_value(deployment):
+    identities = (
+        "milo-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com,"
+        "milo-gateway-canary@big-cabinet-457321-t7.iam.gserviceaccount.com"
+    )
+    for doc in (deployment.service_before, deployment.service_after):
+        for entry in _container_env(doc):
+            if entry.get("name") == "MILO_APPROVED_GATEWAY_IDENTITIES":
+                entry["value"] = identities
+    result = deployment.run(MILO_APPROVED_GATEWAY_IDENTITIES=identities)
+    assert result.returncode == 0, result.stderr
+    assert f"MILO_APPROVED_GATEWAY_IDENTITIES={identities}" in deployment.command("run deploy ")
 
 
 # ---------------------------------------------------------------------------

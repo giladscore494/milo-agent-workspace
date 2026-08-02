@@ -10,6 +10,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # shellcheck source=lib/common.sh
 source "${SCRIPT_DIR}/lib/common.sh"
+# Image paths, Stage A posture and required bindings are shared with
+# scripts/deploy/cloud-run.sh so the plan and the executable script cannot
+# drift apart.
+# shellcheck source=../deploy/deployment-contract.sh
+source "${REPO_ROOT}/scripts/deploy/deployment-contract.sh"
 
 usage() {
   cat << 'EOF'
@@ -74,10 +79,76 @@ if [[ -f "${MANIFEST}" ]] && tool_available python3; then
 fi
 
 SHA="${RELEASE_SHA}"
+DELIM="${MILO_ENV_VAR_DELIMITER}"
+
 # Stage A: every execution flag is pinned OFF by the deployment itself
-# (mirrors backend/production_config.py EXECUTION_FLAGS). The '@' delimiter
-# prefix keeps comma-containing values (CORS origins, identity lists) intact.
-STAGE_A_FLAGS='JOB_LAUNCHER=disabled@MILO_ENABLE_RUN_CREATION=false@MILO_ENABLE_PROPOSAL_MUTATIONS=false@MILO_ENABLE_PROPOSAL_READS=false@MILO_ENABLE_RUN_CANCELLATION=false@MILO_ENABLE_EXECUTION_CONTROL=false@MILO_ENABLE_PAID_EXECUTION=false'
+# (mirrors backend/production_config.py EXECUTION_FLAGS, via the shared
+# deployment contract). The alternate delimiter prefix keeps comma-containing
+# values (CORS origins, identity allowlists) intact as a single value.
+EXECUTION_FLAG_ARGS=""
+for flag in "${MILO_STAGE_A_EXECUTION_FLAGS[@]}"; do
+  EXECUTION_FLAG_ARGS="${EXECUTION_FLAG_ARGS:+${EXECUTION_FLAG_ARGS}${DELIM}}${flag}"
+done
+# JOB_LAUNCHER is an API-only variable; the worker never launches jobs.
+STAGE_A_FLAGS="JOB_LAUNCHER=disabled${DELIM}${EXECUTION_FLAG_ARGS}"
+
+# Secret Manager RESOURCE names live in the approved manifest, so the plan
+# emits a placeholder per binding. The environment NAME and the version are
+# fixed by the shared contract and are identical to what cloud-run.sh binds.
+secret_placeholder() {
+  case "$1" in
+    SUPABASE_URL) printf '<SUPABASE_URL_SECRET_NAME>' ;;
+    SUPABASE_SERVICE_ROLE_KEY) printf '<SUPABASE_SERVICE_KEY_SECRET_NAME>' ;;
+    UPSTASH_REDIS_REST_URL) printf '<REDIS_URL_SECRET_NAME>' ;;
+    UPSTASH_REDIS_REST_TOKEN) printf '<REDIS_TOKEN_SECRET_NAME>' ;;
+    *) return 1 ;;
+  esac
+}
+
+unmapped_secret=""
+secret_bindings() {
+  local out="" name placeholder
+  for name in "$@"; do
+    if ! placeholder="$(secret_placeholder "${name}")"; then
+      unmapped_secret="${name}"
+      continue
+    fi
+    out="${out:+${out},}${name}=${placeholder}:${MILO_SECRET_VERSION}"
+  done
+  printf '%s' "${out}"
+}
+
+API_SECRET_ARGS="$(secret_bindings "${MILO_API_SECRET_ENV_NAMES[@]}")"
+WORKER_SECRET_ARGS="$(secret_bindings "${MILO_WORKER_SECRET_ENV_NAMES[@]}")"
+if [[ -n "${unmapped_secret}" ]]; then
+  record_check BLOCKED "secret-bindings" "no manifest placeholder is defined for the secret-backed variable '${unmapped_secret}'; the plan would omit a required binding"
+  finish_checks "generate-deployment-plan" "${JSON_OUTPUT}"
+  exit $?
+fi
+
+# Non-secret variables, in the same order both tools set them. Stage A binds
+# NO provider key on either resource, so none appears in either command.
+API_ENV_ARGS="ENVIRONMENT=production${DELIM}GCP_PROJECT_ID=<GCP_PROJECT_ID>${DELIM}GCP_REGION=<GCP_REGION>${DELIM}CLOUD_RUN_WORKER_JOB=<CLOUD_RUN_WORKER_JOB>${DELIM}ALLOWED_CORS_ORIGINS=<PRODUCTION_ORIGINS>${DELIM}MILO_GATEWAY_AUDIENCE=<CLOUD_RUN_API_URL>${DELIM}MILO_APPROVED_GATEWAY_IDENTITIES=<GATEWAY_IDENTITY_EMAIL>${DELIM}${STAGE_A_FLAGS}"
+WORKER_ENV_ARGS="ENVIRONMENT=production${DELIM}GCP_PROJECT_ID=<GCP_PROJECT_ID>${DELIM}GCP_REGION=<GCP_REGION>${DELIM}${EXECUTION_FLAG_ARGS}"
+
+API_IMAGE_REF="<GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/${MILO_API_IMAGE_REPO}:${SHA}"
+WORKER_IMAGE_REF="<GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/${MILO_WORKER_IMAGE_REPO}:${SHA}"
+
+# jq expressions that render one line per binding, capturing the secret
+# REFERENCE (secret name and version) as well as the variable name, so a
+# remapped binding is as visible as a removed one. Names and references only —
+# never a secret value.
+JQ_BINDINGS='.[] | if .valueFrom.secretKeyRef then "secret \(.name) \(.valueFrom.secretKeyRef.secret):\(.valueFrom.secretKeyRef.key)" else "env \(.name)" end'
+API_ENV_PATH='(.spec.template.spec.containers[0].env // [])'
+WORKER_ENV_PATH='(.spec.template.spec.template.spec.containers[0].env // [])'
+
+# Grep alternations for the verification steps, built from the same contract
+# the deploy commands are built from.
+API_REQUIRED_GREP="$(IFS='|'; printf '%s' "${MILO_API_REQUIRED_ENV_NAMES[*]}")"
+API_REQUIRED_COUNT="${#MILO_API_REQUIRED_ENV_NAMES[@]}"
+WORKER_REQUIRED_GREP="$(IFS='|'; printf '%s' "${MILO_WORKER_REQUIRED_ENV_NAMES[*]}")"
+WORKER_REQUIRED_COUNT="${#MILO_WORKER_REQUIRED_ENV_NAMES[@]}"
+PROVIDER_KEY_GREP="$(IFS='|'; printf '%s' "${MILO_PROVIDER_KEY_ENV_NAMES[*]}")"
 plan="$(cat << EOF
 # MILO staged deployment plan — release ${SHA}
 
@@ -98,8 +169,22 @@ Two rules apply to every command below:
   \`--set-secrets\` forms would delete every production variable and secret
   binding not repeated in the command, so they are forbidden here — as are
   \`--clear-env-vars\` and \`--clear-secrets\`. Variables this release does
-  not own (gateway audience, worker identities, budget caps, rate limits)
-  keep their current values.
+  not own (worker audience, budget caps, rate limits) keep their current
+  values.
+
+Stage A posture, in one paragraph: every execution flag is \`false\`, and
+**no provider API key is bound to anything** — not to the API service, not
+to the worker job. Stage A makes no provider call, so a reachable provider
+credential would be blast radius with no purpose. \`KIMI_API_KEY\` /
+\`MOONSHOT_API_KEY\` enter the deployment only through the separate,
+explicit Stage C operator action described in
+docs/production-readiness/STAGED_ACTIVATION.md, together with the budget
+caps and the rehearsed kill switch that make paid execution safe. The
+gateway identity variables (\`MILO_GATEWAY_AUDIENCE\`,
+\`MILO_APPROVED_GATEWAY_IDENTITIES\`) are set explicitly with their approved
+values: production refuses to start without them even while execution is
+disabled, because the read-only routes must never trust a bare browser
+header.
 
 ## 0. Prerequisites (verify, do not skip)
 
@@ -126,41 +211,44 @@ per docs/production-readiness/MIGRATIONS.md before continuing.
     docker build -f Dockerfile.api \\
       --label org.opencontainers.image.revision=${SHA} \\
       --label org.opencontainers.image.title=milo-api \\
-      -t <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-api:${SHA} .
+      -t ${API_IMAGE_REF} .
 
     docker build -f Dockerfile.worker \\
       --label org.opencontainers.image.revision=${SHA} \\
       --label org.opencontainers.image.title=milo-worker \\
-      -t <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-worker:${SHA} .
+      -t ${WORKER_IMAGE_REF} .
 
 ## 4. Push immutable images (manual operator action)
 
-    docker push <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-api:${SHA}
-    docker push <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-worker:${SHA}
+    docker push ${API_IMAGE_REF}
+    docker push ${WORKER_IMAGE_REF}
 
 ## 5. Record the CURRENT worker/API configuration (proof of preservation)
 
-Capture the live variable names and secret references before changing
-anything, so step 9 can prove that nothing was dropped. Names and secret
-references only — never secret values.
+Capture the live bindings before changing anything, so steps 7 and 9 can
+prove that nothing was dropped **or silently repointed**. Each line records
+the variable name and, for a secret-backed variable, the secret name and
+version it reads — names and references only, never secret values. A
+binding remapped to a different secret or a different version changes its
+line and shows up in the diff exactly like a removal.
 
-    gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
-      --format 'value(spec.template.spec.template.spec.containers[0].env[].name)' | tr ';' '\n' | sort > worker-env-before.txt
-    gcloud run services describe <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
-      --format 'value(spec.template.spec.containers[0].env[].name)' | tr ';' '\n' | sort > api-env-before.txt
+    gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> --format=json \\
+      | jq -r '${WORKER_ENV_PATH} | ${JQ_BINDINGS}' | sort > worker-bindings-before.txt
+    gcloud run services describe <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> --project <GCP_PROJECT_ID> --format=json \\
+      | jq -r '${API_ENV_PATH} | ${JQ_BINDINGS}' | sort > api-bindings-before.txt
 
 ## 6. Deploy or update the PRIVATE worker job FIRST (never execute it)
 
-The provider key (\`KIMI_API_KEY\`) is bound to the WORKER ONLY and only
-from Stage C onwards; the API never receives it. At Stage A the worker
-carries no provider key at all.
+Stage A binds no provider key to the worker. \`KIMI_API_KEY\` /
+\`MOONSHOT_API_KEY\` are added only by the separate Stage C operator action,
+never by this plan.
 
     gcloud run jobs deploy <CLOUD_RUN_WORKER_JOB> \\
-      --image <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-worker:${SHA} \\
+      --image ${WORKER_IMAGE_REF} \\
       --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
       --service-account <WORKER_SERVICE_ACCOUNT_EMAIL> \\
-      --update-secrets SUPABASE_SERVICE_ROLE_KEY=<SUPABASE_SERVICE_KEY_SECRET>:latest \\
-      --update-env-vars '^@^ENVIRONMENT=production@SUPABASE_URL=<SUPABASE_URL>@${STAGE_A_FLAGS#JOB_LAUNCHER=disabled@}' \\
+      --update-secrets ${WORKER_SECRET_ARGS} \\
+      --update-env-vars '^${DELIM}^${WORKER_ENV_ARGS}' \\
       --max-retries 0 --task-timeout 3600
 
 \`gcloud run jobs deploy\` only creates/updates the job definition. Do NOT
@@ -170,57 +258,64 @@ run \`gcloud run jobs execute\` at any point in this plan.
 
     gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
       --format 'value(spec.template.spec.template.spec.serviceAccountName, spec.template.spec.template.spec.containers[0].image)'
-    gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
-      --format 'value(spec.template.spec.template.spec.containers[0].env[].name)'                              # variable NAMES
-    gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
-      --format 'value(spec.template.spec.template.spec.containers[0].env[].valueFrom.secretKeyRef.secret)'     # secret REFERENCES
+    gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> --format=json \\
+      | jq -r '${WORKER_ENV_PATH} | ${JQ_BINDINGS}' | sort > worker-bindings-after.txt   # variable NAMES + secret REFERENCES
     gcloud run jobs executions list --job <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION>   # expect: no new executions
 
-Preservation proof — the update must add variables, never remove them:
+Preservation proof — the update must add bindings, never remove or repoint
+one:
 
-    gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
-      --format 'value(spec.template.spec.template.spec.containers[0].env[].name)' | tr ';' '\n' | sort > worker-env-after.txt
-    comm -23 worker-env-before.txt worker-env-after.txt   # expect: EMPTY (nothing was dropped)
+    comm -23 worker-bindings-before.txt worker-bindings-after.txt   # expect: EMPTY (nothing was dropped or remapped)
+
+Required variables present, provider keys absent:
+
+    grep -Ec '^(env|secret) (${WORKER_REQUIRED_GREP})\b' worker-bindings-after.txt   # expect: ${WORKER_REQUIRED_COUNT}
+    grep -E '^(env|secret) (${PROVIDER_KEY_GREP})\b' worker-bindings-after.txt      # expect: EMPTY (no provider key on the worker)
 
 Expected: image tag = ${SHA}, service account = <WORKER_SERVICE_ACCOUNT_EMAIL>
-(never the API account), every execution flag present and \`false\`, and an
-execution list identical to the one from before the deployment.
+(never the API account), every execution flag present and \`false\`, no
+provider key bound, and an execution list identical to the one from before
+the deployment.
 
 ## 8. Deploy or update the PRIVATE Cloud Run API
 
     gcloud run deploy <CLOUD_RUN_API_SERVICE> \\
-      --image <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-api:${SHA} \\
+      --image ${API_IMAGE_REF} \\
       --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
       --service-account <API_SERVICE_ACCOUNT_EMAIL> \\
       --no-allow-unauthenticated --ingress all \\
       --revision-suffix rel-${SHA:0:12} \\
-      --update-secrets SUPABASE_SERVICE_ROLE_KEY=<SUPABASE_SERVICE_KEY_SECRET>:latest \\
-      --update-env-vars '^@^ENVIRONMENT=production@SUPABASE_URL=<SUPABASE_URL>@ALLOWED_CORS_ORIGINS=<PRODUCTION_ORIGINS>@MILO_GATEWAY_AUDIENCE=<CLOUD_RUN_API_URL>@MILO_APPROVED_GATEWAY_IDENTITIES=<GATEWAY_IDENTITY_EMAIL>@${STAGE_A_FLAGS}'
+      --update-secrets ${API_SECRET_ARGS} \\
+      --update-env-vars '^${DELIM}^${API_ENV_ARGS}'
 
 Note: authentication is enforced by --no-allow-unauthenticated (Cloud Run
 IAM) plus the application-level verified gateway token; ingress stays
 reachable only to authorized identities. The API service account differs
-from the worker service account and the API is never given the provider
-key.
+from the worker service account, and no provider key is bound to either
+resource at Stage A.
 
 ## 9. Verify API revision, identity, variable names and secret references
 
     gcloud run services describe <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
       --format 'value(status.latestReadyRevisionName, spec.template.spec.containers[0].image, spec.template.spec.serviceAccountName)'
-    gcloud run services describe <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
-      --format 'value(spec.template.spec.containers[0].env[].name)' | tr ';' '\n' | sort > api-env-after.txt
-    gcloud run services describe <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
-      --format 'value(spec.template.spec.containers[0].env[].valueFrom.secretKeyRef.secret)'                   # secret REFERENCES
+    gcloud run services describe <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> --project <GCP_PROJECT_ID> --format=json \\
+      | jq -r '${API_ENV_PATH} | ${JQ_BINDINGS}' | sort > api-bindings-after.txt   # variable NAMES + secret REFERENCES
 
-Preservation proof — the deployment must add variables, never remove them:
+Preservation proof — the deployment must add bindings, never remove or
+repoint one:
 
-    comm -23 api-env-before.txt api-env-after.txt    # expect: EMPTY (nothing was dropped)
+    comm -23 api-bindings-before.txt api-bindings-after.txt    # expect: EMPTY (nothing was dropped or remapped)
 
-\`KIMI_API_KEY\` / \`MOONSHOT_API_KEY\` must NOT appear in the API secret
-references. The image digest must match the pushed milo-api:${SHA} digest:
+Required Stage A variables present (including the gateway identity pair
+production refuses to start without), provider keys absent:
 
-    gcloud artifacts docker images describe <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-api:${SHA} --format 'value(image_summary.digest)'
-    gcloud artifacts docker images describe <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-worker:${SHA} --format 'value(image_summary.digest)'
+    grep -Ec '^(env|secret) (${API_REQUIRED_GREP})\b' api-bindings-after.txt   # expect: ${API_REQUIRED_COUNT}
+    grep -E '^(env|secret) (${PROVIDER_KEY_GREP})\b' api-bindings-after.txt   # expect: EMPTY (no provider key on the API)
+
+The image digest must match the pushed digest for each image:
+
+    gcloud artifacts docker images describe ${API_IMAGE_REF} --format 'value(image_summary.digest)'
+    gcloud artifacts docker images describe ${WORKER_IMAGE_REF} --format 'value(image_summary.digest)'
 
 ## 10. Verify private ingress and invoker policy
 
@@ -251,7 +346,16 @@ references. The image digest must match the pushed milo-api:${SHA} digest:
 
 Only after explicit operator approval, per
 docs/production-readiness/STAGED_ACTIVATION.md (Stages B, C, D). This plan
-never enables an execution flag.
+never enables an execution flag and never introduces a provider key.
+
+Introducing the provider key is a Stage C action in its own right: the
+operator adds \`KIMI_API_KEY=<PROVIDER_KEY_SECRET_NAME>:latest\` to the
+WORKER job (never the API service) with a separate
+\`gcloud run jobs update --update-secrets\` command, after the budget caps
+are configured and the kill switch is rehearsed. It is deliberately not
+part of any release command above, so no routine deployment can put a
+spendable credential in front of a runtime that is not yet allowed to
+spend.
 EOF
 )"
 
@@ -270,16 +374,29 @@ else
   record_check PASS "env-update-mode" "plan uses only non-destructive --update-env-vars/--update-secrets (existing variables and secret bindings are preserved)"
 fi
 
-# Image references must always carry the full 40-character SHA.
+# Every registry reference must use a canonical repository path AND the full
+# 40-character SHA. A reference to some other repository path would deploy an
+# image this release never built.
 bad_tag=0
+bad_repo=""
 while IFS= read -r ref; do
-  [[ "${ref}" == "milo-api:${SHA}" || "${ref}" == "milo-worker:${SHA}" ]] || bad_tag=1
-done < <(grep -Eo 'milo-(api|worker):[A-Za-z0-9_.-]+' <<< "${plan}" || true)
+  case "${ref}" in
+    */"${MILO_API_IMAGE_REPO}":*|*/"${MILO_WORKER_IMAGE_REPO}":*) ;;
+    *) bad_repo="${ref}"; continue ;;
+  esac
+  [[ "${ref##*:}" == "${SHA}" ]] || bad_tag=1
+done < <(grep -Eo '[^[:space:]]*docker\.pkg\.dev/[^[:space:]]+' <<< "${plan}" || true)
 if [[ "${bad_tag}" -eq 1 ]]; then
   record_check BLOCKED "image-tags" "plan contains an image reference that is not tagged with the full release SHA ${SHA}"
   plan_blocked=1
 else
   record_check PASS "image-tags" "every API and worker image reference uses the full 40-character release SHA"
+fi
+if [[ -n "${bad_repo}" ]]; then
+  record_check BLOCKED "image-repository" "plan references image repository '${bad_repo}', which is neither the canonical '${MILO_API_IMAGE_REPO}' nor '${MILO_WORKER_IMAGE_REPO}' path used by scripts/deploy/cloud-run.sh"
+  plan_blocked=1
+else
+  record_check PASS "image-repository" "every image reference uses the canonical '${MILO_API_IMAGE_REPO}'/'${MILO_WORKER_IMAGE_REPO}' repository paths shared with scripts/deploy/cloud-run.sh"
 fi
 
 missing_flags=""
@@ -295,13 +412,55 @@ else
   record_check PASS "stage-a-flags" "plan pins JOB_LAUNCHER=disabled and every MILO_ENABLE_* execution flag to false"
 fi
 
-# The provider key is worker-only: it must never appear in an API command.
-api_deploy_block="$(sed -n '/gcloud run deploy /,/^$/p' <<< "${plan_commands}")"
-if grep -Eq 'KIMI_API_KEY|MOONSHOT_API_KEY' <<< "${api_deploy_block}"; then
-  record_check BLOCKED "provider-key-scope" "plan binds a provider API key to the Cloud Run API service; provider keys are worker-only"
+# Stage A binds no provider key to EITHER resource. Only the deploy commands
+# are scanned: the verification steps grep the live configuration for exactly
+# these names and must not be mistaken for a binding.
+command_block() {
+  # The command line matching a prefix plus its backslash continuations —
+  # never the unrelated commands that follow it.
+  awk -v prefix="$1" '
+    !found && index($0, prefix) { found = 1; print; if ($0 !~ /\\$/) exit; next }
+    found { print; if ($0 !~ /\\$/) exit }
+  ' <<< "${plan_commands}"
+}
+api_deploy_block="$(command_block 'gcloud run deploy ')"
+worker_deploy_block="$(command_block 'gcloud run jobs deploy ')"
+provider_key_pattern="$(IFS='|'; printf '%s' "${MILO_PROVIDER_KEY_ENV_NAMES[*]}")"
+provider_key_on=""
+grep -Eq -- "${provider_key_pattern}" <<< "${api_deploy_block}" && provider_key_on="the API service"
+grep -Eq -- "${provider_key_pattern}" <<< "${worker_deploy_block}" && provider_key_on="${provider_key_on:+${provider_key_on} and }the worker job"
+if [[ -n "${provider_key_on}" ]]; then
+  record_check BLOCKED "provider-key-scope" "plan binds a provider API key to ${provider_key_on}; Stage A binds no provider key anywhere (Stage C introduces it by a separate operator action)"
   plan_blocked=1
 else
-  record_check PASS "provider-key-scope" "no provider API key is bound to the API service (worker-only)"
+  record_check PASS "provider-key-scope" "no provider API key is bound to the API service or the worker job (Stage A posture)"
+fi
+
+# Gateway identity is mandatory in production even while execution is off.
+missing_gateway=""
+for required in MILO_GATEWAY_AUDIENCE MILO_APPROVED_GATEWAY_IDENTITIES; do
+  grep -Fq -- "${required}=" <<< "${api_deploy_block}" || missing_gateway="${missing_gateway} ${required}"
+done
+if [[ -n "${missing_gateway}" ]]; then
+  record_check BLOCKED "gateway-identity" "API deploy command omits required gateway identity variables:${missing_gateway}"
+  plan_blocked=1
+else
+  record_check PASS "gateway-identity" "API deploy command sets MILO_GATEWAY_AUDIENCE and MILO_APPROVED_GATEWAY_IDENTITIES explicitly"
+fi
+
+# Both resources must carry the same Supabase/Upstash bindings as cloud-run.sh.
+missing_bindings=""
+for required in "${MILO_API_SECRET_ENV_NAMES[@]}"; do
+  grep -Fq -- "${required}=" <<< "${api_deploy_block}" || missing_bindings="${missing_bindings} api:${required}"
+done
+for required in "${MILO_WORKER_SECRET_ENV_NAMES[@]}"; do
+  grep -Fq -- "${required}=" <<< "${worker_deploy_block}" || missing_bindings="${missing_bindings} worker:${required}"
+done
+if [[ -n "${missing_bindings}" ]]; then
+  record_check BLOCKED "secret-bindings" "plan omits required secret bindings:${missing_bindings}"
+  plan_blocked=1
+else
+  record_check PASS "secret-bindings" "API and worker both bind every required Supabase and Upstash secret, matching scripts/deploy/cloud-run.sh"
 fi
 
 # Only indented command lines count; the prose explicitly forbidding the

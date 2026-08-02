@@ -2,14 +2,18 @@
 
 These assertions encode the production hardening contract for the Cloud Run
 deployment: immutable full-SHA image tags, non-destructive environment and
-secret updates, Stage A execution flags pinned off, a worker-only provider
-key, separate runtime identities, worker-before-API ordering, and mandatory
-post-deployment verification.
+secret updates, Stage A execution flags pinned off, no provider key on any
+runtime, mandatory gateway identity configuration, separate runtime
+identities, worker-before-API ordering, and post-deployment verification.
 """
 
 from pathlib import Path
 
 SCRIPT = Path("scripts/deploy/cloud-run.sh").read_text()
+CONTRACT = Path("scripts/deploy/deployment-contract.sh").read_text()
+# The contract is sourced by the script, so a value defined there is as
+# binding as one written inline.
+SOURCES = SCRIPT + CONTRACT
 
 API_SA = "milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
 WORKER_SA = "milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
@@ -40,9 +44,10 @@ def _command_starting_with(prefix: str) -> str:
 
 
 def _array_literal(name: str) -> str:
-    start = SCRIPT.index(f"{name}=(")
-    end = SCRIPT.index("\n)", start)
-    return SCRIPT[start:end]
+    text = SCRIPT if f"{name}=(" in SCRIPT else CONTRACT
+    start = text.index(f"{name}=(")
+    end = text.index("\n)", start)
+    return text[start:end]
 
 
 def _worker_deploy_block():
@@ -78,9 +83,22 @@ def test_release_sha_is_validated_as_forty_hex_characters():
 
 
 def test_both_image_tags_use_the_full_release_sha():
-    assert 'API_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/api:$RELEASE_SHA"' in SCRIPT
-    assert 'WORKER_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/worker:$RELEASE_SHA"' in SCRIPT
+    assert (
+        'API_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY'
+        '/$MILO_API_IMAGE_REPO:$RELEASE_SHA"'
+    ) in SCRIPT
+    assert (
+        'WORKER_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY'
+        '/$MILO_WORKER_IMAGE_REPO:$RELEASE_SHA"'
+    ) in SCRIPT
     assert ":$SHORT_SHA" not in SCRIPT
+
+
+def test_image_repository_paths_come_from_the_shared_contract():
+    """One canonical repository path, shared with the plan generator."""
+    assert 'MILO_API_IMAGE_REPO="api"' in CONTRACT
+    assert 'MILO_WORKER_IMAGE_REPO="worker"' in CONTRACT
+    assert 'source "$SCRIPT_DIR/deployment-contract.sh"' in SCRIPT
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +143,21 @@ def test_pre_existing_bindings_are_snapshotted_and_verified_after_deploy():
     assert SCRIPT.index('assert_bindings_preserved "API service') > SCRIPT.index("gcloud run deploy ")
 
 
+def test_preservation_compares_full_binding_identity_not_just_names():
+    """A remapped secret keeps its name while changing what it reads."""
+    identities = SCRIPT.split("binding_identities() {", 1)[1].split("\n}", 1)[0]
+    assert '$1 == "env"    { print "env\\t" $2 }' in identities
+    assert '$1 == "secret" { print "secret\\t" $2 "\\t" $3 }' in identities
+    assert "was REMAPPED from" in SCRIPT
+    assert "no secret reference removed or remapped" in SCRIPT
+    # The before/after snapshots use the same full-identity comparison.
+    assert "API_BINDINGS_BEFORE=$(binding_identities" in SCRIPT
+    assert "WORKER_BINDINGS_BEFORE=$(binding_identities" in SCRIPT
+    assert "binding_names" not in SCRIPT
+
+
 def test_api_env_vars_use_alternate_delimiter_preserving_comma_separated_cors():
-    assert 'ENV_VAR_DELIMITER="@"' in SCRIPT
+    assert 'ENV_VAR_DELIMITER="$MILO_ENV_VAR_DELIMITER"' in SCRIPT
     assert "printf '^%s^%s' \"$ENV_VAR_DELIMITER\"" in SCRIPT
     assert '--update-env-vars "$(delimited_env_arg "${API_ENV_VARS[@]}")"' in _api_deploy_block()
     assert '--update-env-vars "$(delimited_env_arg "${WORKER_ENV_VARS[@]}")"' in _worker_deploy_block()
@@ -134,9 +165,16 @@ def test_api_env_vars_use_alternate_delimiter_preserving_comma_separated_cors():
 
 
 def test_cors_validation_rejects_selected_alternate_delimiter():
-    assert 'ENV_VAR_DELIMITER="@"' in SCRIPT
+    assert 'MILO_ENV_VAR_DELIMITER=";"' in CONTRACT
     assert "ALLOWED_CORS_ORIGINS must not contain the gcloud env-var delimiter" in SCRIPT
     assert '[[ "$origin" == *"$ENV_VAR_DELIMITER"* ]]' in SCRIPT
+
+
+def test_the_delimiter_cannot_be_a_character_that_appears_in_an_identity():
+    """Service account emails all contain '@'; it cannot be the delimiter."""
+    assert 'MILO_ENV_VAR_DELIMITER="@"' not in CONTRACT
+    delimiter = CONTRACT.split('MILO_ENV_VAR_DELIMITER="', 1)[1][0]
+    assert delimiter not in "@."
 
 
 # ---------------------------------------------------------------------------
@@ -179,10 +217,12 @@ def test_check_mode_exits_before_build_deploy_iam_or_worker_execution():
 
 
 def test_stage_a_execution_flags_are_all_pinned_false():
-    flags = _array_literal("STAGE_A_EXECUTION_FLAGS")
+    flags = _array_literal("MILO_STAGE_A_EXECUTION_FLAGS")
     for name in EXECUTION_FLAGS:
         assert f"{name}=false" in flags, f"{name} must be pinned false for Stage A"
-        assert f"{name}=true" not in SCRIPT
+        assert f"{name}=true" not in SOURCES
+    # The script takes the canonical list rather than keeping its own copy.
+    assert 'STAGE_A_EXECUTION_FLAGS=("${MILO_STAGE_A_EXECUTION_FLAGS[@]}")' in SCRIPT
 
 
 def test_api_and_worker_both_receive_every_stage_a_flag():
@@ -198,8 +238,44 @@ def test_api_env_vars_include_every_required_stage_a_variable():
         "GCP_PROJECT_ID=$PROJECT_ID",
         "GCP_REGION=$REGION",
         "CLOUD_RUN_WORKER_JOB=$WORKER_JOB",
+        "MILO_GATEWAY_AUDIENCE=$MILO_GATEWAY_AUDIENCE",
+        "MILO_APPROVED_GATEWAY_IDENTITIES=$MILO_APPROVED_GATEWAY_IDENTITIES",
     ):
         assert required in api_env, f"API deployment must set {required}"
+
+
+# ---------------------------------------------------------------------------
+# 5b. gateway identity is required even while execution is disabled
+# ---------------------------------------------------------------------------
+
+
+def test_gateway_identity_is_required_before_anything_is_built():
+    assert "require_gateway_identity_config" in SCRIPT
+    assert "MILO_GATEWAY_AUDIENCE must be set" in SCRIPT
+    assert "MILO_APPROVED_GATEWAY_IDENTITIES must list" in SCRIPT
+    guard = SCRIPT.index("  require_gateway_identity_config")
+    assert guard < SCRIPT.index("gcloud builds submit")
+
+
+def test_gateway_identity_values_are_validated_not_merely_present():
+    assert "is not a service account email" in SCRIPT
+    assert "MILO_APPROVED_GATEWAY_IDENTITIES must not contain '*'" in SCRIPT
+    assert "MILO_APPROVED_GATEWAY_IDENTITIES contains an empty entry." in SCRIPT
+
+
+def test_gateway_variables_are_deployed_not_left_to_existing_configuration():
+    """Preservation keeps unknown values; it does not supply approved ones."""
+    for name in ("MILO_GATEWAY_AUDIENCE", "MILO_APPROVED_GATEWAY_IDENTITIES"):
+        assert name in _array_literal("API_ENV_VARS")
+        assert name in _array_literal("MILO_API_REQUIRED_ENV_NAMES")
+
+
+def test_deployed_gateway_values_are_verified_not_merely_present():
+    """A stale audience left on the service would pass a presence check."""
+    tail = SCRIPT[SCRIPT.index("gcloud run deploy ") :]
+    assert 'verify_gateway_identity "API service' in tail
+    assert "instead of the approved" in SCRIPT
+    assert "no caller would be verifiable" in SCRIPT
 
 
 def test_worker_env_vars_include_every_required_stage_a_variable():
@@ -242,34 +318,65 @@ def test_job_launcher_mode_and_release_sha_are_printed_in_targets():
 
 
 # ---------------------------------------------------------------------------
-# 6. KIMI_API_KEY stays worker-only
+# 6. no provider key on ANY runtime during Stage A
 # ---------------------------------------------------------------------------
 
 
-def test_api_secret_bindings_never_include_the_provider_key():
-    api_secrets = _array_literal("API_SECRETS")
-    assert "KIMI_API_KEY" not in api_secrets
-    assert "MOONSHOT_API_KEY" not in api_secrets
+def test_no_provider_key_is_bound_to_either_resource():
+    for array in ("API_SECRETS", "WORKER_SECRETS", "API_ENV_VARS", "WORKER_ENV_VARS"):
+        literal = _array_literal(array)
+        for key in ("KIMI_API_KEY", "MOONSHOT_API_KEY"):
+            assert key not in literal, f"{array} must not bind {key} during Stage A"
 
 
-def test_api_deploy_command_never_references_the_provider_key():
-    assert "KIMI_API_KEY" not in _api_deploy_block()
+def test_provider_key_is_not_a_stage_a_prerequisite():
+    """Requiring the secret to exist would gate Stage A on a Stage C artifact."""
+    required = SCRIPT.split("REQUIRED_SECRETS=(", 1)[1].split(")", 1)[0]
+    assert "KIMI_API_KEY" not in required
+    assert "MOONSHOT_API_KEY" not in required
+    assert "SUPABASE_SECRET_KEY" in required
 
 
-def test_worker_secret_bindings_still_include_the_provider_key():
-    assert "KIMI_API_KEY=KIMI_API_KEY:latest" in _array_literal("WORKER_SECRETS")
+def test_neither_deploy_command_references_a_provider_key():
+    for block in (_api_deploy_block(), _worker_deploy_block()):
+        assert "KIMI_API_KEY" not in block
+        assert "MOONSHOT_API_KEY" not in block
 
 
-def test_provider_key_absence_on_the_api_is_verified_after_deployment():
-    assert 'verify_secret_absent "API service' in SCRIPT
-    assert "KIMI_API_KEY" in SCRIPT.split("verify_secret_absent \"API service", 1)[1].splitlines()[0]
-    assert "must not be bound to secret" in SCRIPT
+def test_a_reintroduced_provider_key_binding_fails_preflight():
+    assert "require_no_provider_key_bindings" in SCRIPT
+    guard = SCRIPT.index("  require_no_provider_key_bindings")
+    assert guard < SCRIPT.index("gcloud builds submit")
+    assert "must not be bound during Stage A" in SCRIPT
+
+
+def test_provider_key_absence_is_verified_on_both_resources_after_deployment():
+    tail = SCRIPT[SCRIPT.index("gcloud run deploy ") :]
+    assert 'verify_no_provider_key "API service' in tail
+    assert 'verify_no_provider_key "Worker job' in tail
+    assert "Stage A binds no provider key to any runtime" in SCRIPT
+    # Both a secret binding and a literal value are caught.
+    assert '$1 == "env" || $1 == "secret" { print $2 }' in SCRIPT
 
 
 def test_supabase_secret_manager_mapping_preserves_service_role_env_contract():
     assert "SUPABASE_SECRET_KEY" in SCRIPT
-    assert "SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest" in SCRIPT
+    assert "SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:$MILO_SECRET_VERSION" in SCRIPT
+    assert 'MILO_SECRET_VERSION="latest"' in CONTRACT
     assert "gcloud secrets versions access" not in SCRIPT
+
+
+def test_api_and_worker_carry_identical_supabase_and_upstash_bindings():
+    api = _array_literal("API_SECRETS")
+    worker = _array_literal("WORKER_SECRETS")
+    for binding in (
+        "SUPABASE_URL=SUPABASE_URL:$MILO_SECRET_VERSION",
+        "SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:$MILO_SECRET_VERSION",
+        "UPSTASH_REDIS_REST_URL=UPSTASH_REDIS_REST_URL:$MILO_SECRET_VERSION",
+        "UPSTASH_REDIS_REST_TOKEN=UPSTASH_REDIS_REST_TOKEN:$MILO_SECRET_VERSION",
+    ):
+        assert binding in api
+        assert binding in worker
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +448,8 @@ def test_every_required_verification_runs_after_deployment():
         'verify_secret_refs "API service',
         'verify_stage_a_flags "Worker job',
         'verify_stage_a_flags "API service',
+        'verify_no_provider_key "Worker job',
+        'verify_no_provider_key "API service',
         "verify_no_public_access job",
         "verify_no_public_access service",
         "verify_no_worker_execution",
@@ -367,6 +476,7 @@ def test_private_ingress_verification_rejects_public_principals():
 def test_verification_reports_names_and_references_but_never_secret_values():
     # Only the non-secret Stage A flags are ever read by value.
     assert 'binding_report() {' in SCRIPT
-    assert 'python3 -c "$CONTAINER_REPORT_PY" JOB_LAUNCHER "${STAGE_A_FLAG_NAMES[@]}"' in SCRIPT
+    assert 'python3 -c "$CONTAINER_REPORT_PY" \\' in SCRIPT
+    assert 'JOB_LAUNCHER "${STAGE_A_FLAG_NAMES[@]}" "${GATEWAY_IDENTITY_VAR_NAMES[@]}"' in SCRIPT
     assert "allow_values = set(sys.argv[1:])" in SCRIPT
     assert "gcloud secrets versions access" not in SCRIPT

@@ -10,6 +10,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "${SCRIPT_DIR}/lib/common.sh"
+# Canonical image repository paths, shared with scripts/deploy/cloud-run.sh
+# and generate-deployment-plan.sh: a rollback must name the same images the
+# deployment pushed.
+# shellcheck source=../deploy/deployment-contract.sh
+source "${SCRIPT_DIR}/../deploy/deployment-contract.sh"
 
 usage() {
   cat << 'EOF'
@@ -80,7 +85,7 @@ is no enable-all or disable-all script by design; each flag is explicit.
 
     gcloud run revisions list --service <CLOUD_RUN_API_SERVICE> --region <GCP_REGION>   # identify previous revision
     gcloud run revisions describe <PREVIOUS_REVISION> --region <GCP_REGION> \\
-      --format 'value(spec.containers[0].image)'          # verify digest matches milo-api:${SHA}
+      --format 'value(spec.containers[0].image)'          # verify digest matches ${MILO_API_IMAGE_REPO}:${SHA}
     gcloud run services update-traffic <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> \\
       --to-revisions <PREVIOUS_REVISION>=100              # move traffic explicitly
     gcloud run services get-iam-policy <CLOUD_RUN_API_SERVICE> --region <GCP_REGION>    # verify private IAM (no allUsers)
@@ -91,7 +96,7 @@ is no enable-all or disable-all script by design; each flag is explicit.
 
     # stop new launches first: JOB_LAUNCHER=disabled and run-creation off (step 0)
     gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \\
-      --image <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/milo-worker:${SHA}
+      --image <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/${MILO_WORKER_IMAGE_REPO}:${SHA}
     # do NOT execute the job to "test" the rollback.
     gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \\
       --format 'value(spec.template.spec.template.spec.serviceAccountName)'   # verify SA + secret mappings

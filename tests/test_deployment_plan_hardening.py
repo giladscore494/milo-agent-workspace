@@ -7,8 +7,10 @@ it and assert that the emitted plan cannot instruct an operator to:
 - use the destructive ``--set-env-vars`` / ``--set-secrets`` forms, which
   would delete every production variable and secret binding not repeated in
   the command;
-- omit a Stage A variable or leave an execution flag on;
-- bind ``KIMI_API_KEY`` to the API service;
+- omit a Stage A variable, including the gateway identity pair production
+  refuses to start without, or leave an execution flag on;
+- bind a provider key to the API service or the worker job;
+- reference an image repository the executable deployment never pushes to;
 - deploy the API before the worker job, or execute the worker.
 """
 
@@ -108,18 +110,33 @@ def test_mutable_tags_are_rejected(tmp_path):
         assert plan_text == ""
 
 
-def test_every_image_reference_uses_the_full_sha(plan):
-    references = [
+def image_references(plan_text: str) -> list[str]:
+    return [
         token
-        for line in plan.splitlines()
+        for line in plan_text.splitlines()
         for token in line.split()
-        if "milo-api:" in token or "milo-worker:" in token
+        if "docker.pkg.dev/" in token
     ]
+
+
+def test_every_image_reference_uses_the_full_sha(plan):
+    references = image_references(plan)
     assert references
     for reference in references:
         tag = reference.split(":")[-1]
         assert tag == FULL_SHA, f"image reference is not tagged with the full SHA: {reference}"
         assert len(tag) == 40
+
+
+def test_every_image_reference_uses_the_canonical_repository_path(plan):
+    """The plan must name the images cloud-run.sh actually builds and pushes."""
+    references = image_references(plan)
+    assert references
+    for reference in references:
+        repository = reference.rsplit("/", 1)[-1].split(":")[0]
+        assert repository in ("api", "worker"), (
+            f"image reference uses a non-canonical repository path: {reference}"
+        )
 
 
 def test_revision_suffix_is_documented_as_a_revision_name_not_an_image_tag(plan):
@@ -145,16 +162,29 @@ def test_both_deploy_commands_use_update_flags(plan):
         assert "--update-secrets" in command
 
 
-def test_plan_proves_no_variable_was_dropped(plan):
-    assert "comm -23 api-env-before.txt api-env-after.txt" in plan
-    assert "comm -23 worker-env-before.txt worker-env-after.txt" in plan
-    assert "expect: EMPTY (nothing was dropped)" in plan
+def test_plan_proves_no_binding_was_dropped_or_remapped(plan):
+    assert "comm -23 api-bindings-before.txt api-bindings-after.txt" in plan
+    assert "comm -23 worker-bindings-before.txt worker-bindings-after.txt" in plan
+    assert "expect: EMPTY (nothing was dropped or remapped)" in plan
+
+
+def test_snapshots_capture_secret_references_not_only_names(plan):
+    """A binding repointed at another secret must show up like a removal."""
+    assert plan.count("valueFrom.secretKeyRef.secret):\\(.valueFrom.secretKeyRef.key)") == 4
+    for snapshot in (
+        "worker-bindings-before.txt",
+        "api-bindings-before.txt",
+        "worker-bindings-after.txt",
+        "api-bindings-after.txt",
+    ):
+        assert snapshot in plan
+    assert "or silently repointed" in plan
 
 
 def test_comma_containing_values_use_the_alternate_delimiter(plan):
     api = deploy_command(plan, "gcloud run deploy")
-    assert "'^@^" in api
-    assert "@ALLOWED_CORS_ORIGINS=<PRODUCTION_ORIGINS>@" in api
+    assert "'^;^" in api
+    assert ";ALLOWED_CORS_ORIGINS=<PRODUCTION_ORIGINS>;" in api
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +201,26 @@ def test_api_command_pins_every_stage_a_variable(plan):
         assert f"{flag}=true" not in plan
 
 
+def test_api_command_sets_the_gateway_identity_variables(plan):
+    """Required in production at every stage, including execution-disabled A."""
+    api = deploy_command(plan, "gcloud run deploy")
+    assert "MILO_GATEWAY_AUDIENCE=<CLOUD_RUN_API_URL>" in api
+    assert "MILO_APPROVED_GATEWAY_IDENTITIES=<GATEWAY_IDENTITY_EMAIL>" in api
+
+
+def test_both_commands_bind_the_same_supabase_and_upstash_secrets(plan):
+    api = deploy_command(plan, "gcloud run deploy")
+    worker = deploy_command(plan, "gcloud run jobs deploy")
+    for name in (
+        "SUPABASE_URL",
+        "SUPABASE_SERVICE_ROLE_KEY",
+        "UPSTASH_REDIS_REST_URL",
+        "UPSTASH_REDIS_REST_TOKEN",
+    ):
+        assert f"{name}=<" in api, f"API command omits the {name} binding"
+        assert f"{name}=<" in worker, f"worker command omits the {name} binding"
+
+
 def test_worker_command_pins_every_execution_flag(plan):
     worker = deploy_command(plan, "gcloud run jobs deploy")
     for flag in EXECUTION_FLAGS:
@@ -184,11 +234,22 @@ def test_worker_command_pins_every_execution_flag(plan):
 # ---------------------------------------------------------------------------
 
 
-def test_api_command_never_binds_a_provider_key(plan):
-    api = deploy_command(plan, "gcloud run deploy")
-    assert "KIMI_API_KEY" not in api
-    assert "MOONSHOT_API_KEY" not in api
-    assert "must NOT appear in the API secret" in plan
+def test_neither_deploy_command_binds_a_provider_key(plan):
+    """Stage A performs no provider call, so no runtime gets a provider key."""
+    for prefix in ("gcloud run deploy", "gcloud run jobs deploy"):
+        command = deploy_command(plan, prefix)
+        assert "KIMI_API_KEY" not in command
+        assert "MOONSHOT_API_KEY" not in command
+
+
+def test_plan_verifies_provider_key_absence_on_both_resources(plan):
+    assert "expect: EMPTY (no provider key on the API)" in plan
+    assert "expect: EMPTY (no provider key on the worker)" in plan
+
+
+def test_plan_defers_the_provider_key_to_an_explicit_stage_c_action(plan):
+    assert "Stage C action in its own right" in plan
+    assert "never by this plan" in plan
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +278,7 @@ def test_plan_never_executes_the_worker(plan):
         "image_summary.digest",  # release digest
         "spec.template.spec.serviceAccountName",  # API identity
         "spec.template.spec.template.spec.serviceAccountName",  # worker identity
-        "containers[0].env[].name",  # variable NAMES
+        "containers[0].env",  # variable NAMES
         "valueFrom.secretKeyRef.secret",  # secret REFERENCES
         "gcloud run services get-iam-policy",  # private IAM
         "gcloud run jobs get-iam-policy",
@@ -241,7 +302,10 @@ def test_generator_self_checks_all_pass(tmp_path):
     for name in (
         "env-update-mode",
         "image-tags",
+        "image-repository",
         "stage-a-flags",
+        "gateway-identity",
+        "secret-bindings",
         "provider-key-scope",
         "no-worker-execution",
         "deploy-order",
@@ -255,12 +319,13 @@ def test_generator_blocks_a_plan_containing_a_destructive_flag(tmp_path):
     # it is copied into an equivalent throwaway tree before being patched.
     root = tmp_path / "repo"
     shutil.copytree(GENERATOR.parent, root / "scripts" / "release")
+    shutil.copytree(REPO / "scripts" / "deploy", root / "scripts" / "deploy")
     (root / "Dockerfile.api").write_text("FROM scratch\n")
     (root / "Dockerfile.worker").write_text("FROM scratch\n")
     patched = root / "scripts" / "release" / "generate-deployment-plan.sh"
     source = GENERATOR.read_text().replace(
-        "--update-secrets SUPABASE_SERVICE_ROLE_KEY=<SUPABASE_SERVICE_KEY_SECRET>:latest",
-        "--set-secrets SUPABASE_SERVICE_ROLE_KEY=<SUPABASE_SERVICE_KEY_SECRET>:latest",
+        "--update-secrets ${WORKER_SECRET_ARGS}",
+        "--set-secrets ${WORKER_SECRET_ARGS}",
         1,
     )
     patched.write_text(source)
