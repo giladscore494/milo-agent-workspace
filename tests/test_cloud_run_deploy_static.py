@@ -350,6 +350,54 @@ def test_a_reintroduced_provider_key_binding_fails_preflight():
     assert "must not be bound during Stage A" in SCRIPT
 
 
+def test_live_provider_key_check_runs_before_the_first_build():
+    """A legacy binding survives a non-destructive update, so it is caught
+    before anything is built rather than after four mutations have landed."""
+    assert "require_no_live_provider_key_bindings" in SCRIPT
+    call = SCRIPT.index("  require_no_live_provider_key_bindings")
+    assert call < SCRIPT.index("gcloud builds submit")
+    assert call < SCRIPT.index("gcloud run jobs deploy ")
+    assert call < SCRIPT.index("gcloud run deploy ")
+    assert call < SCRIPT.index("gcloud run jobs add-iam-policy-binding ")
+    # It is part of preflight, which runs before the check-mode early exit,
+    # so `check` mode reports a legacy binding too.
+    preflight = SCRIPT[SCRIPT.index("preflight() {") : SCRIPT.index("print_targets() {")]
+    assert "require_no_live_provider_key_bindings" in preflight
+    assert SCRIPT.index("preflight\nprint_targets") < SCRIPT.index('if [[ "$DEPLOY_MODE" == "check" ]]')
+
+
+def test_live_provider_key_check_inspects_both_resources_in_both_forms():
+    body = SCRIPT.split("require_no_live_provider_key_bindings() {", 1)[1]
+    assert 'for target in "service:$API_SERVICE" "job:$WORKER_JOB"' in body
+    # Secret-backed and plain bindings both count.
+    assert 'case "$record_kind" in env | secret' in body
+    assert "Secret Manager-backed binding" in body
+    assert "plain environment variable" in body
+    assert '"${MILO_PROVIDER_KEY_ENV_NAMES[@]}"' in body
+
+
+def test_live_provider_key_check_fails_closed_and_tolerates_missing_resources():
+    describe = SCRIPT.split("describe_live_json() {", 1)[1].split("\n}", 1)[0]
+    # A resource that does not exist is distinguished from one that cannot
+    # be inspected; only the former is safe to pass.
+    assert "NOT_FOUND|not found|Cannot find|does not exist" in describe
+    assert "return 2" in describe
+    assert "return 1" in describe
+    assert "not created yet, nothing bound." in SCRIPT
+    assert "the absence of a provider key cannot be proven" in SCRIPT
+    assert "Failing closed rather than deploying blind" in SCRIPT
+
+
+def test_the_script_never_removes_a_live_binding_itself():
+    """Removal is destructive; this release path deliberately is not."""
+    assert "--remove-secrets" not in SCRIPT
+    assert "--remove-env-vars" not in SCRIPT
+    assert "gcloud run jobs update" not in SCRIPT
+    assert "gcloud run services update" not in SCRIPT
+    assert "separate, explicit operator action" in SCRIPT
+    assert "docs/production-readiness/DEPLOYMENT.md" in SCRIPT
+
+
 def test_provider_key_absence_is_verified_on_both_resources_after_deployment():
     tail = SCRIPT[SCRIPT.index("gcloud run deploy ") :]
     assert 'verify_no_provider_key "API service' in tail
@@ -476,6 +524,7 @@ def test_private_ingress_verification_rejects_public_principals():
 def test_verification_reports_names_and_references_but_never_secret_values():
     # Only the non-secret Stage A flags are ever read by value.
     assert 'binding_report() {' in SCRIPT
+    assert 'report_from_json() {' in SCRIPT
     assert 'python3 -c "$CONTAINER_REPORT_PY" \\' in SCRIPT
     assert 'JOB_LAUNCHER "${STAGE_A_FLAG_NAMES[@]}" "${GATEWAY_IDENTITY_VAR_NAMES[@]}"' in SCRIPT
     assert "allow_values = set(sys.argv[1:])" in SCRIPT

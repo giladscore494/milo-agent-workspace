@@ -17,6 +17,7 @@ it and assert that the emitted plan cannot instruct an operator to:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -170,14 +171,22 @@ def test_plan_proves_no_binding_was_dropped_or_remapped(plan):
 
 def test_snapshots_capture_secret_references_not_only_names(plan):
     """A binding repointed at another secret must show up like a removal."""
-    assert plan.count("valueFrom.secretKeyRef.secret):\\(.valueFrom.secretKeyRef.key)") == 4
-    for snapshot in (
-        "worker-bindings-before.txt",
+    snapshots = [
+        line
+        for line in plan.splitlines()
+        if re.search(r"> (?:api|worker)-bindings-(?:before|after)\.txt", line)
+    ]
+    assert sorted(
+        re.search(r"> ((?:api|worker)-bindings-(?:before|after)\.txt)", line).group(1)
+        for line in snapshots
+    ) == [
+        "api-bindings-after.txt",
         "api-bindings-before.txt",
         "worker-bindings-after.txt",
-        "api-bindings-after.txt",
-    ):
-        assert snapshot in plan
+        "worker-bindings-before.txt",
+    ]
+    for line in snapshots:
+        assert "valueFrom.secretKeyRef.secret):\\(.valueFrom.secretKeyRef.key)" in line
     assert "or silently repointed" in plan
 
 
@@ -240,6 +249,31 @@ def test_neither_deploy_command_binds_a_provider_key(plan):
         command = deploy_command(plan, prefix)
         assert "KIMI_API_KEY" not in command
         assert "MOONSHOT_API_KEY" not in command
+
+
+def test_plan_checks_the_live_resources_for_a_legacy_key_before_building(plan):
+    """Non-destructive updates preserve a key an earlier release bound."""
+    assert "## 3. Confirm no legacy provider key is bound" in plan
+    assert plan.index("## 3. Confirm no legacy provider key") < plan.index("docker build")
+    step = plan.split("## 3. Confirm no legacy provider key", 1)[1].split("## 4.", 1)[0]
+    # Both live resources, both binding forms, expected empty.
+    assert "gcloud run services describe <CLOUD_RUN_API_SERVICE>" in step
+    assert "gcloud run jobs describe <CLOUD_RUN_WORKER_JOB>" in step
+    assert step.count("^(env|secret) (KIMI_API_KEY|MOONSHOT_API_KEY)") == 2
+    assert "Expect NO output from either command" in step
+    # Removal is the operator's separate action, not part of the sequence.
+    assert "STOP" in step
+    assert "separate, reviewed operator action" in step
+    assert "docs/production-readiness/DEPLOYMENT.md" in step
+    # Missing vs uninspectable resources are distinguished for the operator.
+    assert "does not exist yet" in step
+    assert "Do not proceed on an uninspectable resource." in step
+
+
+def test_plan_never_removes_a_binding_for_the_operator(plan):
+    commands = command_lines(plan)
+    for destructive in ("--remove-secrets", "--remove-env-vars"):
+        assert destructive not in commands
 
 
 def test_plan_verifies_provider_key_absence_on_both_resources(plan):
@@ -307,6 +341,7 @@ def test_generator_self_checks_all_pass(tmp_path):
         "gateway-identity",
         "secret-bindings",
         "provider-key-scope",
+        "provider-key-preflight",
         "no-worker-execution",
         "deploy-order",
     ):

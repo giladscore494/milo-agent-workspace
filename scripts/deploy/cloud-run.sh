@@ -215,10 +215,13 @@ preflight() {
       fail "Required Secret Manager secret '$secret' does not exist or is not accessible."
   done
 
-  if [[ "$DEPLOY_MODE" == "apply" ]]; then
-    # Post-deployment verification parses gcloud JSON with python3.
-    require_command python3
-  fi
+  # Live configuration is inspected (read-only) with python3, in both modes.
+  require_command python3
+
+  # Last preflight gate: the LIVE resources must not already carry a provider
+  # key. This runs after authentication and project access are proven, so an
+  # inspection failure here is a real failure and not a missing credential.
+  require_no_live_provider_key_bindings
 }
 
 print_targets() {
@@ -331,9 +334,113 @@ describe_json() {
 #   flag\t<NAME>\t<VALUE>   (only for JOB_LAUNCHER / MILO_ENABLE_* flags)
 GATEWAY_IDENTITY_VAR_NAMES=(MILO_GATEWAY_AUDIENCE MILO_APPROVED_GATEWAY_IDENTITIES)
 
-binding_report() {
-  describe_json "$1" "$2" | python3 -c "$CONTAINER_REPORT_PY" \
+report_from_json() {
+  printf '%s' "$1" | python3 -c "$CONTAINER_REPORT_PY" \
     JOB_LAUNCHER "${STAGE_A_FLAG_NAMES[@]}" "${GATEWAY_IDENTITY_VAR_NAMES[@]}"
+}
+
+binding_report() {
+  report_from_json "$(describe_json "$1" "$2")"
+}
+
+# ---------------------------------------------------------------------------
+# live provider-key preflight
+#
+# --update-secrets is non-destructive by design, which means it never removes
+# a binding it does not mention. A provider key bound by an earlier release
+# therefore SURVIVES this deployment untouched — the previous version of this
+# script bound KIMI_API_KEY to the worker, so that is a realistic legacy
+# state, not a hypothetical one. Detecting it only in post-deployment
+# verification would mean discovering it after both images were built, the
+# worker job was deployed, IAM was written and the API was deployed.
+#
+# So it is checked here, before any mutation, and the deployment stops. The
+# binding is NOT removed automatically: this script is deliberately
+# non-destructive, and deleting a live secret binding is an operator decision
+# with its own review. The removal commands live in
+# docs/production-readiness/DEPLOYMENT.md so that no destructive flag appears
+# anywhere in this script.
+# ---------------------------------------------------------------------------
+# gcloud's stderr is captured to a file rather than a variable: this function
+# is called from a command substitution, so anything it assigned would be lost
+# with the subshell.
+LIVE_DESCRIBE_ERROR_FILE=""
+
+# describe_live_json KIND NAME -> JSON on stdout.
+#   0 = described   2 = resource does not exist yet   1 = inspection failed
+# Unlike describe_json, a failure is never flattened into an empty document:
+# "I could not look" must not be indistinguishable from "there is nothing
+# there", or an inaccessible resource would silently pass this gate.
+describe_live_json() {
+  local kind="$1" name="$2" out="" status=0
+  : >"$LIVE_DESCRIBE_ERROR_FILE"
+  case "$kind" in
+    service) out=$(gcloud run services describe "$name" --project "$PROJECT_ID" --region "$REGION" --format=json 2>"$LIVE_DESCRIBE_ERROR_FILE") || status=$? ;;
+    job) out=$(gcloud run jobs describe "$name" --project "$PROJECT_ID" --region "$REGION" --format=json 2>"$LIVE_DESCRIBE_ERROR_FILE") || status=$? ;;
+    *) fail "describe_live_json: unknown resource kind '$kind'." ;;
+  esac
+  if [[ "$status" -eq 0 ]]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  # A resource that has never been created carries no provider key.
+  if grep -qiE 'NOT_FOUND|not found|Cannot find|does not exist' "$LIVE_DESCRIBE_ERROR_FILE"; then
+    return 2
+  fi
+  return 1
+}
+
+require_no_live_provider_key_bindings() {
+  local target kind name label json status record_kind record_name found="" reported
+  LIVE_DESCRIBE_ERROR_FILE=$(mktemp)
+  for target in "service:$API_SERVICE" "job:$WORKER_JOB"; do
+    kind="${target%%:*}"
+    name="${target#*:}"
+    case "$kind" in
+      service) label="API service '$name'" ;;
+      job) label="Worker job '$name'" ;;
+    esac
+
+    status=0
+    json=$(describe_live_json "$kind" "$name") || status=$?
+    case "$status" in
+      2)
+        echo "Live provider-key check — $label: not created yet, nothing bound."
+        continue
+        ;;
+      1)
+        reported=$(head -n 1 "$LIVE_DESCRIBE_ERROR_FILE")
+        rm -f "$LIVE_DESCRIBE_ERROR_FILE"
+        fail "Could not inspect the live configuration of $label, so the absence of a provider key cannot be proven. Failing closed rather than deploying blind. gcloud reported: ${reported:-<no output>}"
+        ;;
+    esac
+
+    # Only binding NAMES are read here. No value of any kind is printed.
+    while IFS=$'\t' read -r record_kind record_name _; do
+      case "$record_kind" in env | secret) ;; *) continue ;; esac
+      if milo_contains "$record_name" "${MILO_PROVIDER_KEY_ENV_NAMES[@]}"; then
+        if [[ "$record_kind" == "secret" ]]; then
+          found+="  $label carries $record_name (Secret Manager-backed binding)"$'\n'
+        else
+          found+="  $label carries $record_name (plain environment variable)"$'\n'
+        fi
+      fi
+    done <<<"$(report_from_json "$json")"
+
+    echo "Live provider-key check — $label: inspected."
+  done
+  rm -f "$LIVE_DESCRIBE_ERROR_FILE"
+
+  if [[ -n "$found" ]]; then
+    local message
+    message="A provider API key is already bound to live Cloud Run configuration:"$'\n'
+    message+="$found"
+    message+="Stage A requires provider keys (${MILO_PROVIDER_KEY_ENV_NAMES[*]}) to be absent from BOTH the API service and the worker job."$'\n'
+    message+="This deployment updates configuration non-destructively, so it would leave the existing binding in place rather than remove it."$'\n'
+    message+="Removing a legacy provider binding is a separate, explicit operator action: see 'Legacy provider bindings' in docs/production-readiness/DEPLOYMENT.md for the removal command matching the binding type shown above, then re-run this preflight."$'\n'
+    message+="Nothing was built, deployed, executed or changed."
+    fail "$message"
+  fi
 }
 
 report_field() {

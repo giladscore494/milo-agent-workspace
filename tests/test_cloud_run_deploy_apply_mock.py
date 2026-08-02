@@ -56,16 +56,29 @@ MOCK_GCLOUD = r"""#!/usr/bin/env bash
 printf 'gcloud %s\n' "$*" >> "$MOCK_LOG"
 args="$*"
 
+# Describes reflect the live state at the time they are made: the
+# before-state until a deploy command has run, the after-state once one has.
+# Keying on the deploy (rather than counting calls) keeps the fixture honest
+# no matter how many times the script inspects the resources.
+deployed() {
+  [[ -f "$MOCK_DIR/deployed.marker" ]]
+}
+
 serve_json() {
-  local kind="$1" counter n=0
-  counter="$MOCK_DIR/${kind}.count"
-  [[ -f "$counter" ]] && n=$(cat "$counter")
-  n=$((n + 1))
-  printf '%s' "$n" > "$counter"
-  if [[ "$n" -le 1 ]]; then
-    cat "$MOCK_DIR/${kind}-before.json"
-  else
+  local kind="$1" status
+  status="$(cat "$MOCK_DIR/${kind}-describe-status" 2>/dev/null || echo ok)"
+  case "$status" in
+    missing)
+      printf 'ERROR: (gcloud.run.%s.describe) NOT_FOUND: Resource not found.\n' "$kind" >&2
+      exit 1 ;;
+    denied)
+      printf 'ERROR: (gcloud.run.%s.describe) PERMISSION_DENIED: caller lacks run.services.get.\n' "$kind" >&2
+      exit 1 ;;
+  esac
+  if deployed; then
     cat "$MOCK_DIR/${kind}-after.json"
+  else
+    cat "$MOCK_DIR/${kind}-before.json"
   fi
 }
 
@@ -89,15 +102,10 @@ case "$args" in
   "builds submit"*)
     echo "build submitted (mock)" ;;
   "run jobs executions list"*)
-    local_counter="$MOCK_DIR/executions.count"
-    n=0
-    [[ -f "$local_counter" ]] && n=$(cat "$local_counter")
-    n=$((n + 1))
-    printf '%s' "$n" > "$local_counter"
-    if [[ "$n" -le 1 ]]; then
-      cat "$MOCK_DIR/executions-before.txt"
-    else
+    if deployed; then
       cat "$MOCK_DIR/executions-after.txt"
+    else
+      cat "$MOCK_DIR/executions-before.txt"
     fi ;;
   "run services describe"*)
     case "$args" in
@@ -110,7 +118,10 @@ case "$args" in
     cat "$MOCK_DIR/service-iam.json" ;;
   "run jobs get-iam-policy"*)
     cat "$MOCK_DIR/job-iam.json" ;;
-  "run jobs deploy"*|"run deploy"*|"run jobs add-iam-policy-binding"*)
+  "run jobs deploy"*|"run deploy"*)
+    touch "$MOCK_DIR/deployed.marker"
+    echo "ok (mock)" ;;
+  "run jobs add-iam-policy-binding"*)
     echo "ok (mock)" ;;
   *)
     echo "unexpected gcloud invocation: $args" >&2
@@ -228,6 +239,9 @@ class Deployment:
         self.executions_after: list[str] = []
         self.service_iam = copy.deepcopy(PRIVATE_IAM_POLICY)
         self.job_iam = copy.deepcopy(PRIVATE_IAM_POLICY)
+        # "ok" | "missing" (resource not created yet) | "denied" (cannot look)
+        self.service_describe = "ok"
+        self.job_describe = "ok"
 
     def run(self, **env_overrides: str) -> subprocess.CompletedProcess:
         (self.dir / "service-before.json").write_text(json.dumps(self.service_before))
@@ -238,6 +252,8 @@ class Deployment:
         (self.dir / "executions-after.txt").write_text("".join(f"{n}\n" for n in self.executions_after))
         (self.dir / "service-iam.json").write_text(json.dumps(self.service_iam))
         (self.dir / "job-iam.json").write_text(json.dumps(self.job_iam))
+        (self.dir / "service-describe-status").write_text(self.service_describe)
+        (self.dir / "job-describe-status").write_text(self.job_describe)
 
         env = dict(os.environ)
         env.update(
@@ -441,8 +457,7 @@ def test_deployment_fails_when_a_provider_key_reaches_the_api(deployment):
 
 def test_deployment_fails_when_a_provider_key_reaches_the_worker(deployment):
     """Stage A binds no provider key to the worker either, not just the API."""
-    for doc in (deployment.job_before, deployment.job_after):
-        _container_env(doc).append(secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
+    _container_env(deployment.job_after).append(secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
     result = deployment.run()
     assert result.returncode != 0
     assert "carries provider key 'KIMI_API_KEY'" in result.stderr
@@ -450,8 +465,7 @@ def test_deployment_fails_when_a_provider_key_reaches_the_worker(deployment):
 
 def test_deployment_fails_when_a_provider_key_is_a_plain_environment_value(deployment):
     """A key pasted in as a literal is as reachable as a secret binding."""
-    for doc in (deployment.job_before, deployment.job_after):
-        _container_env(doc).append(env_entry("MOONSHOT_API_KEY", "sk-not-a-real-key"))
+    _container_env(deployment.job_after).append(env_entry("MOONSHOT_API_KEY", "sk-not-a-real-key"))
     result = deployment.run()
     assert result.returncode != 0
     assert "carries provider key 'MOONSHOT_API_KEY'" in result.stderr
@@ -533,6 +547,123 @@ def test_deployment_fails_when_a_worker_execution_appears(deployment):
     result = deployment.run()
     assert result.returncode != 0
     assert "Worker job executions changed during deployment" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# a provider key ALREADY bound to the live resources (legacy state)
+#
+# --update-secrets never removes a binding it does not mention, so a provider
+# key bound by an earlier release survives this deployment. The previous
+# version of this script bound KIMI_API_KEY to the worker, so this is the
+# realistic state of production, not a hypothetical. It has to be caught
+# before anything is built — catching it in post-deployment verification
+# would mean discovering it after two builds, a worker deploy, an IAM write
+# and an API deploy.
+# ---------------------------------------------------------------------------
+
+
+def assert_nothing_was_mutated(deployment: Deployment) -> None:
+    log = "\n".join(deployment.invocations())
+    assert "builds submit" not in log, "images were built"
+    assert "run jobs deploy" not in log, "the worker job was deployed"
+    assert "run deploy " not in log, "the API service was deployed"
+    assert "add-iam-policy-binding" not in log, "IAM was modified"
+    assert "run jobs execute" not in log, "the worker was executed"
+    assert "--remove-secrets" not in log, "the script removed a binding itself"
+    assert "--remove-env-vars" not in log, "the script removed a variable itself"
+
+
+def assert_legacy_binding_error(result, resource: str, key: str, form: str) -> None:
+    assert result.returncode != 0
+    assert "A provider API key is already bound to live Cloud Run configuration" in result.stderr
+    assert f"{resource} carries {key} ({form})" in result.stderr
+    assert "Stage A requires provider keys" in result.stderr
+    assert "separate, explicit operator action" in result.stderr
+    assert "Nothing was built, deployed, executed or changed." in result.stderr
+
+
+def test_legacy_provider_secret_on_the_worker_blocks_before_any_mutation(deployment):
+    """The exact state the previous version of this script would have left."""
+    _container_env(deployment.job_before).append(secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
+    result = deployment.run()
+    assert_legacy_binding_error(
+        result, "Worker job 'milo-agent-worker'", "KIMI_API_KEY", "Secret Manager-backed binding"
+    )
+    assert_nothing_was_mutated(deployment)
+
+
+def test_legacy_provider_secret_on_the_api_blocks_before_any_mutation(deployment):
+    _container_env(deployment.service_before).append(
+        secret_entry("MOONSHOT_API_KEY", "MOONSHOT_API_KEY")
+    )
+    result = deployment.run()
+    assert_legacy_binding_error(
+        result,
+        "API service 'milo-agent-api'",
+        "MOONSHOT_API_KEY",
+        "Secret Manager-backed binding",
+    )
+    assert_nothing_was_mutated(deployment)
+
+
+def test_legacy_provider_key_as_a_plain_variable_blocks_before_any_mutation(deployment):
+    """A literal value is as spendable as a Secret Manager binding."""
+    _container_env(deployment.job_before).append(env_entry("MOONSHOT_API_KEY", "sk-legacy-value"))
+    result = deployment.run()
+    assert_legacy_binding_error(
+        result, "Worker job 'milo-agent-worker'", "MOONSHOT_API_KEY", "plain environment variable"
+    )
+    assert_nothing_was_mutated(deployment)
+    # The value itself is never echoed, only the variable name.
+    assert "sk-legacy-value" not in result.stderr + result.stdout
+
+
+def test_legacy_provider_keys_on_both_resources_are_both_reported(deployment):
+    _container_env(deployment.service_before).append(secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
+    _container_env(deployment.job_before).append(secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "API service 'milo-agent-api' carries KIMI_API_KEY" in result.stderr
+    assert "Worker job 'milo-agent-worker' carries KIMI_API_KEY" in result.stderr
+    assert_nothing_was_mutated(deployment)
+
+
+def test_the_script_never_offers_to_remove_the_binding_itself(deployment):
+    """Non-destructive by design: removal is the operator's reviewed action."""
+    _container_env(deployment.job_before).append(secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "docs/production-readiness/DEPLOYMENT.md" in result.stderr
+    assert "re-run this preflight" in result.stderr
+
+
+def test_clean_live_state_reports_both_resources_inspected(deployment):
+    result = deployment.run()
+    assert result.returncode == 0, result.stderr
+    assert "Live provider-key check — API service 'milo-agent-api': inspected." in result.stdout
+    assert "Live provider-key check — Worker job 'milo-agent-worker': inspected." in result.stdout
+
+
+@pytest.mark.parametrize("resource", ["service", "job"])
+def test_a_resource_that_does_not_exist_yet_is_not_a_false_positive(deployment, resource):
+    """First deployment: nothing is bound because nothing is there."""
+    setattr(deployment, f"{resource}_describe", "missing")
+    result = deployment.run(DEPLOY_MODE="check")
+    assert result.returncode == 0, result.stderr
+    assert "not created yet, nothing bound." in result.stdout
+    assert "A provider API key is already bound" not in result.stderr
+
+
+@pytest.mark.parametrize("resource", ["service", "job"])
+def test_an_uninspectable_resource_fails_closed(deployment, resource):
+    """'I could not look' must never be read as 'there is nothing there'."""
+    setattr(deployment, f"{resource}_describe", "denied")
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "the absence of a provider key cannot be proven" in result.stderr
+    assert "Failing closed" in result.stderr
+    assert "PERMISSION_DENIED" in result.stderr
+    assert_nothing_was_mutated(deployment)
 
 
 # ---------------------------------------------------------------------------

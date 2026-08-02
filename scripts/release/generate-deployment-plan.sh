@@ -206,7 +206,38 @@ per docs/production-readiness/MIGRATIONS.md before continuing.
 
     scripts/release/smoke-test-execution-disabled.sh --env-file <APPROVED_ENV_METADATA>
 
-## 3. Build both immutable images (local build; nothing pushed)
+## 3. Confirm no legacy provider key is bound (read-only; stop if one is)
+
+Every configuration command in this plan is non-destructive, which means it
+never removes a binding it does not mention. A provider key bound by an
+EARLIER release therefore survives this deployment untouched — and an
+earlier version of \`scripts/deploy/cloud-run.sh\` bound \`KIMI_API_KEY\` to the
+worker job, so this is a realistic state of production rather than a
+hypothetical one. Stage A requires the key to be absent, so check BOTH live
+resources here, before anything is built.
+
+Expect NO output from either command:
+
+    gcloud run services describe <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> --project <GCP_PROJECT_ID> --format=json \\
+      | jq -r '${API_ENV_PATH} | ${JQ_BINDINGS}' | grep -E '^(env|secret) (${PROVIDER_KEY_GREP})\\b'
+    gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> --format=json \\
+      | jq -r '${WORKER_ENV_PATH} | ${JQ_BINDINGS}' | grep -E '^(env|secret) (${PROVIDER_KEY_GREP})\\b'
+
+A resource that does not exist yet returns an error from \`describe\` — that
+is not a provider key, and the first deployment of a resource has nothing to
+check. Any OTHER failure to inspect (permission denied, for example) means
+the absence cannot be proven: stop, fix the access, and repeat this step.
+Do not proceed on an uninspectable resource.
+
+**If either command prints a line, STOP — do not continue to step 4.**
+Removing a live provider binding is a separate, reviewed operator action and
+is deliberately not part of this release sequence. The printed line tells you
+which form the binding takes (\`secret …\` or \`env …\`); use the matching
+removal command from "Legacy provider bindings" in
+docs/production-readiness/DEPLOYMENT.md, then re-run this step and
+\`DEPLOY_MODE=check scripts/deploy/cloud-run.sh\` before continuing.
+
+## 4. Build both immutable images (local build; nothing pushed)
 
     docker build -f Dockerfile.api \\
       --label org.opencontainers.image.revision=${SHA} \\
@@ -218,14 +249,14 @@ per docs/production-readiness/MIGRATIONS.md before continuing.
       --label org.opencontainers.image.title=milo-worker \\
       -t ${WORKER_IMAGE_REF} .
 
-## 4. Push immutable images (manual operator action)
+## 5. Push immutable images (manual operator action)
 
     docker push ${API_IMAGE_REF}
     docker push ${WORKER_IMAGE_REF}
 
-## 5. Record the CURRENT worker/API configuration (proof of preservation)
+## 6. Record the CURRENT worker/API configuration (proof of preservation)
 
-Capture the live bindings before changing anything, so steps 7 and 9 can
+Capture the live bindings before changing anything, so steps 8 and 10 can
 prove that nothing was dropped **or silently repointed**. Each line records
 the variable name and, for a secret-backed variable, the secret name and
 version it reads — names and references only, never secret values. A
@@ -237,7 +268,7 @@ line and shows up in the diff exactly like a removal.
     gcloud run services describe <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> --project <GCP_PROJECT_ID> --format=json \\
       | jq -r '${API_ENV_PATH} | ${JQ_BINDINGS}' | sort > api-bindings-before.txt
 
-## 6. Deploy or update the PRIVATE worker job FIRST (never execute it)
+## 7. Deploy or update the PRIVATE worker job FIRST (never execute it)
 
 Stage A binds no provider key to the worker. \`KIMI_API_KEY\` /
 \`MOONSHOT_API_KEY\` are added only by the separate Stage C operator action,
@@ -254,7 +285,7 @@ never by this plan.
 \`gcloud run jobs deploy\` only creates/updates the job definition. Do NOT
 run \`gcloud run jobs execute\` at any point in this plan.
 
-## 7. Verify worker job configuration WITHOUT executing it
+## 8. Verify worker job configuration WITHOUT executing it
 
     gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
       --format 'value(spec.template.spec.template.spec.serviceAccountName, spec.template.spec.template.spec.containers[0].image)'
@@ -277,7 +308,7 @@ Expected: image tag = ${SHA}, service account = <WORKER_SERVICE_ACCOUNT_EMAIL>
 provider key bound, and an execution list identical to the one from before
 the deployment.
 
-## 8. Deploy or update the PRIVATE Cloud Run API
+## 9. Deploy or update the PRIVATE Cloud Run API
 
     gcloud run deploy <CLOUD_RUN_API_SERVICE> \\
       --image ${API_IMAGE_REF} \\
@@ -294,7 +325,7 @@ reachable only to authorized identities. The API service account differs
 from the worker service account, and no provider key is bound to either
 resource at Stage A.
 
-## 9. Verify API revision, identity, variable names and secret references
+## 10. Verify API revision, identity, variable names and secret references
 
     gcloud run services describe <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> --project <GCP_PROJECT_ID> \\
       --format 'value(status.latestReadyRevisionName, spec.template.spec.containers[0].image, spec.template.spec.serviceAccountName)'
@@ -317,13 +348,13 @@ The image digest must match the pushed digest for each image:
     gcloud artifacts docker images describe ${API_IMAGE_REF} --format 'value(image_summary.digest)'
     gcloud artifacts docker images describe ${WORKER_IMAGE_REF} --format 'value(image_summary.digest)'
 
-## 10. Verify private ingress and invoker policy
+## 11. Verify private ingress and invoker policy
 
     gcloud run services get-iam-policy <CLOUD_RUN_API_SERVICE> --region <GCP_REGION>   # expect: no allUsers
     gcloud run jobs get-iam-policy <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION>        # expect: no allUsers
     curl -s -o /dev/null -w '%{http_code}\n' <CLOUD_RUN_API_URL>/health                 # expect: 401/403 (private)
 
-## 11. Configure Vercel server environment (names in ENVIRONMENT_MATRIX.md)
+## 12. Configure Vercel server environment (names in ENVIRONMENT_MATRIX.md)
 
     vercel env add CLOUD_RUN_API_URL production
     vercel env add GCP_PROJECT_NUMBER production
@@ -333,16 +364,16 @@ The image digest must match the pushed digest for each image:
     vercel env add UPSTASH_REDIS_REST_URL production
     vercel env add UPSTASH_REDIS_REST_TOKEN production
 
-## 12. Deploy Vercel
+## 13. Deploy Vercel
 
     vercel deploy --prod
 
-## 13. Stage A read-only validation
+## 14. Stage A read-only validation
 
     scripts/release/smoke-test-read-only.sh --base-url <PRODUCTION_VERCEL_URL> --user-token-env MILO_SMOKE_USER_TOKEN ...
     scripts/release/smoke-test-execution-disabled.sh --base-url <PRODUCTION_VERCEL_URL> --env-file <APPROVED_ENV_METADATA>
 
-## 14. Later activation stages
+## 15. Later activation stages
 
 Only after explicit operator approval, per
 docs/production-readiness/STAGED_ACTIVATION.md (Stages B, C, D). This plan
@@ -434,6 +465,18 @@ if [[ -n "${provider_key_on}" ]]; then
   plan_blocked=1
 else
   record_check PASS "provider-key-scope" "no provider API key is bound to the API service or the worker job (Stage A posture)"
+fi
+
+# A legacy provider key survives a non-destructive update, so the plan must
+# tell the operator to look for one BEFORE the first build — not after four
+# mutations have already landed.
+provider_preflight_line="$(grep -n -- "${provider_key_pattern}" <<< "${plan_commands}" | head -n 1 | cut -d: -f1)"
+first_build_line="$(grep -n 'docker build ' <<< "${plan_commands}" | head -n 1 | cut -d: -f1)"
+if [[ -n "${provider_preflight_line}" && -n "${first_build_line}" && "${provider_preflight_line}" -lt "${first_build_line}" ]]; then
+  record_check PASS "provider-key-preflight" "plan inspects both live resources for an existing provider key before anything is built or deployed"
+else
+  record_check BLOCKED "provider-key-preflight" "plan must check the live API service and worker job for an existing provider-key binding before the first build; a non-destructive update would otherwise preserve it"
+  plan_blocked=1
 fi
 
 # Gateway identity is mandatory in production even while execution is off.

@@ -269,6 +269,29 @@ def test_both_tools_source_the_shared_contract():
         assert "deployment-contract.sh" in tool.read_text(), f"{tool.name} defines its own copy"
 
 
+def test_both_tools_check_the_live_state_before_any_mutation(tmp_path):
+    """Neither path may discover a legacy provider key after deploying."""
+    script = (REPO / "scripts" / "deploy" / "cloud-run.sh").read_text()
+    assert script.index("  require_no_live_provider_key_bindings") < script.index(
+        "gcloud builds submit"
+    )
+
+    output = tmp_path / "plan.md"
+    subprocess.run(
+        ["bash", str(GENERATOR), "--release-sha", FULL_SHA, "--output", str(output)],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+    plan = output.read_text()
+    for key in PROVIDER_KEYS:
+        assert plan.index(key) < plan.index("docker build"), (
+            f"the plan must look for {key} on the live resources before building"
+        )
+
+
 def test_contract_execution_flags_match_the_backend_definition():
     """The deployed posture and the runtime's own list cannot disagree."""
     from backend.production_config import EXECUTION_FLAGS
