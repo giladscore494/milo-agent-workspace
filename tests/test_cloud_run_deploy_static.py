@@ -529,3 +529,17 @@ def test_verification_reports_names_and_references_but_never_secret_values():
     assert 'JOB_LAUNCHER "${STAGE_A_FLAG_NAMES[@]}" "${GATEWAY_IDENTITY_VAR_NAMES[@]}"' in SCRIPT
     assert "allow_values = set(sys.argv[1:])" in SCRIPT
     assert "gcloud secrets versions access" not in SCRIPT
+
+
+def test_secret_ref_parser_supports_cloud_run_json_shapes():
+    from pathlib import Path
+
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "deploy"
+        / "cloud-run.sh"
+    ).read_text()
+
+    assert 'ref.get("secret") or ref.get("name") or ""' in script
+    assert 'ref.get("version") or ref.get("key") or ""' in script
