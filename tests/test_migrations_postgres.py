@@ -1269,6 +1269,10 @@ def test_013_is_rerun_safe(db):
 # (service_role) keeps EXECUTE except where a migration deliberately revoked
 # it (the deprecated migration-014 daily RPCs).
 SERVICE_ONLY_RPCS = [
+    "public.create_message_and_run_v2(uuid, text, jsonb, uuid, text, text, integer, integer)",
+    "public.create_project_from_proposal_with_owner_v2(uuid, text, text, text, jsonb, uuid)",
+    "public.reserve_model_call_budget_v2(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text)",
+    "public.settle_model_call_budget_v2(uuid, numeric, text, text)",
     "public.create_project_from_proposal_with_owner(uuid, text, text, text, jsonb, uuid)",
     "public.create_message_and_run(uuid, text, jsonb, uuid, text, text, integer, integer)",
     "public.claim_run_lease(uuid, text, integer)",
@@ -1561,3 +1565,30 @@ def test_lease_guard_migration_is_rerun_safe(db):
     db.psql(file=migration)
     db.psql(file=migration)
     assert db.psql("select count(*) from pg_proc where proname='assert_worker_lease'") == "1"
+
+
+def test_every_http_facing_rpc_returns_a_set(db):
+    """The pinned supabase-py/postgrest-py client parses RPC responses as a
+    LIST; a function returning a single composite row (JSON object) fails
+    client-side AFTER the write commits (observed live in staging). Every
+    RPC the repository calls over PostgREST must therefore return SETOF."""
+    rpcs = [
+        "create_message_and_run_v2",
+        "create_project_from_proposal_with_owner_v2",
+        "claim_run_lease",
+        "reserve_model_call_budget_v2",
+        "settle_model_call_budget_v2",
+        "reserve_model_call_budget_guarded",
+        "settle_model_call_budget_guarded",
+        "append_run_event_guarded",
+        "save_checkpoint_guarded",
+        "upsert_run_blackboard_guarded",
+        "create_agent_message_guarded",
+        "create_supervisor_decision_guarded",
+        "model_call_budget_committed",
+    ]
+    for name in rpcs:
+        assert db.psql(
+            f"select bool_and(proretset) from pg_proc p join pg_namespace n on n.oid = p.pronamespace "
+            f"where n.nspname='public' and p.proname='{name}'"
+        ) == "t", f"{name} must return SETOF for PostgREST client compatibility"

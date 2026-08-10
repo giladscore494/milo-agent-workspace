@@ -145,7 +145,7 @@ class SupabaseRepository:
         012): idempotent replay, concurrency admission and both inserts
         happen in ONE database transaction under advisory locks."""
         try:
-            response = self.client.rpc("create_message_and_run", {
+            response = self.client.rpc("create_message_and_run_v2", {
                 "p_conversation_id": str(conversation_id),
                 "p_content": content,
                 "p_metadata": metadata,
@@ -285,7 +285,7 @@ class SupabaseRepository:
                 **params, "p_worker_id": worker_id, "p_attempt": attempt, "p_lease_token": lease_token,
             }, "model_call_budget_reservation")
         else:
-            row = self.client.rpc("reserve_model_call_budget", params).execute().data
+            row = self.client.rpc("reserve_model_call_budget_v2", params).execute().data
             row = row[0] if isinstance(row, list) else row
         if row and row.get("status") == "rejected":
             reason = row.get("rejection_reason") or "DAILY_BUDGET_REACHED"
@@ -304,7 +304,7 @@ class SupabaseRepository:
                 "p_status": status,
                 "p_rejection_reason": rejection_reason,
             }, "model_call_budget_reservation")
-        row = self.client.rpc("settle_model_call_budget", {
+        row = self.client.rpc("settle_model_call_budget_v2", {
             "p_reservation_id": str(reservation_id),
             "p_actual_cost": actual_cost,
             "p_status": status,
@@ -511,7 +511,7 @@ class SupabaseRepository:
         # one transaction (migration 011); no orphan project can remain if
         # the membership insert fails.
         try:
-            response = self.client.rpc("create_project_from_proposal_with_owner", {
+            response = self.client.rpc("create_project_from_proposal_with_owner_v2", {
                 "p_proposal_id": str(proposal_id),
                 "p_slug": slug,
                 "p_name": name,

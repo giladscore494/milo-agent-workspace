@@ -14,7 +14,8 @@
 -- only per the repository convention (revoke public/anon/authenticated,
 -- grant service_role).
 
-create or replace function public.assert_worker_lease(
+drop function if exists public.assert_worker_lease(uuid, text, integer, text);
+create function public.assert_worker_lease(
   p_run_id uuid,
   p_worker_id text,
   p_attempt integer,
@@ -37,7 +38,8 @@ begin
 end;
 $$;
 
-create or replace function public.append_run_event_guarded(
+drop function if exists public.append_run_event_guarded(uuid, text, integer, text, text, text, text, text, jsonb, jsonb);
+create function public.append_run_event_guarded(
   p_run_id uuid,
   p_worker_id text,
   p_attempt integer,
@@ -48,7 +50,7 @@ create or replace function public.append_run_event_guarded(
   p_phase text default null,
   p_progress jsonb default null,
   p_payload jsonb default '{}'::jsonb
-) returns public.run_events
+) returns setof public.run_events
 language plpgsql
 as $$
 declare
@@ -58,11 +60,13 @@ begin
   insert into public.run_events (run_id, event_type, message, agent, phase, progress, payload)
   values (p_run_id, p_event_type, p_message, p_agent, p_phase, p_progress, coalesce(p_payload, '{}'::jsonb))
   returning * into v_row;
-  return v_row;
+  return next v_row;
+  return;
 end;
 $$;
 
-create or replace function public.save_checkpoint_guarded(
+drop function if exists public.save_checkpoint_guarded(uuid, text, integer, text, text, text, text, jsonb, jsonb, jsonb, jsonb, jsonb);
+create function public.save_checkpoint_guarded(
   p_run_id uuid,
   p_worker_id text,
   p_attempt integer,
@@ -75,7 +79,7 @@ create or replace function public.save_checkpoint_guarded(
   p_failures jsonb default '[]'::jsonb,
   p_token_usage jsonb default '{}'::jsonb,
   p_last_event jsonb default null
-) returns public.run_checkpoints
+) returns setof public.run_checkpoints
 language plpgsql
 as $$
 declare
@@ -90,17 +94,19 @@ begin
     p_last_event, p_attempt
   )
   returning * into v_row;
-  return v_row;
+  return next v_row;
+  return;
 end;
 $$;
 
-create or replace function public.upsert_run_blackboard_guarded(
+drop function if exists public.upsert_run_blackboard_guarded(uuid, text, integer, text, jsonb);
+create function public.upsert_run_blackboard_guarded(
   p_run_id uuid,
   p_worker_id text,
   p_attempt integer,
   p_lease_token text,
   p_blackboard jsonb
-) returns public.run_blackboards
+) returns setof public.run_blackboards
 language plpgsql
 as $$
 declare
@@ -141,17 +147,19 @@ begin
     completion_score = excluded.completion_score,
     updated_at = now()
   returning * into v_row;
-  return v_row;
+  return next v_row;
+  return;
 end;
 $$;
 
-create or replace function public.create_agent_message_guarded(
+drop function if exists public.create_agent_message_guarded(uuid, text, integer, text, jsonb);
+create function public.create_agent_message_guarded(
   p_run_id uuid,
   p_worker_id text,
   p_attempt integer,
   p_lease_token text,
   p_message jsonb
-) returns public.agent_messages
+) returns setof public.agent_messages
 language plpgsql
 as $$
 declare
@@ -170,17 +178,19 @@ begin
     nullif(p_message->>'read_at', '')::timestamptz
   )
   returning * into v_row;
-  return v_row;
+  return next v_row;
+  return;
 end;
 $$;
 
-create or replace function public.create_supervisor_decision_guarded(
+drop function if exists public.create_supervisor_decision_guarded(uuid, text, integer, text, jsonb);
+create function public.create_supervisor_decision_guarded(
   p_run_id uuid,
   p_worker_id text,
   p_attempt integer,
   p_lease_token text,
   p_decision jsonb
-) returns public.supervisor_decisions
+) returns setof public.supervisor_decisions
 language plpgsql
 as $$
 declare
@@ -199,14 +209,16 @@ begin
     coalesce(p_decision->'evaluation_report', '{}'::jsonb)
   )
   returning * into v_row;
-  return v_row;
+  return next v_row;
+  return;
 end;
 $$;
 
 -- Budget lifecycle with lease enforcement: a stale worker can neither
 -- reserve nor settle. Delegates to the migration-015 SECURITY DEFINER
 -- functions after the lease assertion inside the same transaction.
-create or replace function public.reserve_model_call_budget_guarded(
+drop function if exists public.reserve_model_call_budget_guarded(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, integer, text, text, text);
+create function public.reserve_model_call_budget_guarded(
   p_run_id uuid,
   p_call_seq integer,
   p_user_id uuid,
@@ -219,19 +231,21 @@ create or replace function public.reserve_model_call_budget_guarded(
   p_lease_token text,
   p_provider text default 'moonshot',
   p_model text default 'kimi'
-) returns public.model_call_budget_reservations
+) returns setof public.model_call_budget_reservations
 language plpgsql
 as $$
 begin
   perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
-  return public.reserve_model_call_budget(
+  return next public.reserve_model_call_budget(
     p_run_id, p_call_seq, p_user_id, p_project_id, p_estimated_cost,
     p_daily_user_limit, p_daily_project_limit, p_provider, p_model
   );
+  return;
 end;
 $$;
 
-create or replace function public.settle_model_call_budget_guarded(
+drop function if exists public.settle_model_call_budget_guarded(uuid, numeric, uuid, text, integer, text, text, text);
+create function public.settle_model_call_budget_guarded(
   p_reservation_id uuid,
   p_actual_cost numeric,
   p_run_id uuid,
@@ -240,12 +254,13 @@ create or replace function public.settle_model_call_budget_guarded(
   p_lease_token text,
   p_status text default 'settled',
   p_rejection_reason text default null
-) returns public.model_call_budget_reservations
+) returns setof public.model_call_budget_reservations
 language plpgsql
 as $$
 begin
   perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
-  return public.settle_model_call_budget(p_reservation_id, p_actual_cost, p_status, p_rejection_reason);
+  return next public.settle_model_call_budget(p_reservation_id, p_actual_cost, p_status, p_rejection_reason);
+  return;
 end;
 $$;
 
