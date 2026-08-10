@@ -205,3 +205,74 @@ def test_stale_worker_every_mutation_rejected_via_memory_repository():
     repo.mark_run_complete(run_id, {"models": []}, **lease_b)
     assert repo.get_run(run_id)["status"] == "completed"
     assert repo.get_run(run_id)["output"] == {"models": []}
+
+
+def test_mock_engine_happy_path_completes_with_checkpoints(monkeypatch):
+    """MILO_WORKER_ENGINE=mock runs the zero-cost lifecycle: events,
+    checkpoints, simulated budget-tracked calls, successful completion —
+    with no provider client ever constructed."""
+    monkeypatch.setenv("MILO_WORKER_ENGINE", "mock")
+    monkeypatch.delenv("MILO_ENABLE_PAID_EXECUTION", raising=False)
+
+    class CheckpointCapturingRepo(WorkerRepo):
+        def __init__(self):
+            super().__init__()
+            self.checkpoints = []
+        def save_checkpoint(self, checkpoint, worker_id=None, attempt=None, lease_token=None):
+            self._assert_lease(worker_id, attempt, lease_token)
+            self.checkpoints.append(checkpoint)
+            return checkpoint
+
+    repo = CheckpointCapturingRepo()
+    code = execute_run(repo.run_id, repo)
+    assert code == 0
+    assert repo.completed is not None
+    phases = [c.get("phase") for c in repo.checkpoints]
+    assert phases == ["discovery", "technical", "summary"]
+    event_types = [event[1] for event in repo.events]
+    assert "run_started" in event_types
+    assert "phase_completed" in event_types
+    assert event_types[-1] == "run_completed"
+
+
+def test_mock_engine_budget_loop_trips_model_call_limit(monkeypatch):
+    monkeypatch.setenv("MILO_WORKER_ENGINE", "mock")
+    monkeypatch.setenv("MILO_MAX_MODEL_CALLS_PER_RUN", "3")
+    monkeypatch.delenv("MILO_ENABLE_PAID_EXECUTION", raising=False)
+
+    class BudgetRepo(WorkerRepo):
+        def __init__(self):
+            super().__init__()
+            self.terminal = None
+        def get_run(self, run_id):
+            run = super().get_run(run_id)
+            run["input"] = {"metadata": {"mock_scenario": "budget_loop", "mock_max_loop": 10}}
+            return run
+        def claim_run(self, run_id, worker_id, lease_seconds=300):
+            super().claim_run(run_id, worker_id, lease_seconds)
+            return self.get_run(run_id)
+        def transition_run(self, run_id, status, expected_worker_id=None, expected_attempt=None, expected_lease_token=None, **fields):
+            self._assert_lease(expected_worker_id, expected_attempt, expected_lease_token)
+            if status in {"budget_exhausted", "failed", "timed_out"}:
+                self.terminal = (status, fields.get("error"))
+            return {"id": run_id, "status": status, **fields}
+
+    repo = BudgetRepo()
+    code = execute_run(repo.run_id, repo)
+    assert code == 1
+    assert repo.terminal is not None
+    status, error = repo.terminal
+    assert status == "budget_exhausted"
+    assert error and "MODEL_CALL" in str(error.get("code", "")).upper()
+
+
+def test_mock_engine_never_selected_without_env(monkeypatch):
+    monkeypatch.delenv("MILO_WORKER_ENGINE", raising=False)
+    from backend.worker import main as worker_main
+    # The default path still uses the real adapter; nothing about the mock
+    # module is imported at module import time.
+    import sys
+    sys.modules.pop("backend.worker.mock_engine", None)
+    import importlib
+    importlib.reload(worker_main)
+    assert "backend.worker.mock_engine" not in sys.modules

@@ -187,3 +187,61 @@ def test_project_rate_limit_uses_project_id_not_conversation_id(monkeypatch):
         assert second.status_code == 429
     finally:
         app.dependency_overrides.clear()
+
+
+def test_staging_redis_shim_speaks_the_upstash_protocol(monkeypatch):
+    """The staging rate-limit shim (scripts/staging/redis-shim) must be
+    protocol-compatible with the real UpstashRateLimiter: pipeline INCR /
+    PEXPIRE NX / PTTL semantics, bearer-token auth, and fail-closed on a
+    wrong token."""
+    import importlib.util
+    import threading
+    import time as _time
+    from http.server import ThreadingHTTPServer
+    from pathlib import Path
+
+    monkeypatch.setenv("SHIM_TOKEN", "staging-shim-test-token")
+    shim_path = Path(__file__).resolve().parents[1] / "scripts" / "staging" / "redis-shim" / "main.py"
+    spec = importlib.util.spec_from_file_location("redis_shim", shim_path)
+    shim = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shim)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), shim.Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        import httpx
+        from backend.rate_limit import RateLimiterUnavailable, UpstashRateLimiter
+
+        def post(full_url, commands):
+            response = httpx.post(full_url, json=commands, headers={"Authorization": "Bearer staging-shim-test-token"}, timeout=3.0)
+            response.raise_for_status()
+            return response.json()
+
+        limiter = UpstashRateLimiter(url, "staging-shim-test-token", http_post=post)
+        count1, ttl1 = limiter.increment("rl:test:abc", window_seconds=60)
+        count2, ttl2 = limiter.increment("rl:test:abc", window_seconds=60)
+        assert (count1, count2) == (1, 2)
+        assert 0 < ttl2 <= ttl1 <= 60.0
+        # A different key counts independently (shared store, separate windows).
+        other, _ = limiter.increment("rl:test:other", window_seconds=60)
+        assert other == 1
+
+        # Wrong token: the limiter must fail CLOSED, not fall back open.
+        def bad_post(full_url, commands):
+            response = httpx.post(full_url, json=commands, headers={"Authorization": "Bearer wrong"}, timeout=3.0)
+            response.raise_for_status()
+            return response.json()
+
+        bad_limiter = UpstashRateLimiter(url, "wrong", http_post=bad_post)
+        with pytest.raises(RateLimiterUnavailable):
+            bad_limiter.increment("rl:test:abc", window_seconds=60)
+
+        # Window expiry resets the count (PEXPIRE NX + PTTL semantics).
+        limiter.increment("rl:test:expiry", window_seconds=1)
+        _time.sleep(1.1)
+        reset_count, _ = limiter.increment("rl:test:expiry", window_seconds=1)
+        assert reset_count == 1
+    finally:
+        server.shutdown()

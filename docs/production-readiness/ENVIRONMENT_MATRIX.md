@@ -45,6 +45,7 @@ disabled (Stage A).
 | `MILO_ALLOW_INSECURE_DEV_IDENTITY` | test | no | no | forbidden | forbidden | never in production | `INSECURE_DEV_IDENTITY_IN_PRODUCTION` error | off | remove immediately |
 | `CLOUD_RUN_AUTH_MODE` | test | no | no | forbidden (`e2e-test`) | forbidden | never in production | `TEST_ADAPTER_IN_PRODUCTION` error; hard-disabled in prod builds | unset | remove immediately |
 | `MILO_E2E_INPROCESS_WORKER` | test | no | no | forbidden | forbidden | never in production | `TEST_ADAPTER_IN_PRODUCTION` error | off | remove immediately |
+| `MILO_WORKER_ENGINE` | worker (staging only) | no | no | forbidden | forbidden | isolated staging only (`mock` = zero-cost lifecycle engine) | `TEST_ADAPTER_IN_PRODUCTION` error | unset | remove immediately |
 | `MILO_REQUIRE_PG_TESTS` | test | no | no | n/a (CI only) | n/a | CI | CI job | unset | n/a |
 | `NEXT_PUBLIC_API_URL` | deprecated | yes | no | no | no | legacy CI env only | inventory marks deprecated | unset | remove from CI when convenient |
 

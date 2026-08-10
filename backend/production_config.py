@@ -145,6 +145,8 @@ def validate(env: dict[str, str] | None = None) -> ConfigReport:
             error("TEST_ADAPTER_IN_PRODUCTION", "CLOUD_RUN_AUTH_MODE=e2e-test is a test-only escape and is forbidden in production")
         if _flag(env, "MILO_E2E_INPROCESS_WORKER"):
             error("TEST_ADAPTER_IN_PRODUCTION", "MILO_E2E_INPROCESS_WORKER is a test-only adapter and is forbidden in production")
+        if (env.get("MILO_WORKER_ENGINE") or "").strip():
+            error("TEST_ADAPTER_IN_PRODUCTION", "MILO_WORKER_ENGINE selects a non-production engine (e.g. the zero-cost mock) and is forbidden in production")
 
     # 6. Public execution UI cannot imply backend run creation.
     public_ui = _flag(env, "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI")

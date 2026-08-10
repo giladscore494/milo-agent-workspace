@@ -44,6 +44,13 @@ ALLOWED_PREFIXES = (
     "frontend/tests/",
     "scripts/check_unsafe_defaults.py",
     "docs/",
+    # The Stage B staging deployer enables run creation/cancellation for the
+    # mocked zero-cost lifecycle in the ISOLATED staging project only: it
+    # hard-refuses the production project id, pins paid execution off, and
+    # binds no provider key (require_staging_isolation /
+    # require_no_provider_key_in_staging_config in the script itself).
+    "scripts/deploy/staging-cloud-run.sh",
+    "scripts/staging/",
 )
 
 # Config/deploy surfaces we care about most; everything tracked is scanned,

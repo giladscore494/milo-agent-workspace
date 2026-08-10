@@ -133,6 +133,8 @@ def test_test_adapters_are_rejected_in_production():
     assert "TEST_ADAPTER_IN_PRODUCTION" in codes(report)
     report2 = validate({**BASE_PROD, "MILO_E2E_INPROCESS_WORKER": "true"})
     assert "TEST_ADAPTER_IN_PRODUCTION" in codes(report2)
+    report3 = validate({**BASE_PROD, "MILO_WORKER_ENGINE": "mock"})
+    assert "TEST_ADAPTER_IN_PRODUCTION" in codes(report3)
 
 
 def test_release_scripts_are_not_exempt_from_unsafe_default_scanning():

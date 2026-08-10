@@ -174,8 +174,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     **entry,
                 })
 
+        # MILO_WORKER_ENGINE=mock (forbidden in production by
+        # backend/production_config.py) runs the zero-cost staging engine: no
+        # provider client exists, so the tracker's kill switch is satisfied
+        # locally and simulated calls exercise the real reservation lifecycle
+        # with mock costs only.
+        engine_mode = (os.getenv("MILO_WORKER_ENGINE") or "").strip().lower()
         tracker = budget_tracker or BudgetTracker(
             budget_config,
+            kill_switch=(lambda: True) if engine_mode == "mock" else paid_execution_enabled,
             cancellation_checker=is_cancelled,
             event_emitter=emit_budget_event,
             usage_recorder=record_usage,
@@ -207,14 +214,28 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             tracker.record_retry()
             forward_event("retry_limit_checked", {"agent": agent, "phase": phase, "reason": reason, "message": f"Retry allowance consumed for {agent}/{phase}"})
 
-        selected_engine = engine or VehicleCatalogV1Adapter(
-            model_client_factory=build_guarded_client_factory(tracker),
-            event_sink=forward_event,
-            checkpoint_sink=save_checkpoint,
-            cancellation_checker=is_cancelled,
-            agent_step_callback=record_agent_step,
-            retry_callback=record_retry,
-        )
+        if engine is not None:
+            selected_engine = engine
+        elif engine_mode == "mock":
+            from backend.worker.mock_engine import MockLifecycleEngine
+
+            selected_engine = MockLifecycleEngine(
+                event_sink=forward_event,
+                checkpoint_sink=save_checkpoint,
+                cancellation_checker=is_cancelled,
+                agent_step_callback=record_agent_step,
+                retry_callback=record_retry,
+                budget_tracker=tracker,
+            )
+        else:
+            selected_engine = VehicleCatalogV1Adapter(
+                model_client_factory=build_guarded_client_factory(tracker),
+                event_sink=forward_event,
+                checkpoint_sink=save_checkpoint,
+                cancellation_checker=is_cancelled,
+                agent_step_callback=record_agent_step,
+                retry_callback=record_retry,
+            )
         try:
             result = selected_engine.run(run)
         except CancellationRequested:
