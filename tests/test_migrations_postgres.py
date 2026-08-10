@@ -226,6 +226,12 @@ begin
     create role service_role nologin bypassrls;
   end if;
 end $$;
+-- Replicate Supabase's default function privileges: every function created
+-- by postgres in schema public grants EXECUTE to anon, authenticated and
+-- service_role. Without this, plain PostgreSQL would hide the exact ACL gap
+-- migration 20260810000100 closes (anon EXECUTE on service-only RPCs), and
+-- the revocation tests below would pass vacuously.
+alter default privileges in schema public grant execute on functions to anon, authenticated, service_role;
 """
 
 SEED_LEGACY_ROWS = """
@@ -1254,3 +1260,145 @@ def test_013_is_rerun_safe(db):
     migration_013 = next(m for m in MIGRATIONS if m.name.startswith("013"))
     db.psql(file=migration_013)
     assert db.psql("select count(*) from pg_trigger where tgname='run_usage_ledger_append_only'") == "1"
+
+
+# --- migrations 014/015 + 20260810000100 (service RPC ACLs) ---
+
+# Every service-only RPC with its exact signature. Browser roles (anon,
+# authenticated) must hold EXECUTE on none of these; the trusted backend
+# (service_role) keeps EXECUTE except where a migration deliberately revoked
+# it (the deprecated migration-014 daily RPCs).
+SERVICE_ONLY_RPCS = [
+    "public.create_project_from_proposal_with_owner(uuid, text, text, text, jsonb, uuid)",
+    "public.create_message_and_run(uuid, text, jsonb, uuid, text, text, integer, integer)",
+    "public.claim_run_lease(uuid, text, integer)",
+    "public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text)",
+    "public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text)",
+    "public.model_call_budget_committed(uuid, uuid, date)",
+    "public.reserve_model_call_budget(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text)",
+    "public.settle_model_call_budget(uuid, numeric, text, text)",
+]
+DEPRECATED_RPCS_WITHOUT_SERVICE_ROLE = {
+    "public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text)",
+    "public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text)",
+}
+
+
+def _has_execute(db, role: str, signature: str) -> bool:
+    return db.psql(
+        f"select has_function_privilege('{role}', '{signature}', 'execute')"
+    ) == "t"
+
+
+def test_anon_has_no_execute_on_any_service_rpc(db):
+    granted = [sig for sig in SERVICE_ONLY_RPCS if _has_execute(db, "anon", sig)]
+    assert granted == [], f"anon must not execute service RPCs: {granted}"
+
+
+def test_authenticated_has_no_execute_on_any_service_rpc(db):
+    granted = [sig for sig in SERVICE_ONLY_RPCS if _has_execute(db, "authenticated", sig)]
+    assert granted == [], f"authenticated must not execute service RPCs: {granted}"
+
+
+def test_service_role_execute_matches_expectations(db):
+    for sig in SERVICE_ONLY_RPCS:
+        expected = sig not in DEPRECATED_RPCS_WITHOUT_SERVICE_ROLE
+        assert _has_execute(db, "service_role", sig) is expected, (
+            f"service_role EXECUTE on {sig} expected={expected}"
+        )
+
+
+def test_no_public_non_trigger_function_is_executable_by_anon(db):
+    """Future-proof guard: a migration that adds an anon-callable RPC (or
+    forgets to revoke Supabase's default anon EXECUTE grant) must fail this
+    test. Trigger functions are excluded because PostgREST cannot invoke
+    them and trigger firing does not check the caller's EXECUTE privilege."""
+    leaked = db.psql(
+        "select p.oid::regprocedure::text from pg_proc p "
+        "join pg_namespace n on n.oid = p.pronamespace "
+        "where n.nspname = 'public' and p.prorettype <> 'trigger'::regtype "
+        # Extension-owned functions (pgcrypto) sit in public only in this
+        # test cluster; Supabase installs them in the unexposed `extensions`
+        # schema, so they are not part of the PostgREST RPC surface.
+        "and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e') "
+        "and has_function_privilege('anon', p.oid, 'execute') order by 1"
+    ).splitlines()
+    assert leaked == [], f"anon-executable public functions: {leaked}"
+
+
+def test_revoke_migration_is_rerun_safe(db):
+    migration = next(m for m in MIGRATIONS if "revoke_anon_execute" in m.name)
+    db.psql(file=migration)
+    db.psql(file=migration)
+    assert not _has_execute(db, "anon", SERVICE_ONLY_RPCS[0])
+
+
+def test_future_functions_following_repo_convention_are_fully_locked(db):
+    """Historically, `revoke ... from public` (the convention every service
+    RPC migration follows) was NOT enough on Supabase: anon held a direct
+    EXECUTE grant from Supabase's default privileges that survived the
+    public revoke. Migration 20260810000100 removes those default grants for
+    anon/authenticated, so a future function that follows the existing
+    convention is now genuinely browser-inaccessible. (The built-in PUBLIC
+    execute default cannot be removed per-schema, which is why the explicit
+    `from public` revoke stays part of the convention and is enforced by
+    test_no_public_non_trigger_function_is_executable_by_anon.)"""
+    db.psql(
+        "create or replace function public.zz_test_future_probe() returns int "
+        "language sql as $$ select 1 $$"
+    )
+    try:
+        db.psql("revoke execute on function public.zz_test_future_probe() from public")
+        assert not _has_execute(db, "anon", "public.zz_test_future_probe()")
+        assert not _has_execute(db, "authenticated", "public.zz_test_future_probe()")
+        assert _has_execute(db, "service_role", "public.zz_test_future_probe()")
+    finally:
+        db.psql("drop function public.zz_test_future_probe()")
+
+
+# --- migration 20260810000200 (explicit RLS on service-only tables) ---
+
+def test_every_public_table_has_rls_enabled_without_external_trigger(db):
+    """This plain-PostgreSQL cluster has no `ensure_rls` event trigger (a
+    platform guardrail some managed environments install), so this proves
+    the migrations themselves enable RLS on every public table. It is also
+    the future-proof guard: a migration creating a table without enabling
+    RLS fails here."""
+    assert db.psql("select count(*) from pg_event_trigger where evtname='ensure_rls'") == "0"
+    missing = db.psql(
+        "select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+        "where n.nspname = 'public' and c.relkind = 'r' and not c.relrowsecurity order by 1"
+    ).splitlines()
+    assert missing == [], f"public tables without RLS: {missing}"
+
+
+def test_service_only_tables_have_no_policies(db):
+    """RLS with zero policies is the deny-all posture for browser roles on
+    service-path tables; only the eight browser tables carry policies."""
+    policy_tables = set(db.psql(
+        "select distinct tablename from pg_policies where schemaname='public'"
+    ).splitlines())
+    browser_tables = {
+        "projects", "project_members", "conversations", "messages",
+        "runs", "run_events", "workflow_proposals",
+    }
+    assert policy_tables <= browser_tables, (
+        f"unexpected policies outside the browser surface: {policy_tables - browser_tables}"
+    )
+    service_only = {
+        "run_checkpoints", "worker_heartbeats", "agent_instances", "agent_tasks",
+        "task_dependencies", "agent_messages", "run_blackboards", "supervisor_decisions",
+        "tool_access_requests", "tool_grants", "tool_usage", "sources", "claims",
+        "source_claim_links", "conflicts", "run_usage_ledger",
+        "model_call_budget_reservations", "run_invocations",
+    }
+    assert policy_tables & service_only == set()
+
+
+def test_rls_migration_is_rerun_safe(db):
+    migration = next(m for m in MIGRATIONS if "enable_rls_on_service_only_tables" in m.name)
+    db.psql(file=migration)
+    db.psql(file=migration)
+    assert db.psql(
+        "select relrowsecurity from pg_class where relname='model_call_budget_reservations'"
+    ) == "t"

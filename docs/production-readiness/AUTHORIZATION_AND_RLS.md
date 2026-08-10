@@ -27,12 +27,42 @@ every browser operation, and ownership is protected against tampering
 
 ## RLS — `COMPLETED_IN_CODE`
 
-All browser-reachable tables enable row level security; policies are
-membership-based. The service-role connection used by the API/worker
-bypasses RLS by design, which is why it is server-only and why application
-authorization (membership checks) runs on every browser-facing route
-regardless. Executable RLS validation runs against real PostgreSQL in CI
-(`tests/test_migrations_postgres.py`, zero skips enforced).
+Every `public` table enables row level security explicitly in the
+migrations. Browser-reachable tables carry membership-based policies; all
+other tables are service-path only and carry RLS with zero policies
+(deny-all for browser roles). Migration
+`20260810000200_enable_rls_on_service_only_tables.sql` added the explicit
+enablement for the service-only tables from migrations 002/004/005/015 —
+previously that invariant silently depended on an environment-specific
+`ensure_rls` event trigger (a platform guardrail some Supabase projects
+install, not part of this repository). The service-role connection used by
+the API/worker bypasses RLS by design, which is why it is server-only and
+why application authorization (membership checks) runs on every
+browser-facing route regardless. Executable RLS validation runs against
+real PostgreSQL in CI (`tests/test_migrations_postgres.py`, zero skips
+enforced), including a guard that every public table has RLS with no
+external trigger present.
+
+## Service-only RPC ACLs — `COMPLETED_IN_CODE`
+
+Supabase grants EXECUTE on public-schema functions to `anon`,
+`authenticated` and `service_role` through default privileges. The service
+RPC migrations (011/012/014/015) revoked `public` and `authenticated` but
+not `anon`, so every service RPC — including the SECURITY DEFINER budget
+functions — remained anonymously callable via PostgREST on a real Supabase
+project. Migration `20260810000100_revoke_anon_execute_on_service_rpcs.sql`
+revokes `anon` (and re-asserts `authenticated`/`public`) on all eight
+service RPCs and removes the schema-level default EXECUTE grants for
+`anon`/`authenticated`, so the existing per-function
+`revoke ... from public` convention is now sufficient for future
+functions. Regression coverage: `tests/test_migrations_postgres.py`
+replicates Supabase's default function privileges in its shim and asserts
+no non-trigger public function is executable by `anon`.
+
+**Production follow-up (required before Stage C):** both hardening
+migrations are applied to staging only. Production must receive them via
+the manual migration procedure, and the anon-EXECUTE gap should be assumed
+present in production until then.
 
 ## Ownership backfills — `REQUIRES_MANUAL_OPERATOR_CONFIGURATION`
 
