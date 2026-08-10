@@ -1300,7 +1300,7 @@ def test_authenticated_has_no_execute_on_any_service_rpc(db):
     assert granted == [], f"authenticated must not execute service RPCs: {granted}"
 
 
-def test_service_role_execute_matches_expectations(db):
+def test_service_role_grant_matrix(db):
     for sig in SERVICE_ONLY_RPCS:
         expected = sig not in DEPRECATED_RPCS_WITHOUT_SERVICE_ROLE
         assert _has_execute(db, "service_role", sig) is expected, (
@@ -1402,3 +1402,162 @@ def test_rls_migration_is_rerun_safe(db):
     assert db.psql(
         "select relrowsecurity from pg_class where relname='model_call_budget_reservations'"
     ) == "t"
+
+
+# --- migration 20260810000300 (lease-guarded worker writes) ---
+
+STALE_CONVERSATION = "dddddddd-0000-4000-8000-000000000099"
+
+
+def _seed_stale_worker_run(db) -> str:
+    db.psql(
+        f"insert into public.projects (id, slug, name, workflow_key) values "
+        f"('bbbbbbbb-0000-4000-8000-000000000099', 'stale-scope', 'Stale Scope', 'vehicle_catalog_v1') on conflict (id) do nothing; "
+        f"insert into public.conversations (id, project_id, title) values "
+        f"('{STALE_CONVERSATION}', 'bbbbbbbb-0000-4000-8000-000000000099', 'stale worker conversation') on conflict (id) do nothing"
+    )
+    return db.psql(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{STALE_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+    )
+
+
+def _guarded_calls(run_id: str, worker: str, attempt: str, token: str) -> dict[str, str]:
+    """Every worker-originated durable write, expressed through the guarded
+    surface a stale worker would hit."""
+    lease = f"'{run_id}', '{worker}', {attempt}, '{token}'"
+    return {
+        "event": f"select id from public.append_run_event_guarded({lease}, 'run_started', 'msg', null, null, null, '{{}}'::jsonb)",
+        "checkpoint": f"select id from public.save_checkpoint_guarded({lease}, 'v1', 'vehicle_catalog_v1', 'fetch')",
+        "blackboard": f"select id from public.upsert_run_blackboard_guarded({lease}, '{{\"goal\": \"g\"}}'::jsonb)",
+        "agent_message": f"select id from public.create_agent_message_guarded({lease}, '{{\"message_type\": \"progress\", \"sender\": \"a\", \"recipient\": \"supervisor\"}}'::jsonb)",
+        "supervisor_decision": f"select id from public.create_supervisor_decision_guarded({lease}, '{{\"assessment\": \"ok\", \"rationale_summary\": \"r\"}}'::jsonb)",
+        "reserve": f"select status from public.reserve_model_call_budget_guarded('{run_id}', {attempt}00, null, null, 0.01, null, null, '{worker}', {attempt}, '{token}')",
+    }
+
+
+def test_stale_worker_full_scenario_every_mutation_rejected(db):
+    """The Stage B acceptance scenario, executed against real PostgreSQL:
+    worker A claims and receives lease A; A's lease is reclaimed by worker B
+    with a new attempt+token; every durable write A attempts is rejected
+    atomically at the database boundary while B continues to completion."""
+    run_id = _seed_stale_worker_run(db)
+
+    # 1-2) Worker A acquires the run and its lease token.
+    row_a = db.psql(f"select worker_id, attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-A', 300)")
+    worker_a, attempt_a, token_a = row_a.split("|")
+    assert (worker_a, attempt_a) == ("worker-A", "1")
+
+    # While current, worker A can perform every guarded write.
+    for name, sql in _guarded_calls(run_id, "worker-A", attempt_a, token_a).items():
+        assert db.psql(sql).strip(), f"live worker A blocked on {name}"
+    # A settles its own reservation while still holding the lease.
+    reservation_a = db.psql(f"select id from public.model_call_budget_reservations where run_id='{run_id}' and call_seq={attempt_a}00")
+    assert db.psql(
+        f"select status from public.settle_model_call_budget_guarded('{reservation_a}', 0.005, '{run_id}', 'worker-A', {attempt_a}, '{token_a}')"
+    ) == "settled"
+
+    # 3) A's lease becomes stale/reclaimable.
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+
+    # 4) Worker B acquires the run with a new attempt and token.
+    row_b = db.psql(f"select worker_id, attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-B', 300)")
+    worker_b, attempt_b, token_b = row_b.split("|")
+    assert (worker_b, attempt_b) == ("worker-B", "2")
+    assert token_b != token_a
+
+    # 5-6) Every relevant mutation worker A attempts is rejected.
+    for name, sql in _guarded_calls(run_id, "worker-A", attempt_a, token_a).items():
+        with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+            db.psql(sql)
+    # A cannot settle a reservation for a run it no longer owns.
+    with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+        db.psql(f"select public.settle_model_call_budget_guarded('{reservation_a}', 0.001, '{run_id}', 'worker-A', {attempt_a}, '{token_a}')")
+    # A's usage snapshot matches zero rows (repository-style conditional UPDATE).
+    assert db.psql(
+        f"update public.runs set usage='{{\"stale\": true}}'::jsonb where id='{run_id}' "
+        f"and worker_id='worker-A' and attempt={attempt_a} and lease_token='{token_a}' and lease_expires_at > now() returning id"
+    ).strip() == ""
+    # A's terminal transition matches zero rows.
+    assert db.psql(
+        f"update public.runs set status='failed' where id='{run_id}' "
+        f"and worker_id='worker-A' and attempt={attempt_a} and lease_token='{token_a}' and lease_expires_at > now() returning id"
+    ).strip() == ""
+    # A's heartbeat matches zero rows.
+    assert db.psql(
+        f"update public.runs set lease_expires_at = now() + interval '5 minutes' where id='{run_id}' "
+        f"and worker_id='worker-A' and lease_token='{token_a}' and lease_expires_at > now() returning id"
+    ).strip() == ""
+
+    # 7) Worker B continues successfully through every write and completes.
+    for name, sql in _guarded_calls(run_id, "worker-B", attempt_b, token_b).items():
+        assert db.psql(sql).strip(), f"new holder worker B blocked on {name}"
+    assert db.psql(
+        f"update public.runs set status='running' where id='{run_id}' "
+        f"and worker_id='worker-B' and attempt={attempt_b} and lease_token='{token_b}' and lease_expires_at > now() returning id"
+    ).strip()
+    assert db.psql(
+        f"update public.runs set status='completed', finished_at=now() where id='{run_id}' and status='running' "
+        f"and worker_id='worker-B' and attempt={attempt_b} and lease_token='{token_b}' and lease_expires_at > now() returning id"
+    ).strip()
+    assert db.psql(f"select status from public.runs where id='{run_id}'") == "completed"
+    # Even after completion, A's stale writes stay rejected.
+    with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+        db.psql(_guarded_calls(run_id, "worker-A", attempt_a, token_a)["event"])
+    # The event stream contains only lease-valid writes: one per worker per kind.
+    assert db.psql(
+        f"select count(*) from public.run_events where run_id='{run_id}' and event_type='run_started'"
+    ) == "2"
+
+
+def test_guarded_write_race_with_concurrent_reclaim_is_atomic(db):
+    """FOR SHARE on the runs row makes guard+insert atomic: a reclaim that
+    runs concurrently with a guarded write cannot interleave between the
+    lease check and the insert."""
+    import concurrent.futures
+
+    run_id = _seed_stale_worker_run(db)
+    row_a = db.psql(f"select attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-A', 300)")
+    attempt_a, token_a = row_a.split("|")
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+
+    def stale_write(_):
+        try:
+            db.psql(_guarded_calls(run_id, "worker-A", attempt_a, token_a)["event"])
+            return "wrote"
+        except AssertionError:
+            return "rejected"
+
+    def reclaim(_):
+        return db.psql(f"select worker_id from public.claim_run_lease('{run_id}', 'worker-B', 300)")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        stale_result = pool.submit(stale_write, None)
+        reclaim_result = pool.submit(reclaim, None)
+        assert reclaim_result.result() == "worker-B"
+        # The stale write must be rejected: its lease was already expired
+        # before the race, and the reclaim serializes against FOR SHARE.
+        assert stale_result.result() == "rejected"
+
+
+def test_guarded_functions_are_service_path_only(db):
+    for signature in [
+        "public.assert_worker_lease(uuid, text, integer, text)",
+        "public.append_run_event_guarded(uuid, text, integer, text, text, text, text, text, jsonb, jsonb)",
+        "public.save_checkpoint_guarded(uuid, text, integer, text, text, text, text, jsonb, jsonb, jsonb, jsonb, jsonb)",
+        "public.upsert_run_blackboard_guarded(uuid, text, integer, text, jsonb)",
+        "public.create_agent_message_guarded(uuid, text, integer, text, jsonb)",
+        "public.create_supervisor_decision_guarded(uuid, text, integer, text, jsonb)",
+        "public.reserve_model_call_budget_guarded(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, integer, text, text, text)",
+        "public.settle_model_call_budget_guarded(uuid, numeric, uuid, text, integer, text, text, text)",
+    ]:
+        assert not _has_execute(db, "anon", signature), signature
+        assert not _has_execute(db, "authenticated", signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+
+
+def test_lease_guard_migration_is_rerun_safe(db):
+    migration = next(m for m in MIGRATIONS if "lease_guarded_worker_writes" in m.name)
+    db.psql(file=migration)
+    db.psql(file=migration)
+    assert db.psql("select count(*) from pg_proc where proname='assert_worker_lease'") == "1"

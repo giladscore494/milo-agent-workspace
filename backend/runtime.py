@@ -98,10 +98,18 @@ class InMemoryEventSink:
         return event
 
 class SupabaseEventSink:
-    def __init__(self, repo: Any) -> None:
+    def __init__(self, repo: Any, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> None:
         self.repo = repo
+        # Worker sinks carry the active lease so every event append is
+        # rejected atomically once the lease is reclaimed.
+        self.worker_id = worker_id
+        self.attempt = attempt
+        self.lease_token = lease_token
     def emit(self, event: RunEventRecord) -> RunEventRecord:
-        self.repo.append_run_event(event.run_id, event.type, event.as_payload())
+        if self.worker_id is not None:
+            self.repo.append_run_event(event.run_id, event.type, event.as_payload(), worker_id=self.worker_id, attempt=self.attempt, lease_token=self.lease_token)
+        else:
+            self.repo.append_run_event(event.run_id, event.type, event.as_payload())
         return event
 
 @dataclass

@@ -314,18 +314,18 @@ def test_worker_refuses_paid_execution_without_mandatory_budget(monkeypatch):
         def get_run(self, run_id, user_id=None):
             return dict(self.run)
 
-        def append_run_event(self, run_id, event_type, payload):
+        def append_run_event(self, run_id, event_type, payload, worker_id=None, attempt=None, lease_token=None):
             self.events.append(event_type)
             return {"id": 1}
 
-        def mark_run_failed(self, run_id, code, message):
+        def mark_run_failed(self, run_id, code, message, worker_id=None, attempt=None, lease_token=None):
             self.failed.append(code)
             return dict(self.run, status="failed")
 
         def latest_checkpoint(self, run_id, workflow_key=None):
             return None
 
-        def mark_run_complete(self, run_id, output):
+        def mark_run_complete(self, run_id, output, worker_id=None, attempt=None, lease_token=None):
             raise AssertionError("must not complete")
 
     monkeypatch.setenv("MILO_ENABLE_PAID_EXECUTION", "true")
@@ -485,10 +485,10 @@ def test_worker_refuses_paid_execution_without_provider_key(monkeypatch):
         def get_run(self, run_id, user_id=None):
             return dict(self.run)
 
-        def append_run_event(self, run_id, event_type, payload):
+        def append_run_event(self, run_id, event_type, payload, worker_id=None, attempt=None, lease_token=None):
             return {"id": 1}
 
-        def mark_run_failed(self, run_id, code, message, worker_id=None):
+        def mark_run_failed(self, run_id, code, message, worker_id=None, attempt=None, lease_token=None):
             self.failed.append(code)
             return dict(self.run, status="failed")
 

@@ -45,16 +45,28 @@ Revocation: remove the identity from `MILO_APPROVED_GATEWAY_IDENTITIES`
 account's `roles/run.invoker` binding and the workload-identity-pool
 provider (infrastructure layer).
 
-## Worker → API internal routes — `COMPLETED_IN_CODE`
+## Worker mutation path and worker-facing API routes — `COMPLETED_IN_CODE`
 
-The worker job presents a Google OIDC identity token (minted by the
-metadata server, no key file) as `X-Milo-Worker-Token` with audience
+The canonical worker mutation path is **worker → Supabase directly** with
+the server-only service-role key (`backend/worker/main.py`,
+`backend/repository/supabase.py`): the worker claims a lease and then
+performs every durable write — status transitions, heartbeats, events,
+checkpoints, usage, shadow-supervisor rows and budget
+reservations/settlements — under that lease. Each write is validated
+against (run id, worker id, attempt, lease token, unexpired lease)
+atomically in the database (migrations `012` and `20260810000300`), so a
+stale or superseded worker is rejected at the database boundary, not by
+an application-side read-then-write check.
+
+Separately, the API's `/internal/*` routes are a worker-facing surface:
+callers present a Google OIDC identity token (minted by the metadata
+server, no key file) as `X-Milo-Worker-Token` with audience
 `MILO_WORKER_AUDIENCE`; the API verifies signature, issuer, audience,
 expiry and allowlist membership (`MILO_APPROVED_WORKER_IDENTITIES`,
 empty ⇒ fail closed) — `backend/worker_auth.py`. Browser Supabase tokens
-can never pass (wrong signer). Additionally every worker mutation must
-carry the active lease (worker id + attempt + lease token); stale workers
-are rejected (`backend/repository/supabase.py`, migration `012`).
+can never pass (wrong signer). The shipping worker does not use these
+routes for its mutations; they remain OIDC-guarded so that no
+identity-less path onto worker semantics exists through the API.
 
 Identity separation is validated at startup: an identity approved for both
 gateway and worker roles is a configuration error
