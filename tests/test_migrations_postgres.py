@@ -1592,3 +1592,22 @@ def test_every_http_facing_rpc_returns_a_set(db):
             f"select bool_and(proretset) from pg_proc p join pg_namespace n on n.oid = p.pronamespace "
             f"where n.nspname='public' and p.proname='{name}'"
         ) == "t", f"{name} must return SETOF for PostgREST client compatibility"
+
+
+def test_ledger_accepts_every_code_written_decision(db):
+    """BudgetTracker writes decisions reserved/settled/rejected/overage/
+    released; the ledger constraint must accept all five (a live staging
+    overage crashed on the pre-20260810000500 constraint) and still reject
+    unknown values."""
+    run_id = db.psql(
+        "insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+    )
+    for seq, decision in enumerate(["reserved", "settled", "rejected", "overage", "released"], start=900):
+        db.psql(
+            f"insert into public.run_usage_ledger (run_id, call_seq, decision) values ('{run_id}', {seq}, '{decision}')"
+        )
+    with pytest.raises(AssertionError, match="run_usage_ledger_decision_check"):
+        db.psql(
+            f"insert into public.run_usage_ledger (run_id, call_seq, decision) values ('{run_id}', 999, 'bogus')"
+        )
