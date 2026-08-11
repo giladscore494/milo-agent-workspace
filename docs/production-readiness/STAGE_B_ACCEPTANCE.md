@@ -9,19 +9,19 @@ throughout; its worker execution count was zero before and after.
 
 ## Overall status
 
-**PASS_PENDING_OPERATOR_E2E.** Every Stage B invariant that can be
-proven without Cloud Run IAM mutation is proven, but the end-to-end
-API-driven launch path (real API → launcher → Cloud Run Job execution)
-has NOT run live: the three staging IAM bindings listed under "Evidence
-notes" are operator-only, and until they exist the deployed staging API
-is reachable by no identity. The service-to-service identity matrix ran
-against the real API application with real Google-signed OIDC tokens
-minted by the real gateway/worker service accounts (10/10 checks PASS)
-via disposable app-layer instances; worker lifecycle evidence used
-directly-triggered job executions, not API-driven launches. Stage B
-completes when the operator applies the three bindings and the
-API-driven happy-path E2E succeeds. Production follow-up before Stage C:
-migrations `20260810000100`–`000600`.
+**PASS.** The operator applied the three staging Cloud Run IAM bindings
+(verified read-only via `get-iam-policy` on 2026-08-11), and the real
+end-to-end API-driven launch path then ran live and passed: a Cloud Run
+job running as `milo-gateway-staging@` minted a real Google-signed OIDC
+token for the deployed private API and drove the full path — `POST
+/conversations/{id}/runs` (HTTP 202) → launcher (`cloud_run_job` mode,
+`roles/run.jobsExecutorWithOverrides`) → worker job execution
+`milo-agent-worker-staging-zth8n` → run `c7412f33…` `queued → running →
+completed` with 12 lifecycle events, 3/3 reservations settled through
+the attempt-aware guarded path, a DB-clock heartbeat row, and an
+idempotent replay (same key → HTTP 202, same run id). See "Live
+API-driven E2E". Production follow-up before Stage C: migrations
+`20260810000100`–`000600`.
 
 ## Acceptance table
 
@@ -53,7 +53,7 @@ migrations `20260810000100`–`000600`.
 | Reconciliation tooling verified | PASS | script list mode run locally (read-only, MANUAL without a DB URL); its exact listing query and guarded resolution CTEs executed against staging |
 | Staging cannot reference production | PASS | deployer hard-fails on the production project id; deployed env/images/SAs/secret refs enumerated — all staging-scoped; Supabase URL is the staging ref |
 | Relevant tests green | PASS | 688 backend tests (596 unit + 92 PostgreSQL migration, zero skips); frontend 60 unit + secret/static checks + build + 15 isolated E2E; checkers (migrations/secret/unsafe-default) pass; shellcheck clean |
-| API-driven launch E2E (API → launcher → Cloud Run Job) | PENDING (operator) | blocked on the three Cloud Run IAM bindings; all sub-components proven separately (identity matrix, launcher unit/contract tests, direct job executions) |
+| API-driven launch E2E (API → launcher → Cloud Run Job) | PASS | live 2026-08-11 after operator IAM bindings: gateway-identity `POST /conversations/{id}/runs` 202 → execution `milo-agent-worker-staging-zth8n` → run `c7412f33…` completed; idempotent replay returned the same run; probe exit 0 |
 
 ## Live-testing discoveries fixed during Stage B
 
@@ -101,7 +101,10 @@ status change to PASS_PENDING_OPERATOR_E2E.
    (`test_db_clock_decides_lease_expiry_for_every_guarded_run_write`).
 3. **Acceptance status (this document):** changed from unconditional PASS
    to **PASS_PENDING_OPERATOR_E2E** — the real API→launcher→Cloud Run Job
-   path has not run live (blocked on the operator IAM bindings).
+   path had not run live (blocked on the operator IAM bindings). Resolved
+   on 2026-08-11: the operator applied the bindings and the live
+   API-driven E2E passed (see "Live API-driven E2E"), returning the
+   overall status to **PASS**.
 4. **Staging dependency isolation (fixed):** `ENVIRONMENT=staging` now
    fail-closes at startup unless `MILO_EXPECTED_SUPABASE_PROJECT_REF` and
    `MILO_EXPECTED_REDIS_HOST` are set and match the configured
@@ -131,6 +134,42 @@ entirely through the new DB-clock guarded RPCs: terminal transition via
 and 3/3 attempt-1 reservations settled through the attempt-aware
 reserve/settle path with zero dangling reservations.
 
+## Live API-driven E2E (2026-08-11, after operator IAM bindings)
+
+Precondition: all three Cloud Run IAM bindings verified read-only via
+`get-iam-policy` (worker job: `roles/run.jobsExecutorWithOverrides` for
+`milo-api-staging@` only; API service: `roles/run.invoker` for
+`milo-gateway-staging@` and `milo-worker-staging@` only).
+
+A disposable Cloud Run job (`python:3.12-slim`, deleted after the run)
+executed AS `milo-gateway-staging@`, minted a real Google-signed OIDC
+token (audience = the deployed API URL) from the metadata server, and
+drove the deployed private staging API end to end:
+
+1. `GET /health` → 200 (Cloud Run ingress admitted the gateway identity;
+   app accepted the gateway token).
+2. `POST /conversations/24022382…/runs` with
+   `metadata.mock_scenario=happy` and idempotency key
+   `e2e-api-launch-9f9ab9a-1` → **202**, run
+   `c7412f33-f1a5-48d9-afe3-72b638b0bbc8`, `launch_state=launched`.
+3. The API's launcher (running as `milo-api-staging@`, `cloud_run_job`
+   mode) created worker execution **`milo-agent-worker-staging-zth8n`**
+   with `RUN_ID` container overrides — the `run_invocations` row records
+   the launch operation at the same second the execution was created.
+4. Polled through the API: `queued → running → completed`; final usage
+   `actual_cost=0.003` (3 mock calls), 12 lifecycle events
+   (`run_created … run_completed`), 3/3 reservations settled through the
+   attempt-aware guarded path, one DB-clock heartbeat row, zero dangling
+   reservations.
+5. Idempotent replay of the same `POST` → 202 with the SAME run id
+   (`created=false` path), after completion.
+6. Probe summary `E2E SUMMARY: PASS … final=completed`, container
+   exit 0; execution succeeded (`succeededCount=1`).
+
+Zero-cost invariants held throughout: `MILO_WORKER_ENGINE=mock`,
+`MILO_ENABLE_PAID_EXECUTION=false`, no provider credential exists in the
+staging project, and production was not touched.
+
 ## Evidence notes and residual items
 
 - **Identity matrix evidence (AUTHMX, 10/10 PASS):** a disposable
@@ -144,10 +183,10 @@ reserve/settle path with zero dangling reservations.
   cannot-act-as-gateway 403, browser JWT 401. Both identities also
   probed the deployed private API and were rejected 403 at the Cloud Run
   ingress (private, no invoker bound).
-- **Cloud Run IAM bindings (operator, before API-driven E2E/Stage C):**
-  the automation tooling cannot mutate IAM policies, so three bindings
-  remain for the operator; until then the deployed staging API is
-  reachable by no identity (fail-closed):
+- **Cloud Run IAM bindings — APPLIED (2026-08-11):** the automation
+  tooling cannot mutate IAM policies, so the operator applied the three
+  bindings; they were then independently verified read-only via
+  `get-iam-policy`:
   1. `roles/run.jobsExecutorWithOverrides` on `milo-agent-worker-staging`
      for `milo-api-staging@…` (API→worker launch);
   2. `roles/run.invoker` on `milo-agent-api-staging` for
