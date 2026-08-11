@@ -35,6 +35,7 @@ production.
 | ts | `20260810000300_lease_guarded_worker_writes.sql` | assert_worker_lease + lease-guarded RPCs for every worker durable write |
 | ts | `20260810000400_setof_rpc_returns.sql` | SETOF `_v2` wrappers for historical RPCs (PostgREST client compatibility) |
 | ts | `20260810000500_ledger_decision_overage.sql` | run_usage_ledger decision check widened to overage/released |
+| ts | `20260810000600_corrective_lease_and_attempt_hardening.sql` | attempt-aware reservation identity (run_id, attempt, call_seq); cross-run-safe guarded settle; DB-clock guarded usage/heartbeat/worker-transition RPCs |
 
 All migrations are additive, idempotent and data-preserving. There are no
 destructive down-migrations, by policy (`scripts/check_migrations.py`
