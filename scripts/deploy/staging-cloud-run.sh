@@ -31,6 +31,9 @@ WORKER_SERVICE_ACCOUNT=${STAGING_WORKER_SERVICE_ACCOUNT:-milo-worker-staging@${P
 GATEWAY_SERVICE_ACCOUNT=${STAGING_GATEWAY_SERVICE_ACCOUNT:-milo-gateway-staging@${PROJECT_ID}.iam.gserviceaccount.com}
 DEPLOY_MODE=${DEPLOY_MODE:-check}
 STAGING_SUPABASE_PROJECT_REF=${STAGING_SUPABASE_PROJECT_REF:-cxlwavxvwgrfikkudtzf}
+STAGING_REDIS_SERVICE=${STAGING_REDIS_SERVICE:-milo-redis-shim-staging}
+# Resolved in apply mode from the deployed shim service; may be pre-set.
+STAGING_REDIS_HOST=${STAGING_REDIS_HOST:-}
 
 RELEASE_SHA=$(git rev-parse HEAD)
 API_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/$MILO_API_IMAGE_REPO:$RELEASE_SHA"
@@ -195,6 +198,22 @@ main() {
     grant_secret_access "$secret" "$WORKER_SERVICE_ACCOUNT"
   done
 
+  # Runtime dependency pins (fail-closed in backend/production_config.py):
+  # the staging runtime refuses to start against any Supabase project or
+  # Redis endpoint other than the ones pinned here.
+  if [[ -z "$STAGING_REDIS_HOST" ]]; then
+    redis_url=$(gcloud run services describe "$STAGING_REDIS_SERVICE" --project "$PROJECT_ID" --region "$REGION" --format "value(status.url)") \
+      || fail "cannot resolve the staging Redis service '$STAGING_REDIS_SERVICE'; deploy it first or set STAGING_REDIS_HOST"
+    STAGING_REDIS_HOST="${redis_url#https://}"
+    [[ -n "$STAGING_REDIS_HOST" ]] || fail "staging Redis host resolution returned empty"
+  fi
+  [[ "$STAGING_REDIS_HOST" != *"upstash.io"* || -n "${STAGING_ALLOW_UPSTASH:-}" ]] \
+    || fail "STAGING_REDIS_HOST resolves to an Upstash endpoint; set STAGING_ALLOW_UPSTASH=1 only for a dedicated STAGING Upstash database, never the production one"
+  DEPENDENCY_PINS=(
+    "MILO_EXPECTED_SUPABASE_PROJECT_REF=$STAGING_SUPABASE_PROJECT_REF"
+    "MILO_EXPECTED_REDIS_HOST=$STAGING_REDIS_HOST"
+  )
+
   gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --config scripts/deploy/cloudbuild-worker.yaml --substitutions "_WORKER_IMAGE=$WORKER_IMAGE" .
   gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --config scripts/deploy/cloudbuild-api.yaml --substitutions "_API_IMAGE=$API_IMAGE" .
 
@@ -202,13 +221,13 @@ main() {
   if gcloud run jobs describe "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" >/dev/null 2>&1; then
     gcloud run jobs update "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" \
       --image "$WORKER_IMAGE" --service-account "$WORKER_SERVICE_ACCOUNT" \
-      --update-env-vars "$(delimited_env_arg "${WORKER_ENV_VARS[@]}")" \
+      --update-env-vars "$(delimited_env_arg "${WORKER_ENV_VARS[@]}" "${DEPENDENCY_PINS[@]}")" \
       --update-secrets "$(delimited_env_arg "${WORKER_SECRETS[@]}")" \
       --cpu 1 --memory 1Gi --task-timeout 900 --max-retries 1 --parallelism 1 --tasks 1
   else
     gcloud run jobs create "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" \
       --image "$WORKER_IMAGE" --service-account "$WORKER_SERVICE_ACCOUNT" \
-      --set-env-vars "$(delimited_env_arg "${WORKER_ENV_VARS[@]}")" \
+      --set-env-vars "$(delimited_env_arg "${WORKER_ENV_VARS[@]}" "${DEPENDENCY_PINS[@]}")" \
       --set-secrets "$(delimited_env_arg "${WORKER_SECRETS[@]}")" \
       --cpu 1 --memory 1Gi --task-timeout 900 --max-retries 1 --parallelism 1 --tasks 1
   fi
@@ -223,13 +242,13 @@ main() {
   if gcloud run services describe "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" >/dev/null 2>&1; then
     gcloud run deploy "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" \
       --image "$API_IMAGE" --service-account "$API_SERVICE_ACCOUNT" --no-allow-unauthenticated \
-      --update-env-vars "$(delimited_env_arg "${API_ENV_VARS[@]}")" \
+      --update-env-vars "$(delimited_env_arg "${API_ENV_VARS[@]}" "${DEPENDENCY_PINS[@]}")" \
       --update-secrets "$(delimited_env_arg "${API_SECRETS[@]}")" \
       --port 8080 --cpu 1 --memory 1Gi --timeout 300 --max-instances 3
   else
     gcloud run deploy "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" \
       --image "$API_IMAGE" --service-account "$API_SERVICE_ACCOUNT" --no-allow-unauthenticated \
-      --set-env-vars "$(delimited_env_arg "${API_ENV_VARS[@]}")" \
+      --set-env-vars "$(delimited_env_arg "${API_ENV_VARS[@]}" "${DEPENDENCY_PINS[@]}")" \
       --set-secrets "$(delimited_env_arg "${API_SECRETS[@]}")" \
       --port 8080 --cpu 1 --memory 1Gi --timeout 300 --max-instances 3
   fi

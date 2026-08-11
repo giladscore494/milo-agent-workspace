@@ -148,6 +148,29 @@ def validate(env: dict[str, str] | None = None) -> ConfigReport:
         if (env.get("MILO_WORKER_ENGINE") or "").strip():
             error("TEST_ADAPTER_IN_PRODUCTION", "MILO_WORKER_ENGINE selects a non-production engine (e.g. the zero-cost mock) and is forbidden in production")
 
+    # 5e. Staging must be pinned to its declared dependencies (fail closed):
+    # a staging deployment must never be able to silently point at the
+    # production Supabase or Redis environment. Values are never echoed.
+    if (env.get("ENVIRONMENT") or "").strip().lower() == "staging":
+        from urllib.parse import urlparse
+
+        expected_ref = (env.get("MILO_EXPECTED_SUPABASE_PROJECT_REF") or "").strip()
+        supabase_url = (env.get("SUPABASE_URL") or "").strip()
+        if not expected_ref:
+            error("STAGING_DEPENDENCY_UNPINNED", "ENVIRONMENT=staging requires MILO_EXPECTED_SUPABASE_PROJECT_REF so the runtime refuses any non-staging Supabase project")
+        elif supabase_url:
+            host = (urlparse(supabase_url).hostname or "").lower()
+            if host != f"{expected_ref.lower()}.supabase.co":
+                error("STAGING_DEPENDENCY_MISMATCH", "SUPABASE_URL does not match the expected staging Supabase project ref (values not shown)")
+        expected_redis_host = (env.get("MILO_EXPECTED_REDIS_HOST") or "").strip().lower()
+        redis_url = (env.get("UPSTASH_REDIS_REST_URL") or "").strip()
+        if not expected_redis_host:
+            error("STAGING_DEPENDENCY_UNPINNED", "ENVIRONMENT=staging requires MILO_EXPECTED_REDIS_HOST so the runtime refuses any non-staging Redis endpoint")
+        elif redis_url:
+            host = (urlparse(redis_url).hostname or "").lower()
+            if host != expected_redis_host:
+                error("STAGING_DEPENDENCY_MISMATCH", "UPSTASH_REDIS_REST_URL host does not match the expected staging Redis host (values not shown)")
+
     # 6. Public execution UI cannot imply backend run creation.
     public_ui = _flag(env, "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI")
     if public_ui and not execution_enabled:
@@ -176,9 +199,13 @@ def validate_production_config(env: dict[str, str] | None = None, on_error: Call
     """Validate and fail closed in production when errors are present."""
     env = dict(os.environ if env is None else env)
     report = validate(env)
-    if not report.ok() and _is_production(env):
+    environment = (env.get("ENVIRONMENT") or "").strip().lower()
+    # Production always fails closed on any error. Staging additionally
+    # fails closed so a misconfigured staging deployment (e.g. pointed at a
+    # non-staging Supabase or Redis dependency) never starts.
+    if not report.ok() and (_is_production(env) or environment == "staging"):
         summary = "; ".join(f"{i.code}: {i.message}" for i in report.errors)
-        message = f"production configuration validation failed: {summary}"
+        message = f"{environment or 'production'} configuration validation failed: {summary}"
         if on_error is not None:
             on_error(message)
         raise RuntimeError(message)

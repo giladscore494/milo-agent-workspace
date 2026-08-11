@@ -199,22 +199,22 @@ class SupabaseRepository:
         return len(rows)
 
     def update_run_usage(self, run_id: UUID, usage: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
-        query = self.client.table("runs").update({"usage": usage}).eq("id", str(run_id))
         if worker_id is not None:
-            # Atomic lease predicate: a stale worker's usage snapshot matches
-            # zero rows instead of clobbering the live worker's accounting.
-            query = query.eq("worker_id", worker_id).gt("lease_expires_at", datetime.now(UTC).isoformat())
-            if attempt is not None:
-                query = query.eq("attempt", attempt)
-            if lease_token is not None:
-                query = query.eq("lease_token", lease_token)
+            # Worker-originated usage snapshot: lease validity (including
+            # expiry) is decided by the DATABASE clock inside the guarded
+            # RPC; a stale worker cannot clobber the live worker's accounting.
+            return self._guarded_rpc("update_run_usage_guarded", {
+                "p_run_id": str(run_id),
+                "p_worker_id": worker_id,
+                "p_attempt": attempt,
+                "p_lease_token": lease_token,
+                "p_usage": usage,
+            }, "run")
         try:
-            rows = query.select("*").execute().data or []
+            rows = self.client.table("runs").update({"usage": usage}).eq("id", str(run_id)).select("*").execute().data or []
         except Exception as exc:
             raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
         if not rows:
-            if worker_id is not None:
-                raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409)
             raise NotFoundError("run", str(run_id))
         return rows[0]
 
@@ -404,6 +404,8 @@ class SupabaseRepository:
         rows = self._many(query)
         return rows[0] if rows else None
 
+    WORKER_TRANSITION_FIELDS = {"output", "error", "usage", "started_at", "finished_at"}
+
     def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
         current = str(self.get_run(run_id).get("status", ""))
         # Same-status updates (heartbeats, metadata refresh) are no-op
@@ -415,6 +417,27 @@ class SupabaseRepository:
                 validate_transition(current, status)
             except InvalidTransition as exc:
                 raise AppError("INVALID_RUN_TRANSITION", str(exc), 409) from exc
+        if expected_worker_id is not None:
+            # Worker-originated transition: lease validity (including expiry)
+            # is decided by the DATABASE clock inside the guarded RPC, never
+            # by this container's clock.
+            unsupported = set(fields) - self.WORKER_TRANSITION_FIELDS
+            if unsupported:
+                raise AppError("REPOSITORY_ERROR", f"unsupported worker transition fields: {sorted(unsupported)}", 502)
+            return self._guarded_rpc("transition_run_worker_guarded", {
+                "p_run_id": str(run_id),
+                "p_status": status,
+                "p_expected_status": current if transitioning else None,
+                "p_worker_id": expected_worker_id,
+                "p_attempt": expected_attempt,
+                "p_lease_token": expected_lease_token,
+                "p_output": fields.get("output"),
+                "p_error": fields.get("error"),
+                "p_clear_error": "error" in fields and fields["error"] is None,
+                "p_usage": fields.get("usage"),
+                "p_started_at": fields.get("started_at"),
+                "p_finished_at": fields.get("finished_at"),
+            }, "run")
         payload = {"status": status, **fields}
         query = self.client.table("runs").update(payload).eq("id", str(run_id))
         if transitioning:
@@ -422,15 +445,6 @@ class SupabaseRepository:
             # (e.g. a newer worker writing a terminal result) makes this
             # update match zero rows instead of silently overwriting it.
             query = query.eq("status", current)
-        if expected_worker_id is not None:
-            # Stale workers whose lease was reclaimed cannot overwrite the
-            # newer holder's state. Lease expiry is part of ownership.
-            query = query.eq("worker_id", expected_worker_id)
-            query = query.gt("lease_expires_at", datetime.now(UTC).isoformat())
-        if expected_attempt is not None:
-            query = query.eq("attempt", expected_attempt)
-        if expected_lease_token is not None:
-            query = query.eq("lease_token", expected_lease_token)
         try:
             rows = query.select("*").execute().data or []
         except Exception as exc:
@@ -457,24 +471,16 @@ class SupabaseRepository:
         return rows[0] if isinstance(rows, list) else rows
 
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
-        now = datetime.now(UTC)
-        expires = (now + timedelta(seconds=lease_seconds)).isoformat()
-        # Atomic ownership check: the lease only extends when this worker
-        # still holds it.
-        try:
-            query = self.client.table("runs").update({"last_heartbeat_at": now.isoformat(), "lease_expires_at": expires}).eq("id", str(run_id)).eq("worker_id", worker_id).gt("lease_expires_at", now.isoformat()).in_("status", ["starting", "running", "cancellation_requested"])
-            if attempt is not None:
-                query = query.eq("attempt", attempt)
-            if lease_token is not None:
-                query = query.eq("lease_token", lease_token)
-            rows = query.select("*").execute().data or []
-        except Exception as exc:
-            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
-        if not rows:
-            raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409)
-        run = rows[0]
-        self.client.table("worker_heartbeats").insert({"run_id": str(run_id), "worker_id": worker_id, "attempt": run.get("attempt", 1), "heartbeat_at": now.isoformat(), "lease_expires_at": expires}).execute()
-        return run
+        # Atomic ownership check with DATABASE-clock expiry: the lease only
+        # extends when this worker still holds it according to PostgreSQL
+        # now(); a skewed container clock cannot revive an expired lease.
+        return self._guarded_rpc("heartbeat_run_guarded", {
+            "p_run_id": str(run_id),
+            "p_worker_id": worker_id,
+            "p_attempt": attempt,
+            "p_lease_token": lease_token,
+            "p_lease_seconds": int(lease_seconds),
+        }, "run")
 
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]:
         return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=datetime.now(UTC).isoformat(), cancellation_reason=reason)

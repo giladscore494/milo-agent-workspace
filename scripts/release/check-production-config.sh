@@ -116,6 +116,8 @@ INVENTORY=(
   "CLOUD_RUN_AUTH_MODE|local-test-only|no|frontend/lib/server/cloudRunAuth.ts"
   "MILO_E2E_INPROCESS_WORKER|local-test-only|no|backend/production_config.py"
   "MILO_WORKER_ENGINE|local-test-only|no|backend/production_config.py"
+  "MILO_EXPECTED_SUPABASE_PROJECT_REF|staging-only|no|backend/production_config.py"
+  "MILO_EXPECTED_REDIS_HOST|staging-only|no|backend/production_config.py"
   "MILO_REQUIRE_PG_TESTS|local-test-only|no|tests/test_migrations_postgres.py"
   "NEXT_PUBLIC_API_URL|deprecated|no|.github/workflows/ci.yml"
 )

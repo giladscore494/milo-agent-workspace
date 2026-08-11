@@ -361,6 +361,10 @@ class MemoryRepository:
                 self._assert_active_lease(run, worker_id, attempt, lease_token)
             for row in getattr(self, "usage_ledger", []):
                 if str(row.get("id")) == str(reservation_id):
+                    # A lease for one run must never settle another run's
+                    # reservation (parity with settle_model_call_budget_guarded).
+                    if run_id is not None and str(row.get("run_id")) != str(run_id):
+                        raise AppError("RESERVATION_RUN_MISMATCH", "reservation does not belong to this run", 409)
                     if row.get("settled"):
                         raise AppError("BUDGET_RESERVATION_SETTLED", "reservation already settled", 409)
                     row["settled"] = True

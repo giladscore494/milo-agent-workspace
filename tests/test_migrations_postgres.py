@@ -1611,3 +1611,124 @@ def test_ledger_accepts_every_code_written_decision(db):
         db.psql(
             f"insert into public.run_usage_ledger (run_id, call_seq, decision) values ('{run_id}', 999, 'bogus')"
         )
+
+
+# --- migration 20260810000600 (corrective lease/attempt hardening) ---
+
+def test_settle_guard_rejects_cross_run_reservation(db):
+    """A valid worker lease for run A must NEVER settle a reservation
+    belonging to run B; B's reservation stays byte-for-byte unchanged."""
+    run_a = _seed_stale_worker_run(db)
+    run_b = _seed_stale_worker_run(db)
+    row_a = db.psql(f"select attempt, lease_token from public.claim_run_lease('{run_a}', 'worker-XA', 300)")
+    attempt_a, token_a = row_a.split("|")
+    row_b = db.psql(f"select attempt, lease_token from public.claim_run_lease('{run_b}', 'worker-XB', 300)")
+    attempt_b, token_b = row_b.split("|")
+    reservation_b = db.psql(
+        f"select id from public.reserve_model_call_budget_guarded('{run_b}', 7, null, null, 0.01, null, null, 'worker-XB', {attempt_b}, '{token_b}')"
+    )
+    before = db.psql(f"select status || '|' || coalesce(actual_cost::text,'') || '|' || coalesce(settled_at::text,'') from public.model_call_budget_reservations where id='{reservation_b}'")
+    # Worker A holds a perfectly valid lease for run A — and must be rejected.
+    with pytest.raises(AssertionError, match="RESERVATION_RUN_MISMATCH_OR_SETTLED"):
+        db.psql(f"select public.settle_model_call_budget_guarded('{reservation_b}', 0.005, '{run_a}', 'worker-XA', {attempt_a}, '{token_a}')")
+    after = db.psql(f"select status || '|' || coalesce(actual_cost::text,'') || '|' || coalesce(settled_at::text,'') from public.model_call_budget_reservations where id='{reservation_b}'")
+    assert before == after == "reserved||"
+    # The rightful owner can still settle it.
+    assert db.psql(
+        f"select status from public.settle_model_call_budget_guarded('{reservation_b}', 0.005, '{run_b}', 'worker-XB', {attempt_b}, '{token_b}')"
+    ) == "settled"
+
+
+def test_db_clock_decides_lease_expiry_for_every_guarded_run_write(db):
+    """Clock skew must not matter: once the DATABASE considers the lease
+    expired, usage/heartbeat/terminal-transition writes with the correct
+    (worker_id, attempt, lease_token) tuple are rejected — there is no
+    application timestamp anywhere in these predicates."""
+    run_id = _seed_stale_worker_run(db)
+    row = db.psql(f"select attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-CLK', 300)")
+    attempt, token = row.split("|")
+    lease = f"'{run_id}', 'worker-CLK', {attempt}, '{token}'"
+    # While DB-current, all three writes succeed.
+    assert db.psql(f"select id from public.update_run_usage_guarded({lease}, '{{\"calls\": 1}}'::jsonb)").strip()
+    assert db.psql(f"select id from public.heartbeat_run_guarded({lease}, 300)").strip()
+    assert db.psql(
+        f"select status from public.transition_run_worker_guarded('{run_id}', 'running', 'starting', 'worker-CLK', {attempt}, '{token}')"
+    ) == "running"
+    # DB-expire the lease; the tuple is still 'correct' from the worker's view.
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '1 second' where id='{run_id}'")
+    for sql in [
+        f"select public.update_run_usage_guarded({lease}, '{{\"stale\": true}}'::jsonb)",
+        f"select public.heartbeat_run_guarded({lease}, 300)",
+        f"select public.transition_run_worker_guarded('{run_id}', 'completed', 'running', 'worker-CLK', {attempt}, '{token}', null, null, true, null, null, now())",
+    ]:
+        with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+            db.psql(sql)
+    assert db.psql(f"select status from public.runs where id='{run_id}'") == "running"
+
+
+def test_heartbeat_guarded_extends_lease_and_records_heartbeat_row(db):
+    run_id = _seed_stale_worker_run(db)
+    row = db.psql(f"select attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-HB', 60)")
+    attempt, token = row.split("|")
+    before = db.psql(f"select lease_expires_at from public.runs where id='{run_id}'")
+    extended = db.psql(f"select lease_expires_at from public.heartbeat_run_guarded('{run_id}', 'worker-HB', {attempt}, '{token}', 600)")
+    assert extended > before
+    assert db.psql(
+        f"select count(*) from public.worker_heartbeats where run_id='{run_id}' and worker_id='worker-HB'"
+    ) == "1"
+
+
+def test_attempt_aware_reservations_do_not_collide_and_stay_counted(db):
+    """A reclaimed attempt reserving the same call_seq creates a NEW
+    reservation row; the earlier attempt's possibly-spent reservation is
+    never mutated and keeps counting toward committed budget."""
+    user = "aaaaaaaa-0000-4000-8000-000000000077"
+    db.psql(f"insert into auth.users (id) values ('{user}') on conflict do nothing")
+    run_id = _seed_stale_worker_run(db)
+    row1 = db.psql(f"select attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-A1', 300)")
+    attempt1, token1 = row1.split("|")
+    r1 = db.psql(
+        f"select id from public.reserve_model_call_budget_guarded('{run_id}', 1, '{user}', null, 0.25, 10.0, null, 'worker-A1', {attempt1}, '{token1}')"
+    )
+    committed_1 = db.psql(f"select user_committed from public.model_call_budget_committed('{user}', null, (now() at time zone 'utc')::date)")
+    # Crash: lease expires; a new attempt reclaims and reuses call_seq 1.
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+    row2 = db.psql(f"select attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-A2', 300)")
+    attempt2, token2 = row2.split("|")
+    assert int(attempt2) == int(attempt1) + 1
+    r2 = db.psql(
+        f"select id from public.reserve_model_call_budget_guarded('{run_id}', 1, '{user}', null, 0.25, 10.0, null, 'worker-A2', {attempt2}, '{token2}')"
+    )
+    assert r2 and r2 != r1, "reclaimed attempt must get its own reservation row"
+    # Attempt 1's row is untouched and still counted (conservative: a
+    # possibly-spent provider call never disappears from accounting).
+    assert db.psql(f"select status || '|' || attempt::text from public.model_call_budget_reservations where id='{r1}'") == f"reserved|{attempt1}"
+    committed_2 = db.psql(f"select user_committed from public.model_call_budget_committed('{user}', null, (now() at time zone 'utc')::date)")
+    assert float(committed_2) == float(committed_1) + 0.25
+    # The new attempt settles ITS row; attempt 1's row still cannot be
+    # touched by attempt 2 (attempt binding in the settle guard).
+    assert db.psql(
+        f"select status from public.settle_model_call_budget_guarded('{r2}', 0.20, '{run_id}', 'worker-A2', {attempt2}, '{token2}')"
+    ) == "settled"
+    with pytest.raises(AssertionError, match="RESERVATION_RUN_MISMATCH_OR_SETTLED"):
+        db.psql(f"select public.settle_model_call_budget_guarded('{r1}', 0.20, '{run_id}', 'worker-A2', {attempt2}, '{token2}')")
+    assert db.psql(f"select status from public.model_call_budget_reservations where id='{r1}'") == "reserved"
+
+
+def test_corrective_migration_functions_are_service_path_only(db):
+    for signature in [
+        "public.reserve_model_call_budget_for_attempt(uuid, integer, integer, uuid, uuid, numeric, numeric, numeric, text, text)",
+        "public.update_run_usage_guarded(uuid, text, integer, text, jsonb)",
+        "public.heartbeat_run_guarded(uuid, text, integer, text, integer)",
+        "public.transition_run_worker_guarded(uuid, text, text, text, integer, text, jsonb, jsonb, boolean, jsonb, timestamptz, timestamptz)",
+    ]:
+        assert not _has_execute(db, "anon", signature), signature
+        assert not _has_execute(db, "authenticated", signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+
+
+def test_corrective_migration_is_rerun_safe(db):
+    migration = next(m for m in MIGRATIONS if "corrective_lease_and_attempt_hardening" in m.name)
+    db.psql(file=migration)
+    db.psql(file=migration)
+    assert db.psql("select count(*) from pg_proc where proname='transition_run_worker_guarded'") == "1"

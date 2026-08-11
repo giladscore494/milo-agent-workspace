@@ -214,55 +214,11 @@ begin
 end;
 $$;
 
--- Budget lifecycle with lease enforcement: a stale worker can neither
--- reserve nor settle. Delegates to the migration-015 SECURITY DEFINER
--- functions after the lease assertion inside the same transaction.
-drop function if exists public.reserve_model_call_budget_guarded(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, integer, text, text, text);
-create function public.reserve_model_call_budget_guarded(
-  p_run_id uuid,
-  p_call_seq integer,
-  p_user_id uuid,
-  p_project_id uuid,
-  p_estimated_cost numeric,
-  p_daily_user_limit numeric,
-  p_daily_project_limit numeric,
-  p_worker_id text,
-  p_attempt integer,
-  p_lease_token text,
-  p_provider text default 'moonshot',
-  p_model text default 'kimi'
-) returns setof public.model_call_budget_reservations
-language plpgsql
-as $$
-begin
-  perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
-  return next public.reserve_model_call_budget(
-    p_run_id, p_call_seq, p_user_id, p_project_id, p_estimated_cost,
-    p_daily_user_limit, p_daily_project_limit, p_provider, p_model
-  );
-  return;
-end;
-$$;
-
-drop function if exists public.settle_model_call_budget_guarded(uuid, numeric, uuid, text, integer, text, text, text);
-create function public.settle_model_call_budget_guarded(
-  p_reservation_id uuid,
-  p_actual_cost numeric,
-  p_run_id uuid,
-  p_worker_id text,
-  p_attempt integer,
-  p_lease_token text,
-  p_status text default 'settled',
-  p_rejection_reason text default null
-) returns setof public.model_call_budget_reservations
-language plpgsql
-as $$
-begin
-  perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
-  return next public.settle_model_call_budget(p_reservation_id, p_actual_cost, p_status, p_rejection_reason);
-  return;
-end;
-$$;
+-- Budget reservation/settlement lease guards live in
+-- 20260810000600_corrective_lease_and_attempt_hardening.sql, which owns
+-- reserve_model_call_budget_guarded / settle_model_call_budget_guarded with
+-- attempt-aware, run-bound semantics. They are deliberately NOT defined
+-- here so re-running this file can never revert them.
 
 -- Service-path only: revoke browser access, grant the trusted backend.
 do $$
@@ -275,9 +231,7 @@ begin
     'public.save_checkpoint_guarded(uuid, text, integer, text, text, text, text, jsonb, jsonb, jsonb, jsonb, jsonb)',
     'public.upsert_run_blackboard_guarded(uuid, text, integer, text, jsonb)',
     'public.create_agent_message_guarded(uuid, text, integer, text, jsonb)',
-    'public.create_supervisor_decision_guarded(uuid, text, integer, text, jsonb)',
-    'public.reserve_model_call_budget_guarded(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, integer, text, text, text)',
-    'public.settle_model_call_budget_guarded(uuid, numeric, uuid, text, integer, text, text, text)'
+    'public.create_supervisor_decision_guarded(uuid, text, integer, text, jsonb)'
   ]
   loop
     execute format('revoke execute on function %s from public', fn);
