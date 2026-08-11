@@ -133,8 +133,56 @@ def test_test_adapters_are_rejected_in_production():
     assert "TEST_ADAPTER_IN_PRODUCTION" in codes(report)
     report2 = validate({**BASE_PROD, "MILO_E2E_INPROCESS_WORKER": "true"})
     assert "TEST_ADAPTER_IN_PRODUCTION" in codes(report2)
+    report3 = validate({**BASE_PROD, "MILO_WORKER_ENGINE": "mock"})
+    assert "TEST_ADAPTER_IN_PRODUCTION" in codes(report3)
 
 
 def test_release_scripts_are_not_exempt_from_unsafe_default_scanning():
     text = Path(REPO / "scripts" / "check_unsafe_defaults.py").read_text()
     assert "scripts/release/" not in text.split("ALLOWED_PREFIXES")[1].split(")")[0]
+
+
+BASE_STAGING = {
+    "ENVIRONMENT": "staging",
+    "SUPABASE_URL": "https://cxlwavxvwgrfikkudtzf.supabase.co",
+    "UPSTASH_REDIS_REST_URL": "https://milo-redis-shim-staging-501121602031.us-central1.run.app",
+    "MILO_EXPECTED_SUPABASE_PROJECT_REF": "cxlwavxvwgrfikkudtzf",
+    "MILO_EXPECTED_REDIS_HOST": "milo-redis-shim-staging-501121602031.us-central1.run.app",
+}
+
+
+def test_staging_with_matching_dependency_pins_is_clean():
+    report = validate(BASE_STAGING)
+    assert not [i for i in report.errors if i.code.startswith("STAGING_")]
+
+
+def test_staging_without_dependency_pins_fails_closed():
+    env = {k: v for k, v in BASE_STAGING.items() if not k.startswith("MILO_EXPECTED_")}
+    report = validate(env)
+    assert [i for i in report.errors if i.code == "STAGING_DEPENDENCY_UNPINNED"]
+    with pytest.raises(RuntimeError, match="STAGING_DEPENDENCY_UNPINNED"):
+        validate_production_config(env)
+
+
+def test_staging_pointed_at_wrong_supabase_project_fails_closed():
+    env = {**BASE_STAGING, "SUPABASE_URL": "https://someotherproject.supabase.co"}
+    report = validate(env)
+    assert [i for i in report.errors if i.code == "STAGING_DEPENDENCY_MISMATCH"]
+    with pytest.raises(RuntimeError, match="STAGING_DEPENDENCY_MISMATCH") as excinfo:
+        validate_production_config(env)
+    # Fail-closed without echoing dependency values.
+    assert "someotherproject" not in str(excinfo.value)
+
+
+def test_staging_pointed_at_wrong_redis_host_fails_closed():
+    env = {**BASE_STAGING, "UPSTASH_REDIS_REST_URL": "https://prod-db.upstash.io"}
+    report = validate(env)
+    assert [i for i in report.errors if i.code == "STAGING_DEPENDENCY_MISMATCH"]
+    with pytest.raises(RuntimeError) as excinfo:
+        validate_production_config(env)
+    assert "prod-db" not in str(excinfo.value)
+
+
+def test_production_is_unaffected_by_staging_pins():
+    report = validate(BASE_PROD)
+    assert not [i for i in report.errors if i.code.startswith("STAGING_")]

@@ -115,6 +115,9 @@ INVENTORY=(
   "MILO_ALLOW_INSECURE_DEV_IDENTITY|local-test-only|no|backend/gateway_auth.py"
   "CLOUD_RUN_AUTH_MODE|local-test-only|no|frontend/lib/server/cloudRunAuth.ts"
   "MILO_E2E_INPROCESS_WORKER|local-test-only|no|backend/production_config.py"
+  "MILO_WORKER_ENGINE|local-test-only|no|backend/production_config.py"
+  "MILO_EXPECTED_SUPABASE_PROJECT_REF|staging-only|no|backend/production_config.py"
+  "MILO_EXPECTED_REDIS_HOST|staging-only|no|backend/production_config.py"
   "MILO_REQUIRE_PG_TESTS|local-test-only|no|tests/test_migrations_postgres.py"
   "NEXT_PUBLIC_API_URL|deprecated|no|.github/workflows/ci.yml"
 )
@@ -284,6 +287,10 @@ else
   inprocess="$(env_meta MILO_E2E_INPROCESS_WORKER M | tr '[:upper:]' '[:lower:]')"
   if [[ "${inprocess}" =~ ^(1|true|yes|on)$ ]]; then
     record_check BLOCKED "test-adapter:MILO_E2E_INPROCESS_WORKER" "test-only in-process worker is forbidden in production"
+  fi
+  worker_engine="$(env_meta MILO_WORKER_ENGINE M)"
+  if [[ -n "${worker_engine}" ]]; then
+    record_check BLOCKED "test-adapter:MILO_WORKER_ENGINE" "non-production worker engine selection (e.g. the zero-cost mock) is forbidden in production"
   fi
   record_check PASS "test-adapter" "no test adapter enabled"
 

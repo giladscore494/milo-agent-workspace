@@ -168,11 +168,15 @@ no long-lived Google key anywhere in the flow; do not introduce one.
 - **Identity used:** `<API_SERVICE_ACCOUNT_EMAIL>` (launcher).
 - **Source → destination:** API → Cloud Run Jobs Run API (job execution).
 - **Authentication mechanism:** the API's own runtime identity calls
-  `jobs.run` on exactly one job. The API cannot impersonate arbitrary
-  service accounts (no `serviceAccountUser` grants). The worker receives
-  the run ID as an argument/env override — never browser-supplied secrets.
-  Launch results are recorded via CAS; uncertain responses persist
-  `launch_unknown` and are never auto-relaunched.
+  `jobs.run` on exactly one job **with `containerOverrides`** (the run ID
+  travels as an env override — `backend/job_launcher.py`), so the binding
+  must be `roles/run.jobsExecutorWithOverrides`; plain `roles/run.invoker`
+  does not include `run.jobs.runWithOverrides` and the launch would fail
+  with 403. The API cannot impersonate arbitrary service accounts (no
+  `serviceAccountUser` grants). The worker receives the run ID as an env
+  override — never browser-supplied secrets. Launch results are recorded
+  via CAS; uncertain responses persist `launch_unknown` and are never
+  auto-relaunched.
 - **Variables:** API env: `JOB_LAUNCHER` (`disabled` until Stage B),
   `GCP_PROJECT_ID`, `GCP_REGION`, `CLOUD_RUN_WORKER_JOB`.
 - **Worker job creation template:** see step 5 of
@@ -181,12 +185,13 @@ no long-lived Google key anywhere in the flow; do not introduce one.
 
       gcloud run jobs add-iam-policy-binding <CLOUD_RUN_WORKER_JOB> \
         --region <GCP_REGION> --project <GCP_PROJECT_ID> \
-        --member serviceAccount:<API_SERVICE_ACCOUNT_EMAIL> --role roles/run.invoker
+        --member serviceAccount:<API_SERVICE_ACCOUNT_EMAIL> --role roles/run.jobsExecutorWithOverrides
 
 - **Read-only verification:**
 
       gcloud run jobs get-iam-policy <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION>
-      # expect: only the API SA; no allUsers; not the gateway identity.
+      # expect: only the API SA with roles/run.jobsExecutorWithOverrides;
+      # no allUsers; not the gateway identity.
 
 - **Negative authorization test:** attempt `gcloud run jobs run` while
   authenticated as the gateway identity or a browser-derived credential —

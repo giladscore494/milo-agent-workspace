@@ -37,11 +37,20 @@ stripped from browser responses.
 `claim_run_lease` (migration `012`) atomically assigns worker id, attempt
 and a fresh `lease_token` nonce, setting `lease_expires_at`. A heartbeat
 thread extends the lease (`MILO_WORKER_LEASE_SECONDS`,
-`MILO_WORKER_HEARTBEAT_INTERVAL_SECONDS`); every worker mutation
-(heartbeat, transition, checkpoint, events, completion) must present the
-matching worker id + attempt + lease token, so a stale or superseded worker
-cannot mutate a reclaimed run. Lease loss short-circuits execution
-(`backend/worker/main.py`).
+`MILO_WORKER_HEARTBEAT_INTERVAL_SECONDS`). Every worker-originated
+durable write presents the matching worker id + attempt + lease token and
+is validated **atomically in the database**, not by an application-side
+read-then-write check: run transitions, heartbeats and usage snapshots
+via conditional `UPDATE` predicates (migration `012`,
+`backend/repository/supabase.py`), and event appends, checkpoints,
+blackboard upserts, agent messages, supervisor decisions and budget
+reservations/settlements via the lease-guarded RPCs of migration
+`20260810000300` (`assert_worker_lease` takes `FOR SHARE` on the runs row
+so a concurrent reclaim serializes against the write). A stale or
+superseded worker is rejected with `STALE_WORKER_WRITE`/zero-row updates
+on every one of these paths — proven end-to-end by
+`tests/test_migrations_postgres.py::test_stale_worker_full_scenario_every_mutation_rejected`.
+Lease loss also short-circuits execution (`backend/worker/main.py`).
 
 ## Checkpoints and events
 

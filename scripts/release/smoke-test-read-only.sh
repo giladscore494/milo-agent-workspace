@@ -139,8 +139,10 @@ else
 fi
 
 # 5. Worker-route rejection from a browser identity: the gateway policy
-# must refuse to proxy internal worker routes at all.
-expect "worker-route" POST "/internal/runs/00000000-0000-0000-0000-000000000000/heartbeat" "${USER_TOKEN_ENV}" "401,403,404" "worker route is not reachable through the browser gateway"
+# must refuse to proxy internal worker routes at all. The probed path is a
+# REAL internal route (backend/main.py registers /internal/runs/{id}/events)
+# so this check cannot pass vacuously against a route that does not exist.
+expect "worker-route" POST "/internal/runs/00000000-0000-0000-0000-000000000000/events" "${USER_TOKEN_ENV}" "401,403,404" "worker route is not reachable through the browser gateway"
 
 printf '\nThis smoke test performed only reads and expected rejections: no run creation, no worker trigger, no provider call, no project mutation, no migration.\n'
 finish_checks "smoke-test-read-only" "${JSON_OUTPUT}"

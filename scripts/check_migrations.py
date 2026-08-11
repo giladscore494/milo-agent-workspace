@@ -59,6 +59,38 @@ REQUIRED_PER_FILE = {
         "create unique index if not exists runs_user_conversation_idempotency_uidx",
         "not valid",
     ],
+    "20260810000100_revoke_anon_execute_on_service_rpcs.sql": [
+        # anon must never regain EXECUTE on service-only RPCs
+        "from anon",
+        "revoke execute on function public.reserve_model_call_budget",
+        "revoke execute on function public.settle_model_call_budget",
+        "revoke execute on function public.model_call_budget_committed",
+        "revoke execute on function public.reserve_daily_user_budget",
+        "revoke execute on function public.reserve_daily_project_budget",
+        "revoke execute on function public.create_message_and_run",
+        "revoke execute on function public.claim_run_lease",
+        "revoke execute on function public.create_project_from_proposal_with_owner",
+        "alter default privileges for role postgres in schema public revoke execute on functions",
+    ],
+    "20260810000200_enable_rls_on_service_only_tables.sql": [
+        # explicit RLS must not depend on an environment ensure_rls trigger
+        "run_checkpoints enable row level security",
+        "worker_heartbeats enable row level security",
+        "agent_instances enable row level security",
+        "agent_tasks enable row level security",
+        "task_dependencies enable row level security",
+        "agent_messages enable row level security",
+        "run_blackboards enable row level security",
+        "supervisor_decisions enable row level security",
+        "tool_access_requests enable row level security",
+        "tool_grants enable row level security",
+        "tool_usage enable row level security",
+        "sources enable row level security",
+        "claims enable row level security",
+        "source_claim_links enable row level security",
+        "conflicts enable row level security",
+        "model_call_budget_reservations enable row level security",
+    ],
 }
 
 FORBIDDEN_EVERYWHERE = [

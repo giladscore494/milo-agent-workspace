@@ -29,7 +29,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         run = repo.claim_run(run_id, worker_id, lease_seconds=lease_seconds)
     else:
         run = repo.get_run(run_id)
-    sink = SupabaseEventSink(repo)
+    # The active lease travels with every durable write this worker makes:
+    # once the lease is reclaimed, each of these writes is rejected
+    # atomically at the database boundary.
+    lease_ctx = {"worker_id": worker_id, "attempt": run.get("attempt"), "lease_token": run.get("lease_token")}
+    sink = SupabaseEventSink(repo, **lease_ctx)
     lease_lost = threading.Event()
     stop_heartbeat = threading.Event()
     heartbeat_thread: threading.Thread | None = None
@@ -74,15 +78,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             try:
                 shadow_blackboard = apply_event_to_blackboard(shadow_blackboard, event_type, payload)
                 if hasattr(repo, "upsert_run_blackboard"):
-                    repo.upsert_run_blackboard(run_id, shadow_blackboard.model_dump(mode="json"))
+                    repo.upsert_run_blackboard(run_id, shadow_blackboard.model_dump(mode="json"), **lease_ctx)
                 message = route_event_message(run_id, event_type, payload)
                 if message and hasattr(repo, "create_agent_message"):
-                    repo.create_agent_message(message.model_dump(mode="json"))
+                    repo.create_agent_message(message.model_dump(mode="json"), **lease_ctx)
                 if event_type in {"checkpoint_saved", "chunk_failed", "run_failed", "run_completed", "run_partial_success"} and hasattr(repo, "create_supervisor_decision"):
                     previous = repo.list_supervisor_decisions(run_id) if hasattr(repo, "list_supervisor_decisions") else []
                     decision = make_shadow_decision(SupervisorInput(goal=shadow_blackboard.goal, compiled_workflow=shadow_blackboard.approved_plan, blackboard=shadow_blackboard, unread_messages=[message] if message else [], open_conflicts=shadow_blackboard.claims_conflict_summaries, budget=shadow_blackboard.remaining_budget), previous_decisions=previous)
                     report = build_evaluation_report(decision, [event_type])
-                    repo.create_supervisor_decision(run_id, {"input": {"goal": shadow_blackboard.goal, "compiled_workflow": shadow_blackboard.approved_plan}, "assessment": decision.assessment, "proposed_commands": [c.model_dump(mode="json") for c in decision.proposed_commands], "next_wake_condition": decision.next_wake_condition.model_dump(mode="json"), "rationale_summary": decision.rationale_summary, "evaluation_report": report.model_dump(mode="json")})
+                    repo.create_supervisor_decision(run_id, {"input": {"goal": shadow_blackboard.goal, "compiled_workflow": shadow_blackboard.approved_plan}, "assessment": decision.assessment, "proposed_commands": [c.model_dump(mode="json") for c in decision.proposed_commands], "next_wake_condition": decision.next_wake_condition.model_dump(mode="json"), "rationale_summary": decision.rationale_summary, "evaluation_report": report.model_dump(mode="json")}, **lease_ctx)
             except Exception as exc:
                 sink.emit(RunEventRecord(run_id=run_id, type="supervisor_shadow_failed", message="Supervisor shadow observation failed without altering execution", payload={"code": "SUPERVISOR_SHADOW_FAILED", "message": str(exc)}))
 
@@ -98,7 +102,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 result = {"status": final.get("status", "success"), "result": final, "summary": (artifacts.get("hebrew_summary") or {}).get("parsed", {}).get("summary"), "results": artifacts, **(latest_checkpoint.get("token_usage") or {})}
                 sink.emit(RunEventRecord(run_id=run_id, type="run_completed", message="Run completed from checkpoint", payload={"checkpoint_id": str(latest_checkpoint.get("id", ""))}))
                 shadow_observe("run_completed", {"checkpoint_id": str(latest_checkpoint.get("id", ""))})
-                repo.mark_run_complete(run_id, result, worker_id=worker_id)
+                repo.mark_run_complete(run_id, result, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
                 return 0
         if hasattr(repo, "transition_run"):
             repo.transition_run(run_id, "running", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), started_at=run.get("started_at") or datetime.now(UTC).isoformat())
@@ -106,8 +110,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             repo.heartbeat(run_id, worker_id, lease_seconds=lease_seconds, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
         def save_checkpoint(_phase, checkpoint):
             if hasattr(repo, "save_checkpoint"):
-                checkpoint = {**checkpoint, "run_id": str(run_id), "worker_id": worker_id, "attempt": run.get("attempt", 1), "lease_token": run.get("lease_token")}
-                repo.save_checkpoint(checkpoint)
+                checkpoint = {**checkpoint, "run_id": str(run_id), "attempt": run.get("attempt", 1)}
+                repo.save_checkpoint(checkpoint, **lease_ctx)
                 shadow_observe("checkpoint_saved", checkpoint)
         def is_cancelled():
             return repo.get_run(run_id).get("status") == "cancellation_requested"
@@ -119,7 +123,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         if paid_execution_enabled() and budget_config.missing_mandatory():
             missing = ", ".join(budget_config.missing_mandatory())
             sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Budget configuration incomplete; refusing paid execution", payload={"code": "BUDGET_CONFIG_INVALID", "missing": missing}))
-            repo.mark_run_failed(run_id, "BUDGET_CONFIG_INVALID", f"mandatory budget settings missing: {missing}")
+            repo.mark_run_failed(run_id, "BUDGET_CONFIG_INVALID", f"mandatory budget settings missing: {missing}", worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
             return 1
         # Provider credentials are worker-only (env/Secret Manager). Paid
         # execution fails closed when the key is absent; the key value itself is
@@ -128,7 +132,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
 
         if paid_execution_enabled() and not worker_provider_api_key():
             sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider API key not configured for this worker; refusing paid execution", payload={"code": "PROVIDER_KEY_MISSING"}))
-            repo.mark_run_failed(run_id, "PROVIDER_KEY_MISSING", "worker provider API key (KIMI_API_KEY/MOONSHOT_API_KEY) is not configured")
+            repo.mark_run_failed(run_id, "PROVIDER_KEY_MISSING", "worker provider API key (KIMI_API_KEY/MOONSHOT_API_KEY) is not configured", worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
             return 1
 
         def emit_budget_event(event_type, payload):
@@ -137,7 +141,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
 
         def record_usage(usage):
             if hasattr(repo, "update_run_usage"):
-                repo.update_run_usage(run_id, usage)
+                repo.update_run_usage(run_id, usage, **lease_ctx)
 
         def holds_lease():
             if lease_lost.is_set():
@@ -170,8 +174,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     **entry,
                 })
 
+        # MILO_WORKER_ENGINE=mock (forbidden in production by
+        # backend/production_config.py) runs the zero-cost staging engine: no
+        # provider client exists, so the tracker's kill switch is satisfied
+        # locally and simulated calls exercise the real reservation lifecycle
+        # with mock costs only.
+        engine_mode = (os.getenv("MILO_WORKER_ENGINE") or "").strip().lower()
         tracker = budget_tracker or BudgetTracker(
             budget_config,
+            kill_switch=(lambda: True) if engine_mode == "mock" else paid_execution_enabled,
             cancellation_checker=is_cancelled,
             event_emitter=emit_budget_event,
             usage_recorder=record_usage,
@@ -179,9 +190,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             lease_checker=holds_lease,
             daily_user_cost_provider=(lambda: repo.sum_daily_ledger_cost(user_id=run.get("requested_by"))) if hasattr(repo, "sum_daily_ledger_cost") and run.get("requested_by") else None,
             daily_project_cost_provider=(lambda: repo.sum_daily_ledger_cost(project_id=str(ledger_project_id))) if hasattr(repo, "sum_daily_ledger_cost") and ledger_project_id else None,
-            daily_user_reserver=(lambda amount, call_seq: repo.reserve_model_call_budget(run_id, call_seq, run.get("requested_by"), str(ledger_project_id) if ledger_project_id else None, amount, budget_config.daily_user_budget, budget_config.daily_project_budget)) if hasattr(repo, "reserve_model_call_budget") and (run.get("requested_by") or ledger_project_id) and (budget_config.daily_user_budget or budget_config.daily_project_budget) else None,
+            daily_user_reserver=(lambda amount, call_seq: repo.reserve_model_call_budget(run_id, call_seq, run.get("requested_by"), str(ledger_project_id) if ledger_project_id else None, amount, budget_config.daily_user_budget, budget_config.daily_project_budget, **lease_ctx)) if hasattr(repo, "reserve_model_call_budget") and (run.get("requested_by") or ledger_project_id) and (budget_config.daily_user_budget or budget_config.daily_project_budget) else None,
             daily_project_reserver=None,
-            daily_settler=(lambda reservation, actual_cost, status, reason: repo.settle_model_call_budget(reservation.id if isinstance(reservation, ModelCallReservation) else str(reservation), actual_cost, status, reason)) if hasattr(repo, "settle_model_call_budget") else None,
+            daily_settler=(lambda reservation, actual_cost, status, reason: repo.settle_model_call_budget(reservation.id if isinstance(reservation, ModelCallReservation) else str(reservation), actual_cost, status, reason, run_id=run_id, **lease_ctx)) if hasattr(repo, "settle_model_call_budget") else None,
         )
 
         def forward_event(t, p):
@@ -203,14 +214,28 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             tracker.record_retry()
             forward_event("retry_limit_checked", {"agent": agent, "phase": phase, "reason": reason, "message": f"Retry allowance consumed for {agent}/{phase}"})
 
-        selected_engine = engine or VehicleCatalogV1Adapter(
-            model_client_factory=build_guarded_client_factory(tracker),
-            event_sink=forward_event,
-            checkpoint_sink=save_checkpoint,
-            cancellation_checker=is_cancelled,
-            agent_step_callback=record_agent_step,
-            retry_callback=record_retry,
-        )
+        if engine is not None:
+            selected_engine = engine
+        elif engine_mode == "mock":
+            from backend.worker.mock_engine import MockLifecycleEngine
+
+            selected_engine = MockLifecycleEngine(
+                event_sink=forward_event,
+                checkpoint_sink=save_checkpoint,
+                cancellation_checker=is_cancelled,
+                agent_step_callback=record_agent_step,
+                retry_callback=record_retry,
+                budget_tracker=tracker,
+            )
+        else:
+            selected_engine = VehicleCatalogV1Adapter(
+                model_client_factory=build_guarded_client_factory(tracker),
+                event_sink=forward_event,
+                checkpoint_sink=save_checkpoint,
+                cancellation_checker=is_cancelled,
+                agent_step_callback=record_agent_step,
+                retry_callback=record_retry,
+            )
         try:
             result = selected_engine.run(run)
         except CancellationRequested:
@@ -237,14 +262,14 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             if hasattr(repo, "transition_run") and status == "partial_success":
                 repo.transition_run(run_id, "partial_success", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), output=result, error=None, finished_at=datetime.now(UTC).isoformat())
             else:
-                repo.mark_run_complete(run_id, result, worker_id=worker_id)
+                repo.mark_run_complete(run_id, result, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
             return 0
         error = result.get("error", {}) if isinstance(result, dict) else {}
         code = error.get("code", "ENGINE_FAILED")
         message = error.get("message", "vehicle_catalog_v1 engine failed")
         sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message=message, payload={"code": code}))
         shadow_observe("run_failed", {"code": code})
-        repo.mark_run_failed(run_id, code, message, worker_id=worker_id)
+        repo.mark_run_failed(run_id, code, message, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
         return 1
     finally:
         cleanup_heartbeat()

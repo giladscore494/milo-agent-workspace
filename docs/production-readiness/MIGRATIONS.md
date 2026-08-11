@@ -30,6 +30,12 @@ production.
 | 014 | `014_atomic_daily_budget_reservations.sql` | legacy daily RPCs (deprecated, execute revoked) |
 | 015 | `015_atomic_model_call_budget_lifecycle.sql` | model_call_budget_reservations + reserve/settle RPCs, portable grants |
 | ts | `20260706192500_grant_…_schema_privileges.sql` | service-role schema privileges (timestamped) |
+| ts | `20260810000100_revoke_anon_execute_on_service_rpcs.sql` | revoke anon EXECUTE on all service-only RPCs + default-privilege hardening |
+| ts | `20260810000200_enable_rls_on_service_only_tables.sql` | explicit RLS on service-only tables from 002/004/005/015 |
+| ts | `20260810000300_lease_guarded_worker_writes.sql` | assert_worker_lease + lease-guarded RPCs for every worker durable write |
+| ts | `20260810000400_setof_rpc_returns.sql` | SETOF `_v2` wrappers for historical RPCs (PostgREST client compatibility) |
+| ts | `20260810000500_ledger_decision_overage.sql` | run_usage_ledger decision check widened to overage/released |
+| ts | `20260810000600_corrective_lease_and_attempt_hardening.sql` | attempt-aware reservation identity (run_id, attempt, call_seq); cross-run-safe guarded settle; DB-clock guarded usage/heartbeat/worker-transition RPCs |
 
 All migrations are additive, idempotent and data-preserving. There are no
 destructive down-migrations, by policy (`scripts/check_migrations.py`

@@ -90,7 +90,7 @@ class StatefulRepo:
         run["cancellation_reason"] = reason
         return dict(run)
 
-    def append_run_event(self, run_id, event_type, payload):
+    def append_run_event(self, run_id, event_type, payload, worker_id=None, attempt=None, lease_token=None):
         self.events.append({"run_id": run_id, "event_type": event_type, "payload": payload})
         return {"id": len(self.events)}
 

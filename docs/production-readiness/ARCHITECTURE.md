@@ -24,9 +24,14 @@ Status: `COMPLETED_IN_CODE` (application architecture) /
 - **Cloud Run worker job (`Dockerfile.worker`)** — private batch job with
   its own service account. Claims runs via an atomic lease
   (`claim_run_lease`, migration `012`), heartbeats, executes the engine,
-  and mutates state only through internal API routes authenticated with a
-  Google OIDC token for `MILO_WORKER_AUDIENCE`
-  (`backend/worker_auth.py`).
+  and mutates state directly in Supabase with the service-role key
+  (`backend/repository/supabase.py`). Every durable worker write —
+  transitions, events, checkpoints, usage, shadow-supervisor rows and
+  budget reservations — carries the active lease and is rejected
+  atomically at the database boundary when stale (migrations `012` and
+  `20260810000300`). The API's `/internal/*` routes exist as an
+  OIDC-verified worker surface (`backend/worker_auth.py`) but are not on
+  the canonical worker mutation path.
 - **Supabase (PostgreSQL + auth)** — source of truth; RLS on all
   browser-reachable tables; service-role credential is server-only.
 - **Redis (Upstash REST)** — shared rate-limit store for gateway and API;
@@ -46,10 +51,15 @@ Status: `COMPLETED_IN_CODE` (application architecture) /
 3. **API → worker job**: the API's launcher identity may only invoke the
    specific worker job. The worker receives the run ID, never
    browser-supplied secrets.
-4. **Worker → API (internal routes)**: trust is a Google-signed ID token
-   for `MILO_WORKER_AUDIENCE` from an identity in
-   `MILO_APPROVED_WORKER_IDENTITIES`, plus the active lease
-   (worker id + attempt + lease token) on every mutation.
+4. **Worker → Supabase (canonical mutation path)**: trust is the
+   server-only service-role key plus the active lease — every durable
+   worker write is validated against (run id, worker id, attempt, lease
+   token, unexpired lease) atomically in the database (migrations `012`,
+   `20260810000300`), so a stale or superseded worker cannot write
+   anything. **Worker → API (internal routes)**: any API route a worker
+   would call requires a Google-signed ID token for
+   `MILO_WORKER_AUDIENCE` from an identity in
+   `MILO_APPROVED_WORKER_IDENTITIES` (`backend/worker_auth.py`).
    Gateway and worker identity sets must be disjoint (enforced by
    `backend/production_config.py`).
 
@@ -78,7 +88,7 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     A[Cloud Run API] -->|SUPABASE_URL + service-role key secret| S[(Supabase)]
-    A -->|run.invoker on the one job only| W[Cloud Run worker job]
+    A -->|run.jobsExecutorWithOverrides on the one job only| W[Cloud Run worker job]
     W -->|service-role key secret| S
     W -->|KIMI/MOONSHOT_API_KEY secret, Stage C only, budgets enforced| P[Kimi/Moonshot]
     A -->|UPSTASH REST + token| R[(Redis)]

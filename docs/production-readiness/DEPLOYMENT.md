@@ -261,7 +261,10 @@ Proven by the templates in the generated plan plus
 - Revision naming: `--revision-suffix rel-<SHA12>` ties revisions to the
   release; traffic promotion is explicit (`--to-revisions`).
 - Concurrency/instances/timeouts are deliberate template values
-  (`--max-retries 0 --task-timeout 3600` for the job) — tune in the
+  (`--max-retries 1 --task-timeout 3600` for the job; a retried task
+  re-claims the lease with an incremented attempt, and stale writes from
+  the prior attempt are rejected atomically — migrations `012`,
+  `20260810000300`) — tune in the
   manifest copy, not ad hoc.
 
 ## Least-privilege IAM matrix
@@ -270,8 +273,8 @@ Proven by the templates in the generated plan plus
 | --- | --- | --- |
 | Human deployment operator | run deployments manually | `roles/run.admin`, `roles/artifactregistry.writer`, `roles/iam.serviceAccountUser` **on the two runtime SAs only**, `roles/secretmanager.admin` on MILO secrets only |
 | CI build identity | build/test only | **none in GCP** — CI never pushes images or deploys, by design |
-| API runtime SA `<API_SERVICE_ACCOUNT_EMAIL>` | serve API, launch job | `roles/run.invoker` on `<CLOUD_RUN_WORKER_JOB>`; secretAccessor on Supabase + Redis secrets (secret-level) |
-| Worker runtime SA `<WORKER_SERVICE_ACCOUNT_EMAIL>` | execute runs | `roles/run.invoker` on `<CLOUD_RUN_API_SERVICE>` (internal routes); secretAccessor on Supabase + provider + Redis secrets (secret-level) |
+| API runtime SA `<API_SERVICE_ACCOUNT_EMAIL>` | serve API, launch job | `roles/run.jobsExecutorWithOverrides` on `<CLOUD_RUN_WORKER_JOB>` (the launcher sends `containerOverrides` for `RUN_ID` — `backend/job_launcher.py` — so plain `roles/run.invoker` is insufficient); secretAccessor on Supabase + Redis secrets (secret-level) |
+| Worker runtime SA `<WORKER_SERVICE_ACCOUNT_EMAIL>` | execute runs | secretAccessor on Supabase + provider + Redis secrets (secret-level). No Cloud Run invoker grant: the worker mutates Supabase directly under its lease and does not call the API |
 | Vercel gateway identity `<GATEWAY_IDENTITY_EMAIL>` | call private API | `roles/run.invoker` on `<CLOUD_RUN_API_SERVICE>`; `roles/iam.workloadIdentityUser` from the Vercel pool; **no Secret Manager access, no job access** |
 | Logging/monitoring | read logs/metrics | `roles/logging.viewer`, `roles/monitoring.viewer` for the operator group |
 

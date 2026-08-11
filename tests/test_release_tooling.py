@@ -541,6 +541,12 @@ def test_no_enable_all_command_exists():
     enable_re = re.compile(
         r"MILO_ENABLE_[A-Z_]+\s*=\s*['\"]?(1|true|yes|on)['\"]?", re.I
     )
+    # The ONLY script allowed to enable execution flags is the Stage B
+    # staging deployer, which can never touch production: it must keep its
+    # hard production-project refusal and pin paid execution off. Every
+    # other script stays subject to the blanket rule, so no production
+    # enable-all command can exist.
+    staging_exception = REPO / "scripts" / "deploy" / "staging-cloud-run.sh"
     for path in (REPO / "scripts").rglob("*"):
         if not path.is_file():
             continue
@@ -548,6 +554,11 @@ def test_no_enable_all_command_exists():
         assert "enable_all" not in path.name.lower()
         text = path.read_text(errors="ignore")
         matches = enable_re.findall(text)
+        if path == staging_exception:
+            assert "refusing to run: PROJECT_ID is the production project" in text
+            assert "MILO_ENABLE_PAID_EXECUTION=false" in text
+            assert not re.search(r"MILO_ENABLE_PAID_EXECUTION\s*=\s*['\"]?(1|true|yes|on)", text, re.I)
+            continue
         assert not matches, f"{path} assigns an execution flag on: {matches}"
 
 

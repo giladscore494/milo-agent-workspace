@@ -21,18 +21,18 @@ class Repository(Protocol):
     def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None: ...
     def count_active_runs_for_user(self, user_id: UUID) -> int: ...
     def count_active_runs_for_project(self, project_id: UUID) -> int: ...
-    def update_run_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]: ...
+    def update_run_usage(self, run_id: UUID, usage: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
-    def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
-    def save_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]: ...
+    def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def save_checkpoint(self, checkpoint: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None: ...
     def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]: ...
     def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]: ...
-    def mark_run_failed(self, run_id: UUID, code: str, message: str) -> dict[str, Any]: ...
-    def mark_run_complete(self, run_id: UUID, output: dict[str, Any]) -> dict[str, Any]: ...
+    def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any], project_id: UUID | None = None, created_by: UUID | None = None) -> dict[str, Any]: ...
     def get_workflow_proposal(self, proposal_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]: ...
@@ -45,10 +45,10 @@ class Repository(Protocol):
     def create_conflict(self, run_id: UUID, conflict: dict[str, Any]) -> dict[str, Any]: ...
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
 
-    def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any]) -> dict[str, Any]: ...
-    def create_agent_message(self, message: dict[str, Any]) -> dict[str, Any]: ...
+    def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def list_unread_agent_messages(self, run_id: UUID, recipient: str = "supervisor") -> list[dict[str, Any]]: ...
-    def create_supervisor_decision(self, run_id: UUID, decision: dict[str, Any]) -> dict[str, Any]: ...
+    def create_supervisor_decision(self, run_id: UUID, decision: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def list_supervisor_decisions(self, run_id: UUID) -> list[dict[str, Any]]: ...
 
 
@@ -145,7 +145,7 @@ class SupabaseRepository:
         012): idempotent replay, concurrency admission and both inserts
         happen in ONE database transaction under advisory locks."""
         try:
-            response = self.client.rpc("create_message_and_run", {
+            response = self.client.rpc("create_message_and_run_v2", {
                 "p_conversation_id": str(conversation_id),
                 "p_content": content,
                 "p_metadata": metadata,
@@ -198,8 +198,25 @@ class SupabaseRepository:
         rows = self._many(self.client.table("runs").select("id, conversations!inner(project_id)").eq("conversations.project_id", str(project_id)).in_("status", list(self.ACTIVE_RUN_STATES)).limit(1000))
         return len(rows)
 
-    def update_run_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]:
-        return self._single(self.client.table("runs").update({"usage": usage}).eq("id", str(run_id)).select("*"), "run", str(run_id))
+    def update_run_usage(self, run_id: UUID, usage: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        if worker_id is not None:
+            # Worker-originated usage snapshot: lease validity (including
+            # expiry) is decided by the DATABASE clock inside the guarded
+            # RPC; a stale worker cannot clobber the live worker's accounting.
+            return self._guarded_rpc("update_run_usage_guarded", {
+                "p_run_id": str(run_id),
+                "p_worker_id": worker_id,
+                "p_attempt": attempt,
+                "p_lease_token": lease_token,
+                "p_usage": usage,
+            }, "run")
+        try:
+            rows = self.client.table("runs").update({"usage": usage}).eq("id", str(run_id)).select("*").execute().data or []
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        if not rows:
+            raise NotFoundError("run", str(run_id))
+        return rows[0]
 
     LEDGER_FIELDS = (
         "run_id", "project_id", "user_id", "provider", "model", "call_seq", "decision",
@@ -252,8 +269,8 @@ class SupabaseRepository:
             raise AppError("DAILY_PROJECT_BUDGET_REACHED", "daily project budget exhausted", 429)
         return row
 
-    def reserve_model_call_budget(self, run_id: UUID, call_seq: int, user_id: str | None, project_id: str | None, amount: float, daily_user_limit: float | None, daily_project_limit: float | None) -> dict[str, Any]:
-        row = self.client.rpc("reserve_model_call_budget", {
+    def reserve_model_call_budget(self, run_id: UUID, call_seq: int, user_id: str | None, project_id: str | None, amount: float, daily_user_limit: float | None, daily_project_limit: float | None, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {
             "p_run_id": str(run_id),
             "p_call_seq": int(call_seq),
             "p_user_id": str(user_id) if user_id else None,
@@ -261,15 +278,33 @@ class SupabaseRepository:
             "p_estimated_cost": amount,
             "p_daily_user_limit": daily_user_limit,
             "p_daily_project_limit": daily_project_limit,
-        }).execute().data
-        row = row[0] if isinstance(row, list) else row
+        }
+        if worker_id is not None:
+            # A stale worker cannot reserve budget for a run it no longer owns.
+            row = self._guarded_rpc("reserve_model_call_budget_guarded", {
+                **params, "p_worker_id": worker_id, "p_attempt": attempt, "p_lease_token": lease_token,
+            }, "model_call_budget_reservation")
+        else:
+            row = self.client.rpc("reserve_model_call_budget_v2", params).execute().data
+            row = row[0] if isinstance(row, list) else row
         if row and row.get("status") == "rejected":
             reason = row.get("rejection_reason") or "DAILY_BUDGET_REACHED"
             raise AppError(reason, "daily budget exhausted", 429)
         return row
 
-    def settle_model_call_budget(self, reservation_id: str, actual_cost: float, status: str = "settled", rejection_reason: str | None = None) -> dict[str, Any]:
-        row = self.client.rpc("settle_model_call_budget", {
+    def settle_model_call_budget(self, reservation_id: str, actual_cost: float, status: str = "settled", rejection_reason: str | None = None, run_id: UUID | None = None, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        if worker_id is not None and run_id is not None:
+            return self._guarded_rpc("settle_model_call_budget_guarded", {
+                "p_reservation_id": str(reservation_id),
+                "p_actual_cost": actual_cost,
+                "p_run_id": str(run_id),
+                "p_worker_id": worker_id,
+                "p_attempt": attempt,
+                "p_lease_token": lease_token,
+                "p_status": status,
+                "p_rejection_reason": rejection_reason,
+            }, "model_call_budget_reservation")
+        row = self.client.rpc("settle_model_call_budget_v2", {
             "p_reservation_id": str(reservation_id),
             "p_actual_cost": actual_cost,
             "p_status": status,
@@ -292,7 +327,42 @@ class SupabaseRepository:
             query = query.gt("id", after_event_id)
         return self._many(query.order("id").limit(500))
 
-    def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _is_stale_lease_error(exc: Exception) -> bool:
+        return "STALE_WORKER_WRITE" in str(exc)
+
+    def _guarded_rpc(self, function: str, params: dict[str, Any], resource: str) -> dict[str, Any]:
+        """Call a lease-guarded RPC (migration 20260810000300); a stale lease
+        surfaces as RUN_LEASE_LOST so worker code paths treat it exactly like
+        a failed heartbeat."""
+        try:
+            data = self.client.rpc(function, params).execute().data
+        except Exception as exc:
+            if self._is_stale_lease_error(exc):
+                raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409) from exc
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if data is None:
+            raise AppError("REPOSITORY_ERROR", f"{resource} guarded write returned no row", 502)
+        return data
+
+    def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        if worker_id is not None:
+            # Worker-originated events are lease-guarded atomically in the
+            # database: a stale worker cannot append to the event stream.
+            return self._guarded_rpc("append_run_event_guarded", {
+                "p_run_id": str(run_id),
+                "p_worker_id": worker_id,
+                "p_attempt": attempt,
+                "p_lease_token": lease_token,
+                "p_event_type": event_type,
+                "p_message": payload.get("message"),
+                "p_agent": payload.get("agent"),
+                "p_phase": payload.get("phase"),
+                "p_progress": payload.get("progress"),
+                "p_payload": payload.get("payload", payload),
+            }, "run_event")
         row = {
             "run_id": str(run_id),
             "event_type": event_type,
@@ -304,8 +374,28 @@ class SupabaseRepository:
         }
         return self._single(self.client.table("run_events").insert(row).select("*"), "run_event", "new")
 
-    def save_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
-        return self._single(self.client.table("run_checkpoints").insert(checkpoint).select("*"), "run_checkpoint", "new")
+    CHECKPOINT_COLUMNS = ("run_id", "engine_version", "workflow_key", "phase", "completed_tasks", "artifacts", "failures", "token_usage", "last_event", "attempt")
+
+    def save_checkpoint(self, checkpoint: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        if worker_id is not None:
+            return self._guarded_rpc("save_checkpoint_guarded", {
+                "p_run_id": str(checkpoint["run_id"]),
+                "p_worker_id": worker_id,
+                "p_attempt": attempt,
+                "p_lease_token": lease_token,
+                "p_engine_version": checkpoint.get("engine_version"),
+                "p_workflow_key": checkpoint.get("workflow_key"),
+                "p_phase": checkpoint.get("phase"),
+                "p_completed_tasks": checkpoint.get("completed_tasks", []),
+                "p_artifacts": checkpoint.get("artifacts", {}),
+                "p_failures": checkpoint.get("failures", []),
+                "p_token_usage": checkpoint.get("token_usage", {}),
+                "p_last_event": checkpoint.get("last_event"),
+            }, "run_checkpoint")
+        # run_checkpoints has no worker_id/lease_token columns; keep the row
+        # to the real schema.
+        row = {key: checkpoint[key] for key in self.CHECKPOINT_COLUMNS if key in checkpoint}
+        return self._single(self.client.table("run_checkpoints").insert(row).select("*"), "run_checkpoint", "new")
 
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None:
         query = self.client.table("run_checkpoints").select("*").eq("run_id", str(run_id)).order("created_at", desc=True).limit(1)
@@ -313,6 +403,8 @@ class SupabaseRepository:
             query = query.eq("workflow_key", workflow_key)
         rows = self._many(query)
         return rows[0] if rows else None
+
+    WORKER_TRANSITION_FIELDS = {"output", "error", "usage", "started_at", "finished_at"}
 
     def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
         current = str(self.get_run(run_id).get("status", ""))
@@ -325,6 +417,27 @@ class SupabaseRepository:
                 validate_transition(current, status)
             except InvalidTransition as exc:
                 raise AppError("INVALID_RUN_TRANSITION", str(exc), 409) from exc
+        if expected_worker_id is not None:
+            # Worker-originated transition: lease validity (including expiry)
+            # is decided by the DATABASE clock inside the guarded RPC, never
+            # by this container's clock.
+            unsupported = set(fields) - self.WORKER_TRANSITION_FIELDS
+            if unsupported:
+                raise AppError("REPOSITORY_ERROR", f"unsupported worker transition fields: {sorted(unsupported)}", 502)
+            return self._guarded_rpc("transition_run_worker_guarded", {
+                "p_run_id": str(run_id),
+                "p_status": status,
+                "p_expected_status": current if transitioning else None,
+                "p_worker_id": expected_worker_id,
+                "p_attempt": expected_attempt,
+                "p_lease_token": expected_lease_token,
+                "p_output": fields.get("output"),
+                "p_error": fields.get("error"),
+                "p_clear_error": "error" in fields and fields["error"] is None,
+                "p_usage": fields.get("usage"),
+                "p_started_at": fields.get("started_at"),
+                "p_finished_at": fields.get("finished_at"),
+            }, "run")
         payload = {"status": status, **fields}
         query = self.client.table("runs").update(payload).eq("id", str(run_id))
         if transitioning:
@@ -332,15 +445,6 @@ class SupabaseRepository:
             # (e.g. a newer worker writing a terminal result) makes this
             # update match zero rows instead of silently overwriting it.
             query = query.eq("status", current)
-        if expected_worker_id is not None:
-            # Stale workers whose lease was reclaimed cannot overwrite the
-            # newer holder's state. Lease expiry is part of ownership.
-            query = query.eq("worker_id", expected_worker_id)
-            query = query.gt("lease_expires_at", datetime.now(UTC).isoformat())
-        if expected_attempt is not None:
-            query = query.eq("attempt", expected_attempt)
-        if expected_lease_token is not None:
-            query = query.eq("lease_token", expected_lease_token)
         try:
             rows = query.select("*").execute().data or []
         except Exception as exc:
@@ -367,33 +471,25 @@ class SupabaseRepository:
         return rows[0] if isinstance(rows, list) else rows
 
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
-        now = datetime.now(UTC)
-        expires = (now + timedelta(seconds=lease_seconds)).isoformat()
-        # Atomic ownership check: the lease only extends when this worker
-        # still holds it.
-        try:
-            query = self.client.table("runs").update({"last_heartbeat_at": now.isoformat(), "lease_expires_at": expires}).eq("id", str(run_id)).eq("worker_id", worker_id).gt("lease_expires_at", now.isoformat()).in_("status", ["starting", "running", "cancellation_requested"])
-            if attempt is not None:
-                query = query.eq("attempt", attempt)
-            if lease_token is not None:
-                query = query.eq("lease_token", lease_token)
-            rows = query.select("*").execute().data or []
-        except Exception as exc:
-            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
-        if not rows:
-            raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409)
-        run = rows[0]
-        self.client.table("worker_heartbeats").insert({"run_id": str(run_id), "worker_id": worker_id, "attempt": run.get("attempt", 1), "heartbeat_at": now.isoformat(), "lease_expires_at": expires}).execute()
-        return run
+        # Atomic ownership check with DATABASE-clock expiry: the lease only
+        # extends when this worker still holds it according to PostgreSQL
+        # now(); a skewed container clock cannot revive an expired lease.
+        return self._guarded_rpc("heartbeat_run_guarded", {
+            "p_run_id": str(run_id),
+            "p_worker_id": worker_id,
+            "p_attempt": attempt,
+            "p_lease_token": lease_token,
+            "p_lease_seconds": int(lease_seconds),
+        }, "run")
 
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]:
         return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=datetime.now(UTC).isoformat(), cancellation_reason=reason)
 
-    def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "failed", expected_worker_id=worker_id, error={"code": code, "message": message}, finished_at=datetime.now(UTC).isoformat())
+    def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        return self.transition_run(run_id, "failed", expected_worker_id=worker_id, expected_attempt=attempt, expected_lease_token=lease_token, error={"code": code, "message": message}, finished_at=datetime.now(UTC).isoformat())
 
-    def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "completed", expected_worker_id=worker_id, output=output, error=None, finished_at=datetime.now(UTC).isoformat())
+    def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        return self.transition_run(run_id, "completed", expected_worker_id=worker_id, expected_attempt=attempt, expected_lease_token=lease_token, output=output, error=None, finished_at=datetime.now(UTC).isoformat())
 
     def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any], project_id: UUID | None = None, created_by: UUID | None = None) -> dict[str, Any]:
         payload = {"user_request": user_request, **proposal}
@@ -421,7 +517,7 @@ class SupabaseRepository:
         # one transaction (migration 011); no orphan project can remain if
         # the membership insert fails.
         try:
-            response = self.client.rpc("create_project_from_proposal_with_owner", {
+            response = self.client.rpc("create_project_from_proposal_with_owner_v2", {
                 "p_proposal_id": str(proposal_id),
                 "p_slug": slug,
                 "p_name": name,
@@ -436,11 +532,19 @@ class SupabaseRepository:
             raise AppError("REPOSITORY_ERROR", "project creation returned no row", 502)
         return data[0] if isinstance(data, list) else data
 
-    def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any]) -> dict[str, Any]:
+    def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        if worker_id is not None:
+            return self._guarded_rpc("upsert_run_blackboard_guarded", {
+                "p_run_id": str(run_id),
+                "p_worker_id": worker_id,
+                "p_attempt": attempt,
+                "p_lease_token": lease_token,
+                "p_blackboard": blackboard,
+            }, "run_blackboard")
         payload = {"run_id": str(run_id), **blackboard, "updated_at": datetime.now(UTC).isoformat()}
         return self._single(self.client.table("run_blackboards").upsert(payload, on_conflict="run_id").select("*"), "run_blackboard", str(run_id))
 
-    def create_agent_message(self, message: dict[str, Any]) -> dict[str, Any]:
+    def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         payload = {
             "id": str(message.get("id")) if message.get("id") else None,
             "run_id": str(message["run_id"]),
@@ -452,12 +556,28 @@ class SupabaseRepository:
             "read_at": message.get("read_at"),
         }
         payload = {k: v for k, v in payload.items() if v is not None}
+        if worker_id is not None:
+            return self._guarded_rpc("create_agent_message_guarded", {
+                "p_run_id": payload["run_id"],
+                "p_worker_id": worker_id,
+                "p_attempt": attempt,
+                "p_lease_token": lease_token,
+                "p_message": payload,
+            }, "agent_message")
         return self._single(self.client.table("agent_messages").insert(payload).select("*"), "agent_message", "new")
 
     def list_unread_agent_messages(self, run_id: UUID, recipient: str = "supervisor") -> list[dict[str, Any]]:
         return self._many(self.client.table("agent_messages").select("*").eq("run_id", str(run_id)).eq("recipient", recipient).is_("read_at", "null").order("created_at"))
 
-    def create_supervisor_decision(self, run_id: UUID, decision: dict[str, Any]) -> dict[str, Any]:
+    def create_supervisor_decision(self, run_id: UUID, decision: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        if worker_id is not None:
+            return self._guarded_rpc("create_supervisor_decision_guarded", {
+                "p_run_id": str(run_id),
+                "p_worker_id": worker_id,
+                "p_attempt": attempt,
+                "p_lease_token": lease_token,
+                "p_decision": decision,
+            }, "supervisor_decision")
         payload = {"run_id": str(run_id), "mode": "shadow", **decision}
         return self._single(self.client.table("supervisor_decisions").insert(payload).select("*"), "supervisor_decision", "new")
 

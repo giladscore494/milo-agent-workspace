@@ -167,8 +167,13 @@ class MemoryRepository:
             events = [e for e in events if e["id"] > after_event_id]
         return [dict(e) for e in events]
 
-    def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         with self.lock:
+            if worker_id is not None:
+                run = self.runs.get(str(run_id))
+                if run is None:
+                    raise NotFoundError("run", str(run_id))
+                self._assert_active_lease(run, worker_id, attempt, lease_token)
             event = {
                 "id": len(self.run_events) + 1,
                 "run_id": str(run_id),
@@ -211,19 +216,21 @@ class MemoryRepository:
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]:
         return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=_now(), cancellation_reason=reason)
 
-    def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "failed", expected_worker_id=worker_id, error={"code": code, "message": message}, finished_at=_now())
+    def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        return self.transition_run(run_id, "failed", expected_worker_id=worker_id, expected_attempt=attempt, expected_lease_token=lease_token, error={"code": code, "message": message}, finished_at=_now())
 
-    def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "completed", expected_worker_id=worker_id, output=output, error=None, finished_at=_now())
+    def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        return self.transition_run(run_id, "completed", expected_worker_id=worker_id, expected_attempt=attempt, expected_lease_token=lease_token, output=output, error=None, finished_at=_now())
 
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]:
         row = {"id": str(uuid4()), "run_id": str(run_id), **invocation}
         self.invocations.append(row)
         return dict(row)
 
-    def update_run_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]:
+    def update_run_usage(self, run_id: UUID, usage: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         run = self.runs[str(run_id)]
+        if worker_id is not None:
+            self._assert_active_lease(run, worker_id, attempt, lease_token)
         run["usage"] = usage
         return dict(run)
 
@@ -316,16 +323,26 @@ class MemoryRepository:
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None:
         return None
 
-    def save_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
+    def save_checkpoint(self, checkpoint: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         run_id = checkpoint.get("run_id")
         if run_id:
             run = self.runs[str(run_id)]
-            self._assert_active_lease(run, checkpoint.get("worker_id"), checkpoint.get("attempt"), checkpoint.get("lease_token"))
+            self._assert_active_lease(
+                run,
+                worker_id if worker_id is not None else checkpoint.get("worker_id"),
+                attempt if attempt is not None else checkpoint.get("attempt"),
+                lease_token if lease_token is not None else checkpoint.get("lease_token"),
+            )
         self.checkpoints.append(checkpoint)
         return dict(checkpoint)
 
-    def reserve_model_call_budget(self, run_id: UUID, call_seq: int, user_id: str | None, project_id: str | None, amount: float, daily_user_limit: float | None, daily_project_limit: float | None) -> dict[str, Any]:
+    def reserve_model_call_budget(self, run_id: UUID, call_seq: int, user_id: str | None, project_id: str | None, amount: float, daily_user_limit: float | None, daily_project_limit: float | None, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         with self.lock:
+            if worker_id is not None:
+                run = self.runs.get(str(run_id))
+                if run is None:
+                    raise NotFoundError("run", str(run_id))
+                self._assert_active_lease(run, worker_id, attempt, lease_token)
             user_spend = self.sum_daily_ledger_cost(user_id=user_id) if user_id else 0.0
             project_spend = self.sum_daily_ledger_cost(project_id=project_id) if project_id else 0.0
             status, reason = "reserved", None
@@ -335,10 +352,19 @@ class MemoryRepository:
                 status, reason = "rejected", "DAILY_PROJECT_BUDGET_REACHED"
             return self.append_usage_ledger({"run_id": str(run_id), "call_seq": call_seq, "user_id": user_id, "project_id": project_id, "decision": status, "status": status, "estimated_cost": amount, "rejection_reason": reason})
 
-    def settle_model_call_budget(self, reservation_id: str, actual_cost: float, status: str = "settled", rejection_reason: str | None = None) -> dict[str, Any]:
+    def settle_model_call_budget(self, reservation_id: str, actual_cost: float, status: str = "settled", rejection_reason: str | None = None, run_id: UUID | None = None, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         with self.lock:
+            if worker_id is not None and run_id is not None:
+                run = self.runs.get(str(run_id))
+                if run is None:
+                    raise NotFoundError("run", str(run_id))
+                self._assert_active_lease(run, worker_id, attempt, lease_token)
             for row in getattr(self, "usage_ledger", []):
                 if str(row.get("id")) == str(reservation_id):
+                    # A lease for one run must never settle another run's
+                    # reservation (parity with settle_model_call_budget_guarded).
+                    if run_id is not None and str(row.get("run_id")) != str(run_id):
+                        raise AppError("RESERVATION_RUN_MISMATCH", "reservation does not belong to this run", 409)
                     if row.get("settled"):
                         raise AppError("BUDGET_RESERVATION_SETTLED", "reservation already settled", 409)
                     row["settled"] = True
