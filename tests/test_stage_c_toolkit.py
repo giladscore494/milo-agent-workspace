@@ -122,10 +122,44 @@ def test_parse_content_range_total(db):
     assert db.parse_content_range_total("garbage") is None
 
 
-def preflight_with(db, monkeypatch, count, expected="0", key_count=0):
+def openapi_spec(db, drop_rpc=None, drop_arg_from=None, mangle=None):
+    """A PostgREST-shaped Swagger 2.0 document advertising the Stage C RPCs."""
+    paths = {}
+    for rpc, args in db.REQUIRED_RPC_ARGS.items():
+        if rpc == drop_rpc:
+            continue
+        advertised = set(args)
+        if rpc == drop_arg_from:
+            advertised.discard(sorted(args)[0])
+        paths[f"/rpc/{rpc}"] = {"post": {"parameters": [
+            {"in": "body", "name": "args", "schema": {"type": "object", "properties": {a: {"type": "string"} for a in sorted(advertised)}}}
+        ]}}
+    spec = {"swagger": "2.0", "paths": paths}
+    if mangle == "paths":
+        spec["paths"] = "not-a-dict"
+    elif mangle == "no_body_schema":
+        for entry in paths.values():
+            entry["post"]["parameters"] = [{"in": "body", "name": "args"}]
+    return spec
+
+
+def preflight_with(db, monkeypatch, count, expected="0", key_count=0, spec=None, root_status=200, record=None):
     monkeypatch.setenv("STAGE_C_EXPECTED_PRIOR_RUNS", expected)
     monkeypatch.setenv("STAGE_C_IDEMPOTENCY_KEY", "stage-c-smoke-0001")
-    monkeypatch.setattr(db, "call", lambda *a, **k: (200, []))
+    resolved_spec = openapi_spec(db) if spec is None else spec
+
+    def fake_call(method, path, body=None, headers=None):
+        if record is not None:
+            record.append((method, path))
+        if path == "/rest/v1/":
+            return root_status, resolved_spec
+        if method == "POST" and "/rest/v1/rpc/" in path:
+            # A real parameterized RPC answers a bodyless probe with a
+            # function-resolution 404 (PGRST202) even though it EXISTS.
+            return 404, {"code": "PGRST202", "message": "Could not find the function"}
+        return 200, []
+
+    monkeypatch.setattr(db, "call", fake_call)
 
     def fake_count(path):
         return key_count if "idempotency_key" in path else count
@@ -158,6 +192,96 @@ def test_preflight_uses_exact_count_not_page_length(db):
     """The zero-run precondition must come from count_exact, never len(rows)."""
     source = (STAGE_C / "probe_db.py").read_text()
     assert "len(rows or [])" not in source
+
+
+# ---------------------------------------------------------------------------
+# RPC surface introspection: non-mutating and signature-safe
+# (Stage C attempt 2 falsely classified existing parameterized RPCs as
+# MISSING because POST {} gets a function-resolution 404 from PostgREST)
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_passes_when_all_rpc_metadata_present(db, monkeypatch, capsys):
+    preflight_with(db, monkeypatch, count=0)
+    out = capsys.readouterr().out
+    assert '"ok": true' in out
+    for rpc in db.REQUIRED_RPC_ARGS:
+        assert f'"rpc_{rpc}": "present"' in out
+
+
+def test_preflight_fails_when_one_rpc_genuinely_absent(db, monkeypatch, capsys):
+    spec = openapi_spec(db, drop_rpc="heartbeat_run_guarded")
+    with pytest.raises(SystemExit):
+        preflight_with(db, monkeypatch, count=0, spec=spec)
+    out = capsys.readouterr().out
+    assert '"rpc_heartbeat_run_guarded": "MISSING"' in out
+    # The others are still individually verified as present.
+    assert '"rpc_create_message_and_run_v2": "present"' in out
+
+
+def test_preflight_fails_closed_when_metadata_endpoint_unavailable(db, monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        preflight_with(db, monkeypatch, count=0, root_status=503, spec={"error": "unavailable"})
+    out = capsys.readouterr().out
+    assert "failing closed" in out
+    assert '"UNVERIFIED"' in out
+    assert '"present"' not in out.split('"reservations_attempt_column"')[0]  # no rpc assumed present
+
+
+@pytest.mark.parametrize("mangle", ["paths", "no_body_schema"])
+def test_preflight_fails_closed_on_malformed_metadata(db, monkeypatch, capsys, mangle):
+    spec = openapi_spec(db, mangle=mangle)
+    with pytest.raises(SystemExit):
+        preflight_with(db, monkeypatch, count=0, spec=spec)
+    assert "failing closed" in capsys.readouterr().out
+
+
+def test_existing_rpc_answering_404_to_empty_post_is_not_classified_missing(db, monkeypatch, capsys):
+    """Attempt-2 regression: the function EXISTS but a bodyless POST would
+    get a signature-mismatch 404. The fake call() in preflight_with answers
+    exactly that 404 for every RPC POST — the new implementation must
+    classify every RPC present (from metadata) without ever noticing."""
+    preflight_with(db, monkeypatch, count=0)
+    out = capsys.readouterr().out
+    assert '"ok": true' in out
+    assert '"MISSING"' not in out
+
+
+def test_preflight_rpc_checks_perform_no_mutating_posts(db, monkeypatch):
+    calls = []
+    preflight_with(db, monkeypatch, count=0, record=calls)
+    posts = [(m, p) for m, p in calls if m != "GET"]
+    assert posts == [], f"preflight made non-GET calls: {posts}"
+    assert not any("/rest/v1/rpc/" in p for _, p in calls), "preflight touched an RPC endpoint"
+
+
+def test_preflight_signature_mismatch_fails_closed(db, monkeypatch, capsys):
+    spec = openapi_spec(db, drop_arg_from="update_run_usage_guarded")
+    with pytest.raises(SystemExit):
+        preflight_with(db, monkeypatch, count=0, spec=spec)
+    out = capsys.readouterr().out
+    assert '"rpc_update_run_usage_guarded": "SIGNATURE_MISMATCH"' in out
+
+
+def test_preflight_zero_run_checks_still_enforced_alongside_rpc_metadata(db, monkeypatch, capsys):
+    """RPC metadata all present must not mask a non-zero run count."""
+    with pytest.raises(SystemExit):
+        preflight_with(db, monkeypatch, count=1)
+    out = capsys.readouterr().out
+    assert '"existing_runs": "1"' in out
+    with pytest.raises(SystemExit):
+        preflight_with(db, monkeypatch, count=0, key_count=1)
+
+
+def test_required_rpc_args_match_release_migrations(db):
+    """The expected argument names are pinned to the migration definitions."""
+    migrations = REPO / "supabase" / "migrations"
+    corrective = (migrations / "20260810000600_corrective_lease_and_attempt_hardening.sql").read_text()
+    setof = (migrations / "20260810000400_setof_rpc_returns.sql").read_text()
+    for rpc, args in db.REQUIRED_RPC_ARGS.items():
+        source = setof if rpc == "create_message_and_run_v2" else corrective
+        for arg in args:
+            assert arg in source, f"{rpc}: expected arg {arg} not found in the release migration"
 
 
 # ---------------------------------------------------------------------------

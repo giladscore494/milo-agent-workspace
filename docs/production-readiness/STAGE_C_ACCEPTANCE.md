@@ -1,11 +1,12 @@
 # Stage C acceptance report — one controlled paid smoke run
 
-Status: **ATTEMPT_1_FAILED_SAFELY_AT_PREFLIGHT — corrective PR pending
-review** (see "Stage C attempt 1" below). No MILO run was ever created:
-zero worker executions, zero provider calls, zero paid cost. The operator
-ran the kill switch and restored the fail-closed posture; do NOT
-re-attempt Stage C until the probe-transport corrective fix is reviewed
-and merged. The complete operator toolkit is in
+Status: **ATTEMPT_2_FAILED_SAFELY_AT_PREFLIGHT — corrective PR pending
+review** (see "Stage C attempt 2" below; attempt 1 further below). Across
+both attempts, no MILO run was ever created: zero worker executions, zero
+provider calls, zero tokens, $0 paid cost. The operator ran the kill
+switch and restored the fail-closed posture after each attempt; do NOT
+re-attempt Stage C until the RPC-preflight corrective fix is reviewed and
+merged. The complete operator toolkit is in
 [`scripts/release/stage-c/`](../../scripts/release/stage-c/README.md).
 (The original pre-toolkit status, kept for history: the first prepared
 session was blocked on operator write access and executed nothing.)
@@ -68,6 +69,51 @@ combination and would likely fail mid-lifecycle. No image exists in the
 production registry for `30b05bc…` (verified via
 `gcloud artifacts docker tags list`). Toolkit steps 1–2 build and deploy
 the correct release before anything is enabled.
+
+## Stage C attempt 2 (2026-08-13/14) — FAILED SAFELY at DB preflight
+
+The operator re-ran the toolkit after the attempt-1 corrective (PR #44).
+Launch invariants passed (release images, exact caps on both surfaces,
+IAM, zero executions). The DB preflight then ran and **failed closed
+before setup and before run creation** — correctly on the safety side,
+but for a wrong reason:
+
+| Preflight check | Result |
+| --- | --- |
+| `existing_runs` (exact count) | **0** |
+| `existing_stage_c_runs` (exact count) | **0** |
+| `reservations_attempt_column` / `runs_lease_columns` / `run_usage_ledger` | present |
+| all five Stage C RPCs | **falsely reported MISSING** |
+
+Root cause: the preflight tested RPC existence by POSTing an empty JSON
+body and treating HTTP 404 as "function absent". All five Stage C RPCs
+(`create_message_and_run_v2`, `transition_run_worker_guarded`,
+`heartbeat_run_guarded`, `update_run_usage_guarded`,
+`settle_model_call_budget_guarded`) have **required parameters** in the
+release migrations (000400/000600), and PostgREST resolves a function by
+name AND supplied argument keys — so an existing parameterized function
+answers a bodyless probe with a function-resolution 404 (PGRST202). The
+check produced a false negative for every one of them; a mismatched-
+invocation 404 is not proof of absence. It was also unsafe by
+construction: it invoked mutating RPCs merely to test existence.
+
+Outcome: **no setup rows created, no MILO run created, zero worker
+executions, zero provider calls, zero tokens, $0 provider cost.** The
+operator applied the kill switch and completed the full step-7 cleanup:
+API and worker restored fail-closed (`MILO_ENABLE_PAID_EXECUTION=false`,
+`KIMI_API_KEY` unbound, `MILO_ENABLE_RUN_CREATION=false`,
+`JOB_LAUNCHER=disabled`) and both disposable probe jobs deleted.
+
+Corrective fix (this commit, no production mutation): the preflight RPC
+check is now **non-mutating and signature-aware** — it GETs the PostgREST
+OpenAPI document with the existing service-role credentials and requires
+every Stage C RPC to be exposed as `/rpc/<name>` advertising every
+required argument name from the release migrations; it never POSTs to an
+RPC, and unavailable/malformed/ambiguous metadata fails closed
+(`UNVERIFIED`), never assuming presence. All other preflight gates
+(exact zero-run counts, idempotency-key count, column/ledger checks) are
+unchanged. Stage C was NOT passed and must not be re-attempted until this
+corrective is reviewed and merged.
 
 ## Stage C attempt 1 (2026-08-13) — FAILED SAFELY at DB preflight
 

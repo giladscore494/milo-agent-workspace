@@ -107,26 +107,119 @@ def fail(reason: str) -> None:
     sys.exit(1)
 
 
+# Stage C RPC surface with the REQUIRED argument names of each function as
+# defined by the release migrations (000400 for create_message_and_run_v2,
+# 000600 for the guarded worker RPCs). Optional (defaulted) arguments are
+# deliberately excluded so a migration adding an optional parameter does
+# not fail the check, while a missing/renamed required argument does.
+REQUIRED_RPC_ARGS: dict[str, set[str]] = {
+    "create_message_and_run_v2": {
+        "p_conversation_id", "p_content", "p_metadata",
+        "p_requested_by", "p_idempotency_key", "p_request_fingerprint",
+    },
+    "transition_run_worker_guarded": {
+        "p_run_id", "p_status", "p_expected_status",
+        "p_worker_id", "p_attempt", "p_lease_token",
+    },
+    "heartbeat_run_guarded": {"p_run_id", "p_worker_id", "p_attempt", "p_lease_token"},
+    "update_run_usage_guarded": {"p_run_id", "p_worker_id", "p_attempt", "p_lease_token", "p_usage"},
+    "settle_model_call_budget_guarded": {
+        "p_reservation_id", "p_actual_cost", "p_run_id",
+        "p_worker_id", "p_attempt", "p_lease_token",
+    },
+}
+
+
+def advertised_rpc_args(post_spec: dict) -> set[str] | None:
+    """Argument names an RPC advertises in the PostgREST OpenAPI document.
+
+    PostgREST (Swagger 2.0) lists an RPC's named arguments as the
+    properties of its single in-body parameter schema. Returns None when
+    that shape cannot be established — callers must fail closed on None,
+    never assume.
+    """
+    parameters = post_spec.get("parameters")
+    if not isinstance(parameters, list):
+        return None
+    for parameter in parameters:
+        if isinstance(parameter, dict) and parameter.get("in") == "body":
+            schema = parameter.get("schema")
+            if not isinstance(schema, dict):
+                return None
+            properties = schema.get("properties")
+            if not isinstance(properties, dict):
+                return None
+            return set(properties)
+    return None
+
+
+def check_rpc_surface(checks: dict[str, str], problems: list[str]) -> None:
+    """NON-MUTATING RPC existence/signature check via OpenAPI introspection.
+
+    Never POSTs to an RPC: Stage C attempt 2 failed because the previous
+    check POSTed `{}` and treated HTTP 404 as "function absent" — but
+    PostgREST resolves functions by name AND argument keys, so an existing
+    function with required parameters answers 404 (PGRST202) to an empty
+    body. A mismatched-invocation 404 is NOT proof of absence, and probing
+    by invoking mutating RPCs is unsafe by construction. Instead the
+    service-role GET of the PostgREST root returns the OpenAPI document;
+    each required RPC must be exposed as /rpc/<name> and advertise every
+    required argument name. Any unavailable, malformed, unauthorized or
+    ambiguous metadata fails closed.
+    """
+    status, spec = call("GET", "/rest/v1/")
+    paths = spec.get("paths") if isinstance(spec, dict) else None
+    if status != 200 or not isinstance(paths, dict):
+        for rpc in REQUIRED_RPC_ARGS:
+            checks[f"rpc_{rpc}"] = "UNVERIFIED"
+        problems.append(
+            f"PostgREST OpenAPI introspection unavailable (HTTP {status}) — "
+            "cannot establish the RPC surface; failing closed"
+        )
+        return
+    for rpc, required_args in REQUIRED_RPC_ARGS.items():
+        entry = paths.get(f"/rpc/{rpc}")
+        post_spec = entry.get("post") if isinstance(entry, dict) else None
+        if not isinstance(post_spec, dict):
+            checks[f"rpc_{rpc}"] = "MISSING"
+            problems.append(f"rpc_{rpc} is MISSING from the exposed RPC surface")
+            continue
+        advertised = advertised_rpc_args(post_spec)
+        if advertised is None:
+            checks[f"rpc_{rpc}"] = "UNVERIFIED"
+            problems.append(
+                f"rpc_{rpc}: argument metadata malformed/ambiguous — "
+                "cannot verify the callable surface; failing closed"
+            )
+        elif not required_args <= advertised:
+            missing = sorted(required_args - advertised)
+            checks[f"rpc_{rpc}"] = "SIGNATURE_MISMATCH"
+            problems.append(
+                f"rpc_{rpc}: required argument(s) {missing} not advertised — "
+                "the deployed signature differs from the release migrations"
+            )
+        else:
+            checks[f"rpc_{rpc}"] = "present"
+
+
 def preflight() -> None:
     checks: dict[str, str] = {}
     problems: list[str] = []
-    # Migration 012/000400: transactional run-creation RPC must exist.
-    status, body = call("POST", "/rest/v1/rpc/create_message_and_run_v2", {})
-    checks["rpc_create_message_and_run_v2"] = "present" if status != 404 else "MISSING"
+    # Migrations 012/000400/000300/000600: full RPC surface, verified
+    # WITHOUT invoking anything (see check_rpc_surface).
+    check_rpc_surface(checks, problems)
     # Migration 000600: attempt-aware reservation identity.
     status, _ = call("GET", "/rest/v1/model_call_budget_reservations?select=attempt&limit=1")
     checks["reservations_attempt_column"] = "present" if status == 200 else "MISSING"
     # Migration 012: lease tokens on runs.
     status, _ = call("GET", "/rest/v1/runs?select=lease_token,launch_state&limit=1")
     checks["runs_lease_columns"] = "present" if status == 200 else "MISSING"
-    # Migration 000300/000600 guarded RPC surface.
-    for rpc in ("transition_run_worker_guarded", "heartbeat_run_guarded", "update_run_usage_guarded", "settle_model_call_budget_guarded"):
-        status, _ = call("POST", f"/rest/v1/rpc/{rpc}", {})
-        checks[f"rpc_{rpc}"] = "present" if status != 404 else "MISSING"
     # Ledger table (013/000500).
     status, _ = call("GET", "/rest/v1/run_usage_ledger?select=id&limit=1")
     checks["run_usage_ledger"] = "present" if status == 200 else "MISSING"
-    problems.extend(f"{k} is MISSING" for k, v in checks.items() if v == "MISSING")
+    problems.extend(
+        f"{k} is MISSING" for k, v in checks.items() if v == "MISSING" and not k.startswith("rpc_")
+    )
 
     # Stage C precondition: the runs table must hold EXACTLY the expected
     # number of pre-existing rows (default zero) — enforced with a real
