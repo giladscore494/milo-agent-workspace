@@ -27,13 +27,21 @@ fail() {
 
 run_probe() {
   local job="$1"; shift
-  # ^@^ delimiter so values may contain commas (e.g. STAGE_C_CAPS).
+  # Multi-character gcloud env-var delimiter so values may contain commas
+  # (e.g. STAGE_C_CAPS). Collision fails closed BEFORE any gcloud call.
+  local delim=":::"
   local env_overrides=""
-  for kv in "$@"; do env_overrides+="${env_overrides:+@}${kv}"; done
+  for kv in "$@"; do
+    if [[ "${kv}" == *"${delim}"* ]]; then
+      echo "STAGE C REFUSED: env override '${kv%%=*}' contains the delimiter '${delim}'" >&2
+      exit 1
+    fi
+    env_overrides+="${env_overrides:+${delim}}${kv}"
+  done
   local exec_name
   exec_name="$(gcloud run jobs execute "${job}" \
     --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
-    --update-env-vars="^@^${env_overrides}" \
+    --update-env-vars="^${delim}^${env_overrides}" \
     --wait --format='value(metadata.name)')"
   gcloud logging read \
     "resource.type=cloud_run_job AND resource.labels.job_name=${job} AND labels.\"run.googleapis.com/execution_name\"=${exec_name}" \
