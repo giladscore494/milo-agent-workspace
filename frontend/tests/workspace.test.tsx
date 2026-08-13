@@ -95,6 +95,18 @@ describe('authenticated workspace (execution UI disabled)', () => {
     expect(await screen.findByText(`ID ${CONVERSATION.id} • project ${CONVERSATION.project_id}`)).toBeInTheDocument();
   });
 
+  it('creates a conversation without typing a title (backend supplies the default)', async () => {
+    const DEFAULT_TITLED = { ...CONVERSATION, title: 'New conversation' };
+    apiMocks.api.createConversation.mockResolvedValue(DEFAULT_TITLED);
+    render(<Page/>);
+    fireEvent.click(await screen.findByText('MILO Vehicle Catalog'));
+    fireEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+    // No title typed: the client sends undefined and the request must still succeed.
+    await waitFor(() => expect(apiMocks.api.createConversation).toHaveBeenCalledWith(PROJECT.id, undefined));
+    expect(await screen.findByText(`ID ${DEFAULT_TITLED.id} • project ${DEFAULT_TITLED.project_id}`)).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
   it('lists existing conversations for the selected project', async () => {
     apiMocks.api.conversations.mockResolvedValue([CONVERSATION]);
     render(<Page/>);

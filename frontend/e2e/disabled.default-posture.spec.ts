@@ -56,6 +56,25 @@ test('7. conversation creation succeeds for a member', async ({ page }) => {
   await expect(page.getByText(/ID .* • project/)).toBeVisible();
 });
 
+test('7b. clicking New conversation with no title succeeds with the safe default', async ({ page }) => {
+  // Regression: an empty title used to reach the NOT NULL conversations.title
+  // column as null (PostgreSQL 23502) and fail the click.
+  await loginViaUi(page, 'alice');
+  await page.getByText('Alpha Research').click();
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await expect(page.getByText(/ID .* • project/)).toBeVisible();
+});
+
+test('7c. API conversation creation without a title returns 201 and the default title', async ({ request, baseURL }) => {
+  const token = await apiToken(request, 'alice');
+  const response = await request.post(`${baseURL}/api/gateway/projects/${PROJECT_ALPHA}/conversations`, {
+    headers: authHeaders(token),
+    data: {},
+  });
+  expect(response.status()).toBe(201);
+  expect((await response.json()).title).toBe('New conversation');
+});
+
 test('8. proposal creation while disabled returns 403', async ({ request, baseURL }) => {
   const token = await apiToken(request, 'alice');
   const response = await request.post(`${baseURL}/api/gateway/workflow-proposals`, {

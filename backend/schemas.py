@@ -1,7 +1,19 @@
 from datetime import datetime
 from typing import Any
 from uuid import UUID
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+DEFAULT_CONVERSATION_TITLE = "New conversation"
+
+
+def normalize_conversation_title(title: str | None) -> str:
+    """Non-null conversation title for the NOT NULL conversations.title column.
+
+    Missing/None/blank/whitespace-only titles become the safe default;
+    explicit titles are preserved (surrounding whitespace stripped).
+    """
+    normalized = (title or "").strip()
+    return normalized or DEFAULT_CONVERSATION_TITLE
 
 
 class HealthResponse(BaseModel):
@@ -21,7 +33,16 @@ class Project(BaseModel):
 
 
 class ConversationCreate(BaseModel):
-    title: str | None = None
+    # The request may omit the title entirely; the contract guarantees a
+    # non-null value so inserts can never violate conversations.title NOT NULL.
+    title: str = DEFAULT_CONVERSATION_TITLE
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _non_null_title(cls, value: Any) -> str:
+        if value is not None and not isinstance(value, str):
+            raise ValueError("title must be a string")
+        return normalize_conversation_title(value)
 
 
 class Conversation(BaseModel):
