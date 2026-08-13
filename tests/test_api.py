@@ -178,6 +178,21 @@ def test_conversation_creation(repo):
     assert response.json()["project_id"] == str(repo.project_id)
 
 
+@pytest.mark.parametrize("body", [{}, {"title": None}, {"title": ""}, {"title": "   "}])
+def test_conversation_creation_without_title_gets_safe_default(repo, body):
+    """Regression: missing/null/blank titles must never reach the NOT NULL
+    conversations.title column as None (PostgreSQL 23502)."""
+    response = TestClient(app).post(f"/projects/{repo.project_id}/conversations", json=body, headers={"x-milo-auth-user-id": str(repo.user_id)})
+    assert response.status_code == 201
+    assert response.json()["title"] == "New conversation"
+
+
+def test_conversation_creation_preserves_explicit_title(repo):
+    response = TestClient(app).post(f"/projects/{repo.project_id}/conversations", json={"title": "  Q3 market sweep  "}, headers={"x-milo-auth-user-id": str(repo.user_id)})
+    assert response.status_code == 201
+    assert response.json()["title"] == "Q3 market sweep"
+
+
 def test_run_creation_disabled_creates_no_message_run_or_launch(repo):
     response = TestClient(app).post(f"/conversations/{repo.conversation_id}/runs", json={"content": "Build catalog"})
     assert response.status_code == 403

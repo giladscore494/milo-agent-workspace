@@ -5,6 +5,7 @@ from supabase import create_client
 from backend.config import Settings
 from backend.errors import AppError, NotFoundError
 from backend.runtime import RUN_STATES, InvalidTransition, validate_transition
+from backend.schemas import normalize_conversation_title
 
 
 class Repository(Protocol):
@@ -84,7 +85,8 @@ class SupabaseRepository:
 
     def create_conversation(self, project_id: UUID, title: str | None, user_id: UUID | None = None) -> dict[str, Any]:
         self.get_project(project_id, user_id)
-        return self._single(self.client.table("conversations").insert({"project_id": str(project_id), "title": title}).select("*"), "conversation", "new")
+        # conversations.title is NOT NULL in production; never insert None.
+        return self._single(self.client.table("conversations").insert({"project_id": str(project_id), "title": normalize_conversation_title(title)}).select("*"), "conversation", "new")
 
     def list_conversations(self, project_id: UUID) -> list[dict[str, Any]]:
         # Callers must have already verified project membership.

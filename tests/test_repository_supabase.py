@@ -80,6 +80,25 @@ def repo():
     return repository
 
 
+@pytest.mark.parametrize("title", [None, "", "   "])
+def test_create_conversation_never_inserts_null_title(repo, title):
+    """Regression: conversations.title is NOT NULL in production (23502)."""
+    project_id = uuid4()
+    repo.client.select_data["projects"] = [{"id": str(project_id)}]
+    repo.create_conversation(project_id, title)
+    table, payload = repo.client.inserted[0]
+    assert table == "conversations"
+    assert payload["title"] == "New conversation"
+
+
+def test_create_conversation_preserves_explicit_title(repo):
+    project_id = uuid4()
+    repo.client.select_data["projects"] = [{"id": str(project_id)}]
+    repo.create_conversation(project_id, "  Fleet refresh  ")
+    _, payload = repo.client.inserted[0]
+    assert payload["title"] == "Fleet refresh"
+
+
 def test_create_user_message_writes_role_column(repo):
     conversation_id = uuid4()
     repo.client.select_data["conversations"] = [{"id": str(conversation_id)}]
