@@ -1,11 +1,14 @@
 # Stage C acceptance report — one controlled paid smoke run
 
-Status: **BLOCKED_PENDING_OPERATOR_WRITE_ACCESS** — the paid smoke run was
-**not executed**. Zero production mutations occurred, zero provider calls
-were made, zero cost was incurred, and production remains in its exact
-pre-Stage-C posture (re-verified read-only at the end of the session, see
-"Production unchanged" below). Stage C is fully prepared: the complete
-operator toolkit is in [`scripts/release/stage-c/`](../../scripts/release/stage-c/README.md).
+Status: **ATTEMPT_1_FAILED_SAFELY_AT_PREFLIGHT — corrective PR pending
+review** (see "Stage C attempt 1" below). No MILO run was ever created:
+zero worker executions, zero provider calls, zero paid cost. The operator
+ran the kill switch and restored the fail-closed posture; do NOT
+re-attempt Stage C until the probe-transport corrective fix is reviewed
+and merged. The complete operator toolkit is in
+[`scripts/release/stage-c/`](../../scripts/release/stage-c/README.md).
+(The original pre-toolkit status, kept for history: the first prepared
+session was blocked on operator write access and executed nothing.)
 
 Date: 2026-08-11/12. Production: GCP `big-cabinet-457321-t7`
 (us-central1). Provider: Moonshot/Kimi (`kimi-k2.6`). Release under test:
@@ -65,6 +68,39 @@ combination and would likely fail mid-lifecycle. No image exists in the
 production registry for `30b05bc…` (verified via
 `gcloud artifacts docker tags list`). Toolkit steps 1–2 build and deploy
 the correct release before anything is enabled.
+
+## Stage C attempt 1 (2026-08-13) — FAILED SAFELY at DB preflight
+
+The operator executed the toolkit through step 5. The **preflight DB probe
+crashed before any MILO run existed**: `04-create-probes.sh` transported
+the raw `probe_db.py` source inside `--set-env-vars` using `^@^` as the
+gcloud dict delimiter, and the source contains the literal
+`stage-c-smoke@invalid.milo`, so gcloud split `PROBE_SOURCE` at the `@`.
+The deployed probe failed with
+`SyntaxError: unterminated string literal` at `TEST_EMAIL`.
+The fail-closed design held:
+
+| Outcome | Value |
+| --- | --- |
+| MILO runs created | **0** |
+| Worker executions | **0** |
+| Provider calls / tokens / paid cost | **0 / 0 / $0** |
+| Kill switch + cleanup | completed by the operator |
+
+Restored posture (operator-confirmed): `MILO_ENABLE_PAID_EXECUTION=false`,
+`KIMI_API_KEY` unbound from the worker, `MILO_ENABLE_RUN_CREATION=false`,
+`JOB_LAUNCHER=disabled`, both disposable probe jobs deleted. Release
+images remain deployed (signed-off code, inert while flags are off).
+
+Corrective fix (this commit, no production mutation): probe-source
+transport now uses a multi-character delimiter (`:::`) that is asserted
+absent from BOTH probe sources before any `gcloud` call — a collision
+fails closed; the sources still ship byte-for-byte, unchanged. The
+`run_probe` helpers in steps 5/6 (same transport pattern, no live
+collision in their current values) were hardened to the same checked
+delimiter. Stage C must NOT be re-attempted (no rebuild, deploy,
+re-enable, probe creation or run) until this corrective PR is reviewed
+and merged.
 
 ## Corrective safety pass (2026-08-13, no production mutation)
 

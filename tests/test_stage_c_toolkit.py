@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -553,6 +554,116 @@ def test_step_scripts_abort_when_env_refuses():
     assert result.returncode != 0
     assert "STAGE C REFUSED" in result.stderr
     assert "gcloud" not in result.stdout  # refused before doing anything
+
+
+# ---------------------------------------------------------------------------
+# probe-source transport: gcloud env-var delimiter must never split the source
+# (Stage C attempt 1 failed on '^@^' splitting at stage-c-smoke@invalid.milo)
+# ---------------------------------------------------------------------------
+
+
+DELIM = ":::"
+
+
+def gcloud_env_dict(set_env_vars_arg: str) -> dict[str, str]:
+    """Replicate gcloud's ^DELIM^ env-var splitting semantics."""
+    assert set_env_vars_arg.startswith("^"), set_env_vars_arg[:20]
+    delim, _, rest = set_env_vars_arg[1:].partition("^")
+    env = {}
+    for pair in rest.split(delim):
+        key, _, value = pair.partition("=")
+        env[key] = value
+    return env
+
+
+def run_create_probes(stage_c_dir: Path, tmp_path: Path):
+    """Run 04-create-probes.sh with a mocked gcloud that records argv verbatim."""
+    bin_dir = tmp_path / "mockbin"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "gcloud-args.log"
+    mock = bin_dir / "gcloud"
+    mock.write_text('#!/usr/bin/env bash\nprintf "%s\\0" "$@" >> "' + str(log) + '"\n')
+    mock.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(stage_c_dir / "04-create-probes.sh")],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        timeout=120,
+    )
+    args = log.read_bytes().decode().split("\0") if log.exists() else []
+    return result, args
+
+
+def test_delimiter_absent_from_both_probe_sources_and_at_sign_present():
+    db_source = (STAGE_C / "probe_db.py").read_text()
+    gw_source = (STAGE_C / "probe_gateway.py").read_text()
+    for name, source in (("probe_db.py", db_source), ("probe_gateway.py", gw_source)):
+        assert DELIM not in source, f"{name} contains the transport delimiter {DELIM!r}"
+        # The regression trigger must stay covered: '@' IS in the sources,
+        # so a single-character '@' delimiter would split them again.
+        assert "@" in source, name
+
+
+def test_probe_sources_survive_gcloud_transport_byte_for_byte(tmp_path):
+    result, args = run_create_probes(STAGE_C, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    env_args = [a for a in args if a.startswith("--set-env-vars=")]
+    assert len(env_args) == 2, "expected one env-var arg per probe job"
+    db_env = gcloud_env_dict(env_args[0].removeprefix("--set-env-vars="))
+    gw_env = gcloud_env_dict(env_args[1].removeprefix("--set-env-vars="))
+    # Byte-for-byte identical to the files on disk after gcloud splitting.
+    assert db_env["PROBE_SOURCE"] == (STAGE_C / "probe_db.py").read_text()
+    assert gw_env["PROBE_SOURCE"] == (STAGE_C / "probe_gateway.py").read_text()
+    # The literal that broke attempt 1 survives whole.
+    assert 'os.environ.get("STAGE_C_TEST_EMAIL", "stage-c-smoke@invalid.milo")' in db_env["PROBE_SOURCE"]
+    # And the transported sources are still valid Python.
+    compile(db_env["PROBE_SOURCE"], "probe_db.py", "exec")
+    compile(gw_env["PROBE_SOURCE"], "probe_gateway.py", "exec")
+    assert db_env["STAGE_C_MODE"] == "preflight"
+    assert gw_env["STAGE_C_MODE"] == "create"
+
+
+def test_delimiter_collision_fails_closed_before_any_gcloud_call(tmp_path):
+    staged = tmp_path / "stage-c"
+    shutil.copytree(STAGE_C, staged)
+    with open(staged / "probe_db.py", "a", encoding="utf-8") as fh:
+        fh.write(f'\nCOLLIDING = "{DELIM}"\n')
+    result, args = run_create_probes(staged, tmp_path)
+    assert result.returncode != 0
+    assert "STAGE C REFUSED" in result.stderr
+    assert "DB_SOURCE" in result.stderr
+    assert args == [], "gcloud was invoked despite the delimiter collision"
+
+
+def test_create_probes_introduces_no_paid_flags_or_extra_mutations(tmp_path):
+    result, args = run_create_probes(STAGE_C, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    blob = "\0".join(args)
+    # Only the two authorized disposable job creations; nothing else.
+    assert blob.count("jobs\0create") == 2
+    for forbidden in ("services\0update", "jobs\0update", "jobs\0execute", "builds\0submit", "MILO_ENABLE_", "KIMI_API_KEY="):
+        assert forbidden not in blob, f"unexpected mutation surface: {forbidden}"
+    # The gateway probe binds no secrets; the DB probe binds only the two
+    # Supabase secrets that identity already reads.
+    secret_args = [a for a in args if a.startswith("--set-secrets=")]
+    assert secret_args == ["--set-secrets=SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest"]
+
+
+def test_run_probe_helpers_use_checked_multichar_delimiter():
+    for script in ("05-execute-smoke.sh", "06-collect-evidence.sh"):
+        text = (STAGE_C / script).read_text()
+        assert 'delim=":::"' in text, script
+        assert "STAGE C REFUSED" in text, script
+        assert '"^@^' not in text, f"{script} still uses the collision-prone @ delimiter"
+    assert '"^@^' not in (STAGE_C / "04-create-probes.sh").read_text()
+
+
+def test_acceptance_doc_records_attempt_1_failed_safely():
+    text = (REPO / "docs" / "production-readiness" / "STAGE_C_ACCEPTANCE.md").read_text()
+    assert "FAILED SAFELY at DB preflight" in text
+    assert "unterminated string literal" in text
+    assert "stage-c-smoke@invalid.milo" in text
 
 
 def test_acceptance_doc_does_not_call_three_dollars_a_hard_billing_ceiling():
