@@ -465,10 +465,94 @@ def test_collect_evidence_is_a_gate_not_a_checklist():
     assert "Validation checklist to record" not in text  # replaced by executable checks
 
 
-def test_env_defines_single_pass_terminal_state_default():
-    text = (STAGE_C / "stage-c-env.sh").read_text()
-    assert 'STAGE_C_ACCEPTABLE_TERMINAL_STATES:-completed' in text
-    assert 'STAGE_C_EXPECTED_PRIOR_RUNS:-0' in text
+# ---------------------------------------------------------------------------
+# stage-c-env.sh: authorized constants are pinned; inherited shell values
+# cannot widen or redirect the authorization
+# ---------------------------------------------------------------------------
+
+
+AUTHORIZED = {
+    "STAGE_C_PROJECT": "big-cabinet-457321-t7",
+    "STAGE_C_REGION": "us-central1",
+    "STAGE_C_RELEASE_SHA": RELEASE_SHA,
+    "STAGE_C_EXPECTED_PRIOR_RUNS": "0",
+    "STAGE_C_ACCEPTABLE_TERMINAL_STATES": "completed",
+}
+
+
+def source_stage_c_env(overrides=None):
+    """Source stage-c-env.sh the way every step script does and dump the
+    resulting authorized values (empty env apart from the overrides)."""
+    dump = "; ".join(f'echo "{k}=${{{k}}}"' for k in list(AUTHORIZED) + ["STAGE_C_CAPS", "STAGE_C_REGISTRY", "STAGE_C_REPO_URL"])
+    return subprocess.run(
+        ["bash", "-c", f"set -euo pipefail; source '{STAGE_C / 'stage-c-env.sh'}'; {dump}"],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", **(overrides or {})},
+        timeout=60,
+    )
+
+
+def test_env_exports_the_exact_authorized_constants():
+    result = source_stage_c_env()
+    assert result.returncode == 0, result.stderr
+    for key, value in AUTHORIZED.items():
+        assert f"{key}={value}" in result.stdout
+    assert f"STAGE_C_CAPS={CAPS}" in result.stdout  # caps kept exact
+
+
+@pytest.mark.parametrize("var,hostile", [
+    ("STAGE_C_PROJECT", "attacker-project-123"),
+    ("STAGE_C_REGION", "europe-west1"),
+    ("STAGE_C_RELEASE_SHA", "791f7af9" + "0" * 32),  # a different valid-looking SHA
+    ("STAGE_C_EXPECTED_PRIOR_RUNS", "5"),
+    ("STAGE_C_ACCEPTABLE_TERMINAL_STATES", "completed,failed,budget_exhausted"),
+])
+def test_env_refuses_inherited_override_of_authorized_constants(var, hostile):
+    result = source_stage_c_env({var: hostile})
+    assert result.returncode != 0, f"{var} override was silently accepted"
+    assert "STAGE C REFUSED" in result.stderr
+    assert var in result.stderr
+    # The hostile value must never surface as the exported posture.
+    assert f"{var}={hostile}" not in result.stdout
+
+
+@pytest.mark.parametrize("var,hostile", [
+    ("STAGE_C_CAPS", "MILO_MAX_COST_PER_RUN=300.00"),
+    ("STAGE_C_REGISTRY", "us-central1-docker.pkg.dev/attacker-project/evil"),
+    ("STAGE_C_REPO_URL", "https://github.com/attacker/fork.git"),
+    ("STAGE_C_API_URL", "https://attacker.example.run.app"),
+    ("STAGE_C_IDEMPOTENCY_KEY", "second-run-key"),
+])
+def test_env_refuses_redirection_of_derived_authorization_surface(var, hostile):
+    result = source_stage_c_env({var: hostile})
+    assert result.returncode != 0, f"{var} override was silently accepted"
+    assert "STAGE C REFUSED" in result.stderr
+
+
+def test_env_accepts_values_equal_to_the_authorized_constants():
+    """Re-sourcing (every step script sources the file) must stay idempotent."""
+    result = source_stage_c_env(dict(AUTHORIZED))
+    assert result.returncode == 0, result.stderr
+
+
+def test_step_scripts_abort_when_env_refuses():
+    """A conflicting environment must stop a step script before any gcloud
+    call — the refusal happens at source time under set -e."""
+    for script in ("05-execute-smoke.sh", "06-collect-evidence.sh", "kill-switch.sh"):
+        text = (STAGE_C / script).read_text()
+        assert "set -euo pipefail" in text
+        assert "source ./stage-c-env.sh" in text
+    result = subprocess.run(
+        ["bash", str(STAGE_C / "03b-verify-stage-c-posture.sh")],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "STAGE_C_PROJECT": "attacker-project-123"},
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "STAGE C REFUSED" in result.stderr
+    assert "gcloud" not in result.stdout  # refused before doing anything
 
 
 def test_acceptance_doc_does_not_call_three_dollars_a_hard_billing_ceiling():

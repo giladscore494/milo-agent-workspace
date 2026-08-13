@@ -94,6 +94,15 @@ Nothing was deployed, enabled, bound, or executed in production. Fixes:
 5. **Cost ceiling corrected** — see "Cost ceiling" above: $3.00 bounds
    tracked token-derived cost only; provider-side web-search tool charges
    are untracked and bounded separately (conservative total ≤ $9.00).
+6. **Authorized constants pinned** — `stage-c-env.sh` no longer accepts
+   environment overrides: project (`big-cabinet-457321-t7`), region
+   (`us-central1`), release SHA (`30b05bc…`), expected prior runs (0),
+   acceptable terminal states (`completed`), plus the registry, repo URL,
+   service/job/SA names, API URL, idempotency key and `STAGE_C_CAPS` are
+   all pinned. An inherited shell value that conflicts with any pinned
+   constant makes every step script refuse at source time (fail closed) —
+   the authorization cannot be widened or redirected from the operator's
+   shell; changing a constant requires a reviewed commit.
 
 ## Prepared procedure (operator-executable, in order)
 
