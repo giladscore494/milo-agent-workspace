@@ -15,8 +15,8 @@ production by design; these steps are why.
 | 2 | `02-deploy-images.sh` | worker job, API service | deploy release images, **flags unchanged/off** |
 | 3 | `03-enable-stage-c.md` (**manual commands** — by policy no committed script enables execution flags) then `03b-verify-stage-c-posture.sh` (read-only) | worker job, API service | smallest-safe caps; worker: paid flag on + `KIMI_API_KEY` binding (worker only); API: launcher + run creation on |
 | 4 | `04-create-probes.sh` | creates 2 disposable jobs | `stagec-db-probe` (as `milo-api-runtime@`; DB checks/setup/evidence) and `stagec-gw-probe` (as `milo-vercel-gateway@`; drives the API) |
-| 5 | `05-execute-smoke.sh` | one run | re-verifies launch invariants, creates test data, executes exactly ONE run through API → launcher → worker → provider → Supabase, monitors to terminal state, immediate idempotent-replay check |
-| 6 | `06-collect-evidence.sh` | no | full post-run DB/lifecycle/budget evidence + post-completion replay check |
+| 5 | `05-execute-smoke.sh` | one run | re-verifies launch invariants (release images + **exact** cap values on both surfaces via `verify_caps.py`, IAM, zero executions), exact zero-prior-run DB preflight, creates test data, executes exactly ONE run through API → launcher → worker → provider → Supabase; the poll exits non-zero (kill switch!) on any terminal state outside the acceptance policy (default: `completed` only) |
+| 6 | `06-collect-evidence.sh` | no | **executable acceptance gate** — exits non-zero unless every criterion holds (one run/one execution, terminal state, claim/heartbeat invariants, zero dangling reservations, ledger/usage accounting, cost/token/call caps, idempotent replay, zero secret markers) |
 | 7 | `07-post-smoke-posture.sh` | worker job, API service, deletes probes | fail-closed posture: run creation off, launcher disabled, paid off, provider-key binding removed |
 | any | `kill-switch.sh` | worker job, API service | immediate fail-closed (use at ANY sign of trouble) |
 
@@ -36,4 +36,16 @@ Notes:
   any worker execution already exists.
 - Caps are defined once in `stage-c-env.sh` (`STAGE_C_CAPS`); see
   `docs/production-readiness/STAGE_C_ACCEPTANCE.md` for the sizing
-  rationale against the preserved pipeline shape.
+  rationale against the preserved pipeline shape. `verify_caps.py`
+  enforces the exact values on both worker and API immediately before run
+  creation and fails on any missing/changed/unexpected budget variable.
+- **Cost ceiling caveat**: `MILO_MAX_COST_PER_RUN=3.00` bounds tracked
+  token-derived cost only. Moonshot's `$web_search` tool is billed per
+  invocation outside MILO's accounting — conservative total exposure for
+  the one run is ≤ $9.00 (see the cost-ceiling section of
+  `STAGE_C_ACCEPTANCE.md`). Verify the actual billed total in the
+  Moonshot console after the run.
+- Acceptance policy: only `completed` is a PASS terminal state.
+  `failed`/`cancelled`/`timed_out`/`budget_exhausted`/`partial_success`
+  fail the smoke test — the poll and evidence gates exit non-zero and
+  instruct you to run `kill-switch.sh`.

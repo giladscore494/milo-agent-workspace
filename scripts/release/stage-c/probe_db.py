@@ -7,10 +7,17 @@ Python standard library only, prints structured JSON evidence and NEVER
 prints a secret value.
 
 Modes (env STAGE_C_MODE):
-  preflight — verify migration-dependent schema/RPC surface + zero runs
+  preflight — verify migration-dependent schema/RPC surface AND enforce
+              (via a real server-side exact count) that the runs table
+              holds exactly STAGE_C_EXPECTED_PRIOR_RUNS rows (default 0)
+              and zero rows for the Stage C idempotency key; fails closed
+              on any other value or on an unavailable count
   setup     — idempotently create the operator test user, dedicated
               stage-c-smoke project, membership and conversation
-  evidence  — full post-run evidence for env STAGE_C_RUN_ID
+  evidence  — executable acceptance gate for env STAGE_C_RUN_ID: exits
+              non-zero unless EVERY acceptance criterion holds
+
+Exit codes: 0 = PASS, 1 = a check failed (fail closed).
 """
 
 from __future__ import annotations
@@ -25,6 +32,12 @@ BASE = os.environ["SUPABASE_URL"].rstrip("/")
 KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 TEST_EMAIL = os.environ.get("STAGE_C_TEST_EMAIL", "stage-c-smoke@invalid.milo")
 PROJECT_SLUG = "stage-c-smoke"
+
+KILL_SWITCH_ACTION = (
+    "Treat the smoke run as FAILED. RUN THE KILL SWITCH NOW: "
+    "scripts/release/stage-c/kill-switch.sh — then restore posture with "
+    "07-post-smoke-posture.sh and record the failure in STAGE_C_ACCEPTANCE.md."
+)
 
 
 def call(method: str, path: str, body: dict | list | None = None, headers: dict | None = None):
@@ -51,6 +64,44 @@ def call(method: str, path: str, body: dict | list | None = None, headers: dict 
             return exc.code, {"raw": raw.decode(errors="replace")[:300]}
 
 
+def parse_content_range_total(header: str | None) -> int | None:
+    """Total row count from a PostgREST Content-Range header, else None.
+
+    Accepts "0-0/17" and "*/0" forms. "0-0/*" (count not computed) returns
+    None so callers fail closed instead of trusting a partial page length.
+    """
+    if not header or "/" not in header:
+        return None
+    total = header.rsplit("/", 1)[1].strip()
+    if not total.isdigit():
+        return None
+    return int(total)
+
+
+def count_exact(path_with_query: str) -> int | None:
+    """Real server-side exact row count (Prefer: count=exact), else None."""
+    request = urllib.request.Request(
+        BASE + path_with_query,
+        method="GET",
+        headers={
+            "apikey": KEY,
+            "Authorization": f"Bearer {KEY}",
+            "Prefer": "count=exact",
+            "Range-Unit": "items",
+            "Range": "0-0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return parse_content_range_total(response.headers.get("Content-Range"))
+    except urllib.error.HTTPError as exc:
+        # PostgREST answers 416 for an out-of-range page on some versions;
+        # the Content-Range header still carries the exact total.
+        if exc.code == 416:
+            return parse_content_range_total(exc.headers.get("Content-Range"))
+        return None
+
+
 def fail(reason: str) -> None:
     print(json.dumps({"stage_c_probe": "BLOCKED", "reason": reason}))
     sys.exit(1)
@@ -58,6 +109,7 @@ def fail(reason: str) -> None:
 
 def preflight() -> None:
     checks: dict[str, str] = {}
+    problems: list[str] = []
     # Migration 012/000400: transactional run-creation RPC must exist.
     status, body = call("POST", "/rest/v1/rpc/create_message_and_run_v2", {})
     checks["rpc_create_message_and_run_v2"] = "present" if status != 404 else "MISSING"
@@ -74,12 +126,35 @@ def preflight() -> None:
     # Ledger table (013/000500).
     status, _ = call("GET", "/rest/v1/run_usage_ledger?select=id&limit=1")
     checks["run_usage_ledger"] = "present" if status == 200 else "MISSING"
-    # Zero prior runs (Stage C precondition).
-    status, rows = call("GET", "/rest/v1/runs?select=id", headers={"Prefer": "count=exact", "Range": "0-0"})
-    checks["existing_runs"] = str(len(rows or []))
-    missing = {k: v for k, v in checks.items() if v == "MISSING"}
-    print(json.dumps({"stage_c_probe": "preflight", "checks": checks, "ok": not missing}))
-    if missing:
+    problems.extend(f"{k} is MISSING" for k, v in checks.items() if v == "MISSING")
+
+    # Stage C precondition: the runs table must hold EXACTLY the expected
+    # number of pre-existing rows (default zero) — enforced with a real
+    # server-side exact count, failing closed if the count is unavailable.
+    expected_prior = int(os.environ.get("STAGE_C_EXPECTED_PRIOR_RUNS", "0"))
+    total_runs = count_exact("/rest/v1/runs?select=id")
+    checks["existing_runs"] = "UNKNOWN" if total_runs is None else str(total_runs)
+    checks["expected_prior_runs"] = str(expected_prior)
+    if total_runs is None:
+        problems.append("exact run count unavailable (no Content-Range total) — failing closed")
+    elif total_runs != expected_prior:
+        problems.append(
+            f"runs table holds {total_runs} row(s), expected exactly {expected_prior} — "
+            "a Stage C/test run may already exist; refusing to create the authorized run"
+        )
+
+    # Zero pre-existing Stage C runs under the fixed idempotency key.
+    idempotency_key = os.environ.get("STAGE_C_IDEMPOTENCY_KEY")
+    if idempotency_key:
+        stage_c_runs = count_exact(f"/rest/v1/runs?select=id&idempotency_key=eq.{idempotency_key}")
+        checks["existing_stage_c_runs"] = "UNKNOWN" if stage_c_runs is None else str(stage_c_runs)
+        if stage_c_runs is None:
+            problems.append("exact Stage C run count unavailable — failing closed")
+        elif stage_c_runs != 0:
+            problems.append(f"{stage_c_runs} pre-existing run(s) with idempotency key {idempotency_key!r}")
+
+    print(json.dumps({"stage_c_probe": "preflight", "checks": checks, "problems": problems, "ok": not problems}))
+    if problems:
         sys.exit(1)
 
 
@@ -149,10 +224,51 @@ def setup() -> None:
 
 SECRET_MARKERS = ("sk-", "KIMI_API_KEY", "MOONSHOT_API_KEY", "service_role", "sb_secret")
 
+# Cap values the evidence gate verifies against; provided via STAGE_C_CAPS
+# (the exact string from stage-c-env.sh) so there is a single source of
+# expected values. Missing keys fail the gate closed.
+REQUIRED_CAP_KEYS = (
+    "MILO_MAX_MODEL_CALLS_PER_RUN",
+    "MILO_MAX_INPUT_TOKENS_PER_RUN",
+    "MILO_MAX_OUTPUT_TOKENS_PER_RUN",
+    "MILO_MAX_TOTAL_TOKENS_PER_RUN",
+    "MILO_MAX_COST_PER_RUN",
+)
+
+COST_TOLERANCE = 5e-6  # ledger/usage values are rounded to 6 decimal places
+
+
+def expected_caps() -> dict[str, str]:
+    caps: dict[str, str] = {}
+    for pair in os.environ.get("STAGE_C_CAPS", "").split(","):
+        if "=" in pair:
+            key, value = pair.split("=", 1)
+            caps[key.strip()] = value.strip()
+    return caps
+
 
 def evidence() -> None:
+    """Executable acceptance gate — exits non-zero if ANY criterion fails.
+
+    Two criteria live in 06-collect-evidence.sh because they need gcloud or
+    the gateway identity: worker execution count == 1 and the
+    post-completion idempotent replay; the shell gate enforces both.
+    """
     run_id = os.environ["STAGE_C_RUN_ID"]
+    expected_terminal = {
+        s.strip()
+        for s in os.environ.get("STAGE_C_EXPECTED_TERMINAL_STATES", "completed").split(",")
+        if s.strip()
+    }
+    expected_idempotency = os.environ.get("STAGE_C_IDEMPOTENCY_KEY")
+    caps = expected_caps()
+    failures: list[str] = []
     out: dict = {"stage_c_probe": "evidence", "run_id": run_id}
+
+    missing_caps = [k for k in REQUIRED_CAP_KEYS if k not in caps]
+    if missing_caps:
+        failures.append(f"fail-closed: expected cap values missing from STAGE_C_CAPS: {missing_caps}")
+
     # Run row (lease token excluded from output).
     _, rows = call(
         "GET",
@@ -161,26 +277,67 @@ def evidence() -> None:
         "last_heartbeat_at,lease_expires_at,usage,error,requested_by,idempotency_key",
     )
     if not rows:
-        fail("run row not found")
-    out["run"] = rows[0]
-    # Total runs — must be exactly 1 (no duplicate execution).
-    _, allruns = call("GET", "/rest/v1/runs?select=id,status")
-    out["total_runs"] = len(allruns or [])
-    # Lifecycle events.
+        print(json.dumps({"stage_c_probe": "evidence", "ok": False, "failures": ["run row not found"], "operator_action": KILL_SWITCH_ACTION}))
+        sys.exit(1)
+    run = rows[0]
+    out["run"] = run
+
+    # Exactly one authorized run — real exact count, fail closed if unknown.
+    total_runs = count_exact("/rest/v1/runs?select=id")
+    out["total_runs"] = total_runs
+    if total_runs is None:
+        failures.append("exact run count unavailable — failing closed")
+    elif total_runs != 1:
+        failures.append(f"total_runs={total_runs}, expected exactly 1 authorized run")
+    if expected_idempotency and run.get("idempotency_key") != expected_idempotency:
+        failures.append(
+            f"run idempotency_key {run.get('idempotency_key')!r} != authorized key {expected_idempotency!r}"
+        )
+
+    # Expected terminal state per the acceptance policy.
+    state = run.get("status")
+    if state not in expected_terminal:
+        failures.append(f"terminal state {state!r} not in acceptance policy {sorted(expected_terminal)}")
+
+    # Attempt / claim / heartbeat invariants.
+    if run.get("attempt") != 1:
+        failures.append(f"attempt={run.get('attempt')}, expected 1 (single execution, no retry claim)")
+    for field in ("worker_id", "started_at", "finished_at", "last_heartbeat_at"):
+        if not run.get(field):
+            failures.append(f"run.{field} is missing — claim/heartbeat lifecycle incomplete")
+    if run.get("launch_state") != "launched":
+        failures.append(f"launch_state={run.get('launch_state')!r}, expected 'launched'")
+
+    # Lifecycle events + secret-leak scan (counts only; no values printed).
     _, events = call("GET", f"/rest/v1/run_events?run_id=eq.{run_id}&select=event_type,agent,phase,created_at,payload&order=id.asc")
     out["event_count"] = len(events or [])
     out["event_types"] = [e["event_type"] for e in (events or [])]
-    # Secret-leak scan over event payloads/messages (counts only).
+    if not events:
+        failures.append("no lifecycle events recorded for the run")
     blob = json.dumps(events or [])
-    out["secret_marker_hits"] = {m: blob.count(m) for m in SECRET_MARKERS if blob.count(m)}
-    # Checkpoints.
+    hits = {m: blob.count(m) for m in SECRET_MARKERS if blob.count(m)}
+    out["secret_marker_hits"] = hits
+    if hits:
+        failures.append(f"secret markers found in DB events: {sorted(hits)}")
+
+    # Checkpoints (evidence only).
     _, checkpoints = call("GET", f"/rest/v1/run_checkpoints?run_id=eq.{run_id}&select=phase,attempt,created_at&order=created_at.asc")
     out["checkpoints"] = [c["phase"] for c in (checkpoints or [])]
-    # Heartbeats.
+
+    # Heartbeats must exist and match the claiming worker/attempt.
     _, beats = call("GET", f"/rest/v1/worker_heartbeats?run_id=eq.{run_id}&select=worker_id,attempt,heartbeat_at&order=heartbeat_at.desc")
-    out["heartbeat_count"] = len(beats or [])
-    out["latest_heartbeat"] = (beats or [{}])[0]
-    # Budget reservations: settled vs dangling.
+    beats = beats or []
+    out["heartbeat_count"] = len(beats)
+    out["latest_heartbeat"] = beats[0] if beats else {}
+    if not beats:
+        failures.append("zero worker heartbeats recorded")
+    else:
+        if beats[0].get("worker_id") != run.get("worker_id"):
+            failures.append("latest heartbeat worker_id does not match the run's claiming worker")
+        if beats[0].get("attempt") != run.get("attempt"):
+            failures.append("latest heartbeat attempt does not match the run attempt")
+
+    # Budget reservations: all settled, zero dangling.
     _, reservations = call("GET", f"/rest/v1/model_call_budget_reservations?run_id=eq.{run_id}&select=call_seq,attempt,status,estimated_cost,actual_cost")
     reservations = reservations or []
     by_status: dict[str, int] = {}
@@ -189,22 +346,83 @@ def evidence() -> None:
     out["reservations_total"] = len(reservations)
     out["reservations_by_status"] = by_status
     out["dangling_reservations"] = by_status.get("reserved", 0)
+    if by_status.get("reserved", 0) != 0:
+        failures.append(f"{by_status.get('reserved')} dangling reservation(s) still in 'reserved'")
+    unexpected_statuses = sorted(set(by_status) - {"settled", "overage", "released"})
+    if unexpected_statuses:
+        failures.append(f"unexpected reservation status(es): {unexpected_statuses}")
     out["reserved_cost_sum"] = round(sum(float(r["estimated_cost"] or 0) for r in reservations), 6)
-    out["settled_cost_sum"] = round(sum(float(r["actual_cost"] or 0) for r in reservations if r["status"] in ("settled", "overage")), 6)
-    # Usage ledger decisions.
+    settled_cost_sum = round(sum(float(r["actual_cost"] or 0) for r in reservations if r["status"] in ("settled", "overage")), 6)
+    out["settled_cost_sum"] = settled_cost_sum
+
+    # Usage ledger decisions and sums.
     _, ledger = call("GET", f"/rest/v1/run_usage_ledger?run_id=eq.{run_id}&select=decision,call_seq,actual_input_tokens,actual_output_tokens,actual_cost,estimated_cost")
     ledger = ledger or []
     decisions: dict[str, int] = {}
     for row in ledger:
         decisions[row["decision"]] = decisions.get(row["decision"], 0) + 1
     out["ledger_decisions"] = decisions
-    out["ledger_actual_cost_sum"] = round(sum(float(r["actual_cost"] or 0) for r in ledger), 6)
-    out["ledger_input_tokens"] = sum(int(r["actual_input_tokens"] or 0) for r in ledger)
-    out["ledger_output_tokens"] = sum(int(r["actual_output_tokens"] or 0) for r in ledger)
-    # Launch invocation audit.
+    ledger_cost = round(sum(float(r["actual_cost"] or 0) for r in ledger), 6)
+    ledger_input = sum(int(r["actual_input_tokens"] or 0) for r in ledger)
+    ledger_output = sum(int(r["actual_output_tokens"] or 0) for r in ledger)
+    out["ledger_actual_cost_sum"] = ledger_cost
+    out["ledger_input_tokens"] = ledger_input
+    out["ledger_output_tokens"] = ledger_output
+
+    # Reservation / ledger / run-usage accounting consistency.
+    usage = run.get("usage")
+    if isinstance(usage, str):
+        try:
+            usage = json.loads(usage)
+        except json.JSONDecodeError:
+            usage = None
+    if not isinstance(usage, dict):
+        failures.append("run.usage snapshot missing — cannot verify caps; failing closed")
+        usage = {}
+    if abs(settled_cost_sum - ledger_cost) > COST_TOLERANCE:
+        failures.append(f"reservation settled cost {settled_cost_sum} != ledger cost {ledger_cost}")
+    usage_cost = float(usage.get("actual_cost") or 0)
+    if abs(usage_cost - ledger_cost) > COST_TOLERANCE:
+        failures.append(f"run.usage actual_cost {usage_cost} != ledger cost {ledger_cost}")
+    if int(usage.get("input_tokens") or 0) != ledger_input:
+        failures.append(f"run.usage input_tokens {usage.get('input_tokens')} != ledger sum {ledger_input}")
+    if int(usage.get("output_tokens") or 0) != ledger_output:
+        failures.append(f"run.usage output_tokens {usage.get('output_tokens')} != ledger sum {ledger_output}")
+
+    # Tracked cost / token / call caps vs the exact configured values.
+    if not missing_caps:
+        max_cost = float(caps["MILO_MAX_COST_PER_RUN"])
+        max_calls = int(caps["MILO_MAX_MODEL_CALLS_PER_RUN"])
+        max_input = int(caps["MILO_MAX_INPUT_TOKENS_PER_RUN"])
+        max_output = int(caps["MILO_MAX_OUTPUT_TOKENS_PER_RUN"])
+        max_total = int(caps["MILO_MAX_TOTAL_TOKENS_PER_RUN"])
+        if ledger_cost > max_cost or usage_cost > max_cost:
+            failures.append(f"tracked cost (ledger {ledger_cost} / usage {usage_cost}) exceeds cap {max_cost}")
+        model_calls = int(usage.get("model_calls") or 0)
+        if model_calls > max_calls:
+            failures.append(f"model_calls {model_calls} exceeds cap {max_calls}")
+        if len(reservations) > max_calls:
+            failures.append(f"reservation count {len(reservations)} exceeds call cap {max_calls}")
+        if ledger_input > max_input:
+            failures.append(f"input tokens {ledger_input} exceed cap {max_input}")
+        if ledger_output > max_output:
+            failures.append(f"output tokens {ledger_output} exceed cap {max_output}")
+        if ledger_input + ledger_output > max_total:
+            failures.append(f"total tokens {ledger_input + ledger_output} exceed cap {max_total}")
+
+    # Launch invocation audit: exactly one launcher invocation.
     _, invocations = call("GET", f"/rest/v1/run_invocations?run_id=eq.{run_id}&select=created_at,invocation")
     out["invocations"] = len(invocations or [])
+    if len(invocations or []) != 1:
+        failures.append(f"run_invocations={len(invocations or [])}, expected exactly 1")
+
+    out["failures"] = failures
+    out["ok"] = not failures
+    if failures:
+        out["operator_action"] = KILL_SWITCH_ACTION
     print(json.dumps(out, default=str))
+    if failures:
+        sys.exit(1)
 
 
 def main() -> None:

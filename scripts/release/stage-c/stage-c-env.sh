@@ -14,6 +14,17 @@ export STAGE_C_API_URL="${STAGE_C_API_URL:-https://milo-agent-api-beplbca7yq-uc.
 export STAGE_C_DB_PROBE_JOB="stagec-db-probe"
 export STAGE_C_GW_PROBE_JOB="stagec-gw-probe"
 
+# The ONE authorized run identity and its acceptance policy.
+export STAGE_C_IDEMPOTENCY_KEY="${STAGE_C_IDEMPOTENCY_KEY:-stage-c-smoke-0001}"
+# Exact number of runs that may already exist before the authorized run is
+# created (preflight fails closed on any other exact count).
+export STAGE_C_EXPECTED_PRIOR_RUNS="${STAGE_C_EXPECTED_PRIOR_RUNS:-0}"
+# The ONLY terminal state(s) that count as a PASS. failed / cancelled /
+# timed_out / budget_exhausted / partial_success are controlled fail-closed
+# terminals: they prove the safety rails but FAIL the smoke test, trigger a
+# non-zero probe exit and require the kill switch + investigation.
+export STAGE_C_ACCEPTABLE_TERMINAL_STATES="${STAGE_C_ACCEPTABLE_TERMINAL_STATES:-completed}"
+
 # Flag-enable value referenced ONLY by the manual operator commands in
 # 03-enable-stage-c.md; no committed line pairs an execution-flag name with
 # an enabled value (policy: scripts/check_unsafe_defaults.py, and

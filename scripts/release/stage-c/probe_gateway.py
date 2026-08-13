@@ -9,9 +9,16 @@ structured JSON only; the identity token is never printed.
 Modes (env STAGE_C_MODE):
   create — create the ONE run (fixed idempotency key) and immediately
            verify the idempotent replay returns the same run id
-  poll   — poll run status through the API until a terminal state
+  poll   — poll run status through the API until a terminal state; exits 0
+           ONLY if the terminal state is in the Stage C acceptance policy
+           (STAGE_C_ACCEPTABLE_TERMINAL_STATES, default "completed");
+           any other terminal state exits non-zero and instructs the
+           operator to run the kill switch
   replay — post-completion replay with the same key; must return the same
            run id and create no new run
+
+Exit codes: 0 = PASS, 1 = infrastructure/timeout failure, 2 = the run
+reached a terminal state that the acceptance policy does not accept.
 """
 
 from __future__ import annotations
@@ -27,13 +34,34 @@ API = os.environ["STAGE_C_API_URL"].rstrip("/")
 USER_ID = os.environ["STAGE_C_USER_ID"]
 CONVERSATION_ID = os.environ["STAGE_C_CONVERSATION_ID"]
 IDEMPOTENCY_KEY = os.environ.get("STAGE_C_IDEMPOTENCY_KEY", "stage-c-smoke-0001")
+
+# Every state the run lifecycle can terminate in.
 TERMINAL = {"completed", "partial_success", "failed", "cancelled", "timed_out", "budget_exhausted"}
+
+KILL_SWITCH_ACTION = (
+    "RUN THE KILL SWITCH NOW: scripts/release/stage-c/kill-switch.sh — then "
+    "collect evidence with 06-collect-evidence.sh and record the failure in "
+    "STAGE_C_ACCEPTANCE.md. Do NOT start another run."
+)
 
 RUN_REQUEST = {
     "content": "Stage C production smoke test - vehicle catalog run",
     "metadata": {"stage": "stage-c-smoke"},
     "idempotency_key": IDEMPOTENCY_KEY,
 }
+
+
+def acceptable_terminal_states() -> set[str]:
+    """Stage C acceptance policy: ONLY these terminal states are a PASS.
+
+    `failed`, `cancelled`, `timed_out`, `budget_exhausted` and
+    `partial_success` are controlled fail-closed terminals — they prove the
+    safety rails, but they are NOT an acceptable smoke-test outcome unless
+    the operator explicitly widens the policy via the env var.
+    """
+    raw = os.environ.get("STAGE_C_ACCEPTABLE_TERMINAL_STATES", "completed")
+    states = {s.strip() for s in raw.split(",") if s.strip()}
+    return states & TERMINAL
 
 
 def identity_token() -> str:
@@ -97,6 +125,8 @@ def create() -> None:
 def poll() -> None:
     run_id = os.environ["STAGE_C_RUN_ID"]
     deadline = time.time() + int(os.environ.get("STAGE_C_POLL_SECONDS", "3500"))
+    interval = int(os.environ.get("STAGE_C_POLL_INTERVAL_SECONDS", "20"))
+    acceptable = acceptable_terminal_states()
     last = None
     while time.time() < deadline:
         status, run = call("GET", f"/runs/{run_id}")
@@ -106,17 +136,41 @@ def poll() -> None:
                 print(json.dumps({"stage_c_probe": "poll", "status": state, "usage": run.get("usage")}), flush=True)
                 last = state
             if state in TERMINAL:
-                print(json.dumps({"stage_c_probe": "poll", "terminal": state, "run": {
-                    "status": state,
-                    "attempt": run.get("attempt"),
-                    "started_at": run.get("started_at"),
-                    "finished_at": run.get("finished_at"),
-                    "usage": run.get("usage"),
-                    "error": run.get("error"),
-                }}))
-                return
-        time.sleep(20)
-    print(json.dumps({"stage_c_probe": "poll", "terminal": None, "reason": "poll timeout"}))
+                is_pass = state in acceptable
+                print(json.dumps({
+                    "stage_c_probe": "poll",
+                    "terminal": state,
+                    "acceptable": is_pass,
+                    "acceptance_policy": sorted(acceptable),
+                    "run": {
+                        "status": state,
+                        "attempt": run.get("attempt"),
+                        "started_at": run.get("started_at"),
+                        "finished_at": run.get("finished_at"),
+                        "usage": run.get("usage"),
+                        "error": run.get("error"),
+                    },
+                }), flush=True)
+                if is_pass:
+                    return
+                print(json.dumps({
+                    "stage_c_probe": "poll",
+                    "verdict": "FAIL",
+                    "reason": (
+                        f"terminal state {state!r} is NOT in the Stage C acceptance policy "
+                        f"{sorted(acceptable)} — this smoke run FAILED"
+                    ),
+                    "operator_action": KILL_SWITCH_ACTION,
+                }), flush=True)
+                sys.exit(2)
+        time.sleep(interval)
+    print(json.dumps({
+        "stage_c_probe": "poll",
+        "terminal": None,
+        "verdict": "FAIL",
+        "reason": "poll timeout — the run never reached a terminal state within the window",
+        "operator_action": KILL_SWITCH_ACTION,
+    }), flush=True)
     sys.exit(1)
 
 

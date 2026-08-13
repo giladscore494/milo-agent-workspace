@@ -66,6 +66,35 @@ production registry for `30b05bc…` (verified via
 `gcloud artifacts docker tags list`). Toolkit steps 1–2 build and deploy
 the correct release before anything is enabled.
 
+## Corrective safety pass (2026-08-13, no production mutation)
+
+A corrective review hardened the operator toolkit before any execution.
+Nothing was deployed, enabled, bound, or executed in production. Fixes:
+
+1. **Poll verdicts** — `probe_gateway.py` poll now distinguishes PASS from
+   FAIL terminal states: only states in the acceptance policy (default:
+   `completed` only) exit 0; every other terminal state exits non-zero and
+   instructs the operator to run the kill switch.
+2. **Preflight exact count** — `probe_db.py` preflight now uses a real
+   server-side exact count (`Prefer: count=exact` / `Content-Range`), not
+   the length of a `Range: 0-0` page, and fails closed unless the runs
+   table holds exactly `STAGE_C_EXPECTED_PRIOR_RUNS` (default 0) rows and
+   zero rows for the Stage C idempotency key.
+3. **Evidence is now an executable acceptance gate** — `probe_db.py`
+   evidence mode and `06-collect-evidence.sh` exit non-zero unless ALL
+   criteria hold (one run, one execution, expected terminal state,
+   attempt/claim/heartbeat invariants, zero dangling reservations,
+   reservation/ledger/usage accounting consistency, cost/token/call caps,
+   idempotent replay, zero secret markers). No warning-only checklists.
+4. **Exact cap verification** — new `verify_caps.py` compares every cap in
+   `STAGE_C_CAPS` for exact equality on BOTH worker and API immediately
+   before run creation (and in `03b`), fails on missing, changed, or
+   unexpected budget variables, and enforces the signed-off release images
+   (the production-image blocker above) as an executable pre-run check.
+5. **Cost ceiling corrected** — see "Cost ceiling" above: $3.00 bounds
+   tracked token-derived cost only; provider-side web-search tool charges
+   are untracked and bounded separately (conservative total ≤ $9.00).
+
 ## Prepared procedure (operator-executable, in order)
 
 `scripts/release/stage-c/` — see its README for the step table. Summary:
@@ -148,9 +177,43 @@ controlled `budget_exhausted`/`timed_out` terminal.
 | `MILO_DAILY_USER_BUDGET` | 5.00 | activates the reservation ledger |
 | `MILO_DAILY_PROJECT_BUDGET` | 5.00 | activates the reservation ledger |
 
-Worst-case bounded provider spend ≈ the $3.00 actual-cost cap (expected
-well under $1 at kimi-k2.6 pricing $0.60/M input, $2.50/M output), plus
-provider-side web-search tool fees bounded by the 200-call cap.
+### Acceptance policy for the terminal state
+
+The ONLY terminal state that makes the smoke run a PASS is `completed`
+(`STAGE_C_ACCEPTABLE_TERMINAL_STATES` in `stage-c-env.sh`). `failed`,
+`cancelled`, `timed_out`, `budget_exhausted` and `partial_success` are
+controlled fail-closed terminals: they prove the safety rails held, but
+they FAIL the smoke test — the poll probe exits non-zero on them and
+instructs the operator to run `kill-switch.sh` and investigate before any
+further Stage C action.
+
+### Cost ceiling — what $3.00 does and does NOT bound
+
+**MILO `actual_cost` does not include provider-side web-search tool
+charges.** The guarded client (`backend/budget.py`) takes a provider-sent
+`usage.cost` field when present; Moonshot chat completions do not send
+one, so `actual_cost` falls back to token-only pricing
+(`backend/model_pricing.py`: kimi-k2.6 at $0.60/M input, $2.50/M output).
+The pipeline's `$web_search` builtin tool is billed by Moonshot **per
+search invocation, separately from tokens**, and those charges never enter
+`actual_cost`, the reservation ledger, or the daily budgets. Therefore
+`MILO_MAX_COST_PER_RUN=3.00` is a hard ceiling on **tracked token-derived
+cost only — it is NOT a hard provider-billing ceiling.**
+
+Conservative maximum total monetary exposure for this ONE run:
+
+| Component | Bound | Basis |
+| --- | --- | --- |
+| Token-billed (tracked) | ≤ $3.00 hard; ≈ $1.05 by token caps | 700k input ($0.42) + 250k output ($0.63); tracker hard-stops at $3.00 |
+| Web-search tool fees (UNTRACKED) | ≤ $6.00 | ≤ 200 guarded call rounds × ≤ 3 search invocations/round × $0.01/invocation (2× safety factor over the documented ≈ $0.005 fee) |
+| **Conservative maximum total** | **≤ $9.00** | expected actual total well under $1 |
+
+Operator obligations that no MILO cap can replace: verify the current
+per-invocation web-search fee in the Moonshot console **before** the run
+(recompute the table if it changed), and verify the **actual billed
+total** (tokens AND tool fees) in the Moonshot console after the run —
+step 6 reminds you. The daily budgets ($5.00) also see only tracked cost
+and do not bound search fees.
 
 Cancellation-path verification (runbook Stage C action 10) is satisfied by
 the Stage B live evidence (pre-start and mid-execution cancellation on the
