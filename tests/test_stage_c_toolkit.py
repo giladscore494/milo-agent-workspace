@@ -590,6 +590,27 @@ def test_collect_evidence_is_a_gate_not_a_checklist():
     assert "Validation checklist to record" not in text  # replaced by executable checks
 
 
+def test_stage_c_log_collection_handles_structured_and_text_payloads():
+    execute = (STAGE_C / "05-execute-smoke.sh").read_text()
+    evidence = (STAGE_C / "06-collect-evidence.sh").read_text()
+
+    # Cloud Run Python probes emit structured records as jsonPayload in
+    # production. Operator gates must not silently look only at textPayload.
+    assert execute.count("--format='json(textPayload,jsonPayload)'") == 1
+    assert evidence.count("--format='json(textPayload,jsonPayload)'") == 2
+    assert "value(textPayload)" not in execute
+    assert "value(textPayload)" not in evidence
+
+    # run_probe renders structured payloads back into JSON lines so the
+    # existing explicit ok/terminal verdict parsers continue to gate on them.
+    for script in (execute, evidence):
+        assert 'record.get("jsonPayload")' in script
+        assert '"stage_c_probe" in payload' in script
+        assert 'json.loads(text)' in script
+        assert 'file=sys.stderr' in script
+        assert 'json.dumps(payload, sort_keys=True)' in script
+
+
 # ---------------------------------------------------------------------------
 # stage-c-env.sh: authorized constants are pinned; inherited shell values
 # cannot widen or redirect the authorization

@@ -45,8 +45,33 @@ run_probe() {
     --wait --format='value(metadata.name)')"
   gcloud logging read \
     "resource.type=cloud_run_job AND resource.labels.job_name=${job} AND labels.\"run.googleapis.com/execution_name\"=${exec_name}" \
-    --project="${STAGE_C_PROJECT}" --format='value(textPayload)' --order=asc \
-    | grep -v '^$' || true
+    --project="${STAGE_C_PROJECT}" --format='json(textPayload,jsonPayload)' --order=asc \
+    | python3 -c '
+import json, sys
+for record in json.load(sys.stdin):
+    payload = record.get("jsonPayload")
+    if payload is not None:
+        if isinstance(payload, dict) and "stage_c_probe" in payload:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(json.dumps(payload, sort_keys=True), file=sys.stderr)
+        continue
+
+    text = record.get("textPayload")
+    if not text:
+        continue
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        print(text, file=sys.stderr)
+        continue
+
+    if isinstance(parsed, dict) and "stage_c_probe" in parsed:
+        print(json.dumps(parsed, sort_keys=True))
+    else:
+        print(text, file=sys.stderr)
+' || true
 }
 
 # A probe's PASS/FAIL is read from its structured log line, not just the
@@ -101,7 +126,7 @@ test "${executions}" = "1" || fail "worker execution count is ${executions}, exp
 echo "== 4. Worker log secret-marker scan (counts only; no values printed)"
 hits="$(gcloud logging read \
   "resource.type=cloud_run_job AND resource.labels.job_name=${STAGE_C_WORKER_JOB}" \
-  --project="${STAGE_C_PROJECT}" --format='value(textPayload)' --limit=5000 \
+  --project="${STAGE_C_PROJECT}" --format='json(textPayload,jsonPayload)' --limit=5000 \
   | grep -c -E 'sk-[A-Za-z0-9]|KIMI_API_KEY=|sb_secret' || true)"
 test "${hits}" = "0" || fail "${hits} secret-marker hit(s) in worker logs"
 

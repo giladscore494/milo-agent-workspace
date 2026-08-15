@@ -42,8 +42,33 @@ run_probe() { # job [KEY=VALUE ...] — execute, wait, print the execution log
     --wait --format='value(metadata.name)')"
   gcloud logging read \
     "resource.type=cloud_run_job AND resource.labels.job_name=${job} AND labels.\"run.googleapis.com/execution_name\"=${exec_name}" \
-    --project="${STAGE_C_PROJECT}" --format='value(textPayload)' --order=asc \
-    | grep -v '^$' || true
+    --project="${STAGE_C_PROJECT}" --format='json(textPayload,jsonPayload)' --order=asc \
+    | python3 -c '
+import json, sys
+for record in json.load(sys.stdin):
+    payload = record.get("jsonPayload")
+    if payload is not None:
+        if isinstance(payload, dict) and "stage_c_probe" in payload:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(json.dumps(payload, sort_keys=True), file=sys.stderr)
+        continue
+
+    text = record.get("textPayload")
+    if not text:
+        continue
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        print(text, file=sys.stderr)
+        continue
+
+    if isinstance(parsed, dict) and "stage_c_probe" in parsed:
+        print(json.dumps(parsed, sort_keys=True))
+    else:
+        print(text, file=sys.stderr)
+' || true
 }
 
 echo "== 1. Launch invariants (images, exact caps on BOTH surfaces, IAM, zero executions)"
