@@ -49,6 +49,9 @@ run_probe() {
     | python3 -c '
 import json, sys
 for record in json.load(sys.stdin):
+    if not isinstance(record, dict):
+        continue
+
     payload = record.get("jsonPayload")
     if payload is not None:
         if isinstance(payload, dict) and "stage_c_probe" in payload:
@@ -71,7 +74,7 @@ for record in json.load(sys.stdin):
         print(json.dumps(parsed, sort_keys=True))
     else:
         print(text, file=sys.stderr)
-' || true
+'
 }
 
 # A probe's PASS/FAIL is read from its structured log line, not just the
