@@ -1,12 +1,16 @@
 # Stage C acceptance report — one controlled paid smoke run
 
-Status: **ATTEMPT_2_FAILED_SAFELY_AT_PREFLIGHT — corrective PR pending
-review** (see "Stage C attempt 2" below; attempt 1 further below). Across
-both attempts, no MILO run was ever created: zero worker executions, zero
-provider calls, zero tokens, $0 paid cost. The operator ran the kill
-switch and restored the fail-closed posture after each attempt; do NOT
-re-attempt Stage C until the RPC-preflight corrective fix is reviewed and
-merged. The complete operator toolkit is in
+Status: **PRE-PAID VALIDATION BLOCKED SAFELY — Cloud Logging null-record
+corrective pending review.** The authorized paid Stage C smoke has still
+not run. Across all operator attempts and validation cycles: zero MILO
+runs, zero worker executions, zero provider calls, zero tokens, $0 paid
+cost. The signed-off release remains deployed; API/worker execution
+surfaces are currently fail-closed and `KIMI_API_KEY` is unbound.
+Disposable `stagec-db-probe` and `stagec-gw-probe` jobs currently exist
+only for preflight validation and are removed by step 7. Do NOT enable
+paid execution or run creation until the current corrective is reviewed,
+merged, and the log renderer is revalidated live. The complete operator
+toolkit is in
 [`scripts/release/stage-c/`](../../scripts/release/stage-c/README.md).
 (The original pre-toolkit status, kept for history: the first prepared
 session was blocked on operator write access and executed nothing.)
@@ -69,6 +73,64 @@ combination and would likely fail mid-lifecycle. No image exists in the
 production registry for `30b05bc…` (verified via
 `gcloud artifacts docker tags list`). Toolkit steps 1–2 build and deploy
 the correct release before anything is enabled.
+
+## Stage C attempt 3 (2026-08-15) — STOPPED SAFELY before run creation
+
+After PR #45 merged, the operator repeated the pre-paid validation path.
+A live DB preflight passed: exact run counts were zero, the reservation/
+lease/ledger schema was present, and all five required RPCs were exposed
+with the expected signatures. The worker was then enabled with the exact
+Stage C caps and worker-only `KIMI_API_KEY`; the API was enabled for run
+creation/launcher, and `03b-verify-stage-c-posture.sh` passed.
+
+**Before `05-execute-smoke.sh` was run**, review found that steps 5/6 read
+Cloud Run logs with `value(textPayload)` only, while the Python probes
+emit their structured records into `jsonPayload`. That could make a
+successful probe invisible to the acceptance gates; the worker-log
+secret scan had the same payload-type blind spot.
+
+No setup/create step was executed, no MILO run existed, worker executions
+remained zero, and no provider call/token/cost occurred. The operator
+immediately applied the kill switch; after the initially interrupted API
+update, read-only verification already showed fail-closed, and the full
+step-7 cleanup then completed. API ended fail-closed
+(`MILO_ENABLE_RUN_CREATION=false`, `JOB_LAUNCHER=disabled`,
+`MILO_ENABLE_PAID_EXECUTION=false`); worker paid execution was false and
+`KIMI_API_KEY` was unbound. Both disposable probes were deleted.
+
+PR #46 corrected log collection to read both `jsonPayload` and
+`textPayload`, emit only actual `stage_c_probe` records to stdout, and
+scan both payload types for secret markers. CI, Repo Scan and Vercel
+passed and PR #46 was merged as
+`7127516a3f0487016d27e01063df4feaff08ef8e`.
+
+## Post-PR #46 live validation (2026-08-15) — null log record found safely
+
+With API/worker still fail-closed and worker executions still exactly
+zero, the disposable probes were recreated. A standalone DB preflight
+execution (`stagec-db-probe-24wvk`) completed successfully and its real
+Cloud Logging payload reported `ok=true`, exact zero run counts, all five
+RPCs present, and all required schema/ledger checks present.
+
+The same live log response also exposed a second transport edge case:
+`gcloud logging read --format=json(textPayload,jsonPayload)` returned an
+array containing the valid `jsonPayload` probe record, the Cloud Run
+system `textPayload` (`Container called exit(0).`), **and a trailing
+JSON `null` record**. The merged renderer called `record.get(...)`
+unconditionally, so a `null` element would raise `AttributeError`; its
+then-existing `|| true` could additionally mask that renderer failure.
+
+The current corrective therefore skips non-dictionary log records and
+removes the renderer's `|| true`, so parsing/log-transport failures fail
+closed rather than being swallowed. The real captured Cloud Logging
+fixture was replayed locally against the corrected logic: exactly one
+preflight probe record was emitted, `ok=true`, while the system line and
+`null` were safely ignored.
+
+No paid surface was enabled during this validation. No setup/create step
+ran, no MILO run was created, worker executions remain zero, and there
+were zero provider calls/tokens/cost. The two disposable probe jobs
+currently remain present solely for the next preflight validation.
 
 ## Stage C attempt 2 (2026-08-13/14) — FAILED SAFELY at DB preflight
 
@@ -311,34 +373,50 @@ the Stage B live evidence (pre-start and mid-execution cancellation on the
 identical code path in staging); mock adapters are hard-forbidden in
 production, so no production cancellation rehearsal is performed.
 
-## Production mutations performed by this session
+## Production mutations / current posture
 
-**None.** Four write attempts were made and all were denied before any
-change (table above). Re-verified after the session: worker job
-generation still `7`, API service generation still `8` (revision
-`milo-agent-api-00008-lx5`), worker executions still zero, no secret
-bindings changed.
+The original automation-identity session performed no writes, but the
+subsequent authenticated operator sessions did perform the controlled
+Stage C preparation mutations documented above: the exact signed-off
+release images were built/deployed, disposable probes were
+created/deleted/recreated, and tightly controlled enable/kill/cleanup
+cycles were used while investigating the pre-run blockers.
+
+**None of those cycles created a MILO run or a worker execution.**
+
+Current verified execution posture before this corrective:
+
+- API: `MILO_ENABLE_RUN_CREATION=false`,
+  `JOB_LAUNCHER=disabled`, `MILO_ENABLE_PAID_EXECUTION=false`.
+- Worker: `MILO_ENABLE_PAID_EXECUTION=false`.
+- Worker `KIMI_API_KEY`: unbound.
+- Worker executions: **0**.
+- Signed-off release under test remains deployed:
+  `30b05bc45d6f9372261e4fac20cd983c69db971f`.
+- `stagec-db-probe` and `stagec-gw-probe` currently exist as disposable
+  preflight-only resources; step 7 removes them.
 
 ## Provider call / token / cost accounting
 
-Zero provider calls, zero tokens, zero cost — no run was executed and no
-provider credential was ever read or bound by this session.
+**Zero provider calls, zero tokens, zero paid cost.** The one authorized
+paid Stage C smoke has not been consumed. No MILO run has been created
+during attempts 1–3 or the post-PR #46 validation.
 
 ## Verdict
 
-- Stage C: **NOT EXECUTED — BLOCKED** on production write access for the
-  automation identity. No invariant failed; production is fail-closed and
-  unchanged.
-- Remaining before the run can happen, in order: either (a) the operator
-  runs `scripts/release/stage-c/01…07` from an authenticated shell
-  (recommended; the scripts encode the full verification), or (b) the
-  operator grants the automation identity the minimal write roles
-  (`roles/cloudbuild.builds.editor`, `roles/run.developer` on the two
-  Cloud Run resources + `roles/run.jobsExecutor` for probe execution,
-  `iam.serviceAccountUser` on the three runtime SAs) and re-authorizes
-  this session to continue Stage C end to end.
-- Remaining before Stage D (after a PASS run): unchanged from the
-  runbook — Stage C acceptance record completed with real run evidence,
-  post-smoke posture restored, then the Stage D expansion gates
-  (allowlist, budgets, monitoring, rollback rehearsal) each under new
-  explicit approval.
+- Stage C: **NOT PASSED — PAID SMOKE NOT YET EXECUTED.**
+- The safety gates have repeatedly failed closed before run creation.
+  The latest live DB preflight itself passes; the remaining blocker is
+  the Cloud Logging renderer edge case for non-object (`null`) records.
+- Before the single paid run: merge this corrective with green CI,
+  restore local `main`, verify production is still fail-closed and worker
+  executions are zero, recreate/revalidate probes as needed, prove the
+  corrected renderer against live preflight logs, then enable the exact
+  Stage C posture and run `05-execute-smoke.sh` **once**.
+- Any failure after run creation consumes the one-run attempt: invoke the
+  kill switch and do not create another paid run without fresh explicit
+  authorization.
+- Stage D remains blocked until the paid run reaches `completed`,
+  `06-collect-evidence.sh` passes all acceptance invariants, actual
+  provider billing is checked, and step 7 restores the post-smoke
+  fail-closed posture.

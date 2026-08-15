@@ -604,11 +604,16 @@ def test_stage_c_log_collection_handles_structured_and_text_payloads():
     # run_probe renders structured payloads back into JSON lines so the
     # existing explicit ok/terminal verdict parsers continue to gate on them.
     for script in (execute, evidence):
+        assert 'if not isinstance(record, dict):' in script
         assert 'record.get("jsonPayload")' in script
         assert '"stage_c_probe" in payload' in script
         assert 'json.loads(text)' in script
         assert 'file=sys.stderr' in script
         assert 'json.dumps(payload, sort_keys=True)' in script
+
+    for script in (execute, evidence):
+        renderer_tail = script.split("for record in json.load(sys.stdin):", 1)[1].split("\n}", 1)[0]
+        assert "' || true" not in renderer_tail
 
 
 # ---------------------------------------------------------------------------
