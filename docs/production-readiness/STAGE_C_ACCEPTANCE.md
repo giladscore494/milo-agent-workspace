@@ -373,6 +373,44 @@ the Stage B live evidence (pre-start and mid-execution cancellation on the
 identical code path in staging); mock adapters are hard-forbidden in
 production, so no production cancellation rehearsal is performed.
 
+## Stage C attempt 4 (2026-08-17) — BLOCKED SAFELY at run creation
+
+After PR #47 merged and the corrected Cloud Logging renderer passed live
+DB preflight validation, the operator enabled the exact Stage C posture
+and ran `05-execute-smoke.sh`.
+
+Launch invariants passed: all 14 caps matched exactly, the API and worker
+were still on the signed-off `30b05bc45d6f9372261e4fac20cd983c69db971f`
+release, provider-secret access remained worker-only, and launcher IAM
+remained restricted to the API runtime identity. The live DB preflight
+also passed with `existing_runs=0` and `existing_stage_c_runs=0`, and the
+disposable test user/project/conversation setup completed successfully.
+
+The gateway create probe then failed with HTTP 502. The underlying
+Postgres error was `42501: permission denied for function
+create_message_and_run`. The backend calls the service-role-only
+`create_message_and_run_v2` SETOF wrapper, but that wrapper is SECURITY
+INVOKER and delegates to the base `create_message_and_run` function.
+`service_role` had EXECUTE on the wrapper but not on that base dependency.
+
+The operator immediately ran `kill-switch.sh` and then
+`07-post-smoke-posture.sh`. Production returned fail-closed: API run
+creation false, launcher disabled, API/worker paid execution false, and
+the worker `KIMI_API_KEY` binding removed. Disposable probes were deleted.
+
+No worker execution was created, Kimi was never invoked, no provider call
+occurred, no tokens were consumed, and provider cost remained $0. There
+is no evidence that a MILO run was created because the database rejected
+the function invocation before execution. Therefore the single authorized
+paid Stage C smoke remains unconsumed.
+
+Root cause audit found two SECURITY INVOKER wrapper dependencies missing
+`service_role` EXECUTE: `create_message_and_run(...)` and
+`create_project_from_proposal_with_owner(...)`. The corrective is an
+additive migration that keeps PUBLIC/anon/authenticated revoked while
+granting EXECUTE only to `service_role`, plus regression coverage for the
+wrapper dependency ACL contract.
+
 ## Production mutations / current posture
 
 The original automation-identity session performed no writes, but the
@@ -393,26 +431,30 @@ Current verified execution posture before this corrective:
 - Worker executions: **0**.
 - Signed-off release under test remains deployed:
   `30b05bc45d6f9372261e4fac20cd983c69db971f`.
-- `stagec-db-probe` and `stagec-gw-probe` currently exist as disposable
-  preflight-only resources; step 7 removes them.
+- Disposable `stagec-db-probe` and `stagec-gw-probe` jobs were deleted
+  during the Attempt 4 step-7 cleanup and must be recreated before the
+  next Stage C preflight.
 
 ## Provider call / token / cost accounting
 
 **Zero provider calls, zero tokens, zero paid cost.** The one authorized
-paid Stage C smoke has not been consumed. No MILO run has been created
-during attempts 1–3 or the post-PR #46 validation.
+paid Stage C smoke has not been consumed. No worker execution was created
+during attempts 1–4, and Attempt 4's database rejection occurred before
+the underlying run-creation function executed.
 
 ## Verdict
 
-- Stage C: **NOT PASSED — PAID SMOKE NOT YET EXECUTED.**
-- The safety gates have repeatedly failed closed before run creation.
-  The latest live DB preflight itself passes; the remaining blocker is
-  the Cloud Logging renderer edge case for non-object (`null`) records.
-- Before the single paid run: merge this corrective with green CI,
-  restore local `main`, verify production is still fail-closed and worker
-  executions are zero, recreate/revalidate probes as needed, prove the
-  corrected renderer against live preflight logs, then enable the exact
-  Stage C posture and run `05-execute-smoke.sh` **once**.
+- Stage C: **NOT PASSED — AUTHORIZED PAID RUN NOT YET CREATED.**
+- The safety gates have repeatedly failed closed before provider execution.
+  Attempt 4 reached the gateway create path and exposed the remaining
+  blocker: missing `service_role` EXECUTE on the SECURITY INVOKER wrapper
+  base-function dependencies.
+- Before the single paid run: merge the ACL corrective with green CI,
+  restore local `main`, apply only the new corrective migration to
+  production, verify the live ACLs read-only, recreate the disposable
+  probes, rerun DB preflight, enable the exact Stage C worker/API posture,
+  require `03b-verify-stage-c-posture.sh` to pass, and only then run
+  `05-execute-smoke.sh` **once**.
 - Any failure after run creation consumes the one-run attempt: invoke the
   kill switch and do not create another paid run without fresh explicit
   authorization.
