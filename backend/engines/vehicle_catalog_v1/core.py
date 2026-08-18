@@ -16,12 +16,22 @@ try:
 except ModuleNotFoundError:  # optional until live engine execution
     OpenAI = None
 
+from backend.provider_scheduler import (
+    ProviderBackpressureExceeded,
+    ProviderLimitsConfig,
+    ProviderScheduler,
+    estimate_request_tokens,
+    is_provider_rate_limit_error,
+)
+
 MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
 KIMI_MODEL = "kimi-k2.6"
 SEARCH_TEMPERATURE = 0.6
 CONSOLIDATION_TEMPERATURE = 0.6
 MAX_TOOL_ROUNDS = 15
 MAX_PARALLEL_KIMI_CALLS = 2
+# Preserved legacy constant; provider concurrency is now enforced by the
+# shared ProviderScheduler (default max_concurrency matches this limit).
 KIMI_CONCURRENCY_SEMAPHORE = BoundedSemaphore(MAX_PARALLEL_KIMI_CALLS)
 MODEL_CLIENT_FACTORY = None
 SLEEP_FN = time.sleep
@@ -31,6 +41,13 @@ SLEEP_FN = time.sleep
 # for real agent/model steps and retry/fallback attempts.
 AGENT_STEP_CALLBACK = None
 RETRY_CALLBACK = None
+# Provider 429/backpressure telemetry callback (agent, phase, reason,
+# wait_seconds). Separate from RETRY_CALLBACK on purpose: provider
+# backpressure must never consume the semantic retry allowance.
+PROVIDER_BACKPRESSURE_CALLBACK = None
+# The ONE scheduler shared by every Kimi call inside a worker execution.
+# Installed per run by the engine; lazily created from env when standalone.
+PROVIDER_SCHEDULER = None
 API_CONCURRENCY_RETRY_DELAY_SECONDS = 2
 API_CONCURRENCY_MAX_RETRIES = 2
 MAX_DISCOVERY_TOKENS = 1800
@@ -436,14 +453,35 @@ def _message_content(message: Any) -> str:
 
 
 def is_kimi_concurrency_error(exc: Any) -> bool:
-    text = str(exc or "").lower()
-    status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-    return (
-        status_code == 429
-        or "http 429" in text
-        or "error code: 429" in text
-        or "max organization concurrency" in text
-        or "rate_limit_reached_error" in text
+    return is_provider_rate_limit_error(exc)
+
+
+def _notify_backpressure(agent: str, phase: str, reason: str, wait_seconds: float) -> None:
+    if PROVIDER_BACKPRESSURE_CALLBACK is not None:
+        PROVIDER_BACKPRESSURE_CALLBACK(agent, phase, reason, wait_seconds)
+
+
+def _provider_scheduler() -> ProviderScheduler:
+    global PROVIDER_SCHEDULER
+    if PROVIDER_SCHEDULER is None:
+        PROVIDER_SCHEDULER = ProviderScheduler(
+            ProviderLimitsConfig.from_env(),
+            sleep_fn=lambda seconds: SLEEP_FN(seconds),
+            backpressure_callback=_notify_backpressure,
+        )
+    return PROVIDER_SCHEDULER
+
+
+def _scheduled_provider_call(client: Any, kwargs: Dict[str, Any], agent_name: str, phase_name: str) -> Any:
+    """The single guarded path for EVERY provider request (initial calls,
+    tool rounds, fallbacks and summaries). No raw create call may bypass it."""
+    scheduler = _provider_scheduler()
+    estimated = estimate_request_tokens(kwargs.get("messages"), kwargs.get("max_tokens"))
+    return scheduler.execute(
+        lambda: client.chat.completions.create(**kwargs),
+        estimated_tokens=estimated,
+        agent=agent_name,
+        phase=phase_name,
     )
 
 
@@ -501,8 +539,7 @@ def moonshot_chat(
         if response_format:
             kwargs["response_format"] = response_format
 
-        with KIMI_CONCURRENCY_SEMAPHORE:
-            response = client.chat.completions.create(**kwargs)
+        response = _scheduled_provider_call(client, kwargs, agent_name, phase_name)
         in_tokens, out_tokens = _usage_tokens(response)
         total_input += in_tokens
         total_output += out_tokens
@@ -549,8 +586,7 @@ def moonshot_chat(
             if response_format:
                 kwargs["response_format"] = response_format
 
-            with KIMI_CONCURRENCY_SEMAPHORE:
-                response = client.chat.completions.create(**kwargs)
+            response = _scheduled_provider_call(client, kwargs, agent_name, phase_name)
             in_tokens, out_tokens = _usage_tokens(response)
             total_input += in_tokens
             total_output += out_tokens
@@ -586,10 +622,17 @@ def moonshot_chat(
     }
 
 
+def _discovery_market_context(market: str) -> str:
+    """Israel-market discovery guidance, injected into EVERY discovery
+    prompt (primary and retry) whenever the run targets the Israeli market."""
+    return ISRAEL_DISCOVERY_CONTEXT if "israel" in (market or "").lower() else ""
+
+
 def discovery_prompt(agent: AgentConfig, manufacturer: str, market: str, period: str, retry: bool = False) -> List[Dict[str, str]]:
     max_models = DISCOVERY_MAX_MODELS.get(agent.key, 25)
+    market_context = _discovery_market_context(market)
     if retry:
-        system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. JSON only. No prose. Extra fields are forbidden."
+        system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. JSON only. No prose. Extra fields are forbidden." + market_context
         user = f'''Return only this compact JSON object:
 {{
   "agent": "{agent.key}",
@@ -600,7 +643,7 @@ def discovery_prompt(agent: AgentConfig, manufacturer: str, market: str, period:
 No other fields. Maximum {max_models} models. Scope: {agent.responsibility}'''
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
-    system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Find Hyundai model names for {market}. JSON only; no planning text. Extra model fields are forbidden."
+    system = MANDATORY_WEB_SEARCH_INSTRUCTION + f"You are {agent.key}. Find {manufacturer} model names for {market}. JSON only; no planning text. Extra model fields are forbidden." + market_context
     user = f'''Manufacturer: {manufacturer}
 Market: {market}
 Period: {period}
@@ -919,11 +962,21 @@ def run_safe_agent(
         while True:
             try:
                 return moonshot_chat(api_key, messages, temperature=0.6, use_web_search=use_web_search, response_format=response_format, max_tokens=token_limit, agent_name=agent_name, phase_name=phase)
+            except ProviderBackpressureExceeded as exc:
+                # The shared scheduler already applied its full bounded
+                # backoff budget: fail this agent with a specific provider
+                # backpressure reason instead of retrying further or
+                # consuming the semantic retry allowance.
+                payload = _api_concurrency_payload(exc, attempts + 1, agent=agent_name, phase=phase)
+                payload["api_retry_count"] = attempts
+                payload["backpressure"] = {"attempts": exc.attempts, "waited_seconds": exc.waited_seconds, "reason": "PROVIDER_BACKPRESSURE_EXCEEDED"}
+                return payload
             except Exception as exc:  # noqa: BLE001 - API errors must be classified for UI/tests.
                 if is_kimi_concurrency_error(exc):
                     if attempts < API_CONCURRENCY_MAX_RETRIES:
-                        if RETRY_CALLBACK is not None:
-                            RETRY_CALLBACK(agent_name, phase, "provider_concurrency_retry")
+                        # Provider backpressure telemetry only — a 429 must
+                        # never increment the semantic retry counter.
+                        _notify_backpressure(agent_name, phase, "provider_concurrency_retry", API_CONCURRENCY_RETRY_DELAY_SECONDS)
                         attempts += 1
                         SLEEP_FN(API_CONCURRENCY_RETRY_DELAY_SECONDS)
                         continue
