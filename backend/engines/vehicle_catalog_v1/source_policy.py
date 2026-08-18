@@ -26,7 +26,7 @@ manufacturer-specific business rules are hard-coded.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 SOURCE_CLASS_RANK: Dict[str, int] = {

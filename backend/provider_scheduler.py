@@ -169,6 +169,9 @@ BackpressureCallback = Callable[[str, str, str, float], None]
 
 _WINDOW_SECONDS = 60.0
 _WAIT_CHUNK_SECONDS = 1.0
+# Cooperative concurrency-slot polling interval: short enough to notice a
+# freed slot or a cancellation promptly, long enough to avoid busy polling.
+_SLOT_POLL_SECONDS = 0.05
 
 
 class ProviderScheduler:
@@ -260,6 +263,34 @@ class ProviderScheduler:
             self._wait(delay)
             waited += delay
 
+    def _acquire_slot(self, waited_total: float, agent: str, phase: str) -> float:
+        """Acquire a concurrency slot cooperatively; return seconds waited.
+
+        Bounded and cancellable like every other scheduler wait: slot
+        waiting counts toward max_backpressure_wait_seconds and raises
+        ProviderBackpressureExceeded when the bound is exhausted. On any
+        raise no slot is held, so callers release only after success."""
+        if self._slots.acquire(blocking=False):
+            return 0.0
+        cfg = self.config
+        waited = 0.0
+        notified = False
+        while True:
+            self._check_cancelled()
+            if waited_total + waited + _SLOT_POLL_SECONDS > cfg.max_backpressure_wait_seconds:
+                raise ProviderBackpressureExceeded(
+                    "provider concurrency capacity did not clear within the configured backpressure bound",
+                    waited_seconds=round(waited_total + waited, 3),
+                )
+            if not notified and self._backpressure_callback:
+                self._backpressure_callback(agent, phase, "provider_concurrency_slot_wait", _SLOT_POLL_SECONDS)
+                notified = True
+            self._sleep(_SLOT_POLL_SECONDS)
+            waited += _SLOT_POLL_SECONDS
+            self._check_cancelled()
+            if self._slots.acquire(blocking=False):
+                return waited
+
     # -- the guarded call path -------------------------------------------------
     def execute(self, call: Callable[[], Any], *, estimated_tokens: int = 0, agent: str = "", phase: str = "") -> Any:
         """Run one provider request under capacity scheduling and bounded
@@ -270,7 +301,7 @@ class ProviderScheduler:
         while True:
             waited_total += self._admit(estimated_tokens, waited_total, agent, phase)
             self._check_cancelled()
-            self._slots.acquire()
+            waited_total += self._acquire_slot(waited_total, agent, phase)
             try:
                 return call()
             except Exception as exc:  # noqa: BLE001 - classified below; others re-raise

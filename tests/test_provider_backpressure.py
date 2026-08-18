@@ -10,7 +10,7 @@ import pytest
 
 from backend.budget import BudgetConfig, BudgetTracker, GuardedModelClient
 from backend.engines.vehicle_catalog_v1 import core
-from backend.provider_scheduler import ProviderBackpressureExceeded, ProviderLimitsConfig, ProviderScheduler
+from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 
 
 class FakeClock:

@@ -58,12 +58,20 @@ printf '%s\n' "${args}" >> "${MOCK_LOG}"
 case "${args}" in
   *"jobs update"*"--remove-secrets"*)
     exit "${MOCK_REMOVE_SECRETS_EXIT:-0}" ;;
+  *"jobs update"*"--remove-env-vars"*)
+    exit "${MOCK_REMOVE_ENV_VARS_EXIT:-0}" ;;
   *"jobs update"*)
     exit "${MOCK_JOBS_UPDATE_EXIT:-0}" ;;
   *"services update"*)
     exit "${MOCK_SERVICES_UPDATE_EXIT:-0}" ;;
   *"executions list"*)
-    cat "${MOCK_DIR}/executions.json" ;;
+    n=$(( $(cat "${MOCK_DIR}/list-count" 2>/dev/null || echo 0) + 1 ))
+    echo "${n}" > "${MOCK_DIR}/list-count"
+    if [ -f "${MOCK_DIR}/executions-${n}.json" ]; then
+      cat "${MOCK_DIR}/executions-${n}.json"
+    else
+      cat "${MOCK_DIR}/executions.json"
+    fi ;;
   *"executions cancel"*)
     if [ "${MOCK_CANCEL_EXIT:-0}" != "0" ]; then exit "${MOCK_CANCEL_EXIT}"; fi
     if [ -f "${MOCK_DIR}/executions-after-cancel.json" ]; then
@@ -81,7 +89,12 @@ esac
 """
 
 
-def run_kill_switch(tmp_path, *, executions, after_cancel=None, api=API_OK, worker=WORKER_OK, env=None):
+def run_kill_switch(tmp_path, *, executions, after_cancel=None, api=API_OK, worker=WORKER_OK, env=None, sequence=None):
+    """Run kill-switch.sh against the mocked gcloud.
+
+    ``sequence`` maps a 1-based executions-list call number to a listing (or
+    raw string) served for exactly that call; other calls fall back to the
+    ``executions`` fixture (which ``after_cancel`` rewrites on cancel)."""
     mock_dir = tmp_path / "mock"
     mock_dir.mkdir(exist_ok=True)
     bin_dir = tmp_path / "bin"
@@ -89,6 +102,10 @@ def run_kill_switch(tmp_path, *, executions, after_cancel=None, api=API_OK, work
     (mock_dir / "executions.json").write_text(json.dumps(executions))
     if after_cancel is not None:
         (mock_dir / "executions-after-cancel.json").write_text(json.dumps(after_cancel))
+    for call_number, listing in (sequence or {}).items():
+        body = listing if isinstance(listing, str) else json.dumps(listing)
+        (mock_dir / f"executions-{call_number}.json").write_text(body)
+    (mock_dir / "list-count").write_text("0")
     (mock_dir / "api.json").write_text(json.dumps(api))
     (mock_dir / "worker.json").write_text(json.dumps(worker))
     gcloud = bin_dir / "gcloud"
@@ -123,6 +140,15 @@ def test_zero_executions_succeeds_without_cancelling(tmp_path):
     assert "services update" in log
     assert "MILO_ENABLE_PAID_EXECUTION=false" in log
     assert "MILO_ENABLE_RUN_CREATION=false,JOB_LAUNCHER=disabled" in log
+    # BOTH provider-key aliases are removed, as secrets AND as env vars.
+    for alias in ("KIMI_API_KEY", "MOONSHOT_API_KEY"):
+        assert f"--remove-secrets={alias}" in log
+        assert f"--remove-env-vars={alias}" in log
+    # The final zero-active verification ran even though the initial
+    # listing was already empty.
+    assert log.count("executions list") >= 2
+    assert "Final verification: zero active worker executions." in result.stdout
+    assert result.stdout.index("Final verification") < result.stdout.index("KILL SWITCH APPLIED")
 
 
 def test_one_active_execution_is_cancelled_and_verified(tmp_path):
@@ -182,17 +208,17 @@ def test_missing_or_null_completion_fields_are_treated_as_active(tmp_path, nonte
 
 
 def test_already_fail_closed_state_is_idempotent(tmp_path):
-    """Rerun semantics: the provider secret binding is already gone, so
-    --remove-secrets fails; the flag-only fallback and postconditions still
-    succeed."""
-    result, log = run_kill_switch(tmp_path, executions=[], env={"MOCK_REMOVE_SECRETS_EXIT": "1"})
+    """Rerun semantics: every provider alias binding is already gone, so
+    each per-alias removal fails; that stays a tolerated no-op because the
+    postconditions independently prove absence."""
+    result, log = run_kill_switch(tmp_path, executions=[], env={"MOCK_REMOVE_SECRETS_EXIT": "1", "MOCK_REMOVE_ENV_VARS_EXIT": "1"})
     assert result.returncode == 0, result.stdout + result.stderr
     assert "KILL SWITCH APPLIED" in result.stdout
-    # Fallback flag-only update ran after the remove-secrets failure.
     update_lines = [line for line in log.splitlines() if "jobs update" in line]
-    assert len(update_lines) == 2
-    assert "--remove-secrets" in update_lines[0]
-    assert "--remove-secrets" not in update_lines[1]
+    # One paid-flag update plus one secret + one env-var removal per alias.
+    assert len(update_lines) == 5
+    assert sum("--remove-secrets" in line for line in update_lines) == 2
+    assert sum("--remove-env-vars" in line for line in update_lines) == 2
 
 
 def test_safe_repeated_execution(tmp_path):
@@ -223,7 +249,7 @@ def test_execution_still_active_after_bounded_verification_fails(tmp_path):
         after_cancel=[active_execution("milo-agent-worker-stuck1")],
     )
     assert result.returncode != 0
-    assert "still active after cancellation" in result.stderr
+    assert "still active after bounded cancellation" in result.stderr
     assert "KILL SWITCH APPLIED" not in result.stdout
     # Bounded: exactly initial list + verify-attempt lists, no runaway loop.
     assert log.count("executions list") <= 4
@@ -282,3 +308,131 @@ def test_env_pinning_still_refuses_hostile_overrides(tmp_path):
     result, _ = run_kill_switch(tmp_path, executions=[], env={"STAGE_C_PROJECT": "attacker-project-123"})
     assert result.returncode != 0
     assert "STAGE C REFUSED" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Provider-key alias coverage: the worker accepts KIMI_API_KEY OR
+# MOONSHOT_API_KEY, so the kill switch must remove and verify BOTH.
+# ---------------------------------------------------------------------------
+
+
+def worker_with(env_entries):
+    return {"spec": {"template": {"spec": {"template": {"spec": {"containers": [{"env": [
+        {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
+        *env_entries,
+    ]}]}}}}}}
+
+
+def api_with(extra_entries):
+    spec = json.loads(json.dumps(API_OK))
+    spec["spec"]["template"]["spec"]["containers"][0]["env"].extend(extra_entries)
+    return spec
+
+
+def secret_entry(name):
+    return {"name": name, "valueFrom": {"secretKeyRef": {"name": name}}}
+
+
+def literal_entry(name):
+    return {"name": name, "value": "unit-test-literal-value"}
+
+
+def test_worker_with_only_moonshot_alias_bound_fails_postcondition(tmp_path):
+    result, _ = run_kill_switch(tmp_path, executions=[], worker=worker_with([secret_entry("MOONSHOT_API_KEY")]))
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "worker postcondition failed" in result.stderr
+
+
+@pytest.mark.parametrize("alias", ["KIMI_API_KEY", "MOONSHOT_API_KEY"])
+def test_worker_with_literal_provider_value_fails_postcondition(tmp_path, alias):
+    result, _ = run_kill_switch(tmp_path, executions=[], worker=worker_with([literal_entry(alias)]))
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "worker postcondition failed" in result.stderr
+
+
+def test_both_aliases_are_removed_when_bound(tmp_path):
+    """Both aliases bound → a removal invocation is issued per alias and per
+    binding kind, each in its own gcloud call so one alias's failure can
+    never hide behind the other's success; the (post-removal) describe then
+    proves both absent."""
+    result, log = run_kill_switch(tmp_path, executions=[])
+    assert result.returncode == 0, result.stdout + result.stderr
+    removal_lines = [line for line in log.splitlines() if "--remove-secrets" in line or "--remove-env-vars" in line]
+    assert len(removal_lines) == 4
+    for line in removal_lines:  # one alias per invocation, never combined
+        assert line.count("API_KEY") == 1
+
+
+@pytest.mark.parametrize("entry", [secret_entry("KIMI_API_KEY"), secret_entry("MOONSHOT_API_KEY"), literal_entry("MOONSHOT_API_KEY")])
+def test_api_with_any_provider_alias_fails_postcondition(tmp_path, entry):
+    result, _ = run_kill_switch(tmp_path, executions=[], api=api_with([entry]))
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "API postcondition failed" in result.stderr
+
+
+def test_one_alias_removal_failure_is_not_hidden_when_still_bound(tmp_path):
+    """--remove-secrets fails for one alias that IS still bound: the
+    tolerated removal failure cannot produce success, because the worker
+    postcondition independently detects the surviving binding."""
+    result, _ = run_kill_switch(
+        tmp_path,
+        executions=[],
+        worker=worker_with([secret_entry("MOONSHOT_API_KEY")]),
+        env={"MOCK_REMOVE_SECRETS_EXIT": "1"},
+    )
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "worker postcondition failed" in result.stderr
+
+
+def test_alias_fixtures_never_leak_values(tmp_path):
+    result, log = run_kill_switch(tmp_path, executions=[], worker=worker_with([literal_entry("MOONSHOT_API_KEY")]))
+    combined = result.stdout + result.stderr + log
+    assert "unit-test-literal-value" not in combined
+    assert "secretKeyRef" not in result.stdout + result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Unconditional final active-execution verification
+# ---------------------------------------------------------------------------
+
+
+def test_execution_appearing_only_in_final_verification_is_cancelled_before_success(tmp_path):
+    """Initial listing empty; a fresh execution becomes visible only in the
+    final verification listing. It must be cancelled and re-verified before
+    any success claim."""
+    result, log = run_kill_switch(
+        tmp_path,
+        executions=[],
+        sequence={1: [], 2: [active_execution("milo-agent-worker-late1")]},
+        after_cancel=[execution("milo-agent-worker-late1")],
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert log.count("executions cancel") == 1
+    assert "milo-agent-worker-late1" in log
+    assert log.count("executions list") >= 3  # initial, final-detect, re-verify
+    assert "KILL SWITCH APPLIED" in result.stdout
+
+
+def test_execution_appearing_in_final_verification_that_never_settles_blocks_success(tmp_path):
+    result, _ = run_kill_switch(
+        tmp_path,
+        executions=[active_execution("milo-agent-worker-late2")],
+        sequence={1: []},
+        after_cancel=[active_execution("milo-agent-worker-late2")],
+    )
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "still active after bounded cancellation" in result.stderr
+
+
+def test_final_execution_list_parse_failure_returns_nonzero(tmp_path):
+    """Initial listing is fine and empty; the FINAL verification listing is
+    unparseable — success must not be claimed."""
+    result, _ = run_kill_switch(tmp_path, executions=[], sequence={2: "this is not json"})
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "could not determine active worker executions" in result.stderr

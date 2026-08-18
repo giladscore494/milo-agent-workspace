@@ -296,3 +296,103 @@ def test_non_rate_limit_errors_propagate_unchanged():
 def test_estimate_request_tokens_counts_input_and_requested_output():
     assert estimate_request_tokens([{"content": "x" * 400}], 100) == 200
     assert estimate_request_tokens([], None) == 1
+
+
+# -- bounded, cancellable concurrency-slot acquisition ------------------------
+
+
+def test_saturated_slot_wait_is_bounded_and_never_invokes_the_call():
+    scheduler, clock, sleeper = make_scheduler(max_concurrency=1, rpm_limit=None, max_backpressure_wait_seconds=2.0)
+    assert scheduler._slots.acquire(blocking=False)  # saturate the only slot
+    invoked = []
+    with pytest.raises(ProviderBackpressureExceeded) as exc:
+        scheduler.execute(lambda: invoked.append(True))
+    assert invoked == []  # the provider callable never ran without a slot
+    assert exc.value.waited_seconds <= 2.0
+    assert clock.now <= 2.0 + 0.1  # no indefinite blocking
+    assert sleeper.sleeps  # it waited cooperatively, not busy-spun
+
+
+def test_slot_wait_responds_to_cancellation():
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    cancelled = {"flag": False}
+
+    def cancel_after_first_sleep(seconds):
+        sleeper(seconds)
+        cancelled["flag"] = True
+
+    scheduler = ProviderScheduler(
+        ProviderLimitsConfig(max_concurrency=1, rpm_limit=None, max_backpressure_wait_seconds=600.0),
+        sleep_fn=cancel_after_first_sleep,
+        clock=clock,
+        rng=lambda: 0.0,
+        cancellation_checker=lambda: cancelled["flag"],
+    )
+    assert scheduler._slots.acquire(blocking=False)
+    invoked = []
+    with pytest.raises(CancellationRequested):
+        scheduler.execute(lambda: invoked.append(True))
+    assert invoked == []
+
+
+def test_slot_is_not_over_released_after_failed_acquisition():
+    scheduler, _, _ = make_scheduler(max_concurrency=1, rpm_limit=None, max_backpressure_wait_seconds=1.0)
+    assert scheduler._slots.acquire(blocking=False)
+    with pytest.raises(ProviderBackpressureExceeded):
+        scheduler.execute(lambda: "never")
+    # The failed acquisition released nothing: the single permit is still
+    # held, and returning it restores exactly one available slot.
+    assert not scheduler._slots.acquire(blocking=False)
+    scheduler._slots.release()
+    assert scheduler.execute(lambda: "ok") == "ok"  # accounting intact
+    assert scheduler._slots.acquire(blocking=False)
+    assert not scheduler._slots.acquire(blocking=False)
+    scheduler._slots.release()
+    with pytest.raises(ValueError):
+        scheduler._slots.release()  # BoundedSemaphore proves no leak occurred
+
+
+def test_slot_wait_resumes_when_a_slot_frees_and_emits_distinct_telemetry():
+    events = []
+    clock = FakeClock()
+    inner_sleeper = FakeSleeper(clock)
+    state = {"sleeps": 0}
+    config = ProviderLimitsConfig(max_concurrency=1, rpm_limit=None, max_backpressure_wait_seconds=600.0)
+    scheduler = ProviderScheduler(
+        config,
+        sleep_fn=None,  # set below, needs the scheduler reference
+        clock=clock,
+        rng=lambda: 0.0,
+        backpressure_callback=lambda *a: events.append(a),
+    )
+
+    def releasing_sleep(seconds):
+        inner_sleeper(seconds)
+        state["sleeps"] += 1
+        if state["sleeps"] == 3:
+            scheduler._slots.release()  # the stuck call finally finishes
+
+    scheduler._sleep = releasing_sleep
+    assert scheduler._slots.acquire(blocking=False)
+    assert scheduler.execute(lambda: "ok", agent="a1", phase="technical") == "ok"
+    reasons = {event[2] for event in events}
+    assert "provider_concurrency_slot_wait" in reasons
+    # Distinct from RPM/TPM capacity waits and 429 backpressure waits.
+    assert "provider_capacity_wait" not in reasons
+    assert "provider_rate_limited" not in reasons
+    assert events[0][:2] == ("a1", "technical")
+
+
+def test_slot_wait_counts_toward_the_shared_backpressure_bound():
+    """Time spent waiting for a slot leaves less budget for 429 backoff."""
+    scheduler, clock, _ = make_scheduler(max_concurrency=1, rpm_limit=None, max_backpressure_wait_seconds=3.0)
+
+    def hold_briefly():
+        raise FakeRateLimitError(retry_after=2.9)
+
+    assert scheduler._slots.acquire(blocking=False)
+    # Consume ~all of the bound waiting for the slot instead:
+    with pytest.raises(ProviderBackpressureExceeded):
+        scheduler.execute(hold_briefly)
+    assert clock.now <= 3.1  # bound covered slot wait; the call never ran
