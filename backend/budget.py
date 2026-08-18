@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from backend.provider_scheduler import is_provider_rate_limit_error
 from backend.runtime import CancellationRequested
 
 
@@ -187,6 +188,7 @@ class BudgetTracker:
     estimated_cost: float = 0.0
     actual_cost: float = 0.0
     retries: int = 0
+    provider_backpressure_events: int = 0
     agent_steps: int = 0
     stop: BudgetExceeded | None = None
     _started_at: float = field(default=None, init=False)  # type: ignore[assignment]
@@ -221,6 +223,7 @@ class BudgetTracker:
             "estimated_cost": round(self.estimated_cost, 6),
             "actual_cost": round(self.actual_cost, 6),
             "retries": self.retries,
+            "provider_backpressure_events": self.provider_backpressure_events,
             "agent_steps": self.agent_steps,
             "elapsed_seconds": round(self.clock() - self._started_at, 3),
         }
@@ -406,6 +409,15 @@ class BudgetTracker:
             if self.config.max_retries is not None and self.retries > self.config.max_retries:
                 raise self._reject("RETRY_LIMIT_REACHED", "retry limit reached", "retry_limit_reached", "failed")
 
+    def record_provider_backpressure(self) -> None:
+        """Count a provider 429/backpressure event for telemetry only.
+
+        Provider backpressure is paced and bounded by the shared provider
+        scheduler; it must never consume the semantic retry allowance
+        (max_retries), so this counter enforces no limit of its own."""
+        with self._lock:
+            self.provider_backpressure_events += 1
+
 
 class _GuardedCompletions:
     def __init__(self, inner: Any, tracker: BudgetTracker):
@@ -424,9 +436,19 @@ class _GuardedCompletions:
             kwargs["max_tokens"] = allowed_output
         try:
             response = self._inner.create(**kwargs)
-        except Exception:
-            self._tracker.settle_call(estimated_input, reserved_output, 0, 0, 0.0, status="released", rejection_reason="PROVIDER_EXCEPTION")
-            self._tracker.record_retry()
+        except Exception as exc:
+            rate_limited = is_provider_rate_limit_error(exc)
+            self._tracker.settle_call(
+                estimated_input, reserved_output, 0, 0, 0.0, status="released",
+                rejection_reason="PROVIDER_RATE_LIMITED" if rate_limited else "PROVIDER_EXCEPTION",
+            )
+            if rate_limited:
+                # A 429 is provider backpressure, not a semantic model
+                # failure: it must never consume the semantic retry
+                # allowance. The shared provider scheduler bounds it.
+                self._tracker.record_provider_backpressure()
+            else:
+                self._tracker.record_retry()
             raise
         usage = getattr(response, "usage", None)
         provider_cost = getattr(usage, "cost", None) or getattr(usage, "total_cost", None) or getattr(response, "cost", None)

@@ -5,8 +5,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
 from . import core
+from .source_policy import apply_israel_source_policy, market_requires_israel_policy
 
 EventSink = Callable[[str, dict[str, Any]], None]
 CheckpointSink = Callable[[str, dict[str, Any]], None]
@@ -31,12 +33,16 @@ class VehicleCatalogEngine:
     cancellation_checker: CancellationChecker | None = None
     agent_step_callback: Callable[[str, str], None] | None = None
     retry_callback: Callable[[str, str, str], None] | None = None
+    provider_limits: ProviderLimitsConfig | None = None
+    provider_backpressure_callback: Callable[[str, str, str, float], None] | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     _previous_client_factory: Any = field(default=None, init=False)
     _previous_sleep_fn: Any = field(default=None, init=False)
     _previous_agent_step_callback: Any = field(default=None, init=False)
     _previous_retry_callback: Any = field(default=None, init=False)
+    _previous_scheduler: Any = field(default=None, init=False)
+    _previous_backpressure_callback: Any = field(default=None, init=False)
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.event_sink:
@@ -70,18 +76,32 @@ class VehicleCatalogEngine:
         self._previous_sleep_fn = core.SLEEP_FN
         self._previous_agent_step_callback = core.AGENT_STEP_CALLBACK
         self._previous_retry_callback = core.RETRY_CALLBACK
+        self._previous_scheduler = core.PROVIDER_SCHEDULER
+        self._previous_backpressure_callback = core.PROVIDER_BACKPRESSURE_CALLBACK
         if self.model_client_factory is not None:
             core.MODEL_CLIENT_FACTORY = self.model_client_factory
         if self.sleep_fn is not None:
             core.SLEEP_FN = self.sleep_fn
         core.AGENT_STEP_CALLBACK = self.agent_step_callback
         core.RETRY_CALLBACK = self.retry_callback
+        core.PROVIDER_BACKPRESSURE_CALLBACK = self.provider_backpressure_callback
+        # One fresh scheduler instance shared by ALL Kimi calls in this run
+        # (initial calls, tool rounds, fallbacks and summaries). Fail-closed:
+        # invalid provider limit configuration raises before any call.
+        core.PROVIDER_SCHEDULER = ProviderScheduler(
+            self.provider_limits or ProviderLimitsConfig.from_env(),
+            sleep_fn=lambda seconds: core.SLEEP_FN(seconds),
+            cancellation_checker=self.cancellation_checker,
+            backpressure_callback=core._notify_backpressure,
+        )
 
     def _restore_injections(self) -> None:
         core.MODEL_CLIENT_FACTORY = self._previous_client_factory
         core.SLEEP_FN = self._previous_sleep_fn
         core.AGENT_STEP_CALLBACK = self._previous_agent_step_callback
         core.RETRY_CALLBACK = self._previous_retry_callback
+        core.PROVIDER_SCHEDULER = self._previous_scheduler
+        core.PROVIDER_BACKPRESSURE_CALLBACK = self._previous_backpressure_callback
 
     def run(self, config: VehicleCatalogRunConfig) -> dict[str, Any]:
         start = time.perf_counter()
@@ -162,6 +182,7 @@ class VehicleCatalogEngine:
             self._emit("phase_started", {"phase": "final_builder"})
             self._check_cancelled(results, failed_summaries, start)
             final = core.run_final_builder_phase(config.api_key, normalizer["parsed"], technical_clean, verifier_data, failed_summaries, config.manufacturer, config.market, config.period)
+            self._apply_source_policy(final, config)
             self._add_tokens(final)
             results["final_builder"] = final
             self._emit("phase_completed", {"phase": "final_builder", "result": final})
@@ -179,6 +200,13 @@ class VehicleCatalogEngine:
             return {"status": status, "result": final["parsed"], "summary": summary.get("parsed", {}).get("summary") if summary.get("status") == "success" else None, "results": results, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens, "elapsed_seconds": time.perf_counter() - start}
         finally:
             self._restore_injections()
+
+    def _apply_source_policy(self, final: dict[str, Any], config: VehicleCatalogRunConfig) -> None:
+        """Deterministic Israel evidence policy on the merged final output:
+        foreign/global-only candidates stay preserved but downgraded to
+        needs_review with capped confidence."""
+        if market_requires_israel_policy(config.market) and final.get("status") == "success" and isinstance(final.get("parsed"), dict):
+            final["parsed"] = apply_israel_source_policy(final["parsed"], config.manufacturer)
 
     def _failed(self, results: dict[str, Any], code: str, message: str, start: float) -> dict[str, Any]:
         return {"status": "failed", "error": {"code": code, "message": message}, "results": results, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens, "elapsed_seconds": time.perf_counter() - start}

@@ -135,6 +135,22 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             repo.mark_run_failed(run_id, "PROVIDER_KEY_MISSING", "worker provider API key (KIMI_API_KEY/MOONSHOT_API_KEY) is not configured", worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
             return 1
 
+        # Provider-side scheduling limits (concurrency/RPM/TPM/backpressure
+        # bounds) are numeric deployment configuration validated fail-closed:
+        # an invalid value refuses the run instead of degrading into
+        # unlimited capacity.
+        from backend.provider_scheduler import ProviderLimitsConfig
+
+        engine_mode = (os.getenv("MILO_WORKER_ENGINE") or "").strip().lower()
+        provider_limits = None
+        if engine is None and engine_mode != "mock":
+            try:
+                provider_limits = ProviderLimitsConfig.from_env()
+            except ValueError as exc:
+                sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider limit configuration invalid; refusing execution", payload={"code": "PROVIDER_LIMITS_CONFIG_INVALID", "message": str(exc)}))
+                repo.mark_run_failed(run_id, "PROVIDER_LIMITS_CONFIG_INVALID", str(exc), worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+                return 1
+
         def emit_budget_event(event_type, payload):
             sink.emit(RunEventRecord(run_id=run_id, type=event_type, message=payload.get("message", event_type), payload=payload.get("payload", payload)))
             shadow_observe(event_type, payload)
@@ -179,7 +195,6 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # provider client exists, so the tracker's kill switch is satisfied
         # locally and simulated calls exercise the real reservation lifecycle
         # with mock costs only.
-        engine_mode = (os.getenv("MILO_WORKER_ENGINE") or "").strip().lower()
         tracker = budget_tracker or BudgetTracker(
             budget_config,
             kill_switch=(lambda: True) if engine_mode == "mock" else paid_execution_enabled,
@@ -214,6 +229,13 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             tracker.record_retry()
             forward_event("retry_limit_checked", {"agent": agent, "phase": phase, "reason": reason, "message": f"Retry allowance consumed for {agent}/{phase}"})
 
+        def record_provider_backpressure(agent: str, phase: str, reason: str, wait_seconds: float) -> None:
+            """Provider backpressure wait telemetry: distinct from semantic
+            retries and never consumes the retry allowance. The tracker's
+            provider_backpressure_events counter is incremented once per 429
+            by the guarded client, so this callback only records the event."""
+            forward_event("provider_backpressure_wait", {"agent": agent, "phase": phase, "reason": reason, "wait_seconds": wait_seconds, "message": f"Provider backpressure for {agent}/{phase}: waiting {wait_seconds}s ({reason})"})
+
         if engine is not None:
             selected_engine = engine
         elif engine_mode == "mock":
@@ -235,6 +257,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 cancellation_checker=is_cancelled,
                 agent_step_callback=record_agent_step,
                 retry_callback=record_retry,
+                provider_limits=provider_limits,
+                provider_backpressure_callback=record_provider_backpressure,
             )
         try:
             result = selected_engine.run(run)
