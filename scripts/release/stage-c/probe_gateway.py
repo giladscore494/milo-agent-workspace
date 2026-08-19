@@ -33,7 +33,10 @@ import urllib.request
 API = os.environ["STAGE_C_API_URL"].rstrip("/")
 USER_ID = os.environ["STAGE_C_USER_ID"]
 CONVERSATION_ID = os.environ["STAGE_C_CONVERSATION_ID"]
-IDEMPOTENCY_KEY = os.environ.get("STAGE_C_IDEMPOTENCY_KEY", "stage-c-smoke-0001")
+# Fallback matches the pinned Attempt 7 key in stage-c-env.sh; the step
+# scripts always transport the pinned value explicitly. The Attempt 5/6
+# key (stage-c-smoke-0001) is consumed history and is never reused.
+IDEMPOTENCY_KEY = os.environ.get("STAGE_C_IDEMPOTENCY_KEY", "stage-c-smoke-attempt-7-20260819")
 
 # Every state the run lifecycle can terminate in.
 TERMINAL = {"completed", "partial_success", "failed", "cancelled", "timed_out", "budget_exhausted"}

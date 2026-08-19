@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Stage C step 5: execute exactly ONE controlled paid run and monitor it to
-# a terminal state. Refuses to run if any worker execution already exists.
+# a terminal state. Refuses to run unless the Worker execution history
+# matches the pinned Attempt 5/6 baseline EXACTLY: exactly
+# STAGE_C_EXPECTED_PRIOR_EXECUTIONS historical executions, every one
+# terminal, zero active — a new active execution before authorization, a
+# count mismatch, or an unverifiable listing all block the run.
 #
 # Sequence:
-#   1. re-verify launch invariants: release images + EXACT cap values on
-#      both worker and API (verify_caps.py), secret binding, IAM, zero
-#      executions;
-#   2. db-probe preflight (migration surface + exact zero-prior-run count)
+#   1. re-verify launch invariants: release images + EXACT cap and
+#      worker-only provider-limit values (verify_caps.py), secret binding,
+#      IAM, exact terminal execution baseline;
+#   2. db-probe preflight (migration surface + exact pinned prior-run
+#      baseline + zero rows under the Attempt 7 idempotency key)
 #      + setup (test user/project/conversation) — capture USER_ID /
 #      CONVERSATION_ID from its log;
 #   3. gw-probe create (POST run + immediate idempotent replay check);
@@ -74,10 +79,16 @@ for record in json.load(sys.stdin):
 '
 }
 
-echo "== 1. Launch invariants (images, exact caps on BOTH surfaces, IAM, zero executions)"
-executions="$(gcloud run jobs executions list --job="${STAGE_C_WORKER_JOB}" \
-  --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format='value(metadata.name)' | sed '/^$/d' | wc -l)"
-test "${executions}" = "0" || fail "${executions} worker execution(s) already exist — a paid run may already have happened"
+echo "== 1. Launch invariants (images, exact caps + worker provider limits, IAM, exact terminal execution baseline)"
+# Exactly the pinned historical executions (Attempts 5+6), every one
+# terminal, zero active. More or fewer executions than the baseline, any
+# active execution, or an unparseable listing fails closed BEFORE run
+# creation — this proves the coming launch will be a one-execution
+# increment. Historical terminal executions are never cancelled.
+gcloud run jobs executions list --job="${STAGE_C_WORKER_JOB}" \
+  --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format=json \
+  | python3 ./verify_executions.py --expected-total "${STAGE_C_EXPECTED_PRIOR_EXECUTIONS}" \
+  || fail "worker execution posture does not match the pinned historical baseline (expected exactly ${STAGE_C_EXPECTED_PRIOR_EXECUTIONS} terminal executions, zero active) — an unexpected or active execution blocks the run"
 
 worker_json="$(mktemp)"; api_json="$(mktemp)"
 trap 'rm -f "${worker_json}" "${api_json}"' EXIT
@@ -86,9 +97,12 @@ gcloud run jobs describe "${STAGE_C_WORKER_JOB}" \
 gcloud run services describe "${STAGE_C_API_SERVICE}" \
   --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format=json > "${api_json}"
 # Every Stage C cap compared against the exact expected value from
-# stage-c-env.sh, on worker AND API, immediately before run creation; also
-# enforces the signed-off release images (production-image blocker) and
-# the exact flag posture. Fails on any missing/changed/unexpected value.
+# stage-c-env.sh, on worker AND API, and every worker-only provider limit
+# (STAGE_C_WORKER_PROVIDER_LIMITS) exact on the Worker, immediately before
+# run creation; also enforces the pinned release images (production-image
+# blocker) and the exact flag/provider-secret posture. Fails on any
+# missing/changed/unexpected value, including any MILO_PROVIDER_* variable
+# on the API.
 python3 ./verify_caps.py --worker-json "${worker_json}" --api-json "${api_json}" \
   || fail "cap/image/posture verification failed — do NOT create the run"
 
@@ -97,7 +111,7 @@ gcloud secrets get-iam-policy KIMI_API_KEY --project="${STAGE_C_PROJECT}" --form
 gcloud run jobs get-iam-policy "${STAGE_C_WORKER_JOB}" --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format=json \
   | python3 -c 'import json,sys; p=json.load(sys.stdin); b=p.get("bindings",[]); assert b==[{"members":["serviceAccount:'"${STAGE_C_API_SA}"'"],"role":"roles/run.jobsExecutorWithOverrides"}], b; print("OK: launcher IAM unchanged (API SA only)")'
 
-echo "== 2. DB preflight (exact zero-prior-run count) + test-data setup"
+echo "== 2. DB preflight (exact pinned prior-run baseline + zero Attempt 7 key rows) + test-data setup"
 run_probe "${STAGE_C_DB_PROBE_JOB}" "STAGE_C_MODE=preflight" \
   "STAGE_C_EXPECTED_PRIOR_RUNS=${STAGE_C_EXPECTED_PRIOR_RUNS}" \
   "STAGE_C_IDEMPOTENCY_KEY=${STAGE_C_IDEMPOTENCY_KEY}" \

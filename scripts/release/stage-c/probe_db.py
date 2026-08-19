@@ -9,13 +9,19 @@ prints a secret value.
 Modes (env STAGE_C_MODE):
   preflight — verify migration-dependent schema/RPC surface AND enforce
               (via a real server-side exact count) that the runs table
-              holds exactly STAGE_C_EXPECTED_PRIOR_RUNS rows (default 0)
-              and zero rows for the Stage C idempotency key; fails closed
-              on any other value or on an unavailable count
+              holds exactly STAGE_C_EXPECTED_PRIOR_RUNS rows (the pinned
+              historical Attempt 5/6 baseline) and zero rows for the
+              current Stage C idempotency key; fails closed on any other
+              value, on an unavailable count, and on missing/invalid
+              baseline configuration
   setup     — idempotently create the operator test user, dedicated
               stage-c-smoke project, membership and conversation
   evidence  — executable acceptance gate for env STAGE_C_RUN_ID: exits
-              non-zero unless EVERY acceptance criterion holds
+              non-zero unless EVERY acceptance criterion holds, including
+              exactly one new authorized run over the pinned prior
+              baseline (total = STAGE_C_EXPECTED_PRIOR_RUNS + 1) carrying
+              the current idempotency key — historical runs never satisfy
+              the new run's acceptance and are never deleted or hidden
 
 Exit codes: 0 = PASS, 1 = a check failed (fail closed).
 """
@@ -105,6 +111,19 @@ def count_exact(path_with_query: str) -> int | None:
 def fail(reason: str) -> None:
     print(json.dumps({"stage_c_probe": "BLOCKED", "reason": reason}))
     sys.exit(1)
+
+
+def expected_prior_runs() -> int | None:
+    """Pinned historical run baseline from the environment, else None.
+
+    A missing, empty or non-integer STAGE_C_EXPECTED_PRIOR_RUNS returns
+    None so callers fail closed — the gates must never fall back to
+    assuming an empty system (the Attempt 5/6 history is real).
+    """
+    raw = os.environ.get("STAGE_C_EXPECTED_PRIOR_RUNS")
+    if raw is None or not raw.strip().isdigit():
+        return None
+    return int(raw.strip())
 
 
 # Stage C RPC surface with the REQUIRED argument names of each function as
@@ -221,24 +240,32 @@ def preflight() -> None:
         f"{k} is MISSING" for k, v in checks.items() if v == "MISSING" and not k.startswith("rpc_")
     )
 
-    # Stage C precondition: the runs table must hold EXACTLY the expected
-    # number of pre-existing rows (default zero) — enforced with a real
-    # server-side exact count, failing closed if the count is unavailable.
-    expected_prior = int(os.environ.get("STAGE_C_EXPECTED_PRIOR_RUNS", "0"))
+    # Stage C precondition: the runs table must hold EXACTLY the pinned
+    # historical baseline (Attempt 7: the 2 prior Attempt 5/6 runs, which
+    # are preserved as evidence, never deleted or rewritten) — enforced
+    # with a real server-side exact count, failing closed if the count OR
+    # the baseline configuration is unavailable/invalid.
+    expected_prior = expected_prior_runs()
     total_runs = count_exact("/rest/v1/runs?select=id")
     checks["existing_runs"] = "UNKNOWN" if total_runs is None else str(total_runs)
-    checks["expected_prior_runs"] = str(expected_prior)
+    checks["expected_prior_runs"] = "INVALID" if expected_prior is None else str(expected_prior)
+    if expected_prior is None:
+        problems.append("STAGE_C_EXPECTED_PRIOR_RUNS is missing or not a non-negative integer — failing closed")
     if total_runs is None:
         problems.append("exact run count unavailable (no Content-Range total) — failing closed")
-    elif total_runs != expected_prior:
+    elif expected_prior is not None and total_runs != expected_prior:
         problems.append(
-            f"runs table holds {total_runs} row(s), expected exactly {expected_prior} — "
-            "a Stage C/test run may already exist; refusing to create the authorized run"
+            f"runs table holds {total_runs} row(s), expected exactly the pinned prior baseline of {expected_prior} — "
+            "an unexpected run may exist (or history was altered); refusing to create the authorized run"
         )
 
-    # Zero pre-existing Stage C runs under the fixed idempotency key.
+    # Zero pre-existing rows under the CURRENT (Attempt 7) idempotency key
+    # — the key is fresh and unique, so any row under it means the
+    # authorization was already consumed or the key was reused.
     idempotency_key = os.environ.get("STAGE_C_IDEMPOTENCY_KEY")
-    if idempotency_key:
+    if not idempotency_key:
+        problems.append("STAGE_C_IDEMPOTENCY_KEY is missing — failing closed")
+    else:
         stage_c_runs = count_exact(f"/rest/v1/runs?select=id&idempotency_key=eq.{idempotency_key}")
         checks["existing_stage_c_runs"] = "UNKNOWN" if stage_c_runs is None else str(stage_c_runs)
         if stage_c_runs is None:
@@ -343,9 +370,14 @@ def expected_caps() -> dict[str, str]:
 def evidence() -> None:
     """Executable acceptance gate — exits non-zero if ANY criterion fails.
 
-    Two criteria live in 06-collect-evidence.sh because they need gcloud or
-    the gateway identity: worker execution count == 1 and the
-    post-completion idempotent replay; the shell gate enforces both.
+    Verifies exactly one new authorized run over the pinned prior baseline
+    (total = STAGE_C_EXPECTED_PRIOR_RUNS + 1) and that the ONE requested
+    run carries the current idempotency key — the historical Attempt 5/6
+    rows are preserved evidence and can never satisfy the new run's
+    acceptance. Two criteria live in 06-collect-evidence.sh because they
+    need gcloud or the gateway identity: the worker execution total
+    (pinned baseline + 1, all terminal) and the post-completion idempotent
+    replay; the shell gate enforces both.
     """
     run_id = os.environ["STAGE_C_RUN_ID"]
     expected_terminal = {
@@ -375,17 +407,40 @@ def evidence() -> None:
     run = rows[0]
     out["run"] = run
 
-    # Exactly one authorized run — real exact count, fail closed if unknown.
+    # Exactly one new authorized run over the pinned prior baseline — real
+    # exact counts, fail closed if unknown or if the baseline configuration
+    # is missing/invalid. Historical rows are never deleted to make counts
+    # easier; the increment itself is the proof.
+    prior_baseline = expected_prior_runs()
+    out["expected_prior_runs"] = prior_baseline
+    if prior_baseline is None:
+        failures.append("STAGE_C_EXPECTED_PRIOR_RUNS is missing or not a non-negative integer — failing closed")
     total_runs = count_exact("/rest/v1/runs?select=id")
     out["total_runs"] = total_runs
     if total_runs is None:
         failures.append("exact run count unavailable — failing closed")
-    elif total_runs != 1:
-        failures.append(f"total_runs={total_runs}, expected exactly 1 authorized run")
-    if expected_idempotency and run.get("idempotency_key") != expected_idempotency:
+    elif prior_baseline is not None and total_runs != prior_baseline + 1:
         failures.append(
-            f"run idempotency_key {run.get('idempotency_key')!r} != authorized key {expected_idempotency!r}"
+            f"total_runs={total_runs}, expected exactly {prior_baseline + 1} "
+            f"(the pinned prior baseline of {prior_baseline} plus exactly one new authorized run)"
         )
+    if not expected_idempotency:
+        failures.append("STAGE_C_IDEMPOTENCY_KEY is missing — cannot attribute the new run; failing closed")
+    else:
+        if run.get("idempotency_key") != expected_idempotency:
+            failures.append(
+                f"run idempotency_key {run.get('idempotency_key')!r} != authorized key {expected_idempotency!r} — "
+                "a historical run cannot satisfy the new run's acceptance"
+            )
+        # Exactly ONE run may carry the fresh Attempt 7 key: zero means the
+        # new run is unaccounted for, more than one means a duplicate
+        # slipped past idempotency.
+        key_runs = count_exact(f"/rest/v1/runs?select=id&idempotency_key=eq.{expected_idempotency}")
+        out["runs_with_current_key"] = key_runs
+        if key_runs is None:
+            failures.append("exact current-key run count unavailable — failing closed")
+        elif key_runs != 1:
+            failures.append(f"{key_runs} run(s) carry the authorized idempotency key, expected exactly 1")
 
     # Expected terminal state per the acceptance policy.
     state = run.get("status")
