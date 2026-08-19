@@ -38,7 +38,7 @@ gcloud run jobs create "${STAGE_C_DB_PROBE_JOB}" \
   --service-account="${STAGE_C_API_SA}" \
   --max-retries=0 --task-timeout=600 \
   --set-secrets="SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest" \
-  --set-env-vars="^${STAGE_C_ENV_DELIM}^PROBE_SOURCE=${DB_SOURCE}${STAGE_C_ENV_DELIM}STAGE_C_MODE=preflight" \
+  --set-env-vars="^${STAGE_C_ENV_DELIM}^PROBE_SOURCE=${DB_SOURCE}${STAGE_C_ENV_DELIM}STAGE_C_MODE=preflight${STAGE_C_ENV_DELIM}STAGE_C_EXPECTED_PRIOR_RUNS=${STAGE_C_EXPECTED_PRIOR_RUNS}${STAGE_C_ENV_DELIM}STAGE_C_IDEMPOTENCY_KEY=${STAGE_C_IDEMPOTENCY_KEY}" \
   --command=python3 --args=-c,'import os; exec(os.environ["PROBE_SOURCE"])'
 
 echo "== Creating ${STAGE_C_GW_PROBE_JOB} (SA: ${STAGE_C_GATEWAY_SA}, no secrets)"

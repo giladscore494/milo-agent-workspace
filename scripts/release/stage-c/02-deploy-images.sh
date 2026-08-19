@@ -24,13 +24,18 @@ ready="$(gcloud run services describe "${STAGE_C_API_SERVICE}" \
   --format='value(status.conditions[0].status)')"
 test "${ready}" = "True" || { echo "BLOCKED: API service not Ready"; exit 1; }
 
-executions="$(gcloud run jobs executions list --job="${STAGE_C_WORKER_JOB}" \
-  --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format='value(metadata.name)' | wc -l)"
-test "${executions}" = "0" || { echo "BLOCKED: worker executions exist (${executions})"; exit 1; }
+# Exact historical execution baseline: exactly the pinned prior terminal
+# executions (Attempts 5+6), none active/unverifiable. Deploying with a
+# different count, or with anything still running, fails closed. The
+# historical terminal executions are evidence and stay untouched.
+gcloud run jobs executions list --job="${STAGE_C_WORKER_JOB}" \
+  --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format=json \
+  | python3 ./verify_executions.py --expected-total "${STAGE_C_EXPECTED_PRIOR_EXECUTIONS}" \
+  || { echo "BLOCKED: worker execution posture does not match the pinned historical baseline (${STAGE_C_EXPECTED_PRIOR_EXECUTIONS} terminal, 0 active)"; exit 1; }
 
 flags="$(gcloud run services describe "${STAGE_C_API_SERVICE}" \
   --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format=json \
   | python3 -c 'import json,sys; env={e["name"]:e.get("value") for e in json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0]["env"] if "value" in e}; print(env.get("MILO_ENABLE_RUN_CREATION"), env.get("MILO_ENABLE_PAID_EXECUTION"), env.get("JOB_LAUNCHER"))')"
 test "${flags}" = "false false disabled" || { echo "BLOCKED: flags changed unexpectedly: ${flags}"; exit 1; }
 
-echo "OK: release images deployed, execution still fully disabled, zero executions."
+echo "OK: release images deployed, execution still fully disabled, execution baseline matches (${STAGE_C_EXPECTED_PRIOR_EXECUTIONS} historical terminal, 0 active)."

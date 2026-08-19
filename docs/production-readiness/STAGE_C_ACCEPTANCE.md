@@ -1,23 +1,51 @@
 # Stage C acceptance report — one controlled paid smoke run
 
-Status: **PRE-PAID VALIDATION BLOCKED SAFELY — Cloud Logging null-record
-corrective pending review.** The authorized paid Stage C smoke has still
-not run. Across all operator attempts and validation cycles: zero MILO
-runs, zero worker executions, zero provider calls, zero tokens, $0 paid
-cost. The signed-off release remains deployed; API/worker execution
-surfaces are currently fail-closed and `KIMI_API_KEY` is unbound.
-Disposable `stagec-db-probe` and `stagec-gw-probe` jobs currently exist
-only for preflight validation and are removed by step 7. Do NOT enable
-paid execution or run creation until the current corrective is reviewed,
-merged, and the log renderer is revalidated live. The complete operator
-toolkit is in
+Status (2026-08-19): **STAGE C NOT PASSED — ATTEMPT 6 AUTHORIZATION
+CONSUMED; ATTEMPT 7 PREPARED BUT NOT AUTHORIZED.** Attempt 6 reached real
+paid Worker execution and **failed** (terminal `failed`,
+`RETRY_LIMIT_REACHED` after repeated provider 429s during technical
+enrichment). Production now truthfully holds **2 MILO runs** (Attempts 5
+and 6) and **2 terminal Worker executions**; Attempt 6 consumed real
+provider usage (25 model calls, 47,380 tokens, tracked cost $0.03976).
+Earlier "zero runs / zero executions / zero provider calls /
+authorization unconsumed" claims in this report are superseded and kept
+below only as dated history.
+
+Current facts:
+
+- PR #50 is merged; the Attempt 7 **runtime release candidate** is its
+  merge commit `88224bccc836f80f3dc1d173306a1aa63cddcc7a`, pinned as
+  `STAGE_C_RELEASE_SHA` in `stage-c-env.sh`. (The release-preparation PR
+  that updates the tooling deliberately does NOT re-pin the SHA to its
+  own merge commit — the runtime pin must reference the reviewed runtime
+  code, never the tooling PR itself.)
+- The production Kimi organization is **operator-confirmed Tier 2**
+  (concurrency 100 / RPM 500 / TPM 3,000,000 / TPD unlimited); the pinned
+  worker-only operating envelope is deliberately below that ceiling (see
+  the provider-envelope section).
+- Production is **reported** fail-closed after the Attempt 6 kill-switch/
+  cleanup cycle, but that posture MUST be re-verified live (read-only)
+  before any deployment or enablement.
+- **Attempt 7 is NOT authorized by this report or by merging the
+  release-preparation PR.** It requires a fresh, separate, explicit
+  operator authorization after: PR merge → CI green → image build →
+  flags-off deployment → read-only posture verification. Exactly ONE new
+  run / ONE new Worker execution over the pinned historical baseline is
+  then allowed, under the fresh idempotency key
+  `stage-c-smoke-attempt-7-20260819` (the consumed `stage-c-smoke-0001`
+  key is never reused).
+- Stage D remains unauthorized and blocked.
+
+The complete operator toolkit is in
 [`scripts/release/stage-c/`](../../scripts/release/stage-c/README.md).
 (The original pre-toolkit status, kept for history: the first prepared
 session was blocked on operator write access and executed nothing.)
 
-Date: 2026-08-11/12. Production: GCP `big-cabinet-457321-t7`
-(us-central1). Provider: Moonshot/Kimi (`kimi-k2.6`). Release under test:
-`30b05bc45d6f9372261e4fac20cd983c69db971f` (merge of PR #42, Stage B PASS).
+Original report date: 2026-08-11/12. Production: GCP
+`big-cabinet-457321-t7` (us-central1). Provider: Moonshot/Kimi
+(`kimi-k2.6`). Release under test at that time:
+`30b05bc45d6f9372261e4fac20cd983c69db971f` (merge of PR #42, Stage B
+PASS); superseded for Attempt 7 by the pinned `88224bc…` candidate above.
 
 ## Why the run did not happen
 
@@ -61,6 +89,11 @@ verification below possible.
 | Production Supabase migration surface | PREPARED | the staging-scoped Supabase tooling cannot reach production by design; `stagec-db-probe --preflight` (toolkit step 5) verifies the `_v2`/guarded RPC surface and the attempt-aware reservation schema live before any run |
 
 ## Blocking deployment-consistency finding (must be fixed before the run)
+
+*(Dated history, 2026-08-11/12 — resolved: later operator sessions built
+and deployed the `30b05bc…` images via toolkit steps 1–2. For Attempt 7
+the same rule applies to the new pinned candidate: steps 1–2 must build
+and deploy `88224bc…` before anything is enabled.)*
 
 Production still runs images `api:791f7af9…` / `worker:791f7af9…`
 (built 2026-08-02), which **predate the Stage B corrective code** that
@@ -253,46 +286,54 @@ Nothing was deployed, enabled, bound, or executed in production. Fixes:
 `scripts/release/stage-c/` — see its README for the step table. Summary:
 
 1. `01-build-images.sh` — Cloud Build clones the **public** repository at
-   `30b05bc…` (SHA verified in-build) and pushes full-SHA-tagged images.
+   the pinned runtime `STAGE_C_RELEASE_SHA` (`88224bc…`, SHA verified
+   in-build) and pushes full-SHA-tagged images.
 2. `02-deploy-images.sh` — worker job then API service image update,
-   flags untouched; verifies Ready + still fully disabled + zero
-   executions.
+   flags untouched; verifies Ready + still fully disabled + the exact
+   historical execution baseline (2 terminal executions, 0 active).
 3. `03-enable-stage-c.md` (manual commands — by repository policy no
    committed script may enable an execution flag; verified afterwards by
    the read-only `03b-verify-stage-c-posture.sh`) — after re-verifying
    worker-only key IAM:
-   worker = `MILO_ENABLE_PAID_EXECUTION=true` + caps +
+   worker = `MILO_ENABLE_PAID_EXECUTION=true` + caps + the pinned
+   worker-only provider envelope (`STAGE_C_WORKER_PROVIDER_LIMITS`) +
    `KIMI_API_KEY=KIMI_API_KEY:latest` (worker runtime only, per
    authorization); API = `JOB_LAUNCHER=cloud_run` +
-   `MILO_ENABLE_RUN_CREATION=true` + caps. The API **keeps**
-   `MILO_ENABLE_PAID_EXECUTION=false` (it never holds the provider key;
-   `production_config.py` forbids the paid flag without it; the worker is
-   the paid-execution enforcement point). All other flags stay false. The
-   Vercel gateway is untouched (`GATEWAY_ALLOW_EXECUTION_ROUTES` off), so
-   no browser can reach run creation — public/general execution stays
-   disabled throughout.
+   `MILO_ENABLE_RUN_CREATION=true` + caps, and NO `MILO_PROVIDER_*`
+   variable. The API **keeps** `MILO_ENABLE_PAID_EXECUTION=false` (it
+   never holds the provider key; `production_config.py` forbids the paid
+   flag without it; the worker is the paid-execution enforcement point).
+   All other flags stay false. The Vercel gateway is untouched
+   (`GATEWAY_ALLOW_EXECUTION_ROUTES` off), so no browser can reach run
+   creation — public/general execution stays disabled throughout.
 4. `04-create-probes.sh` — two disposable Cloud Run jobs:
    `stagec-db-probe` (runs as `milo-api-runtime@`; binds only the two
    Supabase secrets that identity already reads — no new IAM grants;
    migration preflight, test-data setup, post-run evidence) and
    `stagec-gw-probe` (runs as `milo-vercel-gateway@`, no secrets; mints
    its identity token from the metadata server like the real gateway).
-5. `05-execute-smoke.sh` — refuses if any execution exists; re-verifies
-   launch invariants (worker-only key IAM, launcher IAM, caps present);
-   DB preflight; creates the operator test user
-   (`stage-c-smoke@invalid.milo`), dedicated `stage-c-smoke` project
-   (test user is the **only** member), and conversation; then executes
-   exactly **one** run through the canonical path
+5. `05-execute-smoke.sh` — refuses unless the Worker execution history
+   matches the pinned baseline exactly (2 historical executions, every
+   one terminal, zero active — `verify_executions.py`); re-verifies
+   launch invariants (worker-only key IAM, launcher IAM, exact caps on
+   both surfaces + exact provider limits on the worker only); DB
+   preflight (exactly 2 prior runs, 0 rows under the Attempt 7 key);
+   creates the operator test user (`stage-c-smoke@invalid.milo`),
+   dedicated `stage-c-smoke` project (test user is the **only** member),
+   and conversation; then executes exactly **one** new run through the
+   canonical path
    API → launcher → Cloud Run worker → real provider → Supabase, with an
    immediate idempotent-replay check, and monitors to a terminal state.
 6. `06-collect-evidence.sh <RUN_ID>` — full validation: claim/lease/
    heartbeat, event/checkpoint sequence, reservation settlement with zero
    dangling rows, ledger token/cost sums vs the run usage snapshot,
-   `total_runs=1` / `executions=1` (no duplicate execution, no
-   stale-worker writes), post-completion idempotent replay returns the
-   same run, secret-marker scans over DB events and worker logs.
-   Actual provider cost is additionally verified in the Moonshot console
-   (external).
+   exactly one new authorized run/execution over the pinned prior
+   baseline — `total_runs=3` / `executions=3` (all terminal; no duplicate
+   execution, no stale-worker writes) with exactly one run under the
+   Attempt 7 key, verified by the requested Run ID — post-completion
+   idempotent replay returns the same run, secret-marker scans over DB
+   events and worker logs. Actual provider cost is additionally verified
+   in the Moonshot console (external).
 7. `07-post-smoke-posture.sh` — safest documented posture (ROLLBACK.md
    order): paid off + key binding removed, run creation off, launcher
    disabled, probe jobs deleted; release images remain (signed-off code);
@@ -411,54 +452,126 @@ additive migration that keeps PUBLIC/anon/authenticated revoked while
 granting EXECUTE only to `service_role`, plus regression coverage for the
 wrapper dependency ACL contract.
 
+## Stage C attempt 5 — FAILED SAFELY before any provider call
+
+Run `58daa7de-76f5-4359-93e1-3a767c912c20` was created and a Worker
+execution was launched. The Worker failed at the `claim_run_lease` ACL
+before any Kimi request: **zero provider calls, zero tokens, $0 provider
+cost for this attempt**. The Worker execution reached a terminal state
+and is preserved as historical evidence (it is counted in the pinned
+execution baseline and is never cancelled or deleted).
+
+## Stage C attempt 6 — REAL PAID EXECUTION, FAILED
+
+Run `37912575-f9ce-4437-893d-7dfa45c53aa9` (idempotency key
+`stage-c-smoke-0001`) was created and its Worker execution reached real
+Kimi execution:
+
+| Quantity | Value |
+| --- | --- |
+| Model calls | 25 |
+| Total tokens | 47,380 |
+| Actual tracked cost | $0.03976 |
+| Checkpoints | through the normalizer |
+| Failure point | technical enrichment, after repeated provider 429s |
+| Terminal status | `failed` |
+| Error | `RETRY_LIMIT_REACHED` |
+
+The Attempt 6 Worker execution was terminal. **The Attempt 6
+authorization is consumed**: under the acceptance policy only `completed`
+is a PASS, so Attempt 6 FAILED the smoke test, and a further attempt
+requires fresh explicit operator authorization. The run row, its
+execution and its usage accounting are preserved as historical evidence
+— nothing is deleted, rewritten or hidden to make later counts easier.
+
+Consequence for Attempt 7 preparation: the toolkit's former
+empty-system assumptions (zero prior runs, zero prior Worker executions,
+"refuse if any execution exists", "exactly one total run/execution") are
+no longer valid. All preflight and evidence gates now verify a
+one-run/one-execution increment over the exact pinned historical
+baseline: exactly 2 prior runs and 2 terminal prior executions before
+run creation (zero active), exactly 3/3 after the one authorized launch,
+and zero-then-one rows under the fresh Attempt 7 idempotency key.
+
 ## Production mutations / current posture
 
 The original automation-identity session performed no writes, but the
 subsequent authenticated operator sessions did perform the controlled
-Stage C preparation mutations documented above: the exact signed-off
-release images were built/deployed, disposable probes were
-created/deleted/recreated, and tightly controlled enable/kill/cleanup
-cycles were used while investigating the pre-run blockers.
+Stage C mutations documented above: release images were built/deployed,
+disposable probes were created/deleted/recreated, tightly controlled
+enable/kill/cleanup cycles were used, and — in Attempts 5 and 6 — one
+MILO run and one Worker execution were created per attempt.
 
-**None of those cycles created a MILO run or a worker execution.**
+**Attempts 5 and 6 each created a MILO run and a Worker execution;
+Attempt 6 reached real paid provider execution and failed.**
 
-Current verified execution posture before this corrective:
+Reported execution posture after the Attempt 6 kill-switch/cleanup cycle
+(MUST be re-verified live, read-only, before any Attempt 7 deployment or
+enablement):
 
 - API: `MILO_ENABLE_RUN_CREATION=false`,
   `JOB_LAUNCHER=disabled`, `MILO_ENABLE_PAID_EXECUTION=false`.
 - Worker: `MILO_ENABLE_PAID_EXECUTION=false`.
 - Worker `KIMI_API_KEY`: unbound.
-- Worker executions: **0**.
-- Signed-off release under test remains deployed:
-  `30b05bc45d6f9372261e4fac20cd983c69db971f`.
-- Disposable `stagec-db-probe` and `stagec-gw-probe` jobs were deleted
-  during the Attempt 4 step-7 cleanup and must be recreated before the
-  next Stage C preflight.
+- MILO runs: **2** (Attempts 5 and 6 — historical, preserved).
+- Worker executions: **2**, both terminal (historical, preserved).
+- Runs under the Attempt 7 key `stage-c-smoke-attempt-7-20260819`: **0**.
+- Runtime release candidate for Attempt 7 (pinned, to be built/deployed
+  by steps 1–2 after authorization):
+  `88224bccc836f80f3dc1d173306a1aa63cddcc7a` (merge of PR #50).
+- Disposable `stagec-db-probe` and `stagec-gw-probe` jobs must be
+  recreated before the next Stage C preflight.
 
 ## Provider call / token / cost accounting
 
-**Zero provider calls, zero tokens, zero paid cost.** The one authorized
-paid Stage C smoke has not been consumed. No worker execution was created
-during attempts 1–4, and Attempt 4's database rejection occurred before
-the underlying run-creation function executed.
+Attempts 1–5 made **zero provider calls** (Attempt 5 failed at the
+`claim_run_lease` ACL before any Kimi request). Attempt 6 made **25 real
+model calls, 47,380 total tokens, actual tracked cost $0.03976**. The
+Attempt 6 authorization is consumed; the one-run allowance of any future
+Attempt 7 requires fresh explicit operator authorization.
+
+## Provider operating envelope (Attempt 7, worker-only)
+
+The production Kimi organization is operator-confirmed **Tier 2**:
+concurrency 100, RPM 500, TPM 3,000,000, TPD unlimited. That
+confirmation authorizes NO provider call and NO paid smoke. The pinned
+V1 envelope (`STAGE_C_WORKER_PROVIDER_LIMITS` in `stage-c-env.sh`) is
+deliberately below the Tier 2 ceiling:
+
+| Variable | Pinned value | Tier 2 ceiling |
+| --- | --- | --- |
+| `MILO_PROVIDER_MAX_CONCURRENCY` | 2 (intentionally — preserved V1 engine parallelism; no V2 concurrency) | 100 |
+| `MILO_PROVIDER_RPM_LIMIT` | 350 | 500 |
+| `MILO_PROVIDER_TPM_LIMIT` | 2400000 | 3,000,000 |
+| `MILO_PROVIDER_MAX_RATE_LIMIT_RETRIES` | 5 | — |
+| `MILO_PROVIDER_MAX_BACKPRESSURE_WAIT_SECONDS` | 240 | — |
+| `MILO_PROVIDER_BACKOFF_BASE_SECONDS` | 2 | — |
+| `MILO_PROVIDER_BACKOFF_MAX_SECONDS` | 30 | — |
+
+These settings are applied to the **Worker only** (the API receives no
+`MILO_PROVIDER_*` variable; `verify_caps.py` enforces both directions).
 
 ## Verdict
 
-- Stage C: **NOT PASSED — AUTHORIZED PAID RUN NOT YET CREATED.**
-- The safety gates have repeatedly failed closed before provider execution.
-  Attempt 4 reached the gateway create path and exposed the remaining
-  blocker: missing `service_role` EXECUTE on the SECURITY INVOKER wrapper
-  base-function dependencies.
-- Before the single paid run: merge the ACL corrective with green CI,
-  restore local `main`, apply only the new corrective migration to
-  production, verify the live ACLs read-only, recreate the disposable
-  probes, rerun DB preflight, enable the exact Stage C worker/API posture,
-  require `03b-verify-stage-c-posture.sh` to pass, and only then run
-  `05-execute-smoke.sh` **once**.
+- Stage C: **NOT PASSED.** Attempt 6 consumed its authorization on a real
+  paid Worker execution that terminated `failed`
+  (`RETRY_LIMIT_REACHED`); only `completed` counts as Stage C acceptance.
+- This release-preparation PR only pins Attempt 7 tooling: runtime SHA
+  `88224bc…`, fresh idempotency key, exact historical baselines (2 runs /
+  2 terminal executions) and the worker-only provider envelope. **Merging
+  it authorizes nothing** — no build, deployment, secret binding, flag
+  enablement, probe creation, run creation, provider call, Attempt 7 or
+  Stage D.
+- Before any Attempt 7 (after fresh explicit operator authorization):
+  merge + green CI, build the pinned `88224bc…` images, deploy flags-off,
+  verify the read-only posture AND the exact historical baselines live
+  (`03b-verify-stage-c-posture.sh`, DB preflight), enable the exact
+  Stage C worker/API posture, and only then run `05-execute-smoke.sh`
+  **once**.
 - Any failure after run creation consumes the one-run attempt: invoke the
   kill switch and do not create another paid run without fresh explicit
   authorization.
-- Stage D remains blocked until the paid run reaches `completed`,
-  `06-collect-evidence.sh` passes all acceptance invariants, actual
-  provider billing is checked, and step 7 restores the post-smoke
-  fail-closed posture.
+- Stage D remains blocked until a paid run reaches `completed`,
+  `06-collect-evidence.sh` passes all acceptance invariants (including
+  the exact 3-run/3-execution post-run totals), actual provider billing
+  is checked, and step 7 restores the post-smoke fail-closed posture.
