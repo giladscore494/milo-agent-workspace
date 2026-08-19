@@ -1508,3 +1508,77 @@ def test_deploy_fails_when_api_not_ready(tmp_path):
     result, _ = run_deploy(tmp_path, ready="False")
     assert result.returncode != 0
     assert "BLOCKED: API service not Ready" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# 02-deploy-images.sh: the paid flag must be the LITERAL "false" — a secret
+# binding or an absent flag can never pass the fail-closed gate
+# ---------------------------------------------------------------------------
+
+
+PAID_FLAG_BINDING = {"name": "MILO_ENABLE_PAID_EXECUTION", "valueFrom": {"secretKeyRef": {"name": "PAID_FLAG_SECRET"}}}
+PAID_FLAG_FALSE = {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"}
+API_BASE_ENV = [
+    {"name": "MILO_ENABLE_RUN_CREATION", "value": "false"},
+    {"name": "JOB_LAUNCHER", "value": "disabled"},
+]
+
+
+def worker_spec_with_env(entries):
+    return {"spec": {"template": {"spec": {"template": {"spec": {"containers": [{"env": entries}]}}}}}}
+
+
+def api_spec_with_env(entries):
+    return {"spec": {"template": {"spec": {"containers": [{"env": entries}]}}}}
+
+
+@pytest.mark.parametrize("worker_env", [
+    [PAID_FLAG_BINDING],                   # bound instead of literal
+    [PAID_FLAG_FALSE, PAID_FLAG_BINDING],  # literal false PLUS a binding
+    [],                                    # absent — no fallback allowed
+])
+def test_deploy_blocks_before_mutation_on_non_literal_worker_paid_flag(tmp_path, worker_env):
+    result, log = run_deploy(tmp_path, worker=worker_spec_with_env(worker_env))
+    assert result.returncode != 0
+    assert "BLOCKED (pre-deploy): worker is not fail-closed" in result.stdout
+    assert mutation_lines(log) == [], "production was mutated despite a non-literal paid flag"
+    combined = result.stdout + result.stderr
+    assert "secretKeyRef" not in combined
+    assert "PAID_FLAG_SECRET" not in combined
+
+
+@pytest.mark.parametrize("api_env", [
+    API_BASE_ENV + [PAID_FLAG_BINDING],
+    API_BASE_ENV + [PAID_FLAG_FALSE, PAID_FLAG_BINDING],
+    API_BASE_ENV,  # paid flag absent — no fallback allowed
+])
+def test_deploy_blocks_before_mutation_on_non_literal_api_paid_flag(tmp_path, api_env):
+    result, log = run_deploy(tmp_path, api=api_spec_with_env(api_env))
+    assert result.returncode != 0
+    assert "BLOCKED (pre-deploy): API is not fail-closed" in result.stdout
+    assert mutation_lines(log) == [], "production was mutated despite a non-literal paid flag"
+    combined = result.stdout + result.stderr
+    assert "secretKeyRef" not in combined
+    assert "PAID_FLAG_SECRET" not in combined
+
+
+def test_deploy_fails_when_paid_flag_becomes_secret_bound_after_deployment(tmp_path):
+    """The literal-only rule is re-enforced by the post-deploy gate too."""
+    result, log = run_deploy(
+        tmp_path,
+        worker_after=worker_spec_with_env([PAID_FLAG_BINDING]),
+    )
+    assert result.returncode != 0
+    assert len(mutation_lines(log)) == 2  # deploy happened, then the gate caught it
+    assert "BLOCKED (post-deploy): worker is not fail-closed" in result.stdout
+    assert "OK: release images deployed" not in result.stdout
+    assert "secretKeyRef" not in result.stdout + result.stderr
+
+
+def test_deploy_gate_requires_the_exact_literal_false():
+    """No-fallback proof at the source level: the deploy gate never reads
+    the paid flag with a default."""
+    text = (STAGE_C / "02-deploy-images.sh").read_text()
+    assert 'values.get("MILO_ENABLE_PAID_EXECUTION", "false")' not in text
+    assert text.count('"MILO_ENABLE_PAID_EXECUTION" not in secret_refs') == 2  # worker + API
+    assert text.count('values.get("MILO_ENABLE_PAID_EXECUTION") == "false"') == 2

@@ -8,10 +8,12 @@
 #   1. the exact historical Worker-execution baseline (exactly
 #      STAGE_C_EXPECTED_PRIOR_EXECUTIONS terminal executions, zero
 #      active/unverifiable — structured JSON via verify_executions.py);
-#   2. the fail-closed posture: worker MILO_ENABLE_PAID_EXECUTION=false;
-#      API run creation + paid execution false and launcher disabled; and
-#      NEITHER surface carries KIMI_API_KEY or MOONSHOT_API_KEY as a
-#      literal env value or a Secret Manager binding.
+#   2. the fail-closed posture: worker and API MILO_ENABLE_PAID_EXECUTION
+#      must be the LITERAL value "false" — present, exact, and never a
+#      Secret Manager binding (no absent-flag fallback); API run creation
+#      false and launcher disabled; and NEITHER surface carries
+#      KIMI_API_KEY or MOONSHOT_API_KEY as a literal env value or a
+#      Secret Manager binding.
 # A failed pre-gate means nothing is mutated; a failed post-gate means the
 # deploy is BLOCKED before proceeding to step 3. Names/flags only — secret
 # VALUES are never read or printed.
@@ -47,7 +49,11 @@ container = json.load(sys.stdin)["spec"]["template"]["spec"]["template"]["spec"]
 env = container.get("env") or []
 values = {e["name"]: e.get("value") for e in env if "value" in e}
 secret_refs = {e["name"] for e in env if "valueFrom" in e}
-assert values.get("MILO_ENABLE_PAID_EXECUTION", "false") == "false", "worker MILO_ENABLE_PAID_EXECUTION is not false"
+# The paid flag must be a LITERAL, exactly "false" — never a secret
+# binding (an operator cannot audit a bound value by name) and never
+# absent-with-fallback.
+assert "MILO_ENABLE_PAID_EXECUTION" not in secret_refs, "worker MILO_ENABLE_PAID_EXECUTION is supplied via a secret binding"
+assert values.get("MILO_ENABLE_PAID_EXECUTION") == "false", "worker MILO_ENABLE_PAID_EXECUTION is not the literal value false"
 for alias in aliases:
     assert alias not in secret_refs, f"provider secret {alias} bound to the worker"
     assert alias not in values, f"provider variable {alias} present on the worker"
@@ -65,7 +71,9 @@ values = {e["name"]: e.get("value") for e in env if "value" in e}
 secret_refs = {e["name"] for e in env if "valueFrom" in e}
 assert values.get("MILO_ENABLE_RUN_CREATION") == "false", "MILO_ENABLE_RUN_CREATION is not false"
 assert values.get("JOB_LAUNCHER") == "disabled", "JOB_LAUNCHER is not disabled"
-assert values.get("MILO_ENABLE_PAID_EXECUTION", "false") == "false", "API MILO_ENABLE_PAID_EXECUTION is not false"
+# Same literal-only rule as the worker: no binding, no fallback.
+assert "MILO_ENABLE_PAID_EXECUTION" not in secret_refs, "API MILO_ENABLE_PAID_EXECUTION is supplied via a secret binding"
+assert values.get("MILO_ENABLE_PAID_EXECUTION") == "false", "API MILO_ENABLE_PAID_EXECUTION is not the literal value false"
 for alias in aliases:
     assert alias not in secret_refs, f"provider secret {alias} bound to the API"
     assert alias not in values, f"provider variable {alias} present on the API"
