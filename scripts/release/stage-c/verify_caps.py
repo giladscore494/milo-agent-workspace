@@ -6,9 +6,10 @@ immediately before run creation, and every provider limit in
 STAGE_C_WORKER_PROVIDER_LIMITS against the Worker ONLY. Fails on any
 missing, changed, or unexpected value — an extra budget/cap variable that
 is not in the expected set also fails, so nothing can be loosened out of
-band; an unexpected MILO_PROVIDER_* variable on the Worker fails unless
-pinned, and ANY MILO_PROVIDER_* variable on the API fails (provider
-scheduling belongs to the Worker alone). Also verifies both surfaces run
+band; an unexpected MILO_PROVIDER_* variable on the Worker — whether a
+literal env value or a Secret Manager binding — fails unless pinned, and
+ANY MILO_PROVIDER_* variable on the API fails (provider scheduling
+belongs to the Worker alone). Also verifies both surfaces run
 the pinned release images (the production-image blocker: Stage C must
 deploy the exact STAGE_C_RELEASE_SHA runtime images before enabling any
 execution surface), the exact flag posture, and the provider-secret
@@ -107,9 +108,10 @@ def check_caps(surface: str, env: dict[str, str], caps: dict[str, str], problems
             problems.append(f"{surface}: unexpected budget/cap variable {key}={env[key]!r} not in STAGE_C_CAPS")
 
 
-def check_provider_limits(worker_env: dict[str, str], api_env: dict[str, str], api_secrets: set[str], limits: dict[str, str], problems: list[str]) -> None:
-    # Every pinned provider limit exact on the Worker; missing or changed
-    # values fail closed.
+def check_provider_limits(worker_env: dict[str, str], worker_secrets: set[str], api_env: dict[str, str], api_secrets: set[str], limits: dict[str, str], problems: list[str]) -> None:
+    # Every pinned provider limit exact on the Worker as a LITERAL value;
+    # missing or changed values fail closed (a pinned name supplied only
+    # via a secret binding therefore also fails as MISSING).
     for key, expected in limits.items():
         actual = worker_env.get(key)
         if actual is None:
@@ -117,8 +119,10 @@ def check_provider_limits(worker_env: dict[str, str], api_env: dict[str, str], a
         elif actual != expected:
             problems.append(f"worker: provider limit {key}={actual!r} differs from pinned {expected!r}")
     # Any unexpected MILO_PROVIDER_* variable on the Worker fails unless
-    # pinned (name only — values are never assumed printable).
-    for key in sorted(worker_env):
+    # pinned — checked across BOTH literal env values AND Secret Manager
+    # bindings, so a limit cannot be smuggled in through a secret ref
+    # (name only — values are never assumed printable).
+    for key in sorted(set(worker_env) | worker_secrets):
         if key.startswith(PROVIDER_PREFIX) and key not in limits:
             problems.append(f"worker: unexpected provider variable {key} is not pinned in STAGE_C_WORKER_PROVIDER_LIMITS")
     # ANY MILO_PROVIDER_* variable on the API fails: provider scheduling
@@ -192,7 +196,7 @@ def main() -> int:
 
     # Provider operating envelope: exact on the Worker, absent on the API.
     if provider_limits:
-        check_provider_limits(worker_env, api_env, api_secrets, provider_limits, problems)
+        check_provider_limits(worker_env, worker_secrets, api_env, api_secrets, provider_limits, problems)
 
     # Provider-secret posture: worker binding only, no literals anywhere,
     # nothing on the API.

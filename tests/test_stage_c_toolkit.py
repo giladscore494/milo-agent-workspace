@@ -583,10 +583,11 @@ def worker_env_list(**overrides):
     return env
 
 
-def worker_spec(env=None, image=None, bind_key=True):
+def worker_spec(env=None, image=None, bind_key=True, extra=None):
     entries = [{"name": k, "value": v} for k, v in (env or worker_env_list()).items()]
     if bind_key:
         entries.append({"name": "KIMI_API_KEY", "valueFrom": {"secretKeyRef": {"name": "KIMI_API_KEY"}}})
+    entries.extend(extra or [])
     return {"spec": {"template": {"spec": {"template": {"spec": {"containers": [
         {"image": image or f"{REGISTRY}/worker:{RELEASE_SHA}", "env": entries}
     ]}}}}}}
@@ -732,6 +733,29 @@ def test_verify_caps_fails_on_unexpected_worker_provider_variable(tmp_path):
     assert result.returncode != 0
     assert "MILO_PROVIDER_SNEAKY_SETTING" in result.stdout
     assert "not pinned in STAGE_C_WORKER_PROVIDER_LIMITS" in result.stdout
+
+
+def test_verify_caps_fails_on_unexpected_worker_provider_secret_binding(tmp_path):
+    """An unexpected MILO_PROVIDER_* variable cannot hide inside a Secret
+    Manager binding: the not-pinned scan covers worker_env ∪ worker_secrets."""
+    sneaky = {"name": "MILO_PROVIDER_HIDDEN_TOKEN", "valueFrom": {"secretKeyRef": {"name": "HIDDEN_SECRET"}}}
+    result = run_verify_caps(tmp_path, worker_spec(extra=[sneaky]), api_spec())
+    assert result.returncode != 0
+    assert "worker: unexpected provider variable MILO_PROVIDER_HIDDEN_TOKEN" in result.stdout
+    assert "not pinned in STAGE_C_WORKER_PROVIDER_LIMITS" in result.stdout
+    # The binding's secret NAME payload is never echoed beyond the var name.
+    assert "HIDDEN_SECRET" not in result.stdout + result.stderr
+
+
+def test_verify_caps_fails_when_a_pinned_provider_limit_arrives_as_a_secret_binding(tmp_path):
+    """A pinned limit supplied only via a binding is not a literal exact
+    value — it fails as MISSING rather than being trusted."""
+    env = worker_env_list()
+    del env["MILO_PROVIDER_RPM_LIMIT"]
+    binding = {"name": "MILO_PROVIDER_RPM_LIMIT", "valueFrom": {"secretKeyRef": {"name": "RPM_SECRET"}}}
+    result = run_verify_caps(tmp_path, worker_spec(env=env, extra=[binding]), api_spec())
+    assert result.returncode != 0
+    assert "provider limit MILO_PROVIDER_RPM_LIMIT is MISSING" in result.stdout
 
 
 def test_verify_caps_fails_on_any_provider_variable_on_api(tmp_path):
@@ -1250,3 +1274,237 @@ def test_acceptance_doc_states_the_current_pins_and_boundaries():
     assert "Stage D remains unauthorized" in text
     # Merging the preparation PR must never read as run authorization.
     assert "authorizes nothing" in text
+
+
+# ---------------------------------------------------------------------------
+# 02-deploy-images.sh: execution-baseline and fail-closed posture gates run
+# BEFORE the first production mutation and are repeated after deployment
+# (mocked gcloud — no network, no real mutation)
+# ---------------------------------------------------------------------------
+
+
+DEPLOY_WORKER_FAIL_CLOSED = {"spec": {"template": {"spec": {"template": {"spec": {"containers": [{"env": [
+    {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
+]}]}}}}}}
+
+DEPLOY_API_FAIL_CLOSED = {"spec": {"template": {"spec": {"containers": [{"env": [
+    {"name": "MILO_ENABLE_RUN_CREATION", "value": "false"},
+    {"name": "JOB_LAUNCHER", "value": "disabled"},
+    {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
+]}]}}}}
+
+
+def deploy_worker_with(extra_entries):
+    spec = json.loads(json.dumps(DEPLOY_WORKER_FAIL_CLOSED))
+    spec["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["env"].extend(extra_entries)
+    return spec
+
+
+def deploy_api_with(extra_entries):
+    spec = json.loads(json.dumps(DEPLOY_API_FAIL_CLOSED))
+    spec["spec"]["template"]["spec"]["containers"][0]["env"].extend(extra_entries)
+    return spec
+
+
+DEPLOY_MOCK_GCLOUD = r"""#!/usr/bin/env bash
+args="$*"
+printf '%s\n' "${args}" >> "${MOCK_LOG}"
+serve() { # base-name — serves the -after variant once a mutation happened
+  if [ -e "${MOCK_DIR}/deployed" ] && [ -f "${MOCK_DIR}/${1}-after.json" ]; then
+    cat "${MOCK_DIR}/${1}-after.json"
+  else
+    cat "${MOCK_DIR}/${1}.json"
+  fi
+}
+case "${args}" in
+  *"jobs update"*|*"services update"*)
+    touch "${MOCK_DIR}/deployed"
+    exit 0 ;;
+  *"executions list"*)
+    serve executions ;;
+  *"services describe"*"value(status.conditions"*)
+    cat "${MOCK_DIR}/ready.txt" ;;
+  *"services describe"*)
+    serve api ;;
+  *"jobs describe"*)
+    serve worker ;;
+  *)
+    echo "unexpected gcloud invocation: ${args}" >&2
+    exit 9 ;;
+esac
+"""
+
+
+def run_deploy(tmp_path, *, executions=None, worker=None, api=None,
+               executions_after=None, worker_after=None, api_after=None, ready="True"):
+    mock_dir = tmp_path / "mock"
+    mock_dir.mkdir(exist_ok=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (mock_dir / "executions.json").write_text(json.dumps(HISTORICAL_BASELINE if executions is None else executions))
+    (mock_dir / "worker.json").write_text(json.dumps(DEPLOY_WORKER_FAIL_CLOSED if worker is None else worker))
+    (mock_dir / "api.json").write_text(json.dumps(DEPLOY_API_FAIL_CLOSED if api is None else api))
+    if executions_after is not None:
+        (mock_dir / "executions-after.json").write_text(json.dumps(executions_after))
+    if worker_after is not None:
+        (mock_dir / "worker-after.json").write_text(json.dumps(worker_after))
+    if api_after is not None:
+        (mock_dir / "api-after.json").write_text(json.dumps(api_after))
+    (mock_dir / "ready.txt").write_text(f"{ready}\n")
+    gcloud = bin_dir / "gcloud"
+    gcloud.write_text(DEPLOY_MOCK_GCLOUD)
+    gcloud.chmod(0o755)
+    log = mock_dir / "gcloud.log"
+    log.write_text("")
+    result = subprocess.run(
+        ["bash", str(STAGE_C / "02-deploy-images.sh")],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin", "MOCK_DIR": str(mock_dir), "MOCK_LOG": str(log)},
+        timeout=120,
+    )
+    return result, log.read_text().splitlines()
+
+
+def mutation_lines(log_lines):
+    return [line for line in log_lines if "jobs update" in line or "services update" in line]
+
+
+def test_deploy_gates_run_before_any_mutation_and_again_after(tmp_path):
+    result, log = run_deploy(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "OK: release images deployed" in result.stdout
+    mutations = mutation_lines(log)
+    assert len(mutations) == 2  # worker image + API image, nothing else
+    first_mutation = log.index(mutations[0])
+    # BOTH read-only gates completed before the first mutating call.
+    pre = log[:first_mutation]
+    assert any("executions list" in line for line in pre)
+    assert any("jobs describe" in line for line in pre)
+    assert any("services describe" in line for line in pre)
+    # And BOTH gates ran again after the last mutating call.
+    post = log[log.index(mutations[1]) + 1:]
+    assert any("executions list" in line for line in post)
+    assert any("jobs describe" in line for line in post)
+    assert sum("services describe" in line for line in post) >= 2  # Ready + posture
+    assert result.stdout.count("pre-deploy") >= 2
+    assert result.stdout.count("post-deploy") >= 2
+
+
+@pytest.mark.parametrize("listing", [
+    HISTORICAL_BASELINE[:1],  # 1 — history altered?
+    HISTORICAL_BASELINE + [terminal_execution("milo-agent-worker-extra")],  # 3
+    [HISTORICAL_BASELINE[0], {"metadata": {"name": "milo-agent-worker-live1"}, "status": {"completionTime": None}}],  # active
+    "this is not json",
+])
+def test_deploy_blocks_before_mutation_on_execution_baseline_violations(tmp_path, listing):
+    executions = listing if isinstance(listing, list) else None
+    if isinstance(listing, str):
+        result, log = run_deploy_raw_listing(tmp_path, listing)
+    else:
+        result, log = run_deploy(tmp_path, executions=executions)
+    assert result.returncode != 0
+    assert "BLOCKED (pre-deploy)" in result.stdout
+    assert mutation_lines(log) == [], "production was mutated despite a failed pre-gate"
+
+
+def run_deploy_raw_listing(tmp_path, raw):
+    result, log = run_deploy(tmp_path)  # builds the mock tree (happy files)
+    (tmp_path / "mock" / "executions.json").write_text(raw)
+    (tmp_path / "mock" / "gcloud.log").write_text("")
+    deployed = tmp_path / "mock" / "deployed"
+    if deployed.exists():
+        deployed.unlink()
+    rerun = subprocess.run(
+        ["bash", str(STAGE_C / "02-deploy-images.sh")],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{tmp_path / 'bin'}:/usr/bin:/bin", "MOCK_DIR": str(tmp_path / "mock"), "MOCK_LOG": str(tmp_path / "mock" / "gcloud.log")},
+        timeout=120,
+    )
+    return rerun, (tmp_path / "mock" / "gcloud.log").read_text().splitlines()
+
+
+def test_deploy_blocks_before_mutation_when_worker_is_not_fail_closed(tmp_path):
+    hot_worker = deploy_worker_with([])
+    hot_worker["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["env"] = [
+        {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "true"},
+    ]
+    result, log = run_deploy(tmp_path, worker=hot_worker)
+    assert result.returncode != 0
+    assert "BLOCKED (pre-deploy): worker is not fail-closed" in result.stdout
+    assert mutation_lines(log) == []
+
+
+@pytest.mark.parametrize("bad_env", [
+    [{"name": "MILO_ENABLE_RUN_CREATION", "value": "true"}, {"name": "JOB_LAUNCHER", "value": "disabled"}],
+    [{"name": "MILO_ENABLE_RUN_CREATION", "value": "false"}, {"name": "JOB_LAUNCHER", "value": "cloud_run"}],
+    [{"name": "MILO_ENABLE_RUN_CREATION", "value": "false"}, {"name": "JOB_LAUNCHER", "value": "disabled"}, {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "true"}],
+])
+def test_deploy_blocks_before_mutation_when_api_is_not_fail_closed(tmp_path, bad_env):
+    bad_api = {"spec": {"template": {"spec": {"containers": [{"env": bad_env}]}}}}
+    result, log = run_deploy(tmp_path, api=bad_api)
+    assert result.returncode != 0
+    assert "BLOCKED (pre-deploy): API is not fail-closed" in result.stdout
+    assert mutation_lines(log) == []
+
+
+def secret_binding(name):
+    return {"name": name, "valueFrom": {"secretKeyRef": {"name": name}}}
+
+
+def literal_value(name):
+    return {"name": name, "value": "unit-test-literal-value"}
+
+
+@pytest.mark.parametrize("entry", [
+    secret_binding("KIMI_API_KEY"), secret_binding("MOONSHOT_API_KEY"),
+    literal_value("KIMI_API_KEY"), literal_value("MOONSHOT_API_KEY"),
+])
+def test_deploy_blocks_on_provider_alias_on_worker_without_printing_values(tmp_path, entry):
+    result, log = run_deploy(tmp_path, worker=deploy_worker_with([entry]))
+    assert result.returncode != 0
+    assert "BLOCKED (pre-deploy): worker is not fail-closed" in result.stdout
+    assert mutation_lines(log) == []
+    assert "unit-test-literal-value" not in result.stdout + result.stderr
+    assert "secretKeyRef" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("entry", [
+    secret_binding("KIMI_API_KEY"), secret_binding("MOONSHOT_API_KEY"),
+    literal_value("KIMI_API_KEY"), literal_value("MOONSHOT_API_KEY"),
+])
+def test_deploy_blocks_on_provider_alias_on_api_without_printing_values(tmp_path, entry):
+    result, log = run_deploy(tmp_path, api=deploy_api_with([entry]))
+    assert result.returncode != 0
+    assert "BLOCKED (pre-deploy): API is not fail-closed" in result.stdout
+    assert mutation_lines(log) == []
+    assert "unit-test-literal-value" not in result.stdout + result.stderr
+    assert "secretKeyRef" not in result.stdout + result.stderr
+
+
+def test_deploy_fails_when_the_posture_regresses_after_deployment(tmp_path):
+    """Pre-gates pass, images deploy, but the post-deploy re-check finds a
+    provider binding on the worker — the step exits non-zero."""
+    result, log = run_deploy(tmp_path, worker_after=deploy_worker_with([secret_binding("KIMI_API_KEY")]))
+    assert result.returncode != 0
+    assert len(mutation_lines(log)) == 2  # the deploy did happen
+    assert "BLOCKED (post-deploy): worker is not fail-closed" in result.stdout
+    assert "OK: release images deployed" not in result.stdout
+
+
+def test_deploy_fails_when_a_new_execution_appears_during_deployment(tmp_path):
+    result, log = run_deploy(
+        tmp_path,
+        executions_after=HISTORICAL_BASELINE + [terminal_execution("milo-agent-worker-surprise")],
+    )
+    assert result.returncode != 0
+    assert len(mutation_lines(log)) == 2
+    assert "BLOCKED (post-deploy)" in result.stdout
+    assert "OK: release images deployed" not in result.stdout
+
+
+def test_deploy_fails_when_api_not_ready(tmp_path):
+    result, _ = run_deploy(tmp_path, ready="False")
+    assert result.returncode != 0
+    assert "BLOCKED: API service not Ready" in result.stdout
