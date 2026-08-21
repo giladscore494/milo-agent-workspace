@@ -49,19 +49,28 @@ stage_c_pin STAGE_C_GW_PROBE_JOB "stagec-gw-probe"
 # Attempt 5/6 identity and is never reused; only zero pre-existing rows
 # under the new key are acceptable.
 stage_c_pin STAGE_C_IDEMPOTENCY_KEY "stage-c-smoke-attempt-7-20260819"
-# Exact HISTORICAL baseline that must already exist before the Attempt 7
-# run is created (preflight fails closed on any other exact count):
-#   - 2 prior database runs: Attempt 5 (58daa7de-…, failed at the
-#     claim_run_lease ACL before any provider call) and Attempt 6
-#     (37912575-…, real paid execution, terminal `failed` after
-#     RETRY_LIMIT_REACHED). Neither is deleted, rewritten or hidden.
-#   - 2 prior Worker executions (both terminal): Attempt 5's and
-#     Attempt 6's. Attempt 6's authorization is consumed.
+# Exact baseline that must already exist before the Attempt 7 run is
+# created (preflight fails closed on any other exact count). Two facts
+# are deliberately distinct here:
+#   - HISTORY: 2 Worker executions historically occurred — Attempt 5
+#     (milo-agent-worker-d2gfx) and Attempt 6 (milo-agent-worker-mcfrx).
+#   - LIVE, EXECUTABLE BASELINE: Cloud Run currently exposes exactly 1
+#     terminal historical execution — Attempt 6's. Attempt 5's execution
+#     was explicitly deleted at 2026-08-18T02:00:48Z via
+#     google.cloud.run.v1.Executions.DeleteExecution (proven by Cloud
+#     Audit Logs), so it is no longer visible and cannot be part of a
+#     gate that lists executions.
+# Database baseline (rows are never deleted, rewritten or hidden):
+#   - 2 prior runs: Attempt 5 (58daa7de-…, failed at the claim_run_lease
+#     ACL before any provider call) and Attempt 6 (37912575-…, real paid
+#     execution, terminal `failed` after RETRY_LIMIT_REACHED). Attempt
+#     6's authorization is consumed.
 # Evidence gates verify a ONE-run/ONE-execution increment over these
-# exact baselines (expected post-run totals: 3 and 3), never an empty
-# system and never "some run exists".
+# exact live baselines (expected post-run totals: 3 database runs and 2
+# visible terminal executions), never an empty system and never "some
+# run exists".
 stage_c_pin STAGE_C_EXPECTED_PRIOR_RUNS "2"
-stage_c_pin STAGE_C_EXPECTED_PRIOR_EXECUTIONS "2"
+stage_c_pin STAGE_C_EXPECTED_PRIOR_EXECUTIONS "1"
 # The ONLY terminal state that counts as a PASS. failed / cancelled /
 # timed_out / budget_exhausted / partial_success are controlled fail-closed
 # terminals: they prove the safety rails but FAIL the smoke test, trigger a

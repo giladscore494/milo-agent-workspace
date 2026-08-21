@@ -38,12 +38,17 @@ CAPS = (
     "MILO_DAILY_USER_BUDGET=5.00,MILO_DAILY_PROJECT_BUDGET=5.00,MILO_ESTIMATED_COST_PER_CALL=0.02"
 )
 
-# The pinned Attempt 7 run identity and historical baseline (Attempts 5+6
-# left 2 runs and 2 terminal Worker executions in production).
+# The pinned Attempt 7 run identity and baselines. Attempts 5+6 left 2
+# database runs (both rows preserved). 2 Worker executions historically
+# occurred (Attempt 5 milo-agent-worker-d2gfx, Attempt 6
+# milo-agent-worker-mcfrx), but Attempt 5's was explicitly deleted at
+# 2026-08-18T02:00:48Z (google.cloud.run.v1.Executions.DeleteExecution,
+# Cloud Audit Logs), so Cloud Run currently exposes exactly 1 visible
+# terminal execution — the executable live baseline.
 ATTEMPT7_KEY = "stage-c-smoke-attempt-7-20260819"
 CONSUMED_KEY = "stage-c-smoke-0001"  # Attempt 5/6 identity — never reused
 EXPECTED_PRIOR_RUNS = "2"
-EXPECTED_PRIOR_EXECUTIONS = "2"
+EXPECTED_PRIOR_EXECUTIONS = "1"
 
 # The exact seven pinned worker-only provider settings (Tier 2 confirmed;
 # envelope deliberately below the account ceiling; concurrency stays 2).
@@ -955,7 +960,7 @@ def test_env_pins_all_seven_provider_limits_exactly():
     ("STAGE_C_EXPECTED_PRIOR_RUNS", "0"),  # pretending the history is empty
     ("STAGE_C_EXPECTED_PRIOR_RUNS", "5"),
     ("STAGE_C_EXPECTED_PRIOR_EXECUTIONS", "0"),
-    ("STAGE_C_EXPECTED_PRIOR_EXECUTIONS", "3"),
+    ("STAGE_C_EXPECTED_PRIOR_EXECUTIONS", "2"),  # the pre-deletion count — no longer the live baseline
     ("STAGE_C_ACCEPTABLE_TERMINAL_STATES", "completed,failed,budget_exhausted"),
 ])
 def test_env_refuses_inherited_override_of_authorized_constants(var, hostile):
@@ -1127,8 +1132,10 @@ def test_acceptance_doc_does_not_call_three_dollars_a_hard_billing_ceiling():
 
 # ---------------------------------------------------------------------------
 # verify_executions.py: exact Worker-execution baseline gate (Attempt 7 —
-# 2 terminal historical executions before the run, 3 after; fail-safe on
-# anything unverifiable)
+# 1 VISIBLE terminal historical execution before the run, 2 after;
+# fail-safe on anything unverifiable). 2 executions historically occurred,
+# but Attempt 5's was deleted on 2026-08-18, so only Attempt 6's is
+# visible in Cloud Run and countable by the gate.
 # ---------------------------------------------------------------------------
 
 
@@ -1145,9 +1152,17 @@ def active_execution(name):
     return {"metadata": {"name": name}, "status": {"completionTime": None, "conditions": [{"type": "Completed", "status": "Unknown"}]}}
 
 
-HISTORICAL_BASELINE = [
-    terminal_execution("milo-agent-worker-attempt5"),
-    terminal_execution("milo-agent-worker-attempt6", completion_time=None, condition="False"),
+# The one execution Cloud Run still exposes: Attempt 6's, terminal
+# `failed` (Completed=False). Attempt 5's execution is NOT here — it was
+# deleted on 2026-08-18 and a listing can never contain it again.
+VISIBLE_BASELINE = [
+    terminal_execution("milo-agent-worker-mcfrx", completion_time=None, condition="False"),
+]
+# What a listing would look like if a second historical-looking terminal
+# execution (re)appeared — e.g. an Attempt 5-style resurrection. With the
+# visible baseline pinned at 1, this is a violation, not the baseline.
+TWO_TERMINAL_EXECUTIONS = VISIBLE_BASELINE + [
+    terminal_execution("milo-agent-worker-d2gfx"),
 ]
 
 
@@ -1163,22 +1178,25 @@ def run_verify_executions(listing, expected_total):
     )
 
 
-def test_two_terminal_historical_executions_pass_the_pre_run_gate():
-    result = run_verify_executions(HISTORICAL_BASELINE, 2)
+def test_exactly_one_visible_terminal_execution_passes_the_pre_run_gate():
+    result = run_verify_executions(VISIBLE_BASELINE, 1)
     assert result.returncode == 0, result.stdout + result.stderr
     verdict = json.loads(result.stdout)
     assert verdict["ok"] is True
-    assert verdict["terminal"] == 2
+    assert verdict["terminal"] == 1
     assert verdict["nonterminal"] == 0
 
 
 @pytest.mark.parametrize("listing", [
-    HISTORICAL_BASELINE[:1],  # only one prior execution — history altered?
-    HISTORICAL_BASELINE + [terminal_execution("milo-agent-worker-extra")],  # three
-    [],
+    [],  # zero — the visible Attempt 6 execution vanished too?
+    TWO_TERMINAL_EXECUTIONS,  # two — the deleted Attempt 5 execution cannot reappear
+    VISIBLE_BASELINE + [
+        terminal_execution("milo-agent-worker-extra"),
+        terminal_execution("milo-agent-worker-extra2"),
+    ],  # three
 ])
 def test_pre_run_gate_fails_on_any_count_other_than_the_pinned_baseline(listing):
-    result = run_verify_executions(listing, 2)
+    result = run_verify_executions(listing, 1)
     assert result.returncode != 0
     assert json.loads(result.stdout)["ok"] is False
 
@@ -1186,7 +1204,7 @@ def test_pre_run_gate_fails_on_any_count_other_than_the_pinned_baseline(listing)
 def test_pre_run_gate_fails_on_a_new_active_execution():
     """A new active execution before authorization blocks the run even when
     the total still looks like the baseline."""
-    result = run_verify_executions([HISTORICAL_BASELINE[0], active_execution("milo-agent-worker-live1")], 2)
+    result = run_verify_executions([active_execution("milo-agent-worker-live1")], 1)
     assert result.returncode != 0
     verdict = json.loads(result.stdout)
     assert verdict["nonterminal"] == 1
@@ -1200,39 +1218,41 @@ def test_pre_run_gate_fails_on_a_new_active_execution():
     {"metadata": {"name": "milo-agent-worker-bad1"}, "status": "not-a-dict"},
 ])
 def test_missing_null_or_malformed_status_fails_safe_as_nonterminal(unverifiable):
-    result = run_verify_executions([HISTORICAL_BASELINE[0], unverifiable], 2)
+    """Total matches the baseline (1) but the status proves nothing —
+    fail-safe as nonterminal/unverifiable."""
+    result = run_verify_executions([unverifiable], 1)
     assert result.returncode != 0
     assert json.loads(result.stdout)["nonterminal"] == 1
 
 
-def test_exactly_three_terminal_executions_pass_the_post_run_gate():
-    listing = HISTORICAL_BASELINE + [terminal_execution("milo-agent-worker-attempt7")]
-    result = run_verify_executions(listing, 3)
+def test_exactly_two_visible_terminal_executions_pass_the_post_run_gate():
+    listing = VISIBLE_BASELINE + [terminal_execution("milo-agent-worker-attempt7")]
+    result = run_verify_executions(listing, 2)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)["ok"] is True
 
 
 @pytest.mark.parametrize("extra", [
-    [],  # the new execution never happened — still 2
-    [terminal_execution("milo-agent-worker-attempt7"), terminal_execution("milo-agent-worker-sneaky")],  # 4
+    [],  # the new execution never happened — still 1
+    [terminal_execution("milo-agent-worker-attempt7"), terminal_execution("milo-agent-worker-sneaky")],  # 3
 ])
 def test_post_run_gate_fails_unless_exactly_one_execution_was_added(extra):
     """A second new execution cannot pass unnoticed: the exact-total check
     catches it whether it is terminal or active."""
-    result = run_verify_executions(HISTORICAL_BASELINE + extra, 3)
+    result = run_verify_executions(VISIBLE_BASELINE + extra, 2)
     assert result.returncode != 0
     assert json.loads(result.stdout)["ok"] is False
 
 
 def test_post_run_gate_fails_on_a_still_active_new_execution():
-    result = run_verify_executions(HISTORICAL_BASELINE + [active_execution("milo-agent-worker-attempt7")], 3)
+    result = run_verify_executions(VISIBLE_BASELINE + [active_execution("milo-agent-worker-attempt7")], 2)
     assert result.returncode != 0
     assert json.loads(result.stdout)["nonterminal"] == 1
 
 
 @pytest.mark.parametrize("listing", ["this is not json", '{"not": "a list"}', "null"])
 def test_structured_listing_parse_failures_return_nonzero(listing):
-    result = run_verify_executions(listing, 2)
+    result = run_verify_executions(listing, 1)
     assert result.returncode != 0
     assert json.loads(result.stdout)["ok"] is False
     assert "failing closed" in result.stdout
@@ -1262,6 +1282,23 @@ def test_acceptance_doc_records_attempts_5_and_6_truthfully():
     assert "47,380" in text
     assert "$0.03976" in text
     assert "Attempt 6\nauthorization is consumed" in text or "Attempt 6 authorization is consumed" in text or "ATTEMPT 6 AUTHORIZATION\nCONSUMED" in text
+
+
+def test_acceptance_doc_distinguishes_occurred_from_visible_executions():
+    """2 Worker executions historically occurred, but Attempt 5's was
+    explicitly deleted (proven by Cloud Audit Logs) — the doc must state
+    both facts and never claim both executions remain visible/preserved."""
+    text = acceptance_doc()
+    assert "milo-agent-worker-d2gfx" in text
+    assert "milo-agent-worker-mcfrx" in text
+    assert "2 Worker executions historically occurred" in text
+    assert "2026-08-18T02:00:48" in text
+    assert "google.cloud.run.v1.Executions.DeleteExecution" in text
+    assert "exactly 1 is currently visible in Cloud Run" in text
+    # The superseded both-executions-preserved claims are gone.
+    assert "Worker executions: **2**, both terminal (historical, preserved)" not in text
+    assert "2 terminal Worker executions**" not in text
+    assert "is never cancelled or deleted" not in text
 
 
 def test_acceptance_doc_states_the_current_pins_and_boundaries():
@@ -1341,7 +1378,7 @@ def run_deploy(tmp_path, *, executions=None, worker=None, api=None,
     mock_dir.mkdir(exist_ok=True)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    (mock_dir / "executions.json").write_text(json.dumps(HISTORICAL_BASELINE if executions is None else executions))
+    (mock_dir / "executions.json").write_text(json.dumps(VISIBLE_BASELINE if executions is None else executions))
     (mock_dir / "worker.json").write_text(json.dumps(DEPLOY_WORKER_FAIL_CLOSED if worker is None else worker))
     (mock_dir / "api.json").write_text(json.dumps(DEPLOY_API_FAIL_CLOSED if api is None else api))
     if executions_after is not None:
@@ -1392,9 +1429,9 @@ def test_deploy_gates_run_before_any_mutation_and_again_after(tmp_path):
 
 
 @pytest.mark.parametrize("listing", [
-    HISTORICAL_BASELINE[:1],  # 1 — history altered?
-    HISTORICAL_BASELINE + [terminal_execution("milo-agent-worker-extra")],  # 3
-    [HISTORICAL_BASELINE[0], {"metadata": {"name": "milo-agent-worker-live1"}, "status": {"completionTime": None}}],  # active
+    [],  # 0 — the one visible execution vanished too?
+    TWO_TERMINAL_EXECUTIONS,  # 2 — the deleted Attempt 5 execution cannot reappear
+    [{"metadata": {"name": "milo-agent-worker-live1"}, "status": {"completionTime": None}}],  # active
     "this is not json",
 ])
 def test_deploy_blocks_before_mutation_on_execution_baseline_violations(tmp_path, listing):
@@ -1496,7 +1533,7 @@ def test_deploy_fails_when_the_posture_regresses_after_deployment(tmp_path):
 def test_deploy_fails_when_a_new_execution_appears_during_deployment(tmp_path):
     result, log = run_deploy(
         tmp_path,
-        executions_after=HISTORICAL_BASELINE + [terminal_execution("milo-agent-worker-surprise")],
+        executions_after=VISIBLE_BASELINE + [terminal_execution("milo-agent-worker-surprise")],
     )
     assert result.returncode != 0
     assert len(mutation_lines(log)) == 2
