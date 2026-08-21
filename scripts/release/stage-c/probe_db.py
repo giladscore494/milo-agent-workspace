@@ -10,7 +10,7 @@ Modes (env STAGE_C_MODE):
   preflight — verify migration-dependent schema/RPC surface AND enforce
               (via a real server-side exact count) that the runs table
               holds exactly STAGE_C_EXPECTED_PRIOR_RUNS rows (the pinned
-              historical Attempt 5/6 baseline) and zero rows for the
+              live baseline — Attempt 6's run row) and zero rows for the
               current Stage C idempotency key; fails closed on any other
               value, on an unavailable count, and on missing/invalid
               baseline configuration
@@ -118,7 +118,7 @@ def expected_prior_runs() -> int | None:
 
     A missing, empty or non-integer STAGE_C_EXPECTED_PRIOR_RUNS returns
     None so callers fail closed — the gates must never fall back to
-    assuming an empty system (the Attempt 5/6 history is real).
+    assuming an empty system (Attempt 6's run row is real history).
     """
     raw = os.environ.get("STAGE_C_EXPECTED_PRIOR_RUNS")
     if raw is None or not raw.strip().isdigit():
@@ -241,10 +241,11 @@ def preflight() -> None:
     )
 
     # Stage C precondition: the runs table must hold EXACTLY the pinned
-    # historical baseline (Attempt 7: the 2 prior Attempt 5/6 runs, which
-    # are preserved as evidence, never deleted or rewritten) — enforced
-    # with a real server-side exact count, failing closed if the count OR
-    # the baseline configuration is unavailable/invalid.
+    # live baseline (Attempt 7: the 1 prior Attempt 6 run row. Attempt 5
+    # also occurred historically, but its row is absent from production
+    # for an unverified reason and is NOT counted) — enforced with a real
+    # server-side exact count, failing closed if the count OR the
+    # baseline configuration is unavailable/invalid.
     expected_prior = expected_prior_runs()
     total_runs = count_exact("/rest/v1/runs?select=id")
     checks["existing_runs"] = "UNKNOWN" if total_runs is None else str(total_runs)
@@ -372,8 +373,8 @@ def evidence() -> None:
 
     Verifies exactly one new authorized run over the pinned prior baseline
     (total = STAGE_C_EXPECTED_PRIOR_RUNS + 1) and that the ONE requested
-    run carries the current idempotency key — the historical Attempt 5/6
-    rows are preserved evidence and can never satisfy the new run's
+    run carries the current idempotency key — the historical Attempt 6
+    row is counted only as baseline and can never satisfy the new run's
     acceptance. Two criteria live in 06-collect-evidence.sh because they
     need gcloud or the gateway identity: the worker execution total
     (pinned baseline + 1, all terminal) and the post-completion idempotent
@@ -409,8 +410,8 @@ def evidence() -> None:
 
     # Exactly one new authorized run over the pinned prior baseline — real
     # exact counts, fail closed if unknown or if the baseline configuration
-    # is missing/invalid. Historical rows are never deleted to make counts
-    # easier; the increment itself is the proof.
+    # is missing/invalid. The gates never delete or hide historical rows
+    # to make counts easier; the increment itself is the proof.
     prior_baseline = expected_prior_runs()
     out["expected_prior_runs"] = prior_baseline
     if prior_baseline is None:
