@@ -7,7 +7,7 @@
 #     STAGE_C_EXPECTED_PRIOR_RUNS+1 database runs and
 #     STAGE_C_EXPECTED_PRIOR_EXECUTIONS+1 VISIBLE executions — a second
 #     new run or execution cannot pass unnoticed, and the historical
-#     Attempt 5/6 database rows never satisfy the new run's acceptance);
+#     Attempt 6 database row never satisfies the new run's acceptance);
 #   - expected terminal state;
 #   - attempt/claim/heartbeat invariants;
 #   - zero dangling reservations;

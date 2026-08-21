@@ -1,11 +1,15 @@
 # Stage C acceptance report — one controlled paid smoke run
 
-Status (2026-08-19): **STAGE C NOT PASSED — ATTEMPT 6 AUTHORIZATION
+Status (2026-08-21): **STAGE C NOT PASSED — ATTEMPT 6 AUTHORIZATION
 CONSUMED; ATTEMPT 7 PREPARED BUT NOT AUTHORIZED.** Attempt 6 reached real
 paid Worker execution and **failed** (terminal `failed`,
 `RETRY_LIMIT_REACHED` after repeated provider 429s during technical
-enrichment). Production now truthfully holds **2 MILO runs** (Attempts 5
-and 6). **2 Worker executions historically occurred** (Attempt 5
+enrichment). Two smoke attempts (5 and 6) occurred historically, but
+`public.runs` currently holds **exactly 1 run row** — Attempt 6's
+(`37912575-f9ce-4437-893d-7dfa45c53aa9`); Attempt 5's row
+(`58daa7de-76f5-4359-93e1-3a767c912c20`) is **absent, and the reason for
+its absence is unverified** — no audited deletion is claimed for the
+database row. **2 Worker executions historically occurred** (Attempt 5
 `milo-agent-worker-d2gfx`, Attempt 6 `milo-agent-worker-mcfrx`), but
 **exactly 1 is currently visible in Cloud Run** — Attempt 5's execution
 was explicitly deleted at `2026-08-18T02:00:48.774522Z` via
@@ -322,7 +326,7 @@ Nothing was deployed, enabled, bound, or executed in production. Fixes:
    execution, terminal, zero active — `verify_executions.py`); re-verifies
    launch invariants (worker-only key IAM, launcher IAM, exact caps on
    both surfaces + exact provider limits on the worker only); DB
-   preflight (exactly 2 prior runs, 0 rows under the Attempt 7 key);
+   preflight (exactly 1 prior run row, 0 rows under the Attempt 7 key);
    creates the operator test user (`stage-c-smoke@invalid.milo`),
    dedicated `stage-c-smoke` project (test user is the **only** member),
    and conversation; then executes exactly **one** new run through the
@@ -333,7 +337,7 @@ Nothing was deployed, enabled, bound, or executed in production. Fixes:
    heartbeat, event/checkpoint sequence, reservation settlement with zero
    dangling rows, ledger token/cost sums vs the run usage snapshot,
    exactly one new authorized run/execution over the pinned prior
-   baseline — `total_runs=3` / visible `executions=2` (all terminal; no duplicate
+   baseline — `total_runs=2` / visible `executions=2` (all terminal; no duplicate
    execution, no stale-worker writes) with exactly one run under the
    Attempt 7 key, verified by the requested Run ID — post-completion
    idempotent replay returns the same run, secret-marker scans over DB
@@ -468,8 +472,10 @@ deleted** at `2026-08-18T02:00:48.774522Z` via
 `google.cloud.run.v1.Executions.DeleteExecution` (the successful
 deletion is proven by Cloud Audit Logs), so it no longer appears in the
 Cloud Run execution listing and is NOT counted in the pinned visible
-execution baseline. The Attempt 5 database run row remains preserved and
-is counted in the pinned database baseline.
+execution baseline. The Attempt 5 database run row (`58daa7de-…`) is
+**absent from `public.runs`** (verified live 2026-08-21). The reason for
+its absence is unverified — no audited deletion is claimed for the
+database row — and it is NOT counted in the pinned database baseline.
 
 ## Stage C attempt 6 — REAL PAID EXECUTION, FAILED
 
@@ -490,23 +496,55 @@ Kimi execution:
 The Attempt 6 Worker execution (`milo-agent-worker-mcfrx`) was terminal.
 **The Attempt 6 authorization is consumed**: under the acceptance policy
 only `completed` is a PASS, so Attempt 6 FAILED the smoke test, and a
-further attempt requires fresh explicit operator authorization. The run
-row, its execution and its usage accounting are preserved as historical
-evidence; `milo-agent-worker-mcfrx` is the only Worker execution still
-visible in Cloud Run (Attempt 5's was deleted on 2026-08-18 — see
-above), and it is the pinned visible execution baseline.
+further attempt requires fresh explicit operator authorization. The
+Attempt 6 run row, its execution and its usage accounting are present as
+historical evidence; `milo-agent-worker-mcfrx` is the only Worker
+execution still visible in Cloud Run (Attempt 5's was deleted on
+2026-08-18 — see above), and it is the pinned visible execution
+baseline.
 
 Consequence for Attempt 7 preparation: the toolkit's former
 empty-system assumptions (zero prior runs, zero prior Worker executions,
 "refuse if any execution exists", "exactly one total run/execution") are
 no longer valid. All preflight and evidence gates now verify a
 one-run/one-execution increment over the exact pinned live baseline:
-exactly 2 prior database runs and exactly 1 VISIBLE terminal prior
-execution before run creation (zero active) — 2 executions historically
-occurred, but Attempt 5's was deleted on 2026-08-18, so Cloud Run
-exposes only Attempt 6's — exactly 3 database runs and 2 visible
-executions after the one authorized launch, and zero-then-one rows under
-the fresh Attempt 7 idempotency key.
+exactly 1 prior database run row (Attempt 6's — Attempt 5's row is
+absent for an unverified reason and cannot be counted) and exactly 1
+VISIBLE terminal prior execution before run creation (zero active) — 2
+executions historically occurred, but Attempt 5's was deleted on
+2026-08-18, so Cloud Run exposes only Attempt 6's — exactly 2 database
+runs and 2 visible executions after the one authorized launch, and
+zero-then-one rows under the fresh Attempt 7 idempotency key.
+
+## Database-baseline corrective (2026-08-21, no production mutation)
+
+A live read-only verification of `public.runs` found that the previously
+pinned database baseline of 2 prior rows no longer matches production:
+
+- `public.runs` holds **exactly 1 row**:
+  `37912575-f9ce-4437-893d-7dfa45c53aa9` (Attempt 6, `status=failed`,
+  `idempotency_key=stage-c-smoke-0001`).
+- Attempt 5's row `58daa7de-76f5-4359-93e1-3a767c912c20` is **absent**.
+  The cause of its absence is **unverified** — unlike Attempt 5's Worker
+  execution (whose deletion is proven by Cloud Audit Logs), no audited
+  deletion is claimed for the database row.
+- The Attempt 7 key `stage-c-smoke-attempt-7-20260819` has **zero rows**.
+- The visible Worker execution baseline is unchanged: exactly 1 terminal
+  execution (Attempt 6 `milo-agent-worker-mcfrx`).
+- No Attempt 7 run and no paid provider call was created by this
+  verification; production remains fail-closed.
+
+With the old pin, the DB preflight would fail closed on the live count
+of 1 — correctly on the safety side, but against a stale expectation.
+The corrective re-pins `STAGE_C_EXPECTED_PRIOR_RUNS` to `1` (post-run
+database total: exactly 2) so the gates verify the exact live state, and
+this report's earlier "both database rows preserved" claims are
+superseded: two attempts occurred historically, but only Attempt 6's run
+row is currently present. All fail-closed gate semantics are unchanged —
+preflight still requires the exact pinned count and zero Attempt 7 key
+rows, evidence still requires exactly baseline+1 total rows with exactly
+one row under the Attempt 7 key, and the Cloud Run execution baseline
+stays 1 → 2.
 
 ## Production mutations / current posture
 
@@ -528,7 +566,13 @@ enablement):
   `JOB_LAUNCHER=disabled`, `MILO_ENABLE_PAID_EXECUTION=false`.
 - Worker: `MILO_ENABLE_PAID_EXECUTION=false`.
 - Worker `KIMI_API_KEY`: unbound.
-- MILO runs: **2** (Attempts 5 and 6 — historical, preserved).
+- MILO run rows in `public.runs`: **1** (Attempt 6
+  `37912575-f9ce-4437-893d-7dfa45c53aa9`, attempt 6, terminal `failed`,
+  idempotency key `stage-c-smoke-0001`). Two attempts occurred
+  historically, but Attempt 5's row
+  `58daa7de-76f5-4359-93e1-3a767c912c20` is absent; the reason for its
+  absence is unverified (no audited deletion is claimed for the
+  database row).
 - Worker executions visible in Cloud Run: **1**, terminal (Attempt 6
   `milo-agent-worker-mcfrx`). 2 executions historically occurred;
   Attempt 5's `milo-agent-worker-d2gfx` was explicitly and successfully
@@ -577,8 +621,8 @@ These settings are applied to the **Worker only** (the API receives no
   paid Worker execution that terminated `failed`
   (`RETRY_LIMIT_REACHED`); only `completed` counts as Stage C acceptance.
 - This release-preparation PR only pins Attempt 7 tooling: runtime SHA
-  `88224bc…`, fresh idempotency key, exact live baselines (2 database
-  runs / 1 visible terminal execution) and the worker-only provider
+  `88224bc…`, fresh idempotency key, exact live baselines (1 database
+  run row / 1 visible terminal execution) and the worker-only provider
   envelope. **Merging
   it authorizes nothing** — no build, deployment, secret binding, flag
   enablement, probe creation, run creation, provider call, Attempt 7 or
@@ -594,6 +638,6 @@ These settings are applied to the **Worker only** (the API receives no
   authorization.
 - Stage D remains blocked until a paid run reaches `completed`,
   `06-collect-evidence.sh` passes all acceptance invariants (including
-  the exact post-run totals of 3 database runs and 2 visible
+  the exact post-run totals of 2 database runs and 2 visible
   executions), actual provider billing
   is checked, and step 7 restores the post-smoke fail-closed posture.

@@ -38,16 +38,19 @@ CAPS = (
     "MILO_DAILY_USER_BUDGET=5.00,MILO_DAILY_PROJECT_BUDGET=5.00,MILO_ESTIMATED_COST_PER_CALL=0.02"
 )
 
-# The pinned Attempt 7 run identity and baselines. Attempts 5+6 left 2
-# database runs (both rows preserved). 2 Worker executions historically
+# The pinned Attempt 7 run identity and baselines. Attempts 5+6 occurred
+# historically, but public.runs currently holds exactly 1 row — Attempt
+# 6's (37912575-…); Attempt 5's row (58daa7de-…) is absent and the
+# reason for its absence is unverified. 2 Worker executions historically
 # occurred (Attempt 5 milo-agent-worker-d2gfx, Attempt 6
 # milo-agent-worker-mcfrx), but Attempt 5's was explicitly deleted at
 # 2026-08-18T02:00:48Z (google.cloud.run.v1.Executions.DeleteExecution,
 # Cloud Audit Logs), so Cloud Run currently exposes exactly 1 visible
-# terminal execution — the executable live baseline.
+# terminal execution. On both surfaces the executable live baseline is
+# what production actually holds: 1 run row, 1 visible execution.
 ATTEMPT7_KEY = "stage-c-smoke-attempt-7-20260819"
 CONSUMED_KEY = "stage-c-smoke-0001"  # Attempt 5/6 identity — never reused
-EXPECTED_PRIOR_RUNS = "2"
+EXPECTED_PRIOR_RUNS = "1"
 EXPECTED_PRIOR_EXECUTIONS = "1"
 
 # The exact seven pinned worker-only provider settings (Tier 2 confirmed;
@@ -196,12 +199,13 @@ def preflight_with(db, monkeypatch, count, expected=EXPECTED_PRIOR_RUNS, key_cou
 
 
 def test_preflight_passes_on_exact_pinned_baseline(db, monkeypatch, capsys):
-    """2 historical runs (Attempts 5+6) and 0 Attempt 7 key rows is the ONLY
-    acceptable pre-run state."""
-    preflight_with(db, monkeypatch, count=2)
+    """Exactly 1 prior run row (Attempt 6's — Attempt 5's row is absent
+    from production for an unverified reason) and 0 Attempt 7 key rows is
+    the ONLY acceptable pre-run state."""
+    preflight_with(db, monkeypatch, count=1)
     out = capsys.readouterr().out
     assert '"ok": true' in out
-    assert '"expected_prior_runs": "2"' in out
+    assert '"expected_prior_runs": "1"' in out
 
 
 def test_preflight_fails_closed_when_count_unavailable(db, monkeypatch):
@@ -209,30 +213,32 @@ def test_preflight_fails_closed_when_count_unavailable(db, monkeypatch):
         preflight_with(db, monkeypatch, count=None)
 
 
-@pytest.mark.parametrize("count", [0, 1, 3])
+@pytest.mark.parametrize("count", [0, 2, 3])
 def test_preflight_fails_on_any_count_other_than_the_pinned_baseline(db, monkeypatch, count):
-    """Fewer runs than the baseline (history deleted?) fails exactly like
-    more runs (an unexpected run) — the count must be exact."""
+    """Fewer rows than the baseline (Attempt 6's row vanished too?) fails
+    exactly like more rows (an unexpected row — including the superseded
+    2-row expectation and an Attempt 5-style row resurfacing) — the count
+    must be exact."""
     with pytest.raises(SystemExit):
         preflight_with(db, monkeypatch, count=count)
 
 
 def test_preflight_fails_on_preexisting_attempt_7_key_run(db, monkeypatch, capsys):
     with pytest.raises(SystemExit):
-        preflight_with(db, monkeypatch, count=2, key_count=1)
+        preflight_with(db, monkeypatch, count=1, key_count=1)
     assert ATTEMPT7_KEY in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("expected", [None, "", "two", "-1", "2.0"])
 def test_preflight_fails_closed_on_missing_or_invalid_baseline_config(db, monkeypatch, capsys, expected):
     with pytest.raises(SystemExit):
-        preflight_with(db, monkeypatch, count=2, expected=expected)
+        preflight_with(db, monkeypatch, count=1, expected=expected)
     assert "STAGE_C_EXPECTED_PRIOR_RUNS" in capsys.readouterr().out
 
 
 def test_preflight_fails_closed_without_idempotency_key(db, monkeypatch, capsys):
     with pytest.raises(SystemExit):
-        preflight_with(db, monkeypatch, count=2, key=None)
+        preflight_with(db, monkeypatch, count=1, key=None)
     assert "STAGE_C_IDEMPOTENCY_KEY" in capsys.readouterr().out
 
 
@@ -250,7 +256,7 @@ def test_preflight_uses_exact_count_not_page_length(db):
 
 
 def test_preflight_passes_when_all_rpc_metadata_present(db, monkeypatch, capsys):
-    preflight_with(db, monkeypatch, count=2)
+    preflight_with(db, monkeypatch, count=1)
     out = capsys.readouterr().out
     assert '"ok": true' in out
     for rpc in db.REQUIRED_RPC_ARGS:
@@ -260,7 +266,7 @@ def test_preflight_passes_when_all_rpc_metadata_present(db, monkeypatch, capsys)
 def test_preflight_fails_when_one_rpc_genuinely_absent(db, monkeypatch, capsys):
     spec = openapi_spec(db, drop_rpc="heartbeat_run_guarded")
     with pytest.raises(SystemExit):
-        preflight_with(db, monkeypatch, count=2, spec=spec)
+        preflight_with(db, monkeypatch, count=1, spec=spec)
     out = capsys.readouterr().out
     assert '"rpc_heartbeat_run_guarded": "MISSING"' in out
     # The others are still individually verified as present.
@@ -269,7 +275,7 @@ def test_preflight_fails_when_one_rpc_genuinely_absent(db, monkeypatch, capsys):
 
 def test_preflight_fails_closed_when_metadata_endpoint_unavailable(db, monkeypatch, capsys):
     with pytest.raises(SystemExit):
-        preflight_with(db, monkeypatch, count=2, root_status=503, spec={"error": "unavailable"})
+        preflight_with(db, monkeypatch, count=1, root_status=503, spec={"error": "unavailable"})
     out = capsys.readouterr().out
     assert "failing closed" in out
     assert '"UNVERIFIED"' in out
@@ -280,7 +286,7 @@ def test_preflight_fails_closed_when_metadata_endpoint_unavailable(db, monkeypat
 def test_preflight_fails_closed_on_malformed_metadata(db, monkeypatch, capsys, mangle):
     spec = openapi_spec(db, mangle=mangle)
     with pytest.raises(SystemExit):
-        preflight_with(db, monkeypatch, count=2, spec=spec)
+        preflight_with(db, monkeypatch, count=1, spec=spec)
     assert "failing closed" in capsys.readouterr().out
 
 
@@ -289,7 +295,7 @@ def test_existing_rpc_answering_404_to_empty_post_is_not_classified_missing(db, 
     get a signature-mismatch 404. The fake call() in preflight_with answers
     exactly that 404 for every RPC POST — the new implementation must
     classify every RPC present (from metadata) without ever noticing."""
-    preflight_with(db, monkeypatch, count=2)
+    preflight_with(db, monkeypatch, count=1)
     out = capsys.readouterr().out
     assert '"ok": true' in out
     assert '"MISSING"' not in out
@@ -297,7 +303,7 @@ def test_existing_rpc_answering_404_to_empty_post_is_not_classified_missing(db, 
 
 def test_preflight_rpc_checks_perform_no_mutating_posts(db, monkeypatch):
     calls = []
-    preflight_with(db, monkeypatch, count=2, record=calls)
+    preflight_with(db, monkeypatch, count=1, record=calls)
     posts = [(m, p) for m, p in calls if m != "GET"]
     assert posts == [], f"preflight made non-GET calls: {posts}"
     assert not any("/rest/v1/rpc/" in p for _, p in calls), "preflight touched an RPC endpoint"
@@ -306,7 +312,7 @@ def test_preflight_rpc_checks_perform_no_mutating_posts(db, monkeypatch):
 def test_preflight_signature_mismatch_fails_closed(db, monkeypatch, capsys):
     spec = openapi_spec(db, drop_arg_from="update_run_usage_guarded")
     with pytest.raises(SystemExit):
-        preflight_with(db, monkeypatch, count=2, spec=spec)
+        preflight_with(db, monkeypatch, count=1, spec=spec)
     out = capsys.readouterr().out
     assert '"rpc_update_run_usage_guarded": "SIGNATURE_MISMATCH"' in out
 
@@ -314,11 +320,11 @@ def test_preflight_signature_mismatch_fails_closed(db, monkeypatch, capsys):
 def test_preflight_baseline_checks_still_enforced_alongside_rpc_metadata(db, monkeypatch, capsys):
     """RPC metadata all present must not mask an off-baseline run count."""
     with pytest.raises(SystemExit):
-        preflight_with(db, monkeypatch, count=3)
+        preflight_with(db, monkeypatch, count=2)
     out = capsys.readouterr().out
-    assert '"existing_runs": "3"' in out
+    assert '"existing_runs": "2"' in out
     with pytest.raises(SystemExit):
-        preflight_with(db, monkeypatch, count=2, key_count=1)
+        preflight_with(db, monkeypatch, count=1, key_count=1)
 
 
 def test_required_rpc_args_match_release_migrations(db):
@@ -393,7 +399,7 @@ def happy_dataset():
     }
 
 
-def wire_evidence(db, monkeypatch, data, total_runs=3, key_runs=1, prior=EXPECTED_PRIOR_RUNS):
+def wire_evidence(db, monkeypatch, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS):
     monkeypatch.setenv("STAGE_C_RUN_ID", "run-1")
     monkeypatch.setenv("STAGE_C_CAPS", CAPS)
     monkeypatch.setenv("STAGE_C_EXPECTED_TERMINAL_STATES", "completed")
@@ -426,18 +432,18 @@ def gate_output(db, capsys):
 
 
 def test_evidence_gate_passes_on_exactly_one_new_run_over_the_baseline(db, monkeypatch, capsys):
-    """3 total runs (pinned baseline 2 + the one authorized Attempt 7 run,
+    """2 total runs (pinned baseline 1 + the one authorized Attempt 7 run,
     which carries the fresh key) passes the count gate."""
     wire_evidence(db, monkeypatch, happy_dataset())
     db.evidence()
     verdict = gate_output(db, capsys)
     assert verdict["ok"] is True
     assert verdict["failures"] == []
-    assert verdict["total_runs"] == 3
+    assert verdict["total_runs"] == 2
     assert verdict["runs_with_current_key"] == 1
 
 
-def evidence_must_fail(db, monkeypatch, capsys, data, total_runs=3, key_runs=1, prior=EXPECTED_PRIOR_RUNS):
+def evidence_must_fail(db, monkeypatch, capsys, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS):
     wire_evidence(db, monkeypatch, data, total_runs=total_runs, key_runs=key_runs, prior=prior)
     with pytest.raises(SystemExit) as excinfo:
         db.evidence()
@@ -449,12 +455,12 @@ def evidence_must_fail(db, monkeypatch, capsys, data, total_runs=3, key_runs=1, 
     return verdict
 
 
-@pytest.mark.parametrize("total_runs", [2, 4])
+@pytest.mark.parametrize("total_runs", [1, 3, 4])
 def test_evidence_fails_unless_exactly_one_run_was_added(db, monkeypatch, capsys, total_runs):
-    """2 total = the new run never landed; 4 total = a second new run
-    slipped in. Both fail the exact-increment gate."""
+    """1 total = the new run never landed; 3 or more = extra new run(s)
+    slipped in. Every total other than 2 fails the exact-increment gate."""
     verdict = evidence_must_fail(db, monkeypatch, capsys, happy_dataset(), total_runs=total_runs)
-    assert any("expected exactly 3" in f for f in verdict["failures"])
+    assert any("expected exactly 2" in f for f in verdict["failures"])
 
 
 @pytest.mark.parametrize("key_runs", [0, 2])
@@ -856,7 +862,7 @@ def test_collect_evidence_is_a_gate_not_a_checklist():
     assert 'test "${hits}" = "0"' in text
     assert "WARNING: possible secret markers" not in text
     assert "Validation checklist to record" not in text  # replaced by executable checks
-    # The DB gate receives the pinned run baseline for its 3-total check.
+    # The DB gate receives the pinned run baseline for its 2-total check.
     assert '"STAGE_C_EXPECTED_PRIOR_RUNS=${STAGE_C_EXPECTED_PRIOR_RUNS}"' in text
 
 
@@ -958,6 +964,7 @@ def test_env_pins_all_seven_provider_limits_exactly():
     ("STAGE_C_RELEASE_SHA", "791f7af9" + "0" * 32),  # a different valid-looking SHA
     ("STAGE_C_RELEASE_SHA", "30b05bc45d6f9372261e4fac20cd983c69db971f"),  # the superseded release
     ("STAGE_C_EXPECTED_PRIOR_RUNS", "0"),  # pretending the history is empty
+    ("STAGE_C_EXPECTED_PRIOR_RUNS", "2"),  # the superseded count — Attempt 5's row is absent
     ("STAGE_C_EXPECTED_PRIOR_RUNS", "5"),
     ("STAGE_C_EXPECTED_PRIOR_EXECUTIONS", "0"),
     ("STAGE_C_EXPECTED_PRIOR_EXECUTIONS", "2"),  # the pre-deletion count — no longer the live baseline
@@ -1299,6 +1306,26 @@ def test_acceptance_doc_distinguishes_occurred_from_visible_executions():
     assert "Worker executions: **2**, both terminal (historical, preserved)" not in text
     assert "2 terminal Worker executions**" not in text
     assert "is never cancelled or deleted" not in text
+
+
+def test_acceptance_doc_distinguishes_occurred_from_present_database_rows():
+    """Two attempts occurred historically, but only Attempt 6's run row is
+    currently present in public.runs; Attempt 5's row is absent for an
+    unverified reason. The doc must state both facts, never claim both
+    database rows are preserved, and never invent an audited deletion of
+    the row."""
+    text = acceptance_doc()
+    assert "exactly 1 run row" in text
+    assert "absent" in text
+    assert "unverified" in text
+    assert "no audited deletion is claimed" in text
+    # The superseded both-rows-preserved claims are gone.
+    assert "holds **2 MILO runs**" not in text
+    assert "MILO runs: **2**" not in text
+    assert "The Attempt 5 database run row remains preserved" not in text
+    assert "exactly 2 prior database runs" not in text
+    assert "3 database runs" not in text
+    assert "total_runs=3" not in text
 
 
 def test_acceptance_doc_states_the_current_pins_and_boundaries():

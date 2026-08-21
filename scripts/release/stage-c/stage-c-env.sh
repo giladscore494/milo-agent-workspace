@@ -60,16 +60,19 @@ stage_c_pin STAGE_C_IDEMPOTENCY_KEY "stage-c-smoke-attempt-7-20260819"
 #     google.cloud.run.v1.Executions.DeleteExecution (proven by Cloud
 #     Audit Logs), so it is no longer visible and cannot be part of a
 #     gate that lists executions.
-# Database baseline (rows are never deleted, rewritten or hidden):
-#   - 2 prior runs: Attempt 5 (58daa7de-…, failed at the claim_run_lease
-#     ACL before any provider call) and Attempt 6 (37912575-…, real paid
-#     execution, terminal `failed` after RETRY_LIMIT_REACHED). Attempt
-#     6's authorization is consumed.
+# Database baseline (live, verified against production 2026-08-21):
+#   - 1 prior run row: Attempt 6 (37912575-…, real paid execution,
+#     terminal `failed` after RETRY_LIMIT_REACHED, idempotency key
+#     stage-c-smoke-0001; its authorization is consumed). Attempt 5
+#     (58daa7de-…, failed at the claim_run_lease ACL before any provider
+#     call) also occurred historically, but its run row is ABSENT from
+#     public.runs and the reason for that absence is unverified — the
+#     gates count only what the database actually holds.
 # Evidence gates verify a ONE-run/ONE-execution increment over these
-# exact live baselines (expected post-run totals: 3 database runs and 2
+# exact live baselines (expected post-run totals: 2 database runs and 2
 # visible terminal executions), never an empty system and never "some
 # run exists".
-stage_c_pin STAGE_C_EXPECTED_PRIOR_RUNS "2"
+stage_c_pin STAGE_C_EXPECTED_PRIOR_RUNS "1"
 stage_c_pin STAGE_C_EXPECTED_PRIOR_EXECUTIONS "1"
 # The ONLY terminal state that counts as a PASS. failed / cancelled /
 # timed_out / budget_exhausted / partial_success are controlled fail-closed
