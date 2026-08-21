@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Stage C step 5: execute exactly ONE controlled paid run and monitor it to
-# a terminal state. Refuses to run unless the Worker execution history
-# matches the pinned Attempt 5/6 baseline EXACTLY: exactly
-# STAGE_C_EXPECTED_PRIOR_EXECUTIONS historical executions, every one
+# a terminal state. Refuses to run unless the VISIBLE Worker execution
+# listing matches the pinned live baseline EXACTLY: exactly
+# STAGE_C_EXPECTED_PRIOR_EXECUTIONS visible historical executions (Attempt
+# 6's milo-agent-worker-mcfrx — Attempt 5's was deleted 2026-08-18, so 2
+# occurred historically but only 1 is visible in Cloud Run), every one
 # terminal, zero active — a new active execution before authorization, a
 # count mismatch, or an unverifiable listing all block the run.
 #

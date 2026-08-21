@@ -5,9 +5,11 @@
 #
 # Two read-only gates run BEFORE the first production mutation and are
 # REPEATED after deployment:
-#   1. the exact historical Worker-execution baseline (exactly
+#   1. the exact VISIBLE Worker-execution baseline (exactly
 #      STAGE_C_EXPECTED_PRIOR_EXECUTIONS terminal executions, zero
-#      active/unverifiable — structured JSON via verify_executions.py);
+#      active/unverifiable — structured JSON via verify_executions.py;
+#      2 executions historically occurred but Attempt 5's was deleted on
+#      2026-08-18, so Cloud Run exposes only Attempt 6's);
 #   2. the fail-closed posture: worker and API MILO_ENABLE_PAID_EXECUTION
 #      must be the LITERAL value "false" — present, exact, and never a
 #      Secret Manager binding (no absent-flag fallback); API run creation
@@ -28,10 +30,11 @@ PROVIDER_SECRET_ALIASES=("KIMI_API_KEY" "MOONSHOT_API_KEY")
 
 verify_execution_baseline() { # LABEL
   echo "== ${1}: exact execution baseline (${STAGE_C_EXPECTED_PRIOR_EXECUTIONS} terminal, 0 active)"
-  # Exactly the pinned prior terminal executions (Attempts 5+6), none
-  # active/unverifiable; count mismatches and unparseable listings fail
-  # closed. The historical terminal executions are evidence and stay
-  # untouched.
+  # Exactly the pinned VISIBLE prior terminal executions — Attempt 6's
+  # milo-agent-worker-mcfrx is the only one Cloud Run still exposes
+  # (Attempt 5's milo-agent-worker-d2gfx was deleted 2026-08-18 per Cloud
+  # Audit Logs) — none active/unverifiable; count mismatches and
+  # unparseable listings fail closed. This gate never mutates executions.
   gcloud run jobs executions list --job="${STAGE_C_WORKER_JOB}" \
     --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format=json \
     | python3 ./verify_executions.py --expected-total "${STAGE_C_EXPECTED_PRIOR_EXECUTIONS}" \

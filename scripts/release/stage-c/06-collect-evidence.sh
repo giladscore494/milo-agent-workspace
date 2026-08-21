@@ -4,10 +4,10 @@
 # acceptance criterion fails:
 #   - exactly one new authorized run / one new worker execution over the
 #     pinned prior baseline (Attempt 7: totals of exactly
-#     STAGE_C_EXPECTED_PRIOR_RUNS+1 runs and
-#     STAGE_C_EXPECTED_PRIOR_EXECUTIONS+1 executions — a second new run
-#     or execution cannot pass unnoticed, and the historical Attempt 5/6
-#     rows never satisfy the new run's acceptance);
+#     STAGE_C_EXPECTED_PRIOR_RUNS+1 database runs and
+#     STAGE_C_EXPECTED_PRIOR_EXECUTIONS+1 VISIBLE executions — a second
+#     new run or execution cannot pass unnoticed, and the historical
+#     Attempt 5/6 database rows never satisfy the new run's acceptance);
 #   - expected terminal state;
 #   - attempt/claim/heartbeat invariants;
 #   - zero dangling reservations;
@@ -125,11 +125,12 @@ probe_ok /tmp/stagec-replay.log replay \
   || fail "idempotent replay did NOT return the same run (probe exit=${replay_status})"
 
 echo "== 3. Worker execution total must be exactly baseline+1, all terminal"
-# One-execution increment over the pinned Attempt 5/6 baseline: exactly
-# STAGE_C_EXPECTED_PRIOR_EXECUTIONS+1 executions in total, every one
-# terminal, zero active. A second new execution, a still-active execution
-# or an unparseable listing fails the gate closed. Structured JSON, not a
-# line count, decides terminal state.
+# One-execution increment over the pinned VISIBLE baseline (Attempt 6's
+# execution — the only one Cloud Run still exposes; Attempt 5's was
+# deleted 2026-08-18): exactly STAGE_C_EXPECTED_PRIOR_EXECUTIONS+1
+# executions in total, every one terminal, zero active. A second new
+# execution, a still-active execution or an unparseable listing fails the
+# gate closed. Structured JSON, not a line count, decides terminal state.
 expected_total_executions=$((STAGE_C_EXPECTED_PRIOR_EXECUTIONS + 1))
 gcloud run jobs executions list --job="${STAGE_C_WORKER_JOB}" \
   --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \

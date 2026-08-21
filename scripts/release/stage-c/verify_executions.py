@@ -6,9 +6,15 @@ from stdin and verifies an EXACT execution posture instead of a fragile
 line count:
 
   - the total number of executions equals --expected-total exactly
-    (Attempt 7: 2 historical terminal executions before the run, 3 after
-    the one authorized launch — a one-execution increment over the pinned
-    baseline, never merely "some execution exists");
+    (Attempt 7: 1 visible historical terminal execution before the run,
+    2 after the one authorized launch — a one-execution increment over
+    the pinned live baseline, never merely "some execution exists").
+    Note the deliberate distinction: 2 executions historically occurred
+    (Attempt 5 milo-agent-worker-d2gfx and Attempt 6
+    milo-agent-worker-mcfrx), but Attempt 5's was explicitly deleted at
+    2026-08-18T02:00:48Z via google.cloud.run.v1.Executions.DeleteExecution
+    (Cloud Audit Logs), so exactly 1 — Attempt 6's — is currently visible
+    in Cloud Run and countable by this gate;
   - every execution is verifiably TERMINAL (a non-empty completionTime or
     a Completed condition with status True/False — the same rule the kill
     switch uses);
@@ -16,14 +22,16 @@ line count:
     status is treated fail-safe as nonterminal/unverifiable and FAILS the
     gate; it is never assumed terminal.
 
-Historical terminal executions are evidence: they are never cancelled,
-deleted or hidden by this gate. Listing or parsing failures exit non-zero
-(fail closed). Prints one structured JSON verdict line; never prints
-secret values. Exit 0 only when every check passes.
+This gate itself never cancels, deletes or hides an execution — it only
+lists and counts. It gates on what Cloud Run actually exposes right now
+(the visible baseline), not on how many executions ever occurred.
+Listing or parsing failures exit non-zero (fail closed). Prints one
+structured JSON verdict line; never prints secret values. Exit 0 only
+when every check passes.
 
 Usage:
   gcloud run jobs executions list ... --format=json \
-    | python3 verify_executions.py --expected-total 2
+    | python3 verify_executions.py --expected-total 1
 """
 
 from __future__ import annotations

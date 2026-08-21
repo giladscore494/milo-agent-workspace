@@ -24,10 +24,13 @@ gcloud run services describe "${STAGE_C_API_SERVICE}" \
 # pinned release images and the full flag/provider-secret posture.
 python3 ./verify_caps.py --worker-json "${worker_json}" --api-json "${api_json}"
 
-echo "== Exact historical Worker-execution baseline (read-only)"
-# Attempt 7 preparation: exactly the pinned prior terminal executions
-# (Attempts 5+6) must exist and NONE may be active/unverifiable before
-# any run is created. Historical terminal executions are never cancelled.
+echo "== Exact visible Worker-execution baseline (read-only)"
+# Attempt 7 preparation: exactly the pinned VISIBLE prior terminal
+# executions must exist and NONE may be active/unverifiable before any
+# run is created. 2 executions historically occurred (Attempts 5+6), but
+# Attempt 5's was deleted on 2026-08-18 (Cloud Audit Logs:
+# Executions.DeleteExecution), so the live baseline is Attempt 6's
+# execution alone. This read-only check never cancels an execution.
 gcloud run jobs executions list --job="${STAGE_C_WORKER_JOB}" \
   --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format=json \
   | python3 ./verify_executions.py --expected-total "${STAGE_C_EXPECTED_PRIOR_EXECUTIONS}"
