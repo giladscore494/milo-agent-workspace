@@ -22,6 +22,7 @@ import json
 import shutil
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -389,17 +390,19 @@ def happy_dataset():
         "worker_heartbeats": [{"worker_id": "worker-abc", "attempt": 1, "heartbeat_at": "2026-08-13T00:09:50Z"}],
         "model_call_budget_reservations": [
             {"call_seq": i, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": 0.001}
-            for i in range(20)
+            for i in range(1, 21)
         ],
         "run_usage_ledger": [
             {"decision": "settled", "call_seq": i, "actual_input_tokens": 50, "actual_output_tokens": 25, "actual_cost": 0.001, "estimated_cost": 0.02}
-            for i in range(20)
+            for i in range(1, 21)
         ],
-        "run_invocations": [{"created_at": "2026-08-13T00:00:01Z", "invocation": {}}],
+        # Real migration-006 columns (launcher/execution_name/created_at) —
+        # the table has NO `invocation` column.
+        "run_invocations": [{"created_at": "2026-08-13T00:00:01Z", "launcher": "cloud_run", "execution_name": "milo-agent-worker-gggdc"}],
     }
 
 
-def wire_evidence(db, monkeypatch, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS):
+def wire_evidence(db, monkeypatch, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS, errors=None):
     monkeypatch.setenv("STAGE_C_RUN_ID", "run-1")
     monkeypatch.setenv("STAGE_C_CAPS", CAPS)
     monkeypatch.setenv("STAGE_C_EXPECTED_TERMINAL_STATES", "completed")
@@ -412,6 +415,8 @@ def wire_evidence(db, monkeypatch, data, total_runs=2, key_runs=1, prior=EXPECTE
     def fake_call(method, path, body=None, headers=None):
         for table in ("runs", "run_events", "run_checkpoints", "worker_heartbeats", "model_call_budget_reservations", "run_usage_ledger", "run_invocations"):
             if f"/rest/v1/{table}?" in path:
+                if errors and table in errors:
+                    return errors[table]
                 return 200, data[table]
         return 200, []
 
@@ -443,8 +448,8 @@ def test_evidence_gate_passes_on_exactly_one_new_run_over_the_baseline(db, monke
     assert verdict["runs_with_current_key"] == 1
 
 
-def evidence_must_fail(db, monkeypatch, capsys, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS):
-    wire_evidence(db, monkeypatch, data, total_runs=total_runs, key_runs=key_runs, prior=prior)
+def evidence_must_fail(db, monkeypatch, capsys, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS, errors=None):
+    wire_evidence(db, monkeypatch, data, total_runs=total_runs, key_runs=key_runs, prior=prior, errors=errors)
     with pytest.raises(SystemExit) as excinfo:
         db.evidence()
     assert excinfo.value.code == 1
@@ -524,9 +529,9 @@ def test_evidence_fails_on_token_cap_violation(db, monkeypatch, capsys):
 
 def test_evidence_fails_on_accounting_mismatch(db, monkeypatch, capsys):
     data = happy_dataset()
-    data["runs"][0]["usage"]["actual_cost"] = 0.9  # ledger says 0.02
+    data["runs"][0]["usage"]["actual_cost"] = 0.9  # reservations say 0.02
     verdict = evidence_must_fail(db, monkeypatch, capsys, data)
-    assert any("ledger cost" in f for f in verdict["failures"])
+    assert any("unrounded reservation total" in f for f in verdict["failures"])
 
 
 def test_evidence_fails_on_attempt_or_heartbeat_invariants(db, monkeypatch, capsys):
@@ -559,8 +564,239 @@ def test_evidence_fails_closed_without_expected_caps(db, monkeypatch, capsys):
 
 def test_evidence_fails_on_duplicate_launch_invocation(db, monkeypatch, capsys):
     data = happy_dataset()
-    data["run_invocations"].append({"created_at": "2026-08-13T00:00:02Z", "invocation": {}})
+    data["run_invocations"].append({"created_at": "2026-08-13T00:00:02Z", "launcher": "cloud_run", "execution_name": "milo-agent-worker-zzzzz"})
     evidence_must_fail(db, monkeypatch, capsys, data)
+
+
+# ---------------------------------------------------------------------------
+# Attempt 7 corrective — defect 1: run_invocations schema + PostgREST error
+# shapes must fail closed, never masquerade as row collections
+# ---------------------------------------------------------------------------
+
+
+# The real PostgREST answer to the old `select=created_at,invocation` query:
+# migration 006 defines launcher/execution_name/payload/created_at — there
+# is NO `invocation` column. len() of this dict is 4, which the old gate
+# reported as "run_invocations=4, expected exactly 1".
+PGRST_MISSING_COLUMN_ERROR = (400, {
+    "code": "42703",
+    "details": None,
+    "hint": None,
+    "message": "column run_invocations.invocation does not exist",
+})
+
+
+def test_evidence_queries_only_real_run_invocations_columns(db):
+    source = (STAGE_C / "probe_db.py").read_text()
+    assert "run_invocations?run_id=eq.{run_id}&select=launcher,execution_name,created_at" in source
+    assert "select=created_at,invocation" not in source
+
+
+def test_evidence_fails_closed_on_run_invocations_postgrest_error(db, monkeypatch, capsys):
+    verdict = evidence_must_fail(
+        db, monkeypatch, capsys, happy_dataset(),
+        errors={"run_invocations": PGRST_MISSING_COLUMN_ERROR},
+    )
+    assert any("fail-closed: run_invocations query" in f and "42703" in f for f in verdict["failures"])
+    # The error dict must never be counted as rows (the old defect produced
+    # a bogus "run_invocations=4" from len() of the 4-key error object).
+    assert not any(f.startswith("run_invocations=") for f in verdict["failures"])
+    assert "invocations" not in verdict
+
+
+@pytest.mark.parametrize("table", ["run_usage_ledger", "model_call_budget_reservations", "run_events", "worker_heartbeats"])
+def test_evidence_fails_closed_on_any_postgrest_error_shape(db, monkeypatch, capsys, table):
+    verdict = evidence_must_fail(
+        db, monkeypatch, capsys, happy_dataset(),
+        errors={table: (500, {"message": "canceling statement due to statement timeout"})},
+    )
+    assert any(f"fail-closed: {table} query" in f for f in verdict["failures"])
+
+
+def test_evidence_fails_closed_on_non_list_success_body(db, monkeypatch, capsys):
+    """Even an HTTP 200 body that is not a row list must never be counted."""
+    verdict = evidence_must_fail(
+        db, monkeypatch, capsys, happy_dataset(),
+        errors={"run_invocations": (200, {"status": "ok"})},
+    )
+    assert any("fail-closed: run_invocations query" in f for f in verdict["failures"])
+
+
+# ---------------------------------------------------------------------------
+# Attempt 7 corrective — defect 2: Decimal, call_seq-aware one-to-one cost
+# reconciliation (the exact production 84-call rounding shape must PASS;
+# tampering, duplicates and missing calls must FAIL; caps stay strict)
+# ---------------------------------------------------------------------------
+
+
+def attempt7_rounding_dataset():
+    """The exact 84-call Attempt 7 rounding shape (run 8b4a4277-…).
+
+    Reservation rows hold the UNROUNDED per-call costs (plain numeric,
+    migration 015); each settled ledger row holds the SAME cost rounded to
+    6 decimals (numeric(12,6), migration 013). 22 calls carry a per-row
+    rounding drift of +0.0000004 — every row within the 0.0000005
+    half-ulp — so the aggregate signed drift is +0.0000088, larger than
+    the old fixed 5e-6 aggregate tolerance: the old gate false-failed on
+    exactly this legitimate production shape. run.usage.actual_cost is the
+    worker's unrounded running total rounded once (0.252069); tokens
+    total 312,018 over 84 calls.
+    """
+    unrounded, rounded = {}, {}
+    for seq in range(1, 85):
+        if seq <= 22:
+            unrounded[seq], rounded[seq] = 0.0029996, 0.003000
+        elif seq <= 83:
+            unrounded[seq], rounded[seq] = 0.003001, 0.003001
+        else:
+            unrounded[seq], rounded[seq] = 0.0030168, 0.0030168
+    data = happy_dataset()
+    data["runs"][0]["usage"] = {
+        "model_calls": 84,
+        "input_tokens": 252_000,
+        "output_tokens": 60_018,
+        "total_tokens": 312_018,
+        "actual_cost": 0.252069,
+    }
+    data["model_call_budget_reservations"] = [
+        {"call_seq": seq, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": unrounded[seq]}
+        for seq in range(1, 85)
+    ]
+    data["run_usage_ledger"] = [
+        {"decision": "reserved", "call_seq": seq, "actual_input_tokens": None, "actual_output_tokens": None, "actual_cost": None, "estimated_cost": 0.02}
+        for seq in range(1, 85)
+    ] + [
+        {"decision": "settled", "call_seq": seq, "actual_input_tokens": 3000, "actual_output_tokens": 715 if seq <= 42 else 714, "actual_cost": rounded[seq], "estimated_cost": None}
+        for seq in range(1, 85)
+    ]
+    return data
+
+
+def test_attempt_7_production_rounding_shape_passes(db, monkeypatch, capsys):
+    wire_evidence(db, monkeypatch, attempt7_rounding_dataset())
+    db.evidence()
+    verdict = gate_output(db, capsys)
+    assert verdict["ok"] is True, verdict["failures"]
+    assert verdict["failures"] == []
+    assert verdict["matched_calls"] == 84
+    assert verdict["settled_cost_sum"] == "0.2520690"      # unrounded reservation total
+    assert verdict["ledger_actual_cost_sum"] == "0.2520778"  # per-row 6-dp rounded total
+
+
+def test_attempt_7_shape_exceeds_the_old_aggregate_tolerance(db):
+    """Documents the false failure: the legitimate aggregate signed drift
+    (0.0000088) is larger than the removed fixed 5e-6 tolerance, and no
+    fixed aggregate tolerance can be right for every call count."""
+    drift = Decimal("0.2520778") - Decimal("0.2520690")
+    assert drift == Decimal("0.0000088")
+    assert drift > Decimal("0.000005")
+    assert not hasattr(db, "COST_TOLERANCE")
+
+
+def test_reconciliation_rejects_tampering_beyond_per_row_rounding(db, monkeypatch, capsys):
+    """A ledger row moved by just 2 ulps of the 7th decimal — far below the
+    old aggregate tolerance — is beyond legitimate 6-dp rounding and fails."""
+    data = attempt7_rounding_dataset()
+    settled = [r for r in data["run_usage_ledger"] if r["decision"] == "settled"]
+    assert settled[0]["call_seq"] == 1
+    settled[0]["actual_cost"] = 0.003001  # reservation 0.0029996 → drift 0.0000014
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("call_seq 1" in f and "rounding tolerance" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_gross_tampering(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    settled = [r for r in data["run_usage_ledger"] if r["decision"] == "settled"]
+    settled[-1]["actual_cost"] = 0.01
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("call_seq 84" in f and "rounding tolerance" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_duplicate_ledger_call_seq(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    data["run_usage_ledger"].append({"decision": "settled", "call_seq": 5, "actual_input_tokens": 0, "actual_output_tokens": 0, "actual_cost": 0.003, "estimated_cost": None})
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("duplicate settled ledger row for call_seq 5" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_duplicate_reservation_call_seq(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    data["model_call_budget_reservations"].append({"call_seq": 5, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": 0.003001})
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("duplicate reservation for call_seq 5" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_missing_ledger_call(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    data["run_usage_ledger"] = [r for r in data["run_usage_ledger"] if not (r["decision"] == "settled" and r["call_seq"] == 7)]
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("missing a settled ledger row: [7]" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_unmatched_ledger_call(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    data["run_usage_ledger"].append({"decision": "settled", "call_seq": 999, "actual_input_tokens": 0, "actual_output_tokens": 0, "actual_cost": 0.003, "estimated_cost": None})
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("without a settled reservation: [999]" in f for f in verdict["failures"])
+
+
+def test_usage_total_is_compared_to_the_unrounded_reservation_total(db, monkeypatch, capsys):
+    """Rewriting run.usage to the per-row-ROUNDED ledger sum (0.2520778)
+    must fail: the worker snapshots the unrounded running total, so only
+    0.252069 is consistent — this is the comparison the old gate got
+    backwards by comparing usage to the ledger sum."""
+    data = attempt7_rounding_dataset()
+    data["runs"][0]["usage"]["actual_cost"] = 0.252078
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("unrounded reservation total" in f for f in verdict["failures"])
+
+
+def test_cost_caps_stay_strict_with_no_rounding_tolerance(db, monkeypatch, capsys):
+    """One micro-dollar over the $3.00 cap fails — reconciliation tolerances
+    never loosen the caps."""
+    data = attempt7_rounding_dataset()
+    over = 3.000001
+    data["runs"][0]["usage"]["actual_cost"] = over
+    data["model_call_budget_reservations"] = [
+        {"call_seq": 1, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": over}
+    ]
+    data["run_usage_ledger"] = [
+        {"decision": "settled", "call_seq": 1, "actual_input_tokens": 3000, "actual_output_tokens": 714, "actual_cost": over, "estimated_cost": None}
+    ]
+    data["runs"][0]["usage"].update({"model_calls": 1, "input_tokens": 3000, "output_tokens": 714, "total_tokens": 3714})
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("exceeds cap" in f for f in verdict["failures"])
+
+
+def test_unrounded_reservation_total_over_cap_fails_even_when_rounded_views_hide_it(db, monkeypatch, capsys):
+    """A true spend of $3.0000001 must fail the $3.00 cap even though
+    six-decimal rounding makes every rounded view read exactly $3.000000:
+    the ledger rows round to 1.500000 each (sum 3.000000, not over) and
+    run.usage snapshots round(3.0000001, 6) = 3.0 (not over) — only the
+    UNROUNDED reservation total exceeds the cap, and it must be capped
+    too."""
+    data = attempt7_rounding_dataset()
+    data["model_call_budget_reservations"] = [
+        {"call_seq": 1, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": 1.5000001},
+        {"call_seq": 2, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": 1.5},
+    ]
+    data["run_usage_ledger"] = [
+        {"decision": "settled", "call_seq": 1, "actual_input_tokens": 50, "actual_output_tokens": 25, "actual_cost": 1.500000, "estimated_cost": None},
+        {"decision": "settled", "call_seq": 2, "actual_input_tokens": 50, "actual_output_tokens": 25, "actual_cost": 1.500000, "estimated_cost": None},
+    ]
+    data["runs"][0]["usage"] = {
+        "model_calls": 2,
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "total_tokens": 150,
+        "actual_cost": 3.0,  # round(3.0000001, 6) — reads exactly at the cap
+    }
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("exceeds cap" in f and "unrounded reservations 3.0000001" in f for f in verdict["failures"])
+    # The rounded views alone would NOT have tripped anything: no per-row
+    # rounding failure and no usage-total failure may fire here.
+    assert not any("rounding tolerance" in f for f in verdict["failures"])
+    assert not any("unrounded reservation total" in f and "run.usage" in f for f in verdict["failures"])
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +1129,128 @@ def test_stage_c_log_collection_handles_structured_and_text_payloads():
 
 
 # ---------------------------------------------------------------------------
+# Attempt 7 corrective — defect 3: a probe execution that completes nonzero
+# must never lose its execution name; its structured failure logs are
+# retrieved anyway, and an unestablishable name fails clearly instead of
+# issuing an invalid empty logging filter
+# ---------------------------------------------------------------------------
+
+
+ATTEMPT7_RUN_ID = "8b4a4277-fdf0-41b2-8515-d7e1d50e441b"
+
+# Mock gcloud: the evidence probe execution completes NONZERO (terminal
+# Completed=False) — the exact case where the old `--wait` form lost
+# exec_name — while Cloud Logging still holds its structured failure line.
+FAILED_PROBE_GCLOUD = r'''#!/usr/bin/env bash
+{ printf '%s\x1f' "$@"; printf '\n'; } >> "__LOG__"
+case "$*" in
+  *"run jobs execute"*)
+    echo "stagec-db-probe-fail1"
+    ;;
+  *"run jobs executions describe"*)
+    echo '{"metadata":{"name":"stagec-db-probe-fail1"},"status":{"completionTime":"2026-08-21T00:00:00Z","conditions":[{"type":"Completed","status":"False"}]}}'
+    ;;
+  *"logging read"*)
+    echo '[{"textPayload":"{\"stage_c_probe\": \"evidence\", \"ok\": false, \"failures\": [\"total_runs=3, expected exactly 2 (the pinned prior baseline of 1 plus exactly one new authorized run)\"]}"}]'
+    ;;
+esac
+exit 0
+'''
+
+# Mock gcloud: execution creation itself fails — no name can ever be
+# established, so the gate must refuse clearly and issue NO logging call.
+NO_NAME_GCLOUD = r'''#!/usr/bin/env bash
+{ printf '%s\x1f' "$@"; printf '\n'; } >> "__LOG__"
+case "$*" in
+  *"run jobs execute"*)
+    echo "ERROR: (gcloud.run.jobs.execute) job not found" >&2
+    exit 1
+    ;;
+esac
+exit 0
+'''
+
+
+def run_collect_evidence(tmp_path, mock_gcloud_script):
+    bin_dir = tmp_path / "mockbin"
+    bin_dir.mkdir()
+    log = tmp_path / "gcloud-args.log"
+    mock = bin_dir / "gcloud"
+    mock.write_text(mock_gcloud_script.replace("__LOG__", str(log)))
+    mock.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(STAGE_C / "06-collect-evidence.sh"), ATTEMPT7_RUN_ID],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        timeout=120,
+    )
+    calls = log.read_text().splitlines() if log.exists() else []
+    return result, [c.split("\x1f") for c in calls]
+
+
+def test_failed_probe_execution_keeps_its_name_and_its_structured_failure_logs(tmp_path):
+    result, calls = run_collect_evidence(tmp_path, FAILED_PROBE_GCLOUD)
+    # The gate fails (the probe reported failures) — but with evidence.
+    assert result.returncode != 0
+    assert "DB evidence gate reported failures" in result.stdout
+    # The probe's structured failure record was retrieved and surfaced.
+    assert '"ok": false' in result.stdout
+    assert "total_runs=3" in result.stdout
+    # The logging filter used the preserved execution name — never empty.
+    logging_calls = [c for c in calls if "logging" in c and "read" in c]
+    assert logging_calls, "no log retrieval happened for the failed probe"
+    filters = "\x1f".join(logging_calls[0])
+    assert 'execution_name"=stagec-db-probe-fail1' in filters
+    assert 'execution_name"=\x1f' not in filters and not filters.rstrip().endswith('execution_name"=')
+    # The terminal verdict came from the structured describe, not a lost
+    # gcloud exit status.
+    assert any("describe" in c for c in calls)
+
+
+def test_unestablishable_execution_name_fails_clearly_with_no_empty_filter(tmp_path):
+    result, calls = run_collect_evidence(tmp_path, NO_NAME_GCLOUD)
+    assert result.returncode != 0
+    assert "could not establish the execution name" in result.stderr
+    # No logging read may ever be issued without an execution name (the
+    # old defect issued an invalid empty `execution_name=` filter).
+    assert not any("logging" in c and "read" in c for c in calls)
+
+
+def test_collect_evidence_launches_probes_async_and_waits_on_the_named_execution():
+    text = (STAGE_C / "06-collect-evidence.sh").read_text()
+    assert "--async --format='value(metadata.name)'" in text
+    code_lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    assert not any("--wait" in line for line in code_lines)
+    assert "wait_for_probe_execution" in text
+    assert "execution_state.py" in text
+    assert "could not establish the execution name" in text
+
+
+@pytest.mark.parametrize("payload,expected", [
+    (json.dumps({"metadata": {"name": "e1"}, "status": {"conditions": [{"type": "Completed", "status": "True"}]}}), "succeeded"),
+    (json.dumps({"metadata": {"name": "e1"}, "status": {"conditions": [{"type": "Completed", "status": "False"}], "completionTime": "2026-08-21T00:00:00Z"}}), "failed"),
+    # Terminal without a positive Completed condition: fail-safe as failed.
+    (json.dumps({"status": {"completionTime": "2026-08-21T00:00:00Z"}}), "failed"),
+    (json.dumps({"status": {"conditions": [{"type": "Completed", "status": "Unknown"}]}}), "running"),
+    (json.dumps({"status": {}}), "running"),
+    (json.dumps(None), "running"),
+    ("not json at all", "running"),
+])
+def test_execution_state_verdicts_are_fail_safe(payload, expected):
+    result = subprocess.run(
+        [sys.executable, str(STAGE_C / "execution_state.py")],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin"},
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+# ---------------------------------------------------------------------------
 # stage-c-env.sh: authorized constants are pinned; inherited shell values
 # cannot widen or redirect the authorization
 # ---------------------------------------------------------------------------
@@ -1137,6 +1495,282 @@ def test_acceptance_doc_does_not_call_three_dollars_a_hard_billing_ceiling():
     assert "Blocking deployment-consistency finding" in text
 
 
+def test_acceptance_doc_records_attempt_7_truthfully():
+    """The paid run completed, the gate false-failed, the kill switch
+    completed — and Stage C is still NOT PASSED with no second run."""
+    text = (REPO / "docs" / "production-readiness" / "STAGE_C_ACCEPTANCE.md").read_text()
+    assert "8b4a4277-fdf0-41b2-8515-d7e1d50e441b" in text
+    assert "milo-agent-worker-gggdc" in text
+    assert "FALSE-FAILED" in text
+    assert "STAGE C NOT PASSED" in text
+    assert "$0.252069" in text
+    assert "312,018" in text
+    assert "no second paid run is permitted" in text.lower()
+    assert "kill switch" in text.lower()
+    assert "08-recover-evidence.md" in text
+    # The report must never claim the acceptance evidence passed.
+    assert "STAGE C PASSED" not in text
+
+
+def test_acceptance_doc_does_not_claim_the_probes_were_deleted():
+    """The live output proves kill-switch.sh ran but 07-post-smoke-posture.sh
+    did not — the kill switch never deletes the probe jobs, so the report
+    must record them as STILL PRESENT (with the defective pre-corrective
+    source), never as deleted."""
+    text = acceptance_doc()
+    assert "deleted by the kill-switch/cleanup cycle" not in text
+    assert "STILL\nPRESENT" in text or "STILL PRESENT" in text
+    assert "07-post-smoke-posture.sh" in text
+    assert "was NOT" in text
+
+
+def recovery_block() -> str:
+    """The ONE fenced bash block of 08-recover-evidence.md."""
+    import re
+    text = (STAGE_C / "08-recover-evidence.md").read_text()
+    blocks = re.findall(r"```bash\n(.*?)```", text, re.S)
+    assert len(blocks) == 1, "the recovery must be exactly ONE operator block"
+    return blocks[0]
+
+
+def test_recovery_runbook_is_pinned_and_fail_closed():
+    """08-recover-evidence.md: manual-only, ONE pinned RUN_ID, worker paid
+    flag and provider aliases untouched, launcher stays disabled, restore
+    + probe deletion + exact-count proofs present, and no committed
+    executable line pairs an execution flag with an enabled value."""
+    text = (STAGE_C / "08-recover-evidence.md").read_text()
+    assert "REQUIRES_MANUAL_OPERATOR_CONFIGURATION" in text
+    assert text.count('RUN_ID="8b4a4277-fdf0-41b2-8515-d7e1d50e441b"') == 1
+    # Fail-closed invariants.
+    assert 'MILO_ENABLE_PAID_EXECUTION") == "false"' in text
+    assert "MOONSHOT_API_KEY" in text and "KIMI_API_KEY" in text
+    assert 'JOB_LAUNCHER") == "disabled"' in text
+    # Exact-count proofs: post-run baseline is 2 runs / 2 executions.
+    assert text.count("--expected-total 2") == 2
+    assert "06-collect-evidence.sh" in text
+    # The only enablement is the manual replay-surface flag via the
+    # operator-run-time STAGE_C_ON indirection (03-enable pattern): the
+    # literal enable value never appears in a committed line.
+    assert 'MILO_ENABLE_RUN_CREATION=${STAGE_C_ON}' in text
+    assert "MILO_ENABLE_RUN_CREATION=true" not in text
+    assert "MILO_ENABLE_PAID_EXECUTION=${STAGE_C_ON}" not in text
+    assert "MILO_ENABLE_PAID_EXECUTION=true" not in text
+    assert "--update-secrets" not in text  # never binds a provider key
+    # Restore + cleanup.
+    assert "MILO_ENABLE_RUN_CREATION=false" in text
+    assert "kill-switch.sh" in text
+    assert text.count("jobs delete") == 2  # stale reconcile + trap cleanup
+    # It must never invoke the paid-run path.
+    assert "05-execute-smoke.sh" not in text
+    assert "STAGE_C_MODE=create" not in text
+    # 07 never ran: the runbook must say the stale probes are still
+    # present and reconcile them — never assume a clean slate.
+    assert "07-post-smoke-posture.sh` was NOT" in text
+    assert "refusing to delete" in text
+
+
+def test_recovery_block_is_one_trap_guarded_subshell(tmp_path):
+    """The recovery is a single valid subshell under set -Eeuo pipefail:
+    cleanup traps for EXIT/ERR/INT/TERM are armed BEFORE any mutation
+    (and thus before API run creation is enabled), every stop is a real
+    nonzero exit (no `|| echo STOP` anywhere), and all waiting is
+    bounded."""
+    block = recovery_block()
+    script = tmp_path / "recovery-block.sh"
+    script.write_text("#!/usr/bin/env bash\n" + block)
+    result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+    assert block.lstrip().startswith("(")
+    assert block.rstrip().endswith(")")
+    assert "set -Eeuo pipefail" in block
+    # Trap coverage and ordering: armed after the read-only posture
+    # verification, before the FIRST mutation and before the enable.
+    trap_at = block.index("trap on_exit EXIT ERR INT TERM")
+    assert trap_at < block.index('echo "== R.2')  # armed before the first mutation
+    assert trap_at < block.index("04-create-probes.sh")
+    assert trap_at < block.index("MILO_ENABLE_RUN_CREATION=${STAGE_C_ON}")
+    # The cleanup restores the flag, runs the kill switch and deletes
+    # both probes.
+    cleanup = block[block.index("recover_cleanup_body() {"):block.index("on_exit()")]
+    assert 'MILO_ENABLE_RUN_CREATION=false' in cleanup
+    assert "./kill-switch.sh" in cleanup
+    assert "jobs delete" in cleanup
+    assert "still exists after cleanup deletion" in cleanup
+    # No soft stops: every refusal is a nonzero exit.
+    assert "|| echo" not in block
+    assert 'echo "STOP' not in block
+    assert "hard_stop" in block
+    # Bounded waiting only.
+    assert "RECOVERY_POLL_TIMEOUT_SECONDS" in block
+    assert "RECOVERY_LOG_RETRIES" in block
+    assert "while true" not in block
+
+
+def test_recovery_block_verifies_stale_probes_before_touching_them():
+    """07 never ran, so the stale probes still exist: the block must
+    verify each job's exact name, pinned disposable-probe service
+    account, transported PROBE_SOURCE, absent paid flag and absent
+    provider aliases before deleting — and refuse anything else."""
+    block = recovery_block()
+    reconcile = block[block.index("R.2"):block.index("R.3")]
+    assert 'assert name == job' in reconcile
+    assert "NOT a known disposable probe; refusing to delete" in reconcile
+    assert '"PROBE_SOURCE" in names' in reconcile
+    assert "MILO_ENABLE_PAID_EXECUTION" in reconcile
+    assert "KIMI_API_KEY" in reconcile and "MOONSHOT_API_KEY" in reconcile
+    assert "refusing to delete the job" in reconcile  # active executions
+    assert "still exists after deletion" in reconcile
+    # Recreation from corrected source happens strictly AFTER deletion.
+    assert reconcile.index("jobs delete") < reconcile.index("04-create-probes.sh")
+
+
+# ---------------------------------------------------------------------------
+# Recovery block end-to-end (mock gcloud): hard stop before any mutation on
+# a bad posture; stale-probe reconciliation + trap cleanup on gate failure
+# ---------------------------------------------------------------------------
+
+
+def recovery_mock_gcloud(state_dir, log_file, worker_paid="false", evidence_ok="false"):
+    return r'''#!/usr/bin/env bash
+{ printf '%s\x1f' "$@"; printf '\n'; } >> "__LOG__"
+args="$*"
+state="__STATE__"
+case "${args}" in
+  *"run jobs executions describe"*)
+    echo '{"metadata":{"name":"e"},"status":{"completionTime":"2026-08-22T00:00:00Z","conditions":[{"type":"Completed","status":"True"}]}}'
+    ;;
+  *"run jobs executions list"*)
+    case "${args}" in
+      *"--job=milo-agent-worker"*)
+        echo '[{"metadata":{"name":"milo-agent-worker-mcfrx"},"status":{"completionTime":"a","conditions":[{"type":"Completed","status":"False"}]}},{"metadata":{"name":"milo-agent-worker-gggdc"},"status":{"completionTime":"b","conditions":[{"type":"Completed","status":"True"}]}}]'
+        ;;
+      *) echo '[]' ;;
+    esac
+    ;;
+  *"run jobs describe milo-agent-worker"*)
+    echo '{"metadata":{"name":"milo-agent-worker"},"spec":{"template":{"spec":{"template":{"spec":{"serviceAccountName":"milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com","containers":[{"env":[{"name":"MILO_ENABLE_PAID_EXECUTION","value":"__WORKER_PAID__"}]}]}}}}}}'
+    ;;
+  *"run services describe milo-agent-api"*)
+    echo '{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"MILO_ENABLE_RUN_CREATION","value":"false"},{"name":"JOB_LAUNCHER","value":"disabled"},{"name":"MILO_ENABLE_PAID_EXECUTION","value":"false"}]}]}}}}'
+    ;;
+  *"run jobs describe stagec-"*)
+    if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then job="${BASH_REMATCH[1]}"; else exit 1; fi
+    if [ -e "${state}/deleted-${job}" ] && [ ! -e "${state}/created-${job}" ]; then exit 1; fi
+    if [ "${job}" = "stagec-db-probe" ]; then sa="milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"; else sa="milo-vercel-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"; fi
+    printf '{"metadata":{"name":"%s"},"spec":{"template":{"spec":{"template":{"spec":{"serviceAccountName":"%s","containers":[{"env":[{"name":"PROBE_SOURCE","value":"stale-source"},{"name":"STAGE_C_MODE","value":"preflight"}]}]}}}}}}\n' "${job}" "${sa}"
+    ;;
+  *"run jobs delete"*)
+    if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then
+      touch "${state}/deleted-${BASH_REMATCH[1]}"
+      rm -f "${state}/created-${BASH_REMATCH[1]}"
+    fi
+    ;;
+  *"run jobs create"*)
+    if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then
+      touch "${state}/created-${BASH_REMATCH[1]}"
+    fi
+    ;;
+  *"run jobs execute"*)
+    case "${args}" in
+      *"STAGE_C_MODE=setup"*) echo "stagec-db-probe-setup1" ;;
+      *"STAGE_C_MODE=evidence"*) echo "stagec-db-probe-ev1" ;;
+      *"STAGE_C_MODE=replay"*) echo "stagec-gw-probe-rep1" ;;
+    esac
+    ;;
+  *"logging read"*)
+    case "${args}" in
+      *"stagec-db-probe-setup1"*)
+        echo '[{"textPayload":"{\"stage_c_probe\": \"setup\", \"user_id\": \"u-1\", \"project_id\": \"p-1\", \"conversation_id\": \"c-1\", \"members\": \"test user only\"}"}]'
+        ;;
+      *"stagec-db-probe-ev1"*)
+        echo '[{"textPayload":"{\"stage_c_probe\": \"evidence\", \"ok\": __EVIDENCE_OK__, \"failures\": []}"}]'
+        ;;
+      *"stagec-gw-probe-rep1"*)
+        echo '[{"textPayload":"{\"stage_c_probe\": \"replay\", \"ok\": __EVIDENCE_OK__, \"returned_run_id\": \"8b4a4277-fdf0-41b2-8515-d7e1d50e441b\"}"}]'
+        ;;
+      *) echo '[]' ;;
+    esac
+    ;;
+esac
+exit 0
+'''.replace("__LOG__", str(log_file)).replace("__STATE__", str(state_dir)).replace("__WORKER_PAID__", worker_paid).replace("__EVIDENCE_OK__", evidence_ok)
+
+
+def run_recovery_block(tmp_path, worker_paid="false", evidence_ok="false"):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    bin_dir = tmp_path / "mockbin"
+    bin_dir.mkdir()
+    log = tmp_path / "gcloud-args.log"
+    mock = bin_dir / "gcloud"
+    mock.write_text(recovery_mock_gcloud(state_dir, log, worker_paid=worker_paid, evidence_ok=evidence_ok))
+    mock.chmod(0o755)
+    script = tmp_path / "recovery-block.sh"
+    script.write_text("#!/usr/bin/env bash\n" + recovery_block())
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO),
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        timeout=300,
+    )
+    lines = log.read_text().splitlines() if log.exists() else []
+    return result, lines
+
+
+def test_recovery_hard_stops_before_any_mutation_on_bad_posture(tmp_path):
+    """A worker whose paid flag is not false must stop the whole recovery
+    at R.1 — read-only, before the traps, before any delete/create/update
+    and before any flag enable."""
+    result, calls = run_recovery_block(tmp_path, worker_paid="true")
+    assert result.returncode != 0
+    assert "worker paid flag is not false" in result.stderr
+    blob = "\n".join(calls)
+    for forbidden in ("jobs\x1fdelete", "jobs\x1fcreate", "services\x1fupdate", "jobs\x1fexecute", "jobs\x1fupdate"):
+        assert forbidden not in blob, f"mutation surface touched on a failed precondition: {forbidden}"
+
+
+def test_recovery_reconciles_stale_probes_and_traps_restore_on_gate_failure(tmp_path):
+    """With the stale probes still present (07 never ran) and the rerun
+    evidence gate failing, the block must: verify + delete + recreate the
+    probes from corrected source, and the armed traps must then restore
+    MILO_ENABLE_RUN_CREATION=false, run the kill switch and delete both
+    probes — while the block still exits nonzero."""
+    result, calls = run_recovery_block(tmp_path, evidence_ok="false")
+    assert result.returncode != 0
+    # Stale probes were verified before deletion, then recreated.
+    assert "OK: stale disposable probe stagec-db-probe verified" in result.stdout
+    assert "OK: stale disposable probe stagec-gw-probe verified" in result.stdout
+    blob = "\n".join(calls)
+    db_delete = blob.index("jobs\x1fdelete\x1fstagec-db-probe")
+    db_create = blob.index("jobs\x1fcreate\x1fstagec-db-probe")
+    assert db_delete < db_create, "stale probe must be deleted before recreation"
+    # The gate failed -> traps ran the full cleanup:
+    enable_at = blob.index("MILO_ENABLE_RUN_CREATION=true")
+    restore_at = blob.rindex("MILO_ENABLE_RUN_CREATION=false")
+    assert enable_at < restore_at, "the replay flag was not restored to false"
+    assert "MILO_ENABLE_PAID_EXECUTION=false" in blob  # kill-switch step 1 ran
+    assert "KILL SWITCH APPLIED" in result.stdout
+    assert "RECOVERY DID NOT COMPLETE" in result.stderr
+    # Cleanup deleted the recreated probes again (delete recorded after create).
+    assert blob.rindex("jobs\x1fdelete\x1fstagec-db-probe") > db_create
+    assert "jobs\x1fdelete\x1fstagec-gw-probe" in blob
+
+
+def test_recovery_succeeds_end_to_end_and_still_runs_cleanup(tmp_path):
+    """When the rerun gate passes, the same cleanup runs on the success
+    path and the block exits 0 after the final exact-count proof."""
+    result, calls = run_recovery_block(tmp_path, evidence_ok="true")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RECOVERY COMPLETE" in result.stdout
+    assert "KILL SWITCH APPLIED" in result.stdout
+    blob = "\n".join(calls)
+    assert blob.index("MILO_ENABLE_RUN_CREATION=true") < blob.rindex("MILO_ENABLE_RUN_CREATION=false")
+    assert blob.rindex("jobs\x1fdelete\x1fstagec-db-probe") > blob.index("jobs\x1fcreate\x1fstagec-db-probe")
+
+
 # ---------------------------------------------------------------------------
 # verify_executions.py: exact Worker-execution baseline gate (Attempt 7 —
 # 1 VISIBLE terminal historical execution before the run, 2 after;
@@ -1298,13 +1932,15 @@ def test_acceptance_doc_distinguishes_occurred_from_visible_executions():
     text = acceptance_doc()
     assert "milo-agent-worker-d2gfx" in text
     assert "milo-agent-worker-mcfrx" in text
-    assert "2 Worker executions historically occurred" in text
+    assert "2 Worker executions occurred before Attempt 7" in text
     assert "2026-08-18T02:00:48" in text
     assert "google.cloud.run.v1.Executions.DeleteExecution" in text
-    assert "exactly 1 is currently visible in Cloud Run" in text
+    # Post-Attempt-7 visible posture: exactly 2 (Attempts 6 + 7); Attempt
+    # 5's deleted execution is still never counted as visible.
+    assert "Worker executions visible in Cloud Run: **2**" in text
+    assert "no longer visible" in text
     # The superseded both-executions-preserved claims are gone.
     assert "Worker executions: **2**, both terminal (historical, preserved)" not in text
-    assert "2 terminal Worker executions**" not in text
     assert "is never cancelled or deleted" not in text
 
 

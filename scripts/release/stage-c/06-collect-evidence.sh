@@ -30,6 +30,36 @@ fail() {
   exit 1
 }
 
+# Bounded wait for ONE named probe execution to reach a terminal state.
+# Returns 0 (succeeded), 1 (failed) or 2 (never proved terminal in time).
+# The verdict comes from execution_state.py over the structured describe
+# JSON — never from a lost gcloud exit status.
+PROBE_WAIT_TIMEOUT_SECONDS="${PROBE_WAIT_TIMEOUT_SECONDS:-1800}"
+PROBE_POLL_INTERVAL_SECONDS="${PROBE_POLL_INTERVAL_SECONDS:-15}"
+# Cloud Logging ingestion can lag a just-completed execution by a few
+# seconds; the structured-log fetch retries BOUNDED times, never forever.
+PROBE_LOG_RETRIES="${PROBE_LOG_RETRIES:-10}"
+PROBE_LOG_RETRY_DELAY_SECONDS="${PROBE_LOG_RETRY_DELAY_SECONDS:-10}"
+
+wait_for_probe_execution() { # exec_name
+  local exec_name="$1" waited=0 state
+  while :; do
+    state="$(gcloud run jobs executions describe "${exec_name}" \
+      --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format=json \
+      | python3 ./execution_state.py)" || state="running"
+    case "${state}" in
+      succeeded) return 0 ;;
+      failed) return 1 ;;
+    esac
+    if (( waited >= PROBE_WAIT_TIMEOUT_SECONDS )); then
+      echo "STAGE C: probe execution '${exec_name}' did not verifiably reach a terminal state within ${PROBE_WAIT_TIMEOUT_SECONDS}s — failing closed" >&2
+      return 2
+    fi
+    sleep "${PROBE_POLL_INTERVAL_SECONDS}"
+    waited=$((waited + PROBE_POLL_INTERVAL_SECONDS))
+  done
+}
+
 run_probe() {
   local job="$1"; shift
   # Multi-character gcloud env-var delimiter so values may contain commas
@@ -43,15 +73,49 @@ run_probe() {
     fi
     env_overrides+="${env_overrides:+${delim}}${kv}"
   done
-  local exec_name
+  # Launch WITHOUT --wait: the previous `--wait --format=value(metadata.name)`
+  # form lost the execution name whenever the probe completed nonzero (the
+  # evidence gate's own fail-closed exit!), and the empty name then produced
+  # an invalid empty `execution_name=` logging filter — discarding the
+  # structured failure evidence exactly when it was needed. --async prints
+  # the created execution's name BEFORE completion, so a later nonzero
+  # completion can never lose it.
+  local exec_name=""
   exec_name="$(gcloud run jobs execute "${job}" \
     --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
     --update-env-vars="^${delim}^${env_overrides}" \
-    --wait --format='value(metadata.name)')"
-  gcloud logging read \
-    "resource.type=cloud_run_job AND resource.labels.job_name=${job} AND labels.\"run.googleapis.com/execution_name\"=${exec_name}" \
-    --project="${STAGE_C_PROJECT}" --format='json(textPayload,jsonPayload)' --order=asc \
-    | python3 -c '
+    --async --format='value(metadata.name)')" || exec_name=""
+  if [[ -z "${exec_name}" ]]; then
+    echo "STAGE C REFUSED: could not establish the execution name for probe job '${job}' — its logs cannot be attributed or retrieved; failing closed" >&2
+    return 1
+  fi
+  echo "probe execution: ${exec_name}" >&2
+  local exec_status=0
+  wait_for_probe_execution "${exec_name}" || exec_status=$?
+  # Structured log retrieval runs UNCONDITIONALLY for the named execution —
+  # a probe that completed nonzero is precisely the one whose structured
+  # failure record the gate must surface. Bounded ingestion retries: the
+  # fetch repeats until a structured probe record has been ingested, at
+  # most PROBE_LOG_RETRIES times; whatever was retrieved is then rendered
+  # (a still-missing record fails the gate closed via probe_ok).
+  local raw_log log_attempt=0
+  raw_log="$(mktemp)"
+  while :; do
+    gcloud logging read \
+      "resource.type=cloud_run_job AND resource.labels.job_name=${job} AND labels.\"run.googleapis.com/execution_name\"=${exec_name}" \
+      --project="${STAGE_C_PROJECT}" --format='json(textPayload,jsonPayload)' --order=asc \
+      > "${raw_log}" || true
+    if grep -q 'stage_c_probe' "${raw_log}"; then
+      break
+    fi
+    log_attempt=$((log_attempt + 1))
+    if (( log_attempt >= PROBE_LOG_RETRIES )); then
+      echo "STAGE C: no structured probe record ingested for '${exec_name}' after ${PROBE_LOG_RETRIES} bounded retries" >&2
+      break
+    fi
+    sleep "${PROBE_LOG_RETRY_DELAY_SECONDS}"
+  done
+  python3 -c '
 import json, sys
 for record in json.load(sys.stdin):
     if not isinstance(record, dict):
@@ -79,7 +143,9 @@ for record in json.load(sys.stdin):
         print(json.dumps(parsed, sort_keys=True))
     else:
         print(text, file=sys.stderr)
-'
+' < "${raw_log}"
+  rm -f "${raw_log}"
+  return "${exec_status}"
 }
 
 # A probe's PASS/FAIL is read from its structured log line, not just the
