@@ -1,28 +1,38 @@
 # Stage C acceptance report — one controlled paid smoke run
 
-Status (2026-08-22): **STAGE C NOT PASSED — ATTEMPT 7 PAID RUN
-COMPLETED SUCCESSFULLY, BUT THE FORMAL EVIDENCE GATE FALSE-FAILED ON
-TOOLING DEFECTS AND MUST BE RERUN (CORRECTED) BEFORE ACCEPTANCE.**
-Attempt 7 (run `8b4a4277-fdf0-41b2-8515-d7e1d50e441b`, Worker execution
-`milo-agent-worker-gggdc`) reached terminal `completed` — the first paid
-run to do so — with 84 model calls, 312,018 tokens, $0.252069 tracked
-actual cost, 0 retries/backpressure events, 84 settled reservations and
-0 dangling. The evidence gate then reported failures caused by three
-confirmed defects in the GATE ITSELF, not by the run (see the Attempt 7
-section below). The operator completed the kill switch: paid execution
-off, both provider aliases absent, API disabled, zero active executions.
-`07-post-smoke-posture.sh` was NOT run, so the disposable probe jobs
-initially remained present with the defective pre-corrective probe
-source. **Evidence recovery attempt 1 (2026-08-22) then FAILED SAFELY at
-R.2 probe recreation**: the stale probes were verified and deleted, but
-`04-create-probes.sh` transported `probe_db.py` as a raw 35,021-character
-`PROBE_SOURCE` env value, exceeding Cloud Run's 32,768-character limit.
-The armed cleanup trap completed — kill switch PASSED, zero active
-Worker executions, both probes absent (see the recovery-attempt section
-below). Probe transport is now deterministic gzip+base64 with a
-pre-mutation size guard. **Stage C remains NOT PASSED until the
-corrected evidence gate passes over this same run
-(`08-recover-evidence.md`); no second paid run is permitted.** Post-run state: `public.runs` holds **exactly 2 run rows**
+Status (2026-08-22): **STAGE C PASSED.** Evidence recovery attempt 2
+(2026-08-22) completed successfully for run
+`8b4a4277-fdf0-41b2-8515-d7e1d50e441b`: the corrected DB evidence gate
+PASSED (terminal `completed`, 84 matched calls, 312,018 tokens, 84
+settled reservations, 0 dangling, 0 retries/backpressure events,
+internal `actual_cost` $0.252069); the post-completion idempotent
+replay returned the SAME completed Run ID with HTTP 202 and created no
+new run and no new Worker execution; exactly 2 visible Worker
+executions remain, both terminal, zero active; the final kill switch
+PASSED (paid execution off, both provider aliases absent, API run
+creation off, launcher disabled); and both disposable probes were
+deleted. The Moonshot console "Today's Consumption" of **$0.52555** is
+recorded as the conservative provider-billed WHOLE-DAY upper bound —
+including any provider-side tool fees or other usage — and sits
+**$2.47445 below the $3.00 cap, using at most 17.52% of it**. **The
+Attempt 7 one-run authorization is consumed, no second paid run is
+authorized, and Stage D remains unauthorized.**
+
+How Stage C got here (full dated sections below): Attempt 7
+(run `8b4a4277-…`, Worker execution `milo-agent-worker-gggdc`) reached
+terminal `completed` on 2026-08-21 — the first paid run to do so — with
+84 model calls, 312,018 tokens, $0.252069 tracked actual cost, 0
+retries/backpressure events, 84 settled reservations and 0 dangling.
+The original evidence gate then reported failures caused by three
+confirmed defects in the GATE ITSELF, not by the run, and the operator
+completed the kill switch. Evidence recovery attempt 1 (2026-08-22)
+FAILED SAFELY at R.2 probe recreation (`probe_db.py` transported as a
+raw 35,021-character `PROBE_SOURCE` env value, over Cloud Run's
+32,768-character limit); its armed cleanup trap completed — kill switch
+PASSED, zero active Worker executions, both probes absent. Probe
+transport became deterministic gzip+base64 with a pre-mutation size
+guard, and recovery attempt 2 then passed every criterion.
+Post-run state: `public.runs` holds **exactly 2 run rows**
 (Attempt 6's `37912575-f9ce-4437-893d-7dfa45c53aa9`, terminal `failed`,
 plus Attempt 7's `8b4a4277-…`, terminal `completed` — exactly 1 row under
 the Attempt 7 key), and Cloud Run exposes **exactly 2 visible terminal
@@ -65,17 +75,20 @@ Current facts:
   `stage-c-smoke-attempt-7-20260819`, Worker execution
   `milo-agent-worker-gggdc`, succeeded). That one-run authorization is
   now consumed; **no second paid run is permitted.**
-- Production is fail-closed after the Attempt 7 kill switch completed:
-  worker paid execution off, both provider aliases (`KIMI_API_KEY`,
-  `MOONSHOT_API_KEY`) absent, API run creation off and launcher
-  disabled, zero active executions. The posture MUST still be
-  re-verified live (read-only) before the evidence-recovery procedure.
-- The formal evidence gate FALSE-FAILED on three confirmed tooling
-  defects (see the Attempt 7 section); Stage C acceptance is pending the
-  corrected gate's rerun over the SAME run via `08-recover-evidence.md`
-  — a replay/evidence-only procedure that keeps the worker paid flag
-  false and creates no run and no execution.
-- Stage D remains unauthorized and blocked.
+- **The corrected evidence gate PASSED over that same run** in evidence
+  recovery attempt 2 (2026-08-22, section below): all acceptance
+  criteria verified, idempotent replay returned the same completed Run
+  ID with HTTP 202, no new run or Worker execution was created, and the
+  Moonshot-billed whole-day upper bound ($0.52555) is far under the
+  $3.00 cap. **Stage C is PASSED.**
+- Production is fail-closed after recovery attempt 2's final kill
+  switch PASSED: worker paid execution off, both provider aliases
+  (`KIMI_API_KEY`, `MOONSHOT_API_KEY`) absent, API run creation off and
+  launcher disabled, zero active executions, both disposable probes
+  deleted.
+- Stage D remains unauthorized and blocked; Stage C passing does not
+  authorize it, and any Stage D work requires its own fresh explicit
+  operator authorization.
 
 The complete operator toolkit is in
 [`scripts/release/stage-c/`](../../scripts/release/stage-c/README.md).
@@ -650,8 +663,10 @@ evidence recovery attempt 1 deleted that stale pair and its cleanup
 verified both probes absent — see the recovery-attempt section below.)
 The fail-closed machinery that ran worked; the gate's verdict was wrong.
 
-Consequence: **the paid run completed, but Stage C remains NOT PASSED**
-until the corrected evidence gate passes over this same run. The
+Consequence (as assessed at the time; since resolved — the corrected
+gate PASSED in evidence recovery attempt 2, see below): **the paid run
+completed, but Stage C remained NOT PASSED**
+until the corrected evidence gate passed over this same run. The
 recovery procedure is `scripts/release/stage-c/08-recover-evidence.md` —
 ONE fail-closed operator block (`set -Eeuo pipefail`, cleanup traps on
 EXIT/ERR/INT/TERM armed before any mutation, every stop a real nonzero
@@ -709,6 +724,43 @@ determinism across runs, the pre-mutation size guard (an oversized
 value must refuse before ANY gcloud call), and delimiter-containing
 sources now transporting safely.
 
+## Evidence recovery attempt 2 (2026-08-22) — SUCCEEDED; STAGE C PASSED
+
+With the corrected probe transport merged, the operator re-ran the
+`08-recover-evidence.md` block for run
+`8b4a4277-fdf0-41b2-8515-d7e1d50e441b` (the ONLY authorized target).
+Every step and every acceptance criterion passed:
+
+| Criterion | Verified outcome |
+| --- | --- |
+| Corrected DB evidence gate | **PASS** — terminal `completed`; 84 matched calls (call_seq-aware one-to-one reconciliation); 312,018 tokens; 84 settled reservations, 0 dangling; 0 retries / 0 backpressure events; internal `actual_cost` $0.252069; exactly 2 total runs, exactly 1 run under the Attempt 7 key, exactly 1 launch invocation |
+| Post-completion idempotent replay | **PASS** — HTTP 202 returning the SAME completed Run ID `8b4a4277-…`; **no new run and no new Worker execution was created** |
+| Worker execution posture | **PASS** — exactly 2 visible Worker executions (`milo-agent-worker-mcfrx`, `milo-agent-worker-gggdc`), both terminal, zero active |
+| Final kill switch | **PASSED** — paid execution off, both provider aliases absent, API run creation off, launcher disabled |
+| Disposable probes | **both deleted** (recreated from corrected source for the rerun, removed again by the cleanup) |
+| Provider billing check (Moonshot console) | "Today's Consumption" **$0.52555** — see below |
+
+Provider-billed bound: the Moonshot console "Today's Consumption" of
+**$0.52555** is recorded as the **conservative provider-billed
+WHOLE-DAY upper bound** for the run — it covers the entire billing day,
+including any provider-side `$web_search` tool fees and any other usage
+on the account, all of which MILO's internal token-derived
+`actual_cost` ($0.252069) deliberately excludes. Even this whole-day
+upper bound is **$2.47445 below the $3.00 cap, using at most 17.52% of
+it**. This satisfies the operator obligation from the cost-ceiling
+section (verify the actual billed total, tokens AND tool fees, in the
+Moonshot console after the run).
+
+Throughout the recovery: the worker paid flag stayed `false`, both
+provider aliases stayed absent, the launcher stayed `disabled`, and the
+only temporary change — API `MILO_ENABLE_RUN_CREATION` for the replay —
+was restored to `false` by the cleanup. No provider call was made.
+
+**Stage C is PASSED.** The Attempt 7 one-run authorization is consumed:
+**no second paid run is authorized**, and **Stage D remains
+unauthorized** — this acceptance does not enable it, and any Stage D
+work requires its own fresh explicit operator authorization.
+
 ## Production mutations / current posture
 
 The original automation-identity session performed no writes, but the
@@ -722,9 +774,8 @@ MILO run and one Worker execution were created per attempt.
 Attempt 6 reached real paid execution and failed; Attempt 7 reached real
 paid execution and COMPLETED.**
 
-Execution posture after the Attempt 7 kill switch completed (MUST be
-re-verified live, read-only, as recovery step R.1 before the evidence
-rerun):
+Execution posture after evidence recovery attempt 2 completed and its
+final kill switch PASSED (verified live 2026-08-22):
 
 - API: `MILO_ENABLE_RUN_CREATION=false`,
   `JOB_LAUNCHER=disabled`, `MILO_ENABLE_PAID_EXECUTION=false`.
@@ -763,7 +814,9 @@ rerun):
   posture, deleted; absent job — nothing to reconcile) and recreates
   both from the corrected source, which now ships as deterministic
   gzip+base64; the recovery traps and R.6 delete them again at the end
-  on every exit path.
+  on every exit path. Evidence recovery attempt 2 (2026-08-22)
+  recreated both from the corrected source for the successful rerun and
+  its cleanup **deleted both again — final state: absent.**
 
 ## Provider call / token / cost accounting
 
@@ -775,7 +828,11 @@ tracked cost $0.252069** (0 retries, 0 backpressure events, 84 settled
 reservations, 0 dangling) and reached terminal `completed`. Both
 consumed authorizations are spent; **no further paid run is authorized.**
 The operator obligation to verify the actual billed total (tokens AND
-web-search tool fees) in the Moonshot console still applies to Attempt 7.
+web-search tool fees) in the Moonshot console was fulfilled on
+2026-08-22: "Today's Consumption" read **$0.52555**, recorded as the
+conservative provider-billed WHOLE-DAY upper bound (it includes any
+provider-side tool fees and any other same-day account usage on top of
+this run) — $2.47445 below the $3.00 cap, at most 17.52% of it.
 
 ## Provider operating envelope (Attempt 7, worker-only)
 
@@ -800,35 +857,30 @@ These settings are applied to the **Worker only** (the API receives no
 
 ## Verdict
 
-- Stage C: **NOT PASSED (evidence pending).** The Attempt 7 paid run
-  itself COMPLETED (run `8b4a4277-…`, execution
-  `milo-agent-worker-gggdc`, 84 calls / 312,018 tokens / $0.252069, all
-  safety rails held), but the formal evidence gate false-failed on three
-  confirmed tooling defects and its verdict is void. Stage C acceptance
-  requires the CORRECTED gate to pass over this same run.
-- This corrective PR fixes the three gate defects (run_invocations
-  schema + fail-closed PostgREST handling; Decimal call_seq-aware cost
-  reconciliation replacing the invalid fixed aggregate tolerance;
-  execution-name preservation and failure-log retrieval in
-  `06-collect-evidence.sh`), adds offline regression coverage including
-  the exact 84-call rounding fixture, and documents the pinned recovery
-  procedure. **Merging it authorizes nothing beyond the
-  replay/evidence-only recovery in `08-recover-evidence.md`** — no
-  build, deployment, secret binding, paid-flag enablement, new run,
-  provider call or Stage D.
-- After merge, the operator may run `08-recover-evidence.md` for run
-  `8b4a4277-…` ONLY — one trap-guarded fail-closed block: reconcile the
-  STALE disposable probes left behind because `07-post-smoke-posture.sh`
-  never ran (verify exact names/posture, delete, recreate from corrected
-  source), replay and rerun the evidence gate with the worker paid flag
-  `false`, all provider aliases absent and the launcher `disabled`,
-  prove no new run/execution was created, and — on every exit path —
-  restore the full fail-closed posture and delete both probes.
-- The kill switch completed and the Attempt 7 one-run authorization is
-  consumed: **no second paid run is permitted**, whatever the recovery
-  outcome.
-- Stage D remains blocked until the corrected `06-collect-evidence.sh`
-  passes all acceptance invariants over run `8b4a4277-…` (including the
-  exact post-run totals of 2 database runs and 2 visible executions),
-  actual provider billing is checked in the Moonshot console, and the
-  fail-closed posture is re-verified after recovery.
+- Stage C: **PASSED (2026-08-22).** The one authorized Attempt 7 paid
+  run COMPLETED (run `8b4a4277-fdf0-41b2-8515-d7e1d50e441b`, execution
+  `milo-agent-worker-gggdc`, 84 calls / 312,018 tokens / internal
+  `actual_cost` $0.252069, all safety rails held), and evidence
+  recovery attempt 2 passed every acceptance criterion with the
+  CORRECTED gate: 84-call one-to-one cost reconciliation, exact
+  2-runs/1-key-run/1-invocation totals, idempotent replay returning the
+  same completed Run ID with HTTP 202 (no new run, no new Worker
+  execution), exactly 2 visible terminal executions with zero active,
+  and zero secret markers.
+- Provider billing was checked in the Moonshot console: "Today's
+  Consumption" $0.52555, recorded as the conservative provider-billed
+  whole-day upper bound (including provider-side tool fees and any
+  other same-day usage) — $2.47445 under the $3.00 cap, at most 17.52%
+  of it.
+- Production ended fail-closed and verified: the final kill switch
+  PASSED (worker/API paid execution off, both provider aliases absent,
+  API run creation off, launcher disabled, zero active executions) and
+  both disposable probes were deleted.
+- **The Attempt 7 one-run authorization is consumed; no second paid run
+  is authorized.** The Stage C tooling (steps 1–8) is retained as the
+  audited record; none of it may be re-executed against production
+  without fresh explicit operator authorization, and merging this or
+  any documentation/tooling PR authorizes nothing.
+- **Stage D remains unauthorized and blocked.** Stage C passing does
+  not enable, authorize or schedule any Stage D activity; Stage D
+  requires its own fresh, separate, explicit operator authorization.
