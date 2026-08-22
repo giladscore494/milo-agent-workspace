@@ -768,6 +768,37 @@ def test_cost_caps_stay_strict_with_no_rounding_tolerance(db, monkeypatch, capsy
     assert any("exceeds cap" in f for f in verdict["failures"])
 
 
+def test_unrounded_reservation_total_over_cap_fails_even_when_rounded_views_hide_it(db, monkeypatch, capsys):
+    """A true spend of $3.0000001 must fail the $3.00 cap even though
+    six-decimal rounding makes every rounded view read exactly $3.000000:
+    the ledger rows round to 1.500000 each (sum 3.000000, not over) and
+    run.usage snapshots round(3.0000001, 6) = 3.0 (not over) — only the
+    UNROUNDED reservation total exceeds the cap, and it must be capped
+    too."""
+    data = attempt7_rounding_dataset()
+    data["model_call_budget_reservations"] = [
+        {"call_seq": 1, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": 1.5000001},
+        {"call_seq": 2, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": 1.5},
+    ]
+    data["run_usage_ledger"] = [
+        {"decision": "settled", "call_seq": 1, "actual_input_tokens": 50, "actual_output_tokens": 25, "actual_cost": 1.500000, "estimated_cost": None},
+        {"decision": "settled", "call_seq": 2, "actual_input_tokens": 50, "actual_output_tokens": 25, "actual_cost": 1.500000, "estimated_cost": None},
+    ]
+    data["runs"][0]["usage"] = {
+        "model_calls": 2,
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "total_tokens": 150,
+        "actual_cost": 3.0,  # round(3.0000001, 6) — reads exactly at the cap
+    }
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("exceeds cap" in f and "unrounded reservations 3.0000001" in f for f in verdict["failures"])
+    # The rounded views alone would NOT have tripped anything: no per-row
+    # rounding failure and no usage-total failure may fire here.
+    assert not any("rounding tolerance" in f for f in verdict["failures"])
+    assert not any("unrounded reservation total" in f and "run.usage" in f for f in verdict["failures"])
+
+
 # ---------------------------------------------------------------------------
 # verify_caps.py: exact cap verification on both surfaces
 # ---------------------------------------------------------------------------
@@ -1481,6 +1512,27 @@ def test_acceptance_doc_records_attempt_7_truthfully():
     assert "STAGE C PASSED" not in text
 
 
+def test_acceptance_doc_does_not_claim_the_probes_were_deleted():
+    """The live output proves kill-switch.sh ran but 07-post-smoke-posture.sh
+    did not — the kill switch never deletes the probe jobs, so the report
+    must record them as STILL PRESENT (with the defective pre-corrective
+    source), never as deleted."""
+    text = acceptance_doc()
+    assert "deleted by the kill-switch/cleanup cycle" not in text
+    assert "STILL\nPRESENT" in text or "STILL PRESENT" in text
+    assert "07-post-smoke-posture.sh" in text
+    assert "was NOT" in text
+
+
+def recovery_block() -> str:
+    """The ONE fenced bash block of 08-recover-evidence.md."""
+    import re
+    text = (STAGE_C / "08-recover-evidence.md").read_text()
+    blocks = re.findall(r"```bash\n(.*?)```", text, re.S)
+    assert len(blocks) == 1, "the recovery must be exactly ONE operator block"
+    return blocks[0]
+
+
 def test_recovery_runbook_is_pinned_and_fail_closed():
     """08-recover-evidence.md: manual-only, ONE pinned RUN_ID, worker paid
     flag and provider aliases untouched, launcher stays disabled, restore
@@ -1507,10 +1559,216 @@ def test_recovery_runbook_is_pinned_and_fail_closed():
     # Restore + cleanup.
     assert "MILO_ENABLE_RUN_CREATION=false" in text
     assert "kill-switch.sh" in text
-    assert text.count("jobs delete") == 2
+    assert text.count("jobs delete") == 2  # stale reconcile + trap cleanup
     # It must never invoke the paid-run path.
     assert "05-execute-smoke.sh" not in text
     assert "STAGE_C_MODE=create" not in text
+    # 07 never ran: the runbook must say the stale probes are still
+    # present and reconcile them — never assume a clean slate.
+    assert "07-post-smoke-posture.sh` was NOT" in text
+    assert "refusing to delete" in text
+
+
+def test_recovery_block_is_one_trap_guarded_subshell(tmp_path):
+    """The recovery is a single valid subshell under set -Eeuo pipefail:
+    cleanup traps for EXIT/ERR/INT/TERM are armed BEFORE any mutation
+    (and thus before API run creation is enabled), every stop is a real
+    nonzero exit (no `|| echo STOP` anywhere), and all waiting is
+    bounded."""
+    block = recovery_block()
+    script = tmp_path / "recovery-block.sh"
+    script.write_text("#!/usr/bin/env bash\n" + block)
+    result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+    assert block.lstrip().startswith("(")
+    assert block.rstrip().endswith(")")
+    assert "set -Eeuo pipefail" in block
+    # Trap coverage and ordering: armed after the read-only posture
+    # verification, before the FIRST mutation and before the enable.
+    trap_at = block.index("trap on_exit EXIT ERR INT TERM")
+    assert trap_at < block.index('echo "== R.2')  # armed before the first mutation
+    assert trap_at < block.index("04-create-probes.sh")
+    assert trap_at < block.index("MILO_ENABLE_RUN_CREATION=${STAGE_C_ON}")
+    # The cleanup restores the flag, runs the kill switch and deletes
+    # both probes.
+    cleanup = block[block.index("recover_cleanup_body() {"):block.index("on_exit()")]
+    assert 'MILO_ENABLE_RUN_CREATION=false' in cleanup
+    assert "./kill-switch.sh" in cleanup
+    assert "jobs delete" in cleanup
+    assert "still exists after cleanup deletion" in cleanup
+    # No soft stops: every refusal is a nonzero exit.
+    assert "|| echo" not in block
+    assert 'echo "STOP' not in block
+    assert "hard_stop" in block
+    # Bounded waiting only.
+    assert "RECOVERY_POLL_TIMEOUT_SECONDS" in block
+    assert "RECOVERY_LOG_RETRIES" in block
+    assert "while true" not in block
+
+
+def test_recovery_block_verifies_stale_probes_before_touching_them():
+    """07 never ran, so the stale probes still exist: the block must
+    verify each job's exact name, pinned disposable-probe service
+    account, transported PROBE_SOURCE, absent paid flag and absent
+    provider aliases before deleting — and refuse anything else."""
+    block = recovery_block()
+    reconcile = block[block.index("R.2"):block.index("R.3")]
+    assert 'assert name == job' in reconcile
+    assert "NOT a known disposable probe; refusing to delete" in reconcile
+    assert '"PROBE_SOURCE" in names' in reconcile
+    assert "MILO_ENABLE_PAID_EXECUTION" in reconcile
+    assert "KIMI_API_KEY" in reconcile and "MOONSHOT_API_KEY" in reconcile
+    assert "refusing to delete the job" in reconcile  # active executions
+    assert "still exists after deletion" in reconcile
+    # Recreation from corrected source happens strictly AFTER deletion.
+    assert reconcile.index("jobs delete") < reconcile.index("04-create-probes.sh")
+
+
+# ---------------------------------------------------------------------------
+# Recovery block end-to-end (mock gcloud): hard stop before any mutation on
+# a bad posture; stale-probe reconciliation + trap cleanup on gate failure
+# ---------------------------------------------------------------------------
+
+
+def recovery_mock_gcloud(state_dir, log_file, worker_paid="false", evidence_ok="false"):
+    return r'''#!/usr/bin/env bash
+{ printf '%s\x1f' "$@"; printf '\n'; } >> "__LOG__"
+args="$*"
+state="__STATE__"
+case "${args}" in
+  *"run jobs executions describe"*)
+    echo '{"metadata":{"name":"e"},"status":{"completionTime":"2026-08-22T00:00:00Z","conditions":[{"type":"Completed","status":"True"}]}}'
+    ;;
+  *"run jobs executions list"*)
+    case "${args}" in
+      *"--job=milo-agent-worker"*)
+        echo '[{"metadata":{"name":"milo-agent-worker-mcfrx"},"status":{"completionTime":"a","conditions":[{"type":"Completed","status":"False"}]}},{"metadata":{"name":"milo-agent-worker-gggdc"},"status":{"completionTime":"b","conditions":[{"type":"Completed","status":"True"}]}}]'
+        ;;
+      *) echo '[]' ;;
+    esac
+    ;;
+  *"run jobs describe milo-agent-worker"*)
+    echo '{"metadata":{"name":"milo-agent-worker"},"spec":{"template":{"spec":{"template":{"spec":{"serviceAccountName":"milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com","containers":[{"env":[{"name":"MILO_ENABLE_PAID_EXECUTION","value":"__WORKER_PAID__"}]}]}}}}}}'
+    ;;
+  *"run services describe milo-agent-api"*)
+    echo '{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"MILO_ENABLE_RUN_CREATION","value":"false"},{"name":"JOB_LAUNCHER","value":"disabled"},{"name":"MILO_ENABLE_PAID_EXECUTION","value":"false"}]}]}}}}'
+    ;;
+  *"run jobs describe stagec-"*)
+    if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then job="${BASH_REMATCH[1]}"; else exit 1; fi
+    if [ -e "${state}/deleted-${job}" ] && [ ! -e "${state}/created-${job}" ]; then exit 1; fi
+    if [ "${job}" = "stagec-db-probe" ]; then sa="milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"; else sa="milo-vercel-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"; fi
+    printf '{"metadata":{"name":"%s"},"spec":{"template":{"spec":{"template":{"spec":{"serviceAccountName":"%s","containers":[{"env":[{"name":"PROBE_SOURCE","value":"stale-source"},{"name":"STAGE_C_MODE","value":"preflight"}]}]}}}}}}\n' "${job}" "${sa}"
+    ;;
+  *"run jobs delete"*)
+    if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then
+      touch "${state}/deleted-${BASH_REMATCH[1]}"
+      rm -f "${state}/created-${BASH_REMATCH[1]}"
+    fi
+    ;;
+  *"run jobs create"*)
+    if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then
+      touch "${state}/created-${BASH_REMATCH[1]}"
+    fi
+    ;;
+  *"run jobs execute"*)
+    case "${args}" in
+      *"STAGE_C_MODE=setup"*) echo "stagec-db-probe-setup1" ;;
+      *"STAGE_C_MODE=evidence"*) echo "stagec-db-probe-ev1" ;;
+      *"STAGE_C_MODE=replay"*) echo "stagec-gw-probe-rep1" ;;
+    esac
+    ;;
+  *"logging read"*)
+    case "${args}" in
+      *"stagec-db-probe-setup1"*)
+        echo '[{"textPayload":"{\"stage_c_probe\": \"setup\", \"user_id\": \"u-1\", \"project_id\": \"p-1\", \"conversation_id\": \"c-1\", \"members\": \"test user only\"}"}]'
+        ;;
+      *"stagec-db-probe-ev1"*)
+        echo '[{"textPayload":"{\"stage_c_probe\": \"evidence\", \"ok\": __EVIDENCE_OK__, \"failures\": []}"}]'
+        ;;
+      *"stagec-gw-probe-rep1"*)
+        echo '[{"textPayload":"{\"stage_c_probe\": \"replay\", \"ok\": __EVIDENCE_OK__, \"returned_run_id\": \"8b4a4277-fdf0-41b2-8515-d7e1d50e441b\"}"}]'
+        ;;
+      *) echo '[]' ;;
+    esac
+    ;;
+esac
+exit 0
+'''.replace("__LOG__", str(log_file)).replace("__STATE__", str(state_dir)).replace("__WORKER_PAID__", worker_paid).replace("__EVIDENCE_OK__", evidence_ok)
+
+
+def run_recovery_block(tmp_path, worker_paid="false", evidence_ok="false"):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    bin_dir = tmp_path / "mockbin"
+    bin_dir.mkdir()
+    log = tmp_path / "gcloud-args.log"
+    mock = bin_dir / "gcloud"
+    mock.write_text(recovery_mock_gcloud(state_dir, log, worker_paid=worker_paid, evidence_ok=evidence_ok))
+    mock.chmod(0o755)
+    script = tmp_path / "recovery-block.sh"
+    script.write_text("#!/usr/bin/env bash\n" + recovery_block())
+    result = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO),
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        timeout=300,
+    )
+    lines = log.read_text().splitlines() if log.exists() else []
+    return result, lines
+
+
+def test_recovery_hard_stops_before_any_mutation_on_bad_posture(tmp_path):
+    """A worker whose paid flag is not false must stop the whole recovery
+    at R.1 — read-only, before the traps, before any delete/create/update
+    and before any flag enable."""
+    result, calls = run_recovery_block(tmp_path, worker_paid="true")
+    assert result.returncode != 0
+    assert "worker paid flag is not false" in result.stderr
+    blob = "\n".join(calls)
+    for forbidden in ("jobs\x1fdelete", "jobs\x1fcreate", "services\x1fupdate", "jobs\x1fexecute", "jobs\x1fupdate"):
+        assert forbidden not in blob, f"mutation surface touched on a failed precondition: {forbidden}"
+
+
+def test_recovery_reconciles_stale_probes_and_traps_restore_on_gate_failure(tmp_path):
+    """With the stale probes still present (07 never ran) and the rerun
+    evidence gate failing, the block must: verify + delete + recreate the
+    probes from corrected source, and the armed traps must then restore
+    MILO_ENABLE_RUN_CREATION=false, run the kill switch and delete both
+    probes — while the block still exits nonzero."""
+    result, calls = run_recovery_block(tmp_path, evidence_ok="false")
+    assert result.returncode != 0
+    # Stale probes were verified before deletion, then recreated.
+    assert "OK: stale disposable probe stagec-db-probe verified" in result.stdout
+    assert "OK: stale disposable probe stagec-gw-probe verified" in result.stdout
+    blob = "\n".join(calls)
+    db_delete = blob.index("jobs\x1fdelete\x1fstagec-db-probe")
+    db_create = blob.index("jobs\x1fcreate\x1fstagec-db-probe")
+    assert db_delete < db_create, "stale probe must be deleted before recreation"
+    # The gate failed -> traps ran the full cleanup:
+    enable_at = blob.index("MILO_ENABLE_RUN_CREATION=true")
+    restore_at = blob.rindex("MILO_ENABLE_RUN_CREATION=false")
+    assert enable_at < restore_at, "the replay flag was not restored to false"
+    assert "MILO_ENABLE_PAID_EXECUTION=false" in blob  # kill-switch step 1 ran
+    assert "KILL SWITCH APPLIED" in result.stdout
+    assert "RECOVERY DID NOT COMPLETE" in result.stderr
+    # Cleanup deleted the recreated probes again (delete recorded after create).
+    assert blob.rindex("jobs\x1fdelete\x1fstagec-db-probe") > db_create
+    assert "jobs\x1fdelete\x1fstagec-gw-probe" in blob
+
+
+def test_recovery_succeeds_end_to_end_and_still_runs_cleanup(tmp_path):
+    """When the rerun gate passes, the same cleanup runs on the success
+    path and the block exits 0 after the final exact-count proof."""
+    result, calls = run_recovery_block(tmp_path, evidence_ok="true")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RECOVERY COMPLETE" in result.stdout
+    assert "KILL SWITCH APPLIED" in result.stdout
+    blob = "\n".join(calls)
+    assert blob.index("MILO_ENABLE_RUN_CREATION=true") < blob.rindex("MILO_ENABLE_RUN_CREATION=false")
+    assert blob.rindex("jobs\x1fdelete\x1fstagec-db-probe") > blob.index("jobs\x1fcreate\x1fstagec-db-probe")
 
 
 # ---------------------------------------------------------------------------

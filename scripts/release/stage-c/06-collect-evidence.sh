@@ -36,6 +36,10 @@ fail() {
 # JSON — never from a lost gcloud exit status.
 PROBE_WAIT_TIMEOUT_SECONDS="${PROBE_WAIT_TIMEOUT_SECONDS:-1800}"
 PROBE_POLL_INTERVAL_SECONDS="${PROBE_POLL_INTERVAL_SECONDS:-15}"
+# Cloud Logging ingestion can lag a just-completed execution by a few
+# seconds; the structured-log fetch retries BOUNDED times, never forever.
+PROBE_LOG_RETRIES="${PROBE_LOG_RETRIES:-10}"
+PROBE_LOG_RETRY_DELAY_SECONDS="${PROBE_LOG_RETRY_DELAY_SECONDS:-10}"
 
 wait_for_probe_execution() { # exec_name
   local exec_name="$1" waited=0 state
@@ -90,11 +94,28 @@ run_probe() {
   wait_for_probe_execution "${exec_name}" || exec_status=$?
   # Structured log retrieval runs UNCONDITIONALLY for the named execution —
   # a probe that completed nonzero is precisely the one whose structured
-  # failure record the gate must surface.
-  gcloud logging read \
-    "resource.type=cloud_run_job AND resource.labels.job_name=${job} AND labels.\"run.googleapis.com/execution_name\"=${exec_name}" \
-    --project="${STAGE_C_PROJECT}" --format='json(textPayload,jsonPayload)' --order=asc \
-    | python3 -c '
+  # failure record the gate must surface. Bounded ingestion retries: the
+  # fetch repeats until a structured probe record has been ingested, at
+  # most PROBE_LOG_RETRIES times; whatever was retrieved is then rendered
+  # (a still-missing record fails the gate closed via probe_ok).
+  local raw_log log_attempt=0
+  raw_log="$(mktemp)"
+  while :; do
+    gcloud logging read \
+      "resource.type=cloud_run_job AND resource.labels.job_name=${job} AND labels.\"run.googleapis.com/execution_name\"=${exec_name}" \
+      --project="${STAGE_C_PROJECT}" --format='json(textPayload,jsonPayload)' --order=asc \
+      > "${raw_log}" || true
+    if grep -q 'stage_c_probe' "${raw_log}"; then
+      break
+    fi
+    log_attempt=$((log_attempt + 1))
+    if (( log_attempt >= PROBE_LOG_RETRIES )); then
+      echo "STAGE C: no structured probe record ingested for '${exec_name}' after ${PROBE_LOG_RETRIES} bounded retries" >&2
+      break
+    fi
+    sleep "${PROBE_LOG_RETRY_DELAY_SECONDS}"
+  done
+  python3 -c '
 import json, sys
 for record in json.load(sys.stdin):
     if not isinstance(record, dict):
@@ -122,7 +143,8 @@ for record in json.load(sys.stdin):
         print(json.dumps(parsed, sort_keys=True))
     else:
         print(text, file=sys.stderr)
-'
+' < "${raw_log}"
+  rm -f "${raw_log}"
   return "${exec_status}"
 }
 

@@ -11,9 +11,11 @@ actual cost, 0 retries/backpressure events, 84 settled reservations and
 confirmed defects in the GATE ITSELF, not by the run (see the Attempt 7
 section below). The operator completed the kill switch: paid execution
 off, both provider aliases absent, API disabled, zero active executions.
-**Stage C remains NOT PASSED until the corrected evidence gate passes
-over this same run (`08-recover-evidence.md`); no second paid run is
-permitted.** Post-run state: `public.runs` holds **exactly 2 run rows**
+`07-post-smoke-posture.sh` was NOT run, so the disposable probe jobs
+were NOT deleted and remain present with the defective pre-corrective
+probe source (the recovery reconciles them). **Stage C remains NOT
+PASSED until the corrected evidence gate passes over this same run
+(`08-recover-evidence.md`); no second paid run is permitted.** Post-run state: `public.runs` holds **exactly 2 run rows**
 (Attempt 6's `37912575-f9ce-4437-893d-7dfa45c53aa9`, terminal `failed`,
 plus Attempt 7's `8b4a4277-…`, terminal `completed` — exactly 1 row under
 the Attempt 7 key), and Cloud Run exposes **exactly 2 visible terminal
@@ -614,7 +616,10 @@ no production mutation):
    half-ulp; duplicate, missing and unmatched calls are rejected;
    `run.usage.actual_cost` is compared against the UNROUNDED reservation
    total (what the worker actually snapshots); and all $3.00/token/call
-   caps remain strict with no tolerance.
+   caps remain strict with no tolerance — the UNROUNDED reservation
+   total is checked against `MILO_MAX_COST_PER_RUN` too, so a true spend
+   of $3.0000001 fails the cap even when six-decimal rounding makes the
+   ledger and `run.usage` totals read exactly $3.000000.
 3. **`06-collect-evidence.sh` lost the probe execution name whenever a
    probe completed nonzero** (`--wait --format='value(metadata.name)'`
    prints nothing on a nonzero completion), and then issued an invalid
@@ -629,21 +634,31 @@ no production mutation):
 **The kill switch completed successfully after the false failure**
 (treating the gate report at face value, exactly as designed): worker
 paid execution off, both provider aliases absent in every binding form,
-API run creation off and launcher disabled, zero active executions. The
-fail-closed machinery worked; the gate's verdict was wrong.
+API run creation off and launcher disabled, zero active executions.
+**`07-post-smoke-posture.sh` was NOT run** — the kill switch never
+deletes the disposable probes, so `stagec-db-probe` and
+`stagec-gw-probe` are STILL PRESENT in production, still carrying the
+defective pre-corrective probe source. The fail-closed machinery that
+ran worked; the gate's verdict was wrong.
 
 Consequence: **the paid run completed, but Stage C remains NOT PASSED**
 until the corrected evidence gate passes over this same run. The
 recovery procedure is `scripts/release/stage-c/08-recover-evidence.md` —
-pinned to run `8b4a4277-…` ONLY. It recreates the disposable probes from
-the corrected source, performs the required post-completion idempotent
-replay while the worker paid flag stays `false` and all provider aliases
-stay absent (the launcher also stays `disabled`; a terminal-run replay
-returns the same run id without any launch), proves via the exact-count
-gates that no new run and no new Worker execution was created, reruns
-the evidence gate, restores the full fail-closed posture and deletes the
-probes. **No second paid run is permitted; the Attempt 7 one-run
-authorization is consumed.**
+ONE fail-closed operator block (`set -Eeuo pipefail`, cleanup traps on
+EXIT/ERR/INT/TERM armed before any mutation, every stop a real nonzero
+exit, all polling and log-ingestion retries bounded), pinned to run
+`8b4a4277-…` ONLY. It verifies the fail-closed posture read-only,
+reconciles the STALE disposable probes (verifies exact name and posture,
+refuses anything that is not a known disposable probe, deletes them) and
+recreates both from the corrected source, performs the required
+post-completion idempotent replay while the worker paid flag stays
+`false` and all provider aliases stay absent (the launcher also stays
+`disabled`; a terminal-run replay returns the same run id without any
+launch), proves via the exact-count gates that no new run and no new
+Worker execution was created, reruns the evidence gate, and — on EVERY
+exit path, via the traps — restores `MILO_ENABLE_RUN_CREATION=false`,
+runs `kill-switch.sh` and deletes both probes. **No second paid run is
+permitted; the Attempt 7 one-run authorization is consumed.**
 
 ## Production mutations / current posture
 
@@ -686,9 +701,16 @@ rerun):
   (the completed run itself — the key is consumed).
 - Runtime release deployed for Attempt 7:
   `88224bccc836f80f3dc1d173306a1aa63cddcc7a` (merge of PR #50).
-- Disposable `stagec-db-probe` and `stagec-gw-probe` jobs: deleted by the
-  kill-switch/cleanup cycle; recovery step R.2 recreates them from the
-  corrected source, and step R.6 deletes them again.
+- Disposable `stagec-db-probe` and `stagec-gw-probe` jobs: **STILL
+  PRESENT** — the live output proves `kill-switch.sh` ran, but
+  `07-post-smoke-posture.sh` (the step that deletes the probes; the kill
+  switch never does) did NOT run. The stale jobs still carry the
+  DEFECTIVE pre-corrective probe source. Recovery step R.2 verifies each
+  stale job's exact name and posture (pinned disposable-probe service
+  account, transported `PROBE_SOURCE`, no paid flag, no provider alias —
+  anything else hard-stops), deletes them, and recreates both from the
+  corrected source; the recovery traps and R.6 delete them again at the
+  end on every exit path.
 
 ## Provider call / token / cost accounting
 
@@ -742,11 +764,13 @@ These settings are applied to the **Worker only** (the API receives no
   build, deployment, secret binding, paid-flag enablement, new run,
   provider call or Stage D.
 - After merge, the operator may run `08-recover-evidence.md` for run
-  `8b4a4277-…` ONLY: recreate probes from corrected source, replay and
-  rerun the evidence gate with the worker paid flag `false`, all
-  provider aliases absent and the launcher `disabled`, prove no new
-  run/execution was created, restore full fail-closed posture and delete
-  the probes.
+  `8b4a4277-…` ONLY — one trap-guarded fail-closed block: reconcile the
+  STALE disposable probes left behind because `07-post-smoke-posture.sh`
+  never ran (verify exact names/posture, delete, recreate from corrected
+  source), replay and rerun the evidence gate with the worker paid flag
+  `false`, all provider aliases absent and the launcher `disabled`,
+  prove no new run/execution was created, and — on every exit path —
+  restore the full fail-closed posture and delete both probes.
 - The kill switch completed and the Attempt 7 one-run authorization is
   consumed: **no second paid run is permitted**, whatever the recovery
   outcome.

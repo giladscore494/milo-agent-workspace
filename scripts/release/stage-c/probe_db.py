@@ -669,17 +669,24 @@ def evidence() -> None:
         failures.append(f"run.usage output_tokens {usage.get('output_tokens')} != ledger sum {ledger_output}")
 
     # Tracked cost / token / call caps vs the exact configured values.
-    # The caps stay STRICT: no rounding tolerance ever loosens them; both
-    # the per-row-rounded ledger total and the run.usage snapshot must be
-    # within the $ cap exactly.
+    # The caps stay STRICT: no rounding tolerance ever loosens them. ALL
+    # THREE cost views must be within the $ cap exactly — the per-row-
+    # rounded ledger total, the run.usage snapshot AND the UNROUNDED
+    # reservation total: six-decimal rounding may round a true spend of
+    # e.g. $3.0000001 down to a ledger/usage total of exactly $3.000000,
+    # and the unrounded view is what actually left the budget.
     if not missing_caps:
         max_cost = Decimal(caps["MILO_MAX_COST_PER_RUN"])
         max_calls = int(caps["MILO_MAX_MODEL_CALLS_PER_RUN"])
         max_input = int(caps["MILO_MAX_INPUT_TOKENS_PER_RUN"])
         max_output = int(caps["MILO_MAX_OUTPUT_TOKENS_PER_RUN"])
         max_total = int(caps["MILO_MAX_TOTAL_TOKENS_PER_RUN"])
-        if ledger_cost > max_cost or (usage_cost or Decimal(0)) > max_cost:
-            failures.append(f"tracked cost (ledger {ledger_cost} / usage {usage_cost}) exceeds cap {max_cost}")
+        reservation_total = reconciliation["reservation_total_unrounded"]
+        if ledger_cost > max_cost or (usage_cost or Decimal(0)) > max_cost or reservation_total > max_cost:
+            failures.append(
+                f"tracked cost (ledger {ledger_cost} / usage {usage_cost} / "
+                f"unrounded reservations {reservation_total}) exceeds cap {max_cost}"
+            )
         model_calls = int(usage.get("model_calls") or 0)
         if model_calls > max_calls:
             failures.append(f"model_calls {model_calls} exceeds cap {max_calls}")
