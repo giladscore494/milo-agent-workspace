@@ -1,17 +1,35 @@
 # Stage C acceptance report — one controlled paid smoke run
 
-Status (2026-08-21): **STAGE C NOT PASSED — ATTEMPT 6 AUTHORIZATION
-CONSUMED; ATTEMPT 7 PREPARED BUT NOT AUTHORIZED.** Attempt 6 reached real
+Status (2026-08-22): **STAGE C NOT PASSED — ATTEMPT 7 PAID RUN
+COMPLETED SUCCESSFULLY, BUT THE FORMAL EVIDENCE GATE FALSE-FAILED ON
+TOOLING DEFECTS AND MUST BE RERUN (CORRECTED) BEFORE ACCEPTANCE.**
+Attempt 7 (run `8b4a4277-fdf0-41b2-8515-d7e1d50e441b`, Worker execution
+`milo-agent-worker-gggdc`) reached terminal `completed` — the first paid
+run to do so — with 84 model calls, 312,018 tokens, $0.252069 tracked
+actual cost, 0 retries/backpressure events, 84 settled reservations and
+0 dangling. The evidence gate then reported failures caused by three
+confirmed defects in the GATE ITSELF, not by the run (see the Attempt 7
+section below). The operator completed the kill switch: paid execution
+off, both provider aliases absent, API disabled, zero active executions.
+**Stage C remains NOT PASSED until the corrected evidence gate passes
+over this same run (`08-recover-evidence.md`); no second paid run is
+permitted.** Post-run state: `public.runs` holds **exactly 2 run rows**
+(Attempt 6's `37912575-f9ce-4437-893d-7dfa45c53aa9`, terminal `failed`,
+plus Attempt 7's `8b4a4277-…`, terminal `completed` — exactly 1 row under
+the Attempt 7 key), and Cloud Run exposes **exactly 2 visible terminal
+Worker executions** (`milo-agent-worker-mcfrx`, `milo-agent-worker-gggdc`).
+
+Superseded history: Attempt 6 reached real
 paid Worker execution and **failed** (terminal `failed`,
 `RETRY_LIMIT_REACHED` after repeated provider 429s during technical
-enrichment). Two smoke attempts (5 and 6) occurred historically, but
-`public.runs` currently holds **exactly 1 run row** — Attempt 6's
-(`37912575-f9ce-4437-893d-7dfa45c53aa9`); Attempt 5's row
+enrichment). Two smoke attempts (5 and 6) occurred before Attempt 7, but
+before the Attempt 7 launch `public.runs` held **exactly 1 run row** —
+Attempt 6's (`37912575-f9ce-4437-893d-7dfa45c53aa9`); Attempt 5's row
 (`58daa7de-76f5-4359-93e1-3a767c912c20`) is **absent, and the reason for
 its absence is unverified** — no audited deletion is claimed for the
-database row. **2 Worker executions historically occurred** (Attempt 5
+database row. **2 Worker executions occurred before Attempt 7** (Attempt 5
 `milo-agent-worker-d2gfx`, Attempt 6 `milo-agent-worker-mcfrx`), but
-**exactly 1 is currently visible in Cloud Run** — Attempt 5's execution
+exactly 1 of those was still visible in Cloud Run — Attempt 5's execution
 was explicitly deleted at `2026-08-18T02:00:48.774522Z` via
 `google.cloud.run.v1.Executions.DeleteExecution` (proven by Cloud Audit
 Logs). Attempt 6 consumed real
@@ -32,17 +50,22 @@ Current facts:
   (concurrency 100 / RPM 500 / TPM 3,000,000 / TPD unlimited); the pinned
   worker-only operating envelope is deliberately below that ceiling (see
   the provider-envelope section).
-- Production is **reported** fail-closed after the Attempt 6 kill-switch/
-  cleanup cycle, but that posture MUST be re-verified live (read-only)
-  before any deployment or enablement.
-- **Attempt 7 is NOT authorized by this report or by merging the
-  release-preparation PR.** It requires a fresh, separate, explicit
-  operator authorization after: PR merge → CI green → image build →
-  flags-off deployment → read-only posture verification. Exactly ONE new
-  run / ONE new Worker execution over the pinned historical baseline is
-  then allowed, under the fresh idempotency key
-  `stage-c-smoke-attempt-7-20260819` (the consumed `stage-c-smoke-0001`
-  key is never reused).
+- **Attempt 7 was executed under its fresh explicit operator
+  authorization on 2026-08-21 and the paid run COMPLETED** (run
+  `8b4a4277-fdf0-41b2-8515-d7e1d50e441b`, idempotency key
+  `stage-c-smoke-attempt-7-20260819`, Worker execution
+  `milo-agent-worker-gggdc`, succeeded). That one-run authorization is
+  now consumed; **no second paid run is permitted.**
+- Production is fail-closed after the Attempt 7 kill switch completed:
+  worker paid execution off, both provider aliases (`KIMI_API_KEY`,
+  `MOONSHOT_API_KEY`) absent, API run creation off and launcher
+  disabled, zero active executions. The posture MUST still be
+  re-verified live (read-only) before the evidence-recovery procedure.
+- The formal evidence gate FALSE-FAILED on three confirmed tooling
+  defects (see the Attempt 7 section); Stage C acceptance is pending the
+  corrected gate's rerun over the SAME run via `08-recover-evidence.md`
+  — a replay/evidence-only procedure that keeps the worker paid flag
+  false and creates no run and no execution.
 - Stage D remains unauthorized and blocked.
 
 The complete operator toolkit is in
@@ -546,6 +569,82 @@ rows, evidence still requires exactly baseline+1 total rows with exactly
 one row under the Attempt 7 key, and the Cloud Run execution baseline
 stays 1 → 2.
 
+## Stage C attempt 7 (2026-08-21) — PAID RUN COMPLETED; EVIDENCE GATE FALSE-FAILED; KILL SWITCH COMPLETED
+
+Under its fresh explicit operator authorization, Attempt 7 executed the
+one authorized run end-to-end through the canonical path
+API → launcher → Cloud Run worker → real provider → Supabase:
+
+| Quantity | Value |
+| --- | --- |
+| Run | `8b4a4277-fdf0-41b2-8515-d7e1d50e441b` (idempotency key `stage-c-smoke-attempt-7-20260819`) |
+| Worker execution | `milo-agent-worker-gggdc` — **succeeded** |
+| Terminal status | `completed` (the ONLY acceptance-policy PASS state) |
+| Model calls | 84 |
+| Total tokens | 312,018 |
+| Actual tracked cost | $0.252069 (well under the $3.00 hard cap) |
+| Retries / backpressure events | 0 / 0 |
+| Budget reservations | 84 settled, 0 dangling |
+| Database runs (total) | exactly 2 (pinned baseline 1 + this run) |
+| Runs under the Attempt 7 key | exactly 1 |
+| Launch invocations | exactly 1 |
+
+**The formal evidence gate then FALSE-FAILED**: the failures it reported
+were caused by three confirmed defects in the gate tooling itself, not by
+the run. The run's own lifecycle, accounting and safety invariants held.
+The three defects (fixed by this corrective, offline-regression-tested,
+no production mutation):
+
+1. **`probe_db.py` queried a nonexistent `run_invocations.invocation`
+   column.** Migration 006 defines `launcher`/`execution_name`/`payload`/
+   `created_at`; PostgREST answered HTTP 400 with an error OBJECT, and the
+   gate counted that dict as rows (reporting a bogus invocation count).
+   The corrected gate queries the real columns, validates HTTP status and
+   list shape on every collection it reads, and fails closed on any
+   PostgREST error shape.
+2. **The cost reconciliation used an invalid fixed aggregate tolerance
+   (5e-6).** The ledger stores per-call `actual_cost` as `numeric(12,6)`
+   while the reservation rows keep the unrounded per-call cost, so each
+   of the 84 matched calls may legitimately differ by up to 0.0000005 —
+   and the aggregate signed drift of this run is 0.0000088, which the
+   fixed tolerance wrongly rejected (a fixed aggregate bound cannot be
+   right for every call count). The corrected gate performs Decimal-based,
+   `call_seq`-aware one-to-one reconciliation: every settled reservation
+   must match exactly one settled ledger row within the per-row rounding
+   half-ulp; duplicate, missing and unmatched calls are rejected;
+   `run.usage.actual_cost` is compared against the UNROUNDED reservation
+   total (what the worker actually snapshots); and all $3.00/token/call
+   caps remain strict with no tolerance.
+3. **`06-collect-evidence.sh` lost the probe execution name whenever a
+   probe completed nonzero** (`--wait --format='value(metadata.name)'`
+   prints nothing on a nonzero completion), and then issued an invalid
+   EMPTY `execution_name=` logging filter — discarding the structured
+   failure evidence exactly when it mattered. The corrected script
+   launches probes with `--async` (capturing the name BEFORE completion),
+   waits on the named execution via the structured describe verdict
+   (`execution_state.py`), retrieves the structured logs unconditionally
+   for that named execution, and fails clearly if the name cannot be
+   established.
+
+**The kill switch completed successfully after the false failure**
+(treating the gate report at face value, exactly as designed): worker
+paid execution off, both provider aliases absent in every binding form,
+API run creation off and launcher disabled, zero active executions. The
+fail-closed machinery worked; the gate's verdict was wrong.
+
+Consequence: **the paid run completed, but Stage C remains NOT PASSED**
+until the corrected evidence gate passes over this same run. The
+recovery procedure is `scripts/release/stage-c/08-recover-evidence.md` —
+pinned to run `8b4a4277-…` ONLY. It recreates the disposable probes from
+the corrected source, performs the required post-completion idempotent
+replay while the worker paid flag stays `false` and all provider aliases
+stay absent (the launcher also stays `disabled`; a terminal-run replay
+returns the same run id without any launch), proves via the exact-count
+gates that no new run and no new Worker execution was created, reruns
+the evidence gate, restores the full fail-closed posture and deletes the
+probes. **No second paid run is permitted; the Attempt 7 one-run
+authorization is consumed.**
+
 ## Production mutations / current posture
 
 The original automation-identity session performed no writes, but the
@@ -555,44 +654,53 @@ disposable probes were created/deleted/recreated, tightly controlled
 enable/kill/cleanup cycles were used, and — in Attempts 5 and 6 — one
 MILO run and one Worker execution were created per attempt.
 
-**Attempts 5 and 6 each created a MILO run and a Worker execution;
-Attempt 6 reached real paid provider execution and failed.**
+**Attempts 5, 6 and 7 each created a MILO run and a Worker execution;
+Attempt 6 reached real paid execution and failed; Attempt 7 reached real
+paid execution and COMPLETED.**
 
-Reported execution posture after the Attempt 6 kill-switch/cleanup cycle
-(MUST be re-verified live, read-only, before any Attempt 7 deployment or
-enablement):
+Execution posture after the Attempt 7 kill switch completed (MUST be
+re-verified live, read-only, as recovery step R.1 before the evidence
+rerun):
 
 - API: `MILO_ENABLE_RUN_CREATION=false`,
   `JOB_LAUNCHER=disabled`, `MILO_ENABLE_PAID_EXECUTION=false`.
 - Worker: `MILO_ENABLE_PAID_EXECUTION=false`.
-- Worker `KIMI_API_KEY`: unbound.
-- MILO run rows in `public.runs`: **1** (Attempt 6
-  `37912575-f9ce-4437-893d-7dfa45c53aa9`, attempt 6, terminal `failed`,
-  idempotency key `stage-c-smoke-0001`). Two attempts occurred
-  historically, but Attempt 5's row
-  `58daa7de-76f5-4359-93e1-3a767c912c20` is absent; the reason for its
-  absence is unverified (no audited deletion is claimed for the
+- Worker provider aliases (`KIMI_API_KEY`, `MOONSHOT_API_KEY`): absent
+  in every binding form.
+- Active Worker executions: **0**.
+- MILO run rows in `public.runs`: **2** — Attempt 6
+  `37912575-f9ce-4437-893d-7dfa45c53aa9` (terminal `failed`, consumed key
+  `stage-c-smoke-0001`) and Attempt 7
+  `8b4a4277-fdf0-41b2-8515-d7e1d50e441b` (terminal `completed`, key
+  `stage-c-smoke-attempt-7-20260819`). Attempt 5's row
+  `58daa7de-76f5-4359-93e1-3a767c912c20` remains absent; the reason for
+  its absence is unverified (no audited deletion is claimed for the
   database row).
-- Worker executions visible in Cloud Run: **1**, terminal (Attempt 6
-  `milo-agent-worker-mcfrx`). 2 executions historically occurred;
-  Attempt 5's `milo-agent-worker-d2gfx` was explicitly and successfully
-  deleted at `2026-08-18T02:00:48.774522Z`
+- Worker executions visible in Cloud Run: **2**, both terminal
+  (Attempt 6 `milo-agent-worker-mcfrx`, Attempt 7
+  `milo-agent-worker-gggdc`). Attempt 5's `milo-agent-worker-d2gfx` was
+  explicitly and successfully deleted at `2026-08-18T02:00:48.774522Z`
   (`google.cloud.run.v1.Executions.DeleteExecution`, Cloud Audit Logs)
   and is no longer visible.
-- Runs under the Attempt 7 key `stage-c-smoke-attempt-7-20260819`: **0**.
-- Runtime release candidate for Attempt 7 (pinned, to be built/deployed
-  by steps 1–2 after authorization):
+- Runs under the Attempt 7 key `stage-c-smoke-attempt-7-20260819`: **1**
+  (the completed run itself — the key is consumed).
+- Runtime release deployed for Attempt 7:
   `88224bccc836f80f3dc1d173306a1aa63cddcc7a` (merge of PR #50).
-- Disposable `stagec-db-probe` and `stagec-gw-probe` jobs must be
-  recreated before the next Stage C preflight.
+- Disposable `stagec-db-probe` and `stagec-gw-probe` jobs: deleted by the
+  kill-switch/cleanup cycle; recovery step R.2 recreates them from the
+  corrected source, and step R.6 deletes them again.
 
 ## Provider call / token / cost accounting
 
 Attempts 1–5 made **zero provider calls** (Attempt 5 failed at the
 `claim_run_lease` ACL before any Kimi request). Attempt 6 made **25 real
-model calls, 47,380 total tokens, actual tracked cost $0.03976**. The
-Attempt 6 authorization is consumed; the one-run allowance of any future
-Attempt 7 requires fresh explicit operator authorization.
+model calls, 47,380 total tokens, actual tracked cost $0.03976**.
+Attempt 7 made **84 real model calls, 312,018 total tokens, actual
+tracked cost $0.252069** (0 retries, 0 backpressure events, 84 settled
+reservations, 0 dangling) and reached terminal `completed`. Both
+consumed authorizations are spent; **no further paid run is authorized.**
+The operator obligation to verify the actual billed total (tokens AND
+web-search tool fees) in the Moonshot console still applies to Attempt 7.
 
 ## Provider operating envelope (Attempt 7, worker-only)
 
@@ -617,27 +725,33 @@ These settings are applied to the **Worker only** (the API receives no
 
 ## Verdict
 
-- Stage C: **NOT PASSED.** Attempt 6 consumed its authorization on a real
-  paid Worker execution that terminated `failed`
-  (`RETRY_LIMIT_REACHED`); only `completed` counts as Stage C acceptance.
-- This release-preparation PR only pins Attempt 7 tooling: runtime SHA
-  `88224bc…`, fresh idempotency key, exact live baselines (1 database
-  run row / 1 visible terminal execution) and the worker-only provider
-  envelope. **Merging
-  it authorizes nothing** — no build, deployment, secret binding, flag
-  enablement, probe creation, run creation, provider call, Attempt 7 or
-  Stage D.
-- Before any Attempt 7 (after fresh explicit operator authorization):
-  merge + green CI, build the pinned `88224bc…` images, deploy flags-off,
-  verify the read-only posture AND the exact historical baselines live
-  (`03b-verify-stage-c-posture.sh`, DB preflight), enable the exact
-  Stage C worker/API posture, and only then run `05-execute-smoke.sh`
-  **once**.
-- Any failure after run creation consumes the one-run attempt: invoke the
-  kill switch and do not create another paid run without fresh explicit
-  authorization.
-- Stage D remains blocked until a paid run reaches `completed`,
-  `06-collect-evidence.sh` passes all acceptance invariants (including
-  the exact post-run totals of 2 database runs and 2 visible
-  executions), actual provider billing
-  is checked, and step 7 restores the post-smoke fail-closed posture.
+- Stage C: **NOT PASSED (evidence pending).** The Attempt 7 paid run
+  itself COMPLETED (run `8b4a4277-…`, execution
+  `milo-agent-worker-gggdc`, 84 calls / 312,018 tokens / $0.252069, all
+  safety rails held), but the formal evidence gate false-failed on three
+  confirmed tooling defects and its verdict is void. Stage C acceptance
+  requires the CORRECTED gate to pass over this same run.
+- This corrective PR fixes the three gate defects (run_invocations
+  schema + fail-closed PostgREST handling; Decimal call_seq-aware cost
+  reconciliation replacing the invalid fixed aggregate tolerance;
+  execution-name preservation and failure-log retrieval in
+  `06-collect-evidence.sh`), adds offline regression coverage including
+  the exact 84-call rounding fixture, and documents the pinned recovery
+  procedure. **Merging it authorizes nothing beyond the
+  replay/evidence-only recovery in `08-recover-evidence.md`** — no
+  build, deployment, secret binding, paid-flag enablement, new run,
+  provider call or Stage D.
+- After merge, the operator may run `08-recover-evidence.md` for run
+  `8b4a4277-…` ONLY: recreate probes from corrected source, replay and
+  rerun the evidence gate with the worker paid flag `false`, all
+  provider aliases absent and the launcher `disabled`, prove no new
+  run/execution was created, restore full fail-closed posture and delete
+  the probes.
+- The kill switch completed and the Attempt 7 one-run authorization is
+  consumed: **no second paid run is permitted**, whatever the recovery
+  outcome.
+- Stage D remains blocked until the corrected `06-collect-evidence.sh`
+  passes all acceptance invariants over run `8b4a4277-…` (including the
+  exact post-run totals of 2 database runs and 2 visible executions),
+  actual provider billing is checked in the Moonshot console, and the
+  fail-closed posture is re-verified after recovery.

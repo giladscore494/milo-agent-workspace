@@ -22,6 +22,7 @@ import json
 import shutil
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -389,17 +390,19 @@ def happy_dataset():
         "worker_heartbeats": [{"worker_id": "worker-abc", "attempt": 1, "heartbeat_at": "2026-08-13T00:09:50Z"}],
         "model_call_budget_reservations": [
             {"call_seq": i, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": 0.001}
-            for i in range(20)
+            for i in range(1, 21)
         ],
         "run_usage_ledger": [
             {"decision": "settled", "call_seq": i, "actual_input_tokens": 50, "actual_output_tokens": 25, "actual_cost": 0.001, "estimated_cost": 0.02}
-            for i in range(20)
+            for i in range(1, 21)
         ],
-        "run_invocations": [{"created_at": "2026-08-13T00:00:01Z", "invocation": {}}],
+        # Real migration-006 columns (launcher/execution_name/created_at) —
+        # the table has NO `invocation` column.
+        "run_invocations": [{"created_at": "2026-08-13T00:00:01Z", "launcher": "cloud_run", "execution_name": "milo-agent-worker-gggdc"}],
     }
 
 
-def wire_evidence(db, monkeypatch, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS):
+def wire_evidence(db, monkeypatch, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS, errors=None):
     monkeypatch.setenv("STAGE_C_RUN_ID", "run-1")
     monkeypatch.setenv("STAGE_C_CAPS", CAPS)
     monkeypatch.setenv("STAGE_C_EXPECTED_TERMINAL_STATES", "completed")
@@ -412,6 +415,8 @@ def wire_evidence(db, monkeypatch, data, total_runs=2, key_runs=1, prior=EXPECTE
     def fake_call(method, path, body=None, headers=None):
         for table in ("runs", "run_events", "run_checkpoints", "worker_heartbeats", "model_call_budget_reservations", "run_usage_ledger", "run_invocations"):
             if f"/rest/v1/{table}?" in path:
+                if errors and table in errors:
+                    return errors[table]
                 return 200, data[table]
         return 200, []
 
@@ -443,8 +448,8 @@ def test_evidence_gate_passes_on_exactly_one_new_run_over_the_baseline(db, monke
     assert verdict["runs_with_current_key"] == 1
 
 
-def evidence_must_fail(db, monkeypatch, capsys, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS):
-    wire_evidence(db, monkeypatch, data, total_runs=total_runs, key_runs=key_runs, prior=prior)
+def evidence_must_fail(db, monkeypatch, capsys, data, total_runs=2, key_runs=1, prior=EXPECTED_PRIOR_RUNS, errors=None):
+    wire_evidence(db, monkeypatch, data, total_runs=total_runs, key_runs=key_runs, prior=prior, errors=errors)
     with pytest.raises(SystemExit) as excinfo:
         db.evidence()
     assert excinfo.value.code == 1
@@ -524,9 +529,9 @@ def test_evidence_fails_on_token_cap_violation(db, monkeypatch, capsys):
 
 def test_evidence_fails_on_accounting_mismatch(db, monkeypatch, capsys):
     data = happy_dataset()
-    data["runs"][0]["usage"]["actual_cost"] = 0.9  # ledger says 0.02
+    data["runs"][0]["usage"]["actual_cost"] = 0.9  # reservations say 0.02
     verdict = evidence_must_fail(db, monkeypatch, capsys, data)
-    assert any("ledger cost" in f for f in verdict["failures"])
+    assert any("unrounded reservation total" in f for f in verdict["failures"])
 
 
 def test_evidence_fails_on_attempt_or_heartbeat_invariants(db, monkeypatch, capsys):
@@ -559,8 +564,208 @@ def test_evidence_fails_closed_without_expected_caps(db, monkeypatch, capsys):
 
 def test_evidence_fails_on_duplicate_launch_invocation(db, monkeypatch, capsys):
     data = happy_dataset()
-    data["run_invocations"].append({"created_at": "2026-08-13T00:00:02Z", "invocation": {}})
+    data["run_invocations"].append({"created_at": "2026-08-13T00:00:02Z", "launcher": "cloud_run", "execution_name": "milo-agent-worker-zzzzz"})
     evidence_must_fail(db, monkeypatch, capsys, data)
+
+
+# ---------------------------------------------------------------------------
+# Attempt 7 corrective — defect 1: run_invocations schema + PostgREST error
+# shapes must fail closed, never masquerade as row collections
+# ---------------------------------------------------------------------------
+
+
+# The real PostgREST answer to the old `select=created_at,invocation` query:
+# migration 006 defines launcher/execution_name/payload/created_at — there
+# is NO `invocation` column. len() of this dict is 4, which the old gate
+# reported as "run_invocations=4, expected exactly 1".
+PGRST_MISSING_COLUMN_ERROR = (400, {
+    "code": "42703",
+    "details": None,
+    "hint": None,
+    "message": "column run_invocations.invocation does not exist",
+})
+
+
+def test_evidence_queries_only_real_run_invocations_columns(db):
+    source = (STAGE_C / "probe_db.py").read_text()
+    assert "run_invocations?run_id=eq.{run_id}&select=launcher,execution_name,created_at" in source
+    assert "select=created_at,invocation" not in source
+
+
+def test_evidence_fails_closed_on_run_invocations_postgrest_error(db, monkeypatch, capsys):
+    verdict = evidence_must_fail(
+        db, monkeypatch, capsys, happy_dataset(),
+        errors={"run_invocations": PGRST_MISSING_COLUMN_ERROR},
+    )
+    assert any("fail-closed: run_invocations query" in f and "42703" in f for f in verdict["failures"])
+    # The error dict must never be counted as rows (the old defect produced
+    # a bogus "run_invocations=4" from len() of the 4-key error object).
+    assert not any(f.startswith("run_invocations=") for f in verdict["failures"])
+    assert "invocations" not in verdict
+
+
+@pytest.mark.parametrize("table", ["run_usage_ledger", "model_call_budget_reservations", "run_events", "worker_heartbeats"])
+def test_evidence_fails_closed_on_any_postgrest_error_shape(db, monkeypatch, capsys, table):
+    verdict = evidence_must_fail(
+        db, monkeypatch, capsys, happy_dataset(),
+        errors={table: (500, {"message": "canceling statement due to statement timeout"})},
+    )
+    assert any(f"fail-closed: {table} query" in f for f in verdict["failures"])
+
+
+def test_evidence_fails_closed_on_non_list_success_body(db, monkeypatch, capsys):
+    """Even an HTTP 200 body that is not a row list must never be counted."""
+    verdict = evidence_must_fail(
+        db, monkeypatch, capsys, happy_dataset(),
+        errors={"run_invocations": (200, {"status": "ok"})},
+    )
+    assert any("fail-closed: run_invocations query" in f for f in verdict["failures"])
+
+
+# ---------------------------------------------------------------------------
+# Attempt 7 corrective — defect 2: Decimal, call_seq-aware one-to-one cost
+# reconciliation (the exact production 84-call rounding shape must PASS;
+# tampering, duplicates and missing calls must FAIL; caps stay strict)
+# ---------------------------------------------------------------------------
+
+
+def attempt7_rounding_dataset():
+    """The exact 84-call Attempt 7 rounding shape (run 8b4a4277-…).
+
+    Reservation rows hold the UNROUNDED per-call costs (plain numeric,
+    migration 015); each settled ledger row holds the SAME cost rounded to
+    6 decimals (numeric(12,6), migration 013). 22 calls carry a per-row
+    rounding drift of +0.0000004 — every row within the 0.0000005
+    half-ulp — so the aggregate signed drift is +0.0000088, larger than
+    the old fixed 5e-6 aggregate tolerance: the old gate false-failed on
+    exactly this legitimate production shape. run.usage.actual_cost is the
+    worker's unrounded running total rounded once (0.252069); tokens
+    total 312,018 over 84 calls.
+    """
+    unrounded, rounded = {}, {}
+    for seq in range(1, 85):
+        if seq <= 22:
+            unrounded[seq], rounded[seq] = 0.0029996, 0.003000
+        elif seq <= 83:
+            unrounded[seq], rounded[seq] = 0.003001, 0.003001
+        else:
+            unrounded[seq], rounded[seq] = 0.0030168, 0.0030168
+    data = happy_dataset()
+    data["runs"][0]["usage"] = {
+        "model_calls": 84,
+        "input_tokens": 252_000,
+        "output_tokens": 60_018,
+        "total_tokens": 312_018,
+        "actual_cost": 0.252069,
+    }
+    data["model_call_budget_reservations"] = [
+        {"call_seq": seq, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": unrounded[seq]}
+        for seq in range(1, 85)
+    ]
+    data["run_usage_ledger"] = [
+        {"decision": "reserved", "call_seq": seq, "actual_input_tokens": None, "actual_output_tokens": None, "actual_cost": None, "estimated_cost": 0.02}
+        for seq in range(1, 85)
+    ] + [
+        {"decision": "settled", "call_seq": seq, "actual_input_tokens": 3000, "actual_output_tokens": 715 if seq <= 42 else 714, "actual_cost": rounded[seq], "estimated_cost": None}
+        for seq in range(1, 85)
+    ]
+    return data
+
+
+def test_attempt_7_production_rounding_shape_passes(db, monkeypatch, capsys):
+    wire_evidence(db, monkeypatch, attempt7_rounding_dataset())
+    db.evidence()
+    verdict = gate_output(db, capsys)
+    assert verdict["ok"] is True, verdict["failures"]
+    assert verdict["failures"] == []
+    assert verdict["matched_calls"] == 84
+    assert verdict["settled_cost_sum"] == "0.2520690"      # unrounded reservation total
+    assert verdict["ledger_actual_cost_sum"] == "0.2520778"  # per-row 6-dp rounded total
+
+
+def test_attempt_7_shape_exceeds_the_old_aggregate_tolerance(db):
+    """Documents the false failure: the legitimate aggregate signed drift
+    (0.0000088) is larger than the removed fixed 5e-6 tolerance, and no
+    fixed aggregate tolerance can be right for every call count."""
+    drift = Decimal("0.2520778") - Decimal("0.2520690")
+    assert drift == Decimal("0.0000088")
+    assert drift > Decimal("0.000005")
+    assert not hasattr(db, "COST_TOLERANCE")
+
+
+def test_reconciliation_rejects_tampering_beyond_per_row_rounding(db, monkeypatch, capsys):
+    """A ledger row moved by just 2 ulps of the 7th decimal — far below the
+    old aggregate tolerance — is beyond legitimate 6-dp rounding and fails."""
+    data = attempt7_rounding_dataset()
+    settled = [r for r in data["run_usage_ledger"] if r["decision"] == "settled"]
+    assert settled[0]["call_seq"] == 1
+    settled[0]["actual_cost"] = 0.003001  # reservation 0.0029996 → drift 0.0000014
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("call_seq 1" in f and "rounding tolerance" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_gross_tampering(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    settled = [r for r in data["run_usage_ledger"] if r["decision"] == "settled"]
+    settled[-1]["actual_cost"] = 0.01
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("call_seq 84" in f and "rounding tolerance" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_duplicate_ledger_call_seq(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    data["run_usage_ledger"].append({"decision": "settled", "call_seq": 5, "actual_input_tokens": 0, "actual_output_tokens": 0, "actual_cost": 0.003, "estimated_cost": None})
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("duplicate settled ledger row for call_seq 5" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_duplicate_reservation_call_seq(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    data["model_call_budget_reservations"].append({"call_seq": 5, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": 0.003001})
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("duplicate reservation for call_seq 5" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_missing_ledger_call(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    data["run_usage_ledger"] = [r for r in data["run_usage_ledger"] if not (r["decision"] == "settled" and r["call_seq"] == 7)]
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("missing a settled ledger row: [7]" in f for f in verdict["failures"])
+
+
+def test_reconciliation_rejects_unmatched_ledger_call(db, monkeypatch, capsys):
+    data = attempt7_rounding_dataset()
+    data["run_usage_ledger"].append({"decision": "settled", "call_seq": 999, "actual_input_tokens": 0, "actual_output_tokens": 0, "actual_cost": 0.003, "estimated_cost": None})
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("without a settled reservation: [999]" in f for f in verdict["failures"])
+
+
+def test_usage_total_is_compared_to_the_unrounded_reservation_total(db, monkeypatch, capsys):
+    """Rewriting run.usage to the per-row-ROUNDED ledger sum (0.2520778)
+    must fail: the worker snapshots the unrounded running total, so only
+    0.252069 is consistent — this is the comparison the old gate got
+    backwards by comparing usage to the ledger sum."""
+    data = attempt7_rounding_dataset()
+    data["runs"][0]["usage"]["actual_cost"] = 0.252078
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("unrounded reservation total" in f for f in verdict["failures"])
+
+
+def test_cost_caps_stay_strict_with_no_rounding_tolerance(db, monkeypatch, capsys):
+    """One micro-dollar over the $3.00 cap fails — reconciliation tolerances
+    never loosen the caps."""
+    data = attempt7_rounding_dataset()
+    over = 3.000001
+    data["runs"][0]["usage"]["actual_cost"] = over
+    data["model_call_budget_reservations"] = [
+        {"call_seq": 1, "attempt": 1, "status": "settled", "estimated_cost": 0.02, "actual_cost": over}
+    ]
+    data["run_usage_ledger"] = [
+        {"decision": "settled", "call_seq": 1, "actual_input_tokens": 3000, "actual_output_tokens": 714, "actual_cost": over, "estimated_cost": None}
+    ]
+    data["runs"][0]["usage"].update({"model_calls": 1, "input_tokens": 3000, "output_tokens": 714, "total_tokens": 3714})
+    verdict = evidence_must_fail(db, monkeypatch, capsys, data)
+    assert any("exceeds cap" in f for f in verdict["failures"])
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +1098,128 @@ def test_stage_c_log_collection_handles_structured_and_text_payloads():
 
 
 # ---------------------------------------------------------------------------
+# Attempt 7 corrective — defect 3: a probe execution that completes nonzero
+# must never lose its execution name; its structured failure logs are
+# retrieved anyway, and an unestablishable name fails clearly instead of
+# issuing an invalid empty logging filter
+# ---------------------------------------------------------------------------
+
+
+ATTEMPT7_RUN_ID = "8b4a4277-fdf0-41b2-8515-d7e1d50e441b"
+
+# Mock gcloud: the evidence probe execution completes NONZERO (terminal
+# Completed=False) — the exact case where the old `--wait` form lost
+# exec_name — while Cloud Logging still holds its structured failure line.
+FAILED_PROBE_GCLOUD = r'''#!/usr/bin/env bash
+{ printf '%s\x1f' "$@"; printf '\n'; } >> "__LOG__"
+case "$*" in
+  *"run jobs execute"*)
+    echo "stagec-db-probe-fail1"
+    ;;
+  *"run jobs executions describe"*)
+    echo '{"metadata":{"name":"stagec-db-probe-fail1"},"status":{"completionTime":"2026-08-21T00:00:00Z","conditions":[{"type":"Completed","status":"False"}]}}'
+    ;;
+  *"logging read"*)
+    echo '[{"textPayload":"{\"stage_c_probe\": \"evidence\", \"ok\": false, \"failures\": [\"total_runs=3, expected exactly 2 (the pinned prior baseline of 1 plus exactly one new authorized run)\"]}"}]'
+    ;;
+esac
+exit 0
+'''
+
+# Mock gcloud: execution creation itself fails — no name can ever be
+# established, so the gate must refuse clearly and issue NO logging call.
+NO_NAME_GCLOUD = r'''#!/usr/bin/env bash
+{ printf '%s\x1f' "$@"; printf '\n'; } >> "__LOG__"
+case "$*" in
+  *"run jobs execute"*)
+    echo "ERROR: (gcloud.run.jobs.execute) job not found" >&2
+    exit 1
+    ;;
+esac
+exit 0
+'''
+
+
+def run_collect_evidence(tmp_path, mock_gcloud_script):
+    bin_dir = tmp_path / "mockbin"
+    bin_dir.mkdir()
+    log = tmp_path / "gcloud-args.log"
+    mock = bin_dir / "gcloud"
+    mock.write_text(mock_gcloud_script.replace("__LOG__", str(log)))
+    mock.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(STAGE_C / "06-collect-evidence.sh"), ATTEMPT7_RUN_ID],
+        capture_output=True,
+        text=True,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        timeout=120,
+    )
+    calls = log.read_text().splitlines() if log.exists() else []
+    return result, [c.split("\x1f") for c in calls]
+
+
+def test_failed_probe_execution_keeps_its_name_and_its_structured_failure_logs(tmp_path):
+    result, calls = run_collect_evidence(tmp_path, FAILED_PROBE_GCLOUD)
+    # The gate fails (the probe reported failures) — but with evidence.
+    assert result.returncode != 0
+    assert "DB evidence gate reported failures" in result.stdout
+    # The probe's structured failure record was retrieved and surfaced.
+    assert '"ok": false' in result.stdout
+    assert "total_runs=3" in result.stdout
+    # The logging filter used the preserved execution name — never empty.
+    logging_calls = [c for c in calls if "logging" in c and "read" in c]
+    assert logging_calls, "no log retrieval happened for the failed probe"
+    filters = "\x1f".join(logging_calls[0])
+    assert 'execution_name"=stagec-db-probe-fail1' in filters
+    assert 'execution_name"=\x1f' not in filters and not filters.rstrip().endswith('execution_name"=')
+    # The terminal verdict came from the structured describe, not a lost
+    # gcloud exit status.
+    assert any("describe" in c for c in calls)
+
+
+def test_unestablishable_execution_name_fails_clearly_with_no_empty_filter(tmp_path):
+    result, calls = run_collect_evidence(tmp_path, NO_NAME_GCLOUD)
+    assert result.returncode != 0
+    assert "could not establish the execution name" in result.stderr
+    # No logging read may ever be issued without an execution name (the
+    # old defect issued an invalid empty `execution_name=` filter).
+    assert not any("logging" in c and "read" in c for c in calls)
+
+
+def test_collect_evidence_launches_probes_async_and_waits_on_the_named_execution():
+    text = (STAGE_C / "06-collect-evidence.sh").read_text()
+    assert "--async --format='value(metadata.name)'" in text
+    code_lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    assert not any("--wait" in line for line in code_lines)
+    assert "wait_for_probe_execution" in text
+    assert "execution_state.py" in text
+    assert "could not establish the execution name" in text
+
+
+@pytest.mark.parametrize("payload,expected", [
+    (json.dumps({"metadata": {"name": "e1"}, "status": {"conditions": [{"type": "Completed", "status": "True"}]}}), "succeeded"),
+    (json.dumps({"metadata": {"name": "e1"}, "status": {"conditions": [{"type": "Completed", "status": "False"}], "completionTime": "2026-08-21T00:00:00Z"}}), "failed"),
+    # Terminal without a positive Completed condition: fail-safe as failed.
+    (json.dumps({"status": {"completionTime": "2026-08-21T00:00:00Z"}}), "failed"),
+    (json.dumps({"status": {"conditions": [{"type": "Completed", "status": "Unknown"}]}}), "running"),
+    (json.dumps({"status": {}}), "running"),
+    (json.dumps(None), "running"),
+    ("not json at all", "running"),
+])
+def test_execution_state_verdicts_are_fail_safe(payload, expected):
+    result = subprocess.run(
+        [sys.executable, str(STAGE_C / "execution_state.py")],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin"},
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+# ---------------------------------------------------------------------------
 # stage-c-env.sh: authorized constants are pinned; inherited shell values
 # cannot widen or redirect the authorization
 # ---------------------------------------------------------------------------
@@ -1137,6 +1464,55 @@ def test_acceptance_doc_does_not_call_three_dollars_a_hard_billing_ceiling():
     assert "Blocking deployment-consistency finding" in text
 
 
+def test_acceptance_doc_records_attempt_7_truthfully():
+    """The paid run completed, the gate false-failed, the kill switch
+    completed — and Stage C is still NOT PASSED with no second run."""
+    text = (REPO / "docs" / "production-readiness" / "STAGE_C_ACCEPTANCE.md").read_text()
+    assert "8b4a4277-fdf0-41b2-8515-d7e1d50e441b" in text
+    assert "milo-agent-worker-gggdc" in text
+    assert "FALSE-FAILED" in text
+    assert "STAGE C NOT PASSED" in text
+    assert "$0.252069" in text
+    assert "312,018" in text
+    assert "no second paid run is permitted" in text.lower()
+    assert "kill switch" in text.lower()
+    assert "08-recover-evidence.md" in text
+    # The report must never claim the acceptance evidence passed.
+    assert "STAGE C PASSED" not in text
+
+
+def test_recovery_runbook_is_pinned_and_fail_closed():
+    """08-recover-evidence.md: manual-only, ONE pinned RUN_ID, worker paid
+    flag and provider aliases untouched, launcher stays disabled, restore
+    + probe deletion + exact-count proofs present, and no committed
+    executable line pairs an execution flag with an enabled value."""
+    text = (STAGE_C / "08-recover-evidence.md").read_text()
+    assert "REQUIRES_MANUAL_OPERATOR_CONFIGURATION" in text
+    assert text.count('RUN_ID="8b4a4277-fdf0-41b2-8515-d7e1d50e441b"') == 1
+    # Fail-closed invariants.
+    assert 'MILO_ENABLE_PAID_EXECUTION") == "false"' in text
+    assert "MOONSHOT_API_KEY" in text and "KIMI_API_KEY" in text
+    assert 'JOB_LAUNCHER") == "disabled"' in text
+    # Exact-count proofs: post-run baseline is 2 runs / 2 executions.
+    assert text.count("--expected-total 2") == 2
+    assert "06-collect-evidence.sh" in text
+    # The only enablement is the manual replay-surface flag via the
+    # operator-run-time STAGE_C_ON indirection (03-enable pattern): the
+    # literal enable value never appears in a committed line.
+    assert 'MILO_ENABLE_RUN_CREATION=${STAGE_C_ON}' in text
+    assert "MILO_ENABLE_RUN_CREATION=true" not in text
+    assert "MILO_ENABLE_PAID_EXECUTION=${STAGE_C_ON}" not in text
+    assert "MILO_ENABLE_PAID_EXECUTION=true" not in text
+    assert "--update-secrets" not in text  # never binds a provider key
+    # Restore + cleanup.
+    assert "MILO_ENABLE_RUN_CREATION=false" in text
+    assert "kill-switch.sh" in text
+    assert text.count("jobs delete") == 2
+    # It must never invoke the paid-run path.
+    assert "05-execute-smoke.sh" not in text
+    assert "STAGE_C_MODE=create" not in text
+
+
 # ---------------------------------------------------------------------------
 # verify_executions.py: exact Worker-execution baseline gate (Attempt 7 —
 # 1 VISIBLE terminal historical execution before the run, 2 after;
@@ -1298,13 +1674,15 @@ def test_acceptance_doc_distinguishes_occurred_from_visible_executions():
     text = acceptance_doc()
     assert "milo-agent-worker-d2gfx" in text
     assert "milo-agent-worker-mcfrx" in text
-    assert "2 Worker executions historically occurred" in text
+    assert "2 Worker executions occurred before Attempt 7" in text
     assert "2026-08-18T02:00:48" in text
     assert "google.cloud.run.v1.Executions.DeleteExecution" in text
-    assert "exactly 1 is currently visible in Cloud Run" in text
+    # Post-Attempt-7 visible posture: exactly 2 (Attempts 6 + 7); Attempt
+    # 5's deleted execution is still never counted as visible.
+    assert "Worker executions visible in Cloud Run: **2**" in text
+    assert "no longer visible" in text
     # The superseded both-executions-preserved claims are gone.
     assert "Worker executions: **2**, both terminal (historical, preserved)" not in text
-    assert "2 terminal Worker executions**" not in text
     assert "is never cancelled or deleted" not in text
 
 

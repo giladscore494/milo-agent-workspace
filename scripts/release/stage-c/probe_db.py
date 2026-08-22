@@ -33,6 +33,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from decimal import Decimal, InvalidOperation
 
 BASE = os.environ["SUPABASE_URL"].rstrip("/")
 KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
@@ -356,7 +357,136 @@ REQUIRED_CAP_KEYS = (
     "MILO_MAX_COST_PER_RUN",
 )
 
-COST_TOLERANCE = 5e-6  # ledger/usage values are rounded to 6 decimal places
+# Per-call rounding tolerance for the ledger↔reservation reconciliation.
+# The ledger stores actual_cost as numeric(12,6) (migration 013), so each
+# settled ledger row is the 6-decimal rounding of the UNROUNDED per-call
+# cost the worker settled into its reservation row (plain numeric,
+# migration 015). Half an ulp of that rounding is the largest legitimate
+# per-row difference; anything larger is tampering or corruption. There is
+# deliberately NO fixed aggregate tolerance: signed per-row rounding drift
+# accumulates with the call count (production Attempt 7: 84 calls,
+# per-row drift ≤ 0.0000005, aggregate signed drift 0.0000088), so an
+# aggregate bound is either too loose for small runs or false-fails large
+# ones — the reconciliation is one-to-one by call_seq instead.
+PER_CALL_ROUNDING_TOLERANCE = Decimal("0.0000005")
+# run.usage.actual_cost is the worker's float running total rounded ONCE
+# to 6 decimals; compare it against the UNROUNDED reservation total
+# quantized to the same 6 decimals, allowing one unit in the last place
+# for the float-accumulation/rounding-mode boundary.
+USAGE_TOTAL_TOLERANCE = Decimal("0.000001")
+
+
+def to_decimal(value: object) -> Decimal | None:
+    """Exact Decimal for a PostgREST-serialized numeric/float, else None."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def fetch_rows(path: str, label: str, failures: list[str]) -> list[dict] | None:
+    """GET a PostgREST collection, failing closed on anything but rows.
+
+    A PostgREST error (missing column, bad filter, RLS denial, …) answers
+    with a non-200 status and a JSON error OBJECT. Treating that dict as a
+    row collection silently corrupts every downstream count and scan, so a
+    non-200 status, a non-list body or a non-dict element records a
+    fail-closed failure and returns None — never the error body.
+    """
+    status, body = call("GET", path)
+    if status != 200 or not isinstance(body, list) or not all(isinstance(row, dict) for row in body):
+        detail = ""
+        if isinstance(body, dict):
+            error_fields = {k: body[k] for k in ("code", "message", "hint") if k in body}
+            if error_fields:
+                detail = f" PostgREST error: {json.dumps(error_fields, default=str)[:300]}"
+        failures.append(
+            f"fail-closed: {label} query did not return a row list (HTTP {status}).{detail}"
+        )
+        return None
+    return body
+
+
+def reconcile_costs(reservations: list[dict], ledger: list[dict], usage_cost: Decimal | None, failures: list[str]) -> dict:
+    """Decimal-based, call_seq-aware one-to-one cost reconciliation.
+
+    Matches every settled/overage reservation row to exactly one settled
+    ledger row by call_seq and verifies each pair within the 6-decimal
+    per-row rounding tolerance. Rejects duplicate, missing and unmatched
+    call_seq values on either side and any per-row difference beyond the
+    rounding half-ulp. run.usage.actual_cost is compared against the
+    UNROUNDED reservation total (the same running total the worker
+    snapshots), never against the per-row-rounded ledger sum. Appends
+    failures in place; returns the Decimal sums for evidence output and
+    for the strict cap checks.
+    """
+    reservation_costs: dict[int, Decimal] = {}
+    for row in reservations:
+        if row.get("status") not in ("settled", "overage"):
+            continue
+        seq = row.get("call_seq")
+        if not isinstance(seq, int):
+            failures.append(f"reservation row has invalid call_seq {seq!r} — cannot reconcile; failing closed")
+            continue
+        if seq in reservation_costs:
+            failures.append(f"duplicate reservation for call_seq {seq} — reconciliation is ambiguous")
+            continue
+        cost = to_decimal(row.get("actual_cost"))
+        if cost is None:
+            failures.append(f"settled reservation call_seq {seq} has no numeric actual_cost — failing closed")
+            continue
+        reservation_costs[seq] = cost
+
+    ledger_costs: dict[int, Decimal] = {}
+    for row in ledger:
+        if row.get("decision") != "settled":
+            continue
+        seq = row.get("call_seq")
+        if not isinstance(seq, int):
+            failures.append(f"settled ledger row has invalid call_seq {seq!r} — cannot reconcile; failing closed")
+            continue
+        if seq in ledger_costs:
+            failures.append(f"duplicate settled ledger row for call_seq {seq} — reconciliation is ambiguous")
+            continue
+        # A zero-cost call may legitimately ledger actual_cost as NULL;
+        # normalizing to 0 keeps it comparable while any nonzero
+        # reservation cost still exceeds the tolerance and fails.
+        ledger_costs[seq] = to_decimal(row.get("actual_cost")) or Decimal(0)
+
+    missing_in_ledger = sorted(set(reservation_costs) - set(ledger_costs))
+    if missing_in_ledger:
+        failures.append(f"settled reservation call_seq(s) missing a settled ledger row: {missing_in_ledger[:20]}")
+    missing_in_reservations = sorted(set(ledger_costs) - set(reservation_costs))
+    if missing_in_reservations:
+        failures.append(f"settled ledger call_seq(s) without a settled reservation: {missing_in_reservations[:20]}")
+
+    for seq in sorted(set(reservation_costs) & set(ledger_costs)):
+        drift = ledger_costs[seq] - reservation_costs[seq]
+        if abs(drift) > PER_CALL_ROUNDING_TOLERANCE:
+            failures.append(
+                f"call_seq {seq}: ledger actual_cost {ledger_costs[seq]} differs from reservation "
+                f"actual_cost {reservation_costs[seq]} by {drift} — beyond the 6-decimal per-row "
+                f"rounding tolerance {PER_CALL_ROUNDING_TOLERANCE}"
+            )
+
+    reservation_total = sum(reservation_costs.values(), Decimal(0))
+    ledger_total = sum(ledger_costs.values(), Decimal(0))
+    if usage_cost is None:
+        failures.append("run.usage actual_cost is missing or not numeric — failing closed")
+    else:
+        expected_usage = reservation_total.quantize(Decimal("0.000001"))
+        if abs(usage_cost - expected_usage) > USAGE_TOTAL_TOLERANCE:
+            failures.append(
+                f"run.usage actual_cost {usage_cost} != unrounded reservation total {reservation_total} "
+                f"(rounded {expected_usage}, tolerance {USAGE_TOTAL_TOLERANCE})"
+            )
+    return {
+        "matched_calls": len(set(reservation_costs) & set(ledger_costs)),
+        "reservation_total_unrounded": reservation_total,
+        "ledger_total": ledger_total,
+    }
 
 
 def expected_caps() -> dict[str, str]:
@@ -396,14 +526,16 @@ def evidence() -> None:
         failures.append(f"fail-closed: expected cap values missing from STAGE_C_CAPS: {missing_caps}")
 
     # Run row (lease token excluded from output).
-    _, rows = call(
-        "GET",
+    rows = fetch_rows(
         f"/rest/v1/runs?id=eq.{run_id}"
         "&select=id,status,attempt,worker_id,launch_state,started_at,finished_at,"
         "last_heartbeat_at,lease_expires_at,usage,error,requested_by,idempotency_key",
+        "runs",
+        failures,
     )
     if not rows:
-        print(json.dumps({"stage_c_probe": "evidence", "ok": False, "failures": ["run row not found"], "operator_action": KILL_SWITCH_ACTION}))
+        failures.append("run row not found")
+        print(json.dumps({"stage_c_probe": "evidence", "ok": False, "failures": failures, "operator_action": KILL_SWITCH_ACTION}))
         sys.exit(1)
     run = rows[0]
     out["run"] = run
@@ -458,7 +590,7 @@ def evidence() -> None:
         failures.append(f"launch_state={run.get('launch_state')!r}, expected 'launched'")
 
     # Lifecycle events + secret-leak scan (counts only; no values printed).
-    _, events = call("GET", f"/rest/v1/run_events?run_id=eq.{run_id}&select=event_type,agent,phase,created_at,payload&order=id.asc")
+    events = fetch_rows(f"/rest/v1/run_events?run_id=eq.{run_id}&select=event_type,agent,phase,created_at,payload&order=id.asc", "run_events", failures)
     out["event_count"] = len(events or [])
     out["event_types"] = [e["event_type"] for e in (events or [])]
     if not events:
@@ -470,11 +602,11 @@ def evidence() -> None:
         failures.append(f"secret markers found in DB events: {sorted(hits)}")
 
     # Checkpoints (evidence only).
-    _, checkpoints = call("GET", f"/rest/v1/run_checkpoints?run_id=eq.{run_id}&select=phase,attempt,created_at&order=created_at.asc")
+    checkpoints = fetch_rows(f"/rest/v1/run_checkpoints?run_id=eq.{run_id}&select=phase,attempt,created_at&order=created_at.asc", "run_checkpoints", failures)
     out["checkpoints"] = [c["phase"] for c in (checkpoints or [])]
 
     # Heartbeats must exist and match the claiming worker/attempt.
-    _, beats = call("GET", f"/rest/v1/worker_heartbeats?run_id=eq.{run_id}&select=worker_id,attempt,heartbeat_at&order=heartbeat_at.desc")
+    beats = fetch_rows(f"/rest/v1/worker_heartbeats?run_id=eq.{run_id}&select=worker_id,attempt,heartbeat_at&order=heartbeat_at.desc", "worker_heartbeats", failures)
     beats = beats or []
     out["heartbeat_count"] = len(beats)
     out["latest_heartbeat"] = beats[0] if beats else {}
@@ -487,7 +619,7 @@ def evidence() -> None:
             failures.append("latest heartbeat attempt does not match the run attempt")
 
     # Budget reservations: all settled, zero dangling.
-    _, reservations = call("GET", f"/rest/v1/model_call_budget_reservations?run_id=eq.{run_id}&select=call_seq,attempt,status,estimated_cost,actual_cost")
+    reservations = fetch_rows(f"/rest/v1/model_call_budget_reservations?run_id=eq.{run_id}&select=call_seq,attempt,status,estimated_cost,actual_cost", "model_call_budget_reservations", failures)
     reservations = reservations or []
     by_status: dict[str, int] = {}
     for r in reservations:
@@ -500,25 +632,22 @@ def evidence() -> None:
     unexpected_statuses = sorted(set(by_status) - {"settled", "overage", "released"})
     if unexpected_statuses:
         failures.append(f"unexpected reservation status(es): {unexpected_statuses}")
-    out["reserved_cost_sum"] = round(sum(float(r["estimated_cost"] or 0) for r in reservations), 6)
-    settled_cost_sum = round(sum(float(r["actual_cost"] or 0) for r in reservations if r["status"] in ("settled", "overage")), 6)
-    out["settled_cost_sum"] = settled_cost_sum
+    out["reserved_cost_sum"] = str(sum((to_decimal(r.get("estimated_cost")) or Decimal(0) for r in reservations), Decimal(0)))
 
-    # Usage ledger decisions and sums.
-    _, ledger = call("GET", f"/rest/v1/run_usage_ledger?run_id=eq.{run_id}&select=decision,call_seq,actual_input_tokens,actual_output_tokens,actual_cost,estimated_cost")
+    # Usage ledger decisions and token sums.
+    ledger = fetch_rows(f"/rest/v1/run_usage_ledger?run_id=eq.{run_id}&select=decision,call_seq,actual_input_tokens,actual_output_tokens,actual_cost,estimated_cost", "run_usage_ledger", failures)
     ledger = ledger or []
     decisions: dict[str, int] = {}
     for row in ledger:
         decisions[row["decision"]] = decisions.get(row["decision"], 0) + 1
     out["ledger_decisions"] = decisions
-    ledger_cost = round(sum(float(r["actual_cost"] or 0) for r in ledger), 6)
     ledger_input = sum(int(r["actual_input_tokens"] or 0) for r in ledger)
     ledger_output = sum(int(r["actual_output_tokens"] or 0) for r in ledger)
-    out["ledger_actual_cost_sum"] = ledger_cost
     out["ledger_input_tokens"] = ledger_input
     out["ledger_output_tokens"] = ledger_output
 
-    # Reservation / ledger / run-usage accounting consistency.
+    # Reservation / ledger / run-usage accounting consistency: Decimal,
+    # call_seq-aware, one-to-one (see reconcile_costs).
     usage = run.get("usage")
     if isinstance(usage, str):
         try:
@@ -528,24 +657,28 @@ def evidence() -> None:
     if not isinstance(usage, dict):
         failures.append("run.usage snapshot missing — cannot verify caps; failing closed")
         usage = {}
-    if abs(settled_cost_sum - ledger_cost) > COST_TOLERANCE:
-        failures.append(f"reservation settled cost {settled_cost_sum} != ledger cost {ledger_cost}")
-    usage_cost = float(usage.get("actual_cost") or 0)
-    if abs(usage_cost - ledger_cost) > COST_TOLERANCE:
-        failures.append(f"run.usage actual_cost {usage_cost} != ledger cost {ledger_cost}")
+    usage_cost = to_decimal(usage.get("actual_cost"))
+    reconciliation = reconcile_costs(reservations, ledger, usage_cost, failures)
+    ledger_cost = reconciliation["ledger_total"]
+    out["matched_calls"] = reconciliation["matched_calls"]
+    out["settled_cost_sum"] = str(reconciliation["reservation_total_unrounded"])
+    out["ledger_actual_cost_sum"] = str(ledger_cost)
     if int(usage.get("input_tokens") or 0) != ledger_input:
         failures.append(f"run.usage input_tokens {usage.get('input_tokens')} != ledger sum {ledger_input}")
     if int(usage.get("output_tokens") or 0) != ledger_output:
         failures.append(f"run.usage output_tokens {usage.get('output_tokens')} != ledger sum {ledger_output}")
 
     # Tracked cost / token / call caps vs the exact configured values.
+    # The caps stay STRICT: no rounding tolerance ever loosens them; both
+    # the per-row-rounded ledger total and the run.usage snapshot must be
+    # within the $ cap exactly.
     if not missing_caps:
-        max_cost = float(caps["MILO_MAX_COST_PER_RUN"])
+        max_cost = Decimal(caps["MILO_MAX_COST_PER_RUN"])
         max_calls = int(caps["MILO_MAX_MODEL_CALLS_PER_RUN"])
         max_input = int(caps["MILO_MAX_INPUT_TOKENS_PER_RUN"])
         max_output = int(caps["MILO_MAX_OUTPUT_TOKENS_PER_RUN"])
         max_total = int(caps["MILO_MAX_TOTAL_TOKENS_PER_RUN"])
-        if ledger_cost > max_cost or usage_cost > max_cost:
+        if ledger_cost > max_cost or (usage_cost or Decimal(0)) > max_cost:
             failures.append(f"tracked cost (ledger {ledger_cost} / usage {usage_cost}) exceeds cap {max_cost}")
         model_calls = int(usage.get("model_calls") or 0)
         if model_calls > max_calls:
@@ -559,11 +692,18 @@ def evidence() -> None:
         if ledger_input + ledger_output > max_total:
             failures.append(f"total tokens {ledger_input + ledger_output} exceed cap {max_total}")
 
-    # Launch invocation audit: exactly one launcher invocation.
-    _, invocations = call("GET", f"/rest/v1/run_invocations?run_id=eq.{run_id}&select=created_at,invocation")
-    out["invocations"] = len(invocations or [])
-    if len(invocations or []) != 1:
-        failures.append(f"run_invocations={len(invocations or [])}, expected exactly 1")
+    # Launch invocation audit: exactly one launcher invocation. The
+    # run_invocations table has NO `invocation` column (migration 006:
+    # launcher/execution_name/payload/created_at) — selecting one made
+    # PostgREST answer HTTP 400 with an error dict, which the old code
+    # counted as rows. Real columns only, and a failed query fails closed
+    # above instead of masquerading as a count mismatch.
+    invocations = fetch_rows(f"/rest/v1/run_invocations?run_id=eq.{run_id}&select=launcher,execution_name,created_at", "run_invocations", failures)
+    if invocations is not None:
+        out["invocations"] = len(invocations)
+        out["invocation_launchers"] = sorted(str(i.get("launcher")) for i in invocations)
+        if len(invocations) != 1:
+            failures.append(f"run_invocations={len(invocations)}, expected exactly 1")
 
     out["failures"] = failures
     out["ok"] = not failures
