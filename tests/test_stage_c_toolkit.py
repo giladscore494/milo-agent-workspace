@@ -17,6 +17,9 @@ No network, no gcloud, no provider calls.
 
 from __future__ import annotations
 
+import base64
+import gzip
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -1426,6 +1429,31 @@ def test_delimiter_absent_from_both_probe_sources_and_at_sign_present():
         assert "@" in source, name
 
 
+# Cloud Run's documented per-env-value limit; evidence recovery attempt 1
+# failed safely when the raw 35,021-character probe_db.py exceeded it.
+CLOUD_RUN_ENV_VALUE_MAX = 32768
+
+
+def decode_transport(value: str) -> bytes:
+    return gzip.decompress(base64.b64decode(value))
+
+
+def reference_transport(path: Path) -> str:
+    """The deterministic encoding 04-create-probes.sh must produce."""
+    return base64.b64encode(gzip.compress(path.read_bytes(), compresslevel=9, mtime=0)).decode("ascii")
+
+
+def test_probe_db_raw_source_exceeds_the_cloud_run_env_limit():
+    """The regression trigger stays real: the actual probe_db.py is larger
+    than 32,768 characters raw, so raw PROBE_SOURCE transport can never
+    work again — the compressed transport is mandatory, and its encoded
+    form must fit."""
+    raw = (STAGE_C / "probe_db.py").read_text()
+    assert len(raw) > CLOUD_RUN_ENV_VALUE_MAX
+    assert len((STAGE_C / "probe_db.py").read_bytes()) > CLOUD_RUN_ENV_VALUE_MAX
+    assert len(reference_transport(STAGE_C / "probe_db.py")) <= CLOUD_RUN_ENV_VALUE_MAX
+
+
 def test_probe_sources_survive_gcloud_transport_byte_for_byte(tmp_path):
     result, args = run_create_probes(STAGE_C, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -1433,28 +1461,107 @@ def test_probe_sources_survive_gcloud_transport_byte_for_byte(tmp_path):
     assert len(env_args) == 2, "expected one env-var arg per probe job"
     db_env = gcloud_env_dict(env_args[0].removeprefix("--set-env-vars="))
     gw_env = gcloud_env_dict(env_args[1].removeprefix("--set-env-vars="))
-    # Byte-for-byte identical to the files on disk after gcloud splitting.
-    assert db_env["PROBE_SOURCE"] == (STAGE_C / "probe_db.py").read_text()
-    assert gw_env["PROBE_SOURCE"] == (STAGE_C / "probe_gateway.py").read_text()
+    # EXACT round trip: decoding the compressed transport reproduces the
+    # files on disk byte-for-byte after gcloud splitting.
+    db_bytes = decode_transport(db_env["PROBE_SOURCE_GZIP_B64"])
+    gw_bytes = decode_transport(gw_env["PROBE_SOURCE_GZIP_B64"])
+    assert db_bytes == (STAGE_C / "probe_db.py").read_bytes()
+    assert gw_bytes == (STAGE_C / "probe_gateway.py").read_bytes()
     # The literal that broke attempt 1 survives whole.
-    assert 'os.environ.get("STAGE_C_TEST_EMAIL", "stage-c-smoke@invalid.milo")' in db_env["PROBE_SOURCE"]
-    # And the transported sources are still valid Python.
-    compile(db_env["PROBE_SOURCE"], "probe_db.py", "exec")
-    compile(gw_env["PROBE_SOURCE"], "probe_gateway.py", "exec")
+    assert 'os.environ.get("STAGE_C_TEST_EMAIL", "stage-c-smoke@invalid.milo")' in db_bytes.decode("utf-8")
+    # And the reconstructed sources are still valid Python.
+    compile(db_bytes.decode("utf-8"), "probe_db.py", "exec")
+    compile(gw_bytes.decode("utf-8"), "probe_gateway.py", "exec")
     assert db_env["STAGE_C_MODE"] == "preflight"
     assert gw_env["STAGE_C_MODE"] == "create"
+    # No raw transport remains, and EVERY transported env value respects
+    # the Cloud Run per-value limit (the recovery-attempt-1 failure mode).
+    for env in (db_env, gw_env):
+        assert "PROBE_SOURCE" not in env
+        for name, value in env.items():
+            assert len(value) <= CLOUD_RUN_ENV_VALUE_MAX, f"{name} exceeds the env-value limit"
+    # The container bootstrap reconstructs the exact UTF-8 bytes.
+    blob = "\0".join(args)
+    assert 'exec(gzip.decompress(base64.b64decode(os.environ["PROBE_SOURCE_GZIP_B64"])).decode("utf-8"))' in blob
 
 
-def test_delimiter_collision_fails_closed_before_any_gcloud_call(tmp_path):
+def test_probe_transport_is_deterministic():
+    """Identical source bytes must always yield the identical transported
+    value (gzip mtime pinned to 0, no filename, unwrapped base64) — the
+    reference encoding computed here must match what two independent runs
+    of the script produce."""
+    ref = reference_transport(STAGE_C / "probe_db.py")
+    assert decode_transport(ref) == (STAGE_C / "probe_db.py").read_bytes()
+    encode = (
+        "import base64, gzip, sys\n"
+        "raw = open(sys.argv[1], 'rb').read()\n"
+        "print(base64.b64encode(gzip.compress(raw, compresslevel=9, mtime=0)).decode('ascii'))\n"
+    )
+    runs = [
+        subprocess.run(
+            [sys.executable, "-c", encode, str(STAGE_C / "probe_db.py")],
+            capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"}, timeout=60,
+        ).stdout.strip()
+        for _ in range(2)
+    ]
+    assert runs[0] == runs[1] == ref
+
+
+def test_probe_transport_determinism_across_script_runs(tmp_path):
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    r1, a1 = run_create_probes(STAGE_C, tmp_path / "one")
+    r2, a2 = run_create_probes(STAGE_C, tmp_path / "two")
+    assert r1.returncode == 0 and r2.returncode == 0
+    e1 = sorted(a for a in a1 if a.startswith("--set-env-vars="))
+    e2 = sorted(a for a in a2 if a.startswith("--set-env-vars="))
+    assert e1 == e2, "transport must be deterministic across runs"
+    db_env = gcloud_env_dict(next(a for a in a1 if "PROBE_SOURCE_GZIP_B64" in a and "preflight" in a).removeprefix("--set-env-vars="))
+    assert db_env["PROBE_SOURCE_GZIP_B64"] == reference_transport(STAGE_C / "probe_db.py")
+
+
+def test_oversized_transport_value_fails_closed_before_any_gcloud_call(tmp_path):
+    """Recovery attempt 1 discovered the 32,768-character limit only when
+    gcloud rejected the create. The guard must now refuse BEFORE any
+    gcloud invocation when even the COMPRESSED transport exceeds the
+    limit (forced here with deterministic high-entropy padding that gzip
+    cannot shrink under the limit)."""
+    staged = tmp_path / "stage-c"
+    shutil.copytree(STAGE_C, staged)
+    chunk = b""
+    seed = b"stage-c-oversize"
+    while len(chunk) < 90_000:
+        seed = hashlib.sha256(seed).digest()
+        chunk += seed
+    with open(staged / "probe_db.py", "a", encoding="utf-8") as fh:
+        fh.write('\nPADDING = "' + base64.b64encode(chunk).decode("ascii") + '"\n')
+    assert len(reference_transport(staged / "probe_db.py")) > CLOUD_RUN_ENV_VALUE_MAX
+    result, args = run_create_probes(staged, tmp_path)
+    assert result.returncode != 0
+    assert "STAGE C REFUSED" in result.stderr
+    assert "exceeds the Cloud Run env-value limit of 32768" in result.stderr
+    assert args == [], "gcloud was invoked despite the oversized transport value"
+
+
+def test_delimiter_in_probe_source_now_transports_safely(tmp_path):
+    """The attempt-1 failure class is structurally gone: a probe source
+    containing the transport delimiter itself now ships byte-for-byte
+    (base64 output cannot contain ':'), instead of refusing or splitting."""
     staged = tmp_path / "stage-c"
     shutil.copytree(STAGE_C, staged)
     with open(staged / "probe_db.py", "a", encoding="utf-8") as fh:
         fh.write(f'\nCOLLIDING = "{DELIM}"\n')
     result, args = run_create_probes(staged, tmp_path)
-    assert result.returncode != 0
-    assert "STAGE C REFUSED" in result.stderr
-    assert "DB_SOURCE" in result.stderr
-    assert args == [], "gcloud was invoked despite the delimiter collision"
+    assert result.returncode == 0, result.stdout + result.stderr
+    env_args = [a for a in args if a.startswith("--set-env-vars=")]
+    db_env = gcloud_env_dict(env_args[0].removeprefix("--set-env-vars="))
+    decoded = decode_transport(db_env["PROBE_SOURCE_GZIP_B64"]).decode("utf-8")
+    assert f'COLLIDING = "{DELIM}"' in decoded
+    # The delimiter guard itself stays in place for every transported value.
+    text = (STAGE_C / "04-create-probes.sh").read_text()
+    assert "contains the env-var delimiter" in text
+    assert "exceeds the Cloud Run env-value limit" in text
+    assert "check_transport_value" in text
 
 
 def test_create_probes_introduces_no_paid_flags_or_extra_mutations(tmp_path):
@@ -1512,16 +1619,37 @@ def test_acceptance_doc_records_attempt_7_truthfully():
     assert "STAGE C PASSED" not in text
 
 
-def test_acceptance_doc_does_not_claim_the_probes_were_deleted():
+def test_acceptance_doc_does_not_claim_the_probes_were_deleted_by_the_kill_switch():
     """The live output proves kill-switch.sh ran but 07-post-smoke-posture.sh
-    did not — the kill switch never deletes the probe jobs, so the report
-    must record them as STILL PRESENT (with the defective pre-corrective
-    source), never as deleted."""
+    did not — the kill switch never deletes the probe jobs. The report must
+    keep that history (the stale probes remained until recovery attempt 1
+    removed them) and never attribute their deletion to the kill switch."""
     text = acceptance_doc()
     assert "deleted by the kill-switch/cleanup cycle" not in text
-    assert "STILL\nPRESENT" in text or "STILL PRESENT" in text
+    assert "STILL PRESENT" in text  # the recorded pre-recovery history
     assert "07-post-smoke-posture.sh" in text
     assert "was NOT" in text
+    # Current posture: absent since recovery attempt 1's cleanup.
+    assert "**ABSENT**" in text
+
+
+def test_acceptance_doc_records_recovery_attempt_1_truthfully():
+    """Recovery attempt 1 failed safely at R.2 probe recreation on the
+    Cloud Run env-value limit; the cleanup trap completed (kill switch
+    passed, zero active executions, both probes absent). The report must
+    record the failure, the numbers, and the successful fail-closed
+    cleanup — and never claim the recovery succeeded."""
+    text = acceptance_doc()
+    assert "Evidence recovery attempt 1 (2026-08-22) — FAILED SAFELY at R.2 probe recreation" in text
+    assert "35,021" in text
+    assert "32,768" in text
+    assert "kill switch PASSED" in text
+    assert "zero active Worker executions" in text
+    assert "both probes absent" in text
+    assert "PROBE_SOURCE_GZIP_B64" in text
+    assert "never enabled (failure before R.4)" in text
+    assert "RECOVERY COMPLETE" not in text
+    assert "STAGE C PASSED" not in text
 
 
 def recovery_block() -> str:
@@ -1616,7 +1744,9 @@ def test_recovery_block_verifies_stale_probes_before_touching_them():
     reconcile = block[block.index("R.2"):block.index("R.3")]
     assert 'assert name == job' in reconcile
     assert "NOT a known disposable probe; refusing to delete" in reconcile
-    assert '"PROBE_SOURCE" in names' in reconcile
+    # Both probe generations are recognized: the legacy raw transport and
+    # the current compressed transport — anything else refuses.
+    assert 'names & {"PROBE_SOURCE", "PROBE_SOURCE_GZIP_B64"}' in reconcile
     assert "MILO_ENABLE_PAID_EXECUTION" in reconcile
     assert "KIMI_API_KEY" in reconcile and "MOONSHOT_API_KEY" in reconcile
     assert "refusing to delete the job" in reconcile  # active executions
@@ -1657,8 +1787,8 @@ case "${args}" in
   *"run jobs describe stagec-"*)
     if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then job="${BASH_REMATCH[1]}"; else exit 1; fi
     if [ -e "${state}/deleted-${job}" ] && [ ! -e "${state}/created-${job}" ]; then exit 1; fi
-    if [ "${job}" = "stagec-db-probe" ]; then sa="milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"; else sa="milo-vercel-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"; fi
-    printf '{"metadata":{"name":"%s"},"spec":{"template":{"spec":{"template":{"spec":{"serviceAccountName":"%s","containers":[{"env":[{"name":"PROBE_SOURCE","value":"stale-source"},{"name":"STAGE_C_MODE","value":"preflight"}]}]}}}}}}\n' "${job}" "${sa}"
+    if [ "${job}" = "stagec-db-probe" ]; then sa="milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"; srcvar="PROBE_SOURCE"; else sa="milo-vercel-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"; srcvar="PROBE_SOURCE_GZIP_B64"; fi
+    printf '{"metadata":{"name":"%s"},"spec":{"template":{"spec":{"template":{"spec":{"serviceAccountName":"%s","containers":[{"env":[{"name":"%s","value":"stale-source"},{"name":"STAGE_C_MODE","value":"preflight"}]}]}}}}}}\n' "${job}" "${sa}" "${srcvar}"
     ;;
   *"run jobs delete"*)
     if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then

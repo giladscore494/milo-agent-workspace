@@ -25,11 +25,16 @@ Hard preconditions — the block itself also verifies them and hard-stops:
   off, provider aliases unbound, API run creation off, launcher
   disabled, zero active executions. **`07-post-smoke-posture.sh` was NOT
   run**, so the disposable `stagec-db-probe` / `stagec-gw-probe` jobs
-  are still present in production and still carry the DEFECTIVE
-  pre-corrective probe source; step R.2 verifies each stale job's exact
-  name and posture, refuses to touch anything that is not a known
-  disposable probe, deletes them, and recreates both from the corrected
-  source.
+  initially remained in production with the DEFECTIVE pre-corrective
+  probe source. Evidence recovery attempt 1 (2026-08-22) then deleted
+  that stale pair in R.2 and FAILED SAFELY at recreation (the raw
+  35,021-character `PROBE_SOURCE` exceeded Cloud Run's 32,768-character
+  env-value limit); its cleanup trap completed and verified both probes
+  absent. Step R.2 therefore handles EITHER state: a present stale job is
+  verified by exact name and posture (raw `PROBE_SOURCE` legacy transport
+  or the current compressed `PROBE_SOURCE_GZIP_B64` transport — anything
+  else refuses), deleted, and recreated; an absent job is simply
+  recreated from the corrected source, which now ships compressed.
 
 Fail-closed design of the block:
 
@@ -168,13 +173,16 @@ gcloud run jobs executions list --job="${STAGE_C_WORKER_JOB}" \
 trap on_exit EXIT ERR INT TERM
 
 echo "== R.2 reconcile the STALE disposable probes (07 cleanup never ran)"
-# The pre-corrective probes still exist and still carry the DEFECTIVE
-# probe source. Each is verified by exact name AND posture before it is
-# touched: the pinned disposable-probe service account, a transported
-# PROBE_SOURCE, no paid flag and no provider alias — anything else is NOT
-# a known disposable probe and hard-stops the recovery. Verified stale
-# probes (with zero active executions) are deleted and recreated from
-# the corrected source.
+# A pre-corrective probe may still exist (raw PROBE_SOURCE legacy
+# transport) or may already be absent (recovery attempt 1 deleted the
+# stale pair before failing safely at recreation on the env-value
+# limit). Each PRESENT job is verified by exact name AND posture before
+# it is touched: the pinned disposable-probe service account, a
+# transported probe source (legacy raw PROBE_SOURCE or the current
+# compressed PROBE_SOURCE_GZIP_B64), no paid flag and no provider alias —
+# anything else is NOT a known disposable probe and hard-stops the
+# recovery. Verified stale probes (with zero active executions) are
+# deleted; both probes are then recreated from the corrected source.
 for pair in "${STAGE_C_DB_PROBE_JOB}=${STAGE_C_API_SA}" "${STAGE_C_GW_PROBE_JOB}=${STAGE_C_GATEWAY_SA}"; do
   job="${pair%%=*}"
   expected_sa="${pair#*=}"
@@ -194,7 +202,8 @@ assert sa == expected_sa, f"stale job {job} runs as {sa!r}, expected {expected_s
 env_entries = tpl["containers"][0].get("env") or []
 values = {e["name"]: e.get("value") for e in env_entries if "value" in e}
 names = {e["name"] for e in env_entries}
-assert "PROBE_SOURCE" in names, f"stale job {job} has no transported PROBE_SOURCE - not a disposable probe; refusing to delete"
+transports = names & {"PROBE_SOURCE", "PROBE_SOURCE_GZIP_B64"}
+assert transports, f"stale job {job} has no transported probe source (raw PROBE_SOURCE or compressed PROBE_SOURCE_GZIP_B64) - not a disposable probe; refusing to delete"
 assert values.get("MILO_ENABLE_PAID_EXECUTION") in (None, "false"), f"stale job {job} carries an enabled paid flag"
 for alias in ("KIMI_API_KEY", "MOONSHOT_API_KEY"):
     assert alias not in names, f"stale job {job} carries provider alias {alias}"

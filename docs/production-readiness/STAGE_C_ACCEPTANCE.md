@@ -12,9 +12,16 @@ confirmed defects in the GATE ITSELF, not by the run (see the Attempt 7
 section below). The operator completed the kill switch: paid execution
 off, both provider aliases absent, API disabled, zero active executions.
 `07-post-smoke-posture.sh` was NOT run, so the disposable probe jobs
-were NOT deleted and remain present with the defective pre-corrective
-probe source (the recovery reconciles them). **Stage C remains NOT
-PASSED until the corrected evidence gate passes over this same run
+initially remained present with the defective pre-corrective probe
+source. **Evidence recovery attempt 1 (2026-08-22) then FAILED SAFELY at
+R.2 probe recreation**: the stale probes were verified and deleted, but
+`04-create-probes.sh` transported `probe_db.py` as a raw 35,021-character
+`PROBE_SOURCE` env value, exceeding Cloud Run's 32,768-character limit.
+The armed cleanup trap completed — kill switch PASSED, zero active
+Worker executions, both probes absent (see the recovery-attempt section
+below). Probe transport is now deterministic gzip+base64 with a
+pre-mutation size guard. **Stage C remains NOT PASSED until the
+corrected evidence gate passes over this same run
 (`08-recover-evidence.md`); no second paid run is permitted.** Post-run state: `public.runs` holds **exactly 2 run rows**
 (Attempt 6's `37912575-f9ce-4437-893d-7dfa45c53aa9`, terminal `failed`,
 plus Attempt 7's `8b4a4277-…`, terminal `completed` — exactly 1 row under
@@ -636,10 +643,12 @@ no production mutation):
 paid execution off, both provider aliases absent in every binding form,
 API run creation off and launcher disabled, zero active executions.
 **`07-post-smoke-posture.sh` was NOT run** — the kill switch never
-deletes the disposable probes, so `stagec-db-probe` and
-`stagec-gw-probe` are STILL PRESENT in production, still carrying the
-defective pre-corrective probe source. The fail-closed machinery that
-ran worked; the gate's verdict was wrong.
+deletes the disposable probes, so at that point `stagec-db-probe` and
+`stagec-gw-probe` were STILL PRESENT in production, still carrying the
+defective pre-corrective probe source. (Superseded on 2026-08-22:
+evidence recovery attempt 1 deleted that stale pair and its cleanup
+verified both probes absent — see the recovery-attempt section below.)
+The fail-closed machinery that ran worked; the gate's verdict was wrong.
 
 Consequence: **the paid run completed, but Stage C remains NOT PASSED**
 until the corrected evidence gate passes over this same run. The
@@ -659,6 +668,46 @@ Worker execution was created, reruns the evidence gate, and — on EVERY
 exit path, via the traps — restores `MILO_ENABLE_RUN_CREATION=false`,
 runs `kill-switch.sh` and deletes both probes. **No second paid run is
 permitted; the Attempt 7 one-run authorization is consumed.**
+
+## Evidence recovery attempt 1 (2026-08-22) — FAILED SAFELY at R.2 probe recreation; CLEANUP COMPLETED
+
+The operator ran the `08-recover-evidence.md` block after the
+evidence-gate corrective merged. R.1 passed read-only (worker paid flag
+`false`, both provider aliases absent, API run creation off, launcher
+disabled, exactly 2 terminal Worker executions, zero active). R.2
+verified the stale pre-corrective probes by exact name and posture and
+deleted them, then **failed safely inside `04-create-probes.sh`**:
+`probe_db.py` was transported as a raw `PROBE_SOURCE` env value of
+**35,021 characters**, exceeding Cloud Run's **32,768-character**
+per-env-value limit, so the `gcloud run jobs create` call was rejected.
+
+Outcome — everything fail-closed held:
+
+| Fact | Value |
+| --- | --- |
+| Failure point | R.2, `gcloud run jobs create` env-value limit (35,021 > 32,768) |
+| Probes created | 0 (the create was rejected; nothing partial) |
+| API `MILO_ENABLE_RUN_CREATION` | never enabled (failure before R.4) |
+| New runs / Worker executions / provider calls | 0 / 0 / 0 |
+| Cleanup trap | completed: flag restore idempotent, **kill switch PASSED**, zero active Worker executions |
+| Probes after cleanup | **both absent** (stale pair deleted in R.2; cleanup re-verified absence) |
+
+Corrective (this PR, no production mutation): `04-create-probes.sh` no
+longer ships raw source. Both probe sources are transported as
+**deterministic gzip+base64** (`PROBE_SOURCE_GZIP_B64`, gzip `mtime=0`,
+unwrapped base64, encoder round-trip-verified before use — 14,048
+characters for `probe_db.py`) and reconstructed to the exact original
+UTF-8 bytes inside `python:3.12-slim` before `exec`. Every transported
+env value is checked against the 32,768-character Cloud Run limit (and
+the transport delimiter) BEFORE any `gcloud` mutation, failing closed
+with `STAGE C REFUSED`. The recovery verifier in R.2 recognizes both
+the legacy raw `PROBE_SOURCE` transport and the new compressed
+transport, so it can reconcile a stale probe of either generation.
+Offline regression coverage: the real >32,768-character `probe_db.py`,
+exact byte-for-byte round-trip through the mocked gcloud transport,
+determinism across runs, the pre-mutation size guard (an oversized
+value must refuse before ANY gcloud call), and delimiter-containing
+sources now transporting safely.
 
 ## Production mutations / current posture
 
@@ -701,16 +750,20 @@ rerun):
   (the completed run itself — the key is consumed).
 - Runtime release deployed for Attempt 7:
   `88224bccc836f80f3dc1d173306a1aa63cddcc7a` (merge of PR #50).
-- Disposable `stagec-db-probe` and `stagec-gw-probe` jobs: **STILL
-  PRESENT** — the live output proves `kill-switch.sh` ran, but
+- Disposable `stagec-db-probe` and `stagec-gw-probe` jobs: **ABSENT**.
+  History: `kill-switch.sh` ran after the false-failed gate but
   `07-post-smoke-posture.sh` (the step that deletes the probes; the kill
-  switch never does) did NOT run. The stale jobs still carry the
-  DEFECTIVE pre-corrective probe source. Recovery step R.2 verifies each
-  stale job's exact name and posture (pinned disposable-probe service
-  account, transported `PROBE_SOURCE`, no paid flag, no provider alias —
-  anything else hard-stops), deletes them, and recreates both from the
-  corrected source; the recovery traps and R.6 delete them again at the
-  end on every exit path.
+  switch never does) did NOT run, so the stale pre-corrective probes
+  initially remained. Evidence recovery attempt 1 (2026-08-22) verified
+  and deleted that stale pair in R.2, then FAILED SAFELY at recreation
+  (raw `PROBE_SOURCE` over the Cloud Run env-value limit); its cleanup
+  trap completed and verified both probes absent. Recovery step R.2
+  handles either state (present stale job — legacy raw `PROBE_SOURCE` or
+  compressed `PROBE_SOURCE_GZIP_B64` — verified by exact name and
+  posture, deleted; absent job — nothing to reconcile) and recreates
+  both from the corrected source, which now ships as deterministic
+  gzip+base64; the recovery traps and R.6 delete them again at the end
+  on every exit path.
 
 ## Provider call / token / cost accounting
 
