@@ -1603,20 +1603,23 @@ def test_acceptance_doc_does_not_call_three_dollars_a_hard_billing_ceiling():
 
 
 def test_acceptance_doc_records_attempt_7_truthfully():
-    """The paid run completed, the gate false-failed, the kill switch
-    completed — and Stage C is still NOT PASSED with no second run."""
+    """The paid run completed, the original gate false-failed, the kill
+    switch completed — that history stays recorded even now that the
+    corrected gate has passed and Stage C is PASSED."""
     text = (REPO / "docs" / "production-readiness" / "STAGE_C_ACCEPTANCE.md").read_text()
     assert "8b4a4277-fdf0-41b2-8515-d7e1d50e441b" in text
     assert "milo-agent-worker-gggdc" in text
     assert "FALSE-FAILED" in text
-    assert "STAGE C NOT PASSED" in text
     assert "$0.252069" in text
     assert "312,018" in text
-    assert "no second paid run is permitted" in text.lower()
+    assert "no second paid run is" in text.lower()
     assert "kill switch" in text.lower()
     assert "08-recover-evidence.md" in text
-    # The report must never claim the acceptance evidence passed.
-    assert "STAGE C PASSED" not in text
+    # The acceptance claim exists exactly once as the status and once in
+    # the recovery-attempt-2 record — never as a blanket rewrite of the
+    # failure history.
+    assert "STAGE C PASSED" in text
+    assert "FAILED SAFELY" in text  # attempt history is preserved
 
 
 def test_acceptance_doc_does_not_claim_the_probes_were_deleted_by_the_kill_switch():
@@ -1648,8 +1651,58 @@ def test_acceptance_doc_records_recovery_attempt_1_truthfully():
     assert "both probes absent" in text
     assert "PROBE_SOURCE_GZIP_B64" in text
     assert "never enabled (failure before R.4)" in text
-    assert "RECOVERY COMPLETE" not in text
-    assert "STAGE C PASSED" not in text
+
+
+def test_acceptance_doc_records_stage_c_closure_truthfully():
+    """Stage C closure: recovery attempt 2 passed the corrected gate over
+    the SAME run, the replay proved no new run/execution, production
+    ended fail-closed with the probes deleted, and the Moonshot figure is
+    recorded as a whole-day conservative upper bound — never as the
+    run's exact provider bill. Authorization boundaries stay explicit."""
+    text = acceptance_doc()
+    assert "STAGE C PASSED" in text
+    assert "Evidence recovery attempt 2 (2026-08-22) — SUCCEEDED; STAGE C PASSED" in text
+    # Corrected gate outcome, exact numbers.
+    assert "84 matched calls" in text
+    assert "84 settled reservations" in text
+    assert "0 dangling" in text
+    assert "$0.252069" in text
+    assert "312,018" in text
+    # Replay proof: same completed Run ID, HTTP 202, nothing new created.
+    assert "HTTP 202" in text
+    assert "SAME completed Run ID" in text
+    assert "no new run and no new Worker execution" in text
+    # Execution posture and final fail-closed state.
+    assert "both terminal, zero active" in text
+    assert "final kill switch" in text.lower()
+    assert "both disposable probes were deleted" in text
+    # Moonshot bound: framed as a conservative WHOLE-DAY upper bound
+    # (tool fees and other usage included), never the run's exact bill.
+    assert "$0.52555" in text
+    assert "WHOLE-DAY upper bound" in text
+    assert "conservative" in text
+    assert "tool fees" in text
+    assert "$2.47445" in text
+    assert "17.52%" in text
+    assert "$3.00 cap" in text
+    # Authorization boundaries.
+    assert "authorization is consumed" in text
+    assert "no second paid run is authorized" in text
+    assert "Stage D remains" in text and "unauthorized" in text
+    # The internal figure must not be conflated with the billed figure.
+    assert "$0.52555 tracked" not in text
+    assert "actual_cost $0.52555" not in text
+
+
+def test_stage_c_readme_records_closure():
+    text = (STAGE_C / "README.md").read_text()
+    assert "STAGE C PASSED (2026-08-22)" in text
+    assert "8b4a4277-fdf0-41b2-8515-d7e1d50e441b" in text
+    assert "$0.52555" in text
+    assert "17.52%" in text
+    assert "no second paid run is" in text
+    assert "Stage D remains unauthorized" in text
+    assert "retained as the audited record" in text
 
 
 def recovery_block() -> str:
@@ -2096,7 +2149,7 @@ def test_acceptance_doc_distinguishes_occurred_from_present_database_rows():
 
 def test_acceptance_doc_states_the_current_pins_and_boundaries():
     text = acceptance_doc()
-    assert "STAGE C NOT PASSED" in text
+    assert "STAGE C PASSED" in text
     assert "88224bccc836f80f3dc1d173306a1aa63cddcc7a" in text
     assert "stage-c-smoke-attempt-7-20260819" in text
     assert "Tier 2" in text

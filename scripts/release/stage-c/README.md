@@ -1,5 +1,22 @@
 # Stage C operator toolkit — one controlled paid smoke run
 
+**Status: STAGE C PASSED (2026-08-22).** The one authorized Attempt 7
+run (`8b4a4277-fdf0-41b2-8515-d7e1d50e441b`, Worker execution
+`milo-agent-worker-gggdc`) reached terminal `completed`, and evidence
+recovery attempt 2 passed the corrected acceptance gate: 84 matched
+calls, 312,018 tokens, 84 settled reservations / 0 dangling, internal
+`actual_cost` $0.252069, idempotent replay returning the same completed
+Run ID with HTTP 202 (no new run or Worker execution), exactly 2
+visible Worker executions (both terminal, zero active), final kill
+switch PASSED and both disposable probes deleted. The Moonshot console
+whole-day consumption of $0.52555 (a conservative provider-billed upper
+bound including tool fees) used at most 17.52% of the $3.00 cap. Full
+record: `docs/production-readiness/STAGE_C_ACCEPTANCE.md`.
+**The Attempt 7 authorization is consumed — no second paid run is
+authorized — and Stage D remains unauthorized.** This toolkit is
+retained as the audited record; nothing here may be re-executed against
+production without fresh explicit operator authorization.
+
 Implements the Stage C procedure of
 [`docs/production-readiness/STAGED_ACTIVATION.md`](../../../docs/production-readiness/STAGED_ACTIVATION.md)
 as an exact, auditable command sequence. Every script is manual-only,
