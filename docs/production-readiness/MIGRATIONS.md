@@ -72,7 +72,7 @@ real PostgreSQL in CI (`tests/test_migrations_postgres.py`,
 
 1. `scripts/release/check-migration-state.sh --database-url-env
    MILO_READONLY_DB_URL --plan-output migration-plan.json`
-2. Review the plan and hashes; confirm a database backup exists.
+2. Review the plan and hashes; create and verify an encrypted pre-migration backup via [SUPABASE_BACKUP.md](SUPABASE_BACKUP.md), and confirm its matching passphrase remains available in the approved operator secret store.
 3. Apply each pending migration manually, in order, via `psql` or the
    Supabase SQL editor.
 4. Re-run the state check; validate RLS and function permissions

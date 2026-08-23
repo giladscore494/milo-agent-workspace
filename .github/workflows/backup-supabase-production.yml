@@ -1,0 +1,191 @@
+name: Backup Supabase Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Exact 40-character main SHA to back up before migration"
+        required: true
+        type: string
+      confirmation:
+        description: "Type exactly: CREATE_ENCRYPTED_PRODUCTION_BACKUP"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-production-backup
+  cancel-in-progress: false
+
+jobs:
+  backup-supabase-production:
+    name: Backup Supabase Production
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+
+      - name: Validate immutable authorization
+        shell: bash
+        env:
+          EXPECTED_SHA_INPUT: ${{ inputs.expected_sha }}
+          CONFIRMATION_INPUT: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_SHA_INPUT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected SHA must be exactly 40 lowercase hexadecimal characters."
+            exit 1
+          fi
+          if [ "${GITHUB_SHA}" != "${EXPECTED_SHA_INPUT}" ]; then
+            echo "Workflow SHA does not match the explicitly authorized SHA."
+            exit 1
+          fi
+          if [ "${CONFIRMATION_INPUT}" != "CREATE_ENCRYPTED_PRODUCTION_BACKUP" ]; then
+            echo "Confirmation did not match; no backup was created."
+            exit 1
+          fi
+
+      - name: Set up Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: 2.31.8
+
+      - name: Verify required secrets
+        shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+          SUPABASE_BACKUP_PASSPHRASE: ${{ secrets.SUPABASE_BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in SUPABASE_ACCESS_TOKEN SUPABASE_DB_PASSWORD SUPABASE_PROJECT_ID SUPABASE_BACKUP_PASSPHRASE; do
+            if [ -z "${!name:-}" ]; then
+              echo "Required secret ${name} is not configured or is empty."
+              missing=1
+            else
+              echo "Required secret ${name} is configured."
+            fi
+          done
+          test "${missing}" -eq 0
+
+      - name: Link production project
+        shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          supabase link --project-ref "${SUPABASE_PROJECT_ID}"
+
+      - name: Create and verify encrypted logical backup
+        shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+          SUPABASE_BACKUP_PASSPHRASE: ${{ secrets.SUPABASE_BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+
+          backup_dir="${RUNNER_TEMP}/milo-supabase-backup"
+          verify_dir="${RUNNER_TEMP}/milo-supabase-backup-verify"
+          mkdir -p "${backup_dir}" "${verify_dir}"
+
+          supabase migration list --linked > "${backup_dir}/migration-history.txt"
+          supabase db dump --linked --schema public             --file "${backup_dir}/schema.sql"
+          supabase db dump --linked --schema public --data-only --use-copy             --file "${backup_dir}/data.sql"
+          supabase db dump --linked --role-only             --file "${backup_dir}/roles.sql"
+
+          for file in schema.sql data.sql roles.sql migration-history.txt; do
+            test -s "${backup_dir}/${file}" || {
+              echo "Backup component ${file} is empty."
+              exit 1
+            }
+          done
+
+          (
+            cd "${backup_dir}"
+            sha256sum schema.sql data.sql roles.sql migration-history.txt               > checksums.sha256
+          )
+
+          plaintext_bundle="${backup_dir}/supabase-public-${GITHUB_SHA}-${GITHUB_RUN_ID}.tar.gz"
+          encrypted_bundle="${plaintext_bundle}.enc"
+
+          tar -C "${backup_dir}" -czf "${plaintext_bundle}"             schema.sql data.sql roles.sql migration-history.txt checksums.sha256
+
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 600000 -md sha256             -in "${plaintext_bundle}"             -out "${encrypted_bundle}"             -pass env:SUPABASE_BACKUP_PASSPHRASE
+
+          decrypted_bundle="${verify_dir}/backup.tar.gz"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -md sha256             -in "${encrypted_bundle}"             -out "${decrypted_bundle}"             -pass env:SUPABASE_BACKUP_PASSPHRASE
+
+          tar -C "${verify_dir}" -xzf "${decrypted_bundle}"
+          (
+            cd "${verify_dir}"
+            sha256sum -c checksums.sha256
+          )
+
+          encrypted_sha="$(sha256sum "${encrypted_bundle}" | awk '{print $1}')"
+          encrypted_size="$(stat -c '%s' "${encrypted_bundle}")"
+          created_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          manifest="${backup_dir}/manifest.json"
+
+          python3 - "${manifest}" "$(basename "${encrypted_bundle}")"             "${encrypted_sha}" "${encrypted_size}" "${created_at}"             "${GITHUB_SHA}" "${GITHUB_RUN_ID}" <<'PY'
+          import json
+          import sys
+
+          path, filename, digest, size, created_at, source_sha, run_id = sys.argv[1:]
+          payload = {
+              "format": "milo-supabase-encrypted-backup-v1",
+              "encrypted_file": filename,
+              "encrypted_sha256": digest,
+              "encrypted_size_bytes": int(size),
+              "created_at": created_at,
+              "source_sha": source_sha,
+              "workflow_run_id": int(run_id),
+              "cipher": "aes-256-cbc",
+              "kdf": "pbkdf2-sha256",
+              "pbkdf2_iterations": 600000,
+              "scope": {
+                  "schema": "public",
+                  "data": "public",
+                  "roles_included": True,
+                  "managed_schemas_excluded": ["auth", "storage"],
+              },
+          }
+          with open(path, "w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          PY
+
+          rm -f "${plaintext_bundle}"             "${backup_dir}/schema.sql"             "${backup_dir}/data.sql"             "${backup_dir}/roles.sql"             "${backup_dir}/migration-history.txt"             "${backup_dir}/checksums.sha256"
+          rm -rf "${verify_dir}"
+
+          test -s "${encrypted_bundle}"
+          test -s "${manifest}"
+          test "$(find "${backup_dir}" -maxdepth 1 -type f | wc -l)" -eq 2
+          echo "Encrypted backup created and decryptability/checksums verified."
+
+      - name: Upload encrypted backup only
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-production-backup-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/milo-supabase-backup/*.tar.gz.enc
+            ${{ runner.temp }}/milo-supabase-backup/manifest.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Cleanup backup workspace
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "${RUNNER_TEMP}/milo-supabase-backup"             "${RUNNER_TEMP}/milo-supabase-backup-verify"
