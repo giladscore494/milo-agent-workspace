@@ -60,6 +60,7 @@ class PlanValidator:
 
         by_id: dict[str, DynamicTask] = {}
         signatures: set[str] = set()
+        total_tool_calls = 0
         for task in tasks:
             if task.task_id in by_id:
                 raise PlanValidationError(f"duplicate task id: {task.task_id}")
@@ -78,8 +79,9 @@ class PlanValidator:
             for tool in task.tools:
                 if tool.name not in self._allowed_tools:
                     raise PlanValidationError(f"tool is not allowlisted: {tool.name}")
-                if tool.max_calls > limits.max_tool_calls:
-                    raise PlanValidationError("tool call limit exceeded")
+                total_tool_calls += tool.max_calls
+        if total_tool_calls > limits.max_tool_calls:
+            raise PlanValidationError("aggregate tool call limit exceeded")
 
         ids = set(by_id)
         for task in tasks:
