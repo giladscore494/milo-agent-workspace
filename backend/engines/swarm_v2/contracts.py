@@ -157,6 +157,9 @@ class VerificationVerdict(StrictContract):
 
 
 class RemainingBudget(StrictContract):
+    """Independent remaining capacities; cost units are not model-call slots."""
+
     cost_units: int = Field(ge=0)
     tool_calls: int = Field(ge=0)
     tasks: int = Field(ge=0)
+    model_calls: int = Field(default=1_000, ge=0)
