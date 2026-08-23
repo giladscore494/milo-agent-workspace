@@ -323,7 +323,12 @@ class MemoryRepository:
         return dict(run)
 
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None:
-        return None
+        matches = [
+            checkpoint for checkpoint in self.checkpoints
+            if str(checkpoint.get("run_id")) == str(run_id)
+            and (workflow_key is None or checkpoint.get("workflow_key") == workflow_key)
+        ]
+        return dict(matches[-1]) if matches else None
 
     def save_checkpoint(self, checkpoint: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         run_id = checkpoint.get("run_id")

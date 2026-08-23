@@ -8,6 +8,8 @@ from backend.worker.main import execute_run, resolve_run_id
 class WorkerRepo:
     def __init__(self):
         self.run_id = uuid4()
+        self.conversation_id = uuid4()
+        self.project_id = uuid4()
         self.worker_id = None
         self.attempt = 1
         self.lease_token = "test-lease-token"
@@ -17,7 +19,13 @@ class WorkerRepo:
         self.events = []
         self.partial = None
     def get_run(self, run_id):
-        return {"id": run_id, "status": "running" if self.worker_id else "queued", "input": {}, "worker_id": self.worker_id, "attempt": self.attempt, "lease_token": self.lease_token if self.worker_id else None, "lease_expires_at": self.lease_expires_at}
+        return {"id": run_id, "conversation_id": self.conversation_id, "status": "running" if self.worker_id else "queued", "input": {}, "worker_id": self.worker_id, "attempt": self.attempt, "lease_token": self.lease_token if self.worker_id else None, "lease_expires_at": self.lease_expires_at}
+    def get_conversation(self, conversation_id):
+        assert conversation_id == self.conversation_id
+        return {"id": conversation_id, "project_id": self.project_id}
+    def get_project(self, project_id):
+        assert project_id == self.project_id
+        return {"id": project_id, "workflow_key": "vehicle_catalog_v1"}
     def _assert_lease(self, worker_id=None, attempt=None, lease_token=None):
         if worker_id is not None and worker_id != self.worker_id:
             raise AppError("RUN_LEASE_LOST", "wrong worker", 409)
