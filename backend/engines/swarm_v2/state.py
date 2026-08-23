@@ -3,6 +3,7 @@
 from typing import Any
 from pydantic import ConfigDict, Field
 from .contracts import StrictContract
+from .evidence import safe_durable_value
 
 
 class SwarmState(StrictContract):
@@ -22,6 +23,7 @@ class SwarmState(StrictContract):
 
     @classmethod
     def resume(cls, raw: Any, *, run_id: str, workflow_key: str = "swarm_v2") -> "SwarmState":
+        safe_durable_value(raw)
         state = cls.model_validate(raw)
         if state.run_id != run_id or state.workflow_key != workflow_key or state.engine_version != "swarm_v2.1":
             raise ValueError("incompatible Swarm V2 checkpoint")

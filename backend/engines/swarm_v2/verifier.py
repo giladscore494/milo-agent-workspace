@@ -4,6 +4,7 @@ import json
 from typing import Iterable
 from .contracts import EvidenceReference, VerificationVerdict
 from .model_gateway import ModelGateway
+from .evidence import safe_durable_value
 
 
 class Verifier:
@@ -25,6 +26,7 @@ class Verifier:
                 response_format={"type": "json_object"})
             raw = response if isinstance(response, dict) else json.loads(response.choices[0].message.content)
             parsed = [VerificationVerdict.model_validate(v) for v in raw.get("verdicts", [])]
+            safe_durable_value([v.model_dump(mode="json") for v in parsed])
             by_id = {v.claim_id: v for v in parsed}
             verdicts.extend(by_id.get(item.claim_id, VerificationVerdict(
                 claim_id=item.claim_id, verdict="rejected", reason="verifier omitted claim")) for item in candidates)

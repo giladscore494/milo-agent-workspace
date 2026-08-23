@@ -17,5 +17,5 @@ class FinalBuilder:
             elif verdict and verdict.verdict == "needs_review":
                 review.append({"field": item.field, "value": item.value,
                                "reason": verdict.reason, "provenance": trace})
-        return {"status": "completed", "fields": fields,
+        return {"status": "complete", "fields": fields,
                 "needs_review": sorted(review, key=lambda x: (x["field"], x["provenance"]["claim_id"]))}

@@ -140,7 +140,11 @@ class EvidenceReference(StrictContract):
     source_id: str = Field(min_length=1, max_length=200)
     run_id: str = Field(min_length=1, max_length=200)
     task_id: str = Field(min_length=1, max_length=80)
+    entity: str = Field(default="general", min_length=1, max_length=200)
     field: str = Field(min_length=1, max_length=200)
+    geography: str | None = Field(default=None, max_length=200)
+    market: str | None = Field(default=None, max_length=200)
+    time_scope: dict[str, Any] = Field(default_factory=dict)
     value: Any
     confidence: float = Field(ge=0, le=1)
     supported: bool = True
@@ -150,3 +154,9 @@ class VerificationVerdict(StrictContract):
     claim_id: str = Field(min_length=1, max_length=200)
     verdict: Literal["verified", "needs_review", "rejected"]
     reason: str = Field(min_length=1, max_length=500)
+
+
+class RemainingBudget(StrictContract):
+    cost_units: int = Field(ge=0)
+    tool_calls: int = Field(ge=0)
+    tasks: int = Field(ge=0)

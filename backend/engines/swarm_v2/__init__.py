@@ -3,7 +3,7 @@
 from .adapter import SwarmV2Adapter
 from .commander import Commander
 from .contracts import (CommanderDecision, CommanderPlan, CompletionCriteria, DynamicTask,
-                        EvidenceReference, VerificationVerdict,
+                        EvidenceReference, RemainingBudget, VerificationVerdict,
                         EvidenceRequirement, TaskGraph, ToolRequirement,
                         WorkerAssignment)
 from .engine import SwarmV2Engine
@@ -21,4 +21,4 @@ __all__ = ["Commander", "CommanderDecision", "CommanderModelError", "CommanderMo
            "PlanValidationError", "PlanValidator", "SwarmV2Adapter", "SwarmV2Engine",
            "TaskGraph", "ToolRequirement", "WorkerAssignment"]
 __all__ += ["BoundedTaskExecutor", "ExecutionResult", "GenericWorker", "ModelGateway", "TaskResult"]
-__all__ += ["EvidenceReference", "FinalBuilder", "SwarmState", "VerificationVerdict", "Verifier"]
+__all__ += ["EvidenceReference", "FinalBuilder", "RemainingBudget", "SwarmState", "VerificationVerdict", "Verifier"]

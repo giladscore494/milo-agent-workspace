@@ -5,6 +5,7 @@ from .adapters import CommanderClient
 from .contracts import CommanderDecision, CommanderPlan
 from .models import CommanderModelResolver
 from .validation import PlanValidator
+from .evidence import safe_durable_value
 
 
 class Commander:
@@ -26,6 +27,7 @@ class Commander:
         inert = (create(model=model, objective=objective, summary=summary) if create else
                  self._client.create_plan(model=model, objective=objective, context={"status": summary}))
         decision = CommanderDecision.model_validate_json(inert) if isinstance(inert, (str, bytes)) else CommanderDecision.model_validate(inert)
+        safe_durable_value(decision.reason)
         if decision.plan is not None:
             # Re-parse through the same deterministic firewall; nested Pydantic
             # validation alone is deliberately not authorization.

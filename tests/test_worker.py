@@ -284,3 +284,43 @@ def test_mock_engine_never_selected_without_env(monkeypatch):
     import importlib
     importlib.reload(worker_main)
     assert "backend.worker.mock_engine" not in sys.modules
+
+
+def test_default_registry_routes_trusted_swarm_v2_and_completes(monkeypatch):
+    """The production registry builds V2; no mock engine or metadata routing is used."""
+    import json
+    from types import SimpleNamespace
+    from backend.budget import BudgetConfig, BudgetTracker
+    from test_swarm_v2 import plan, task
+    import backend.worker.main as worker_main
+
+    planned_task = task("research", "neutral research")
+    planned_task["tools"] = []
+    initial = plan([planned_task])
+    responses = [initial, {"answer": "done"},
+                 {"decision": "FINISH", "plan": None, "reason": "complete"}]
+    class Completions:
+        def create(self, **kwargs):
+            content = json.dumps(responses.pop(0))
+            return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, cost=0),
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    monkeypatch.setattr(worker_main, "build_guarded_client_factory", lambda tracker: lambda *_: client)
+    monkeypatch.setenv("MILO_COMMANDER_MODEL_ALLOWLIST", "fake")
+    monkeypatch.setenv("MILO_COMMANDER_MODEL", "fake")
+    monkeypatch.setenv("MILO_SWARM_WORKER_MODEL", "fake")
+
+    class SwarmRepo(WorkerRepo):
+        def get_project(self, project_id):
+            return {"id": project_id, "workflow_key": "swarm_v2"}
+        def get_run(self, run_id):
+            row = super().get_run(run_id)
+            row["input"] = {"objective": "offline swarm", "commander_model": "fake"}
+            return row
+        def latest_checkpoint(self, run_id, workflow_key=None): return None
+    repo = SwarmRepo()
+    tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=10), kill_switch=lambda: True)
+    assert worker_main.execute_run(repo.run_id, repo, budget_tracker=tracker) == 0
+    assert repo.completed is not None
+    assert repo.completed[1]["status"] == "complete"
+    assert responses == []

@@ -75,16 +75,21 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # Routing is resolved from server-owned relations only. Do this before
         # checkpoint access and before invoking any engine factory.
         engine_builder = None
+        swarm_engine_builder = None
 
         def build_default_engine():
             if engine_builder is None:
                 raise RuntimeError("engine factory invoked before worker dependencies were ready")
             return engine_builder()
 
-        registry = engine_registry or EngineRegistry({
-            (engine.workflow_key if engine is not None else "vehicle_catalog_v1"):
-                (lambda: engine) if engine is not None else build_default_engine,
-        })
+        def build_swarm_engine():
+            if swarm_engine_builder is None:
+                raise RuntimeError("swarm engine factory invoked before worker dependencies were ready")
+            return swarm_engine_builder()
+
+        registry = engine_registry or EngineRegistry(
+            {engine.workflow_key: lambda: engine} if engine is not None else
+            {"vehicle_catalog_v1": build_default_engine, "swarm_v2": build_swarm_engine})
         try:
             resolved_engine = EngineResolver(repo, registry).resolve(run)
         except AppError as exc:
@@ -273,6 +278,51 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 agent_step_callback=record_agent_step, retry_callback=record_retry,
                 provider_limits=provider_limits, provider_backpressure_callback=record_provider_backpressure,
             )
+            def make_swarm_engine():
+                from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander,
+                    CommanderModelResolver, EvidenceReference, GenericWorker, ModelGateway,
+                    PlanLimits, PlanValidator, RemainingBudget, SwarmV2Adapter, Verifier)
+                from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+                from backend.provider_scheduler import ProviderScheduler
+                from backend.tools import ToolContext, ToolRegistry
+
+                allowed = tuple(filter(None, (item.strip() for item in
+                    os.getenv("MILO_COMMANDER_MODEL_ALLOWLIST", "").split(","))))
+                commander_model = os.getenv("MILO_COMMANDER_MODEL", "").strip()
+                worker_model = os.getenv("MILO_SWARM_WORKER_MODEL", "").strip()
+                if not allowed or not commander_model or not worker_model or commander_model not in allowed:
+                    raise ValueError("Swarm V2 model configuration is incomplete or not allowlisted")
+                scheduler = ProviderScheduler(provider_limits,
+                    cancellation_checker=is_cancelled,
+                    backpressure_callback=record_provider_backpressure)
+                gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker),
+                    scheduler=scheduler, api_key=worker_provider_api_key(),
+                    base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
+                    cancellation_checker=is_cancelled, agent_step_callback=record_agent_step)
+                tools = ToolRegistry()  # real tools are registered explicitly; mocks never enter this path
+                validator = PlanValidator(allowed_tools=tools.allowed_names, limits=PlanLimits())
+                commander = Commander(client=gateway,
+                    resolver=CommanderModelResolver(allowed, set(allowed)), validator=validator)
+                tool_context = ToolContext(cancellation_checker=is_cancelled)
+                executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
+                    gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
+                    cancellation_checker=is_cancelled, event_sink=forward_event),
+                    max_active_workers=BoundedTaskExecutor.configured_limit(),
+                    cancellation_checker=is_cancelled)
+                board = EvidenceBoard(repo, WorkerLease(run_id, worker_id,
+                    int(run.get("attempt") or 1), str(run.get("lease_token") or "")))
+                def remaining():
+                    cfg = tracker.config
+                    calls = max(0, (cfg.max_model_calls_per_run or 100) - tracker.model_calls)
+                    return RemainingBudget(cost_units=calls, tool_calls=calls,
+                                           tasks=max(0, calls - 1))
+                return SwarmV2Adapter(commander=commander, executor=executor,
+                    verifier=Verifier(gateway=gateway, model=commander_model),
+                    evidence_loader=lambda _: [EvidenceReference.model_validate(item)
+                                               for item in board.references()],
+                    checkpoint_sink=save_checkpoint, event_sink=forward_event,
+                    usage_snapshot=tracker.snapshot, remaining_budget=remaining)
+            swarm_engine_builder = make_swarm_engine
         selected_engine = resolved_engine.factory()
         try:
             # V2 owns its versioned checkpoint compatibility checks. V1 keeps
