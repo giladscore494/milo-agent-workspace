@@ -11,7 +11,8 @@ from backend.errors import AppError
 from backend.repository import Repository, SupabaseRepository
 from backend.runtime import CancellationRequested, RunEventRecord, SupabaseEventSink
 from backend.supervisor import SupervisorInput, apply_event_to_blackboard, build_evaluation_report, initial_blackboard, make_shadow_decision, route_event_message
-from backend.worker.engine import Engine, VehicleCatalogV1Adapter
+from backend.engines.vehicle_catalog_v1 import VehicleCatalogV1Adapter
+from backend.worker.engine import Engine, EngineRegistry, EngineResolver
 
 
 def resolve_run_id(cli_run_id: str | None) -> UUID:
@@ -21,7 +22,7 @@ def resolve_run_id(cli_run_id: str | None) -> UUID:
     return UUID(value)
 
 
-def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, budget_tracker: "BudgetTracker | None" = None) -> int:
+def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, budget_tracker: "BudgetTracker | None" = None, engine_registry: EngineRegistry | None = None) -> int:
     worker_id = os.getenv("WORKER_ID", f"worker-{uuid4()}")
     lease_seconds = int(os.getenv("MILO_WORKER_LEASE_SECONDS", "300"))
     heartbeat_interval = max(1.0, min(float(os.getenv("MILO_WORKER_HEARTBEAT_INTERVAL_SECONDS", "30")), lease_seconds / 3))
@@ -71,6 +72,27 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             if hasattr(repo, "transition_run"):
                 repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), finished_at=datetime.now(UTC).isoformat())
             return 0
+        # Routing is resolved from server-owned relations only. Do this before
+        # checkpoint access and before invoking any engine factory.
+        engine_builder = None
+
+        def build_default_engine():
+            if engine_builder is None:
+                raise RuntimeError("engine factory invoked before worker dependencies were ready")
+            return engine_builder()
+
+        registry = engine_registry or EngineRegistry({
+            (engine.workflow_key if engine is not None else "vehicle_catalog_v1"):
+                (lambda: engine) if engine is not None else build_default_engine,
+        })
+        try:
+            resolved_engine = EngineResolver(repo, registry).resolve(run)
+        except AppError as exc:
+            sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message=exc.message, payload={"code": exc.code}))
+            repo.mark_run_failed(run_id, exc.code, exc.message, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+            return 1
+        workflow_key = resolved_engine.workflow_key
+
         shadow_blackboard = initial_blackboard(str((run.get("input") or {}).get("content") or "MILO vehicle catalog run"))
 
         def shadow_observe(event_type: str, payload: dict[str, Any]) -> None:
@@ -92,7 +114,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
 
         sink.emit(RunEventRecord(run_id=run_id, type="run_started", message="Run started", payload={"worker_id": worker_id, "attempt": run.get("attempt", 1)}))
         shadow_observe("run_started", {"worker_id": worker_id, "attempt": run.get("attempt", 1)})
-        latest_checkpoint = repo.latest_checkpoint(run_id, getattr(engine, "workflow_key", "vehicle_catalog_v1")) if hasattr(repo, "latest_checkpoint") else None
+        latest_checkpoint = repo.latest_checkpoint(run_id, workflow_key) if hasattr(repo, "latest_checkpoint") else None
         if latest_checkpoint:
             sink.emit(RunEventRecord(run_id=run_id, type="run_resumed", message="Run resumed from latest compatible checkpoint", payload={"checkpoint_id": str(latest_checkpoint.get("id", "")), "phase": latest_checkpoint.get("phase")}))
             shadow_observe("run_resumed", {"checkpoint_id": str(latest_checkpoint.get("id", "")), "phase": latest_checkpoint.get("phase")})
@@ -110,7 +132,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             repo.heartbeat(run_id, worker_id, lease_seconds=lease_seconds, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
         def save_checkpoint(_phase, checkpoint):
             if hasattr(repo, "save_checkpoint"):
-                checkpoint = {**checkpoint, "run_id": str(run_id), "attempt": run.get("attempt", 1)}
+                checkpoint = {**checkpoint, "run_id": str(run_id), "attempt": run.get("attempt", 1), "workflow_key": workflow_key}
                 repo.save_checkpoint(checkpoint, **lease_ctx)
                 shadow_observe("checkpoint_saved", checkpoint)
         def is_cancelled():
@@ -236,30 +258,22 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             by the guarded client, so this callback only records the event."""
             forward_event("provider_backpressure_wait", {"agent": agent, "phase": phase, "reason": reason, "wait_seconds": wait_seconds, "message": f"Provider backpressure for {agent}/{phase}: waiting {wait_seconds}s ({reason})"})
 
-        if engine is not None:
-            selected_engine = engine
-        elif engine_mode == "mock":
+        if engine is None and engine_registry is None and engine_mode == "mock":
             from backend.worker.mock_engine import MockLifecycleEngine
 
-            selected_engine = MockLifecycleEngine(
-                event_sink=forward_event,
-                checkpoint_sink=save_checkpoint,
-                cancellation_checker=is_cancelled,
-                agent_step_callback=record_agent_step,
-                retry_callback=record_retry,
-                budget_tracker=tracker,
+            engine_builder = lambda: MockLifecycleEngine(
+                event_sink=forward_event, checkpoint_sink=save_checkpoint,
+                cancellation_checker=is_cancelled, agent_step_callback=record_agent_step,
+                retry_callback=record_retry, budget_tracker=tracker,
             )
-        else:
-            selected_engine = VehicleCatalogV1Adapter(
-                model_client_factory=build_guarded_client_factory(tracker),
-                event_sink=forward_event,
-                checkpoint_sink=save_checkpoint,
-                cancellation_checker=is_cancelled,
-                agent_step_callback=record_agent_step,
-                retry_callback=record_retry,
-                provider_limits=provider_limits,
-                provider_backpressure_callback=record_provider_backpressure,
+        elif engine is None and engine_registry is None:
+            engine_builder = lambda: VehicleCatalogV1Adapter(
+                model_client_factory=build_guarded_client_factory(tracker), event_sink=forward_event,
+                checkpoint_sink=save_checkpoint, cancellation_checker=is_cancelled,
+                agent_step_callback=record_agent_step, retry_callback=record_retry,
+                provider_limits=provider_limits, provider_backpressure_callback=record_provider_backpressure,
             )
+        selected_engine = resolved_engine.factory()
         try:
             result = selected_engine.run(run)
         except CancellationRequested:

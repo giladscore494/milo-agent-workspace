@@ -218,7 +218,14 @@ def test_worker_refuses_invalid_provider_limit_configuration(monkeypatch):
     class MiniRepo:
         def __init__(self):
             self.failed = []
-            self.run = {"id": str(uuid4()), "status": "queued", "input": {"content": "x"}, "attempt": 1}
+            self.conversation_id, self.project_id = uuid4(), uuid4()
+            self.run = {"id": str(uuid4()), "conversation_id": self.conversation_id, "status": "queued", "input": {"content": "x"}, "attempt": 1}
+
+        def get_conversation(self, conversation_id):
+            return {"id": conversation_id, "project_id": self.project_id}
+
+        def get_project(self, project_id):
+            return {"id": project_id, "workflow_key": "vehicle_catalog_v1"}
 
         def claim_run(self, run_id, worker_id, lease_seconds=300):
             return dict(self.run)
