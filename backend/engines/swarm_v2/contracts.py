@@ -135,6 +135,36 @@ class CommanderDecision(StrictContract):
         return self
 
 
+def commander_plan_json_schema() -> dict[str, Any]:
+    """Return the authoritative provider-visible CommanderPlan contract."""
+    return CommanderPlan.model_json_schema()
+
+
+def commander_decision_json_schema() -> dict[str, Any]:
+    """Return the decision contract with model-validator rules made explicit."""
+    schema = CommanderDecision.model_json_schema()
+    schema["allOf"] = [
+        *schema.get("allOf", []),
+        {
+            "if": {
+                "properties": {
+                    "decision": {"enum": ["ADD_TASKS", "REVISE_TASK"]}
+                },
+                "required": ["decision"],
+            },
+            "then": {
+                "properties": {"plan": {"not": {"type": "null"}}},
+                "required": ["plan"],
+            },
+            "else": {
+                "properties": {"plan": {"type": "null"}},
+                "required": ["plan"],
+            },
+        },
+    ]
+    return schema
+
+
 class EvidenceReference(StrictContract):
     claim_id: str = Field(min_length=1, max_length=200)
     source_id: str = Field(min_length=1, max_length=200)
