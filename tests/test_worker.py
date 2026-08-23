@@ -296,6 +296,9 @@ def test_default_registry_routes_trusted_swarm_v2_and_completes(monkeypatch):
 
     planned_task = task("research", "neutral research")
     planned_task["tools"] = []
+    planned_task["evidence"] = {
+        "minimum_sources": 0, "required_fields": [], "min_confidence": 0.0}
+    planned_task["completion"]["evidence_satisfied"] = False
     initial = plan([planned_task])
     responses = [initial, {"answer": "done"},
                  {"decision": "FINISH", "plan": None, "reason": "complete"}]
@@ -324,3 +327,23 @@ def test_default_registry_routes_trusted_swarm_v2_and_completes(monkeypatch):
     assert repo.completed is not None
     assert repo.completed[1]["status"] == "complete"
     assert responses == []
+
+
+def test_swarm_v2_failure_is_sanitized_and_marks_run_failed():
+    sentinel = "provider secret sentinel must never persist"
+
+    class FailingSwarm:
+        workflow_key = "swarm_v2"
+        def run(self, run):
+            raise RuntimeError(sentinel)
+
+    class SwarmRepo(WorkerRepo):
+        def get_project(self, project_id):
+            return {"id": project_id, "workflow_key": "swarm_v2"}
+
+    repo = SwarmRepo()
+    assert execute_run(repo.run_id, repo, FailingSwarm()) == 1
+    assert repo.failed == (repo.run_id, "SWARM_V2_FAILED", "Swarm V2 execution failed")
+    assert sentinel not in str(repo.failed)
+    assert sentinel not in str(repo.events)
+    assert [event[1] for event in repo.events][-1] == "run_failed"
