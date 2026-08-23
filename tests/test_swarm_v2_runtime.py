@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend.budget import BudgetConfig, BudgetTracker, build_guarded_client_factory
-from backend.engines.swarm_v2 import BoundedTaskExecutor, ModelGateway, TaskGraph, TaskResult
+from backend.engines.swarm_v2 import BoundedTaskExecutor, GenericWorker, ModelGateway, TaskGraph, TaskResult
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
 from backend.tools import MockSearchTool, ToolContext, ToolError, ToolMode, ToolRegistry
@@ -53,17 +53,34 @@ def test_dependency_priority_bounded_parallelism_and_failure_isolation():
     assert result.tasks["low"].status == "completed"
 
 
-def test_cancellation_stops_queued_and_active_work():
+def test_external_cancellation_stops_active_tool_and_queued_work_cooperatively():
     cancelled = threading.Event()
-    class CancellingWorker(RecordingWorker):
-        def execute(self, spec, dependencies):
-            cancelled.set()
-            time.sleep(.02)
-            raise CancellationRequested("RUN_CANCELLED")
-    executor = BoundedTaskExecutor(worker_factory=lambda: CancellingWorker([], threading.Lock()),
-                                   max_active_workers=1, cancellation_checker=cancelled.is_set)
+    tool_started = threading.Event()
+    starts, model_calls = [], []
+    class CooperativeTool(MockSearchTool):
+        def execute(self, context, payload):
+            starts.append(payload["query"])
+            tool_started.set()
+            while True:
+                context.check_cancelled()
+                time.sleep(.001)
+    class Gateway:
+        def call(self, **kwargs):
+            model_calls.append(kwargs)
+            return {"answer": "unexpected"}
+    registry = ToolRegistry([CooperativeTool()])
+    context = ToolContext(scopes=frozenset({"mock:search"}))
+    worker_factory = lambda: GenericWorker(gateway=Gateway(), tools=registry, model="fake",
+        tool_context=context, cancellation_checker=cancelled.is_set)
+    executor = BoundedTaskExecutor(worker_factory=worker_factory, max_active_workers=1,
+                                   cancellation_checker=cancelled.is_set)
+    canceller = threading.Thread(target=lambda: (tool_started.wait(1), cancelled.set()))
+    canceller.start()
     with pytest.raises(CancellationRequested):
-        executor.execute(graph(task("a", "a"), task("b", "b")))
+        executor.execute(graph(task("a", "a", tool="mock.search"), task("b", "b", tool="mock.search")))
+    canceller.join()
+    assert starts == ["a"]
+    assert model_calls == []
 
 
 def test_registry_allowlist_schemas_scope_and_write_capability():
@@ -95,6 +112,40 @@ def test_registry_allowlist_schemas_scope_and_write_capability():
     approved = ToolContext(scopes=frozenset({"mock:search"}), write_approved=True,
                            capabilities=frozenset({"tool:write:mock.search"}))
     assert writes.execute("mock.search", approved, {"query": "q"}) == {"rows": []}
+
+
+@pytest.mark.parametrize("target,schema", [
+    ("input_schema", {"type": "object", "properties": {"nested": {"type": "mystery"}},
+                      "required": [], "additionalProperties": False}),
+    ("output_schema", {"type": "object", "properties": {"nested": {"type": "object",
+                       "properties": {}, "required": []}}, "required": [], "additionalProperties": False}),
+    ("input_schema", {"type": "array"}),
+    ("output_schema", {"type": "string", "pattern": ".*"}),
+])
+def test_registry_rejects_invalid_nested_schemas_before_execution(target, schema):
+    executed = []
+    class InvalidTool(MockSearchTool):
+        def execute(self, context, payload):
+            executed.append(True)
+            return {"rows": []}
+    tool = InvalidTool()
+    object.__setattr__(tool, target, schema)
+    with pytest.raises(ValueError):
+        ToolRegistry([tool])
+    assert executed == []
+
+
+def test_generic_worker_sanitizes_internal_exception_text():
+    secret = "SECRET_SENTINEL_DO_NOT_EXPOSE"
+    class FailingGateway:
+        def call(self, **kwargs): raise RuntimeError(secret)
+    worker = GenericWorker(gateway=FailingGateway(), tools=ToolRegistry(), model="fake", tool_context=ToolContext())
+    task_data = task("safe", "safe", tool="search")
+    task_data["tools"] = []
+    spec = TaskGraph.model_validate({"tasks": [task_data]}).tasks[0]
+    result = worker.execute(spec, {})
+    assert result.error == {"code": "TASK_FAILED", "message": "task execution failed"}
+    assert secret not in str(result)
 
 
 def test_every_call_uses_one_gateway_guard_accounting_and_429_is_not_semantic_retry():

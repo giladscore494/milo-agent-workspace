@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
+
+from backend.runtime import CancellationRequested
 
 
 class ToolMode(str, Enum):
@@ -17,6 +19,11 @@ class ToolContext:
     scopes: frozenset[str] = field(default_factory=frozenset)
     capabilities: frozenset[str] = field(default_factory=frozenset)
     write_approved: bool = False
+    cancellation_checker: Callable[[], bool] | None = None
+
+    def check_cancelled(self) -> None:
+        if self.cancellation_checker and self.cancellation_checker():
+            raise CancellationRequested("RUN_CANCELLED")
 
 
 class ToolError(Exception):
