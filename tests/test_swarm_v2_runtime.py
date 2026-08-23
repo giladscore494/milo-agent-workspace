@@ -7,16 +7,86 @@ from types import SimpleNamespace
 import pytest
 
 from backend.budget import BudgetConfig, BudgetTracker, build_guarded_client_factory
-from backend.engines.swarm_v2 import BoundedTaskExecutor, GenericWorker, ModelGateway, TaskGraph, TaskResult
+from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander, CommanderDecision,
+    CommanderModelResolver, CommanderPlan, GenericWorker, ModelGateway, PlanLimits,
+    PlanValidationError, PlanValidator, TaskGraph, TaskResult)
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
 from backend.tools import MockSearchTool, ToolContext, ToolError, ToolMode, ToolRegistry
 
-from test_swarm_v2 import task
+from test_swarm_v2 import plan, task
 
 
 def graph(*items):
     return TaskGraph.model_validate({"tasks": list(items)})
+
+
+class RecordingCompletions:
+    def __init__(self, responses):
+        self.responses, self.requests = iter(responses), []
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=response))])
+
+
+def recording_gateway(responses, *, allowed_tools=frozenset()):
+    completions = RecordingCompletions(responses)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    scheduler = ProviderScheduler(ProviderLimitsConfig(max_concurrency=1, rpm_limit=None))
+    gateway = ModelGateway(guarded_client_factory=lambda *_: client, scheduler=scheduler,
+        api_key="offline", base_url="offline", allowed_tools=allowed_tools)
+    return gateway, completions.requests
+
+
+def test_commander_requests_contain_authoritative_schemas_and_server_tool_allowlist():
+    valid_plan = plan([task("a", "answer", tool="mock.search")])
+    gateway, requests = recording_gateway([
+        __import__("json").dumps(valid_plan),
+        '{"decision":"FINISH","plan":null,"reason":"all tasks are complete"}',
+    ], allowed_tools=frozenset({"mock.search"}))
+
+    assert CommanderPlan.model_validate_json(gateway.create_plan(
+        model="fake", objective="objective", context={"tools": ["user.injected"]}))
+    assert CommanderDecision.model_validate_json(gateway.create_replan(
+        model="fake", objective="objective", summary={"completed": ["a"]}))
+    plan_instruction = __import__("json").loads(requests[0]["messages"][0]["content"])
+    decision_instruction = __import__("json").loads(requests[1]["messages"][0]["content"])
+    assert plan_instruction["json_schema"] == CommanderPlan.model_json_schema()
+    assert decision_instruction["json_schema"] == CommanderDecision.model_json_schema()
+    assert decision_instruction["json_schema"]["allOf"]
+    assert plan_instruction["tool_authorization"]["allowed_names"] == ["mock.search"]
+    assert "user.injected" not in requests[0]["messages"][0]["content"]
+    assert requests[0]["response_format"] == requests[1]["response_format"] == {"type": "json_object"}
+
+
+def test_empty_registry_explicitly_requires_no_tools_and_firewall_fails_closed():
+    gateway, requests = recording_gateway([__import__("json").dumps(plan([task("a", "answer")]))])
+    candidate = gateway.create_plan(model="fake", objective="objective",
+                                    context={"metadata": {"allowed_tool": "search"}})
+    instruction = __import__("json").loads(requests[0]["messages"][0]["content"])
+    assert instruction["tool_authorization"]["allowed_names"] == []
+    assert "tools: []" in instruction["tool_authorization"]["rule"]
+    commander = Commander(client=SimpleNamespace(create_plan=lambda **_: candidate),
+        resolver=CommanderModelResolver(("fake",), {"fake"}),
+        validator=PlanValidator(allowed_tools=frozenset(), limits=PlanLimits(max_tasks=1)))
+    with pytest.raises(PlanValidationError, match="not allowlisted"):
+        commander.plan(requested_model="fake", objective="objective", context={})
+
+
+@pytest.mark.parametrize("candidate,match", [
+    ("not-json", "invalid Commander plan"),
+    (__import__("json").dumps(plan([task("a", "a"), task("b", "b")])), "task count limit"),
+])
+def test_real_provider_shaped_malformed_and_over_limit_plans_fail_closed(candidate, match):
+    gateway, _ = recording_gateway([candidate])
+    commander = Commander(client=gateway, resolver=CommanderModelResolver(("fake",), {"fake"}),
+        validator=PlanValidator(allowed_tools={"search"}, limits=PlanLimits(max_tasks=1)))
+    with pytest.raises(PlanValidationError, match=match):
+        commander.plan(requested_model="fake", objective="objective", context={})
 
 
 class RecordingWorker:

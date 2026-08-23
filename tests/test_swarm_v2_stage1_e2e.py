@@ -81,8 +81,14 @@ def test_dynamic_parallel_replan_conflict_verification_final_and_events():
             "conflict_found", "commander_replanned", "verification_completed"} <= kinds
     assert all("provider" not in str(payload).lower() and "exception" not in payload for _, payload in events)
     assert checkpoints[-1]["artifacts"]["swarm_state"]["completed_task_ids"] == ["a", "b", "c", "follow"]
-    assert all(set(context) <= {"completed", "failed", "evidence", "conflicts", "gaps", "remaining_budget"}
+    assert all(set(context) <= {"completed", "failed", "evidence", "conflicts", "gaps",
+                                "execution_state", "remaining_budget"}
                for context in client.contexts[1:])
+    assert client.contexts[-1]["execution_state"] == {
+        "all_planned_tasks_completed": True,
+        "has_unresolved_issues": True,
+        "valid_terminal_decisions": ["REQUEST_VERIFICATION"],
+    }
 
 
 def test_resume_skips_completed_tasks_and_preserves_checkpoint_evidence():
@@ -110,6 +116,11 @@ def test_resume_skips_completed_tasks_and_preserves_checkpoint_evidence():
     assert {item["claim_id"] for item in
             checkpoints[-1]["artifacts"]["swarm_state"]["evidence_references"]} == {
         "claim-done", "claim-next"}
+    assert client.contexts[-1]["execution_state"] == {
+        "all_planned_tasks_completed": True,
+        "has_unresolved_issues": False,
+        "valid_terminal_decisions": ["FINISH"],
+    }
 
 
 def test_resume_rejects_cross_workflow_or_version():

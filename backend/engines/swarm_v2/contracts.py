@@ -123,6 +123,23 @@ class CommanderPlan(StrictContract):
 class CommanderDecision(StrictContract):
     """A replan is inert data until its replacement plan is validated."""
 
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        json_schema_extra={
+            "allOf": [
+                {
+                    "if": {"properties": {"decision": {"enum": ["ADD_TASKS", "REVISE_TASK"]}}},
+                    "then": {"required": ["plan"], "properties": {"plan": {"not": {"type": "null"}}}},
+                },
+                {
+                    "if": {"properties": {"decision": {"enum": ["REQUEST_VERIFICATION", "FINISH"]}}},
+                    "then": {"required": ["plan"], "properties": {"plan": {"type": "null"}}},
+                },
+            ]
+        },
+    )
+
     decision: Literal["ADD_TASKS", "REVISE_TASK", "REQUEST_VERIFICATION", "FINISH"]
     plan: CommanderPlan | None = None
     reason: str = Field(min_length=1, max_length=500)

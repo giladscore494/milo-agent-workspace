@@ -295,11 +295,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 scheduler = ProviderScheduler(provider_limits,
                     cancellation_checker=is_cancelled,
                     backpressure_callback=record_provider_backpressure)
+                tools = ToolRegistry()  # real tools are registered explicitly; mocks never enter this path
                 gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker),
                     scheduler=scheduler, api_key=worker_provider_api_key(),
                     base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
-                    cancellation_checker=is_cancelled, agent_step_callback=record_agent_step)
-                tools = ToolRegistry()  # real tools are registered explicitly; mocks never enter this path
+                    cancellation_checker=is_cancelled, agent_step_callback=record_agent_step,
+                    allowed_tools=tools.allowed_names)
                 limits = PlanLimits()
                 validator = PlanValidator(allowed_tools=tools.allowed_names, limits=limits)
                 commander = Commander(client=gateway,

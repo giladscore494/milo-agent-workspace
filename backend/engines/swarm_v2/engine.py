@@ -203,6 +203,12 @@ class SwarmV2Engine:
                               "task_id": e.task_id, "field": e.field,
                               "confidence": e.confidence} for e in evidence],
                 "conflicts": sorted(conflict_ids), "gaps": gaps,
+                "execution_state": {
+                    "all_planned_tasks_completed": not failed and len(completed) == len(plan.graph.tasks),
+                    "has_unresolved_issues": bool(failed or gaps or conflict_ids),
+                    "valid_terminal_decisions": (["REQUEST_VERIFICATION"]
+                        if failed or gaps or conflict_ids else ["FINISH"]),
+                },
                 "remaining_budget": self._remaining_budget().model_dump(mode="json")}
             decision = self._commander.replan(
                 requested_model=requested_model, objective=objective, summary=summary
