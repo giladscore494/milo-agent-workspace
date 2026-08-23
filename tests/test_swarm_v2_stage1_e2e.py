@@ -47,10 +47,10 @@ def evidence(results):
     refs = []
     for task_id, result in results.items():
         if result.status != "completed": continue
-        field = "disputed" if task_id in {"a", "b"} else f"field_{task_id}"
+        entity = "shared" if task_id in {"a", "b"} else task_id
         refs.append(EvidenceReference(claim_id=f"claim-{task_id}", source_id=f"source-{task_id}",
-            run_id="run-1", task_id=task_id, field=field, value=result.output["answer"],
-            confidence=.9, supported=True))
+            run_id="run-1", task_id=task_id, entity=entity, field="answer",
+            value=result.output["answer"], confidence=.9, supported=True))
     return refs
 
 
@@ -71,33 +71,52 @@ def test_dynamic_parallel_replan_conflict_verification_final_and_events():
         checkpoint_sink=lambda phase, value: checkpoints.append(deepcopy(value)))
     result = engine.run({"id": "run-1", "input": {"objective": "taxonomy neutral", "commander_model": "fake"}})
     assert sorted(calls) == ["a", "b", "c", "follow"]  # completed tasks did not rerun after replan
-    assert result["status"] == "complete"
-    assert "disputed" not in result["fields"]
-    assert {x["field"] for x in result["needs_review"]} == {"disputed"}
-    assert result == FinalBuilder().build(evidence({k: TaskResult(k, "completed", {"answer": k}) for k in calls}),
-        Verifier(gateway=VerifyGateway(), model="fake").verify(evidence({k: TaskResult(k, "completed", {"answer": k}) for k in calls}), conflict_claim_ids={"claim-a", "claim-b"}))
+    assert result["status"] == "partial_success"
+    assert {x["provenance"]["claim_id"] for x in result["needs_review"]} == {
+        "claim-a", "claim-b"}
+    assert {item["provenance"]["claim_id"] for item in result["fields"]["answer"]} == {
+        "claim-c", "claim-follow"}
     kinds = {kind for kind, _ in events}
     assert {"commander_plan_created", "task_ready", "task_started", "task_completed", "evidence_added",
             "conflict_found", "commander_replanned", "verification_completed"} <= kinds
     assert all("provider" not in str(payload).lower() and "exception" not in payload for _, payload in events)
     assert checkpoints[-1]["artifacts"]["swarm_state"]["completed_task_ids"] == ["a", "b", "c", "follow"]
-    assert all(set(context) <= {"completed", "failed", "evidence", "conflicts", "remaining_budget"}
+    assert all(set(context) <= {"completed", "failed", "evidence", "conflicts", "gaps", "remaining_budget"}
                for context in client.contexts[1:])
 
 
-def test_resume_skips_completed_tasks_and_rejects_cross_workflow_or_version():
-    initial = plan([task("a", "alpha"), task("b", "beta", dependencies=["a"])], contexts={"b": ["a"]})
+def test_resume_skips_completed_tasks_and_preserves_checkpoint_evidence():
+    initial = plan([task("done", "alpha"), task("next", "beta", dependencies=["done"])],
+                   contexts={"next": ["done"]})
+    saved_result = TaskResult("done", "completed", {"answer": "done"})
+    saved_evidence = evidence({"done": saved_result})[0].model_dump(mode="json")
     state = SwarmState(run_id="run-1", objective="resume", approved_plan=initial,
-        completed_task_ids=["a"], task_outputs={"a": {"answer": "a"}})
-    calls = []
+        completed_task_ids=["done"], task_outputs={"done": {"answer": "done"}},
+        evidence_references=[saved_evidence])
+    calls, checkpoints = [], []
     client = Plans(initial, [{"decision": "FINISH", "plan": None, "reason": "done"}])
     engine = SwarmV2Engine(commander=commander(client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls), max_active_workers=2),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"), evidence_loader=evidence)
-    engine.run({"id": "run-1", "input": {"commander_model": "fake"},
+        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        evidence_loader=lambda results: evidence({
+            key: value for key, value in results.items() if key == "next"}),
+        checkpoint_sink=lambda phase, value: checkpoints.append(deepcopy(value)))
+    result = engine.run({"id": "run-1", "input": {"commander_model": "fake"},
                 "checkpoint": {"artifacts": {"swarm_state": state.model_dump(mode="json")}}})
-    assert calls == ["b"]
-    for change in ({"workflow_key": "vehicle_catalog_v1"}, {"engine_version": "swarm_v2.0"}, {"run_id": "other"}):
+    assert calls == ["next"]
+    assert result["status"] == "complete"
+    assert {item["provenance"]["claim_id"] for item in result["fields"]["answer"]} == {
+        "claim-done", "claim-next"}
+    assert {item["claim_id"] for item in
+            checkpoints[-1]["artifacts"]["swarm_state"]["evidence_references"]} == {
+        "claim-done", "claim-next"}
+
+
+def test_resume_rejects_cross_workflow_or_version():
+    initial = plan([task("a", "alpha")])
+    state = SwarmState(run_id="run-1", objective="resume", approved_plan=initial)
+    for change in ({"workflow_key": "vehicle_catalog_v1"},
+                   {"engine_version": "swarm_v2.0"}, {"run_id": "other"}):
         raw = state.model_dump(mode="json") | change
         with pytest.raises(ValueError, match="incompatible"):
             SwarmState.resume(raw, run_id="run-1")
@@ -115,17 +134,22 @@ def test_builder_is_deterministic_traceable_and_excludes_unsupported_claims():
     assert first == second
     assert "unsafe" not in first["fields"]
     assert first["fields"]["answer"][0]["provenance"] == {
-        "claim_id": "c1", "source_id": "s1", "run_id": "r1", "task_id": "t1"}
+        "claim_id": "c1", "source_id": "s1", "run_id": "r1", "task_id": "t1",
+        "scope": {"entity": "general", "field": "answer", "geography": None,
+                  "market": None, "time_scope": {}}}
 
 
 def test_conflicts_require_same_full_scope():
     def ref(claim, entity, geography, value):
-        return EvidenceReference(claim_id=claim, source_id=f"s-{claim}", run_id="r", task_id="t",
-            entity=entity, field="price", geography=geography, market="retail",
-            time_scope={"year": 2026}, value=value, confidence=.9)
+        return EvidenceReference(claim_id=claim, source_id=f"s-{claim}",
+            run_id="run-1", task_id="a", entity=entity, field="price",
+            geography=geography, market="retail", time_scope={"year": 2026},
+            value=value, confidence=.9)
     different = [ref("c1", "one", "IL", 1), ref("c2", "two", "IL", 2)]
     same = [ref("c3", "shared", "IL", 1), ref("c4", "shared", "IL", 2)]
-    client = Plans(plan([task("a", "a")]), [{"decision": "FINISH", "plan": None, "reason": "done"}])
+    planned = task("a", "a")
+    planned["evidence"]["required_fields"] = ["price"]
+    client = Plans(plan([planned]), [{"decision": "FINISH", "plan": None, "reason": "done"}])
     events = []
     engine = SwarmV2Engine(commander=commander(client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker([]), max_active_workers=1),
@@ -162,7 +186,65 @@ def test_over_budget_replan_rejected_before_followup_execution():
     engine = SwarmV2Engine(commander=commander(client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls), max_active_workers=1),
         verifier=Verifier(gateway=VerifyGateway(), model="fake"),
-        remaining_budget=lambda: RemainingBudget(cost_units=0, tool_calls=0, tasks=0))
+        remaining_budget=lambda: (RemainingBudget(
+            cost_units=100, tool_calls=30, tasks=10, model_calls=10)
+            if not calls else RemainingBudget(
+                cost_units=0, tool_calls=0, tasks=0, model_calls=0)))
     with pytest.raises(ValueError, match="remaining budget"):
         engine.run({"id": "run-1", "input": {"objective": "budget", "commander_model": "fake"}})
     assert calls == ["a"]
+
+
+def test_logically_equal_json_values_do_not_create_false_conflicts():
+    planned = task("a", "a")
+    planned["evidence"]["required_fields"] = ["price"]
+    refs = [
+        EvidenceReference(claim_id="c1", source_id="s1", run_id="run-1",
+            task_id="a", entity="same", field="price", value={"a": 1, "b": 2},
+            confidence=.9),
+        EvidenceReference(claim_id="c2", source_id="s2", run_id="run-1",
+            task_id="a", entity="same", field="price", value={"b": 2, "a": 1},
+            confidence=.9),
+    ]
+    events = []
+    engine = SwarmV2Engine(
+        commander=commander(Plans(plan([planned]), [
+            {"decision": "FINISH", "plan": None, "reason": "done"}])),
+        executor=BoundedTaskExecutor(worker_factory=lambda: Worker([]), max_active_workers=1),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        evidence_loader=lambda _: refs, event_sink=lambda kind, payload: events.append((kind, payload)),
+    )
+    result = engine.run({"id": "run-1", "input": {
+        "objective": "canonical values", "commander_model": "fake"}})
+    assert result["status"] == "complete"
+    assert not [event for event in events if event[0] == "conflict_found"]
+
+
+def test_replan_cannot_mutate_a_completed_task():
+    initial = plan([task("a", "a")])
+    changed = plan([task("a", "changed")])
+    client = Plans(initial, [
+        {"decision": "REVISE_TASK", "plan": changed, "reason": "missing evidence"}])
+    calls = []
+    engine = SwarmV2Engine(
+        commander=commander(client),
+        executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls), max_active_workers=1),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+    )
+    with pytest.raises(ValueError, match="cannot revise or discard"):
+        engine.run({"id": "run-1", "input": {
+            "objective": "immutable completion", "commander_model": "fake"}})
+    assert calls == ["a"]
+
+
+def test_finish_fails_closed_when_required_evidence_is_missing():
+    initial = plan([task("a", "a")])
+    engine = SwarmV2Engine(
+        commander=commander(Plans(initial, [
+            {"decision": "FINISH", "plan": None, "reason": "done"}])),
+        executor=BoundedTaskExecutor(worker_factory=lambda: Worker([]), max_active_workers=1),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+    )
+    with pytest.raises(ValueError, match="completion criteria"):
+        engine.run({"id": "run-1", "input": {
+            "objective": "evidence required", "commander_model": "fake"}})
