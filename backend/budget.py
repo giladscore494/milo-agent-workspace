@@ -228,6 +228,60 @@ class BudgetTracker:
             "elapsed_seconds": round(self.clock() - self._started_at, 3),
         }
 
+    def restore_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Restore a trusted checkpoint's cumulative usage before resume.
+
+        A resumed worker must not regain per-run model, token, cost, retry or
+        agent-step capacity. In-flight reservations are deliberately not
+        restored; the previous process no longer owns them.
+        """
+        if not isinstance(snapshot, dict):
+            raise ValueError("budget snapshot must be an object")
+        allowed = {
+            "model_calls", "input_tokens", "output_tokens", "total_tokens",
+            "estimated_cost", "actual_cost", "retries",
+            "provider_backpressure_events", "agent_steps", "elapsed_seconds",
+        }
+        if set(snapshot) - allowed:
+            raise ValueError("budget snapshot contains unknown fields")
+        integer_fields = (
+            "model_calls", "input_tokens", "output_tokens", "retries",
+            "provider_backpressure_events", "agent_steps",
+        )
+        parsed_ints: dict[str, int] = {}
+        for name in integer_fields:
+            value = snapshot.get(name, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("budget snapshot contains an invalid counter")
+            parsed_ints[name] = value
+        declared_total = snapshot.get(
+            "total_tokens", parsed_ints["input_tokens"] + parsed_ints["output_tokens"]
+        )
+        if (isinstance(declared_total, bool) or not isinstance(declared_total, int) or
+                declared_total != parsed_ints["input_tokens"] + parsed_ints["output_tokens"]):
+            raise ValueError("budget snapshot token total is inconsistent")
+        import math
+        parsed_floats: dict[str, float] = {}
+        for name in ("estimated_cost", "actual_cost", "elapsed_seconds"):
+            value = snapshot.get(name, 0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("budget snapshot contains an invalid amount")
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric < 0:
+                raise ValueError("budget snapshot contains an invalid amount")
+            parsed_floats[name] = numeric
+        with self._lock:
+            if any((self.model_calls, self.input_tokens, self.output_tokens,
+                    self.estimated_cost, self.actual_cost, self.retries,
+                    self.provider_backpressure_events, self.agent_steps,
+                    self.reserved_input_tokens, self.reserved_output_tokens)):
+                raise ValueError("budget usage can only be restored into a fresh tracker")
+            for name, value in parsed_ints.items():
+                setattr(self, name, value)
+            self.estimated_cost = parsed_floats["estimated_cost"]
+            self.actual_cost = parsed_floats["actual_cost"]
+            self._started_at = self.clock() - parsed_floats["elapsed_seconds"]
+
     def elapsed(self) -> float:
         return self.clock() - self._started_at
 
