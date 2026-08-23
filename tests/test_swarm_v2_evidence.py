@@ -31,7 +31,7 @@ class GuardedEvidenceRepository:
         self.links.add((str(payload["source_id"]), row["id"]))
         return row
     def create_conflict(self, run_id, payload, **kwargs): return self._write("conflict", payload, kwargs)
-    def upsert_run_blackboard(self, run_id, payload, **kwargs):
+    def patch_run_blackboard_evidence(self, run_id, payload, **kwargs):
         assert kwargs["lease_token"] == self.lease.lease_token
         self.blackboard = payload
         return {"run_id": str(run_id), **payload}
@@ -60,11 +60,12 @@ def test_retry_resume_is_idempotent_and_traceable(board):
     usage = ToolUsageCreate(grant_id=uuid4(), agent="worker", tool="search", operation="query")
     assert evidence.record_tool_usage(usage, task_key="task-1")["id"] == evidence.record_tool_usage(usage, task_key="task-1")["id"]
     first = evidence.record_source(source(), task_key="task-1")
-    assert first["id"] == evidence.record_source(source(), task_key="task-1")["id"]
+    resumed = EvidenceBoard(repo, evidence.lease)
+    assert first["id"] == resumed.record_source(source(), task_key="task-1")["id"]
     item = claim(UUID(first["id"]), 100)
     saved = evidence.record_claim(item, task_key="task-1")
-    assert saved["id"] == evidence.record_claim(item, task_key="task-1")["id"]
-    trace = evidence.persist_trace_summary(goal="Compare price")
+    assert saved["id"] == resumed.record_claim(item, task_key="task-1")["id"]
+    trace = resumed.persist_trace_summary(goal="Compare price")
     assert trace["known_entities"] == [{
         "claim_id": saved["id"], "source_id": first["id"], "run_id": str(evidence.lease.run_id),
         "task_key": "task-1", "entity_key": "vehicle:1", "field_key": "price", "market": "IL",
@@ -97,3 +98,12 @@ def test_invalid_source_and_sensitive_reasoning_are_rejected(board):
         evidence.record_claim(unsafe, task_key="task")
     with pytest.raises(EvidenceValidationError, match="unsafe evidence text rejected"):
         evidence.detect_and_record_conflicts(task_key="task", rationale="hidden reasoning from provider")
+
+
+def test_tool_error_is_reduced_before_sensitive_payload_validation(board):
+    evidence, repo = board
+    usage = ToolUsageCreate(grant_id=uuid4(), agent="worker", tool="search", operation="query",
+                            status="failed", error={"code": "TIMEOUT", "provider_detail": "secret sentinel"})
+    row = evidence.record_tool_usage(usage, task_key="task")
+    assert row["error"] == {"code": "TIMEOUT"}
+    assert "secret sentinel" not in str(repo.tables).casefold()

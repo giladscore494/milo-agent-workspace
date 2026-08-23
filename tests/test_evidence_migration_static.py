@@ -7,6 +7,7 @@ RPCS = (
     "upsert_source_guarded",
     "create_claim_with_source_guarded",
     "create_conflict_guarded",
+    "patch_run_blackboard_evidence_guarded",
 )
 
 
@@ -19,11 +20,11 @@ def test_evidence_migration_is_rerun_safe_guarded_and_service_only():
         signature = f"public.{rpc}(uuid,text,integer,text,jsonb)"
         assert f"revoke execute on function %s from public" in sql
         assert signature in sql
-    assert sql.count("perform public.assert_worker_lease") == 4
+    assert sql.count("perform public.assert_worker_lease") == 5
     assert "grant execute on function %s to service_role" in sql
     assert "revoke execute on function %s from anon" in sql
     assert "revoke execute on function %s from authenticated" in sql
-    assert sql.count("set search_path = pg_catalog") == 4
+    assert sql.count("set search_path = pg_catalog") == 5
 
 
 def test_claim_and_link_are_atomic_and_conflicts_are_scope_checked():

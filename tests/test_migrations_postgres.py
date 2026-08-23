@@ -24,6 +24,7 @@ binaries are available, so a skip can never be mistaken for executable
 validation.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -1732,3 +1733,144 @@ def test_corrective_migration_is_rerun_safe(db):
     db.psql(file=migration)
     db.psql(file=migration)
     assert db.psql("select count(*) from pg_proc where proname='transition_run_worker_guarded'") == "1"
+
+
+# --- migration 20260823000100 (lease-guarded evidence writes) ---
+
+def _evidence_fixture(db, suffix: str):
+    run_a = _seed_stale_worker_run(db)
+    run_b = _seed_stale_worker_run(db)
+    attempt_a, token_a = db.psql(
+        f"select attempt, lease_token from public.claim_run_lease('{run_a}', 'evidence-{suffix}-a', 300)"
+    ).split("|")
+    attempt_b, token_b = db.psql(
+        f"select attempt, lease_token from public.claim_run_lease('{run_b}', 'evidence-{suffix}-b', 300)"
+    ).split("|")
+    grant_a = db.psql(
+        f"insert into public.tool_grants(run_id,agent,tool,max_searches,max_rounds,expires_at,approver_policy) "
+        f"values ('{run_a}','agent','search',10,2,now()+interval '1 hour','test') returning id"
+    )
+    grant_b = db.psql(
+        f"insert into public.tool_grants(run_id,agent,tool,max_searches,max_rounds,expires_at,approver_policy) "
+        f"values ('{run_b}','agent','search',10,2,now()+interval '1 hour','test') returning id"
+    )
+    return (run_a, "evidence-" + suffix + "-a", attempt_a, token_a, grant_a), (run_b, "evidence-" + suffix + "-b", attempt_b, token_b, grant_b)
+
+
+def _rpc_as_service(db, sql: str) -> str:
+    return db.psql(f"set role service_role; {sql}; reset role")
+
+
+def _source_json(key: str) -> str:
+    return json.dumps({"agent": "agent", "url": f"https://example.test/{key}", "title": "title",
+                       "domain": "example.test", "source_type": "primary", "source_strength": "strong",
+                       "query": "query", "tool_operation": "search", "evidence_key": key, "task_key": "task"})
+
+
+def _claim_json(key: str, source_id: str, value: int) -> str:
+    return json.dumps({"entity_key": "entity", "field_key": "price", "value": value,
+                       "time_scope": {"as_of": "2026-08"}, "market": "IL", "source_id": source_id,
+                       "source_strength": "strong", "confidence": .9, "agent": "agent",
+                       "evidence_key": key, "task_key": "task"})
+
+
+def test_evidence_rpcs_trusted_role_lifecycle_idempotency_and_blackboard_preservation(db):
+    lease, _ = _evidence_fixture(db, "life")
+    run_id, worker, attempt, token, grant = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    usage = json.dumps({"grant_id": grant, "agent": "agent", "tool": "search", "operation": "query",
+                        "status": "succeeded", "idempotency_key": "usage-life", "task_key": "task"})
+    assert _rpc_as_service(db, f"select id from public.create_tool_usage_guarded({args},'{usage}'::jsonb)")
+    source_1 = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('source-life-1')}'::jsonb)")
+    source_2 = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('source-life-2')}'::jsonb)")
+    claim_1 = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_claim_json('claim-life-1', source_1, 100)}'::jsonb)")
+    claim_2 = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_claim_json('claim-life-2', source_2, 120)}'::jsonb)")
+    conflict = json.dumps({"entity_key": "entity", "field_key": "price", "claim_ids": [claim_1, claim_2],
+                           "rationale": "values differ", "evidence_key": "conflict-life", "task_key": "review"})
+    assert _rpc_as_service(db, f"select id from public.create_conflict_guarded({args},'{conflict}'::jsonb)")
+    # Retry every operation through a fresh SQL call: all identities are stable.
+    _rpc_as_service(db, f"select id from public.create_tool_usage_guarded({args},'{usage}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('source-life-1')}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_claim_json('claim-life-1', source_1, 100)}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.create_conflict_guarded({args},'{conflict}'::jsonb)")
+    assert db.psql(f"select (select count(*) from public.tool_usage where run_id='{run_id}') || '|' || "
+                   f"(select count(*) from public.sources where run_id='{run_id}') || '|' || "
+                   f"(select count(*) from public.claims where run_id='{run_id}') || '|' || "
+                   f"(select count(*) from public.source_claim_links l join public.claims c on c.id=l.claim_id where c.run_id='{run_id}') || '|' || "
+                   f"(select count(*) from public.conflicts where run_id='{run_id}')") == "1|2|2|2|1"
+    db.psql(f"insert into public.run_blackboards(run_id,goal,approved_plan,completed_tasks,active_agents,open_questions,missing_fields,artifacts,remaining_budget,completion_score) "
+            f"values ('{run_id}','goal','{{\"plan\":1}}','[\"done\"]','[\"agent\"]','[\"q\"]','[\"field\"]','{{\"a\":1}}','{{\"units\":7}}',.75)")
+    summary = json.dumps({"known_entities": [{"claim_id": claim_1}], "claims_conflict_summaries": [{"conflict_id": "c"}]})
+    _rpc_as_service(db, f"select id from public.patch_run_blackboard_evidence_guarded({args},'{summary}'::jsonb)")
+    assert db.psql(f"select approved_plan::text || '|' || completed_tasks::text || '|' || active_agents::text || '|' || open_questions::text || '|' || missing_fields::text || '|' || artifacts::text || '|' || remaining_budget::text || '|' || completion_score from public.run_blackboards where run_id='{run_id}'") == '{"plan": 1}|["done"]|["agent"]|["q"]|["field"]|{"a": 1}|{"units": 7}|0.75'
+
+
+def test_evidence_rpc_acl_and_cross_run_provenance_guards(db):
+    lease_a, lease_b = _evidence_fixture(db, "cross")
+    run_a, worker_a, attempt_a, token_a, grant_a = lease_a
+    run_b, _, _, _, grant_b = lease_b
+    args = f"'{run_a}','{worker_a}',{attempt_a},'{token_a}'"
+    for role in ("anon", "authenticated"):
+        for rpc in ("create_tool_usage_guarded", "upsert_source_guarded",
+                    "create_claim_with_source_guarded", "create_conflict_guarded",
+                    "patch_run_blackboard_evidence_guarded"):
+            with pytest.raises(AssertionError, match="permission denied"):
+                db.psql(f"set role {role}; select public.{rpc}({args},'{{}}'::jsonb)")
+    for grant, agent, tool in ((grant_b, "agent", "search"), (grant_a, "wrong", "search"), (grant_a, "agent", "wrong")):
+        usage = json.dumps({"grant_id": grant, "agent": agent, "tool": tool, "operation": "query",
+                            "status": "succeeded", "idempotency_key": f"bad-{grant}-{agent}-{tool}", "task_key": "task"})
+        with pytest.raises(AssertionError, match="invalid tool grant"):
+            _rpc_as_service(db, f"select public.create_tool_usage_guarded({args},'{usage}'::jsonb)")
+    source_b = _rpc_as_service(db, f"select id from public.upsert_source_guarded('{run_b}','{lease_b[1]}',{lease_b[2]},'{lease_b[3]}','{_source_json('cross-source')}'::jsonb)")
+    with pytest.raises(AssertionError, match="invalid claim source"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{_claim_json('cross-claim', source_b, 1)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.claims where run_id='{run_a}' and evidence_key='cross-claim'") == "0"
+    source_a = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('cross-source-a')}'::jsonb)")
+    claim_a = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_claim_json('cross-claim-a', source_a, 1)}'::jsonb)")
+    claim_b = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded('{run_b}','{lease_b[1]}',{lease_b[2]},'{lease_b[3]}','{_claim_json('cross-claim-b', source_b, 2)}'::jsonb)")
+    mixed = json.dumps({"entity_key": "entity", "field_key": "price", "claim_ids": [claim_a, claim_b],
+                        "evidence_key": "cross-conflict", "task_key": "review"})
+    with pytest.raises(AssertionError, match="must exist, share one scope, and contradict"):
+        _rpc_as_service(db, f"select public.create_conflict_guarded({args},'{mixed}'::jsonb)")
+
+
+def test_evidence_stale_wrong_expired_leases_and_claim_link_rollback_write_nothing(db):
+    lease, _ = _evidence_fixture(db, "stale")
+    run_id, worker, attempt, token, grant = lease
+    source_payload = _source_json("never-written")
+    usage = json.dumps({"grant_id": grant, "agent": "agent", "tool": "search", "operation": "query",
+                        "status": "succeeded", "idempotency_key": "never-written", "task_key": "task"})
+    bad_leases = [("wrong", attempt, token, False), (worker, str(int(attempt) + 1), token, False),
+                  (worker, attempt, "wrong", False), (worker, attempt, token, True)]
+    for bad_worker, bad_attempt, bad_token, expire in bad_leases:
+        if expire:
+            db.psql(f"update public.runs set lease_expires_at=now()-interval '1 second' where id='{run_id}'")
+        bad = f"'{run_id}','{bad_worker}',{bad_attempt},'{bad_token}'"
+        for call in (f"select public.create_tool_usage_guarded({bad},'{usage}'::jsonb)",
+                     f"select public.upsert_source_guarded({bad},'{source_payload}'::jsonb)",
+                     f"select public.create_claim_with_source_guarded({bad},'{{}}'::jsonb)",
+                     f"select public.create_conflict_guarded({bad},'{{}}'::jsonb)",
+                     f"select public.patch_run_blackboard_evidence_guarded({bad},'{{}}'::jsonb)"):
+            with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+                _rpc_as_service(db, call)
+    assert db.psql(f"select (select count(*) from public.tool_usage where run_id='{run_id}') + (select count(*) from public.sources where run_id='{run_id}') + (select count(*) from public.claims where run_id='{run_id}') + (select count(*) from public.source_claim_links l join public.claims c on c.id=l.claim_id where c.run_id='{run_id}') + (select count(*) from public.conflicts where run_id='{run_id}') + (select count(*) from public.run_blackboards where run_id='{run_id}')") == "0"
+
+    # A forced link failure proves the claim inserted earlier in the same RPC rolls back.
+    db.psql(f"update public.runs set lease_expires_at=now()+interval '5 minutes' where id='{run_id}'")
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source_id = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('rollback-source')}'::jsonb)")
+    db.psql("create or replace function public.reject_test_link() returns trigger language plpgsql as $$ begin raise exception 'forced link failure'; end $$; create trigger reject_test_link before insert on public.source_claim_links for each row execute function public.reject_test_link()")
+    with pytest.raises(AssertionError, match="forced link failure"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{_claim_json('rollback-claim', source_id, 1)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.claims where run_id='{run_id}' and evidence_key='rollback-claim'") == "0"
+    db.psql("drop trigger reject_test_link on public.source_claim_links; drop function public.reject_test_link()")
+
+
+def test_evidence_migration_is_executably_rerun_safe(db):
+    migration = next(m for m in MIGRATIONS if "lease_guarded_evidence_writes" in m.name)
+    db.psql(file=migration)
+    db.psql(file=migration)
+    for name in ("create_tool_usage_guarded", "upsert_source_guarded",
+                 "create_claim_with_source_guarded", "create_conflict_guarded",
+                 "patch_run_blackboard_evidence_guarded"):
+        assert db.psql(f"select count(*) from pg_proc where proname='{name}'") == "1"

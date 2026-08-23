@@ -79,10 +79,16 @@ class EvidenceBoard:
                 "lease_token": self.lease.lease_token}
 
     def record_tool_usage(self, usage: ToolUsageCreate, *, task_key: str) -> dict[str, Any]:
-        payload = _safe(usage.model_dump(mode="json"))
+        payload = usage.model_dump(mode="json")
+        # Reduce potentially hostile provider error objects before the
+        # general evidence validator sees them.  Only a bounded code crosses
+        # the persistence boundary; messages/details/sentinels are discarded.
         if payload.get("error") is not None:
             code = payload["error"].get("code") if isinstance(payload["error"], Mapping) else None
-            payload["error"] = {"code": str(code or "TOOL_OPERATION_FAILED")[:80]}
+            raw_code = str(code or "TOOL_OPERATION_FAILED")
+            safe_code = "".join(ch for ch in raw_code if ch.isascii() and (ch.isalnum() or ch in "_-"))[:80]
+            payload["error"] = {"code": safe_code or "TOOL_OPERATION_FAILED"}
+        payload = _safe(payload)
         payload.update(task_key=self._task(task_key),
                        idempotency_key=_key("tool", {"task_key": task_key, **payload}))
         return self._repository.create_tool_usage(self.lease.run_id, payload, **self._lease_kwargs)
@@ -141,9 +147,9 @@ class EvidenceBoard:
         summaries = [{"conflict_id": row["id"], "claim_ids": row["claim_ids"],
                       "task_key": row["task_key"], "rationale": row.get("rationale")}
                      for row in self._conflicts.values()]
-        blackboard = {"goal": _safe(goal), "known_entities": claims,
-                      "claims_conflict_summaries": summaries}
-        return self._repository.upsert_run_blackboard(self.lease.run_id, blackboard, **self._lease_kwargs)
+        _safe(goal)  # validate caller text, but never overwrite blackboard goal/state
+        summary = {"known_entities": claims, "claims_conflict_summaries": summaries}
+        return self._repository.patch_run_blackboard_evidence(self.lease.run_id, summary, **self._lease_kwargs)
 
     @staticmethod
     def _task(task_key: str) -> str:

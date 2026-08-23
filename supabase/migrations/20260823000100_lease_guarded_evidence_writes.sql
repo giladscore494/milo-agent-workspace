@@ -30,7 +30,7 @@ create or replace function public.create_tool_usage_guarded(
 language plpgsql
 set search_path = pg_catalog
 as $$
-declare v_row public.tool_usage;
+declare v_row public.tool_usage; v_grant public.tool_grants;
 begin
   perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
   if p_usage::text ~* '"(chain_of_thought|provider_detail|raw_error|api_key|secret|password|authorization|credentials|exception|lease_token|token)"[[:space:]]*:'
@@ -39,6 +39,15 @@ begin
   end if;
   if nullif(p_usage->>'idempotency_key', '') is null then
     raise exception 'invalid tool usage: idempotency_key is required' using errcode = '22023';
+  end if;
+  select * into v_grant from public.tool_grants
+    where id = (p_usage->>'grant_id')::uuid
+      and run_id = p_run_id
+      and agent = p_usage->>'agent'
+      and tool = p_usage->>'tool'
+    for key share;
+  if v_grant.id is null then
+    raise exception 'invalid tool grant' using errcode = '23503';
   end if;
   insert into public.tool_usage
     (run_id, grant_id, agent, tool, operation, query, url, status, error, idempotency_key, task_key)
@@ -51,6 +60,32 @@ begin
     select * into v_row from public.tool_usage
       where run_id = p_run_id and idempotency_key = p_usage->>'idempotency_key';
   end if;
+  return next v_row;
+end;
+$$;
+
+-- Patch only Evidence Board-owned blackboard fields.  Unlike the general
+-- blackboard upsert this can never reset planning/execution state when an
+-- evidence worker persists a summary.
+create or replace function public.patch_run_blackboard_evidence_guarded(
+  p_run_id uuid, p_worker_id text, p_attempt integer, p_lease_token text,
+  p_summary jsonb
+) returns setof public.run_blackboards
+language plpgsql
+set search_path = pg_catalog
+as $$
+declare v_row public.run_blackboards;
+begin
+  perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
+  insert into public.run_blackboards
+    (run_id, goal, known_entities, claims_conflict_summaries)
+  values (p_run_id, '', coalesce(p_summary->'known_entities', '[]'::jsonb),
+          coalesce(p_summary->'claims_conflict_summaries', '[]'::jsonb))
+  on conflict (run_id) do update set
+    known_entities = excluded.known_entities,
+    claims_conflict_summaries = excluded.claims_conflict_summaries,
+    updated_at = now()
+  returning * into v_row;
   return next v_row;
 end;
 $$;
@@ -187,7 +222,8 @@ begin
     'public.create_tool_usage_guarded(uuid,text,integer,text,jsonb)',
     'public.upsert_source_guarded(uuid,text,integer,text,jsonb)',
     'public.create_claim_with_source_guarded(uuid,text,integer,text,jsonb)',
-    'public.create_conflict_guarded(uuid,text,integer,text,jsonb)'
+    'public.create_conflict_guarded(uuid,text,integer,text,jsonb)',
+    'public.patch_run_blackboard_evidence_guarded(uuid,text,integer,text,jsonb)'
   ] loop
     execute format('revoke execute on function %s from public', fn);
     if exists (select 1 from pg_roles where rolname='anon') then execute format('revoke execute on function %s from anon', fn); end if;
