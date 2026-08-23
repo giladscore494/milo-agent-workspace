@@ -199,3 +199,10 @@ def test_commander_output_is_inert_until_validation() -> None:
     with pytest.raises(PlanValidationError):
         commander.plan(requested_model="fake", objective="offline", context={})
     assert client.calls == 1
+
+
+def test_commander_cannot_disable_declared_evidence_requirements():
+    candidate = plan([task("research", "research")])
+    candidate["graph"]["tasks"][0]["completion"]["evidence_satisfied"] = False
+    with pytest.raises(PlanValidationError, match="cannot be disabled"):
+        validator().validate(candidate)
