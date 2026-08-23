@@ -39,15 +39,22 @@ _FORBIDDEN_KEYS = frozenset({
 _FORBIDDEN_TEXT = ("chain of thought", "hidden reasoning", "secret sentinel", "begin private key")
 
 
-def _safe(value: Any) -> Any:
+def _unsafe_key(key: Any) -> bool:
+    folded = str(key).casefold()
+    return (folded in _FORBIDDEN_KEYS or "api_key" in folded or "password" in folded or
+            "credential" in folded or "authorization" in folded or
+            folded.endswith("_secret") or folded in {"access_token", "refresh_token"})
+
+
+def safe_durable_value(value: Any) -> Any:
     """Return JSON-compatible evidence or fail with a sanitized error."""
     if isinstance(value, Mapping):
         for key in value:
-            if str(key).casefold() in _FORBIDDEN_KEYS:
+            if _unsafe_key(key):
                 raise EvidenceValidationError("unsafe evidence metadata rejected")
-        return {str(key): _safe(item) for key, item in value.items()}
+        return {str(key): safe_durable_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_safe(item) for item in value]
+        return [safe_durable_value(item) for item in value]
     if isinstance(value, str):
         folded = value.casefold()
         if any(marker in folded for marker in _FORBIDDEN_TEXT):
@@ -59,7 +66,7 @@ def _safe(value: Any) -> Any:
 
 
 def _key(kind: str, payload: Mapping[str, Any]) -> str:
-    encoded = json.dumps(_safe(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    encoded = json.dumps(safe_durable_value(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return f"{kind}:{hashlib.sha256(encoded.encode()).hexdigest()}"
 
 
@@ -88,13 +95,13 @@ class EvidenceBoard:
             raw_code = str(code or "TOOL_OPERATION_FAILED")
             safe_code = "".join(ch for ch in raw_code if ch.isascii() and (ch.isalnum() or ch in "_-"))[:80]
             payload["error"] = {"code": safe_code or "TOOL_OPERATION_FAILED"}
-        payload = _safe(payload)
+        payload = safe_durable_value(payload)
         payload.update(task_key=self._task(task_key),
                        idempotency_key=_key("tool", {"task_key": task_key, **payload}))
         return self._repository.create_tool_usage(self.lease.run_id, payload, **self._lease_kwargs)
 
     def record_source(self, source: SourceCreate, *, task_key: str) -> dict[str, Any]:
-        payload = _safe(source.model_dump(mode="json"))
+        payload = safe_durable_value(source.model_dump(mode="json"))
         payload.update(task_key=self._task(task_key),
                        evidence_key=_key("source", {"task_key": task_key, **payload}))
         row = self._repository.create_source(self.lease.run_id, payload, **self._lease_kwargs)
@@ -102,7 +109,7 @@ class EvidenceBoard:
         return row
 
     def record_claim(self, claim: ClaimCreate, *, task_key: str) -> dict[str, Any]:
-        payload = _safe(claim.model_dump(mode="json"))
+        payload = safe_durable_value(claim.model_dump(mode="json"))
         # Scope is exactly entity + field + market/geography + time.  Source,
         # confidence, run and task provenance remain attached to every claim.
         payload.update(task_key=self._task(task_key), evidence_key=_key("claim", {
@@ -129,7 +136,7 @@ class EvidenceBoard:
             ids = sorted(UUID(str(item["id"])) for item in claims)
             conflict = ConflictCreate(entity_key=claims[0]["entity_key"], field_key=claims[0]["field_key"],
                                       claim_ids=ids, rationale=rationale)
-            payload = _safe(conflict.model_dump(mode="json"))
+            payload = safe_durable_value(conflict.model_dump(mode="json"))
             payload.update(task_key=self._task(task_key), evidence_key=_key("conflict", payload))
             row = self._repository.create_conflict(self.lease.run_id, payload, **self._lease_kwargs)
             self._conflicts[str(row["id"])] = dict(row)
@@ -147,9 +154,19 @@ class EvidenceBoard:
         summaries = [{"conflict_id": row["id"], "claim_ids": row["claim_ids"],
                       "task_key": row["task_key"], "rationale": row.get("rationale")}
                      for row in self._conflicts.values()]
-        _safe(goal)  # validate caller text, but never overwrite blackboard goal/state
+        safe_durable_value(goal)  # validate caller text, but never overwrite blackboard goal/state
         summary = {"known_entities": claims, "claims_conflict_summaries": summaries}
         return self._repository.patch_run_blackboard_evidence(self.lease.run_id, summary, **self._lease_kwargs)
+
+    def references(self) -> list[dict[str, Any]]:
+        """Return compact references from the existing claim/source records."""
+        return [{"claim_id": str(row["id"]), "source_id": str(row["source_id"]),
+                 "run_id": str(self.lease.run_id), "task_id": row["task_key"],
+                 "entity": row["entity_key"], "field": row["field_key"],
+                 "geography": row.get("geography"), "market": row.get("market"),
+                 "time_scope": row.get("time_scope") or {}, "value": row.get("value"),
+                 "confidence": row["confidence"], "supported": True}
+                for row in self._claims.values()]
 
     @staticmethod
     def _task(task_key: str) -> str:
@@ -159,10 +176,10 @@ class EvidenceBoard:
 
     @staticmethod
     def _rationale(value: str) -> str:
-        safe = _safe(value.strip())
+        safe = safe_durable_value(value.strip())
         if not safe or len(safe) > 500:
             raise EvidenceValidationError("rationale summary must be 1-500 characters")
         return safe
 
 
-__all__ = ["EvidenceBoard", "EvidenceValidationError", "WorkerLease"]
+__all__ = ["EvidenceBoard", "EvidenceValidationError", "WorkerLease", "safe_durable_value"]

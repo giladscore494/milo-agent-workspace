@@ -18,11 +18,13 @@ class TaskResult:
 
 class GenericWorker:
     def __init__(self, *, gateway: ModelGateway, tools: ToolRegistry, model: str, tool_context: ToolContext,
-                 cancellation_checker: Callable[[], bool] | None = None):
+                 cancellation_checker: Callable[[], bool] | None = None,
+                 event_sink: Callable[[str, dict[str, Any]], None] | None = None):
         self._gateway, self._tools, self._model = gateway, tools, model
         self._tool_context = (replace(tool_context, cancellation_checker=cancellation_checker)
                               if cancellation_checker is not None else tool_context)
         self._cancelled = cancellation_checker
+        self._event_sink = event_sink
 
     def _check_cancelled(self) -> None:
         if self._cancelled and self._cancelled():
@@ -36,6 +38,8 @@ class GenericWorker:
                 tool_outputs[requirement.name] = self._tools.execute(
                     requirement.name, self._tool_context, {"query": task.goal}
                 )
+                if self._event_sink:
+                    self._event_sink("tool_called", {"task_id": task.task_id, "tool": requirement.name})
                 self._check_cancelled()
             self._check_cancelled()
             response = self._gateway.call(model=self._model, agent=f"worker:{task.task_id}", phase="execute",

@@ -533,3 +533,41 @@ def test_daily_ledger_cost_prefers_settled_actuals(monkeypatch):
     repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 2, "decision": "reserved", "estimated_cost": 0.05})
     assert repo.sum_daily_ledger_cost(user_id=user) == pytest.approx(0.07)
     assert repo.sum_daily_ledger_cost(user_id="someone-else") == 0.0
+
+
+def test_restore_snapshot_preserves_cumulative_run_limits():
+    tracker = make_tracker(max_model_calls_per_run=3)
+    tracker.restore_snapshot({
+        "model_calls": 2,
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "estimated_cost": 0.1,
+        "actual_cost": 0.08,
+        "retries": 1,
+        "provider_backpressure_events": 2,
+        "agent_steps": 3,
+        "elapsed_seconds": 4.0,
+    })
+    assert tracker.model_calls == 2
+    assert tracker.input_tokens == 10
+    assert tracker.output_tokens == 5
+    assert tracker.retries == 1
+    assert tracker.provider_backpressure_events == 2
+    assert tracker.agent_steps == 3
+    assert tracker.elapsed() >= 4.0
+    tracker.before_call()
+    with pytest.raises(BudgetExceeded) as exc:
+        tracker.before_call()
+    assert exc.value.code == "MODEL_CALL_LIMIT_REACHED"
+
+
+@pytest.mark.parametrize("snapshot", [
+    {"model_calls": -1},
+    {"model_calls": True},
+    {"unknown": 1},
+    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 1},
+])
+def test_restore_snapshot_rejects_malformed_usage(snapshot):
+    with pytest.raises(ValueError, match="budget snapshot"):
+        make_tracker().restore_snapshot(snapshot)

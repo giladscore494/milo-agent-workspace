@@ -75,16 +75,21 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # Routing is resolved from server-owned relations only. Do this before
         # checkpoint access and before invoking any engine factory.
         engine_builder = None
+        swarm_engine_builder = None
 
         def build_default_engine():
             if engine_builder is None:
                 raise RuntimeError("engine factory invoked before worker dependencies were ready")
             return engine_builder()
 
-        registry = engine_registry or EngineRegistry({
-            (engine.workflow_key if engine is not None else "vehicle_catalog_v1"):
-                (lambda: engine) if engine is not None else build_default_engine,
-        })
+        def build_swarm_engine():
+            if swarm_engine_builder is None:
+                raise RuntimeError("swarm engine factory invoked before worker dependencies were ready")
+            return swarm_engine_builder()
+
+        registry = engine_registry or EngineRegistry(
+            {engine.workflow_key: lambda: engine} if engine is not None else
+            {"vehicle_catalog_v1": build_default_engine, "swarm_v2": build_swarm_engine})
         try:
             resolved_engine = EngineResolver(repo, registry).resolve(run)
         except AppError as exc:
@@ -273,9 +278,75 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 agent_step_callback=record_agent_step, retry_callback=record_retry,
                 provider_limits=provider_limits, provider_backpressure_callback=record_provider_backpressure,
             )
-        selected_engine = resolved_engine.factory()
+            def make_swarm_engine():
+                from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander,
+                    CommanderModelResolver, EvidenceReference, GenericWorker, ModelGateway,
+                    PlanLimits, PlanValidator, RemainingBudget, SwarmV2Adapter, Verifier)
+                from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+                from backend.provider_scheduler import ProviderScheduler
+                from backend.tools import ToolContext, ToolRegistry
+
+                allowed = tuple(filter(None, (item.strip() for item in
+                    os.getenv("MILO_COMMANDER_MODEL_ALLOWLIST", "").split(","))))
+                commander_model = os.getenv("MILO_COMMANDER_MODEL", "").strip()
+                worker_model = os.getenv("MILO_SWARM_WORKER_MODEL", "").strip()
+                if not allowed or not commander_model or not worker_model or commander_model not in allowed:
+                    raise ValueError("Swarm V2 model configuration is incomplete or not allowlisted")
+                scheduler = ProviderScheduler(provider_limits,
+                    cancellation_checker=is_cancelled,
+                    backpressure_callback=record_provider_backpressure)
+                gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker),
+                    scheduler=scheduler, api_key=worker_provider_api_key(),
+                    base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
+                    cancellation_checker=is_cancelled, agent_step_callback=record_agent_step)
+                tools = ToolRegistry()  # real tools are registered explicitly; mocks never enter this path
+                limits = PlanLimits()
+                validator = PlanValidator(allowed_tools=tools.allowed_names, limits=limits)
+                commander = Commander(client=gateway,
+                    resolver=CommanderModelResolver(allowed, set(allowed)), validator=validator)
+                tool_context = ToolContext(cancellation_checker=is_cancelled)
+                executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
+                    gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
+                    cancellation_checker=is_cancelled, event_sink=forward_event),
+                    max_active_workers=BoundedTaskExecutor.configured_limit(),
+                    cancellation_checker=is_cancelled)
+                board = EvidenceBoard(repo, WorkerLease(run_id, worker_id,
+                    int(run.get("attempt") or 1), str(run.get("lease_token") or "")))
+                def remaining():
+                    cfg = tracker.config
+                    model_calls = max(
+                        0, (cfg.max_model_calls_per_run or
+                            (limits.max_tasks + 2)) - tracker.model_calls
+                    )
+                    return RemainingBudget(
+                        cost_units=limits.max_cost_units,
+                        tool_calls=limits.max_tool_calls,
+                        tasks=limits.max_tasks,
+                        model_calls=model_calls,
+                    )
+                return SwarmV2Adapter(commander=commander, executor=executor,
+                    verifier=Verifier(gateway=gateway, model=commander_model),
+                    evidence_loader=lambda _: [EvidenceReference.model_validate(item)
+                                               for item in board.references()],
+                    checkpoint_sink=save_checkpoint, event_sink=forward_event,
+                    usage_snapshot=tracker.snapshot, remaining_budget=remaining)
+            swarm_engine_builder = make_swarm_engine
         try:
-            result = selected_engine.run(run)
+            # Restore cumulative V2 usage before constructing any model path.
+            # A restarted worker must not regain per-run budget capacity.
+            if workflow_key == "swarm_v2" and latest_checkpoint:
+                checkpoint_usage = latest_checkpoint.get("token_usage") or {}
+                if not checkpoint_usage:
+                    checkpoint_usage = (((latest_checkpoint.get("artifacts") or {})
+                                         .get("swarm_state") or {})
+                                        .get("usage_snapshot") or {})
+                tracker.restore_snapshot(dict(checkpoint_usage))
+            selected_engine = resolved_engine.factory()
+            # V2 owns its versioned checkpoint compatibility checks. V1 keeps
+            # its existing artifact-based resume path above unchanged.
+            engine_run = ({**run, "checkpoint": latest_checkpoint}
+                          if workflow_key == "swarm_v2" and latest_checkpoint else run)
+            result = selected_engine.run(engine_run)
         except CancellationRequested:
             sink.emit(RunEventRecord(run_id=run_id, type="run_cancelled", message="Run cancelled", payload={}))
             shadow_observe("run_cancelled", {})
@@ -285,6 +356,21 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         except BudgetExceeded as exc:
             if hasattr(repo, "transition_run"):
                 repo.transition_run(run_id, exc.terminal_status, expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), error={"code": exc.code, "message": exc.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+            return 1
+        except Exception:
+            # Preserve V1 behavior. V2 validation/factory/provider failures are
+            # terminal and sanitized, but a stale worker is never allowed to
+            # write a failure after losing its lease.
+            if workflow_key != "swarm_v2" or not holds_lease():
+                raise
+            code = "SWARM_V2_FAILED"
+            message = "Swarm V2 execution failed"
+            sink.emit(RunEventRecord(run_id=run_id, type="run_failed",
+                                     message=message, payload={"code": code}))
+            shadow_observe("run_failed", {"code": code})
+            repo.mark_run_failed(run_id, code, message, worker_id=worker_id,
+                                 attempt=run.get("attempt"),
+                                 lease_token=run.get("lease_token"))
             return 1
         if tracker.stop is not None:
             # The engine absorbed per-agent failures, but a hard limit tripped:

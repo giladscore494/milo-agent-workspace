@@ -76,6 +76,10 @@ class PlanValidator:
             signatures.add(signature)
             if task.recursion_depth > limits.max_recursion_depth:
                 raise PlanValidationError("task recursion limit exceeded")
+            if (not task.completion.evidence_satisfied and
+                    (task.evidence.minimum_sources or task.evidence.required_fields)):
+                raise PlanValidationError(
+                    "evidence requirements cannot be disabled by completion criteria")
             for tool in task.tools:
                 if tool.name not in self._allowed_tools:
                     raise PlanValidationError(f"tool is not allowlisted: {tool.name}")
