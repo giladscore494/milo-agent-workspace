@@ -198,12 +198,20 @@ class SwarmV2Engine:
             failed = sorted(k for k, v in execution.tasks.items()
                             if v.status != "completed")
             gaps = self._coverage_gaps(plan, execution.tasks, evidence)
+            unresolved = bool(failed or gaps or conflict_ids)
             summary = {"completed": sorted(completed), "failed": failed,
                 "evidence": [{"claim_id": e.claim_id, "source_id": e.source_id,
                               "task_id": e.task_id, "field": e.field,
                               "confidence": e.confidence} for e in evidence],
                 "conflicts": sorted(conflict_ids), "gaps": gaps,
-                "remaining_budget": self._remaining_budget().model_dump(mode="json")}
+                "remaining_budget": self._remaining_budget().model_dump(mode="json"),
+                "decision_context": {
+                    "all_tasks_completed": len(completed) == len(plan.graph.tasks),
+                    "has_unresolved_issues": unresolved,
+                    "valid_terminal_decision": (
+                        "REQUEST_VERIFICATION" if unresolved else "FINISH"
+                    ),
+                }}
             decision = self._commander.replan(
                 requested_model=requested_model, objective=objective, summary=summary
             )

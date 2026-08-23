@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from types import SimpleNamespace
@@ -7,7 +8,21 @@ from types import SimpleNamespace
 import pytest
 
 from backend.budget import BudgetConfig, BudgetTracker, build_guarded_client_factory
-from backend.engines.swarm_v2 import BoundedTaskExecutor, GenericWorker, ModelGateway, TaskGraph, TaskResult
+from backend.engines.swarm_v2 import (
+    BoundedTaskExecutor,
+    CommanderDecision,
+    CommanderPlan,
+    GenericWorker,
+    ModelGateway,
+    PlanValidator,
+    TaskGraph,
+    TaskResult,
+)
+from backend.engines.swarm_v2.contracts import (
+    commander_decision_json_schema,
+    commander_plan_json_schema,
+)
+from backend.engines.swarm_v2.validation import PlanLimits
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
 from backend.tools import MockSearchTool, ToolContext, ToolError, ToolMode, ToolRegistry
@@ -173,3 +188,160 @@ def test_every_call_uses_one_gateway_guard_accounting_and_429_is_not_semantic_re
     assert tracker.provider_backpressure_events == 1
     assert tracker.retries == 0
     assert [item["decision"] for item in ledger] == ["reserved", "settled", "reserved", "settled"]
+
+class RecordingCompletions:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        message = SimpleNamespace(content=json.dumps(next(self.responses)))
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def _recording_gateway(responses, *, allowed_tools=()):
+    completions = RecordingCompletions(responses)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    scheduler = ProviderScheduler(ProviderLimitsConfig(
+        max_concurrency=1,
+        rpm_limit=None,
+        max_rate_limit_retries=0,
+        max_backpressure_wait_seconds=1,
+        backoff_base_seconds=.001,
+        backoff_max_seconds=.001,
+    ))
+    gateway = ModelGateway(
+        guarded_client_factory=lambda *_: client,
+        scheduler=scheduler,
+        api_key="offline",
+        base_url="offline",
+        allowed_tool_names=allowed_tools,
+    )
+    return gateway, completions
+
+
+def _canonical_schema(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _valid_provider_plan(*, tool_name=None):
+    tools = [] if tool_name is None else [{
+        "name": tool_name, "scope": "mock:search", "max_calls": 1,
+    }]
+    return {
+        "version": "1",
+        "objective": "offline",
+        "graph": {"tasks": [{
+            "task_id": "only",
+            "goal": "produce an offline answer",
+            "scope": "provided objective only",
+            "dependencies": [],
+            "tools": tools,
+            "output_schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+            "evidence": {
+                "minimum_sources": 0,
+                "required_fields": [],
+                "min_confidence": 0.0,
+            },
+            "priority": 1,
+            "recursion_depth": 0,
+            "estimated_cost_units": 1,
+            "completion": {
+                "required_outputs": ["answer"],
+                "evidence_satisfied": False,
+                "allow_partial": False,
+            },
+        }]},
+        "assignments": [{
+            "task_id": "only",
+            "worker_role": "generic",
+            "context_task_ids": [],
+        }],
+        "max_replans": 0,
+        "estimated_cost_units": 1,
+    }
+
+
+def test_real_model_commander_requests_authoritative_contracts_and_tools():
+    valid_plan = _valid_provider_plan()
+    finish = {"decision": "FINISH", "plan": None, "reason": "all tasks completed"}
+    gateway, completions = _recording_gateway([valid_plan, finish])
+
+    plan_payload = gateway.create_plan(
+        model="fake",
+        objective="offline",
+        context={"allowed_tools": ["user.injected"]},
+    )
+    decision_payload = gateway.create_replan(
+        model="fake",
+        objective="offline",
+        summary={
+            "decision_context": {
+                "all_tasks_completed": True,
+                "has_unresolved_issues": False,
+                "valid_terminal_decision": "FINISH",
+            }
+        },
+    )
+
+    assert CommanderPlan.model_validate_json(plan_payload)
+    assert CommanderDecision.model_validate_json(decision_payload)
+    assert all(call["response_format"] == {"type": "json_object"}
+               for call in completions.calls)
+
+    plan_system = completions.calls[0]["messages"][0]["content"]
+    decision_system = completions.calls[1]["messages"][0]["content"]
+    assert _canonical_schema(commander_plan_json_schema()) in plan_system
+    assert _canonical_schema(commander_decision_json_schema()) in decision_system
+    assert "Server-authorized tool names: []" in plan_system
+    assert "every task must use tools: []" in plan_system
+    assert "user.injected" not in plan_system
+    assert "ADD_TASKS and REVISE_TASK require a replacement plan" in decision_system
+    assert "REQUEST_VERIFICATION and FINISH forbid one" in decision_system
+
+
+def test_model_visible_tool_allowlist_is_sorted_and_validation_stays_fail_closed():
+    gateway, completions = _recording_gateway(
+        [_valid_provider_plan(tool_name="mock.search")],
+        allowed_tools=("mock.zeta", "mock.search"),
+    )
+    payload = gateway.create_plan(
+        model="fake", objective="offline", context={"allowed_tools": ["evil.write"]}
+    )
+    system = completions.calls[0]["messages"][0]["content"]
+    assert 'Server-authorized tool names: ["mock.search","mock.zeta"]' in system
+    assert "evil.write" not in system
+
+    validator = PlanValidator(
+        allowed_tools={"mock.search"},
+        limits=PlanLimits(max_tasks=1, max_tool_calls=1),
+    )
+    assert validator.validate(payload).graph.tasks[0].tools[0].name == "mock.search"
+
+    unknown = json.loads(payload)
+    unknown["graph"]["tasks"][0]["tools"][0]["name"] = "evil.write"
+    with pytest.raises(ValueError, match="allowlisted"):
+        validator.validate(unknown)
+
+    excessive = json.loads(payload)
+    excessive["graph"]["tasks"].append({
+        **excessive["graph"]["tasks"][0],
+        "task_id": "second",
+    })
+    excessive["assignments"].append({
+        "task_id": "second",
+        "worker_role": "generic",
+        "context_task_ids": [],
+    })
+    with pytest.raises(ValueError, match="task count limit"):
+        validator.validate(excessive)
+
+    with pytest.raises(ValueError):
+        validator.validate({"version": "1"})
+
