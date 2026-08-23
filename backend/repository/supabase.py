@@ -40,10 +40,11 @@ class Repository(Protocol):
     def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any], created_by: UUID | None = None) -> dict[str, Any]: ...
     def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]: ...
     def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]: ...
-    def create_tool_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]: ...
-    def create_source(self, run_id: UUID, source: dict[str, Any]) -> dict[str, Any]: ...
-    def create_claim(self, run_id: UUID, claim: dict[str, Any]) -> dict[str, Any]: ...
-    def create_conflict(self, run_id: UUID, conflict: dict[str, Any]) -> dict[str, Any]: ...
+    def create_tool_usage(self, run_id: UUID, usage: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_source(self, run_id: UUID, source: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_claim(self, run_id: UUID, claim: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_conflict(self, run_id: UUID, conflict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -342,7 +343,10 @@ class SupabaseRepository:
         except Exception as exc:
             if self._is_stale_lease_error(exc):
                 raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409) from exc
-            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+            # Provider/PostgREST details can contain SQL values, URLs, or
+            # credentials.  Keep the original exception only as an internal
+            # cause; durable/API-visible errors are deliberately generic.
+            raise AppError("REPOSITORY_ERROR", "guarded persistence operation failed", 502) from exc
         if isinstance(data, list):
             data = data[0] if data else None
         if data is None:
@@ -596,23 +600,32 @@ class SupabaseRepository:
             self.client.table("tool_access_requests").update({"status": "granted"}).eq("id", str(payload["request_id"])).execute()
         return self._single(self.client.table("tool_grants").insert(payload).select("*"), "tool_grant", "new")
 
-    def create_tool_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]:
-        payload = {"run_id": str(run_id), **usage}
-        return self._single(self.client.table("tool_usage").insert(payload).select("*"), "tool_usage", "new")
+    @staticmethod
+    def _lease_params(run_id: UUID, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        if not worker_id or not lease_token or attempt < 1:
+            raise AppError("INVALID_WORKER_LEASE", "complete worker lease is required", 422)
+        return {"p_run_id": str(run_id), "p_worker_id": worker_id,
+                "p_attempt": attempt, "p_lease_token": lease_token}
 
-    def create_source(self, run_id: UUID, source: dict[str, Any]) -> dict[str, Any]:
-        payload = {"run_id": str(run_id), **source}
-        return self._single(self.client.table("sources").insert(payload).select("*"), "source", "new")
+    def create_tool_usage(self, run_id: UUID, usage: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_usage": usage}
+        return self._guarded_rpc("create_tool_usage_guarded", params, "tool_usage")
 
-    def create_claim(self, run_id: UUID, claim: dict[str, Any]) -> dict[str, Any]:
-        payload = {"run_id": str(run_id), **claim}
-        row = self._single(self.client.table("claims").insert(payload).select("*"), "claim", "new")
-        self.client.table("source_claim_links").insert({"source_id": str(row["source_id"]), "claim_id": str(row["id"])}).execute()
-        return row
+    def create_source(self, run_id: UUID, source: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_source": source}
+        return self._guarded_rpc("upsert_source_guarded", params, "source")
 
-    def create_conflict(self, run_id: UUID, conflict: dict[str, Any]) -> dict[str, Any]:
-        payload = {"run_id": str(run_id), **conflict}
-        return self._single(self.client.table("conflicts").insert(payload).select("*"), "conflict", "new")
+    def create_claim(self, run_id: UUID, claim: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_claim": claim}
+        return self._guarded_rpc("create_claim_with_source_guarded", params, "claim")
+
+    def create_conflict(self, run_id: UUID, conflict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_conflict": conflict}
+        return self._guarded_rpc("create_conflict_guarded", params, "conflict")
+
+    def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_summary": summary}
+        return self._guarded_rpc("patch_run_blackboard_evidence_guarded", params, "run_blackboard")
 
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]:
         payload = {"run_id": str(run_id), "launcher": invocation.get("mode"), "execution_name": invocation.get("execution"), "payload": invocation}
