@@ -1787,7 +1787,7 @@ def test_evidence_rpcs_trusted_role_lifecycle_idempotency_and_blackboard_preserv
     claim_2 = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_claim_json('claim-life-2', source_2, 120)}'::jsonb)")
     conflict = json.dumps({"entity_key": "entity", "field_key": "price", "claim_ids": [claim_1, claim_2],
                            "rationale": "values differ", "evidence_key": "conflict-life", "task_key": "review"})
-    assert _rpc_as_service(db, f"select id from public.create_conflict_guarded({args},'{conflict}'::jsonb)")
+    conflict_id = _rpc_as_service(db, f"select id from public.create_conflict_guarded({args},'{conflict}'::jsonb)")
     # Retry every operation through a fresh SQL call: all identities are stable.
     _rpc_as_service(db, f"select id from public.create_tool_usage_guarded({args},'{usage}'::jsonb)")
     _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('source-life-1')}'::jsonb)")
@@ -1800,9 +1800,31 @@ def test_evidence_rpcs_trusted_role_lifecycle_idempotency_and_blackboard_preserv
                    f"(select count(*) from public.conflicts where run_id='{run_id}')") == "1|2|2|2|1"
     db.psql(f"insert into public.run_blackboards(run_id,goal,approved_plan,completed_tasks,active_agents,open_questions,missing_fields,artifacts,remaining_budget,completion_score) "
             f"values ('{run_id}','goal','{{\"plan\":1}}','[\"done\"]','[\"agent\"]','[\"q\"]','[\"field\"]','{{\"a\":1}}','{{\"units\":7}}',.75)")
-    summary = json.dumps({"known_entities": [{"claim_id": claim_1}], "claims_conflict_summaries": [{"conflict_id": "c"}]})
-    _rpc_as_service(db, f"select id from public.patch_run_blackboard_evidence_guarded({args},'{summary}'::jsonb)")
+    summary_a = json.dumps({"known_entities": [{"claim_id": claim_1, "task_key": "task-a"}],
+                            "claims_conflict_summaries": [{"conflict_id": conflict_id, "task_key": "task-a"}]})
+    summary_b = json.dumps({"known_entities": [{"claim_id": claim_2, "task_key": "task-b"}],
+                            "claims_conflict_summaries": [{"conflict_id": "00000000-0000-4000-8000-000000000061", "task_key": "task-b"}]})
+    _rpc_as_service(db, f"select id from public.patch_run_blackboard_evidence_guarded({args},'{summary_a}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.patch_run_blackboard_evidence_guarded({args},'{summary_b}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.patch_run_blackboard_evidence_guarded({args},'{summary_b}'::jsonb)")
+    assert db.psql(f"select jsonb_array_length(known_entities) || '|' || jsonb_array_length(claims_conflict_summaries) || '|' || "
+                   f"(select count(distinct item->>'claim_id') from jsonb_array_elements(known_entities) item) || '|' || "
+                   f"(select count(distinct item->>'conflict_id') from jsonb_array_elements(claims_conflict_summaries) item) "
+                   f"from public.run_blackboards where run_id='{run_id}'") == "2|2|2|2"
     assert db.psql(f"select approved_plan::text || '|' || completed_tasks::text || '|' || active_agents::text || '|' || open_questions::text || '|' || missing_fields::text || '|' || artifacts::text || '|' || remaining_budget::text || '|' || completion_score from public.run_blackboards where run_id='{run_id}'") == '{"plan": 1}|["done"]|["agent"]|["q"]|["field"]|{"a": 1}|{"units": 7}|0.75'
+    before = db.psql(f"select known_entities::text || '|' || claims_conflict_summaries::text || '|' || updated_at::text from public.run_blackboards where run_id='{run_id}'")
+    invalid_summaries = [
+        {"known_entities": [], "claims_conflict_summaries": [], "artifacts": {}},
+        {"known_entities": {}, "claims_conflict_summaries": []},
+        {"known_entities": [], "claims_conflict_summaries": {}},
+        {"known_entities": [{"claim_id": "x", "provider_detail": "secret sentinel"}], "claims_conflict_summaries": []},
+    ]
+    for invalid in invalid_summaries:
+        payload = json.dumps(invalid)
+        with pytest.raises(AssertionError, match="invalid evidence summary|unsafe evidence payload rejected"):
+            _rpc_as_service(db, f"select public.patch_run_blackboard_evidence_guarded({args},'{payload}'::jsonb)")
+    after = db.psql(f"select known_entities::text || '|' || claims_conflict_summaries::text || '|' || updated_at::text from public.run_blackboards where run_id='{run_id}'")
+    assert after == before
 
 
 def test_evidence_rpc_acl_and_cross_run_provenance_guards(db):

@@ -77,13 +77,57 @@ as $$
 declare v_row public.run_blackboards;
 begin
   perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
-  insert into public.run_blackboards
+  if p_summary is null or jsonb_typeof(p_summary) <> 'object' then
+    raise exception 'invalid evidence summary' using errcode = '22023';
+  end if;
+  if not (p_summary ? 'known_entities')
+     or not (p_summary ? 'claims_conflict_summaries')
+     or jsonb_typeof(p_summary->'known_entities') <> 'array'
+     or jsonb_typeof(p_summary->'claims_conflict_summaries') <> 'array'
+     or exists (select 1 from jsonb_object_keys(p_summary) as keys(key)
+                where key not in ('known_entities', 'claims_conflict_summaries')) then
+    raise exception 'invalid evidence summary' using errcode = '22023';
+  end if;
+  if exists (select 1 from jsonb_array_elements(p_summary->'known_entities') as item
+                where jsonb_typeof(item) <> 'object' or nullif(item->>'claim_id', '') is null)
+     or exists (select 1 from jsonb_array_elements(p_summary->'claims_conflict_summaries') as item
+                where jsonb_typeof(item) <> 'object' or nullif(item->>'conflict_id', '') is null) then
+    raise exception 'invalid evidence summary' using errcode = '22023';
+  end if;
+  if p_summary::text ~* '"(chain_of_thought|provider_detail|raw_error|api_key|secret|password|authorization|credentials|exception|lease_token|token)"[[:space:]]*:'
+     or lower(p_summary::text) like '%secret sentinel%'
+     or lower(p_summary::text) like '%chain of thought%'
+     or lower(p_summary::text) like '%hidden reasoning%' then
+    raise exception 'unsafe evidence payload rejected' using errcode = '22023';
+  end if;
+  insert into public.run_blackboards as existing
     (run_id, goal, known_entities, claims_conflict_summaries)
-  values (p_run_id, '', coalesce(p_summary->'known_entities', '[]'::jsonb),
-          coalesce(p_summary->'claims_conflict_summaries', '[]'::jsonb))
+  values (p_run_id, '', p_summary->'known_entities', p_summary->'claims_conflict_summaries')
   on conflict (run_id) do update set
-    known_entities = excluded.known_entities,
-    claims_conflict_summaries = excluded.claims_conflict_summaries,
+    known_entities = (
+      select coalesce(jsonb_agg(d.item order by d.item->>'claim_id'), '[]'::jsonb)
+      from (
+        select distinct on (merged.item->>'claim_id') merged.item
+        from (
+          select item, 0 as priority from jsonb_array_elements(existing.known_entities) as item
+          union all
+          select item, 1 as priority from jsonb_array_elements(excluded.known_entities) as item
+        ) as merged
+        order by merged.item->>'claim_id', merged.priority, merged.item::text
+      ) as d
+    ),
+    claims_conflict_summaries = (
+      select coalesce(jsonb_agg(d.item order by d.item->>'conflict_id'), '[]'::jsonb)
+      from (
+        select distinct on (merged.item->>'conflict_id') merged.item
+        from (
+          select item, 0 as priority from jsonb_array_elements(existing.claims_conflict_summaries) as item
+          union all
+          select item, 1 as priority from jsonb_array_elements(excluded.claims_conflict_summaries) as item
+        ) as merged
+        order by merged.item->>'conflict_id', merged.priority, merged.item::text
+      ) as d
+    ),
     updated_at = now()
   returning * into v_row;
   return next v_row;

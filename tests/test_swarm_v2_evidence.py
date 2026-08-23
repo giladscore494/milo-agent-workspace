@@ -33,8 +33,14 @@ class GuardedEvidenceRepository:
     def create_conflict(self, run_id, payload, **kwargs): return self._write("conflict", payload, kwargs)
     def patch_run_blackboard_evidence(self, run_id, payload, **kwargs):
         assert kwargs["lease_token"] == self.lease.lease_token
-        self.blackboard = payload
-        return {"run_id": str(run_id), **payload}
+        current = self.blackboard or {"approved_plan": {"keep": True}, "completed_tasks": ["done"]}
+        claims = {item["claim_id"]: item for item in current.get("known_entities", [])}
+        claims.update({item["claim_id"]: item for item in payload["known_entities"]})
+        conflicts = {item["conflict_id"]: item for item in current.get("claims_conflict_summaries", [])}
+        conflicts.update({item["conflict_id"]: item for item in payload["claims_conflict_summaries"]})
+        self.blackboard = {**current, "known_entities": [claims[key] for key in sorted(claims)],
+                           "claims_conflict_summaries": [conflicts[key] for key in sorted(conflicts)]}
+        return {"run_id": str(run_id), **self.blackboard}
 
 
 @pytest.fixture
@@ -107,3 +113,28 @@ def test_tool_error_is_reduced_before_sensitive_payload_validation(board):
     row = evidence.record_tool_usage(usage, task_key="task")
     assert row["error"] == {"code": "TIMEOUT"}
     assert "secret sentinel" not in str(repo.tables).casefold()
+
+
+def test_fresh_board_summary_merges_prior_task_traces_idempotently(board):
+    board_a, repo = board
+    source_ids = [UUID(board_a.record_source(source(f"https://example.test/a-{i}"), task_key="task-a")["id"])
+                  for i in range(2)]
+    board_a.record_claim(claim(source_ids[0], 100), task_key="task-a")
+    board_a.record_claim(claim(source_ids[1], 110), task_key="task-a")
+    board_a.detect_and_record_conflicts(task_key="task-a")
+    first = board_a.persist_trace_summary()
+
+    board_b = EvidenceBoard(repo, board_a.lease)
+    source_ids = [UUID(board_b.record_source(source(f"https://example.test/b-{i}"), task_key="task-b")["id"])
+                  for i in range(2)]
+    board_b.record_claim(claim(source_ids[0], 120, market="US"), task_key="task-b")
+    board_b.record_claim(claim(source_ids[1], 130, market="US"), task_key="task-b")
+    board_b.detect_and_record_conflicts(task_key="task-b")
+    merged = board_b.persist_trace_summary()
+    retried = board_b.persist_trace_summary()
+
+    assert len(first["known_entities"]) == 2 and len(first["claims_conflict_summaries"]) == 1
+    assert len(merged["known_entities"]) == 4 and len(merged["claims_conflict_summaries"]) == 2
+    assert retried["known_entities"] == merged["known_entities"]
+    assert retried["claims_conflict_summaries"] == merged["claims_conflict_summaries"]
+    assert merged["approved_plan"] == {"keep": True} and merged["completed_tasks"] == ["done"]
