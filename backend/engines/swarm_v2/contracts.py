@@ -118,3 +118,35 @@ class CommanderPlan(StrictContract):
             if not set(assignment.context_task_ids) <= task_ids:
                 raise ValueError("assignment context references an unknown task")
         return self
+
+
+class CommanderDecision(StrictContract):
+    """A replan is inert data until its replacement plan is validated."""
+
+    decision: Literal["ADD_TASKS", "REVISE_TASK", "REQUEST_VERIFICATION", "FINISH"]
+    plan: CommanderPlan | None = None
+    reason: str = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def plan_matches_decision(self) -> "CommanderDecision":
+        needs_plan = self.decision in {"ADD_TASKS", "REVISE_TASK"}
+        if needs_plan != (self.plan is not None):
+            raise ValueError("ADD_TASKS/REVISE_TASK require a plan and terminal decisions forbid one")
+        return self
+
+
+class EvidenceReference(StrictContract):
+    claim_id: str = Field(min_length=1, max_length=200)
+    source_id: str = Field(min_length=1, max_length=200)
+    run_id: str = Field(min_length=1, max_length=200)
+    task_id: str = Field(min_length=1, max_length=80)
+    field: str = Field(min_length=1, max_length=200)
+    value: Any
+    confidence: float = Field(ge=0, le=1)
+    supported: bool = True
+
+
+class VerificationVerdict(StrictContract):
+    claim_id: str = Field(min_length=1, max_length=200)
+    verdict: Literal["verified", "needs_review", "rejected"]
+    reason: str = Field(min_length=1, max_length=500)

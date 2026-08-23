@@ -275,7 +275,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             )
         selected_engine = resolved_engine.factory()
         try:
-            result = selected_engine.run(run)
+            # V2 owns its versioned checkpoint compatibility checks. V1 keeps
+            # its existing artifact-based resume path above unchanged.
+            engine_run = ({**run, "checkpoint": latest_checkpoint}
+                          if workflow_key == "swarm_v2" and latest_checkpoint else run)
+            result = selected_engine.run(engine_run)
         except CancellationRequested:
             sink.emit(RunEventRecord(run_id=run_id, type="run_cancelled", message="Run cancelled", payload={}))
             shadow_observe("run_cancelled", {})

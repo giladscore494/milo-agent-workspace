@@ -5,7 +5,7 @@ import os
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Mapping
 from backend.runtime import CancellationRequested
 from .contracts import TaskGraph
 from .worker import GenericWorker, TaskResult
@@ -37,8 +37,14 @@ class BoundedTaskExecutor:
         if self._cancelled and self._cancelled():
             raise CancellationRequested("RUN_CANCELLED")
 
-    def execute(self, graph: TaskGraph) -> ExecutionResult:
-        tasks, remaining, results = {t.task_id: t for t in graph.tasks}, {t.task_id for t in graph.tasks}, {}
+    def execute(self, graph: TaskGraph, *, completed: Mapping[str, TaskResult] | None = None,
+                event_sink: Callable[[str, dict], None] | None = None,
+                task_completed: Callable[[TaskResult], None] | None = None) -> ExecutionResult:
+        tasks = {t.task_id: t for t in graph.tasks}
+        results = dict(completed or {})
+        if not set(results) <= set(tasks) or any(r.status != "completed" for r in results.values()):
+            raise ValueError("resume results are incompatible with task graph")
+        remaining = set(tasks) - set(results)
         running: dict[Future[TaskResult], str] = {}
         active = peak = 0
         active_lock = threading.Lock()
@@ -69,13 +75,24 @@ class BoundedTaskExecutor:
                 while ready and len(running) < self._limit:
                     _, task_id = heapq.heappop(ready)
                     if task_id in remaining:
-                        remaining.remove(task_id); running[pool.submit(run, task_id)] = task_id
+                        remaining.remove(task_id)
+                        if event_sink: event_sink("task_ready", {"task_id": task_id})
+                        if event_sink: event_sink("task_started", {"task_id": task_id})
+                        running[pool.submit(run, task_id)] = task_id
                 if not running:
                     if remaining: raise ValueError("task graph is cyclic or has missing dependencies")
                     break
                 done, _ = wait(running, return_when=FIRST_COMPLETED, timeout=.05)
                 for future in done:
-                    results[running.pop(future)] = future.result()
+                    task_id = running.pop(future)
+                    result = future.result()
+                    results[task_id] = result
+                    if event_sink:
+                        event_sink("task_completed" if result.status == "completed" else "task_failed",
+                                   {"task_id": task_id, "status": result.status,
+                                    **({"code": result.error.get("code", "TASK_FAILED")} if result.error else {})})
+                    if result.status == "completed" and task_completed:
+                        task_completed(result)
             return ExecutionResult(results, peak)
         except CancellationRequested:
             for future in running: future.cancel()

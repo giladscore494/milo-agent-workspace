@@ -2,7 +2,7 @@
 
 from typing import Any, Mapping
 from .adapters import CommanderClient
-from .contracts import CommanderPlan
+from .contracts import CommanderDecision, CommanderPlan
 from .models import CommanderModelResolver
 from .validation import PlanValidator
 
@@ -17,3 +17,22 @@ class Commander:
         model = self._resolver.resolve(requested_model)
         inert_json = self._client.create_plan(model=model, objective=objective, context=context)
         return self._validator.validate(inert_json)
+
+    def replan(self, *, requested_model: str, objective: str,
+               summary: Mapping[str, Any]) -> CommanderDecision:
+        """Give the model only the compact, provider-neutral run summary."""
+        model = self._resolver.resolve(requested_model)
+        create = getattr(self._client, "create_replan", None)
+        inert = (create(model=model, objective=objective, summary=summary) if create else
+                 self._client.create_plan(model=model, objective=objective, context={"status": summary}))
+        decision = CommanderDecision.model_validate_json(inert) if isinstance(inert, (str, bytes)) else CommanderDecision.model_validate(inert)
+        if decision.plan is not None:
+            # Re-parse through the same deterministic firewall; nested Pydantic
+            # validation alone is deliberately not authorization.
+            validated = self._validator.validate(decision.plan.model_dump(mode="json"))
+            decision = decision.model_copy(update={"plan": validated})
+        return decision
+
+    def validate_saved_plan(self, candidate: Mapping[str, Any]) -> CommanderPlan:
+        """Re-authorize checkpoint data through the deterministic firewall."""
+        return self._validator.validate(dict(candidate))

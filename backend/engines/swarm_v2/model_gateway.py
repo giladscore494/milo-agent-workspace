@@ -35,3 +35,11 @@ class ModelGateway:
             if isinstance(response, (str, bytes, dict)):
                 return response
             raise ValueError("model gateway received an invalid completion response") from None
+
+    def create_replan(self, *, model: str, objective: str, summary: Mapping[str, Any]) -> str | bytes | dict[str, Any]:
+        response = self.call(model=model, agent="commander", phase="replanning", response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": "Return a CommanderDecision JSON object. Never request raw traces."},
+                      {"role": "user", "content": json.dumps({"objective": objective, "status": summary}, sort_keys=True)}])
+        if isinstance(response, (str, bytes, dict)):
+            return response
+        return response.choices[0].message.content
