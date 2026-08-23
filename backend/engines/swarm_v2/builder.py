@@ -11,7 +11,10 @@ class FinalBuilder:
         for item in sorted(evidence, key=lambda x: (x.field, x.claim_id)):
             verdict = verdict_by_claim.get(item.claim_id)
             trace = {"claim_id": item.claim_id, "source_id": item.source_id,
-                     "run_id": item.run_id, "task_id": item.task_id}
+                     "run_id": item.run_id, "task_id": item.task_id,
+                     "scope": {"entity": item.entity, "field": item.field,
+                               "geography": item.geography, "market": item.market,
+                               "time_scope": item.time_scope}}
             if verdict and verdict.verdict == "verified" and item.supported:
                 fields.setdefault(item.field, []).append({"value": item.value, "provenance": trace})
             elif verdict and verdict.verdict == "needs_review":
