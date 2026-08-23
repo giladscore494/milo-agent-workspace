@@ -68,9 +68,14 @@ class FakeClient:
         self.inserted = []
         self.updated = []
         self.select_data = {}
+        self.rpc_calls = []
 
     def table(self, name):
         return FakeQuery(self, name)
+
+    def rpc(self, name, params):
+        self.rpc_calls.append((name, params))
+        return type("Rpc", (), {"execute": lambda self: FakeResult([{"id": str(uuid4())}])})()
 
 
 @pytest.fixture
@@ -78,6 +83,28 @@ def repo():
     repository = SupabaseRepository.__new__(SupabaseRepository)
     repository.client = FakeClient()
     return repository
+
+
+@pytest.mark.parametrize("method,rpc,payload_name", [
+    ("create_tool_usage", "create_tool_usage_guarded", "p_usage"),
+    ("create_source", "upsert_source_guarded", "p_source"),
+    ("create_claim", "create_claim_with_source_guarded", "p_claim"),
+    ("create_conflict", "create_conflict_guarded", "p_conflict"),
+])
+def test_evidence_writes_use_only_complete_lease_guarded_rpcs(repo, method, rpc, payload_name):
+    payload = {"structured": True}
+    getattr(repo, method)(uuid4(), payload, worker_id="worker-1", attempt=3, lease_token="lease-1")
+    name, params = repo.client.rpc_calls[-1]
+    assert name == rpc
+    assert params[payload_name] == payload
+    assert (params["p_worker_id"], params["p_attempt"], params["p_lease_token"]) == ("worker-1", 3, "lease-1")
+    assert repo.client.inserted == []
+
+
+def test_evidence_writes_reject_incomplete_lease_before_rpc(repo):
+    with pytest.raises(Exception, match="complete worker lease is required"):
+        repo.create_source(uuid4(), {}, worker_id="", attempt=0, lease_token="")
+    assert repo.client.rpc_calls == []
 
 
 @pytest.mark.parametrize("title", [None, "", "   "])
