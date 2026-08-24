@@ -10,7 +10,10 @@ import pytest
 from backend.budget import BudgetConfig, BudgetTracker, build_guarded_client_factory
 from backend.engines.swarm_v2 import (
     BoundedTaskExecutor,
+    Commander,
     CommanderDecision,
+    CommanderModelResolver,
+    CommanderPlanFailure,
     CommanderPlan,
     GenericWorker,
     ModelGateway,
@@ -268,6 +271,104 @@ def _valid_provider_plan(*, tool_name=None):
     }
 
 
+def _commander_for_gateway(gateway, *, max_tasks=64):
+    return Commander(
+        client=gateway,
+        resolver=CommanderModelResolver(("fake",), {"fake"}),
+        validator=PlanValidator(
+            allowed_tools=set(), limits=PlanLimits(max_tasks=max_tasks)
+        ),
+    )
+
+
+def test_provider_shaped_json_string_traverses_completion_decode_schema_and_limits():
+    gateway, _ = _recording_gateway([_valid_provider_plan()])
+    approved = _commander_for_gateway(gateway).plan(
+        requested_model="fake", objective="offline", context={}
+    )
+    assert approved.graph.tasks[0].task_id == "only"
+
+
+@pytest.mark.parametrize("content", [None, ""])
+def test_empty_provider_content_has_stable_completion_shape_code(content):
+    class Completions:
+        def create(self, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=content)
+            )])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    gateway, _ = _recording_gateway([_valid_provider_plan()])
+    gateway._client = client
+    with pytest.raises(CommanderPlanFailure) as failure:
+        _commander_for_gateway(gateway).plan(
+            requested_model="fake", objective="offline", context={}
+        )
+    assert failure.value.code == "COMMANDER_COMPLETION_SHAPE_INVALID"
+
+
+@pytest.mark.parametrize("content,code", [
+    ("{broken", "COMMANDER_PLAN_JSON_INVALID"),
+    (json.dumps({"version": "1"}), "COMMANDER_PLAN_SCHEMA_INVALID"),
+])
+def test_bad_provider_plan_has_only_stable_safe_code(content, code):
+    sentinel = "SECRET_PROVIDER_SENTINEL"
+    class Completions:
+        def create(self, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=content + sentinel)
+            )])
+    # Schema-invalid JSON must remain valid JSON, so use the ordinary shaped
+    # completion for that case.
+    if code == "COMMANDER_PLAN_SCHEMA_INVALID":
+        response = json.loads(content)
+        gateway, _ = _recording_gateway([response])
+    else:
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+        gateway, _ = _recording_gateway([_valid_provider_plan()])
+        gateway._client = client
+    with pytest.raises(CommanderPlanFailure) as failure:
+        _commander_for_gateway(gateway).plan(
+            requested_model="fake", objective="offline", context={}
+        )
+    assert failure.value.code == code
+    assert sentinel not in str(failure.value)
+
+
+def test_plan_limit_and_provider_exception_codes_are_sanitized():
+    gateway, _ = _recording_gateway([_valid_provider_plan()])
+    with pytest.raises(CommanderPlanFailure) as limited:
+        _commander_for_gateway(gateway, max_tasks=0).plan(
+            requested_model="fake", objective="offline", context={}
+        )
+    assert limited.value.code == "COMMANDER_PLAN_LIMIT_EXCEEDED"
+
+    sentinel = "SECRET_PROVIDER_SENTINEL"
+    class ProviderFailure:
+        def create_plan(self, **kwargs):
+            raise RuntimeError(sentinel)
+    with pytest.raises(CommanderPlanFailure) as provider:
+        _commander_for_gateway(ProviderFailure()).plan(
+            requested_model="fake", objective="offline", context={}
+        )
+    assert provider.value.code == "COMMANDER_COMPLETION_FAILED"
+    assert sentinel not in str(provider.value)
+
+
+@pytest.mark.parametrize("response", [object(), SimpleNamespace(choices=[]),
+                                        SimpleNamespace(choices=[object()])])
+def test_unexpected_completion_shapes_have_stable_safe_code(response):
+    class Completions:
+        def create(self, **kwargs): return response
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    gateway, _ = _recording_gateway([_valid_provider_plan()])
+    gateway._client = client
+    with pytest.raises(CommanderPlanFailure) as failure:
+        _commander_for_gateway(gateway).plan(
+            requested_model="fake", objective="offline", context={}
+        )
+    assert failure.value.code == "COMMANDER_COMPLETION_SHAPE_INVALID"
+
+
 def test_real_model_commander_requests_authoritative_contracts_and_tools():
     valid_plan = _valid_provider_plan()
     finish = {"decision": "FINISH", "plan": None, "reason": "all tasks completed"}
@@ -344,4 +445,3 @@ def test_model_visible_tool_allowlist_is_sorted_and_validation_stays_fail_closed
 
     with pytest.raises(ValueError):
         validator.validate({"version": "1"})
-

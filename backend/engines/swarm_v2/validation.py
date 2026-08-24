@@ -15,6 +15,18 @@ class PlanValidationError(ValueError):
     """A plan is malformed or exceeds a configured safety boundary."""
 
 
+class PlanJsonError(PlanValidationError):
+    """The Commander response is not a JSON object."""
+
+
+class PlanSchemaError(PlanValidationError):
+    """The decoded object does not satisfy the Commander contract."""
+
+
+class PlanLimitError(PlanValidationError):
+    """A valid Commander contract exceeds a deterministic safety limit."""
+
+
 @dataclass(frozen=True)
 class PlanLimits:
     max_tasks: int = 64
@@ -36,12 +48,21 @@ class PlanValidator:
 
     def validate(self, candidate: str | bytes | dict[str, Any]) -> CommanderPlan:
         """Return an executable contract only after all checks succeed."""
+        decoded: Any = candidate
+        if isinstance(candidate, (str, bytes)):
+            try:
+                decoded = json.loads(candidate)
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
+                raise PlanJsonError("Commander plan is not valid JSON") from None
+        if not isinstance(decoded, dict):
+            raise PlanSchemaError("Commander plan must be a JSON object")
         try:
-            plan = (CommanderPlan.model_validate_json(candidate)
-                    if isinstance(candidate, (str, bytes))
-                    else CommanderPlan.model_validate(candidate))
+            plan = CommanderPlan.model_validate(decoded)
         except (ValidationError, ValueError, TypeError) as exc:
-            raise PlanValidationError(f"invalid Commander plan: {exc}") from exc
+            # Detailed validation diagnostics remain inside this deterministic
+            # boundary for callers/tests. Commander replaces them with a safe
+            # stable code before the worker can persist or emit the failure.
+            raise PlanSchemaError(f"invalid Commander plan: {exc}") from exc
         self._validate_plan(plan)
         return plan
 
@@ -49,14 +70,14 @@ class PlanValidator:
         limits = self._limits
         tasks = plan.graph.tasks
         if len(tasks) > limits.max_tasks:
-            raise PlanValidationError("task count limit exceeded")
+            raise PlanLimitError("task count limit exceeded")
         if plan.max_replans > limits.max_replans:
-            raise PlanValidationError("replan/recursion limit exceeded")
+            raise PlanLimitError("replan/recursion limit exceeded")
         if plan.estimated_cost_units > limits.max_cost_units:
-            raise PlanValidationError("plan cost limit exceeded")
+            raise PlanLimitError("plan cost limit exceeded")
         calculated_cost = sum(task.estimated_cost_units for task in tasks)
         if calculated_cost > limits.max_cost_units or calculated_cost > plan.estimated_cost_units:
-            raise PlanValidationError("task cost exceeds the declared or configured budget")
+            raise PlanLimitError("task cost exceeds the declared or configured budget")
 
         by_id: dict[str, DynamicTask] = {}
         signatures: set[str] = set()
@@ -75,7 +96,7 @@ class PlanValidator:
                 raise PlanValidationError("duplicate task signature")
             signatures.add(signature)
             if task.recursion_depth > limits.max_recursion_depth:
-                raise PlanValidationError("task recursion limit exceeded")
+                raise PlanLimitError("task recursion limit exceeded")
             if (not task.completion.evidence_satisfied and
                     (task.evidence.minimum_sources or task.evidence.required_fields)):
                 raise PlanValidationError(
@@ -85,7 +106,7 @@ class PlanValidator:
                     raise PlanValidationError(f"tool is not allowlisted: {tool.name}")
                 total_tool_calls += tool.max_calls
         if total_tool_calls > limits.max_tool_calls:
-            raise PlanValidationError("aggregate tool call limit exceeded")
+            raise PlanLimitError("aggregate tool call limit exceeded")
 
         ids = set(by_id)
         for task in tasks:
@@ -108,7 +129,7 @@ class PlanValidator:
             depths[task_id] = value
             return value
         if max(depth(task_id) for task_id in by_id) > limits.max_graph_depth:
-            raise PlanValidationError("graph depth limit exceeded")
+            raise PlanLimitError("graph depth limit exceeded")
 
         for assignment in plan.assignments:
             dependencies = self._dependency_closure(assignment.task_id, by_id)

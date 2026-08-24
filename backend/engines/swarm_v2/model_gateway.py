@@ -11,6 +11,7 @@ from .contracts import (
     commander_decision_json_schema,
     commander_plan_json_schema,
 )
+from .commander import CommanderPlanFailure
 
 
 def _canonical_json(value: Any) -> str:
@@ -107,13 +108,19 @@ class ModelGateway:
             ],
         )
         try:
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
         except (AttributeError, IndexError, TypeError):
             if isinstance(response, (str, bytes, dict)):
-                return response
-            raise ValueError(
-                "model gateway received an invalid completion response"
-            ) from None
+                content = response
+            else:
+                raise CommanderPlanFailure(
+                    "COMMANDER_COMPLETION_SHAPE_INVALID"
+                ) from None
+        if content is None or content == "":
+            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID")
+        if not isinstance(content, (str, bytes, dict)):
+            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID")
+        return content
 
     def create_replan(
         self,

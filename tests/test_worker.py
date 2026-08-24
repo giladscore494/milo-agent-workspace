@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from backend.errors import AppError
 from backend.worker.main import execute_run, resolve_run_id
+from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker
 
 
 class WorkerRepo:
@@ -342,8 +343,164 @@ def test_swarm_v2_failure_is_sanitized_and_marks_run_failed():
             return {"id": project_id, "workflow_key": "swarm_v2"}
 
     repo = SwarmRepo()
-    assert execute_run(repo.run_id, repo, FailingSwarm()) == 1
-    assert repo.failed == (repo.run_id, "SWARM_V2_FAILED", "Swarm V2 execution failed")
+    assert execute_run(repo.run_id, repo, FailingSwarm()) == 0
+    assert repo.failed == (repo.run_id, "SWARM_V2_EXECUTION_FAILED", "Swarm V2 execution failed")
     assert sentinel not in str(repo.failed)
     assert sentinel not in str(repo.events)
     assert [event[1] for event in repo.events][-1] == "run_failed"
+
+
+@pytest.mark.parametrize("code,message", [
+    ("COMMANDER_COMPLETION_FAILED", "Commander completion failed"),
+    ("COMMANDER_COMPLETION_SHAPE_INVALID", "Commander completion shape is invalid"),
+    ("COMMANDER_PLAN_JSON_INVALID", "Commander plan JSON is invalid"),
+    ("COMMANDER_PLAN_SCHEMA_INVALID", "Commander plan schema is invalid"),
+    ("COMMANDER_PLAN_LIMIT_EXCEEDED", "Commander plan exceeds safety limits"),
+])
+def test_swarm_v2_commander_failure_persists_safe_code_and_is_handled(
+        capsys, code, message):
+    from backend.engines.swarm_v2 import CommanderPlanFailure
+    sentinel = "SECRET_PROVIDER_SENTINEL"
+
+    class FailingSwarm:
+        workflow_key = "swarm_v2"
+        def run(self, run):
+            try:
+                raise RuntimeError(sentinel)
+            except RuntimeError:
+                raise CommanderPlanFailure(code) from None
+
+    class SwarmRepo(WorkerRepo):
+        def get_project(self, project_id):
+            return {"id": project_id, "workflow_key": "swarm_v2"}
+
+    repo = SwarmRepo()
+    assert execute_run(repo.run_id, repo, FailingSwarm()) == 0
+    assert repo.failed == (repo.run_id, code, message)
+    assert sentinel not in str(repo.events)
+    assert sentinel not in str(repo.failed)
+    captured = capsys.readouterr()
+    assert sentinel not in captured.out + captured.err
+
+
+def test_swarm_v2_failure_is_not_handled_when_terminal_write_is_not_durable():
+    class FailingSwarm:
+        workflow_key = "swarm_v2"
+        def run(self, run): raise RuntimeError("private provider detail")
+
+    class UnwritableRepo(WorkerRepo):
+        def get_project(self, project_id):
+            return {"id": project_id, "workflow_key": "swarm_v2"}
+        def mark_run_failed(self, *args, **kwargs):
+            raise AppError("RUN_LEASE_LOST", "lease unavailable", 409)
+
+    repo = UnwritableRepo()
+    with pytest.raises(AppError, match="lease unavailable"):
+        execute_run(repo.run_id, repo, FailingSwarm())
+
+
+def _budget_stop():
+    return BudgetExceeded(
+        "MODEL_CALL_LIMIT_EXCEEDED",
+        "Model-call budget exceeded",
+        "budget_exhausted",
+        "budget_exhausted",
+    )
+
+
+class _BudgetTerminalEngine:
+    def __init__(self, workflow_key, *, raises):
+        self.workflow_key = workflow_key
+        self.raises = raises
+
+    def run(self, run):
+        if self.raises:
+            raise _budget_stop()
+        return {"status": "success", "result": {"offline": True}}
+
+
+class _BudgetTerminalRepo(WorkerRepo):
+    def __init__(self, workflow_key):
+        super().__init__()
+        self.workflow_key = workflow_key
+        self.terminal_transitions = []
+
+    def get_project(self, project_id):
+        return {"id": project_id, "workflow_key": self.workflow_key}
+
+    def transition_run(self, run_id, status, expected_worker_id=None,
+                       expected_attempt=None, expected_lease_token=None, **fields):
+        result = super().transition_run(
+            run_id, status, expected_worker_id, expected_attempt,
+            expected_lease_token, **fields
+        )
+        if status in {"budget_exhausted", "failed", "timed_out"}:
+            self.terminal_transitions.append((status, fields.get("error")))
+        return result
+
+
+def _execute_budget_terminal(repo, workflow_key, stop_path):
+    stop = _budget_stop()
+    tracker = BudgetTracker(BudgetConfig(), kill_switch=lambda: True)
+    engine = _BudgetTerminalEngine(workflow_key, raises=stop_path == "exception")
+    if stop_path == "tracker":
+        tracker.stop = stop
+    return execute_run(repo.run_id, repo, engine, budget_tracker=tracker)
+
+
+@pytest.mark.parametrize("stop_path", ["exception", "tracker"])
+def test_swarm_v2_budget_terminal_returns_zero_only_after_durable_transition(stop_path):
+    repo = _BudgetTerminalRepo("swarm_v2")
+    assert _execute_budget_terminal(repo, "swarm_v2", stop_path) == 0
+    assert repo.terminal_transitions == [("budget_exhausted", {
+        "code": "MODEL_CALL_LIMIT_EXCEEDED",
+        "message": "Model-call budget exceeded",
+    })]
+
+
+@pytest.mark.parametrize("stop_path", ["exception", "tracker"])
+def test_swarm_v2_budget_terminal_missing_transition_is_not_handled(stop_path):
+    class MissingTerminalTransitionRepo(_BudgetTerminalRepo):
+        def transition_run(self, run_id, status, expected_worker_id=None,
+                           expected_attempt=None, expected_lease_token=None,
+                           **fields):
+            if status == "running":
+                result = super().transition_run(
+                    run_id, status, expected_worker_id, expected_attempt,
+                    expected_lease_token, **fields
+                )
+                self.transition_run = None
+                return result
+            raise AssertionError("terminal transition should be unavailable")
+
+    repo = MissingTerminalTransitionRepo("swarm_v2")
+    with pytest.raises(AppError) as failure:
+        _execute_budget_terminal(repo, "swarm_v2", stop_path)
+    assert failure.value.code == "RUN_FINALIZATION_UNAVAILABLE"
+
+
+@pytest.mark.parametrize("stop_path", ["exception", "tracker"])
+def test_swarm_v2_budget_terminal_transition_failure_propagates(stop_path):
+    class FailingTerminalTransitionRepo(_BudgetTerminalRepo):
+        def transition_run(self, run_id, status, expected_worker_id=None,
+                           expected_attempt=None, expected_lease_token=None,
+                           **fields):
+            if status == "budget_exhausted":
+                raise AppError("RUN_LEASE_LOST", "terminal write rejected", 409)
+            return super().transition_run(
+                run_id, status, expected_worker_id, expected_attempt,
+                expected_lease_token, **fields
+            )
+
+    repo = FailingTerminalTransitionRepo("swarm_v2")
+    with pytest.raises(AppError) as failure:
+        _execute_budget_terminal(repo, "swarm_v2", stop_path)
+    assert failure.value.code == "RUN_LEASE_LOST"
+    assert repo.terminal_transitions == []
+
+
+@pytest.mark.parametrize("stop_path", ["exception", "tracker"])
+def test_v1_durable_budget_terminal_exit_code_remains_nonzero(stop_path):
+    repo = _BudgetTerminalRepo("vehicle_catalog_v1")
+    assert _execute_budget_terminal(repo, "vehicle_catalog_v1", stop_path) == 1
+    assert len(repo.terminal_transitions) == 1
