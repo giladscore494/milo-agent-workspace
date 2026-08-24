@@ -14,12 +14,22 @@ environments only warn; production raises.
 from __future__ import annotations
 
 import os
+import json
+import sys
 from dataclasses import dataclass, field
 from typing import Callable
 
 from backend.budget import BudgetConfig
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+class ProductionConfigError(RuntimeError):
+    """Sanitized startup failure whose string form is stable and bounded."""
+
+    def __init__(self, issues: list[ConfigIssue]) -> None:
+        self.codes = tuple(sorted({issue.code for issue in issues}))
+        super().__init__(f"CONFIG_VALIDATION_FAILED[{','.join(self.codes)}]")
 
 
 def _flag(env: dict[str, str], name: str) -> bool:
@@ -204,9 +214,17 @@ def validate_production_config(env: dict[str, str] | None = None, on_error: Call
     # fails closed so a misconfigured staging deployment (e.g. pointed at a
     # non-staging Supabase or Redis dependency) never starts.
     if not report.ok() and (_is_production(env) or environment == "staging"):
-        summary = "; ".join(f"{i.code}: {i.message}" for i in report.errors)
-        message = f"{environment or 'production'} configuration validation failed: {summary}"
+        # Emit a structured, value-free diagnostic before import aborts.  Cloud
+        # Run may truncate Python tracebacks; this one-line record preserves the
+        # exact validation codes without ever serializing configuration values.
+        diagnostic = json.dumps({
+            "event": "production_config_validation_failed",
+            "environment": environment or "production",
+            "codes": sorted({i.code for i in report.errors}),
+        }, sort_keys=True)
         if on_error is not None:
-            on_error(message)
-        raise RuntimeError(message)
+            on_error(diagnostic)
+        else:
+            print(diagnostic, file=sys.stderr, flush=True)
+        raise ProductionConfigError(report.errors)
     return report
