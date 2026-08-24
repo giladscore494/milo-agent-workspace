@@ -383,6 +383,12 @@ class SupabaseRepository:
     CHECKPOINT_COLUMNS = ("run_id", "engine_version", "workflow_key", "phase", "completed_tasks", "artifacts", "failures", "token_usage", "last_event", "attempt")
 
     def save_checkpoint(self, checkpoint: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        # run_checkpoints requires these columns NOT NULL; refuse locally with
+        # a clear error instead of surfacing a database constraint violation
+        # after a paid model call already happened.
+        for column in ("engine_version", "workflow_key", "phase"):
+            if not checkpoint.get(column):
+                raise AppError("CHECKPOINT_INVALID", f"checkpoint is missing mandatory field: {column}", 422)
         if worker_id is not None:
             return self._guarded_rpc("save_checkpoint_guarded", {
                 "p_run_id": str(checkpoint["run_id"]),

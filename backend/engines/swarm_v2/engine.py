@@ -49,7 +49,12 @@ class SwarmV2Engine:
 
     def _save(self, state: SwarmState) -> None:
         if self._checkpoint_sink:
-            checkpoint = {"phase": "swarm_v2", "version": state.engine_version,
+            # run_checkpoints.engine_version and .workflow_key are NOT NULL in
+            # production; the durable checkpoint must carry both under their
+            # column names or the guarded insert fails after a paid call.
+            checkpoint = {"phase": "swarm_v2", "engine_version": state.engine_version,
+                "workflow_key": state.workflow_key,
+                "completed_tasks": list(state.completed_task_ids),
                 "artifacts": {"swarm_state": state.model_dump(mode="json")},
                 "token_usage": dict(state.usage_snapshot)}
             safe_durable_value(checkpoint)

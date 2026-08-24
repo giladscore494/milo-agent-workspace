@@ -1896,3 +1896,39 @@ def test_evidence_migration_is_executably_rerun_safe(db):
                  "create_claim_with_source_guarded", "create_conflict_guarded",
                  "patch_run_blackboard_evidence_guarded"):
         assert db.psql(f"select count(*) from pg_proc where proname='{name}'") == "1"
+
+
+def test_swarm_checkpoint_shape_persists_and_null_engine_version_rejected(db):
+    """The Swarm V2 engine's durable checkpoint must satisfy the real
+    run_checkpoints NOT NULL columns through the guarded RPC. The NULL
+    engine_version case reproduces the pre-fix engine payload (it sent
+    'version' instead of 'engine_version') and must be rejected by the
+    database, never silently accepted."""
+    run_id = _seed_stale_worker_run(db)
+    row = db.psql(f"select worker_id, attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-SWM', 300)")
+    worker, attempt, token = row.split("|")
+    lease = f"'{run_id}', '{worker}', {attempt}, '{token}'"
+    checkpoint_id = db.psql(
+        f"select id from public.save_checkpoint_guarded({lease}, 'swarm_v2.1', 'swarm_v2', 'swarm_v2', "
+        f"'[]'::jsonb, '{{\"swarm_state\": {{\"run_id\": \"{run_id}\", \"objective\": \"o\"}}}}'::jsonb, "
+        f"'[]'::jsonb, '{{\"model_calls\": 1, \"total_tokens\": 160}}'::jsonb, null)"
+    )
+    assert checkpoint_id
+    stored = db.psql(
+        f"select engine_version, workflow_key, phase from public.run_checkpoints where id='{checkpoint_id}'"
+    )
+    assert stored == "swarm_v2.1|swarm_v2|swarm_v2"
+    with pytest.raises(AssertionError, match="null value|not-null"):
+        db.psql(f"select id from public.save_checkpoint_guarded({lease}, null, 'swarm_v2', 'swarm_v2')")
+
+
+def test_claim_run_lease_returns_no_row_for_every_terminal_status(db):
+    """A Cloud Run retry claiming a durably finalized run matches zero rows
+    (surfaced as RUN_ALREADY_CLAIMED by the repository); the worker treats
+    that as a no-op success, so the retry chain ends without touching the
+    run."""
+    for status in ("completed", "failed", "cancelled", "timed_out", "budget_exhausted", "partial_success"):
+        run_id = _seed_stale_worker_run(db)
+        db.psql(f"update public.runs set status='{status}' where id='{run_id}'")
+        assert db.psql(f"select worker_id from public.claim_run_lease('{run_id}', 'worker-RETRY', 300)") == ""
+        assert db.psql(f"select status, attempt from public.runs where id='{run_id}'") == f"{status}|1"

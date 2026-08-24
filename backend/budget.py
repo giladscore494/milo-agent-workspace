@@ -315,18 +315,24 @@ class BudgetTracker:
 
     # -- the hard gate --------------------------------------------------------
     def reserve_call(self, estimated_input_tokens: int = 0, requested_max_tokens: int | None = None) -> int | None:
+        """Backwards-compatible reservation returning only the output allowance."""
+        return self.open_call(estimated_input_tokens, requested_max_tokens)[1]
+
+    def open_call(self, estimated_input_tokens: int = 0, requested_max_tokens: int | None = None) -> tuple[int, int | None]:
         """Atomically reserve capacity for one model call BEFORE it happens.
 
         Checks (in order): paid-execution kill switch, worker lease,
         cancellation, elapsed time, model-call count, agent steps, retries,
         remaining input/output/total tokens (including the pre-call input
         estimate and in-flight reservations), remaining estimated cost, and
-        daily budgets. Returns the output-token allowance the call may use
-        (``max_tokens`` must be clamped to it), or None when no output cap
-        applies. Raises BudgetExceeded when the call must not happen; the
-        decision is persisted through the ledger recorder either way.
-        Thread-safe: concurrent calls cannot both reserve the final
-        remaining call, tokens or cost.
+        daily budgets. Returns ``(call_seq, allowed_output)``: the call's
+        reservation sequence (which MUST be passed back to ``settle_call`` so
+        concurrent calls settle their own reservations) and the output-token
+        allowance the call may use (``max_tokens`` must be clamped to it), or
+        None when no output cap applies. Raises BudgetExceeded when the call
+        must not happen; the decision is persisted through the ledger
+        recorder either way. Thread-safe: concurrent calls cannot both
+        reserve the final remaining call, tokens or cost.
         """
         with self._lock:
             if self.stop is not None:
@@ -398,18 +404,24 @@ class BudgetTracker:
                 reserved_output_tokens=(allowed_output or 0) if requested_max_tokens is not None else 0,
                 estimated_cost=round(cfg.estimated_cost_per_call, 6),
             )
-            return allowed_output
+            return next_call_seq, allowed_output
 
-    def settle_call(self, reserved_input_tokens: int = 0, reserved_output_tokens: int | None = None, input_tokens: int = 0, output_tokens: int = 0, cost: float | None = None, status: str = "settled", rejection_reason: str | None = None) -> None:
-        """Release the reservation and record actual usage after a call."""
+    def settle_call(self, reserved_input_tokens: int = 0, reserved_output_tokens: int | None = None, input_tokens: int = 0, output_tokens: int = 0, cost: float | None = None, status: str = "settled", rejection_reason: str | None = None, call_seq: int | None = None) -> None:
+        """Release the reservation and record actual usage after a call.
+
+        ``call_seq`` identifies WHICH reservation settles. Concurrent calls
+        must pass the sequence returned by ``open_call``; the fallback to the
+        current model-call counter is only correct for strictly sequential
+        callers (the legacy before_call/after_call path)."""
         with self._lock:
-            reservation = self._reservations.pop(self.model_calls, None)
+            settled_seq = call_seq if call_seq is not None else self.model_calls
+            reservation = self._reservations.pop(settled_seq, None)
             actual_cost = float(cost) if cost else 0.0
             if reservation is not None and self.daily_settler is not None:
                 try:
                     self.daily_settler(reservation, actual_cost, status, rejection_reason)
                 except Exception as exc:
-                    self._reservations[self.model_calls] = reservation
+                    self._reservations[settled_seq] = reservation
                     raise self._stop("BUDGET_SETTLEMENT_FAILED", "model-call budget settlement failed", "budget_exhausted", "failed") from exc
             self.reserved_input_tokens = max(0, self.reserved_input_tokens - max(0, int(reserved_input_tokens or 0)))
             if reserved_output_tokens:
@@ -425,6 +437,7 @@ class BudgetTracker:
             self._warn_if_close("elapsed_seconds", self.elapsed(), cfg.max_run_duration_seconds)
             self._ledger(
                 "settled",
+                call_seq=settled_seq,
                 actual_input_tokens=int(input_tokens or 0),
                 actual_output_tokens=int(output_tokens or 0),
                 actual_cost=actual_cost if cost else None,
@@ -432,16 +445,16 @@ class BudgetTracker:
             if self.usage_recorder:
                 self.usage_recorder(self.snapshot())
             if cfg.max_input_tokens_per_run is not None and self.input_tokens > cfg.max_input_tokens_per_run:
-                self._ledger("overage", rejection_reason="INPUT_TOKEN_LIMIT_EXCEEDED")
+                self._ledger("overage", call_seq=settled_seq, rejection_reason="INPUT_TOKEN_LIMIT_EXCEEDED")
                 raise self._stop("INPUT_TOKEN_LIMIT_EXCEEDED", "actual input token limit exceeded", "token_limit_reached", "budget_exhausted")
             if cfg.max_output_tokens_per_run is not None and self.output_tokens > cfg.max_output_tokens_per_run:
-                self._ledger("overage", rejection_reason="OUTPUT_TOKEN_LIMIT_EXCEEDED")
+                self._ledger("overage", call_seq=settled_seq, rejection_reason="OUTPUT_TOKEN_LIMIT_EXCEEDED")
                 raise self._stop("OUTPUT_TOKEN_LIMIT_EXCEEDED", "actual output token limit exceeded", "token_limit_reached", "budget_exhausted")
             if cfg.max_total_tokens_per_run is not None and (self.input_tokens + self.output_tokens) > cfg.max_total_tokens_per_run:
-                self._ledger("overage", rejection_reason="TOTAL_TOKEN_LIMIT_EXCEEDED")
+                self._ledger("overage", call_seq=settled_seq, rejection_reason="TOTAL_TOKEN_LIMIT_EXCEEDED")
                 raise self._stop("TOTAL_TOKEN_LIMIT_EXCEEDED", "actual total token limit exceeded", "token_limit_reached", "budget_exhausted")
             if cfg.max_cost_per_run is not None and self.actual_cost > cfg.max_cost_per_run:
-                self._ledger("overage", rejection_reason="COST_LIMIT_EXCEEDED")
+                self._ledger("overage", call_seq=settled_seq, rejection_reason="COST_LIMIT_EXCEEDED")
                 raise self._stop("COST_LIMIT_EXCEEDED", "actual cost limit exceeded", "budget_exhausted", "budget_exhausted")
 
     def before_call(self) -> None:
@@ -483,8 +496,9 @@ class _GuardedCompletions:
         requested_max = kwargs.get("max_tokens")
         # Hard pre-call gate: reserve capacity FIRST; the adapter is only
         # reached after the reservation succeeds, and max_tokens is clamped
-        # to the remaining safe allowance.
-        allowed_output = self._tracker.reserve_call(estimated_input, requested_max)
+        # to the remaining safe allowance. The reservation sequence travels
+        # with this call so concurrent workers settle their own reservations.
+        call_seq, allowed_output = self._tracker.open_call(estimated_input, requested_max)
         reserved_output = allowed_output if requested_max is not None else None
         if allowed_output is not None:
             kwargs["max_tokens"] = allowed_output
@@ -495,6 +509,7 @@ class _GuardedCompletions:
             self._tracker.settle_call(
                 estimated_input, reserved_output, 0, 0, 0.0, status="released",
                 rejection_reason="PROVIDER_RATE_LIMITED" if rate_limited else "PROVIDER_EXCEPTION",
+                call_seq=call_seq,
             )
             if rate_limited:
                 # A 429 is provider backpressure, not a semantic model
@@ -517,6 +532,7 @@ class _GuardedCompletions:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost=float(provider_cost or 0),
+            call_seq=call_seq,
         )
         return response
 

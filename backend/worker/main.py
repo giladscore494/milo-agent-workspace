@@ -9,7 +9,7 @@ from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCal
 from backend.config import get_settings
 from backend.errors import AppError
 from backend.repository import Repository, SupabaseRepository
-from backend.runtime import CancellationRequested, RunEventRecord, SupabaseEventSink
+from backend.runtime import TERMINAL_STATES, CancellationRequested, RunEventRecord, SupabaseEventSink
 from backend.supervisor import SupervisorInput, apply_event_to_blackboard, build_evaluation_report, initial_blackboard, make_shadow_decision, route_event_message
 from backend.engines.vehicle_catalog_v1 import VehicleCatalogV1Adapter
 from backend.worker.engine import Engine, EngineRegistry, EngineResolver
@@ -50,12 +50,46 @@ def _persist_budget_terminal(repo: Repository, run_id: UUID,
     )
 
 
+def _claim_run_with_recovery(repo: Repository, run_id: UUID, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
+    """Claim the run lease; a retry against a finalized run is a no-op.
+
+    Cloud Run retries a task whose previous attempt exited non-zero. When
+    that retry finds the run already in a durable terminal state, exiting
+    non-zero again would only burn the retry budget on RUN_ALREADY_CLAIMED
+    (the recorded production failure mode), so it returns None and the
+    caller exits 0 without touching the run. When another worker still
+    holds an unexpired lease, the retry waits it out (bounded by the lease
+    duration itself) and re-claims through the same atomic CAS; if the
+    holder keeps heartbeating past the bound, the conflict escapes
+    unchanged so this stale retry never writes anything.
+    """
+    deadline = time.monotonic() + max(
+        0.0, float(os.getenv("MILO_WORKER_CLAIM_WAIT_SECONDS", str(lease_seconds + 30)))
+    )
+    while True:
+        try:
+            return repo.claim_run(run_id, worker_id, lease_seconds=lease_seconds)
+        except AppError as exc:
+            if exc.code != "RUN_ALREADY_CLAIMED":
+                raise
+            if repo.get_run(run_id).get("status") in TERMINAL_STATES:
+                return None
+            if time.monotonic() >= deadline:
+                raise
+        time.sleep(min(5.0, max(0.5, deadline - time.monotonic())))
+
+
 def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, budget_tracker: "BudgetTracker | None" = None, engine_registry: EngineRegistry | None = None) -> int:
     worker_id = os.getenv("WORKER_ID", f"worker-{uuid4()}")
     lease_seconds = int(os.getenv("MILO_WORKER_LEASE_SECONDS", "300"))
     heartbeat_interval = max(1.0, min(float(os.getenv("MILO_WORKER_HEARTBEAT_INTERVAL_SECONDS", "30")), lease_seconds / 3))
     if hasattr(repo, "claim_run"):
-        run = repo.claim_run(run_id, worker_id, lease_seconds=lease_seconds)
+        claimed = _claim_run_with_recovery(repo, run_id, worker_id, lease_seconds)
+        if claimed is None:
+            # The run already reached a durable terminal state: nothing to
+            # execute, nothing to write, and the retry chain ends here.
+            return 0
+        run = claimed
     else:
         run = repo.get_run(run_id)
     # The active lease travels with every durable write this worker makes:
@@ -143,7 +177,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     report = build_evaluation_report(decision, [event_type])
                     repo.create_supervisor_decision(run_id, {"input": {"goal": shadow_blackboard.goal, "compiled_workflow": shadow_blackboard.approved_plan}, "assessment": decision.assessment, "proposed_commands": [c.model_dump(mode="json") for c in decision.proposed_commands], "next_wake_condition": decision.next_wake_condition.model_dump(mode="json"), "rationale_summary": decision.rationale_summary, "evaluation_report": report.model_dump(mode="json")}, **lease_ctx)
             except Exception as exc:
-                sink.emit(RunEventRecord(run_id=run_id, type="supervisor_shadow_failed", message="Supervisor shadow observation failed without altering execution", payload={"code": "SUPERVISOR_SHADOW_FAILED", "message": str(exc)}))
+                # Only the exception class name is persisted: raw exception
+                # text can carry provider/database details into run_events.
+                sink.emit(RunEventRecord(run_id=run_id, type="supervisor_shadow_failed", message="Supervisor shadow observation failed without altering execution", payload={"code": "SUPERVISOR_SHADOW_FAILED", "error_type": type(exc).__name__}))
 
         sink.emit(RunEventRecord(run_id=run_id, type="run_started", message="Run started", payload={"worker_id": worker_id, "attempt": run.get("attempt", 1)}))
         shadow_observe("run_started", {"worker_id": worker_id, "attempt": run.get("attempt", 1)})
@@ -388,8 +424,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         except Exception as exc:
             # Preserve V1 behavior. V2 validation/factory/provider failures are
             # terminal and sanitized, but a stale worker is never allowed to
-            # write a failure after losing its lease.
-            if workflow_key != "swarm_v2" or not holds_lease():
+            # write a failure after losing its lease, and a persistence/lease
+            # failure surfacing as AppError from the repository boundary is an
+            # infrastructure outcome that must escape: it can never be
+            # reported as a handled Swarm run failure.
+            if workflow_key != "swarm_v2" or isinstance(exc, AppError) or not holds_lease():
                 raise
             from backend.engines.swarm_v2 import CommanderPlanFailure
             if isinstance(exc, CommanderPlanFailure):
