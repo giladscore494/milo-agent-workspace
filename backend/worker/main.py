@@ -151,7 +151,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             missing = ", ".join(budget_config.missing_mandatory())
             sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Budget configuration incomplete; refusing paid execution", payload={"code": "BUDGET_CONFIG_INVALID", "missing": missing}))
             repo.mark_run_failed(run_id, "BUDGET_CONFIG_INVALID", f"mandatory budget settings missing: {missing}", worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
-            return 1
+            return 0 if workflow_key == "swarm_v2" else 1
         # Provider credentials are worker-only (env/Secret Manager). Paid
         # execution fails closed when the key is absent; the key value itself is
         # never logged, persisted or echoed into events.
@@ -160,7 +160,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         if paid_execution_enabled() and not worker_provider_api_key():
             sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider API key not configured for this worker; refusing paid execution", payload={"code": "PROVIDER_KEY_MISSING"}))
             repo.mark_run_failed(run_id, "PROVIDER_KEY_MISSING", "worker provider API key (KIMI_API_KEY/MOONSHOT_API_KEY) is not configured", worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
-            return 1
+            return 0 if workflow_key == "swarm_v2" else 1
 
         # Provider-side scheduling limits (concurrency/RPM/TPM/backpressure
         # bounds) are numeric deployment configuration validated fail-closed:
@@ -176,7 +176,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             except ValueError as exc:
                 sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider limit configuration invalid; refusing execution", payload={"code": "PROVIDER_LIMITS_CONFIG_INVALID", "message": str(exc)}))
                 repo.mark_run_failed(run_id, "PROVIDER_LIMITS_CONFIG_INVALID", str(exc), worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
-                return 1
+                return 0 if workflow_key == "swarm_v2" else 1
 
         def emit_budget_event(event_type, payload):
             sink.emit(RunEventRecord(run_id=run_id, type=event_type, message=payload.get("message", event_type), payload=payload.get("payload", payload)))
@@ -357,29 +357,35 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         except BudgetExceeded as exc:
             if hasattr(repo, "transition_run"):
                 repo.transition_run(run_id, exc.terminal_status, expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), error={"code": exc.code, "message": exc.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
-            return 1
-        except Exception:
+            return 0 if workflow_key == "swarm_v2" else 1
+        except Exception as exc:
             # Preserve V1 behavior. V2 validation/factory/provider failures are
             # terminal and sanitized, but a stale worker is never allowed to
             # write a failure after losing its lease.
             if workflow_key != "swarm_v2" or not holds_lease():
                 raise
-            code = "SWARM_V2_FAILED"
-            message = "Swarm V2 execution failed"
+            from backend.engines.swarm_v2 import CommanderPlanFailure
+            if isinstance(exc, CommanderPlanFailure):
+                code, message = exc.code, exc.safe_message
+            else:
+                code, message = "SWARM_V2_EXECUTION_FAILED", "Swarm V2 execution failed"
             sink.emit(RunEventRecord(run_id=run_id, type="run_failed",
                                      message=message, payload={"code": code}))
             shadow_observe("run_failed", {"code": code})
             repo.mark_run_failed(run_id, code, message, worker_id=worker_id,
                                  attempt=run.get("attempt"),
                                  lease_token=run.get("lease_token"))
-            return 1
+            # A terminal failure committed under this lease is a handled job
+            # outcome. Non-zero is reserved for exceptions above (lease loss
+            # or inability to durably write the terminal state).
+            return 0
         if tracker.stop is not None:
             # The engine absorbed per-agent failures, but a hard limit tripped:
             # never report success and record the terminal budget status.
             stop = tracker.stop
             if hasattr(repo, "transition_run"):
                 repo.transition_run(run_id, stop.terminal_status, expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), error={"code": stop.code, "message": stop.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
-            return 1
+            return 0 if workflow_key == "swarm_v2" else 1
         if result.get("status") in {"complete", "partial_success", "success"} or (result.get("status") != "failed" and result.get("result")):
             status = "partial_success" if result.get("status") == "partial_success" else "completed"
             sink.emit(RunEventRecord(run_id=run_id, type="run_partial_success" if status == "partial_success" else "run_completed", message=f"Run {status}", payload={"status": result.get("status")}))
@@ -395,7 +401,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message=message, payload={"code": code}))
         shadow_observe("run_failed", {"code": code})
         repo.mark_run_failed(run_id, code, message, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
-        return 1
+        return 0 if workflow_key == "swarm_v2" else 1
     finally:
         cleanup_heartbeat()
 

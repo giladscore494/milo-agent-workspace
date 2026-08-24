@@ -11,6 +11,7 @@ from backend.engines.swarm_v2 import (
     CommanderModelError,
     CommanderModelResolver,
     CommanderPlan,
+    CommanderPlanFailure,
     PlanLimits,
     PlanValidationError,
     PlanValidator,
@@ -196,8 +197,9 @@ def test_commander_output_is_inert_until_validation() -> None:
         resolver=CommanderModelResolver(("fake",), {"fake"}),
         validator=validator(),
     )
-    with pytest.raises(PlanValidationError):
+    with pytest.raises(CommanderPlanFailure) as failure:
         commander.plan(requested_model="fake", objective="offline", context={})
+    assert failure.value.code == "COMMANDER_PLAN_SCHEMA_INVALID"
     assert client.calls == 1
 
 

@@ -342,8 +342,57 @@ def test_swarm_v2_failure_is_sanitized_and_marks_run_failed():
             return {"id": project_id, "workflow_key": "swarm_v2"}
 
     repo = SwarmRepo()
-    assert execute_run(repo.run_id, repo, FailingSwarm()) == 1
-    assert repo.failed == (repo.run_id, "SWARM_V2_FAILED", "Swarm V2 execution failed")
+    assert execute_run(repo.run_id, repo, FailingSwarm()) == 0
+    assert repo.failed == (repo.run_id, "SWARM_V2_EXECUTION_FAILED", "Swarm V2 execution failed")
     assert sentinel not in str(repo.failed)
     assert sentinel not in str(repo.events)
     assert [event[1] for event in repo.events][-1] == "run_failed"
+
+
+@pytest.mark.parametrize("code,message", [
+    ("COMMANDER_COMPLETION_FAILED", "Commander completion failed"),
+    ("COMMANDER_COMPLETION_SHAPE_INVALID", "Commander completion shape is invalid"),
+    ("COMMANDER_PLAN_JSON_INVALID", "Commander plan JSON is invalid"),
+    ("COMMANDER_PLAN_SCHEMA_INVALID", "Commander plan schema is invalid"),
+    ("COMMANDER_PLAN_LIMIT_EXCEEDED", "Commander plan exceeds safety limits"),
+])
+def test_swarm_v2_commander_failure_persists_safe_code_and_is_handled(
+        capsys, code, message):
+    from backend.engines.swarm_v2 import CommanderPlanFailure
+    sentinel = "SECRET_PROVIDER_SENTINEL"
+
+    class FailingSwarm:
+        workflow_key = "swarm_v2"
+        def run(self, run):
+            try:
+                raise RuntimeError(sentinel)
+            except RuntimeError:
+                raise CommanderPlanFailure(code) from None
+
+    class SwarmRepo(WorkerRepo):
+        def get_project(self, project_id):
+            return {"id": project_id, "workflow_key": "swarm_v2"}
+
+    repo = SwarmRepo()
+    assert execute_run(repo.run_id, repo, FailingSwarm()) == 0
+    assert repo.failed == (repo.run_id, code, message)
+    assert sentinel not in str(repo.events)
+    assert sentinel not in str(repo.failed)
+    captured = capsys.readouterr()
+    assert sentinel not in captured.out + captured.err
+
+
+def test_swarm_v2_failure_is_not_handled_when_terminal_write_is_not_durable():
+    class FailingSwarm:
+        workflow_key = "swarm_v2"
+        def run(self, run): raise RuntimeError("private provider detail")
+
+    class UnwritableRepo(WorkerRepo):
+        def get_project(self, project_id):
+            return {"id": project_id, "workflow_key": "swarm_v2"}
+        def mark_run_failed(self, *args, **kwargs):
+            raise AppError("RUN_LEASE_LOST", "lease unavailable", 409)
+
+    repo = UnwritableRepo()
+    with pytest.raises(AppError, match="lease unavailable"):
+        execute_run(repo.run_id, repo, FailingSwarm())
