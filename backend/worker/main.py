@@ -22,6 +22,34 @@ def resolve_run_id(cli_run_id: str | None) -> UUID:
     return UUID(value)
 
 
+def _persist_budget_terminal(repo: Repository, run_id: UUID,
+                             stop: BudgetExceeded, tracker: BudgetTracker,
+                             lease_ctx: dict[str, Any]) -> None:
+    """Persist a budget stop or fail so the job remains retryable.
+
+    Returning from this helper means the terminal transition completed under
+    the active lease. A missing repository capability is an infrastructure
+    failure, not a handled run outcome.
+    """
+    transition = getattr(repo, "transition_run", None)
+    if not callable(transition):
+        raise AppError(
+            "RUN_FINALIZATION_UNAVAILABLE",
+            "terminal run transition is unavailable",
+            503,
+        )
+    transition(
+        run_id,
+        stop.terminal_status,
+        expected_worker_id=lease_ctx["worker_id"],
+        expected_attempt=lease_ctx["attempt"],
+        expected_lease_token=lease_ctx["lease_token"],
+        error={"code": stop.code, "message": stop.message},
+        finished_at=datetime.now(UTC).isoformat(),
+        usage=tracker.snapshot(),
+    )
+
+
 def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, budget_tracker: "BudgetTracker | None" = None, engine_registry: EngineRegistry | None = None) -> int:
     worker_id = os.getenv("WORKER_ID", f"worker-{uuid4()}")
     lease_seconds = int(os.getenv("MILO_WORKER_LEASE_SECONDS", "300"))
@@ -355,8 +383,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), finished_at=datetime.now(UTC).isoformat())
             return 0
         except BudgetExceeded as exc:
-            if hasattr(repo, "transition_run"):
-                repo.transition_run(run_id, exc.terminal_status, expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), error={"code": exc.code, "message": exc.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+            _persist_budget_terminal(repo, run_id, exc, tracker, lease_ctx)
             return 0 if workflow_key == "swarm_v2" else 1
         except Exception as exc:
             # Preserve V1 behavior. V2 validation/factory/provider failures are
@@ -383,8 +410,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # The engine absorbed per-agent failures, but a hard limit tripped:
             # never report success and record the terminal budget status.
             stop = tracker.stop
-            if hasattr(repo, "transition_run"):
-                repo.transition_run(run_id, stop.terminal_status, expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), error={"code": stop.code, "message": stop.message}, finished_at=datetime.now(UTC).isoformat(), usage=tracker.snapshot())
+            _persist_budget_terminal(repo, run_id, stop, tracker, lease_ctx)
             return 0 if workflow_key == "swarm_v2" else 1
         if result.get("status") in {"complete", "partial_success", "success"} or (result.get("status") != "failed" and result.get("result")):
             status = "partial_success" if result.get("status") == "partial_success" else "completed"
