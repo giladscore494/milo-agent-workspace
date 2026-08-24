@@ -186,9 +186,10 @@ def test_model_resolver_allowlist_auto_priority_and_fallback() -> None:
 
 def test_commander_output_is_inert_until_validation() -> None:
     class FakeClient:
-        calls = 0
+        def __init__(self):
+            self.calls = []
         def create_plan(self, **kwargs):
-            self.calls += 1
+            self.calls.append(kwargs)
             return plan([task("unsafe", "inject", tool="shell.exec")])
 
     client = FakeClient()
@@ -200,7 +201,15 @@ def test_commander_output_is_inert_until_validation() -> None:
     with pytest.raises(CommanderPlanFailure) as failure:
         commander.plan(requested_model="fake", objective="offline", context={})
     assert failure.value.code == "COMMANDER_PLAN_SCHEMA_INVALID"
-    assert client.calls == 1
+    assert failure.value.validation_reason == "TOOL_NOT_ALLOWLISTED"
+    # Exactly one bounded semantic repair, then a hard stop: two calls, never
+    # three. The repair sees only the static safe reason code — never the
+    # rejected plan or any validation diagnostic.
+    assert len(client.calls) == 2
+    assert "repair_reason" not in client.calls[0]
+    assert client.calls[1]["repair_reason"] == "TOOL_NOT_ALLOWLISTED"
+    assert set(client.calls[1]) == {"model", "objective", "context", "repair_reason"}
+    assert client.calls[1]["context"] == {}
 
 
 def test_commander_cannot_disable_declared_evidence_requirements():

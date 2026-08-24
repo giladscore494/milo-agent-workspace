@@ -360,15 +360,20 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 scheduler = ProviderScheduler(provider_limits,
                     cancellation_checker=is_cancelled,
                     backpressure_callback=record_provider_backpressure)
+                # ONE PlanLimits instance feeds both the provider-visible
+                # policy (ModelGateway) and the deterministic firewall
+                # (PlanValidator): contract parity cannot drift silently.
+                limits = PlanLimits()
                 gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker),
                     scheduler=scheduler, api_key=worker_provider_api_key(),
                     base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
                     allowed_tool_names=tools.allowed_names,
-                    cancellation_checker=is_cancelled, agent_step_callback=record_agent_step)
-                limits = PlanLimits()
+                    cancellation_checker=is_cancelled, agent_step_callback=record_agent_step,
+                    plan_limits=limits)
                 validator = PlanValidator(allowed_tools=tools.allowed_names, limits=limits)
                 commander = Commander(client=gateway,
-                    resolver=CommanderModelResolver(allowed, set(allowed)), validator=validator)
+                    resolver=CommanderModelResolver(allowed, set(allowed)), validator=validator,
+                    retry_callback=record_retry)
                 tool_context = ToolContext(cancellation_checker=is_cancelled)
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
@@ -430,14 +435,23 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # reported as a handled Swarm run failure.
             if workflow_key != "swarm_v2" or isinstance(exc, AppError) or not holds_lease():
                 raise
-            from backend.engines.swarm_v2 import CommanderPlanFailure
+            from backend.engines.swarm_v2 import VALIDATION_REASONS, CommanderPlanFailure
+            failure_payload: dict[str, Any]
             if isinstance(exc, CommanderPlanFailure):
                 code, message = exc.code, exc.safe_message
+                failure_payload = {"code": code}
+                # Bounded diagnostic classification for telemetry only:
+                # exclusively a static allowlisted reason code, never raw
+                # model/validation/provider text. run.error stays unchanged.
+                reason = getattr(exc, "validation_reason", None)
+                if reason in VALIDATION_REASONS:
+                    failure_payload["validation_reason"] = reason
             else:
                 code, message = "SWARM_V2_EXECUTION_FAILED", "Swarm V2 execution failed"
+                failure_payload = {"code": code}
             sink.emit(RunEventRecord(run_id=run_id, type="run_failed",
-                                     message=message, payload={"code": code}))
-            shadow_observe("run_failed", {"code": code})
+                                     message=message, payload=failure_payload))
+            shadow_observe("run_failed", dict(failure_payload))
             repo.mark_run_failed(run_id, code, message, worker_id=worker_id,
                                  attempt=run.get("attempt"),
                                  lease_token=run.get("lease_token"))
