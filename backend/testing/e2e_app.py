@@ -100,15 +100,40 @@ class InProcessFakeWorkerLauncher:
     def _emit(self, run_id: UUID, event_type: str, message: str, **extra: Any) -> None:
         self.repo.append_run_event(run_id, event_type, {"message": message, **extra})
 
+    def _cancel(self, run_id: UUID) -> None:
+        self._emit(run_id, "run_cancelled", "Run cancelled", payload={})
+        self.repo.transition_run(run_id, "cancelled", finished_at=None)
+
+    def _advance_or_cancel(self, run_id: UUID, status: str, **fields: Any) -> bool:
+        """Mirror the real worker's claim-time semantics: a cancellation that
+        lands before/between the startup transitions must finalize the run as
+        cancelled, never crash into a failed terminal (the invalid
+        cancellation_requested -> starting/running transition race)."""
+        from backend.errors import AppError
+
+        if self.repo.get_run(run_id)["status"] == "cancellation_requested":
+            self._cancel(run_id)
+            return False
+        try:
+            self.repo.transition_run(run_id, status, **fields)
+            return True
+        except AppError:
+            if self.repo.get_run(run_id)["status"] == "cancellation_requested":
+                self._cancel(run_id)
+                return False
+            raise
+
     def _run(self, run_id: UUID) -> None:
         repo = self.repo
         try:
             time.sleep(0.2)
             run = repo.get_run(run_id)
             content = str((run.get("input") or {}).get("content") or "").lower()
-            repo.transition_run(run_id, "starting", started_at=run.get("started_at"))
+            if not self._advance_or_cancel(run_id, "starting", started_at=run.get("started_at")):
+                return
             self._emit(run_id, "run_started", "Run started", payload={"worker": "e2e"})
-            repo.transition_run(run_id, "running")
+            if not self._advance_or_cancel(run_id, "running"):
+                return
 
             if "timeout" in content:
                 tracker = BudgetTracker(BudgetConfig(max_run_duration_seconds=1), kill_switch=lambda: True, clock=time.monotonic, event_emitter=lambda t, p: self._emit(run_id, t, p.get("message", t), payload=p.get("payload", {})))
