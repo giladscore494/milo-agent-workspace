@@ -88,3 +88,24 @@ smoke window are explicit operator actions per
 - A retry that finds the run already in a terminal state exits 0 without
   touching the run — a durably finalized run can never produce a
   `RUN_ALREADY_CLAIMED` failure loop.
+
+## Automatic closure and semantic acceptance
+
+`execute` and standalone `monitor` arm the canonical PR #67 shutdown
+before they can proceed. Their EXIT/INT/TERM/HUP guard runs it after a clean
+success and after every failure, timeout, interruption or Cloud Shell
+disconnect. The original failure code is preserved unless shutdown itself
+is incomplete, which is reported as a critical failure.
+
+Cloud Run task exit code zero is not a positive-smoke verdict: handled
+Swarm failures intentionally exit zero after durable finalization. After
+the execution settles, the controller reads only the sanitized run and
+latest-checkpoint fields from Supabase and accepts exactly a
+`completed` Swarm V2 run at the expected attempt, with 1–200 model calls,
+actual cost at or below USD 3.00, and a compatible `swarm_v2.1`
+checkpoint. Other terminal states fail the smoke and still trigger the
+automatic shutdown.
+
+Kimi IAM is evaluated across both the secret resource policy and inherited
+project IAM. During an active smoke the pinned Worker accessor is required;
+any other effective accessor fails closed.

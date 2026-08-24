@@ -34,6 +34,7 @@ def load(name: str):
 parse_env_contract = load("parse_env_contract")
 parse_iam = load("parse_iam")
 parse_executions = load("parse_executions")
+parse_run_state = load("parse_run_state")
 
 
 # --- controller shell hygiene ------------------------------------------------
@@ -42,7 +43,11 @@ def test_controller_bash_syntax_and_strict_mode():
     subprocess.run(["bash", "-n", str(CONTROLLER)], check=True)
     text = CONTROLLER.read_text()
     assert "set -euo pipefail" in text
-    assert re.search(r"trap cleanup EXIT", text), "temp workspace must be removed on every exit path"
+    assert re.search(r"trap shutdown_guard EXIT", text)
+    assert "trap 'exit 130' INT" in text
+    assert "trap 'exit 143' TERM" in text
+    assert "trap 'exit 129' HUP" in text
+    assert "canonical_shutdown" in text
     assert "mktemp -d" in text
 
 
@@ -65,7 +70,7 @@ def test_no_parser_competes_for_stdin():
 
 
 def test_parsers_have_no_stdin_reads():
-    for helper in ("parse_env_contract", "parse_iam", "parse_executions"):
+    for helper in ("parse_env_contract", "parse_iam", "parse_executions", "parse_run_state"):
         source = (SMOKE_DIR / f"{helper}.py").read_text()
         assert "sys.stdin" not in source, f"{helper} must not read stdin"
         assert not re.search(r"(?<![\w.])input\(", source), f"{helper} must not read interactively"
@@ -351,6 +356,18 @@ def test_kimi_secret_iam_must_be_worker_only(tmp_path):
 
     empty = write_json(tmp_path / "empty.json", {"bindings": []})
     assert parse_iam.main([empty, "--secret-accessor-only", WORKER_SA]) == 0
+    assert parse_iam.main([
+        empty, "--secret-accessor-only", WORKER_SA, "--require-allowed-accessor"
+    ]) == 1
+
+    inherited = write_json(tmp_path / "project.json", {
+        "bindings": [{"role": "roles/secretmanager.secretAccessor",
+                      "members": [f"serviceAccount:{API_SA}"]}]
+    })
+    assert parse_iam.main([
+        path, "--secret-accessor-only", WORKER_SA,
+        "--inherited-policy-file", inherited,
+    ]) == 1
 
     intruder = {"bindings": [{"role": "roles/secretmanager.secretAccessor",
                               "members": [f"serviceAccount:{WORKER_SA}",
@@ -374,6 +391,7 @@ args="$*"
 printf '%s\n' "${args}" >> "${MOCK_LOG}"
 case "${args}" in
   *"secrets get-iam-policy"*) cat "${MOCK_DIR}/secret-iam.json" ;;
+  *"projects get-iam-policy"*) cat "${MOCK_DIR}/project-iam.json" ;;
   *"services get-iam-policy"*) cat "${MOCK_DIR}/api-iam.json" ;;
   *"revisions describe"*) cat "${MOCK_DIR}/api-revision.json" ;;
   *"services describe"*) cat "${MOCK_DIR}/api.json" ;;
@@ -415,6 +433,7 @@ def run_controller(tmp_path, mode, *, api=None, api_revision=None, worker=None,
     write_json(mock_dir / "secret-iam.json", secret_iam if secret_iam is not None else {
         "bindings": [{"role": "roles/secretmanager.secretAccessor",
                       "members": [f"serviceAccount:{WORKER_SA}"]}]})
+    write_json(mock_dir / "project-iam.json", {"bindings": []})
     gcloud = bin_dir / "gcloud"
     gcloud.write_text(SMOKE_MOCK_GCLOUD)
     gcloud.chmod(0o755)
@@ -556,3 +575,72 @@ def test_controller_kill_fails_when_provider_binding_remains(tmp_path):
     result, _ = run_controller(tmp_path, "kill", api=kill_api, worker=keyed_worker)
     assert result.returncode != 0
     assert "KILL SWITCH INCOMPLETE" in result.stderr + result.stdout
+
+
+# --- automatic shutdown and durable semantic acceptance ----------------------
+
+def test_execute_arms_automatic_shutdown_before_validation(tmp_path):
+    result, log = run_controller(tmp_path, "execute")
+    assert result.returncode != 0
+    assert "automatic canonical fail-closed shutdown" in result.stdout
+    assert "jobs update" in log
+    assert "services update" in log
+    assert "KILL SWITCH APPLIED" in result.stdout
+
+
+def test_controller_binds_cloud_run_success_to_semantic_verification():
+    text = CONTROLLER.read_text()
+    succeeded = text.split("succeeded)", 1)[1].split(";;", 1)[0]
+    assert "semantic_verify_run" in succeeded
+    assert "SMOKE_SAFETY_ARMED=1" in text
+    assert "trap shutdown_guard EXIT" in text
+
+
+def _positive_run(run_id="11111111-1111-4111-8111-111111111111"):
+    return [{
+        "id": run_id,
+        "status": "completed",
+        "attempt": 1,
+        "finished_at": "2026-08-24T16:00:00Z",
+        "usage": {"model_calls": 4, "actual_cost": 0.02},
+    }]
+
+
+def _positive_checkpoint(run_id="11111111-1111-4111-8111-111111111111"):
+    return [{
+        "run_id": run_id,
+        "engine_version": "swarm_v2.1",
+        "workflow_key": "swarm_v2",
+        "phase": "swarm_v2",
+        "attempt": 1,
+    }]
+
+
+def test_semantic_positive_smoke_requires_completed_checkpoint_and_caps(tmp_path):
+    run_id = "11111111-1111-4111-8111-111111111111"
+    run_file = write_json(tmp_path / "run.json", _positive_run(run_id))
+    checkpoint_file = write_json(
+        tmp_path / "checkpoint.json", _positive_checkpoint(run_id)
+    )
+    args = [
+        run_file, checkpoint_file,
+        "--run-id", run_id,
+        "--expected-attempt", "1",
+        "--max-model-calls", "200",
+        "--max-actual-cost", "3.00",
+    ]
+    assert parse_run_state.main(args) == 0
+
+    failed = _positive_run(run_id)
+    failed[0]["status"] = "failed"
+    write_json(tmp_path / "run.json", failed)
+    assert parse_run_state.main(args) == 1
+
+    over_cap = _positive_run(run_id)
+    over_cap[0]["usage"] = {"model_calls": 201, "actual_cost": 3.01}
+    write_json(tmp_path / "run.json", over_cap)
+    assert parse_run_state.main(args) == 1
+
+    write_json(tmp_path / "run.json", _positive_run(run_id))
+    write_json(tmp_path / "checkpoint.json", [])
+    assert parse_run_state.main(args) == 1
