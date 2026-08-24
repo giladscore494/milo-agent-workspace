@@ -305,14 +305,38 @@ class MemoryRepository:
         return dict(self.projects[project_id])
 
     # -- worker-side extras ----------------------------------------------------------
+    CLAIMABLE_STATES = {"queued", "launching", "waiting", "cancellation_requested", "starting", "running"}
+
     def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
-        run = self.get_run(run_id)
-        target = run["status"] if run["status"] == "cancellation_requested" else "starting"
+        # Parity with public.claim_run_lease: a terminal run (or one whose
+        # lease another worker still holds unexpired) matches no rows and
+        # surfaces as RUN_ALREADY_CLAIMED, exactly like production.
         from datetime import datetime, UTC, timedelta
-        attempt = int(run.get("attempt") or 1)
-        if run.get("worker_id") and run.get("worker_id") != worker_id:
-            attempt += 1
-        return self.transition_run(run_id, target, worker_id=worker_id, attempt=attempt, lease_token=secrets.token_urlsafe(32), started_at=run.get("started_at") or _now(), lease_expires_at=(datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat())
+        with self.lock:
+            run = self.get_run(run_id)
+            if run["status"] not in self.CLAIMABLE_STATES:
+                raise AppError("RUN_ALREADY_CLAIMED", "run is already claimed by another worker", 409)
+            holder = run.get("worker_id")
+            expires = run.get("lease_expires_at")
+            expired = not expires or expires < _now()
+            if holder and holder != worker_id and not expired:
+                raise AppError("RUN_ALREADY_CLAIMED", "run is already claimed by another worker", 409)
+            target = run["status"] if run["status"] == "cancellation_requested" else "starting"
+            attempt = int(run.get("attempt") or 1)
+            if holder and holder != worker_id and expired:
+                attempt += 1
+            # The production claim is a single-statement CAS that does not
+            # consult the transition table (e.g. an expired 'running' run is
+            # reclaimed back to 'starting'); mirror that exactly.
+            stored = self.runs[str(run_id)]
+            stored.update({
+                "status": target, "worker_id": worker_id, "attempt": attempt,
+                "lease_token": secrets.token_urlsafe(32),
+                "started_at": run.get("started_at") or _now(),
+                "lease_expires_at": (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat(),
+                "updated_at": _now(),
+            })
+            return dict(stored)
 
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         from datetime import datetime, UTC, timedelta

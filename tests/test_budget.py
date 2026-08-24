@@ -571,3 +571,46 @@ def test_restore_snapshot_preserves_cumulative_run_limits():
 def test_restore_snapshot_rejects_malformed_usage(snapshot):
     with pytest.raises(ValueError, match="budget snapshot"):
         make_tracker().restore_snapshot(snapshot)
+
+
+def test_out_of_order_settlement_settles_own_reservation_no_dangling():
+    """Concurrent guarded calls settle by their reservation sequence, so an
+    out-of-order settle can never orphan another call's daily reservation."""
+    from backend.budget import ModelCallReservation
+
+    settled = []
+    tracker = BudgetTracker(
+        BudgetConfig(daily_user_budget=10.0),
+        kill_switch=lambda: True,
+        daily_user_reserver=lambda amount, seq: ModelCallReservation(f"r{seq}", seq, amount),
+        daily_settler=lambda res, cost, status, reason: settled.append((res.id, status, cost)),
+    )
+    seq_a, _ = tracker.open_call(0, None)
+    seq_b, _ = tracker.open_call(0, None)
+    assert (seq_a, seq_b) == (1, 2)
+    # Settle B before A: each must release its OWN database reservation.
+    tracker.settle_call(cost=0.02, call_seq=seq_b)
+    tracker.settle_call(cost=0.01, call_seq=seq_a)
+    assert sorted(settled) == [("r1", "settled", 0.01), ("r2", "settled", 0.02)]
+    assert tracker._reservations == {}
+
+
+def test_settlement_failure_restores_reservation_under_correct_sequence():
+    from backend.budget import ModelCallReservation
+
+    def failing_settler(reservation, cost, status, reason):
+        raise RuntimeError("settlement backend unavailable")
+
+    tracker = BudgetTracker(
+        BudgetConfig(daily_user_budget=10.0),
+        kill_switch=lambda: True,
+        daily_user_reserver=lambda amount, seq: ModelCallReservation(f"r{seq}", seq, amount),
+        daily_settler=failing_settler,
+    )
+    seq_a, _ = tracker.open_call(0, None)
+    seq_b, _ = tracker.open_call(0, None)
+    with pytest.raises(BudgetExceeded) as stop:
+        tracker.settle_call(cost=0.02, call_seq=seq_a)
+    assert stop.value.code == "BUDGET_SETTLEMENT_FAILED"
+    # The unsettled reservation is retained under ITS OWN sequence.
+    assert set(tracker._reservations) == {seq_a, seq_b}

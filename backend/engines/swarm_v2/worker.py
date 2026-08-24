@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping
+from backend.budget import BudgetExceeded
+from backend.errors import AppError
+from backend.provider_scheduler import ProviderBackpressureExceeded
 from backend.runtime import CancellationRequested
 from backend.tools import ToolContext, ToolError, ToolRegistry
 from backend.tools.registry import validate_json_schema
@@ -42,8 +45,12 @@ class GenericWorker:
                     self._event_sink("tool_called", {"task_id": task.task_id, "tool": requirement.name})
                 self._check_cancelled()
             self._check_cancelled()
+            # The explicit JSON system instruction is required: OpenAI-compatible
+            # providers (including Moonshot) may reject response_format
+            # json_object when no message mentions JSON output.
             response = self._gateway.call(model=self._model, agent=f"worker:{task.task_id}", phase="execute",
-                messages=[{"role": "user", "content": json.dumps({"goal": task.goal, "scope": task.scope,
+                messages=[{"role": "system", "content": "Return only one JSON object that validates exactly against the provided output_schema. No markdown, no extra fields."},
+                          {"role": "user", "content": json.dumps({"goal": task.goal, "scope": task.scope,
                     "dependencies": dependency_outputs, "tools": tool_outputs, "output_schema": task.output_schema}, sort_keys=True)}],
                 response_format={"type": "json_object"})
             content = response if isinstance(response, dict) else response.choices[0].message.content
@@ -52,7 +59,17 @@ class GenericWorker:
             return TaskResult(task.task_id, "completed", output=output)
         except CancellationRequested:
             raise
+        except BudgetExceeded:
+            # A tripped hard budget limit is a run-terminal outcome, never a
+            # per-task failure: it must reach the worker's terminal handler.
+            raise
+        except AppError:
+            # Persistence/lease failures from the guarded call path are
+            # infrastructure outcomes, never per-task failures.
+            raise
         except ToolError as exc:
             return TaskResult(task.task_id, "failed", error=exc.as_dict()["error"])
+        except ProviderBackpressureExceeded:
+            return TaskResult(task.task_id, "failed", error={"code": "PROVIDER_BACKPRESSURE_EXCEEDED", "message": "provider backpressure did not clear"})
         except Exception:
             return TaskResult(task.task_id, "failed", error={"code": "TASK_FAILED", "message": "task execution failed"})
