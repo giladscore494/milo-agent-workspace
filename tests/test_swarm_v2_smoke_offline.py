@@ -253,9 +253,32 @@ def test_offline_smoke_classified_commander_failure_one_attempt_no_retry(offline
     assert launcher.exit_codes == [0]
     run = repo.get_run(UUID(run_id))
     assert run["status"] == "failed"
-    assert run["error"]["code"] == "COMMANDER_PLAN_JSON_INVALID"
+    assert run["error"] == {"code": "COMMANDER_PLAN_JSON_INVALID",
+                            "message": "Commander plan JSON is invalid"}
     assert run["attempt"] == 1
-    assert len(completions.calls) == 1  # exactly one paid Commander attempt
+    # Exactly one bounded in-run semantic repair: two paid Commander calls,
+    # never three, counted as one semantic retry inside the same attempt.
+    assert len(completions.calls) == 2
+    assert run["usage"]["model_calls"] == 2
+    assert run["usage"]["retries"] == 1
+    repair_system = " ".join(m.get("content", "")
+                             for m in completions.calls[1]["messages"]
+                             if m.get("role") == "system")
+    assert "JSON_DECODE_FAILED" in repair_system
+    assert "this is not json {{" not in repair_system
+
+    # The run_failed event carries the bounded static classification only.
+    failed_events = [e for e in repo.run_events if str(e["run_id"]) == run_id
+                     and e["event_type"] == "run_failed"]
+    assert failed_events
+    assert failed_events[-1]["payload"] == {
+        "code": "COMMANDER_PLAN_JSON_INVALID",
+        "validation_reason": "JSON_DECODE_FAILED"}
+
+    # Every daily-budget reservation settled: no dangling reservation.
+    reservations = [r for r in getattr(repo, "usage_ledger", [])
+                    if r.get("status") == "reserved"]
+    assert reservations and all(r.get("settled") for r in reservations)
 
     # A Cloud Run retry against the durably finalized run is a no-op success
     # — never a RUN_ALREADY_CLAIMED failure loop.
@@ -264,7 +287,7 @@ def test_offline_smoke_classified_commander_failure_one_attempt_no_retry(offline
     run = repo.get_run(UUID(run_id))
     assert run["status"] == "failed"
     assert run["attempt"] == 1
-    assert len(completions.calls) == 1
+    assert len(completions.calls) == 2
     assert len(repo.run_events) == events_before
 
 

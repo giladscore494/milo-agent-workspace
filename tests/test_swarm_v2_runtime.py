@@ -318,10 +318,11 @@ def test_bad_provider_plan_has_only_stable_safe_code(content, code):
                 message=SimpleNamespace(content=content + sentinel)
             )])
     # Schema-invalid JSON must remain valid JSON, so use the ordinary shaped
-    # completion for that case.
+    # completion for that case. Both invalid cases now include the single
+    # bounded repair attempt, so the fake provider serves two completions.
     if code == "COMMANDER_PLAN_SCHEMA_INVALID":
         response = json.loads(content)
-        gateway, _ = _recording_gateway([response])
+        gateway, _ = _recording_gateway([response, response])
     else:
         client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
         gateway, _ = _recording_gateway([_valid_provider_plan()])
@@ -335,12 +336,14 @@ def test_bad_provider_plan_has_only_stable_safe_code(content, code):
 
 
 def test_plan_limit_and_provider_exception_codes_are_sanitized():
-    gateway, _ = _recording_gateway([_valid_provider_plan()])
+    # A deterministic limit failure is repairable: one repair, then stop.
+    gateway, _ = _recording_gateway([_valid_provider_plan(), _valid_provider_plan()])
     with pytest.raises(CommanderPlanFailure) as limited:
         _commander_for_gateway(gateway, max_tasks=0).plan(
             requested_model="fake", objective="offline", context={}
         )
     assert limited.value.code == "COMMANDER_PLAN_LIMIT_EXCEEDED"
+    assert limited.value.validation_reason == "TASK_COUNT_LIMIT"
 
     sentinel = "SECRET_PROVIDER_SENTINEL"
     class ProviderFailure:

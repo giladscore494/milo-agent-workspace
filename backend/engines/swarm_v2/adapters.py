@@ -4,7 +4,11 @@ from typing import Any, Mapping, Protocol
 
 
 class CommanderClient(Protocol):
-    def create_plan(self, *, model: str, objective: str, context: Mapping[str, Any]) -> str | bytes | dict[str, Any]: ...
+    # repair_reason is optional for implementations: Commander only performs
+    # its single bounded plan repair when the client's create_plan signature
+    # accepts it, and passes exclusively a static allowlisted reason code.
+    def create_plan(self, *, model: str, objective: str, context: Mapping[str, Any],
+                    repair_reason: str | None = None) -> str | bytes | dict[str, Any]: ...
 
 
 class StateStore(Protocol):

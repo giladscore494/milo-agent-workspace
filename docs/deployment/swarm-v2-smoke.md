@@ -109,3 +109,29 @@ automatic shutdown.
 Kimi IAM is evaluated across both the secret resource policy and inherited
 project IAM. During an active smoke the pinned Worker accessor is required;
 any other effective accessor fails closed.
+
+## Known historical dangling reservation (requires separate recovery)
+
+Run `0d44d491-bc40-404e-9642-a5b8f77f3441` left budget reservation
+`8b05de80-fa01-4614-bec1-37f72ca63acc` in `status=reserved`
+(`estimated_cost=0.02`, `actual_cost=null`, `settled_at=null`). It predates
+the current settlement guarantees and is deliberately NOT mutated, settled
+or migrated by any code change: a separate, explicitly authorized
+production recovery operation must settle or void this one reservation
+before the next smoke acceptance, because the acceptance gate requires
+zero dangling reservations. Do not add a migration that silently cleans
+historical reservations.
+
+## Commander plan repair and failure classification
+
+A Commander completion rejected by JSON decoding, the strict contract or
+the deterministic plan firewall gets exactly ONE in-run semantic repair
+attempt: a second guarded model call through the same ModelGateway,
+BudgetTracker reservation/settlement and ProviderScheduler, counted as one
+semantic retry (provider 429 backpressure remains distinct and consumes no
+retry). The repair prompt carries only a static allowlisted reason code —
+never the rejected plan or raw validation text. If the second response is
+also invalid the run fails closed with the stable public error code, and
+the `run_failed` event additionally carries the bounded
+`validation_reason` code. Worker attempt stays 1; provider/infrastructure
+errors, cancellation and budget stops are never repaired.
