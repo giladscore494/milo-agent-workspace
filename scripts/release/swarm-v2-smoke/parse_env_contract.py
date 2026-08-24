@@ -6,8 +6,13 @@ attempt failed because piped JSON and a Python heredoc competed for stdin.
 This parser has exactly one input channel and no interactive reads.
 
 Usage:
-    parse_env_contract.py worker <describe.json> [--smoke-active]
-    parse_env_contract.py api    <describe.json> [--smoke-active]
+    parse_env_contract.py worker <describe.json> [--smoke-active] [--service-account EMAIL]
+    parse_env_contract.py api    <describe.json> [--smoke-active] [--service-account EMAIL]
+
+The input may be a Cloud Run SERVICE describe, a JOB describe, or a
+REVISION describe: the API contract is verified against the actual
+serving revision (resolved by the controller via latestReadyRevisionName),
+never against the service template alone.
 
 Exit codes: 0 contract satisfied; 1 contract violation; 2 usage/parse error.
 Values are compared, never printed for secret-backed variables.
@@ -46,6 +51,7 @@ API_EXPECTED = {
     "CLOUD_RUN_WORKER_JOB": "milo-agent-worker",
     "GCP_PROJECT_ID": "big-cabinet-457321-t7",
     "GCP_REGION": "us-central1",
+    "JOB_LAUNCHER": "disabled",
     "MILO_MAX_CONCURRENT_RUNS_PER_USER": "1",
     "MILO_MAX_CONCURRENT_RUNS_PER_PROJECT": "1",
 }
@@ -68,14 +74,26 @@ SECRET_BACKED = ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY",
                  "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN")
 
 
-def _containers(document: dict) -> list[dict]:
-    spec = document.get("spec", {}).get("template", {}).get("spec", {})
+def _resolved_spec(document: dict) -> dict:
+    spec = document.get("spec", {})
+    if "containers" in spec:  # Cloud Run Revision: containers live directly on spec
+        return spec
+    spec = spec.get("template", {}).get("spec", {})
     if "template" in spec:  # Cloud Run Job: one more template layer
         spec = spec.get("template", {}).get("spec", {})
-    return spec.get("containers", []) or []
+    return spec
 
 
-def check(role: str, document: dict, smoke_active: bool) -> list[str]:
+def _containers(document: dict) -> list[dict]:
+    return _resolved_spec(document).get("containers", []) or []
+
+
+def _service_account(document: dict) -> str:
+    return str(_resolved_spec(document).get("serviceAccountName") or "")
+
+
+def check(role: str, document: dict, smoke_active: bool,
+          expected_service_account: str | None = None) -> list[str]:
     problems: list[str] = []
     containers = _containers(document)
     if len(containers) != 1:
@@ -111,14 +129,49 @@ def check(role: str, document: dict, smoke_active: bool) -> list[str]:
                 problems.append("KIMI_API_KEY must be secret-bound to the worker during the smoke window")
             if not smoke_active and name in secret:
                 problems.append(f"{name} must be unbound from the worker at rest")
+
+    # Worker-mutation surfaces are unusable without a verified service
+    # identity boundary: execution control may never be enabled without a
+    # concrete worker audience and a non-wildcard identity allowlist
+    # (mirrors backend/production_config.py rule 5).
+    if plain.get("MILO_ENABLE_EXECUTION_CONTROL") == "true":
+        audience = (plain.get("MILO_WORKER_AUDIENCE") or "").strip()
+        allowlist = (plain.get("MILO_APPROVED_WORKER_IDENTITIES") or "").strip()
+        if not audience or audience == "*":
+            problems.append("MILO_ENABLE_EXECUTION_CONTROL requires a concrete MILO_WORKER_AUDIENCE")
+        entries = [item.strip() for item in allowlist.split(",") if item.strip()]
+        if not entries or any(entry == "*" or "@" not in entry for entry in entries):
+            problems.append("MILO_ENABLE_EXECUTION_CONTROL requires an explicit, non-wildcard MILO_APPROVED_WORKER_IDENTITIES allowlist")
+
+    if expected_service_account:
+        actual = _service_account(document)
+        if actual != expected_service_account:
+            problems.append(
+                f"runtime service account is {actual or '<unset>'!r}, expected {expected_service_account!r}")
     return problems
 
 
 def main(argv: list[str]) -> int:
-    args = [a for a in argv if a != "--smoke-active"]
     smoke_active = "--smoke-active" in argv
+    expected_service_account = None
+    args: list[str] = []
+    skip_next = False
+    for index, item in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--smoke-active":
+            continue
+        if item == "--service-account":
+            if index + 1 >= len(argv):
+                print("--service-account requires an email argument", file=sys.stderr)
+                return 2
+            expected_service_account = argv[index + 1]
+            skip_next = True
+            continue
+        args.append(item)
     if len(args) != 2 or args[0] not in {"worker", "api"}:
-        print("usage: parse_env_contract.py worker|api <describe.json> [--smoke-active]", file=sys.stderr)
+        print("usage: parse_env_contract.py worker|api <describe.json> [--smoke-active] [--service-account EMAIL]", file=sys.stderr)
         return 2
     try:
         with open(args[1], encoding="utf-8") as handle:
@@ -126,7 +179,7 @@ def main(argv: list[str]) -> int:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"cannot parse {args[1]}: {type(exc).__name__}", file=sys.stderr)
         return 2
-    problems = check(args[0], document, smoke_active)
+    problems = check(args[0], document, smoke_active, expected_service_account)
     for problem in problems:
         print(f"CONTRACT VIOLATION [{args[0]}]: {problem}")
     if not problems:

@@ -36,11 +36,38 @@ code cannot silently drift.
 
 | Mode | Mutates? | Purpose |
 | --- | --- | --- |
-| `preflight [--smoke-active]` | no | env contract + IAM + admission closure (zero active executions) |
+| `preflight [--smoke-active]` | no | serving-revision resolution + env contract + IAM + secret IAM + admission closure |
 | `execute` | YES (paid) | one worker execution for `SMOKE_RUN_ID`, then monitors to a terminal state |
 | `monitor <execution>` | no | resume monitoring an execution |
-| `kill <execution>` | YES | cancel the active smoke execution |
+| `kill` | YES | the complete canonical fail-closed shutdown (delegates to `scripts/release/stage-c/kill-switch.sh`) |
 | `post-verify` | no | at-rest posture: flags off, provider key unbound, zero active executions |
+
+`kill` is never a single-execution cancel: it reuses the hardened Stage C
+kill switch verbatim, which disables all six API execution flags, sets
+`JOB_LAUNCHER=disabled`, disables Worker paid execution, removes both
+provider-key aliases (secret and literal) from API and Worker, cancels
+every active Worker execution with a bounded settle loop, and
+independently verifies each postcondition — including that the serving
+API revision is fail-closed — before claiming success. The target passes
+through the `STAGE_C_*` pins, which refuse any conflict with the
+authorized production constants.
+
+## Serving-revision verification
+
+`preflight` and `post-verify` never trust the API service template:
+they resolve `status.latestReadyRevisionName`, describe exactly that
+revision, require it to receive 100% of traffic, and evaluate the
+environment contract (flags, launcher, provider aliases, runtime service
+account) against that revision's containers. Additional preflight gates:
+
+- `MILO_ENABLE_EXECUTION_CONTROL=true` without a concrete
+  `MILO_WORKER_AUDIENCE` and an explicit, non-wildcard
+  `MILO_APPROVED_WORKER_IDENTITIES` fails closed.
+- The worker job and serving API revision must run as the pinned runtime
+  service accounts (`milo-worker-runtime@…`, `milo-api-runtime@…`).
+- The `KIMI_API_KEY` Secret Manager policy may grant
+  `roles/secretmanager.secretAccessor` to the worker runtime identity
+  only; any other accessor fails, in every posture.
 
 `execute` refuses to run without
 `SMOKE_ACK=I_UNDERSTAND_THIS_EXECUTES_ONE_PAID_PRODUCTION_RUN`, a
