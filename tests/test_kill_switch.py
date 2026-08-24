@@ -17,11 +17,25 @@ REPO = Path(__file__).resolve().parents[1]
 KILL_SWITCH = REPO / "scripts" / "release" / "stage-c" / "kill-switch.sh"
 
 
-API_OK = {"spec": {"template": {"spec": {"containers": [{"env": [
+API_OK = {"status": {"latestReadyRevisionName": "api-safe", "traffic": [{"revisionName": "api-safe", "percent": 100}]}, "spec": {"template": {"spec": {"containers": [{"env": [
     {"name": "MILO_ENABLE_RUN_CREATION", "value": "false"},
+    {"name": "MILO_ENABLE_PROPOSAL_MUTATIONS", "value": "false"},
+    {"name": "MILO_ENABLE_PROPOSAL_READS", "value": "false"},
+    {"name": "MILO_ENABLE_RUN_CANCELLATION", "value": "false"},
+    {"name": "MILO_ENABLE_EXECUTION_CONTROL", "value": "false"},
     {"name": "JOB_LAUNCHER", "value": "disabled"},
     {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
 ]}]}}}}
+
+API_REVISION_OK = {"metadata": {"name": "api-safe"}, "spec": {"containers": [{"env": [
+    {"name": "MILO_ENABLE_RUN_CREATION", "value": "false"},
+    {"name": "MILO_ENABLE_PROPOSAL_MUTATIONS", "value": "false"},
+    {"name": "MILO_ENABLE_PROPOSAL_READS", "value": "false"},
+    {"name": "MILO_ENABLE_RUN_CANCELLATION", "value": "false"},
+    {"name": "MILO_ENABLE_EXECUTION_CONTROL", "value": "false"},
+    {"name": "JOB_LAUNCHER", "value": "disabled"},
+    {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
+]}]}}
 
 WORKER_OK = {"spec": {"template": {"spec": {"template": {"spec": {"containers": [{"env": [
     {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
@@ -78,6 +92,8 @@ case "${args}" in
       cp "${MOCK_DIR}/executions-after-cancel.json" "${MOCK_DIR}/executions.json"
     fi
     ;;
+  *"revisions describe"*)
+    cat "${MOCK_DIR}/api-revision.json" ;;
   *"services describe"*)
     cat "${MOCK_DIR}/api.json" ;;
   *"jobs describe"*)
@@ -89,7 +105,17 @@ esac
 """
 
 
-def run_kill_switch(tmp_path, *, executions, after_cancel=None, api=API_OK, worker=WORKER_OK, env=None, sequence=None):
+def run_kill_switch(
+    tmp_path,
+    *,
+    executions,
+    after_cancel=None,
+    api=API_OK,
+    api_revision=API_REVISION_OK,
+    worker=WORKER_OK,
+    env=None,
+    sequence=None,
+):
     """Run kill-switch.sh against the mocked gcloud.
 
     ``sequence`` maps a 1-based executions-list call number to a listing (or
@@ -107,6 +133,7 @@ def run_kill_switch(tmp_path, *, executions, after_cancel=None, api=API_OK, work
         (mock_dir / f"executions-{call_number}.json").write_text(body)
     (mock_dir / "list-count").write_text("0")
     (mock_dir / "api.json").write_text(json.dumps(api))
+    (mock_dir / "api-revision.json").write_text(json.dumps(api_revision))
     (mock_dir / "worker.json").write_text(json.dumps(worker))
     gcloud = bin_dir / "gcloud"
     gcloud.write_text(MOCK_GCLOUD)
@@ -139,11 +166,16 @@ def test_zero_executions_succeeds_without_cancelling(tmp_path):
     assert "jobs update" in log
     assert "services update" in log
     assert "MILO_ENABLE_PAID_EXECUTION=false" in log
-    assert "MILO_ENABLE_RUN_CREATION=false,JOB_LAUNCHER=disabled" in log
+    assert "MILO_ENABLE_RUN_CREATION=false" in log
+    assert "JOB_LAUNCHER=disabled" in log
+    for flag in ("MILO_ENABLE_RUN_CREATION", "MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_PROPOSAL_READS", "MILO_ENABLE_RUN_CANCELLATION", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PAID_EXECUTION"):
+        assert f"{flag}=false" in log
     # BOTH provider-key aliases are removed, as secrets AND as env vars.
     for alias in ("KIMI_API_KEY", "MOONSHOT_API_KEY"):
         assert f"--remove-secrets={alias}" in log
         assert f"--remove-env-vars={alias}" in log
+    assert log.count("--remove-secrets=") == 4
+    assert log.count("--remove-env-vars=") == 4
     # The final zero-active verification ran even though the initial
     # listing was already empty.
     assert log.count("executions list") >= 2
@@ -273,6 +305,37 @@ def test_failed_api_postcondition_exits_nonzero(tmp_path):
     assert "API postcondition failed" in result.stderr
 
 
+def test_serving_revision_posture_is_authoritative(tmp_path):
+    bad_revision = json.loads(json.dumps(API_REVISION_OK))
+    entries = bad_revision["spec"]["containers"][0]["env"]
+    for entry in entries:
+        if entry["name"] == "MILO_ENABLE_EXECUTION_CONTROL":
+            entry["value"] = "true"
+    result, _ = run_kill_switch(
+        tmp_path,
+        executions=[],
+        api=API_OK,
+        api_revision=bad_revision,
+    )
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "API postcondition failed" in result.stderr
+
+
+def test_described_revision_must_match_latest_ready_revision(tmp_path):
+    wrong_revision = json.loads(json.dumps(API_REVISION_OK))
+    wrong_revision["metadata"]["name"] = "api-not-serving"
+    result, _ = run_kill_switch(
+        tmp_path,
+        executions=[],
+        api=API_OK,
+        api_revision=wrong_revision,
+    )
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "API postcondition failed" in result.stderr
+
+
 def test_malformed_execution_listing_fails_closed(tmp_path):
     mock_dir = tmp_path / "mock"
     mock_dir.mkdir(exist_ok=True)
@@ -323,9 +386,9 @@ def worker_with(env_entries):
     ]}]}}}}}}
 
 
-def api_with(extra_entries):
-    spec = json.loads(json.dumps(API_OK))
-    spec["spec"]["template"]["spec"]["containers"][0]["env"].extend(extra_entries)
+def api_revision_with(extra_entries):
+    spec = json.loads(json.dumps(API_REVISION_OK))
+    spec["spec"]["containers"][0]["env"].extend(extra_entries)
     return spec
 
 
@@ -360,14 +423,16 @@ def test_both_aliases_are_removed_when_bound(tmp_path):
     result, log = run_kill_switch(tmp_path, executions=[])
     assert result.returncode == 0, result.stdout + result.stderr
     removal_lines = [line for line in log.splitlines() if "--remove-secrets" in line or "--remove-env-vars" in line]
-    assert len(removal_lines) == 4
+    assert len(removal_lines) == 8
+    assert sum("jobs update" in line for line in removal_lines) == 4
+    assert sum("services update" in line for line in removal_lines) == 4
     for line in removal_lines:  # one alias per invocation, never combined
         assert line.count("API_KEY") == 1
 
 
 @pytest.mark.parametrize("entry", [secret_entry("KIMI_API_KEY"), secret_entry("MOONSHOT_API_KEY"), literal_entry("MOONSHOT_API_KEY")])
 def test_api_with_any_provider_alias_fails_postcondition(tmp_path, entry):
-    result, _ = run_kill_switch(tmp_path, executions=[], api=api_with([entry]))
+    result, _ = run_kill_switch(tmp_path, executions=[], api_revision=api_revision_with([entry]))
     assert result.returncode != 0
     assert "KILL SWITCH APPLIED" not in result.stdout
     assert "API postcondition failed" in result.stderr

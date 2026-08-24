@@ -1834,8 +1834,11 @@ case "${args}" in
   *"run jobs describe milo-agent-worker"*)
     echo '{"metadata":{"name":"milo-agent-worker"},"spec":{"template":{"spec":{"template":{"spec":{"serviceAccountName":"milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com","containers":[{"env":[{"name":"MILO_ENABLE_PAID_EXECUTION","value":"__WORKER_PAID__"}]}]}}}}}}'
     ;;
+  *"run revisions describe api-safe"*)
+    echo '{"metadata":{"name":"api-safe"},"spec":{"containers":[{"env":[{"name":"MILO_ENABLE_RUN_CREATION","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_MUTATIONS","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_READS","value":"false"},{"name":"MILO_ENABLE_RUN_CANCELLATION","value":"false"},{"name":"MILO_ENABLE_EXECUTION_CONTROL","value":"false"},{"name":"MILO_ENABLE_PAID_EXECUTION","value":"false"},{"name":"JOB_LAUNCHER","value":"disabled"}]}]}}'
+    ;;
   *"run services describe milo-agent-api"*)
-    echo '{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"MILO_ENABLE_RUN_CREATION","value":"false"},{"name":"JOB_LAUNCHER","value":"disabled"},{"name":"MILO_ENABLE_PAID_EXECUTION","value":"false"}]}]}}}}'
+    echo '{"status":{"latestReadyRevisionName":"api-safe","traffic":[{"revisionName":"api-safe","percent":100}]},"spec":{"template":{"spec":{"containers":[{"env":[{"name":"MILO_ENABLE_RUN_CREATION","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_MUTATIONS","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_READS","value":"false"},{"name":"MILO_ENABLE_RUN_CANCELLATION","value":"false"},{"name":"MILO_ENABLE_EXECUTION_CONTROL","value":"false"},{"name":"MILO_ENABLE_PAID_EXECUTION","value":"false"},{"name":"JOB_LAUNCHER","value":"disabled"}]}]}}}}'
     ;;
   *"run jobs describe stagec-"*)
     if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then job="${BASH_REMATCH[1]}"; else exit 1; fi
