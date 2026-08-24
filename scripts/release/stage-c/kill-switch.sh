@@ -57,12 +57,24 @@ for alias in "${PROVIDER_SECRET_ALIASES[@]}"; do
   fi
 done
 
-# -- 3+4. Run creation OFF + launcher disabled (API).
+# -- 3+4. Explicitly reset the COMPLETE API execution surface.  Do not
+# depend on absent-variable defaults or on a previous revision's template.
 if ! gcloud run services update "${STAGE_C_API_SERVICE}" \
     --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
-    --update-env-vars="MILO_ENABLE_RUN_CREATION=false,JOB_LAUNCHER=disabled"; then
+    --update-env-vars="MILO_ENABLE_RUN_CREATION=false,MILO_ENABLE_PROPOSAL_MUTATIONS=false,MILO_ENABLE_PROPOSAL_READS=false,MILO_ENABLE_RUN_CANCELLATION=false,MILO_ENABLE_EXECUTION_CONTROL=false,MILO_ENABLE_PAID_EXECUTION=false,JOB_LAUNCHER=disabled"; then
   note_failure "API fail-closed flag update failed"
 fi
+
+# Provider aliases are forbidden on both surfaces.  As above, removal errors
+# may mean "already absent"; the postcondition is authoritative.
+for alias in "${PROVIDER_SECRET_ALIASES[@]}"; do
+  gcloud run services update "${STAGE_C_API_SERVICE}" \
+    --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
+    --remove-secrets="${alias}" || echo "note: API secret ${alias} already absent or removal failed; verifying."
+  gcloud run services update "${STAGE_C_API_SERVICE}" \
+    --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
+    --remove-env-vars="${alias}" || echo "note: API variable ${alias} already absent or removal failed; verifying."
+done
 
 # -- 5. Find genuinely nonterminal worker executions via structured JSON.
 # An execution is terminal only when the serialized status carries a
@@ -184,16 +196,23 @@ verify_api_posture() {
     | python3 -c '
 import json, sys
 aliases = sys.argv[1:]
-container = json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0]
+service = json.load(sys.stdin)
+container = service["spec"]["template"]["spec"]["containers"][0]
 env = container.get("env") or []
 values = {e["name"]: e.get("value") for e in env if "value" in e}
 secret_refs = {e["name"] for e in env if "valueFrom" in e}
 assert values.get("MILO_ENABLE_RUN_CREATION") == "false", "MILO_ENABLE_RUN_CREATION is not false"
+for flag in ("MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_PROPOSAL_READS", "MILO_ENABLE_RUN_CANCELLATION", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PAID_EXECUTION"):
+    assert values.get(flag) == "false", f"{flag} is not false"
 assert values.get("JOB_LAUNCHER") == "disabled", "JOB_LAUNCHER is not disabled"
-assert values.get("MILO_ENABLE_PAID_EXECUTION", "false") == "false", "API MILO_ENABLE_PAID_EXECUTION is not false"
 for alias in aliases:
     assert alias not in secret_refs, f"provider secret {alias} bound to the API"
     assert alias not in values, f"provider variable {alias} present on the API"
+status = service.get("status") or {}
+ready = status.get("latestReadyRevisionName")
+traffic = status.get("traffic") or []
+assert ready, "API has no latest ready revision"
+assert any(t.get("revisionName") == ready and int(t.get("percent", 0)) == 100 for t in traffic), "latest ready revision is not serving 100% of traffic"
 print("OK: API fail-closed, no provider alias present")
 ' "${PROVIDER_SECRET_ALIASES[@]}"
 }

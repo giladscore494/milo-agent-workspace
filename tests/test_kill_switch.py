@@ -17,8 +17,12 @@ REPO = Path(__file__).resolve().parents[1]
 KILL_SWITCH = REPO / "scripts" / "release" / "stage-c" / "kill-switch.sh"
 
 
-API_OK = {"spec": {"template": {"spec": {"containers": [{"env": [
+API_OK = {"status": {"latestReadyRevisionName": "api-safe", "traffic": [{"revisionName": "api-safe", "percent": 100}]}, "spec": {"template": {"spec": {"containers": [{"env": [
     {"name": "MILO_ENABLE_RUN_CREATION", "value": "false"},
+    {"name": "MILO_ENABLE_PROPOSAL_MUTATIONS", "value": "false"},
+    {"name": "MILO_ENABLE_PROPOSAL_READS", "value": "false"},
+    {"name": "MILO_ENABLE_RUN_CANCELLATION", "value": "false"},
+    {"name": "MILO_ENABLE_EXECUTION_CONTROL", "value": "false"},
     {"name": "JOB_LAUNCHER", "value": "disabled"},
     {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
 ]}]}}}}
@@ -139,11 +143,16 @@ def test_zero_executions_succeeds_without_cancelling(tmp_path):
     assert "jobs update" in log
     assert "services update" in log
     assert "MILO_ENABLE_PAID_EXECUTION=false" in log
-    assert "MILO_ENABLE_RUN_CREATION=false,JOB_LAUNCHER=disabled" in log
+    assert "MILO_ENABLE_RUN_CREATION=false" in log
+    assert "JOB_LAUNCHER=disabled" in log
+    for flag in ("MILO_ENABLE_RUN_CREATION", "MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_PROPOSAL_READS", "MILO_ENABLE_RUN_CANCELLATION", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PAID_EXECUTION"):
+        assert f"{flag}=false" in log
     # BOTH provider-key aliases are removed, as secrets AND as env vars.
     for alias in ("KIMI_API_KEY", "MOONSHOT_API_KEY"):
         assert f"--remove-secrets={alias}" in log
         assert f"--remove-env-vars={alias}" in log
+    assert log.count("--remove-secrets=") == 4
+    assert log.count("--remove-env-vars=") == 4
     # The final zero-active verification ran even though the initial
     # listing was already empty.
     assert log.count("executions list") >= 2
@@ -360,7 +369,9 @@ def test_both_aliases_are_removed_when_bound(tmp_path):
     result, log = run_kill_switch(tmp_path, executions=[])
     assert result.returncode == 0, result.stdout + result.stderr
     removal_lines = [line for line in log.splitlines() if "--remove-secrets" in line or "--remove-env-vars" in line]
-    assert len(removal_lines) == 4
+    assert len(removal_lines) == 8
+    assert sum("jobs update" in line for line in removal_lines) == 4
+    assert sum("services update" in line for line in removal_lines) == 4
     for line in removal_lines:  # one alias per invocation, never combined
         assert line.count("API_KEY") == 1
 

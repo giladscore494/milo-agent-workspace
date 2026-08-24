@@ -6,7 +6,21 @@ from pathlib import Path
 
 import pytest
 
-from backend.production_config import validate, validate_production_config
+from backend.production_config import ProductionConfigError, validate, validate_production_config
+
+
+def test_startup_failure_has_stable_sanitized_codes(capsys):
+    env = {**BASE_PROD, "MILO_ENABLE_EXECUTION_CONTROL": "true"}
+    env.pop("MILO_WORKER_AUDIENCE", None)
+    env.pop("MILO_APPROVED_WORKER_IDENTITIES", None)
+    with pytest.raises(ProductionConfigError) as excinfo:
+        validate_production_config(env)
+    assert str(excinfo.value) == "CONFIG_VALIDATION_FAILED[WORKER_ALLOWLIST_EMPTY,WORKER_AUTH_AUDIENCE_MISSING]"
+    diagnostic = capsys.readouterr().err
+    assert '"event": "production_config_validation_failed"' in diagnostic
+    assert "WORKER_AUTH_AUDIENCE_MISSING" in diagnostic
+    assert "https://db.example" not in diagnostic
+    assert "service-secret" not in diagnostic
 
 REPO = Path(__file__).resolve().parents[1]
 
