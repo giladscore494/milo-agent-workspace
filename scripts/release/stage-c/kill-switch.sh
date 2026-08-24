@@ -191,30 +191,89 @@ fi
 # be absent from the worker AND from the API, whether bound via valueFrom
 # or present as a literal env value.
 verify_api_posture() {
-  gcloud run services describe "${STAGE_C_API_SERVICE}" \
-    --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" --format=json \
-    | python3 -c '
+  local service_json revision_json ready rc
+  service_json="$(mktemp)"
+  revision_json="$(mktemp)"
+  rc=0
+
+  if ! gcloud run services describe "${STAGE_C_API_SERVICE}" \
+      --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
+      --format=json > "${service_json}"; then
+    rm -f "${service_json}" "${revision_json}"
+    return 1
+  fi
+
+  if ! ready="$(python3 -c '
 import json, sys
-aliases = sys.argv[1:]
-service = json.load(sys.stdin)
-container = service["spec"]["template"]["spec"]["containers"][0]
-env = container.get("env") or []
-values = {e["name"]: e.get("value") for e in env if "value" in e}
-secret_refs = {e["name"] for e in env if "valueFrom" in e}
-assert values.get("MILO_ENABLE_RUN_CREATION") == "false", "MILO_ENABLE_RUN_CREATION is not false"
-for flag in ("MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_PROPOSAL_READS", "MILO_ENABLE_RUN_CANCELLATION", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PAID_EXECUTION"):
-    assert values.get(flag) == "false", f"{flag} is not false"
-assert values.get("JOB_LAUNCHER") == "disabled", "JOB_LAUNCHER is not disabled"
-for alias in aliases:
-    assert alias not in secret_refs, f"provider secret {alias} bound to the API"
-    assert alias not in values, f"provider variable {alias} present on the API"
+with open(sys.argv[1], encoding="utf-8") as handle:
+    status = json.load(handle).get("status") or {}
+ready = status.get("latestReadyRevisionName") or ""
+if not ready:
+    raise SystemExit("API has no latest ready revision")
+print(ready)
+' "${service_json}")"; then
+    rm -f "${service_json}" "${revision_json}"
+    return 1
+  fi
+
+  if ! gcloud run revisions describe "${ready}" \
+      --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
+      --format=json > "${revision_json}"; then
+    rm -f "${service_json}" "${revision_json}"
+    return 1
+  fi
+
+  python3 - "${service_json}" "${revision_json}" "${PROVIDER_SECRET_ALIASES[@]}" <<'PY' || rc=$?
+import json
+import sys
+
+service_path, revision_path, *aliases = sys.argv[1:]
+with open(service_path, encoding="utf-8") as handle:
+    service = json.load(handle)
+with open(revision_path, encoding="utf-8") as handle:
+    revision = json.load(handle)
+
 status = service.get("status") or {}
 ready = status.get("latestReadyRevisionName")
 traffic = status.get("traffic") or []
 assert ready, "API has no latest ready revision"
-assert any(t.get("revisionName") == ready and int(t.get("percent", 0)) == 100 for t in traffic), "latest ready revision is not serving 100% of traffic"
-print("OK: API fail-closed, no provider alias present")
-' "${PROVIDER_SECRET_ALIASES[@]}"
+assert any(
+    item.get("revisionName") == ready and int(item.get("percent", 0)) == 100
+    for item in traffic
+), "latest ready revision is not serving 100% of traffic"
+assert (revision.get("metadata") or {}).get("name") == ready, (
+    "described revision is not the latest ready revision"
+)
+
+container = revision["spec"]["containers"][0]
+env = container.get("env") or []
+values = {entry["name"]: entry.get("value") for entry in env if "value" in entry}
+secret_refs = {entry["name"] for entry in env if "valueFrom" in entry}
+
+for flag in (
+    "MILO_ENABLE_RUN_CREATION",
+    "MILO_ENABLE_PROPOSAL_MUTATIONS",
+    "MILO_ENABLE_PROPOSAL_READS",
+    "MILO_ENABLE_RUN_CANCELLATION",
+    "MILO_ENABLE_EXECUTION_CONTROL",
+    "MILO_ENABLE_PAID_EXECUTION",
+):
+    assert values.get(flag) == "false", f"{flag} is not false on serving revision"
+assert values.get("JOB_LAUNCHER") == "disabled", (
+    "JOB_LAUNCHER is not disabled on serving revision"
+)
+for alias in aliases:
+    assert alias not in secret_refs, (
+        f"provider secret {alias} bound to serving API revision"
+    )
+    assert alias not in values, (
+        f"provider variable {alias} present on serving API revision"
+    )
+print(f"OK: serving API revision {ready} is fail-closed; no provider alias present")
+PY
+
+  rm -f "${service_json}" "${revision_json}"
+  return "${rc}"
 }
 
 verify_worker_posture() {

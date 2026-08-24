@@ -27,6 +27,16 @@ API_OK = {"status": {"latestReadyRevisionName": "api-safe", "traffic": [{"revisi
     {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
 ]}]}}}}
 
+API_REVISION_OK = {"metadata": {"name": "api-safe"}, "spec": {"containers": [{"env": [
+    {"name": "MILO_ENABLE_RUN_CREATION", "value": "false"},
+    {"name": "MILO_ENABLE_PROPOSAL_MUTATIONS", "value": "false"},
+    {"name": "MILO_ENABLE_PROPOSAL_READS", "value": "false"},
+    {"name": "MILO_ENABLE_RUN_CANCELLATION", "value": "false"},
+    {"name": "MILO_ENABLE_EXECUTION_CONTROL", "value": "false"},
+    {"name": "JOB_LAUNCHER", "value": "disabled"},
+    {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
+]}]}}
+
 WORKER_OK = {"spec": {"template": {"spec": {"template": {"spec": {"containers": [{"env": [
     {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
 ]}]}}}}}}
@@ -82,6 +92,8 @@ case "${args}" in
       cp "${MOCK_DIR}/executions-after-cancel.json" "${MOCK_DIR}/executions.json"
     fi
     ;;
+  *"revisions describe"*)
+    cat "${MOCK_DIR}/api-revision.json" ;;
   *"services describe"*)
     cat "${MOCK_DIR}/api.json" ;;
   *"jobs describe"*)
@@ -93,7 +105,17 @@ esac
 """
 
 
-def run_kill_switch(tmp_path, *, executions, after_cancel=None, api=API_OK, worker=WORKER_OK, env=None, sequence=None):
+def run_kill_switch(
+    tmp_path,
+    *,
+    executions,
+    after_cancel=None,
+    api=API_OK,
+    api_revision=API_REVISION_OK,
+    worker=WORKER_OK,
+    env=None,
+    sequence=None,
+):
     """Run kill-switch.sh against the mocked gcloud.
 
     ``sequence`` maps a 1-based executions-list call number to a listing (or
@@ -111,6 +133,7 @@ def run_kill_switch(tmp_path, *, executions, after_cancel=None, api=API_OK, work
         (mock_dir / f"executions-{call_number}.json").write_text(body)
     (mock_dir / "list-count").write_text("0")
     (mock_dir / "api.json").write_text(json.dumps(api))
+    (mock_dir / "api-revision.json").write_text(json.dumps(api_revision))
     (mock_dir / "worker.json").write_text(json.dumps(worker))
     gcloud = bin_dir / "gcloud"
     gcloud.write_text(MOCK_GCLOUD)
@@ -282,6 +305,37 @@ def test_failed_api_postcondition_exits_nonzero(tmp_path):
     assert "API postcondition failed" in result.stderr
 
 
+def test_serving_revision_posture_is_authoritative(tmp_path):
+    bad_revision = json.loads(json.dumps(API_REVISION_OK))
+    entries = bad_revision["spec"]["containers"][0]["env"]
+    for entry in entries:
+        if entry["name"] == "MILO_ENABLE_EXECUTION_CONTROL":
+            entry["value"] = "true"
+    result, _ = run_kill_switch(
+        tmp_path,
+        executions=[],
+        api=API_OK,
+        api_revision=bad_revision,
+    )
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "API postcondition failed" in result.stderr
+
+
+def test_described_revision_must_match_latest_ready_revision(tmp_path):
+    wrong_revision = json.loads(json.dumps(API_REVISION_OK))
+    wrong_revision["metadata"]["name"] = "api-not-serving"
+    result, _ = run_kill_switch(
+        tmp_path,
+        executions=[],
+        api=API_OK,
+        api_revision=wrong_revision,
+    )
+    assert result.returncode != 0
+    assert "KILL SWITCH APPLIED" not in result.stdout
+    assert "API postcondition failed" in result.stderr
+
+
 def test_malformed_execution_listing_fails_closed(tmp_path):
     mock_dir = tmp_path / "mock"
     mock_dir.mkdir(exist_ok=True)
@@ -332,9 +386,9 @@ def worker_with(env_entries):
     ]}]}}}}}}
 
 
-def api_with(extra_entries):
-    spec = json.loads(json.dumps(API_OK))
-    spec["spec"]["template"]["spec"]["containers"][0]["env"].extend(extra_entries)
+def api_revision_with(extra_entries):
+    spec = json.loads(json.dumps(API_REVISION_OK))
+    spec["spec"]["containers"][0]["env"].extend(extra_entries)
     return spec
 
 
@@ -378,7 +432,7 @@ def test_both_aliases_are_removed_when_bound(tmp_path):
 
 @pytest.mark.parametrize("entry", [secret_entry("KIMI_API_KEY"), secret_entry("MOONSHOT_API_KEY"), literal_entry("MOONSHOT_API_KEY")])
 def test_api_with_any_provider_alias_fails_postcondition(tmp_path, entry):
-    result, _ = run_kill_switch(tmp_path, executions=[], api=api_with([entry]))
+    result, _ = run_kill_switch(tmp_path, executions=[], api_revision=api_revision_with([entry]))
     assert result.returncode != 0
     assert "KILL SWITCH APPLIED" not in result.stdout
     assert "API postcondition failed" in result.stderr
