@@ -7,11 +7,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.budget import (
+    CUMULATIVE_USAGE_AMOUNTS,
+    CUMULATIVE_USAGE_COUNTERS,
+    USAGE_SNAPSHOT_FIELDS,
     BudgetConfig,
     BudgetExceeded,
     BudgetTracker,
     GuardedModelClient,
     build_guarded_client_factory,
+    merge_usage_snapshots,
     paid_execution_enabled,
 )
 from backend.dependencies import get_job_launcher, get_repository
@@ -614,3 +618,120 @@ def test_settlement_failure_restores_reservation_under_correct_sequence():
     assert stop.value.code == "BUDGET_SETTLEMENT_FAILED"
     # The unsettled reservation is retained under ITS OWN sequence.
     assert set(tracker._reservations) == {seq_a, seq_b}
+
+
+# --- monotonic durable usage merge ------------------------------------------
+#
+# A run records its usage in more than one durable place, and they advance at
+# different rates: runs.usage is rewritten after every settled provider call,
+# an engine checkpoint only at task and batch boundaries. Restoring the wrong
+# one on resume hands back capacity the run already spent.
+
+def usage(**overrides) -> dict:
+    """A complete, self-consistent tracker snapshot."""
+    snapshot = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0,
+                "estimated_cost": 0.0, "actual_cost": 0.0, "retries": 0,
+                "provider_backpressure_events": 0, "agent_steps": 0,
+                "elapsed_seconds": 0.0}
+    snapshot.update(overrides)
+    snapshot["total_tokens"] = snapshot["input_tokens"] + snapshot["output_tokens"]
+    return snapshot
+
+
+def test_the_merge_covers_every_snapshot_field_the_tracker_writes():
+    """No cumulative dimension may be left out of the monotonic rule: a field
+    the merge does not know about is a field a stale snapshot could refund."""
+    assert USAGE_SNAPSHOT_FIELDS == set(BudgetTracker(BudgetConfig()).snapshot())
+    assert USAGE_SNAPSHOT_FIELDS == {
+        *CUMULATIVE_USAGE_COUNTERS, *CUMULATIVE_USAGE_AMOUNTS, "total_tokens"}
+
+
+def test_a_stale_checkpoint_never_lowers_the_newer_durable_run_usage():
+    """The crash window: the provider call settled and runs.usage advanced,
+    then the process died before the checkpoint was written."""
+    checkpoint = usage(model_calls=3, input_tokens=100, output_tokens=40,
+                       actual_cost=0.30, retries=1, agent_steps=3, elapsed_seconds=12.0)
+    run_row = usage(model_calls=4, input_tokens=150, output_tokens=60,
+                    actual_cost=0.42, retries=1, agent_steps=4, elapsed_seconds=19.5)
+    merged = merge_usage_snapshots(run_row, checkpoint)
+    assert merged["model_calls"] == 4
+    assert (merged["input_tokens"], merged["output_tokens"], merged["total_tokens"]) == (150, 60, 210)
+    assert merged["actual_cost"] == pytest.approx(0.42)
+    assert merged["agent_steps"] == 4
+    assert merged["elapsed_seconds"] == pytest.approx(19.5)
+    # Argument order must not decide the outcome.
+    assert merge_usage_snapshots(checkpoint, run_row) == merged
+
+
+def test_a_run_row_left_behind_by_a_rejected_write_never_lowers_the_checkpoint():
+    """The other direction: a stale-lease rejection can leave runs.usage
+    BEHIND its own checkpoint, so the rule is a maximum, not a preference."""
+    checkpoint = usage(model_calls=6, input_tokens=90, actual_cost=0.6)
+    run_row = usage(model_calls=2, input_tokens=20, actual_cost=0.2)
+    merged = merge_usage_snapshots(run_row, checkpoint)
+    assert (merged["model_calls"], merged["input_tokens"]) == (6, 90)
+    assert merged["actual_cost"] == pytest.approx(0.6)
+
+
+def test_the_merge_is_component_wise_so_neither_source_is_refunded_anywhere():
+    """Each source is ahead on a different dimension; the merge keeps both."""
+    merged = merge_usage_snapshots(usage(model_calls=5, actual_cost=0.1, retries=0),
+                                   usage(model_calls=2, actual_cost=0.9, retries=3))
+    assert (merged["model_calls"], merged["retries"]) == (5, 3)
+    assert merged["actual_cost"] == pytest.approx(0.9)
+
+
+def test_equal_snapshots_merge_to_themselves():
+    same = usage(model_calls=3, input_tokens=11, output_tokens=7, actual_cost=0.25)
+    assert merge_usage_snapshots(same, dict(same)) == same
+
+
+@pytest.mark.parametrize("present,absent", [
+    (usage(model_calls=4, input_tokens=8), {}),
+    (usage(model_calls=4, input_tokens=8), None),
+])
+def test_a_missing_side_falls_back_to_the_one_that_exists(present, absent):
+    assert merge_usage_snapshots(present, absent) == present
+    assert merge_usage_snapshots(absent, present) == present
+
+
+def test_nothing_durable_merges_to_nothing_so_a_first_attempt_restores_nothing():
+    assert merge_usage_snapshots({}, {}) == {}
+    assert merge_usage_snapshots(None, None) == {}
+    assert merge_usage_snapshots() == {}
+
+
+def test_a_merged_snapshot_is_accepted_by_restore_snapshot_unchanged():
+    """The merge must produce exactly the contract restore_snapshot enforces —
+    including the derived total, which is recomputed rather than maximised."""
+    merged = merge_usage_snapshots(usage(model_calls=2, input_tokens=10, output_tokens=1),
+                                   usage(model_calls=1, input_tokens=3, output_tokens=9))
+    assert merged["total_tokens"] == merged["input_tokens"] + merged["output_tokens"] == 19
+    tracker = make_tracker(max_model_calls_per_run=5)
+    tracker.restore_snapshot(merged)
+    assert (tracker.model_calls, tracker.input_tokens, tracker.output_tokens) == (2, 10, 9)
+
+
+@pytest.mark.parametrize("corrupt", [
+    {"model_calls": -1},
+    {"model_calls": True},
+    {"model_calls": "3"},
+    {"actual_cost": float("nan")},
+    {"actual_cost": float("inf")},
+    {"estimated_cost": -0.5},
+    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 5},
+])
+def test_a_corrupt_durable_snapshot_fails_closed_rather_than_being_ignored(corrupt):
+    """Silently dropping a corrupt value is indistinguishable from refunding
+    it, so the merge raises instead."""
+    with pytest.raises(ValueError, match="budget snapshot"):
+        merge_usage_snapshots(usage(model_calls=9), corrupt)
+
+
+def test_an_unknown_key_is_ignored_rather_than_bricking_a_resume():
+    """A dimension written by a future release cannot be enforced here, but it
+    must not make an otherwise valid resume impossible either."""
+    merged = merge_usage_snapshots(usage(model_calls=2), {"model_calls": 5, "future_meter": 3})
+    assert merged["model_calls"] == 5
+    assert "future_meter" not in merged
+    make_tracker().restore_snapshot(merged)  # still a valid restore payload

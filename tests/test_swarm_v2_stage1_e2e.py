@@ -73,7 +73,11 @@ class StubResolver:
 
 
 class VerifyGateway:
-    """Offline verifier model that cites one real supplied fragment hash."""
+    """Offline verifier model that cites one real supplied fragment hash.
+
+    Answers in the exact response contract: a decision and its evidence, with
+    no free-text field the backend could copy into a durable verdict.
+    """
 
     def call(self, **kwargs):
         import json
@@ -81,7 +85,6 @@ class VerifyGateway:
         hashes = {source["source_id"]: [item["content_hash"] for item in source["fragments"]]
                   for source in document["sources"]}
         return {"verdicts": [{"claim_id": claim["claim_id"], "verdict": "verified",
-                              "reason": "supported",
                               "supporting_fragment_hashes": hashes[claim["source_id"]][:1]}
                              for claim in document["claims"]]}
 

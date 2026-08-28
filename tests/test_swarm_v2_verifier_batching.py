@@ -19,7 +19,8 @@ import pytest
 
 from backend.engines.swarm_v2 import (
     MAX_VERIFIER_BATCH_JSON_BYTES, MAX_VERIFIER_CLAIMS_PER_BATCH,
-    MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH, BoundedTaskExecutor, EvidenceReference,
+    GROUNDED_VERDICT_REASONS, MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH,
+    BoundedTaskExecutor, EvidenceReference,
     GroundedCandidate, RemainingBudget, SwarmState, SwarmV2Engine, Verifier,
     VerifierContractError, build_verifier_batches, parse_verifier_batch,
     plan_grounded_verification, serialize_verifier_candidates, verifier_payload_bytes,
@@ -92,7 +93,6 @@ class RecordingGateway:
             if self._responder is not None:
                 return self._responder(claim_ids, self.model_calls, hashes)
             return {"verdicts": [{"claim_id": claim_id, "verdict": "verified",
-                                  "reason": "supported",
                                   "supporting_fragment_hashes": hashes[claim_id][:1]}
                                  for claim_id in claim_ids]}
         finally:
@@ -235,7 +235,7 @@ def test_unsupported_and_conflicted_claims_never_appear_in_a_model_request():
 
 def test_reordered_response_is_accepted_and_final_order_stays_deterministic():
     def responder(claim_ids, _index, hashes):
-        return {"verdicts": [{"claim_id": claim_id, "verdict": "verified", "reason": "ok",
+        return {"verdicts": [{"claim_id": claim_id, "verdict": "verified",
                               "supporting_fragment_hashes": hashes[claim_id][:1]}
                              for claim_id in reversed(claim_ids)]}
     gateway = RecordingGateway(responder)
@@ -266,7 +266,7 @@ def test_duplicate_evidence_identity_fails_closed():
 def test_omission_is_local_to_its_own_batch():
     def responder(claim_ids, index, hashes):
         answered = claim_ids[1:] if index == 2 else claim_ids
-        return {"verdicts": [{"claim_id": claim_id, "verdict": "verified", "reason": "ok",
+        return {"verdicts": [{"claim_id": claim_id, "verdict": "verified",
                               "supporting_fragment_hashes": hashes[claim_id][:1]}
                              for claim_id in answered]}
     gateway = RecordingGateway(responder)
@@ -281,9 +281,9 @@ def test_omission_is_local_to_its_own_batch():
 def test_duplicate_response_claim_id_fails_closed_without_last_wins():
     def responder(claim_ids, _index, hashes):
         return {"verdicts": [
-            {"claim_id": claim_ids[0], "verdict": "verified", "reason": "first",
+            {"claim_id": claim_ids[0], "verdict": "verified",
              "supporting_fragment_hashes": hashes[claim_ids[0]][:1]},
-            {"claim_id": claim_ids[0], "verdict": "rejected", "reason": "second"},
+            {"claim_id": claim_ids[0], "verdict": "rejected"},
         ]}
     with pytest.raises(VerifierContractError) as excinfo:
         verifier(RecordingGateway(responder)).verify(refs(2))
@@ -292,8 +292,7 @@ def test_duplicate_response_claim_id_fails_closed_without_last_wins():
 
 def test_foreign_response_claim_id_fails_closed():
     def responder(claim_ids, _index, hashes):
-        return {"verdicts": [{"claim_id": f"foreign-{SENTINEL}", "verdict": "verified",
-                              "reason": "invented"}]}
+        return {"verdicts": [{"claim_id": f"foreign-{SENTINEL}", "verdict": "verified"}]}
     with pytest.raises(VerifierContractError) as excinfo:
         verifier(RecordingGateway(responder)).verify(refs(2))
     assert excinfo.value.reason_code == "VERIFIER_RESPONSE_UNKNOWN_CLAIM"
@@ -397,8 +396,11 @@ def test_resume_skips_checkpointed_claims_and_matches_an_uninterrupted_run():
     assert uninterrupted_gateway.model_calls == 3
 
     first_batch = build_verifier_batches(grounded(items))[0]
+    # Exactly what a completed grounded batch made durable: the reason is
+    # backend-owned, so a resumed verdict is byte-identical to a fresh one.
     checkpoint = {item.claim_id: {"claim_id": item.claim_id, "verdict": "verified",
-                                  "reason": "supported"} for item in first_batch}
+                                  "reason": GROUNDED_VERDICT_REASONS["verified"]}
+                  for item in first_batch}
     resumed_gateway = RecordingGateway()
     resumed = verifier(resumed_gateway).verify(items, existing_verdicts=checkpoint)
     assert resumed_gateway.model_calls == 2
@@ -562,8 +564,7 @@ def test_incompatible_checkpoint_verifier_state_fails_the_run_closed():
 
 def test_no_raw_verifier_material_reaches_state_events_or_the_error():
     def responder(claim_ids, _index, hashes):
-        return {"verdicts": [{"claim_id": f"{SENTINEL}", "verdict": "verified",
-                              "reason": SENTINEL}]}
+        return {"verdicts": [{"claim_id": f"{SENTINEL}", "verdict": "verified"}]}
     gateway, checkpoints, events = RecordingGateway(responder), [], []
     engine, _ = engine_with(gateway, refs(3), checkpoints=checkpoints, events=events)
     with pytest.raises(VerifierContractError) as excinfo:

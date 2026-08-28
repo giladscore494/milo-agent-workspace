@@ -17,11 +17,13 @@ from .worker import (MAX_WORKER_OUTPUT_MODEL_ATTEMPTS, WORKER_OUTPUT_REASONS, Ge
                      TaskResult, WorkerOutputValidationError, build_worker_request,
                      validate_worker_output)
 from .builder import FinalBuilder
-from .grounding import (GROUNDING_REASONS, MAX_SOURCES_PER_RESOLVER_READ,
-                        VERIFIER_GROUNDING_VERSION, EvidenceResolver, GroundedCandidate,
-                        GroundingContractError, RepositoryEvidenceResolver,
-                        ResolvedSourceEvidence, SourceFragment, resolve_source_context)
-from .verifier import (MAX_VERIFIER_BATCH_JSON_BYTES, MAX_VERIFIER_CLAIMS_PER_BATCH,
+from .grounding import (FRAGMENT_OVER_READ_PER_SOURCE, GROUNDING_REASONS,
+                        MAX_SOURCES_PER_RESOLVER_READ, VERIFIER_GROUNDING_VERSION,
+                        EvidenceResolver, GroundedCandidate, GroundingContractError,
+                        RepositoryEvidenceResolver, ResolvedSourceEvidence, SourceFragment,
+                        resolve_source_context)
+from .verifier import (GROUNDED_VERDICT_REASONS, MAX_VERIFIER_BATCH_JSON_BYTES,
+                       MAX_VERIFIER_CLAIMS_PER_BATCH,
                        MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH, MISSING_CONTEXT_VERDICT,
                        VERIFIER_REASONS, GroundedVerificationPlan, Verifier,
                        VerifierContractError, VerifierProgress, VerifierResponseVerdict,
@@ -39,14 +41,16 @@ __all__ += ["EvidenceReference", "FinalBuilder", "RemainingBudget", "SwarmState"
 __all__ += ["VALIDATION_REASONS", "provider_plan_policy"]
 __all__ += ["MAX_WORKER_OUTPUT_MODEL_ATTEMPTS", "WORKER_OUTPUT_REASONS",
             "WorkerOutputValidationError", "build_worker_request", "validate_worker_output"]
-__all__ += ["MAX_VERIFIER_BATCH_JSON_BYTES", "MAX_VERIFIER_CLAIMS_PER_BATCH",
+__all__ += ["GROUNDED_VERDICT_REASONS", "MAX_VERIFIER_BATCH_JSON_BYTES",
+            "MAX_VERIFIER_CLAIMS_PER_BATCH",
             "MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH", "MISSING_CONTEXT_VERDICT",
             "VERIFIER_REASONS", "GroundedVerificationPlan", "VerifierContractError",
             "VerifierProgress", "VerifierResponseVerdict", "build_verifier_batches",
             "parse_verifier_batch", "plan_grounded_verification",
             "serialize_verifier_candidates", "verifier_evidence_chars",
             "verifier_payload_bytes"]
-__all__ += ["GROUNDING_REASONS", "MAX_SOURCES_PER_RESOLVER_READ",
+__all__ += ["FRAGMENT_OVER_READ_PER_SOURCE", "GROUNDING_REASONS",
+            "MAX_SOURCES_PER_RESOLVER_READ",
             "VERIFIER_GROUNDING_VERSION", "EvidenceResolver", "GroundedCandidate",
             "GroundingContractError", "RepositoryEvidenceResolver",
             "ResolvedSourceEvidence", "SourceFragment", "resolve_source_context"]

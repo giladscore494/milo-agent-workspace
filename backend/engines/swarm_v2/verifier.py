@@ -79,6 +79,19 @@ VERIFIER_REASONS = frozenset({
     "VERIFIER_STATE_INCOMPATIBLE_VERDICT",
 })
 
+# Durable verdict reasons are BACKEND-OWNED and finite. The model chooses a
+# verdict and cites evidence; it never authors text that crosses the grounding
+# boundary. Without this, a model could copy a source fragment into a free-text
+# `reason`, which VerificationVerdict carries into verifier_state, the durable
+# checkpoint, FinalBuilder's needs_review entries and finally runs.output --
+# which GET /runs/{id} serves to the browser. That would defeat the whole point
+# of keeping fragment text model-input-only.
+GROUNDED_VERDICT_REASONS = {
+    "verified": "source evidence supports claim",
+    "needs_review": "source evidence is insufficient or ambiguous",
+    "rejected": "source evidence does not support claim",
+}
+
 UNSUPPORTED_VERDICT = ("rejected", "unsupported claim")
 CONFLICT_VERDICT = ("needs_review", "unresolved conflict")
 OMITTED_VERDICT = ("rejected", "verifier omitted claim")
@@ -112,13 +125,14 @@ _SYSTEM_PROMPT = (
     "URL, source metadata or a reconstructed excerpt as evidence, never "
     "browse, and never infer source content that was not supplied. "
     "RESPONSE: return JSON "
-    "{verdicts:[{claim_id,verdict,reason,supporting_fragment_hashes}]}; "
+    "{verdicts:[{claim_id,verdict,supporting_fragment_hashes}]}; "
     "verdict is verified, needs_review, or rejected. Return exactly one "
     "verdict for every claim_id in the request and never a claim_id that is "
     "not in the request. supporting_fragment_hashes holds content_hash values "
     "copied verbatim from that claim's own source block: a verified verdict "
     "must cite at least one, and no verdict may cite a hash from another "
-    "source."
+    "source. Return no other field and no free text of your own: never quote, "
+    "restate or summarise source content anywhere in your response."
 )
 
 
@@ -154,6 +168,11 @@ class VerifierContractError(ValueError):
 class VerifierResponseVerdict(StrictContract):
     """The strict INTERNAL verifier response contract.
 
+    Deliberately carries NO free-text field. The model returns a decision and
+    the evidence it rests on, nothing a source fragment could be copied into:
+    every string that becomes durable comes from GROUNDED_VERDICT_REASONS
+    instead. There is simply no attribute here for prose to land in.
+
     `supporting_fragment_hashes` is a grounding-validation device only: it is
     checked against the fragments actually supplied for that claim's source
     and then dropped. It never reaches VerificationVerdict, verifier_state,
@@ -162,7 +181,6 @@ class VerifierResponseVerdict(StrictContract):
 
     claim_id: str = Field(min_length=1, max_length=200)
     verdict: Literal["verified", "needs_review", "rejected"]
-    reason: str = Field(min_length=1, max_length=500)
     supporting_fragment_hashes: list[str] = Field(default_factory=list,
                                                   max_length=MAX_FRAGMENTS_PER_SOURCE)
 
@@ -424,6 +442,10 @@ def parse_verifier_batch(content: Any, expected: Sequence[str], *,
     one that was not supplied, or one belonging to a different source in the
     same batch, fails closed. Hashes on a non-verified verdict decide nothing
     and are simply dropped with the rest.
+
+    The durable `reason` is chosen HERE from GROUNDED_VERDICT_REASONS and is
+    never taken from the response, so no model-authored string can cross into
+    VerificationVerdict and no quoted source text can ride out on one.
     """
     if isinstance(content, Mapping):
         document: Any = dict(content)
@@ -442,6 +464,13 @@ def parse_verifier_batch(content: Any, expected: Sequence[str], *,
         raise VerifierContractError("VERIFIER_RESPONSE_INVALID")
     allowed, by_id = set(expected), {}
     for entry in entries:
+        if isinstance(entry, Mapping):
+            # A model that narrates its verdict anyway must not fail a whole
+            # batch over one cosmetic field, but its prose is discarded HERE,
+            # unread, at the boundary: the strict model below has no attribute
+            # it could be validated into, so it can never become durable.
+            # Every OTHER unknown key still fails closed.
+            entry = {key: value for key, value in entry.items() if key != "reason"}
         try:
             answer = VerifierResponseVerdict.model_validate(entry)
         except (TypeError, ValueError):
@@ -461,10 +490,12 @@ def parse_verifier_batch(content: Any, expected: Sequence[str], *,
             if not set(cited) <= frozenset(supporting_by_claim.get(answer.claim_id, ())):
                 # Includes a hash belonging to another source in this batch.
                 raise VerifierContractError("VERIFIER_RESPONSE_UNKNOWN_EVIDENCE")
-        # The hash list is dropped HERE: the durable verdict contract stays
-        # exactly {claim_id, verdict, reason}.
+        # The hash list is dropped HERE and the reason is OURS: the durable
+        # verdict contract stays exactly {claim_id, verdict, reason}, and every
+        # part of it is backend-authored.
         by_id[answer.claim_id] = VerificationVerdict(
-            claim_id=answer.claim_id, verdict=answer.verdict, reason=answer.reason)
+            claim_id=answer.claim_id, verdict=answer.verdict,
+            reason=GROUNDED_VERDICT_REASONS[answer.verdict])
     omitted, omitted_reason = OMITTED_VERDICT
     return [by_id[claim_id] if claim_id in by_id else
             VerificationVerdict(claim_id=claim_id, verdict=omitted, reason=omitted_reason)
@@ -555,7 +586,8 @@ class Verifier:
         return resolved
 
 
-__all__ = ["CONFLICT_VERDICT", "MAX_VERIFIER_BATCH_JSON_BYTES",
+__all__ = ["CONFLICT_VERDICT", "GROUNDED_VERDICT_REASONS",
+           "MAX_VERIFIER_BATCH_JSON_BYTES",
            "MAX_VERIFIER_CLAIMS_PER_BATCH", "MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH",
            "MISSING_CONTEXT_VERDICT", "OMITTED_VERDICT", "UNSUPPORTED_VERDICT",
            "VERIFIER_REASONS", "GroundedVerificationPlan", "Verifier",

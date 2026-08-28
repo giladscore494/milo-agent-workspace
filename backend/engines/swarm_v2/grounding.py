@@ -55,11 +55,27 @@ from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE,
 # produced against durable B2 source evidence".
 VERIFIER_GROUNDING_VERSION = 1
 
-# One bounded internal read covers this many sources at a time.  It matches
-# SupabaseRepository.MAX_SOURCE_CONTEXT_ROWS and keeps the fragment read
-# inside MAX_EVIDENCE_FRAGMENT_ROWS (50 * 4 == 200), so a chunk can never be
-# silently truncated by the repository's own row cap.
-MAX_SOURCES_PER_RESOLVER_READ = 50
+# One bounded internal read covers this many sources at a time.
+#
+# The chunk size is derived from a detection requirement, not from the
+# repository's cap.  A fragment read limited to exactly MAX_FRAGMENTS_PER_SOURCE
+# rows per source cannot tell a source holding the legal maximum from a
+# corrupted one holding more: the row that would prove the corruption is the
+# one the LIMIT drops.  So every read deliberately asks for ONE row per source
+# beyond the durable bound, purely so an over-limit source is observable and
+# can fail closed instead of arriving quietly trimmed.
+#
+# That over-read is what fixes the chunk size:
+#
+#     40 sources * (4 + 1) rows == 200 == MAX_EVIDENCE_FRAGMENT_ROWS
+#
+# so a full chunk still fits the repository's own row cap with nothing lost,
+# and 40 <= MAX_SOURCE_CONTEXT_ROWS keeps the paired source read inside its cap
+# too.  tests/test_swarm_v2_grounded_verifier.py pins all three relationships.
+MAX_SOURCES_PER_RESOLVER_READ = 40
+# One row past the durable per-source bound: enough to DETECT corruption,
+# never enough to hold a fifth fragment in a resolved context.
+FRAGMENT_OVER_READ_PER_SOURCE = MAX_FRAGMENTS_PER_SOURCE + 1
 
 GROUNDING_REASONS = frozenset({"SOURCE_CONTEXT_INVALID"})
 
@@ -278,7 +294,7 @@ class RepositoryEvidenceResolver:
         fragments: dict[str, list[SourceFragment]] = {}
         for chunk in _chunks(source_ids, MAX_SOURCES_PER_RESOLVER_READ):
             rows = self._repository.list_evidence_fragments_for_sources(
-                self._run_id, chunk, limit=len(chunk) * MAX_FRAGMENTS_PER_SOURCE)
+                self._run_id, chunk, limit=len(chunk) * FRAGMENT_OVER_READ_PER_SOURCE)
             for row in rows:
                 source_id = str(row.get("source_id"))
                 source = sources.get(source_id)
@@ -295,7 +311,15 @@ class RepositoryEvidenceResolver:
                 except (KeyError, TypeError):
                     # `from None`: the raised message would quote durable text.
                     raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
-                fragments.setdefault(source_id, []).append(fragment)
+                owned = fragments.setdefault(source_id, [])
+                owned.append(fragment)
+                # The over-read exists so this can fire. A source holding more
+                # than the durable bound is corrupted grounding context and
+                # fails closed here -- it is never quietly trimmed back to the
+                # first MAX_FRAGMENTS_PER_SOURCE rows, which would present a
+                # broken source as a valid one.
+                if len(owned) > MAX_FRAGMENTS_PER_SOURCE:
+                    raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         return fragments
 
     @staticmethod
@@ -313,7 +337,8 @@ class RepositoryEvidenceResolver:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
 
 
-__all__ = ["GROUNDING_REASONS", "MAX_SOURCES_PER_RESOLVER_READ",
+__all__ = ["FRAGMENT_OVER_READ_PER_SOURCE", "GROUNDING_REASONS",
+           "MAX_SOURCES_PER_RESOLVER_READ",
            "VERIFIER_GROUNDING_VERSION", "EvidenceResolver", "GroundedCandidate",
            "GroundingContractError", "RepositoryEvidenceResolver", "ResolvedSourceEvidence",
            "SourceFragment", "resolve_source_context"]
