@@ -94,8 +94,12 @@ class SwarmV2Engine:
             sum(tool.max_calls for task in completed_specs for tool in task.tools)
         )
         available_tasks = max(0, remaining.tasks - len(completed_specs))
-        # Each pending task performs one worker-model call. Keep two slots for
-        # the next Commander decision and the verifier.
+        # The MINIMUM each pending task costs is one worker-model call; a
+        # structurally invalid completion may add one bounded repair call
+        # (see worker.MAX_WORKER_OUTPUT_MODEL_ATTEMPTS). This gate stays a
+        # pre-flight floor deliberately -- BudgetTracker remains the sole
+        # authority that refuses a call. Keep two slots for the next
+        # Commander decision and the verifier.
         required_model_calls = len(pending) + 2
         if (sum(task.estimated_cost_units for task in pending) > available_cost or
                 sum(tool.max_calls for task in pending for tool in task.tools) > available_tools or

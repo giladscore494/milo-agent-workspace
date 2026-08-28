@@ -13,7 +13,9 @@ from .validation import (VALIDATION_REASONS, PlanJsonError, PlanLimitError, Plan
                          provider_plan_policy)
 from .executor import BoundedTaskExecutor, ExecutionResult
 from .model_gateway import ModelGateway
-from .worker import GenericWorker, TaskResult
+from .worker import (MAX_WORKER_OUTPUT_MODEL_ATTEMPTS, WORKER_OUTPUT_REASONS, GenericWorker,
+                     TaskResult, WorkerOutputValidationError, build_worker_request,
+                     validate_worker_output)
 from .builder import FinalBuilder
 from .verifier import Verifier
 from .state import SwarmState
@@ -25,3 +27,5 @@ __all__ = ["Commander", "CommanderDecision", "CommanderModelError", "CommanderMo
 __all__ += ["BoundedTaskExecutor", "ExecutionResult", "GenericWorker", "ModelGateway", "TaskResult"]
 __all__ += ["EvidenceReference", "FinalBuilder", "RemainingBudget", "SwarmState", "VerificationVerdict", "Verifier"]
 __all__ += ["VALIDATION_REASONS", "provider_plan_policy"]
+__all__ += ["MAX_WORKER_OUTPUT_MODEL_ATTEMPTS", "WORKER_OUTPUT_REASONS",
+            "WorkerOutputValidationError", "build_worker_request", "validate_worker_output"]
