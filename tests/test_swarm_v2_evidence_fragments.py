@@ -61,6 +61,9 @@ class GuardedFragmentRepository:
                        and row["run_id"] == str(run_id)), None)
         if source is None:
             raise AssertionError("invalid evidence fragment source")
+        # The lineage is task -> source -> fragment: the same run is not enough.
+        if source.get("task_key") != payload["task_key"]:
+            raise AssertionError("evidence fragment task provenance mismatch")
         if len(payload["fragment_text"]) > MAX_FRAGMENT_CHARS:
             raise AssertionError("fragment_text exceeds the durable bound")
         if fragment_content_hash(payload["fragment_text"]) != payload["content_hash"]:
@@ -68,8 +71,13 @@ class GuardedFragmentRepository:
         key = (str(run_id), payload["evidence_key"])
         existing = self.fragments.get(key)
         if existing is not None:
-            if existing["source_id"] != payload["source_id"]:
-                raise AssertionError("idempotency key belongs to a different source")
+            # An existing row may only be returned when it is the SAME logical
+            # fragment; fragment_index is excluded from that identity and a
+            # replay never rewrites it.  Concurrency is not simulated here --
+            # the per-source lock is proven in the real PostgreSQL regression.
+            if any(existing[field] != payload[field] for field in
+                   ("source_id", "task_key", "fragment_text", "content_hash")):
+                raise AssertionError("evidence fragment idempotency conflict")
             return existing
         owned = [row for row in self.fragments.values()
                  if row["source_id"] == payload["source_id"]]
@@ -179,9 +187,51 @@ def test_reusing_another_sources_fragment_key_is_rejected(board):
     hijack = {"source_id": second["id"], "fragment_text": text, "task_key": "task-1",
               "content_hash": fragment_content_hash(text), "fragment_index": 0,
               "evidence_key": stored["evidence_key"]}
-    with pytest.raises(AssertionError, match="belongs to a different source"):
+    with pytest.raises(AssertionError, match="evidence fragment idempotency conflict"):
         repo.record_evidence_fragment(evidence.lease.run_id, hijack, worker_id="worker-1",
                                       attempt=2, lease_token="lease-token")
+
+
+def test_same_source_key_with_different_text_is_a_hard_idempotency_conflict(board):
+    """A replay is only a replay when the logical fragment is identical."""
+    evidence, repo = board
+    row = evidence.record_source(source(), task_key="task-1")
+    stored = evidence.record_evidence_fragment(row["id"], "Original sentence.", task_key="task-1")
+    for field, value in (("fragment_text", "Different sentence."),
+                         ("content_hash", fragment_content_hash("Different sentence.")),
+                         ("task_key", "task-2")):
+        forged = {**{key: stored[key] for key in
+                     ("source_id", "task_key", "fragment_text", "content_hash",
+                      "fragment_index", "evidence_key")}, field: value}
+        with pytest.raises(AssertionError):
+            repo.record_evidence_fragment(evidence.lease.run_id, forged, worker_id="worker-1",
+                                          attempt=2, lease_token="lease-token")
+    assert len(repo.fragments) == 1
+    assert repo.fragments[(str(evidence.lease.run_id), stored["evidence_key"])] == stored
+
+
+def test_replay_at_a_different_position_returns_the_row_without_rewriting_the_index(board):
+    """fragment_index is deliberately outside the fragment's logical identity."""
+    evidence, repo = board
+    row = evidence.record_source(source(), task_key="task-1")
+    stored = evidence.record_evidence_fragment(row["id"], "Stable sentence.",
+                                               task_key="task-1", fragment_index=0)
+    replay = evidence.record_evidence_fragment(row["id"], "Stable sentence.",
+                                               task_key="task-1", fragment_index=2)
+    assert replay["id"] == stored["id"]
+    assert replay["fragment_index"] == 0  # the stored position is never mutated
+    assert len(repo.fragments) == 1
+
+
+def test_fragment_task_must_match_the_durable_source_task(board):
+    """task -> source -> fragment: the same run is not enough provenance."""
+    evidence, repo = board
+    row = evidence.record_source(source(), task_key="task-a")
+    with pytest.raises(AssertionError, match="task provenance mismatch"):
+        evidence.record_evidence_fragment(row["id"], "Wrong task text.", task_key="task-b")
+    assert repo.fragments == {}
+    assert evidence.record_evidence_fragment(row["id"], "Right task text.",
+                                             task_key="task-a")["task_key"] == "task-a"
 
 
 def test_cross_run_source_is_rejected(board):
@@ -498,3 +548,14 @@ def test_acquisition_flow_replays_to_the_same_durable_rows(board):
     assert replay_source["id"] == first_source["id"]
     assert [item["id"] for item in replay_fragments] == [item["id"] for item in first_fragments]
     assert len(repo.sources) == 1 and len(repo.fragments) == 2
+
+
+def test_acquisition_flow_keeps_source_and_fragment_task_provenance_aligned(board):
+    evidence, repo = board
+    row, fragments = evidence.record_source_with_evidence(source(), TOOL_RESULT, task_key="task-a")
+    assert row["task_key"] == "task-a"
+    assert {item["task_key"] for item in fragments} == {"task-a"}
+    # The same source can never gain a fragment attributed to another task.
+    with pytest.raises(AssertionError, match="task provenance mismatch"):
+        evidence.record_source_evidence(row["id"], {"rows": ["Other task."]}, task_key="task-b")
+    assert len(repo.fragments) == 2

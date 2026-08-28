@@ -1767,10 +1767,10 @@ def _rpc_as_service(db, sql: str) -> str:
     return db.psql(f"set role service_role; {sql}; reset role")
 
 
-def _source_json(key: str) -> str:
+def _source_json(key: str, *, task: str = "task") -> str:
     return json.dumps({"agent": "agent", "url": f"https://example.test/{key}", "title": "title",
                        "domain": "example.test", "source_type": "primary", "source_strength": "strong",
-                       "query": "query", "tool_operation": "search", "evidence_key": key, "task_key": "task"})
+                       "query": "query", "tool_operation": "search", "evidence_key": key, "task_key": task})
 
 
 def _claim_json(key: str, source_id: str, value: int, *, entity: str = "entity",
@@ -2227,7 +2227,7 @@ def test_evidence_fragment_persists_replays_and_stays_bound_to_one_source_and_ru
 
     # One source can never inherit another source's fragment relationship.
     hijack = _fragment_json(source_2, FRAGMENT_TEXT, key="frag-1")
-    with pytest.raises(AssertionError, match="belongs to a different source"):
+    with pytest.raises(AssertionError, match="evidence fragment idempotency conflict"):
         _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{hijack}'::jsonb)")
     own = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source_2, FRAGMENT_TEXT, key='frag-2')}'::jsonb)")
     assert db.psql(f"select source_id from public.source_evidence_fragments where id='{own}'") == source_2
@@ -2303,6 +2303,12 @@ def test_evidence_fragment_rejects_stale_leases_unsafe_text_and_every_hard_bound
     with pytest.raises(AssertionError, match="count limit reached"):
         _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{_fragment_json(source_id, 'One too many.', key='frag-cap-x')}'::jsonb)")
     assert db.psql(f"select count(*) from public.source_evidence_fragments where source_id='{source_id}'") == "4"
+    # A retry of an already durable fragment still succeeds with the quota full:
+    # replay is resolved before the budget is consulted and consumes nothing.
+    full_replay = _fragment_json(source_id, "Bounded sentence number 0.", key="frag-cap-0")
+    replayed = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{full_replay}'::jsonb)")
+    assert replayed == db.psql(f"select id from public.source_evidence_fragments where run_id='{run_id}' and evidence_key='frag-cap-0'")
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where source_id='{source_id}'") == "4"
 
     # The per-source character budget holds independently of the count.
     budget_source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-budget-src')}'::jsonb)")
@@ -2374,3 +2380,129 @@ def test_legacy_sources_and_claims_stay_valid_without_any_fragment(fragment_db):
         f"from public.source_evidence_fragments "
         f"where run_id='{run_id}' and source_id in ('{legacy}','{grounded}')"
     ) == grounded
+
+
+def _fragment_call(db, args: str, payload: str, *, hold_seconds: float = 0.0) -> str:
+    """One service-role transaction that calls the RPC and optionally keeps the
+    per-source lock afterwards.  Each db.psql is its own psql process, hence its
+    own session and transaction, so two of these genuinely contend."""
+    hold = f"select pg_sleep({hold_seconds}); " if hold_seconds else ""
+    db.psql(f"set role service_role; begin; "
+            f"select public.record_evidence_fragment_guarded({args},'{payload}'::jsonb); "
+            f"{hold}commit; reset role")
+    return "admitted"
+
+
+def _fragment_outcome(db, args: str, payload: str, *, hold_seconds: float = 0.0) -> str:
+    try:
+        return _fragment_call(db, args, payload, hold_seconds=hold_seconds)
+    except AssertionError as exc:
+        return str(exc)
+
+
+def test_evidence_fragment_replay_must_be_identical_and_carry_the_source_task(fragment_db):
+    """The durable replay invariant and the task -> source -> fragment lineage."""
+    db = fragment_db
+    lease, _ = _evidence_fixture(db, "fragident")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source_a = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-ident-a', task='task-a')}'::jsonb)")
+    source_b = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-ident-b', task='task-b')}'::jsonb)")
+
+    # A fragment may only be attributed to the task that captured its source;
+    # belonging to the same run is not enough, and nothing is written.
+    wrong_task = _fragment_json(source_a, FRAGMENT_TEXT, key="frag-wrong-task", task="task-b")
+    with pytest.raises(AssertionError, match="evidence fragment task provenance mismatch"):
+        _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{wrong_task}'::jsonb)")
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where run_id='{run_id}'") == "0"
+
+    stored = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source_a, FRAGMENT_TEXT, key='frag-ident', task='task-a')}'::jsonb)")
+    # An identical replay is the same durable row.
+    assert _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source_a, FRAGMENT_TEXT, key='frag-ident', task='task-a')}'::jsonb)") == stored
+
+    # Reusing that evidence_key while changing any identity field fails closed
+    # instead of being silently accepted as a replay.
+    conflicts = [
+        # different text (and therefore a different, still self-consistent hash)
+        _fragment_json(source_a, "A completely different durable sentence.", key="frag-ident", task="task-a"),
+        # different source of the same run, which also carries a different task
+        _fragment_json(source_b, FRAGMENT_TEXT, key="frag-ident", task="task-b"),
+    ]
+    for payload in conflicts:
+        with pytest.raises(AssertionError, match="evidence fragment idempotency conflict|task provenance mismatch"):
+            _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where run_id='{run_id}'") == "1"
+    assert db.psql(
+        f"select fragment_text, task_key, fragment_index from public.source_evidence_fragments where id='{stored}'"
+    ) == f"{FRAGMENT_TEXT}|task-a|0"
+
+    # A replay at a different tool position returns the row and never rewrites
+    # the stored index: position is outside the fragment's logical identity.
+    moved = _fragment_json(source_a, FRAGMENT_TEXT, key="frag-ident", task="task-a", index=3)
+    assert _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{moved}'::jsonb)") == stored
+    assert db.psql(f"select fragment_index from public.source_evidence_fragments where id='{stored}'") == "0"
+
+
+def test_concurrent_writers_for_one_source_cannot_exceed_the_durable_fragment_limits(fragment_db):
+    """The per-source quota is a hard durable limit, not a best-effort check.
+
+    Each attempt runs in its own psql session/transaction.  The holder takes the
+    source row lock inside the RPC and keeps it after inserting, so the
+    challenger provably blocks at the same admission point instead of reading a
+    stale pre-insert count and being admitted alongside it.
+    """
+    import concurrent.futures
+    import time
+
+    db = fragment_db
+    lease, _ = _evidence_fixture(db, "fragrace")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+
+    def race(source_key: str, seeded: list[str], holder: str, challenger: str) -> dict:
+        source_id = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json(source_key)}'::jsonb)")
+        for index, seed in enumerate(seeded):
+            _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source_id, seed, key=f'{source_key}-seed-{index}', index=index)}'::jsonb)")
+        outcome: dict = {"source_id": source_id}
+
+        def hold():
+            outcome["holder"] = _fragment_outcome(
+                db, args, _fragment_json(source_id, holder, key=f"{source_key}-hold", index=len(seeded)),
+                hold_seconds=1.2)
+
+        def challenge():
+            time.sleep(0.4)  # the holder owns the source lock by now
+            started = time.monotonic()
+            outcome["challenger"] = _fragment_outcome(
+                db, args, _fragment_json(source_id, challenger, key=f"{source_key}-chal", index=len(seeded)))
+            outcome["waited"] = time.monotonic() - started
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(lambda call: call(), (hold, challenge)))
+        return outcome
+
+    # Count boundary: three fragments already durable, two concurrent fourths.
+    counted = race("frag-race-count", [f"Seeded race sentence {index}." for index in range(3)],
+                   "Fourth race sentence.", "Fifth race sentence.")
+    assert counted["holder"] == "admitted"
+    assert "count limit reached" in counted["challenger"]
+    assert counted["waited"] >= 0.5, counted["waited"]  # it blocked on the source lock
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where source_id='{counted['source_id']}'") == "4"
+
+    # Character-budget boundary: 798 durable characters, two concurrent 399s of
+    # which only the first can fit inside the 1200-character source budget.
+    budget = race("frag-race-budget", ["a" * 399, "b" * 399], "c" * 399, "d" * 399)
+    assert budget["holder"] == "admitted"
+    assert "character budget exhausted" in budget["challenger"]
+    assert budget["waited"] >= 0.5, budget["waited"]
+    assert db.psql(
+        f"select count(*), coalesce(sum(char_length(fragment_text)), 0) "
+        f"from public.source_evidence_fragments where source_id='{budget['source_id']}'"
+    ) == "3|1197"
+
+    # Neither race left the relation over its documented hard limits anywhere.
+    assert db.psql(
+        "select count(*) from (select source_id, count(*) as rows, "
+        "sum(char_length(fragment_text)) as chars from public.source_evidence_fragments "
+        "group by source_id) as per_source where rows > 4 or chars > 1200"
+    ) == "0"

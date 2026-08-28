@@ -92,6 +92,7 @@ declare
   v_row public.source_evidence_fragments;
   v_source public.sources;
   v_text text; v_hash text; v_index integer;
+  v_key text; v_task text;
   v_count integer; v_total integer;
 begin
   perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
@@ -102,6 +103,8 @@ begin
   if nullif(p_fragment->>'evidence_key', '') is null or nullif(p_fragment->>'task_key', '') is null then
     raise exception 'invalid evidence fragment: evidence_key and task_key are required' using errcode = '22023';
   end if;
+  v_key := p_fragment->>'evidence_key';
+  v_task := p_fragment->>'task_key';
   v_text := p_fragment->>'fragment_text';
   v_hash := p_fragment->>'content_hash';
   v_index := (p_fragment->>'fragment_index')::integer;
@@ -130,49 +133,76 @@ begin
     raise exception 'invalid evidence fragment: content hash does not match the bounded text' using errcode = '22023';
   end if;
 
-  -- Source-bound only: the fragment must attach to a real source of THIS run.
+  -- Source-bound only, and the SINGLE per-source admission point.
+  --
+  -- FOR UPDATE (not FOR KEY SHARE) is what makes the per-source quota below a
+  -- genuinely hard limit: two legitimate concurrent writers for the same
+  -- source would otherwise both read the same pre-insert count/total and both
+  -- be admitted.  The lock is transaction-scoped and per row, so writers for
+  -- different sources never contend, and the lock order every guarded
+  -- evidence RPC follows is unchanged -- public.runs (FOR SHARE, inside
+  -- assert_worker_lease) and only then public.sources -- so this cannot
+  -- deadlock against create_claim_with_source_guarded.
   select * into v_source from public.sources
-    where id = (p_fragment->>'source_id')::uuid and run_id = p_run_id for key share;
+    where id = (p_fragment->>'source_id')::uuid and run_id = p_run_id for update;
   if v_source.id is null then
     raise exception 'invalid evidence fragment source' using errcode = '23503';
   end if;
 
-  -- Exact replay: return the existing durable row instead of a duplicate, and
-  -- never let one source's idempotency key be reused for another source.
+  -- Task provenance: the lineage is task -> source -> fragment -> claim, so a
+  -- fragment may only be attributed to the task that captured its source.
+  -- Belonging to the same run is not enough.  IS DISTINCT FROM is deliberate:
+  -- a legacy source predating the evidence migration carries a NULL task_key
+  -- and therefore fails closed here rather than adopting the caller's task.
+  if v_source.task_key is distinct from v_task then
+    raise exception 'evidence fragment task provenance mismatch' using errcode = '22023';
+  end if;
+
+  -- Exact replay is resolved BEFORE the quota is consulted, so a retry of an
+  -- already durable fragment still succeeds once the source is at its budget.
   select * into v_row from public.source_evidence_fragments
-    where run_id = p_run_id and evidence_key = p_fragment->>'evidence_key';
-  if v_row.id is not null then
-    if v_row.source_id <> v_source.id then
-      raise exception 'idempotency key belongs to a different source' using errcode = '22023';
+    where run_id = p_run_id and evidence_key = v_key;
+
+  if v_row.id is null then
+    -- A genuinely new fragment: the durable per-source bounds are evaluated
+    -- while this transaction still holds the source lock.
+    select count(*), coalesce(sum(char_length(fragment_text)), 0) into v_count, v_total
+      from public.source_evidence_fragments where source_id = v_source.id;
+    if v_count >= 4 then
+      raise exception 'evidence fragment count limit reached for this source' using errcode = '22023';
     end if;
-    return next v_row;
-    return;
-  end if;
+    if v_total + char_length(v_text) > 1200 then
+      raise exception 'evidence fragment character budget exhausted for this source' using errcode = '22023';
+    end if;
 
-  -- Per-source hard limits: small, relevant verification context, never
-  -- archival completeness.  Checked only for a genuinely new fragment, so a
-  -- retry can always replay what is already durable.
-  select count(*), coalesce(sum(char_length(fragment_text)), 0) into v_count, v_total
-    from public.source_evidence_fragments where source_id = v_source.id;
-  if v_count >= 4 then
-    raise exception 'evidence fragment count limit reached for this source' using errcode = '22023';
-  end if;
-  if v_total + char_length(v_text) > 1200 then
-    raise exception 'evidence fragment character budget exhausted for this source' using errcode = '22023';
-  end if;
-
-  insert into public.source_evidence_fragments
-    (run_id, source_id, task_key, evidence_key, fragment_text, content_hash, fragment_index)
-  values (p_run_id, v_source.id, p_fragment->>'task_key', p_fragment->>'evidence_key',
-    v_text, v_hash, v_index)
-  on conflict (run_id, evidence_key) do nothing
-  returning * into v_row;
-  if v_row is null then
+    insert into public.source_evidence_fragments
+      (run_id, source_id, task_key, evidence_key, fragment_text, content_hash, fragment_index)
+    values (p_run_id, v_source.id, v_task, v_key, v_text, v_hash, v_index)
+    on conflict (run_id, evidence_key) do nothing
+    returning * into v_row;
+    if v_row.id is not null then
+      return next v_row;  -- freshly written: it is exactly what was validated
+      return;
+    end if;
+    -- A concurrent writer claimed this evidence_key for a DIFFERENT source of
+    -- the same run (same-source writers serialize on the lock above), so fall
+    -- through to the one replay check below.
     select * into v_row from public.source_evidence_fragments
-      where run_id = p_run_id and evidence_key = p_fragment->>'evidence_key';
-    if v_row.source_id <> v_source.id then
-      raise exception 'idempotency key belongs to a different source' using errcode = '22023';
-    end if;
+      where run_id = p_run_id and evidence_key = v_key;
+  end if;
+
+  -- ONE replay invariant, reached by both the pre-insert and the
+  -- lost-the-race path: an existing row may only be returned when it is the
+  -- SAME logical fragment.  Reusing an evidence_key with different task
+  -- provenance, different text or a different hash is a caller bug, never a
+  -- silent no-op.  fragment_index is excluded on purpose: position is not
+  -- part of B2's fragment identity, and a replay never rewrites it.  The
+  -- error is static and carries no incoming or stored evidence text.
+  if v_row.source_id is distinct from v_source.id
+     or v_row.task_key is distinct from v_task
+     or v_row.fragment_text is distinct from v_text
+     or v_row.content_hash is distinct from v_hash then
+    raise exception 'evidence fragment idempotency conflict' using errcode = '22023';
   end if;
   return next v_row;
 end;

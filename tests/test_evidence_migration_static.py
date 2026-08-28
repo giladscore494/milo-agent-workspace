@@ -166,7 +166,28 @@ def test_fragment_rpc_enforces_source_binding_safety_and_hash_integrity():
     rpc = sql.split("create or replace function public.record_evidence_fragment_guarded", 1)[1]
     assert "from public.sources" in rpc and "run_id = p_run_id" in rpc
     assert "invalid evidence fragment source" in rpc
-    assert "idempotency key belongs to a different source" in rpc
+    # Per-source quota admission is serialized on the durable source row, so
+    # concurrent writers cannot both pass a pre-insert count/budget check.
+    assert "and run_id = p_run_id for update;" in rpc
+    assert "p_run_id for key share" not in rpc  # the weaker lock is gone
+    # Lineage: task -> source -> fragment.  Same run is not enough provenance.
+    assert "v_source.task_key is distinct from v_task" in rpc
+    assert "evidence fragment task provenance mismatch" in rpc
+    # ONE replay invariant, reached by both the pre-insert and the
+    # lost-the-race path; the error is static and leaks no evidence text.
+    assert rpc.count("evidence fragment idempotency conflict") == 1
+    for field in ("v_row.source_id is distinct from v_source.id",
+                  "v_row.task_key is distinct from v_task",
+                  "v_row.fragment_text is distinct from v_text",
+                  "v_row.content_hash is distinct from v_hash"):
+        assert field in rpc
+    # fragment_index is deliberately outside the fragment's logical identity
+    # and a replay must never rewrite the stored position.
+    assert "v_row.fragment_index" not in rpc
+    # Quota is evaluated only for a genuinely new fragment, so an exact replay
+    # still succeeds once the source is at its budget.
+    replay_first = rpc.index("select * into v_row from public.source_evidence_fragments")
+    assert replay_first < rpc.index("v_count >= 4")
     # The database recomputes the hash from the durable text; no embedding or
     # similarity is involved anywhere.
     assert "encode(sha256(convert_to(v_text, 'utf8')), 'hex') <> v_hash" in rpc
