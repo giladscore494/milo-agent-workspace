@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Recorded GET /runs/{id} response bodies, shared by the backend and frontend",
+    "test suites so the two contracts cannot drift apart.",
+    "Backend: tests/test_run_usage_contract.py regenerates these through the real",
+    "FastAPI app and asserts equality. Frontend: tests/runUsageContract.test.ts",
+    "parses them with lib/runUsage.ts. Ids are fixed placeholders."
+  ],
+  "settled": {
+    "id": "1bbde49b-61a0-4378-9ee7-6fca3818060d",
+    "conversation_id": "161eb7e8-45d7-4195-b056-c3a2c33f61b8",
+    "status": "completed",
+    "attempt": 1,
+    "started_at": null,
+    "finished_at": null,
+    "last_heartbeat_at": null,
+    "cancellation_requested_at": null,
+    "cancellation_reason": null,
+    "input": null,
+    "output": null,
+    "error": null,
+    "launch_state": "pending",
+    "launch_error_class": null,
+    "launch_reconciliation_required": false,
+    "usage": {
+      "model_calls": 7,
+      "input_tokens": 7120,
+      "output_tokens": 3250,
+      "total_tokens": 10370,
+      "estimated_cost": 0.02,
+      "actual_cost": 0.019178,
+      "retries": 0,
+      "provider_backpressure_events": 0,
+      "agent_steps": 7,
+      "elapsed_seconds": 41.5
+    },
+    "created_at": null,
+    "updated_at": null
+  },
+  "unsettled": {
+    "id": "1bbde49b-61a0-4378-9ee7-6fca3818060d",
+    "conversation_id": "161eb7e8-45d7-4195-b056-c3a2c33f61b8",
+    "status": "running",
+    "attempt": 1,
+    "started_at": null,
+    "finished_at": null,
+    "last_heartbeat_at": null,
+    "cancellation_requested_at": null,
+    "cancellation_reason": null,
+    "input": null,
+    "output": null,
+    "error": null,
+    "launch_state": "pending",
+    "launch_error_class": null,
+    "launch_reconciliation_required": false,
+    "usage": null,
+    "created_at": null,
+    "updated_at": null
+  }
+}

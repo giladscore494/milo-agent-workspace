@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.budget import BudgetConfig
@@ -33,6 +34,7 @@ from backend.schemas import (
     RunCreate,
     RunCreated,
     RunEvent,
+    RunUsage,
     WorkflowProposal,
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
     WorkerRunCompleteRequest, WorkerRunEventCreate, WorkerRunFailRequest,
@@ -89,18 +91,47 @@ SAFE_LAUNCH_ERROR_CLASSES = {
 }
 
 
+def _safe_run_usage(raw: object) -> RunUsage | None:
+    """Project the durable runs.usage object onto the bounded public contract.
+
+    ``runs.usage`` is ``jsonb NOT NULL DEFAULT '{}'`` (migration 010), so a run
+    that has not settled a model call stores an empty object. That means
+    "nothing recorded", not "zero spend", and is returned as null rather than
+    as a row of zeroes.
+
+    Anything that cannot be represented as RunUsage is dropped instead of
+    raising. This is the endpoint the workspace polls, so degrading to "no
+    usage reported" -- which the client already handles -- is safer than
+    failing the whole run read on an unexpected stored value. Keys outside the
+    schema are ignored by it and can never reach the browser.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return None
+    try:
+        usage = RunUsage.model_validate(raw)
+    except ValidationError:
+        return None
+    # An object carrying only unrecognized keys projects onto nothing.
+    return usage if usage.model_dump(exclude_none=True) else None
+
+
 def _safe_run_response(run: dict) -> dict:
     """Return a browser-safe run shape.
 
     Launch exception messages are operational data and may include provider,
     platform or stack details. Browser responses only expose a finite
     classification and whether operator reconciliation is required.
+
+    Aggregate usage is the run's own authoritative accounting and is exposed
+    through the typed RunUsage contract; the browser must never reconstruct it
+    by summing events.
     """
     launch_state = run.get("launch_state") or "pending"
     safe = dict(run)
     safe["launch_state"] = launch_state
     safe["launch_error_class"] = SAFE_LAUNCH_ERROR_CLASSES.get(launch_state)
     safe["launch_reconciliation_required"] = launch_state == "launch_unknown"
+    safe["usage"] = _safe_run_usage(run.get("usage"))
     safe.pop("launch_error", None)
     safe.pop("lease_token", None)
     return safe
