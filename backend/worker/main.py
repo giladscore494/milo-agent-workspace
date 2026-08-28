@@ -377,7 +377,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 tool_context = ToolContext(cancellation_checker=is_cancelled)
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
-                    cancellation_checker=is_cancelled, event_sink=forward_event),
+                    cancellation_checker=is_cancelled, event_sink=forward_event,
+                    # A bounded worker-output repair is a semantic retry and
+                    # consumes the SAME run-level retry allowance the
+                    # Commander repair does. Provider 429 backpressure is
+                    # absorbed by the scheduler and never reaches here.
+                    retry_callback=record_retry),
                     max_active_workers=BoundedTaskExecutor.configured_limit(),
                     cancellation_checker=is_cancelled)
                 board = EvidenceBoard(repo, WorkerLease(run_id, worker_id,
