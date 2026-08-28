@@ -113,6 +113,12 @@ class EvidenceBoard:
 
     def record_claim(self, claim: ClaimCreate, *, task_key: str) -> dict[str, Any]:
         payload = safe_durable_value(claim.model_dump(mode="json"))
+        # The idempotent evidence identity is derived from task provenance plus
+        # the ORIGINAL claim payload only — exactly as before canonical scopes
+        # existed — so a claim persisted by a pre-canonical release replays to
+        # the same evidence_key.  Derived canonical metadata (and any future
+        # SCOPE_NORMALIZATION_VERSION) must never change this identity.
+        evidence_key = _key("claim", {"task_key": task_key, **payload})
         # Scope is exactly entity + field + market/geography + time.  Source,
         # confidence, run and task provenance remain attached to every claim.
         # The trusted canonical identity travels with the claim so the durable
@@ -122,10 +128,8 @@ class EvidenceBoard:
                                     geography=payload.get("geography"), market=payload.get("market"),
                                     time_scope=payload.get("time_scope") or {})
         payload.update(canonical_scope_hash=canonical_scope_hash(scope),
-                       scope_normalization_version=SCOPE_NORMALIZATION_VERSION)
-        payload.update(task_key=self._task(task_key), evidence_key=_key("claim", {
-            "task_key": task_key, **payload,
-        }))
+                       scope_normalization_version=SCOPE_NORMALIZATION_VERSION,
+                       task_key=self._task(task_key), evidence_key=evidence_key)
         row = self._repository.create_claim(self.lease.run_id, payload, **self._lease_kwargs)
         self._claims[str(row["id"])] = dict(row)
         return row

@@ -1,6 +1,8 @@
 """B1: one deterministic canonical scope identity for Swarm V2 conflict grouping."""
 from __future__ import annotations
 
+import hashlib
+import json
 from uuid import UUID, uuid4
 
 from backend.engines.swarm_v2 import (
@@ -9,7 +11,7 @@ from backend.engines.swarm_v2 import (
 from backend.engines.swarm_v2 import engine as engine_module
 from backend.engines.swarm_v2 import evidence as evidence_module
 from backend.engines.swarm_v2 import normalization
-from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease, safe_durable_value
 from backend.engines.swarm_v2.normalization import (
     SCOPE_NORMALIZATION_VERSION, CanonicalScope, canonical_scope_hash,
     canonical_scope_key, canonical_value_key, normalize_entity_key,
@@ -273,6 +275,26 @@ def test_board_persists_the_durable_canonical_identity_from_the_shared_module():
     # Originals still stored verbatim next to the internal identity.
     assert {row["entity_key"] for row in rows} == {
         "Toyota Corolla 2020", " TOYOTA   COROLLA-2020 ", "Tucson New"}
+
+
+def test_claim_evidence_key_is_independent_of_canonical_metadata(monkeypatch):
+    """The idempotent claim identity is task provenance plus the ORIGINAL
+    payload only — the pre-canonical rule — so claims written by a
+    pre-canonical release replay to the same evidence_key, and a future
+    SCOPE_NORMALIZATION_VERSION bump can never duplicate logical claims."""
+    board, repo = fresh_board()
+    source_id = UUID(board.record_source(board_source(), task_key="task")["id"])
+    claim = board_claim(source_id, 100)
+    row = board.record_claim(claim, task_key="task")
+    original = json.dumps(safe_durable_value({"task_key": "task", **claim.model_dump(mode="json")}),
+                          sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    assert "canonical" not in original
+    assert row["evidence_key"] == f"claim:{hashlib.sha256(original.encode()).hexdigest()}"
+    assert row["canonical_scope_hash"] and row["scope_normalization_version"] == 1
+    monkeypatch.setattr(evidence_module, "SCOPE_NORMALIZATION_VERSION", 2)
+    replay = EvidenceBoard(repo, board.lease).record_claim(claim, task_key="task")
+    assert replay["evidence_key"] == row["evidence_key"] and replay["id"] == row["id"]
+    assert len(repo.tables["claim"]) == 1
 
 
 def test_canonical_scope_hash_is_deterministic_sha256_of_the_scope():

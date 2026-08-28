@@ -64,7 +64,25 @@ def test_canonical_scope_migration_is_additive_guarded_and_service_only():
     assert "revoke execute on function %s from authenticated" in sql
     for marker in ("chain_of_thought", "provider_detail", "raw_error", "secret sentinel"):
         assert marker in sql
-    assert "drop table" not in sql and "delete from" not in sql and "update public.claims" not in sql
+    assert "drop table" not in sql and "delete from" not in sql
+
+
+def test_canonical_scope_migration_upgrades_only_exact_replays_never_bulk():
+    sql = CANONICAL_MIGRATION.read_text().lower()
+    # Exactly one UPDATE exists: the single-row upgrade-on-replay that
+    # populates ONLY the canonical identity columns for one verified claim id.
+    # No bulk backfill of historical rows is permitted in this migration.
+    assert sql.count("update public.claims") == 1
+    upgrade = sql.split("update public.claims", 1)[1].split("returning", 1)[0]
+    assert "where id = v_row.id" in upgrade
+    assert "canonical_scope_hash" in upgrade and "scope_normalization_version" in upgrade
+    for original in ("entity_key", "field_key", "value", "time_scope", "geography",
+                     "market", "evidence_key", "task_key", "source_id"):
+        assert f"{original} =" not in upgrade.replace("where id =", "")
+    # The replay path fails closed on mismatch and on half-populated state.
+    assert "canonical scope identity mismatch" in sql
+    assert "does not match the stored claim" in sql
+    assert "canonical scope state is invalid" in sql
 
 
 def test_canonical_scope_migration_validates_trusted_identity_not_raw_text():

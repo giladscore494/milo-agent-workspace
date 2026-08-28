@@ -2091,3 +2091,86 @@ def test_canonical_migration_is_rerun_safe_and_service_only(canonical_db):
         assert not _has_execute(db, "anon", signature), signature
         assert not _has_execute(db, "authenticated", signature), signature
         assert _has_execute(db, "service_role", signature), signature
+
+
+def _apply_evidence_migration(db, marker: str) -> None:
+    db.psql(file=next(m for m in MIGRATIONS if marker in m.name))
+
+
+def test_pre_canonical_claim_replay_upgrades_in_place_and_reaches_conflict(canonical_db):
+    """Upgrade-boundary regression: a claim persisted by the pre-canonical
+    release and replayed after the canonical deployment must keep its row id
+    and evidence_key, gain ONLY the canonical identity, and then work with
+    canonical conflict persistence."""
+    db = canonical_db
+    run_id, args = _canonical_lease(db, "upg")
+    # STEP 1 — pre-canonical deployment: the older evidence RPC is active and
+    # ignores the canonical payload fields entirely.
+    _apply_evidence_migration(db, "lease_guarded_evidence_writes")
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('src-upg')}'::jsonb)")
+    payload = _claim_json("upg-claim", source, 100, **VARIANT_A)
+    legacy_id = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select canonical_scope_hash is null and scope_normalization_version is null from public.claims where id='{legacy_id}'") == "t"
+    provenance_sql = (f"select entity_key || '|' || field_key || '|' || value::text || '|' || time_scope::text || '|' || "
+                      f"geography || '|' || market || '|' || source_id::text || '|' || evidence_key || '|' || task_key || '|' || id::text "
+                      f"from public.claims where run_id='{run_id}'")
+    before = db.psql(provenance_sql)
+    # STEP 2 — canonical deployment boundary: replay the exact same logical claim.
+    _apply_evidence_migration(db, "canonical_scope_conflict_identity")
+    assert _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)") == legacy_id
+    assert db.psql(f"select count(*) from public.claims where run_id='{run_id}'") == "1"
+    expected = canonical_scope_hash(canonical_scope_key(
+        entity=VARIANT_A["entity"], field=VARIANT_A["field"], geography=VARIANT_A["geography"],
+        market=VARIANT_A["market"], time_scope=VARIANT_A["time_scope"]))
+    assert db.psql(f"select canonical_scope_hash || '|' || scope_normalization_version from public.claims where id='{legacy_id}'") == f"{expected}|{SCOPE_NORMALIZATION_VERSION}"
+    assert db.psql(provenance_sql) == before
+    # Exact replay after the upgrade: same id, still no duplicate or mutation.
+    assert _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)") == legacy_id
+    assert db.psql(f"select count(*) from public.claims where run_id='{run_id}'") == "1"
+    assert db.psql(provenance_sql) == before
+    # STEP 3 — the replay-upgraded claim persists one canonical conflict with a
+    # formatting-variant contradiction.
+    other = _seed_claim(db, args, "upg-variant", 120, **VARIANT_B)
+    conflict = _conflict_json("upg-conflict", VARIANT_A["entity"], VARIANT_A["field"], [legacy_id, other])
+    assert _rpc_as_service(db, f"select id from public.create_conflict_guarded({args},'{conflict}'::jsonb)")
+
+
+def test_mismatched_and_partial_canonical_replays_fail_closed(canonical_db):
+    db = canonical_db
+    run_id, args = _canonical_lease(db, "upgneg")
+    _apply_evidence_migration(db, "lease_guarded_evidence_writes")
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('src-upgneg')}'::jsonb)")
+    payload = _claim_json("upgneg-claim", source, 100, **VARIANT_A)
+    legacy_id = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)")
+    _apply_evidence_migration(db, "canonical_scope_conflict_identity")
+    # Same evidence_key, different original payload: never silently upgraded.
+    tampered = json.loads(payload)
+    tampered["value"] = 999
+    with pytest.raises(AssertionError, match="does not match the stored claim"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(tampered)}'::jsonb)")
+    assert db.psql(f"select canonical_scope_hash is null from public.claims where id='{legacy_id}'") == "t"
+    # Same evidence_key, different source: existing idempotency guard holds.
+    source_2 = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('src-upgneg-2')}'::jsonb)")
+    moved = json.loads(payload)
+    moved["source_id"] = source_2
+    with pytest.raises(AssertionError, match="idempotency key belongs to a different source"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(moved)}'::jsonb)")
+    # The exact replay upgrades; afterwards a differing canonical identity or
+    # normalization version is rejected instead of overwritten.
+    assert _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)") == legacy_id
+    forged = json.loads(payload)
+    forged["canonical_scope_hash"] = "0" * 64
+    with pytest.raises(AssertionError, match="canonical scope identity mismatch"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(forged)}'::jsonb)")
+    bumped = json.loads(payload)
+    bumped["scope_normalization_version"] = 2
+    with pytest.raises(AssertionError, match="canonical scope identity mismatch"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(bumped)}'::jsonb)")
+    assert db.psql(f"select scope_normalization_version from public.claims where id='{legacy_id}'") == str(SCOPE_NORMALIZATION_VERSION)
+    # Half-populated canonical state is invalid, never guessed or repaired.
+    partial_payload = _claim_json("upgneg-partial", source, 100, **VARIANT_A)
+    partial_hash = json.loads(partial_payload)["canonical_scope_hash"]
+    db.psql(f"insert into public.claims (run_id, entity_key, field_key, value, time_scope, geography, market, source_id, source_strength, confidence, agent, evidence_key, task_key, canonical_scope_hash) "
+            f"values ('{run_id}', '{VARIANT_A['entity']}', '{VARIANT_A['field']}', '100'::jsonb, '{{\"year\": 2020}}'::jsonb, '{VARIANT_A['geography']}', '{VARIANT_A['market']}', '{source}', 'strong', 0.9, 'agent', 'upgneg-partial', 'task', '{partial_hash}')")
+    with pytest.raises(AssertionError, match="canonical scope state is invalid"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{partial_payload}'::jsonb)")

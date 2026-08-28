@@ -18,9 +18,16 @@
 -- without a canonical identity are all rejected.
 --
 -- Legacy claims created before this migration keep a NULL canonical
--- identity.  They are never backfilled with a guessed scope and can never
--- join a canonical-scope conflict group (fail-closed), preserving historical
--- provenance exactly as written.
+-- identity.  They are never bulk-backfilled with a guessed scope and can
+-- never join a canonical-scope conflict group (fail-closed), preserving
+-- historical provenance exactly as written.  The ONE sanctioned upgrade is
+-- an exact idempotent replay: when a resumed run replays the same logical
+-- claim (same run + evidence_key, and every stored original field verified
+-- against the incoming payload), only the two canonical identity columns are
+-- populated from the trusted backend values — the row id, evidence_key and
+-- all original provenance stay untouched.  A mismatched replay, a differing
+-- stored canonical identity, or a partially-populated canonical state fails
+-- closed instead.
 
 alter table public.claims add column if not exists canonical_scope_hash text;
 alter table public.claims add column if not exists scope_normalization_version integer;
@@ -71,9 +78,44 @@ begin
   returning * into v_row;
   if v_row is null then
     select * into v_row from public.claims
-      where run_id = p_run_id and evidence_key = p_claim->>'evidence_key';
+      where run_id = p_run_id and evidence_key = p_claim->>'evidence_key'
+      for update;
     if v_row.source_id <> v_source.id then
       raise exception 'idempotency key belongs to a different source' using errcode = '22023';
+    end if;
+    if v_row.canonical_scope_hash is not null and v_row.scope_normalization_version is not null then
+      -- Replay of a claim that already carries its canonical identity: the
+      -- trusted incoming values must agree; never overwrite a different one.
+      if v_row.canonical_scope_hash is distinct from p_claim->>'canonical_scope_hash'
+         or v_row.scope_normalization_version is distinct from (p_claim->>'scope_normalization_version')::integer then
+        raise exception 'claim canonical scope identity mismatch' using errcode = '22023';
+      end if;
+    elsif v_row.canonical_scope_hash is null and v_row.scope_normalization_version is null then
+      -- Pre-canonical row replayed by the trusted backend: verify the stored
+      -- original claim really is this claim (defense in depth beyond the
+      -- evidence_key text), then populate ONLY the canonical identity.
+      if v_row.entity_key is distinct from p_claim->>'entity_key'
+         or v_row.field_key is distinct from p_claim->>'field_key'
+         or v_row.value is distinct from p_claim->'value'
+         or v_row.unit is distinct from p_claim->>'unit'
+         or v_row.time_scope is distinct from coalesce(p_claim->'time_scope', '{}'::jsonb)
+         or v_row.geography is distinct from p_claim->>'geography'
+         or v_row.market is distinct from p_claim->>'market'
+         or v_row.source_strength is distinct from p_claim->>'source_strength'
+         or v_row.confidence is distinct from (p_claim->>'confidence')::numeric
+         or v_row.agent is distinct from p_claim->>'agent'
+         or v_row.status is distinct from coalesce(p_claim->>'status', 'active')
+         or v_row.task_key is distinct from p_claim->>'task_key' then
+        raise exception 'idempotent claim replay does not match the stored claim' using errcode = '22023';
+      end if;
+      update public.claims
+        set canonical_scope_hash = p_claim->>'canonical_scope_hash',
+            scope_normalization_version = (p_claim->>'scope_normalization_version')::integer
+        where id = v_row.id
+        returning * into v_row;
+    else
+      -- Half-populated canonical state is never guessed or repaired silently.
+      raise exception 'claim canonical scope state is invalid' using errcode = '22023';
     end if;
   end if;
   insert into public.source_claim_links(source_id, claim_id)
