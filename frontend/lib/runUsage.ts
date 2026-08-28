@@ -13,11 +13,12 @@
  *
  * and any event-derived total would be wrong by construction.
  *
- * CONTRACT GAP (documented, not worked around): `GET /runs/{id}` currently
- * returns `backend.schemas.Run`, which does not declare `usage`. Pydantic drops
- * undeclared keys, so the browser receives no `usage` field today even though
- * the column is populated. Every field below is therefore optional and the
- * normalized view reports `present: false` rather than inventing a zero.
+ * `GET /runs/{id}` returns it through the typed `backend.schemas.RunUsage`
+ * contract: a closed set of non-negative numbers, with any other stored key
+ * ignored server-side. Every field stays optional because the backend sends
+ * `usage: null` for a run that has not settled a call (`runs.usage` defaults to
+ * `{}`), and the normalized view reports `present: false` rather than inventing
+ * a zero -- "nothing recorded yet" and "zero model calls" are different facts.
  */
 
 export type RunUsage = {

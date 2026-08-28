@@ -59,6 +59,42 @@ class RunCreate(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=128)
 
 
+class RunUsage(BaseModel):
+    """Browser-safe aggregate usage for one run.
+
+    This mirrors ``BudgetTracker.snapshot()`` (backend/budget.py) field for
+    field, which is the ONLY shape ever written to ``runs.usage``: the worker
+    persists it through ``update_run_usage`` after every settled provider call
+    and through ``transition_run`` on a budget terminal.
+
+    The contract is deliberately a closed set of non-negative numbers. Extra
+    keys are ignored rather than forwarded, so nothing outside this allowlist
+    can reach the browser through it -- no provider or model identity, prompt,
+    model response, evidence text, reservation, lease, ledger row or error
+    detail, none of which the snapshot carries in the first place.
+
+    Every field is optional. A run that has not settled a call stores ``{}``
+    (migration 010's ``NOT NULL DEFAULT``), and absent is never rewritten as
+    zero: "nothing recorded yet" and "zero model calls" are different facts.
+    """
+
+    # `model_` is a pydantic protected namespace; `model_calls` is the durable
+    # column name and is not renamed for the wire.
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    model_calls: int | None = Field(default=None, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    estimated_cost: float | None = Field(default=None, ge=0)
+    actual_cost: float | None = Field(default=None, ge=0)
+    retries: int | None = Field(default=None, ge=0)
+    provider_backpressure_events: int | None = Field(default=None, ge=0)
+    # Backend-counted model-backed steps; NOT a count of UI agents.
+    agent_steps: int | None = Field(default=None, ge=0)
+    elapsed_seconds: float | None = Field(default=None, ge=0)
+
+
 class Run(BaseModel):
     id: UUID
     conversation_id: UUID
@@ -75,6 +111,9 @@ class Run(BaseModel):
     launch_state: str | None = None
     launch_error_class: str | None = None
     launch_reconciliation_required: bool = False
+    # Authoritative aggregate usage for this run. `null` means nothing has been
+    # recorded yet; it is never a synonym for zero spend.
+    usage: RunUsage | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
