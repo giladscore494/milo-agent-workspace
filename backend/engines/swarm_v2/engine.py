@@ -8,6 +8,7 @@ from .commander import Commander
 from .contracts import EvidenceReference, RemainingBudget
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
+from .normalization import CanonicalScope, canonical_scope_key, canonical_value_key
 from .state import SwarmState
 from .verifier import Verifier
 from .worker import TaskResult
@@ -189,14 +190,16 @@ class SwarmV2Engine:
                 self._emit("evidence_added", {"claim_id": item.claim_id,
                     "source_id": item.source_id, "task_id": item.task_id})
 
-            values_by_scope: dict[tuple[str, str, str | None, str | None, str], set[str]] = {}
+            values_by_scope: dict[CanonicalScope, set[str]] = {}
+            scope_by_claim: dict[str, CanonicalScope] = {}
             for item in evidence:
-                scope = (item.entity, item.field, item.geography, item.market,
-                         self._canonical(item.time_scope))
-                values_by_scope.setdefault(scope, set()).add(self._canonical(item.value))
+                scope = canonical_scope_key(entity=item.entity, field=item.field,
+                                            geography=item.geography, market=item.market,
+                                            time_scope=item.time_scope)
+                scope_by_claim[item.claim_id] = scope
+                values_by_scope.setdefault(scope, set()).add(canonical_value_key(item.value))
             conflict_ids = {item.claim_id for item in evidence
-                if len(values_by_scope[(item.entity, item.field, item.geography, item.market,
-                    self._canonical(item.time_scope))]) > 1}
+                            if len(values_by_scope[scope_by_claim[item.claim_id]]) > 1}
             for claim_id in sorted(conflict_ids):
                 self._emit("conflict_found", {"claim_id": claim_id})
 
