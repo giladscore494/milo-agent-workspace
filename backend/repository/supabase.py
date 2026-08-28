@@ -45,6 +45,7 @@ class Repository(Protocol):
     def create_claim(self, run_id: UUID, claim: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def create_conflict(self, run_id: UUID, conflict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def record_evidence_fragment(self, run_id: UUID, fragment: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def list_sources_for_ids(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 50) -> list[dict[str, Any]]: ...
     def list_evidence_fragments_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 200) -> list[dict[str, Any]]: ...
     def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
@@ -634,6 +635,35 @@ class SupabaseRepository:
     def record_evidence_fragment(self, run_id: UUID, fragment: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_fragment": fragment}
         return self._guarded_rpc("record_evidence_fragment_guarded", params, "evidence_fragment")
+
+    # The explicit safe column allowlist a grounded verifier may see: durable
+    # provenance plus the browser-visible descriptive metadata that already
+    # travels with a source.  Never `*`: agent, query, tool_operation,
+    # retrieved_at and evidence_key are operational bookkeeping, not evidence.
+    SOURCE_CONTEXT_COLUMNS = ("id, run_id, task_key, url, title, domain, "
+                              "source_type, source_strength, source_date")
+    # 50 sources per read keeps the paired fragment read (<= 4 rows per source)
+    # inside MAX_EVIDENCE_FRAGMENT_ROWS, so neither cap can silently truncate.
+    MAX_SOURCE_CONTEXT_ROWS = 50
+
+    def list_sources_for_ids(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = MAX_SOURCE_CONTEXT_ROWS) -> list[dict[str, Any]]:
+        """Internal bounded read of durable source metadata for the grounded
+        verifier.
+
+        Server/service path only: no browser endpoint exposes it, it performs
+        no provider call, and the caller supplies a run plus source ids -- never
+        SQL.  Rows are restricted to the requested run AND the requested
+        sources, selected through an explicit column allowlist, capped at
+        MAX_SOURCE_CONTEXT_ROWS and ordered deterministically by id.  The
+        public SourceRecord/browser contract is untouched: this adds a read,
+        not a column, a table or an endpoint."""
+        identifiers = sorted({str(source_id) for source_id in source_ids})
+        if not identifiers:
+            return []
+        bounded = max(1, min(int(limit), self.MAX_SOURCE_CONTEXT_ROWS))
+        return self._many(
+            self.client.table("sources").select(self.SOURCE_CONTEXT_COLUMNS)
+            .eq("run_id", str(run_id)).in_("id", identifiers).order("id").limit(bounded))
 
     EVIDENCE_FRAGMENT_COLUMNS = ("id, run_id, source_id, task_key, evidence_key, "
                                  "fragment_text, content_hash, fragment_index, created_at")
