@@ -14,6 +14,7 @@ state, or vehicle catalog data.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import unicodedata
 from typing import Any, Mapping, NamedTuple
@@ -74,6 +75,15 @@ def canonical_scope_key(*, entity: str, field: str, geography: str | None = None
                           time_scope=normalize_time_scope(time_scope))
 
 
-__all__ = ["SCOPE_NORMALIZATION_VERSION", "CanonicalScope", "canonical_scope_key",
-           "canonical_value_key", "normalize_entity_key", "normalize_field_key",
-           "normalize_geography_key", "normalize_market_key", "normalize_time_scope"]
+def canonical_scope_hash(scope: CanonicalScope) -> str:
+    """Bounded durable identity of a canonical scope: SHA-256 over its
+    deterministic serialization.  PostgreSQL validates equality of this
+    backend-computed value instead of re-implementing normalization."""
+    encoded = json.dumps(list(scope), separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+__all__ = ["SCOPE_NORMALIZATION_VERSION", "CanonicalScope", "canonical_scope_hash",
+           "canonical_scope_key", "canonical_value_key", "normalize_entity_key",
+           "normalize_field_key", "normalize_geography_key", "normalize_market_key",
+           "normalize_time_scope"]

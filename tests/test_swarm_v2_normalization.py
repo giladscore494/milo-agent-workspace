@@ -11,9 +11,10 @@ from backend.engines.swarm_v2 import evidence as evidence_module
 from backend.engines.swarm_v2 import normalization
 from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
 from backend.engines.swarm_v2.normalization import (
-    SCOPE_NORMALIZATION_VERSION, CanonicalScope, canonical_scope_key,
-    canonical_value_key, normalize_entity_key, normalize_field_key,
-    normalize_geography_key, normalize_market_key, normalize_time_scope,
+    SCOPE_NORMALIZATION_VERSION, CanonicalScope, canonical_scope_hash,
+    canonical_scope_key, canonical_value_key, normalize_entity_key,
+    normalize_field_key, normalize_geography_key, normalize_market_key,
+    normalize_time_scope,
 )
 from backend.schemas import ClaimCreate, SourceCreate
 from test_swarm_v2 import plan, task
@@ -250,6 +251,37 @@ def test_board_conflict_identity_is_insertion_order_independent():
     assert [(row["evidence_key"], row["claim_ids"], row["entity_key"]) for row in first] == \
         [(row["evidence_key"], row["claim_ids"], row["entity_key"]) for row in second]
     assert len(repo.tables["conflict"]) == 1
+
+
+def test_board_persists_the_durable_canonical_identity_from_the_shared_module():
+    """The claim payload that reaches the guarded RPC carries the canonical
+    identity computed by the one normalization module, so Python grouping and
+    the PostgreSQL conflict firewall cannot silently diverge."""
+    board, repo = fresh_board()
+    source_ids = [UUID(board.record_source(board_source(f"https://example.test/{i}"),
+                                           task_key=f"task-{i}")["id"]) for i in range(3)]
+    record_all(board, formatting_variant_claims(source_ids), [0, 1, 2])
+    rows = list(repo.tables["claim"].values())
+    expected = canonical_scope_hash(canonical_scope_key(
+        entity="Toyota Corolla 2020", field="engine-power", geography="IL",
+        market="Israel", time_scope={"year": 2020}))
+    hashes = {row["entity_key"]: row["canonical_scope_hash"] for row in rows}
+    assert hashes["Toyota Corolla 2020"] == hashes[" TOYOTA   COROLLA-2020 "] == expected
+    assert hashes["Tucson New"] != expected
+    assert {row["scope_normalization_version"] for row in rows} == {SCOPE_NORMALIZATION_VERSION}
+    assert len({row["canonical_scope_hash"] for row in rows}) == 2
+    # Originals still stored verbatim next to the internal identity.
+    assert {row["entity_key"] for row in rows} == {
+        "Toyota Corolla 2020", " TOYOTA   COROLLA-2020 ", "Tucson New"}
+
+
+def test_canonical_scope_hash_is_deterministic_sha256_of_the_scope():
+    scope = canonical_scope_key(entity="Toyota Corolla 2020", field="engine-power",
+                                geography="IL", market="Israel", time_scope={"year": 2020})
+    digest = canonical_scope_hash(scope)
+    assert digest == canonical_scope_hash(scope)
+    assert len(digest) == 64 and set(digest) <= set("0123456789abcdef")
+    assert digest != canonical_scope_hash(scope._replace(time_scope=normalize_time_scope({"year": 2021})))
 
 
 def test_canonical_value_key_matches_existing_deterministic_json_treatment():

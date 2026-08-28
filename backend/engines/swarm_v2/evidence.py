@@ -15,7 +15,8 @@ from uuid import UUID
 
 from backend.schemas import ClaimCreate, ConflictCreate, SourceCreate, ToolUsageCreate
 
-from .normalization import CanonicalScope, canonical_scope_key, canonical_value_key
+from .normalization import (SCOPE_NORMALIZATION_VERSION, CanonicalScope, canonical_scope_hash,
+                            canonical_scope_key, canonical_value_key)
 
 
 class EvidenceValidationError(ValueError):
@@ -114,6 +115,14 @@ class EvidenceBoard:
         payload = safe_durable_value(claim.model_dump(mode="json"))
         # Scope is exactly entity + field + market/geography + time.  Source,
         # confidence, run and task provenance remain attached to every claim.
+        # The trusted canonical identity travels with the claim so the durable
+        # conflict firewall validates the same scope equality as this board;
+        # the original scope fields are stored untouched for provenance.
+        scope = canonical_scope_key(entity=payload["entity_key"], field=payload["field_key"],
+                                    geography=payload.get("geography"), market=payload.get("market"),
+                                    time_scope=payload.get("time_scope") or {})
+        payload.update(canonical_scope_hash=canonical_scope_hash(scope),
+                       scope_normalization_version=SCOPE_NORMALIZATION_VERSION)
         payload.update(task_key=self._task(task_key), evidence_key=_key("claim", {
             "task_key": task_key, **payload,
         }))
