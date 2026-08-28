@@ -1,17 +1,11 @@
 'use client';
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { api } from './api';
+import { EventId, maxEventId, normalizeEventId } from './eventId';
 import { initialWorkspaceState, reduceRunEvent } from './runReducer';
+import { isTerminalRunStatus } from './runStatus';
+import { SwarmRunViewModel, buildSwarmRunViewModel } from './swarmViewModel';
 import { Run, RunEvent, WorkspaceState } from './types';
-
-const TERMINAL_RUN_STATES = new Set([
-  'completed',
-  'partial_success',
-  'failed',
-  'cancelled',
-  'timed_out',
-  'budget_exhausted',
-]);
 
 const BASE_INTERVAL_MS = 3_000;
 const MAX_BACKOFF_MS = 30_000;
@@ -30,7 +24,7 @@ function workspaceReducer(state: WorkspaceState, action: RunAction): WorkspaceSt
     return initialWorkspaceState;
   }
   if (action.kind === 'run') {
-    return { ...state, run: action.run, currentPhase: TERMINAL_RUN_STATES.has(action.run.status) ? action.run.status : state.currentPhase };
+    return { ...state, run: action.run, currentPhase: isTerminalRunStatus(action.run.status) ? action.run.status : state.currentPhase };
   }
   // reduceRunEvent already de-duplicates by event id.
   return reduceRunEvent(state, action.event);
@@ -53,10 +47,10 @@ function workspaceReducer(state: WorkspaceState, action: RunAction): WorkspaceSt
  * Supabase Realtime remains intentionally disabled until it can join with
  * the same authenticated browser session; polling is the supported path.
  */
-export function useRunRealtime(runId?: string) {
+export function useRunRealtime(runId?: string, workflowKey?: string) {
   const [state, dispatch] = useReducer(workspaceReducer, initialWorkspaceState);
   const [mode, setMode] = useState<PollingMode>('idle');
-  const lastEventId = useRef<number | undefined>(undefined);
+  const lastEventId = useRef<EventId | undefined>(undefined);
   const inFlight = useRef(false);
   const failures = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout>>();
@@ -65,9 +59,9 @@ export function useRunRealtime(runId?: string) {
   // changes, so a late response from run A can never mutate run B's state.
   const generation = useRef(0);
 
-  useEffect(() => {
-    lastEventId.current = state.lastEventId;
-  }, [state.lastEventId]);
+  // The cursor has exactly one owner: `poll` advances it from the events it
+  // just folded, and the run-switch effect below clears it. Deriving it from
+  // rendered state as well would give it a second, racier writer.
 
   const poll = useCallback(async (id: string, myGeneration: number) => {
     if (inFlight.current || stopped.current) return;
@@ -78,9 +72,25 @@ export function useRunRealtime(runId?: string) {
       dispatch({ kind: 'run', run });
       const events = await api.events(id, lastEventId.current);
       if (generation.current !== myGeneration) return; // stale response
-      for (const event of events) dispatch({ kind: 'event', event });
+      for (const raw of events) {
+        // The event-id contract is enforced at ingest, before the reducer runs,
+        // so a malformed id degrades to "this one event is not rendered"
+        // instead of throwing inside a React reducer. The backend types the
+        // column as a NOT NULL bigint, so this branch is defensive only.
+        let id: EventId;
+        try {
+          id = normalizeEventId(raw.id);
+        } catch {
+          continue;
+        }
+        dispatch({ kind: 'event', event: { ...raw, id } });
+        // Advance the cursor from the response itself rather than from rendered
+        // state, and by numeric maximum rather than array position, so the next
+        // after_event_id can never move backwards or repeat an event.
+        lastEventId.current = maxEventId(lastEventId.current, id);
+      }
       failures.current = 0;
-      if (TERMINAL_RUN_STATES.has(run.status)) {
+      if (isTerminalRunStatus(run.status)) {
         stopped.current = true;
         setMode('terminal');
       } else {
@@ -132,5 +142,12 @@ export function useRunRealtime(runId?: string) {
     };
   }, [runId, poll]);
 
-  return { state, mode };
+  // The Swarm V2 view model is derived, never stored, so it resets with the
+  // workspace state on every run switch and can never outlive its run.
+  const swarm: SwarmRunViewModel = useMemo(
+    () => buildSwarmRunViewModel({ run: state.run, swarm: state.swarm, workflowKey }),
+    [state.run, state.swarm, workflowKey],
+  );
+
+  return { state, mode, swarm };
 }

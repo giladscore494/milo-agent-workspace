@@ -1,3 +1,5 @@
+import { EventId, eventCursorParam } from './eventId';
+import { parseJsonPreservingBigIntegers } from './losslessJson';
 import { getCurrentAccessToken } from './supabaseClient';
 import { Conversation, Project, Proposal, Run, RunEvent } from './types';
 
@@ -36,7 +38,13 @@ async function authHeaders(): Promise<HeadersInit> {
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+type JsonParser = (text: string) => unknown;
+
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  parse: JsonParser = JSON.parse,
+): Promise<T> {
   const response = await fetch(`${API}${path}`, {
     ...init,
     headers: {
@@ -59,7 +67,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(response.status, code, String(message));
   }
 
-  return response.json() as Promise<T>;
+  return parse(await response.text()) as T;
 }
 
 export function newIdempotencyKey(): string {
@@ -118,11 +126,23 @@ export const api = {
 
   run: (id: string) => request<Run>(`/runs/${id}`),
 
-  events: (id: string, after?: number) =>
+  /**
+   * Incremental event polling.
+   *
+   * `run_events.id` is a PostgreSQL bigint. The backend serializes it as a JSON
+   * number with full digits and the gateway route streams the body through
+   * unchanged, so the exact digits reach here; only `JSON.parse` would round
+   * them. The response body is therefore parsed with the bigint-preserving
+   * parser and the cursor stays a decimal string all the way into the query
+   * string, where the backend reads it as an arbitrary-precision Python int.
+   */
+  events: (id: string, after?: EventId) =>
     request<RunEvent[]>(
       after === undefined
         ? `/runs/${id}/events`
-        : `/runs/${id}/events?after_event_id=${encodeURIComponent(after)}`,
+        : `/runs/${id}/events?after_event_id=${encodeURIComponent(eventCursorParam(after))}`,
+      undefined,
+      parseJsonPreservingBigIntegers,
     ),
 
   cancel: (id: string, reason?: string) =>
