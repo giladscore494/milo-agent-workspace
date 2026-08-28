@@ -3,13 +3,15 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, api, executionUiEnabled, newIdempotencyKey } from '@/lib/api';
 import { getCurrentSession, onAuthStateChange, signInWithSupabase, signOutFromSupabase, SupabaseSession } from '@/lib/supabaseClient';
 import { initialWorkspaceState } from '@/lib/runReducer';
+import { isTerminalRunStatus, isPartialSuccessRunStatus } from '@/lib/runStatus';
+import { normalizeRunUsage } from '@/lib/runUsage';
+import { SwarmRunViewModel, summarizeSwarmRun } from '@/lib/swarmViewModel';
 import { useRunRealtime } from '@/lib/useRunRealtime';
 import { AgentState, Conversation, InternetPolicy, Project, Proposal } from '@/lib/types';
 import { redactSecrets, safeText } from '@/lib/sanitize';
 
 const internetLabels: InternetPolicy[] = ['forbidden','allowed','required','conditional','requested','approved','denied','active'];
 const HARDENING_NOTE = 'Execution controls are hidden: the execution UI flag is off. Backend execution flags and authorization stay authoritative either way.';
-const TERMINAL_STATES = new Set(['completed','partial_success','failed','cancelled','timed_out','budget_exhausted']);
 
 function activeRunStorageKey(conversationId: string): string {
   return `milo.activeRun.${conversationId}`;
@@ -73,12 +75,14 @@ export default function WorkspacePage() {
   const [cancelError, setCancelError] = useState('');
 
   const [tab, setTab] = useState('Agents');
-  const { state, mode } = useRunRealtime(executionUi ? activeRunId : undefined);
+  // The project's trusted workflow_key selects V2 vs V1 presentation; the
+  // frontend never guesses the engine from event shapes.
+  const { state, mode, swarm } = useRunRealtime(executionUi ? activeRunId : undefined, selectedProject?.workflow_key);
   const agents = Object.values(state.agents);
   const runStatus = state.run?.status;
   const launchState = state.run?.launch_state;
   const launchReconciliationRequired = state.run?.launch_reconciliation_required;
-  const runIsTerminal = !!runStatus && TERMINAL_STATES.has(runStatus);
+  const runIsTerminal = isTerminalRunStatus(runStatus);
 
   useEffect(() => {
     let mounted = true;
@@ -381,7 +385,12 @@ export default function WorkspacePage() {
                 </div>
               )}
               {cancelError && <p role="alert">{safeText(cancelError)}</p>}
-              {runIsTerminal && <p>Run finished with status <b>{safeText(runStatus)}</b>.</p>}
+              {runIsTerminal && (
+                <p>
+                  Run finished with status <b>{safeText(runStatus)}</b>.
+                  {isPartialSuccessRunStatus(runStatus) && ' Partial success is not a completed run: some tasks, coverage gaps, conflicts or verdicts remain outstanding.'}
+                </p>
+              )}
               {launchState && (
                 <p>
                   Launch state <b>{safeText(launchState)}</b>
@@ -416,7 +425,7 @@ export default function WorkspacePage() {
       </section>
       <aside className="inspector">
         <nav>{['Agents','Workflow','Sources','Claims','Conflicts','Costs','Developer'].map(t => <button className={tab === t ? 'selected' : ''} onClick={() => setTab(t)} key={t}>{t}</button>)}</nav>
-        <Inspector tab={tab} agents={agents} state={state}/>
+        <Inspector tab={tab} agents={agents} state={state} swarm={swarm}/>
       </aside>
     </main>
   );
@@ -426,7 +435,7 @@ function InternetBadge({ policy, reason }: { policy: InternetPolicy; reason?: st
   return <span className={`internet ${policy}`}>{policy} internet — {safeText(reason || 'policy visible')}</span>;
 }
 
-function Inspector({ tab, agents, state }: { tab: string; agents: AgentState[]; state: typeof initialWorkspaceState }) {
+function Inspector({ tab, agents, state, swarm }: { tab: string; agents: AgentState[]; state: typeof initialWorkspaceState; swarm: SwarmRunViewModel }) {
   if (tab === 'Agents') return <>{agents.length === 0 && <p>No agents are running.</p>}{agents.map(agent => (
     <div className="agent-card" key={agent.name}>
       <b>{safeText(agent.name)}</b> <span className={`badge ${agent.status}`}>{safeText(agent.status)}</span>
@@ -434,10 +443,15 @@ function Inspector({ tab, agents, state }: { tab: string; agents: AgentState[]; 
       <InternetBadge policy={agent.internet} reason={agent.internetReason}/>
     </div>
   ))}{agents.length === 0 && internetLabels.map(p => <InternetBadge key={p} policy={p}/>)}</>;
-  if (tab === 'Workflow') return state.events.length === 0 ? <p>No workflow activity yet.</p> : <pre>{JSON.stringify(redactSecrets({ phase: state.currentPhase, progress: state.progress, checkpoints: state.checkpoints.length }), null, 2)}</pre>;
+  // Swarm V2 shows logical tasks, plan revision and verification progress.
+  // Logical tasks, model calls and verifier batches stay separate quantities:
+  // there is no agent count here and none is derivable from them.
+  if (tab === 'Workflow') return state.events.length === 0 ? <p>No workflow activity yet.</p> : <pre>{JSON.stringify(redactSecrets(swarm.isSwarmV2 ? summarizeSwarmRun(swarm) : { phase: state.currentPhase, progress: state.progress, checkpoints: state.checkpoints.length }), null, 2)}</pre>;
   if (tab === 'Sources') return state.sources.length === 0 ? <p>No sources recorded.</p> : <>{state.sources.map(source => <div className="source" key={source.id}><b>{safeText(source.title)}</b><small> {safeText(source.domain)} • {safeText(source.source_strength)}</small></div>)}</>;
   if (tab === 'Claims') return <pre>{JSON.stringify(redactSecrets(state.claims), null, 2)}</pre>;
   if (tab === 'Conflicts') return <pre>{JSON.stringify(redactSecrets(state.conflicts), null, 2)}</pre>;
-  if (tab === 'Costs') return <pre>{JSON.stringify({ tokens: state.tokens, cost: state.cost, usage: redactSecrets((state.run as any)?.usage ?? {}) }, null, 2)}</pre>;
+  // run.usage is the authoritative aggregate; the event-derived totals stay
+  // labelled as such and are never presented as the run's model-call count.
+  if (tab === 'Costs') return <pre>{JSON.stringify({ event_derived_tokens: state.tokens, event_derived_cost: state.cost, usage: normalizeRunUsage(state.run?.usage) }, null, 2)}</pre>;
   return <pre>{JSON.stringify(redactSecrets({ events: state.events.length, checkpoints: state.checkpoints, validationErrors: state.validationErrors, rawErrors: state.rawErrors }), null, 2)}</pre>;
 }
