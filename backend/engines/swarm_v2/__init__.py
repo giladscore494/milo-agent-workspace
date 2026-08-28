@@ -17,7 +17,11 @@ from .worker import (MAX_WORKER_OUTPUT_MODEL_ATTEMPTS, WORKER_OUTPUT_REASONS, Ge
                      TaskResult, WorkerOutputValidationError, build_worker_request,
                      validate_worker_output)
 from .builder import FinalBuilder
-from .verifier import Verifier
+from .verifier import (MAX_VERIFIER_BATCH_JSON_BYTES, MAX_VERIFIER_CLAIMS_PER_BATCH,
+                       VERIFIER_REASONS, VerificationPlan, Verifier, VerifierContractError,
+                       VerifierProgress, build_verifier_batches, parse_verifier_batch,
+                       plan_verification, serialize_verifier_candidates,
+                       verifier_payload_bytes)
 from .state import SwarmState
 
 __all__ = ["Commander", "CommanderDecision", "CommanderModelError", "CommanderModelResolver", "CommanderPlan", "CommanderPlanFailure",
@@ -29,3 +33,7 @@ __all__ += ["EvidenceReference", "FinalBuilder", "RemainingBudget", "SwarmState"
 __all__ += ["VALIDATION_REASONS", "provider_plan_policy"]
 __all__ += ["MAX_WORKER_OUTPUT_MODEL_ATTEMPTS", "WORKER_OUTPUT_REASONS",
             "WorkerOutputValidationError", "build_worker_request", "validate_worker_output"]
+__all__ += ["MAX_VERIFIER_BATCH_JSON_BYTES", "MAX_VERIFIER_CLAIMS_PER_BATCH",
+            "VERIFIER_REASONS", "VerificationPlan", "VerifierContractError",
+            "VerifierProgress", "build_verifier_batches", "parse_verifier_batch",
+            "plan_verification", "serialize_verifier_candidates", "verifier_payload_bytes"]

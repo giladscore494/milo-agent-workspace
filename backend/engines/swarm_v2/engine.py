@@ -5,12 +5,12 @@ from typing import Any, Callable, Iterable, Mapping
 
 from .builder import FinalBuilder
 from .commander import Commander
-from .contracts import EvidenceReference, RemainingBudget
+from .contracts import EvidenceReference, RemainingBudget, VerificationVerdict
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
 from .normalization import CanonicalScope, canonical_scope_key, canonical_value_key
 from .state import SwarmState
-from .verifier import Verifier
+from .verifier import Verifier, VerifierProgress, plan_verification
 from .worker import TaskResult
 
 
@@ -42,7 +42,8 @@ class SwarmV2Engine:
         # Vocabulary and payloads are deliberately narrow. Provider responses,
         # exception strings, credentials and reasoning never reach this sink.
         allowed = {"task_id", "status", "code", "tool", "graph_revision", "decision",
-                   "claim_id", "source_id", "conflict_id", "verdict"}
+                   "claim_id", "source_id", "conflict_id", "verdict",
+                   "batch_index", "batch_count", "claim_count"}
         safe = {key: value for key, value in payload.items() if key in allowed and
                 (value is None or isinstance(value, (str, int, float, bool)))}
         if self._event_sink:
@@ -99,7 +100,9 @@ class SwarmV2Engine:
         # (see worker.MAX_WORKER_OUTPUT_MODEL_ATTEMPTS). This gate stays a
         # pre-flight floor deliberately -- BudgetTracker remains the sole
         # authority that refuses a call. Keep two slots for the next
-        # Commander decision and the verifier.
+        # Commander decision and at least one verifier batch. The EXACT
+        # remaining verifier batch count is unknowable here (no evidence set
+        # yet) and is checked separately in _run_verification.
         required_model_calls = len(pending) + 2
         if (sum(task.estimated_cost_units for task in pending) > available_cost or
                 sum(tool.max_calls for task in pending for tool in task.tools) > available_tools or
@@ -139,6 +142,48 @@ class SwarmV2Engine:
         after = {task.task_id: task.model_dump(mode="json") for task in replacement.graph.tasks}
         return all(task_id in after and before.get(task_id) == after[task_id]
                    for task_id in completed)
+
+    def _run_verification(self, state: SwarmState, evidence: list[EvidenceReference],
+                          conflict_ids: set[str]) -> list[VerificationVerdict]:
+        """Verify every claim under an exact, resumable model-call budget.
+
+        The deterministic partitioner that the Verifier executes also sizes
+        this pre-flight check, so the run never starts a verifier sequence it
+        already knows it cannot finish. Only the REMAINING batches are
+        charged: batches whose verdicts are already in the checkpoint are not
+        required again. BudgetTracker stays the hard per-call authority and a
+        BudgetExceeded refusal is never laundered into a verdict.
+        """
+        existing = dict(state.verifier_state)
+        required_verifier_calls = len(plan_verification(
+            evidence, conflict_claim_ids=conflict_ids, existing_verdicts=existing).batches)
+        if required_verifier_calls > self._remaining_budget().model_calls:
+            raise ValueError("verification exceeds remaining model-call budget")
+
+        def record(progress: VerifierProgress) -> None:
+            # Validated verdicts, the authoritative usage snapshot and the
+            # checkpoint move together, so a resume never replays a batch
+            # whose verdicts are already durable. There is NO exactly-once
+            # guarantee across the provider-call -> checkpoint boundary: a
+            # crash in that window replays that one batch (at-least-once),
+            # which stays inside BudgetTracker's durable accounting.
+            for verdict in progress.verdicts:
+                state.verifier_state[verdict.claim_id] = verdict.model_dump(mode="json")
+            state.usage_snapshot = dict(self._usage_snapshot())
+            self._save(state)
+            if progress.batch_index >= 1:
+                self._emit("verification_batch_completed",
+                           {"batch_index": progress.batch_index,
+                            "batch_count": progress.batch_count,
+                            "claim_count": progress.claim_count})
+
+        verdicts = self._verifier.verify(evidence, conflict_claim_ids=conflict_ids,
+                                         existing_verdicts=existing, batch_completed=record)
+        state.verifier_state = {v.claim_id: v.model_dump(mode="json") for v in verdicts}
+        state.usage_snapshot = dict(self._usage_snapshot())
+        self._emit("verification_completed", {"status": "completed"})
+        self._save(state)
+        return verdicts
 
     def run(self, run: dict[str, Any]) -> dict[str, Any]:
         run_input = run.get("input") or {}
@@ -258,11 +303,7 @@ class SwarmV2Engine:
             if hard_gaps:
                 raise ValueError("completion criteria not satisfied")
 
-            verdicts = self._verifier.verify(evidence, conflict_claim_ids=conflict_ids)
-            state.verifier_state = {v.claim_id: v.model_dump(mode="json") for v in verdicts}
-            state.usage_snapshot = dict(self._usage_snapshot())
-            self._emit("verification_completed", {"status": "completed"})
-            self._save(state)
+            verdicts = self._run_verification(state, evidence, conflict_ids)
             final = self._builder.build(evidence, verdicts)
             failures = [{"task_id": task_id,
                          "code": (result.error or {}).get("code", "TASK_FAILED")}
