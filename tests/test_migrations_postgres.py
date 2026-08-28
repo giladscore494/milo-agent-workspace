@@ -33,6 +33,10 @@ from pathlib import Path
 
 import pytest
 
+from backend.engines.swarm_v2.normalization import (
+    SCOPE_NORMALIZATION_VERSION, canonical_scope_hash, canonical_scope_key,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = sorted((REPO_ROOT / "supabase" / "migrations").glob("*.sql"))
 BASELINE = REPO_ROOT / "tests" / "fixtures" / "legacy_baseline.sql"
@@ -1767,10 +1771,20 @@ def _source_json(key: str) -> str:
                        "query": "query", "tool_operation": "search", "evidence_key": key, "task_key": "task"})
 
 
-def _claim_json(key: str, source_id: str, value: int) -> str:
-    return json.dumps({"entity_key": "entity", "field_key": "price", "value": value,
-                       "time_scope": {"as_of": "2026-08"}, "market": "IL", "source_id": source_id,
+def _claim_json(key: str, source_id: str, value: int, *, entity: str = "entity",
+                field: str = "price", market: str | None = "IL", geography: str | None = None,
+                time_scope: dict | None = None) -> str:
+    time_scope = {"as_of": "2026-08"} if time_scope is None else time_scope
+    # The canonical identity is computed by the trusted backend normalization
+    # module — exactly the production claim persistence path.
+    scope = canonical_scope_key(entity=entity, field=field, geography=geography,
+                                market=market, time_scope=time_scope)
+    return json.dumps({"entity_key": entity, "field_key": field, "value": value,
+                       "time_scope": time_scope, "market": market, "geography": geography,
+                       "source_id": source_id,
                        "source_strength": "strong", "confidence": .9, "agent": "agent",
+                       "canonical_scope_hash": canonical_scope_hash(scope),
+                       "scope_normalization_version": SCOPE_NORMALIZATION_VERSION,
                        "evidence_key": key, "task_key": "task"})
 
 
@@ -1932,3 +1946,231 @@ def test_claim_run_lease_returns_no_row_for_every_terminal_status(db):
         db.psql(f"update public.runs set status='{status}' where id='{run_id}'")
         assert db.psql(f"select worker_id from public.claim_run_lease('{run_id}', 'worker-RETRY', 300)") == ""
         assert db.psql(f"select status, attempt from public.runs where id='{run_id}'") == f"{status}|1"
+
+
+# --- migration 20260828000100 (canonical scope conflict identity) ---
+
+@pytest.fixture
+def canonical_db(db):
+    """The shared module DB with the canonical-scope migration guaranteed
+    current, even after earlier rerun-safety tests re-applied the older
+    evidence migration (which restores the pre-canonical RPC definitions)."""
+    migration = next(m for m in MIGRATIONS if "canonical_scope_conflict_identity" in m.name)
+    db.psql(file=migration)
+    return db
+
+
+def _canonical_lease(db, suffix: str):
+    lease, _ = _evidence_fixture(db, suffix)
+    run_id, worker, attempt, token, _grant = lease
+    return run_id, f"'{run_id}','{worker}',{attempt},'{token}'"
+
+
+def _seed_claim(db, args: str, key: str, value: int, **scope) -> str:
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json(f'src-{key}')}'::jsonb)")
+    return _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_claim_json(key, source, value, **scope)}'::jsonb)")
+
+
+def _conflict_json(key: str, entity: str, field: str, claim_ids: list[str]) -> str:
+    return json.dumps({"entity_key": entity, "field_key": field, "claim_ids": sorted(claim_ids),
+                       "rationale": "values differ", "evidence_key": key, "task_key": "review"})
+
+
+VARIANT_A = dict(entity="Toyota Corolla 2020", field="engine-power", market="Israel",
+                 geography="IL", time_scope={"year": 2020})
+VARIANT_B = dict(entity="toyota_corolla_2020", field="Engine Power", market=" israel ",
+                 geography="il", time_scope={"year": 2020})
+
+
+def test_formatting_variant_claims_persist_as_one_durable_conflict(canonical_db):
+    """B1 regression: before the canonical-scope migration this exact flow was
+    rejected with 'must exist, share one scope, and contradict' because the
+    conflict RPC compared raw scope text."""
+    db = canonical_db
+    run_id, args = _canonical_lease(db, "canon")
+    claim_a = _seed_claim(db, args, "canon-a", 100, **VARIANT_A)
+    claim_b = _seed_claim(db, args, "canon-b", 120, **VARIANT_B)
+    conflict = _conflict_json("canon-conflict", "Toyota Corolla 2020", "engine-power", [claim_a, claim_b])
+    conflict_id = _rpc_as_service(db, f"select id from public.create_conflict_guarded({args},'{conflict}'::jsonb)")
+    assert conflict_id
+    # Idempotent retry reuses the same durable conflict.
+    retried = _rpc_as_service(db, f"select id from public.create_conflict_guarded({args},'{conflict}'::jsonb)")
+    assert retried == conflict_id
+    assert db.psql(f"select count(*) from public.conflicts where run_id='{run_id}'") == "1"
+    # Original provenance is stored untouched; only the canonical identity is shared.
+    assert db.psql(f"select entity_key || '|' || field_key || '|' || market || '|' || geography || '|' || time_scope::text from public.claims where id='{claim_a}'") == 'Toyota Corolla 2020|engine-power|Israel|IL|{"year": 2020}'
+    assert db.psql(f"select entity_key || '|' || field_key || '|' || market || '|' || geography from public.claims where id='{claim_b}'") == "toyota_corolla_2020|Engine Power| israel |il"
+    stored = db.psql(f"select distinct canonical_scope_hash || '|' || scope_normalization_version from public.claims where id in ('{claim_a}','{claim_b}')")
+    expected = canonical_scope_hash(canonical_scope_key(
+        entity=VARIANT_A["entity"], field=VARIANT_A["field"], geography=VARIANT_A["geography"],
+        market=VARIANT_A["market"], time_scope=VARIANT_A["time_scope"]))
+    assert stored == f"{expected}|{SCOPE_NORMALIZATION_VERSION}"
+
+
+def test_semantic_year_and_market_scope_differences_stay_rejected(canonical_db):
+    db = canonical_db
+    _, args = _canonical_lease(db, "canonsem")
+    base = _seed_claim(db, args, "sem-base", 100, **VARIANT_A)
+    different_scopes = [
+        ("sem-year", dict(VARIANT_A, time_scope={"year": 2021})),
+        ("sem-market", dict(VARIANT_A, market="Global")),
+        ("sem-geo", dict(VARIANT_A, geography="US")),
+        ("sem-alias", dict(VARIANT_A, entity="Toyota Corolla 2020 New")),
+    ]
+    for key, scope in different_scopes:
+        other = _seed_claim(db, args, key, 999, **scope)
+        assert db.psql(f"select count(distinct canonical_scope_hash) from public.claims where id in ('{base}','{other}')") == "2"
+        conflict = _conflict_json(f"{key}-conflict", scope["entity"], scope["field"], [base, other])
+        with pytest.raises(AssertionError, match="must exist, share one scope, and contradict"):
+            _rpc_as_service(db, f"select public.create_conflict_guarded({args},'{conflict}'::jsonb)")
+    accent = _seed_claim(db, args, "sem-accent", 1, **dict(VARIANT_A, entity="Accent"))
+    i25 = _seed_claim(db, args, "sem-i25", 2, **dict(VARIANT_A, entity="i25"))
+    with pytest.raises(AssertionError, match="must exist, share one scope, and contradict"):
+        _rpc_as_service(db, f"select public.create_conflict_guarded({args},'{_conflict_json('sem-accent-conflict', 'Accent', VARIANT_A['field'], [accent, i25])}'::jsonb)")
+
+
+def test_same_canonical_scope_same_value_missing_and_cross_run_stay_rejected(canonical_db):
+    db = canonical_db
+    _, args = _canonical_lease(db, "canonneg")
+    claim_a = _seed_claim(db, args, "neg-a", 100, **VARIANT_A)
+    claim_b = _seed_claim(db, args, "neg-b", 100, **VARIANT_B)
+    agreeing = _conflict_json("neg-agree", VARIANT_A["entity"], VARIANT_A["field"], [claim_a, claim_b])
+    with pytest.raises(AssertionError, match="must exist, share one scope, and contradict"):
+        _rpc_as_service(db, f"select public.create_conflict_guarded({args},'{agreeing}'::jsonb)")
+    missing = _conflict_json("neg-missing", VARIANT_A["entity"], VARIANT_A["field"],
+                             [claim_a, "00000000-0000-4000-8000-000000000099"])
+    with pytest.raises(AssertionError, match="must exist, share one scope, and contradict"):
+        _rpc_as_service(db, f"select public.create_conflict_guarded({args},'{missing}'::jsonb)")
+    _, args_other = _canonical_lease(db, "canonother")
+    foreign = _seed_claim(db, args_other, "neg-foreign", 120, **VARIANT_A)
+    crossed = _conflict_json("neg-cross", VARIANT_A["entity"], VARIANT_A["field"], [claim_a, foreign])
+    with pytest.raises(AssertionError, match="must exist, share one scope, and contradict"):
+        _rpc_as_service(db, f"select public.create_conflict_guarded({args},'{crossed}'::jsonb)")
+    single = json.dumps({"entity_key": VARIANT_A["entity"], "field_key": VARIANT_A["field"],
+                         "claim_ids": [claim_a], "evidence_key": "neg-single", "task_key": "review"})
+    with pytest.raises(AssertionError, match="at least two claims"):
+        _rpc_as_service(db, f"select public.create_conflict_guarded({args},'{single}'::jsonb)")
+
+
+def test_legacy_and_untrusted_canonical_identities_fail_closed(canonical_db):
+    db = canonical_db
+    run_id, args = _canonical_lease(db, "canonlegacy")
+    modern = _seed_claim(db, args, "legacy-modern", 100, **VARIANT_A)
+    # A pre-canonical legacy row: created outside the new RPC, canonical
+    # identity absent, provenance preserved verbatim, never backfilled.
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('legacy-src')}'::jsonb)")
+    legacy = db.psql(
+        f"insert into public.claims (run_id, entity_key, field_key, value, time_scope, geography, market, source_id, source_strength, confidence, agent, evidence_key, task_key) "
+        f"values ('{run_id}', 'Toyota Corolla 2020', 'engine-power', '120'::jsonb, '{{\"year\": 2020}}'::jsonb, 'IL', 'Israel', '{source}', 'strong', 0.9, 'agent', 'legacy-claim', 'task') returning id"
+    )
+    conflict = _conflict_json("legacy-conflict", VARIANT_A["entity"], VARIANT_A["field"], [modern, legacy])
+    with pytest.raises(AssertionError, match="require a trusted canonical scope identity"):
+        _rpc_as_service(db, f"select public.create_conflict_guarded({args},'{conflict}'::jsonb)")
+    assert db.psql(f"select canonical_scope_hash is null and scope_normalization_version is null from public.claims where id='{legacy}'") == "t"
+    # New claims cannot skip or forge the canonical identity.
+    bad_payloads = [
+        {"canonical_scope_hash": None, "scope_normalization_version": None},
+        {"canonical_scope_hash": "not-a-hash", "scope_normalization_version": 1},
+        {"canonical_scope_hash": "a" * 64, "scope_normalization_version": 0},
+    ]
+    for index, overrides in enumerate(bad_payloads):
+        payload = json.loads(_claim_json(f"legacy-bad-{index}", source, 5, **VARIANT_A))
+        payload.update(overrides)
+        with pytest.raises(AssertionError, match="trusted canonical scope identity is required"):
+            _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(payload)}'::jsonb)")
+
+
+def test_canonical_migration_is_rerun_safe_and_service_only(canonical_db):
+    db = canonical_db
+    migration = next(m for m in MIGRATIONS if "canonical_scope_conflict_identity" in m.name)
+    db.psql(file=migration)
+    db.psql(file=migration)
+    for name in ("create_claim_with_source_guarded", "create_conflict_guarded"):
+        assert db.psql(f"select count(*) from pg_proc where proname='{name}'") == "1"
+        signature = f"public.{name}(uuid,text,integer,text,jsonb)"
+        assert not _has_execute(db, "anon", signature), signature
+        assert not _has_execute(db, "authenticated", signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+
+
+def _apply_evidence_migration(db, marker: str) -> None:
+    db.psql(file=next(m for m in MIGRATIONS if marker in m.name))
+
+
+def test_pre_canonical_claim_replay_upgrades_in_place_and_reaches_conflict(canonical_db):
+    """Upgrade-boundary regression: a claim persisted by the pre-canonical
+    release and replayed after the canonical deployment must keep its row id
+    and evidence_key, gain ONLY the canonical identity, and then work with
+    canonical conflict persistence."""
+    db = canonical_db
+    run_id, args = _canonical_lease(db, "upg")
+    # STEP 1 — pre-canonical deployment: the older evidence RPC is active and
+    # ignores the canonical payload fields entirely.
+    _apply_evidence_migration(db, "lease_guarded_evidence_writes")
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('src-upg')}'::jsonb)")
+    payload = _claim_json("upg-claim", source, 100, **VARIANT_A)
+    legacy_id = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select canonical_scope_hash is null and scope_normalization_version is null from public.claims where id='{legacy_id}'") == "t"
+    provenance_sql = (f"select entity_key || '|' || field_key || '|' || value::text || '|' || time_scope::text || '|' || "
+                      f"geography || '|' || market || '|' || source_id::text || '|' || evidence_key || '|' || task_key || '|' || id::text "
+                      f"from public.claims where run_id='{run_id}'")
+    before = db.psql(provenance_sql)
+    # STEP 2 — canonical deployment boundary: replay the exact same logical claim.
+    _apply_evidence_migration(db, "canonical_scope_conflict_identity")
+    assert _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)") == legacy_id
+    assert db.psql(f"select count(*) from public.claims where run_id='{run_id}'") == "1"
+    expected = canonical_scope_hash(canonical_scope_key(
+        entity=VARIANT_A["entity"], field=VARIANT_A["field"], geography=VARIANT_A["geography"],
+        market=VARIANT_A["market"], time_scope=VARIANT_A["time_scope"]))
+    assert db.psql(f"select canonical_scope_hash || '|' || scope_normalization_version from public.claims where id='{legacy_id}'") == f"{expected}|{SCOPE_NORMALIZATION_VERSION}"
+    assert db.psql(provenance_sql) == before
+    # Exact replay after the upgrade: same id, still no duplicate or mutation.
+    assert _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)") == legacy_id
+    assert db.psql(f"select count(*) from public.claims where run_id='{run_id}'") == "1"
+    assert db.psql(provenance_sql) == before
+    # STEP 3 — the replay-upgraded claim persists one canonical conflict with a
+    # formatting-variant contradiction.
+    other = _seed_claim(db, args, "upg-variant", 120, **VARIANT_B)
+    conflict = _conflict_json("upg-conflict", VARIANT_A["entity"], VARIANT_A["field"], [legacy_id, other])
+    assert _rpc_as_service(db, f"select id from public.create_conflict_guarded({args},'{conflict}'::jsonb)")
+
+
+def test_mismatched_and_partial_canonical_replays_fail_closed(canonical_db):
+    db = canonical_db
+    run_id, args = _canonical_lease(db, "upgneg")
+    _apply_evidence_migration(db, "lease_guarded_evidence_writes")
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('src-upgneg')}'::jsonb)")
+    payload = _claim_json("upgneg-claim", source, 100, **VARIANT_A)
+    legacy_id = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)")
+    _apply_evidence_migration(db, "canonical_scope_conflict_identity")
+    # Same evidence_key, different original payload: never silently upgraded.
+    tampered = json.loads(payload)
+    tampered["value"] = 999
+    with pytest.raises(AssertionError, match="does not match the stored claim"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(tampered)}'::jsonb)")
+    assert db.psql(f"select canonical_scope_hash is null from public.claims where id='{legacy_id}'") == "t"
+    # Same evidence_key, different source: existing idempotency guard holds.
+    source_2 = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('src-upgneg-2')}'::jsonb)")
+    moved = json.loads(payload)
+    moved["source_id"] = source_2
+    with pytest.raises(AssertionError, match="idempotency key belongs to a different source"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(moved)}'::jsonb)")
+    # The exact replay upgrades; afterwards a differing canonical identity or
+    # normalization version is rejected instead of overwritten.
+    assert _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{payload}'::jsonb)") == legacy_id
+    forged = json.loads(payload)
+    forged["canonical_scope_hash"] = "0" * 64
+    with pytest.raises(AssertionError, match="canonical scope identity mismatch"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(forged)}'::jsonb)")
+    bumped = json.loads(payload)
+    bumped["scope_normalization_version"] = 2
+    with pytest.raises(AssertionError, match="canonical scope identity mismatch"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(bumped)}'::jsonb)")
+    assert db.psql(f"select scope_normalization_version from public.claims where id='{legacy_id}'") == str(SCOPE_NORMALIZATION_VERSION)
+    # Half-populated canonical state is invalid, never guessed or repaired.
+    partial_payload = _claim_json("upgneg-partial", source, 100, **VARIANT_A)
+    partial_hash = json.loads(partial_payload)["canonical_scope_hash"]
+    db.psql(f"insert into public.claims (run_id, entity_key, field_key, value, time_scope, geography, market, source_id, source_strength, confidence, agent, evidence_key, task_key, canonical_scope_hash) "
+            f"values ('{run_id}', '{VARIANT_A['entity']}', '{VARIANT_A['field']}', '100'::jsonb, '{{\"year\": 2020}}'::jsonb, '{VARIANT_A['geography']}', '{VARIANT_A['market']}', '{source}', 'strong', 0.9, 'agent', 'upgneg-partial', 'task', '{partial_hash}')")
+    with pytest.raises(AssertionError, match="canonical scope state is invalid"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{partial_payload}'::jsonb)")

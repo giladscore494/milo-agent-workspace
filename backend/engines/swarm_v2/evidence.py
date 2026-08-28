@@ -15,6 +15,9 @@ from uuid import UUID
 
 from backend.schemas import ClaimCreate, ConflictCreate, SourceCreate, ToolUsageCreate
 
+from .normalization import (SCOPE_NORMALIZATION_VERSION, CanonicalScope, canonical_scope_hash,
+                            canonical_scope_key, canonical_value_key)
+
 
 class EvidenceValidationError(ValueError):
     """A safe, provider-neutral evidence validation failure."""
@@ -110,11 +113,23 @@ class EvidenceBoard:
 
     def record_claim(self, claim: ClaimCreate, *, task_key: str) -> dict[str, Any]:
         payload = safe_durable_value(claim.model_dump(mode="json"))
+        # The idempotent evidence identity is derived from task provenance plus
+        # the ORIGINAL claim payload only — exactly as before canonical scopes
+        # existed — so a claim persisted by a pre-canonical release replays to
+        # the same evidence_key.  Derived canonical metadata (and any future
+        # SCOPE_NORMALIZATION_VERSION) must never change this identity.
+        evidence_key = _key("claim", {"task_key": task_key, **payload})
         # Scope is exactly entity + field + market/geography + time.  Source,
         # confidence, run and task provenance remain attached to every claim.
-        payload.update(task_key=self._task(task_key), evidence_key=_key("claim", {
-            "task_key": task_key, **payload,
-        }))
+        # The trusted canonical identity travels with the claim so the durable
+        # conflict firewall validates the same scope equality as this board;
+        # the original scope fields are stored untouched for provenance.
+        scope = canonical_scope_key(entity=payload["entity_key"], field=payload["field_key"],
+                                    geography=payload.get("geography"), market=payload.get("market"),
+                                    time_scope=payload.get("time_scope") or {})
+        payload.update(canonical_scope_hash=canonical_scope_hash(scope),
+                       scope_normalization_version=SCOPE_NORMALIZATION_VERSION,
+                       task_key=self._task(task_key), evidence_key=evidence_key)
         row = self._repository.create_claim(self.lease.run_id, payload, **self._lease_kwargs)
         self._claims[str(row["id"])] = dict(row)
         return row
@@ -122,18 +137,21 @@ class EvidenceBoard:
     def detect_and_record_conflicts(self, *, task_key: str,
                                     rationale: str = "Contradictory values in the same evidence scope.") -> list[dict[str, Any]]:
         rationale = self._rationale(rationale)
-        groups: dict[str, list[dict[str, Any]]] = {}
+        groups: dict[CanonicalScope, list[dict[str, Any]]] = {}
         for claim in self._claims.values():
-            scope = json.dumps([claim.get("entity_key"), claim.get("field_key"),
-                                claim.get("market"), claim.get("geography"),
-                                claim.get("time_scope") or {}], sort_keys=True, separators=(",", ":"))
+            scope = canonical_scope_key(entity=claim["entity_key"], field=claim["field_key"],
+                                        geography=claim.get("geography"), market=claim.get("market"),
+                                        time_scope=claim.get("time_scope") or {})
             groups.setdefault(scope, []).append(claim)
         recorded = []
         for claims in groups.values():
-            values = {json.dumps(item.get("value"), sort_keys=True, separators=(",", ":")) for item in claims}
+            values = {canonical_value_key(item.get("value")) for item in claims}
             if len(claims) < 2 or len(values) < 2:
                 continue
-            ids = sorted(UUID(str(item["id"])) for item in claims)
+            # Formatting variants may differ across a group's claims; keying the
+            # conflict on the lowest claim id keeps it insertion-order independent.
+            claims = sorted(claims, key=lambda item: UUID(str(item["id"])))
+            ids = [UUID(str(item["id"])) for item in claims]
             conflict = ConflictCreate(entity_key=claims[0]["entity_key"], field_key=claims[0]["field_key"],
                                       claim_ids=ids, rationale=rationale)
             payload = safe_durable_value(conflict.model_dump(mode="json"))
