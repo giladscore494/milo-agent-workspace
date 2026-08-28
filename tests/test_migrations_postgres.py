@@ -33,6 +33,7 @@ from pathlib import Path
 
 import pytest
 
+from backend.engines.swarm_v2.fragments import fragment_content_hash
 from backend.engines.swarm_v2.normalization import (
     SCOPE_NORMALIZATION_VERSION, canonical_scope_hash, canonical_scope_key,
 )
@@ -1400,6 +1401,7 @@ def test_service_only_tables_have_no_policies(db):
         "tool_access_requests", "tool_grants", "tool_usage", "sources", "claims",
         "source_claim_links", "conflicts", "run_usage_ledger",
         "model_call_budget_reservations", "run_invocations",
+        "source_evidence_fragments",
     }
     assert policy_tables & service_only == set()
 
@@ -2174,3 +2176,201 @@ def test_mismatched_and_partial_canonical_replays_fail_closed(canonical_db):
             f"values ('{run_id}', '{VARIANT_A['entity']}', '{VARIANT_A['field']}', '100'::jsonb, '{{\"year\": 2020}}'::jsonb, '{VARIANT_A['geography']}', '{VARIANT_A['market']}', '{source}', 'strong', 0.9, 'agent', 'upgneg-partial', 'task', '{partial_hash}')")
     with pytest.raises(AssertionError, match="canonical scope state is invalid"):
         _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{partial_payload}'::jsonb)")
+
+
+# --- migration 20260828000200 (source evidence fragments) ---
+
+@pytest.fixture
+def fragment_db(db):
+    """The shared module DB with the evidence-fragment migration guaranteed
+    current, independent of earlier rerun-safety tests re-applying older
+    evidence migrations."""
+    migration = next(m for m in MIGRATIONS if "source_evidence_fragments" in m.name)
+    db.psql(file=migration)
+    return db
+
+
+def _fragment_json(source_id: str, text: str, *, key: str, task: str = "task",
+                   index: int = 0, content_hash: str | None = None) -> str:
+    # The content hash is produced by the trusted backend helper the worker
+    # itself uses, so PostgreSQL validates the real production value.
+    return json.dumps({"source_id": source_id, "fragment_text": text,
+                       "content_hash": content_hash or fragment_content_hash(text),
+                       "fragment_index": index, "task_key": task, "evidence_key": key})
+
+
+FRAGMENT_TEXT = "The 2020 model was rated at 1798 cc by the official importer."
+
+
+def test_evidence_fragment_persists_replays_and_stays_bound_to_one_source_and_run(fragment_db):
+    db = fragment_db
+    lease_a, lease_b = _evidence_fixture(db, "frag")
+    run_a, worker_a, attempt_a, token_a, _ = lease_a
+    run_b, worker_b, attempt_b, token_b, _ = lease_b
+    args = f"'{run_a}','{worker_a}',{attempt_a},'{token_a}'"
+    args_b = f"'{run_b}','{worker_b}',{attempt_b},'{token_b}'"
+    source_1 = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-src-1')}'::jsonb)")
+    source_2 = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-src-2')}'::jsonb)")
+    source_b = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args_b},'{_source_json('frag-src-b')}'::jsonb)")
+
+    # A valid source-bound fragment persists with complete provenance.
+    payload = _fragment_json(source_1, FRAGMENT_TEXT, key="frag-1")
+    stored = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(
+        f"select run_id, source_id, task_key, fragment_index, fragment_text "
+        f"from public.source_evidence_fragments where id='{stored}'"
+    ) == f"{run_a}|{source_1}|task|0|{FRAGMENT_TEXT}"
+
+    # An exact replay returns the same durable row instead of duplicating it.
+    assert _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{payload}'::jsonb)") == stored
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where run_id='{run_a}'") == "1"
+
+    # One source can never inherit another source's fragment relationship.
+    hijack = _fragment_json(source_2, FRAGMENT_TEXT, key="frag-1")
+    with pytest.raises(AssertionError, match="belongs to a different source"):
+        _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{hijack}'::jsonb)")
+    own = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source_2, FRAGMENT_TEXT, key='frag-2')}'::jsonb)")
+    assert db.psql(f"select source_id from public.source_evidence_fragments where id='{own}'") == source_2
+
+    # A source belonging to another run is rejected and nothing is written.
+    cross = _fragment_json(source_b, FRAGMENT_TEXT, key="frag-cross")
+    with pytest.raises(AssertionError, match="invalid evidence fragment source"):
+        _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{cross}'::jsonb)")
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where evidence_key='frag-cross'") == "0"
+
+    # Multiple fragments of one source read back in a deterministic order, and
+    # the source metadata itself is untouched by any of this.
+    for index, sentence in enumerate(("Second recorded sentence.", "Third recorded sentence."), start=1):
+        _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source_1, sentence, key=f'frag-1-{index}', index=index)}'::jsonb)")
+    assert db.psql(
+        f"select string_agg(fragment_index::text, ',' order by fragment_index, content_hash) "
+        f"from public.source_evidence_fragments where source_id='{source_1}'"
+    ) == "0,1,2"
+    assert db.psql(
+        f"select url, title, domain, evidence_key, task_key from public.sources where id='{source_1}'"
+    ) == f"https://example.test/frag-src-1|title|example.test|frag-src-1|task"
+
+
+def test_evidence_fragment_rejects_stale_leases_unsafe_text_and_every_hard_bound(fragment_db):
+    db = fragment_db
+    lease, _ = _evidence_fixture(db, "fragguard")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source_id = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-guard-src')}'::jsonb)")
+
+    # A stale, wrong or expired lease writes nothing at all.
+    never = _fragment_json(source_id, "Never written.", key="frag-never")
+    bad_leases = [("wrong", attempt, token, False), (worker, str(int(attempt) + 1), token, False),
+                  (worker, attempt, "wrong", False), (worker, attempt, token, True)]
+    for bad_worker, bad_attempt, bad_token, expire in bad_leases:
+        if expire:
+            db.psql(f"update public.runs set lease_expires_at=now()-interval '1 second' where id='{run_id}'")
+        bad = f"'{run_id}','{bad_worker}',{bad_attempt},'{bad_token}'"
+        with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+            _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({bad},'{never}'::jsonb)")
+    db.psql(f"update public.runs set lease_expires_at=now()+interval '5 minutes' where id='{run_id}'")
+
+    rejected = [
+        # Over the hard character bound; the durable boundary rejects, never truncates.
+        (_fragment_json(source_id, "w" * 401, key="frag-long"), "exceeds the durable bound"),
+        # Empty and whitespace-only text.
+        (_fragment_json(source_id, "", key="frag-empty"), "must not be empty"),
+        (_fragment_json(source_id, "   ", key="frag-blank"), "must not be empty"),
+        # Credential and hidden-reasoning markers.
+        (_fragment_json(source_id, "api_key=ABCDEFGHIJKLMNOP", key="frag-key"), "unsafe evidence"),
+        (_fragment_json(source_id, "authorization: Token abcdef", key="frag-auth"), "unsafe evidence"),
+        (_fragment_json(source_id, "the lease_token was printed", key="frag-lease"), "unsafe evidence"),
+        (_fragment_json(source_id, "-----begin certificate-----", key="frag-pem"), "unsafe evidence"),
+        (_fragment_json(source_id, "captured chain of thought", key="frag-cot"), "unsafe evidence"),
+        # A hash that does not describe the durable text.
+        (_fragment_json(source_id, FRAGMENT_TEXT, key="frag-hash", content_hash="0" * 64),
+         "content hash does not match"),
+        (_fragment_json(source_id, FRAGMENT_TEXT, key="frag-shape", content_hash="not-a-hash"),
+         "content hash does not match"),
+        # Provenance is mandatory.
+        (_fragment_json(source_id, FRAGMENT_TEXT, key="", task=""), "evidence_key and task_key are required"),
+        # The index bound mirrors the per-source count limit.
+        (_fragment_json(source_id, FRAGMENT_TEXT, key="frag-index", index=4), "fragment_index is outside"),
+    ]
+    for payload, message in rejected:
+        with pytest.raises(AssertionError, match=message):
+            _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where run_id='{run_id}'") == "0"
+
+    # The per-source count limit holds after four real fragments.
+    for index in range(4):
+        _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source_id, f'Bounded sentence number {index}.', key=f'frag-cap-{index}', index=index)}'::jsonb)")
+    with pytest.raises(AssertionError, match="count limit reached"):
+        _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{_fragment_json(source_id, 'One too many.', key='frag-cap-x')}'::jsonb)")
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where source_id='{source_id}'") == "4"
+
+    # The per-source character budget holds independently of the count.
+    budget_source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-budget-src')}'::jsonb)")
+    for index in range(3):
+        _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(budget_source, chr(97 + index) * 399, key=f'frag-budget-{index}', index=index)}'::jsonb)")
+    with pytest.raises(AssertionError, match="character budget exhausted"):
+        _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{_fragment_json(budget_source, 'z' * 399, key='frag-budget-3', index=3)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where source_id='{budget_source}'") == "3"
+
+
+def test_evidence_fragment_surface_is_service_only_append_only_and_rerun_safe(fragment_db):
+    db = fragment_db
+    lease, _ = _evidence_fixture(db, "fragacl")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source_id = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-acl-src')}'::jsonb)")
+    stored = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source_id, FRAGMENT_TEXT, key='frag-acl')}'::jsonb)")
+
+    # Browser roles can neither execute the write RPC nor touch the relation.
+    for role in ("anon", "authenticated"):
+        with pytest.raises(AssertionError, match="permission denied"):
+            db.psql(f"set role {role}; select public.record_evidence_fragment_guarded({args},'{{}}'::jsonb)")
+        assert db.psql(
+            "select count(*) from information_schema.role_table_grants "
+            f"where grantee='{role}' and table_name='source_evidence_fragments'"
+        ) == "0"
+    assert db.psql(
+        "select relrowsecurity from pg_class where relname='source_evidence_fragments'"
+    ) == "t"
+    assert db.psql(
+        "select count(*) from pg_policies where tablename='source_evidence_fragments'"
+    ) == "0"
+
+    # Captured evidence is an audit record: no role may rewrite or remove it.
+    for mutation in (f"update public.source_evidence_fragments set fragment_text='x' where id='{stored}'",
+                     f"delete from public.source_evidence_fragments where id='{stored}'"):
+        with pytest.raises(AssertionError, match="append-only"):
+            db.psql(mutation)
+        with pytest.raises(AssertionError, match="append-only|permission denied"):
+            _rpc_as_service(db, mutation)
+    assert db.psql(f"select fragment_text from public.source_evidence_fragments where id='{stored}'") == FRAGMENT_TEXT
+
+    # Rerun-safe, and the fragment written before the rerun survives untouched.
+    migration = next(m for m in MIGRATIONS if "source_evidence_fragments" in m.name)
+    db.psql(file=migration)
+    db.psql(file=migration)
+    assert db.psql("select count(*) from pg_proc where proname='record_evidence_fragment_guarded'") == "1"
+    assert db.psql(f"select fragment_text from public.source_evidence_fragments where id='{stored}'") == FRAGMENT_TEXT
+
+
+def test_legacy_sources_and_claims_stay_valid_without_any_fragment(fragment_db):
+    """No historical row is backfilled, and a source with no grounding context
+    is distinguishable from one with fragments rather than fabricated."""
+    db = fragment_db
+    lease, _ = _evidence_fixture(db, "fraglegacy")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    legacy = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-legacy-src')}'::jsonb)")
+    grounded = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('frag-grounded-src')}'::jsonb)")
+    claim_id = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_claim_json('frag-legacy-claim', legacy, 100)}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(grounded, FRAGMENT_TEXT, key='frag-grounded')}'::jsonb)")
+    assert claim_id
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where source_id='{legacy}'") == "0"
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where source_id='{grounded}'") == "1"
+    # The internal read path a future verifier uses: only the requested run and
+    # sources, in a deterministic order.
+    assert db.psql(
+        f"select string_agg(source_id::text, ',' order by source_id, fragment_index, content_hash) "
+        f"from public.source_evidence_fragments "
+        f"where run_id='{run_id}' and source_id in ('{legacy}','{grounded}')"
+    ) == grounded

@@ -1,5 +1,5 @@
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any, Iterable, Protocol
 from uuid import UUID
 from supabase import create_client
 from backend.config import Settings
@@ -44,6 +44,8 @@ class Repository(Protocol):
     def create_source(self, run_id: UUID, source: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def create_claim(self, run_id: UUID, claim: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def create_conflict(self, run_id: UUID, conflict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_evidence_fragment(self, run_id: UUID, fragment: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def list_evidence_fragments_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 200) -> list[dict[str, Any]]: ...
     def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -628,6 +630,34 @@ class SupabaseRepository:
     def create_conflict(self, run_id: UUID, conflict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_conflict": conflict}
         return self._guarded_rpc("create_conflict_guarded", params, "conflict")
+
+    def record_evidence_fragment(self, run_id: UUID, fragment: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_fragment": fragment}
+        return self._guarded_rpc("record_evidence_fragment_guarded", params, "evidence_fragment")
+
+    EVIDENCE_FRAGMENT_COLUMNS = ("id, run_id, source_id, task_key, evidence_key, "
+                                 "fragment_text, content_hash, fragment_index, created_at")
+    MAX_EVIDENCE_FRAGMENT_ROWS = 200
+
+    def list_evidence_fragments_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = MAX_EVIDENCE_FRAGMENT_ROWS) -> list[dict[str, Any]]:
+        """Internal bounded read of durable evidence fragments for a future
+        grounded verifier.
+
+        Server/service path only: no browser endpoint exposes it, it performs
+        no provider call, and the caller supplies a run plus source ids -- never
+        SQL.  Rows are restricted to the requested run AND the requested
+        sources, capped at MAX_EVIDENCE_FRAGMENT_ROWS, and ordered
+        deterministically by (source_id, fragment_index, content_hash).  A
+        source with no fragment simply yields no row: a legacy source without
+        grounding context is never fabricated."""
+        identifiers = sorted({str(source_id) for source_id in source_ids})
+        if not identifiers:
+            return []
+        bounded = max(1, min(int(limit), self.MAX_EVIDENCE_FRAGMENT_ROWS))
+        return self._many(
+            self.client.table("source_evidence_fragments").select(self.EVIDENCE_FRAGMENT_COLUMNS)
+            .eq("run_id", str(run_id)).in_("source_id", identifiers)
+            .order("source_id").order("fragment_index").order("content_hash").limit(bounded))
 
     def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_summary": summary}
