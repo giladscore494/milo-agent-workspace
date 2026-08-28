@@ -1,8 +1,14 @@
 """Lease-guarded Evidence Board backed by the existing evidence tables.
 
-Only structured findings and brief rationale summaries cross this boundary.
-Model scratch work, provider errors, credentials, and chain-of-thought are
-rejected rather than copied into durable evidence.
+Only structured findings, brief rationale summaries, and bounded verbatim
+source evidence fragments cross this boundary.  Model scratch work, provider
+errors, credentials, and chain-of-thought are rejected rather than copied
+into durable evidence.
+
+Evidence fragments are captured at acquisition time from real tool material
+(see .fragments) and land in the service-only relation
+public.source_evidence_fragments -- never in the browser-visible source
+metadata, the claim value, or a run event.
 """
 
 from __future__ import annotations
@@ -15,6 +21,8 @@ from uuid import UUID
 
 from backend.schemas import ClaimCreate, ConflictCreate, SourceCreate, ToolUsageCreate
 
+from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENTS_PER_SOURCE, extract_source_fragments,
+                        fragment_content_hash, normalize_fragment_text)
 from .normalization import (SCOPE_NORMALIZATION_VERSION, CanonicalScope, canonical_scope_hash,
                             canonical_scope_key, canonical_value_key)
 
@@ -68,6 +76,40 @@ def safe_durable_value(value: Any) -> Any:
     raise EvidenceValidationError("evidence must be JSON structured")
 
 
+# Durable fragment safety is a FINITE, mechanical marker set: credential and
+# hidden-reasoning shapes that can never be ordinary source prose.  Quoted
+# source text that merely reasons ("therefore", "we concluded") is legitimate
+# evidence and is never censored here.
+# supabase/migrations/20260828000200_source_evidence_fragments.sql enforces
+# the same set at the durable boundary, so a direct RPC call cannot bypass it.
+_FRAGMENT_SECRET_MARKERS = (
+    "-----begin", "-----end", "api_key=", "apikey=", "aws_secret_access_key",
+    "authorization:", "client_secret", "lease_token", "password=", "private_key",
+    "refresh_token", "secret_key", "x-api-key",
+)
+
+
+def safe_fragment_text(value: Any) -> str:
+    """Return bounded, safe durable evidence text or fail with a safe error.
+
+    This is the persistence boundary, so it REJECTS rather than repairs: an
+    over-long fragment is a caller bug (acquisition already bounds text in
+    .fragments), and silently truncating here would hide it.
+    """
+    if not isinstance(value, str):
+        raise EvidenceValidationError("evidence fragment text must be a string")
+    text = normalize_fragment_text(value)
+    if not text:
+        raise EvidenceValidationError("evidence fragment text must not be empty")
+    if len(text) > MAX_FRAGMENT_CHARS:
+        raise EvidenceValidationError("evidence fragment exceeds the durable size bound")
+    safe_durable_value(text)  # the existing finite hidden-reasoning/sentinel policy
+    folded = text.casefold()
+    if any(marker in folded for marker in _FRAGMENT_SECRET_MARKERS):
+        raise EvidenceValidationError("unsafe evidence fragment rejected")
+    return text
+
+
 def _key(kind: str, payload: Mapping[str, Any]) -> str:
     encoded = json.dumps(safe_durable_value(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return f"{kind}:{hashlib.sha256(encoded.encode()).hexdigest()}"
@@ -110,6 +152,59 @@ class EvidenceBoard:
         row = self._repository.create_source(self.lease.run_id, payload, **self._lease_kwargs)
         self._sources[str(row["id"])] = dict(row)
         return row
+
+    def record_source_with_evidence(self, source: SourceCreate, tool_result: Mapping[str, Any], *,
+                                    task_key: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Persist a source and the bounded evidence that supports it, in order.
+
+        This is the acquisition-time entry point and it encodes the required
+        ordering in one call -- source metadata durable first, then fragments
+        bound to the durable source id it returned -- so no caller can persist
+        a fragment against a source id it guessed, and evidence acquisition can
+        never be deferred to the verifier.  The structured claim is recorded
+        afterwards by the caller and continues to reference only source_id.
+        """
+        row = self.record_source(source, task_key=task_key)
+        return row, self.record_source_evidence(row["id"], tool_result, task_key=task_key)
+
+    def record_source_evidence(self, source_id: Any, tool_result: Mapping[str, Any], *,
+                               task_key: str) -> list[dict[str, Any]]:
+        """Capture bounded source evidence at acquisition time.
+
+        `tool_result` MUST be the structured result a registered tool returned
+        for `source_id` while the source was being recorded.  A worker/model
+        completion is never a valid input: B2 has no path that asks a model to
+        write the excerpt supporting its own claim.
+
+        The caller records the source first, so every fragment is bound to a
+        real durable source_id; free-floating excerpts are impossible.
+        """
+        return [self.record_evidence_fragment(source_id, text, task_key=task_key,
+                                              fragment_index=index)
+                for index, text in enumerate(extract_source_fragments(tool_result))]
+
+    def record_evidence_fragment(self, source_id: Any, fragment_text: str, *, task_key: str,
+                                 fragment_index: int = 0) -> dict[str, Any]:
+        """Persist one bounded, source-bound fragment through the guarded RPC.
+
+        Identity is stable provenance only -- source + task + the final bounded
+        text's content hash -- so an exact replay of the same fragment for the
+        same source and task returns the same durable row instead of a
+        duplicate.  No timestamp, UUID, or call sequence enters the key.
+        """
+        text = safe_fragment_text(fragment_text)
+        if not isinstance(fragment_index, int) or isinstance(fragment_index, bool) or \
+                not 0 <= fragment_index < MAX_FRAGMENTS_PER_SOURCE:
+            raise EvidenceValidationError("fragment index is outside the durable bound")
+        content_hash = fragment_content_hash(text)
+        identity = {"task_key": task_key, "source_id": str(source_id),
+                    "content_hash": content_hash}
+        payload = {"source_id": str(source_id), "fragment_text": text,
+                   "content_hash": content_hash, "fragment_index": fragment_index,
+                   "task_key": self._task(task_key),
+                   "evidence_key": _key("fragment", identity)}
+        return self._repository.record_evidence_fragment(self.lease.run_id, payload,
+                                                         **self._lease_kwargs)
 
     def record_claim(self, claim: ClaimCreate, *, task_key: str) -> dict[str, Any]:
         payload = safe_durable_value(claim.model_dump(mode="json"))
@@ -200,4 +295,5 @@ class EvidenceBoard:
         return safe
 
 
-__all__ = ["EvidenceBoard", "EvidenceValidationError", "WorkerLease", "safe_durable_value"]
+__all__ = ["EvidenceBoard", "EvidenceValidationError", "WorkerLease", "safe_durable_value",
+           "safe_fragment_text"]

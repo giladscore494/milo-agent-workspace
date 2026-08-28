@@ -90,6 +90,7 @@ def repo():
     ("create_source", "upsert_source_guarded", "p_source"),
     ("create_claim", "create_claim_with_source_guarded", "p_claim"),
     ("create_conflict", "create_conflict_guarded", "p_conflict"),
+    ("record_evidence_fragment", "record_evidence_fragment_guarded", "p_fragment"),
     ("patch_run_blackboard_evidence", "patch_run_blackboard_evidence_guarded", "p_summary"),
 ])
 def test_evidence_writes_use_only_complete_lease_guarded_rpcs(repo, method, rpc, payload_name):
