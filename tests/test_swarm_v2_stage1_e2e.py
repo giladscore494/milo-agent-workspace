@@ -6,8 +6,10 @@ import pytest
 
 from backend.engines.swarm_v2 import (
     BoundedTaskExecutor, Commander, CommanderModelResolver, EvidenceReference,
-    FinalBuilder, PlanValidator, SwarmState, SwarmV2Engine, TaskResult, Verifier,
+    FinalBuilder, PlanValidator, ResolvedSourceEvidence, SourceFragment, SwarmState,
+    SwarmV2Engine, TaskResult, Verifier,
 )
+from backend.engines.swarm_v2.fragments import MAX_FRAGMENT_CHARS, fragment_content_hash
 from backend.engines.swarm_v2.validation import PlanLimits
 from test_swarm_v2 import plan, task
 
@@ -31,11 +33,60 @@ class Worker:
         return TaskResult(spec.task_id, "completed", {"answer": spec.task_id})
 
 
+def source_context(source_id: str, task_id: str, *, texts=()) -> ResolvedSourceEvidence:
+    """One B2-shaped durable source context, built offline."""
+    return ResolvedSourceEvidence(
+        source_id=source_id, task_id=task_id, url=f"https://example.test/{source_id}",
+        title="Evidence", domain="example.test", source_type="primary",
+        source_strength="strong", source_date="2026-08",
+        fragments=tuple(SourceFragment(fragment_index=index, content_hash=fragment_content_hash(text),
+                                       text=text)
+                        for index, text in enumerate(texts)))
+
+
+class StubResolver:
+    """Offline EvidenceResolver: durable-style source context, no repository.
+
+    It mirrors RepositoryEvidenceResolver's contract -- one bounded context
+    per REFERENCED source id -- while touching no database, no URL, no tool
+    and no provider. `texts` supplies explicit fragments per source; any
+    source without an entry gets one fragment quoting the claim's own value,
+    and an entry of `()` is a source that captured no evidence at all.
+    """
+
+    def __init__(self, texts: dict[str, tuple[str, ...]] | None = None):
+        self._texts = dict(texts or {})
+        self.calls: list[list[str]] = []
+
+    def resolve(self, evidence):
+        references = list(evidence)
+        self.calls.append(sorted({item.source_id for item in references}))
+        contexts = {}
+        for item in references:
+            texts = self._texts.get(item.source_id)
+            if texts is None:
+                # Bounded exactly like a durable B2 fragment, whatever the
+                # claim value's size: evidence is never a copy of the payload.
+                texts = (f"The recorded value is {item.value}."[:MAX_FRAGMENT_CHARS],)
+            contexts[item.source_id] = source_context(item.source_id, item.task_id, texts=texts)
+        return contexts
+
+
 class VerifyGateway:
+    """Offline verifier model that cites one real supplied fragment hash.
+
+    Answers in the exact response contract: a decision and its evidence, with
+    no free-text field the backend could copy into a durable verdict.
+    """
+
     def call(self, **kwargs):
         import json
-        claims = json.loads(kwargs["messages"][1]["content"])
-        return {"verdicts": [{"claim_id": c["claim_id"], "verdict": "verified", "reason": "supported"} for c in claims]}
+        document = json.loads(kwargs["messages"][1]["content"])
+        hashes = {source["source_id"]: [item["content_hash"] for item in source["fragments"]]
+                  for source in document["sources"]}
+        return {"verdicts": [{"claim_id": claim["claim_id"], "verdict": "verified",
+                              "supporting_fragment_hashes": hashes[claim["source_id"]][:1]}
+                             for claim in document["claims"]]}
 
 
 def commander(client):
@@ -66,7 +117,7 @@ def test_dynamic_parallel_replan_conflict_verification_final_and_events():
     calls, events, checkpoints = [], [], []
     engine = SwarmV2Engine(commander=commander(client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls), max_active_workers=2),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"), builder=FinalBuilder(),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()), builder=FinalBuilder(),
         evidence_loader=evidence, event_sink=lambda kind, payload: events.append((kind, payload)),
         checkpoint_sink=lambda phase, value: checkpoints.append(deepcopy(value)))
     result = engine.run({"id": "run-1", "input": {"objective": "taxonomy neutral", "commander_model": "fake"}})
@@ -103,7 +154,7 @@ def test_resume_skips_completed_tasks_and_preserves_checkpoint_evidence():
     client = Plans(initial, [{"decision": "FINISH", "plan": None, "reason": "done"}])
     engine = SwarmV2Engine(commander=commander(client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls), max_active_workers=2),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
         evidence_loader=lambda results: evidence({
             key: value for key, value in results.items() if key == "next"}),
         checkpoint_sink=lambda phase, value: checkpoints.append(deepcopy(value)))
@@ -139,7 +190,8 @@ def test_builder_is_deterministic_traceable_and_excludes_unsupported_claims():
     unsupported = EvidenceReference(claim_id="c2", source_id="s2", run_id="r1", task_id="t2",
         field="unsafe", value="invented", confidence=.9, supported=False)
     gateway = VerifyGateway()
-    verdicts = Verifier(gateway=gateway, model="fake").verify([unsupported, supported])
+    verdicts = Verifier(gateway=gateway, model="fake",
+                       resolver=StubResolver()).verify([unsupported, supported])
     first = FinalBuilder().build([unsupported, supported], verdicts)
     second = FinalBuilder().build([supported, unsupported], reversed(verdicts))
     assert first == second
@@ -164,7 +216,7 @@ def test_conflicts_require_same_full_scope():
     events = []
     engine = SwarmV2Engine(commander=commander(client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker([]), max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
         evidence_loader=lambda _: different + same, event_sink=lambda k, p: events.append((k, p)))
     result = engine.run({"id": "run-1", "input": {"objective": "scope", "commander_model": "fake"}})
     conflicts = {payload["claim_id"] for kind, payload in events if kind == "conflict_found"}
@@ -180,7 +232,7 @@ def test_unsafe_task_output_has_zero_checkpoint_mutation():
     writes = []
     engine = SwarmV2Engine(commander=commander(Plans(initial, [])),
         executor=BoundedTaskExecutor(worker_factory=UnsafeWorker, max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
         checkpoint_sink=lambda phase, value: writes.append(value))
     with pytest.raises(ValueError, match="unsafe evidence"):
         engine.run({"id": "run-1", "input": {"objective": "safe", "commander_model": "fake"}})
@@ -196,7 +248,7 @@ def test_over_budget_replan_rejected_before_followup_execution():
     from backend.engines.swarm_v2 import RemainingBudget
     engine = SwarmV2Engine(commander=commander(client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls), max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
         remaining_budget=lambda: (RemainingBudget(
             cost_units=100, tool_calls=30, tasks=10, model_calls=10)
             if not calls else RemainingBudget(
@@ -222,7 +274,7 @@ def test_logically_equal_json_values_do_not_create_false_conflicts():
         commander=commander(Plans(plan([planned]), [
             {"decision": "FINISH", "plan": None, "reason": "done"}])),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker([]), max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
         evidence_loader=lambda _: refs, event_sink=lambda kind, payload: events.append((kind, payload)),
     )
     result = engine.run({"id": "run-1", "input": {
@@ -240,7 +292,7 @@ def test_replan_cannot_mutate_a_completed_task():
     engine = SwarmV2Engine(
         commander=commander(client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls), max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
     )
     with pytest.raises(ValueError, match="cannot revise or discard"):
         engine.run({"id": "run-1", "input": {
@@ -254,7 +306,7 @@ def test_finish_fails_closed_when_required_evidence_is_missing():
         commander=commander(Plans(initial, [
             {"decision": "FINISH", "plan": None, "reason": "done"}])),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker([]), max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
     )
     with pytest.raises(ValueError, match="completion criteria"):
         engine.run({"id": "run-1", "input": {

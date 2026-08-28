@@ -21,7 +21,7 @@ from backend.engines.swarm_v2.normalization import (
 from backend.schemas import ClaimCreate, SourceCreate
 from test_swarm_v2 import plan, task
 from test_swarm_v2_evidence import GuardedEvidenceRepository
-from test_swarm_v2_stage1_e2e import Plans, VerifyGateway, Worker, commander
+from test_swarm_v2_stage1_e2e import Plans, StubResolver, VerifyGateway, Worker, commander
 
 
 # --- pure normalization contract ---------------------------------------------
@@ -100,7 +100,7 @@ def run_engine(refs):
         commander=commander(Plans(plan([planned]), [
             {"decision": "FINISH", "plan": None, "reason": "done"}])),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker([]), max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
         evidence_loader=lambda _: list(refs),
         event_sink=lambda kind, payload: events.append((kind, payload)))
     result = engine.run({"id": "run-1", "input": {"objective": "scope", "commander_model": "fake"}})
@@ -161,7 +161,7 @@ def test_engine_preserves_original_evidence_values():
         commander=commander(Plans(plan([planned]), [
             {"decision": "FINISH", "plan": None, "reason": "done"}])),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker([]), max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake"),
+        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
         evidence_loader=lambda _: list(refs),
         checkpoint_sink=lambda phase, value: checkpoints.append(value))
     result = engine.run({"id": "run-1", "input": {"objective": "scope", "commander_model": "fake"}})

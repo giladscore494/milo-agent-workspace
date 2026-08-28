@@ -23,6 +23,7 @@ The tracker never sees or stores API keys; configuration is numeric only.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -34,6 +35,95 @@ from backend.runtime import CancellationRequested
 
 def paid_execution_enabled() -> bool:
     return os.getenv("MILO_ENABLE_PAID_EXECUTION", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# The cumulative dimensions of a run's durable usage snapshot. EVERY one of
+# them only ever grows while a run executes, which is what makes a
+# component-wise maximum of two snapshots of the same run safe: it can never
+# hand back capacity a snapshot already recorded as spent.
+#
+# `total_tokens` is deliberately NOT here: it is derived (input + output) and
+# is recomputed from the merged components rather than maximised on its own.
+# `reserved_input_tokens` / `reserved_output_tokens` are not here either --
+# they are in-flight reservations the previous process no longer owns, and
+# they never enter a snapshot at all.
+CUMULATIVE_USAGE_COUNTERS = (
+    "model_calls", "input_tokens", "output_tokens", "retries",
+    "provider_backpressure_events", "agent_steps",
+)
+# elapsed_seconds is wall-clock rather than a counter, but it behaves the same
+# way for budget purposes: a LARGER elapsed time leaves LESS run duration, so
+# taking the maximum stays the conservative direction here too.
+CUMULATIVE_USAGE_AMOUNTS = ("estimated_cost", "actual_cost", "elapsed_seconds")
+USAGE_SNAPSHOT_FIELDS = frozenset(
+    {*CUMULATIVE_USAGE_COUNTERS, *CUMULATIVE_USAGE_AMOUNTS, "total_tokens"})
+
+
+def _usage_counter(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("budget snapshot contains an invalid counter")
+    return value
+
+
+def _usage_amount(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("budget snapshot contains an invalid amount")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric < 0:
+        raise ValueError("budget snapshot contains an invalid amount")
+    return numeric
+
+
+def merge_usage_snapshots(*snapshots: Any) -> dict[str, Any]:
+    """Fold durable usage snapshots of ONE run into the most advanced of them.
+
+    A run records its usage in more than one durable place and they advance at
+    different rates: ``runs.usage`` is rewritten after every settled provider
+    call, while an engine checkpoint is only written at task and batch
+    boundaries. A crash between the two therefore leaves the checkpoint
+    STALER than the run row, and restoring the checkpoint alone would hand
+    back model calls, tokens and cost the run had already durably spent.
+
+    The merge is a component-wise maximum over the cumulative dimensions, so
+    the result is never lower than ANY input on any dimension, whichever
+    source happens to be ahead. Empty and absent snapshots contribute nothing
+    (a run that never spent anything stores ``{}``), and an empty result means
+    there is nothing to restore.
+
+    Fail-closed on the way in: an invalid counter or amount raises rather than
+    being treated as absent, because silently dropping a corrupt value is
+    indistinguishable from refunding it. Keys outside the known cumulative set
+    are ignored rather than rejected, so a snapshot written by a future
+    release cannot brick a resume -- this release simply cannot enforce a
+    dimension it does not know about.
+    """
+    merged: dict[str, float] = {}
+    contributed = False
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict) or not snapshot:
+            continue
+        contributed = True
+        for name in CUMULATIVE_USAGE_COUNTERS:
+            if name in snapshot:
+                merged[name] = max(merged.get(name, 0), _usage_counter(snapshot[name]))
+        for name in CUMULATIVE_USAGE_AMOUNTS:
+            if name in snapshot:
+                merged[name] = max(merged.get(name, 0.0), _usage_amount(snapshot[name]))
+        declared = snapshot.get("total_tokens")
+        if declared is not None and _usage_counter(declared) != (
+                _usage_counter(snapshot.get("input_tokens", 0)) +
+                _usage_counter(snapshot.get("output_tokens", 0))):
+            raise ValueError("budget snapshot token total is inconsistent")
+    if not contributed:
+        return {}
+    restored: dict[str, Any] = {name: int(merged.get(name, 0))
+                                for name in CUMULATIVE_USAGE_COUNTERS}
+    restored.update({name: float(merged.get(name, 0.0))
+                     for name in CUMULATIVE_USAGE_AMOUNTS})
+    # Derived, never maximised independently: restore_snapshot requires the
+    # declared total to equal the components it is restoring.
+    restored["total_tokens"] = restored["input_tokens"] + restored["output_tokens"]
+    return restored
 
 
 class BudgetExceeded(Exception):
@@ -237,39 +327,18 @@ class BudgetTracker:
         """
         if not isinstance(snapshot, dict):
             raise ValueError("budget snapshot must be an object")
-        allowed = {
-            "model_calls", "input_tokens", "output_tokens", "total_tokens",
-            "estimated_cost", "actual_cost", "retries",
-            "provider_backpressure_events", "agent_steps", "elapsed_seconds",
-        }
-        if set(snapshot) - allowed:
+        if set(snapshot) - USAGE_SNAPSHOT_FIELDS:
             raise ValueError("budget snapshot contains unknown fields")
-        integer_fields = (
-            "model_calls", "input_tokens", "output_tokens", "retries",
-            "provider_backpressure_events", "agent_steps",
-        )
-        parsed_ints: dict[str, int] = {}
-        for name in integer_fields:
-            value = snapshot.get(name, 0)
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError("budget snapshot contains an invalid counter")
-            parsed_ints[name] = value
+        parsed_ints = {name: _usage_counter(snapshot.get(name, 0))
+                       for name in CUMULATIVE_USAGE_COUNTERS}
         declared_total = snapshot.get(
             "total_tokens", parsed_ints["input_tokens"] + parsed_ints["output_tokens"]
         )
         if (isinstance(declared_total, bool) or not isinstance(declared_total, int) or
                 declared_total != parsed_ints["input_tokens"] + parsed_ints["output_tokens"]):
             raise ValueError("budget snapshot token total is inconsistent")
-        import math
-        parsed_floats: dict[str, float] = {}
-        for name in ("estimated_cost", "actual_cost", "elapsed_seconds"):
-            value = snapshot.get(name, 0)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError("budget snapshot contains an invalid amount")
-            numeric = float(value)
-            if not math.isfinite(numeric) or numeric < 0:
-                raise ValueError("budget snapshot contains an invalid amount")
-            parsed_floats[name] = numeric
+        parsed_floats = {name: _usage_amount(snapshot.get(name, 0))
+                         for name in CUMULATIVE_USAGE_AMOUNTS}
         with self._lock:
             if any((self.model_calls, self.input_tokens, self.output_tokens,
                     self.estimated_cost, self.actual_cost, self.retries,

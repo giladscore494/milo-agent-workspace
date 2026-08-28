@@ -5,7 +5,7 @@ import time
 from typing import Any
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
-from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, paid_execution_enabled
+from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, merge_usage_snapshots, paid_execution_enabled
 from backend.config import get_settings
 from backend.errors import AppError
 from backend.repository import Repository, SupabaseRepository
@@ -347,6 +347,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     CommanderModelResolver, EvidenceReference, GenericWorker, ModelGateway,
                     PlanLimits, PlanValidator, RemainingBudget, SwarmV2Adapter, Verifier)
                 from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+                from backend.engines.swarm_v2.grounding import RepositoryEvidenceResolver
                 from backend.provider_scheduler import ProviderScheduler
                 from backend.tools import ToolContext, ToolRegistry
 
@@ -400,7 +401,13 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                         model_calls=model_calls,
                     )
                 return SwarmV2Adapter(commander=commander, executor=executor,
-                    verifier=Verifier(gateway=gateway, model=commander_model),
+                    # The resolver is the Verifier's ONLY route to durable
+                    # evidence: it is constructed here, in the trusted worker
+                    # wiring that already holds the repository and the run, so
+                    # the Verifier itself never gains database, web or tool
+                    # access of its own.
+                    verifier=Verifier(gateway=gateway, model=commander_model,
+                                      resolver=RepositoryEvidenceResolver(repo, run_id=run_id)),
                     evidence_loader=lambda _: [EvidenceReference.model_validate(item)
                                                for item in board.references()],
                     checkpoint_sink=save_checkpoint, event_sink=forward_event,
@@ -408,14 +415,30 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             swarm_engine_builder = make_swarm_engine
         try:
             # Restore cumulative V2 usage before constructing any model path.
-            # A restarted worker must not regain per-run budget capacity.
-            if workflow_key == "swarm_v2" and latest_checkpoint:
-                checkpoint_usage = latest_checkpoint.get("token_usage") or {}
-                if not checkpoint_usage:
-                    checkpoint_usage = (((latest_checkpoint.get("artifacts") or {})
-                                         .get("swarm_state") or {})
-                                        .get("usage_snapshot") or {})
-                tracker.restore_snapshot(dict(checkpoint_usage))
+            # A restarted worker must not regain per-run budget capacity, so
+            # the restore takes the MOST ADVANCED durable snapshot rather than
+            # simply the checkpoint's. runs.usage is rewritten after every
+            # settled provider call, while a checkpoint is only written at
+            # task and verifier-batch boundaries: a crash in that window
+            # leaves the checkpoint STALER than the run row, and trusting it
+            # alone would refund calls, tokens and cost the run had already
+            # durably spent. The component-wise maximum is never lower than
+            # either source on any dimension, so it holds whichever one is
+            # ahead -- including a run row that a stale-lease rejection left
+            # BEHIND its own checkpoint.
+            if workflow_key == "swarm_v2":
+                checkpoint_usage: dict[str, Any] = {}
+                if latest_checkpoint:
+                    checkpoint_usage = latest_checkpoint.get("token_usage") or {}
+                    if not checkpoint_usage:
+                        checkpoint_usage = (((latest_checkpoint.get("artifacts") or {})
+                                             .get("swarm_state") or {})
+                                            .get("usage_snapshot") or {})
+                # A run that never spent anything stores {} in both places, so
+                # a first attempt merges to nothing and restores nothing.
+                restored = merge_usage_snapshots(run.get("usage"), checkpoint_usage)
+                if restored:
+                    tracker.restore_snapshot(restored)
             selected_engine = resolved_engine.factory()
             # V2 owns its versioned checkpoint compatibility checks. V1 keeps
             # its existing artifact-based resume path above unchanged.

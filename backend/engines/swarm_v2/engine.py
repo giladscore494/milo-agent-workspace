@@ -8,9 +8,10 @@ from .commander import Commander
 from .contracts import EvidenceReference, RemainingBudget, VerificationVerdict
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
+from .grounding import VERIFIER_GROUNDING_VERSION
 from .normalization import CanonicalScope, canonical_scope_key, canonical_value_key
 from .state import SwarmState
-from .verifier import Verifier, VerifierProgress, plan_verification
+from .verifier import Verifier, VerifierProgress
 from .worker import TaskResult
 
 
@@ -43,7 +44,8 @@ class SwarmV2Engine:
         # exception strings, credentials and reasoning never reach this sink.
         allowed = {"task_id", "status", "code", "tool", "graph_revision", "decision",
                    "claim_id", "source_id", "conflict_id", "verdict",
-                   "batch_index", "batch_count", "claim_count"}
+                   "batch_index", "batch_count", "claim_count",
+                   "source_count", "missing_context_count"}
         safe = {key: value for key, value in payload.items() if key in allowed and
                 (value is None or isinstance(value, (str, int, float, bool)))}
         if self._event_sink:
@@ -147,18 +149,36 @@ class SwarmV2Engine:
                           conflict_ids: set[str]) -> list[VerificationVerdict]:
         """Verify every claim under an exact, resumable model-call budget.
 
-        The deterministic partitioner that the Verifier executes also sizes
-        this pre-flight check, so the run never starts a verifier sequence it
-        already knows it cannot finish. Only the REMAINING batches are
-        charged: batches whose verdicts are already in the checkpoint are not
-        required again. BudgetTracker stays the hard per-call authority and a
-        BudgetExceeded refusal is never laundered into a verdict.
+        The plan is prepared ONCE -- source evidence resolved, missing-context
+        claims settled, grounded batches partitioned -- and that same prepared
+        plan both sizes this pre-flight check and is executed, so the run never
+        starts a verifier sequence it already knows it cannot finish and the
+        estimate can never disagree with what runs. Only the REMAINING batches
+        are charged: batches whose verdicts are already in the checkpoint are
+        not required again. BudgetTracker stays the hard per-call authority and
+        a BudgetExceeded refusal is never laundered into a verdict.
+
+        Under a version-0 checkpoint the prepared plan deliberately re-verifies
+        model-backed verdicts that predate grounded verification. That costs
+        real model calls, so it is charged here like any other remaining batch;
+        the restored cumulative usage is never rewound to pay for it.
         """
         existing = dict(state.verifier_state)
-        required_verifier_calls = len(plan_verification(
-            evidence, conflict_claim_ids=conflict_ids, existing_verdicts=existing).batches)
-        if required_verifier_calls > self._remaining_budget().model_calls:
+        plan = self._verifier.prepare(
+            evidence, conflict_claim_ids=conflict_ids, existing_verdicts=existing,
+            grounding_version=state.verifier_grounding_version)
+        if len(plan.batches) > self._remaining_budget().model_calls:
             raise ValueError("verification exceeds remaining model-call budget")
+        # Legacy ungrounded verdicts are dropped from durable state together
+        # with the version bump, so no later resume can mistake one for
+        # grounded progress. Under version 1 this is the same map plus the
+        # deterministic and missing-context verdicts.
+        state.verifier_state = {v.claim_id: v.model_dump(mode="json") for v in plan.settled}
+        state.verifier_grounding_version = VERIFIER_GROUNDING_VERSION
+        self._emit("grounding_context_resolved",
+                   {"claim_count": sum(len(batch) for batch in plan.batches),
+                    "source_count": plan.source_count,
+                    "missing_context_count": plan.missing_context_count})
 
         def record(progress: VerifierProgress) -> None:
             # Validated verdicts, the authoritative usage snapshot and the
@@ -177,8 +197,7 @@ class SwarmV2Engine:
                             "batch_count": progress.batch_count,
                             "claim_count": progress.claim_count})
 
-        verdicts = self._verifier.verify(evidence, conflict_claim_ids=conflict_ids,
-                                         existing_verdicts=existing, batch_completed=record)
+        verdicts = self._verifier.verify_prepared(plan, batch_completed=record)
         state.verifier_state = {v.claim_id: v.model_dump(mode="json") for v in verdicts}
         state.usage_snapshot = dict(self._usage_snapshot())
         self._emit("verification_completed", {"status": "completed"})
