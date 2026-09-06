@@ -32,7 +32,6 @@
   --reading: 56rem;
   --rail-left: 288px;
   --rail-right: 372px;
-  --desktop: 1100px;
 }
 
 * { box-sizing: border-box; }
