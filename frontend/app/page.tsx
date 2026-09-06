@@ -2,15 +2,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, api, executionUiEnabled, newIdempotencyKey } from '@/lib/api';
 import { getCurrentSession, onAuthStateChange, signInWithSupabase, signOutFromSupabase, SupabaseSession } from '@/lib/supabaseClient';
-import { initialWorkspaceState } from '@/lib/runReducer';
 import { isTerminalRunStatus, isPartialSuccessRunStatus } from '@/lib/runStatus';
-import { normalizeRunUsage } from '@/lib/runUsage';
-import { SwarmRunViewModel, summarizeSwarmRun } from '@/lib/swarmViewModel';
 import { useRunRealtime } from '@/lib/useRunRealtime';
-import { AgentState, Conversation, InternetPolicy, Project, Proposal } from '@/lib/types';
-import { redactSecrets, safeText } from '@/lib/sanitize';
+import { Conversation, Project, Proposal } from '@/lib/types';
+import { AuthScreen, SessionRestoreScreen } from '@/components/auth/AuthScreen';
+import { ConversationView } from '@/components/conversation/ConversationView';
+import { TaskComposer } from '@/components/conversation/TaskComposer';
+import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector';
+import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
+import { CurrentRunPanel } from '@/components/run/CurrentRunPanel';
+import { RunOutputPanel } from '@/components/run/RunOutputPanel';
+import { WorkspaceShell } from '@/components/workspace/WorkspaceShell';
+import { WorkspaceSidebar } from '@/components/workspace/WorkspaceSidebar';
 
-const internetLabels: InternetPolicy[] = ['forbidden','allowed','required','conditional','requested','approved','denied','active'];
 const HARDENING_NOTE = 'Execution controls are hidden: the execution UI flag is off. Backend execution flags and authorization stay authoritative either way.';
 
 function activeRunStorageKey(conversationId: string): string {
@@ -41,9 +45,19 @@ function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
 }
 
+/**
+ * Orchestration boundary for the workspace.
+ *
+ * Every API call, every piece of session, project, conversation, proposal and
+ * run state, the idempotency-key lifetime, the active-run session storage and
+ * the polling hook live here. The components below are presentational: they
+ * receive typed props and report intent back through callbacks, so no state
+ * has a second owner.
+ */
 export default function WorkspacePage() {
   const executionUi = executionUiEnabled();
-  const [mobileOpen, setMobileOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState('');
@@ -59,6 +73,7 @@ export default function WorkspacePage() {
   const [conversationError, setConversationError] = useState('');
   const [creatingConversation, setCreatingConversation] = useState(false);
 
+  const [proposalOpen, setProposalOpen] = useState(false);
   const [proposalRequest, setProposalRequest] = useState('');
   const [proposal, setProposal] = useState<Proposal>();
   const [proposalError, setProposalError] = useState('');
@@ -74,7 +89,7 @@ export default function WorkspacePage() {
   const [confirmingCancel, setConfirmingCancel] = useState(false);
   const [cancelError, setCancelError] = useState('');
 
-  const [tab, setTab] = useState('Agents');
+  const [tab, setTab] = useState<InspectorTab>('Agents');
   // The project's trusted workflow_key selects V2 vs V1 presentation; the
   // frontend never guesses the engine from event shapes.
   const { state, mode, swarm } = useRunRealtime(executionUi ? activeRunId : undefined, selectedProject?.workflow_key);
@@ -149,7 +164,7 @@ export default function WorkspacePage() {
     setActiveRunId(undefined);
     setProposal(undefined);
     setConversationError('');
-    setMobileOpen(false);
+    setSidebarOpen(false);
     loadConversations(project);
   }
 
@@ -157,6 +172,7 @@ export default function WorkspacePage() {
     setActiveConversation(conversation);
     setRunError('');
     setCancelError('');
+    setSidebarOpen(false);
     // Reopen an existing run after refresh or navigation.
     setActiveRunId(readStoredRunId(conversation.id));
   }
@@ -248,210 +264,109 @@ export default function WorkspacePage() {
     }
   }
 
-  if (session === undefined) return <main className="auth-only"><p>Restoring your MILO session…</p></main>;
+  if (session === undefined) return <SessionRestoreScreen/>;
   if (!session) return (
-    <main className="auth-only">
-      <h1>MILO</h1>
-      <p>Sign in to access the authenticated workspace.</p>
-      <input aria-label="Email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email"/>
-      <input aria-label="Password" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="Password"/>
-      <button onClick={login}>Login</button>
-      {authError && <p role="alert">{authError}</p>}
-    </main>
+    <AuthScreen
+      email={email}
+      password={password}
+      error={authError}
+      onEmailChange={setEmail}
+      onPasswordChange={setPassword}
+      onSubmit={login}
+    />
   );
-
-  const projectsLoading = projects === undefined;
-  const conversationsLoading = selectedProject !== undefined && conversations === undefined;
 
   return (
-    <main className="shell">
-      <section className="auth-panel">
-        <b>{session.user?.email ?? 'Authenticated'}</b>
-        <button onClick={logout}>Logout</button>
-        {!executionUi && <small>{HARDENING_NOTE}</small>}
-      </section>
-      <button className="mobile-menu" onClick={() => setMobileOpen(true)}>☰ Workspace</button>
-      <aside className={`sidebar ${mobileOpen ? 'open' : ''}`}>
-        <button className="close" onClick={() => setMobileOpen(false)}>×</button>
-        <h1>MILO</h1>
-        <section>
-          <h2>Projects</h2>
-          {projectsLoading && <p>Loading your projects…</p>}
-          {projectsError && <div role="alert"><p>{safeText(projectsError)}</p><button onClick={loadProjects}>Retry loading projects</button></div>}
-          {!projectsLoading && !projectsError && projects.length === 0 && <p>No projects are assigned to your account yet. Ask an operator to add your project membership.</p>}
-          {!projectsLoading && projects.map(project => (
-            <button key={project.id} className={`nav-card ${selectedProject?.id === project.id ? 'active' : ''}`} onClick={() => selectProject(project)}>
-              <span>{safeText(project.name)}</span>
-              <small>{safeText(project.slug)}</small>
-            </button>
-          ))}
-        </section>
-        <section>
-          <h2>Conversations</h2>
-          {conversationsLoading && <p>Loading conversations…</p>}
-          {!selectedProject && <p>Select a project to start a conversation.</p>}
-          {selectedProject && !conversationsLoading && (conversations?.length ?? 0) === 0 && <p>No conversations yet in this project.</p>}
-          {(conversations ?? []).map(conversation => (
-            <button key={conversation.id} className={`nav-card ${activeConversation?.id === conversation.id ? 'active' : ''}`} onClick={() => selectConversation(conversation)}>
-              <span>{safeText(conversation.title || 'Untitled conversation')}</span>
-            </button>
-          ))}
-        </section>
-      </aside>
-      <section className="chat">
-        <header>
-          <div>
-            <p className="eyebrow">Backend-authoritative agent workspace</p>
-            <h2>{selectedProject ? safeText(selectedProject.name) : 'Select a project to begin'}</h2>
-          </div>
-          <span className="badge idle">{executionUi ? `execution UI enabled • backend flags authoritative` : 'read-only • execution disabled'}</span>
-        </header>
-        <div className="messages">
-          {selectedProject ? (
-            <article className="message user">
-              <b>New conversation in {safeText(selectedProject.name)}</b>
-              {selectedProject.description && <p>{safeText(selectedProject.description)}</p>}
-              <input aria-label="Conversation title" value={conversationTitle} onChange={e => setConversationTitle(e.target.value)} placeholder="Conversation title (optional)"/>
-              <button className="primary" onClick={createConversation} disabled={creatingConversation}>{creatingConversation ? 'Creating conversation…' : 'New conversation'}</button>
-              {conversationError && <p role="alert">{safeText(conversationError)}</p>}
-            </article>
-          ) : (
-            <article className="message user"><b>No project selected</b><p>Choose one of your authorized projects from the sidebar. Projects are loaded through the authenticated gateway; membership is enforced server-side.</p></article>
-          )}
-          {activeConversation && (
-            <article className="message assistant">
-              <b>Conversation</b>
-              <p>{safeText(activeConversation.title || 'Untitled conversation')}</p>
-              <small>ID {safeText(activeConversation.id)} • project {safeText(activeConversation.project_id)}</small>
-            </article>
-          )}
-
-          {executionUi && selectedProject ? (
-            <article className="proposal">
-              <h3>Workflow proposal</h3>
-              <textarea aria-label="Proposal request" value={proposalRequest} onChange={e => setProposalRequest(e.target.value)} placeholder="Describe the workflow you need…"/>
-              <div className="grid">
-                <button className="primary" onClick={generateProposal} disabled={proposalBusy || !proposalRequest.trim()}>{proposalBusy ? 'Working…' : 'Generate proposal'}</button>
-                {proposal && <button onClick={reviseProposal} disabled={proposalBusy || !proposalRequest.trim()}>Revise with new request</button>}
-              </div>
-              {proposalError && <p role="alert">{safeText(proposalError)}</p>}
-              {proposal && (
-                <div>
-                  <p><span className={`badge ${proposal.status}`}>{safeText(proposal.status)}</span></p>
-                  <p>{safeText(proposal.user_request)}</p>
-                  {(proposal.draft?.agents ?? []).map((agent: any) => (
-                    <p key={agent.key ?? agent.role}>
-                      <b>{safeText(agent.role ?? agent.key)}</b>{' '}
-                      <InternetBadge policy={(agent.internet_policy ?? 'conditional') as InternetPolicy} reason={agent.internet_reason}/>
-                    </p>
-                  ))}
-                  <pre>{JSON.stringify(redactSecrets({ steps: proposal.draft?.workflow ?? proposal.draft?.steps ?? [], budget: proposal.estimates, critiques: proposal.critiques }), null, 2)}</pre>
-                  <div className="grid">
-                    <button className="primary" onClick={() => decideProposal('approve')} disabled={proposalBusy || proposal.status !== 'approved'}>Approve</button>
-                    <button onClick={() => decideProposal('reject')} disabled={proposalBusy}>Reject</button>
-                  </div>
-                </div>
-              )}
-            </article>
-          ) : (
-            <article className="proposal">
-              <h3>Workflow proposal</h3>
-              <p>{HARDENING_NOTE}</p>
-            </article>
-          )}
-
-          {executionUi && activeConversation ? (
-            <article className="run-card">
-              <h3>Run</h3>
-              <textarea aria-label="Task content" value={taskContent} onChange={e => setTaskContent(e.target.value)} placeholder="Describe the task for this run…"/>
-              <button className="primary" onClick={startRun} disabled={submittingRun || !taskContent.trim()}>{submittingRun ? 'Sending…' : 'Send task'}</button>
-              {runError && <p role="alert">{safeText(runError)}</p>}
-              {activeRunId && (
-                <dl>
-                  <dt>Run</dt><dd>{safeText(activeRunId)}</dd>
-                  <dt>Status</dt><dd>{safeText(runStatus ?? 'loading…')}</dd>
-                  <dt>Phase</dt><dd>{safeText(state.currentPhase)}</dd>
-                  <dt>Connection</dt><dd>{mode === 'reconnecting' ? 'reconnecting…' : mode}</dd>
-                </dl>
-              )}
-              {activeRunId && !runIsTerminal && !confirmingCancel && (
-                <button onClick={() => setConfirmingCancel(true)}>Cancel run</button>
-              )}
-              {activeRunId && confirmingCancel && (
-                <div>
-                  <input aria-label="Cancellation reason" value={cancelReason} onChange={e => setCancelReason(e.target.value)} placeholder="Reason (optional)"/>
-                  <button className="primary" onClick={confirmCancelRun}>Confirm cancellation</button>
-                  <button onClick={() => setConfirmingCancel(false)}>Keep running</button>
-                </div>
-              )}
-              {cancelError && <p role="alert">{safeText(cancelError)}</p>}
-              {runIsTerminal && (
-                <p>
-                  Run finished with status <b>{safeText(runStatus)}</b>.
-                  {isPartialSuccessRunStatus(runStatus) && ' Partial success is not a completed run: some tasks, coverage gaps, conflicts or verdicts remain outstanding.'}
-                </p>
-              )}
-              {launchState && (
-                <p>
-                  Launch state <b>{safeText(launchState)}</b>
-                  {launchReconciliationRequired ? ' — reconciliation required.' : '.'}
-                </p>
-              )}
-            </article>
-          ) : (
-            <article className="run-card">
-              <h3>Live run</h3>
-              <p>{executionUi ? 'Select or create a conversation to start a run.' : 'No active run. Run creation and execution control are disabled until a separately approved execution stage.'}</p>
-            </article>
-          )}
-
-          <article className="message assistant">
-            <b>Live event stream</b>
-            {state.events.length === 0 && <p>{executionUi ? 'No events yet.' : 'No events. Realtime and polling stay disabled while execution surfaces are off.'}</p>}
-            {state.events.slice(-50).map(event => (
-              <div className="event" key={event.id}>
-                <small>{safeText(event.event_type)}</small>
-                <span>{safeText(event.agent ?? '')}</span>
-                <small>{safeText(event.phase ?? '')}</small>
-                <p>{safeText(event.message ?? '')}</p>
-              </div>
-            ))}
-          </article>
-          <article className="artifacts">
-            <b>Final artifacts</b>
-            <pre>{JSON.stringify(redactSecrets(state.run?.output ?? {}), null, 2)}</pre>
-          </article>
-        </div>
-      </section>
-      <aside className="inspector">
-        <nav>{['Agents','Workflow','Sources','Claims','Conflicts','Costs','Developer'].map(t => <button className={tab === t ? 'selected' : ''} onClick={() => setTab(t)} key={t}>{t}</button>)}</nav>
-        <Inspector tab={tab} agents={agents} state={state} swarm={swarm}/>
-      </aside>
-    </main>
+    <WorkspaceShell
+      sidebarOpen={sidebarOpen}
+      inspectorOpen={inspectorOpen}
+      onSidebarOpenChange={setSidebarOpen}
+      onInspectorOpenChange={setInspectorOpen}
+      sidebar={
+        <WorkspaceSidebar
+          userEmail={session.user?.email}
+          executionUi={executionUi}
+          hardeningNote={HARDENING_NOTE}
+          projects={projects}
+          projectsError={projectsError}
+          selectedProjectId={selectedProject?.id}
+          onSelectProject={selectProject}
+          onRetryProjects={loadProjects}
+          conversations={conversations}
+          conversationsLoading={selectedProject !== undefined && conversations === undefined}
+          conversationError={conversationError}
+          activeConversationId={activeConversation?.id}
+          onSelectConversation={selectConversation}
+          conversationTitle={conversationTitle}
+          onConversationTitleChange={setConversationTitle}
+          onCreateConversation={createConversation}
+          creatingConversation={creatingConversation}
+          onLogout={logout}
+        />
+      }
+      inspector={
+        <RunInspector
+          executionUi={executionUi}
+          tab={tab}
+          onTabChange={setTab}
+          agents={agents}
+          state={state}
+          swarm={swarm}
+        />
+      }
+    >
+      <ConversationView
+        executionUi={executionUi}
+        project={selectedProject}
+        conversation={activeConversation}
+        composer={
+          <TaskComposer
+            executionUi={executionUi}
+            hasConversation={activeConversation !== undefined}
+            content={taskContent}
+            onContentChange={setTaskContent}
+            onSubmit={startRun}
+            submitting={submittingRun}
+            error={runError}
+          />
+        }
+      >
+        <WorkflowProposalPanel
+          executionUi={executionUi}
+          hasProject={selectedProject !== undefined}
+          hardeningNote={HARDENING_NOTE}
+          open={proposalOpen}
+          onOpenChange={setProposalOpen}
+          request={proposalRequest}
+          onRequestChange={setProposalRequest}
+          proposal={proposal}
+          error={proposalError}
+          busy={proposalBusy}
+          onGenerate={generateProposal}
+          onRevise={reviseProposal}
+          onDecide={decideProposal}
+        />
+        <CurrentRunPanel
+          executionUi={executionUi}
+          hasConversation={activeConversation !== undefined}
+          runId={activeRunId}
+          runStatus={runStatus}
+          phase={state.currentPhase}
+          connection={mode}
+          isTerminal={runIsTerminal}
+          isPartialSuccess={isPartialSuccessRunStatus(runStatus)}
+          launchState={launchState}
+          launchReconciliationRequired={launchReconciliationRequired}
+          confirmingCancel={confirmingCancel}
+          cancelReason={cancelReason}
+          cancelError={cancelError}
+          onCancelReasonChange={setCancelReason}
+          onRequestCancel={() => setConfirmingCancel(true)}
+          onConfirmCancel={confirmCancelRun}
+          onKeepRunning={() => setConfirmingCancel(false)}
+        />
+        <RunOutputPanel visible={executionUi && activeRunId !== undefined} output={state.run?.output} />
+      </ConversationView>
+    </WorkspaceShell>
   );
-}
-
-function InternetBadge({ policy, reason }: { policy: InternetPolicy; reason?: string }) {
-  return <span className={`internet ${policy}`}>{policy} internet — {safeText(reason || 'policy visible')}</span>;
-}
-
-function Inspector({ tab, agents, state, swarm }: { tab: string; agents: AgentState[]; state: typeof initialWorkspaceState; swarm: SwarmRunViewModel }) {
-  if (tab === 'Agents') return <>{agents.length === 0 && <p>No agents are running.</p>}{agents.map(agent => (
-    <div className="agent-card" key={agent.name}>
-      <b>{safeText(agent.name)}</b> <span className={`badge ${agent.status}`}>{safeText(agent.status)}</span>
-      <p>{safeText(agent.currentTask ?? agent.responsibility)}</p>
-      <InternetBadge policy={agent.internet} reason={agent.internetReason}/>
-    </div>
-  ))}{agents.length === 0 && internetLabels.map(p => <InternetBadge key={p} policy={p}/>)}</>;
-  // Swarm V2 shows logical tasks, plan revision and verification progress.
-  // Logical tasks, model calls and verifier batches stay separate quantities:
-  // there is no agent count here and none is derivable from them.
-  if (tab === 'Workflow') return state.events.length === 0 ? <p>No workflow activity yet.</p> : <pre>{JSON.stringify(redactSecrets(swarm.isSwarmV2 ? summarizeSwarmRun(swarm) : { phase: state.currentPhase, progress: state.progress, checkpoints: state.checkpoints.length }), null, 2)}</pre>;
-  if (tab === 'Sources') return state.sources.length === 0 ? <p>No sources recorded.</p> : <>{state.sources.map(source => <div className="source" key={source.id}><b>{safeText(source.title)}</b><small> {safeText(source.domain)} • {safeText(source.source_strength)}</small></div>)}</>;
-  if (tab === 'Claims') return <pre>{JSON.stringify(redactSecrets(state.claims), null, 2)}</pre>;
-  if (tab === 'Conflicts') return <pre>{JSON.stringify(redactSecrets(state.conflicts), null, 2)}</pre>;
-  // run.usage is the authoritative aggregate; the event-derived totals stay
-  // labelled as such and are never presented as the run's model-call count.
-  if (tab === 'Costs') return <pre>{JSON.stringify({ event_derived_tokens: state.tokens, event_derived_cost: state.cost, usage: normalizeRunUsage(state.run?.usage) }, null, 2)}</pre>;
-  return <pre>{JSON.stringify(redactSecrets({ events: state.events.length, checkpoints: state.checkpoints, validationErrors: state.validationErrors, rawErrors: state.rawErrors }), null, 2)}</pre>;
 }
