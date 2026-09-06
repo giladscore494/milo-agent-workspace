@@ -589,3 +589,272 @@ textarea { resize: vertical; min-height: 4.5rem; }
     scroll-behavior: auto !important;
   }
 }
+
+/* ---------- swarm v2 run card ---------- */
+
+/*
+ * The Swarm V2 execution surface. Every state is carried by text and by a
+ * shape; colour is reinforcement only. There is no progress bar anywhere in
+ * here, because the backend never reports a completion fraction.
+ */
+
+.swarm-card { gap: 0.9rem; }
+
+.swarm-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.swarm-card-heading { display: grid; gap: 0.1rem; min-width: 0; }
+
+.swarm-reconnect { border-color: rgba(211, 160, 87, 0.45); color: var(--warning); }
+
+.swarm-lifecycle { display: grid; gap: 0.2rem; justify-items: start; min-width: 0; }
+
+.swarm-headline {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 1.15rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+/* Live decoration only. It is rendered exclusively for a non-terminal run, so
+   a finished run cannot keep pulsing, and reduced motion stops the animation
+   without removing any information. */
+.swarm-pulse {
+  width: 0.55rem;
+  height: 0.55rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: swarm-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes swarm-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.78); }
+}
+
+.swarm-detail { color: var(--muted); overflow-wrap: anywhere; }
+
+.swarm-adjusted {
+  display: inline-block;
+  border: 1px solid rgba(211, 160, 87, 0.45);
+  color: var(--warning);
+  border-radius: 999px;
+  padding: 0.15rem 0.55rem;
+  font-size: 0.74rem;
+}
+
+.swarm-note-strong {
+  border: 1px solid rgba(211, 160, 87, 0.35);
+  background: rgba(211, 160, 87, 0.08);
+  color: #edd6ae;
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.6rem;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+/* Four named stages, never a ratio. auto-fit folds them to two columns on a
+   narrow viewport without any horizontal overflow. */
+.swarm-stages {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.swarm-stage {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.1rem 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  padding: 0.45rem 0.55rem;
+  min-width: 0;
+}
+
+.swarm-stage-icon { grid-row: span 2; font-size: 0.9rem; }
+/* The four stage names are a fixed, short vocabulary, so they wrap on word
+   boundaries; breaking "Executing" mid-word would be worse than a second line. */
+.swarm-stage-name { font-size: 0.86rem; font-weight: 600; }
+.swarm-stage-state { font-size: 0.72rem; color: var(--muted); overflow-wrap: anywhere; }
+
+/*
+ * Stage colour is keyed to the tone, not to the structural state, so a run that
+ * failed, was cancelled, timed out or exhausted its budget can never pick up
+ * the green "succeeded" treatment. `success` is reachable on the Finished cell
+ * only for `completed`; every other terminal outcome resolves to warning,
+ * failure or neutral, and the cell's own text names it.
+ */
+.swarm-stage[data-tone="active"] { border-color: rgba(91, 124, 250, 0.45); background: var(--accent-soft); }
+.swarm-stage[data-tone="active"] .swarm-stage-icon { color: var(--accent); }
+.swarm-stage[data-tone="success"] { border-color: rgba(87, 185, 140, 0.4); }
+.swarm-stage[data-tone="success"] .swarm-stage-icon { color: var(--success); }
+.swarm-stage[data-tone="warning"] { border-color: rgba(211, 160, 87, 0.5); background: rgba(211, 160, 87, 0.08); }
+.swarm-stage[data-tone="warning"] .swarm-stage-icon,
+.swarm-stage[data-tone="warning"] .swarm-stage-state { color: var(--warning); }
+.swarm-stage[data-tone="failure"] { border-color: rgba(224, 115, 111, 0.55); background: rgba(224, 115, 111, 0.08); }
+.swarm-stage[data-tone="failure"] .swarm-stage-icon,
+.swarm-stage[data-tone="failure"] .swarm-stage-state { color: var(--danger); }
+.swarm-stage[data-tone="neutral"] { border-color: var(--border-strong); }
+.swarm-stage[data-tone="neutral"] .swarm-stage-icon { color: var(--muted); }
+.swarm-stage[data-tone="pending"] .swarm-stage-name { color: var(--muted); }
+.swarm-stage[aria-current="step"] { box-shadow: inset 2px 0 0 var(--accent); }
+
+/* The outcome line and the verdict carry the same tone as the Finished cell. */
+.swarm-detail[data-tone="success"] { color: var(--success); }
+.swarm-detail[data-tone="warning"] { color: var(--warning); }
+.swarm-detail[data-tone="failure"] { color: var(--danger); }
+.swarm-detail[data-tone="neutral"] { color: var(--text); }
+
+.run-verdict[data-tone="warning"] { border-top-color: rgba(211, 160, 87, 0.4); }
+.run-verdict[data-tone="failure"] { border-top-color: rgba(224, 115, 111, 0.45); }
+
+.swarm-section {
+  display: grid;
+  gap: 0.45rem;
+  justify-items: start;
+  border-top: 1px solid var(--border);
+  padding-top: 0.7rem;
+  min-width: 0;
+}
+
+.swarm-section > * { max-width: 100%; }
+
+.swarm-commander { overflow-wrap: anywhere; }
+.swarm-commander-meta { color: var(--muted); }
+.swarm-decision { font-size: 0.78rem; color: var(--muted); overflow-wrap: anywhere; }
+
+.swarm-concurrency { font-size: 0.78rem; color: var(--accent); }
+
+/* A list, never a single active slot: several tasks legitimately run at once. */
+.swarm-tasks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.4rem;
+  width: 100%;
+  min-width: 0;
+}
+
+.swarm-task {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  align-items: start;
+  gap: 0.3rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-elevated);
+  padding: 0.5rem 0.6rem;
+  min-width: 0;
+}
+
+.swarm-task-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  /* A shared minimum keeps the task labels aligned down the list instead of
+     stepping in and out with the width of each status word. */
+  min-width: 6.5rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.swarm-task-icon { font-size: 0.85rem; }
+
+.swarm-task[data-status="running"] .swarm-task-status { color: var(--accent); }
+.swarm-task[data-status="completed"] .swarm-task-status { color: var(--success); }
+.swarm-task[data-status="failed"] .swarm-task-status { color: var(--danger); }
+.swarm-task[data-status="failed"] { border-color: rgba(224, 115, 111, 0.4); }
+
+.swarm-task-body { display: grid; gap: 0.15rem; min-width: 0; }
+.swarm-task-label { overflow-wrap: anywhere; }
+
+.swarm-task-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem 0.5rem;
+  font-size: 0.76rem;
+  color: var(--muted);
+  min-width: 0;
+}
+
+/* Generated separators only: nothing here changes the row's text content. */
+.swarm-task-meta > * + *::before { content: '· '; }
+
+.swarm-task-code { color: var(--danger); overflow-wrap: anywhere; }
+.swarm-task-counts { overflow-wrap: anywhere; }
+
+.swarm-facts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.swarm-fact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  padding: 0.2rem 0.6rem;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.swarm-fact-label { color: var(--muted); }
+.swarm-fact-value { font-variant-numeric: tabular-nums; }
+
+.swarm-usage {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  gap: 0.5rem;
+  width: 100%;
+  min-width: 0;
+}
+
+.swarm-usage-item { min-width: 0; display: grid; gap: 0.1rem; }
+.swarm-usage-item dt { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; overflow-wrap: anywhere; }
+.swarm-usage-item dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+/* Absent usage is unknown, and is styled as unknown rather than as a value. */
+.swarm-usage-item[data-known="false"] dd { color: var(--muted); font-style: italic; }
+
+.swarm-card-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.75rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.6rem;
+  min-width: 0;
+}
+
+@media (max-width: 560px) {
+  .swarm-headline { font-size: 1.05rem; }
+  /* Below this width the status chip sits above the label instead of beside
+     it, so a long task identifier never forces the page to scroll sideways. */
+  .swarm-task { grid-template-columns: minmax(0, 1fr); }
+  .swarm-task-status { min-width: 0; }
+  /* Two columns, not three: a third column is too narrow for the stage names. */
+  .swarm-stages { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
