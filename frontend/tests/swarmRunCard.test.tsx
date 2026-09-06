@@ -92,11 +92,51 @@ function detailText(container: HTMLElement): string | undefined {
   return container.querySelector('.swarm-detail')?.textContent ?? undefined;
 }
 
-function stageState(container: HTMLElement, stage: string): string | undefined {
-  const node = Array.from(container.querySelectorAll<HTMLElement>('.swarm-stage')).find(
+function stageCell(container: HTMLElement, stage: string): HTMLElement | undefined {
+  return Array.from(container.querySelectorAll<HTMLElement>('.swarm-stage')).find(
     (candidate) => candidate.querySelector('.swarm-stage-name')?.textContent === stage,
   );
-  return node?.dataset.state;
+}
+
+function stageState(container: HTMLElement, stage: string): string | undefined {
+  return stageCell(container, stage)?.dataset.state;
+}
+
+function stageTone(container: HTMLElement, stage: string): string | undefined {
+  return stageCell(container, stage)?.dataset.tone;
+}
+
+function stageIcon(container: HTMLElement, stage: string): string | undefined {
+  return stageCell(container, stage)?.querySelector('.swarm-stage-icon')?.textContent ?? undefined;
+}
+
+function stageLabel(container: HTMLElement, stage: string): string | undefined {
+  return stageCell(container, stage)?.querySelector('.swarm-stage-state')?.textContent ?? undefined;
+}
+
+/** Every tone present in the track; used to prove no stray success mark. */
+function trackTones(container: HTMLElement): string[] {
+  return Array.from(container.querySelectorAll<HTMLElement>('.swarm-stage')).map(
+    (node) => node.dataset.tone ?? '',
+  );
+}
+
+function footerStatus(container: HTMLElement): string | undefined {
+  return Array.from(container.querySelectorAll('.swarm-card-foot .note'))
+    .map((node) => node.textContent ?? '')
+    .find((text) => text.startsWith('Status '));
+}
+
+/**
+ * The backend writes the terminal EVENT before `runs.status` settles, so a card
+ * can legitimately see a terminal lifecycle while the run row still says
+ * "running". These streams reproduce exactly that window.
+ */
+function raceEvents(terminalEventType: string): RunEvent[] {
+  const events = smokeEventStream();
+  events.pop(); // drop the trailing run_completed
+  events.push(swarmEvent(terminalEventType, {}));
+  return events;
 }
 
 /** The plan plus two dependency-free tasks that genuinely start together. */
@@ -524,6 +564,177 @@ describe('secondary run detail', () => {
     expect(container.querySelector('script')).toBeNull();
     expect(container.querySelector('img')).toBeNull();
     expect(container.textContent).toContain('‹img src=x›');
+  });
+});
+
+describe('terminal outcomes are visually distinguishable', () => {
+  function terminalCard(status: string) {
+    return renderCard(viewModel({ events: smokeEventStream(), status, usage: SMOKE_USAGE }));
+  }
+
+  it('1. completed is the one outcome allowed a green success checkmark', () => {
+    const { container } = terminalCard('completed');
+    expect(stageTone(container, 'Finished')).toBe('success');
+    expect(stageIcon(container, 'Finished')).toBe('✓');
+    expect(stageLabel(container, 'Finished')).toBe('Completed');
+    expect(container.querySelector('.swarm-detail')?.getAttribute('data-tone')).toBe('success');
+    expect(container.querySelector('.run-verdict')?.getAttribute('data-tone')).toBe('success');
+  });
+
+  it.each([
+    ['2. partial_success', 'partial_success', 'warning', '⚠', 'Partial success'],
+    ['3. failed', 'failed', 'failure', '✕', 'Failed'],
+    ['4. cancelled', 'cancelled', 'neutral', '⊘', 'Cancelled'],
+    ['5. timed_out', 'timed_out', 'warning', '⚠', 'Timed out'],
+    ['6. budget_exhausted', 'budget_exhausted', 'warning', '⚠', 'Budget exhausted'],
+  ])('%s gets its own non-success treatment', (_name, status, tone, icon, label) => {
+    const { container } = terminalCard(status);
+    expect(stageTone(container, 'Finished')).toBe(tone);
+    expect(stageIcon(container, 'Finished')).toBe(icon);
+    expect(stageLabel(container, 'Finished')).toBe(label);
+    // The outcome is stated in words, so meaning never rests on colour.
+    expect(detailText(container)).toBe(label);
+    expect(container.querySelector('.swarm-detail')?.getAttribute('data-tone')).toBe(tone);
+  });
+
+  it.each(['partial_success', 'failed', 'cancelled', 'timed_out', 'budget_exhausted'])(
+    '%s shows no success checkmark anywhere in the track',
+    (status) => {
+      const { container } = terminalCard(status);
+      expect(trackTones(container)).not.toContain('success');
+      // Reached earlier stages report that they ended, not that they succeeded.
+      expect(stageLabel(container, 'Planning')).toBe('Ended');
+      expect(stageIcon(container, 'Planning')).not.toBe('✓');
+      expect(stageLabel(container, 'Finished')).not.toBe('Done');
+    },
+  );
+
+  it('completed keeps green checkmarks on the stages it did complete', () => {
+    const { container } = terminalCard('completed');
+    expect(trackTones(container)).toEqual(['success', 'success', 'success', 'success']);
+    expect(stageLabel(container, 'Planning')).toBe('Done');
+  });
+
+  it('failure is never dressed in the success tone', () => {
+    const { container } = terminalCard('failed');
+    expect(stageTone(container, 'Finished')).toBe('failure');
+    expect(container.querySelector('.swarm-stage[data-tone="success"]')).toBeNull();
+    expect(container.querySelector('.run-verdict')?.getAttribute('data-tone')).toBe('failure');
+  });
+
+  it('keeps the four structural stages and no percentage for every outcome', () => {
+    for (const status of ['completed', 'partial_success', 'failed', 'cancelled', 'timed_out', 'budget_exhausted']) {
+      const { container, unmount } = terminalCard(status);
+      const names = Array.from(container.querySelectorAll('.swarm-stage-name')).map((n) => n.textContent);
+      expect(names).toEqual(['Planning', 'Executing', 'Verifying', 'Finished']);
+      expect(container.textContent).not.toMatch(/%/);
+      unmount();
+    }
+  });
+});
+
+describe('7-11. a terminal event that outruns the run row', () => {
+  const RACE_CASES: Array<[string, string, string, string]> = [
+    ['7. run_completed', 'run_completed', 'completed', 'Completed'],
+    ['8a. run_partial_success', 'run_partial_success', 'partial_success', 'Partial success'],
+    ['8b. run_failed', 'run_failed', 'failed', 'Failed'],
+    ['8c. run_cancelled', 'run_cancelled', 'cancelled', 'Cancelled'],
+    ['8d. run_timed_out', 'run_timed_out', 'timed_out', 'Timed out'],
+    ['8e. budget_exhausted', 'budget_exhausted', 'budget_exhausted', 'Budget exhausted'],
+  ];
+
+  it.each(RACE_CASES)(
+    '%s resolves to one consistent outcome while the run row still says running',
+    (_name, eventType, phase, label) => {
+      const { container } = renderCard(
+        viewModel({ events: raceEvents(eventType), status: 'running', usage: SMOKE_USAGE }),
+      );
+      // Headline, detail, verdict and footer all quote the same resolved outcome.
+      expect(headlineText(container)).toBe('Finished');
+      expect(detailText(container)).toBe(label);
+      expect(stageLabel(container, 'Finished')).toBe(label);
+      expect(container.querySelector('.run-verdict')?.textContent).toContain(phase);
+      expect(footerStatus(container)).toBe(`Status ${phase}`);
+    },
+  );
+
+  it.each(RACE_CASES)('%s never reports the stale run status anywhere', (_name, eventType) => {
+    const { container } = renderCard(
+      viewModel({ events: raceEvents(eventType), status: 'running', usage: SMOKE_USAGE }),
+    );
+    const text = container.textContent ?? '';
+    // 9. the exact contradiction the reviewer saw must be impossible.
+    expect(text).not.toContain('Status running');
+    expect(text).not.toMatch(/finished with status running/i);
+    expect(text).not.toMatch(/finished with status queued/i);
+    expect(text).not.toMatch(/finished with status cancellation_requested/i);
+  });
+
+  it.each(RACE_CASES)('%s stops live animation and withdraws cancellation', (_name, eventType) => {
+    const { container } = renderCard(
+      viewModel({ events: raceEvents(eventType), status: 'running', usage: SMOKE_USAGE }),
+      { confirmingCancel: true },
+    );
+    // 10. a terminal lifecycle event alone is enough to end the live treatment.
+    expect(container.querySelector('.swarm-pulse')).toBeNull();
+    expect(container.querySelector('.swarm-card')?.getAttribute('data-live')).toBe('false');
+    expect(screen.queryByRole('button', { name: 'Cancel run' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Confirm cancellation' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Cancellation reason')).not.toBeInTheDocument();
+  });
+
+  it('still explains partial success when the run row has not caught up', () => {
+    // The explanation used to hang off the durable run status, so it vanished
+    // during exactly the window where the outcome is easiest to misread.
+    const { container } = renderCard(
+      viewModel({ events: raceEvents('run_partial_success'), status: 'running', usage: SMOKE_USAGE }),
+    );
+    expect(screen.getByText(/Partial success is not a completed run/)).toBeInTheDocument();
+    expect(container.querySelector('.run-verdict')?.getAttribute('data-tone')).toBe('warning');
+  });
+
+  it('a cancellation still in flight is not announced once the run is cancelled', () => {
+    const { container } = renderCard(
+      viewModel({ events: raceEvents('run_cancelled'), status: 'cancellation_requested', usage: SMOKE_USAGE }),
+    );
+    expect(detailText(container)).toBe('Cancelled');
+    expect(screen.queryByText(/Cancellation requested\./)).not.toBeInTheDocument();
+    expect(footerStatus(container)).toBe('Status cancelled');
+  });
+
+  it('a durable terminal run status still wins over the event-derived phase', () => {
+    // run_completed on the stream, but the run row already settled on failed.
+    const { container } = renderCard(
+      viewModel({ events: smokeEventStream(), status: 'failed', usage: SMOKE_USAGE }),
+    );
+    expect(detailText(container)).toBe('Failed');
+    expect(stageTone(container, 'Finished')).toBe('failure');
+    expect(footerStatus(container)).toBe('Status failed');
+  });
+
+  it('11. an active run still reports its own nonterminal status', () => {
+    const { container } = renderCard(viewModel({ events: concurrentStartEvents(), status: 'running' }));
+    expect(headlineText(container)).toBe('Executing');
+    expect(footerStatus(container)).toBe('Status running');
+    expect(container.querySelector('.run-verdict')).toBeNull();
+    expect(container.querySelector('.swarm-pulse')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Cancel run' })).toBeInTheDocument();
+  });
+
+  it('11b. a queued run reports queued and stays cancellable', () => {
+    const { container } = renderCard(viewModel({ events: [], status: 'queued' }));
+    expect(footerStatus(container)).toBe('Status queued');
+    expect(container.querySelector('.run-verdict')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Cancel run' })).toBeInTheDocument();
+  });
+
+  it('11c. a cancellation request is still announced while the run is live', () => {
+    const { container } = renderCard(
+      viewModel({ events: concurrentStartEvents(), status: 'cancellation_requested' }),
+    );
+    expect(screen.getByText(/Cancellation requested\./)).toBeInTheDocument();
+    expect(footerStatus(container)).toBe('Status cancellation_requested');
+    expect(container.querySelector('.run-verdict')).toBeNull();
   });
 });
 

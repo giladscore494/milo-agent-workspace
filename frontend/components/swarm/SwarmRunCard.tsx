@@ -63,7 +63,9 @@ export function SwarmRunCard({
   const verification = describeSwarmVerification(swarm);
   const usage = describeSwarmUsage(swarm);
   const finished = lifecycle.finished;
-  const cancellationRequested = swarm.runStatus === 'cancellation_requested';
+  // Only meaningful while the run is still live: once a terminal outcome is
+  // resolved, saying the run "stays active" would contradict the verdict.
+  const cancellationRequested = !finished && swarm.runStatus === 'cancellation_requested';
 
   return (
     <section className="panel swarm-card" data-live={lifecycle.live} aria-labelledby="swarm-run-title">
@@ -86,7 +88,9 @@ export function SwarmRunCard({
           {lifecycle.live && <span className="swarm-pulse" aria-hidden="true" />}
           <span className="swarm-headline-text">{lifecycle.headline}</span>
         </p>
-        {lifecycle.detail && <p className="swarm-detail">{lifecycle.detail}</p>}
+        {lifecycle.detail && (
+          <p className="swarm-detail" data-tone={lifecycle.outcomeTone}>{lifecycle.detail}</p>
+        )}
         {lifecycle.planAdjusted && <p className="swarm-adjusted">Plan adjusted</p>}
       </div>
 
@@ -178,9 +182,9 @@ export function SwarmRunCard({
       {cancelError && <p className="alert" role="alert">{safeText(cancelError)}</p>}
 
       {finished && (
-        <p className="run-verdict">
-          Run finished with status <b>{safeText(swarm.runStatus ?? swarm.lifecycleLabel)}</b>.
-          {swarm.partialSuccess && ' Partial success is not a completed run: some tasks, coverage gaps, conflicts or verdicts remain outstanding.'}
+        <p className="run-verdict" data-tone={lifecycle.outcomeTone}>
+          Run finished with status <b>{safeText(lifecycle.outcome ?? swarm.lifecycleLabel)}</b>.
+          {lifecycle.outcome === 'partial_success' && ' Partial success is not a completed run: some tasks, coverage gaps, conflicts or verdicts remain outstanding.'}
         </p>
       )}
 
@@ -188,7 +192,11 @@ export function SwarmRunCard({
           the execution story above. */}
       <footer className="swarm-card-foot">
         <span className="identifier">Run {safeText(runId)}</span>
-        {swarm.runStatus && <span className="note">Status {safeText(swarm.runStatus)}</span>}
+        {/* The run row can still say "running" for a poll or two after a
+            terminal event; the resolved outcome is what the card reports. */}
+        {(lifecycle.outcome ?? swarm.runStatus) && (
+          <span className="note">Status {safeText(lifecycle.outcome ?? swarm.runStatus)}</span>
+        )}
         {launchState && (
           <span className="note">
             Launch {safeText(launchState)}{launchReconciliationRequired ? ' · reconciliation required' : ''}

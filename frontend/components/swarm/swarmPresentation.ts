@@ -18,7 +18,7 @@
  */
 
 import { SwarmLifecyclePhase, SwarmTaskStatus } from '@/lib/swarmTypes';
-import { SwarmRunViewModel } from '@/lib/swarmViewModel';
+import { SwarmRunViewModel, swarmLifecycleLabel } from '@/lib/swarmViewModel';
 
 /** The four user-facing stages. Backend lifecycle phases map onto these. */
 export const SWARM_STAGES = ['Planning', 'Executing', 'Verifying', 'Finished'] as const;
@@ -31,7 +31,66 @@ export type SwarmStagePresentation = {
   state: SwarmStageState;
   /** The stage the run is positioned at right now; at most one is true. */
   current: boolean;
+  /** Drives colour AND icon, so meaning never rests on colour alone. */
+  tone: SwarmStageTone;
+  icon: string;
+  /** Explicit wording for this cell: "Done", "Ended", "Failed", ... */
+  stateLabel: string;
 };
+
+/**
+ * A stage cell's meaning.
+ *
+ * `success` is the ONLY tone that renders a green checkmark, and the Finished
+ * cell can only reach it on `completed`. A run that failed, was cancelled,
+ * timed out, exhausted its budget or only partly succeeded never shows a
+ * success mark anywhere in the track — the stages it did reach report `neutral`
+ * ("Ended"), because "this stage is over" is a fact and "this stage succeeded"
+ * is not.
+ */
+export type SwarmStageTone = 'pending' | 'active' | 'success' | 'warning' | 'failure' | 'neutral';
+
+/** The six durable terminal outcomes, as lifecycle phases. */
+export type SwarmTerminalPhase =
+  | 'completed'
+  | 'partial_success'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out'
+  | 'budget_exhausted';
+
+export type SwarmOutcomeTone = 'success' | 'warning' | 'failure' | 'neutral';
+
+/**
+ * How each terminal outcome is allowed to look.
+ *
+ * Keyed by lifecycle phase rather than by run status, because the view model's
+ * `lifecycle` is the resolved outcome: a durable terminal status wins over
+ * event-derived state there, and a terminal event still resolves while the run
+ * row is briefly behind.
+ */
+const TERMINAL_OUTCOME: Record<SwarmTerminalPhase, { tone: SwarmOutcomeTone; icon: string }> = {
+  completed: { tone: 'success', icon: '✓' },
+  partial_success: { tone: 'warning', icon: '⚠' },
+  failed: { tone: 'failure', icon: '✕' },
+  cancelled: { tone: 'neutral', icon: '⊘' },
+  timed_out: { tone: 'warning', icon: '⚠' },
+  budget_exhausted: { tone: 'warning', icon: '⚠' },
+};
+
+function isTerminalPhase(phase: SwarmLifecyclePhase): phase is SwarmTerminalPhase {
+  return phase in TERMINAL_OUTCOME;
+}
+
+/** Icon and wording for the three non-terminal stage states. */
+const STAGE_STATE_PRESENTATION: Record<SwarmStageState, { tone: SwarmStageTone; icon: string; label: string }> = {
+  pending: { tone: 'pending', icon: '○', label: 'Not started' },
+  active: { tone: 'active', icon: '◐', label: 'In progress' },
+  complete: { tone: 'success', icon: '✓', label: 'Done' },
+};
+
+/** A reached stage on a run that did not fully succeed: over, not successful. */
+const ENDED_STAGE = { tone: 'neutral' as const, icon: '●', label: 'Ended' };
 
 export type SwarmLifecyclePresentation = {
   /** One of the four stage names, or the idle wording. */
@@ -47,6 +106,20 @@ export type SwarmLifecyclePresentation = {
    * terminal lifecycle event. Cancellation and live decoration both stop here.
    */
   finished: boolean;
+  /**
+   * The canonical terminal outcome, present exactly when `finished`.
+   *
+   * This is the ONE value every terminal label in the card must use. The run
+   * row can lag a terminal event by a poll or two — `run_completed` is written
+   * before `runs.status` settles — so `run.status` is not a safe source for a
+   * finished run's wording: it would read "finished with status running".
+   * `viewModel.lifecycle` has already reconciled the two, with the durable
+   * status winning whenever it is itself terminal.
+   */
+  outcome?: SwarmTerminalPhase;
+  /** Human label for `outcome`, e.g. "Partial success". */
+  outcomeLabel?: string;
+  outcomeTone?: SwarmOutcomeTone;
   stages: SwarmStagePresentation[];
 };
 
@@ -106,6 +179,10 @@ export function describeSwarmLifecycle(viewModel: SwarmRunViewModel): SwarmLifec
   const currentStage = LIFECYCLE_STAGE[lifecycle];
   const currentIndex = currentStage ? SWARM_STAGES.indexOf(currentStage) : -1;
 
+  const outcome = finished && isTerminalPhase(lifecycle) ? lifecycle : undefined;
+  const outcomeStyle = outcome ? TERMINAL_OUTCOME[outcome] : undefined;
+  const succeeded = outcome === 'completed';
+
   const stages = SWARM_STAGES.map((stage, index): SwarmStagePresentation => {
     const reached = stageReached(stage, viewModel, finished);
     let state: SwarmStageState;
@@ -121,7 +198,27 @@ export function describeSwarmLifecycle(viewModel: SwarmRunViewModel): SwarmLifec
       // genuinely underway; the evidence wins over the position.
       state = reached ? 'active' : 'pending';
     }
-    return { stage, state, current: index === currentIndex };
+
+    const current = index === currentIndex;
+
+    // The Finished cell carries the exact outcome, in text and in shape.
+    if (stage === 'Finished' && outcomeStyle && outcome) {
+      return {
+        stage,
+        state,
+        current,
+        tone: outcomeStyle.tone,
+        icon: outcomeStyle.icon,
+        stateLabel: swarmLifecycleLabel(outcome),
+      };
+    }
+    // An earlier stage of a run that did not fully succeed is over, not
+    // successful: it keeps a neutral mark instead of a green checkmark.
+    if (state === 'complete' && finished && !succeeded) {
+      return { stage, state, current, ...ENDED_STAGE, stateLabel: ENDED_STAGE.label };
+    }
+    const style = STAGE_STATE_PRESENTATION[state];
+    return { stage, state, current, tone: style.tone, icon: style.icon, stateLabel: style.label };
   });
 
   return {
@@ -130,13 +227,16 @@ export function describeSwarmLifecycle(viewModel: SwarmRunViewModel): SwarmLifec
     // partial success, cancellation, timeout and budget exhaustion can never
     // read as a plain success.
     detail: finished
-      ? viewModel.lifecycleLabel
+      ? (outcome ? swarmLifecycleLabel(outcome) : viewModel.lifecycleLabel)
       : lifecycle === 'plan_created'
         ? PLAN_CREATED_DETAIL
         : undefined,
     planAdjusted: viewModel.plan.replanCount > 0,
     live: !finished && lifecycle !== 'idle',
     finished,
+    outcome,
+    outcomeLabel: outcome ? swarmLifecycleLabel(outcome) : undefined,
+    outcomeTone: outcomeStyle?.tone,
     stages,
   };
 }

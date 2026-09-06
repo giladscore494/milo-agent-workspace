@@ -692,12 +692,36 @@ textarea { resize: vertical; min-height: 4.5rem; }
 .swarm-stage-name { font-size: 0.86rem; font-weight: 600; }
 .swarm-stage-state { font-size: 0.72rem; color: var(--muted); overflow-wrap: anywhere; }
 
-.swarm-stage[data-state="active"] { border-color: rgba(91, 124, 250, 0.45); background: var(--accent-soft); }
-.swarm-stage[data-state="active"] .swarm-stage-icon { color: var(--accent); }
-.swarm-stage[data-state="complete"] { border-color: rgba(87, 185, 140, 0.4); }
-.swarm-stage[data-state="complete"] .swarm-stage-icon { color: var(--success); }
-.swarm-stage[data-state="pending"] .swarm-stage-name { color: var(--muted); }
+/*
+ * Stage colour is keyed to the tone, not to the structural state, so a run that
+ * failed, was cancelled, timed out or exhausted its budget can never pick up
+ * the green "succeeded" treatment. `success` is reachable on the Finished cell
+ * only for `completed`; every other terminal outcome resolves to warning,
+ * failure or neutral, and the cell's own text names it.
+ */
+.swarm-stage[data-tone="active"] { border-color: rgba(91, 124, 250, 0.45); background: var(--accent-soft); }
+.swarm-stage[data-tone="active"] .swarm-stage-icon { color: var(--accent); }
+.swarm-stage[data-tone="success"] { border-color: rgba(87, 185, 140, 0.4); }
+.swarm-stage[data-tone="success"] .swarm-stage-icon { color: var(--success); }
+.swarm-stage[data-tone="warning"] { border-color: rgba(211, 160, 87, 0.5); background: rgba(211, 160, 87, 0.08); }
+.swarm-stage[data-tone="warning"] .swarm-stage-icon,
+.swarm-stage[data-tone="warning"] .swarm-stage-state { color: var(--warning); }
+.swarm-stage[data-tone="failure"] { border-color: rgba(224, 115, 111, 0.55); background: rgba(224, 115, 111, 0.08); }
+.swarm-stage[data-tone="failure"] .swarm-stage-icon,
+.swarm-stage[data-tone="failure"] .swarm-stage-state { color: var(--danger); }
+.swarm-stage[data-tone="neutral"] { border-color: var(--border-strong); }
+.swarm-stage[data-tone="neutral"] .swarm-stage-icon { color: var(--muted); }
+.swarm-stage[data-tone="pending"] .swarm-stage-name { color: var(--muted); }
 .swarm-stage[aria-current="step"] { box-shadow: inset 2px 0 0 var(--accent); }
+
+/* The outcome line and the verdict carry the same tone as the Finished cell. */
+.swarm-detail[data-tone="success"] { color: var(--success); }
+.swarm-detail[data-tone="warning"] { color: var(--warning); }
+.swarm-detail[data-tone="failure"] { color: var(--danger); }
+.swarm-detail[data-tone="neutral"] { color: var(--text); }
+
+.run-verdict[data-tone="warning"] { border-top-color: rgba(211, 160, 87, 0.4); }
+.run-verdict[data-tone="failure"] { border-top-color: rgba(224, 115, 111, 0.45); }
 
 .swarm-section {
   display: grid;
