@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import Page from '../app/page';
+import { getCurrentSession } from '../lib/supabaseClient';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 let mockSession: any = { access_token: 'fresh', user: { email: 'u@example.com' } };
@@ -41,6 +42,7 @@ vi.mock('../lib/api', () => ({
 }));
 
 const PROJECT = { id: '677db6c2-b44c-41c1-b4e1-b51229d697df', slug: 'milo-vehicle-catalog', name: 'MILO Vehicle Catalog', workflow_key: 'vehicle_catalog_v1' };
+const OTHER_PROJECT = { id: '9a1d1b02-0b2f-4a5b-9a24-8f0d5a6f4c31', slug: 'beta-catalog', name: 'Beta Catalog', workflow_key: 'vehicle_catalog_v1' };
 const CONVERSATION = { id: '1f90f4ce-7844-4031-91d6-b74e40e1884e', project_id: PROJECT.id, title: 'Kickoff' };
 const RUN = { id: '2c9e2c11-58c8-4b46-b7d5-3d8de9f4b7aa', conversation_id: CONVERSATION.id, status: 'queued' };
 
@@ -59,9 +61,20 @@ describe('authenticated workspace (execution UI disabled)', () => {
     mockSession = null;
     render(<Page/>);
     expect(await screen.findByText(/Sign in to access/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Email')).toBeInTheDocument();
+    expect(screen.getByLabelText('Password')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Login' })).toBeInTheDocument();
     expect(apiMocks.api.projects).not.toHaveBeenCalled();
     expect(screen.queryByText('MILO Vehicle Catalog')).not.toBeInTheDocument();
+  });
+
+  it('renders the session restore screen until Supabase answers, without loading workspace data', async () => {
+    vi.mocked(getCurrentSession).mockReturnValueOnce(new Promise(() => {}));
+    render(<Page/>);
+    expect(await screen.findByText('Restoring your MILO session…')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Login' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Logout' })).not.toBeInTheDocument();
+    expect(apiMocks.api.projects).not.toHaveBeenCalled();
   });
 
   it('loads the authenticated user projects through the gateway', async () => {
@@ -107,6 +120,17 @@ describe('authenticated workspace (execution UI disabled)', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
+  it('marks the selected sidebar project as current and loads only its conversations', async () => {
+    apiMocks.api.projects.mockResolvedValue([PROJECT, OTHER_PROJECT]);
+    render(<Page/>);
+    fireEvent.click(await screen.findByText('MILO Vehicle Catalog'));
+    const selected = screen.getByRole('button', { name: /MILO Vehicle Catalog/ });
+    expect(selected).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByRole('button', { name: /Beta Catalog/ })).not.toHaveAttribute('aria-current');
+    await waitFor(() => expect(apiMocks.api.conversations).toHaveBeenCalledWith(PROJECT.id));
+    expect(apiMocks.api.conversations).toHaveBeenCalledTimes(1);
+  });
+
   it('lists existing conversations for the selected project', async () => {
     apiMocks.api.conversations.mockResolvedValue([CONVERSATION]);
     render(<Page/>);
@@ -131,6 +155,10 @@ describe('authenticated workspace (execution UI disabled)', () => {
     }
     expect(screen.getByText('Live run')).toBeInTheDocument();
     expect(screen.getByText(/No active run/)).toBeInTheDocument();
+    // The proposal surface is named but never interactive while the flag is off.
+    expect(screen.getByText('Workflow proposal')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Workflow proposal' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Task content')).not.toBeInTheDocument();
     expect(apiMocks.api.run).not.toHaveBeenCalled();
     expect(apiMocks.api.events).not.toHaveBeenCalled();
   });
@@ -206,6 +234,8 @@ describe('authenticated workspace (execution UI enabled)', () => {
     await openConversation();
     expect(await screen.findByText(/Run finished with status/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Cancel run' })).not.toBeInTheDocument();
+    // The sanitized output surface stays reachable after the refactor.
+    expect(screen.getByText('Final artifacts')).toBeInTheDocument();
     // Secrets are redacted from rendered output.
     expect(screen.queryByText(new RegExp(leak))).not.toBeInTheDocument();
     expect((document.body.textContent ?? '')).toContain('[REDACTED]');
@@ -225,6 +255,9 @@ describe('authenticated workspace (execution UI enabled)', () => {
     apiMocks.api.decideProposal.mockResolvedValue({ ...proposal, status: 'rejected' });
     render(<Page/>);
     fireEvent.click(await screen.findByText('MILO Vehicle Catalog'));
+    // The proposal surface is a disclosure now: open it like a user would.
+    expect(screen.queryByLabelText('Proposal request')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Workflow proposal' }));
     fireEvent.change(screen.getByLabelText('Proposal request'), { target: { value: 'Research the market' } });
     fireEvent.click(screen.getByRole('button', { name: 'Generate proposal' }));
     await waitFor(() => expect(apiMocks.api.createProposal).toHaveBeenCalledWith(PROJECT.id, 'Research the market'));
@@ -237,8 +270,78 @@ describe('authenticated workspace (execution UI enabled)', () => {
     apiMocks.api.createProposal.mockRejectedValue(new Error('workflow proposal creation is disabled (EXECUTION_SURFACE_DISABLED)'));
     render(<Page/>);
     fireEvent.click(await screen.findByText('MILO Vehicle Catalog'));
+    fireEvent.click(screen.getByRole('button', { name: 'Workflow proposal' }));
     fireEvent.change(screen.getByLabelText('Proposal request'), { target: { value: 'X' } });
     fireEvent.click(screen.getByRole('button', { name: 'Generate proposal' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('EXECUTION_SURFACE_DISABLED');
+  });
+});
+
+describe('workspace shell drawers', () => {
+  beforeEach(() => {
+    mockSession = { access_token: 'fresh', user: { email: 'u@example.com' } };
+    apiMocks.executionUi = false;
+    for (const fn of Object.values(apiMocks.api)) fn.mockReset();
+    apiMocks.api.projects.mockResolvedValue([PROJECT]);
+    apiMocks.api.conversations.mockResolvedValue([CONVERSATION]);
+    window.sessionStorage.clear();
+  });
+
+  async function renderWorkspace() {
+    render(<Page/>);
+    await screen.findByText('MILO Vehicle Catalog');
+    return {
+      sidebarToggle: screen.getByRole('button', { name: 'Workspace navigation' }),
+      inspectorToggle: screen.getByRole('button', { name: 'Run inspector' }),
+    };
+  }
+
+  it('exposes the sidebar drawer through an accessible toggle', async () => {
+    const { sidebarToggle } = await renderWorkspace();
+    expect(sidebarToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(sidebarToggle).toHaveAttribute('aria-controls', 'workspace-sidebar');
+    fireEvent.click(sidebarToggle);
+    expect(sidebarToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(document.getElementById('workspace-sidebar')).toHaveAttribute('data-open', 'true');
+    // The icon-only close control still carries an accessible name.
+    fireEvent.click(screen.getByRole('button', { name: 'Close projects and conversations' }));
+    expect(sidebarToggle).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('exposes the inspector drawer through its own accessible toggle', async () => {
+    const { inspectorToggle } = await renderWorkspace();
+    expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(inspectorToggle).toHaveAttribute('aria-controls', 'workspace-inspector');
+    fireEvent.click(inspectorToggle);
+    expect(inspectorToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(document.getElementById('workspace-inspector')).toHaveAttribute('data-open', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'Close inspector panel' }));
+    expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('keeps the two drawers independent and closes only the active one on Escape', async () => {
+    const { sidebarToggle, inspectorToggle } = await renderWorkspace();
+    fireEvent.click(sidebarToggle);
+    fireEvent.click(inspectorToggle);
+    expect(sidebarToggle).toHaveAttribute('aria-expanded', 'true');
+    expect(inspectorToggle).toHaveAttribute('aria-expanded', 'true');
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(inspectorToggle).toHaveAttribute('aria-expanded', 'false');
+    // The sidebar keeps its own state; one drawer never corrupts the other.
+    expect(sidebarToggle).toHaveAttribute('aria-expanded', 'true');
+
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(sidebarToggle).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('closes the sidebar drawer when a project is selected but leaves the inspector alone', async () => {
+    const { sidebarToggle, inspectorToggle } = await renderWorkspace();
+    fireEvent.click(sidebarToggle);
+    fireEvent.click(inspectorToggle);
+    fireEvent.click(screen.getByText('MILO Vehicle Catalog'));
+    expect(sidebarToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(inspectorToggle).toHaveAttribute('aria-expanded', 'true');
+    await waitFor(() => expect(apiMocks.api.conversations).toHaveBeenCalledWith(PROJECT.id));
   });
 });
