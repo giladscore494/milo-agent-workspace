@@ -92,6 +92,17 @@ export function RunInspector({ executionUi, tab, onTabChange, agents, state, swa
 
 function InspectorPanel({ tab, agents, state, swarm }: { tab: InspectorTab; agents: AgentState[]; state: WorkspaceState; swarm: SwarmRunViewModel }) {
   if (tab === 'Agents') {
+    // Swarm V2 has no agent concept at all: its logical tasks are not agents
+    // and must never be listed as if they were. Saying the legacy view does not
+    // apply is the smallest honest adjustment; the tab itself stays put.
+    if (swarm.isSwarmV2) {
+      return (
+        <p className="muted">
+          Not applicable to Swarm V2. This run has no legacy agents — its logical tasks are shown in the
+          run card and under Workflow.
+        </p>
+      );
+    }
     return (
       <>
         {agents.length === 0 && <p className="muted">No agents are running.</p>}

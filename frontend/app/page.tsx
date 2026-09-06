@@ -12,6 +12,7 @@ import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector'
 import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
 import { CurrentRunPanel } from '@/components/run/CurrentRunPanel';
 import { RunOutputPanel } from '@/components/run/RunOutputPanel';
+import { SwarmRunCard } from '@/components/swarm/SwarmRunCard';
 import { WorkspaceShell } from '@/components/workspace/WorkspaceShell';
 import { WorkspaceSidebar } from '@/components/workspace/WorkspaceSidebar';
 
@@ -98,6 +99,11 @@ export default function WorkspacePage() {
   const launchState = state.run?.launch_state;
   const launchReconciliationRequired = state.run?.launch_reconciliation_required;
   const runIsTerminal = isTerminalRunStatus(runStatus);
+  // Exactly one run surface renders at a time. A Swarm V2 project with a live
+  // run gets the dedicated card; every other case — Swarm V1, no run yet, the
+  // execution UI switched off — keeps the existing CurrentRunPanel path.
+  const swarmCardRunId =
+    swarm.isSwarmV2 && executionUi && activeConversation !== undefined ? activeRunId : undefined;
 
   useEffect(() => {
     let mounted = true;
@@ -346,25 +352,42 @@ export default function WorkspacePage() {
           onRevise={reviseProposal}
           onDecide={decideProposal}
         />
-        <CurrentRunPanel
-          executionUi={executionUi}
-          hasConversation={activeConversation !== undefined}
-          runId={activeRunId}
-          runStatus={runStatus}
-          phase={state.currentPhase}
-          connection={mode}
-          isTerminal={runIsTerminal}
-          isPartialSuccess={isPartialSuccessRunStatus(runStatus)}
-          launchState={launchState}
-          launchReconciliationRequired={launchReconciliationRequired}
-          confirmingCancel={confirmingCancel}
-          cancelReason={cancelReason}
-          cancelError={cancelError}
-          onCancelReasonChange={setCancelReason}
-          onRequestCancel={() => setConfirmingCancel(true)}
-          onConfirmCancel={confirmCancelRun}
-          onKeepRunning={() => setConfirmingCancel(false)}
-        />
+        {swarmCardRunId ? (
+          <SwarmRunCard
+            swarm={swarm}
+            runId={swarmCardRunId}
+            connection={mode}
+            launchState={launchState}
+            launchReconciliationRequired={launchReconciliationRequired}
+            confirmingCancel={confirmingCancel}
+            cancelReason={cancelReason}
+            cancelError={cancelError}
+            onCancelReasonChange={setCancelReason}
+            onRequestCancel={() => setConfirmingCancel(true)}
+            onConfirmCancel={confirmCancelRun}
+            onKeepRunning={() => setConfirmingCancel(false)}
+          />
+        ) : (
+          <CurrentRunPanel
+            executionUi={executionUi}
+            hasConversation={activeConversation !== undefined}
+            runId={activeRunId}
+            runStatus={runStatus}
+            phase={state.currentPhase}
+            connection={mode}
+            isTerminal={runIsTerminal}
+            isPartialSuccess={isPartialSuccessRunStatus(runStatus)}
+            launchState={launchState}
+            launchReconciliationRequired={launchReconciliationRequired}
+            confirmingCancel={confirmingCancel}
+            cancelReason={cancelReason}
+            cancelError={cancelError}
+            onCancelReasonChange={setCancelReason}
+            onRequestCancel={() => setConfirmingCancel(true)}
+            onConfirmCancel={confirmCancelRun}
+            onKeepRunning={() => setConfirmingCancel(false)}
+          />
+        )}
         <RunOutputPanel visible={executionUi && activeRunId !== undefined} output={state.run?.output} />
       </ConversationView>
     </WorkspaceShell>
