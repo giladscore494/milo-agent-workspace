@@ -11,7 +11,7 @@ from backend.engines.swarm_v2 import (
 )
 from backend.engines.swarm_v2.fragments import MAX_FRAGMENT_CHARS, fragment_content_hash
 from backend.engines.swarm_v2.validation import PlanLimits
-from test_swarm_v2 import plan, task
+from test_swarm_v2 import plan, task, tool_descriptors
 
 
 class Plans:
@@ -91,7 +91,8 @@ class VerifyGateway:
 
 def commander(client):
     return Commander(client=client, resolver=CommanderModelResolver(("fake",), {"fake"}),
-        validator=PlanValidator(allowed_tools={"search"}, limits=PlanLimits(max_tasks=10, max_tool_calls=30)))
+        validator=PlanValidator(allowed_tools=tool_descriptors("search"),
+                                limits=PlanLimits(max_tasks=10, max_tool_calls=30)))
 
 
 def evidence(results):

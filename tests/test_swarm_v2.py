@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
 
 import pytest
 from pydantic import ValidationError
@@ -17,6 +19,42 @@ from backend.engines.swarm_v2 import (
     PlanValidator,
     SwarmV2Adapter,
 )
+from backend.tools import ToolContext, ToolMode, ToolOperation, ToolRegistry
+
+QUERY_SCHEMA = {"type": "object", "properties": {"query": {"type": "string"}},
+                "required": ["query"], "additionalProperties": False}
+ROWS_SCHEMA = {"type": "object",
+               "properties": {"rows": {"type": "array", "items": {"type": "string"}}},
+               "required": ["rows"], "additionalProperties": False}
+
+
+@dataclass(frozen=True)
+class FixtureTool:
+    """A registrable offline tool, so descriptors come from a REAL registry."""
+
+    name: str
+    description: str = "offline fixture tool"
+    required_scope: str = "fixture:read"
+    mode: ToolMode = ToolMode.READ
+    operations = {"search": ToolOperation("search", "Offline fixture lookup.",
+                                          QUERY_SCHEMA, ROWS_SCHEMA)}
+
+    def execute(self, context: ToolContext, operation: str,
+                payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        return {"rows": []}
+
+
+def tool_descriptors(*names: str):
+    """Sanitized descriptors derived only from registered tools."""
+    return ToolRegistry([FixtureTool(name) for name in names]).descriptors()
+
+
+def call(call_id: str, name: str = "search", *, operation: str = "search",
+         arguments: dict | None = None, bindings: list[dict] | None = None) -> dict:
+    """One exact planned tool call."""
+    return {"call_id": call_id, "name": name, "operation": operation,
+            "arguments": {"query": "public facts"} if arguments is None else arguments,
+            "dependency_bindings": bindings or []}
 
 
 def task(task_id: str, goal: str, *, dependencies: list[str] | None = None,
@@ -26,7 +64,10 @@ def task(task_id: str, goal: str, *, dependencies: list[str] | None = None,
         "goal": goal,
         "scope": f"bounded scope for {goal}",
         "dependencies": dependencies or [],
-        "tools": [{"name": tool, "scope": "read public facts", "max_calls": 2}],
+        # TWO exact calls to the same tool, distinguished only by call_id:
+        # the default fixture exercises the repeat-call shape the old
+        # name-keyed ToolRequirement could not express.
+        "tools": [call("primary", tool), call("secondary", tool)],
         "output_schema": {
             "type": "object",
             "properties": {"answer": {"type": "string"}},
@@ -56,7 +97,8 @@ def plan(tasks: list[dict], *, contexts: dict[str, list[str]] | None = None,
 
 
 def validator(**limits: int) -> PlanValidator:
-    return PlanValidator(allowed_tools={"search", "calculator"}, limits=PlanLimits(**limits))
+    return PlanValidator(allowed_tools=tool_descriptors("search", "calculator"),
+                         limits=PlanLimits(**limits))
 
 
 @pytest.mark.parametrize("goals", [
@@ -146,15 +188,20 @@ def test_task_depth_recursion_and_cost_limits_rejected() -> None:
         validator(max_replans=1).validate(plan([task("a", "one")], max_replans=2))
 
 
-def test_aggregate_tool_call_limit_rejected() -> None:
+def test_exact_call_count_drives_the_aggregate_and_per_task_tool_limits() -> None:
+    """The charge is the EXACT call list, not a promised maximum."""
     candidate = plan([task("a", "one"), task("b", "two")])
-    assert all(
-        tool["max_calls"] < 3
-        for planned_task in candidate["graph"]["tasks"]
-        for tool in planned_task["tools"]
-    )
-    with pytest.raises(PlanValidationError, match="aggregate tool call limit"):
-        validator(max_tool_calls=3).validate(candidate)
+    planned_calls = sum(len(item["tools"]) for item in candidate["graph"]["tasks"])
+    assert planned_calls == 4
+    assert validator(max_tool_calls=planned_calls).validate(candidate)
+    with pytest.raises(PlanValidationError, match="aggregate tool call limit") as aggregate:
+        validator(max_tool_calls=planned_calls - 1).validate(candidate)
+    assert aggregate.value.reason == "AGGREGATE_TOOL_CALL_LIMIT"
+
+    # The per-task bound is independent of the aggregate one.
+    with pytest.raises(PlanValidationError, match="task tool call limit") as per_task:
+        validator(max_tool_calls_per_task=1).validate(candidate)
+    assert per_task.value.reason == "TASK_TOOL_CALL_LIMIT"
 
 
 def test_unregistered_tool_and_prompt_injection_plan_rejected() -> None:

@@ -1,10 +1,12 @@
 """Allowlisted tool capabilities shared by MILO engines."""
 
-from .contracts import ToolContext, ToolError, ToolMode
-from .mock import MockCatalogTool, MockSearchTool, MockStructuredDataTool
-from .registry import ToolRegistry
+from .contracts import ToolContext, ToolError, ToolMode, ToolOperation
+from .mock import (MockCatalogTool, MockSearchTool, MockStructuredDataTool,
+                   MockVehicleCatalogTool)
+from .registry import ToolDescriptor, ToolOperationDescriptor, ToolRegistry
 
 __all__ = [
     "MockCatalogTool", "MockSearchTool", "MockStructuredDataTool",
-    "ToolContext", "ToolError", "ToolMode", "ToolRegistry",
+    "MockVehicleCatalogTool", "ToolContext", "ToolDescriptor", "ToolError",
+    "ToolMode", "ToolOperation", "ToolOperationDescriptor", "ToolRegistry",
 ]

@@ -2,9 +2,10 @@
 
 from .adapter import SwarmV2Adapter
 from .commander import Commander, CommanderPlanFailure
-from .contracts import (CommanderDecision, CommanderPlan, CompletionCriteria, DynamicTask,
-                        EvidenceReference, RemainingBudget, VerificationVerdict,
-                        EvidenceRequirement, TaskGraph, ToolRequirement,
+from .contracts import (CommanderDecision, CommanderPlan, CompletionCriteria,
+                        DependencyBinding, DynamicTask,
+                        EvidenceReference, PlannedToolCall, RemainingBudget,
+                        VerificationVerdict, EvidenceRequirement, TaskGraph,
                         WorkerAssignment)
 from .engine import SwarmV2Engine
 from .models import CommanderModelError, CommanderModelResolver
@@ -13,6 +14,13 @@ from .validation import (VALIDATION_REASONS, PlanJsonError, PlanLimitError, Plan
                          provider_plan_policy)
 from .executor import BoundedTaskExecutor, ExecutionResult
 from .model_gateway import ModelGateway
+from .tool_calls import (MAX_BINDING_PATH_SEGMENTS, MAX_DEPENDENCY_BINDINGS_PER_CALL,
+                         MAX_TASK_OUTPUT_JSON_BYTES, MAX_TOOL_CALLS_PER_TASK,
+                         MAX_TOOL_COLLECTION_ITEMS, MAX_TOOL_INPUT_JSON_BYTES,
+                         MAX_TOOL_MATERIAL_JSON_BYTES, MAX_TOOL_OUTPUT_JSON_BYTES,
+                         MAX_TOOL_VALUE_DEPTH, PLAN_TOOL_CALL_REASONS,
+                         TOOL_CALL_REASONS, ToolCallError, ToolCallRecord,
+                         ToolResultSink, resolve_tool_arguments, validate_binding_path)
 from .worker import (MAX_WORKER_OUTPUT_MODEL_ATTEMPTS, WORKER_OUTPUT_REASONS, GenericWorker,
                      TaskResult, WorkerOutputValidationError, build_worker_request,
                      validate_worker_output)
@@ -40,7 +48,7 @@ from .state import SwarmState
 __all__ = ["Commander", "CommanderDecision", "CommanderModelError", "CommanderModelResolver", "CommanderPlan", "CommanderPlanFailure",
            "CompletionCriteria", "DynamicTask", "EvidenceRequirement", "PlanLimits",
            "PlanJsonError", "PlanLimitError", "PlanSchemaError", "PlanValidationError", "PlanValidator", "SwarmV2Adapter", "SwarmV2Engine",
-           "TaskGraph", "ToolRequirement", "WorkerAssignment"]
+           "TaskGraph", "WorkerAssignment"]
 __all__ += ["BoundedTaskExecutor", "ExecutionResult", "GenericWorker", "ModelGateway", "TaskResult"]
 __all__ += ["EvidenceReference", "FinalBuilder", "RemainingBudget", "SwarmState", "VerificationVerdict", "Verifier"]
 __all__ += ["ALLOWED_OUTCOMES", "DURABLE_RUN_STATUS", "NO_USABLE_RESULT_CODE",
@@ -49,6 +57,14 @@ __all__ += ["ALLOWED_OUTCOMES", "DURABLE_RUN_STATUS", "NO_USABLE_RESULT_CODE",
             "decide_outcome", "durable_run_status", "finalize_product_outcome",
             "validate_product_outcome"]
 __all__ += ["VALIDATION_REASONS", "provider_plan_policy"]
+__all__ += ["DependencyBinding", "PlannedToolCall",
+            "MAX_BINDING_PATH_SEGMENTS", "MAX_DEPENDENCY_BINDINGS_PER_CALL",
+            "MAX_TASK_OUTPUT_JSON_BYTES", "MAX_TOOL_CALLS_PER_TASK",
+            "MAX_TOOL_COLLECTION_ITEMS", "MAX_TOOL_INPUT_JSON_BYTES",
+            "MAX_TOOL_MATERIAL_JSON_BYTES", "MAX_TOOL_OUTPUT_JSON_BYTES",
+            "MAX_TOOL_VALUE_DEPTH", "PLAN_TOOL_CALL_REASONS", "TOOL_CALL_REASONS",
+            "ToolCallError", "ToolCallRecord", "ToolResultSink",
+            "resolve_tool_arguments", "validate_binding_path"]
 __all__ += ["MAX_WORKER_OUTPUT_MODEL_ATTEMPTS", "WORKER_OUTPUT_REASONS",
             "WorkerOutputValidationError", "build_worker_request", "validate_worker_output"]
 __all__ += ["GROUNDED_VERDICT_REASONS", "MAX_VERIFIER_BATCH_JSON_BYTES",

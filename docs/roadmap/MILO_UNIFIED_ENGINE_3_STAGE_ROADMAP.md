@@ -203,7 +203,7 @@ Done כאשר: יש package עצמאי שמיישם Engine Protocol וניתן �
 
 מטרה: להגדיר מה Commander רשאי ליצור בלי לקבע “מנוע/גיר/מידות” בקוד.
 
-מימוש טכני: להגדיר Pydantic contracts עם \`extra=forbid\`: \`DynamicTask\`, \`TaskGraph\`, \`ToolRequirement\`, \`EvidenceRequirement\`, \`CompletionCriteria\`, \`WorkerAssignment\`, \`CommanderPlan\`. כל task כולל goal, scope, dependencies, allowed tools, output schema, evidence minimum, priority, recursion depth ו־completion criteria.
+מימוש טכני: להגדיר Pydantic contracts עם \`extra=forbid\`: \`DynamicTask\`, \`TaskGraph\`, \`PlannedToolCall\`, \`EvidenceRequirement\`, \`CompletionCriteria\`, \`WorkerAssignment\`, \`CommanderPlan\`. כל task כולל goal, scope, dependencies, allowed tools, output schema, evidence minimum, priority, recursion depth ו־completion criteria.
 
 מוקדי קוד:
 
