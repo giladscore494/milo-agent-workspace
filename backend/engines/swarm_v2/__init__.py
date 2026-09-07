@@ -8,6 +8,24 @@ from .contracts import (CommanderDecision, CommanderPlan, CompletionCriteria,
                         VerificationVerdict, EvidenceRequirement, TaskGraph,
                         WorkerAssignment)
 from .engine import SwarmV2Engine
+from .evidence_bounds import (FRAGMENT_TYPES, LOCATOR_KINDS, MAX_DOCUMENT_OFFSET,
+                              MAX_FACTS_PER_BUNDLE, MAX_FACT_VALUE_DEPTH,
+                              MAX_FACT_VALUE_JSON_BYTES, MAX_LOCATOR_KEY_CHARS,
+                              MAX_LOCATOR_PATH_SEGMENTS, MAX_LOCATOR_SCOPE_IDS,
+                              MAX_PROJECTION_FIELDS, MAX_SOURCE_VERSION_CHARS,
+                              MAX_SOURCE_VERSION_KEY_CHARS, MAX_UNIT_CHARS,
+                              SOURCE_VERSION_KINDS)
+from .evidence_contracts import (EVIDENCE_CONTRACT_REASONS, EvidenceBundle,
+                                 EvidenceContractError, EvidenceLocator,
+                                 FocusedEvidenceFragment, SourceVersion,
+                                 StructuredEvidenceFact, VersionedEvidenceSource,
+                                 build_evidence_bundle, canonical_projection,
+                                 document_span_locator, read_locator_path,
+                                 record_field_locator, snapshot_version,
+                                 structured_projection, verbatim_excerpt)
+from .evidence_mapping import (EVIDENCE_MAPPING_REASONS, PRODUCTION_EVIDENCE_MAPPERS,
+                               AcquiredEvidence, EvidenceMapper, EvidenceMapperRegistry,
+                               EvidenceMappingError, TrustedEvidenceAcquisition)
 from .models import CommanderModelError, CommanderModelResolver
 from .validation import (VALIDATION_REASONS, PlanJsonError, PlanLimitError, PlanLimits,
                          PlanSchemaError, PlanValidationError, PlanValidator,
@@ -75,6 +93,18 @@ __all__ += ["GROUNDED_VERDICT_REASONS", "MAX_VERIFIER_BATCH_JSON_BYTES",
             "parse_verifier_batch", "plan_grounded_verification",
             "serialize_verifier_candidates", "verifier_evidence_chars",
             "verifier_payload_bytes"]
+__all__ += ["EVIDENCE_CONTRACT_REASONS", "EVIDENCE_MAPPING_REASONS", "FRAGMENT_TYPES",
+            "LOCATOR_KINDS", "MAX_DOCUMENT_OFFSET", "MAX_FACTS_PER_BUNDLE",
+            "MAX_FACT_VALUE_DEPTH", "MAX_FACT_VALUE_JSON_BYTES", "MAX_LOCATOR_KEY_CHARS",
+            "MAX_LOCATOR_PATH_SEGMENTS", "MAX_LOCATOR_SCOPE_IDS", "MAX_PROJECTION_FIELDS",
+            "MAX_SOURCE_VERSION_CHARS", "MAX_SOURCE_VERSION_KEY_CHARS", "MAX_UNIT_CHARS",
+            "PRODUCTION_EVIDENCE_MAPPERS", "SOURCE_VERSION_KINDS", "AcquiredEvidence",
+            "EvidenceBundle", "EvidenceContractError", "EvidenceLocator", "EvidenceMapper",
+            "EvidenceMapperRegistry", "EvidenceMappingError", "FocusedEvidenceFragment",
+            "SourceVersion", "StructuredEvidenceFact", "TrustedEvidenceAcquisition",
+            "VersionedEvidenceSource", "build_evidence_bundle", "canonical_projection",
+            "document_span_locator", "read_locator_path", "record_field_locator",
+            "snapshot_version", "structured_projection", "verbatim_excerpt"]
 __all__ += ["FRAGMENT_OVER_READ_PER_SOURCE", "GROUNDING_REASONS",
             "MAX_SOURCES_PER_RESOLVER_READ",
             "VERIFIER_GROUNDING_VERSION", "EvidenceResolver", "GroundedCandidate",

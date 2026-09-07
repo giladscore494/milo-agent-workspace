@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from backend.engines.swarm_v2.evidence_contracts import (document_span_locator,
+                                                         record_field_locator)
 from backend.engines.swarm_v2.fragments import fragment_content_hash
 from backend.engines.swarm_v2.normalization import (
     SCOPE_NORMALIZATION_VERSION, canonical_scope_hash, canonical_scope_key,
@@ -2506,3 +2508,266 @@ def test_concurrent_writers_for_one_source_cannot_exceed_the_durable_fragment_li
         "sum(char_length(fragment_text)) as chars from public.source_evidence_fragments "
         "group by source_id) as per_source where rows > 4 or chars > 1200"
     ) == "0"
+
+
+# --- migration 20260902000100 (R3 versioned, located evidence) ---
+
+@pytest.fixture
+def r3_db(db):
+    """The shared module DB with the R3 evidence migration guaranteed current,
+    independent of earlier rerun-safety tests re-applying older evidence
+    migrations."""
+    for name in ("source_evidence_fragments", "r3_versioned_focused_evidence"):
+        db.psql(file=next(m for m in MIGRATIONS if name in m.name))
+    return db
+
+
+R3_VERSION = ("dataset_version", "2026.08.1")
+R3_LOCATOR = record_field_locator("rec-1", ("engine_displacement_cc",)).locator_key
+R3_SPAN = document_span_locator("doc-1", 612, 680, section="Engine specifications").locator_key
+R3_TEXT = "model_name=Fixture Hatch; model_year=2020; engine_displacement_cc=1798"
+
+
+def _r3_source_json(key: str, *, task: str = "task", kind: str | None = R3_VERSION[0],
+                    identifier: str | None = R3_VERSION[1]) -> str:
+    payload = json.loads(_source_json(key, task=task))
+    payload.update(source_version_kind=kind, source_version_id=identifier)
+    return json.dumps(payload)
+
+
+def _r3_claim_json(key: str, source_id: str, value, *, locator: str | None = R3_LOCATOR,
+                   unit: str | None = "cc", field: str = "engine_displacement_cc") -> str:
+    payload = json.loads(_claim_json(key, source_id, 0, field=field))
+    payload.update(value=value, unit=unit, evidence_locator=locator)
+    return json.dumps(payload)
+
+
+def _r3_fragment_json(source_id: str, text: str = R3_TEXT, *, key: str, task: str = "task",
+                      index: int = 0, kind: str | None = "structured_projection",
+                      locator: str | None = R3_LOCATOR) -> str:
+    payload = json.loads(_fragment_json(source_id, text, key=key, task=task, index=index))
+    payload.update(fragment_type=kind, locator_key=locator)
+    return json.dumps(payload)
+
+
+def test_r3_evidence_persists_with_its_version_locator_and_fragment_type(r3_db):
+    db = r3_db
+    lease, _ = _evidence_fixture(db, "r3")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json('r3-src-1')}'::jsonb)")
+    assert db.psql(f"select source_version_kind, source_version_id from public.sources where id='{source}'") \
+        == "dataset_version|2026.08.1"
+
+    fragment = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, key='r3-frag-1')}'::jsonb)")
+    assert db.psql(f"select fragment_type, locator_key from public.source_evidence_fragments where id='{fragment}'") \
+        == f"structured_projection|{R3_LOCATOR}"
+
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_r3_claim_json('r3-claim-1', source, 1798)}'::jsonb)")
+    assert db.psql(f"select value, unit, evidence_locator from public.claims where id='{claim}'") \
+        == f"1798|cc|{R3_LOCATOR}"
+
+    # An exact replay of the whole bundle returns the same durable rows.
+    assert _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json('r3-src-1')}'::jsonb)") == source
+    assert _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, key='r3-frag-1')}'::jsonb)") == fragment
+    assert _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_r3_claim_json('r3-claim-1', source, 1798)}'::jsonb)") == claim
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where run_id='{run_id}'") == "1"
+    assert db.psql(f"select count(*) from public.claims where run_id='{run_id}'") == "1"
+
+    # Identical TEXT read from a different locator is different evidence: the
+    # backend folds the locator into evidence_key, so both rows survive.
+    other = record_field_locator("rec-2", ("engine_displacement_cc",)).locator_key
+    twin = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, key='r3-frag-2', index=1, locator=other)}'::jsonb)")
+    assert twin != fragment
+    assert db.psql(
+        f"select count(*), count(distinct content_hash), count(distinct locator_key) "
+        f"from public.source_evidence_fragments where source_id='{source}'") == "2|1|2"
+
+    # A new source VERSION is new provenance, never a merge into the old row.
+    republished = json.loads(_r3_source_json("r3-src-1", identifier="2026.09.1"))
+    republished["evidence_key"] = "r3-src-1-v2"   # the backend key includes the version
+    second = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{json.dumps(republished)}'::jsonb)")
+    assert second != source
+    assert db.psql(f"select count(distinct source_version_id) from public.sources where run_id='{run_id}'") == "2"
+    # Reusing ONE evidence_key across two versions fails closed instead.
+    with pytest.raises(AssertionError, match="source version identity conflict"):
+        _rpc_as_service(db, f"select public.upsert_source_guarded({args},'{_r3_source_json('r3-src-1', identifier='2026.10.1')}'::jsonb)")
+
+
+def test_r3_rpcs_reject_every_incomplete_or_malformed_contract(r3_db):
+    db = r3_db
+    lease, _ = _evidence_fixture(db, "r3guard")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+
+    # Source version: all-or-nothing, closed kind set, bounded identifier.
+    for payload, message in (
+            (_r3_source_json("r3-half-a", identifier=None), "requires both a kind and an identifier"),
+            (_r3_source_json("r3-half-b", kind=None), "requires both a kind and an identifier"),
+            (_r3_source_json("r3-kind", kind="retrieved_at"), "unknown or oversized source version"),
+            (_r3_source_json("r3-long", identifier="v" * 129), "unknown or oversized source version")):
+        with pytest.raises(AssertionError, match=message):
+            _rpc_as_service(db, f"select public.upsert_source_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select count(*) from public.sources where run_id='{run_id}'") == "0"
+
+    versioned = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json('r3-guard-src')}'::jsonb)")
+    legacy = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('r3-legacy-src')}'::jsonb)")
+
+    # Fragment focus provenance: all-or-nothing, closed type set, bounded locator.
+    for payload, message in (
+            (_r3_fragment_json(versioned, key="r3-f-a", locator=None), "requires both a type and a locator"),
+            (_r3_fragment_json(versioned, key="r3-f-b", kind=None), "requires both a type and a locator"),
+            (_r3_fragment_json(versioned, key="r3-f-c", kind="verbatim_quote"), "unknown fragment type or oversized locator"),
+            (_r3_fragment_json(versioned, key="r3-f-d", locator="l" * 801), "unknown fragment type or oversized locator"),
+            # R3 evidence may only rest on a source whose version was captured.
+            (_r3_fragment_json(legacy, key="r3-f-e"), "requires a versioned source")):
+        with pytest.raises(AssertionError, match=message):
+            _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where run_id='{run_id}'") == "0"
+
+    # A located fact states its unit, rests on a versioned source, and its
+    # locator is bounded.
+    for payload, message in (
+            (_r3_claim_json("r3-c-a", versioned, 1798, unit=None), "requires an explicit unit"),
+            (_r3_claim_json("r3-c-b", versioned, 1798.5, unit=""), "requires an explicit unit"),
+            (_r3_claim_json("r3-c-c", versioned, 1798, locator="l" * 801), "evidence locator exceeds the durable bound"),
+            (_r3_claim_json("r3-c-d", legacy, 1798), "requires a versioned source")):
+        with pytest.raises(AssertionError, match=message):
+            _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select count(*) from public.claims where run_id='{run_id}'") == "0"
+
+    # A replay may never move a stored fact or fragment to a different place.
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_r3_claim_json('r3-c-ok', versioned, 1798)}'::jsonb)")
+    moved = _r3_claim_json("r3-c-ok", versioned, 1798,
+                           locator=record_field_locator("rec-9", ("engine_displacement_cc",)).locator_key)
+    with pytest.raises(AssertionError, match="claim evidence locator mismatch"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{moved}'::jsonb)")
+    assert db.psql(f"select evidence_locator from public.claims where id='{claim}'") == R3_LOCATOR
+    stored = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(versioned, key='r3-f-ok')}'::jsonb)")
+    relocated = _r3_fragment_json(versioned, key="r3-f-ok", locator=R3_SPAN, kind="verbatim_excerpt")
+    with pytest.raises(AssertionError, match="evidence fragment idempotency conflict"):
+        _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{relocated}'::jsonb)")
+    assert db.psql(f"select locator_key from public.source_evidence_fragments where id='{stored}'") == R3_LOCATOR
+
+
+def test_r3_preserves_every_pre_existing_evidence_guarantee(r3_db):
+    """The replaced RPCs keep the lease, safety, lineage and quota rules."""
+    db = r3_db
+    lease, other = _evidence_fixture(db, "r3keep")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json('r3-keep-src')}'::jsonb)")
+    foreign = _rpc_as_service(db, f"select id from public.upsert_source_guarded('{other[0]}','{other[1]}',{other[2]},'{other[3]}','{_r3_source_json('r3-keep-foreign')}'::jsonb)")
+
+    # A stale, wrong or expired lease still writes nothing at all.
+    never = _r3_fragment_json(source, key="r3-keep-never")
+    for bad_worker, bad_attempt, bad_token, expire in (
+            ("wrong", attempt, token, False), (worker, str(int(attempt) + 1), token, False),
+            (worker, attempt, "wrong", False), (worker, attempt, token, True)):
+        if expire:
+            db.psql(f"update public.runs set lease_expires_at=now()-interval '1 second' where id='{run_id}'")
+        bad = f"'{run_id}','{bad_worker}',{bad_attempt},'{bad_token}'"
+        with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+            _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({bad},'{never}'::jsonb)")
+        with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+            _rpc_as_service(db, f"select public.upsert_source_guarded({bad},'{_r3_source_json('r3-keep-never')}'::jsonb)")
+    db.psql(f"update public.runs set lease_expires_at=now()+interval '5 minutes' where id='{run_id}'")
+
+    # Cross-run sources, task lineage, unsafe text, empty/oversized text, the
+    # index bound and the hash recomputation are all still enforced.
+    for payload, message in (
+            (_r3_fragment_json(foreign, key="r3-keep-cross"), "invalid evidence fragment source"),
+            (_r3_fragment_json(source, key="r3-keep-task", task="other-task"), "task provenance mismatch"),
+            (_r3_fragment_json(source, "api_key=ABCDEFGHIJKLMNOP", key="r3-keep-secret"), "unsafe evidence"),
+            (_r3_fragment_json(source, "   ", key="r3-keep-blank"), "must not be empty"),
+            (_r3_fragment_json(source, "w" * 401, key="r3-keep-long"), "exceeds the durable bound"),
+            (_r3_fragment_json(source, key="r3-keep-index", index=4), "fragment_index is outside the durable bound"),
+            (json.dumps({**json.loads(_r3_fragment_json(source, key="r3-keep-hash")),
+                         "content_hash": "0" * 64}), "content hash does not match")):
+        with pytest.raises(AssertionError, match=message):
+            _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{payload}'::jsonb)")
+    with pytest.raises(AssertionError, match="unsafe evidence payload rejected"):
+        _rpc_as_service(db, f"select public.upsert_source_guarded({args},'{json.dumps({**json.loads(_r3_source_json('r3-keep-unsafe')), 'api_key': 'x'})}'::jsonb)")
+    assert db.psql(f"select count(*) from public.source_evidence_fragments where run_id='{run_id}'") == "0"
+
+    # The per-source quota and the atomic claim link both survive.
+    for index in range(4):
+        _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, f'projection {index}', key=f'r3-keep-{index}', index=index)}'::jsonb)")
+    with pytest.raises(AssertionError, match="count limit reached"):
+        _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, 'one too many', key='r3-keep-fifth')}'::jsonb)")
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_r3_claim_json('r3-keep-claim', source, 1798)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.source_claim_links where claim_id='{claim}' and source_id='{source}'") == "1"
+    # The trusted canonical scope identity is still mandatory.
+    without_scope = json.loads(_r3_claim_json("r3-keep-noscope", source, 1798))
+    without_scope.pop("canonical_scope_hash")
+    with pytest.raises(AssertionError, match="trusted canonical scope identity is required"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(without_scope)}'::jsonb)")
+
+
+def test_r3_legacy_rows_stay_valid_readable_and_never_backfilled(r3_db):
+    db = r3_db
+    lease, _ = _evidence_fixture(db, "r3legacy")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+
+    # A pre-R3 source, fragment and claim: no version, no locator, no type.
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('r3-legacy')}'::jsonb)")
+    fragment = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source, FRAGMENT_TEXT, key='r3-legacy-frag')}'::jsonb)")
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_claim_json('r3-legacy-claim', source, 100)}'::jsonb)")
+    assert db.psql(f"select coalesce(source_version_kind,'-'), coalesce(source_version_id,'-') from public.sources where id='{source}'") == "-|-"
+    assert db.psql(f"select coalesce(fragment_type,'-'), coalesce(locator_key,'-') from public.source_evidence_fragments where id='{fragment}'") == "-|-"
+    assert db.psql(f"select coalesce(evidence_locator,'-') from public.claims where id='{claim}'") == "-"
+    # A legacy numeric claim with no unit is never retro-invalidated.
+    assert db.psql(f"select value, coalesce(unit,'-') from public.claims where id='{claim}'") == "100|-"
+    # Replaying them keeps working and still backfills nothing.
+    assert _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('r3-legacy')}'::jsonb)") == source
+    assert _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_fragment_json(source, FRAGMENT_TEXT, key='r3-legacy-frag')}'::jsonb)") == fragment
+    assert db.psql(f"select count(*) from public.sources where run_id='{run_id}' and source_version_kind is not null") == "0"
+
+
+def test_r3_surface_stays_service_only_append_only_and_rerun_safe(r3_db):
+    db = r3_db
+    migration = next(m for m in MIGRATIONS if "r3_versioned_focused_evidence" in m.name)
+    lease, _ = _evidence_fixture(db, "r3acl")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json('r3-acl-src')}'::jsonb)")
+    fragment = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, key='r3-acl-frag')}'::jsonb)")
+
+    # The new columns never become browser payload and never become mutable.
+    for role in ("anon", "authenticated"):
+        assert db.psql(
+            f"select coalesce(bool_or(has_column_privilege('{role}', 'public.source_evidence_fragments', "
+            f"column_name, 'SELECT')), false) from information_schema.columns "
+            f"where table_schema='public' and table_name='source_evidence_fragments'") == "f"
+        for function in ("upsert_source_guarded", "create_claim_with_source_guarded",
+                         "record_evidence_fragment_guarded"):
+            assert db.psql(
+                f"select has_function_privilege('{role}', "
+                f"'public.{function}(uuid,text,integer,text,jsonb)', 'EXECUTE')") == "f"
+        assert db.psql(f"select has_function_privilege('{role}', "
+                       f"'public.upsert_source_guarded(uuid,text,integer,text,jsonb)', 'EXECUTE')") == "f"
+    assert db.psql("select relrowsecurity from pg_class where oid='public.source_evidence_fragments'::regclass") == "t"
+    assert db.psql("select count(*) from pg_policies where schemaname='public' and tablename='source_evidence_fragments'") == "0"
+    with pytest.raises(AssertionError, match="append-only"):
+        db.psql(f"update public.source_evidence_fragments set locator_key='rewritten' where id='{fragment}'")
+    with pytest.raises(AssertionError, match="append-only"):
+        db.psql(f"delete from public.source_evidence_fragments where id='{fragment}'")
+
+    # Re-applying the migration preserves every row and every constraint.
+    before = db.psql("select count(*) from public.sources") + "|" + db.psql("select count(*) from public.source_evidence_fragments")
+    db.psql(file=migration)
+    db.psql(file=migration)
+    assert db.psql("select count(*) from public.sources") + "|" + db.psql("select count(*) from public.source_evidence_fragments") == before
+    assert db.psql(f"select source_version_id from public.sources where id='{source}'") == "2026.08.1"
+    assert db.psql(f"select locator_key from public.source_evidence_fragments where id='{fragment}'") == R3_LOCATOR
+    for name in ("sources_version_pairing", "claims_evidence_locator_bounded",
+                 "source_evidence_fragments_focus_pairing"):
+        assert db.psql(f"select count(*) from pg_constraint where conname='{name}'") == "1"
+    # The table constraints themselves reject a half-specified row written
+    # around the RPC, so the durable shape holds even for a direct insert.
+    with pytest.raises(AssertionError, match="sources_version_pairing"):
+        db.psql(f"insert into public.sources(run_id, agent, url, title, domain, source_type, "
+                f"source_strength, query, tool_operation, evidence_key, task_key, source_version_kind) "
+                f"values ('{run_id}','a','u','t','d','primary','strong','q','op','r3-direct','task','dataset_version')")

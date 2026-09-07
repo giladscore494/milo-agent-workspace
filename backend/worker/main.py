@@ -390,10 +390,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
                     cancellation_checker=is_cancelled, event_sink=forward_event,
-                    # tool_result_sink is deliberately left unwired: the
-                    # trusted seam exists and is tested, but turning a tool
-                    # result into Source/Claim evidence needs domain mapping
-                    # and a real evidence grant, which is Y4/G3 work.
+                    # tool_result_sink is deliberately left unwired. R3 built
+                    # the trusted mapping this seam was waiting for
+                    # (engines/swarm_v2/evidence_mapping.py), but
+                    # PRODUCTION_EVIDENCE_MAPPERS is empty and the production
+                    # ToolRegistry above registers no real source-bearing
+                    # tool, so there is nothing to acquire; wiring the sink
+                    # additionally needs a real evidence grant, which R3 does
+                    # not create. The contract is proven end to end against
+                    # deterministic offline tools and trusted offline mappers.
                     # A bounded worker-output repair is a semantic retry and
                     # consumes the SAME run-level retry allowance the
                     # Commander repair does. Provider 429 backpressure is
