@@ -251,11 +251,18 @@ def test_r3_migration_is_additive_nullable_rerun_safe_and_never_backfills():
     assert "where id = v_row.id" in upgrade
     assert "canonical_scope_hash" in upgrade and "scope_normalization_version" in upgrade
     assert "evidence_locator" not in upgrade
-    # Constraints are added idempotently, so a re-apply is a no-op.
-    assert sql.count("from pg_constraint where conname") == 3
-    for name in ("sources_version_pairing", "claims_evidence_locator_bounded",
+    # Constraints are dropped and re-added BY NAME, so a re-apply converges on
+    # the current definition instead of silently keeping an earlier draft's.
+    for name in ("sources_version_pairing", "claims_evidence_locator_canonical",
                  "source_evidence_fragments_focus_pairing"):
-        assert f"conname = '{name}'" in sql and f"add constraint {name}" in sql
+        assert f"drop constraint if exists {name}" in sql
+        assert sql.count(f"add constraint {name}") == 1
+    assert "drop constraint if exists claims_evidence_locator_bounded" in sql  # the earlier draft
+    assert "drop constraint" in sql and sql.count("drop constraint if exists") == 4
+
+
+R3_HELPERS = ("r3_source_version_valid(text,text)", "r3_canonical_locator(text)",
+              "r3_focus_valid(text,text)")
 
 
 def test_r3_rpcs_stay_lease_guarded_service_only_and_return_a_set():
@@ -263,8 +270,14 @@ def test_r3_rpcs_stay_lease_guarded_service_only_and_return_a_set():
     for rpc in R3_RPCS:
         assert f"create or replace function public.{rpc}" in sql
         assert f"public.{rpc}(uuid,text,integer,text,jsonb)" in sql
+    # The three shape helpers are pure, read no table, and follow the SAME
+    # service-only ACL convention as every other public function.
+    for helper in R3_HELPERS:
+        assert f"create or replace function public.{helper.split('(')[0]}" in sql
+        assert f"'public.{helper}'" in sql
     assert sql.count("perform public.assert_worker_lease") == 3
-    assert sql.count("set search_path = pg_catalog") == 3
+    assert sql.count("set search_path = pg_catalog") == 6
+    assert sql.count("\nimmutable\n") == 3   # the three helpers, and only them
     assert sql.count("returns setof public.sources") == 1
     assert sql.count("returns setof public.claims") == 1
     assert sql.count("returns setof public.source_evidence_fragments") == 1
@@ -336,27 +349,74 @@ def test_r3_rpcs_validate_the_new_contract_in_sql_not_only_in_pydantic():
     assert "claim evidence locator mismatch" in sql
     assert "v_row.locator_key is distinct from v_locator" in sql
     assert "v_row.fragment_type is distinct from v_type" in sql
+    # The COMPLETE shape, in SQL: kind-specific versions, canonical locators,
+    # fragment-type/locator-kind pairing, and a located claim backed by
+    # focused evidence of its own source in its own run.
+    assert "not public.r3_source_version_valid(v_kind, v_identifier)" in sql
+    assert sql.count("public.r3_canonical_locator(v_locator) is null") == 2   # claim + fragment
+    assert "not public.r3_focus_valid(v_type, v_locator)" in sql
+    assert "fragment type does not match the locator kind" in sql
+    assert "locator is not a canonical bounded location" in sql
+    backing = sql.split("'invalid claim: a located fact must be backed by focused evidence of its own source'", 1)[0]
+    backing = backing[backing.rindex("if v_locator is not null and not exists"):]
+    assert "f.run_id = p_run_id and f.source_id = v_source.id and f.locator_key = v_locator" in backing
+    # The table constraints apply the SAME helpers, so a direct insert that
+    # bypasses the RPC is held to the same shape.
+    assert "public.r3_source_version_valid(source_version_kind, source_version_id)" in sql
+    assert "public.r3_canonical_locator(evidence_locator) is not null" in sql
+    assert "public.r3_focus_valid(fragment_type, locator_key)" in sql
+    # A locator is parsed, bounded, re-rendered and compared -- never run.
+    canonical = sql.split("create or replace function public.r3_canonical_locator", 1)[1]
+    canonical = canonical.split("create or replace function public.r3_focus_valid", 1)[0]
+    assert "if v_canonical <> p_locator then" in canonical
+    assert "jsonb_array_length(v) <> 6" in canonical
+    for forbidden in ("jsonb_path_query", "jsonb_path_exists", "@?", "@@", "execute "):
+        assert forbidden not in canonical
 
 
 def test_r3_hard_limits_match_the_backend_constants_exactly():
-    """The SQL literals and the Python bounds are one contract."""
-    from backend.engines.swarm_v2.evidence_bounds import (FRAGMENT_TYPES,
-                                                          MAX_LOCATOR_KEY_CHARS,
-                                                          MAX_SOURCE_VERSION_CHARS,
-                                                          SOURCE_VERSION_KINDS)
+    """The SQL literals and the Python bounds/patterns are one contract."""
+    from backend.engines.swarm_v2.evidence_bounds import (
+        FRAGMENT_TYPE_BY_LOCATOR_KIND, FRAGMENT_TYPES, LOCATOR_RECORD_ID_PATTERN,
+        LOCATOR_SEGMENT_PATTERN, MAX_DOCUMENT_OFFSET, MAX_LOCATOR_KEY_CHARS,
+        MAX_LOCATOR_PATH_SEGMENTS, MAX_LOCATOR_SECTION_CHARS, SOURCE_VERSION_KINDS,
+        SOURCE_VERSION_PATTERNS)
+    from backend.engines.swarm_v2.fragments import MAX_FRAGMENT_CHARS
 
-    sql = R3_MIGRATION.read_text().lower()
-    kinds = ", ".join(f"'{kind}'" for kind in sorted(SOURCE_VERSION_KINDS))
+    sql = R3_MIGRATION.read_text()   # case-sensitive: the patterns carry [A-Z]
+    lowered = sql.lower()
+    # Every version kind's identifier rule is the SAME expression in SQL.
+    version_fn = sql.split("public.r3_source_version_valid(p_kind text, p_identifier text)", 1)[1]
+    version_fn = version_fn.split("$$;", 1)[0]
+    for kind, pattern in SOURCE_VERSION_PATTERNS.items():
+        assert f"when '{kind}' then p_identifier ~ '{pattern}'" in version_fn
+    assert set(SOURCE_VERSION_KINDS) == set(SOURCE_VERSION_PATTERNS)
+    assert version_fn.count("when '") == len(SOURCE_VERSION_KINDS)
+    # The locator alphabet, the closed kind set and every bound, verbatim.
+    locator_fn = sql.split("create or replace function public.r3_canonical_locator", 1)[1]
+    locator_fn = locator_fn.split("create or replace function public.r3_focus_valid", 1)[0]
+    assert f"v_record !~ '{LOCATOR_RECORD_ID_PATTERN}'" in locator_fn
+    assert f"(element #>> '{{}}') !~ '{LOCATOR_SEGMENT_PATTERN}'" in locator_fn
+    assert f"char_length(p_locator) > {MAX_LOCATOR_KEY_CHARS}" in locator_fn
+    assert f"v_len < 1 or v_len > {MAX_LOCATOR_PATH_SEGMENTS}" in locator_fn
+    assert f"v_end > {MAX_DOCUMENT_OFFSET} or v_end - v_start > {MAX_FRAGMENT_CHARS}" in locator_fn
+    assert f"char_length(v_section) > {MAX_LOCATOR_SECTION_CHARS}" in locator_fn
+    assert "v_kind not in ('document_span', 'record_field')" in locator_fn
+    # The fragment-type/locator-kind pairing is the same closed map.
+    focus_fn = sql.split("create or replace function public.r3_focus_valid", 1)[1].split("$$;", 1)[0]
+    for kind, fragment_type in FRAGMENT_TYPE_BY_LOCATOR_KIND.items():
+        assert f"(p_fragment_type = '{fragment_type}' and v_kind = '{kind}')" in focus_fn
+    # Both boolean helpers are strictly boolean: a NULL result would pass a
+    # CHECK constraint and silently admit the rows they exist to refuse.
+    assert "if v_kind is null then\n    return false;" in focus_fn
+    assert "select coalesce(p_kind is not null and p_identifier is not null and case p_kind" in sql
+    assert "end, false)" in sql
     types = ", ".join(f"'{kind}'" for kind in sorted(FRAGMENT_TYPES))
-    assert sql.count(f"in ({kinds})") == 2          # table constraint + RPC
-    assert sql.count(f"in ({types})") == 2
-    assert f"char_length(source_version_id) between 1 and {MAX_SOURCE_VERSION_CHARS}" in sql
-    assert f"char_length(v_identifier) > {MAX_SOURCE_VERSION_CHARS}" in sql
-    assert f"char_length(evidence_locator) between 1 and {MAX_LOCATOR_KEY_CHARS}" in sql
-    assert f"char_length(locator_key) between 1 and {MAX_LOCATOR_KEY_CHARS}" in sql
-    # Once in the claim RPC and once in the fragment RPC: both validate the
+    assert lowered.count(f"in ({types})") == 1       # the fragment RPC's early allowlist
+    # Once in the claim RPC and once in the fragment RPC: both bound the
     # locator in SQL rather than trusting the backend contract alone.
-    assert sql.count(f"char_length(v_locator) > {MAX_LOCATOR_KEY_CHARS}") == 2
+    assert lowered.count(f"char_length(v_locator) > {MAX_LOCATOR_KEY_CHARS}") == 2
+    sql = lowered
     # The three B2 fragment bounds are REUSED unchanged, never redefined.
     from backend.engines.swarm_v2.fragments import (MAX_FRAGMENT_CHARS,
                                                     MAX_FRAGMENTS_PER_SOURCE,

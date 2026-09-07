@@ -24,8 +24,8 @@ import pytest
 
 from backend.engines.swarm_v2 import (FRAGMENT_TYPES, MAX_FACTS_PER_BUNDLE,
                                       MAX_LOCATOR_KEY_CHARS, MAX_LOCATOR_PATH_SEGMENTS,
-                                      PRODUCTION_EVIDENCE_MAPPERS, SOURCE_VERSION_KINDS,
-                                      EvidenceBundle, EvidenceContractError, EvidenceLocator,
+                                      PRODUCTION_EVIDENCE_MAPPERS, EvidenceBundle,
+                                      EvidenceContractError, EvidenceLocator,
                                       EvidenceMapperRegistry, EvidenceMappingError,
                                       FocusedEvidenceFragment, GenericWorker, SourceVersion,
                                       StructuredEvidenceFact, ToolCallRecord,
@@ -34,6 +34,9 @@ from backend.engines.swarm_v2 import (FRAGMENT_TYPES, MAX_FACTS_PER_BUNDLE,
                                       document_span_locator, record_field_locator,
                                       snapshot_version, structured_projection,
                                       verbatim_excerpt)
+from backend.engines.swarm_v2.evidence_contracts import (FrozenDict, fragment_type_for,
+                                                         parse_locator_key, parse_version_key,
+                                                         revalidate_evidence_bundle)
 from backend.engines.swarm_v2.contracts import EvidenceReference
 from backend.engines.swarm_v2.evidence import EvidenceBoard, EvidenceValidationError, WorkerLease
 from backend.engines.swarm_v2.fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENTS_PER_SOURCE,
@@ -128,13 +131,24 @@ class R3GuardedRepository:
                 "lease_token": self.lease.lease_token}:
             raise AssertionError("STALE_WORKER_WRITE")
 
+    @staticmethod
+    def _canonical_locator(value):
+        """Mirror of public.r3_canonical_locator: the SAME parser the contract uses."""
+        try:
+            return parse_locator_key(value)
+        except EvidenceContractError:
+            return None
+
     def create_source(self, run_id, payload, **kwargs):
         self._assert_lease(run_id, kwargs, "source")
         kind, identifier = payload.get("source_version_kind"), payload.get("source_version_id")
         if (kind is None) != (identifier is None):
             raise AssertionError("a source version requires both a kind and an identifier")
-        if kind is not None and (kind not in SOURCE_VERSION_KINDS or len(identifier) > 128):
-            raise AssertionError("unknown or oversized source version")
+        if kind is not None:
+            try:  # mirror of public.r3_source_version_valid: kind-specific rules
+                parse_version_key(f"{kind}:{identifier}")
+            except EvidenceContractError:
+                raise AssertionError("unknown or malformed source version") from None
         existing = self.sources.get(payload["evidence_key"])
         if existing is not None:
             if (existing.get("source_version_kind"), existing.get("source_version_id")) != \
@@ -155,11 +169,18 @@ class R3GuardedRepository:
         if locator is not None:
             if len(locator) > MAX_LOCATOR_KEY_CHARS:
                 raise AssertionError("evidence locator exceeds the durable bound")
+            if self._canonical_locator(locator) is None:
+                raise AssertionError("evidence locator is not a canonical bounded location")
             if isinstance(payload["value"], (int, float)) and not isinstance(payload["value"], bool) \
                     and not payload.get("unit"):
                 raise AssertionError("a numeric located fact requires an explicit unit")
             if source.get("source_version_kind") is None:
                 raise AssertionError("a located fact requires a versioned source")
+            # A located fact must be backed by focused evidence at that exact
+            # location belonging to THIS source in THIS run.
+            if not any(row["source_id"] == source["id"] and row["run_id"] == str(run_id)
+                       and row.get("locator_key") == locator for row in self.fragments.values()):
+                raise AssertionError("must be backed by focused evidence of its own source")
         existing = self.claims.get(payload["evidence_key"])
         if existing is not None:
             if existing.get("evidence_locator") != locator:
@@ -187,6 +208,11 @@ class R3GuardedRepository:
         if kind is not None:
             if kind not in FRAGMENT_TYPES or len(locator) > MAX_LOCATOR_KEY_CHARS:
                 raise AssertionError("unknown fragment type or oversized locator")
+            located = self._canonical_locator(locator)
+            if located is None:
+                raise AssertionError("locator is not a canonical bounded location")
+            if fragment_type_for(located) != kind:  # mirror of public.r3_focus_valid
+                raise AssertionError("fragment type does not match the locator kind")
             if source.get("source_version_kind") is None:
                 raise AssertionError("a focused fragment requires a versioned source")
         existing = self.fragments.get(payload["evidence_key"])
@@ -487,7 +513,7 @@ def test_an_r3_source_without_a_version_or_a_fragment_without_a_locator_is_rejec
                                           fragment_type="verbatim_excerpt")
     with pytest.raises(AssertionError, match="requires a versioned source"):
         evidence.record_evidence_fragment(unversioned["id"], "text", task_key="task-1",
-                                          fragment_type="verbatim_excerpt",
+                                          fragment_type="structured_projection",
                                           locator_key=record_field_locator("r", ("f",)).locator_key)
     with pytest.raises(AssertionError, match="requires a versioned source"):
         evidence.record_claim(
@@ -1027,3 +1053,331 @@ def test_the_r3_path_never_calls_the_generic_prefix_extractor(board, monkeypatch
     from pathlib import Path
     source = Path("backend/engines/swarm_v2/evidence.py").read_text()
     assert source.count("extract_source_fragments(") == 1
+
+
+# =============================================================================
+# review blocker 1: identical text at distinct locators passes grounding
+# =============================================================================
+
+TWIN_TEXT = "Identical evidence sentence."
+
+
+def grounded_twin(board, locators):
+    """persist -> RepositoryEvidenceResolver -> ResolvedSourceEvidence -> serialization."""
+    evidence, repository = board
+    acquired = evidence.record_evidence_bundle(twin_bundle(locators=locators), task_key="task-1")
+    reference = EvidenceReference.model_validate(evidence.references()[0])
+    resolver = RepositoryEvidenceResolver(repository, run_id=evidence.lease.run_id)
+    context = resolve_source_context(resolver, [reference])[reference.claim_id]
+    assert context.source_id == acquired.source["id"]
+    document = json.loads(serialize_verifier_candidates(
+        [GroundedCandidate(reference=reference, source=context)]))
+    return context, document["sources"][0]["fragments"]
+
+
+def test_identical_text_from_two_records_resolves_through_grounding(board):
+    locators = (record_field_locator("rec-1", ("note",)), record_field_locator("rec-2", ("note",)))
+    context, serialized = grounded_twin(board, locators)
+    assert len(context.fragments) == 2 and context.is_r3_qualified
+    assert {item.content_hash for item in context.fragments} == {fragment_content_hash(TWIN_TEXT)}
+    assert {item.locator for item in context.fragments} == {item.locator_key for item in locators}
+    # Both locators and both fragment types survive verifier serialization,
+    # and the verdict contract is untouched: one hash still cites the source.
+    assert [item["locator"] for item in serialized] == [item.locator_key for item in locators]
+    assert {item["fragment_type"] for item in serialized} == {"structured_projection"}
+    assert context.content_hashes == {fragment_content_hash(TWIN_TEXT)}
+
+
+def test_identical_text_from_two_fields_of_one_record_resolves_through_grounding(board):
+    locators = (record_field_locator("rec-9", ("note",)), record_field_locator("rec-9", ("footnote",)))
+    context, serialized = grounded_twin(board, locators)
+    assert len(context.fragments) == 2
+    assert {json.loads(item["locator"])[2][0] for item in serialized} == {"note", "footnote"}
+    assert all(item["text"] == TWIN_TEXT for item in serialized)
+
+
+def test_a_true_duplicate_with_the_same_complete_provenance_is_rejected():
+    locator = record_field_locator("rec-1", ("note",)).locator_key
+    duplicate = tuple(SourceFragment(fragment_index=index, text=TWIN_TEXT,
+                                     content_hash=fragment_content_hash(TWIN_TEXT),
+                                     fragment_type="structured_projection", locator=locator)
+                      for index in range(2))
+    with pytest.raises(GroundingContractError):
+        ResolvedSourceEvidence(source_id="s", task_id="t", url="u", title="t", domain="d",
+                               source_type="structured", source_strength="strong",
+                               source_date=None, source_version="dataset_version:v1",
+                               fragments=duplicate)
+    # Position is not provenance: a different fragment_index does not make it
+    # a different fragment (the durable identity never included the index).
+    assert duplicate[0].identity == duplicate[1].identity
+
+
+def test_legacy_fragment_identity_is_unchanged_by_the_locator_rule():
+    def legacy(index, text):
+        return SourceFragment(fragment_index=index, text=text, content_hash=fragment_content_hash(text))
+
+    def context(fragments):
+        return ResolvedSourceEvidence(source_id="s", task_id="t", url="u", title="t", domain="d",
+                                      source_type="primary", source_strength="strong",
+                                      source_date=None, fragments=fragments)
+
+    # Two different legacy sentences resolve exactly as before...
+    resolved = context((legacy(0, "First sentence."), legacy(1, "Second sentence.")))
+    assert len(resolved.fragments) == 2 and not resolved.is_r3_qualified
+    assert all(item.identity == (item.content_hash, None) for item in resolved.fragments)
+    # ...and the same legacy sentence twice is still a duplicate.
+    with pytest.raises(GroundingContractError):
+        context((legacy(0, TWIN_TEXT), legacy(1, TWIN_TEXT)))
+    # A legacy fragment and an R3 fragment with the same text have different
+    # durable identities, so they resolve side by side.
+    located = SourceFragment(fragment_index=1, text=TWIN_TEXT,
+                             content_hash=fragment_content_hash(TWIN_TEXT),
+                             fragment_type="structured_projection",
+                             locator=record_field_locator("rec-1", ("note",)).locator_key)
+    assert len(context((legacy(0, TWIN_TEXT), located)).fragments) == 2
+
+
+# =============================================================================
+# review blocker 2: immutability, non-finite numbers, boundary revalidation
+# =============================================================================
+
+DEEP = {"a": {"b": {"c": {"d": {"e": "secret sentinel marker"}}}}}
+
+
+def test_mutation_after_construction_cannot_bypass_validation(board):
+    locator = record_field_locator("rec-1", ("note",))
+    fact = StructuredEvidenceFact(entity_key="rec-1", field_key="note",
+                                  value={"a": [1, {"b": 2}]}, time_scope={"year": 2020},
+                                  locator=locator)
+    assert isinstance(fact.value, FrozenDict) and isinstance(fact.value["a"], tuple)
+    assert isinstance(fact.time_scope, FrozenDict)
+    attempts = (lambda: fact.value.__setitem__("a", DEEP), lambda: fact.value.update(z=1),
+                lambda: fact.value.pop("a"), lambda: fact.value.clear(),
+                lambda: fact.value.setdefault("q", 1), lambda: fact.value["a"][1].__setitem__("b", DEEP),
+                lambda: fact.time_scope.clear(), lambda: fact.time_scope.__setitem__("year", DEEP))
+    for attempt in attempts:
+        with pytest.raises(TypeError):
+            attempt()
+    assert fact.value == {"a": (1, {"b": 2})} and fact.time_scope == {"year": 2020}
+    # The frozen model itself stays frozen too.
+    with pytest.raises(Exception):
+        fact.unit = "cc"   # type: ignore[misc]
+
+
+def forged_bundle(call, *, fact_overrides=None, fragment_overrides=None):
+    """A bundle assembled AROUND validation via model_construct."""
+    genuine = offline_evidence_mappers().map(call)
+    facts, fragments = list(genuine.facts), list(genuine.fragments)
+    if fact_overrides is not None:
+        facts[0] = StructuredEvidenceFact.model_construct(**{**dict(facts[0]), **fact_overrides})
+    if fragment_overrides is not None:
+        fragments[0] = FocusedEvidenceFragment.model_construct(**{**dict(fragments[0]), **fragment_overrides})
+    return EvidenceBundle.model_construct(source=genuine.source, locator_scope=genuine.locator_scope,
+                                          facts=tuple(facts), fragments=tuple(fragments))
+
+
+@pytest.mark.parametrize("field,forged,reason", [
+    ("value", DEEP, "EVIDENCE_VALUE_INVALID"),                                        # depth
+    ("value", {f"k{i}": i for i in range(17)}, "EVIDENCE_VALUE_INVALID"),            # collection size
+    ("value", "x" * 600, "EVIDENCE_LIMIT_EXCEEDED"),                                  # byte size
+    ("value", 1798, "EVIDENCE_FACT_UNIT_REQUIRED"),                                   # numeric, unit stripped
+    ("locator", EvidenceLocator.model_construct(kind="record_field", record_id="rec-1",
+                                                field_path=("$..price",), section=None,
+                                                char_start=None, char_end=None),
+     "EVIDENCE_LOCATOR_INVALID"),                                                     # locator
+])
+def test_a_forged_or_mutated_bundle_fails_before_the_first_repository_write(board, field, forged, reason):
+    evidence, repository = board
+    call = call_record(record_result())
+    overrides = {field: forged}
+    if field == "value" and forged == 1798:
+        overrides["unit"] = None
+    bundle = forged_bundle(call, fact_overrides=overrides)
+
+    class Forger:
+        tool, operation = "mock.structured_registry", "get_record"
+
+        def map(self, _call):
+            return bundle
+
+    # Rejected at the mapper boundary...
+    with pytest.raises(EvidenceContractError) as failure:
+        acquisition(evidence, EvidenceMapperRegistry((Forger(),))).acquire(call)
+    assert failure.value.reason_code == reason
+    # ...and again immediately before persistence, with NO write either time --
+    # not even the source row.
+    with pytest.raises(EvidenceContractError):
+        evidence.record_evidence_bundle(bundle, task_key="task-1")
+    assert repository.writes == [] and repository.sources == {}
+    # The rejected evidence never travels with the error.
+    assert "secret sentinel" not in str(failure.value) and "$.." not in str(failure.value)
+
+
+def test_a_forged_fragment_hash_fails_before_the_first_repository_write(board):
+    evidence, repository = board
+    bundle = forged_bundle(call_record(record_result()),
+                           fragment_overrides={"content_hash": fragment_content_hash("other")})
+    with pytest.raises(EvidenceContractError) as failure:
+        evidence.record_evidence_bundle(bundle, task_key="task-1")
+    assert failure.value.reason_code == "EVIDENCE_FRAGMENT_HASH_MISMATCH"
+    assert repository.writes == []
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_nan_and_infinities_are_rejected_everywhere(bad):
+    locator = record_field_locator("rec-1", ("note",))
+    with pytest.raises(EvidenceContractError) as failure:
+        StructuredEvidenceFact(entity_key="e", field_key="f", value=bad, unit="cc", locator=locator)
+    assert failure.value.reason_code == "EVIDENCE_VALUE_INVALID"
+    with pytest.raises(EvidenceContractError):    # nested inside a bounded value
+        StructuredEvidenceFact(entity_key="e", field_key="f", value={"a": [bad]}, locator=locator)
+    with pytest.raises(EvidenceContractError):    # in the time scope
+        StructuredEvidenceFact(entity_key="e", field_key="f", value="v",
+                               time_scope={"year": bad}, locator=locator)
+    with pytest.raises(EvidenceContractError):    # in a snapshot-version input
+        snapshot_version({"x": bad})
+    with pytest.raises(ValueError):               # canonical JSON never emits NaN/Infinity
+        from backend.engines.swarm_v2.evidence_contracts import canonical_json
+        canonical_json(bad)
+    assert "nan" not in str(failure.value).lower() and "inf" not in str(failure.value).lower()
+
+
+def test_valid_nested_values_within_bounds_are_accepted_and_persisted(board):
+    evidence, repository = board
+    value = {"limits": {"city": [1, 2.5, None], "flags": {"eu6": True}}, "label": "ok"}
+    fact = StructuredEvidenceFact(entity_key="rec-1", field_key="note", value=value,
+                                  time_scope={"year": 2020, "quarter": "Q3"},
+                                  locator=record_field_locator("rec-1", ("note",)))
+    assert fact.value == {"limits": {"city": (1, 2.5, None), "flags": {"eu6": True}}, "label": "ok"}
+    bundle = twin_bundle(locators=(record_field_locator("rec-1", ("note",)),))
+    bundle = build_evidence_bundle(source=bundle.source, locator_scope=bundle.locator_scope,
+                                   facts=(fact,), fragments=bundle.fragments)
+    acquired = evidence.record_evidence_bundle(bundle, task_key="task-1")
+    assert acquired.claims[0]["value"] == value                 # plain JSON in the durable row
+    assert acquired.claims[0]["time_scope"] == {"year": 2020, "quarter": "Q3"}
+    assert revalidate_evidence_bundle(bundle) == bundle          # idempotent revalidation
+
+
+# =============================================================================
+# review blocker 3: malformed durable provenance fails closed in grounding
+# =============================================================================
+
+MALFORMED_LOCATORS = [
+    '["record_field", "rec-1", ["a"], null, null, null]',     # not canonical (spaces)
+    "not json", "", "[]", '{"kind": "record_field"}',
+    '["record_field","rec-1",["$..price"],null,null,null]',   # JSONPath
+    '["record_field","rec-1",["a[0]"],null,null,null]',       # index/filter syntax
+    '["record_field","rec-1",["*"],null,null,null]',           # wildcard
+    '["record_field","rec-1",[],null,null,null]',              # empty path
+    '["record_field","rec-1",["a","b","c","d","e","f","g"],null,null,null]',
+    '["record_field","rec-1",["a"],"section",null,null]',     # section on a record locator
+    '["record_field","rec-1",["a"],null,0,5]',                 # offsets on a record locator
+    '["record_field","rec-1",["a"],null,null,null,1]',         # seven elements
+    '["document_span","doc-1",["x"],null,0,5]',                # path on a span
+    '["document_span","doc-1",[],null,0,5.0]',                 # float offset
+    '["document_span","doc-1",[],null,0,1e3]',                 # non-canonical number
+    '["document_span","doc-1",[],null,5,5]',                   # empty span
+    '["document_span","doc-1",[],null,0,401]',                 # a page
+    '["document_span","doc-1",[],null,-1,5]',
+    '["document_span","doc-1",[],"a  b",0,5]',                 # unnormalized section
+    '["document_span","doc-1",[],null,0,NaN]',
+    '["made_up","rec-1",["a"],null,null,null]',
+    '["record_field","rec 1",["a"],null,null,null]',
+]
+
+
+@pytest.mark.parametrize("locator", MALFORMED_LOCATORS)
+def test_grounding_rejects_a_malformed_or_non_canonical_locator(locator):
+    fragment_type = "verbatim_excerpt" if locator.startswith('["document_span"') else "structured_projection"
+    with pytest.raises(GroundingContractError):
+        SourceFragment(fragment_index=0, text=SENTENCE, content_hash=fragment_content_hash(SENTENCE),
+                       fragment_type=fragment_type, locator=locator)
+    with pytest.raises(EvidenceContractError):
+        parse_locator_key(locator)
+
+
+def test_grounding_rejects_a_fragment_type_that_does_not_match_its_locator_kind():
+    record = record_field_locator("rec-1", ("a",)).locator_key
+    span = document_span_locator("doc-1", 0, 5).locator_key
+    hash_ = fragment_content_hash(SENTENCE)
+    with pytest.raises(GroundingContractError):
+        SourceFragment(fragment_index=0, text=SENTENCE, content_hash=hash_,
+                       fragment_type="verbatim_excerpt", locator=record)
+    with pytest.raises(GroundingContractError):
+        SourceFragment(fragment_index=0, text=SENTENCE, content_hash=hash_,
+                       fragment_type="structured_projection", locator=span)
+    assert SourceFragment(fragment_index=0, text=SENTENCE, content_hash=hash_,
+                          fragment_type="verbatim_excerpt", locator=span).locator == span
+
+
+@pytest.mark.parametrize("version", [
+    "content_sha256:abc", "content_sha256:" + "A" * 64, "content_sha256:" + "a" * 63,
+    "git_commit:zzzzzzz", "git_commit:abcdef", "dataset_version:", "dataset_version:-x",
+    "document_revision:rev 7", "retrieved_at:2026-08", "dataset_version", ":v1",
+    "content_sha256:" + "a" * 64 + " ", "dataset_version:" + "v" * 129,
+])
+def test_grounding_rejects_a_malformed_source_version(version):
+    with pytest.raises(GroundingContractError):
+        ResolvedSourceEvidence(source_id="s", task_id="t", url="u", title="t", domain="d",
+                               source_type="structured", source_strength="strong",
+                               source_date=None, source_version=version)
+    with pytest.raises(EvidenceContractError):
+        parse_version_key(version)
+
+
+@pytest.mark.parametrize("version", ["content_sha256:" + "a" * 64, "git_commit:abcdef0",
+                                     "dataset_version:2026.08.1", "document_revision:rev-7"])
+def test_grounding_accepts_every_well_formed_version_kind(version):
+    assert parse_version_key(version).version_key == version
+    assert ResolvedSourceEvidence(source_id="s", task_id="t", url="u", title="t", domain="d",
+                                  source_type="structured", source_strength="strong",
+                                  source_date=None, source_version=version).source_version == version
+
+
+def test_malformed_durable_provenance_fails_closed_before_the_verifier(board):
+    """A forged row in the repository never reaches serialization."""
+    evidence, repository = board
+    acquired = acquisition(evidence).acquire(call_record(record_result()))
+    reference = EvidenceReference.model_validate(evidence.references()[0])
+    resolver = RepositoryEvidenceResolver(repository, run_id=evidence.lease.run_id)
+    assert resolver.resolve([reference])[acquired.source["id"]].is_r3_qualified
+
+    fragment = next(iter(repository.fragments.values()))
+    original = fragment["locator_key"]
+    for forged in ('["record_field", "rec-1", ["x"], null, null, null]', "not json",
+                   '["record_field","rec-1",["$..x"],null,null,null]'):
+        fragment["locator_key"] = forged
+        with pytest.raises(GroundingContractError):
+            resolver.resolve([reference])
+    fragment["locator_key"] = original
+    fragment["fragment_type"] = "verbatim_excerpt"          # kind mismatch
+    with pytest.raises(GroundingContractError):
+        resolver.resolve([reference])
+    fragment["fragment_type"] = "structured_projection"
+
+    source = next(iter(repository.sources.values()))
+    for kind, identifier in (("content_sha256", "abc"), ("git_commit", "zzzzzzz"),
+                             ("retrieved_at", "2026-08"), ("dataset_version", None)):
+        source["source_version_kind"], source["source_version_id"] = kind, identifier
+        with pytest.raises(GroundingContractError):
+            resolver.resolve([reference])
+    source["source_version_kind"], source["source_version_id"] = "dataset_version", "2026.08.1"
+    assert resolver.resolve([reference])[acquired.source["id"]].is_r3_qualified
+
+
+def test_a_located_fact_must_be_backed_by_focused_evidence_at_its_locator():
+    source = VersionedEvidenceSource(
+        agent="a", url="https://example.test/x", title="t", domain="example.test",
+        source_type="structured", source_strength="strong", query="q",
+        tool_operation="mock.structured_registry.get_record",
+        version=SourceVersion(kind="dataset_version", identifier="v1"), confidence=0.9)
+    backed = record_field_locator("rec-1", ("note",))
+    fragment = FocusedEvidenceFragment(fragment_type="structured_projection", text="t",
+                                       locator=backed, fragment_index=0,
+                                       content_hash=fragment_content_hash("t"))
+    unbacked = StructuredEvidenceFact(entity_key="rec-1", field_key="other", value="v",
+                                      locator=record_field_locator("rec-1", ("other",)))
+    with pytest.raises(EvidenceContractError) as failure:
+        build_evidence_bundle(source=source, locator_scope=("rec-1",), facts=(unbacked,),
+                              fragments=(fragment,))
+    assert failure.value.reason_code == "EVIDENCE_LOCATOR_OUT_OF_SCOPE"

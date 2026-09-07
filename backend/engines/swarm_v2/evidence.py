@@ -42,7 +42,8 @@ from backend.schemas import ClaimCreate, ConflictCreate, SourceCreate, ToolUsage
 
 from .evidence_contracts import (FRAGMENT_TYPES, MAX_LOCATOR_KEY_CHARS, EvidenceBundle,
                                  FocusedEvidenceFragment, SourceVersion,
-                                 StructuredEvidenceFact, VersionedEvidenceSource)
+                                 StructuredEvidenceFact, VersionedEvidenceSource,
+                                 revalidate_evidence_bundle)
 from .evidence_mapping import AcquiredEvidence
 from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENTS_PER_SOURCE, extract_source_fragments,
                         fragment_content_hash, normalize_fragment_text)
@@ -357,10 +358,15 @@ class EvidenceBoard:
         instead of duplicating them.
 
         The bundle is trusted mapper output, not model output: see
-        .evidence_mapping for the only path that produces one.
+        .evidence_mapping for the only path that produces one.  It is still
+        revalidated HERE, from a copy of its own data, immediately before the
+        first write: whatever happened to the object between mapping and
+        persistence, nothing that fails the contract now can cause any
+        durable write -- not even the source row.
         """
         if not isinstance(bundle, EvidenceBundle):
             raise EvidenceValidationError("a validated evidence bundle is required")
+        bundle = revalidate_evidence_bundle(bundle)
         descriptor = bundle.source
         source = SourceCreate(agent=descriptor.agent, url=descriptor.url, title=descriptor.title,
                               domain=descriptor.domain, source_type=descriptor.source_type,

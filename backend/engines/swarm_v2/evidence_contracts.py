@@ -47,45 +47,40 @@ preserved verbatim; it is never interpreted.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import math
 import re
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from .contracts import StrictContract
-from .evidence_bounds import (FRAGMENT_TYPES, LOCATOR_KINDS, MAX_DOCUMENT_OFFSET,
-                              MAX_FACTS_PER_BUNDLE, MAX_FACT_COLLECTION_ITEMS,
-                              MAX_FACT_VALUE_DEPTH, MAX_FACT_VALUE_JSON_BYTES,
-                              MAX_LOCATOR_KEY_CHARS, MAX_LOCATOR_PATH_SEGMENTS,
-                              MAX_LOCATOR_RECORD_ID_CHARS, MAX_LOCATOR_SCOPE_IDS,
-                              MAX_LOCATOR_SECTION_CHARS, MAX_LOCATOR_SEGMENT_CHARS,
-                              MAX_PROJECTION_FIELDS, MAX_SOURCE_VERSION_CHARS,
-                              MAX_SOURCE_VERSION_KEY_CHARS, MAX_TIME_SCOPE_KEYS,
-                              MAX_TOOL_SNAPSHOT_JSON_BYTES, MAX_UNIT_CHARS,
-                              SOURCE_VERSION_KINDS)
+from .evidence_bounds import (FRAGMENT_TYPE_BY_LOCATOR_KIND, FRAGMENT_TYPES, LOCATOR_KINDS,
+                              LOCATOR_RECORD_ID_PATTERN, LOCATOR_SEGMENT_PATTERN,
+                              MAX_DOCUMENT_OFFSET, MAX_FACTS_PER_BUNDLE,
+                              MAX_FACT_COLLECTION_ITEMS, MAX_FACT_VALUE_DEPTH,
+                              MAX_FACT_VALUE_JSON_BYTES, MAX_LOCATOR_KEY_CHARS,
+                              MAX_LOCATOR_PATH_SEGMENTS, MAX_LOCATOR_RECORD_ID_CHARS,
+                              MAX_LOCATOR_SCOPE_IDS, MAX_LOCATOR_SECTION_CHARS,
+                              MAX_LOCATOR_SEGMENT_CHARS, MAX_PROJECTION_FIELDS,
+                              MAX_SOURCE_VERSION_CHARS, MAX_SOURCE_VERSION_KEY_CHARS,
+                              MAX_TIME_SCOPE_KEYS, MAX_TOOL_SNAPSHOT_JSON_BYTES,
+                              MAX_UNIT_CHARS, SOURCE_VERSION_KINDS, SOURCE_VERSION_PATTERNS)
 from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENTS_PER_SOURCE,
                         MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE, fragment_content_hash,
                         normalize_fragment_text)
 
-# The deterministic bounds live in .evidence_bounds (a dependency-free leaf,
-# so .contracts can bound the same provenance without an import cycle) and are
-# re-exported here; the three FRAGMENT bounds come from .fragments unchanged.
-#
-# A locator segment is a LITERAL object key and a record id is a LITERAL
-# identifier.  Neither pattern admits `$`, `*`, `[`, `]`, `?`, a quote, a
-# comma or `..`, so JSONPath/expression/filter syntax is rejected as a
-# malformed key rather than being parsed and then refused.
-_SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
-_RECORD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,127}$")
+# The deterministic bounds, the closed vocabularies and the shared identifier
+# patterns live in .evidence_bounds (a dependency-free leaf, so .contracts can
+# bound the same provenance without an import cycle, and so the SQL copies can
+# be pinned against ONE definition) and are re-exported here; the three
+# FRAGMENT bounds come from .fragments unchanged.
+_SEGMENT_PATTERN = re.compile(LOCATOR_SEGMENT_PATTERN)
+_RECORD_ID_PATTERN = re.compile(LOCATOR_RECORD_ID_PATTERN)
 _UNIT_PATTERN = re.compile(r"^[A-Za-z%][A-Za-z0-9%^/._-]{0,31}$")
-_VERSION_PATTERNS = {
-    "content_sha256": re.compile(r"^[0-9a-f]{64}$"),
-    "dataset_version": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$"),
-    "document_revision": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$"),
-    "git_commit": re.compile(r"^[0-9a-f]{7,64}$"),
-}
+_VERSION_PATTERNS = {kind: re.compile(pattern) for kind, pattern in SOURCE_VERSION_PATTERNS.items()}
 
 EVIDENCE_CONTRACT_REASONS = frozenset({
     "EVIDENCE_CONTRACT_INVALID",
@@ -169,12 +164,76 @@ class BoundedEvidenceContract(StrictContract):
 
 
 def canonical_json(value: Any) -> str:
-    """Deterministic JSON identity; the ONE serialization this module uses."""
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    """Deterministic JSON identity; the ONE serialization this module uses.
+
+    `allow_nan=False` is deliberate: NaN and the infinities are not JSON, and a
+    token like `Infinity` would otherwise be emitted here and only fail later,
+    at a serialization or PostgreSQL boundary, instead of at acquisition.
+    """
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                      allow_nan=False)
+
+
+def _locator_json(value: Any) -> str:
+    """The canonical rendering of a locator: compact, unicode kept verbatim.
+
+    `ensure_ascii=False` (unlike canonical_json) so the rendering is exactly
+    what PostgreSQL's own `to_jsonb(text)::text` produces for the section
+    heading: the guarded RPCs rebuild this string from the parsed locator and
+    require the stored text to match it byte for byte.
+    """
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+class FrozenDict(dict):
+    """A dict that cannot be changed after the contract validated it.
+
+    A frozen pydantic model only protects its own attributes; a nested dict
+    inside a `value: Any` field stayed mutable, so a caller holding the
+    already-validated fact could deepen or widen it past the bounds after the
+    check had run.  Freezing the nested structure at validation time closes
+    that gap at its source.  It stays a real `dict` so json, pydantic
+    serialization and every existing consumer read it unchanged.
+    """
+
+    __slots__ = ()
+
+    def _immutable(self, *_args: Any, **_kwargs: Any) -> None:
+        raise TypeError("validated evidence values are immutable")
+
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = _immutable  # type: ignore[assignment]
+    __ior__ = _immutable  # type: ignore[assignment]
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (FrozenDict, (dict(self),))
+
+    def __copy__(self) -> "FrozenDict":
+        return FrozenDict(self)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "FrozenDict":
+        return FrozenDict({key: copy.deepcopy(item, memo) for key, item in self.items()})
+
+
+def _freeze(value: Any) -> Any:
+    """Deep-freeze a validated JSON value: dicts become FrozenDict, lists tuples."""
+    if isinstance(value, Mapping):
+        return FrozenDict({str(key): _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    """A fresh, mutable deep copy of a JSON value, for revalidation."""
+    if isinstance(value, Mapping):
+        return {str(key): _thaw(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw(item) for item in value]
+    return value
 
 
 def _bounded_value(value: Any, *, depth: int = 0) -> Any:
-    """Reject anything that is not small, shallow, JSON-shaped evidence."""
+    """Reject anything that is not small, shallow, finite, JSON-shaped evidence."""
     if depth > MAX_FACT_VALUE_DEPTH:
         raise EvidenceContractError("EVIDENCE_VALUE_INVALID")
     if isinstance(value, Mapping):
@@ -191,6 +250,9 @@ def _bounded_value(value: Any, *, depth: int = 0) -> Any:
         for item in value:
             _bounded_value(item, depth=depth + 1)
         return value
+    if isinstance(value, float) and not math.isfinite(value):
+        # NaN, +inf and -inf are not JSON and can never be evidence.
+        raise EvidenceContractError("EVIDENCE_VALUE_INVALID")
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     raise EvidenceContractError("EVIDENCE_VALUE_INVALID")
@@ -205,6 +267,11 @@ def _bounded_json(value: Any, limit: int) -> str:
     if len(encoded.encode()) > limit:
         raise EvidenceContractError("EVIDENCE_LIMIT_EXCEEDED")
     return encoded
+
+
+def _reject_constant(_token: str) -> Any:
+    # json.loads would otherwise accept the non-JSON tokens NaN/Infinity.
+    raise ValueError("non-standard JSON numeric token")
 
 
 class SourceVersion(BoundedEvidenceContract):
@@ -232,6 +299,26 @@ class SourceVersion(BoundedEvidenceContract):
     def version_key(self) -> str:
         """The single durable/canonical representation: `kind:identifier`."""
         return f"{self.kind}:{self.identifier}"
+
+
+def parse_version_key(value: Any) -> SourceVersion:
+    """Rebuild a SourceVersion from its canonical durable `kind:identifier`.
+
+    This is how the grounding reader validates a version that came back from
+    the database: the kind must be one of the closed set, the identifier must
+    satisfy that kind's own rule, and the rebuilt key must equal the stored
+    text exactly.  `content_sha256:abc` therefore fails here just as it fails
+    in the Python contract and in the guarded RPC.
+    """
+    if not isinstance(value, str) or not 1 <= len(value) <= MAX_SOURCE_VERSION_KEY_CHARS:
+        raise EvidenceContractError("EVIDENCE_SOURCE_VERSION_INVALID")
+    kind, separator, identifier = value.partition(":")
+    if not separator or not identifier or kind not in SOURCE_VERSION_KINDS:
+        raise EvidenceContractError("EVIDENCE_SOURCE_VERSION_INVALID")
+    version = SourceVersion(kind=kind, identifier=identifier)  # type: ignore[arg-type]
+    if version.version_key != value:
+        raise EvidenceContractError("EVIDENCE_SOURCE_VERSION_INVALID")
+    return version
 
 
 def snapshot_version(snapshot: Any) -> SourceVersion:
@@ -308,8 +395,52 @@ class EvidenceLocator(BoundedEvidenceContract):
         injective, so two different locations can never collapse onto one
         durable identity and dedupe evidence that is not the same evidence.
         """
-        return canonical_json([self.kind, self.record_id, list(self.field_path),
-                               self.section, self.char_start, self.char_end])
+        return _locator_json([self.kind, self.record_id, list(self.field_path),
+                              self.section, self.char_start, self.char_end])
+
+
+def parse_locator_key(value: Any) -> EvidenceLocator:
+    """Rebuild an EvidenceLocator from its canonical durable text, or fail.
+
+    The ONLY way a locator string re-enters the contract: it must be a JSON
+    array of exactly six elements `[kind, record_id, field_path, section,
+    char_start, char_end]`, every element must satisfy the closed shape for
+    its kind, and the rebuilt locator's own canonical rendering must equal the
+    input byte for byte.  A non-JSON string, a differently spaced or ordered
+    rendering, a wildcard segment, an extra element, a float offset and a
+    locator of the wrong kind for its fragment type all fail here.  Nothing is
+    evaluated: the string is parsed, compared and rebuilt, never run.
+    """
+    if not isinstance(value, str) or not 1 <= len(value) <= MAX_LOCATOR_KEY_CHARS:
+        raise EvidenceContractError("EVIDENCE_LOCATOR_INVALID")
+    try:
+        parsed = json.loads(value, parse_constant=_reject_constant)
+    except (TypeError, ValueError, RecursionError):
+        raise EvidenceContractError("EVIDENCE_LOCATOR_INVALID") from None
+    if not isinstance(parsed, list) or len(parsed) != 6:
+        raise EvidenceContractError("EVIDENCE_LOCATOR_INVALID")
+    kind, record_id, field_path, section, char_start, char_end = parsed
+    if not isinstance(kind, str) or kind not in LOCATOR_KINDS:
+        raise EvidenceContractError("EVIDENCE_LOCATOR_INVALID")
+    if not isinstance(record_id, str) or not isinstance(field_path, list) \
+            or any(not isinstance(segment, str) for segment in field_path):
+        raise EvidenceContractError("EVIDENCE_LOCATOR_INVALID")
+    if section is not None and not isinstance(section, str):
+        raise EvidenceContractError("EVIDENCE_LOCATOR_INVALID")
+    for offset in (char_start, char_end):
+        if offset is not None and (isinstance(offset, bool) or not isinstance(offset, int)):
+            raise EvidenceContractError("EVIDENCE_LOCATOR_INVALID")
+    locator = EvidenceLocator(kind=kind, record_id=record_id,  # type: ignore[arg-type]
+                              field_path=tuple(field_path), section=section,
+                              char_start=char_start, char_end=char_end)
+    if locator.locator_key != value:
+        raise EvidenceContractError("EVIDENCE_LOCATOR_INVALID")
+    return locator
+
+
+def fragment_type_for(locator: EvidenceLocator) -> str:
+    """The one fragment type a locator of this kind may carry."""
+    return FRAGMENT_TYPE_BY_LOCATOR_KIND[locator.kind]
 
 
 def record_field_locator(record_id: str, field_path: Sequence[str]) -> EvidenceLocator:
@@ -350,8 +481,7 @@ class FocusedEvidenceFragment(BoundedEvidenceContract):
     def _shape(self) -> "FocusedEvidenceFragment":
         if normalize_fragment_text(self.text) != self.text:
             raise EvidenceContractError("EVIDENCE_FRAGMENT_TEXT_INVALID")
-        expected = "document_span" if self.fragment_type == "verbatim_excerpt" else "record_field"
-        if self.locator.kind != expected:
+        if FRAGMENT_TYPE_BY_LOCATOR_KIND[self.locator.kind] != self.fragment_type:
             raise EvidenceContractError("EVIDENCE_LOCATOR_INVALID")
         if fragment_content_hash(self.text) != self.content_hash:
             raise EvidenceContractError("EVIDENCE_FRAGMENT_HASH_MISMATCH")
@@ -489,6 +619,12 @@ class StructuredEvidenceFact(BoundedEvidenceContract):
         if len(self.time_scope) > MAX_TIME_SCOPE_KEYS:
             raise EvidenceContractError("EVIDENCE_LIMIT_EXCEEDED")
         _bounded_json(self.time_scope, MAX_FACT_VALUE_JSON_BYTES)
+        # What was validated is what stays: the nested value and scope are
+        # deep-frozen so no caller can deepen, widen or replace them after
+        # the bounds above were checked.  `frozen=True` alone only guards the
+        # attributes of this model, not the containers inside them.
+        object.__setattr__(self, "value", _freeze(self.value))
+        object.__setattr__(self, "time_scope", _freeze(self.time_scope))
         return self
 
 
@@ -552,6 +688,13 @@ class EvidenceBundle(BoundedEvidenceContract):
             raise EvidenceContractError("EVIDENCE_CONTRACT_INVALID")
         if sum(len(item.text) for item in self.fragments) > MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE:
             raise EvidenceContractError("EVIDENCE_LIMIT_EXCEEDED")
+        # A located fact is only a fact because focused evidence at that exact
+        # location supports it: every fact locator must be one of this
+        # bundle's own fragment locators.  The guarded claim RPC enforces the
+        # same rule against the durable fragments of the same source.
+        located = {item.locator.locator_key for item in self.fragments}
+        if any(item.locator.locator_key not in located for item in self.facts):
+            raise EvidenceContractError("EVIDENCE_LOCATOR_OUT_OF_SCOPE")
         return self
 
 
@@ -563,8 +706,55 @@ def build_evidence_bundle(*, source: VersionedEvidenceSource, locator_scope: Ite
                           facts=tuple(facts), fragments=tuple(fragments))
 
 
+def _copy_locator(locator: EvidenceLocator) -> EvidenceLocator:
+    return EvidenceLocator(kind=locator.kind, record_id=locator.record_id,
+                           field_path=tuple(locator.field_path), section=locator.section,
+                           char_start=locator.char_start, char_end=locator.char_end)
+
+
+def revalidate_evidence_bundle(bundle: Any) -> EvidenceBundle:
+    """Rebuild a bundle from a copy of its own data so EVERY validator runs again.
+
+    Called at the two trust boundaries a bundle crosses -- immediately after
+    the mapper returns it and immediately before the first durable write --
+    so a bundle assembled around validation (`model_construct`, a subclass, a
+    shared reference mutated after construction) is caught before it can
+    cause any write, including a partially persisted source.  Every nested
+    value is thawed into a fresh copy first, so the rebuilt contract shares no
+    container with the input and cannot be changed underneath it afterwards.
+    """
+    if not isinstance(bundle, EvidenceBundle):
+        raise EvidenceContractError("EVIDENCE_CONTRACT_INVALID")
+    try:
+        descriptor, version = bundle.source, bundle.source.version
+        source = VersionedEvidenceSource(
+            agent=descriptor.agent, url=descriptor.url, title=descriptor.title,
+            domain=descriptor.domain, source_type=descriptor.source_type,
+            source_strength=descriptor.source_strength, source_date=descriptor.source_date,
+            query=descriptor.query, tool_operation=descriptor.tool_operation,
+            version=SourceVersion(kind=version.kind, identifier=version.identifier),
+            confidence=descriptor.confidence)
+        facts = tuple(StructuredEvidenceFact(
+            entity_key=item.entity_key, field_key=item.field_key, value=_thaw(item.value),
+            unit=item.unit, time_scope=_thaw(item.time_scope), geography=item.geography,
+            market=item.market, locator=_copy_locator(item.locator)) for item in bundle.facts)
+        fragments = tuple(FocusedEvidenceFragment(
+            fragment_type=item.fragment_type, text=item.text,
+            locator=_copy_locator(item.locator), fragment_index=item.fragment_index,
+            content_hash=item.content_hash) for item in bundle.fragments)
+        return EvidenceBundle(source=source, locator_scope=tuple(bundle.locator_scope),
+                              facts=facts, fragments=fragments)
+    except EvidenceContractError:
+        raise
+    except Exception:
+        # `from None`: an attribute/type error from a forged bundle can quote
+        # its contents.
+        raise EvidenceContractError("EVIDENCE_CONTRACT_INVALID") from None
+
+
 __all__ = [
-    "EVIDENCE_CONTRACT_REASONS", "FRAGMENT_TYPES", "LOCATOR_KINDS",
+    "EVIDENCE_CONTRACT_REASONS", "FRAGMENT_TYPES", "FRAGMENT_TYPE_BY_LOCATOR_KIND",
+    "LOCATOR_KINDS",
     "MAX_DOCUMENT_OFFSET", "MAX_FACTS_PER_BUNDLE", "MAX_FACT_COLLECTION_ITEMS",
     "MAX_FACT_VALUE_DEPTH", "MAX_FACT_VALUE_JSON_BYTES", "MAX_LOCATOR_KEY_CHARS",
     "MAX_LOCATOR_PATH_SEGMENTS", "MAX_LOCATOR_RECORD_ID_CHARS",
@@ -573,9 +763,11 @@ __all__ = [
     "MAX_SOURCE_VERSION_KEY_CHARS", "MAX_TOOL_SNAPSHOT_JSON_BYTES",
     "MAX_UNIT_CHARS", "SOURCE_VERSION_KINDS",
     "BoundedEvidenceContract", "EvidenceBundle", "EvidenceContractError",
-    "EvidenceLocator", "FocusedEvidenceFragment", "SourceVersion",
+    "EvidenceLocator", "FocusedEvidenceFragment", "FrozenDict", "SourceVersion",
     "StructuredEvidenceFact", "VersionedEvidenceSource",
     "build_evidence_bundle", "canonical_json", "canonical_projection",
-    "document_span_locator", "read_locator_path", "record_field_locator",
-    "snapshot_version", "structured_projection", "verbatim_excerpt",
+    "document_span_locator", "fragment_type_for", "parse_locator_key",
+    "parse_version_key", "read_locator_path", "record_field_locator",
+    "revalidate_evidence_bundle", "snapshot_version", "structured_projection",
+    "verbatim_excerpt",
 ]

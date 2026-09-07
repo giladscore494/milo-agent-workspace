@@ -42,7 +42,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Protocol
 
-from .evidence_contracts import EvidenceBundle, EvidenceContractError
+from .evidence_contracts import (EvidenceBundle, EvidenceContractError,
+                                 revalidate_evidence_bundle)
 from .tool_calls import ToolCallRecord
 
 EVIDENCE_MAPPING_REASONS = frozenset({
@@ -144,6 +145,12 @@ class EvidenceMapperRegistry:
             raise EvidenceMappingError("EVIDENCE_BUNDLE_INVALID") from None
         if not isinstance(bundle, EvidenceBundle):
             raise EvidenceMappingError("EVIDENCE_BUNDLE_INVALID")
+        # The mapper's object is not trusted as validated just because it has
+        # the right type: it is rebuilt from a copy of its own data so every
+        # contract validator runs again, here, before anything downstream can
+        # see it.  A bundle assembled around validation, or mutated after it,
+        # fails at this line with a static reason.
+        bundle = revalidate_evidence_bundle(bundle)
         if bundle.source.tool_operation != f"{record.tool}.{record.operation}":
             # The bundle must describe the operation that actually ran, so a
             # mapper cannot attribute evidence to a different capability.

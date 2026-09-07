@@ -40,7 +40,32 @@ SOURCE_VERSION_KINDS = ("content_sha256", "dataset_version", "document_revision"
 LOCATOR_KINDS = ("document_span", "record_field")
 FRAGMENT_TYPES = ("structured_projection", "verbatim_excerpt")
 
-__all__ = ["FRAGMENT_TYPES", "LOCATOR_KINDS", "MAX_DOCUMENT_OFFSET",
+# The kind-specific identifier rule of every source version kind.  ONE
+# definition: the Python contract, the grounding reader, the guarded RPCs and
+# the table constraints all apply exactly these expressions (the SQL copies are
+# pinned against these strings by tests/test_evidence_migration_static.py).
+# Written in the POSIX-compatible subset PostgreSQL's `~` and Python's `re`
+# read identically.
+SOURCE_VERSION_PATTERNS = {
+    "content_sha256": r"^[0-9a-f]{64}$",
+    "dataset_version": r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$",
+    "document_revision": r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$",
+    "git_commit": r"^[0-9a-f]{7,64}$",
+}
+# A locator segment is a LITERAL object key and a record id is a LITERAL
+# identifier.  Neither pattern admits `$`, `*`, `[`, `]`, `?`, a quote, a
+# comma or `..`, so JSONPath/expression/filter syntax is rejected as a
+# malformed key rather than being parsed and then refused.
+LOCATOR_SEGMENT_PATTERN = r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$"
+LOCATOR_RECORD_ID_PATTERN = r"^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,127}$"
+# The fragment type is a function of the locator shape, never a free choice: a
+# verbatim excerpt can only come from a document span and a structured
+# projection can only come from a record field.
+FRAGMENT_TYPE_BY_LOCATOR_KIND = {"document_span": "verbatim_excerpt",
+                                 "record_field": "structured_projection"}
+
+__all__ = ["FRAGMENT_TYPES", "FRAGMENT_TYPE_BY_LOCATOR_KIND", "LOCATOR_KINDS",
+           "LOCATOR_RECORD_ID_PATTERN", "LOCATOR_SEGMENT_PATTERN", "MAX_DOCUMENT_OFFSET",
            "MAX_FACTS_PER_BUNDLE", "MAX_FACT_COLLECTION_ITEMS", "MAX_FACT_VALUE_DEPTH",
            "MAX_FACT_VALUE_JSON_BYTES", "MAX_LOCATOR_KEY_CHARS",
            "MAX_LOCATOR_PATH_SEGMENTS", "MAX_LOCATOR_RECORD_ID_CHARS",
@@ -48,4 +73,4 @@ __all__ = ["FRAGMENT_TYPES", "LOCATOR_KINDS", "MAX_DOCUMENT_OFFSET",
            "MAX_LOCATOR_SEGMENT_CHARS", "MAX_PROJECTION_FIELDS",
            "MAX_SOURCE_VERSION_CHARS", "MAX_SOURCE_VERSION_KEY_CHARS",
            "MAX_TIME_SCOPE_KEYS", "MAX_TOOL_SNAPSHOT_JSON_BYTES", "MAX_UNIT_CHARS",
-           "SOURCE_VERSION_KINDS"]
+           "SOURCE_VERSION_KINDS", "SOURCE_VERSION_PATTERNS"]

@@ -52,8 +52,9 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 from uuid import UUID
 
 from .contracts import EvidenceReference
-from .evidence_bounds import (FRAGMENT_TYPES, MAX_LOCATOR_KEY_CHARS,
-                              MAX_SOURCE_VERSION_KEY_CHARS, SOURCE_VERSION_KINDS)
+from .evidence_bounds import FRAGMENT_TYPES
+from .evidence_contracts import (EvidenceContractError, fragment_type_for, parse_locator_key,
+                                 parse_version_key)
 from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE,
                         MAX_FRAGMENTS_PER_SOURCE, fragment_content_hash)
 
@@ -124,7 +125,10 @@ class SourceFragment:
 
     `fragment_type` and `locator` are all-or-nothing and optional: an R3
     fragment always has both, a pre-R3 fragment has neither, and a
-    half-specified one is corrupted grounding context that fails closed.
+    half-specified one is corrupted grounding context that fails closed.  A
+    locator is validated with the SAME parser the acquisition contract uses:
+    it must be the canonical rendering of one of the two closed locator
+    shapes, and the fragment type must be the one that shape allows.
     """
 
     fragment_index: int
@@ -150,9 +154,26 @@ class SourceFragment:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         if self.fragment_type is not None and self.fragment_type not in FRAGMENT_TYPES:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
-        if self.locator is not None and (not isinstance(self.locator, str) or
-                                         not 1 <= len(self.locator) <= MAX_LOCATOR_KEY_CHARS):
-            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        if self.locator is not None:
+            try:
+                located = parse_locator_key(self.locator)
+            except EvidenceContractError:
+                # `from None`: the contract error is static, but keep ONE
+                # grounding reason at this boundary.
+                raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
+            if fragment_type_for(located) != self.fragment_type:
+                raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+
+    @property
+    def identity(self) -> tuple[str, str | None]:
+        """What makes a durable fragment THIS fragment: its text and its place.
+
+        R3 evidence identity is the content hash together with the locator, so
+        the same sentence read from two different records (or two fields of
+        one record) is two pieces of evidence.  A pre-R3 fragment has no
+        locator and is identified by its text alone, exactly as before.
+        """
+        return (self.content_hash, self.locator)
 
 
 @dataclass(frozen=True)
@@ -191,23 +212,26 @@ class ResolvedSourceEvidence:
         # captured -- readable, but never complete R3 evidence.  A malformed
         # or unknown version kind is corruption and fails closed.
         if self.source_version is not None:
-            if not isinstance(self.source_version, str) or \
-                    len(self.source_version) > MAX_SOURCE_VERSION_KEY_CHARS:
-                raise GroundingContractError("SOURCE_CONTEXT_INVALID")
-            kind, _, identifier = self.source_version.partition(":")
-            if kind not in SOURCE_VERSION_KINDS or not identifier:
-                raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+            try:
+                parse_version_key(self.source_version)
+            except EvidenceContractError:
+                # The SAME kind-specific rule as the acquisition contract and
+                # the guarded RPC: `content_sha256:abc` is corruption here too.
+                raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
         if not isinstance(self.fragments, tuple):
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         if len(self.fragments) > MAX_FRAGMENTS_PER_SOURCE:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         if sum(len(item.text) for item in self.fragments) > MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
-        # Durable identity is (source, task, content hash), so one source can
-        # never legitimately hold the same fragment twice; a duplicate would
-        # also make the verified-evidence hash lookup ambiguous.
-        hashes = [item.content_hash for item in self.fragments]
-        if len(set(hashes)) != len(hashes):
+        # Durable identity is (source, task, content hash, locator): one
+        # source can never legitimately hold the same fragment from the same
+        # place twice, but the SAME text read from two different locators is
+        # two distinct pieces of R3 evidence and must resolve.  A pre-R3
+        # fragment has no locator, so for legacy evidence this is exactly the
+        # content-hash uniqueness that always applied.
+        identities = [item.identity for item in self.fragments]
+        if len(set(identities)) != len(identities):
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
 
     @property
@@ -229,7 +253,8 @@ class ResolvedSourceEvidence:
             all(item.locator and item.fragment_type for item in self.fragments)
 
     def ordered_fragments(self) -> tuple[SourceFragment, ...]:
-        return tuple(sorted(self.fragments, key=lambda item: (item.fragment_index, item.content_hash)))
+        return tuple(sorted(self.fragments, key=lambda item: (item.fragment_index, item.content_hash,
+                                                              item.locator or "")))
 
 
 @dataclass(frozen=True)

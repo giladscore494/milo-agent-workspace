@@ -28,9 +28,42 @@
 -- an R3 locator must be bound to a versioned source -- so historical records
 -- can never be retro-invalidated.
 --
--- Rerun-safe: every column, constraint, index and function is added or
--- replaced idempotently, and the service-only ACL of each replaced function
--- is re-asserted rather than assumed.
+-- The COMPLETE contract is validated here, not only its outline.  Three
+-- helper functions hold one SQL definition each of the rules the Python
+-- contracts apply (backend/engines/swarm_v2/evidence_bounds.py and
+-- evidence_contracts.py; tests/test_evidence_migration_static.py pins the
+-- expressions against the Python constants), and BOTH the guarded RPCs and
+-- the table CHECK constraints call them, so a direct insert that bypasses the
+-- RPC is held to exactly the same shape:
+--
+--   r3_source_version_valid  every version kind has its own identifier rule
+--                            (content_sha256 is exactly 64 lowercase hex;
+--                            git_commit 7-64 lowercase hex; dataset_version
+--                            and document_revision a bounded token)
+--   r3_canonical_locator     a locator is the CANONICAL rendering of one of
+--                            the two closed shapes: a six-element JSON array
+--                            [kind, record_id, field_path, section, start,
+--                            end] whose elements satisfy that kind's bounds
+--                            and whose compact re-rendering equals the stored
+--                            text byte for byte.  Nothing is evaluated: the
+--                            text is parsed, bounded, re-rendered and
+--                            compared, never run.
+--   r3_focus_valid           the fragment type is the one its locator kind
+--                            allows: structured_projection <-> record_field,
+--                            verbatim_excerpt <-> document_span
+--
+-- and a LOCATED CLAIM must be backed by focused evidence of its own source:
+-- the claim's locator must already be a fragment locator of the same durable
+-- source in the same run (the R3 write order persists fragments before
+-- claims), so an arbitrary, missing or cross-source locator cannot be
+-- attached to a versioned source.
+--
+-- Rerun-safe: every column, function and constraint is added or replaced
+-- idempotently.  The three CHECK constraints are dropped and re-added by name
+-- so a database that applied an earlier draft of this migration converges on
+-- the current definition (every existing row holds NULL in the new columns,
+-- so re-validation is trivially satisfied), and the service-only ACL of each
+-- replaced or added function is re-asserted rather than assumed.
 --
 -- Every existing guarantee of the replaced functions is carried forward
 -- verbatim: the worker lease assertion, the unsafe-payload rejection, the
@@ -47,32 +80,176 @@ alter table public.claims add column if not exists evidence_locator text;
 alter table public.source_evidence_fragments add column if not exists fragment_type text;
 alter table public.source_evidence_fragments add column if not exists locator_key text;
 
--- Hard shape bounds in the database as well as in the backend contracts.
--- Every existing row holds NULL in all five columns, so each constraint is
--- trivially satisfied by historical data and can be added fully validated.
--- These literals mirror backend/engines/swarm_v2/evidence_bounds.py;
--- tests/test_evidence_migration_static.py proves they cannot drift apart.
-do $$
+-- ONE SQL definition of each R3 shape rule.  These are pure functions of
+-- their arguments (IMMUTABLE, so a CHECK constraint may call them); they
+-- read no table and are the same expressions the Python contracts apply.
+-- The regular expressions are written in the POSIX subset PostgreSQL's `~`
+-- and Python's `re` read identically and are pinned against
+-- backend/engines/swarm_v2/evidence_bounds.py by the static drift test.
+create or replace function public.r3_source_version_valid(p_kind text, p_identifier text)
+returns boolean
+language sql
+immutable
+set search_path = pg_catalog
+as $$
+  -- Strictly boolean, never NULL: a CHECK constraint treats NULL as passing,
+  -- so a helper that could yield NULL would silently admit the very rows it
+  -- exists to refuse.
+  select coalesce(p_kind is not null and p_identifier is not null and case p_kind
+    when 'content_sha256' then p_identifier ~ '^[0-9a-f]{64}$'
+    when 'git_commit' then p_identifier ~ '^[0-9a-f]{7,64}$'
+    when 'dataset_version' then p_identifier ~ '^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$'
+    when 'document_revision' then p_identifier ~ '^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$'
+    else false
+  end, false)
+$$;
+
+-- Returns the parsed locator when, and only when, the text is the canonical
+-- rendering of a valid locator; NULL otherwise.  The canonical rendering is
+-- the compact JSON the backend emits (no spaces, unicode verbatim), rebuilt
+-- here element by element: record ids and path segments are restricted to a
+-- safe ASCII alphabet so quoting them is exact, offsets are re-rendered as
+-- integers (so `612.0` and `1e3` are non-canonical), and the section heading
+-- is re-rendered with to_jsonb, whose text form matches Python's
+-- json.dumps(ensure_ascii=False) for the printable, whitespace-normalized
+-- text the backend allows there.
+create or replace function public.r3_canonical_locator(p_locator text)
+returns jsonb
+language plpgsql
+immutable
+set search_path = pg_catalog
+as $$
+declare
+  v jsonb; v_kind text; v_record text; v_path jsonb; v_section text;
+  v_start numeric; v_end numeric; v_len integer; v_canonical text;
 begin
-  if not exists (select 1 from pg_constraint where conname = 'sources_version_pairing') then
-    alter table public.sources add constraint sources_version_pairing check (
-      (source_version_kind is null) = (source_version_id is null)
-      and (source_version_kind is null or (
-        source_version_kind in ('content_sha256', 'dataset_version', 'document_revision', 'git_commit')
-        and char_length(source_version_id) between 1 and 128)));
+  if p_locator is null or char_length(p_locator) < 1 or char_length(p_locator) > 800 then
+    return null;
   end if;
-  if not exists (select 1 from pg_constraint where conname = 'claims_evidence_locator_bounded') then
-    alter table public.claims add constraint claims_evidence_locator_bounded check (
-      evidence_locator is null or char_length(evidence_locator) between 1 and 800);
+  begin
+    v := p_locator::jsonb;
+  exception when others then
+    return null;
+  end;
+  if jsonb_typeof(v) <> 'array' or jsonb_array_length(v) <> 6 then
+    return null;
   end if;
-  if not exists (select 1 from pg_constraint where conname = 'source_evidence_fragments_focus_pairing') then
-    alter table public.source_evidence_fragments add constraint source_evidence_fragments_focus_pairing check (
-      (fragment_type is null) = (locator_key is null)
-      and (fragment_type is null or (
-        fragment_type in ('structured_projection', 'verbatim_excerpt')
-        and char_length(locator_key) between 1 and 800)));
+  if jsonb_typeof(v->0) <> 'string' or jsonb_typeof(v->1) <> 'string'
+     or jsonb_typeof(v->2) <> 'array'
+     or jsonb_typeof(v->3) not in ('string', 'null')
+     or jsonb_typeof(v->4) not in ('number', 'null')
+     or jsonb_typeof(v->5) not in ('number', 'null') then
+    return null;
   end if;
-end $$;
+  v_kind := v->>0;
+  v_record := v->>1;
+  v_path := v->2;
+  v_len := jsonb_array_length(v_path);
+  if v_kind not in ('document_span', 'record_field') then
+    return null;
+  end if;
+  if v_record !~ '^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,127}$' then
+    return null;
+  end if;
+  -- Every path element is a LITERAL object key: no `$`, `*`, `[`, `?`, quote
+  -- or `..` can pass, so JSONPath/filter/wildcard syntax is malformed here.
+  if exists (select 1 from jsonb_array_elements(v_path) as element
+             where jsonb_typeof(element) <> 'string'
+                or (element #>> '{}') !~ '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$') then
+    return null;
+  end if;
+  if v_kind = 'record_field' then
+    if v_len < 1 or v_len > 6 then
+      return null;
+    end if;
+    if jsonb_typeof(v->3) <> 'null' or jsonb_typeof(v->4) <> 'null' or jsonb_typeof(v->5) <> 'null' then
+      return null;
+    end if;
+  else
+    if v_len <> 0 then
+      return null;
+    end if;
+    if jsonb_typeof(v->4) <> 'number' or jsonb_typeof(v->5) <> 'number' then
+      return null;
+    end if;
+    v_start := (v->>4)::numeric;
+    v_end := (v->>5)::numeric;
+    if v_start <> trunc(v_start) or v_end <> trunc(v_end) then
+      return null;
+    end if;
+    -- A span is bounded exactly as a durable fragment is: it can never cover
+    -- a page.
+    if v_start < 0 or v_start >= v_end or v_end > 1000000 or v_end - v_start > 400 then
+      return null;
+    end if;
+    if jsonb_typeof(v->3) = 'string' then
+      v_section := v->>3;
+      if char_length(v_section) < 1 or char_length(v_section) > 120
+         or v_section ~ '[[:cntrl:]]'
+         or v_section <> btrim(regexp_replace(v_section, '[[:space:]]+', ' ', 'g')) then
+        return null;
+      end if;
+    end if;
+  end if;
+  v_canonical := '["' || v_kind || '","' || v_record || '",['
+    || coalesce((select string_agg('"' || (segment.element #>> '{}') || '"', ',' order by segment.ordinality)
+                 from jsonb_array_elements(v_path) with ordinality as segment(element, ordinality)), '')
+    || '],'
+    || case when jsonb_typeof(v->3) = 'null' then 'null' else to_jsonb(v_section)::text end
+    || ','
+    || case when jsonb_typeof(v->4) = 'null' then 'null' else trunc(v_start)::bigint::text end
+    || ','
+    || case when jsonb_typeof(v->5) = 'null' then 'null' else trunc(v_end)::bigint::text end
+    || ']';
+  if v_canonical <> p_locator then
+    return null;
+  end if;
+  return v;
+end;
+$$;
+
+-- The fragment type is a function of the locator shape, never a free choice.
+create or replace function public.r3_focus_valid(p_fragment_type text, p_locator text)
+returns boolean
+language plpgsql
+immutable
+set search_path = pg_catalog
+as $$
+declare v_kind text;
+begin
+  if p_fragment_type is null or p_locator is null then
+    return false;
+  end if;
+  v_kind := public.r3_canonical_locator(p_locator)->>0;
+  -- A non-canonical locator has no kind.  Return FALSE explicitly: comparing
+  -- NULL below would yield NULL, and a CHECK constraint treats NULL as
+  -- passing -- exactly the bypass this helper exists to close.
+  if v_kind is null then
+    return false;
+  end if;
+  return (p_fragment_type = 'structured_projection' and v_kind = 'record_field')
+      or (p_fragment_type = 'verbatim_excerpt' and v_kind = 'document_span');
+end;
+$$;
+
+-- The same rules as table constraints, so the durable shape holds even for a
+-- direct insert that bypasses the guarded RPC.  Dropped and re-added by name:
+-- every existing row holds NULL in all five columns, so re-validation is
+-- trivially satisfied, and a database that applied an earlier draft of this
+-- migration converges on the current definition.
+alter table public.sources drop constraint if exists sources_version_pairing;
+alter table public.sources add constraint sources_version_pairing check (
+  (source_version_kind is null) = (source_version_id is null)
+  and (source_version_kind is null
+       or public.r3_source_version_valid(source_version_kind, source_version_id)));
+alter table public.claims drop constraint if exists claims_evidence_locator_bounded;
+alter table public.claims drop constraint if exists claims_evidence_locator_canonical;
+alter table public.claims add constraint claims_evidence_locator_canonical check (
+  evidence_locator is null or public.r3_canonical_locator(evidence_locator) is not null);
+alter table public.source_evidence_fragments drop constraint if exists source_evidence_fragments_focus_pairing;
+alter table public.source_evidence_fragments add constraint source_evidence_fragments_focus_pairing check (
+  (fragment_type is null) = (locator_key is null)
+  and (fragment_type is null or public.r3_focus_valid(fragment_type, locator_key)));
 
 -- Source persistence: unchanged guarantees plus the optional trusted version.
 create or replace function public.upsert_source_guarded(
@@ -99,10 +276,10 @@ begin
   if (v_kind is null) <> (v_identifier is null) then
     raise exception 'invalid source: a source version requires both a kind and an identifier' using errcode = '22023';
   end if;
-  if v_kind is not null and (
-       v_kind not in ('content_sha256', 'dataset_version', 'document_revision', 'git_commit')
-       or char_length(v_identifier) > 128) then
-    raise exception 'invalid source: unknown or oversized source version' using errcode = '22023';
+  -- Kind-specific: a content_sha256 IS 64 lowercase hex characters, a
+  -- git_commit IS 7-64 of them, and the token kinds are bounded tokens.
+  if v_kind is not null and not public.r3_source_version_valid(v_kind, v_identifier) then
+    raise exception 'invalid source: unknown or malformed source version' using errcode = '22023';
   end if;
   insert into public.sources
     (run_id, agent, url, title, domain, source_type, source_strength, source_date,
@@ -161,6 +338,11 @@ begin
     if char_length(v_locator) > 800 then
       raise exception 'invalid claim: evidence locator exceeds the durable bound' using errcode = '22023';
     end if;
+    -- The locator must be the canonical rendering of one of the two closed
+    -- locator shapes; an arbitrary string is not a location.
+    if public.r3_canonical_locator(v_locator) is null then
+      raise exception 'invalid claim: evidence locator is not a canonical bounded location' using errcode = '22023';
+    end if;
     -- An R3-qualified fact states its unit.  "1798" is not a fact until it
     -- says cc.  Gated on the locator so no legacy unit-less claim is ever
     -- retro-invalidated; R3 carries the unit and never interprets it.
@@ -176,6 +358,15 @@ begin
   if v_locator is not null and v_source.source_version_kind is null then
     -- R3 evidence may only rest on a source whose version was captured.
     raise exception 'invalid claim: a located fact requires a versioned source' using errcode = '22023';
+  end if;
+  -- A located fact is only a fact because focused evidence at that exact
+  -- location supports it: the locator must already be a fragment locator of
+  -- THIS durable source in THIS run.  A locator that exists only on another
+  -- source, only in another run, or nowhere at all cannot be attached here.
+  if v_locator is not null and not exists (
+       select 1 from public.source_evidence_fragments f
+        where f.run_id = p_run_id and f.source_id = v_source.id and f.locator_key = v_locator) then
+    raise exception 'invalid claim: a located fact must be backed by focused evidence of its own source' using errcode = '22023';
   end if;
   insert into public.claims
     (run_id, entity_key, field_key, value, unit, time_scope, geography, market,
@@ -290,6 +481,16 @@ begin
        or char_length(v_locator) > 800) then
     raise exception 'invalid evidence fragment: unknown fragment type or oversized locator' using errcode = '22023';
   end if;
+  if v_type is not null then
+    -- The locator must be the canonical rendering of one of the two closed
+    -- locator shapes, and the fragment type must be the one that shape allows.
+    if public.r3_canonical_locator(v_locator) is null then
+      raise exception 'invalid evidence fragment: locator is not a canonical bounded location' using errcode = '22023';
+    end if;
+    if not public.r3_focus_valid(v_type, v_locator) then
+      raise exception 'invalid evidence fragment: fragment type does not match the locator kind' using errcode = '22023';
+    end if;
+  end if;
   if lower(v_text) ~ '(-----begin|-----end|api_key=|apikey=|aws_secret_access_key|authorization:|client_secret|lease_token|password=|private_key|refresh_token|secret_key|x-api-key|chain of thought|hidden reasoning|secret sentinel)' then
     raise exception 'unsafe evidence fragment rejected' using errcode = '22023';
   end if;
@@ -366,6 +567,9 @@ do $$
 declare fn text;
 begin
   foreach fn in array array[
+    'public.r3_source_version_valid(text,text)',
+    'public.r3_canonical_locator(text)',
+    'public.r3_focus_valid(text,text)',
     'public.upsert_source_guarded(uuid,text,integer,text,jsonb)',
     'public.create_claim_with_source_guarded(uuid,text,integer,text,jsonb)',
     'public.record_evidence_fragment_guarded(uuid,text,integer,text,jsonb)'
