@@ -3,6 +3,7 @@
 from typing import Any
 from pydantic import ConfigDict, Field
 from .contracts import StrictContract
+from .correction import MAX_CORRECTION_ROUNDS
 from .evidence import safe_durable_value
 from .grounding import VERIFIER_GROUNDING_VERSION
 
@@ -28,6 +29,28 @@ class SwarmState(StrictContract):
     # understand fails closed instead of being read optimistically.
     verifier_grounding_version: int = Field(default=0, ge=0,
                                             le=VERIFIER_GROUNDING_VERSION)
+    # R4: the bounded identifier of the verification contract behind
+    # verifier_state.  A checkpoint written before R4 lacks the field and
+    # loads as "", which is exactly what a reader needs to know: its verdicts
+    # are readable and are NOT decisions of the current contract.  It is never
+    # used to accept a verdict -- the per-verdict provenance does that -- only
+    # to state, durably, which contract the stored map came from.
+    verifier_contract_version: str = Field(default="", max_length=120)
+    # R4: the typed decision taken for every contradicting scope, kept so a
+    # resume replays the same decisions instead of re-deciding them from a
+    # different evidence set.  Append-only in meaning: a resolution records a
+    # decision, it never edits or removes the claims it decided.
+    conflict_resolutions: list[dict[str, Any]] = Field(default_factory=list)
+    # R4: how many bounded correction rounds this run has STARTED.  The
+    # allowance is one for the whole run, and it lives in the checkpoint so a
+    # resumed run cannot quietly earn a second one.
+    correction_rounds: int = Field(default=0, ge=0, le=MAX_CORRECTION_ROUNDS)
+    # R4: the Commander was offered the correction round and DECLINED it. That
+    # is a terminal answer, not a pause, so it lives in the checkpoint: a
+    # resume from that checkpoint finalizes instead of asking again. A round
+    # that was merely blocked by a budget is deliberately NOT recorded here --
+    # a later resume with capacity may legitimately still take it.
+    correction_declined: bool = False
     usage_snapshot: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod

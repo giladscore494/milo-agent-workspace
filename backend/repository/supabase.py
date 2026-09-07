@@ -47,6 +47,9 @@ class Repository(Protocol):
     def record_evidence_fragment(self, run_id: UUID, fragment: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def list_sources_for_ids(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 50) -> list[dict[str, Any]]: ...
     def list_evidence_fragments_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 200) -> list[dict[str, Any]]: ...
+    def list_structured_facts_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 200) -> list[dict[str, Any]]: ...
+    def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -693,6 +696,49 @@ class SupabaseRepository:
             self.client.table("source_evidence_fragments").select(self.EVIDENCE_FRAGMENT_COLUMNS)
             .eq("run_id", str(run_id)).in_("source_id", identifiers)
             .order("source_id").order("fragment_index").order("content_hash").limit(bounded))
+
+    # R4: the explicit safe column allowlist of a durable STRUCTURED SOURCE
+    # FACT -- a claim that was read from an exact location in a versioned
+    # source.  It is the comparison authority of the deterministic verifier, so
+    # it carries exactly what a comparison needs: identity, scope, value, unit
+    # and the locator it was read at.  Never `*`: agent, confidence,
+    # source_strength, status, evidence_key and the canonical scope columns are
+    # bookkeeping, not the fact.
+    STRUCTURED_FACT_COLUMNS = ("id, run_id, source_id, task_key, entity_key, field_key, "
+                               "value, unit, time_scope, geography, market, "
+                               "evidence_locator, identity_scope")
+    MAX_STRUCTURED_FACT_ROWS = 200
+
+    def list_structured_facts_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = MAX_STRUCTURED_FACT_ROWS) -> list[dict[str, Any]]:
+        """Internal bounded read of the structured facts recorded FROM sources.
+
+        The third and last internal read the grounded/deterministic verifier
+        may perform.  Server/service path only: no browser endpoint exposes it,
+        it performs no provider call, and the caller supplies a run plus source
+        ids -- never SQL.  Rows are restricted to the requested run AND the
+        requested sources, filtered to claims that carry an R3 evidence locator
+        (a claim with no locator is a statement ABOUT a source, not a fact read
+        FROM it), selected through an explicit column allowlist, capped at
+        MAX_STRUCTURED_FACT_ROWS and ordered deterministically by id.  The
+        public claim/browser contract is untouched: this adds a read, not a
+        column, a table or an endpoint."""
+        identifiers = sorted({str(source_id) for source_id in source_ids})
+        if not identifiers:
+            return []
+        bounded = max(1, min(int(limit), self.MAX_STRUCTURED_FACT_ROWS))
+        return self._many(
+            self.client.table("claims").select(self.STRUCTURED_FACT_COLUMNS)
+            .eq("run_id", str(run_id)).in_("source_id", identifiers)
+            .not_.is_("evidence_locator", "null")
+            .order("source_id").order("id").limit(bounded))
+
+    def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_verdict": verdict}
+        return self._guarded_rpc("record_claim_verdict_guarded", params, "claim_verdict")
+
+    def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_resolution": resolution}
+        return self._guarded_rpc("record_conflict_resolution_guarded", params, "conflict_resolution")
 
     def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_summary": summary}

@@ -57,9 +57,11 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from .contracts import StrictContract
-from .evidence_bounds import (FRAGMENT_TYPE_BY_LOCATOR_KIND, FRAGMENT_TYPES, LOCATOR_KINDS,
+from .evidence_bounds import (FRAGMENT_TYPE_BY_LOCATOR_KIND, FRAGMENT_TYPES,
+                              IDENTITY_DIMENSIONS, LOCATOR_KINDS,
                               LOCATOR_RECORD_ID_PATTERN, LOCATOR_SEGMENT_PATTERN,
                               MAX_DOCUMENT_OFFSET, MAX_FACTS_PER_BUNDLE,
+                              MAX_IDENTITY_DIMENSION_CHARS,
                               MAX_FACT_COLLECTION_ITEMS, MAX_FACT_VALUE_DEPTH,
                               MAX_FACT_VALUE_JSON_BYTES, MAX_LOCATOR_KEY_CHARS,
                               MAX_LOCATOR_PATH_SEGMENTS, MAX_LOCATOR_RECORD_ID_CHARS,
@@ -84,6 +86,7 @@ _VERSION_PATTERNS = {kind: re.compile(pattern) for kind, pattern in SOURCE_VERSI
 
 EVIDENCE_CONTRACT_REASONS = frozenset({
     "EVIDENCE_CONTRACT_INVALID",
+    "EVIDENCE_FACT_IDENTITY_INVALID",
     "EVIDENCE_FACT_UNIT_REQUIRED",
     "EVIDENCE_FRAGMENT_HASH_MISMATCH",
     "EVIDENCE_FRAGMENT_TEXT_INVALID",
@@ -106,6 +109,7 @@ class EvidenceContractError(ValueError):
 
     MESSAGES = {
         "EVIDENCE_CONTRACT_INVALID": "evidence does not satisfy the R3 contract",
+        "EVIDENCE_FACT_IDENTITY_INVALID": "structured fact identity is not a bounded closed dimension set",
         "EVIDENCE_FACT_UNIT_REQUIRED": "a numeric structured fact requires an explicit unit",
         "EVIDENCE_FRAGMENT_HASH_MISMATCH": "fragment content hash does not match the bounded text",
         "EVIDENCE_FRAGMENT_TEXT_INVALID": "fragment text is empty or not normalized",
@@ -605,11 +609,25 @@ class StructuredEvidenceFact(BoundedEvidenceContract):
     time_scope: dict[str, Any] = Field(default_factory=dict)
     geography: str | None = Field(default=None, max_length=200)
     market: str | None = Field(default=None, max_length=200)
+    # R4: the closed identity dimensions the record itself stated.  The
+    # trusted mapper copies them from declared fields of the operation it is
+    # registered for; it never invents one, and a dimension outside the closed
+    # vocabulary fails closed rather than being carried as free-form metadata.
+    # Empty is the honest default for a record that qualifies itself no
+    # further, and it never widens a later comparison: an empty identity only
+    # ever matches another empty identity.
+    identity: dict[str, str] = Field(default_factory=dict)
     locator: EvidenceLocator
 
     @model_validator(mode="after")
     def _shape(self) -> "StructuredEvidenceFact":
         _bounded_json(self.value, MAX_FACT_VALUE_JSON_BYTES)
+        if not set(self.identity) <= set(IDENTITY_DIMENSIONS):
+            raise EvidenceContractError("EVIDENCE_FACT_IDENTITY_INVALID")
+        if any(not isinstance(item, str) or not item.strip()
+               or len(item) > MAX_IDENTITY_DIMENSION_CHARS
+               for item in self.identity.values()):
+            raise EvidenceContractError("EVIDENCE_FACT_IDENTITY_INVALID")
         if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
             pass
         elif self.unit is None:
@@ -625,6 +643,7 @@ class StructuredEvidenceFact(BoundedEvidenceContract):
         # attributes of this model, not the containers inside them.
         object.__setattr__(self, "value", _freeze(self.value))
         object.__setattr__(self, "time_scope", _freeze(self.time_scope))
+        object.__setattr__(self, "identity", _freeze(self.identity))
         return self
 
 
@@ -737,7 +756,8 @@ def revalidate_evidence_bundle(bundle: Any) -> EvidenceBundle:
         facts = tuple(StructuredEvidenceFact(
             entity_key=item.entity_key, field_key=item.field_key, value=_thaw(item.value),
             unit=item.unit, time_scope=_thaw(item.time_scope), geography=item.geography,
-            market=item.market, locator=_copy_locator(item.locator)) for item in bundle.facts)
+            market=item.market, identity=_thaw(item.identity),
+            locator=_copy_locator(item.locator)) for item in bundle.facts)
         fragments = tuple(FocusedEvidenceFragment(
             fragment_type=item.fragment_type, text=item.text,
             locator=_copy_locator(item.locator), fragment_index=item.fragment_index,
@@ -754,7 +774,7 @@ def revalidate_evidence_bundle(bundle: Any) -> EvidenceBundle:
 
 __all__ = [
     "EVIDENCE_CONTRACT_REASONS", "FRAGMENT_TYPES", "FRAGMENT_TYPE_BY_LOCATOR_KIND",
-    "LOCATOR_KINDS",
+    "IDENTITY_DIMENSIONS", "LOCATOR_KINDS", "MAX_IDENTITY_DIMENSION_CHARS",
     "MAX_DOCUMENT_OFFSET", "MAX_FACTS_PER_BUNDLE", "MAX_FACT_COLLECTION_ITEMS",
     "MAX_FACT_VALUE_DEPTH", "MAX_FACT_VALUE_JSON_BYTES", "MAX_LOCATOR_KEY_CHARS",
     "MAX_LOCATOR_PATH_SEGMENTS", "MAX_LOCATOR_RECORD_ID_CHARS",

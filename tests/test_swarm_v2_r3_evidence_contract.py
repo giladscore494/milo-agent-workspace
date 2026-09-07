@@ -858,7 +858,13 @@ def test_pre_r3_evidence_still_resolves_and_serializes_exactly_as_before():
         [GroundedCandidate(reference=reference, source=legacy_source)]))
     assert "unit" not in document["claims"][0] and "locator" not in document["claims"][0]
     assert "source_version" not in document["sources"][0]
-    assert set(document["sources"][0]["fragments"][0]) == {"fragment_index", "content_hash", "text"}
+    # Absent R3 provenance is still OMITTED rather than sent as null. `ref` is
+    # not provenance the record carries: it is the request-local handle R4
+    # prints for EVERY fragment, legacy ones included, so a model can cite the
+    # exact row it used instead of a hash that may name two.
+    assert set(document["sources"][0]["fragments"][0]) == {
+        "ref", "fragment_index", "content_hash", "text"}
+    assert document["sources"][0]["fragments"][0]["ref"] == "f0-0"
     # Readable, and honestly NOT complete R3 evidence.
     assert legacy_source.source_version is None and not legacy_source.is_r3_qualified
 

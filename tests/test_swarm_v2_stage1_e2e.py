@@ -14,16 +14,41 @@ from backend.engines.swarm_v2.validation import PlanLimits
 from test_swarm_v2 import plan, task, tool_descriptors
 
 
+# The one static decline decision an offline fixture returns when the run asks
+# for its ONE bounded R4 correction round and the fixture models no research
+# for it. It is a real terminal Commander answer, not a fallback: a declined
+# correction round finalizes the run under the R1 outcome contract.
+DECLINE_CORRECTION = {"decision": "FINISH", "plan": None,
+                      "reason": "no further correction is required"}
+
+
 class Plans:
-    def __init__(self, initial, decisions):
+    """An offline Commander client whose decisions are scripted in order.
+
+    R4 asks for at most ONE extra decision at the end of a run whose final
+    verification discovered something (see engine._start_correction_round), so
+    a fixture that does not script that decision answers `final` instead of
+    raising. `replans` counts every decision actually requested, so a test can
+    still assert exactly how many Commander decisions a run took.
+    """
+
+    def __init__(self, initial, decisions, *, final=DECLINE_CORRECTION):
         self.initial, self.decisions = initial, iter(decisions)
         self.contexts = []
+        self.replans = 0
+        self._final = final
     def create_plan(self, **kwargs):
         self.contexts.append(kwargs["context"])
         return self.initial
     def create_replan(self, **kwargs):
         self.contexts.append(kwargs["summary"])
-        return next(self.decisions)
+        self.replans += 1
+        try:
+            return next(self.decisions)
+        except StopIteration:
+            if self._final is None:
+                raise
+            return self._final
 
 
 class Worker:
@@ -134,7 +159,10 @@ def test_dynamic_parallel_replan_conflict_verification_final_and_events():
     assert all("provider" not in str(payload).lower() and "exception" not in payload for _, payload in events)
     assert checkpoints[-1]["artifacts"]["swarm_state"]["completed_task_ids"] == ["a", "b", "c", "follow"]
     assert all(set(context) <= {"completed", "failed", "evidence", "conflicts", "gaps",
-                                        "remaining_budget", "decision_context"}
+                                "remaining_budget", "decision_context",
+                                # R4 adds exactly one key, and only on the one
+                                # bounded correction decision.
+                                "verification_findings"}
                for context in client.contexts[1:])
     assert client.contexts[1]["decision_context"] == {
         "all_tasks_completed": True,

@@ -52,6 +52,19 @@ REGISTRY_FACT_FIELDS: tuple[tuple[str, str | None], ...] = (
 REGISTRY_PRICE_FIELD = "list_price"
 REGISTRY_PRICE_UNIT_FIELD = "price_currency"
 REGISTRY_CONTEXT_FIELDS: tuple[str, ...] = ("model_name", "model_year", "market")
+# R4: the record fields that identify the VARIANT rather than the commercial
+# model, mapped onto the closed identity vocabulary.  STATIC server data, like
+# every other list here: the mapper copies the dimensions the record states and
+# never infers, renames or invents one, so a record that says nothing about its
+# generation produces a fact with no generation -- which can then only ever be
+# compared to another fact that says nothing about its generation either.
+REGISTRY_IDENTITY_FIELDS: tuple[tuple[str, str], ...] = (
+    # (field name in the record, identity dimension it states)
+    ("generation", "generation"),
+    ("engine", "engine"),
+    ("transmission", "transmission"),
+    ("model_code", "model_code"),
+)
 
 
 class StructuredRegistryEvidenceMapper:
@@ -84,6 +97,8 @@ class StructuredRegistryEvidenceMapper:
         # The unit of a price is the record's own currency field, read as data
         # from a declared field -- never inferred from the number itself.
         priced = (REGISTRY_PRICE_FIELD, str(record[REGISTRY_PRICE_UNIT_FIELD]))
+        identity = {dimension: str(record[name])
+                    for name, dimension in REGISTRY_IDENTITY_FIELDS if name in record}
         facts, fragments = [], []
         for index, (name, unit) in enumerate((*REGISTRY_FACT_FIELDS, priced)):
             locator = record_field_locator(record_id, (name,))
@@ -91,7 +106,7 @@ class StructuredRegistryEvidenceMapper:
                 entity_key=record_id, field_key=name, value=record[name], unit=unit,
                 time_scope={"model_year": record["model_year"]},
                 geography=str(record["market"]), market=str(record["market"]),
-                locator=locator))
+                identity=identity, locator=locator))
             fragments.append(structured_projection(
                 record=record, fields=(*REGISTRY_CONTEXT_FIELDS, name), locator=locator,
                 fragment_index=index))
@@ -160,6 +175,7 @@ def offline_evidence_mappers(**overrides: Any) -> EvidenceMapperRegistry:
                                    DocumentArchiveEvidenceMapper(**overrides)))
 
 
-__all__ = ["REGISTRY_CONTEXT_FIELDS", "REGISTRY_FACT_FIELDS", "REGISTRY_PRICE_FIELD",
+__all__ = ["REGISTRY_CONTEXT_FIELDS", "REGISTRY_FACT_FIELDS", "REGISTRY_IDENTITY_FIELDS",
+           "REGISTRY_PRICE_FIELD",
            "REGISTRY_PRICE_UNIT_FIELD", "DocumentArchiveEvidenceMapper",
            "StructuredRegistryEvidenceMapper", "offline_evidence_mappers"]

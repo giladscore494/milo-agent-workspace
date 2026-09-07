@@ -2,13 +2,30 @@
 
 from .adapter import SwarmV2Adapter
 from .commander import Commander, CommanderPlanFailure
+from .comparison import (COMPARISON_REASONS, STRUCTURED_COMPARISON_VERSION,
+                         UNIT_CONVERSIONS, UNIT_RULE_VERSION, QuantityIdentity,
+                         ScopeIdentity, StructuredComparison, StructuredSourceFact,
+                         compare_structured, compare_values, normalize_identity,
+                         normalize_unit, reference_identity, same_value, scope_identity,
+                         scope_identity_hash, value_identity)
+from .conflict_policy import (CLAIM_RESOLUTION_STATES, CONFLICT_POLICY_VERSION,
+                              FIELD_FAMILIES, RESOLUTION_REASONS, RESOLUTION_STATES,
+                              SOURCE_TYPE_AUTHORITY, ConflictResolution, conflict_groups,
+                              field_family, is_authoritative, parse_resolutions,
+                              resolve_conflict_group, resolve_conflicts)
+from .correction import (CORRECTION_BLOCK_REASONS, CORRECTION_ISSUE_CODES,
+                         MAX_CORRECTION_ISSUES, MAX_CORRECTION_ROUNDS,
+                         MIN_CORRECTION_MODEL_CALLS, CorrectionAllowance,
+                         correction_allowance, correction_issues,
+                         correction_path_closed, correction_summary)
 from .contracts import (CommanderDecision, CommanderPlan, CompletionCriteria,
                         DependencyBinding, DynamicTask,
                         EvidenceReference, PlannedToolCall, RemainingBudget,
-                        VerificationVerdict, EvidenceRequirement, TaskGraph,
+                        SupportLink, VerificationVerdict, EvidenceRequirement, TaskGraph,
                         WorkerAssignment)
 from .engine import SwarmV2Engine
-from .evidence_bounds import (FRAGMENT_TYPES, LOCATOR_KINDS, MAX_DOCUMENT_OFFSET,
+from .evidence_bounds import (FRAGMENT_TYPES, IDENTITY_DIMENSIONS, LOCATOR_KINDS,
+                              MAX_DOCUMENT_OFFSET, MAX_IDENTITY_DIMENSION_CHARS,
                               MAX_FACTS_PER_BUNDLE, MAX_FACT_VALUE_DEPTH,
                               MAX_FACT_VALUE_JSON_BYTES, MAX_LOCATOR_KEY_CHARS,
                               MAX_LOCATOR_PATH_SEGMENTS, MAX_LOCATOR_SCOPE_IDS,
@@ -49,16 +66,25 @@ from .outcome import (ALLOWED_OUTCOMES, DURABLE_RUN_STATUS, NO_USABLE_RESULT_COD
                       decide_outcome, durable_run_status, finalize_product_outcome,
                       validate_product_outcome)
 from .grounding import (FRAGMENT_OVER_READ_PER_SOURCE, GROUNDING_REASONS,
-                        MAX_SOURCES_PER_RESOLVER_READ, VERIFIER_GROUNDING_VERSION,
+                        MAX_SOURCES_PER_RESOLVER_READ, MAX_STRUCTURED_FACTS_PER_SOURCE,
+                        STRUCTURED_FACT_OVER_READ_PER_SOURCE, VERIFIER_GROUNDING_VERSION,
                         EvidenceResolver, GroundedCandidate, GroundingContractError,
                         RepositoryEvidenceResolver, ResolvedSourceEvidence, SourceFragment,
                         resolve_source_context)
+from .support import (EVIDENCE_BEARING_MODES, MAX_SUPPORT_LINKS_PER_VERDICT,
+                      SUPPORT_REASONS, VERIFICATION_MODES, VERIFIER_CONTRACT_VERSION,
+                      SupportContractError, fragment_reference, link_for_citation,
+                      links_for_citations, links_for_locator, parse_support,
+                      validate_support)
 from .verifier import (GROUNDED_VERDICT_REASONS, MAX_VERIFIER_BATCH_JSON_BYTES,
                        MAX_VERIFIER_CLAIMS_PER_BATCH,
                        MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH, MISSING_CONTEXT_VERDICT,
-                       VERIFIER_REASONS, GroundedVerificationPlan, Verifier,
+                       SCOPE_DEPENDENT_REASONS, STRUCTURED_VERDICT_BY_REASON,
+                       SUPERSEDED_VERDICT, VERIFIER_REASONS,
+                       GroundedVerificationPlan, Verifier,
                        VerifierContractError, VerifierProgress, VerifierResponseVerdict,
-                       build_verifier_batches, parse_verifier_batch,
+                       build_verifier_batches, fragment_reference_index,
+                       parse_verifier_batch,
                        plan_grounded_verification, serialize_verifier_candidates,
                        verifier_evidence_chars, verifier_payload_bytes)
 from .state import SwarmState
@@ -90,7 +116,7 @@ __all__ += ["GROUNDED_VERDICT_REASONS", "MAX_VERIFIER_BATCH_JSON_BYTES",
             "MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH", "MISSING_CONTEXT_VERDICT",
             "VERIFIER_REASONS", "GroundedVerificationPlan", "VerifierContractError",
             "VerifierProgress", "VerifierResponseVerdict", "build_verifier_batches",
-            "parse_verifier_batch", "plan_grounded_verification",
+            "fragment_reference_index", "parse_verifier_batch", "plan_grounded_verification",
             "serialize_verifier_candidates", "verifier_evidence_chars",
             "verifier_payload_bytes"]
 __all__ += ["EVIDENCE_CONTRACT_REASONS", "EVIDENCE_MAPPING_REASONS", "FRAGMENT_TYPES",
@@ -106,7 +132,29 @@ __all__ += ["EVIDENCE_CONTRACT_REASONS", "EVIDENCE_MAPPING_REASONS", "FRAGMENT_T
             "document_span_locator", "read_locator_path", "record_field_locator",
             "snapshot_version", "structured_projection", "verbatim_excerpt"]
 __all__ += ["FRAGMENT_OVER_READ_PER_SOURCE", "GROUNDING_REASONS",
-            "MAX_SOURCES_PER_RESOLVER_READ",
+            "MAX_SOURCES_PER_RESOLVER_READ", "MAX_STRUCTURED_FACTS_PER_SOURCE",
+            "STRUCTURED_FACT_OVER_READ_PER_SOURCE",
             "VERIFIER_GROUNDING_VERSION", "EvidenceResolver", "GroundedCandidate",
             "GroundingContractError", "RepositoryEvidenceResolver",
             "ResolvedSourceEvidence", "SourceFragment", "resolve_source_context"]
+# --- R4: deterministic verification, durable support, conflict resolution ----
+__all__ += ["COMPARISON_REASONS", "IDENTITY_DIMENSIONS", "MAX_IDENTITY_DIMENSION_CHARS",
+            "STRUCTURED_COMPARISON_VERSION", "UNIT_CONVERSIONS", "UNIT_RULE_VERSION",
+            "QuantityIdentity", "ScopeIdentity", "StructuredComparison",
+            "StructuredSourceFact", "compare_structured", "compare_values",
+            "normalize_identity", "normalize_unit", "reference_identity", "same_value",
+            "scope_identity", "scope_identity_hash", "value_identity"]
+__all__ += ["EVIDENCE_BEARING_MODES", "MAX_SUPPORT_LINKS_PER_VERDICT", "SUPPORT_REASONS",
+            "VERIFICATION_MODES", "VERIFIER_CONTRACT_VERSION", "SupportContractError",
+            "SupportLink", "fragment_reference", "link_for_citation", "links_for_citations",
+            "links_for_locator", "parse_support", "validate_support"]
+__all__ += ["CLAIM_RESOLUTION_STATES", "CONFLICT_POLICY_VERSION", "FIELD_FAMILIES",
+            "RESOLUTION_REASONS", "RESOLUTION_STATES", "SOURCE_TYPE_AUTHORITY",
+            "ConflictResolution", "conflict_groups", "field_family", "is_authoritative",
+            "parse_resolutions", "resolve_conflict_group", "resolve_conflicts"]
+__all__ += ["CORRECTION_BLOCK_REASONS", "CORRECTION_ISSUE_CODES", "MAX_CORRECTION_ISSUES",
+            "MAX_CORRECTION_ROUNDS", "MIN_CORRECTION_MODEL_CALLS", "CorrectionAllowance",
+            "correction_allowance", "correction_issues", "correction_path_closed",
+            "correction_summary"]
+__all__ += ["SCOPE_DEPENDENT_REASONS", "STRUCTURED_VERDICT_BY_REASON",
+            "SUPERSEDED_VERDICT"]
