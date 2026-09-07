@@ -66,7 +66,11 @@ def worker_task(*, tools=("mock.search",)):
         "goal": "produce one bounded structured answer",
         "scope": "offline fixture material only",
         "dependencies": [],
-        "tools": [{"name": name, "scope": "read offline fixtures", "max_calls": 1}
+        # One exact planned call per tool, each with its own call_id.
+        "tools": [{"call_id": name.replace(".", "_"), "name": name,
+                   "operation": "search",
+                   "arguments": {"query": "produce one bounded structured answer"},
+                   "dependency_bindings": []}
                   for name in tools],
         "output_schema": {"type": "object", "properties": {"answer": {"type": "string"}},
                           "required": ["answer"], "additionalProperties": False},
@@ -81,12 +85,12 @@ def counting_registry(calls):
     """A registry whose tools record every invocation."""
 
     class CountingSearch(MockSearchTool):
-        def execute(self, context, payload):
+        def execute(self, context, operation, payload):
             calls.append(("mock.search", payload["query"]))
             return {"rows": ["validated search material"]}
 
     class CountingCatalog(MockCatalogTool):
-        def execute(self, context, payload):
+        def execute(self, context, operation, payload):
             calls.append(("mock.catalog", payload["query"]))
             return {"rows": ["validated catalog material"]}
 
@@ -415,8 +419,9 @@ def test_every_declared_tool_runs_exactly_once_even_when_the_output_is_repaired(
 
     assert result.status == "completed"
     assert len(completions.calls) == 2
+    # Declaration order, one invocation per PLANNED CALL, not per attempt.
     assert [name for name, _ in tool_calls] == ["mock.search", "mock.catalog"]
-    assert len(tool_calls) == 2  # one invocation per DECLARED tool, not per attempt
+    assert len(tool_calls) == 2
 
 
 def test_repair_reuses_the_already_validated_tool_and_dependency_material():
@@ -428,8 +433,10 @@ def test_repair_reuses_the_already_validated_tool_and_dependency_material():
     worker.execute(worker_task(tools=("mock.search", "mock.catalog")), dependencies)
 
     initial, repair = (user_payload(call) for call in completions.calls)
-    assert initial["tools"] == {"mock.search": {"rows": ["validated search material"]},
-                                "mock.catalog": {"rows": ["validated catalog material"]}}
+    # Material is keyed by call_id, not by tool name, so a second call to the
+    # same tool could never overwrite the first one's result.
+    assert initial["tools"] == {"mock_search": {"rows": ["validated search material"]},
+                                "mock_catalog": {"rows": ["validated catalog material"]}}
     # Byte-identical material: no tool re-ran and no dependency was reloaded.
     assert repair["tools"] == initial["tools"]
     assert repair["dependencies"] == initial["dependencies"] == dependencies

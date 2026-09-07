@@ -26,6 +26,23 @@ class ToolContext:
             raise CancellationRequested("RUN_CANCELLED")
 
 
+@dataclass(frozen=True)
+class ToolOperation:
+    """One named, individually schema'd capability of a registered tool.
+
+    A tool is a namespace; an OPERATION is the unit a plan selects and the
+    unit the Registry validates. Each operation owns its own closed input and
+    output schema, so `vehicle_catalog.get_model(make, model)` and
+    `vehicle_catalog.list_models(make)` can never be confused for one another
+    or share a single lowest-common-denominator payload shape.
+    """
+
+    name: str
+    description: str
+    input_schema: Mapping[str, Any]
+    output_schema: Mapping[str, Any]
+
+
 class ToolError(Exception):
     """A safe, structured tool failure (never a provider traceback)."""
 
@@ -41,8 +58,8 @@ class Tool(Protocol):
     name: str
     description: str
     mode: ToolMode
-    input_schema: Mapping[str, Any]
-    output_schema: Mapping[str, Any]
     required_scope: str
+    operations: Mapping[str, ToolOperation]
 
-    def execute(self, context: ToolContext, payload: Mapping[str, Any]) -> Mapping[str, Any]: ...
+    def execute(self, context: ToolContext, operation: str,
+                payload: Mapping[str, Any]) -> Mapping[str, Any]: ...

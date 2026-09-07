@@ -28,9 +28,10 @@ from backend.engines.swarm_v2.contracts import (
 from backend.engines.swarm_v2.validation import PlanLimits
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
-from backend.tools import MockSearchTool, ToolContext, ToolError, ToolMode, ToolRegistry
+from backend.tools import (MockSearchTool, ToolContext, ToolError, ToolMode,
+                           ToolOperation, ToolRegistry)
 
-from test_swarm_v2 import task
+from test_swarm_v2 import call, task, tool_descriptors
 
 
 def graph(*items):
@@ -76,7 +77,7 @@ def test_external_cancellation_stops_active_tool_and_queued_work_cooperatively()
     tool_started = threading.Event()
     starts, model_calls = [], []
     class CooperativeTool(MockSearchTool):
-        def execute(self, context, payload):
+        def execute(self, context, operation, payload):
             starts.append(payload["query"])
             tool_started.set()
             while True:
@@ -94,8 +95,17 @@ def test_external_cancellation_stops_active_tool_and_queued_work_cooperatively()
                                    cancellation_checker=cancelled.is_set)
     canceller = threading.Thread(target=lambda: (tool_started.wait(1), cancelled.set()))
     canceller.start()
+
+    def blocking(task_id):
+        # One exact call per task, whose argument identifies the task, so the
+        # recorded start proves WHICH task's planned call ran.
+        spec = task(task_id, task_id, tool="mock.search")
+        spec["tools"] = [call(f"{task_id}_lookup", "mock.search",
+                              arguments={"query": task_id})]
+        return spec
+
     with pytest.raises(CancellationRequested):
-        executor.execute(graph(task("a", "a", tool="mock.search"), task("b", "b", tool="mock.search")))
+        executor.execute(graph(blocking("a"), blocking("b")))
     canceller.join()
     assert starts == ["a"]
     assert model_calls == []
@@ -104,18 +114,24 @@ def test_external_cancellation_stops_active_tool_and_queued_work_cooperatively()
 def test_registry_allowlist_schemas_scope_and_write_capability():
     registry = ToolRegistry([MockSearchTool({"q": ("answer",)})])
     context = ToolContext(scopes=frozenset({"mock:search"}))
-    assert registry.execute("mock.search", context, {"query": "q"}) == {"rows": ["answer"]}
+    assert registry.execute("mock.search", "search", context, {"query": "q"}) == {"rows": ["answer"]}
     with pytest.raises(ToolError, match="not registered") as unknown:
-        registry.execute("missing", context, {})
+        registry.execute("missing", "search", context, {})
     assert unknown.value.code == "TOOL_NOT_ALLOWED"
+    with pytest.raises(ToolError, match="operation is not registered") as operation:
+        registry.execute("mock.search", "delete_everything", context, {"query": "q"})
+    assert operation.value.code == "TOOL_OPERATION_NOT_ALLOWED"
     with pytest.raises(ToolError) as invalid:
-        registry.execute("mock.search", context, {"query": 4})
+        registry.execute("mock.search", "search", context, {"query": 4})
     assert invalid.value.code == "TOOL_INPUT_INVALID"
+    with pytest.raises(ToolError) as unscoped:
+        registry.execute("mock.search", "search", ToolContext(), {"query": "q"})
+    assert unscoped.value.code == "TOOL_SCOPE_REQUIRED"
 
     class BadOutput(MockSearchTool):
-        def execute(self, context, payload): return {"rows": [7]}
+        def execute(self, context, operation, payload): return {"rows": [7]}
     with pytest.raises(ToolError) as output:
-        ToolRegistry([BadOutput()]).execute("mock.search", context, {"query": "q"})
+        ToolRegistry([BadOutput()]).execute("mock.search", "search", context, {"query": "q"})
     assert output.value.code == "TOOL_OUTPUT_INVALID"
 
     class Writer(MockSearchTool):
@@ -125,11 +141,18 @@ def test_registry_allowlist_schemas_scope_and_write_capability():
     object.__setattr__(writer, "mode", ToolMode.WRITE)
     writes = ToolRegistry([writer])
     with pytest.raises(ToolError) as denied:
-        writes.execute("mock.search", context, {"query": "q"})
+        writes.execute("mock.search", "search", context, {"query": "q"})
     assert denied.value.code == "TOOL_WRITE_NOT_APPROVED"
+    # Approval alone is not enough, and neither is the capability alone.
+    for partial in (ToolContext(scopes=frozenset({"mock:search"}), write_approved=True),
+                    ToolContext(scopes=frozenset({"mock:search"}),
+                                capabilities=frozenset({"tool:write:mock.search"}))):
+        with pytest.raises(ToolError) as half:
+            writes.execute("mock.search", "search", partial, {"query": "q"})
+        assert half.value.code == "TOOL_WRITE_NOT_APPROVED"
     approved = ToolContext(scopes=frozenset({"mock:search"}), write_approved=True,
                            capabilities=frozenset({"tool:write:mock.search"}))
-    assert writes.execute("mock.search", approved, {"query": "q"}) == {"rows": []}
+    assert writes.execute("mock.search", "search", approved, {"query": "q"}) == {"rows": []}
 
 
 @pytest.mark.parametrize("target,schema", [
@@ -143,11 +166,16 @@ def test_registry_allowlist_schemas_scope_and_write_capability():
 def test_registry_rejects_invalid_nested_schemas_before_execution(target, schema):
     executed = []
     class InvalidTool(MockSearchTool):
-        def execute(self, context, payload):
+        def execute(self, context, operation, payload):
             executed.append(True)
             return {"rows": []}
     tool = InvalidTool()
-    object.__setattr__(tool, target, schema)
+    object.__setattr__(tool, "operations", {"search": ToolOperation(
+        "search", "invalid fixture",
+        schema if target == "input_schema" else {"type": "object", "properties": {},
+                                                 "required": [], "additionalProperties": False},
+        schema if target == "output_schema" else {"type": "object", "properties": {},
+                                                  "required": [], "additionalProperties": False})})
     with pytest.raises(ValueError):
         ToolRegistry([tool])
     assert executed == []
@@ -204,6 +232,7 @@ class RecordingCompletions:
 
 
 def _recording_gateway(responses, *, allowed_tools=()):
+    """`allowed_tools` names are registered as real tools, then described."""
     completions = RecordingCompletions(responses)
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
     scheduler = ProviderScheduler(ProviderLimitsConfig(
@@ -219,7 +248,7 @@ def _recording_gateway(responses, *, allowed_tools=()):
         scheduler=scheduler,
         api_key="offline",
         base_url="offline",
-        allowed_tool_names=allowed_tools,
+        tool_descriptors=tool_descriptors(*allowed_tools),
     )
     return gateway, completions
 
@@ -229,9 +258,8 @@ def _canonical_schema(value):
 
 
 def _valid_provider_plan(*, tool_name=None):
-    tools = [] if tool_name is None else [{
-        "name": tool_name, "scope": "mock:search", "max_calls": 1,
-    }]
+    tools = [] if tool_name is None else [
+        call("lookup", tool_name, arguments={"query": "offline"})]
     return {
         "version": "1",
         "objective": "offline",
@@ -423,7 +451,7 @@ def test_model_visible_tool_allowlist_is_sorted_and_validation_stays_fail_closed
     assert "evil.write" not in system
 
     validator = PlanValidator(
-        allowed_tools={"mock.search"},
+        allowed_tools=tool_descriptors("mock.search"),
         limits=PlanLimits(max_tasks=1, max_tool_calls=1),
     )
     assert validator.validate(payload).graph.tasks[0].tools[0].name == "mock.search"

@@ -357,7 +357,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 worker_model = os.getenv("MILO_SWARM_WORKER_MODEL", "").strip()
                 if not allowed or not commander_model or not worker_model or commander_model not in allowed:
                     raise ValueError("Swarm V2 model configuration is incomplete or not allowlisted")
-                tools = ToolRegistry()  # real tools are registered explicitly; mocks never enter this path
+                # The production registry stays EMPTY in this release: no Yeda,
+                # Government, CKAN or web tool is registered, so every plan the
+                # firewall can approve is a no-tool plan. Registering a real
+                # tool is a separate, deliberate change that must also grant
+                # its scope on the ToolContext below.
+                tools = ToolRegistry()
                 scheduler = ProviderScheduler(provider_limits,
                     cancellation_checker=is_cancelled,
                     backpressure_callback=record_provider_backpressure)
@@ -368,17 +373,27 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker),
                     scheduler=scheduler, api_key=worker_provider_api_key(),
                     base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
-                    allowed_tool_names=tools.allowed_names,
+                    # Sanitized, server-owned descriptors: Commander sees each
+                    # registered tool's operations and schemas, and the SAME
+                    # descriptors are the firewall's only tool authority.
+                    tool_descriptors=tools.descriptors(),
                     cancellation_checker=is_cancelled, agent_step_callback=record_agent_step,
                     plan_limits=limits)
-                validator = PlanValidator(allowed_tools=tools.allowed_names, limits=limits)
+                validator = PlanValidator(allowed_tools=tools.descriptors(), limits=limits)
                 commander = Commander(client=gateway,
                     resolver=CommanderModelResolver(allowed, set(allowed)), validator=validator,
                     retry_callback=record_retry)
+                # No scope, no capability and no write approval are granted:
+                # a plan can request a registered capability, never authorize
+                # one. Write tools therefore remain impossible here.
                 tool_context = ToolContext(cancellation_checker=is_cancelled)
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
                     cancellation_checker=is_cancelled, event_sink=forward_event,
+                    # tool_result_sink is deliberately left unwired: the
+                    # trusted seam exists and is tested, but turning a tool
+                    # result into Source/Claim evidence needs domain mapping
+                    # and a real evidence grant, which is Y4/G3 work.
                     # A bounded worker-output repair is a semantic retry and
                     # consumes the SAME run-level retry allowance the
                     # Commander repair does. Provider 429 backpressure is

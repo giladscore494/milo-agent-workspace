@@ -6,15 +6,46 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .tool_calls import MAX_BINDING_PATH_SEGMENTS, MAX_DEPENDENCY_BINDINGS_PER_CALL
+
 
 class StrictContract(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
-class ToolRequirement(StrictContract):
+class DependencyBinding(StrictContract):
+    """One argument taken from one declared dependency's output.
+
+    `path` is a bounded literal key/index path, never a query expression:
+    see .tool_calls.validate_binding_path for the deterministic bound that
+    both the plan firewall and the trusted resolver apply to it.
+    """
+
+    argument: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    task_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    path: list[str | int] = Field(min_length=1, max_length=MAX_BINDING_PATH_SEGMENTS)
+
+
+class PlannedToolCall(StrictContract):
+    """ONE exact tool call: the single executable tool representation.
+
+    This replaced the ambiguous `ToolRequirement`, which named a tool and a
+    free-text scope, promised `max_calls` invocations the worker never made,
+    and left the worker to invent a `{"query": task.goal}` payload that no
+    structured operation could accept. Here the plan states the operation and
+    the arguments outright, the firewall checks them against the registered
+    operation schema, and the worker executes exactly what was approved.
+
+    The number of entries in a task's list is therefore both the promise and
+    the charge: `len(task.tools)` is what tool-call budgeting counts.
+    """
+
+    call_id: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     name: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_.-]*$")
-    scope: str = Field(min_length=1, max_length=200)
-    max_calls: int = Field(ge=1, le=100)
+    operation: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    dependency_bindings: list[DependencyBinding] = Field(
+        default_factory=list, max_length=MAX_DEPENDENCY_BINDINGS_PER_CALL)
 
 
 class EvidenceRequirement(StrictContract):
@@ -48,7 +79,7 @@ class DynamicTask(StrictContract):
     goal: str = Field(min_length=1, max_length=2000)
     scope: str = Field(min_length=1, max_length=1000)
     dependencies: list[str] = Field(default_factory=list, max_length=100)
-    tools: list[ToolRequirement] = Field(default_factory=list, max_length=50)
+    tools: list[PlannedToolCall] = Field(default_factory=list, max_length=50)
     output_schema: dict[str, Any]
     evidence: EvidenceRequirement
     priority: int = Field(ge=0, le=100)
@@ -61,13 +92,6 @@ class DynamicTask(StrictContract):
     def unique_dependencies(cls, value: list[str]) -> list[str]:
         if len(set(value)) != len(value):
             raise ValueError("dependencies must be unique")
-        return value
-
-    @field_validator("tools")
-    @classmethod
-    def unique_tools(cls, value: list[ToolRequirement]) -> list[ToolRequirement]:
-        if len({tool.name for tool in value}) != len(value):
-            raise ValueError("tools must be unique per task")
         return value
 
     @field_validator("output_schema")

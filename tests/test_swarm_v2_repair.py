@@ -30,7 +30,7 @@ from backend.engines.swarm_v2 import (
 from backend.errors import AppError
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
-from test_swarm_v2 import plan, task
+from test_swarm_v2 import plan, task, tool_descriptors
 from test_swarm_v2_smoke_offline import (
     FakeKimiCompletions,
     build_repo,
@@ -49,7 +49,8 @@ def _canonical(value):
 
 
 def _validator(**limits):
-    return PlanValidator(allowed_tools={"search", "calculator"}, limits=PlanLimits(**limits))
+    return PlanValidator(allowed_tools=tool_descriptors("search", "calculator"),
+                         limits=PlanLimits(**limits))
 
 
 def _system_of(call):
@@ -78,8 +79,8 @@ def gateway_with_limits(limits, responses, allowed=()):
         backoff_max_seconds=.001))
     gateway = ModelGateway(
         guarded_client_factory=lambda *_: client, scheduler=scheduler,
-        api_key="offline", base_url="offline", allowed_tool_names=allowed,
-        plan_limits=limits)
+        api_key="offline", base_url="offline",
+        tool_descriptors=tool_descriptors(*allowed), plan_limits=limits)
     return gateway, completions
 
 
@@ -200,6 +201,16 @@ def _two_task_candidate():
      "DEPENDENCY_CYCLE"),
     (lambda p: p["graph"]["tasks"][0]["tools"][0].update({"name": "shell.exec"}), {},
      "TOOL_NOT_ALLOWLISTED"),
+    (lambda p: p["graph"]["tasks"][0]["tools"][0].update({"operation": "drop_table"}), {},
+     "TOOL_OPERATION_UNKNOWN"),
+    (lambda p: p["graph"]["tasks"][0]["tools"][1].update({"call_id": "primary"}), {},
+     "DUPLICATE_TOOL_CALL_ID"),
+    (lambda p: p["graph"]["tasks"][0]["tools"][0].update({"arguments": {"unknown": "x"}}),
+     {}, "TOOL_ARGUMENTS_INVALID"),
+    (lambda p: p["graph"]["tasks"][0]["tools"][0]["dependency_bindings"].append(
+        {"argument": "query", "task_id": "b", "path": ["answer"]}), {},
+     "TOOL_BINDING_CONFLICT"),
+    (lambda p: None, {"max_tool_calls_per_task": 1}, "TASK_TOOL_CALL_LIMIT"),
     (lambda p: p["graph"]["tasks"][1].update(
         {"goal": p["graph"]["tasks"][0]["goal"],
          "scope": p["graph"]["tasks"][0]["scope"],

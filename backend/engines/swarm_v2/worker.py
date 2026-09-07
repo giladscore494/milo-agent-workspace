@@ -11,6 +11,9 @@ from backend.tools import ToolContext, ToolError, ToolRegistry
 from backend.tools.registry import validate_json_schema
 from .contracts import DynamicTask
 from .model_gateway import ModelGateway
+from .tool_calls import (MAX_TASK_OUTPUT_JSON_BYTES, MAX_TOOL_MATERIAL_JSON_BYTES,
+                         MAX_TOOL_OUTPUT_JSON_BYTES, ToolCallError, ToolCallRecord,
+                         ToolResultCallback, check_material, resolve_tool_arguments)
 
 
 # One initial worker completion plus AT MOST one bounded semantic repair.
@@ -62,6 +65,11 @@ def validate_worker_output(completion: Any, output_schema: Mapping[str, Any]) ->
     distinguished — JSON versus schema — and every raw diagnostic is dropped
     at this boundary.
     """
+    if isinstance(completion, (str, bytes, bytearray)) and len(completion) > MAX_TASK_OUTPUT_JSON_BYTES:
+        # Refused BEFORE decoding: an oversized completion must never be
+        # parsed into memory, repaired, or written to durable state. This is
+        # deliberately NOT a repairable worker-output failure.
+        raise ToolCallError("TASK_OUTPUT_TOO_LARGE")
     if isinstance(completion, Mapping):
         parsed: Any = dict(completion)
     elif not isinstance(completion, (str, bytes, bytearray)):
@@ -75,6 +83,7 @@ def validate_worker_output(completion: Any, output_schema: Mapping[str, Any]) ->
             # `from None`: the decoder exception carries the raw document and
             # must never travel with the safe classification.
             raise WorkerOutputValidationError("WORKER_OUTPUT_JSON_INVALID") from None
+    check_material(parsed, MAX_TASK_OUTPUT_JSON_BYTES, "TASK_OUTPUT_TOO_LARGE")
     try:
         validate_json_schema(output_schema, parsed, "$model_output")
     except (TypeError, ValueError):
@@ -91,7 +100,8 @@ def build_worker_request(task: DynamicTask, tool_outputs: Mapping[str, Any],
 
     Both attempts are built here from the SAME trusted material — the task
     goal and scope, the dependency context the first call already used, the
-    already validated tool outputs and the declared output_schema — so the
+    already validated tool outputs (keyed by call_id, so two calls to the same
+    tool stay distinguishable) and the declared output_schema — so the
     repair can never silently see more or less than the initial call.
 
     The repair carries only a static reason code. The malformed completion is
@@ -131,13 +141,18 @@ class GenericWorker:
     def __init__(self, *, gateway: ModelGateway, tools: ToolRegistry, model: str, tool_context: ToolContext,
                  cancellation_checker: Callable[[], bool] | None = None,
                  event_sink: Callable[[str, dict[str, Any]], None] | None = None,
-                 retry_callback: Callable[[str, str, str], None] | None = None):
+                 retry_callback: Callable[[str, str, str], None] | None = None,
+                 tool_result_sink: ToolResultCallback | None = None):
         self._gateway, self._tools, self._model = gateway, tools, model
         self._tool_context = (replace(tool_context, cancellation_checker=cancellation_checker)
                               if cancellation_checker is not None else tool_context)
         self._cancelled = cancellation_checker
         self._event_sink = event_sink
         self._retry_callback = retry_callback
+        # The trusted post-execution seam (see .tool_calls.ToolCallRecord).
+        # Unwired in production until Y4/G3 connect a domain mapping to a real
+        # evidence grant; a validated result is material, never a fact.
+        self._tool_result_sink = tool_result_sink
 
     def _check_cancelled(self) -> None:
         if self._cancelled and self._cancelled():
@@ -145,20 +160,12 @@ class GenericWorker:
 
     def execute(self, task: DynamicTask, dependency_outputs: Mapping[str, Any]) -> TaskResult:
         try:
-            tool_outputs = {}
-            for requirement in task.tools:
-                self._check_cancelled()
-                tool_outputs[requirement.name] = self._tools.execute(
-                    requirement.name, self._tool_context, {"query": task.goal}
-                )
-                if self._event_sink:
-                    self._event_sink("tool_called", {"task_id": task.task_id, "tool": requirement.name})
-                self._check_cancelled()
+            tool_outputs = self._run_planned_calls(task, dependency_outputs)
             self._check_cancelled()
             # Tool execution is COMPLETE and final at this line. Everything
             # below is the model-output boundary: the bounded repair re-uses
             # exactly these captured outputs and never re-enters the loop
-            # above, so each declared tool is invoked exactly once per task
+            # above, so each planned call is invoked exactly once per task
             # execution whether or not a repair happens.
             output = self._resolve_output(task, dependency_outputs, tool_outputs)
             return TaskResult(task.task_id, "completed", output=output)
@@ -176,6 +183,12 @@ class GenericWorker:
             raise
         except ToolError as exc:
             return TaskResult(task.task_id, "failed", error=exc.as_dict()["error"])
+        except ToolCallError as exc:
+            # A binding that could not be resolved, or material that exceeded a
+            # deterministic bound. Only the static code travels; the rejected
+            # value never reaches a durable result or a run event.
+            return TaskResult(task.task_id, "failed",
+                              error={"code": exc.code, "message": exc.safe_message})
         except ProviderBackpressureExceeded:
             return TaskResult(task.task_id, "failed", error={"code": "PROVIDER_BACKPRESSURE_EXCEEDED", "message": "provider backpressure did not clear"})
         except WorkerOutputValidationError as exc:
@@ -187,6 +200,52 @@ class GenericWorker:
                               error={"code": exc.reason_code, "message": exc.safe_message})
         except Exception:
             return TaskResult(task.task_id, "failed", error={"code": "TASK_FAILED", "message": "task execution failed"})
+
+    def _run_planned_calls(self, task: DynamicTask,
+                           dependency_outputs: Mapping[str, Any]) -> dict[str, Any]:
+        """Execute exactly the approved calls, once each, in declaration order.
+
+        There is no fallback payload and no dynamic loop: every call, its
+        operation and its arguments come from the already-validated plan, and
+        a task that declares no calls performs none. Results are keyed by
+        `call_id`, so the same tool may legitimately be called more than once
+        in one task without either result overwriting the other.
+
+        The first failure stops the task: later calls are never attempted
+        after one fails, so a task can never be completed from a partial set
+        of tool material.
+        """
+        outputs: dict[str, Any] = {}
+        for call in task.tools:
+            self._check_cancelled()
+            if call.call_id in outputs:
+                # Defence in depth: the firewall already rejects duplicates.
+                raise ToolCallError("DUPLICATE_TOOL_CALL_ID")
+            # Bindings are resolved HERE, in trusted code, from the direct
+            # dependency outputs the executor supplied -- never by the model
+            # and never from the wider run -- and the resolver bounds the
+            # FINAL payload's shape and size before it can reach a tool.
+            arguments = resolve_tool_arguments(call, dependency_outputs)
+            result = self._tools.execute(call.name, call.operation,
+                                         self._tool_context, arguments)
+            check_material(result, MAX_TOOL_OUTPUT_JSON_BYTES, "TOOL_OUTPUT_TOO_LARGE")
+            outputs[call.call_id] = result
+            if self._tool_result_sink is not None:
+                # Reached only with a Registry-validated result and
+                # server-resolved identity; the worker model cannot call it.
+                self._tool_result_sink(ToolCallRecord(
+                    task_id=task.task_id, call_id=call.call_id, tool=call.name,
+                    operation=call.operation, result=result))
+            if self._event_sink:
+                # Identifiers only. Arguments and results are deliberately
+                # absent: a public run event is not an evidence channel.
+                self._event_sink("tool_called", {
+                    "task_id": task.task_id, "tool": call.name,
+                    "call_id": call.call_id, "operation": call.operation})
+            self._check_cancelled()
+        # The combined material is bounded BEFORE it can reach a model prompt.
+        check_material(outputs, MAX_TOOL_MATERIAL_JSON_BYTES, "TOOL_MATERIAL_TOO_LARGE")
+        return outputs
 
     def _resolve_output(self, task: DynamicTask, dependency_outputs: Mapping[str, Any],
                         tool_outputs: Mapping[str, Any]) -> Any:

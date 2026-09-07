@@ -42,7 +42,8 @@ class SwarmV2Engine:
     def _emit(self, kind: str, payload: dict[str, Any]) -> None:
         # Vocabulary and payloads are deliberately narrow. Provider responses,
         # exception strings, credentials and reasoning never reach this sink.
-        allowed = {"task_id", "status", "code", "tool", "graph_revision", "decision",
+        allowed = {"task_id", "status", "code", "tool", "call_id", "operation",
+                   "graph_revision", "decision",
                    "claim_id", "source_id", "conflict_id", "verdict",
                    "batch_index", "batch_count", "claim_count",
                    "source_count", "missing_context_count"}
@@ -92,9 +93,11 @@ class SwarmV2Engine:
             0, remaining.cost_units -
             sum(task.estimated_cost_units for task in completed_specs)
         )
+        # Tool-call budgeting is charged against the EXACT planned call list:
+        # `len(task.tools)` is both what the firewall approved and what the
+        # worker executes, so the reservation can never disagree with the run.
         available_tools = max(
-            0, remaining.tool_calls -
-            sum(tool.max_calls for task in completed_specs for tool in task.tools)
+            0, remaining.tool_calls - sum(len(task.tools) for task in completed_specs)
         )
         available_tasks = max(0, remaining.tasks - len(completed_specs))
         # The MINIMUM each pending task costs is one worker-model call; a
@@ -107,7 +110,7 @@ class SwarmV2Engine:
         # yet) and is checked separately in _run_verification.
         required_model_calls = len(pending) + 2
         if (sum(task.estimated_cost_units for task in pending) > available_cost or
-                sum(tool.max_calls for task in pending for tool in task.tools) > available_tools or
+                sum(len(task.tools) for task in pending) > available_tools or
                 len(pending) > available_tasks or
                 required_model_calls > remaining.model_calls):
             raise ValueError("plan exceeds remaining budget")
