@@ -100,11 +100,16 @@ is incomplete, which is reported as a critical failure.
 Cloud Run task exit code zero is not a positive-smoke verdict: handled
 Swarm failures intentionally exit zero after durable finalization. After
 the execution settles, the controller reads only the sanitized run and
-latest-checkpoint fields from Supabase and accepts exactly a
-`completed` Swarm V2 run at the expected attempt, with 1–200 model calls,
-actual cost at or below USD 3.00, and a compatible `swarm_v2.1`
-checkpoint. Other terminal states fail the smoke and still trigger the
-automatic shutdown.
+latest-checkpoint fields from Supabase and accepts a `completed` or
+`partial_success` Swarm V2 run at the expected attempt, with 1–200 model
+calls, actual cost at or below USD 3.00, and a compatible `swarm_v2.1`
+checkpoint. Both are accepted because this smoke exercises the minimal
+no-tool plan: it proves the infrastructure path, not product usefulness.
+With no tools there is no evidence and therefore no verified field, so the
+truthful product outcome is `partial_success` / `no_usable_result` and the
+run is durably finalized as `partial_success`. Every other terminal state
+— failed, cancelled, timed_out, budget_exhausted — fails the smoke and
+still triggers the automatic shutdown.
 
 Kimi IAM is evaluated across both the secret resource policy and inherited
 project IAM. During an active smoke the pinned Worker accessor is required;

@@ -17,6 +17,11 @@ from .worker import (MAX_WORKER_OUTPUT_MODEL_ATTEMPTS, WORKER_OUTPUT_REASONS, Ge
                      TaskResult, WorkerOutputValidationError, build_worker_request,
                      validate_worker_output)
 from .builder import FinalBuilder
+from .outcome import (ALLOWED_OUTCOMES, DURABLE_RUN_STATUS, NO_USABLE_RESULT_CODE,
+                      PRODUCT_STATUSES, RESULT_KINDS, TRUSTED_NEGATIVE_CODES,
+                      ProductOutcome, ProductOutcomeError, TrustedNegativeResult,
+                      decide_outcome, durable_run_status, finalize_product_outcome,
+                      validate_product_outcome)
 from .grounding import (FRAGMENT_OVER_READ_PER_SOURCE, GROUNDING_REASONS,
                         MAX_SOURCES_PER_RESOLVER_READ, VERIFIER_GROUNDING_VERSION,
                         EvidenceResolver, GroundedCandidate, GroundingContractError,
@@ -38,6 +43,11 @@ __all__ = ["Commander", "CommanderDecision", "CommanderModelError", "CommanderMo
            "TaskGraph", "ToolRequirement", "WorkerAssignment"]
 __all__ += ["BoundedTaskExecutor", "ExecutionResult", "GenericWorker", "ModelGateway", "TaskResult"]
 __all__ += ["EvidenceReference", "FinalBuilder", "RemainingBudget", "SwarmState", "VerificationVerdict", "Verifier"]
+__all__ += ["ALLOWED_OUTCOMES", "DURABLE_RUN_STATUS", "NO_USABLE_RESULT_CODE",
+            "PRODUCT_STATUSES", "RESULT_KINDS", "TRUSTED_NEGATIVE_CODES",
+            "ProductOutcome", "ProductOutcomeError", "TrustedNegativeResult",
+            "decide_outcome", "durable_run_status", "finalize_product_outcome",
+            "validate_product_outcome"]
 __all__ += ["VALIDATION_REASONS", "provider_plan_policy"]
 __all__ += ["MAX_WORKER_OUTPUT_MODEL_ATTEMPTS", "WORKER_OUTPUT_REASONS",
             "WorkerOutputValidationError", "build_worker_request", "validate_worker_output"]

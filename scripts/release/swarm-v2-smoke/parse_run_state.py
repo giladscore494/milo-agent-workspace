@@ -13,6 +13,17 @@ import json
 import sys
 from decimal import Decimal, InvalidOperation
 
+# The positive smoke runs the minimal no-tool plan: it proves the
+# infrastructure path (planning, logical task execution, model-call
+# accounting, checkpointing, durable finalization), never product
+# usefulness. With no tools there is no evidence and therefore no verified
+# field, so the truthful durable terminal state is `partial_success`
+# (result_kind `no_usable_result`); a plan that does verify a field lands as
+# `completed`. Both are handled non-failure terminals and both are accepted.
+# Every other terminal state -- failed, cancelled, timed_out,
+# budget_exhausted -- and any non-terminal status still fails the smoke.
+POSITIVE_SMOKE_STATUSES = ("completed", "partial_success")
+
 
 def _load_array(path: str) -> list[dict]:
     with open(path, encoding="utf-8") as handle:
@@ -37,14 +48,15 @@ def verify(
     run = runs[0]
     if str(run.get("id") or "") != run_id:
         problems.append("run id does not match the authorized smoke run")
-    if run.get("status") != "completed":
-        problems.append(f"run status is {run.get('status')!r}, expected 'completed'")
+    if run.get("status") not in POSITIVE_SMOKE_STATUSES:
+        expected = " or ".join(repr(item) for item in POSITIVE_SMOKE_STATUSES)
+        problems.append(f"run status is {run.get('status')!r}, expected {expected}")
     if run.get("attempt") != expected_attempt:
         problems.append(
             f"run attempt is {run.get('attempt')!r}, expected {expected_attempt}"
         )
     if not run.get("finished_at"):
-        problems.append("completed run has no finished_at timestamp")
+        problems.append("terminal run has no finished_at timestamp")
 
     usage = run.get("usage")
     if not isinstance(usage, dict):

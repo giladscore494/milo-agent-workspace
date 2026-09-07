@@ -644,3 +644,32 @@ def test_semantic_positive_smoke_requires_completed_checkpoint_and_caps(tmp_path
     write_json(tmp_path / "run.json", _positive_run(run_id))
     write_json(tmp_path / "checkpoint.json", [])
     assert parse_run_state.main(args) == 1
+
+
+def test_semantic_positive_smoke_accepts_only_non_failure_terminal_states(tmp_path):
+    """The no-tool smoke verifies no field, so its truthful durable terminal
+    state is partial_success. That is accepted alongside completed -- and
+    nothing else is."""
+    run_id = "11111111-1111-4111-8111-111111111111"
+    run_file = write_json(tmp_path / "run.json", _positive_run(run_id))
+    checkpoint_file = write_json(
+        tmp_path / "checkpoint.json", _positive_checkpoint(run_id)
+    )
+    args = [
+        run_file, checkpoint_file,
+        "--run-id", run_id,
+        "--expected-attempt", "1",
+        "--max-model-calls", "200",
+        "--max-actual-cost", "3.00",
+    ]
+    for accepted in parse_run_state.POSITIVE_SMOKE_STATUSES:
+        rows = _positive_run(run_id)
+        rows[0]["status"] = accepted
+        write_json(tmp_path / "run.json", rows)
+        assert parse_run_state.main(args) == 0, accepted
+    for rejected in ("failed", "cancelled", "timed_out", "budget_exhausted",
+                     "running", "queued", "partial", ""):
+        rows = _positive_run(run_id)
+        rows[0]["status"] = rejected
+        write_json(tmp_path / "run.json", rows)
+        assert parse_run_state.main(args) == 1, rejected

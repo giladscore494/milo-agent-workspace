@@ -171,7 +171,7 @@ def test_engine_preserves_original_evidence_values():
     assert saved["c2"]["entity"] == " TOYOTA   COROLLA-2020 " and saved["c2"]["market"] == " ISRAEL "
     assert refs[1].entity == " TOYOTA   COROLLA-2020 "
     scopes = {item["provenance"]["claim_id"]: item["provenance"]["scope"]
-              for item in result["needs_review"]}
+              for item in result["needs_review"] if "provenance" in item}
     assert scopes["c2"]["entity"] == " TOYOTA   COROLLA-2020 "
 
 

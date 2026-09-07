@@ -287,8 +287,13 @@ def test_mock_engine_never_selected_without_env(monkeypatch):
     assert "backend.worker.mock_engine" not in sys.modules
 
 
-def test_default_registry_routes_trusted_swarm_v2_and_completes(monkeypatch):
-    """The production registry builds V2; no mock engine or metadata routing is used."""
+def test_default_registry_routes_trusted_swarm_v2_and_reaches_a_truthful_outcome(monkeypatch):
+    """The production registry builds V2; no mock engine or metadata routing is used.
+
+    Routing is what this test proves. The routed run has no tools and no
+    evidence, so its truthful product outcome is partial_success /
+    no_usable_result — never an empty `complete`.
+    """
     import json
     from types import SimpleNamespace
     from backend.budget import BudgetConfig, BudgetTracker
@@ -325,8 +330,10 @@ def test_default_registry_routes_trusted_swarm_v2_and_completes(monkeypatch):
     repo = SwarmRepo()
     tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=10), kill_switch=lambda: True)
     assert worker_main.execute_run(repo.run_id, repo, budget_tracker=tracker) == 0
-    assert repo.completed is not None
-    assert repo.completed[1]["status"] == "complete"
+    assert repo.completed is None
+    assert repo.partial is not None
+    assert repo.partial[1]["status"] == "partial_success"
+    assert repo.partial[1]["result_kind"] == "no_usable_result"
     assert responses == []
 
 
