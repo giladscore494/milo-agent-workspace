@@ -6,9 +6,28 @@ errors, credentials, and chain-of-thought are rejected rather than copied
 into durable evidence.
 
 Evidence fragments are captured at acquisition time from real tool material
-(see .fragments) and land in the service-only relation
-public.source_evidence_fragments -- never in the browser-visible source
-metadata, the claim value, or a run event.
+and land in the service-only relation public.source_evidence_fragments --
+never in the browser-visible source metadata, the claim value, or a run
+event.
+
+There are two acquisition paths and they must not be confused:
+
+*   The R3 path (`record_evidence_bundle`).  A trusted mapper turned ONE
+    validated ToolCallRecord into a versioned source, structured facts with
+    units, and focused fragments carrying an exact locator.  This is the only
+    path new evidence may take.
+*   The pre-R3 generic path (`record_source_with_evidence`).  It scans a tool
+    result for text-shaped keys and stores a 400-character prefix.  It is
+    retained ONLY so historical callers and their durable rows keep working;
+    R3-qualified evidence never uses it, and nothing falls back to it.
+
+The R3 additions -- the source version, the fragment locator/type and the
+claim's evidence locator -- are INTERNAL durable columns added here, by the
+trusted board.  They are deliberately not fields of SourceCreate/ClaimCreate,
+because those schemas are the worker-facing HTTP contract whose rows are
+echoed into browser-visible run events (backend/main.py).  Keeping the R3
+provenance on this side of the boundary is what lets grounding receive it
+while the public API surface stays exactly as it was.
 """
 
 from __future__ import annotations
@@ -21,6 +40,11 @@ from uuid import UUID
 
 from backend.schemas import ClaimCreate, ConflictCreate, SourceCreate, ToolUsageCreate
 
+from .evidence_contracts import (FRAGMENT_TYPES, MAX_LOCATOR_KEY_CHARS, EvidenceBundle,
+                                 FocusedEvidenceFragment, SourceVersion,
+                                 StructuredEvidenceFact, VersionedEvidenceSource,
+                                 revalidate_evidence_bundle)
+from .evidence_mapping import AcquiredEvidence
 from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENTS_PER_SOURCE, extract_source_fragments,
                         fragment_content_hash, normalize_fragment_text)
 from .normalization import (SCOPE_NORMALIZATION_VERSION, CanonicalScope, canonical_scope_hash,
@@ -115,6 +139,27 @@ def _key(kind: str, payload: Mapping[str, Any]) -> str:
     return f"{kind}:{hashlib.sha256(encoded.encode()).hexdigest()}"
 
 
+# R3 provenance that participates in evidence IDENTITY when it is present.
+# A key whose value is None is dropped from the identity payload, so a source
+# or claim written by a pre-R3 release replays to exactly the same
+# evidence_key it had before this contract existed.  When the value IS
+# present it changes identity on purpose: evidence read from a different
+# source version, or from a different record/field, is different evidence and
+# must never be deduplicated onto an existing row.
+_R3_IDENTITY_KEYS = ("source_version_kind", "source_version_id", "evidence_locator")
+
+
+def _identity(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items()
+            if value is not None or key not in _R3_IDENTITY_KEYS}
+
+
+def _locator_key(value: Any) -> str:
+    if not isinstance(value, str) or not value or len(value) > MAX_LOCATOR_KEY_CHARS:
+        raise EvidenceValidationError("evidence locator is outside the durable bound")
+    return value
+
+
 class EvidenceBoard:
     """Persist retry-safe evidence and maintain trace summaries on run_blackboard."""
 
@@ -145,10 +190,28 @@ class EvidenceBoard:
                        idempotency_key=_key("tool", {"task_key": task_key, **payload}))
         return self._repository.create_tool_usage(self.lease.run_id, payload, **self._lease_kwargs)
 
-    def record_source(self, source: SourceCreate, *, task_key: str) -> dict[str, Any]:
+    def record_source(self, source: SourceCreate, *, task_key: str,
+                      version: SourceVersion | None = None) -> dict[str, Any]:
+        """Persist source metadata, optionally pinned to its exact version.
+
+        `version` comes from the trusted adapter/mapper, never from a model
+        and never from the fragment: `retrieved_at` records when we looked and
+        a content hash records what we quoted, so neither can stand in for
+        which version of the source was read.  It participates in the
+        source's durable identity, so acquiring the same source at a NEW
+        version creates new provenance instead of merging into the old row.
+
+        `version=None` keeps the exact pre-R3 behaviour and the exact pre-R3
+        evidence_key, so historical callers and resumed legacy runs are
+        unaffected.
+        """
+        if version is not None and not isinstance(version, SourceVersion):
+            raise EvidenceValidationError("a trusted source version contract is required")
         payload = safe_durable_value(source.model_dump(mode="json"))
+        payload.update(source_version_kind=version.kind if version else None,
+                       source_version_id=version.identifier if version else None)
         payload.update(task_key=self._task(task_key),
-                       evidence_key=_key("source", {"task_key": task_key, **payload}))
+                       evidence_key=_key("source", _identity({"task_key": task_key, **payload})))
         row = self._repository.create_source(self.lease.run_id, payload, **self._lease_kwargs)
         self._sources[str(row["id"])] = dict(row)
         return row
@@ -178,42 +241,88 @@ class EvidenceBoard:
 
         The caller records the source first, so every fragment is bound to a
         real durable source_id; free-floating excerpts are impossible.
+
+        This is the PRE-R3 generic path: it takes a bounded prefix of whatever
+        text-shaped key the result happens to carry, and it keeps neither a
+        source version nor a locator.  It is retained for backward
+        compatibility with historical callers only.  R3-qualified evidence is
+        acquired through `record_evidence_bundle`, and an operation with no
+        registered evidence mapper never falls back to here.
         """
         return [self.record_evidence_fragment(source_id, text, task_key=task_key,
                                               fragment_index=index)
                 for index, text in enumerate(extract_source_fragments(tool_result))]
 
     def record_evidence_fragment(self, source_id: Any, fragment_text: str, *, task_key: str,
-                                 fragment_index: int = 0) -> dict[str, Any]:
+                                 fragment_index: int = 0, fragment_type: str | None = None,
+                                 locator_key: str | None = None) -> dict[str, Any]:
         """Persist one bounded, source-bound fragment through the guarded RPC.
 
         Identity is stable provenance only -- source + task + the final bounded
-        text's content hash -- so an exact replay of the same fragment for the
-        same source and task returns the same durable row instead of a
-        duplicate.  No timestamp, UUID, or call sequence enters the key.
+        text's content hash, plus the R3 locator and fragment type when the
+        fragment carries them -- so an exact replay of the same fragment for
+        the same source, task and location returns the same durable row
+        instead of a duplicate.  No timestamp, UUID, or call sequence enters
+        the key.
+
+        The locator is what keeps two IDENTICAL sentences read from two
+        different records (or two different fields) as two distinct pieces of
+        evidence: without it their content hashes would collide and the
+        second one would silently vanish into the first.
+
+        Locator and fragment type are all-or-nothing: an R3 fragment always
+        has both, and a legacy fragment has neither.  A half-specified
+        fragment is a caller bug and fails closed here and again in the RPC.
         """
         text = safe_fragment_text(fragment_text)
         if not isinstance(fragment_index, int) or isinstance(fragment_index, bool) or \
                 not 0 <= fragment_index < MAX_FRAGMENTS_PER_SOURCE:
             raise EvidenceValidationError("fragment index is outside the durable bound")
+        if (fragment_type is None) != (locator_key is None):
+            raise EvidenceValidationError("a focused fragment requires both a type and a locator")
         content_hash = fragment_content_hash(text)
         identity = {"task_key": task_key, "source_id": str(source_id),
                     "content_hash": content_hash}
+        if fragment_type is not None:
+            if fragment_type not in FRAGMENT_TYPES:
+                raise EvidenceValidationError("unknown evidence fragment type")
+            identity.update(fragment_type=fragment_type, locator_key=_locator_key(locator_key))
         payload = {"source_id": str(source_id), "fragment_text": text,
                    "content_hash": content_hash, "fragment_index": fragment_index,
+                   "fragment_type": fragment_type, "locator_key": locator_key,
                    "task_key": self._task(task_key),
                    "evidence_key": _key("fragment", identity)}
         return self._repository.record_evidence_fragment(self.lease.run_id, payload,
                                                          **self._lease_kwargs)
 
-    def record_claim(self, claim: ClaimCreate, *, task_key: str) -> dict[str, Any]:
+    def record_focused_fragment(self, source_id: Any, fragment: FocusedEvidenceFragment, *,
+                                task_key: str) -> dict[str, Any]:
+        """Persist ONE validated R3 fragment, with its locator and its type."""
+        if not isinstance(fragment, FocusedEvidenceFragment):
+            raise EvidenceValidationError("a validated focused evidence fragment is required")
+        return self.record_evidence_fragment(
+            source_id, fragment.text, task_key=task_key,
+            fragment_index=fragment.fragment_index, fragment_type=fragment.fragment_type,
+            locator_key=fragment.locator.locator_key)
+
+    def record_claim(self, claim: ClaimCreate, *, task_key: str,
+                     evidence_locator: str | None = None) -> dict[str, Any]:
         payload = safe_durable_value(claim.model_dump(mode="json"))
+        # `evidence_locator` is the exact record/field or document span the
+        # fact was read from.  It is an INTERNAL durable column (never a
+        # ClaimCreate field, so it never reaches a browser-visible run event)
+        # and it participates in identity, so the same value read from two
+        # different records stays two claims.
+        payload["evidence_locator"] = (None if evidence_locator is None
+                                       else _locator_key(evidence_locator))
         # The idempotent evidence identity is derived from task provenance plus
         # the ORIGINAL claim payload only — exactly as before canonical scopes
         # existed — so a claim persisted by a pre-canonical release replays to
         # the same evidence_key.  Derived canonical metadata (and any future
-        # SCOPE_NORMALIZATION_VERSION) must never change this identity.
-        evidence_key = _key("claim", {"task_key": task_key, **payload})
+        # SCOPE_NORMALIZATION_VERSION) must never change this identity.  A
+        # claim with no locator drops the key entirely, so a pre-R3 claim
+        # replays to exactly the evidence_key it already has.
+        evidence_key = _key("claim", _identity({"task_key": task_key, **payload}))
         # Scope is exactly entity + field + market/geography + time.  Source,
         # confidence, run and task provenance remain attached to every claim.
         # The trusted canonical identity travels with the claim so the durable
@@ -228,6 +337,66 @@ class EvidenceBoard:
         row = self._repository.create_claim(self.lease.run_id, payload, **self._lease_kwargs)
         self._claims[str(row["id"])] = dict(row)
         return row
+
+    def record_evidence_bundle(self, bundle: EvidenceBundle, *,
+                               task_key: str) -> AcquiredEvidence:
+        """The R3 acquisition entry point: one validated bundle, one source.
+
+        The write ORDER is part of the contract and is encoded here so no
+        caller can get it wrong:
+
+        1.  the versioned source, so every fragment and claim below is bound
+            to a real durable source id that was never guessed;
+        2.  its focused fragments, so the evidence a claim rests on is durable
+            BEFORE the claim that cites it;
+        3.  its structured facts as claims, each carrying its unit and the
+            locator it was read from.
+
+        Every write goes through the same lease-guarded, idempotent RPCs as
+        every other evidence write, so a resumed run that already persisted
+        the source and some of its fragments replays onto the same rows
+        instead of duplicating them.
+
+        The bundle is trusted mapper output, not model output: see
+        .evidence_mapping for the only path that produces one.  It is still
+        revalidated HERE, from a copy of its own data, immediately before the
+        first write: whatever happened to the object between mapping and
+        persistence, nothing that fails the contract now can cause any
+        durable write -- not even the source row.
+        """
+        if not isinstance(bundle, EvidenceBundle):
+            raise EvidenceValidationError("a validated evidence bundle is required")
+        bundle = revalidate_evidence_bundle(bundle)
+        descriptor = bundle.source
+        source = SourceCreate(agent=descriptor.agent, url=descriptor.url, title=descriptor.title,
+                              domain=descriptor.domain, source_type=descriptor.source_type,
+                              source_strength=descriptor.source_strength,
+                              source_date=descriptor.source_date, query=descriptor.query,
+                              tool_operation=descriptor.tool_operation)
+        row = self.record_source(source, task_key=task_key, version=descriptor.version)
+        fragments = tuple(self.record_focused_fragment(row["id"], fragment, task_key=task_key)
+                          for fragment in bundle.fragments)
+        claims = tuple(self._record_fact(fact, source_row=row, descriptor=descriptor,
+                                         task_key=task_key) for fact in bundle.facts)
+        return AcquiredEvidence(source=row, fragments=fragments, claims=claims)
+
+    def _record_fact(self, fact: StructuredEvidenceFact, *, source_row: Mapping[str, Any],
+                     descriptor: VersionedEvidenceSource, task_key: str) -> dict[str, Any]:
+        """Persist ONE structured fact as a durable claim of its own source.
+
+        The unit travels from the fact into the claim untouched.  R3 never
+        converts, normalizes or compares units -- that is R4.
+        """
+        if not isinstance(fact, StructuredEvidenceFact):
+            raise EvidenceValidationError("a validated structured evidence fact is required")
+        claim = ClaimCreate(entity_key=fact.entity_key, field_key=fact.field_key,
+                            value=fact.value, unit=fact.unit, time_scope=dict(fact.time_scope),
+                            geography=fact.geography, market=fact.market,
+                            source_id=UUID(str(source_row["id"])),
+                            source_strength=descriptor.source_strength,
+                            confidence=descriptor.confidence, agent=descriptor.agent)
+        return self.record_claim(claim, task_key=task_key,
+                                 evidence_locator=fact.locator.locator_key)
 
     def detect_and_record_conflicts(self, *, task_key: str,
                                     rationale: str = "Contradictory values in the same evidence scope.") -> list[dict[str, Any]]:
@@ -272,14 +441,29 @@ class EvidenceBoard:
         return self._repository.patch_run_blackboard_evidence(self.lease.run_id, summary, **self._lease_kwargs)
 
     def references(self) -> list[dict[str, Any]]:
-        """Return compact references from the existing claim/source records."""
+        """Return compact references from the existing claim/source records.
+
+        R3 adds three provenance fields the grounding layer previously had no
+        way to see: the claim's own unit, the exact locator the fact was read
+        from, and the version of the source it was read at.  All three are
+        optional, so a reference rebuilt from a pre-R3 claim is byte-identical
+        to what this returned before.
+        """
         return [{"claim_id": str(row["id"]), "source_id": str(row["source_id"]),
                  "run_id": str(self.lease.run_id), "task_id": row["task_key"],
                  "entity": row["entity_key"], "field": row["field_key"],
                  "geography": row.get("geography"), "market": row.get("market"),
                  "time_scope": row.get("time_scope") or {}, "value": row.get("value"),
+                 "unit": row.get("unit"), "locator": row.get("evidence_locator"),
+                 "source_version": self._source_version(row.get("source_id")),
                  "confidence": row["confidence"], "supported": True}
                 for row in self._claims.values()]
+
+    def _source_version(self, source_id: Any) -> str | None:
+        """The canonical `kind:identifier` of a recorded source, if it has one."""
+        row = self._sources.get(str(source_id)) or {}
+        kind, identifier = row.get("source_version_kind"), row.get("source_version_id")
+        return f"{kind}:{identifier}" if kind and identifier else None
 
     @staticmethod
     def _task(task_key: str) -> str:

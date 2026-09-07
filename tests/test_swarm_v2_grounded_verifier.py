@@ -1106,8 +1106,13 @@ def test_the_source_context_read_is_scoped_allowlisted_ordered_and_bounded():
     assert "*" not in query.columns
     assert set(part.strip() for part in query.columns.split(",")) == {
         "id", "run_id", "task_key", "url", "title", "domain", "source_type",
-        "source_strength", "source_date"}
-    # Operational bookkeeping is deliberately NOT grounding context.
+        "source_strength", "source_date",
+        # R3: the version the fragments below were read at IS grounding
+        # provenance, so it is deliberately part of the allowlist.
+        "source_version_kind", "source_version_id"}
+    # Operational bookkeeping is deliberately NOT grounding context.  Note
+    # retrieved_at stays excluded even now that a version is read: when we
+    # looked is not which version we looked at.
     for excluded in ("agent", "query", "tool_operation", "retrieved_at", "evidence_key"):
         assert excluded not in query.columns
 

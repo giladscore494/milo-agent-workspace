@@ -34,6 +34,14 @@ the correct, honest outcome -- ungrounded claims stop reaching `verified`
 now -- and it is deliberately NOT patched over here with a network fetcher or
 a stand-in tool.  Real capture arrives when a later PR wires acquisition into
 EvidenceBoard.record_source_with_evidence().
+
+R3 update: this contract now also carries the provenance the evidence itself
+records -- the version of the source the fragments were read at, the exact
+locator each fragment came from, and whether a fragment is a verbatim
+document excerpt or a deterministic projection of a structured record.  All
+three are OPTIONAL: a source or fragment written before R3 carries none of
+them and resolves exactly as it did before, which is what keeps historical
+records readable without pretending they are complete R3 evidence.
 """
 
 from __future__ import annotations
@@ -44,6 +52,9 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 from uuid import UUID
 
 from .contracts import EvidenceReference
+from .evidence_bounds import FRAGMENT_TYPES
+from .evidence_contracts import (EvidenceContractError, fragment_type_for, parse_locator_key,
+                                 parse_version_key)
 from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE,
                         MAX_FRAGMENTS_PER_SOURCE, fragment_content_hash)
 
@@ -107,13 +118,24 @@ class SourceFragment:
     """One durable, bounded piece of quoted source text.
 
     Carries exactly what verification needs -- position, durable identity and
-    the text itself.  Row ids, evidence keys, timestamps and every other
-    database internal stay out.
+    the text itself, plus (R3) the exact location the text was read from and
+    whether it is a verbatim document excerpt or a deterministic projection
+    of a structured record.  Row ids, evidence keys, timestamps and every
+    other database internal stay out.
+
+    `fragment_type` and `locator` are all-or-nothing and optional: an R3
+    fragment always has both, a pre-R3 fragment has neither, and a
+    half-specified one is corrupted grounding context that fails closed.  A
+    locator is validated with the SAME parser the acquisition contract uses:
+    it must be the canonical rendering of one of the two closed locator
+    shapes, and the fragment type must be the one that shape allows.
     """
 
     fragment_index: int
     content_hash: str
     text: str
+    fragment_type: str | None = None
+    locator: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not 1 <= len(self.text) <= MAX_FRAGMENT_CHARS:
@@ -128,6 +150,30 @@ class SourceFragment:
         # different fragment and a model-invented hash all fail closed here.
         if fragment_content_hash(self.text) != self.content_hash:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        if (self.fragment_type is None) != (self.locator is None):
+            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        if self.fragment_type is not None and self.fragment_type not in FRAGMENT_TYPES:
+            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        if self.locator is not None:
+            try:
+                located = parse_locator_key(self.locator)
+            except EvidenceContractError:
+                # `from None`: the contract error is static, but keep ONE
+                # grounding reason at this boundary.
+                raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
+            if fragment_type_for(located) != self.fragment_type:
+                raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+
+    @property
+    def identity(self) -> tuple[str, str | None]:
+        """What makes a durable fragment THIS fragment: its text and its place.
+
+        R3 evidence identity is the content hash together with the locator, so
+        the same sentence read from two different records (or two fields of
+        one record) is two pieces of evidence.  A pre-R3 fragment has no
+        locator and is identified by its text alone, exactly as before.
+        """
+        return (self.content_hash, self.locator)
 
 
 @dataclass(frozen=True)
@@ -148,6 +194,7 @@ class ResolvedSourceEvidence:
     source_type: str
     source_strength: str
     source_date: str | None
+    source_version: str | None = None
     fragments: tuple[SourceFragment, ...] = ()
 
     def __post_init__(self) -> None:
@@ -160,17 +207,31 @@ class ResolvedSourceEvidence:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         if self.source_date is not None and not isinstance(self.source_date, str):
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        # R3: the canonical `kind:identifier` of the version this source was
+        # read at.  None means a pre-R3 source whose version was never
+        # captured -- readable, but never complete R3 evidence.  A malformed
+        # or unknown version kind is corruption and fails closed.
+        if self.source_version is not None:
+            try:
+                parse_version_key(self.source_version)
+            except EvidenceContractError:
+                # The SAME kind-specific rule as the acquisition contract and
+                # the guarded RPC: `content_sha256:abc` is corruption here too.
+                raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
         if not isinstance(self.fragments, tuple):
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         if len(self.fragments) > MAX_FRAGMENTS_PER_SOURCE:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         if sum(len(item.text) for item in self.fragments) > MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
-        # Durable identity is (source, task, content hash), so one source can
-        # never legitimately hold the same fragment twice; a duplicate would
-        # also make the verified-evidence hash lookup ambiguous.
-        hashes = [item.content_hash for item in self.fragments]
-        if len(set(hashes)) != len(hashes):
+        # Durable identity is (source, task, content hash, locator): one
+        # source can never legitimately hold the same fragment from the same
+        # place twice, but the SAME text read from two different locators is
+        # two distinct pieces of R3 evidence and must resolve.  A pre-R3
+        # fragment has no locator, so for legacy evidence this is exactly the
+        # content-hash uniqueness that always applied.
+        identities = [item.identity for item in self.fragments]
+        if len(set(identities)) != len(identities):
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
 
     @property
@@ -178,8 +239,22 @@ class ResolvedSourceEvidence:
         """The ONLY hashes a verified verdict may cite for this source."""
         return frozenset(item.content_hash for item in self.fragments)
 
+    @property
+    def is_r3_qualified(self) -> bool:
+        """Whether this context is COMPLETE R3 evidence.
+
+        True only when the source records the version it was read at and every
+        fragment records exactly where it came from.  A historical source is
+        still perfectly readable and still grounds a verdict from the text it
+        captured -- it simply is not complete R3 evidence, and this property is
+        how that distinction is stated rather than inferred.
+        """
+        return bool(self.source_version) and bool(self.fragments) and \
+            all(item.locator and item.fragment_type for item in self.fragments)
+
     def ordered_fragments(self) -> tuple[SourceFragment, ...]:
-        return tuple(sorted(self.fragments, key=lambda item: (item.fragment_index, item.content_hash)))
+        return tuple(sorted(self.fragments, key=lambda item: (item.fragment_index, item.content_hash,
+                                                              item.locator or "")))
 
 
 @dataclass(frozen=True)
@@ -192,6 +267,12 @@ class GroundedCandidate:
     def __post_init__(self) -> None:
         if self.reference.source_id != self.source.source_id or \
                 self.reference.task_id != self.source.task_id:
+            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        # R3: a claim that recorded the version it was read at may only be
+        # grounded by that exact version of its source.  A reference with no
+        # version is pre-R3 and is not held to a version it never had.
+        if self.reference.source_version is not None and \
+                self.reference.source_version != self.source.source_version:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
 
     @property
@@ -307,7 +388,9 @@ class RepositoryEvidenceResolver:
                 try:
                     fragment = SourceFragment(fragment_index=row["fragment_index"],
                                               content_hash=row["content_hash"],
-                                              text=row["fragment_text"])
+                                              text=row["fragment_text"],
+                                              fragment_type=row.get("fragment_type"),
+                                              locator=row.get("locator_key"))
                 except (KeyError, TypeError):
                     # `from None`: the raised message would quote durable text.
                     raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
@@ -327,12 +410,19 @@ class RepositoryEvidenceResolver:
                  fragments: Iterable[SourceFragment]) -> ResolvedSourceEvidence:
         """Build one source context from the explicit safe column allowlist."""
         ordered = tuple(sorted(fragments, key=lambda item: (item.fragment_index, item.content_hash)))
+        # R3: the version columns are all-or-nothing.  A half-populated pair is
+        # never guessed or repaired -- it is corrupted provenance.
+        kind, identifier = row.get("source_version_kind"), row.get("source_version_id")
+        if (kind is None) != (identifier is None):
+            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         try:
             return ResolvedSourceEvidence(
                 source_id=str(row["id"]), task_id=row.get("task_key"), url=row.get("url"),
                 title=row.get("title"), domain=row.get("domain"),
                 source_type=row.get("source_type"), source_strength=row.get("source_strength"),
-                source_date=row.get("source_date"), fragments=ordered)
+                source_date=row.get("source_date"),
+                source_version=None if kind is None else f"{kind}:{identifier}",
+                fragments=ordered)
         except KeyError:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
 

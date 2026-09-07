@@ -640,8 +640,12 @@ class SupabaseRepository:
     # provenance plus the browser-visible descriptive metadata that already
     # travels with a source.  Never `*`: agent, query, tool_operation,
     # retrieved_at and evidence_key are operational bookkeeping, not evidence.
+    # R3 adds the source VERSION, which is evidence provenance: it says which
+    # version of the source the fragments below were read at.  retrieved_at
+    # stays excluded -- when we looked is not what we looked at.
     SOURCE_CONTEXT_COLUMNS = ("id, run_id, task_key, url, title, domain, "
-                              "source_type, source_strength, source_date")
+                              "source_type, source_strength, source_date, "
+                              "source_version_kind, source_version_id")
     # 50 sources per read keeps the paired fragment read (<= 4 rows per source)
     # inside MAX_EVIDENCE_FRAGMENT_ROWS, so neither cap can silently truncate.
     MAX_SOURCE_CONTEXT_ROWS = 50
@@ -666,7 +670,8 @@ class SupabaseRepository:
             .eq("run_id", str(run_id)).in_("id", identifiers).order("id").limit(bounded))
 
     EVIDENCE_FRAGMENT_COLUMNS = ("id, run_id, source_id, task_key, evidence_key, "
-                                 "fragment_text, content_hash, fragment_index, created_at")
+                                 "fragment_text, content_hash, fragment_index, "
+                                 "fragment_type, locator_key, created_at")
     MAX_EVIDENCE_FRAGMENT_ROWS = 200
 
     def list_evidence_fragments_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = MAX_EVIDENCE_FRAGMENT_ROWS) -> list[dict[str, Any]]:

@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .evidence_bounds import (MAX_LOCATOR_KEY_CHARS, MAX_SOURCE_VERSION_KEY_CHARS,
+                              MAX_UNIT_CHARS)
 from .tool_calls import MAX_BINDING_PATH_SEGMENTS, MAX_DEPENDENCY_BINDINGS_PER_CALL
 
 
@@ -190,6 +192,15 @@ def commander_decision_json_schema() -> dict[str, Any]:
 
 
 class EvidenceReference(StrictContract):
+    """One durable claim, as the internal grounding/verification layer sees it.
+
+    `unit`, `locator` and `source_version` are the R3 provenance additions.
+    They are optional on purpose: a reference rebuilt from a pre-R3 claim, or
+    restored from a checkpoint written before R3, simply carries None and
+    behaves exactly as it did before.  R3 carries a unit; it never converts or
+    compares one (that is R4).
+    """
+
     claim_id: str = Field(min_length=1, max_length=200)
     source_id: str = Field(min_length=1, max_length=200)
     run_id: str = Field(min_length=1, max_length=200)
@@ -200,6 +211,9 @@ class EvidenceReference(StrictContract):
     market: str | None = Field(default=None, max_length=200)
     time_scope: dict[str, Any] = Field(default_factory=dict)
     value: Any
+    unit: str | None = Field(default=None, max_length=MAX_UNIT_CHARS)
+    locator: str | None = Field(default=None, max_length=MAX_LOCATOR_KEY_CHARS)
+    source_version: str | None = Field(default=None, max_length=MAX_SOURCE_VERSION_KEY_CHARS)
     confidence: float = Field(ge=0, le=1)
     supported: bool = True
 
