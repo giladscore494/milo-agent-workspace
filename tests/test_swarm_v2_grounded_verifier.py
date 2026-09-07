@@ -1306,9 +1306,14 @@ def test_a_model_authored_reason_is_dropped_for_every_verdict_kind():
 
 
 def test_the_response_contract_has_no_field_prose_could_be_validated_into():
-    """Not merely dropped by convention: there is no attribute to land in."""
+    """Not merely dropped by convention: there is no attribute to land in.
+
+    R4 adds one more field, and it is a bounded list of opaque fragment
+    REFERENCES -- identifiers the backend itself printed, not text the model
+    composes -- so the contract still offers prose nowhere to land.
+    """
     assert set(VerifierResponseVerdict.model_fields) == {
-        "claim_id", "verdict", "supporting_fragment_hashes"}
+        "claim_id", "verdict", "supporting_fragment_refs", "supporting_fragment_hashes"}
     assert "reason" not in VerifierResponseVerdict.model_fields
     # ...and the durable reason vocabulary is finite and backend-owned.
     assert set(GROUNDED_VERDICT_REASONS) == {"verified", "needs_review", "rejected"}

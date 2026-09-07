@@ -41,13 +41,18 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from pydantic import Field, model_validator
 
-from .comparison import ScopeIdentity, scope_identity_hash
+from .comparison import ScopeIdentity, scope_identity_hash, value_identity
 from .contracts import StrictContract
-from .normalization import canonical_value_key, normalize_field_key
+from .normalization import normalize_field_key
 
 # The version of the authority policy below.  Persisted with every resolution,
 # so a durable decision always names the rules that produced it.
-CONFLICT_POLICY_VERSION = "r4.authority.1"
+#
+# r4.authority.2 decides agreement with the shared QUANTITY identity
+# (comparison.value_identity) instead of the raw value: equal numbers in
+# incompatible units are a contradiction, and equivalent numbers in
+# allowlisted units are corroboration.
+CONFLICT_POLICY_VERSION = "r4.authority.2"
 
 #: The typed lifecycle of one contradicting scope.  `superseded` is the state
 #: of a losing CLAIM inside a resolved conflict, never of the conflict itself.
@@ -212,20 +217,24 @@ def resolve_conflict_group(identity: ScopeIdentity, claims: Sequence[Any], *,
     if not decisive:
         return ConflictResolution(state="unresolved",
                                   reason="R4_CONFLICT_UNRESOLVED_NO_DECISIVE_SOURCE", **base)
-    values = {canonical_value_key(item.value) for item in decisive}
+    # Agreement is decided on the QUANTITY, never the raw number: two
+    # authoritative sources writing 1600 cc and 1.6 l agree and resolve the
+    # scope together, and two writing 1600 cc and 1600 l disagree.
+    values = {value_identity(item.value, item.unit) for item in decisive}
     if len(values) > 1:
         # Two authoritative sources contradicting each other is exactly the
         # case a completion rate would love to break the tie on.  It stays open.
         return ConflictResolution(state="unresolved",
                                   reason="R4_CONFLICT_UNRESOLVED_AMBIGUOUS", **base)
     winner = decisive[0].claim_id
-    winning_value = canonical_value_key(decisive[0].value)
-    # EVERY claim stating a different value loses; every other claim states the
-    # winning value and is corroboration, not a loser, so it keeps its own
-    # verdict and is neither superseded nor the winner. The conflict exists
-    # because two different values were stated, so this list is never empty.
+    winning_value = value_identity(decisive[0].value, decisive[0].unit)
+    # EVERY claim stating a different QUANTITY loses; every other claim states
+    # the winning quantity -- in whatever allowlisted unit -- and is
+    # corroboration, not a loser, so it keeps its own verdict and is neither
+    # superseded nor the winner. The conflict exists because two different
+    # quantities were stated, so this list is never empty.
     superseded = [item.claim_id for item in ordered
-                  if canonical_value_key(item.value) != winning_value]
+                  if value_identity(item.value, item.unit) != winning_value]
     return ConflictResolution(state="resolved",
                               reason="R4_CONFLICT_RESOLVED_BY_DECISIVE_SOURCE",
                               winning_claim_id=winner, superseded_claim_ids=superseded, **base)
@@ -245,15 +254,20 @@ def conflict_groups(references: Iterable[Any]) -> dict[ScopeIdentity, list[Any]]
 
     Uses the R4 identity (scope PLUS the closed identity dimensions), so two
     claims that differ only by generation, engine, transmission or official
-    code are two different variants and never a contradiction.
+    code are two different variants and never a contradiction, and the shared
+    QUANTITY identity, so agreement is decided on what was stated rather than
+    on the bare number.
     """
     from .comparison import reference_identity  # local: keeps this module import-light
 
     by_identity: dict[ScopeIdentity, list[Any]] = {}
     for item in references:
         by_identity.setdefault(reference_identity(item), []).append(item)
+    # A contradiction needs two DIFFERENT quantities in one identity. The unit
+    # is part of the statement, so `1600 cc` vs `1600 l` contradicts while
+    # `1600 cc` vs `1.6 l` does not.
     return {identity: claims for identity, claims in by_identity.items()
-            if len(claims) > 1 and len({canonical_value_key(item.value)
+            if len(claims) > 1 and len({value_identity(item.value, item.unit)
                                         for item in claims}) > 1}
 
 

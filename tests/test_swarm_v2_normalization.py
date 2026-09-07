@@ -83,11 +83,16 @@ def test_one_shared_scope_implementation_across_board_and_engine():
     assert engine_module.conflict_groups is conflict_policy.conflict_groups
     assert comparison.canonical_scope_key is normalization.canonical_scope_key
     assert comparison.canonical_value_key is normalization.canonical_value_key
-    assert conflict_policy.canonical_value_key is normalization.canonical_value_key
     assert evidence_module.canonical_scope_key is normalization.canonical_scope_key
-    assert evidence_module.canonical_value_key is normalization.canonical_value_key
     assert comparison.CanonicalScope is normalization.CanonicalScope
     assert evidence_module.ScopeIdentity is comparison.ScopeIdentity
+    # R4: agreement between two stated values has exactly ONE definition, and
+    # every path that decides a contradiction references that same object.
+    # A second value-equivalence algorithm must fail here.
+    for module in (conflict_policy, evidence_module):
+        assert module.value_identity is comparison.value_identity
+    assert "canonical_value_key" not in vars(conflict_policy)
+    assert "canonical_value_key" not in vars(evidence_module)
 
 
 # --- SwarmV2Engine conflict path ---------------------------------------------

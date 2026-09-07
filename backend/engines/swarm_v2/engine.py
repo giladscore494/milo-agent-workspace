@@ -7,7 +7,8 @@ from .builder import FinalBuilder
 from .commander import Commander
 from .conflict_policy import ConflictResolution, conflict_groups
 from .contracts import EvidenceReference, RemainingBudget, VerificationVerdict
-from .correction import correction_allowance, correction_issues, correction_summary
+from .correction import (MAX_CORRECTION_ROUNDS, correction_allowance, correction_issues,
+                         correction_summary)
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
 from .grounding import VERIFIER_GROUNDING_VERSION
@@ -285,11 +286,19 @@ class SwarmV2Engine:
           round -- there is no second orchestrator and no open-ended agent
           loop;
         * the Commander may decline it, and a declined round is final: the
-          issues become needs_review and the run finalizes under R1.
+          decline is checkpointed, the issues become needs_review and the run
+          finalizes under R1;
+        * once a round HAS been accepted, the ordinary task-adding replan path
+          is closed for the rest of the run (see `run`), so the same findings
+          can never produce a second research task through another door.
 
         Returning a plan means "execute this and verify again"; returning None
         means "finalize now".
         """
+        if state.correction_declined:
+            # The Commander already looked at these findings and declined. A
+            # resume must not put the same question a second time.
+            return None
         issues = correction_issues(evidence, verdicts)
         if not issues:
             return None
@@ -308,8 +317,11 @@ class SwarmV2Engine:
                      correction_summary(issues, resolutions=resolutions)})
         if decision.decision not in {"ADD_TASKS", "REVISE_TASK"}:
             # The Commander looked at the findings and chose not to research
-            # them. That is a terminal answer, not an invitation to ask again.
+            # them. That is a terminal answer, not an invitation to ask again,
+            # and it is CHECKPOINTED so a resume cannot re-open the question.
+            state.correction_declined = True
             self._emit("correction_round_declined", {"decision": decision.decision})
+            self._save(state)
             return None
         replacement = decision.plan
         assert replacement is not None
@@ -410,10 +422,25 @@ class SwarmV2Engine:
                         "REQUEST_VERIFICATION" if unresolved else "FINISH"
                     ),
                 }}
-            decision = self._commander.replan(
-                requested_model=requested_model, objective=objective, summary=summary
-            )
-            if decision.decision in {"ADD_TASKS", "REVISE_TASK"}:
+            # R4: the one bounded correction round is the LAST thing that may
+            # add work to a run. Once it has been accepted, the ordinary
+            # pre-verification replan path is closed: the correction plan is
+            # executed exactly once and the run goes straight to
+            # re-verification and finalization. Without this, the very same
+            # verifier-discovered conflict could be handed back to the
+            # Commander here and earn a second research task while
+            # `correction_rounds` still read 1. The flag lives in the
+            # checkpoint, so a resume mid-correction is closed too, and every
+            # replan BEFORE the correction round behaves exactly as it did.
+            if state.correction_rounds >= MAX_CORRECTION_ROUNDS:
+                self._emit("correction_round_finalizing",
+                           {"round": state.correction_rounds})
+                decision = None
+            else:
+                decision = self._commander.replan(
+                    requested_model=requested_model, objective=objective, summary=summary
+                )
+            if decision is not None and decision.decision in {"ADD_TASKS", "REVISE_TASK"}:
                 if not (failed or gaps or conflict_ids):
                     raise ValueError("replan requires an unresolved gap or conflict")
                 if len(state.replans) >= plan.max_replans:

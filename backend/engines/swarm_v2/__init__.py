@@ -3,10 +3,11 @@
 from .adapter import SwarmV2Adapter
 from .commander import Commander, CommanderPlanFailure
 from .comparison import (COMPARISON_REASONS, STRUCTURED_COMPARISON_VERSION,
-                         UNIT_CONVERSIONS, UNIT_RULE_VERSION, ScopeIdentity,
-                         StructuredComparison, StructuredSourceFact, compare_structured,
-                         compare_values, normalize_identity, normalize_unit,
-                         reference_identity, scope_identity, scope_identity_hash)
+                         UNIT_CONVERSIONS, UNIT_RULE_VERSION, QuantityIdentity,
+                         ScopeIdentity, StructuredComparison, StructuredSourceFact,
+                         compare_structured, compare_values, normalize_identity,
+                         normalize_unit, reference_identity, same_value, scope_identity,
+                         scope_identity_hash, value_identity)
 from .conflict_policy import (CLAIM_RESOLUTION_STATES, CONFLICT_POLICY_VERSION,
                               FIELD_FAMILIES, RESOLUTION_REASONS, RESOLUTION_STATES,
                               SOURCE_TYPE_AUTHORITY, ConflictResolution, conflict_groups,
@@ -71,8 +72,9 @@ from .grounding import (FRAGMENT_OVER_READ_PER_SOURCE, GROUNDING_REASONS,
                         resolve_source_context)
 from .support import (EVIDENCE_BEARING_MODES, MAX_SUPPORT_LINKS_PER_VERDICT,
                       SUPPORT_REASONS, VERIFICATION_MODES, VERIFIER_CONTRACT_VERSION,
-                      SupportContractError, links_for_hashes, links_for_locator,
-                      parse_support, validate_support)
+                      SupportContractError, fragment_reference, link_for_citation,
+                      links_for_citations, links_for_locator, parse_support,
+                      validate_support)
 from .verifier import (GROUNDED_VERDICT_REASONS, MAX_VERIFIER_BATCH_JSON_BYTES,
                        MAX_VERIFIER_CLAIMS_PER_BATCH,
                        MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH, MISSING_CONTEXT_VERDICT,
@@ -80,7 +82,8 @@ from .verifier import (GROUNDED_VERDICT_REASONS, MAX_VERIFIER_BATCH_JSON_BYTES,
                        SUPERSEDED_VERDICT, VERIFIER_REASONS,
                        GroundedVerificationPlan, Verifier,
                        VerifierContractError, VerifierProgress, VerifierResponseVerdict,
-                       build_verifier_batches, parse_verifier_batch,
+                       build_verifier_batches, fragment_reference_index,
+                       parse_verifier_batch,
                        plan_grounded_verification, serialize_verifier_candidates,
                        verifier_evidence_chars, verifier_payload_bytes)
 from .state import SwarmState
@@ -112,7 +115,7 @@ __all__ += ["GROUNDED_VERDICT_REASONS", "MAX_VERIFIER_BATCH_JSON_BYTES",
             "MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH", "MISSING_CONTEXT_VERDICT",
             "VERIFIER_REASONS", "GroundedVerificationPlan", "VerifierContractError",
             "VerifierProgress", "VerifierResponseVerdict", "build_verifier_batches",
-            "parse_verifier_batch", "plan_grounded_verification",
+            "fragment_reference_index", "parse_verifier_batch", "plan_grounded_verification",
             "serialize_verifier_candidates", "verifier_evidence_chars",
             "verifier_payload_bytes"]
 __all__ += ["EVIDENCE_CONTRACT_REASONS", "EVIDENCE_MAPPING_REASONS", "FRAGMENT_TYPES",
@@ -136,14 +139,14 @@ __all__ += ["FRAGMENT_OVER_READ_PER_SOURCE", "GROUNDING_REASONS",
 # --- R4: deterministic verification, durable support, conflict resolution ----
 __all__ += ["COMPARISON_REASONS", "IDENTITY_DIMENSIONS", "MAX_IDENTITY_DIMENSION_CHARS",
             "STRUCTURED_COMPARISON_VERSION", "UNIT_CONVERSIONS", "UNIT_RULE_VERSION",
-            "ScopeIdentity", "StructuredComparison", "StructuredSourceFact",
-            "compare_structured", "compare_values", "normalize_identity",
-            "normalize_unit", "reference_identity", "scope_identity",
-            "scope_identity_hash"]
+            "QuantityIdentity", "ScopeIdentity", "StructuredComparison",
+            "StructuredSourceFact", "compare_structured", "compare_values",
+            "normalize_identity", "normalize_unit", "reference_identity", "same_value",
+            "scope_identity", "scope_identity_hash", "value_identity"]
 __all__ += ["EVIDENCE_BEARING_MODES", "MAX_SUPPORT_LINKS_PER_VERDICT", "SUPPORT_REASONS",
             "VERIFICATION_MODES", "VERIFIER_CONTRACT_VERSION", "SupportContractError",
-            "SupportLink", "links_for_hashes", "links_for_locator", "parse_support",
-            "validate_support"]
+            "SupportLink", "fragment_reference", "link_for_citation", "links_for_citations",
+            "links_for_locator", "parse_support", "validate_support"]
 __all__ += ["CLAIM_RESOLUTION_STATES", "CONFLICT_POLICY_VERSION", "FIELD_FAMILIES",
             "RESOLUTION_REASONS", "RESOLUTION_STATES", "SOURCE_TYPE_AUTHORITY",
             "ConflictResolution", "conflict_groups", "field_family", "is_authoritative",

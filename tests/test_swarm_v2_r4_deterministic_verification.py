@@ -30,8 +30,8 @@ from backend.engines.swarm_v2 import (
     SwarmV2Engine, VerificationVerdict, Verifier, VerifierContractError,
     compare_structured, compare_values, conflict_groups, correction_allowance,
     correction_issues, correction_summary, field_family, is_authoritative,
-    normalize_identity, parse_support, resolve_conflicts, scope_identity,
-    validate_support,
+    normalize_identity, normalize_unit, parse_support, resolve_conflicts, scope_identity,
+    validate_support, value_identity,
 )
 from backend.engines.swarm_v2.evidence_contracts import record_field_locator
 from backend.engines.swarm_v2.fragments import fragment_content_hash
@@ -220,7 +220,7 @@ def test_free_text_evidence_still_uses_the_grounded_model_verifier():
 
 
 def test_the_comparison_contract_is_closed_versioned_and_exact():
-    assert STRUCTURED_COMPARISON_VERSION == "r4.structured.1"
+    assert STRUCTURED_COMPARISON_VERSION == "r4.structured.2"
     assert UNIT_RULE_VERSION == "r4.units.1"
     # Exact rational arithmetic, never float tolerance.
     assert compare_values(1.6, "l", 1600, "cc") == "R4_STRUCTURED_MATCH"
@@ -591,7 +591,12 @@ def test_a_verifier_discovered_gap_creates_exactly_one_correction_round():
         events=events, checkpoints=checkpoints)
     kinds = [kind for kind, _ in events]
     assert kinds.count("correction_round_started") == 1
-    assert client.replans == 3          # verify, the ONE correction, then finish
+    # Two Commander decisions, not three: the ordinary replan path is CLOSED
+    # once the correction round is accepted, so after the correction task runs
+    # the engine goes straight to re-verification and finalization instead of
+    # asking again (and paying for) a decision that could add more work.
+    assert client.replans == 2          # the pre-verification decision, then the ONE correction
+    assert kinds.count("correction_round_finalizing") == 1
     states = [c["artifacts"]["swarm_state"] for c in checkpoints]
     assert states[-1]["correction_rounds"] == MAX_CORRECTION_ROUNDS == 1
     # The run still finalizes under the R1 outcome contract.
@@ -989,3 +994,468 @@ def test_the_engine_hands_every_verdict_and_decision_to_the_durable_sinks():
                item.contract_version == VERIFIER_CONTRACT_VERSION for item in verdicts)
     assert [item.state for item in resolutions] == ["resolved"]
     assert only(resolutions).policy_version == CONFLICT_POLICY_VERSION
+
+
+# --- H. R4 correction: ONE value-and-unit equivalence identity ---------------
+#
+# Regression cover for the first reproduced blocker: conflict detection and
+# resolution compared the RAW value, so `1600 cc` and `1600 l` looked like
+# agreement while `1600 cc` and `1.6 l` looked like a contradiction.
+
+def quantity(claim_id: str, value: object, unit: str | None, *, source: str | None = None,
+             entity: str = "vehicle:corolla", field: str = FIELD) -> EvidenceReference:
+    """One claim stating a value IN A UNIT, in one shared identity and scope."""
+    return ref(claim_id, source_id=source or f"source-{claim_id}", entity=entity, field=field,
+               value=value).model_copy(update={"unit": unit})
+
+
+def test_equal_raw_values_in_incompatible_units_are_a_conflict_not_corroboration():
+    """1600 cc and 1600 l are radically different quantities.
+
+    Before the fix `conflict_groups` returned {} for this pair, so the run
+    treated a 1000x discrepancy as two sources agreeing.
+    """
+    contested = [quantity("claim-0001", 1600, "cc"), quantity("claim-0002", 1600, "l")]
+    groups = conflict_groups(contested)
+    assert [item.claim_id for claims in groups.values() for item in claims] == [
+        "claim-0001", "claim-0002"]
+    # And neither can supersede or corroborate the other by accident: with one
+    # decisive source the OTHER quantity loses outright.
+    resolution = only(resolve_conflicts(groups, decisive_claim_ids={"claim-0001"}))
+    assert (resolution.state, resolution.winning_claim_id) == ("resolved", "claim-0001")
+    assert resolution.superseded_claim_ids == ["claim-0002"]
+    assert resolution.state_of("claim-0002") == "superseded"   # never "corroborating"
+
+
+def test_equivalent_values_in_allowlisted_units_are_never_a_conflict():
+    """1600 cc IS 1.6 l under the versioned allowlist, so they cannot contradict."""
+    assert conflict_groups([quantity("claim-0001", 1600, "cc"),
+                            quantity("claim-0002", 1.6, "l")]) == {}
+    # Every allowlisted family behaves the same way, on exact rationals.
+    for left, left_unit, right, right_unit in ((1000, "g", 1, "kg"), (1, "km", 100_000, "cm"),
+                                               (150, "kw", 150_000, "w"), (2.5, "l", 2500, "ml")):
+        assert conflict_groups([quantity("claim-0001", left, left_unit),
+                                quantity("claim-0002", right, right_unit)]) == {}
+
+
+def test_two_authoritative_sources_in_equivalent_units_corroborate_each_other():
+    """Both are decisive and both state the same quantity, so the scope is not
+    ambiguous -- it simply is not a conflict at all."""
+    agreeing = [quantity("claim-0001", 1600, "cc"), quantity("claim-0002", 1.6, "l")]
+    assert conflict_groups(agreeing) == {}
+    assert resolve_conflicts(conflict_groups(agreeing),
+                             decisive_claim_ids={"claim-0001", "claim-0002"}) == ()
+    # And when a third, genuinely different quantity joins, the two equivalent
+    # statements corroborate the winner instead of one of them losing.
+    contested = [*agreeing, quantity("claim-0003", 1800, "cc")]
+    resolution = only(resolve_conflicts(conflict_groups(contested),
+                                        decisive_claim_ids={"claim-0001", "claim-0002"}))
+    assert (resolution.state, resolution.winning_claim_id) == ("resolved", "claim-0001")
+    assert resolution.superseded_claim_ids == ["claim-0003"]
+    assert resolution.state_of("claim-0002") == "corroborating"
+
+
+def test_a_source_stating_one_quantity_in_two_units_is_not_ambiguous():
+    reference, resolver = structured_setup(claim_value=SOURCE_CC)
+    other = record_field_locator("source-0001", ("displacement_litres",)).locator_key
+    resolver.repository.facts.append(
+        fact_row("source-0001", claim_id="fact-litres", value=1.6, unit="l",
+                 entity="vehicle:corolla", locator=other))
+    resolver.repository.fragments.append(
+        {**projection("source-0001", value=1.6, index=1), "locator_key": other})
+    verdict = only(verifier_with(resolver)[0].verify([reference]))
+    assert (verdict.verdict, verdict.reason) == ("verified", "R4_STRUCTURED_MATCH")
+
+
+def test_a_source_stating_two_different_quantities_stays_ambiguous():
+    reference, resolver = structured_setup(claim_value=SOURCE_CC)
+    other = record_field_locator("source-0001", ("displacement_litres",)).locator_key
+    resolver.repository.facts.append(
+        fact_row("source-0001", claim_id="fact-litres", value=1.8, unit="l",
+                 entity="vehicle:corolla", locator=other))
+    resolver.repository.fragments.append(
+        {**projection("source-0001", value=1.8, index=1), "locator_key": other})
+    verdict = only(verifier_with(resolver)[0].verify([reference]))
+    assert (verdict.verdict, verdict.reason) == ("needs_review", "R4_AMBIGUOUS_SOURCE_FACT")
+
+
+def test_missing_and_unsupported_units_fail_closed_in_the_identity():
+    """An equivalence nobody can prove is never asserted."""
+    # A bare number and a stated measurement are different statements.
+    assert conflict_groups([quantity("claim-0001", 1600, None),
+                            quantity("claim-0002", 1600, "cc")])
+    # Two units the allowlist cannot relate are different statements.
+    assert conflict_groups([quantity("claim-0001", 1600, "hp"),
+                            quantity("claim-0002", 1600, "kw")])
+    # But two LITERALLY identical statements never contradict themselves, even
+    # when neither can be verified: failing to verify is not contradicting.
+    assert conflict_groups([quantity("claim-0001", 1600, None),
+                            quantity("claim-0002", 1600, None)]) == {}
+    assert conflict_groups([quantity("claim-0001", 1600, "hp"),
+                            quantity("claim-0002", 1600, "hp")]) == {}
+
+
+@pytest.mark.parametrize("left,left_unit,right,right_unit", [
+    (1600, "cc", 1.6, "l"), (1600, "cc", 1600, "cm3"), (1600, "cc", 1600, "l"),
+    (1600, "cc", 1800, "cc"), (1600, "hp", 1600, "kw"), (1600, "hp", 1600, "hp"),
+    (1600, "cc", 1600, None), ("hybrid", None, "Hybrid", None),
+    ("hybrid", None, "petrol", None), (1600, "cc", "1600", "cc"),
+])
+def test_the_identity_and_the_comparison_agree_except_where_documented(
+        left, left_unit, right, right_unit):
+    """`value_identity` and `compare_values` are one contract.
+
+    They answer different questions -- "is this the same statement" versus
+    "does this claim verify against this source fact" -- and they agree
+    everywhere except the ONE documented case: two identical unit-less numbers
+    are the same statement but neither is verifiable.
+    """
+    same = value_identity(left, left_unit) == value_identity(right, right_unit)
+    verifies = compare_values(left, left_unit, right, right_unit) == "R4_STRUCTURED_MATCH"
+    unitless_pair = (normalize_unit(left_unit) is None and normalize_unit(right_unit) is None
+                     and isinstance(left, (int, float)) and not isinstance(left, bool))
+    assert same == verifies or (unitless_pair and same and not verifies)
+
+
+def test_every_conflict_path_shares_one_value_identity_end_to_end():
+    """The Evidence Board, the verifier's grouping, the resolution policy and
+    the final active result all decide agreement the same way."""
+    from uuid import UUID as _UUID
+    from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+    from backend.schemas import ClaimCreate, SourceCreate
+    from test_swarm_v2_evidence import GuardedEvidenceRepository
+
+    lease = WorkerLease(uuid4(), "worker-1", 2, "lease-token")
+    board = EvidenceBoard(GuardedEvidenceRepository(lease), lease)
+    source = board.record_source(
+        SourceCreate(agent="w", url="https://example.test/a", title="t", domain="example.test",
+                     source_type="structured", source_strength="strong", query="q",
+                     tool_operation="op"), task_key="task-1")
+
+    def claim(value, unit):
+        return ClaimCreate(entity_key="vehicle:1", field_key=FIELD, value=value, unit=unit,
+                           time_scope={"year": 2020}, market="IL",
+                           source_id=_UUID(str(source["id"])), source_strength="strong",
+                           confidence=.9, agent="w")
+
+    # Equivalent statements: the durable board records NO conflict.
+    board.record_claim(claim(1600, "cc"), task_key="task-1")
+    board.record_claim(claim(1.6, "l"), task_key="task-1")
+    assert board.detect_and_record_conflicts(task_key="task-1") == []
+    # Equal raw numbers in incompatible units: the board DOES record one.
+    board.record_claim(claim(1600, "l"), task_key="task-1")
+    assert len(board.detect_and_record_conflicts(task_key="task-1")) == 1
+    # And the pure grouping the engine and the verifier use agrees exactly.
+    assert conflict_groups([quantity("claim-0001", 1600, "cc"),
+                            quantity("claim-0002", 1.6, "l")]) == {}
+    assert conflict_groups([quantity("claim-0001", 1600, "cc"),
+                            quantity("claim-0003", 1600, "l")])
+
+
+# --- I. R4 correction: ONE citation names exactly ONE durable row ------------
+#
+# Regression cover for the second reproduced blocker: the grounded response
+# cited a bare content hash, and `links_for_hashes` expanded that one citation
+# into every fragment carrying the hash. R3 deliberately allows identical text
+# at two different locators, so one citation became two durable support links
+# with two different fragment ids -- provenance nobody had selected.
+
+TWIN_TEXT = f"{FIELD}={SOURCE_CC}"
+TWIN_HASH = fragment_content_hash(TWIN_TEXT)
+
+
+def twin_locator(index: int) -> str:
+    return record_field_locator(f"rec-{index}", (FIELD,)).locator_key
+
+
+def twins() -> tuple[EvidenceReference, object, list[dict]]:
+    """One source holding the SAME text at two different locators.
+
+    Exactly the R3-legal shape that made one hash ambiguous: two durable rows,
+    two ids, two locators, one content hash.
+    """
+    rows = [{**fragment_row("source-0001", TWIN_TEXT, index=index),
+             "id": f"11111111-2222-4333-8444-00000000000{index}",
+             "fragment_type": "structured_projection", "locator_key": twin_locator(index)}
+            for index in (0, 1)]
+    facts = [fact_row("source-0001", value=SOURCE_CC, unit="cc", entity="vehicle:corolla",
+                      locator=twin_locator(0))]
+    reference = ref("claim-0001", entity="vehicle:corolla", field=FIELD,
+                    value=SOURCE_CC).model_copy(update={"unit": "cc"})
+    return reference, resolver_for([structured_source()], rows, facts), rows
+
+
+def cite(document, *, ref_index: int | None = None, hashes: list[str] | None = None) -> dict:
+    fragments = document["sources"][0]["fragments"]
+    payload: dict = {"claim_id": document["claims"][0]["claim_id"], "verdict": "verified"}
+    if ref_index is not None:
+        payload["supporting_fragment_refs"] = [fragments[ref_index]["ref"]]
+    if hashes is not None:
+        payload["supporting_fragment_hashes"] = hashes
+    return {"verdicts": [payload]}
+
+
+def test_identical_text_at_two_locators_stays_two_distinct_durable_rows():
+    reference, resolver, rows = twins()
+    context = resolver.resolve([reference])["source-0001"]
+    assert len({item.content_hash for item in context.fragments}) == 1
+    assert len({item.locator for item in context.fragments}) == 2
+    assert len({item.fragment_id for item in context.fragments}) == 2
+
+
+@pytest.mark.parametrize("selected", [0, 1])
+def test_a_reference_citation_persists_exactly_the_fragment_it_names(selected):
+    """One citation, one durable link -- and the SELECTED one, not both."""
+    reference, resolver, rows = twins()
+    # The claim's own fact sits at locator 0, so the deterministic path would
+    # settle it; drop the structured fact to exercise the grounded path.
+    resolver.repository.facts.clear()
+    gateway = GroundingJudgeGateway(lambda document: cite(document, ref_index=selected))
+    verdict = only(verifier_with(resolver, gateway)[0].verify([reference]))
+    assert verdict.verdict == "verified" and verdict.mode == "grounded_model"
+    assert len(verdict.support) == 1                       # never an expansion
+    link = verdict.support[0]
+    assert link.fragment_id == rows[selected]["id"]
+    assert link.locator == twin_locator(selected)
+    assert link.content_hash == TWIN_HASH
+
+
+def test_an_ambiguous_hash_only_citation_fails_closed():
+    reference, resolver, _ = twins()
+    resolver.repository.facts.clear()
+    gateway = GroundingJudgeGateway(lambda document: cite(document, hashes=[TWIN_HASH]))
+    with pytest.raises(VerifierContractError) as excinfo:
+        verifier_with(resolver, gateway)[0].verify([reference])
+    assert excinfo.value.reason_code == "VERIFIER_RESPONSE_AMBIGUOUS_EVIDENCE"
+
+
+def test_a_hash_only_citation_still_works_when_the_hash_is_unique():
+    """Legacy compatibility, exactly where the evidence is genuinely unambiguous."""
+    reference, resolver = structured_setup(claim_value=SOURCE_CC)
+    resolver.repository.facts.clear()
+    unique = resolver.repository.fragments[0]
+    gateway = GroundingJudgeGateway(
+        lambda document: cite(document, hashes=[unique["content_hash"]]))
+    verdict = only(verifier_with(resolver, gateway)[0].verify([reference]))
+    assert verdict.verdict == "verified"
+    assert [link.fragment_id for link in verdict.support] == [unique["id"]]
+
+
+@pytest.mark.parametrize("forged", [
+    {"supporting_fragment_refs": ["f9-9"]},                       # no such reference
+    {"supporting_fragment_refs": ["f0-0"], "supporting_fragment_hashes": ["b" * 64]},
+])
+def test_a_forged_reference_or_hash_combination_fails_closed(forged):
+    reference, resolver, _ = twins()
+    resolver.repository.facts.clear()
+    gateway = GroundingJudgeGateway(lambda document: {"verdicts": [
+        {"claim_id": document["claims"][0]["claim_id"], "verdict": "verified", **forged}]})
+    with pytest.raises(VerifierContractError):
+        verifier_with(resolver, gateway)[0].verify([reference])
+
+
+def test_a_deterministic_match_whose_locator_holds_two_fragments_reviews_not_verifies():
+    """Two different fragments at ONE locator is legitimate durable data, but
+    it does not name the single row a decision rests on. Fail closed for review
+    instead of aborting the run or inventing provenance."""
+    reference, resolver = structured_setup(claim_value=SOURCE_CC)
+    locator = resolver.repository.fragments[0]["locator_key"]
+    resolver.repository.fragments.append(
+        {**projection("source-0001", value=SOURCE_CC, index=1),
+         "id": str(uuid4()), "locator_key": locator,
+         **{k: v for k, v in fragment_row("source-0001", "a different projection",
+                                          index=1).items() if k in ("fragment_text",
+                                                                    "content_hash")}})
+    verdict = only(verifier_with(resolver)[0].verify([reference]))
+    assert (verdict.verdict, verdict.reason) == ("needs_review",
+                                                 "R4_AMBIGUOUS_SUPPORT_EVIDENCE")
+    assert not verdict.support
+
+
+def test_exact_support_survives_checkpoint_and_resume_without_expansion():
+    reference, resolver, rows = twins()
+    resolver.repository.facts.clear()
+    gateway = GroundingJudgeGateway(lambda document: cite(document, ref_index=1))
+    verifier = verifier_with(resolver, gateway)[0]
+    verdict = only(verifier.verify([reference]))
+    stored = verdict.model_dump(mode="json")
+    assert len(stored["support"]) == 1
+
+    replayed = only(verifier.verify([reference], existing_verdicts={"claim-0001": stored}))
+    assert replayed.model_dump(mode="json") == stored     # byte-identical, no expansion
+    assert [link.fragment_id for link in replayed.support] == [rows[1]["id"]]
+    assert parse_support(stored["support"]) == tuple(verdict.support)
+
+
+# --- J. R4 correction: the single round cannot be bypassed -------------------
+#
+# Regression cover for the third reproduced blocker: after the one correction
+# plan was accepted and executed, `run()` returned to the ORDINARY
+# pre-verification replan path. With `max_replans` capacity left, the same
+# verifier-discovered conflict earned a second research task -- observed as
+# worker calls ['a', 'fix', 'fix2'] while correction_rounds still read 1.
+
+def second_round_plan() -> dict:
+    """A plan adding a SECOND research task -- the decision that must never
+    be consumed once the correction round has been spent."""
+    research = task("fix2", "a second research task that must never run")
+    research["completion"]["evidence_satisfied"] = False
+    research["evidence"]["required_fields"] = []
+    research["evidence"]["minimum_sources"] = 0
+    return plan([*correction_plan(field=FIELD)["graph"]["tasks"], research], max_replans=3)
+
+
+def adversarial_run(*, decisions, checkpoint=None, checkpoints=None, events=None,
+                    verdicts=None, worker_calls=None):
+    """A run whose verification finds an unresolved conflict every pass.
+
+    The conflict never closes (neither source is field-authoritative), so the
+    ordinary replan path would happily keep adding tasks if it were still open.
+    """
+    contested = [quantity("claim-0001", 1798, "cc", source="source-0001"),
+                 quantity("claim-0002", 1600, "cc", source="source-0002")]
+    resolver = resolver_for(
+        [source_row("source-0001"), source_row("source-0002")],
+        [fragment_row("source-0001", "prose about the corolla"),
+         fragment_row("source-0002", "different prose about the corolla")])
+    planned = task("a", "a")
+    planned["evidence"]["required_fields"] = [FIELD]
+    client = Plans(plan([planned], max_replans=3), decisions, final=None)
+    calls = worker_calls if worker_calls is not None else []
+    engine = SwarmV2Engine(
+        commander=commander(client),
+        executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls),
+                                     max_active_workers=1),
+        verifier=Verifier(gateway=GroundingJudgeGateway(), model="fake", resolver=resolver),
+        builder=FinalBuilder(), evidence_loader=lambda _: list(contested),
+        checkpoint_sink=(None if checkpoints is None
+                         else lambda phase, value: checkpoints.append(deepcopy(value))),
+        event_sink=(None if events is None
+                    else lambda kind, payload: events.append((kind, payload))),
+        verdict_sink=(None if verdicts is None else verdicts.append))
+    payload = {"id": RUN_ID, "input": {"objective": "conflict", "commander_model": "fake"}}
+    if checkpoint is not None:
+        payload["checkpoint"] = checkpoint
+    return client, calls, engine.run(payload)
+
+
+ADVERSARIAL_DECISIONS = [
+    # 1. the ordinary pre-verification decision
+    {"decision": "REQUEST_VERIFICATION", "plan": None, "reason": "verify"},
+    # 2. the ONE allowed correction round
+    {"decision": "ADD_TASKS", "plan": correction_plan(field=FIELD),
+     "reason": "research the contradiction"},
+    # 3. a SECOND task-adding decision, armed and waiting. The engine must
+    #    never ask for it, because the correction round is already spent.
+    {"decision": "ADD_TASKS", "plan": second_round_plan(),
+     "reason": "a second research round that must never be taken"},
+    # 4. a terminal decision after it, so a build that DOES take the bypass
+    #    still runs to completion and fails on the symptom -- worker calls
+    #    ['a', 'fix', 'fix2'] -- rather than on an exhausted script.
+    {"decision": "REQUEST_VERIFICATION", "plan": None, "reason": "after the second round"},
+]
+
+
+def test_a_second_research_task_can_never_be_created_after_the_correction_round():
+    """The adversarial case, end to end.
+
+    A scripted Commander is ready to hand back another ADD_TASKS built from the
+    SAME unresolved conflict, and every budget still has capacity. The engine
+    must never consume it.
+    """
+    events, checkpoints, verdicts = [], [], []
+    client, calls, result = adversarial_run(decisions=deepcopy(ADVERSARIAL_DECISIONS),
+                                            events=events, checkpoints=checkpoints,
+                                            verdicts=verdicts)
+    # Only the original task and the single correction task ever ran.
+    assert calls == ["a", "fix"]
+    assert "fix2" not in calls
+    # The armed second decision was never even requested.
+    assert client.replans == 2
+    kinds = [kind for kind, _ in events]
+    assert kinds.count("correction_round_started") == 1
+    assert kinds.count("commander_replanned") == 1
+    assert kinds.count("correction_round_finalizing") == 1
+    # Re-verification ran once after the correction round, and the run
+    # finalized under the unchanged R1 outcome contract.
+    assert kinds.count("verification_completed") == 2      # before and after correction
+    state = checkpoints[-1]["artifacts"]["swarm_state"]
+    assert state["correction_rounds"] == MAX_CORRECTION_ROUNDS == 1
+    assert state["completed_task_ids"] == ["a", "fix"]
+    assert result["status"] == "partial_success"
+    # The conflict is still open and honest about it -- it was never forced.
+    assert {v["reason"] for v in state["verifier_state"].values()} == {"unresolved conflict"}
+
+
+def test_the_bypass_stays_closed_on_resume_from_every_checkpoint():
+    baseline_checkpoints, baseline_calls = [], []
+    _, _, expected = adversarial_run(decisions=deepcopy(ADVERSARIAL_DECISIONS),
+                                     checkpoints=baseline_checkpoints,
+                                     worker_calls=baseline_calls)
+    assert baseline_calls == ["a", "fix"]
+
+    for index, saved in enumerate(baseline_checkpoints):
+        checkpoints, verdicts, calls = [], [], []
+        client, calls, result = adversarial_run(
+            decisions=deepcopy(ADVERSARIAL_DECISIONS), checkpoint=deepcopy(saved),
+            checkpoints=checkpoints, verdicts=verdicts, worker_calls=calls)
+        assert result == expected, f"resume from checkpoint {index} changed the outcome"
+        assert "fix2" not in calls, f"checkpoint {index} re-opened the replan path"
+        state = checkpoints[-1]["artifacts"]["swarm_state"]
+        assert state["correction_rounds"] <= MAX_CORRECTION_ROUNDS
+        assert state["completed_task_ids"] == sorted(set(state["completed_task_ids"]))
+        assert set(state["completed_task_ids"]) <= {"a", "fix"}
+        claims = [item["claim_id"] for item in state["evidence_references"]]
+        assert len(claims) == len(set(claims))
+        keys = {(v.claim_id, v.verdict, v.reason) for v in verdicts}
+        assert len({claim for claim, _, _ in keys}) == len(keys)   # no claim, two verdicts
+        links = [(v.claim_id, link.identity) for v in verdicts for link in v.support]
+        assert len(links) == len(set(links))                       # no duplicate support
+
+
+def test_a_declined_correction_round_is_terminal_across_resume():
+    """A decline is an answer, not a pause: it is checkpointed, so a resume
+    finalizes instead of putting the same question a second time."""
+    decisions = [{"decision": "REQUEST_VERIFICATION", "plan": None, "reason": "verify"},
+                 DECLINE_CORRECTION,
+                 # Armed and waiting: a resume must never reach this.
+                 {"decision": "ADD_TASKS", "plan": second_round_plan(),
+                  "reason": "must never be taken after a decline"}]
+    checkpoints, events = [], []
+    client, calls, expected = adversarial_run(decisions=deepcopy(decisions),
+                                              checkpoints=checkpoints, events=events)
+    assert calls == ["a"]
+    assert [kind for kind, _ in events].count("correction_round_declined") == 1
+    state = checkpoints[-1]["artifacts"]["swarm_state"]
+    assert state["correction_declined"] is True and state["correction_rounds"] == 0
+
+    for index, saved in enumerate(checkpoints):
+        resumed_events, resumed_calls = [], []
+        _, resumed_calls, result = adversarial_run(
+            decisions=deepcopy(decisions), checkpoint=deepcopy(saved),
+            events=resumed_events, worker_calls=resumed_calls)
+        assert "fix2" not in resumed_calls, f"checkpoint {index} re-offered a declined round"
+        if state["correction_declined"] and saved is checkpoints[-1]:
+            # Resuming from the checkpoint that RECORDED the decline never asks
+            # the Commander about the correction round again.
+            assert not [k for k, _ in resumed_events if k == "correction_round_started"]
+        assert result["status"] == expected["status"]
+
+
+def test_replanning_before_the_correction_round_is_completely_unchanged():
+    """The bypass is closed only AFTER a correction round is accepted; the
+    ordinary pre-verification replan loop keeps working exactly as it did."""
+    revised = correction_plan(field=FIELD)
+    decisions = [{"decision": "ADD_TASKS", "plan": revised, "reason": "an ordinary replan"},
+                 {"decision": "REQUEST_VERIFICATION", "plan": None, "reason": "verify"},
+                 DECLINE_CORRECTION]
+    events, checkpoints = [], []
+    client, calls, result = adversarial_run(decisions=decisions, events=events,
+                                            checkpoints=checkpoints)
+    # The ordinary replan added its task and it ran, before verification.
+    assert calls == ["a", "fix"]
+    assert [kind for kind, _ in events].count("commander_replanned") == 1
+    state = checkpoints[-1]["artifacts"]["swarm_state"]
+    assert state["correction_rounds"] == 0            # no correction round was spent
+    assert state["correction_declined"] is True       # the offer was made and declined
+    assert client.replans == 3

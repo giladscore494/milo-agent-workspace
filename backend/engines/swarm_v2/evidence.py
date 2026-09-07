@@ -40,7 +40,7 @@ from uuid import UUID
 
 from backend.schemas import ClaimCreate, ConflictCreate, SourceCreate, ToolUsageCreate
 
-from .comparison import ScopeIdentity, normalize_identity, scope_identity
+from .comparison import ScopeIdentity, normalize_identity, scope_identity, value_identity
 from .conflict_policy import ConflictResolution
 from .contracts import VerificationVerdict
 from .evidence_contracts import (FRAGMENT_TYPES, MAX_LOCATOR_KEY_CHARS, EvidenceBundle,
@@ -51,7 +51,7 @@ from .evidence_mapping import AcquiredEvidence
 from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENTS_PER_SOURCE, extract_source_fragments,
                         fragment_content_hash, normalize_fragment_text)
 from .normalization import (SCOPE_NORMALIZATION_VERSION, canonical_scope_hash,
-                            canonical_scope_key, canonical_value_key)
+                            canonical_scope_key)
 from .support import MAX_VERIFIER_CONTRACT_VERSION_CHARS
 
 
@@ -435,7 +435,10 @@ class EvidenceBoard:
             groups.setdefault(identity, []).append(claim)
         recorded = []
         for claims in groups.values():
-            values = {canonical_value_key(item.get("value")) for item in claims}
+            # The SAME quantity identity the engine, the verifier and the
+            # conflict policy use: a durable conflict is two different
+            # QUANTITIES in one identity, never two spellings of one.
+            values = {value_identity(item.get("value"), item.get("unit")) for item in claims}
             if len(claims) < 2 or len(values) < 2:
                 continue
             # Formatting variants may differ across a group's claims; keying the

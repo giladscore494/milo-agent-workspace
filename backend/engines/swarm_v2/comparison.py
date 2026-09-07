@@ -54,7 +54,12 @@ from .normalization import (CanonicalScope, canonical_scope_key, canonical_value
 # older one's.  Bumping it is a deliberate act: it invalidates nothing
 # retroactively, it simply stops older verdicts from being presented as
 # decisions of the current contract.
-STRUCTURED_COMPARISON_VERSION = "r4.structured.1"
+#
+# r4.structured.2 corrects the conflict/ambiguity semantics: equivalence is now
+# a QUANTITY identity (`value_identity`) shared by every caller, so equal raw
+# numbers in incompatible units no longer collapse and equivalent numbers in
+# allowlisted units no longer contradict.
+STRUCTURED_COMPARISON_VERSION = "r4.structured.2"
 # The version of the unit/value equivalence allowlist below.  Separate from
 # the comparison version on purpose: adding one allowlisted conversion is a
 # smaller change than changing how identity or scope is compared.
@@ -65,6 +70,7 @@ UNIT_RULE_VERSION = "r4.units.1"
 # excerpt or any provider material.
 COMPARISON_REASONS = frozenset({
     "R4_STRUCTURED_MATCH",
+    "R4_AMBIGUOUS_SUPPORT_EVIDENCE",
     "R4_VALUE_MISMATCH",
     "R4_VALUE_NOT_COMPARABLE",
     "R4_UNIT_MISSING",
@@ -206,6 +212,74 @@ def compare_values(claim_value: Any, claim_unit: Any, fact_value: Any,
     return ("R4_STRUCTURED_MATCH"
             if canonical_value_key(claim_value) == canonical_value_key(fact_value)
             else "R4_VALUE_MISMATCH")
+
+
+class QuantityIdentity(NamedTuple):
+    """The ONE code-owned identity of a stated value-and-unit.
+
+    Two statements are THE SAME STATEMENT exactly when their identities are
+    equal.  There is one definition and every caller uses it -- the source
+    self-consistency check, conflict grouping, conflict resolution and the
+    Evidence Board's durable conflict detection -- so no two of them can drift
+    into disagreeing about what "the same value" means.
+
+    Two shapes, and the difference is the whole point:
+
+    *   `("quantity", family, exact)` -- a number stated in an ALLOWLISTED
+        unit, converted to its family's base with exact rational arithmetic.
+        `1600 cc` and `1.6 l` produce the identical tuple, so they can never
+        contradict each other; `1600 cc` and `1600 l` produce different ones,
+        so equal raw numbers in incompatible units can never collapse into
+        agreement.
+    *   `("opaque", unit, value)` -- anything the allowlist cannot relate: a
+        missing unit, an unknown unit, a non-numeric value.  Two of these are
+        equal ONLY when the stated unit token and the value are literally the
+        same, so an unprovable equivalence is never asserted.  That is the
+        fail-closed half: `1600` and `1600 cc` are different statements, and
+        `1600 hp` and `1600 kw` are different statements, because nothing in
+        the contract can prove otherwise.
+    """
+
+    kind: str
+    unit: str
+    value: str
+
+
+def value_identity(value: Any, unit: Any = None) -> QuantityIdentity:
+    """The deterministic identity of ONE stated value-and-unit.
+
+    Total and pure: every input shape maps to an identity and nothing raises.
+
+    This answers "are these the same statement", which is deliberately NOT the
+    same question as `compare_values`, which answers "does this claim VERIFY
+    against a source fact".  They agree everywhere except one documented case:
+    two identical UNIT-LESS numbers have the same identity (they are literally
+    the same statement, so they do not contradict) while `compare_values`
+    refuses to verify either of them (`R4_UNIT_MISSING`: a measurement without
+    a unit is unverifiable).  Failing to verify is not the same as
+    contradicting, and conflating the two would invent contradictions that can
+    never be closed.  tests/test_swarm_v2_r4_deterministic_verification.py
+    pins the whole agreement matrix, including that one difference.
+    """
+    normalized = normalize_unit(unit)
+    if _is_number(value):
+        rule = unit_factor(normalized)
+        if rule is not None:
+            family, factor = rule
+            base = _exact(value) * factor
+            # `Fraction` normalizes to lowest terms, so the rendering is a
+            # canonical identity for the quantity, not for how it was written.
+            return QuantityIdentity("quantity", family, f"{base.numerator}/{base.denominator}")
+        return QuantityIdentity("opaque", normalized or "", canonical_value_key(value))
+    if isinstance(value, str):
+        # The same formatting-only text normalization compare_values applies.
+        return QuantityIdentity("opaque", normalized or "", normalize_field_key(value))
+    return QuantityIdentity("opaque", normalized or "", canonical_value_key(value))
+
+
+def same_value(left_value: Any, left_unit: Any, right_value: Any, right_unit: Any) -> bool:
+    """Whether two stated values are the same statement under the contract."""
+    return value_identity(left_value, left_unit) == value_identity(right_value, right_unit)
 
 
 def normalize_identity(identity: Mapping[str, Any] | None) -> tuple[tuple[str, str], ...]:
@@ -387,12 +461,14 @@ def compare_structured(reference: Any, facts: Sequence[StructuredSourceFact], *,
         return StructuredComparison(
             "mismatch",
             "R4_IDENTITY_MISMATCH" if differing_identity else "R4_SCOPE_MISMATCH")
-    distinct = {(canonical_value_key(fact.value), normalize_unit(fact.unit))
-                for fact in candidates}
+    distinct = {value_identity(fact.value, fact.unit) for fact in candidates}
     if len(distinct) > 1:
-        # One source stating two different values for one identity is a
+        # One source stating two DIFFERENT quantities for one identity is a
         # contradiction inside the source itself.  It is never resolved by
-        # picking one: it stays for review.
+        # picking one: it stays for review.  Two EQUIVALENT statements of the
+        # same quantity (1600 cc and 1.6 l) share one identity and are not a
+        # contradiction, so a self-consistent source is never called ambiguous
+        # for writing the same fact in two allowlisted units.
         return StructuredComparison("ambiguous", "R4_AMBIGUOUS_SOURCE_FACT")
     fact = min(candidates, key=lambda item: item.fact_id)
     reason = compare_values(reference.value, getattr(reference, "unit", None),
@@ -402,7 +478,8 @@ def compare_structured(reference: Any, facts: Sequence[StructuredSourceFact], *,
 
 
 __all__ = ["COMPARISON_REASONS", "IDENTITY_DIMENSIONS", "STRUCTURED_COMPARISON_VERSION",
-           "UNIT_CONVERSIONS", "UNIT_RULE_VERSION", "ScopeIdentity", "StructuredComparison",
-           "StructuredSourceFact", "compare_structured", "compare_values",
-           "normalize_identity", "normalize_unit", "reference_identity", "scope_identity",
-           "scope_identity_hash", "unit_factor"]
+           "UNIT_CONVERSIONS", "UNIT_RULE_VERSION", "QuantityIdentity", "ScopeIdentity",
+           "StructuredComparison", "StructuredSourceFact", "compare_structured",
+           "compare_values", "normalize_identity", "normalize_unit", "reference_identity",
+           "same_value", "scope_identity", "scope_identity_hash", "unit_factor",
+           "value_identity"]

@@ -3312,3 +3312,55 @@ def test_r4_legacy_evidence_stays_valid_readable_and_never_backfilled(r4_db):
     # And a locally settled verdict about it is still perfectly recordable.
     verdict = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4-legacy-verdict', verdict='needs_review', reason='SOURCE_CONTEXT_UNAVAILABLE', mode='deterministic_local')}'::jsonb)")
     assert db.psql(f"select verification_mode from public.claim_verdicts where id='{verdict}'") == "deterministic_local"
+
+
+def test_r4_identical_text_at_two_locators_persists_only_the_cited_row(r4_db):
+    """R4 correction: one citation is one durable support row, never an expansion.
+
+    R3 deliberately allows identical text at two different locators, so a bare
+    content hash can name two durable rows. The verdict must persist exactly
+    the fragment the decision selected, and a replay must not accumulate the
+    other one.
+    """
+    db = r4_db
+    lease, _ = _evidence_fixture(db, "r4twin")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    other_locator = record_field_locator("rec-2", ("engine_displacement_cc",)).locator_key
+    source, first, claim = _r4_bundle(db, args, "r4t")
+    # The SAME text at a second locator: a second durable row, one hash.
+    second = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, R3_TEXT, key='r4t-frag-2', index=1, locator=other_locator)}'::jsonb)")
+    assert second != first
+    assert db.psql(
+        f"select count(*), count(distinct content_hash), count(distinct locator_key) "
+        f"from public.source_evidence_fragments where source_id='{source}'") == "2|1|2"
+
+    # A verdict citing the SECOND row persists that row and only that row.
+    payload = _r4_verdict_json(claim, key="r4t-verdict",
+                               support=[_r4_support(second, R3_TEXT, other_locator)])
+    verdict = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(
+        f"select count(*) from public.claim_verdict_supports where verdict_id='{verdict}'") == "1"
+    assert db.psql(
+        f"select fragment_id, locator_key from public.claim_verdict_supports "
+        f"where verdict_id='{verdict}'") == f"{second}|{other_locator}"
+
+    # A replay lands on the same row and does not accumulate the twin.
+    assert _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{payload}'::jsonb)") == verdict
+    assert db.psql(
+        f"select count(*) from public.claim_verdict_supports where verdict_id='{verdict}'") == "1"
+    assert db.psql(f"select count(*) from public.claim_verdicts where run_id='{run_id}'") == "1"
+
+    # Citing the FIRST row is a different verdict with its own single link, and
+    # neither verdict ever acquires the other's evidence.
+    first_payload = _r4_verdict_json(claim, key="r4t-verdict-first",
+                                     support=[_r4_support(first)])
+    other = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{first_payload}'::jsonb)")
+    assert db.psql(
+        f"select fragment_id from public.claim_verdict_supports where verdict_id='{other}'") == first
+    assert db.psql(
+        f"select count(*) from public.claim_verdict_supports where run_id='{run_id}'") == "2"
+    # A support link naming a fragment whose hash matches but whose locator
+    # does not is still refused: the row, not the hash, is the provenance.
+    with pytest.raises(AssertionError, match="locator mismatch"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4t-mixed', support=[_r4_support(second, R3_TEXT, R3_LOCATOR)])}'::jsonb)")

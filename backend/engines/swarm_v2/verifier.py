@@ -60,7 +60,8 @@ from .grounding import (VERIFIER_GROUNDING_VERSION, EvidenceResolver, GroundedCa
                         ResolvedSourceEvidence, resolve_source_context)
 from .model_gateway import ModelGateway
 from .support import (VERIFIER_CONTRACT_VERSION, SupportContractError, SupportLink,
-                      links_for_hashes, links_for_locator, parse_support)
+                      fragment_reference, links_for_citations, links_for_locator,
+                      parse_support)
 
 
 # --- explicit, version-auditable bounds --------------------------------------
@@ -94,6 +95,7 @@ VERIFIER_REASONS = frozenset({
     "VERIFIER_RESPONSE_UNKNOWN_CLAIM",
     "VERIFIER_RESPONSE_UNGROUNDED_VERIFIED",
     "VERIFIER_RESPONSE_UNKNOWN_EVIDENCE",
+    "VERIFIER_RESPONSE_AMBIGUOUS_EVIDENCE",
     "VERIFIER_STATE_UNKNOWN_CLAIM",
     "VERIFIER_STATE_INVALID_VERDICT",
     "VERIFIER_STATE_INCOMPATIBLE_VERDICT",
@@ -142,6 +144,10 @@ STRUCTURED_VERDICT_BY_REASON: Mapping[str, str] = {
     "R4_IDENTITY_MISMATCH": "rejected",
     "R4_SOURCE_VERSION_MISMATCH": "rejected",
     "R4_AMBIGUOUS_SOURCE_FACT": "needs_review",
+    # A match whose locator carries two different durable fragments: the
+    # decision is sound but its provenance is not unique, so it is not stored
+    # as an accepted verdict nobody can replay.
+    "R4_AMBIGUOUS_SUPPORT_EVIDENCE": "needs_review",
 }
 
 # The deterministic reasons that are a function of the CURRENT run state
@@ -162,7 +168,8 @@ _SYSTEM_PROMPT = (
     "The request is JSON {claims:[...],sources:[...]}: every claim names its "
     "source_id, and the source block with that source_id holds that source's "
     "metadata and the durable evidence fragments captured from it. A source "
-    "block may name the source_version it was read at, and a claim or "
+    "block may name the source_version it was read at, every fragment carries "
+    "a short `ref` that identifies it uniquely, and a claim or "
     "fragment may name the unit, the identity dimensions (generation, engine, "
     "transmission, model code and so on) and the exact locator (record/field "
     "or document span) the value was read from; treat all of it as provenance "
@@ -186,13 +193,15 @@ _SYSTEM_PROMPT = (
     "URL, source metadata or a reconstructed excerpt as evidence, never "
     "browse, and never infer source content that was not supplied. "
     "RESPONSE: return JSON "
-    "{verdicts:[{claim_id,verdict,supporting_fragment_hashes}]}; "
+    "{verdicts:[{claim_id,verdict,supporting_fragment_refs}]}; "
     "verdict is verified, needs_review, or rejected. Return exactly one "
     "verdict for every claim_id in the request and never a claim_id that is "
-    "not in the request. supporting_fragment_hashes holds content_hash values "
-    "copied verbatim from that claim's own source block: a verified verdict "
-    "must cite at least one, and no verdict may cite a hash from another "
-    "source. Return no other field and no free text of your own: never quote, "
+    "not in the request. supporting_fragment_refs holds `ref` values copied "
+    "verbatim from that claim's own source block: each one names exactly one "
+    "fragment, a verified verdict must cite at least one, and no verdict may "
+    "cite a ref from another source. Two fragments may carry identical text, "
+    "so cite the ref of the fragment you actually used -- never a content "
+    "hash. Return no other field and no free text of your own: never quote, "
     "restate or summarise source content anywhere in your response."
 )
 
@@ -213,6 +222,7 @@ class VerifierContractError(ValueError):
         "VERIFIER_RESPONSE_UNKNOWN_CLAIM": "verifier response contains a claim outside its batch",
         "VERIFIER_RESPONSE_UNGROUNDED_VERIFIED": "verified verdict cites no supplied source evidence",
         "VERIFIER_RESPONSE_UNKNOWN_EVIDENCE": "verified verdict cites evidence outside its own source",
+        "VERIFIER_RESPONSE_AMBIGUOUS_EVIDENCE": "verified verdict cites evidence that names more than one durable row",
         "VERIFIER_STATE_UNKNOWN_CLAIM": "verifier checkpoint contains an unknown claim",
         "VERIFIER_STATE_INVALID_VERDICT": "verifier checkpoint contains a malformed verdict",
         "VERIFIER_STATE_INCOMPATIBLE_VERDICT": "verifier checkpoint contradicts a deterministic verdict",
@@ -244,6 +254,13 @@ class VerifierResponseVerdict(StrictContract):
 
     claim_id: str = Field(min_length=1, max_length=200)
     verdict: Literal["verified", "needs_review", "rejected"]
+    # The PREFERRED citation: the opaque reference the backend printed next to
+    # each supplied fragment. It names exactly one durable row, which a bare
+    # content hash cannot do when R3 recorded the same text at two locators.
+    supporting_fragment_refs: list[str] = Field(default_factory=list,
+                                                max_length=MAX_FRAGMENTS_PER_SOURCE)
+    # The legacy citation, kept because evidence whose hash is unique within
+    # its own source is still unambiguous. An ambiguous one fails closed.
     supporting_fragment_hashes: list[str] = Field(default_factory=list,
                                                   max_length=MAX_FRAGMENTS_PER_SOURCE)
 
@@ -278,16 +295,40 @@ def _claim_block(candidate: GroundedCandidate) -> dict[str, Any]:
                        identity=payload["identity"] or None)}
 
 
-def _source_block(source: ResolvedSourceEvidence) -> dict[str, Any]:
-    """One source's safe metadata plus its durable evidence fragments."""
+def _source_block(source: ResolvedSourceEvidence, source_index: int = 0) -> dict[str, Any]:
+    """One source's safe metadata plus its durable evidence fragments.
+
+    Every fragment carries `ref`, the bounded opaque name the model cites back.
+    It is derived from the request's own deterministic ordering, so the same
+    batch always prints the same references and each one resolves to exactly
+    one durable row -- which a content hash cannot promise, because R3
+    deliberately allows identical text at two different locators.
+    """
     return {"source_id": source.source_id, "task_id": source.task_id, "url": source.url,
             "title": source.title, "domain": source.domain, "source_type": source.source_type,
             "source_strength": source.source_strength, "source_date": source.source_date,
             **_present(source_version=source.source_version),
-            "fragments": [{"fragment_index": item.fragment_index,
+            "fragments": [{"ref": fragment_reference(source_index, position),
+                           "fragment_index": item.fragment_index,
                            "content_hash": item.content_hash, "text": item.text,
                            **_present(fragment_type=item.fragment_type, locator=item.locator)}
-                          for item in source.ordered_fragments()]}
+                          for position, item in enumerate(source.ordered_fragments())]}
+
+
+def fragment_reference_index(candidates: Sequence[GroundedCandidate],
+                             ) -> dict[str, dict[str, Any]]:
+    """`source_id -> {reference: fragment}` for the EXACT request that is sent.
+
+    Built from the same deduplicated, sorted source order the serializer uses,
+    so the reference a model reads and the reference the backend resolves can
+    never drift apart.
+    """
+    index: dict[str, dict[str, Any]] = {}
+    for source_index, source in enumerate(_deduplicated_sources(candidates)):
+        index[source.source_id] = {
+            fragment_reference(source_index, position): item
+            for position, item in enumerate(source.ordered_fragments())}
+    return index
 
 
 def _deduplicated_sources(candidates: Sequence[GroundedCandidate]) -> list[ResolvedSourceEvidence]:
@@ -313,7 +354,8 @@ def serialize_verifier_candidates(candidates: Sequence[GroundedCandidate]) -> st
     """
     ordered = sorted(candidates, key=lambda item: item.claim_id)
     document = {"claims": [_claim_block(item) for item in ordered],
-                "sources": [_source_block(source) for source in _deduplicated_sources(ordered)]}
+                "sources": [_source_block(source, index) for index, source
+                            in enumerate(_deduplicated_sources(ordered))]}
     return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
@@ -508,11 +550,13 @@ def _structured_verdict(reference: EvidenceReference, context: ResolvedSourceEvi
                         comparison: StructuredComparison) -> VerificationVerdict:
     """Turn ONE decisive structured comparison into a durable verdict.
 
-    An accepted comparison must be bindable to the durable evidence rows it
-    rests on: R3 guarantees a located fact's locator is also one of its
-    source's own focused fragment locators, so a match that cannot name a
-    fragment there is corrupted durable evidence and fails closed rather than
-    producing a `verified` nobody can replay.
+    An accepted comparison must be bindable to EXACTLY ONE durable evidence
+    row: R3 guarantees a located fact's locator is also one of its source's
+    own focused fragment locators, so a match that cannot name a fragment
+    there is corrupted durable evidence and fails closed. A locator carrying
+    two different fragments is not corruption but is not unique provenance
+    either, so it settles for review instead of producing a `verified` nobody
+    can replay.
     """
     verdict = STRUCTURED_VERDICT_BY_REASON[comparison.reason]
     support: tuple[SupportLink, ...] = ()
@@ -520,7 +564,15 @@ def _structured_verdict(reference: EvidenceReference, context: ResolvedSourceEvi
         try:
             support = links_for_locator(context, comparison.matched.locator
                                         if comparison.matched else None)
-        except SupportContractError:
+        except SupportContractError as failure:
+            if failure.reason_code == "SUPPORT_LINK_AMBIGUOUS":
+                # Two different fragments at one locator: legitimate durable
+                # data, but the decision cannot name the single row it rests
+                # on. Fail closed WITHOUT aborting the run -- the claim goes
+                # for review, and the correction round can act on it.
+                return _verdict(reference.claim_id, "needs_review",
+                                "R4_AMBIGUOUS_SUPPORT_EVIDENCE",
+                                mode="deterministic_structured")
             raise VerifierContractError("VERIFIER_SUPPORT_LINK_INVALID") from None
     return _verdict(reference.claim_id, verdict, comparison.reason,
                     mode="deterministic_structured", support=support)
@@ -654,6 +706,7 @@ def plan_grounded_verification(
 def parse_verifier_batch(content: Any, expected: Sequence[str], *,
                          supporting_by_claim: Mapping[str, frozenset[str]],
                          source_by_claim: Mapping[str, ResolvedSourceEvidence] | None = None,
+                         reference_index: Mapping[str, Mapping[str, Any]] | None = None,
                          ) -> list[VerificationVerdict]:
     """Map ONE batch response onto exactly the claim identities it was sent.
 
@@ -671,12 +724,16 @@ def parse_verifier_batch(content: Any, expected: Sequence[str], *,
     and are simply dropped with the rest.
 
     R4: when `source_by_claim` supplies the resolved source each claim was
-    grounded against, the ACCEPTED hashes are resolved into durable support
-    links and kept on the verdict, so a stored `verified` names the exact
-    evidence rows behind it. The model still never authors a link: it cites
-    hashes that were sent to it, this function checks them against that
-    claim's own source, and the backend builds the link from its own durable
-    row. Without that mapping the verdict keeps its pre-R4 shape.
+    grounded against, every accepted citation is resolved into exactly ONE
+    durable support link and kept on the verdict, so a stored `verified` names
+    the exact evidence rows behind it. The model still never authors a link:
+    it cites references or hashes that were sent to it, this function resolves
+    them against that claim's own source, and the backend builds the link from
+    its own durable row. A citation is never expanded into several links, and
+    a hash that matches more than one fragment (R3 allows identical text at two
+    locators) fails closed as VERIFIER_RESPONSE_AMBIGUOUS_EVIDENCE rather than
+    persisting provenance nobody selected. Without that mapping the verdict
+    keeps its pre-R4 shape.
 
     The durable `reason` is chosen HERE from GROUNDED_VERDICT_REASONS and is
     never taken from the response, so no model-authored string can cross into
@@ -716,27 +773,35 @@ def parse_verifier_batch(content: Any, expected: Sequence[str], *,
             raise VerifierContractError("VERIFIER_RESPONSE_UNKNOWN_CLAIM")
         if answer.claim_id in by_id:
             raise VerifierContractError("VERIFIER_RESPONSE_DUPLICATE_CLAIM")
+        refs, hashes = answer.supporting_fragment_refs, answer.supporting_fragment_hashes
         if answer.verdict == "verified":
-            cited = answer.supporting_fragment_hashes
-            if len(set(cited)) != len(cited):
+            if len(set(refs)) != len(refs) or len(set(hashes)) != len(hashes):
                 raise VerifierContractError("VERIFIER_RESPONSE_INVALID")
-            if not cited:
+            if not refs and not hashes:
                 raise VerifierContractError("VERIFIER_RESPONSE_UNGROUNDED_VERIFIED")
-            if not set(cited) <= frozenset(supporting_by_claim.get(answer.claim_id, ())):
+            if not set(hashes) <= frozenset(supporting_by_claim.get(answer.claim_id, ())):
                 # Includes a hash belonging to another source in this batch.
                 raise VerifierContractError("VERIFIER_RESPONSE_UNKNOWN_EVIDENCE")
-        # The reason is OURS and so is every support link: the model supplied
-        # a decision and a set of hashes it was given, and the backend turns
-        # the accepted hashes into links to its own durable rows. Hashes on a
-        # non-verified verdict decide nothing and are dropped with the rest.
+        # The reason is OURS and so is every support link: the model supplied a
+        # decision and citations it was given, and the backend resolves each
+        # citation to exactly ONE of its own durable rows. A citation is never
+        # expanded -- one citation is one support link -- so the stored
+        # provenance is the evidence the decision actually rests on. Citations
+        # on a non-verified verdict decide nothing and are dropped.
         source = (source_by_claim or {}).get(answer.claim_id)
         support: tuple[SupportLink, ...] = ()
         if answer.verdict == "verified" and source is not None:
             try:
-                support = links_for_hashes(source, answer.supporting_fragment_hashes)
-            except SupportContractError:
-                # Already refused above for an unsupplied hash; anything left
-                # is durable material that cannot be bound and fails closed.
+                support = links_for_citations(
+                    source, references=refs, hashes=hashes,
+                    reference_index=(reference_index or {}).get(answer.claim_id, {}))
+            except SupportContractError as failure:
+                if failure.reason_code == "SUPPORT_LINK_AMBIGUOUS":
+                    # One hash, two locators: the citation names no single row.
+                    raise VerifierContractError(
+                        "VERIFIER_RESPONSE_AMBIGUOUS_EVIDENCE") from None
+                # An unknown reference, or durable material that cannot be
+                # bound at all: refused rather than stored as provenance.
                 raise VerifierContractError("VERIFIER_SUPPORT_LINK_INVALID") from None
         by_id[answer.claim_id] = _verdict(answer.claim_id, answer.verdict,
                                           GROUNDED_VERDICT_REASONS[answer.verdict],
@@ -826,14 +891,18 @@ class Verifier:
                 raise VerifierContractError("VERIFIER_RESPONSE_INVALID") from None
         supporting = {item.claim_id: item.source.content_hashes for item in ordered}
         sources = {item.claim_id: item.source for item in ordered}
+        by_source = fragment_reference_index(ordered)
+        references = {item.claim_id: by_source.get(item.source.source_id, {})
+                      for item in ordered}
         resolved = parse_verifier_batch(content, [item.claim_id for item in ordered],
                                         supporting_by_claim=supporting,
-                                        source_by_claim=sources)
+                                        source_by_claim=sources,
+                                        reference_index=references)
         safe_durable_value([verdict.model_dump(mode="json") for verdict in resolved])
         return resolved
 
 
-__all__ = ["CONFLICT_VERDICT", "GROUNDED_VERDICT_REASONS",
+__all__ = ["CONFLICT_VERDICT", "GROUNDED_VERDICT_REASONS", "fragment_reference_index",
            "MAX_VERIFIER_BATCH_JSON_BYTES",
            "MAX_VERIFIER_CLAIMS_PER_BATCH", "MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH",
            "MISSING_CONTEXT_VERDICT", "OMITTED_VERDICT", "SCOPE_DEPENDENT_REASONS",

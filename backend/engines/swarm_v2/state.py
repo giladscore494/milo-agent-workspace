@@ -45,6 +45,12 @@ class SwarmState(StrictContract):
     # allowance is one for the whole run, and it lives in the checkpoint so a
     # resumed run cannot quietly earn a second one.
     correction_rounds: int = Field(default=0, ge=0, le=MAX_CORRECTION_ROUNDS)
+    # R4: the Commander was offered the correction round and DECLINED it. That
+    # is a terminal answer, not a pause, so it lives in the checkpoint: a
+    # resume from that checkpoint finalizes instead of asking again. A round
+    # that was merely blocked by a budget is deliberately NOT recorded here --
+    # a later resume with capacity may legitimately still take it.
+    correction_declined: bool = False
     usage_snapshot: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod

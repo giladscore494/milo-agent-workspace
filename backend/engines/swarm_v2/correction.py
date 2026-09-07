@@ -100,6 +100,7 @@ _ISSUE_BY_REASON: Mapping[str, str] = {
     "R4_IDENTITY_MISMATCH": "R4_ISSUE_STRUCTURED_MISMATCH",
     "R4_SOURCE_VERSION_MISMATCH": "R4_ISSUE_STRUCTURED_MISMATCH",
     "R4_AMBIGUOUS_SOURCE_FACT": "R4_ISSUE_UNRESOLVED_CONFLICT",
+    "R4_AMBIGUOUS_SUPPORT_EVIDENCE": "R4_ISSUE_UNVERIFIED",
     "source evidence is insufficient or ambiguous": "R4_ISSUE_UNVERIFIED",
     "source evidence does not support claim": "R4_ISSUE_UNVERIFIED",
     "verifier omitted claim": "R4_ISSUE_UNVERIFIED",
