@@ -29,9 +29,9 @@ from backend.engines.swarm_v2 import (
     RemainingBudget, StructuredSourceFact, SupportContractError, SupportLink, SwarmState,
     SwarmV2Engine, VerificationVerdict, Verifier, VerifierContractError,
     compare_structured, compare_values, conflict_groups, correction_allowance,
-    correction_issues, correction_summary, field_family, is_authoritative,
-    normalize_identity, normalize_unit, parse_support, resolve_conflicts, scope_identity,
-    validate_support, value_identity,
+    correction_issues, correction_path_closed, correction_summary, field_family,
+    is_authoritative, normalize_identity, normalize_unit, parse_support,
+    resolve_conflicts, scope_identity, validate_support, value_identity,
 )
 from backend.engines.swarm_v2.evidence_contracts import record_field_locator
 from backend.engines.swarm_v2.fragments import fragment_content_hash
@@ -1442,9 +1442,93 @@ def test_a_declined_correction_round_is_terminal_across_resume():
         assert result["status"] == expected["status"]
 
 
+@pytest.mark.parametrize("rounds_used, declined, closed", [
+    # Nothing terminal was answered, so the ordinary replan path stays open.
+    # This is also the shape of a round refused for BUDGET: that decided
+    # nothing, and a resume with restored capacity may still take it.
+    (0, False, False),
+    (0, True, True),     # DECLINED at round 0: the reproduced resume bypass
+    (1, False, True),    # the round was spent
+    (1, True, True),     # spent and declined -- still closed, not reopened
+])
+def test_the_correction_path_closes_on_either_terminal_answer(rounds_used, declined, closed):
+    """One predicate, both terminal answers. A run that spent its round and a
+    run whose Commander declined one are equally finished with the question,
+    so neither may be handed the findings again -- in the pass that recorded
+    the answer or in any resume from its checkpoint."""
+    assert correction_path_closed(rounds_used=rounds_used, declined=declined) is closed
+
+
+def test_a_decline_closes_the_ordinary_replan_path_on_resume():
+    """The adversarial decline case: resume from the checkpoint that RECORDED
+    the decline, with ADD_TASKS as the FIRST decision the resumed run can
+    consume.
+
+    Reproduction cover. A decline is checkpointed as `correction_declined`
+    while `correction_rounds` stays 0, so a guard that only asked
+    `correction_rounds >= MAX_CORRECTION_ROUNDS` left the ORDINARY
+    pre-verification replan path wide open on resume: the very findings the
+    Commander had already refused to research came straight back as a summary,
+    an armed ADD_TASKS was consumed, and new tasks ran -- observed as
+    initial calls ['a'] then resumed calls ['fix', 'fix2'].
+    """
+    decline = [{"decision": "REQUEST_VERIFICATION", "plan": None, "reason": "verify"},
+               DECLINE_CORRECTION]
+    checkpoints, calls, events = [], [], []
+    _, calls, expected = adversarial_run(decisions=deepcopy(decline), events=events,
+                                         checkpoints=checkpoints, worker_calls=calls)
+    assert calls == ["a"]
+    assert [kind for kind, _ in events].count("correction_round_declined") == 1
+    declined = [c for c in checkpoints
+                if c["artifacts"]["swarm_state"]["correction_declined"]]
+    saved = only(declined)                       # exactly one checkpoint records it
+    before = saved["artifacts"]["swarm_state"]
+    assert before["correction_declined"] is True and before["correction_rounds"] == 0
+
+    # Armed FIRST, not third: the resumed run's very next Commander answer
+    # would be a second research plan built from the same refused findings.
+    resumed_events, resumed_calls, resumed_checkpoints, resumed_verdicts = [], [], [], []
+    client, resumed_calls, result = adversarial_run(
+        decisions=[{"decision": "ADD_TASKS", "plan": second_round_plan(),
+                    "reason": "must never be taken after a decline"},
+                   {"decision": "REQUEST_VERIFICATION", "plan": None,
+                    "reason": "after the second round"},
+                   DECLINE_CORRECTION],
+        checkpoint=deepcopy(saved), checkpoints=resumed_checkpoints,
+        events=resumed_events, verdicts=resumed_verdicts, worker_calls=resumed_calls)
+
+    # 1. No worker task ran at all -- not the armed one, not a repeat of "a".
+    assert resumed_calls == []
+    # 2. The Commander was never asked, so the armed decision was not consumed.
+    assert client.replans == 0
+    kinds = [kind for kind, _ in resumed_events]
+    assert not [k for k in kinds if k in {"commander_replanned", "correction_round_started",
+                                          "correction_round_declined"}]
+    # The resume says out loud why it went straight to finalization.
+    assert only([payload for kind, payload in resumed_events
+                 if kind == "correction_round_finalizing"]) == {"round": 0, "declined": True}
+    # 3. The graph and the completed set are exactly what the decline left.
+    after = resumed_checkpoints[-1]["artifacts"]["swarm_state"]
+    assert after["graph_revision"] == before["graph_revision"]
+    assert after["completed_task_ids"] == before["completed_task_ids"] == ["a"]
+    assert after["approved_plan"] == before["approved_plan"]
+    assert after["replans"] == before["replans"]
+    assert after["correction_rounds"] == 0 and after["correction_declined"] is True
+    # 4. The terminal outcome is byte-for-byte the one the declined run built.
+    assert result == expected
+    # Re-verification is deterministic and append-only: no claim gained a
+    # second verdict and no support link was duplicated on the way through.
+    keys = {(v.claim_id, v.verdict, v.reason) for v in resumed_verdicts}
+    assert len({claim for claim, _, _ in keys}) == len(keys)
+    links = [(v.claim_id, link.identity) for v in resumed_verdicts for link in v.support]
+    assert len(links) == len(set(links))
+
+
 def test_replanning_before_the_correction_round_is_completely_unchanged():
-    """The bypass is closed only AFTER a correction round is accepted; the
-    ordinary pre-verification replan loop keeps working exactly as it did."""
+    """The path is closed only once the run has its terminal answer -- the
+    round accepted or declined. Every replan BEFORE that, including the one
+    that runs in the same pass the decline is later recorded in, keeps
+    working exactly as it did."""
     revised = correction_plan(field=FIELD)
     decisions = [{"decision": "ADD_TASKS", "plan": revised, "reason": "an ordinary replan"},
                  {"decision": "REQUEST_VERIFICATION", "plan": None, "reason": "verify"},

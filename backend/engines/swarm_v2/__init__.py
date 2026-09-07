@@ -16,7 +16,8 @@ from .conflict_policy import (CLAIM_RESOLUTION_STATES, CONFLICT_POLICY_VERSION,
 from .correction import (CORRECTION_BLOCK_REASONS, CORRECTION_ISSUE_CODES,
                          MAX_CORRECTION_ISSUES, MAX_CORRECTION_ROUNDS,
                          MIN_CORRECTION_MODEL_CALLS, CorrectionAllowance,
-                         correction_allowance, correction_issues, correction_summary)
+                         correction_allowance, correction_issues,
+                         correction_path_closed, correction_summary)
 from .contracts import (CommanderDecision, CommanderPlan, CompletionCriteria,
                         DependencyBinding, DynamicTask,
                         EvidenceReference, PlannedToolCall, RemainingBudget,
@@ -153,6 +154,7 @@ __all__ += ["CLAIM_RESOLUTION_STATES", "CONFLICT_POLICY_VERSION", "FIELD_FAMILIE
             "parse_resolutions", "resolve_conflict_group", "resolve_conflicts"]
 __all__ += ["CORRECTION_BLOCK_REASONS", "CORRECTION_ISSUE_CODES", "MAX_CORRECTION_ISSUES",
             "MAX_CORRECTION_ROUNDS", "MIN_CORRECTION_MODEL_CALLS", "CorrectionAllowance",
-            "correction_allowance", "correction_issues", "correction_summary"]
+            "correction_allowance", "correction_issues", "correction_path_closed",
+            "correction_summary"]
 __all__ += ["SCOPE_DEPENDENT_REASONS", "STRUCTURED_VERDICT_BY_REASON",
             "SUPERSEDED_VERDICT"]

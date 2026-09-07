@@ -7,7 +7,7 @@ from .builder import FinalBuilder
 from .commander import Commander
 from .conflict_policy import ConflictResolution, conflict_groups
 from .contracts import EvidenceReference, RemainingBudget, VerificationVerdict
-from .correction import (MAX_CORRECTION_ROUNDS, correction_allowance, correction_issues,
+from .correction import (correction_allowance, correction_issues, correction_path_closed,
                          correction_summary)
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
@@ -64,7 +64,11 @@ class SwarmV2Engine:
                    # policy/contract version and a static reason carry no
                    # value, no unit, no source text and no provider material.
                    "scope_hash", "state", "reason", "policy_version",
-                   "structured_count", "issue_count", "round"}
+                   "structured_count", "issue_count", "round",
+                   # A bare boolean saying WHICH terminal answer closed the
+                   # correction path, so a resumed run that finalizes at
+                   # round 0 explains itself without carrying any finding.
+                   "declined"}
         safe = {key: value for key, value in payload.items() if key in allowed and
                 (value is None or isinstance(value, (str, int, float, bool)))}
         if self._event_sink:
@@ -288,8 +292,10 @@ class SwarmV2Engine:
         * the Commander may decline it, and a declined round is final: the
           decline is checkpointed, the issues become needs_review and the run
           finalizes under R1;
-        * once a round HAS been accepted, the ordinary task-adding replan path
-          is closed for the rest of the run (see `run`), so the same findings
+        * once the run has its terminal answer -- the round was ACCEPTED or it
+          was DECLINED -- the ordinary task-adding replan path is closed for
+          the rest of the run and across every resume (see
+          `correction.correction_path_closed` and `run`), so the same findings
           can never produce a second research task through another door.
 
         Returning a plan means "execute this and verify again"; returning None
@@ -423,18 +429,24 @@ class SwarmV2Engine:
                     ),
                 }}
             # R4: the one bounded correction round is the LAST thing that may
-            # add work to a run. Once it has been accepted, the ordinary
-            # pre-verification replan path is closed: the correction plan is
-            # executed exactly once and the run goes straight to
-            # re-verification and finalization. Without this, the very same
-            # verifier-discovered conflict could be handed back to the
-            # Commander here and earn a second research task while
-            # `correction_rounds` still read 1. The flag lives in the
-            # checkpoint, so a resume mid-correction is closed too, and every
-            # replan BEFORE the correction round behaves exactly as it did.
-            if state.correction_rounds >= MAX_CORRECTION_ROUNDS:
+            # add work to a run. Once the run has had its TERMINAL answer
+            # about the verifier's findings -- the round was spent, or the
+            # Commander declined it -- the ordinary pre-verification replan
+            # path is closed: the run goes straight to re-verification and
+            # finalization. Without this, the very same verifier-discovered
+            # conflict could be handed back to the Commander here and earn a
+            # second research task through the other door. Both answers live
+            # in the CHECKPOINT (`correction_rounds` / `correction_declined`),
+            # so a resume is closed exactly like the pass that recorded them:
+            # resuming from a decline never asks the Commander anything again.
+            # A round merely blocked by a budget decided nothing and is not
+            # closed, and every replan BEFORE the correction round behaves
+            # exactly as it did.
+            if correction_path_closed(rounds_used=state.correction_rounds,
+                                      declined=state.correction_declined):
                 self._emit("correction_round_finalizing",
-                           {"round": state.correction_rounds})
+                           {"round": state.correction_rounds,
+                            "declined": state.correction_declined})
                 decision = None
             else:
                 decision = self._commander.replan(

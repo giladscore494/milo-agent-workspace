@@ -137,6 +137,33 @@ class CorrectionAllowance:
             raise ValueError("correction block reason must come from the static allowlist")
 
 
+def correction_path_closed(*, rounds_used: int, declined: bool) -> bool:
+    """True once the run's ONE correction round has been finally answered.
+
+    A run gets a single terminal answer about the findings verification made,
+    and there are exactly two of them:
+
+    *   it SPENT the round -- `rounds_used >= MAX_CORRECTION_ROUNDS`; or
+    *   the Commander DECLINED it -- a decline is an answer, not a pause, and
+        it is checkpointed (`SwarmState.correction_declined`) precisely so a
+        resume cannot put the same question again.
+
+    Both answers close the same door, so they are one predicate rather than
+    two conditions the engine could drift apart.  A round merely *blocked by
+    a budget* is deliberately NOT closed: nothing terminal was decided, and a
+    later resume with restored capacity may still legitimately take it.
+
+    `SwarmV2Engine.run` consults this to close the ordinary task-adding
+    replan path: once a run has had its terminal answer, the same findings
+    must not be able to earn another research task through the
+    pre-verification door either.  `_start_correction_round` enforces the two
+    answers on its own path as well -- the decline through its early return,
+    the spent round through `correction_allowance`, which still names
+    `R4_CORRECTION_ALLOWANCE_SPENT` so the refusal stays observable.
+    """
+    return declined or rounds_used >= MAX_CORRECTION_ROUNDS
+
+
 def correction_allowance(*, rounds_used: int, remaining: Any, replans_used: int,
                          max_replans: int) -> CorrectionAllowance:
     """Decide whether ONE more bounded correction round may start.
@@ -276,4 +303,4 @@ __all__ = ["CORRECTION_BLOCK_REASONS", "CORRECTION_ISSUE_CODES",
            "MAX_CORRECTION_ISSUES", "MAX_CORRECTION_ROUNDS",
            "MAX_CORRECTION_SUMMARY_JSON_BYTES", "MAX_CORRECTION_VALUE_CHARS",
            "MIN_CORRECTION_MODEL_CALLS", "CorrectionAllowance", "correction_allowance",
-           "correction_issues", "correction_summary"]
+           "correction_issues", "correction_path_closed", "correction_summary"]
