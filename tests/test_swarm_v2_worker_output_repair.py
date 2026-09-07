@@ -584,7 +584,10 @@ def test_a_repaired_worker_costs_exactly_one_extra_model_call(
     assert worker_main.execute_run(run_id, repo) == 0
 
     run = repo.get_run(run_id)
-    assert run["status"] == "completed"
+    # A no-tool plan verifies nothing, so the truthful terminal state is
+    # partial_success; this test's subject is the run reaching it, not
+    # product usefulness.
+    assert run["status"] == "partial_success"
     assert len(completions.calls) == expected_model_calls
     assert run["usage"]["model_calls"] == expected_model_calls
     # A worker repair IS a semantic retry; provider backpressure is not.

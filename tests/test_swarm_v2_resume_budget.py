@@ -180,7 +180,9 @@ def test_a_first_attempt_restores_nothing_and_starts_from_zero(offline, monkeypa
     completions, exit_code = run_worker(monkeypatch, repo, run_id, tracker)
 
     assert exit_code == 0
-    assert repo.get_run(UUID(run_id))["status"] == "completed"
+    # This budget fixture runs the no-tool plan: it reaches a durable terminal
+    # state, and with nothing verified that state is truthfully partial_success.
+    assert repo.get_run(UUID(run_id))["status"] == "partial_success"
     assert tracker.model_calls == len(completions.calls)
 
 

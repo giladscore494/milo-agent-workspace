@@ -171,7 +171,10 @@ def test_worker_wires_one_plan_limits_instance_into_gateway_and_validator(monkey
     run_id = run_worker_directly(repo, conversation_id, monkeypatch,
                                  FakeKimiCompletions(), idempotency_key="parity-000001")
     assert worker_main.execute_run(run_id, repo) == 0
-    assert repo.get_run(run_id)["status"] == "completed"
+    # A no-tool plan verifies nothing, so the truthful terminal state is
+    # partial_success; this test's subject is the run reaching it, not
+    # product usefulness.
+    assert repo.get_run(run_id)["status"] == "partial_success"
     assert isinstance(captured.get("gateway_limits"), PlanLimits)
     assert captured["gateway_limits"] is captured["validator_limits"]
 
@@ -288,7 +291,10 @@ def test_one_repair_success_completes_within_the_same_attempt(monkeypatch):
                                  idempotency_key="repair-ok-00001")
     assert worker_main.execute_run(run_id, repo) == 0
     run = repo.get_run(run_id)
-    assert run["status"] == "completed"
+    # A no-tool plan verifies nothing, so the truthful terminal state is
+    # partial_success; this test's subject is the run reaching it, not
+    # product usefulness.
+    assert run["status"] == "partial_success"
     assert run["attempt"] == 1
 
     plan_calls = _plan_calls(completions)

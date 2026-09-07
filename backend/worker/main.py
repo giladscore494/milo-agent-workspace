@@ -493,6 +493,47 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             stop = tracker.stop
             _persist_budget_terminal(repo, run_id, stop, tracker, lease_ctx)
             return 0 if workflow_key == "swarm_v2" else 1
+        # Product outcome -> durable run status.
+        #
+        # Swarm V2 owns a validated product-outcome contract, so the worker
+        # LOOKS IT UP instead of guessing usefulness from dictionary
+        # truthiness: `status` and `result_kind` must be allowlisted, must
+        # agree with each other and must agree with the verified fields, or
+        # the run is a contract violation rather than a quiet success. In
+        # particular `no_usable_result` can only ever reach `partial_success`
+        # and can never emit run_completed.
+        #
+        # V1 (and the mock lifecycle engine) keep their existing mapping
+        # unchanged, including the generic `result` fallback they rely on.
+        if workflow_key == "swarm_v2":
+            from backend.engines.swarm_v2 import ProductOutcomeError, durable_run_status
+            try:
+                status = durable_run_status(result)
+            except ProductOutcomeError:
+                # Static classification only: the offending payload never
+                # reaches an event, run.error or the browser.
+                code, message = "SWARM_V2_OUTCOME_INVALID", "Swarm V2 product outcome is invalid"
+                sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message=message,
+                                         payload={"code": code}))
+                shadow_observe("run_failed", {"code": code})
+                repo.mark_run_failed(run_id, code, message, worker_id=worker_id,
+                                     attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+                return 0
+            sink.emit(RunEventRecord(run_id=run_id, type="run_partial_success" if status == "partial_success" else "run_completed", message=f"Run {status}", payload={"status": result.get("status"), "result_kind": result.get("result_kind")}))
+            shadow_observe("run_partial_success" if status == "partial_success" else "run_completed", {"status": result.get("status"), "result_kind": result.get("result_kind")})
+            if status == "partial_success":
+                # Never silently downgrade to mark_run_complete when the
+                # repository cannot express partial_success: reporting an
+                # unusable result as `completed` is the exact defect this
+                # contract exists to prevent, so a missing capability is an
+                # infrastructure failure (as it already is for budget stops).
+                if not callable(getattr(repo, "transition_run", None)):
+                    raise AppError("RUN_FINALIZATION_UNAVAILABLE",
+                                   "terminal run transition is unavailable", 503)
+                repo.transition_run(run_id, "partial_success", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), output=result, error=None, finished_at=datetime.now(UTC).isoformat())
+            else:
+                repo.mark_run_complete(run_id, result, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+            return 0
         if result.get("status") in {"complete", "partial_success", "success"} or (result.get("status") != "failed" and result.get("result")):
             status = "partial_success" if result.get("status") == "partial_success" else "completed"
             sink.emit(RunEventRecord(run_id=run_id, type="run_partial_success" if status == "partial_success" else "run_completed", message=f"Run {status}", payload={"status": result.get("status")}))

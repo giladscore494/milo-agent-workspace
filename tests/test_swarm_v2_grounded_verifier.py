@@ -289,7 +289,12 @@ def test_missing_context_claims_never_enter_canonical_final_fields():
     verifier, _ = verifier_with(resolver)
     final = FinalBuilder().build([item], verifier.verify([item]))
     assert final["fields"] == {}
-    assert [entry["reason"] for entry in final["needs_review"]] == ["SOURCE_CONTEXT_UNAVAILABLE"]
+    assert [entry["reason"] for entry in final["needs_review"]
+            if "reason" in entry] == ["SOURCE_CONTEXT_UNAVAILABLE"]
+    # needs_review without any verified field is NOT a partial useful result.
+    assert final["status"] == "partial_success"
+    assert final["result_kind"] == "no_usable_result"
+    assert final["needs_review"][-1] == {"code": "NO_USABLE_RESULT"}
 
 
 # --- D/E/F. evidence that does not actually support the claim ----------------
@@ -800,8 +805,11 @@ def test_the_engine_no_fragment_path_needs_review_without_a_model_call():
     result = run_engine(engine)
     assert gateway.model_calls == 0
     assert result["status"] == "partial_success"
+    assert result["result_kind"] == "no_usable_result"
     assert result["fields"] == {}
-    assert [entry["reason"] for entry in result["needs_review"]] == ["SOURCE_CONTEXT_UNAVAILABLE"]
+    assert [entry["reason"] for entry in result["needs_review"]
+            if "reason" in entry] == ["SOURCE_CONTEXT_UNAVAILABLE"]
+    assert result["needs_review"][-1] == {"code": "NO_USABLE_RESULT"}
     assert swarm_states(checkpoints)[-1]["verifier_state"] == {
         "claim-0001": {"claim_id": "claim-0001", "verdict": "needs_review",
                        "reason": "SOURCE_CONTEXT_UNAVAILABLE"}}

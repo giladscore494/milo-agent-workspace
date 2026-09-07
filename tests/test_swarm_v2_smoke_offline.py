@@ -8,7 +8,12 @@ the exact Moonshot/Kimi completion and usage envelopes. No network, no
 paid call: the provider client is process-local.
 
 Proves the two mandatory smoke outcomes:
-  * one successful minimal no-tool Swarm run reaching status=completed;
+  * one minimal no-tool Swarm run driven end to end to a durable terminal
+    state. It has no tools and therefore no evidence, so the truthful
+    product outcome is partial_success / no_usable_result: this smoke is
+    infrastructure coverage (planning, logical task execution, model-call
+    accounting, checkpointing, terminal persistence), NOT a demonstration
+    of a useful product result;
   * one safely classified Commander failure with exactly one Worker
     attempt and no effective retry (a simulated Cloud Run retry is a
     no-op success, never RUN_ALREADY_CLAIMED).
@@ -188,7 +193,18 @@ def create_run(client, conversation_id, idempotency_key="smoke-000001"):
 
 # --- the two mandatory smoke outcomes ---------------------------------------
 
-def test_offline_smoke_gateway_to_completed_terminal_state(offline_stack, monkeypatch):
+def test_offline_smoke_gateway_to_terminal_state_without_usable_product_result(
+        offline_stack, monkeypatch):
+    """The full infrastructure path, ending in the TRUTHFUL product outcome.
+
+    This smoke has always proved infrastructure, not product usefulness: it
+    plans, executes logical tasks, accounts for model calls, checkpoints and
+    persists a terminal state — with no tools, no evidence and therefore no
+    verified field. Every one of those infrastructure assertions is kept
+    exactly as it was. What changed is only the claim the smoke makes about
+    the PRODUCT: a run that verified nothing is `partial_success /
+    no_usable_result`, never an empty success.
+    """
     repo, conversation_id, launcher = offline_stack
     completions = FakeKimiCompletions()
     patch_client(monkeypatch, completions)
@@ -199,8 +215,11 @@ def test_offline_smoke_gateway_to_completed_terminal_state(offline_stack, monkey
 
     assert launcher.exit_codes == [0]
     run = repo.get_run(UUID(run_id))
-    assert run["status"] == "completed"
-    assert run["output"]["status"] == "complete"
+    assert run["status"] == "partial_success"
+    assert run["output"]["status"] == "partial_success"
+    assert run["output"]["result_kind"] == "no_usable_result"
+    assert run["output"]["fields"] == {}
+    assert run["output"]["needs_review"] == [{"code": "NO_USABLE_RESULT"}]
     assert run["attempt"] == 1
     # plan + 2 tasks + replan; the verifier is skipped with no evidence.
     assert len(completions.calls) == 4
@@ -210,8 +229,9 @@ def test_offline_smoke_gateway_to_completed_terminal_state(offline_stack, monkey
 
     event_types = [e["event_type"] for e in repo.run_events if str(e["run_id"]) == run_id]
     for expected in ("run_started", "commander_plan_created", "task_started",
-                     "task_completed", "verification_completed", "run_completed"):
+                     "task_completed", "verification_completed", "run_partial_success"):
         assert expected in event_types, event_types
+    assert "run_completed" not in event_types
 
     checkpoints = [c for c in repo.checkpoints if str(c.get("run_id")) == run_id]
     assert checkpoints, "swarm run must persist checkpoints"
@@ -555,7 +575,9 @@ def test_expired_foreign_lease_is_reclaimed_with_new_attempt(monkeypatch):
     repo.runs[str(run_id)]["lease_expires_at"] = "2000-01-01T00:00:00+00:00"
     assert worker_main.execute_run(run_id, repo) == 0
     run = repo.get_run(run_id)
-    assert run["status"] == "completed"
+    # A reclaimed lease still drives the run to its own truthful terminal
+    # state; this no-tool run verifies nothing, so that is partial_success.
+    assert run["status"] == "partial_success"
     assert run["attempt"] == 2
     assert run["worker_id"] != "dead-worker"
 

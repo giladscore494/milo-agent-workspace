@@ -323,13 +323,18 @@ class SwarmV2Engine:
                 raise ValueError("completion criteria not satisfied")
 
             verdicts = self._run_verification(state, evidence, conflict_ids)
-            final = self._builder.build(evidence, verdicts)
             failures = [{"task_id": task_id,
                          "code": (result.error or {}).get("code", "TASK_FAILED")}
                         for task_id, result in sorted(execution.tasks.items())
                         if result.status != "completed"]
-            non_verified = [v for v in verdicts if v.verdict != "verified"]
-            if failures or gaps or conflict_ids or non_verified:
-                final["status"] = "partial_success"
-                final["needs_review"] = [*final["needs_review"], *failures, *gaps]
+            # ONE canonical finalization. Everything the run knows -- verified
+            # evidence, verdicts, task failures, coverage gaps and conflicts --
+            # is handed to the builder in a single call, and the payload it
+            # returns is never mutated here. The engine deliberately passes NO
+            # trusted negative result: no registered tool can yet return a
+            # typed "no match" signal, so `not_found` is unreachable and is
+            # never inferred from an empty field set (see .outcome).
+            final = self._builder.build(evidence, verdicts, task_failures=failures,
+                                        coverage_gaps=gaps,
+                                        conflict_claim_ids=sorted(conflict_ids))
             return safe_durable_value(final)
