@@ -293,19 +293,196 @@ def test_the_result_kind_vocabulary_is_statically_allowlisted():
     assert ("complete", "partial_result") not in ALLOWED_OUTCOMES
 
 
-@pytest.mark.parametrize("payload", [
-    {"status": "complete", "result_kind": "no_usable_result", "fields": {}, "needs_review": []},
-    {"status": "complete", "result_kind": "usable_result", "fields": {}, "needs_review": []},
-    {"status": "complete", "fields": {"a": [1]}, "needs_review": []},
-    {"status": "success", "result_kind": "usable_result", "fields": {"a": [1]}, "needs_review": []},
-    {"status": "complete", "result_kind": "totally_fine", "fields": {"a": [1]}, "needs_review": []},
-    {"status": "complete", "result_kind": "usable_result", "fields": {"a": [1]}},
-    {"result_kind": "usable_result", "fields": {"a": [1]}, "needs_review": []},
-    "complete",
-])
-def test_a_contradictory_or_unknown_outcome_is_refused_not_trusted(payload):
+# Every payload a correct engine could never produce. The validator must
+# refuse each one with ProductOutcomeError -- never a TypeError, KeyError or
+# any other incidental exception, because it runs AFTER the worker's engine
+# exception boundary and an incidental raise would escape execute_run and
+# leave the run with no durable terminal classification at all.
+INVALID_OUTCOMES = {
+    # contradictory status / result-kind pairs
+    "complete_no_usable": {"status": "complete", "result_kind": "no_usable_result",
+                           "fields": {}, "needs_review": []},
+    "complete_usable_without_fields": {"status": "complete", "result_kind": "usable_result",
+                                       "fields": {}, "needs_review": []},
+    "partial_result_without_fields": {"status": "partial_success",
+                                      "result_kind": "partial_result",
+                                      "fields": {}, "needs_review": []},
+    "no_usable_with_fields": {"status": "partial_success", "result_kind": "no_usable_result",
+                              "fields": {"a": [1]},
+                              "needs_review": [{"code": "NO_USABLE_RESULT"}]},
+    # unknown vocabulary
+    "unknown_status": {"status": "success", "result_kind": "usable_result",
+                       "fields": {"a": [1]}, "needs_review": []},
+    "unknown_result_kind": {"status": "complete", "result_kind": "totally_fine",
+                            "fields": {"a": [1]}, "needs_review": []},
+    # non-text / unhashable vocabulary -- these raised TypeError before R1's
+    # follow-up and escaped the worker entirely
+    "unhashable_status": {"status": [], "result_kind": "usable_result",
+                          "fields": {"a": [1]}, "needs_review": []},
+    "unhashable_result_kind": {"status": "complete", "result_kind": [],
+                               "fields": {"a": [1]}, "needs_review": []},
+    "dict_status": {"status": {"complete": True}, "result_kind": "usable_result",
+                    "fields": {"a": [1]}, "needs_review": []},
+    "none_status": {"status": None, "result_kind": "usable_result",
+                    "fields": {"a": [1]}, "needs_review": []},
+    "bool_result_kind": {"status": "complete", "result_kind": True,
+                         "fields": {"a": [1]}, "needs_review": []},
+    # missing required keys
+    "missing_result_kind": {"status": "complete", "fields": {"a": [1]}, "needs_review": []},
+    "missing_status": {"result_kind": "usable_result", "fields": {"a": [1]},
+                       "needs_review": []},
+    "missing_needs_review": {"status": "complete", "result_kind": "usable_result",
+                             "fields": {"a": [1]}},
+    "missing_fields": {"status": "complete", "result_kind": "usable_result",
+                       "needs_review": []},
+    # structurally wrong containers
+    "not_a_mapping": "complete",
+    "fields_not_a_mapping": {"status": "complete", "result_kind": "usable_result",
+                             "fields": [["a", [1]]], "needs_review": []},
+    "needs_review_not_a_list": {"status": "partial_success", "result_kind": "no_usable_result",
+                                "fields": {}, "needs_review": {"code": "NO_USABLE_RESULT"}},
+    "malformed_review_entry": {"status": "partial_success", "result_kind": "no_usable_result",
+                               "fields": {}, "needs_review": ["NO_USABLE_RESULT"]},
+    "review_entry_is_none": {"status": "partial_success", "result_kind": "partial_result",
+                             "fields": {"a": [1]}, "needs_review": [None]},
+    # `complete` carrying outstanding items
+    "complete_with_review": {"status": "complete", "result_kind": "usable_result",
+                             "fields": {"a": [1]},
+                             "needs_review": [{"task_id": "b", "code": "TASK_FAILED"}]},
+    "not_found_with_review": {"status": "complete", "result_kind": "not_found",
+                              "fields": {}, "needs_review": [{"code": "X"}]},
+    # marker defects
+    "no_usable_without_marker": {"status": "partial_success",
+                                 "result_kind": "no_usable_result",
+                                 "fields": {}, "needs_review": []},
+    "duplicate_marker": {"status": "partial_success", "result_kind": "no_usable_result",
+                         "fields": {},
+                         "needs_review": [{"code": "NO_USABLE_RESULT"},
+                                          {"code": "NO_USABLE_RESULT"}]},
+    "marker_not_last": {"status": "partial_success", "result_kind": "no_usable_result",
+                        "fields": {},
+                        "needs_review": [{"code": "NO_USABLE_RESULT"},
+                                         {"task_id": "b", "code": "TASK_FAILED"}]},
+    "marker_with_extra_keys": {"status": "partial_success", "result_kind": "no_usable_result",
+                               "fields": {},
+                               "needs_review": [{"code": "NO_USABLE_RESULT",
+                                                 "detail": "raw provider prose"}]},
+    "marker_on_partial_result": {"status": "partial_success", "result_kind": "partial_result",
+                                 "fields": {"a": [1]},
+                                 "needs_review": [{"code": "NO_USABLE_RESULT"}]},
+    "marker_on_not_found": {"status": "complete", "result_kind": "not_found", "fields": {},
+                            "needs_review": [{"code": "NO_USABLE_RESULT"}]},
+}
+
+
+@pytest.mark.parametrize("name", sorted(INVALID_OUTCOMES))
+def test_a_contradictory_or_unknown_outcome_is_refused_not_trusted(name):
     with pytest.raises(ProductOutcomeError):
-        validate_product_outcome(payload)
+        validate_product_outcome(INVALID_OUTCOMES[name])
+    with pytest.raises(ProductOutcomeError):
+        durable_run_status(INVALID_OUTCOMES[name])
+
+
+@pytest.mark.parametrize("name", sorted(INVALID_OUTCOMES))
+def test_no_incidental_exception_ever_escapes_the_validator(name):
+    """ProductOutcomeError specifically -- a bare TypeError would sail past
+    the worker's `except ProductOutcomeError` and out of execute_run."""
+    try:
+        validate_product_outcome(INVALID_OUTCOMES[name])
+    except ProductOutcomeError:
+        return
+    except BaseException as exc:  # noqa: BLE001 - the point of the test
+        raise AssertionError(f"{type(exc).__name__} leaked for {name}: {exc}") from exc
+    raise AssertionError(f"{name} was accepted")
+
+
+@pytest.mark.parametrize("payload", [
+    # A rejected claim makes a run partial WITHOUT producing a review entry:
+    # partial_result must never be required to carry one.
+    {"status": "partial_success", "result_kind": "partial_result",
+     "fields": {"answer": [{"value": 1}]}, "needs_review": []},
+    {"status": "partial_success", "result_kind": "partial_result",
+     "fields": {"answer": [{"value": 1}]},
+     "needs_review": [{"task_id": "b", "code": "TASK_FAILED"}]},
+    {"status": "complete", "result_kind": "usable_result",
+     "fields": {"answer": [{"value": 1}]}, "needs_review": []},
+    {"status": "partial_success", "result_kind": "no_usable_result",
+     "fields": {}, "needs_review": [{"code": "NO_USABLE_RESULT"}]},
+    {"status": "partial_success", "result_kind": "no_usable_result", "fields": {},
+     "needs_review": [{"task_id": "b", "code": "TASK_FAILED"},
+                      {"code": "NO_USABLE_RESULT"}]},
+    {"status": "complete", "result_kind": "not_found", "fields": {}, "needs_review": []},
+])
+def test_every_canonical_outcome_shape_still_validates(payload):
+    outcome = validate_product_outcome(payload)
+    assert (outcome.status, outcome.result_kind) in ALLOWED_OUTCOMES
+
+
+def test_every_outcome_the_finalizer_can_produce_validates():
+    """The finalizer and the validator must agree by construction."""
+    for built in (
+        FinalBuilder().build([], []),
+        FinalBuilder().build([ref("c1")], [verdict("c1", "verified")]),
+        FinalBuilder().build([ref("c1"), ref("c2", value="43")],
+                             [verdict("c1", "verified"), verdict("c2", "needs_review")]),
+        FinalBuilder().build([ref("c1"), ref("c2", value="43")],
+                             [verdict("c1", "verified"), verdict("c2", "rejected")]),
+        FinalBuilder().build([ref("c1")], [verdict("c1", "rejected")]),
+        FinalBuilder().build([ref("c1")], [verdict("c1", "verified")],
+                             task_failures=[{"task_id": "b", "code": "TASK_FAILED"}]),
+        FinalBuilder().build([], [], task_failures=[{"task_id": "b", "code": "TASK_FAILED"}]),
+        run_engine(no_evidence_engine()),
+        finalize_product_outcome(fields={}, verdict_review=[MARKER]),
+        finalize_product_outcome(fields={},
+                                 verdict_review=[MARKER, {"task_id": "b", "code": "X"}]),
+    ):
+        validate_product_outcome(built)
+
+
+def test_the_finalizer_and_the_validator_agree_over_the_whole_fact_space():
+    """Exhaustive cross-product of every fact finalize_product_outcome takes.
+
+    The validator is strict enough to reject contradictions, so the risk is
+    that it also rejects something the canonical finalizer legitimately
+    produces. Enumerating the whole input space proves it cannot: every
+    outcome the finalizer can build validates, and all four result kinds are
+    actually exercised.
+    """
+    import itertools
+
+    field_sets = [{}, {"answer": []}, {"answer": [{"value": 1}]},
+                  {"answer": [{"value": 1}], "price": []}]
+    reviews = [[], [{"field": "answer", "value": 1, "reason": "r",
+                     "provenance": {"claim_id": "c1"}}]]
+    failures = [[], [{"task_id": "b", "code": "TASK_FAILED"}]]
+    gaps = [[], [{"task_id": "b", "code": "EVIDENCE_REQUIREMENTS_UNMET"}]]
+    conflicts = [[], ["c1"]]
+    unverified = [[], ["c2"]]
+    negatives = [None, TrustedNegativeResult(code="TRUSTED_SOURCE_NO_MATCH",
+                                             source_id="s1", task_id="a")]
+
+    seen = set()
+    for combo in itertools.product(field_sets, reviews, failures, gaps,
+                                   conflicts, unverified, negatives):
+        fields, review, failed, gap, conflict, unverif, negative = combo
+        built = finalize_product_outcome(
+            fields=fields, verdict_review=review, task_failures=failed,
+            coverage_gaps=gap, conflict_claim_ids=conflict,
+            unverified_claim_ids=unverif, trusted_negative=negative)
+        outcome = validate_product_outcome(built)   # must never raise
+        assert (outcome.status, outcome.result_kind) in ALLOWED_OUTCOMES
+        assert durable_run_status(built) in {"completed", "partial_success"}
+        seen.add(outcome.result_kind)
+    assert seen == RESULT_KINDS, seen
+
+
+def test_the_marker_is_normalized_to_exactly_one_trailing_entry():
+    """_with_marker rebuilds rather than guards, so a stray or misplaced
+    marker in the input cannot survive into the output."""
+    out = finalize_product_outcome(
+        fields={}, verdict_review=[MARKER, {"task_id": "b", "code": "TASK_FAILED"}, MARKER])
+    assert out["needs_review"] == [{"task_id": "b", "code": "TASK_FAILED"}, MARKER]
+    assert out["needs_review"].count(MARKER) == 1
 
 
 def test_a_self_consistent_outcome_maps_to_its_durable_run_status():
@@ -384,12 +561,89 @@ def test_worker_refuses_to_finalize_partial_success_it_cannot_express():
     assert repo.completed is None and repo.partial is None
 
 
-def test_worker_never_leaks_the_offending_payload_when_it_refuses():
+@pytest.mark.parametrize("name", sorted(INVALID_OUTCOMES))
+def test_every_malformed_outcome_reaches_the_sanitized_durable_failure(name):
+    """No malformed Swarm V2 outcome may escape execute_run or be finalized
+    as any kind of success: each one is durably classified, once, as
+    SWARM_V2_OUTCOME_INVALID."""
     repo = SwarmWorkerRepo()
-    sentinel = "provider secret sentinel"
-    worker_result(repo, {"status": "complete", "result": {"raw": sentinel}})
-    assert sentinel not in json.dumps([str(event) for event in repo.events])
-    assert sentinel not in json.dumps(list(repo.failed[1:]))
+    # Returns the handled Swarm V2 code path -- it never raises out of
+    # execute_run, which would leave the run with no terminal state at all.
+    assert worker_result(repo, INVALID_OUTCOMES[name]) == 0
+
+    assert repo.failed is not None, name
+    assert repo.failed[1] == "SWARM_V2_OUTCOME_INVALID"
+    assert repo.completed is None and repo.partial is None
+
+    types = [event[1] for event in repo.events]
+    assert "run_completed" not in types
+    assert "run_partial_success" not in types
+    assert types[-1] == "run_failed"
+
+    # The refusal carries a static code only: no fragment of the offending
+    # payload reaches the event or the durable error.
+    failed_events = [event for event in repo.events if event[1] == "run_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0][2]["payload"] == {"code": "SWARM_V2_OUTCOME_INVALID"}
+    assert failed_events[0][2]["message"] == "Swarm V2 product outcome is invalid"
+    durable = json.dumps([str(event) for event in repo.events] + list(repo.failed[1:]))
+    for fragment in ("totally_fine", "raw provider prose", "TASK_FAILED", "success"):
+        assert fragment not in durable, (name, fragment)
+
+
+def test_a_malformed_outcome_cannot_escape_execute_run_as_a_raw_exception():
+    """The pre-fix defect: an unhashable status raised TypeError from the
+    allowlist lookup, sailed past `except ProductOutcomeError`, and left the
+    run with no durable terminal classification."""
+    repo = SwarmWorkerRepo()
+    assert worker_result(repo, {"status": [], "result_kind": "usable_result",
+                                "fields": {"a": [1]}, "needs_review": []}) == 0
+    assert repo.failed[1] == "SWARM_V2_OUTCOME_INVALID"
+    assert [event[1] for event in repo.events][-1] == "run_failed"
+
+
+def test_valid_canonical_outcomes_are_still_finalized_normally():
+    """The hardening must not have made a correct outcome refusable."""
+    usable = SwarmWorkerRepo()
+    assert worker_result(usable, FinalBuilder().build(
+        [ref("c1")], [verdict("c1", "verified")])) == 0
+    assert usable.failed is None and usable.completed is not None
+
+    empty = SwarmWorkerRepo()
+    assert worker_result(empty, FinalBuilder().build([], [])) == 0
+    assert empty.failed is None and empty.partial is not None
+
+    partial = SwarmWorkerRepo()
+    assert worker_result(partial, FinalBuilder().build(
+        [ref("c1"), ref("c2", value="43")],
+        [verdict("c1", "verified"), verdict("c2", "rejected")])) == 0
+    assert partial.failed is None and partial.partial is not None
+    assert partial.partial[1]["result_kind"] == "partial_result"
+
+
+SENTINEL = "provider secret sentinel"
+
+
+@pytest.mark.parametrize("payload", [
+    {"status": "complete", "result": {"raw": SENTINEL}},
+    {"status": SENTINEL, "result_kind": "usable_result",
+     "fields": {"a": [1]}, "needs_review": []},
+    {"status": "complete", "result_kind": SENTINEL,
+     "fields": {"a": [1]}, "needs_review": []},
+    {"status": "partial_success", "result_kind": "no_usable_result",
+     "fields": {SENTINEL: [{"value": SENTINEL}]}, "needs_review": []},
+    {"status": "partial_success", "result_kind": "no_usable_result", "fields": {},
+     "needs_review": [{"code": "NO_USABLE_RESULT", "detail": SENTINEL}]},
+    {"status": "complete", "result_kind": "usable_result", "fields": {"a": [1]},
+     "needs_review": [{"code": "TASK_FAILED", "reason": SENTINEL}]},
+])
+def test_worker_never_leaks_the_offending_payload_when_it_refuses(payload):
+    repo = SwarmWorkerRepo()
+    assert worker_result(repo, payload) == 0
+    assert repo.failed[1] == "SWARM_V2_OUTCOME_INVALID"
+    assert SENTINEL not in json.dumps([str(event) for event in repo.events])
+    assert SENTINEL not in json.dumps(list(repo.failed[1:]))
+    assert repo.completed is None and repo.partial is None
 
 
 # --- 12 / 13 / 14: V1, cancellation and terminal states are untouched --------

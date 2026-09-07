@@ -274,7 +274,7 @@ monitor() { # execution-name
       succeeded)
         echo "execution completed: task exit code 0; verifying durable semantic outcome"
         semantic_verify_run
-        echo "semantic smoke PASS: durable run reached an accepted non-failure terminal state with compatible Swarm V2 checkpoint and bounded usage"
+        echo "semantic smoke PASS: durable run is partial_success (the no-tool plan verifies no field) with compatible Swarm V2 checkpoint and bounded usage"
         return 0
         ;;
       failed:*)

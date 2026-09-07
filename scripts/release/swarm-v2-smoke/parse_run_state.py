@@ -13,16 +13,21 @@ import json
 import sys
 from decimal import Decimal, InvalidOperation
 
-# The positive smoke runs the minimal no-tool plan: it proves the
-# infrastructure path (planning, logical task execution, model-call
-# accounting, checkpointing, durable finalization), never product
-# usefulness. With no tools there is no evidence and therefore no verified
-# field, so the truthful durable terminal state is `partial_success`
-# (result_kind `no_usable_result`); a plan that does verify a field lands as
-# `completed`. Both are handled non-failure terminals and both are accepted.
-# Every other terminal state -- failed, cancelled, timed_out,
-# budget_exhausted -- and any non-terminal status still fails the smoke.
-POSITIVE_SMOKE_STATUSES = ("completed", "partial_success")
+# The positive smoke runs ONE FIXED minimal no-tool plan. It has no tools,
+# so it can acquire no evidence, so it can verify no field: its only truthful
+# successful outcome is the product outcome `partial_success` /
+# `no_usable_result`, persisted as the durable run status `partial_success`.
+#
+# This is therefore an EXACT match, not an allowlist. A durable `completed`
+# here is precisely the regression this smoke has to catch -- an empty result
+# reported as full success -- so accepting it alongside partial_success would
+# leave the gate unable to fail on the one defect it exists for. Every other
+# status, terminal (failed, cancelled, timed_out, budget_exhausted) or not,
+# fails the smoke as before.
+#
+# If a future change gives the smoke plan real tools and real evidence, that
+# change owns updating this constant deliberately, together with the plan.
+POSITIVE_SMOKE_STATUS = "partial_success"
 
 
 def _load_array(path: str) -> list[dict]:
@@ -48,9 +53,12 @@ def verify(
     run = runs[0]
     if str(run.get("id") or "") != run_id:
         problems.append("run id does not match the authorized smoke run")
-    if run.get("status") not in POSITIVE_SMOKE_STATUSES:
-        expected = " or ".join(repr(item) for item in POSITIVE_SMOKE_STATUSES)
-        problems.append(f"run status is {run.get('status')!r}, expected {expected}")
+    if run.get("status") != POSITIVE_SMOKE_STATUS:
+        problems.append(
+            f"run status is {run.get('status')!r}, expected {POSITIVE_SMOKE_STATUS!r} "
+            "(the no-tool smoke verifies no field, so a `completed` run would be "
+            "an empty result falsely reported as success)"
+        )
     if run.get("attempt") != expected_attempt:
         problems.append(
             f"run attempt is {run.get('attempt')!r}, expected {expected_attempt}"

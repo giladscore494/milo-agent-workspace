@@ -15,6 +15,7 @@ import json
 import re
 import shutil
 import subprocess
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -597,9 +598,11 @@ def test_controller_binds_cloud_run_success_to_semantic_verification():
 
 
 def _positive_run(run_id="11111111-1111-4111-8111-111111111111"):
+    # The no-tool smoke plan verifies no field, so its only truthful
+    # successful durable status is partial_success.
     return [{
         "id": run_id,
-        "status": "completed",
+        "status": "partial_success",
         "attempt": 1,
         "finished_at": "2026-08-24T16:00:00Z",
         "usage": {"model_calls": 4, "actual_cost": 0.02},
@@ -616,7 +619,7 @@ def _positive_checkpoint(run_id="11111111-1111-4111-8111-111111111111"):
     }]
 
 
-def test_semantic_positive_smoke_requires_completed_checkpoint_and_caps(tmp_path):
+def test_semantic_positive_smoke_requires_compatible_checkpoint_and_caps(tmp_path):
     run_id = "11111111-1111-4111-8111-111111111111"
     run_file = write_json(tmp_path / "run.json", _positive_run(run_id))
     checkpoint_file = write_json(
@@ -646,30 +649,98 @@ def test_semantic_positive_smoke_requires_completed_checkpoint_and_caps(tmp_path
     assert parse_run_state.main(args) == 1
 
 
-def test_semantic_positive_smoke_accepts_only_non_failure_terminal_states(tmp_path):
-    """The no-tool smoke verifies no field, so its truthful durable terminal
-    state is partial_success. That is accepted alongside completed -- and
-    nothing else is."""
-    run_id = "11111111-1111-4111-8111-111111111111"
+def _smoke_args(tmp_path, run_id):
     run_file = write_json(tmp_path / "run.json", _positive_run(run_id))
     checkpoint_file = write_json(
         tmp_path / "checkpoint.json", _positive_checkpoint(run_id)
     )
-    args = [
+    return [
         run_file, checkpoint_file,
         "--run-id", run_id,
         "--expected-attempt", "1",
         "--max-model-calls", "200",
         "--max-actual-cost", "3.00",
     ]
-    for accepted in parse_run_state.POSITIVE_SMOKE_STATUSES:
-        rows = _positive_run(run_id)
-        rows[0]["status"] = accepted
-        write_json(tmp_path / "run.json", rows)
-        assert parse_run_state.main(args) == 0, accepted
-    for rejected in ("failed", "cancelled", "timed_out", "budget_exhausted",
-                     "running", "queued", "partial", ""):
+
+
+def test_semantic_positive_smoke_requires_exactly_partial_success(tmp_path):
+    """The no-tool smoke plan verifies no field, so partial_success is its
+    ONLY truthful successful status -- an exact match, not an allowlist."""
+    run_id = "11111111-1111-4111-8111-111111111111"
+    args = _smoke_args(tmp_path, run_id)
+
+    assert parse_run_state.POSITIVE_SMOKE_STATUS == "partial_success"
+    assert parse_run_state.main(args) == 0
+
+    for rejected in ("completed", "failed", "cancelled", "timed_out",
+                     "budget_exhausted", "running", "queued", "waiting",
+                     "partial", "", None):
         rows = _positive_run(run_id)
         rows[0]["status"] = rejected
         write_json(tmp_path / "run.json", rows)
         assert parse_run_state.main(args) == 1, rejected
+
+
+def test_a_durable_completed_no_tool_run_fails_the_smoke_regression_gate(tmp_path):
+    """The R1 regression itself: an empty no-tool result durably marked
+    `completed` is exactly what this gate exists to reject. Every other
+    acceptance criterion below is satisfied, so only the status can fail it."""
+    run_id = "11111111-1111-4111-8111-111111111111"
+    args = _smoke_args(tmp_path, run_id)
+    rows = _positive_run(run_id)
+    rows[0]["status"] = "completed"
+    write_json(tmp_path / "run.json", rows)
+
+    problems, _ = parse_run_state.verify(
+        rows, _positive_checkpoint(run_id), run_id=run_id, expected_attempt=1,
+        max_model_calls=200, max_actual_cost=Decimal("3.00"))
+    assert problems, "a durable `completed` no-tool run must fail the smoke"
+    assert any("expected 'partial_success'" in item for item in problems), problems
+    assert parse_run_state.main(args) == 1
+
+
+def test_the_smoke_still_enforces_every_infrastructure_criterion(tmp_path):
+    """Narrowing the status must not have loosened anything else."""
+    run_id = "11111111-1111-4111-8111-111111111111"
+    args = _smoke_args(tmp_path, run_id)
+    assert parse_run_state.main(args) == 0
+
+    def failing(mutate_run=None, checkpoint=None):
+        rows = _positive_run(run_id)
+        if mutate_run is not None:
+            mutate_run(rows[0])
+        write_json(tmp_path / "run.json", rows)
+        write_json(tmp_path / "checkpoint.json",
+                   _positive_checkpoint(run_id) if checkpoint is None else checkpoint)
+        return parse_run_state.main(args)
+
+    assert failing(lambda row: row.update(id="22222222-2222-4222-8222-222222222222")) == 1
+    assert failing(lambda row: row.update(attempt=2)) == 1
+    assert failing(lambda row: row.update(finished_at=None)) == 1
+    assert failing(lambda row: row.update(usage={"model_calls": 201,
+                                                 "actual_cost": 0.02})) == 1
+    assert failing(lambda row: row.update(usage={"model_calls": 4,
+                                                 "actual_cost": 3.01})) == 1
+    assert failing(lambda row: row.update(usage={})) == 1
+    bad_engine = _positive_checkpoint(run_id)
+    bad_engine[0]["engine_version"] = "swarm_v2.0"
+    assert failing(checkpoint=bad_engine) == 1
+    bad_workflow = _positive_checkpoint(run_id)
+    bad_workflow[0]["workflow_key"] = "vehicle_catalog_v1"
+    assert failing(checkpoint=bad_workflow) == 1
+    bad_phase = _positive_checkpoint(run_id)
+    bad_phase[0]["phase"] = "summary"
+    assert failing(checkpoint=bad_phase) == 1
+    assert failing(checkpoint=[]) == 1
+
+
+def test_the_stage_c_policy_for_vehicle_catalog_v1_is_untouched():
+    """Narrowing the Swarm V2 no-tool smoke must not touch the generic Stage C
+    acceptance policy, which targets vehicle_catalog_v1."""
+    root = Path(__file__).resolve().parents[1] / "scripts" / "release" / "stage-c"
+    assert 'os.environ.get("STAGE_C_EXPECTED_TERMINAL_STATES", "completed")' in \
+        (root / "probe_db.py").read_text()
+    assert 'os.environ.get("STAGE_C_ACCEPTABLE_TERMINAL_STATES", "completed")' in \
+        (root / "probe_gateway.py").read_text()
+    assert 'stage_c_pin STAGE_C_ACCEPTABLE_TERMINAL_STATES "completed"' in \
+        (root / "stage-c-env.sh").read_text()

@@ -136,11 +136,17 @@ def decide_outcome(*, usable_fields: bool, has_blocking_items: bool,
 
 
 def _with_marker(review: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Append the static empty-result marker exactly once, at the end."""
-    if any(isinstance(item, Mapping) and item.get("code") == NO_USABLE_RESULT_CODE
-           for item in review):
-        return review
-    return [*review, {"code": NO_USABLE_RESULT_CODE}]
+    """Return the review list carrying exactly one static marker, last.
+
+    Idempotent by construction rather than by a guard: any marker already
+    present is dropped and one canonical marker is appended. A rebuild, a
+    resume or a re-finalization therefore always produces the same single
+    trailing marker, which is exactly the shape validate_product_outcome
+    requires -- the finalizer and the validator cannot drift apart.
+    """
+    kept = [item for item in review
+            if not (isinstance(item, Mapping) and item.get("code") == NO_USABLE_RESULT_CODE)]
+    return [*kept, {"code": NO_USABLE_RESULT_CODE}]
 
 
 def finalize_product_outcome(*, fields: Mapping[str, Any],
@@ -179,26 +185,55 @@ def validate_product_outcome(result: Any) -> ProductOutcome:
     """Validate a Swarm V2 product outcome, or refuse it.
 
     The outer worker calls this instead of inspecting dictionary truthiness:
-    a payload only maps to a durable run status when its status and result
-    kind are both allowlisted AND form one of the pairs this module can
-    actually produce. Anything else -- a missing key, an unknown vocabulary
-    entry, a status the payload's own classification contradicts -- is a
-    contract violation, never a run that quietly succeeds.
+    a payload only maps to a durable run status when it is EXACTLY a payload
+    finalize_product_outcome could have produced. Anything else -- a missing
+    key, an unknown or non-text vocabulary entry, a status that contradicts
+    the result kind, the verified fields or the review items -- is a contract
+    violation, never a run that quietly succeeds.
+
+    This function is TOTAL: every rejection is a ProductOutcomeError. It runs
+    after the engine's exception boundary in backend/worker/main.py, so an
+    incidental TypeError or KeyError here would escape execute_run and leave
+    the run with no durable terminal classification at all -- bypassing the
+    very SWARM_V2_OUTCOME_INVALID path that exists to catch this. Every value
+    is therefore type-checked before it is used as a set member, a mapping key
+    or an index.
     """
     if not isinstance(result, Mapping):
         raise ProductOutcomeError("product outcome must be a mapping")
     status, result_kind = result.get("status"), result.get("result_kind")
+    # Types first. An unhashable value (`status: []`) would raise TypeError
+    # from the allowlist lookup below rather than failing closed.
+    if not isinstance(status, str) or not isinstance(result_kind, str):
+        raise ProductOutcomeError("product outcome vocabulary must be text")
     if status not in PRODUCT_STATUSES or result_kind not in RESULT_KINDS:
         raise ProductOutcomeError("product outcome vocabulary is not allowlisted")
     if (status, result_kind) not in ALLOWED_OUTCOMES:
         raise ProductOutcomeError("product status contradicts the result kind")
-    if not isinstance(result.get("fields"), Mapping) or \
-            not isinstance(result.get("needs_review"), list):
+    fields, review = result.get("fields"), result.get("needs_review")
+    if not isinstance(fields, Mapping) or not isinstance(review, list) or \
+            any(not isinstance(item, Mapping) for item in review):
         raise ProductOutcomeError("product outcome is structurally invalid")
-    if (_usable_field_count(result["fields"]) > 0) != (result_kind in
-                                                       {"usable_result", "partial_result"}):
+    if (_usable_field_count(fields) > 0) != (result_kind in
+                                             {"usable_result", "partial_result"}):
         raise ProductOutcomeError("product result kind contradicts the verified fields")
-    return ProductOutcome(str(status), str(result_kind))
+    # `complete` is reachable only with nothing outstanding, so a complete
+    # outcome carrying review items contradicts its own status.
+    if status == "complete" and review:
+        raise ProductOutcomeError("a complete outcome cannot carry review items")
+    markers = [index for index, item in enumerate(review)
+               if item.get("code") == NO_USABLE_RESULT_CODE]
+    if result_kind == "no_usable_result":
+        # Exactly one marker, last, and byte-for-byte the static entry: no
+        # extra keys can smuggle prose in beside the code.
+        if markers != [len(review) - 1] or review[-1] != {"code": NO_USABLE_RESULT_CODE}:
+            raise ProductOutcomeError(
+                "no_usable_result requires exactly one trailing static marker")
+    elif markers:
+        raise ProductOutcomeError("the empty-result marker contradicts the result kind")
+    # `partial_result` deliberately has NO review-item requirement: a rejected
+    # claim makes a run partial without producing a review entry of its own.
+    return ProductOutcome(status, result_kind)
 
 
 def durable_run_status(result: Any) -> str:
