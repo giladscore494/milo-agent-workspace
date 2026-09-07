@@ -33,8 +33,10 @@ from pathlib import Path
 
 import pytest
 
+from backend.engines.swarm_v2.conflict_policy import CONFLICT_POLICY_VERSION
 from backend.engines.swarm_v2.evidence_contracts import (document_span_locator,
                                                          record_field_locator)
+from backend.engines.swarm_v2.support import VERIFIER_CONTRACT_VERSION
 from backend.engines.swarm_v2.fragments import fragment_content_hash
 from backend.engines.swarm_v2.normalization import (
     SCOPE_NORMALIZATION_VERSION, canonical_scope_hash, canonical_scope_key,
@@ -2989,3 +2991,324 @@ def test_r3_shape_helpers_are_service_only_and_pure(r3_db):
                   "public.r3_source_version_valid('content_sha256', null)",
                   "public.r3_source_version_valid('made_up', 'abc')"):
         assert db.psql(f"select ({probe}) is false") == "t", probe
+
+
+# --- migration 20260907000100 (R4 deterministic verification) ---
+
+@pytest.fixture
+def r4_db(db):
+    """The shared module DB with the R3 and R4 evidence migrations guaranteed
+    current, independent of earlier rerun-safety tests re-applying older
+    evidence migrations."""
+    for name in ("source_evidence_fragments", "r3_versioned_focused_evidence",
+                 "r4_deterministic_verification"):
+        db.psql(file=next(m for m in MIGRATIONS if name in m.name))
+    return db
+
+
+R4_CONTRACT = VERIFIER_CONTRACT_VERSION
+R4_SCOPE_HASH = "d" * 64
+
+
+def _r4_bundle(db, args, prefix: str, *, value=1798, identity: dict | None = None,
+               field: str = "engine_displacement_cc", locator: str = R3_LOCATOR,
+               text: str = R3_TEXT):
+    """One versioned source + one located fragment + one located claim."""
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json(prefix + '-src')}'::jsonb)")
+    fragment = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, text, key=prefix + '-frag', locator=locator)}'::jsonb)")
+    payload = json.loads(_r3_claim_json(prefix + "-claim", source, value, locator=locator,
+                                        field=field))
+    if identity is not None:
+        payload["identity_scope"] = identity
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{json.dumps(payload)}'::jsonb)")
+    return source, fragment, claim
+
+
+def _r4_verdict_json(claim_id: str, *, key: str, verdict: str = "verified",
+                     reason: str = "R4_STRUCTURED_MATCH",
+                     mode: str = "deterministic_structured",
+                     support: list[dict] | None = None) -> str:
+    return json.dumps({"claim_id": claim_id, "verdict": verdict, "reason": reason,
+                       "verification_mode": mode, "verifier_contract_version": R4_CONTRACT,
+                       "support": support or [], "evidence_key": key})
+
+
+def _r4_support(fragment_id: str, text: str = R3_TEXT, locator: str = R3_LOCATOR) -> dict:
+    return {"fragment_id": fragment_id, "content_hash": fragment_content_hash(text),
+            "locator_key": locator}
+
+
+def _r4_resolution_json(claim_ids: list[str], *, key: str, state: str = "resolved",
+                        reason: str = "R4_CONFLICT_RESOLVED_BY_DECISIVE_SOURCE",
+                        winner: str | None = None,
+                        superseded: list[str] | None = None) -> str:
+    return json.dumps({"evidence_key": key, "scope_hash": R4_SCOPE_HASH, "entity": "entity",
+                       "field": "engine_displacement_cc", "state": state, "reason": reason,
+                       "policy_version": CONFLICT_POLICY_VERSION, "claim_ids": claim_ids,
+                       "winning_claim_id": winner,
+                       "superseded_claim_ids": superseded or []})
+
+
+def test_r4_verdict_persists_with_its_support_and_replays_onto_the_same_row(r4_db):
+    db = r4_db
+    lease, _ = _evidence_fixture(db, "r4")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    _, fragment, claim = _r4_bundle(db, args, "r4a")
+
+    payload = _r4_verdict_json(claim, key="r4a-verdict", support=[_r4_support(fragment)])
+    verdict = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(
+        f"select verdict, reason, verification_mode, verifier_contract_version "
+        f"from public.claim_verdicts where id='{verdict}'"
+    ) == f"verified|R4_STRUCTURED_MATCH|deterministic_structured|{R4_CONTRACT}"
+    assert db.psql(
+        f"select fragment_id, content_hash, locator_key from public.claim_verdict_supports "
+        f"where verdict_id='{verdict}'") == f"{fragment}|{fragment_content_hash(R3_TEXT)}|{R3_LOCATOR}"
+
+    # An exact replay -- a resumed run, a re-verification after the one bounded
+    # correction round, a retried batch -- lands on the SAME row and the same
+    # single support link.
+    assert _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{payload}'::jsonb)") == verdict
+    assert db.psql(f"select count(*) from public.claim_verdicts where run_id='{run_id}'") == "1"
+    assert db.psql(f"select count(*) from public.claim_verdict_supports where run_id='{run_id}'") == "1"
+
+    # Reusing one evidence_key for a DIFFERENT decision fails closed.
+    with pytest.raises(AssertionError, match="idempotency conflict"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4a-verdict', verdict='rejected', reason='R4_VALUE_MISMATCH')}'::jsonb)")
+
+
+def test_r4_forged_cross_source_and_missing_support_links_fail_closed(r4_db):
+    db = r4_db
+    lease_a, lease_b = _evidence_fixture(db, "r4support")
+    run_a, worker_a, attempt_a, token_a, _ = lease_a
+    run_b, worker_b, attempt_b, token_b, _ = lease_b
+    args = f"'{run_a}','{worker_a}',{attempt_a},'{token_a}'"
+    args_b = f"'{run_b}','{worker_b}',{attempt_b},'{token_b}'"
+    _, fragment, claim = _r4_bundle(db, args, "r4b")
+    other_locator = record_field_locator("rec-9", ("engine_displacement_cc",)).locator_key
+    _, other_fragment, _ = _r4_bundle(db, args, "r4c", locator=other_locator,
+                                      text="model_name=Other; engine_displacement_cc=1600")
+    _, foreign_fragment, _ = _r4_bundle(db, args_b, "r4d")
+
+    # A support link naming evidence of ANOTHER source of the same run.
+    with pytest.raises(AssertionError, match="belongs to another source"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4b-cross', support=[_r4_support(other_fragment, 'model_name=Other; engine_displacement_cc=1600', other_locator)])}'::jsonb)")
+    # A support link naming evidence of another RUN entirely.
+    with pytest.raises(AssertionError, match="does not name durable evidence"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4b-foreign', support=[_r4_support(foreign_fragment)])}'::jsonb)")
+    # A completely invented fragment id.
+    with pytest.raises(AssertionError, match="does not name durable evidence"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4b-invented', support=[_r4_support('11111111-2222-4333-8444-555555555555')])}'::jsonb)")
+    # A real fragment cited with a hash or locator that is not its own.
+    forged_hash = {**_r4_support(fragment), "content_hash": "b" * 64}
+    with pytest.raises(AssertionError, match="content hash mismatch"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4b-hash', support=[forged_hash])}'::jsonb)")
+    forged_locator = {**_r4_support(fragment), "locator_key": other_locator}
+    with pytest.raises(AssertionError, match="locator mismatch"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4b-loc', support=[forged_locator])}'::jsonb)")
+    # An ACCEPTED verdict with no evidence at all.
+    with pytest.raises(AssertionError, match="must cite durable evidence"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4b-empty')}'::jsonb)")
+    # A locally settled verdict that cites evidence it never compared.
+    with pytest.raises(AssertionError, match="cites no evidence"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4b-local', verdict='needs_review', reason='unresolved conflict', mode='deterministic_local', support=[_r4_support(fragment)])}'::jsonb)")
+    # Nothing above was written.
+    assert db.psql(f"select count(*) from public.claim_verdicts where run_id='{run_a}'") == "0"
+    assert db.psql(f"select count(*) from public.claim_verdict_supports where run_id='{run_a}'") == "0"
+
+
+def test_r4_verdict_rejects_stale_leases_unknown_vocabulary_and_unsafe_payloads(r4_db):
+    db = r4_db
+    lease, other = _evidence_fixture(db, "r4guard")
+    run_id, worker, attempt, token, _ = lease
+    run_b, worker_b, attempt_b, token_b, _ = other
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    _, fragment, claim = _r4_bundle(db, args, "r4e")
+    support = [_r4_support(fragment)]
+
+    for bad in (f"'{run_id}','wrong-worker',{attempt},'{token}'",
+                f"'{run_id}','{worker}',{attempt},'wrong-token'",
+                f"'{run_id}','{worker}',{int(attempt) + 1},'{token}'"):
+        with pytest.raises(AssertionError):
+            _rpc_as_service(db, f"select public.record_claim_verdict_guarded({bad},'{_r4_verdict_json(claim, key='r4e-stale', support=support)}'::jsonb)")
+
+    # A claim of ANOTHER run can never receive a verdict from this one.
+    args_b = f"'{run_b}','{worker_b}',{attempt_b},'{token_b}'"
+    _, _, foreign_claim = _r4_bundle(db, args_b, "r4f")
+    with pytest.raises(AssertionError, match="invalid claim verdict claim"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{_r4_verdict_json(foreign_claim, key='r4e-cross')}'::jsonb)")
+
+    for payload, pattern in (
+        (_r4_verdict_json(claim, key="r4e-verdict", verdict="probably", support=support),
+         "claim_verdicts_verdict_allowlisted"),
+        (_r4_verdict_json(claim, key="r4e-mode", mode="vibes", support=support),
+         "claim_verdicts_mode_allowlisted"),
+        (json.dumps({**json.loads(_r4_verdict_json(claim, key="r4e-nokey", support=support)),
+                     "evidence_key": ""}), "evidence_key is required"),
+        (json.dumps({**json.loads(_r4_verdict_json(claim, key="r4e-secret", support=support)),
+                     "chain_of_thought": "hidden"}), "unsafe evidence payload rejected"),
+        (json.dumps({**json.loads(_r4_verdict_json(claim, key="r4e-long", support=support)),
+                     "verifier_contract_version": "x" * 200}),
+         "claim_verdicts_contract_bounded"),
+        (json.dumps({**json.loads(_r4_verdict_json(claim, key="r4e-many", support=support)),
+                     "support": [_r4_support(fragment)] * 5}),
+         "more evidence than a source can hold"),
+    ):
+        with pytest.raises(AssertionError, match=pattern):
+            _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select count(*) from public.claim_verdicts where run_id='{run_id}'") == "0"
+
+
+def test_r4_conflict_resolution_persists_supersedes_and_never_deletes_a_claim(r4_db):
+    db = r4_db
+    lease, _ = _evidence_fixture(db, "r4conflict")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    _, _, loser = _r4_bundle(db, args, "r4g", value=1798)
+    other_locator = record_field_locator("rec-2", ("engine_displacement_cc",)).locator_key
+    _, _, winner = _r4_bundle(db, args, "r4h", value=1600, locator=other_locator,
+                              text="model_name=Fixture; engine_displacement_cc=1600")
+
+    payload = _r4_resolution_json([loser, winner], key="r4-res-1", winner=winner,
+                                  superseded=[loser])
+    resolution = _rpc_as_service(db, f"select id from public.record_conflict_resolution_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(
+        f"select state, reason, policy_version, winning_claim_id "
+        f"from public.conflict_resolutions where id='{resolution}'"
+    ) == f"resolved|R4_CONFLICT_RESOLVED_BY_DECISIVE_SOURCE|{CONFLICT_POLICY_VERSION}|{winner}"
+    # The losing claim is still there, with its evidence, exactly as recorded.
+    assert db.psql(f"select count(*) from public.claims where id='{loser}'") == "1"
+    assert db.psql(
+        f"select count(*) from public.source_claim_links l join public.claims c "
+        f"on c.id = l.claim_id where c.run_id='{run_id}'") == "2"
+    # A replay returns the same decision.
+    assert _rpc_as_service(db, f"select id from public.record_conflict_resolution_guarded({args},'{payload}'::jsonb)") == resolution
+    assert db.psql(f"select count(*) from public.conflict_resolutions where run_id='{run_id}'") == "1"
+
+    for bad, pattern in (
+        (_r4_resolution_json([loser, winner], key="r4-res-1", state="unresolved",
+                             reason="R4_CONFLICT_UNRESOLVED_AMBIGUOUS"),
+         "idempotency conflict"),
+        (_r4_resolution_json([loser, winner], key="r4-res-2", winner=winner),
+         "supersedes at least one losing claim"),
+        (_r4_resolution_json([loser, winner], key="r4-res-3", winner=winner,
+                             superseded=[winner]),
+         "supersedes at least one losing claim"),
+        (_r4_resolution_json([loser], key="r4-res-4", winner=loser, superseded=[loser]),
+         "decides at least two claims"),
+        (_r4_resolution_json([loser, "11111111-2222-4333-8444-555555555555"],
+                             key="r4-res-5", winner=loser, superseded=[loser]),
+         "must decide claims of this run"),
+        (_r4_resolution_json([loser, winner], key="r4-res-6", state="settled",
+                             reason="R4_CONFLICT_RESOLVED_BY_DECISIVE_SOURCE",
+                             winner=winner, superseded=[loser]),
+         "conflict_resolutions_state_allowlisted"),
+        (_r4_resolution_json([loser, winner], key="r4-res-7", reason="because",
+                             winner=winner, superseded=[loser]),
+         "conflict_resolutions_reason_allowlisted"),
+    ):
+        with pytest.raises(AssertionError, match=pattern):
+            _rpc_as_service(db, f"select public.record_conflict_resolution_guarded({args},'{bad}'::jsonb)")
+    assert db.psql(f"select count(*) from public.conflict_resolutions where run_id='{run_id}'") == "1"
+
+
+def test_r4_identity_scope_is_closed_bounded_and_optional(r4_db):
+    db = r4_db
+    lease, _ = _evidence_fixture(db, "r4identity")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    _, _, qualified = _r4_bundle(db, args, "r4i", identity={"generation": "e210"})
+    assert db.psql(f"select identity_scope->>'generation' from public.claims where id='{qualified}'") == "e210"
+
+    # A pre-R4 claim carries no identity at all and stays perfectly valid.
+    other_locator = record_field_locator("rec-3", ("engine_displacement_cc",)).locator_key
+    _, _, legacy = _r4_bundle(db, args, "r4j", locator=other_locator,
+                              text="model_name=Legacy; engine_displacement_cc=1798")
+    assert db.psql(f"select identity_scope is null from public.claims where id='{legacy}'") == "t"
+
+    # The closed vocabulary and the value bound are enforced at the table, so a
+    # direct insert that bypasses every RPC is held to exactly the same shape.
+    source = db.psql(f"select source_id from public.claims where id='{qualified}'")
+    for identity, pattern in (('{"invented": "x"}', "claims_identity_scope_closed"),
+                              ('{"generation": 5}', "claims_identity_scope_closed"),
+                              ('{"generation": ""}', "claims_identity_scope_closed"),
+                              (json.dumps({"generation": "x" * 200}),
+                               "claims_identity_scope_closed"),
+                              ('["generation"]', "claims_identity_scope_closed")):
+        with pytest.raises(AssertionError, match=pattern):
+            db.psql(
+                f"insert into public.claims(run_id,entity_key,field_key,value,source_id,"
+                f"source_strength,confidence,agent,identity_scope) values "
+                f"('{run_id}','e','f','1'::jsonb,'{source}','strong',0.9,'agent',"
+                f"'{identity}'::jsonb)")
+    assert db.psql("select public.r4_identity_scope_valid(null) is false") == "t"
+    assert db.psql("""select public.r4_identity_scope_valid('{"generation":"e210"}'::jsonb)""") == "t"
+
+
+def test_r4_surface_stays_service_only_append_only_and_rerun_safe(r4_db):
+    db = r4_db
+    lease, _ = _evidence_fixture(db, "r4acl")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    _, fragment, claim = _r4_bundle(db, args, "r4k")
+    verdict = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4k-verdict', support=[_r4_support(fragment)])}'::jsonb)")
+
+    tables = ("claim_verdicts", "claim_verdict_supports", "conflict_resolutions")
+    for table in tables:
+        assert db.psql(f"select relrowsecurity from pg_class where relname='{table}'") == "t"
+        assert db.psql(f"select count(*) from pg_policies where tablename='{table}'") == "0"
+        for role in ("anon", "authenticated"):
+            for privilege in ("select", "insert", "update", "delete"):
+                assert db.psql(
+                    f"select has_table_privilege('{role}', 'public.{table}', '{privilege}')") == "f"
+        for privilege in ("select", "insert"):
+            assert db.psql(
+                f"select has_table_privilege('service_role', 'public.{table}', '{privilege}')") == "t"
+        for privilege in ("update", "delete"):
+            assert db.psql(
+                f"select has_table_privilege('service_role', 'public.{table}', '{privilege}')") == "f"
+    for signature in ("public.record_claim_verdict_guarded(uuid,text,integer,text,jsonb)",
+                      "public.record_conflict_resolution_guarded(uuid,text,integer,text,jsonb)",
+                      "public.r4_identity_scope_valid(jsonb)"):
+        for role in ("anon", "authenticated"):
+            assert db.psql(f"select has_function_privilege('{role}', '{signature}', 'execute')") == "f"
+        assert db.psql(f"select has_function_privilege('service_role', '{signature}', 'execute')") == "t"
+
+    # Append-only: a recorded verdict, its support and a conflict decision can
+    # never be rewritten or removed by ANY role, including the owner.
+    for statement in (f"update public.claim_verdicts set verdict='rejected' where id='{verdict}'",
+                      f"delete from public.claim_verdicts where id='{verdict}'",
+                      f"update public.claim_verdict_supports set content_hash='{'a' * 64}' where verdict_id='{verdict}'",
+                      f"delete from public.claim_verdict_supports where verdict_id='{verdict}'"):
+        with pytest.raises(AssertionError, match="append-only"):
+            db.psql(statement)
+
+    # Rerun-safe, and the re-application changes nothing that already exists.
+    migration = next(m for m in MIGRATIONS if "r4_deterministic_verification" in m.name)
+    db.psql(file=migration)
+    db.psql(file=migration)
+    assert db.psql(f"select count(*) from public.claim_verdicts where id='{verdict}'") == "1"
+    for name in ("record_claim_verdict_guarded", "record_conflict_resolution_guarded",
+                 "r4_identity_scope_valid"):
+        assert db.psql(f"select count(*) from pg_proc where proname='{name}'") == "1"
+
+
+def test_r4_legacy_evidence_stays_valid_readable_and_never_backfilled(r4_db):
+    db = r4_db
+    lease, _ = _evidence_fixture(db, "r4legacy")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    # A pre-R3 source and a pre-R3 claim: no version, no locator, no identity.
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_source_json('r4-legacy-src')}'::jsonb)")
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_claim_json('r4-legacy-claim', source, 1798)}'::jsonb)")
+    assert db.psql(
+        f"select source_version_kind is null, evidence_locator is null, identity_scope is null "
+        f"from public.claims join public.sources on sources.id = claims.source_id "
+        f"where claims.id='{claim}'") == "t|t|t"
+    # It has no verdict row, which is exactly how a legacy verdict stays
+    # readable in its checkpoint without being presented as R4-grounded.
+    assert db.psql(f"select count(*) from public.claim_verdicts where claim_id='{claim}'") == "0"
+    # And a locally settled verdict about it is still perfectly recordable.
+    verdict = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='r4-legacy-verdict', verdict='needs_review', reason='SOURCE_CONTEXT_UNAVAILABLE', mode='deterministic_local')}'::jsonb)")
+    assert db.psql(f"select verification_mode from public.claim_verdicts where id='{verdict}'") == "deterministic_local"

@@ -443,3 +443,148 @@ def test_r3_adds_no_browser_surface_and_no_production_tool():
     assert "deliberately left unwired" in worker         # and so does the acquisition sink
     mapping = Path("backend/engines/swarm_v2/evidence_mapping.py").read_text()
     assert "PRODUCTION_EVIDENCE_MAPPERS = EvidenceMapperRegistry()" in mapping
+
+
+R4_MIGRATION = Path("supabase/migrations/20260907000100_r4_deterministic_verification.sql")
+
+
+def test_r4_migration_is_additive_nullable_rerun_safe_and_never_backfills():
+    sql = R4_MIGRATION.read_text().lower()
+    # Exactly one added column, nullable, on an existing table.
+    assert sql.count("add column if not exists") == 1
+    assert "alter table public.claims add column if not exists identity_scope jsonb" in sql
+    assert " not null" not in sql.split("add column if not exists")[1].split("\n")[0]
+    # Three NEW relations, created idempotently, with idempotent indexes.
+    for table in ("claim_verdicts", "claim_verdict_supports", "conflict_resolutions"):
+        assert f"create table if not exists public.{table}" in sql
+    assert sql.count("create unique index if not exists") == 3
+    assert sql.count("create index if not exists") == 3
+    # Nothing is dropped, rewritten in bulk or backfilled. The ONE update the
+    # migration carries forward is 20260828000100's sanctioned per-row
+    # canonical-scope upgrade-on-replay, inside the replaced claim RPC.
+    for forbidden in ("update public.conflicts", "drop table", "drop column",
+                      "alter column", "delete from", "update public.sources"):
+        assert forbidden not in sql
+    assert sql.count("update public.claims") == 1
+    assert "set canonical_scope_hash = p_claim->>'canonical_scope_hash'" in sql
+    # Constraints are dropped/re-added BY NAME so a re-application converges.
+    assert sql.count("drop constraint if exists") == 1
+    assert "claims_identity_scope_closed" in sql
+
+
+def test_r4_verification_relations_are_append_only_and_service_only():
+    sql = R4_MIGRATION.read_text().lower()
+    for table in ("claim_verdicts", "claim_verdict_supports", "conflict_resolutions"):
+        assert f"alter table public.{table} enable row level security" in sql
+        assert f"create trigger {table}_append_only" in sql
+        assert f"drop trigger if exists {table}_append_only" in sql
+    assert "verification records are append-only" in sql
+    assert sql.count("before update or delete on") == 3
+    # No policy is created anywhere: browser roles get no access at all.
+    assert "create policy" not in sql
+    assert "grant select, insert on table %s to service_role" in sql
+    assert "revoke update, delete on table %s from service_role" in sql
+    for role in ("anon", "authenticated"):
+        assert f"revoke all on table %s from {role}" in sql
+
+
+def test_r4_rpcs_stay_lease_guarded_service_only_and_return_a_set():
+    sql = R4_MIGRATION.read_text().lower()
+    rpcs = ("record_claim_verdict_guarded", "record_conflict_resolution_guarded",
+            "create_claim_with_source_guarded")
+    for rpc in rpcs:
+        assert f"create or replace function public.{rpc}" in sql
+        assert f"public.{rpc}(uuid,text,integer,text,jsonb)" in sql
+    assert sql.count("perform public.assert_worker_lease") == len(rpcs)
+    assert sql.count("returns setof public.") == len(rpcs)
+    assert sql.count("set search_path = pg_catalog") == len(rpcs) + 1  # + the shape helper
+    assert "revoke execute on function %s from public" in sql
+    assert "grant execute on function %s to service_role" in sql
+    for marker in ("chain_of_thought", "provider_detail", "raw_error", "secret sentinel",
+                   "chain of thought"):
+        assert marker in sql
+
+
+def test_r4_verdict_rpc_binds_every_support_link_to_the_claims_own_evidence():
+    sql = R4_MIGRATION.read_text().lower()
+    verdict_rpc = sql.split("create or replace function public.record_claim_verdict_guarded", 1)[1]
+    verdict_rpc = verdict_rpc.split(
+        "create or replace function public.record_conflict_resolution_guarded", 1)[0]
+    # The lineage a support link must satisfy, in SQL, not only in Python.
+    assert "does not name durable evidence" in verdict_rpc
+    assert "belongs to another source" in verdict_rpc
+    assert "task provenance mismatch" in verdict_rpc
+    assert "content hash mismatch" in verdict_rpc
+    assert "locator mismatch" in verdict_rpc
+    assert "must cite durable evidence" in verdict_rpc
+    assert "cites no evidence" in verdict_rpc
+    assert "idempotency conflict" in verdict_rpc
+    # And the link is written from the DURABLE row, never from the payload.
+    assert "values (p_run_id, v_row.id, v_fragment.id, v_fragment.content_hash," in verdict_rpc
+
+
+def test_r4_conflict_rpc_never_edits_or_removes_a_claim():
+    sql = R4_MIGRATION.read_text().lower()
+    resolution_rpc = sql.split(
+        "create or replace function public.record_conflict_resolution_guarded", 1)[1]
+    assert "insert into public.conflict_resolutions" in resolution_rpc
+    for forbidden in ("update public.claims", "delete from public.claims",
+                      "update public.conflicts", "delete from public.conflicts"):
+        assert forbidden not in resolution_rpc
+    assert "must decide claims of this run" in resolution_rpc
+    assert "supersedes at least one losing claim" in resolution_rpc
+    assert "idempotency conflict" in resolution_rpc
+
+
+def test_r4_hard_limits_match_the_backend_constants_exactly():
+    """The SQL literals and the Python vocabularies are one contract."""
+    from backend.engines.swarm_v2.conflict_policy import RESOLUTION_REASONS, RESOLUTION_STATES
+    from backend.engines.swarm_v2.evidence_bounds import (IDENTITY_DIMENSIONS,
+                                                          MAX_IDENTITY_DIMENSION_CHARS,
+                                                          MAX_VERIFIER_CONTRACT_VERSION_CHARS)
+    from backend.engines.swarm_v2.fragments import MAX_FRAGMENTS_PER_SOURCE
+    from backend.engines.swarm_v2.support import (MAX_SUPPORT_LINKS_PER_VERDICT,
+                                                  VERIFICATION_MODES)
+
+    sql = R4_MIGRATION.read_text()
+    identity_fn = sql.split("public.r4_identity_scope_valid(p_identity jsonb)", 1)[1]
+    identity_fn = identity_fn.split("$$;", 1)[0]
+    # The closed vocabulary is ONE list, in SQL and in Python: the rendered
+    # `not in (...)` clause must name exactly the sorted dimensions, so adding
+    # one on either side without the other fails here.
+    clause = identity_fn.split("entry.key not in (", 1)[1].split(")", 1)[0]
+    assert [item.strip().strip("'") for item in clause.replace("\n", " ").split(",")] == \
+        sorted(IDENTITY_DIMENSIONS)
+    assert f"between 1 and {MAX_IDENTITY_DIMENSION_CHARS}" in identity_fn
+    # Strictly boolean: a NULL result would pass a CHECK constraint.
+    assert "select coalesce(" in identity_fn and "), false)" in identity_fn
+
+    verdicts = ", ".join(f"'{value}'" for value in ("verified", "needs_review", "rejected"))
+    assert f"check (verdict in ({verdicts}))" in sql
+    # The closed mode vocabulary is likewise ONE list in both places.
+    mode_clause = sql.split("check (verification_mode in (", 1)[1].split("))", 1)[0]
+    assert [item.strip().strip("'") for item in mode_clause.replace("\n", " ").split(",")] == \
+        list(VERIFICATION_MODES)
+    assert f"between 1 and {MAX_VERIFIER_CONTRACT_VERSION_CHARS}" in sql
+    # One verdict rests on fragments of ONE source, so the per-source durable
+    # fragment bound is also the bound on how much evidence it may cite.
+    assert MAX_SUPPORT_LINKS_PER_VERDICT == MAX_FRAGMENTS_PER_SOURCE
+    assert f"jsonb_array_length(v_support) > {MAX_SUPPORT_LINKS_PER_VERDICT}" in sql
+    for state in RESOLUTION_STATES:
+        assert f"'{state}'" in sql
+    for reason in RESOLUTION_REASONS:
+        assert f"'{reason}'" in sql
+
+
+def test_r4_adds_no_browser_surface():
+    """Verdict support is verifier-internal provenance, and stays internal."""
+    api = Path("backend/main.py").read_text()
+    for internal in ("identity_scope", "claim_verdicts", "claim_verdict_supports",
+                     "conflict_resolutions", "verification_mode",
+                     "verifier_contract_version"):
+        assert internal not in api
+    # The R4 column is added by the trusted board, never by the worker-facing
+    # HTTP schemas whose rows are echoed into browser-visible run events.
+    schemas = Path("backend/schemas.py").read_text()
+    for internal in ("identity_scope", "verification_mode", "verifier_contract_version"):
+        assert internal not in schemas

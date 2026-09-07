@@ -25,6 +25,7 @@ from backend.engines.swarm_v2 import (
     VerifierContractError, build_verifier_batches, parse_verifier_batch,
     plan_grounded_verification, serialize_verifier_candidates, verifier_payload_bytes,
 )
+from backend.engines.swarm_v2.support import VERIFIER_CONTRACT_VERSION
 from test_swarm_v2 import plan, task
 from test_swarm_v2_stage1_e2e import Plans, StubResolver, Worker, commander
 
@@ -111,14 +112,21 @@ def test_all_deterministic_claims_consume_zero_verifier_model_calls():
     verdicts = verifier(gateway, resolver).verify(
         [*unsupported, *conflicted], conflict_claim_ids={"claim-0002", "claim-0003"})
     assert gateway.model_calls == 0
-    # Q/R: a deterministically settled claim needs no grounding context at all.
-    assert resolver.calls == []
+    # An UNSUPPORTED claim still needs no grounding context at all. R4
+    # deliberately resolves the context of a CONTESTED one: a contradiction
+    # can only be closed by looking at what the competing sources actually
+    # record, and reading durable evidence is not a model call.
+    assert resolver.calls == [["source-0002", "source-0003"]]
     assert [(v.claim_id, v.verdict, v.reason) for v in verdicts] == [
         ("claim-0000", "rejected", "unsupported claim"),
         ("claim-0001", "rejected", "unsupported claim"),
         ("claim-0002", "needs_review", "unresolved conflict"),
         ("claim-0003", "needs_review", "unresolved conflict"),
     ]
+    # Every verdict states HOW it was reached and under which contract.
+    assert {v.mode for v in verdicts} == {"deterministic_local"}
+    assert {v.contract_version for v in verdicts} == {VERIFIER_CONTRACT_VERSION}
+    assert all(not v.support for v in verdicts)
 
 
 def test_unsupported_wins_over_conflict_so_identity_is_never_duplicated():
@@ -371,20 +379,42 @@ def test_unknown_checkpoint_claim_fails_closed():
     assert excinfo.value.reason_code == "VERIFIER_STATE_UNKNOWN_CLAIM"
 
 
-@pytest.mark.parametrize("stored,conflicts,unsupported", [
-    ({"claim_id": "claim-0000", "verdict": "verified", "reason": "ok"}, {"claim-0000"}, False),
-    ({"claim_id": "claim-0000", "verdict": "verified", "reason": "ok"}, set(), True),
-    ({"claim_id": "claim-0000", "verdict": "needs_review", "reason": "other reason"},
-     {"claim-0000"}, False),
-])
-def test_checkpoint_contradicting_a_deterministic_verdict_fails_closed(
-        stored, conflicts, unsupported):
-    items = [ref(0, supported=not unsupported, entity="shared"), ref(1, entity="shared")]
+def test_checkpoint_contradicting_a_deterministic_verdict_fails_closed():
+    """A stored verdict that contradicts a CLAIM-LOCAL deterministic one is
+    corruption: an unsupported claim is rejected whatever a checkpoint says."""
+    items = [ref(0, supported=False, entity="shared"), ref(1, entity="shared")]
     with pytest.raises(VerifierContractError) as excinfo:
-        plan_grounded_verification(items, resolver=StubResolver(),
-                                   conflict_claim_ids=conflicts,
-                                   existing_verdicts={"claim-0000": stored})
+        plan_grounded_verification(
+            items, resolver=StubResolver(), conflict_claim_ids=set(),
+            existing_verdicts={"claim-0000": {"claim_id": "claim-0000",
+                                              "verdict": "verified", "reason": "ok"}})
     assert excinfo.value.reason_code == "VERIFIER_STATE_INCOMPATIBLE_VERDICT"
+
+
+@pytest.mark.parametrize("stored", [
+    {"claim_id": "claim-0000", "verdict": "verified", "reason": "ok"},
+    {"claim_id": "claim-0000", "verdict": "needs_review", "reason": "other reason"},
+    {"claim_id": "claim-0000", "verdict": "needs_review", "reason": "unresolved conflict"},
+])
+def test_a_stored_verdict_for_a_contested_claim_is_recomputed_not_trusted(stored):
+    """R4: a verdict about a CONTESTED scope is never resumed.
+
+    The answer depends on the whole evidence set -- a decisive source acquired
+    in a later round can close the contradiction -- so a stored verdict for a
+    claim inside a contradicting scope is discarded and recomputed rather than
+    believed. Dropping is strictly safer than the pre-R4 fail-closed: a stale
+    `verified` can never be carried into a decision it no longer supports, and
+    recomputing a conflict verdict costs no model call.
+    """
+    items = [ref(0, entity="shared"), ref(1, entity="shared")]
+    plan = plan_grounded_verification(items, resolver=StubResolver(),
+                                      conflict_claim_ids={"claim-0000", "claim-0001"},
+                                      existing_verdicts={"claim-0000": stored})
+    assert plan.batches == ()
+    assert [(v.claim_id, v.verdict, v.reason, v.mode) for v in plan.settled] == [
+        ("claim-0000", "needs_review", "unresolved conflict", "deterministic_local"),
+        ("claim-0001", "needs_review", "unresolved conflict", "deterministic_local"),
+    ]
 
 
 # --- Q/V. resume at the Verifier boundary ------------------------------------
@@ -396,11 +426,14 @@ def test_resume_skips_checkpointed_claims_and_matches_an_uninterrupted_run():
     assert uninterrupted_gateway.model_calls == 3
 
     first_batch = build_verifier_batches(grounded(items))[0]
-    # Exactly what a completed grounded batch made durable: the reason is
-    # backend-owned, so a resumed verdict is byte-identical to a fresh one.
-    checkpoint = {item.claim_id: {"claim_id": item.claim_id, "verdict": "verified",
-                                  "reason": GROUNDED_VERDICT_REASONS["verified"]}
+    # Exactly what a completed grounded batch made durable: the reason, the
+    # mode, the contract version and the support links are all backend-owned,
+    # so a resumed verdict is byte-identical to a fresh one.
+    by_claim = {verdict.claim_id: verdict for verdict in expected}
+    checkpoint = {item.claim_id: by_claim[item.claim_id].model_dump(mode="json")
                   for item in first_batch}
+    assert all(entry["mode"] == "grounded_model" and entry["support"]
+               for entry in checkpoint.values())
     resumed_gateway = RecordingGateway()
     resumed = verifier(resumed_gateway).verify(items, existing_verdicts=checkpoint)
     assert resumed_gateway.model_calls == 2

@@ -40,6 +40,9 @@ from uuid import UUID
 
 from backend.schemas import ClaimCreate, ConflictCreate, SourceCreate, ToolUsageCreate
 
+from .comparison import ScopeIdentity, normalize_identity, scope_identity
+from .conflict_policy import ConflictResolution
+from .contracts import VerificationVerdict
 from .evidence_contracts import (FRAGMENT_TYPES, MAX_LOCATOR_KEY_CHARS, EvidenceBundle,
                                  FocusedEvidenceFragment, SourceVersion,
                                  StructuredEvidenceFact, VersionedEvidenceSource,
@@ -47,8 +50,9 @@ from .evidence_contracts import (FRAGMENT_TYPES, MAX_LOCATOR_KEY_CHARS, Evidence
 from .evidence_mapping import AcquiredEvidence
 from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENTS_PER_SOURCE, extract_source_fragments,
                         fragment_content_hash, normalize_fragment_text)
-from .normalization import (SCOPE_NORMALIZATION_VERSION, CanonicalScope, canonical_scope_hash,
+from .normalization import (SCOPE_NORMALIZATION_VERSION, canonical_scope_hash,
                             canonical_scope_key, canonical_value_key)
+from .support import MAX_VERIFIER_CONTRACT_VERSION_CHARS
 
 
 class EvidenceValidationError(ValueError):
@@ -146,7 +150,13 @@ def _key(kind: str, payload: Mapping[str, Any]) -> str:
 # present it changes identity on purpose: evidence read from a different
 # source version, or from a different record/field, is different evidence and
 # must never be deduplicated onto an existing row.
-_R3_IDENTITY_KEYS = ("source_version_kind", "source_version_id", "evidence_locator")
+# R4 adds one more: the closed identity dimensions a structured fact stated.
+# It follows exactly the same rule -- absent means "dropped from the identity
+# payload", so a claim written before R4 replays to the evidence_key it
+# already has, while a fact that names a generation, an engine or an official
+# code is genuinely different evidence and can never merge onto it.
+_R3_IDENTITY_KEYS = ("source_version_kind", "source_version_id", "evidence_locator",
+                     "identity_scope")
 
 
 def _identity(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -306,8 +316,18 @@ class EvidenceBoard:
             locator_key=fragment.locator.locator_key)
 
     def record_claim(self, claim: ClaimCreate, *, task_key: str,
-                     evidence_locator: str | None = None) -> dict[str, Any]:
+                     evidence_locator: str | None = None,
+                     identity: Mapping[str, str] | None = None) -> dict[str, Any]:
         payload = safe_durable_value(claim.model_dump(mode="json"))
+        # R4 `identity`: the closed identity dimensions the record stated.  Like
+        # `evidence_locator` it is an INTERNAL durable column added by this
+        # trusted board -- never a ClaimCreate field, so it never reaches a
+        # browser-visible run event -- and it participates in identity, because
+        # the same value stated for a different generation, engine,
+        # transmission or official code is a different fact.  Absent (the pre-R4
+        # default) drops the key entirely and replays to the existing row.
+        payload["identity_scope"] = (None if not identity else
+                                     dict(normalize_identity(identity)))
         # `evidence_locator` is the exact record/field or document span the
         # fact was read from.  It is an INTERNAL durable column (never a
         # ClaimCreate field, so it never reaches a browser-visible run event)
@@ -396,17 +416,23 @@ class EvidenceBoard:
                             source_strength=descriptor.source_strength,
                             confidence=descriptor.confidence, agent=descriptor.agent)
         return self.record_claim(claim, task_key=task_key,
-                                 evidence_locator=fact.locator.locator_key)
+                                 evidence_locator=fact.locator.locator_key,
+                                 identity=dict(fact.identity))
 
     def detect_and_record_conflicts(self, *, task_key: str,
                                     rationale: str = "Contradictory values in the same evidence scope.") -> list[dict[str, Any]]:
         rationale = self._rationale(rationale)
-        groups: dict[CanonicalScope, list[dict[str, Any]]] = {}
+        # R4: grouped on the COMPLETE identity -- the canonical scope plus the
+        # closed identity dimensions -- through the one shared contract the
+        # engine and the verifier also use.  A pre-R4 claim states no identity
+        # dimension, so its grouping is byte-identical to what it was.
+        groups: dict[ScopeIdentity, list[dict[str, Any]]] = {}
         for claim in self._claims.values():
-            scope = canonical_scope_key(entity=claim["entity_key"], field=claim["field_key"],
-                                        geography=claim.get("geography"), market=claim.get("market"),
-                                        time_scope=claim.get("time_scope") or {})
-            groups.setdefault(scope, []).append(claim)
+            identity = scope_identity(entity=claim["entity_key"], field=claim["field_key"],
+                                      geography=claim.get("geography"), market=claim.get("market"),
+                                      time_scope=claim.get("time_scope") or {},
+                                      identity=claim.get("identity_scope") or {})
+            groups.setdefault(identity, []).append(claim)
         recorded = []
         for claims in groups.values():
             values = {canonical_value_key(item.get("value")) for item in claims}
@@ -424,6 +450,56 @@ class EvidenceBoard:
             self._conflicts[str(row["id"])] = dict(row)
             recorded.append(row)
         return recorded
+
+    def record_verification_verdict(self, verdict: VerificationVerdict) -> dict[str, Any]:
+        """R4: persist ONE verdict together with the evidence it rests on.
+
+        The durable row records the decision, the verification MODE that
+        produced it, the bounded verifier CONTRACT VERSION it was decided
+        under, and the exact durable fragments that supported it -- ids and
+        content hashes, never text.  There is no field a prompt, a provider
+        payload, a chain of thought or an unbounded explanation could occupy:
+        the reason is a bounded backend-owned code and the support is a list
+        of identifiers.
+
+        Identity is the verdict's own content, so replay is idempotent: a
+        resumed run, a re-verification after a correction round and a retried
+        batch all land on the SAME row instead of appending a second one.  The
+        guarded RPC additionally validates every support link against the
+        claim's own source, run, task and source version, so a forged or
+        cross-source link fails closed at the durable boundary too.
+        """
+        if not isinstance(verdict, VerificationVerdict):
+            raise EvidenceValidationError("a validated verification verdict is required")
+        if verdict.mode is None or verdict.contract_version is None:
+            raise EvidenceValidationError("a durable verdict must state its mode and contract")
+        if len(verdict.contract_version) > MAX_VERIFIER_CONTRACT_VERSION_CHARS:
+            raise EvidenceValidationError("verifier contract version exceeds the durable bound")
+        support = [{"content_hash": link.content_hash, "fragment_id": link.fragment_id,
+                    "locator_key": link.locator} for link in verdict.support]
+        payload = safe_durable_value({
+            "claim_id": str(verdict.claim_id), "verdict": verdict.verdict,
+            "reason": verdict.reason, "verification_mode": verdict.mode,
+            "verifier_contract_version": verdict.contract_version, "support": support})
+        payload["evidence_key"] = _key("verdict", payload)
+        return self._repository.record_claim_verdict(self.lease.run_id, payload,
+                                                     **self._lease_kwargs)
+
+    def record_conflict_resolution(self, resolution: ConflictResolution) -> dict[str, Any]:
+        """R4: persist ONE typed conflict decision, append-only.
+
+        A resolution is a decision ABOUT claims and never an edit OF them: the
+        losing claim keeps its row, its evidence and its place in history, and
+        this record is what states that a field-authoritative source settled
+        the scope against it.  Identity is the decision's own content, so a
+        replayed decision returns the same durable row.
+        """
+        if not isinstance(resolution, ConflictResolution):
+            raise EvidenceValidationError("a validated conflict resolution is required")
+        payload = safe_durable_value(resolution.model_dump(mode="json"))
+        payload["evidence_key"] = _key("resolution", payload)
+        return self._repository.record_conflict_resolution(self.lease.run_id, payload,
+                                                           **self._lease_kwargs)
 
     def persist_trace_summary(self, *, goal: str = "") -> dict[str, Any]:
         """Write a compact, fully traceable view to the existing run blackboard."""
@@ -445,9 +521,10 @@ class EvidenceBoard:
 
         R3 adds three provenance fields the grounding layer previously had no
         way to see: the claim's own unit, the exact locator the fact was read
-        from, and the version of the source it was read at.  All three are
-        optional, so a reference rebuilt from a pre-R3 claim is byte-identical
-        to what this returned before.
+        from, and the version of the source it was read at.  R4 adds a fourth,
+        the closed identity dimensions the record stated.  All four are
+        optional, so a reference rebuilt from a pre-R3 claim carries an empty
+        identity and behaves exactly as it did before.
         """
         return [{"claim_id": str(row["id"]), "source_id": str(row["source_id"]),
                  "run_id": str(self.lease.run_id), "task_id": row["task_key"],
@@ -455,6 +532,7 @@ class EvidenceBoard:
                  "geography": row.get("geography"), "market": row.get("market"),
                  "time_scope": row.get("time_scope") or {}, "value": row.get("value"),
                  "unit": row.get("unit"), "locator": row.get("evidence_locator"),
+                 "identity": dict(row.get("identity_scope") or {}),
                  "source_version": self._source_version(row.get("source_id")),
                  "confidence": row["confidence"], "supported": True}
                 for row in self._claims.values()]

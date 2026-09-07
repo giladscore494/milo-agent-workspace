@@ -31,10 +31,12 @@ from backend.engines.swarm_v2 import (
     plan_grounded_verification, serialize_verifier_candidates, verifier_evidence_chars,
     verifier_payload_bytes,
 )
+from backend.engines.swarm_v2.evidence_contracts import record_field_locator
 from backend.engines.swarm_v2.fragments import (MAX_FRAGMENT_CHARS,
                                                 MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE,
                                                 MAX_FRAGMENTS_PER_SOURCE,
                                                 fragment_content_hash)
+from backend.engines.swarm_v2.support import VERIFIER_CONTRACT_VERSION
 from backend.engines.swarm_v2.verifier import MISSING_CONTEXT_VERDICT, VerifierResponseVerdict
 from backend.repository.supabase import SupabaseRepository
 from test_swarm_v2 import plan, task
@@ -67,6 +69,8 @@ def ref(claim_id: str = "claim-0001", *, source_id: str = "source-0001",
 
 def source_row(source_id: str = "source-0001", *, run_id: str = RUN_ID,
                task_key: str = TASK, **overrides) -> dict:
+    # `source_version_kind`/`source_version_id` stay absent unless a fixture
+    # asks for them, so a pre-R3 source keeps resolving exactly as before.
     """A row shaped exactly like SupabaseRepository.SOURCE_CONTEXT_COLUMNS."""
     return {"id": source_id, "run_id": run_id, "task_key": task_key,
             "url": f"https://example.test/{source_id}", "title": "Specification sheet",
@@ -84,19 +88,56 @@ def fragment_row(source_id: str, text: str, *, index: int = 0, run_id: str = RUN
             "fragment_index": index, "created_at": "2026-08-28T00:00:00Z"}
 
 
+def fact_row(source_id: str, *, claim_id: str | None = None, run_id: str = RUN_ID,
+             task_key: str = TASK, entity: str = "vehicle:corolla",
+             field: str = "engine_displacement_cc", value: object = 1798,
+             unit: str | None = "cc", geography: str | None = "Israel",
+             market: str | None = "IL", time_scope: dict | None = None,
+             identity: dict | None = None, locator: str | None = None) -> dict:
+    """A row shaped exactly like SupabaseRepository.STRUCTURED_FACT_COLUMNS.
+
+    A structured source fact is a durable CLAIM that carries an R3 evidence
+    locator -- one a trusted mapper read out of an exact location in a
+    versioned source. The locator defaults to a canonical record/field one, so
+    a fixture never hand-writes locator JSON.
+    """
+    return {"id": claim_id or f"fact-{source_id}-{field}", "run_id": run_id,
+            "source_id": source_id, "task_key": task_key, "entity_key": entity,
+            "field_key": field, "value": value, "unit": unit,
+            "time_scope": {"year": 2020} if time_scope is None else time_scope,
+            "geography": geography, "market": market,
+            "evidence_locator": locator or record_field_locator(source_id, (field,)).locator_key,
+            "identity_scope": identity}
+
+
 class DurableRepository:
-    """A faithful stand-in for the two bounded internal reads B5 may use.
+    """A faithful stand-in for the three bounded internal reads the verifier
+    may use.
 
     It exposes NOTHING else: a resolver built on it cannot reach another
     table, a URL, a tool or a provider even by accident.
     """
 
-    def __init__(self, sources=(), fragments=(), *, enforce_run_scope: bool = True):
+    def __init__(self, sources=(), fragments=(), facts=(), *,
+                 enforce_run_scope: bool = True):
         self.sources, self.fragments = list(sources), list(fragments)
+        self.facts = list(facts)
         self.source_reads: list[list[str]] = []
         self.fragment_reads: list[list[str]] = []
+        self.fact_reads: list[list[str]] = []
         self.fragment_limits: list[int] = []
+        self.fact_limits: list[int] = []
         self._enforce_run_scope = enforce_run_scope
+
+    def list_structured_facts_for_sources(self, run_id, source_ids, *, limit=200):
+        wanted = sorted({str(item) for item in source_ids})
+        self.fact_reads.append(wanted)
+        self.fact_limits.append(limit)
+        rows = [row for row in self.facts if str(row["source_id"]) in wanted and
+                (not self._enforce_run_scope or str(row["run_id"]) == str(run_id))
+                and row.get("evidence_locator") is not None]
+        rows.sort(key=lambda row: (str(row["source_id"]), str(row["id"])))
+        return rows[:limit]
 
     def list_sources_for_ids(self, run_id, source_ids, *, limit=50):
         wanted = sorted({str(item) for item in source_ids})
@@ -116,8 +157,8 @@ class DurableRepository:
         return rows[:limit]
 
 
-def resolver_for(sources=(), fragments=(), **kwargs) -> RepositoryEvidenceResolver:
-    repository = DurableRepository(sources, fragments, **kwargs)
+def resolver_for(sources=(), fragments=(), facts=(), **kwargs) -> RepositoryEvidenceResolver:
+    repository = DurableRepository(sources, fragments, facts, **kwargs)
     resolver = RepositoryEvidenceResolver(repository, run_id=RUN_ID)
     resolver.repository = repository  # test-only handle on the read log
     return resolver
@@ -211,6 +252,23 @@ def verifier_with(resolver, gateway=None) -> tuple[Verifier, GroundingJudgeGatew
     return Verifier(gateway=gateway, model="fake", resolver=resolver), gateway
 
 
+def durable(claim_id: str, verdict: str, reason: str, *, mode: str,
+            support: list[dict] | None = None) -> dict:
+    """The EXACT durable shape of one R4 verdict in verifier_state.
+
+    R4 stores the decision together with the provenance that makes it
+    auditable: the verification MODE, the bounded verifier CONTRACT VERSION
+    and the durable support links it rests on. A helper rather than a literal
+    per assertion, so the shape is pinned in exactly one place.
+    """
+    return {"claim_id": claim_id, "verdict": verdict, "reason": reason, "mode": mode,
+            "contract_version": VERIFIER_CONTRACT_VERSION, "support": support or []}
+
+
+def support_of(state: dict, claim_id: str = "claim-0001") -> list[dict]:
+    return state["verifier_state"][claim_id]["support"]
+
+
 def candidates_for(resolver, items) -> list[GroundedCandidate]:
     """Join references to their resolved context, exactly as prepare does."""
     contexts = resolver.resolve(list(items))
@@ -230,11 +288,18 @@ def test_matching_durable_evidence_verifies_the_claim_with_a_real_hash():
     document = gateway.documents[0]
     assert document["sources"][0]["fragments"][0]["content_hash"] == \
         fragment_content_hash(MATCHING)
-    # K: the verdict that leaves the Verifier carries no hash, and its reason
-    # is the backend's own -- nothing the model wrote survives this boundary.
-    assert verdicts[0].model_dump(mode="json") == {
-        "claim_id": "claim-0001", "verdict": "verified",
-        "reason": GROUNDED_VERDICT_REASONS["verified"]}
+    # K/R4: the reason is the backend's own -- nothing the model WROTE
+    # survives this boundary -- and the evidence it cited is now KEPT, as a
+    # link to the durable row rather than as a copy of its text.
+    payload = verdicts[0].model_dump(mode="json")
+    assert payload["reason"] == GROUNDED_VERDICT_REASONS["verified"]
+    assert payload["mode"] == "grounded_model"
+    assert payload["contract_version"] == VERIFIER_CONTRACT_VERSION
+    assert [link["content_hash"] for link in payload["support"]] == \
+        [fragment_content_hash(MATCHING)]
+    assert all(set(link) == {"source_id", "content_hash", "fragment_id", "locator"}
+               and link["source_id"] == "source-0001" for link in payload["support"])
+    assert verdicts[0].is_r4_grounded
 
 
 def test_the_exact_structured_claim_facts_are_visible_in_the_request():
@@ -617,13 +682,21 @@ def test_an_unsupported_claim_is_rejected_without_grounding_or_a_model_call():
 
 
 def test_an_unresolved_conflict_stays_needs_review_without_grounded_verification():
-    resolver = resolver_for([], [])
+    # R4 reads the contradicting claims' durable context -- a contradiction can
+    # only be closed by looking at what the competing sources record -- but a
+    # source with no structured fact and no fragment settles nothing, so the
+    # conflict stays open and still costs no model call.
+    resolver = resolver_for([source_row("source-0001"), source_row("source-0002")], [])
     verifier, gateway = verifier_with(resolver)
-    items = [ref("claim-0001"), ref("claim-0002", source_id="source-0002")]
+    items = [ref("claim-0001", value=1798),
+             ref("claim-0002", source_id="source-0002", value=1600)]
     verdicts = verifier.verify(items, conflict_claim_ids={"claim-0001", "claim-0002"})
     assert {(v.verdict, v.reason) for v in verdicts} == {("needs_review", "unresolved conflict")}
+    assert {v.mode for v in verdicts} == {"deterministic_local"}
     assert gateway.model_calls == 0
-    assert resolver.repository.source_reads == []
+    # R4 DOES read the contested sources once -- reading durable evidence is
+    # how a contradiction is decided -- but never twice, and never a model call.
+    assert resolver.repository.source_reads == [["source-0001", "source-0002"]]
 
 
 # --- S/T/U/V. the grounded payload is what the bounds measure ----------------
@@ -791,9 +864,11 @@ def test_the_full_grounded_engine_path_reaches_a_canonical_verified_field():
     assert result["status"] == "complete"
     final_state = swarm_states(checkpoints)[-1]
     assert final_state["verifier_state"] == {
-        "claim-0001": {"claim_id": "claim-0001", "verdict": "verified",
-                       "reason": GROUNDED_VERDICT_REASONS["verified"]}}
+        "claim-0001": durable("claim-0001", "verified", GROUNDED_VERDICT_REASONS["verified"],
+                              mode="grounded_model", support=support_of(final_state))}
+    assert [link["source_id"] for link in support_of(final_state)] == ["source-0001"]
     assert final_state["verifier_grounding_version"] == VERIFIER_GROUNDING_VERSION
+    assert final_state["verifier_contract_version"] == VERIFIER_CONTRACT_VERSION
 
 
 def test_the_engine_no_fragment_path_needs_review_without_a_model_call():
@@ -811,10 +886,11 @@ def test_the_engine_no_fragment_path_needs_review_without_a_model_call():
             if "reason" in entry] == ["SOURCE_CONTEXT_UNAVAILABLE"]
     assert result["needs_review"][-1] == {"code": "NO_USABLE_RESULT"}
     assert swarm_states(checkpoints)[-1]["verifier_state"] == {
-        "claim-0001": {"claim_id": "claim-0001", "verdict": "needs_review",
-                       "reason": "SOURCE_CONTEXT_UNAVAILABLE"}}
+        "claim-0001": durable("claim-0001", "needs_review", "SOURCE_CONTEXT_UNAVAILABLE",
+                              mode="deterministic_local")}
     resolved = [payload for kind, payload in events if kind == "grounding_context_resolved"]
-    assert resolved == [{"claim_count": 0, "source_count": 0, "missing_context_count": 1}]
+    assert resolved == [{"claim_count": 0, "source_count": 0, "missing_context_count": 1,
+                         "structured_count": 0}]
 
 
 # --- Y/Z/AD. grounded checkpointing and version-1 resume ---------------------
@@ -838,8 +914,14 @@ def test_each_grounded_batch_checkpoints_only_verdicts_usage_and_progress():
         {"model_calls": 1}, {"model_calls": 2}, {"model_calls": 2}]
     for state in verification:
         assert state["verifier_grounding_version"] == VERIFIER_GROUNDING_VERSION
+        assert state["verifier_contract_version"] == VERIFIER_CONTRACT_VERSION
         for verdict in state["verifier_state"].values():
-            assert set(verdict) == {"claim_id", "verdict", "reason"}
+            # R4 adds exactly three provenance keys, and nothing else: a mode,
+            # a bounded contract version and durable support links.
+            assert set(verdict) == {"claim_id", "verdict", "reason", "mode",
+                                    "contract_version", "support"}
+            for link in verdict["support"]:
+                assert set(link) == {"source_id", "content_hash", "fragment_id", "locator"}
     progress = [payload for kind, payload in events if kind == "verification_batch_completed"]
     assert progress == [{"batch_index": 1, "batch_count": 2, "claim_count": 25},
                         {"batch_index": 2, "batch_count": 2, "claim_count": 5}]
@@ -915,8 +997,8 @@ def test_a_legacy_verified_verdict_with_no_evidence_becomes_needs_review():
     assert gateway.model_calls == 0
     assert result["fields"] == {}  # the legacy `verified` never became canonical
     assert swarm_states(checkpoints)[-1]["verifier_state"] == {
-        "claim-0001": {"claim_id": "claim-0001", "verdict": "needs_review",
-                       "reason": "SOURCE_CONTEXT_UNAVAILABLE"}}
+        "claim-0001": durable("claim-0001", "needs_review", "SOURCE_CONTEXT_UNAVAILABLE",
+                              mode="deterministic_local")}
 
 
 def test_legacy_re_grounding_never_rewinds_restored_usage():
@@ -966,7 +1048,14 @@ def test_no_fragment_text_reaches_events_checkpoints_or_the_final_output():
     assert SENTINEL not in json.dumps(checkpoints)  # never durable state
     assert SENTINEL not in json.dumps(events)       # never a run event
     assert SENTINEL not in json.dumps(result)       # never final/frontend output
-    assert "content_hash" not in json.dumps(checkpoints)
+    # R4 KEEPS the hash the verdict rests on -- that is the durable support
+    # link -- but only in the service-only checkpoint. It is internal support
+    # metadata: it never reaches a run event or the browser-facing output.
+    assert "content_hash" in json.dumps(checkpoints)
+    assert "content_hash" not in json.dumps(events)
+    assert "content_hash" not in json.dumps(result)
+    assert fragment_content_hash(engine_fragment(1, suffix=f" {SENTINEL}")["fragment_text"]) \
+        not in json.dumps(result)
 
 
 def test_no_fragment_text_reaches_a_safe_grounding_failure():
@@ -1191,9 +1280,10 @@ def test_a_model_authored_reason_never_becomes_a_durable_verdict():
     # The verdict itself is accepted: the decision and its evidence were valid.
     assert result["fields"]["answer"][0]["value"] == 1798
     # But the prose is gone, and the durable reason is the backend's own.
-    assert swarm_states(checkpoints)[-1]["verifier_state"] == {
-        "claim-0001": {"claim_id": "claim-0001", "verdict": "verified",
-                       "reason": GROUNDED_VERDICT_REASONS["verified"]}}
+    final_state = swarm_states(checkpoints)[-1]
+    assert final_state["verifier_state"] == {
+        "claim-0001": durable("claim-0001", "verified", GROUNDED_VERDICT_REASONS["verified"],
+                              mode="grounded_model", support=support_of(final_state))}
     assert SENTINEL in gateway.payloads[0]           # supplied as untrusted data
     assert SENTINEL not in json.dumps(checkpoints)   # never durable state
     assert SENTINEL not in json.dumps(events)        # never a run event
@@ -1244,11 +1334,16 @@ def test_every_reason_that_can_reach_final_output_is_backend_owned():
         [engine_fragment(1), engine_fragment(2), engine_fragment(5)])
     verifier, _ = verifier_with(resolver, GroundingJudgeGateway(responder))
     # claim-0001 answered, claim-0005 omitted from the same batch, claim-0002
-    # conflicted, claim-0003 without evidence, claim-0004 unsupported.
+    # and claim-0006 contradicting each other, claim-0003 without evidence,
+    # claim-0004 unsupported. R4 groups a contradiction rather than trusting a
+    # bare list of ids: one claim on its own is not a contradiction, so the
+    # conflict branch needs two claims stating different values in one scope.
+    contested = ref("claim-0006", source_id="source-0002", entity="vehicle-0002",
+                    field="answer", value=1600, geography="IL")
     verdicts = verifier.verify(
         [engine_ref(1), engine_ref(2), engine_ref(3), engine_ref(4, supported=False),
-         engine_ref(5)],
-        conflict_claim_ids={"claim-0002"})
+         engine_ref(5), contested],
+        conflict_claim_ids={"claim-0002", "claim-0006"})
     assert {v.reason for v in verdicts} <= allowed
     # every deterministic branch is exercised, plus one omitted claim
     assert {v.reason for v in verdicts} == {

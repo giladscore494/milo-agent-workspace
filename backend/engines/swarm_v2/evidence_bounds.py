@@ -30,6 +30,21 @@ MAX_TIME_SCOPE_KEYS = 8
 MAX_PROJECTION_FIELDS = 8
 MAX_LOCATOR_SCOPE_IDS = 8
 MAX_UNIT_CHARS = 32
+# R4: the closed set of identity dimensions a structured fact may qualify
+# itself with, and the bounds of one entry.  These exist because "make +
+# commercial model + an overlapping year" does NOT identify a variant: a
+# generation change, a different engine or transmission, a different market or
+# a different official/model code are all DIFFERENT things, and comparing a
+# claim against a fact that differs on any of them is comparing two vehicles.
+# The vocabulary is closed and server-owned: a mapper may state a dimension it
+# read, never invent one.
+IDENTITY_DIMENSIONS = ("body_style", "drivetrain", "engine", "generation", "model_code",
+                       "transmission", "trim")
+MAX_IDENTITY_DIMENSION_CHARS = 120
+# R4: the bounded identifier of the verification contract a durable verdict
+# was decided under, and the bound on ONE verdict's support-link list.
+MAX_VERIFIER_CONTRACT_VERSION_CHARS = 120
+MAX_VERDICT_REASON_CODE_CHARS = 64
 # A tool result is already bounded by the registry's output bound; this is the
 # independent ceiling for the snapshot a content version may be computed over.
 MAX_TOOL_SNAPSHOT_JSON_BYTES = 32_768
@@ -64,7 +79,9 @@ LOCATOR_RECORD_ID_PATTERN = r"^[A-Za-z0-9_][A-Za-z0-9_.:@-]{0,127}$"
 FRAGMENT_TYPE_BY_LOCATOR_KIND = {"document_span": "verbatim_excerpt",
                                  "record_field": "structured_projection"}
 
-__all__ = ["FRAGMENT_TYPES", "FRAGMENT_TYPE_BY_LOCATOR_KIND", "LOCATOR_KINDS",
+__all__ = ["FRAGMENT_TYPES", "FRAGMENT_TYPE_BY_LOCATOR_KIND", "IDENTITY_DIMENSIONS",
+           "LOCATOR_KINDS", "MAX_IDENTITY_DIMENSION_CHARS",
+           "MAX_VERDICT_REASON_CODE_CHARS", "MAX_VERIFIER_CONTRACT_VERSION_CHARS",
            "LOCATOR_RECORD_ID_PATTERN", "LOCATOR_SEGMENT_PATTERN", "MAX_DOCUMENT_OFFSET",
            "MAX_FACTS_PER_BUNDLE", "MAX_FACT_COLLECTION_ITEMS", "MAX_FACT_VALUE_DEPTH",
            "MAX_FACT_VALUE_JSON_BYTES", "MAX_LOCATOR_KEY_CHARS",

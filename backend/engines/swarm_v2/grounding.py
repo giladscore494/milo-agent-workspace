@@ -51,8 +51,9 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 from uuid import UUID
 
+from .comparison import StructuredSourceFact
 from .contracts import EvidenceReference
-from .evidence_bounds import FRAGMENT_TYPES
+from .evidence_bounds import FRAGMENT_TYPES, MAX_FACTS_PER_BUNDLE
 from .evidence_contracts import (EvidenceContractError, fragment_type_for, parse_locator_key,
                                  parse_version_key)
 from .fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE,
@@ -87,6 +88,14 @@ MAX_SOURCES_PER_RESOLVER_READ = 40
 # One row past the durable per-source bound: enough to DETECT corruption,
 # never enough to hold a fifth fragment in a resolved context.
 FRAGMENT_OVER_READ_PER_SOURCE = MAX_FRAGMENTS_PER_SOURCE + 1
+# R4: the structured facts durably recorded FROM a source are the comparison
+# authority of the deterministic verifier.  One bundle may hold at most
+# MAX_FACTS_PER_BUNDLE facts, and a source may legitimately be acquired by
+# more than one bundle, so the read is bounded generously per source but still
+# hard-bounded; a source holding more is corrupted context and fails closed
+# rather than arriving quietly trimmed.
+MAX_STRUCTURED_FACTS_PER_SOURCE = 4 * MAX_FACTS_PER_BUNDLE
+STRUCTURED_FACT_OVER_READ_PER_SOURCE = MAX_STRUCTURED_FACTS_PER_SOURCE + 1
 
 GROUNDING_REASONS = frozenset({"SOURCE_CONTEXT_INVALID"})
 
@@ -136,6 +145,14 @@ class SourceFragment:
     text: str
     fragment_type: str | None = None
     locator: str | None = None
+    # R4: the durable row id, when the resolver could supply one.  It is the
+    # exact evidence identity a stored verdict's support link records, so a
+    # verdict can be replayed against the row that produced it rather than
+    # against a hash that merely matches.  A resolver that never reads a
+    # database legitimately has none, and the content hash still identifies
+    # the evidence -- which is why this is optional and never a substitute for
+    # the hash.
+    fragment_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not 1 <= len(self.text) <= MAX_FRAGMENT_CHARS:
@@ -153,6 +170,9 @@ class SourceFragment:
         if (self.fragment_type is None) != (self.locator is None):
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         if self.fragment_type is not None and self.fragment_type not in FRAGMENT_TYPES:
+            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        if self.fragment_id is not None and (not isinstance(self.fragment_id, str)
+                                             or not 1 <= len(self.fragment_id) <= 200):
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         if self.locator is not None:
             try:
@@ -196,6 +216,13 @@ class ResolvedSourceEvidence:
     source_date: str | None
     source_version: str | None = None
     fragments: tuple[SourceFragment, ...] = ()
+    # R4: the structured facts durably recorded FROM this source.  They are
+    # the comparison authority of the deterministic verifier: a claim about
+    # this source is checked against what the source itself states, not
+    # against what a model believes about it.  Empty means the source is
+    # free-text (or pre-R3) evidence, and such a claim continues to the
+    # grounded model verifier exactly as before.
+    facts: tuple[StructuredSourceFact, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_id, str) or not self.source_id:
@@ -233,6 +260,24 @@ class ResolvedSourceEvidence:
         identities = [item.identity for item in self.fragments]
         if len(set(identities)) != len(identities):
             raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        if not isinstance(self.facts, tuple):
+            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        if len(self.facts) > MAX_STRUCTURED_FACTS_PER_SOURCE:
+            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        if any(not isinstance(item, StructuredSourceFact) or item.source_id != self.source_id
+               or item.task_id != self.task_id for item in self.facts):
+            # A fact of another source, or of another task, can never describe
+            # THIS source: that is corrupted context, not missing context.
+            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        fact_ids = [item.fact_id for item in self.facts]
+        if len(set(fact_ids)) != len(fact_ids):
+            raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+
+    @property
+    def structured_facts(self) -> tuple[StructuredSourceFact, ...]:
+        """This source's located structured facts, in deterministic order."""
+        return tuple(sorted((item for item in self.facts if item.locator),
+                            key=lambda item: item.fact_id))
 
     @property
     def content_hashes(self) -> frozenset[str]:
@@ -350,7 +395,9 @@ class RepositoryEvidenceResolver:
             return {}
         sources = self._read_sources(source_ids)
         fragments = self._read_fragments(source_ids, sources)
-        return {source_id: self._context(sources[source_id], fragments.get(source_id, ()))
+        facts = self._read_structured_facts(source_ids, sources)
+        return {source_id: self._context(sources[source_id], fragments.get(source_id, ()),
+                                         facts.get(source_id, ()))
                 for source_id in source_ids}
 
     def _read_sources(self, source_ids: Sequence[str]) -> dict[str, Mapping[str, Any]]:
@@ -390,7 +437,9 @@ class RepositoryEvidenceResolver:
                                               content_hash=row["content_hash"],
                                               text=row["fragment_text"],
                                               fragment_type=row.get("fragment_type"),
-                                              locator=row.get("locator_key"))
+                                              locator=row.get("locator_key"),
+                                              fragment_id=(None if row.get("id") is None
+                                                           else str(row["id"])))
                 except (KeyError, TypeError):
                     # `from None`: the raised message would quote durable text.
                     raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
@@ -405,11 +454,77 @@ class RepositoryEvidenceResolver:
                     raise GroundingContractError("SOURCE_CONTEXT_INVALID")
         return fragments
 
+    def _read_structured_facts(self, source_ids: Sequence[str],
+                               sources: Mapping[str, Mapping[str, Any]],
+                               ) -> dict[str, list[StructuredSourceFact]]:
+        """R4: the located structured facts durably recorded FROM these sources.
+
+        The third and last bounded internal read.  Like the other two it is
+        run-scoped, source-scoped, column-allowlisted and caller-parameterised
+        -- never SQL, never model-steerable and never a network call.  A
+        repository that does not expose the read at all simply yields no facts,
+        so a pre-R4 deployment keeps exactly its previous behaviour instead of
+        failing.
+
+        Only LOCATED claims count as structured facts: a claim with no evidence
+        locator is a statement someone made about a source, not a fact read
+        from an exact place inside it, and it is never a comparison authority.
+        """
+        read = getattr(self._repository, "list_structured_facts_for_sources", None)
+        if read is None:
+            return {}
+        facts: dict[str, list[StructuredSourceFact]] = {}
+        for chunk in _chunks(source_ids, MAX_SOURCES_PER_RESOLVER_READ):
+            rows = read(self._run_id, chunk,
+                        limit=len(chunk) * STRUCTURED_FACT_OVER_READ_PER_SOURCE)
+            for row in rows:
+                source_id = str(row.get("source_id"))
+                source = sources.get(source_id)
+                if source is None or str(row.get("run_id")) != self._run_key:
+                    raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+                # task -> source -> fact is one lineage, exactly as it is for
+                # a fragment: the same run is not enough.
+                if row.get("task_key") != source.get("task_key"):
+                    raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+                locator = row.get("evidence_locator")
+                if locator is None:
+                    continue  # a claim, not a located structured fact
+                try:
+                    parse_locator_key(locator)
+                except EvidenceContractError:
+                    raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
+                identity = row.get("identity_scope") or {}
+                if not isinstance(identity, Mapping):
+                    raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+                time_scope = row.get("time_scope") or {}
+                if not isinstance(time_scope, Mapping):
+                    raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+                try:
+                    fact = StructuredSourceFact(
+                        fact_id=str(row["id"]), source_id=source_id,
+                        task_id=str(row["task_key"]), field=str(row["field_key"]),
+                        entity=str(row["entity_key"]), value=row["value"],
+                        unit=row.get("unit"), geography=row.get("geography"),
+                        market=row.get("market"), time_scope=dict(time_scope),
+                        identity=dict(identity), locator=str(locator))
+                except (KeyError, TypeError, ValueError):
+                    # `from None`: the raised message would quote durable evidence.
+                    raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
+                owned = facts.setdefault(source_id, [])
+                owned.append(fact)
+                # The over-read exists so this can fire: a source holding more
+                # structured facts than the durable bound is corrupted context
+                # and is never quietly trimmed to the first N rows.
+                if len(owned) > MAX_STRUCTURED_FACTS_PER_SOURCE:
+                    raise GroundingContractError("SOURCE_CONTEXT_INVALID")
+        return facts
+
     @staticmethod
-    def _context(row: Mapping[str, Any],
-                 fragments: Iterable[SourceFragment]) -> ResolvedSourceEvidence:
+    def _context(row: Mapping[str, Any], fragments: Iterable[SourceFragment],
+                 facts: Iterable[StructuredSourceFact] = ()) -> ResolvedSourceEvidence:
         """Build one source context from the explicit safe column allowlist."""
-        ordered = tuple(sorted(fragments, key=lambda item: (item.fragment_index, item.content_hash)))
+        ordered = tuple(sorted(fragments, key=lambda item: (item.fragment_index, item.content_hash,
+                                                            item.locator or "")))
         # R3: the version columns are all-or-nothing.  A half-populated pair is
         # never guessed or repaired -- it is corrupted provenance.
         kind, identifier = row.get("source_version_kind"), row.get("source_version_id")
@@ -422,13 +537,15 @@ class RepositoryEvidenceResolver:
                 source_type=row.get("source_type"), source_strength=row.get("source_strength"),
                 source_date=row.get("source_date"),
                 source_version=None if kind is None else f"{kind}:{identifier}",
-                fragments=ordered)
+                fragments=ordered,
+                facts=tuple(sorted(facts, key=lambda item: item.fact_id)))
         except KeyError:
             raise GroundingContractError("SOURCE_CONTEXT_INVALID") from None
 
 
 __all__ = ["FRAGMENT_OVER_READ_PER_SOURCE", "GROUNDING_REASONS",
-           "MAX_SOURCES_PER_RESOLVER_READ",
+           "MAX_SOURCES_PER_RESOLVER_READ", "MAX_STRUCTURED_FACTS_PER_SOURCE",
+           "STRUCTURED_FACT_OVER_READ_PER_SOURCE",
            "VERIFIER_GROUNDING_VERSION", "EvidenceResolver", "GroundedCandidate",
            "GroundingContractError", "RepositoryEvidenceResolver", "ResolvedSourceEvidence",
            "SourceFragment", "resolve_source_context"]

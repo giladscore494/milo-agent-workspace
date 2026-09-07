@@ -414,11 +414,19 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                         0, (cfg.max_model_calls_per_run or
                             (limits.max_tasks + 2)) - tracker.model_calls
                     )
+                    # R4: the remaining SEMANTIC retry allowance, so the one
+                    # bounded correction round is refused when the run has no
+                    # retries left. A deployment with no configured limit keeps
+                    # the permissive contract default and is not given one here.
+                    retries = (RemainingBudget.model_fields["retries"].default
+                               if cfg.max_retries is None else
+                               max(0, cfg.max_retries - tracker.retries))
                     return RemainingBudget(
                         cost_units=limits.max_cost_units,
                         tool_calls=limits.max_tool_calls,
                         tasks=limits.max_tasks,
                         model_calls=model_calls,
+                        retries=retries,
                     )
                 return SwarmV2Adapter(commander=commander, executor=executor,
                     # The resolver is the Verifier's ONLY route to durable
@@ -431,7 +439,14 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     evidence_loader=lambda _: [EvidenceReference.model_validate(item)
                                                for item in board.references()],
                     checkpoint_sink=save_checkpoint, event_sink=forward_event,
-                    usage_snapshot=tracker.snapshot, remaining_budget=remaining)
+                    usage_snapshot=tracker.snapshot, remaining_budget=remaining,
+                    # R4 durable provenance. The engine still holds no
+                    # repository handle: it hands each settled verdict and each
+                    # conflict decision to the run's own lease-guarded Evidence
+                    # Board, which writes them through the same idempotent,
+                    # append-only guarded RPCs as every other evidence write.
+                    verdict_sink=board.record_verification_verdict,
+                    resolution_sink=board.record_conflict_resolution)
             swarm_engine_builder = make_swarm_engine
         try:
             # Restore cumulative V2 usage before constructing any model path.

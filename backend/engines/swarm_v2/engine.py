@@ -5,12 +5,14 @@ from typing import Any, Callable, Iterable, Mapping
 
 from .builder import FinalBuilder
 from .commander import Commander
+from .conflict_policy import ConflictResolution, conflict_groups
 from .contracts import EvidenceReference, RemainingBudget, VerificationVerdict
+from .correction import correction_allowance, correction_issues, correction_summary
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
 from .grounding import VERIFIER_GROUNDING_VERSION
-from .normalization import CanonicalScope, canonical_scope_key, canonical_value_key
 from .state import SwarmState
+from .support import VERIFIER_CONTRACT_VERSION
 from .verifier import Verifier, VerifierProgress
 from .worker import TaskResult
 
@@ -24,7 +26,9 @@ class SwarmV2Engine:
                  checkpoint_sink: Callable[[str, dict], None] | None = None,
                  event_sink: Callable[[str, dict], None] | None = None,
                  usage_snapshot: Callable[[], Mapping[str, Any]] | None = None,
-                 remaining_budget: Callable[[], RemainingBudget] | None = None):
+                 remaining_budget: Callable[[], RemainingBudget] | None = None,
+                 verdict_sink: Callable[[VerificationVerdict], None] | None = None,
+                 resolution_sink: Callable[[ConflictResolution], None] | None = None):
         self._commander = commander
         self._executor, self._verifier = executor, verifier
         self._builder = builder or FinalBuilder()
@@ -33,6 +37,14 @@ class SwarmV2Engine:
         self._usage_snapshot = usage_snapshot or (lambda: {})
         self._remaining_budget = remaining_budget or (lambda: RemainingBudget(
             cost_units=100_000, tool_calls=100, tasks=64, model_calls=100))
+        # R4 durable sinks. The engine still holds NO repository handle: these
+        # are injected by the trusted worker wiring that already owns the run's
+        # lease-guarded Evidence Board, so a verdict, its support links and a
+        # conflict decision are persisted through exactly the same guarded,
+        # idempotent RPCs as every other evidence write. Both are optional: a
+        # deployment that has not wired them keeps the checkpoint as the only
+        # durable home of a verdict, exactly as before R4.
+        self._verdict_sink, self._resolution_sink = verdict_sink, resolution_sink
 
     @staticmethod
     def _canonical(value: Any) -> str:
@@ -46,7 +58,12 @@ class SwarmV2Engine:
                    "graph_revision", "decision",
                    "claim_id", "source_id", "conflict_id", "verdict",
                    "batch_index", "batch_count", "claim_count",
-                   "source_count", "missing_context_count"}
+                   "source_count", "missing_context_count",
+                   # R4: identifiers and static codes only. A scope hash, a
+                   # policy/contract version and a static reason carry no
+                   # value, no unit, no source text and no provider material.
+                   "scope_hash", "state", "reason", "policy_version",
+                   "structured_count", "issue_count", "round"}
         safe = {key: value for key, value in payload.items() if key in allowed and
                 (value is None or isinstance(value, (str, int, float, bool)))}
         if self._event_sink:
@@ -178,10 +195,13 @@ class SwarmV2Engine:
         # deterministic and missing-context verdicts.
         state.verifier_state = {v.claim_id: v.model_dump(mode="json") for v in plan.settled}
         state.verifier_grounding_version = VERIFIER_GROUNDING_VERSION
+        state.verifier_contract_version = VERIFIER_CONTRACT_VERSION
+        self._record_resolutions(state, plan.resolutions)
         self._emit("grounding_context_resolved",
                    {"claim_count": sum(len(batch) for batch in plan.batches),
                     "source_count": plan.source_count,
-                    "missing_context_count": plan.missing_context_count})
+                    "missing_context_count": plan.missing_context_count,
+                    "structured_count": plan.structured_count})
 
         def record(progress: VerifierProgress) -> None:
             # Validated verdicts, the authoritative usage snapshot and the
@@ -192,6 +212,7 @@ class SwarmV2Engine:
             # which stays inside BudgetTracker's durable accounting.
             for verdict in progress.verdicts:
                 state.verifier_state[verdict.claim_id] = verdict.model_dump(mode="json")
+            self._persist_verdicts(progress.verdicts)
             state.usage_snapshot = dict(self._usage_snapshot())
             self._save(state)
             if progress.batch_index >= 1:
@@ -202,10 +223,111 @@ class SwarmV2Engine:
 
         verdicts = self._verifier.verify_prepared(plan, batch_completed=record)
         state.verifier_state = {v.claim_id: v.model_dump(mode="json") for v in verdicts}
+        self._persist_verdicts(verdicts)
         state.usage_snapshot = dict(self._usage_snapshot())
         self._emit("verification_completed", {"status": "completed"})
         self._save(state)
-        return verdicts
+        return plan.resolutions, verdicts
+
+    def _persist_verdicts(self, verdicts: Iterable[VerificationVerdict]) -> None:
+        """Hand every settled verdict, with its support links, to the sink.
+
+        Idempotency is by STABLE IDENTITY, not by bookkeeping: the sink writes
+        through a lease-guarded RPC keyed on the run plus a key derived from
+        the verdict's own content, so a resumed run, a re-verification after a
+        correction round and a retried batch all replay onto the same durable
+        row instead of appending a second one. This is deliberately NOT an
+        exactly-once claim across the provider-call/checkpoint boundary: it is
+        at-least-once delivery onto an idempotent write.
+        """
+        if self._verdict_sink is None:
+            return
+        for verdict in verdicts:
+            self._verdict_sink(verdict)
+
+    def _record_resolutions(self, state: SwarmState,
+                            resolutions: tuple[ConflictResolution, ...]) -> None:
+        """Make every conflict decision durable, visible and replayable.
+
+        A resolution is a decision ABOUT claims, never an edit OF them: the
+        losing claim keeps its row and its evidence, and this record is what
+        says a field-authoritative source settled the scope against it.
+        """
+        state.conflict_resolutions = [item.model_dump(mode="json") for item in resolutions]
+        for resolution in resolutions:
+            if self._resolution_sink is not None:
+                self._resolution_sink(resolution)
+            self._emit("conflict_resolution_recorded",
+                       {"scope_hash": resolution.scope_hash, "state": resolution.state,
+                        "reason": resolution.reason,
+                        "policy_version": resolution.policy_version,
+                        "claim_count": len(resolution.claim_ids)})
+
+    def _start_correction_round(self, state: SwarmState, plan: Any,
+                                completed: Mapping[str, TaskResult], *,
+                                evidence: list[EvidenceReference],
+                                verdicts: list[VerificationVerdict],
+                                resolutions: tuple[ConflictResolution, ...],
+                                summary: Mapping[str, Any], requested_model: str,
+                                objective: str) -> Any:
+        """Spend the run's ONE bounded correction round, or return None.
+
+        This is the only place a finding made during FINAL verification can
+        still change the run, and it is deliberately not a loop:
+
+        * the round is offered at most `correction.MAX_CORRECTION_ROUNDS`
+          times for the whole run, and the count lives in the checkpoint so a
+          resume cannot earn a second one;
+        * it is refused outright when the task, tool-call, model-call, retry,
+          cost or replan budget is unavailable;
+        * it goes through the SAME Commander, PlanValidator, feasibility
+          check, executor, checkpoint and cancellation path as every other
+          round -- there is no second orchestrator and no open-ended agent
+          loop;
+        * the Commander may decline it, and a declined round is final: the
+          issues become needs_review and the run finalizes under R1.
+
+        Returning a plan means "execute this and verify again"; returning None
+        means "finalize now".
+        """
+        issues = correction_issues(evidence, verdicts)
+        if not issues:
+            return None
+        allowance = correction_allowance(
+            rounds_used=state.correction_rounds, remaining=self._remaining_budget(),
+            replans_used=len(state.replans), max_replans=plan.max_replans)
+        if not allowance.allowed:
+            self._emit("correction_round_blocked",
+                       {"reason": allowance.reason, "issue_count": len(issues)})
+            return None
+        self._emit("correction_round_started",
+                   {"round": state.correction_rounds + 1, "issue_count": len(issues)})
+        decision = self._commander.replan(
+            requested_model=requested_model, objective=objective,
+            summary={**summary, "verification_findings":
+                     correction_summary(issues, resolutions=resolutions)})
+        if decision.decision not in {"ADD_TASKS", "REVISE_TASK"}:
+            # The Commander looked at the findings and chose not to research
+            # them. That is a terminal answer, not an invitation to ask again.
+            self._emit("correction_round_declined", {"decision": decision.decision})
+            return None
+        replacement = decision.plan
+        assert replacement is not None
+        if not self._completed_tasks_unchanged(plan, replacement, completed):
+            raise ValueError("replan cannot revise or discard completed tasks")
+        self._check_feasible(replacement, completed)
+        # A correction round IS a replan and is charged as one, so it consumes
+        # the plan's own replan allowance alongside the one-round allowance.
+        state.replans.append({"decision": decision.decision, "reason": decision.reason,
+                              "correction_round": state.correction_rounds + 1})
+        state.correction_rounds += 1
+        state.graph_revision += 1
+        state.approved_plan = replacement.model_dump(mode="json")
+        state.usage_snapshot = dict(self._usage_snapshot())
+        self._emit("commander_replanned", {"decision": decision.decision,
+                                           "graph_revision": state.graph_revision})
+        self._save(state)
+        return replacement
 
     def run(self, run: dict[str, Any]) -> dict[str, Any]:
         run_input = run.get("input") or {}
@@ -261,16 +383,13 @@ class SwarmV2Engine:
                 self._emit("evidence_added", {"claim_id": item.claim_id,
                     "source_id": item.source_id, "task_id": item.task_id})
 
-            values_by_scope: dict[CanonicalScope, set[str]] = {}
-            scope_by_claim: dict[str, CanonicalScope] = {}
-            for item in evidence:
-                scope = canonical_scope_key(entity=item.entity, field=item.field,
-                                            geography=item.geography, market=item.market,
-                                            time_scope=item.time_scope)
-                scope_by_claim[item.claim_id] = scope
-                values_by_scope.setdefault(scope, set()).add(canonical_value_key(item.value))
-            conflict_ids = {item.claim_id for item in evidence
-                            if len(values_by_scope[scope_by_claim[item.claim_id]]) > 1}
+            # R4: contradiction is decided on the COMPLETE identity -- the
+            # canonical scope PLUS the closed identity dimensions -- through
+            # the one shared grouping the verifier also uses. Two claims that
+            # differ only by generation, engine, transmission or official code
+            # describe two different variants and were never a contradiction.
+            groups = conflict_groups(evidence)
+            conflict_ids = {item.claim_id for claims in groups.values() for item in claims}
             for claim_id in sorted(conflict_ids):
                 self._emit("conflict_found", {"claim_id": claim_id})
 
@@ -325,7 +444,14 @@ class SwarmV2Engine:
             if hard_gaps:
                 raise ValueError("completion criteria not satisfied")
 
-            verdicts = self._run_verification(state, evidence, conflict_ids)
+            resolutions, verdicts = self._run_verification(state, evidence, conflict_ids)
+            correction = self._start_correction_round(
+                state, plan, completed, evidence=evidence, verdicts=verdicts,
+                resolutions=resolutions, summary=summary,
+                requested_model=requested_model, objective=objective)
+            if correction is not None:
+                plan = correction
+                continue
             failures = [{"task_id": task_id,
                          "code": (result.error or {}).get("code", "TASK_FAILED")}
                         for task_id, result in sorted(execution.tasks.items())

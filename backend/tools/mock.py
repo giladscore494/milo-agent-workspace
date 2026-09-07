@@ -101,6 +101,18 @@ _STRUCTURED_RECORD_FIELDS = {
     "price_currency": {"type": "string"},
     "fuel_type": {"type": "string"},
 }
+# R4: the identity dimensions a real registry record states about the VARIANT,
+# as opposed to the commercial model.  They are OPTIONAL in the schema (a
+# fixture written before R4 stays valid and simply qualifies itself no
+# further) and the mapper copies only the ones the record actually carries: a
+# generation, an engine, a transmission or an official model code is never
+# inferred and never invented.
+_STRUCTURED_IDENTITY_FIELDS = {
+    "generation": {"type": "string"},
+    "engine": {"type": "string"},
+    "transmission": {"type": "string"},
+    "model_code": {"type": "string"},
+}
 _RECORD_REQUEST = {"type": "object", "properties": {"record_id": {"type": "string"}},
                    "required": ["record_id"], "additionalProperties": False}
 _RECORD_RESULT = {
@@ -111,7 +123,9 @@ _RECORD_RESULT = {
         # infer one from a timestamp.
         "dataset_version": {"type": "string"},
         "record_id": {"type": "string"},
-        "record": {"type": "object", "properties": dict(_STRUCTURED_RECORD_FIELDS),
+        "record": {"type": "object",
+                   "properties": {**_STRUCTURED_RECORD_FIELDS,
+                                  **_STRUCTURED_IDENTITY_FIELDS},
                    "required": sorted(_STRUCTURED_RECORD_FIELDS),
                    "additionalProperties": False},
     },
