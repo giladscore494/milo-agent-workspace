@@ -28,8 +28,11 @@ tests pin its boundaries:
 
 from __future__ import annotations
 
+import json
 import shutil
+from copy import deepcopy
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -37,8 +40,27 @@ from backend.engines.swarm_v2 import (
     DETERMINISTIC_OUTPUT_REASONS,
     MAX_TASK_OUTPUT_JSON_BYTES,
     WORKER_OUTPUT_REASONS,
+    BoundedTaskExecutor,
+    Commander,
+    CommanderModelResolver,
+    EvidenceReference,
+    FinalBuilder,
     GenericWorker,
+    PlanLimits,
+    PlanValidator,
+    SwarmV2Engine,
+    TaskGraph,
+    Verifier,
+    validate_product_outcome,
 )
+from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+from backend.engines.swarm_v2.evidence_mapping import TrustedEvidenceAcquisition
+from backend.engines.swarm_v2.grounding import RepositoryEvidenceResolver
+from backend.engines.swarm_v2.support import VERIFIER_CONTRACT_VERSION
+from backend.testing.r5_proof.commander import (TOYOTA_RAV4_PHEV_IL_2021,
+                                                DeterministicProofCommanderClient,
+                                                UnknownProofRequest)
+from backend.testing.r5_proof.strategy import VehicleProofOutputStrategy
 from backend.engines.swarm_v2.contracts import CommanderPlan, DynamicTask, PlannedToolCall
 from backend.engines.swarm_v2.evidence_bounds import IDENTITY_DIMENSIONS
 from backend.engines.swarm_v2.evidence_mapping import (PRODUCTION_EVIDENCE_MAPPERS,
@@ -51,7 +73,18 @@ from backend.testing.r5_proof.mappers import (YEDA_FACT_FIELDS, YEDA_SOURCE_TYPE
 from backend.testing.r5_proof.tools import YEDA_MARKET_PRESENCE, YedaVehicleCatalogTool
 from backend.tools import ToolContext, ToolError, ToolRegistry
 
+from test_swarm_v2_r3_evidence_contract import R3GuardedRepository
 from test_swarm_v2_tool_contract import CONTEXT, StubGateway, get_model, registry, spec
+
+#: The one run this proof executes under.
+RUN_UUID = UUID("5a5f0000-0000-4000-8000-000000000005")
+
+
+def only(items):
+    """Exactly one item, or a failure that says so."""
+    values = list(items)
+    assert len(values) == 1, f"expected exactly one item, got {len(values)}"
+    return values[0]
 
 
 # --- the pinned proof source ------------------------------------------------
@@ -594,3 +627,311 @@ def test_the_proof_mappers_are_not_production_mappers():
     assert PRODUCTION_EVIDENCE_MAPPERS.registered == frozenset()
     assert proof_evidence_mappers().registered == {
         ("yeda.vehicle_catalog", "get_model_variant")}
+
+
+# =============================================================================
+# 9. the WHOLE path, through the real engine, with zero model calls
+# =============================================================================
+#
+# This is the section that makes R5 a proof rather than a collection of unit
+# tests. It runs the real SwarmV2Engine over the real Commander, PlanValidator,
+# BoundedTaskExecutor, GenericWorker, ToolRegistry, ToolCallRecord,
+# TrustedEvidenceAcquisition, EvidenceBoard, RepositoryEvidenceResolver,
+# Verifier and FinalBuilder -- and every model dependency in it is POISONED, so
+# any provider path that were reached would fail the test immediately rather
+# than quietly returning a plausible answer.
+
+class PoisonedModelDependency(AssertionError):
+    """Raised the instant any Commander/Worker/Verifier model path is used."""
+
+
+class PoisonGateway:
+    """A ModelGateway stand-in that can only fail, and counts being asked.
+
+    A mock that RETURNS a response is not evidence of zero model use: the call
+    still happened, and a run could depend on it. This one makes the call
+    itself fatal, so "no model was used" is proven by the run completing at
+    all rather than by inspecting a counter afterwards -- though the counter is
+    asserted too.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def call(self, **kwargs):
+        self.calls.append(kwargs)
+        raise PoisonedModelDependency(
+            f"a model call reached the provider path: {kwargs.get('agent')}")
+
+    # The two client shapes Commander probes for, poisoned the same way.
+    def create_plan(self, **kwargs):
+        self.calls.append(kwargs)
+        raise PoisonedModelDependency("a Commander completion was requested")
+
+    def create_replan(self, **kwargs):
+        self.calls.append(kwargs)
+        raise PoisonedModelDependency("a Commander replan completion was requested")
+
+
+class ProofRepository(R3GuardedRepository):
+    """The R3 guarded evidence repository plus the two R4 durable writes.
+
+    Deliberately a SUBCLASS of the repository the R3 suite already proves,
+    rather than a new persistence layer: R5 introduces no evidence store of
+    its own, so the same guarded-RPC guarantees -- lease on every write,
+    idempotency on `evidence_key`, provenance validated instead of trusted --
+    cover the R5 path unchanged.
+    """
+
+    def __init__(self, lease):
+        super().__init__(lease)
+        self.verdicts: dict[str, dict] = {}
+        self.supports: list[dict] = []
+        self.resolutions: dict[str, dict] = {}
+        self.checkpoints: list[dict] = []
+
+    def list_structured_facts_for_sources(self, run_id, source_ids, *, limit=200):
+        """The third bounded internal read the R4 grounding resolver performs."""
+        wanted = {str(item) for item in source_ids}
+        rows = [row for row in self.claims.values()
+                if row["run_id"] == str(run_id) and str(row["source_id"]) in wanted]
+        rows.sort(key=lambda row: (str(row["source_id"]), row["id"]))
+        return rows[:limit]
+
+    def record_claim_verdict(self, run_id, payload, **kwargs):
+        self._assert_lease(run_id, kwargs, "verdict")
+        claim = next((row for row in self.claims.values()
+                      if row["id"] == str(payload["claim_id"])), None)
+        if claim is None:
+            raise AssertionError("invalid claim verdict claim")
+        for link in payload["support"]:
+            fragment = next((row for row in self.fragments.values()
+                             if row["id"] == str(link["fragment_id"])), None)
+            if fragment is None:
+                raise AssertionError("verdict support link does not name durable evidence")
+            if str(fragment["source_id"]) != str(claim["source_id"]):
+                raise AssertionError("verdict support link belongs to another source")
+            if fragment["content_hash"] != link["content_hash"]:
+                raise AssertionError("verdict support link content hash mismatch")
+        row = self.verdicts.setdefault(payload["evidence_key"],
+                                       {"id": str(uuid4()), "run_id": str(run_id), **payload})
+        if row["verdict"] != payload["verdict"] or row["reason"] != payload["reason"]:
+            raise AssertionError("claim verdict idempotency conflict")
+        self.supports = [item for item in self.supports if item["verdict_id"] != row["id"]]
+        self.supports.extend({"verdict_id": row["id"], **link} for link in payload["support"])
+        return row
+
+    def record_conflict_resolution(self, run_id, payload, **kwargs):
+        self._assert_lease(run_id, kwargs, "resolution")
+        return self.resolutions.setdefault(
+            payload["evidence_key"], {"id": str(uuid4()), "run_id": str(run_id), **payload})
+
+
+def proof_run(*, checkpoint=None, repository=None, board=None, checkpoints=None):
+    """Execute the compiled proof plan through the REAL engine, end to end.
+
+    Every model dependency is the poison gateway: the Commander client, the
+    worker's gateway and the verifier's gateway. Nothing here supplies a
+    scripted completion, so the run can only finish if no model path is
+    reached at all.
+    """
+    lease = WorkerLease(RUN_UUID, "worker-r5", 1, "lease-token-r5")
+    repository = repository if repository is not None else ProofRepository(lease)
+    board = board if board is not None else EvidenceBoard(repository, lease)
+    poison = PoisonGateway()
+    registry_of_proof = proof_registry()
+
+    commander = Commander(
+        client=DeterministicProofCommanderClient(TOYOTA_RAV4_PHEV_IL_2021.key),
+        resolver=CommanderModelResolver(("compiled",), {"compiled"}),
+        # The SAME deterministic firewall a model-authored plan passes.
+        validator=PlanValidator(allowed_tools=registry_of_proof.descriptors(),
+                                limits=PlanLimits(max_tasks=8, max_tool_calls=8,
+                                                  max_replans=0)))
+    acquisition = TrustedEvidenceAcquisition(board=board, mappers=proof_evidence_mappers())
+    executor = BoundedTaskExecutor(
+        worker_factory=lambda: GenericWorker(
+            gateway=poison, tools=registry_of_proof, model="unused",
+            tool_context=PROOF_CONTEXT,
+            tool_result_sink=acquisition,
+            task_output_strategy=VehicleProofOutputStrategy()),
+        max_active_workers=1)
+    engine = SwarmV2Engine(
+        commander=commander, executor=executor,
+        verifier=Verifier(gateway=poison, model="unused",
+                          resolver=RepositoryEvidenceResolver(repository, run_id=RUN_UUID)),
+        builder=FinalBuilder(),
+        evidence_loader=lambda _: [EvidenceReference.model_validate(item)
+                                   for item in board.references()],
+        checkpoint_sink=(None if checkpoints is None
+                         else lambda phase, value: checkpoints.append(deepcopy(value))),
+        verdict_sink=board.record_verification_verdict,
+        resolution_sink=board.record_conflict_resolution)
+    payload = {"id": str(RUN_UUID),
+               "input": {"objective": "prove one real vehicle evidence path",
+                         "commander_model": "compiled"}}
+    if checkpoint is not None:
+        payload["checkpoint"] = checkpoint
+    return engine.run(payload), repository, poison, board
+
+
+def test_the_whole_proof_runs_through_the_real_engine_with_zero_model_calls():
+    """The acceptance path, end to end, offline.
+
+    real pinned Yeda fixture -> validated read-only ToolRegistry operation ->
+    ToolCallRecord -> trusted operation-specific mapper -> versioned source ->
+    focused fragments and structured facts -> lease-guarded EvidenceBoard ->
+    RepositoryEvidenceResolver -> R4 deterministic verification -> FinalBuilder
+    -> truthful R1 product outcome.
+    """
+    checkpoints = []
+    result, repository, poison, board = proof_run(checkpoints=checkpoints)
+
+    # 1. Not one model or provider call anywhere in the run.
+    assert poison.calls == []
+
+    # 2. Durable evidence was written in the contract's order, under the lease.
+    assert repository.writes[:4] == ["source", "fragment", "fragment", "fragment"]
+    assert repository.writes.count("source") == 1
+    assert len(repository.claims) == 3 and len(repository.fragments) == 3
+
+    # 3. The source is pinned to the real commit, and every claim is located.
+    source = only(list(repository.sources.values()))
+    assert (source["source_version_kind"], source["source_version_id"]) == \
+        ("git_commit", proof_manifest.source_entry("yeda")["commit_sha"])
+    assert all(row["evidence_locator"] for row in repository.claims.values())
+
+    # 4. Every claim was settled DETERMINISTICALLY, with durable support.
+    assert len(repository.verdicts) == 3
+    assert {row["verdict"] for row in repository.verdicts.values()} == {"verified"}
+    assert {row["verification_mode"] for row in repository.verdicts.values()} == \
+        {"deterministic_structured"}
+    assert {row["verifier_contract_version"] for row in repository.verdicts.values()} == \
+        {VERIFIER_CONTRACT_VERSION}
+    assert len(repository.supports) == 3
+
+    # 5. The R1 product outcome is valid, and its fields are verified material.
+    assert validate_product_outcome(result)
+    assert result["fields"]["fuel_type"][0]["value"] == "plug_in_hybrid"
+    assert result["fields"]["horsepower_hp"][0]["value"] == 306
+    assert result["fields"]["nominal_engine_displacement_l"][0]["value"] == 2.5
+    # Provenance travels into the product output: every field names the claim,
+    # the source and the run that produced it.
+    for entries in result["fields"].values():
+        for entry in entries:
+            assert entry["provenance"]["source_id"] == source["id"]
+            assert entry["provenance"]["run_id"] == str(RUN_UUID)
+
+    # 6. The checkpoint carries the same verdicts, so a resume replays them.
+    state = checkpoints[-1]["artifacts"]["swarm_state"]
+    assert len(state["evidence_references"]) == 3
+    assert {item["reason"] for item in state["verifier_state"].values()} == \
+        {"R4_STRUCTURED_MATCH"}
+
+
+def test_the_proof_would_fail_if_it_bypassed_any_required_stage():
+    """The stages are load-bearing, not decorative.
+
+    Each disabled stage below is one the proof is REQUIRED to use. If a future
+    change let the run reach a result without it, this test fails -- which is
+    the point: it is the guard against quietly re-implementing the path.
+    """
+    lease = WorkerLease(RUN_UUID, "worker-r5", 1, "lease-token-r5")
+
+    # (a) Without ToolRegistry validation there is no validated result at all:
+    # the registry refuses an operation whose scope was never granted, so no
+    # ToolCallRecord, no mapper, no evidence.
+    repository = ProofRepository(lease)
+    board = EvidenceBoard(repository, lease)
+    acquisition = TrustedEvidenceAcquisition(board=board, mappers=proof_evidence_mappers())
+    worker = GenericWorker(gateway=PoisonGateway(), tools=proof_registry(), model="unused",
+                           tool_context=ToolContext(scopes=frozenset()),
+                           tool_result_sink=acquisition,
+                           task_output_strategy=VehicleProofOutputStrategy())
+    task = TOYOTA_RAV4_PHEV_IL_2021.tasks[0]
+    graph = TaskGraph.model_validate({"tasks": [task.as_plan_task()]})
+    denied = worker.execute(graph.tasks[0], {})
+    assert denied.status == "failed" and denied.error["code"] == "TOOL_SCOPE_REQUIRED"
+    assert repository.sources == {} and repository.claims == {}
+
+    # (b) Without TrustedEvidenceAcquisition the tool result stays MATERIAL:
+    # the task still completes, and not one durable evidence row exists.
+    unwired_repository = ProofRepository(lease)
+    unwired = GenericWorker(gateway=PoisonGateway(), tools=proof_registry(), model="unused",
+                            tool_context=PROOF_CONTEXT,
+                            task_output_strategy=VehicleProofOutputStrategy())
+    completed = unwired.execute(graph.tasks[0], {})
+    assert completed.status == "completed"
+    assert unwired_repository.sources == {} and unwired_repository.claims == {}
+
+    # (c) Without RepositoryEvidenceResolver reading the structured facts, the
+    # deterministic comparison has nothing to compare against, so verification
+    # falls through to the grounded MODEL verifier -- which is poisoned.
+    class NoStructuredFacts(ProofRepository):
+        def list_structured_facts_for_sources(self, run_id, source_ids, *, limit=200):
+            return []
+
+    with pytest.raises(PoisonedModelDependency):
+        proof_run(repository=NoStructuredFacts(
+            WorkerLease(RUN_UUID, "worker-r5", 1, "lease-token-r5")))
+
+
+def test_replaying_the_proof_duplicates_no_durable_evidence():
+    """Replay is read-only and idempotent on the durable rows.
+
+    The same source version, the same locators and the same content replay
+    onto the SAME rows, so a resumed or retried run cannot inflate the
+    evidence behind a result.
+    """
+    lease = WorkerLease(RUN_UUID, "worker-r5", 1, "lease-token-r5")
+    repository = ProofRepository(lease)
+    first, _, _, _ = proof_run(repository=repository)
+    counts = (len(repository.sources), len(repository.fragments), len(repository.claims),
+              len(repository.verdicts), len(repository.supports))
+    second, _, _, _ = proof_run(repository=repository)
+    assert second == first
+    assert (len(repository.sources), len(repository.fragments), len(repository.claims),
+            len(repository.verdicts), len(repository.supports)) == counts
+    assert counts == (1, 3, 3, 3, 3)
+
+
+def test_a_stale_worker_lease_fails_every_durable_proof_write_closed():
+    """Evidence is only ever written under the ACTIVE lease."""
+    lease = WorkerLease(RUN_UUID, "worker-r5", 1, "lease-token-r5")
+    repository = ProofRepository(lease)
+    stale = EvidenceBoard(repository, WorkerLease(RUN_UUID, "worker-r5", 1, "superseded"))
+    acquisition = TrustedEvidenceAcquisition(board=stale, mappers=proof_evidence_mappers())
+    record = ToolCallRecord(task_id="yeda_variant", call_id="yeda-1",
+                            tool="yeda.vehicle_catalog", operation="get_model_variant",
+                            result=yeda_result())
+    with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+        acquisition.acquire(record)
+    assert repository.sources == {}
+
+
+def test_the_compiled_plan_passes_the_real_firewall_and_grants_nothing():
+    """A compiled plan is inert until PlanValidator approves it.
+
+    It gets no shortcut: same contract, same limits, same semantic rules a
+    model-authored plan faces. And it cannot grant itself anything -- scopes
+    live on the server-owned ToolContext, which no plan can reach.
+    """
+    client = DeterministicProofCommanderClient(TOYOTA_RAV4_PHEV_IL_2021.key)
+    validator = PlanValidator(allowed_tools=proof_registry().descriptors(),
+                              limits=PlanLimits(max_tasks=8, max_tool_calls=8, max_replans=0))
+    plan = validator.validate(client.create_plan(model="compiled", objective="anything at all",
+                                                 context={"hostile": "input"}))
+    call = only(only(plan.graph.tasks).tools)
+    assert (call.name, call.operation) == ("yeda.vehicle_catalog", "get_model_variant")
+    # The arguments came from the static table, never from the objective or
+    # the context the caller supplied.
+    assert call.arguments == {"make": "Toyota", "commercial_model": "RAV4", "market": "IL",
+                              "model_year": 2021, "fuel_type": "plug_in_hybrid"}
+    assert "hostile" not in json.dumps(plan.model_dump(mode="json"))
+    # No scope, capability or write approval is expressible in a plan at all.
+    assert "scopes" not in json.dumps(plan.model_dump(mode="json"))
+
+
+def test_an_unknown_proof_request_has_no_plan_at_all():
+    with pytest.raises(UnknownProofRequest):
+        DeterministicProofCommanderClient("some-other-vehicle")
