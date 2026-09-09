@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Protocol
 from backend.budget import BudgetExceeded
 from backend.errors import AppError
 from backend.provider_scheduler import ProviderBackpressureExceeded
@@ -33,6 +33,40 @@ WORKER_OUTPUT_REASONS = frozenset({
     "WORKER_OUTPUT_JSON_INVALID",
     "WORKER_OUTPUT_SCHEMA_INVALID",
 })
+
+
+# R5: the static reasons a TRUSTED deterministic task-output strategy can fail
+# with. They are deliberately NOT part of WORKER_OUTPUT_REASONS: those are the
+# failures a bounded model repair may answer, and there is no model in this
+# path to answer anything. A deterministic strategy that raises or returns a
+# value the task's own closed output_schema rejects is a server defect, so it
+# fails the task closed instead of silently falling back to a model call.
+DETERMINISTIC_OUTPUT_REASONS = frozenset({
+    "WORKER_OUTPUT_STRATEGY_FAILED",
+    "WORKER_OUTPUT_STRATEGY_INVALID",
+})
+
+
+class DeterministicOutputError(ValueError):
+    """A trusted deterministic-strategy failure carrying ONLY a static code.
+
+    The strategy's traceback and its rejected value never travel with the
+    classification, exactly like every other failure this module raises, so
+    the safe representation is fit for a durable task result, a run event and
+    telemetry alike.
+    """
+
+    MESSAGES = {
+        "WORKER_OUTPUT_STRATEGY_FAILED": "the deterministic task-output strategy failed",
+        "WORKER_OUTPUT_STRATEGY_INVALID": "the deterministic task output does not satisfy the declared output schema",
+    }
+
+    def __init__(self, reason_code: str):
+        if reason_code not in DETERMINISTIC_OUTPUT_REASONS:
+            raise ValueError("deterministic output reason must come from the static allowlist")
+        self.reason_code = reason_code
+        self.safe_message = self.MESSAGES[reason_code]
+        super().__init__(self.safe_message)
 
 
 class WorkerOutputValidationError(ValueError):
@@ -130,6 +164,37 @@ def build_worker_request(task: DynamicTask, tool_outputs: Mapping[str, Any],
     ]
 
 
+class TaskOutputStrategy(Protocol):
+    """R5: trusted server code that produces ONE task's structured output.
+
+    The seam exists so a TOOL-COMPLETE structured task can finish without a
+    worker model call. It is deliberately narrow:
+
+    *   It is selected by CONSTRUCTOR INJECTION from trusted server/test
+        wiring only. There is no run-input field, no plan field and no model
+        output that can reach, name or enable it, so a client can never ask a
+        run to skip the model.
+    *   It receives only material the server already validated: the approved
+        task, the Registry-validated tool results (keyed by call_id) and the
+        direct dependency outputs -- the exact same trusted material
+        `build_worker_request` would otherwise put in a prompt.
+    *   Its return value is validated against the task's own closed
+        `output_schema` through the SAME `validate_worker_output` path a model
+        completion goes through, so it cannot widen a contract or exceed a
+        durable bound.
+    *   It has no evidence capability whatsoever. Evidence acquisition already
+        happened inside the tool loop, through the trusted mapper and the
+        lease-guarded Evidence Board; a strategy returns a task OUTPUT and can
+        neither create a source, alter source metadata nor influence a verdict.
+
+    When no strategy is injected the worker's behaviour is byte-for-byte the
+    current model-backed one.
+    """
+
+    def __call__(self, *, task: DynamicTask, tool_outputs: Mapping[str, Any],
+                 dependency_outputs: Mapping[str, Any]) -> Any: ...
+
+
 @dataclass(frozen=True)
 class TaskResult:
     task_id: str
@@ -142,7 +207,8 @@ class GenericWorker:
                  cancellation_checker: Callable[[], bool] | None = None,
                  event_sink: Callable[[str, dict[str, Any]], None] | None = None,
                  retry_callback: Callable[[str, str, str], None] | None = None,
-                 tool_result_sink: ToolResultCallback | None = None):
+                 tool_result_sink: ToolResultCallback | None = None,
+                 task_output_strategy: TaskOutputStrategy | None = None):
         self._gateway, self._tools, self._model = gateway, tools, model
         self._tool_context = (replace(tool_context, cancellation_checker=cancellation_checker)
                               if cancellation_checker is not None else tool_context)
@@ -153,6 +219,10 @@ class GenericWorker:
         # Unwired in production until Y4/G3 connect a domain mapping to a real
         # evidence grant; a validated result is material, never a fact.
         self._tool_result_sink = tool_result_sink
+        # R5: the OPTIONAL deterministic task-output strategy. `None` -- the
+        # production default -- keeps the model-backed behaviour exactly as it
+        # is; nothing outside this constructor can set it.
+        self._task_output_strategy = task_output_strategy
 
     def _check_cancelled(self) -> None:
         if self._cancelled and self._cancelled():
@@ -191,6 +261,14 @@ class GenericWorker:
                               error={"code": exc.code, "message": exc.safe_message})
         except ProviderBackpressureExceeded:
             return TaskResult(task.task_id, "failed", error={"code": "PROVIDER_BACKPRESSURE_EXCEEDED", "message": "provider backpressure did not clear"})
+        except DeterministicOutputError as exc:
+            # A trusted deterministic strategy raised, or produced output the
+            # task's own closed schema rejects. There is deliberately NO
+            # fallback to a model call: silently paying for a completion here
+            # would turn a server defect into an invisible provider charge and
+            # would make a zero-model-call guarantee unprovable.
+            return TaskResult(task.task_id, "failed",
+                              error={"code": exc.reason_code, "message": exc.safe_message})
         except WorkerOutputValidationError as exc:
             # A structural model-output failure that already exhausted
             # MAX_WORKER_OUTPUT_MODEL_ATTEMPTS. The static code of the FINAL
@@ -258,6 +336,11 @@ class GenericWorker:
         budget authority, provider scheduling, cancellation and usage
         accounting are identical for the repair and for the first call.
         """
+        if self._task_output_strategy is not None:
+            # R5: the task is tool-complete and trusted server code can state
+            # its output. Nothing below this line runs, so this task produces
+            # no reservation, no provider call and no model usage at all.
+            return self._deterministic_output(task, dependency_outputs, tool_outputs)
         repair_reason: str | None = None
         attempt = 1
         while True:
@@ -289,3 +372,27 @@ class GenericWorker:
                 if attempt >= MAX_WORKER_OUTPUT_MODEL_ATTEMPTS:
                     raise
                 repair_reason, attempt = exc.reason_code, attempt + 1
+
+    def _deterministic_output(self, task: DynamicTask, dependency_outputs: Mapping[str, Any],
+                              tool_outputs: Mapping[str, Any]) -> Any:
+        """Produce and re-validate ONE task output with no model call at all.
+
+        The strategy's return value is never trusted for being the strategy's:
+        it goes through the SAME `validate_worker_output` the model path uses,
+        so a deterministic answer is held to the task's declared closed
+        `output_schema` and to the identical durable size bound. Both failure
+        shapes -- the strategy raising, and the strategy returning something
+        invalid -- collapse to a static code here, so neither a traceback nor
+        the rejected value can reach a durable task result.
+        """
+        try:
+            produced = self._task_output_strategy(
+                task=task, tool_outputs=tool_outputs, dependency_outputs=dependency_outputs)
+        except Exception:
+            # `from None`: a strategy traceback can quote tool material.
+            raise DeterministicOutputError("WORKER_OUTPUT_STRATEGY_FAILED") from None
+        try:
+            return validate_worker_output(produced, task.output_schema)
+        except (WorkerOutputValidationError, ToolCallError):
+            # Deliberately NOT repairable: see DETERMINISTIC_OUTPUT_REASONS.
+            raise DeterministicOutputError("WORKER_OUTPUT_STRATEGY_INVALID") from None
