@@ -28,7 +28,7 @@ guarantee:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from backend.engines.swarm_v2.evidence_bounds import IDENTITY_DIMENSIONS
 from backend.tools.contracts import ToolContext, ToolError, ToolMode, ToolOperation
