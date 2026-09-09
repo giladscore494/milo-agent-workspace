@@ -1,0 +1,32 @@
+{
+  "manifest_version": 1,
+  "proof": "r5_vehicle_proof",
+  "sources": {
+    "yeda": {
+      "blob_sha": "383ba9bf12ddfafeac79fe42ea449c11204dc017",
+      "canonical_url": "https://github.com/giladscore494/reliabilityAIModelsR2/blob/f7bf132abf1b1ec8f9d81076560a5a618447a9e6/my-flask-app/app/data/model_technical_catalog_il.json",
+      "capture_method": "read from a read-only local clone pinned to commit_sha; the checkout commit, the git blob sha and the file sha256 are all verified before the catalog is parsed",
+      "commit_sha": "f7bf132abf1b1ec8f9d81076560a5a618447a9e6",
+      "fixture_kind": "exact_record_subset",
+      "fixture_path": "yeda/rav4_model_record.json",
+      "fixture_sha256": "a2ce25de43f315517a5584eed94658bd54de721b5d9cee791f9ba952b09ad8c6",
+      "record_locator": {
+        "catalog_market": "IL",
+        "make": "Toyota",
+        "model": "RAV4",
+        "model_index": 860,
+        "record_market_presence": "IL-confirmed",
+        "record_profile_confidence": "medium",
+        "variant_index": 4,
+        "variant_support_level": "direct"
+      },
+      "repository": "giladscore494/reliabilityAIModelsR2",
+      "repository_path": "my-flask-app/app/data/model_technical_catalog_il.json",
+      "retrieved_at_utc": "2026-09-09T14:06:59Z",
+      "source_kind": "git_repository_file",
+      "upstream_catalog_hash": "76d2b5fbaa141577",
+      "upstream_generated_at": "2026-06-25T00:20:49Z",
+      "upstream_sha256": "0a8d0e4240cbf11ad908012168d9dd60cafc2c9f75b92caecbd73f126c349ad6"
+    }
+  }
+}
