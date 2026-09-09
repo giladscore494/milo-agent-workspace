@@ -53,6 +53,7 @@ from backend.engines.swarm_v2 import (
     Verifier,
     validate_product_outcome,
 )
+from backend.engines.swarm_v2.outcome import NO_USABLE_RESULT_CODE
 from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
 from backend.engines.swarm_v2.evidence_mapping import TrustedEvidenceAcquisition
 from backend.engines.swarm_v2.grounding import RepositoryEvidenceResolver
@@ -727,7 +728,7 @@ class ProofRepository(R3GuardedRepository):
             payload["evidence_key"], {"id": str(uuid4()), "run_id": str(run_id), **payload})
 
 
-def proof_run(*, checkpoint=None, repository=None, board=None, checkpoints=None):
+def proof_run(*, checkpoint=None, repository=None, board=None, checkpoints=None, events=None):
     """Execute the compiled proof plan through the REAL engine, end to end.
 
     Every model dependency is the poison gateway: the Commander client, the
@@ -765,6 +766,8 @@ def proof_run(*, checkpoint=None, repository=None, board=None, checkpoints=None)
                                    for item in board.references()],
         checkpoint_sink=(None if checkpoints is None
                          else lambda phase, value: checkpoints.append(deepcopy(value))),
+        event_sink=(None if events is None
+                    else lambda kind, payload: events.append((kind, payload))),
         verdict_sink=board.record_verification_verdict,
         resolution_sink=board.record_conflict_resolution)
     payload = {"id": str(RUN_UUID),
@@ -935,3 +938,204 @@ def test_the_compiled_plan_passes_the_real_firewall_and_grants_nothing():
 def test_an_unknown_proof_request_has_no_plan_at_all():
     with pytest.raises(UnknownProofRequest):
         DeterministicProofCommanderClient("some-other-vehicle")
+
+
+# =============================================================================
+# 10. controlled mutation: a wrong fact is rejected, whatever a model would say
+# =============================================================================
+#
+# The wrong fact is NEVER invented data dressed up as a source. Each case below
+# takes a REAL captured fact and changes exactly one thing about it, so what is
+# being tested is the comparison contract rather than a fixture. The Yeda
+# catalog's nominal engine-class label and a homologated exact displacement are
+# deliberately NOT used as a wrong-fact pair: a nominal label and an exact
+# measurement are different statements, not a right and a wrong answer, and
+# treating them as one would assert a semantic equivalence neither source makes.
+
+def captured_reference(board, field: str):
+    """One REAL durable claim of the completed proof, as the verifier sees it."""
+    return next(EvidenceReference.model_validate(item) for item in board.references()
+                if item["field"] == field)
+
+
+def settle(repository, reference):
+    """Settle ONE reference against the real durable evidence, with no model.
+
+    The verifier's gateway is poisoned, so a case that fell through to the
+    grounded model verifier would raise instead of returning a verdict --
+    which is what makes "rejected regardless of any model behaviour" a proof
+    rather than an assertion about a mock's scripted answer.
+    """
+    verifier = Verifier(gateway=PoisonGateway(), model="unused",
+                        resolver=RepositoryEvidenceResolver(repository, run_id=RUN_UUID))
+    plan = verifier.prepare([reference], conflict_claim_ids=set(), existing_verdicts={})
+    # Zero batches means deterministic code settled it: no model call was even
+    # planned, let alone made.
+    assert plan.batches == ()
+    return only(plan.settled)
+
+
+@pytest.mark.parametrize("label, mutation, expected", [
+    ("a wrong value", {"value": 305}, "R4_VALUE_MISMATCH"),
+    ("an unconvertible unit", {"unit": "kw"}, "R4_UNIT_NOT_CONVERTIBLE"),
+    ("no unit at all", {"unit": None}, "R4_UNIT_MISSING"),
+    ("a wrong model year", {"time_scope": {"year_start": 2019, "year_end": 2020}},
+     "R4_SCOPE_MISMATCH"),
+    ("a wrong market", {"market": "DE"}, "R4_SCOPE_MISMATCH"),
+    ("a wrong variant identity",
+     {"identity": {"body_style": "SUV", "drivetrain": "FWD", "engine": "2.5L",
+                   "transmission": "cvt"}}, "R4_IDENTITY_MISMATCH"),
+    ("a mismatched source version", {"source_version": "git_commit:" + "a" * 40},
+     "R4_SOURCE_VERSION_MISMATCH"),
+])
+def test_one_controlled_mutation_of_a_real_fact_is_always_rejected(label, mutation, expected):
+    _, repository, _, board = proof_run()
+    reference = captured_reference(board, "horsepower_hp")
+    verdict = settle(repository, reference.model_copy(update=mutation))
+    assert verdict.verdict == "rejected", label
+    assert verdict.reason == expected, label
+    assert verdict.mode == "deterministic_structured"
+    # The unmutated fact still verifies against the same durable evidence, so
+    # the rejection is the mutation's doing and nothing else.
+    assert settle(repository, reference).verdict == "verified"
+
+
+def test_a_rejected_fact_never_reaches_the_product_fields():
+    """A rejected claim is preserved in history and excluded from the answer."""
+    _, repository, _, board = proof_run()
+    wrong = captured_reference(board, "horsepower_hp").model_copy(update={"value": 305})
+    verdict = settle(repository, wrong)
+    result = FinalBuilder().build([wrong], [verdict])
+    assert result["fields"] == {}
+    assert validate_product_outcome(result).result_kind == "no_usable_result"
+
+
+# =============================================================================
+# 11. replay, resume and the durable-record guarantees
+# =============================================================================
+
+def test_resume_from_every_saved_checkpoint_duplicates_no_durable_record():
+    """A resumed run replays onto the SAME rows, and re-executes no task.
+
+    Every normal checkpoint of a completed proof is resumed from, and after
+    each resume the durable evidence, the verdicts and the support links are
+    still exactly what one run produced.
+    """
+    lease = WorkerLease(RUN_UUID, "worker-r5", 1, "lease-token-r5")
+    repository = ProofRepository(lease)
+    checkpoints = []
+    first, _, _, _ = proof_run(repository=repository, checkpoints=checkpoints)
+    counts = (len(repository.sources), len(repository.fragments), len(repository.claims),
+              len(repository.verdicts), len(repository.supports))
+    assert counts == (1, 3, 3, 3, 3)
+    assert checkpoints, "the proof produced no checkpoint to resume from"
+
+    for index, checkpoint in enumerate(checkpoints):
+        resumed, _, poison, _ = proof_run(repository=repository, checkpoint=checkpoint)
+        assert poison.calls == [], f"resume {index} reached a model path"
+        assert resumed == first, f"resume {index} changed the product result"
+        assert (len(repository.sources), len(repository.fragments), len(repository.claims),
+                len(repository.verdicts), len(repository.supports)) == counts, index
+
+
+def test_a_changed_version_or_locator_creates_distinct_provenance():
+    """Two versions of one source can never merge into one durable row.
+
+    Re-acquiring the same record at a DIFFERENT source version is new
+    provenance, not an update of the old row -- which is exactly why a claim
+    read at one version can never be validated against another.
+    """
+    lease = WorkerLease(RUN_UUID, "worker-r5", 1, "lease-token-r5")
+    repository = ProofRepository(lease)
+    board = EvidenceBoard(repository, lease)
+    acquisition = TrustedEvidenceAcquisition(board=board, mappers=proof_evidence_mappers())
+    result = yeda_result()
+    acquisition.acquire(ToolCallRecord(task_id="yeda_variant", call_id="yeda-1",
+                                       tool="yeda.vehicle_catalog",
+                                       operation="get_model_variant", result=result))
+    assert len(repository.sources) == 1
+
+    # The SAME record, read at a different commit of the same catalog.
+    other = deepcopy(result)
+    other["source"] = {**other["source"], "commit_sha": "b" * 40}
+    acquisition.acquire(ToolCallRecord(task_id="yeda_variant", call_id="yeda-1",
+                                       tool="yeda.vehicle_catalog",
+                                       operation="get_model_variant", result=other))
+    assert len(repository.sources) == 2
+    assert {row["source_version_id"] for row in repository.sources.values()} == {
+        proof_manifest.source_entry("yeda")["commit_sha"], "b" * 40}
+    # Same locators, distinct sources: six claims, not three overwritten ones.
+    assert len(repository.claims) == 6 and len(repository.fragments) == 6
+
+
+# =============================================================================
+# 12. not_found stays unreachable without a typed trusted negative
+# =============================================================================
+
+def test_empty_or_unmatched_ordinary_evidence_never_becomes_not_found():
+    """An absent answer is not a proven absence.
+
+    `not_found` requires a TYPED, tool-backed trusted negative. Nothing in this
+    proof constructs one -- the read-only tools raise a static "no such
+    variant" error, which is a failed lookup, not a source proving the vehicle
+    does not exist -- so an empty result stays `no_usable_result`.
+    """
+    empty = FinalBuilder().build([], [])
+    outcome = validate_product_outcome(empty)
+    assert (outcome.status, outcome.result_kind) == ("partial_success", "no_usable_result")
+    assert empty["needs_review"] == [{"code": NO_USABLE_RESULT_CODE}]
+
+    # An unmatched lookup is a tool ERROR, never a typed negative result.
+    with pytest.raises(ToolError) as failure:
+        proof_registry().execute("yeda.vehicle_catalog", "get_model_variant", PROOF_CONTEXT,
+                                 {**NARROWED, "model_year": 1998})
+    assert failure.value.code == "R5_YEDA_VARIANT_NOT_FOUND"
+
+
+def test_the_proof_constructs_no_trusted_negative_result_anywhere():
+    """The one type that could reach `not_found` is never built here."""
+    proof_sources = list(Path("backend/testing/r5_proof").rglob("*.py"))
+    assert proof_sources
+    for path in proof_sources:
+        assert "TrustedNegativeResult" not in path.read_text()
+    # And the engine still passes the builder no `trusted_negative=` argument,
+    # so `not_found` stays unreachable from a real run.
+    engine_source = Path("backend/engines/swarm_v2/engine.py").read_text()
+    assert "trusted_negative=" not in engine_source
+
+
+# =============================================================================
+# 13. nothing internal leaks to a browser-facing surface
+# =============================================================================
+
+def test_run_events_carry_identifiers_only_and_no_source_material():
+    """A public run event is not an evidence channel.
+
+    The proof's fixtures contain real source text, real URLs and Hebrew
+    titles. None of it may reach the event stream the browser polls.
+    """
+    events = []
+    _, repository, _, board = proof_run(events=events)
+    assert events, "the proof emitted no events"
+    serialized = json.dumps(events, ensure_ascii=False)
+    for leaked in ("plug_in_hybrid", "RAV4", "github.com", "reliabilityAIModelsR2",
+                   "make=Toyota", "yeda.models.860"):
+        assert leaked not in serialized, leaked
+    # Every payload value is a bounded identifier or a static code.
+    for _, payload in events:
+        for value in payload.values():
+            assert value is None or isinstance(value, (str, int, float, bool))
+            assert not isinstance(value, str) or len(value) <= 200
+
+
+def test_the_product_output_carries_no_internal_evidence_material():
+    """The browser-visible result names provenance; it never quotes evidence."""
+    result, repository, _, _ = proof_run()
+    serialized = json.dumps(result, ensure_ascii=False)
+    # No fragment text, no locator key, no support link, no verdict internals.
+    for leaked in ("make=Toyota", "structured_projection", "record_field",
+                   "content_hash", "fragment_id", "verification_mode",
+                   "R4_STRUCTURED_MATCH", "commit_sha"):
+        assert leaked not in serialized, leaked
+    # Durable fragment text exists, and stayed on the service side.
+    assert any("make=Toyota" in row["fragment_text"] for row in repository.fragments.values())
