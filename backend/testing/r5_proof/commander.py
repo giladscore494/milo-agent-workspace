@@ -31,7 +31,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+from .government import GovernmentVehicleRegistryTool, WLTP_RESOURCE_ID
 from .tools import YedaVehicleCatalogTool
+from .web import ToyotaArchivedModelDocumentTool
 
 #: The task output every proof task declares. Small, closed and structural:
 #: the deterministic strategy states exactly these fields and the worker
@@ -73,6 +75,12 @@ class ProofTask:
     required_fields: tuple[str, ...]
     minimum_sources: int = 1
     min_confidence: float = 0.5
+    #: Whether this task is ALLOWED not to resolve. False for every task that
+    #: must produce evidence -- a failure there is a defect and must stop the
+    #: run. True only for a task whose honest answer may be "this cannot be
+    #: determined conservatively": its failure is then a recorded unresolved
+    #: item in `needs_review`, which is what such a question deserves.
+    allow_partial: bool = False
 
     def as_plan_task(self) -> dict[str, Any]:
         return {
@@ -84,7 +92,7 @@ class ProofTask:
                          "min_confidence": self.min_confidence},
             "priority": 50, "recursion_depth": 0, "estimated_cost_units": 0,
             "completion": {"required_outputs": sorted(PROOF_OUTPUT_SCHEMA["required"]),
-                           "evidence_satisfied": True, "allow_partial": False},
+                           "evidence_satisfied": True, "allow_partial": self.allow_partial},
         }
 
 
@@ -108,14 +116,26 @@ class ProofRequest:
         }
 
 
-#: The selected vehicle, as the pinned Yeda catalog states it. `fuel_type` is
-#: present because make + commercial model + model year matches FIVE RAV4
-#: variants in that catalog: without it the registered operation fails closed
-#: as ambiguous rather than choosing one.
+#: The one vehicle this proof is about, as the catalog and the register both
+#: name it. `fuel_type` is present because make + commercial model + model year
+#: matches FIVE RAV4 variants in the catalog and three registry rows: without
+#: it the registered operations fail closed as ambiguous rather than choosing.
+_VEHICLE = {"make": "Toyota", "commercial_model": "RAV4", "market": "IL"}
+
+#: The registry row the 2021 question resolves to. It is NOT a chosen row: for
+#: model year 2021 exactly one committed record carries this commercial model,
+#: this market, plug-in propulsion and four-wheel drive, and the `_id` below is
+#: stated so the tool can CHECK the row it selected is the row this plan was
+#: reviewed against. Naming it can never resolve an ambiguity -- a request that
+#: matches two rows fails whether or not it names one of them.
+GOVERNMENT_RECORD_ID_2021 = 36327
+
 TOYOTA_RAV4_PHEV_IL_2021 = ProofRequest(
     key="toyota-rav4-phev-il-2021",
-    objective=("Establish what the pinned Israeli vehicle knowledge catalog states about the "
-               "Toyota RAV4 plug-in hybrid variant offered in Israel for model year 2021."),
+    objective=("Establish what the pinned Israeli vehicle knowledge catalog, the Israeli "
+               "Ministry of Transport vehicle-model register and the official Toyota "
+               "Israel archived-model page each state about the Toyota RAV4 plug-in "
+               "hybrid offered in Israel."),
     tasks=(
         ProofTask(
             task_id="yeda_variant",
@@ -125,9 +145,59 @@ TOYOTA_RAV4_PHEV_IL_2021 = ProofRequest(
             calls=(ProofCall(
                 call_id="yeda-1", tool=YedaVehicleCatalogTool.name,
                 operation="get_model_variant",
-                arguments={"make": "Toyota", "commercial_model": "RAV4", "market": "IL",
-                           "model_year": 2021, "fuel_type": "plug_in_hybrid"}),),
+                arguments={**_VEHICLE, "model_year": 2021, "fuel_type": "plug_in_hybrid"}),),
             required_fields=("fuel_type",),
+        ),
+        ProofTask(
+            task_id="government_record",
+            goal=("Read the homologated model-year 2021 Toyota RAV4 plug-in hybrid record "
+                  "from the pinned Israeli Ministry of Transport vehicle-model register."),
+            scope="One registry record, identified conservatively. Read-only.",
+            calls=(ProofCall(
+                call_id="gov-1", tool=GovernmentVehicleRegistryTool.name,
+                operation="get_model_record",
+                arguments={**_VEHICLE, "resource_id": WLTP_RESOURCE_ID, "model_year": 2021,
+                           "fuel_type": "plug_in_hybrid", "propulsion_technology": "plug_in",
+                           "drivetrain": "awd",
+                           "expected_record_id": GOVERNMENT_RECORD_ID_2021}),),
+            required_fields=("engine_displacement_cc",),
+        ),
+        ProofTask(
+            task_id="web_archived_status",
+            goal=("Read the official Toyota Israel archived-model page for the RAV4 "
+                  "Plug-in: model identity and marketing status only."),
+            scope=("One saved official page. Identity and archived status only -- never a "
+                   "technical specification. Read-only."),
+            calls=(ProofCall(
+                call_id="web-1", tool=ToyotaArchivedModelDocumentTool.name,
+                operation="read_archived_model_document",
+                arguments={"document_id": "toyota_il_rav4_phev", "make": "Toyota",
+                           # Toyota Israel's OWN commercial name for the model.
+                           "commercial_model": "RAV4 Plug-in", "market": "IL"}),),
+            required_fields=("marketing_status",),
+        ),
+        ProofTask(
+            task_id="government_record_2026",
+            goal=("Identify the model-year 2026 Toyota RAV4 plug-in hybrid registry record "
+                  "using only the dimensions the catalog itself states."),
+            scope=("The same conservative identity as the catalog variant -- make, "
+                   "commercial model, market, model year, fuel, propulsion, drivetrain -- "
+                   "and deliberately NO trim and NO model code, because the catalog states "
+                   "neither. Read-only."),
+            calls=(ProofCall(
+                call_id="gov-2", tool=GovernmentVehicleRegistryTool.name,
+                operation="get_model_record",
+                arguments={**_VEHICLE, "resource_id": WLTP_RESOURCE_ID, "model_year": 2026,
+                           "fuel_type": "plug_in_hybrid", "propulsion_technology": "plug_in",
+                           "drivetrain": "awd"}),),
+            required_fields=("engine_displacement_cc",),
+            # The one task allowed not to resolve. Two committed registry rows
+            # answer this identity for 2026 and differ only by trim, which the
+            # catalog does not state, so there is no conservative answer and
+            # the register is asked to refuse rather than choose. Its refusal
+            # is the run's real unresolved item, and it reaches `needs_review`
+            # through the ordinary task-failure path.
+            allow_partial=True,
         ),
     ),
 )
@@ -192,6 +262,7 @@ class DeterministicProofCommanderClient:
                 "reason": "the compiled proof plan is complete; verify the acquired evidence"}
 
 
-__all__ = ["PROOF_OUTPUT_SCHEMA", "PROOF_REQUESTS", "TOYOTA_RAV4_PHEV_IL_2021",
+__all__ = ["GOVERNMENT_RECORD_ID_2021", "PROOF_OUTPUT_SCHEMA", "PROOF_REQUESTS",
+           "TOYOTA_RAV4_PHEV_IL_2021",
            "DeterministicProofCommanderClient", "ProofCall", "ProofRequest", "ProofTask",
            "UnknownProofRequest"]

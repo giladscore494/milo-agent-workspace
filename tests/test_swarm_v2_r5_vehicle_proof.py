@@ -5,8 +5,10 @@ browser capture, no production Supabase and no committed secret: the proof
 reads pinned fixtures captured once, by hand, as an explicit development
 action, and every assertion below is a deterministic function of those bytes.
 
-This module currently covers the R5 execution seam. The three-source vehicle
-proof itself lands with the pinned Yeda/Government/Web fixtures.
+This module covers the whole R5 proof: the execution seam, the three pinned
+real sources -- the Yeda catalog, the Israeli Ministry of Transport
+vehicle-model register and the official Toyota Israel archived-model page --
+and the truthful partial outcome they actually support.
 
 --- the deterministic zero-model execution seam ------------------------------
 
@@ -28,10 +30,13 @@ tests pin its boundaries:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import shutil
 from copy import deepcopy
 from pathlib import Path
+from typing import Mapping
 from uuid import UUID, uuid4
 
 import pytest
@@ -50,6 +55,7 @@ from backend.engines.swarm_v2 import (
     PlanValidator,
     SwarmV2Engine,
     TaskGraph,
+    VerificationVerdict,
     Verifier,
     validate_product_outcome,
 )
@@ -58,7 +64,8 @@ from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
 from backend.engines.swarm_v2.evidence_mapping import TrustedEvidenceAcquisition
 from backend.engines.swarm_v2.grounding import RepositoryEvidenceResolver
 from backend.engines.swarm_v2.support import VERIFIER_CONTRACT_VERSION
-from backend.testing.r5_proof.commander import (TOYOTA_RAV4_PHEV_IL_2021,
+from backend.testing.r5_proof.commander import (GOVERNMENT_RECORD_ID_2021,
+                                                TOYOTA_RAV4_PHEV_IL_2021,
                                                 DeterministicProofCommanderClient,
                                                 UnknownProofRequest)
 from backend.testing.r5_proof.strategy import VehicleProofOutputStrategy
@@ -69,10 +76,21 @@ from backend.engines.swarm_v2.evidence_mapping import (PRODUCTION_EVIDENCE_MAPPE
 from backend.engines.swarm_v2.tool_calls import ToolCallRecord
 from backend.testing.r5_proof import manifest as proof_manifest
 from backend.testing.r5_proof.identity import VehicleIdentityError, vehicle_entity_key
-from backend.testing.r5_proof.mappers import (YEDA_FACT_FIELDS, YEDA_SOURCE_TYPE,
-                                              proof_evidence_mappers)
+from backend.testing.r5_proof.government import (GOVERNMENT_DATASET_MARKET, UNMAPPED_FIELDS,
+                                                 WLTP_RESOURCE_ID,
+                                                 GovernmentVehicleRegistryTool)
+from backend.testing.r5_proof.mappers import (GOVERNMENT_FACT_FIELDS, GOVERNMENT_SOURCE_TYPE,
+                                              WEB_SOURCE_TYPE, YEDA_FACT_FIELDS,
+                                              YEDA_SOURCE_TYPE, proof_evidence_mappers)
 from backend.testing.r5_proof.tools import YEDA_MARKET_PRESENCE, YedaVehicleCatalogTool
-from backend.tools import ToolContext, ToolError, ToolRegistry
+from backend.testing.r5_proof.web import (TOYOTA_RAV4_PHEV_STATEMENTS,
+                                          WEB_TEXT_PROJECTION_VERSION,
+                                          ToyotaArchivedModelDocumentTool,
+                                          visible_text_projection)
+from backend.engines.swarm_v2.comparison import scope_identity
+from backend.engines.swarm_v2.conflict_policy import (SOURCE_TYPE_AUTHORITY, conflict_groups,
+                                                      is_authoritative)
+from backend.tools import ToolContext, ToolError, ToolMode, ToolRegistry
 
 from test_swarm_v2_r3_evidence_contract import R3GuardedRepository
 from test_swarm_v2_tool_contract import CONTEXT, StubGateway, get_model, registry, spec
@@ -90,7 +108,8 @@ def only(items):
 
 # --- the pinned proof source ------------------------------------------------
 
-PROOF_SCOPES = frozenset({"yeda:catalog_read"})
+PROOF_SCOPES = frozenset({"yeda:catalog_read", "gov_il:registry_read",
+                          "web:saved_document_read"})
 PROOF_CONTEXT = ToolContext(scopes=PROOF_SCOPES)
 
 #: The selected vehicle, as the pinned Yeda catalog states it.
@@ -99,9 +118,22 @@ VEHICLE = {"make": "Toyota", "commercial_model": "RAV4", "market": "IL", "model_
 #: catalog states for the same commercial model and the same year.
 NARROWED = {**VEHICLE, "fuel_type": "plug_in_hybrid"}
 
+#: The same vehicle as the Israeli register identifies it, narrowed by exactly
+#: the dimensions the catalog also states -- and by no more, so the ambiguous
+#: model year stays genuinely ambiguous.
+GOVERNMENT_REQUEST = {"resource_id": WLTP_RESOURCE_ID, "make": "Toyota",
+                      "commercial_model": "RAV4", "market": "IL",
+                      "fuel_type": "plug_in_hybrid", "propulsion_technology": "plug_in",
+                      "drivetrain": "awd"}
+
+#: The saved official page, as Toyota Israel itself names the model.
+WEB_REQUEST = {"document_id": "toyota_il_rav4_phev", "make": "Toyota",
+               "commercial_model": "RAV4 Plug-in", "market": "IL"}
+
 
 def proof_registry() -> ToolRegistry:
-    return ToolRegistry([YedaVehicleCatalogTool()])
+    return ToolRegistry([YedaVehicleCatalogTool(), GovernmentVehicleRegistryTool(),
+                         ToyotaArchivedModelDocumentTool()])
 
 
 def yeda_result(**overrides):
@@ -115,6 +147,36 @@ def yeda_bundle(result=None):
     record = ToolCallRecord(task_id="proof-yeda", call_id="yeda-1",
                             tool="yeda.vehicle_catalog", operation="get_model_variant",
                             result=result if result is not None else yeda_result())
+    return proof_evidence_mappers().map(record)
+
+
+def government_result(**overrides):
+    """Run the real registered registry operation against the pinned pages."""
+    payload = {**GOVERNMENT_REQUEST, "model_year": 2021,
+               "expected_record_id": GOVERNMENT_RECORD_ID_2021, **overrides}
+    return proof_registry().execute("gov_il.vehicle_registry", "get_model_record",
+                                    PROOF_CONTEXT, payload)
+
+
+def government_bundle(result=None):
+    record = ToolCallRecord(task_id="proof-gov", call_id="gov-1",
+                            tool="gov_il.vehicle_registry", operation="get_model_record",
+                            result=result if result is not None else government_result())
+    return proof_evidence_mappers().map(record)
+
+
+def web_result(**overrides):
+    """Run the real registered saved-document operation against the page."""
+    return proof_registry().execute("toyota.archived_model_document",
+                                    "read_archived_model_document", PROOF_CONTEXT,
+                                    {**WEB_REQUEST, **overrides})
+
+
+def web_bundle(result=None):
+    record = ToolCallRecord(task_id="proof-web", call_id="web-1",
+                            tool="toyota.archived_model_document",
+                            operation="read_archived_model_document",
+                            result=result if result is not None else web_result())
     return proof_evidence_mappers().map(record)
 
 
@@ -360,7 +422,10 @@ def test_every_committed_fixture_matches_its_manifest_checksum():
     under the same provenance.
     """
     verified = proof_manifest.verify_all_fixtures()
-    assert "yeda" in verified
+    # All three real source families are committed, checksum-gated, and read
+    # through the SAME gate. None of them is described in prose only.
+    assert set(verified) == {"yeda", "government_package", "government_wltp_page_1",
+                             "government_wltp_page_2", "web_toyota_rav4_phev"}
     manifest = proof_manifest.load_manifest()
     assert manifest["manifest_version"] == proof_manifest.MANIFEST_VERSION
     for key in verified:
@@ -627,7 +692,9 @@ def test_the_entity_key_is_one_shared_conservative_identity():
 def test_the_proof_mappers_are_not_production_mappers():
     assert PRODUCTION_EVIDENCE_MAPPERS.registered == frozenset()
     assert proof_evidence_mappers().registered == {
-        ("yeda.vehicle_catalog", "get_model_variant")}
+        ("yeda.vehicle_catalog", "get_model_variant"),
+        ("gov_il.vehicle_registry", "get_model_record"),
+        ("toyota.archived_model_document", "read_archived_model_document")}
 
 
 # =============================================================================
@@ -779,13 +846,13 @@ def proof_run(*, checkpoint=None, repository=None, board=None, checkpoints=None,
 
 
 def test_the_whole_proof_runs_through_the_real_engine_with_zero_model_calls():
-    """The acceptance path, end to end, offline.
+    """The acceptance path, end to end, offline, across all three sources.
 
-    real pinned Yeda fixture -> validated read-only ToolRegistry operation ->
-    ToolCallRecord -> trusted operation-specific mapper -> versioned source ->
-    focused fragments and structured facts -> lease-guarded EvidenceBoard ->
-    RepositoryEvidenceResolver -> R4 deterministic verification -> FinalBuilder
-    -> truthful R1 product outcome.
+    real pinned Yeda / Government / Web fixtures -> validated read-only
+    ToolRegistry operations -> ToolCallRecords -> trusted operation-specific
+    mappers -> versioned sources -> focused fragments and structured facts ->
+    lease-guarded EvidenceBoard -> RepositoryEvidenceResolver -> R4
+    deterministic verification -> FinalBuilder -> truthful R1 product outcome.
     """
     checkpoints = []
     result, repository, poison, board = proof_run(checkpoints=checkpoints)
@@ -793,43 +860,124 @@ def test_the_whole_proof_runs_through_the_real_engine_with_zero_model_calls():
     # 1. Not one model or provider call anywhere in the run.
     assert poison.calls == []
 
-    # 2. Durable evidence was written in the contract's order, under the lease.
-    assert repository.writes[:4] == ["source", "fragment", "fragment", "fragment"]
-    assert repository.writes.count("source") == 1
-    assert len(repository.claims) == 3 and len(repository.fragments) == 3
+    # 2. All THREE real source families participated, each pinned to the
+    # strongest immutable version it actually publishes.
+    assert len(repository.sources) == 3
+    assert {(row["source_version_kind"], row["source_version_id"])
+            for row in repository.sources.values()} == {
+        ("git_commit", proof_manifest.source_entry("yeda")["commit_sha"]),
+        ("dataset_version", proof_manifest.source_entry("government_wltp_page_1")["source_version"]),
+        ("content_sha256", proof_manifest.source_entry("web_toyota_rav4_phev")["upstream_sha256"]),
+    }
+    assert {row["source_type"] for row in repository.sources.values()} == {
+        YEDA_SOURCE_TYPE, GOVERNMENT_SOURCE_TYPE, WEB_SOURCE_TYPE}
 
-    # 3. The source is pinned to the real commit, and every claim is located.
-    source = only(list(repository.sources.values()))
-    assert (source["source_version_kind"], source["source_version_id"]) == \
-        ("git_commit", proof_manifest.source_entry("yeda")["commit_sha"])
+    # 3. Durable evidence was written in the contract's order, under the lease,
+    # and every claim is located.
+    assert repository.writes[:4] == ["source", "fragment", "fragment", "fragment"]
+    assert repository.writes.count("source") == 3
+    assert len(repository.claims) == 9 and len(repository.fragments) == 9
     assert all(row["evidence_locator"] for row in repository.claims.values())
+    # A structured record is projected; a document is quoted. The fragment type
+    # is decided by the locator shape, so neither can impersonate the other.
+    assert {row["fragment_type"] for row in repository.fragments.values()} == \
+        {"structured_projection", "verbatim_excerpt"}
 
     # 4. Every claim was settled DETERMINISTICALLY, with durable support.
-    assert len(repository.verdicts) == 3
+    assert len(repository.verdicts) == 9
     assert {row["verdict"] for row in repository.verdicts.values()} == {"verified"}
     assert {row["verification_mode"] for row in repository.verdicts.values()} == \
         {"deterministic_structured"}
     assert {row["verifier_contract_version"] for row in repository.verdicts.values()} == \
         {VERIFIER_CONTRACT_VERSION}
-    assert len(repository.supports) == 3
+    assert len(repository.supports) == 9
 
-    # 5. The R1 product outcome is valid, and its fields are verified material.
+    # 5. The R1 product outcome is valid, and every source contributed a
+    # verified field the answer actually rests on.
     assert validate_product_outcome(result)
     assert result["fields"]["fuel_type"][0]["value"] == "plug_in_hybrid"
     assert result["fields"]["horsepower_hp"][0]["value"] == 306
     assert result["fields"]["nominal_engine_displacement_l"][0]["value"] == 2.5
+    assert result["fields"]["engine_displacement_cc"][0]["value"] == 2487
+    assert result["fields"]["official_model_code"][0]["value"] == "AXAP54L ANXMBK"
+    assert result["fields"]["marketing_status"][0]["value"] == "ended"
+    contributing = {entry["provenance"]["task_id"]
+                    for entries in result["fields"].values() for entry in entries}
+    assert contributing == {"yeda_variant", "government_record", "web_archived_status"}
     # Provenance travels into the product output: every field names the claim,
     # the source and the run that produced it.
+    known_sources = {row["id"] for row in repository.sources.values()}
     for entries in result["fields"].values():
         for entry in entries:
-            assert entry["provenance"]["source_id"] == source["id"]
+            assert entry["provenance"]["source_id"] in known_sources
             assert entry["provenance"]["run_id"] == str(RUN_UUID)
 
-    # 6. The checkpoint carries the same verdicts, so a resume replays them.
+    # 6. The outcome is `partial_success / partial_result` because the evidence
+    # holds BOTH usable verified material and one real unresolved item -- not
+    # because anything here asked for that pair. The unresolved item is the
+    # model year the register genuinely cannot answer conservatively.
+    assert (result["status"], result["result_kind"]) == ("partial_success", "partial_result")
+    assert result["needs_review"] == [{"task_id": "government_record_2026",
+                                       "code": "R5_GOV_RECORD_AMBIGUOUS"}]
+
+    # 7. The checkpoint carries the same verdicts, so a resume replays them.
     state = checkpoints[-1]["artifacts"]["swarm_state"]
-    assert len(state["evidence_references"]) == 3
+    assert len(state["evidence_references"]) == 9
     assert {item["reason"] for item in state["verifier_state"].values()} == \
         {"R4_STRUCTURED_MATCH"}
+
+
+def test_the_partial_outcome_is_decided_by_the_canonical_policy_alone():
+    """`partial_success / partial_result` is derived, never asserted.
+
+    The proof does not construct its own status: it hands the builder what the
+    run found, and `decide_outcome` pairs "at least one usable verified field"
+    with "at least one unresolved item". Removing either half changes the
+    outcome, which is what shows the pair was earned rather than chosen.
+    """
+    result, _, _, board = proof_run()
+    references = [EvidenceReference.model_validate(item) for item in board.references()]
+    verdicts = [VerificationVerdict(claim_id=item.claim_id, verdict="verified",
+                                    reason="R4_STRUCTURED_MATCH")
+                for item in references]
+
+    # The same verified evidence with NOTHING outstanding is a complete run...
+    without_gap = FinalBuilder().build(references, verdicts)
+    assert (without_gap["status"], without_gap["result_kind"]) == ("complete", "usable_result")
+    # ...and the same unresolved item with NO usable field is not partial at all.
+    without_fields = FinalBuilder().build([], [], task_failures=result["needs_review"])
+    assert (without_fields["status"], without_fields["result_kind"]) == \
+        ("partial_success", "no_usable_result")
+    # Only both together produce what the real run produced.
+    both = FinalBuilder().build(references, verdicts, task_failures=result["needs_review"])
+    assert (both["status"], both["result_kind"]) == ("partial_success", "partial_result")
+    assert (result["status"], result["result_kind"]) == (both["status"], both["result_kind"])
+
+
+def test_the_unresolved_item_is_a_real_ambiguity_in_the_captured_records():
+    """The gap in `needs_review` is a property of the data, not of the plan.
+
+    Two committed registry rows answer the 2026 identity the catalog states,
+    and they differ ONLY by trim -- which the catalog does not state. Naming
+    the trim resolves it; that is what makes the refusal a real limit of the
+    sources rather than a tool that cannot find anything.
+    """
+    with pytest.raises(ToolError) as failure:
+        proof_registry().execute("gov_il.vehicle_registry", "get_model_record",
+                                 PROOF_CONTEXT, {**GOVERNMENT_REQUEST, "model_year": 2026})
+    assert failure.value.code == "R5_GOV_RECORD_AMBIGUOUS"
+
+    # The two rows are real, distinct, and separated by exactly one dimension.
+    resolved = [proof_registry().execute(
+        "gov_il.vehicle_registry", "get_model_record", PROOF_CONTEXT,
+        {**GOVERNMENT_REQUEST, "model_year": 2026, "trim": trim})
+        for trim in ("SE-PLUGIN", "XSE-PLUGIN")]
+    assert [item["record_id"] for item in resolved] == [37392, 37393]
+    first, second = (item["variant"] for item in resolved)
+    assert {key for key in first if first[key] != second[key]} == {"trim"}
+    # And the same identity for 2021 has exactly ONE answer, so the 2026
+    # refusal is not the tool simply being unable to select anything.
+    assert government_result()["record_id"] == GOVERNMENT_RECORD_ID_2021
 
 
 def test_the_proof_would_fail_if_it_bypassed_any_required_stage():
@@ -895,7 +1043,7 @@ def test_replaying_the_proof_duplicates_no_durable_evidence():
     assert second == first
     assert (len(repository.sources), len(repository.fragments), len(repository.claims),
             len(repository.verdicts), len(repository.supports)) == counts
-    assert counts == (1, 3, 3, 3, 3)
+    assert counts == (3, 9, 9, 9, 9)
 
 
 def test_a_stale_worker_lease_fails_every_durable_proof_write_closed():
@@ -924,12 +1072,25 @@ def test_the_compiled_plan_passes_the_real_firewall_and_grants_nothing():
                               limits=PlanLimits(max_tasks=8, max_tool_calls=8, max_replans=0))
     plan = validator.validate(client.create_plan(model="compiled", objective="anything at all",
                                                  context={"hostile": "input"}))
-    call = only(only(plan.graph.tasks).tools)
-    assert (call.name, call.operation) == ("yeda.vehicle_catalog", "get_model_variant")
+    planned = {task.task_id: only(task.tools) for task in plan.graph.tasks}
+    assert {(call.name, call.operation) for call in planned.values()} == {
+        ("yeda.vehicle_catalog", "get_model_variant"),
+        ("gov_il.vehicle_registry", "get_model_record"),
+        ("toyota.archived_model_document", "read_archived_model_document")}
     # The arguments came from the static table, never from the objective or
     # the context the caller supplied.
-    assert call.arguments == {"make": "Toyota", "commercial_model": "RAV4", "market": "IL",
-                              "model_year": 2021, "fuel_type": "plug_in_hybrid"}
+    assert planned["yeda_variant"].arguments == {
+        "make": "Toyota", "commercial_model": "RAV4", "market": "IL",
+        "model_year": 2021, "fuel_type": "plug_in_hybrid"}
+    assert planned["government_record"].arguments == {
+        **GOVERNMENT_REQUEST, "model_year": 2021,
+        "expected_record_id": GOVERNMENT_RECORD_ID_2021}
+    assert planned["web_archived_status"].arguments == WEB_REQUEST
+    # The 2026 question states NO trim and NO model code, because the catalog
+    # states neither. That is what makes its ambiguity real rather than staged.
+    ambiguous = planned["government_record_2026"].arguments
+    assert ambiguous == {**GOVERNMENT_REQUEST, "model_year": 2026}
+    assert "trim" not in ambiguous and "expected_record_id" not in ambiguous
     assert "hostile" not in json.dumps(plan.model_dump(mode="json"))
     # No scope, capability or write approval is expressible in a plan at all.
     assert "scopes" not in json.dumps(plan.model_dump(mode="json"))
@@ -1027,7 +1188,7 @@ def test_resume_from_every_saved_checkpoint_duplicates_no_durable_record():
     first, _, _, _ = proof_run(repository=repository, checkpoints=checkpoints)
     counts = (len(repository.sources), len(repository.fragments), len(repository.claims),
               len(repository.verdicts), len(repository.supports))
-    assert counts == (1, 3, 3, 3, 3)
+    assert counts == (3, 9, 9, 9, 9)
     assert checkpoints, "the proof produced no checkpoint to resume from"
 
     for index, checkpoint in enumerate(checkpoints):
@@ -1139,3 +1300,747 @@ def test_the_product_output_carries_no_internal_evidence_material():
         assert leaked not in serialized, leaked
     # Durable fragment text exists, and stayed on the service side.
     assert any("make=Toyota" in row["fragment_text"] for row in repository.fragments.values())
+
+
+# =============================================================================
+# 14. the captured Government and Web sources: provenance, gates and refusals
+# =============================================================================
+#
+# Everything below is a property of the material that was actually captured on
+# 2026-09-14 and committed byte-for-byte. Nothing here mocks a source, and
+# nothing asserts a value that was not read out of the committed bytes.
+
+#: The archived-status sentence the official page must carry, verbatim:
+#: "marketing of the RAV4 Plug-in model has ended."
+ENDED_SENTENCE = "שיווק הדגם ראב4 פלאג-אין הסתיים."
+
+#: The same sentence as the RAW markup writes it -- inside a `<strong>`, with
+#: non-breaking spaces the visible-text projection normalizes away. Editing the
+#: committed bytes means editing this form, not the normalized one.
+RAW_ENDED_SENTENCE = "שיווק הדגם\u00a0ראב4 פלאג-אין הסתיים.".replace("\\u00a0", "\u00a0")
+
+
+@pytest.mark.parametrize("key", ["government_package", "government_wltp_page_1",
+                                 "government_wltp_page_2"])
+def test_a_captured_government_fixture_is_the_exact_response_that_was_received(key):
+    """An `exact_response` fixture IS the response, not a rendering of it.
+
+    `fixture_sha256` is the digest of the committed bytes and `upstream_sha256`
+    is the digest of what the server sent. For an `exact_response` they are
+    necessarily equal, and `upstream_committed` says so -- which is exactly what
+    lets the two fixtures that are NOT the whole response say the opposite.
+    """
+    entry, payload = proof_manifest.verify_fixture(key)
+    assert entry["fixture_kind"] == "exact_response"
+    assert entry["upstream_committed"] is True
+    assert entry["fixture_sha256"] == entry["upstream_sha256"]
+    assert entry["fixture_byte_count"] == entry["response_byte_count"] == len(payload)
+    assert entry["http_status"] == 200
+    assert entry["redirect_chain"] == []
+    # Requested and final URL agree, on one approved host, over HTTPS.
+    assert entry["requested_url"] == entry["final_url"]
+    assert entry["final_url"].startswith("https://")
+
+
+@pytest.mark.parametrize("key, kind", [("yeda", "exact_record_subset"),
+                                       ("web_toyota_rav4_phev", "deterministic_projection")])
+def test_a_fixture_that_is_not_the_whole_upstream_object_says_so(key, kind):
+    """Two digests, two objects, and the manifest never conflates them.
+
+    Neither the 7.3 MB Yeda catalog nor the 356 KB Toyota page is committed.
+    What is committed is a bounded piece of each, and the manifest records the
+    committed digest and the UPSTREAM digest as separate fields with
+    `upstream_committed: false` -- so a reader is never invited to assume the
+    stronger claim that the repository holds the whole object.
+    """
+    entry, payload = proof_manifest.verify_fixture(key)
+    assert entry["fixture_kind"] == kind
+    assert entry["upstream_committed"] is False
+    assert entry["fixture_sha256"] != entry["upstream_sha256"]
+    assert entry["fixture_byte_count"] == len(payload)
+    # The SOURCE VERSION is still the whole upstream object, never the excerpt.
+    if entry.get("source_version_kind") == "content_sha256":
+        assert entry["source_version"] == entry["upstream_sha256"]
+        assert entry["fixture_byte_count"] < entry["response_byte_count"]
+
+
+def test_absent_response_metadata_is_recorded_as_absent_and_checked_both_ways():
+    """No ETag, no Last-Modified, no revision -- said out loud, and enforced.
+
+    None of the captured responses carried a validator, and the CKAN resource
+    publishes no `revision_id`. That is recorded as an explicit null plus a
+    declaration, and the manifest gate checks BOTH directions, so neither a
+    silently invented value nor an undeclared gap can survive review.
+    """
+    for key in ("government_wltp_page_1", "web_toyota_rav4_phev"):
+        entry = proof_manifest.source_entry(key)
+        assert entry["absent_source_metadata"], key
+        for name in entry["absent_source_metadata"]:
+            assert name in proof_manifest.OPTIONAL_SOURCE_METADATA
+            assert name in entry and entry[name] is None, (key, name)
+
+    # Inventing one without withdrawing the declaration is a refusal...
+    invented = {**proof_manifest.source_entry("government_wltp_page_1"),
+                "etag": 'W/"deadbeef"'}
+    with pytest.raises(proof_manifest.ProofManifestError) as failure:
+        proof_manifest._validate_source(invented)
+    assert failure.value.reason_code == "R5_MANIFEST_INVALID"
+    # ...and so is a null nobody declared, which is the shape a later edit
+    # would need in order to fill a gap in quietly.
+    undeclared = {**proof_manifest.source_entry("government_wltp_page_1"),
+                  "absent_source_metadata": ["etag", "resource_revision_id"]}
+    with pytest.raises(proof_manifest.ProofManifestError) as second:
+        proof_manifest._validate_source(undeclared)
+    assert second.value.reason_code == "R5_MANIFEST_INVALID"
+
+
+@pytest.mark.parametrize("key, relative, before, after", [
+    ("government_wltp_page_1", "government/wltp_page_000001.json",
+     '"nefah_manoa":2487', '"nefah_manoa":2488'),
+    ("web_toyota_rav4_phev", "web/toyota_il_rav4_phev.visible_text.txt",
+     "הסתיים", "ממשיך"),
+])
+def test_one_modified_captured_byte_fails_the_fixture_closed(relocated_fixtures, key,
+                                                             relative, before, after):
+    """A single edited byte of a captured response stops the proof.
+
+    Both edits are exactly the plausible kind: a homologated displacement off
+    by one, and an archived-status word turned into its opposite. Neither
+    reaches a parser, because the digest is compared before the bytes are
+    decoded at all.
+    """
+    def flip(root):
+        path = root / relative
+        raw = path.read_bytes()
+        assert before.encode("utf-8") in raw, "the fixture no longer holds the text under test"
+        path.write_bytes(raw.replace(before.encode("utf-8"), after.encode("utf-8"), 1))
+
+    relocated_fixtures(flip)
+    with pytest.raises(proof_manifest.ProofManifestError) as failure:
+        proof_manifest.verify_fixture(key)
+    assert failure.value.reason_code in {"R5_FIXTURE_CHECKSUM_MISMATCH",
+                                         "R5_FIXTURE_BYTE_COUNT_MISMATCH"}
+
+
+def test_a_truncated_captured_fixture_is_classified_as_truncation(relocated_fixtures):
+    """A short read is a size failure, not a generic checksum failure."""
+    def truncate(root):
+        path = root / "web" / "toyota_il_rav4_phev.visible_text.txt"
+        path.write_bytes(path.read_bytes()[:-64])
+
+    relocated_fixtures(truncate)
+    with pytest.raises(proof_manifest.ProofManifestError) as failure:
+        proof_manifest.verify_fixture("web_toyota_rav4_phev")
+    assert failure.value.reason_code == "R5_FIXTURE_BYTE_COUNT_MISMATCH"
+
+
+def test_the_government_source_is_pinned_to_the_datasets_own_published_version():
+    """A retrieval time is not a version, and neither is a page digest.
+
+    The register's version is the DATASET's own `last_modified`, read from the
+    CKAN package metadata captured alongside the rows. The resource publishes
+    no `revision_id`, so none is recorded and none is invented.
+    """
+    entry = proof_manifest.source_entry("government_wltp_page_1")
+    assert entry["source_version_kind"] == "dataset_version"
+    assert entry["resource_id"] == WLTP_RESOURCE_ID
+    assert entry["ckan_package_id"] == "degem-rechev-wltp"
+    assert entry["resource_revision_id"] is None
+
+    package = json.loads((proof_manifest.FIXTURE_ROOT / "government" /
+                          "package_show.json").read_text(encoding="utf-8"))
+    resource = only([item for item in package["result"]["resources"]
+                     if item["id"] == WLTP_RESOURCE_ID])
+    # The manifest's version IS the dataset's own field, not a copy that drifted.
+    assert entry["source_version"] == resource["last_modified"]
+    # The resource carries no `revision_id` key AT ALL, which is why the
+    # manifest records the absence rather than a value.
+    assert "revision_id" not in resource
+    # Its published `hash` is kept as provenance and is deliberately not the
+    # version: it is an MD5 of the full CSV export, not of the JSON served.
+    assert entry["resource_content_hash"] == resource["hash"]
+    assert entry["source_version_kind"] != "content_sha256"
+    # And it is what the tool reports and what the mapper pins the evidence to.
+    result = government_result()
+    assert result["source"]["dataset_version"] == entry["source_version"]
+    assert government_bundle(result).source.version.version_key == \
+        f"dataset_version:{entry['source_version']}"
+    assert result["source"]["publisher"] == "ministry_of_transport"
+
+
+def test_the_committed_record_keeps_its_original_government_id():
+    """The row is addressed by the register's OWN `_id`, and nothing else."""
+    result = government_result()
+    assert result["record_id"] == GOVERNMENT_RECORD_ID_2021
+    assert result["durable_record_id"] == f"gov_il.wltp.{GOVERNMENT_RECORD_ID_2021}"
+    assert result["record_locator"]["government_id"] == GOVERNMENT_RECORD_ID_2021
+
+    # The manifest names the same `_id` and the exact index it sits at inside
+    # the committed response page, so the row is findable in the raw bytes.
+    entry = proof_manifest.source_entry("government_wltp_page_1")
+    locator = entry["record_locator"]
+    assert locator["record_ids"] == [GOVERNMENT_RECORD_ID_2021]
+    page = json.loads((proof_manifest.FIXTURE_ROOT /
+                       entry["fixture_path"]).read_text(encoding="utf-8"))
+    index = locator["record_indexes"][str(GOVERNMENT_RECORD_ID_2021)]
+    assert page["result"]["records"][index]["_id"] == GOVERNMENT_RECORD_ID_2021
+    assert result["record_locator"]["record_index"] == index
+    # Every durable locator names that row.
+    assert all(fact.locator.record_id == result["durable_record_id"]
+               for fact in government_bundle(result).facts)
+
+
+@pytest.mark.parametrize("label, payload, expected", [
+    ("a wrong asserted record id", {"expected_record_id": 37392},
+     "R5_GOV_RECORD_ID_MISMATCH"),
+    ("an identity the register does not hold", {"commercial_model": "Corolla"},
+     "R5_GOV_RECORD_NOT_FOUND"),
+    ("a market outside the dataset's documented scope", {"market": "DE"},
+     "R5_GOV_MARKET_OUT_OF_SCOPE"),
+    ("a resource no committed page belongs to",
+     {"resource_id": "5e87a7a1-2f6f-41c1-8aec-7216d52a6cf6"}, "R5_GOV_RESOURCE_UNKNOWN"),
+])
+def test_the_government_tool_fails_closed_rather_than_choosing(label, payload, expected):
+    """Every wrong request refuses; none of them answers approximately."""
+    request = {**GOVERNMENT_REQUEST, "model_year": 2021,
+               "expected_record_id": GOVERNMENT_RECORD_ID_2021, **payload}
+    with pytest.raises(ToolError) as failure:
+        proof_registry().execute("gov_il.vehicle_registry", "get_model_record",
+                                 PROOF_CONTEXT, request)
+    assert failure.value.code == expected, label
+
+
+def test_naming_a_record_id_can_never_resolve_an_ambiguity():
+    """`expected_record_id` is an assertion, never a tiebreak.
+
+    If it could select, a caller could resolve a genuine ambiguity by fiat,
+    which is exactly what the refusal exists to prevent. So a 2026 request
+    naming one of the two matching rows fails just as it does naming none.
+    """
+    for named in (None, 37392, 37393):
+        request = {**GOVERNMENT_REQUEST, "model_year": 2026}
+        if named is not None:
+            request["expected_record_id"] = named
+        with pytest.raises(ToolError) as failure:
+            proof_registry().execute("gov_il.vehicle_registry", "get_model_record",
+                                     PROOF_CONTEXT, request)
+        assert failure.value.code == "R5_GOV_RECORD_AMBIGUOUS", named
+
+
+def test_the_government_tool_reads_only_closed_code_vocabularies():
+    """A Hebrew name is never parsed; a code is mapped and its name checked.
+
+    The decoded row must agree with the register's own code/name pairing. A row
+    whose `delek_cd` no longer travels with the `delek_nm` this proof was
+    reviewed against is drift, and drift must stop the selection rather than be
+    interpreted.
+    """
+    result = government_result()
+    upstream = dict(result["upstream_fields"])
+    assert (upstream["delek_cd"], upstream["delek_nm"]) == (7, "חשמל/בנזין")
+    assert (upstream["technologiat_hanaa_cd"], upstream["technologiat_hanaa_nm"]) == \
+        (2, "PLUG IN")
+    assert upstream["hanaa_nm"] == "4X4"
+    assert result["variant"]["fuel_type"] == "plug_in_hybrid"
+    assert result["variant"]["propulsion_technology"] == "plug_in"
+    assert result["variant"]["drivetrain"] == "awd"
+
+    tool = GovernmentVehicleRegistryTool()
+    assert tool._decode(upstream) is not None
+    # A drifted pairing is skipped, so the request finds nothing rather than
+    # reading the row through a vocabulary it no longer matches.
+    assert tool._decode({**upstream, "delek_nm": "something else"}) is None
+    assert tool._decode({**upstream, "delek_cd": 99}) is None
+    # And a row whose fuel and propulsion statements disagree is not material.
+    assert tool._decode({**upstream, "technologiat_hanaa_cd": 1,
+                         "technologiat_hanaa_nm": "היברידי רגיל"}) is None
+
+
+def test_a_power_figure_with_unresolved_semantics_is_a_gap_not_a_fact():
+    """`koah_sus` is captured, reported as unmapped, and never becomes evidence.
+
+    Across the committed plug-in rows it takes both engine-scale and
+    system-scale values, and the dataset defines neither. A field whose meaning
+    is unresolved IN THE SOURCE cannot be evidence, and mapping it to
+    `horsepower_hp` on the strength of its name is exactly the guess this proof
+    refuses to make.
+    """
+    result = government_result()
+    unmapped = {item["field"] for item in result["unmapped_fields"]}
+    assert "koah_sus" in unmapped
+    assert {field for field, _ in UNMAPPED_FIELDS} == unmapped
+    # It is not in the operation's declared variant output at all...
+    assert "koah_sus" not in result["variant"]
+    assert "koah_sus" not in result["upstream_fields"]
+    # ...and no Government fact claims a power field.
+    assert {field for field, _, _ in GOVERNMENT_FACT_FIELDS} == {
+        "engine_displacement_cc", "fuel_type", "official_model_code"}
+    assert not any(fact.field_key == "horsepower_hp" for fact in government_bundle().facts)
+    # The stated reason is checkable: the captured rows really do disagree.
+    page = json.loads((proof_manifest.FIXTURE_ROOT / "government" /
+                       "wltp_page_000002.json").read_text(encoding="utf-8"))
+    plug_in_power = {row["koah_sus"] for row in page["result"]["records"]
+                     if row.get("delek_cd") == 7}
+    assert len(plug_in_power) > 1, plug_in_power
+
+
+# --- the official saved Web document ----------------------------------------
+
+def test_the_web_document_is_pinned_to_the_digest_of_its_whole_body():
+    """The page publishes no validator, so its content digest is its version.
+
+    Not a hash of the quoted spans -- the digest of the EXACT FULL captured
+    response. A version computed from what happened to be selected would change
+    whenever the selection did.
+    """
+    entry = proof_manifest.source_entry("web_toyota_rav4_phev")
+    assert entry["absent_source_metadata"] == ["etag", "last_modified"]
+    assert entry["source_version_kind"] == "content_sha256"
+    # The version is the digest of the WHOLE captured response, which is NOT
+    # what is committed -- the committed file is its visible-text projection.
+    assert entry["source_version"] == entry["upstream_sha256"]
+    committed = (proof_manifest.FIXTURE_ROOT / entry["fixture_path"]).read_bytes()
+    assert hashlib.sha256(committed).hexdigest() == entry["fixture_sha256"]
+    assert hashlib.sha256(committed).hexdigest() != entry["source_version"]
+    assert web_bundle().source.version.version_key == \
+        f"content_sha256:{entry['source_version']}"
+    assert web_result()["source"]["canonical_url"] == "https://www.toyota.co.il/cars/RAV4-PHEV"
+
+
+def test_the_obsolete_web_url_is_provenance_only_and_is_never_the_source():
+    """The 404 URL explains the replacement; it never stands in for it.
+
+    The previously documented page returned HTTP 404 and was replaced by the
+    official archive page. It may appear in prose about why -- it must never be
+    a canonical URL, a fixture, or a document this proof reads.
+    """
+    obsolete = "https://www.toyota.co.il/models/rav4-plugin"
+    assert obsolete not in proof_manifest.MANIFEST_PATH.read_text(encoding="utf-8")
+    for path in Path("backend/testing/r5_proof").rglob("*.py"):
+        assert obsolete not in path.read_text(encoding="utf-8"), path
+    assert web_result()["source"]["canonical_url"] != obsolete
+
+
+def test_scripts_styles_and_templates_never_become_factual_evidence():
+    """What a bundler inlined is not something the page says."""
+    projection = _committed_projection()
+    for excluded in ("<script", "function(", "window.", "@media", "</", "{", "<"):
+        assert excluded not in projection, excluded
+    # A page's inlined code is exactly where credential-shaped material lives,
+    # and none of it survives into the evidence surface.
+    for pattern in (r"pk\.eyJ[A-Za-z0-9_.-]{20,}", r"sk\.ey[A-Za-z0-9_.-]{20,}",
+                    r"\bpub[0-9a-f]{24,}", r"\beyJ[A-Za-z0-9_-]{15,}",
+                    r"\b[0-9a-f]{32,}\b"):
+        assert re.search(pattern, projection) is None, pattern
+    # Markup is stripped BEFORE entities are unescaped, so text a page wrote as
+    # data can never become an element the stripper then honours.
+    assert visible_text_projection("<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>") == \
+        "<script>alert(1)</script>"
+
+
+def _committed_projection() -> str:
+    """The committed visible-text projection, read through the checksum gate."""
+    _, text = proof_manifest.load_text_fixture("web_toyota_rav4_phev")
+    return text
+
+
+def test_the_committed_projection_is_demonstrably_a_projection_output():
+    """Idempotency is the checkable property of a projection.
+
+    The raw page is not committed, so a reviewer inside this repository cannot
+    re-derive the projection from it -- that check belongs to whoever holds the
+    capture archive, whose digest the manifest records. What CAN be checked
+    here is that the committed file is a fixed point of the same versioned
+    rule: projecting it again changes nothing. An edited copy of a page, or a
+    file produced by a different rule, would not be.
+    """
+    projection = _committed_projection()
+    assert visible_text_projection(projection) == projection
+    entry = proof_manifest.source_entry("web_toyota_rav4_phev")
+    assert entry["text_projection_version"] == WEB_TEXT_PROJECTION_VERSION
+    assert entry["record_locator"]["projection_char_count"] == len(projection)
+    # And the tool refuses a committed document that is NOT a fixed point.
+    tool = ToyotaArchivedModelDocumentTool()
+    with pytest.raises(ToolError) as failure:
+        tool._locate("<p>not a projection</p>", TOYOTA_RAV4_PHEV_STATEMENTS[0])
+    assert failure.value.code == "R5_WEB_STATEMENT_ABSENT"
+
+
+def test_the_archived_status_comes_from_visible_text_not_from_metadata():
+    """The page says it in four places; only one of them is something it SAYS.
+
+    The captured HTML carries the ended-marketing wording in an `og:description`
+    meta tag, a `twitter:description` meta tag, a `name="description"` meta tag
+    and a JSON-LD `<script>` -- all of which are machine metadata a site author
+    writes for crawlers, and none of which is the page's visible text. The
+    projection drops `<head>` and `<script>` wholesale, so the only occurrence
+    that survives is the sentence the page actually renders to a reader.
+    """
+    projection = _committed_projection()
+    # The projection keeps exactly one occurrence, and it is the rendered
+    # sentence -- not the `og:description`, `twitter:description`,
+    # `name="description"` or JSON-LD copies the raw page also carries, all of
+    # which live in `<head>` or a `<script>` and are removed with their
+    # contents. The raw page is not committed, so the multiplicity is recorded
+    # in the proof document rather than re-asserted against bytes this
+    # repository does not hold.
+    assert projection.count("הסתיים") == 1
+    assert projection.count(ENDED_SENTENCE) == 1
+    # The raw markup writes it with non-breaking spaces; the projection
+    # normalizes them, which is why offsets are stated against the projection.
+    assert RAW_ENDED_SENTENCE not in projection
+    located = only([item for item in web_result()["statements"]
+                    if item["field_key"] == "marketing_status"])
+    assert located["text"] == ENDED_SENTENCE
+
+
+def test_every_web_fact_quotes_an_exact_span_of_the_documents_own_text():
+    """A document-span locator has to be checkable by someone with the bytes."""
+    projection = _committed_projection()
+    result = web_result()
+    # The tool reports the digest of the WHOLE projection, so a reviewer can
+    # confirm they re-derived the same text before reading any offset.
+    assert result["source"]["projection_sha256"] == \
+        hashlib.sha256(projection.encode("utf-8")).hexdigest()
+    assert result["source"]["projection_char_count"] == len(projection)
+    assert result["source"]["text_projection_version"] == WEB_TEXT_PROJECTION_VERSION
+
+    bundle = web_bundle(result)
+    assert len(bundle.fragments) == len(TOYOTA_RAV4_PHEV_STATEMENTS)
+    for statement, fragment in zip(result["statements"], bundle.fragments):
+        # Re-read the span out of the independently re-derived projection.
+        assert projection[statement["char_start"]:statement["char_end"]] == statement["text"]
+        assert fragment.fragment_type == "verbatim_excerpt"
+        assert fragment.text == statement["text"]
+        assert (fragment.locator.char_start, fragment.locator.char_end) == \
+            (statement["char_start"], statement["char_end"])
+        # Each expected phrase occurs exactly once, so the locator is unique.
+        assert projection.count(statement["text"]) == 1
+
+
+def test_the_web_document_states_identity_and_archived_status_and_nothing_else():
+    """Exactly what the page says, and no specification it does not say."""
+    result = web_result()
+    assert result["states_no_technical_specification"] is True
+    assert {statement["field_key"] for statement in result["statements"]} == {
+        "manufacturer_model_designation", "archived_model_heading", "marketing_status"}
+    ended = only([item for item in result["statements"]
+                  if item["field_key"] == "marketing_status"])
+    # The value is a closed reading of one exact sentence, not a paraphrase.
+    assert ended["value"] == "ended"
+    assert ended["text"] == ENDED_SENTENCE
+    # No technical field can come out of this source at all.
+    for fact in web_bundle(result).facts:
+        assert fact.field_key not in {"engine_displacement_cc", "horsepower_hp",
+                                      "nominal_engine_displacement_l", "fuel_type",
+                                      "power_kw", "gross_weight_kg"}
+        assert fact.unit is None
+
+
+@pytest.mark.parametrize("wrong", [{"make": "Honda"}, {"commercial_model": "RAV4"},
+                                   {"market": "DE"}])
+def test_the_web_tool_fails_closed_on_a_vehicle_the_page_does_not_describe(wrong):
+    with pytest.raises(ToolError) as failure:
+        web_result(**wrong)
+    assert failure.value.code == "R5_WEB_DOCUMENT_IDENTITY_MISMATCH"
+
+
+def test_an_uncommitted_web_document_has_no_fixture_and_cannot_be_read():
+    with pytest.raises(ToolError) as failure:
+        web_result(document_id="toyota_il_some_other_model")
+    assert failure.value.code == "R5_WEB_DOCUMENT_UNKNOWN"
+
+
+#: A well-formed replacement for the archived-status sentence: same shape, same
+#: line, opposite meaning. Used so the edited document stays a VALID projection
+#: and the test exercises the statement requirement rather than tripping the
+#: structural check first.
+REWORDED_SENTENCE = "שיווק הדגם ראב4 פלאג-אין נמשך."
+
+
+def test_a_page_that_no_longer_states_it_was_archived_stops_the_proof(relocated_fixtures):
+    """Missing archived-status wording is a refusal, not a quieter answer.
+
+    The sentence is REWORDED rather than deleted, and the manifest is re-pinned
+    to the edited bytes, so the checksum gate passes and the document is still
+    a well-formed projection. What is under test is therefore the STATEMENT
+    requirement alone: a page that still proves identity must not be able to
+    answer a question about marketing status just because it looks intact.
+    """
+    def drop_the_sentence(root):
+        path = root / "web" / "toyota_il_rav4_phev.visible_text.txt"
+        edited = path.read_bytes().replace(ENDED_SENTENCE.encode("utf-8"),
+                                           REWORDED_SENTENCE.encode("utf-8"), 1)
+        assert edited != path.read_bytes(), "the sentence was not found to reword"
+        path.write_bytes(edited)
+        manifest_path = root / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = manifest["sources"]["web_toyota_rav4_phev"]
+        entry["fixture_sha256"] = hashlib.sha256(edited).hexdigest()
+        entry["fixture_byte_count"] = len(edited)
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+
+    relocated_fixtures(drop_the_sentence)
+    with pytest.raises(ToolError) as failure:
+        web_result()
+    assert failure.value.code == "R5_WEB_STATEMENT_ABSENT"
+
+
+# =============================================================================
+# 15. reconciliation: what these three sources may and may not conclude jointly
+# =============================================================================
+
+def _reference(fact):
+    """One StructuredEvidenceFact as the claim the conflict policy groups."""
+    return EvidenceReference(claim_id=str(uuid4()), source_id=str(uuid4()),
+                             run_id=str(RUN_UUID), task_id="t", entity=fact.entity_key,
+                             field=fact.field_key, value=_thawed(fact.value),
+                             unit=fact.unit, geography=fact.geography, market=fact.market,
+                             time_scope=_thawed(fact.time_scope),
+                             identity=_thawed(fact.identity), supported=True,
+                             confidence=0.9)
+
+
+def _thawed(value):
+    """A plain, mutable copy of a deep-frozen contract value."""
+    if isinstance(value, Mapping):
+        return {key: _thawed(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thawed(item) for item in value]
+    return value
+
+
+def _fact(bundle, field):
+    return only([item for item in bundle.facts if item.field_key == field])
+
+
+def _scope(fact):
+    """The R4 comparison scope of one R3 structured fact."""
+    return scope_identity(entity=fact.entity_key, field=fact.field_key,
+                          geography=fact.geography, market=fact.market,
+                          time_scope=_thawed(fact.time_scope),
+                          identity=_thawed(fact.identity))
+
+
+def test_source_authority_is_field_specific_and_never_leaks():
+    """Being official does not make a source authoritative for everything."""
+    # The register is authoritative inside the dataset's documented scope...
+    for field in ("engine_displacement_cc", "official_model_code", "fuel_type"):
+        assert is_authoritative(GOVERNMENT_SOURCE_TYPE, field), field
+    # ...and for nothing outside it, however official the publisher is.
+    for field in ("list_price", "reliability_score", "marketing_status", "horsepower_hp"):
+        assert not is_authoritative(GOVERNMENT_SOURCE_TYPE, field), field
+    # An official manufacturer ARCHIVE page is authoritative for nothing: it
+    # establishes who a model is, which is not a licence to state measurements.
+    # Typing it `manufacturer_specification` would hand it exactly that.
+    for field in ("engine_displacement_cc", "official_model_code", "fuel_type",
+                  "marketing_status", "list_price"):
+        assert not is_authoritative(WEB_SOURCE_TYPE, field), field
+    assert not is_authoritative(YEDA_SOURCE_TYPE, "fuel_type")
+    assert WEB_SOURCE_TYPE not in SOURCE_TYPE_AUTHORITY
+    assert YEDA_SOURCE_TYPE not in SOURCE_TYPE_AUTHORITY
+
+
+def test_a_nominal_label_and_an_exact_displacement_never_share_a_scope():
+    """The two displacement statements are different statements.
+
+    The catalog states an engine-CLASS label (2.5 l); the register states a
+    homologated displacement (2487 cc). They carry different field keys, so
+    they can never reach one comparison scope -- which is why this proof
+    manufactures neither a contradiction nor an agreement between them.
+    """
+    catalog = _fact(yeda_bundle(), "nominal_engine_displacement_l")
+    register = _fact(government_bundle(), "engine_displacement_cc")
+    assert (catalog.value, catalog.unit) == (2.5, "l")
+    assert (register.value, register.unit) == (2487, "cc")
+    assert _scope(catalog).scope.field != _scope(register).scope.field
+    # Same entity, and still not the same statement.
+    assert catalog.entity_key == register.entity_key == "toyota:rav4:il"
+    assert conflict_groups([_reference(catalog), _reference(register)]) == {}
+
+
+def test_missing_identity_dimensions_are_never_agreement():
+    """Silence is unknown, and unknown never matches a stated dimension.
+
+    The catalog states no model code and no trim; the register states both. So
+    a catalog statement and a register statement about the same commercial
+    model are NOT statements about the same variant, and R4 keeps them apart
+    instead of letting two partially-identified rows merge.
+    """
+    catalog = _fact(yeda_bundle(), "fuel_type")
+    register = _fact(government_bundle(), "fuel_type")
+    assert catalog.value == register.value == "plug_in_hybrid"
+    assert "model_code" not in catalog.identity and "trim" not in catalog.identity
+    assert register.identity["model_code"] == "AXAP54L ANXMBK"
+    assert register.identity["trim"] == "PRIME AWD SE"
+    # Equal values, one entity, and still different comparison scopes: the
+    # register row is model year 2021 only, the catalog variant spans a range,
+    # and neither silently adopts the other's identity.
+    assert _scope(catalog) != _scope(register)
+    assert dict(catalog.time_scope) != dict(register.time_scope)
+
+
+def test_the_official_page_cannot_widen_into_a_technical_or_shared_claim():
+    """An identity statement stays an identity statement.
+
+    The page's own commercial name is `RAV4 Plug-in`, which is not the bare
+    `RAV4` the other two sources use, so its entity differs and its statement
+    never merges into theirs. Normalizing the name to force a merge is exactly
+    the inference this proof declines to make.
+    """
+    web = web_bundle()
+    assert {fact.entity_key for fact in web.facts} == {"toyota:rav4-plug-in:il"}
+    assert {fact.entity_key for fact in government_bundle().facts} == {"toyota:rav4:il"}
+    # It states no identity dimension and no time scope, so it can never narrow
+    # -- or be narrowed by -- a variant statement from another source.
+    assert all(not fact.identity and not fact.time_scope for fact in web.facts)
+    # Nothing it produces is comparable to a technical claim.
+    together = [_reference(fact) for fact in (*web.facts, *government_bundle().facts,
+                                              *yeda_bundle().facts)]
+    assert conflict_groups(together) == {}
+
+
+def test_incompatible_variants_do_not_merge_even_within_one_source():
+    """Two registry rows of one model year are two variants, not one fact."""
+    rows = [government_result(model_year=2026, trim=trim, expected_record_id=record)
+            for trim, record in (("SE-PLUGIN", 37392), ("XSE-PLUGIN", 37393))]
+    facts = [_fact(government_bundle(row), "engine_displacement_cc") for row in rows]
+    # The same displacement, stated for two different trims.
+    assert facts[0].value == facts[1].value == 2487
+    assert facts[0].identity["trim"] != facts[1].identity["trim"]
+    assert _scope(facts[0]) != _scope(facts[1])
+    # Equal values under different identities: two statements, no conflict,
+    # and -- crucially -- no merge into one better-supported claim.
+    assert conflict_groups([_reference(fact) for fact in facts]) == {}
+
+
+# =============================================================================
+# 16. controlled mutation of the captured Government and Web facts
+# =============================================================================
+#
+# As in section 10, every wrong value below is a REAL captured value with
+# exactly one thing changed, so what is under test is the comparison contract
+# rather than a fixture written to fail.
+
+@pytest.mark.parametrize("label, field, mutation, expected", [
+    ("a homologated displacement off by one", "engine_displacement_cc",
+     {"value": 2488}, "R4_VALUE_MISMATCH"),
+    ("the same number in another unit", "engine_displacement_cc",
+     {"unit": "kg"}, "R4_UNIT_NOT_CONVERTIBLE"),
+    ("a displacement with no unit", "engine_displacement_cc",
+     {"unit": None}, "R4_UNIT_MISSING"),
+    ("a different model year", "engine_displacement_cc",
+     {"time_scope": {"year_start": 2026, "year_end": 2026}}, "R4_SCOPE_MISMATCH"),
+    ("a different market", "engine_displacement_cc", {"market": "DE"}, "R4_SCOPE_MISMATCH"),
+    ("a different trim of the same row", "engine_displacement_cc",
+     {"identity": {"body_style": "suv", "drivetrain": "awd",
+                   "model_code": "AXAP54L ANXMBK", "trim": "XSE"}},
+     "R4_IDENTITY_MISMATCH"),
+    ("a dataset version the evidence was not read at", "engine_displacement_cc",
+     {"source_version": "dataset_version:2020-01-01T00:00:00.000000"},
+     "R4_SOURCE_VERSION_MISMATCH"),
+    ("an official model code off by one character", "official_model_code",
+     {"value": "AXAP54L ANXMBX"}, "R4_VALUE_MISMATCH"),
+])
+def test_one_controlled_mutation_of_a_real_government_fact_is_rejected(
+        label, field, mutation, expected):
+    _, repository, _, board = proof_run()
+    reference = captured_reference(board, field)
+    verdict = settle(repository, reference.model_copy(update=mutation))
+    assert verdict.verdict == "rejected", label
+    assert verdict.reason == expected, label
+    assert verdict.mode == "deterministic_structured"
+    # The unmutated fact still verifies against the same durable evidence, so
+    # the rejection is the mutation's doing and nothing else.
+    assert settle(repository, reference).verdict == "verified"
+
+
+@pytest.mark.parametrize("label, mutation, expected", [
+    ("marketing reported as continuing", {"value": "active"}, "R4_VALUE_MISMATCH"),
+    ("a content digest the evidence was not read at",
+     {"source_version": "content_sha256:" + "b" * 64}, "R4_SOURCE_VERSION_MISMATCH"),
+    ("a market the page never mentions", {"market": "DE"}, "R4_SCOPE_MISMATCH"),
+    ("an identity the page never states",
+     {"identity": {"trim": "GR SPORT"}}, "R4_IDENTITY_MISMATCH"),
+])
+def test_one_controlled_mutation_of_a_real_web_fact_is_rejected(label, mutation, expected):
+    _, repository, _, board = proof_run()
+    reference = captured_reference(board, "marketing_status")
+    verdict = settle(repository, reference.model_copy(update=mutation))
+    assert verdict.verdict == "rejected", label
+    assert verdict.reason == expected, label
+    assert verdict.mode == "deterministic_structured"
+    assert settle(repository, reference).verdict == "verified"
+
+
+# =============================================================================
+# 17. the proof reaches no network, no production registry and no write path
+# =============================================================================
+
+def test_no_proof_module_can_reach_a_network_or_a_database():
+    """Offline by construction, not by convention.
+
+    Every module the proof loads is checked for the import that would make a
+    live call possible at all. A fixture-backed proof that could open a socket
+    is one refactor away from being a live integration nobody reviewed.
+    """
+    forbidden = ("import requests", "import httpx", "import socket", "urllib.request",
+                 "from supabase", "import psycopg", "openai", "webbrowser")
+    for path in sorted(Path("backend/testing/r5_proof").rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in source, f"{path} names {token}"
+
+
+def test_the_committed_page_carries_no_secret_of_ours_and_no_captured_session():
+    """A saved third-party page is committed whole, and reviewed for what is in it.
+
+    The page is stored byte-for-byte because `fixture_sha256 == upstream_sha256`
+    is the entire provenance guarantee -- redacting a byte would break the digest
+    chain the proof rests on. So the question is not whether to edit it but what
+    it actually contains, and that is checked rather than assumed:
+
+    *   no credential of OURS, in any form the repository's own scanner or the
+        patterns below recognise;
+    *   no captured session -- the capture retained no `Set-Cookie`, sent no
+        `Authorization`, and replayed no cookie, so nothing user-identifying
+        was recorded in the first place.
+
+    What the page DOES carry is Toyota's own client-side public tokens -- Mapbox
+    publishable (`pk.`) keys and a `pub`-prefixed analytics key -- which every
+    visitor to the public site already receives, and which this repository
+    neither owns nor can use to reach anything. They are called out in
+    `docs/proofs/R5_VEHICLE_EVIDENCE_PROOF.md` so a reviewer sees a considered
+    decision rather than an oversight.
+    """
+    page = _committed_projection()
+    # The repository's own scanner patterns, plus the shapes it does not cover.
+    # Matched as KEY SHAPES rather than substrings: a bare "sk-" also occurs
+    # inside "mask-user-input", and a test that flagged that would be noise
+    # rather than a check.
+    for pattern in (r"sk-[A-Za-z0-9_-]{20,}", r"sk\.ey[A-Za-z0-9_.-]{20,}",
+                    r"service_role[A-Za-z0-9_.-]{20,}", r"-----BEGIN [A-Z ]*PRIVATE KEY",
+                    r"(?i)set-cookie\s*:", r"(?i)\bauthorization\s*:\s*bearer",
+                    r"(?i)aws_secret_access_key", r"SUPABASE_SERVICE_ROLE"):
+        assert re.search(pattern, page) is None, pattern
+    # The capture recorded no response validator and no cookie for this page.
+    entry = proof_manifest.source_entry("web_toyota_rav4_phev")
+    assert set(entry["absent_source_metadata"]) == {"etag", "last_modified"}
+
+
+def test_the_proof_registers_no_production_tool_and_no_write_operation():
+    """Three read-only tools, none of them production, none of them a writer."""
+    tools = [YedaVehicleCatalogTool(), GovernmentVehicleRegistryTool(),
+             ToyotaArchivedModelDocumentTool()]
+    for tool in tools:
+        assert tool.mode is ToolMode.READ
+        assert len(tool.operations) == 1
+        assert "write" not in tool.required_scope
+        for operation in tool.operations.values():
+            assert operation.input_schema["additionalProperties"] is False
+            assert operation.output_schema["additionalProperties"] is False
+    # The production registry and the production mapper allowlist stay empty.
+    assert ToolRegistry().allowed_names == frozenset()
+    assert PRODUCTION_EVIDENCE_MAPPERS.registered == frozenset()
+    assert proof_registry().allowed_names == {tool.name for tool in tools}
