@@ -79,6 +79,14 @@
       },
       "record_locator": {
         "ckan_package_id": "degem-rechev-wltp",
+        "page": {
+          "query_token": "RAV4",
+          "reported_total": 233,
+          "requested_limit": 100,
+          "requested_offset": 0,
+          "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
+          "returned_record_count": 100
+        },
         "raw_capture_path": "raw/government/wltp/pages/page_000001.json",
         "record_ids": [
           36327
@@ -129,6 +137,14 @@
       },
       "record_locator": {
         "ckan_package_id": "degem-rechev-wltp",
+        "page": {
+          "query_token": "RAV4",
+          "reported_total": 233,
+          "requested_limit": 100,
+          "requested_offset": 100,
+          "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
+          "returned_record_count": 100
+        },
         "raw_capture_path": "raw/government/wltp/pages/page_000002.json",
         "record_ids": [
           37392,
@@ -154,6 +170,59 @@
       "source_version_origin": "package_show -> resources[WLTP_RESOURCE_ID].last_modified; the resource carries no revision_id key at all, so none is recorded. Its published `hash` is recorded beside this as provenance but is NOT used as the version: it is an MD5 of the full 53 MB CSV export, which is neither a SHA-256 nor the JSON the datastore API served",
       "upstream_committed": true,
       "upstream_sha256": "e5b0bb90178191478cec8b1468818d6f3962cbc6146ca10188410bd72eeec6fb"
+    },
+    "government_wltp_page_3": {
+      "absent_source_metadata": [
+        "etag",
+        "last_modified",
+        "resource_revision_id"
+      ],
+      "canonical_url": "https://data.gov.il/api/3/action/datastore_search?resource_id=142afde2-6228-49f9-8a29-9b6c3a0cbe40&limit=100&offset=200&q=RAV4",
+      "capture_method": "public unauthenticated read-only HTTPS GET captured by MILO-R5-streamlit-evidence-capture/2.0 into milo-r5-source-capture-20260914T161110Z, then imported byte-for-byte after the archive's own checksums, byte counts, HTTP statuses and host allowlist were independently re-verified",
+      "ckan_package_id": "degem-rechev-wltp",
+      "content_type": "application/json;charset=utf-8",
+      "etag": null,
+      "final_url": "https://data.gov.il/api/3/action/datastore_search?resource_id=142afde2-6228-49f9-8a29-9b6c3a0cbe40&limit=100&offset=200&q=RAV4",
+      "fixture_byte_count": 89673,
+      "fixture_kind": "exact_response",
+      "fixture_path": "government/wltp_page_000003.json",
+      "fixture_sha256": "5f96a2ff3fbdd1f73602e5f89b5446c9e8e5c2ea261b742f88ba84ced308cedc",
+      "http_status": 200,
+      "last_modified": null,
+      "query": {
+        "limit": "100",
+        "offset": "200",
+        "q": "RAV4",
+        "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
+      },
+      "record_locator": {
+        "ckan_package_id": "degem-rechev-wltp",
+        "page": {
+          "query_token": "RAV4",
+          "reported_total": 233,
+          "requested_limit": 100,
+          "requested_offset": 200,
+          "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
+          "returned_record_count": 33
+        },
+        "raw_capture_path": "raw/government/wltp/pages/page_000003.json",
+        "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
+        "selected_records": "none; this page completes the pinned query and holds no row this proof selects"
+      },
+      "redirect_chain": [],
+      "requested_url": "https://data.gov.il/api/3/action/datastore_search?resource_id=142afde2-6228-49f9-8a29-9b6c3a0cbe40&limit=100&offset=200&q=RAV4",
+      "resource_content_hash": "79ab5917935c722fa6de8460a594a778",
+      "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
+      "resource_metadata_modified": "2026-09-14T02:41:31.884381",
+      "resource_revision_id": null,
+      "response_byte_count": 89673,
+      "retrieved_at_utc": "2026-09-14T16:11:13.272Z",
+      "source_kind": "government_dataset_resource",
+      "source_version": "2026-09-14T02:41:31.842626",
+      "source_version_kind": "dataset_version",
+      "source_version_origin": "package_show -> resources[WLTP_RESOURCE_ID].last_modified; the resource carries no revision_id key at all, so none is recorded. Its published `hash` is recorded beside this as provenance but is NOT used as the version: it is an MD5 of the full 53 MB CSV export, which is neither a SHA-256 nor the JSON the datastore API served",
+      "upstream_committed": true,
+      "upstream_sha256": "5f96a2ff3fbdd1f73602e5f89b5446c9e8e5c2ea261b742f88ba84ced308cedc"
     },
     "web_toyota_rav4_phev": {
       "absent_source_metadata": [

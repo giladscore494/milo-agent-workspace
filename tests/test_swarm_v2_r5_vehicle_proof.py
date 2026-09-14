@@ -76,13 +76,18 @@ from backend.engines.swarm_v2.evidence_mapping import (PRODUCTION_EVIDENCE_MAPPE
 from backend.engines.swarm_v2.tool_calls import ToolCallRecord
 from backend.testing.r5_proof import manifest as proof_manifest
 from backend.testing.r5_proof.identity import VehicleIdentityError, vehicle_entity_key
-from backend.testing.r5_proof.government import (GOVERNMENT_DATASET_MARKET, UNMAPPED_FIELDS,
+from backend.testing.r5_proof import government as government_module
+from backend.testing.r5_proof.government import (GOVERNMENT_DATASET_MARKET, MAKE_BY_TOZAR,
+                                                 MAX_SCANNED_RECORDS,
+                                                 R5_GOV_PAGINATION_REASONS, UNMAPPED_FIELDS,
+                                                 WLTP_PAGE_PLAN, WLTP_PAGE_SOURCE_KEYS,
                                                  WLTP_RESOURCE_ID,
                                                  GovernmentVehicleRegistryTool)
 from backend.testing.r5_proof.mappers import (GOVERNMENT_FACT_FIELDS, GOVERNMENT_SOURCE_TYPE,
                                               WEB_SOURCE_TYPE, YEDA_FACT_FIELDS,
                                               YEDA_SOURCE_TYPE, proof_evidence_mappers)
 from backend.testing.r5_proof.tools import YEDA_MARKET_PRESENCE, YedaVehicleCatalogTool
+from scripts import r5_capture_fixtures
 from backend.testing.r5_proof.web import (TOYOTA_RAV4_PHEV_STATEMENTS,
                                           WEB_TEXT_PROJECTION_VERSION,
                                           ToyotaArchivedModelDocumentTool,
@@ -423,9 +428,12 @@ def test_every_committed_fixture_matches_its_manifest_checksum():
     """
     verified = proof_manifest.verify_all_fixtures()
     # All three real source families are committed, checksum-gated, and read
-    # through the SAME gate. None of them is described in prose only.
+    # through the SAME gate. None of them is described in prose only -- and
+    # the Government family is committed as ALL THREE pages of its query, not
+    # as the prefix of one.
     assert set(verified) == {"yeda", "government_package", "government_wltp_page_1",
-                             "government_wltp_page_2", "web_toyota_rav4_phev"}
+                             "government_wltp_page_2", "government_wltp_page_3",
+                             "web_toyota_rav4_phev"}
     manifest = proof_manifest.load_manifest()
     assert manifest["manifest_version"] == proof_manifest.MANIFEST_VERSION
     for key in verified:
@@ -1321,7 +1329,7 @@ RAW_ENDED_SENTENCE = "שיווק הדגם\u00a0ראב4 פלאג-אין הסתי�
 
 
 @pytest.mark.parametrize("key", ["government_package", "government_wltp_page_1",
-                                 "government_wltp_page_2"])
+                                 "government_wltp_page_2", "government_wltp_page_3"])
 def test_a_captured_government_fixture_is_the_exact_response_that_was_received(key):
     """An `exact_response` fixture IS the response, not a rendering of it.
 
@@ -1397,6 +1405,10 @@ def test_absent_response_metadata_is_recorded_as_absent_and_checked_both_ways():
 @pytest.mark.parametrize("key, relative, before, after", [
     ("government_wltp_page_1", "government/wltp_page_000001.json",
      '"nefah_manoa":2487', '"nefah_manoa":2488'),
+    # The third page carries no selected row, and is gated exactly as hard:
+    # an unread page is still evidence that the query is complete.
+    ("government_wltp_page_3", "government/wltp_page_000003.json",
+     '"offset": 200', '"offset": 300'),
     ("web_toyota_rav4_phev", "web/toyota_il_rav4_phev.visible_text.txt",
      "הסתיים", "ממשיך"),
 ])
@@ -1582,6 +1594,388 @@ def test_a_power_figure_with_unresolved_semantics_is_a_gap_not_a_fact():
     plug_in_power = {row["koah_sus"] for row in page["result"]["records"]
                      if row.get("delek_cd") == 7}
     assert len(plug_in_power) > 1, plug_in_power
+
+
+# --- the pinned Government query is COMPLETE --------------------------------
+#
+# The R5 capture asked `data.gov.il` one bounded question -- `q=RAV4` over the
+# WLTP resource, 100 rows a page -- and the datastore answered 233 rows in
+# three pages. The first R5 round committed two of them, because neither held a
+# row the proof selects. That was wrong in a way no single page can reveal:
+# every page reports the full total of 233, so 200 committed rows look exactly
+# like a complete query. The proof was scanning a PREFIX while its provenance
+# named the whole query.
+#
+# All three pages are committed now, and the tests below hold the completeness
+# itself -- not just the bytes -- to the gate.
+
+#: The third page's committed identity, stated here so a re-import that changed
+#: it has to change this test too.
+PAGE_3_SHA256 = "5f96a2ff3fbdd1f73602e5f89b5446c9e8e5c2ea261b742f88ba84ced308cedc"
+PAGE_3_BYTES = 89673
+
+#: The pinned query, as the datastore itself served it.
+PAGE_ROW_COUNTS = (100, 100, 33)
+PAGE_OFFSETS = (0, 100, 200)
+QUERY_TOTAL = 233
+
+
+def government_page(key, root=None):
+    """One committed page's parsed body, read through the checksum gate."""
+    _, document = proof_manifest.load_fixture(key)
+    return document["result"]
+
+
+def repin(root, key, mutate_body):
+    """Rewrite one committed page AND re-pin its manifest digest.
+
+    Tamper-detection is proven separately, by the byte-level tests above. What
+    these tests need is for the checksum gate to PASS, so that the property
+    under test is the pagination gate BEHIND it. A mutation that only edited
+    bytes would stop at the digest and would prove nothing about whether the
+    pages are validated as one query.
+    """
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entry = manifest["sources"][key]
+    path = root / entry["fixture_path"]
+    body = json.loads(path.read_text(encoding="utf-8"))
+    mutate_body(body)
+    payload = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(payload)
+    entry["fixture_sha256"] = entry["upstream_sha256"] = hashlib.sha256(payload).hexdigest()
+    entry["fixture_byte_count"] = entry["response_byte_count"] = len(payload)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8")
+
+
+def edit_manifest(root, mutate):
+    """Change the committed provenance without touching a captured byte."""
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutate(manifest)
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8")
+
+
+def government_refusal(**overrides):
+    """Run the real registry operation and return the code it refused with."""
+    with pytest.raises(ToolError) as failure:
+        government_result(**overrides)
+    return failure.value.code
+
+
+def registry_refusal(payload):
+    """Refuse a request built from scratch, asserting no record id at all."""
+    with pytest.raises(ToolError) as failure:
+        proof_registry().execute("gov_il.vehicle_registry", "get_model_record",
+                                 PROOF_CONTEXT, payload)
+    return failure.value.code
+
+
+def test_the_third_page_is_committed_at_its_exact_captured_identity():
+    """The page the first R5 round left out, pinned byte for byte.
+
+    Size and digest are asserted as literals rather than read back out of the
+    manifest, so a re-import that silently produced different bytes under the
+    same provenance fails here instead of being re-pinned into agreement.
+    """
+    entry, payload = proof_manifest.verify_fixture("government_wltp_page_3")
+    assert len(payload) == PAGE_3_BYTES
+    assert hashlib.sha256(payload).hexdigest() == PAGE_3_SHA256
+    assert entry["fixture_sha256"] == entry["upstream_sha256"] == PAGE_3_SHA256
+    assert entry["fixture_byte_count"] == entry["response_byte_count"] == PAGE_3_BYTES
+    assert entry["fixture_kind"] == "exact_response" and entry["upstream_committed"] is True
+    assert entry["retrieved_at_utc"] == "2026-09-14T16:11:13.272Z"
+    assert entry["http_status"] == 200 and entry["redirect_chain"] == []
+    assert entry["query"] == {"resource_id": WLTP_RESOURCE_ID, "limit": "100",
+                              "offset": "200", "q": "RAV4"}
+
+
+def test_the_third_pages_locator_is_page_level_and_claims_no_record():
+    """No row was selected here, so no row is named here.
+
+    Pages one and two carry `record_ids` because the proof reads a row from
+    each. This page carries none, and says so, rather than being given a
+    plausible-looking id and index to make the three entries look alike.
+    """
+    locator = proof_manifest.source_entry("government_wltp_page_3")["record_locator"]
+    assert "record_ids" not in locator and "record_indexes" not in locator
+    assert locator["selected_records"].startswith("none;")
+    assert locator["page"] == {"requested_offset": 200, "requested_limit": 100,
+                               "returned_record_count": 33, "reported_total": QUERY_TOTAL,
+                               "query_token": "RAV4", "resource_id": WLTP_RESOURCE_ID}
+    # The pages that DO hold a selected row still name it, and now also carry
+    # the same page-level position, so all three locate themselves in the query.
+    for key, ids in (("government_wltp_page_1", [GOVERNMENT_RECORD_ID_2021]),
+                     ("government_wltp_page_2", [37392, 37393])):
+        other = proof_manifest.source_entry(key)["record_locator"]
+        assert other["record_ids"] == ids
+        assert other["page"]["reported_total"] == QUERY_TOTAL
+
+
+def test_the_committed_pages_are_the_whole_query_and_nothing_twice():
+    """100 + 100 + 33 = 233, which is the total the datastore itself reports.
+
+    Every page states the same total, every page sits at the offset the page
+    before it ends at, and no registry row is reachable from two pages -- which
+    is what makes 233 the number of DISTINCT rows the proof scans rather than
+    the number of times it read something.
+    """
+    counts, offsets, identities = [], [], []
+    for key, expected_offset in zip(WLTP_PAGE_SOURCE_KEYS, PAGE_OFFSETS):
+        result = government_page(key)
+        assert result["resource_id"] == WLTP_RESOURCE_ID and result["q"] == "RAV4"
+        assert result["limit"] == 100
+        assert result["total"] == QUERY_TOTAL
+        assert result["offset"] == expected_offset
+        counts.append(len(result["records"]))
+        offsets.append(result["offset"])
+        identities.extend(record["_id"] for record in result["records"])
+
+    assert tuple(counts) == PAGE_ROW_COUNTS
+    assert tuple(offsets) == PAGE_OFFSETS
+    # No gap and no overlap: each page starts exactly where the last one ended.
+    assert offsets == [sum(counts[:index]) for index in range(len(counts))]
+    assert sum(counts) == QUERY_TOTAL
+    assert len(identities) == len(set(identities)) == QUERY_TOTAL
+    # And the whole query still fits inside the bound one call may scan.
+    assert QUERY_TOTAL <= MAX_SCANNED_RECORDS
+
+
+def test_the_two_page_query_this_correction_replaces_now_fails_closed():
+    """The exact defect being corrected, asserted as a refusal.
+
+    With the plan shortened back to the two pages R5 originally committed,
+    every page still passes its own checks -- right offset, right size, right
+    query, and the same honest total of 233 -- and the scan still finds the
+    2021 row. The ONLY thing wrong is that 200 rows are not 233, and that is
+    now the thing that stops the call.
+    """
+    two_pages = WLTP_PAGE_PLAN[:2]
+    assert [key for key, _, _ in two_pages] == ["government_wltp_page_1",
+                                                "government_wltp_page_2"]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(government_module, "WLTP_PAGE_PLAN", two_pages)
+        assert government_refusal() == "R5_GOV_PAGINATION_INCOMPLETE"
+
+
+def test_the_third_page_adds_no_answer_to_either_identity_the_proof_asks():
+    """Completeness changed what is PROVEN, not what is ANSWERED.
+
+    This is the honest outcome of committing the page: 2021 still resolves to
+    exactly one row and 2026 is still ambiguous between exactly two. The
+    difference is that both statements are now about the whole query instead of
+    about its first 200 rows.
+    """
+    assert government_result()["record_id"] == GOVERNMENT_RECORD_ID_2021
+    assert registry_refusal({**GOVERNMENT_REQUEST,
+                             "model_year": 2026}) == "R5_GOV_RECORD_AMBIGUOUS"
+
+    # Read directly from the third page's own rows: none of them answers
+    # either identity, so neither answer could have come from here.
+    records = government_page("government_wltp_page_3")["records"]
+    assert len(records) == 33
+    matching = [record["_id"] for record in records
+                if record.get("shnat_yitzur") in (2021, 2026)
+                and MAKE_BY_TOZAR.get(str(record.get("tozar"))) == "Toyota"
+                and str(record.get("kinuy_mishari")).strip() == "RAV4"
+                and record.get("delek_cd") == 7 and record.get("technologiat_hanaa_cd") == 2
+                and record.get("hanaa_cd") == 3]
+    assert matching == []
+
+    # The page is NOT empty of plug-in RAV4s, which is the point: it holds two
+    # 2026 plug-in four-wheel-drive Toyotas the register calls "RAV4 PLUG IN"
+    # and "RAV4 PHEV". They stay out of the 2026 answer because the commercial
+    # model is matched EXACTLY and never on a substring -- so committing this
+    # page tests that promise against real rows instead of asserting it.
+    near_misses = {record["_id"]: str(record["kinuy_mishari"]).strip() for record in records
+                   if record.get("delek_cd") == 7 and record.get("hanaa_cd") == 3
+                   and record.get("shnat_yitzur") == 2026}
+    assert near_misses == {37367: "RAV4 PLUG IN", 37372: "RAV4 PHEV"}
+    assert government_result()["record_id"] not in near_misses
+
+
+def test_a_matching_row_on_the_third_page_is_actually_reached(relocated_fixtures):
+    """Proof that the third page is SCANNED, not merely committed.
+
+    A page can be checksum-gated, counted and still never read. So one row on
+    the third page is turned into a genuine second answer to the 2021 identity
+    -- the committed 2021 row, re-identified and re-trimmed -- and the 2021
+    question must stop being answerable. If the scan did not reach this page,
+    it would still return one row and this test would fail.
+    """
+    def plant(body):
+        source = government_page("government_wltp_page_1")["records"][74]
+        assert source["_id"] == GOVERNMENT_RECORD_ID_2021
+        body["result"]["records"][0] = {**deepcopy(source), "_id": 999999,
+                                        "ramat_gimur": "PRIME AWD XSE"}
+
+    root = relocated_fixtures()
+    # Before the mutation, in this very copy, 2021 has exactly one answer.
+    assert government_result()["record_id"] == GOVERNMENT_RECORD_ID_2021
+    repin(root, "government_wltp_page_3", plant)
+    assert government_refusal() == "R5_GOV_RECORD_AMBIGUOUS"
+    # And the planted row is reachable by name, so the refusal is the two rows
+    # it should be rather than any other failure that also happens to refuse.
+    assert government_result(trim="PRIME AWD XSE",
+                             expected_record_id=999999)["record_id"] == 999999
+
+
+@pytest.mark.parametrize("label, key, mutate, expected", [
+    ("a page that is no longer committed at all", None,
+     lambda root: edit_manifest(root, lambda m: m["sources"].pop("government_wltp_page_3")),
+     "R5_GOV_PAGE_MISSING"),
+    ("a gap between the second page and the third", "government_wltp_page_3",
+     lambda body: body["result"].update(offset=300), "R5_GOV_PAGE_OFFSET_UNEXPECTED"),
+    ("a page served at a different page size", "government_wltp_page_3",
+     lambda body: body["result"].update(limit=33), "R5_GOV_PAGE_OFFSET_UNEXPECTED"),
+    ("a page that answered a different question", "government_wltp_page_3",
+     lambda body: body["result"].update(q="COROLLA"), "R5_GOV_PAGE_QUERY_MISMATCH"),
+    ("a page that belongs to another resource", "government_wltp_page_3",
+     lambda body: body["result"].update(
+         resource_id="5e87a7a1-2f6f-41c1-8aec-7216d52a6cf6"),
+     "R5_GOV_PAGE_QUERY_MISMATCH"),
+    ("pages that disagree about how many rows the query has", "government_wltp_page_3",
+     lambda body: body["result"].update(total=200), "R5_GOV_PAGE_TOTAL_INCONSISTENT"),
+    ("a page that lost a row", "government_wltp_page_3",
+     lambda body: body["result"]["records"].pop(), "R5_GOV_PAGE_COUNT_UNEXPECTED"),
+    ("a page that gained one", "government_wltp_page_3",
+     lambda body: body["result"]["records"].append(
+         deepcopy(body["result"]["records"][0])), "R5_GOV_PAGE_COUNT_UNEXPECTED"),
+    ("one registry row reachable from two pages", "government_wltp_page_3",
+     lambda body: body["result"]["records"][0].update(_id=GOVERNMENT_RECORD_ID_2021),
+     "R5_GOV_RECORD_ID_DUPLICATED"),
+    ("a row with no registry identity at all", "government_wltp_page_3",
+     lambda body: body["result"]["records"][0].update(_id="36327"),
+     "R5_GOV_FIXTURE_INVALID"),
+])
+def test_an_incomplete_or_inconsistent_pinned_query_fails_closed(relocated_fixtures, label,
+                                                                 key, mutate, expected):
+    """Every way the committed query could stop being that query is a refusal.
+
+    None of these reaches a smaller scan, a best-effort answer or a warning.
+    The checksum of each edited page is re-pinned first, so what is under test
+    here is the completeness gate and never the digest gate in front of it.
+    """
+    root = relocated_fixtures()
+    if key is None:
+        mutate(root)
+    else:
+        repin(root, key, mutate)
+    assert government_refusal() == expected
+    assert expected in R5_GOV_PAGINATION_REASONS or expected == "R5_GOV_FIXTURE_INVALID"
+
+
+@pytest.mark.parametrize("field, value", [("requested_offset", 300), ("requested_limit", 33),
+                                          ("returned_record_count", 34),
+                                          ("reported_total", 200)])
+def test_moving_a_page_in_its_provenance_alone_also_fails_closed(relocated_fixtures,
+                                                                 field, value):
+    """The manifest cannot relocate a page the response still contradicts.
+
+    A page's position is stated three times -- in the query the capture
+    recorded sending, in the manifest's own page locator, and in the body's
+    echo of what it answered. Editing only the provenance leaves the other two
+    disagreeing, so a page cannot be quietly re-labelled into a gap.
+    """
+    root = relocated_fixtures()
+    edit_manifest(root, lambda manifest: manifest["sources"]["government_wltp_page_3"]
+                  ["record_locator"]["page"].update({field: value}))
+    assert government_refusal() == "R5_GOV_PAGE_OFFSET_UNEXPECTED"
+
+
+@pytest.mark.parametrize("mutate, expected", [
+    (lambda path: path.write_bytes(path.read_bytes()[:-128]),
+     "R5_FIXTURE_BYTE_COUNT_MISMATCH"),
+    (lambda path: path.write_bytes(path.read_bytes().replace(b'"total": 233',
+                                                             b'"total": 133', 1)),
+     "R5_FIXTURE_CHECKSUM_MISMATCH"),
+])
+def test_a_truncated_or_tampered_third_page_never_reaches_the_scan(relocated_fixtures,
+                                                                   mutate, expected):
+    """The digest gate runs first, for the unread page exactly as for the read ones."""
+    root = relocated_fixtures()
+    mutate(root / "government" / "wltp_page_000003.json")
+    with pytest.raises(proof_manifest.ProofManifestError) as failure:
+        proof_manifest.verify_fixture("government_wltp_page_3")
+    assert failure.value.reason_code == expected
+    # And the tool refuses with that same static reason rather than scanning on.
+    assert government_refusal() == expected
+
+
+def test_the_importer_reproduces_the_third_pages_committed_provenance():
+    """The committed manifest entry is what the IMPORTER emits, not prose.
+
+    `government_source_entry` is the one rule for a committed government
+    source's provenance. Rebuilding page three's entry from the committed bytes
+    and the archive facts the manifest itself records must reproduce that entry
+    exactly -- so a field edited by hand into a shape the importer would never
+    produce (an invented record id, a locator moved off the page it describes)
+    is a test failure rather than a plausible line in a diff. Running it twice
+    pins the determinism the fixture refresh depends on.
+    """
+    entry = dict(proof_manifest.source_entry("government_wltp_page_3"))
+    archive = proof_manifest.load_manifest()["capture_archive"]
+    page = entry["record_locator"]["page"]
+    capture_entry = {
+        "source_id": "government_wltp_q0_page_000003",
+        "source_type": "government_datastore_page",
+        "raw_path": entry["record_locator"]["raw_capture_path"],
+        "requested_url": entry["requested_url"], "final_url": entry["final_url"],
+        "redirect_chain": [], "http_status": 200,
+        "finished_utc": entry["retrieved_at_utc"], "content_type": entry["content_type"],
+        "resource_id": entry["resource_id"], "query_params": dict(entry["query"]),
+        "query_token": page["query_token"],
+        "requested_offset": page["requested_offset"],
+        "requested_limit": page["requested_limit"],
+        "returned_record_count": page["returned_record_count"],
+        "reported_total": page["reported_total"],
+        "sha256": entry["upstream_sha256"], "byte_count": entry["response_byte_count"],
+        "headers": {},
+    }
+    resource = {"hash": entry["resource_content_hash"],
+                "metadata_modified": entry["resource_metadata_modified"],
+                "revision_id": entry["resource_revision_id"]}
+    path = proof_manifest.FIXTURE_ROOT / entry["fixture_path"]
+
+    def build():
+        return r5_capture_fixtures.government_source_entry(
+            {"tool": archive["tool"], "capture_id": archive["capture_id"]}, capture_entry,
+            "government_wltp_page_3", entry["fixture_path"], path, entry["fixture_sha256"],
+            entry["fixture_byte_count"], entry["source_version"], resource)
+
+    assert build() == entry
+    assert build() == build()
+    # The importer holds the page to its recorded position too, so an archive
+    # that described this page wrongly could never have produced this entry.
+    moved = {**capture_entry, "requested_offset": 300}
+    with pytest.raises(r5_capture_fixtures.CaptureRefused):
+        r5_capture_fixtures.government_source_entry(
+            {"tool": archive["tool"], "capture_id": archive["capture_id"]}, moved,
+            "government_wltp_page_3", entry["fixture_path"], path, entry["fixture_sha256"],
+            entry["fixture_byte_count"], entry["source_version"], resource)
+
+
+def test_the_third_page_is_not_in_the_selected_record_table():
+    """A page is imported because it completes the query, not because it holds a row.
+
+    `GOVERNMENT_RECORD_IDS` names the rows the proof actually reads, and the
+    third page is deliberately absent from it. That absence is what keeps the
+    importer from being handed an invented id to make the three pages look
+    uniform.
+    """
+    assert set(r5_capture_fixtures.IMPORTED_GOVERNMENT.values()) == {
+        ("government/package_show.json", "government_package"),
+        ("government/wltp_page_000001.json", "government_wltp_page_1"),
+        ("government/wltp_page_000002.json", "government_wltp_page_2"),
+        ("government/wltp_page_000003.json", "government_wltp_page_3"),
+    }
+    assert set(r5_capture_fixtures.GOVERNMENT_RECORD_IDS) == {"government_wltp_page_1",
+                                                              "government_wltp_page_2"}
+    assert "government_wltp_page_3" not in r5_capture_fixtures.GOVERNMENT_RECORD_IDS
 
 
 # --- the official saved Web document ----------------------------------------
