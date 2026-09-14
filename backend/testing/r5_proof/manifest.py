@@ -12,6 +12,12 @@ producing different evidence. A fixture with no manifest entry, a manifest
 entry with no fixture, an unknown fixture kind and a missing provenance field
 are all refusals, not warnings.
 
+The manifest also records what a capture did NOT receive. An ETag, a
+Last-Modified header and a CKAN resource revision are recorded as explicit
+nulls, declared in `absent_source_metadata` and machine-checked here, so
+"the server sent none" is a stated, verified fact rather than a missing key
+that a later edit could quietly fill with an invented value.
+
 Pure module: file reads only. No network access, no provider call, no database
 access, no tool execution and no global mutable state. Refreshing a fixture is
 an explicit manual development action (scripts/r5_capture_fixtures.py); nothing
@@ -22,13 +28,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Mapping
+
+from backend.engines.swarm_v2.evidence_bounds import (SOURCE_VERSION_KINDS,
+                                                      SOURCE_VERSION_PATTERNS)
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures"
 MANIFEST_PATH = FIXTURE_ROOT / "manifest.json"
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 
 #: How a committed fixture relates to what the upstream source actually served.
 #: The distinction is load-bearing: a verbatim excerpt and a normalized
@@ -46,20 +56,42 @@ REQUIRED_SOURCE_FIELDS = ("source_kind", "canonical_url", "retrieved_at_utc",
                           "fixture_sha256", "record_locator")
 
 #: The extra provenance each source KIND must carry. A git-backed source has to
-#: name the commit and blob it was read at; a dataset resource has to name the
-#: resource and the snapshot; a saved document has to name the document.
+#: name the commit and blob it was read at; a captured HTTP source has to name
+#: what was requested, what answered, how many bytes came back, which immutable
+#: version the evidence is pinned to, and which response metadata was absent.
 REQUIRED_BY_KIND: Mapping[str, tuple[str, ...]] = {
     "git_repository_file": ("repository", "repository_path", "commit_sha", "blob_sha",
                             "upstream_sha256"),
-    "government_dataset_resource": ("resource_id", "upstream_sha256"),
-    "saved_web_document": ("document_id", "upstream_sha256"),
+    "government_dataset_resource": ("resource_id", "ckan_package_id", "upstream_sha256",
+                                    "requested_url", "final_url", "query",
+                                    "source_version", "source_version_kind",
+                                    "fixture_byte_count", "response_byte_count",
+                                    "absent_source_metadata"),
+    "saved_web_document": ("document_id", "upstream_sha256", "requested_url", "final_url",
+                           "source_version", "source_version_kind", "fixture_byte_count",
+                           "response_byte_count", "absent_source_metadata",
+                           "text_projection_version"),
 }
+
+#: Response/source metadata a capture may legitimately not receive. An absent
+#: one must be declared in `absent_source_metadata` AND carried as an explicit
+#: null. Both halves are checked, in both directions: a declared-absent key
+#: that holds a value, and a null key that was not declared absent, are equally
+#: a refusal. Nothing may be invented later without failing this gate.
+OPTIONAL_SOURCE_METADATA = ("etag", "last_modified", "resource_revision_id")
+
+#: The closed source-version kinds a captured fixture may pin itself to. Same
+#: vocabulary the durable evidence contract uses, so a manifest can never name
+#: a version kind the evidence layer would refuse.
+MANIFEST_SOURCE_VERSION_KINDS = frozenset(SOURCE_VERSION_KINDS)
 
 _SHA256_LENGTH = 64
 
 R5_MANIFEST_REASONS = frozenset({
+    "R5_FIXTURE_BYTE_COUNT_MISMATCH",
     "R5_FIXTURE_CHECKSUM_MISMATCH",
     "R5_FIXTURE_MISSING",
+    "R5_FIXTURE_NOT_TEXT",
     "R5_FIXTURE_NOT_JSON",
     "R5_FIXTURE_PATH_INVALID",
     "R5_MANIFEST_INVALID",
@@ -76,8 +108,10 @@ class ProofManifestError(ValueError):
     """
 
     MESSAGES = {
+        "R5_FIXTURE_BYTE_COUNT_MISMATCH": "a committed fixture is not the size its manifest records",
         "R5_FIXTURE_CHECKSUM_MISMATCH": "a committed fixture does not match its manifest checksum",
         "R5_FIXTURE_MISSING": "a manifest entry names a fixture that is not committed",
+        "R5_FIXTURE_NOT_TEXT": "a committed fixture is not the UTF-8 document the manifest describes",
         "R5_FIXTURE_NOT_JSON": "a committed fixture is not the JSON document the manifest describes",
         "R5_FIXTURE_PATH_INVALID": "a fixture path escapes the committed fixture root",
         "R5_MANIFEST_INVALID": "the proof fixture manifest is missing or malformed",
@@ -130,7 +164,44 @@ def _validate_source(entry: Any) -> Mapping[str, Any]:
         raise ProofManifestError("R5_MANIFEST_INVALID")
     if not isinstance(entry["record_locator"], Mapping) or not entry["record_locator"]:
         raise ProofManifestError("R5_MANIFEST_INVALID")
+    _validate_captured_metadata(entry)
     return entry
+
+
+def _validate_captured_metadata(entry: Mapping[str, Any]) -> None:
+    """Check the parts of a CAPTURED source's provenance that must be exact.
+
+    Only entries that declare them are held to them, so the git-backed Yeda
+    source is unaffected. What is checked is what could otherwise be quietly
+    fabricated: the pinned version's shape, the recorded response size, and --
+    in both directions -- the claim that the server sent no validator.
+    """
+    kind, version = entry.get("source_version_kind"), entry.get("source_version")
+    if kind is not None or version is not None:
+        if kind not in MANIFEST_SOURCE_VERSION_KINDS or not isinstance(version, str) or \
+                not re.fullmatch(SOURCE_VERSION_PATTERNS[kind], version):
+            raise ProofManifestError("R5_MANIFEST_INVALID")
+    for field in ("fixture_byte_count", "response_byte_count"):
+        size = entry.get(field)
+        if size is not None and (isinstance(size, bool) or not isinstance(size, int)
+                                 or size <= 0):
+            raise ProofManifestError("R5_MANIFEST_INVALID")
+    declared = entry.get("absent_source_metadata")
+    if declared is None:
+        return
+    if not isinstance(declared, list) or len(set(declared)) != len(declared) or \
+            not set(declared) <= set(OPTIONAL_SOURCE_METADATA):
+        raise ProofManifestError("R5_MANIFEST_INVALID")
+    for name in OPTIONAL_SOURCE_METADATA:
+        if name in declared:
+            # Declared absent, so the key must exist and must be an explicit
+            # null. A value here would mean the manifest contradicts itself.
+            if name not in entry or entry[name] is not None:
+                raise ProofManifestError("R5_MANIFEST_INVALID")
+        elif name in entry and entry[name] is None:
+            # A null that was never declared absent: the one shape in which an
+            # unrecorded gap could later be filled in without review.
+            raise ProofManifestError("R5_MANIFEST_INVALID")
 
 
 def load_manifest() -> Mapping[str, Any]:
@@ -171,6 +242,13 @@ def verify_fixture(source_key: str) -> tuple[Mapping[str, Any], bytes]:
         payload = path.read_bytes()
     except OSError:
         raise ProofManifestError("R5_FIXTURE_MISSING") from None
+    # `fixture_byte_count` is the size of the COMMITTED file; `response_byte_count`
+    # is the size of the upstream response, which is the same object only for an
+    # `exact_response`. Checked BEFORE the digest so a truncated read is
+    # classified as the truncation it is rather than as a checksum failure.
+    expected_size = entry.get("fixture_byte_count")
+    if expected_size is not None and len(payload) != expected_size:
+        raise ProofManifestError("R5_FIXTURE_BYTE_COUNT_MISMATCH")
     if hashlib.sha256(payload).hexdigest() != entry["fixture_sha256"]:
         raise ProofManifestError("R5_FIXTURE_CHECKSUM_MISMATCH")
     return entry, payload
@@ -188,6 +266,22 @@ def load_fixture(source_key: str) -> tuple[Mapping[str, Any], Any]:
     return entry, document
 
 
+def load_text_fixture(source_key: str) -> tuple[Mapping[str, Any], str]:
+    """Return `(manifest entry, decoded text)` for ONE verified source.
+
+    The sibling of `load_fixture` for a source that is a document rather than
+    a JSON body. The checksum gate is identical and runs first: a saved page is
+    decoded only after its bytes have been proven to be the bytes the manifest
+    describes, and a body that is not strict UTF-8 is a refusal rather than a
+    lossy decode that would silently change the offsets every locator uses.
+    """
+    entry, payload = verify_fixture(source_key)
+    try:
+        return entry, payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ProofManifestError("R5_FIXTURE_NOT_TEXT") from None
+
+
 def verify_all_fixtures() -> tuple[str, ...]:
     """Re-hash every committed fixture. Returns the verified source keys."""
     keys = tuple(sorted(load_manifest()["sources"]))
@@ -197,6 +291,7 @@ def verify_all_fixtures() -> tuple[str, ...]:
 
 
 __all__ = ["FIXTURE_KINDS", "FIXTURE_ROOT", "MANIFEST_PATH", "MANIFEST_VERSION",
+           "MANIFEST_SOURCE_VERSION_KINDS", "OPTIONAL_SOURCE_METADATA",
            "R5_MANIFEST_REASONS", "REQUIRED_BY_KIND", "REQUIRED_SOURCE_FIELDS",
-           "ProofManifestError", "load_fixture", "load_manifest", "source_entry",
-           "verify_all_fixtures", "verify_fixture"]
+           "ProofManifestError", "load_fixture", "load_manifest", "load_text_fixture",
+           "source_entry", "verify_all_fixtures", "verify_fixture"]
