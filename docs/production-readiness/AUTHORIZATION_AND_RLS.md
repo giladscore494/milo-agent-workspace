@@ -43,6 +43,49 @@ real PostgreSQL in CI (`tests/test_migrations_postgres.py`, zero skips
 enforced), including a guard that every public table has RLS with no
 external trigger present.
 
+## Durable catalog namespace — `COMPLETED_IN_CODE`
+
+Migration `20260914200000_catalog_evidence_foundation.sql` (Catalog PR1) adds
+six service-path-only relations: `catalog_source_snapshots`,
+`catalog_raw_records`, `catalog_candidate_variants`,
+`catalog_candidate_evidence_links`, and the canonical `catalog_models` /
+`catalog_model_variants`. All six enable RLS with **zero policies**, so
+browser roles (`PUBLIC` / `anon` / `authenticated`) are denied outright, and
+all six additionally hold **no grant at all** for those roles — two
+independent barriers, neither depending on the other.
+
+`service_role` privileges are deliberately narrow and differ per relation:
+
+| Relation | `service_role` holds |
+| --- | --- |
+| `catalog_raw_records`, `catalog_candidate_evidence_links` | `SELECT`, `INSERT` — append-only; no `UPDATE`, no `DELETE` |
+| `catalog_source_snapshots`, `catalog_candidate_variants` | `SELECT`, `INSERT`, `UPDATE` — the one reviewed transition each carries (snapshot completion counters, candidate status); no `DELETE` |
+| `catalog_models`, `catalog_model_variants` | **`SELECT` only** |
+
+The canonical pair being read-only is what makes "the canonical catalog starts
+empty and stays empty in PR1" a database property rather than a claim about
+the code: no role can insert a canonical row, so canonical promotion cannot
+happen by accident or by an unreviewed backend release. Catalog PR3 grants the
+privilege it needs in its own reviewed migration.
+
+Every durable write goes through one of five lease-guarded RPCs
+(`record_catalog_snapshot_guarded`, `record_catalog_raw_record_guarded`,
+`activate_catalog_snapshot_guarded`, `record_catalog_candidate_guarded`,
+`link_catalog_candidate_evidence_guarded`), each calling
+`assert_worker_lease` before writing anything, each `EXECUTE`-revoked from
+`public`/`anon`/`authenticated` and granted only to `service_role`, and each
+idempotent on a backend-derived key that fails closed when replayed with
+different content. The constraint helper
+`catalog_identity_dimensions_valid(jsonb)` is revoked from the browser roles
+on the same footing as the `r3_*` predicates. Executable validation:
+`tests/test_migrations_postgres.py` (the `test_catalog_*` cases,
+`MILO_REQUIRE_PG_TESTS=1`, zero skips).
+
+Catalog foreign keys are all `ON DELETE RESTRICT`, never `CASCADE` — unlike
+the run-scoped evidence relations. Durable catalog state must not disappear
+with a run, and a run that catalog state depends on cannot be deleted out from
+under it.
+
 ## Service-only RPC ACLs — `COMPLETED_IN_CODE`
 
 Supabase grants EXECUTE on public-schema functions to `anon`,

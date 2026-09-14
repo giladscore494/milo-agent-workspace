@@ -499,6 +499,58 @@ Done כאשר: פרויקט עם workflow_key=swarm_v2 מסיים Run במצב c
 
 # שלב 2 — חיבור המנוע ל״ידע רכב״
 
+> ## SUPERSEDED — the existing Yeda JSON is no longer treated as the canonical catalog
+>
+> **Status: the plan below is retained as the historical Stage 2 design. The
+> product decision it rests on has been superseded and is stated here instead.**
+>
+> Stage 2 was written on the assumption that
+> `reliabilityAIModelsR2/my-flask-app/app/data/model_technical_catalog_il.json`
+> **is** the vehicle catalog, and that MILO's job is to read it, find coverage
+> gaps in it, patch it and write back to it. Review of the file established
+> that it is **incomplete, contains incorrect information, and is missing
+> models and variants**. A catalog cannot be built by patching a source that
+> is wrong in unknown places, because every correction inherits whatever was
+> wrong and unreviewed around it.
+>
+> The corrected architecture:
+>
+> * **The canonical catalog starts EMPTY.** It is not seeded, backfilled or
+>   migrated from the existing JSON, and no row of that JSON is copied into a
+>   migration. `public.catalog_models` and `public.catalog_model_variants` are
+>   created with no rows at all.
+> * **The existing catalog is an unverified `legacy_reference`.** It may be
+>   used for candidate discovery, aliases and comparison, and for nothing
+>   else. It is never authoritative, never promoted automatically, and can
+>   never verify a fact or override Government or manufacturer evidence. The
+>   database pins its trust state to `unverified` per source family, so this
+>   is a constraint rather than a convention. The 7.3 MB file is never loaded
+>   into a prompt or into a migration.
+> * **Government (`data.gov.il`) is a READ-ONLY source.** MILO reads the
+>   official register; it never writes to it and holds no credential for it.
+> * **MILO accumulates its own material in a bounded catalog namespace**:
+>   immutable source snapshots, append-only raw records, and candidate vehicle
+>   variants that may legitimately remain `ambiguous`. Every candidate links
+>   back to the EXISTING evidence relations (`public.sources`,
+>   `public.claims`, `public.claim_verdicts`) by their own identifiers rather
+>   than copying facts into a parallel evidence system.
+> * **Every canonical fact must be traceable to verified evidence**, and no
+>   canonical identity is ever silently overwritten.
+>
+> Delivery, in three reviewable steps:
+>
+> | PR | Scope | State |
+> | --- | --- | --- |
+> | **Catalog PR1** | Persistence only: the versioned schema, the guarded write paths, RLS/ACL, and an empty canonical catalog. No ingestion, no HTTP, no tool, no promotion. | this PR |
+> | **Catalog PR2** | Government ingestion into that schema: the read-only `data.gov.il` path that fills snapshots, raw records and candidates. | next |
+> | **Catalog PR3** | Connect the capability to Swarm V2 and add controlled canonical promotion, gated on verified evidence. | after PR2 |
+>
+> What Stage 2 below still describes correctly: the bounded query surface, the
+> refusal to stream the whole catalog into a model, and the
+> provenance/coverage vocabulary. What it no longer describes: the JSON as
+> canonical truth, and the patch/write-back flow against it (§2.7 is not a
+> Stage 2 deliverable under this decision).
+
 יעד השלב: להפוך את המאגר הקיים לכלי native של המנוע. ה־Commander יוכל לקרוא דגמים/שנתונים/וריאנטים, להבין coverage, להשוות, ליצור patch proposal ולבצע write מבוקר — בלי להזרים את קובץ ה־JSON המלא למודל.
 
 <table>
@@ -738,6 +790,14 @@ Done כאשר: MILO מסוגל לקרוא, להשוות ולהציע/להחיל 
 # שלב 3 — חיבור ל־API הממשלתי של data.gov.il
 
 יעד השלב: להפוך את מאגר משרד התחבורה לעוגן דטרמיניסטי של קיום דגם/שנתון/וריאנט. ה־Commander לא “מגלה” בישראל דרך Web עובדה שהממשלה כבר נותנת; הוא משתמש ב־GovernmentVehicleTool ורק פותר gaps/aliases/מידע שאינו קיים במקור הרשמי.
+
+> **Government is READ-ONLY, and it now lands in the catalog namespace.** Under
+> the corrected Stage 2 decision above, ingestion from `data.gov.il` writes
+> immutable source snapshots, append-only raw records and candidate variants
+> into the relations Catalog PR1 established — it does not patch an existing
+> aggregated JSON. MILO never writes to `data.gov.il` and holds no credential
+> for it. That ingestion is **Catalog PR2**; Catalog PR1 added persistence only.
+
 
 <table>
 <colgroup>

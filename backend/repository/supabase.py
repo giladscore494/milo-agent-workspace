@@ -53,6 +53,20 @@ class Repository(Protocol):
     def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
 
+    # --- durable catalog staging (PR1: persistence only) ---------------------
+    #
+    # The evidence relations above are RUN-SCOPED and cascade away with their
+    # run.  These five write into the long-lived catalog namespace instead.
+    # Every one is lease-guarded exactly like the evidence writes, and every
+    # one is idempotent on a backend-derived key.  There is deliberately no
+    # canonical-promotion method here: the canonical tables are read-only in
+    # PR1 at the database level, so no repository method could write one.
+    def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_catalog_candidate(self, run_id: UUID, candidate: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def link_catalog_candidate_evidence(self, run_id: UUID, link: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def list_unread_agent_messages(self, run_id: UUID, recipient: str = "supervisor") -> list[dict[str, Any]]: ...
@@ -735,6 +749,34 @@ class SupabaseRepository:
     def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_verdict": verdict}
         return self._guarded_rpc("record_claim_verdict_guarded", params, "claim_verdict")
+
+    # --- durable catalog staging (PR1) ---------------------------------------
+    #
+    # Guarded RPCs, never direct inserts: the lease check, the idempotency
+    # identity, the cross-run and cross-snapshot guards and the fail-closed
+    # replay conflict all live in the database, so they hold for any caller
+    # rather than for whichever backend release happens to be deployed.  The
+    # function name is a literal in every case -- no table or function is ever
+    # selected from a payload.
+    def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_snapshot": snapshot}
+        return self._guarded_rpc("record_catalog_snapshot_guarded", params, "catalog_snapshot")
+
+    def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_record": record}
+        return self._guarded_rpc("record_catalog_raw_record_guarded", params, "catalog_raw_record")
+
+    def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_activation": activation}
+        return self._guarded_rpc("activate_catalog_snapshot_guarded", params, "catalog_snapshot")
+
+    def record_catalog_candidate(self, run_id: UUID, candidate: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_candidate": candidate}
+        return self._guarded_rpc("record_catalog_candidate_guarded", params, "catalog_candidate")
+
+    def link_catalog_candidate_evidence(self, run_id: UUID, link: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_link": link}
+        return self._guarded_rpc("link_catalog_candidate_evidence_guarded", params, "catalog_evidence_link")
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_resolution": resolution}

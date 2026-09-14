@@ -33,7 +33,12 @@ Status: `COMPLETED_IN_CODE` (application architecture) /
   OIDC-verified worker surface (`backend/worker_auth.py`) but are not on
   the canonical worker mutation path.
 - **Supabase (PostgreSQL + auth)** — source of truth; RLS on all
-  browser-reachable tables; service-role credential is server-only.
+  browser-reachable tables; service-role credential is server-only. It also
+  holds the **durable catalog namespace** (`catalog_*`, Catalog PR1): unlike
+  the run-scoped evidence relations, these outlive the run that produced them
+  and reference it with `ON DELETE RESTRICT`. There is exactly one database:
+  no separate Yeda connection, credential or cross-project trust boundary
+  exists or is introduced.
 - **Redis (Upstash REST)** — shared rate-limit store for gateway and API;
   production fails closed on limited surfaces when unavailable.
 - **Provider (Kimi/Moonshot)** — reached only by the worker, only when
