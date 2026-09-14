@@ -38,10 +38,30 @@ production.
 | ts | `20260810000600_corrective_lease_and_attempt_hardening.sql` | attempt-aware reservation identity (run_id, attempt, call_seq); cross-run-safe guarded settle; DB-clock guarded usage/heartbeat/worker-transition RPCs |
 | ts | `20260818000100_stage_c_service_role_rpc_acl.sql` | service_role EXECUTE on the create_message_and_run / create_project_from_proposal_with_owner base RPCs (Stage C Attempt 4 corrective) |
 | ts | `20260818000200_claim_run_lease_service_role_acl.sql` | service_role EXECUTE on claim_run_lease (Stage C Attempt 5 corrective; full worker-path ACL contract now enforced by `tests/test_worker_rpc_acl_postgres.py`) |
+| ts | `20260914200000_catalog_evidence_foundation.sql` | Catalog PR1: the durable catalog namespace — `catalog_source_snapshots`, `catalog_raw_records`, `catalog_candidate_variants`, `catalog_candidate_evidence_links` plus the **empty** canonical `catalog_models` / `catalog_model_variants`, their lease-guarded RPCs, append-only triggers, RLS and least-privilege grants |
 
 All migrations are additive, idempotent and data-preserving. There are no
 destructive down-migrations, by policy (`scripts/check_migrations.py`
 forbids `drop table` and data deletes).
+
+### Catalog PR1 — migration and rollback impact
+
+`20260914200000_catalog_evidence_foundation.sql` is purely additive: it
+creates six new relations, one immutable predicate, five lease-guarded RPCs
+and their triggers, and touches no existing table, column, RPC, index, policy
+or grant. It **seeds nothing** — no row is inserted by the migration, and the
+canonical relations (`catalog_models`, `catalog_model_variants`) are created
+empty and are `SELECT`-only for `service_role`, so no write path that exists
+today can put a row in either. The existing aggregated Yeda catalog is
+deliberately **not** imported; it is representable only as a
+`legacy_reference` snapshot whose trust state is pinned to `unverified`.
+
+Rollback is the usual forward-only story, and it is unusually cheap here:
+because nothing reads or writes these relations yet, reverting means simply
+not using them. If the schema itself must go, the corrective forward
+migration drops the six relations, the five RPCs and the predicate — an
+operation that loses no data while the catalog is empty. No existing
+behaviour, row or contract depends on this migration.
 
 ## Confirmed legacy baseline
 
