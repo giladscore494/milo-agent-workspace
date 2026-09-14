@@ -1,0 +1,681 @@
+{
+  "catalog": {
+    "generated_at": "2026-06-25T00:20:49Z",
+    "market": "IL",
+    "model_count": 965,
+    "catalog_hash": "76d2b5fbaa141577"
+  },
+  "model_index": 860,
+  "model": {
+    "sources": [
+      {
+        "source_index": 918,
+        "title": "Toyota RAV4 2019-2024 Specifications - iCar",
+        "url": "https://www.icar.co.il/Toyota/RAV4/",
+        "source_name": "iCar",
+        "source_type": "auto_catalog",
+        "supports": [
+          "body_type",
+          "fuel_type",
+          "engine",
+          "engine_displacement_l",
+          "horsepower_hp",
+          "transmission",
+          "drivetrain",
+          "year_start",
+          "year_end"
+        ]
+      },
+      {
+        "source_index": 919,
+        "title": "Toyota RAV4 Plug-in Specifications",
+        "url": "https://www.toyota.co.il/models/rav4-plugin",
+        "source_name": "Toyota Israel",
+        "source_type": "official_importer",
+        "supports": [
+          "body_type",
+          "fuel_type",
+          "engine",
+          "engine_displacement_l",
+          "horsepower_hp",
+          "transmission",
+          "drivetrain",
+          "year_start",
+          "year_end"
+        ]
+      },
+      {
+        "source_index": 920,
+        "title": "Toyota RAV4 2013-2018 Specifications - iCar",
+        "url": "https://www.icar.co.il/Toyota/RAV4/2013/",
+        "source_name": "iCar",
+        "source_type": "auto_catalog",
+        "supports": [
+          "body_type",
+          "fuel_type",
+          "engine",
+          "engine_displacement_l",
+          "horsepower_hp",
+          "transmission",
+          "drivetrain",
+          "year_start",
+          "year_end"
+        ]
+      },
+      {
+        "source_index": 921,
+        "title": "Toyota RAV4 2006-2012 Prices and Specs",
+        "url": "https://www.carzone.co.il/toyota/rav4/2006-2012/",
+        "source_name": "Carzone",
+        "source_type": "auto_catalog",
+        "supports": [
+          "body_type",
+          "fuel_type",
+          "engine",
+          "engine_displacement_l",
+          "horsepower_hp",
+          "transmission",
+          "drivetrain",
+          "year_start",
+          "year_end"
+        ]
+      },
+      {
+        "source_index": 922,
+        "title": "Toyota RAV4 2000-2005 Prices and Specs",
+        "url": "https://www.carzone.co.il/toyota/rav4/2000-2005/",
+        "source_name": "Carzone",
+        "source_type": "auto_catalog",
+        "supports": [
+          "body_type",
+          "fuel_type",
+          "engine",
+          "engine_displacement_l",
+          "horsepower_hp",
+          "transmission",
+          "drivetrain",
+          "year_start",
+          "year_end"
+        ]
+      }
+    ],
+    "technical_variants_il": [
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "petrol",
+        "engine": "2.0L",
+        "engine_displacement_l": 2.0,
+        "horsepower_hp": 175,
+        "transmission": "cvt",
+        "drivetrain": "FWD",
+        "year_start": 2019,
+        "year_end": 2026,
+        "support_level": "direct",
+        "source_indexes": [
+          918
+        ],
+        "field_sources": {
+          "body_type": [
+            918
+          ],
+          "fuel_type": [
+            918
+          ],
+          "engine": [
+            918
+          ],
+          "engine_displacement_l": [
+            918
+          ],
+          "horsepower_hp": [
+            918
+          ],
+          "transmission": [
+            918
+          ],
+          "drivetrain": [
+            918
+          ],
+          "year_start": [
+            918
+          ],
+          "year_end": [
+            918
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      },
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "petrol",
+        "engine": "2.0L",
+        "engine_displacement_l": 2.0,
+        "horsepower_hp": 175,
+        "transmission": "cvt",
+        "drivetrain": "AWD",
+        "year_start": 2019,
+        "year_end": 2026,
+        "support_level": "direct",
+        "source_indexes": [
+          918
+        ],
+        "field_sources": {
+          "body_type": [
+            918
+          ],
+          "fuel_type": [
+            918
+          ],
+          "engine": [
+            918
+          ],
+          "engine_displacement_l": [
+            918
+          ],
+          "horsepower_hp": [
+            918
+          ],
+          "transmission": [
+            918
+          ],
+          "drivetrain": [
+            918
+          ],
+          "year_start": [
+            918
+          ],
+          "year_end": [
+            918
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      },
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "hybrid",
+        "engine": "2.5L",
+        "engine_displacement_l": 2.5,
+        "horsepower_hp": 218,
+        "transmission": "cvt",
+        "drivetrain": "FWD",
+        "year_start": 2019,
+        "year_end": 2026,
+        "support_level": "direct",
+        "source_indexes": [
+          918
+        ],
+        "field_sources": {
+          "body_type": [
+            918
+          ],
+          "fuel_type": [
+            918
+          ],
+          "engine": [
+            918
+          ],
+          "engine_displacement_l": [
+            918
+          ],
+          "horsepower_hp": [
+            918
+          ],
+          "transmission": [
+            918
+          ],
+          "drivetrain": [
+            918
+          ],
+          "year_start": [
+            918
+          ],
+          "year_end": [
+            918
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      },
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "hybrid",
+        "engine": "2.5L",
+        "engine_displacement_l": 2.5,
+        "horsepower_hp": 222,
+        "transmission": "cvt",
+        "drivetrain": "AWD",
+        "year_start": 2019,
+        "year_end": 2026,
+        "support_level": "direct",
+        "source_indexes": [
+          918
+        ],
+        "field_sources": {
+          "body_type": [
+            918
+          ],
+          "fuel_type": [
+            918
+          ],
+          "engine": [
+            918
+          ],
+          "engine_displacement_l": [
+            918
+          ],
+          "horsepower_hp": [
+            918
+          ],
+          "transmission": [
+            918
+          ],
+          "drivetrain": [
+            918
+          ],
+          "year_start": [
+            918
+          ],
+          "year_end": [
+            918
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      },
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "plug_in_hybrid",
+        "engine": "2.5L",
+        "engine_displacement_l": 2.5,
+        "horsepower_hp": 306,
+        "transmission": "cvt",
+        "drivetrain": "AWD",
+        "year_start": 2021,
+        "year_end": 2026,
+        "support_level": "direct",
+        "source_indexes": [
+          919
+        ],
+        "field_sources": {
+          "body_type": [
+            919
+          ],
+          "fuel_type": [
+            919
+          ],
+          "engine": [
+            919
+          ],
+          "engine_displacement_l": [
+            919
+          ],
+          "horsepower_hp": [
+            919
+          ],
+          "transmission": [
+            919
+          ],
+          "drivetrain": [
+            919
+          ],
+          "year_start": [
+            919
+          ],
+          "year_end": [
+            919
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      },
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "petrol",
+        "engine": "2.0L",
+        "engine_displacement_l": 2.0,
+        "horsepower_hp": 151,
+        "transmission": "cvt",
+        "drivetrain": "AWD",
+        "year_start": 2013,
+        "year_end": 2018,
+        "support_level": "direct",
+        "source_indexes": [
+          920
+        ],
+        "field_sources": {
+          "body_type": [
+            920
+          ],
+          "fuel_type": [
+            920
+          ],
+          "engine": [
+            920
+          ],
+          "engine_displacement_l": [
+            920
+          ],
+          "horsepower_hp": [
+            920
+          ],
+          "transmission": [
+            920
+          ],
+          "drivetrain": [
+            920
+          ],
+          "year_start": [
+            920
+          ],
+          "year_end": [
+            920
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      },
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "hybrid",
+        "engine": "2.5L",
+        "engine_displacement_l": 2.5,
+        "horsepower_hp": 197,
+        "transmission": "cvt",
+        "drivetrain": "FWD",
+        "year_start": 2016,
+        "year_end": 2018,
+        "support_level": "direct",
+        "source_indexes": [
+          920
+        ],
+        "field_sources": {
+          "body_type": [
+            920
+          ],
+          "fuel_type": [
+            920
+          ],
+          "engine": [
+            920
+          ],
+          "engine_displacement_l": [
+            920
+          ],
+          "horsepower_hp": [
+            920
+          ],
+          "transmission": [
+            920
+          ],
+          "drivetrain": [
+            920
+          ],
+          "year_start": [
+            920
+          ],
+          "year_end": [
+            920
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      },
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "hybrid",
+        "engine": "2.5L",
+        "engine_displacement_l": 2.5,
+        "horsepower_hp": 197,
+        "transmission": "cvt",
+        "drivetrain": "AWD",
+        "year_start": 2016,
+        "year_end": 2018,
+        "support_level": "direct",
+        "source_indexes": [
+          920
+        ],
+        "field_sources": {
+          "body_type": [
+            920
+          ],
+          "fuel_type": [
+            920
+          ],
+          "engine": [
+            920
+          ],
+          "engine_displacement_l": [
+            920
+          ],
+          "horsepower_hp": [
+            920
+          ],
+          "transmission": [
+            920
+          ],
+          "drivetrain": [
+            920
+          ],
+          "year_start": [
+            920
+          ],
+          "year_end": [
+            920
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      },
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "petrol",
+        "engine": "2.0L",
+        "engine_displacement_l": 2.0,
+        "horsepower_hp": 152,
+        "transmission": "4-speed automatic",
+        "drivetrain": "AWD",
+        "year_start": 2006,
+        "year_end": 2012,
+        "support_level": "direct",
+        "source_indexes": [
+          921
+        ],
+        "field_sources": {
+          "body_type": [
+            921
+          ],
+          "fuel_type": [
+            921
+          ],
+          "engine": [
+            921
+          ],
+          "engine_displacement_l": [
+            921
+          ],
+          "horsepower_hp": [
+            921
+          ],
+          "transmission": [
+            921
+          ],
+          "drivetrain": [
+            921
+          ],
+          "year_start": [
+            921
+          ],
+          "year_end": [
+            921
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      },
+      {
+        "version_or_trim": null,
+        "body_type": "SUV",
+        "fuel_type": "petrol",
+        "engine": "2.0L",
+        "engine_displacement_l": 2.0,
+        "horsepower_hp": 150,
+        "transmission": "4-speed automatic",
+        "drivetrain": "AWD",
+        "year_start": 2000,
+        "year_end": 2005,
+        "support_level": "direct",
+        "source_indexes": [
+          922
+        ],
+        "field_sources": {
+          "body_type": [
+            922
+          ],
+          "fuel_type": [
+            922
+          ],
+          "engine": [
+            922
+          ],
+          "engine_displacement_l": [
+            922
+          ],
+          "horsepower_hp": [
+            922
+          ],
+          "transmission": [
+            922
+          ],
+          "drivetrain": [
+            922
+          ],
+          "year_start": [
+            922
+          ],
+          "year_end": [
+            922
+          ],
+          "version_or_trim": []
+        },
+        "missing_grounded_fields": []
+      }
+    ],
+    "invalid_or_non_trim_labels": [
+      {
+        "label": "2.0L petrol, 129 hp",
+        "classification": "engine_spec_with_hp"
+      },
+      {
+        "label": "2.0L petrol, 150 hp",
+        "classification": "engine_spec_with_hp"
+      },
+      {
+        "label": "2.0L petrol, 151 hp",
+        "classification": "engine_spec_with_hp"
+      },
+      {
+        "label": "2.0L petrol, 152-158 hp",
+        "classification": "engine_spec_with_hp"
+      },
+      {
+        "label": "2.0L petrol, 175 hp",
+        "classification": "engine_spec_with_hp"
+      },
+      {
+        "label": "2.5L hybrid, 197 hp",
+        "classification": "engine_spec_with_hp"
+      },
+      {
+        "label": "2.5L hybrid, 218 hp",
+        "classification": "engine_spec_with_hp"
+      },
+      {
+        "label": "2.5L plug-in hybrid, 306 hp",
+        "classification": "engine_spec_with_hp"
+      },
+      {
+        "label": "4-speed automatic",
+        "classification": "transmission"
+      },
+      {
+        "label": "CVT",
+        "classification": "transmission"
+      },
+      {
+        "label": "e-CVT",
+        "classification": "transmission"
+      },
+      {
+        "label": "Hybrid",
+        "classification": "fuel_type"
+      },
+      {
+        "label": "Petrol",
+        "classification": "fuel_type"
+      },
+      {
+        "label": "Plug-in Hybrid",
+        "classification": "fuel_type"
+      },
+      {
+        "label": "AWD",
+        "classification": "drivetrain"
+      },
+      {
+        "label": "FWD",
+        "classification": "drivetrain"
+      }
+    ],
+    "available_values_for_website": {
+      "version_or_trim": [],
+      "body_type": [
+        "SUV"
+      ],
+      "fuel_type": [
+        "hybrid",
+        "petrol",
+        "plug_in_hybrid"
+      ],
+      "engine": [
+        "2.0L",
+        "2.5L"
+      ],
+      "horsepower_hp": [
+        150,
+        151,
+        152,
+        175,
+        197,
+        218,
+        222,
+        306
+      ],
+      "transmission": [
+        "4-speed automatic",
+        "cvt"
+      ],
+      "drivetrain": [
+        "AWD",
+        "FWD"
+      ]
+    },
+    "market": "IL-confirmed",
+    "make": "Toyota",
+    "model": "RAV4",
+    "canonical_model": "RAV4",
+    "profile_confidence": "medium",
+    "year_start": 2000,
+    "year_end": null
+  }
+}

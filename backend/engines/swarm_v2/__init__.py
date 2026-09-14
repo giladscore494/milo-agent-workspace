@@ -56,9 +56,10 @@ from .tool_calls import (MAX_BINDING_PATH_SEGMENTS, MAX_DEPENDENCY_BINDINGS_PER_
                          MAX_TOOL_VALUE_DEPTH, PLAN_TOOL_CALL_REASONS,
                          TOOL_CALL_REASONS, ToolCallError, ToolCallRecord,
                          ToolResultSink, resolve_tool_arguments, validate_binding_path)
-from .worker import (MAX_WORKER_OUTPUT_MODEL_ATTEMPTS, WORKER_OUTPUT_REASONS, GenericWorker,
-                     TaskResult, WorkerOutputValidationError, build_worker_request,
-                     validate_worker_output)
+from .worker import (DETERMINISTIC_OUTPUT_REASONS, MAX_WORKER_OUTPUT_MODEL_ATTEMPTS,
+                     WORKER_OUTPUT_REASONS, DeterministicOutputError, GenericWorker,
+                     TaskOutputStrategy, TaskResult, WorkerOutputValidationError,
+                     build_worker_request, validate_worker_output)
 from .builder import FinalBuilder
 from .outcome import (ALLOWED_OUTCOMES, DURABLE_RUN_STATUS, NO_USABLE_RESULT_CODE,
                       PRODUCT_STATUSES, RESULT_KINDS, TRUSTED_NEGATIVE_CODES,
@@ -109,7 +110,8 @@ __all__ += ["DependencyBinding", "PlannedToolCall",
             "MAX_TOOL_VALUE_DEPTH", "PLAN_TOOL_CALL_REASONS", "TOOL_CALL_REASONS",
             "ToolCallError", "ToolCallRecord", "ToolResultSink",
             "resolve_tool_arguments", "validate_binding_path"]
-__all__ += ["MAX_WORKER_OUTPUT_MODEL_ATTEMPTS", "WORKER_OUTPUT_REASONS",
+__all__ += ["DETERMINISTIC_OUTPUT_REASONS", "MAX_WORKER_OUTPUT_MODEL_ATTEMPTS",
+            "WORKER_OUTPUT_REASONS", "DeterministicOutputError", "TaskOutputStrategy",
             "WorkerOutputValidationError", "build_worker_request", "validate_worker_output"]
 __all__ += ["GROUNDED_VERDICT_REASONS", "MAX_VERIFIER_BATCH_JSON_BYTES",
             "MAX_VERIFIER_CLAIMS_PER_BATCH",

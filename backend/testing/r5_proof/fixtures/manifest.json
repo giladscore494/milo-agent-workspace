@@ -1,0 +1,223 @@
+{
+  "capture_archive": {
+    "authentication": "none; all sources are public read-only endpoints",
+    "capture_id": "milo-r5-source-capture-20260914T161110Z",
+    "finished_utc": "2026-09-14T16:11:16.271Z",
+    "manifest_sha256": "3c48a4d8545f5ab6404e4573920c0c1b18c9d5bea0da04cf79fea3c840ca309f",
+    "note": "byte-exact bodies of public unauthenticated read-only HTTPS GETs, captured outside this environment because its egress proxy refuses data.gov.il and www.toyota.co.il with HTTP 403 to CONNECT",
+    "overall_status": "ready_for_r5_bundle_review",
+    "request_count": 11,
+    "started_utc": "2026-09-14T16:11:10.024Z",
+    "tool": "MILO-R5-streamlit-evidence-capture/2.0"
+  },
+  "manifest_version": 2,
+  "proof": "r5_vehicle_proof",
+  "sources": {
+    "government_package": {
+      "absent_source_metadata": [
+        "etag",
+        "last_modified",
+        "resource_revision_id"
+      ],
+      "canonical_url": "https://data.gov.il/api/3/action/package_show?id=degem-rechev-wltp",
+      "capture_method": "public unauthenticated read-only HTTPS GET captured by MILO-R5-streamlit-evidence-capture/2.0 into milo-r5-source-capture-20260914T161110Z, then imported byte-for-byte after the archive's own checksums, byte counts, HTTP statuses and host allowlist were independently re-verified",
+      "ckan_package_id": "degem-rechev-wltp",
+      "content_type": "application/json;charset=utf-8",
+      "etag": null,
+      "final_url": "https://data.gov.il/api/3/action/package_show?id=degem-rechev-wltp",
+      "fixture_byte_count": 7821,
+      "fixture_kind": "exact_response",
+      "fixture_path": "government/package_show.json",
+      "fixture_sha256": "4e8f30b9047f5600740542bcfebc0697d97d7a0edb1e26fb1fa97e9295c1721a",
+      "http_status": 200,
+      "last_modified": null,
+      "query": {
+        "id": "degem-rechev-wltp"
+      },
+      "record_locator": {
+        "ckan_package_id": "degem-rechev-wltp",
+        "raw_capture_path": "raw/government/package_show.json"
+      },
+      "redirect_chain": [],
+      "requested_url": "https://data.gov.il/api/3/action/package_show?id=degem-rechev-wltp",
+      "resource_content_hash": "79ab5917935c722fa6de8460a594a778",
+      "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
+      "resource_metadata_modified": "2026-09-14T02:41:31.884381",
+      "resource_revision_id": null,
+      "response_byte_count": 7821,
+      "retrieved_at_utc": "2026-09-14T16:11:10.360Z",
+      "source_kind": "government_dataset_resource",
+      "source_version": "2026-09-14T02:41:31.842626",
+      "source_version_kind": "dataset_version",
+      "source_version_origin": "package_show -> resources[WLTP_RESOURCE_ID].last_modified; the resource carries no revision_id key at all, so none is recorded. Its published `hash` is recorded beside this as provenance but is NOT used as the version: it is an MD5 of the full 53 MB CSV export, which is neither a SHA-256 nor the JSON the datastore API served",
+      "upstream_committed": true,
+      "upstream_sha256": "4e8f30b9047f5600740542bcfebc0697d97d7a0edb1e26fb1fa97e9295c1721a"
+    },
+    "government_wltp_page_1": {
+      "absent_source_metadata": [
+        "etag",
+        "last_modified",
+        "resource_revision_id"
+      ],
+      "canonical_url": "https://data.gov.il/api/3/action/datastore_search?resource_id=142afde2-6228-49f9-8a29-9b6c3a0cbe40&limit=100&offset=0&q=RAV4",
+      "capture_method": "public unauthenticated read-only HTTPS GET captured by MILO-R5-streamlit-evidence-capture/2.0 into milo-r5-source-capture-20260914T161110Z, then imported byte-for-byte after the archive's own checksums, byte counts, HTTP statuses and host allowlist were independently re-verified",
+      "ckan_package_id": "degem-rechev-wltp",
+      "content_type": "application/json;charset=utf-8",
+      "etag": null,
+      "final_url": "https://data.gov.il/api/3/action/datastore_search?resource_id=142afde2-6228-49f9-8a29-9b6c3a0cbe40&limit=100&offset=0&q=RAV4",
+      "fixture_byte_count": 250013,
+      "fixture_kind": "exact_response",
+      "fixture_path": "government/wltp_page_000001.json",
+      "fixture_sha256": "e1160dc47222ead6f54cf6b3f8f1b65d50a0a4526ac659aea61f8db1b91b2036",
+      "http_status": 200,
+      "last_modified": null,
+      "query": {
+        "limit": "100",
+        "offset": "0",
+        "q": "RAV4",
+        "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
+      },
+      "record_locator": {
+        "ckan_package_id": "degem-rechev-wltp",
+        "raw_capture_path": "raw/government/wltp/pages/page_000001.json",
+        "record_ids": [
+          36327
+        ],
+        "record_indexes": {
+          "36327": 74
+        },
+        "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
+      },
+      "redirect_chain": [],
+      "requested_url": "https://data.gov.il/api/3/action/datastore_search?resource_id=142afde2-6228-49f9-8a29-9b6c3a0cbe40&limit=100&offset=0&q=RAV4",
+      "resource_content_hash": "79ab5917935c722fa6de8460a594a778",
+      "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
+      "resource_metadata_modified": "2026-09-14T02:41:31.884381",
+      "resource_revision_id": null,
+      "response_byte_count": 250013,
+      "retrieved_at_utc": "2026-09-14T16:11:11.739Z",
+      "source_kind": "government_dataset_resource",
+      "source_version": "2026-09-14T02:41:31.842626",
+      "source_version_kind": "dataset_version",
+      "source_version_origin": "package_show -> resources[WLTP_RESOURCE_ID].last_modified; the resource carries no revision_id key at all, so none is recorded. Its published `hash` is recorded beside this as provenance but is NOT used as the version: it is an MD5 of the full 53 MB CSV export, which is neither a SHA-256 nor the JSON the datastore API served",
+      "upstream_committed": true,
+      "upstream_sha256": "e1160dc47222ead6f54cf6b3f8f1b65d50a0a4526ac659aea61f8db1b91b2036"
+    },
+    "government_wltp_page_2": {
+      "absent_source_metadata": [
+        "etag",
+        "last_modified",
+        "resource_revision_id"
+      ],
+      "canonical_url": "https://data.gov.il/api/3/action/datastore_search?resource_id=142afde2-6228-49f9-8a29-9b6c3a0cbe40&limit=100&offset=100&q=RAV4",
+      "capture_method": "public unauthenticated read-only HTTPS GET captured by MILO-R5-streamlit-evidence-capture/2.0 into milo-r5-source-capture-20260914T161110Z, then imported byte-for-byte after the archive's own checksums, byte counts, HTTP statuses and host allowlist were independently re-verified",
+      "ckan_package_id": "degem-rechev-wltp",
+      "content_type": "application/json;charset=utf-8",
+      "etag": null,
+      "final_url": "https://data.gov.il/api/3/action/datastore_search?resource_id=142afde2-6228-49f9-8a29-9b6c3a0cbe40&limit=100&offset=100&q=RAV4",
+      "fixture_byte_count": 249979,
+      "fixture_kind": "exact_response",
+      "fixture_path": "government/wltp_page_000002.json",
+      "fixture_sha256": "e5b0bb90178191478cec8b1468818d6f3962cbc6146ca10188410bd72eeec6fb",
+      "http_status": 200,
+      "last_modified": null,
+      "query": {
+        "limit": "100",
+        "offset": "100",
+        "q": "RAV4",
+        "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
+      },
+      "record_locator": {
+        "ckan_package_id": "degem-rechev-wltp",
+        "raw_capture_path": "raw/government/wltp/pages/page_000002.json",
+        "record_ids": [
+          37392,
+          37393
+        ],
+        "record_indexes": {
+          "37392": 89,
+          "37393": 90
+        },
+        "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
+      },
+      "redirect_chain": [],
+      "requested_url": "https://data.gov.il/api/3/action/datastore_search?resource_id=142afde2-6228-49f9-8a29-9b6c3a0cbe40&limit=100&offset=100&q=RAV4",
+      "resource_content_hash": "79ab5917935c722fa6de8460a594a778",
+      "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
+      "resource_metadata_modified": "2026-09-14T02:41:31.884381",
+      "resource_revision_id": null,
+      "response_byte_count": 249979,
+      "retrieved_at_utc": "2026-09-14T16:11:12.858Z",
+      "source_kind": "government_dataset_resource",
+      "source_version": "2026-09-14T02:41:31.842626",
+      "source_version_kind": "dataset_version",
+      "source_version_origin": "package_show -> resources[WLTP_RESOURCE_ID].last_modified; the resource carries no revision_id key at all, so none is recorded. Its published `hash` is recorded beside this as provenance but is NOT used as the version: it is an MD5 of the full 53 MB CSV export, which is neither a SHA-256 nor the JSON the datastore API served",
+      "upstream_committed": true,
+      "upstream_sha256": "e5b0bb90178191478cec8b1468818d6f3962cbc6146ca10188410bd72eeec6fb"
+    },
+    "web_toyota_rav4_phev": {
+      "absent_source_metadata": [
+        "etag",
+        "last_modified"
+      ],
+      "canonical_url": "https://www.toyota.co.il/cars/RAV4-PHEV",
+      "capture_method": "public unauthenticated read-only HTTPS GET captured by MILO-R5-streamlit-evidence-capture/2.0 into milo-r5-source-capture-20260914T161110Z; the response body was verified against the archive's recorded digest and byte count and then projected to its visible text by r5.visible_text.1. The raw HTML is NOT committed: it carries the site's own client-side Mapbox and analytics tokens, which GitHub push protection refuses, and the projection is the evidence surface every locator points into. The raw response digest is recorded as upstream_sha256 and remains the source version",
+      "capture_validation_result": "passed_official_archived_model_identity_requires_human_fact_check",
+      "content_type": "text/html;charset=utf-8",
+      "document_id": "toyota_il_rav4_phev",
+      "etag": null,
+      "final_url": "https://www.toyota.co.il/cars/RAV4-PHEV",
+      "fixture_byte_count": 17458,
+      "fixture_kind": "deterministic_projection",
+      "fixture_path": "web/toyota_il_rav4_phev.visible_text.txt",
+      "fixture_sha256": "85606cf6c41e32bb683076f6308b562f464ce5399257052111d56e44df98f320",
+      "http_status": 200,
+      "last_modified": null,
+      "record_locator": {
+        "document_id": "toyota_il_rav4_phev",
+        "projection_char_count": 10541,
+        "raw_capture_path": "raw/toyota/rav4-phev.html",
+        "text_projection_version": "r5.visible_text.1"
+      },
+      "redirect_chain": [],
+      "requested_url": "https://www.toyota.co.il/cars/RAV4-PHEV",
+      "response_byte_count": 356019,
+      "retrieved_at_utc": "2026-09-14T16:11:16.237Z",
+      "source_kind": "saved_web_document",
+      "source_version": "41ad54208a8ed274ddead7218ac305d3f0a4f928a5e966c688885c89b64fa61c",
+      "source_version_kind": "content_sha256",
+      "source_version_origin": "sha256 of the exact full captured response body; the response carried neither an ETag nor a Last-Modified header",
+      "text_projection_version": "r5.visible_text.1",
+      "upstream_committed": false,
+      "upstream_sha256": "41ad54208a8ed274ddead7218ac305d3f0a4f928a5e966c688885c89b64fa61c"
+    },
+    "yeda": {
+      "blob_sha": "383ba9bf12ddfafeac79fe42ea449c11204dc017",
+      "canonical_url": "https://github.com/giladscore494/reliabilityAIModelsR2/blob/f7bf132abf1b1ec8f9d81076560a5a618447a9e6/my-flask-app/app/data/model_technical_catalog_il.json",
+      "capture_method": "read from a read-only local clone pinned to commit_sha; the checkout commit, the git blob sha and the file sha256 are all verified before the catalog is parsed",
+      "commit_sha": "f7bf132abf1b1ec8f9d81076560a5a618447a9e6",
+      "fixture_byte_count": 15225,
+      "fixture_kind": "exact_record_subset",
+      "fixture_path": "yeda/rav4_model_record.json",
+      "fixture_sha256": "a2ce25de43f315517a5584eed94658bd54de721b5d9cee791f9ba952b09ad8c6",
+      "record_locator": {
+        "catalog_market": "IL",
+        "make": "Toyota",
+        "model": "RAV4",
+        "model_index": 860,
+        "record_market_presence": "IL-confirmed",
+        "record_profile_confidence": "medium",
+        "variant_index": 4,
+        "variant_support_level": "direct"
+      },
+      "repository": "giladscore494/reliabilityAIModelsR2",
+      "repository_path": "my-flask-app/app/data/model_technical_catalog_il.json",
+      "retrieved_at_utc": "2026-09-09T14:06:59Z",
+      "source_kind": "git_repository_file",
+      "upstream_catalog_hash": "76d2b5fbaa141577",
+      "upstream_committed": false,
+      "upstream_generated_at": "2026-06-25T00:20:49Z",
+      "upstream_sha256": "0a8d0e4240cbf11ad908012168d9dd60cafc2c9f75b92caecbd73f126c349ad6"
+    }
+  }
+}
