@@ -12,6 +12,12 @@ Base commit: `220b5e6871b8d14fc8c647179363c3de1689f0e8` (merge of
 R4 state). `origin/main` still pointed at exactly that commit when this branch
 was created.
 
+**Follow-up round (Government pagination).** The original round committed two of
+the three pages of the pinned `data.gov.il` query. A follow-up, based on
+`01a8cbd962c6a932ab6a3743d1a8c778dd75f341`, committed the third and added a
+completeness gate — see §3. The R5 outcome is unchanged; the sections below
+describe the current, corrected state, and nothing else about R5 was rewritten.
+
 ## 1. Acceptance gate
 
 | R5 requirement | State |
@@ -137,17 +143,62 @@ on any request; that absence is recorded as explicit nulls and declared in
 | `government/package_show.json` | 7,821 | `4e8f30b9047f5600740542bcfebc0697d97d7a0edb1e26fb1fa97e9295c1721a` | `id=degem-rechev-wltp` | — (dataset scope + version) |
 | `government/wltp_page_000001.json` | 250,013 | `e1160dc47222ead6f54cf6b3f8f1b65d50a0a4526ac659aea61f8db1b91b2036` | `q=RAV4&limit=100&offset=0` | `_id` **36327** at index 74 |
 | `government/wltp_page_000002.json` | 249,979 | `e5b0bb90178191478cec8b1468818d6f3962cbc6146ca10188410bd72eeec6fb` | `q=RAV4&limit=100&offset=100` | `_id` **37392** (index 89), **37393** (index 90) |
+| `government/wltp_page_000003.json` | 89,673 | `5f96a2ff3fbdd1f73602e5f89b5446c9e8e5c2ea261b742f88ba84ced308cedc` | `q=RAV4&limit=100&offset=200` | — (completes the query; no selected row) |
 
-Retrieved (UTC) `2026-09-14T16:11:10.360Z`, `…:11.739Z`, `…:12.858Z`
-respectively. Requested URL and final URL are identical, over HTTPS, on
-`data.gov.il`, with an empty redirect chain.
+Retrieved (UTC) `2026-09-14T16:11:10.360Z`, `…:11.739Z`, `…:12.858Z` and
+`…:13.272Z` respectively. Requested URL and final URL are identical, over
+HTTPS, on `data.gov.il`, with an empty redirect chain.
 
 These are **`exact_response` fixtures** (`upstream_committed: true`): the
 committed bytes are the response bytes, which is why `fixture_sha256` equals
 `upstream_sha256` here and deliberately does **not** for the Yeda record subset
-or the Web projection. The archive's third WLTP page, the whole `5e87a7a1-…`
-resource and the derived consolidations hold no record this proof reads and are
-**not** committed.
+or the Web projection. The whole `5e87a7a1-…` resource and the derived
+consolidations are a different resource and a derived artefact respectively;
+neither is a page of this query, and neither is committed.
+
+#### The query is committed COMPLETE — all 233 rows
+
+`q=RAV4&limit=100` over the pinned resource reports **233** matching rows, and
+the datastore served them as **100 + 100 + 33**. All three pages are committed
+and all 233 rows are scanned on every call.
+
+The first R5 round committed only the first two pages, on the reasoning that
+the third held no row the proof reads. That was wrong, and wrong in a way no
+single page can reveal: **every page honestly reports the full total of 233**,
+so 200 committed rows look exactly like a complete query. The proof was
+scanning a prefix of a query whose provenance named the whole of it.
+
+`_pages` now validates the three pages as one result set before a single row
+reaches the scan. Offsets must be exactly 0, 100 and 200; each page must have
+been requested at the pinned page size of 100 and must echo the same query
+token and resource id; every page must report a total of 233; the pages must
+hold exactly 100, 100 and 33 rows summing to that total; and no `_id` may
+appear on two pages. A page's position is stated **three** times — in the query
+the capture recorded sending, in the manifest's own page locator, and in the
+body's echo of what it answered — and all three must agree, so a page cannot be
+relocated by editing one of them. Each failure has its own static reason code
+(`R5_GOV_PAGE_MISSING`, `R5_GOV_PAGE_OFFSET_UNEXPECTED`,
+`R5_GOV_PAGE_QUERY_MISMATCH`, `R5_GOV_PAGE_COUNT_UNEXPECTED`,
+`R5_GOV_PAGE_TOTAL_INCONSISTENT`, `R5_GOV_PAGINATION_INCOMPLETE`,
+`R5_GOV_RECORD_ID_DUPLICATED`), and none of them carries an offset or a row.
+
+**The correction improves completeness without changing the R5 outcome.** 2021
+still resolves to exactly one row, `_id` 36327; 2026 is still ambiguous between
+exactly `_id` 37392 and 37393; every verified field, the coverage gap and the
+`partial_result` end state are unchanged. What changed is that those statements
+are now about the whole query rather than about its first 200 rows.
+
+The third page is not inert, either. It holds two 2026 plug-in four-wheel-drive
+Toyotas that the register calls `RAV4 PLUG IN` (`_id` 37367) and `RAV4 PHEV`
+(`_id` 37372). They stay out of the 2026 answer because the commercial model is
+matched **exactly** and never on a substring — so committing this page tests
+that promise against real rows instead of merely asserting it.
+
+Its manifest entry carries a **page-level** locator: the offset, page size,
+returned row count and reported total it occupies in the query, plus an
+explicit `selected_records: "none; …"`. It is deliberately absent from
+`GOVERNMENT_RECORD_IDS` and was given no invented `_id` or index to make the
+three entries look uniform.
 
 ### Web — official Toyota Israel archived-model page
 
@@ -215,8 +266,14 @@ happened to execute. **Tests and CI never fetch, refresh or import a source.**
   copied byte-for-byte. The Web response is verified against its recorded digest
   and byte count and then projected; the importer refuses a projection that is
   not idempotent, so a non-projection can never be committed as one. Every
-  manifest entry is written from the archive's own recorded values, so no
-  provenance field is transcribed by hand.
+  manifest entry is written from the archive's own recorded values by one
+  function, `government_source_entry`, so no provenance field is transcribed by
+  hand — and a datastore page is additionally held to the position the archive
+  recorded for it: the offset, page size, row count and total in the capture
+  entry must equal the page's own echo of them, or the import is refused.
+  `tests/test_swarm_v2_r5_vehicle_proof.py` rebuilds page three's committed
+  entry through that same function offline, so a manifest field edited into a
+  shape the importer would never emit fails a test rather than passing review.
 
 `backend/testing/r5_proof/manifest.py` is the gate at read time. Every proof
 read re-hashes its fixture and re-checks its recorded `fixture_byte_count`
@@ -597,3 +654,35 @@ python scripts/check_unsafe_defaults.py                           -> passed
 The single skip is pre-existing and environmental — `shellcheck` is unavailable
 in this container — and is not caused by R5. The PostgreSQL suites run with zero
 skips using the container's PostgreSQL 16 binaries.
+
+### Re-run after the Government pagination follow-up
+
+The follow-up round committed the third WLTP page and added the completeness
+gate described in §3. Re-run on that branch:
+
+```text
+pytest -q tests/test_swarm_v2_r5_vehicle_proof.py                 -> 137 passed
+pytest -q tests/test_swarm_v2_tool_contract.py                    ->  64 passed
+pytest -q tests/test_swarm_v2_r3_evidence_contract.py
+       tests/test_swarm_v2_r4_deterministic_verification.py
+       tests/test_swarm_v2_outcome_contract.py
+       tests/test_swarm_v2_stage1_e2e.py                          -> 360 passed
+pytest -q -rs tests --ignore=MILO-main-original/MILO-main/test_websearch.py
+                                                                  -> 2068 passed, 1 skipped
+MILO_REQUIRE_PG_TESTS=1 pytest -q -rs tests/test_migrations_postgres.py
+                                                                  -> 131 passed, zero skips
+MILO_REQUIRE_PG_TESTS=1 pytest -q -rs tests/test_worker_rpc_acl_postgres.py
+                                      tests/test_evidence_migration_static.py
+                                                                  ->  31 passed
+python scripts/check_migrations.py                                -> passed
+python scripts/secret_scan.py                                     -> passed
+python scripts/check_unsafe_defaults.py                           -> passed
+python scripts/release/validate_production_manifest.py … --mode plan
+                                                                  -> passed
+bash scripts/release/production-readiness.sh                      -> RESULT: OK
+```
+
+The R5 file gained 26 cases and no existing case changed its meaning: the 111
+that passed before still pass, which is the evidence that committing the third
+page changed what is proven and not what is answered. The one skip is the same
+pre-existing `shellcheck` skip.

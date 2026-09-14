@@ -7,6 +7,25 @@ byte-for-byte. The tool below reads ONLY those committed response pages: no
 network access, no credential, no CKAN query language, no SQL, no write
 operation, and no registration in the production ToolRegistry.
 
+The committed pages are one COMPLETE query
+------------------------------------------
+
+`q=RAV4&limit=100` over the pinned resource reports 233 matching rows, and the
+datastore served them as three pages of 100, 100 and 33. All three are
+committed, and `_pages` validates them as one result set before a single row
+reaches the scan: the offsets must be exactly 0, 100 and 200, every page must
+have been requested at the pinned page size and must echo the same query token
+and resource id, every page must report the same total of 233, the pages must
+hold exactly 100 + 100 + 33 rows, those rows must sum to the reported total,
+and no `_id` may appear on two pages.
+
+That gate exists because an incomplete capture is invisible from inside any one
+page: each page honestly reports the full total, so two committed pages of a
+three-page query look exactly like a complete query whose rows happen to number
+200. A proof that scanned the first 200 of 233 rows would still answer -- and
+would be answering from a prefix while its provenance named the whole query.
+Here that is a refusal instead.
+
 Selection is conservative, and deliberately so
 ----------------------------------------------
 
@@ -64,11 +83,54 @@ from .manifest import ProofManifestError, load_fixture
 CKAN_PACKAGE_ID = "degem-rechev-wltp"
 WLTP_RESOURCE_ID = "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
 
-#: The committed response pages, in a fixed server-owned order. There is no
-#: operation that reads "the dataset": a call reads these pages and nothing
-#: else, so the bound on a call is a constant of this module rather than a
-#: property of whatever the caller asked for.
-WLTP_PAGE_SOURCE_KEYS: tuple[str, ...] = ("government_wltp_page_1", "government_wltp_page_2")
+#: The committed pages of the pinned query, in the server's own pagination
+#: order, each with the offset it was requested at and the number of rows it
+#: returned. There is no operation that reads "the dataset": a call reads these
+#: pages and nothing else, so the bound on a call is a constant of this module
+#: rather than a property of whatever the caller asked for.
+#:
+#: These three pages are ONE query. `q=RAV4&limit=100` over the pinned resource
+#: reports 233 matching rows and the datastore served them as 100 + 100 + 33.
+#: Committing only the first two would leave the proof scanning a PREFIX of a
+#: query whose provenance names the whole of it -- a gap that is invisible in
+#: any single page, because every page reports the same honest total. So the
+#: plan is checked as a whole on every call: a missing page, a gap or overlap
+#: in the offsets, a page that answered a different query or resource, a total
+#: that disagrees between pages, a short or long page, a sum that is not the
+#: reported total, and a row that appears on two pages are each a refusal
+#: rather than a quietly smaller scan.
+WLTP_PAGE_PLAN: tuple[tuple[str, int, int], ...] = (
+    ("government_wltp_page_1", 0, 100),
+    ("government_wltp_page_2", 100, 100),
+    ("government_wltp_page_3", 200, 33),
+)
+
+#: The page source keys alone, in the same pagination order.
+WLTP_PAGE_SOURCE_KEYS: tuple[str, ...] = tuple(key for key, _, _ in WLTP_PAGE_PLAN)
+
+#: The page size every page of the pinned query was requested at.
+WLTP_PAGE_LIMIT = 100
+
+#: The query token the pinned pages answer. A page captured for a different
+#: query is not part of THIS query's result set, whatever else it holds.
+WLTP_QUERY_TOKEN = "RAV4"
+
+#: The row count the datastore itself reports for the pinned query, on every
+#: page. The committed pages must sum to exactly this.
+WLTP_REPORTED_TOTAL = 233
+
+#: The closed vocabulary of pagination refusals. Static and code-owned: a
+#: refusal names which property of the committed result set failed, and never
+#: carries an offset, a row or a page a caller could read back out of it.
+R5_GOV_PAGINATION_REASONS = frozenset({
+    "R5_GOV_PAGE_MISSING",
+    "R5_GOV_PAGE_OFFSET_UNEXPECTED",
+    "R5_GOV_PAGE_QUERY_MISMATCH",
+    "R5_GOV_PAGE_COUNT_UNEXPECTED",
+    "R5_GOV_PAGE_TOTAL_INCONSISTENT",
+    "R5_GOV_PAGINATION_INCOMPLETE",
+    "R5_GOV_RECORD_ID_DUPLICATED",
+})
 
 #: The dataset metadata page, read only for the publisher and the scope the
 #: dataset states about ITSELF.
@@ -284,6 +346,23 @@ def _text(value: Any) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _as_int(value: Any) -> int | None:
+    """Read an integer the source states as a number or as a digit string.
+
+    The manifest records a captured query exactly as it was sent -- as URL
+    parameter strings -- while the response echoes the same values as JSON
+    numbers. Both are read here and nothing else is, so a float, a boolean or
+    any other text can never compare equal to a page's position in the plan.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
 @dataclass(frozen=True)
 class GovernmentVehicleRegistryTool:
     """The pinned Israeli vehicle-model registry, as ONE bounded lookup.
@@ -291,7 +370,8 @@ class GovernmentVehicleRegistryTool:
     `get_model_record` answers with exactly one row or refuses. There is no
     list operation, no free-text search and no way to ask for the dataset, so
     the 101,476-row upstream resource can never cross this boundary even in
-    principle -- only the two committed response pages exist here at all.
+    principle -- only the 233 rows of the one pinned query exist here at all,
+    committed as the three response pages the datastore served them in.
     """
 
     name: str = "gov_il.vehicle_registry"
@@ -371,11 +451,32 @@ class GovernmentVehicleRegistryTool:
                 "dataset_version": str(resource["last_modified"])}
 
     def _pages(self):
-        """Every committed response page, checksum-gated before parsing."""
-        for source_key in WLTP_PAGE_SOURCE_KEYS:
+        """The complete pinned query, checksum-gated and validated as ONE set.
+
+        Each page is re-hashed against the manifest, then held to the position
+        it occupies in `WLTP_PAGE_PLAN`: the offset it was requested at, the
+        page size, the query token and resource it answered, the total the
+        datastore reported, and the number of rows it actually returned. The
+        pages are then checked TOGETHER -- they must sum to that reported total
+        and must share no `_id`.
+
+        Eager on purpose. A generator would let the caller select a record from
+        page one while a later page was still unvalidated, so the whole result
+        set is proven complete BEFORE the first row is offered to the scan.
+        """
+        pages: list[tuple[Mapping[str, Any], list[Any]]] = []
+        seen: set[int] = set()
+        for source_key, offset, expected_count in WLTP_PAGE_PLAN:
             try:
                 entry, document = load_fixture(source_key)
             except ProofManifestError as failure:
+                # A page the manifest does not describe at all is the one
+                # failure that means the committed query is INCOMPLETE rather
+                # than corrupt, and it is reported as its own refusal.
+                if failure.reason_code == "R5_MANIFEST_SOURCE_UNKNOWN":
+                    raise ToolError("R5_GOV_PAGE_MISSING",
+                                    "a page of the pinned query is not committed",
+                                    tool=self.name) from None
                 raise ToolError(failure.reason_code, failure.safe_message,
                                 tool=self.name) from None
             result = document.get("result")
@@ -387,7 +488,91 @@ class GovernmentVehicleRegistryTool:
                 raise ToolError("R5_GOV_FIXTURE_INVALID",
                                 "a committed response page belongs to another resource",
                                 tool=self.name)
-            yield entry, records
+            self._check_page(entry, result, records, offset, expected_count, seen)
+            pages.append((entry, records))
+
+        scanned = sum(len(records) for _, records in pages)
+        if scanned != WLTP_REPORTED_TOTAL or len(seen) != WLTP_REPORTED_TOTAL:
+            # Every page agreed on the total and every page was the size the
+            # plan expects, yet the committed pages do not add up to it: the
+            # result set is not the query it claims to be.
+            raise ToolError("R5_GOV_PAGINATION_INCOMPLETE",
+                            "the committed pages are not the whole pinned query",
+                            tool=self.name)
+        return tuple(pages)
+
+    def _check_page(self, entry: Mapping[str, Any], result: Mapping[str, Any],
+                    records: list[Any], offset: int, expected_count: int,
+                    seen: set[int]) -> None:
+        """Hold ONE page to its place in the query, or fail closed.
+
+        The manifest entry and the response body are checked against the plan
+        AND against each other, so neither an edited manifest nor an edited
+        body can move a page, resize it, or re-point it at another query on its
+        own. The row identities are accumulated across pages as they are read,
+        which is what makes a row that appears twice a refusal rather than two
+        candidates that look like an ambiguity.
+        """
+        declared = entry.get("query")
+        declared = declared if isinstance(declared, Mapping) else {}
+        locator = entry.get("record_locator")
+        locator = locator if isinstance(locator, Mapping) else {}
+        page = locator.get("page")
+        page = page if isinstance(page, Mapping) else {}
+        # Three independent statements about where this page sits: the query
+        # the capture RECORDED sending, the position the manifest's locator
+        # records, and what the response itself SAYS it answered. All three
+        # must be this page's place in the plan, so moving a page takes an
+        # edit to the body AND to two places in its provenance.
+        if _as_int(page.get("requested_offset")) != offset or \
+                _as_int(page.get("requested_limit")) != WLTP_PAGE_LIMIT or \
+                _as_int(page.get("returned_record_count")) != expected_count or \
+                _as_int(page.get("reported_total")) != WLTP_REPORTED_TOTAL:
+            raise ToolError("R5_GOV_PAGE_OFFSET_UNEXPECTED",
+                            "a committed page does not record the position the query needs",
+                            tool=self.name)
+        if _text(page.get("query_token")) != WLTP_QUERY_TOKEN or \
+                str(page.get("resource_id")) != WLTP_RESOURCE_ID:
+            raise ToolError("R5_GOV_PAGE_QUERY_MISMATCH",
+                            "a committed page records a different query or resource",
+                            tool=self.name)
+        if _as_int(declared.get("offset")) != offset or _as_int(result.get("offset")) != offset:
+            raise ToolError("R5_GOV_PAGE_OFFSET_UNEXPECTED",
+                            "a committed page is not at the offset the pinned query needs",
+                            tool=self.name)
+        if _as_int(declared.get("limit")) != WLTP_PAGE_LIMIT or \
+                _as_int(result.get("limit")) != WLTP_PAGE_LIMIT:
+            raise ToolError("R5_GOV_PAGE_OFFSET_UNEXPECTED",
+                            "a committed page was not requested at the pinned page size",
+                            tool=self.name)
+        if _text(declared.get("q")) != WLTP_QUERY_TOKEN or \
+                _text(result.get("q")) != WLTP_QUERY_TOKEN or \
+                str(declared.get("resource_id")) != WLTP_RESOURCE_ID or \
+                str(result.get("resource_id")) != WLTP_RESOURCE_ID:
+            raise ToolError("R5_GOV_PAGE_QUERY_MISMATCH",
+                            "a committed page answers a different query or resource",
+                            tool=self.name)
+        if _as_int(result.get("total")) != WLTP_REPORTED_TOTAL:
+            raise ToolError("R5_GOV_PAGE_TOTAL_INCONSISTENT",
+                            "a committed page reports a different total for the pinned query",
+                            tool=self.name)
+        if len(records) != expected_count:
+            raise ToolError("R5_GOV_PAGE_COUNT_UNEXPECTED",
+                            "a committed page does not hold the rows the pinned query needs",
+                            tool=self.name)
+        for record in records:
+            identity = record.get("_id") if isinstance(record, Mapping) else None
+            if not isinstance(identity, int) or isinstance(identity, bool):
+                raise ToolError("R5_GOV_FIXTURE_INVALID",
+                                "a committed row states no registry identity", tool=self.name)
+            if identity in seen:
+                # One row reachable twice would be two candidates for one
+                # vehicle -- an ambiguity manufactured by the pagination, not
+                # stated by the register.
+                raise ToolError("R5_GOV_RECORD_ID_DUPLICATED",
+                                "one registry row appears on more than one committed page",
+                                tool=self.name)
+            seen.add(identity)
 
     def _candidates(self, payload: Mapping[str, Any]):
         """Every committed row matching the STATED identity, and only those."""
@@ -505,5 +690,7 @@ __all__ = ["BODY_STYLE_BY_MERKAV", "CKAN_PACKAGE_ID", "CONSISTENT_FUEL_PROPULSIO
            "UPSTREAM_FIELDS",
            "DRIVETRAIN_BY_CODE", "FUEL_BY_CODE", "GOVERNMENT_DATASET_MARKET",
            "GOVERNMENT_PUBLISHER", "MAKE_BY_TOZAR", "MAX_SCANNED_RECORDS",
-           "PACKAGE_SOURCE_KEY", "PROPULSION_BY_CODE", "UNMAPPED_FIELDS",
-           "WLTP_PAGE_SOURCE_KEYS", "WLTP_RESOURCE_ID", "GovernmentVehicleRegistryTool"]
+           "PACKAGE_SOURCE_KEY", "PROPULSION_BY_CODE", "R5_GOV_PAGINATION_REASONS",
+           "UNMAPPED_FIELDS", "WLTP_PAGE_LIMIT", "WLTP_PAGE_PLAN",
+           "WLTP_PAGE_SOURCE_KEYS", "WLTP_QUERY_TOKEN", "WLTP_REPORTED_TOTAL",
+           "WLTP_RESOURCE_ID", "GovernmentVehicleRegistryTool"]

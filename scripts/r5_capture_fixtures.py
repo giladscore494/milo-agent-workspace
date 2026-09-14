@@ -241,20 +241,37 @@ WLTP_RESOURCE_ID = "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
 #: any other host invalidates the whole archive rather than one entry.
 APPROVED_CAPTURE_HOSTS = frozenset({"data.gov.il", "www.toyota.co.il"})
 
+#: The archive's own source type for one page of a datastore query. A page
+#: carries a position in its query; the package-metadata and schema entries
+#: carry none, and must never be given one.
+GOVERNMENT_PAGE_SOURCE_TYPE = "government_datastore_page"
+
 #: The one overall status an importable archive may carry. Every other status
 #: the capture app can emit means the capture did not establish what R5 needs.
 IMPORTABLE_CAPTURE_STATUS = "ready_for_r5_bundle_review"
 
 #: What is imported, and nothing else: capture entry id -> (fixture path,
-#: manifest source key). The archive also holds a third WLTP page, the whole
-#: `additional` resource and the derived consolidations; none of them carries a
-#: record this proof reads, so none of them is committed.
+#: manifest source key).
+#:
+#: All three pages of the pinned `q=RAV4` query are committed. The query
+#: reports 233 rows and the datastore served them as 100 + 100 + 33, so a
+#: two-page import would have committed a PREFIX of the query while its
+#: provenance named the whole of it -- and the shortfall would be invisible,
+#: because every page reports the same honest total. The third page carries no
+#: row this proof selects, which is a fact the proof establishes by scanning
+#: it, not a reason to leave it out.
+#:
+#: The archive also holds the whole `additional` resource and the derived
+#: consolidations. Those are a DIFFERENT resource and a derived artefact
+#: respectively, not missing pages of this query, and neither is committed.
 IMPORTED_GOVERNMENT: dict[str, tuple[str, str]] = {
     "government_package_show": ("government/package_show.json", "government_package"),
     "government_wltp_q0_page_000001": ("government/wltp_page_000001.json",
                                        "government_wltp_page_1"),
     "government_wltp_q0_page_000002": ("government/wltp_page_000002.json",
                                        "government_wltp_page_2"),
+    "government_wltp_q0_page_000003": ("government/wltp_page_000003.json",
+                                       "government_wltp_page_3"),
 }
 #: capture entry id -> (fixture path, manifest source key, document id).
 #:
@@ -281,10 +298,51 @@ IMPORTED_WEB: dict[str, tuple[str, str, str]] = {
 #: The Government records this proof actually reads, per committed page. Stated
 #: here so the manifest records WHICH rows the page was imported for, and so a
 #: page whose expected rows are absent is refused instead of silently committed.
+#:
+#: `government_wltp_page_3` is deliberately absent from this table and gets no
+#: entry with an invented id: no row on that page matches the identity this
+#: proof selects, and a page is imported because it completes the query, not
+#: because it holds a selected row. Its manifest locator is page-level and says
+#: exactly that.
 GOVERNMENT_RECORD_IDS: dict[str, tuple[int, ...]] = {
     "government_wltp_page_1": (36327,),
     "government_wltp_page_2": (37392, 37393),
 }
+
+
+def _page_locator(entry: dict[str, Any], path: Path) -> dict[str, Any]:
+    """One datastore page's position in its query, recorded and re-checked.
+
+    The archive says which offset was requested, at which page size, how many
+    rows came back and what total the datastore reported. The committed body
+    echoes all four, so both are compared here: a page whose recorded position
+    and whose own response disagree is refused rather than imported with a
+    locator that would then be checked against nothing.
+    """
+    body = json.loads(path.read_text(encoding="utf-8"))
+    result = body.get("result")
+    if not isinstance(result, dict):
+        raise CaptureRefused(f"{entry['source_id']} is not a datastore response")
+    records = result.get("records")
+    if not isinstance(records, list):
+        raise CaptureRefused(f"{entry['source_id']} states no records")
+    stated = {"requested_offset": result.get("offset"), "requested_limit": result.get("limit"),
+              "returned_record_count": len(records), "reported_total": result.get("total")}
+    recorded = {field: entry.get(field) for field in stated}
+    if any(not isinstance(value, int) or isinstance(value, bool)
+           for value in recorded.values()):
+        raise CaptureRefused(f"{entry['source_id']} records no complete page position")
+    if stated != recorded:
+        raise CaptureRefused(f"{entry['source_id']} does not answer at its recorded position")
+    if _text_param(result.get("q")) != _text_param(entry.get("query_token")) or \
+            str(result.get("resource_id")) != str(entry.get("resource_id")):
+        raise CaptureRefused(f"{entry['source_id']} answers a different query or resource")
+    return {**recorded, "query_token": entry["query_token"],
+            "resource_id": entry["resource_id"]}
+
+
+def _text_param(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _capture_manifest(root: Path) -> dict[str, Any]:
@@ -381,6 +439,92 @@ def _write_projection(source: Path, relative: str) -> tuple[Path, str, int]:
     return target, hashlib.sha256(payload).hexdigest(), len(payload)
 
 
+def government_source_entry(capture: dict[str, Any], entry: dict[str, Any], key: str,
+                            relative: str, path: Path, digest: str, size: int,
+                            dataset_version: str, wltp: dict[str, Any]) -> dict[str, Any]:
+    """Build ONE government source's manifest entry from its captured bytes.
+
+    Extracted from `capture_import` so there is exactly one rule for what a
+    committed government fixture's provenance says, and so that rule can be
+    exercised offline against the committed bytes -- a manifest entry edited by
+    hand into a shape this function would never produce is then a test failure
+    rather than a plausible-looking line in a diff.
+
+    Pure: it reads the capture entry and the committed file and returns a dict.
+    It writes nothing and fetches nothing.
+    """
+    headers = entry.get("headers") or {}
+    record_ids = GOVERNMENT_RECORD_IDS.get(key)
+    locator: dict[str, Any] = {"raw_capture_path": entry["raw_path"],
+                               "ckan_package_id": CKAN_PACKAGE_ID}
+    # The package-metadata response is about the DATASET, not about one
+    # resource, so it carries no resource id to record and none is
+    # invented for it.
+    if entry.get("resource_id"):
+        locator["resource_id"] = entry["resource_id"]
+    if entry.get("source_type") == GOVERNMENT_PAGE_SOURCE_TYPE:
+        # A datastore page's locator is its POSITION IN THE QUERY, which it
+        # has whether or not it holds a row this proof selects. Recorded
+        # from the archive and then checked against the page's own echo of
+        # it, so a page the capture described wrongly is refused here
+        # rather than committed and trusted later.
+        locator["page"] = _page_locator(entry, path)
+    if record_ids is not None:
+        body = json.loads(path.read_text(encoding="utf-8"))
+        index_of = {record["_id"]: position for position, record
+                    in enumerate(body["result"]["records"])}
+        missing = [item for item in record_ids if item not in index_of]
+        if missing:
+            raise CaptureRefused(f"{entry['source_id']} does not hold records {missing}")
+        locator["record_ids"] = list(record_ids)
+        locator["record_indexes"] = {str(item): index_of[item] for item in record_ids}
+    elif "page" in locator:
+        # Said out loud, so an empty record list is a reviewed fact about
+        # this page rather than a field a later edit could quietly fill.
+        locator["selected_records"] = (
+            "none; this page completes the pinned query and holds no row "
+            "this proof selects")
+    return {
+        "source_kind": "government_dataset_resource",
+        "canonical_url": entry["requested_url"],
+        "requested_url": entry["requested_url"], "final_url": entry["final_url"],
+        "redirect_chain": list(entry.get("redirect_chain") or []),
+        "http_status": entry["http_status"],
+        "retrieved_at_utc": entry["finished_utc"],
+        "capture_method": (
+            "public unauthenticated read-only HTTPS GET captured by "
+            f"{capture['tool']} into {capture['capture_id']}, then imported "
+            "byte-for-byte after the archive's own checksums, byte counts, HTTP "
+            "statuses and host allowlist were independently re-verified"),
+        "fixture_kind": "exact_response",
+        "fixture_path": relative,
+        "fixture_sha256": digest,
+        "fixture_byte_count": size,
+        "upstream_sha256": entry["sha256"],
+        "response_byte_count": size,
+        "upstream_committed": True,
+        "content_type": entry.get("content_type"),
+        "resource_id": entry.get("resource_id") or WLTP_RESOURCE_ID,
+        "ckan_package_id": CKAN_PACKAGE_ID,
+        "query": dict(entry.get("query_params") or {}),
+        "source_version_kind": "dataset_version",
+        "source_version": dataset_version,
+        "source_version_origin": (
+            "package_show -> resources[WLTP_RESOURCE_ID].last_modified; the "
+            "resource carries no revision_id key at all, so none is recorded. "
+            "Its published `hash` is recorded beside this as provenance but is "
+            "NOT used as the version: it is an MD5 of the full 53 MB CSV export, "
+            "which is neither a SHA-256 nor the JSON the datastore API served"),
+        "resource_content_hash": wltp.get("hash"),
+        "resource_metadata_modified": wltp.get("metadata_modified"),
+        "record_locator": locator,
+        **_absent_metadata(entry, names=("etag", "last_modified", "resource_revision_id"),
+                           values={"etag": headers.get("ETag"),
+                                   "last_modified": headers.get("Last-Modified"),
+                                   "resource_revision_id": wltp.get("revision_id")}),
+    }
+
+
 def capture_import(root: Path) -> None:
     """Import the verified Government and Web sources from a capture archive."""
     capture = _capture_manifest(root)
@@ -415,63 +559,8 @@ def capture_import(root: Path) -> None:
         path, digest, size = _copy_exact(root / entry["raw_path"], relative)
         if digest != entry["sha256"] or size != entry["byte_count"]:
             raise CaptureRefused(f"{source_id} did not import byte-for-byte")
-        headers = entry.get("headers") or {}
-        record_ids = GOVERNMENT_RECORD_IDS.get(key)
-        locator: dict[str, Any] = {"raw_capture_path": entry["raw_path"],
-                                   "ckan_package_id": CKAN_PACKAGE_ID}
-        # The package-metadata response is about the DATASET, not about one
-        # resource, so it carries no resource id to record and none is
-        # invented for it.
-        if entry.get("resource_id"):
-            locator["resource_id"] = entry["resource_id"]
-        if record_ids is not None:
-            body = json.loads(path.read_text(encoding="utf-8"))
-            index_of = {record["_id"]: position for position, record
-                        in enumerate(body["result"]["records"])}
-            missing = [item for item in record_ids if item not in index_of]
-            if missing:
-                raise CaptureRefused(f"{source_id} does not hold records {missing}")
-            locator["record_ids"] = list(record_ids)
-            locator["record_indexes"] = {str(item): index_of[item] for item in record_ids}
-        manifest["sources"][key] = {
-            "source_kind": "government_dataset_resource",
-            "canonical_url": entry["requested_url"],
-            "requested_url": entry["requested_url"], "final_url": entry["final_url"],
-            "redirect_chain": list(entry.get("redirect_chain") or []),
-            "http_status": entry["http_status"],
-            "retrieved_at_utc": entry["finished_utc"],
-            "capture_method": (
-                "public unauthenticated read-only HTTPS GET captured by "
-                f"{capture['tool']} into {capture['capture_id']}, then imported "
-                "byte-for-byte after the archive's own checksums, byte counts, HTTP "
-                "statuses and host allowlist were independently re-verified"),
-            "fixture_kind": "exact_response",
-            "fixture_path": relative,
-            "fixture_sha256": digest,
-            "fixture_byte_count": size,
-            "upstream_sha256": entry["sha256"],
-            "response_byte_count": size,
-            "upstream_committed": True,
-            "content_type": entry.get("content_type"),
-            "resource_id": entry.get("resource_id") or WLTP_RESOURCE_ID,
-            "ckan_package_id": CKAN_PACKAGE_ID,
-            "query": dict(entry.get("query_params") or {}),
-            "source_version_kind": "dataset_version",
-            "source_version": dataset_version,
-            "source_version_origin": (
-                "package_show -> resources[WLTP_RESOURCE_ID].last_modified; the "
-                "resource carries no revision_id key at all, so none is recorded. "
-                "Its published `hash` is recorded beside this as provenance but is "
-                "NOT used as the version: it is an MD5 of the full 53 MB CSV export, "
-                "which is neither a SHA-256 nor the JSON the datastore API served"),
-            "resource_content_hash": wltp.get("hash"),
-            "resource_metadata_modified": wltp.get("metadata_modified"),
-            "record_locator": locator,
-            **_absent_metadata(entry, names=("etag", "last_modified", "resource_revision_id"),
-                               values={"etag": headers.get("ETag"),
-                                       "last_modified": headers.get("Last-Modified"),
-                                       "resource_revision_id": wltp.get("revision_id")}),
-        }
+        manifest["sources"][key] = government_source_entry(
+            capture, entry, key, relative, path, digest, size, dataset_version, wltp)
         print(f"imported {path} ({size} bytes, sha256 {digest})")
 
     for source_id, (relative, key, document_id) in sorted(IMPORTED_WEB.items()):
