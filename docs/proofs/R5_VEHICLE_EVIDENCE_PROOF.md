@@ -622,17 +622,26 @@ an architecture, not a live integration:
 
   **Updated by Catalog PR2.** A CKAN client and a snapshot/raw-record/candidate
   ingestion path now exist (`backend/catalog/government/`), and this proof's
-  committed pages are the fixtures its tests read. That does not change what R5
-  itself establishes, and it is still not a live integration: no production
-  entrypoint constructs a transport, no tool is registered, and no sync has been
-  activated. See `docs/catalog-pr2-government-ingestion.md`.
+  committed pages are the fixtures its tests read.
+
+  **Updated by Catalog PR3.** A bounded read-only Tool
+  (`catalog.government_vehicle`) and a crosswalk now exist too, and the Tool IS
+  registered in the production worker path. That still does not make this a
+  LIVE integration: the Tool reads durable catalog rows and holds no transport,
+  no production entrypoint constructs one, and the `sync_if_changed` refresh
+  operation has no schedule and no production caller. Neither PR changes what
+  R5 itself establishes. See `docs/catalog-pr3-swarm-and-promotion.md`.
 - **Web is not production-connected.** No live research tool, no browser, no
   fetcher. One captured page's visible-text projection is committed and read
   from disk; the raw response is not committed at all.
-- The production `ToolRegistry` is **empty**. `PRODUCTION_EVIDENCE_MAPPERS` is
-  **empty**. None of the three proof tools and none of the three proof mappers
-  is registered in either, and `backend/worker/main.py` injects no deterministic
-  strategy, so production Swarm V2 behaviour is unchanged.
+- **Updated by Catalog PR3: the production registries are no longer empty.**
+  They hold exactly one tool (`catalog.government_vehicle`, read-only) and
+  exactly one evidence mapper
+  (`catalog.government_vehicle.resolve_variant`). What R5 asserted here still
+  holds in the form that matters: **none of the three proof tools and none of
+  the three proof mappers is registered in either**, and
+  `backend/worker/main.py` injects no deterministic task-output strategy, so
+  the production worker still reaches its model exactly as it did.
 - A test asserts that no module under `backend/testing/r5_proof/` so much as
   imports `requests`, `httpx`, `socket`, `urllib.request`, a Supabase client or
   a provider SDK, so the proof is offline by construction rather than by

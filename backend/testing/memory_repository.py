@@ -473,6 +473,33 @@ class MemoryRepository:
             self.evidence_kinds[row["id"]] = kind
         return dict(row)
 
+    def _replay_or_append(self, run_id: UUID, payload: dict[str, Any], kind: str, *,
+                          conflicts: tuple[tuple[str, str], ...]) -> dict[str, Any]:
+        """Return the stored row for an exact replay, or append a new one.
+
+        Mirrors the `on conflict (run_id, evidence_key) where evidence_key is
+        not null do nothing` shape both R3 upserts use: the same key returns
+        the same row, and a replay that disagrees on a field naming WHERE the
+        evidence came from fails closed rather than being merged.
+
+        A payload with NO `evidence_key` has no replay identity and is appended
+        -- which is the partial index's own behaviour, and keeps every
+        pre-R3 caller that passes none working exactly as it did.
+        """
+        key = payload.get("evidence_key")
+        if not key:
+            return self._tool_row(run_id, payload, kind=kind)
+        existing = next((row for row in self.tool_rows
+                         if str(row.get("run_id")) == str(run_id)
+                         and row.get("evidence_key") == key
+                         and self.evidence_kinds.get(str(row.get("id"))) == kind), None)
+        if existing is None:
+            return self._tool_row(run_id, payload, kind=kind)
+        for field, message in conflicts:
+            if str(existing.get(field) or "") != str(payload.get(field) or ""):
+                raise AppError(f"{kind.upper()}_IDEMPOTENCY_CONFLICT", message, 409)
+        return dict(existing)
+
     def _evidence_lease(self, run_id: UUID, worker_id: str | None, attempt: int | None,
                         lease_token: str | None) -> None:
         """Hold a durable evidence write to the same lease its RPC requires.
@@ -525,7 +552,18 @@ class MemoryRepository:
         if lease:
             self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
                                  lease.get("lease_token"))
-        return self._tool_row(run_id, source, kind="source")
+        # `upsert_source_guarded` is idempotent on `(run_id, evidence_key)`, so
+        # a RESUMED run replays onto the stored row instead of appending a
+        # second source for the same acquisition. Mirrored here because an
+        # offline resume proof that duplicated sources would be proving the
+        # opposite of what PostgreSQL does.
+        #
+        # The partial index is `where evidence_key is not null`: a row with no
+        # key has no replay identity and is appended, exactly as before.
+        return self._replay_or_append(
+            run_id, source, "source",
+            conflicts=(("source_version_kind", "source version identity conflict"),
+                       ("source_version_id", "source version identity conflict")))
 
     def create_claim(self, run_id: UUID, claim: dict[str, Any], **lease: Any) -> dict[str, Any]:
         # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the
@@ -536,7 +574,14 @@ class MemoryRepository:
         if lease:
             self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
                                  lease.get("lease_token"))
-        return self._tool_row(run_id, claim, kind="claim")
+        # `create_claim_with_source_guarded` is idempotent on the same identity,
+        # and refuses a replay that would move a stored fact to a different
+        # source, a different location or a different scope.
+        return self._replay_or_append(
+            run_id, claim, "claim",
+            conflicts=(("source_id", "idempotency key belongs to a different source"),
+                       ("evidence_locator", "claim evidence locator mismatch"),
+                       ("canonical_scope_hash", "claim canonical scope identity mismatch")))
 
     def create_conflict(self, run_id: UUID, conflict: dict[str, Any], **lease: Any) -> dict[str, Any]:
         # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the

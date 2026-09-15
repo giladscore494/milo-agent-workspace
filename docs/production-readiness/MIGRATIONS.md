@@ -41,6 +41,8 @@ production.
 | ts | `20260914200000_catalog_evidence_foundation.sql` | Catalog PR1: the durable catalog namespace — `catalog_source_snapshots`, `catalog_raw_records`, `catalog_candidate_variants`, `catalog_candidate_evidence_links` plus the **empty** canonical `catalog_models` / `catalog_model_variants`, their lease-guarded RPCs, append-only triggers, RLS and least-privilege grants |
 | ts | `20260915120000_catalog_integrity_corrections.sql` | Catalog PR1 corrective round: derived evidence-link provenance (verified verdicts only, locator/version read from the cited claim and source), required `claim_id`, terminal `failed` snapshots, creating-run snapshot ownership, derived payload digests, domain-separated identity keys with natural uniqueness, composite cross-table foreign keys and their indexes, and fully immutable canonical rows |
 | ts | `20260915180000_catalog_raw_record_source_locator.sql` | Catalog PR2: one generic `source_locator` jsonb column on `catalog_raw_records` (closed key vocabulary `capture_index` / `page_index` / `page_number` / `page_offset`, bounded, position-unique per snapshot) so a stored record states WHERE in a paginated retrieval it came from; the raw-record RPC carries and replay-checks it |
+| ts | `20260916090000_catalog_bounded_candidate_queries.sql` | Catalog PR3: six bounded, fixed-order, exactly-totalled READ functions over `catalog_candidate_variants` / `catalog_raw_records`, each gated on an active, complete, USABLE snapshot, plus three indexes created with the same `collate "C"` the functions order by. Generic over the catalog relations — nothing in the file names `data.gov.il`, CKAN, a Government field or a vehicle |
+| ts | `20260916120000_catalog_field_level_promotion.sql` | Catalog PR3: `catalog_canonical_field_provenance` (append-only, ONE row per promoted canonical FACT), the BEFORE-INSERT support-chain trigger, the two DEFERRED coverage triggers, derived canonical keys and natural uniqueness, the `catalog_canonical_field_current` / `catalog_canonical_variant_current` read model, and `promote_catalog_variant_guarded`. Grants `service_role` `INSERT` on the canonical pair and on the provenance relation, and nothing else |
 
 All migrations are additive, idempotent and data-preserving. There are no
 destructive down-migrations, by policy (`scripts/check_migrations.py`
@@ -82,6 +84,45 @@ a stored fact.
 Rollback: the relation is still empty, so reverting means not using the column.
 A forward migration could drop it; nothing reads it outside
 `backend/catalog/government/`.
+
+### Catalog PR3 — migration and rollback impact
+
+`20260916090000_catalog_bounded_candidate_queries.sql` is purely additive and
+READ-ONLY in effect: six functions, three `create index if not exists`, and an
+`EXECUTE` grant to `service_role` after revoking `PUBLIC`/`anon`/`authenticated`.
+It creates no table, alters no relation, changes no existing function and
+backfills nothing. Rollback: the functions are unused if nothing calls them; a
+forward migration could drop them.
+
+`20260916120000_catalog_field_level_promotion.sql` creates ONE table
+(`catalog_canonical_field_provenance`), two views, four functions, four
+triggers and eleven indexes, and tightens the two canonical relations that are
+still EMPTY: their `canonical_key` checks become derived-identity patterns
+(`^cm1\.[0-9a-f]{32}$` / `^cv1\.[0-9a-f]{32}$`) and `catalog_models` gains a
+natural-uniqueness constraint on `(manufacturer, commercial_model)`. Every
+tightening is a no-op against existing data by construction, because both
+relations hold zero rows.
+
+The one privilege change is deliberate and narrow: `service_role` gains
+`INSERT` on `catalog_models`, `catalog_model_variants` and the new provenance
+relation. `UPDATE` and `DELETE` stay revoked on all three, and the two
+DEFERRED constraint triggers make a canonical row without complete verified
+per-field provenance impossible to COMMIT for any writer — which is what makes
+the grant safe. Both views are created with `security_invoker = true` and have
+`REVOKE ALL` applied to `service_role` before the single `SELECT` grant,
+because a view is a new object and Supabase default privileges would otherwise
+hand it every privilege.
+
+Rerun safety: both files are part of the ordered catalog set the executable
+test replays twice (`test_catalog_migration_applies_and_is_rerun_safe`). Every
+`create` is `if not exists` or `create or replace`, every `add constraint` is
+preceded by a drop of both its own name and the PR1 name it replaces, and every
+trigger is dropped before it is created.
+
+Rollback: the canonical relations are empty before this PR and nothing in a
+release promotes into them, so reverting means not calling the promotion RPC. A
+forward corrective migration could revoke the `INSERT` again; nothing else in
+the schema depends on it.
 
 ### The corrective round — migration and rollback impact
 

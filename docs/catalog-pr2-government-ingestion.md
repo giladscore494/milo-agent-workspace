@@ -1,5 +1,13 @@
 # Catalog PR2 — deterministic Government ingestion
 
+> **Superseded in part by Catalog PR3.** Everything below describes what PR2
+> established and remains accurate about the CAPTURE path. Three statements are
+> no longer true of `main`: the production `ToolRegistry` is no longer empty
+> (it registers `catalog.government_vehicle`), the canonical catalog is no
+> longer unwritable (it is writable only through one lease-guarded promotion
+> RPC with a verified verdict per promoted field), and §11's "deferred to PR3"
+> list is delivered. See `docs/catalog-pr3-swarm-and-promotion.md`.
+
 **Scope: ingestion only.** This PR reads the Israeli Ministry of Transport's
 `degem-rechev-wltp` dataset from `data.gov.il` and writes into the relations
 Catalog PR1 established. It connects nothing to Swarm V2, registers no tool,
@@ -16,8 +24,8 @@ is fixture-backed rather than production-exercised, it says so.
 | Base of this PR | `e8a540b11f6befb762ad071a5629828eab1d0000` — branched directly from `origin/main`, not stacked on the PR #86 branch |
 | New package | `backend/catalog/government/` |
 | New migration | `20260915180000_catalog_raw_record_source_locator.sql` |
-| Canonical rows after ingestion | **zero**, and still unwritable by every role |
-| Production tool registrations | **zero** — `ToolRegistry()` is still constructed empty |
+| Canonical rows after ingestion | **zero**, and unwritable by every role at PR2. Catalog PR3 opens the canonical pair to `INSERT` only, behind field-level verified provenance |
+| Production tool registrations | **zero at PR2** — `ToolRegistry()` was still constructed empty. Catalog PR3 registers one |
 | Live syncs activated | **none** — no production entrypoint constructs a transport |
 
 The stored data allows deterministic reconstruction of

@@ -49,6 +49,16 @@ from backend.errors import AppError
 from .contracts import (CANONICAL_DIMENSION_PREFIX, CANONICAL_VARIANT_FIELDS,
                         is_evidence_family, stated_canonical_fields)
 
+#: The repository codes that mean "this worker no longer holds the run".
+#:
+#: Two spellings for one condition, and both must escape: the Supabase
+#: repository classifies a stale-lease RPC failure as `RUN_LEASE_LOST`, and the
+#: in-memory repository raises `RUN_TRANSITION_CONFLICT` from the same check.
+#: A stale worker is an INFRASTRUCTURE outcome that has to reach the worker's
+#: own lease handling; laundering it into a promotion refusal would make a lost
+#: lease look like a decision about the evidence.
+LEASE_FAILURE_CODES = frozenset({"RUN_LEASE_LOST", "RUN_TRANSITION_CONFLICT"})
+
 #: The one status a candidate may be promoted from. `candidate` is an unread
 #: reading, `ambiguous` is a first-class answer that promotion must not
 #: overrule, and `rejected` is a decision against it.
@@ -324,7 +334,7 @@ class CanonicalPromotion:
             variant = self._repository.promote_catalog_variant(
                 self._lease.run_id, plan.as_payload(), **self._lease_kwargs)
         except AppError as failure:
-            if failure.code == "RUN_LEASE_LOST":
+            if failure.code in LEASE_FAILURE_CODES:
                 # A stale worker is an infrastructure outcome, never a
                 # promotion refusal: it must reach the worker's lease handling
                 # exactly as every other guarded write's does.
@@ -343,6 +353,7 @@ class CanonicalPromotion:
         return list(self._repository.list_canonical_field_provenance(variant_id))
 
 
-__all__ = ["PROMOTABLE_CANDIDATE_STATUS", "PROMOTION_REASONS", "CanonicalPromotion",
+__all__ = ["LEASE_FAILURE_CODES", "PROMOTABLE_CANDIDATE_STATUS", "PROMOTION_REASONS",
+           "CanonicalPromotion",
            "CatalogPromotionError", "FieldEvidence", "PromotionOutcome", "PromotionPlan",
            "build_promotion_plan", "field_evidence_for"]

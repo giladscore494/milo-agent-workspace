@@ -542,8 +542,12 @@ Done כאשר: פרויקט עם workflow_key=swarm_v2 מסיים Run במצב c
 > | PR | Scope | State |
 > | --- | --- | --- |
 > | **Catalog PR1** | Persistence only: the versioned schema, the guarded write paths, RLS/ACL, and an empty canonical catalog. No ingestion, no HTTP, no tool, no promotion. | merged (#85, corrected by #86) |
-> | **Catalog PR2** | Government ingestion into that schema: the read-only `data.gov.il` path that fills snapshots, raw records and candidates. | this PR |
-> | **Catalog PR3** | Connect the capability to Swarm V2 and add controlled canonical promotion, gated on verified evidence. | after PR2 |
+> | **Catalog PR2** | Government ingestion into that schema: the read-only `data.gov.il` path that fills snapshots, raw records and candidates. | merged (#87) |
+> | **Catalog PR3** | Connect the capability to Swarm V2 and add controlled canonical promotion, gated on verified evidence. | **this PR** — see `docs/catalog-pr3-swarm-and-promotion.md` |
+>
+> **THE CATALOG WORKSTREAM ENDS WITH PR3.** These three are the whole of the
+> corrected catalog track. There is no Catalog PR4, and the next work returns
+> to the pre-catalog MILO roadmap below.
 >
 > **What Catalog PR2 delivers, exactly.** A bounded, deterministic, read-only
 > capture path (`backend/catalog/government/`) from the CKAN Action/DataStore
@@ -553,17 +557,32 @@ Done כאשר: פרויקט עם workflow_key=swarm_v2 מסיים Run במצב c
 > traces to its snapshot, resource id, upstream `_id`, source version, raw
 > record and the exact page and index it was captured at.
 >
-> **What Catalog PR2 deliberately does NOT do.** It writes no canonical row —
-> `catalog_models` and `catalog_model_variants` are still empty and still
-> unwritable by every role. It creates no claim, no verdict and no evidence
-> link: PR2 provenance is snapshot → raw record → candidate, and evidence
-> mapping plus verdict-backed promotion are PR3's. It registers **no Tool** —
-> the production `ToolRegistry` is untouched and still empty, and
-> `backend/catalog/government/projection.py` is an internal service/query
-> component rather than a `Tool`. It changes no Commander or Worker routing, no
-> model prompt and no Frontend, and **no production sync has been activated**:
-> no production entrypoint constructs a transport, so nothing can reach the
-> network on this path.
+> **What Catalog PR2 deliberately did NOT do, and what PR3 then did.** PR2
+> wrote no canonical row, created no claim, verdict or evidence link, and
+> registered no Tool. Catalog PR3 closed every one of those, and only those:
+>
+> * it registers ONE production Tool, `catalog.government_vehicle` — read mode,
+>   eight bounded operations, one static server-owned scope
+>   (`catalog:government:read`) granted in the trusted worker construction path.
+>   `backend/catalog/government/projection.py` and `query.py` are still service
+>   components with no operations mapping, no schema and no required scope;
+> * it registers ONE production evidence mapper,
+>   `catalog.government_vehicle.resolve_variant`, and routes the trusted sink so
+>   the tool's seven other reads record nothing rather than failing the task
+>   that called them. The production registries are therefore no longer empty —
+>   any statement that they are is stale;
+> * it opens the canonical catalog behind FIELD-LEVEL, append-only provenance:
+>   `service_role` gains INSERT on the canonical pair and nothing else, and two
+>   triggers make a canonical row without complete verified per-field evidence
+>   impossible to commit for every writer, not only through the RPC;
+> * it adds a compact Government-first SOURCE policy to the provider-visible
+>   plan policy, keyed by the registered tool name. It is not a workflow: the
+>   taxonomy and the task graph stay the Commander's.
+>
+> **Still not activated after PR3.** No production entrypoint constructs a
+> transport, so no release can reach `data.gov.il`; the refresh operation exists
+> and no schedule runs it; no reviewed alias rule ships; and nothing in the
+> production worker calls the promotion path.
 >
 > **The old JSON remains an unverified `legacy_reference`.** PR2 imports none
 > of it, seeds none of it, and adds no code that reads it. The canonical
@@ -850,20 +869,43 @@ Done כאשר: MILO מסוגל לקרוא, להשוות ולהציע/להחיל 
 > aggregated JSON. MILO never writes to `data.gov.il` and holds no credential
 > for it. That ingestion is **Catalog PR2**; Catalog PR1 added persistence only.
 >
-> **Catalog PR2 has now built that ingestion.** §3.1 and §3.2 below are
-> delivered: `DataGovClient` is the bounded CKAN reader, and snapshots, raw
-> records and candidates land in PR1's relations. §3.3 is delivered
+> **Catalog PR2 built that ingestion and Catalog PR3 connected it.** §3.1 and
+> §3.2 are delivered: `DataGovClient` is the bounded CKAN reader, and snapshots,
+> raw records and candidates land in PR1's relations. §3.3 is delivered
 > DIFFERENTLY from the text below, and the text below is superseded on that
 > point: there are **no** `government_vehicle_model_years` /
 > `government_vehicle_variants` tables and no parallel Government snapshot
 > database. A Government-specific set of normalized tables is exactly the
 > duplicate persistence model the three-PR decision removed, so normalization
 > writes `catalog_candidate_variants` and the `manufacturer → model → years →
-> variants` tree is reconstructed by a deterministic internal query layer over
-> active snapshots. §3.4 (`GovernmentVehicleTool`), §3.5 (crosswalk), §3.6
-> (evidence/provenance), §3.7 (Commander policy), §3.8 (end-to-end) and §3.9
-> (refresh/diff as a scheduled operation) remain **PR3 and later**; PR2
-> registers no tool and connects nothing to Swarm V2.
+> variants` tree is reconstructed by deterministic query layers over active
+> snapshots — in Python for a bounded snapshot (`projection.py`) and in the
+> DATABASE for one of any size (`query.py` over the reviewed aggregation RPCs).
+>
+> §3.4–§3.9 are delivered by **Catalog PR3**, with these corrections to the
+> text below:
+>
+> * **§3.4** — the tool is `catalog.government_vehicle`, in
+>   `backend/tools/government_vehicle.py`, wrapping the reviewed query layer.
+>   `get_government_evidence` is NOT an operation: evidence is produced by a
+>   trusted mapper from a validated tool result, never asked for by a model.
+> * **§3.5** — the crosswalk is `backend/catalog/government/reconcile.py`, and
+>   the legacy side is bounded `legacy_reference` catalog material rather than a
+>   Yeda tool. No production Yeda tool exists and none is invented: the
+>   aggregated JSON is never imported, read or parsed.
+> * **§3.6** — provenance uses the EXISTING R3/R4 relations. There is no
+>   `provenance.py` and no parallel claim, verdict, fragment or conflict table.
+> * **§3.7** — delivered as `SOURCE_FIRST_TOOL_POLICY`, derived from the
+>   registered tool names.
+> * **§3.8** — proven offline and fixture-backed in
+>   `tests/test_catalog_pr3_swarm_promotion.py`, and against real PostgreSQL in
+>   `tests/test_migrations_postgres.py`. The Yeda PatchProposal half of the
+>   original §3.8 is superseded: under the corrected decision there is no
+>   write-back to the aggregated JSON.
+> * **§3.9** — `sync_if_changed` and the bounded diff exist as a service
+>   operation. **No schedule is activated**, and rollback is reading a pinned
+>   older snapshot rather than moving an active pointer, because an active
+>   snapshot is immutable and raw history is never deleted.
 
 
 <table>
@@ -1163,7 +1205,7 @@ Yeda GitHub branch / PR</th>
 | Safety          | כל V2 durable writes lease-guarded; stale worker cannot write; paid execution fail-closed.           |
 | Budget/provider | כל Kimi call עובר BudgetTracker + shared ProviderScheduler; 429 אינו semantic retry.                 |
 | Dynamic swarm   | Commander יוצר task taxonomies שונות; אין engine/gearbox/dimensions roles קשיחים.                    |
-| Tools           | Registry allowlisted; invalid tool blocked; read/write capabilities נפרדות.                          |
+| Tools           | Registry allowlisted; invalid tool blocked; read/write capabilities נפרדות. **Catalog PR3:** one registered production tool, `catalog.government_vehicle`, read-only, one server-owned scope; no write tool is registered and no write capability is granted. |
 | Yeda read       | מאגר pinned + snapshot/index; query compact; provenance מלא.                                         |
 | Yeda write      | Patch deterministic, schema-validated, approval required, stale SHA blocks write, token worker-only. |
 | Government      | שני CKAN resources מסונכרנים דטרמיניסטית עם snapshot/checksum/raw provenance.                        |
