@@ -1148,3 +1148,65 @@ def test_a_verified_verdict_can_never_be_locally_settled(memory, support_given):
                                       support=[link_a] if support_given else []), **lease)
     assert not [row for row in repository.tool_rows
                 if row.get("evidence_key") == "v-verified-local"]
+
+
+# -----------------------------------------------------------------------------
+# `support` must be a JSON ARRAY when it is supplied at all.
+# -----------------------------------------------------------------------------
+#
+# `support = verdict.get("support") or []` collapsed every FALSY value -- null,
+# {}, "", 0, false -- into an empty list, so the `isinstance(support, list)`
+# check immediately below it could never fire, and the junk value was stored
+# verbatim in the row. Observed at `2b6c77f`: all five accepted, storing
+# `support=None`, `{}`, `''`, `0` and `False`.
+#
+# PostgreSQL separates an ABSENT key from a supplied one -- see
+# `evidence_fixtures.SUPPORT_VALUE_CASES` for the mechanism -- and the matrix
+# there is run against the real RPC by
+# `tests/test_migrations_postgres.py::test_the_verdict_support_field_must_be_a_json_array`.
+#
+# `needs_review` is used throughout so the "an accepted verdict must cite
+# durable evidence" rule cannot mask the type check.
+
+
+@pytest.mark.parametrize("label, value, accepted", F.SUPPORT_VALUE_CASES)
+def test_the_memory_verdict_holds_support_to_a_json_array(memory, label, value, accepted):
+    """A missing `support` means none; a supplied one must be an array."""
+    repository, run_id, lease = memory
+    claim, _, _ = verdict_scenario(repository, run_id, lease, f"type-{label}")
+    key = f"v-type-{label}"
+    payload = F.verdict_payload_with_support(key, claim["id"], value)
+
+    if accepted:
+        row = repository.record_claim_verdict(run_id, payload, **lease)
+        assert support_set(stored_verdict(repository, run_id, key)) == set()
+        assert row["verdict"] == "needs_review"
+        return
+
+    with pytest.raises(AppError, match=F.SUPPORT_TYPE_ERROR):
+        repository.record_claim_verdict(run_id, payload, **lease)
+    # A refused FIRST write leaves no verdict row and no support state at all.
+    assert not [row for row in repository.tool_rows if row.get("evidence_key") == key]
+    assert not [row_id for row_id, kind in repository.evidence_kinds.items()
+                if kind == "claim_verdict"
+                and any(r.get("id") == row_id and r.get("evidence_key") == key
+                        for r in repository.tool_rows)]
+
+
+@pytest.mark.parametrize("label, value", F.REJECTED_SUPPORT_CASES)
+def test_a_memory_verdict_replay_holds_support_to_a_json_array(memory, label, value):
+    """A malformed `support` on a REPLAY changes nothing that is stored."""
+    repository, run_id, lease = memory
+    claim, link_a, _ = verdict_scenario(repository, run_id, lease, f"rtype-{label}")
+    key = f"v-rtype-{label}"
+    repository.record_claim_verdict(
+        run_id, F.verdict_payload(key, claim["id"], verdict="needs_review",
+                                  support=[link_a]), **lease)
+    before = stored_verdict(repository, run_id, key)
+    assert support_set(before) == {(link_a["fragment_id"], link_a["content_hash"],
+                                    link_a["locator_key"])}
+
+    with pytest.raises(AppError, match=F.SUPPORT_TYPE_ERROR):
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload_with_support(key, claim["id"], value), **lease)
+    assert_unchanged(repository, run_id, key, before)

@@ -146,6 +146,63 @@ def verdict_payload(key: str, claim_id: Any, *, verdict: str = "verified",
             "support": list(support or []), "evidence_key": key}
 
 
+#: The `support` KEY is absent from the payload entirely. Distinct from every
+#: JSON value, `null` included -- which is the whole point of the matrix below.
+OMITTED_SUPPORT = object()
+
+#: The message BOTH backends raise for a `support` that is not a JSON array.
+SUPPORT_TYPE_ERROR = "invalid claim verdict: support must be an array"
+
+#: The SHARED support-value matrix: (label, value at `support`, accepted?).
+#:
+#: PostgreSQL distinguishes an ABSENT key from a supplied one:
+#: `p_verdict->'support'` is SQL NULL only when the key is missing, so
+#: `coalesce(..., '[]'::jsonb)` substitutes an empty array there -- while a
+#: supplied JSON `null` is `'null'::jsonb`, which is NOT SQL NULL and so
+#: reaches `jsonb_typeof(v_support) <> 'array'` and is refused, as are an
+#: object, a string, a number and a boolean.
+#:
+#: Every case is run against `MemoryRepository.record_claim_verdict` in
+#: `tests/test_catalog_persistence.py` and against the real
+#: `record_claim_verdict_guarded` in `tests/test_migrations_postgres.py`.
+SUPPORT_VALUE_CASES = (
+    ("missing", OMITTED_SUPPORT, True),
+    ("empty_array", [], True),
+    ("null", None, False),
+    ("object", {}, False),
+    ("string", "", False),
+    ("number", 0, False),
+    ("boolean", False, False),
+)
+
+#: Just the values that must be refused, for the replay half of the matrix.
+REJECTED_SUPPORT_CASES = tuple((label, value)
+                               for label, value, accepted in SUPPORT_VALUE_CASES
+                               if not accepted)
+
+
+def verdict_payload_with_support(key: str, claim_id: Any, value: Any, *,
+                                 verdict: str = "needs_review",
+                                 **kwargs: Any) -> dict[str, Any]:
+    """One verdict payload whose `support` is EXACTLY `value` -- or absent.
+
+    `verdict_payload` coerces its `support` argument with `list(support or [])`,
+    which is the right thing for a well-formed chain and exactly wrong for
+    probing what each backend does with a malformed one. This places the raw
+    value, or removes the key.
+
+    The default verdict is `needs_review` deliberately: an empty support set is
+    legitimate for it, so the "an accepted verdict must cite durable evidence"
+    rule cannot mask what the type check does or does not do.
+    """
+    payload = verdict_payload(key, claim_id, verdict=verdict, support=[], **kwargs)
+    if value is OMITTED_SUPPORT:
+        payload.pop("support")
+    else:
+        payload["support"] = value
+    return payload
+
+
 def chain_payloads(label: str) -> dict[str, dict[str, Any]]:
     """The four payloads of one complete chain, keyed by their stable identities.
 
@@ -160,7 +217,9 @@ def chain_payloads(label: str) -> dict[str, dict[str, Any]]:
 
 
 __all__ = ["ENTITY_KEY", "FIELD_KEY", "FIELD_UNIT", "FIELD_VALUE", "FRAGMENT_HASH",
-           "FRAGMENT_TEXT", "FRAGMENT_TYPE", "LOCATOR", "MARKET", "SOURCE_VERSION_ID",
-           "SOURCE_VERSION_KIND", "TASK_KEY", "TIME_SCOPE", "VERDICT_REASON",
-           "VERIFICATION_MODE", "VERIFIER_CONTRACT", "chain_payloads", "claim_payload",
-           "fragment_payload", "source_payload", "support_link", "verdict_payload"]
+           "FRAGMENT_TEXT", "FRAGMENT_TYPE", "LOCATOR", "MARKET", "OMITTED_SUPPORT",
+           "REJECTED_SUPPORT_CASES", "SOURCE_VERSION_ID", "SOURCE_VERSION_KIND",
+           "SUPPORT_TYPE_ERROR", "SUPPORT_VALUE_CASES", "TASK_KEY", "TIME_SCOPE",
+           "VERDICT_REASON", "VERIFICATION_MODE", "VERIFIER_CONTRACT", "chain_payloads",
+           "claim_payload", "fragment_payload", "source_payload", "support_link",
+           "verdict_payload", "verdict_payload_with_support"]

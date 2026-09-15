@@ -635,8 +635,22 @@ $$;
 --     so set membership and cardinality are the identity, not sequence.
 --
 -- Forward-only: this replaces the function body in place. The
--- `claim_verdicts` / `claim_verdict_supports` relations are unchanged, no row
--- is written, and every previously-accepted call is still accepted.
+-- `claim_verdicts` / `claim_verdict_supports` relations are unchanged and no
+-- row is written by this migration.
+--
+-- THE COMPATIBILITY BOUNDARY, stated exactly. This is NOT a pure widening:
+--
+--   * a valid FIRST write is still accepted, unchanged;
+--   * an EXACT replay -- same identity, same support set, in any order -- is
+--     still accepted and still returns the same row;
+--   * a replay that MUTATED the stored support set is now REFUSED. Adding
+--     evidence to an existing verdict used to succeed (see above), and that
+--     acceptance is deliberately withdrawn: it let an idempotent write change
+--     the durable evidence a stored verdict rests on.
+--
+-- Nothing depends on the withdrawn behaviour today -- these relations are
+-- empty on this branch and no caller adds support on replay -- but the change
+-- is a rejection where there was an acceptance, and is recorded as one.
 
 create or replace function public.record_claim_verdict_guarded(
   p_run_id uuid, p_worker_id text, p_attempt integer, p_lease_token text,

@@ -4834,3 +4834,66 @@ def test_the_verdict_replay_contract_is_the_databases_own(db, case, expected):
     assert _stored_support(db, run_id, key) == before
     assert db.psql(f"select count(*) from public.claim_verdicts where run_id='{run_id}' "
                    f"and evidence_key='{key}'") == ("1" if first_calls else "0")
+
+
+# ---------------------------------------------------------------------------
+# `support` must be a JSON ARRAY when it is supplied at all.
+# ---------------------------------------------------------------------------
+#
+# Paired with `tests/test_catalog_persistence.py::…_holds_support_to_a_json_array`
+# over the SAME `evidence_fixtures.SUPPORT_VALUE_CASES` matrix. The mirror
+# collapsed every falsy value into an empty list; these establish, on the real
+# database, what it must collapse and what it must refuse.
+
+
+@pytest.mark.parametrize("label, value, accepted", evidence_fixtures.SUPPORT_VALUE_CASES)
+def test_the_verdict_support_field_must_be_a_json_array(db, label, value, accepted):
+    """A MISSING key coalesces to `[]`; a supplied non-array is refused.
+
+    The distinction is real jsonb semantics, not a convention: `p_verdict->
+    'support'` is SQL NULL only when the key is absent, so `coalesce(...,
+    '[]'::jsonb)` fires there alone. A supplied JSON `null` is `'null'::jsonb`,
+    which survives the coalesce and fails `jsonb_typeof(...) <> 'array'`.
+    """
+    lease, _ = _evidence_fixture(db, f"stype-{label}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    claim, _, _ = _verdict_scenario(db, args, f"stype-{label}")
+    key = f"v-stype-{label}"
+    payload = evidence_fixtures.verdict_payload_with_support(key, claim, value)
+    call = f"select id from public.record_claim_verdict_guarded({args},'{json.dumps(payload)}'::jsonb)"
+
+    if accepted:
+        verdict_id = _rpc_as_service(db, call)
+        assert db.psql(f"select count(*) from public.claim_verdict_supports "
+                       f"where verdict_id='{verdict_id}'") == "0"
+        return
+
+    with pytest.raises(AssertionError, match=evidence_fixtures.SUPPORT_TYPE_ERROR):
+        _rpc_as_service(db, call)
+    # A refused FIRST write leaves no verdict row and no support row.
+    assert db.psql(f"select count(*) from public.claim_verdicts where run_id='{run_id}' "
+                   f"and evidence_key='{key}'") == "0"
+    assert db.psql(f"select count(*) from public.claim_verdict_supports s "
+                   f"join public.claim_verdicts v on v.id = s.verdict_id "
+                   f"where v.run_id='{run_id}'") == "0"
+
+
+@pytest.mark.parametrize("label, value", evidence_fixtures.REJECTED_SUPPORT_CASES)
+def test_a_verdict_replay_holds_support_to_a_json_array(db, label, value):
+    """A malformed `support` on a REPLAY changes nothing that is stored."""
+    lease, _ = _evidence_fixture(db, f"rstype-{label}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    claim, link_a, _ = _verdict_scenario(db, args, f"rstype-{label}")
+    key = f"v-rstype-{label}"
+    stored = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{json.dumps(evidence_fixtures.verdict_payload(key, claim, verdict='needs_review', support=[link_a]))}'::jsonb)")
+    before = _stored_support(db, run_id, key)
+    assert before
+
+    payload = evidence_fixtures.verdict_payload_with_support(key, claim, value)
+    with pytest.raises(AssertionError, match=evidence_fixtures.SUPPORT_TYPE_ERROR):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{json.dumps(payload)}'::jsonb)")
+    assert _stored_support(db, run_id, key) == before
+    assert db.psql(f"select id from public.claim_verdicts where run_id='{run_id}' "
+                   f"and evidence_key='{key}'") == stored

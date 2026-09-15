@@ -650,7 +650,18 @@ class MemoryRepository:
         if verdict.get("verdict") not in ("verified", "needs_review", "rejected"):
             raise AppError("CLAIM_VERDICT_INVALID",
                            "invalid claim verdict: unknown verdict", 400)
-        support = verdict.get("support") or []
+        # A MISSING `support` key means "cites nothing"; a SUPPLIED one must be
+        # a JSON array. `verdict.get("support") or []` conflated the two: every
+        # falsy value -- `null`, `{}`, `""`, `0`, `false` -- became an empty
+        # list, so the type check below could never fire and the junk value was
+        # stored verbatim in the row.
+        #
+        # PostgreSQL keeps the two apart, and not by convention:
+        # `p_verdict->'support'` is SQL NULL only when the KEY IS ABSENT, so
+        # `coalesce(..., '[]'::jsonb)` substitutes an empty array there alone,
+        # while a supplied JSON `null` is `'null'::jsonb` -- not SQL NULL --
+        # and reaches `jsonb_typeof(v_support) <> 'array'`.
+        support = verdict["support"] if "support" in verdict else []
         if not isinstance(support, list):
             raise AppError("CLAIM_VERDICT_INVALID",
                            "invalid claim verdict: support must be an array", 400)
