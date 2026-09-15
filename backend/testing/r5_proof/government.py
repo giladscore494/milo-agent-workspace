@@ -75,6 +75,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from backend.catalog.government import vocabulary as _vocabulary
 from backend.tools.contracts import ToolContext, ToolError, ToolMode, ToolOperation
 
 from .manifest import ProofManifestError, load_fixture
@@ -155,40 +156,50 @@ MAX_SCANNED_RECORDS = 400
 #: than being transliterated at run time.
 MAKE_BY_TOZAR: Mapping[str, str] = {"טויוטה": "Toyota"}
 
+# The register's own code/label semantics live in ONE place --
+# `backend/catalog/government/vocabulary.py`, in the production catalog
+# namespace -- because Catalog PR2 reads the same fields of the same resource
+# and two copies of a semantic table are two things that can drift.
+#
+# What this proof keeps is its own KEY SET. Every table below SELECTS exactly
+# the codes R5 reviewed against the committed capture, so the shared module may
+# grow for a wider capture without changing which rows this tool decodes: this
+# selection is conservative, and a table that silently widened could turn a
+# settled unique match into an ambiguity. A change to the MEANING of a code
+# this proof does read breaks here immediately, which is the point.
+
 #: `delek_cd` -> (fuel type, the `delek_nm` that code is paired with). The code
 #: decides; the name is a cross-check that the dataset's own pairing still
 #: holds. `7` is electricity/petrol -- a plug-in hybrid, not a "hybrid".
 FUEL_BY_CODE: Mapping[int, tuple[str, str]] = {
-    1: ("petrol", "בנזין"),
-    7: ("plug_in_hybrid", "חשמל/בנזין"),
+    code: _vocabulary.FUEL_BY_CODE[code] for code in (1, 7)
 }
 
 #: `technologiat_hanaa_cd` -> (propulsion technology, its paired name). The
 #: conventional-drive rows carry NO code at all, so they are absent here and a
 #: request can never select one by propulsion.
 PROPULSION_BY_CODE: Mapping[int, tuple[str, str]] = {
-    1: ("hybrid", "היברידי רגיל"),
-    2: ("plug_in", "PLUG IN"),
+    code: _vocabulary.PROPULSION_BY_CODE[code] for code in (1, 2)
 }
 
 #: `hanaa_cd` -> (drivetrain, its paired name). `לא ידוע קוד` ("unknown code")
 #: is deliberately absent: a row that does not state its drivetrain must not
 #: match a request that does.
 DRIVETRAIN_BY_CODE: Mapping[int, tuple[str, str]] = {
-    1: ("two_wheel_drive", "4X2"),
-    3: ("awd", "4X4"),
+    code: _vocabulary.DRIVETRAIN_BY_CODE[code] for code in (1, 3)
 }
 
 #: `merkav` (body) -> body style. Closed, and read only as an R4 identity
 #: dimension.
-BODY_STYLE_BY_MERKAV: Mapping[str, str] = {"פנאי-שטח": "suv"}
+BODY_STYLE_BY_MERKAV: Mapping[str, str] = {
+    body: _vocabulary.BODY_STYLE_BY_MERKAV[body] for body in ("פנאי-שטח",)
+}
 
 #: Fuel and propulsion are two independent statements about one row, and a row
 #: whose two statements disagree is not material this proof will read. Only
 #: these pairings occur in the captured data; anything else fails closed.
-CONSISTENT_FUEL_PROPULSION: frozenset[tuple[str, str]] = frozenset({
-    ("petrol", "hybrid"), ("petrol", "conventional"), ("plug_in_hybrid", "plug_in"),
-})
+CONSISTENT_FUEL_PROPULSION: frozenset[tuple[str, str]] = \
+    _vocabulary.CONSISTENT_FUEL_PROPULSION
 
 _RECORD_REQUEST = {
     "type": "object",
@@ -319,27 +330,21 @@ _RECORD_RESULT = {
 
 #: Why a captured field of the selected row is not evidence. Static: the reason
 #: is written by a reviewer, never derived from the row in front of the tool.
-UNMAPPED_FIELDS: tuple[tuple[str, str], ...] = (
-    ("koah_sus",
-     "the dataset publishes no definition of this power figure, and across the captured "
-     "plug-in rows of one commercial model it takes both engine-scale (177/185/186) and "
-     "system-scale (302/324) values, so its semantics are unresolved in the source"),
-    ("dg_metach_solela",
-     "battery voltage is stated as 650.0, 12.0, 0.01 and null across the captured "
-     "plug-in rows, which cannot all describe one traction battery"),
-    ("mishkal_kolel",
-     "a total mass is stated with no unit anywhere in the dataset or its metadata"),
-)
+#: The three this proof reports are named explicitly and in this order -- the
+#: reasons are the shared module's, the SELECTION is this proof's, so a field
+#: added there for a wider capture does not silently join this tool's result.
+UNMAPPED_FIELDS: tuple[tuple[str, str], ...] = _vocabulary.unmapped_fields(
+    "koah_sus", "dg_metach_solela", "mishkal_kolel")
 
 
 #: The record's own field names this proof copies verbatim. Closed and static:
 #: a row that grows a new field contributes nothing new until a reviewer adds
-#: it here, and the durable locators can only ever name one of these.
-UPSTREAM_FIELDS: tuple[str, ...] = (
-    "tozar", "kinuy_mishari", "shnat_yitzur", "nefah_manoa", "delek_cd", "delek_nm",
-    "technologiat_hanaa_cd", "technologiat_hanaa_nm", "degem_nm", "hanaa_cd",
-    "hanaa_nm", "merkav", "ramat_gimur",
-)
+#: it to the shared vocabulary, and the durable locators can only ever name one
+#: of these. Deliberately the WHOLE shared list rather than a selection: this
+#: proof and the catalog normalizer read exactly the same fields of the same
+#: resource, and `_RECORD_RESULT` below names all thirteen in a closed schema,
+#: so a widening there fails this suite loudly rather than passing silently.
+UPSTREAM_FIELDS: tuple[str, ...] = _vocabulary.GOVERNMENT_IDENTITY_FIELDS
 
 
 def _text(value: Any) -> str | None:
