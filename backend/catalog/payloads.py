@@ -31,7 +31,8 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from . import keys
-from .contracts import stated_source_locator
+from .contracts import (CANONICAL_VARIANT_FIELDS, MAX_CANONICAL_FIELDS,
+                        stated_canonical_fields, stated_source_locator)
 from .keys import CatalogKeyError
 
 #: The structural identity of a snapshot: what makes one retrieval that
@@ -47,6 +48,15 @@ CANDIDATE_IDENTITY = ("manufacturer", "commercial_model", "model_year_start",
 #: Fields a caller supplies purely so a child's key can be derived from its
 #: parent's identity. They are stripped before the payload reaches a database.
 PARENT_KEY_FIELDS = ("snapshot_key", "record_key", "candidate_key")
+
+#: The identity of the canonical VARIANT one promotion establishes.
+CANONICAL_VARIANT_IDENTITY = ("model_year_start", "model_year_end",
+                              "official_model_code", "trim", "identity_dimensions")
+
+#: Exactly the keys one promoted-field entry carries. Closed in BOTH
+#: directions: a missing key and an extra one are equally a refusal, because an
+#: entry this code does not fully understand is not an entry it may promote.
+PROMOTION_FIELD_KEYS = frozenset({"field_key", "value", "evidence_link_id"})
 
 
 class CatalogPayloadError(ValueError):
@@ -134,6 +144,84 @@ def prepare_evidence_link(payload: Mapping[str, Any]) -> dict[str, Any]:
     return _settle_key(payload, "link_key", derived)
 
 
-__all__ = ["CANDIDATE_IDENTITY", "PARENT_KEY_FIELDS", "SNAPSHOT_IDENTITY",
-           "CatalogPayloadError", "prepare_candidate", "prepare_evidence_link",
+def prepare_promotion(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """One canonical promotion, keyed by what it promotes.
+
+    Three identities are DERIVED here and none is accepted: the canonical model
+    key, the canonical variant key and the promotion key. A caller MAY state
+    any of them and is then held to it, exactly like every other catalog key.
+
+    The FIELD SET is checked against the variant the promotion states, in both
+    directions, before anything reaches the database:
+
+    *   every field the canonical variant would state must have an entry, so a
+        column cannot arrive without provenance;
+    *   every entry must name a field the variant states, so provenance cannot
+        arrive without a column;
+    *   every entry's `value` must be EXACTLY the value the variant states for
+        that field, so the provenance and the row cannot disagree.
+
+    The database applies the same three rules, for every writer, in
+    `20260916120000_catalog_field_level_promotion.sql`. This is the local copy
+    that makes the refusal readable and makes the memory repository apply the
+    identical rule -- it is not the enforcement.
+
+    `evidence_link_id` is the only thing an entry contributes beyond the value:
+    the source, the claim, the verdict, the version and the locator are all
+    DERIVED from that link by the promotion transaction, never supplied, for
+    the same reason `prepare_evidence_link` refuses a supplied digest.
+    """
+    _require(payload, "candidate_id", "candidate_key", "manufacturer", "commercial_model")
+    variant = {name: payload.get(name) for name in CANONICAL_VARIANT_IDENTITY}
+    variant["identity_dimensions"] = dict(variant.get("identity_dimensions") or {})
+    if (variant["model_year_start"] is None) != (variant["model_year_end"] is None):
+        raise CatalogPayloadError("a catalog model year range must be whole")
+    try:
+        stated = stated_canonical_fields(variant)
+    except ValueError as failure:
+        raise CatalogPayloadError(str(failure)) from None
+
+    entries = payload.get("fields")
+    if not isinstance(entries, list) or not entries or len(entries) > MAX_CANONICAL_FIELDS:
+        raise CatalogPayloadError("a catalog promotion must state its promoted fields")
+    promoted: dict[str, Any] = {}
+    prepared_fields: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != PROMOTION_FIELD_KEYS:
+            raise CatalogPayloadError("a promoted catalog field states a key, a value and a link")
+        field_key = entry["field_key"]
+        if field_key not in CANONICAL_VARIANT_FIELDS or field_key in promoted:
+            raise CatalogPayloadError("unknown or repeated promoted catalog field")
+        if not entry.get("evidence_link_id"):
+            raise CatalogPayloadError("a promoted catalog field must cite its evidence link")
+        promoted[str(field_key)] = entry["value"]
+        prepared_fields.append({"field_key": str(field_key), "value": entry["value"],
+                                "evidence_link_id": str(entry["evidence_link_id"])})
+    if promoted != stated:
+        # Both directions at once: a missing field, an extra field and a field
+        # whose promoted value is not the value the row would state are all
+        # this one refusal, because all three are the same defect -- the row
+        # and its provenance describing different vehicles.
+        raise CatalogPayloadError("promoted catalog fields do not match the canonical row")
+
+    model_key = keys.canonical_model_key(manufacturer=payload["manufacturer"],
+                                         commercial_model=payload["commercial_model"])
+    variant_key = keys.canonical_variant_key(model_key=model_key, **variant)
+    prepared = dict(payload)
+    prepared["fields"] = sorted(prepared_fields, key=lambda item: item["field_key"])
+    prepared["identity_dimensions"] = variant["identity_dimensions"]
+    prepared = _settle_key(prepared, "model_canonical_key", model_key)
+    prepared = _settle_key(prepared, "canonical_key", variant_key)
+    prepared = _settle_key(prepared, "promotion_key",
+                           keys.promotion_key(candidate_key=payload["candidate_key"],
+                                              variant_key=variant_key, fields=promoted))
+    # The candidate key is a PARENT key: it exists so the promotion key can be
+    # derived from the candidate's identity, and it is not a column.
+    prepared.pop("candidate_key", None)
+    return prepared
+
+
+__all__ = ["CANDIDATE_IDENTITY", "CANONICAL_VARIANT_IDENTITY", "PARENT_KEY_FIELDS",
+           "PROMOTION_FIELD_KEYS", "SNAPSHOT_IDENTITY", "CatalogPayloadError",
+           "prepare_candidate", "prepare_evidence_link", "prepare_promotion",
            "prepare_raw_record", "prepare_snapshot"]

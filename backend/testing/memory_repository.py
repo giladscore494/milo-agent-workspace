@@ -15,8 +15,9 @@ from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
-                                       stated_identity_dimensions, stated_source_locator,
-                                       trust_state_for)
+                                       CANONICAL_DIMENSION_PREFIX,
+                                       stated_canonical_fields, stated_identity_dimensions,
+                                       stated_source_locator, trust_state_for)
 from backend.catalog.digest import catalog_payload_digest
 from backend.engines.swarm_v2.evidence_bounds import FRAGMENT_TYPES
 from backend.engines.swarm_v2.evidence_contracts import (fragment_type_for,
@@ -24,7 +25,8 @@ from backend.engines.swarm_v2.evidence_contracts import (fragment_type_for,
 from backend.engines.swarm_v2.fragments import fragment_content_hash
 from backend.engines.swarm_v2.support import VERIFICATION_MODES, VERIFIER_CONTRACT_VERSION
 from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
-                                      prepare_raw_record, prepare_snapshot)
+                                      prepare_promotion, prepare_raw_record,
+                                      prepare_snapshot)
 from backend.errors import AppError, NotFoundError
 from backend.runtime import RUN_STATES, InvalidTransition, validate_transition
 from backend.schemas import normalize_conversation_title
@@ -77,11 +79,15 @@ class MemoryRepository:
         self.catalog_raw_records: dict[tuple[str, str], dict[str, Any]] = {}
         self.catalog_candidates: dict[tuple[str, str], dict[str, Any]] = {}
         self.catalog_evidence_links: dict[tuple[str, str], dict[str, Any]] = {}
-        # Canonical state. Present so a test can PROVE it stays empty; there
-        # is deliberately no method anywhere that appends to either list,
-        # mirroring the database, where service_role holds SELECT only.
+        # Canonical state (PR3). Written ONLY by `promote_catalog_variant`,
+        # which mirrors the promotion transaction: the canonical identity and
+        # every field's provenance are created together or not at all, and a
+        # canonical row that states a field with no verified provenance is
+        # refused here exactly as the deferred constraint trigger refuses it in
+        # PostgreSQL.
         self.catalog_models: list[dict[str, Any]] = []
         self.catalog_model_variants: list[dict[str, Any]] = []
+        self.catalog_canonical_field_provenance: list[dict[str, Any]] = []
         self.checkpoints: list[dict[str, Any]] = []
 
     # -- seeding -------------------------------------------------------------
@@ -1184,6 +1190,408 @@ class MemoryRepository:
         rows.sort(key=lambda row: row["candidate_key"])
         start = max(0, int(offset))
         return rows[start:start + max(1, min(int(limit), self.MAX_CATALOG_CANDIDATE_ROWS))]
+
+    # --- bounded database-side catalog aggregation (PR3) ---------------------
+    #
+    # Mirrors of the reviewed RPCs in
+    # `20260916090000_catalog_bounded_candidate_queries.sql`, including the
+    # parts that MATTER for the query layer to be meaningful: the active +
+    # complete + USABLE snapshot gate, the fixed codepoint ordering, the
+    # explicit page bound and the EXACT total on every row.
+    #
+    # The ordering is Python's own string comparison, which is codepoint order,
+    # and the SQL orders `collate "C"`, which for UTF-8 is byte order and
+    # therefore the same order. The identity text here is Hebrew, so a
+    # collation-dependent ordering would make the two disagree.
+    MAX_CATALOG_AGGREGATE_ROWS = 200
+
+    def _readable_snapshot(self, snapshot_id: Any, allow_incomplete: bool) -> dict[str, Any]:
+        """The snapshot gate, applied here exactly as `catalog_readable_snapshot`
+        applies it: active, complete, states a reading, and free of unresolved
+        issues unless the caller has acknowledged them."""
+        snapshot = self._catalog_snapshot_by_id(snapshot_id)
+        if snapshot.get("activated_at") is None or snapshot.get("validation_state") != "complete":
+            raise AppError("CATALOG_SNAPSHOT_NOT_ACTIVE", "catalog snapshot is not active", 409)
+        metadata = snapshot.get("retrieval_metadata") or {}
+        contract = metadata.get("normalization_contract")
+        if not contract or contract == "raw_only":
+            raise AppError("CATALOG_SNAPSHOT_NOT_READ",
+                           "catalog snapshot states no readable identities", 409)
+        issues = metadata.get("normalization_issue_count")
+        if isinstance(issues, bool) or not isinstance(issues, int):
+            raise AppError("CATALOG_SNAPSHOT_STATE_INVALID",
+                           "catalog snapshot reading state is malformed", 409)
+        if issues > 0 and not allow_incomplete:
+            raise AppError("CATALOG_SNAPSHOT_INCOMPLETE",
+                           "catalog snapshot holds rows its vocabulary could not read", 409)
+        return snapshot
+
+    def _snapshot_candidates(self, snapshot_id: Any) -> list[dict[str, Any]]:
+        return [row for row in self.catalog_candidates.values()
+                if row["snapshot_id"] == str(snapshot_id)]
+
+    @staticmethod
+    def _aggregate_page(items: list[dict[str, Any]], limit: int, offset: int) -> list[dict[str, Any]]:
+        """Attach the EXACT total to every returned row, then cut the page."""
+        total = len(items)
+        bounded = max(1, min(int(limit), MemoryRepository.MAX_CATALOG_AGGREGATE_ROWS))
+        start = max(0, int(offset))
+        return [{**row, "total_count": total} for row in items[start:start + bounded]]
+
+    def catalog_candidate_manufacturers(self, snapshot_id: Any, *, limit: int = 50,
+                                        offset: int = 0,
+                                        allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        with self.lock:
+            self._readable_snapshot(snapshot_id, allow_incomplete)
+            grouped: dict[str, dict[str, Any]] = {}
+            for row in self._snapshot_candidates(snapshot_id):
+                entry = grouped.setdefault(row["manufacturer"],
+                                           {"manufacturer": row["manufacturer"],
+                                            "_models": set(), "variant_count": 0,
+                                            "ambiguous_variant_count": 0})
+                entry["_models"].add(row["commercial_model"])
+                entry["variant_count"] += 1
+                entry["ambiguous_variant_count"] += 1 if row["status"] == "ambiguous" else 0
+            items = [{"manufacturer": name, "model_count": len(entry.pop("_models")),
+                      "variant_count": entry["variant_count"],
+                      "ambiguous_variant_count": entry["ambiguous_variant_count"]}
+                     for name, entry in sorted(grouped.items())]
+            return self._aggregate_page(items, limit, offset)
+
+    def catalog_candidate_models(self, snapshot_id: Any, *, manufacturer: str, limit: int = 50,
+                                 offset: int = 0,
+                                 allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        with self.lock:
+            self._readable_snapshot(snapshot_id, allow_incomplete)
+            if not str(manufacturer).strip():
+                raise AppError("CATALOG_QUERY_INVALID", "a manufacturer is required", 400)
+            grouped: dict[str, dict[str, Any]] = {}
+            for row in self._snapshot_candidates(snapshot_id):
+                if row["manufacturer"] != manufacturer:
+                    continue
+                entry = grouped.setdefault(row["commercial_model"], {
+                    "manufacturer": manufacturer, "commercial_model": row["commercial_model"],
+                    "variant_count": 0, "ambiguous_variant_count": 0,
+                    "model_year_start": None, "model_year_end": None})
+                entry["variant_count"] += 1
+                entry["ambiguous_variant_count"] += 1 if row["status"] == "ambiguous" else 0
+                start, end = row.get("model_year_start"), row.get("model_year_end")
+                if start is not None:
+                    entry["model_year_start"] = start if entry["model_year_start"] is None \
+                        else min(entry["model_year_start"], start)
+                    entry["model_year_end"] = end if entry["model_year_end"] is None \
+                        else max(entry["model_year_end"], end)
+            items = [entry for _, entry in sorted(grouped.items())]
+            return self._aggregate_page(items, limit, offset)
+
+    def catalog_candidate_model_years(self, snapshot_id: Any, *, manufacturer: str,
+                                      commercial_model: str, limit: int = 50, offset: int = 0,
+                                      allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        with self.lock:
+            self._readable_snapshot(snapshot_id, allow_incomplete)
+            if not str(manufacturer).strip() or not str(commercial_model).strip():
+                raise AppError("CATALOG_QUERY_INVALID",
+                               "a manufacturer and a commercial model are required", 400)
+            grouped: dict[int, dict[str, Any]] = {}
+            for row in self._snapshot_candidates(snapshot_id):
+                if row["manufacturer"] != manufacturer \
+                        or row["commercial_model"] != commercial_model \
+                        or row.get("model_year_start") is None:
+                    continue
+                for year in range(row["model_year_start"], row["model_year_end"] + 1):
+                    entry = grouped.setdefault(year, {
+                        "manufacturer": manufacturer, "commercial_model": commercial_model,
+                        "model_year": year, "variant_count": 0, "ambiguous_variant_count": 0})
+                    entry["variant_count"] += 1
+                    entry["ambiguous_variant_count"] += 1 if row["status"] == "ambiguous" else 0
+            items = [entry for _, entry in sorted(grouped.items())]
+            return self._aggregate_page(items, limit, offset)
+
+    def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None,
+                                       commercial_model: str | None = None,
+                                       model_year: int | None = None,
+                                       official_model_code: str | None = None,
+                                       trim: str | None = None,
+                                       identity_dimensions: dict[str, Any] | None = None,
+                                       status: str | None = None, limit: int = 50,
+                                       offset: int = 0,
+                                       allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        with self.lock:
+            self._readable_snapshot(snapshot_id, allow_incomplete)
+            if status is not None and status not in CANDIDATE_STATUSES:
+                raise AppError("CATALOG_QUERY_INVALID",
+                               "unknown catalog candidate status", 400)
+            # Raises on a dimension outside the closed vocabulary, exactly as
+            # `catalog_identity_dimensions_valid` refuses one in SQL.
+            wanted = stated_identity_dimensions(identity_dimensions or {})
+            records = {row["id"]: row for row in self.catalog_raw_records.values()
+                       if row["snapshot_id"] == str(snapshot_id)}
+            matched: list[dict[str, Any]] = []
+            for row in self._snapshot_candidates(snapshot_id):
+                if manufacturer is not None and row["manufacturer"] != manufacturer:
+                    continue
+                if commercial_model is not None and row["commercial_model"] != commercial_model:
+                    continue
+                if official_model_code is not None \
+                        and row.get("official_model_code") != official_model_code:
+                    continue
+                if trim is not None and row.get("trim") != trim:
+                    continue
+                if status is not None and row["status"] != status:
+                    continue
+                if model_year is not None:
+                    start = row.get("model_year_start")
+                    if start is None or not start <= int(model_year) <= row["model_year_end"]:
+                        continue
+                stored = row.get("identity_dimensions") or {}
+                if any(stored.get(name) != value for name, value in wanted.items()):
+                    continue
+                record = records.get(row["raw_record_id"])
+                if record is None:
+                    continue
+                matched.append({
+                    "id": row["id"], "snapshot_id": row["snapshot_id"],
+                    "raw_record_id": row["raw_record_id"],
+                    "manufacturer": row["manufacturer"],
+                    "commercial_model": row["commercial_model"],
+                    "model_year_start": row.get("model_year_start"),
+                    "model_year_end": row.get("model_year_end"),
+                    "official_model_code": row.get("official_model_code"),
+                    "trim": row.get("trim"),
+                    "identity_dimensions": dict(stored), "status": row["status"],
+                    "candidate_key": row["candidate_key"],
+                    "upstream_record_id": record["upstream_record_id"],
+                    "resource_id": record["resource_id"],
+                    "source_locator": dict(record.get("source_locator") or {}),
+                    "payload_sha256": record["payload_sha256"]})
+            matched.sort(key=lambda item: (
+                item["manufacturer"], item["commercial_model"],
+                item["model_year_start"], item["model_year_end"],
+                item["official_model_code"] or "", item["trim"] or "", item["candidate_key"]))
+            return self._aggregate_page(matched, limit, offset)
+
+    def catalog_raw_record_by_upstream_id(self, snapshot_id: Any, upstream_record_id: str, *,
+                                          allow_incomplete: bool = False) -> dict[str, Any] | None:
+        with self.lock:
+            self._readable_snapshot(snapshot_id, allow_incomplete)
+            if not str(upstream_record_id).strip():
+                raise AppError("CATALOG_QUERY_INVALID", "an upstream record id is required", 400)
+            return next((dict(row) for row in self.catalog_raw_records.values()
+                         if row["snapshot_id"] == str(snapshot_id)
+                         and row["upstream_record_id"] == str(upstream_record_id)), None)
+
+    # --- field-level canonical promotion (PR3) -------------------------------
+    #
+    # Mirrors `promote_catalog_variant_guarded` and, more importantly, the two
+    # TRIGGERS that hold for every writer: the per-fact support chain
+    # (`catalog_check_field_provenance`) and the deferred coverage check
+    # (`catalog_require_field_provenance`).
+    #
+    # WHAT THIS IS NOT. It is a mirror of the rules, not a second
+    # implementation of PostgreSQL. Two protections are deliberately
+    # DATABASE-ONLY and are documented as such rather than claimed here: the
+    # DEFERRED timing (this implementation checks coverage before it appends
+    # anything, so there is no window at all rather than a window that closes
+    # at COMMIT), and the concurrency semantics of the unique indexes under
+    # simultaneous writers, which a single-process dictionary cannot exhibit.
+    _CANONICAL_PROVENANCE_DERIVED = ("snapshot_id", "source_id", "claim_id", "verdict_id",
+                                     "record_locator", "source_version",
+                                     "source_version_kind")
+
+    def _check_field_provenance(self, run_id: UUID, candidate: dict[str, Any],
+                                field_key: str, value: Any,
+                                link_id: Any) -> dict[str, Any]:
+        """One promoted fact, held to its WHOLE support chain, or refused."""
+        link = next((row for row in self.catalog_evidence_links.values()
+                     if row["id"] == str(link_id)), None)
+        if link is None:
+            raise AppError("CATALOG_PROMOTION_LINK_INVALID",
+                           "canonical field provenance cites no catalog evidence link", 400)
+        if str(link["candidate_id"]) != str(candidate["id"]):
+            raise AppError("CATALOG_PROMOTION_LINK_CANDIDATE",
+                           "canonical field provenance cites evidence of another candidate", 400)
+        snapshot = self._catalog_snapshot_by_id(link["snapshot_id"])
+        if str(candidate["snapshot_id"]) != str(link["snapshot_id"]):
+            raise AppError("CATALOG_PROMOTION_SNAPSHOT_MISMATCH",
+                           "canonical field provenance snapshot mismatch", 400)
+        if snapshot.get("activated_at") is None or snapshot.get("validation_state") != "complete":
+            raise AppError("CATALOG_PROMOTION_SNAPSHOT_UNUSABLE",
+                           "catalog promotion requires an active complete snapshot", 409)
+        if snapshot.get("trust_state") != "evidence":
+            raise AppError("CATALOG_PROMOTION_UNVERIFIED_SOURCE",
+                           "an unverified catalog source cannot support a canonical fact", 409)
+        if link.get("verdict_id") is None:
+            raise AppError("CATALOG_PROMOTION_UNVERIFIED",
+                           "canonical field provenance cites unverified evidence", 409)
+        verdict = self._catalog_evidence_row(link["verdict_id"], run_id, "VERDICT")
+        if verdict.get("verdict") != "verified":
+            raise AppError("CATALOG_PROMOTION_VERDICT_NOT_VERIFIED",
+                           "canonical field provenance verdict is not verified", 409)
+        claim = self._catalog_evidence_row(link["claim_id"], run_id, "CLAIM")
+        if str(verdict.get("claim_id")) != str(claim["id"]):
+            raise AppError("CATALOG_PROMOTION_VERDICT_CLAIM_MISMATCH",
+                           "canonical field provenance verdict claim mismatch", 400)
+        if str(claim.get("source_id")) != str(link["source_id"]):
+            raise AppError("CATALOG_PROMOTION_CLAIM_SOURCE_MISMATCH",
+                           "canonical field provenance claim source mismatch", 400)
+        if claim.get("status", "active") != "active":
+            raise AppError("CATALOG_PROMOTION_CLAIM_INACTIVE",
+                           "canonical field provenance cites a claim that is not active", 400)
+        # THE FIELD GATE: the verified claim must state this exact field at
+        # this exact value. A verdict that confirmed one field says nothing
+        # about the field beside it.
+        if claim.get("field_key") != field_key:
+            raise AppError("CATALOG_PROMOTION_FIELD_MISMATCH",
+                           "canonical field provenance claim states a different field", 400)
+        if claim.get("value") != value:
+            raise AppError("CATALOG_PROMOTION_VALUE_MISMATCH",
+                           "canonical field provenance claim states a different value", 400)
+        if any(row.get("outcome") == "unresolved_needs_review"
+               and str(claim["id"]) in [str(item) for item in (row.get("claim_ids") or [])]
+               for row in self.tool_rows
+               if self.evidence_kinds.get(str(row.get("id"))) == "conflict"):
+            raise AppError("CATALOG_PROMOTION_UNRESOLVED_CONFLICT",
+                           "canonical field provenance claim is in an unresolved conflict", 409)
+        return link
+
+    def promote_catalog_variant(self, run_id: UUID, promotion: dict[str, Any], *,
+                                worker_id: str, attempt: int,
+                                lease_token: str) -> dict[str, Any]:
+        with self.lock:
+            self._catalog_lease(run_id, worker_id, attempt, lease_token)
+            promotion = prepare_promotion(promotion)
+            candidate = next((row for row in self.catalog_candidates.values()
+                              if row["id"] == str(promotion.get("candidate_id"))), None)
+            if candidate is None:
+                raise AppError("CATALOG_PROMOTION_INVALID",
+                               "invalid catalog promotion candidate", 400)
+            # An AMBIGUOUS, rejected or still-unreviewed candidate is not
+            # promotable: ambiguity is a first-class answer in this schema.
+            if candidate.get("status") != "ready_for_review":
+                raise AppError("CATALOG_PROMOTION_CANDIDATE_NOT_READY",
+                               "catalog candidate is not ready for promotion", 409)
+            stated = stated_canonical_fields(promotion)
+            requested = {entry["field_key"]: entry["value"] for entry in promotion["fields"]}
+            if requested != stated:
+                raise AppError("CATALOG_PROMOTION_FIELDS_MISMATCH",
+                               "promoted catalog fields do not match the canonical row", 400)
+
+            key = str(promotion["promotion_key"])
+            stored = {row["field_key"]: row["field_value"]
+                      for row in self.catalog_canonical_field_provenance
+                      if row["promotion_key"] == key}
+            if stored:
+                variant = next(row for row in self.catalog_model_variants
+                               if row["id"] == next(item["variant_id"]
+                                                    for item in self.catalog_canonical_field_provenance
+                                                    if item["promotion_key"] == key))
+                if stored != requested or variant["canonical_key"] != promotion["canonical_key"] \
+                        or any(row["candidate_id"] != candidate["id"]
+                               for row in self.catalog_canonical_field_provenance
+                               if row["promotion_key"] == key):
+                    raise AppError("CATALOG_PROMOTION_IDEMPOTENCY_CONFLICT",
+                                   "catalog promotion idempotency conflict", 409)
+                return dict(variant)
+
+            # Validate EVERY field before appending ANY row: a promotion is
+            # atomic, so a refusal must leave the canonical catalog exactly as
+            # it was -- including leaving no half-created model.
+            links = {entry["field_key"]: self._check_field_provenance(
+                        run_id, candidate, entry["field_key"], entry["value"],
+                        entry["evidence_link_id"])
+                     for entry in promotion["fields"]}
+
+            model = next((row for row in self.catalog_models
+                          if row["canonical_key"] == promotion["model_canonical_key"]), None)
+            if model is None:
+                model = {"id": str(uuid4()), "manufacturer": promotion["manufacturer"],
+                         "commercial_model": promotion["commercial_model"],
+                         "canonical_key": promotion["model_canonical_key"], "revision": 1,
+                         "created_at": _now(), "updated_at": _now()}
+                self.catalog_models.append(model)
+            if model["manufacturer"] != promotion["manufacturer"] \
+                    or model["commercial_model"] != promotion["commercial_model"]:
+                raise AppError("CATALOG_PROMOTION_MODEL_CONFLICT",
+                               "catalog canonical model identity conflict", 409)
+
+            anchor = links[sorted(links)[0]]
+            variant = next((row for row in self.catalog_model_variants
+                            if row["canonical_key"] == promotion["canonical_key"]), None)
+            if variant is None:
+                variant = {"id": str(uuid4()), "model_id": model["id"],
+                           "promoted_from_candidate_id": candidate["id"],
+                           "promoted_from_verdict_id": anchor["verdict_id"],
+                           "canonical_key": promotion["canonical_key"],
+                           "model_year_start": promotion["model_year_start"],
+                           "model_year_end": promotion["model_year_end"],
+                           "official_model_code": promotion.get("official_model_code"),
+                           "trim": promotion.get("trim"),
+                           "identity_dimensions": dict(promotion.get("identity_dimensions") or {}),
+                           "revision": 1, "created_at": _now()}
+                self.catalog_model_variants.append(variant)
+            for entry in promotion["fields"]:
+                link = links[entry["field_key"]]
+                revision = 1 + max((row["revision"] for row in self.catalog_canonical_field_provenance
+                                    if row["variant_id"] == variant["id"]
+                                    and row["field_key"] == entry["field_key"]), default=0)
+                self.catalog_canonical_field_provenance.append({
+                    "id": str(uuid4()), "model_id": model["id"], "variant_id": variant["id"],
+                    "field_key": entry["field_key"], "field_value": entry["value"],
+                    "revision": revision, "candidate_id": candidate["id"],
+                    "evidence_link_id": link["id"], "snapshot_id": link["snapshot_id"],
+                    "source_id": link["source_id"], "claim_id": link["claim_id"],
+                    "verdict_id": link["verdict_id"], "run_id": str(run_id),
+                    "worker_id": worker_id, "attempt": int(attempt),
+                    "source_version": link["source_version"],
+                    "source_version_kind": link["source_version_kind"],
+                    "record_locator": link["record_locator"], "promotion_key": key,
+                    "created_at": _now()})
+            return dict(variant)
+
+    def get_canonical_catalog_variant(self, canonical_key: str) -> dict[str, Any] | None:
+        """ONE canonical variant's CURRENT state, assembled exactly as the
+        authoritative view assembles it: the HIGHEST revision of every promoted
+        field, never the columns frozen at revision 1."""
+        with self.lock:
+            variant = next((row for row in self.catalog_model_variants
+                            if row["canonical_key"] == str(canonical_key)), None)
+            if variant is None:
+                return None
+            model = next(row for row in self.catalog_models if row["id"] == variant["model_id"])
+            current: dict[str, dict[str, Any]] = {}
+            for row in self.catalog_canonical_field_provenance:
+                if row["variant_id"] != variant["id"]:
+                    continue
+                held = current.get(row["field_key"])
+                if held is None or row["revision"] > held["revision"]:
+                    current[row["field_key"]] = row
+            dimensions = {name[len(CANONICAL_DIMENSION_PREFIX):]: row["field_value"]
+                          for name, row in current.items()
+                          if name.startswith(CANONICAL_DIMENSION_PREFIX)}
+            return {"variant_id": variant["id"], "model_id": model["id"],
+                    "canonical_key": variant["canonical_key"],
+                    "model_canonical_key": model["canonical_key"],
+                    "manufacturer": model["manufacturer"],
+                    "commercial_model": model["commercial_model"],
+                    "promoted_from_candidate_id": variant["promoted_from_candidate_id"],
+                    "promoted_from_verdict_id": variant["promoted_from_verdict_id"],
+                    "model_year_start": current["model_year_start"]["field_value"],
+                    "model_year_end": current["model_year_end"]["field_value"],
+                    "official_model_code": (current["official_model_code"]["field_value"]
+                                            if "official_model_code" in current else None),
+                    "trim": current["trim"]["field_value"] if "trim" in current else None,
+                    "identity_dimensions": dimensions,
+                    "field_revisions": {name: row["revision"] for name, row in current.items()},
+                    "promoted_at": variant["created_at"],
+                    "revised_at": max(row["created_at"] for row in current.values())}
+
+    def list_canonical_field_provenance(self, variant_id: Any, *,
+                                        limit: int = 200) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = [dict(row) for row in self.catalog_canonical_field_provenance
+                    if row["variant_id"] == str(variant_id)]
+        rows.sort(key=lambda row: (row["field_key"], row["revision"]))
+        return rows[:max(1, min(int(limit), 200))]
 
     def _catalog_snapshot_by_id(self, snapshot_id: Any) -> dict[str, Any]:
         snapshot = next((row for row in self.catalog_snapshots.values()

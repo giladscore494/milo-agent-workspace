@@ -3,7 +3,8 @@ from typing import Any, Iterable, Protocol
 from uuid import UUID
 from supabase import create_client
 from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
-                                      prepare_raw_record, prepare_snapshot)
+                                      prepare_promotion, prepare_raw_record,
+                                      prepare_snapshot)
 from backend.config import Settings
 from backend.errors import AppError, NotFoundError
 from backend.runtime import RUN_STATES, InvalidTransition, validate_transition
@@ -80,6 +81,30 @@ class Repository(Protocol):
     def find_active_catalog_snapshot(self, source_family: str, resource_id: str, snapshot_key: str) -> dict[str, Any] | None: ...
     def list_catalog_raw_records(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
     def list_catalog_candidates(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
+
+    # --- bounded database-side catalog aggregation (PR3) ---------------------
+    #
+    # The Python projection reads a whole snapshot and refuses beyond
+    # MAX_PROJECTION_CANDIDATES.  These answer over a snapshot of ANY size by
+    # aggregating in the database: fixed filters, fixed ordering, an explicit
+    # page and the EXACT total, so `has_more` is a fact rather than a guess.
+    # Still reads, so still no lease, and still no SQL, table name, column name
+    # or ordering from a caller.
+    def catalog_candidate_manufacturers(self, snapshot_id: Any, *, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_candidate_models(self, snapshot_id: Any, *, manufacturer: str, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_candidate_model_years(self, snapshot_id: Any, *, manufacturer: str, commercial_model: str, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, official_model_code: str | None = None, trim: str | None = None, identity_dimensions: dict[str, Any] | None = None, status: str | None = None, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_raw_record_by_upstream_id(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None: ...
+
+    # --- field-level canonical promotion (PR3) -------------------------------
+    #
+    # The ONE write path into the canonical catalog.  Lease-guarded like every
+    # other durable worker write, idempotent on a derived promotion key, and
+    # atomic: the canonical identity and EVERY field's provenance are created
+    # in one transaction or not at all.
+    def promote_catalog_variant(self, run_id: UUID, promotion: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def get_canonical_catalog_variant(self, canonical_key: str) -> dict[str, Any] | None: ...
+    def list_canonical_field_provenance(self, variant_id: Any, *, limit: int = 200) -> list[dict[str, Any]]: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -884,6 +909,118 @@ class SupabaseRepository:
             self.client.table("catalog_candidate_variants").select(self.CATALOG_CANDIDATE_COLUMNS)
             .eq("snapshot_id", str(snapshot_id)).order("candidate_key")
             .range(start, start + bounded - 1))
+
+    # --- bounded database-side catalog aggregation (PR3) ---------------------
+    #
+    # Reviewed RPCs, never a client-built query: the filters, the ordering, the
+    # page bound and the exact total all live in
+    # `20260916090000_catalog_bounded_candidate_queries.sql`, so a backend
+    # release cannot widen them and a caller cannot name a column, a table or
+    # an ordering.  The function name is a literal in every case.
+    def _read_rpc(self, function: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Call a bounded READ rpc and return its rows, or fail sanitized.
+
+        Deliberately not `_guarded_rpc`: these take no lease, so a stale-lease
+        classification would be a lie.  PostgREST details can quote SQL values,
+        so the original exception stays an internal cause.
+        """
+        try:
+            data = self.client.rpc(function, params).execute().data
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", "bounded catalog read failed", 502) from exc
+        if data is None:
+            return []
+        if isinstance(data, dict):
+            return [data]
+        return [row for row in data if isinstance(row, dict)]
+
+    MAX_CATALOG_AGGREGATE_ROWS = 200
+
+    def _page_params(self, snapshot_id: Any, limit: int, offset: int,
+                     allow_incomplete: bool) -> dict[str, Any]:
+        return {"p_snapshot_id": str(snapshot_id),
+                "p_limit": max(1, min(int(limit), self.MAX_CATALOG_AGGREGATE_ROWS)),
+                "p_offset": max(0, int(offset)),
+                "p_allow_incomplete": bool(allow_incomplete)}
+
+    def catalog_candidate_manufacturers(self, snapshot_id: Any, *, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        return self._read_rpc("catalog_candidate_manufacturers",
+                              self._page_params(snapshot_id, limit, offset, allow_incomplete))
+
+    def catalog_candidate_models(self, snapshot_id: Any, *, manufacturer: str, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        return self._read_rpc("catalog_candidate_models",
+                              {**self._page_params(snapshot_id, limit, offset, allow_incomplete),
+                               "p_manufacturer": str(manufacturer)})
+
+    def catalog_candidate_model_years(self, snapshot_id: Any, *, manufacturer: str, commercial_model: str, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        return self._read_rpc("catalog_candidate_model_years",
+                              {**self._page_params(snapshot_id, limit, offset, allow_incomplete),
+                               "p_manufacturer": str(manufacturer),
+                               "p_commercial_model": str(commercial_model)})
+
+    def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, official_model_code: str | None = None, trim: str | None = None, identity_dimensions: dict[str, Any] | None = None, status: str | None = None, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        return self._read_rpc("catalog_candidate_variant_page", {
+            **self._page_params(snapshot_id, limit, offset, allow_incomplete),
+            "p_manufacturer": None if manufacturer is None else str(manufacturer),
+            "p_commercial_model": None if commercial_model is None else str(commercial_model),
+            "p_model_year": None if model_year is None else int(model_year),
+            "p_official_model_code": None if official_model_code is None else str(official_model_code),
+            "p_trim": None if trim is None else str(trim),
+            "p_identity_dimensions": dict(identity_dimensions) if identity_dimensions else None,
+            "p_status": None if status is None else str(status)})
+
+    def catalog_raw_record_by_upstream_id(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None:
+        rows = self._read_rpc("catalog_raw_record_by_upstream_id",
+                              {"p_snapshot_id": str(snapshot_id),
+                               "p_upstream_record_id": str(upstream_record_id),
+                               "p_allow_incomplete": bool(allow_incomplete)})
+        return rows[0] if rows else None
+
+    # --- field-level canonical promotion (PR3) -------------------------------
+    #
+    # ONE lease-guarded RPC, exactly like every other durable catalog write.
+    # The canonical identity and every field's provenance are created in ONE
+    # transaction; the database refuses a canonical row whose stated fields are
+    # not all covered by verified field provenance, whichever path wrote it.
+    def promote_catalog_variant(self, run_id: UUID, promotion: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_promotion": prepare_promotion(promotion)}
+        return self._guarded_rpc("promote_catalog_variant_guarded", params, "catalog_promotion")
+
+    CANONICAL_VARIANT_COLUMNS = ("variant_id, model_id, canonical_key, manufacturer, "
+                                 "commercial_model, model_canonical_key, "
+                                 "promoted_from_candidate_id, promoted_from_verdict_id, "
+                                 "model_year_start, model_year_end, official_model_code, "
+                                 "trim, identity_dimensions, field_revisions, "
+                                 "promoted_at, revised_at")
+    CANONICAL_PROVENANCE_COLUMNS = ("id, model_id, variant_id, field_key, field_value, "
+                                    "revision, candidate_id, evidence_link_id, snapshot_id, "
+                                    "source_id, claim_id, verdict_id, run_id, worker_id, "
+                                    "attempt, source_version, source_version_kind, "
+                                    "record_locator, promotion_key, created_at")
+    MAX_CANONICAL_PROVENANCE_ROWS = 200
+
+    def get_canonical_catalog_variant(self, canonical_key: str) -> dict[str, Any] | None:
+        """ONE canonical variant's CURRENT state, from the authoritative view.
+
+        `catalog_canonical_variant_current` is what "the current canonical
+        value" means: it is assembled from the append-only field provenance, so
+        a later revision of one field is visible here without any canonical row
+        ever having been rewritten."""
+        rows = self._many(
+            self.client.table("catalog_canonical_variant_current")
+            .select(self.CANONICAL_VARIANT_COLUMNS)
+            .eq("canonical_key", str(canonical_key)).limit(1))
+        return rows[0] if rows else None
+
+    def list_canonical_field_provenance(self, variant_id: Any, *, limit: int = MAX_CANONICAL_PROVENANCE_ROWS) -> list[dict[str, Any]]:
+        """Every promoted fact of one canonical variant, oldest revision first."""
+        bounded = max(1, min(int(limit), self.MAX_CANONICAL_PROVENANCE_ROWS))
+        return self._many(
+            self.client.table("catalog_canonical_field_provenance")
+            .select(self.CANONICAL_PROVENANCE_COLUMNS)
+            .eq("variant_id", str(variant_id))
+            .order("field_key").order("revision").limit(bounded))
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_resolution": resolution}

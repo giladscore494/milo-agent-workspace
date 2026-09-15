@@ -1199,14 +1199,27 @@ def test_the_production_tool_registry_is_still_empty():
         assert not hasattr(GovernmentCatalogProjection, attribute)
 
 
-def test_nothing_outside_the_package_and_its_tests_imports_it_yet():
-    """PR2 builds the capability; PR3 connects it."""
-    # `backend/testing/r5_proof/government.py` reads the shared code/label
-    # vocabulary, which is the point of moving it: ONE definition of what a
-    # register code means, selected down to the subset R5 reviewed.
-    allowed = {"backend/catalog/government", "backend/testing/government_capture.py",
-               "backend/testing/r5_proof/government.py",
-               "tests/test_catalog_government_ingestion.py"}
+def test_only_the_reviewed_pr3_seams_import_the_government_package():
+    """PR2 built the capability; Catalog PR3 connects it -- at NAMED seams.
+
+    PR2 asserted here that nothing outside the package imported it at all.
+    PR3 makes that false on purpose, so the assertion becomes the list of
+    places it is now reachable from -- and stays a test failure if a sixth
+    module starts importing the Government catalog without a reviewer noticing.
+
+    `backend/testing/r5_proof/government.py` reads the shared code/label
+    vocabulary, which is the point of moving it: ONE definition of what a
+    register code means, selected down to the subset R5 reviewed.
+    """
+    allowed = {
+        "backend/catalog/government",
+        "backend/testing/government_capture.py",
+        "backend/testing/r5_proof/government.py",
+        # PR3: the Tool that exposes the reviewed query layer, and the worker
+        # wiring that registers it. Nothing else in `backend/` may reach it.
+        "backend/tools/government_vehicle.py",
+        "backend/worker/main.py",
+    }
     for path in sorted(Path("backend").rglob("*.py")):
         text = str(path)
         if any(text.startswith(prefix) for prefix in allowed):
