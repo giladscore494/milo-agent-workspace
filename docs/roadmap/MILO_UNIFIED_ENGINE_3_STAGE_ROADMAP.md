@@ -541,9 +541,46 @@ Done כאשר: פרויקט עם workflow_key=swarm_v2 מסיים Run במצב c
 >
 > | PR | Scope | State |
 > | --- | --- | --- |
-> | **Catalog PR1** | Persistence only: the versioned schema, the guarded write paths, RLS/ACL, and an empty canonical catalog. No ingestion, no HTTP, no tool, no promotion. | this PR |
-> | **Catalog PR2** | Government ingestion into that schema: the read-only `data.gov.il` path that fills snapshots, raw records and candidates. | next |
+> | **Catalog PR1** | Persistence only: the versioned schema, the guarded write paths, RLS/ACL, and an empty canonical catalog. No ingestion, no HTTP, no tool, no promotion. | merged (#85, corrected by #86) |
+> | **Catalog PR2** | Government ingestion into that schema: the read-only `data.gov.il` path that fills snapshots, raw records and candidates. | this PR |
 > | **Catalog PR3** | Connect the capability to Swarm V2 and add controlled canonical promotion, gated on verified evidence. | after PR2 |
+>
+> **What Catalog PR2 delivers, exactly.** A bounded, deterministic, read-only
+> capture path (`backend/catalog/government/`) from the CKAN Action/DataStore
+> API into the relations PR1 established: immutable source snapshots,
+> append-only raw records, and candidate variants. Every durable write goes
+> through PR1's existing lease-guarded repository methods; every candidate
+> traces to its snapshot, resource id, upstream `_id`, source version, raw
+> record and the exact page and index it was captured at.
+>
+> **What Catalog PR2 deliberately does NOT do.** It writes no canonical row —
+> `catalog_models` and `catalog_model_variants` are still empty and still
+> unwritable by every role. It creates no claim, no verdict and no evidence
+> link: PR2 provenance is snapshot → raw record → candidate, and evidence
+> mapping plus verdict-backed promotion are PR3's. It registers **no Tool** —
+> the production `ToolRegistry` is untouched and still empty, and
+> `backend/catalog/government/projection.py` is an internal service/query
+> component rather than a `Tool`. It changes no Commander or Worker routing, no
+> model prompt and no Frontend, and **no production sync has been activated**:
+> no production entrypoint constructs a transport, so nothing can reach the
+> network on this path.
+>
+> **The old JSON remains an unverified `legacy_reference`.** PR2 imports none
+> of it, seeds none of it, and adds no code that reads it. The canonical
+> catalog still starts empty.
+>
+> **Source-field authority is field-specific.** The register is the anchor for
+> existence, model year, official model code, trim and the coded identity
+> dimensions it publishes; it is not authority for a field whose semantics it
+> does not define. `koah_sus` is captured and deliberately never mapped to
+> horsepower, and nor are `dg_metach_solela`, `mishkal_kolel`, `automatic_ind`
+> or `sug_degem` — each with a reviewer's reason recorded in code.
+>
+> **PR2 does not prove complete production coverage of Israel.** Its tests run
+> against the committed R5 capture of one bounded query (`q=RAV4`, 233 rows of
+> the WLTP resource). The production code is generic enough for bounded
+> complete pagination of a whole resource, and that has not been executed
+> against the live service from this repository.
 >
 > What Stage 2 below still describes correctly: the bounded query surface, the
 > refusal to stream the whole catalog into a model, and the
@@ -797,6 +834,21 @@ Done כאשר: MILO מסוגל לקרוא, להשוות ולהציע/להחיל 
 > into the relations Catalog PR1 established — it does not patch an existing
 > aggregated JSON. MILO never writes to `data.gov.il` and holds no credential
 > for it. That ingestion is **Catalog PR2**; Catalog PR1 added persistence only.
+>
+> **Catalog PR2 has now built that ingestion.** §3.1 and §3.2 below are
+> delivered: `DataGovClient` is the bounded CKAN reader, and snapshots, raw
+> records and candidates land in PR1's relations. §3.3 is delivered
+> DIFFERENTLY from the text below, and the text below is superseded on that
+> point: there are **no** `government_vehicle_model_years` /
+> `government_vehicle_variants` tables and no parallel Government snapshot
+> database. A Government-specific set of normalized tables is exactly the
+> duplicate persistence model the three-PR decision removed, so normalization
+> writes `catalog_candidate_variants` and the `manufacturer → model → years →
+> variants` tree is reconstructed by a deterministic internal query layer over
+> active snapshots. §3.4 (`GovernmentVehicleTool`), §3.5 (crosswalk), §3.6
+> (evidence/provenance), §3.7 (Commander policy), §3.8 (end-to-end) and §3.9
+> (refresh/diff as a scheduled operation) remain **PR3 and later**; PR2
+> registers no tool and connects nothing to Swarm V2.
 
 
 <table>
