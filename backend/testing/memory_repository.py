@@ -11,11 +11,19 @@ from __future__ import annotations
 import threading
 import secrets
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
                                        stated_identity_dimensions, trust_state_for)
+from backend.catalog.digest import catalog_payload_digest
+from backend.engines.swarm_v2.evidence_bounds import FRAGMENT_TYPES
+from backend.engines.swarm_v2.evidence_contracts import (fragment_type_for,
+                                                         parse_locator_key)
+from backend.engines.swarm_v2.fragments import fragment_content_hash
+from backend.engines.swarm_v2.support import VERIFICATION_MODES, VERIFIER_CONTRACT_VERSION
+from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
+                                      prepare_raw_record, prepare_snapshot)
 from backend.errors import AppError, NotFoundError
 from backend.runtime import RUN_STATES, InvalidTransition, validate_transition
 from backend.schemas import normalize_conversation_title
@@ -23,6 +31,24 @@ from backend.schemas import normalize_conversation_title
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _support_set(support: Any) -> frozenset[tuple[str, Any, Any]]:
+    """A verdict's durable support as the SET PostgreSQL actually stores.
+
+    `claim_verdict_supports` holds one relational row per cited fragment,
+    unique on `(verdict_id, fragment_id)` and carrying the fragment's own
+    `content_hash` and `locator_key`. So the identity of a verdict's support
+    is the SET of those triples: input order is not part of it, and one
+    fragment cited twice is one row, never two.
+
+    Collapsing to a set is therefore the comparison, and the CARDINALITY of
+    the incoming list is checked separately by the caller -- a list that
+    shrinks when it becomes a set was never a valid citation.
+    """
+    return frozenset((str(link.get("fragment_id")), link.get("content_hash"),
+                      link.get("locator_key"))
+                     for link in (support or []) if isinstance(link, Mapping))
 
 
 class MemoryRepository:
@@ -38,6 +64,11 @@ class MemoryRepository:
         self.proposals: dict[str, dict[str, Any]] = {}
         self.invocations: list[dict[str, Any]] = []
         self.tool_rows: list[dict[str, Any]] = []
+        # Evidence row id -> what KIND of evidence row it is. Kept beside the
+        # rows rather than inside them so a row's shape stays exactly what the
+        # caller wrote, while a typed lookup can still refuse a source that is
+        # being passed off as a claim.
+        self.evidence_kinds: dict[str, str] = {}
         # The durable catalog namespace (PR1). Keyed by the same idempotency
         # identities the guarded RPCs use, so a replay collapses here exactly
         # as it does in PostgreSQL.
@@ -418,10 +449,48 @@ class MemoryRepository:
                     return dict(settled)
             raise NotFoundError("model_call_budget_reservation", reservation_id)
 
-    def _tool_row(self, run_id: UUID, payload: dict[str, Any]) -> dict[str, Any]:
+    def _tool_row(self, run_id: UUID, payload: dict[str, Any],
+                  kind: str | None = None) -> dict[str, Any]:
+        """Append one evidence row, recording WHAT KIND of row it is.
+
+        Every evidence row shares `tool_rows`, so without a recorded type a
+        lookup could only check an id and a run -- and a source id would then
+        pass as a claim id, and a claim id as a verdict id. The type is kept in
+        a side table rather than inside the row so the row's shape stays
+        exactly what a caller wrote, and a row written with no kind is
+        untyped: it can never satisfy a typed lookup.
+        """
         row = {"id": str(uuid4()), "run_id": str(run_id), **payload}
         self.tool_rows.append(row)
+        if kind is not None:
+            self.evidence_kinds[row["id"]] = kind
         return dict(row)
+
+    def _evidence_lease(self, run_id: UUID, worker_id: str | None, attempt: int | None,
+                        lease_token: str | None) -> None:
+        """Hold a durable evidence write to the same lease its RPC requires.
+
+        The PostgreSQL counterparts all call `assert_worker_lease` first, and
+        its four arguments are NOT optional there, so a wrong worker, a
+        superseded attempt, a wrong token or an expired lease writes nothing.
+
+        FAIL CLOSED ON AN ABSENT VALUE. `_assert_active_lease` skips whichever
+        component is `None` -- that is deliberate for the older call paths that
+        legitimately pass none -- so handing it a missing value here would turn
+        "no lease" into "no check", which is how an earlier round of this branch
+        let a leaseless write succeed. A durable evidence write states all three
+        or writes nothing.
+        """
+        missing = [name for name, value in (("worker_id", worker_id), ("attempt", attempt),
+                                            ("lease_token", lease_token))
+                   if value is None or (isinstance(value, str) and not value.strip())]
+        if missing:
+            raise AppError("RUN_TRANSITION_CONFLICT",
+                           "a durable evidence write requires a complete worker lease", 409)
+        run = self.runs.get(str(run_id))
+        if run is None:
+            raise NotFoundError("run", str(run_id))
+        self._assert_active_lease(run, worker_id, attempt, lease_token)
 
     def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]:
         return self._tool_row(run_id, request)
@@ -429,27 +498,333 @@ class MemoryRepository:
     def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]:
         return self._tool_row(run_id, grant)
 
-    def create_tool_usage(self, run_id: UUID, usage: dict[str, Any]) -> dict[str, Any]:
-        return self._tool_row(run_id, usage)
+    def create_tool_usage(self, run_id: UUID, usage: dict[str, Any], **lease: Any) -> dict[str, Any]:
+        # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the
+        # lease contract and many callers pass none. A lease that IS supplied
+        # is enforced completely -- partial is refused like any other -- but an
+        # omitted one is still permitted here, unlike the three durable
+        # evidence writers above.
+        if lease:
+            self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
+                                 lease.get("lease_token"))
+        return self._tool_row(run_id, usage, kind="tool_usage")
 
-    def create_source(self, run_id: UUID, source: dict[str, Any]) -> dict[str, Any]:
-        return self._tool_row(run_id, source)
+    def create_source(self, run_id: UUID, source: dict[str, Any], **lease: Any) -> dict[str, Any]:
+        # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the
+        # lease contract and many callers pass none. A lease that IS supplied
+        # is enforced completely -- partial is refused like any other -- but an
+        # omitted one is still permitted here, unlike the three durable
+        # evidence writers above.
+        if lease:
+            self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
+                                 lease.get("lease_token"))
+        return self._tool_row(run_id, source, kind="source")
 
-    def create_claim(self, run_id: UUID, claim: dict[str, Any]) -> dict[str, Any]:
-        return self._tool_row(run_id, claim)
+    def create_claim(self, run_id: UUID, claim: dict[str, Any], **lease: Any) -> dict[str, Any]:
+        # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the
+        # lease contract and many callers pass none. A lease that IS supplied
+        # is enforced completely -- partial is refused like any other -- but an
+        # omitted one is still permitted here, unlike the three durable
+        # evidence writers above.
+        if lease:
+            self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
+                                 lease.get("lease_token"))
+        return self._tool_row(run_id, claim, kind="claim")
 
-    def create_conflict(self, run_id: UUID, conflict: dict[str, Any]) -> dict[str, Any]:
-        return self._tool_row(run_id, conflict)
+    def create_conflict(self, run_id: UUID, conflict: dict[str, Any], **lease: Any) -> dict[str, Any]:
+        # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the
+        # lease contract and many callers pass none. A lease that IS supplied
+        # is enforced completely -- partial is refused like any other -- but an
+        # omitted one is still permitted here, unlike the three durable
+        # evidence writers above.
+        if lease:
+            self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
+                                 lease.get("lease_token"))
+        return self._tool_row(run_id, conflict, kind="conflict")
 
-    # --- durable catalog staging (PR1) ---------------------------------------
+    # The Repository protocol declares these three, and their absence was
+    # itself a parity gap: a test could not build a real verdict to cite, so a
+    # catalog test had no choice but to invent a uuid for one. They are
+    # lease-guarded here exactly as their RPCs are.
+    def record_evidence_fragment(self, run_id: UUID, fragment: dict[str, Any], *,
+                                 worker_id: str, attempt: int,
+                                 lease_token: str) -> dict[str, Any]:
+        """One focused fragment, held to `record_evidence_fragment_guarded`'s rules.
+
+        Mirrored here because the catalog link path depends on them: a fragment
+        is what a verdict's support link names, so a fragment that could not
+        exist in PostgreSQL would make every verdict citing it meaningless.
+        """
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
+        key = self._require_evidence_key(fragment, "EVIDENCE_FRAGMENT")
+        task = fragment.get("task_key")
+        if not task:
+            raise AppError("EVIDENCE_FRAGMENT_INVALID",
+                           "invalid evidence fragment: evidence_key and task_key are required",
+                           400)
+        source = self._typed_evidence_row(fragment.get("source_id"), run_id, "source",
+                                          "EVIDENCE_FRAGMENT", "evidence fragment source")
+        # Task provenance: a fragment may only be attributed to the task that
+        # captured its source. Belonging to the same run is not enough.
+        if source.get("task_key") != task:
+            raise AppError("EVIDENCE_FRAGMENT_TASK",
+                           "evidence fragment task provenance mismatch", 400)
+        # A FOCUSED fragment states a type and a locator that agree, or states
+        # neither. `r3_focus_valid` pairs a `record_field` locator with a
+        # `structured_projection` and a `document_span` with a
+        # `verbatim_excerpt`, and nothing else.
+        fragment_type = fragment.get("fragment_type")
+        locator = fragment.get("locator_key")
+        if (fragment_type is None) != (locator is None):
+            raise AppError("EVIDENCE_FRAGMENT_FOCUS",
+                           "invalid evidence fragment: a focused fragment requires both a "
+                           "type and a locator", 400)
+        if fragment_type is not None:
+            if fragment_type not in FRAGMENT_TYPES:
+                raise AppError("EVIDENCE_FRAGMENT_FOCUS",
+                               "invalid evidence fragment: unknown fragment type", 400)
+            # The pairing rule is the contract module's own, not a copy: a
+            # non-canonical locator raises here rather than resolving to a kind.
+            try:
+                expected = fragment_type_for(parse_locator_key(locator))
+            except Exception:
+                raise AppError("EVIDENCE_FRAGMENT_FOCUS",
+                               "invalid evidence fragment: locator is not a canonical "
+                               "bounded location", 400) from None
+            if expected != fragment_type:
+                raise AppError("EVIDENCE_FRAGMENT_FOCUS",
+                               "invalid evidence fragment: fragment type does not match the "
+                               "locator kind", 400)
+        text = fragment.get("fragment_text")
+        if not text or not str(text).strip():
+            raise AppError("EVIDENCE_FRAGMENT_INVALID",
+                           "invalid evidence fragment: fragment_text must not be empty", 400)
+        if fragment.get("content_hash") != fragment_content_hash(text):
+            raise AppError("EVIDENCE_FRAGMENT_HASH",
+                           "invalid evidence fragment: content hash does not match the "
+                           "bounded text", 400)
+        return self._replayable_evidence_row(run_id, key, fragment, "evidence_fragment",
+                                             ("source_id", "task_key", "fragment_text",
+                                              "content_hash", "fragment_type", "locator_key"),
+                                             "EVIDENCE_FRAGMENT")
+
+    def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any], *,
+                             worker_id: str, attempt: int,
+                             lease_token: str) -> dict[str, Any]:
+        """One verdict, held to the support contract `record_claim_verdict_guarded` applies.
+
+        The rule that matters most here: **an accepted verdict must cite
+        durable evidence**. PR #86's memory implementation accepted a
+        `verified` verdict with no support at all, and its own catalog fixture
+        built exactly such a verdict -- so the catalog tests were citing
+        something PostgreSQL would have refused to create.
+
+        THE REPLAY IDENTITY IS THE WHOLE VERDICT, SUPPORT INCLUDED. An earlier
+        round compared only `(claim_id, verdict, verification_mode,
+        verifier_contract_version)`, so the same evidence key could be replayed
+        with a different stated `reason`, or with evidence added, removed or
+        swapped, and quietly return the stored row. PostgreSQL compares the
+        reason too, and holds the stored support set to the cited one.
+
+        SUPPORT IS A SET, NOT A SEQUENCE. PostgreSQL stores support as rows
+        unique on `(verdict_id, fragment_id)`, so input ORDER is not identity
+        -- membership and cardinality are. The same links in a different order
+        replay onto the same row; a repeated link cites one fragment and can
+        never produce two stored rows, so it is refused.
+
+        NOTHING IS WRITTEN UNTIL EVERY CHECK HAS PASSED. The lease, the
+        vocabulary, the lineage of each cited link, the set cardinality and the
+        replay comparison all run before the row is appended, so a refused call
+        -- first write or replay -- leaves the stored verdict and its support
+        exactly as they were.
+        """
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
+        key = self._require_evidence_key(verdict, "CLAIM_VERDICT")
+        # HOW a verdict was reached and under WHICH contract are part of it.
+        if verdict.get("verification_mode") not in VERIFICATION_MODES:
+            raise AppError("CLAIM_VERDICT_INVALID",
+                           "invalid claim verdict: unknown verification mode", 400)
+        if verdict.get("verifier_contract_version") != VERIFIER_CONTRACT_VERSION:
+            raise AppError("CLAIM_VERDICT_CONTRACT",
+                           "invalid claim verdict: unknown verifier contract version", 400)
+        if verdict.get("verdict") not in ("verified", "needs_review", "rejected"):
+            raise AppError("CLAIM_VERDICT_INVALID",
+                           "invalid claim verdict: unknown verdict", 400)
+        # A MISSING `support` key means "cites nothing"; a SUPPLIED one must be
+        # a JSON array. `verdict.get("support") or []` conflated the two: every
+        # falsy value -- `null`, `{}`, `""`, `0`, `false` -- became an empty
+        # list, so the type check below could never fire and the junk value was
+        # stored verbatim in the row.
+        #
+        # PostgreSQL keeps the two apart, and not by convention:
+        # `p_verdict->'support'` is SQL NULL only when the KEY IS ABSENT, so
+        # `coalesce(..., '[]'::jsonb)` substitutes an empty array there alone,
+        # while a supplied JSON `null` is `'null'::jsonb` -- not SQL NULL --
+        # and reaches `jsonb_typeof(v_support) <> 'array'`.
+        support = verdict["support"] if "support" in verdict else []
+        if not isinstance(support, list):
+            raise AppError("CLAIM_VERDICT_INVALID",
+                           "invalid claim verdict: support must be an array", 400)
+        if len(support) > 4:
+            raise AppError("CLAIM_VERDICT_INVALID",
+                           "claim verdict cites more evidence than a source can hold", 400)
+        claim = self._typed_evidence_row(verdict.get("claim_id"), run_id, "claim",
+                                         "CLAIM_VERDICT", "claim")
+        # A locally settled verdict compares no evidence, so it may cite none.
+        # With the rule below, this also makes `verified` + `deterministic_local`
+        # unreachable from either side: local permits no support, and an
+        # accepted verdict requires it.
+        if verdict.get("verification_mode") == "deterministic_local" and support:
+            raise AppError("CLAIM_VERDICT_LOCAL_SUPPORT",
+                           "a locally settled verdict cites no evidence", 400)
+        if verdict.get("verdict") == "verified" and not support:
+            raise AppError("CLAIM_VERDICT_UNSUPPORTED",
+                           "an accepted verdict must cite durable evidence", 400)
+        for link in support:
+            if not isinstance(link, dict):
+                raise AppError("CLAIM_VERDICT_INVALID",
+                               "invalid claim verdict: support must be an array", 400)
+            # A support link naming no durable fragment of this run is forged.
+            fragment = self._typed_evidence_row(link.get("fragment_id"), run_id,
+                                                "evidence_fragment", "CLAIM_VERDICT",
+                                                "support link")
+            # The lineage: the evidence must belong to the claim's own source.
+            if str(fragment.get("source_id")) != str(claim.get("source_id")):
+                raise AppError("CLAIM_VERDICT_SUPPORT_SOURCE",
+                               "verdict support link belongs to another source", 400)
+            if fragment.get("content_hash") != link.get("content_hash"):
+                raise AppError("CLAIM_VERDICT_SUPPORT_HASH",
+                               "verdict support link content hash mismatch", 400)
+            if fragment.get("locator_key") != link.get("locator_key"):
+                raise AppError("CLAIM_VERDICT_SUPPORT_LOCATOR",
+                               "verdict support link locator mismatch", 400)
+        # Support is a SET: a list naming one fragment twice cites one fragment,
+        # so it could never become two rows unique on (verdict_id, fragment_id).
+        if len(_support_set(support)) != len(support):
+            raise AppError("CLAIM_VERDICT_SUPPORT_SET",
+                           "verdict support links do not match the cited evidence", 400)
+        return self._replayable_evidence_row(run_id, key, verdict, "claim_verdict",
+                                             ("claim_id", "verdict", "reason",
+                                              "verification_mode",
+                                              "verifier_contract_version", "support"),
+                                             "CLAIM_VERDICT",
+                                             normalizers={"support": _support_set},
+                                             messages={"support": "verdict support links "
+                                                       "do not match the cited evidence"})
+
+    def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *,
+                                   worker_id: str, attempt: int,
+                                   lease_token: str) -> dict[str, Any]:
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
+        return self._tool_row(run_id, resolution, kind="conflict_resolution")
+
+    @staticmethod
+    def _require_evidence_key(payload: Mapping[str, Any], code: str) -> str:
+        """The stable replay identity every durable evidence row must carry."""
+        key = payload.get("evidence_key")
+        if not key or not str(key).strip():
+            raise AppError(f"{code}_INVALID",
+                           "invalid durable evidence: evidence_key is required", 400)
+        return str(key)
+
+    def _replayable_evidence_row(self, run_id: UUID, key: str, payload: dict[str, Any],
+                                 kind: str, identity: tuple[str, ...],
+                                 code: str, *,
+                                 normalizers: Mapping[str, Any] | None = None,
+                                 messages: Mapping[str, str] | None = None,
+                                 ) -> dict[str, Any]:
+        """Return the existing row for an exact replay, or fail closed.
+
+        `(run_id, evidence_key)` is the replay identity in PostgreSQL, so a
+        retry of the same logical row collapses onto it and a reuse of the key
+        for different content is a conflict -- never a second row and never a
+        silent overwrite.
+        """
+        normalizers = normalizers or {}
+        messages = messages or {}
+        existing = next((row for row in self.tool_rows
+                         if str(row.get("run_id")) == str(run_id)
+                         and row.get("evidence_key") == key
+                         and self.evidence_kinds.get(str(row.get("id"))) == kind), None)
+        if existing is None:
+            return self._tool_row(run_id, payload, kind=kind)
+        for field in identity:
+            # A normalized field is compared by VALUE, not by representation:
+            # a verdict's support is a set of relational rows in PostgreSQL, so
+            # the same links in a different order are the same support.
+            normalize = normalizers.get(field)
+            stored, cited = existing.get(field), payload.get(field)
+            if normalize is not None:
+                stored, cited = normalize(stored), normalize(cited)
+            if stored != cited:
+                raise AppError(f"{code}_IDEMPOTENCY_CONFLICT",
+                               messages.get(field,
+                                            f"{kind.replace('_', ' ')} idempotency conflict"),
+                               409)
+        return dict(existing)
+
+    def _typed_evidence_row(self, row_id: Any, run_id: UUID, kind: str,
+                            code: str, label: str) -> dict[str, Any]:
+        """One evidence row of THIS run AND of this exact kind, or fail closed.
+
+        The type check is the point: `tool_rows` holds sources, claims,
+        fragments, verdicts and resolutions together, so an id-and-run lookup
+        alone would let a source stand in for a claim.
+        """
+        row = next((item for item in self.tool_rows
+                    if str(item.get("id")) == str(row_id)
+                    and str(item.get("run_id")) == str(run_id)
+                    and self.evidence_kinds.get(str(item.get("id"))) == kind), None)
+        if row is None:
+            raise AppError(f"{code}_INVALID", f"invalid {label}", 400)
+        return row
+
+    # --- durable catalog staging --------------------------------------------
     #
-    # These mirror the guarded RPCs of
-    # `20260914200000_catalog_evidence_foundation.sql`, and mirror the parts
-    # that MATTER for a test to be meaningful: the lease guard, the
-    # idempotency identity, the fail-closed replay conflict, the activation
-    # gate, and the cross-run / cross-snapshot / unverified-source refusals. A
-    # mirror that accepted everything would let a unit test pass against
-    # behavior PostgreSQL rejects.
+    # These mirror the guarded RPCs of the catalog migrations, and they mirror
+    # the parts that MATTER for a test to be meaningful: the lease guard, the
+    # derived identity keys and payload digest, the referential provenance
+    # checks, the fail-closed replay conflict, the snapshot lifecycle and the
+    # cross-run / cross-snapshot / unverified-source refusals.
+    #
+    # The identity keys and the payload rules come from the SAME
+    # `backend.catalog.payloads` preparers the Supabase repository uses, and
+    # every rejection below has a counterpart proven against real PostgreSQL in
+    # `tests/test_migrations_postgres.py`. A mirror that accepted what
+    # PostgreSQL rejects would let a unit test pass against behaviour the
+    # database refuses -- which is what the PR1 round did.
+    #
+    # WHAT THIS IS NOT. This is a mirror of the rules these catalog and
+    # evidence paths depend on, enumerated and tested one by one -- not a
+    # reimplementation of PostgreSQL. It does not reproduce every R3/R4
+    # validation (fragment size and count bounds, the credential/reasoning
+    # marker screens, canonical scope hashing, conflict grouping), and the
+    # older `create_*` evidence writers enforce a lease only when one is passed,
+    # because their signatures predate the lease contract. Read the tests for
+    # what is actually established; do not read this class as a claim that
+    # anything PostgreSQL refuses is refused here.
+    #
+    # HOW FAR REPLAY PARITY GOES. It is established, case by case against the
+    # real RPCs, for the DURABLE EVIDENCE WRITERS ONLY:
+    #
+    #   * `record_claim_verdict` -- the full replay identity (claim, verdict,
+    #     reason, mode, contract version) and the durable support set, as a
+    #     set: see `tests/test_catalog_persistence.py` section 4, paired with
+    #     `test_the_verdict_replay_contract_is_the_databases_own`;
+    #   * `record_evidence_fragment` and the catalog writers -- `(run_id,
+    #     evidence_key)` / the catalog identity keys, each with a counterpart
+    #     PostgreSQL test.
+    #
+    # It is NOT claimed for `create_source`, `create_claim`, `create_conflict`
+    # or `create_tool_usage`, whose replay behaviour is untested here and
+    # unchanged.
+    #
+    # One rule is deliberately absent from `record_claim_verdict` because it is
+    # unreachable, not because it is unenforced: PostgreSQL re-checks each
+    # support link's `task_key` against the cited source's. Here
+    # `record_evidence_fragment` already refuses a fragment whose task differs
+    # from its own source's, so a fragment of the claim's source always carries
+    # that source's task.
 
     _CATALOG_SNAPSHOT_IDENTITY = ("source_family", "resource_id", "upstream_version",
                                   "upstream_version_kind", "content_sha256",
@@ -467,8 +842,31 @@ class MemoryRepository:
             raise NotFoundError("run", str(run_id))
         self._assert_active_lease(run, worker_id, attempt, lease_token)
 
+    #: What kind of evidence row each catalog link field must name.
+    _CATALOG_LINK_ROW_KINDS = {"SOURCE": "source", "CLAIM": "claim",
+                               "VERDICT": "claim_verdict"}
+
+    def _catalog_evidence_row(self, row_id: Any, run_id: UUID, kind: str) -> dict[str, Any]:
+        """One evidence row of THIS run AND of the right KIND, or fail closed.
+
+        No arbitrary uuid ever stands in for evidence, and no row of the wrong
+        type does either: PostgreSQL reads `public.sources`, `public.claims`
+        and `public.claim_verdicts` as separate relations, so a source id
+        simply cannot resolve as a claim there. Checking only id and run here
+        -- which is what this did before -- let exactly that through.
+        """
+        row = next((item for item in self.tool_rows
+                    if str(item.get("id")) == str(row_id)
+                    and str(item.get("run_id")) == str(run_id)
+                    and self.evidence_kinds.get(str(item.get("id")))
+                    == self._CATALOG_LINK_ROW_KINDS[kind]), None)
+        if row is None:
+            raise AppError(f"CATALOG_LINK_{kind}_INVALID",
+                           f"invalid catalog evidence link {kind.lower()}", 400)
+        return row
+
     @staticmethod
-    def _catalog_replay(existing: dict[str, Any], incoming: dict[str, Any],
+    def _catalog_replay(existing: dict[str, Any], incoming: Mapping[str, Any],
                         identity: tuple[str, ...], kind: str) -> dict[str, Any]:
         """Return the existing row for an exact replay, or fail closed.
 
@@ -485,6 +883,7 @@ class MemoryRepository:
                                 worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
+            snapshot = prepare_snapshot(snapshot)
             family = snapshot.get("source_family")
             if family not in CATALOG_SOURCE_FAMILIES:
                 raise AppError("CATALOG_SNAPSHOT_INVALID", "unknown catalog source family", 400)
@@ -494,16 +893,21 @@ class MemoryRepository:
             if snapshot.get("trust_state") not in (None, trust):
                 raise AppError("CATALOG_SNAPSHOT_INVALID",
                                "catalog trust state is pinned to the source family", 400)
-            if "activated_at" in snapshot or "stored_record_count" in snapshot:
-                raise AppError("CATALOG_SNAPSHOT_INVALID",
-                               "catalog snapshot activation is not a caller-supplied field", 400)
-            key = snapshot.get("snapshot_key")
-            if not key:
-                raise AppError("CATALOG_SNAPSHOT_INVALID", "catalog snapshot key is required", 400)
+            key = snapshot["snapshot_key"]
             existing = self.catalog_snapshots.get(key)
             if existing is not None:
                 return self._catalog_replay(existing, snapshot,
                                             self._CATALOG_SNAPSHOT_IDENTITY, "SNAPSHOT")
+            # Natural uniqueness: a rename cannot duplicate a retrieval.
+            natural = tuple(snapshot.get(field) for field in
+                            ("source_family", "resource_id", "upstream_version_kind",
+                             "upstream_version", "content_sha256"))
+            if any(tuple(row.get(field) for field in
+                         ("source_family", "resource_id", "upstream_version_kind",
+                          "upstream_version", "content_sha256")) == natural
+                   for row in self.catalog_snapshots.values()):
+                raise AppError("CATALOG_SNAPSHOT_DUPLICATE",
+                               "catalog_source_snapshots_natural_uidx", 409)
             row = {"id": str(uuid4()), "created_by_run_id": str(run_id), "trust_state": trust,
                    "validation_state": snapshot.get("validation_state", "pending"),
                    "stored_record_count": 0, "activated_at": None,
@@ -514,20 +918,38 @@ class MemoryRepository:
             self.catalog_snapshots[key] = row
             return dict(row)
 
+    def _catalog_owned_snapshot(self, snapshot_id: Any, run_id: UUID) -> dict[str, Any]:
+        """The snapshot this run opened, or fail closed.
+
+        A snapshot belongs to the run that opened it: holding SOME valid lease
+        is not enough to fill or decide another run's capture.
+        """
+        snapshot = self._catalog_snapshot_by_id(snapshot_id)
+        if snapshot["created_by_run_id"] != str(run_id):
+            raise AppError("CATALOG_SNAPSHOT_NOT_OWNED",
+                           "this catalog snapshot does not belong to this run", 409)
+        return snapshot
+
     def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *,
                                   worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
-            snapshot = self._catalog_snapshot_by_id(record.get("snapshot_id"))
+            record = prepare_raw_record(record)
+            snapshot = self._catalog_owned_snapshot(record.get("snapshot_id"), run_id)
+            # Both decided states are terminal.
+            if snapshot["validation_state"] == "failed":
+                raise AppError("CATALOG_SNAPSHOT_FAILED",
+                               "a failed catalog snapshot is terminal", 409)
             if snapshot["activated_at"] is not None:
                 raise AppError("CATALOG_SNAPSHOT_ACTIVE",
                                "an active catalog snapshot is immutable", 409)
             if record.get("resource_id") != snapshot["resource_id"]:
                 raise AppError("CATALOG_RECORD_INVALID",
                                "catalog raw record resource mismatch", 400)
-            key = (snapshot["id"], record.get("record_key") or "")
-            if not key[1]:
-                raise AppError("CATALOG_RECORD_INVALID", "catalog record key is required", 400)
+            # The digest is derived from the stored payload, exactly as the
+            # database derives it -- never predicted by the caller.
+            record = {**record, "payload_sha256": catalog_payload_digest(record["payload"])}
+            key = (snapshot["id"], record["record_key"])
             existing = self.catalog_raw_records.get(key)
             if existing is not None:
                 return self._catalog_replay(existing, record,
@@ -544,15 +966,22 @@ class MemoryRepository:
                                   worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
-            snapshot = self._catalog_snapshot_by_id(activation.get("snapshot_id"))
+            snapshot = self._catalog_owned_snapshot(activation.get("snapshot_id"), run_id)
             state = activation.get("validation_state") or "complete"
             if state not in ("complete", "failed"):
                 raise AppError("CATALOG_SNAPSHOT_INVALID",
                                "invalid catalog snapshot validation state", 400)
+            # `failed` is terminal: re-declaring it is a no-op, anything else
+            # is refused, so an unusable capture never becomes complete.
+            if snapshot["validation_state"] == "failed":
+                if state != "failed":
+                    raise AppError("CATALOG_SNAPSHOT_FAILED",
+                                   "a failed catalog snapshot is terminal", 409)
+                return dict(snapshot)
             if snapshot["activated_at"] is not None:
                 if state != "complete":
-                    raise AppError("CATALOG_SNAPSHOT_CONFLICT",
-                                   "catalog snapshot activation conflict", 409)
+                    raise AppError("CATALOG_SNAPSHOT_ACTIVE",
+                                   "an active catalog snapshot is immutable", 409)
                 return dict(snapshot)
             if state == "failed":
                 snapshot["validation_state"] = "failed"
@@ -570,6 +999,7 @@ class MemoryRepository:
                                  worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
+            candidate = prepare_candidate(candidate)
             record = next((row for row in self.catalog_raw_records.values()
                            if row["id"] == str(candidate.get("raw_record_id"))), None)
             if record is None:
@@ -584,14 +1014,9 @@ class MemoryRepository:
             if status not in CANDIDATE_STATUSES:
                 raise AppError("CATALOG_CANDIDATE_INVALID",
                                "invalid catalog candidate status", 400)
-            if (candidate.get("model_year_start") is None) != (candidate.get("model_year_end") is None):
-                raise AppError("CATALOG_CANDIDATE_INVALID",
-                               "a model year range must be whole", 400)
             # Raises on an unknown dimension, an empty one, or a padded one.
             stated_identity_dimensions(candidate.get("identity_dimensions"))
-            key = (record["snapshot_id"], candidate.get("candidate_key") or "")
-            if not key[1]:
-                raise AppError("CATALOG_CANDIDATE_INVALID", "catalog candidate key is required", 400)
+            key = (record["snapshot_id"], candidate["candidate_key"])
             existing = self.catalog_candidates.get(key)
             if existing is not None:
                 replayed = self._catalog_replay(existing, {**candidate,
@@ -613,35 +1038,78 @@ class MemoryRepository:
                                         worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
+            link = prepare_evidence_link(link)
             candidate = next((row for row in self.catalog_candidates.values()
                               if row["id"] == str(link.get("candidate_id"))), None)
             if candidate is None:
                 raise AppError("CATALOG_LINK_INVALID", "invalid catalog evidence link candidate", 400)
             snapshot = self._catalog_snapshot_by_id(candidate["snapshot_id"])
-            # Cross-RUN linkage: the cited source must belong to the run
-            # holding the lease.
-            source = next((row for row in self.tool_rows
-                           if row["id"] == str(link.get("source_id"))
-                           and row["run_id"] == str(run_id)), None)
-            if source is None:
-                raise AppError("CATALOG_LINK_INVALID", "invalid catalog evidence link source", 400)
-            if link.get("verdict_id") is not None:
-                if link.get("claim_id") is None:
-                    raise AppError("CATALOG_LINK_INVALID",
-                                   "catalog evidence link verdict requires its claim", 400)
+
+            # Cross-RUN linkage: every cited row must belong to the run holding
+            # the lease. A later run may add evidence to an existing candidate
+            # -- deliberately -- but only ever evidence of its own.
+            source = self._catalog_evidence_row(link.get("source_id"), run_id, "SOURCE")
+            claim = self._catalog_evidence_row(link.get("claim_id"), run_id, "CLAIM")
+            # The claim must rest on the source being cited, not merely share a run.
+            if str(claim.get("source_id")) != str(source["id"]):
+                raise AppError("CATALOG_LINK_CLAIM_SOURCE_MISMATCH",
+                               "catalog evidence link claim source mismatch", 400)
+
+            # Provenance is DERIVED from the evidence, never taken from the
+            # caller; a caller that states it is held to it.
+            locator = claim.get("evidence_locator")
+            kind = source.get("source_version_kind")
+            version = source.get("source_version_id")
+            if not locator:
+                raise AppError("CATALOG_LINK_NO_LOCATOR",
+                               "the cited claim states no evidence locator", 400)
+            if not kind or not version:
+                raise AppError("CATALOG_LINK_NO_VERSION",
+                               "the cited source states no version to pin this link to", 400)
+            if link.get("record_locator") not in (None, locator):
+                raise AppError("CATALOG_LINK_LOCATOR_MISMATCH",
+                               "catalog evidence link record locator does not match the cited claim",
+                               400)
+            if link.get("source_version") not in (None, version) or \
+                    link.get("source_version_kind") not in (None, kind):
+                raise AppError("CATALOG_LINK_VERSION_MISMATCH",
+                               "catalog evidence link source version does not match the cited source",
+                               400)
+
+            verdict_id = link.get("verdict_id")
+            if verdict_id is not None:
                 # The legacy catalog never verifies a fact.
                 if snapshot["trust_state"] != "evidence":
                     raise AppError("CATALOG_LINK_UNVERIFIED_SOURCE",
                                    "an unverified catalog source cannot carry a verdict", 409)
-            key = (candidate["id"], link.get("link_key") or "")
-            if not key[1]:
-                raise AppError("CATALOG_LINK_INVALID", "catalog link key is required", 400)
+                verdict = self._catalog_evidence_row(verdict_id, run_id, "VERDICT")
+                if str(verdict.get("claim_id")) != str(claim["id"]):
+                    raise AppError("CATALOG_LINK_VERDICT_CLAIM_MISMATCH",
+                                   "catalog evidence link verdict claim mismatch", 400)
+                # What the verdict SAYS, not merely that it exists.
+                if verdict.get("verdict") != "verified":
+                    raise AppError("CATALOG_LINK_VERDICT_NOT_VERIFIED",
+                                   "catalog evidence link verdict is not verified", 409)
+
+            resolved = {**link, "record_locator": locator, "source_version": version,
+                        "source_version_kind": kind}
+            key = (candidate["id"], link["link_key"])
             existing = self.catalog_evidence_links.get(key)
             if existing is not None:
-                return self._catalog_replay(existing, link, self._CATALOG_LINK_IDENTITY, "LINK")
+                return self._catalog_replay(existing, resolved,
+                                            self._CATALOG_LINK_IDENTITY, "LINK")
+            # Natural uniqueness: one citation of one claim per candidate, per
+            # verdict state.
+            natural = (candidate["id"], str(claim["id"]),
+                       None if verdict_id is None else str(verdict_id))
+            if any((row["candidate_id"], str(row["claim_id"]),
+                    None if row["verdict_id"] is None else str(row["verdict_id"])) == natural
+                   for row in self.catalog_evidence_links.values()):
+                raise AppError("CATALOG_LINK_DUPLICATE",
+                               "catalog_candidate_evidence_links_natural_uidx", 409)
             row = {"id": str(uuid4()), "candidate_id": candidate["id"],
                    "snapshot_id": snapshot["id"], "run_id": str(run_id), "link_key": key[1],
-                   **{field: link.get(field) for field in self._CATALOG_LINK_IDENTITY},
+                   **{field: resolved.get(field) for field in self._CATALOG_LINK_IDENTITY},
                    "created_at": _now()}
             self.catalog_evidence_links[key] = row
             return dict(row)
