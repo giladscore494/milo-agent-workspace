@@ -53,12 +53,29 @@ from typing import Any, Callable, Mapping, Sequence
 from . import source as src
 from .client import DataGovClient, ResourceMetadata
 from .ingest import GovernmentCatalogIngestor, IngestionReport
-from .projection import GovernmentProjectionError, resolve_active_snapshot, snapshot_usability
+from backend.runtime import CancellationRequested
+
+from .projection import (MAX_RESULT_ITEMS, GovernmentProjectionError,
+                         resolve_active_snapshot, snapshot_usability)
 
 #: How many changed candidates one diff reports individually. The COUNTS are
 #: always exact; the lists are bounded, because a refresh that changed
 #: everything must not be able to produce an unbounded work item.
 MAX_DIFF_ITEMS = 100
+
+#: How many candidate rows one side of a diff may be read into memory.
+#:
+#: A diff compares two whole snapshots, so it is the one read in this package
+#: that ACCUMULATES rather than answering a page at a time. `MAX_RESULT_ITEMS`
+#: bounds each page; without this, a whole-resource snapshot (~101 000 rows)
+#: would be materialized twice to produce one comparison -- which is exactly
+#: the unbounded read `MAX_PROJECTION_CANDIDATES` exists to refuse.
+#:
+#: Beyond it the comparison is REFUSED, and the refusal is reported rather than
+#: turned into a smaller diff: the snapshot has already landed and is already
+#: readable, so a bound on the comparison must not be mistaken for a statement
+#: about what changed.
+MAX_DIFF_SCAN_ROWS = 5_000
 
 #: What a diff compares: the candidate's COMPLETE stated identity, never its
 #: surrogate id and never the register's own `_id`.
@@ -133,6 +150,17 @@ class RefreshOutcome:
     #: property a scheduled refresh has to have: a quiet source is quiet.
     no_op: bool = True
     detail: tuple[str, ...] = ()
+
+    @property
+    def diff_unavailable(self) -> bool:
+        """A CHANGED source whose difference could not be computed.
+
+        Distinct from an empty diff, and the distinction matters: an empty diff
+        means nothing changed between two snapshots, while this means the
+        comparison was not performed. The new snapshot landed and is readable
+        either way; what is absent is the focused work item.
+        """
+        return self.changed and self.diff is None
 
     @property
     def research_required(self) -> bool:
@@ -260,23 +288,35 @@ class GovernmentCatalogRefresh:
                 active_snapshot_key=str(active["snapshot_key"]), no_op=True,
                 detail=("the register publishes the version this catalog already holds",))
 
-        previous = self._candidate_rows(active) if active is not None else ()
+        # Read the PREVIOUS side before ingesting, and tolerate a bound: the
+        # comparison is a convenience on top of the capture, and refusing to
+        # capture because two snapshots are too large to compare would be the
+        # tail wagging the dog.
+        previous, previous_refusal = self._candidate_rows(active)
         report = GovernmentCatalogIngestor(
             self._repository, self._lease, client=self._client,
             cancellation_checker=self._cancellation_checker,
             event_sink=self._event_sink).ingest_resource(
                 self._resource_id, package_id=package_id, query=query)
-        current = self._candidate_rows(
-            self._repository.find_active_catalog_snapshot(
-                src.GOVERNMENT_SOURCE_FAMILY, self._resource_id, report.snapshot_key))
-        diff = diff_candidate_sets(
+        landed = self._repository.find_active_catalog_snapshot(
+            src.GOVERNMENT_SOURCE_FAMILY, self._resource_id, report.snapshot_key)
+        current, current_refusal = self._candidate_rows(landed)
+        refusal = previous_refusal or current_refusal or (
+            # The snapshot this ingestion just activated is not readable back.
+            # Comparing against an EMPTY set here would report every row of the
+            # other side as added or removed -- a fabricated diff, which is
+            # worse than no diff at all.
+            "GOV_PROJECTION_NO_ACTIVE_SNAPSHOT" if landed is None else None)
+        diff = None if refusal else diff_candidate_sets(
             previous, current,
             previous_snapshot_key=str(active["snapshot_key"]) if active is not None else "",
             snapshot_key=report.snapshot_key)
         self._emit("catalog_refresh_completed",
                    {"resource_id": self._resource_id, "snapshot_key": report.snapshot_key,
-                    "added": diff.added_count, "changed": diff.changed_count,
-                    "removed": diff.removed_count})
+                    "added": diff.added_count if diff else 0,
+                    "changed": diff.changed_count if diff else 0,
+                    "removed": diff.removed_count if diff else 0,
+                    "diff_refused": refusal or ""})
         return RefreshOutcome(
             changed=True, resource_id=self._resource_id,
             upstream_version=metadata.upstream_version,
@@ -284,8 +324,11 @@ class GovernmentCatalogRefresh:
             active_snapshot_key=report.snapshot_key, report=report, diff=diff,
             # A replay of an identical capture creates no snapshot and writes
             # nothing, so it is still a no-op even though the version check
-            # sent it down this path.
-            no_op=report.candidate_count == 0 and diff.is_empty)
+            # sent it down this path. A refused comparison is NOT a no-op: the
+            # snapshot landed and nobody knows what moved.
+            no_op=bool(diff) and report.candidate_count == 0 and diff.is_empty,
+            detail=() if not refusal else
+                   (f"the snapshot landed; its difference was not computed ({refusal})",))
 
     # --- helpers -------------------------------------------------------------
 
@@ -313,29 +356,44 @@ class GovernmentCatalogRefresh:
                 and str(snapshot.get("upstream_version_kind")) == metadata.upstream_version_kind
                 and snapshot_usability(snapshot) is None)
 
-    def _candidate_rows(self, snapshot: Mapping[str, Any] | None) -> tuple[Mapping[str, Any], ...]:
-        """One snapshot's candidates joined to the register id each was read from.
+    def _candidate_rows(self, snapshot: Mapping[str, Any] | None
+                        ) -> tuple[tuple[Mapping[str, Any], ...], str | None]:
+        """One snapshot's candidates, or the static reason they were not read.
 
-        Bounded by the same page bound every other read in this namespace uses;
-        a snapshot larger than the diff can hold reports exact COUNTS with the
-        item lists dropped whole.
+        Returns `(rows, refusal)` rather than raising, because the CAPTURE must
+        not be undone by a bound on the COMPARISON: by the time this is called
+        for the new side, an immutable snapshot has already landed and is
+        already readable.
+
+        Accumulating past `MAX_DIFF_SCAN_ROWS` is refused rather than truncated.
+        A truncated side would produce a diff that looks complete and is not --
+        every unread row of it reported as added or removed on the other side.
         """
         if snapshot is None:
-            return ()
+            return (), None
         rows: list[Mapping[str, Any]] = []
         offset = 0
         while True:
+            self._check_cancelled()
             page = list(self._repository.catalog_candidate_variant_page(
-                snapshot["id"], limit=200, offset=offset, allow_incomplete=False))
+                snapshot["id"], limit=MAX_RESULT_ITEMS, offset=offset,
+                allow_incomplete=False))
             rows.extend(page)
-            if len(page) < 200:
-                return tuple(rows)
-            offset += 200
+            if len(rows) > MAX_DIFF_SCAN_ROWS:
+                return (), "GOV_PROJECTION_BOUND_EXCEEDED"
+            if len(page) < MAX_RESULT_ITEMS:
+                return tuple(rows), None
+            offset += MAX_RESULT_ITEMS
+
+    def _check_cancelled(self) -> None:
+        if self._cancellation_checker is not None and self._cancellation_checker():
+            raise CancellationRequested("RUN_CANCELLED")
 
     def _emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
         if self._event_sink is not None:
             self._event_sink(event_type, dict(payload))
 
 
-__all__ = ["DIFF_IDENTITY", "MAX_DIFF_ITEMS", "CandidateDelta", "GovernmentCatalogRefresh",
-           "RefreshOutcome", "SnapshotDiff", "diff_candidate_sets"]
+__all__ = ["DIFF_IDENTITY", "MAX_DIFF_ITEMS", "MAX_DIFF_SCAN_ROWS", "CandidateDelta",
+           "GovernmentCatalogRefresh", "RefreshOutcome", "SnapshotDiff",
+           "diff_candidate_sets"]

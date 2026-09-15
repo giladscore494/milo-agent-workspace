@@ -45,7 +45,9 @@ from backend.catalog.government.reconcile import (AliasRule, CatalogReconciliati
                                                   ReconcilableVariant, normalize_identity_text,
                                                   reconcile_catalog,
                                                   variants_from_candidate_rows)
-from backend.catalog.government.refresh import (GovernmentCatalogRefresh, diff_candidate_sets)
+from backend.catalog.government.refresh import (MAX_DIFF_SCAN_ROWS,
+                                                GovernmentCatalogRefresh,
+                                                diff_candidate_sets)
 from backend.catalog.keys import CatalogKeyError
 from backend.catalog.promotion import (LEASE_FAILURE_CODES, CanonicalPromotion,
                                        CatalogPromotionError, build_promotion_plan,
@@ -913,6 +915,51 @@ def test_the_diff_states_exact_counts_and_drops_an_oversized_list_whole():
     changed = diff_candidate_sets(previous[:1], [{**previous[0], "status": "ready_for_review"}])
     assert (changed.added_count, changed.changed_count, changed.removed_count) == (0, 1, 0)
     assert changed.changed[0].changed_fields == ("status",)
+
+
+def test_a_snapshot_too_large_to_compare_still_lands_and_says_the_diff_is_absent(repository,
+                                                                                 landed,
+                                                                                 monkeypatch):
+    """A bound on the COMPARISON never undoes the CAPTURE, and never guesses.
+
+    By the time the new side is read, an immutable snapshot has already landed
+    and is already readable. Truncating one side would produce a diff that
+    looks complete and is not -- every unread row reported as added or removed
+    on the other side -- so the comparison is refused and SAID to be refused.
+    """
+    from backend.testing.government_capture import encode, page_document
+
+    lease, first = landed
+    real_page = repository.catalog_candidate_variant_page
+
+    def oversized(*args, **kwargs):
+        rows = real_page(*args, **kwargs)
+        # Every page comes back full, so the accumulator runs past the bound.
+        return rows * (MAX_DIFF_SCAN_ROWS + 1) if rows else rows
+
+    document = page_document(0)
+    document["result"]["records"][0]["ramat_gimur"] = "ADVENTURE PLUS"
+    package = json.loads(FixtureTransport().get(
+        "https://data.gov.il/api/3/action/package_show", params={"id": src.CKAN_PACKAGE_ID},
+        connect_timeout=1, read_timeout=1, max_bytes=10 ** 7).body)
+    for resource in package["result"]["resources"]:
+        if resource["id"] == src.WLTP_RESOURCE_ID:
+            resource["last_modified"] = "2026-10-01T00:00:00.000000"
+            resource.pop("revision_id", None)
+    monkeypatch.setattr(repository, "catalog_candidate_variant_page", oversized)
+    outcome = refresh(repository, lease,
+                      transport=FixtureTransport(bodies={0: encode(document),
+                                                         "package": encode(package)})
+                      ).sync_if_changed(query=dict(PINNED_QUERY))
+    assert outcome.changed and outcome.diff is None and outcome.diff_unavailable
+    assert not outcome.no_op and not outcome.research_required
+    assert "GOV_PROJECTION_BOUND_EXCEEDED" in outcome.detail[0]
+    # The snapshot landed anyway, and is readable.
+    monkeypatch.undo()
+    assert outcome.report.snapshot_key != first.snapshot_key
+    assert GovernmentCatalogQuery(
+        repository, snapshot_key=outcome.report.snapshot_key
+    ).dataset_metadata().snapshot_key == outcome.report.snapshot_key
 
 
 def test_no_production_entrypoint_schedules_this_refresh():
