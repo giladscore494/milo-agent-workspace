@@ -68,6 +68,15 @@ no role can insert a canonical row, so canonical promotion cannot happen by
 accident or by an unreviewed backend release. Catalog PR3 grants the privilege
 it needs in its own reviewed migration.
 
+Catalog PR2 (`20260915180000_catalog_raw_record_source_locator.sql`) changes
+none of this. It adds one column to `catalog_raw_records` and one immutable
+constraint predicate, `public.catalog_source_locator_valid(jsonb)`, which is
+revoked from `PUBLIC`/`anon`/`authenticated` and granted to `service_role`
+exactly like the other constraint helpers in this namespace. No grant widens,
+no relation gains `UPDATE` or `DELETE`, and the canonical pair is untouched —
+after a full Government ingestion, both canonical relations still hold zero
+rows and still refuse `INSERT` for every role.
+
 **And canonical rows are now immutable outright.** The original trigger froze
 identity and provenance but allowed the factual columns to be rewritten as long
 as a revision counter advanced — so a row could state values that the single

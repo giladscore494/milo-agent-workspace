@@ -19,11 +19,24 @@ class FakeResult:
 
 
 class FakeQuery:
+    """A recording stand-in for a PostgREST query builder.
+
+    It records the SHAPE of every read -- table, selected columns, filters,
+    ordering and bounds -- because that shape is the contract: a read that
+    selects `*`, forgets a filter, orders by a collation-dependent column or
+    drops its bound is a defect no amount of returned data would reveal.
+    """
+
     def __init__(self, client, table):
         self.client = client
         self.table = table
         self.op = "select"
         self.payload = None
+        self.columns = None
+        self.filters: list[tuple] = []
+        self.orders: list[tuple[str, bool]] = []
+        self.bounds = None
+        self._negated = False
 
     def insert(self, payload):
         self.op = "insert"
@@ -36,21 +49,37 @@ class FakeQuery:
         return self
 
     def select(self, *args):
+        self.columns = args[0] if args else None
         return self
 
     def eq(self, *args):
+        self.filters.append(("eq", *args))
         return self
 
     def in_(self, *args):
+        self.filters.append(("in", *args))
         return self
 
     def is_(self, *args):
+        self.filters.append(("not.is" if self._negated else "is", *args))
+        self._negated = False
+        return self
+
+    @property
+    def not_(self):
+        self._negated = True
         return self
 
     def limit(self, *args):
+        self.bounds = ("limit", *args)
+        return self
+
+    def range(self, *args):
+        self.bounds = ("range", *args)
         return self
 
     def order(self, *args, **kwargs):
+        self.orders.append((args[0] if args else None, bool(kwargs.get("desc"))))
         return self
 
     def execute(self):
@@ -60,6 +89,7 @@ class FakeQuery:
         if self.op == "update":
             self.client.updated.append((self.table, self.payload))
             return FakeResult([self.payload])
+        self.client.selected.append(self)
         return FakeResult(list(self.client.select_data.get(self.table, [])))
 
 
@@ -69,6 +99,8 @@ class FakeClient:
         self.updated = []
         self.select_data = {}
         self.rpc_calls = []
+        #: Every completed read, as the FakeQuery that performed it.
+        self.selected = []
 
     def table(self, name):
         return FakeQuery(self, name)

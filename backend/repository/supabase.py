@@ -69,6 +69,18 @@ class Repository(Protocol):
     def record_catalog_candidate(self, run_id: UUID, candidate: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def link_catalog_candidate_evidence(self, run_id: UUID, link: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
 
+    # --- durable catalog reads (PR2: internal, bounded, no lease) ------------
+    #
+    # READS, so they take no lease: a lease authorizes a durable WRITE, and
+    # requiring one to look at already-durable catalog state would make a
+    # query layer impossible to build without holding a run open.  Each is
+    # bounded, each orders deterministically, and none of them accepts SQL, a
+    # table name, a column name or an ordering from its caller.
+    def list_active_catalog_snapshots(self, source_family: str, *, resource_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]: ...
+    def find_active_catalog_snapshot(self, source_family: str, resource_id: str, snapshot_key: str) -> dict[str, Any] | None: ...
+    def list_catalog_raw_records(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
+    def list_catalog_candidates(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
+
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def list_unread_agent_messages(self, run_id: UUID, recipient: str = "supervisor") -> list[dict[str, Any]]: ...
@@ -794,6 +806,84 @@ class SupabaseRepository:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
                   "p_link": prepare_evidence_link(link)}
         return self._guarded_rpc("link_catalog_candidate_evidence_guarded", params, "catalog_evidence_link")
+
+    # --- durable catalog reads ------------------------------------------------
+    #
+    # Explicit column allowlists, never `*`: a column added later joins a read
+    # only when a reviewer adds it here.  Every ordering is by columns that are
+    # ASCII and unique within their scope (`snapshot_key`, `record_key`,
+    # `candidate_key`), so the order a caller receives does not depend on the
+    # database's text collation -- the Government identity text is Hebrew, and
+    # collation-dependent ordering would make "the same snapshot produces the
+    # same ordered tree" false on a differently configured cluster.  Semantic
+    # ordering is applied above this layer, over a materialized bounded set.
+    CATALOG_SNAPSHOT_COLUMNS = ("id, created_by_run_id, source_family, trust_state, "
+                                "resource_id, upstream_version, upstream_version_kind, "
+                                "content_sha256, retrieved_at, retrieval_metadata, "
+                                "declared_record_count, stored_record_count, "
+                                "validation_state, activated_at, snapshot_key, created_at")
+    CATALOG_RAW_RECORD_COLUMNS = ("id, snapshot_id, resource_id, upstream_record_id, "
+                                  "payload, payload_sha256, record_key, source_locator, "
+                                  "created_at")
+    CATALOG_CANDIDATE_COLUMNS = ("id, snapshot_id, raw_record_id, manufacturer, "
+                                 "commercial_model, model_year_start, model_year_end, "
+                                 "official_model_code, trim, identity_dimensions, status, "
+                                 "candidate_key, created_at")
+    MAX_CATALOG_SNAPSHOT_ROWS = 50
+    MAX_CATALOG_RECORD_ROWS = 500
+    MAX_CATALOG_CANDIDATE_ROWS = 500
+
+    def list_active_catalog_snapshots(self, source_family: str, *, resource_id: str | None = None, limit: int = MAX_CATALOG_SNAPSHOT_ROWS) -> list[dict[str, Any]]:
+        """ACTIVE snapshots of one family, newest activation first.
+
+        `activated_at is not null` is the ONLY thing that makes a snapshot
+        readable: a pending capture is still being appended to and a failed one
+        is the record that a capture was unusable, so neither may answer a
+        query.  The filter is a column predicate, not a convention above it."""
+        bounded = max(1, min(int(limit), self.MAX_CATALOG_SNAPSHOT_ROWS))
+        query = (self.client.table("catalog_source_snapshots").select(self.CATALOG_SNAPSHOT_COLUMNS)
+                 .eq("source_family", str(source_family)).not_.is_("activated_at", "null"))
+        if resource_id is not None:
+            query = query.eq("resource_id", str(resource_id))
+        return self._many(query.order("activated_at", desc=True).order("snapshot_key").limit(bounded))
+
+    def find_active_catalog_snapshot(self, source_family: str, resource_id: str, snapshot_key: str) -> dict[str, Any] | None:
+        """ONE active snapshot named exactly, or None.
+
+        Deliberately not a search of `list_active_catalog_snapshots`: that
+        listing is bounded to the NEWEST rows, so resolving an explicit
+        `snapshot_key` through it made every active snapshot older than the
+        bound unreachable -- a "no such snapshot" for a row sitting active in
+        the table.  This is an equality lookup on all four properties, capped
+        at one row, so its cost does not grow with the catalog.
+
+        `source_family` and `resource_id` are part of the lookup rather than
+        checked afterwards: a key is unique, but a caller asking for a
+        Government WLTP snapshot must not be handed a row of another family or
+        another resource that happens to carry it."""
+        rows = self._many(
+            self.client.table("catalog_source_snapshots").select(self.CATALOG_SNAPSHOT_COLUMNS)
+            .eq("source_family", str(source_family)).eq("resource_id", str(resource_id))
+            .eq("snapshot_key", str(snapshot_key)).not_.is_("activated_at", "null").limit(1))
+        return rows[0] if rows else None
+
+    def list_catalog_raw_records(self, snapshot_id: Any, *, limit: int = MAX_CATALOG_RECORD_ROWS, offset: int = 0) -> list[dict[str, Any]]:
+        """One snapshot's captured rows, in a stable, collation-free order."""
+        bounded = max(1, min(int(limit), self.MAX_CATALOG_RECORD_ROWS))
+        start = max(0, int(offset))
+        return self._many(
+            self.client.table("catalog_raw_records").select(self.CATALOG_RAW_RECORD_COLUMNS)
+            .eq("snapshot_id", str(snapshot_id)).order("record_key")
+            .range(start, start + bounded - 1))
+
+    def list_catalog_candidates(self, snapshot_id: Any, *, limit: int = MAX_CATALOG_CANDIDATE_ROWS, offset: int = 0) -> list[dict[str, Any]]:
+        """One snapshot's candidate readings, in a stable, collation-free order."""
+        bounded = max(1, min(int(limit), self.MAX_CATALOG_CANDIDATE_ROWS))
+        start = max(0, int(offset))
+        return self._many(
+            self.client.table("catalog_candidate_variants").select(self.CATALOG_CANDIDATE_COLUMNS)
+            .eq("snapshot_id", str(snapshot_id)).order("candidate_key")
+            .range(start, start + bounded - 1))
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_resolution": resolution}

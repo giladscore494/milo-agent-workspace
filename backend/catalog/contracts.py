@@ -1,18 +1,21 @@
 """The closed vocabularies and hard bounds of the durable catalog namespace.
 
-ONE definition of each rule. The guarded RPCs and the table constraints in
-`supabase/migrations/20260914200000_catalog_evidence_foundation.sql` apply
-exactly these values, and `tests/test_catalog_migration_static.py` proves the
-two copies cannot drift apart -- the same device migration
+ONE definition of each rule. The guarded RPCs and the table constraints in the
+ordered catalog migration set -- `20260914200000_catalog_evidence_foundation.sql`,
+`20260915120000_catalog_integrity_corrections.sql` and
+`20260915180000_catalog_raw_record_source_locator.sql` -- apply exactly these
+values, and `tests/test_catalog_migration_static.py` proves the two copies
+cannot drift apart: the same device migration
 `20260828000200_source_evidence_fragments.sql` and
 `backend/engines/swarm_v2/fragments.py` already use for the evidence bounds.
 
 Nothing here reads a file, opens a connection, or fetches anything. These are
-constants plus two pure predicates.
+constants plus four pure functions.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping
 
 #: Where a snapshot came from. Closed: a family this tuple does not name has no
@@ -80,6 +83,26 @@ MAX_RAW_PAYLOAD_CHARS = 16384
 #: source content.
 MAX_RETRIEVAL_METADATA_CHARS = 4096
 
+#: Where a raw record sat in the retrieval that captured it. Closed and
+#: GENERIC: these four describe any paginated read, and none of them names a
+#: source family, a publisher, an API or a vehicle.
+#:
+#: The locator is what makes a stored record checkable against the response it
+#: came out of. A snapshot's retrieval metadata records the page plan; without
+#: this a reviewer could re-fetch the page a snapshot names and still not know
+#: which row of it a given record is.
+#:
+#: Every entry is OPTIONAL and every stated one is a non-negative whole number.
+#: A record captured by a path with no pagination states no locator at all,
+#: which is an absent object rather than a set of zeroes.
+RAW_RECORD_LOCATOR_KEYS = ("capture_index", "page_index", "page_number", "page_offset")
+
+#: The durable bound on one stored locator, and the largest position it may
+#: state. Both are mirrored by CHECK constraints in
+#: `supabase/migrations/20260915180000_catalog_raw_record_source_locator.sql`.
+MAX_RAW_RECORD_LOCATOR_CHARS = 256
+MAX_RAW_RECORD_LOCATOR_POSITION = 2147483647
+
 #: The shape every idempotency identity in this namespace must have. Bounded
 #: and ASCII so it is safe to compare, index and log; never derived from model
 #: output.
@@ -129,9 +152,37 @@ def stated_identity_dimensions(dimensions: Mapping[str, Any] | None) -> dict[str
     return stated
 
 
+def stated_source_locator(locator: Mapping[str, Any] | None) -> dict[str, int]:
+    """The capture position a record actually STATED, validated, or fail closed.
+
+    Mirrors `stated_identity_dimensions`, and for the same reason: an absent
+    position is an absent key. A name outside the closed vocabulary, a value
+    that is not a whole number, a negative one, a boolean and one beyond the
+    durable bound are all refusals rather than silently dropped fields, because
+    a dropped field is how a guess becomes indistinguishable from a statement.
+    """
+    if locator is None:
+        return {}
+    if not isinstance(locator, Mapping):
+        raise ValueError("a catalog raw record source locator must be an object")
+    stated: dict[str, int] = {}
+    for name, value in locator.items():
+        if name not in RAW_RECORD_LOCATOR_KEYS:
+            raise ValueError("unknown catalog raw record locator field")
+        if isinstance(value, bool) or not isinstance(value, int) \
+                or value < 0 or value > MAX_RAW_RECORD_LOCATOR_POSITION:
+            raise ValueError("a catalog raw record locator position must be a bounded whole number")
+        stated[name] = value
+    if len(json.dumps(stated, separators=(",", ":"))) > MAX_RAW_RECORD_LOCATOR_CHARS:
+        raise ValueError("a catalog raw record source locator exceeds the durable bound")
+    return stated
+
+
 __all__ = ["CANDIDATE_IDENTITY_DIMENSIONS", "CANDIDATE_STATUSES",
            "CATALOG_SOURCE_FAMILIES", "CATALOG_TRUST_STATES",
            "CONTENT_SHA256_PATTERN", "IDEMPOTENCY_KEY_PATTERN",
-           "MAX_RAW_PAYLOAD_CHARS", "MAX_RETRIEVAL_METADATA_CHARS",
-           "SNAPSHOT_VALIDATION_STATES", "TRUST_STATE_BY_FAMILY",
-           "is_evidence_family", "stated_identity_dimensions", "trust_state_for"]
+           "MAX_RAW_PAYLOAD_CHARS", "MAX_RAW_RECORD_LOCATOR_CHARS",
+           "MAX_RAW_RECORD_LOCATOR_POSITION", "MAX_RETRIEVAL_METADATA_CHARS",
+           "RAW_RECORD_LOCATOR_KEYS", "SNAPSHOT_VALIDATION_STATES", "TRUST_STATE_BY_FAMILY",
+           "is_evidence_family", "stated_identity_dimensions", "stated_source_locator",
+           "trust_state_for"]

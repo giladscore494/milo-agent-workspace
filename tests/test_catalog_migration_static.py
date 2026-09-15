@@ -16,15 +16,18 @@ from pathlib import Path
 from backend.catalog.contracts import (CANDIDATE_IDENTITY_DIMENSIONS, CANDIDATE_STATUSES,
                                        CATALOG_SOURCE_FAMILIES, CATALOG_TRUST_STATES,
                                        CONTENT_SHA256_PATTERN, IDEMPOTENCY_KEY_PATTERN,
-                                       MAX_RAW_PAYLOAD_CHARS, MAX_RETRIEVAL_METADATA_CHARS,
+                                       MAX_RAW_PAYLOAD_CHARS, MAX_RAW_RECORD_LOCATOR_CHARS,
+                                       MAX_RAW_RECORD_LOCATOR_POSITION,
+                                       MAX_RETRIEVAL_METADATA_CHARS, RAW_RECORD_LOCATOR_KEYS,
                                        SNAPSHOT_VALIDATION_STATES, TRUST_STATE_BY_FAMILY,
                                        is_evidence_family, stated_identity_dimensions,
-                                       trust_state_for)
+                                       stated_source_locator, trust_state_for)
 
 import pytest
 
 MIGRATION = Path("supabase/migrations/20260914200000_catalog_evidence_foundation.sql")
 CORRECTION = Path("supabase/migrations/20260915120000_catalog_integrity_corrections.sql")
+LOCATOR = Path("supabase/migrations/20260915180000_catalog_raw_record_source_locator.sql")
 
 #: Every relation the catalog namespace adds, and nothing else.
 STAGING_TABLES = ("catalog_source_snapshots", "catalog_raw_records",
@@ -36,18 +39,23 @@ GUARDED_RPCS = ("record_catalog_snapshot_guarded", "record_catalog_raw_record_gu
 
 
 def sql() -> str:
-    """Both catalog migrations, as one text.
+    """All three catalog migrations, in apply order, as one text.
 
     Rerun safety and every invariant below are properties of the ORDERED SET,
-    not of one file: the corrective migration replaces function bodies and
-    constraints the foundation migration introduced, so reading either alone
-    would describe a schema that never exists.
+    not of one file: each later migration replaces function bodies and
+    constraints an earlier one introduced, so reading any of them alone would
+    describe a schema that never exists.
     """
-    return MIGRATION.read_text(encoding="utf-8") + "\n" + CORRECTION.read_text(encoding="utf-8")
+    return "\n".join(path.read_text(encoding="utf-8")
+                     for path in (MIGRATION, CORRECTION, LOCATOR))
 
 
 def correction() -> str:
     return CORRECTION.read_text(encoding="utf-8")
+
+
+def locator() -> str:
+    return LOCATOR.read_text(encoding="utf-8")
 
 
 def statements() -> str:
@@ -313,3 +321,93 @@ def test_the_python_contract_refuses_a_guessed_identity_dimension():
             stated_identity_dimensions(guess)
     with pytest.raises(ValueError):
         trust_state_for("something_else")
+
+
+# =============================================================================
+# Catalog PR2: the raw-record capture position
+# =============================================================================
+
+def test_the_locator_vocabulary_is_written_into_the_schema_verbatim():
+    """A key the backend accepts and the database refuses is a production 500.
+
+    Checked in both directions, like the identity dimensions: every name the
+    Python tuple states appears in the SQL allowlist, and the SQL allowlist
+    names nothing the Python tuple does not.
+    """
+    text = locator()
+    for key in RAW_RECORD_LOCATOR_KEYS:
+        assert f"'{key}'" in text, key
+    allowlist = text.split("where entry.key not in (", 1)[1].split(")", 1)[0]
+    named = {chunk.strip().strip("'") for chunk in allowlist.split(",") if chunk.strip()}
+    assert named == set(RAW_RECORD_LOCATOR_KEYS)
+    assert f"<= {MAX_RAW_RECORD_LOCATOR_CHARS}" in text
+    assert str(MAX_RAW_RECORD_LOCATOR_POSITION) in text
+
+
+def test_a_locator_position_must_be_a_non_negative_whole_number_in_both_copies():
+    """The SQL reads the jsonb value as text and requires digits only, which is
+    the same rule the Python preparer applies -- a float, a boolean, a string
+    and a negative value are refused by both."""
+    text = locator()
+    assert "jsonb_typeof(entry.value) <> 'number'" in text
+    assert "!~ '^[0-9]+$'" in text
+    assert stated_source_locator(None) == {}
+    assert stated_source_locator({"page_index": 0}) == {"page_index": 0}
+    for guess in ({"page": 1}, {"page_index": -1}, {"page_index": "3"}, {"page_index": 1.5},
+                  {"page_index": True}, {"page_index": None},
+                  {"page_index": MAX_RAW_RECORD_LOCATOR_POSITION + 1}):
+        with pytest.raises(ValueError):
+            stated_source_locator(guess)
+
+
+def test_the_locator_migration_is_additive_and_changes_no_other_object():
+    """ONE nullable-by-default column on an existing relation.
+
+    No table is created, nothing is backfilled, no existing column or
+    constraint outside this one is touched, and the relation's append-only
+    trigger is left exactly as it was -- so a locator is written once with its
+    row and can never be revised.
+    """
+    body = "".join(line.split("--", 1)[0] + "\n" for line in locator().splitlines())
+    parts = body.split("$$")
+    top_level = "".join(parts[index] for index in range(0, len(parts), 2)).lower()
+    for forbidden in ("create table", "drop table", "drop column", "delete from", "truncate",
+                      "insert into", "update public.", "drop trigger", "create policy"):
+        assert forbidden not in top_level, forbidden
+    assert "add column if not exists source_locator jsonb not null default '{}'::jsonb" in top_level
+    # Only this one relation is altered at all.
+    altered = {chunk.split("\n", 1)[0].strip()
+               for chunk in top_level.split("alter table ")[1:]}
+    assert altered == {"public.catalog_raw_records"}
+
+
+def test_one_capture_position_belongs_to_one_row():
+    text = locator()
+    assert "create unique index if not exists catalog_raw_records_snapshot_position_uidx" in text
+    assert "where source_locator ? 'capture_index'" in text
+
+
+def test_the_locator_joins_the_raw_record_replay_identity():
+    """A replay that MOVES a row is not a retry."""
+    body = locator()
+    conflict = body.split("-- Replay: identical content AND identical position", 1)[1]
+    assert "v_row.source_locator is distinct from v_locator" in conflict
+    assert "catalog raw record idempotency conflict" in conflict
+    # And every PR1 refusal the corrected body carried is still present.
+    for rule in ("payload digest is derived, not supplied",
+                 "this catalog snapshot does not belong to this run",
+                 "a failed catalog snapshot is terminal",
+                 "an active catalog snapshot is immutable",
+                 "catalog raw record resource mismatch",
+                 "payload exceeds the durable bound"):
+        assert rule in body, rule
+
+
+def test_the_locator_predicate_is_immutable_strictly_boolean_and_service_only():
+    text = locator()
+    predicate = text.split("create or replace function public.catalog_source_locator_valid", 1)[1]
+    predicate = predicate.split("$$;", 1)[0]
+    assert "immutable" in predicate and "set search_path = pg_catalog" in predicate
+    # A CHECK treats NULL as passing, so the helper may never yield one.
+    assert "coalesce(" in predicate and ", false)" in predicate
+    assert "'public.catalog_source_locator_valid(jsonb)'" in text

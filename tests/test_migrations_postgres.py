@@ -3427,14 +3427,19 @@ def _catalog_snapshot_json(key: str, *, family: str = "government",
 
 def _catalog_record_json(snapshot_id: str, key: str, *, upstream: str = "36327",
                          resource: str = "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
-                         payload: dict | None = None) -> str:
+                         payload: dict | None = None, locator: dict | None = None) -> str:
     payload = {"_id": 36327, "kinuy_mishari": "RAV4"} if payload is None else payload
     # The digest is DERIVED inside the trusted persistence path after the
     # corrective round, so a caller that still sends one is refused.
-    return json.dumps({"snapshot_id": snapshot_id,
-                       "record_key": _catalog_key("catalog.raw_record", key),
-                       "upstream_record_id": upstream, "resource_id": resource,
-                       "payload": payload})
+    record = {"snapshot_id": snapshot_id,
+              "record_key": _catalog_key("catalog.raw_record", key),
+              "upstream_record_id": upstream, "resource_id": resource,
+              "payload": payload}
+    # PR2: where the row sat in the retrieval that captured it. Optional, and
+    # exact when stated -- `None` omits it entirely rather than nulling it.
+    if locator is not None:
+        record["source_locator"] = locator
+    return json.dumps(record)
 
 
 def _catalog_candidate_json(snapshot_id: str, record_id: str, key: str, *,
@@ -3521,7 +3526,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
     forward-only, idempotent migration contract."""
     assert [m.name for m in CATALOG_MIGRATIONS] == [
         "20260914200000_catalog_evidence_foundation.sql",
-        "20260915120000_catalog_integrity_corrections.sql"]
+        "20260915120000_catalog_integrity_corrections.sql",
+        "20260915180000_catalog_raw_record_source_locator.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
@@ -4897,3 +4903,238 @@ def test_a_verdict_replay_holds_support_to_a_json_array(db, label, value):
     assert _stored_support(db, run_id, key) == before
     assert db.psql(f"select id from public.claim_verdicts where run_id='{run_id}' "
                    f"and evidence_key='{key}'") == stored
+
+
+# ===========================================================================
+# Catalog PR2: a raw record states WHERE in the capture it came from
+# ===========================================================================
+#
+# The column, its closed vocabulary, its position uniqueness and its place in
+# the replay identity, against the live schema. The Government ingestion path
+# that WRITES these values is proven offline in
+# `tests/test_catalog_government_ingestion.py`; what is checked here is what
+# PostgreSQL itself enforces, for every writer rather than for one backend.
+
+LOCATOR_MIGRATION = "20260915180000_catalog_raw_record_source_locator.sql"
+
+
+def _catalog_open_snapshot(db, suffix: str, *, declared: int = 8):
+    """A leased run plus a PENDING snapshot that can still take records.
+
+    `_catalog_fixture` activates its snapshot, which correctly freezes it; the
+    locator rules below are all about APPENDING, so they need one that is still
+    open. `declared` is deliberately larger than any test writes, so nothing
+    here can accidentally activate.
+    """
+    lease, _other = _evidence_fixture(db, f"catalog-{suffix}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{_catalog_snapshot_json(f'open-{suffix}', declared=declared)}'::jsonb)")
+    return args, snapshot
+
+
+def test_catalog_raw_record_locator_column_exists_with_a_safe_default(db):
+    """Additive: the column defaults to an empty object, so a record captured
+    by a path with no pagination states no position at all."""
+    assert db.psql(
+        "select data_type || '|' || is_nullable || '|' || column_default "
+        "from information_schema.columns where table_schema='public' "
+        "and table_name='catalog_raw_records' and column_name='source_locator'"
+    ) == "jsonb|NO|'{}'::jsonb"
+    _lease, _other, _args, snapshot, _record, _candidate = _catalog_fixture(db, "loc-default")
+    stored = _rpc_as_service(db, f"select source_locator from public.catalog_raw_records "
+                                 f"where snapshot_id='{snapshot}' limit 1")
+    assert stored == "{}"
+
+
+@pytest.mark.parametrize("label, locator", [
+    ("an unknown field", {"page": 1}),
+    ("a negative position", {"page_index": -1}),
+    ("a text position", {"page_index": "3"}),
+    ("a fractional position", {"page_index": 1.5}),
+    ("a boolean position", {"page_index": True}),
+    ("an object position", {"page_index": {}}),
+    ("an array locator", ["page_index", 1]),
+    ("a text locator", "page_index=1"),
+])
+def test_catalog_raw_record_locator_vocabulary_is_closed(db, label, locator):
+    """A position that cannot be compared is not a position.
+
+    Refused by the guarded RPC AND by a CHECK constraint, so the rule holds for
+    `service_role`'s direct DML too -- which is what makes it a property of the
+    schema rather than of one write path.
+    """
+    args, snapshot = _catalog_open_snapshot(db, f"loc-{label.replace(' ', '-')}")
+    payload = _catalog_record_json(snapshot, f"loc-bad-{label}", upstream="99001",
+                                   locator=locator)
+    with pytest.raises(AssertionError, match="source locator|invalid input|cannot"):
+        _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{payload}'::jsonb)")
+
+
+def test_catalog_raw_record_locator_constraint_holds_for_direct_dml(db):
+    """`service_role` holds direct INSERT on this table, so the vocabulary has
+    to live in the schema and not only in the function."""
+    args, snapshot = _catalog_open_snapshot(db, "loc-dml")
+    with pytest.raises(AssertionError, match="locator_allowlisted"):
+        db.psql(
+            "set role service_role; insert into public.catalog_raw_records "
+            "(snapshot_id, resource_id, upstream_record_id, payload, payload_sha256, "
+            f"record_key, source_locator) values ('{snapshot}', "
+            "'142afde2-6228-49f9-8a29-9b6c3a0cbe40', '99002', '{\"_id\": 99002}'::jsonb, "
+            f"repeat('a', 64), '{_catalog_key('catalog.raw_record', 'loc-dml-direct')}', "
+            "'{\"page\": 1}'::jsonb)")
+
+
+def test_catalog_one_capture_position_belongs_to_one_row(db):
+    """Two records of one snapshot cannot claim the same place in the capture."""
+    args, snapshot = _catalog_open_snapshot(db, "loc-uniq")
+    first = _catalog_record_json(snapshot, "loc-uniq-1", upstream="99101",
+                                 payload={"_id": 99101}, locator={"capture_index": 7})
+    _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{first}'::jsonb)")
+    second = _catalog_record_json(snapshot, "loc-uniq-2", upstream="99102",
+                                  payload={"_id": 99102}, locator={"capture_index": 7})
+    with pytest.raises(AssertionError, match="catalog_raw_records_snapshot_position_uidx"):
+        _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{second}'::jsonb)")
+    # A record that states NO position collides with nothing.
+    third = _catalog_record_json(snapshot, "loc-uniq-3", upstream="99103", payload={"_id": 99103})
+    _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{third}'::jsonb)")
+    # The first row and the unpositioned one; the colliding one wrote nothing.
+    assert db.psql(f"select count(*) from public.catalog_raw_records "
+                   f"where snapshot_id='{snapshot}'") == "2"
+
+
+def test_catalog_raw_record_replay_holds_the_capture_position(db):
+    """A replay that MOVES a row is not a retry.
+
+    Same identity, same payload, a different place in the capture: the row
+    would then state a provenance it was not written with, so it fails closed
+    exactly as a changed payload does.
+    """
+    args, snapshot = _catalog_open_snapshot(db, "loc-replay")
+    payload = _catalog_record_json(snapshot, "loc-replay-1", upstream="99201",
+                                   payload={"_id": 99201}, locator={"page_number": 1,
+                                                                    "capture_index": 3})
+    stored = _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{payload}'::jsonb)")
+    # Exact replay collapses onto the same row and adds no record.
+    assert _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{payload}'::jsonb)") == stored
+    moved = _catalog_record_json(snapshot, "loc-replay-1", upstream="99201",
+                                 payload={"_id": 99201}, locator={"page_number": 2,
+                                                                  "capture_index": 3})
+    with pytest.raises(AssertionError, match="idempotency conflict"):
+        _rpc_as_service(db, f"select public.record_catalog_raw_record_guarded({args},'{moved}'::jsonb)")
+    assert db.psql(f"select source_locator->>'page_number' from public.catalog_raw_records "
+                   f"where id='{stored}'") == "1"
+
+
+def test_catalog_locator_predicate_is_service_path_only(db):
+    """A constraint helper is not a browser surface."""
+    assert db.psql(
+        "select has_function_privilege('service_role',"
+        "'public.catalog_source_locator_valid(jsonb)','execute')") == "t"
+    for role in ("anon", "authenticated"):
+        assert db.psql(
+            f"select has_function_privilege('{role}',"
+            "'public.catalog_source_locator_valid(jsonb)','execute')") == "f", role
+
+
+def test_catalog_canonical_tables_stay_empty_through_a_government_shaped_ingestion(db):
+    """Catalog PR2 writes snapshots, raw records and candidates -- and nothing
+    else. The canonical pair is still empty, still unwritable and now immutable
+    outright, so "the canonical catalog starts empty" survives an ingestion.
+    """
+    lease, _other, args, snapshot, record, candidate = _catalog_fixture(db, "gov-canonical")
+    assert db.psql(f"select count(*) from public.catalog_raw_records where snapshot_id='{snapshot}'") == "1"
+    assert db.psql(f"select count(*) from public.catalog_candidate_variants where id='{candidate}'") == "1"
+    for table in CATALOG_CANONICAL_TABLES:
+        assert db.psql(f"select count(*) from public.{table}") == "0"
+        with pytest.raises(AssertionError, match="permission denied"):
+            db.psql(f"set role service_role; insert into public.{table} default values")
+        with pytest.raises(AssertionError, match="permission denied"):
+            db.psql(f"set role service_role; delete from public.{table}")
+    # And no RPC in this schema can create one either: none of them names a
+    # canonical relation at all.
+    assert db.psql(
+        "select count(*) from pg_proc where prosrc like '%catalog_models%' "
+        "or prosrc like '%catalog_model_variants%'") == "0"
+
+
+def test_the_real_government_payloads_are_accepted_by_real_postgresql(db):
+    """The shapes Catalog PR2 actually writes, through the real guarded RPCs.
+
+    Every other catalog test here builds a payload by hand, which proves the
+    RULES but not that the ingestion path produces payloads those rules accept.
+    This one takes a REAL capture of the committed R5 Government fixtures --
+    the same bytes, through the same client -- and submits the snapshot, raw
+    records and candidates it produces to PostgreSQL unchanged.
+
+    That is what catches a retrieval-metadata object over the durable bound, a
+    metadata key the credential screen would reject, a locator outside the
+    closed vocabulary, or a candidate dimension the schema does not allow --
+    none of which an offline test against the memory repository can see.
+    """
+    from backend.catalog.government import snapshot as gov_snapshot
+    from backend.catalog.government import source as gov_source
+    from backend.catalog.government.client import DataGovClient
+    from backend.catalog.government import normalize as gov_normalize
+    from backend.catalog.government.normalize import read_wltp_record
+    from backend.catalog.payloads import (prepare_candidate, prepare_raw_record,
+                                          prepare_snapshot)
+    from backend.testing.government_capture import FixtureTransport, PINNED_QUERY
+
+    capture = DataGovClient(FixtureTransport(), page_limit=100).capture_resource(
+        gov_source.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    lease, _other = _evidence_fixture(db, "catalog-gov-real")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+
+    # The snapshot key is DERIVED, never stated by the ingestion payload, so it
+    # comes back from the same preparer the repository uses.
+    normalization = gov_normalize.read_capture(
+        [record for _, record in capture.located_records()], resource_id=capture.resource_id)
+    prepared = prepare_snapshot(gov_snapshot.snapshot_payload(capture, normalization))
+    snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{json.dumps(prepared)}'::jsonb)")
+    stored = db.psql(f"select content_sha256 || '|' || upstream_version_kind || '|' || "
+                     f"declared_record_count from public.catalog_source_snapshots where id='{snapshot}'")
+    assert stored == (f"{gov_snapshot.snapshot_content_sha256(capture)}|dataset_version|"
+                      f"{capture.reported_total}")
+    # The retrieval metadata survived the durable bound AND the credential
+    # screen, with its page checksums intact.
+    assert db.psql(f"select retrieval_metadata->>'page_chain_sha256' from "
+                   f"public.catalog_source_snapshots where id='{snapshot}'") == \
+        gov_snapshot.page_chain_digest(tuple(page.body_sha256 for page in capture.pages))
+    assert db.psql(f"select jsonb_array_length(retrieval_metadata->'page_checksums') from "
+                   f"public.catalog_source_snapshots where id='{snapshot}'") == "3"
+
+    # A representative slice of real rows, with their real capture positions
+    # and their real readings. Three, not 233: each psql call is a process, and
+    # what is under test is the SHAPE the ingestion produces.
+    written = []
+    snapshot_row = {"id": snapshot, "snapshot_key": prepared["snapshot_key"]}
+    for record_payload, record in list(
+            gov_snapshot.raw_record_payloads(capture, snapshot_row))[:3]:
+        row_id = _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{json.dumps(prepare_raw_record(record_payload))}'::jsonb)")
+        written.append((row_id, record))
+    assert db.psql(f"select source_locator from public.catalog_raw_records "
+                   f"where id='{written[0][0]}'") == \
+        '{"page_index": 0, "page_number": 1, "page_offset": 0, "capture_index": 0}'
+
+    for row_id, record in written:
+        reading = read_wltp_record(record)
+        candidate = reading.candidate_payload(
+            {"snapshot_id": snapshot, "id": row_id,
+             "record_key": db.psql(f"select record_key from public.catalog_raw_records where id='{row_id}'")})
+        _rpc_as_service(db, f"select id from public.record_catalog_candidate_guarded({args},'{json.dumps(prepare_candidate(candidate))}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_variants "
+                   f"where snapshot_id='{snapshot}'") == "3"
+    assert db.psql(f"select count(*) from public.catalog_candidate_variants "
+                   f"where snapshot_id='{snapshot}' and identity_dimensions ? 'body_style'") == "3"
+
+    # Three of 233 is not a complete capture, so the snapshot cannot activate --
+    # which is the R5 pagination lesson holding against the real payloads.
+    with pytest.raises(AssertionError, match="catalog snapshot is incomplete"):
+        _rpc_as_service(db, f"select public.activate_catalog_snapshot_guarded({args},'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
+    assert db.psql(f"select activated_at is null from public.catalog_source_snapshots "
+                   f"where id='{snapshot}'") == "t"
+    # And nothing on this path created a canonical row, a claim or a verdict.
+    for table in CATALOG_CANONICAL_TABLES:
+        assert db.psql(f"select count(*) from public.{table}") == "0"

@@ -31,6 +31,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from . import keys
+from .contracts import stated_source_locator
 from .keys import CatalogKeyError
 
 #: The structural identity of a snapshot: what makes one retrieval that
@@ -93,6 +94,15 @@ def prepare_raw_record(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise CatalogPayloadError("a catalog raw record payload must be an object")
     if "payload_sha256" in payload:
         raise CatalogPayloadError("catalog raw record payload digest is derived, not supplied")
+    # The capture position, when the retrieval had one. Validated here rather
+    # than at the database boundary so an unknown field or a non-position value
+    # is a local refusal with a readable reason, and so both repositories apply
+    # exactly this rule.
+    if payload.get("source_locator") is not None:
+        try:
+            stated_source_locator(payload["source_locator"])
+        except ValueError as failure:
+            raise CatalogPayloadError(str(failure)) from None
     return _settle_key(payload, "record_key", keys.raw_record_key(**parent))
 
 

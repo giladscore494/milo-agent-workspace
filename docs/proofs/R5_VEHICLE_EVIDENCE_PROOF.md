@@ -315,6 +315,19 @@ table, and the record's own **name** field must still be the name that code is
 paired with. A code the table does not name, or a pairing that has drifted,
 fails closed. Nothing is guessed from a Hebrew string.
 
+**Where those tables now live.** Catalog PR2 reads the same fields of the same
+resource, so the code/label pairings moved to
+`backend/catalog/government/vocabulary.py` — one definition, in the production
+catalog namespace, which `backend/testing/` may import and which may never
+import it back. This proof's module now SELECTS the exact subset it reviewed
+(`FUEL_BY_CODE` for codes 1 and 7, `PROPULSION_BY_CODE` for 1 and 2,
+`DRIVETRAIN_BY_CODE` for 1 and 3, `BODY_STYLE_BY_MERKAV` for `פנאי-שטח`), so
+the shared module can grow for a wider capture without moving what R5 proved —
+this tool's selection is conservative, and a table that silently widened could
+turn a settled unique match into an ambiguity. The VALUES are unchanged and the
+137 cases of this suite are unchanged; a change to the meaning of a code this
+proof reads now breaks it immediately rather than quietly.
+
 **Deliberately unmapped, and reported as such in the tool result:**
 
 | Field | Why it is not evidence |
@@ -603,9 +616,16 @@ an architecture, not a live integration:
 
 - **Yeda is not production-connected.** No GitHub catalog synchronizer, no
   snapshot table, no coverage index, no write path, no `PatchProposal`.
-- **Government is not production-connected.** No CKAN client, no live
-  `datastore_search`, no snapshot database, no crosswalk, no scheduled refresh.
-  Three captured response bodies are committed and read from disk.
+- **Government is not production-connected.** No live `datastore_search`, no
+  crosswalk, no scheduled refresh. Three captured response bodies are committed
+  and read from disk.
+
+  **Updated by Catalog PR2.** A CKAN client and a snapshot/raw-record/candidate
+  ingestion path now exist (`backend/catalog/government/`), and this proof's
+  committed pages are the fixtures its tests read. That does not change what R5
+  itself establishes, and it is still not a live integration: no production
+  entrypoint constructs a transport, no tool is registered, and no sync has been
+  activated. See `docs/catalog-pr2-government-ingestion.md`.
 - **Web is not production-connected.** No live research tool, no browser, no
   fetcher. One captured page's visible-text projection is committed and read
   from disk; the raw response is not committed at all.

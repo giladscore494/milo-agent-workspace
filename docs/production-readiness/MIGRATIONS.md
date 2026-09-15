@@ -40,6 +40,7 @@ production.
 | ts | `20260818000200_claim_run_lease_service_role_acl.sql` | service_role EXECUTE on claim_run_lease (Stage C Attempt 5 corrective; full worker-path ACL contract now enforced by `tests/test_worker_rpc_acl_postgres.py`) |
 | ts | `20260914200000_catalog_evidence_foundation.sql` | Catalog PR1: the durable catalog namespace — `catalog_source_snapshots`, `catalog_raw_records`, `catalog_candidate_variants`, `catalog_candidate_evidence_links` plus the **empty** canonical `catalog_models` / `catalog_model_variants`, their lease-guarded RPCs, append-only triggers, RLS and least-privilege grants |
 | ts | `20260915120000_catalog_integrity_corrections.sql` | Catalog PR1 corrective round: derived evidence-link provenance (verified verdicts only, locator/version read from the cited claim and source), required `claim_id`, terminal `failed` snapshots, creating-run snapshot ownership, derived payload digests, domain-separated identity keys with natural uniqueness, composite cross-table foreign keys and their indexes, and fully immutable canonical rows |
+| ts | `20260915180000_catalog_raw_record_source_locator.sql` | Catalog PR2: one generic `source_locator` jsonb column on `catalog_raw_records` (closed key vocabulary `capture_index` / `page_index` / `page_number` / `page_offset`, bounded, position-unique per snapshot) so a stored record states WHERE in a paginated retrieval it came from; the raw-record RPC carries and replay-checks it |
 
 All migrations are additive, idempotent and data-preserving. There are no
 destructive down-migrations, by policy (`scripts/check_migrations.py`
@@ -56,6 +57,31 @@ empty and are `SELECT`-only for `service_role`, so no write path that exists
 today can put a row in either. The existing aggregated Yeda catalog is
 deliberately **not** imported; it is representable only as a
 `legacy_reference` snapshot whose trust state is pinned to `unverified`.
+
+### Catalog PR2 — migration and rollback impact
+
+`20260915180000_catalog_raw_record_source_locator.sql` is forward-only and
+additive: it adds ONE nullable-by-default `jsonb` column to the existing
+`public.catalog_raw_records`, one immutable predicate that closes its key
+vocabulary, two CHECK constraints, one partial unique index, and it redefines
+`record_catalog_raw_record_guarded` in place with the same name, signature and
+lease posture. It creates no table, alters no other relation, backfills
+nothing, and leaves the relation's append-only trigger untouched — so a locator
+is written exactly once with its row and can never be revised.
+
+The column is GENERIC rather than Government-specific: `page_offset`,
+`page_index`, `page_number` and `capture_index` describe any paginated
+retrieval, and nothing in the file names `data.gov.il`, CKAN, a Government
+field or a vehicle. Catalog PR2 adds **no** Government-specific table.
+
+The column exists because a snapshot's `retrieval_metadata` records the page
+plan while an individual row could not say which page it came out of, so
+"traceable to the exact page and record" would otherwise be a claim rather than
+a stored fact.
+
+Rollback: the relation is still empty, so reverting means not using the column.
+A forward migration could drop it; nothing reads it outside
+`backend/catalog/government/`.
 
 ### The corrective round — migration and rollback impact
 
