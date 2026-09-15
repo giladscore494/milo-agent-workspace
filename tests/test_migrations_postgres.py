@@ -3987,15 +3987,19 @@ def test_no_canonical_row_can_be_created_through_the_staging_write_path(db):
         "where prosrc like '%insert into public.catalog_model_variants%'")
     assert canonical_writers == "promote_catalog_variant_guarded"
     # A bare canonical insert is refused at COMMIT, by the provenance gate.
+    # The back-pointer names a REAL verified verdict, so the refusal below is
+    # the provenance coverage rule and not a missing foreign key.
+    evidence = _pr3_field_evidence(db, args, "no-canonical-year", "model_year_start",
+                                   2021, "year", "shnat_yitzur")
+    model_key, variant_key = "cm1." + "0" * 32, "cv1." + "0" * 32
     with pytest.raises(AssertionError, match="requires verified provenance for every field"):
         db.psql("begin; set role service_role; "
                 "insert into public.catalog_models (manufacturer, commercial_model, canonical_key) "
-                "values ('Toyota','RAV4','cm1." + "0" * 32 + "'); "
+                f"values ('Toyota','RAV4','{model_key}'); "
                 "insert into public.catalog_model_variants (model_id, promoted_from_candidate_id, "
                 "promoted_from_verdict_id, canonical_key, model_year_start, model_year_end) "
-                f"select id, '{candidate}', "
-                "(select id from public.claim_verdicts limit 1), 'cv1." + "0" * 32 + "', 2021, 2021 "
-                "from public.catalog_models where canonical_key='cm1." + "0" * 32 + "'; commit")
+                f"select id, '{candidate}', '{evidence['verdict']}', '{variant_key}', 2021, 2021 "
+                f"from public.catalog_models where canonical_key='{model_key}'; commit")
     for table in CATALOG_CANONICAL_TABLES:
         assert db.psql(f"select count(*) from public.{table}") == "0"
     assert db.psql(f"select count(*) from public.catalog_raw_records where id='{record}'") == "1"
@@ -5186,3 +5190,497 @@ def test_the_real_government_payloads_are_accepted_by_real_postgresql(db):
     # And nothing on this path created a canonical row, a claim or a verdict.
     for table in CATALOG_CANONICAL_TABLES:
         assert db.psql(f"select count(*) from public.{table}") == "0"
+
+
+# ===========================================================================
+# Catalog PR3: bounded database-side aggregation, and FIELD-LEVEL promotion
+# ===========================================================================
+#
+# The two halves this PR adds, held to real PostgreSQL:
+#
+#   * `20260916090000_catalog_bounded_candidate_queries.sql` -- five bounded
+#     aggregations that answer over a snapshot of any size, each gated on an
+#     ACTIVE, COMPLETE, USABLE snapshot and each returning the EXACT total;
+#   * `20260916120000_catalog_field_level_promotion.sql` -- one append-only
+#     provenance row per promoted FACT, plus the two triggers that make a
+#     canonical row without complete verified provenance impossible to commit
+#     FOR EVERY WRITER, not only for callers of the RPC.
+#
+# The refusal matrix below is the point of the second migration. Each case is
+# one way a canonical fact could be wrong, and each one is a refusal rather
+# than a smaller truth.
+
+#: The canonical fields one promotion states, and the register field each is
+#: read from. Mirrors `GOVERNMENT_FIELD_SOURCES` in
+#: `backend/catalog/government/evidence.py`; the fifth is a namespaced identity
+#: dimension, which is what proves a dimension is promoted like any other fact.
+PR3_FIELDS = (
+    ("model_year_start", 2021, "year", "shnat_yitzur"),
+    ("model_year_end", 2021, "year", "shnat_yitzur_end"),
+    ("official_model_code", "AXAP54L-ANXGBW", None, "degem_nm"),
+    ("trim", "PRIME AWD SE", None, "ramat_gimur"),
+    ("identity_dimensions.fuel_type", "plug_in_hybrid", None, "delek_cd"),
+)
+
+#: A usable snapshot's own durable reading, as `catalog_readable_snapshot`
+#: parses it. One row read, none refused.
+PR3_READ_METADATA = {"http_status": 200, "redirect_chain": [],
+                     "normalization_contract": "gov.wltp.normalize.1",
+                     "normalized_record_count": 1, "normalization_issue_count": 0,
+                     "normalization_issues": [], "normalization_issue_records": []}
+
+
+def _pr3_field_evidence(db, args: str, label: str, field_key: str, value,
+                        unit: str | None, register_field: str) -> dict[str, str]:
+    """A complete R3/R4 chain for ONE promotable field.
+
+    One source per field, deliberately: a source may carry at most four focused
+    fragments, and every promoted field needs its own exact locator. Spreading
+    them proves a promotion legitimately spans sources -- which is what the
+    field-level design is FOR.
+    """
+    locator = record_field_locator("rec-1", (register_field,)).locator_key
+    text = f"{register_field}={value}"
+    source = _rpc_as_service(db, "select id from public.upsert_source_guarded("
+                                 f"{args},'{_r3_source_json(f'{label}-src')}'::jsonb)")
+    fragment = _rpc_as_service(
+        db, "select id from public.record_evidence_fragment_guarded("
+            f"{args},'{_r3_fragment_json(source, text, key=f'{label}-frag', locator=locator)}'::jsonb)")
+    claim = _rpc_as_service(
+        db, "select id from public.create_claim_with_source_guarded("
+            f"{args},'{_r3_claim_json(f'{label}-claim', source, value, locator=locator, unit=unit, field=field_key)}'::jsonb)")
+    support = [{"fragment_id": fragment, "content_hash": fragment_content_hash(text),
+                "locator_key": locator}]
+    verdict = _rpc_as_service(
+        db, "select id from public.record_claim_verdict_guarded("
+            f"{args},'{_r4_verdict_json(claim, key=f'{label}-verdict', support=support)}'::jsonb)")
+    return {"source": source, "fragment": fragment, "claim": claim, "verdict": verdict,
+            "field_key": field_key, "value": value}
+
+
+def _pr3_promotable(db, suffix: str, *, status: str = "ready_for_review",
+                    family: str = "government", fields=PR3_FIELDS):
+    """A ready candidate with a VERIFIED evidence link per promotable field.
+
+    Each case gets its OWN manufacturer. `catalog_models_natural_uniq` makes
+    (manufacturer, commercial model) a single canonical model -- which is the
+    point of the constraint -- so two cases sharing a marque would share a
+    canonical model row and one would be revising the other's variant instead
+    of establishing its own.
+    """
+    make = f"Toyota-{suffix}"
+    lease, _other = _evidence_fixture(db, f"pr3-{suffix}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    snapshot = _rpc_as_service(
+        db, "select id from public.record_catalog_snapshot_guarded("
+            f"{args},'{_catalog_snapshot_json(f'pr3-snap-{suffix}', family=family, retrieval_metadata=PR3_READ_METADATA)}'::jsonb)")
+    record = _rpc_as_service(
+        db, "select id from public.record_catalog_raw_record_guarded("
+            f"{args},'{_catalog_record_json(snapshot, f'pr3-rec-{suffix}')}'::jsonb)")
+    _rpc_as_service(db, "select id from public.activate_catalog_snapshot_guarded("
+                        f"{args},'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
+    candidate = _rpc_as_service(
+        db, "select id from public.record_catalog_candidate_guarded("
+            f"{args},'{_catalog_candidate_json(snapshot, record, f'pr3-cand-{suffix}', status=status, make=make, dimensions={'fuel_type': 'plug_in_hybrid'})}'::jsonb)")
+    links = {}
+    for index, (field_key, value, unit, register_field) in enumerate(fields):
+        evidence = _pr3_field_evidence(db, args, f"pr3-{suffix}-{index}", field_key, value,
+                                       unit, register_field)
+        link = _rpc_as_service(
+            db, "select id from public.link_catalog_candidate_evidence_guarded("
+                f"{args},'{_catalog_link_json(candidate, evidence['source'], f'pr3-link-{suffix}-{index}', claim_id=evidence['claim'], verdict_id=evidence['verdict'], locator=None, version=None, kind=None)}'::jsonb)")
+        links[field_key] = {**evidence, "link": link}
+    return args, snapshot, record, candidate, links, make
+
+
+def _pr3_promotion_json(candidate: str, links: dict, make: str, *, key: str,
+                        fields=PR3_FIELDS, code: str | None = "AXAP54L-ANXGBW",
+                        trim: str | None = "PRIME AWD SE",
+                        years: tuple[int, int] = (2021, 2021),
+                        dimensions: dict | None = None,
+                        entries: list[dict] | None = None) -> str:
+    """One promotion payload, with the canonical keys derived as production does.
+
+    The model and variant keys come from `backend/catalog/keys.py`, so a test
+    exercises the same identity the repository preparer derives -- including
+    `catalog_models_natural_uniq`, which makes one (manufacturer, commercial
+    model) exactly one canonical model however it is keyed.
+
+    The PROMOTION key is label-derived, and only that one: an idempotency test
+    has to replay deliberately CONFLICTING payloads under one identity, which a
+    key derived from the payload's own content could never do.
+    """
+    model_key = catalog_keys.canonical_model_key(manufacturer=make, commercial_model="RAV4")
+    payload = {
+        "candidate_id": candidate,
+        "model_canonical_key": model_key,
+        "canonical_key": catalog_keys.canonical_variant_key(
+            model_key=model_key, model_year_start=years[0], model_year_end=years[1],
+            official_model_code=code, trim=trim),
+        "promotion_key": catalog_keys.derive_key("catalog.promotion", test_label=key),
+        "manufacturer": make, "commercial_model": "RAV4",
+        "model_year_start": years[0], "model_year_end": years[1],
+        "identity_dimensions": {"fuel_type": "plug_in_hybrid"} if dimensions is None
+                               else dimensions,
+        "fields": entries if entries is not None else [
+            {"field_key": field_key, "value": value,
+             "evidence_link_id": links[field_key]["link"]}
+            for field_key, value, _unit, _register in fields]}
+    if code is not None:
+        payload["official_model_code"] = code
+    if trim is not None:
+        payload["trim"] = trim
+    return json.dumps(payload)
+
+
+def _promote(db, args: str, promotion: str) -> str:
+    return _rpc_as_service(
+        db, f"select id from public.promote_catalog_variant_guarded({args},'{promotion}'::jsonb)")
+
+
+# --- the bounded aggregations ----------------------------------------------
+
+def test_the_bounded_catalog_queries_answer_only_from_a_usable_snapshot(db):
+    """Active, complete, read, and free of unresolved gaps -- or no answer.
+
+    The Python projection applies the same gate (`snapshot_usability`), and the
+    database applying it too is what makes it hold for a direct caller.
+    """
+    args, snapshot, _record, candidate, _links, make = _pr3_promotable(db, "query")
+    rows = db.psql("select manufacturer || '|' || model_count || '|' || variant_count "
+                   f"|| '|' || total_count from public.catalog_candidate_manufacturers('{snapshot}')")
+    assert rows == f"{make}|1|1|1"
+    assert db.psql("select commercial_model || '|' || variant_count || '|' || model_year_start "
+                   f"from public.catalog_candidate_models('{snapshot}','{make}')") == "RAV4|1|2021"
+    assert db.psql("select model_year || '|' || variant_count from "
+                   f"public.catalog_candidate_model_years('{snapshot}','{make}','RAV4')") == "2021|1"
+    assert db.psql("select id || '|' || upstream_record_id || '|' || total_count from "
+                   f"public.catalog_candidate_variant_page('{snapshot}')") == f"{candidate}|36327|1"
+    # A pending snapshot answers nothing at all.
+    other = _rpc_as_service(db, "select id from public.record_catalog_snapshot_guarded("
+                                f"{args},'{_catalog_snapshot_json('pr3-pending', retrieval_metadata=PR3_READ_METADATA)}'::jsonb)")
+    with pytest.raises(AssertionError, match="catalog snapshot is not active"):
+        db.psql(f"select * from public.catalog_candidate_manufacturers('{other}')")
+
+
+def test_the_bounded_catalog_queries_bound_the_page_and_state_the_exact_total(db):
+    """A caller asking for more than the server bound gets the bound.
+
+    And `total_count` is the count of the whole FILTERED set, not of the page,
+    so `has_more` is a fact rather than "the page came back full".
+    """
+    _args, snapshot, _record, _candidate, _links, _make = _pr3_promotable(db, "bound")
+    assert db.psql("select limit_applied from (select count(*) as limit_applied from "
+                   f"public.catalog_candidate_variant_page('{snapshot}', p_limit => 9999)) t") == "1"
+    assert db.psql("select public.catalog_page_limit()") == "200"
+    # A filter that matches nothing returns no rows at all -- and therefore no
+    # total to misread as a count of something.
+    assert db.psql("select count(*) from public.catalog_candidate_variant_page("
+                   f"'{snapshot}', p_manufacturer => 'Hyundai')") == "0"
+    # An identity dimension outside the closed vocabulary is refused, never
+    # matched loosely.
+    with pytest.raises(AssertionError, match="unknown catalog identity dimension"):
+        db.psql("select * from public.catalog_candidate_variant_page("
+                f"'{snapshot}', p_identity_dimensions => '{{\"horsepower\": \"120\"}}'::jsonb)")
+    with pytest.raises(AssertionError, match="unknown catalog candidate status"):
+        db.psql(f"select * from public.catalog_candidate_variant_page('{snapshot}', p_status => 'promoted')")
+
+
+def test_a_snapshot_with_an_unread_row_answers_only_under_acknowledgement(db):
+    """PR2's reading gap, enforced by the database as well as by Python."""
+    lease, _other = _evidence_fixture(db, "pr3-gap")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    metadata = {**PR3_READ_METADATA, "normalization_issue_count": 1,
+                "normalization_issues": [{"reason": "GOV_NORM_LABEL_CONTRADICTION", "count": 1}],
+                "normalization_issue_records": ["36327"]}
+    snapshot = _rpc_as_service(db, "select id from public.record_catalog_snapshot_guarded("
+                                   f"{args},'{_catalog_snapshot_json('pr3-gap-snap', retrieval_metadata=metadata)}'::jsonb)")
+    _rpc_as_service(db, "select id from public.record_catalog_raw_record_guarded("
+                        f"{args},'{_catalog_record_json(snapshot, 'pr3-gap-rec')}'::jsonb)")
+    _rpc_as_service(db, "select id from public.activate_catalog_snapshot_guarded("
+                        f"{args},'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
+    with pytest.raises(AssertionError, match="rows its vocabulary could not read"):
+        db.psql(f"select * from public.catalog_candidate_manufacturers('{snapshot}')")
+    assert db.psql("select count(*) from public.catalog_candidate_manufacturers("
+                   f"'{snapshot}', p_allow_incomplete => true)") == "0"
+    # A RAW-ONLY snapshot is never answerable, acknowledged or not: it states
+    # no identities, so there is no gap it could acknowledge.
+    raw_only = {**PR3_READ_METADATA, "normalization_contract": "raw_only",
+                "normalized_record_count": 0}
+    other = _rpc_as_service(db, "select id from public.record_catalog_snapshot_guarded("
+                                f"{args},'{_catalog_snapshot_json('pr3-rawonly', retrieval_metadata=raw_only)}'::jsonb)")
+    _rpc_as_service(db, "select id from public.record_catalog_raw_record_guarded("
+                        f"{args},'{_catalog_record_json(other, 'pr3-rawonly-rec')}'::jsonb)")
+    _rpc_as_service(db, "select id from public.activate_catalog_snapshot_guarded("
+                        f"{args},'{json.dumps({'snapshot_id': other})}'::jsonb)")
+    for acknowledged in ("false", "true"):
+        with pytest.raises(AssertionError, match="states no readable identities"):
+            db.psql("select * from public.catalog_candidate_manufacturers("
+                    f"'{other}', p_allow_incomplete => {acknowledged})")
+
+
+# --- the promotion transaction ----------------------------------------------
+
+def test_a_promotion_writes_one_provenance_row_per_field_and_the_read_model(db):
+    """The whole point of Catalog PR3, against real PostgreSQL.
+
+    One canonical variant, five promoted facts, and every one of them traceable
+    on its own to the candidate, the evidence link, the snapshot, the source,
+    the claim, the VERIFIED verdict, the run and worker lease, the source
+    version and the exact locator.
+    """
+    args, snapshot, _record, candidate, links, make = _pr3_promotable(db, "promote")
+    promotion = _pr3_promotion_json(candidate, links, make, key="pr3-promote")
+    variant = _promote(db, args, promotion)
+
+    assert db.psql("select count(*) from public.catalog_canonical_field_provenance "
+                   f"where variant_id='{variant}'") == str(len(PR3_FIELDS))
+    for field_key, value, _unit, _register in PR3_FIELDS:
+        row = db.psql("select field_value::text || '|' || revision || '|' || "
+                      "(source_id = (select source_id from public.catalog_candidate_evidence_links "
+                      " where id = evidence_link_id)) || '|' || "
+                      "(record_locator = (select evidence_locator from public.claims where id = claim_id)) "
+                      "from public.catalog_canonical_field_provenance "
+                      f"where variant_id='{variant}' and field_key='{field_key}'")
+        expected = json.dumps(value) if not isinstance(value, str) else f'"{value}"'
+        assert row == f"{expected}|1|true|true", (field_key, row)
+    # The READ MODEL is what "the current canonical value" means, and it is
+    # assembled from the highest revision of each field.
+    current = db.psql("select manufacturer || '|' || commercial_model || '|' || model_year_start "
+                      "|| '|' || official_model_code || '|' || trim || '|' || identity_dimensions::text "
+                      f"from public.catalog_canonical_variant_current where variant_id='{variant}'")
+    assert current == f'{make}|RAV4|2021|AXAP54L-ANXGBW|PRIME AWD SE|{{"fuel_type": "plug_in_hybrid"}}'
+    # The row-level PR1 back-pointer is checked, not decorative: it names a
+    # verdict and a candidate that are in this row's OWN field provenance.
+    assert db.psql("select count(*) from public.catalog_model_variants v "
+                   "join public.catalog_canonical_field_provenance p on p.variant_id = v.id "
+                   "and p.verdict_id = v.promoted_from_verdict_id "
+                   f"where v.id='{variant}'") >= "1"
+    # An EXACT replay is a deterministic no-op: same row, same provenance.
+    assert _promote(db, args, promotion) == variant
+    assert db.psql("select count(*) from public.catalog_canonical_field_provenance "
+                   f"where variant_id='{variant}'") == str(len(PR3_FIELDS))
+
+
+def test_a_canonical_row_cannot_commit_without_provenance_for_every_field(db):
+    """The DEFERRED gate, exercised by a writer that never called the RPC.
+
+    `service_role` holds direct INSERT on the canonical relations, so this is
+    the check that makes the grant safe: a canonical row whose stated fields
+    are not all covered by revision-1 provenance cannot COMMIT, whichever path
+    wrote it.
+    """
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "deferred")
+    verdict = links["model_year_start"]["verdict"]
+    model_key, variant_key = "cm1." + "c" * 32, "cv1." + "c" * 32
+    statement = (
+        "begin; set role service_role; "
+        "insert into public.catalog_models (manufacturer, commercial_model, canonical_key) "
+        f"values ('Toyota','RAV4','{model_key}'); "
+        "insert into public.catalog_model_variants (model_id, promoted_from_candidate_id, "
+        "promoted_from_verdict_id, canonical_key, model_year_start, model_year_end, trim) "
+        f"select id, '{candidate}', '{verdict}', '{variant_key}', 2021, 2021, 'PRIME AWD SE' "
+        f"from public.catalog_models where canonical_key='{model_key}'; commit")
+    with pytest.raises(AssertionError, match="requires verified provenance for every field"):
+        db.psql(statement)
+    assert db.psql(f"select count(*) from public.catalog_model_variants where canonical_key='{variant_key}'") == "0"
+    assert db.psql(f"select count(*) from public.catalog_models where canonical_key='{model_key}'") == "0"
+    # A bare canonical MODEL cannot commit either: a model exists because a
+    # variant of it was promoted.
+    with pytest.raises(AssertionError, match="requires at least one promoted variant"):
+        db.psql("begin; set role service_role; "
+                "insert into public.catalog_models (manufacturer, commercial_model, canonical_key) "
+                f"values ('Toyota','COROLLA','{model_key}'); commit")
+
+
+def test_a_promoted_fact_is_held_to_its_whole_support_chain_for_every_writer(db):
+    """The BEFORE INSERT gate: a forged provenance row cannot be stored.
+
+    Every case is one way a canonical fact could be wrong, attempted directly
+    against the table rather than through the RPC -- which is the only way to
+    show that the rule holds for `service_role`'s own DML.
+    """
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "chain")
+    variant = _promote(db, args, _pr3_promotion_json(candidate, links, make, key="pr3-chain"))
+    run_id = args.split(",")[0].strip("'")
+    year = links["model_year_start"]
+    trim = links["trim"]
+
+    def forge(field_key: str, value: str, link_id: str, expected: str):
+        with pytest.raises(AssertionError, match=expected):
+            db.psql(
+                "set role service_role; "
+                "insert into public.catalog_canonical_field_provenance "
+                "(model_id, variant_id, field_key, field_value, revision, candidate_id, "
+                " evidence_link_id, snapshot_id, source_id, claim_id, verdict_id, run_id, "
+                " worker_id, attempt, source_version, source_version_kind, record_locator, "
+                " promotion_key) "
+                f"select v.model_id, v.id, '{field_key}', '{value}'::jsonb, 9, '{candidate}', "
+                f" '{link_id}', l.snapshot_id, l.source_id, l.claim_id, l.verdict_id, '{run_id}', "
+                f" 'w', 1, l.source_version, l.source_version_kind, l.record_locator, "
+                f" '{'cp1.' + 'd' * 32}' "
+                "from public.catalog_model_variants v, public.catalog_candidate_evidence_links l "
+                f"where v.id='{variant}' and l.id='{link_id}'")
+
+    # The claim states a DIFFERENT field than the one being promoted.
+    forge("trim", '"PRIME AWD SE"', year["link"], "claim states a different field")
+    # The claim states the right field at a DIFFERENT value.
+    forge("trim", '"LIMITED"', trim["link"], "claim states a different value")
+    # A field PR2 deliberately left UNMAPPED, verified end to end and still
+    # refused. `koah_sus` is the exact case: the register publishes it, the
+    # dataset defines no semantics for it, and a verified claim about it -- a
+    # perfectly legitimate piece of evidence -- can still never become a
+    # canonical fact, because it is outside the closed promotable vocabulary.
+    unmapped = _pr3_field_evidence(db, args, "pr3-chain-unmapped", "koah_sus", "150",
+                                   None, "koah_sus")
+    unmapped_link = _rpc_as_service(
+        db, "select id from public.link_catalog_candidate_evidence_guarded("
+            f"{args},'{_catalog_link_json(candidate, unmapped['source'], 'pr3-chain-unmapped-link', claim_id=unmapped['claim'], verdict_id=unmapped['verdict'], locator=None, version=None, kind=None)}'::jsonb)")
+    forge("koah_sus", '"150"', unmapped_link,
+          "catalog_canonical_field_provenance_field_allowlisted")
+    # An IDENTITY field restated differently is a different variant wearing
+    # this one's name.
+    forge("model_year_start", "2099", year["link"], "claim states a different value")
+
+
+def test_the_promotion_refusal_matrix(db):
+    """Every way a promotion must fail closed, one case at a time."""
+    # 1. a `legacy_reference` source can never support a canonical fact, and
+    #    the refusal comes one step EARLIER than promotion: such a candidate
+    #    cannot acquire a verified evidence link at all, so there is nothing a
+    #    promotion could cite.
+    with pytest.raises(AssertionError, match="unverified catalog source cannot carry a verdict"):
+        _pr3_promotable(db, "legacy", family="legacy_reference", fields=PR3_FIELDS[:1])
+    assert db.psql("select count(*) from public.catalog_candidate_evidence_links l "
+                   "join public.catalog_source_snapshots s on s.id = l.snapshot_id "
+                   "where s.trust_state = 'unverified' and l.verdict_id is not null") == "0"
+
+    # 2. an AMBIGUOUS candidate is never promotable.
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(
+        db, "ambiguous", status="ambiguous")
+    with pytest.raises(AssertionError, match="not ready for promotion"):
+        _promote(db, args, _pr3_promotion_json(candidate, links, make, key="pr3-ambiguous"))
+
+    # 3. a field the canonical row states with no evidence entry at all.
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "missing")
+    with pytest.raises(AssertionError, match="do not match the canonical row"):
+        _promote(db, args, _pr3_promotion_json(
+            candidate, links, make, key="pr3-missing",
+            entries=[{"field_key": field_key, "value": value,
+                      "evidence_link_id": links[field_key]["link"]}
+                     for field_key, value, _u, _r in PR3_FIELDS[:-1]]))
+
+    # 4. an evidence entry for a field the canonical row does not state.
+    with pytest.raises(AssertionError, match="do not match the canonical row"):
+        _promote(db, args, _pr3_promotion_json(candidate, links, make, key="pr3-extra", trim=None))
+
+    # 5. a promoted value that is not the value the verified claim states.
+    with pytest.raises(AssertionError, match="do not match the canonical row"):
+        _promote(db, args, _pr3_promotion_json(candidate, links, make, key="pr3-value",
+                                               trim="LIMITED"))
+
+    # 6. an evidence link of ANOTHER candidate.
+    other_args, _s, _r, other_candidate, other_links, _other_make = _pr3_promotable(db, "foreign")
+    borrowed = [{"field_key": field_key, "value": value,
+                 "evidence_link_id": (other_links if field_key == "trim" else links)[field_key]["link"]}
+                for field_key, value, _u, _r in PR3_FIELDS]
+    with pytest.raises(AssertionError, match="evidence of another candidate"):
+        _promote(db, args, _pr3_promotion_json(candidate, links, make, key="pr3-foreign",
+                                               entries=borrowed))
+    # And the canonical model that promotion would have created does not exist:
+    # a refused promotion leaves the catalog exactly as it was.
+    assert db.psql("select count(*) from public.catalog_models where manufacturer="
+                   f"'{make}'") == "0"
+
+    # 7. an idempotency key replayed with DIFFERENT content.
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "replay")
+    key = "pr3-replay"
+    variant = _promote(db, args, _pr3_promotion_json(candidate, links, make, key=key))
+    conflicting = json.loads(_pr3_promotion_json(candidate, links, make, key=key))
+    conflicting["fields"] = [entry for entry in conflicting["fields"]
+                             if entry["field_key"] != "trim"]
+    conflicting.pop("trim")
+    with pytest.raises(AssertionError, match="idempotency conflict"):
+        _promote(db, args, json.dumps(conflicting))
+    assert db.psql("select count(*) from public.catalog_canonical_field_provenance "
+                   f"where variant_id='{variant}'") == str(len(PR3_FIELDS))
+
+    # 8. a STALE worker. The lease is the first statement of the RPC, so a
+    #    superseded worker writes nothing at all.
+    run_id = args.split(",")[0].strip("'")
+    stale = f"'{run_id}','ghost',1,'not-the-token'"
+    with pytest.raises(AssertionError, match="lease"):
+        _promote(db, stale, _pr3_promotion_json(candidate, links, make, key="pr3-stale"))
+
+
+def test_a_canonical_fact_is_never_promoted_out_of_an_unresolved_conflict(db):
+    """Two verified sources disagreeing is not a value to pick -- it is a wait.
+
+    Promoting either side would settle the disagreement by writing it down,
+    which is precisely what a conflict record exists to prevent.
+    """
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "conflict")
+    claim = links["trim"]["claim"]
+    db.psql("set role service_role; insert into public.conflicts "
+            "(run_id, entity_key, field_key, claim_ids, outcome) values "
+            f"('{args.split(',')[0].strip(chr(39))}','vehicle','trim', "
+            f"array['{claim}']::uuid[], 'unresolved_needs_review')")
+    with pytest.raises(AssertionError, match="unresolved conflict"):
+        _promote(db, args, _pr3_promotion_json(candidate, links, make, key="pr3-conflict"))
+    assert db.psql("select count(*) from public.catalog_model_variants v "
+                   "join public.catalog_models m on m.id = v.model_id "
+                   f"where m.manufacturer='{make}'") == "0"
+
+
+def test_a_revision_appends_and_the_read_model_moves_but_the_row_never_does(db):
+    """Canonical UPDATES are append-only revisions, and the view is the answer.
+
+    A later, better source revises a DIMENSION by appending revision 2. The
+    canonical row's own columns -- frozen at revision 1, and immutable by
+    trigger -- do not move, and the authoritative read model reports the new
+    value. That is what keeps one definition of "the current canonical value".
+    """
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "revision")
+    variant = _promote(db, args, _pr3_promotion_json(candidate, links, make, key="pr3-revision"))
+    revised = _pr3_field_evidence(db, args, "pr3-revision-later",
+                                  "identity_dimensions.fuel_type", "electric", None, "delek_cd")
+    link = _rpc_as_service(
+        db, "select id from public.link_catalog_candidate_evidence_guarded("
+            f"{args},'{_catalog_link_json(candidate, revised['source'], 'pr3-revision-link', claim_id=revised['claim'], verdict_id=revised['verdict'], locator=None, version=None, kind=None)}'::jsonb)")
+    payload = json.loads(_pr3_promotion_json(candidate, links, make, key="pr3-revision"))
+    payload["promotion_key"] = catalog_keys.derive_key("catalog.promotion",
+                                                       test_label="pr3-revision-2")
+    payload["identity_dimensions"] = {"fuel_type": "electric"}
+    payload["fields"] = [entry for entry in payload["fields"]
+                         if entry["field_key"] != "identity_dimensions.fuel_type"]
+    payload["fields"].append({"field_key": "identity_dimensions.fuel_type",
+                              "value": "electric", "evidence_link_id": link})
+    assert _promote(db, args, json.dumps(payload)) == variant
+    assert db.psql("select revision || '|' || field_value::text from "
+                   "public.catalog_canonical_field_current where "
+                   f"variant_id='{variant}' and field_key='identity_dimensions.fuel_type'") \
+        == '2|"electric"'
+    # The canonical ROW never moved, and could not have: it is immutable.
+    assert db.psql(f"select identity_dimensions::text from public.catalog_model_variants where id='{variant}'") \
+        == '{"fuel_type": "plug_in_hybrid"}'
+    assert db.psql("select identity_dimensions::text from "
+                   f"public.catalog_canonical_variant_current where variant_id='{variant}'") \
+        == '{"fuel_type": "electric"}'
+    # TWO independent barriers, and the order matters: `service_role` has no
+    # UPDATE privilege at all, and even a role that did would be stopped by the
+    # trigger. Both are asserted, because either one alone could be relaxed by
+    # accident.
+    with pytest.raises(AssertionError, match="permission denied"):
+        db.psql("set role service_role; update public.catalog_model_variants "
+                f"set identity_dimensions='{{}}'::jsonb where id='{variant}'")
+    with pytest.raises(AssertionError, match="canonical catalog rows are immutable"):
+        db.psql("update public.catalog_model_variants "
+                f"set identity_dimensions='{{}}'::jsonb where id='{variant}'")
+    # And a promoted fact is append-only outright, by privilege AND by trigger.
+    with pytest.raises(AssertionError, match="permission denied"):
+        db.psql("set role service_role; delete from public.catalog_canonical_field_provenance "
+                f"where variant_id='{variant}'")
+    with pytest.raises(AssertionError, match="append-only"):
+        db.psql(f"delete from public.catalog_canonical_field_provenance where variant_id='{variant}'")
