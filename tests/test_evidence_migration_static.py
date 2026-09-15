@@ -427,8 +427,8 @@ def test_r3_hard_limits_match_the_backend_constants_exactly():
     assert f"v_total + char_length(v_text) > {MAX_FRAGMENT_TOTAL_CHARS_PER_SOURCE}" in sql
 
 
-def test_r3_adds_no_browser_surface_and_no_production_tool():
-    """R3 provenance is internal evidence, and no real source is connected."""
+def test_r3_provenance_stays_internal_and_the_production_mapping_is_one_pair():
+    """R3 provenance is internal evidence, and the production mapping is narrow."""
     api = Path("backend/main.py").read_text()
     for internal in ("source_version_kind", "source_version_id", "evidence_locator",
                      "locator_key", "fragment_type", "source_evidence_fragments"):
@@ -438,11 +438,22 @@ def test_r3_adds_no_browser_surface_and_no_production_tool():
     schemas = Path("backend/schemas.py").read_text()
     for internal in ("source_version_kind", "source_version_id", "evidence_locator"):
         assert internal not in schemas
-    worker = Path("backend/worker/main.py").read_text()
-    assert "tools = ToolRegistry()" in worker            # production registry stays empty
-    assert "deliberately left unwired" in worker         # and so does the acquisition sink
+    # Catalog PR3 wired the seam. What must stay true is the SHAPE: exactly one
+    # registered tool, one read scope, no write approval anywhere. Read from
+    # the EXECUTABLE source: a comment saying a grant is absent uses the same
+    # words the grant would.
+    worker = "\n".join(line.split("#", 1)[0] for line
+                       in Path("backend/worker/main.py").read_text().splitlines())
+    assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in worker
+    assert "tool_result_sink=evidence_sink" in worker
+    assert "write_approved" not in worker
     mapping = Path("backend/engines/swarm_v2/evidence_mapping.py").read_text()
-    assert "PRODUCTION_EVIDENCE_MAPPERS = EvidenceMapperRegistry()" in mapping
+    # Catalog PR3 replaced the empty module constant with a BUILDER plus a
+    # static declaration of what production maps, so the allowlist is still
+    # readable without constructing anything -- and is still exactly one pair.
+    assert "PRODUCTION_EVIDENCE_MAPPER_OPERATIONS = frozenset({" in mapping
+    assert '("catalog.government_vehicle", "resolve_variant"),' in mapping
+    assert "def production_evidence_mappers()" in mapping
 
 
 R4_MIGRATION = Path("supabase/migrations/20260907000100_r4_deterministic_verification.sql")

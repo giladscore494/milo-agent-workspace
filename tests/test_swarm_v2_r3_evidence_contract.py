@@ -24,7 +24,7 @@ import pytest
 
 from backend.engines.swarm_v2 import (FRAGMENT_TYPES, MAX_FACTS_PER_BUNDLE,
                                       MAX_LOCATOR_KEY_CHARS, MAX_LOCATOR_PATH_SEGMENTS,
-                                      PRODUCTION_EVIDENCE_MAPPERS, EvidenceBundle,
+                                      PRODUCTION_EVIDENCE_MAPPER_OPERATIONS, EvidenceBundle,
                                       EvidenceContractError, EvidenceLocator,
                                       EvidenceMapperRegistry, EvidenceMappingError,
                                       FocusedEvidenceFragment, GenericWorker, SourceVersion,
@@ -541,13 +541,25 @@ def test_an_operation_without_an_evidence_mapper_fails_closed(board):
     assert extract_source_fragments({"rows": ["some text"]})
 
 
-def test_the_production_mapper_registry_and_tool_registry_stay_empty():
-    assert PRODUCTION_EVIDENCE_MAPPERS.registered == frozenset()
-    assert PRODUCTION_EVIDENCE_MAPPERS.mapper_for("mock.structured_registry", "get_record") is None
-    assert ToolRegistry().allowed_names == frozenset()
+def test_the_offline_fixtures_are_never_production_mappers():
+    """R3 built the contract; Catalog PR3 connected exactly ONE real operation.
+
+    This test asserted emptiness until PR3 registered
+    `catalog.government_vehicle.resolve_variant`. What it pins now is the thing
+    that still matters: the production allowlist is that one pair and nothing
+    else, and NONE of R3's offline fixtures leaked into it.
+    """
+    from backend.engines.swarm_v2.evidence_mapping import production_evidence_mappers
+
+    production = production_evidence_mappers()
+    assert production.registered == PRODUCTION_EVIDENCE_MAPPER_OPERATIONS
+    assert production.registered == {("catalog.government_vehicle", "resolve_variant")}
+    assert production.mapper_for("mock.structured_registry", "get_record") is None
+    assert production.mapper_for("mock.document_archive", "locate_passage") is None
     # The offline fixtures are registered nowhere but in the test allowlist.
     assert offline_evidence_mappers().registered == {
         ("mock.structured_registry", "get_record"), ("mock.document_archive", "locate_passage")}
+    assert not (offline_evidence_mappers().registered & production.registered)
 
 
 # =============================================================================
@@ -990,15 +1002,39 @@ def test_the_document_flow_captures_the_passage_not_the_page(board):
     assert (claim["value"], claim["unit"]) == (1798, "cc")
 
 
-def test_no_real_vehicle_or_web_tool_is_registered_or_mapped():
-    """R3 proves the contract offline; R5 connects real sources."""
-    for name in ("yeda", "gov", "ckan", "web", "http", "search_engine"):
-        assert not any(name in registered for registered in ToolRegistry().allowed_names)
-        assert not any(name in tool for tool, _ in PRODUCTION_EVIDENCE_MAPPERS.registered)
+def test_no_yeda_or_web_tool_is_registered_or_mapped_and_the_sink_is_routed():
+    """R3 proved the contract offline; Catalog PR3 connects ONE real source.
+
+    The previous shape of this test asserted the seam was unwired. It is wired
+    now, so the assertion becomes the shape of the wiring -- which is the part
+    a reviewer actually has to be able to trust:
+
+    *   the ONE registered production tool is the bounded Government catalog
+        read, and no Yeda, CKAN, web or HTTP tool joined it;
+    *   the sink is the ROUTED one, so an operation with no mapper records
+        nothing instead of failing the task that called it;
+    *   no WRITE tool is registered and no write capability is granted.
+    """
     from pathlib import Path
-    worker_main = Path("backend/worker/main.py").read_text()
-    assert "tools = ToolRegistry()" in worker_main
-    assert "tool_result_sink" in worker_main and "deliberately left unwired" in worker_main
+
+    from backend.engines.swarm_v2.evidence_mapping import production_evidence_mappers
+    from backend.tools.government_vehicle import GOVERNMENT_TOOL_NAME, GovernmentVehicleTool
+
+    production_tools = ToolRegistry([GovernmentVehicleTool(object())])
+    assert production_tools.allowed_names == {GOVERNMENT_TOOL_NAME}
+    for name in ("yeda", "ckan", "web", "http", "search_engine"):
+        assert not any(name in registered for registered in production_tools.allowed_names)
+        assert not any(name in tool for tool, _ in production_evidence_mappers().registered)
+    # The EXECUTABLE wiring, with comments removed: a comment explaining that
+    # a grant is deliberately absent contains the same words as the grant.
+    worker_main = "\n".join(line.split("#", 1)[0] for line
+                            in Path("backend/worker/main.py").read_text().splitlines())
+    assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in worker_main
+    assert "tool_result_sink=evidence_sink" in worker_main
+    assert "RegisteredOperationEvidenceSink(" in worker_main
+    # Read scope only, and no write approval anywhere in the wiring.
+    assert "ToolContext(scopes=frozenset({GOVERNMENT_TOOL_SCOPE})" in worker_main
+    assert "write_approved" not in worker_main
 
 
 # =============================================================================

@@ -71,7 +71,7 @@ from backend.testing.r5_proof.commander import (GOVERNMENT_RECORD_ID_2021,
 from backend.testing.r5_proof.strategy import VehicleProofOutputStrategy
 from backend.engines.swarm_v2.contracts import CommanderPlan, DynamicTask, PlannedToolCall
 from backend.engines.swarm_v2.evidence_bounds import IDENTITY_DIMENSIONS
-from backend.engines.swarm_v2.evidence_mapping import (PRODUCTION_EVIDENCE_MAPPERS,
+from backend.engines.swarm_v2.evidence_mapping import (PRODUCTION_EVIDENCE_MAPPER_OPERATIONS,
                                                        EvidenceMappingError)
 from backend.engines.swarm_v2.tool_calls import ToolCallRecord
 from backend.testing.r5_proof import manifest as proof_manifest
@@ -408,10 +408,19 @@ def test_the_strategy_is_reachable_only_through_the_worker_constructor():
 # 5. R5 introduces no production tool registration and no write capability
 # =============================================================================
 
-def test_the_production_tool_registry_is_still_empty():
-    assert ToolRegistry().allowed_names == frozenset()
+def test_none_of_r5s_proof_tools_reached_the_production_registry():
+    """R5's three proof tools are registered nowhere but in the proof registry.
+
+    The production registry was empty when this test was written and is not
+    any more: Catalog PR3 registers ONE tool, the bounded Government catalog
+    read. What still has to be true -- and is what this test now says -- is
+    that none of R5's own fixtures is it.
+    """
     worker_main = Path("backend/worker/main.py").read_text()
-    assert "tools = ToolRegistry()" in worker_main
+    assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in worker_main
+    for name in ("yeda.vehicle_catalog", "gov_il.vehicle_registry",
+                 "toyota.archived_model_document"):
+        assert name not in worker_main
 
 
 # =============================================================================
@@ -698,7 +707,15 @@ def test_the_entity_key_is_one_shared_conservative_identity():
 
 
 def test_the_proof_mappers_are_not_production_mappers():
-    assert PRODUCTION_EVIDENCE_MAPPERS.registered == frozenset()
+    """R5's three proof mappers are disjoint from the production allowlist.
+
+    Catalog PR3 made that allowlist non-empty (one Government operation), so
+    "the proof mappers are not production mappers" is now a DISJOINTNESS
+    assertion rather than an emptiness one -- which is what it always meant.
+    """
+    assert not (proof_evidence_mappers().registered & PRODUCTION_EVIDENCE_MAPPER_OPERATIONS)
+    assert PRODUCTION_EVIDENCE_MAPPER_OPERATIONS == {
+        ("catalog.government_vehicle", "resolve_variant")}
     assert proof_evidence_mappers().registered == {
         ("yeda.vehicle_catalog", "get_model_variant"),
         ("gov_il.vehicle_registry", "get_model_record"),
@@ -2434,7 +2451,9 @@ def test_the_proof_registers_no_production_tool_and_no_write_operation():
         for operation in tool.operations.values():
             assert operation.input_schema["additionalProperties"] is False
             assert operation.output_schema["additionalProperties"] is False
-    # The production registry and the production mapper allowlist stay empty.
-    assert ToolRegistry().allowed_names == frozenset()
-    assert PRODUCTION_EVIDENCE_MAPPERS.registered == frozenset()
+    # R5's proof tools are registered NOWHERE but in the proof registry. The
+    # production registry is built in the worker path and holds exactly one
+    # tool -- the bounded Government catalog read -- which is not one of these.
     assert proof_registry().allowed_names == {tool.name for tool in tools}
+    assert not (proof_registry().allowed_names & {"catalog.government_vehicle"})
+    assert not (proof_evidence_mappers().registered & PRODUCTION_EVIDENCE_MAPPER_OPERATIONS)

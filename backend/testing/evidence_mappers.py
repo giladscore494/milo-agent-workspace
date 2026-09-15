@@ -22,7 +22,7 @@ What every mapper here demonstrates, and what a real one must also do:
     converts one.
 *   Nothing consults a model, a network, a database or another tool.
 
-The production registry (`PRODUCTION_EVIDENCE_MAPPERS`) does not contain any
+The production allowlist (`PRODUCTION_EVIDENCE_MAPPER_OPERATIONS`) does not contain any
 of these, and the production ToolRegistry does not register their tools.
 """
 

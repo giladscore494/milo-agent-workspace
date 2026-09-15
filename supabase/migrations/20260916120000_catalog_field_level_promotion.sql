@@ -776,6 +776,12 @@ begin
     if exists (select 1 from pg_roles where rolname='anon') then execute format('revoke all on %s from anon', canonical); end if;
     if exists (select 1 from pg_roles where rolname='authenticated') then execute format('revoke all on %s from authenticated', canonical); end if;
     if exists (select 1 from pg_roles where rolname='service_role') then
+      -- REVOKE ALL first, then grant the one privilege. A view is a NEW object,
+      -- so `alter default privileges ... grant all on tables to service_role`
+      -- (migration 20260706192500) hands it every privilege the moment it is
+      -- created; granting SELECT on top of that would leave INSERT, UPDATE and
+      -- DELETE standing on the read model.
+      execute format('revoke all on %s from service_role', canonical);
       execute format('grant select on %s to service_role', canonical);
     end if;
   end loop;

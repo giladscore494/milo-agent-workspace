@@ -3389,6 +3389,11 @@ def test_r4_identical_text_at_two_locators_persists_only_the_cited_row(r4_db):
 CATALOG_STAGING_TABLES = ("catalog_source_snapshots", "catalog_raw_records",
                           "catalog_candidate_variants", "catalog_candidate_evidence_links")
 CATALOG_CANONICAL_TABLES = ("catalog_models", "catalog_model_variants")
+#: Catalog PR3: the append-only field provenance, and the READ MODEL derived
+#: from it. The views are what "the current canonical value" means; the two
+#: canonical tables above are the frozen revision-1 identity.
+CATALOG_PROVENANCE_TABLES = ("catalog_canonical_field_provenance",)
+CATALOG_VIEWS = ("catalog_canonical_field_current", "catalog_canonical_variant_current")
 CATALOG_RPCS = ("record_catalog_snapshot_guarded", "record_catalog_raw_record_guarded",
                 "activate_catalog_snapshot_guarded", "record_catalog_candidate_guarded",
                 "link_catalog_candidate_evidence_guarded")
@@ -3527,11 +3532,16 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
     assert [m.name for m in CATALOG_MIGRATIONS] == [
         "20260914200000_catalog_evidence_foundation.sql",
         "20260915120000_catalog_integrity_corrections.sql",
-        "20260915180000_catalog_raw_record_source_locator.sql"]
+        "20260915180000_catalog_raw_record_source_locator.sql",
+        "20260916090000_catalog_bounded_candidate_queries.sql",
+        "20260916120000_catalog_field_level_promotion.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
-    assert before == str(len(CATALOG_STAGING_TABLES) + len(CATALOG_CANONICAL_TABLES))
+    # `information_schema.tables` lists views too, so the expected count is the
+    # base relations plus the two canonical read-model views PR3 adds.
+    assert before == str(len(CATALOG_STAGING_TABLES) + len(CATALOG_CANONICAL_TABLES)
+                         + len(CATALOG_PROVENANCE_TABLES) + len(CATALOG_VIEWS))
     _reapply_catalog_migrations(db)
     _reapply_catalog_migrations(db)
     assert db.psql(
@@ -3572,12 +3582,16 @@ def test_catalog_canonical_tables_start_empty_and_hold_no_legacy_row(db):
             "'cs1.00000000000000000000000000000001' from public.runs limit 1")
 
 
-def test_catalog_privileges_are_minimal_and_the_canonical_pair_is_read_only(db):
+def test_catalog_privileges_are_minimal_and_the_canonical_pair_is_append_only(db):
     """Least privilege, table by table, read out of the live ACLs.
 
-    The canonical relations are SELECT-only for `service_role`: the PR1
-    staging path cannot create a canonical row because no role holds the
-    privilege to insert one. Promotion arrives in PR3 with the grant it needs.
+    PR1 and PR2 kept the canonical relations SELECT-only, because a row-level
+    `promoted_from_verdict_id` cannot verify a multi-field row. Catalog PR3
+    adds the field-level provenance that makes an insert checkable and grants
+    EXACTLY that: `service_role` gains INSERT on the canonical pair and on the
+    provenance relation, and gains nothing else -- no UPDATE and no DELETE
+    anywhere, so a promoted row can never be rewritten and a later, better
+    source APPENDS a revision instead.
     """
     for table in CATALOG_STAGING_TABLES:
         assert db.psql(
@@ -3592,13 +3606,26 @@ def test_catalog_privileges_are_minimal_and_the_canonical_pair_is_read_only(db):
     for table in ("catalog_source_snapshots", "catalog_candidate_variants"):
         assert db.psql(
             f"select has_table_privilege('service_role','public.{table}','update')") == "t"
-    for table in CATALOG_CANONICAL_TABLES:
+    for table in CATALOG_CANONICAL_TABLES + CATALOG_PROVENANCE_TABLES:
         assert db.psql(
             f"select has_table_privilege('service_role','public.{table}','select') || '|' || "
             f"has_table_privilege('service_role','public.{table}','insert') || '|' || "
             f"has_table_privilege('service_role','public.{table}','update') || '|' || "
             f"has_table_privilege('service_role','public.{table}','delete')"
-        ) == "true|false|false|false"
+        ) == "true|true|false|false", table
+    # The read model is exactly that: SELECT for the service path, nothing for
+    # a browser role, and no privilege of its own beyond the caller's.
+    for view in CATALOG_VIEWS:
+        assert db.psql(
+            f"select has_table_privilege('service_role','public.{view}','select') || '|' || "
+            f"has_table_privilege('service_role','public.{view}','insert')") == "true|false", view
+        for role in ("anon", "authenticated"):
+            assert db.psql(
+                f"select has_table_privilege('{role}','public.{view}','select')") == "f", (role, view)
+        # `security_invoker` so a view can never read more than its caller.
+        assert db.psql(
+            "select count(*) from pg_class where relname='" + view +
+            "' and 'security_invoker=true' = any(reloptions)") == "1", view
 
 
 def test_catalog_browser_roles_have_no_access_at_all(db):
@@ -3927,12 +3954,19 @@ def test_the_legacy_catalog_can_suggest_a_candidate_but_never_verifies_a_fact(db
         _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(gov_candidate, source, 'link-orphan-verdict', verdict_id=verdict, locator=None, version=None, kind=None)}'::jsonb)")
 
 
-def test_no_canonical_row_can_be_created_through_the_pr1_write_path(db):
-    """PR1 adds persistence, not promotion -- and the database says so.
+def test_no_canonical_row_can_be_created_through_the_staging_write_path(db):
+    """Ingestion is persistence, not promotion -- and the database says so.
 
-    Every guarded write this migration adds is exercised, then the canonical
-    relations are counted. They are still empty, and `service_role` cannot
-    insert into them at all, so promotion is structurally PR3's to add.
+    Every guarded STAGING write is exercised, then the canonical relations are
+    counted. They are still empty: none of the five staging RPCs names a
+    canonical relation at all, so landing a whole Government capture cannot
+    produce a canonical row by any path.
+
+    Catalog PR3 grants `service_role` the INSERT those relations needed, so
+    "no role holds the privilege" is no longer what stops a bare insert.
+    What stops it is the DEFERRED constraint trigger: a canonical row whose
+    stated fields are not all covered by verified field provenance cannot
+    COMMIT, whichever writer attempted it.
     """
     _, _, args, snapshot, record, candidate = _catalog_fixture(db, "no-canonical")
     run_id = args.split(",")[0].strip("'")
@@ -3942,15 +3976,28 @@ def test_no_canonical_row_can_be_created_through_the_pr1_write_path(db):
     assert db.psql(f"select count(*) from public.catalog_candidate_variants where snapshot_id='{snapshot}'") >= "1"
     for table in CATALOG_CANONICAL_TABLES:
         assert db.psql(f"select count(*) from public.{table}") == "0"
-    # And no catalog RPC in this migration even mentions the canonical tables.
+    # And no STAGING rpc mentions the canonical tables. The promotion RPC does,
+    # and it is the only one -- checked by name rather than by absence.
     for rpc in CATALOG_RPCS:
         body = db.psql(f"select prosrc from pg_proc where proname='{rpc}'")
         for table in CATALOG_CANONICAL_TABLES:
             assert table not in body, (rpc, table)
-    # The service role cannot reach them directly either.
+    canonical_writers = db.psql(
+        "select string_agg(proname, ',' order by proname) from pg_proc "
+        "where prosrc like '%insert into public.catalog_model_variants%'")
+    assert canonical_writers == "promote_catalog_variant_guarded"
+    # A bare canonical insert is refused at COMMIT, by the provenance gate.
+    with pytest.raises(AssertionError, match="requires verified provenance for every field"):
+        db.psql("begin; set role service_role; "
+                "insert into public.catalog_models (manufacturer, commercial_model, canonical_key) "
+                "values ('Toyota','RAV4','cm1." + "0" * 32 + "'); "
+                "insert into public.catalog_model_variants (model_id, promoted_from_candidate_id, "
+                "promoted_from_verdict_id, canonical_key, model_year_start, model_year_end) "
+                f"select id, '{candidate}', "
+                "(select id from public.claim_verdicts limit 1), 'cv1." + "0" * 32 + "', 2021, 2021 "
+                "from public.catalog_models where canonical_key='cm1." + "0" * 32 + "'; commit")
     for table in CATALOG_CANONICAL_TABLES:
-        with pytest.raises(AssertionError, match="permission denied"):
-            db.psql(f"set role service_role; insert into public.{table} default values")
+        assert db.psql(f"select count(*) from public.{table}") == "0"
     assert db.psql(f"select count(*) from public.catalog_raw_records where id='{record}'") == "1"
     assert db.psql(f"select count(*) from public.runs where id='{run_id}'") == "1"
 
@@ -4446,12 +4493,15 @@ def test_canonical_rows_are_fully_immutable_until_pr3_adds_field_provenance(db):
     """
     lease, _, args, source, claim, verdict = _corrective_evidence(db, "canonical")
     _, _, candidate = _catalog_chain(db, "canonical", args)
+    # Catalog PR3 made the canonical keys DERIVED identities, exactly like the
+    # staging keys: `cm1.`/`cv1.` plus 128 bits of the domain-separated digest.
+    model_key, variant_key = "cm1." + "a" * 32, "cv1." + "b" * 32
     model = ("insert into public.catalog_models (manufacturer, commercial_model, canonical_key) "
-             "values ('Toyota', 'RAV4', 'cm-immutable')")
+             f"values ('Toyota', 'RAV4', '{model_key}')")
     variant = ("insert into public.catalog_model_variants (model_id, promoted_from_candidate_id, "
                "promoted_from_verdict_id, canonical_key, model_year_start, model_year_end) "
-               f"select id, '{candidate}', '{verdict}', 'cv-immutable', 2021, 2021 "
-               "from public.catalog_models where canonical_key='cm-immutable'")
+               f"select id, '{candidate}', '{verdict}', '{variant_key}', 2021, 2021 "
+               f"from public.catalog_models where canonical_key='{model_key}'")
 
     for seed, mutation in (
             (model, "update public.catalog_models set revision = revision + 1"),
@@ -5047,15 +5097,13 @@ def test_catalog_canonical_tables_stay_empty_through_a_government_shaped_ingesti
     assert db.psql(f"select count(*) from public.catalog_candidate_variants where id='{candidate}'") == "1"
     for table in CATALOG_CANONICAL_TABLES:
         assert db.psql(f"select count(*) from public.{table}") == "0"
-        with pytest.raises(AssertionError, match="permission denied"):
-            db.psql(f"set role service_role; insert into public.{table} default values")
+        # DELETE is still refused outright, for every role: a promoted fact is
+        # append-only and a canonical identity is never removed.
         with pytest.raises(AssertionError, match="permission denied"):
             db.psql(f"set role service_role; delete from public.{table}")
-    # And no RPC in this schema can create one either: none of them names a
-    # canonical relation at all.
-    assert db.psql(
-        "select count(*) from pg_proc where prosrc like '%catalog_models%' "
-        "or prosrc like '%catalog_model_variants%'") == "0"
+    # A capture that landed cleanly promotes nothing by itself: promotion takes
+    # a verified verdict per field, which an ingestion never creates.
+    assert db.psql("select count(*) from public.catalog_canonical_field_provenance") == "0"
 
 
 def test_the_real_government_payloads_are_accepted_by_real_postgresql(db):

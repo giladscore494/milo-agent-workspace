@@ -347,9 +347,14 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     CommanderModelResolver, EvidenceReference, GenericWorker, ModelGateway,
                     PlanLimits, PlanValidator, RemainingBudget, SwarmV2Adapter, Verifier)
                 from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+                from backend.engines.swarm_v2.evidence_mapping import (
+                    RegisteredOperationEvidenceSink, TrustedEvidenceAcquisition,
+                    production_evidence_mappers)
                 from backend.engines.swarm_v2.grounding import RepositoryEvidenceResolver
                 from backend.provider_scheduler import ProviderScheduler
                 from backend.tools import ToolContext, ToolRegistry
+                from backend.tools.government_vehicle import (GOVERNMENT_TOOL_SCOPE,
+                                                              GovernmentVehicleTool)
 
                 allowed = tuple(filter(None, (item.strip() for item in
                     os.getenv("MILO_COMMANDER_MODEL_ALLOWLIST", "").split(","))))
@@ -357,12 +362,18 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 worker_model = os.getenv("MILO_SWARM_WORKER_MODEL", "").strip()
                 if not allowed or not commander_model or not worker_model or commander_model not in allowed:
                     raise ValueError("Swarm V2 model configuration is incomplete or not allowlisted")
-                # The production registry stays EMPTY in this release: no Yeda,
-                # Government, CKAN or web tool is registered, so every plan the
-                # firewall can approve is a no-tool plan. Registering a real
-                # tool is a separate, deliberate change that must also grant
-                # its scope on the ToolContext below.
-                tools = ToolRegistry()
+                # Catalog PR3 registers the FIRST real production tool: the
+                # bounded, read-only Israeli vehicle register. It reads durable
+                # catalog rows through this worker's own repository and holds
+                # no transport and no credential, so a chat run cannot reach
+                # `data.gov.il` through it. Its scope is granted on the
+                # ToolContext below -- in this trusted wiring, never by a plan.
+                #
+                # No Yeda, CKAN or web tool is registered, and no WRITE tool is
+                # registered at all: canonical promotion is a lease-guarded
+                # repository RPC that trusted server code calls, not a
+                # capability a model can request.
+                tools = ToolRegistry([GovernmentVehicleTool(repo)])
                 scheduler = ProviderScheduler(provider_limits,
                     cancellation_checker=is_cancelled,
                     backpressure_callback=record_provider_backpressure)
@@ -383,22 +394,38 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 commander = Commander(client=gateway,
                     resolver=CommanderModelResolver(allowed, set(allowed)), validator=validator,
                     retry_callback=record_retry)
-                # No scope, no capability and no write approval are granted:
-                # a plan can request a registered capability, never authorize
-                # one. Write tools therefore remain impossible here.
-                tool_context = ToolContext(cancellation_checker=is_cancelled)
+                # Exactly ONE read scope is granted, from trusted server
+                # state. `write_approved` stays False and no
+                # `tool:write:<name>` capability is granted, so a write tool
+                # would still be impossible even if one were registered. A
+                # plan can request a registered capability; it can never
+                # authorize one.
+                tool_context = ToolContext(scopes=frozenset({GOVERNMENT_TOOL_SCOPE}),
+                                           cancellation_checker=is_cancelled)
+                # The run's lease-guarded Evidence Board, built BEFORE the
+                # executor because the worker's trusted tool-result sink writes
+                # through it. Same board the Verifier's verdicts and the
+                # conflict decisions go through, so there is one evidence
+                # writer for the whole run.
+                board = EvidenceBoard(repo, WorkerLease(run_id, worker_id,
+                    int(run.get("attempt") or 1), str(run.get("lease_token") or "")))
+                # The R3 seam, wired for the first time. Routed so that ONLY
+                # the registered Government operation becomes evidence: the
+                # tool's seven other reads record nothing at all rather than
+                # failing the task that called them, and the pre-R3 generic
+                # text extractor stays unreachable either way.
+                evidence_sink = RegisteredOperationEvidenceSink(
+                    TrustedEvidenceAcquisition(board=board,
+                                               mappers=production_evidence_mappers()))
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
                     cancellation_checker=is_cancelled, event_sink=forward_event,
-                    # tool_result_sink is deliberately left unwired. R3 built
-                    # the trusted mapping this seam was waiting for
-                    # (engines/swarm_v2/evidence_mapping.py), but
-                    # PRODUCTION_EVIDENCE_MAPPERS is empty and the production
-                    # ToolRegistry above registers no real source-bearing
-                    # tool, so there is nothing to acquire; wiring the sink
-                    # additionally needs a real evidence grant, which R3 does
-                    # not create. The contract is proven end to end against
-                    # deterministic offline tools and trusted offline mappers.
+                    # The trusted post-execution seam, wired. It is reached
+                    # only with a Registry-validated result and server-resolved
+                    # identity; the worker model cannot call it, cannot choose
+                    # what it writes, and cannot turn its own completion into
+                    # evidence.
+                    tool_result_sink=evidence_sink,
                     # A bounded worker-output repair is a semantic retry and
                     # consumes the SAME run-level retry allowance the
                     # Commander repair does. Provider 429 backpressure is
@@ -406,8 +433,6 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     retry_callback=record_retry),
                     max_active_workers=BoundedTaskExecutor.configured_limit(),
                     cancellation_checker=is_cancelled)
-                board = EvidenceBoard(repo, WorkerLease(run_id, worker_id,
-                    int(run.get("attempt") or 1), str(run.get("lease_token") or "")))
                 def remaining():
                     cfg = tracker.config
                     model_calls = max(

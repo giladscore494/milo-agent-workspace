@@ -29,10 +29,13 @@ Boundaries this module exists to keep:
     a source version, select a locator, write a fragment, or promote its
     completion into evidence.
 
-The production registry is EMPTY.  No Yeda, government, CKAN or web tool is
-registered as a tool, and none is registered as an evidence mapper either;
-wiring this sink into production additionally requires a real evidence grant,
-which is deliberately not created here.  The contract is proven end to end
+Catalog PR3 made the production registry NON-EMPTY for the first time.  Exactly
+one operation is mapped -- `catalog.government_vehicle.resolve_variant`, the
+only Government read that ends with one exact register row -- and the trusted
+sink is routed so that the tool's seven other read operations record nothing at
+all rather than failing the task that called them
+(`RegisteredOperationEvidenceSink`).  No Yeda, CKAN or web tool is registered,
+as a tool or as a mapper.  The contract is additionally proven end to end
 against deterministic offline test tools and trusted offline test mappers
 (backend/testing/evidence_mappers.py).
 """
@@ -50,8 +53,39 @@ EVIDENCE_MAPPING_REASONS = frozenset({
     "EVIDENCE_BUNDLE_INVALID",
     "EVIDENCE_BUNDLE_PROVENANCE_MISMATCH",
     "EVIDENCE_MAPPER_NOT_REGISTERED",
+    "EVIDENCE_RESULT_STATES_NO_FACT",
     "EVIDENCE_SOURCE_NOT_TRUSTED",
 })
+
+
+class _NoEvidence:
+    """What a REGISTERED mapper returns for a result that states no fact.
+
+    Distinct from "no mapper is registered", and the distinction matters. An
+    unregistered operation is one nobody has reviewed as evidence-bearing, and
+    it fails closed. A registered operation can still legitimately answer with
+    a result that states nothing about any one record -- `resolve_variant`
+    reporting an AMBIGUITY is the exact case: it is a true, useful answer, and
+    there is no single register row whose fields could be quoted for it.
+
+    Without this marker a mapper would have to choose between inventing a fact
+    for an ambiguous answer and failing the task that asked an entirely
+    reasonable question. It returns neither.
+
+    A singleton rather than `None`, so a mapper that forgets to return anything
+    at all is still an invalid bundle rather than a silent decline.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "NO_EVIDENCE"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+NO_EVIDENCE = _NoEvidence()
 
 
 class EvidenceMappingError(ValueError):
@@ -66,6 +100,7 @@ class EvidenceMappingError(ValueError):
         "EVIDENCE_BUNDLE_INVALID": "the trusted mapper did not produce a valid evidence bundle",
         "EVIDENCE_BUNDLE_PROVENANCE_MISMATCH": "the evidence bundle does not describe the executed tool operation",
         "EVIDENCE_MAPPER_NOT_REGISTERED": "no evidence mapper is registered for this tool operation",
+        "EVIDENCE_RESULT_STATES_NO_FACT": "this validated tool result states no evidence-bearing fact",
         "EVIDENCE_SOURCE_NOT_TRUSTED": "evidence may only be acquired from a validated tool call record",
     }
 
@@ -89,7 +124,7 @@ class EvidenceMapper(Protocol):
     tool: str
     operation: str
 
-    def map(self, record: ToolCallRecord) -> EvidenceBundle: ...
+    def map(self, record: ToolCallRecord) -> EvidenceBundle | _NoEvidence: ...
 
 
 class EvidenceMapperRegistry:
@@ -121,10 +156,25 @@ class EvidenceMapperRegistry:
     def map(self, record: Any) -> EvidenceBundle:
         """Convert ONE validated tool result into a validated evidence bundle.
 
+        Strict: a result the registered mapper DECLINES is a refusal here, so
+        a caller that requires evidence gets one static reason instead of a
+        `None` it might forget to check. `map_optional` is the same path with
+        the decline expressed as `None`.
+        """
+        bundle = self.map_optional(record)
+        if bundle is None:
+            raise EvidenceMappingError("EVIDENCE_RESULT_STATES_NO_FACT")
+        return bundle
+
+    def map_optional(self, record: Any) -> EvidenceBundle | None:
+        """The same conversion, with an explicit DECLINE expressed as `None`.
+
         Fails closed at every step: an untrusted input, an unmapped
         operation, a mapper that raises, a mapper that returns something else
         and a bundle describing a different operation all raise instead of
-        producing partial evidence.
+        producing partial evidence. The ONE thing that is not a failure is a
+        registered mapper returning `NO_EVIDENCE` for a result that states no
+        fact -- see `_NoEvidence`.
         """
         if not isinstance(record, ToolCallRecord):
             # A worker completion, a task result or a hand-built mapping can
@@ -143,6 +193,11 @@ class EvidenceMapperRegistry:
         except Exception:
             # `from None`: a mapper traceback can quote the tool result.
             raise EvidenceMappingError("EVIDENCE_BUNDLE_INVALID") from None
+        if bundle is NO_EVIDENCE:
+            # The mapper READ the result and found nothing to record. Not a
+            # failure, and not a fallback: no source, no fragment and no claim
+            # is written, exactly as for an unmapped operation.
+            return None
         if not isinstance(bundle, EvidenceBundle):
             raise EvidenceMappingError("EVIDENCE_BUNDLE_INVALID")
         # The mapper's object is not trusted as validated just because it has
@@ -158,11 +213,47 @@ class EvidenceMapperRegistry:
         return bundle
 
 
-# The production allowlist. Deliberately EMPTY, exactly like the production
-# ToolRegistry: no real Yeda, government, CKAN or web source is mapped into
-# evidence in this release, and connecting this sink to a production run
-# additionally requires a real evidence grant that R3 does not create.
-PRODUCTION_EVIDENCE_MAPPERS = EvidenceMapperRegistry()
+#: The production allowlist, as static data: the exact `(tool, operation)`
+#: pairs whose results may become evidence in a release.
+#:
+#: Catalog PR3 made this non-empty for the first time. One entry, and it is the
+#: only Government operation that ends with exactly one register row; the other
+#: seven read operations of the same tool are legitimate answers that state no
+#: fact about one vehicle, and they are absent here rather than mapped loosely.
+#:
+#: Written as literals so a reader -- and a test -- can see what production maps
+#: without importing the catalog package or constructing anything.
+PRODUCTION_EVIDENCE_MAPPER_OPERATIONS = frozenset({
+    ("catalog.government_vehicle", "resolve_variant"),
+})
+
+
+def production_evidence_mappers() -> EvidenceMapperRegistry:
+    """Build the production evidence-mapper allowlist.
+
+    A FUNCTION rather than the module constant it replaced, for one structural
+    reason: the production mapper lives in `backend/catalog/government/`, which
+    imports this package's evidence CONTRACTS. Importing it back at module
+    level here would make the two packages initialize each other -- and because
+    importing any `backend.engines.swarm_v2` submodule runs this package's
+    `__init__`, whichever side happened to be imported first would fail. The
+    deferred import keeps the dependency one-way at load time and explicit at
+    call time.
+
+    Trusted wiring calls this once, in the worker construction path, alongside
+    registering the Tool whose operation it maps. Registering a mapper without
+    registering its tool would be inert; registering the tool without the
+    mapper would make its results material that nothing can turn into evidence.
+    """
+    from backend.catalog.government.evidence import GovernmentVariantEvidenceMapper
+
+    registry = EvidenceMapperRegistry((GovernmentVariantEvidenceMapper(),))
+    if registry.registered != PRODUCTION_EVIDENCE_MAPPER_OPERATIONS:
+        # The literal list above is what a reviewer and a test read. If the
+        # built registry ever disagrees with it, the documented allowlist is
+        # wrong -- which is exactly the drift this check exists to refuse.
+        raise ValueError("the production evidence mapper allowlist does not match its declaration")
+    return registry
 
 
 @dataclass(frozen=True)
@@ -198,8 +289,17 @@ class TrustedEvidenceAcquisition:
     def mappers(self) -> EvidenceMapperRegistry:
         return self._mappers
 
-    def acquire(self, record: Any) -> AcquiredEvidence:
-        bundle = self._mappers.map(record)
+    def acquire(self, record: Any) -> AcquiredEvidence | None:
+        """Persist one validated tool result's evidence, or `None` for a decline.
+
+        `None` means the registered mapper read the result and found no fact in
+        it. Nothing is written in that case -- not a source, not a fragment and
+        not a claim -- so a declined result is indistinguishable from a result
+        that never reached the board.
+        """
+        bundle = self._mappers.map_optional(record)
+        if bundle is None:
+            return None
         return self._board.record_evidence_bundle(bundle, task_key=record.task_id)
 
     def __call__(self, record: Any) -> None:
@@ -207,6 +307,47 @@ class TrustedEvidenceAcquisition:
         self.acquire(record)
 
 
-__all__ = ["EVIDENCE_MAPPING_REASONS", "PRODUCTION_EVIDENCE_MAPPERS", "AcquiredEvidence",
-           "EvidenceMapper", "EvidenceMapperRegistry", "EvidenceMappingError",
-           "TrustedEvidenceAcquisition"]
+class RegisteredOperationEvidenceSink:
+    """The PRODUCTION `ToolResultSink`: acquire where a mapper exists, else nothing.
+
+    Catalog PR3 registers a real Tool with eight read operations, and only
+    SOME of them state evidence-bearing facts about a specific vehicle. The
+    rest -- a dataset description, a manufacturer listing, a coverage count --
+    are legitimate answers that are not evidence about any one record.
+
+    `TrustedEvidenceAcquisition` alone would fail the task for every one of
+    them, because an unmapped operation raises. This sink is the routing that
+    makes "wire the sink only for the registered operations" real:
+
+    *   a validated result of a REGISTERED operation goes to the trusted
+        acquisition, with every R3/R4 rule applied;
+    *   a validated result of any other operation records NOTHING. Not generic
+        text evidence, not a bare source, not a fragment: the pre-R3 prefix
+        extractor is still unreachable, and an operation nobody reviewed as
+        evidence-bearing still produces no evidence;
+    *   anything that is not a `ToolCallRecord` is still refused outright, so
+        a worker completion or a hand-built mapping can never enter this path.
+    """
+
+    def __init__(self, acquisition: TrustedEvidenceAcquisition):
+        if not isinstance(acquisition, TrustedEvidenceAcquisition):
+            raise ValueError("a trusted evidence acquisition is required")
+        self._acquisition = acquisition
+
+    @property
+    def acquisition(self) -> TrustedEvidenceAcquisition:
+        return self._acquisition
+
+    def __call__(self, record: Any) -> None:
+        if not isinstance(record, ToolCallRecord):
+            raise EvidenceMappingError("EVIDENCE_SOURCE_NOT_TRUSTED")
+        if self._acquisition.mappers.mapper_for(record.tool, record.operation) is None:
+            return
+        self._acquisition.acquire(record)
+
+
+__all__ = ["EVIDENCE_MAPPING_REASONS", "NO_EVIDENCE",
+           "PRODUCTION_EVIDENCE_MAPPER_OPERATIONS", "AcquiredEvidence", "EvidenceMapper",
+           "EvidenceMapperRegistry", "EvidenceMappingError",
+           "RegisteredOperationEvidenceSink", "TrustedEvidenceAcquisition",
+           "production_evidence_mappers"]
