@@ -19,12 +19,13 @@ rejection below therefore names the PostgreSQL test that proves the same rule.
 Nothing here opens a connection, applies a migration or calls a provider.
 """
 
+import hashlib
 from uuid import UUID, uuid4
 
 import pytest
 
 from backend.catalog.contracts import CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES, is_evidence_family
-from backend.catalog.digest import catalog_payload_digest
+from backend.catalog.digest import canonical_payload_text, catalog_payload_digest
 from backend.catalog.keys import CatalogKeyError
 from backend.catalog.payloads import CatalogPayloadError
 from backend.errors import AppError
@@ -248,22 +249,38 @@ def leased_run(repository: MemoryRepository, key="catalog-key-1") -> tuple[UUID,
                              "lease_token": claimed["lease_token"]}
 
 
-def real_evidence(repository: MemoryRepository, run_id: UUID, *, verdict="verified",
-                  locator=LOCATOR, kind=VERSION_KIND, version=VERSION_ID):
-    """A REAL source, claim and verdict -- never an invented uuid.
+#: The durable fragment text a support link is pinned to, and its digest.
+FRAGMENT_TEXT = "model_name=Fixture Hatch; engine_displacement_cc=1798"
+FRAGMENT_HASH = hashlib.sha256(FRAGMENT_TEXT.encode("utf-8")).hexdigest()
 
-    Catalog PR1's memory implementation let a link cite `"claim-1"`. These are
-    rows, with the fields the corrected link path actually reads.
+
+def real_evidence(repository: MemoryRepository, run_id: UUID, lease: dict, *,
+                  verdict="verified", locator=LOCATOR, kind=VERSION_KIND,
+                  version=VERSION_ID, support=True):
+    """A REAL R3/R4 chain: source -> fragment -> located claim -> verdict.
+
+    Every link in that chain is a row this repository actually holds, written
+    through the lease-guarded path, with the fields the corrected catalog link
+    reads. PR #86's version stopped at an unsupported verdict -- which
+    `record_claim_verdict_guarded` refuses to create -- so the catalog tests
+    were citing a verdict PostgreSQL would never have produced.
     """
     source = repository.create_source(run_id, {
-        "url": "https://example.test/source", "source_version_kind": kind,
-        "source_version_id": version})
+        "url": "https://example.test/source", "task_key": "task",
+        "source_version_kind": kind, "source_version_id": version}, **lease)
+    fragment = repository.record_evidence_fragment(run_id, {
+        "source_id": source["id"], "task_key": "task", "fragment_text": FRAGMENT_TEXT,
+        "content_hash": FRAGMENT_HASH, "locator_key": locator, "fragment_index": 0},
+        **lease)
     claim = repository.create_claim(run_id, {
         "entity_key": "entity", "field_key": "engine_displacement_cc", "value": 1798,
-        "source_id": source["id"], "evidence_locator": locator})
+        "source_id": source["id"], "evidence_locator": locator}, **lease)
+    links = [{"fragment_id": fragment["id"], "content_hash": FRAGMENT_HASH,
+              "locator_key": locator}] if support else []
     verdict_row = repository.record_claim_verdict(run_id, {
-        "claim_id": claim["id"], "verdict": verdict, "reason": "R4_STRUCTURED_MATCH"})
-    return source, claim, verdict_row
+        "claim_id": claim["id"], "verdict": verdict, "reason": "R4_STRUCTURED_MATCH",
+        "support": links}, **lease)
+    return source, fragment, claim, verdict_row
 
 
 def catalog_chain(repository: MemoryRepository, run_id: UUID, lease, *,
@@ -292,7 +309,7 @@ def test_the_canonical_catalog_starts_empty_and_no_write_path_fills_it(memory):
     repository, run_id, lease = memory
     assert repository.catalog_models == [] and repository.catalog_model_variants == []
     snapshot, record, candidate = catalog_chain(repository, run_id, lease)
-    source, claim, verdict = real_evidence(repository, run_id)
+    source, fragment, claim, verdict = real_evidence(repository, run_id, lease)
     repository.link_catalog_candidate_evidence(
         run_id, link_payload(candidate, source, claim, verdict=verdict), **lease)
     assert repository.catalog_models == [] and repository.catalog_model_variants == []
@@ -328,16 +345,17 @@ def test_the_memory_link_path_rejects_what_postgresql_rejects(memory, build, exp
     """
     repository, run_id, lease = memory
     snapshot, record, candidate = catalog_chain(repository, run_id, lease)
-    source, claim, verdict = real_evidence(repository, run_id)
+    source, fragment, claim, verdict = real_evidence(repository, run_id, lease)
     payload = link_payload(candidate, source, claim, verdict=verdict)
 
     if build == "needs_review_verdict":
-        _, other_claim, other_verdict = real_evidence(repository, run_id, verdict="needs_review")
+        _, _, other_claim, other_verdict = real_evidence(repository, run_id, lease,
+                                                          verdict="needs_review")
         payload = link_payload(candidate, source, claim, verdict=other_verdict)
         payload["verdict_id"] = other_verdict["id"]
         repository.tool_rows[-1]["claim_id"] = claim["id"]
     elif build == "rejected_verdict":
-        _, _, other_verdict = real_evidence(repository, run_id, verdict="rejected")
+        _, _, _, other_verdict = real_evidence(repository, run_id, lease, verdict="rejected")
         repository.tool_rows[-1]["claim_id"] = claim["id"]
         payload = link_payload(candidate, source, claim, verdict=other_verdict)
     elif build == "forged_locator":
@@ -353,18 +371,20 @@ def test_the_memory_link_path_rejects_what_postgresql_rejects(memory, build, exp
     elif build == "unknown_source":
         payload["source_id"] = str(uuid4())
     elif build == "claim_of_another_source":
-        other_source, other_claim, _ = real_evidence(repository, run_id)
+        _, _, other_claim, _ = real_evidence(repository, run_id, lease)
         payload = link_payload(candidate, source, other_claim)
     elif build == "verdict_of_another_claim":
-        _, other_claim, other_verdict = real_evidence(repository, run_id)
+        _, _, other_claim, other_verdict = real_evidence(repository, run_id, lease)
         payload = link_payload(candidate, source, claim, verdict=other_verdict)
     elif build == "claim_without_locator":
-        _, bare_claim, _ = real_evidence(repository, run_id, locator=None)
+        _, _, bare_claim, _ = real_evidence(repository, run_id, lease, locator=None,
+                                            verdict="needs_review")
         bare_source = next(row for row in repository.tool_rows
                            if row["id"] == bare_claim["source_id"])
         payload = link_payload(candidate, bare_source, bare_claim)
     elif build == "source_without_version":
-        _, bare_claim, _ = real_evidence(repository, run_id, kind=None, version=None)
+        _, _, bare_claim, _ = real_evidence(repository, run_id, lease, kind=None,
+                                            version=None)
         bare_source = next(row for row in repository.tool_rows
                            if row["id"] == bare_claim["source_id"])
         payload = link_payload(candidate, bare_source, bare_claim)
@@ -379,7 +399,8 @@ def test_a_memory_link_cannot_cite_another_runs_evidence(memory):
     repository, run_id, lease = memory
     _, _, candidate = catalog_chain(repository, run_id, lease)
     other_run, other_lease = leased_run(repository, key="catalog-key-2")
-    foreign_source, foreign_claim, foreign_verdict = real_evidence(repository, other_run)
+    foreign_source, _, foreign_claim, foreign_verdict = real_evidence(
+        repository, other_run, other_lease)
     with pytest.raises(AppError, match="invalid catalog evidence link source"):
         repository.link_catalog_candidate_evidence(
             run_id, link_payload(candidate, foreign_source, foreign_claim,
@@ -391,7 +412,7 @@ def test_a_memory_link_derives_its_provenance_from_the_evidence(memory):
     """Stored locator and version come from the claim and the source."""
     repository, run_id, lease = memory
     _, _, candidate = catalog_chain(repository, run_id, lease)
-    source, claim, verdict = real_evidence(repository, run_id)
+    source, fragment, claim, verdict = real_evidence(repository, run_id, lease)
     link = repository.link_catalog_candidate_evidence(
         run_id, link_payload(candidate, source, claim, verdict=verdict), **lease)
     assert link["record_locator"] == claim["evidence_locator"] == LOCATOR
@@ -505,7 +526,7 @@ def test_a_snapshot_belongs_to_the_run_that_opened_it(memory):
     repository.activate_catalog_snapshot(run_id, {"snapshot_id": snapshot["id"]}, **lease)
     record = next(row for row in repository.catalog_raw_records.values())
     candidate = repository.record_catalog_candidate(run_id, candidate_payload(record), **lease)
-    source, claim, verdict = real_evidence(repository, other_run)
+    source, _, claim, verdict = real_evidence(repository, other_run, other_lease)
     link = repository.link_catalog_candidate_evidence(
         other_run, link_payload(candidate, source, claim, verdict=verdict), **other_lease)
     assert link["run_id"] == str(other_run)
@@ -592,7 +613,7 @@ def test_the_legacy_catalog_is_unverified_and_can_never_carry_a_verdict(memory):
             run_id, snapshot_payload(family="legacy_reference", content="9" * 64,
                                      trust_state="evidence"), **lease)
 
-    source, claim, verdict = real_evidence(repository, run_id)
+    source, _, claim, verdict = real_evidence(repository, run_id, lease)
     # Discovery is fine...
     repository.link_catalog_candidate_evidence(
         run_id, link_payload(candidate, source, claim), **lease)
@@ -604,3 +625,233 @@ def test_the_legacy_catalog_is_unverified_and_can_never_carry_a_verdict(memory):
 
 def test_the_candidate_status_vocabulary_admits_ambiguity_as_a_real_answer():
     assert set(CANDIDATE_STATUSES) == {"candidate", "ambiguous", "rejected", "ready_for_review"}
+
+
+# =============================================================================
+# 3. the memory evidence writers themselves
+# =============================================================================
+#
+# PR #86 added `record_evidence_fragment`, `record_claim_verdict` and
+# `record_conflict_resolution` to close a parity gap -- a test could not build
+# a real verdict to cite -- but the three accepted their lease arguments and
+# ignored them, and the verdict writer accepted a `verified` verdict with no
+# durable support at all. Both are what the guarded RPCs refuse, so a memory
+# test could establish an evidence path PostgreSQL would never have created.
+#
+# The rules below mirror `record_evidence_fragment_guarded` and
+# `record_claim_verdict_guarded` in
+# `supabase/migrations/20260907000100_r4_deterministic_verification.sql`.
+
+NEW_EVIDENCE_WRITERS = ("record_evidence_fragment", "record_claim_verdict",
+                        "record_conflict_resolution")
+
+
+def evidence_payload_for(method, claim_id="claim", fragment_id="fragment"):
+    return {
+        "record_evidence_fragment": {"source_id": "s", "task_key": "task",
+                                     "fragment_text": FRAGMENT_TEXT,
+                                     "content_hash": FRAGMENT_HASH, "locator_key": LOCATOR},
+        "record_claim_verdict": {"claim_id": claim_id, "verdict": "needs_review",
+                                 "reason": "R4_NEEDS_REVIEW", "support": []},
+        "record_conflict_resolution": {"evidence_key": "res-1", "state": "resolved"},
+    }[method]
+
+
+@pytest.mark.parametrize("method", NEW_EVIDENCE_WRITERS)
+@pytest.mark.parametrize("break_lease", ["wrong_worker", "wrong_attempt", "wrong_token",
+                                         "superseded", "expired"])
+def test_no_memory_evidence_writer_accepts_a_broken_lease(memory, method, break_lease):
+    """A wrong, superseded or expired lease writes NOTHING, on all three.
+
+    Their PostgreSQL counterparts all call `assert_worker_lease` first, so a
+    stale worker is rejected atomically at the database boundary. These three
+    took the lease arguments and dropped them.
+    """
+    repository, run_id, lease = memory
+    before = len(repository.tool_rows)
+    bad = dict(lease)
+    if break_lease == "wrong_worker":
+        bad["worker_id"] = "a-different-worker"
+    elif break_lease == "wrong_attempt":
+        bad["attempt"] = lease["attempt"] + 1
+    elif break_lease == "wrong_token":
+        bad["lease_token"] = "not-the-token"
+    elif break_lease == "superseded":
+        # The lease expires and another worker claims the run: the old
+        # worker's attempt and token are both superseded.
+        repository.runs[str(run_id)]["lease_expires_at"] = "2000-01-01T00:00:00+00:00"
+        repository.claim_run(run_id, "a-later-worker", lease_seconds=300)
+    elif break_lease == "expired":
+        repository.runs[str(run_id)]["lease_expires_at"] = "2000-01-01T00:00:00+00:00"
+
+    with pytest.raises(AppError, match="no longer (held|active)|has expired") as refusal:
+        getattr(repository, method)(run_id, evidence_payload_for(method), **bad)
+    assert refusal.value.code == "RUN_TRANSITION_CONFLICT"
+    assert len(repository.tool_rows) == before, "a refused evidence write must store nothing"
+    assert repository.evidence_kinds.get(str(run_id)) is None
+
+
+def test_a_verified_verdict_without_durable_support_is_rejected(memory):
+    """`an accepted verdict must cite durable evidence`, in memory too.
+
+    PR #86's own catalog fixture built exactly this shape -- a `verified`
+    verdict with no support -- so every catalog test that cited a verdict was
+    citing one `record_claim_verdict_guarded` refuses to create.
+    """
+    repository, run_id, lease = memory
+    source, fragment, claim, _ = real_evidence(repository, run_id, lease)
+    before = len(repository.tool_rows)
+    with pytest.raises(AppError, match="an accepted verdict must cite durable evidence"):
+        repository.record_claim_verdict(run_id, {
+            "claim_id": claim["id"], "verdict": "verified", "support": []}, **lease)
+    assert len(repository.tool_rows) == before
+    # A verdict that does NOT accept the claim may legitimately cite nothing.
+    repository.record_claim_verdict(run_id, {
+        "claim_id": claim["id"], "verdict": "needs_review", "support": []}, **lease)
+    # And a verified verdict WITH its durable support is accepted.
+    accepted = repository.record_claim_verdict(run_id, {
+        "claim_id": claim["id"], "verdict": "verified",
+        "support": [{"fragment_id": fragment["id"], "content_hash": FRAGMENT_HASH,
+                     "locator_key": LOCATOR}]}, **lease)
+    assert accepted["verdict"] == "verified"
+
+
+@pytest.mark.parametrize("build, expected", [
+    ("invented_fragment", "invalid support link"),
+    ("cross_run_fragment", "invalid support link"),
+    ("fragment_of_another_source", "belongs to another source"),
+    ("wrong_content_hash", "content hash mismatch"),
+    ("wrong_locator", "locator mismatch"),
+    ("source_as_fragment", "invalid support link"),
+])
+def test_forged_or_mismatched_verdict_support_is_rejected(memory, build, expected):
+    """Every way a support link could name something it is not."""
+    repository, run_id, lease = memory
+    source, fragment, claim, _ = real_evidence(repository, run_id, lease)
+    link = {"fragment_id": fragment["id"], "content_hash": FRAGMENT_HASH,
+            "locator_key": LOCATOR}
+
+    if build == "invented_fragment":
+        link["fragment_id"] = str(uuid4())
+    elif build == "cross_run_fragment":
+        other_run, other_lease = leased_run(repository, key="catalog-key-support")
+        _, foreign_fragment, _, _ = real_evidence(repository, other_run, other_lease)
+        link["fragment_id"] = foreign_fragment["id"]
+    elif build == "fragment_of_another_source":
+        _, other_fragment, _, _ = real_evidence(repository, run_id, lease)
+        link["fragment_id"] = other_fragment["id"]
+    elif build == "wrong_content_hash":
+        link["content_hash"] = "f" * 64
+    elif build == "wrong_locator":
+        link["locator_key"] = '["document_span","doc-1",[],"Other",900,950]'
+    elif build == "source_as_fragment":
+        link["fragment_id"] = source["id"]
+
+    before = len(repository.tool_rows)
+    with pytest.raises(AppError, match=expected):
+        repository.record_claim_verdict(run_id, {
+            "claim_id": claim["id"], "verdict": "verified", "support": [link]}, **lease)
+    assert len(repository.tool_rows) == before
+
+
+@pytest.mark.parametrize("field, wrong_kind, expected", [
+    ("claim_id", "source", "invalid claim"),
+    ("claim_id", "verdict", "invalid claim"),
+])
+def test_a_row_of_the_wrong_type_cannot_stand_in_for_a_claim(memory, field, wrong_kind,
+                                                             expected):
+    """Every memory evidence row shares `tool_rows`; only its TYPE separates them.
+
+    PostgreSQL reads `public.sources`, `public.claims` and
+    `public.claim_verdicts` as separate relations, so a source id simply cannot
+    resolve as a claim there. The memory lookup checked only id and run.
+    """
+    repository, run_id, lease = memory
+    source, fragment, claim, verdict = real_evidence(repository, run_id, lease)
+    impostor = {"source": source, "verdict": verdict}[wrong_kind]
+    with pytest.raises(AppError, match=expected):
+        repository.record_claim_verdict(run_id, {
+            field: impostor["id"], "verdict": "needs_review", "support": []}, **lease)
+
+
+@pytest.mark.parametrize("field, impostor_kind, expected", [
+    ("source_id", "claim", "invalid catalog evidence link source"),
+    ("source_id", "verdict", "invalid catalog evidence link source"),
+    ("claim_id", "source", "invalid catalog evidence link claim"),
+    ("claim_id", "verdict", "invalid catalog evidence link claim"),
+    ("verdict_id", "source", "invalid catalog evidence link verdict"),
+    ("verdict_id", "claim", "invalid catalog evidence link verdict"),
+])
+def test_a_catalog_link_rejects_an_evidence_row_of_the_wrong_type(memory, field,
+                                                                  impostor_kind, expected):
+    """A source cannot masquerade as a claim, nor a claim as a verdict."""
+    repository, run_id, lease = memory
+    _, _, candidate = catalog_chain(repository, run_id, lease)
+    source, fragment, claim, verdict = real_evidence(repository, run_id, lease)
+    rows = {"source": source, "claim": claim, "verdict": verdict}
+    payload = link_payload(candidate, source, claim, verdict=verdict)
+    payload[field] = rows[impostor_kind]["id"]
+    with pytest.raises(AppError, match=expected):
+        repository.link_catalog_candidate_evidence(run_id, payload, **lease)
+    assert repository.catalog_evidence_links == {}
+
+
+# =============================================================================
+# 4. the raw-record digest: storage-local, and order-independent within a backend
+# =============================================================================
+
+REORDERED_PAYLOADS = [
+    ({"a": 1, "b": 2}, {"b": 2, "a": 1}),
+    # Keys where bytewise order and PostgreSQL's (length, bytes) order DISAGREE,
+    # which is the case that would break any claim of one canonical rendering.
+    ({"b": 1, "aa": 2}, {"aa": 2, "b": 1}),
+    ({"outer": {"z": 1, "a": 2}, "x": 3}, {"x": 3, "outer": {"a": 2, "z": 1}}),
+]
+
+
+@pytest.mark.parametrize("forward, reversed_", REORDERED_PAYLOADS)
+def test_the_memory_digest_is_a_function_of_the_value_not_the_key_order(forward, reversed_):
+    """Equal JSON is one value, at any depth, so it is one digest.
+
+    PR #86's digest rendered a Python dict in INSERTION order, so
+    `{"a":1,"b":2}` and `{"b":2,"a":1}` -- one value to every JSON reader and
+    one `jsonb` to PostgreSQL -- received different digests.
+    """
+    assert forward == reversed_, "the two payloads must be the same value"
+    assert catalog_payload_digest(forward) == catalog_payload_digest(reversed_)
+    assert catalog_payload_digest(forward) != catalog_payload_digest({**forward, "zz": 9})
+
+
+@pytest.mark.parametrize("forward, reversed_", REORDERED_PAYLOADS)
+def test_a_reordered_payload_replays_onto_the_same_memory_record(memory, forward, reversed_):
+    """The behaviour replay depends on, stated on the repository."""
+    repository, run_id, lease = memory
+    snapshot = repository.record_catalog_snapshot(run_id, snapshot_payload(declared=1), **lease)
+    first = repository.record_catalog_raw_record(
+        run_id, record_payload(snapshot, body=forward), **lease)
+    again = repository.record_catalog_raw_record(
+        run_id, record_payload(snapshot, body=reversed_), **lease)
+    assert again["id"] == first["id"]
+    assert again["payload_sha256"] == first["payload_sha256"]
+    assert repository.catalog_snapshots[snapshot["snapshot_key"]]["stored_record_count"] == 1
+    # A genuinely different payload under the same upstream id still conflicts.
+    with pytest.raises(AppError, match="record idempotency conflict"):
+        repository.record_catalog_raw_record(
+            run_id, record_payload(snapshot, body={**forward, "zz": 9}), **lease)
+
+
+def test_the_memory_digest_is_storage_local_and_says_so():
+    """It is NOT PostgreSQL's digest, and nothing claims it is.
+
+    The compact separators make the difference structural rather than
+    accidental: PostgreSQL renders `{"a": 1, "b": 2}`, this renders
+    `{"a":1,"b":2}`, so the two digests differ for every non-empty object.
+    `tests/test_migrations_postgres.py::test_the_raw_record_digest_is_storage_local_…`
+    asserts the same inequality from the database side.
+    """
+    payload = {"a": 1, "b": 2}
+    assert canonical_payload_text(payload) == '{"a":1,"b":2}'
+    postgres_rendering = '{"a": 1, "b": 2}'
+    assert canonical_payload_text(payload) != postgres_rendering
+    assert catalog_payload_digest(payload) != hashlib.sha256(
+        postgres_rendering.encode("utf-8")).hexdigest()

@@ -36,6 +36,7 @@ from pathlib import Path
 import pytest
 
 from backend.catalog import keys as catalog_keys
+from backend.catalog.digest import canonical_payload_text, catalog_payload_digest
 from backend.engines.swarm_v2.conflict_policy import CONFLICT_POLICY_VERSION
 from backend.engines.swarm_v2.evidence_contracts import (document_span_locator,
                                                          record_field_locator)
@@ -4463,3 +4464,112 @@ def test_canonical_rows_are_fully_immutable_until_pr3_adds_field_provenance(db):
     assert db.psql(
         "select count(*) from pg_proc where proname='forbid_canonical_identity_rewrite' "
         "and prosrc like '%revision must advance%'") == "0"
+
+
+# --- the raw-record digest: PostgreSQL versus Memory, executably ------------
+#
+# PR #86 documented the memory digest as reproducing PostgreSQL's rendering.
+# It did not: it rendered a Python dict in INSERTION order, while `jsonb`
+# normalizes object keys by (key length, then bytes). Two payloads that are one
+# value to every JSON reader -- and one `jsonb` row to PostgreSQL -- therefore
+# received different memory digests. The cases below pin what each backend
+# actually does instead of describing it.
+
+#: Payload pairs that are the SAME value written in different key orders. The
+#: middle pair is the one that matters: `"b"` sorts before `"aa"` in
+#: PostgreSQL's (length, bytes) order and AFTER it bytewise, so no single
+#: rendering can be both.
+REORDERED_PAYLOAD_PAIRS = [
+    ("flat", {"a": 1, "b": 2}, {"b": 2, "a": 1}),
+    ("length_vs_bytes", {"b": 1, "aa": 2}, {"aa": 2, "b": 1}),
+    ("nested", {"outer": {"z": 1, "a": 2}, "x": 3}, {"x": 3, "outer": {"a": 2, "z": 1}}),
+]
+
+
+@pytest.mark.parametrize("label, forward, reordered", REORDERED_PAYLOAD_PAIRS)
+def test_postgres_stores_one_value_for_either_key_order(db, label, forward, reordered):
+    """`jsonb` is a VALUE, so the key order it arrived in is not part of it."""
+    forward_text = json.dumps(forward)
+    reordered_text = json.dumps(reordered)
+    assert db.psql(f"select '{forward_text}'::jsonb = '{reordered_text}'::jsonb") == "t"
+    assert db.psql(f"select '{forward_text}'::jsonb::text") == \
+        db.psql(f"select '{reordered_text}'::jsonb::text")
+    assert db.psql(
+        f"select encode(sha256(convert_to('{forward_text}'::jsonb::text,'UTF8')),'hex')") == \
+        db.psql(
+        f"select encode(sha256(convert_to('{reordered_text}'::jsonb::text,'UTF8')),'hex')")
+
+
+@pytest.mark.parametrize("label, forward, reordered", REORDERED_PAYLOAD_PAIRS)
+def test_a_reordered_payload_replays_onto_the_same_postgres_record(db, label, forward,
+                                                                   reordered):
+    """Behavioural parity with the memory repository, proven on both sides.
+
+    `tests/test_catalog_persistence.py::test_a_reordered_payload_replays_onto_the_same_memory_record`
+    asserts the identical property against the in-memory backend, with the same
+    payload pairs. That behaviour -- not a shared digest -- is what replay and
+    idempotency actually depend on.
+    """
+    lease, _ = _evidence_fixture(db, f"reorder-{label}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{_catalog_snapshot_json(f'snap-reorder-{label}')}'::jsonb)")
+
+    first = _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{_catalog_record_json(snapshot, f'rec-reorder-{label}', payload=forward)}'::jsonb)")
+    again = _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{_catalog_record_json(snapshot, f'rec-reorder-{label}', payload=reordered)}'::jsonb)")
+    assert again == first, "a reordered payload is the same record, not a conflict"
+    assert db.psql(f"select stored_record_count from public.catalog_source_snapshots "
+                   f"where id='{snapshot}'") == "1"
+    # A genuinely different payload under the same identity still fails closed.
+    with pytest.raises(AssertionError, match="catalog raw record idempotency conflict"):
+        _rpc_as_service(db, f"select public.record_catalog_raw_record_guarded({args},'{_catalog_record_json(snapshot, f'rec-reorder-{label}', payload={**forward, 'zz': 9})}'::jsonb)")
+
+
+@pytest.mark.parametrize("label, forward, reordered", REORDERED_PAYLOAD_PAIRS)
+def test_the_raw_record_digest_is_storage_local_and_the_two_backends_differ(db, label,
+                                                                            forward,
+                                                                            reordered):
+    """The digest is local to its storage, and this asserts the inequality.
+
+    PostgreSQL renders `{"a": 1, "b": 2}` (keys by length then bytes, spaced
+    separators); the memory backend renders `{"a":1,"b":2}` (keys bytewise,
+    compact). Both are order-independent, and they are NOT equal -- which is
+    exactly what `backend/catalog/digest.py` now says, and what PR #86
+    wrongly claimed the opposite of.
+
+    Asserting the inequality here means the claim cannot quietly come back: a
+    future edit that made the memory digest "match" would fail this test and
+    have to justify itself.
+    """
+    lease, _ = _evidence_fixture(db, f"digest-{label}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{_catalog_snapshot_json(f'snap-digest-{label}')}'::jsonb)")
+    record = _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{_catalog_record_json(snapshot, f'rec-digest-{label}', payload=forward)}'::jsonb)")
+
+    stored = db.psql(f"select payload_sha256 from public.catalog_raw_records where id='{record}'")
+    # PostgreSQL's digest is over ITS rendering, and is order-independent.
+    assert stored == db.psql(
+        f"select encode(sha256(convert_to('{json.dumps(reordered)}'::jsonb::text,'UTF8')),'hex')")
+    # The memory backend's digest is order-independent too...
+    assert catalog_payload_digest(forward) == catalog_payload_digest(reordered)
+    # ...and is a DIFFERENT value. Storage-local, stated and enforced.
+    assert catalog_payload_digest(forward) != stored, (
+        "the memory digest must not be claimed equal to PostgreSQL's")
+    # The renderings themselves are what differ.
+    assert canonical_payload_text(forward) != db.psql(
+        f"select '{json.dumps(forward)}'::jsonb::text")
+
+
+def test_postgres_orders_jsonb_keys_by_length_then_bytes(db):
+    """The rule that makes one portable rendering impossible to fake cheaply.
+
+    Documented here because it is the reason the digest is storage-local: a
+    Python `sort_keys=True` is bytewise, and the two orders disagree the moment
+    a shorter key sorts after a longer one.
+    """
+    assert db.psql("""select '{"bb":1,"a":2,"ccc":3}'::jsonb::text""") == \
+        '{"a": 2, "bb": 1, "ccc": 3}'
+    assert db.psql("""select '{"aa":1,"b":2}'::jsonb::text""") == '{"b": 2, "aa": 1}'
+    # Bytewise would have put "aa" first; PostgreSQL puts the shorter key first.
+    assert canonical_payload_text({"aa": 1, "b": 2}) == '{"aa":1,"b":2}'

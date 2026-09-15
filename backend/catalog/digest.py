@@ -1,15 +1,43 @@
-"""The raw-record payload digest, derived the way PostgreSQL derives it.
+"""The raw-record payload digest — deliberately STORAGE-LOCAL, not portable.
 
-The database computes `encode(sha256(convert_to(payload::text, 'UTF8')), 'hex')`
-over the jsonb it actually stores. `jsonb` normalizes as it stores -- object
-keys are reordered and whitespace is dropped -- so the digest is a function of
-the STORED value, not of whatever text a caller happened to send.
+What this is, and what it is not
+--------------------------------
 
-This helper exists so the in-memory repository derives the same value for the
-same payload, and so nothing in the backend has to predict that rendering in
-order to WRITE a record: the field is refused on input everywhere, and the
-digest is produced on the storage side. It is an identity and deduplication
-device only; no similarity or embedding is involved.
+Each backend derives this digest over ITS OWN stored representation of a
+payload:
+
+*   PostgreSQL stores `jsonb` and derives
+    `encode(sha256(convert_to(payload::text, 'UTF8')), 'hex')`. `jsonb`
+    normalizes on the way in -- object keys are reordered by (key length, then
+    bytes) and rendered with `", "` and `": "` separators -- so the digest is a
+    function of the value PostgreSQL stores, not of the text anyone sent.
+*   The in-memory repository stores a Python object and derives the digest over
+    the CANONICAL form below: keys sorted bytewise, compact separators.
+
+**These two renderings are different on purpose, and the digests therefore
+differ for any object with more than one key.** Nothing in this repository
+claims they are equal, and `tests/test_migrations_postgres.py` asserts the
+inequality so the claim cannot quietly reappear.
+
+Reproducing PostgreSQL's rendering in Python would mean reproducing its key
+ordering, its numeric normalization and its escaping rules -- a coupling to one
+database's internals of exactly the kind this corrective round removed when it
+stopped requiring callers to predict `jsonb::text`. A digest that is honestly
+local to its storage is safer than a digest that is portable until the day it
+silently is not.
+
+What IS guaranteed, in both backends
+------------------------------------
+
+The digest is a function of the payload's VALUE, never of the order its keys
+happened to arrive in. `{"a": 1, "b": 2}` and `{"b": 2, "a": 1}` are one value,
+at any nesting depth, so within either backend they produce one digest, collapse
+onto one row on replay, and raise the same idempotency conflict against a
+genuinely different payload. That behavioural parity is what replay depends on,
+and it is proven executably against both backends rather than asserted here.
+
+The digest is an identity and deduplication device only; no similarity or
+embedding is involved anywhere in this path.
 """
 
 from __future__ import annotations
@@ -18,19 +46,32 @@ import hashlib
 import json
 from typing import Any, Mapping
 
+#: How the in-memory backend renders a payload before hashing it. Sorted keys
+#: make the result independent of insertion order at every depth; the compact
+#: separators make it VISIBLY not PostgreSQL's rendering, so the two are never
+#: mistaken for one canonical form.
+_CANONICAL_SEPARATORS = (",", ":")
+
+
+def canonical_payload_text(payload: Mapping[str, Any]) -> str:
+    """The memory backend's canonical rendering of one payload.
+
+    `sort_keys` applies recursively, so nested objects are canonical too.
+    `ensure_ascii=False` keeps source text as the source wrote it rather than
+    escaping it into a different string.
+    """
+    return json.dumps(payload, sort_keys=True, separators=_CANONICAL_SEPARATORS,
+                      ensure_ascii=False)
+
 
 def catalog_payload_digest(payload: Mapping[str, Any]) -> str:
     """The SHA-256 of one stored raw-record payload, lowercase hex.
 
-    PostgreSQL renders jsonb with `", "` between pairs and `": "` after a key,
-    and preserves the insertion order it normalized to. Reproducing that here
-    keeps the memory repository's stored digest equal to the database's for the
-    payloads the catalog accepts -- flat objects of scalars, which is what a
-    bounded upstream record is.
+    Storage-local to the in-memory backend. Equal payloads -- in any key order,
+    at any depth -- give equal digests; different payloads give different ones.
+    It is NOT equal to the digest PostgreSQL stores for the same payload.
     """
-    return hashlib.sha256(
-        json.dumps(payload, separators=(", ", ": "), ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(canonical_payload_text(payload).encode("utf-8")).hexdigest()
 
 
-__all__ = ["catalog_payload_digest"]
+__all__ = ["canonical_payload_text", "catalog_payload_digest"]
