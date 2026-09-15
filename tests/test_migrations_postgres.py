@@ -4724,3 +4724,113 @@ def test_a_catalog_link_cites_a_verdict_built_from_the_shared_fixture(db):
                    f"from public.catalog_candidate_evidence_links where id='{link}'") == (
         f"{evidence_fixtures.LOCATOR}|{evidence_fixtures.SOURCE_VERSION_KIND}"
         f"|{evidence_fixtures.SOURCE_VERSION_ID}")
+
+
+# ---------------------------------------------------------------------------
+# The verdict REPLAY contract, on the database itself.
+# ---------------------------------------------------------------------------
+#
+# Paired one-for-one with
+# `tests/test_catalog_persistence.py` section 4, using the SAME shared-fixture
+# builders, so the memory mirror and the database cannot drift apart.
+
+#: (case, expected error or None when the call must be accepted)
+VERDICT_REPLAY_CASES = [
+    ("reason", "claim verdict idempotency conflict"),
+    ("replace", "verdict support links do not match the cited evidence"),
+    ("add", "verdict support links do not match the cited evidence"),
+    ("remove_one", "verdict support links do not match the cited evidence"),
+    ("remove_all", "verdict support links do not match the cited evidence"),
+    ("duplicate_first", "verdict support links do not match the cited evidence"),
+    ("duplicate_replay", "verdict support links do not match the cited evidence"),
+    ("reorder", None),
+    ("local_with_support", "a locally settled verdict cites no evidence"),
+    ("verified_local_with_support", "a locally settled verdict cites no evidence"),
+    ("verified_local_no_support", "an accepted verdict must cite durable evidence"),
+]
+
+_SECOND_FRAGMENT_TEXT = evidence_fixtures.FRAGMENT_TEXT + " (a second bounded excerpt)"
+
+
+def _verdict_scenario(db, args, label):
+    """A claim with TWO durable fragments of its own source, ready to cite."""
+    F = evidence_fixtures
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{json.dumps(F.source_payload(f'{label}-source'))}'::jsonb)")
+    fragment_a = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{json.dumps(F.fragment_payload(f'{label}-fragA', source))}'::jsonb)")
+    fragment_b = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{json.dumps(F.fragment_payload(f'{label}-fragB', source, text=_SECOND_FRAGMENT_TEXT, index=1))}'::jsonb)")
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{json.dumps(F.claim_payload(f'{label}-claim', source))}'::jsonb)")
+    return (claim, F.support_link(fragment_a),
+            F.support_link(fragment_b, text=_SECOND_FRAGMENT_TEXT))
+
+
+def _verdict_calls(case, claim, link_a, link_b):
+    """The one or two payload kwargs this case submits, in order."""
+    F = evidence_fixtures
+    both, only_a = [link_a, link_b], [link_a]
+    local = {"mode": "deterministic_local"}
+    review = {"verdict": "needs_review"}
+    return {
+        "reason": ([{"support": only_a}],
+                   [{"support": only_a, "reason": "A COMPLETELY DIFFERENT REASON"}]),
+        "replace": ([{"support": only_a}], [{"support": [link_b]}]),
+        "add": ([{"support": only_a}], [{"support": both}]),
+        "remove_one": ([{"support": both, **review}], [{"support": only_a, **review}]),
+        "remove_all": ([{"support": only_a, **review}], [{"support": [], **review}]),
+        "duplicate_first": ([], [{"support": [link_a, dict(link_a)]}]),
+        "duplicate_replay": ([{"support": only_a}],
+                             [{"support": [link_a, dict(link_a)]}]),
+        "reorder": ([{"support": both}], [{"support": [link_b, link_a]}]),
+        "local_with_support": ([], [{"support": only_a, **local, **review}]),
+        "verified_local_with_support": ([], [{"support": only_a, **local}]),
+        "verified_local_no_support": ([], [{"support": [], **local}]),
+    }[case]
+
+
+def _stored_support(db, run_id, key):
+    return db.psql(
+        f"select coalesce(string_agg(s.fragment_id::text, ',' order by s.fragment_id::text), '') "
+        f"from public.claim_verdict_supports s join public.claim_verdicts v on v.id = s.verdict_id "
+        f"where v.run_id = '{run_id}' and v.evidence_key = '{key}'")
+
+
+@pytest.mark.parametrize("case, expected", VERDICT_REPLAY_CASES)
+def test_the_verdict_replay_contract_is_the_databases_own(db, case, expected):
+    """Every verdict-replay rule the memory mirror claims, on real PostgreSQL.
+
+    `add` is the one the database itself got wrong: it inserted the added
+    support link and then compared `count(*)` of the UNION of the stored and
+    cited sets against the CITED length. A cited superset makes those equal,
+    so an addition was accepted and the stored support set silently grew --
+    while the function's own comment said "a replay that dropped or added
+    evidence is a contract failure". The corrective migration compares the
+    stored set to the cited set and writes nothing on a replay.
+    """
+    lease, _ = _evidence_fixture(db, f"replay-{case}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    claim, link_a, link_b = _verdict_scenario(db, args, f"replay-{case}")
+    key = f"v-{case}"
+    first_calls, last_calls = _verdict_calls(case, claim, link_a, link_b)
+
+    def submit(kwargs):
+        payload = evidence_fixtures.verdict_payload(key, claim, **kwargs)
+        return _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{json.dumps(payload)}'::jsonb)")
+
+    verdict_id = None
+    for kwargs in first_calls:
+        verdict_id = submit(kwargs)
+    before = _stored_support(db, run_id, key)
+
+    if expected is None:
+        for kwargs in last_calls:
+            assert submit(kwargs) == verdict_id, "an accepted replay returns the same row"
+    else:
+        for kwargs in last_calls:
+            with pytest.raises(AssertionError, match=expected):
+                submit(kwargs)
+
+    # A refused call writes NOTHING: the stored support set is untouched, and
+    # a refused first call leaves no verdict row at all.
+    assert _stored_support(db, run_id, key) == before
+    assert db.psql(f"select count(*) from public.claim_verdicts where run_id='{run_id}' "
+                   f"and evidence_key='{key}'") == ("1" if first_calls else "0")

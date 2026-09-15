@@ -594,3 +594,204 @@ begin
   return next v_row;
 end;
 $$;
+
+
+-- ---------------------------------------------------------------------------
+-- 8. A verdict REPLAY may not change the durable support set.
+-- ---------------------------------------------------------------------------
+--
+-- `record_claim_verdict_guarded` (from
+-- `20260907000100_r4_deterministic_verification.sql`) says, in its own
+-- comment, that "the stored link set must be EXACTLY what was cited: a replay
+-- that dropped or added evidence is a contract failure". It caught DROPPED and
+-- missed ADDED.
+--
+-- The reason is the shape of the check. It inserted every cited link first --
+-- `on conflict (verdict_id, fragment_id) do nothing` -- and only then compared
+--
+--     count(*) from claim_verdict_supports where verdict_id = v_row.id
+--
+-- against `jsonb_array_length(v_support)`. That count is the count of the
+-- UNION of the already-stored set and the newly-cited set. When the cited set
+-- is a strict SUPERSET of the stored one the union equals the cited set, the
+-- counts match, and the call succeeds -- having already inserted the extra
+-- link. Observed on the merged schema: a verdict stored citing fragment A,
+-- replayed citing [A, B], returned the SAME verdict id with its stored support
+-- silently grown to {A, B}.
+--
+-- So a replay could mutate the durable evidence a stored verdict rests on,
+-- which is exactly what an idempotent write must never do.
+--
+-- The corrected function keeps every message and every lineage rule and
+-- changes only the set comparison:
+--
+--   * the cited links are validated for lineage BEFORE anything is written;
+--   * a cited list with a repeated fragment is not a set, and is refused
+--     whether it is the first write or a replay;
+--   * on a REPLAY nothing is inserted at all -- the stored set and the cited
+--     set are compared, and any difference (added, removed or replaced) is
+--     refused, so a refused replay leaves the stored support untouched;
+--   * input ORDER remains irrelevant: support is stored as relational rows,
+--     so set membership and cardinality are the identity, not sequence.
+--
+-- Forward-only: this replaces the function body in place. The
+-- `claim_verdicts` / `claim_verdict_supports` relations are unchanged, no row
+-- is written, and every previously-accepted call is still accepted.
+
+create or replace function public.record_claim_verdict_guarded(
+  p_run_id uuid, p_worker_id text, p_attempt integer, p_lease_token text,
+  p_verdict jsonb
+) returns setof public.claim_verdicts
+language plpgsql
+set search_path = pg_catalog
+as $$
+declare
+  v_row public.claim_verdicts;
+  v_claim public.claims;
+  v_key text; v_verdict text; v_reason text; v_mode text; v_contract text;
+  v_support jsonb; v_link jsonb; v_fragment public.source_evidence_fragments;
+  v_source public.sources;
+  v_count integer; v_cited integer; v_replay boolean;
+begin
+  perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
+  if p_verdict::text ~* '"(chain_of_thought|provider_detail|raw_error|api_key|secret|password|authorization|credentials|exception|lease_token|token)"[[:space:]]*:'
+     or lower(p_verdict::text) like '%secret sentinel%'
+     or lower(p_verdict::text) like '%chain of thought%' then
+    raise exception 'unsafe evidence payload rejected' using errcode = '22023';
+  end if;
+  if nullif(p_verdict->>'evidence_key', '') is null then
+    raise exception 'invalid claim verdict: evidence_key is required' using errcode = '22023';
+  end if;
+  v_key := p_verdict->>'evidence_key';
+  v_verdict := p_verdict->>'verdict';
+  v_reason := p_verdict->>'reason';
+  v_mode := p_verdict->>'verification_mode';
+  v_contract := p_verdict->>'verifier_contract_version';
+  v_support := coalesce(p_verdict->'support', '[]'::jsonb);
+  if jsonb_typeof(v_support) <> 'array' then
+    raise exception 'invalid claim verdict: support must be an array' using errcode = '22023';
+  end if;
+  -- The per-source durable fragment bound is also the bound on how much
+  -- evidence one verdict may cite: a verdict rests on fragments of ONE source.
+  if jsonb_array_length(v_support) > 4 then
+    raise exception 'claim verdict cites more evidence than a source can hold' using errcode = '22023';
+  end if;
+
+  -- Claim-bound only, and same-run only.
+  select * into v_claim from public.claims
+    where id = (p_verdict->>'claim_id')::uuid and run_id = p_run_id;
+  if v_claim.id is null then
+    raise exception 'invalid claim verdict claim' using errcode = '23503';
+  end if;
+  -- A locally settled verdict compares no evidence, so it may cite none.
+  if v_mode = 'deterministic_local' and jsonb_array_length(v_support) > 0 then
+    raise exception 'a locally settled verdict cites no evidence' using errcode = '22023';
+  end if;
+  -- An ACCEPTED verdict must be bound to durable evidence. This is the durable
+  -- half of "forged, cross-source or missing support links fail closed".
+  if v_verdict = 'verified' and jsonb_array_length(v_support) = 0 then
+    raise exception 'an accepted verdict must cite durable evidence' using errcode = '22023';
+  end if;
+
+  select * into v_source from public.sources
+    where id = v_claim.source_id and run_id = p_run_id;
+  if v_source.id is null then
+    raise exception 'invalid claim verdict source' using errcode = '23503';
+  end if;
+
+  -- Every cited link is validated BEFORE anything is written, so a forged or
+  -- cross-source citation can never reach the stored set.
+  for v_link in select value from jsonb_array_elements(v_support) as entry(value) loop
+    select * into v_fragment from public.source_evidence_fragments
+      where id = (v_link->>'fragment_id')::uuid and run_id = p_run_id;
+    if v_fragment.id is null then
+      -- A support link naming no durable fragment of this run is forged.
+      raise exception 'verdict support link does not name durable evidence' using errcode = '23503';
+    end if;
+    -- The lineage every support link must satisfy: the evidence must belong to
+    -- the CLAIM'S OWN source, and to the same task that captured that source.
+    -- Same run is deliberately not enough.
+    if v_fragment.source_id is distinct from v_claim.source_id then
+      raise exception 'verdict support link belongs to another source' using errcode = '22023';
+    end if;
+    if v_fragment.task_key is distinct from v_source.task_key then
+      raise exception 'verdict support link task provenance mismatch' using errcode = '22023';
+    end if;
+    if v_fragment.content_hash is distinct from (v_link->>'content_hash') then
+      raise exception 'verdict support link content hash mismatch' using errcode = '22023';
+    end if;
+    if v_fragment.locator_key is distinct from nullif(v_link->>'locator_key', '') then
+      raise exception 'verdict support link locator mismatch' using errcode = '22023';
+    end if;
+  end loop;
+
+  -- Support is a SET. A list naming one fragment twice cites one fragment, so
+  -- it can never produce two stored rows -- it is a caller bug, not a set.
+  select count(distinct (value->>'fragment_id')::uuid) into v_cited
+    from jsonb_array_elements(v_support) as entry(value);
+  if v_cited is distinct from jsonb_array_length(v_support) then
+    raise exception 'verdict support links do not match the cited evidence' using errcode = '22023';
+  end if;
+
+  insert into public.claim_verdicts
+    (run_id, claim_id, evidence_key, verdict, reason, verification_mode,
+     verifier_contract_version)
+  values (p_run_id, v_claim.id, v_key, v_verdict, v_reason, v_mode, v_contract)
+  on conflict (run_id, evidence_key) do nothing
+  returning * into v_row;
+  v_replay := v_row.id is null;
+
+  if v_replay then
+    -- Exact replay: the row already exists. ONE replay invariant -- an
+    -- existing row may only be returned when it is the SAME logical verdict.
+    -- Reusing an evidence_key for a different claim or decision is a caller
+    -- bug, never a silent no-op. The error carries no stored evidence.
+    select * into v_row from public.claim_verdicts
+      where run_id = p_run_id and evidence_key = v_key;
+    if v_row.claim_id is distinct from v_claim.id
+       or v_row.verdict is distinct from v_verdict
+       or v_row.reason is distinct from v_reason
+       or v_row.verification_mode is distinct from v_mode
+       or v_row.verifier_contract_version is distinct from v_contract then
+      raise exception 'claim verdict idempotency conflict' using errcode = '22023';
+    end if;
+
+    -- A REPLAY WRITES NO SUPPORT. The stored set must already BE the cited
+    -- set: equal cardinality and every cited link present. Added, removed and
+    -- replaced evidence all fail here, and because nothing was inserted first,
+    -- a refused replay leaves the stored support exactly as it was. Order is
+    -- not compared -- these are relational rows, not a sequence.
+    select count(*) into v_count from public.claim_verdict_supports
+      where verdict_id = v_row.id;
+    if v_count is distinct from jsonb_array_length(v_support)
+       or exists (select 1 from jsonb_array_elements(v_support) as entry(value)
+                    where not exists (
+                      select 1 from public.claim_verdict_supports s
+                        where s.verdict_id = v_row.id
+                          and s.fragment_id = (entry.value->>'fragment_id')::uuid)) then
+      raise exception 'verdict support links do not match the cited evidence' using errcode = '22023';
+    end if;
+    return next v_row;
+    return;
+  end if;
+
+  -- A NEW verdict: store exactly the cited set.
+  for v_link in select value from jsonb_array_elements(v_support) as entry(value) loop
+    select * into v_fragment from public.source_evidence_fragments
+      where id = (v_link->>'fragment_id')::uuid and run_id = p_run_id;
+    insert into public.claim_verdict_supports
+      (run_id, verdict_id, fragment_id, content_hash, locator_key)
+    values (p_run_id, v_row.id, v_fragment.id, v_fragment.content_hash,
+            v_fragment.locator_key)
+    on conflict (verdict_id, fragment_id) do nothing;
+  end loop;
+
+  -- The stored link set must be EXACTLY what was cited.
+  select count(*) into v_count from public.claim_verdict_supports
+    where verdict_id = v_row.id;
+  if v_count <> jsonb_array_length(v_support) then
+    raise exception 'verdict support links do not match the cited evidence' using errcode = '22023';
+  end if;
+  return next v_row;
+end;
+$$;

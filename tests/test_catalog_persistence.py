@@ -912,3 +912,239 @@ def test_the_memory_digest_is_storage_local_and_says_so():
     assert canonical_payload_text(payload) != postgres_rendering
     assert catalog_payload_digest(payload) != hashlib.sha256(
         postgres_rendering.encode("utf-8")).hexdigest()
+
+
+# =============================================================================
+# 4. the verdict REPLAY contract
+# =============================================================================
+#
+# Round 3 gave the three durable evidence writers a real lease and gave the
+# fixture a chain PostgreSQL accepts. It left one parity gap: the memory
+# verdict replay identity was `(claim_id, verdict, verification_mode,
+# verifier_contract_version)` -- it compared neither `reason` nor the durable
+# support set, and it had no `deterministic_local` rule at all.
+#
+# `record_claim_verdict_guarded` in
+# `supabase/migrations/20260907000100_r4_deterministic_verification.sql`, as
+# corrected by `20260915120000_catalog_integrity_corrections.sql`, is the
+# contract. Every case below has a counterpart in
+# `tests/test_migrations_postgres.py::test_the_verdict_replay_contract_is_the_databases_own`
+# that submits the SAME shared-fixture payloads to the real RPC, so neither
+# side can drift alone.
+
+
+def verdict_scenario(repository, run_id, lease, label):
+    """A claim with TWO durable fragments of its own source, ready to cite."""
+    source = repository.create_source(run_id, F.source_payload(f"{label}-source"), **lease)
+    fragment_a = repository.record_evidence_fragment(
+        run_id, F.fragment_payload(f"{label}-fragA", source["id"]), **lease)
+    text_b = F.FRAGMENT_TEXT + " (a second bounded excerpt)"
+    fragment_b = repository.record_evidence_fragment(
+        run_id, F.fragment_payload(f"{label}-fragB", source["id"], text=text_b, index=1),
+        **lease)
+    claim = repository.create_claim(run_id, F.claim_payload(f"{label}-claim", source["id"]),
+                                    **lease)
+    return (claim, F.support_link(fragment_a["id"]),
+            F.support_link(fragment_b["id"], text=text_b))
+
+
+def stored_verdict(repository, run_id, key):
+    """The one stored verdict row for this replay key."""
+    return next(row for row in repository.tool_rows
+                if str(row.get("run_id")) == str(run_id)
+                and row.get("evidence_key") == key
+                and repository.evidence_kinds.get(str(row.get("id"))) == "claim_verdict")
+
+
+def support_set(row):
+    """The durable support of a stored row, as the SET PostgreSQL stores."""
+    return {(str(link.get("fragment_id")), link.get("content_hash"),
+             link.get("locator_key")) for link in row.get("support") or []}
+
+
+def assert_unchanged(repository, run_id, key, before):
+    """A refused replay writes nothing: same row, same identity, same support."""
+    after = stored_verdict(repository, run_id, key)
+    assert after["id"] == before["id"]
+    assert support_set(after) == support_set(before)
+    for field in ("claim_id", "verdict", "reason", "verification_mode",
+                  "verifier_contract_version"):
+        assert after.get(field) == before.get(field)
+    assert len([row for row in repository.tool_rows
+                if repository.evidence_kinds.get(str(row.get("id"))) == "claim_verdict"
+                and row.get("evidence_key") == key]) == 1
+
+
+def test_a_replayed_verdict_may_not_change_its_reason(memory):
+    """`reason` is part of the verdict, so it is part of the replay identity.
+
+    PostgreSQL compares it alongside claim, verdict, mode and contract; the
+    memory identity tuple omitted it, so the SAME evidence key could be
+    replayed with a different stated reason and silently return the old row.
+    """
+    repository, run_id, lease = memory
+    claim, link_a, _ = verdict_scenario(repository, run_id, lease, "reason")
+    repository.record_claim_verdict(
+        run_id, F.verdict_payload("v-reason", claim["id"], support=[link_a]), **lease)
+    before = stored_verdict(repository, run_id, "v-reason")
+
+    with pytest.raises(AppError, match="claim verdict idempotency conflict"):
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload("v-reason", claim["id"], support=[link_a],
+                                      reason="A COMPLETELY DIFFERENT REASON"), **lease)
+    assert_unchanged(repository, run_id, "v-reason", before)
+
+
+def test_a_replayed_verdict_may_not_replace_its_support(memory):
+    """Swapping one durable fragment for another is a different verdict."""
+    repository, run_id, lease = memory
+    claim, link_a, link_b = verdict_scenario(repository, run_id, lease, "replace")
+    repository.record_claim_verdict(
+        run_id, F.verdict_payload("v-replace", claim["id"], support=[link_a]), **lease)
+    before = stored_verdict(repository, run_id, "v-replace")
+
+    with pytest.raises(AppError,
+                       match="verdict support links do not match the cited evidence"):
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload("v-replace", claim["id"], support=[link_b]), **lease)
+    assert_unchanged(repository, run_id, "v-replace", before)
+
+
+def test_a_replayed_verdict_may_not_add_support(memory):
+    """A replay that cites MORE evidence is not the verdict that was stored.
+
+    This is the case PostgreSQL itself got wrong before
+    `20260915120000_catalog_integrity_corrections.sql`: it inserted the added
+    link, then compared `count(*)` of the UNION against the cited length. A
+    cited superset made those equal, so the addition was accepted AND the
+    stored support set was silently grown.
+    """
+    repository, run_id, lease = memory
+    claim, link_a, link_b = verdict_scenario(repository, run_id, lease, "add")
+    repository.record_claim_verdict(
+        run_id, F.verdict_payload("v-add", claim["id"], support=[link_a]), **lease)
+    before = stored_verdict(repository, run_id, "v-add")
+    assert support_set(before) == {(link_a["fragment_id"], link_a["content_hash"],
+                                    link_a["locator_key"])}
+
+    with pytest.raises(AppError,
+                       match="verdict support links do not match the cited evidence"):
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload("v-add", claim["id"], support=[link_a, link_b]),
+            **lease)
+    assert_unchanged(repository, run_id, "v-add", before)
+
+
+@pytest.mark.parametrize("keep", [1, 0])
+def test_a_replayed_verdict_may_not_remove_support(memory, keep):
+    """Dropping evidence is a contract failure, down to citing none at all."""
+    repository, run_id, lease = memory
+    claim, link_a, link_b = verdict_scenario(repository, run_id, lease, f"drop{keep}")
+    key = f"v-drop-{keep}"
+    repository.record_claim_verdict(
+        run_id, F.verdict_payload(key, claim["id"], verdict="needs_review",
+                                  support=[link_a, link_b]), **lease)
+    before = stored_verdict(repository, run_id, key)
+
+    with pytest.raises(AppError,
+                       match="verdict support links do not match the cited evidence"):
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload(key, claim["id"], verdict="needs_review",
+                                      support=[link_a][:keep]), **lease)
+    assert_unchanged(repository, run_id, key, before)
+
+
+def test_a_verdict_may_not_cite_the_same_fragment_twice(memory):
+    """Support is a SET: a list of two identical links cites ONE fragment.
+
+    PostgreSQL stores support as rows unique on `(verdict_id, fragment_id)`,
+    so a duplicated citation can never become two stored links and the count
+    can never match. This holds on the FIRST write, not only on a replay.
+    """
+    repository, run_id, lease = memory
+    claim, link_a, _ = verdict_scenario(repository, run_id, lease, "dup")
+
+    with pytest.raises(AppError,
+                       match="verdict support links do not match the cited evidence"):
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload("v-dup-first", claim["id"],
+                                      support=[link_a, dict(link_a)]), **lease)
+    assert not [row for row in repository.tool_rows
+                if row.get("evidence_key") == "v-dup-first"]
+
+    repository.record_claim_verdict(
+        run_id, F.verdict_payload("v-dup", claim["id"], support=[link_a]), **lease)
+    before = stored_verdict(repository, run_id, "v-dup")
+    with pytest.raises(AppError,
+                       match="verdict support links do not match the cited evidence"):
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload("v-dup", claim["id"],
+                                      support=[link_a, dict(link_a)]), **lease)
+    assert_unchanged(repository, run_id, "v-dup", before)
+
+
+def test_a_replayed_verdict_accepts_the_same_support_in_any_order(memory):
+    """Input order is not identity -- PostgreSQL stores relational rows.
+
+    The stored row is returned unchanged, and the stored support set is still
+    the same set. This is the case that must NOT be broken by making the other
+    seven fail closed.
+    """
+    repository, run_id, lease = memory
+    claim, link_a, link_b = verdict_scenario(repository, run_id, lease, "order")
+    first = repository.record_claim_verdict(
+        run_id, F.verdict_payload("v-order", claim["id"], support=[link_a, link_b]),
+        **lease)
+    before = stored_verdict(repository, run_id, "v-order")
+
+    replay = repository.record_claim_verdict(
+        run_id, F.verdict_payload("v-order", claim["id"], support=[link_b, link_a]),
+        **lease)
+    assert replay["id"] == first["id"]
+    assert_unchanged(repository, run_id, "v-order", before)
+
+
+def test_a_locally_settled_verdict_cites_no_evidence(memory):
+    """`deterministic_local` compares no evidence, so it may cite none.
+
+    Memory accepted support on a local verdict; PostgreSQL refuses it.
+    """
+    repository, run_id, lease = memory
+    claim, link_a, _ = verdict_scenario(repository, run_id, lease, "local")
+
+    with pytest.raises(AppError, match="a locally settled verdict cites no evidence"):
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload("v-local", claim["id"], verdict="needs_review",
+                                      mode="deterministic_local", support=[link_a]),
+            **lease)
+    assert not [row for row in repository.tool_rows
+                if row.get("evidence_key") == "v-local"]
+
+    # The legitimate local shape still writes.
+    settled = repository.record_claim_verdict(
+        run_id, F.verdict_payload("v-local-ok", claim["id"], verdict="needs_review",
+                                  mode="deterministic_local", support=[]), **lease)
+    assert support_set(stored_verdict(repository, run_id, "v-local-ok")) == set()
+    assert settled["verification_mode"] == "deterministic_local"
+
+
+@pytest.mark.parametrize("support_given", [True, False])
+def test_a_verified_verdict_can_never_be_locally_settled(memory, support_given):
+    """The two rules meet: local permits no support, verified requires it.
+
+    So `verified` + `deterministic_local` is unreachable from either side --
+    with support the local rule refuses it, without support the accepted-
+    verdict rule does. Both messages are PostgreSQL's own.
+    """
+    repository, run_id, lease = memory
+    claim, link_a, _ = verdict_scenario(repository, run_id, lease, f"vl{support_given:d}")
+    expected = ("a locally settled verdict cites no evidence" if support_given
+                else "an accepted verdict must cite durable evidence")
+
+    with pytest.raises(AppError, match=expected):
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload("v-verified-local", claim["id"], verdict="verified",
+                                      mode="deterministic_local",
+                                      support=[link_a] if support_given else []), **lease)
+    assert not [row for row in repository.tool_rows
+                if row.get("evidence_key") == "v-verified-local"]

@@ -33,6 +33,24 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _support_set(support: Any) -> frozenset[tuple[str, Any, Any]]:
+    """A verdict's durable support as the SET PostgreSQL actually stores.
+
+    `claim_verdict_supports` holds one relational row per cited fragment,
+    unique on `(verdict_id, fragment_id)` and carrying the fragment's own
+    `content_hash` and `locator_key`. So the identity of a verdict's support
+    is the SET of those triples: input order is not part of it, and one
+    fragment cited twice is one row, never two.
+
+    Collapsing to a set is therefore the comparison, and the CARDINALITY of
+    the incoming list is checked separately by the caller -- a list that
+    shrinks when it becomes a set was never a valid citation.
+    """
+    return frozenset((str(link.get("fragment_id")), link.get("content_hash"),
+                      link.get("locator_key"))
+                     for link in (support or []) if isinstance(link, Mapping))
+
+
 class MemoryRepository:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -600,6 +618,25 @@ class MemoryRepository:
         `verified` verdict with no support at all, and its own catalog fixture
         built exactly such a verdict -- so the catalog tests were citing
         something PostgreSQL would have refused to create.
+
+        THE REPLAY IDENTITY IS THE WHOLE VERDICT, SUPPORT INCLUDED. An earlier
+        round compared only `(claim_id, verdict, verification_mode,
+        verifier_contract_version)`, so the same evidence key could be replayed
+        with a different stated `reason`, or with evidence added, removed or
+        swapped, and quietly return the stored row. PostgreSQL compares the
+        reason too, and holds the stored support set to the cited one.
+
+        SUPPORT IS A SET, NOT A SEQUENCE. PostgreSQL stores support as rows
+        unique on `(verdict_id, fragment_id)`, so input ORDER is not identity
+        -- membership and cardinality are. The same links in a different order
+        replay onto the same row; a repeated link cites one fragment and can
+        never produce two stored rows, so it is refused.
+
+        NOTHING IS WRITTEN UNTIL EVERY CHECK HAS PASSED. The lease, the
+        vocabulary, the lineage of each cited link, the set cardinality and the
+        replay comparison all run before the row is appended, so a refused call
+        -- first write or replay -- leaves the stored verdict and its support
+        exactly as they were.
         """
         self._evidence_lease(run_id, worker_id, attempt, lease_token)
         key = self._require_evidence_key(verdict, "CLAIM_VERDICT")
@@ -622,6 +659,13 @@ class MemoryRepository:
                            "claim verdict cites more evidence than a source can hold", 400)
         claim = self._typed_evidence_row(verdict.get("claim_id"), run_id, "claim",
                                          "CLAIM_VERDICT", "claim")
+        # A locally settled verdict compares no evidence, so it may cite none.
+        # With the rule below, this also makes `verified` + `deterministic_local`
+        # unreachable from either side: local permits no support, and an
+        # accepted verdict requires it.
+        if verdict.get("verification_mode") == "deterministic_local" and support:
+            raise AppError("CLAIM_VERDICT_LOCAL_SUPPORT",
+                           "a locally settled verdict cites no evidence", 400)
         if verdict.get("verdict") == "verified" and not support:
             raise AppError("CLAIM_VERDICT_UNSUPPORTED",
                            "an accepted verdict must cite durable evidence", 400)
@@ -643,10 +687,19 @@ class MemoryRepository:
             if fragment.get("locator_key") != link.get("locator_key"):
                 raise AppError("CLAIM_VERDICT_SUPPORT_LOCATOR",
                                "verdict support link locator mismatch", 400)
+        # Support is a SET: a list naming one fragment twice cites one fragment,
+        # so it could never become two rows unique on (verdict_id, fragment_id).
+        if len(_support_set(support)) != len(support):
+            raise AppError("CLAIM_VERDICT_SUPPORT_SET",
+                           "verdict support links do not match the cited evidence", 400)
         return self._replayable_evidence_row(run_id, key, verdict, "claim_verdict",
-                                             ("claim_id", "verdict", "verification_mode",
-                                              "verifier_contract_version"),
-                                             "CLAIM_VERDICT")
+                                             ("claim_id", "verdict", "reason",
+                                              "verification_mode",
+                                              "verifier_contract_version", "support"),
+                                             "CLAIM_VERDICT",
+                                             normalizers={"support": _support_set},
+                                             messages={"support": "verdict support links "
+                                                       "do not match the cited evidence"})
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *,
                                    worker_id: str, attempt: int,
@@ -665,7 +718,10 @@ class MemoryRepository:
 
     def _replayable_evidence_row(self, run_id: UUID, key: str, payload: dict[str, Any],
                                  kind: str, identity: tuple[str, ...],
-                                 code: str) -> dict[str, Any]:
+                                 code: str, *,
+                                 normalizers: Mapping[str, Any] | None = None,
+                                 messages: Mapping[str, str] | None = None,
+                                 ) -> dict[str, Any]:
         """Return the existing row for an exact replay, or fail closed.
 
         `(run_id, evidence_key)` is the replay identity in PostgreSQL, so a
@@ -673,15 +729,27 @@ class MemoryRepository:
         for different content is a conflict -- never a second row and never a
         silent overwrite.
         """
+        normalizers = normalizers or {}
+        messages = messages or {}
         existing = next((row for row in self.tool_rows
                          if str(row.get("run_id")) == str(run_id)
                          and row.get("evidence_key") == key
                          and self.evidence_kinds.get(str(row.get("id"))) == kind), None)
         if existing is None:
             return self._tool_row(run_id, payload, kind=kind)
-        if any(existing.get(field) != payload.get(field) for field in identity):
-            raise AppError(f"{code}_IDEMPOTENCY_CONFLICT",
-                           f"{kind.replace('_', ' ')} idempotency conflict", 409)
+        for field in identity:
+            # A normalized field is compared by VALUE, not by representation:
+            # a verdict's support is a set of relational rows in PostgreSQL, so
+            # the same links in a different order are the same support.
+            normalize = normalizers.get(field)
+            stored, cited = existing.get(field), payload.get(field)
+            if normalize is not None:
+                stored, cited = normalize(stored), normalize(cited)
+            if stored != cited:
+                raise AppError(f"{code}_IDEMPOTENCY_CONFLICT",
+                               messages.get(field,
+                                            f"{kind.replace('_', ' ')} idempotency conflict"),
+                               409)
         return dict(existing)
 
     def _typed_evidence_row(self, row_id: Any, run_id: UUID, kind: str,
@@ -724,6 +792,28 @@ class MemoryRepository:
     # because their signatures predate the lease contract. Read the tests for
     # what is actually established; do not read this class as a claim that
     # anything PostgreSQL refuses is refused here.
+    #
+    # HOW FAR REPLAY PARITY GOES. It is established, case by case against the
+    # real RPCs, for the DURABLE EVIDENCE WRITERS ONLY:
+    #
+    #   * `record_claim_verdict` -- the full replay identity (claim, verdict,
+    #     reason, mode, contract version) and the durable support set, as a
+    #     set: see `tests/test_catalog_persistence.py` section 4, paired with
+    #     `test_the_verdict_replay_contract_is_the_databases_own`;
+    #   * `record_evidence_fragment` and the catalog writers -- `(run_id,
+    #     evidence_key)` / the catalog identity keys, each with a counterpart
+    #     PostgreSQL test.
+    #
+    # It is NOT claimed for `create_source`, `create_claim`, `create_conflict`
+    # or `create_tool_usage`, whose replay behaviour is untested here and
+    # unchanged.
+    #
+    # One rule is deliberately absent from `record_claim_verdict` because it is
+    # unreachable, not because it is unenforced: PostgreSQL re-checks each
+    # support link's `task_key` against the cited source's. Here
+    # `record_evidence_fragment` already refuses a fragment whose task differs
+    # from its own source's, so a fragment of the claim's source always carries
+    # that source's task.
 
     _CATALOG_SNAPSHOT_IDENTITY = ("source_family", "resource_id", "upstream_version",
                                   "upstream_version_kind", "content_sha256",
