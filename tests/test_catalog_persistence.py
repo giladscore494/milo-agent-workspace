@@ -30,6 +30,7 @@ from backend.catalog.keys import CatalogKeyError
 from backend.catalog.payloads import CatalogPayloadError
 from backend.errors import AppError
 from backend.repository.supabase import Repository, SupabaseRepository
+from backend.testing import evidence_fixtures as F
 from backend.testing.memory_repository import MemoryRepository
 
 from tests.test_repository_supabase import FakeClient  # the same fake, one definition
@@ -45,9 +46,11 @@ CATALOG_WRITES = (
 )
 
 #: The R3 provenance a real source and claim carry, and which a link derives
-#: rather than accepts.
-LOCATOR = '["record_field","rec-1",["engine_displacement_cc"],null,null,null]'
-VERSION_KIND, VERSION_ID = "dataset_version", "2026.09.1"
+#: rather than accepts. Imported from the shared fixture so the memory tests
+#: and the PostgreSQL cross-backend test cite one definition, not two.
+LOCATOR = F.LOCATOR
+VERSION_KIND, VERSION_ID = F.SOURCE_VERSION_KIND, F.SOURCE_VERSION_ID
+FRAGMENT_TEXT, FRAGMENT_HASH = F.FRAGMENT_TEXT, F.FRAGMENT_HASH
 
 
 # =============================================================================
@@ -249,37 +252,38 @@ def leased_run(repository: MemoryRepository, key="catalog-key-1") -> tuple[UUID,
                              "lease_token": claimed["lease_token"]}
 
 
-#: The durable fragment text a support link is pinned to, and its digest.
-FRAGMENT_TEXT = "model_name=Fixture Hatch; engine_displacement_cc=1798"
-FRAGMENT_HASH = hashlib.sha256(FRAGMENT_TEXT.encode("utf-8")).hexdigest()
-
-
 def real_evidence(repository: MemoryRepository, run_id: UUID, lease: dict, *,
-                  verdict="verified", locator=LOCATOR, kind=VERSION_KIND,
-                  version=VERSION_ID, support=True):
-    """A REAL R3/R4 chain: source -> fragment -> located claim -> verdict.
+                  label: str | None = None, verdict="verified", locator=F.LOCATOR,
+                  kind=F.SOURCE_VERSION_KIND, version=F.SOURCE_VERSION_ID,
+                  support=True, task=F.TASK_KEY, unit=F.FIELD_UNIT):
+    """A REAL R3/R4 chain, built from the SHARED fixture both backends use.
 
-    Every link in that chain is a row this repository actually holds, written
-    through the lease-guarded path, with the fields the corrected catalog link
-    reads. PR #86's version stopped at an unsupported verdict -- which
-    `record_claim_verdict_guarded` refuses to create -- so the catalog tests
-    were citing a verdict PostgreSQL would never have produced.
+    `backend/testing/evidence_fixtures.py` defines these payload shapes once,
+    and `tests/test_migrations_postgres.py::test_the_shared_evidence_fixture_is_accepted_by_the_real_rpcs`
+    submits the same builders through `upsert_source_guarded`,
+    `record_evidence_fragment_guarded`, `create_claim_with_source_guarded` and
+    `record_claim_verdict_guarded` against real PostgreSQL. So a chain that
+    passes here is a chain the database accepts -- which the previous
+    hand-built version was not: it had no `evidence_key`, no `task_key`, a
+    locator with no `fragment_type`, no canonical scope identity, no unit on a
+    numeric located fact, and neither verification mode nor contract version.
     """
-    source = repository.create_source(run_id, {
-        "url": "https://example.test/source", "task_key": "task",
-        "source_version_kind": kind, "source_version_id": version}, **lease)
-    fragment = repository.record_evidence_fragment(run_id, {
-        "source_id": source["id"], "task_key": "task", "fragment_text": FRAGMENT_TEXT,
-        "content_hash": FRAGMENT_HASH, "locator_key": locator, "fragment_index": 0},
+    label = label or f"mem-{uuid4().hex[:10]}"
+    source = repository.create_source(
+        run_id, F.source_payload(f"{label}-source", task=task, version_kind=kind,
+                                 version_id=version), **lease)
+    fragment = repository.record_evidence_fragment(
+        run_id, F.fragment_payload(f"{label}-fragment", source["id"], task=task,
+                                   locator=locator,
+                                   fragment_type=F.FRAGMENT_TYPE if locator else None),
         **lease)
-    claim = repository.create_claim(run_id, {
-        "entity_key": "entity", "field_key": "engine_displacement_cc", "value": 1798,
-        "source_id": source["id"], "evidence_locator": locator}, **lease)
-    links = [{"fragment_id": fragment["id"], "content_hash": FRAGMENT_HASH,
-              "locator_key": locator}] if support else []
-    verdict_row = repository.record_claim_verdict(run_id, {
-        "claim_id": claim["id"], "verdict": verdict, "reason": "R4_STRUCTURED_MATCH",
-        "support": links}, **lease)
+    claim = repository.create_claim(
+        run_id, F.claim_payload(f"{label}-claim", source["id"], task=task, unit=unit,
+                                locator=locator), **lease)
+    links = [F.support_link(fragment["id"], locator=locator)] if support else []
+    verdict_row = repository.record_claim_verdict(
+        run_id, F.verdict_payload(f"{label}-verdict", claim["id"], verdict=verdict,
+                                  support=links), **lease)
     return source, fragment, claim, verdict_row
 
 
@@ -648,13 +652,65 @@ NEW_EVIDENCE_WRITERS = ("record_evidence_fragment", "record_claim_verdict",
 
 def evidence_payload_for(method, claim_id="claim", fragment_id="fragment"):
     return {
-        "record_evidence_fragment": {"source_id": "s", "task_key": "task",
-                                     "fragment_text": FRAGMENT_TEXT,
-                                     "content_hash": FRAGMENT_HASH, "locator_key": LOCATOR},
-        "record_claim_verdict": {"claim_id": claim_id, "verdict": "needs_review",
-                                 "reason": "R4_NEEDS_REVIEW", "support": []},
+        "record_evidence_fragment": F.fragment_payload("lease-probe-fragment", "s"),
+        "record_claim_verdict": F.verdict_payload("lease-probe-verdict", claim_id,
+                                                  verdict="needs_review", support=[]),
         "record_conflict_resolution": {"evidence_key": "res-1", "state": "resolved"},
     }[method]
+
+
+@pytest.mark.parametrize("method", NEW_EVIDENCE_WRITERS)
+def test_no_memory_evidence_writer_accepts_a_missing_lease(memory, method):
+    """A lease is REQUIRED, not merely checked when offered.
+
+    The previous round took `**lease` and passed whatever arrived into
+    `_assert_active_lease`, which SKIPS whichever component is `None`. Handing
+    it nothing therefore meant handing it no checks, and a leaseless write
+    succeeded -- while `assert_worker_lease`'s four arguments are mandatory in
+    every RPC signature.
+
+    The keyword-only parameters make Python refuse the call, and
+    `_evidence_lease` refuses a `None` reaching it by any other route, so the
+    contract is pinned rather than left to argument binding.
+    """
+    repository, run_id, lease = memory
+    before = len(repository.tool_rows)
+    with pytest.raises(TypeError, match="required keyword-only argument"):
+        getattr(repository, method)(run_id, evidence_payload_for(method))
+    # ...and the check itself fails closed, independently of how it was called.
+    with pytest.raises(AppError, match="requires a complete worker lease") as refusal:
+        repository._evidence_lease(run_id, None, None, None)
+    assert refusal.value.code == "RUN_TRANSITION_CONFLICT"
+    assert len(repository.tool_rows) == before
+
+
+@pytest.mark.parametrize("method", NEW_EVIDENCE_WRITERS)
+@pytest.mark.parametrize("omit", ["worker_id", "attempt", "lease_token"])
+def test_no_memory_evidence_writer_accepts_a_partial_lease(memory, method, omit):
+    """Each required field, omitted individually, refuses before writing."""
+    repository, run_id, lease = memory
+    before = len(repository.tool_rows)
+    partial = {name: value for name, value in lease.items() if name != omit}
+    with pytest.raises(TypeError, match="required keyword-only argument"):
+        getattr(repository, method)(run_id, evidence_payload_for(method), **partial)
+    # And an explicit None for that field is refused by the check, not skipped.
+    with pytest.raises(AppError, match="requires a complete worker lease"):
+        getattr(repository, method)(run_id, evidence_payload_for(method),
+                                    **{**lease, omit: None})
+    assert len(repository.tool_rows) == before
+
+
+@pytest.mark.parametrize("method", NEW_EVIDENCE_WRITERS)
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_no_memory_evidence_writer_accepts_a_blank_lease_component(memory, method, blank):
+    """An empty string is an absent value, not a lease."""
+    repository, run_id, lease = memory
+    before = len(repository.tool_rows)
+    for field in ("worker_id", "lease_token"):
+        with pytest.raises(AppError, match="requires a complete worker lease"):
+            getattr(repository, method)(run_id, evidence_payload_for(method),
+                                        **{**lease, field: blank})
+    assert len(repository.tool_rows) == before
 
 
 @pytest.mark.parametrize("method", NEW_EVIDENCE_WRITERS)
@@ -702,17 +758,17 @@ def test_a_verified_verdict_without_durable_support_is_rejected(memory):
     source, fragment, claim, _ = real_evidence(repository, run_id, lease)
     before = len(repository.tool_rows)
     with pytest.raises(AppError, match="an accepted verdict must cite durable evidence"):
-        repository.record_claim_verdict(run_id, {
-            "claim_id": claim["id"], "verdict": "verified", "support": []}, **lease)
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload("unsupported", claim["id"], support=[]), **lease)
     assert len(repository.tool_rows) == before
     # A verdict that does NOT accept the claim may legitimately cite nothing.
-    repository.record_claim_verdict(run_id, {
-        "claim_id": claim["id"], "verdict": "needs_review", "support": []}, **lease)
+    repository.record_claim_verdict(
+        run_id, F.verdict_payload("needs-review", claim["id"], verdict="needs_review",
+                                  support=[]), **lease)
     # And a verified verdict WITH its durable support is accepted.
-    accepted = repository.record_claim_verdict(run_id, {
-        "claim_id": claim["id"], "verdict": "verified",
-        "support": [{"fragment_id": fragment["id"], "content_hash": FRAGMENT_HASH,
-                     "locator_key": LOCATOR}]}, **lease)
+    accepted = repository.record_claim_verdict(
+        run_id, F.verdict_payload("supported", claim["id"],
+                                  support=[F.support_link(fragment["id"])]), **lease)
     assert accepted["verdict"] == "verified"
 
 
@@ -728,8 +784,7 @@ def test_forged_or_mismatched_verdict_support_is_rejected(memory, build, expecte
     """Every way a support link could name something it is not."""
     repository, run_id, lease = memory
     source, fragment, claim, _ = real_evidence(repository, run_id, lease)
-    link = {"fragment_id": fragment["id"], "content_hash": FRAGMENT_HASH,
-            "locator_key": LOCATOR}
+    link = F.support_link(fragment["id"])
 
     if build == "invented_fragment":
         link["fragment_id"] = str(uuid4())
@@ -749,8 +804,9 @@ def test_forged_or_mismatched_verdict_support_is_rejected(memory, build, expecte
 
     before = len(repository.tool_rows)
     with pytest.raises(AppError, match=expected):
-        repository.record_claim_verdict(run_id, {
-            "claim_id": claim["id"], "verdict": "verified", "support": [link]}, **lease)
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload(f"forged-{build}", claim["id"], support=[link]),
+            **lease)
     assert len(repository.tool_rows) == before
 
 
@@ -770,8 +826,9 @@ def test_a_row_of_the_wrong_type_cannot_stand_in_for_a_claim(memory, field, wron
     source, fragment, claim, verdict = real_evidence(repository, run_id, lease)
     impostor = {"source": source, "verdict": verdict}[wrong_kind]
     with pytest.raises(AppError, match=expected):
-        repository.record_claim_verdict(run_id, {
-            field: impostor["id"], "verdict": "needs_review", "support": []}, **lease)
+        repository.record_claim_verdict(
+            run_id, F.verdict_payload(f"impostor-{wrong_kind}", impostor["id"],
+                                      verdict="needs_review", support=[]), **lease)
 
 
 @pytest.mark.parametrize("field, impostor_kind, expected", [

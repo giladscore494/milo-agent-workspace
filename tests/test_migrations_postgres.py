@@ -37,6 +37,7 @@ import pytest
 
 from backend.catalog import keys as catalog_keys
 from backend.catalog.digest import canonical_payload_text, catalog_payload_digest
+from backend.testing import evidence_fixtures
 from backend.engines.swarm_v2.conflict_policy import CONFLICT_POLICY_VERSION
 from backend.engines.swarm_v2.evidence_contracts import (document_span_locator,
                                                          record_field_locator)
@@ -4573,3 +4574,153 @@ def test_postgres_orders_jsonb_keys_by_length_then_bytes(db):
     assert db.psql("""select '{"aa":1,"b":2}'::jsonb::text""") == '{"b": 2, "aa": 1}'
     # Bytewise would have put "aa" first; PostgreSQL puts the shorter key first.
     assert canonical_payload_text({"aa": 1, "b": 2}) == '{"aa":1,"b":2}'
+
+
+# --- the SHARED evidence fixture, submitted through the real RPCs -----------
+#
+# `backend/testing/evidence_fixtures.py` defines one R3/R4 chain. The memory
+# tests in `tests/test_catalog_persistence.py` build their source, fragment,
+# claim and verdict from exactly these builders, and the test below submits the
+# SAME payloads through the four guarded RPCs against real PostgreSQL.
+#
+# That is the point. An earlier round of this branch hand-built the memory
+# chain and got it wrong in seven places at once -- no `evidence_key`, no
+# `task_key`, a locator with no `fragment_type`, no canonical scope identity,
+# no unit on a numeric located fact, no `verification_mode`, no
+# `verifier_contract_version`. Every one of those is refused here, so the
+# memory tests were citing evidence PostgreSQL could not have produced. A
+# memory-only assertion cannot catch that; this can.
+
+
+def _shared_chain(db, args, label):
+    """Write one complete shared-fixture chain through the real RPCs."""
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{json.dumps(evidence_fixtures.source_payload(f'{label}-source'))}'::jsonb)")
+    fragment = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{json.dumps(evidence_fixtures.fragment_payload(f'{label}-fragment', source))}'::jsonb)")
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{json.dumps(evidence_fixtures.claim_payload(f'{label}-claim', source))}'::jsonb)")
+    verdict = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{json.dumps(evidence_fixtures.verdict_payload(f'{label}-verdict', claim, support=[evidence_fixtures.support_link(fragment)]))}'::jsonb)")
+    return source, fragment, claim, verdict
+
+
+def test_the_shared_evidence_fixture_is_accepted_by_the_real_rpcs(db):
+    """The fixture the memory tests use is a chain PostgreSQL actually accepts.
+
+    Four guarded RPCs, the shared payloads, no per-backend adjustment. If a
+    builder in `backend/testing/evidence_fixtures.py` drifts out of what the
+    contract allows, this fails -- so the memory tests can never again cite a
+    shape the database refuses.
+    """
+    lease, _ = _evidence_fixture(db, "shared-chain")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source, fragment, claim, verdict = _shared_chain(db, args, "shared")
+
+    # Each row landed, carrying the provenance the fixture states.
+    assert db.psql(f"select source_version_kind || '|' || source_version_id || '|' || task_key "
+                   f"from public.sources where id='{source}'") == (
+        f"{evidence_fixtures.SOURCE_VERSION_KIND}|{evidence_fixtures.SOURCE_VERSION_ID}"
+        f"|{evidence_fixtures.TASK_KEY}")
+    assert db.psql(f"select fragment_type || '|' || locator_key from "
+                   f"public.source_evidence_fragments where id='{fragment}'") == (
+        f"{evidence_fixtures.FRAGMENT_TYPE}|{evidence_fixtures.LOCATOR}")
+    assert db.psql(f"select evidence_locator || '|' || unit from public.claims "
+                   f"where id='{claim}'") == f"{evidence_fixtures.LOCATOR}|{evidence_fixtures.FIELD_UNIT}"
+    assert db.psql(f"select verdict || '|' || verification_mode || '|' || "
+                   f"verifier_contract_version from public.claim_verdicts "
+                   f"where id='{verdict}'") == (
+        f"verified|{evidence_fixtures.VERIFICATION_MODE}|{evidence_fixtures.VERIFIER_CONTRACT}")
+    # The verified verdict carries its durable support link.
+    assert db.psql(f"select fragment_id from public.claim_verdict_supports "
+                   f"where verdict_id='{verdict}'") == fragment
+
+
+def test_the_shared_fixture_replays_exactly_and_conflicts_fail_closed(db):
+    """Evidence keys are replay identities, in PostgreSQL as in memory."""
+    lease, _ = _evidence_fixture(db, "shared-replay")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source, fragment, claim, verdict = _shared_chain(db, args, "replay")
+
+    # An exact replay of every step returns the same row.
+    assert _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{json.dumps(evidence_fixtures.source_payload('replay-source'))}'::jsonb)") == source
+    assert _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{json.dumps(evidence_fixtures.fragment_payload('replay-fragment', source))}'::jsonb)") == fragment
+    assert _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{json.dumps(evidence_fixtures.claim_payload('replay-claim', source))}'::jsonb)") == claim
+    assert _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{json.dumps(evidence_fixtures.verdict_payload('replay-verdict', claim, support=[evidence_fixtures.support_link(fragment)]))}'::jsonb)") == verdict
+
+    # Reusing an evidence key for DIFFERENT content fails closed. The other
+    # source gets its own focused fragment first, so the grounding rule is
+    # satisfied and the idempotency rule is the one under test.
+    other_source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{json.dumps(evidence_fixtures.source_payload('replay-other-source'))}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{json.dumps(evidence_fixtures.fragment_payload('replay-other-fragment', other_source))}'::jsonb)")
+    with pytest.raises(AssertionError, match="idempotency key belongs to a different source"):
+        _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(evidence_fixtures.claim_payload('replay-claim', other_source))}'::jsonb)")
+    with pytest.raises(AssertionError, match="evidence fragment idempotency conflict"):
+        _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{json.dumps(evidence_fixtures.fragment_payload('replay-fragment', source, text='a different bounded excerpt entirely'))}'::jsonb)")
+    with pytest.raises(AssertionError, match="claim verdict idempotency conflict"):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{json.dumps(evidence_fixtures.verdict_payload('replay-verdict', claim, verdict='needs_review', support=[]))}'::jsonb)")
+
+
+@pytest.mark.parametrize("build, expected", [
+    ("fragment_task_mismatch", "evidence fragment task provenance mismatch"),
+    ("fragment_without_type", "a focused fragment requires both a type and a locator"),
+    ("fragment_type_locator_mismatch", "fragment type does not match the locator kind"),
+    ("verified_without_support", "an accepted verdict must cite durable evidence"),
+    ("claim_without_unit", "a numeric located fact requires an explicit unit"),
+    ("source_without_version", "a located fact requires a versioned source"),
+])
+def test_the_shared_fixtures_own_rules_are_the_databases_rules(db, build, expected):
+    """Each way the fixture could drift, refused by PostgreSQL itself.
+
+    These are the exact defects the hand-built memory chain had. Pinning them
+    here means a future edit to the shared builders that reintroduces one is a
+    PostgreSQL failure, not a quietly weaker memory test.
+    """
+    lease, _ = _evidence_fixture(db, f"shared-rule-{build}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+
+    if build == "source_without_version":
+        source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{json.dumps(evidence_fixtures.source_payload(f'{build}-source', version_kind=None, version_id=None))}'::jsonb)")
+        with pytest.raises(AssertionError, match=expected):
+            _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(evidence_fixtures.claim_payload(f'{build}-claim', source))}'::jsonb)")
+        return
+
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{json.dumps(evidence_fixtures.source_payload(f'{build}-source'))}'::jsonb)")
+
+    if build == "fragment_task_mismatch":
+        payload = evidence_fixtures.fragment_payload(f"{build}-fragment", source, task="another-task")
+    elif build == "fragment_without_type":
+        payload = evidence_fixtures.fragment_payload(f"{build}-fragment", source, fragment_type=None)
+    elif build == "fragment_type_locator_mismatch":
+        payload = evidence_fixtures.fragment_payload(f"{build}-fragment", source,
+                                                     fragment_type="verbatim_excerpt")
+    else:
+        payload = None
+
+    if payload is not None:
+        with pytest.raises(AssertionError, match=expected):
+            _rpc_as_service(db, f"select public.record_evidence_fragment_guarded({args},'{json.dumps(payload)}'::jsonb)")
+        return
+
+    _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{json.dumps(evidence_fixtures.fragment_payload(f'{build}-fragment', source))}'::jsonb)")
+    if build == "claim_without_unit":
+        with pytest.raises(AssertionError, match=expected):
+            _rpc_as_service(db, f"select public.create_claim_with_source_guarded({args},'{json.dumps(evidence_fixtures.claim_payload(f'{build}-claim', source, unit=None))}'::jsonb)")
+        return
+
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{json.dumps(evidence_fixtures.claim_payload(f'{build}-claim', source))}'::jsonb)")
+    with pytest.raises(AssertionError, match=expected):
+        _rpc_as_service(db, f"select public.record_claim_verdict_guarded({args},'{json.dumps(evidence_fixtures.verdict_payload(f'{build}-verdict', claim, support=[]))}'::jsonb)")
+
+
+def test_a_catalog_link_cites_a_verdict_built_from_the_shared_fixture(db):
+    """The catalog path, end to end, on evidence PostgreSQL really produced."""
+    lease, _ = _evidence_fixture(db, "shared-catalog")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source, fragment, claim, verdict = _shared_chain(db, args, "catalog")
+    _, _, candidate = _catalog_chain(db, "shared-catalog", args)
+    link = _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-shared', claim_id=claim, verdict_id=verdict, locator=None, version=None, kind=None)}'::jsonb)")
+    assert db.psql(f"select record_locator || '|' || source_version_kind || '|' || source_version "
+                   f"from public.catalog_candidate_evidence_links where id='{link}'") == (
+        f"{evidence_fixtures.LOCATOR}|{evidence_fixtures.SOURCE_VERSION_KIND}"
+        f"|{evidence_fixtures.SOURCE_VERSION_ID}")

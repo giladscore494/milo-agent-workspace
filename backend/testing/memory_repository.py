@@ -17,6 +17,11 @@ from uuid import UUID, uuid4
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
                                        stated_identity_dimensions, trust_state_for)
 from backend.catalog.digest import catalog_payload_digest
+from backend.engines.swarm_v2.evidence_bounds import FRAGMENT_TYPES
+from backend.engines.swarm_v2.evidence_contracts import (fragment_type_for,
+                                                         parse_locator_key)
+from backend.engines.swarm_v2.fragments import fragment_content_hash
+from backend.engines.swarm_v2.support import VERIFICATION_MODES, VERIFIER_CONTRACT_VERSION
 from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
                                       prepare_raw_record, prepare_snapshot)
 from backend.errors import AppError, NotFoundError
@@ -443,19 +448,31 @@ class MemoryRepository:
             self.evidence_kinds[row["id"]] = kind
         return dict(row)
 
-    def _evidence_lease(self, run_id: UUID, lease: dict[str, Any]) -> None:
+    def _evidence_lease(self, run_id: UUID, worker_id: str | None, attempt: int | None,
+                        lease_token: str | None) -> None:
         """Hold a durable evidence write to the same lease its RPC requires.
 
-        The PostgreSQL counterparts all call `assert_worker_lease` first, so a
-        wrong worker, a superseded attempt, a wrong token or an expired lease
-        writes nothing. A memory implementation that ignored the lease would
-        let a test prove an evidence path that the database rejects.
+        The PostgreSQL counterparts all call `assert_worker_lease` first, and
+        its four arguments are NOT optional there, so a wrong worker, a
+        superseded attempt, a wrong token or an expired lease writes nothing.
+
+        FAIL CLOSED ON AN ABSENT VALUE. `_assert_active_lease` skips whichever
+        component is `None` -- that is deliberate for the older call paths that
+        legitimately pass none -- so handing it a missing value here would turn
+        "no lease" into "no check", which is how an earlier round of this branch
+        let a leaseless write succeed. A durable evidence write states all three
+        or writes nothing.
         """
+        missing = [name for name, value in (("worker_id", worker_id), ("attempt", attempt),
+                                            ("lease_token", lease_token))
+                   if value is None or (isinstance(value, str) and not value.strip())]
+        if missing:
+            raise AppError("RUN_TRANSITION_CONFLICT",
+                           "a durable evidence write requires a complete worker lease", 409)
         run = self.runs.get(str(run_id))
         if run is None:
             raise NotFoundError("run", str(run_id))
-        self._assert_active_lease(run, lease.get("worker_id"), lease.get("attempt"),
-                                  lease.get("lease_token"))
+        self._assert_active_lease(run, worker_id, attempt, lease_token)
 
     def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]:
         return self._tool_row(run_id, request)
@@ -464,36 +481,118 @@ class MemoryRepository:
         return self._tool_row(run_id, grant)
 
     def create_tool_usage(self, run_id: UUID, usage: dict[str, Any], **lease: Any) -> dict[str, Any]:
+        # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the
+        # lease contract and many callers pass none. A lease that IS supplied
+        # is enforced completely -- partial is refused like any other -- but an
+        # omitted one is still permitted here, unlike the three durable
+        # evidence writers above.
         if lease:
-            self._evidence_lease(run_id, lease)
+            self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
+                                 lease.get("lease_token"))
         return self._tool_row(run_id, usage, kind="tool_usage")
 
     def create_source(self, run_id: UUID, source: dict[str, Any], **lease: Any) -> dict[str, Any]:
+        # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the
+        # lease contract and many callers pass none. A lease that IS supplied
+        # is enforced completely -- partial is refused like any other -- but an
+        # omitted one is still permitted here, unlike the three durable
+        # evidence writers above.
         if lease:
-            self._evidence_lease(run_id, lease)
+            self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
+                                 lease.get("lease_token"))
         return self._tool_row(run_id, source, kind="source")
 
     def create_claim(self, run_id: UUID, claim: dict[str, Any], **lease: Any) -> dict[str, Any]:
+        # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the
+        # lease contract and many callers pass none. A lease that IS supplied
+        # is enforced completely -- partial is refused like any other -- but an
+        # omitted one is still permitted here, unlike the three durable
+        # evidence writers above.
         if lease:
-            self._evidence_lease(run_id, lease)
+            self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
+                                 lease.get("lease_token"))
         return self._tool_row(run_id, claim, kind="claim")
 
     def create_conflict(self, run_id: UUID, conflict: dict[str, Any], **lease: Any) -> dict[str, Any]:
+        # COMPATIBILITY BOUNDARY, unchanged and documented: these predate the
+        # lease contract and many callers pass none. A lease that IS supplied
+        # is enforced completely -- partial is refused like any other -- but an
+        # omitted one is still permitted here, unlike the three durable
+        # evidence writers above.
         if lease:
-            self._evidence_lease(run_id, lease)
+            self._evidence_lease(run_id, lease.get("worker_id"), lease.get("attempt"),
+                                 lease.get("lease_token"))
         return self._tool_row(run_id, conflict, kind="conflict")
 
     # The Repository protocol declares these three, and their absence was
     # itself a parity gap: a test could not build a real verdict to cite, so a
     # catalog test had no choice but to invent a uuid for one. They are
     # lease-guarded here exactly as their RPCs are.
-    def record_evidence_fragment(self, run_id: UUID, fragment: dict[str, Any],
-                                 **lease: Any) -> dict[str, Any]:
-        self._evidence_lease(run_id, lease)
-        return self._tool_row(run_id, fragment, kind="evidence_fragment")
+    def record_evidence_fragment(self, run_id: UUID, fragment: dict[str, Any], *,
+                                 worker_id: str, attempt: int,
+                                 lease_token: str) -> dict[str, Any]:
+        """One focused fragment, held to `record_evidence_fragment_guarded`'s rules.
 
-    def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any],
-                             **lease: Any) -> dict[str, Any]:
+        Mirrored here because the catalog link path depends on them: a fragment
+        is what a verdict's support link names, so a fragment that could not
+        exist in PostgreSQL would make every verdict citing it meaningless.
+        """
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
+        key = self._require_evidence_key(fragment, "EVIDENCE_FRAGMENT")
+        task = fragment.get("task_key")
+        if not task:
+            raise AppError("EVIDENCE_FRAGMENT_INVALID",
+                           "invalid evidence fragment: evidence_key and task_key are required",
+                           400)
+        source = self._typed_evidence_row(fragment.get("source_id"), run_id, "source",
+                                          "EVIDENCE_FRAGMENT", "evidence fragment source")
+        # Task provenance: a fragment may only be attributed to the task that
+        # captured its source. Belonging to the same run is not enough.
+        if source.get("task_key") != task:
+            raise AppError("EVIDENCE_FRAGMENT_TASK",
+                           "evidence fragment task provenance mismatch", 400)
+        # A FOCUSED fragment states a type and a locator that agree, or states
+        # neither. `r3_focus_valid` pairs a `record_field` locator with a
+        # `structured_projection` and a `document_span` with a
+        # `verbatim_excerpt`, and nothing else.
+        fragment_type = fragment.get("fragment_type")
+        locator = fragment.get("locator_key")
+        if (fragment_type is None) != (locator is None):
+            raise AppError("EVIDENCE_FRAGMENT_FOCUS",
+                           "invalid evidence fragment: a focused fragment requires both a "
+                           "type and a locator", 400)
+        if fragment_type is not None:
+            if fragment_type not in FRAGMENT_TYPES:
+                raise AppError("EVIDENCE_FRAGMENT_FOCUS",
+                               "invalid evidence fragment: unknown fragment type", 400)
+            # The pairing rule is the contract module's own, not a copy: a
+            # non-canonical locator raises here rather than resolving to a kind.
+            try:
+                expected = fragment_type_for(parse_locator_key(locator))
+            except Exception:
+                raise AppError("EVIDENCE_FRAGMENT_FOCUS",
+                               "invalid evidence fragment: locator is not a canonical "
+                               "bounded location", 400) from None
+            if expected != fragment_type:
+                raise AppError("EVIDENCE_FRAGMENT_FOCUS",
+                               "invalid evidence fragment: fragment type does not match the "
+                               "locator kind", 400)
+        text = fragment.get("fragment_text")
+        if not text or not str(text).strip():
+            raise AppError("EVIDENCE_FRAGMENT_INVALID",
+                           "invalid evidence fragment: fragment_text must not be empty", 400)
+        if fragment.get("content_hash") != fragment_content_hash(text):
+            raise AppError("EVIDENCE_FRAGMENT_HASH",
+                           "invalid evidence fragment: content hash does not match the "
+                           "bounded text", 400)
+        return self._replayable_evidence_row(run_id, key, fragment, "evidence_fragment",
+                                             ("source_id", "task_key", "fragment_text",
+                                              "content_hash", "fragment_type", "locator_key"),
+                                             "EVIDENCE_FRAGMENT")
+
+    def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any], *,
+                             worker_id: str, attempt: int,
+                             lease_token: str) -> dict[str, Any]:
         """One verdict, held to the support contract `record_claim_verdict_guarded` applies.
 
         The rule that matters most here: **an accepted verdict must cite
@@ -502,7 +601,18 @@ class MemoryRepository:
         built exactly such a verdict -- so the catalog tests were citing
         something PostgreSQL would have refused to create.
         """
-        self._evidence_lease(run_id, lease)
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
+        key = self._require_evidence_key(verdict, "CLAIM_VERDICT")
+        # HOW a verdict was reached and under WHICH contract are part of it.
+        if verdict.get("verification_mode") not in VERIFICATION_MODES:
+            raise AppError("CLAIM_VERDICT_INVALID",
+                           "invalid claim verdict: unknown verification mode", 400)
+        if verdict.get("verifier_contract_version") != VERIFIER_CONTRACT_VERSION:
+            raise AppError("CLAIM_VERDICT_CONTRACT",
+                           "invalid claim verdict: unknown verifier contract version", 400)
+        if verdict.get("verdict") not in ("verified", "needs_review", "rejected"):
+            raise AppError("CLAIM_VERDICT_INVALID",
+                           "invalid claim verdict: unknown verdict", 400)
         support = verdict.get("support") or []
         if not isinstance(support, list):
             raise AppError("CLAIM_VERDICT_INVALID",
@@ -533,12 +643,46 @@ class MemoryRepository:
             if fragment.get("locator_key") != link.get("locator_key"):
                 raise AppError("CLAIM_VERDICT_SUPPORT_LOCATOR",
                                "verdict support link locator mismatch", 400)
-        return self._tool_row(run_id, verdict, kind="claim_verdict")
+        return self._replayable_evidence_row(run_id, key, verdict, "claim_verdict",
+                                             ("claim_id", "verdict", "verification_mode",
+                                              "verifier_contract_version"),
+                                             "CLAIM_VERDICT")
 
-    def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any],
-                                   **lease: Any) -> dict[str, Any]:
-        self._evidence_lease(run_id, lease)
+    def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *,
+                                   worker_id: str, attempt: int,
+                                   lease_token: str) -> dict[str, Any]:
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
         return self._tool_row(run_id, resolution, kind="conflict_resolution")
+
+    @staticmethod
+    def _require_evidence_key(payload: Mapping[str, Any], code: str) -> str:
+        """The stable replay identity every durable evidence row must carry."""
+        key = payload.get("evidence_key")
+        if not key or not str(key).strip():
+            raise AppError(f"{code}_INVALID",
+                           "invalid durable evidence: evidence_key is required", 400)
+        return str(key)
+
+    def _replayable_evidence_row(self, run_id: UUID, key: str, payload: dict[str, Any],
+                                 kind: str, identity: tuple[str, ...],
+                                 code: str) -> dict[str, Any]:
+        """Return the existing row for an exact replay, or fail closed.
+
+        `(run_id, evidence_key)` is the replay identity in PostgreSQL, so a
+        retry of the same logical row collapses onto it and a reuse of the key
+        for different content is a conflict -- never a second row and never a
+        silent overwrite.
+        """
+        existing = next((row for row in self.tool_rows
+                         if str(row.get("run_id")) == str(run_id)
+                         and row.get("evidence_key") == key
+                         and self.evidence_kinds.get(str(row.get("id"))) == kind), None)
+        if existing is None:
+            return self._tool_row(run_id, payload, kind=kind)
+        if any(existing.get(field) != payload.get(field) for field in identity):
+            raise AppError(f"{code}_IDEMPOTENCY_CONFLICT",
+                           f"{kind.replace('_', ' ')} idempotency conflict", 409)
+        return dict(existing)
 
     def _typed_evidence_row(self, row_id: Any, run_id: UUID, kind: str,
                             code: str, label: str) -> dict[str, Any]:
