@@ -46,6 +46,10 @@ from backend.tools.registry import ToolRegistry
 
 GOVERNMENT_PACKAGE = Path("backend/catalog/government")
 
+#: Distinct from every JSON value, `null` included -- which is the whole point
+#: of the `total_was_estimated` matrix below.
+OMITTED = object()
+
 
 # =============================================================================
 # 0. the module is offline by construction
@@ -116,6 +120,20 @@ def client(**kwargs) -> DataGovClient:
     kwargs.setdefault("page_limit", PINNED_PAGE_LIMIT)
     kwargs.setdefault("sleep_fn", lambda _seconds: None)
     return DataGovClient(transport, **kwargs)
+
+
+def normalized(capture):
+    """The reading of a whole capture, as the ingestor computes it.
+
+    One pure function of the capture, so a test that builds a snapshot payload
+    by hand carries exactly the summary an ingestion would have written.
+    """
+    return normalize.read_capture([record for _, record in capture.located_records()],
+                                  resource_id=capture.resource_id)
+
+
+def snapshot_payload_for(capture):
+    return snapshot_module.snapshot_payload(capture, normalized(capture))
 
 
 def ingest(repository: MemoryRepository, lease: WorkerLease, **kwargs):
@@ -475,7 +493,7 @@ def test_the_retrieval_metadata_stays_inside_the_durable_bound():
     """Checked HERE, so an over-long metadata object is a local refusal rather
     than a database error halfway through an ingestion."""
     capture = client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
-    metadata = snapshot_module.retrieval_metadata(capture)
+    metadata = snapshot_module.retrieval_metadata(capture, normalized(capture))
     rendered = json.dumps(metadata, separators=(",", ":"), ensure_ascii=False)
     assert len(rendered) <= src.MAX_RETRIEVAL_METADATA_CHARS
     assert metadata["page_checksums_inline"] is True
@@ -485,22 +503,75 @@ def test_the_retrieval_metadata_stays_inside_the_durable_bound():
     # more pages than fit, while the chain still commits to every checksum.
     many = copy.copy(capture)
     object.__setattr__(many, "pages", capture.pages * 9)
-    wide = snapshot_module.retrieval_metadata(many)
+    wide = snapshot_module.retrieval_metadata(many, normalized(capture))
     assert wide["page_checksums_inline"] is False and "page_checksums" not in wide
     assert len(json.dumps(wide, separators=(",", ":"), ensure_ascii=False)) \
         <= src.MAX_RETRIEVAL_METADATA_CHARS
     assert wide["page_chain_sha256"] != metadata["page_chain_sha256"]
 
 
-def test_the_inline_page_checksum_limit_still_fits_the_durable_bound():
-    """The worst inline case, computed rather than assumed."""
+def worst_case_normalization(capture):
+    """Every refusal reason present, and the bounded id list full.
+
+    The metadata budget has to hold for the worst snapshot, not the reviewed
+    one -- and the reviewed capture has no refusals at all, so measuring
+    against it would measure nothing.
+    """
+    reasons = sorted(normalize.GOVERNMENT_NORMALIZATION_REASONS)
+    issues = tuple((str(900000 + index), reason) for index, reason in enumerate(reasons))
+    issues += tuple((str(910000 + index), reasons[0])
+                    for index in range(normalize.MAX_DURABLE_ISSUE_RECORDS + 2))
+    return normalize.CaptureNormalization(
+        contract=normalize.NORMALIZATION_CONTRACT,
+        entries=normalized(capture).entries, issues=issues)
+
+
+def widened(capture, page_count):
+    wide = copy.copy(capture)
+    pages = (capture.pages * (page_count // len(capture.pages) + 1))[:page_count]
+    object.__setattr__(wide, "pages", pages)
+    return wide
+
+
+def test_the_inline_page_checksum_limit_holds_against_a_worst_case_summary():
+    """The ceiling is a promise the durable bound can actually keep.
+
+    Measured against the worst normalization summary this contract can produce,
+    so the constant is not an optimistic number that a real capture would
+    quietly exceed.
+    """
     capture = client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
-    widest = copy.copy(capture)
-    pages = (capture.pages * (src.MAX_INLINE_PAGE_CHECKSUMS // len(capture.pages) + 1))
-    object.__setattr__(widest, "pages", pages[:src.MAX_INLINE_PAGE_CHECKSUMS])
-    metadata = snapshot_module.retrieval_metadata(widest)
+    worst = worst_case_normalization(capture)
+    assert len(worst.issues_by_reason) == len(normalize.GOVERNMENT_NORMALIZATION_REASONS)
+    assert len(worst.issue_records) == normalize.MAX_DURABLE_ISSUE_RECORDS
+
+    metadata = snapshot_module.retrieval_metadata(
+        widened(capture, src.MAX_INLINE_PAGE_CHECKSUMS), worst)
     assert metadata["page_checksums_inline"] is True
     assert len(metadata["page_checksums"]) == src.MAX_INLINE_PAGE_CHECKSUMS
+    assert len(json.dumps(metadata, separators=(",", ":"), ensure_ascii=False)) \
+        <= src.MAX_RETRIEVAL_METADATA_CHARS
+
+
+def test_the_inline_page_list_is_dropped_whole_and_never_truncated():
+    """The degradation rule, stated and checked.
+
+    Past the ceiling the per-page list goes away ENTIRELY -- a truncated list
+    would be a snapshot claiming page provenance it does not carry -- while the
+    chain digest, which commits to every checksum, is unchanged. The
+    normalization summary is never what gets dropped: it decides whether the
+    snapshot may answer a query at all.
+    """
+    capture = client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    worst = worst_case_normalization(capture)
+    over = widened(capture, src.MAX_INLINE_PAGE_CHECKSUMS + 1)
+    metadata = snapshot_module.retrieval_metadata(over, worst)
+    assert metadata["page_checksums_inline"] is False
+    assert "page_checksums" not in metadata
+    assert metadata["page_chain_sha256"] == snapshot_module.page_chain_digest(
+        tuple(page.body_sha256 for page in over.pages))
+    assert metadata["normalization_issue_count"] == worst.issue_count
+    assert metadata["normalization_issues"] == worst.durable_summary()["normalization_issues"]
     assert len(json.dumps(metadata, separators=(",", ":"), ensure_ascii=False)) \
         <= src.MAX_RETRIEVAL_METADATA_CHARS
 
@@ -514,7 +585,7 @@ def test_a_partial_snapshot_cannot_activate(repository):
     lease = leased_run(repository)
     capture = client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
     snapshot = repository.record_catalog_snapshot(
-        lease.run_id, snapshot_module.snapshot_payload(capture),
+        lease.run_id, snapshot_payload_for(capture),
         worker_id=lease.worker_id, attempt=lease.attempt, lease_token=lease.lease_token)
     payload, _ = next(iter(snapshot_module.raw_record_payloads(capture, snapshot)))
     repository.record_catalog_raw_record(lease.run_id, payload, worker_id=lease.worker_id,
@@ -586,7 +657,7 @@ def test_a_snapshot_that_cannot_activate_is_terminated_as_failed(repository, mon
 def test_every_catalog_write_requires_the_exact_active_lease(repository):
     lease = leased_run(repository)
     capture = client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
-    payload = snapshot_module.snapshot_payload(capture)
+    payload = snapshot_payload_for(capture)
     good = {"worker_id": lease.worker_id, "attempt": lease.attempt,
             "lease_token": lease.lease_token}
     for wrong in ({"worker_id": "another-worker"}, {"attempt": lease.attempt + 1},
@@ -625,7 +696,7 @@ def test_a_superseded_lease_cannot_finish_a_capture(repository):
     lease = leased_run(repository)
     capture = client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
     snapshot = repository.record_catalog_snapshot(
-        lease.run_id, snapshot_module.snapshot_payload(capture), worker_id=lease.worker_id,
+        lease.run_id, snapshot_payload_for(capture), worker_id=lease.worker_id,
         attempt=lease.attempt, lease_token=lease.lease_token)
     repository.runs[str(lease.run_id)]["lease_expires_at"] = "2000-01-01T00:00:00+00:00"
     superseded = repository.claim_run(lease.run_id, "worker-2")   # the lease moves on
@@ -671,7 +742,7 @@ def test_a_later_run_cannot_adopt_another_runs_unfinished_capture(repository):
     first = leased_run(repository)
     capture = client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
     repository.record_catalog_snapshot(
-        first.run_id, snapshot_module.snapshot_payload(capture), worker_id=first.worker_id,
+        first.run_id, snapshot_payload_for(capture), worker_id=first.worker_id,
         attempt=first.attempt, lease_token=first.lease_token)
     second = leased_run(repository, worker="worker-2")
     with pytest.raises(GovernmentIngestionError) as failure:
@@ -868,7 +939,7 @@ def test_no_row_level_market_field_is_ever_invented():
     reading = read_wltp_record(wltp_record())
     assert "market" not in reading.identity_dimensions
     capture = client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
-    metadata = snapshot_module.retrieval_metadata(capture)
+    metadata = snapshot_module.retrieval_metadata(capture, normalized(capture))
     assert metadata["dataset_market_scope"] == src.GOVERNMENT_DATASET_MARKET == "IL"
     assert all("market" not in record for _, record in capture.located_records())
 
@@ -1065,7 +1136,7 @@ def test_the_projection_reads_only_active_snapshots(repository, ingested):
     pending_capture = client(transport=FixtureTransport(bodies={0: encode(document)})) \
         .capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
     repository.record_catalog_snapshot(
-        lease.run_id, snapshot_module.snapshot_payload(pending_capture),
+        lease.run_id, snapshot_payload_for(pending_capture),
         worker_id=lease.worker_id, attempt=lease.attempt, lease_token=lease.lease_token)
     assert len(repository.catalog_snapshots) == 2
     assert GovernmentCatalogProjection(repository).dataset_metadata().snapshot_key == \
@@ -1200,3 +1271,460 @@ def test_the_caller_never_supplies_a_stored_payload_digest(repository, ingested)
         [payload for payload, _ in snapshot_module.raw_record_payloads(
             client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY)),
             snapshot)][:1])
+
+
+# =============================================================================
+# REGRESSIONS — five defects found in review of fce72a4a
+# =============================================================================
+#
+# Every test in this section fails against that head. They are grouped by the
+# defect they pin rather than by module, so a reviewer can read one block and
+# see the whole property.
+
+
+# --- 1. the pinned CKAN package is enforced BEFORE egress --------------------
+
+def test_a_package_that_is_not_the_pinned_one_never_reaches_the_network():
+    """The package id is a SOURCE IDENTITY, so it is checked before it is sent.
+
+    `package_show` used to put a caller's package id straight into the query
+    string and only compare it against the pinned one AFTER the response came
+    back -- so a wrong value was a request to `data.gov.il` that this package
+    had already decided it would refuse.
+    """
+    transport = FixtureTransport()
+    refuses("GOV_PACKAGE_NOT_ALLOWED", client(transport=transport).package_show,
+            src.WLTP_RESOURCE_ID, package_id="some-other-dataset")
+    assert transport.calls == []
+
+
+def test_no_capture_or_ingestion_can_name_another_package(repository):
+    """Every public entry point applies the same allowlist, before egress and
+    before a single durable write."""
+    transport = FixtureTransport()
+    refuses("GOV_PACKAGE_NOT_ALLOWED", client(transport=transport).capture_resource,
+            src.WLTP_RESOURCE_ID, package_id="some-other-dataset",
+            query=dict(PINNED_QUERY))
+    assert transport.calls == []
+
+    lease = leased_run(repository)
+    ingestor = GovernmentCatalogIngestor(repository, lease,
+                                         client=client(transport=transport))
+    with pytest.raises(GovernmentSourceError) as failure:
+        ingestor.ingest_resource(src.WLTP_RESOURCE_ID, package_id="some-other-dataset",
+                                 query=dict(PINNED_QUERY))
+    assert failure.value.reason_code == "GOV_PACKAGE_NOT_ALLOWED"
+    assert transport.calls == []
+    assert repository.catalog_snapshots == {}
+    assert repository.catalog_raw_records == {}
+    assert repository.catalog_candidates == {}
+
+
+def test_the_package_allowlist_is_closed_and_reasons_are_static():
+    assert src.ALLOWED_PACKAGE_IDS == frozenset({src.CKAN_PACKAGE_ID})
+    assert src.require_allowed_package(src.CKAN_PACKAGE_ID) == src.CKAN_PACKAGE_ID
+    for rejected in ("", "  ", "degem-rechev-wltp-copy", "DEGEM-RECHEV-WLTP", None):
+        refuses("GOV_PACKAGE_NOT_ALLOWED", src.require_allowed_package, rejected)
+    assert "GOV_PACKAGE_NOT_ALLOWED" in src.GOVERNMENT_SOURCE_REASONS
+
+
+# --- 2. `total_was_estimated` is validated by TYPE and value ------------------
+
+#: (label, the JSON value at `total_was_estimated`, accepted?)
+#:
+#: Omission is ACCEPTED and documented: CKAN omits the key entirely on
+#: responses that did not estimate, and refusing an absent key would refuse
+#: every such response. A PRESENT key must be the JSON boolean `false`; `true`
+#: is an estimate and is refused as one; every other type and value is a
+#: malformed response and is refused as that -- `1`, `"true"` and `null` used
+#: to sail straight through an `is True` check.
+ESTIMATED_TOTAL_CASES = (
+    ("missing", OMITTED, True, None),
+    ("false", False, True, None),
+    ("true", True, False, "GOV_TOTAL_ESTIMATED"),
+    ("one", 1, False, "GOV_TOTAL_ESTIMATION_INVALID"),
+    ("zero", 0, False, "GOV_TOTAL_ESTIMATION_INVALID"),
+    ("string true", "true", False, "GOV_TOTAL_ESTIMATION_INVALID"),
+    ("string false", "false", False, "GOV_TOTAL_ESTIMATION_INVALID"),
+    ("null", None, False, "GOV_TOTAL_ESTIMATION_INVALID"),
+    ("object", {}, False, "GOV_TOTAL_ESTIMATION_INVALID"),
+    ("array", [], False, "GOV_TOTAL_ESTIMATION_INVALID"),
+)
+
+
+@pytest.mark.parametrize("label,value,accepted,reason", ESTIMATED_TOTAL_CASES,
+                         ids=[case[0] for case in ESTIMATED_TOTAL_CASES])
+def test_the_estimated_total_flag_is_a_strict_json_boolean(label, value, accepted, reason,
+                                                           repository):
+    document = page_document(0)
+    if value is OMITTED:
+        document["result"].pop("total_was_estimated", None)
+    else:
+        document["result"]["total_was_estimated"] = value
+    transport = FixtureTransport(bodies={0: encode(document)})
+    reader = client(transport=transport)
+    if accepted:
+        capture = reader.capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+        assert capture.reported_total == PINNED_TOTAL
+        return
+    refuses(reason, reader.capture_resource, src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    # A malformed response never reaches pagination or persistence.
+    assert repository.catalog_snapshots == {}
+
+
+def test_a_malformed_estimation_flag_is_refused_before_the_next_page_is_fetched():
+    """It is a property of the FIRST page, so the capture stops there."""
+    transport = FixtureTransport(bodies={0: page_with(0, total_was_estimated="true")})
+    refuses("GOV_TOTAL_ESTIMATION_INVALID", client(transport=transport).capture_resource,
+            src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    offsets = [call[1].get("offset") for call in transport.calls
+               if call[0] == src.DATASTORE_SEARCH]
+    assert offsets == ["0"]
+
+
+# --- 3 & 4. exact snapshot pinning, and ordering parity ----------------------
+
+def activate_empty_snapshot(repository, lease, *, content, resource=None, family="government",
+                            activate=True, state=None, activated_at=None, metadata=None):
+    """One snapshot of zero records, so a test can make many of them cheaply.
+
+    `declared_record_count` is 0, so activation succeeds immediately: what these
+    tests are about is WHICH snapshot a lookup returns, not what is in it.
+    """
+    payload = {"source_family": family,
+               "resource_id": resource or src.WLTP_RESOURCE_ID,
+               "upstream_version": "2026.09.1", "upstream_version_kind": "dataset_version",
+               "content_sha256": content, "retrieved_at": "2026-09-14T16:11:13.272Z",
+               "declared_record_count": 0,
+               "retrieval_metadata": metadata if metadata is not None else {
+                   "normalization_contract": "gov.wltp.normalize.1",
+                   "normalized_record_count": 0, "normalization_issue_count": 0,
+                   "normalization_issues": [], "normalization_issue_records": []}}
+    keys = {"worker_id": lease.worker_id, "attempt": lease.attempt,
+            "lease_token": lease.lease_token}
+    row = repository.record_catalog_snapshot(lease.run_id, payload, **keys)
+    if activate:
+        repository.activate_catalog_snapshot(
+            lease.run_id, {"snapshot_id": row["id"], **({"validation_state": state} if state else {})},
+            **keys)
+    stored = repository.catalog_snapshots[row["snapshot_key"]]
+    if activated_at is not None and stored["activated_at"] is not None:
+        stored["activated_at"] = activated_at
+    return stored
+
+
+def test_an_older_pinned_active_snapshot_is_reachable_past_the_listing_bound(repository):
+    """Pinning a snapshot is an EXACT lookup, not a search of the newest page.
+
+    The bounded listing exists to choose the newest snapshot. Reusing it to
+    resolve an explicit `snapshot_key` made every active snapshot older than
+    the bound unreachable -- a silent "unknown snapshot" for a row that is
+    right there, active, in the table.
+    """
+    lease = leased_run(repository)
+    listing_bound = repository.MAX_CATALOG_SNAPSHOT_ROWS
+    oldest = activate_empty_snapshot(repository, lease, content="a" * 64,
+                                     activated_at="2020-01-01T00:00:00+00:00")
+    for index in range(listing_bound + 10):
+        activate_empty_snapshot(repository, lease, content=f"{index:064x}",
+                                activated_at=f"2026-01-01T00:00:{index % 60:02d}+00:00")
+    assert len(repository.list_active_catalog_snapshots("government")) == listing_bound
+    assert oldest["snapshot_key"] not in {
+        row["snapshot_key"] for row in repository.list_active_catalog_snapshots("government")}
+
+    found = repository.find_active_catalog_snapshot(
+        "government", src.WLTP_RESOURCE_ID, oldest["snapshot_key"])
+    assert found is not None and found["snapshot_key"] == oldest["snapshot_key"]
+    view = GovernmentCatalogProjection(repository, snapshot_key=oldest["snapshot_key"])
+    assert view.dataset_metadata().snapshot_key == oldest["snapshot_key"]
+
+
+@pytest.mark.parametrize("label,kwargs", [
+    ("a pending snapshot", {"activate": False}),
+    ("a failed snapshot", {"state": "failed"}),
+    ("another resource", {"resource": src.QUANTITY_RESOURCE_ID}),
+])
+def test_the_exact_lookup_returns_only_an_active_snapshot_of_that_family_and_resource(
+        repository, label, kwargs):
+    lease = leased_run(repository)
+    row = activate_empty_snapshot(repository, lease, content="b" * 64, **kwargs)
+    assert repository.find_active_catalog_snapshot(
+        "government", src.WLTP_RESOURCE_ID, row["snapshot_key"]) is None
+    assert repository.find_active_catalog_snapshot(
+        "manufacturer", src.WLTP_RESOURCE_ID, row["snapshot_key"]) is None
+
+
+def test_active_snapshots_are_ordered_identically_by_both_repositories(repository):
+    """`activated_at` DESC, then `snapshot_key` ASC -- in BOTH implementations.
+
+    The memory repository sorted the whole tuple in reverse, which reverses the
+    TIEBREAK too. Every snapshot below shares one activation instant, so the
+    order is decided entirely by the tiebreak and the disagreement is visible.
+    """
+    lease = leased_run(repository)
+    keys = sorted(activate_empty_snapshot(repository, lease, content=f"{index:064x}",
+                                          activated_at="2026-09-15T12:00:00+00:00")
+                  ["snapshot_key"] for index in range(5))
+    listed = [row["snapshot_key"]
+              for row in repository.list_active_catalog_snapshots("government")]
+    assert listed == keys, "ties must break on snapshot_key ASCENDING"
+
+    newer = activate_empty_snapshot(repository, lease, content="c" * 64,
+                                    activated_at="2026-09-16T12:00:00+00:00")
+    listed = [row["snapshot_key"]
+              for row in repository.list_active_catalog_snapshots("government")]
+    assert listed == [newer["snapshot_key"], *keys], "newest activation first"
+
+
+# --- 5. an active snapshot never silently loses a normalized row -------------
+
+#: The drivetrain label each `hanaa_cd` is paired with, and its opposite. Used
+#: to give a real row a real contradiction: the code stays exactly as the
+#: register wrote it and the label becomes the OTHER code's label, so what the
+#: test exercises is the contract rather than a fixture written to fail.
+DRIVETRAIN_LABEL_SWAP = {1: "4X4", 3: "4X2"}
+
+
+def contradictory_capture_bodies(count=1):
+    """The committed page one, with `count` rows given a real contradiction.
+
+    The label is chosen from the row's OWN code, so every selected row is
+    genuinely contradictory whatever it happened to state -- writing one fixed
+    label would silently be correct for some rows and prove nothing.
+    """
+    document = page_document(0)
+    broken = []
+    for record in document["result"]["records"][:count]:
+        record["hanaa_nm"] = DRIVETRAIN_LABEL_SWAP[record["hanaa_cd"]]
+        broken.append(str(record["_id"]))
+    return {0: encode(document)}, broken
+
+
+def durable_normalization(repository, snapshot_key):
+    """The normalization summary the SNAPSHOT ROW carries, not the report's."""
+    metadata = repository.catalog_snapshots[snapshot_key]["retrieval_metadata"]
+    return {"contract": metadata.get("normalization_contract"),
+            "normalized": metadata.get("normalized_record_count"),
+            "issues": metadata.get("normalization_issue_count"),
+            "reasons": {entry["reason"]: entry["count"]
+                        for entry in metadata.get("normalization_issues") or []},
+            "records": tuple(metadata.get("normalization_issue_records") or ())}
+
+
+def test_an_active_snapshot_records_its_normalization_gap_durably(repository):
+    """A raw row with no candidate must leave a DURABLE trace.
+
+    Before this, an unreadable row was reported once, in memory, by the
+    ingestion that happened to write it -- and the snapshot went active holding
+    a raw record that no candidate and no stored fact accounted for.
+    """
+    lease = leased_run(repository)
+    bodies, broken = contradictory_capture_bodies()
+    report = ingest(repository, lease, transport=FixtureTransport(bodies=bodies))
+
+    durable = durable_normalization(repository, report.snapshot_key)
+    assert durable["issues"] == 1
+    assert durable["reasons"] == {"GOV_NORM_LABEL_CONTRADICTION": 1}
+    assert durable["records"] == tuple(broken)
+    assert durable["normalized"] == PINNED_TOTAL - 1
+
+    # The arithmetic that makes "silently" impossible: every stored raw record
+    # is either a candidate or a durably counted issue.
+    snapshot = repository.catalog_snapshots[report.snapshot_key]
+    candidates = [row for row in repository.catalog_candidates.values()
+                  if row["snapshot_id"] == snapshot["id"]]
+    assert snapshot["stored_record_count"] - len(candidates) == durable["issues"]
+
+
+def test_a_contradiction_never_silently_becomes_the_newest_usable_projection(repository):
+    """The last usable snapshot keeps answering.
+
+    A newer capture that is raw-complete but semantically incomplete must not
+    displace it, and must not be readable by accident: reading it takes an
+    explicit acknowledgement, and then the gap travels with every answer.
+    """
+    lease = leased_run(repository)
+    good = ingest(repository, lease)
+    bodies, _broken = contradictory_capture_bodies()
+    incomplete = ingest(repository, lease, transport=FixtureTransport(bodies=bodies))
+    assert incomplete.snapshot_key != good.snapshot_key
+    assert incomplete.activated is True          # the RAW capture is complete
+
+    # The default read still answers from the last USABLE snapshot.
+    assert GovernmentCatalogProjection(repository).dataset_metadata().snapshot_key == \
+        good.snapshot_key
+    # Pinning the incomplete one is refused rather than silently answered.
+    with pytest.raises(GovernmentProjectionError) as failure:
+        GovernmentCatalogProjection(repository,
+                                    snapshot_key=incomplete.snapshot_key).dataset_metadata()
+    assert failure.value.reason_code == "GOV_PROJECTION_SNAPSHOT_INCOMPLETE"
+    # And an explicit acknowledgement exposes the gap on every answer.
+    view = GovernmentCatalogProjection(repository, snapshot_key=incomplete.snapshot_key,
+                                       allow_incomplete=True)
+    provenance = view.dataset_metadata()
+    assert provenance.snapshot_key == incomplete.snapshot_key
+    assert provenance.normalization_issue_count == 1
+    assert provenance.normalization_issues == {"GOV_NORM_LABEL_CONTRADICTION": 1}
+    assert view.list_variants("טויוטה", "RAV4").provenance.normalization_issue_count == 1
+
+
+def test_replay_and_cross_run_reuse_report_the_durable_truth(repository):
+    """The gap is a property of the SNAPSHOT, so every report of it agrees."""
+    lease = leased_run(repository)
+    bodies, broken = contradictory_capture_bodies(count=2)
+    first = ingest(repository, lease, transport=FixtureTransport(bodies=bodies))
+    assert (first.normalization_issue_count, first.normalized_record_count) == \
+        (2, PINNED_TOTAL - 2)
+
+    replay = ingest(repository, lease, transport=FixtureTransport(bodies=bodies))
+    assert replay.snapshot_key == first.snapshot_key
+    assert replay.normalization_issue_count == first.normalization_issue_count
+    assert replay.normalization_issues == first.normalization_issues
+    assert replay.normalization_issue_records == tuple(broken)
+
+    later = leased_run(repository, worker="worker-2")
+    reused = GovernmentCatalogIngestor(
+        repository, later, client=client(transport=FixtureTransport(bodies=bodies))
+    ).ingest_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    assert reused.reused_existing is True
+    assert reused.snapshot_key == first.snapshot_key
+    assert reused.normalization_issue_count == first.normalization_issue_count
+    assert reused.normalization_issues == first.normalization_issues
+
+
+def test_a_clean_capture_states_a_clean_normalization_contract(repository, ingested):
+    _, report = ingested
+    assert report.normalization_contract == "gov.wltp.normalize.1"
+    assert report.normalization_issue_count == 0
+    assert report.normalized_record_count == PINNED_TOTAL
+    durable = durable_normalization(repository, report.snapshot_key)
+    assert durable == {"contract": "gov.wltp.normalize.1", "normalized": PINNED_TOTAL,
+                       "issues": 0, "reasons": {}, "records": ()}
+    assert GovernmentCatalogProjection(repository).dataset_metadata() \
+        .normalization_issue_count == 0
+
+
+def quantity_transport():
+    """The committed pages, re-pointed at the QUANTITY resource.
+
+    The rows are WLTP-shaped -- there is no committed capture of the quantity
+    resource -- and that is precisely the point: this test is about the
+    RESOURCE CONTRACT, which says those rows are stored raw and never read for
+    identity, whatever they happen to contain.
+    """
+    bodies = {}
+    for offset in (0, 100, 200):
+        bodies[offset] = page_with(offset, resource_id=src.QUANTITY_RESOURCE_ID)
+    return FixtureTransport(bodies=bodies)
+
+
+def test_the_quantity_resource_is_ingested_raw_only_and_never_normalized(repository):
+    """Allowlisted for CAPTURE, deliberately unread for IDENTITY.
+
+    Its rows are durable and its snapshot is a legitimate active capture; what
+    it is NOT is a source of candidate identities, so it produces no candidate,
+    no normalization issue, and no tree.
+    """
+    lease = leased_run(repository)
+    ingestor = GovernmentCatalogIngestor(repository, lease,
+                                         client=client(transport=quantity_transport()))
+    report = ingestor.ingest_resource(src.QUANTITY_RESOURCE_ID, query=dict(PINNED_QUERY))
+
+    assert report.activated is True
+    assert report.stored_record_count == PINNED_TOTAL
+    assert report.candidate_count == 0
+    assert report.normalization_contract == "raw_only"
+    assert report.normalization_issue_count == 0
+    assert durable_normalization(repository, report.snapshot_key)["contract"] == "raw_only"
+    assert repository.catalog_candidates == {}
+
+    with pytest.raises(GovernmentProjectionError) as failure:
+        GovernmentCatalogProjection(repository,
+                                    resource_id=src.QUANTITY_RESOURCE_ID).dataset_metadata()
+    assert failure.value.reason_code == "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED"
+
+
+def test_a_snapshot_read_under_another_contract_is_not_reused(repository):
+    """A replay must RECONSTRUCT the stored gap, not assume it.
+
+    If the stored summary and the freshly computed one disagree, the snapshot
+    was read under different rules -- a vocabulary entry changed, or another
+    release wrote it -- and reusing it as though this code had read it would be
+    exactly the drift the summary exists to prevent.
+    """
+    lease = leased_run(repository)
+    report = ingest(repository, lease)
+    stored = repository.catalog_snapshots[report.snapshot_key]["retrieval_metadata"]
+    stored["normalization_contract"] = "gov.wltp.normalize.0"
+
+    with pytest.raises(GovernmentIngestionError) as failure:
+        ingest(repository, lease)
+    assert failure.value.reason_code == "GOV_SNAPSHOT_NORMALIZATION_DRIFT"
+    later = leased_run(repository, worker="worker-2")
+    with pytest.raises(GovernmentIngestionError):
+        ingest(repository, later)
+    # A refused replay leaves the stored snapshot exactly as it was.
+    assert repository.catalog_snapshots[report.snapshot_key]["retrieval_metadata"] is stored
+    assert len(repository.catalog_raw_records) == PINNED_TOTAL
+
+
+@pytest.mark.parametrize("label,metadata,reason", [
+    ("a raw-only capture", {"normalization_contract": "raw_only",
+                            "normalized_record_count": 0, "normalization_issue_count": 0},
+     "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED"),
+    ("a snapshot with no stated reading", {"page_count": 1},
+     "GOV_PROJECTION_SNAPSHOT_NOT_READ"),
+])
+def test_an_acknowledgement_never_reaches_a_snapshot_that_states_no_identities(
+        repository, label, metadata, reason):
+    """`allow_incomplete` acknowledges a COUNTED gap, and nothing else.
+
+    A raw-only resource states no vehicle identities at all, and a snapshot
+    that records no reading cannot say what it is missing -- neither is an
+    incomplete answer a caller could acknowledge, so neither becomes readable.
+    """
+    lease = leased_run(repository)
+    row = activate_empty_snapshot(repository, lease, content="d" * 64, metadata=metadata)
+    for acknowledged in (False, True):
+        view = GovernmentCatalogProjection(repository, snapshot_key=row["snapshot_key"],
+                                           allow_incomplete=acknowledged)
+        with pytest.raises(GovernmentProjectionError) as failure:
+            view.dataset_metadata()
+        assert failure.value.reason_code == reason
+    assert projection.ACKNOWLEDGEABLE_REFUSALS == {"GOV_PROJECTION_SNAPSHOT_INCOMPLETE"}
+
+
+def test_an_incomplete_snapshot_with_no_usable_predecessor_refuses_rather_than_answers(
+        repository):
+    """With nothing usable behind it, the read is a refusal -- never a quiet
+    answer from the incomplete capture."""
+    lease = leased_run(repository)
+    bodies, _broken = contradictory_capture_bodies()
+    only = ingest(repository, lease, transport=FixtureTransport(bodies=bodies))
+    assert only.activated is True and only.normalization_issue_count == 1
+    with pytest.raises(GovernmentProjectionError) as failure:
+        GovernmentCatalogProjection(repository).dataset_metadata()
+    assert failure.value.reason_code == "GOV_PROJECTION_SNAPSHOT_INCOMPLETE"
+
+
+def test_an_ambiguous_reading_is_a_candidate_and_never_a_normalization_issue(repository):
+    """An unknown-but-not-contradictory code still produces a candidate.
+
+    `ambiguous` is a first-class answer in the Catalog PR1 vocabulary, so it is
+    not a gap: the row IS read, the reading says what it could not settle, and
+    the snapshot stays usable.
+    """
+    lease = leased_run(repository)
+    document = page_document(0)
+    document["result"]["records"][0].update({"hanaa_cd": 99, "hanaa_nm": "משהו אחר"})
+    report = ingest(repository, lease,
+                    transport=FixtureTransport(bodies={0: encode(document)}))
+    assert report.normalization_issue_count == 0
+    assert report.candidate_count == PINNED_TOTAL
+    assert report.candidate_status_counts == {"candidate": PINNED_TOTAL - 1, "ambiguous": 1}
+    # Still usable, and the ambiguity is visible on the variant itself.
+    view = GovernmentCatalogProjection(repository)
+    assert view.dataset_metadata().normalization_issue_count == 0
+    ambiguous = [item for item in view.list_variants("טויוטה", "RAV4", limit=200).items
+                 if item.status == "ambiguous"]
+    assert len(ambiguous) == 1 and ambiguous[0].unresolved_dimensions == ("drivetrain",)

@@ -8,11 +8,17 @@ reviewer can check here rather than a claim about a call site.
 The URL is BUILT, never supplied
 --------------------------------
 
-There is no caller-controlled URL and no caller-controlled hostname anywhere
-in this package. A call names an ACTION from a closed allowlist and a RESOURCE
-from a closed allowlist, and `action_url` assembles the one URL that can
-result, on the one scheme and the one host below. A response that arrives from
-any other host -- including via a redirect -- is refused rather than read.
+There is no caller-controlled URL, hostname, path or query parameter anywhere
+in this package. A call names an ACTION, a PACKAGE and a RESOURCE, each from a
+closed allowlist checked BEFORE the transport is invoked, and `action_url`
+assembles the one URL that can result, on the one scheme and the one host
+below. A response that arrives from any other host -- including via a redirect
+-- is refused rather than read.
+
+The ordering matters and is not incidental. An identity that is only checked
+against the RESPONSE has already been sent, so `require_allowed_package` and
+`require_allowed_resource` run first and the echo checks are a second,
+independent test of the same facts rather than the only one.
 
 No credential is held, sent or accepted: `data.gov.il` publishes this dataset
 for unauthenticated read, MILO never writes to it, and there is no code path
@@ -21,7 +27,7 @@ here that could attach an authorization header.
 
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Any, Mapping
 from urllib.parse import quote, urlsplit
 
 from backend.catalog.contracts import MAX_RETRIEVAL_METADATA_CHARS
@@ -53,6 +59,15 @@ CKAN_PACKAGE_ID = "degem-rechev-wltp"
 WLTP_RESOURCE_ID = "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
 QUANTITY_RESOURCE_ID = "5e87a7a1-2f6f-41c1-8aec-7216d52a6cf6"
 ALLOWED_RESOURCE_IDS: frozenset[str] = frozenset({WLTP_RESOURCE_ID, QUANTITY_RESOURCE_ID})
+
+#: The packages this code may name. Closed, and checked BEFORE egress.
+#:
+#: The package id is a SOURCE IDENTITY and it travels in the request, so
+#: validating it after the response came back would mean this package had
+#: already asked `data.gov.il` for a dataset it had decided to refuse. It is
+#: allowlisted here exactly like a resource, and `require_allowed_package` is
+#: the first statement of every entry point that accepts one.
+ALLOWED_PACKAGE_IDS: frozenset[str] = frozenset({CKAN_PACKAGE_ID})
 
 #: The market this dataset is authoritative for. A property of the SOURCE --
 #: the publisher is the Israeli Ministry of Transport and the dataset is the
@@ -106,11 +121,17 @@ JSON_CONTENT_TYPES: tuple[str, ...] = ("application/json", "text/json")
 #: above rather than restated, and checked before a write is attempted so an
 #: over-long metadata object is a local refusal rather than a database error.
 #:
-#: How many per-page checksums fit inline in that bound alongside everything
-#: else the metadata states. A capture with more pages than this still commits
-#: to every page checksum through `page_chain_sha256` (see `snapshot.py`),
-#: which is a single 64-character value however many pages there are.
-MAX_INLINE_PAGE_CHECKSUMS = 24
+#: How many per-page checksums are carried inline in that bound alongside
+#: everything else the metadata states -- including a WORST-CASE normalization
+#: summary (every refusal reason present and the bounded id list full), which
+#: is what fixes this number rather than an optimistic one.
+#:
+#: It is a ceiling, not the whole rule: `snapshot.py` also measures the finished
+#: object and drops the inline list if it still does not fit, so the bound holds
+#: even if a future field grows. A capture with more pages than this still
+#: commits to every page checksum through `page_chain_sha256`, which is a single
+#: 64-character value however many pages there are.
+MAX_INLINE_PAGE_CHECKSUMS = 16
 
 
 #: The closed vocabulary of capture refusals. Each names the PROPERTY that
@@ -127,6 +148,7 @@ GOVERNMENT_SOURCE_REASONS: Mapping[str, str] = {
     # identity
     "GOV_ACTION_NOT_ALLOWED": "that government action is not on the allowlist",
     "GOV_RESOURCE_NOT_ALLOWED": "that government resource is not on the allowlist",
+    "GOV_PACKAGE_NOT_ALLOWED": "that government package is not on the allowlist",
     "GOV_PACKAGE_IDENTITY_MISMATCH": "the government metadata is not the pinned package",
     "GOV_PUBLISHER_MISMATCH": "the government dataset is not published by the expected ministry",
     "GOV_RESOURCE_MISSING": "the pinned resource is absent from the government metadata",
@@ -149,6 +171,7 @@ GOVERNMENT_SOURCE_REASONS: Mapping[str, str] = {
     # capture-level bounds
     "GOV_TOTAL_INVALID": "a government page reports an unusable total",
     "GOV_TOTAL_ESTIMATED": "a government page reports an ESTIMATED total, which cannot gate completeness",
+    "GOV_TOTAL_ESTIMATION_INVALID": "a government page states its estimation flag as something other than a JSON boolean",
     "GOV_RECORDS_FORMAT_UNEXPECTED": "a government page was not served as JSON objects",
     "GOV_METADATA_TOO_LARGE": "the retrieval metadata exceeds the durable bound",
     "GOV_PAYLOAD_TOO_LARGE": "a captured row exceeds the durable raw-record bound",
@@ -192,6 +215,19 @@ def require_allowed_resource(resource_id: str) -> str:
     return identifier
 
 
+def require_allowed_package(package_id: Any) -> str:
+    """The package id, or fail closed -- BEFORE anything is sent.
+
+    Exact match, so a near miss (`degem-rechev-wltp-copy`, a case change, a
+    padded value) is a refusal rather than a request. `None` and a non-string
+    are refusals too: they would otherwise be stringified into a query
+    parameter.
+    """
+    if not isinstance(package_id, str) or package_id not in ALLOWED_PACKAGE_IDS:
+        raise GovernmentSourceError("GOV_PACKAGE_NOT_ALLOWED")
+    return package_id
+
+
 def is_approved_url(url: str) -> bool:
     """Whether a URL sits on the approved scheme, host and API path.
 
@@ -221,7 +257,8 @@ def canonical_request_url(action: str, params: Mapping[str, str]) -> str:
     return f"{base}?{query}" if query else base
 
 
-__all__ = ["ALLOWED_ACTIONS", "ALLOWED_RESOURCE_IDS", "CKAN_PACKAGE_ID",
+__all__ = ["ALLOWED_ACTIONS", "ALLOWED_PACKAGE_IDS", "ALLOWED_RESOURCE_IDS",
+           "CKAN_PACKAGE_ID",
            "CONNECT_TIMEOUT_SECONDS", "DATASTORE_SEARCH", "DATA_GOV_ACTION_ROOT",
            "DATA_GOV_HOST", "DATA_GOV_SCHEME", "DEFAULT_PAGE_LIMIT",
            "GOVERNMENT_DATASET_MARKET", "GOVERNMENT_PUBLISHER", "GOVERNMENT_SOURCE_FAMILY",
@@ -231,4 +268,4 @@ __all__ = ["ALLOWED_ACTIONS", "ALLOWED_RESOURCE_IDS", "CKAN_PACKAGE_ID",
            "MAX_RETRIEVAL_METADATA_CHARS", "PACKAGE_SHOW", "QUANTITY_RESOURCE_ID",
            "READ_TIMEOUT_SECONDS", "RETRYABLE_STATUS_CODES", "RETRY_BACKOFF_SECONDS",
            "WLTP_RESOURCE_ID", "action_url", "canonical_request_url", "is_approved_url",
-           "require_allowed_resource"]
+           "require_allowed_package", "require_allowed_resource"]

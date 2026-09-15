@@ -36,9 +36,10 @@ none is reachable from run input.
 | --- | --- |
 | Scheme / host | HTTPS only, `data.gov.il`, bare hostname comparison (never a suffix match) |
 | Actions | `package_show`, `datastore_search` — a closed allowlist; both reads |
-| Package | `degem-rechev-wltp` |
+| Package | `degem-rechev-wltp`, allowlisted and checked **before** the transport is invoked |
 | Resources | `142afde2-6228-49f9-8a29-9b6c3a0cbe40` (WLTP models — identity material), `5e87a7a1-2f6f-41c1-8aec-7216d52a6cf6` (quantities by manufacturer/model/production year) |
-| URL construction | built by `action_url` from the closed action allowlist; there is no caller-controlled URL and no caller-controlled hostname anywhere in the package |
+| URL construction | built by `action_url` from the closed action allowlist; no caller-controlled URL, hostname, path or query parameter anywhere in the package |
+| Identity checks | `require_allowed_package` and `require_allowed_resource` run **first**, so an identity this code may not read is never asked for; the response is then held to the same identity independently |
 | Paging | the client chooses its own offsets at a fixed page size (`DEFAULT_PAGE_LIMIT = 100`, hard ceiling `MAX_PAGE_LIMIT = 1000`); a caller may supply only `q` and/or `filters` |
 | Bounds per capture | `MAX_PAGES_PER_CAPTURE = 200`, `MAX_RECORDS_PER_CAPTURE = 120 000`, `MAX_RESPONSE_BYTES = 8 MiB`, one row bounded by the durable `MAX_RAW_PAYLOAD_CHARS = 16 384` |
 | Timeouts | `CONNECT_TIMEOUT_SECONDS = 10.0`, `READ_TIMEOUT_SECONDS = 30.0` — finite and separate |
@@ -67,9 +68,23 @@ final URL's host; CKAN `success`; the `result` shape.
 Validated, per page: the echoed resource id; the echoed page size; the echoed
 offset; the echoed `q`/`filters` **in both directions** (a parameter that was
 sent must come back unchanged, and one that was not sent must not come back at
-all); the reported total, identical on every page and **not estimated**;
+all); the reported total, identical on every page; the estimation flag (below);
 `records_format`; the row count the page's position implies; the declared field
 schema, identical on every page; every row an object; every row's `_id`.
+
+**`total_was_estimated` is a strict JSON boolean.** An estimated total cannot
+gate completeness, so the flag is part of the response contract and is read by
+type as well as by value:
+
+| Value | Outcome |
+| --- | --- |
+| absent | **accepted** — CKAN omits the key on responses that did not estimate, so refusing an absent key would refuse the ordinary case. Absence means the server made no estimation claim, and the gate then rests on the total alone |
+| JSON `false` | accepted — the server states the total is exact |
+| JSON `true` | refused, `GOV_TOTAL_ESTIMATED` |
+| `1`, `0`, `"true"`, `"false"`, `null`, `{}`, `[]`, anything else | refused, `GOV_TOTAL_ESTIMATION_INVALID` — a server answering any of these is not answering this contract, and it is refused as malformed rather than as an estimate |
+
+A malformed flag on the first page ends the capture there; no later page is
+requested and nothing is persisted.
 
 Validated, per capture: the page lengths sum to the reported total, and the
 count of distinct `_id`s equals it too.
@@ -242,7 +257,70 @@ on resume. That is safe here for two specific reasons and only those: every
 upstream call is read-only, and every durable write is idempotent on a key
 derived from content.
 
-## 8. The internal query layer (for PR3)
+## 8. An active snapshot states its own reading gap
+
+An active snapshot may legitimately hold rows this catalog could not read: a
+code/label contradiction is the register disagreeing with itself, and inventing
+an identity for such a row would be worse than not reading it. What must never
+happen is that the gap disappears.
+
+**The gap is durable.** Normalization runs over the whole capture BEFORE the
+snapshot is opened, so the summary the snapshot carries and the candidates the
+database receives come from one computation of one pure function. The snapshot's
+`retrieval_metadata` then carries, permanently:
+
+| Field | Meaning |
+| --- | --- |
+| `normalization_contract` | `gov.wltp.normalize.1`, or `raw_only` for a resource with no reviewed identity normalization |
+| `normalized_record_count` | rows that produced a candidate |
+| `normalization_issue_count` | rows that could not be read — always exact |
+| `normalization_issues` | `[{reason, count}, …]` per reason code, sorted |
+| `normalization_issue_records` | the refused ids, sorted, bounded to `MAX_DURABLE_ISSUE_RECORDS` (10) |
+
+Every report — first write, exact replay, cross-run reuse — reads these back
+off the snapshot rather than restating what the caller just computed, and a
+replay whose freshly computed summary disagrees with the stored one fails closed
+with `GOV_SNAPSHOT_NORMALIZATION_DRIFT` rather than reusing a snapshot that was
+read under different rules.
+
+**An incomplete snapshot is not usable.** The projection answers from the newest
+snapshot that is active AND free of unresolved issues, so a newer capture that
+is raw-complete but semantically incomplete does not displace the last usable
+one. Reading it takes `allow_incomplete=True`, and then the gap travels on every
+answer. That acknowledgement covers exactly one refusal:
+
+| Refusal | Acknowledgeable? |
+| --- | --- |
+| `GOV_PROJECTION_SNAPSHOT_INCOMPLETE` | **yes** — a real capture with a stated, counted gap |
+| `GOV_PROJECTION_RESOURCE_NOT_NORMALIZED` | no — a raw-only resource states no vehicle identities at all |
+| `GOV_PROJECTION_SNAPSHOT_NOT_READ` | no — a snapshot that records no reading cannot say what it is missing |
+
+**`ambiguous` is not a gap.** An unknown but non-contradictory coded dimension
+still produces a candidate; the reading says which dimension it could not settle
+and the snapshot stays fully usable. Only a hard refusal — a contradiction, a
+missing marque, model or year, an over-long identity — counts as an issue.
+
+**The quantity resource is raw-only, by contract.** Its rows are captured,
+stored and preserved; nothing reads them for identity, so it produces no
+candidate and no issue, its snapshot records `normalization_contract:
+"raw_only"`, and asking the projection for a tree from it is
+`GOV_PROJECTION_RESOURCE_NOT_NORMALIZED`. That is a stated contract rather than
+233 failures.
+
+**The arithmetic that makes "silently" impossible:** for every active snapshot,
+`stored_record_count − candidates == normalization_issue_count`. A raw record
+with neither a candidate nor a durably counted issue cannot exist.
+
+**What the metadata bound drops, if anything.** The durable metadata is bounded
+at 4096 characters. The normalization summary is never what gives way — it
+decides whether a snapshot may answer at all. The per-page checksum list is:
+carried verbatim while the page count is within `MAX_INLINE_PAGE_CHECKSUMS` (16,
+fixed by measuring a worst-case summary) and the finished object fits, and
+otherwise dropped **whole** — never truncated, since a truncated list would be a
+snapshot claiming page provenance it does not carry. `page_chain_sha256` commits
+to every checksum either way.
+
+## 9. The internal query layer (for PR3)
 
 `backend/catalog/government/projection.py` is a service/query component: a plain
 class with typed methods. **It is not a `Tool`** — no operations mapping, no
@@ -254,13 +332,20 @@ result, and returns ambiguity rather than collapsing candidates:
 `resolve_variant` answers with one variant or with every match it found, and
 never picks a first row.
 
+A pinned `snapshot_key` is resolved by an EXACT repository lookup —
+`find_active_catalog_snapshot`, an equality match on family, resource, key and
+active state, capped at one row — never by searching the bounded newest-first
+listing, which would make every active snapshot older than the listing bound
+unreachable. The listing is used only to choose the newest usable snapshot, and
+both repositories order it `activated_at DESC, snapshot_key ASC`.
+
 A snapshot larger than `MAX_PROJECTION_CANDIDATES` (5 000) is a REFUSAL rather
 than a silent truncation. Stated plainly: the pinned `q=RAV4` capture (233 rows)
 fits easily; a capture of the whole ~101 000-row WLTP resource does not, and is
 deliberately out of scope for PR2 — answering it needs database-side aggregation
 and ordering, which belongs with the tool that will consume it.
 
-## 9. What remains fixture-only, and what is deferred
+## 10. What remains fixture-only, and what is deferred
 
 **Fixture-backed.** Every test reads the committed R5 Government capture —
 `q=RAV4&limit=100` over the WLTP resource, offsets 0/100/200, counts
@@ -279,6 +364,18 @@ scope and grant; evidence mapping (source/claim/fragment/verdict) for Government
 rows; the Government↔legacy crosswalk; Commander policy; controlled canonical
 promotion with FIELD-LEVEL provenance; the scheduled refresh/diff operation; and
 database-side aggregation for a whole-resource capture.
+
+**Stated limitations.**
+
+* The unpinned snapshot search covers the bounded newest-first listing (50
+  rows), so a usable snapshot sitting behind more than 50 unusable ones is not
+  found by it. This is deliberate — an unbounded scan is not a read this layer
+  performs — and such a snapshot is still reachable by name through the exact
+  lookup, which has no such bound.
+* `MAX_PROJECTION_CANDIDATES` (5 000) bounds one snapshot's projection; a whole
+  ~101 000-row WLTP capture exceeds it and is refused rather than truncated.
+* The durable issue list names at most 10 refused rows individually. The count
+  and the per-reason breakdown are always exact.
 
 **Not proven here.** Complete production coverage of Israel. The tests exercise
 one bounded query of one resource. The code is generic enough for bounded

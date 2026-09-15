@@ -43,13 +43,14 @@ and nothing here promotes anything to the canonical catalog.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
 from backend.runtime import CancellationRequested
 
 from . import source as src
-from .normalize import (GovernmentNormalizationError, UNMAPPED_FIELDS, read_wltp_record)
+from .normalize import (GovernmentNormalizationError, NORMALIZATION_CONTRACT,
+                        RAW_ONLY_CONTRACT, UNMAPPED_FIELDS, read_wltp_record)
 
 #: The largest number of candidates one snapshot may be projected from in a
 #: single read. A snapshot beyond it is refused rather than truncated.
@@ -76,7 +77,22 @@ GOVERNMENT_PROJECTION_REASONS: Mapping[str, str] = {
         "a candidate names a raw record this snapshot does not hold",
     "GOV_PROJECTION_SNAPSHOT_UNKNOWN":
         "no active government snapshot carries that snapshot key",
+    "GOV_PROJECTION_SNAPSHOT_INCOMPLETE":
+        "that government snapshot holds rows its reviewed vocabulary could not read",
+    "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED":
+        "that government resource is captured raw-only and states no vehicle identities",
+    "GOV_PROJECTION_SNAPSHOT_NOT_READ":
+        "that government snapshot records no reading of its rows at all",
 }
+
+#: The ONE refusal an explicit acknowledgement may bypass.
+#:
+#: An incomplete snapshot is a real capture with a stated, counted gap, so a
+#: caller that has seen the gap may still read it. The other two are not gaps
+#: in an answer -- a raw-only resource states no identities at all, and a
+#: snapshot with no recorded reading cannot say what it is missing -- so no
+#: acknowledgement makes either answerable.
+ACKNOWLEDGEABLE_REFUSALS = frozenset({"GOV_PROJECTION_SNAPSHOT_INCOMPLETE"})
 
 
 class GovernmentProjectionError(ValueError):
@@ -114,6 +130,14 @@ class DatasetProvenance:
     retrieved_at: str
     activated_at: str
     query: Mapping[str, str]
+    #: The snapshot's own durable reading gap. Carried on EVERY answer, so a
+    #: result read under an acknowledgement is never mistaken for a complete
+    #: one further down the line.
+    normalization_contract: str = ""
+    normalized_record_count: int = 0
+    normalization_issue_count: int = 0
+    normalization_issues: Mapping[str, int] = field(default_factory=dict)
+    normalization_issue_records: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -246,10 +270,15 @@ class GovernmentCatalogProjection:
     def __init__(self, repository: Any, *, resource_id: str = src.WLTP_RESOURCE_ID,
                  snapshot_key: str | None = None,
                  max_candidates: int = MAX_PROJECTION_CANDIDATES,
+                 allow_incomplete: bool = False,
                  cancellation_checker: Callable[[], bool] | None = None) -> None:
         self._repository = repository
         self._resource_id = src.require_allowed_resource(resource_id)
         self._snapshot_key = snapshot_key
+        #: Read a snapshot whose reading gap is stated and counted anyway. The
+        #: gap then travels on every answer; it is never a way to be handed an
+        #: incomplete tree without knowing it.
+        self._allow_incomplete = bool(allow_incomplete)
         self._max_candidates = int(max_candidates)
         self._cancellation_checker = cancellation_checker
         self._cache: tuple[DatasetProvenance, tuple[VariantView, ...],
@@ -258,19 +287,72 @@ class GovernmentCatalogProjection:
     # --- the active snapshot -------------------------------------------------
 
     def _active_snapshot(self) -> Mapping[str, Any]:
+        """The snapshot this projection answers from, or a refusal.
+
+        A PINNED key is resolved by an exact repository lookup, never by
+        searching the bounded newest-first listing: that listing exists to
+        choose the newest snapshot, and using it to resolve an explicit key
+        made every active snapshot older than the bound unreachable.
+
+        Without a pin, the newest USABLE snapshot answers. Usability is a
+        property of the snapshot's own durable state (see `_usability`), so a
+        newer capture that is raw-complete but semantically incomplete does not
+        displace the last usable one -- it is skipped, and the refusal that
+        would otherwise be returned names the newest one's gap.
+
+        STATED LIMITATION: the unpinned search covers the BOUNDED listing, so a
+        usable snapshot sitting behind more than `MAX_CATALOG_SNAPSHOT_ROWS`
+        unusable ones is not found by it. That is deliberate -- an unbounded
+        scan is not a read this layer will perform -- and it is reachable by
+        name through the exact lookup above, which has no such bound.
+        """
+        if self._snapshot_key is not None:
+            pinned = self._repository.find_active_catalog_snapshot(
+                src.GOVERNMENT_SOURCE_FAMILY, self._resource_id, self._snapshot_key)
+            if pinned is None:
+                raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_UNKNOWN")
+            self._require_usable(pinned)
+            return pinned
         rows = self._repository.list_active_catalog_snapshots(
             src.GOVERNMENT_SOURCE_FAMILY, resource_id=self._resource_id)
         if not rows:
             raise GovernmentProjectionError("GOV_PROJECTION_NO_ACTIVE_SNAPSHOT")
-        if self._snapshot_key is None:
-            # Newest activation first, and the repository breaks a tie on the
-            # snapshot key, so "the newest active snapshot" is a single row
-            # rather than whichever the database happened to return.
-            return rows[0]
-        pinned = next((row for row in rows if row.get("snapshot_key") == self._snapshot_key), None)
-        if pinned is None:
-            raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_UNKNOWN")
-        return pinned
+        for row in rows:
+            if self._usability(row) is None:
+                return row
+        # Every active snapshot in the listing is unusable. The NEWEST one is
+        # held to the rule, so the refusal names the state a reader would
+        # otherwise have been answered from -- and an acknowledgement reaches
+        # exactly that snapshot rather than an arbitrary older one.
+        self._require_usable(rows[0])
+        return rows[0]
+
+    @staticmethod
+    def _usability(snapshot: Mapping[str, Any]) -> str | None:
+        """Why this snapshot may not answer a query, or None if it may.
+
+        Read from the snapshot's OWN durable metadata, so usability is a
+        property of the stored row rather than of whatever the reader recomputes
+        -- which is what stops a raw-complete but semantically incomplete
+        capture from quietly becoming the newest answer.
+        """
+        metadata = snapshot.get("retrieval_metadata") or {}
+        contract = metadata.get("normalization_contract")
+        if contract == RAW_ONLY_CONTRACT:
+            return "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED"
+        if contract != NORMALIZATION_CONTRACT:
+            # No stated reading at all: a snapshot that cannot say what it is
+            # missing is not a snapshot this layer will answer from.
+            return "GOV_PROJECTION_SNAPSHOT_NOT_READ"
+        if int(metadata.get("normalization_issue_count") or 0) > 0:
+            return "GOV_PROJECTION_SNAPSHOT_INCOMPLETE"
+        return None
+
+    def _require_usable(self, snapshot: Mapping[str, Any]) -> None:
+        reason = self._usability(snapshot)
+        if reason is None or (self._allow_incomplete and reason in ACKNOWLEDGEABLE_REFUSALS):
+            return
+        raise GovernmentProjectionError(reason)
 
     def _load(self) -> tuple[DatasetProvenance, tuple[VariantView, ...],
                              Mapping[str, Mapping[str, Any]]]:
@@ -489,7 +571,14 @@ def _provenance_of(snapshot: Mapping[str, Any]) -> DatasetProvenance:
         declared_record_count=int(snapshot["declared_record_count"]),
         stored_record_count=int(snapshot["stored_record_count"]),
         retrieved_at=str(snapshot["retrieved_at"]), activated_at=str(snapshot["activated_at"]),
-        query={str(key): str(value) for key, value in (metadata.get("query") or {}).items()})
+        query={str(key): str(value) for key, value in (metadata.get("query") or {}).items()},
+        normalization_contract=str(metadata.get("normalization_contract") or ""),
+        normalized_record_count=int(metadata.get("normalized_record_count") or 0),
+        normalization_issue_count=int(metadata.get("normalization_issue_count") or 0),
+        normalization_issues={str(entry["reason"]): int(entry["count"])
+                              for entry in metadata.get("normalization_issues") or []},
+        normalization_issue_records=tuple(
+            str(record) for record in metadata.get("normalization_issue_records") or ()))
 
 
 def _variant_view(candidate: Mapping[str, Any], record: Mapping[str, Any],
@@ -527,7 +616,8 @@ def _variant_view(candidate: Mapping[str, Any], record: Mapping[str, Any],
         engine_displacement_cc=displacement, unresolved_dimensions=unresolved)
 
 
-__all__ = ["DEFAULT_RESULT_ITEMS", "GOVERNMENT_PROJECTION_REASONS",
+__all__ = ["ACKNOWLEDGEABLE_REFUSALS", "DEFAULT_RESULT_ITEMS",
+           "GOVERNMENT_PROJECTION_REASONS",
            "MAX_PROJECTION_CANDIDATES", "MAX_RESULT_ITEMS", "UNMAPPED_FIELDS",
            "DatasetProvenance", "GovernmentCatalogProjection", "GovernmentProjectionError",
            "ManufacturerSummary", "ModelSummary", "ModelYearSummary", "RecordView",

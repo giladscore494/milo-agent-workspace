@@ -569,6 +569,21 @@ Done כאשר: פרויקט עם workflow_key=swarm_v2 מסיים Run במצב c
 > of it, seeds none of it, and adds no code that reads it. The canonical
 > catalog still starts empty.
 >
+> **An active snapshot states its own reading gap.** A row the reviewed
+> vocabulary cannot read — a code/label contradiction, a missing marque, model
+> or year — is stored raw and counted in the snapshot's own durable metadata:
+> the contract it was read under, how many rows were read, how many were
+> refused, the count per reason and a bounded list of refused ids. Replay and
+> cross-run reuse report that stored summary rather than recomputing a private
+> one, and a replay that disagrees with it fails closed. The query layer answers
+> only from a snapshot with no unresolved gap, so a newer raw-complete but
+> semantically incomplete capture never displaces the last usable one; reading
+> it takes an explicit acknowledgement and the gap then travels on every answer.
+> An `ambiguous` candidate is NOT a gap — the row was read, and the reading says
+> what it could not settle. The quantity resource is governed by an explicit
+> raw-only contract: captured and preserved, never read for identity, and never
+> a source of a tree.
+>
 > **Source-field authority is field-specific.** The register is the anchor for
 > existence, model year, official model code, trim and the coded identity
 > dimensions it publishes; it is not authority for a field whose semantics it

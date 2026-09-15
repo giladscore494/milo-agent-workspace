@@ -7,12 +7,17 @@ The order is the safety property
     as one result set BEFORE a single durable write. A partial, inconsistent,
     over-limit or malformed capture therefore leaves no trace at all -- not a
     pending snapshot, not a row.
-2.  **Open the snapshot.** It is born `pending` and can never be born active:
-    the payload preparer refuses `activated_at` and `stored_record_count` as
-    inputs and the guarded RPC refuses them again.
-3.  **Append every raw record**, each with the exact page and index it occupied.
-4.  **Record every candidate reading.**
-5.  **Activate last.** The database's own gate refuses activation unless the
+2.  **Read the whole capture.** Normalization is a pure function of the capture
+    and runs before anything durable exists, so the summary the snapshot
+    carries and the candidates the database receives come from ONE computation.
+    A row that cannot be read is counted here, once, and that count becomes
+    part of the snapshot's own durable state rather than of this report.
+3.  **Open the snapshot**, carrying that summary. It is born `pending` and can
+    never be born active: the payload preparer refuses `activated_at` and
+    `stored_record_count` as inputs and the guarded RPC refuses them again.
+4.  **Append every raw record**, each with the exact page and index it occupied.
+5.  **Record the readings** that step 2 produced.
+6.  **Activate last.** The database's own gate refuses activation unless the
     snapshot holds exactly as many records as the upstream declared, so a
     prefix cannot be activated even by a caller that wanted to.
 
@@ -58,6 +63,27 @@ resume. That is safe here for two specific reasons, and only those -- every
 upstream call is READ-ONLY, and every durable write is idempotent on a key
 derived from content -- so a replayed step lands on the same rows.
 
+A snapshot states its own reading gap
+-------------------------------------
+
+An active snapshot may legitimately hold rows this catalog could not read: a
+code/label contradiction is the register disagreeing with itself, and inventing
+an identity for such a row would be worse than not reading it. What must never
+happen is that the gap disappears -- which is what happened while the only
+record of it was this report, produced once by whichever run wrote the
+snapshot and gone on every replay.
+
+So the gap is DURABLE. `retrieval_metadata` carries the contract the rows were
+read under, how many were read, how many were refused, the count per reason and
+a bounded list of the refused ids. A replay recomputes it and is held to it
+(`GOV_SNAPSHOT_NORMALIZATION_DRIFT`), and every report -- first write, replay,
+cross-run reuse -- states what the SNAPSHOT says rather than what the caller
+just computed.
+
+Reading is then a separate decision, made in `projection.py`: a snapshot with
+an unresolved gap is not usable, so the last usable snapshot keeps answering
+and a reader who wants the incomplete one has to say so.
+
 No model, no provider and no canonical write
 --------------------------------------------
 
@@ -80,8 +106,8 @@ from backend.runtime import CancellationRequested
 from . import snapshot as snapshot_module
 from . import source as src
 from .client import DataGovClient, ResourceCapture
-from .normalize import (GovernmentNormalizationError, RecordReading, UNMAPPED_FIELDS,
-                        read_wltp_record)
+from .normalize import (CaptureNormalization, RAW_ONLY_CONTRACT, UNMAPPED_FIELDS,
+                        read_capture)
 from .source import GovernmentSourceError
 
 #: The bound on how many per-row refusals one report carries verbatim. The
@@ -95,6 +121,8 @@ GOVERNMENT_INGESTION_REASONS: Mapping[str, str] = {
         "this capture was opened by another run and is not finished; it cannot be adopted",
     "GOV_SNAPSHOT_NOT_ACTIVATED":
         "the capture was written in full but the snapshot did not activate",
+    "GOV_SNAPSHOT_NORMALIZATION_DRIFT":
+        "this snapshot was read under a different normalization contract than this code applies",
 }
 
 
@@ -127,10 +155,22 @@ class IngestionReport:
     #: the candidates were already durable and nothing was written.
     candidate_count: int
     candidate_status_counts: Mapping[str, int]
-    #: `(upstream_record_id, reason_code)` for rows that were CAPTURED and
-    #: STORED but could not be read into an identity. Bounded; see
-    #: `rejected_record_count` for the exact total. No raw row is ever lost
-    #: because of a refusal here -- it is durable either way.
+    #: The reading gap, read back from the SNAPSHOT'S OWN durable metadata --
+    #: never from whatever this ingestion happened to compute. That is what
+    #: makes a replay and a cross-run reuse report the same truth as the
+    #: ingestion that wrote the snapshot.
+    normalization_contract: str = ""
+    normalized_record_count: int = 0
+    normalization_issue_count: int = 0
+    normalization_issues: Mapping[str, int] = field(default_factory=dict)
+    normalization_issue_records: tuple[str, ...] = ()
+    #: `(upstream_record_id, reason_code)` for rows THIS ingestion captured,
+    #: stored and could not read into an identity -- with the reason for each,
+    #: bounded by `MAX_REPORTED_REJECTIONS`. Empty on a replay or a reuse,
+    #: where this ingestion read nothing: the `normalization_*` fields below
+    #: are the ones that always speak, because they are read back off the
+    #: snapshot itself. No raw row is ever lost because of a refusal here -- it
+    #: is durable either way.
     rejected_records: tuple[tuple[str, str], ...] = ()
     rejected_record_count: int = 0
     #: The captured fields this ingestion deliberately did not read, each with
@@ -167,16 +207,28 @@ class GovernmentCatalogIngestor:
     def ingest_resource(self, resource_id: str, *, package_id: str = src.CKAN_PACKAGE_ID,
                         query: Mapping[str, str] | None = None) -> IngestionReport:
         """Capture one complete bounded query and land it in the catalog."""
+        # Both source identities are allowlisted at THIS boundary too, so an
+        # entry point that is read on its own states the rule it applies rather
+        # than relying on a callee to apply it.
         capture = self._client.capture_resource(
-            src.require_allowed_resource(resource_id), package_id=package_id, query=query)
+            src.require_allowed_resource(resource_id),
+            package_id=src.require_allowed_package(package_id), query=query)
         return self.ingest_capture(capture)
 
     def ingest_capture(self, capture: ResourceCapture) -> IngestionReport:
         """Land an ALREADY-VALIDATED capture. Separated so a capture can be
         taken once and landed under test without a second transport."""
         self._check_cancelled()
+        # Read the WHOLE capture before opening the snapshot. The summary the
+        # snapshot carries and the candidates the database receives then come
+        # from one computation of one pure function, so they cannot disagree --
+        # and the gap is durable from the moment the snapshot exists rather
+        # than being discovered halfway through writing it.
+        normalization = read_capture([record for _, record in capture.located_records()],
+                                     resource_id=capture.resource_id)
         snapshot = self._repository.record_catalog_snapshot(
-            self._lease.run_id, snapshot_module.snapshot_payload(capture), **self._lease_kwargs)
+            self._lease.run_id, snapshot_module.snapshot_payload(capture, normalization),
+            **self._lease_kwargs)
         owner = str(snapshot.get("created_by_run_id"))
         if owner != str(self._lease.run_id):
             # Another run opened this capture. If it FINISHED it, this run has
@@ -185,17 +237,19 @@ class GovernmentCatalogIngestor:
             # here keeps a half-written attempt out of the report.
             if snapshot.get("activated_at") is None:
                 raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN")
+            self._check_normalization(snapshot, normalization)
             return self._report(capture, snapshot, candidates=(), reused=True)
 
         if snapshot.get("activated_at") is not None:
             # Exact replay of our own completed capture: the records and the
             # candidates are already durable and the snapshot is frozen, so
             # this is a deterministic no-op rather than a second ingestion.
+            self._check_normalization(snapshot, normalization)
             self._emit("catalog_snapshot_replayed", {"snapshot_key": snapshot["snapshot_key"]})
             return self._report(capture, snapshot, candidates=(), reused=False)
 
         records = self._write_records(capture, snapshot)
-        candidates, rejected = self._write_candidates(capture, records)
+        candidates, rejected = self._write_candidates(normalization, records)
         snapshot = self._activate(snapshot)
         return self._report(capture, snapshot, candidates=candidates, reused=False,
                             rejected=rejected)
@@ -218,30 +272,34 @@ class GovernmentCatalogIngestor:
                                                "count": len(stored)})
         return stored
 
-    def _write_candidates(self, capture: ResourceCapture,
+    def _write_candidates(self, normalization: CaptureNormalization,
                           records: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]]
                           ) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
-        """Read every stored row into an identity, or report why not.
+        """Write the readings this capture already produced, in capture order.
 
-        A row that cannot be read is NOT lost and NOT silently dropped: it is
-        already durable as a raw record, and the reason it could not be read
-        travels in the report. Reading is per-row on purpose -- one unreadable
-        row must not discard a capture in which every other row is fine.
+        The readings were computed before the snapshot was opened, so nothing
+        is decided here -- this walks the positional entries and writes the ones
+        that exist. A row that could not be read is NOT lost: it is durable as a
+        raw record, and its reason is already in the snapshot's own metadata, so
+        it survives this ingestion rather than living only in this report.
+
+        A RAW-ONLY resource produces no entries at all and therefore no
+        candidates, which is its stated contract rather than 233 failures.
         """
+        if normalization.contract == RAW_ONLY_CONTRACT:
+            self._emit("catalog_candidates_skipped", {"contract": RAW_ONLY_CONTRACT,
+                                                      "records": len(records)})
+            return [], []
         candidates: list[dict[str, Any]] = []
-        rejected: list[tuple[str, str]] = []
-        for record_row, raw in records:
+        for (record_row, _raw), reading in zip(records, normalization.entries):
             self._check_cancelled()
-            try:
-                reading: RecordReading = read_wltp_record(raw, resource_id=capture.resource_id)
-            except GovernmentNormalizationError as refusal:
-                rejected.append((str(record_row["upstream_record_id"]), refusal.reason_code))
+            if reading is None:
                 continue
             candidates.append(self._repository.record_catalog_candidate(
                 self._lease.run_id, reading.candidate_payload(record_row), **self._lease_kwargs))
         self._emit("catalog_candidates_written", {"count": len(candidates),
-                                                  "rejected": len(rejected)})
-        return candidates, rejected
+                                                  "rejected": normalization.issue_count})
+        return candidates, list(normalization.issues)
 
     def _activate(self, snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
         """Decide the snapshot, and record a failure AS a failure.
@@ -264,6 +322,23 @@ class GovernmentCatalogIngestor:
                                                   "records": decided["stored_record_count"]})
         return decided
 
+    @staticmethod
+    def _check_normalization(snapshot: Mapping[str, Any],
+                             normalization: CaptureNormalization) -> None:
+        """A replay or a reuse must RECONSTRUCT the stored gap, not assume it.
+
+        The summary is a function of the captured content, so the same content
+        read under the same contract reproduces it exactly. If it does not, the
+        stored snapshot was read under different rules -- a vocabulary entry
+        changed, or another release wrote it -- and reusing it as though this
+        code had read it would be the drift the summary exists to prevent. So
+        it fails closed instead, and the stored snapshot is left untouched.
+        """
+        stored = snapshot.get("retrieval_metadata") or {}
+        fresh = normalization.durable_summary()
+        if any(stored.get(field) != value for field, value in fresh.items()):
+            raise GovernmentIngestionError("GOV_SNAPSHOT_NORMALIZATION_DRIFT")
+
     # --- reporting -----------------------------------------------------------
 
     def _report(self, capture: ResourceCapture, snapshot: Mapping[str, Any], *,
@@ -273,6 +348,9 @@ class GovernmentCatalogIngestor:
         for candidate in candidates:
             status = str(candidate.get("status"))
             statuses[status] = statuses.get(status, 0) + 1
+        # Read from the SNAPSHOT, so a replay and a reuse report exactly what
+        # the ingestion that wrote it recorded.
+        metadata = snapshot.get("retrieval_metadata") or {}
         return IngestionReport(
             snapshot_id=str(snapshot["id"]), snapshot_key=str(snapshot["snapshot_key"]),
             content_sha256=str(snapshot["content_sha256"]),
@@ -286,6 +364,13 @@ class GovernmentCatalogIngestor:
             candidate_status_counts=statuses,
             rejected_records=tuple(rejected[:MAX_REPORTED_REJECTIONS]),
             rejected_record_count=len(rejected),
+            normalization_contract=str(metadata.get("normalization_contract") or ""),
+            normalized_record_count=int(metadata.get("normalized_record_count") or 0),
+            normalization_issue_count=int(metadata.get("normalization_issue_count") or 0),
+            normalization_issues={str(entry["reason"]): int(entry["count"])
+                                  for entry in metadata.get("normalization_issues") or []},
+            normalization_issue_records=tuple(
+                str(record) for record in metadata.get("normalization_issue_records") or ()),
             activated=snapshot.get("activated_at") is not None,
             reused_existing=reused, created_by_run_id=str(snapshot.get("created_by_run_id")),
             candidates=tuple(dict(candidate) for candidate in candidates))

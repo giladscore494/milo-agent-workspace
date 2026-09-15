@@ -77,6 +77,7 @@ class Repository(Protocol):
     # bounded, each orders deterministically, and none of them accepts SQL, a
     # table name, a column name or an ordering from its caller.
     def list_active_catalog_snapshots(self, source_family: str, *, resource_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]: ...
+    def find_active_catalog_snapshot(self, source_family: str, resource_id: str, snapshot_key: str) -> dict[str, Any] | None: ...
     def list_catalog_raw_records(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
     def list_catalog_candidates(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
 
@@ -845,6 +846,26 @@ class SupabaseRepository:
         if resource_id is not None:
             query = query.eq("resource_id", str(resource_id))
         return self._many(query.order("activated_at", desc=True).order("snapshot_key").limit(bounded))
+
+    def find_active_catalog_snapshot(self, source_family: str, resource_id: str, snapshot_key: str) -> dict[str, Any] | None:
+        """ONE active snapshot named exactly, or None.
+
+        Deliberately not a search of `list_active_catalog_snapshots`: that
+        listing is bounded to the NEWEST rows, so resolving an explicit
+        `snapshot_key` through it made every active snapshot older than the
+        bound unreachable -- a "no such snapshot" for a row sitting active in
+        the table.  This is an equality lookup on all four properties, capped
+        at one row, so its cost does not grow with the catalog.
+
+        `source_family` and `resource_id` are part of the lookup rather than
+        checked afterwards: a key is unique, but a caller asking for a
+        Government WLTP snapshot must not be handed a row of another family or
+        another resource that happens to carry it."""
+        rows = self._many(
+            self.client.table("catalog_source_snapshots").select(self.CATALOG_SNAPSHOT_COLUMNS)
+            .eq("source_family", str(source_family)).eq("resource_id", str(resource_id))
+            .eq("snapshot_key", str(snapshot_key)).not_.is_("activated_at", "null").limit(1))
+        return rows[0] if rows else None
 
     def list_catalog_raw_records(self, snapshot_id: Any, *, limit: int = MAX_CATALOG_RECORD_ROWS, offset: int = 0) -> list[dict[str, Any]]:
         """One snapshot's captured rows, in a stable, collation-free order."""

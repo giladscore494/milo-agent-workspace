@@ -1148,8 +1148,24 @@ class MemoryRepository:
                     if row.get("source_family") == str(source_family)
                     and row.get("activated_at") is not None
                     and (resource_id is None or row.get("resource_id") == str(resource_id))]
-        rows.sort(key=lambda row: (row["activated_at"], row["snapshot_key"]), reverse=True)
+        # `activated_at` DESC, then `snapshot_key` ASC -- exactly the Supabase
+        # ordering.  Sorting the whole tuple in reverse would reverse the
+        # TIEBREAK too, so snapshots activated in the same instant came back in
+        # the opposite order from the database's.  Two stable passes, ascending
+        # tiebreak first, is the one spelling that cannot drift.
+        rows.sort(key=lambda row: row["snapshot_key"])
+        rows.sort(key=lambda row: row["activated_at"], reverse=True)
         return rows[:max(1, min(int(limit), self.MAX_CATALOG_SNAPSHOT_ROWS))]
+
+    def find_active_catalog_snapshot(self, source_family: str, resource_id: Any,
+                                     snapshot_key: str) -> dict[str, Any] | None:
+        """ONE active snapshot named exactly, or None. Not a bounded search."""
+        with self.lock:
+            return next((dict(row) for row in self.catalog_snapshots.values()
+                         if row.get("snapshot_key") == str(snapshot_key)
+                         and row.get("source_family") == str(source_family)
+                         and row.get("resource_id") == str(resource_id)
+                         and row.get("activated_at") is not None), None)
 
     def list_catalog_raw_records(self, snapshot_id: Any, *, limit: int = MAX_CATALOG_RECORD_ROWS,
                                  offset: int = 0) -> list[dict[str, Any]]:

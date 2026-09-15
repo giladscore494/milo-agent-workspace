@@ -70,7 +70,7 @@ Pure module: dict reading and string checks. No I/O, no clock, no randomness.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from backend.catalog.contracts import CANDIDATE_IDENTITY_DIMENSIONS
 
@@ -84,6 +84,30 @@ MAX_MANUFACTURER_CHARS = 120
 MAX_COMMERCIAL_MODEL_CHARS = 200
 MAX_MODEL_CODE_CHARS = 120
 MAX_TRIM_CHARS = 120
+
+#: The contract one WLTP snapshot was read under, recorded in its own durable
+#: retrieval metadata. Versioned: if the reviewed vocabulary or these rules
+#: change, this string changes with them, and a replay whose freshly computed
+#: summary disagrees with a stored one fails closed instead of being accepted
+#: under rules the stored snapshot was never read by.
+NORMALIZATION_CONTRACT = "gov.wltp.normalize.1"
+
+#: The contract a resource with NO reviewed identity normalization is ingested
+#: under. Its rows are captured, stored and preserved; they are never read for
+#: identity, produce no candidate, and cannot answer a tree. This is a stated
+#: contract rather than an absence, so a reader can tell "nothing was read here
+#: by design" apart from "nothing was read here and nobody said why".
+RAW_ONLY_CONTRACT = "raw_only"
+
+#: Resources that HAVE a reviewed identity normalization. Everything else the
+#: client may capture is raw-only, by this table rather than by omission.
+NORMALIZED_RESOURCE_IDS: frozenset[str] = frozenset({src.WLTP_RESOURCE_ID})
+
+#: How many refused rows a snapshot's durable summary names individually. The
+#: COUNT and the per-reason breakdown are always exact; the id list is bounded,
+#: because durable retrieval metadata is bounded and a systematically
+#: unreadable capture must not be able to fill it.
+MAX_DURABLE_ISSUE_RECORDS = 10
 
 #: The closed vocabulary of per-row normalization refusals. A refusal names the
 #: PROPERTY that failed and carries no field value and no row.
@@ -272,6 +296,89 @@ def read_wltp_record(record: Mapping[str, Any], *,
         engine_displacement_cc=displacement if displacement and displacement > 0 else None)
 
 
+
+@dataclass(frozen=True)
+class CaptureNormalization:
+    """What a WHOLE capture reads as -- the readings and the gap, together.
+
+    Computed BEFORE anything durable is written, from the capture alone, so the
+    summary that reaches the snapshot's own metadata and the candidates that
+    reach the database come from ONE computation of one pure function. Two
+    ingestions of the same content therefore agree by construction rather than
+    by both happening to run the same code twice.
+    """
+
+    contract: str
+    #: One entry per captured row, IN CAPTURE ORDER, `None` where the row could
+    #: not be read. Positional, so a caller never has to re-establish which
+    #: reading belongs to which record.
+    entries: tuple[RecordReading | None, ...]
+    #: `(upstream record id, reason code)` for every row that could not be read.
+    issues: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def normalized_record_count(self) -> int:
+        return sum(1 for entry in self.entries if entry is not None)
+
+    @property
+    def issue_count(self) -> int:
+        return len(self.issues)
+
+    @property
+    def issues_by_reason(self) -> dict[str, int]:
+        counted: dict[str, int] = {}
+        for _, reason in self.issues:
+            counted[reason] = counted.get(reason, 0) + 1
+        return dict(sorted(counted.items()))
+
+    @property
+    def issue_records(self) -> tuple[str, ...]:
+        """The refused rows this summary names, bounded and deterministic.
+
+        Sorted by the register's own id so the list is a function of WHICH rows
+        failed, never of the order they were read in.
+        """
+        return tuple(sorted({record for record, _ in self.issues})[:MAX_DURABLE_ISSUE_RECORDS])
+
+    def durable_summary(self) -> dict[str, Any]:
+        """The bounded, deterministic gap a snapshot carries in its metadata."""
+        return {"normalization_contract": self.contract,
+                "normalized_record_count": self.normalized_record_count,
+                "normalization_issue_count": self.issue_count,
+                "normalization_issues": [{"reason": reason, "count": count}
+                                         for reason, count in self.issues_by_reason.items()],
+                "normalization_issue_records": list(self.issue_records)}
+
+
+def read_capture(records: Iterable[Mapping[str, Any]], *, resource_id: str) -> CaptureNormalization:
+    """Read every captured row of one resource, or record why a row could not be.
+
+    A refusal is per ROW and is never fatal to the capture: the row is still
+    stored verbatim, and the reason it could not be read travels in the summary
+    rather than disappearing. What a refusal must never do is vanish -- which is
+    exactly what happened while the only record of it was an in-memory report.
+
+    A resource with no reviewed normalization returns the RAW-ONLY contract and
+    no entries at all. That is deliberately not the same as "every row failed":
+    nothing was attempted, and the summary says so.
+    """
+    identifier = src.require_allowed_resource(resource_id)
+    if identifier not in NORMALIZED_RESOURCE_IDS:
+        return CaptureNormalization(contract=RAW_ONLY_CONTRACT, entries=(), issues=())
+    entries: list[RecordReading | None] = []
+    issues: list[tuple[str, str]] = []
+    for record in records:
+        try:
+            entries.append(read_wltp_record(record, resource_id=identifier))
+        except GovernmentNormalizationError as refusal:
+            identity = record.get(vocab.GOVERNMENT_RECORD_ID_FIELD) \
+                if isinstance(record, Mapping) else None
+            entries.append(None)
+            issues.append((str(identity), refusal.reason_code))
+    return CaptureNormalization(contract=NORMALIZATION_CONTRACT, entries=tuple(entries),
+                                issues=tuple(issues))
+
+
 #: dimension -> (code field, name field, closed code table, uncoded-name table).
 #: Every key is in `CANDIDATE_IDENTITY_DIMENSIONS`, asserted below, so this
 #: normalizer cannot name a dimension the durable schema would refuse.
@@ -292,6 +399,8 @@ UNMAPPED_FIELDS: tuple[tuple[str, str], ...] = vocab.unmapped_fields(
 
 
 __all__ = ["GOVERNMENT_NORMALIZATION_REASONS", "MAX_COMMERCIAL_MODEL_CHARS",
-           "MAX_MANUFACTURER_CHARS", "MAX_MODEL_CODE_CHARS", "MAX_TRIM_CHARS",
-           "UNMAPPED_FIELDS", "GovernmentNormalizationError", "RecordReading",
+           "MAX_DURABLE_ISSUE_RECORDS", "MAX_MANUFACTURER_CHARS", "MAX_MODEL_CODE_CHARS",
+           "MAX_TRIM_CHARS", "NORMALIZATION_CONTRACT", "NORMALIZED_RESOURCE_IDS",
+           "RAW_ONLY_CONTRACT", "UNMAPPED_FIELDS", "CaptureNormalization",
+           "GovernmentNormalizationError", "RecordReading", "read_capture",
            "read_wltp_record"]

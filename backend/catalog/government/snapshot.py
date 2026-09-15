@@ -45,6 +45,7 @@ from backend.catalog.contracts import MAX_RETRIEVAL_METADATA_CHARS
 
 from . import source as src
 from .client import ResourceCapture
+from .normalize import CaptureNormalization
 from .source import GovernmentSourceError
 
 #: The contract version of the snapshot identity manifest. Part of the hashed
@@ -108,8 +109,9 @@ def snapshot_content_sha256(capture: ResourceCapture) -> str:
     return hashlib.sha256(snapshot_content_basis(capture).encode("utf-8")).hexdigest()
 
 
-def retrieval_metadata(capture: ResourceCapture) -> dict[str, Any]:
-    """The bounded, safe provenance of one capture.
+def retrieval_metadata(capture: ResourceCapture,
+                       normalization: CaptureNormalization) -> dict[str, Any]:
+    """The bounded, safe provenance of one capture -- INCLUDING its reading gap.
 
     Safe means: no credential (none exists on this path and the flag below says
     so), no response body, no row, and no field name the guarded RPC's
@@ -117,14 +119,24 @@ def retrieval_metadata(capture: ResourceCapture) -> dict[str, Any]:
     metadata bound HERE, so an over-long object is a local refusal rather than
     a database error halfway through an ingestion.
 
-    Every page checksum is committed to by `page_chain_sha256` whatever the
-    page count. The per-page list is additionally carried VERBATIM while it
-    fits -- up to `MAX_INLINE_PAGE_CHECKSUMS` pages -- and `page_checksums_inline`
-    states plainly which of the two a given snapshot holds, so a reader never
-    has to infer why a list is absent.
+    The normalization summary is carried because the gap has to OUTLIVE the
+    ingestion that found it. A raw row that could not be read used to be
+    reported once, in memory, by whichever run happened to write it, and then
+    vanished from every replay and every later reader -- so an active snapshot
+    could hold records that no candidate accounted for and nothing said so. It
+    is a function of the captured content, so a replay of the same content
+    reconstructs it exactly, which `ingest.py` checks rather than assumes.
+
+    What gets dropped under pressure is DEFINED rather than incidental. Every
+    page checksum is committed to by `page_chain_sha256` whatever the page
+    count, so the per-page list is the one part that may be omitted: it is
+    carried verbatim while the page count is within `MAX_INLINE_PAGE_CHECKSUMS`
+    AND the whole object fits the durable bound, and dropped otherwise.
+    `page_checksums_inline` states plainly which of the two a snapshot holds, so
+    a reader never has to infer why a list is absent. The normalization summary
+    is never dropped: it decides whether a snapshot may answer a query at all.
     """
     checksums = tuple(page.body_sha256 for page in capture.pages)
-    inline = len(capture.pages) <= src.MAX_INLINE_PAGE_CHECKSUMS
     metadata: dict[str, Any] = {
         "capture_contract": SNAPSHOT_CONTENT_CONTRACT,
         "capture_tool": CAPTURE_TOOL,
@@ -147,7 +159,6 @@ def retrieval_metadata(capture: ResourceCapture) -> dict[str, Any]:
         "schema_fingerprint": capture.schema_fingerprint,
         "schema_field_count": len(capture.field_schema),
         "page_chain_sha256": page_chain_digest(checksums),
-        "page_checksums_inline": inline,
         "metadata_response_sha256": capture.metadata.metadata_response_sha256,
         "resource_content_hash": capture.metadata.resource_content_hash,
         "resource_metadata_modified": capture.metadata.resource_metadata_modified,
@@ -156,18 +167,38 @@ def retrieval_metadata(capture: ResourceCapture) -> dict[str, Any]:
         "authenticated": False,
         "started_at": capture.started_at,
         "completed_at": capture.completed_at,
+        **normalization.durable_summary(),
     }
-    if inline:
-        metadata["page_checksums"] = [
-            {"offset": page.offset, "limit": page.limit,
-             "record_count": page.record_count, "sha256": page.body_sha256}
-            for page in capture.pages]
-    if len(json.dumps(metadata, separators=(",", ":"), ensure_ascii=False)) > MAX_RETRIEVAL_METADATA_CHARS:
+    inline = {**metadata, "page_checksums_inline": True,
+              "page_checksums": [{"offset": page.offset, "limit": page.limit,
+                                  "record_count": page.record_count,
+                                  "sha256": page.body_sha256}
+                                 for page in capture.pages]}
+    if len(capture.pages) <= src.MAX_INLINE_PAGE_CHECKSUMS and _fits(inline):
+        return inline
+    return _bounded(metadata)
+
+
+def _fits(metadata: Mapping[str, Any]) -> bool:
+    return len(json.dumps(metadata, separators=(",", ":"),
+                          ensure_ascii=False)) <= MAX_RETRIEVAL_METADATA_CHARS
+
+
+def _bounded(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """The metadata without its inline page list, or a refusal.
+
+    Reached when the list does not fit. The chain digest still commits to every
+    page checksum, so nothing about the capture's provenance is lost -- only
+    the convenience of reading the checksums without recomputing them.
+    """
+    without = {**metadata, "page_checksums_inline": False}
+    if not _fits(without):
         raise GovernmentSourceError("GOV_METADATA_TOO_LARGE")
-    return metadata
+    return without
 
 
-def snapshot_payload(capture: ResourceCapture) -> dict[str, Any]:
+def snapshot_payload(capture: ResourceCapture,
+                     normalization: CaptureNormalization) -> dict[str, Any]:
     """The `record_catalog_snapshot` payload for one complete capture.
 
     Deliberately NOT carrying `snapshot_key`: the key is DERIVED from these
@@ -185,7 +216,7 @@ def snapshot_payload(capture: ResourceCapture) -> dict[str, Any]:
         "content_sha256": snapshot_content_sha256(capture),
         "retrieved_at": capture.metadata.retrieved_at,
         "declared_record_count": capture.reported_total,
-        "retrieval_metadata": retrieval_metadata(capture),
+        "retrieval_metadata": retrieval_metadata(capture, normalization),
     }
 
 

@@ -1229,6 +1229,8 @@ def test_a_memory_verdict_replay_holds_support_to_a_json_array(memory, label, va
 
 CATALOG_READS = (
     ("list_active_catalog_snapshots", ("government",), "catalog_source_snapshots"),
+    ("find_active_catalog_snapshot", ("government", "142afde2", "cs1." + "0" * 32),
+     "catalog_source_snapshots"),
     ("list_catalog_raw_records", (str(uuid4()),), "catalog_raw_records"),
     ("list_catalog_candidates", (str(uuid4()),), "catalog_candidate_variants"),
 )
@@ -1241,7 +1243,7 @@ def test_the_catalog_reads_are_implemented_on_the_repository_itself(repo, method
     database -- and the implementation is the one that runs."""
     assert getattr(Repository, method, None) is not None
     assert getattr(SupabaseRepository, method) is not getattr(Repository, method)
-    assert getattr(repo, method)(*args) == []
+    assert getattr(repo, method)(*args) in ([], None)
     read = repo.client.selected[-1]
     assert read.table == table
     # Never `*`: a column added later joins a read only when a reviewer adds it.
@@ -1304,3 +1306,54 @@ def test_the_two_repositories_agree_about_what_a_catalog_read_returns():
     assert memory.list_active_catalog_snapshots("government") == []
     assert memory.list_catalog_raw_records(str(uuid4())) == []
     assert memory.list_catalog_candidates(str(uuid4())) == []
+
+
+def test_pinning_a_snapshot_is_an_exact_lookup_not_a_bounded_search(repo):
+    """Resolving an explicit `snapshot_key` must not go through the listing.
+
+    The listing is bounded to the NEWEST snapshots, so searching it for a key
+    made every active snapshot older than the bound unreachable. This is an
+    equality lookup on all four properties, capped at one row, so its cost does
+    not grow with the catalog.
+    """
+    assert repo.find_active_catalog_snapshot("government", "142afde2",
+                                             "cs1." + "0" * 32) is None
+    read = repo.client.selected[-1]
+    assert read.table == "catalog_source_snapshots"
+    assert read.columns and "*" not in read.columns
+    assert set(read.filters) == {
+        ("eq", "source_family", "government"),
+        ("eq", "resource_id", "142afde2"),
+        ("eq", "snapshot_key", "cs1." + "0" * 32),
+        ("not.is", "activated_at", "null"),
+    }
+    assert read.bounds == ("limit", 1)
+    # An exact lookup needs no ordering: at most one row can match.
+    assert read.orders == []
+
+
+def test_the_memory_repository_orders_active_snapshots_exactly_as_supabase_does():
+    """`activated_at` DESC, then `snapshot_key` ASC -- the SAME tiebreak.
+
+    Sorting the whole tuple in reverse reverses the tiebreak too, so snapshots
+    activated in one instant came back in the opposite order from the
+    database's. Every row below shares an activation instant, so the order is
+    decided entirely by the tiebreak.
+    """
+    memory = MemoryRepository()
+    stamp = "2026-09-15T12:00:00+00:00"
+    for index, key in enumerate(("cs1." + "c" * 32, "cs1." + "a" * 32, "cs1." + "b" * 32)):
+        memory.catalog_snapshots[key] = {
+            "id": str(uuid4()), "snapshot_key": key, "source_family": "government",
+            "resource_id": "142afde2", "activated_at": stamp,
+            "validation_state": "complete", "retrieval_metadata": {},
+        }
+    memory.catalog_snapshots["cs1." + "d" * 32] = {
+        "id": str(uuid4()), "snapshot_key": "cs1." + "d" * 32, "source_family": "government",
+        "resource_id": "142afde2", "activated_at": "2026-09-16T12:00:00+00:00",
+        "validation_state": "complete", "retrieval_metadata": {},
+    }
+    listed = [row["snapshot_key"]
+              for row in memory.list_active_catalog_snapshots("government")]
+    assert listed == ["cs1." + "d" * 32, "cs1." + "a" * 32, "cs1." + "b" * 32,
+                      "cs1." + "c" * 32]

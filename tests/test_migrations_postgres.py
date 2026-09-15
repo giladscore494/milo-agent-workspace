@@ -5075,6 +5075,7 @@ def test_the_real_government_payloads_are_accepted_by_real_postgresql(db):
     from backend.catalog.government import snapshot as gov_snapshot
     from backend.catalog.government import source as gov_source
     from backend.catalog.government.client import DataGovClient
+    from backend.catalog.government import normalize as gov_normalize
     from backend.catalog.government.normalize import read_wltp_record
     from backend.catalog.payloads import (prepare_candidate, prepare_raw_record,
                                           prepare_snapshot)
@@ -5088,7 +5089,9 @@ def test_the_real_government_payloads_are_accepted_by_real_postgresql(db):
 
     # The snapshot key is DERIVED, never stated by the ingestion payload, so it
     # comes back from the same preparer the repository uses.
-    prepared = prepare_snapshot(gov_snapshot.snapshot_payload(capture))
+    normalization = gov_normalize.read_capture(
+        [record for _, record in capture.located_records()], resource_id=capture.resource_id)
+    prepared = prepare_snapshot(gov_snapshot.snapshot_payload(capture, normalization))
     snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{json.dumps(prepared)}'::jsonb)")
     stored = db.psql(f"select content_sha256 || '|' || upstream_version_kind || '|' || "
                      f"declared_record_count from public.catalog_source_snapshots where id='{snapshot}'")

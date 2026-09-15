@@ -228,12 +228,19 @@ class DataGovClient:
 
     def package_show(self, resource_id: str, *,
                      package_id: str = src.CKAN_PACKAGE_ID) -> ResourceMetadata:
-        """The pinned resource's identity and version, or fail closed."""
+        """The pinned resource's identity and version, or fail closed.
+
+        Both identities are allowlisted BEFORE the request is built, so a
+        package or resource this code may not read is never asked for. The
+        response is then held to the same package id independently -- two
+        checks of one fact, neither standing in for the other.
+        """
+        package = src.require_allowed_package(package_id)
         identifier = src.require_allowed_resource(resource_id)
         retrieved_at = self._clock()
-        document, response, _ = self._request(src.PACKAGE_SHOW, {"id": str(package_id)})
+        document, response, _ = self._request(src.PACKAGE_SHOW, {"id": package})
         result = document["result"]
-        if _text(result.get("name")) != str(package_id):
+        if _text(result.get("name")) != package:
             raise GovernmentSourceError("GOV_PACKAGE_IDENTITY_MISMATCH")
         organization = result.get("organization")
         if not isinstance(organization, Mapping) or \
@@ -248,7 +255,7 @@ class DataGovClient:
             raise GovernmentSourceError("GOV_RESOURCE_MISSING")
         version, kind = self._resource_version(resource)
         return ResourceMetadata(
-            package_id=str(package_id), resource_id=identifier,
+            package_id=package, resource_id=identifier,
             publisher=src.GOVERNMENT_PUBLISHER,
             dataset_title=str(_text(result.get("title")) or package_id),
             upstream_version=version, upstream_version_kind=kind,
@@ -282,12 +289,13 @@ class DataGovClient:
         is echoed back by every page or the capture fails. Omitting it captures
         the WHOLE resource, page by page, under exactly the same bounds.
         """
+        package = src.require_allowed_package(package_id)
         identifier = src.require_allowed_resource(resource_id)
         selection = self._validated_query(query)
         started_at = self._clock()
         if metadata is None:
-            metadata = self.package_show(identifier, package_id=package_id)
-        elif metadata.resource_id != identifier:
+            metadata = self.package_show(identifier, package_id=package)
+        elif metadata.resource_id != identifier or metadata.package_id != package:
             raise GovernmentSourceError("GOV_RESOURCE_ECHO_MISMATCH")
 
         pages: list[CapturedPage] = []
@@ -356,10 +364,7 @@ class DataGovClient:
         total = _as_int(result.get("total"))
         if total is None or total < 0:
             raise GovernmentSourceError("GOV_TOTAL_INVALID")
-        if result.get("total_was_estimated") is True:
-            # An estimate cannot gate completeness: page lengths that sum to an
-            # estimated total prove nothing about the query.
-            raise GovernmentSourceError("GOV_TOTAL_ESTIMATED")
+        self._check_total_is_exact(result)
         if reported_total is not None and total != reported_total:
             raise GovernmentSourceError("GOV_PAGE_TOTAL_INCONSISTENT")
         if "records_format" in result and _text(result.get("records_format")) != "objects":
@@ -389,6 +394,38 @@ class DataGovClient:
             requested_url=requested_url, final_url=str(response.final_url),
             retrieved_at=retrieved_at, schema_fingerprint=schema_fingerprint(result))
         return page, (page.schema_fingerprint, field_schema_of(result))
+
+    @staticmethod
+    def _check_total_is_exact(result: Mapping[str, Any]) -> None:
+        """`total_was_estimated`, by TYPE and by value.
+
+        An estimated total cannot gate completeness: page lengths that sum to
+        an estimate prove nothing about the query. So the flag is part of the
+        response contract and is read strictly:
+
+        *   **absent** -- ACCEPTED. CKAN omits the key on responses that did
+            not estimate, so refusing an absent key would refuse the ordinary
+            case. Absence means the server made no estimation claim, and the
+            completeness gate then rests on the total alone.
+        *   **JSON `false`** -- accepted; the server states the total is exact.
+        *   **JSON `true`** -- refused as an estimate.
+        *   **anything else** -- refused as a MALFORMED response, and refused
+            as that rather than as an estimate, because a server that answers
+            `1`, `"true"`, `null`, `[]` or `{}` here is not answering this
+            contract at all.
+
+        An `is True` check accepted every one of those malformed values in
+        silence, which is the defect this exists to close. `isinstance(v, bool)`
+        is what separates them: in JSON-decoded Python `True`/`False` are the
+        only booleans, and `1`/`0` are plain integers.
+        """
+        if "total_was_estimated" not in result:
+            return
+        estimated = result["total_was_estimated"]
+        if not isinstance(estimated, bool):
+            raise GovernmentSourceError("GOV_TOTAL_ESTIMATION_INVALID")
+        if estimated:
+            raise GovernmentSourceError("GOV_TOTAL_ESTIMATED")
 
     @staticmethod
     def _check_query_echo(result: Mapping[str, Any], selection: Mapping[str, str]) -> None:
