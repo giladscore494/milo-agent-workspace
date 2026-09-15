@@ -35,6 +35,7 @@ from pathlib import Path
 
 import pytest
 
+from backend.catalog import keys as catalog_keys
 from backend.engines.swarm_v2.conflict_policy import CONFLICT_POLICY_VERSION
 from backend.engines.swarm_v2.evidence_contracts import (document_span_locator,
                                                          record_field_locator)
@@ -3393,22 +3394,26 @@ CATALOG_RPCS = ("record_catalog_snapshot_guarded", "record_catalog_raw_record_gu
 CATALOG_MIGRATION_MARKER = "catalog_evidence_foundation"
 
 
-def _catalog_payload_hash(payload: dict) -> str:
-    """The digest PostgreSQL recomputes from the stored jsonb.
+def _catalog_key(domain: str, label: str) -> str:
+    """A shape-valid catalog key for a test object, stable per label.
 
-    `jsonb` normalizes: keys are reordered and whitespace is dropped, so the
-    hash must be taken over the value as the DATABASE renders it, which is
-    exactly what the RPC does with `payload::text`.
+    PostgreSQL enforces a key's DOMAIN and SHAPE (`cs1.`/`cr1.`/`cc1.`/`cl1.`
+    plus 32 hex characters); the FULL derivation from an object's structural
+    identity is a repository-side rule, proven in `tests/test_catalog_keys.py`
+    and `tests/test_catalog_persistence.py`. Deriving from a label here keeps a
+    key stable across the deliberately CONFLICTING payloads an idempotency test
+    replays under one identity -- which a true structural derivation, by
+    design, could not do.
     """
-    return hashlib.sha256(json.dumps(payload, separators=(", ", ": "),
-                                     sort_keys=False).encode("utf-8")).hexdigest()
+    return catalog_keys.derive_key(domain, test_label=label)
 
 
 def _catalog_snapshot_json(key: str, *, family: str = "government",
                            resource: str = "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
                            version: str = "2026.09.1", kind: str = "dataset_version",
                            declared: int = 1, content: str | None = None, **extra) -> str:
-    payload = {"snapshot_key": key, "source_family": family, "resource_id": resource,
+    payload = {"snapshot_key": _catalog_key("catalog.snapshot", key),
+               "source_family": family, "resource_id": resource,
                "upstream_version": version, "upstream_version_kind": kind,
                "content_sha256": content or hashlib.sha256(key.encode()).hexdigest(),
                "retrieved_at": "2026-09-14T16:11:13.272Z",
@@ -3422,9 +3427,12 @@ def _catalog_record_json(snapshot_id: str, key: str, *, upstream: str = "36327",
                          resource: str = "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
                          payload: dict | None = None) -> str:
     payload = {"_id": 36327, "kinuy_mishari": "RAV4"} if payload is None else payload
-    return json.dumps({"snapshot_id": snapshot_id, "record_key": key,
+    # The digest is DERIVED inside the trusted persistence path after the
+    # corrective round, so a caller that still sends one is refused.
+    return json.dumps({"snapshot_id": snapshot_id,
+                       "record_key": _catalog_key("catalog.raw_record", key),
                        "upstream_record_id": upstream, "resource_id": resource,
-                       "payload": payload, "payload_sha256": _catalog_payload_hash(payload)})
+                       "payload": payload})
 
 
 def _catalog_candidate_json(snapshot_id: str, record_id: str, key: str, *,
@@ -3432,7 +3440,8 @@ def _catalog_candidate_json(snapshot_id: str, record_id: str, key: str, *,
                             model: str = "RAV4", years: tuple[int, int] | None = (2021, 2021),
                             code: str | None = "AXAP54L-ANXGBW", trim: str | None = "PRIME AWD SE",
                             dimensions: dict | None = None) -> str:
-    payload = {"snapshot_id": snapshot_id, "raw_record_id": record_id, "candidate_key": key,
+    payload = {"snapshot_id": snapshot_id, "raw_record_id": record_id,
+               "candidate_key": _catalog_key("catalog.candidate", key),
                "manufacturer": make, "commercial_model": model, "status": status,
                "official_model_code": code, "trim": trim,
                "identity_dimensions": {"drivetrain": "awd", "fuel_type": "plug_in_hybrid"}
@@ -3444,16 +3453,40 @@ def _catalog_candidate_json(snapshot_id: str, record_id: str, key: str, *,
 
 def _catalog_link_json(candidate_id: str, source_id: str, key: str, *,
                        claim_id: str | None = None, verdict_id: str | None = None,
-                       locator: str = R3_LOCATOR, version: str = R3_VERSION[1],
-                       kind: str = R3_VERSION[0]) -> str:
-    payload = {"candidate_id": candidate_id, "source_id": source_id, "link_key": key,
-               "record_locator": locator, "source_version": version,
-               "source_version_kind": kind}
-    if claim_id is not None:
-        payload["claim_id"] = claim_id
-    if verdict_id is not None:
-        payload["verdict_id"] = verdict_id
+                       locator: str | None = R3_LOCATOR,
+                       version: str | None = R3_VERSION[1],
+                       kind: str | None = R3_VERSION[0]) -> str:
+    """One evidence-link payload. `None` OMITS a field rather than nulling it.
+
+    Omission is the supported path after the corrective round: the locator and
+    the source version are derived from the cited claim and source, so a
+    caller that states them is asserting something the database will check
+    rather than supplying something it will trust.
+    """
+    payload = {"candidate_id": candidate_id, "source_id": source_id,
+               "link_key": _catalog_key("catalog.evidence_link", key)}
+    for field, value in (("record_locator", locator), ("source_version", version),
+                         ("source_version_kind", kind), ("claim_id", claim_id),
+                         ("verdict_id", verdict_id)):
+        if value is not None:
+            payload[field] = value
     return json.dumps(payload)
+
+
+def _catalog_claim_for(db, args: str, label: str) -> tuple[str, str]:
+    """A real source and a real claim resting on it, for one leased run.
+
+    After the corrective round an evidence link must cite a claim, because the
+    locator and the source version it records are DERIVED from that claim and
+    that source rather than supplied. Tests therefore build genuine evidence
+    instead of standing an arbitrary uuid in for it.
+    """
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json(label)}'::jsonb)")
+    # R3 order: a located fact must already be backed by focused evidence of
+    # its own source.
+    _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, key=f'{label}-fragment')}'::jsonb)")
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_r3_claim_json(f'{label}-claim', source, 1798)}'::jsonb)")
+    return source, claim
 
 
 def _catalog_fixture(db, suffix: str):
@@ -3468,17 +3501,31 @@ def _catalog_fixture(db, suffix: str):
     return lease, other, args, snapshot, record, candidate
 
 
+#: Every catalog migration, in apply order. Rerun safety is a property of the
+#: ORDERED SET, not of one file: replaying an earlier migration alone would
+#: restore the function bodies a later one corrected, which is exactly the
+#: hazard this list exists to avoid reintroducing.
+CATALOG_MIGRATIONS = tuple(m for m in MIGRATIONS if "catalog" in m.name)
+
+
+def _reapply_catalog_migrations(db) -> None:
+    for migration in CATALOG_MIGRATIONS:
+        db.psql(file=migration)
+
+
 def test_catalog_migration_applies_and_is_rerun_safe(db):
-    """It applied inside the `db` fixture with every other migration, and
-    applying it twice more changes nothing -- the repository's forward-only,
-    idempotent migration contract."""
-    migration = next(m for m in MIGRATIONS if CATALOG_MIGRATION_MARKER in m.name)
+    """They applied inside the `db` fixture with every other migration, and
+    applying the ordered set twice more changes nothing -- the repository's
+    forward-only, idempotent migration contract."""
+    assert [m.name for m in CATALOG_MIGRATIONS] == [
+        "20260914200000_catalog_evidence_foundation.sql",
+        "20260915120000_catalog_integrity_corrections.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
     assert before == str(len(CATALOG_STAGING_TABLES) + len(CATALOG_CANONICAL_TABLES))
-    db.psql(file=migration)
-    db.psql(file=migration)
+    _reapply_catalog_migrations(db)
+    _reapply_catalog_migrations(db)
     assert db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'") == before
@@ -3514,7 +3561,7 @@ def test_catalog_canonical_tables_start_empty_and_hold_no_legacy_row(db):
             "trust_state, resource_id, upstream_version, upstream_version_kind, content_sha256, "
             "retrieved_at, declared_record_count, snapshot_key) select id, 'legacy_reference', "
             "'evidence', 'yeda', '2026.01.1', 'dataset_version', repeat('a', 64), now(), 0, "
-            "'legacy-as-evidence' from public.runs limit 1")
+            "'cs1.00000000000000000000000000000001' from public.runs limit 1")
 
 
 def test_catalog_privileges_are_minimal_and_the_canonical_pair_is_read_only(db):
@@ -3577,7 +3624,8 @@ def test_catalog_snapshot_replay_is_idempotent_and_conflict_fails_closed(db):
     first = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{payload}'::jsonb)")
     # Byte-identical replay collapses onto the same row.
     assert _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{payload}'::jsonb)") == first
-    assert db.psql("select count(*) from public.catalog_source_snapshots where snapshot_key='snap-replay'") == "1"
+    replay_key = _catalog_key("catalog.snapshot", "snap-replay")
+    assert db.psql(f"select count(*) from public.catalog_source_snapshots where snapshot_key='{replay_key}'") == "1"
 
     # The SAME identity with DIFFERENT content is a different retrieval wearing
     # the same name. Every dimension of that is a refusal, never an overwrite.
@@ -3590,7 +3638,7 @@ def test_catalog_snapshot_replay_is_idempotent_and_conflict_fails_closed(db):
     # Nothing was written and nothing was changed by any of those attempts.
     assert db.psql(
         f"select count(*) || '|' || max(declared_record_count::text) from "
-        f"public.catalog_source_snapshots where snapshot_key='snap-replay'") == "1|2"
+        f"public.catalog_source_snapshots where snapshot_key='{replay_key}'") == "1|2"
 
     # The caller can neither pin its own trust state nor activate a snapshot
     # on the way in: activation is a separate, evidenced decision.
@@ -3621,11 +3669,11 @@ def test_catalog_raw_record_replay_is_idempotent_and_conflict_fails_closed(db):
     conflicting = _catalog_record_json(snapshot, "rec-replay", payload={"_id": 36327, "kinuy_mishari": "RAV4 PHEV"})
     with pytest.raises(AssertionError, match="catalog raw record idempotency conflict"):
         _rpc_as_service(db, f"select public.record_catalog_raw_record_guarded({args},'{conflicting}'::jsonb)")
-    # ...and a payload whose declared digest does not match what would be
-    # stored never becomes a row at all: PostgreSQL recomputes the hash.
+    # ...and a caller that still supplies a digest is refused outright: the
+    # value is derived inside the trusted path, so nothing reads a sent one.
     forged = json.loads(_catalog_record_json(snapshot, "rec-forged"))
     forged["payload_sha256"] = "c" * 64
-    with pytest.raises(AssertionError, match="payload hash does not match"):
+    with pytest.raises(AssertionError, match="payload digest is derived"):
         _rpc_as_service(db, f"select public.record_catalog_raw_record_guarded({args},'{json.dumps(forged)}'::jsonb)")
     assert db.psql(f"select stored_record_count from public.catalog_source_snapshots where id='{snapshot}'") == "1"
 
@@ -3684,7 +3732,7 @@ def test_catalog_snapshot_is_active_only_after_complete_validation(db):
     assert db.psql(f"select activated_at is not null, validation_state, stored_record_count = declared_record_count from public.catalog_source_snapshots where id='{snapshot}'") == "t|complete|t"
     # Activation replays cleanly and can never be revoked.
     _rpc_as_service(db, f"select id from public.activate_catalog_snapshot_guarded({args},'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
-    with pytest.raises(AssertionError, match="catalog snapshot activation conflict"):
+    with pytest.raises(AssertionError, match="an active catalog snapshot is immutable"):
         _rpc_as_service(db, f"select public.activate_catalog_snapshot_guarded({args},'{json.dumps({'snapshot_id': snapshot, 'validation_state': 'failed'})}'::jsonb)")
     # The constraint holds even against a direct write by a superuser.
     with pytest.raises(AssertionError, match="active_only_when_complete|immutable"):
@@ -3693,7 +3741,7 @@ def test_catalog_snapshot_is_active_only_after_complete_validation(db):
                 "retrieved_at, declared_record_count, stored_record_count, validation_state, "
                 "activated_at, snapshot_key) select id, 'government', 'evidence', 'r', '2026.1', "
                 "'dataset_version', repeat('d', 64), now(), 5, 2, 'complete', now(), "
-                "'forced-active' from public.runs limit 1")
+                "'cs1.00000000000000000000000000000002' from public.runs limit 1")
 
 
 def test_catalog_candidates_may_stay_ambiguous_and_never_guess_an_identity(db):
@@ -3812,13 +3860,17 @@ def test_catalog_rejects_cross_run_and_cross_snapshot_linkage(db):
     # The honest link -- candidate, its own run's source, and the claim that
     # rests on exactly that source -- is accepted, and replays idempotently.
     good_claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_r3_claim_json('catalog-good-claim', source_a, 1798)}'::jsonb)")
-    payload = _catalog_link_json(candidate, source_a, "link-good", claim_id=good_claim)
+    payload = _catalog_link_json(candidate, source_a, "link-good", claim_id=good_claim,
+                                 locator=None, version=None, kind=None)
     link = _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{payload}'::jsonb)")
     assert _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{payload}'::jsonb)") == link
     assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links where candidate_id='{candidate}'") == "1"
-    # Re-pointing a link under the same key is a new fact, not a retry.
+    # Re-pointing a link under the same key is a new fact, not a retry. Proven
+    # with a different CLAIM, because the locator and the version are derived
+    # from the evidence now and are no longer the caller's to vary.
+    other_claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_r3_claim_json('catalog-good-claim-2', source_a, 1799)}'::jsonb)")
     with pytest.raises(AssertionError, match="catalog evidence link idempotency conflict"):
-        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source_a, 'link-good', claim_id=good_claim, version='2026.09.9')}'::jsonb)")
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source_a, 'link-good', claim_id=other_claim, locator=None, version=None, kind=None)}'::jsonb)")
     # The exact locator and the exact source version travelled with the link.
     assert db.psql(f"select record_locator = '{R3_LOCATOR}', source_version, source_version_kind from public.catalog_candidate_evidence_links where id='{link}'") == f"t|{R3_VERSION[1]}|{R3_VERSION[0]}"
 
@@ -3847,10 +3899,10 @@ def test_the_legacy_catalog_can_suggest_a_candidate_but_never_verifies_a_fact(db
     verdict = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key='catalog-legacy-verdict', support=[_r4_support(fragment)])}'::jsonb)")
 
     # Discovery: an unverified candidate may cite a source, with no verdict.
-    _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-legacy-discovery', claim_id=claim)}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-legacy-discovery', claim_id=claim, locator=None, version=None, kind=None)}'::jsonb)")
     # Verification: refused, because the snapshot is not evidence.
     with pytest.raises(AssertionError, match="an unverified catalog source cannot carry a verdict"):
-        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-legacy-verdict', claim_id=claim, verdict_id=verdict)}'::jsonb)")
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-legacy-verdict', claim_id=claim, verdict_id=verdict, locator=None, version=None, kind=None)}'::jsonb)")
     assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links where candidate_id='{candidate}' and verdict_id is not null") == "0"
 
     # The same verdict on a GOVERNMENT candidate is accepted, so the refusal
@@ -3861,8 +3913,10 @@ def test_the_legacy_catalog_can_suggest_a_candidate_but_never_verifies_a_fact(db
     _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(gov_candidate, source, 'link-gov-verdict', claim_id=claim, verdict_id=verdict)}'::jsonb)")
     assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links where candidate_id='{gov_candidate}' and verdict_id='{verdict}'") == "1"
     # A verdict with no claim beside it is never provenance.
-    with pytest.raises(AssertionError, match="verdict requires its claim"):
-        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(gov_candidate, source, 'link-orphan-verdict', verdict_id=verdict)}'::jsonb)")
+    # A verdict with no claim beside it is never provenance -- and after the
+    # corrective round the claim is required before the verdict is even read.
+    with pytest.raises(AssertionError, match="requires the claim it is evidence for"):
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(gov_candidate, source, 'link-orphan-verdict', verdict_id=verdict, locator=None, version=None, kind=None)}'::jsonb)")
 
 
 def test_no_canonical_row_can_be_created_through_the_pr1_write_path(db):
@@ -3874,8 +3928,8 @@ def test_no_canonical_row_can_be_created_through_the_pr1_write_path(db):
     """
     _, _, args, snapshot, record, candidate = _catalog_fixture(db, "no-canonical")
     run_id = args.split(",")[0].strip("'")
-    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json('catalog-canon-source')}'::jsonb)")
-    _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-canon')}'::jsonb)")
+    source, claim = _catalog_claim_for(db, args, "catalog-canon-source")
+    _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-canon', claim_id=claim, locator=None, version=None, kind=None)}'::jsonb)")
     # Staging rows exist; canonical rows do not.
     assert db.psql(f"select count(*) from public.catalog_candidate_variants where snapshot_id='{snapshot}'") >= "1"
     for table in CATALOG_CANONICAL_TABLES:
@@ -3911,12 +3965,18 @@ def test_catalog_state_outlives_evidence_and_never_cascades_from_a_run(db):
 
     _, _, args, snapshot, record, candidate = _catalog_fixture(db, "outlives")
     run_id = args.split(",")[0].strip("'")
-    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json('catalog-outlive-source')}'::jsonb)")
-    _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-outlive')}'::jsonb)")
-    # Deleting the run would cascade the evidence away; the catalog link
-    # refuses to let that happen silently.
-    with pytest.raises(AssertionError, match="violates foreign key constraint"):
+    source, claim = _catalog_claim_for(db, args, "catalog-outlive-source")
+    _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-outlive', claim_id=claim, locator=None, version=None, kind=None)}'::jsonb)")
+    # Deleting the run would cascade the evidence away. It is refused, and the
+    # catalog rows are all still there afterwards.
+    with pytest.raises(AssertionError, match="violates foreign key constraint|append-only"):
         db.psql(f"delete from public.runs where id='{run_id}'")
+    assert db.psql(f"select count(*) from public.runs where id='{run_id}'") == "1"
+    # And the refusal is the CATALOG's, independently of any other guard: the
+    # cited claim cannot be removed while a catalog link names it.
+    with pytest.raises(AssertionError,
+                       match="catalog_candidate_evidence_links_claim_id_fkey"):
+        db.psql(f"delete from public.claims where id='{claim}'")
     assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links where candidate_id='{candidate}'") == "1"
     assert db.psql(f"select count(*) from public.catalog_raw_records where id='{record}'") == "1"
     assert db.psql(f"select count(*) from public.catalog_source_snapshots where id='{snapshot}'") == "1"
@@ -3933,18 +3993,473 @@ def test_catalog_rpcs_refuse_reasoning_and_credential_shaped_payloads(db):
     size bound, recomputed digest), which the tests above exercise.
     """
     _, _, args, snapshot, record, candidate = _catalog_fixture(db, "unsafe")
+    unsafe_snapshot_keys, unsafe_candidate_keys, unsafe_link_keys = [], [], []
     for field in ("chain_of_thought", "provider_detail", "raw_error", "api_key", "lease_token"):
         snapshot_payload = json.loads(_catalog_snapshot_json(f"snap-unsafe-{field}"))
         snapshot_payload[field] = "anything at all"
+        unsafe_snapshot_keys.append(snapshot_payload["snapshot_key"])
         candidate_payload = json.loads(_catalog_candidate_json(snapshot, record, f"cand-unsafe-{field}"))
         candidate_payload[field] = "anything at all"
+        unsafe_candidate_keys.append(candidate_payload["candidate_key"])
         link_payload = json.loads(_catalog_link_json(candidate, str(uuid.uuid4()), f"link-unsafe-{field}"))
         link_payload[field] = "anything at all"
+        unsafe_link_keys.append(link_payload["link_key"])
         for rpc, payload in (("record_catalog_snapshot_guarded", snapshot_payload),
                              ("record_catalog_candidate_guarded", candidate_payload),
                              ("link_catalog_candidate_evidence_guarded", link_payload)):
             with pytest.raises(AssertionError, match="unsafe catalog payload rejected"):
                 _rpc_as_service(db, f"select public.{rpc}({args},'{json.dumps(payload)}'::jsonb)")
-    assert db.psql("select count(*) from public.catalog_source_snapshots where snapshot_key like 'snap-unsafe-%'") == "0"
-    assert db.psql("select count(*) from public.catalog_candidate_variants where candidate_key like 'cand-unsafe-%'") == "0"
-    assert db.psql("select count(*) from public.catalog_candidate_evidence_links where link_key like 'link-unsafe-%'") == "0"
+    # Nothing was written by any of the refused calls. Counted by the keys the
+    # helpers derived for them, since a catalog key is structural now.
+    for table, column, domain, labels in (
+            ("catalog_source_snapshots", "snapshot_key", "catalog.snapshot", unsafe_snapshot_keys),
+            ("catalog_candidate_variants", "candidate_key", "catalog.candidate", unsafe_candidate_keys),
+            ("catalog_candidate_evidence_links", "link_key", "catalog.evidence_link", unsafe_link_keys)):
+        listed = ", ".join(f"'{key}'" for key in labels)
+        assert db.psql(f"select count(*) from public.{table} where {column} in ({listed})") == "0"
+
+
+# ===========================================================================
+# Catalog PR1 corrective round: integrity gaps and their repairs
+# ===========================================================================
+#
+# Catalog PR1 established the relations and the lease/idempotency posture, but
+# six of its guarantees were weaker than the migration and the documentation
+# said. Each test below FAILED against the PR1 schema and passes against the
+# corrective migration; each names the defect it pins.
+#
+# The common thread is the difference between SYNTACTIC and REFERENTIAL
+# validation. PR1 checked that a caller's locator and source version parsed
+# (`r3_canonical_locator`, `r3_source_version_valid`) and then stored them
+# verbatim beside a claim and a source that might say something else entirely.
+# A provenance field that is merely well-formed is not provenance.
+
+
+def _corrective_evidence(db, suffix, *, verdict="verified", source_key=None):
+    """One run with a real source, fragment, claim and verdict of its own.
+
+    Deliberately built through the REAL evidence RPCs -- no invented uuid ever
+    stands in for a claim or a verdict here, because the whole point of this
+    round is that a link must cite evidence that actually exists and actually
+    says what the link claims it says.
+    """
+    lease, other = _evidence_fixture(db, f"corrective-{suffix}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    key = source_key or f"corrective-{suffix}"
+    source = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json(key)}'::jsonb)")
+    fragment = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args},'{_r3_fragment_json(source, key=f'{key}-fragment')}'::jsonb)")
+    claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_r3_claim_json(f'{key}-claim', source, 1798)}'::jsonb)")
+    verdict_id = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args},'{_r4_verdict_json(claim, key=f'{key}-verdict', verdict=verdict, support=[_r4_support(fragment)])}'::jsonb)")
+    return lease, other, args, source, claim, verdict_id
+
+
+def _catalog_chain(db, suffix, args, *, family="government"):
+    """A complete, active snapshot with one record and one candidate."""
+    snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{_catalog_snapshot_json(f'snap-{suffix}', family=family, resource=('model_technical_catalog_il' if family == 'legacy_reference' else None) or '142afde2-6228-49f9-8a29-9b6c3a0cbe40')}'::jsonb)")
+    record = _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{_catalog_record_json(snapshot, f'rec-{suffix}', resource=('model_technical_catalog_il' if family == 'legacy_reference' else '142afde2-6228-49f9-8a29-9b6c3a0cbe40'))}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.activate_catalog_snapshot_guarded({args},'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
+    candidate = _rpc_as_service(db, f"select id from public.record_catalog_candidate_guarded({args},'{_catalog_candidate_json(snapshot, record, f'cand-{suffix}')}'::jsonb)")
+    return snapshot, record, candidate
+
+
+# --- defect 1: an unverified verdict could back a catalog link --------------
+
+@pytest.mark.parametrize("verdict_state", ["needs_review", "rejected"])
+def test_only_a_verified_verdict_may_back_a_catalog_evidence_link(db, verdict_state):
+    """PR1 checked that the verdict EXISTED, never what it SAID.
+
+    `claim_verdicts.verdict` is one of verified / needs_review / rejected. A
+    link carrying a `rejected` verdict asserted the opposite of what the
+    verifier concluded, and a promotion path reading `verdict_id is not null`
+    as "this fact was confirmed" would have promoted a refuted fact.
+    """
+    lease, _, args, source, claim, verdict = _corrective_evidence(
+        db, f"verdict-{verdict_state}", verdict=verdict_state)
+    _, _, candidate = _catalog_chain(db, f"verdict-{verdict_state}", args)
+    payload = _catalog_link_json(candidate, source, f"link-{verdict_state}",
+                                 claim_id=claim, verdict_id=verdict)
+    with pytest.raises(AssertionError, match="catalog evidence link verdict is not verified"):
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links "
+                   f"where candidate_id='{candidate}'") == "0"
+
+    # The same link with the run's VERIFIED verdict is accepted, so the refusal
+    # is about what the verdict says and nothing else.
+    _, _, verified_args, verified_source, verified_claim, verified_verdict = _corrective_evidence(
+        db, f"verdict-ok-{verdict_state}")
+    _, _, verified_candidate = _catalog_chain(db, f"verdict-ok-{verdict_state}", verified_args)
+    _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({verified_args},'{_catalog_link_json(verified_candidate, verified_source, 'link-verified', claim_id=verified_claim, verdict_id=verified_verdict)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links "
+                   f"where candidate_id='{verified_candidate}' and verdict_id='{verified_verdict}'") == "1"
+
+
+# --- defect 2: the stored locator need not be the claim's locator -----------
+
+def test_a_links_record_locator_must_be_the_claims_own_evidence_locator(db):
+    """PR1 accepted any SYNTACTICALLY valid locator and stored it verbatim.
+
+    `r3_canonical_locator(...) is not null` proves a locator is well-formed. It
+    proves nothing about whether it is the locator the cited claim was read at,
+    so a link could point at a different field of a different record and still
+    look like exact provenance.
+    """
+    lease, _, args, source, claim, verdict = _corrective_evidence(db, "locator")
+    _, _, candidate = _catalog_chain(db, "locator", args)
+    # A different, perfectly well-formed locator: same document, other span.
+    forged = document_span_locator("doc-1", 900, 950, section="Other section").locator_key
+    assert db.psql(f"select public.r3_canonical_locator('{forged}') is not null") == "t"
+    with pytest.raises(AssertionError, match="record locator does not match the cited claim"):
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-forged-locator', claim_id=claim, locator=forged)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links "
+                   f"where candidate_id='{candidate}'") == "0"
+
+    # Omitting it entirely is the supported path: the locator is DERIVED from
+    # the claim, so there is nothing for a caller to get wrong.
+    derived = _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-derived-locator', claim_id=claim, locator=None)}'::jsonb)")
+    assert db.psql(f"select record_locator from public.catalog_candidate_evidence_links "
+                   f"where id='{derived}'") == db.psql(
+        f"select evidence_locator from public.claims where id='{claim}'")
+
+
+# --- defect 3: the stored source version need not be the source's -----------
+
+@pytest.mark.parametrize("field, value", [
+    ("version", "2099.12.31"),
+    ("kind", "content_sha256"),
+])
+def test_a_links_source_version_must_be_the_cited_sources_own_version(db, field, value):
+    """Same defect, on the version rather than the locator.
+
+    `r3_source_version_valid` checks the SHAPE of a version identifier. A link
+    could therefore claim a fact was read at a version the source was never
+    captured at -- which is precisely the kind of claim provenance exists to
+    make unfalsifiable.
+    """
+    lease, _, args, source, claim, verdict = _corrective_evidence(db, f"version-{field}")
+    _, _, candidate = _catalog_chain(db, f"version-{field}", args)
+    override = {"version": value} if field == "version" else {"kind": value}
+    payload = _catalog_link_json(candidate, source, f"link-forged-{field}", claim_id=claim,
+                                 version=override.get("version", R3_VERSION[1]),
+                                 kind=override.get("kind", R3_VERSION[0]))
+    if field == "kind":
+        # A content_sha256 kind needs a hash-shaped identifier to pass the R3
+        # syntactic gate at all, so the forgery is internally well-formed.
+        payload = _catalog_link_json(candidate, source, f"link-forged-{field}", claim_id=claim,
+                                     version="e" * 64, kind="content_sha256")
+    with pytest.raises(AssertionError, match="source version does not match the cited source"):
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{payload}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links "
+                   f"where candidate_id='{candidate}'") == "0"
+
+    # Derived from the source, the link records exactly what was captured.
+    derived = _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, f'link-derived-{field}', claim_id=claim, version=None, kind=None)}'::jsonb)")
+    assert db.psql(f"select source_version_kind || '|' || source_version from "
+                   f"public.catalog_candidate_evidence_links where id='{derived}'") == db.psql(
+        f"select source_version_kind || '|' || source_version_id from public.sources "
+        f"where id='{source}'")
+
+
+def test_an_evidence_link_requires_a_real_claim_and_fails_closed_without_provenance(db):
+    """A link with no claim stored exact-fact provenance it could not support.
+
+    PR1 allowed a source-only link that still carried a `record_locator` and a
+    `source_version` -- fields that assert WHERE a fact was read and at WHICH
+    version, with nothing to check them against. The corrected contract
+    requires the claim, so every link's provenance is derivable and checkable.
+    """
+    lease, _, args, source, claim, _ = _corrective_evidence(db, "needs-claim")
+    _, _, candidate = _catalog_chain(db, "needs-claim", args)
+    with pytest.raises(AssertionError, match="requires the claim it is evidence for"):
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-no-claim')}'::jsonb)")
+
+    # A source whose own version was never recorded cannot back a link either:
+    # missing provenance fails closed rather than defaulting to the caller's.
+    # (R3 already refuses a FOCUSED fragment on an unversioned source, so this
+    # claim is deliberately unlocated -- which is also the case that proves the
+    # locator must come from the claim rather than from the caller.)
+    unversioned = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args},'{_r3_source_json('corrective-unversioned', kind=None, identifier=None)}'::jsonb)")
+    unversioned_claim = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args},'{_r3_claim_json('corrective-unversioned-claim', unversioned, 1798, locator=None, unit=None)}'::jsonb)")
+    with pytest.raises(AssertionError, match="states no evidence locator|states no version"):
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, unversioned, 'link-unversioned', claim_id=unversioned_claim, locator=None, version=None, kind=None)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links "
+                   f"where candidate_id='{candidate}'") == "0"
+
+
+def test_the_legacy_catalog_still_cannot_carry_a_verdict_after_the_correction(db):
+    """The PR1 product decision survives the tightening, unchanged."""
+    lease, _, args, source, claim, verdict = _corrective_evidence(db, "legacy-still")
+    _, _, candidate = _catalog_chain(db, "legacy-still", args, family="legacy_reference")
+    with pytest.raises(AssertionError, match="unverified catalog source cannot carry a verdict"):
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-legacy-verdict', claim_id=claim, verdict_id=verdict)}'::jsonb)")
+    # Discovery -- claim-backed, verdict-free -- still works for the legacy
+    # family, and now carries provenance derived from the claim and the source
+    # rather than caller text.
+    link = _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-legacy-discovery', claim_id=claim, locator=None, version=None, kind=None)}'::jsonb)")
+    assert db.psql(f"select verdict_id is null from public.catalog_candidate_evidence_links "
+                   f"where id='{link}'") == "t"
+
+
+# --- defect 5: a failed snapshot was not terminal ---------------------------
+
+def test_a_failed_snapshot_is_terminal_and_accepts_no_further_record(db):
+    """PR1 refused appends to an ACTIVE snapshot and forgot the FAILED one.
+
+    `activated_at is not null` was the only gate, and a failed snapshot has no
+    activation timestamp -- so records could keep arriving after a capture had
+    been declared unusable, and the same snapshot could then be activated
+    complete as though the failure had never been recorded.
+    """
+    lease, _ = _evidence_fixture(db, "corrective-failed")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{_catalog_snapshot_json('snap-failed', declared=2)}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{_catalog_record_json(snapshot, 'rec-failed-1')}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.activate_catalog_snapshot_guarded({args},'{json.dumps({'snapshot_id': snapshot, 'validation_state': 'failed'})}'::jsonb)")
+    assert db.psql(f"select validation_state, activated_at is null from "
+                   f"public.catalog_source_snapshots where id='{snapshot}'") == "failed|t"
+
+    # No further record may be appended...
+    with pytest.raises(AssertionError, match="failed catalog snapshot is terminal"):
+        _rpc_as_service(db, f"select public.record_catalog_raw_record_guarded({args},'{_catalog_record_json(snapshot, 'rec-failed-2', upstream='37392', payload={'_id': 37392})}'::jsonb)")
+    # ...and it can never become complete, even once its counts would agree.
+    with pytest.raises(AssertionError, match="failed catalog snapshot is terminal"):
+        _rpc_as_service(db, f"select public.activate_catalog_snapshot_guarded({args},'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
+    # Re-declaring the same failure is an idempotent no-op, not an error.
+    _rpc_as_service(db, f"select id from public.activate_catalog_snapshot_guarded({args},'{json.dumps({'snapshot_id': snapshot, 'validation_state': 'failed'})}'::jsonb)")
+    assert db.psql(f"select validation_state, stored_record_count from "
+                   f"public.catalog_source_snapshots where id='{snapshot}'") == "failed|1"
+    # Not even a direct write can reopen it.
+    with pytest.raises(AssertionError, match="terminal|immutable"):
+        db.psql(f"update public.catalog_source_snapshots set validation_state='complete' "
+                f"where id='{snapshot}'")
+
+
+def test_snapshot_ingestion_and_activation_require_the_creating_runs_lease(db):
+    """A snapshot belongs to the run that opened it.
+
+    PR1 checked only that SOME run held a valid lease, so any concurrently
+    leased run could append records to, and activate, a capture it did not
+    open -- and the snapshot's `created_by_run_id` would still name the first
+    run, making the provenance wrong rather than merely loose.
+    """
+    lease, other = _evidence_fixture(db, "corrective-owner")
+    run_a, worker_a, attempt_a, token_a, _ = lease
+    run_b, worker_b, attempt_b, token_b, _ = other
+    args_a = f"'{run_a}','{worker_a}',{attempt_a},'{token_a}'"
+    args_b = f"'{run_b}','{worker_b}',{attempt_b},'{token_b}'"
+    snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args_a},'{_catalog_snapshot_json('snap-owned', declared=1)}'::jsonb)")
+
+    for call in (f"select public.record_catalog_raw_record_guarded({args_b},'{_catalog_record_json(snapshot, 'rec-foreign')}'::jsonb)",
+                 f"select public.activate_catalog_snapshot_guarded({args_b},'{json.dumps({'snapshot_id': snapshot})}'::jsonb)"):
+        with pytest.raises(AssertionError, match="does not belong to this run"):
+            _rpc_as_service(db, call)
+    assert db.psql(f"select stored_record_count, activated_at is null from "
+                   f"public.catalog_source_snapshots where id='{snapshot}'") == "0|t"
+
+    # The owning run proceeds normally.
+    _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args_a},'{_catalog_record_json(snapshot, 'rec-owned')}'::jsonb)")
+    _rpc_as_service(db, f"select id from public.activate_catalog_snapshot_guarded({args_a},'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
+    assert db.psql(f"select activated_at is not null from public.catalog_source_snapshots "
+                   f"where id='{snapshot}'") == "t"
+
+
+def test_a_later_run_may_add_evidence_to_an_existing_candidate_deliberately(db):
+    """The ONE cross-run allowance, stated and tested on its own.
+
+    Snapshot ownership is exclusive: only the creating run fills and activates
+    a capture. Evidence LINKS are deliberately not, because a later run may
+    verify an existing candidate with evidence of its own. That later run's
+    source, claim and verdict must all belong to it, and the link records
+    which run supplied them -- so the allowance widens who may ADD evidence,
+    never who may speak for another run's evidence.
+    """
+    lease, other, args_a, source_a, claim_a, verdict_a = _corrective_evidence(db, "later-run")
+    run_b, worker_b, attempt_b, token_b, _ = other
+    args_b = f"'{run_b}','{worker_b}',{attempt_b},'{token_b}'"
+    snapshot, record, candidate = _catalog_chain(db, "later-run", args_a)
+
+    # Run B builds its own evidence and links it to run A's candidate.
+    source_b = _rpc_as_service(db, f"select id from public.upsert_source_guarded({args_b},'{_r3_source_json('corrective-later-b')}'::jsonb)")
+    fragment_b = _rpc_as_service(db, f"select id from public.record_evidence_fragment_guarded({args_b},'{_r3_fragment_json(source_b, key='corrective-later-b-fragment')}'::jsonb)")
+    claim_b = _rpc_as_service(db, f"select id from public.create_claim_with_source_guarded({args_b},'{_r3_claim_json('corrective-later-b-claim', source_b, 1798)}'::jsonb)")
+    verdict_b = _rpc_as_service(db, f"select id from public.record_claim_verdict_guarded({args_b},'{_r4_verdict_json(claim_b, key='corrective-later-b-verdict', support=[_r4_support(fragment_b)])}'::jsonb)")
+    link_b = _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args_b},'{_catalog_link_json(candidate, source_b, 'link-later-b', claim_id=claim_b, verdict_id=verdict_b, locator=None, version=None, kind=None)}'::jsonb)")
+    assert db.psql(f"select run_id from public.catalog_candidate_evidence_links "
+                   f"where id='{link_b}'") == run_b
+
+    # But run B still cannot borrow run A's evidence, and still cannot touch
+    # run A's snapshot.
+    with pytest.raises(AssertionError, match="invalid catalog evidence link source"):
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args_b},'{_catalog_link_json(candidate, source_a, 'link-borrowed', claim_id=claim_a, verdict_id=verdict_a, locator=None, version=None, kind=None)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links "
+                   f"where candidate_id='{candidate}'") == "1"
+
+
+# --- defect 4/D: the payload digest was the caller's to get right -----------
+
+def test_the_raw_record_digest_is_derived_and_a_supplied_one_is_refused(db):
+    """PR1 made PR2 reproduce PostgreSQL's incidental `jsonb::text` rendering.
+
+    The stored hash was compared against `encode(sha256(convert_to(payload::text
+    ...)))`, so a correct caller had to predict jsonb's key ordering and
+    separator style exactly. That is not a security property, it is a
+    formatting coincidence, and the first ingestion path that formatted its
+    JSON differently would have failed for no real reason. The digest is now
+    derived inside the trusted path and a supplied one is refused outright.
+    """
+    lease, _ = _evidence_fixture(db, "corrective-hash")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{_catalog_snapshot_json('snap-hash', declared=1)}'::jsonb)")
+    supplied = json.loads(_catalog_record_json(snapshot, "rec-hash"))
+    # PR1 REQUIRED this field and compared it against `jsonb::text`; a correct
+    # caller had to predict jsonb's key ordering and separator style. Even the
+    # value PostgreSQL itself would compute is now refused, because the field
+    # is no longer read at all.
+    correct = hashlib.sha256(json.dumps(supplied["payload"], separators=(", ", ": ")
+                                        ).encode("utf-8")).hexdigest()
+    for digest in (correct, "c" * 64):
+        with pytest.raises(AssertionError, match="payload digest is derived"):
+            _rpc_as_service(db, f"select public.record_catalog_raw_record_guarded({args},'{json.dumps({**supplied, 'payload_sha256': digest})}'::jsonb)")
+
+    # Without it, the record is stored and the digest is the database's own.
+    record = _rpc_as_service(db, f"select id from public.record_catalog_raw_record_guarded({args},'{json.dumps(supplied)}'::jsonb)")
+    assert db.psql(f"select payload_sha256 = encode(sha256(convert_to(payload::text, 'UTF8')), 'hex') "
+                   f"from public.catalog_raw_records where id='{record}'") == "t"
+    # A replay whose payload differs still fails closed on the same identity.
+    changed = {**supplied, "payload": {"_id": 36327, "kinuy_mishari": "RAV4 PHEV"}}
+    with pytest.raises(AssertionError, match="catalog raw record idempotency conflict"):
+        _rpc_as_service(db, f"select public.record_catalog_raw_record_guarded({args},'{json.dumps(changed)}'::jsonb)")
+
+
+def test_a_catalog_key_must_carry_its_own_domain_and_shape(db):
+    """Keys are structural, never free text and never model-authored.
+
+    The database enforces the two halves it can check without depending on one
+    language's JSON rendering: a key's DOMAIN prefix and its SHAPE. The full
+    derivation from an object's identity is a repository rule -- reproducing
+    that digest in SQL would mean reproducing Python's exact JSON formatting in
+    SQL, which is the very brittleness this round removes from the payload
+    hash.
+    """
+    lease, _ = _evidence_fixture(db, "corrective-keys")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    payload = json.loads(_catalog_snapshot_json("snap-keys"))
+    assert payload["snapshot_key"].startswith("cs1.")
+
+    for bad in ("a-name-i-chose", "snap-keys", "cr1." + payload["snapshot_key"][4:],
+                "cs1.NOTHEX" + "0" * 26):
+        with pytest.raises(AssertionError, match="catalog_source_snapshots_key_derived"):
+            _rpc_as_service(db, f"select public.record_catalog_snapshot_guarded({args},'{json.dumps({**payload, 'snapshot_key': bad})}'::jsonb)")
+    snapshot = _rpc_as_service(db, f"select id from public.record_catalog_snapshot_guarded({args},'{json.dumps(payload)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_source_snapshots where id='{snapshot}'") == "1"
+
+
+def test_a_rename_cannot_duplicate_a_logical_catalog_identity(db):
+    """Natural uniqueness, so the KEY is not the only thing holding identity.
+
+    PR1 keyed every relation solely on a caller-supplied name, so the same
+    retrieval, the same reading and the same citation could each be stored
+    twice by being called something else. Each now carries a unique index over
+    what actually makes it that object.
+    """
+    lease, _, args, source, claim, verdict = _corrective_evidence(db, "natural")
+    snapshot, record, candidate = _catalog_chain(db, "natural", args)
+
+    # Same retrieval, different name -> refused by the schema, not the RPC.
+    duplicate = json.loads(_catalog_snapshot_json("snap-natural"))
+    duplicate["snapshot_key"] = _catalog_key("catalog.snapshot", "snap-natural-renamed")
+    with pytest.raises(AssertionError, match="catalog_source_snapshots_natural_uidx"):
+        _rpc_as_service(db, f"select public.record_catalog_snapshot_guarded({args},'{json.dumps(duplicate)}'::jsonb)")
+
+    # Same reading of the same record, different name -> refused.
+    twin = json.loads(_catalog_candidate_json(snapshot, record, "cand-natural"))
+    twin["candidate_key"] = _catalog_key("catalog.candidate", "cand-natural-renamed")
+    with pytest.raises(AssertionError, match="catalog_candidate_variants_natural_uidx"):
+        _rpc_as_service(db, f"select public.record_catalog_candidate_guarded({args},'{json.dumps(twin)}'::jsonb)")
+
+    # Same citation of the same claim, different name -> refused.
+    _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-natural', claim_id=claim, locator=None, version=None, kind=None)}'::jsonb)")
+    with pytest.raises(AssertionError, match="catalog_candidate_evidence_links_natural_uidx"):
+        _rpc_as_service(db, f"select public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-natural-renamed', claim_id=claim, locator=None, version=None, kind=None)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links "
+                   f"where candidate_id='{candidate}'") == "1"
+
+    # The verdict-bearing citation of the SAME claim is a different statement
+    # and is kept alongside the discovery link, by design.
+    _rpc_as_service(db, f"select id from public.link_catalog_candidate_evidence_guarded({args},'{_catalog_link_json(candidate, source, 'link-natural-verified', claim_id=claim, verdict_id=verdict, locator=None, version=None, kind=None)}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_evidence_links "
+                   f"where candidate_id='{candidate}'") == "2"
+
+
+def test_every_catalog_foreign_key_column_is_indexed(db):
+    """A referencing column with no index makes every delete-check a scan.
+
+    Enumerated from the catalog rather than listed, so a future migration that
+    adds a foreign key without its index fails here instead of at load.
+    """
+    unindexed = db.psql("""
+        select c.conrelid::regclass::text || '.' || a.attname
+        from pg_constraint c
+        join unnest(c.conkey) with ordinality as k(attnum, ord) on true
+        join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+        where c.contype = 'f'
+          and c.conrelid::regclass::text like 'catalog\\_%'
+          and k.ord = 1
+          and not exists (
+            select 1 from pg_index i
+            where i.indrelid = c.conrelid and i.indkey[0] = a.attnum)
+        order by 1
+    """).splitlines()
+    assert unindexed == [], f"catalog FK columns without a leading index: {unindexed}"
+
+
+# --- defect 7: canonical rows could change their facts ----------------------
+
+def test_canonical_rows_are_fully_immutable_until_pr3_adds_field_provenance(db):
+    """PR1's trigger froze identity and provenance but not the FACTS.
+
+    `catalog_model_variants` carries ONE `promoted_from_verdict_id` for a row
+    of several independent facts -- the year range, the model code, the trim
+    and every stated dimension. PR1 allowed those factual columns to be
+    rewritten as long as the revision counter advanced, so a row could end up
+    stating values its attached verdict had never seen, with an advancing
+    counter making it look reviewed.
+
+    Row-level provenance cannot verify a multi-field row, so there is no update
+    path at all until PR3 adds FIELD-LEVEL, append-only revision provenance.
+
+    A row-level trigger only fires per row, and the canonical tables are
+    empty -- so each case below inserts one inside a transaction that is never
+    committed. The failing statement aborts it, which is why the tables are
+    still empty afterwards.
+    """
+    lease, _, args, source, claim, verdict = _corrective_evidence(db, "canonical")
+    _, _, candidate = _catalog_chain(db, "canonical", args)
+    model = ("insert into public.catalog_models (manufacturer, commercial_model, canonical_key) "
+             "values ('Toyota', 'RAV4', 'cm-immutable')")
+    variant = ("insert into public.catalog_model_variants (model_id, promoted_from_candidate_id, "
+               "promoted_from_verdict_id, canonical_key, model_year_start, model_year_end) "
+               f"select id, '{candidate}', '{verdict}', 'cv-immutable', 2021, 2021 "
+               "from public.catalog_models where canonical_key='cm-immutable'")
+
+    for seed, mutation in (
+            (model, "update public.catalog_models set revision = revision + 1"),
+            (model, "update public.catalog_models set commercial_model = 'RAV4 PHEV'"),
+            (model, "delete from public.catalog_models"),
+            (f"{model}; {variant}",
+             "update public.catalog_model_variants set model_year_end = 2026, revision = 2"),
+            (f"{model}; {variant}", "delete from public.catalog_model_variants")):
+        with pytest.raises(AssertionError, match="canonical catalog rows are immutable"):
+            db.psql(f"begin; {seed}; {mutation}; commit")
+    # The aborted transactions left nothing behind.
+    for table in CATALOG_CANONICAL_TABLES:
+        assert db.psql(f"select count(*) from public.{table}") == "0"
+
+    # And the trigger no longer offers a revision path that would imply a
+    # factual rewrite is safe.
+    assert db.psql(
+        "select count(*) from pg_proc where proname='forbid_canonical_identity_rewrite' "
+        "and prosrc like '%revision must advance%'") == "0"

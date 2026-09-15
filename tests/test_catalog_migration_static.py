@@ -24,6 +24,7 @@ from backend.catalog.contracts import (CANDIDATE_IDENTITY_DIMENSIONS, CANDIDATE_
 import pytest
 
 MIGRATION = Path("supabase/migrations/20260914200000_catalog_evidence_foundation.sql")
+CORRECTION = Path("supabase/migrations/20260915120000_catalog_integrity_corrections.sql")
 
 #: Every relation the catalog namespace adds, and nothing else.
 STAGING_TABLES = ("catalog_source_snapshots", "catalog_raw_records",
@@ -35,7 +36,18 @@ GUARDED_RPCS = ("record_catalog_snapshot_guarded", "record_catalog_raw_record_gu
 
 
 def sql() -> str:
-    return MIGRATION.read_text(encoding="utf-8")
+    """Both catalog migrations, as one text.
+
+    Rerun safety and every invariant below are properties of the ORDERED SET,
+    not of one file: the corrective migration replaces function bodies and
+    constraints the foundation migration introduced, so reading either alone
+    would describe a schema that never exists.
+    """
+    return MIGRATION.read_text(encoding="utf-8") + "\n" + CORRECTION.read_text(encoding="utf-8")
+
+
+def correction() -> str:
+    return CORRECTION.read_text(encoding="utf-8")
 
 
 def statements() -> str:
@@ -137,9 +149,23 @@ def test_the_canonical_tables_are_created_empty_and_unwritable_in_pr1():
 
 
 def test_every_durable_write_is_lease_guarded_and_service_only():
+    """Every catalog RPC leads with the lease guard, in both migrations.
+
+    Three of the five are REDEFINED by the corrective migration, so the lease
+    guard has to be present in each definition rather than counted once: a
+    corrected body that dropped it would still leave the original file's copy
+    in the concatenated text.
+    """
     text = sql()
-    assert text.count("perform public.assert_worker_lease") == len(GUARDED_RPCS)
-    assert text.count("set search_path = pg_catalog") == len(GUARDED_RPCS) + 1  # + the predicate
+    for body in text.split("create or replace function public.")[1:]:
+        name = body.split("(", 1)[0]
+        if not name.endswith("_guarded"):
+            continue
+        statements = [line.strip() for line in body.split("as $$", 1)[1].splitlines()
+                      if line.strip() and not line.strip().startswith("--")]
+        first = statements[statements.index("begin") + 1]
+        assert first.startswith("perform public.assert_worker_lease"), name
+        assert "set search_path = pg_catalog" in body.split("as $$", 1)[0], name
     for rpc in GUARDED_RPCS:
         assert f"create or replace function public.{rpc}" in text
         assert f"'public.{rpc}(uuid,text,integer,text,jsonb)'" in text
@@ -147,6 +173,61 @@ def test_every_durable_write_is_lease_guarded_and_service_only():
     assert "revoke execute on function %s from anon" in text
     assert "revoke execute on function %s from authenticated" in text
     assert "grant execute on function %s to service_role" in text
+
+
+def test_the_corrective_migration_states_the_authorization_boundary_exactly():
+    """No claim that the RPCs are the only database write path.
+
+    They are SECURITY INVOKER and `service_role` keeps direct DML on the
+    staging tables, so the accurate statement is about the REPOSITORY's write
+    path. Anything that must hold for every writer is a constraint or a
+    trigger, not a function body -- which is why the cross-table identity
+    checks moved into the schema in this round.
+    """
+    body = correction()
+    assert "security definer" not in body.lower(), (
+        "converting these RPCs to SECURITY DEFINER is a separate, reviewed decision")
+    assert "REPOSITORY'S CATALOG WRITE PATH goes through these RPCs" in body
+    assert "not that they are the only way to write these tables" in body
+    # And the schema, not a function, carries the cross-table invariants.
+    for constraint in ("catalog_candidate_variants_record_snapshot_fk",
+                       "catalog_candidate_evidence_links_candidate_snapshot_fk"):
+        assert constraint in body
+
+
+def test_the_corrective_migration_derives_provenance_rather_than_trusting_it():
+    """The defect this round exists for, pinned in the SQL."""
+    body = correction()
+    for rule in ("catalog evidence link verdict is not verified",
+                 "record locator does not match the cited claim",
+                 "source version does not match the cited source",
+                 "requires the claim it is evidence for",
+                 "the cited claim states no evidence locator",
+                 "the cited source states no version to pin this link to",
+                 "a failed catalog snapshot is terminal",
+                 "does not belong to this run",
+                 "payload digest is derived, not supplied",
+                 "canonical catalog rows are immutable"):
+        assert rule in body, rule
+    # The claim is structurally required, not merely checked in a function.
+    assert "alter column claim_id set not null" in body
+    # And the locator/version are read from the evidence, not the payload.
+    assert "v_locator := v_claim.evidence_locator;" in body
+    assert "v_kind := v_source.source_version_kind;" in body
+    assert "v_version := v_source.source_version_id;" in body
+
+
+def test_canonical_rows_have_no_update_path_and_pr3_is_told_why():
+    """Row-level provenance cannot verify a multi-field row."""
+    body = correction()
+    assert "revision must advance" not in body
+    assert "FIELD-LEVEL, append-only" in body
+    assert "a row-level FK is not sufficient" in body
+    trigger = body.split("create or replace function public.forbid_canonical_identity_rewrite", 1)[1]
+    trigger = trigger.split("$$;", 1)[0]
+    assert "raise exception 'canonical catalog rows are immutable'" in trigger
+    assert "before update or delete on public.catalog_models" in body
+    assert "before update or delete on public.catalog_model_variants" in body
 
 
 def test_every_new_table_enables_rls_and_carries_no_policy():

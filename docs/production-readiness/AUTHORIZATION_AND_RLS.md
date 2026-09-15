@@ -60,26 +60,79 @@ independent barriers, neither depending on the other.
 | --- | --- |
 | `catalog_raw_records`, `catalog_candidate_evidence_links` | `SELECT`, `INSERT` — append-only; no `UPDATE`, no `DELETE` |
 | `catalog_source_snapshots`, `catalog_candidate_variants` | `SELECT`, `INSERT`, `UPDATE` — the one reviewed transition each carries (snapshot completion counters, candidate status); no `DELETE` |
-| `catalog_models`, `catalog_model_variants` | **`SELECT` only** |
+| `catalog_models`, `catalog_model_variants` | **`SELECT` only**, and immutable by trigger |
 
 The canonical pair being read-only is what makes "the canonical catalog starts
-empty and stays empty in PR1" a database property rather than a claim about
-the code: no role can insert a canonical row, so canonical promotion cannot
-happen by accident or by an unreviewed backend release. Catalog PR3 grants the
-privilege it needs in its own reviewed migration.
+empty and stays empty" a database property rather than a claim about the code:
+no role can insert a canonical row, so canonical promotion cannot happen by
+accident or by an unreviewed backend release. Catalog PR3 grants the privilege
+it needs in its own reviewed migration.
 
-Every durable write goes through one of five lease-guarded RPCs
+**And canonical rows are now immutable outright.** The original trigger froze
+identity and provenance but allowed the factual columns to be rewritten as long
+as a revision counter advanced — so a row could state values that the single
+`promoted_from_verdict_id` attached to it had never seen, with the advancing
+counter making it look reviewed. Row-level provenance cannot verify a
+multi-field row: a verdict that confirmed the drivetrain says nothing about the
+model year beside it. **PR3 must add field-level, append-only revision
+provenance — one provenance row per fact, not one per canonical row — before
+enabling any insert.** A row-level foreign key is not sufficient and must not
+be treated as if it were.
+
+**The repository's catalog write path** goes through five lease-guarded RPCs
 (`record_catalog_snapshot_guarded`, `record_catalog_raw_record_guarded`,
 `activate_catalog_snapshot_guarded`, `record_catalog_candidate_guarded`,
 `link_catalog_candidate_evidence_guarded`), each calling
 `assert_worker_lease` before writing anything, each `EXECUTE`-revoked from
 `public`/`anon`/`authenticated` and granted only to `service_role`, and each
-idempotent on a backend-derived key that fails closed when replayed with
-different content. The constraint helper
-`catalog_identity_dimensions_valid(jsonb)` is revoked from the browser roles
-on the same footing as the `r3_*` predicates. Executable validation:
-`tests/test_migrations_postgres.py` (the `test_catalog_*` cases,
-`MILO_REQUIRE_PG_TESTS=1`, zero skips).
+idempotent on a derived key that fails closed when replayed with different
+content.
+
+**Stated exactly: these RPCs are *not* the only database write path.** They
+are `SECURITY INVOKER`, and `service_role` retains the direct staging-table
+DML in the table above — so a caller holding the service-role credential can
+write those tables without them. The accurate guarantee is therefore about the
+repository, not the database:
+
+- *the repository's catalog write path uses guarded RPCs* — true, and enforced
+  by `tests/test_catalog_persistence.py`, which proves every repository method
+  calls a literal RPC name and never a direct insert;
+- *the RPCs are the only way to write these tables* — **false**, and the
+  migrations no longer claim it.
+
+Anything that must hold for **every** writer therefore lives in the schema
+rather than in a function body: the cross-table identity foreign keys
+(`catalog_candidate_variants_record_snapshot_fk`,
+`catalog_candidate_evidence_links_candidate_snapshot_fk`), the natural
+uniqueness indexes, the key domain/shape checks, the append-only and
+lifecycle triggers, and the canonical-immutability trigger. Converting the
+public RPCs to `SECURITY DEFINER` to close the remaining gap is a separate,
+reviewed decision: it would need a safe owner and `search_path`, revoked
+default `EXECUTE`, proven inaccessibility to browser roles and its own
+executable authorization tests, and it is deliberately **not** done here.
+
+The constraint helper `catalog_identity_dimensions_valid(jsonb)` is revoked
+from the browser roles on the same footing as the `r3_*` predicates.
+Executable validation: `tests/test_migrations_postgres.py` (the `test_catalog_*`
+and corrective cases, `MILO_REQUIRE_PG_TESTS=1`, zero skips).
+
+### Evidence-link provenance is derived, not asserted
+
+A `catalog_candidate_evidence_links` row must cite a real `public.claims` row
+(`claim_id` is `NOT NULL`), and its `record_locator`, `source_version_kind` and
+`source_version` are **derived** from that claim's `evidence_locator` and that
+source's `source_version_kind`/`source_version_id`. A caller may state them and
+is then held to them; a mismatch fails closed. A non-null `verdict_id` is
+accepted only when `claim_verdicts.verdict = 'verified'` and the verdict
+belongs to that exact claim and run. A `legacy_reference` snapshot still cannot
+carry a verdict at all.
+
+Snapshot ownership is exclusive to the creating run: only `created_by_run_id`
+may append records to, or decide, its own capture, and both decided states
+(`complete`+active, and `failed`) are terminal. Evidence **links** are the one
+deliberate cross-run allowance — a later run may cite evidence *of its own* for
+an existing candidate — which is stated and tested separately
+(`test_a_later_run_may_add_evidence_to_an_existing_candidate_deliberately`).
 
 Catalog foreign keys are all `ON DELETE RESTRICT`, never `CASCADE` — unlike
 the run-scoped evidence relations. Durable catalog state must not disappear

@@ -2,6 +2,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Protocol
 from uuid import UUID
 from supabase import create_client
+from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
+                                      prepare_raw_record, prepare_snapshot)
 from backend.config import Settings
 from backend.errors import AppError, NotFoundError
 from backend.runtime import RUN_STATES, InvalidTransition, validate_transition
@@ -750,20 +752,33 @@ class SupabaseRepository:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_verdict": verdict}
         return self._guarded_rpc("record_claim_verdict_guarded", params, "claim_verdict")
 
-    # --- durable catalog staging (PR1) ---------------------------------------
+    # --- durable catalog staging --------------------------------------------
     #
-    # Guarded RPCs, never direct inserts: the lease check, the idempotency
-    # identity, the cross-run and cross-snapshot guards and the fail-closed
-    # replay conflict all live in the database, so they hold for any caller
-    # rather than for whichever backend release happens to be deployed.  The
-    # function name is a literal in every case -- no table or function is ever
-    # selected from a payload.
+    # Guarded RPCs, never direct inserts: the lease check, the referential
+    # provenance checks, the cross-run and cross-snapshot guards and the
+    # fail-closed replay conflict all live in the database, so they hold for
+    # any caller rather than for whichever backend release happens to be
+    # deployed.  The function name is a literal in every case -- no table or
+    # function is ever selected from a payload.
+    #
+    # Note the exact boundary: these RPCs are SECURITY INVOKER and `service_role`
+    # retains direct DML on the staging tables, so the accurate statement is
+    # that THE REPOSITORY'S CATALOG WRITE PATH goes through them -- not that
+    # they are the only way to write those tables from the database.  Anything
+    # that must hold for every writer is a constraint or a trigger.
+    #
+    # Every identity key is DERIVED from the object's own structural fields
+    # (`backend/catalog/payloads.py`), and a caller-supplied key that disagrees
+    # is refused rather than trusted.  The memory repository shares these
+    # preparers, so the two implementations cannot drift.
     def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
-        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_snapshot": snapshot}
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_snapshot": prepare_snapshot(snapshot)}
         return self._guarded_rpc("record_catalog_snapshot_guarded", params, "catalog_snapshot")
 
     def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
-        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_record": record}
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_record": prepare_raw_record(record)}
         return self._guarded_rpc("record_catalog_raw_record_guarded", params, "catalog_raw_record")
 
     def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
@@ -771,11 +786,13 @@ class SupabaseRepository:
         return self._guarded_rpc("activate_catalog_snapshot_guarded", params, "catalog_snapshot")
 
     def record_catalog_candidate(self, run_id: UUID, candidate: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
-        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_candidate": candidate}
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_candidate": prepare_candidate(candidate)}
         return self._guarded_rpc("record_catalog_candidate_guarded", params, "catalog_candidate")
 
     def link_catalog_candidate_evidence(self, run_id: UUID, link: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
-        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_link": link}
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_link": prepare_evidence_link(link)}
         return self._guarded_rpc("link_catalog_candidate_evidence_guarded", params, "catalog_evidence_link")
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:

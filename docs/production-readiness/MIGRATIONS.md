@@ -39,6 +39,7 @@ production.
 | ts | `20260818000100_stage_c_service_role_rpc_acl.sql` | service_role EXECUTE on the create_message_and_run / create_project_from_proposal_with_owner base RPCs (Stage C Attempt 4 corrective) |
 | ts | `20260818000200_claim_run_lease_service_role_acl.sql` | service_role EXECUTE on claim_run_lease (Stage C Attempt 5 corrective; full worker-path ACL contract now enforced by `tests/test_worker_rpc_acl_postgres.py`) |
 | ts | `20260914200000_catalog_evidence_foundation.sql` | Catalog PR1: the durable catalog namespace — `catalog_source_snapshots`, `catalog_raw_records`, `catalog_candidate_variants`, `catalog_candidate_evidence_links` plus the **empty** canonical `catalog_models` / `catalog_model_variants`, their lease-guarded RPCs, append-only triggers, RLS and least-privilege grants |
+| ts | `20260915120000_catalog_integrity_corrections.sql` | Catalog PR1 corrective round: derived evidence-link provenance (verified verdicts only, locator/version read from the cited claim and source), required `claim_id`, terminal `failed` snapshots, creating-run snapshot ownership, derived payload digests, domain-separated identity keys with natural uniqueness, composite cross-table foreign keys and their indexes, and fully immutable canonical rows |
 
 All migrations are additive, idempotent and data-preserving. There are no
 destructive down-migrations, by policy (`scripts/check_migrations.py`
@@ -55,6 +56,27 @@ empty and are `SELECT`-only for `service_role`, so no write path that exists
 today can put a row in either. The existing aggregated Yeda catalog is
 deliberately **not** imported; it is representable only as a
 `legacy_reference` snapshot whose trust state is pinned to `unverified`.
+
+### The corrective round — migration and rollback impact
+
+`20260915120000_catalog_integrity_corrections.sql` is forward-only and does not
+rewrite the migration it corrects. It operates on relations that are still
+empty, so every tightening it applies — `claim_id` becoming `NOT NULL`, the key
+domain/shape checks, the natural uniqueness indexes, the composite foreign keys
+— is a no-op against existing data by construction. It redefines three RPC
+bodies and two trigger functions in place, and adds eight indexes.
+
+Rerun safety is a property of the **ordered set**: replaying the foundation
+migration alone would restore the function bodies this one corrected, so the
+executable test replays both files in order
+(`test_catalog_migration_applies_and_is_rerun_safe`). Each `add constraint` is
+paired with drops of both its own name and the PR1 name it replaces, and the
+composite foreign keys are dropped before the unique constraints they depend on
+and re-added afterwards.
+
+Rollback: the catalog is still empty, so reverting means not using these
+relations. A corrective forward migration could restore the looser PR1
+definitions, but doing so would reintegrate the defects this round fixed.
 
 Rollback is the usual forward-only story, and it is unusually cheap here:
 because nothing reads or writes these relations yet, reverting means simply
