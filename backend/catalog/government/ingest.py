@@ -1,0 +1,304 @@
+"""Capture -> snapshot -> raw records -> candidates -> activation. In that order.
+
+The order is the safety property
+--------------------------------
+
+1.  **Capture first, and completely.** The whole query is fetched and validated
+    as one result set BEFORE a single durable write. A partial, inconsistent,
+    over-limit or malformed capture therefore leaves no trace at all -- not a
+    pending snapshot, not a row.
+2.  **Open the snapshot.** It is born `pending` and can never be born active:
+    the payload preparer refuses `activated_at` and `stored_record_count` as
+    inputs and the guarded RPC refuses them again.
+3.  **Append every raw record**, each with the exact page and index it occupied.
+4.  **Record every candidate reading.**
+5.  **Activate last.** The database's own gate refuses activation unless the
+    snapshot holds exactly as many records as the upstream declared, so a
+    prefix cannot be activated even by a caller that wanted to.
+
+Because activation is last and gated, a crash, a cancellation or a lost lease
+at ANY point leaves a non-active snapshot. Nothing downstream reads a non-active
+snapshot, so an interrupted ingestion is invisible to a reader rather than being
+a smaller truth.
+
+Every durable write carries the lease
+-------------------------------------
+
+`run_id`, `worker_id`, `attempt` and `lease_token` travel with every write, and
+`assert_worker_lease` validates all four atomically before a byte is written. A
+stale, superseded or expired worker writes nothing at all. This module holds no
+other way to reach the database: there is no direct insert here, and no function
+or table name is ever assembled from data.
+
+Replay, refresh and ownership
+-----------------------------
+
+*   **Exact replay is a deterministic no-op.** The snapshot identity is a
+    function of what was captured, so re-reading unchanged content derives the
+    same `content_sha256`, the same `snapshot_key`, the same record keys and the
+    same candidate keys. Every write collapses onto the existing row.
+*   **A later run may REUSE an already-active identical snapshot.** It is
+    returned by the idempotent snapshot write, recognised as another run's
+    completed work, and left completely alone -- this module never attempts to
+    fill or decide a capture it did not open, which the database would refuse
+    anyway.
+*   **A later run may not adopt another run's UNFINISHED capture.** That is a
+    refusal here, with its own reason, rather than an attempt that fails
+    halfway.
+*   **Changed content is a new snapshot.** A different capture derives a
+    different `content_sha256`, so it is a different `snapshot_key` and a
+    different row; the previous snapshot and all its raw records are untouched.
+*   **A failed refresh never replaces the last valid active snapshot**, because
+    it never reaches activation and the previous snapshot is never modified.
+
+This is AT-LEAST-ONCE delivery onto idempotent writes, not exactly-once. There
+is no exactly-once guarantee across the window between a durable write and the
+checkpoint that records it: a crash inside that window re-executes the step on
+resume. That is safe here for two specific reasons, and only those -- every
+upstream call is READ-ONLY, and every durable write is idempotent on a key
+derived from content -- so a replayed step lands on the same rows.
+
+No model, no provider and no canonical write
+--------------------------------------------
+
+Nothing on this path calls a provider or a model. Nothing here writes
+`catalog_models` or `catalog_model_variants` -- there is no repository method
+that could, and `service_role` holds SELECT only on both. No claim, verdict or
+evidence link is created either: PR2 provenance is snapshot -> raw record ->
+candidate, and evidence mapping is PR3's work.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Sequence
+
+from backend.engines.swarm_v2.evidence import WorkerLease
+from backend.errors import AppError
+from backend.runtime import CancellationRequested
+
+from . import snapshot as snapshot_module
+from . import source as src
+from .client import DataGovClient, ResourceCapture
+from .normalize import (GovernmentNormalizationError, RecordReading, UNMAPPED_FIELDS,
+                        read_wltp_record)
+from .source import GovernmentSourceError
+
+#: The bound on how many per-row refusals one report carries verbatim. The
+#: COUNT is always exact; the list is bounded so a systematically unreadable
+#: capture cannot produce an unbounded report.
+MAX_REPORTED_REJECTIONS = 100
+
+#: Ingestion-level refusals, beyond the capture and normalization vocabularies.
+GOVERNMENT_INGESTION_REASONS: Mapping[str, str] = {
+    "GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN":
+        "this capture was opened by another run and is not finished; it cannot be adopted",
+    "GOV_SNAPSHOT_NOT_ACTIVATED":
+        "the capture was written in full but the snapshot did not activate",
+}
+
+
+class GovernmentIngestionError(ValueError):
+    """An ingestion refusal carrying ONLY a static, code-owned reason."""
+
+    def __init__(self, reason_code: str):
+        if reason_code not in GOVERNMENT_INGESTION_REASONS:
+            raise ValueError("government ingestion reason must come from the static allowlist")
+        self.reason_code = reason_code
+        self.safe_message = GOVERNMENT_INGESTION_REASONS[reason_code]
+        super().__init__(self.safe_message)
+
+
+@dataclass(frozen=True)
+class IngestionReport:
+    """What one ingestion did, in terms a reviewer can check against the rows."""
+
+    snapshot_id: str
+    snapshot_key: str
+    content_sha256: str
+    resource_id: str
+    upstream_version: str
+    upstream_version_kind: str
+    schema_fingerprint: str
+    declared_record_count: int
+    stored_record_count: int
+    page_count: int
+    #: Candidates THIS ingestion recorded. Zero on a replay or a reuse, where
+    #: the candidates were already durable and nothing was written.
+    candidate_count: int
+    candidate_status_counts: Mapping[str, int]
+    #: `(upstream_record_id, reason_code)` for rows that were CAPTURED and
+    #: STORED but could not be read into an identity. Bounded; see
+    #: `rejected_record_count` for the exact total. No raw row is ever lost
+    #: because of a refusal here -- it is durable either way.
+    rejected_records: tuple[tuple[str, str], ...] = ()
+    rejected_record_count: int = 0
+    #: The captured fields this ingestion deliberately did not read, each with
+    #: a reviewer's reason.
+    unmapped_fields: tuple[tuple[str, str], ...] = UNMAPPED_FIELDS
+    activated: bool = False
+    #: True when the snapshot already existed, ACTIVE, and held exactly this
+    #: content -- so this ingestion wrote nothing at all.
+    reused_existing: bool = False
+    #: The run that opened the snapshot, which is this run unless it was reused.
+    created_by_run_id: str = ""
+    candidates: tuple[Mapping[str, Any], ...] = field(default=(), repr=False)
+
+
+class GovernmentCatalogIngestor:
+    """One deterministic, bounded, read-only Government ingestion."""
+
+    def __init__(self, repository: Any, lease: WorkerLease, *, client: DataGovClient,
+                 cancellation_checker: Callable[[], bool] | None = None,
+                 event_sink: Callable[[str, Mapping[str, Any]], None] | None = None) -> None:
+        self._repository = repository
+        self._lease = lease
+        self._client = client
+        self._cancellation_checker = cancellation_checker
+        self._event_sink = event_sink
+
+    @property
+    def _lease_kwargs(self) -> dict[str, Any]:
+        return {"worker_id": self._lease.worker_id, "attempt": self._lease.attempt,
+                "lease_token": self._lease.lease_token}
+
+    # --- the whole path ------------------------------------------------------
+
+    def ingest_resource(self, resource_id: str, *, package_id: str = src.CKAN_PACKAGE_ID,
+                        query: Mapping[str, str] | None = None) -> IngestionReport:
+        """Capture one complete bounded query and land it in the catalog."""
+        capture = self._client.capture_resource(
+            src.require_allowed_resource(resource_id), package_id=package_id, query=query)
+        return self.ingest_capture(capture)
+
+    def ingest_capture(self, capture: ResourceCapture) -> IngestionReport:
+        """Land an ALREADY-VALIDATED capture. Separated so a capture can be
+        taken once and landed under test without a second transport."""
+        self._check_cancelled()
+        snapshot = self._repository.record_catalog_snapshot(
+            self._lease.run_id, snapshot_module.snapshot_payload(capture), **self._lease_kwargs)
+        owner = str(snapshot.get("created_by_run_id"))
+        if owner != str(self._lease.run_id):
+            # Another run opened this capture. If it FINISHED it, this run has
+            # nothing to do and must not touch it; if it did not, this run may
+            # not adopt it either -- the database refuses both, and refusing
+            # here keeps a half-written attempt out of the report.
+            if snapshot.get("activated_at") is None:
+                raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN")
+            return self._report(capture, snapshot, candidates=(), reused=True)
+
+        if snapshot.get("activated_at") is not None:
+            # Exact replay of our own completed capture: the records and the
+            # candidates are already durable and the snapshot is frozen, so
+            # this is a deterministic no-op rather than a second ingestion.
+            self._emit("catalog_snapshot_replayed", {"snapshot_key": snapshot["snapshot_key"]})
+            return self._report(capture, snapshot, candidates=(), reused=False)
+
+        records = self._write_records(capture, snapshot)
+        candidates, rejected = self._write_candidates(capture, records)
+        snapshot = self._activate(snapshot)
+        return self._report(capture, snapshot, candidates=candidates, reused=False,
+                            rejected=rejected)
+
+    # --- steps ---------------------------------------------------------------
+
+    def _write_records(self, capture: ResourceCapture, snapshot: Mapping[str, Any]
+                       ) -> list[tuple[dict[str, Any], Mapping[str, Any]]]:
+        """Append every captured row, in capture order, with its position.
+
+        Returns each stored row PAIRED with the register row it came from, so
+        the reading step never has to re-establish that pairing by index.
+        """
+        stored: list[tuple[dict[str, Any], Mapping[str, Any]]] = []
+        for payload, record in snapshot_module.raw_record_payloads(capture, snapshot):
+            self._check_cancelled()
+            stored.append((self._repository.record_catalog_raw_record(
+                self._lease.run_id, payload, **self._lease_kwargs), record))
+        self._emit("catalog_records_written", {"snapshot_key": snapshot["snapshot_key"],
+                                               "count": len(stored)})
+        return stored
+
+    def _write_candidates(self, capture: ResourceCapture,
+                          records: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]]
+                          ) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+        """Read every stored row into an identity, or report why not.
+
+        A row that cannot be read is NOT lost and NOT silently dropped: it is
+        already durable as a raw record, and the reason it could not be read
+        travels in the report. Reading is per-row on purpose -- one unreadable
+        row must not discard a capture in which every other row is fine.
+        """
+        candidates: list[dict[str, Any]] = []
+        rejected: list[tuple[str, str]] = []
+        for record_row, raw in records:
+            self._check_cancelled()
+            try:
+                reading: RecordReading = read_wltp_record(raw, resource_id=capture.resource_id)
+            except GovernmentNormalizationError as refusal:
+                rejected.append((str(record_row["upstream_record_id"]), refusal.reason_code))
+                continue
+            candidates.append(self._repository.record_catalog_candidate(
+                self._lease.run_id, reading.candidate_payload(record_row), **self._lease_kwargs))
+        self._emit("catalog_candidates_written", {"count": len(candidates),
+                                                  "rejected": len(rejected)})
+        return candidates, rejected
+
+    def _activate(self, snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Decide the snapshot, and record a failure AS a failure.
+
+        The completeness gate lives in the database. If it refuses, this
+        capture did not establish what it claimed, so the snapshot is marked
+        `failed` -- terminal, and never activatable afterwards -- rather than
+        left pending for a later attempt to finish with different material.
+        """
+        self._check_cancelled()
+        try:
+            decided = self._repository.activate_catalog_snapshot(
+                self._lease.run_id, {"snapshot_id": snapshot["id"]}, **self._lease_kwargs)
+        except AppError:
+            self._repository.activate_catalog_snapshot(
+                self._lease.run_id, {"snapshot_id": snapshot["id"], "validation_state": "failed"},
+                **self._lease_kwargs)
+            raise GovernmentIngestionError("GOV_SNAPSHOT_NOT_ACTIVATED") from None
+        self._emit("catalog_snapshot_activated", {"snapshot_key": decided["snapshot_key"],
+                                                  "records": decided["stored_record_count"]})
+        return decided
+
+    # --- reporting -----------------------------------------------------------
+
+    def _report(self, capture: ResourceCapture, snapshot: Mapping[str, Any], *,
+                candidates: Sequence[Mapping[str, Any]], reused: bool,
+                rejected: Sequence[tuple[str, str]] = ()) -> IngestionReport:
+        statuses: dict[str, int] = {}
+        for candidate in candidates:
+            status = str(candidate.get("status"))
+            statuses[status] = statuses.get(status, 0) + 1
+        return IngestionReport(
+            snapshot_id=str(snapshot["id"]), snapshot_key=str(snapshot["snapshot_key"]),
+            content_sha256=str(snapshot["content_sha256"]),
+            resource_id=str(snapshot["resource_id"]),
+            upstream_version=str(snapshot["upstream_version"]),
+            upstream_version_kind=str(snapshot["upstream_version_kind"]),
+            schema_fingerprint=capture.schema_fingerprint,
+            declared_record_count=int(snapshot["declared_record_count"]),
+            stored_record_count=int(snapshot["stored_record_count"]),
+            page_count=len(capture.pages), candidate_count=len(candidates),
+            candidate_status_counts=statuses,
+            rejected_records=tuple(rejected[:MAX_REPORTED_REJECTIONS]),
+            rejected_record_count=len(rejected),
+            activated=snapshot.get("activated_at") is not None,
+            reused_existing=reused, created_by_run_id=str(snapshot.get("created_by_run_id")),
+            candidates=tuple(dict(candidate) for candidate in candidates))
+
+    def _emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
+        if self._event_sink is not None:
+            self._event_sink(event_type, dict(payload))
+
+    def _check_cancelled(self) -> None:
+        if self._cancellation_checker is not None and self._cancellation_checker():
+            raise CancellationRequested("RUN_CANCELLED")
+
+
+__all__ = ["GOVERNMENT_INGESTION_REASONS", "MAX_REPORTED_REJECTIONS",
+           "GovernmentCatalogIngestor", "GovernmentIngestionError", "IngestionReport",
+           "GovernmentSourceError"]

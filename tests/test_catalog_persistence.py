@@ -1210,3 +1210,97 @@ def test_a_memory_verdict_replay_holds_support_to_a_json_array(memory, label, va
         repository.record_claim_verdict(
             run_id, F.verdict_payload_with_support(key, claim["id"], value), **lease)
     assert_unchanged(repository, run_id, key, before)
+
+
+# =============================================================================
+# 6. the durable catalog READS (Catalog PR2)
+# =============================================================================
+#
+# Reads take no lease -- a lease authorizes a durable WRITE, and requiring one
+# to look at already-durable catalog state would make a query layer impossible
+# to build without holding a run open. What each read must still be is bounded,
+# deterministically ordered and restricted to material that may answer a query,
+# and that is a property of the query SHAPE rather than of any returned row.
+#
+# These tests also exist because an earlier revision of this branch defined the
+# three concrete readers on the `Repository` PROTOCOL instead of on
+# `SupabaseRepository`, where they would never have run in production. Asserting
+# that each one actually reaches its table is what makes that a test failure.
+
+CATALOG_READS = (
+    ("list_active_catalog_snapshots", ("government",), "catalog_source_snapshots"),
+    ("list_catalog_raw_records", (str(uuid4()),), "catalog_raw_records"),
+    ("list_catalog_candidates", (str(uuid4()),), "catalog_candidate_variants"),
+)
+
+
+@pytest.mark.parametrize("method,args,table", CATALOG_READS,
+                         ids=[case[0] for case in CATALOG_READS])
+def test_the_catalog_reads_are_implemented_on_the_repository_itself(repo, method, args, table):
+    """Declared on the Protocol AND implemented on the class that talks to the
+    database -- and the implementation is the one that runs."""
+    assert getattr(Repository, method, None) is not None
+    assert getattr(SupabaseRepository, method) is not getattr(Repository, method)
+    assert getattr(repo, method)(*args) == []
+    read = repo.client.selected[-1]
+    assert read.table == table
+    # Never `*`: a column added later joins a read only when a reviewer adds it.
+    assert read.columns and "*" not in read.columns
+    assert repo.client.rpc_calls == [] and repo.client.inserted == []
+
+
+def test_only_active_snapshots_can_answer_a_catalog_query(repo):
+    """`activated_at is not null` is a column predicate, not a convention.
+
+    A pending capture is still being appended to and a failed one is the record
+    that a capture was unusable, so neither may answer a query at all.
+    """
+    repo.list_active_catalog_snapshots("government", resource_id="142afde2")
+    read = repo.client.selected[-1]
+    assert ("not.is", "activated_at", "null") in read.filters
+    assert ("eq", "source_family", "government") in read.filters
+    assert ("eq", "resource_id", "142afde2") in read.filters
+    # Newest activation first, broken by a key that is unique per row.
+    assert read.orders == [("activated_at", True), ("snapshot_key", False)]
+    assert read.bounds == ("limit", SupabaseRepository.MAX_CATALOG_SNAPSHOT_ROWS)
+
+
+def test_catalog_reads_order_by_a_collation_free_key_and_are_bounded(repo):
+    """The Government identity text is Hebrew, so ordering by it in the
+    database would make "the same snapshot produces the same ordered tree"
+    depend on the cluster's collation. These order by ASCII keys that are
+    unique within their scope; semantic ordering happens above this layer."""
+    snapshot = str(uuid4())
+    repo.list_catalog_raw_records(snapshot, limit=10, offset=20)
+    read = repo.client.selected[-1]
+    assert read.orders == [("record_key", False)]
+    assert read.bounds == ("range", 20, 29)
+    assert ("eq", "snapshot_id", snapshot) in read.filters
+
+    repo.list_catalog_candidates(snapshot, limit=10, offset=0)
+    read = repo.client.selected[-1]
+    assert read.orders == [("candidate_key", False)]
+    assert read.bounds == ("range", 0, 9)
+
+
+@pytest.mark.parametrize("method,ceiling", [
+    ("list_catalog_raw_records", SupabaseRepository.MAX_CATALOG_RECORD_ROWS),
+    ("list_catalog_candidates", SupabaseRepository.MAX_CATALOG_CANDIDATE_ROWS),
+])
+def test_a_caller_cannot_widen_a_catalog_read_past_the_server_bound(repo, method, ceiling):
+    getattr(repo, method)(str(uuid4()), limit=10_000, offset=-5)
+    read = repo.client.selected[-1]
+    assert read.bounds == ("range", 0, ceiling - 1)
+
+
+def test_the_two_repositories_agree_about_what_a_catalog_read_returns():
+    """Bounds and ordering are the same rule in both implementations, so a
+    test written against the memory repository is a test of the same contract."""
+    memory = MemoryRepository()
+    for attribute in ("MAX_CATALOG_SNAPSHOT_ROWS", "MAX_CATALOG_RECORD_ROWS",
+                      "MAX_CATALOG_CANDIDATE_ROWS"):
+        assert getattr(memory, attribute) == getattr(SupabaseRepository, attribute)
+    # And an empty catalog answers nothing rather than raising.
+    assert memory.list_active_catalog_snapshots("government") == []
+    assert memory.list_catalog_raw_records(str(uuid4())) == []
+    assert memory.list_catalog_candidates(str(uuid4())) == []
