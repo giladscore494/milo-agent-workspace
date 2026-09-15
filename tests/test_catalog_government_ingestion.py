@@ -14,6 +14,7 @@ repository boundary, replay and refresh, and the internal query projection.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import socket
 from pathlib import Path
@@ -25,7 +26,8 @@ from backend.catalog.contracts import stated_source_locator
 from backend.catalog.government import normalize, projection, snapshot as snapshot_module
 from backend.catalog.government import source as src
 from backend.catalog.government import vocabulary as vocab
-from backend.catalog.government.client import DataGovClient, schema_fingerprint
+from backend.catalog.government.client import (DataGovClient, ResourceMetadata,
+                                                schema_fingerprint)
 from backend.catalog.government.ingest import (GovernmentCatalogIngestor,
                                                GovernmentIngestionError)
 from backend.catalog.government.normalize import (GovernmentNormalizationError,
@@ -1670,10 +1672,22 @@ def test_a_snapshot_read_under_another_contract_is_not_reused(repository):
 
 @pytest.mark.parametrize("label,metadata,reason", [
     ("a raw-only capture", {"normalization_contract": "raw_only",
-                            "normalized_record_count": 0, "normalization_issue_count": 0},
+                            "normalized_record_count": 0, "normalization_issue_count": 0,
+                            "normalization_issues": [], "normalization_issue_records": []},
      "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED"),
     ("a snapshot with no stated reading", {"page_count": 1},
      "GOV_PROJECTION_SNAPSHOT_NOT_READ"),
+    # A raw-only summary is held to the same completeness as any other: an
+    # omitted list is metadata this code did not write, not an empty one.
+    ("a half-stated raw-only summary", {"normalization_contract": "raw_only",
+                                        "normalized_record_count": 0,
+                                        "normalization_issue_count": 0},
+     "GOV_PROJECTION_SNAPSHOT_STATE_INVALID"),
+    ("a raw-only summary claiming a reading",
+     {"normalization_contract": "raw_only", "normalized_record_count": 3,
+      "normalization_issue_count": 0, "normalization_issues": [],
+      "normalization_issue_records": []},
+     "GOV_PROJECTION_SNAPSHOT_STATE_INVALID"),
 ])
 def test_an_acknowledgement_never_reaches_a_snapshot_that_states_no_identities(
         repository, label, metadata, reason):
@@ -1728,3 +1742,363 @@ def test_an_ambiguous_reading_is_a_candidate_and_never_a_normalization_issue(rep
     ambiguous = [item for item in view.list_variants("טויוטה", "RAV4", limit=200).items
                  if item.status == "ambiguous"]
     assert len(ambiguous) == 1 and ambiguous[0].unresolved_dimensions == ("drivetrain",)
+
+
+# =============================================================================
+# REGRESSIONS — trust-boundary findings from the review of fcc567b
+# =============================================================================
+
+
+# --- 1. metadata is never caller-authored -----------------------------------
+
+def test_capture_resource_accepts_no_caller_authored_metadata():
+    """`ResourceMetadata` is a RESULT of the validated path, never an input.
+
+    `capture_resource` used to take a `metadata=` override that it checked only
+    for package and resource equality -- so a caller could hand it a publisher,
+    a source version and a response digest that `package_show` had never
+    validated, and every page and every durable row would then be pinned to
+    them. The parameter had no caller anywhere; it is gone.
+    """
+    import inspect
+
+    parameters = inspect.signature(DataGovClient.capture_resource).parameters
+    assert "metadata" not in parameters
+    assert set(parameters) == {"self", "resource_id", "package_id", "query"}
+    with pytest.raises(TypeError):
+        client().capture_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY),
+                                  metadata=object())
+
+
+def test_forged_metadata_with_an_allowed_package_and_resource_cannot_capture(repository):
+    """The exact bypass: allowed ids, everything else invented.
+
+    `ResourceMetadata` carries the publisher, the source version and the
+    digest of the metadata response -- the three things `package_show`
+    validates. The override checked only the package and the resource, so a
+    caller could satisfy it while inventing all three, and every page, every
+    raw record and the snapshot itself would then be pinned to provenance no
+    response ever stated.
+    """
+    forged = ResourceMetadata(
+        package_id=src.CKAN_PACKAGE_ID, resource_id=src.WLTP_RESOURCE_ID,
+        publisher="ministry_of_someone_else", dataset_title="Forged",
+        upstream_version="2099.12.31", upstream_version_kind="dataset_version",
+        retrieved_at="2099-12-31T00:00:00Z", metadata_response_sha256="f" * 64)
+    transport = FixtureTransport()
+    with pytest.raises(TypeError):
+        client(transport=transport).capture_resource(
+            src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY), metadata=forged)
+    assert transport.calls == []
+    assert repository.catalog_snapshots == {}
+
+
+def test_every_capture_reads_its_metadata_through_package_show():
+    transport = FixtureTransport()
+    capture = client(transport=transport).capture_resource(
+        src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    assert transport.calls[0][0] == src.PACKAGE_SHOW
+    assert capture.metadata.publisher == src.GOVERNMENT_PUBLISHER
+    assert capture.metadata.metadata_response_sha256 == \
+        hashlib.sha256(capture_fixtures.package_body()).hexdigest()
+
+
+FORGED_PACKAGE_METADATA = (
+    ("a forged publisher", "organization", {"name": "ministry_of_someone_else"},
+     "GOV_PUBLISHER_MISMATCH"),
+    ("a forged package identity", "name", "degem-rechev-wltp-copy",
+     "GOV_PACKAGE_IDENTITY_MISMATCH"),
+)
+
+
+@pytest.mark.parametrize("label,field,value,reason", FORGED_PACKAGE_METADATA,
+                         ids=[case[0] for case in FORGED_PACKAGE_METADATA])
+def test_forged_dataset_metadata_produces_no_capture_and_no_snapshot(
+        repository, label, field, value, reason):
+    """The allowlist decides WHICH dataset; `package_show` decides what it IS.
+
+    An allowed package and an allowed resource are necessary and not
+    sufficient: the publisher and the identity the response states are checked
+    too, before a single page is requested.
+    """
+    package = json.loads(capture_fixtures.package_body().decode("utf-8"))
+    package["result"][field] = value
+    transport = FixtureTransport(bodies={"package": encode(package)})
+    refuses(reason, client(transport=transport).capture_resource,
+            src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    assert [call[0] for call in transport.calls] == [src.PACKAGE_SHOW]
+
+    lease = leased_run(repository)
+    with pytest.raises(GovernmentSourceError):
+        GovernmentCatalogIngestor(repository, lease, client=client(transport=transport)) \
+            .ingest_resource(src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    assert repository.catalog_snapshots == {}
+    assert repository.catalog_raw_records == {}
+
+
+@pytest.mark.parametrize("label,version", [
+    ("a version the evidence contract would refuse", "not a version"),
+    ("an empty version", "   "),
+])
+def test_a_forged_source_version_produces_no_capture(label, version):
+    package = json.loads(capture_fixtures.package_body().decode("utf-8"))
+    for resource in package["result"]["resources"]:
+        resource.pop("revision_id", None)
+        resource["last_modified"] = version
+    transport = FixtureTransport(bodies={"package": encode(package)})
+    refuses("GOV_RESOURCE_UNVERSIONED", client(transport=transport).capture_resource,
+            src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    assert [call[0] for call in transport.calls] == [src.PACKAGE_SHOW]
+
+
+# --- 2. durable normalization state is PARSED, not assumed -------------------
+
+def stored_metadata(repository, snapshot_key):
+    return repository.catalog_snapshots[snapshot_key]["retrieval_metadata"]
+
+
+def ingested_then_metadata(repository, *, removed=(), **overrides):
+    """One real ingestion whose stored summary is then edited to a bad state."""
+    lease = leased_run(repository)
+    report = ingest(repository, lease)
+    metadata = stored_metadata(repository, report.snapshot_key)
+    for field in removed:
+        metadata.pop(field, None)
+    metadata.update(overrides)
+    return report
+
+
+CONTRADICTION = "GOV_NORM_LABEL_CONTRADICTION"
+
+#: Durable summaries that LOOK fine to an equality check and are not.
+#:
+#: Every one of these passed the old `_usability`, which asked only whether the
+#: contract string matched and whether one integer was zero -- so a snapshot
+#: whose recorded reading was missing, mistyped, internally inconsistent or
+#: simply invented answered queries as though it were whole.
+MALFORMED_NORMALIZATION_STATES = (
+    ("a missing normalized count", {"removed": ("normalized_record_count",)}),
+    ("a missing issue count", {"removed": ("normalization_issue_count",)}),
+    ("a missing issues list", {"removed": ("normalization_issues",)}),
+    ("a negative normalized count", {"normalized_record_count": -1}),
+    ("a negative issue count", {"normalization_issue_count": -1}),
+    ("a string normalized count", {"normalized_record_count": "233"}),
+    ("a string issue count", {"normalization_issue_count": "0"}),
+    ("a boolean issue count", {"normalization_issue_count": True}),
+    ("a list normalized count", {"normalized_record_count": []}),
+    ("an object normalized count", {"normalized_record_count": {}}),
+    ("counts that do not sum to the stored rows", {"normalized_record_count": 200}),
+    ("an issues list that is not a list", {"normalization_issues": {CONTRADICTION: 1}}),
+    ("an issue entry that is not an object", {"normalization_issue_count": 1,
+                                              "normalized_record_count": 232,
+                                              "normalization_issues": [CONTRADICTION],
+                                              "normalization_issue_records": ["38683"]}),
+    ("an issue entry with unexpected keys", {"normalization_issue_count": 1,
+                                             "normalized_record_count": 232,
+                                             "normalization_issues": [
+                                                 {"reason": CONTRADICTION, "count": 1,
+                                                  "note": "why"}],
+                                             "normalization_issue_records": ["38683"]}),
+    ("an unknown reason", {"normalization_issue_count": 1, "normalized_record_count": 232,
+                           "normalization_issues": [{"reason": "GOV_NORM_INVENTED",
+                                                     "count": 1}],
+                           "normalization_issue_records": ["38683"]}),
+    ("a zero reason count", {"normalization_issue_count": 1, "normalized_record_count": 232,
+                             "normalization_issues": [{"reason": CONTRADICTION, "count": 0}],
+                             "normalization_issue_records": ["38683"]}),
+    ("a boolean reason count", {"normalization_issue_count": 1, "normalized_record_count": 232,
+                                "normalization_issues": [{"reason": CONTRADICTION,
+                                                          "count": True}],
+                                "normalization_issue_records": ["38683"]}),
+    ("a repeated reason", {"normalization_issue_count": 2, "normalized_record_count": 231,
+                           "normalization_issues": [{"reason": CONTRADICTION, "count": 1},
+                                                    {"reason": CONTRADICTION, "count": 1}],
+                           "normalization_issue_records": ["38683", "38684"]}),
+    ("reason totals that disagree with the issue count",
+     {"normalization_issue_count": 2, "normalized_record_count": 231,
+      "normalization_issues": [{"reason": CONTRADICTION, "count": 1}],
+      "normalization_issue_records": ["38683", "38684"]}),
+    ("issues stated with a zero issue count",
+     {"normalization_issues": [{"reason": CONTRADICTION, "count": 1}]}),
+    ("issue records stated with a zero issue count",
+     {"normalization_issue_records": ["38683"]}),
+    ("an issue-record list that is not a list", {"normalization_issue_records": "38683"}),
+    ("a non-string issue record", {"normalization_issue_count": 1,
+                                   "normalized_record_count": 232,
+                                   "normalization_issues": [{"reason": CONTRADICTION,
+                                                             "count": 1}],
+                                   "normalization_issue_records": [38683]}),
+    ("more issue records than the durable bound",
+     {"normalization_issue_count": 40, "normalized_record_count": 193,
+      "normalization_issues": [{"reason": CONTRADICTION, "count": 40}],
+      "normalization_issue_records": [str(900000 + index) for index in range(11)]}),
+    ("fewer issue records than the issues name",
+     {"normalization_issue_count": 3, "normalized_record_count": 230,
+      "normalization_issues": [{"reason": CONTRADICTION, "count": 3}],
+      "normalization_issue_records": ["38683"]}),
+)
+
+
+@pytest.mark.parametrize("label,edit", MALFORMED_NORMALIZATION_STATES,
+                         ids=[case[0] for case in MALFORMED_NORMALIZATION_STATES])
+@pytest.mark.parametrize("acknowledged", [False, True], ids=["plain", "allow_incomplete"])
+def test_malformed_durable_normalization_state_is_refused(repository, label, edit,
+                                                          acknowledged):
+    """And `allow_incomplete` never reaches it.
+
+    An acknowledgement is for a REAL, consistently recorded gap. Malformed or
+    self-contradicting state is not a gap a caller can acknowledge, because
+    nothing about it can be relied on -- including the count it would be
+    acknowledging.
+    """
+    ingested_then_metadata(repository, **edit)
+    view = GovernmentCatalogProjection(repository, allow_incomplete=acknowledged)
+    with pytest.raises(GovernmentProjectionError) as failure:
+        view.dataset_metadata()
+    assert failure.value.reason_code == "GOV_PROJECTION_SNAPSHOT_STATE_INVALID"
+
+
+def test_a_snapshot_whose_candidates_went_missing_is_refused(repository):
+    """Clean-looking metadata, and nothing behind it.
+
+    The summary says 233 rows were read. If the candidates are not there, the
+    snapshot is not what it says it is, and answering an empty tree from it
+    would be the silent incompleteness the summary exists to prevent.
+    """
+    lease = leased_run(repository)
+    report = ingest(repository, lease)
+    repository.catalog_candidates.clear()
+    assert stored_metadata(repository, report.snapshot_key)["normalized_record_count"] == \
+        PINNED_TOTAL
+    for acknowledged in (False, True):
+        with pytest.raises(GovernmentProjectionError) as failure:
+            GovernmentCatalogProjection(repository,
+                                        allow_incomplete=acknowledged).dataset_metadata()
+        assert failure.value.reason_code == "GOV_PROJECTION_SNAPSHOT_STATE_INVALID"
+
+
+def test_two_candidates_for_one_raw_record_are_refused(repository):
+    """The count can be right while the SET is wrong.
+
+    Dropping one candidate and duplicating another keeps the total at 233, so
+    only a distinctness check catches it: one raw record must be read exactly
+    once, or a row is being counted for a vehicle it never described.
+    """
+    lease = leased_run(repository)
+    ingest(repository, lease)
+    keys = sorted(repository.catalog_candidates)
+    survivor = dict(repository.catalog_candidates[keys[0]])
+    dropped = keys[-1]
+    repository.catalog_candidates[dropped] = {
+        **survivor, "id": str(uuid4()),
+        "candidate_key": repository.catalog_candidates[dropped]["candidate_key"]}
+    assert len(repository.catalog_candidates) == PINNED_TOTAL
+    with pytest.raises(GovernmentProjectionError) as failure:
+        GovernmentCatalogProjection(repository).dataset_metadata()
+    assert failure.value.reason_code == "GOV_PROJECTION_SNAPSHOT_STATE_INVALID"
+
+
+def test_a_raw_only_snapshot_holding_a_candidate_is_refused(repository):
+    """A resource that states no identities cannot have read any."""
+    lease = leased_run(repository)
+    ingestor = GovernmentCatalogIngestor(repository, lease,
+                                         client=client(transport=quantity_transport()))
+    report = ingestor.ingest_resource(src.QUANTITY_RESOURCE_ID, query=dict(PINNED_QUERY))
+    snapshot = repository.catalog_snapshots[report.snapshot_key]
+    record = next(row for row in repository.catalog_raw_records.values()
+                  if row["snapshot_id"] == snapshot["id"])
+    repository.catalog_candidates[(snapshot["id"], "cc1." + "e" * 32)] = {
+        "id": str(uuid4()), "snapshot_id": snapshot["id"], "raw_record_id": record["id"],
+        "candidate_key": "cc1." + "e" * 32, "status": "candidate",
+        "manufacturer": "x", "commercial_model": "y", "model_year_start": 2021,
+        "model_year_end": 2021, "official_model_code": None, "trim": None,
+        "identity_dimensions": {}, "created_at": "2026-09-15T00:00:00+00:00"}
+    for acknowledged in (False, True):
+        with pytest.raises(GovernmentProjectionError) as failure:
+            GovernmentCatalogProjection(repository, resource_id=src.QUANTITY_RESOURCE_ID,
+                                        allow_incomplete=acknowledged).dataset_metadata()
+        assert failure.value.reason_code in ("GOV_PROJECTION_RESOURCE_NOT_NORMALIZED",
+                                             "GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+
+
+def test_a_consistently_recorded_gap_is_still_acknowledgeable(repository):
+    """The correction must not make a REAL gap unreadable."""
+    lease = leased_run(repository)
+    bodies, broken = contradictory_capture_bodies()
+    report = ingest(repository, lease, transport=FixtureTransport(bodies=bodies))
+    view = GovernmentCatalogProjection(repository, snapshot_key=report.snapshot_key,
+                                       allow_incomplete=True)
+    provenance = view.dataset_metadata()
+    assert provenance.normalization_issue_count == 1
+    assert provenance.normalization_issues == {CONTRADICTION: 1}
+    assert provenance.normalization_issue_records == tuple(broken)
+    assert view.list_variants("טויוטה", "RAV4", limit=200).total >= 1
+
+
+def test_a_projection_refusal_is_never_a_raw_python_error(repository):
+    """Every refusal on this path is a static, code-owned reason.
+
+    A `KeyError` or a `ValueError` escaping here would carry a field name, a
+    row or a traceback into a caller that is meant to receive a classification.
+    """
+    for edit in ({"normalized_record_count": None}, {"normalization_issues": None},
+                 {"normalization_issue_records": {}}):
+        repo = MemoryRepository()
+        ingested_then_metadata(repo, **edit)
+        with pytest.raises(GovernmentProjectionError) as failure:
+            GovernmentCatalogProjection(repo).dataset_metadata()
+        assert failure.value.reason_code in projection.GOVERNMENT_PROJECTION_REASONS
+        assert failure.value.safe_message
+
+
+# --- 3. the security documentation states the real boundary ------------------
+
+def test_the_documented_query_boundary_matches_the_code():
+    """The package documented "no caller-controlled query parameter". It does
+    accept caller-selected `q` and `filters` -- bounded, closed-key and echoed
+    back, but caller-selected. The claim is now the accurate one, and this test
+    pins the two together so the overclaim cannot come back.
+    """
+    for path in (GOVERNMENT_PACKAGE / "source.py", GOVERNMENT_PACKAGE / "client.py",
+                 Path("docs/catalog-pr2-government-ingestion.md")):
+        text = path.read_text(encoding="utf-8")
+        assert "no caller-controlled query parameter" not in text, path
+        assert "hostname, path or query parameter" not in text, path
+    boundary = (GOVERNMENT_PACKAGE / "source.py").read_text(encoding="utf-8")
+    assert "Two query parameters ARE caller-selectable" in boundary
+    assert "Paging -- `limit` and `offset` -- stays server-owned" in boundary
+
+    # And the code is what the claim describes: exactly two selectable keys,
+    # paging refused, and every value sent as a PARAMETER rather than spliced
+    # into a URL.
+    for allowed in ({"q": "RAV4"}, {"filters": '{"tozar":"x"}'}, {}):
+        client()._validated_query(allowed)
+    for refused in ({"limit": "10"}, {"offset": "5"}, {"sort": "_id"}, {"resource_id": "x"}):
+        refuses("GOV_QUERY_ECHO_MISMATCH", client()._validated_query, refused)
+
+    transport = FixtureTransport()
+    client(transport=transport).capture_resource(src.WLTP_RESOURCE_ID,
+                                                 query=dict(PINNED_QUERY))
+    for action, params in transport.calls:
+        assert "?" not in action and "&" not in action
+        assert set(params) <= {"id", "resource_id", "limit", "offset", "q", "filters"}
+    # Paging is the client's own, on every page it requested.
+    offsets = [params["offset"] for action, params in transport.calls
+               if action == src.DATASTORE_SEARCH]
+    assert offsets == ["0", "100", "200"]
+
+
+def test_no_sql_is_built_or_executed_anywhere_on_this_path():
+    """CKAN's SQL action is not on the allowlist, and no driver is reachable.
+
+    `datastore_search_sql` is the CKAN endpoint that would take a query string;
+    it is absent from the package entirely, so there is no SQL for a caller's
+    `q` or `filters` to reach. Nor can this package execute SQL of its own: it
+    holds no database driver and no cursor.
+    """
+    assert src.ALLOWED_ACTIONS == {src.PACKAGE_SHOW, src.DATASTORE_SEARCH}
+    for path in sorted(GOVERNMENT_PACKAGE.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for token in ("datastore_search_sql", "psycopg", "sqlalchemy", "sqlite3",
+                      ".execute(", "cursor(", "text(\"select", "raw_sql"):
+            assert token not in text, f"{path} names {token!r}"

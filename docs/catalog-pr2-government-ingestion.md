@@ -38,8 +38,9 @@ none is reachable from run input.
 | Actions | `package_show`, `datastore_search` — a closed allowlist; both reads |
 | Package | `degem-rechev-wltp`, allowlisted and checked **before** the transport is invoked |
 | Resources | `142afde2-6228-49f9-8a29-9b6c3a0cbe40` (WLTP models — identity material), `5e87a7a1-2f6f-41c1-8aec-7216d52a6cf6` (quantities by manufacturer/model/production year) |
-| URL construction | built by `action_url` from the closed action allowlist; no caller-controlled URL, hostname, path or query parameter anywhere in the package |
+| URL construction | built by `action_url` from the closed action allowlist |
 | Identity checks | `require_allowed_package` and `require_allowed_resource` run **first**, so an identity this code may not read is never asked for; the response is then held to the same identity independently |
+| Dataset metadata | always read through `package_show`; `ResourceMetadata` is a **result** of that path and can never be supplied by a caller |
 | Paging | the client chooses its own offsets at a fixed page size (`DEFAULT_PAGE_LIMIT = 100`, hard ceiling `MAX_PAGE_LIMIT = 1000`); a caller may supply only `q` and/or `filters` |
 | Bounds per capture | `MAX_PAGES_PER_CAPTURE = 200`, `MAX_RECORDS_PER_CAPTURE = 120 000`, `MAX_RESPONSE_BYTES = 8 MiB`, one row bounded by the durable `MAX_RAW_PAYLOAD_CHARS = 16 384` |
 | Timeouts | `CONNECT_TIMEOUT_SECONDS = 10.0`, `READ_TIMEOUT_SECONDS = 30.0` — finite and separate |
@@ -47,6 +48,22 @@ none is reachable from run input.
 | Redirects | never followed; a response whose final URL is not on the approved scheme, host and `/api/3/action/` path is refused |
 | Credentials | none exist on this path — no token, no cookie, no `Authorization` header, and `trust_env` is off on the session |
 | Provider/model calls | none anywhere in the package (asserted by test over every module) |
+
+### What is and is not caller-controlled
+
+Stated exactly, because the earlier wording ("no caller-controlled query
+parameter") was an overclaim:
+
+| | |
+| --- | --- |
+| **Not caller-controlled** | the URL, the scheme, the host, the path, the CKAN action, the package and the resource — each from a closed allowlist checked before the transport is invoked |
+| **Not caller-controlled** | `limit` and `offset`. Paging is server-owned, because the completeness gate is arithmetic over the offsets the client chose |
+| **Caller-selectable, bounded** | `q` and `filters`, and nothing else. `_validated_query` refuses any other key, bounds the value, and requires every page to echo it back in both directions |
+
+Every value is handed to the transport as a **parameter** and encoded by the
+HTTP client. Nothing concatenates a value into a URL —
+`canonical_request_url` percent-encodes for provenance only and is never the
+string the transport is given — and nothing on this path builds SQL at all.
 
 `backend/catalog/government/transport.py` is the **only** module that can open
 a socket. A test asserts every other module in the package names no HTTP
@@ -257,7 +274,26 @@ on resume. That is safe here for two specific reasons and only those: every
 upstream call is read-only, and every durable write is idempotent on a key
 derived from content.
 
-## 8. An active snapshot states its own reading gap
+## 8. The internal trust boundary, stated plainly
+
+`DataGovClient.capture_resource` is the only thing in this package that turns a
+response into a `ResourceCapture`, and it is where the guarantees live: the
+allowlists, the `package_show` publisher/identity/version checks, the per-page
+echo checks and the completeness gate.
+
+`GovernmentCatalogIngestor.ingest_capture` **trusts its argument**. It is an
+internal seam — it exists so a capture can be taken once and landed without a
+second transport — and a `ResourceCapture` built by hand is a Python object with
+the right fields and nothing more: not remotely verified, not cryptographically
+attested, and carrying no evidence that its digests were ever computed over
+bytes a server sent. Callers that need the guarantees call `ingest_resource`.
+
+The digests in this document describe **what was captured**, so that two
+captures can be compared and a replay recognised. They are not an attestation
+that the capture came from `data.gov.il`; that comes from the validated path
+above, and from nowhere else.
+
+## 9. An active snapshot states its own reading gap
 
 An active snapshot may legitimately hold rows this catalog could not read: a
 code/label contradiction is the register disagreeing with itself, and inventing
@@ -282,6 +318,23 @@ off the snapshot rather than restating what the caller just computed, and a
 replay whose freshly computed summary disagrees with the stored one fails closed
 with `GOV_SNAPSHOT_NORMALIZATION_DRIFT` rather than reusing a snapshot that was
 read under different rules.
+
+**And the stored summary is PARSED, never taken on trust.**
+`parse_normalization_state` refuses a snapshot whose recorded reading is
+missing, mistyped, out of range or internally inconsistent — both counts must be
+JSON integers (a boolean is not one), they must sum to the snapshot's own
+`stored_record_count`, every reason must be in the refusal vocabulary with a
+positive count and no repeats, the counts must sum to the issue count, and the
+bounded id list must be exactly as long as the issue count implies. Zero issues
+means both lists are empty. After the rows are read, the candidates must match
+too: as many as the summary claims, each naming a **distinct** raw record **of
+this snapshot** — so a dropped candidate cannot hide behind a duplicated one.
+Every failure is `GOV_PROJECTION_SNAPSHOT_STATE_INVALID`; no `KeyError` or
+`ValueError` escapes this layer.
+
+`allow_incomplete=True` acknowledges a real, consistently recorded gap. It never
+reaches malformed or self-contradicting state, because nothing about such state
+can be relied on — including the count that would be acknowledged.
 
 **An incomplete snapshot is not usable.** The projection answers from the newest
 snapshot that is active AND free of unresolved issues, so a newer capture that
@@ -320,7 +373,7 @@ otherwise dropped **whole** — never truncated, since a truncated list would be
 snapshot claiming page provenance it does not carry. `page_chain_sha256` commits
 to every checksum either way.
 
-## 9. The internal query layer (for PR3)
+## 10. The internal query layer (for PR3)
 
 `backend/catalog/government/projection.py` is a service/query component: a plain
 class with typed methods. **It is not a `Tool`** — no operations mapping, no
@@ -345,7 +398,7 @@ fits easily; a capture of the whole ~101 000-row WLTP resource does not, and is
 deliberately out of scope for PR2 — answering it needs database-side aggregation
 and ordering, which belongs with the tool that will consume it.
 
-## 10. What remains fixture-only, and what is deferred
+## 11. What remains fixture-only, and what is deferred
 
 **Fixture-backed.** Every test reads the committed R5 Government capture —
 `q=RAV4&limit=100` over the WLTP resource, offsets 0/100/200, counts

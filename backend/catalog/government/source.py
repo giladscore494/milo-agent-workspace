@@ -8,12 +8,24 @@ reviewer can check here rather than a claim about a call site.
 The URL is BUILT, never supplied
 --------------------------------
 
-There is no caller-controlled URL, hostname, path or query parameter anywhere
-in this package. A call names an ACTION, a PACKAGE and a RESOURCE, each from a
-closed allowlist checked BEFORE the transport is invoked, and `action_url`
-assembles the one URL that can result, on the one scheme and the one host
-below. A response that arrives from any other host -- including via a redirect
--- is refused rather than read.
+The URL, the scheme, the host, the path, the action, the package and the
+resource are NOT caller-controlled. A call names an ACTION, a PACKAGE and a
+RESOURCE, each from a closed allowlist checked BEFORE the transport is invoked,
+and `action_url` assembles the one URL that can result, on the one scheme and
+the one host below. A response that arrives from any other host -- including
+via a redirect -- is refused rather than read.
+
+Two query parameters ARE caller-selectable, and saying otherwise would be an
+overclaim: `q` and `filters`. They are bounded and their key vocabulary is
+closed (`DataGovClient._validated_query` refuses any other key, bounds the
+value, and requires every page to echo it back), but the VALUES may come from a
+caller. Paging -- `limit` and `offset` -- stays server-owned, because the
+completeness gate is arithmetic over the offsets this client chose.
+
+Every value is handed to the transport as a parameter and encoded by the HTTP
+client; `canonical_request_url` percent-encodes for PROVENANCE only and is
+never the string the transport is given. Nothing here concatenates a value into
+a URL, and nothing on this path builds SQL.
 
 The ordering matters and is not incidental. An identity that is only checked
 against the RESPONSE has already been sent, so `require_allowed_package` and

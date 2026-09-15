@@ -43,13 +43,15 @@ and nothing here promotes anything to the canonical catalog.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
 from backend.runtime import CancellationRequested
 
 from . import source as src
-from .normalize import (GovernmentNormalizationError, NORMALIZATION_CONTRACT,
+from .normalize import (GOVERNMENT_NORMALIZATION_REASONS, GovernmentNormalizationError,
+                        MAX_DURABLE_ISSUE_RECORDS, NORMALIZATION_CONTRACT,
                         RAW_ONLY_CONTRACT, UNMAPPED_FIELDS, read_wltp_record)
 
 #: The largest number of candidates one snapshot may be projected from in a
@@ -83,6 +85,8 @@ GOVERNMENT_PROJECTION_REASONS: Mapping[str, str] = {
         "that government resource is captured raw-only and states no vehicle identities",
     "GOV_PROJECTION_SNAPSHOT_NOT_READ":
         "that government snapshot records no reading of its rows at all",
+    "GOV_PROJECTION_SNAPSHOT_STATE_INVALID":
+        "that government snapshot's recorded reading is malformed or disagrees with its rows",
 }
 
 #: The ONE refusal an explicit acknowledgement may bypass.
@@ -104,6 +108,29 @@ class GovernmentProjectionError(ValueError):
         self.reason_code = reason_code
         self.safe_message = GOVERNMENT_PROJECTION_REASONS[reason_code]
         super().__init__(self.safe_message)
+
+
+@dataclass(frozen=True)
+class NormalizationState:
+    """A snapshot's recorded reading, PARSED rather than taken on trust.
+
+    `_usability` used to ask two questions of the stored metadata -- does the
+    contract string match, and is one integer zero -- and treat the answer as
+    the truth. Everything else about the summary was accepted as written, so a
+    recorded reading that was missing, mistyped, self-contradicting or simply
+    invented produced a snapshot that answered queries as though it were whole.
+
+    This type exists so that the only way to reach a projection is through a
+    parse that either yields a consistent state or refuses. Constructing one
+    means every field was present, of the right type, in range, and in
+    agreement with the snapshot's own row counts.
+    """
+
+    contract: str
+    normalized_record_count: int
+    issue_count: int
+    issues: Mapping[str, int]
+    issue_records: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -247,6 +274,105 @@ class RecordView:
     variants: tuple[VariantView, ...] = ()
 
 
+#: What a durable issue-record id may look like. The register's own `_id` is an
+#: integer, so a stored id is its decimal text: bounded, and never a path, a
+#: locator or free text that a reader might be tempted to resolve.
+_ISSUE_RECORD_PATTERN = re.compile(r"^[0-9]{1,20}$")
+
+#: Exactly the keys one durable issue entry carries. Closed in BOTH directions:
+#: a missing key and an extra one are equally a refusal, because an entry this
+#: code does not fully understand is not an entry it may count.
+_ISSUE_ENTRY_KEYS = frozenset({"reason", "count"})
+
+
+def _whole(value: Any) -> int | None:
+    """A non-negative JSON integer, or None. `True` is not 1 here."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def parse_normalization_state(snapshot: Mapping[str, Any]) -> NormalizationState:
+    """Read a snapshot's recorded reading STRICTLY, or refuse it.
+
+    Every rule below is a way the stored summary could be wrong while still
+    satisfying an equality check on the contract string, and each one is a
+    refusal rather than a coercion:
+
+    *   both counts present, JSON integers, non-negative -- and `True`/`False`
+        are not integers here, because a boolean that reads as 1 would let a
+        malformed summary pass as a count;
+    *   the two counts SUM to the snapshot's own `stored_record_count`, so a
+        summary cannot describe a different number of rows than the snapshot
+        holds;
+    *   `normalization_issues` is a list of `{reason, count}` objects and
+        nothing else: every reason is in the normalization refusal vocabulary,
+        no reason repeats, every count is a POSITIVE integer, and the counts sum
+        to exactly `normalization_issue_count`;
+    *   `normalization_issue_records` is a bounded list of distinct id strings,
+        and its length is exactly what the issue count implies given the durable
+        bound -- so neither an invented id nor a quietly dropped one survives;
+    *   zero issues means an empty reason list AND an empty record list.
+
+    A raw-only snapshot states no reading at all, so it is held to zeroes and
+    empty lists rather than to the rules above.
+
+    Never raises anything but `GovernmentProjectionError`: a `KeyError` or a
+    `ValueError` escaping here would carry a field name or a row into a caller
+    that is meant to receive a classification.
+    """
+    metadata = snapshot.get("retrieval_metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    contract = metadata.get("normalization_contract")
+    if contract not in (RAW_ONLY_CONTRACT, NORMALIZATION_CONTRACT):
+        raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_NOT_READ")
+
+    normalized = _whole(metadata.get("normalized_record_count"))
+    issue_count = _whole(metadata.get("normalization_issue_count"))
+    entries = metadata.get("normalization_issues")
+    records = metadata.get("normalization_issue_records")
+    if normalized is None or issue_count is None or not isinstance(entries, list) \
+            or not isinstance(records, list):
+        raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+
+    stored = _whole(snapshot.get("stored_record_count"))
+    if stored is None:
+        raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+
+    if contract == RAW_ONLY_CONTRACT:
+        # Nothing was read, so nothing may be claimed.
+        if normalized or issue_count or entries or records:
+            raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+        return NormalizationState(contract=contract, normalized_record_count=0,
+                                  issue_count=0, issues={}, issue_records=())
+
+    if normalized + issue_count != stored:
+        raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+
+    issues: dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != _ISSUE_ENTRY_KEYS:
+            raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+        reason, count = entry.get("reason"), _whole(entry.get("count"))
+        if reason not in GOVERNMENT_NORMALIZATION_REASONS or reason in issues \
+                or count is None or count < 1:
+            raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+        issues[str(reason)] = count
+    if sum(issues.values()) != issue_count:
+        raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+
+    if any(not isinstance(record, str) or not _ISSUE_RECORD_PATTERN.fullmatch(record)
+           for record in records) or len(set(records)) != len(records):
+        raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+    # The list is bounded, so its length is decided: every refused row while
+    # they fit, and exactly the bound once they do not.
+    if len(records) != min(issue_count, MAX_DURABLE_ISSUE_RECORDS):
+        raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+    return NormalizationState(contract=str(contract), normalized_record_count=normalized,
+                              issue_count=issue_count, issues=dict(sorted(issues.items())),
+                              issue_records=tuple(records))
+
+
 def _bounded(limit: int) -> int:
     return max(1, min(int(limit), MAX_RESULT_ITEMS))
 
@@ -331,20 +457,24 @@ class GovernmentCatalogProjection:
     def _usability(snapshot: Mapping[str, Any]) -> str | None:
         """Why this snapshot may not answer a query, or None if it may.
 
-        Read from the snapshot's OWN durable metadata, so usability is a
-        property of the stored row rather than of whatever the reader recomputes
-        -- which is what stops a raw-complete but semantically incomplete
-        capture from quietly becoming the newest answer.
+        Read from the snapshot's OWN durable metadata, and PARSED before it is
+        read -- so usability is a property of a state that was checked, not of
+        two fields that happened to look right.
         """
-        metadata = snapshot.get("retrieval_metadata") or {}
+        metadata = snapshot.get("retrieval_metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
         contract = metadata.get("normalization_contract")
-        if contract == RAW_ONLY_CONTRACT:
-            return "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED"
-        if contract != NORMALIZATION_CONTRACT:
+        if contract not in (RAW_ONLY_CONTRACT, NORMALIZATION_CONTRACT):
             # No stated reading at all: a snapshot that cannot say what it is
             # missing is not a snapshot this layer will answer from.
             return "GOV_PROJECTION_SNAPSHOT_NOT_READ"
-        if int(metadata.get("normalization_issue_count") or 0) > 0:
+        try:
+            state = parse_normalization_state(snapshot)
+        except GovernmentProjectionError as refusal:
+            return refusal.reason_code
+        if state.contract == RAW_ONLY_CONTRACT:
+            return "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED"
+        if state.issue_count > 0:
             return "GOV_PROJECTION_SNAPSHOT_INCOMPLETE"
         return None
 
@@ -360,10 +490,12 @@ class GovernmentCatalogProjection:
         if self._cache is not None:
             return self._cache
         snapshot = self._active_snapshot()
+        state = parse_normalization_state(snapshot)
         records = {str(row["id"]): row
                    for row in self._read_all(self._repository.list_catalog_raw_records,
                                              snapshot["id"])}
         candidates = self._read_all(self._repository.list_catalog_candidates, snapshot["id"])
+        self._require_candidates_match(state, candidates, records)
         provenance = _provenance_of(snapshot)
         views: list[VariantView] = []
         for candidate in candidates:
@@ -380,6 +512,41 @@ class GovernmentCatalogProjection:
         self._cache = (provenance, tuple(views),
                        {str(row["upstream_record_id"]): row for row in records.values()})
         return self._cache
+
+    @staticmethod
+    def _require_candidates_match(state: NormalizationState,
+                                  candidates: Sequence[Mapping[str, Any]],
+                                  records: Mapping[str, Mapping[str, Any]]) -> None:
+        """The rows must BE what the recorded reading says they are.
+
+        The summary is durable and the candidates are durable, and nothing in
+        the schema ties the two together -- so a summary claiming 233 readings
+        can sit above a snapshot holding none, and a projection that trusted it
+        would answer an empty tree while reporting a complete capture.
+
+        Three things are checked, and each catches something the others do not:
+
+        *   the CARDINALITY -- as many candidates as the summary says were read;
+        *   the DISTINCTNESS -- one raw record read at most once, so a dropped
+            candidate cannot be hidden by a duplicated one while the count
+            still balances;
+        *   the OWNERSHIP -- every candidate names a raw record of this
+            snapshot, so a count cannot be made up out of another capture's
+            rows.
+
+        The raw-only branch is defence in depth: `_active_snapshot` refuses such
+        a snapshot outright, so this is unreachable through the ordinary path
+        and exists so the invariant survives if that gate ever moves.
+        """
+        if state.contract == RAW_ONLY_CONTRACT:
+            if candidates:
+                raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
+            return
+        owners = [str(candidate.get("raw_record_id")) for candidate in candidates]
+        if len(candidates) != state.normalized_record_count \
+                or len(set(owners)) != len(owners) \
+                or any(owner not in records for owner in owners):
+            raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_STATE_INVALID")
 
     def _read_all(self, reader: Callable[..., Sequence[Mapping[str, Any]]],
                   snapshot_id: Any) -> list[Mapping[str, Any]]:
@@ -552,8 +719,15 @@ class GovernmentCatalogProjection:
 
 
 def _provenance_of(snapshot: Mapping[str, Any]) -> DatasetProvenance:
-    """Read a snapshot row into provenance, using only what it stored."""
-    metadata = snapshot.get("retrieval_metadata") or {}
+    """Read a snapshot row into provenance, using only what it stored.
+
+    The reading gap comes from the PARSED state rather than from the raw
+    metadata, so a provenance object can never carry a count this layer refused
+    to believe.
+    """
+    metadata = snapshot.get("retrieval_metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    state = parse_normalization_state(snapshot)
     return DatasetProvenance(
         snapshot_id=str(snapshot["id"]), snapshot_key=str(snapshot["snapshot_key"]),
         source_family=str(snapshot["source_family"]), trust_state=str(snapshot["trust_state"]),
@@ -567,18 +741,20 @@ def _provenance_of(snapshot: Mapping[str, Any]) -> DatasetProvenance:
         content_sha256=str(snapshot["content_sha256"]),
         schema_fingerprint=str(metadata.get("schema_fingerprint") or ""),
         page_chain_sha256=str(metadata.get("page_chain_sha256") or ""),
-        page_count=int(metadata.get("page_count") or 0),
+        # From the jsonb blob rather than a typed column, so it is read through
+        # the same total helper the state parser uses: a value that is not a
+        # whole number reports as 0 rather than raising a TypeError out of a
+        # layer whose refusals are meant to be classifications.
+        page_count=_whole(metadata.get("page_count")) or 0,
         declared_record_count=int(snapshot["declared_record_count"]),
         stored_record_count=int(snapshot["stored_record_count"]),
         retrieved_at=str(snapshot["retrieved_at"]), activated_at=str(snapshot["activated_at"]),
         query={str(key): str(value) for key, value in (metadata.get("query") or {}).items()},
-        normalization_contract=str(metadata.get("normalization_contract") or ""),
-        normalized_record_count=int(metadata.get("normalized_record_count") or 0),
-        normalization_issue_count=int(metadata.get("normalization_issue_count") or 0),
-        normalization_issues={str(entry["reason"]): int(entry["count"])
-                              for entry in metadata.get("normalization_issues") or []},
-        normalization_issue_records=tuple(
-            str(record) for record in metadata.get("normalization_issue_records") or ()))
+        normalization_contract=state.contract,
+        normalized_record_count=state.normalized_record_count,
+        normalization_issue_count=state.issue_count,
+        normalization_issues=dict(state.issues),
+        normalization_issue_records=state.issue_records)
 
 
 def _variant_view(candidate: Mapping[str, Any], record: Mapping[str, Any],
@@ -617,7 +793,8 @@ def _variant_view(candidate: Mapping[str, Any], record: Mapping[str, Any],
 
 
 __all__ = ["ACKNOWLEDGEABLE_REFUSALS", "DEFAULT_RESULT_ITEMS",
-           "GOVERNMENT_PROJECTION_REASONS",
+           "GOVERNMENT_PROJECTION_REASONS", "NormalizationState",
+           "parse_normalization_state",
            "MAX_PROJECTION_CANDIDATES", "MAX_RESULT_ITEMS", "UNMAPPED_FIELDS",
            "DatasetProvenance", "GovernmentCatalogProjection", "GovernmentProjectionError",
            "ManufacturerSummary", "ModelSummary", "ModelYearSummary", "RecordView",

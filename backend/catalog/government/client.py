@@ -5,10 +5,24 @@ Scope
 
 Two CKAN actions, both reads: `package_show` for the dataset's own identity and
 version, and `datastore_search` for the rows. No write, no credential, no CKAN
-query language, no SQL, no provider or model call anywhere on this path, and no
-caller-controlled URL or hostname -- the client names an ALLOWLISTED action and
-an ALLOWLISTED resource and `source.action_url` builds the one URL that can
-result.
+query language, no SQL, and no provider or model call anywhere on this path.
+
+What a caller may and may not choose, exactly:
+
+*   **NOT caller-controlled**: the URL, the scheme, the host, the path, the
+    action, the package and the resource. Each comes from a closed allowlist
+    checked before the transport is invoked, and `source.action_url` builds the
+    one URL that can result.
+*   **NOT caller-controlled**: `limit` and `offset`. Paging is this client's
+    business, because the completeness gate is arithmetic over the offsets it
+    chose.
+*   **Caller-selectable, bounded**: `q` and `filters`, and nothing else --
+    `_validated_query` refuses any other key, bounds the value and requires
+    every page to echo it back.
+
+Every query value is handed to the transport as a PARAMETER and encoded by the
+HTTP client. Nothing here concatenates a value into a URL, and nothing on this
+path builds SQL at all.
 
 A capture is COMPLETE or it is a refusal
 ----------------------------------------
@@ -281,22 +295,27 @@ class DataGovClient:
         raise GovernmentSourceError("GOV_RESOURCE_UNVERSIONED")
 
     def capture_resource(self, resource_id: str, *, package_id: str = src.CKAN_PACKAGE_ID,
-                         query: Mapping[str, str] | None = None,
-                         metadata: ResourceMetadata | None = None) -> ResourceCapture:
+                         query: Mapping[str, str] | None = None) -> ResourceCapture:
         """Read ONE complete bounded query over one allowlisted resource.
 
         `query` holds the non-paging parameters -- `q` and/or `filters` -- and
         is echoed back by every page or the capture fails. Omitting it captures
         the WHOLE resource, page by page, under exactly the same bounds.
+
+        THE METADATA IS ALWAYS READ HERE, through `package_show`. There is no
+        override, deliberately: `ResourceMetadata` carries the publisher, the
+        source version and the digest of the metadata response -- the three
+        things `package_show` validates -- so accepting one from a caller would
+        let all three be invented while an allowlist check on the package and
+        the resource still passed, and every page, every raw record and the
+        snapshot itself would be pinned to provenance no response ever stated.
+        `ResourceMetadata` is a RESULT of this path and never an input to it.
         """
         package = src.require_allowed_package(package_id)
         identifier = src.require_allowed_resource(resource_id)
         selection = self._validated_query(query)
         started_at = self._clock()
-        if metadata is None:
-            metadata = self.package_show(identifier, package_id=package)
-        elif metadata.resource_id != identifier or metadata.package_id != package:
-            raise GovernmentSourceError("GOV_RESOURCE_ECHO_MISMATCH")
+        metadata = self.package_show(identifier, package_id=package)
 
         pages: list[CapturedPage] = []
         seen_ids: set[int] = set()

@@ -216,8 +216,24 @@ class GovernmentCatalogIngestor:
         return self.ingest_capture(capture)
 
     def ingest_capture(self, capture: ResourceCapture) -> IngestionReport:
-        """Land an ALREADY-VALIDATED capture. Separated so a capture can be
-        taken once and landed under test without a second transport."""
+        """Land a capture this process already took. AN INTERNAL SEAM.
+
+        Stated accurately, because the distinction matters: this method TRUSTS
+        its argument. The validation that makes a `ResourceCapture` meaningful
+        -- the allowlists, the publisher and version checks, the per-page echo
+        checks, the completeness gate -- all live in
+        `DataGovClient.capture_resource`, which is the only thing in this
+        package that produces one from a response. A `ResourceCapture` built by
+        hand is a Python object with the right fields and nothing more: it is
+        not remotely verified, not cryptographically attested, and carries no
+        evidence that any of its digests were ever computed over bytes a server
+        sent.
+
+        It is separated from `ingest_resource` so a capture can be taken once
+        and landed without a second transport -- which is a test convenience,
+        and is why this method is not a public entry point. Callers that need
+        the guarantees call `ingest_resource`.
+        """
         self._check_cancelled()
         # Read the WHOLE capture before opening the snapshot. The summary the
         # snapshot carries and the candidates the database receives then come
