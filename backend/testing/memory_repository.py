@@ -15,7 +15,8 @@ from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
-                                       stated_identity_dimensions, trust_state_for)
+                                       stated_identity_dimensions, stated_source_locator,
+                                       trust_state_for)
 from backend.catalog.digest import catalog_payload_digest
 from backend.engines.swarm_v2.evidence_bounds import FRAGMENT_TYPES
 from backend.engines.swarm_v2.evidence_contracts import (fragment_type_for,
@@ -829,7 +830,8 @@ class MemoryRepository:
     _CATALOG_SNAPSHOT_IDENTITY = ("source_family", "resource_id", "upstream_version",
                                   "upstream_version_kind", "content_sha256",
                                   "declared_record_count")
-    _CATALOG_RECORD_IDENTITY = ("upstream_record_id", "payload_sha256", "payload")
+    _CATALOG_RECORD_IDENTITY = ("upstream_record_id", "payload_sha256", "payload",
+                                "source_locator")
     _CATALOG_CANDIDATE_IDENTITY = ("raw_record_id", "manufacturer", "commercial_model",
                                    "model_year_start", "model_year_end",
                                    "official_model_code", "trim", "identity_dimensions")
@@ -948,12 +950,26 @@ class MemoryRepository:
                                "catalog raw record resource mismatch", 400)
             # The digest is derived from the stored payload, exactly as the
             # database derives it -- never predicted by the caller.
-            record = {**record, "payload_sha256": catalog_payload_digest(record["payload"])}
+            # The locator is the record's position in the capture: validated
+            # against the closed vocabulary, and normalized to `{}` when the
+            # retrieval had no pagination, exactly as the column's default is.
+            record = {**record, "payload_sha256": catalog_payload_digest(record["payload"]),
+                      "source_locator": stated_source_locator(record.get("source_locator"))}
             key = (snapshot["id"], record["record_key"])
             existing = self.catalog_raw_records.get(key)
             if existing is not None:
                 return self._catalog_replay(existing, record,
                                             self._CATALOG_RECORD_IDENTITY, "RECORD")
+            # One POSITION belongs to one row. Mirrors the partial unique index
+            # `catalog_raw_records_snapshot_position_uidx`: a record that states
+            # no position collides with nothing.
+            position = record["source_locator"].get("capture_index")
+            if position is not None and any(
+                    row["snapshot_id"] == snapshot["id"]
+                    and (row.get("source_locator") or {}).get("capture_index") == position
+                    for row in self.catalog_raw_records.values()):
+                raise AppError("CATALOG_RECORD_DUPLICATE",
+                               "catalog_raw_records_snapshot_position_uidx", 409)
             row = {"id": str(uuid4()), "snapshot_id": snapshot["id"],
                    "resource_id": snapshot["resource_id"], "record_key": key[1],
                    **{field: record.get(field) for field in self._CATALOG_RECORD_IDENTITY},
@@ -1113,6 +1129,45 @@ class MemoryRepository:
                    "created_at": _now()}
             self.catalog_evidence_links[key] = row
             return dict(row)
+
+    # --- durable catalog reads ------------------------------------------------
+    #
+    # Mirrors of the Supabase reads, including the parts that MATTER for a
+    # query layer to be meaningful: only ACTIVE snapshots are visible, every
+    # ordering is by an ASCII key that is unique within its scope, and every
+    # read is bounded and offset-paged.
+
+    MAX_CATALOG_SNAPSHOT_ROWS = 50
+    MAX_CATALOG_RECORD_ROWS = 500
+    MAX_CATALOG_CANDIDATE_ROWS = 500
+
+    def list_active_catalog_snapshots(self, source_family: str, *, resource_id: Any = None,
+                                      limit: int = MAX_CATALOG_SNAPSHOT_ROWS) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = [dict(row) for row in self.catalog_snapshots.values()
+                    if row.get("source_family") == str(source_family)
+                    and row.get("activated_at") is not None
+                    and (resource_id is None or row.get("resource_id") == str(resource_id))]
+        rows.sort(key=lambda row: (row["activated_at"], row["snapshot_key"]), reverse=True)
+        return rows[:max(1, min(int(limit), self.MAX_CATALOG_SNAPSHOT_ROWS))]
+
+    def list_catalog_raw_records(self, snapshot_id: Any, *, limit: int = MAX_CATALOG_RECORD_ROWS,
+                                 offset: int = 0) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = [dict(row) for row in self.catalog_raw_records.values()
+                    if row["snapshot_id"] == str(snapshot_id)]
+        rows.sort(key=lambda row: row["record_key"])
+        start = max(0, int(offset))
+        return rows[start:start + max(1, min(int(limit), self.MAX_CATALOG_RECORD_ROWS))]
+
+    def list_catalog_candidates(self, snapshot_id: Any, *, limit: int = MAX_CATALOG_CANDIDATE_ROWS,
+                                offset: int = 0) -> list[dict[str, Any]]:
+        with self.lock:
+            rows = [dict(row) for row in self.catalog_candidates.values()
+                    if row["snapshot_id"] == str(snapshot_id)]
+        rows.sort(key=lambda row: row["candidate_key"])
+        start = max(0, int(offset))
+        return rows[start:start + max(1, min(int(limit), self.MAX_CATALOG_CANDIDATE_ROWS))]
 
     def _catalog_snapshot_by_id(self, snapshot_id: Any) -> dict[str, Any]:
         snapshot = next((row for row in self.catalog_snapshots.values()
