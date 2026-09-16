@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -33,17 +33,72 @@ describe('static UI marker coverage after component extraction', () => {
   });
 
   it('fails deterministically and names a marker that disappears from components', () => {
-    const workspace = mkdtempSync(join(tmpdir(), 'milo-static-ui-'));
-    try {
-      for (const root of ['app', 'components', 'lib']) {
-        cpSync(resolve(process.cwd(), root), join(workspace, root), { recursive: true });
-      }
+    withWorkspace((workspace) => {
       rmSync(join(workspace, 'components/run/RunOutputPanel.tsx'));
       const result = spawnSync('node', [SCRIPT], { cwd: workspace, encoding: 'utf8' });
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain('Missing UI marker: Final artifacts');
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
+    });
+  });
+});
+
+/** Copy the scanned roots into a scratch tree so a failure case can be staged. */
+function withWorkspace(body: (workspace: string) => void): void {
+  const workspace = mkdtempSync(join(tmpdir(), 'milo-static-ui-'));
+  try {
+    for (const root of ['app', 'components', 'lib']) {
+      cpSync(resolve(process.cwd(), root), join(workspace, root), { recursive: true });
     }
+    body(workspace);
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
+describe('final-result surface construct guard', () => {
+  it('requires the final-result surface to exist at all', () => {
+    withWorkspace((workspace) => {
+      rmSync(join(workspace, 'components/result'), { recursive: true });
+      const result = spawnSync('node', [SCRIPT], { cwd: workspace, encoding: 'utf8' });
+      expect(result.status).not.toBe(0);
+      // It fails on the missing markers first; either way it never passes.
+      expect(result.stderr).toMatch(/Missing final-result marker|no final-result surface/);
+    });
+  });
+
+  for (const forbidden of ['JSON.stringify', 'dangerouslySetInnerHTML']) {
+    it(`rejects ${forbidden} used as CODE in the final-result surface`, () => {
+      withWorkspace((workspace) => {
+        const file = join(workspace, 'components/result/FinalResultPanel.tsx');
+        const body = readFileSync(file, 'utf8');
+        writeFileSync(file, `${body}\nconst leak = ${forbidden};\n`);
+        const result = spawnSync('node', [SCRIPT], { cwd: workspace, encoding: 'utf8' });
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain(`Forbidden construct ${forbidden}`);
+      });
+    });
+  }
+
+  it('allows a doc comment to NAME the construct it forbids', () => {
+    // Otherwise the only way to document the rule would be to avoid saying
+    // what it forbids, which is how a rule quietly stops being understood.
+    withWorkspace((workspace) => {
+      const file = join(workspace, 'components/result/FinalResultPanel.tsx');
+      const body = readFileSync(file, 'utf8');
+      writeFileSync(file, `/* never JSON.stringify the payload */\n// and no dangerouslySetInnerHTML\n${body}`);
+      const result = spawnSync('node', [SCRIPT], { cwd: workspace, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+    });
+  });
+
+  it('does not let a URL swallow real code on the same line', () => {
+    withWorkspace((workspace) => {
+      const file = join(workspace, 'components/result/FinalResultPanel.tsx');
+      const body = readFileSync(file, 'utf8');
+      writeFileSync(file, `${body}\nconst x = 'https://example.com'; const leak = JSON.stringify;\n`);
+      const result = spawnSync('node', [SCRIPT], { cwd: workspace, encoding: 'utf8' });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('Forbidden construct JSON.stringify');
+    });
   });
 });

@@ -8,6 +8,10 @@ export const USERS = {
 
 export const PROJECT_ALPHA = 'bbbbbbbb-1111-4111-8111-000000000001';
 export const PROJECT_BETA = 'bbbbbbbb-1111-4111-8111-000000000002';
+/** The seeded `workflow_key = swarm_v2` project. Alice is a member of it. */
+export const PROJECT_GAMMA = 'bbbbbbbb-1111-4111-8111-000000000003';
+/** Every project Alice is a member of, in the order the repository seeds them. */
+export const ALICE_PROJECTS = [PROJECT_ALPHA, PROJECT_GAMMA];
 
 const MOCK_SUPABASE = 'http://127.0.0.1:9998';
 

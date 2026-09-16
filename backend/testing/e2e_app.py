@@ -36,6 +36,9 @@ BOB = "aaaaaaaa-1111-4111-8111-000000000002"
 MALLORY = "aaaaaaaa-1111-4111-8111-000000000003"
 PROJECT_ALPHA = "bbbbbbbb-1111-4111-8111-000000000001"
 PROJECT_BETA = "bbbbbbbb-1111-4111-8111-000000000002"
+# Swarm V2 project: the ONLY workflow whose runs reach the typed final-result
+# surface. Its workflow_key is trusted project state, exactly as in production.
+PROJECT_GAMMA = "bbbbbbbb-1111-4111-8111-000000000003"
 
 APPROVED_WORKER_SA = "e2e-worker@example-project.iam.gserviceaccount.com"
 UNAPPROVED_WORKER_SA = "e2e-intruder@example-project.iam.gserviceaccount.com"
@@ -48,6 +51,8 @@ def build_repository() -> MemoryRepository:
         repo.seed_user(user)
     repo.seed_project(PROJECT_ALPHA, "alpha-research", "Alpha Research", [ALICE])
     repo.seed_project(PROJECT_BETA, "beta-catalog", "Beta Catalog", [BOB])
+    repo.seed_project(PROJECT_GAMMA, "gamma-swarm", "Gamma Swarm", [ALICE],
+                      workflow_key="swarm_v2")
     return repo
 
 
@@ -82,6 +87,64 @@ class MockUsage:
 
 class MockModelResponse:
     usage = MockUsage()
+
+
+def build_swarm_v2_product_result(content: str) -> dict[str, Any]:
+    """Build a REAL Swarm V2 product payload for the E2E stack.
+
+    The payload is assembled by the SAME production code the engine uses --
+    `FinalBuilder` over `finalize_product_outcome` -- so the E2E asserts the
+    browser against a payload production could actually have written, not
+    against a hand-typed lookalike. Only the evidence and the verdicts are
+    mocked; the outcome policy, the status/kind pairing and the review
+    composition are the shipped ones.
+
+    No model is called and no source is fetched to produce any of it.
+    """
+    from backend.engines.swarm_v2.builder import FinalBuilder
+    from backend.engines.swarm_v2.contracts import EvidenceReference, VerificationVerdict
+
+    run_reference = "e2e-swarm-run"
+    supports = "source evidence supports claim"
+
+    def evidence(claim_id: str, field: str, value: Any, source_id: str) -> EvidenceReference:
+        return EvidenceReference(
+            claim_id=claim_id, source_id=source_id, run_id=run_reference,
+            task_id="government_record_2026", entity="toyota_rav4_phev", field=field,
+            geography="IL", market="IL", time_scope={"model_year": 2026},
+            value=value, confidence=0.9, supported=True)
+
+    builder = FinalBuilder()
+    lowered = content.lower()
+
+    if "no usable" in lowered:
+        # Nothing verified and nothing disproved -> partial_success/no_usable_result.
+        return builder.build([], [], task_failures=[
+            {"task_id": "government_record_2026", "code": "R5_GOV_RECORD_AMBIGUOUS"}])
+
+    if "partial" in lowered:
+        # A verified field PLUS an unresolved conflict, a task failure and a
+        # coverage gap -> partial_success/partial_result.
+        return builder.build(
+            [evidence("claim-fuel", "fuel_type", "plug-in hybrid", "src-gov-1"),
+             evidence("claim-disp", "engine_displacement_cc", 2487, "src-gov-2")],
+            [VerificationVerdict(claim_id="claim-fuel", verdict="verified", reason=supports),
+             VerificationVerdict(claim_id="claim-disp", verdict="needs_review",
+                                 reason="unresolved conflict")],
+            task_failures=[{"task_id": "catalog_lookup", "code": "R5_GOV_RECORD_AMBIGUOUS"}],
+            coverage_gaps=[{"task_id": "compile_report", "code": "EVIDENCE_REQUIREMENTS_UNMET"}],
+            conflict_claim_ids=["claim-disp"])
+
+    # Default: everything verified, with ONE field carrying two verified values
+    # so the browser is asserted against the "more than one value, none chosen"
+    # case rather than only the easy one -> complete/usable_result.
+    return builder.build(
+        [evidence("claim-hp-1", "horsepower_hp", 302, "src-gov-1"),
+         evidence("claim-hp-2", "horsepower_hp", 306, "src-gov-2"),
+         evidence("claim-fuel", "fuel_type", "plug-in hybrid", "src-gov-1")],
+        [VerificationVerdict(claim_id="claim-hp-1", verdict="verified", reason=supports),
+         VerificationVerdict(claim_id="claim-hp-2", verdict="verified", reason=supports),
+         VerificationVerdict(claim_id="claim-fuel", verdict="verified", reason=supports)])
 
 
 class InProcessFakeWorkerLauncher:
@@ -122,6 +185,37 @@ class InProcessFakeWorkerLauncher:
                 self._cancel(run_id)
                 return False
             raise
+
+    def _workflow_key(self, run_id: UUID) -> str:
+        """Resolve run -> conversation -> project, exactly like EngineResolver.
+
+        Trusted records only. The run's own input never selects a workflow.
+        """
+        run = self.repo.get_run(run_id)
+        conversation = self.repo.get_conversation(run["conversation_id"])
+        return str(self.repo.get_project(conversation["project_id"]).get("workflow_key") or "")
+
+    def _finalize_swarm_v2(self, run_id: UUID, content: str) -> None:
+        """Finalize a Swarm V2 run through the PRODUCTION outcome contract.
+
+        `durable_run_status` is the same lookup `backend/worker/main.py` uses,
+        so the durable status and the recorded payload cannot disagree here in
+        a way they could not disagree in production -- and a payload that
+        failed `validate_product_outcome` would raise rather than quietly
+        complete, exactly as the real worker treats it.
+        """
+        from backend.engines.swarm_v2 import durable_run_status
+
+        result = build_swarm_v2_product_result(content)
+        status = durable_run_status(result)
+        payload = {"status": result["status"], "result_kind": result["result_kind"]}
+        if status == "partial_success":
+            self._emit(run_id, "run_partial_success", "Run partial_success", payload=payload)
+            self.repo.transition_run(run_id, "partial_success", output=result, error=None,
+                                     finished_at=None)
+        else:
+            self._emit(run_id, "run_completed", "Run completed", payload=payload)
+            self.repo.mark_run_complete(run_id, result)
 
     def _run(self, run_id: UUID) -> None:
         repo = self.repo
@@ -169,6 +263,11 @@ class InProcessFakeWorkerLauncher:
                 self._emit(run_id, "agent_progress", f"step {index + 1}/{steps}", agent="researcher", phase="research", progress={"percent": int(100 * (index + 1) / steps)})
                 time.sleep(0.35 if "slow" in content else 0.15)
             self._emit(run_id, "source_recorded", "Example source", agent="researcher", payload={"id": "src-1", "title": "Example source", "domain": "example.com", "url": "https://example.com", "source_type": "web", "source_strength": "high"})
+
+            if self._workflow_key(run_id) == "swarm_v2":
+                self._finalize_swarm_v2(run_id, content)
+                return
+
             self._emit(run_id, "run_completed", "Run completed", payload={})
             repo.mark_run_complete(run_id, {"summary": "E2E mocked output", "artifacts": {"report": "final report body"}})
         except Exception as exc:  # pragma: no cover - defensive

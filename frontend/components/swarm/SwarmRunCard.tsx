@@ -41,8 +41,10 @@ export type SwarmRunCardProps = {
  * There is no agent concept in Swarm V2 and none is reconstructed.
  *
  * This card is not the final-result renderer. It reports the durable terminal
- * status; the sanitized output surface stays where it is until F4 defines
- * final-result semantics.
+ * status only. The product answer — verified fields, outstanding items and
+ * what the outcome means — is a separate surface
+ * (components/result/FinalResultPanel), so execution telemetry can never be
+ * read as the result.
  */
 export function SwarmRunCard({
   swarm,

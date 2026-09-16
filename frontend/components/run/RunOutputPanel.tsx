@@ -7,10 +7,15 @@ export type RunOutputPanelProps = {
 };
 
 /**
- * Transitional sanitized-output surface. It shows exactly what the backend
- * recorded, redacted, and says so plainly when nothing was recorded: an empty
- * output is never dressed up as a product result. The F4 final-result contract
- * replaces this panel.
+ * The sanitized-output surface for workflows that have no typed product
+ * contract — V1 and anything else that is not Swarm V2.
+ *
+ * It shows exactly what the backend recorded, redacted, and says so plainly
+ * when nothing was recorded: an empty output is never dressed up as a product
+ * result. Swarm V2 no longer reaches this panel; it has a closed, typed
+ * contract and its own product surface (components/result/FinalResultPanel).
+ * The caller decides between the two from the project's trusted workflow_key,
+ * so this path is unchanged for every workflow that used it before.
  */
 export function RunOutputPanel({ visible, output }: RunOutputPanelProps) {
   if (!visible) return null;

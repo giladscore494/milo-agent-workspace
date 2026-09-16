@@ -124,10 +124,14 @@ class MemoryRepository:
     def seed_user(self, user_id: str) -> None:
         self.users.add(user_id)
 
-    def seed_project(self, project_id: str, slug: str, name: str, members: list[str]) -> None:
+    def seed_project(self, project_id: str, slug: str, name: str, members: list[str],
+                     workflow_key: str = "vehicle_catalog_v1") -> None:
+        # `workflow_key` is TRUSTED project state: the frontend selects its run
+        # and result surfaces from it and never from a payload. It defaults to
+        # the V1 engine, so every existing caller is unchanged.
         self.projects[project_id] = {
             "id": project_id, "slug": slug, "name": name, "description": None,
-            "workflow_key": "vehicle_catalog_v1", "configuration": {},
+            "workflow_key": workflow_key, "configuration": {},
             "created_at": _now(), "updated_at": _now(),
         }
         for user_id in members:

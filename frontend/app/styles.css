@@ -858,3 +858,109 @@ textarea { resize: vertical; min-height: 4.5rem; }
   /* Two columns, not three: a third column is too narrow for the stage names. */
   .swarm-stages { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* --- Final result (Swarm V2 product surface) ------------------------------
+   Status meaning never depends on colour: every tone below is also carried by
+   a symbol and a text label in the markup, so the surface stays fully legible
+   with no stylesheet, in monochrome, and to a screen reader. The tone only
+   tints a border. */
+.final-result-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.final-result-banner {
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  margin: 12px 0 4px;
+  background: var(--surface-muted);
+}
+.final-result-banner[data-tone='positive'] { border-left-color: var(--success); }
+.final-result-banner[data-tone='caution'] { border-left-color: var(--warning); }
+.final-result-banner[data-tone='negative'] { border-left-color: var(--danger); }
+.final-result-banner[data-tone='neutral'] { border-left-color: var(--border-strong); }
+
+.final-result-outcome {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+.final-result-symbol { font-size: 1.05rem; line-height: 1; }
+.final-result-label { font-size: 1rem; }
+.final-result-summary { font-size: 0.9rem; color: var(--muted); }
+.final-result-code { margin-top: 8px; font-size: 0.82rem; color: var(--muted); }
+
+.final-result-section { margin-top: 18px; }
+
+.final-result-fields { margin: 10px 0 0; display: grid; gap: 12px; }
+.final-result-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+}
+.final-result-field-name {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-weight: 600;
+}
+.final-result-field-key { font-weight: 400; font-size: 0.75rem; color: var(--muted); }
+.final-result-field-values { margin: 0; }
+.final-result-multiple { margin-bottom: 6px; font-size: 0.8rem; font-weight: 600; }
+.final-result-values { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.final-result-value { display: grid; gap: 4px; min-width: 0; }
+.final-result-value-text { overflow-wrap: anywhere; }
+
+.final-result-value-list { list-style: disc; margin: 0; padding-left: 18px; display: grid; gap: 2px; }
+.final-result-value-record { margin: 0; display: grid; gap: 2px; }
+.final-result-value-record-row {
+  display: grid;
+  grid-template-columns: minmax(0, 12rem) minmax(0, 1fr);
+  gap: 8px;
+}
+.final-result-value-record-row > dt { color: var(--muted); overflow-wrap: anywhere; }
+.final-result-value-record-row > dd { margin: 0; overflow-wrap: anywhere; }
+
+.final-result-provenance { font-size: 0.8rem; }
+.final-result-provenance > summary { cursor: pointer; color: var(--muted); }
+.final-result-provenance-list { margin: 6px 0 0; display: grid; gap: 4px; }
+.final-result-provenance-row {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 8px;
+}
+.final-result-provenance-row > dt { color: var(--muted); }
+.final-result-provenance-row > dd { margin: 0; overflow-wrap: anywhere; }
+
+.final-result-review-group { margin-top: 12px; }
+.final-result-review-title { margin: 0; font-size: 0.9rem; font-weight: 600; }
+.final-result-review-items { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px; }
+.final-result-review-item {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  min-width: 0;
+}
+.final-result-review-subject { font-weight: 600; }
+.final-result-review-reason,
+.final-result-review-value { font-size: 0.85rem; color: var(--muted); overflow-wrap: anywhere; }
+
+@media (max-width: 560px) {
+  .final-result-provenance-row,
+  .final-result-value-record-row { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .final-result-banner { padding: 10px 12px; }
+}
