@@ -36,7 +36,15 @@
  * is therefore inert in the browser until it is added here on purpose.
  */
 
-/** Mirror of `backend/runtime.py` `EVENT_TYPES`. Keep in step with it. */
+/**
+ * Mirror of `V1_EVENT_TYPES` in `backend/runtime.py`. Keep in step with it.
+ *
+ * NOT the backend's `EVENT_TYPES`: that is this set UNION
+ * `CATALOG_EVENT_TYPES`, and it answers a different question. `EVENT_TYPES` is
+ * what the API ACCEPTS from a worker; this set is what OWNS the V1 projection.
+ * Mirroring the union here would hand the catalog types the agent, phase,
+ * progress and spend projection that membership of this set grants.
+ */
 export const V1_EVENT_TYPES: ReadonlySet<string> = new Set([
   'run_created', 'run_started', 'run_resumed', 'phase_started', 'phase_completed',
   'agent_created', 'agent_started', 'agent_progress', 'agent_completed', 'agent_failed',

@@ -3,7 +3,8 @@ import { KeyboardEvent, useRef } from 'react';
 import { INTERNET_POLICIES, InternetBadge } from '@/components/common/InternetBadge';
 import { redactSecrets, safeText } from '@/lib/sanitize';
 import { normalizeRunUsage } from '@/lib/runUsage';
-import { catalogRefusalLabel } from '@/lib/catalogStatus';
+import { CatalogAction, UNKNOWN_CATALOG_REFUSAL,
+         catalogRefusalReasonLabel } from '@/lib/catalogStatus';
 import { SwarmCatalogStatus, SwarmRunViewModel, summarizeSwarmRun } from '@/lib/swarmViewModel';
 import { AgentState, WorkspaceState } from '@/lib/types';
 
@@ -155,23 +156,41 @@ function CatalogStatusPanel({ catalog }: { catalog: SwarmCatalogStatus }) {
               {action.replayed ? ' (replay)' : ''}
             </span>
             <span className="catalog-action-key">{safeText(action.candidateKey ?? 'unnamed candidate')}</span>
-            {action.outcome === 'promoted' ? (
-              <small className="catalog-action-detail">
-                {action.promotedFieldCount} field{action.promotedFieldCount === 1 ? '' : 's'} promoted
-                {action.unsupportedFieldCount > 0 ? `, ${action.unsupportedFieldCount} unsupported` : ''}
-              </small>
-            ) : (
-              <small className="catalog-action-detail">
-                {/* An absent code resolves to the same static fallback as an
-                    unrecognised one — the label never comes from the payload. */}
-                {safeText(catalogRefusalLabel(action.reasonCode ?? ''))}
-              </small>
-            )}
+            <small className="catalog-action-detail">
+              {/* Both branches are repository-authored static text — a label
+                  from the closed allowlist, or a sentence built from bounded
+                  counts — and both still go through `safeText`, so the
+                  invariant holds uniformly rather than per branch. A refused
+                  action always carries a reason; the shared sentinel is the
+                  defensive default rather than an ad-hoc literal. */}
+              {safeText(action.outcome === 'promoted'
+                ? promotedFieldsText(action)
+                : catalogRefusalReasonLabel(action.reason ?? UNKNOWN_CATALOG_REFUSAL))}
+            </small>
           </li>
         ))}
       </ul>
     </section>
   );
+}
+
+/**
+ * What a promotion did, in field counts — or that the counts are unavailable.
+ *
+ * `promotedFieldCount` is absent when the event's list broke its declared
+ * contract (not an array, not an array of strings, or longer than
+ * `MAX_CANONICAL_FIELDS`). Rendering that as "0 fields promoted" would state a
+ * number nothing established, so the surface says the count is unavailable
+ * instead. The promotion itself is still reported — the event type is what
+ * establishes that, and it is trusted.
+ */
+function promotedFieldsText(action: CatalogAction): string {
+  const promotedCount = action.promotedFieldCount;
+  if (promotedCount === undefined) return 'Field count unavailable';
+  const unsupported = action.unsupportedFieldCount;
+  const promotedText = `${promotedCount} field${promotedCount === 1 ? '' : 's'} promoted`;
+  if (unsupported === undefined) return `${promotedText}, unsupported count unavailable`;
+  return unsupported > 0 ? `${promotedText}, ${unsupported} unsupported` : promotedText;
 }
 
 function InspectorPanel({ tab, agents, state, swarm }: { tab: InspectorTab; agents: AgentState[]; state: WorkspaceState; swarm: SwarmRunViewModel }) {

@@ -588,6 +588,48 @@ def test_the_frontend_mirrors_the_same_two_catalog_types():
     assert set(re.findall(r"'([a-z_]+)'", literal)) == set(CATALOG_EVENT_TYPES)
 
 
+def test_the_frontend_bounds_promoted_field_counts_at_the_backend_maximum():
+    """A parity test, in the same shape as the vocabulary mirror above.
+
+    `PromotionAttempt.as_event()` carries `promoted_fields` and
+    `unsupported_fields`, and both are subsets of `CANONICAL_VARIANT_FIELDS`:
+    `promoted_fields` is one entry per `plan.fields`, and `unsupported_fields`
+    is the unsupported subset of the namespaced identity dimensions. So
+    `MAX_CANONICAL_FIELDS` bounds both, and the browser projection enforces
+    that same bound before it will present a list's length as a field count.
+
+    The bound is DECLARED in the TypeScript, not fetched from here -- there is
+    no runtime coupling between the browser and this package. This test is the
+    drift alarm: widen `CANONICAL_VARIANT_FIELDS` (add an identity dimension,
+    say) and the frontend bound goes stale silently without it.
+    """
+    from backend.catalog.contracts import (CANONICAL_VARIANT_FIELDS,
+                                           MAX_CANONICAL_FIELDS)
+
+    # The backend bound is derived, not hand-written, and must stay that way.
+    assert MAX_CANONICAL_FIELDS == len(CANONICAL_VARIANT_FIELDS)
+
+    source = (REPO / "frontend/lib/catalogStatus.ts").read_text()
+    declared = re.search(r"export const MAX_CANONICAL_FIELDS\s*=\s*(\d+)\s*;", source)
+    assert declared is not None, \
+        "frontend/lib/catalogStatus.ts must declare MAX_CANONICAL_FIELDS"
+    assert int(declared.group(1)) == MAX_CANONICAL_FIELDS, (
+        f"frontend MAX_CANONICAL_FIELDS={declared.group(1)} has drifted from the "
+        f"backend contract's {MAX_CANONICAL_FIELDS} "
+        f"(len(CANONICAL_VARIANT_FIELDS)); update frontend/lib/catalogStatus.ts")
+
+
+def test_the_promotion_event_contract_still_carries_both_field_lists():
+    """The parity test above is only meaningful while these keys exist.
+
+    If `as_event()` stopped emitting either list, the frontend bound would be
+    guarding a field nothing sends and the drift alarm would be inert.
+    """
+    source = (REPO / "backend/catalog/pipeline.py").read_text()
+    assert 'payload["promoted_fields"] = list(self.outcome.promoted_fields)' in source
+    assert 'payload["unsupported_fields"] = list(self.outcome.unsupported_fields)' in source
+
+
 def test_an_enabled_catalog_run_emits_only_recognised_event_types(monkeypatch):
     """Whatever this run emits, the API's own allowlist accepts it."""
     from backend.runtime import EVENT_TYPES

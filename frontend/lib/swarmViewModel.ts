@@ -17,7 +17,7 @@
 import {
   CatalogAction,
   MAX_CATALOG_ACTIONS,
-  catalogRefusalLabel,
+  catalogRefusalReasonLabel,
 } from './catalogStatus';
 import {
   NormalizedRunUsage,
@@ -83,7 +83,11 @@ export type SwarmCatalogStatus = {
   refusedCount: number;
   /** Promotions an earlier attempt had already made (a resumed worker). */
   replayedCount: number;
-  /** Static label for the latest allowlisted refusal code, if there was one. */
+  /**
+   * Static text for the LATEST refusal, absent only when no refusal was
+   * observed. An unknown, missing or malformed reason resolves to
+   * `UNKNOWN_CATALOG_REFUSAL_LABEL` — never to the previous refusal's label.
+   */
   lastRefusalLabel?: string;
   /** Bounded, oldest first; at most `MAX_CATALOG_ACTIONS`. */
   actions: CatalogAction[];
@@ -171,9 +175,15 @@ export function selectSwarmTaskCounts(state: SwarmRunState): SwarmTaskCounts {
 /**
  * The catalog slice, resolved into what an operator reads.
  *
- * The only transformation is code → static label. Every number comes straight
- * from the bounded slice, and the action list is already a fixed-size ring, so
- * this selector cannot grow with the event stream.
+ * The only transformation is the refusal tri-state → static text. Every number
+ * comes straight from the bounded slice, and the action list is already a
+ * fixed-size ring, so this selector cannot grow with the event stream.
+ *
+ * The three states map one-to-one, with no fallback between them: absent stays
+ * absent (the summary is omitted), a known code becomes its allowlisted label,
+ * and the unknown sentinel becomes the static unknown label. There is
+ * deliberately no path here that can substitute an older refusal's label for
+ * the latest one.
  */
 export function selectCatalogStatus(state: SwarmRunState): SwarmCatalogStatus {
   const catalog = state.catalog;
@@ -182,9 +192,9 @@ export function selectCatalogStatus(state: SwarmRunState): SwarmCatalogStatus {
     promotedCount: catalog.promotedCount,
     refusedCount: catalog.refusedCount,
     replayedCount: catalog.replayedCount,
-    lastRefusalLabel: catalog.lastRefusalCode === undefined
+    lastRefusalLabel: catalog.lastRefusalReason === undefined
       ? undefined
-      : catalogRefusalLabel(catalog.lastRefusalCode),
+      : catalogRefusalReasonLabel(catalog.lastRefusalReason),
     actions: catalog.actions.slice(-MAX_CATALOG_ACTIONS),
   };
 }

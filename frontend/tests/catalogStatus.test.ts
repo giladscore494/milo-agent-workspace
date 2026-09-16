@@ -29,8 +29,10 @@ import {
 } from '../lib/eventVocabulary';
 import {
   CATALOG_REFUSAL_LABELS,
+  MAX_CANONICAL_FIELDS,
   MAX_CATALOG_ACTIONS,
   MAX_CATALOG_KEY_CHARS,
+  UNKNOWN_CATALOG_REFUSAL,
   UNKNOWN_CATALOG_REFUSAL_LABEL,
   catalogRefusalLabel,
   initialCatalogState,
@@ -134,7 +136,7 @@ describe('catalog status projection', () => {
     expect(state.observed).toBe(true);
     expect(state.promotedCount).toBe(1);
     expect(state.refusedCount).toBe(0);
-    expect(state.lastRefusalCode).toBeUndefined();
+    expect(state.lastRefusalReason).toBeUndefined();
     expect(state.actions).toHaveLength(1);
     expect(state.actions[0]).toMatchObject({
       outcome: 'promoted',
@@ -151,7 +153,8 @@ describe('catalog status projection', () => {
       initialCatalogState, refused('kia_niro_2020', 'CATALOG_PROMOTION_CONFLICT_UNRESOLVED'), '1');
     expect(state.refusedCount).toBe(1);
     expect(state.promotedCount).toBe(0);
-    expect(state.lastRefusalCode).toBe('CATALOG_PROMOTION_CONFLICT_UNRESOLVED');
+    expect(state.lastRefusalReason)
+      .toEqual({ known: true, code: 'CATALOG_PROMOTION_CONFLICT_UNRESOLVED' });
     expect(state.actions[0].outcome).toBe('refused');
     // A refusal is an operational catalog outcome. The projection carries no
     // run-failure concept at all, which is the structural version of that rule.
@@ -198,8 +201,10 @@ describe('catalog status projection', () => {
     const action = state.actions[0];
     expect(action.candidateKey).toBeUndefined();
     expect(action.canonicalKey).toBeUndefined();
-    expect(action.promotedFieldCount).toBe(0);
-    expect(action.unsupportedFieldCount).toBe(0);
+    // A malformed list is not "zero fields" — that would be a false count.
+    // It is DROPPED, and the surface says the count is unavailable.
+    expect(action.promotedFieldCount).toBeUndefined();
+    expect(action.unsupportedFieldCount).toBeUndefined();
     expect(action.replayed).toBe(false);
     // The event TYPE decides the outcome, not the payload: the type is what
     // the trusted emitter chose, `promoted: 'yes'` is just data travelling
@@ -229,14 +234,18 @@ describe('catalog status projection', () => {
     expect(state.actions[0].canonicalKey!.length).toBeLessThanOrEqual(MAX_CATALOG_KEY_CHARS);
   });
 
-  it('bounds list lengths by counting rather than retaining', () => {
+  it('refuses to report an over-contract list length as telemetry', () => {
+    // The backend bounds a canonical promotion to MAX_CANONICAL_FIELDS. A
+    // longer list cannot have come from `PromotionAttempt.as_event()`, so its
+    // length is not a number this surface may present as a field count.
     const many = Array.from({ length: 5_000 }, (_, i) => `field_${i}`);
     const state = reduceCatalogEvent(
       initialCatalogState,
       event(PROMOTED, { candidate_key: 'k', promoted: true, canonical_key: 'c',
                         promoted_fields: many, unsupported_fields: many, replayed: false }),
       '1');
-    expect(state.actions[0].promotedFieldCount).toBe(5_000);
+    expect(state.actions[0].promotedFieldCount).toBeUndefined();
+    expect(state.actions[0].unsupportedFieldCount).toBeUndefined();
     // Counts, not contents: the serialized slice cannot grow with the list.
     expect(JSON.stringify(state).length).toBeLessThan(1_000);
   });
@@ -280,13 +289,14 @@ describe('refusal codes', () => {
     }
   });
 
-  it('never stores an unrecognised reason code', () => {
+  it('never stores an unrecognised reason code, but still records the refusal', () => {
     const state = reduceCatalogEvent(
       initialCatalogState, refused('k', 'ERROR: duplicate key value violates unique constraint'), '1');
-    expect(state.lastRefusalCode).toBeUndefined();
+    // The untrusted text is nowhere in the slice — but the slice still knows
+    // that the LATEST refusal had a reason it cannot name.
+    expect(state.lastRefusalReason).toEqual(UNKNOWN_CATALOG_REFUSAL);
+    expect(state.lastRefusalReason).not.toHaveProperty('code');
     expect(JSON.stringify(state)).not.toContain('duplicate key');
-    // Still counted: something was refused, even though its code is not one
-    // this release knows how to name.
     expect(state.refusedCount).toBe(1);
   });
 
@@ -305,6 +315,242 @@ describe('refusal codes', () => {
     for (const fragment of SECRET_FRAGMENTS) {
       expect(serialized, fragment).not.toContain(fragment);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CORRECTION 1: "Latest refusal" must describe the ACTUAL latest refusal
+// ---------------------------------------------------------------------------
+
+/**
+ * The defect this suite exists to hold closed.
+ *
+ * The first implementation kept the previous reason when a later refusal had no
+ * allowlisted one (`reasonCode ?? state.lastRefusalCode`). So a run that was
+ * refused for `VALUE_MISMATCH` and then refused again for something this
+ * release cannot name went on displaying "value mismatch" as *the latest
+ * refusal* — an operator reading the summary was told the newest refusal had a
+ * reason it did not have.
+ *
+ * The state model now distinguishes THREE conditions, and the middle one is
+ * the one that was missing:
+ *
+ *   1. no refusal has ever been observed      -> `lastRefusalReason` absent
+ *   2. the latest refusal is allowlisted      -> `{ known: true, code }`
+ *   3. the latest refusal is unknown/missing/
+ *      malformed                              -> `{ known: false }`
+ *
+ * Condition 3 is a TRUSTED SENTINEL, not the payload's value: the variant has
+ * no `code` property at all, so there is nowhere for untrusted text to sit.
+ */
+describe('the latest refusal is the latest refusal', () => {
+  const KNOWN = 'CATALOG_PROMOTION_VALUE_MISMATCH';
+  const OTHER_KNOWN = 'CATALOG_PROMOTION_CONFLICT_UNRESOLVED';
+
+  /** A refusal whose `reason` key is whatever the caller passes — or absent. */
+  function refusedWith(payload: Record<string, unknown>): RunEvent {
+    return event(REFUSED, { candidate_key: 'k', promoted: false, ...payload });
+  }
+
+  function fold(events: readonly RunEvent[]) {
+    return events.reduce(
+      (state, e, i) => reduceCatalogEvent(state, e, String(i + 1)),
+      initialCatalogState);
+  }
+
+  it('known -> unknown reports the unknown fallback, not the stale known reason', () => {
+    const state = fold([refusedWith({ reason: KNOWN }),
+                        refusedWith({ reason: 'CATALOG_PROMOTION_INVENTED' })]);
+    expect(state.lastRefusalReason).toEqual(UNKNOWN_CATALOG_REFUSAL);
+    // The exact regression: the older known code must NOT survive as "latest".
+    expect(state.lastRefusalReason).not.toEqual({ known: true, code: KNOWN });
+    expect(JSON.stringify(state.lastRefusalReason)).not.toContain(KNOWN);
+    expect(selectCatalogStatus({ ...initialSwarmRunState, catalog: state })
+      .lastRefusalLabel).toBe(UNKNOWN_CATALOG_REFUSAL_LABEL);
+  });
+
+  it('known -> MISSING reason reports the unknown fallback', () => {
+    const state = fold([refusedWith({ reason: KNOWN }), refusedWith({})]);
+    expect(state.lastRefusalReason).toEqual(UNKNOWN_CATALOG_REFUSAL);
+    expect(selectCatalogStatus({ ...initialSwarmRunState, catalog: state })
+      .lastRefusalLabel).toBe(UNKNOWN_CATALOG_REFUSAL_LABEL);
+  });
+
+  it.each([
+    ['a number', 42],
+    ['an object', { code: 'CATALOG_PROMOTION_VALUE_MISMATCH' }],
+    ['an array', ['CATALOG_PROMOTION_VALUE_MISMATCH']],
+    ['null', null],
+    ['a boolean', true],
+    ['an empty string', ''],
+    ['whitespace', '   '],
+  ])('known -> malformed reason (%s) reports the unknown fallback', (_label, reason) => {
+    const state = fold([refusedWith({ reason: KNOWN }), refusedWith({ reason })]);
+    expect(state.lastRefusalReason).toEqual(UNKNOWN_CATALOG_REFUSAL);
+    expect(JSON.stringify(state.lastRefusalReason)).not.toContain(KNOWN);
+    expect(selectCatalogStatus({ ...initialSwarmRunState, catalog: state })
+      .lastRefusalLabel).toBe(UNKNOWN_CATALOG_REFUSAL_LABEL);
+  });
+
+  it('unknown -> known reports the NEW static label', () => {
+    const state = fold([refusedWith({ reason: 'CATALOG_PROMOTION_INVENTED' }),
+                        refusedWith({ reason: OTHER_KNOWN })]);
+    expect(state.lastRefusalReason).toEqual({ known: true, code: OTHER_KNOWN });
+    expect(selectCatalogStatus({ ...initialSwarmRunState, catalog: state })
+      .lastRefusalLabel).toBe(CATALOG_REFUSAL_LABELS[OTHER_KNOWN]);
+  });
+
+  it('known -> other known reports the newer of the two', () => {
+    const state = fold([refusedWith({ reason: KNOWN }),
+                        refusedWith({ reason: OTHER_KNOWN })]);
+    expect(state.lastRefusalReason).toEqual({ known: true, code: OTHER_KNOWN });
+  });
+
+  it('a later PROMOTION preserves the refusal summary — it is not a newer refusal', () => {
+    const state = fold([refusedWith({ reason: KNOWN }), promoted('mazda_3_2021')]);
+    expect(state.lastRefusalReason).toEqual({ known: true, code: KNOWN });
+    expect(state.promotedCount).toBe(1);
+    expect(state.refusedCount).toBe(1);
+    expect(selectCatalogStatus({ ...initialSwarmRunState, catalog: state })
+      .lastRefusalLabel).toBe(CATALOG_REFUSAL_LABELS[KNOWN]);
+  });
+
+  it('a promotion after an UNKNOWN refusal preserves the unknown fallback', () => {
+    const state = fold([refusedWith({ reason: 'CATALOG_PROMOTION_INVENTED' }),
+                        promoted('mazda_3_2021')]);
+    expect(state.lastRefusalReason).toEqual(UNKNOWN_CATALOG_REFUSAL);
+  });
+
+  it('no refusal at all omits the summary entirely', () => {
+    expect(initialCatalogState.lastRefusalReason).toBeUndefined();
+    const promotionsOnly = fold([promoted('a'), promoted('b')]);
+    expect(promotionsOnly.lastRefusalReason).toBeUndefined();
+    expect(selectCatalogStatus({ ...initialSwarmRunState, catalog: promotionsOnly })
+      .lastRefusalLabel).toBeUndefined();
+  });
+
+  it('never stores an untrusted reason string in any of the three conditions', () => {
+    const hostile = 'ERROR: relation "catalog_canonical_variants" does not exist';
+    const state = fold([refusedWith({ reason: KNOWN }), refusedWith({ reason: hostile })]);
+    const serialized = JSON.stringify(state);
+    expect(serialized).not.toContain('relation');
+    expect(serialized).not.toContain('does not exist');
+    // And the per-action record is equally sentinel-only.
+    expect(state.actions[1].reason).toEqual(UNKNOWN_CATALOG_REFUSAL);
+    expect(state.actions[1].reason).not.toHaveProperty('code');
+  });
+
+  it('keeps the action ring bounded and deterministic across mixed outcomes', () => {
+    const many: RunEvent[] = [];
+    for (let i = 0; i < MAX_CATALOG_ACTIONS * 2; i += 1) {
+      many.push(i % 2 === 0 ? refusedWith({ reason: KNOWN }) : promoted(`c_${i}`));
+    }
+    const state = fold(many);
+    expect(state.actions).toHaveLength(MAX_CATALOG_ACTIONS);
+    expect(state.refusedCount).toBe(MAX_CATALOG_ACTIONS);
+    expect(state.promotedCount).toBe(MAX_CATALOG_ACTIONS);
+    // The last event was a promotion, so the newest refusal reason survives.
+    expect(state.lastRefusalReason).toEqual({ known: true, code: KNOWN });
+    // Folding the same stream twice is identical.
+    expect(fold(many)).toEqual(state);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CORRECTION 2: the declared list contract is enforced, not assumed
+// ---------------------------------------------------------------------------
+
+/**
+ * `listLength` previously accepted ANY array and exposed its full length. That
+ * contradicted this module's own claim that every field is checked for its
+ * exact declared type and that collections are bounded: an array of objects
+ * counted, and a 5 000-entry array reported 5 000 promoted fields as if it
+ * were telemetry.
+ *
+ * The declared type is `list[str]`, and the backend bounds a canonical
+ * promotion to `MAX_CANONICAL_FIELDS` (`backend/catalog/contracts.py`). A list
+ * that breaks either rule cannot have come from
+ * `PromotionAttempt.as_event()`, so its length is DROPPED rather than
+ * presented — an absent count, never a false zero.
+ */
+describe('field-list counts', () => {
+  function countsFor(payload: Record<string, unknown>) {
+    const state = reduceCatalogEvent(
+      initialCatalogState,
+      event(PROMOTED, { candidate_key: 'k', promoted: true, canonical_key: 'c',
+                        replayed: false, ...payload }),
+      '1');
+    return state.actions[0];
+  }
+
+  it('accepts a valid empty string array as a real zero', () => {
+    const action = countsFor({ promoted_fields: [], unsupported_fields: [] });
+    expect(action.promotedFieldCount).toBe(0);
+    expect(action.unsupportedFieldCount).toBe(0);
+  });
+
+  it('accepts a valid non-empty string array', () => {
+    const action = countsFor({
+      promoted_fields: ['model_year_start', 'model_year_end', 'trim'],
+      unsupported_fields: ['identity_dimensions.market'],
+    });
+    expect(action.promotedFieldCount).toBe(3);
+    expect(action.unsupportedFieldCount).toBe(1);
+  });
+
+  it('accepts exactly MAX_CANONICAL_FIELDS entries', () => {
+    const exact = Array.from({ length: MAX_CANONICAL_FIELDS }, (_, i) => `field_${i}`);
+    expect(countsFor({ promoted_fields: exact }).promotedFieldCount)
+      .toBe(MAX_CANONICAL_FIELDS);
+  });
+
+  it('drops one entry OVER the contract bound', () => {
+    const over = Array.from({ length: MAX_CANONICAL_FIELDS + 1 }, (_, i) => `field_${i}`);
+    expect(countsFor({ promoted_fields: over }).promotedFieldCount).toBeUndefined();
+  });
+
+  it.each([
+    ['a string', 'model_year_start'],
+    ['a number', 3],
+    ['null', null],
+    ['a boolean', true],
+    ['an object', { 0: 'model_year_start', length: 1 }],
+    ['an absent key', undefined],
+  ])('drops a non-array value (%s)', (_label, value) => {
+    expect(countsFor({ promoted_fields: value }).promotedFieldCount).toBeUndefined();
+  });
+
+  it.each([
+    ['an object member', ['model_year_start', { field: 'trim' }]],
+    ['a number member', ['model_year_start', 7]],
+    ['a null member', ['model_year_start', null]],
+    ['an undefined member', ['model_year_start', undefined]],
+    ['a nested array member', ['model_year_start', ['trim']]],
+    ['only non-string members', [1, 2, 3]],
+  ])('drops an array containing %s', (_label, value) => {
+    expect(countsFor({ promoted_fields: value }).promotedFieldCount).toBeUndefined();
+  });
+
+  it('judges each list independently', () => {
+    const action = countsFor({
+      promoted_fields: ['model_year_start'],
+      unsupported_fields: [{ not: 'a string' }],
+    });
+    expect(action.promotedFieldCount).toBe(1);
+    expect(action.unsupportedFieldCount).toBeUndefined();
+  });
+
+  it('still stores only counts — never a field name', () => {
+    const action = countsFor({
+      promoted_fields: ['model_year_start', 'identity_dimensions.market'],
+      unsupported_fields: ['identity_dimensions.generation'],
+    });
+    const serialized = JSON.stringify(action);
+    for (const name of ['model_year_start', 'identity_dimensions.market',
+                        'identity_dimensions.generation']) {
+      expect(serialized, name).not.toContain(name);
+    }
+    expect(action.promotedFieldCount).toBe(2);
   });
 });
 

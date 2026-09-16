@@ -16,7 +16,8 @@
 import { render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { RunInspector } from '../components/inspector/RunInspector';
-import { CATALOG_REFUSAL_LABELS, UNKNOWN_CATALOG_REFUSAL_LABEL } from '../lib/catalogStatus';
+import { CATALOG_REFUSAL_LABELS, MAX_CANONICAL_FIELDS,
+         UNKNOWN_CATALOG_REFUSAL_LABEL } from '../lib/catalogStatus';
 import { initialWorkspaceState, reconstructRun } from '../lib/runReducer';
 import { buildSwarmRunViewModel } from '../lib/swarmViewModel';
 import { Run, RunEvent, WorkspaceState } from '../lib/types';
@@ -80,6 +81,20 @@ function renderInspector(options: {
 
 function catalogPanel(): HTMLElement | null {
   return screen.queryByRole('region', { name: /catalog status/i });
+}
+
+/**
+ * The top-level "Latest refusal" summary element, and ONLY that element.
+ *
+ * Reading `panel.textContent` would let an older action still sitting in the
+ * bounded history satisfy an assertion about the summary — exactly the
+ * false positive that let the stale-reason defect through. This narrows to the
+ * one element the summary renders into.
+ */
+function latestRefusalSummary(): string | null {
+  const panel = catalogPanel();
+  const node = panel?.querySelector('.catalog-status-reason') ?? null;
+  return node === null ? null : (node.textContent ?? '');
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +211,111 @@ describe('what the surface says', () => {
                         'catalog_raw_records', '[object Object]', '{"']) {
       expect(panel.textContent, leak).not.toContain(leak);
     }
+  });
+});
+
+describe('the rendered "Latest refusal" summary', () => {
+  const KNOWN = 'CATALOG_PROMOTION_VALUE_MISMATCH';
+  const OTHER_KNOWN = 'CATALOG_PROMOTION_CONFLICT_UNRESOLVED';
+
+  function refusedWith(payload: Record<string, unknown>): RunEvent {
+    return event('catalog_promotion_refused', { candidate_key: 'k', promoted: false, ...payload });
+  }
+
+  it('shows the unknown fallback after known -> unknown, not the stale reason', () => {
+    renderInspector({
+      events: [refusedWith({ reason: KNOWN }),
+               refusedWith({ reason: 'CATALOG_PROMOTION_INVENTED' })],
+    });
+    const summary = latestRefusalSummary();
+    expect(summary).toContain(UNKNOWN_CATALOG_REFUSAL_LABEL);
+    // The regression: the older known label must not be what the SUMMARY says.
+    expect(summary).not.toContain(CATALOG_REFUSAL_LABELS[KNOWN]);
+    // It is still legitimately present in the action history below it — which
+    // is precisely why this test reads the summary element and not the panel.
+    expect(catalogPanel()!.textContent).toContain(CATALOG_REFUSAL_LABELS[KNOWN]);
+  });
+
+  it('shows the unknown fallback after known -> missing reason', () => {
+    renderInspector({ events: [refusedWith({ reason: KNOWN }), refusedWith({})] });
+    const summary = latestRefusalSummary();
+    expect(summary).toContain(UNKNOWN_CATALOG_REFUSAL_LABEL);
+    expect(summary).not.toContain(CATALOG_REFUSAL_LABELS[KNOWN]);
+  });
+
+  it('shows the unknown fallback after known -> malformed reason type', () => {
+    renderInspector({ events: [refusedWith({ reason: KNOWN }), refusedWith({ reason: 42 })] });
+    const summary = latestRefusalSummary();
+    expect(summary).toContain(UNKNOWN_CATALOG_REFUSAL_LABEL);
+    expect(summary).not.toContain(CATALOG_REFUSAL_LABELS[KNOWN]);
+  });
+
+  it('shows the new static label after unknown -> known', () => {
+    renderInspector({
+      events: [refusedWith({ reason: 'CATALOG_PROMOTION_INVENTED' }),
+               refusedWith({ reason: OTHER_KNOWN })],
+    });
+    const summary = latestRefusalSummary();
+    expect(summary).toContain(CATALOG_REFUSAL_LABELS[OTHER_KNOWN]);
+    expect(summary).not.toContain(UNKNOWN_CATALOG_REFUSAL_LABEL);
+  });
+
+  it('keeps the refusal summary after a later promotion', () => {
+    renderInspector({ events: [refusedWith({ reason: KNOWN }), promoted('mazda_3_2021')] });
+    expect(latestRefusalSummary()).toContain(CATALOG_REFUSAL_LABELS[KNOWN]);
+  });
+
+  it('omits the summary entirely when no refusal was observed', () => {
+    renderInspector({ events: [promoted('mazda_3_2021')] });
+    expect(catalogPanel()).not.toBeNull();
+    expect(latestRefusalSummary()).toBeNull();
+    expect(catalogPanel()!.textContent).not.toContain('Latest refusal');
+  });
+
+  it('never renders an untrusted reason string in the summary', () => {
+    renderInspector({
+      events: [refusedWith({ reason: KNOWN }),
+               refusedWith({ reason: 'ERROR: relation "catalog_canonical_variants" does not exist' })],
+    });
+    const panel = catalogPanel()!.textContent!;
+    expect(panel).not.toContain('relation');
+    expect(panel).not.toContain('does not exist');
+    expect(latestRefusalSummary()).toContain(UNKNOWN_CATALOG_REFUSAL_LABEL);
+  });
+});
+
+describe('the rendered field counts stay honest', () => {
+  it('reports real counts for a well-formed list', () => {
+    renderInspector({ events: [promoted('mazda_3_2021')] });
+    expect(catalogPanel()!.textContent).toContain('2 fields promoted');
+    expect(catalogPanel()!.textContent).toContain('1 unsupported');
+  });
+
+  it('says the count is unavailable rather than claiming zero, for a malformed list', () => {
+    renderInspector({
+      events: [event('catalog_variant_promoted', {
+        candidate_key: 'k', promoted: true, canonical_key: 'c',
+        promoted_fields: ['model_year_start', { field: 'trim' }],
+        unsupported_fields: 'not-an-array', replayed: false,
+      })],
+    });
+    const panel = catalogPanel()!.textContent!;
+    expect(panel).toContain('Field count unavailable');
+    expect(panel).not.toContain('0 fields promoted');
+    expect(panel).not.toContain('trim');
+  });
+
+  it('says the count is unavailable for an over-contract list', () => {
+    const over = Array.from({ length: MAX_CANONICAL_FIELDS + 1 }, (_, i) => `field_${i}`);
+    renderInspector({
+      events: [event('catalog_variant_promoted', {
+        candidate_key: 'k', promoted: true, canonical_key: 'c',
+        promoted_fields: over, unsupported_fields: [], replayed: false,
+      })],
+    });
+    const panel = catalogPanel()!.textContent!;
+    expect(panel).toContain('Field count unavailable');
+    expect(panel).not.toContain(String(MAX_CANONICAL_FIELDS + 1));
   });
 });
 

@@ -99,6 +99,65 @@ export function catalogRefusalLabel(code: string): string {
   return CATALOG_REFUSAL_LABELS[code] ?? UNKNOWN_CATALOG_REFUSAL_LABEL;
 }
 
+/**
+ * What a refusal's reason is, as TRUSTED state — a closed tri-state.
+ *
+ * The first implementation stored `lastRefusalCode?: string` and, when a later
+ * refusal had no allowlisted code, kept the previous one
+ * (`reasonCode ?? state.lastRefusalCode`). Two conditions were therefore
+ * indistinguishable — "the latest refusal has no code I can name" and "the
+ * latest refusal is the older one I can name" — and the surface resolved the
+ * ambiguity the wrong way: it went on presenting a stale known reason as *the
+ * latest refusal*.
+ *
+ * So the reason is a value with three states, not a nullable string:
+ *
+ *   absent                    no refusal has been observed at all
+ *   { known: true, code }     the latest refusal's code is on the allowlist
+ *   { known: false }          the latest refusal's reason is unknown, missing
+ *                             or malformed
+ *
+ * The `known: false` variant carries NO code property. There is nowhere in the
+ * type for an untrusted string to sit, so "we saw a reason we cannot name" is
+ * recorded without retaining one byte of what it said.
+ */
+export type CatalogRefusalReason =
+  | { readonly known: true; readonly code: string }
+  | { readonly known: false };
+
+/**
+ * The trusted sentinel for the third state.
+ *
+ * Frozen and shared: it is repository-authored data, never anything a payload
+ * produced, and `catalogRefusalLabel` resolves it to static text.
+ */
+export const UNKNOWN_CATALOG_REFUSAL: CatalogRefusalReason = Object.freeze({ known: false });
+
+/** The static text for a refusal reason in any of its known states. */
+export function catalogRefusalReasonLabel(reason: CatalogRefusalReason): string {
+  return reason.known ? catalogRefusalLabel(reason.code) : UNKNOWN_CATALOG_REFUSAL_LABEL;
+}
+
+/**
+ * The largest number of promoted or unsupported fields one canonical promotion
+ * can state. Mirror of `MAX_CANONICAL_FIELDS` in
+ * `backend/catalog/contracts.py`, where it is `len(CANONICAL_VARIANT_FIELDS)`:
+ * the two required identity columns, the two optional ones, and one per closed
+ * identity dimension.
+ *
+ * Both lists `PromotionAttempt.as_event()` carries are subsets of that tuple —
+ * `promoted_fields` is one entry per planned field, `unsupported_fields` is the
+ * unsupported subset of the namespaced dimensions — so this one number bounds
+ * both. A longer list did not come from that contract, and this module will not
+ * present its length as a field count.
+ *
+ * Declared here rather than fetched, so the browser stays free of any runtime
+ * coupling to the backend package;
+ * `tests/test_catalog_execution_flag.py::test_the_frontend_bounds_promoted_field_counts_at_the_backend_maximum`
+ * is the drift alarm that keeps the two numbers equal.
+ */
+export const MAX_CANONICAL_FIELDS = 12;
+
 export type CatalogActionOutcome = 'promoted' | 'refused';
 
 /** One bounded record of what the run did about one candidate. */
@@ -108,13 +167,21 @@ export type CatalogAction = {
   /** Bounded; absent when the payload did not state a usable string. */
   candidateKey?: string;
   canonicalKey?: string;
-  /** Counts, never the field names themselves. */
-  promotedFieldCount: number;
-  unsupportedFieldCount: number;
+  /**
+   * Counts, never the field names themselves.
+   *
+   * ABSENT rather than zero when the payload's list broke its declared
+   * contract — not an array, not an array of strings, or longer than
+   * `MAX_CANONICAL_FIELDS`. A malformed list is not evidence of zero fields,
+   * and rendering it as `0 fields promoted` would be a false statement of the
+   * same kind the stale-reason defect made.
+   */
+  promotedFieldCount?: number;
+  unsupportedFieldCount?: number;
   /** A promotion an earlier attempt already made; not a second write. */
   replayed: boolean;
-  /** Present only for an allowlisted refusal code. */
-  reasonCode?: string;
+  /** Present only on a refusal; the tri-state, never an untrusted string. */
+  reason?: CatalogRefusalReason;
 };
 
 export type CatalogRunState = {
@@ -123,8 +190,15 @@ export type CatalogRunState = {
   promotedCount: number;
   refusedCount: number;
   replayedCount: number;
-  /** Most recent ALLOWLISTED refusal code; unknown codes are not stored. */
-  lastRefusalCode?: string;
+  /**
+   * The LATEST refusal's reason, as the tri-state above.
+   *
+   * Absent means exactly one thing: no refusal has been observed. It is never
+   * used to mean "the latest refusal had a reason I could not name" — that is
+   * `UNKNOWN_CATALOG_REFUSAL`, and conflating the two is the defect this
+   * field's type exists to make unrepresentable.
+   */
+  lastRefusalReason?: CatalogRefusalReason;
   /** Fixed-size ring, oldest first. */
   actions: CatalogAction[];
 };
@@ -165,10 +239,50 @@ function boundedString(payload: Record<string, unknown>, key: string): string | 
   return trimmed.slice(0, MAX_CATALOG_KEY_CHARS);
 }
 
-/** How many entries a declared array holds. Anything else counts as none. */
-function listLength(payload: Record<string, unknown>, key: string): number {
+/**
+ * How many entries a field list holds — or `undefined` when it is not a field
+ * list this contract can have produced.
+ *
+ * The declared type is `list[str]`, bounded by `MAX_CANONICAL_FIELDS`. Three
+ * things are therefore rejected outright, and rejection means an ABSENT count
+ * rather than a zero:
+ *
+ *  - not an array at all. `'model_year_start'` is a malformed payload, and
+ *    counting its 16 characters, or an object's `length` property, would be
+ *    fabricating telemetry out of a type error;
+ *  - an array with a non-string member. The backend emits field KEYS; an array
+ *    holding an object or a number is not the list it claims to be, and the
+ *    honest count of it is "none available";
+ *  - longer than the contract allows. A canonical promotion cannot state more
+ *    fields than `CANONICAL_VARIANT_FIELDS` has entries, so a longer list did
+ *    not come from `as_event()` and its length is not a fact about a promotion.
+ *
+ * The length check runs BEFORE the per-member check so a hostile 100 000-entry
+ * array is rejected without being walked.
+ */
+function fieldListCount(payload: Record<string, unknown>, key: string): number | undefined {
   const value = payload[key];
-  return Array.isArray(value) ? value.length : 0;
+  if (!Array.isArray(value)) return undefined;
+  if (value.length > MAX_CANONICAL_FIELDS) return undefined;
+  if (!value.every((item) => typeof item === 'string')) return undefined;
+  return value.length;
+}
+
+/**
+ * The refusal reason as trusted state.
+ *
+ * Every path that is not an allowlisted code lands on the same sentinel:
+ * absent key, wrong type, empty or whitespace-only string, and a well-formed
+ * string that simply is not on the allowlist. The caller cannot tell those
+ * apart, and does not need to — what it needs is that none of them can be
+ * mistaken for a code, and that none of them retains the payload's value.
+ */
+function readRefusalReason(payload: Record<string, unknown>): CatalogRefusalReason {
+  const raw = boundedString(payload, 'reason');
+  if (raw !== undefined && Object.prototype.hasOwnProperty.call(CATALOG_REFUSAL_LABELS, raw)) {
+    return { known: true, code: raw };
+  }
+  return UNKNOWN_CATALOG_REFUSAL;
 }
 
 function readBoolean(payload: Record<string, unknown>, key: string): boolean {
@@ -203,12 +317,9 @@ export function reduceCatalogEvent(
 
   const payload = readPayload(event);
   const promoted = event.event_type === 'catalog_variant_promoted';
-  // A reason travels only with a refusal, and only an allowlisted code is kept.
-  const reasonRaw = promoted ? undefined : boundedString(payload, 'reason');
-  const reasonCode = reasonRaw !== undefined
-    && Object.prototype.hasOwnProperty.call(CATALOG_REFUSAL_LABELS, reasonRaw)
-    ? reasonRaw
-    : undefined;
+  // A reason travels only with a refusal. On a refusal it is ALWAYS resolved
+  // to the tri-state, so a refusal always has a reason of its own to report.
+  const reason = promoted ? undefined : readRefusalReason(payload);
   const replayed = promoted && readBoolean(payload, 'replayed');
 
   const action: CatalogAction = {
@@ -216,10 +327,10 @@ export function reduceCatalogEvent(
     outcome: promoted ? 'promoted' : 'refused',
     candidateKey: boundedString(payload, 'candidate_key'),
     canonicalKey: promoted ? boundedString(payload, 'canonical_key') : undefined,
-    promotedFieldCount: listLength(payload, 'promoted_fields'),
-    unsupportedFieldCount: listLength(payload, 'unsupported_fields'),
+    promotedFieldCount: fieldListCount(payload, 'promoted_fields'),
+    unsupportedFieldCount: fieldListCount(payload, 'unsupported_fields'),
     replayed,
-    reasonCode,
+    reason,
   };
 
   return {
@@ -227,7 +338,14 @@ export function reduceCatalogEvent(
     promotedCount: state.promotedCount + (promoted ? 1 : 0),
     refusedCount: state.refusedCount + (promoted ? 0 : 1),
     replayedCount: state.replayedCount + (replayed ? 1 : 0),
-    lastRefusalCode: promoted ? state.lastRefusalCode : (reasonCode ?? state.lastRefusalCode),
+    // A REFUSAL always replaces the summary with its own reason — including
+    // when that reason is the unknown sentinel. Falling back to the previous
+    // value here is what made the surface claim an older known reason was the
+    // latest refusal.
+    //
+    // A PROMOTION preserves it, because a promotion is not a newer refusal and
+    // does not make the most recent one stop having happened.
+    lastRefusalReason: promoted ? state.lastRefusalReason : reason,
     actions: push(state, action),
   };
 }

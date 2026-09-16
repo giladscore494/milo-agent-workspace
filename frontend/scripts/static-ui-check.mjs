@@ -73,7 +73,11 @@ const requiredF5Ui = [
 const requiredCatalogUi = [
   'Catalog status',
   'not a failed run',
-  'catalogRefusalLabel',
+  // The tri-state resolver, not the bare code lookup: rendering a reason any
+  // other way is how a stale or untrusted reason reaches the surface.
+  'catalogRefusalReasonLabel',
+  // A malformed field list must say so rather than claim zero.
+  'Field count unavailable',
 ];
 /**
  * Client state ownership, checked PER FILE.
@@ -105,7 +109,12 @@ const requiredOwnership = {
   'lib/runReducer.ts': ['ownsV1Projection', 'ownsAgentProjection', 'ownsSpendTelemetry'],
   // The catalog slice is written only through its own gated reducer.
   'lib/swarmReducer.ts': ['ownsCatalogProjection', 'reduceCatalogEvent'],
-  'lib/catalogStatus.ts': ['CATALOG_REFUSAL_LABELS', 'UNKNOWN_CATALOG_REFUSAL_LABEL', 'redactSecretText'],
+  'lib/catalogStatus.ts': ['CATALOG_REFUSAL_LABELS', 'UNKNOWN_CATALOG_REFUSAL_LABEL',
+    'redactSecretText',
+    // The refusal tri-state and the declared list bound. Dropping either
+    // reintroduces a corrected defect: a stale "latest refusal", or an
+    // unbounded array's length presented as a field count.
+    'CatalogRefusalReason', 'UNKNOWN_CATALOG_REFUSAL', 'MAX_CANONICAL_FIELDS'],
   // No upstream text is ever rendered: copy is authored here, allowlisted by
   // classification value.
   'lib/errorText.ts': ['ERROR_COPY', 'AuthFailure', 'classifyError'],
