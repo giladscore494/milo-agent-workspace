@@ -37,6 +37,7 @@ disabled (Stage A).
 | `MILO_ENABLE_RUN_CREATION` | api | no | no | must be off until Stage C | must be off | operator (staged) | `check_unsafe_defaults.py`; smoke tests | off | set off (kill switch #2) |
 | `MILO_ENABLE_PROPOSAL_MUTATIONS` / `_PROPOSAL_READS` / `_RUN_CANCELLATION` / `_EXECUTION_CONTROL` | api | no | no | staged | must be off | operator (staged) | same | off | set off |
 | `MILO_ENABLE_PAID_EXECUTION` | api+worker | no | no | must be off until Stage C | must be off | operator (Stage C) | fail-closed without budgets+key | off | set off (kill switch #1) |
+| `MILO_ENABLE_CATALOG_EXECUTION` | worker | no | no | must be off until separately authorized | must be off | operator (separate authorization; never a release side effect) | `check_unsafe_defaults.py`; `check-production-config.sh`; `parse_env_contract.py`; Stage A deployment contract; `verify_caps.py` | off | set off — the independent catalog kill switch; no code rollback needed; deletes/mutates no catalog row |
 | `MILO_DAILY_USER_BUDGET` / `MILO_DAILY_PROJECT_BUDGET` | api+worker | no | no | yes before Stage C | no | operator | nonzero numeric check | none (reserve refuses) | lower/restore values |
 | `MILO_MAX_COST_PER_RUN` / `_ESTIMATED_COST_PER_RUN` / `_MODEL_CALLS_PER_RUN` / `_INPUT_TOKENS_PER_RUN` / `_OUTPUT_TOKENS_PER_RUN` / `_TOTAL_TOKENS_PER_RUN` / `_AGENT_STEPS` / `_RETRIES` / `_RUN_DURATION_SECONDS` / `_CONCURRENT_RUNS_PER_USER` / `_CONCURRENT_RUNS_PER_PROJECT` | api+worker | no | no | mandatory subset before paid execution | no | operator | `PAID_WITHOUT_BUDGET` fail-closed | none (paid exec refused) | restore previous caps |
 | `MILO_ESTIMATED_COST_PER_CALL` | api+worker | no | no | no | no | operator | code default | 0.05 | unset |
@@ -53,6 +54,16 @@ disabled (Stage A).
 
 Notes:
 
+- **`MILO_ENABLE_CATALOG_EXECUTION` is worker-only and is never browser
+  controlled.** It gates the catalog capability INSIDE a Swarm V2 run that is
+  already happening: the `GovernmentVehicleTool` registration, the
+  `catalog:government:read` scope, the Government evidence mapper and the
+  `CatalogPromotionPipeline` (`backend/catalog/execution.py`,
+  `backend/worker/main.py`). Off means the capability is ABSENT from trusted
+  wiring, not hidden. Unset, `false` and any unrecognised value all mean off.
+  It creates no run, opens no execution route, authorizes no paid call, starts
+  no capture and schedules nothing, and every existing kill switch remains
+  authoritative above it. There is deliberately no `NEXT_PUBLIC_` twin.
 - **No server secret uses the `NEXT_PUBLIC_` prefix** — enforced by
   `scripts/check_unsafe_defaults.py`, `backend/production_config.py`
   (`PUBLIC_CONTAINS_SECRET`) and the frontend bundle secret check.

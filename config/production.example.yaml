@@ -63,6 +63,11 @@ execution_flags:
   MILO_ENABLE_RUN_CANCELLATION: false
   MILO_ENABLE_EXECUTION_CONTROL: false
   MILO_ENABLE_PAID_EXECUTION: false
+  # Worker-only: the catalog capability inside a Swarm V2 run (the Government
+  # tool, its scope and evidence mapper, and the canonical promotion pipeline).
+  # Enabling it is a separate, explicitly authorized operator decision and is
+  # never part of a release — see docs/production-readiness/STAGED_ACTIVATION.md.
+  MILO_ENABLE_CATALOG_EXECUTION: false
   GATEWAY_ALLOW_EXECUTION_ROUTES: false
 
 # Secret Manager RESOURCE NAMES (never values) and their sole consumers.

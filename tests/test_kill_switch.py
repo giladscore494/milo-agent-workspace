@@ -25,6 +25,8 @@ API_OK = {"status": {"latestReadyRevisionName": "api-safe", "traffic": [{"revisi
     {"name": "MILO_ENABLE_EXECUTION_CONTROL", "value": "false"},
     {"name": "JOB_LAUNCHER", "value": "disabled"},
     {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
+    # CODE-2: the kill switch closes the catalog path too, and verifies it.
+    {"name": "MILO_ENABLE_CATALOG_EXECUTION", "value": "false"},
 ]}]}}}}
 
 API_REVISION_OK = {"metadata": {"name": "api-safe"}, "spec": {"containers": [{"env": [
@@ -35,16 +37,23 @@ API_REVISION_OK = {"metadata": {"name": "api-safe"}, "spec": {"containers": [{"e
     {"name": "MILO_ENABLE_EXECUTION_CONTROL", "value": "false"},
     {"name": "JOB_LAUNCHER", "value": "disabled"},
     {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
+    # CODE-2: the kill switch closes the catalog path too, and verifies it.
+    {"name": "MILO_ENABLE_CATALOG_EXECUTION", "value": "false"},
 ]}]}}
 
 WORKER_OK = {"spec": {"template": {"spec": {"template": {"spec": {"containers": [{"env": [
     {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
+    # CODE-2: the worker is where the catalog capability is CONSTRUCTED, so a
+    # shutdown that left this flag enabled would leave the Government tool and
+    # the canonical promotion pipeline live on the next run.
+    {"name": "MILO_ENABLE_CATALOG_EXECUTION", "value": "false"},
 ]}]}}}}}}
 
 
 def worker_with_bound_key():
     return {"spec": {"template": {"spec": {"template": {"spec": {"containers": [{"env": [
         {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
+        {"name": "MILO_ENABLE_CATALOG_EXECUTION", "value": "false"},
         {"name": "KIMI_API_KEY", "valueFrom": {"secretKeyRef": {"name": "KIMI_API_KEY"}}},
     ]}]}}}}}}
 
@@ -168,7 +177,7 @@ def test_zero_executions_succeeds_without_cancelling(tmp_path):
     assert "MILO_ENABLE_PAID_EXECUTION=false" in log
     assert "MILO_ENABLE_RUN_CREATION=false" in log
     assert "JOB_LAUNCHER=disabled" in log
-    for flag in ("MILO_ENABLE_RUN_CREATION", "MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_PROPOSAL_READS", "MILO_ENABLE_RUN_CANCELLATION", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PAID_EXECUTION"):
+    for flag in ("MILO_ENABLE_RUN_CREATION", "MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_PROPOSAL_READS", "MILO_ENABLE_RUN_CANCELLATION", "MILO_ENABLE_EXECUTION_CONTROL", "MILO_ENABLE_PAID_EXECUTION", "MILO_ENABLE_CATALOG_EXECUTION"):
         assert f"{flag}=false" in log
     # BOTH provider-key aliases are removed, as secrets AND as env vars.
     for alias in ("KIMI_API_KEY", "MOONSHOT_API_KEY"):

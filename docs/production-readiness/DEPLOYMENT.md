@@ -128,9 +128,17 @@ set to the selected launcher mode (default `disabled`) and with every
 execution flag pinned off — `MILO_ENABLE_RUN_CREATION`,
 `MILO_ENABLE_PROPOSAL_MUTATIONS`, `MILO_ENABLE_PROPOSAL_READS`,
 `MILO_ENABLE_RUN_CANCELLATION`, `MILO_ENABLE_EXECUTION_CONTROL`,
-`MILO_ENABLE_PAID_EXECUTION` all `false` (the canonical list in
-`backend/production_config.py`). Enabling a stage is a deliberate,
-separate operator action; a release never flips a flag on.
+`MILO_ENABLE_PAID_EXECUTION`, `MILO_ENABLE_CATALOG_EXECUTION` all `false`
+(the canonical list in `backend/production_config.py`). Enabling a stage is
+a deliberate, separate operator action; a release never flips a flag on.
+
+`MILO_ENABLE_CATALOG_EXECUTION` is worker-only in effect — it gates the
+catalog capability inside a Swarm V2 run — but the deployment pins it `false`
+on **both** surfaces so that neither can drift on, and the deployer's own
+post-deploy verification treats it like every other `MILO_ENABLE_*` flag.
+Enabling it is not part of any stage: see
+[STAGED_ACTIVATION.md](STAGED_ACTIVATION.md) §"Catalog execution — a separate
+stage, separately authorized".
 
 ### No provider key exists at Stage A
 

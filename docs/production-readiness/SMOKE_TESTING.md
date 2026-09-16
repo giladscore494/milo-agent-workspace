@@ -26,7 +26,9 @@ the assertion.
 --env-file <metadata> --user-token-env <NAME> --conversation-id <uuid> …`
 
 Proves the production-like deployment stays safe while execution is
-disabled: paid-execution flag off (metadata); **authenticated** run
+disabled: paid-execution flag off, run-creation flag off, gateway execution
+routes off, and **catalog execution off** (`MILO_ENABLE_CATALOG_EXECUTION`) —
+all read from the deployment metadata; **authenticated** run
 creation blocked (HTTP 403 carrying the execution-disabled application
 classification — `EXECUTION_SURFACE_DISABLED` / the gateway safety-policy
 message); read-only surface functional; no secret material in responses;
@@ -62,6 +64,21 @@ The `no-secret-returned` health check is likewise fail-closed: it requires a
 successful `curl`, HTTP `200`, and a non-empty body before scanning for
 secret-looking material. A transport failure, a non-200 status, or an empty
 body is `BLOCKED`, never a false `PASS`.
+
+## Catalog posture in the Stage A smoke
+
+`MILO_ENABLE_CATALOG_EXECUTION` is checked with the other execution flags and
+must be off. Off means the catalog capability is ABSENT from trusted Swarm V2
+wiring — no Government tool registered, no `catalog:government:read` scope
+granted, no promotion pipeline constructed — rather than present and idle, so a
+deployment whose database already holds a usable Government snapshot stays inert
+for chat runs. A run in this posture can emit neither `catalog_variant_promoted`
+nor `catalog_promotion_refused`; seeing either one while the flag is supposed to
+be off means the deployed worker revision does not carry the configuration the
+metadata describes, and is `BLOCKED`, not a curiosity.
+
+Enabling it is never part of Stage A, B, C or D — see STAGED_ACTIVATION.md
+§"Catalog execution — a separate stage, separately authorized".
 
 ## Exact smoke-test order (Stage A)
 

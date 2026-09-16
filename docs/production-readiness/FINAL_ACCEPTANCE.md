@@ -54,6 +54,43 @@ Consolidated classification of every major item. Classifications:
 | Automated launch_unknown reconciliation | INTENTIONALLY_DEFERRED | below |
 | Supabase Realtime as primary event channel | INTENTIONALLY_DEFERRED | below |
 
+## Catalog, Swarm V2 and frontend stages
+
+Added by CODE-2, which found the table above silently omitted four merged
+stages (gap-audit row `OPS-09`). Every row below is a repository claim:
+`COMPLETED_IN_CODE` means implemented and tested here, and says nothing about
+what is deployed or enabled in any production environment.
+
+| Item | Classification | Reference |
+| --- | --- | --- |
+| Swarm V2 engine: Commander, plan firewall, model gateway, bounded workers, budgets | COMPLETED_IN_CODE | ARCHITECTURE.md, `backend/engines/swarm_v2/` |
+| Trusted engine routing from `project.workflow_key` (never from a payload) | COMPLETED_IN_CODE | `backend/worker/engine.py` |
+| Swarm V2 checkpoint/resume and durable terminal persistence | COMPLETED_IN_CODE | `docs/deployment/swarm-v2-smoke.md` |
+| Bounded read-only Government vehicle Tool (no transport, no credential) | COMPLETED_IN_CODE | `backend/tools/government_vehicle.py` |
+| Registered-operation evidence mapping (one allowlisted operation) | COMPLETED_IN_CODE | `backend/engines/swarm_v2/evidence_mapping.py` |
+| Lease-guarded, idempotent field-level canonical promotion | COMPLETED_IN_CODE | `backend/catalog/pipeline.py` |
+| Catalog migrations (bounded candidate queries, field-level promotion) | COMPLETED_IN_CODE | MIGRATIONS.md |
+| **Independent catalog execution kill switch (`MILO_ENABLE_CATALOG_EXECUTION`, default off)** | COMPLETED_IN_CODE | ENVIRONMENT_MATRIX.md, `backend/catalog/execution.py` |
+| **Fail-closed catalog capability gating in trusted worker wiring** | COMPLETED_IN_CODE | `backend/worker/main.py`, `tests/test_catalog_execution_flag.py` |
+| **Typed recognition for `catalog_variant_promoted` / `catalog_promotion_refused`** | COMPLETED_IN_CODE | `backend/runtime.py`, `frontend/lib/eventVocabulary.ts` |
+| **Bounded operator-facing catalog status projection** | COMPLETED_IN_CODE | `frontend/lib/catalogStatus.ts`, `components/inspector/RunInspector.tsx` |
+| **Catalog monitoring signals, rollback procedure and staged-activation position** | COMPLETED_IN_CODE (documentation) | MONITORING_AND_INCIDENTS.md, ROLLBACK.md, STAGED_ACTIVATION.md |
+| Catalog alerting bound to a real monitoring system | REQUIRES_MANUAL_OPERATOR_CONFIGURATION | MONITORING_AND_INCIDENTS.md |
+| Enabling catalog execution in a deployed environment | REQUIRES_MANUAL_OPERATOR_CONFIGURATION (separate explicit authorization) | STAGED_ACTIVATION.md |
+| Live Government capture entrypoint (operator CLI / job) | INTENTIONALLY_DEFERRED (not implemented; no production caller exists) | `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` (S3-02a) |
+| Bounded membership-authorized catalog read/review API and UI | INTENTIONALLY_DEFERRED (not implemented) | `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` (CAT-10) |
+| Manufacturer/importer source and targeted-Web evidence tool | INTENTIONALLY_DEFERRED (test-only implementations) | `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` |
+| Reconciliation / refresh scheduling and a `legacy_reference` producer | INTENTIONALLY_DEFERRED (no production caller or schedule) | `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` |
+| F4 typed Final Result rendering for Swarm V2, with V1 isolated | COMPLETED_IN_CODE | FRONTEND_ACCEPTANCE.md |
+| F5 client state ownership, safe error classification, hostile event handling | COMPLETED_IN_CODE | FRONTEND_ACCEPTANCE.md |
+| Event recognition before projection (unknown types stay inert) | COMPLETED_IN_CODE | `frontend/lib/eventVocabulary.ts`, FRONTEND_ACCEPTANCE.md |
+| Operator UI verification pass against a live browser | REQUIRES_MANUAL_OPERATOR_CONFIGURATION | FRONTEND_PRE_RELEASE.md |
+
+**Nothing in this section claims a deployment.** No catalog dashboard, alert,
+deployment or production verification is created by the work these rows
+describe; where a row says an alert or an activation is needed, it is operator
+work that has not been performed.
+
 ## Operator-tooling status and the honest meaning of "not BLOCKED"
 
 The Phase 9–11 operator tooling was found to contain real defects during a
@@ -91,6 +128,8 @@ secrets redacted.
 | Images + Cloud Run | Artifact Registry / Cloud Run | CI green on release SHA | `generate-deployment-plan.sh` output | revision digest verification | ROLLBACK.md |
 | Stage C smoke run | provider | Stages A+B signed off | STAGED_ACTIVATION.md Stage C | acceptance record | kill-switch order |
 | Monitoring | operator's system | signals list | MONITORING_AND_INCIDENTS.md | alert test | n/a |
+| Catalog alert binding | operator's system | catalog signals list | MONITORING_AND_INCIDENTS.md §Catalog signals | alert test | n/a |
+| Enabling catalog execution | Cloud Run worker job | Stages A+B signed off; read-only schema inspection; rollback rehearsed | STAGED_ACTIVATION.md §Catalog execution | flag value on the worker revision; catalog event counts | `MILO_ENABLE_CATALOG_EXECUTION=false` (ROLLBACK.md §Catalog execution) |
 
 ## Deferred items — required details
 
@@ -112,7 +151,8 @@ secrets redacted.
 9. verify the production Redis instance; 10. verify service-account
 separation; 11. verify required APIs; 12. verify Artifact Registry;
 13. verify secret resource names; 14. verify secret-level IAM; 15. verify
-all execution flags off; 16. verify the rollback revision/image
+all execution flags off, `MILO_ENABLE_CATALOG_EXECUTION` included;
+16. verify the rollback revision/image
 (`release.rollback_sha`); 17. obtain change approval.
 
 (Steps 5–15 are automated read-only by

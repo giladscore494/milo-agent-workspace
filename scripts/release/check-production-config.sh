@@ -94,6 +94,8 @@ INVENTORY=(
   "MILO_ENABLE_RUN_CANCELLATION|cloud-run-api-only|no|backend/production_config.py"
   "MILO_ENABLE_EXECUTION_CONTROL|cloud-run-api-only|no|backend/production_config.py"
   "MILO_ENABLE_PAID_EXECUTION|cloud-run-api-only|no|backend/production_config.py"
+  # Worker-only: the catalog capability inside a Swarm V2 run.
+  "MILO_ENABLE_CATALOG_EXECUTION|cloud-run-worker-only|no|backend/catalog/execution.py"
   "MILO_DAILY_USER_BUDGET|shared-api-worker|no|backend/budget.py"
   "MILO_DAILY_PROJECT_BUDGET|shared-api-worker|no|backend/budget.py"
   "MILO_MAX_COST_PER_RUN|shared-api-worker|no|backend/budget.py"
@@ -129,6 +131,7 @@ EXECUTION_FLAGS=(
   MILO_ENABLE_RUN_CANCELLATION
   MILO_ENABLE_EXECUTION_CONTROL
   MILO_ENABLE_PAID_EXECUTION
+  MILO_ENABLE_CATALOG_EXECUTION
   GATEWAY_ALLOW_EXECUTION_ROUTES
   NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI
 )

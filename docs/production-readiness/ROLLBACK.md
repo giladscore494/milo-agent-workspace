@@ -20,6 +20,57 @@ automatically.
 Flags are individual by design; there is no disable-all script either —
 each step is explicit and auditable.
 
+## Catalog execution — the independent rollback
+
+The catalog path has its own switch, so a catalog defect does **not** require
+the escalation above and does **not** require a code rollback.
+
+**Operator action (one command, not performed by this repository):**
+
+```
+gcloud run jobs update <CLOUD_RUN_WORKER_JOB> \
+  --project <GCP_PROJECT_ID> --region <GCP_REGION> \
+  --update-env-vars MILO_ENABLE_CATALOG_EXECUTION=false
+```
+
+**Order.** Reach for this FIRST for a catalog-specific incident — a wrong
+canonical value, an unexpected promotion, a refusal pattern that looks like a
+defect. Escalate to the general order above only if the incident is not
+confined to the catalog. If the general order has already been run, the Stage C
+kill switch (`scripts/release/stage-c/kill-switch.sh`) sets this flag false on
+the worker as part of its shutdown and verifies it afterwards, so the catalog is
+closed either way.
+
+**Verification evidence to capture (all read-only):**
+
+1. `gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> --format json` — the worker
+   container env shows `MILO_ENABLE_CATALOG_EXECUTION=false`;
+2. the next `swarm_v2` run emits neither `catalog_variant_promoted` nor
+   `catalog_promotion_refused` (query `run_events` for that run);
+3. `scripts/release/smoke-test-execution-disabled.sh --env-file <metadata>`
+   reports `flag:MILO_ENABLE_CATALOG_EXECUTION` as off.
+
+**What it does.** Subsequent runs register no Government tool, grant no
+`catalog:government:read` scope, build no Government evidence mapper and
+construct no promotion pipeline. The capability is absent from trusted wiring,
+not merely hidden. Runs already in flight finish under the configuration they
+started with.
+
+**What it does NOT do.** It **deletes and mutates no catalog row**. Snapshots,
+raw records, candidates, evidence links and canonical variants are left exactly
+as they are — this is a switch on future work, never a cleanup. Re-enabling it
+(a separate, explicitly authorized decision) resumes from the same durable
+state. There is deliberately no automated catalog data rollback: a canonical
+row written in error is corrected by forward review, under the migration policy
+below, never by an automatic delete.
+
+**What the two events mean** when you are reading a run during an incident is
+in [MONITORING_AND_INCIDENTS.md](MONITORING_AND_INCIDENTS.md): a
+`catalog_promotion_refused` is an operational catalog outcome, not a failed
+run, and an infrastructure failure (lost lease, failed pending-promotion read)
+emits no catalog event at all and leaves the run retryable rather than
+terminal.
+
 ## Vercel
 
 1. `vercel ls <VERCEL_PROJECT_NAME>` — identify the previous successful

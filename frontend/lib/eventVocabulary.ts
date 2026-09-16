@@ -14,10 +14,12 @@
  *
  * So recognition comes first, and it is by exact type, never by substring.
  *
- * `V1_EVENT_TYPES` is the frontend mirror of `EVENT_TYPES` in
- * `backend/runtime.py` — the set the API validates worker-written events
- * against — exactly as `lib/runStatus.ts` mirrors `TERMINAL_STATES`. It is the
- * ONLY set whose members may write the V1 projection.
+ * `V1_EVENT_TYPES` is the frontend mirror of `V1_EVENT_TYPES` in
+ * `backend/runtime.py`, exactly as `lib/runStatus.ts` mirrors
+ * `TERMINAL_STATES`. It is the ONLY set whose members may write the V1
+ * projection. (The backend's `EVENT_TYPES` — what the API accepts from a
+ * worker — is that set UNION the catalog set below; acceptance and projection
+ * ownership are deliberately two different questions.)
  *
  * `SWARM_V2_EVENT_TYPES` is the vocabulary `lib/swarmReducer.ts` handles. Its
  * members fold into the swarm slice and are deliberately NOT allowed into the
@@ -62,6 +64,30 @@ export const SWARM_V2_EVENT_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * The catalog path's two events. Mirror of `CATALOG_EVENT_TYPES` in
+ * `backend/runtime.py`.
+ *
+ * A DEDICATED closed set, not an addition to either set above, because
+ * membership is what grants a projection here. Putting these two in
+ * `V1_EVENT_TYPES` would hand a catalog event the agent, phase, progress and
+ * spend projection; putting them in `SWARM_V2_EVENT_TYPES` would offer them the
+ * task and lifecycle machinery. They own exactly one thing: the bounded catalog
+ * slice in `lib/catalogStatus.ts`. They keep the raw event stream they already
+ * had — every event is appended to it unconditionally — and they gain nothing
+ * else.
+ *
+ * These events are emitted by trusted server code (`backend/worker/main.py`,
+ * from `PromotionAttempt.as_event()`) that has no agent, task, phase or spend
+ * concept at all. Their payload carries ids, counts, booleans and static reason
+ * codes. Anything else in one is a payload making a claim its emitter cannot
+ * make, and the reducer ignores it.
+ */
+export const CATALOG_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'catalog_variant_promoted',
+  'catalog_promotion_refused',
+]);
+
+/**
  * Types that are about the RUN, not about an agent inside it.
  *
  * They are legitimate V1 events and keep every other projection they own — a
@@ -81,7 +107,19 @@ const RUN_LEVEL_EVENT_TYPES: ReadonlySet<string> = new Set([
 
 /** Recognised at all: it may be folded rather than only observed. */
 export function isKnownEventType(type: string): boolean {
-  return V1_EVENT_TYPES.has(type) || SWARM_V2_EVENT_TYPES.has(type);
+  return V1_EVENT_TYPES.has(type) || SWARM_V2_EVENT_TYPES.has(type)
+    || CATALOG_EVENT_TYPES.has(type);
+}
+
+/**
+ * May this type write the bounded catalog status slice?
+ *
+ * Exact membership of the catalog set and nothing else. `catalog_` is not a
+ * prefix rule and never becomes one: `catalog_variant_promoted_v2` is a type
+ * this release has never heard of, and it stays inert like any other.
+ */
+export function ownsCatalogProjection(type: string): boolean {
+  return CATALOG_EVENT_TYPES.has(type);
 }
 
 /**

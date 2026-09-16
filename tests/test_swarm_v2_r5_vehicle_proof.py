@@ -413,11 +413,13 @@ def test_none_of_r5s_proof_tools_reached_the_production_registry():
 
     The production registry was empty when this test was written and is not
     any more: Catalog PR3 registers ONE tool, the bounded Government catalog
-    read. What still has to be true -- and is what this test now says -- is
-    that none of R5's own fixtures is it.
+    read, and CODE-2 makes even that one conditional on the catalog execution
+    flag. What still has to be true -- and is what this test now says -- is
+    that none of R5's own fixtures is it, at EITHER flag value.
     """
     worker_main = Path("backend/worker/main.py").read_text()
-    assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in worker_main
+    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if catalog_enabled else [])"
+            in worker_main)
     for name in ("yeda.vehicle_catalog", "gov_il.vehicle_registry",
                  "toyota.archived_model_document"):
         assert name not in worker_main

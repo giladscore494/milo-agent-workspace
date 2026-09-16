@@ -26,7 +26,11 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
     "timed_out": set(),
     "budget_exhausted": set(),
 }
-EVENT_TYPES = {
+# The V1 engine's own vocabulary. `frontend/lib/eventVocabulary.ts` mirrors
+# THIS set into `V1_EVENT_TYPES`, and `ownsV1Projection` is that membership
+# test: a type in here may write the browser's agent, phase, progress, source,
+# claim, conflict and spend projection. Nothing may be added to it casually.
+V1_EVENT_TYPES = frozenset({
     "run_created", "run_started", "run_resumed", "phase_started", "phase_completed",
     "agent_created", "agent_started", "agent_progress", "agent_completed", "agent_failed",
     "chunk_started", "chunk_completed", "chunk_failed", "fallback_started", "fallback_completed",
@@ -38,7 +42,31 @@ EVENT_TYPES = {
     "budget_warning", "budget_exhausted", "token_limit_reached", "run_timed_out",
     "retry_limit_reached", "kill_switch_activated",
     "supervisor_shadow_failed",
-}
+})
+
+# CODE-2: the catalog path's two events, given typed recognition in their OWN
+# closed set rather than being folded into the V1 vocabulary above.
+#
+# The distinction is the whole point. These types must be RECOGNISED -- so the
+# API accepts them, so the browser can project them, so an operator has
+# something to act on -- without acquiring the V1 projection that membership of
+# `V1_EVENT_TYPES` would hand them. A `catalog_promotion_refused` event is
+# emitted by trusted server code that knows nothing about agents, phases,
+# progress or spend, and a payload claiming otherwise is a payload asserting
+# something its emitter cannot assert. That is the F5 rule, and recognising
+# these two types must not weaken it.
+#
+# Emitted by `backend/worker/main.py` from `PromotionAttempt.as_event()`, whose
+# payload is ids, counts, booleans and static reason codes only.
+CATALOG_EVENT_TYPES = frozenset({
+    "catalog_variant_promoted",
+    "catalog_promotion_refused",
+})
+
+# The authoritative acceptance vocabulary: every type a worker may durably
+# append (`backend/main.py` validates against exactly this). Recognition here
+# is exact set membership, never a substring or prefix test.
+EVENT_TYPES = V1_EVENT_TYPES | CATALOG_EVENT_TYPES
 
 class InvalidTransition(ValueError):
     pass

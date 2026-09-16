@@ -542,6 +542,47 @@ textarea { resize: vertical; min-height: 4.5rem; }
 .event-phase { grid-column: 1 / -1; color: var(--muted); }
 .event-message { grid-column: 1 / -1; color: var(--muted); font-size: 0.85rem; overflow-wrap: anywhere; }
 
+/* ---------- CODE-2: catalog status ----------
+   Every state is stated in words in the markup, so nothing here is the only
+   carrier of meaning: the rules below are emphasis, never the signal. The
+   counts wrap rather than scroll, and every key can break mid-token, so a
+   long candidate key cannot push the rail out of the viewport on a phone. */
+
+.catalog-status {
+  display: grid;
+  gap: 0.35rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.9rem;
+  min-width: 0;
+}
+
+.catalog-status-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.1rem;
+  margin: 0;
+}
+
+.catalog-status-counts > div { display: flex; gap: 0.35rem; align-items: baseline; }
+.catalog-status-counts dt { color: var(--muted); font-size: 0.82rem; }
+.catalog-status-counts dd { margin: 0; font-weight: 600; }
+.catalog-status-reason { margin: 0; color: var(--muted); font-size: 0.85rem; overflow-wrap: anywhere; }
+
+.catalog-status-actions { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.2rem; min-width: 0; }
+
+.catalog-action {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.15rem 0.5rem;
+  padding: 0.4rem 0;
+  border-top: 1px solid var(--border);
+}
+
+.catalog-action-outcome { font-weight: 600; font-size: 0.8rem; }
+.catalog-action.is-refused .catalog-action-outcome { color: var(--muted); }
+.catalog-action-key { overflow-wrap: anywhere; font-size: 0.85rem; }
+.catalog-action-detail { grid-column: 1 / -1; color: var(--muted); font-size: 0.8rem; overflow-wrap: anywhere; }
+
 /* ---------- desktop: static three-zone workspace ---------- */
 
 @media (min-width: 1100px) {

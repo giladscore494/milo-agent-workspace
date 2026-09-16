@@ -10,6 +10,7 @@
  * is not a model call; the run's model-call count lives in `run.usage` alone.
  */
 
+import { CatalogRunState, initialCatalogState } from './catalogStatus';
 import { EventId } from './eventId';
 import { humanizeKey } from './humanize';
 
@@ -92,6 +93,12 @@ export type SwarmRunState = {
   verification: SwarmVerificationState;
   /** Bounded ring of recent observable activity. */
   activity: SwarmActivityItem[];
+  /**
+   * The catalog path's own slice, and the ONLY projection its two events own.
+   * It carries counts, bounded keys and allowlisted reason codes — never a
+   * task, an agent, a lifecycle phase or a spend total.
+   */
+  catalog: CatalogRunState;
   conflictClaimIds: string[];
   evidenceClaimIds: string[];
   /** Safe forward compatibility: unrecognized event types are recorded, not applied. */
@@ -123,6 +130,7 @@ export const initialSwarmRunState: SwarmRunState = {
   taskOrder: [],
   verification: initialSwarmVerificationState,
   activity: [],
+  catalog: initialCatalogState,
   conflictClaimIds: [],
   evidenceClaimIds: [],
   unknownEventTypes: [],

@@ -879,17 +879,27 @@ def test_production_registers_exactly_one_read_tool_and_routes_the_seam():
     from trusted server state; the sink routed so an unmapped operation
     records nothing; and no write approval and no `tool:write:` capability
     anywhere in the wiring.
+
+    CODE-2 makes each of those three constructions CONDITIONAL on
+    `MILO_ENABLE_CATALOG_EXECUTION`, so the assertions below pin the guarded
+    forms. They remain a shape check over the source text; the behavioural
+    enabled/disabled contract -- what is actually registered, granted, mapped
+    and promoted at each flag value -- is proven against the real
+    `execute_run` in `tests/test_catalog_execution_flag.py`.
     """
     from backend.tools.government_vehicle import GovernmentVehicleTool
 
     source = _worker_wiring_source()
-    assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in source
-    assert "ToolContext(scopes=frozenset({GOVERNMENT_TOOL_SCOPE})" in source
+    assert "catalog_enabled = catalog_execution_enabled()" in source
+    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if catalog_enabled else [])"
+            in source)
+    assert "scopes=frozenset({GOVERNMENT_TOOL_SCOPE}) if catalog_enabled" in source
     assert "tool_result_sink=evidence_sink" in source
     assert "RegisteredOperationEvidenceSink(" in source
     # Catalog PR3's promotion path OBSERVES nothing here: it reads what the run
     # still owes from the database, so a resumed worker promotes what a crashed
-    # one would have.
+    # one would have. CODE-2 only decides WHETHER it is built.
+    assert "if catalog_enabled:" in source
     assert "CatalogPromotionPipeline(repo, board.lease)" in source
     assert "catalog_promotion[\"pipeline\"].promote()" in source
     assert "write_approved" not in source

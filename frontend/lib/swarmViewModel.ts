@@ -15,6 +15,11 @@
  */
 
 import {
+  CatalogAction,
+  MAX_CATALOG_ACTIONS,
+  catalogRefusalLabel,
+} from './catalogStatus';
+import {
   NormalizedRunUsage,
   RunUsage,
   normalizeRunUsage,
@@ -61,6 +66,29 @@ export type SwarmExecutionScale = {
   workerRepairs: number;
 };
 
+/**
+ * The operator-facing catalog answer for one reconstructed run.
+ *
+ * Counts, a bounded action list and STATIC text. `lastRefusalLabel` is resolved
+ * through the closed allowlist in `lib/catalogStatus.ts`, so what renders is
+ * always text this repository wrote — never a code a payload chose.
+ *
+ * A refusal here is an operational catalog outcome, not a failed run: this type
+ * has no failure field, and nothing derives one from these counts.
+ */
+export type SwarmCatalogStatus = {
+  /** False when no catalog event was seen — the ordinary case for a chat run. */
+  observed: boolean;
+  promotedCount: number;
+  refusedCount: number;
+  /** Promotions an earlier attempt had already made (a resumed worker). */
+  replayedCount: number;
+  /** Static label for the latest allowlisted refusal code, if there was one. */
+  lastRefusalLabel?: string;
+  /** Bounded, oldest first; at most `MAX_CATALOG_ACTIONS`. */
+  actions: CatalogAction[];
+};
+
 export type SwarmRunViewModel = {
   workflowKey?: string;
   isSwarmV2: boolean;
@@ -79,6 +107,7 @@ export type SwarmRunViewModel = {
   usage: NormalizedRunUsage;
   scale: SwarmExecutionScale;
   activity: SwarmActivityItem[];
+  catalog: SwarmCatalogStatus;
   conflictClaimCount: number;
   evidenceClaimCount: number;
   unknownEventTypes: string[];
@@ -139,6 +168,27 @@ export function selectSwarmTaskCounts(state: SwarmRunState): SwarmTaskCounts {
   return counts;
 }
 
+/**
+ * The catalog slice, resolved into what an operator reads.
+ *
+ * The only transformation is code → static label. Every number comes straight
+ * from the bounded slice, and the action list is already a fixed-size ring, so
+ * this selector cannot grow with the event stream.
+ */
+export function selectCatalogStatus(state: SwarmRunState): SwarmCatalogStatus {
+  const catalog = state.catalog;
+  return {
+    observed: catalog.observed,
+    promotedCount: catalog.promotedCount,
+    refusedCount: catalog.refusedCount,
+    replayedCount: catalog.replayedCount,
+    lastRefusalLabel: catalog.lastRefusalCode === undefined
+      ? undefined
+      : catalogRefusalLabel(catalog.lastRefusalCode),
+    actions: catalog.actions.slice(-MAX_CATALOG_ACTIONS),
+  };
+}
+
 /** Tasks running concurrently; two different task ids may both be running. */
 export function selectRunningSwarmTaskIds(state: SwarmRunState): string[] {
   return selectSwarmTasks(state)
@@ -189,6 +239,7 @@ export function buildSwarmRunViewModel(input: SwarmRunViewModelInput): SwarmRunV
       workerRepairs: tasks.reduce((total, task) => total + task.repairCount, 0),
     },
     activity: swarm.activity,
+    catalog: selectCatalogStatus(swarm),
     conflictClaimCount: swarm.conflictClaimIds.length,
     evidenceClaimCount: swarm.evidenceClaimIds.length,
     unknownEventTypes: swarm.unknownEventTypes,
@@ -229,5 +280,15 @@ export function summarizeSwarmRun(viewModel: SwarmRunViewModel): Record<string, 
     worker_repairs: viewModel.scale.workerRepairs,
     conflicts: viewModel.conflictClaimCount,
     evidence_claims: viewModel.evidenceClaimCount,
+    // Counts and a static label. No candidate key, no canonical key and no
+    // reason code goes into this developer blob: the operator surface renders
+    // them as structured text, and this summary stays a summary.
+    catalog: {
+      observed: viewModel.catalog.observed,
+      promoted: viewModel.catalog.promotedCount,
+      refused: viewModel.catalog.refusedCount,
+      replayed: viewModel.catalog.replayedCount,
+      last_refusal: viewModel.catalog.lastRefusalLabel,
+    },
   };
 }

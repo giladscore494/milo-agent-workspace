@@ -72,7 +72,7 @@ if [[ -n "${ENV_FILE}" ]]; then
   load_env_file "${ENV_FILE}" "X" || {
     finish_checks "smoke-test-execution-disabled" "${JSON_OUTPUT}"; exit $?
   }
-  for flag in MILO_ENABLE_PAID_EXECUTION MILO_ENABLE_RUN_CREATION GATEWAY_ALLOW_EXECUTION_ROUTES; do
+  for flag in MILO_ENABLE_PAID_EXECUTION MILO_ENABLE_RUN_CREATION MILO_ENABLE_CATALOG_EXECUTION GATEWAY_ALLOW_EXECUTION_ROUTES; do
     value="$(env_meta "${flag}" X | tr '[:upper:]' '[:lower:]')"
     if [[ "${value}" =~ ^(1|true|yes|on)$ ]]; then
       record_check BLOCKED "flag:${flag}" "must be off for the execution-disabled posture"

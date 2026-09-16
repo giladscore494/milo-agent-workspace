@@ -1776,11 +1776,18 @@ def swarm_run_reaching_completion(monkeypatch):
     smoke fixture settles on `partial_success`, where blocking the completion
     branch would prove nothing.
     """
+    from backend.catalog.execution import CATALOG_EXECUTION_FLAG
     from test_swarm_v2_smoke_offline import (FakeKimiCompletions, build_repo,
                                              run_worker_directly, swarm_env)
     import backend.engines.swarm_v2 as swarm_pkg
 
-    swarm_env(monkeypatch)
+    # CODE-2: this test is about what the promotion path does when its durable
+    # read fails, so it has to be a run where the promotion path EXISTS. The
+    # catalog flag is default-off, and a run with the capability absent would
+    # pass the "never marked complete" assertion for the wrong reason -- by
+    # never reaching a promotion at all. `tests/test_catalog_execution_flag.py`
+    # owns the disabled posture; this one owns the enabled one.
+    swarm_env(monkeypatch, **{CATALOG_EXECUTION_FLAG: "true"})
     monkeypatch.setattr(swarm_pkg.SwarmV2Adapter, "run",
                         lambda self, run: dict(USABLE_PRODUCT_OUTCOME))
     repo, conversation_id = build_repo()

@@ -30,11 +30,18 @@ note_failure() {
   echo "KILL SWITCH CRITICAL: $1" >&2
 }
 
-# -- 1. Paid execution OFF (worker). A failure here is critical on its own.
+# -- 1. Paid execution OFF and catalog execution OFF (worker). A failure here
+# is critical on its own.
+#
+# The catalog flag is the worker's OWN switch: the Government tool and the
+# canonical promotion pipeline are built from it, and this is the only place a
+# full shutdown can close them. Setting it false stops this worker from reading
+# candidates and writing canonical facts; it DELETES AND MUTATES NOTHING, so
+# the durable catalog is exactly as it was when the flag is set back.
 if ! gcloud run jobs update "${STAGE_C_WORKER_JOB}" \
     --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
-    --update-env-vars="MILO_ENABLE_PAID_EXECUTION=false"; then
-  note_failure "worker paid-execution flag update failed"
+    --update-env-vars="MILO_ENABLE_PAID_EXECUTION=false,MILO_ENABLE_CATALOG_EXECUTION=false"; then
+  note_failure "worker paid-execution/catalog-execution flag update failed"
 fi
 
 # -- 2. Remove EVERY provider-key alias from the worker, one invocation per
@@ -61,7 +68,7 @@ done
 # depend on absent-variable defaults or on a previous revision's template.
 if ! gcloud run services update "${STAGE_C_API_SERVICE}" \
     --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
-    --update-env-vars="MILO_ENABLE_RUN_CREATION=false,MILO_ENABLE_PROPOSAL_MUTATIONS=false,MILO_ENABLE_PROPOSAL_READS=false,MILO_ENABLE_RUN_CANCELLATION=false,MILO_ENABLE_EXECUTION_CONTROL=false,MILO_ENABLE_PAID_EXECUTION=false,JOB_LAUNCHER=disabled"; then
+    --update-env-vars="MILO_ENABLE_RUN_CREATION=false,MILO_ENABLE_PROPOSAL_MUTATIONS=false,MILO_ENABLE_PROPOSAL_READS=false,MILO_ENABLE_RUN_CANCELLATION=false,MILO_ENABLE_EXECUTION_CONTROL=false,MILO_ENABLE_PAID_EXECUTION=false,MILO_ENABLE_CATALOG_EXECUTION=false,JOB_LAUNCHER=disabled"; then
   note_failure "API fail-closed flag update failed"
 fi
 
@@ -257,6 +264,7 @@ for flag in (
     "MILO_ENABLE_RUN_CANCELLATION",
     "MILO_ENABLE_EXECUTION_CONTROL",
     "MILO_ENABLE_PAID_EXECUTION",
+    "MILO_ENABLE_CATALOG_EXECUTION",
 ):
     assert values.get(flag) == "false", f"{flag} is not false on serving revision"
 assert values.get("JOB_LAUNCHER") == "disabled", (
@@ -287,6 +295,7 @@ env = container.get("env") or []
 values = {e["name"]: e.get("value") for e in env if "value" in e}
 secret_refs = {e["name"] for e in env if "valueFrom" in e}
 assert values.get("MILO_ENABLE_PAID_EXECUTION") == "false", "worker MILO_ENABLE_PAID_EXECUTION is not false"
+assert values.get("MILO_ENABLE_CATALOG_EXECUTION") == "false", "worker MILO_ENABLE_CATALOG_EXECUTION is not false"
 for alias in aliases:
     assert alias not in secret_refs, f"provider secret {alias} still bound to the worker"
     assert alias not in values, f"provider variable {alias} still present on the worker"
