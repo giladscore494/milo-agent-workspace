@@ -543,7 +543,7 @@ Done כאשר: פרויקט עם workflow_key=swarm_v2 מסיים Run במצב c
 > | --- | --- | --- |
 > | **Catalog PR1** | Persistence only: the versioned schema, the guarded write paths, RLS/ACL, and an empty canonical catalog. No ingestion, no HTTP, no tool, no promotion. | merged (#85, corrected by #86) |
 > | **Catalog PR2** | Government ingestion into that schema: the read-only `data.gov.il` path that fills snapshots, raw records and candidates. | merged (#87) |
-> | **Catalog PR3** | Connect the capability to Swarm V2 and add controlled canonical promotion, gated on verified evidence. | **this PR** — see `docs/catalog-pr3-swarm-and-promotion.md` |
+> | **Catalog PR3** | Connect the capability to Swarm V2 and add controlled canonical promotion, gated on verified evidence. | merged (#88, `18c5f6402afc6a210a5d44ddd98a012231e350de`) — see `docs/catalog-pr3-swarm-and-promotion.md` |
 >
 > **THE CATALOG WORKSTREAM ENDS WITH PR3.** These three are the whole of the
 > corrected catalog track. There is no Catalog PR4, and the next work returns
