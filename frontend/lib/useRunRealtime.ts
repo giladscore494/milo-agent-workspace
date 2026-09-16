@@ -74,24 +74,25 @@ export function useRunRealtime(
   // Monotonic generation: bumps whenever the active run (or user/session)
   // changes, so a late response from run A can never mutate run B's state.
   const generation = useRef(0);
-  // Read through refs so a changed callback or a changed conversation does not
-  // restart polling; the run switch is the only thing that may do that.
-  const expectedConversation = useRef(expectedConversationId);
-  expectedConversation.current = expectedConversationId;
+  // The rejection callback is read through a ref so that an unstable callback
+  // from a caller cannot restart polling. It is synced in an effect declared
+  // BEFORE the polling effect, never during render: effects run in declaration
+  // order, so the ref is current before any poll can read it, and a render
+  // React discards can never leave a stale value behind.
   const rejectRun = useRef(onRunRejected);
-  rejectRun.current = onRunRejected;
+  useEffect(() => { rejectRun.current = onRunRejected; }, [onRunRejected]);
 
   // The cursor has exactly one owner: `poll` advances it from the events it
   // just folded, and the run-switch effect below clears it. Deriving it from
   // rendered state as well would give it a second, racier writer.
 
-  const poll = useCallback(async (id: string, myGeneration: number) => {
+  const poll = useCallback(async (id: string, myGeneration: number, conversationId?: string) => {
     if (inFlight.current || stopped.current) return;
     inFlight.current = true;
     try {
       const run = await api.run(id);
       if (generation.current !== myGeneration) return; // stale response
-      if (!runBelongsToScope(run, id, expectedConversation.current)) {
+      if (!runBelongsToScope(run, id, conversationId)) {
         // Not the run that was asked for, or not this conversation's run.
         // Nothing is dispatched, polling stops, and the caller is told so it
         // can clear whatever produced the id.
@@ -159,7 +160,7 @@ export function useRunRealtime(
     let cancelled = false;
     const tick = async () => {
       if (cancelled || stopped.current || generation.current !== myGeneration) return;
-      await poll(runId, myGeneration);
+      await poll(runId, myGeneration, expectedConversationId);
       if (cancelled || stopped.current || generation.current !== myGeneration) return;
       const backoff = Math.min(
         BASE_INTERVAL_MS * 2 ** failures.current,
@@ -174,7 +175,11 @@ export function useRunRealtime(
       stopped.current = true;
       if (timer.current) clearTimeout(timer.current);
     };
-  }, [runId, poll]);
+    // The expected conversation is a DEPENDENCY, not a ref read during render:
+    // the guard must never compare against a value from a render that was
+    // abandoned. A conversation change already implies a run change, so this
+    // adds no extra restarts in practice.
+  }, [runId, expectedConversationId, poll]);
 
   // The Swarm V2 view model is derived, never stored, so it resets with the
   // workspace state on every run switch and can never outlive its run.
