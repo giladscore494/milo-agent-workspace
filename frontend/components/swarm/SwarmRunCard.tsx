@@ -1,8 +1,11 @@
 'use client';
+import { useRef } from 'react';
 import { safeText } from '@/lib/sanitize';
 import { SwarmRunViewModel } from '@/lib/swarmViewModel';
 import { LaunchState } from '@/lib/types';
 import { PollingMode } from '@/lib/useRunRealtime';
+import { CancelRunControl } from '../run/CancelRunControl';
+import { LaunchStateNote } from '../run/LaunchStateNote';
 import { SwarmStageTrack } from './SwarmStageTrack';
 import { SwarmTaskList } from './SwarmTaskList';
 import {
@@ -60,6 +63,9 @@ export function SwarmRunCard({
   onConfirmCancel,
   onKeepRunning,
 }: SwarmRunCardProps) {
+  // Where focus lands if the cancellation control is withdrawn from under it
+  // because the run reached a terminal state.
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
   const lifecycle = describeSwarmLifecycle(swarm);
   const commander = describeSwarmCommander(swarm);
   const verification = describeSwarmVerification(swarm);
@@ -73,7 +79,7 @@ export function SwarmRunCard({
     <section className="panel swarm-card" data-live={lifecycle.live} aria-labelledby="swarm-run-title">
       <header className="swarm-card-head">
         <div className="swarm-card-heading">
-          <h3 className="panel-title" id="swarm-run-title">Swarm run</h3>
+          <h3 className="panel-title" id="swarm-run-title" ref={headingRef} tabIndex={-1}>Swarm run</h3>
           <p className="eyebrow">Swarm V2 execution</p>
         </div>
         {/* Polling stays visually silent; only a failing poll says anything,
@@ -161,27 +167,18 @@ export function SwarmRunCard({
       {/* Cancellation stays available only while the run is active, keeps the
           existing confirm-with-optional-reason interaction, and leaves the API
           call and the terminal verdict to the backend. */}
-      {!finished && !confirmingCancel && (
-        <button type="button" className="button button--quiet" onClick={onRequestCancel}>Cancel run</button>
-      )}
-      {!finished && confirmingCancel && (
-        <div className="cancel-form">
-          <div className="field">
-            <label className="field-label sr-only" htmlFor="swarm-cancel-reason">Cancellation reason</label>
-            <input
-              id="swarm-cancel-reason"
-              value={cancelReason}
-              onChange={(event) => onCancelReasonChange(event.target.value)}
-              placeholder="Reason (optional)"
-            />
-          </div>
-          <div className="button-row">
-            <button type="button" className="button button--danger" onClick={onConfirmCancel}>Confirm cancellation</button>
-            <button type="button" className="button button--quiet" onClick={onKeepRunning}>Keep running</button>
-          </div>
-        </div>
-      )}
-      {cancelError && <p className="alert" role="alert">{safeText(cancelError)}</p>}
+      <CancelRunControl
+        idPrefix="swarm"
+        available={!finished}
+        confirming={confirmingCancel}
+        reason={cancelReason}
+        error={cancelError}
+        onReasonChange={onCancelReasonChange}
+        onRequestCancel={onRequestCancel}
+        onConfirm={onConfirmCancel}
+        onKeepRunning={onKeepRunning}
+        focusFallbackRef={headingRef}
+      />
 
       {finished && (
         <p className="run-verdict" data-tone={lifecycle.outcomeTone}>
@@ -199,11 +196,11 @@ export function SwarmRunCard({
         {(lifecycle.outcome ?? swarm.runStatus) && (
           <span className="note">Status {safeText(lifecycle.outcome ?? swarm.runStatus)}</span>
         )}
-        {launchState && (
-          <span className="note">
-            Launch {safeText(launchState)}{launchReconciliationRequired ? ' · reconciliation required' : ''}
-          </span>
-        )}
+        <LaunchStateNote
+          launchState={launchState}
+          launchReconciliationRequired={launchReconciliationRequired}
+          tone="note"
+        />
       </footer>
     </section>
   );

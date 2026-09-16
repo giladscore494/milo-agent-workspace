@@ -196,6 +196,28 @@ test('24. timeout stops execution', async ({ page }) => {
   await expect(page.getByText('timed_out').first()).toBeVisible();
 });
 
+test('25b. partial_success is reported as its own terminal status, never as completed', async ({ page }) => {
+  // The other five terminal statuses are asserted as literals by tests 20/22/
+  // 23/24/25 on the V1 path. `partial_success` is only reachable through the
+  // Swarm V2 product contract, so it is asserted here — and it is the one that
+  // most needs asserting, because reading it as "completed" would present an
+  // unfinished run as a finished one.
+  await loginViaUi(page, 'alice');
+  await page.getByText('Gamma Swarm').click();
+  await page.getByLabel('Conversation title').fill('convo-partial-terminal');
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await page.getByLabel('Task content').fill('produce a partial report please');
+  await page.getByRole('button', { name: 'Send task' }).click();
+
+  const execution = page.getByRole('region', { name: 'Swarm run' });
+  await expect(execution.getByText(/Run finished with status/)).toBeVisible({ timeout: 30_000 });
+  await expect(execution.getByText('partial_success').first()).toBeVisible();
+  await expect(execution.getByText(/Partial success is not a completed run/)).toBeVisible();
+  // The durable status is `partial_success`, and nothing on the execution
+  // surface calls the run completed.
+  await expect(execution.getByText('Run finished with status completed')).toHaveCount(0);
+});
+
 test('25. worker failure displays a safe error', async ({ page }) => {
   await loginViaUi(page, 'alice');
   await page.getByText('Alpha Research').click();

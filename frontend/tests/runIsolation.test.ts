@@ -86,6 +86,61 @@ describe('run state isolation', () => {
     expect(result.current.state.run).toBeUndefined();
   });
 
+  it('refuses a run row whose id is not the run that was asked for', async () => {
+    // The generation counter says "this answer is for the run the hook is on".
+    // It cannot say "this answer IS that run", so the row is checked too.
+    apiMocks.run.mockResolvedValue(runPayload(RUN_B, 'completed'));
+    apiMocks.events.mockResolvedValue([eventPayload(1, RUN_B, 'from the wrong run')]);
+    const rejected = vi.fn();
+
+    const { result } = renderHook(() => useRunRealtime(RUN_A, undefined, undefined, rejected));
+
+    await waitFor(() => expect(rejected).toHaveBeenCalledWith(RUN_A));
+    expect(result.current.state.run).toBeUndefined();
+    expect(result.current.state.events).toHaveLength(0);
+    // Nothing was dispatched, so the events endpoint was never even reached.
+    expect(apiMocks.events).not.toHaveBeenCalled();
+  });
+
+  it('refuses a run that belongs to a different conversation than the one selected', async () => {
+    apiMocks.run.mockResolvedValue({ id: RUN_A, conversation_id: 'other-conversation', status: 'completed' });
+    apiMocks.events.mockResolvedValue([]);
+    const rejected = vi.fn();
+
+    const { result } = renderHook(() => useRunRealtime(RUN_A, undefined, 'selected-conversation', rejected));
+
+    await waitFor(() => expect(rejected).toHaveBeenCalledWith(RUN_A));
+    expect(result.current.state.run).toBeUndefined();
+  });
+
+  it('accepts the run when it matches both the requested id and the conversation', async () => {
+    apiMocks.run.mockResolvedValue({ id: RUN_A, conversation_id: 'selected-conversation', status: 'running' });
+    apiMocks.events.mockResolvedValue([]);
+    const rejected = vi.fn();
+
+    const { result } = renderHook(() => useRunRealtime(RUN_A, undefined, 'selected-conversation', rejected));
+
+    await waitFor(() => expect(result.current.state.run?.id).toBe(RUN_A));
+    expect(rejected).not.toHaveBeenCalled();
+  });
+
+  it('never folds an event that names another run', async () => {
+    apiMocks.run.mockImplementation(async (id: string) => runPayload(id));
+    apiMocks.events.mockResolvedValue([
+      eventPayload(1, RUN_A, 'mine'),
+      eventPayload(2, RUN_B, 'not mine'),
+      { id: 3, event_type: 'agent_progress', message: 'unattributed' },
+    ]);
+
+    const { result } = renderHook(() => useRunRealtime(RUN_A));
+
+    await waitFor(() => expect(result.current.state.events).toHaveLength(1));
+    expect(result.current.state.events[0].message).toBe('mine');
+    // The dropped events carried tokens and cost; neither may be counted.
+    expect(result.current.state.tokens).toBe(10);
+    expect(result.current.state.cost).toBe(0.5);
+  });
+
   it('stops polling on every terminal state', async () => {
     for (const status of ['completed', 'partial_success', 'failed', 'cancelled', 'timed_out', 'budget_exhausted']) {
       apiMocks.run.mockResolvedValue(runPayload(RUN_A, status));

@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { ALICE_PROJECTS, PROJECT_ALPHA, PROJECT_BETA, apiToken, authHeaders, createConversation, loginViaUi } from './helpers';
+import { ALICE_PROJECTS, APPROVED_PUBLIC_VARS, PROJECT_ALPHA, PROJECT_BETA, apiToken, authHeaders, createConversation, loginViaUi } from './helpers';
 
 // DISABLED stack: every execution flag is off. These tests prove the
 // default production posture end to end.
@@ -136,6 +136,29 @@ test('27. sign-out removes access', async ({ page }) => {
   await expect(page.getByText('Alpha Research')).toHaveCount(0);
 });
 
+test('27b. sign-out also clears the browser record of which run each conversation was on', async ({ page }) => {
+  await loginViaUi(page, 'alice');
+  // Session storage is workspace state the browser keeps for itself. A
+  // signed-out page may not keep it, and a refresh after sign-out must not be
+  // able to reopen anything from it.
+  await page.evaluate(() => {
+    window.sessionStorage.setItem('milo.activeRun.11111111-1111-4111-8111-000000000001', 'a-previous-run');
+    window.sessionStorage.setItem('unrelated.key', 'kept');
+  });
+
+  await page.getByRole('button', { name: 'Logout' }).click();
+  await expect(page.getByRole('button', { name: 'Login' })).toBeVisible();
+
+  const stored = await page.evaluate(() => ({
+    run: window.sessionStorage.getItem('milo.activeRun.11111111-1111-4111-8111-000000000001'),
+    unrelated: window.sessionStorage.getItem('unrelated.key'),
+  }));
+  expect(stored.run).toBeNull();
+  // Only MILO's own keys are cleared; the page does not empty storage it does
+  // not own.
+  expect(stored.unrelated).toBe('kept');
+});
+
 test('28. no secrets are exposed in served pages or client bundles', async ({ page, request, baseURL }) => {
   await page.goto('/');
   const html = await page.content();
@@ -147,10 +170,20 @@ test('28. no secrets are exposed in served pages or client bundles', async ({ pa
     expect(html, String(pattern)).not.toMatch(pattern);
   }
   const scripts = await page.locator('script[src]').evaluateAll((nodes) => nodes.map((n) => (n as HTMLScriptElement).src));
-  for (const src of scripts.slice(0, 10)) {
+  // EVERY served script, not a sample of them: a credential in the eleventh
+  // chunk is a credential. `npm run test:secrets` scans the built bundle on
+  // disk; this scans what the running server actually hands the browser, and
+  // the two are different evidence.
+  expect(scripts.length, 'the page served no scripts to scan').toBeGreaterThan(0);
+  for (const src of scripts) {
     const body = await (await request.get(src)).text();
     for (const pattern of forbidden) {
       expect(body, `${src} ${pattern}`).not.toMatch(pattern);
+    }
+    // Only approved public configuration may be inlined into browser code.
+    const publicVars = body.match(/NEXT_PUBLIC_[A-Z0-9_]+/g) ?? [];
+    for (const name of new Set(publicVars)) {
+      expect(APPROVED_PUBLIC_VARS, `${src} ${name}`).toContain(name);
     }
   }
 });

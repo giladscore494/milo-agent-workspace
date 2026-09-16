@@ -9,6 +9,11 @@ production configures differently:
   only; no paid model call is possible);
 - a deterministic worker-token verifier instead of Google certificates.
 
+The fake launcher can also raise the PRODUCTION `JobLaunchUncertain`
+condition on demand (see `UNCERTAIN_LAUNCH_MARKER`), so the
+`launch_unknown` path is exercised through the real API handling rather
+than by writing the state directly.
+
 Security behavior is NOT weakened: authorization, execution flags,
 idempotency, budget gates and worker identity checks all run production
 code. Never deploy this module.
@@ -27,6 +32,7 @@ from uuid import UUID
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker
 from backend.dependencies import get_job_launcher, get_repository
 from backend.gateway_auth import get_gateway_token_verifier
+from backend.job_launcher import JobLaunchUncertain
 from backend.main import app
 from backend.testing.memory_repository import MemoryRepository
 from backend.worker_auth import get_token_verifier
@@ -171,6 +177,12 @@ def build_swarm_v2_product_result(content: str) -> dict[str, Any]:
          VerificationVerdict(claim_id="claim-fuel", verdict="verified", reason=supports)])
 
 
+#: Task content that makes the test launcher report an UNCERTAIN launch.
+#: Deliberately avoids the substrings the worker's own branches match
+#: ("fail", "timeout", "exhaust budget", "partial", "slow").
+UNCERTAIN_LAUNCH_MARKER = "uncertain launch"
+
+
 class InProcessFakeWorkerLauncher:
     """Simulates the Cloud Run worker in a daemon thread with mocked model
     calls. Exercises polling, cancellation, budget exhaustion, timeout,
@@ -179,7 +191,27 @@ class InProcessFakeWorkerLauncher:
     def __init__(self, repo: MemoryRepository):
         self.repo = repo
 
+    def _run_content(self, run_id: UUID) -> str:
+        try:
+            return str((self.repo.get_run(run_id).get("input") or {}).get("content") or "").lower()
+        except Exception:  # pragma: no cover - defensive; the run was just created
+            return ""
+
     def launch(self, run_id: UUID) -> dict[str, str]:
+        if UNCERTAIN_LAUNCH_MARKER in self._run_content(run_id):
+            # The PRODUCTION uncertainty condition, raised at the production
+            # seam. `CloudRunJobLauncher.launch` raises exactly this when the
+            # HTTP request may have reached Google before the connection broke:
+            # an execution might already be running, so the API must park the
+            # run as `launch_unknown` and never relaunch it on its own.
+            #
+            # Nothing downstream is stubbed. `_create_and_launch_run` handles
+            # this exception in production code, and NO worker thread is
+            # started here -- which is what makes "the launcher was not invoked
+            # twice" observable: a second invocation would append a second
+            # `launch_failed` event.
+            raise JobLaunchUncertain(
+                "E2E: Cloud Run Job launch outcome unknown (test-only launcher seam)")
         thread = threading.Thread(target=self._run, args=(run_id,), daemon=True)
         thread.start()
         return {"mode": "e2e-inprocess", "run_id": str(run_id), "execution": f"e2e-{run_id}"}

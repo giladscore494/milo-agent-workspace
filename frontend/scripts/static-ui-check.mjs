@@ -39,6 +39,7 @@ if (scanned.length === 0) {
 const ui = scanned.map((file) => readFileSync(file, 'utf8')).join('\n');
 const reducer = readFileSync('lib/runReducer.ts', 'utf8');
 
+
 /** User-visible surfaces that must survive any refactor of the workspace. */
 const requiredUi = ['Projects', 'Conversations', 'Workflow proposal', 'Live run', 'Live event stream', 'Final artifacts', 'Agents', 'Workflow', 'Sources', 'Claims', 'Conflicts', 'Costs', 'Developer', 'forbidden', 'approved', 'active'];
 /**
@@ -49,6 +50,36 @@ const requiredUi = ['Projects', 'Conversations', 'Workflow proposal', 'Live run'
 const requiredFinalResult = ['Final result', 'Verified fields', 'Outstanding items', 'Result unavailable', 'parseFinalResult', 'Provenance'];
 /** Security and durable-contract behaviour that must stay wired into the UI. */
 const requiredSecurity = ['safeText', 'redactSecrets', 'milo.activeRun.', 'Run finished with status', 'aria-expanded', 'aria-controls'];
+/**
+ * The F5 surfaces. `launch_unknown` must keep saying that nothing retries it,
+ * and the cancellation confirmation must keep its accessible name — both are
+ * behaviour a refactor can drop without breaking a render test.
+ */
+const requiredF5Ui = [
+  'Confirm run cancellation',
+  'operator reconciliation required',
+  'will <b>not</b> be relaunched automatically',
+  'safeErrorText',
+];
+/**
+ * Client state ownership, checked PER FILE.
+ *
+ * These are the guards that keep one selection's data out of another's. The
+ * marker has to be present where it is actually applied, not merely somewhere
+ * in the tree: a helper that still EXISTS while nothing calls it is exactly the
+ * regression this is here to catch.
+ */
+const requiredOwnership = {
+  'lib/ownership.ts': [
+    'runBelongsToScope', 'eventBelongsToRun',
+    'ownsSession', 'ownsProject', 'ownsConversation', 'ownsRun', 'nextSessionScope',
+  ],
+  'lib/useRunRealtime.ts': ['runBelongsToScope', 'eventBelongsToRun'],
+  'app/page.tsx': [
+    'ownsSession', 'ownsProject', 'ownsConversation', 'ownsRun',
+    'nextSessionScope', 'clearStoredRunIds',
+  ],
+};
 const requiredReducer = ['some(e => e.id === event.id)', 'reconstructRun', 'tool_access_granted', 'source_recorded'];
 
 const where = `${scanned.length} files under ${ROOTS.join(', ')}`;
@@ -60,6 +91,17 @@ for (const item of requiredFinalResult) {
 }
 for (const item of requiredSecurity) {
   if (!ui.includes(item)) throw new Error(`Missing UI security marker: ${item} (searched ${where})`);
+}
+for (const item of requiredF5Ui) {
+  if (!ui.includes(item)) throw new Error(`Missing F5 marker: ${item} (searched ${where})`);
+}
+for (const [file, markers] of Object.entries(requiredOwnership)) {
+  const source = readFileSync(file, 'utf8');
+  for (const marker of markers) {
+    if (!source.includes(marker)) {
+      throw new Error(`Missing state-ownership marker: ${marker} (expected in ${file})`);
+    }
+  }
 }
 for (const item of requiredReducer) {
   if (!reducer.includes(item)) throw new Error(`Missing reducer marker: ${item}`);
