@@ -17,8 +17,9 @@ from uuid import UUID, uuid4
 
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
                                        CANONICAL_DIMENSION_PREFIX,
-                                       SHARED_IDENTITY_DIMENSIONS, claim_entity_key,
-                                       record_locator_id, stated_canonical_fields,
+                                       MAX_PROMOTIONS_PER_RUN, candidate_identity_scope,
+                                       claim_entity_key, record_locator_id,
+                                       stated_canonical_fields,
                                        stated_identity_dimensions, stated_source_locator,
                                        trust_state_for)
 from backend.catalog.diff import MAX_DIFF_ITEMS, diff_rows
@@ -27,7 +28,6 @@ from backend.engines.swarm_v2.evidence_bounds import FRAGMENT_TYPES
 from backend.engines.swarm_v2.evidence_contracts import (fragment_type_for,
                                                          parse_locator_key)
 from backend.engines.swarm_v2.fragments import fragment_content_hash
-from backend.engines.swarm_v2.normalization import normalize_field_key
 from backend.engines.swarm_v2.support import VERIFICATION_MODES, VERIFIER_CONTRACT_VERSION
 from backend.catalog.payloads import (CANONICAL_VARIANT_KEY_FIELDS, prepare_candidate,
                                       prepare_evidence_link, prepare_promotion,
@@ -1468,6 +1468,102 @@ class MemoryRepository:
                          if row["snapshot_id"] == str(snapshot_id)
                          and row["upstream_record_id"] == str(upstream_record_id)), None)
 
+    def catalog_run_pending_promotions(self, run_id: UUID, tool_operation: str, *,
+                                       limit: int = MAX_PROMOTIONS_PER_RUN
+                                       ) -> list[dict[str, Any]]:
+        """Mirrors `public.catalog_run_pending_promotions`, rule for rule.
+
+        The association between a claim and the CANDIDATE it is evidence for is
+        derived here exactly as it is derived in SQL: from the claim's own
+        evidence locator, through the captured upstream row it names, to the
+        candidate that is a reading of that row with exactly this identity
+        scope. Nothing is remembered in this process, so a promotion path
+        driven from this survives losing the process that gathered the
+        evidence.
+        """
+        with self.lock:
+            if not str(tool_operation or "").strip():
+                raise AppError("CATALOG_QUERY_INVALID",
+                               "a run and a tool operation are required", 400)
+            bound = max(0, min(int(limit), MAX_PROMOTIONS_PER_RUN))
+            snapshots = {row["id"]: row for row in self.catalog_snapshots.values()
+                         if row.get("trust_state") == "evidence"
+                         and row.get("activated_at") is not None
+                         and row.get("validation_state") == "complete"}
+            records = {row["id"]: row for row in self.catalog_raw_records.values()
+                       if row["snapshot_id"] in snapshots}
+            by_locator: dict[str, dict[str, Any]] = {}
+            for row in records.values():
+                snapshot = snapshots[row["snapshot_id"]]
+                by_locator[record_locator_id(str(snapshot["snapshot_key"]),
+                                             str(row["upstream_record_id"]))] = row
+            verdicts = {str(row["claim_id"]): row for row in self.tool_rows
+                        if self.evidence_kinds.get(str(row.get("id"))) == "claim_verdict"
+                        and str(row.get("run_id")) == str(run_id)
+                        and row.get("verdict") == "verified"}
+            sources = {str(row["id"]): row for row in self.tool_rows
+                       if self.evidence_kinds.get(str(row.get("id"))) == "source"
+                       and str(row.get("run_id")) == str(run_id)
+                       and row.get("tool_operation") == str(tool_operation)}
+            matched: list[dict[str, Any]] = []
+            for claim in self.tool_rows:
+                if self.evidence_kinds.get(str(claim.get("id"))) != "claim":
+                    continue
+                if str(claim.get("run_id")) != str(run_id) \
+                        or claim.get("status", "active") != "active" \
+                        or str(claim.get("source_id")) not in sources \
+                        or not claim.get("evidence_locator"):
+                    continue
+                verdict = verdicts.get(str(claim["id"]))
+                if verdict is None:
+                    continue
+                try:
+                    locator = parse_locator_key(claim["evidence_locator"]).record_id
+                except Exception:
+                    continue
+                record = by_locator.get(locator)
+                if record is None:
+                    continue
+                scope = dict(claim.get("identity_scope") or {})
+                readings = [row for row in self.catalog_candidates.values()
+                            if row["raw_record_id"] == record["id"]
+                            and row["snapshot_id"] == record["snapshot_id"]
+                            and row["status"] in ("candidate", "ready_for_review")
+                            and candidate_identity_scope(row.get("identity_dimensions"),
+                                                         row.get("official_model_code"),
+                                                         row.get("trim")) == scope]
+                # A locator and identity that resolve to more than one reading
+                # is an ambiguity this read refuses to settle.
+                if len(readings) != 1:
+                    continue
+                candidate = readings[0]
+                snapshot = snapshots[record["snapshot_id"]]
+                matched.append({
+                    "candidate_id": candidate["id"], "candidate_key": candidate["candidate_key"],
+                    "status": candidate["status"], "snapshot_id": snapshot["id"],
+                    "snapshot_key": snapshot["snapshot_key"],
+                    "source_family": snapshot["source_family"],
+                    "resource_id": snapshot["resource_id"],
+                    "raw_record_id": record["id"],
+                    "upstream_record_id": record["upstream_record_id"],
+                    "record_key": record["record_key"],
+                    "manufacturer": candidate["manufacturer"],
+                    "commercial_model": candidate["commercial_model"],
+                    "model_year_start": candidate.get("model_year_start"),
+                    "model_year_end": candidate.get("model_year_end"),
+                    "official_model_code": candidate.get("official_model_code"),
+                    "trim": candidate.get("trim"),
+                    "identity_dimensions": dict(candidate.get("identity_dimensions") or {}),
+                    "claim_id": claim["id"], "source_id": claim["source_id"],
+                    "verdict_id": verdict["id"], "field_key": claim["field_key"],
+                    "field_value": claim["value"]})
+            # The SAME bound and the SAME order the SQL applies, so a resumed
+            # worker sees exactly the set the crashed one would have.
+            keys = sorted({row["candidate_key"] for row in matched})[:bound]
+            return sorted((row for row in matched if row["candidate_key"] in keys),
+                          key=lambda row: (row["candidate_key"], row["field_key"],
+                                           str(row["claim_id"])))
+
     def catalog_snapshot_candidate_diff(self, previous_snapshot_id: Any, snapshot_id: Any, *,
                                         limit: int = MAX_DIFF_ITEMS,
                                         allow_incomplete: bool = False) -> list[dict[str, Any]]:
@@ -1623,15 +1719,9 @@ class MemoryRepository:
         # for THIS variant. Keys exactly; values under the same normalization
         # R4 stored them with.
         identity = dict(claim.get("identity_scope") or {})
-        dimensions = dict(candidate.get("identity_dimensions") or {})
-        expected = {name: dimensions[name] for name in SHARED_IDENTITY_DIMENSIONS
-                    if name in dimensions}
-        if candidate.get("official_model_code") is not None:
-            expected["model_code"] = candidate["official_model_code"]
-        if candidate.get("trim") is not None:
-            expected["trim"] = candidate["trim"]
-        if set(identity) != set(expected) or any(
-                identity[name] != normalize_field_key(str(expected[name])) for name in identity):
+        if identity != candidate_identity_scope(candidate.get("identity_dimensions"),
+                                                candidate.get("official_model_code"),
+                                                candidate.get("trim")):
             raise AppError("CATALOG_PROMOTION_IDENTITY_SCOPE",
                            "canonical field provenance claim is scoped to another vehicle identity",
                            400)

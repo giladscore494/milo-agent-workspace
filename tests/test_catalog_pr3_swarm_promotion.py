@@ -29,6 +29,7 @@ import json
 import socket
 import uuid
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -49,7 +50,7 @@ from backend.catalog.diff import MAX_DIFF_ITEMS, diff_rows, is_count_row
 from backend.catalog.government.refresh import (GovernmentCatalogRefresh,
                                                 diff_candidate_sets)
 from backend.catalog.keys import CatalogKeyError
-from backend.catalog.pipeline import (MAX_PROMOTIONS_PER_RUN, CatalogEvidenceLedger,
+from backend.catalog.pipeline import (MAX_PROMOTIONS_PER_RUN, PROMOTABLE_TOOL_OPERATION,
                                       CatalogPromotionPipeline)
 from backend.catalog.promotion import (LEASE_FAILURE_CODES, CanonicalPromotion,
                                        CatalogPromotionError, build_promotion_plan,
@@ -225,42 +226,128 @@ def verify_and_link(repository, lease, board, acquired, candidate, *,
     return links, claims, verdicts
 
 
-def production_path(repository, lease, *, year: int = PINNED_YEAR,
-                    verdict: str = "verified", operation: str = "resolve_variant"):
-    """The PRODUCTION orchestration, driven exactly as `backend/worker/main.py` does.
+class RecordingRepository:
+    """A repository that remembers WHICH methods something used.
 
-    No step is assembled by hand. The ledger is fed through the two trusted
-    seams the worker wires -- the tool-result sink and the verdict sink -- and
-    then `CatalogPromotionPipeline.promote` does the linking, the reviewed
-    status transition, the planning and the guarded promotion itself.
+    The wrapper is the whole point of the resume proofs: "no tool call and no
+    model call was repeated" is checked by the set of repository methods the
+    resumed worker actually reached, not by a comment saying it did not.
+    """
 
-    That is the whole point of this helper: a test that performed those four
-    steps itself would prove the steps work and prove nothing about whether
-    anything in production ever performs them.
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._inner, name)
+        if not callable(value):
+            return value
+
+        def recorded(*args: Any, **kwargs: Any) -> Any:
+            self.calls.append(name)
+            return value(*args, **kwargs)
+        return recorded
+
+
+#: Every repository method that WRITES evidence. A repeated Government tool
+#: call or a repeated model call can only reach durable state through one of
+#: these, so a resume that touches none of them repeated neither.
+EVIDENCE_WRITE_METHODS = frozenset({
+    "create_source", "create_claim", "record_evidence_fragment", "record_claim_verdict",
+    "create_conflict", "record_conflict_resolution",
+    "record_catalog_snapshot", "record_catalog_raw_record", "activate_catalog_snapshot"})
+
+
+def run_government_task(repository, lease, *, year: int = PINNED_YEAR,
+                        operation: str = "resolve_variant", call_id: str = "call-1"):
+    """What the ENGINE's tool loop does: one resolution, into the trusted sink.
+
+    Exactly the seam `backend/worker/main.py` wires. Nothing here links
+    evidence, moves a status or promotes -- it stops where a crash would leave
+    a run whose R3 evidence is durable and whose verdicts are not.
     """
     board = EvidenceBoard(repository, lease)
     sink = RegisteredOperationEvidenceSink(
         TrustedEvidenceAcquisition(board=board, mappers=production_evidence_mappers()))
-    ledger = CatalogEvidenceLedger(sink, verdict_sink=board.record_verification_verdict)
+    result = resolve(repository, code=one_code(repository, year), year=year)
+    sink(ToolCallRecord(task_id="task-1", call_id=call_id, tool=GOVERNMENT_TOOL_NAME,
+                        operation=operation, result=result))
+    return board
 
-    code = one_code(repository, year)
-    result = resolve(repository, code=code, year=year)
-    # The worker's tool loop calls the sink with a Registry-validated record.
-    ledger(ToolCallRecord(task_id="task-1", call_id="call-1", tool=GOVERNMENT_TOOL_NAME,
-                          operation=operation, result=result))
-    # The engine hands every settled verdict to the same sink the worker wired.
+
+def settle_verdicts(repository, lease, *, verdict: str = "verified"):
+    """What the VERIFIER does: one settled verdict per unverified claim.
+
+    Idempotent by omission, so a resumed worker that re-verifies writes the
+    same rows the crashed one did rather than a second set.
+    """
+    board = EvidenceBoard(repository, lease)
     fragments = {row["locator_key"]: row for row in board_fragments(repository, lease)}
+    settled = {str(row["claim_id"]) for row in repository.tool_rows
+               if repository.evidence_kinds.get(str(row.get("id"))) == "claim_verdict"}
     for claim in claims_of(repository, lease):
-        fragment = fragments[claim["evidence_locator"]]
-        ledger.record_verdict(VerificationVerdict(
+        fragment = fragments.get(claim["evidence_locator"])
+        if fragment is None or str(claim["id"]) in settled:
+            continue
+        board.record_verification_verdict(VerificationVerdict(
             claim_id=str(claim["id"]), verdict=verdict, reason="R4_STRUCTURED_MATCH",
             mode="deterministic_structured", contract_version=VERIFIER_CONTRACT_VERSION,
             support=[SupportLink(source_id=str(claim["source_id"]),
                                  content_hash=fragment["content_hash"],
                                  fragment_id=str(fragment["id"]),
                                  locator=fragment["locator_key"])]))
-    attempts = CatalogPromotionPipeline(repository, lease).promote(ledger)
-    return ledger, attempts
+    return board
+
+
+def gather_evidence(repository, lease, *, year: int = PINNED_YEAR,
+                    verdict: str = "verified", operation: str = "resolve_variant",
+                    call_id: str = "call-1"):
+    """Everything the ENGINE does, and nothing the promotion path does.
+
+    Stops exactly where a crash would leave a run whose evidence, verdicts and
+    checkpoint are all durable and whose canonical catalog is still empty --
+    the window that used to lose the promotion entirely.
+    """
+    run_government_task(repository, lease, year=year, operation=operation, call_id=call_id)
+    return settle_verdicts(repository, lease, verdict=verdict)
+
+
+def production_path(repository, lease, *, year: int = PINNED_YEAR,
+                    verdict: str = "verified", operation: str = "resolve_variant"):
+    """The PRODUCTION orchestration, driven exactly as `backend/worker/main.py` does.
+
+    No step is assembled by hand: the engine's half runs, and then
+    `CatalogPromotionPipeline.promote` does the durable read, the linking, the
+    reviewed status transition, the planning and the guarded promotion itself.
+
+    That is the whole point of this helper: a test that performed those steps
+    itself would prove the steps work and prove nothing about whether anything
+    in production ever performs them.
+    """
+    gather_evidence(repository, lease, year=year, verdict=verdict, operation=operation)
+    return CatalogPromotionPipeline(repository, lease).promote()
+
+
+def restarted_lease(repository, lease, *, worker: str = "worker-restarted") -> WorkerLease:
+    """The lease a REPLACEMENT worker holds after the first one died.
+
+    The dead worker's lease is expired -- which is exactly what happens when a
+    process stops: nothing renews it -- and the run is re-claimed. The attempt
+    advances, as production's single-statement CAS advances it, so the
+    replacement writes under its own lease and the dead worker can write
+    nothing at all.
+    """
+    repository.runs[str(lease.run_id)]["lease_expires_at"] = "2000-01-01T00:00:00+00:00"
+    claimed = repository.claim_run(lease.run_id, worker)
+    return WorkerLease(lease.run_id, worker, int(claimed["attempt"]),
+                       claimed["lease_token"])
+
+
+def canonical_counts(repository) -> tuple[int, int, int, int]:
+    """Every durable row a promotion can create, counted."""
+    return (len(repository.catalog_models), len(repository.catalog_model_variants),
+            len(repository.catalog_canonical_field_provenance),
+            len(repository.catalog_evidence_links))
 
 
 #: Every WRONG-SCOPE refusal the promotion gate states, with the one thing each
@@ -446,14 +533,17 @@ def test_the_production_path_promotes_without_anyone_assembling_the_steps(reposi
     lease, _report = landed
     assert not repository.catalog_model_variants
 
-    ledger, attempts = production_path(repository, lease)
-
-    # The ledger observed ONE candidate, from the server-produced tool result.
-    assert len(ledger.observations) == 1
-    observation = ledger.observations[0]
+    gather_evidence(repository, lease)
+    # The DURABLE read found ONE candidate, derived from rows the server wrote
+    # -- not from anything a process was holding.
+    pipeline = CatalogPromotionPipeline(repository, lease)
+    pending = pipeline.pending()
+    assert len(pending) == 1
+    observation = pending[0]
     assert observation.candidate["manufacturer"] == TOYOTA
     assert observation.claims and all(row["source_id"] for row in observation.claims)
 
+    attempts = pipeline.promote()
     assert len(attempts) == 1 and attempts[0].promoted
     outcome = attempts[0].outcome
 
@@ -499,9 +589,10 @@ def test_the_production_path_promotes_nothing_without_a_verified_verdict(reposit
     stays empty -- and it says WHY, with a static code.
     """
     lease, _report = landed
-    _ledger, attempts = production_path(repository, lease, verdict="needs_review")
-    assert len(attempts) == 1 and not attempts[0].promoted
-    assert attempts[0].reason_code == "CATALOG_PROMOTION_NO_VERIFIED_EVIDENCE"
+    attempts = production_path(repository, lease, verdict="needs_review")
+    # The durable read joins on a VERIFIED verdict, so an unverified run owes
+    # nothing at all -- there is no candidate to refuse, and nothing was moved.
+    assert attempts == ()
     assert not repository.catalog_model_variants and not repository.catalog_models
     # The candidate was NOT moved to `ready_for_review` on the way past.
     assert all(row["status"] != "ready_for_review"
@@ -512,34 +603,36 @@ def test_the_production_path_promotes_nothing_without_a_verified_verdict(reposit
 def test_the_production_path_replays_onto_the_same_canonical_row(repository, landed):
     """Running the whole connection twice writes one canonical row, not two."""
     lease, _report = landed
-    _first_ledger, first = production_path(repository, lease)
-    variants = len(repository.catalog_model_variants)
-    provenance = len(repository.catalog_canonical_field_provenance)
-    _second_ledger, second = production_path(repository, lease)
+    first = production_path(repository, lease)
+    counts = canonical_counts(repository)
+    second = CatalogPromotionPipeline(repository, lease).promote()
     assert first[0].outcome.variant["id"] == second[0].outcome.variant["id"]
-    assert len(repository.catalog_model_variants) == variants
-    assert len(repository.catalog_canonical_field_provenance) == provenance
+    assert canonical_counts(repository) == counts
     assert second[0].outcome.replayed
 
 
 def test_the_production_path_is_bounded_and_promotion_is_not_a_tool(repository, landed):
     """Two properties that must hold however many vehicles a run resolves."""
     lease, _report = landed
-    board = EvidenceBoard(repository, lease)
-    sink = RegisteredOperationEvidenceSink(
-        TrustedEvidenceAcquisition(board=board, mappers=production_evidence_mappers()))
-    ledger = CatalogEvidenceLedger(sink, verdict_sink=board.record_verification_verdict,
-                                   max_candidates=1)
     for year in (PINNED_YEAR, PINNED_YEAR + 1):
-        result = resolve(repository, code=one_code(repository, year), year=year)
-        if result["match_count"] == 1:
-            ledger(ToolCallRecord(task_id="task-1", call_id=f"call-{year}",
-                                  tool=GOVERNMENT_TOOL_NAME, operation="resolve_variant",
-                                  result=result))
-    # The ledger stops REMEMBERING past its bound, so the end-of-run promotion
-    # can never become an unbounded write loop.
-    assert len(ledger.observations) <= 1
+        gather_evidence(repository, lease, year=year, call_id=f"call-{year}")
+    # The durable read is BOUNDED, so the end-of-run promotion can never become
+    # an unbounded write loop however many vehicles a run resolved -- and the
+    # bound is applied in `candidate_key` order, so the same set comes back
+    # every time it is asked.
+    unbounded = CatalogPromotionPipeline(repository, lease).pending()
+    bounded = CatalogPromotionPipeline(repository, lease, limit=1).pending()
+    assert len(bounded) == 1
+    assert bounded[0].candidate_key == min(item.candidate_key for item in unbounded)
+    assert CatalogPromotionPipeline(repository, lease, limit=1).pending()[0].candidate_key \
+        == bounded[0].candidate_key
     assert MAX_PROMOTIONS_PER_RUN == 25
+    # The durable read is scoped to the ONE operation the registered mapper
+    # actually records on every source it writes -- pinned against a real
+    # source row rather than against the constant beside it.
+    sources = [row for row in repository.tool_rows
+               if repository.evidence_kinds.get(str(row["id"])) == "source"]
+    assert sources and {row["tool_operation"] for row in sources} == {PROMOTABLE_TOOL_OPERATION}
     # Promotion is not a registered capability: no operation of the one
     # registered tool writes anything, so a plan cannot ask for one.
     operations = {operation.name for operation
@@ -1252,12 +1345,208 @@ def test_no_production_entrypoint_schedules_this_refresh():
 # 6. resume: the same work twice produces the same durable state
 # =============================================================================
 
-def test_a_resumed_run_duplicates_no_tool_result_no_evidence_and_no_revision(repository, landed):
-    """At-least-once delivery onto idempotent writes, end to end.
+def test_a_replacement_worker_promotes_what_the_crashed_one_never_did(repository, landed):
+    """THE crash window this path used to lose, closed and proven closed.
 
-    Every step is replayed exactly as a resumed worker would replay it -- the
-    tool call, the evidence acquisition, the verdicts, the links and the
-    promotion -- and the durable state afterwards is identical.
+    The first attempt stops where a worker dies: Swarm V2 has durably persisted
+    its evidence and its verified verdicts, and the canonical catalog is still
+    empty. A REPLACEMENT worker is then constructed -- new worker id, new
+    attempt, new lease, new pipeline, nothing carried over from the process
+    that gathered any of it.
+
+    It does not replay the tool call, and the test does not replay it either.
+    It cannot: the resumed worker restored completed tasks from the checkpoint,
+    so there is nothing left to re-execute. Everything it needs it derives from
+    durable rows, and the proof that it did is the SET OF REPOSITORY METHODS it
+    reached -- no source, no fragment, no claim, no verdict and no capture.
+
+    This is the property the earlier round claimed and did not have: the
+    association between a claim and the candidate it is evidence for lived in
+    the crashed worker's memory, so the replacement found nothing to promote
+    and the canonical catalog stayed empty with nothing saying why.
+    """
+    lease, _report = landed
+
+    # --- attempt 1: the engine's half, then the process dies ----------------
+    gather_evidence(repository, lease)
+    assert canonical_counts(repository) == (0, 0, 0, 0)
+    claims = len(claims_of(repository, lease))
+    assert claims and all(row["source_id"] for row in claims_of(repository, lease))
+    sources_before = len([row for row in repository.tool_rows
+                          if repository.evidence_kinds.get(str(row["id"])) == "source"])
+
+    # --- attempt 2: a replacement worker, with nothing carried over ---------
+    resumed = restarted_lease(repository, lease)
+    assert resumed.worker_id != lease.worker_id and resumed.attempt > lease.attempt
+    recording = RecordingRepository(repository)
+    attempts = CatalogPromotionPipeline(recording, resumed).promote()
+
+    assert len(attempts) == 1 and attempts[0].promoted
+    assert not attempts[0].outcome.replayed
+    # NOTHING was re-gathered: no tool call, no model call, no capture, no
+    # source request could have happened without one of these writes.
+    assert not (set(recording.calls) & EVIDENCE_WRITE_METHODS), sorted(set(recording.calls))
+    assert "catalog_run_pending_promotions" in recording.calls
+    assert len([row for row in repository.tool_rows
+                if repository.evidence_kinds.get(str(row["id"])) == "source"]) == sources_before
+    assert len(claims_of(repository, lease)) == claims
+
+    # The canonical variant exists, and its provenance names the RESUMED
+    # worker's own lease -- the dead worker wrote none of it.
+    variant = repository.get_canonical_catalog_variant(
+        attempts[0].outcome.variant["canonical_key"])
+    assert variant is not None and variant["manufacturer"] == TOYOTA
+    provenance = repository.list_canonical_field_provenance(variant["variant_id"])
+    assert provenance and all(row["worker_id"] == resumed.worker_id
+                              and row["attempt"] == resumed.attempt
+                              and row["run_id"] == str(lease.run_id) for row in provenance)
+
+    # --- attempt 3: a SECOND resume writes nothing at all --------------------
+    counts = canonical_counts(repository)
+    again = CatalogPromotionPipeline(repository, restarted_lease(
+        repository, resumed, worker="worker-restarted-again")).promote()
+    assert len(again) == 1 and again[0].promoted and again[0].outcome.replayed
+    assert canonical_counts(repository) == counts
+    assert again[0].outcome.variant["id"] == attempts[0].outcome.variant["id"]
+
+
+def test_every_crash_window_of_the_promotion_resumes_to_one_canonical_row(repository, landed):
+    """One run, crashed at every window the path has, ending in ONE row.
+
+    A crash is represented the only honest way: a step raises something the
+    pipeline does not catch, so `promote` does not return -- and then a
+    replacement worker starts from durable state. After all six the canonical
+    catalog holds exactly one model, one variant and one provenance row per
+    promoted field, because every write on the way is idempotent on a derived
+    key.
+    """
+    lease, _report = landed
+
+    # 1. AFTER EVIDENCE, BEFORE VERDICTS. Nothing is promotable: the durable
+    #    read joins on a VERIFIED verdict, so the run owes nothing yet.
+    run_government_task(repository, lease)
+    resumed = restarted_lease(repository, lease, worker="w-1")
+    assert CatalogPromotionPipeline(repository, resumed).pending() == ()
+    assert CatalogPromotionPipeline(repository, resumed).promote() == ()
+    assert canonical_counts(repository) == (0, 0, 0, 0)
+
+    # 2. AFTER VERIFIED VERDICTS AND CHECKPOINT, BEFORE PROMOTION. The window
+    #    that used to lose everything. The replacement worker finds the work.
+    settle_verdicts(repository, resumed)
+    resumed = restarted_lease(repository, resumed, worker="w-2")
+    assert len(CatalogPromotionPipeline(repository, resumed).pending()) == 1
+    assert canonical_counts(repository) == (0, 0, 0, 0)
+
+    # 3. AFTER THE LINKS WERE CREATED. The reviewed transition dies.
+    def dying_review(*_args, **_kwargs):
+        raise RuntimeError("worker died after linking")
+
+    crashing = RecordingRepository(repository)
+    crashing.record_catalog_candidate = dying_review
+    with pytest.raises(RuntimeError):
+        CatalogPromotionPipeline(crashing, resumed).promote()
+    links_after_crash = len(repository.catalog_evidence_links)
+    assert links_after_crash > 0
+    assert all(row["status"] != "ready_for_review"
+               for row in repository.catalog_candidates.values())
+    assert canonical_counts(repository)[:3] == (0, 0, 0)
+
+    # 4. AFTER `ready_for_review` WAS WRITTEN, BEFORE THE CANONICAL PROMOTION.
+    resumed = restarted_lease(repository, resumed, worker="w-3")
+
+    def dying_promotion(*_args, **_kwargs):
+        raise RuntimeError("worker died after the reviewed transition")
+
+    crashing = RecordingRepository(repository)
+    crashing.promote_catalog_variant = dying_promotion
+    with pytest.raises(RuntimeError):
+        CatalogPromotionPipeline(crashing, resumed).promote()
+    assert any(row["status"] == "ready_for_review"
+               for row in repository.catalog_candidates.values())
+    assert canonical_counts(repository)[:3] == (0, 0, 0)
+    # Re-linking created no second link: the key is derived from the evidence.
+    assert len(repository.catalog_evidence_links) == links_after_crash
+
+    # 5. THE PROMOTION ITSELF, on the next replacement.
+    resumed = restarted_lease(repository, resumed, worker="w-4")
+    attempts = CatalogPromotionPipeline(repository, resumed).promote()
+    assert len(attempts) == 1 and attempts[0].promoted and not attempts[0].outcome.replayed
+    counts = canonical_counts(repository)
+    assert counts[0] == 1 and counts[1] == 1
+    assert counts[2] == len(attempts[0].outcome.promoted_fields)
+    assert counts[3] == links_after_crash
+
+    # 6. AFTER PROMOTION, BEFORE THE RUN WAS FINALIZED. Everything replays.
+    resumed = restarted_lease(repository, resumed, worker="w-5")
+    replayed = CatalogPromotionPipeline(repository, resumed).promote()
+    assert len(replayed) == 1 and replayed[0].outcome.replayed
+    assert canonical_counts(repository) == counts
+    # No duplicate revision either: every field is still at revision 1.
+    provenance = repository.list_canonical_field_provenance(
+        attempts[0].outcome.variant["id"])
+    assert provenance and all(row["revision"] == 1 for row in provenance)
+
+
+def test_a_partly_promoted_run_resumes_the_candidates_it_did_not_reach(repository, landed):
+    """Some promoted, others not -- and the replacement finishes the rest.
+
+    The crash lands BETWEEN two candidates, which is the window where a naive
+    resume would either skip the unpromoted one or write the promoted one
+    twice. It does neither: the first comes back a replay, the second is
+    promoted, and the canonical catalog ends with exactly two variants.
+    """
+    lease, _report = landed
+    for year in (PINNED_YEAR, PINNED_YEAR + 1):
+        gather_evidence(repository, lease, year=year, call_id=f"call-{year}")
+    pending = CatalogPromotionPipeline(repository, lease).pending()
+    assert len(pending) == 2
+
+    # The worker dies after the FIRST canonical promotion lands.
+    real_promote = repository.promote_catalog_variant
+    promoted_now: list[str] = []
+
+    def dies_after_the_first(run_id, promotion, **kwargs):
+        if promoted_now:
+            raise RuntimeError("worker died between candidates")
+        row = real_promote(run_id, promotion, **kwargs)
+        promoted_now.append(str(row["id"]))
+        return row
+
+    crashing = RecordingRepository(repository)
+    crashing.promote_catalog_variant = dies_after_the_first
+    with pytest.raises(RuntimeError):
+        CatalogPromotionPipeline(crashing, lease).promote()
+    assert len(repository.catalog_model_variants) == 1
+
+    # The replacement worker finishes the job.
+    resumed = restarted_lease(repository, lease)
+    recording = RecordingRepository(repository)
+    attempts = CatalogPromotionPipeline(recording, resumed).promote()
+    assert len(attempts) == 2 and all(item.promoted for item in attempts)
+    # Exactly one replay: the candidate the crashed worker reached. The other
+    # was promoted for the first time.
+    assert sum(1 for item in attempts if item.outcome.replayed) == 1
+    assert len(repository.catalog_model_variants) == 2
+    assert len({row["id"] for row in repository.catalog_model_variants}) == 2
+    # Still nothing re-gathered.
+    assert not (set(recording.calls) & EVIDENCE_WRITE_METHODS)
+
+    # And a third pass writes nothing.
+    counts = canonical_counts(repository)
+    final = CatalogPromotionPipeline(repository, restarted_lease(
+        repository, resumed, worker="worker-final")).promote()
+    assert len(final) == 2 and all(item.outcome.replayed for item in final)
+    assert canonical_counts(repository) == counts
+
+
+def test_every_guarded_write_replays_onto_the_row_it_already_wrote(repository, landed):
+    """At-least-once delivery onto idempotent writes, write by write.
+
+    This is NOT the resume proof -- `test_a_replacement_worker_promotes_what_
+    the_crashed_one_never_did` is, and it drives the real restart path. This
+    one replays each guarded write BY HAND, which is the only way to show that
+    every individual one is idempotent rather than that the sequence happens to
+    be.
     """
     lease, _report = landed
     promotion, plan, outcome, acquired, candidate, links, claims, verdicts = promoted(

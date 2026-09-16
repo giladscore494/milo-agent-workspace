@@ -97,6 +97,7 @@ class Repository(Protocol):
     def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, official_model_code: str | None = None, trim: str | None = None, identity_dimensions: dict[str, Any] | None = None, status: str | None = None, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
     def catalog_raw_record_by_upstream_id(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None: ...
     def catalog_snapshot_candidate_diff(self, previous_snapshot_id: Any, snapshot_id: Any, *, limit: int = MAX_DIFF_ITEMS, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_run_pending_promotions(self, run_id: UUID, tool_operation: str, *, limit: int = 25) -> list[dict[str, Any]]: ...
 
     # --- field-level canonical promotion (PR3) -------------------------------
     #
@@ -970,6 +971,19 @@ class SupabaseRepository:
             "p_trim": None if trim is None else str(trim),
             "p_identity_dimensions": dict(identity_dimensions) if identity_dimensions else None,
             "p_status": None if status is None else str(status)})
+
+    def catalog_run_pending_promotions(self, run_id: UUID, tool_operation: str, *, limit: int = 25) -> list[dict[str, Any]]:
+        """What one RUN still has to promote, reconstructed from durable state.
+
+        One bounded READ. It takes no lease because it writes nothing, and it
+        is what makes the promotion path survive a worker restart: the
+        candidate a claim is evidence for is derived from rows the server
+        itself wrote, never from a ledger in a process that may be gone.
+        """
+        return self._read_rpc("catalog_run_pending_promotions",
+                              {"p_run_id": str(run_id),
+                               "p_tool_operation": str(tool_operation),
+                               "p_limit": max(0, int(limit))})
 
     def catalog_snapshot_candidate_diff(self, previous_snapshot_id: Any, snapshot_id: Any, *, limit: int = MAX_DIFF_ITEMS, allow_incomplete: bool = False) -> list[dict[str, Any]]:
         """What changed between two snapshots, compared INSIDE the database.

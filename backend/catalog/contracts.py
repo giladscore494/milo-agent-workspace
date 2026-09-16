@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
+from backend.engines.swarm_v2.normalization import normalize_field_key
+
 #: Where a snapshot came from. Closed: a family this tuple does not name has no
 #: reviewed trust posture, so it cannot be persisted at all.
 #:
@@ -254,6 +256,14 @@ def stated_source_locator(locator: Mapping[str, Any] | None) -> dict[str, int]:
     return stated
 
 
+#: How many candidates ONE RUN may promote. A research run resolves a handful
+#: of vehicles; a run that somehow resolved thousands must not turn into an
+#: unbounded write loop at the end of it, so the durable pending-promotion read
+#: returns at most this many CANDIDATES and the extras wait for another run.
+#:
+#: Mirrored by the `p_limit` default of `public.catalog_run_pending_promotions`.
+MAX_PROMOTIONS_PER_RUN = 25
+
 #: The R4 identity dimensions a catalog CANDIDATE can also state. The two
 #: closed vocabularies overlap here and nowhere else: a dimension only one side
 #: names is left unstated rather than translated into the nearest word.
@@ -262,6 +272,31 @@ def stated_source_locator(locator: Mapping[str, Any] | None) -> dict[str, int]:
 #: on a candidate rather than entries in `identity_dimensions`, so they are
 #: handled separately by every caller.
 SHARED_IDENTITY_DIMENSIONS = ("body_style", "drivetrain", "generation", "transmission")
+
+
+def candidate_identity_scope(identity_dimensions: Mapping[str, Any] | None,
+                            official_model_code: Any, trim: Any) -> dict[str, str]:
+    """The IDENTITY SCOPE one candidate narrows a claim to, as R4 stores it.
+
+    `claims.identity_scope` is written NORMALIZED by the trusted Evidence
+    Board, so comparing it to a candidate's raw columns would reject every
+    value that merely differs in case or separator. This assembles the
+    candidate's side under the same normalization, and it is what the promotion
+    gate compares against and what the durable pending-promotion
+    reconstruction joins on.
+
+    Mirrored in SQL by `public.catalog_candidate_identity_scope`; the two are
+    pinned together by `tests/test_catalog_migration_static.py` and compared
+    over a real vocabulary by `tests/test_migrations_postgres.py`.
+    """
+    scope = {name: normalize_field_key(str(value))
+             for name, value in sorted((identity_dimensions or {}).items())
+             if name in SHARED_IDENTITY_DIMENSIONS}
+    if official_model_code is not None:
+        scope["model_code"] = normalize_field_key(str(official_model_code))
+    if trim is not None:
+        scope["trim"] = normalize_field_key(str(trim))
+    return scope
 
 
 def record_locator_id(snapshot_key: str, upstream_record_id: str) -> str:
@@ -314,6 +349,7 @@ ABSENT = _Absent()
 
 
 __all__ = ["ABSENT", "CANDIDATE_IDENTITY_DIMENSIONS", "CANDIDATE_STATUSES",
+           "MAX_PROMOTIONS_PER_RUN",
            "CANONICAL_DIMENSION_PREFIX", "CANONICAL_OPTIONAL_FIELDS",
            "CANONICAL_REQUIRED_FIELDS", "CANONICAL_VARIANT_FIELDS",
            "MAX_CANONICAL_FIELDS", "canonical_field_value", "stated_canonical_fields",
@@ -323,5 +359,6 @@ __all__ = ["ABSENT", "CANDIDATE_IDENTITY_DIMENSIONS", "CANDIDATE_STATUSES",
            "MAX_RAW_RECORD_LOCATOR_POSITION", "MAX_RETRIEVAL_METADATA_CHARS",
            "RAW_RECORD_LOCATOR_KEYS", "SHARED_IDENTITY_DIMENSIONS",
            "SNAPSHOT_VALIDATION_STATES", "TRUST_STATE_BY_FAMILY",
-           "claim_entity_key", "is_evidence_family", "record_locator_id",
+           "candidate_identity_scope", "claim_entity_key", "is_evidence_family",
+           "record_locator_id",
            "stated_identity_dimensions", "stated_source_locator", "trust_state_for"]

@@ -360,8 +360,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 from backend.tools import ToolContext, ToolRegistry
                 from backend.tools.government_vehicle import (GOVERNMENT_TOOL_SCOPE,
                                                               GovernmentVehicleTool)
-                from backend.catalog.pipeline import (CatalogEvidenceLedger,
-                                                      CatalogPromotionPipeline)
+                from backend.catalog.pipeline import CatalogPromotionPipeline
 
                 allowed = tuple(filter(None, (item.strip() for item in
                     os.getenv("MILO_COMMANDER_MODEL_ALLOWLIST", "").split(","))))
@@ -424,16 +423,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 evidence_sink = RegisteredOperationEvidenceSink(
                     TrustedEvidenceAcquisition(board=board,
                                                mappers=production_evidence_mappers()))
-                # Catalog PR3: the two trusted seams, OBSERVED, so the
-                # promotion path afterwards knows which durable candidate each
-                # Government resolution was evidence for. A claim row does not
-                # say that, and the only place it is known is the
-                # server-produced tool result. The ledger writes nothing
-                # itself: it delegates to the sink above and to the board's own
-                # verdict writer, and remembers ids.
-                ledger = CatalogEvidenceLedger(evidence_sink,
-                                               verdict_sink=board.record_verification_verdict)
-                catalog_promotion["ledger"] = ledger
+                # Catalog PR3: the trusted promotion path. It observes NOTHING
+                # here and holds no state: when it runs it asks the database
+                # which candidates this run still owes, deriving the
+                # association from rows the server itself wrote. That is what
+                # makes it behave identically in a worker that gathered the
+                # evidence and in one that replaced a worker which did.
                 catalog_promotion["pipeline"] = CatalogPromotionPipeline(repo, board.lease)
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
@@ -443,7 +438,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     # identity; the worker model cannot call it, cannot choose
                     # what it writes, and cannot turn its own completion into
                     # evidence.
-                    tool_result_sink=ledger,
+                    tool_result_sink=evidence_sink,
                     # A bounded worker-output repair is a semantic retry and
                     # consumes the SAME run-level retry allowance the
                     # Commander repair does. Provider 429 backpressure is
@@ -488,7 +483,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     # conflict decision to the run's own lease-guarded Evidence
                     # Board, which writes them through the same idempotent,
                     # append-only guarded RPCs as every other evidence write.
-                    verdict_sink=ledger.record_verdict,
+                    verdict_sink=board.record_verification_verdict,
                     resolution_sink=board.record_conflict_resolution)
             swarm_engine_builder = make_swarm_engine
         try:
@@ -528,15 +523,16 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # still holds the lease every write it performs is guarded by.
             #
             # It is deliberately not a Tool and not an engine step: a model can
-            # cause a Government READ and nothing beyond it. It runs only over
-            # this run's own resolutions, promotes at most
-            # `MAX_PROMOTIONS_PER_RUN`, starts no capture and schedules
+            # cause a Government READ and nothing beyond it. It asks the
+            # database what this run still owes -- so a RESUMED worker, which
+            # restored the completed tasks and never re-executed the tool,
+            # promotes exactly what the crashed one would have -- promotes at
+            # most `MAX_PROMOTIONS_PER_RUN`, starts no capture and schedules
             # nothing. A refusal is a legitimate outcome and is emitted as a
             # run event rather than failing the run; a LOST LEASE is not a
             # refusal and propagates to the lease handling below.
             if workflow_key == "swarm_v2" and catalog_promotion.get("pipeline") is not None:
-                for attempt in catalog_promotion["pipeline"].promote(
-                        catalog_promotion["ledger"]):
+                for attempt in catalog_promotion["pipeline"].promote():
                     sink.emit(RunEventRecord(
                         run_id=run_id,
                         type="catalog_variant_promoted" if attempt.promoted

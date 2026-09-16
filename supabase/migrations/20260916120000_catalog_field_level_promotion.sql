@@ -211,6 +211,41 @@ as $$
                          '\s+', ' ', 'g')) end
 $$;
 
+-- The IDENTITY SCOPE one candidate narrows a claim to, as R4 stores it.
+--
+-- `claims.identity_scope` is written NORMALIZED, so comparing it to a
+-- candidate's raw columns would reject every value that merely differs in case
+-- or separator. This assembles the candidate's side under the same
+-- normalization, and it is the ONE definition: the promotion gate below
+-- compares against it, `catalog_run_pending_promotions` joins on it, and
+-- `candidate_identity_scope` in `backend/catalog/contracts.py` is its Python
+-- mirror.
+--
+-- The vocabulary is the INTERSECTION of the two closed sets -- the four
+-- dimensions a catalog candidate and an R4 identity both name -- plus
+-- `model_code` and `trim`, which are candidate COLUMNS rather than dimensions.
+-- A dimension only one side names is left unstated rather than translated into
+-- the nearest word.
+create or replace function public.catalog_candidate_identity_scope(
+  p_identity_dimensions jsonb, p_official_model_code text, p_trim text
+) returns jsonb
+language sql immutable
+set search_path = pg_catalog
+as $$
+  select coalesce(jsonb_object_agg(entry.name, entry.value), '{}'::jsonb)
+    from (
+      select d.key as name, public.r4_normalized_scope_text(d.value #>> '{}') as value
+        from jsonb_each(coalesce(p_identity_dimensions, '{}'::jsonb)) as d(key, value)
+       where d.key in ('body_style', 'drivetrain', 'generation', 'transmission')
+      union all
+      select 'model_code', public.r4_normalized_scope_text(p_official_model_code)
+       where p_official_model_code is not null
+      union all
+      select 'trim', public.r4_normalized_scope_text(p_trim)
+       where p_trim is not null
+    ) as entry
+$$;
+
 -- ---------------------------------------------------------------------------
 -- 2. The append-only field provenance relation.
 -- ---------------------------------------------------------------------------
@@ -348,7 +383,6 @@ declare
   v_expected jsonb;
   v_identity jsonb;
   v_year integer;
-  v_expected_keys text[];
 begin
   select * into v_link from public.catalog_candidate_evidence_links
     where id = new.evidence_link_id;
@@ -536,33 +570,9 @@ begin
   -- one, and neither is evidence for THIS variant. The key set is compared
   -- first and exactly, because a key is never normalized.
   v_identity := coalesce(v_claim.identity_scope, '{}'::jsonb);
-  select coalesce(array_agg(expected.name order by expected.name), '{}'::text[])
-    into v_expected_keys
-    from (
-      select d.key as name
-        from jsonb_object_keys(v_candidate.identity_dimensions) as d(key)
-       where d.key in ('body_style', 'drivetrain', 'generation', 'transmission')
-      union all
-      select 'model_code' where v_candidate.official_model_code is not null
-      union all
-      select 'trim' where v_candidate.trim is not null
-    ) as expected;
-  if coalesce((select array_agg(e.name order by e.name)
-                 from jsonb_object_keys(v_identity) as e(name)), '{}'::text[])
-       is distinct from v_expected_keys then
-    raise exception 'canonical field provenance claim is scoped to another vehicle identity'
-      using errcode = '22023';
-  end if;
-  -- ... and every value, compared under the SAME normalization R4 stored it
-  -- with, must be the candidate's own.
-  if exists (
-      select 1 from jsonb_each_text(v_identity) as e(name, value)
-       where e.value is distinct from public.r4_normalized_scope_text(
-               case e.name
-                 when 'model_code' then v_candidate.official_model_code
-                 when 'trim' then v_candidate.trim
-                 else v_candidate.identity_dimensions->>e.name
-               end)) then
+  if v_identity is distinct from public.catalog_candidate_identity_scope(
+       v_candidate.identity_dimensions, v_candidate.official_model_code,
+       v_candidate.trim) then
     raise exception 'canonical field provenance claim is scoped to another vehicle identity'
       using errcode = '22023';
   end if;
@@ -1064,6 +1074,132 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
+-- 7b. What one RUN still has to promote, reconstructed from durable state.
+-- ---------------------------------------------------------------------------
+--
+-- WHY THIS EXISTS. The promotion path used to learn which candidate a claim was
+-- evidence FOR from the worker's own memory: the tool result named the
+-- candidate, and a ledger in the process remembered it. That is lost on a
+-- crash. A replacement worker restores the run from its checkpoint WITHOUT
+-- re-executing the Government tool -- the tasks are already complete -- so the
+-- association was gone, the promotion found nothing to do, and a run whose
+-- evidence and verdicts were fully durable left the canonical catalog empty.
+--
+-- The association is not actually lost, though: it is DERIVABLE from rows the
+-- server itself wrote, and this function derives it. Nothing here reads a model
+-- output, and nothing here calls a tool or a source.
+--
+--   claims of this run whose SOURCE records the registered tool operation
+--     -> the claim's own evidence locator names ONE captured upstream row
+--        (`catalog_record_locator_id`, the same convention the promotion gate
+--         above holds every promoted fact to)
+--     -> that row belongs to ONE snapshot, which must be ACTIVE, COMPLETE and
+--        of an `evidence` trust family
+--     -> the candidate that is a reading of that row, whose identity scope is
+--        exactly the claim's (`catalog_candidate_identity_scope`)
+--
+-- AMBIGUITY IS REFUSED, NOT SETTLED. A claim whose locator and identity scope
+-- resolve to more than one candidate reading is dropped: choosing between them
+-- would be inventing an association the durable rows do not state. An
+-- `ambiguous` or `rejected` candidate is excluded outright -- ambiguity is a
+-- first-class answer in this schema and a promotion may never overrule it.
+--
+-- BOUNDED. At most `p_limit` CANDIDATES, chosen in `candidate_key` order so a
+-- resumed worker sees exactly the set the crashed one would have, and at most
+-- `MAX_FACTS_PER_BUNDLE` claims each. It is a READ: no lease, `SECURITY
+-- INVOKER`, fixed `search_path`, every relation named as a literal.
+create or replace function public.catalog_run_pending_promotions(
+  p_run_id uuid, p_tool_operation text, p_limit integer default 25
+) returns table (
+  candidate_id uuid, candidate_key text, status text,
+  snapshot_id uuid, snapshot_key text, source_family text, resource_id text,
+  raw_record_id uuid, upstream_record_id text, record_key text,
+  manufacturer text, commercial_model text,
+  model_year_start integer, model_year_end integer,
+  official_model_code text, "trim" text, identity_dimensions jsonb,
+  claim_id uuid, source_id uuid, verdict_id uuid,
+  field_key text, field_value jsonb
+)
+language plpgsql stable
+set search_path = pg_catalog
+as $$
+declare v_limit integer;
+begin
+  if p_run_id is null or p_tool_operation is null or btrim(p_tool_operation) = '' then
+    raise exception 'a run and a tool operation are required' using errcode = '22023';
+  end if;
+  v_limit := greatest(0, least(coalesce(p_limit, 25), public.catalog_page_limit()));
+  return query
+  with evidence as (
+    -- ONE run, ONE registered tool operation, VERIFIED verdicts only. A
+    -- `needs_review` or `rejected` verdict is a real answer, and it is an
+    -- answer against promoting.
+    select c.id as claim_id, c.source_id, c.field_key, c.value as field_value,
+           coalesce(c.identity_scope, '{}'::jsonb) as identity_scope,
+           public.r3_canonical_locator(c.evidence_locator)->>1 as locator_record,
+           v.id as verdict_id
+      from public.claims c
+      join public.sources s on s.id = c.source_id and s.run_id = p_run_id
+      join public.claim_verdicts v
+        on v.claim_id = c.id and v.run_id = p_run_id and v.verdict = 'verified'
+     where c.run_id = p_run_id
+       and c.status = 'active'
+       and s.tool_operation = p_tool_operation
+       and c.evidence_locator is not null
+  ), located as (
+    select e.claim_id, e.source_id, e.field_key, e.field_value, e.identity_scope,
+           e.verdict_id, r.id as raw_record_id, r.record_key, r.upstream_record_id,
+           sn.id as snapshot_id, sn.snapshot_key, sn.source_family, sn.resource_id
+      from evidence e
+      join public.catalog_source_snapshots sn
+        on sn.trust_state = 'evidence'
+       and sn.activated_at is not null
+       and sn.validation_state = 'complete'
+      join public.catalog_raw_records r
+        on r.snapshot_id = sn.id
+       and public.catalog_record_locator_id(sn.snapshot_key, r.upstream_record_id)
+           = e.locator_record
+  ), matched as (
+    select l.claim_id, l.source_id, l.field_key, l.field_value, l.verdict_id,
+           l.raw_record_id, l.record_key, l.upstream_record_id, l.snapshot_id,
+           l.snapshot_key, l.source_family, l.resource_id,
+           cand.id as candidate_id, cand.candidate_key, cand.status,
+           cand.manufacturer, cand.commercial_model,
+           cand.model_year_start, cand.model_year_end,
+           cand.official_model_code, cand.trim as candidate_trim,
+           cand.identity_dimensions
+      from located l
+      join public.catalog_candidate_variants cand
+        on cand.snapshot_id = l.snapshot_id
+       and cand.raw_record_id = l.raw_record_id
+     where cand.status in ('candidate', 'ready_for_review')
+       and public.catalog_candidate_identity_scope(
+             cand.identity_dimensions, cand.official_model_code, cand.trim)
+           = l.identity_scope
+  ), unambiguous as (
+    select m.claim_id from matched m
+     group by m.claim_id having count(distinct m.candidate_id) = 1
+  ), chosen as (
+    select m.candidate_key
+      from matched m join unambiguous u on u.claim_id = m.claim_id
+     group by m.candidate_key
+     order by m.candidate_key collate "C"
+     limit v_limit
+  )
+  select m.candidate_id, m.candidate_key, m.status, m.snapshot_id, m.snapshot_key,
+         m.source_family, m.resource_id, m.raw_record_id, m.upstream_record_id,
+         m.record_key, m.manufacturer, m.commercial_model, m.model_year_start,
+         m.model_year_end, m.official_model_code, m.candidate_trim,
+         m.identity_dimensions, m.claim_id, m.source_id, m.verdict_id,
+         m.field_key, m.field_value
+    from matched m
+    join unambiguous u on u.claim_id = m.claim_id
+    join chosen ch on ch.candidate_key = m.candidate_key
+   order by m.candidate_key collate "C", m.field_key collate "C", m.claim_id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- 8. Privileges: the canonical catalog becomes INSERT-able, and nothing more.
 -- ---------------------------------------------------------------------------
 do $$
@@ -1075,6 +1211,8 @@ begin
     'public.catalog_canonical_identity_field(text)',
     'public.catalog_record_locator_id(text,text)',
     'public.catalog_claim_entity_key(text,integer)',
+    'public.catalog_candidate_identity_scope(jsonb,text,text)',
+    'public.catalog_run_pending_promotions(uuid,text,integer)',
     'public.r4_normalized_scope_text(text)',
     'public.promote_catalog_variant_guarded(uuid,text,integer,text,jsonb)'
   ] loop

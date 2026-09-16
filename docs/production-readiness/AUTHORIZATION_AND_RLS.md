@@ -124,9 +124,11 @@ a literal, order deterministically, bound every page with a server-owned
 constant and return the exact total — including on an EMPTY page, which comes
 back as one COUNT ROW rather than as no rows at all. Each has `EXECUTE` revoked
 from `PUBLIC`/`anon`/`authenticated` before the narrow `service_role` grant,
-exactly like every other function in this namespace, and so do the three
-IMMUTABLE pure helpers PR3 adds (`catalog_record_locator_id`,
-`catalog_claim_entity_key`, `r4_normalized_scope_text`).
+exactly like every other function in this namespace, and so do
+`catalog_run_pending_promotions` — the bounded read that derives what one run
+still has to promote — and the four IMMUTABLE pure helpers PR3 adds
+(`catalog_record_locator_id`, `catalog_claim_entity_key`,
+`catalog_candidate_identity_scope`, `r4_normalized_scope_text`).
 
 **The repository's catalog write path** goes through six lease-guarded RPCs
 (`record_catalog_snapshot_guarded`, `record_catalog_raw_record_guarded`,

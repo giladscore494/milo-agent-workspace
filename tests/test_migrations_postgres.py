@@ -47,7 +47,9 @@ from backend.engines.swarm_v2.normalization import (
     SCOPE_NORMALIZATION_VERSION, canonical_scope_hash, canonical_scope_key,
     normalize_field_key,
 )
-from backend.catalog.contracts import claim_entity_key, record_locator_id
+from backend.catalog.contracts import (candidate_identity_scope, claim_entity_key,
+                                       record_locator_id)
+from backend.catalog.pipeline import PROMOTABLE_TOOL_OPERATION
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS = sorted((REPO_ROOT / "supabase" / "migrations").glob("*.sql"))
@@ -2543,8 +2545,11 @@ R3_TEXT = "model_name=Fixture Hatch; model_year=2020; engine_displacement_cc=179
 
 
 def _r3_source_json(key: str, *, task: str = "task", kind: str | None = R3_VERSION[0],
-                    identifier: str | None = R3_VERSION[1]) -> str:
+                    identifier: str | None = R3_VERSION[1],
+                    tool_operation: str | None = None) -> str:
     payload = json.loads(_source_json(key, task=task))
+    if tool_operation is not None:
+        payload["tool_operation"] = tool_operation
     payload.update(source_version_kind=kind, source_version_id=identifier)
     return json.dumps(payload)
 
@@ -5309,7 +5314,8 @@ def _pr3_context(suffix: str, make: str) -> tuple[str, dict]:
 
 def _pr3_field_evidence(db, args: str, label: str, field_key: str, value,
                         unit: str | None, register_field: str, *,
-                        record_id: str, scope: dict) -> dict[str, str]:
+                        record_id: str, scope: dict,
+                        verdict: str = "verified") -> dict[str, str]:
     """A complete R3/R4 chain for ONE promotable field.
 
     One source per field, deliberately: a source may carry at most four focused
@@ -5324,8 +5330,9 @@ def _pr3_field_evidence(db, args: str, label: str, field_key: str, value,
     """
     locator = record_field_locator(record_id, (register_field,)).locator_key
     text = f"{register_field}={value}"
-    source = _rpc_as_service(db, "select id from public.upsert_source_guarded("
-                                 f"{args},'{_r3_source_json(f'{label}-src')}'::jsonb)")
+    source = _rpc_as_service(
+        db, "select id from public.upsert_source_guarded("
+            f"{args},'{_r3_source_json(f'{label}-src', tool_operation=PROMOTABLE_TOOL_OPERATION)}'::jsonb)")
     fragment = _rpc_as_service(
         db, "select id from public.record_evidence_fragment_guarded("
             f"{args},'{_r3_fragment_json(source, text, key=f'{label}-frag', locator=locator)}'::jsonb)")
@@ -5334,16 +5341,16 @@ def _pr3_field_evidence(db, args: str, label: str, field_key: str, value,
             f"{args},'{_r3_claim_json(f'{label}-claim', source, value, locator=locator, unit=unit, field=field_key, **scope)}'::jsonb)")
     support = [{"fragment_id": fragment, "content_hash": fragment_content_hash(text),
                 "locator_key": locator}]
-    verdict = _rpc_as_service(
+    settled = _rpc_as_service(
         db, "select id from public.record_claim_verdict_guarded("
-            f"{args},'{_r4_verdict_json(claim, key=f'{label}-verdict', support=support)}'::jsonb)")
-    return {"source": source, "fragment": fragment, "claim": claim, "verdict": verdict,
+            f"{args},'{_r4_verdict_json(claim, key=f'{label}-verdict', verdict=verdict, support=support)}'::jsonb)")
+    return {"source": source, "fragment": fragment, "claim": claim, "verdict": settled,
             "field_key": field_key, "value": value}
 
 
 def _pr3_promotable(db, suffix: str, *, status: str = "ready_for_review",
                     family: str = "government", fields=PR3_FIELDS,
-                    scope: dict | None = None):
+                    scope: dict | None = None, verified: bool = True):
     """A ready candidate with a VERIFIED evidence link per promotable field.
 
     Each case gets its OWN manufacturer. `catalog_models_natural_uniq` makes
@@ -5377,8 +5384,12 @@ def _pr3_promotable(db, suffix: str, *, status: str = "ready_for_review",
     links = {}
     for index, (field_key, value, unit, register_field) in enumerate(fields):
         evidence = _pr3_field_evidence(db, args, f"pr3-{suffix}-{index}", field_key, value,
-                                       unit, register_field, record_id=record_id, scope=scope)
-        link = _rpc_as_service(
+                                       unit, register_field, record_id=record_id, scope=scope,
+                                       verdict="verified" if verified else "needs_review")
+        # A link may cite only a VERIFIED verdict, so an unverified case links
+        # nothing -- exactly the durable shape a run leaves behind when the
+        # Verifier did not confirm what the register said.
+        link = None if not verified else _rpc_as_service(
             db, "select id from public.link_catalog_candidate_evidence_guarded("
                 f"{args},'{_catalog_link_json(candidate, evidence['source'], f'pr3-link-{suffix}-{index}', claim_id=evidence['claim'], verdict_id=evidence['verdict'], locator=None, version=None, kind=None)}'::jsonb)")
         links[field_key] = {**evidence, "link": link}
@@ -5962,6 +5973,106 @@ def test_a_canonical_fact_is_never_promoted_out_of_an_unresolved_conflict(pr3_db
     assert db.psql("select count(*) from public.catalog_model_variants v "
                    "join public.catalog_models m on m.id = v.model_id "
                    f"where m.manufacturer='{make}'") == "0"
+
+
+def test_the_pending_promotion_read_reconstructs_the_candidate_from_durable_rows(pr3_db):
+    """The crash-safety of the whole promotion path, in one read.
+
+    Nothing in a worker's memory says which candidate a claim is evidence FOR.
+    This function derives it from rows the server itself wrote -- the claim's
+    own locator names one captured upstream row, the row belongs to one active
+    snapshot, and the candidate is the reading of that row whose identity scope
+    is exactly the claim's -- so a REPLACEMENT worker, which restored completed
+    tasks and never re-executed the tool, finds exactly the work the crashed one
+    would have done.
+    """
+    db = pr3_db
+    args, _snapshot, _record, candidate, _links, make = _pr3_promotable(db, "pending")
+    run_id = args.split(",")[0].strip("'")
+    read = ("select %s from public.catalog_run_pending_promotions("
+            f"'{run_id}','{PROMOTABLE_TOOL_OPERATION}',25)")
+
+    # One row per promoted field, all naming the SAME durable candidate.
+    assert db.psql(read % "count(*) || '|' || count(distinct candidate_id)") \
+        == f"{len(PR3_FIELDS)}|1"
+    assert db.psql(read % "distinct candidate_id") == candidate
+    assert db.psql(read % "distinct manufacturer || '|' || commercial_model || '|' || status") \
+        == f"{make}|RAV4|ready_for_review"
+    # Every field, in the deterministic order the function states.
+    assert db.psql(read % "string_agg(field_key, ',')") \
+        == ",".join(sorted(name for name, _v, _u, _r in PR3_FIELDS))
+    # The claim, its source and its VERIFIED verdict all travel with it, which
+    # is what lets the resume link without re-reading anything else.
+    assert db.psql(read % "count(*)"
+                   ) == db.psql(read % "count(distinct claim_id)")
+    assert db.psql("select count(*) from public.catalog_run_pending_promotions("
+                   f"'{run_id}','{PROMOTABLE_TOOL_OPERATION}',25) p "
+                   "join public.claim_verdicts v on v.id = p.verdict_id "
+                   "where v.verdict = 'verified'") == str(len(PR3_FIELDS))
+    # BOUNDED by candidates, not by rows.
+    assert db.psql("select count(*) from public.catalog_run_pending_promotions("
+                   f"'{run_id}','{PROMOTABLE_TOOL_OPERATION}',0)") == "0"
+
+    # A claim of ANOTHER tool operation is invisible: the association is only
+    # ever derived for the one registered Government read.
+    assert db.psql("select count(*) from public.catalog_run_pending_promotions("
+                   f"'{run_id}','catalog.government_vehicle.get_variants',25)") == "0"
+    # And another RUN's evidence is another run's.
+    assert db.psql("select count(*) from public.catalog_run_pending_promotions("
+                   f"'{uuid.uuid4()}','{PROMOTABLE_TOOL_OPERATION}',25)") == "0"
+    with pytest.raises(AssertionError, match="a run and a tool operation are required"):
+        db.psql(f"select * from public.catalog_run_pending_promotions('{run_id}','',25)")
+
+
+def test_the_pending_promotion_read_refuses_what_a_promotion_would_refuse(pr3_db):
+    """An unverified verdict, an ambiguous reading and a foreign record.
+
+    Each one makes the candidate invisible to the resume rather than visible
+    and then refused: the derivation and the promotion gate agree about what
+    may become a canonical fact, so a resumed worker never even proposes one
+    the database would reject.
+    """
+    db = pr3_db
+    read = "select count(*) from public.catalog_run_pending_promotions('%s','%s',25)"
+
+    # 1. NO VERIFIED VERDICT. The evidence is durable and the run owes nothing.
+    args, _s, _r, _candidate, _links, _make = _pr3_promotable(db, "pending-unverified",
+                                                              verified=False)
+    unverified_run = args.split(",")[0].strip("'")
+    assert db.psql(read % (unverified_run, PROMOTABLE_TOOL_OPERATION)) == "0"
+
+    # 2. AN AMBIGUOUS READING stays ambiguous. Promotion may not overrule a
+    #    decision the ingestion made, so the resume does not see it at all.
+    args, _s, _r, _candidate, _links, _make = _pr3_promotable(db, "pending-ambiguous",
+                                                              status="ambiguous")
+    ambiguous_run = args.split(",")[0].strip("'")
+    assert db.psql(read % (ambiguous_run, PROMOTABLE_TOOL_OPERATION)) == "0"
+
+    # 3. A LOCATOR NAMING ANOTHER RECORD resolves to no candidate at all.
+    args, _snapshot, _record, candidate, _links, make = _pr3_promotable(db, "pending-foreign")
+    foreign_run = args.split(",")[0].strip("'")
+    before = db.psql(read % (foreign_run, PROMOTABLE_TOOL_OPERATION))
+    _pr3_field_evidence(db, args, "pr3-pending-foreign-elsewhere", "model_year_start", 2021,
+                        "year", "shnat_yitzur",
+                        record_id=record_locator_id(
+                            _catalog_key("catalog.snapshot", "pr3-snap-pending-foreign"),
+                            "77777"),
+                        scope=_pr3_scope(make))
+    assert db.psql(read % (foreign_run, PROMOTABLE_TOOL_OPERATION)) == before
+
+    # The identity scope the derivation JOINS on is the one Python builds. A
+    # drift here would make every honest resume find nothing, so the two are
+    # compared as values rather than reviewed as code.
+    dimensions = {"fuel_type": "plug_in_hybrid", "drivetrain": "AWD", "body_style": "SUV"}
+    rendered = db.psql("select public.catalog_candidate_identity_scope("
+                       f"'{json.dumps(dimensions)}'::jsonb,"
+                       "'AXAP54L-ANXGBW','PRIME AWD SE')::text")
+    assert json.loads(rendered) == candidate_identity_scope(
+        dimensions, "AXAP54L-ANXGBW", "PRIME AWD SE")
+    # An absent code and an absent trim are ABSENT KEYS on both sides.
+    bare = db.psql("select public.catalog_candidate_identity_scope("
+                   "'{}'::jsonb, null, null)::text")
+    assert json.loads(bare) == candidate_identity_scope({}, None, None) == {}
 
 
 def test_a_revision_appends_and_the_read_model_moves_but_the_row_never_does(pr3_db):

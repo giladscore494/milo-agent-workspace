@@ -445,12 +445,13 @@ def test_r3_provenance_stays_internal_and_the_production_mapping_is_one_pair():
     worker = "\n".join(line.split("#", 1)[0] for line
                        in Path("backend/worker/main.py").read_text().splitlines())
     assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in worker
+    assert "tool_result_sink=evidence_sink" in worker
     assert "RegisteredOperationEvidenceSink(" in worker
-    # Catalog PR3 wraps the production sink in the trusted promotion LEDGER, so
-    # the worker's tool-result sink is the ledger and the ledger delegates to
-    # the sink. Nothing is bypassed: the ledger writes nothing of its own.
-    assert "CatalogEvidenceLedger(evidence_sink," in worker
-    assert "tool_result_sink=ledger," in worker
+    # Catalog PR3's promotion path OBSERVES nothing here: it reads what the run
+    # still owes from the database, so a resumed worker promotes what a crashed
+    # one would have.
+    assert "CatalogPromotionPipeline(repo, board.lease)" in worker
+    assert "catalog_promotion[\"pipeline\"].promote()" in worker
     assert "write_approved" not in worker
     mapping = Path("backend/engines/swarm_v2/evidence_mapping.py").read_text()
     # Catalog PR3 replaced the empty module constant with a BUILDER plus a

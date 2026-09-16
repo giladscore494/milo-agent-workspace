@@ -16,6 +16,31 @@ join:
       -> promotion PLAN     (backend/catalog/promotion.py)
       -> canonical row      (promote_catalog_variant_guarded)
 
+Where the fourth arrow gets its input, and why it matters
+---------------------------------------------------------
+
+From the DATABASE, every time. `catalog_run_pending_promotions` reconstructs
+"which candidate is this claim evidence FOR" out of rows the server itself
+wrote: the claim's own evidence locator names one captured upstream row, that
+row belongs to one active snapshot of an `evidence` trust family, and the
+candidate is the reading of that row whose identity scope is exactly the
+claim's.
+
+An earlier round kept that association in a LEDGER inside the worker process,
+built as the tool results arrived. It was correct while the process lived and
+lost the moment it did not. A worker that crashes after Swarm V2 has durably
+persisted its evidence, its verdicts and its checkpoint is replaced by a worker
+that restores the completed tasks and DOES NOT re-execute the Government tool --
+there is nothing left to re-execute. The replacement's ledger was therefore
+empty, it produced no promotion attempts at all, and a run whose evidence and
+verdicts were entirely durable left the canonical catalog empty with nothing
+anywhere saying why.
+
+Deriving the association instead of remembering it closes that window. It also
+removes the need to trust anything a process was holding: the derivation reads
+claims, verdicts, sources, snapshots, raw records and candidates, and every one
+of those was written by trusted server code through a lease-guarded RPC.
+
 What a model can and cannot do here
 -----------------------------------
 
@@ -29,8 +54,8 @@ server code running in this worker's own wiring:
     picture -- a plan cannot request a promotion because there is nothing to
     request;
 *   every input is server-produced. The candidate identity comes from the
-    durable row the Tool read, not from anything a model wrote; the claims and
-    verdicts come from the Board; the canonical keys are DERIVED by
+    durable row, not from anything a model wrote; the claims and verdicts come
+    from the Board; the canonical keys are DERIVED by
     `backend/catalog/payloads.py`;
 *   every write goes through the same lease-guarded RPC as every other durable
     catalog write, and the database re-checks the whole support chain for every
@@ -39,42 +64,51 @@ server code running in this worker's own wiring:
 What it deliberately does NOT do
 --------------------------------
 
-**It does not schedule anything.** It runs once, at the end of a run that
-already happened, over that run's own Government resolutions. It starts no
-capture, opens no socket and holds no credential; the Government refresh
-operation stays unscheduled and is not called from here.
+**It does not schedule anything.** It runs at the end of a run that already
+happened, over that run's own Government evidence. It starts no capture, opens
+no socket and holds no credential; the Government refresh operation stays
+unscheduled and is not called from here.
 
-**It cannot widen a run.** It reads only what the run already produced, it
-promotes at most one canonical variant per candidate the run resolved, and it
-never queries for more candidates to work on.
+**It cannot widen a run.** The pending-promotion read is scoped to this run's
+own claims and bounded to `MAX_PROMOTIONS_PER_RUN` candidates. It never queries
+for work another run produced.
 
-**It never fails the run.** A refusal is what the durable catalog is FOR: an
-ambiguous candidate, a field with no verified evidence, an unresolved conflict
-and a lost lease are all legitimate outcomes of a research run. Each one is
-returned as a static reason code, and the run's own result is untouched -- with
-one exception, stated in `CatalogPromotionPipeline.promote`: a lost lease is an
-infrastructure outcome and is re-raised, because a stale worker must not keep
-writing.
+**It never overrules an ambiguity.** A candidate the ingestion left `ambiguous`
+or `rejected` is excluded by the durable read and refused again here. Ambiguity
+is a first-class answer in this schema, and a promotion may not settle one by
+writing it down.
+
+**It never fails the run.** A refusal is what the durable catalog is FOR: a
+field with no verified evidence, an unresolved conflict and a lost lease are all
+legitimate outcomes of a research run. Each one is returned as a static reason
+code, and the run's own result is untouched -- with one exception, stated in
+`CatalogPromotionPipeline.promote`: a lost lease is an infrastructure outcome
+and is re-raised, because a stale worker must not keep writing.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from backend.errors import AppError
 
+from .contracts import MAX_PROMOTIONS_PER_RUN
 from .government.evidence import GOVERNMENT_TOOL_NAME, RESOLVE_VARIANT_OPERATION
-from .government.source import GOVERNMENT_SOURCE_FAMILY
 from .promotion import (LEASE_FAILURE_CODES, PROMOTION_REASONS, CanonicalPromotion,
                         CatalogPromotionError, PromotionOutcome, PROMOTABLE_CANDIDATE_STATUS,
                         build_promotion_plan, field_evidence_for)
 
-#: How many candidates one run may promote. A research run resolves a handful
-#: of vehicles; a run that somehow resolved thousands must not turn into an
-#: unbounded write loop at the end of it, so the ledger stops REMEMBERING past
-#: this and the extras are simply never promoted.
-MAX_PROMOTIONS_PER_RUN = 25
+#: The ONE tool operation whose evidence this path promotes, spelled exactly as
+#: the registered mapper records it on every source it writes. The durable read
+#: matches on it, so a claim from any other operation -- or from no tool at all
+#: -- can never be picked up here.
+PROMOTABLE_TOOL_OPERATION = f"{GOVERNMENT_TOOL_NAME}.{RESOLVE_VARIANT_OPERATION}"
+
+#: The candidate statuses a promotion may act on. `ambiguous` and `rejected`
+#: are deliberately absent: both are decisions the ingestion made, and a
+#: promotion may not overrule one by writing a canonical row.
+PROMOTABLE_CANDIDATE_STATUSES = ("candidate", PROMOTABLE_CANDIDATE_STATUS)
 
 #: Refusals this layer adds to the ones `backend/catalog/promotion.py` owns.
 PIPELINE_REASONS: Mapping[str, str] = {
@@ -89,23 +123,62 @@ PIPELINE_REASONS: Mapping[str, str] = {
 
 @dataclass(frozen=True)
 class CandidateEvidence:
-    """One unambiguous Government resolution, and what it wrote for it.
+    """One candidate this run still has to promote, and the evidence for it.
 
-    `candidate` is the durable row the Tool read, as the server produced it --
-    never a model's restatement of it. `claims` are the durable claim rows the
-    registered mapper's bundle became, in write order, exactly as the Evidence
-    Board returned them.
+    Assembled from `catalog_run_pending_promotions` and from nothing else, so
+    every field is a durable server-written value. `claims` carries one entry
+    per verified claim, each already paired with the verdict that verified it.
     """
 
     candidate: Mapping[str, Any]
-    snapshot_key: str
-    resource_id: str
     claims: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def candidate_id(self) -> str:
         return str(self.candidate["candidate_id"])
 
+    @property
+    def candidate_key(self) -> str:
+        return str(self.candidate["candidate_key"])
+
+    @property
+    def status(self) -> str:
+        return str(self.candidate.get("status") or "")
+
+    def as_candidate_row(self) -> dict[str, Any]:
+        """The candidate as the promotion contracts read one.
+
+        The durable read returns the candidate's own columns under their own
+        names except for `id`, which it calls `candidate_id` so one row can
+        carry a candidate and a claim without colliding.
+        """
+        return {"id": self.candidate_id,
+                **{name: self.candidate.get(name) for name in
+                   ("candidate_key", "status", "manufacturer", "commercial_model",
+                    "model_year_start", "model_year_end", "official_model_code",
+                    "trim")},
+                "identity_dimensions": dict(self.candidate.get("identity_dimensions") or {})}
+
+
+def group_pending_promotions(rows: Sequence[Mapping[str, Any]]
+                             ) -> tuple[CandidateEvidence, ...]:
+    """Group the durable read's (candidate, claim) rows by candidate.
+
+    Order-preserving: the read already returns candidates in `candidate_key`
+    order and their claims in field order, so a resumed worker walks exactly
+    the sequence the crashed one would have.
+    """
+    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    candidates: dict[str, Mapping[str, Any]] = {}
+    for row in rows:
+        key = str(row["candidate_key"])
+        candidates.setdefault(key, row)
+        grouped.setdefault(key, []).append(
+            {"id": row["claim_id"], "source_id": row["source_id"],
+             "verdict_id": row["verdict_id"], "field_key": row["field_key"],
+             "value": row["field_value"]})
+    return tuple(CandidateEvidence(candidate=candidates[key], claims=tuple(claims))
+                 for key, claims in grouped.items())
 
 
 @dataclass(frozen=True)
@@ -146,95 +219,6 @@ class PromotionAttempt:
         return payload
 
 
-class CatalogEvidenceLedger:
-    """What this run's Government reads and verdicts produced, observed in order.
-
-    TWO trusted seams feed it and nothing else can reach it: the tool-result
-    sink, which already receives the server-produced result and therefore knows
-    WHICH durable candidate each resolution was about, and the verdict sink,
-    which already receives each settled verdict. Both are wired in
-    `backend/worker/main.py`.
-
-    It performs no write of its own and holds no repository handle. It is a
-    record of what happened, which is exactly what the promotion path needs and
-    could not otherwise obtain: a claim row does not say which candidate it is
-    evidence for, and the only place that is known is the tool result.
-    """
-
-    def __init__(self, sink: Any, *, verdict_sink: Any,
-                 max_candidates: int = MAX_PROMOTIONS_PER_RUN) -> None:
-        self._sink = sink
-        self._verdict_sink = verdict_sink
-        self._max = max(0, int(max_candidates))
-        self._observed: dict[str, CandidateEvidence] = {}
-        self._verdicts: dict[str, dict[str, Any]] = {}
-
-    # --- the ToolResultSink seam --------------------------------------------
-
-    def __call__(self, record: Any) -> None:
-        """Persist the result's evidence exactly as before, then remember it."""
-        acquired = self._sink.acquire(record)
-        if acquired is None:
-            return
-        if getattr(record, "tool", None) != GOVERNMENT_TOOL_NAME \
-                or getattr(record, "operation", None) != RESOLVE_VARIANT_OPERATION:
-            return
-        result = record.result if isinstance(record.result, Mapping) else {}
-        variants = result.get("variants") or []
-        # Belt and braces: the mapper already declines anything that is not a
-        # single resolved row, so an ambiguous answer never gets here. An
-        # ambiguous candidate stays ambiguous.
-        if result.get("match_count") != 1 or len(variants) != 1:
-            return
-        candidate = variants[0]
-        provenance = result.get("provenance") or {}
-        candidate_id = str(candidate.get("candidate_id") or "")
-        if not candidate_id:
-            return
-        claims = tuple(dict(row) for row in acquired.claims)
-        held = self._observed.get(candidate_id)
-        if held is not None:
-            # A later resolution of the same candidate ADDS its claims rather
-            # than replacing them, so a run that read one vehicle twice cites
-            # both readings. Each claim carries its own source, so a second
-            # source is linked correctly without being remembered separately.
-            seen = {str(row["id"]) for row in held.claims}
-            self._observed[candidate_id] = CandidateEvidence(
-                candidate=held.candidate, snapshot_key=held.snapshot_key,
-                resource_id=held.resource_id,
-                claims=held.claims + tuple(row for row in claims
-                                           if str(row["id"]) not in seen))
-            return
-        if len(self._observed) >= self._max:
-            return
-        self._observed[candidate_id] = CandidateEvidence(
-            candidate=dict(candidate), snapshot_key=str(provenance.get("snapshot_key") or ""),
-            resource_id=str(provenance.get("resource_id") or ""), claims=claims)
-
-    @property
-    def sink(self) -> Any:
-        return self._sink
-
-    # --- the verdict seam ----------------------------------------------------
-
-    def record_verdict(self, verdict: Any) -> dict[str, Any]:
-        """Persist ONE settled verdict exactly as before, then remember it."""
-        row = self._verdict_sink(verdict)
-        if isinstance(row, Mapping) and row.get("claim_id") is not None:
-            self._verdicts[str(row["claim_id"])] = dict(row)
-        return row
-
-    # --- what the promotion path reads --------------------------------------
-
-    @property
-    def observations(self) -> tuple[CandidateEvidence, ...]:
-        """The observed candidates, in the order the run resolved them."""
-        return tuple(self._observed.values())
-
-    def verdict_for(self, claim_id: Any) -> Mapping[str, Any] | None:
-        return self._verdicts.get(str(claim_id))
-
-
 class CatalogPromotionPipeline:
     """One run's Government evidence, carried through to canonical rows.
 
@@ -242,11 +226,17 @@ class CatalogPromotionPipeline:
     run's worker lease, exactly like the Evidence Board and for the same
     reason: every write is lease-guarded, idempotent and append-only, and this
     object holds no credential and no model client.
+
+    It holds NO state of its own between calls. Everything it acts on is read
+    from the database at the moment it acts, which is what makes a replacement
+    worker behave identically to the one it replaced.
     """
 
-    def __init__(self, repository: Any, lease: Any) -> None:
+    def __init__(self, repository: Any, lease: Any, *,
+                 limit: int = MAX_PROMOTIONS_PER_RUN) -> None:
         self._repository = repository
         self._lease = lease
+        self._limit = max(0, int(limit))
         self._promotion = CanonicalPromotion(repository, lease)
 
     @property
@@ -254,12 +244,37 @@ class CatalogPromotionPipeline:
         return {"worker_id": self._lease.worker_id, "attempt": self._lease.attempt,
                 "lease_token": self._lease.lease_token}
 
-    def promote(self, ledger: CatalogEvidenceLedger) -> tuple[PromotionAttempt, ...]:
-        """Link, review, plan and promote every candidate the run resolved.
+    def pending(self) -> tuple[CandidateEvidence, ...]:
+        """What this run still has to promote, read from durable state.
 
-        Total and bounded: every observation produces exactly one
+        A failure of the read is not a refusal of anything: nothing is known,
+        so nothing is attempted and nothing is claimed about any candidate.
+        The same holds for a repository that does not offer the read at all --
+        one without the catalog schema behind it, which is to say without a
+        canonical catalog to promote INTO. Neither fails a research run over a
+        capability that run never needed.
+        """
+        read = getattr(self._repository, "catalog_run_pending_promotions", None)
+        if not callable(read):
+            return ()
+        try:
+            rows = read(self._lease.run_id, PROMOTABLE_TOOL_OPERATION, limit=self._limit)
+        except AppError:
+            return ()
+        return group_pending_promotions(list(rows))
+
+    def promote(self) -> tuple[PromotionAttempt, ...]:
+        """Link, review, plan and promote everything this run still owes.
+
+        Total and bounded: every pending candidate produces exactly one
         `PromotionAttempt`, promoted or refused with a static reason, and the
-        ledger already bounds how many there can be.
+        durable read already bounds how many there can be.
+
+        Idempotent end to end, which is what makes a resume safe: the evidence
+        link, the reviewed status and the promotion itself are each idempotent
+        on a derived key, so a candidate a previous attempt already promoted is
+        re-read, re-planned and then written NOWHERE -- it comes back as a
+        replay.
 
         A LOST LEASE is the one thing that escapes. It means this worker is no
         longer the run's writer, so continuing would be a stale worker writing
@@ -267,190 +282,150 @@ class CatalogPromotionPipeline:
         exactly as every other guarded write's does.
         """
         attempts: list[PromotionAttempt] = []
-        for observation in ledger.observations:
+        for pending in self.pending():
             try:
-                attempts.append(self._promote_one(observation, ledger))
+                attempts.append(self._promote_one(pending))
             except AppError as failure:
                 if failure.code in LEASE_FAILURE_CODES:
                     raise
                 attempts.append(PromotionAttempt(
-                    candidate_id=observation.candidate_id, candidate_key="",
+                    candidate_id=pending.candidate_id, candidate_key=pending.candidate_key,
                     reason_code="CATALOG_PROMOTION_REFUSED"))
         return tuple(attempts)
 
     # --- one candidate -------------------------------------------------------
 
-    def _promote_one(self, observation: CandidateEvidence,
-                     ledger: CatalogEvidenceLedger) -> PromotionAttempt:
-        # 0. The DURABLE rows, read back by the server. The tool result names
-        #    the candidate and the record it read; everything the promotion is
-        #    built from is then read from the database rather than taken from
-        #    the result, so the internal keys a promotion needs never have to
-        #    appear in a model-visible tool output at all.
-        snapshot = self._snapshot(observation)
-        record = self._record(snapshot, observation)
-        candidate = self._candidate(snapshot, observation)
-        if snapshot is None or record is None or candidate is None:
-            return PromotionAttempt(candidate_id=observation.candidate_id,
-                                    candidate_key="",
-                                    reason_code="CATALOG_PROMOTION_SNAPSHOT_UNUSABLE")
-        candidate_key = str(candidate["candidate_key"])
+    def _promote_one(self, pending: CandidateEvidence) -> PromotionAttempt:
+        candidate = pending.as_candidate_row()
+        candidate_key = pending.candidate_key
 
-        # 1. LINK. Only a claim whose verdict is exactly `verified` is cited:
-        #    a `needs_review` or `rejected` verdict is a real answer, and it is
-        #    an answer AGAINST promoting.
-        links = self._link(candidate, observation, ledger)
+        # 0. The candidate must be PROMOTABLE AT ALL. The durable read already
+        #    excludes an `ambiguous` or `rejected` reading; refusing it again
+        #    here is what keeps "an ambiguous candidate stays ambiguous" true
+        #    of this module rather than of the query it happens to use.
+        if pending.status not in PROMOTABLE_CANDIDATE_STATUSES:
+            return PromotionAttempt(candidate_id=pending.candidate_id,
+                                    candidate_key=candidate_key,
+                                    reason_code="CATALOG_PROMOTION_CANDIDATE_NOT_READY")
+
+        # 1. The SNAPSHOT, re-read through the repository's own active-snapshot
+        #    lookup, so an inactive, incomplete or `legacy_reference` snapshot
+        #    simply does not come back and nothing is promoted from it.
+        snapshot = self._snapshot(pending)
+        if snapshot is None:
+            return PromotionAttempt(candidate_id=pending.candidate_id,
+                                    candidate_key=candidate_key,
+                                    reason_code="CATALOG_PROMOTION_SNAPSHOT_UNUSABLE")
+
+        # 2. LINK, one per verified claim, idempotent on a derived key -- so a
+        #    resume relinks onto the rows a previous attempt created instead of
+        #    duplicating them.
+        links = self._link(candidate, pending)
         if not links:
-            return PromotionAttempt(candidate_id=observation.candidate_id,
+            return PromotionAttempt(candidate_id=pending.candidate_id,
                                     candidate_key=candidate_key,
                                     reason_code="CATALOG_PROMOTION_NO_VERIFIED_EVIDENCE")
 
-        # 2. PLAN, against the candidate as if it were reviewed. The plan is
+        # 3. PLAN, against the candidate as if it were reviewed. The plan is
         #    what decides whether the candidate IS reviewable: it refuses
         #    unless every identity field the canonical row would state has its
         #    own verified evidence at exactly that value. Building it first is
         #    what keeps `ready_for_review` from becoming a status this code
         #    writes hopefully -- the transition below happens only when a
         #    complete, evidenced promotion is already in hand.
-        proposed = {**dict(candidate), "status": PROMOTABLE_CANDIDATE_STATUS}
+        proposed = {**candidate, "status": PROMOTABLE_CANDIDATE_STATUS}
         try:
             evidence = field_evidence_for(
                 candidate=proposed, links=[link for link, _ in links],
-                claims={str(row["id"]): row for row in observation.claims},
+                claims={str(row["id"]): row for row in pending.claims},
                 verdicts={str(verdict["id"]): verdict for _, verdict in links})
             plan = build_promotion_plan(candidate=proposed, snapshot=snapshot,
                                         evidence=evidence)
         except CatalogPromotionError as refusal:
-            return PromotionAttempt(candidate_id=observation.candidate_id,
+            return PromotionAttempt(candidate_id=pending.candidate_id,
                                     candidate_key=candidate_key,
                                     reason_code=refusal.reason_code)
 
-        # 3. REVIEW. The durable status transition, through the same guarded
+        # 4. REVIEW. The durable status transition, through the same guarded
         #    RPC that created the candidate: it holds the re-presented row to
         #    the identity already stored under that key, so this can move the
-        #    status and can never quietly become a different vehicle.
-        reviewed = self._review(candidate, snapshot, record)
+        #    status and can never quietly become a different vehicle. Already
+        #    `ready_for_review` from an earlier attempt is a no-op.
+        reviewed = self._review(pending, snapshot)
         if reviewed.get("status") != PROMOTABLE_CANDIDATE_STATUS:
-            return PromotionAttempt(candidate_id=observation.candidate_id,
+            return PromotionAttempt(candidate_id=pending.candidate_id,
                                     candidate_key=candidate_key,
                                     reason_code="CATALOG_PROMOTION_CANDIDATE_NOT_READY")
 
-        # 4. PROMOTE, atomically, through the lease-guarded RPC.
+        # 5. PROMOTE, atomically, through the lease-guarded RPC.
         try:
             outcome = self._promotion.promote(plan)
         except CatalogPromotionError as refusal:
-            return PromotionAttempt(candidate_id=observation.candidate_id,
+            return PromotionAttempt(candidate_id=pending.candidate_id,
                                     candidate_key=candidate_key,
                                     reason_code=refusal.reason_code)
-        return PromotionAttempt(candidate_id=observation.candidate_id,
+        return PromotionAttempt(candidate_id=pending.candidate_id,
                                 candidate_key=candidate_key, outcome=outcome)
 
-    def _snapshot(self, observation: CandidateEvidence) -> Mapping[str, Any] | None:
-        """The snapshot the candidate was read from, or None when unusable.
-
-        Looked up by the family, the resource and the snapshot key the TOOL
-        RESULT stated, through the repository's own active-snapshot read -- so
-        an inactive, incomplete or `legacy_reference` snapshot simply does not
-        come back and nothing is promoted from it.
-        """
-        if not observation.snapshot_key:
-            return None
+    def _snapshot(self, pending: CandidateEvidence) -> Mapping[str, Any] | None:
+        """The snapshot the candidate was read from, or None when unusable."""
         try:
             return self._repository.find_active_catalog_snapshot(
-                GOVERNMENT_SOURCE_FAMILY, observation.resource_id, observation.snapshot_key)
+                str(pending.candidate["source_family"]),
+                str(pending.candidate["resource_id"]),
+                str(pending.candidate["snapshot_key"]))
         except AppError:
             return None
 
-    def _link(self, candidate: Mapping[str, Any], observation: CandidateEvidence,
-              ledger: CatalogEvidenceLedger
+    def _link(self, candidate: Mapping[str, Any], pending: CandidateEvidence
               ) -> list[tuple[Mapping[str, Any], Mapping[str, Any]]]:
-        """One evidence link per VERIFIED claim, idempotent on a derived key.
+        """One evidence link per verified claim, paired with its verdict.
 
-        Returns each link paired with the verdict it cites, which is what
-        `field_evidence_for` reads to decide the promoted field set.
+        The verdict is already known to be `verified` -- the durable read joins
+        on it -- so this states the pairing `field_evidence_for` needs rather
+        than deciding anything again.
         """
         linked: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
-        for claim in observation.claims:
-            verdict = ledger.verdict_for(claim["id"])
-            if verdict is None or verdict.get("verdict") != "verified":
-                continue
+        for claim in pending.claims:
             row = self._repository.link_catalog_candidate_evidence(
                 self._lease.run_id,
                 {"candidate_id": str(candidate["id"]),
                  "candidate_key": str(candidate["candidate_key"]),
                  "source_id": str(claim["source_id"]), "claim_id": str(claim["id"]),
-                 "verdict_id": str(verdict["id"])},
+                 "verdict_id": str(claim["verdict_id"])},
                 **self._lease_kwargs)
-            linked.append((dict(row), dict(verdict)))
+            linked.append((dict(row), {"id": claim["verdict_id"], "verdict": "verified"}))
         return linked
 
-    def _record(self, snapshot: Mapping[str, Any] | None,
-                observation: CandidateEvidence) -> Mapping[str, Any] | None:
-        """The captured upstream row the candidate is a reading of."""
-        if snapshot is None:
-            return None
-        try:
-            return self._repository.catalog_raw_record_by_upstream_id(
-                snapshot["id"], str(observation.candidate["upstream_record_id"]),
-                allow_incomplete=False)
-        except AppError:
-            return None
-
-    def _candidate(self, snapshot: Mapping[str, Any] | None,
-                   observation: CandidateEvidence) -> Mapping[str, Any] | None:
-        """The durable candidate row, read back by its own stated identity.
-
-        One bounded page, filtered by exactly the identity the resolution
-        settled on -- which matched a single row, or the mapper would have
-        declined it. The row is then matched by ID, so a filter that somehow
-        returned more than one cannot pick the wrong one.
-        """
-        if snapshot is None:
-            return None
-        try:
-            rows = self._repository.catalog_candidate_variant_page(
-                snapshot["id"],
-                manufacturer=observation.candidate["manufacturer"],
-                commercial_model=observation.candidate["commercial_model"],
-                model_year=observation.candidate.get("model_year_start"),
-                official_model_code=observation.candidate.get("official_model_code"),
-                trim=observation.candidate.get("trim"),
-                identity_dimensions=dict(observation.candidate.get("identity_dimensions") or {})
-                                    or None,
-                limit=MAX_PROMOTIONS_PER_RUN, offset=0, allow_incomplete=False)
-        except AppError:
-            return None
-        return next((dict(row) for row in rows
-                     if str(row.get("id")) == observation.candidate_id), None)
-
-    def _review(self, candidate: Mapping[str, Any], snapshot: Mapping[str, Any],
-                record: Mapping[str, Any]) -> Mapping[str, Any]:
+    def _review(self, pending: CandidateEvidence,
+                snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
         """Move the candidate to `ready_for_review`, through the guarded RPC.
 
         The payload restates the durable row exactly, with one field changed.
         The RPC holds a re-presented candidate to the identity already stored
-        under its key, so this can move the status and can never quietly
-        become a different vehicle -- and `candidate_key` is DERIVED from the
-        record key and that identity, so a drift would be refused rather than
-        written.
+        under its key, so this can move the status and can never quietly become
+        a different vehicle -- and `candidate_key` is DERIVED from the record
+        key and that identity, so a drift would be refused rather than written.
         """
+        row = pending.candidate
         payload = {
             "snapshot_key": str(snapshot["snapshot_key"]),
-            "record_key": str(record["record_key"]),
+            "record_key": str(row["record_key"]),
             "snapshot_id": str(snapshot["id"]),
-            "raw_record_id": str(record["id"]),
-            "candidate_key": str(candidate["candidate_key"]),
-            "manufacturer": candidate["manufacturer"],
-            "commercial_model": candidate["commercial_model"],
-            "model_year_start": candidate.get("model_year_start"),
-            "model_year_end": candidate.get("model_year_end"),
-            "official_model_code": candidate.get("official_model_code"),
-            "trim": candidate.get("trim"),
-            "identity_dimensions": dict(candidate.get("identity_dimensions") or {}),
+            "raw_record_id": str(row["raw_record_id"]),
+            "candidate_key": pending.candidate_key,
+            "manufacturer": row["manufacturer"],
+            "commercial_model": row["commercial_model"],
+            "model_year_start": row.get("model_year_start"),
+            "model_year_end": row.get("model_year_end"),
+            "official_model_code": row.get("official_model_code"),
+            "trim": row.get("trim"),
+            "identity_dimensions": dict(row.get("identity_dimensions") or {}),
             "status": PROMOTABLE_CANDIDATE_STATUS}
         return self._repository.record_catalog_candidate(self._lease.run_id, payload,
                                                          **self._lease_kwargs)
 
 
-__all__ = ["MAX_PROMOTIONS_PER_RUN", "PIPELINE_REASONS", "CandidateEvidence",
-           "CatalogEvidenceLedger", "CatalogPromotionPipeline", "PromotionAttempt"]
+__all__ = ["MAX_PROMOTIONS_PER_RUN", "PIPELINE_REASONS", "PROMOTABLE_CANDIDATE_STATUSES",
+           "PROMOTABLE_TOOL_OPERATION", "CandidateEvidence", "CatalogPromotionPipeline",
+           "PromotionAttempt", "group_pending_promotions"]

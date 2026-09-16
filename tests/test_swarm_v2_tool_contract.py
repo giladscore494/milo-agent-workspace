@@ -885,12 +885,13 @@ def test_production_registers_exactly_one_read_tool_and_routes_the_seam():
     source = _worker_wiring_source()
     assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in source
     assert "ToolContext(scopes=frozenset({GOVERNMENT_TOOL_SCOPE})" in source
+    assert "tool_result_sink=evidence_sink" in source
     assert "RegisteredOperationEvidenceSink(" in source
-    # Catalog PR3 wraps the production sink in the trusted promotion LEDGER, so
-    # the worker's tool-result sink is the ledger and the ledger delegates to
-    # the sink. Nothing is bypassed: the ledger writes nothing of its own.
-    assert "CatalogEvidenceLedger(evidence_sink," in source
-    assert "tool_result_sink=ledger," in source
+    # Catalog PR3's promotion path OBSERVES nothing here: it reads what the run
+    # still owes from the database, so a resumed worker promotes what a crashed
+    # one would have.
+    assert "CatalogPromotionPipeline(repo, board.lease)" in source
+    assert "catalog_promotion[\"pipeline\"].promote()" in source
     assert "write_approved" not in source
     assert "capabilities" not in source
     assert "tool:write:" not in source

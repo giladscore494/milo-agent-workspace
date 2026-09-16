@@ -65,7 +65,7 @@ versioned source + focused fragments + located claims   (R3, existing)
 verified verdicts                                       (R4, existing)
         │
         ▼
-CatalogEvidenceLedger                      (the two trusted seams, observed)
+catalog_run_pending_promotions             (what this run still owes, DERIVED)
         │   read by the worker once the engine has settled every verdict
         ▼
 CatalogPromotionPipeline                   (trusted server code; NOT a Tool)
@@ -326,23 +326,66 @@ previously six unconnected pieces:
       -> promotion PLAN     (backend/catalog/promotion.py)
       -> canonical row      (promote_catalog_variant_guarded)
 
-`CatalogEvidenceLedger` wraps the two trusted seams the worker already wires —
-the tool-result sink and the verdict sink — because a claim row does not say
-which candidate it is evidence FOR, and the server-produced tool result is the
-only place that is known. It writes nothing of its own.
-`CatalogPromotionPipeline.promote` then reads the durable candidate and record
-rows BACK from the repository (so the internal keys a promotion needs never have
-to appear in a model-visible tool output), links each verified claim, builds the
+**Where the fourth arrow gets its input.** From the DATABASE, every time.
+`catalog_run_pending_promotions` derives "which candidate is this claim
+evidence FOR" out of rows the server itself wrote:
+
+    claims of this run whose SOURCE records the registered tool operation
+      → the claim's own evidence locator names ONE captured upstream row
+        (`catalog_record_locator_id`, the convention the promotion gate holds
+         every promoted fact to)
+      → that row belongs to ONE snapshot, which must be active, complete and of
+        an `evidence` trust family
+      → the candidate that is a reading of that row, whose identity scope is
+        exactly the claim's (`catalog_candidate_identity_scope`)
+
+An earlier round of this PR kept that association in a LEDGER inside the worker
+process, built as the tool results arrived. It was correct while the process
+lived and **lost the moment it did not**: a worker that crashes after Swarm V2
+has durably persisted its evidence, its verdicts and its checkpoint is replaced
+by a worker that restores the completed tasks and does not re-execute the
+Government tool — there is nothing left to re-execute. The replacement's ledger
+was empty, it produced no promotion attempts at all, and a run whose evidence
+and verdicts were entirely durable left the canonical catalog empty with
+nothing anywhere saying why. That is the blocker this section now describes as
+closed, and `tests/test_catalog_pr3_swarm_promotion.py` drives the real restart
+path to prove it rather than asserting it.
+
+Ambiguity is refused rather than settled: a claim whose locator and identity
+scope resolve to more than one candidate reading is dropped, and an `ambiguous`
+or `rejected` candidate is excluded outright — a promotion may not overrule a
+decision the ingestion made.
+
+`CatalogPromotionPipeline.promote` then links each verified claim, builds the
 plan, and only then moves the candidate to `ready_for_review` — so the reviewed
 status is written when a complete evidenced promotion is already in hand, never
-hopefully on the way past.
+hopefully on the way past. It holds no state of its own between calls.
 
-A model can cause the FIRST arrow and nothing else. The pipeline runs once, at
-the end of a run that already happened, over that run's own resolutions; it
-promotes at most `MAX_PROMOTIONS_PER_RUN` (25) candidates, starts no capture,
-opens no socket, holds no credential and schedules nothing. Every refusal is a
-static reason code emitted as a run event and never fails the run; a LOST LEASE
-is not a refusal and propagates to the worker's own lease handling.
+A model can cause the FIRST arrow and nothing else. The pipeline runs at the end
+of a run that already happened, over that run's own Government evidence; it
+promotes at most `MAX_PROMOTIONS_PER_RUN` (25) candidates in `candidate_key`
+order — so a replacement worker sees exactly the set the crashed one would have
+— starts no capture, opens no socket, holds no credential and schedules nothing.
+Every refusal is a static reason code emitted as a run event and never fails the
+run; a LOST LEASE is not a refusal and propagates to the worker's own lease
+handling, because a stale worker must not keep writing.
+
+**Crash windows, one by one.** A replacement worker re-claims the run with its
+own lease and a fresh attempt, and reads what the run still owes. Every window
+the path has:
+
+| The worker died… | What the replacement does |
+| --- | --- |
+| after evidence persisted, before the verdicts | owes nothing — the derivation joins on a VERIFIED verdict — and promotes nothing. Its own engine settles the verdicts, and the promotion then runs |
+| after verified verdicts and the checkpoint, before promotion | **the window that used to lose everything.** It finds the work and promotes it, without re-executing the tool |
+| after the evidence links were created | relinks onto the same rows: the link key is derived from the candidate, the source, the claim and the verdict |
+| after `ready_for_review` was written | re-presents the same status through the same guarded RPC; the row does not move |
+| after some candidates were promoted and not others | the promoted ones come back `replayed`, the rest are promoted |
+| after promotion, before the run was finalized | every step replays; no second variant, no second provenance row, no second revision |
+
+None of it repeats a model call, a Government tool call, a live capture or a
+source request — the proof is the set of repository methods the resumed worker
+reaches, asserted rather than described.
 
 ## 9. Refresh and diff
 
@@ -430,7 +473,8 @@ creating a socket an error.
 **Memory-repository parity, stated exactly.** `MemoryRepository` mirrors the
 RULES the database applies — the lease, the derived keys, the support chain, the
 field/value gate, the scope gates, the run-consistency gate, the coverage check,
-the count row and the replay conflict — and does not reproduce PostgreSQL.
+the count row, the pending-promotion derivation and the replay conflict — and
+does not reproduce PostgreSQL.
 Parity is tested rather than claimed: the same table of wrong-vehicle,
 wrong-scope and wrong-locator cases is driven through the in-memory repository in
 `tests/test_catalog_pr3_swarm_promotion.py` and through real PostgreSQL in

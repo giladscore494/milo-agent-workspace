@@ -580,11 +580,19 @@ Done כאשר: פרויקט עם workflow_key=swarm_v2 מסיים Run במצב c
 >   taxonomy and the task graph stay the Commander's.
 >
 > **Connected after PR3.** The production worker runs the promotion path
-> (`backend/catalog/pipeline.py`) once, after the engine has settled every
-> verdict and while it still holds the run's lease: it links each verified
-> claim to its candidate, moves that candidate to `ready_for_review`, plans the
-> promotion and calls the guarded RPC. Promotion is still not a Tool, so a model
-> can cause the Government READ that starts it and nothing beyond.
+> (`backend/catalog/pipeline.py`) after the engine has settled every verdict and
+> while it still holds the run's lease: it asks the database what the run still
+> owes, links each verified claim to its candidate, moves that candidate to
+> `ready_for_review`, plans the promotion and calls the guarded RPC. Promotion
+> is still not a Tool, so a model can cause the Government READ that starts it
+> and nothing beyond.
+>
+> **It survives the worker.** The claim-to-candidate association is DERIVED from
+> durable rows (`catalog_run_pending_promotions`) rather than remembered in the
+> process, so a worker that crashes after the evidence and verdicts are durable
+> is replaced by one that promotes exactly what it would have — without
+> re-executing the Government tool, which the checkpoint has already marked
+> complete.
 >
 > **Still not activated after PR3.** No production entrypoint constructs a
 > transport, so no release can reach `data.gov.il`; the refresh operation exists

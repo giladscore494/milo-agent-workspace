@@ -24,11 +24,14 @@ from backend.catalog.contracts import (CANDIDATE_IDENTITY_DIMENSIONS, CANDIDATE_
                                        MAX_RAW_RECORD_LOCATOR_POSITION,
                                        MAX_RETRIEVAL_METADATA_CHARS, RAW_RECORD_LOCATOR_KEYS,
                                        SNAPSHOT_VALIDATION_STATES, TRUST_STATE_BY_FAMILY,
-                                       claim_entity_key, is_evidence_family,
-                                       record_locator_id, stated_canonical_fields,
+                                       SHARED_IDENTITY_DIMENSIONS,
+                                       candidate_identity_scope, claim_entity_key,
+                                       is_evidence_family, record_locator_id,
+                                       stated_canonical_fields,
                                        stated_identity_dimensions, stated_source_locator,
                                        trust_state_for)
 from backend.catalog.diff import DIFF_IDENTITY, MAX_DIFF_ITEMS
+from backend.catalog.pipeline import MAX_PROMOTIONS_PER_RUN, PROMOTABLE_TOOL_OPERATION
 from backend.catalog.keys import canonical_variant_key
 from backend.catalog.government.normalize import RAW_ONLY_CONTRACT
 from backend.catalog.government.projection import MAX_RESULT_ITEMS
@@ -583,6 +586,52 @@ def test_the_scope_and_run_gates_name_every_refusal_they_make():
                          "catalog_model_variants_natural_uidx", 1)[1].split(";", 1)[0]
     assert "identity_dimensions" not in natural
     assert "identity_dimensions" not in inspect.signature(canonical_variant_key).parameters
+
+
+def test_the_pending_promotion_read_derives_what_a_lost_process_used_to_remember():
+    """The crash-safety of the promotion path, as a property of the schema.
+
+    The claim-to-candidate association must be DERIVABLE, because the process
+    that observed it may be gone. Every join the derivation needs is named
+    here, so a change that quietly reintroduced an in-process dependency would
+    have to delete one of them.
+    """
+    text = promotion()
+    assert "create or replace function public.catalog_run_pending_promotions(" in text
+    body = text.split("create or replace function public.catalog_run_pending_promotions",
+                      1)[1].split("$$;", 1)[0]
+    # It is a READ: no lease, and no write of any kind.
+    assert "assert_worker_lease" not in body
+    for forbidden in ("insert into", "update ", "delete from"):
+        assert forbidden not in body, forbidden
+    # The four durable joins the association is made of.
+    assert "public.r3_canonical_locator(c.evidence_locator)" in body
+    assert "public.catalog_record_locator_id(sn.snapshot_key, r.upstream_record_id)" in body
+    assert "public.catalog_candidate_identity_scope(" in body
+    assert "v.verdict = 'verified'" in body
+    assert "s.tool_operation = p_tool_operation" in body
+    # An unusable snapshot, an ambiguous reading and an ambiguous RESOLUTION are
+    # all excluded rather than returned and then refused.
+    assert "sn.trust_state = 'evidence'" in body
+    assert "cand.status in ('candidate', 'ready_for_review')" in body
+    assert "having count(distinct m.candidate_id) = 1" in body
+    # Bounded by CANDIDATES, in a deterministic order, so a resumed worker sees
+    # the set the crashed one would have.
+    assert 'order by m.candidate_key collate "C"' in body
+    assert "limit v_limit" in body
+    assert MAX_PROMOTIONS_PER_RUN == 25
+    assert PROMOTABLE_TOOL_OPERATION == "catalog.government_vehicle.resolve_variant"
+    # The identity scope is ONE definition in both languages.
+    assert "create or replace function public.catalog_candidate_identity_scope(" in text
+    scope = text.split("create or replace function public.catalog_candidate_identity_scope",
+                       1)[1].split("$$;", 1)[0]
+    assert set(SHARED_IDENTITY_DIMENSIONS) == {"body_style", "drivetrain", "generation",
+                                               "transmission"}
+    for name in SHARED_IDENTITY_DIMENSIONS:
+        assert f"'{name}'" in scope, name
+    assert "'model_code'" in scope and "'trim'" in scope
+    assert candidate_identity_scope({"drivetrain": "AWD"}, None, "SE") == {
+        "drivetrain": "awd", "trim": "se"}
 
 
 def test_the_snapshot_diff_is_bounded_in_its_list_and_exact_in_its_counts():
