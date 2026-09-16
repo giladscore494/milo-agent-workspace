@@ -1,6 +1,6 @@
 # Frontend acceptance matrix — Stage F5
 
-**Tested tree:** `0fa1f66612dd5b030899f8ea8787b5893f0d07e2`
+**Tested tree:** `ad50a466aa2dd81d13f3435d2ac552719245fdec`
 **Base:** `0fdab212ce3c6277fa6d88502a4213401e1a3bcc` (merge of PR #89, Stage F4)
 
 Every local verification result recorded here was executed against that tree.
@@ -336,7 +336,7 @@ shape of problem. Twelve of the fifteen tests in
 
 ## Local verification results
 
-Executed on `0fa1f66612dd5b030899f8ea8787b5893f0d07e2`. Local unless marked.
+Executed on `ad50a466aa2dd81d13f3435d2ac552719245fdec`. Local unless marked.
 Backend commands need `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` set to the
 same offline placeholders CI uses, or `backend.config.Settings` refuses to load.
 
@@ -353,9 +353,9 @@ same offline placeholders CI uses, or `backend.config.Settings` refuses to load.
 | `npm ci` (frontend) | 0 | clean install |
 | `npm run build` | 0 | production build |
 | `npx tsc --noEmit` | 0 | passed |
-| `npm test -- --run` | 0 | **476 passed** (401 at base; +75) |
+| `npm test -- --run` | 0 | **501 passed** (401 at base; +100) |
 | `npm run test:static` | 0 | passed |
-| `npm run test:secrets` | 0 | source **and** bundle scanned |
+| `MILO_REQUIRE_BUNDLE_SCAN=1 npm run test:secrets` | 0 | source **and** bundle scanned |
 | `npx playwright test` | 0 | **47 passed** (43 at base; +4) |
 
 **Not run locally, and why.**
