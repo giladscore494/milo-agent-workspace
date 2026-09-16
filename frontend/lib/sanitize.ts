@@ -29,8 +29,30 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /-----BEGIN[^-]*-----[\s\S]*?(?:-----END[^-]*-----|$)/gi,
   // `Bearer <token>` as a whole, before the token shapes below.
   /\bBearer\s+[A-Za-z0-9._~+/-]{8,}={0,2}/gi,
-  // JWT / Supabase service-role shape: two or three base64url segments.
+  // LEGACY Supabase service-role shape, and JWTs generally: two or three
+  // base64url segments. This does NOT cover the modern key format below.
   /\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]+)?/g,
+  /**
+   * MODERN Supabase server-side secret key.
+   *
+   * `docs/deployment/cloud-run-production.md` mandates this format for the
+   * production server-side credential and forbids it ever reaching the
+   * browser; `backend/production_config.py` and `scripts/check_unsafe_defaults.py`
+   * both blocklist the `sb_secret` substring. A legacy JWT sentinel proves
+   * nothing about it — the two formats share no prefix — so it is matched
+   * explicitly.
+   *
+   * The credential's ENV VAR NAME is deliberately not written here:
+   * `scripts/release/check-vercel-config.sh` blocks any reference to it from
+   * `frontend/lib` or `frontend/app`, and that guard is worth more than the
+   * convenience of naming it in a comment.
+   *
+   * Deliberately anchored on `sb_secret_` and NOT on `sb_`: a publishable or
+   * anon key (`sb_publishable_…`) is public configuration the browser is
+   * MEANT to hold, and redacting it would hide legitimate values while
+   * protecting nothing.
+   */
+  /\bsb_secret_[A-Za-z0-9_-]{8,}/gi,
   // Provider API key shape.
   /\bsk-[A-Za-z0-9_-]{8,}/gi,
 ];

@@ -122,6 +122,19 @@ def build_swarm_v2_product_result(content: str) -> dict[str, Any]:
         return builder.build([], [], task_failures=[
             {"task_id": "government_record_2026", "code": "R5_GOV_RECORD_AMBIGUOUS"}])
 
+    if "incomplete task" in lowered:
+        # EVERY gathered claim is VERIFIED; the run is partial solely because a
+        # separate task failed. The product copy must stay true for this — it
+        # may not say a claim went unverified.
+        #
+        # The trigger deliberately avoids the substring "fail": the generic
+        # failure path in `_run` above matches `"fail" in content` and would
+        # mark the run failed before it ever reaches a product outcome.
+        return builder.build(
+            [evidence("claim-fuel", "fuel_type", "plug-in hybrid", "src-gov-1")],
+            [VerificationVerdict(claim_id="claim-fuel", verdict="verified", reason=supports)],
+            task_failures=[{"task_id": "catalog_lookup", "code": "TASK_FAILED"}])
+
     if "rejected claim" in lowered:
         # A REJECTED verdict makes the run partial WITHOUT writing a
         # needs_review row, so this is a backend-valid partial_result whose

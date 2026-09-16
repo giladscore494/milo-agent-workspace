@@ -139,7 +139,7 @@ describe('result-surface routing', () => {
   it('6b. a partial result with NO itemized rows also survives a refresh unchanged', async () => {
     await openTerminalRun(SWARM_PROJECT, fixtures.partial_result_no_review_items, 'partial_success');
     const before = (await screen.findByRole('region', { name: 'Final result' })).innerHTML;
-    expect(before).toContain('No itemized entries were recorded');
+    expect(before).toContain('contains no itemized entries');
 
     cleanup();
     render(<Page/>);

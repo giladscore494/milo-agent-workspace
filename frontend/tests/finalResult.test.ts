@@ -29,6 +29,8 @@ import {
   BEARER_SENTINEL,
   JWT_SENTINEL,
   SECRET_FRAGMENTS,
+  SUPABASE_PUBLISHABLE_PUBLIC,
+  SUPABASE_SECRET_SENTINEL,
 } from './secretSentinels';
 
 /** Narrow to a successful parse, failing loudly (not silently) otherwise. */
@@ -806,7 +808,67 @@ describe('12. a valid partial result with NO itemized review rows', () => {
     const summary = describeOutcome('partial_result').summary;
     expect(summary).not.toMatch(/items below|listed below|below are/i);
     expect(summary).toMatch(/not a completed result/i);
-    expect(summary).toMatch(/not every claim/i);
+  });
+
+  it('12d. the summary is SOURCE-AGNOSTIC and claims nothing about a claim', () => {
+    // `decide_outcome` reaches `partial_result` from ANY blocking condition,
+    // so a run whose every gathered claim verified can still be partial. The
+    // summary must therefore assert nothing about claims at all.
+    const summary = describeOutcome('partial_result').summary;
+    expect(summary).not.toMatch(/not every claim|unverified|rejected|claim/i);
+    expect(summary).toMatch(/did not complete all the work/i);
+  });
+});
+
+describe('15. every backend route to partial_result keeps the summary true', () => {
+  // Each payload is real builder output whose EVERY gathered claim verified,
+  // or whose blocking signal writes no review row. A summary naming a cause
+  // would be false for at least one of them.
+  const ROUTES = [
+    ['task failure only', fixtures.partial_task_failure_only, 1],
+    ['coverage gap only', fixtures.partial_coverage_gap_only, 1],
+    ['conflict, no rows', fixtures.partial_conflict_no_rows, 0],
+    ['rejected verdict, no rows', fixtures.partial_result_no_review_items, 0],
+  ] as const;
+
+  it('15a. every one is a backend-valid partial_result the parser accepts', () => {
+    for (const [name, payload, rows] of ROUTES) {
+      expect(payload.status, name).toBe('partial_success');
+      expect(payload.result_kind, name).toBe('partial_result');
+      expect(payload.needs_review, name).toHaveLength(rows);
+      const result = ok(payload, 'partial_success');
+      expect(result.kind, name).toBe('partial_result');
+      expect(result.fields.length, name).toBeGreaterThan(0);
+    }
+  });
+
+  it('15b. a task failure and a coverage gap keep their own groups', () => {
+    const failure = ok(fixtures.partial_task_failure_only, 'partial_success');
+    expect(failure.taskFailureCount).toBe(1);
+    expect(failure.coverageGapCount).toBe(0);
+    expect(failure.review[0].kind).toBe('task_failure');
+
+    const gap = ok(fixtures.partial_coverage_gap_only, 'partial_success');
+    expect(gap.coverageGapCount).toBe(1);
+    expect(gap.taskFailureCount).toBe(0);
+    expect(gap.review[0].kind).toBe('coverage_gap');
+  });
+
+  it('15c. a conflict SIGNAL with no review row is still partial and still itemless', () => {
+    // `conflict_claim_ids` blocks the outcome without producing an entry, so
+    // this is partial with nothing to list — and nothing to name.
+    const result = ok(fixtures.partial_conflict_no_rows, 'partial_success');
+    expect(result.review).toHaveLength(0);
+    expect(result.conflictCount).toBe(0);
+    expect(result.fields[0].values[0].value).toEqual({ display: 'text', text: 'plug-in hybrid' });
+  });
+
+  it('15d. none of them is ever describable as a usable result', () => {
+    for (const [name, payload] of ROUTES) {
+      expect(ok(payload, 'partial_success').kind, name).not.toBe('usable_result');
+      // And the completed-run status would contradict the payload outright.
+      expect(invalidCode(payload, 'completed'), name).toBe('RUN_STATUS_CONTRADICTS_OUTCOME');
+    }
   });
 });
 
@@ -871,6 +933,116 @@ describe('14. payload-controlled keys never reach a prototype', () => {
     expect(item?.code).toBe('constructor');
     for (const entry of result.review) {
       expect(typeof entry.code === 'string' || entry.code === undefined).toBe(true);
+    }
+  });
+});
+
+describe('16. the modern Supabase server-side key reaches no display position', () => {
+  // ALL_SECRET_SENTINELS now carries it, so suite 10 already sweeps it through
+  // every position. These assert the specific facts that sweep depends on.
+
+  it('16a. it is redacted out of a verified value, replaced by the marker', () => {
+    const payload = usablePayload();
+    payload.fields.fuel_type[0].value = SUPABASE_SECRET_SENTINEL;
+    const result = ok(payload, 'completed');
+    expect(result.fields.find((f) => f.key === 'fuel_type')?.values[0].value)
+      .toEqual({ display: 'text', text: '[REDACTED]' });
+    assertNoSecret(JSON.stringify(result), 'supabase secret value');
+  });
+
+  it('16b. it is redacted out of a provenance identifier and a scope value', () => {
+    for (const place of ['source_id', 'claim_id'] as const) {
+      const provenance: Record<string, unknown> = validProvenance();
+      provenance[place] = SUPABASE_SECRET_SENTINEL;
+      assertNoSecret(JSON.stringify(ok(payloadWithEntry({ value: 'petrol', provenance }), 'completed')), place);
+    }
+    const scoped = validProvenance();
+    (scoped.scope as Record<string, unknown>).geography = SUPABASE_SECRET_SENTINEL;
+    assertNoSecret(JSON.stringify(ok(payloadWithEntry({ value: 'petrol', provenance: scoped }), 'completed')), 'scope');
+  });
+
+  it('16c. PUBLIC Supabase configuration is NOT redacted', () => {
+    // Redacting a publishable key would hide a legitimate public value.
+    const payload = usablePayload();
+    payload.fields.fuel_type[0].value = SUPABASE_PUBLISHABLE_PUBLIC;
+    expect(ok(payload, 'completed').fields.find((f) => f.key === 'fuel_type')?.values[0].value)
+      .toEqual({ display: 'text', text: SUPABASE_PUBLISHABLE_PUBLIC });
+  });
+});
+
+describe('17. optional scope values mirror the backend contract exactly', () => {
+  // EvidenceReference: `geography: str | None = Field(default=None, max_length=200)`.
+  // No min_length, so "" is backend-valid and the builder copies it through.
+
+  it('17a. the backend-generated empty-scope fixture really carries ""', () => {
+    const scope = (fixtures.empty_optional_scope as any).fields.fuel_type[0].provenance.scope;
+    expect(scope.geography).toBe('');
+    expect(scope.market).toBe('');
+  });
+
+  it('17b. the parser ACCEPTS it — the browser is not stricter than the contract', () => {
+    const result = ok(fixtures.empty_optional_scope, 'completed');
+    expect(result.kind).toBe('usable_result');
+    expect(result.fields).toHaveLength(1);
+  });
+
+  it('17c. an empty optional value is treated as unstated, exactly like null', () => {
+    const fromEmpty = ok(fixtures.empty_optional_scope, 'completed')
+      .fields[0].values[0].provenance;
+    expect(fromEmpty.geography).toBeUndefined();
+    expect(fromEmpty.market).toBeUndefined();
+
+    const nulled = validProvenance();
+    (nulled.scope as Record<string, unknown>).geography = null;
+    (nulled.scope as Record<string, unknown>).market = null;
+    const fromNull = ok(payloadWithEntry({ value: 'petrol', provenance: nulled }), 'completed')
+      .fields[0].values[0].provenance;
+    expect(fromNull.geography).toBeUndefined();
+    expect(fromNull.market).toBeUndefined();
+    // Required identifiers are untouched by this relaxation.
+    expect(fromEmpty.claimId).toBe('claim-fuel');
+    expect(fromEmpty.entity).toBe('toyota_rav4_phev');
+  });
+
+  it('17d. the KEY is still required, and the type and bound still hold', () => {
+    for (const key of ['geography', 'market'] as const) {
+      const missing = validProvenance();
+      delete (missing.scope as Record<string, unknown>)[key];
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: missing })), `missing ${key}`)
+        .toBe('PROVENANCE_INVALID');
+
+      const mistyped = validProvenance();
+      (mistyped.scope as Record<string, unknown>)[key] = 42;
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: mistyped })), `mistyped ${key}`)
+        .toBe('PROVENANCE_INVALID');
+
+      const tooLong = validProvenance();
+      (tooLong.scope as Record<string, unknown>)[key] = 'x'.repeat(201);
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: tooLong })), `long ${key}`)
+        .toBe('PROVENANCE_INVALID');
+
+      // Exactly at the 200-character bound is accepted.
+      const atBound = validProvenance();
+      (atBound.scope as Record<string, unknown>)[key] = 'x'.repeat(200);
+      expect(ok(payloadWithEntry({ value: 'petrol', provenance: atBound }), 'completed')
+        .fields[0].values[0].provenance[key]).toHaveLength(200);
+    }
+  });
+
+  it('17e. REQUIRED identifiers still reject an empty string', () => {
+    // entity and field carry min_length=1 in the backend contract, and the
+    // four ids do too — relaxing the optional pair must not touch them.
+    for (const key of ['claim_id', 'source_id', 'run_id', 'task_id'] as const) {
+      const provenance: Record<string, unknown> = validProvenance();
+      provenance[key] = '';
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance })), key)
+        .toBe('PROVENANCE_INVALID');
+    }
+    for (const key of ['entity', 'field'] as const) {
+      const provenance = validProvenance();
+      (provenance.scope as Record<string, unknown>)[key] = '';
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance })), key)
+        .toBe('PROVENANCE_INVALID');
     }
   });
 });

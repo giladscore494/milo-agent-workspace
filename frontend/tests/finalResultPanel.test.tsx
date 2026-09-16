@@ -20,6 +20,8 @@ import {
   BEARER_SENTINEL,
   JWT_SENTINEL,
   SECRET_FRAGMENTS,
+  SUPABASE_PUBLISHABLE_PUBLIC,
+  SUPABASE_SECRET_SENTINEL,
 } from './secretSentinels';
 
 type PanelProps = React.ComponentProps<typeof FinalResultPanel>;
@@ -372,9 +374,13 @@ describe('8. a valid partial result with no itemized review rows', () => {
     expect(screen.queryByText('Usable result', { exact: true })).not.toBeInTheDocument();
   });
 
-  it('8b. it says some claims were not verified', () => {
+  it('8b. it says the run did not complete its work, without naming a cause', () => {
     renderPanel({ output: PAYLOAD, runStatus: 'partial_success' });
-    expect(screen.getByText(/not every claim it gathered was verified/)).toBeInTheDocument();
+    expect(screen.getByText(/did not complete all the work it was required to/)).toBeInTheDocument();
+    // It must NOT assert that a claim went unverified: a partial result can
+    // arise with every gathered claim verified.
+    const text = panel().textContent ?? '';
+    expect(text).not.toMatch(/not every claim|the verifier rejected|a claim the verifier/i);
   });
 
   it('8c. it promises NO itemized list when none was recorded', () => {
@@ -384,7 +390,8 @@ describe('8. a valid partial result with no itemized review rows', () => {
     // The heading has no count, because there is no list to count.
     expect(screen.getByRole('heading', { name: 'Outstanding items' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: /Outstanding items \(/ })).not.toBeInTheDocument();
-    expect(screen.getByText(/No itemized entries were recorded/)).toBeInTheDocument();
+    expect(screen.getByText(/contains no itemized entries/)).toBeInTheDocument();
+    expect(screen.getByText(/does not infer the missing reason, task or claim/)).toBeInTheDocument();
   });
 
   it('8d. it invents no reason and no field', () => {
@@ -577,5 +584,154 @@ describe('11. a payload-controlled review code cannot crash the surface', () => 
     expect(screen.getByText('Partial result')).toBeInTheDocument();
     expect(screen.getByText('constructor')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Task failures (1)' })).toBeInTheDocument();
+  });
+});
+
+describe('12. the modern Supabase server-side key never reaches the DOM', () => {
+  it('12a. it is shown as the marker, and the field is still reported', () => {
+    const payload = JSON.parse(JSON.stringify(fixtures.usable_result));
+    payload.fields.fuel_type[0].value = SUPABASE_SECRET_SENTINEL;
+    renderPanel({ output: payload, runStatus: 'completed' });
+    expect(screen.getByText('Fuel type')).toBeInTheDocument();
+    expect(screen.getByText('[REDACTED]')).toBeInTheDocument();
+    expect(panel().innerHTML).not.toContain(SUPABASE_SECRET_SENTINEL);
+    expect(panel().innerHTML).not.toContain('sb_secret_');
+  });
+
+  it('12b. it is absent from the FULLY EXPANDED DOM in every position', () => {
+    const positions: [string, (secret: string) => Record<string, unknown>][] = [
+      ['scalar value', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.usable_result)); p2.fields.fuel_type[0].value = s2; return p2; }],
+      ['nested string', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.usable_result)); p2.fields.fuel_type[0].value = { spec: { notes: [s2] } }; return p2; }],
+      ['structured key', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.usable_result)); p2.fields.fuel_type[0].value = { [s2]: 'v' }; return p2; }],
+      ['field key', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.usable_result)); p2.fields = { [s2]: p2.fields.fuel_type }; return p2; }],
+      ['provenance source', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.usable_result)); p2.fields.fuel_type[0].provenance.source_id = s2; return p2; }],
+      ['provenance claim', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.usable_result)); p2.fields.fuel_type[0].provenance.claim_id = s2; return p2; }],
+      ['provenance task', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.usable_result)); p2.fields.fuel_type[0].provenance.task_id = s2.slice(0, 80); return p2; }],
+      ['scope entity', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.usable_result)); p2.fields.fuel_type[0].provenance.scope.entity = s2; return p2; }],
+      ['scope geography', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.usable_result)); p2.fields.fuel_type[0].provenance.scope.geography = s2; return p2; }],
+    ];
+    for (const [name, build] of positions) {
+      const { unmount } = renderPanel({ output: build(SUPABASE_SECRET_SENTINEL), runStatus: 'completed' });
+      for (const node of Array.from(document.querySelectorAll('details'))) {
+        (node as HTMLDetailsElement).open = true;
+      }
+      const html = panel().innerHTML;
+      expect(html, name).not.toContain(SUPABASE_SECRET_SENTINEL);
+      expect(html, name).not.toContain('sb_secret_');
+      unmount();
+    }
+  });
+
+  it('12c. in a review reason, a review code and a task id', () => {
+    const builders: [string, (s2: string) => Record<string, unknown>][] = [
+      ['reason', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.partial_result)); p2.needs_review[0].reason = s2; return p2; }],
+      ['code', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.partial_result)); p2.needs_review[1].code = s2; return p2; }],
+      ['task id', (s2) => { const p2 = JSON.parse(JSON.stringify(fixtures.partial_result)); p2.needs_review[1].task_id = s2.slice(0, 80); return p2; }],
+    ];
+    for (const [name, build] of builders) {
+      const { unmount } = renderPanel({ output: build(SUPABASE_SECRET_SENTINEL), runStatus: 'partial_success' });
+      for (const node of Array.from(document.querySelectorAll('details'))) {
+        (node as HTMLDetailsElement).open = true;
+      }
+      expect(panel().innerHTML, name).not.toContain(SUPABASE_SECRET_SENTINEL);
+      expect(panel().innerHTML, name).not.toContain('sb_secret_');
+      unmount();
+    }
+  });
+
+  it('12d. PUBLIC Supabase configuration still renders — it is not a credential', () => {
+    const payload = JSON.parse(JSON.stringify(fixtures.usable_result));
+    payload.fields.fuel_type[0].value = SUPABASE_PUBLISHABLE_PUBLIC;
+    renderPanel({ output: payload, runStatus: 'completed' });
+    expect(screen.getByText(SUPABASE_PUBLISHABLE_PUBLIC)).toBeInTheDocument();
+  });
+});
+
+describe('13. an empty optional scope value renders as unstated, not as a refusal', () => {
+  it('13a. the backend-built empty-scope payload renders as a usable result', () => {
+    renderPanel({ output: fixtures.empty_optional_scope as Record<string, unknown>, runStatus: 'completed' });
+    expect(screen.getByText('Usable result')).toBeInTheDocument();
+    expect(screen.getByText('Fuel type')).toBeInTheDocument();
+    expect(screen.queryByText('Result unavailable')).not.toBeInTheDocument();
+  });
+
+  it('13b. the empty rows are omitted from the provenance disclosure', () => {
+    renderPanel({ output: fixtures.empty_optional_scope as Record<string, unknown>, runStatus: 'completed' });
+    const details = screen.getAllByText('Provenance')[0].closest('details') as HTMLDetailsElement;
+    details.open = true;
+    const rows = within(details);
+    // The references that ARE stated still appear…
+    expect(rows.getByText('Source')).toBeInTheDocument();
+    expect(rows.getByText('Entity')).toBeInTheDocument();
+    // …and the unstated optional ones are simply absent, not blank rows.
+    expect(rows.queryByText('Geography')).not.toBeInTheDocument();
+    expect(rows.queryByText('Market')).not.toBeInTheDocument();
+  });
+});
+
+describe('14. every backend route to partial_result renders honestly', () => {
+  const ROUTES: [string, Record<string, unknown>, number][] = [
+    ['task failure only', fixtures.partial_task_failure_only as Record<string, unknown>, 1],
+    ['coverage gap only', fixtures.partial_coverage_gap_only as Record<string, unknown>, 1],
+    ['conflict, no rows', fixtures.partial_conflict_no_rows as Record<string, unknown>, 0],
+    ['rejected verdict, no rows', fixtures.partial_result_no_review_items as Record<string, unknown>, 0],
+  ];
+
+  it('14a. each shows Partial result and never Usable result', () => {
+    for (const [name, payload] of ROUTES) {
+      const { unmount } = renderPanel({ output: payload, runStatus: 'partial_success' });
+      expect(screen.getByText('Partial result'), name).toBeInTheDocument();
+      expect(screen.queryByText('Usable result', { exact: true }), name).not.toBeInTheDocument();
+      expect(screen.getByText(/not a completed result/), name).toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('14b. the summary stays TRUE for each — it names no cause', () => {
+    for (const [name, payload] of ROUTES) {
+      const { unmount } = renderPanel({ output: payload, runStatus: 'partial_success' });
+      const text = panel().textContent ?? '';
+      expect(text, name).toMatch(/did not complete all the work it was required to/);
+      // These payloads include ones where EVERY gathered claim verified.
+      expect(text, name).not.toMatch(/not every claim|the verifier rejected|a claim the verifier/i);
+      unmount();
+    }
+  });
+
+  it('14c. a recorded task failure renders in the Task failures group', () => {
+    renderPanel({ output: fixtures.partial_task_failure_only as Record<string, unknown>, runStatus: 'partial_success' });
+    expect(screen.getByRole('heading', { name: 'Outstanding items (1)' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Task failures (1)' })).toBeInTheDocument();
+    expect(screen.getByText('The task did not complete')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Coverage gaps/ })).not.toBeInTheDocument();
+  });
+
+  it('14d. a recorded coverage gap renders in the Coverage gaps group', () => {
+    renderPanel({ output: fixtures.partial_coverage_gap_only as Record<string, unknown>, runStatus: 'partial_success' });
+    expect(screen.getByRole('heading', { name: 'Coverage gaps (1)' })).toBeInTheDocument();
+    expect(screen.getByText('Evidence requirements were not met')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Task failures/ })).not.toBeInTheDocument();
+  });
+
+  it('14e. the itemless routes claim nothing about a rejection or a reason', () => {
+    for (const [name, payload, rows] of ROUTES.filter(([, , n]) => n === 0)) {
+      const { unmount } = renderPanel({ output: payload, runStatus: 'partial_success' });
+      expect(rows).toBe(0);
+      expect(screen.getByRole('heading', { name: 'Outstanding items' }), name).toBeInTheDocument();
+      expect(screen.getByText(/contains no itemized entries/), name).toBeInTheDocument();
+      expect(screen.getByText(/does not infer the missing reason, task or claim/), name).toBeInTheDocument();
+      const text = panel().textContent ?? '';
+      expect(text, name).not.toMatch(/rejected|unverified|conflict/i);
+      unmount();
+    }
+  });
+
+  it('14f. the verified half is still reported in every route', () => {
+    for (const [name, payload] of ROUTES) {
+      const { unmount } = renderPanel({ output: payload, runStatus: 'partial_success' });
+      expect(screen.getByRole('heading', { name: 'Verified fields' }), name).toBeInTheDocument();
+      expect(screen.getByText('plug-in hybrid'), name).toBeInTheDocument();
+      unmount();
+    }
   });
 });

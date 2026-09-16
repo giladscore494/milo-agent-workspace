@@ -301,10 +301,28 @@ function requiredId(value: unknown, maxChars: number): Refusable<string> {
   return safeDurableText(value, maxChars);
 }
 
-/** A nullable bounded scope string: `string | null`, per `EvidenceReference`. */
+/**
+ * An OPTIONAL bounded scope string, mirroring `EvidenceReference` exactly:
+ *
+ *     geography: str | None = Field(default=None, max_length=200)
+ *     market:    str | None = Field(default=None, max_length=200)
+ *
+ * There is no `min_length`, so `""` is backend-valid — `EvidenceReference`
+ * accepts it and `FinalBuilder` copies it into the trace verbatim. Refusing it
+ * here would make the browser STRICTER than the contract it mirrors and turn a
+ * payload the backend legitimately built into `PROVENANCE_INVALID`.
+ *
+ * `null` and `""` are both "this scope dimension was not stated", so both come
+ * back as `undefined` and the row is simply not displayed. The KEY is still
+ * required by the closed scope check above; only its value is optional.
+ *
+ * Still refused: a non-string (a number, an array, an object) and a string past
+ * the 200-character bound.
+ */
 function optionalScopeText(value: unknown, maxChars: number): Refusable<string | undefined> {
   if (value === null) return undefined;
-  if (typeof value !== 'string' || value.length === 0 || value.length > maxChars) return null;
+  if (typeof value !== 'string' || value.length > maxChars) return null;
+  if (value.length === 0) return undefined;
   return safeDurableText(value, maxChars);
 }
 
@@ -745,12 +763,16 @@ const OUTCOMES: Readonly<Record<FinalResultKind, OutcomeDescriptor>> = {
     tone: 'caution',
     label: 'Partial result',
     symbol: '!',
-    // Deliberately promises no LIST. A rejected verdict makes a run partial
-    // without producing a `needs_review` row of its own, so a valid
-    // `partial_result` can carry no itemized entries at all — and a summary
-    // that said "the items below" would then point at nothing.
+    // SOURCE-AGNOSTIC, because `decide_outcome` reaches `partial_result` from
+    // ANY blocking condition: an unverified or rejected claim, a task failure,
+    // a coverage gap, or a conflict. A run whose every gathered claim verified
+    // can still be partial because a separate task failed — so the summary may
+    // not say a claim went unverified, and may not promise a list either,
+    // since a rejected verdict or a bare conflict produces no `needs_review`
+    // row of its own. What is always true is exactly this: there are verified
+    // fields, and the run did not complete all the work it was required to.
     summary:
-      'The run verified the fields below but did not finish: not every claim it gathered was verified. This is not a completed result.',
+      'The run verified the fields below but did not complete all the work it was required to. This is not a completed result.',
   },
   no_usable_result: {
     tone: 'negative',

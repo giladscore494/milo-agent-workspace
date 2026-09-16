@@ -67,9 +67,11 @@ test('F4-2. provenance is safe public references, revealed on demand', async ({ 
   await expect(provenance.getByText('src-gov-1')).toBeVisible();
   await expect(provenance.getByText('government_record_2026')).toBeVisible();
 
-  // Nothing a product surface must never carry.
+  // Nothing a product surface must never carry — including the MODERN
+  // Supabase server-side key format production actually uses.
   const body = await page.content();
   expect(body).not.toMatch(/Traceback|chain of thought|sk-[A-Za-z0-9_-]{8,}|Bearer |service_role/i);
+  expect(body).not.toMatch(/sb_secret_[A-Za-z0-9_-]/i);
 });
 
 test('F4-3. a partial result shows the answer AND everything still outstanding', async ({ page }) => {
@@ -116,17 +118,41 @@ test('F4-4b. a partial result with no itemized rows stays honest about having no
 
   await expect(result.getByText('Partial result')).toBeVisible(TERMINAL);
   await expect(result.getByText(/not a completed result/)).toBeVisible();
-  await expect(result.getByText(/not every claim it gathered was verified/)).toBeVisible();
+  await expect(result.getByText(/did not complete all the work it was required to/)).toBeVisible();
   // The verified half is still reported…
   await expect(result.getByText('Fuel type')).toBeVisible();
   // …and the surface says plainly that no itemized entries exist, rather than
   // pointing at a list that was never recorded.
-  await expect(result.getByText(/No itemized entries were recorded/)).toBeVisible();
+  await expect(result.getByText(/contains no itemized entries/)).toBeVisible();
   await expect(result.getByRole('heading', { name: 'Outstanding items' })).toBeVisible();
   await expect(result.getByRole('heading', { name: /Conflicts/ })).toHaveCount(0);
   await expect(result.getByRole('heading', { name: /Task failures/ })).toHaveCount(0);
   // Nothing is invented about the rejected claim.
   await expect(result.getByText('horsepower_hp')).toHaveCount(0);
+  await expect(result.getByText(/does not infer the missing reason, task or claim/)).toBeVisible();
+  const body = await page.content();
+  expect(body).not.toMatch(/the verifier rejected|not every claim/i);
+});
+
+test('F4-4c. a partial caused only by a task failure keeps the copy true', async ({ page }) => {
+  // EVERY gathered claim is VERIFIED here; the run is partial solely because a
+  // separate task failed. The surface must not say a claim went unverified.
+  await runTask(page, 'Gamma Swarm', 'f4-taskfail', 'an incomplete task please');
+  const result = page.getByRole('region', { name: 'Final result' });
+
+  await expect(result.getByText('Partial result')).toBeVisible(TERMINAL);
+  await expect(result.getByText(/did not complete all the work it was required to/)).toBeVisible();
+  await expect(result.getByText(/not a completed result/)).toBeVisible();
+  await expect(result.getByText('Usable result', { exact: true })).toHaveCount(0);
+
+  // The verified half is reported, and the failure lands in its own group.
+  await expect(result.getByText('Fuel type')).toBeVisible();
+  await expect(result.getByRole('heading', { name: 'Outstanding items (1)' })).toBeVisible();
+  await expect(result.getByRole('heading', { name: 'Task failures (1)' })).toBeVisible();
+
+  // No unsupported claim about a claim being unverified or rejected.
+  const body = await page.content();
+  expect(body).not.toMatch(/not every claim|the verifier rejected/i);
 });
 
 test('F4-5. refresh reconstructs the identical result from the durable run output', async ({ page }) => {

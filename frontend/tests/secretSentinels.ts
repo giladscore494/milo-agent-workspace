@@ -17,8 +17,28 @@ export const API_KEY_SENTINEL = ['sk', 'live', 'A'.repeat(8) + 'B'.repeat(8) + '
 /** Bearer-token shape, as an Authorization header value would carry it. */
 export const BEARER_SENTINEL = `Bearer ${API_KEY_SENTINEL}`;
 
-/** JWT shape, as a Supabase service-role credential would look. */
+/** JWT shape, as a LEGACY Supabase service-role credential would look. */
 export const JWT_SENTINEL = ['eyJhbGciOiJIUzI1NiJ9', 'eyJyb2xlIjoic2VydmljZSJ9', 'not-a-real-signature'].join('.');
+
+/**
+ * MODERN Supabase server-side secret key shape (`sb_secret_…`).
+ *
+ * This is the format `docs/deployment/cloud-run-production.md` mandates for
+ * production and forbids ever reaching the browser. It shares no prefix with
+ * the legacy JWT above, so `JWT_SENTINEL` proves nothing about it — the two
+ * must be swept independently.
+ */
+export const SUPABASE_SECRET_SENTINEL =
+  ['sb', 'secret', 'A'.repeat(10) + 'B'.repeat(10) + '1234'].join('_');
+
+/**
+ * PUBLIC Supabase configuration the browser is MEANT to hold.
+ *
+ * Asserted UNTOUCHED: redacting it would hide a legitimate public value while
+ * protecting nothing, so the redactor targets `sb_secret_` and not `sb_`.
+ */
+export const SUPABASE_PUBLISHABLE_PUBLIC =
+  ['sb', 'publishable', 'C'.repeat(10) + 'D'.repeat(10) + '5678'].join('_');
 
 /** The prefix a leak assertion greps for; kept below the scanner's threshold. */
 export const API_KEY_PREFIX = 'sk-live-';
@@ -28,7 +48,14 @@ export const API_KEY_PREFIX = 'sk-live-';
  * string position the product surface can render and then assert that none of
  * them survives into the display model or the DOM.
  */
-export const ALL_SECRET_SENTINELS = [API_KEY_SENTINEL, BEARER_SENTINEL, JWT_SENTINEL] as const;
+export const ALL_SECRET_SENTINELS = [
+  API_KEY_SENTINEL,
+  BEARER_SENTINEL,
+  JWT_SENTINEL,
+  SUPABASE_SECRET_SENTINEL,
+] as const;
 
 /** Fragments that must not survive even partially redacted. */
-export const SECRET_FRAGMENTS = [API_KEY_PREFIX, 'eyJhbGciOiJIUzI1NiJ9', 'Bearer '] as const;
+export const SECRET_FRAGMENTS = [
+  API_KEY_PREFIX, 'eyJhbGciOiJIUzI1NiJ9', 'Bearer ', 'sb_secret_',
+] as const;

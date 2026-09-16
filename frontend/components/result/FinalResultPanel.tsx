@@ -194,17 +194,17 @@ function ResultBody({ result }: { result: FinalResult }) {
         </p>
       )}
 
-      {/* A backend-VALID partial result can carry no itemized review rows: a
-          rejected verdict makes the run partial without writing one. Saying so
-          is the honest reading — it neither invents a reason or a field, nor
-          leaves the reader looking for a list that was never recorded. */}
+      {/* A backend-VALID partial result can carry no itemized review rows at
+          all: a rejected verdict, an unverified claim and a bare conflict each
+          make a run partial without writing one. The payload does not say
+          WHICH of those happened, so neither does this — naming a cause here
+          would be the inference the next sentence promises not to make. */}
       {result.kind === 'partial_result' && outstanding === 0 && (
         <section className="final-result-section" aria-labelledby="final-result-noitems-title">
           <h4 className="section-title" id="final-result-noitems-title">Outstanding items</h4>
           <p className="note">
-            No itemized entries were recorded. A claim the verifier rejected leaves the result
-            unfinished without producing a review row of its own, so there is nothing further to
-            list — and nothing here is being inferred about which claim or why.
+            The recorded outcome says the run left work unfinished, but it contains no itemized
+            entries. This view does not infer the missing reason, task or claim.
           </p>
         </section>
       )}
