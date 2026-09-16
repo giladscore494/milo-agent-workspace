@@ -2,7 +2,8 @@
 
 One mapper per exact `(tool, operation)` pair. Each is shipped, reviewable
 server code held to the same rules a production adapter's mapper must meet,
-and NONE of them is added to `PRODUCTION_EVIDENCE_MAPPERS`, which stays empty.
+and NONE of them is in `PRODUCTION_EVIDENCE_MAPPER_OPERATIONS`, which names
+exactly one Government operation and nothing else.
 
 What every mapper here does, and what a real one must also do:
 

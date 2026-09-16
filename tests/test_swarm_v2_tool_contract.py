@@ -857,15 +857,46 @@ def test_a_tool_result_does_not_become_evidence_on_its_own():
     assert not hasattr(records[0], "confidence")
 
 
-def test_production_leaves_the_seam_unwired_and_the_registry_empty():
-    import backend.worker.main as worker_main
+def _worker_wiring_source() -> str:
+    """`backend/worker/main.py` with its COMMENTS removed.
+
+    The wiring assertion below asks whether a grant EXISTS, and a comment
+    explaining that a grant is deliberately absent contains the same words.
+    Stripping comments is what keeps "no write approval anywhere" a statement
+    about the code rather than about the prose beside it.
+    """
     from pathlib import Path
 
-    source = Path(worker_main.__file__).read_text(encoding="utf-8")
-    assert "tools = ToolRegistry()" in source
-    # No production tool registration and no evidence seam wiring yet (Y4/G3).
-    assert "tool_result_sink=" not in source
-    for forbidden in ("YedaTool", "GovernmentTool", "WebSearchTool", "CkanTool"):
+    source = Path("backend/worker/main.py").read_text(encoding="utf-8")
+    return "\n".join(line.split("#", 1)[0] for line in source.splitlines())
+
+
+def test_production_registers_exactly_one_read_tool_and_routes_the_seam():
+    """R2 left this seam unwired; Catalog PR3 wires it, for one read tool.
+
+    The shape is what this pins, because the shape is what keeps the seam
+    safe: ONE registered tool, in READ mode, with one static scope granted
+    from trusted server state; the sink routed so an unmapped operation
+    records nothing; and no write approval and no `tool:write:` capability
+    anywhere in the wiring.
+    """
+    from backend.tools.government_vehicle import GovernmentVehicleTool
+
+    source = _worker_wiring_source()
+    assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in source
+    assert "ToolContext(scopes=frozenset({GOVERNMENT_TOOL_SCOPE})" in source
+    assert "tool_result_sink=evidence_sink" in source
+    assert "RegisteredOperationEvidenceSink(" in source
+    # Catalog PR3's promotion path OBSERVES nothing here: it reads what the run
+    # still owes from the database, so a resumed worker promotes what a crashed
+    # one would have.
+    assert "CatalogPromotionPipeline(repo, board.lease)" in source
+    assert "catalog_promotion[\"pipeline\"].promote()" in source
+    assert "write_approved" not in source
+    assert "capabilities" not in source
+    assert "tool:write:" not in source
+    assert GovernmentVehicleTool.mode is ToolMode.READ
+    for forbidden in ("YedaTool", "WebSearchTool", "CkanTool"):
         assert forbidden not in source
 
 

@@ -138,6 +138,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # checkpoint access and before invoking any engine factory.
         engine_builder = None
         swarm_engine_builder = None
+        # Catalog PR3's trusted promotion path, populated by the Swarm V2
+        # wiring below and read once the engine has settled its verdicts. A
+        # plain dict rather than a closure variable because the wiring runs
+        # inside a nested factory; it holds server objects only.
+        catalog_promotion: dict[str, Any] = {}
 
         def build_default_engine():
             if engine_builder is None:
@@ -347,9 +352,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     CommanderModelResolver, EvidenceReference, GenericWorker, ModelGateway,
                     PlanLimits, PlanValidator, RemainingBudget, SwarmV2Adapter, Verifier)
                 from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+                from backend.engines.swarm_v2.evidence_mapping import (
+                    RegisteredOperationEvidenceSink, TrustedEvidenceAcquisition,
+                    production_evidence_mappers)
                 from backend.engines.swarm_v2.grounding import RepositoryEvidenceResolver
                 from backend.provider_scheduler import ProviderScheduler
                 from backend.tools import ToolContext, ToolRegistry
+                from backend.tools.government_vehicle import (GOVERNMENT_TOOL_SCOPE,
+                                                              GovernmentVehicleTool)
+                from backend.catalog.pipeline import CatalogPromotionPipeline
 
                 allowed = tuple(filter(None, (item.strip() for item in
                     os.getenv("MILO_COMMANDER_MODEL_ALLOWLIST", "").split(","))))
@@ -357,12 +368,18 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 worker_model = os.getenv("MILO_SWARM_WORKER_MODEL", "").strip()
                 if not allowed or not commander_model or not worker_model or commander_model not in allowed:
                     raise ValueError("Swarm V2 model configuration is incomplete or not allowlisted")
-                # The production registry stays EMPTY in this release: no Yeda,
-                # Government, CKAN or web tool is registered, so every plan the
-                # firewall can approve is a no-tool plan. Registering a real
-                # tool is a separate, deliberate change that must also grant
-                # its scope on the ToolContext below.
-                tools = ToolRegistry()
+                # Catalog PR3 registers the FIRST real production tool: the
+                # bounded, read-only Israeli vehicle register. It reads durable
+                # catalog rows through this worker's own repository and holds
+                # no transport and no credential, so a chat run cannot reach
+                # `data.gov.il` through it. Its scope is granted on the
+                # ToolContext below -- in this trusted wiring, never by a plan.
+                #
+                # No Yeda, CKAN or web tool is registered, and no WRITE tool is
+                # registered at all: canonical promotion is a lease-guarded
+                # repository RPC that trusted server code calls, not a
+                # capability a model can request.
+                tools = ToolRegistry([GovernmentVehicleTool(repo)])
                 scheduler = ProviderScheduler(provider_limits,
                     cancellation_checker=is_cancelled,
                     backpressure_callback=record_provider_backpressure)
@@ -383,22 +400,45 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 commander = Commander(client=gateway,
                     resolver=CommanderModelResolver(allowed, set(allowed)), validator=validator,
                     retry_callback=record_retry)
-                # No scope, no capability and no write approval are granted:
-                # a plan can request a registered capability, never authorize
-                # one. Write tools therefore remain impossible here.
-                tool_context = ToolContext(cancellation_checker=is_cancelled)
+                # Exactly ONE read scope is granted, from trusted server
+                # state. `write_approved` stays False and no
+                # `tool:write:<name>` capability is granted, so a write tool
+                # would still be impossible even if one were registered. A
+                # plan can request a registered capability; it can never
+                # authorize one.
+                tool_context = ToolContext(scopes=frozenset({GOVERNMENT_TOOL_SCOPE}),
+                                           cancellation_checker=is_cancelled)
+                # The run's lease-guarded Evidence Board, built BEFORE the
+                # executor because the worker's trusted tool-result sink writes
+                # through it. Same board the Verifier's verdicts and the
+                # conflict decisions go through, so there is one evidence
+                # writer for the whole run.
+                board = EvidenceBoard(repo, WorkerLease(run_id, worker_id,
+                    int(run.get("attempt") or 1), str(run.get("lease_token") or "")))
+                # The R3 seam, wired for the first time. Routed so that ONLY
+                # the registered Government operation becomes evidence: the
+                # tool's seven other reads record nothing at all rather than
+                # failing the task that called them, and the pre-R3 generic
+                # text extractor stays unreachable either way.
+                evidence_sink = RegisteredOperationEvidenceSink(
+                    TrustedEvidenceAcquisition(board=board,
+                                               mappers=production_evidence_mappers()))
+                # Catalog PR3: the trusted promotion path. It observes NOTHING
+                # here and holds no state: when it runs it asks the database
+                # which candidates this run still owes, deriving the
+                # association from rows the server itself wrote. That is what
+                # makes it behave identically in a worker that gathered the
+                # evidence and in one that replaced a worker which did.
+                catalog_promotion["pipeline"] = CatalogPromotionPipeline(repo, board.lease)
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
                     cancellation_checker=is_cancelled, event_sink=forward_event,
-                    # tool_result_sink is deliberately left unwired. R3 built
-                    # the trusted mapping this seam was waiting for
-                    # (engines/swarm_v2/evidence_mapping.py), but
-                    # PRODUCTION_EVIDENCE_MAPPERS is empty and the production
-                    # ToolRegistry above registers no real source-bearing
-                    # tool, so there is nothing to acquire; wiring the sink
-                    # additionally needs a real evidence grant, which R3 does
-                    # not create. The contract is proven end to end against
-                    # deterministic offline tools and trusted offline mappers.
+                    # The trusted post-execution seam, wired. It is reached
+                    # only with a Registry-validated result and server-resolved
+                    # identity; the worker model cannot call it, cannot choose
+                    # what it writes, and cannot turn its own completion into
+                    # evidence.
+                    tool_result_sink=evidence_sink,
                     # A bounded worker-output repair is a semantic retry and
                     # consumes the SAME run-level retry allowance the
                     # Commander repair does. Provider 429 backpressure is
@@ -406,8 +446,6 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     retry_callback=record_retry),
                     max_active_workers=BoundedTaskExecutor.configured_limit(),
                     cancellation_checker=is_cancelled)
-                board = EvidenceBoard(repo, WorkerLease(run_id, worker_id,
-                    int(run.get("attempt") or 1), str(run.get("lease_token") or "")))
                 def remaining():
                     cfg = tracker.config
                     model_calls = max(
@@ -480,6 +518,36 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             engine_run = ({**run, "checkpoint": latest_checkpoint}
                           if workflow_key == "swarm_v2" and latest_checkpoint else run)
             result = selected_engine.run(engine_run)
+            # Catalog PR3: the trusted promotion path, AFTER the engine has
+            # settled every verdict and BEFORE the run is finalized, so it
+            # still holds the lease every write it performs is guarded by.
+            #
+            # It is deliberately not a Tool and not an engine step: a model can
+            # cause a Government READ and nothing beyond it. It asks the
+            # database what this run still owes -- so a RESUMED worker, which
+            # restored the completed tasks and never re-executed the tool,
+            # promotes exactly what the crashed one would have -- promotes at
+            # most `MAX_PROMOTIONS_PER_RUN`, starts no capture and schedules
+            # nothing.
+            #
+            # A REFUSAL is a legitimate outcome and is emitted as a run event
+            # rather than failing the run. An INFRASTRUCTURE failure is not a
+            # refusal and is never reported as one: a LOST LEASE and a
+            # PENDING-PROMOTION READ that could not run both raise `AppError`
+            # from here into the handler below, which re-raises it. That is
+            # deliberate and load-bearing -- a failed read is not "this run
+            # owes no promotion", and finalizing the run on one would strand a
+            # run whose verified evidence is durable and whose canonical
+            # promotion never happened, with no later scheduler to revisit it.
+            if workflow_key == "swarm_v2" and catalog_promotion.get("pipeline") is not None:
+                for attempt in catalog_promotion["pipeline"].promote():
+                    sink.emit(RunEventRecord(
+                        run_id=run_id,
+                        type="catalog_variant_promoted" if attempt.promoted
+                             else "catalog_promotion_refused",
+                        message=("Canonical catalog variant promoted."
+                                 if attempt.promoted else attempt.safe_message),
+                        payload=attempt.as_event()))
         except CancellationRequested:
             sink.emit(RunEventRecord(run_id=run_id, type="run_cancelled", message="Run cancelled", payload={}))
             shadow_observe("run_cancelled", {})

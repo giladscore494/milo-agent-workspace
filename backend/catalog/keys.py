@@ -51,6 +51,11 @@ KEY_DOMAINS: Mapping[str, str] = {
     "catalog.raw_record": "cr",
     "catalog.candidate": "cc",
     "catalog.evidence_link": "cl",
+    # Catalog PR3: the canonical catalog's own identities, and the identity of
+    # ONE promotion transaction.
+    "catalog.canonical_model": "cm",
+    "catalog.canonical_variant": "cv",
+    "catalog.promotion": "cp",
 }
 
 #: How much of the digest a key carries. 32 hex characters is 128 bits, which
@@ -159,5 +164,82 @@ def evidence_link_key(*, candidate_key: str, source_id: str, claim_id: str,
                       verdict_id=None if verdict_id is None else str(verdict_id))
 
 
-__all__ = ["KEY_DOMAINS", "KEY_VERSION", "CatalogKeyError", "candidate_key", "derive_key",
-           "evidence_link_key", "raw_record_key", "snapshot_key"]
+def canonical_model_key(*, manufacturer: str, commercial_model: str) -> str:
+    """ONE canonical model -- a marque and a commercial model, and nothing else.
+
+    No year, no code and no trim: those distinguish VARIANTS of a model, and
+    folding one into the model's identity would make `RAV4 (2024)` and
+    `RAV4 (2025)` two different models.
+
+    The text is the source's own, uncollapsed, exactly as
+    `backend/catalog/keys.py` treats every other identity component: two
+    manufacturer spellings the register publishes separately are two
+    manufacturers here, because deciding they are one is a reconciliation
+    judgement with its own evidence requirement -- not something a key builder
+    may make silently.
+    """
+    return derive_key("catalog.canonical_model", manufacturer=manufacturer,
+                      commercial_model=commercial_model)
+
+
+def canonical_variant_key(*, model_key: str, model_year_start: int, model_year_end: int,
+                          official_model_code: str | None = None,
+                          trim: str | None = None) -> str:
+    """ONE canonical variant of one canonical model.
+
+    IDENTITY versus REVISABLE FACT
+    ------------------------------
+
+    A canonical variant is identified by its model, its model year range, its
+    official model code and its trim -- and by NOTHING else. Those four say
+    WHICH vehicle the row is about, so two trims of one model year are two
+    canonical variants rather than one row that silently won, and `None` is
+    preserved distinctly by `_canonical` so an unstated code and an empty one
+    never derive the same key.
+
+    `identity_dimensions` is deliberately NOT here. A dimension -- the fuel
+    type, the drivetrain, the body style -- is a FACT ABOUT the variant that a
+    later, better source may revise, and a key that moved with it would file
+    every revision as a brand-new vehicle. Three places already read it that
+    way and this builder is the fourth:
+
+    *   `catalog_model_variants_natural_uidx` is unique on the model, the year
+        range, the code and the trim, so a second row differing only in a
+        dimension is a DUPLICATE the database refuses;
+    *   `catalog_canonical_identity_field()` names exactly those four fields as
+        the frozen ones, and therefore admits a later revision of a dimension;
+    *   `catalog_canonical_variant_current` rebuilds `identity_dimensions` from
+        the newest provenance revision of each `identity_dimensions.*` field,
+        so the VIEW is where a dimension's current value is read.
+
+    The `identity_dimensions` COLUMN on `catalog_model_variants` is what
+    revision 1 established and never changes, exactly like the other columns;
+    it is a frozen record of the first promotion, not the current belief.
+    """
+    return derive_key("catalog.canonical_variant", model_key=model_key,
+                      model_year_start=model_year_start, model_year_end=model_year_end,
+                      official_model_code=official_model_code, trim=trim)
+
+
+def promotion_key(*, candidate_key: str, variant_key: str,
+                  fields: Mapping[str, Any]) -> str:
+    """ONE promotion transaction: this candidate, this variant, these facts.
+
+    The FIELD SET AND ITS VALUES are in the identity, which is what makes a
+    conflicting replay detectable: the same key presented with a different set
+    of promoted fields, or with the same fields at different values, is a
+    different promotion wearing the same name and is refused rather than
+    collapsing onto the stored one.
+
+    The run, the worker, the attempt and the time are deliberately absent: a
+    retry of the same promotion after a crash must replay onto the same
+    identity, and it cannot do that if the identity moves with the attempt.
+    """
+    return derive_key("catalog.promotion", candidate_key=candidate_key,
+                      variant_key=variant_key,
+                      fields={str(name): fields[name] for name in sorted(fields)})
+
+
+__all__ = ["KEY_DOMAINS", "KEY_VERSION", "CatalogKeyError", "candidate_key",
+           "canonical_model_key", "canonical_variant_key", "derive_key",
+           "evidence_link_key", "promotion_key", "raw_record_key", "snapshot_key"]

@@ -60,13 +60,39 @@ independent barriers, neither depending on the other.
 | --- | --- |
 | `catalog_raw_records`, `catalog_candidate_evidence_links` | `SELECT`, `INSERT` — append-only; no `UPDATE`, no `DELETE` |
 | `catalog_source_snapshots`, `catalog_candidate_variants` | `SELECT`, `INSERT`, `UPDATE` — the one reviewed transition each carries (snapshot completion counters, candidate status); no `DELETE` |
-| `catalog_models`, `catalog_model_variants` | **`SELECT` only**, and immutable by trigger |
+| `catalog_models`, `catalog_model_variants` | **`SELECT`, `INSERT`** after Catalog PR3 — still no `UPDATE`, no `DELETE`, and still immutable by trigger |
+| `catalog_canonical_field_provenance` (PR3) | `SELECT`, `INSERT` — append-only; no `UPDATE`, no `DELETE` |
+| `catalog_canonical_field_current`, `catalog_canonical_variant_current` (PR3, views) | **`SELECT` only**, `security_invoker = true`, nothing for any browser role |
 
-The canonical pair being read-only is what makes "the canonical catalog starts
-empty and stays empty" a database property rather than a claim about the code:
-no role can insert a canonical row, so canonical promotion cannot happen by
-accident or by an unreviewed backend release. Catalog PR3 grants the privilege
-it needs in its own reviewed migration.
+**Catalog PR3 opened the canonical pair, and the shape of that opening is the
+point.** PR1 and PR2 kept it `SELECT`-only because a single row-level
+`promoted_from_verdict_id` cannot verify a row of several independent facts.
+PR3 adds `catalog_canonical_field_provenance` — ONE append-only row per promoted
+FACT, carrying the candidate, evidence link, snapshot, source, claim, verified
+verdict, run and worker lease, source version, exact locator and idempotency key
+— and then grants `INSERT` and nothing else.
+
+Two triggers make that grant safe FOR EVERY WRITER, which matters because
+`service_role` holds direct DML and the RPCs are `SECURITY INVOKER`:
+
+* `catalog_check_field_provenance` (BEFORE INSERT) holds every promoted fact to
+  its whole support chain and DERIVES its source, claim, verdict, version and
+  locator from the cited evidence link. A forged row, a row citing an
+  unverified verdict, a row citing a `legacy_reference` snapshot, a row whose
+  claim states a different field or a different value, and a row whose claim
+  sits in an unresolved conflict are all refused for a direct `INSERT` exactly
+  as they are through the RPC.
+* `catalog_require_field_provenance` (DEFERRED constraint trigger) refuses to
+  COMMIT a canonical variant whose stated fields are not all covered by
+  revision-1 provenance, and holds the PR1 row-level back-pointer to being a
+  verdict and a candidate from that row's own provenance. A companion deferred
+  trigger refuses a bare canonical model with no promoted variant.
+
+So "no canonical fact exists without exact verified evidence for that exact
+field" is a database property rather than a claim about the code. The views are
+created with `security_invoker = true` and have `REVOKE ALL` applied to
+`service_role` before the single `SELECT` grant, because a view is a new object
+and Supabase default privileges would otherwise hand it everything.
 
 Catalog PR2 (`20260915180000_catalog_raw_record_source_locator.sql`) changes
 none of this. It adds one column to `catalog_raw_records` and one immutable
@@ -83,15 +109,32 @@ as a revision counter advanced — so a row could state values that the single
 `promoted_from_verdict_id` attached to it had never seen, with the advancing
 counter making it look reviewed. Row-level provenance cannot verify a
 multi-field row: a verdict that confirmed the drivetrain says nothing about the
-model year beside it. **PR3 must add field-level, append-only revision
-provenance — one provenance row per fact, not one per canonical row — before
-enabling any insert.** A row-level foreign key is not sufficient and must not
-be treated as if it were.
+model year beside it. **Catalog PR3 added exactly that field-level,
+append-only revision provenance before enabling any insert** (see above), and
+the row-level back-pointer is now a CHECKED pointer into the row's own field
+provenance rather than a substitute for it.
 
-**The repository's catalog write path** goes through five lease-guarded RPCs
+**Catalog PR3's read functions** (`catalog_readable_snapshot`,
+`catalog_candidate_manufacturers`, `catalog_candidate_models`,
+`catalog_candidate_model_years`, `catalog_candidate_variant_page`,
+`catalog_raw_record_by_upstream_id`, `catalog_snapshot_candidate_diff`,
+`catalog_page_limit`) take no lease, because a lease authorizes a durable WRITE.
+They are `SECURITY INVOKER`, have a fixed `search_path`, name every relation as
+a literal, order deterministically, bound every page with a server-owned
+constant and return the exact total — including on an EMPTY page, which comes
+back as one COUNT ROW rather than as no rows at all. Each has `EXECUTE` revoked
+from `PUBLIC`/`anon`/`authenticated` before the narrow `service_role` grant,
+exactly like every other function in this namespace, and so do
+`catalog_run_pending_promotions` — the bounded read that derives what one run
+still has to promote — and the four IMMUTABLE pure helpers PR3 adds
+(`catalog_record_locator_id`, `catalog_claim_entity_key`,
+`catalog_candidate_identity_scope`, `r4_normalized_scope_text`).
+
+**The repository's catalog write path** goes through six lease-guarded RPCs
 (`record_catalog_snapshot_guarded`, `record_catalog_raw_record_guarded`,
 `activate_catalog_snapshot_guarded`, `record_catalog_candidate_guarded`,
-`link_catalog_candidate_evidence_guarded`), each calling
+`link_catalog_candidate_evidence_guarded` and, from Catalog PR3,
+`promote_catalog_variant_guarded`), each calling
 `assert_worker_lease` before writing anything, each `EXECUTE`-revoked from
 `public`/`anon`/`authenticated` and granted only to `service_role`, and each
 idempotent on a derived key that fails closed when replayed with different

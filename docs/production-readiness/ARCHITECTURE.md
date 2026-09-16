@@ -40,17 +40,56 @@ Status: `COMPLETED_IN_CODE` (application architecture) /
   no separate Yeda connection, credential or cross-project trust boundary
   exists or is introduced. Catalog PR2 adds the Government INGESTION path that
   fills those relations (`backend/catalog/government/`) and introduces no
-  second database and no parallel evidence model; the canonical catalog
-  (`catalog_models`, `catalog_model_variants`) is still empty and still
-  unwritable by every role.
+  second database and no parallel evidence model. **Catalog PR3 opens the
+  canonical catalog** (`catalog_models`, `catalog_model_variants`): a
+  canonical row can now be created, and ONLY through one lease-guarded
+  promotion RPC with a VERIFIED verdict for every field it states.
+  `service_role` gains `INSERT` on those two relations and nothing else — no
+  `UPDATE`, no `DELETE`, and both stay immutable by trigger, so a later
+  source revises a fact by APPENDING to
+  `catalog_canonical_field_provenance` rather than rewriting a row. Two
+  triggers enforce that for every writer, not only for callers of the RPC.
+  The authoritative answer to "what is the current canonical value" is the
+  view `catalog_canonical_variant_current`, assembled from the highest
+  revision of each promoted field.
 - **`data.gov.il` (Israeli Ministry of Transport)** — **read-only, outbound,
   unauthenticated, and not activated.** Catalog PR2 adds a bounded CKAN reader
   whose only network-capable module is
   `backend/catalog/government/transport.py`; it is HTTPS-only to one
   allowlisted host, follows no redirect, holds no credential, and is
-  constructed explicitly. No production entrypoint builds one, so no release
-  can reach this source; the worker registers no Government tool and the
-  production `ToolRegistry` remains empty.
+  constructed explicitly. **No production entrypoint builds one, so no release
+  can reach this source** — including after Catalog PR3. The Government Tool
+  the worker now registers reads DURABLE catalog rows through the run's own
+  repository and holds no transport, so a chat run cannot reach the network
+  through it; and the `sync_if_changed` refresh operation exists with no
+  schedule and no production caller.
+- **Swarm V2 tool surface** — the production `ToolRegistry` is no longer empty.
+  Catalog PR3 registers exactly one tool, `catalog.government_vehicle`, in READ
+  mode with one static server-owned scope (`catalog:government:read`) granted in
+  `backend/worker/main.py`. No write tool is registered, `write_approved` stays
+  `False` and no `tool:write:<name>` capability is granted anywhere. Canonical
+  promotion is deliberately NOT a tool: it is a lease-guarded repository RPC
+  that trusted server code calls, so a model can neither request nor authorize
+  one.
+- **Canonical promotion path** — `backend/catalog/pipeline.py`, constructed in
+  `backend/worker/main.py` and run after the Swarm V2 engine has settled
+  every verdict and before the run is finalized, while the worker still holds
+  the lease each write is guarded by. It asks the database what the run still
+  owes (`catalog_run_pending_promotions`, which DERIVES the claim-to-candidate
+  association from the claim's own evidence locator rather than remembering it
+  in the process), links each verified claim to its candidate, moves that
+  candidate to `ready_for_review`, plans the promotion and calls the guarded
+  RPC. Holding no in-process state is what makes a REPLACEMENT worker — one
+  that restored a checkpoint and never re-executed the tool — promote exactly
+  what the crashed worker would have. A model can cause the Government READ that starts it
+  and nothing beyond: the path is trusted server code, promotes at most 25
+  candidates per run, reads only what the run itself produced, starts no
+  capture, opens no socket and schedules nothing. A refusal is emitted as a run
+  event and never fails the run. An infrastructure failure is never reported as
+  a refusal: a lost lease and a pending-promotion read that could not run both
+  propagate to the worker unchanged, so a stale worker writes nothing and a run
+  that still owes a promotion is never marked complete on a read nobody could
+  perform.
 - **Redis (Upstash REST)** — shared rate-limit store for gateway and API;
   production fails closed on limited surfaces when unavailable.
 - **Provider (Kimi/Moonshot)** — reached only by the worker, only when

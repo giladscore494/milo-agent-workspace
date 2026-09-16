@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Collection
+from typing import Any, Collection, Mapping
 
 from pydantic import ValidationError
 
@@ -137,12 +137,53 @@ PROVIDER_PLAN_RULES = (
 )
 
 
+# Catalog PR3: the SOURCE-FIRST policy a registered tool brings with it.
+#
+# Static, code-owned text keyed by the tool's REGISTERED NAME, so a rule only
+# reaches a prompt when the server actually registered the capability it talks
+# about -- a policy naming a tool the Commander cannot call would be an
+# instruction to do something impossible.
+#
+# Deliberately NOT a workflow. There is no fixed Government -> legacy -> Web
+# sequence, no fixed category list and no fixed task decomposition: these are
+# rules about WHICH SOURCE ANSWERS WHICH KIND OF QUESTION, and the taxonomy,
+# the task graph and the number of tasks stay entirely the Commander's.
+#
+# And it grants nothing. Like every other line of the plan policy it is text a
+# model reads: the scope that makes the tool callable stays in the server-owned
+# ToolContext, write approval stays off, verdicts stay with the Verifier and
+# canonical promotion stays behind a lease-guarded RPC the model cannot reach.
+SOURCE_FIRST_TOOL_POLICY: Mapping[str, tuple[str, ...]] = {
+    "catalog.government_vehicle": (
+        "For whether an Israeli vehicle EXISTS, which Israeli model years it has, or what its "
+        "official model code is, call catalog.government_vehicle before planning broad web research.",
+        "If the register's answer settles the question, do not add a web discovery task for it.",
+        "Use targeted research only for a gap the register leaves, an enrichment it does not "
+        "define, or a contradiction between two sources.",
+        "An ambiguous resolution stays ambiguous: plan a targeted task that adds evidence, never a merge.",
+        "The register is authority for existence, Israeli model year, official model code, trim and "
+        "the coded dimensions it publishes. It is NOT authority for reliability, faults, price or "
+        "market value; research those independently.",
+    ),
+}
+
+
+def source_policy_rules(allowed_tools: Collection[str]) -> list[str]:
+    """The source-first rules the REGISTERED tools bring, in a stable order."""
+    return [rule for name in sorted(set(allowed_tools))
+            for rule in SOURCE_FIRST_TOOL_POLICY.get(name, ())]
+
+
 def provider_plan_policy(limits: PlanLimits,
                          allowed_tools: Collection[str]) -> dict[str, Any]:
     """Deterministic provider-visible policy derived from the SAME PlanLimits
     the deterministic firewall enforces, so contract and firewall cannot
     drift independently. Contains only server-owned limits, the server tool
-    allowlist and static rule text."""
+    allowlist and static rule text.
+
+    `source_policy` is derived from the REGISTERED tool names for the same
+    reason: a source-first rule appears exactly when the capability it names is
+    registered, and disappears with it."""
     return {
         "limits": {
             "max_tasks": limits.max_tasks,
@@ -155,6 +196,7 @@ def provider_plan_policy(limits: PlanLimits,
         },
         "allowed_tools": sorted(set(allowed_tools)),
         "rules": list(PROVIDER_PLAN_RULES),
+        "source_policy": source_policy_rules(allowed_tools),
     }
 
 

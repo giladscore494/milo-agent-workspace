@@ -1179,34 +1179,68 @@ def test_no_claim_verdict_or_evidence_link_is_manufactured_by_ingestion(reposito
         assert token not in source
 
 
-def test_the_production_tool_registry_is_still_empty():
-    """No `GovernmentVehicleTool`, no registration, no scope, no grant."""
-    assert ToolRegistry().allowed_names == frozenset()
+def test_the_projection_is_still_not_a_tool_and_the_registration_is_a_wrapper():
+    """PR2's query layer stayed a plain class; PR3 wrapped it, and only that.
+
+    The assertion here was "no tool is registered at all". PR3 registers one,
+    so what is worth pinning is that the registration did not turn the query
+    layer INTO a tool: `GovernmentCatalogProjection` and `GovernmentCatalogQuery`
+    still have no operations mapping, no schema and no required scope, and the
+    Tool protocol lives entirely in `backend/tools/government_vehicle.py`.
+
+    `backend/tools/registry.py` still names no source: the framework knows
+    nothing about the Government catalog, exactly as it knew nothing before.
+    """
+    from backend.catalog.government.query import GovernmentCatalogQuery
+
     registry = Path("backend/tools/registry.py").read_text(encoding="utf-8")
     assert "government" not in registry.lower()
+    for reader in (GovernmentCatalogProjection, GovernmentCatalogQuery):
+        for attribute in ("operations", "input_schema", "output_schema",
+                          "required_scope", "mode"):
+            assert not hasattr(reader, attribute), (reader, attribute)
+    # The worker registers the TOOL, not the reader: a plan can name
+    # `catalog.government_vehicle`, and nothing else in this package.
     worker = Path("backend/worker/main.py").read_text(encoding="utf-8")
-    # The registry is still constructed with no tools at all, and nothing in
-    # the worker imports, names or grants this capability. (The worker's own
-    # comment mentions Government to say it is NOT registered, which is the
-    # statement being preserved rather than a wiring.)
-    assert "tools = ToolRegistry()" in worker
-    assert "catalog.government" not in worker
-    assert "GovernmentVehicleTool" not in worker
-    assert "gov_il" not in worker
-    # And the projection is deliberately not a Tool: no operations mapping, no
-    # schemas, no required scope.
-    for attribute in ("operations", "input_schema", "output_schema", "required_scope", "mode"):
-        assert not hasattr(GovernmentCatalogProjection, attribute)
+    assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in worker
+    assert "GovernmentCatalogProjection" not in worker
+    assert "GovernmentCatalogQuery" not in worker
+    assert "DataGovClient" not in worker
+    # And no production entrypoint constructs a transport, so a chat run still
+    # cannot reach `data.gov.il` -- the Tool reads durable rows only.
+    assert "HttpsDataGovTransport" not in worker
 
 
-def test_nothing_outside_the_package_and_its_tests_imports_it_yet():
-    """PR2 builds the capability; PR3 connects it."""
-    # `backend/testing/r5_proof/government.py` reads the shared code/label
-    # vocabulary, which is the point of moving it: ONE definition of what a
-    # register code means, selected down to the subset R5 reviewed.
-    allowed = {"backend/catalog/government", "backend/testing/government_capture.py",
-               "backend/testing/r5_proof/government.py",
-               "tests/test_catalog_government_ingestion.py"}
+def test_only_the_reviewed_pr3_seams_import_the_government_package():
+    """PR2 built the capability; Catalog PR3 connects it -- at NAMED seams.
+
+    PR2 asserted here that nothing outside the package imported it at all.
+    PR3 makes that false on purpose, so the assertion becomes the list of
+    places it is now reachable from -- and stays a test failure if a sixth
+    module starts importing the Government catalog without a reviewer noticing.
+
+    `backend/testing/r5_proof/government.py` reads the shared code/label
+    vocabulary, which is the point of moving it: ONE definition of what a
+    register code means, selected down to the subset R5 reviewed.
+    """
+    allowed = {
+        "backend/catalog/government",
+        "backend/testing/government_capture.py",
+        "backend/testing/r5_proof/government.py",
+        # PR3: the Tool that exposes the reviewed query layer, the worker
+        # wiring that registers it, the production evidence-mapper allowlist
+        # that names its one evidence-bearing operation, and the plan policy
+        # that carries a source-first rule for it. Nothing else in `backend/`
+        # may name the Government catalog.
+        "backend/tools/government_vehicle.py",
+        "backend/worker/main.py",
+        # Catalog PR3's trusted promotion path names the ONE registered
+        # Government operation, so it knows which tool result carries a
+        # candidate. It imports two constants and no capture code.
+        "backend/catalog/pipeline.py",
+        "backend/engines/swarm_v2/evidence_mapping.py",
+        "backend/engines/swarm_v2/validation.py",
+    }
     for path in sorted(Path("backend").rglob("*.py")):
         text = str(path)
         if any(text.startswith(prefix) for prefix in allowed):

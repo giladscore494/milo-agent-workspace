@@ -40,9 +40,11 @@ from .evidence_contracts import (EVIDENCE_CONTRACT_REASONS, EvidenceBundle,
                                  document_span_locator, read_locator_path,
                                  record_field_locator, snapshot_version,
                                  structured_projection, verbatim_excerpt)
-from .evidence_mapping import (EVIDENCE_MAPPING_REASONS, PRODUCTION_EVIDENCE_MAPPERS,
+from .evidence_mapping import (EVIDENCE_MAPPING_REASONS, NO_EVIDENCE,
+                               PRODUCTION_EVIDENCE_MAPPER_OPERATIONS,
                                AcquiredEvidence, EvidenceMapper, EvidenceMapperRegistry,
-                               EvidenceMappingError, TrustedEvidenceAcquisition)
+                               EvidenceMappingError, RegisteredOperationEvidenceSink,
+                               TrustedEvidenceAcquisition, production_evidence_mappers)
 from .models import CommanderModelError, CommanderModelResolver
 from .validation import (VALIDATION_REASONS, PlanJsonError, PlanLimitError, PlanLimits,
                          PlanSchemaError, PlanValidationError, PlanValidator,
@@ -126,7 +128,9 @@ __all__ += ["EVIDENCE_CONTRACT_REASONS", "EVIDENCE_MAPPING_REASONS", "FRAGMENT_T
             "MAX_FACT_VALUE_DEPTH", "MAX_FACT_VALUE_JSON_BYTES", "MAX_LOCATOR_KEY_CHARS",
             "MAX_LOCATOR_PATH_SEGMENTS", "MAX_LOCATOR_SCOPE_IDS", "MAX_PROJECTION_FIELDS",
             "MAX_SOURCE_VERSION_CHARS", "MAX_SOURCE_VERSION_KEY_CHARS", "MAX_UNIT_CHARS",
-            "PRODUCTION_EVIDENCE_MAPPERS", "SOURCE_VERSION_KINDS", "AcquiredEvidence",
+            "NO_EVIDENCE", "PRODUCTION_EVIDENCE_MAPPER_OPERATIONS",
+            "RegisteredOperationEvidenceSink", "SOURCE_VERSION_KINDS", "AcquiredEvidence",
+            "production_evidence_mappers",
             "EvidenceBundle", "EvidenceContractError", "EvidenceLocator", "EvidenceMapper",
             "EvidenceMapperRegistry", "EvidenceMappingError", "FocusedEvidenceFragment",
             "SourceVersion", "StructuredEvidenceFact", "TrustedEvidenceAcquisition",

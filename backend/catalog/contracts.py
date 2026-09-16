@@ -2,21 +2,25 @@
 
 ONE definition of each rule. The guarded RPCs and the table constraints in the
 ordered catalog migration set -- `20260914200000_catalog_evidence_foundation.sql`,
-`20260915120000_catalog_integrity_corrections.sql` and
-`20260915180000_catalog_raw_record_source_locator.sql` -- apply exactly these
+`20260915120000_catalog_integrity_corrections.sql`,
+`20260915180000_catalog_raw_record_source_locator.sql`,
+`20260916090000_catalog_bounded_candidate_queries.sql` and
+`20260916120000_catalog_field_level_promotion.sql` -- apply exactly these
 values, and `tests/test_catalog_migration_static.py` proves the two copies
 cannot drift apart: the same device migration
 `20260828000200_source_evidence_fragments.sql` and
 `backend/engines/swarm_v2/fragments.py` already use for the evidence bounds.
 
 Nothing here reads a file, opens a connection, or fetches anything. These are
-constants plus four pure functions.
+constants plus six pure functions.
 """
 
 from __future__ import annotations
 
 import json
 from typing import Any, Mapping
+
+from backend.engines.swarm_v2.normalization import normalize_field_key
 
 #: Where a snapshot came from. Closed: a family this tuple does not name has no
 #: reviewed trust posture, so it cannot be persisted at all.
@@ -103,6 +107,43 @@ RAW_RECORD_LOCATOR_KEYS = ("capture_index", "page_index", "page_number", "page_o
 MAX_RAW_RECORD_LOCATOR_CHARS = 256
 MAX_RAW_RECORD_LOCATOR_POSITION = 2147483647
 
+#: Catalog PR3: the canonical fields a promotion may state, and the ONE place
+#: that list is written. Closed in both directions: a canonical row may not
+#: state a field this tuple does not name, and every field it DOES state must
+#: carry its own verified provenance row.
+#:
+#: The canonical MODEL identity (manufacturer, commercial model) is deliberately
+#: NOT here. It is not a revisable fact about a vehicle -- it is the ENTITY
+#: every promoted fact is about -- and it is established by the candidate whose
+#: evidence link each provenance row cites, which the promotion transaction
+#: holds every cited claim to. A field key here names something a later, better
+#: source could legitimately revise.
+#:
+#: An identity dimension is namespaced `identity_dimensions.<dimension>` so one
+#: promoted dimension is one fact with one locator, exactly like every other
+#: field. `CANDIDATE_IDENTITY_DIMENSIONS` is the closed dimension vocabulary,
+#: so this tuple cannot name a dimension the durable schema would refuse.
+CANONICAL_VARIANT_FIELDS: tuple[str, ...] = (
+    "model_year_start", "model_year_end", "official_model_code", "trim",
+    *(f"identity_dimensions.{dimension}" for dimension in CANDIDATE_IDENTITY_DIMENSIONS),
+)
+
+#: The fields a canonical variant ALWAYS states, and therefore always needs
+#: provenance for. A variant with no model year is not a variant.
+CANONICAL_REQUIRED_FIELDS: tuple[str, ...] = ("model_year_start", "model_year_end")
+
+#: The variant columns that are optional: stated with provenance, or absent.
+#: There is no third state -- a column present without provenance is refused,
+#: and provenance without the column is refused, in the database and here.
+CANONICAL_OPTIONAL_FIELDS: tuple[str, ...] = ("official_model_code", "trim")
+
+#: The prefix an identity-dimension field key carries.
+CANONICAL_DIMENSION_PREFIX = "identity_dimensions."
+
+#: The largest number of promoted fields one canonical variant may carry. The
+#: required two, the two optional columns, and one per closed dimension.
+MAX_CANONICAL_FIELDS = len(CANONICAL_VARIANT_FIELDS)
+
 #: The shape every idempotency identity in this namespace must have. Bounded
 #: and ASCII so it is safe to compare, index and log; never derived from model
 #: output.
@@ -110,6 +151,43 @@ IDEMPOTENCY_KEY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,199}$"
 
 #: A SHA-256 content identity, lowercase hex.
 CONTENT_SHA256_PATTERN = r"^[0-9a-f]{64}$"
+
+
+def canonical_field_value(payload: Mapping[str, Any], field_key: str) -> Any:
+    """What a canonical variant payload STATES for one field key, or absent.
+
+    Returns the sentinel `ABSENT` rather than `None` for a field the payload
+    does not state, because `None` is a value a column can legitimately hold
+    and conflating the two is how an unstated field becomes a stated null.
+    """
+    if field_key not in CANONICAL_VARIANT_FIELDS:
+        raise ValueError("unknown canonical catalog field")
+    if field_key.startswith(CANONICAL_DIMENSION_PREFIX):
+        dimensions = payload.get("identity_dimensions") or {}
+        if not isinstance(dimensions, Mapping):
+            raise ValueError("catalog identity dimensions must be an object")
+        name = field_key[len(CANONICAL_DIMENSION_PREFIX):]
+        return dimensions[name] if name in dimensions else ABSENT
+    return payload[field_key] if payload.get(field_key) is not None else ABSENT
+
+
+def stated_canonical_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Every field a canonical variant payload states, keyed by field key.
+
+    The ONE derivation of "which fields does this canonical row state", shared
+    by the promotion preparer, both repositories and the documentation. The
+    database derives the same set in `catalog_canonical_stated_fields`, and
+    `tests/test_catalog_migration_static.py` pins the two together.
+    """
+    stated: dict[str, Any] = {}
+    for field_key in CANONICAL_VARIANT_FIELDS:
+        value = canonical_field_value(payload, field_key)
+        if value is not ABSENT:
+            stated[field_key] = value
+    for field_key in CANONICAL_REQUIRED_FIELDS:
+        if field_key not in stated:
+            raise ValueError("a canonical catalog variant must state its model year range")
+    return stated
 
 
 def trust_state_for(source_family: str) -> str:
@@ -178,11 +256,109 @@ def stated_source_locator(locator: Mapping[str, Any] | None) -> dict[str, int]:
     return stated
 
 
-__all__ = ["CANDIDATE_IDENTITY_DIMENSIONS", "CANDIDATE_STATUSES",
+#: How many candidates ONE RUN may promote. A research run resolves a handful
+#: of vehicles; a run that somehow resolved thousands must not turn into an
+#: unbounded write loop at the end of it, so the durable pending-promotion read
+#: returns at most this many CANDIDATES and the extras wait for another run.
+#:
+#: Mirrored by the `p_limit` default of `public.catalog_run_pending_promotions`.
+MAX_PROMOTIONS_PER_RUN = 25
+
+#: The R4 identity dimensions a catalog CANDIDATE can also state. The two
+#: closed vocabularies overlap here and nowhere else: a dimension only one side
+#: names is left unstated rather than translated into the nearest word.
+#:
+#: `model_code` and `trim` are R4 identity dimensions too, but they are columns
+#: on a candidate rather than entries in `identity_dimensions`, so they are
+#: handled separately by every caller.
+SHARED_IDENTITY_DIMENSIONS = ("body_style", "drivetrain", "generation", "transmission")
+
+
+def candidate_identity_scope(identity_dimensions: Mapping[str, Any] | None,
+                            official_model_code: Any, trim: Any) -> dict[str, str]:
+    """The IDENTITY SCOPE one candidate narrows a claim to, as R4 stores it.
+
+    `claims.identity_scope` is written NORMALIZED by the trusted Evidence
+    Board, so comparing it to a candidate's raw columns would reject every
+    value that merely differs in case or separator. This assembles the
+    candidate's side under the same normalization, and it is what the promotion
+    gate compares against and what the durable pending-promotion
+    reconstruction joins on.
+
+    Mirrored in SQL by `public.catalog_candidate_identity_scope`; the two are
+    pinned together by `tests/test_catalog_migration_static.py` and compared
+    over a real vocabulary by `tests/test_migrations_postgres.py`.
+    """
+    scope = {name: normalize_field_key(str(value))
+             for name, value in sorted((identity_dimensions or {}).items())
+             if name in SHARED_IDENTITY_DIMENSIONS}
+    if official_model_code is not None:
+        scope["model_code"] = normalize_field_key(str(official_model_code))
+    if trim is not None:
+        scope["trim"] = normalize_field_key(str(trim))
+    return scope
+
+
+def record_locator_id(snapshot_key: str, upstream_record_id: str) -> str:
+    """The catalog's durable LOCATOR RECORD IDENTITY: one captured row.
+
+    The upstream id alone is NOT enough. It is unique within a snapshot and a
+    register reuses its number space across captures, so a locator built from
+    it alone would point at "row 36451" of no particular retrieval -- and two
+    different vehicles from two snapshots would share one durable locator.
+
+    Mirrored in SQL by `public.catalog_record_locator_id`, which
+    `20260916120000_catalog_field_level_promotion.sql` uses to refuse a promoted
+    fact whose evidence was read from a record other than the candidate's own.
+    """
+    return f"{snapshot_key}:{upstream_record_id}"
+
+
+def claim_entity_key(model_canonical_key: str, model_year: Any) -> str:
+    """The VEHICLE a catalog fact is about: one canonical model, at one year.
+
+    Keyed on the CANONICAL MODEL rather than on the source's own row id, so a
+    Government claim and a future Web claim about the same car share a scope
+    and can therefore conflict -- which is the point. Bounded by construction
+    (a 36-character model key, a colon and a year), which matters: a marque and
+    a commercial model together can exceed the 200-character bound on an entity
+    key, and truncating an identity is how two vehicles become one.
+
+    Mirrored in SQL by `public.catalog_claim_entity_key`.
+    """
+    return f"{model_canonical_key}:{model_year}"
+
+
+class _Absent:
+    """The distinct marker for "this payload states nothing here".
+
+    A singleton rather than `None`, because `None` is a value a nullable
+    canonical column can legitimately hold.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "ABSENT"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+ABSENT = _Absent()
+
+
+__all__ = ["ABSENT", "CANDIDATE_IDENTITY_DIMENSIONS", "CANDIDATE_STATUSES",
+           "MAX_PROMOTIONS_PER_RUN",
+           "CANONICAL_DIMENSION_PREFIX", "CANONICAL_OPTIONAL_FIELDS",
+           "CANONICAL_REQUIRED_FIELDS", "CANONICAL_VARIANT_FIELDS",
+           "MAX_CANONICAL_FIELDS", "canonical_field_value", "stated_canonical_fields",
            "CATALOG_SOURCE_FAMILIES", "CATALOG_TRUST_STATES",
            "CONTENT_SHA256_PATTERN", "IDEMPOTENCY_KEY_PATTERN",
            "MAX_RAW_PAYLOAD_CHARS", "MAX_RAW_RECORD_LOCATOR_CHARS",
            "MAX_RAW_RECORD_LOCATOR_POSITION", "MAX_RETRIEVAL_METADATA_CHARS",
-           "RAW_RECORD_LOCATOR_KEYS", "SNAPSHOT_VALIDATION_STATES", "TRUST_STATE_BY_FAMILY",
-           "is_evidence_family", "stated_identity_dimensions", "stated_source_locator",
-           "trust_state_for"]
+           "RAW_RECORD_LOCATOR_KEYS", "SHARED_IDENTITY_DIMENSIONS",
+           "SNAPSHOT_VALIDATION_STATES", "TRUST_STATE_BY_FAMILY",
+           "candidate_identity_scope", "claim_entity_key", "is_evidence_family",
+           "record_locator_id",
+           "stated_identity_dimensions", "stated_source_locator", "trust_state_for"]

@@ -87,6 +87,12 @@ GOVERNMENT_PROJECTION_REASONS: Mapping[str, str] = {
         "that government snapshot records no reading of its rows at all",
     "GOV_PROJECTION_SNAPSHOT_STATE_INVALID":
         "that government snapshot's recorded reading is malformed or disagrees with its rows",
+    # Catalog PR3: the database-side reader (`query.py`) collapses every
+    # repository refusal onto ONE static reason. The underlying message can
+    # quote SQL values, and a classification is what a caller of that layer is
+    # meant to receive.
+    "GOV_QUERY_UNAVAILABLE":
+        "the bounded government catalog query could not be answered",
 }
 
 #: The ONE refusal an explicit acknowledgement may bypass.
@@ -390,6 +396,87 @@ def _variant_sort_key(view: VariantView) -> tuple:
             view.candidate_key)
 
 
+def snapshot_usability(snapshot: Mapping[str, Any]) -> str | None:
+    """Why this snapshot may not answer a query, or None if it may.
+
+    Read from the snapshot's OWN durable metadata, and PARSED before it is
+    read -- so usability is a property of a state that was checked, not of two
+    fields that happened to look right.
+
+    Module level because Catalog PR3's database-side reader
+    (`backend/catalog/government/query.py`) applies the SAME gate. Two copies
+    of "which snapshot may answer" is exactly the drift that would let one
+    reader answer from a snapshot the other refuses.
+    """
+    metadata = snapshot.get("retrieval_metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    contract = metadata.get("normalization_contract")
+    if contract not in (RAW_ONLY_CONTRACT, NORMALIZATION_CONTRACT):
+        # No stated reading at all: a snapshot that cannot say what it is
+        # missing is not a snapshot this layer will answer from.
+        return "GOV_PROJECTION_SNAPSHOT_NOT_READ"
+    try:
+        state = parse_normalization_state(snapshot)
+    except GovernmentProjectionError as refusal:
+        return refusal.reason_code
+    if state.contract == RAW_ONLY_CONTRACT:
+        return "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED"
+    if state.issue_count > 0:
+        return "GOV_PROJECTION_SNAPSHOT_INCOMPLETE"
+    return None
+
+
+def require_usable_snapshot(snapshot: Mapping[str, Any], *, allow_incomplete: bool) -> None:
+    """Refuse a snapshot that may not answer, honouring the ONE acknowledgement."""
+    reason = snapshot_usability(snapshot)
+    if reason is None or (allow_incomplete and reason in ACKNOWLEDGEABLE_REFUSALS):
+        return
+    raise GovernmentProjectionError(reason)
+
+
+def resolve_active_snapshot(repository: Any, *, resource_id: str, snapshot_key: str | None,
+                            allow_incomplete: bool) -> Mapping[str, Any]:
+    """The snapshot a Government read answers from, or a refusal.
+
+    A PINNED key is resolved by an exact repository lookup, never by searching
+    the bounded newest-first listing: that listing exists to choose the newest
+    snapshot, and using it to resolve an explicit key made every active
+    snapshot older than the bound unreachable.
+
+    Without a pin, the newest USABLE snapshot answers. Usability is a property
+    of the snapshot's own durable state, so a newer capture that is
+    raw-complete but semantically incomplete does not displace the last usable
+    one -- it is skipped, and the refusal that would otherwise be returned
+    names the newest one's gap.
+
+    STATED LIMITATION: the unpinned search covers the BOUNDED listing, so a
+    usable snapshot sitting behind more than `MAX_CATALOG_SNAPSHOT_ROWS`
+    unusable ones is not found by it. That is deliberate -- an unbounded scan
+    is not a read this layer will perform -- and it is reachable by name
+    through the exact lookup above, which has no such bound.
+    """
+    if snapshot_key is not None:
+        pinned = repository.find_active_catalog_snapshot(
+            src.GOVERNMENT_SOURCE_FAMILY, resource_id, snapshot_key)
+        if pinned is None:
+            raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_UNKNOWN")
+        require_usable_snapshot(pinned, allow_incomplete=allow_incomplete)
+        return pinned
+    rows = repository.list_active_catalog_snapshots(
+        src.GOVERNMENT_SOURCE_FAMILY, resource_id=resource_id)
+    if not rows:
+        raise GovernmentProjectionError("GOV_PROJECTION_NO_ACTIVE_SNAPSHOT")
+    for row in rows:
+        if snapshot_usability(row) is None:
+            return row
+    # Every active snapshot in the listing is unusable. The NEWEST one is held
+    # to the rule, so the refusal names the state a reader would otherwise have
+    # been answered from -- and an acknowledgement reaches exactly that
+    # snapshot rather than an arbitrary older one.
+    require_usable_snapshot(rows[0], allow_incomplete=allow_incomplete)
+    return rows[0]
+
+
 class GovernmentCatalogProjection:
     """The bounded internal read over one active Government snapshot."""
 
@@ -415,74 +502,17 @@ class GovernmentCatalogProjection:
     def _active_snapshot(self) -> Mapping[str, Any]:
         """The snapshot this projection answers from, or a refusal.
 
-        A PINNED key is resolved by an exact repository lookup, never by
-        searching the bounded newest-first listing: that listing exists to
-        choose the newest snapshot, and using it to resolve an explicit key
-        made every active snapshot older than the bound unreachable.
-
-        Without a pin, the newest USABLE snapshot answers. Usability is a
-        property of the snapshot's own durable state (see `_usability`), so a
-        newer capture that is raw-complete but semantically incomplete does not
-        displace the last usable one -- it is skipped, and the refusal that
-        would otherwise be returned names the newest one's gap.
-
-        STATED LIMITATION: the unpinned search covers the BOUNDED listing, so a
-        usable snapshot sitting behind more than `MAX_CATALOG_SNAPSHOT_ROWS`
-        unusable ones is not found by it. That is deliberate -- an unbounded
-        scan is not a read this layer will perform -- and it is reachable by
-        name through the exact lookup above, which has no such bound.
+        One line, because the rule is `resolve_active_snapshot` above and is
+        shared verbatim with the database-side reader.
         """
-        if self._snapshot_key is not None:
-            pinned = self._repository.find_active_catalog_snapshot(
-                src.GOVERNMENT_SOURCE_FAMILY, self._resource_id, self._snapshot_key)
-            if pinned is None:
-                raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_UNKNOWN")
-            self._require_usable(pinned)
-            return pinned
-        rows = self._repository.list_active_catalog_snapshots(
-            src.GOVERNMENT_SOURCE_FAMILY, resource_id=self._resource_id)
-        if not rows:
-            raise GovernmentProjectionError("GOV_PROJECTION_NO_ACTIVE_SNAPSHOT")
-        for row in rows:
-            if self._usability(row) is None:
-                return row
-        # Every active snapshot in the listing is unusable. The NEWEST one is
-        # held to the rule, so the refusal names the state a reader would
-        # otherwise have been answered from -- and an acknowledgement reaches
-        # exactly that snapshot rather than an arbitrary older one.
-        self._require_usable(rows[0])
-        return rows[0]
+        return resolve_active_snapshot(self._repository, resource_id=self._resource_id,
+                                       snapshot_key=self._snapshot_key,
+                                       allow_incomplete=self._allow_incomplete)
 
-    @staticmethod
-    def _usability(snapshot: Mapping[str, Any]) -> str | None:
-        """Why this snapshot may not answer a query, or None if it may.
-
-        Read from the snapshot's OWN durable metadata, and PARSED before it is
-        read -- so usability is a property of a state that was checked, not of
-        two fields that happened to look right.
-        """
-        metadata = snapshot.get("retrieval_metadata")
-        metadata = metadata if isinstance(metadata, Mapping) else {}
-        contract = metadata.get("normalization_contract")
-        if contract not in (RAW_ONLY_CONTRACT, NORMALIZATION_CONTRACT):
-            # No stated reading at all: a snapshot that cannot say what it is
-            # missing is not a snapshot this layer will answer from.
-            return "GOV_PROJECTION_SNAPSHOT_NOT_READ"
-        try:
-            state = parse_normalization_state(snapshot)
-        except GovernmentProjectionError as refusal:
-            return refusal.reason_code
-        if state.contract == RAW_ONLY_CONTRACT:
-            return "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED"
-        if state.issue_count > 0:
-            return "GOV_PROJECTION_SNAPSHOT_INCOMPLETE"
-        return None
+    _usability = staticmethod(snapshot_usability)
 
     def _require_usable(self, snapshot: Mapping[str, Any]) -> None:
-        reason = self._usability(snapshot)
-        if reason is None or (self._allow_incomplete and reason in ACKNOWLEDGEABLE_REFUSALS):
-            return
-        raise GovernmentProjectionError(reason)
+        require_usable_snapshot(snapshot, allow_incomplete=self._allow_incomplete)
 
     def _load(self) -> tuple[DatasetProvenance, tuple[VariantView, ...],
                              Mapping[str, Mapping[str, Any]]]:
@@ -794,8 +824,15 @@ def _variant_view(candidate: Mapping[str, Any], record: Mapping[str, Any],
 
 __all__ = ["ACKNOWLEDGEABLE_REFUSALS", "DEFAULT_RESULT_ITEMS",
            "GOVERNMENT_PROJECTION_REASONS", "NormalizationState",
-           "parse_normalization_state",
+           "parse_normalization_state", "provenance_of", "require_usable_snapshot",
+           "resolve_active_snapshot", "snapshot_usability", "variant_sort_key",
            "MAX_PROJECTION_CANDIDATES", "MAX_RESULT_ITEMS", "UNMAPPED_FIELDS",
            "DatasetProvenance", "GovernmentCatalogProjection", "GovernmentProjectionError",
            "ManufacturerSummary", "ModelSummary", "ModelYearSummary", "RecordView",
            "ResultPage", "VariantResolution", "VariantView"]
+
+#: Public aliases for the two pure readers Catalog PR3's database-side query
+#: layer shares with this projection. Aliases rather than renames, so every
+#: existing call site and every PR2 test keeps reading exactly as it did.
+provenance_of = _provenance_of
+variant_sort_key = _variant_sort_key

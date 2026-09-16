@@ -20,6 +20,7 @@ Nothing here opens a connection, applies a migration or calls a provider.
 """
 
 import hashlib
+import inspect
 from uuid import UUID, uuid4
 
 import pytest
@@ -213,12 +214,15 @@ def test_the_rpc_name_is_a_literal_and_is_never_taken_from_the_payload(repo):
     assert {call[0] for call in repo.client.rpc_calls} <= {rpc for _, rpc, _ in CATALOG_WRITES}
 
 
-def test_the_repository_protocol_declares_the_catalog_methods_and_no_promotion():
-    """This round adds persistence corrections only.
+def test_the_repository_protocol_declares_the_catalog_methods_and_one_promotion():
+    """Catalog PR3 adds EXACTLY ONE canonical write path, and no other.
 
-    There is no promote/publish/canonical method, because there is nothing for
-    one to call: the canonical relations are read-only AND immutable in the
-    database until PR3 adds field-level provenance.
+    PR1 and its corrective round asserted here that no promotion method
+    existed at all, because the canonical relations were read-only and
+    immutable in the database. PR3 enables the insert -- and the shape of that
+    enabling is what this test now pins: there is ONE method, it is
+    lease-guarded like every other durable catalog write, and no second
+    canonical write, publish, seed or backfill entry point appeared beside it.
     """
     declared = set(Repository.__annotations__) | {name for name in dir(Repository)
                                                   if not name.startswith("_")}
@@ -226,11 +230,28 @@ def test_the_repository_protocol_declares_the_catalog_methods_and_no_promotion()
         assert method in declared, method
         assert hasattr(SupabaseRepository, method)
         assert hasattr(MemoryRepository, method)
-    forbidden = [name for name in dir(SupabaseRepository)
-                 if not name.startswith("_")
-                 and any(marker in name for marker in ("promote", "canonical_model",
-                                                       "publish_catalog", "seed_catalog"))]
-    assert forbidden == [], forbidden
+    assert "promote_catalog_variant" in declared
+    for implementation in (SupabaseRepository, MemoryRepository):
+        assert hasattr(implementation, "promote_catalog_variant")
+        assert hasattr(implementation, "get_canonical_catalog_variant")
+    # Every method whose NAME suggests it could write the canonical catalog,
+    # and the complete list of the ones that exist. A second one appearing is a
+    # test failure rather than a code review someone has to notice.
+    canonical_writers = sorted(
+        name for name in dir(SupabaseRepository)
+        if not name.startswith("_")
+        and any(marker in name for marker in ("promote", "publish_catalog", "seed_catalog",
+                                              "backfill")))
+    assert canonical_writers == ["promote_catalog_variant"], canonical_writers
+    # The canonical READS are reads: nothing named for the read model writes.
+    assert "insert" not in inspect.getsource(SupabaseRepository.get_canonical_catalog_variant)
+    # And the one writer is lease-guarded, exactly like every other durable
+    # catalog write: the four lease arguments are keyword-only and required.
+    signature = inspect.signature(SupabaseRepository.promote_catalog_variant)
+    for name in ("worker_id", "attempt", "lease_token"):
+        parameter = signature.parameters[name]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
 
 
 # =============================================================================
