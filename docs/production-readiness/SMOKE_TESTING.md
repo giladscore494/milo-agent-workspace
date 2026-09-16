@@ -82,5 +82,10 @@ Playwright E2E suite (`frontend/e2e`, mocked auth/worker/provider with
 gateway verification active and paid execution disabled) covers the
 browser-level equivalents: authenticated read flow, unauthorized
 rejection, proposal flow, idempotent run creation, cancellation, event
-polling, stale-UI prevention, worker-route isolation, launch-state UI and
-execution-disabled behavior.
+polling, stale-UI prevention, worker-route isolation, launch-state UI,
+execution-disabled behavior, and the Swarm V2 **final-result** surface —
+a terminal run whose product payload is built by the shipped
+`FinalBuilder`/`finalize_product_outcome` and mapped by the shipped
+`durable_run_status`, asserted for the usable / partial / empty outcomes,
+refresh reconstruction, mobile width, keyboard operation and the
+`vehicle_catalog_v1` control (see `docs/swarm-v2-final-result.md`).

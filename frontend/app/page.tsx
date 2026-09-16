@@ -10,6 +10,7 @@ import { ConversationView } from '@/components/conversation/ConversationView';
 import { TaskComposer } from '@/components/conversation/TaskComposer';
 import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector';
 import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
+import { FinalResultPanel } from '@/components/result/FinalResultPanel';
 import { CurrentRunPanel } from '@/components/run/CurrentRunPanel';
 import { RunOutputPanel } from '@/components/run/RunOutputPanel';
 import { SwarmRunCard } from '@/components/swarm/SwarmRunCard';
@@ -104,6 +105,13 @@ export default function WorkspacePage() {
   // execution UI switched off — keeps the existing CurrentRunPanel path.
   const swarmCardRunId =
     swarm.isSwarmV2 && executionUi && activeConversation !== undefined ? activeRunId : undefined;
+  // The Final Result surface is the product answer and is shown for Swarm V2
+  // only. It is gated exactly like the run card above — same trusted
+  // workflow_key, same execution flag, same conversation requirement — and
+  // stays mounted for the whole run, so its loading, not-finished, absent and
+  // invalid states are visible rather than appearing from nowhere.
+  const showFinalResult =
+    swarm.isSwarmV2 && executionUi && activeConversation !== undefined && activeRunId !== undefined;
 
   useEffect(() => {
     let mounted = true;
@@ -388,7 +396,18 @@ export default function WorkspacePage() {
             onKeepRunning={() => setConfirmingCancel(false)}
           />
         )}
-        <RunOutputPanel visible={executionUi && activeRunId !== undefined} output={state.run?.output} />
+        {/* Two surfaces, never both. Swarm V2 gets the typed final-result
+            contract; every other workflow keeps the existing sanitized-output
+            path unchanged. The choice comes from the project's trusted
+            workflow_key (via swarm.isSwarmV2), never from the payload. */}
+        <FinalResultPanel
+          visible={showFinalResult}
+          runId={activeRunId}
+          runStatus={runStatus}
+          connection={mode}
+          output={state.run?.output}
+        />
+        <RunOutputPanel visible={executionUi && activeRunId !== undefined && !swarm.isSwarmV2} output={state.run?.output} />
       </ConversationView>
     </WorkspaceShell>
   );

@@ -1,0 +1,326 @@
+{
+  "usable_result": {
+    "status": "complete",
+    "result_kind": "usable_result",
+    "fields": {
+      "fuel_type": [
+        {
+          "value": "plug-in hybrid",
+          "provenance": {
+            "claim_id": "claim-fuel",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "fuel_type",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ],
+      "horsepower_hp": [
+        {
+          "value": 302,
+          "provenance": {
+            "claim_id": "claim-hp-1",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "horsepower_hp",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        },
+        {
+          "value": 306,
+          "provenance": {
+            "claim_id": "claim-hp-2",
+            "source_id": "src-gov-2",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "horsepower_hp",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ]
+    },
+    "needs_review": []
+  },
+  "partial_result": {
+    "status": "partial_success",
+    "result_kind": "partial_result",
+    "fields": {
+      "fuel_type": [
+        {
+          "value": "plug-in hybrid",
+          "provenance": {
+            "claim_id": "claim-fuel",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "fuel_type",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ]
+    },
+    "needs_review": [
+      {
+        "field": "engine_displacement_cc",
+        "value": 2487,
+        "reason": "unresolved conflict",
+        "provenance": {
+          "claim_id": "claim-disp",
+          "source_id": "src-gov-2",
+          "run_id": "cccccccc-1111-4111-8111-000000000f04",
+          "task_id": "government_record_2026",
+          "scope": {
+            "entity": "toyota_rav4_phev",
+            "field": "engine_displacement_cc",
+            "geography": "IL",
+            "market": "IL",
+            "time_scope": {
+              "model_year": 2026
+            }
+          }
+        }
+      },
+      {
+        "task_id": "catalog_lookup",
+        "code": "R5_GOV_RECORD_AMBIGUOUS"
+      },
+      {
+        "task_id": "compile_report",
+        "code": "EVIDENCE_REQUIREMENTS_UNMET"
+      }
+    ]
+  },
+  "partial_task_failure_only": {
+    "status": "partial_success",
+    "result_kind": "partial_result",
+    "fields": {
+      "fuel_type": [
+        {
+          "value": "plug-in hybrid",
+          "provenance": {
+            "claim_id": "claim-fuel",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "fuel_type",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ]
+    },
+    "needs_review": [
+      {
+        "task_id": "catalog_lookup",
+        "code": "TASK_FAILED"
+      }
+    ]
+  },
+  "partial_coverage_gap_only": {
+    "status": "partial_success",
+    "result_kind": "partial_result",
+    "fields": {
+      "fuel_type": [
+        {
+          "value": "plug-in hybrid",
+          "provenance": {
+            "claim_id": "claim-fuel",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "fuel_type",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ]
+    },
+    "needs_review": [
+      {
+        "task_id": "compile_report",
+        "code": "EVIDENCE_REQUIREMENTS_UNMET"
+      }
+    ]
+  },
+  "partial_conflict_no_rows": {
+    "status": "partial_success",
+    "result_kind": "partial_result",
+    "fields": {
+      "fuel_type": [
+        {
+          "value": "plug-in hybrid",
+          "provenance": {
+            "claim_id": "claim-fuel",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "fuel_type",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ]
+    },
+    "needs_review": []
+  },
+  "partial_result_no_review_items": {
+    "status": "partial_success",
+    "result_kind": "partial_result",
+    "fields": {
+      "fuel_type": [
+        {
+          "value": "plug-in hybrid",
+          "provenance": {
+            "claim_id": "claim-fuel",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "fuel_type",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ]
+    },
+    "needs_review": []
+  },
+  "empty_optional_scope": {
+    "status": "complete",
+    "result_kind": "usable_result",
+    "fields": {
+      "fuel_type": [
+        {
+          "value": "plug-in hybrid",
+          "provenance": {
+            "claim_id": "claim-fuel",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "fuel_type",
+              "geography": "",
+              "market": "",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ]
+    },
+    "needs_review": []
+  },
+  "no_usable_result": {
+    "status": "partial_success",
+    "result_kind": "no_usable_result",
+    "fields": {},
+    "needs_review": [
+      {
+        "task_id": "catalog_lookup",
+        "code": "TASK_FAILED"
+      },
+      {
+        "code": "NO_USABLE_RESULT"
+      }
+    ]
+  },
+  "not_found": {
+    "status": "complete",
+    "result_kind": "not_found",
+    "fields": {},
+    "needs_review": []
+  },
+  "structured_value": {
+    "status": "complete",
+    "result_kind": "usable_result",
+    "fields": {
+      "dimensions": [
+        {
+          "value": {
+            "length_mm": 4600,
+            "width_mm": 1855,
+            "axles": [
+              {
+                "position": "front"
+              },
+              {
+                "position": "rear"
+              }
+            ]
+          },
+          "provenance": {
+            "claim_id": "claim-dims",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "dimensions",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ]
+    },
+    "needs_review": []
+  }
+}

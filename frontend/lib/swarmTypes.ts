@@ -11,6 +11,7 @@
  */
 
 import { EventId } from './eventId';
+import { humanizeKey } from './humanize';
 
 export type SwarmLifecyclePhase =
   | 'idle'
@@ -140,11 +141,10 @@ export function isSwarmV2Workflow(workflowKey?: string | null): boolean {
  *
  *     humanizeTaskId('catalog_health') === 'Catalog health'
  *
- * Separators become single spaces and the first character is upper-cased.
- * Nothing else is altered: no alias table, no dictionary, no model.
+ * The formatting itself lives in lib/humanize.ts, because the final-result
+ * surface humanises durable field keys with exactly the same rule. One
+ * implementation means a task id and a field key can never drift apart.
  */
 export function humanizeTaskId(taskId: string): string {
-  const spaced = String(taskId ?? '').replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
-  if (spaced === '') return String(taskId ?? '');
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+  return humanizeKey(taskId);
 }

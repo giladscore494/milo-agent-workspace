@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { PROJECT_ALPHA, PROJECT_BETA, apiToken, authHeaders, createConversation, loginViaUi } from './helpers';
+import { ALICE_PROJECTS, PROJECT_ALPHA, PROJECT_BETA, apiToken, authHeaders, createConversation, loginViaUi } from './helpers';
 
 // DISABLED stack: every execution flag is off. These tests prove the
 // default production posture end to end.
@@ -122,8 +122,11 @@ test('17. spoofed internal identity headers are ignored', async ({ request, base
   });
   expect(response.status()).toBe(200);
   const projects = await response.json();
-  // Identity is regenerated from the validated token: alice's project only.
-  expect(projects.map((p: { id: string }) => p.id)).toEqual([PROJECT_ALPHA]);
+  // Identity is regenerated from the validated token, so the answer is alice's
+  // memberships -- and never bob's, which is what the spoofed headers claimed.
+  const ids = projects.map((p: { id: string }) => p.id);
+  expect(ids).toEqual(ALICE_PROJECTS);
+  expect(ids).not.toContain(PROJECT_BETA);
 });
 
 test('27. sign-out removes access', async ({ page }) => {

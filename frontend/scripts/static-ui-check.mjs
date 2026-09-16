@@ -41,6 +41,12 @@ const reducer = readFileSync('lib/runReducer.ts', 'utf8');
 
 /** User-visible surfaces that must survive any refactor of the workspace. */
 const requiredUi = ['Projects', 'Conversations', 'Workflow proposal', 'Live run', 'Live event stream', 'Final artifacts', 'Agents', 'Workflow', 'Sources', 'Claims', 'Conflicts', 'Costs', 'Developer', 'forbidden', 'approved', 'active'];
+/**
+ * The F4 product surface. `Final result` is a DIFFERENT surface from `Final
+ * artifacts`: both markers are required, so the typed Swarm V2 result and the
+ * V1 sanitized-output path can never be collapsed into one panel by a refactor.
+ */
+const requiredFinalResult = ['Final result', 'Verified fields', 'Outstanding items', 'Result unavailable', 'parseFinalResult', 'Provenance'];
 /** Security and durable-contract behaviour that must stay wired into the UI. */
 const requiredSecurity = ['safeText', 'redactSecrets', 'milo.activeRun.', 'Run finished with status', 'aria-expanded', 'aria-controls'];
 const requiredReducer = ['some(e => e.id === event.id)', 'reconstructRun', 'tool_access_granted', 'source_recorded'];
@@ -49,10 +55,54 @@ const where = `${scanned.length} files under ${ROOTS.join(', ')}`;
 for (const item of requiredUi) {
   if (!ui.includes(item)) throw new Error(`Missing UI marker: ${item} (searched ${where})`);
 }
+for (const item of requiredFinalResult) {
+  if (!ui.includes(item)) throw new Error(`Missing final-result marker: ${item} (searched ${where})`);
+}
 for (const item of requiredSecurity) {
   if (!ui.includes(item)) throw new Error(`Missing UI security marker: ${item} (searched ${where})`);
 }
 for (const item of requiredReducer) {
   if (!reducer.includes(item)) throw new Error(`Missing reducer marker: ${item}`);
 }
+/**
+ * Strip comments so the construct scan below reads CODE, not prose.
+ *
+ * A doc comment that explains why a construct is forbidden must not itself
+ * trip the check — otherwise the only way to document the rule is to avoid
+ * naming the thing it forbids. Line comments are cut at `//` unless it is part
+ * of a scheme-relative or absolute URL (`https://`), which would otherwise
+ * swallow the rest of the line and could hide real code after it.
+ */
+function stripComments(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .split('\n')
+    .map((line) => {
+      const index = line.search(/(^|[^:])\/\//);
+      if (index < 0) return line;
+      return line.slice(0, line.indexOf('//', index));
+    })
+    .join('\n');
+}
+
+/**
+ * The final-result surface renders the CLOSED contract, never the payload.
+ * Serialising the durable payload into the markup, or injecting untrusted
+ * HTML, would reintroduce exactly the raw-output display F4 replaced, so
+ * either one in that directory is a hard failure.
+ */
+const FORBIDDEN_IN_FINAL_RESULT = ['JSON.stringify', 'dangerouslySetInnerHTML'];
+const finalResultSources = scanned.filter((file) => file.includes('components/result'));
+if (finalResultSources.length === 0) {
+  throw new Error('Static UI check found no final-result surface under components/result');
+}
+for (const file of finalResultSources) {
+  const code = stripComments(readFileSync(file, 'utf8'));
+  for (const forbidden of FORBIDDEN_IN_FINAL_RESULT) {
+    if (code.includes(forbidden)) {
+      throw new Error(`Forbidden construct ${forbidden} in final-result surface: ${file}`);
+    }
+  }
+}
+
 console.log(`Static UI/reducer coverage markers found (${where}).`);
