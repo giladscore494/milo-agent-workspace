@@ -246,6 +246,16 @@ a dimension's current value is read.
 | the vehicle identity scope | the claim's `identity_scope` keys are EXACTLY the candidate's (dimensions ∩ R4 vocabulary, plus `model_code` and `trim` when stated), and every value is the candidate's under the same normalization R4 stored it with |
 | the source-record locator | the locator's record component is `catalog_record_locator_id(<snapshot key>, <upstream record id>)` of the candidate's OWN captured row |
 
+**A consequence worth stating.** Because every fact about one variant is held
+to ONE identity scope, a later snapshot whose candidate states a dimension the
+first one did not — a drivetrain appearing where there was none — cannot revise
+that variant: its evidence is scoped to a narrower vehicle than the row. That is
+deliberate and it fails CLOSED. Whether the newly-specified vehicle is the same
+one is a reconciliation judgement with its own evidence requirement, not
+something a promotion may decide by writing it down; `reconcile_catalog` already
+reports it as `under_enriched`. Revising a dimension the candidate already
+stated — the fuel type the register corrected — works, and is tested.
+
 **One promotion is one leased act.** The evidence link, its source, its claim,
 its verdict and the provenance row must all name the run that holds the lease,
 and every field of one promotion shares its run, worker, attempt, candidate and
