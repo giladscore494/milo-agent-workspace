@@ -192,7 +192,7 @@ evidence** · **Test evidence** · **Deployment/activation evidence** ·
 | S1-10 | §1.8 | Bounded generic worker pool, dependency-ordered | `swarm_v2/executor.py`, `worker.py`; `worker/main.py:433-446` | `tests/test_swarm_v2.py`, `tests/test_swarm_v2_stage1_e2e.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S1-11 | §1.9 | Tool Registry as an allowlist with schema/scope/mode enforcement | `backend/tools/registry.py` (`ToolRegistry.execute` re-validates scope, mode, input and output) | `tests/test_swarm_v2_tool_contract.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S1-12 | §1.9 | Stage-1 mock tools for testing | `backend/tools/mock.py` | `tests/test_swarm_v2_tool_contract.py` | never registered in production (correct) | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
-| S1-13 | §1.10 | Every V2 durable evidence/tool write is lease-guarded | migration `20260823000100_lease_guarded_evidence_writes.sql`; `repository/supabase.py` `_guarded_rpc` | `tests/test_migrations_postgres.py::test_stale_worker_full_scenario_every_mutation_rejected` (real PostgreSQL) | **migration not applied remotely** (§2.3) | `COMPLETED_IN_CODE_NOT_ACTIVATED` | applied to the target database | `OPERATOR` | OPERATOR-1 | blocks all durable V2 evidence |
+| S1-13 | §1.10 | Every V2 durable evidence/tool write is lease-guarded | migration `20260823000100_lease_guarded_evidence_writes.sql`; `repository/supabase.py` `_guarded_rpc` | `tests/test_migrations_postgres.py::test_stale_worker_full_scenario_every_mutation_rejected` (real PostgreSQL) | **`20260823000100` IS applied remotely** (§2.3 — it is the newest migration in the remote history) | `COMPLETED_AND_CONNECTED` | none for the rule itself | `NONE` | none | the rule is deployed, but the R3 fragment and R4 verdict relations the current evidence path writes through (`20260828000200`, `20260902000100`, `20260907000100`) are **not** applied, so those writes fail closed today rather than bypassing the lease — tracked as CAT-01/OPS-01, not here |
 | S1-14 | §1.11 | Evidence Board on the existing sources/claims/conflicts | `swarm_v2/evidence.py` (`EvidenceBoard`, `WorkerLease`), constructed `worker/main.py:415-418` | `tests/test_swarm_v2_evidence.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S1-15 | §1.12 | Commander replanning loop with hard caps | `swarm_v2/commander.py`, `engine.py`, `validation.py` `PlanLimits` | `tests/test_swarm_v2.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S1-16 | §1.13 | Verifier issues structured verdicts; deterministic builder assembles the result | `swarm_v2/verifier.py`, `builder.py`, `outcome.py`; wired `worker/main.py:475-476` | `tests/test_swarm_v2_r4_deterministic_verification.py`, `tests/test_swarm_v2_outcome_contract.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
@@ -299,8 +299,8 @@ on the strength of a stated decision **and** a named successor — not on absenc
 
 | Status | Count | Where |
 | --- | ---: | --- |
-| `COMPLETED_AND_CONNECTED` | 32 | S1 ×16, S3 ×4, CAT ×3, FE ×7, OPS ×2 |
-| `COMPLETED_IN_CODE_NOT_ACTIVATED` | 20 | S1 ×2, S3 ×9, CAT ×6, FE ×1, OPS ×2 |
+| `COMPLETED_AND_CONNECTED` | 33 | S1 ×17, S3 ×4, CAT ×3, FE ×7, OPS ×2 |
+| `COMPLETED_IN_CODE_NOT_ACTIVATED` | 19 | S1 ×1, S3 ×9, CAT ×6, FE ×1, OPS ×2 |
 | `FIXTURE_ONLY` | 1 | S3-16 |
 | `REPLACED_BY_NEW_ARCHITECTURE` | 8 | S2 ×6, S3 ×2 |
 | `INTENTIONALLY_DEFERRED` | 3 | FE ×2, OPS ×1 |
@@ -491,7 +491,9 @@ code and its real caller:
   and ProviderScheduler, bounded worker pool, replanning, verifier, deterministic
   builder, versioned checkpoint/resume;
 - lease-guarded durable writes for every worker mutation, including the Evidence
-  Board (code — the enabling migration is not applied remotely);
+  Board — and `20260823000100`, the migration that enforces it, is the newest
+  migration the remote history records, so this one is deployed (the R3/R4
+  evidence relations it would guard are not; see §7);
 - one registered production tool, `catalog.government_vehicle`, read-only, one
   server-owned scope granted only in trusted wiring, eight bounded operations,
   no dump operation, no transport;
