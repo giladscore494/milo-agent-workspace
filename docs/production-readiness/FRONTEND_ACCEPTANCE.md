@@ -1,6 +1,6 @@
 # Frontend acceptance matrix — Stage F5
 
-**Tested tree:** `175bdd4b87d0c4abf2abc2de03cb3acfc3c1e225`
+**Tested tree:** `0fa1f66612dd5b030899f8ea8787b5893f0d07e2`
 **Base:** `0fdab212ce3c6277fa6d88502a4213401e1a3bcc` (merge of PR #89, Stage F4)
 
 Every local verification result recorded here was executed against that tree.
@@ -255,7 +255,7 @@ shape of problem. Twelve of the fifteen tests in
 
 ## Local verification results
 
-Executed on `175bdd4b87d0c4abf2abc2de03cb3acfc3c1e225`. Local unless marked.
+Executed on `0fa1f66612dd5b030899f8ea8787b5893f0d07e2`. Local unless marked.
 Backend commands need `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` set to the
 same offline placeholders CI uses, or `backend.config.Settings` refuses to load.
 
