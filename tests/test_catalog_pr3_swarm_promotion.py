@@ -1321,24 +1321,43 @@ def test_a_comparison_that_cannot_run_still_lands_the_capture_and_says_so(reposi
     ).dataset_metadata().snapshot_key == outcome.report.snapshot_key
 
 
-def test_no_production_entrypoint_schedules_this_refresh():
-    """The operation exists and is deliberately not activated."""
-    # The module and the package's own re-export are not entrypoints. Nothing
-    # ELSE in `backend/` names the operation -- so no worker, no adapter, no
-    # API route and no job can start one.
+def test_the_refresh_has_one_caller_and_no_schedule():
+    """The operation has exactly ONE caller, and it is not a schedule.
+
+    PR3 asserted that nothing called this at all. CODE-1 makes that false on
+    purpose: `backend/catalog/operator_capture.py` is the operator-invoked
+    entrypoint, which refuses by default, is gated on
+    `MILO_ENABLE_CATALOG_EXECUTION`, and runs the operation exactly once per
+    invocation. So the assertion becomes "one caller, and it is that one".
+
+    What is UNCHANGED is the half that matters operationally: no worker, no
+    adapter, no API route, no job, no script and no workflow starts a refresh.
+    A cron entry, a Cloud Scheduler job or a workflow step would still fail
+    here, which is what keeps "not scheduled" a property rather than a habit.
+    """
     owned = {"backend/catalog/government/refresh.py", "backend/catalog/government/__init__.py"}
+    callers = set()
     for path in sorted(Path("backend").rglob("*.py")):
         if str(path) in owned:
             continue
         text = path.read_text(encoding="utf-8")
-        assert "GovernmentCatalogRefresh" not in text, path
-        assert "sync_if_changed" not in text, path
+        if "GovernmentCatalogRefresh" in text or "sync_if_changed" in text:
+            callers.add(str(path))
+    assert callers == {"backend/catalog/operator_capture.py"}
+    # No script, no workflow and no job starts one.
     for path in sorted(Path("scripts").rglob("*")):
         if path.is_file() and path.suffix in (".py", ".sh", ".yaml", ".yml"):
             assert "sync_if_changed" not in path.read_text(encoding="utf-8", errors="ignore"), path
     for path in sorted(Path(".github/workflows").glob("*.yml")):
         assert "catalog" not in path.read_text(encoding="utf-8").lower() or \
             "sync_if_changed" not in path.read_text(encoding="utf-8")
+    # And the one caller invokes it from a single place: one capture per
+    # invocation, never a loop over the operation.
+    # `tests/test_catalog_operator_capture.py::test_the_entrypoint_creates_no_schedule`
+    # is the scheduling scan itself -- it reads that module's statements with
+    # the docstrings stripped, which this text search cannot do.
+    caller = Path("backend/catalog/operator_capture.py").read_text(encoding="utf-8")
+    assert caller.count(".sync_if_changed(") == 1
 
 
 # =============================================================================

@@ -7,6 +7,37 @@ after Catalog PR3 (#88), F4 (#89) and F5 (#90).
 
 ---
 
+> ## Completion note — added 2026-09-16, after CODE-2 (#92) and CODE-1
+>
+> **This audit is a dated, point-in-time observation and is not rewritten.**
+> Every finding below was true of the repository and of the evidence available
+> when it was written, and it stays as written. What follows records, with its
+> own date, which of its **code** gaps have since been closed **in code**. It
+> closes no external, state or authorization gap, and it changes no row's
+> historical reading.
+>
+> | Row | As audited | Since, in code | Still open |
+> | --- | --- | --- | --- |
+> | `S3-02a` / §1.4 — "no supported capture entrypoint exists" | `MISSING` | **closed by CODE-1**: `backend/catalog/operator_capture.py` is a guarded, operator-invoked entrypoint that constructs `HttpsDataGovTransport`, `DataGovClient` and the existing refresh/ingestion path, refuses by default and is gated on `MILO_ENABLE_CATALOG_EXECUTION` | **no live capture has been executed**; OPERATOR-0 then AUTH-1/OPERATOR-3 still gate one |
+> | `S3-04` — "CODE-1 must set and justify the page size" | `COMPLETED_IN_CODE_NOT_ACTIVATED`, page size unsettled | **settled**: the entrypoint requires `--page-limit 1000` explicitly, which is `MAX_PAGE_LIMIT` itself and gives `ceil(101000/1000) = 101 <= 200` pages | whether a 1 000-record page stays under `MAX_RESPONSE_BYTES` at real scale is **still unproven** and fails closed if it does not |
+> | `CAT-03` — "no caller" | `COMPLETED_IN_CODE_NOT_ACTIVATED` | **one caller now exists**, and it is the guarded entrypoint above | activation is unchanged |
+> | `CAT-11` / `CAT-13` / `OPS-09` | — | closed by CODE-2 (#92, merged `b1200680`) | operator alert binding (`OPERATOR-6`) |
+>
+> **Unchanged by either PR, and still exactly as audited:** `S3-02b` (whether a
+> durable snapshot exists in the target database is **not proven either way**),
+> `OPS-01` (`BLOCKED_EXTERNAL` — the deployed object state is unknown until
+> OPERATOR-0 reads it), `OPS-11` (no controlled-capture report exists), every
+> other `OPERATOR` and `AUTHORIZATION` row, and §15's stop conditions — none of
+> which a code change can satisfy. The recommendation in §14 stands: its code
+> half now has an entrypoint, and its state half is still unread.
+>
+> Current classifications live in
+> [`../production-readiness/FINAL_ACCEPTANCE.md`](../production-readiness/FINAL_ACCEPTANCE.md)
+> and the entrypoint's own contract in
+> [`../catalog-code1-operator-capture.md`](../catalog-code1-operator-capture.md).
+
+---
+
 ## 1. Executive conclusion
 
 The engine is built and connected. Nothing in this repository can fill the

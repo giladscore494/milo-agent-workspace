@@ -62,7 +62,29 @@ the worker job closes the catalog path ON ITS OWN, without stopping the product
 and without a code rollback. It is not part of the ordered escalation above: it
 is the NARROW response to a catalog-specific defect, and the exact command and
 its verification evidence are in [ROLLBACK.md](ROLLBACK.md). Disabling it
-deletes and mutates no catalog row.
+deletes and mutates no catalog row. The same flag closes the CODE-1 operator
+capture entrypoint, which refuses before opening a socket or a database
+connection while it is off.
+
+## Government capture signals (CODE-1)
+
+**The capture is operator-invoked and has no schedule**, so there is nothing to
+alert on until somebody runs it. As of 2026-09-16 none has been run. When one
+is (AUTH-1, after OPERATOR-0), the entrypoint's own sanitized report is the
+record — it is bounded, deterministic and carries no raw row, response body,
+URL, credential or lease material.
+
+| Signal | Where | Severity | Response |
+| --- | --- | --- | --- |
+| Exit status `2` with a `CAPTURE_*` reason | the entrypoint's stdout/stderr | LOW | a prerequisite refusal: nothing was constructed, nothing was contacted, nothing changed. Read the code and fix the invocation |
+| Exit status `1` with a `GOV_*` reason | the entrypoint's report | MEDIUM | the capture reached `data.gov.il` and was refused by a bound or a consistency check. No snapshot was activated; the previous one still answers |
+| `CAPTURE_LEASE_LOST` or `CAPTURE_CANCELLED` | the entrypoint's report | MEDIUM | the capture stopped mid-flight. Activation is the last step and is gated on complete persistence, so the snapshot is non-active and invisible to readers |
+| `CAPTURE_REPOSITORY_UNAVAILABLE` | the entrypoint's report | HIGH | a guarded catalog write or activation failed. An infrastructure failure, not a data outcome — restore the write path before re-running |
+| `activated: false` on a `changed` outcome | the entrypoint's report | HIGH | the capture was written in full and the database's completeness gate refused activation. Investigate before re-running; the snapshot is terminal and not activatable afterwards |
+| `normalization_issue_count` far above the previous capture's | the entrypoint's report | MEDIUM | the register's shape may have moved. The rows are durable either way; what changed is how many could be read into an identity |
+
+None of these is bound to an alerting system by this repository, exactly like
+the two catalog events above.
 
 ## Catalog signals — what the two events mean
 

@@ -56,7 +56,17 @@ construct no promotion pipeline. The capability is absent from trusted wiring,
 not merely hidden. Runs already in flight finish under the configuration they
 started with.
 
-**What it does NOT do.** It **deletes and mutates no catalog row**. Snapshots,
+**It also closes the capture entrypoint.** The same flag gates CODE-1's
+operator capture entrypoint (`backend/catalog/operator_capture.py`): with it
+off, unset, empty or malformed, an invocation refuses before constructing a
+transport or a repository, so no request reaches `data.gov.il`, no run is
+claimed, and nothing is captured, ingested or activated. There is no separate
+catalog switch to set. A capture already in flight is not killed by this — it
+holds a lease and finishes or fails on its own terms; stopping one in progress
+is a run cancellation, after which activation cannot occur.
+
+**What it does NOT do.** It prevents the NEXT capture and undoes no previous
+one. It **deletes and mutates no catalog row**. Snapshots,
 raw records, candidates, evidence links and canonical variants are left exactly
 as they are — this is a switch on future work, never a cleanup. Re-enabling it
 (a separate, explicitly authorized decision) resumes from the same durable

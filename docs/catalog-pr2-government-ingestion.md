@@ -1,5 +1,7 @@
 # Catalog PR2 — deterministic Government ingestion
 
+> **Update, 2026-09-16 (CODE-1).** A caller now exists. `backend/catalog/operator_capture.py` is a guarded, operator-invoked entrypoint that constructs `HttpsDataGovTransport`, `DataGovClient` at `page_limit=1000` and the existing refresh/ingestion path. It refuses by default, is gated on `MILO_ENABLE_CATALOG_EXECUTION`, has no schedule and changes none of the logic described below. **No live capture has been executed.** See [catalog-code1-operator-capture.md](catalog-code1-operator-capture.md).
+
 > **Superseded in part by Catalog PR3.** Everything below describes what PR2
 > established and remains accurate about the CAPTURE path. Three statements are
 > no longer true of `main`: the production `ToolRegistry` is no longer empty
