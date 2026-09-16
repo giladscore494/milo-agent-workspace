@@ -1,4 +1,5 @@
 import { createClient, type Session, type SupabaseClient } from '@supabase/supabase-js';
+import { AuthFailure, type AuthFailureReason } from './errorText';
 
 export type SupabaseSession = Session;
 
@@ -35,11 +36,26 @@ export function isSessionExpired(session: SupabaseSession | null | undefined): b
   return session.expires_at * 1000 <= Date.now() + 30_000;
 }
 
+/**
+ * Turn a Supabase error into a classification this application owns.
+ *
+ * The SDK's `message` is upstream prose about an upstream system and never
+ * reaches the screen (`lib/errorText.ts`). Only its HTTP status is read, and
+ * only to choose which locally authored sentence the user sees.
+ */
+function authFailureFrom(error: { status?: number } | null | undefined): AuthFailure {
+  const status = typeof error?.status === 'number' ? error.status : undefined;
+  let reason: AuthFailureReason = 'unavailable';
+  if (status === 400 || status === 401 || status === 422) reason = 'invalid_credentials';
+  else if (status === 429) reason = 'rate_limited';
+  return new AuthFailure(reason);
+}
+
 export async function getCurrentSession(): Promise<SupabaseSession | null> {
   const supabase = getSupabaseBrowserClient();
   if (!supabase) return null;
   const { data, error } = await supabase.auth.getSession();
-  if (error) throw new Error(error.message);
+  if (error) throw authFailureFrom(error);
   const session = data?.session ?? null;
   return isSessionExpired(session) ? null : session;
 }
@@ -64,11 +80,11 @@ export function onAuthStateChange(
 
 export async function signInWithSupabase(email: string, password: string): Promise<SupabaseSession> {
   const supabase = getSupabaseBrowserClient();
-  if (!supabase) throw new Error('Supabase auth is not configured.');
+  if (!supabase) throw new AuthFailure('not_configured');
   const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) throw new Error(error.message);
+  if (error) throw authFailureFrom(error);
   const session = data?.session ?? null;
-  if (isSessionExpired(session) || !session) throw new Error('Supabase session is expired.');
+  if (isSessionExpired(session) || !session) throw new AuthFailure('expired');
   return session;
 }
 
@@ -76,5 +92,5 @@ export async function signOutFromSupabase(): Promise<void> {
   const supabase = getSupabaseBrowserClient();
   if (!supabase) return;
   const { error } = await supabase.auth.signOut();
-  if (error) throw new Error(error.message);
+  if (error) throw authFailureFrom(error);
 }

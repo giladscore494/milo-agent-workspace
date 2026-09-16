@@ -115,10 +115,19 @@ describe('terminal run contract', () => {
 
 describe('run.usage is authoritative', () => {
   it('U. run.usage wins over anything an event stream might suggest', () => {
-    // A stream that carries token-shaped payload keys the V1 projection sums.
+    // Two streams that both carry token-shaped payload keys.
+    //
+    // `agent_progress` is an agent-owned V1 type, so it DOES contribute to the
+    // event-derived developer telemetry — and that total is still not the
+    // run's usage, which is the point of this test.
+    //
+    // `budget_warning` is a RUN-level type. It owns no agent and no spend, so
+    // its token-shaped payload contributes nothing at all: the stream can no
+    // longer even suggest a total there.
     const events: RunEvent[] = [
       ...smokeEventStream(),
-      { id: '900', run_id: SMOKE_RUN_ID, event_type: 'budget_warning', payload: { tokens: 999_999, cost_usd: 5 } },
+      { id: '900', run_id: SMOKE_RUN_ID, event_type: 'agent_progress', agent: 'researcher', payload: { tokens: 999_999, cost_usd: 5 } },
+      { id: '901', run_id: SMOKE_RUN_ID, event_type: 'budget_warning', payload: { tokens: 42_000_000, cost_usd: 9_000 } },
     ];
     const state = events.reduce(reduceRunEvent, initialWorkspaceState);
     const vm = buildSwarmRunViewModel({
@@ -126,8 +135,10 @@ describe('run.usage is authoritative', () => {
       swarm: state.swarm,
       workflowKey: 'swarm_v2',
     });
-    // The V1 event-derived totals exist but are not the run's usage.
+    // The V1 event-derived totals exist but are not the run's usage…
     expect(state.tokens).toBe(999_999);
+    // …and the run-level event contributed nothing to them.
+    expect(state.tokens).not.toBe(999_999 + 42_000_000);
     expect(vm.usage.totalTokens).toBe(10_370);
     expect(vm.usage.actualCost).toBeCloseTo(0.019178, 6);
     expect(vm.usage.modelCalls).toBe(7);

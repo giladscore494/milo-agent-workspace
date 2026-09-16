@@ -1,104 +1,164 @@
 import { ApiError } from './api';
-import { REDACTED, redactSecretText } from './sanitize';
 
 /**
- * Safe user-facing error classification.
+ * Safe user-facing error presentation — a CLOSED, application-owned policy.
  *
- * This is a FOURTH distinct concept, and the other three do not substitute for
+ * This is a fourth distinct boundary, and the other three do not substitute for
  * it:
  *
  *  - HTML/text escaping (`safeText`) stops markup from becoming markup. It
- *    happily prints a credential;
+ *    happily prints a credential, a hostname or a stack frame;
  *  - structured validation (`parseFinalResult`) decides which SHAPES may be
  *    rendered. An error string has no shape to validate;
  *  - redaction (`redactSecretText`) removes credential-shaped substrings. It
- *    leaves an internal hostname, a stack frame or a provider diagnostic
+ *    leaves `OpenRouter upstream quota exhausted for provider account`
  *    perfectly readable.
  *
- * What is left is the question this module answers: is this text something a
- * product surface may show a user at all? The workspace reads its message from
- * whatever the gateway, the API or the Supabase client handed back, and those
- * are operational surfaces. An upstream that one day widens a message — a
- * provider error passed through, an exception string, a private URL — must not
- * silently become browser output.
+ * ## Why "looks harmless" is not authorization
  *
- * So a message is shown only when it survives, in order:
+ * The first version of this module asked whether a message LOOKED unsafe — did
+ * it carry a credential, a URL, a stack frame, markup — and displayed anything
+ * that did not. That inverts the burden. The workspace reads its message from
+ * whatever the gateway, the API or the Supabase SDK handed back, and those are
+ * operational surfaces owned by other systems. A provider quota message, a
+ * PostgREST pool error and a Cloud Run diagnostic all pass a "looks harmless"
+ * test while telling the user about infrastructure they do not operate, in
+ * words nobody here wrote.
  *
- *  1. redaction. If redaction FIRED, the raw text contained credential-shaped
- *     material, and a partially-masked operational string is not worth showing:
- *     the whole message is replaced. Over-replacement is the safe direction;
- *  2. a marker scan for shapes a product message never legitimately has — a
- *     URL or scheme, a stack frame, markup;
- *  3. normalisation: control characters and newlines collapse to spaces and the
- *     result is bounded, so no error can reflow or flood the surface.
+ * So no upstream text is ever rendered. Not `ApiError.message`, not
+ * `Error.message`. What the surface shows is:
  *
- * Anything that fails becomes the caller's own fallback — a static sentence the
- * caller authored for that action, which keeps the error ACTIONABLE ("Run
- * creation failed.") rather than degrading to a single generic string.
+ *  1. copy authored HERE for a classification allowlisted BY VALUE, or
+ *  2. the caller's own static fallback sentence for the action that failed,
  *
- * The CODE is treated separately and kept, because it is what makes an error
- * actionable across a support boundary. It is allowlisted by SHAPE, not by
- * value: a short SCREAMING_SNAKE token, which every `AppError` code and every
- * `HTTP_<status>` fallback already is, and which cannot carry a sentence.
+ * plus the classification code when it is one of ours, because a short stable
+ * token is what makes an error actionable across a support boundary.
+ *
+ * A SCREAMING_SNAKE shape is not a classification. `REPOSITORY_ERROR` has that
+ * shape and means "something inside the server went wrong"; it earns the
+ * caller's fallback, not a sentence of its own.
+ *
+ * ## Consequence, stated plainly
+ *
+ * An upstream message that would have been genuinely useful and is not on the
+ * list below is replaced by the caller's fallback. That is the intended
+ * direction: adding a classification is a deliberate edit here, next to the
+ * copy a user will read, rather than a decision made by whatever system
+ * happened to produce the string.
  */
 
-const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]{1,63}$/;
+/**
+ * Application error classifications the product surfaces, with the copy it
+ * shows for each. Allowlisted BY VALUE.
+ *
+ * Every key is a real code from `backend/errors.py` / `backend/main.py` or a
+ * `HTTP_<status>` classification `lib/api.ts` synthesises when the gateway
+ * answers with its own body. Codes deliberately absent — `REPOSITORY_ERROR`,
+ * `ENGINE_FAILED`, `RUN_TRANSITION_CONFLICT`, every `CATALOG_*`, every
+ * `*_AUTH_*` — are internal conditions with nothing actionable to say to a
+ * person using the workspace.
+ */
+const ERROR_COPY: ReadonlyMap<string, string> = new Map([
+  // Staged activation. The single most common thing a user will hit, and the
+  // one they most need explained rather than blamed for.
+  ['EXECUTION_SURFACE_DISABLED', 'This action is turned off at the current activation stage.'],
 
-/** The longest message the surface will print. Roughly two lines. */
-export const MAX_ERROR_MESSAGE_LENGTH = 240;
+  // Launch lifecycle. `JOB_LAUNCH_UNKNOWN` must say what it means without
+  // trusting the upstream sentence: the run is parked and nothing retries it.
+  ['JOB_LAUNCH_UNKNOWN', 'The worker launch outcome is unknown, so the run is parked for operator reconciliation. It will not be relaunched automatically.'],
+  ['JOB_LAUNCH_FAILED', 'The worker could not be started. The run is still queued and the same request can be retried.'],
 
-const UNSAFE_MESSAGE_MARKERS: readonly RegExp[] = [
-  // Any URL or scheme: internal hostnames, Cloud Run URLs, Supabase endpoints.
-  /[a-z][a-z0-9+.-]*:\/\//i,
-  // Stack traces, both runtimes.
-  /traceback \(most recent call last\)/i,
-  /\bat\s+[\w$.<>]+\s*\(/,
-  /\bFile\s+"[^"]+",\s+line\s+\d+/,
-  // Markup: never legitimate in a product error message.
-  /<\s*[a-z!/]/i,
-];
+  // Idempotency and concurrency.
+  ['IDEMPOTENCY_CONFLICT', 'That submission was already used with different content. Start a new one.'],
+  ['USER_CONCURRENCY_LIMIT', 'You already have as many runs in flight as this stage allows. Wait for one to finish.'],
+  ['PROJECT_CONCURRENCY_LIMIT', 'This project already has as many runs in flight as this stage allows.'],
 
-const CONTROL_CHARACTERS = new RegExp('[\\x00-\\x1f\\x7f]+', 'g');
+  // Budgets.
+  ['DAILY_USER_BUDGET_REACHED', 'Your daily budget for this stage is used up.'],
+  ['DAILY_PROJECT_BUDGET_REACHED', "This project's daily budget for this stage is used up."],
 
-function normalizeWhitespace(text: string): string {
-  // Control characters (including newlines and tabs) collapse to one space, so
-  // a multi-line operational dump cannot reflow the surface it lands in.
-  return text.replace(CONTROL_CHARACTERS, ' ').replace(/\s{2,}/g, ' ').trim();
+  // Rate limiting, from the API and from the gateway.
+  ['RATE_LIMITED', 'Too many requests. Wait a moment and try again.'],
+  ['RATE_LIMITER_UNAVAILABLE', 'The request was refused because the shared rate limiter is unavailable. Try again shortly.'],
+  ['HTTP_429', 'Too many requests. Wait a moment and try again.'],
+
+  // Run and proposal lifecycle.
+  ['RUN_ALREADY_FINISHED', 'That run has already finished.'],
+  ['PROPOSAL_NOT_APPROVABLE', 'This proposal cannot be approved in its current state.'],
+  ['PROPOSAL_NOT_APPROVED', 'This proposal has not been approved.'],
+
+  // Authorization and existence, which the backend deliberately conflates so
+  // that a non-member cannot tell one from the other. The copy conflates them
+  // too, on purpose.
+  ['PROJECT_NOT_FOUND', 'That project is not available to your account.'],
+  ['CONVERSATION_NOT_FOUND', 'That conversation is not available to your account.'],
+  ['RUN_NOT_FOUND', 'That run is not available to your account.'],
+  ['WORKFLOW_PROPOSAL_NOT_FOUND', 'That proposal is not available to your account.'],
+  ['AUTHENTICATION_REQUIRED', 'Your session is no longer valid. Sign in again.'],
+  ['HTTP_401', 'Your session is no longer valid. Sign in again.'],
+  ['HTTP_403', 'That action is not permitted for your account at this stage.'],
+  ['HTTP_404', 'That item is not available to your account.'],
+]);
+
+/**
+ * Classifications whose CODE may be shown beside the copy.
+ *
+ * The authored set above, minus the `HTTP_*` classifications — those are an
+ * artifact of how `lib/api.ts` labels a gateway body, not a code anyone can
+ * look up, so showing one would suggest a support handle that does not exist.
+ */
+function codeIsDisplayable(code: string): boolean {
+  return ERROR_COPY.has(code) && !code.startsWith('HTTP_');
 }
 
 /**
- * Return `raw` when it is safe to show, otherwise `undefined`.
- * Exported for direct testing: the decision is the security boundary.
+ * Why a sign-in attempt failed, as a classification this application owns.
+ *
+ * `lib/supabaseClient.ts` raises this instead of re-throwing the SDK's own
+ * `Error`, so an authentication failure stays understandable without any
+ * Supabase prose reaching the screen.
  */
-export function classifyErrorMessage(raw: unknown): string | undefined {
-  if (typeof raw !== 'string') return undefined;
-  const redacted = redactSecretText(raw);
-  // Redaction fired: the raw string held credential-shaped material, so the
-  // whole message is suspect rather than merely partly masked.
-  if (redacted.includes(REDACTED)) return undefined;
-  const normalized = normalizeWhitespace(redacted);
-  if (normalized === '') return undefined;
-  for (const marker of UNSAFE_MESSAGE_MARKERS) {
-    if (marker.test(normalized)) return undefined;
+export type AuthFailureReason = 'invalid_credentials' | 'rate_limited' | 'unavailable' | 'not_configured' | 'expired';
+
+export class AuthFailure extends Error {
+  constructor(public readonly reason: AuthFailureReason) {
+    super(reason);
+    this.name = 'AuthFailure';
   }
-  return normalized.length > MAX_ERROR_MESSAGE_LENGTH
-    ? `${normalized.slice(0, MAX_ERROR_MESSAGE_LENGTH - 1)}…`
-    : normalized;
 }
 
-/** Return `code` when it is an allowlisted shape, otherwise `undefined`. */
-export function classifyErrorCode(code: unknown): string | undefined {
-  return typeof code === 'string' && SAFE_ERROR_CODE.test(code) ? code : undefined;
+const AUTH_COPY: Readonly<Record<AuthFailureReason, string>> = {
+  invalid_credentials: 'That email and password combination was not accepted.',
+  rate_limited: 'Too many sign-in attempts. Wait a moment and try again.',
+  unavailable: 'Sign-in is temporarily unavailable. Try again shortly.',
+  not_configured: 'Sign-in is not configured for this deployment.',
+  expired: 'Your session has expired. Sign in again.',
+};
+
+/** The classification an error carries, or `undefined` when it has none. */
+export function classifyError(error: unknown): string | undefined {
+  if (error instanceof AuthFailure) return undefined; // handled by its own copy
+  if (error instanceof ApiError && typeof error.code === 'string' && ERROR_COPY.has(error.code)) {
+    return error.code;
+  }
+  return undefined;
 }
 
 /**
  * The one text an error surface may render.
  *
- * `fallback` is the caller's own static sentence for the action that failed and
- * is used whenever the upstream text does not survive classification.
+ * `fallback` is the caller's own static sentence for the action that failed. It
+ * is used whenever the error carries no classification this application
+ * authored copy for — which includes every plain `Error`, every unknown code,
+ * and every provider, repository or internal failure.
  */
 export function safeErrorText(error: unknown, fallback: string): string {
-  const message = classifyErrorMessage(error instanceof Error ? error.message : undefined) ?? fallback;
-  const code = error instanceof ApiError ? classifyErrorCode(error.code) : undefined;
-  return code ? `${message} (${code})` : message;
+  if (error instanceof AuthFailure) return AUTH_COPY[error.reason] ?? fallback;
+  const code = classifyError(error);
+  if (code === undefined) return fallback;
+  const copy = ERROR_COPY.get(code) ?? fallback;
+  return codeIsDisplayable(code) ? `${copy} (${code})` : copy;
 }
+
+/** The classifications this application authors copy for. Exported for tests. */
+export const CLASSIFIED_ERROR_CODES: readonly string[] = [...ERROR_COPY.keys()];

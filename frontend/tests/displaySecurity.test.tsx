@@ -156,7 +156,10 @@ describe('the inspector and the V1 output path stay redacted', () => {
         payload: { id: 'claim-1', value: API_KEY_SENTINEL },
       },
       {
-        id: 2, run_id: RUN_ID, event_type: 'validation_error', message: 'bad',
+        // A REAL backend event type (backend/runtime.py EVENT_TYPES). The
+        // reducer only projects types on that allowlist, so a made-up type
+        // would prove nothing about the production path.
+        id: 2, run_id: RUN_ID, event_type: 'agent_failed', message: 'bad', agent: 'researcher',
         payload: { detail: `authorization: Bearer ${API_KEY_SENTINEL}` },
       },
     ]);

@@ -4,12 +4,15 @@ import { api, executionUiEnabled, newIdempotencyKey } from '@/lib/api';
 import { safeErrorText } from '@/lib/errorText';
 import {
   INITIAL_WORKSPACE_SCOPE,
+  PendingRequest,
   WorkspaceScope,
+  beginPending,
   nextSessionScope,
   ownsConversation,
   ownsProject,
   ownsRun,
   ownsSession,
+  settlePending,
   withConversation,
   withProject,
   withRun,
@@ -124,19 +127,21 @@ export default function WorkspacePage() {
   const [conversations, setConversations] = useState<Conversation[]>();
   const [activeConversation, setActiveConversation] = useState<Conversation>();
   const [conversationError, setConversationError] = useState('');
-  const [creatingConversation, setCreatingConversation] = useState(false);
+  const [creatingConversation, setCreatingConversation] = useState<PendingRequest>();
 
   const [proposalOpen, setProposalOpen] = useState(false);
   const [proposalRequest, setProposalRequest] = useState('');
   const [proposal, setProposal] = useState<Proposal>();
   const [proposalError, setProposalError] = useState('');
-  const [proposalBusy, setProposalBusy] = useState(false);
+  const [proposalBusy, setProposalBusy] = useState<PendingRequest>();
 
   const [taskContent, setTaskContent] = useState('');
   const [runError, setRunError] = useState('');
-  const [submittingRun, setSubmittingRun] = useState(false);
+  const [submittingRun, setSubmittingRun] = useState<PendingRequest>();
   const [activeRunId, setActiveRunId] = useState<string>();
-  const idempotencyKey = useRef<string>();
+  // One key per LOGICAL submission: this session, this conversation, this
+  // content. A key held for a different one is not a retry of this one.
+  const idempotencyKey = useRef<{ key: string; owner: WorkspaceScope; content: string }>();
 
   const [cancelReason, setCancelReason] = useState('');
   const [confirmingCancel, setConfirmingCancel] = useState(false);
@@ -259,6 +264,12 @@ export default function WorkspacePage() {
       setTaskContent('');
       setConfirmingCancel(false);
       setCancelReason('');
+      // The replacement owner inherits no busy state. An old request settling
+      // afterwards cannot clear the new owner's, because `settlePending`
+      // compares request identity, not truthiness.
+      setCreatingConversation(undefined);
+      setProposalBusy(undefined);
+      setSubmittingRun(undefined);
       idempotencyKey.current = undefined;
       if (!session) return;
     }
@@ -331,8 +342,9 @@ export default function WorkspacePage() {
   async function createConversation() {
     if (!selectedProject || creatingConversation) return;
     const owner = scope.current;
+    const pending = beginPending(owner);
     setConversationError('');
-    setCreatingConversation(true);
+    setCreatingConversation(pending);
     try {
       const conversation = await api.createConversation(selectedProject.id, conversationTitle.trim() || undefined);
       // The conversation was created and is safe on the server. It simply does
@@ -345,7 +357,8 @@ export default function WorkspacePage() {
       if (!ownsProject(owner, scope.current)) return;
       setConversationError(safeErrorText(error, 'Failed to create the conversation.'));
     } finally {
-      setCreatingConversation(false);
+      // Only THIS request may clear the busy state it set.
+      setCreatingConversation(current => settlePending(current, pending));
     }
   }
 
@@ -356,7 +369,8 @@ export default function WorkspacePage() {
    */
   async function runProposalRequest(request: Promise<Proposal>, fallback: string) {
     const owner = scope.current;
-    setProposalBusy(true);
+    const pending = beginPending(owner);
+    setProposalBusy(pending);
     setProposalError('');
     try {
       const next = await request;
@@ -366,7 +380,7 @@ export default function WorkspacePage() {
       if (!ownsProject(owner, scope.current)) return;
       setProposalError(safeErrorText(error, fallback));
     } finally {
-      setProposalBusy(false);
+      setProposalBusy(current => settlePending(current, pending));
     }
   }
 
@@ -395,17 +409,37 @@ export default function WorkspacePage() {
     if (!activeConversation || submittingRun || !taskContent.trim()) return;
     const owner = scope.current;
     const conversationId = activeConversation.id;
-    setSubmittingRun(true);
+    const content = taskContent.trim();
+    const pending = beginPending(owner);
+    setSubmittingRun(pending);
     setRunError('');
-    // One key per logical submission: a retry after failure reuses it, so
-    // the backend returns the original run instead of creating a duplicate.
-    idempotencyKey.current ??= newIdempotencyKey();
-    try {
-      const created = await api.startRun(conversationId, taskContent.trim(), idempotencyKey.current);
+    // One key per logical submission, and a submission is (this session, this
+    // conversation, this content). A retry after a failure reuses the key, so
+    // the backend returns the original run instead of creating a duplicate; a
+    // key held for a DIFFERENT submission is dropped rather than reused,
+    // because replaying it would either cross a session boundary or collide
+    // with the backend's own idempotency conflict.
+    const held = idempotencyKey.current;
+    if (held && (!ownsConversation(held.owner, owner) || held.content !== content)) {
       idempotencyKey.current = undefined;
-      // The run exists and belongs to the conversation it was created for, so
-      // it is stored under THAT key whichever conversation is selected now.
+    }
+    idempotencyKey.current ??= { key: newIdempotencyKey(), owner, content };
+    const submission = idempotencyKey.current;
+    try {
+      const created = await api.startRun(conversationId, content, submission.key);
+      // OWNERSHIP BEFORE ANY DURABLE BROWSER-SIDE WRITE. Session storage
+      // survives this component, so a response belonging to a session that no
+      // longer owns the page must store nothing and activate nothing — sign-out
+      // already cleared these keys and this answer may not put one back.
+      if (!ownsSession(owner, scope.current)) return;
+      // Only the session that issued the key may retire it.
+      if (idempotencyKey.current === submission) idempotencyKey.current = undefined;
+      // Same session: the run exists and belongs to the conversation it was
+      // created for, so it is stored under THAT key whichever conversation is
+      // selected now.
       storeRunId(conversationId, created.run_id);
+      // …but it only becomes the ACTIVE run if that conversation is still the
+      // one on screen.
       if (!ownsConversation(owner, scope.current)) return;
       changeActiveRun(created.run_id);
       setTaskContent('');
@@ -413,7 +447,7 @@ export default function WorkspacePage() {
       if (!ownsConversation(owner, scope.current)) return;
       setRunError(safeErrorText(error, 'Run creation failed.'));
     } finally {
-      setSubmittingRun(false);
+      setSubmittingRun(current => settlePending(current, pending));
     }
   }
 
@@ -468,7 +502,7 @@ export default function WorkspacePage() {
           conversationTitle={conversationTitle}
           onConversationTitleChange={setConversationTitle}
           onCreateConversation={createConversation}
-          creatingConversation={creatingConversation}
+          creatingConversation={creatingConversation !== undefined}
           onLogout={logout}
         />
       }
@@ -494,7 +528,7 @@ export default function WorkspacePage() {
             content={taskContent}
             onContentChange={setTaskContent}
             onSubmit={startRun}
-            submitting={submittingRun}
+            submitting={submittingRun !== undefined}
             error={runError}
           />
         }
@@ -509,7 +543,7 @@ export default function WorkspacePage() {
           onRequestChange={setProposalRequest}
           proposal={proposal}
           error={proposalError}
-          busy={proposalBusy}
+          busy={proposalBusy !== undefined}
           onGenerate={generateProposal}
           onRevise={reviseProposal}
           onDecide={decideProposal}

@@ -105,7 +105,11 @@ test('F5-L2. the browser shows a safe error, then that reconciliation is require
   // `role="alert"` route announcer in the document at all times.
   const alert = page.locator('p.alert[role="alert"]');
   await expect(alert).toContainText('JOB_LAUNCH_UNKNOWN');
-  await expect(alert).toContainText('parked for reconciliation');
+  // The MEANING is preserved from copy authored in lib/errorText.ts, not
+  // repeated from the API's own sentence — which the surface never shows.
+  await expect(alert).toContainText('parked for operator reconciliation');
+  await expect(alert).toContainText('will not be relaunched automatically');
+  await expect(alert).not.toContainText('worker launch outcome is unknown; the run is parked');
   await expect(page.locator('body')).not.toContainText('Traceback');
 
   // The user retries explicitly. Same content, same idempotency key, so the

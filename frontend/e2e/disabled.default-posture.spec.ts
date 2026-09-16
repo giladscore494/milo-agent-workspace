@@ -17,7 +17,11 @@ test('2. invalid login is rejected', async ({ page }) => {
   await page.getByLabel('Email').fill('alice@example.com');
   await page.getByLabel('Password').fill('wrong-password');
   await page.getByRole('button', { name: 'Login' }).click();
-  await expect(page.getByText('Invalid login credentials')).toBeVisible();
+  // The Supabase SDK's own sentence ("Invalid login credentials") is upstream
+  // prose about an upstream system. The user sees OUR copy for the same
+  // classification, and the SDK's words never reach the page.
+  await expect(page.getByText('That email and password combination was not accepted.')).toBeVisible();
+  await expect(page.locator('body')).not.toContainText('Invalid login credentials');
   await expect(page.getByRole('button', { name: 'Logout' })).toHaveCount(0);
 });
 

@@ -115,3 +115,43 @@ export function runBelongsToScope(
 export function eventBelongsToRun(event: { run_id?: unknown }, runId: string): boolean {
   return typeof event?.run_id === 'string' && event.run_id === runId;
 }
+
+/**
+ * A request in flight, and who issued it.
+ *
+ * A busy flag cannot be a boolean here. Two different things need to be true
+ * at once and a boolean can express neither:
+ *
+ *  - a request that settles after its owner was replaced must not clear the
+ *    REPLACEMENT owner's busy state — otherwise an old answer re-enables a
+ *    control the current user is still waiting on;
+ *  - the replacement owner must not inherit a busy state it never set —
+ *    otherwise a signed-in user finds a control stuck disabled until somebody
+ *    else's request happens to finish.
+ *
+ * Clearing the flags on sign-out fixes only the second. The token fixes both:
+ * the state holds WHICH request is pending, so settling can compare identity,
+ * and a session change simply drops the token.
+ *
+ * The counter is monotonic for the life of the page. It is never reset,
+ * because a reused id is exactly the confusion it exists to prevent.
+ */
+export type PendingRequest = { readonly id: number; readonly owner: WorkspaceScope };
+
+let pendingRequests = 0;
+
+export function beginPending(owner: WorkspaceScope): PendingRequest {
+  pendingRequests += 1;
+  return { id: pendingRequests, owner };
+}
+
+/**
+ * Clear the pending state only if `settled` is still the request it holds.
+ * A superseded request settling is a no-op.
+ */
+export function settlePending(
+  current: PendingRequest | undefined,
+  settled: PendingRequest,
+): PendingRequest | undefined {
+  return current?.id === settled.id ? undefined : current;
+}

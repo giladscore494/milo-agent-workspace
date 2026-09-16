@@ -60,6 +60,35 @@ the user signed out — or when a different user signed in — was written into 
 page it landed on. Reproduced in `tests/stateOwnership.test.tsx`; both tests
 fail against `0fdab21`.
 
+**A2 — the second defect, found by review of the first fix.** Guarding what
+RENDERS is not the same as guarding what is WRITTEN. `startRun` called
+`storeRunId` and only then checked ownership, so a run-creation response
+belonging to a signed-out session put a key back into `sessionStorage` that
+sign-out had just removed — browser state outliving the session that produced
+it, which is precisely what A2 requires not to happen. Reproduced on `ae2ce45`:
+with Alice's request held open, signing out cleared
+`milo.activeRun.<conversation>`; resolving the request restored Alice's run id
+to it.
+
+Ownership is now checked BEFORE any durable browser-side write, and the three
+outcomes are separated: a response from a replaced or signed-out session stores
+nothing and activates nothing; a response in the same session but a different
+conversation is stored under the conversation it actually belongs to and is
+never activated under the one on screen; only a response that still owns the
+conversation becomes the active run.
+
+**A2 — and the pending state that crossed with it.** `creatingConversation`,
+`proposalBusy` and `submittingRun` were booleans cleared by an unconditional
+`finally`. Two failures follow, and clearing them on sign-out fixes only one:
+a replacement session INHERITED the busy flag (reproduced: after signing out
+mid-request and signing in as another user, "New conversation" read
+"Creating conversation…" and was disabled), and a superseded request settling
+CLEARED its successor's. Each flag now holds which request is in flight
+(`beginPending`/`settlePending` in `lib/ownership.ts`), so settling compares
+identity and a session change simply drops the token. The idempotency key is
+scoped the same way — to one session, one conversation and one content — so it
+is reused for a genuine retry and never inherited by a different submission.
+
 ---
 
 ## B. Run lifecycle
@@ -104,8 +133,8 @@ screen whose other affordance is a retryable submit button.
 | C1 | Logical tasks are never presented as agents | `IMPLEMENTED_AND_PROVEN` | `lib/swarmReducer.ts` keys tasks by `payload.task_id`; there is no agent registry for Swarm V2 | `tests/swarmV2Reducer.test.ts`, `tests/swarmRunCard.test.tsx` | — |
 | C2 | Tool calls, output repairs and verifier batches never increase task count | `IMPLEMENTED_AND_PROVEN` | `lib/swarmReducer.ts` counters on an existing task | `tests/swarmV2Reducer.test.ts`, `tests/swarmV2ViewModel.test.ts` | — |
 | C3 | Model-call count comes only from authoritative `run.usage` | `IMPLEMENTED_AND_PROVEN` | `lib/runUsage.ts`; nothing sums events | `tests/runUsageContract.test.ts`, `tests/swarmV2ViewModel.test.ts` | — |
-| C4 | Unknown event types fail safely | `IMPLEMENTED_AND_PROVEN` | `lib/swarmReducer.ts` allowlisted branches; unknown types fold to nothing | `tests/swarmV2Reducer.test.ts` | — |
-| C5 | Unknown or hostile events cannot manufacture trusted lifecycle transitions, tasks, agents or usage | `IMPLEMENTED_AND_PROVEN` | same, plus sticky terminal phases and non-regressing task status | `tests/swarmV2Reducer.test.ts`, `tests/displaySecurity.test.tsx` | — |
+| C4 | Unknown event types fail safely | `IMPLEMENTED_AND_PROVEN` (was `CONFIRMED_DEFECT`) | `lib/eventVocabulary.ts` decides what each type owns; `lib/runReducer.ts` gates the whole V1 projection on it; `lib/swarmReducer.ts` folds the swarm slice | **`tests/eventProjection.test.ts`** — through `reduceRunEvent` AND `useRunRealtime`; plus `tests/swarmV2Reducer.test.ts` | — |
+| C5 | Unknown or hostile events cannot manufacture trusted lifecycle transitions, tasks, agents or usage | `IMPLEMENTED_AND_PROVEN` (was `CONFIRMED_DEFECT`) | same, plus sticky terminal phases and non-regressing task status | **`tests/eventProjection.test.ts`** (10 of its 15 cases fail against `ae2ce45`), `tests/swarmV2Reducer.test.ts`, `tests/displaySecurity.test.tsx` | — |
 | C6 | Event ordering, de-duplication and PostgreSQL bigint ids remain lossless | `IMPLEMENTED_AND_PROVEN` | `lib/losslessJson.ts`, `lib/eventId.ts`, `lib/runReducer.ts` | `tests/eventId.test.ts`, `tests/swarmV2Reducer.test.ts`, `tests/swarmV2Polling.test.ts` | — |
 | C7 | Late events or responses from an earlier run cannot mutate the active run | `IMPLEMENTED_AND_PROVEN` (was `IMPLEMENTED_TEST_GAP`) | generation counter **plus** `runBelongsToScope` / `eventBelongsToRun` in `lib/useRunRealtime.ts` | `tests/runIsolation.test.ts` (4 new cases); `tests/ownership.test.ts`; E2E "switching runs does not retain stale state" | — |
 
@@ -114,6 +143,28 @@ the run the hook is on". It could not answer "is this answer that run": the
 fetched row was dispatched without checking `run.id`, and events were folded
 without checking `event.run_id`. Both are now checked before anything is
 dispatched.
+
+**C4/C5 — the defect the first F5 revision missed, exactly.** The evidence
+pointed at `reduceSwarmEvent`, which is not the production path.
+`reduceRunEvent` wraps it and runs the V1 projection — agents, lifecycle phase,
+progress, sources, claims, conflicts, event-derived spend — on the event's
+FIELDS before anything asked whether its TYPE was recognised. Reproduced on
+`ae2ce45`: a single event of type `future_unknown_failed_signal` carrying
+`agent: "invented-agent"`, `phase: "completed"` and
+`payload: {tokens: 999999, cost_usd: 1234}` produced an agent named
+`invented-agent` with status `failed` (picked out of a substring of the
+invented type's own name), a `completed` phase, and those exact spend totals.
+A recognised `task_started` carrying a hostile `agent` field likewise created a
+V1 agent, though Swarm V2 has no agent concept.
+
+Recognition now comes first and is by exact type, never substring.
+`lib/eventVocabulary.ts` mirrors `EVENT_TYPES` from `backend/runtime.py` — the
+set the API itself validates worker-written events against — and splits it into
+what each type owns: the V1 projection, the agent registry (the V1 set minus the
+run-level types), and the event-derived spend telemetry. A Swarm V2 type never
+owns any of them. An unrecognised type stays visible as developer telemetry (the
+raw event stream and `swarm.unknownEventTypes`) and touches nothing else, so a
+new backend event type is inert in the browser until it is added on purpose.
 
 ---
 
@@ -154,6 +205,9 @@ Each risk the F5 brief names, audited against the pre-F5 tree.
 | D-3 | Events not checked against the active run | **present** | `CONFIRMED_DEFECT` | `eventBelongsToRun` at ingest | `tests/runIsolation.test.ts` "never folds an event that names another run" |
 | D-4 | A mismatched, unauthorized or malformed stored run rendering under the wrong conversation | **present** | `CONFIRMED_DEFECT` | nothing dispatched, polling stopped, id cleared from session storage, one authored sentence shown | `tests/stateOwnership.test.tsx` (both refusal cases) |
 | D-5 | Late async responses crossing session, project, conversation or run boundaries | **present, seven paths** | `CONFIRMED_DEFECT` | `lib/ownership.ts` scope captured per request | the seven cases below |
+| D-6 | A durable browser-side write (session storage) performed BEFORE the ownership check | **present** | `CONFIRMED_DEFECT` (found reviewing the D-5 fix) | ownership checked first; store-under-its-own-conversation and activate-here separated | `tests/stateOwnership.test.tsx` "a run created after sign-out is neither stored nor rendered", "…for the previous user…" |
+| D-7 | Busy flags crossing a session boundary in both directions | **present** | `CONFIRMED_DEFECT` (same review) | `beginPending`/`settlePending`: the flag holds WHICH request is in flight | `tests/stateOwnership.test.tsx` "a replacement session starts unblocked…", "an old request settling cannot clear the newer owner's busy state" |
+| D-8 | An idempotency key outliving its logical submission | **present** | `CONFIRMED_DEFECT` (same review) | the key is scoped to (session, conversation, content) | `tests/stateOwnership.test.tsx` "the idempotency key is scoped to its submission" (3 cases) |
 
 **The seven delayed-response races.** Each is reproduced by holding the request
 open, changing the selection, then resolving it. All eleven tests in
@@ -183,8 +237,8 @@ even when the same user signs back in.
 | --- | --- | --- | --- | --- | --- |
 | E1 | No `dangerouslySetInnerHTML` or equivalent unsafe rendering path | `IMPLEMENTED_AND_PROVEN` | none exists; `scripts/static-ui-check.mjs` fails the build on one under `components/result` | `tests/staticUiCheck.test.ts`; repository-wide absence | the construct guard is scoped to the final-result surface; the rest is proven by absence |
 | E2 | React escaping is not mistaken for credential redaction | `IMPLEMENTED_AND_PROVEN` (new) | `lib/sanitize.ts` keeps `safeText` and `redactSecretText` separate | `tests/displaySecurity.test.tsx` "escaping is not redaction" — asserts `safeText` prints a credential **unchanged** | — |
-| E3 | User-visible errors cannot expose provider messages, stack traces, internal URLs, tokens, authorization headers or secret-shaped values | `IMPLEMENTED_AND_PROVEN` (was `IMPLEMENTED_TEST_GAP`) | `lib/errorText.ts` `safeErrorText`, used by every error surface in `app/page.tsx` | `tests/errorText.test.ts` (14 cases); E2E F5-L2 | classification is by shape; an upstream message that is plain prose and wrong is still shown |
-| E4 | Gateway and API errors retain safe actionable meaning through allowlisted messages/codes | `IMPLEMENTED_AND_PROVEN` | `lib/errorText.ts` keeps a SCREAMING_SNAKE code and the caller's own fallback sentence | `tests/errorText.test.ts` "falls back to the caller sentence but KEEPS a safe code"; `tests/workspace.test.tsx` `EXECUTION_SURFACE_DISABLED` | — |
+| E3 | User-visible errors cannot expose provider messages, stack traces, internal URLs, tokens, authorization headers or secret-shaped values | `IMPLEMENTED_AND_PROVEN` (was `CONFIRMED_DEFECT`) | `lib/errorText.ts` — a CLOSED policy: no upstream text is ever rendered, only copy authored there for a classification allowlisted **by value**, or the caller's own fallback. `lib/supabaseClient.ts` raises `AuthFailure` instead of the SDK's message | `tests/errorText.test.ts` (14 cases incl. the six upstream strings the review named), `tests/supabaseClient.test.ts`, `tests/workspace.test.tsx`, E2E 2 and F5-L2 | a classification the product has authored no copy for degrades to the caller's fallback — deliberate, and the reason adding one is an edit beside the copy a user reads |
+| E4 | Gateway and API errors retain safe actionable meaning through allowlisted messages/codes | `IMPLEMENTED_AND_PROVEN` | `ERROR_COPY` in `lib/errorText.ts` — one authored sentence per allowlisted classification, plus the code as the support handle (suppressed for `HTTP_*`, which is a label `lib/api.ts` synthesises rather than a code anyone can look up) | `tests/errorText.test.ts` (`EXECUTION_SURFACE_DISABLED`, `JOB_LAUNCH_UNKNOWN` vs `JOB_LAUNCH_FAILED`, idempotency, concurrency, budget, rate-limit and not-found cases); `tests/workspace.test.tsx`; E2E F5-L2 | a SCREAMING_SNAKE shape is not a classification: `REPOSITORY_ERROR` and every `CATALOG_*` code earn the caller's fallback |
 | E5 | Hostile project names, conversation titles, events, errors, task fields, result values and provenance remain inert text | `IMPLEMENTED_AND_PROVEN` | `safeText` at every render site; the closed F4 contract for result values | `tests/displaySecurity.test.tsx` (no element, no attribute created); `tests/swarmRunCard.test.tsx`; `tests/finalResultPanel.test.tsx` hostile payloads | — |
 | E6 | Only approved `NEXT_PUBLIC_*` variables enter the browser | `IMPLEMENTED_AND_PROVEN` (new) | see A9 | `tests/secretBundleCheck.test.ts`; E2E 28 | — |
 | E7 | Service-role/provider/worker secrets absent from source bundles **and served pages** | `IMPLEMENTED_AND_PROVEN` (was `IMPLEMENTED_TEST_GAP`) | `frontend/scripts/no-secret-bundle-check.mjs` now scans `.next*/static` as well as source | `npm run test:secrets`; `tests/secretBundleCheck.test.ts`; E2E 28 scans **every** served script (it previously stopped after ten) | — |
@@ -203,6 +257,33 @@ even when the same user signs back in.
 returns a credential **unchanged**, and `redactSecretText` returns hostile markup
 **unchanged**. If either ever stops being true, the two boundaries have been
 silently merged.
+
+**E3 — the defect the first F5 revision missed, exactly.** The first version of
+`lib/errorText.ts` asked whether a message LOOKED unsafe — credential, URL,
+stack frame, markup — and displayed anything that did not. That inverts the
+burden. Reproduced on `ae2ce45`:
+
+```
+safeErrorText(new ApiError(502, "REPOSITORY_ERROR",
+  "OpenRouter upstream quota exhausted for provider account"), "Run creation failed.")
+→ "OpenRouter upstream quota exhausted for provider account (REPOSITORY_ERROR)"
+```
+
+`Moonshot request rejected by upstream` and `PostgREST connection pool
+exhausted` reached the screen the same way. All three pass a "looks harmless"
+test and all three tell a user about infrastructure they do not operate, in
+words nobody in this repository wrote.
+
+The policy is now closed. `ApiError.message` and `Error.message` are never
+rendered; a classification is matched **by value** against `ERROR_COPY` and the
+sentence the user reads is authored there. `EXECUTION_SURFACE_DISABLED`,
+`JOB_LAUNCH_UNKNOWN`, `JOB_LAUNCH_FAILED`, idempotency, concurrency, budget,
+rate-limit, lifecycle and not-found cases each keep a distinct, actionable
+meaning; everything else — including every `CATALOG_*` code and
+`REPOSITORY_ERROR` — degrades to the caller's own static sentence. Supabase is
+covered at its source: `signInWithSupabase` raises an `AuthFailure` built from
+the SDK error's HTTP **status** only, so "that email and password combination
+was not accepted" is our sentence rather than the SDK's.
 
 **Sentinels.** Every credential-shaped value in the test suite is assembled at
 runtime (`frontend/tests/secretSentinels.ts`). No literal that would trip
@@ -312,8 +393,10 @@ A check that did not run is not green. The rows above say which is which.
 3. **Redaction is pattern-based.** A credential format not in `SECRET_PATTERNS`
    is not redacted. That is why the typed F4 contract exists beside it and why
    neither is described as sufficient alone.
-4. **Error classification is shape-based.** A plain-prose upstream message that
-   is merely wrong or unhelpful is still displayed.
+4. **Error presentation is a closed list.** A classification the product has
+   authored no copy for degrades to the caller's static fallback, so a genuinely
+   useful upstream message that is not on the list is not shown. Adding one is a
+   deliberate edit in `lib/errorText.ts`, beside the sentence a user will read.
 5. **`not_found` has no production producer.** Parser and rendering only.
 6. **Horizontal-overflow measurement covers one phone width (375px)** on the
    final-result route, not every route at every width.

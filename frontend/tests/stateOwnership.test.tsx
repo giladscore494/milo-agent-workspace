@@ -28,6 +28,7 @@ vi.mock('../lib/supabaseClient', () => ({
 
 const apiMocks = vi.hoisted(() => ({
   executionUi: true,
+  keys: 0,
   api: {
     projects: vi.fn(), conversations: vi.fn(), createConversation: vi.fn(),
     createProposal: vi.fn(), proposal: vi.fn(), decideProposal: vi.fn(), reviseProposal: vi.fn(),
@@ -38,7 +39,7 @@ const apiMocks = vi.hoisted(() => ({
 vi.mock('../lib/api', () => ({
   api: apiMocks.api,
   executionUiEnabled: () => apiMocks.executionUi,
-  newIdempotencyKey: () => 'ownership-test-key',
+  newIdempotencyKey: () => `ownership-key-${(apiMocks.keys += 1)}`,
   ApiError: class ApiError extends Error {
     constructor(public status: number, public code: string, message: string) { super(message); }
   },
@@ -297,5 +298,283 @@ describe('delayed responses never cross a selection boundary', () => {
 
     expect(await screen.findByText(/could not be verified as belonging to it/)).toBeInTheDocument();
     expect(screen.queryByText(/a different run entirely/)).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * A durable browser-side write is a separate question from a rendered one.
+ *
+ * `sessionStorage` outlives this component and survives a sign-out, so "did
+ * anything render" does not answer "did anything get written". Ownership is
+ * therefore checked BEFORE the write, not after it — the original ordering
+ * stored the run id first and checked second, which let an answer belonging to
+ * a signed-out session put a key back that sign-out had just removed.
+ */
+describe('a durable write needs ownership first', () => {
+  beforeEach(() => {
+    mockSession = ALICE;
+    apiMocks.executionUi = true;
+    apiMocks.keys = 0;
+    for (const fn of Object.values(apiMocks.api)) {
+      if (typeof fn === 'function') fn.mockReset();
+    }
+    apiMocks.api.projects.mockResolvedValue([PROJECT_A]);
+    apiMocks.api.conversations.mockResolvedValue([CONVO_A, CONVO_A2]);
+    apiMocks.api.run.mockResolvedValue({ id: RUN_A, conversation_id: CONVO_A.id, status: 'queued' });
+    apiMocks.api.events.mockResolvedValue([]);
+    window.sessionStorage.clear();
+  });
+
+  async function openConversationAndSubmit(pending: Promise<any>) {
+    apiMocks.api.startRun.mockReturnValue(pending);
+    render(<Page/>);
+    fireEvent.click(await screen.findByText('Alpha Project'));
+    fireEvent.click(await screen.findByText('Alpha conversation'));
+    fireEvent.change(screen.getByLabelText('Task content'), { target: { value: 'go' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
+  }
+
+  it('a run created after sign-out is neither stored nor rendered', async () => {
+    const slow = deferred<{ run_id: string; status: string }>();
+    await openConversationAndSubmit(slow.promise);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logout' }));
+    await screen.findByRole('button', { name: 'Login' });
+    expect(window.sessionStorage.getItem(`milo.activeRun.${CONVO_A.id}`)).toBeNull();
+
+    slow.resolve({ run_id: RUN_A, status: 'queued' });
+    await settle();
+
+    // Nothing was written back into the browser…
+    expect(window.sessionStorage.getItem(`milo.activeRun.${CONVO_A.id}`)).toBeNull();
+    // …nothing was polled for it…
+    expect(apiMocks.api.run).not.toHaveBeenCalled();
+    // …and the signed-out screen is still just the signed-out screen.
+    expect(screen.getByRole('button', { name: 'Login' })).toBeInTheDocument();
+    expect(screen.queryByText('Alpha Project')).not.toBeInTheDocument();
+    expect(screen.queryByText(RUN_A)).not.toBeInTheDocument();
+  });
+
+  it("a run created for the previous user is neither stored nor rendered for the next one", async () => {
+    const slow = deferred<{ run_id: string; status: string }>();
+    await openConversationAndSubmit(slow.promise);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logout' }));
+    await screen.findByRole('button', { name: 'Login' });
+
+    mockSession = BOB;
+    apiMocks.api.projects.mockResolvedValue([BOB_PROJECT]);
+    fireEvent.change(screen.getByLabelText('Email'), { target: { value: BOB.user.email } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'bob-Password-1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }));
+    expect(await screen.findByText('Bob Only Project')).toBeInTheDocument();
+
+    slow.resolve({ run_id: RUN_A, status: 'queued' }); // Alice's run, answering late
+    await settle();
+
+    expect(window.sessionStorage.getItem(`milo.activeRun.${CONVO_A.id}`)).toBeNull();
+    expect(apiMocks.api.run).not.toHaveBeenCalled();
+    expect(screen.queryByText(RUN_A)).not.toBeInTheDocument();
+    expect(screen.getByText('Bob Only Project')).toBeInTheDocument();
+  });
+
+  it('a run created for conversation A is stored under A and never activated under B', async () => {
+    const slow = deferred<{ run_id: string; status: string }>();
+    await openConversationAndSubmit(slow.promise);
+
+    // Same session, different conversation.
+    fireEvent.click(screen.getByText('Alpha second conversation'));
+    slow.resolve({ run_id: RUN_A, status: 'queued' });
+    await settle();
+
+    // The run exists and belongs to A, so A's own key records it…
+    expect(window.sessionStorage.getItem(`milo.activeRun.${CONVO_A.id}`)).toBe(RUN_A);
+    // …and B neither stores it nor opens it.
+    expect(window.sessionStorage.getItem(`milo.activeRun.${CONVO_A2.id}`)).toBeNull();
+    expect(apiMocks.api.run).not.toHaveBeenCalled();
+    expect(screen.queryByText(RUN_A)).not.toBeInTheDocument();
+
+    // Going back to A finds it exactly where it belongs.
+    fireEvent.click(screen.getByText('Alpha conversation'));
+    await waitFor(() => expect(apiMocks.api.run).toHaveBeenCalledWith(RUN_A));
+  });
+});
+
+/**
+ * A busy flag is not a boolean.
+ *
+ * Two things must hold at once, and the unconditional `finally` setters could
+ * satisfy neither: a replacement owner must not inherit a busy state it never
+ * set, and a superseded request settling must not clear the state its
+ * successor is still waiting on. Clearing flags on sign-out fixes only the
+ * first, which is why the pending state holds WHICH request is in flight.
+ */
+describe('pending state belongs to the request that set it', () => {
+  beforeEach(() => {
+    mockSession = ALICE;
+    apiMocks.executionUi = true;
+    apiMocks.keys = 0;
+    for (const fn of Object.values(apiMocks.api)) {
+      if (typeof fn === 'function') fn.mockReset();
+    }
+    apiMocks.api.projects.mockResolvedValue([PROJECT_A]);
+    apiMocks.api.conversations.mockResolvedValue([]);
+    apiMocks.api.events.mockResolvedValue([]);
+    window.sessionStorage.clear();
+  });
+
+  it('a replacement session starts unblocked rather than inheriting the busy state', async () => {
+    const slowA = deferred<any>();
+    apiMocks.api.createConversation.mockReturnValue(slowA.promise);
+
+    render(<Page/>);
+    fireEvent.click(await screen.findByText('Alpha Project'));
+    fireEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Creating conversation…' })).toBeDisabled());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logout' }));
+    await screen.findByRole('button', { name: 'Login' });
+    mockSession = BOB;
+    apiMocks.api.projects.mockResolvedValue([BOB_PROJECT]);
+    fireEvent.change(screen.getByLabelText('Email'), { target: { value: BOB.user.email } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'bob-Password-1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }));
+    fireEvent.click(await screen.findByText('Bob Only Project'));
+
+    const control = screen.getByRole('button', { name: /New conversation|Creating conversation/ });
+    expect(control).toHaveTextContent('New conversation');
+    expect(control).not.toBeDisabled();
+  });
+
+  it("an old request settling cannot clear the newer owner's busy state", async () => {
+    const slowA = deferred<any>();
+    const slowB = deferred<any>();
+    apiMocks.api.createConversation.mockReturnValueOnce(slowA.promise).mockReturnValueOnce(slowB.promise);
+
+    render(<Page/>);
+    fireEvent.click(await screen.findByText('Alpha Project'));
+    fireEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Creating conversation…' })).toBeDisabled());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logout' }));
+    await screen.findByRole('button', { name: 'Login' });
+    mockSession = BOB;
+    apiMocks.api.projects.mockResolvedValue([BOB_PROJECT]);
+    fireEvent.change(screen.getByLabelText('Email'), { target: { value: BOB.user.email } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'bob-Password-1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }));
+    fireEvent.click(await screen.findByText('Bob Only Project'));
+
+    // Bob starts his own creation and is now waiting on it.
+    fireEvent.click(screen.getByRole('button', { name: 'New conversation' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Creating conversation…' })).toBeDisabled());
+
+    // Alice's superseded request settles. Its `finally` must be a no-op here.
+    slowA.resolve(CONVO_A);
+    await settle();
+
+    expect(screen.getByRole('button', { name: /New conversation|Creating conversation/ }))
+      .toHaveTextContent('Creating conversation…');
+
+    // Bob's own request still frees his control when it settles.
+    slowB.resolve({ id: '55555555-1111-4111-8111-00000000000b', project_id: BOB_PROJECT.id, title: "Bob's conversation" });
+    await settle();
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /New conversation|Creating conversation/ }))
+        .toHaveTextContent('New conversation'));
+  });
+});
+
+/**
+ * The idempotency key belongs to one logical submission.
+ *
+ * Retrying the SAME submission must reuse it, so the backend returns the
+ * original run instead of creating a second one. Anything else — a different
+ * session, a different conversation, different content — is a different
+ * submission and must not inherit it.
+ */
+describe('the idempotency key is scoped to its submission', () => {
+  beforeEach(() => {
+    mockSession = ALICE;
+    apiMocks.executionUi = true;
+    apiMocks.keys = 0;
+    for (const fn of Object.values(apiMocks.api)) {
+      if (typeof fn === 'function') fn.mockReset();
+    }
+    apiMocks.api.projects.mockResolvedValue([PROJECT_A]);
+    apiMocks.api.conversations.mockResolvedValue([CONVO_A, CONVO_A2]);
+    apiMocks.api.run.mockResolvedValue({ id: RUN_A, conversation_id: CONVO_A.id, status: 'queued' });
+    apiMocks.api.events.mockResolvedValue([]);
+    window.sessionStorage.clear();
+  });
+
+  function keysUsed(): string[] {
+    return apiMocks.api.startRun.mock.calls.map((call: unknown[]) => call[2] as string);
+  }
+
+  it('retrying the same submission reuses the key', async () => {
+    apiMocks.api.startRun.mockRejectedValue(new Error('upstream refused'));
+    render(<Page/>);
+    fireEvent.click(await screen.findByText('Alpha Project'));
+    fireEvent.click(await screen.findByText('Alpha conversation'));
+    fireEvent.change(screen.getByLabelText('Task content'), { target: { value: 'the same task' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
+    await settle();
+    fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
+    await settle();
+
+    const [first, second] = keysUsed();
+    expect(second).toBe(first);
+  });
+
+  it('a different session cannot reuse a failed attempt key', async () => {
+    apiMocks.api.startRun.mockRejectedValue(new Error('upstream refused'));
+    render(<Page/>);
+    fireEvent.click(await screen.findByText('Alpha Project'));
+    fireEvent.click(await screen.findByText('Alpha conversation'));
+    fireEvent.change(screen.getByLabelText('Task content'), { target: { value: 'the same task' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
+    await settle();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logout' }));
+    await screen.findByRole('button', { name: 'Login' });
+    mockSession = BOB;
+    fireEvent.change(screen.getByLabelText('Email'), { target: { value: BOB.user.email } });
+    fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'bob-Password-1' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Login' }));
+    fireEvent.click(await screen.findByText('Alpha Project'));
+    fireEvent.click(await screen.findByText('Alpha conversation'));
+    fireEvent.change(screen.getByLabelText('Task content'), { target: { value: 'the same task' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
+    await settle();
+
+    const [aliceKey, bobKey] = keysUsed();
+    expect(bobKey).not.toBe(aliceKey);
+  });
+
+  it('an unrelated submission in the same session cannot reuse it', async () => {
+    apiMocks.api.startRun.mockRejectedValue(new Error('upstream refused'));
+    render(<Page/>);
+    fireEvent.click(await screen.findByText('Alpha Project'));
+    fireEvent.click(await screen.findByText('Alpha conversation'));
+    fireEvent.change(screen.getByLabelText('Task content'), { target: { value: 'first task' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
+    await settle();
+
+    // Different content is a different logical submission…
+    fireEvent.change(screen.getByLabelText('Task content'), { target: { value: 'a completely different task' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
+    await settle();
+
+    // …and so is the same content in a different conversation.
+    fireEvent.click(screen.getByText('Alpha second conversation'));
+    fireEvent.change(screen.getByLabelText('Task content'), { target: { value: 'a completely different task' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
+    await settle();
+
+    const [first, second, third] = keysUsed();
+    expect(second).not.toBe(first);
+    expect(third).not.toBe(second);
   });
 });

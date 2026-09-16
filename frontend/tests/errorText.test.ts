@@ -1,100 +1,167 @@
 import { describe, expect, it } from 'vitest';
 import { ApiError } from '../lib/api';
-import { MAX_ERROR_MESSAGE_LENGTH, classifyErrorCode, classifyErrorMessage, safeErrorText } from '../lib/errorText';
-import { API_KEY_SENTINEL, BEARER_SENTINEL, JWT_SENTINEL, SUPABASE_SECRET_SENTINEL } from './secretSentinels';
+import { AuthFailure, CLASSIFIED_ERROR_CODES, classifyError, safeErrorText } from '../lib/errorText';
+import { API_KEY_SENTINEL } from './secretSentinels';
 
-describe('an error message is shown only if it survives classification', () => {
-  it('keeps an ordinary, actionable backend message', () => {
-    expect(classifyErrorMessage('run creation is disabled')).toBe('run creation is disabled');
-    expect(classifyErrorMessage('Invalid login credentials')).toBe('Invalid login credentials');
-    expect(classifyErrorMessage('Run creation is disabled by the gateway safety policy.'))
-      .toBe('Run creation is disabled by the gateway safety policy.');
-  });
+/**
+ * The error surface shows locally authored copy, or the caller's fallback.
+ * Never upstream text.
+ *
+ * The first version of this module asked whether a message LOOKED unsafe and
+ * displayed anything that did not. Every string below passes that test — no
+ * credential, no URL, no stack frame, no markup — and every one of them is a
+ * sentence about infrastructure the user does not operate, written by a system
+ * nobody here controls. They are the reason "looks harmless" is not
+ * authorization.
+ */
+const UPSTREAM_PROSE = [
+  'OpenRouter upstream quota exhausted for provider account',
+  'Moonshot request rejected by upstream',
+  'PostgREST connection pool exhausted',
+  // A Cloud Run / provider diagnostic that is perfectly clean-looking.
+  'Container instance exceeded its memory limit and was recycled',
+  'The model returned an empty completion after 3 attempts',
+  'connection reset while reading the response body',
+];
 
-  it('refuses a message carrying credential-shaped material outright', () => {
-    // Partial masking is not good enough for an operational string: if a
-    // credential was in there, the rest of it is not product copy either.
-    for (const sentinel of [JWT_SENTINEL, SUPABASE_SECRET_SENTINEL, API_KEY_SENTINEL, BEARER_SENTINEL]) {
-      expect(classifyErrorMessage(`upstream rejected: ${sentinel}`)).toBeUndefined();
+describe('no upstream prose reaches the rendered UI', () => {
+  it('refuses provider, repository and infrastructure prose behind a known code', () => {
+    for (const message of UPSTREAM_PROSE) {
+      const shown = safeErrorText(new ApiError(502, 'REPOSITORY_ERROR', message), 'Run creation failed.');
+      expect(shown, message).toBe('Run creation failed.');
+      expect(shown, message).not.toContain(message);
     }
-    expect(classifyErrorMessage('authorization=abc123def456')).toBeUndefined();
   });
 
-  it('refuses an internal URL or hostname', () => {
-    expect(classifyErrorMessage('failed to reach https://milo-api-internal.a.run.app/runs')).toBeUndefined();
-    expect(classifyErrorMessage('postgres://db.internal:5432 refused the connection')).toBeUndefined();
+  it('refuses the same prose behind an UNKNOWN code of the right shape', () => {
+    // A SCREAMING_SNAKE code is a shape, not a classification.
+    for (const message of UPSTREAM_PROSE) {
+      const shown = safeErrorText(new ApiError(500, 'SOME_FUTURE_BACKEND_CODE', message), 'Run creation failed.');
+      expect(shown, message).toBe('Run creation failed.');
+    }
   });
 
-  it('refuses a stack trace from either runtime', () => {
-    expect(classifyErrorMessage('Traceback (most recent call last): ValueError')).toBeUndefined();
-    expect(classifyErrorMessage('TypeError: x is not a function\n    at handler (/srv/app.js:12:5)')).toBeUndefined();
-    expect(classifyErrorMessage('  File "/app/backend/main.py", line 214, in create_run')).toBeUndefined();
+  it('refuses the same prose from a plain Error', () => {
+    for (const message of UPSTREAM_PROSE) {
+      const shown = safeErrorText(new Error(message), 'Failed to load projects.');
+      expect(shown, message).toBe('Failed to load projects.');
+    }
   });
 
-  it('refuses markup rather than relying on escaping to make it safe', () => {
-    // `safeText` would render this inert. Inert is not the same as appropriate:
-    // an error message is never markup, so it is not shown at all.
-    expect(classifyErrorMessage('<img src=x onerror=alert(1)>')).toBeUndefined();
+  it('refuses a credential even when the code is one we classify', () => {
+    const shown = safeErrorText(
+      new ApiError(403, 'EXECUTION_SURFACE_DISABLED', `upstream said ${API_KEY_SENTINEL}`),
+      'Run creation failed.',
+    );
+    // The authored copy is shown; the upstream string is not consulted at all.
+    expect(shown).toContain('turned off at the current activation stage');
+    expect(shown).not.toContain(API_KEY_SENTINEL);
   });
 
-  it('collapses control characters so one error cannot reflow the surface', () => {
-    expect(classifyErrorMessage('line one\n\n\tline two')).toBe('line one line two');
+  it('never returns an error message, whatever it contains', () => {
+    // The property, stated once over a spread of shapes.
+    const messages = [...UPSTREAM_PROSE, 'ordinary operational prose', 'run creation is disabled', ''];
+    for (const message of messages) {
+      for (const error of [new Error(message), new ApiError(500, 'UNKNOWN_CODE_HERE', message)]) {
+        const shown = safeErrorText(error, 'Fallback sentence.');
+        if (message !== '') expect(shown, message).not.toContain(message);
+      }
+    }
   });
 
-  it('bounds a very long message', () => {
-    const long = 'x'.repeat(MAX_ERROR_MESSAGE_LENGTH + 200);
-    const classified = classifyErrorMessage(long) ?? '';
-    expect(classified).toHaveLength(MAX_ERROR_MESSAGE_LENGTH);
-    expect(classified.endsWith('…')).toBe(true);
-  });
-
-  it('refuses an empty, whitespace-only or non-string message', () => {
-    expect(classifyErrorMessage('')).toBeUndefined();
-    expect(classifyErrorMessage('   \n  ')).toBeUndefined();
-    expect(classifyErrorMessage(undefined)).toBeUndefined();
-    expect(classifyErrorMessage({ message: 'nope' })).toBeUndefined();
-  });
-});
-
-describe('the code is kept because it is what makes an error actionable', () => {
-  it('accepts the SCREAMING_SNAKE shape every AppError code uses', () => {
-    expect(classifyErrorCode('EXECUTION_SURFACE_DISABLED')).toBe('EXECUTION_SURFACE_DISABLED');
-    expect(classifyErrorCode('JOB_LAUNCH_UNKNOWN')).toBe('JOB_LAUNCH_UNKNOWN');
-    expect(classifyErrorCode('HTTP_403')).toBe('HTTP_403');
-  });
-
-  it('refuses anything that could carry a sentence, a URL or a secret', () => {
-    expect(classifyErrorCode('a message pretending to be a code')).toBeUndefined();
-    expect(classifyErrorCode('https://internal.example/x')).toBeUndefined();
-    expect(classifyErrorCode(API_KEY_SENTINEL)).toBeUndefined();
-    expect(classifyErrorCode('X'.repeat(200))).toBeUndefined();
-    expect(classifyErrorCode(42)).toBeUndefined();
-  });
-});
-
-describe('safeErrorText', () => {
-  it('keeps the message and the code when both survive', () => {
-    const error = new ApiError(403, 'EXECUTION_SURFACE_DISABLED', 'run creation is disabled');
-    expect(safeErrorText(error, 'Run creation failed.'))
-      .toBe('run creation is disabled (EXECUTION_SURFACE_DISABLED)');
-  });
-
-  it('falls back to the caller sentence but KEEPS a safe code', () => {
-    // The action stays identifiable even when the upstream text does not.
-    const error = new ApiError(502, 'JOB_LAUNCH_UNKNOWN', `worker at https://internal/x said ${API_KEY_SENTINEL}`);
-    expect(safeErrorText(error, 'Run creation failed.'))
-      .toBe('Run creation failed. (JOB_LAUNCH_UNKNOWN)');
-  });
-
-  it('drops an unsafe code as well as an unsafe message', () => {
-    const error = new ApiError(500, 'internal detail: /srv/app.js', 'Traceback (most recent call last):');
-    expect(safeErrorText(error, 'Run creation failed.')).toBe('Run creation failed.');
-  });
-
-  it('handles a plain Error and a non-error alike', () => {
-    expect(safeErrorText(new Error('403 gateway rejected'), 'Failed to load projects.'))
-      .toBe('403 gateway rejected');
+  it('falls back for a non-error value', () => {
     expect(safeErrorText('a bare string', 'Failed to load projects.')).toBe('Failed to load projects.');
     expect(safeErrorText(undefined, 'Failed to load projects.')).toBe('Failed to load projects.');
+    expect(safeErrorText({ message: 'nope' }, 'Failed to load projects.')).toBe('Failed to load projects.');
+  });
+});
+
+describe('approved classifications keep their actionable meaning', () => {
+  it('EXECUTION_SURFACE_DISABLED still tells the user why, and names itself', () => {
+    const shown = safeErrorText(
+      new ApiError(403, 'EXECUTION_SURFACE_DISABLED', 'conversation run creation is disabled'),
+      'Run creation failed.',
+    );
+    expect(shown).toBe('This action is turned off at the current activation stage. (EXECUTION_SURFACE_DISABLED)');
+  });
+
+  it('JOB_LAUNCH_UNKNOWN says the run is parked and nothing retries it', () => {
+    const shown = safeErrorText(
+      new ApiError(502, 'JOB_LAUNCH_UNKNOWN', 'worker launch outcome is unknown; the run is parked'),
+      'Run creation failed.',
+    );
+    // The meaning is preserved from OUR copy, not from the upstream sentence.
+    expect(shown).toContain('parked for operator reconciliation');
+    expect(shown).toContain('will not be relaunched automatically');
+    expect(shown).toContain('(JOB_LAUNCH_UNKNOWN)');
+    expect(shown).not.toContain('worker launch outcome is unknown; the run is parked');
+  });
+
+  it('JOB_LAUNCH_FAILED is distinguishable from JOB_LAUNCH_UNKNOWN', () => {
+    const failed = safeErrorText(new ApiError(502, 'JOB_LAUNCH_FAILED', 'x'), 'Run creation failed.');
+    expect(failed).toContain('still queued');
+    expect(failed).toContain('can be retried');
+    expect(failed).not.toContain('parked');
+  });
+
+  it('keeps the distinctions that matter without repeating upstream words', () => {
+    const cases: [string, string][] = [
+      ['IDEMPOTENCY_CONFLICT', 'already used with different content'],
+      ['USER_CONCURRENCY_LIMIT', 'as many runs in flight as this stage allows'],
+      ['DAILY_USER_BUDGET_REACHED', 'daily budget'],
+      ['RATE_LIMITED', 'Too many requests'],
+      ['RUN_ALREADY_FINISHED', 'already finished'],
+      ['PROPOSAL_NOT_APPROVABLE', 'cannot be approved'],
+      ['PROJECT_NOT_FOUND', 'not available to your account'],
+      ['AUTHENTICATION_REQUIRED', 'Sign in again'],
+    ];
+    for (const [code, expected] of cases) {
+      const shown = safeErrorText(new ApiError(400, code, 'upstream prose that must not appear'), 'It failed.');
+      expect(shown, code).toContain(expected);
+      expect(shown, code).toContain(`(${code})`);
+      expect(shown, code).not.toContain('upstream prose');
+    }
+  });
+
+  it('shows gateway HTTP classifications without inventing a support code', () => {
+    // `HTTP_429` is how lib/api.ts labels a gateway body, not a code anyone can
+    // look up, so the copy appears and the label does not.
+    const shown = safeErrorText(new ApiError(429, 'HTTP_429', 'Too many requests.'), 'Request failed.');
+    expect(shown).toBe('Too many requests. Wait a moment and try again.');
+    expect(shown).not.toContain('HTTP_429');
+  });
+
+  it('classifies only codes on the list, by value', () => {
+    expect(classifyError(new ApiError(403, 'EXECUTION_SURFACE_DISABLED', 'x'))).toBe('EXECUTION_SURFACE_DISABLED');
+    expect(classifyError(new ApiError(500, 'REPOSITORY_ERROR', 'x'))).toBeUndefined();
+    expect(classifyError(new ApiError(500, 'CATALOG_PROMOTION_UNVERIFIED', 'x'))).toBeUndefined();
+    expect(classifyError(new Error('x'))).toBeUndefined();
+    // Nothing on the list is a sentence, a URL or a credential.
+    for (const code of CLASSIFIED_ERROR_CODES) {
+      expect(code, code).toMatch(/^[A-Z][A-Z0-9_]{1,63}$/);
+    }
+  });
+});
+
+describe('authentication stays understandable without SDK prose', () => {
+  it('names the failure in our own words', () => {
+    expect(safeErrorText(new AuthFailure('invalid_credentials'), 'Authentication failed.'))
+      .toBe('That email and password combination was not accepted.');
+    expect(safeErrorText(new AuthFailure('rate_limited'), 'Authentication failed.'))
+      .toContain('Too many sign-in attempts');
+    expect(safeErrorText(new AuthFailure('expired'), 'Authentication failed.'))
+      .toContain('session has expired');
+    expect(safeErrorText(new AuthFailure('not_configured'), 'Authentication failed.'))
+      .toContain('not configured');
+    expect(safeErrorText(new AuthFailure('unavailable'), 'Authentication failed.'))
+      .toContain('temporarily unavailable');
+  });
+
+  it('carries no Supabase message, because it never holds one', () => {
+    // The classification is built from the SDK error's STATUS only
+    // (lib/supabaseClient.ts). There is no field here to leak.
+    const failure = new AuthFailure('invalid_credentials');
+    expect(safeErrorText(failure, 'Authentication failed.')).not.toContain('Invalid login credentials');
+    expect(safeErrorText(failure, 'Authentication failed.')).not.toContain('AuthApiError');
   });
 });

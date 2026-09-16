@@ -73,12 +73,23 @@ const requiredOwnership = {
   'lib/ownership.ts': [
     'runBelongsToScope', 'eventBelongsToRun',
     'ownsSession', 'ownsProject', 'ownsConversation', 'ownsRun', 'nextSessionScope',
+    // Owner-scoped pending state: a superseded request must not clear its
+    // successor's busy flag, and a replacement session must not inherit one.
+    'beginPending', 'settlePending',
   ],
   'lib/useRunRealtime.ts': ['runBelongsToScope', 'eventBelongsToRun'],
   'app/page.tsx': [
     'ownsSession', 'ownsProject', 'ownsConversation', 'ownsRun',
-    'nextSessionScope', 'clearStoredRunIds',
+    'nextSessionScope', 'clearStoredRunIds', 'beginPending', 'settlePending',
   ],
+  // Recognition before projection. An unknown event type must not be able to
+  // manufacture an agent, a phase or a spend total.
+  'lib/eventVocabulary.ts': ['V1_EVENT_TYPES', 'ownsV1Projection', 'ownsAgentProjection', 'ownsSpendTelemetry'],
+  'lib/runReducer.ts': ['ownsV1Projection', 'ownsAgentProjection', 'ownsSpendTelemetry'],
+  // No upstream text is ever rendered: copy is authored here, allowlisted by
+  // classification value.
+  'lib/errorText.ts': ['ERROR_COPY', 'AuthFailure', 'classifyError'],
+  'lib/supabaseClient.ts': ['AuthFailure'],
 };
 const requiredReducer = ['some(e => e.id === event.id)', 'reconstructRun', 'tool_access_granted', 'source_recorded'];
 
