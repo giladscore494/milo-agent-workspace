@@ -73,7 +73,9 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from backend.catalog import keys as catalog_keys
-from backend.catalog.contracts import CANONICAL_DIMENSION_PREFIX
+from backend.catalog.contracts import (CANONICAL_DIMENSION_PREFIX,
+                                       SHARED_IDENTITY_DIMENSIONS,
+                                       claim_entity_key, record_locator_id)
 from backend.engines.swarm_v2.evidence_bounds import IDENTITY_DIMENSIONS
 from backend.engines.swarm_v2.evidence_contracts import (EvidenceBundle, EvidenceContractError,
                                                          SourceVersion, StructuredEvidenceFact,
@@ -123,20 +125,21 @@ GOVERNMENT_FIELD_SOURCES: tuple[tuple[str, str, tuple[str, ...], str | None], ..
 #: Only the dimensions BOTH closed vocabularies name: a dimension one side does
 #: not have is left unstated rather than translated into the nearest word.
 IDENTITY_DIMENSION_MAP: Mapping[str, str] = {
-    name: name for name in ("body_style", "drivetrain", "generation", "transmission")
-    if name in IDENTITY_DIMENSIONS
+    name: name for name in SHARED_IDENTITY_DIMENSIONS if name in IDENTITY_DIMENSIONS
 }
 
 
 def government_record_id(snapshot_key: str, upstream_record_id: str) -> str:
     """The locator's record identity: one register row, inside one snapshot.
 
-    The upstream `_id` alone is NOT enough. It is unique within a snapshot and
-    the register reuses the number space across captures, so a locator built
-    from it alone would point at "row 36451" of no particular retrieval -- and
-    two different vehicles from two snapshots would share one durable locator.
+    The catalog-wide rule, not a Government one: `record_locator_id` in
+    `backend/catalog/contracts.py` is the single definition, and
+    `public.catalog_record_locator_id` is its SQL mirror. The promotion trigger
+    uses that mirror to refuse a promoted fact whose evidence was read from a
+    record other than the candidate's own, so this spelling and that refusal
+    can never drift apart.
     """
-    return f"{snapshot_key}:{upstream_record_id}"
+    return record_locator_id(snapshot_key, upstream_record_id)
 
 
 def government_entity_key(manufacturer: str, commercial_model: str, model_year: Any) -> str:
@@ -148,14 +151,15 @@ def government_entity_key(manufacturer: str, commercial_model: str, model_year: 
     id here would make every source's statement about the same car a different
     entity, and two contradictory values would never meet.
 
-    Bounded by construction (a 36-character model key, a colon and a year),
-    which matters: the marque and the commercial model together can exceed the
-    200-character bound on an entity key, and truncating an identity is how two
-    vehicles become one.
+    It is also what makes "this evidence is about this canonical row" checkable
+    inside PostgreSQL without re-deriving a digest there: the model key is a
+    column the canonical catalog already stores, and
+    `public.catalog_claim_entity_key` assembles the same string from it.
     """
-    model_key = catalog_keys.canonical_model_key(manufacturer=manufacturer,
-                                                 commercial_model=commercial_model)
-    return f"{model_key}:{model_year}"
+    return claim_entity_key(
+        catalog_keys.canonical_model_key(manufacturer=manufacturer,
+                                         commercial_model=commercial_model),
+        model_year)
 
 
 class GovernmentVariantEvidenceMapper:

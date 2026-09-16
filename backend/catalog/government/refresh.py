@@ -30,9 +30,25 @@ The shape of the answer
     refresh can never replace the last usable snapshot -- it simply never
     activates, and readers keep answering from the one before it.
 *   **Diff** -- the new snapshot is compared against the previous one and the
-    difference is reported as bounded ADDED / CHANGED / REMOVED candidates.
-    That is the focused work item: the Commander can research a handful of new
-    model years instead of re-reading the whole register.
+    difference is reported as ADDED / CHANGED / REMOVED candidates. That is the
+    focused work item: the Commander can research a handful of new model years
+    instead of re-reading the whole register.
+
+Where the comparison runs, and what is bounded
+-----------------------------------------------
+
+Inside PostgreSQL, in `public.catalog_snapshot_candidate_diff`. The real
+resource is ~101 000 candidate rows per side, so comparing them by reading both
+into this process would materialize 200 000 rows to answer one question -- the
+unbounded read this package exists to avoid.
+
+The three COUNTS that comes back are EXACT for the whole resource, always: they
+are computed over every matching row of both snapshots, never over a page, and
+they are never refused for size. What is bounded is the ITEM LIST -- at most
+`MAX_DIFF_ITEMS` deltas, dropped whole rather than truncated when more than
+that changed, because a truncated list is a diff claiming a completeness it
+does not have. `SnapshotDiff.bounded` says which happened, and the counts are
+the answer either way.
 
 Rollback, stated exactly
 ------------------------
@@ -55,44 +71,16 @@ from .client import DataGovClient, ResourceMetadata
 from .ingest import GovernmentCatalogIngestor, IngestionReport
 from backend.runtime import CancellationRequested
 
-from .projection import (MAX_RESULT_ITEMS, GovernmentProjectionError,
-                         resolve_active_snapshot, snapshot_usability)
+from backend.catalog.diff import (DIFF_IDENTITY, MAX_DIFF_ITEMS, candidate_identity,
+                                  diff_rows, is_count_row)
+from backend.errors import AppError
 
-#: How many changed candidates one diff reports individually. The COUNTS are
-#: always exact; the lists are bounded, because a refresh that changed
-#: everything must not be able to produce an unbounded work item.
-MAX_DIFF_ITEMS = 100
+from .projection import (GovernmentProjectionError, resolve_active_snapshot,
+                         snapshot_usability)
 
-#: How many candidate rows one side of a diff may be read into memory.
-#:
-#: A diff compares two whole snapshots, so it is the one read in this package
-#: that ACCUMULATES rather than answering a page at a time. `MAX_RESULT_ITEMS`
-#: bounds each page; without this, a whole-resource snapshot (~101 000 rows)
-#: would be materialized twice to produce one comparison -- which is exactly
-#: the unbounded read `MAX_PROJECTION_CANDIDATES` exists to refuse.
-#:
-#: Beyond it the comparison is REFUSED, and the refusal is reported rather than
-#: turned into a smaller diff: the snapshot has already landed and is already
-#: readable, so a bound on the comparison must not be mistaken for a statement
-#: about what changed.
-MAX_DIFF_SCAN_ROWS = 5_000
-
-#: What a diff compares: the candidate's COMPLETE stated identity, never its
-#: surrogate id and never the register's own `_id`.
-#:
-#: Not the id, because a re-capture produces new rows with new uuids for the
-#: same vehicles, so comparing ids would report every row as added and every
-#: row as removed. Not the register's `_id` either -- PR2 recorded that the
-#: datastore reuses that number space across captures, so it identifies a row
-#: within ONE retrieval and nothing beyond it.
-#:
-#: The COMPLETE identity, dimensions included, because the register publishes
-#: several rows that share a marque, model, year, code and trim and differ only
-#: in their coded dimensions. Leaving the dimensions out would make those rows
-#: one identity, and which of them "won" would then depend on the order they
-#: were read in -- a diff that changes with the read order is not a diff.
-DIFF_IDENTITY = ("manufacturer", "commercial_model", "model_year_start",
-                 "model_year_end", "official_model_code", "trim", "identity_dimensions")
+#: The comparison itself is ONE rule, in `backend/catalog/diff.py`, mirrored by
+#: `public.catalog_snapshot_candidate_diff`. Re-exported here because this is
+#: where a reader of the refresh looks for it.
 
 
 @dataclass(frozen=True)
@@ -173,33 +161,49 @@ class RefreshOutcome:
         return bool(self.diff is not None and not self.diff.is_empty)
 
 
-def _identity(row: Mapping[str, Any]) -> tuple:
-    """One candidate's complete stated identity, as a hashable, ordered tuple.
-
-    The dimensions are sorted, so two readings that stated the same dimensions
-    in a different key order are the same identity -- which they are.
-    """
-    identity: list[Any] = []
-    for name in DIFF_IDENTITY:
-        value = row.get(name)
-        if name == "identity_dimensions":
-            identity.append(tuple(sorted((str(key), str(item))
-                                         for key, item in (value or {}).items())))
-        else:
-            identity.append(value)
-    return tuple(identity)
-
-
-def _delta(row: Mapping[str, Any], state: str,
-           changed_fields: Sequence[str] = ()) -> CandidateDelta:
+def _delta(row: Mapping[str, Any]) -> CandidateDelta:
+    """One returned delta row, as the dataclass a refresh reports."""
     return CandidateDelta(
-        state=state, manufacturer=str(row["manufacturer"]),
+        state=str(row["state"]), manufacturer=str(row["manufacturer"]),
         commercial_model=str(row["commercial_model"]),
         model_year_start=int(row["model_year_start"]),
         model_year_end=int(row["model_year_end"]),
         official_model_code=row.get("official_model_code"), trim=row.get("trim"),
-        changed_fields=tuple(changed_fields),
+        changed_fields=tuple(row.get("changed_fields") or ()),
         upstream_record_id=str(row.get("upstream_record_id") or ""))
+
+
+def snapshot_diff_from_rows(rows: Sequence[Mapping[str, Any]], *,
+                            previous_snapshot_key: str = "",
+                            snapshot_key: str = "") -> SnapshotDiff:
+    """Assemble a `SnapshotDiff` from what the diff RPC returned.
+
+    The three counts are read from the rows rather than counted here: they are
+    exact for the WHOLE resource, and the returned items are at most
+    `MAX_DIFF_ITEMS` of them. `bounded` is therefore "more changed than was
+    listed", derived by comparing the two -- never by re-counting a page.
+    """
+    if not rows:
+        # Only reachable if a repository returned nothing at all; both
+        # implementations return a COUNT ROW for an empty diff.
+        return SnapshotDiff(previous_snapshot_key=previous_snapshot_key,
+                            snapshot_key=snapshot_key, added_count=0, changed_count=0,
+                            removed_count=0)
+    counts = rows[0]
+    items = [_delta(row) for row in rows if not is_count_row(row)]
+    added = tuple(item for item in items if item.state == "added")
+    changed = tuple(item for item in items if item.state == "changed")
+    removed = tuple(item for item in items if item.state == "removed")
+    added_count = int(counts["added_count"])
+    changed_count = int(counts["changed_count"])
+    removed_count = int(counts["removed_count"])
+    return SnapshotDiff(
+        previous_snapshot_key=previous_snapshot_key, snapshot_key=snapshot_key,
+        added_count=added_count, changed_count=changed_count, removed_count=removed_count,
+        added=added, changed=changed, removed=removed,
+        # Dropped WHOLE rather than truncated, so "listed fewer than counted"
+        # can only mean the whole list was dropped.
+        bounded=len(items) < added_count + changed_count + removed_count)
 
 
 def diff_candidate_sets(previous: Sequence[Mapping[str, Any]],
@@ -208,48 +212,14 @@ def diff_candidate_sets(previous: Sequence[Mapping[str, Any]],
                         max_items: int = MAX_DIFF_ITEMS) -> SnapshotDiff:
     """Compare two snapshots' candidate readings, deterministically.
 
-    `added` and `removed` are identities one side has and the other does not.
-    `changed` is an identity BOTH state whose READING differs -- which, since
-    every stated identity field is part of the identity itself, means its
-    STATUS: a candidate the newer capture could read where the older one left
-    it `ambiguous`, or the reverse.
-
-    A snapshot may state one identity more than once; the register does. The
-    FIRST row wins, deterministically, because the rows arrive in a stable
-    order -- and the alternative, last-wins, would make the diff depend on
-    which duplicate happened to be read last.
-
-    Ordered by the identity's own values, so two runs over the same pair of
-    snapshots produce the same diff.
+    The pure form of the comparison, over rows already in hand. Production does
+    NOT go through here -- `GovernmentCatalogRefresh` asks the repository,
+    which asks PostgreSQL -- but it is the same rule, because both call
+    `backend/catalog/diff.py`.
     """
-    before: dict[tuple, Mapping[str, Any]] = {}
-    after: dict[tuple, Mapping[str, Any]] = {}
-    for row in previous:
-        before.setdefault(_identity(row), row)
-    for row in current:
-        after.setdefault(_identity(row), row)
-    added = [_delta(after[key], "added") for key in sorted(set(after) - set(before),
-                                                           key=lambda item: tuple(
-                                                               "" if part is None else str(part)
-                                                               for part in item))]
-    removed = [_delta(before[key], "removed") for key in sorted(set(before) - set(after),
-                                                                key=lambda item: tuple(
-                                                                    "" if part is None else str(part)
-                                                                    for part in item))]
-    changed: list[CandidateDelta] = []
-    for key in sorted(set(before) & set(after),
-                      key=lambda item: tuple("" if part is None else str(part) for part in item)):
-        if before[key].get("status") != after[key].get("status"):
-            changed.append(_delta(after[key], "changed", ("status",)))
-    total = len(added) + len(changed) + len(removed)
-    bounded = total > max_items
-    return SnapshotDiff(
-        previous_snapshot_key=previous_snapshot_key, snapshot_key=snapshot_key,
-        added_count=len(added), changed_count=len(changed), removed_count=len(removed),
-        # Dropped WHOLE when they do not fit, never truncated: the counts stay
-        # exact either way, and `bounded` says which happened.
-        added=() if bounded else tuple(added), changed=() if bounded else tuple(changed),
-        removed=() if bounded else tuple(removed), bounded=bounded)
+    return snapshot_diff_from_rows(
+        diff_rows(previous, current, limit=max_items),
+        previous_snapshot_key=previous_snapshot_key, snapshot_key=snapshot_key)
 
 
 class GovernmentCatalogRefresh:
@@ -288,11 +258,6 @@ class GovernmentCatalogRefresh:
                 active_snapshot_key=str(active["snapshot_key"]), no_op=True,
                 detail=("the register publishes the version this catalog already holds",))
 
-        # Read the PREVIOUS side before ingesting, and tolerate a bound: the
-        # comparison is a convenience on top of the capture, and refusing to
-        # capture because two snapshots are too large to compare would be the
-        # tail wagging the dog.
-        previous, previous_refusal = self._candidate_rows(active)
         report = GovernmentCatalogIngestor(
             self._repository, self._lease, client=self._client,
             cancellation_checker=self._cancellation_checker,
@@ -300,17 +265,7 @@ class GovernmentCatalogRefresh:
                 self._resource_id, package_id=package_id, query=query)
         landed = self._repository.find_active_catalog_snapshot(
             src.GOVERNMENT_SOURCE_FAMILY, self._resource_id, report.snapshot_key)
-        current, current_refusal = self._candidate_rows(landed)
-        refusal = previous_refusal or current_refusal or (
-            # The snapshot this ingestion just activated is not readable back.
-            # Comparing against an EMPTY set here would report every row of the
-            # other side as added or removed -- a fabricated diff, which is
-            # worse than no diff at all.
-            "GOV_PROJECTION_NO_ACTIVE_SNAPSHOT" if landed is None else None)
-        diff = None if refusal else diff_candidate_sets(
-            previous, current,
-            previous_snapshot_key=str(active["snapshot_key"]) if active is not None else "",
-            snapshot_key=report.snapshot_key)
+        diff, refusal = self._diff(active, landed, report.snapshot_key)
         self._emit("catalog_refresh_completed",
                    {"resource_id": self._resource_id, "snapshot_key": report.snapshot_key,
                     "added": diff.added_count if diff else 0,
@@ -356,34 +311,39 @@ class GovernmentCatalogRefresh:
                 and str(snapshot.get("upstream_version_kind")) == metadata.upstream_version_kind
                 and snapshot_usability(snapshot) is None)
 
-    def _candidate_rows(self, snapshot: Mapping[str, Any] | None
-                        ) -> tuple[tuple[Mapping[str, Any], ...], str | None]:
-        """One snapshot's candidates, or the static reason they were not read.
+    def _diff(self, previous: Mapping[str, Any] | None, landed: Mapping[str, Any] | None,
+              snapshot_key: str) -> tuple[SnapshotDiff | None, str | None]:
+        """Ask the DATABASE what changed, and never fabricate an answer.
 
-        Returns `(rows, refusal)` rather than raising, because the CAPTURE must
-        not be undone by a bound on the COMPARISON: by the time this is called
-        for the new side, an immutable snapshot has already landed and is
-        already readable.
+        Returns `(diff, refusal)` rather than raising, because the CAPTURE must
+        not be undone by a failure of the COMPARISON: by the time this is
+        called an immutable snapshot has already landed and is already
+        readable. What is absent on a refusal is the focused work item, not the
+        data.
 
-        Accumulating past `MAX_DIFF_SCAN_ROWS` is refused rather than truncated.
-        A truncated side would produce a diff that looks complete and is not --
-        every unread row of it reported as added or removed on the other side.
+        The comparison itself does not read a candidate row into this process
+        at all -- `catalog_snapshot_candidate_diff` computes it over both whole
+        snapshots and returns exact counts with at most `MAX_DIFF_ITEMS`
+        deltas. A first ingestion has no previous side, which is not a refusal:
+        everything is added, and the database is told so with a null.
         """
-        if snapshot is None:
-            return (), None
-        rows: list[Mapping[str, Any]] = []
-        offset = 0
-        while True:
-            self._check_cancelled()
-            page = list(self._repository.catalog_candidate_variant_page(
-                snapshot["id"], limit=MAX_RESULT_ITEMS, offset=offset,
-                allow_incomplete=False))
-            rows.extend(page)
-            if len(rows) > MAX_DIFF_SCAN_ROWS:
-                return (), "GOV_PROJECTION_BOUND_EXCEEDED"
-            if len(page) < MAX_RESULT_ITEMS:
-                return tuple(rows), None
-            offset += MAX_RESULT_ITEMS
+        self._check_cancelled()
+        if landed is None:
+            # The snapshot this ingestion just activated is not readable back.
+            # Comparing against an EMPTY set here would report every row of the
+            # other side as added or removed -- a fabricated diff, which is
+            # worse than no diff at all.
+            return None, "GOV_PROJECTION_NO_ACTIVE_SNAPSHOT"
+        try:
+            rows = list(self._repository.catalog_snapshot_candidate_diff(
+                None if previous is None else previous["id"], landed["id"],
+                limit=MAX_DIFF_ITEMS, allow_incomplete=False))
+        except AppError:
+            return None, "GOV_QUERY_UNAVAILABLE"
+        self._check_cancelled()
+        return snapshot_diff_from_rows(
+            rows, snapshot_key=snapshot_key,
+            previous_snapshot_key="" if previous is None else str(previous["snapshot_key"])), None
 
     def _check_cancelled(self) -> None:
         if self._cancellation_checker is not None and self._cancellation_checker():
@@ -394,6 +354,6 @@ class GovernmentCatalogRefresh:
             self._event_sink(event_type, dict(payload))
 
 
-__all__ = ["DIFF_IDENTITY", "MAX_DIFF_ITEMS", "MAX_DIFF_SCAN_ROWS", "CandidateDelta",
+__all__ = ["DIFF_IDENTITY", "MAX_DIFF_ITEMS", "CandidateDelta",
            "GovernmentCatalogRefresh", "RefreshOutcome", "SnapshotDiff",
-           "diff_candidate_sets"]
+           "candidate_identity", "diff_candidate_sets", "snapshot_diff_from_rows"]

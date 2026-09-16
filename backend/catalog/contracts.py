@@ -254,6 +254,46 @@ def stated_source_locator(locator: Mapping[str, Any] | None) -> dict[str, int]:
     return stated
 
 
+#: The R4 identity dimensions a catalog CANDIDATE can also state. The two
+#: closed vocabularies overlap here and nowhere else: a dimension only one side
+#: names is left unstated rather than translated into the nearest word.
+#:
+#: `model_code` and `trim` are R4 identity dimensions too, but they are columns
+#: on a candidate rather than entries in `identity_dimensions`, so they are
+#: handled separately by every caller.
+SHARED_IDENTITY_DIMENSIONS = ("body_style", "drivetrain", "generation", "transmission")
+
+
+def record_locator_id(snapshot_key: str, upstream_record_id: str) -> str:
+    """The catalog's durable LOCATOR RECORD IDENTITY: one captured row.
+
+    The upstream id alone is NOT enough. It is unique within a snapshot and a
+    register reuses its number space across captures, so a locator built from
+    it alone would point at "row 36451" of no particular retrieval -- and two
+    different vehicles from two snapshots would share one durable locator.
+
+    Mirrored in SQL by `public.catalog_record_locator_id`, which
+    `20260916120000_catalog_field_level_promotion.sql` uses to refuse a promoted
+    fact whose evidence was read from a record other than the candidate's own.
+    """
+    return f"{snapshot_key}:{upstream_record_id}"
+
+
+def claim_entity_key(model_canonical_key: str, model_year: Any) -> str:
+    """The VEHICLE a catalog fact is about: one canonical model, at one year.
+
+    Keyed on the CANONICAL MODEL rather than on the source's own row id, so a
+    Government claim and a future Web claim about the same car share a scope
+    and can therefore conflict -- which is the point. Bounded by construction
+    (a 36-character model key, a colon and a year), which matters: a marque and
+    a commercial model together can exceed the 200-character bound on an entity
+    key, and truncating an identity is how two vehicles become one.
+
+    Mirrored in SQL by `public.catalog_claim_entity_key`.
+    """
+    return f"{model_canonical_key}:{model_year}"
+
+
 class _Absent:
     """The distinct marker for "this payload states nothing here".
 
@@ -281,6 +321,7 @@ __all__ = ["ABSENT", "CANDIDATE_IDENTITY_DIMENSIONS", "CANDIDATE_STATUSES",
            "CONTENT_SHA256_PATTERN", "IDEMPOTENCY_KEY_PATTERN",
            "MAX_RAW_PAYLOAD_CHARS", "MAX_RAW_RECORD_LOCATOR_CHARS",
            "MAX_RAW_RECORD_LOCATOR_POSITION", "MAX_RETRIEVAL_METADATA_CHARS",
-           "RAW_RECORD_LOCATOR_KEYS", "SNAPSHOT_VALIDATION_STATES", "TRUST_STATE_BY_FAMILY",
-           "is_evidence_family", "stated_identity_dimensions", "stated_source_locator",
-           "trust_state_for"]
+           "RAW_RECORD_LOCATOR_KEYS", "SHARED_IDENTITY_DIMENSIONS",
+           "SNAPSHOT_VALIDATION_STATES", "TRUST_STATE_BY_FAMILY",
+           "claim_entity_key", "is_evidence_family", "record_locator_id",
+           "stated_identity_dimensions", "stated_source_locator", "trust_state_for"]

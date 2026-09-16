@@ -181,6 +181,22 @@ class VariantResolutionResult:
         return self.match_count > 1
 
 
+#: The column every bounded aggregation carries the EXACT match count in.
+TOTAL_COUNT_FIELD = "total_count"
+
+
+def is_count_row(row: Mapping[str, Any]) -> bool:
+    """Whether one returned row is the COUNT ROW rather than a result.
+
+    A page whose offset is past the last matching row has no rows to hang the
+    count on, so the aggregation returns exactly one row with every item column
+    null and the real total. Recognising it by SHAPE keeps this generic: no
+    caller needs to know which column a particular aggregation would have
+    filled in.
+    """
+    return all(value is None for name, value in row.items() if name != TOTAL_COUNT_FIELD)
+
+
 def bounded_limit(limit: Any) -> int:
     """The server-owned page bound. A caller asking for more gets this many."""
     try:
@@ -255,13 +271,13 @@ class GovernmentCatalogQuery:
     def list_manufacturers(self, *, limit: int = DEFAULT_RESULT_ITEMS,
                            offset: int = 0) -> QueryPage:
         snapshot, provenance = self._active(), self.dataset_metadata()
-        rows = self._read(self._repository.catalog_candidate_manufacturers,
-                          snapshot["id"], limit=limit, offset=offset)
+        rows, total = self._read(self._repository.catalog_candidate_manufacturers,
+                                 snapshot["id"], limit=limit, offset=offset)
         return self._page([ManufacturerCoverage(
             manufacturer=str(row["manufacturer"]),
             model_count=int(row["model_count"]), variant_count=int(row["variant_count"]),
             ambiguous_variant_count=int(row["ambiguous_variant_count"]))
-            for row in rows], rows, limit, offset, provenance)
+            for row in rows], total, limit, offset, provenance)
 
     def get_manufacturer_summary(self, manufacturer: str) -> ManufacturerCoverage | None:
         """ONE manufacturer's coverage, or None when the snapshot states none.
@@ -273,20 +289,21 @@ class GovernmentCatalogQuery:
         page = self.list_variants(manufacturer=str(manufacturer), limit=1, offset=0)
         if page.total == 0:
             return None
-        models = self._read(self._repository.catalog_candidate_models, self._active()["id"],
-                            manufacturer=str(manufacturer), limit=1, offset=0)
+        _models, model_count = self._read(
+            self._repository.catalog_candidate_models, self._active()["id"],
+            manufacturer=str(manufacturer), limit=1, offset=0)
         ambiguous = self.list_variants(manufacturer=str(manufacturer), status="ambiguous",
                                        limit=1, offset=0)
         return ManufacturerCoverage(
-            manufacturer=str(manufacturer),
-            model_count=int(models[0]["total_count"]) if models else 0,
+            manufacturer=str(manufacturer), model_count=model_count,
             variant_count=page.total, ambiguous_variant_count=ambiguous.total)
 
     def list_models(self, manufacturer: str, *, limit: int = DEFAULT_RESULT_ITEMS,
                     offset: int = 0) -> QueryPage:
         provenance = self.dataset_metadata()
-        rows = self._read(self._repository.catalog_candidate_models, self._active()["id"],
-                          manufacturer=str(manufacturer), limit=limit, offset=offset)
+        rows, total = self._read(self._repository.catalog_candidate_models,
+                                 self._active()["id"], manufacturer=str(manufacturer),
+                                 limit=limit, offset=offset)
         return self._page([ModelCoverage(
             manufacturer=str(row["manufacturer"]),
             commercial_model=str(row["commercial_model"]),
@@ -294,20 +311,21 @@ class GovernmentCatalogQuery:
             ambiguous_variant_count=int(row["ambiguous_variant_count"]),
             model_year_start=_whole(row.get("model_year_start")),
             model_year_end=_whole(row.get("model_year_end")))
-            for row in rows], rows, limit, offset, provenance)
+            for row in rows], total, limit, offset, provenance)
 
     def list_model_years(self, manufacturer: str, commercial_model: str, *,
                          limit: int = DEFAULT_RESULT_ITEMS, offset: int = 0) -> QueryPage:
         provenance = self.dataset_metadata()
-        rows = self._read(self._repository.catalog_candidate_model_years, self._active()["id"],
-                          manufacturer=str(manufacturer),
-                          commercial_model=str(commercial_model), limit=limit, offset=offset)
+        rows, total = self._read(self._repository.catalog_candidate_model_years,
+                                 self._active()["id"], manufacturer=str(manufacturer),
+                                 commercial_model=str(commercial_model),
+                                 limit=limit, offset=offset)
         return self._page([ModelYearSummary(
             manufacturer=str(row["manufacturer"]),
             commercial_model=str(row["commercial_model"]),
             model_year=int(row["model_year"]), variant_count=int(row["variant_count"]),
             ambiguous_variant_count=int(row["ambiguous_variant_count"]))
-            for row in rows], rows, limit, offset, provenance)
+            for row in rows], total, limit, offset, provenance)
 
     def list_variants(self, *, manufacturer: str | None = None,
                       commercial_model: str | None = None, model_year: int | None = None,
@@ -322,14 +340,14 @@ class GovernmentCatalogQuery:
         states.
         """
         provenance = self.dataset_metadata()
-        rows = self._read(
+        rows, total = self._read(
             self._repository.catalog_candidate_variant_page, self._active()["id"],
             manufacturer=manufacturer, commercial_model=commercial_model,
             model_year=model_year, official_model_code=official_model_code, trim=trim,
             identity_dimensions=dict(identity_dimensions or {}) or None, status=status,
             limit=limit, offset=offset)
         return self._page([self._variant_row(row, provenance) for row in rows],
-                          rows, limit, offset, provenance)
+                          total, limit, offset, provenance)
 
     def find_by_model_code(self, official_model_code: str, *,
                            limit: int = DEFAULT_RESULT_ITEMS, offset: int = 0) -> QueryPage:
@@ -386,8 +404,12 @@ class GovernmentCatalogQuery:
         return row
 
     def _read(self, reader: Callable[..., Sequence[Mapping[str, Any]]], snapshot_id: Any,
-              **kwargs: Any) -> list[Mapping[str, Any]]:
+              **kwargs: Any) -> tuple[list[Mapping[str, Any]], int]:
         """One bounded database read, with the shared cancellation gate.
+
+        Returns the page's rows AND the exact total the filter matched, which
+        are two different things: a page whose offset is past the last matching
+        row has no rows and a total of thousands.
 
         Every repository refusal collapses to ONE static reason: the underlying
         message can quote SQL values, and a classification is what a caller of
@@ -402,7 +424,12 @@ class GovernmentCatalogQuery:
         except AppError:
             raise GovernmentProjectionError("GOV_QUERY_UNAVAILABLE") from None
         self._check_cancelled()
-        return rows
+        # The aggregation carries `total_count` on every row, and on a COUNT
+        # ROW when the page is empty -- one row whose every other column is
+        # null. Reading the total before dropping it is what makes an
+        # out-of-range page report the real total instead of zero.
+        total = int(rows[0][TOTAL_COUNT_FIELD]) if rows else 0
+        return [row for row in rows if not is_count_row(row)], total
 
     def _variant_row(self, row: Mapping[str, Any],
                      provenance: DatasetProvenance) -> CandidateVariantRow:
@@ -423,17 +450,16 @@ class GovernmentCatalogQuery:
             upstream_version_kind=provenance.upstream_version_kind)
 
     @staticmethod
-    def _page(items: Sequence[Any], rows: Sequence[Mapping[str, Any]], limit: Any,
-              offset: Any, provenance: DatasetProvenance) -> QueryPage:
-        """Assemble one page, taking the total from the database's own count.
+    def _page(items: Sequence[Any], total: int, limit: Any, offset: Any,
+              provenance: DatasetProvenance) -> QueryPage:
+        """Assemble one page around the database's own exact count.
 
-        An empty page states total 0 rather than guessing: the aggregation
-        returns `total_count` on every row, so a page with no rows carries no
-        count to read and there is nothing to infer from its emptiness.
+        The total is NEVER inferred from the page: `_read` took it from the
+        aggregation, which states it whether or not the page has rows.
         """
-        total = int(rows[0]["total_count"]) if rows else 0
-        return QueryPage(items=tuple(items), total=total, offset=bounded_offset(offset),
-                         limit=bounded_limit(limit), provenance=provenance)
+        return QueryPage(items=tuple(items), total=int(total),
+                         offset=bounded_offset(offset), limit=bounded_limit(limit),
+                         provenance=provenance)
 
     def _check_cancelled(self) -> None:
         if self._cancellation_checker is not None and self._cancellation_checker():
@@ -449,5 +475,6 @@ def _whole(value: Any) -> int | None:
 __all__ = ["IDENTITY_RECORD_FIELDS", "IDENTITY_RECORD_FIELD_TYPES",
            "MAX_RESOLUTION_MATCHES", "CandidateVariantRow",
            "GovernmentCatalogQuery", "ManufacturerCoverage", "ModelCoverage", "QueryPage",
-           "VariantResolutionResult", "bounded_limit", "bounded_offset",
+           "TOTAL_COUNT_FIELD", "VariantResolutionResult", "bounded_limit",
+           "bounded_offset", "is_count_row",
            "identity_projection"]

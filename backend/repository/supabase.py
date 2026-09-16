@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Protocol
 from uuid import UUID
 from supabase import create_client
+from backend.catalog.diff import MAX_DIFF_ITEMS
 from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
                                       prepare_promotion, prepare_raw_record,
                                       prepare_snapshot)
@@ -95,6 +96,7 @@ class Repository(Protocol):
     def catalog_candidate_model_years(self, snapshot_id: Any, *, manufacturer: str, commercial_model: str, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
     def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, official_model_code: str | None = None, trim: str | None = None, identity_dimensions: dict[str, Any] | None = None, status: str | None = None, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
     def catalog_raw_record_by_upstream_id(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None: ...
+    def catalog_snapshot_candidate_diff(self, previous_snapshot_id: Any, snapshot_id: Any, *, limit: int = MAX_DIFF_ITEMS, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
 
     # --- field-level canonical promotion (PR3) -------------------------------
     #
@@ -968,6 +970,21 @@ class SupabaseRepository:
             "p_trim": None if trim is None else str(trim),
             "p_identity_dimensions": dict(identity_dimensions) if identity_dimensions else None,
             "p_status": None if status is None else str(status)})
+
+    def catalog_snapshot_candidate_diff(self, previous_snapshot_id: Any, snapshot_id: Any, *, limit: int = MAX_DIFF_ITEMS, allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        """What changed between two snapshots, compared INSIDE the database.
+
+        The counts come back exact for the whole resource; only the delta list
+        is bounded. Nothing about either snapshot is read into this process to
+        produce them, which is what keeps a ~101 000-row comparison from being
+        an unbounded read.
+        """
+        return self._read_rpc("catalog_snapshot_candidate_diff", {
+            "p_previous_snapshot_id": None if previous_snapshot_id is None
+                                      else str(previous_snapshot_id),
+            "p_snapshot_id": str(snapshot_id),
+            "p_limit": max(0, min(int(limit), MAX_DIFF_ITEMS)),
+            "p_allow_incomplete": bool(allow_incomplete)})
 
     def catalog_raw_record_by_upstream_id(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None:
         rows = self._read_rpc("catalog_raw_record_by_upstream_id",

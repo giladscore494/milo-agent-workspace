@@ -146,6 +146,22 @@ create index if not exists catalog_candidate_variants_snapshot_status_idx
 -- Each returns `total_count`: the EXACT number of rows the filter matched,
 -- computed over the same filtered set the page comes from, so `has_more` is a
 -- fact rather than "the page came back full".
+--
+-- THE EMPTY PAGE, and why it still carries the count
+-- --------------------------------------------------
+--
+-- A page whose offset is past the last matching row has no rows to hang the
+-- count on, and a reader that inferred "no rows, therefore nothing matched"
+-- would report a total of 0 for a filter that matched thousands -- and would
+-- then say `has_more` is false while every row is still unread.
+--
+-- So every function below joins its page to a one-row anchor. When the page is
+-- empty the anchor still produces exactly ONE row: every item column NULL, and
+-- `total_count` the real count. `_read` in
+-- `backend/catalog/government/query.py` recognises that row by its shape --
+-- every column except `total_count` is null -- drops it from the items, and
+-- keeps the count. It is a COUNT ROW, never a result, and it is the same shape
+-- in all four functions so no caller needs per-function knowledge.
 
 create or replace function public.catalog_candidate_manufacturers(
   p_snapshot_id uuid, p_limit integer default 50, p_offset integer default 0,
@@ -171,11 +187,16 @@ begin
       from public.catalog_candidate_variants c
      where c.snapshot_id = p_snapshot_id
      group by c.manufacturer
+  ), page as (
+    select g.name, g.models, g.variants, g.ambiguous
+      from grouped g
+     order by g.name collate "C"
+     limit v_limit offset v_offset
   )
-  select g.name, g.models, g.variants, g.ambiguous, (select count(*) from grouped)
-    from grouped g
-   order by g.name collate "C"
-   limit v_limit offset v_offset;
+  select p.name, p.models, p.variants, p.ambiguous, (select count(*) from grouped)
+    from (select 1) as anchor
+    left join page p on true
+   order by p.name collate "C" nulls last;
 end;
 $$;
 
@@ -208,12 +229,20 @@ begin
       from public.catalog_candidate_variants c
      where c.snapshot_id = p_snapshot_id and c.manufacturer = p_manufacturer
      group by c.commercial_model
+  ), page as (
+    -- The manufacturer travels INSIDE the page, not as a parameter beside it,
+    -- so the count row's every item column is null and the shape is uniform.
+    select p_manufacturer as make, g.name, g.variants, g.ambiguous,
+           g.first_year, g.last_year
+      from grouped g
+     order by g.name collate "C"
+     limit v_limit offset v_offset
   )
-  select p_manufacturer, g.name, g.variants, g.ambiguous, g.first_year, g.last_year,
+  select p.make, p.name, p.variants, p.ambiguous, p.first_year, p.last_year,
          (select count(*) from grouped)
-    from grouped g
-   order by g.name collate "C"
-   limit v_limit offset v_offset;
+    from (select 1) as anchor
+    left join page p on true
+   order by p.name collate "C" nulls last;
 end;
 $$;
 
@@ -255,12 +284,18 @@ begin
            count(*)::integer as variants,
            count(*) filter (where e.status = 'ambiguous')::integer as ambiguous
       from expanded e group by e.model_year
+  ), page as (
+    select p_manufacturer as make, p_commercial_model as model, g.year,
+           g.variants, g.ambiguous
+      from grouped g
+     order by g.year
+     limit v_limit offset v_offset
   )
-  select p_manufacturer, p_commercial_model, g.year, g.variants, g.ambiguous,
+  select p.make, p.model, p.year, p.variants, p.ambiguous,
          (select count(*) from grouped)
-    from grouped g
-   order by g.year
-   limit v_limit offset v_offset;
+    from (select 1) as anchor
+    left join page p on true
+   order by p.year nulls last;
 end;
 $$;
 
@@ -328,18 +363,155 @@ begin
             or (c.model_year_start is not null
                 and p_model_year between c.model_year_start and c.model_year_end))
        and c.identity_dimensions @> v_dimensions
+  ), page as (
+    select m.*
+      from matched m
+     order by m.manufacturer collate "C", m.commercial_model collate "C",
+              m.model_year_start, m.model_year_end,
+              coalesce(m.official_model_code, '') collate "C",
+              coalesce(m.trim, '') collate "C", m.candidate_key collate "C"
+     limit v_limit offset v_offset
   )
-  select m.id, m.snapshot_id, m.raw_record_id, m.manufacturer, m.commercial_model,
-         m.model_year_start, m.model_year_end, m.official_model_code, m.trim,
-         m.identity_dimensions, m.status, m.candidate_key, m.upstream_record_id,
-         m.resource_id, m.source_locator, m.payload_sha256,
+  select p.id, p.snapshot_id, p.raw_record_id, p.manufacturer, p.commercial_model,
+         p.model_year_start, p.model_year_end, p.official_model_code, p.trim,
+         p.identity_dimensions, p.status, p.candidate_key, p.upstream_record_id,
+         p.resource_id, p.source_locator, p.payload_sha256,
          (select count(*) from matched)
-    from matched m
-   order by m.manufacturer collate "C", m.commercial_model collate "C",
-            m.model_year_start, m.model_year_end,
-            coalesce(m.official_model_code, '') collate "C",
-            coalesce(m.trim, '') collate "C", m.candidate_key collate "C"
-   limit v_limit offset v_offset;
+    from (select 1) as anchor
+    left join page p on true
+   order by p.manufacturer collate "C" nulls last, p.commercial_model collate "C",
+            p.model_year_start, p.model_year_end,
+            coalesce(p.official_model_code, '') collate "C",
+            coalesce(p.trim, '') collate "C", p.candidate_key collate "C";
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 4b. What changed between two snapshots of one resource -- computed HERE.
+-- ---------------------------------------------------------------------------
+--
+-- The one comparison in this namespace that spans a WHOLE snapshot. It runs
+-- inside PostgreSQL precisely so it never becomes an unbounded read: the real
+-- resource is ~101 000 candidate rows per side, and comparing them by reading
+-- both into a process would materialize 200 000 rows to answer one question.
+--
+-- What it returns, and what is bounded
+-- ------------------------------------
+--
+-- The three COUNTS are exact, always, over every matching row of both
+-- snapshots -- never over a page, and never refused for size. What is bounded
+-- is the ITEM LIST: at most `p_limit` delta rows, and dropped WHOLE rather
+-- than truncated when more than that changed, because a truncated list is a
+-- diff claiming a completeness it does not have.
+--
+-- An answer with no items is the same COUNT ROW shape the aggregations above
+-- return: one row, every delta column null, the three counts real. So "nothing
+-- changed" and "too much changed to list" are both counted exactly, and are
+-- told apart by the counts rather than by the absence of rows.
+--
+-- The IDENTITY is the candidate's complete stated identity including its
+-- dimensions, mirroring `DIFF_IDENTITY` in `backend/catalog/diff.py`. A
+-- snapshot may state one identity twice -- the register does -- and the FIRST
+-- row in the page order wins on both sides, which is what makes the comparison
+-- independent of which duplicate happened to be read last.
+create or replace function public.catalog_snapshot_candidate_diff(
+  p_previous_snapshot_id uuid, p_snapshot_id uuid, p_limit integer default 100,
+  p_allow_incomplete boolean default false
+) returns table (
+  state text, manufacturer text, commercial_model text,
+  model_year_start integer, model_year_end integer,
+  official_model_code text, "trim" text, changed_fields text[],
+  upstream_record_id text,
+  added_count bigint, changed_count bigint, removed_count bigint
+)
+language plpgsql stable
+set search_path = pg_catalog
+as $$
+declare v_limit integer;
+begin
+  -- Both sides must be READABLE snapshots, under the same gate every other
+  -- answer in this file passes: an unread or incomplete capture cannot state
+  -- what it is missing, so it cannot state what changed either. A null
+  -- previous side is the FIRST ingestion -- everything is added.
+  if p_previous_snapshot_id is not null then
+    perform public.catalog_readable_snapshot(p_previous_snapshot_id, p_allow_incomplete);
+  end if;
+  perform public.catalog_readable_snapshot(p_snapshot_id, p_allow_incomplete);
+  v_limit := greatest(0, least(coalesce(p_limit, 100), public.catalog_page_limit()));
+  return query
+  with reduced as (
+    select distinct on (c.snapshot_id, c.manufacturer, c.commercial_model,
+                        c.model_year_start, c.model_year_end,
+                        coalesce(c.official_model_code, ''), coalesce(c.trim, ''),
+                        c.identity_dimensions)
+           c.snapshot_id, c.manufacturer, c.commercial_model, c.model_year_start,
+           c.model_year_end, c.official_model_code, c.trim, c.identity_dimensions,
+           c.status, r.upstream_record_id
+      from public.catalog_candidate_variants c
+      join public.catalog_raw_records r
+        on r.id = c.raw_record_id and r.snapshot_id = c.snapshot_id
+     where c.snapshot_id = p_snapshot_id
+        or c.snapshot_id = p_previous_snapshot_id
+     order by c.snapshot_id, c.manufacturer, c.commercial_model, c.model_year_start,
+              c.model_year_end, coalesce(c.official_model_code, ''),
+              coalesce(c.trim, ''), c.identity_dimensions, c.candidate_key collate "C"
+  ), before as (
+    select * from reduced where snapshot_id = p_previous_snapshot_id
+  ), after as (
+    select * from reduced where snapshot_id = p_snapshot_id
+  ), paired as (
+    select case when b.snapshot_id is null then 'added'
+                when a.snapshot_id is null then 'removed'
+                when a.status is distinct from b.status then 'changed'
+                else 'unchanged' end as state,
+           coalesce(a.manufacturer, b.manufacturer) as manufacturer,
+           coalesce(a.commercial_model, b.commercial_model) as commercial_model,
+           coalesce(a.model_year_start, b.model_year_start) as model_year_start,
+           coalesce(a.model_year_end, b.model_year_end) as model_year_end,
+           coalesce(a.official_model_code, b.official_model_code) as official_model_code,
+           coalesce(a.trim, b.trim) as trim,
+           coalesce(a.upstream_record_id, b.upstream_record_id) as upstream_record_id
+      from after a
+      full outer join before b
+        on b.manufacturer = a.manufacturer
+       and b.commercial_model = a.commercial_model
+       and b.model_year_start is not distinct from a.model_year_start
+       and b.model_year_end is not distinct from a.model_year_end
+       -- The optional identity columns are NEVER the empty string (a CHECK on
+       -- the table refuses one), so coalescing to it is an injective way to
+       -- join on "both absent" without a three-way comparison.
+       and coalesce(b.official_model_code, '') = coalesce(a.official_model_code, '')
+       and coalesce(b.trim, '') = coalesce(a.trim, '')
+       and b.identity_dimensions = a.identity_dimensions
+  ), counted as (
+    select count(*) filter (where p.state = 'added') as added,
+           count(*) filter (where p.state = 'changed') as changed,
+           count(*) filter (where p.state = 'removed') as removed
+      from paired p
+  ), page as (
+    select p.state, p.manufacturer, p.commercial_model, p.model_year_start,
+           p.model_year_end, p.official_model_code, p.trim,
+           case when p.state = 'changed' then array['status']::text[]
+                else '{}'::text[] end as changed_fields,
+           p.upstream_record_id
+      from paired p
+     where p.state <> 'unchanged'
+       and (select c.added + c.changed + c.removed from counted c) <= v_limit
+     order by p.state, p.manufacturer collate "C", p.commercial_model collate "C",
+              p.model_year_start, p.model_year_end,
+              coalesce(p.official_model_code, '') collate "C",
+              coalesce(p.trim, '') collate "C", p.upstream_record_id collate "C"
+     limit v_limit
+  )
+  select d.state, d.manufacturer, d.commercial_model, d.model_year_start,
+         d.model_year_end, d.official_model_code, d.trim, d.changed_fields,
+         d.upstream_record_id, c.added, c.changed, c.removed
+    from counted c
+    left join page d on true
+   order by d.state nulls last, d.manufacturer collate "C", d.commercial_model collate "C",
+            d.model_year_start, d.model_year_end,
+            coalesce(d.official_model_code, '') collate "C",
+            coalesce(d.trim, '') collate "C", d.upstream_record_id collate "C";
 end;
 $$;
 
@@ -385,6 +557,7 @@ begin
     'public.catalog_candidate_models(uuid,text,integer,integer,boolean)',
     'public.catalog_candidate_model_years(uuid,text,text,integer,integer,boolean)',
     'public.catalog_candidate_variant_page(uuid,text,text,integer,text,text,jsonb,text,integer,integer,boolean)',
+    'public.catalog_snapshot_candidate_diff(uuid,uuid,integer,boolean)',
     'public.catalog_raw_record_by_upstream_id(uuid,text,boolean)'
   ] loop
     execute format('revoke execute on function %s from public', fn);

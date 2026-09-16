@@ -1030,8 +1030,12 @@ def test_no_yeda_or_web_tool_is_registered_or_mapped_and_the_sink_is_routed():
     worker_main = "\n".join(line.split("#", 1)[0] for line
                             in Path("backend/worker/main.py").read_text().splitlines())
     assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in worker_main
-    assert "tool_result_sink=evidence_sink" in worker_main
     assert "RegisteredOperationEvidenceSink(" in worker_main
+    # Catalog PR3 wraps the production sink in the trusted promotion LEDGER, so
+    # the worker's tool-result sink is the ledger and the ledger delegates to
+    # the sink. Nothing is bypassed: the ledger writes nothing of its own.
+    assert "CatalogEvidenceLedger(evidence_sink," in worker_main
+    assert "tool_result_sink=ledger," in worker_main
     # Read scope only, and no write approval anywhere in the wiring.
     assert "ToolContext(scopes=frozenset({GOVERNMENT_TOOL_SCOPE})" in worker_main
     assert "write_approved" not in worker_main

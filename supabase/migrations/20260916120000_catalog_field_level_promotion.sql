@@ -65,6 +65,24 @@
 -- revision of an identity field whose value is not the column's. Only
 -- `identity_dimensions` is revisable in place, and for it the view is the only
 -- place a reader should look.
+--
+-- IDENTITY versus REVISABLE FACT, stated once for the whole schema
+-- ----------------------------------------------------------------
+--
+-- A canonical variant IS: its model, its model year range, its official model
+-- code and its trim. Four places say so and they say the same thing --
+-- `canonical_variant_key` in `backend/catalog/keys.py` derives the key from
+-- exactly those four, `catalog_canonical_identity_field()` freezes exactly
+-- those four, `catalog_model_variants_natural_uidx` is unique on exactly those
+-- four, and `promote_catalog_variant_guarded` refuses a promotion whose
+-- identity is not its candidate's.
+--
+-- `identity_dimensions` is a FACT ABOUT the variant, not part of who it is. A
+-- better source may revise the fuel type, and that appends a provenance
+-- revision to this same variant rather than naming a second vehicle. The
+-- COLUMN on `catalog_model_variants` is what revision 1 established and never
+-- changes, exactly like the other columns; `catalog_canonical_variant_current`
+-- is where the CURRENT dimensions are read.
 
 -- ---------------------------------------------------------------------------
 -- 1. The closed vocabulary of promotable fields, as a database function.
@@ -126,6 +144,73 @@ as $$
                                   'official_model_code', 'trim'), false)
 $$;
 
+-- The catalog's durable LOCATOR RECORD IDENTITY: which captured row a focused
+-- evidence locator points at. A locator's record component is the SNAPSHOT KEY
+-- and the upstream row id together, because the register reuses its `_id`
+-- number space across captures -- so the bare upstream id would name "row
+-- 36451" of no particular retrieval, and two different vehicles from two
+-- snapshots would share one durable locator.
+--
+-- Mirrored by `government_record_id()` in
+-- `backend/catalog/government/evidence.py`; the two spellings are pinned
+-- together by `tests/test_catalog_migration_static.py`. This is a CATALOG
+-- convention, not a Government one: any future source family that captures
+-- rows into `catalog_raw_records` locates them the same way.
+create or replace function public.catalog_record_locator_id(
+  p_snapshot_key text, p_upstream_record_id text
+) returns text
+language sql immutable
+set search_path = pg_catalog
+as $$
+  select case when p_snapshot_key is null or p_upstream_record_id is null
+              then null else p_snapshot_key || ':' || p_upstream_record_id end
+$$;
+
+-- The ENTITY a claim about one canonical vehicle is filed under: the canonical
+-- model's own key, at one model year. Mirrored by `government_entity_key()` in
+-- `backend/catalog/government/evidence.py`.
+--
+-- Using the MODEL KEY rather than the source's row id is what lets a
+-- Government claim and a future Web claim about the same car meet, conflict
+-- and be resolved -- and it is what makes "this evidence is about this
+-- canonical row" checkable here without re-deriving a digest, because the
+-- model key is a column this schema already stores.
+create or replace function public.catalog_claim_entity_key(
+  p_model_canonical_key text, p_model_year integer
+) returns text
+language sql immutable
+set search_path = pg_catalog
+as $$
+  select case when p_model_canonical_key is null or p_model_year is null
+              then null else p_model_canonical_key || ':' || p_model_year::text end
+$$;
+
+-- The R4 scope normalization, mirrored for the ONE comparison below that needs
+-- it: `claims.identity_scope` is stored NORMALIZED (see `normalize_identity` in
+-- `backend/engines/swarm_v2/comparison.py`), so comparing it to a candidate's
+-- raw text would reject every value that merely differs in case or separator.
+--
+-- Unicode NFKC, case folding, `_` and `-` unified to a space, whitespace runs
+-- collapsed and trimmed -- the same four steps, in the same order, as
+-- `_normalize_text` in `backend/engines/swarm_v2/normalization.py`, pinned
+-- against it over a real vocabulary by `tests/test_migrations_postgres.py`.
+--
+-- `lower()` is PostgreSQL's nearest equivalent of Python's `casefold()`. They
+-- differ only for characters the closed identity vocabulary does not contain
+-- (eszett, the final sigma, a handful of ligatures NFKC has already expanded),
+-- and where they could differ the consequence is a REFUSAL, never an
+-- acceptance: a promoted fact is rejected for a scope mismatch that is really
+-- a spelling difference, which is the safe direction to fail in.
+create or replace function public.r4_normalized_scope_text(p_value text)
+returns text
+language sql immutable
+set search_path = pg_catalog
+as $$
+  select case when p_value is null then null else
+    btrim(regexp_replace(translate(lower(normalize(p_value, NFKC)), '_-', '  '),
+                         '\s+', ' ', 'g')) end
+$$;
+
 -- ---------------------------------------------------------------------------
 -- 2. The append-only field provenance relation.
 -- ---------------------------------------------------------------------------
@@ -160,6 +245,16 @@ create table if not exists public.catalog_canonical_field_provenance (
   source_version text not null,
   source_version_kind text not null,
   record_locator text not null,
+  -- The SCOPE the cited claim stated, derived from it and stored here so a
+  -- reviewer can read WHICH vehicle, WHICH model year, WHICH market and WHICH
+  -- identity a canonical fact was established under without joining four
+  -- relations -- and so the trigger below can hold every later fact about this
+  -- variant to the same scope with a plain comparison.
+  entity_key text not null,
+  market text not null,
+  geography text not null,
+  time_scope jsonb not null,
+  identity_scope jsonb not null,
   promotion_key text not null,
   created_at timestamptz not null default now(),
   constraint catalog_canonical_field_provenance_field_allowlisted
@@ -177,7 +272,19 @@ create table if not exists public.catalog_canonical_field_provenance (
   constraint catalog_canonical_field_provenance_version_valid
     check (public.r3_source_version_valid(source_version_kind, source_version)),
   constraint catalog_canonical_field_provenance_key_derived
-    check (promotion_key ~ '^cp1\.[0-9a-f]{32}$')
+    check (promotion_key ~ '^cp1\.[0-9a-f]{32}$'),
+  constraint catalog_canonical_field_provenance_entity_bounded
+    check (char_length(entity_key) between 1 and 200),
+  constraint catalog_canonical_field_provenance_market_bounded
+    check (char_length(market) between 1 and 120
+           and char_length(geography) between 1 and 120),
+  constraint catalog_canonical_field_provenance_scope_bounded
+    check (jsonb_typeof(time_scope) = 'object'
+           and jsonb_typeof(identity_scope) = 'object'
+           and char_length(time_scope::text) <= 512
+           and char_length(identity_scope::text) <= 1024),
+  constraint catalog_canonical_field_provenance_identity_scope_closed
+    check (public.r4_identity_scope_valid(identity_scope))
 );
 
 -- One value per field per revision: a revision is a POSITION in a field's
@@ -235,7 +342,13 @@ declare
   v_claim public.claims;
   v_verdict public.claim_verdicts;
   v_variant public.catalog_model_variants;
+  v_model public.catalog_models;
+  v_source public.sources;
+  v_record public.catalog_raw_records;
   v_expected jsonb;
+  v_identity jsonb;
+  v_year integer;
+  v_expected_keys text[];
 begin
   select * into v_link from public.catalog_candidate_evidence_links
     where id = new.evidence_link_id;
@@ -349,6 +462,184 @@ begin
     end if;
   end if;
 
+  -- ---------------------------------------------------------------------
+  -- THE VEHICLE. The candidate must be a reading OF THIS CANONICAL ROW.
+  -- ---------------------------------------------------------------------
+  --
+  -- Everything above proves the evidence is sound. None of it proves the
+  -- evidence is about the vehicle being written. Without the three gates
+  -- below, a verified, located, conflict-free fact about one car could be
+  -- promoted onto another, which is the worst failure this table has.
+  select * into v_model from public.catalog_models where id = v_variant.model_id;
+  if v_model.id is null then
+    raise exception 'canonical field provenance cites no canonical model' using errcode = '23503';
+  end if;
+  if v_candidate.manufacturer is distinct from v_model.manufacturer
+     or v_candidate.commercial_model is distinct from v_model.commercial_model then
+    raise exception 'canonical field provenance cites a candidate for another vehicle'
+      using errcode = '22023';
+  end if;
+  -- The four identity fields, which a revision may never restate differently
+  -- (`catalog_canonical_identity_field`). A later snapshot's candidate may
+  -- revise a DIMENSION of this variant; it may not be a candidate for a
+  -- different year range, code or trim and still support this row.
+  if v_candidate.model_year_start is distinct from v_variant.model_year_start
+     or v_candidate.model_year_end is distinct from v_variant.model_year_end
+     or v_candidate.official_model_code is distinct from v_variant.official_model_code
+     or v_candidate.trim is distinct from v_variant.trim then
+    raise exception 'canonical field provenance cites a candidate for another variant'
+      using errcode = '22023';
+  end if;
+
+  -- ---------------------------------------------------------------------
+  -- THE TIME SCOPE, and THE ENTITY.
+  -- ---------------------------------------------------------------------
+  if v_claim.time_scope->>'model_year' is null
+     or (v_claim.time_scope->>'model_year') !~ '^[0-9]{4}$' then
+    raise exception 'canonical field provenance claim states no model year scope'
+      using errcode = '22023';
+  end if;
+  v_year := (v_claim.time_scope->>'model_year')::integer;
+  if v_year < v_variant.model_year_start or v_year > v_variant.model_year_end then
+    raise exception 'canonical field provenance claim is scoped to another model year'
+      using errcode = '22023';
+  end if;
+  -- The claim's entity must be THIS canonical model at THAT model year. Exact
+  -- rather than normalized: the model key is a digest this schema stores, so
+  -- there is nothing to fold and nothing to guess.
+  if v_claim.entity_key is distinct from
+       public.catalog_claim_entity_key(v_model.canonical_key, v_year) then
+    raise exception 'canonical field provenance claim is about another vehicle'
+      using errcode = '22023';
+  end if;
+
+  -- ---------------------------------------------------------------------
+  -- THE MARKET AND GEOGRAPHY.
+  -- ---------------------------------------------------------------------
+  --
+  -- A vehicle fact is a fact somewhere. A claim that names no market states a
+  -- value that cannot be compared to any other, and a canonical catalog built
+  -- out of unscoped values is a catalog that silently mixes markets.
+  if nullif(btrim(coalesce(v_claim.market, '')), '') is null
+     or nullif(btrim(coalesce(v_claim.geography, '')), '') is null then
+    raise exception 'canonical field provenance claim states no market scope'
+      using errcode = '22023';
+  end if;
+
+  -- ---------------------------------------------------------------------
+  -- THE IDENTITY SCOPE.
+  -- ---------------------------------------------------------------------
+  --
+  -- The identity a claim narrows itself to must be EXACTLY the identity the
+  -- candidate states: an extra dimension means the evidence is about a
+  -- narrower vehicle than this row, a missing one means it is about a wider
+  -- one, and neither is evidence for THIS variant. The key set is compared
+  -- first and exactly, because a key is never normalized.
+  v_identity := coalesce(v_claim.identity_scope, '{}'::jsonb);
+  select coalesce(array_agg(expected.name order by expected.name), '{}'::text[])
+    into v_expected_keys
+    from (
+      select d.key as name
+        from jsonb_object_keys(v_candidate.identity_dimensions) as d(key)
+       where d.key in ('body_style', 'drivetrain', 'generation', 'transmission')
+      union all
+      select 'model_code' where v_candidate.official_model_code is not null
+      union all
+      select 'trim' where v_candidate.trim is not null
+    ) as expected;
+  if coalesce((select array_agg(e.name order by e.name)
+                 from jsonb_object_keys(v_identity) as e(name)), '{}'::text[])
+       is distinct from v_expected_keys then
+    raise exception 'canonical field provenance claim is scoped to another vehicle identity'
+      using errcode = '22023';
+  end if;
+  -- ... and every value, compared under the SAME normalization R4 stored it
+  -- with, must be the candidate's own.
+  if exists (
+      select 1 from jsonb_each_text(v_identity) as e(name, value)
+       where e.value is distinct from public.r4_normalized_scope_text(
+               case e.name
+                 when 'model_code' then v_candidate.official_model_code
+                 when 'trim' then v_candidate.trim
+                 else v_candidate.identity_dimensions->>e.name
+               end)) then
+    raise exception 'canonical field provenance claim is scoped to another vehicle identity'
+      using errcode = '22023';
+  end if;
+
+  -- ---------------------------------------------------------------------
+  -- THE SOURCE RECORD the evidence was read from.
+  -- ---------------------------------------------------------------------
+  --
+  -- A candidate is a READING of one captured upstream row. The evidence that
+  -- promotes it must have been read from THAT row: a locator pointing into a
+  -- different record of the same snapshot is evidence about a different
+  -- vehicle wearing this candidate's link.
+  select * into v_record from public.catalog_raw_records
+    where id = v_candidate.raw_record_id;
+  if v_record.id is null then
+    raise exception 'canonical field provenance cites no source record' using errcode = '23503';
+  end if;
+  if v_claim.evidence_locator is distinct from v_link.record_locator then
+    raise exception 'canonical field provenance locator does not match its cited claim'
+      using errcode = '22023';
+  end if;
+  if public.r3_canonical_locator(v_link.record_locator)->>1 is distinct from
+       public.catalog_record_locator_id(v_snapshot.snapshot_key, v_record.upstream_record_id) then
+    raise exception 'canonical field provenance cites evidence read from another source record'
+      using errcode = '22023';
+  end if;
+
+  -- ---------------------------------------------------------------------
+  -- ONE RUN. The lease's authority, carried down to the stored fact.
+  -- ---------------------------------------------------------------------
+  --
+  -- `promote_catalog_variant_guarded` proves the promoting run holds a valid
+  -- worker lease before it writes anything. A trigger cannot assert a lease --
+  -- it does not know the token -- but it CAN refuse to let a promotion be
+  -- attributed to a run other than the one that gathered, verified and linked
+  -- the evidence. Together the two make the whole support chain one leased
+  -- act, for every writer, including a direct INSERT that bypasses the RPC.
+  select * into v_source from public.sources where id = v_link.source_id;
+  if v_source.id is null then
+    raise exception 'canonical field provenance cites no source' using errcode = '23503';
+  end if;
+  if new.run_id is distinct from v_link.run_id then
+    raise exception 'canonical field provenance was not promoted by the run that linked its evidence'
+      using errcode = '22023';
+  end if;
+  if v_source.run_id is distinct from new.run_id
+     or v_claim.run_id is distinct from new.run_id
+     or v_verdict.run_id is distinct from new.run_id then
+    raise exception 'canonical field provenance support chain spans more than one run'
+      using errcode = '22023';
+  end if;
+  -- One promotion is ONE act: every field it writes shares its run, its
+  -- worker, its attempt, its candidate and its variant.
+  if exists (select 1 from public.catalog_canonical_field_provenance p
+              where p.promotion_key = new.promotion_key
+                and (p.run_id is distinct from new.run_id
+                     or p.worker_id is distinct from new.worker_id
+                     or p.attempt is distinct from new.attempt
+                     or p.candidate_id is distinct from new.candidate_id
+                     or p.variant_id is distinct from new.variant_id)) then
+    raise exception 'catalog promotion is not one act of one run' using errcode = '22023';
+  end if;
+  -- Every fact about one canonical variant is read under ONE scope. The first
+  -- promoted field fixes it and every later field and every later REVISION is
+  -- held to it, so a variant can never accumulate facts about two markets, two
+  -- model years or two vehicle identities.
+  if exists (select 1 from public.catalog_canonical_field_provenance p
+              where p.variant_id = new.variant_id
+                and (p.entity_key is distinct from v_claim.entity_key
+                     or p.market is distinct from v_claim.market
+                     or p.geography is distinct from v_claim.geography
+                     or p.time_scope is distinct from coalesce(v_claim.time_scope, '{}'::jsonb)
+                     or p.identity_scope is distinct from v_identity)) then
+    raise exception 'canonical field provenance scope disagrees with this variant'
+      using errcode = '22023';
+  end if;
+
   -- Derived, never taken from the caller; a caller that states one is held to it.
   if new.source_id is not null and new.source_id is distinct from v_link.source_id then
     raise exception 'canonical field provenance source does not match its evidence link'
@@ -372,6 +663,20 @@ begin
     raise exception 'canonical field provenance version does not match its evidence link'
       using errcode = '22023';
   end if;
+  if (new.entity_key is not null and new.entity_key is distinct from v_claim.entity_key)
+     or (new.market is not null and new.market is distinct from v_claim.market)
+     or (new.geography is not null and new.geography is distinct from v_claim.geography)
+     or (new.time_scope is not null
+         and new.time_scope is distinct from coalesce(v_claim.time_scope, '{}'::jsonb))
+     or (new.identity_scope is not null and new.identity_scope is distinct from v_identity) then
+    raise exception 'canonical field provenance scope does not match its cited claim'
+      using errcode = '22023';
+  end if;
+  new.entity_key := v_claim.entity_key;
+  new.market := v_claim.market;
+  new.geography := v_claim.geography;
+  new.time_scope := coalesce(v_claim.time_scope, '{}'::jsonb);
+  new.identity_scope := v_identity;
   new.model_id := v_variant.model_id;
   new.snapshot_id := v_link.snapshot_id;
   new.source_id := v_link.source_id;
@@ -620,6 +925,19 @@ begin
   if v_candidate.status is distinct from 'ready_for_review' then
     raise exception 'catalog candidate is not ready for promotion' using errcode = '22023';
   end if;
+  -- The promotion may not state an identity its own candidate does not. The
+  -- caller derives the canonical key from these five fields, so without this
+  -- the caller -- not the reviewed candidate -- would decide which vehicle a
+  -- verified fact lands on.
+  if v_candidate.manufacturer is distinct from v_manufacturer
+     or v_candidate.commercial_model is distinct from v_commercial_model
+     or v_candidate.model_year_start is distinct from v_year_start
+     or v_candidate.model_year_end is distinct from v_year_end
+     or v_candidate.official_model_code is distinct from v_code
+     or v_candidate.trim is distinct from v_trim then
+    raise exception 'catalog promotion states an identity its candidate does not'
+      using errcode = '22023';
+  end if;
 
   -- The requested field set, as one object, so the comparisons below are one
   -- equality rather than a loop that could exit early and leave a partial view.
@@ -684,6 +1002,12 @@ begin
     raise exception 'catalog promotion cites no verified evidence link' using errcode = '22023';
   end if;
 
+  -- The canonical variant IDENTITY is the model, the year range, the code and
+  -- the trim -- and `identity_dimensions` is deliberately not part of it (see
+  -- `canonical_variant_key` in `backend/catalog/keys.py`). A later, better
+  -- source revising a dimension therefore APPENDS a revision to this same
+  -- variant instead of naming a second vehicle, which is also why
+  -- `catalog_model_variants_natural_uidx` is unique on exactly those four.
   select * into v_variant from public.catalog_model_variants where canonical_key = v_variant_key;
   if v_variant.id is null then
     insert into public.catalog_model_variants
@@ -692,6 +1016,17 @@ begin
     values (v_model.id, v_candidate.id, v_anchor_verdict, v_variant_key,
             v_year_start, v_year_end, v_code, v_trim, v_dimensions)
     returning * into v_variant;
+  else
+    -- A key is a caller-derived string. The stored row is the authority on who
+    -- it is, so a promotion presenting this key for a different vehicle is a
+    -- conflict rather than a revision of the row that already has the name.
+    if v_variant.model_id is distinct from v_model.id
+       or v_variant.model_year_start is distinct from v_year_start
+       or v_variant.model_year_end is distinct from v_year_end
+       or v_variant.official_model_code is distinct from v_code
+       or v_variant.trim is distinct from v_trim then
+      raise exception 'catalog canonical variant identity conflict' using errcode = '22023';
+    end if;
   end if;
 
   -- One provenance row per promoted fact, at the next revision of that field.
@@ -738,6 +1073,9 @@ begin
     'public.catalog_canonical_stated_fields(integer,integer,text,text,jsonb)',
     'public.catalog_promotable_field(text)',
     'public.catalog_canonical_identity_field(text)',
+    'public.catalog_record_locator_id(text,text)',
+    'public.catalog_claim_entity_key(text,integer)',
+    'public.r4_normalized_scope_text(text)',
     'public.promote_catalog_variant_guarded(uuid,text,integer,text,jsonb)'
   ] loop
     execute format('revoke execute on function %s from public', fn);

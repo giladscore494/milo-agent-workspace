@@ -8,6 +8,7 @@ production entrypoints.
 
 from __future__ import annotations
 
+import json
 import threading
 import secrets
 from datetime import UTC, datetime
@@ -16,17 +17,21 @@ from uuid import UUID, uuid4
 
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
                                        CANONICAL_DIMENSION_PREFIX,
-                                       stated_canonical_fields, stated_identity_dimensions,
-                                       stated_source_locator, trust_state_for)
+                                       SHARED_IDENTITY_DIMENSIONS, claim_entity_key,
+                                       record_locator_id, stated_canonical_fields,
+                                       stated_identity_dimensions, stated_source_locator,
+                                       trust_state_for)
+from backend.catalog.diff import MAX_DIFF_ITEMS, diff_rows
 from backend.catalog.digest import catalog_payload_digest
 from backend.engines.swarm_v2.evidence_bounds import FRAGMENT_TYPES
 from backend.engines.swarm_v2.evidence_contracts import (fragment_type_for,
                                                          parse_locator_key)
 from backend.engines.swarm_v2.fragments import fragment_content_hash
+from backend.engines.swarm_v2.normalization import normalize_field_key
 from backend.engines.swarm_v2.support import VERIFICATION_MODES, VERIFIER_CONTRACT_VERSION
-from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
-                                      prepare_promotion, prepare_raw_record,
-                                      prepare_snapshot)
+from backend.catalog.payloads import (CANONICAL_VARIANT_KEY_FIELDS, prepare_candidate,
+                                      prepare_evidence_link, prepare_promotion,
+                                      prepare_raw_record, prepare_snapshot)
 from backend.errors import AppError, NotFoundError
 from backend.runtime import RUN_STATES, InvalidTransition, validate_transition
 from backend.schemas import normalize_conversation_title
@@ -34,6 +39,31 @@ from backend.schemas import normalize_conversation_title
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _variant_page_key(row: Mapping[str, Any]) -> tuple:
+    """The order `catalog_candidate_variant_page` returns candidates in.
+
+    Collation-free by construction: PostgreSQL orders those text columns with
+    `collate "C"`, which is codepoint order -- exactly what Python compares
+    strings with -- so the two implementations agree on Hebrew marque names
+    rather than on whatever locale the server happens to run under.
+    """
+    return (row["manufacturer"], row["commercial_model"],
+            row.get("model_year_start") or 0, row.get("model_year_end") or 0,
+            row.get("official_model_code") or "", row.get("trim") or "",
+            row["candidate_key"])
+
+
+def _scope_identity(scope: Mapping[str, Any]) -> str:
+    """One comparable rendering of a claim's scope, order-independent.
+
+    PostgreSQL compares `jsonb` by value, so `{"a":1,"b":2}` and `{"b":2,"a":1}`
+    are one scope there. Canonical JSON is how a dictionary says the same
+    thing, and it keeps this mirror from refusing a promotion PostgreSQL would
+    accept.
+    """
+    return json.dumps(scope, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
 def _support_set(support: Any) -> frozenset[tuple[str, Any, Any]]:
@@ -1277,11 +1307,21 @@ class MemoryRepository:
 
     @staticmethod
     def _aggregate_page(items: list[dict[str, Any]], limit: int, offset: int) -> list[dict[str, Any]]:
-        """Attach the EXACT total to every returned row, then cut the page."""
+        """Attach the EXACT total to every returned row, then cut the page.
+
+        An EMPTY page still returns one row -- every item column null, the
+        total real. Mirrors the COUNT ROW the SQL aggregations emit, and for
+        the same reason: an offset past the last matching row must report the
+        total the filter matched, not the zero its emptiness would suggest.
+        """
         total = len(items)
         bounded = max(1, min(int(limit), MemoryRepository.MAX_CATALOG_AGGREGATE_ROWS))
         start = max(0, int(offset))
-        return [{**row, "total_count": total} for row in items[start:start + bounded]]
+        page = items[start:start + bounded]
+        if not page:
+            columns = items[0] if items else {}
+            return [{name: None for name in columns} | {"total_count": total}]
+        return [{**row, "total_count": total} for row in page]
 
     def catalog_candidate_manufacturers(self, snapshot_id: Any, *, limit: int = 50,
                                         offset: int = 0,
@@ -1409,10 +1449,7 @@ class MemoryRepository:
                     "resource_id": record["resource_id"],
                     "source_locator": dict(record.get("source_locator") or {}),
                     "payload_sha256": record["payload_sha256"]})
-            matched.sort(key=lambda item: (
-                item["manufacturer"], item["commercial_model"],
-                item["model_year_start"], item["model_year_end"],
-                item["official_model_code"] or "", item["trim"] or "", item["candidate_key"]))
+            matched.sort(key=_variant_page_key)
             return self._aggregate_page(matched, limit, offset)
 
     def catalog_raw_record_by_upstream_id(self, snapshot_id: Any, upstream_record_id: str, *,
@@ -1424,6 +1461,40 @@ class MemoryRepository:
             return next((dict(row) for row in self.catalog_raw_records.values()
                          if row["snapshot_id"] == str(snapshot_id)
                          and row["upstream_record_id"] == str(upstream_record_id)), None)
+
+    def catalog_snapshot_candidate_diff(self, previous_snapshot_id: Any, snapshot_id: Any, *,
+                                        limit: int = MAX_DIFF_ITEMS,
+                                        allow_incomplete: bool = False) -> list[dict[str, Any]]:
+        """Mirrors `public.catalog_snapshot_candidate_diff`, rule for rule.
+
+        Both sides pass the same readability gate, the comparison itself is the
+        ONE definition in `backend/catalog/diff.py` that the SQL function
+        mirrors, and the rows come back in the same shape -- including the
+        COUNT ROW when there are no items to list.
+
+        What is deliberately NOT claimed here is the property the SQL function
+        exists FOR: doing the comparison without reading either snapshot into
+        this process. A dictionary already holds every row, so there is nothing
+        to avoid reading.
+        """
+        with self.lock:
+            if previous_snapshot_id is not None:
+                self._readable_snapshot(previous_snapshot_id, allow_incomplete)
+            self._readable_snapshot(snapshot_id, allow_incomplete)
+            return diff_rows(self._diff_side(previous_snapshot_id),
+                             self._diff_side(snapshot_id),
+                             limit=max(0, min(int(limit), MAX_DIFF_ITEMS)))
+
+    def _diff_side(self, snapshot_id: Any) -> list[dict[str, Any]]:
+        """One snapshot's candidates, joined to their captured rows, in page order."""
+        if snapshot_id is None:
+            return []
+        records = {row["id"]: row for row in self.catalog_raw_records.values()}
+        rows = [{**row, "upstream_record_id":
+                 records.get(str(row["raw_record_id"]), {}).get("upstream_record_id", "")}
+                for row in self.catalog_candidates.values()
+                if str(row["snapshot_id"]) == str(snapshot_id)]
+        return sorted(rows, key=_variant_page_key)
 
     # --- field-level canonical promotion (PR3) -------------------------------
     #
@@ -1444,9 +1515,16 @@ class MemoryRepository:
                                      "source_version_kind")
 
     def _check_field_provenance(self, run_id: UUID, candidate: dict[str, Any],
-                                field_key: str, value: Any,
-                                link_id: Any) -> dict[str, Any]:
-        """One promoted fact, held to its WHOLE support chain, or refused."""
+                                field_key: str, value: Any, link_id: Any, *,
+                                model_key: str, variant: dict[str, Any] | None,
+                                promotion_key: str, worker_id: str,
+                                attempt: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        """One promoted fact, held to its WHOLE support chain, or refused.
+
+        Returns the cited link and the SCOPE the cited claim stated, which the
+        caller stores on the provenance row exactly as the BEFORE INSERT
+        trigger derives it in PostgreSQL.
+        """
         link = next((row for row in self.catalog_evidence_links.values()
                      if row["id"] == str(link_id)), None)
         if link is None:
@@ -1497,7 +1575,108 @@ class MemoryRepository:
                if self.evidence_kinds.get(str(row.get("id"))) == "conflict"):
             raise AppError("CATALOG_PROMOTION_UNRESOLVED_CONFLICT",
                            "canonical field provenance claim is in an unresolved conflict", 409)
-        return link
+
+        # THE TIME SCOPE, and THE ENTITY. Everything above proves the evidence
+        # is sound; none of it proves the evidence is about the vehicle being
+        # written. The candidate's own identity was already held to the
+        # promotion's, so binding the claim to the candidate here binds it to
+        # the canonical row.
+        time_scope = claim.get("time_scope") or {}
+        model_year = time_scope.get("model_year")
+        if not isinstance(model_year, int) or isinstance(model_year, bool):
+            raise AppError("CATALOG_PROMOTION_TIME_SCOPE",
+                           "canonical field provenance claim states no model year scope", 400)
+        if not (int(candidate["model_year_start"]) <= model_year
+                <= int(candidate["model_year_end"])):
+            raise AppError("CATALOG_PROMOTION_TIME_SCOPE",
+                           "canonical field provenance claim is scoped to another model year", 400)
+        if claim.get("entity_key") != claim_entity_key(model_key, model_year):
+            raise AppError("CATALOG_PROMOTION_ENTITY_MISMATCH",
+                           "canonical field provenance claim is about another vehicle", 400)
+
+        # THE MARKET. A vehicle fact is a fact somewhere; an unscoped value
+        # cannot be compared to any other, and a canonical catalog built out of
+        # unscoped values silently mixes markets.
+        if not str(claim.get("market") or "").strip() \
+                or not str(claim.get("geography") or "").strip():
+            raise AppError("CATALOG_PROMOTION_MARKET_SCOPE",
+                           "canonical field provenance claim states no market scope", 400)
+
+        # THE IDENTITY SCOPE. Exactly the identity the candidate states: an
+        # extra dimension means the evidence is about a narrower vehicle than
+        # this row, a missing one means a wider one, and neither is evidence
+        # for THIS variant. Keys exactly; values under the same normalization
+        # R4 stored them with.
+        identity = dict(claim.get("identity_scope") or {})
+        dimensions = dict(candidate.get("identity_dimensions") or {})
+        expected = {name: dimensions[name] for name in SHARED_IDENTITY_DIMENSIONS
+                    if name in dimensions}
+        if candidate.get("official_model_code") is not None:
+            expected["model_code"] = candidate["official_model_code"]
+        if candidate.get("trim") is not None:
+            expected["trim"] = candidate["trim"]
+        if set(identity) != set(expected) or any(
+                identity[name] != normalize_field_key(str(expected[name])) for name in identity):
+            raise AppError("CATALOG_PROMOTION_IDENTITY_SCOPE",
+                           "canonical field provenance claim is scoped to another vehicle identity",
+                           400)
+
+        # THE SOURCE RECORD. A candidate is a READING of one captured upstream
+        # row, and the evidence that promotes it must have been read from THAT
+        # row -- not from a different record of the same snapshot.
+        record = next((row for row in self.catalog_raw_records.values()
+                       if row["id"] == str(candidate["raw_record_id"])), None)
+        if record is None:
+            raise AppError("CATALOG_PROMOTION_RECORD_INVALID",
+                           "canonical field provenance cites no source record", 400)
+        if claim.get("evidence_locator") != link["record_locator"]:
+            raise AppError("CATALOG_PROMOTION_LOCATOR_MISMATCH",
+                           "canonical field provenance locator does not match its cited claim", 400)
+        expected_record = record_locator_id(str(snapshot["snapshot_key"]),
+                                            str(record["upstream_record_id"]))
+        if parse_locator_key(link["record_locator"]).record_id != expected_record:
+            raise AppError("CATALOG_PROMOTION_RECORD_MISMATCH",
+                           "canonical field provenance cites evidence read from another source record",
+                           400)
+
+        # ONE RUN. `promote_catalog_variant` proves the run holds a valid
+        # worker lease before it writes; binding the link, the source, the
+        # claim and the verdict to that same run is what carries the lease's
+        # authority down to the stored fact. (`_catalog_evidence_row` already
+        # required the claim and the verdict to be this run's.)
+        source = self._catalog_evidence_row(link["source_id"], run_id, "SOURCE")
+        if str(link.get("run_id")) != str(run_id):
+            raise AppError("CATALOG_PROMOTION_RUN_MISMATCH",
+                           "canonical field provenance was not promoted by the run that "
+                           "linked its evidence", 409)
+        if str(source.get("run_id")) != str(run_id) or str(claim.get("run_id")) != str(run_id) \
+                or str(verdict.get("run_id")) != str(run_id):
+            raise AppError("CATALOG_PROMOTION_RUN_MISMATCH",
+                           "canonical field provenance support chain spans more than one run", 409)
+
+        scope = {"entity_key": claim["entity_key"], "market": claim["market"],
+                 "geography": claim["geography"], "time_scope": dict(time_scope),
+                 "identity_scope": identity}
+        # One promotion is ONE act: every field it writes shares its run, its
+        # worker, its attempt, its candidate and its variant.
+        if any(row["run_id"] != str(run_id) or row["worker_id"] != worker_id
+               or row["attempt"] != int(attempt)
+               or row["candidate_id"] != candidate["id"]
+               or (variant is not None and row["variant_id"] != variant["id"])
+               for row in self.catalog_canonical_field_provenance
+               if row["promotion_key"] == promotion_key):
+            raise AppError("CATALOG_PROMOTION_RUN_MISMATCH",
+                           "catalog promotion is not one act of one run", 409)
+        # Every fact about one canonical variant is read under ONE scope, so a
+        # variant can never accumulate facts about two markets, two model years
+        # or two vehicle identities.
+        if variant is not None and any(
+                {name: row[name] for name in scope} != scope
+                for row in self.catalog_canonical_field_provenance
+                if row["variant_id"] == variant["id"]):
+            raise AppError("CATALOG_PROMOTION_SCOPE_CONFLICT",
+                           "canonical field provenance scope disagrees with this variant", 409)
+        return link, scope
 
     def promote_catalog_variant(self, run_id: UUID, promotion: dict[str, Any], *,
                                 worker_id: str, attempt: int,
@@ -1515,6 +1694,15 @@ class MemoryRepository:
             if candidate.get("status") != "ready_for_review":
                 raise AppError("CATALOG_PROMOTION_CANDIDATE_NOT_READY",
                                "catalog candidate is not ready for promotion", 409)
+            # The promotion may not state an identity its own candidate does
+            # not. The caller derives the canonical key from these six fields,
+            # so without this the caller -- not the reviewed candidate -- would
+            # decide which vehicle a verified fact lands on.
+            if any(candidate.get(name) != promotion.get(name)
+                   for name in ("manufacturer", "commercial_model", "model_year_start",
+                                "model_year_end", "official_model_code", "trim")):
+                raise AppError("CATALOG_PROMOTION_CANDIDATE_IDENTITY",
+                               "catalog promotion states an identity its candidate does not", 400)
             stated = stated_canonical_fields(promotion)
             requested = {entry["field_key"]: entry["value"] for entry in promotion["fields"]}
             if requested != stated:
@@ -1538,30 +1726,58 @@ class MemoryRepository:
                                    "catalog promotion idempotency conflict", 409)
                 return dict(variant)
 
+            # The existing canonical rows this promotion would land on, looked
+            # up BEFORE anything is validated, because a promoted fact is
+            # checked against the variant it is about.
+            model = next((row for row in self.catalog_models
+                          if row["canonical_key"] == promotion["model_canonical_key"]), None)
+            if model is not None and (model["manufacturer"] != promotion["manufacturer"]
+                                      or model["commercial_model"] != promotion["commercial_model"]):
+                raise AppError("CATALOG_PROMOTION_MODEL_CONFLICT",
+                               "catalog canonical model identity conflict", 409)
+            variant = next((row for row in self.catalog_model_variants
+                            if row["canonical_key"] == promotion["canonical_key"]), None)
+            if variant is not None:
+                # A key is a caller-derived string. The stored row is the
+                # authority on who it is, so a promotion presenting this key
+                # for a different vehicle is a conflict, not a revision.
+                #
+                # `identity_dimensions` is deliberately NOT compared: it is a
+                # revisable fact about the variant rather than part of its
+                # identity, so a better source revising one appends a revision
+                # to THIS variant (`canonical_variant_key` in
+                # `backend/catalog/keys.py` states the same decision).
+                if (model is None or variant["model_id"] != model["id"]
+                        or any(variant.get(name) != promotion.get(name)
+                               for name in CANONICAL_VARIANT_KEY_FIELDS)):
+                    raise AppError("CATALOG_PROMOTION_VARIANT_CONFLICT",
+                                   "catalog canonical variant identity conflict", 409)
+
             # Validate EVERY field before appending ANY row: a promotion is
             # atomic, so a refusal must leave the canonical catalog exactly as
             # it was -- including leaving no half-created model.
-            links = {entry["field_key"]: self._check_field_provenance(
+            checked = {entry["field_key"]: self._check_field_provenance(
                         run_id, candidate, entry["field_key"], entry["value"],
-                        entry["evidence_link_id"])
-                     for entry in promotion["fields"]}
+                        entry["evidence_link_id"],
+                        model_key=str(promotion["model_canonical_key"]), variant=variant,
+                        promotion_key=key, worker_id=worker_id, attempt=int(attempt))
+                       for entry in promotion["fields"]}
+            links = {name: value[0] for name, value in checked.items()}
+            scopes = {name: value[1] for name, value in checked.items()}
+            # Every field of ONE promotion is read under ONE scope, whether or
+            # not the variant already exists to compare against.
+            if len({_scope_identity(scope) for scope in scopes.values()}) > 1:
+                raise AppError("CATALOG_PROMOTION_SCOPE_CONFLICT",
+                               "canonical field provenance scope disagrees with this variant", 409)
 
-            model = next((row for row in self.catalog_models
-                          if row["canonical_key"] == promotion["model_canonical_key"]), None)
             if model is None:
                 model = {"id": str(uuid4()), "manufacturer": promotion["manufacturer"],
                          "commercial_model": promotion["commercial_model"],
                          "canonical_key": promotion["model_canonical_key"], "revision": 1,
                          "created_at": _now(), "updated_at": _now()}
                 self.catalog_models.append(model)
-            if model["manufacturer"] != promotion["manufacturer"] \
-                    or model["commercial_model"] != promotion["commercial_model"]:
-                raise AppError("CATALOG_PROMOTION_MODEL_CONFLICT",
-                               "catalog canonical model identity conflict", 409)
 
             anchor = links[sorted(links)[0]]
-            variant = next((row for row in self.catalog_model_variants
-                            if row["canonical_key"] == promotion["canonical_key"]), None)
             if variant is None:
                 variant = {"id": str(uuid4()), "model_id": model["id"],
                            "promoted_from_candidate_id": candidate["id"],
@@ -1590,7 +1806,7 @@ class MemoryRepository:
                     "source_version": link["source_version"],
                     "source_version_kind": link["source_version_kind"],
                     "record_locator": link["record_locator"], "promotion_key": key,
-                    "created_at": _now()})
+                    **scopes[entry["field_key"]], "created_at": _now()})
             return dict(variant)
 
     def get_canonical_catalog_variant(self, canonical_key: str) -> dict[str, Any] | None:

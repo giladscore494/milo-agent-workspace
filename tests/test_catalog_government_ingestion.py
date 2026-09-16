@@ -1234,6 +1234,10 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # may name the Government catalog.
         "backend/tools/government_vehicle.py",
         "backend/worker/main.py",
+        # Catalog PR3's trusted promotion path names the ONE registered
+        # Government operation, so it knows which tool result carries a
+        # candidate. It imports two constants and no capture code.
+        "backend/catalog/pipeline.py",
         "backend/engines/swarm_v2/evidence_mapping.py",
         "backend/engines/swarm_v2/validation.py",
     }

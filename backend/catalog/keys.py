@@ -183,25 +183,42 @@ def canonical_model_key(*, manufacturer: str, commercial_model: str) -> str:
 
 
 def canonical_variant_key(*, model_key: str, model_year_start: int, model_year_end: int,
-                          official_model_code: str | None = None, trim: str | None = None,
-                          identity_dimensions: Mapping[str, Any] | None = None) -> str:
+                          official_model_code: str | None = None,
+                          trim: str | None = None) -> str:
     """ONE canonical variant of one canonical model.
 
-    Every stated identity component participates, so two trims of one model
-    year are two canonical variants rather than one row that silently won.
-    `None` is preserved distinctly by `_canonical`, so an unstated code and an
-    empty one never derive the same key.
+    IDENTITY versus REVISABLE FACT
+    ------------------------------
 
-    The REVISABLE facts are in the identity on purpose: a canonical variant is
-    the thing a promotion establishes, and a later revision of a field is an
-    append to that variant's provenance, not a new variant. Which is why the
-    key is derived from what the promotion states ONCE, at revision 1, and the
-    current value of each field is then read from the append-only provenance.
+    A canonical variant is identified by its model, its model year range, its
+    official model code and its trim -- and by NOTHING else. Those four say
+    WHICH vehicle the row is about, so two trims of one model year are two
+    canonical variants rather than one row that silently won, and `None` is
+    preserved distinctly by `_canonical` so an unstated code and an empty one
+    never derive the same key.
+
+    `identity_dimensions` is deliberately NOT here. A dimension -- the fuel
+    type, the drivetrain, the body style -- is a FACT ABOUT the variant that a
+    later, better source may revise, and a key that moved with it would file
+    every revision as a brand-new vehicle. Three places already read it that
+    way and this builder is the fourth:
+
+    *   `catalog_model_variants_natural_uidx` is unique on the model, the year
+        range, the code and the trim, so a second row differing only in a
+        dimension is a DUPLICATE the database refuses;
+    *   `catalog_canonical_identity_field()` names exactly those four fields as
+        the frozen ones, and therefore admits a later revision of a dimension;
+    *   `catalog_canonical_variant_current` rebuilds `identity_dimensions` from
+        the newest provenance revision of each `identity_dimensions.*` field,
+        so the VIEW is where a dimension's current value is read.
+
+    The `identity_dimensions` COLUMN on `catalog_model_variants` is what
+    revision 1 established and never changes, exactly like the other columns;
+    it is a frozen record of the first promotion, not the current belief.
     """
     return derive_key("catalog.canonical_variant", model_key=model_key,
                       model_year_start=model_year_start, model_year_end=model_year_end,
-                      official_model_code=official_model_code, trim=trim,
-                      identity_dimensions=dict(identity_dimensions or {}))
+                      official_model_code=official_model_code, trim=trim)
 
 
 def promotion_key(*, candidate_key: str, variant_key: str,

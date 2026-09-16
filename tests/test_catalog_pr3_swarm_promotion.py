@@ -45,8 +45,8 @@ from backend.catalog.government.reconcile import (AliasRule, CatalogReconciliati
                                                   ReconcilableVariant, normalize_identity_text,
                                                   reconcile_catalog,
                                                   variants_from_candidate_rows)
-from backend.catalog.government.refresh import (MAX_DIFF_SCAN_ROWS,
-                                                GovernmentCatalogRefresh,
+from backend.catalog.diff import MAX_DIFF_ITEMS, diff_rows, is_count_row
+from backend.catalog.government.refresh import (GovernmentCatalogRefresh,
                                                 diff_candidate_sets)
 from backend.catalog.keys import CatalogKeyError
 from backend.catalog.promotion import (LEASE_FAILURE_CODES, CanonicalPromotion,
@@ -917,25 +917,55 @@ def test_the_diff_states_exact_counts_and_drops_an_oversized_list_whole():
     assert changed.changed[0].changed_fields == ("status",)
 
 
-def test_a_snapshot_too_large_to_compare_still_lands_and_says_the_diff_is_absent(repository,
-                                                                                 landed,
-                                                                                 monkeypatch):
-    """A bound on the COMPARISON never undoes the CAPTURE, and never guesses.
+def test_a_diff_of_a_whole_resource_states_exact_counts_without_reading_it():
+    """The COUNTS are exact for every row; only the LIST is bounded.
 
-    By the time the new side is read, an immutable snapshot has already landed
-    and is already readable. Truncating one side would produce a diff that
-    looks complete and is not -- every unread row reported as added or removed
-    on the other side -- so the comparison is refused and SAID to be refused.
+    `diff_rows` is the one comparison rule -- mirrored by
+    `public.catalog_snapshot_candidate_diff`, which is what production actually
+    calls -- so this is where "far more rows than any page" is proven. Ten
+    thousand identities disappear, the count says ten thousand, and the list is
+    dropped WHOLE rather than truncated, because a truncated list is a diff
+    claiming a completeness it does not have.
+    """
+    previous = [{"manufacturer": "Toyota", "commercial_model": "RAV4",
+                 "model_year_start": 2000, "model_year_end": 2000,
+                 "official_model_code": f"CODE-{index:06d}", "trim": None,
+                 "identity_dimensions": {}, "status": "candidate",
+                 "upstream_record_id": str(index)}
+                for index in range(10_000)]
+    rows = diff_rows(previous, [], limit=MAX_DIFF_ITEMS)
+    assert len(rows) == 1 and is_count_row(rows[0])
+    assert rows[0]["removed_count"] == 10_000
+    assert (rows[0]["added_count"], rows[0]["changed_count"]) == (0, 0)
+    # Exactly at the bound the list IS reported, and in the deterministic order
+    # the SQL function applies.
+    rows = diff_rows(previous[:MAX_DIFF_ITEMS], [], limit=MAX_DIFF_ITEMS)
+    assert len(rows) == MAX_DIFF_ITEMS and not any(is_count_row(row) for row in rows)
+    assert all(row["removed_count"] == MAX_DIFF_ITEMS for row in rows)
+    # Ordered by the identity itself -- here the official model code -- and
+    # only then by the record id, exactly as the SQL function orders.
+    assert [row["official_model_code"] for row in rows] \
+        == [f"CODE-{index:06d}" for index in range(MAX_DIFF_ITEMS)]
+    # One more than the bound, and the whole list goes.
+    rows = diff_rows(previous[:MAX_DIFF_ITEMS + 1], [], limit=MAX_DIFF_ITEMS)
+    assert len(rows) == 1 and rows[0]["removed_count"] == MAX_DIFF_ITEMS + 1
+
+
+def test_a_comparison_that_cannot_run_still_lands_the_capture_and_says_so(repository, landed,
+                                                                         monkeypatch):
+    """A failure of the COMPARISON never undoes the CAPTURE, and never guesses.
+
+    By the time the diff is asked for, an immutable snapshot has already landed
+    and is already readable. Answering from an EMPTY set would report every row
+    of the other side as added or removed -- a fabricated diff, which is worse
+    than no diff at all -- so the refusal is reported and the snapshot stays.
     """
     from backend.testing.government_capture import encode, page_document
 
     lease, first = landed
-    real_page = repository.catalog_candidate_variant_page
 
-    def oversized(*args, **kwargs):
-        rows = real_page(*args, **kwargs)
-        # Every page comes back full, so the accumulator runs past the bound.
-        return rows * (MAX_DIFF_SCAN_ROWS + 1) if rows else rows
+    def unavailable(*args, **kwargs):
+        raise AppError("CATALOG_QUERY_UNAVAILABLE", "diff is unavailable", 503)
 
     document = page_document(0)
     document["result"]["records"][0]["ramat_gimur"] = "ADVENTURE PLUS"
@@ -946,14 +976,14 @@ def test_a_snapshot_too_large_to_compare_still_lands_and_says_the_diff_is_absent
         if resource["id"] == src.WLTP_RESOURCE_ID:
             resource["last_modified"] = "2026-10-01T00:00:00.000000"
             resource.pop("revision_id", None)
-    monkeypatch.setattr(repository, "catalog_candidate_variant_page", oversized)
+    monkeypatch.setattr(repository, "catalog_snapshot_candidate_diff", unavailable)
     outcome = refresh(repository, lease,
                       transport=FixtureTransport(bodies={0: encode(document),
                                                          "package": encode(package)})
                       ).sync_if_changed(query=dict(PINNED_QUERY))
     assert outcome.changed and outcome.diff is None and outcome.diff_unavailable
     assert not outcome.no_op and not outcome.research_required
-    assert "GOV_PROJECTION_BOUND_EXCEEDED" in outcome.detail[0]
+    assert "GOV_QUERY_UNAVAILABLE" in outcome.detail[0]
     # The snapshot landed anyway, and is readable.
     monkeypatch.undo()
     assert outcome.report.snapshot_key != first.snapshot_key

@@ -338,12 +338,24 @@ class RegisteredOperationEvidenceSink:
     def acquisition(self) -> TrustedEvidenceAcquisition:
         return self._acquisition
 
-    def __call__(self, record: Any) -> None:
+    def acquire(self, record: Any) -> AcquiredEvidence | None:
+        """Persist this result's evidence, or `None` when there is none.
+
+        `None` covers both of the routing's legitimate cases: an operation with
+        no registered mapper (nothing is written at all) and a registered
+        mapper that read the result and found no fact in it. Trusted wiring
+        that needs to know WHAT was written -- Catalog PR3's promotion ledger
+        is the first -- calls this; `__call__` is the sink signature and
+        discards it.
+        """
         if not isinstance(record, ToolCallRecord):
             raise EvidenceMappingError("EVIDENCE_SOURCE_NOT_TRUSTED")
         if self._acquisition.mappers.mapper_for(record.tool, record.operation) is None:
-            return
-        self._acquisition.acquire(record)
+            return None
+        return self._acquisition.acquire(record)
+
+    def __call__(self, record: Any) -> None:
+        self.acquire(record)
 
 
 __all__ = ["EVIDENCE_MAPPING_REASONS", "NO_EVIDENCE",

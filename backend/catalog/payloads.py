@@ -49,9 +49,19 @@ CANDIDATE_IDENTITY = ("manufacturer", "commercial_model", "model_year_start",
 #: parent's identity. They are stripped before the payload reaches a database.
 PARENT_KEY_FIELDS = ("snapshot_key", "record_key", "candidate_key")
 
-#: The identity of the canonical VARIANT one promotion establishes.
+#: Everything a promotion states about the canonical variant it establishes:
+#: the four identity fields plus the revisable dimensions.
 CANONICAL_VARIANT_IDENTITY = ("model_year_start", "model_year_end",
                               "official_model_code", "trim", "identity_dimensions")
+
+#: The subset of the above that is the variant's IDENTITY -- the fields
+#: `keys.canonical_variant_key` derives from, that `catalog_canonical_identity_
+#: field()` freezes, and that `catalog_model_variants_natural_uidx` is unique
+#: on. `identity_dimensions` is deliberately absent: it is a revisable fact
+#: about the variant, so a later revision of one appends a provenance revision
+#: instead of naming a second vehicle.
+CANONICAL_VARIANT_KEY_FIELDS = ("model_year_start", "model_year_end",
+                                "official_model_code", "trim")
 
 #: Exactly the keys one promoted-field entry carries. Closed in BOTH
 #: directions: a missing key and an extra one are equally a refusal, because an
@@ -206,7 +216,9 @@ def prepare_promotion(payload: Mapping[str, Any]) -> dict[str, Any]:
 
     model_key = keys.canonical_model_key(manufacturer=payload["manufacturer"],
                                          commercial_model=payload["commercial_model"])
-    variant_key = keys.canonical_variant_key(model_key=model_key, **variant)
+    variant_key = keys.canonical_variant_key(
+        model_key=model_key,
+        **{name: variant[name] for name in CANONICAL_VARIANT_KEY_FIELDS})
     prepared = dict(payload)
     prepared["fields"] = sorted(prepared_fields, key=lambda item: item["field_key"])
     prepared["identity_dimensions"] = variant["identity_dimensions"]
@@ -221,7 +233,8 @@ def prepare_promotion(payload: Mapping[str, Any]) -> dict[str, Any]:
     return prepared
 
 
-__all__ = ["CANDIDATE_IDENTITY", "CANONICAL_VARIANT_IDENTITY", "PARENT_KEY_FIELDS",
+__all__ = ["CANDIDATE_IDENTITY", "CANONICAL_VARIANT_IDENTITY",
+           "CANONICAL_VARIANT_KEY_FIELDS", "PARENT_KEY_FIELDS",
            "PROMOTION_FIELD_KEYS", "SNAPSHOT_IDENTITY", "CatalogPayloadError",
            "prepare_candidate", "prepare_evidence_link", "prepare_promotion",
            "prepare_raw_record", "prepare_snapshot"]
