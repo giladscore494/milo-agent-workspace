@@ -367,8 +367,10 @@ promotes at most `MAX_PROMOTIONS_PER_RUN` (25) candidates in `candidate_key`
 order — so a replacement worker sees exactly the set the crashed one would have
 — starts no capture, opens no socket, holds no credential and schedules nothing.
 Every refusal is a static reason code emitted as a run event and never fails the
-run; a LOST LEASE is not a refusal and propagates to the worker's own lease
-handling, because a stale worker must not keep writing.
+run. An INFRASTRUCTURE failure is not a refusal and is never reported as one:
+a LOST LEASE (a stale worker must not keep writing) and a PENDING-PROMOTION READ
+that could not run (see §8.1) both propagate to the worker's own handling
+unchanged.
 
 **Crash windows, one by one.** A replacement worker re-claims the run with its
 own lease and a fresh attempt, and reads what the run still owes. Every window
@@ -386,6 +388,63 @@ the path has:
 None of it repeats a model call, a Government tool call, a live capture or a
 source request — the proof is the set of repository methods the resumed worker
 reaches, asserted rather than described.
+
+### 8.1 "No pending promotion" is not "the pending-promotion read is unavailable"
+
+The crash-window table above depends on one thing being true: a run that still
+owes a promotion is never finalized without either performing it or refusing it
+out loud. That holds only if the pipeline can tell the difference between the
+two ways `catalog_run_pending_promotions` produces no work.
+
+| The read | Means | What happens |
+| --- | --- | --- |
+| **ran, matched nothing** | a FACT about durable state: this run owes no promotion | a clean no-op. No attempt, no write, no event. The run finalizes normally |
+| **could not run** (database, RPC or infrastructure `AppError`) | NOTHING — no fact was obtained | the `AppError` propagates unchanged out of `pending`, out of `promote`, and out of `execute_run` |
+| **is not offered by the repository at all** | a fact about the DEPLOYMENT: there is no catalog schema to promote INTO | a clean no-op, as above. This is the isolated-test and catalog-less case, and it is the only empty answer that is not a read result |
+
+`CatalogPromotionPipeline.pending` previously caught `AppError` and returned an
+empty tuple, collapsing the first two rows into one. That converted a database,
+RPC or infrastructure failure into the sentence *"this run owes no promotions"*,
+and `execute_run` believed it: it continued to `run_completed`, emitted neither
+a `catalog_promotion_refused` event nor an infrastructure failure, and called
+`mark_run_complete`. **No scheduler anywhere revisits a completed run**, so the
+run's durable verified evidence was left permanently without canonical
+promotion, with nothing in the run, the events or the catalog saying why. It was
+silent, permanent data loss wearing the shape of a successful run.
+
+The failure now escapes. `promote` reads the pending work OUTSIDE its
+per-candidate `except AppError` handler — deliberately, because that handler
+exists to turn ONE candidate's refusal into a static reason code, and a read
+that failed refuses nothing — so an outage can never be laundered into
+`CATALOG_PROMOTION_REFUSED` either. The worker's existing infrastructure path in
+`backend/worker/main.py` then does exactly what it already does for every other
+guarded repository failure: `isinstance(exc, AppError)` re-raises, the run is
+not marked complete, no `run_completed` is emitted, and the attempt is retryable.
+
+**Two infrastructure outcomes escape this module, and only two.** A LOST LEASE
+(this worker is no longer the run's writer) and a FAILED PENDING-PROMOTION READ
+(nothing was learned). Everything else that this path can decide about a
+candidate is still a refusal: a static reason code, a run event, and a run whose
+own result is untouched.
+
+**Nothing else changed.** Individual promotion refusals, lost leases, the
+`MAX_PROMOTIONS_PER_RUN` bound, the idempotent restart and a repository without
+catalog support all behave exactly as the table above describes. No retry, no
+backoff, no network call, no model call, no tool re-execution, no schedule and
+no second promotion mechanism was added: the recovery is the one that already
+existed — **the next worker attempt re-derives the same pending work from the
+same durable rows and promotes it**, which is the property the whole derivation
+was built for.
+
+`tests/test_catalog_pr3_swarm_promotion.py` §6b proves all four properties:
+that a read raising `AppError("CATALOG_QUERY_UNAVAILABLE", …, 503)` escapes both
+`pending()` and `promote()` unchanged rather than becoming `()`; that the real
+`execute_run`, with its engine finishing successfully and only the read down,
+calls neither `mark_run_complete` nor `mark_run_failed`, emits no
+`run_completed`, and propagates the error; that a replacement worker afterwards
+promotes from the same durable state and creates no duplicate evidence, link,
+variant, provenance row or revision; and that a successful read matching nothing
+remains a silent no-op.
 
 ## 9. Refresh and diff
 

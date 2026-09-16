@@ -78,12 +78,27 @@ or `rejected` is excluded by the durable read and refused again here. Ambiguity
 is a first-class answer in this schema, and a promotion may not settle one by
 writing it down.
 
-**It never fails the run.** A refusal is what the durable catalog is FOR: a
-field with no verified evidence, an unresolved conflict and a lost lease are all
-legitimate outcomes of a research run. Each one is returned as a static reason
-code, and the run's own result is untouched -- with one exception, stated in
-`CatalogPromotionPipeline.promote`: a lost lease is an infrastructure outcome
-and is re-raised, because a stale worker must not keep writing.
+**It never fails the run over a REFUSAL.** A refusal is what the durable catalog
+is FOR: a field with no verified evidence, an unresolved conflict and a
+candidate the ingestion left ambiguous are all legitimate outcomes of a research
+run. Each one is returned as a static reason code, and the run's own result is
+untouched.
+
+An INFRASTRUCTURE failure is the opposite thing and is never laundered into one.
+Two of them escape this module, both stated where they happen:
+
+*   **a lost lease** (`CatalogPromotionPipeline.promote`) -- this worker is no
+    longer the run's writer, so it must stop writing;
+*   **a failed pending-promotion read** (`CatalogPromotionPipeline.pending`) --
+    nothing was learned, so "this run owes no promotion" is not a fact anyone
+    here has. Swallowing it would let the worker finalize a run whose verified
+    evidence is durable and whose canonical promotion never happened, and no
+    later scheduler revisits a completed run.
+
+Both propagate unchanged to the worker, which already treats a repository
+`AppError` as an infrastructure outcome: the run is not marked complete, no
+`run_completed` is emitted, and the next attempt re-derives the same work from
+the same durable rows.
 """
 
 from __future__ import annotations
@@ -247,20 +262,39 @@ class CatalogPromotionPipeline:
     def pending(self) -> tuple[CandidateEvidence, ...]:
         """What this run still has to promote, read from durable state.
 
-        A failure of the read is not a refusal of anything: nothing is known,
-        so nothing is attempted and nothing is claimed about any candidate.
-        The same holds for a repository that does not offer the read at all --
-        one without the catalog schema behind it, which is to say without a
-        canonical catalog to promote INTO. Neither fails a research run over a
+        Three outcomes, and the whole point of this method is that they are
+        three rather than one.
+
+        **No catalog to promote INTO.** A repository that does not offer the
+        read at all has no catalog schema behind it, so this run owes nothing
+        and can owe nothing. That is a true statement about the deployment,
+        not a guess about durable rows, and it fails no research run over a
         capability that run never needed.
+
+        **A successful read that matched nothing.** The ordinary empty case:
+        the database was asked and answered that this run owes no promotion.
+        No attempt is made and nothing is written.
+
+        **A read that FAILED.** Not an empty answer -- an ABSENCE of one. A
+        database, RPC or infrastructure failure means nothing was learned, so
+        "this run owes no promotion" is a claim about durable state this
+        process is in no position to make. Returning `()` here would make the
+        two indistinguishable to the caller, and the caller is
+        `backend/worker/main.py`: it would carry on to `run_completed`, emit
+        neither a catalog refusal nor an infrastructure failure, and mark the
+        run complete -- permanently stranding a run whose verified evidence is
+        durable and whose canonical promotion never happened, because no later
+        scheduler revisits a completed run.
+
+        So the `AppError` propagates UNCHANGED, into the same worker
+        infrastructure path every other guarded repository failure takes: the
+        run is not marked complete, and the next attempt derives exactly this
+        same pending work from exactly these same durable rows.
         """
         read = getattr(self._repository, "catalog_run_pending_promotions", None)
         if not callable(read):
             return ()
-        try:
-            rows = read(self._lease.run_id, PROMOTABLE_TOOL_OPERATION, limit=self._limit)
-        except AppError:
-            return ()
+        rows = read(self._lease.run_id, PROMOTABLE_TOOL_OPERATION, limit=self._limit)
         return group_pending_promotions(list(rows))
 
     def promote(self) -> tuple[PromotionAttempt, ...]:
@@ -276,13 +310,23 @@ class CatalogPromotionPipeline:
         re-read, re-planned and then written NOWHERE -- it comes back as a
         replay.
 
-        A LOST LEASE is the one thing that escapes. It means this worker is no
-        longer the run's writer, so continuing would be a stale worker writing
+        TWO things escape, and neither is a decision about any candidate.
+
+        A failure of the DURABLE READ escapes before a single attempt is made
+        -- it is taken deliberately outside the loop below, because the handler
+        inside it exists to turn one candidate's refusal into a reason code and
+        a read that failed refuses nothing. See `pending`.
+
+        A LOST LEASE escapes from an attempt. It means this worker is no longer
+        the run's writer, so continuing would be a stale worker writing
         canonical facts; it propagates to the worker's own lease handling
         exactly as every other guarded write's does.
         """
+        # Outside the try/except below, and that placement is the contract: an
+        # unavailable read must never be reported as "this run owes nothing".
+        outstanding = self.pending()
         attempts: list[PromotionAttempt] = []
-        for pending in self.pending():
+        for pending in outstanding:
             try:
                 attempts.append(self._promote_one(pending))
             except AppError as failure:

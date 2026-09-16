@@ -85,8 +85,11 @@ Status: `COMPLETED_IN_CODE` (application architecture) /
   and nothing beyond: the path is trusted server code, promotes at most 25
   candidates per run, reads only what the run itself produced, starts no
   capture, opens no socket and schedules nothing. A refusal is emitted as a run
-  event and never fails the run; a lost lease propagates to the worker's lease
-  handling so a stale worker writes nothing.
+  event and never fails the run. An infrastructure failure is never reported as
+  a refusal: a lost lease and a pending-promotion read that could not run both
+  propagate to the worker unchanged, so a stale worker writes nothing and a run
+  that still owes a promotion is never marked complete on a read nobody could
+  perform.
 - **Redis (Upstash REST)** — shared rate-limit store for gateway and API;
   production fails closed on limited surfaces when unavailable.
 - **Provider (Kimi/Moonshot)** — reached only by the worker, only when

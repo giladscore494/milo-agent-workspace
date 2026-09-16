@@ -528,9 +528,17 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # restored the completed tasks and never re-executed the tool,
             # promotes exactly what the crashed one would have -- promotes at
             # most `MAX_PROMOTIONS_PER_RUN`, starts no capture and schedules
-            # nothing. A refusal is a legitimate outcome and is emitted as a
-            # run event rather than failing the run; a LOST LEASE is not a
-            # refusal and propagates to the lease handling below.
+            # nothing.
+            #
+            # A REFUSAL is a legitimate outcome and is emitted as a run event
+            # rather than failing the run. An INFRASTRUCTURE failure is not a
+            # refusal and is never reported as one: a LOST LEASE and a
+            # PENDING-PROMOTION READ that could not run both raise `AppError`
+            # from here into the handler below, which re-raises it. That is
+            # deliberate and load-bearing -- a failed read is not "this run
+            # owes no promotion", and finalizing the run on one would strand a
+            # run whose verified evidence is durable and whose canonical
+            # promotion never happened, with no later scheduler to revisit it.
             if workflow_key == "swarm_v2" and catalog_promotion.get("pipeline") is not None:
                 for attempt in catalog_promotion["pipeline"].promote():
                     sink.emit(RunEventRecord(

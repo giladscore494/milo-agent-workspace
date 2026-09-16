@@ -592,7 +592,10 @@ Done כאשר: פרויקט עם workflow_key=swarm_v2 מסיים Run במצב c
 > process, so a worker that crashes after the evidence and verdicts are durable
 > is replaced by one that promotes exactly what it would have — without
 > re-executing the Government tool, which the checkpoint has already marked
-> complete.
+> complete. And because that read is the ONLY thing standing between a run's
+> verified evidence and its canonical promotion, a read that CANNOT RUN is
+> never reported as "this run owes nothing": the failure propagates, the run
+> is not marked complete, and the next attempt derives the same work again.
 >
 > **Still not activated after PR3.** No production entrypoint constructs a
 > transport, so no release can reach `data.gov.il`; the refresh operation exists

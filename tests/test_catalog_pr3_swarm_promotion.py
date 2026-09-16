@@ -1580,6 +1580,310 @@ def test_every_guarded_write_replays_onto_the_row_it_already_wrote(repository, l
 
 
 # =============================================================================
+# 6b. an unavailable pending-promotion read is an OUTAGE, not an empty answer
+# =============================================================================
+#
+# `catalog_run_pending_promotions` answers one question: what does this run
+# still owe? There are two ways for the answer to be "no promotions", and they
+# are not the same thing:
+#
+#   * the read RAN and matched nothing -- a fact about durable state, and a
+#     clean no-op;
+#   * the read COULD NOT RUN -- no fact at all.
+#
+# Reporting the second as the first is silent permanent data loss rather than a
+# refusal: `execute_run` would carry on to `run_completed`, emit neither a
+# catalog refusal nor an infrastructure failure, and mark the run complete --
+# and no scheduler anywhere revisits a completed run, so the run's durable
+# verified evidence would stay un-promoted forever with nothing saying why.
+
+#: A repository read that is DOWN, spelled the way the Supabase repository
+#: classifies one: a static code, a safe message and a 503.
+CATALOG_READ_OUTAGE = ("CATALOG_QUERY_UNAVAILABLE",
+                       "the catalog read is unavailable", 503)
+
+
+def unavailable_pending_read(repository, *, calls: list | None = None):
+    """`repository`, with ONLY the pending-promotion read failing."""
+    def refuse(*args, **kwargs):
+        if calls is not None:
+            calls.append((args, kwargs))
+        raise AppError(*CATALOG_READ_OUTAGE)
+
+    broken = RecordingRepository(repository)
+    broken.catalog_run_pending_promotions = refuse
+    return broken
+
+
+def test_an_unavailable_pending_promotion_read_escapes_pending_and_promote(repository, landed):
+    """The read fails -> the `AppError` comes OUT, unchanged. It is not `()`.
+
+    Both entry points, because both are reachable: `promote` takes the read
+    deliberately outside its per-candidate refusal handler, so an outage can
+    never be laundered into `CATALOG_PROMOTION_REFUSED` either.
+
+    The distinction is the whole fix. With the failure swallowed, this run --
+    which has durable evidence, durable verified verdicts and exactly one real
+    pending promotion -- would have reported "nothing to promote" and been
+    finalized on it.
+    """
+    lease, _report = landed
+    gather_evidence(repository, lease)
+    # There IS work. That is what makes the swallowed-failure answer a lie
+    # rather than a coincidence.
+    assert len(CatalogPromotionPipeline(repository, lease).pending()) == 1
+
+    for entry_point in ("pending", "promote"):
+        calls: list = []
+        broken = unavailable_pending_read(repository, calls=calls)
+        with pytest.raises(AppError) as raised:
+            getattr(CatalogPromotionPipeline(broken, lease), entry_point)()
+        # Unchanged: the same code, the same message and the same status the
+        # repository raised, so the worker classifies it exactly as it
+        # classifies every other guarded repository failure.
+        assert (raised.value.code, raised.value.message, raised.value.status_code) \
+            == CATALOG_READ_OUTAGE
+        assert len(calls) == 1, "the failed read is never retried here"
+        # Nothing was attempted and nothing was written on the way out.
+        assert canonical_counts(repository) == (0, 0, 0, 0)
+        assert all(row["status"] != "ready_for_review"
+                   for row in repository.catalog_candidates.values())
+
+
+def test_a_successful_pending_promotion_read_with_no_rows_is_a_clean_no_op(repository, landed):
+    """The other answer, preserved exactly: zero rows means zero attempts.
+
+    Three ways to have nothing to promote, all of them still silent:
+    a run with no Government evidence at all, a run whose verdicts are not yet
+    settled, and a repository with no catalog behind it to promote INTO.
+    """
+    lease, _report = landed
+
+    # 1. A real, working read over a run that gathered nothing.
+    recording = RecordingRepository(repository)
+    assert CatalogPromotionPipeline(recording, lease).promote() == ()
+    assert "catalog_run_pending_promotions" in recording.calls
+    assert canonical_counts(repository) == (0, 0, 0, 0)
+
+    # 2. Evidence durable, verdicts not settled: the read runs and matches
+    #    nothing, because it joins on a VERIFIED verdict.
+    run_government_task(repository, lease)
+    assert CatalogPromotionPipeline(repository, lease).pending() == ()
+    assert CatalogPromotionPipeline(repository, lease).promote() == ()
+    assert canonical_counts(repository) == (0, 0, 0, 0)
+
+    # 3. A repository with no catalog schema behind it owes nothing and can
+    #    owe nothing -- a true statement about the deployment, not a guess
+    #    about rows. This is the ONE empty answer that is not a read result.
+    class NoCatalog:
+        pass
+
+    assert CatalogPromotionPipeline(NoCatalog(), lease).pending() == ()
+    assert CatalogPromotionPipeline(NoCatalog(), lease).promote() == ()
+
+    # And once the verdicts ARE settled the same working read finds the work,
+    # so none of the above was emptiness caused by the read itself.
+    settle_verdicts(repository, lease)
+    assert len(CatalogPromotionPipeline(repository, lease).pending()) == 1
+
+
+def test_a_replacement_worker_promotes_after_the_pending_read_recovers(repository, landed):
+    """The outage is survivable, and surviving it duplicates NOTHING.
+
+    Attempt 1 gathers the evidence and settles the verdicts, and then the
+    pending-promotion read is down. The failure escapes, so the run is never
+    finalized -- which is the only reason there is an attempt 2 at all.
+
+    Attempt 2 is a replacement worker reading the same durable rows the crashed
+    one would have read. It promotes, and the proof that it re-gathered nothing
+    is the SET OF REPOSITORY METHODS it reached: no source, no fragment, no
+    claim, no verdict, no capture. Every durable row the run produced is
+    counted before and after, and every count is unchanged except the canonical
+    ones the promotion is supposed to create.
+    """
+    lease, _report = landed
+    gather_evidence(repository, lease)
+
+    def evidence_census() -> dict:
+        return {kind: len([row for row in repository.tool_rows
+                           if repository.evidence_kinds.get(str(row["id"])) == kind])
+                for kind in ("source", "evidence_fragment", "claim", "claim_verdict")}
+
+    before = evidence_census()
+    assert before["claim"] and before["claim_verdict"]
+
+    # --- attempt 1: the read is down -----------------------------------------
+    with pytest.raises(AppError, match="CATALOG_QUERY_UNAVAILABLE|unavailable"):
+        CatalogPromotionPipeline(unavailable_pending_read(repository), lease).promote()
+    assert canonical_counts(repository) == (0, 0, 0, 0)
+    assert evidence_census() == before
+
+    # --- attempt 2: a replacement worker, and the read is back ---------------
+    resumed = restarted_lease(repository, lease)
+    assert resumed.worker_id != lease.worker_id and resumed.attempt > lease.attempt
+    recording = RecordingRepository(repository)
+    attempts = CatalogPromotionPipeline(recording, resumed).promote()
+
+    assert len(attempts) == 1 and attempts[0].promoted
+    assert not attempts[0].outcome.replayed, "the outage wrote nothing to replay onto"
+    assert not (set(recording.calls) & EVIDENCE_WRITE_METHODS), sorted(set(recording.calls))
+    assert evidence_census() == before
+
+    # Exactly one of everything the promotion creates, at revision 1.
+    models, variants, provenance_rows, links = canonical_counts(repository)
+    assert models == 1 and variants == 1
+    assert provenance_rows == len(attempts[0].outcome.promoted_fields)
+    assert links == len(CatalogPromotionPipeline(repository, resumed).pending()[0].claims)
+    provenance = repository.list_canonical_field_provenance(attempts[0].outcome.variant["id"])
+    assert provenance and all(row["revision"] == 1 for row in provenance)
+    assert len({row["field_key"] for row in provenance}) == len(provenance)
+
+    # --- attempt 3: a second outage, then a third worker; still no duplicates -
+    counts = canonical_counts(repository)
+    with pytest.raises(AppError):
+        CatalogPromotionPipeline(unavailable_pending_read(repository), resumed).promote()
+    assert canonical_counts(repository) == counts
+
+    final = CatalogPromotionPipeline(repository, restarted_lease(
+        repository, resumed, worker="worker-final")).promote()
+    assert len(final) == 1 and final[0].outcome.replayed
+    assert canonical_counts(repository) == counts
+    assert final[0].outcome.variant["id"] == attempts[0].outcome.variant["id"]
+    assert evidence_census() == before
+    assert all(row["revision"] == 1 for row in
+               repository.list_canonical_field_provenance(attempts[0].outcome.variant["id"]))
+
+
+#: A Swarm V2 product outcome that maps to the durable status `completed` --
+#: exactly what `finalize_product_outcome` builds for a run with a usable
+#: verified field and nothing outstanding. Stated here so the worker takes its
+#: `mark_run_complete` branch, which is the branch this test has to block.
+USABLE_PRODUCT_OUTCOME = {"status": "complete", "result_kind": "usable_result",
+                          "fields": {"answer": [{"value": "42"}]}, "needs_review": []}
+
+
+def swarm_run_reaching_completion(monkeypatch):
+    """The production worker stack, with the ENGINE's execution made certain.
+
+    Everything `backend/worker/main.py` does stays production code: the real
+    `make_swarm_engine` wiring runs, builds the real ToolRegistry, the real
+    Evidence Board and the real `CatalogPromotionPipeline`, and the real
+    finalization decides the durable status from the returned outcome.
+
+    Only `SwarmV2Adapter.run` is replaced, and only so the run lands on
+    `complete`/`usable_result` deterministically. That matters because
+    `mark_run_complete` is reachable ONLY from that outcome -- the offline
+    smoke fixture settles on `partial_success`, where blocking the completion
+    branch would prove nothing.
+    """
+    from test_swarm_v2_smoke_offline import (FakeKimiCompletions, build_repo,
+                                             run_worker_directly, swarm_env)
+    import backend.engines.swarm_v2 as swarm_pkg
+
+    swarm_env(monkeypatch)
+    monkeypatch.setattr(swarm_pkg.SwarmV2Adapter, "run",
+                        lambda self, run: dict(USABLE_PRODUCT_OUTCOME))
+    repo, conversation_id = build_repo()
+    run_id = run_worker_directly(repo, conversation_id, monkeypatch, FakeKimiCompletions(),
+                                 idempotency_key=f"promotion-read-{uuid4().hex[:8]}")
+    return repo, run_id
+
+
+def run_event_types(repo, run_id) -> list[str]:
+    return [row["event_type"] for row in repo.run_events if str(row["run_id"]) == str(run_id)]
+
+
+def test_a_run_whose_pending_promotion_read_failed_is_never_marked_complete(monkeypatch):
+    """The real `execute_run`, with the engine succeeding and the READ failing.
+
+    Not a pipeline unit test: the whole production worker entrypoint, its real
+    Swarm V2 wiring, its real promotion call and its real finalization, with
+    one repository read down. The engine completes successfully, so the
+    `mark_run_complete` branch is open and only the pending-promotion read
+    stands between this run and being marked complete.
+
+    A CONTROL run goes first on the identical stack with the read working and
+    IS completed -- without it this would only show that the run did not
+    complete, not that the read is what stopped it.
+
+    What must not happen is the run being finalized on an answer nobody has:
+    no `mark_run_complete`, no `run_completed` event, no terminal status, and
+    the `AppError` out of `execute_run` so the attempt can be retried.
+    Swallowing the read failure passes every other assertion in this suite and
+    fails exactly this one.
+    """
+    import backend.worker.main as worker_main
+
+    # Counted so the control can prove the promotion path was actually reached
+    # on this stack, rather than the read never being called at all.
+    reads: list[str] = []
+    real_read = MemoryRepository.catalog_run_pending_promotions
+
+    def counted_read(self, *args, **kwargs):
+        reads.append("read")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(MemoryRepository, "catalog_run_pending_promotions", counted_read)
+
+    finalized: list[str] = []
+    for name in ("mark_run_complete", "mark_run_failed", "transition_run"):
+        original = getattr(MemoryRepository, name)
+
+        def record(self, *args, _name=name, _original=original, **kwargs):
+            # Only the TERMINAL transitions matter; `running` is not one.
+            if _name != "transition_run" or (args and args[0] in
+                                             {"completed", "partial_success", "failed",
+                                              "cancelled"}):
+                finalized.append(_name if _name != "transition_run" else f"transition:{args[0]}")
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(MemoryRepository, name, record)
+
+    # --- the CONTROL: identical stack, read working -> the run COMPLETES -----
+    control_repo, control_id = swarm_run_reaching_completion(monkeypatch)
+    assert worker_main.execute_run(control_id, control_repo) == 0
+    assert "run_completed" in run_event_types(control_repo, control_id)
+    assert finalized == ["mark_run_complete"]
+    assert control_repo.get_run(control_id)["status"] == "completed"
+    # The promotion really did run on this stack: the read WAS reached, so the
+    # subject below fails at a step this run genuinely performs.
+    assert reads == ["read"]
+
+    # --- the SUBJECT: identical stack, read DOWN ----------------------------
+    finalized.clear()
+    repo, run_id = swarm_run_reaching_completion(monkeypatch)
+
+    def unavailable(self, *_args, **_kwargs):
+        raise AppError(*CATALOG_READ_OUTAGE)
+
+    monkeypatch.setattr(MemoryRepository, "catalog_run_pending_promotions", unavailable)
+
+    with pytest.raises(AppError) as raised:
+        worker_main.execute_run(run_id, repo)
+    assert (raised.value.code, raised.value.status_code) \
+        == (CATALOG_READ_OUTAGE[0], CATALOG_READ_OUTAGE[2])
+
+    events = run_event_types(repo, run_id)
+    assert "run_started" in events
+    assert "run_completed" not in events and "run_partial_success" not in events
+    assert "run_failed" not in events
+    # No terminal write of any shape: not `mark_run_complete`, not
+    # `mark_run_failed`, and not a terminal `transition_run` either.
+    assert not finalized, finalized
+    # No catalog event was invented in its place: an outage is not a refusal.
+    assert "catalog_promotion_refused" not in events
+    assert "catalog_variant_promoted" not in events
+
+    # The run is left RETRYABLE, which is the whole point: no terminal status,
+    # no finished_at, no durable output and no error. The attempt is re-run,
+    # and the next worker derives the same pending work from the same durable
+    # rows.
+    run = repo.get_run(run_id)
+    assert run["status"] not in {"completed", "partial_success", "failed", "cancelled"}
+    assert not run.get("finished_at") and not run.get("output") and not run.get("error")
+
+
+# =============================================================================
 # 7. the gates would have FAILED on the Catalog PR2 base
 # =============================================================================
 
