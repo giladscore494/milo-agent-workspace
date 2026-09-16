@@ -120,6 +120,33 @@
       }
     ]
   },
+  "partial_result_no_review_items": {
+    "status": "partial_success",
+    "result_kind": "partial_result",
+    "fields": {
+      "fuel_type": [
+        {
+          "value": "plug-in hybrid",
+          "provenance": {
+            "claim_id": "claim-fuel",
+            "source_id": "src-gov-1",
+            "run_id": "cccccccc-1111-4111-8111-000000000f04",
+            "task_id": "government_record_2026",
+            "scope": {
+              "entity": "toyota_rav4_phev",
+              "field": "fuel_type",
+              "geography": "IL",
+              "market": "IL",
+              "time_scope": {
+                "model_year": 2026
+              }
+            }
+          }
+        }
+      ]
+    },
+    "needs_review": []
+  },
   "no_usable_result": {
     "status": "partial_success",
     "result_kind": "no_usable_result",

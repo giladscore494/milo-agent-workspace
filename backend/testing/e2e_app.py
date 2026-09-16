@@ -122,6 +122,17 @@ def build_swarm_v2_product_result(content: str) -> dict[str, Any]:
         return builder.build([], [], task_failures=[
             {"task_id": "government_record_2026", "code": "R5_GOV_RECORD_AMBIGUOUS"}])
 
+    if "rejected claim" in lowered:
+        # A REJECTED verdict makes the run partial WITHOUT writing a
+        # needs_review row, so this is a backend-valid partial_result whose
+        # needs_review is empty. The product surface must stay honest about it.
+        return builder.build(
+            [evidence("claim-fuel", "fuel_type", "plug-in hybrid", "src-gov-1"),
+             evidence("claim-hp", "horsepower_hp", 302, "src-gov-2")],
+            [VerificationVerdict(claim_id="claim-fuel", verdict="verified", reason=supports),
+             VerificationVerdict(claim_id="claim-hp", verdict="rejected",
+                                 reason="source evidence does not support claim")])
+
     if "partial" in lowered:
         # A verified field PLUS an unresolved conflict, a task failure and a
         # coverage gap -> partial_success/partial_result.

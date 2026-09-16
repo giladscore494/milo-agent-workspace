@@ -14,7 +14,13 @@ import { FinalResultPanel } from '../components/result/FinalResultPanel';
 import { RunOutputPanel } from '../components/run/RunOutputPanel';
 import { NO_USABLE_RESULT_CODE } from '../lib/finalResult';
 import fixtures from './fixtures/swarmV2FinalResult.json';
-import { API_KEY_PREFIX, BEARER_SENTINEL, JWT_SENTINEL } from './secretSentinels';
+import {
+  ALL_SECRET_SENTINELS,
+  API_KEY_PREFIX,
+  BEARER_SENTINEL,
+  JWT_SENTINEL,
+  SECRET_FRAGMENTS,
+} from './secretSentinels';
 
 type PanelProps = React.ComponentProps<typeof FinalResultPanel>;
 
@@ -353,5 +359,223 @@ describe('7. refresh and resume', () => {
     renderPanel({ output: fixtures.usable_result as Record<string, unknown>, connection: 'reconnecting' });
     expect(screen.getByText('Usable result')).toBeInTheDocument();
     expect(screen.queryByText('Loading')).not.toBeInTheDocument();
+  });
+});
+
+describe('8. a valid partial result with no itemized review rows', () => {
+  const PAYLOAD = fixtures.partial_result_no_review_items as Record<string, unknown>;
+
+  it('8a. it still reads as partial and unfinished, never as a completed success', () => {
+    renderPanel({ output: PAYLOAD, runStatus: 'partial_success' });
+    expect(screen.getByText('Partial result')).toBeInTheDocument();
+    expect(screen.getByText(/not a completed result/)).toBeInTheDocument();
+    expect(screen.queryByText('Usable result', { exact: true })).not.toBeInTheDocument();
+  });
+
+  it('8b. it says some claims were not verified', () => {
+    renderPanel({ output: PAYLOAD, runStatus: 'partial_success' });
+    expect(screen.getByText(/not every claim it gathered was verified/)).toBeInTheDocument();
+  });
+
+  it('8c. it promises NO itemized list when none was recorded', () => {
+    renderPanel({ output: PAYLOAD, runStatus: 'partial_success' });
+    const text = panel().textContent ?? '';
+    expect(text).not.toMatch(/items below|listed below|below are still outstanding/i);
+    // The heading has no count, because there is no list to count.
+    expect(screen.getByRole('heading', { name: 'Outstanding items' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Outstanding items \(/ })).not.toBeInTheDocument();
+    expect(screen.getByText(/No itemized entries were recorded/)).toBeInTheDocument();
+  });
+
+  it('8d. it invents no reason and no field', () => {
+    renderPanel({ output: PAYLOAD, runStatus: 'partial_success' });
+    // The rejected claim's field must NOT appear: the builder left it out.
+    expect(screen.queryByText('horsepower_hp')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Conflicts/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Task failures/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Coverage gaps/ })).not.toBeInTheDocument();
+    // The verified half is still reported in full.
+    expect(screen.getByText('Fuel type')).toBeInTheDocument();
+    expect(screen.getByText('plug-in hybrid')).toBeInTheDocument();
+  });
+
+  it('8e. itemized rows still appear when the payload DOES record them', () => {
+    renderPanel({ output: fixtures.partial_result as Record<string, unknown>, runStatus: 'partial_success' });
+    expect(screen.getByRole('heading', { name: 'Outstanding items (3)' })).toBeInTheDocument();
+    expect(screen.queryByText(/No itemized entries were recorded/)).not.toBeInTheDocument();
+  });
+
+  it('8f. the no-items section keeps the heading hierarchy and landmark intact', () => {
+    renderPanel({ output: PAYLOAD, runStatus: 'partial_success' });
+    const region = panel();
+    const levels = within(region).getAllByRole('heading').map((h) => Number(h.tagName[1]));
+    expect(levels[0]).toBe(3);
+    for (let i = 1; i < levels.length; i += 1) {
+      expect(levels[i] - levels[i - 1]).toBeLessThanOrEqual(1);
+    }
+    expect(screen.getByRole('status')).toHaveTextContent('Partial result');
+  });
+
+  it('8g. a refresh rebuilds it identically from the durable payload', () => {
+    const first = renderPanel({ output: PAYLOAD, runStatus: 'partial_success' });
+    const before = panel().innerHTML;
+    first.unmount();
+    renderPanel({ output: JSON.parse(JSON.stringify(PAYLOAD)), runStatus: 'partial_success' });
+    expect(panel().innerHTML).toBe(before);
+  });
+});
+
+describe('9. no credential survives into the rendered DOM', () => {
+  /** Every durable string position the surface can render. */
+  const positions: [string, (secret: string) => Record<string, unknown>][] = [
+    ['scalar value', (secret) => {
+      const p = JSON.parse(JSON.stringify(fixtures.usable_result));
+      p.fields.fuel_type[0].value = secret;
+      return p;
+    }],
+    ['nested string', (secret) => {
+      const p = JSON.parse(JSON.stringify(fixtures.usable_result));
+      p.fields.fuel_type[0].value = { spec: { notes: [secret] } };
+      return p;
+    }],
+    ['structured key', (secret) => {
+      const p = JSON.parse(JSON.stringify(fixtures.usable_result));
+      p.fields.fuel_type[0].value = { [secret]: 'value' };
+      return p;
+    }],
+    ['field key', (secret) => {
+      const p = JSON.parse(JSON.stringify(fixtures.usable_result));
+      p.fields = { [secret]: p.fields.fuel_type };
+      return p;
+    }],
+    ['provenance source', (secret) => {
+      const p = JSON.parse(JSON.stringify(fixtures.usable_result));
+      p.fields.fuel_type[0].provenance.source_id = secret;
+      return p;
+    }],
+    ['provenance scope', (secret) => {
+      const p = JSON.parse(JSON.stringify(fixtures.usable_result));
+      p.fields.fuel_type[0].provenance.scope.entity = secret;
+      return p;
+    }],
+  ];
+
+  it('9a. in every verified-field position, with provenance expanded', () => {
+    for (const [name, build] of positions) {
+      for (const secret of ALL_SECRET_SENTINELS) {
+        const { unmount } = renderPanel({ output: build(secret), runStatus: 'completed' });
+        // Open every disclosure: a collapsed <details> still has its content
+        // in the DOM, but opening it proves the visible path too.
+        for (const node of Array.from(document.querySelectorAll('details'))) {
+          (node as HTMLDetailsElement).open = true;
+        }
+        const html = panel().innerHTML;
+        for (const s of ALL_SECRET_SENTINELS) expect(html, `${name} / ${s}`).not.toContain(s);
+        for (const f of SECRET_FRAGMENTS) expect(html, `${name} / ${f}`).not.toContain(f);
+        unmount();
+      }
+    }
+  });
+
+  it('9b. in a review reason, a review code and a task id', () => {
+    const builders: [string, (secret: string) => Record<string, unknown>][] = [
+      ['reason', (secret) => {
+        const p = JSON.parse(JSON.stringify(fixtures.partial_result));
+        p.needs_review[0].reason = secret;
+        return p;
+      }],
+      ['code', (secret) => {
+        const p = JSON.parse(JSON.stringify(fixtures.partial_result));
+        p.needs_review[1].code = secret;
+        return p;
+      }],
+      ['task id', (secret) => {
+        const p = JSON.parse(JSON.stringify(fixtures.partial_result));
+        p.needs_review[1].task_id = secret.slice(0, 80);
+        return p;
+      }],
+    ];
+    for (const [name, build] of builders) {
+      for (const secret of ALL_SECRET_SENTINELS) {
+        const { unmount } = renderPanel({ output: build(secret), runStatus: 'partial_success' });
+        for (const node of Array.from(document.querySelectorAll('details'))) {
+          (node as HTMLDetailsElement).open = true;
+        }
+        const html = panel().innerHTML;
+        for (const s of ALL_SECRET_SENTINELS) expect(html, `${name} / ${s}`).not.toContain(s);
+        for (const f of SECRET_FRAGMENTS) expect(html, `${name} / ${f}`).not.toContain(f);
+        unmount();
+      }
+    }
+  });
+
+  it('9c. a redacted value is shown as the marker, not silently dropped', () => {
+    const payload = JSON.parse(JSON.stringify(fixtures.usable_result));
+    payload.fields.fuel_type[0].value = BEARER_SENTINEL;
+    renderPanel({ output: payload, runStatus: 'completed' });
+    // The field is still reported; only its content is replaced.
+    expect(screen.getByText('Fuel type')).toBeInTheDocument();
+    expect(screen.getByText('[REDACTED]')).toBeInTheDocument();
+  });
+
+  it('9d. V1 keeps its own existing sanitized-output behaviour, unchanged', () => {
+    // RunOutputPanel still uses redactSecrets over the whole payload. F4 must
+    // not have altered what V1 shows.
+    render(<RunOutputPanel visible output={{ summary: 'V1 mocked output', note: JWT_SENTINEL }} />);
+    expect(screen.getByRole('heading', { name: 'Final artifacts' })).toBeInTheDocument();
+    expect(screen.getByText(/V1 mocked output/)).toBeInTheDocument();
+    expect(document.querySelector('pre.code-block')).toBeInTheDocument();
+  });
+});
+
+describe('10. malformed provenance never renders as a verified field', () => {
+  it('10a. an incomplete trace makes the whole result unavailable', () => {
+    const payload = JSON.parse(JSON.stringify(fixtures.usable_result));
+    payload.fields.fuel_type[0].provenance = {};
+    renderPanel({ output: payload, runStatus: 'completed' });
+    expect(screen.getByText('Result unavailable')).toBeInTheDocument();
+    expect(screen.getByText('PROVENANCE_INVALID')).toBeInTheDocument();
+    // Critically: no field is shown as verified on the strength of it.
+    expect(screen.queryByText('Fuel type')).not.toBeInTheDocument();
+    expect(screen.queryByText('plug-in hybrid')).not.toBeInTheDocument();
+  });
+
+  it('10b. a missing scope key, an extra key and an empty id all refuse', () => {
+    const cases: [string, (p: any) => void][] = [
+      ['missing scope key', (p) => { delete p.fields.fuel_type[0].provenance.scope.market; }],
+      ['extra key', (p) => { p.fields.fuel_type[0].provenance.content_hash = 'sha256:abc'; }],
+      ['empty id', (p) => { p.fields.fuel_type[0].provenance.source_id = ''; }],
+      ['mistyped id', (p) => { p.fields.fuel_type[0].provenance.claim_id = 7; }],
+    ];
+    for (const [name, mutate] of cases) {
+      const payload = JSON.parse(JSON.stringify(fixtures.usable_result));
+      mutate(payload);
+      const { unmount } = renderPanel({ output: payload, runStatus: 'completed' });
+      expect(screen.getByText('Result unavailable'), name).toBeInTheDocument();
+      expect(screen.getByText('PROVENANCE_INVALID'), name).toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('10c. a value that could not have survived JSON refuses too', () => {
+    const payload = JSON.parse(JSON.stringify(fixtures.usable_result));
+    payload.fields.fuel_type[0].value = undefined;
+    renderPanel({ output: payload, runStatus: 'completed' });
+    expect(screen.getByText('Result unavailable')).toBeInTheDocument();
+    expect(screen.getByText('VALUE_NOT_JSON')).toBeInTheDocument();
+    expect(screen.queryByText('No value recorded')).not.toBeInTheDocument();
+  });
+});
+
+describe('11. a payload-controlled review code cannot crash the surface', () => {
+  it('11a. a code naming an Object.prototype member renders as a plain code chip', () => {
+    const payload = JSON.parse(JSON.stringify(fixtures.partial_result));
+    payload.needs_review[1].code = 'constructor';
+    // Before the label table became a Map this threw: "Functions are not valid
+    // as a React child".
+    renderPanel({ output: payload, runStatus: 'partial_success' });
+    expect(screen.getByText('Partial result')).toBeInTheDocument();
+    expect(screen.getByText('constructor')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Task failures (1)' })).toBeInTheDocument();
   });
 });

@@ -33,6 +33,7 @@
  */
 
 import { humanizeKey } from './humanize';
+import { redactSecretText } from './sanitize';
 import { isTerminalRunStatus } from './runStatus';
 
 // --- static vocabulary (mirrors backend.engines.swarm_v2.outcome) ------------
@@ -60,6 +61,29 @@ const ALLOWED_OUTCOMES: ReadonlySet<string> = new Set([
   'partial_success|partial_result',
   'partial_success|no_usable_result',
 ]);
+
+/**
+ * Field bounds mirrored from `backend/engines/swarm_v2/contracts.py`
+ * (`EvidenceReference`, `VerificationVerdict`) and `evidence_bounds.py`.
+ *
+ * For provenance these are VALIDATION bounds, not display truncation: a
+ * durable identifier outside them is a shape the builder cannot have written,
+ * so it refuses the whole outcome rather than being trimmed to fit.
+ */
+export const BACKEND_BOUNDS = {
+  claimId: 200,
+  sourceId: 200,
+  runId: 200,
+  taskId: 80,
+  entity: 200,
+  field: 200,
+  geography: 200,
+  market: 200,
+  reason: 500,
+  /** `MAX_TIME_SCOPE_KEYS` / `MAX_FACT_VALUE_JSON_BYTES` in evidence_bounds.py. */
+  timeScopeKeys: 8,
+  timeScopeJsonBytes: 512,
+} as const;
 
 /** The bounded, static empty-result marker; it carries a code and nothing else. */
 export const NO_USABLE_RESULT_CODE = 'NO_USABLE_RESULT';
@@ -94,6 +118,7 @@ export const INVALID_RESULT_CODES = [
   'FIELD_ENTRY_INVALID',
   'REVIEW_ITEM_INVALID',
   'VALUE_NOT_JSON',
+  'PROVENANCE_INVALID',
 ] as const;
 export type InvalidResultCode = (typeof INVALID_RESULT_CODES)[number];
 
@@ -108,11 +133,13 @@ export type InvalidResultCode = (typeof INVALID_RESULT_CODES)[number];
  * not part of this reference — the Inspector is where technical detail lives.
  */
 export type ProvenanceReference = {
-  claimId?: string;
-  sourceId?: string;
-  taskId?: string;
-  entity?: string;
-  field?: string;
+  /** Always present: the builder writes all four, and the parser requires them. */
+  claimId: string;
+  sourceId: string;
+  taskId: string;
+  entity: string;
+  field: string;
+  /** `EvidenceReference` types these as `str | None`, so they may be absent. */
   geography?: string;
   market?: string;
 };
@@ -239,13 +266,46 @@ function ownEntries(value: Record<string, unknown>): [string, unknown][] {
 /** Bounded so a single durable string can never dominate the surface. */
 const MAX_TEXT_CHARS = 500;
 
-function boundedText(value: string): string {
-  return value.length > MAX_TEXT_CHARS ? `${value.slice(0, MAX_TEXT_CHARS)}…` : value;
+/**
+ * THE redaction boundary for this surface.
+ *
+ * Every durable string that can reach the product surface goes through here —
+ * scalar values, strings nested inside structured values, structured-value
+ * keys, field keys, review reasons and codes, task identifiers, provenance
+ * identifiers and displayed scope values. There is deliberately one function
+ * rather than a call at each render site, because a render site added later
+ * would otherwise be a silent gap.
+ *
+ * Redaction runs BEFORE the length bound: bounding first could cut a
+ * credential in half and leave a fragment that no longer matches a pattern.
+ *
+ * This is defense in depth and is NOT a substitute for the typed contract
+ * above. The contract is what stops an unknown key being rendered at all; this
+ * is what stops a credential hiding inside a key the contract allows. Neither
+ * one makes the other unnecessary.
+ */
+function safeDurableText(value: string, maxChars: number = MAX_TEXT_CHARS): string {
+  const redacted = redactSecretText(value);
+  return redacted.length > maxChars ? `${redacted.slice(0, maxChars)}…` : redacted;
 }
 
-/** A bounded durable identifier, or undefined. Never a fallback string. */
-function reference(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? boundedText(value) : undefined;
+/**
+ * A REQUIRED durable identifier, validated against the backend bound.
+ *
+ * Returns the redacted text for display, or `null` to refuse. Refusing rather
+ * than truncating is the point: a value outside `EvidenceReference`'s bounds is
+ * not a long identifier, it is a payload the builder could not have produced.
+ */
+function requiredId(value: unknown, maxChars: number): Refusable<string> {
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxChars) return null;
+  return safeDurableText(value, maxChars);
+}
+
+/** A nullable bounded scope string: `string | null`, per `EvidenceReference`. */
+function optionalScopeText(value: unknown, maxChars: number): Refusable<string | undefined> {
+  if (value === null) return undefined;
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxChars) return null;
+  return safeDurableText(value, maxChars);
 }
 
 /**
@@ -257,21 +317,28 @@ type Refusable<T> = T | null;
 /**
  * Render one durable value under explicit bounds, or refuse it.
  *
- * `null` is a recorded absence, not the string "null". Scalars render as
- * themselves. Lists and records are rendered — the backend contract permits
- * them, so discarding them would drop a verified answer — but only to
- * `MAX_VALUE_DEPTH` levels and `MAX_VALUE_ITEMS` entries per level, with the
- * remainder COUNTED in `hidden` so the surface can say how much it is not
- * showing. Nothing is truncated silently.
+ * `null` is a recorded absence. `undefined` is NOT: it cannot survive JSON and
+ * `safe_durable_value` can never emit it, so a value key that carries it — at
+ * the top of an entry, inside a list, or inside a structured object — means
+ * the payload did not come from the durable path, and it refuses.
  *
- * Anything JSON cannot express is refused: `safe_durable_value` would never
- * have written it, so its presence means the payload is not the durable
- * payload it claims to be.
+ * Scalars render as themselves. Lists and records are rendered — the backend
+ * contract permits them, so discarding them would drop a verified answer — but
+ * only to `MAX_VALUE_DEPTH` levels and `MAX_VALUE_ITEMS` entries per level,
+ * with the remainder COUNTED in `hidden` so the surface can say how much it is
+ * not showing. Nothing is truncated silently.
+ *
+ * Every string that comes out of here — a scalar value and a record KEY alike
+ * — has been through the redaction boundary.
  */
 export function toDisplayValue(value: unknown, depth = 0): Refusable<DisplayValue> {
-  if (value === null || value === undefined) return { display: 'empty' };
+  // `undefined` is refused; only an explicit JSON null is a recorded absence.
+  if (value === undefined) return null;
+  if (value === null) return { display: 'empty' };
   if (typeof value === 'string') {
-    return value.length === 0 ? { display: 'empty' } : { display: 'text', text: boundedText(value) };
+    if (value.length === 0) return { display: 'empty' };
+    const text = safeDurableText(value);
+    return text.length === 0 ? { display: 'empty' } : { display: 'text', text };
   }
   if (typeof value === 'number') {
     // NaN and +/-Infinity do not survive JSON and `safe_durable_value` never
@@ -307,49 +374,83 @@ export function toDisplayValue(value: unknown, depth = 0): Refusable<DisplayValu
   for (const [key, item] of shown) {
     const rendered = toDisplayValue(item, depth + 1);
     if (rendered === null) return null;
-    entries.push({ key: boundedText(key), value: rendered });
+    // A structured-value KEY is durable text too, and is redacted like one.
+    entries.push({ key: safeDurableText(key), value: rendered });
   }
   return { display: 'record', entries, hidden: all.length - shown.length };
 }
 
-/** Keys a durable provenance trace may carry. Anything else is a violation. */
-const PROVENANCE_KEYS: ReadonlySet<string> = new Set([
-  'claim_id', 'source_id', 'run_id', 'task_id', 'scope',
-]);
-const PROVENANCE_SCOPE_KEYS: ReadonlySet<string> = new Set([
-  'entity', 'field', 'geography', 'market', 'time_scope',
-]);
+/**
+ * A `time_scope` the durable contract could have carried.
+ *
+ * Validated even though the product surface deliberately does not display it:
+ * a malformed scope means the trace is not a builder trace, and the surface
+ * must not present a field as verified on the strength of one.
+ */
+function isValidTimeScope(value: unknown): boolean {
+  if (!isObject(value)) return false;
+  const entries = ownEntries(value);
+  if (entries.length > BACKEND_BOUNDS.timeScopeKeys) return false;
+  // Every member must be JSON-expressible; `undefined` and non-finite numbers
+  // are refused here for exactly the reason they are refused in a value.
+  for (const [, item] of entries) {
+    if (toDisplayValue(item) === null) return false;
+  }
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(value);
+  } catch {
+    return false; // a cycle, or a throwing `toJSON`.
+  }
+  if (typeof json !== 'string') return false;
+  return new TextEncoder().encode(json).length <= BACKEND_BOUNDS.timeScopeJsonBytes;
+}
+
+/**
+ * The EXACT keys `FinalBuilder` writes into a provenance trace, and into its
+ * `scope`. Both levels are closed: a missing key, an extra key, a wrong type,
+ * an empty required identifier or a malformed scope refuses the outcome.
+ */
+const PROVENANCE_KEYS = ['claim_id', 'source_id', 'run_id', 'task_id', 'scope'] as const;
+const PROVENANCE_SCOPE_KEYS = ['entity', 'field', 'geography', 'market', 'time_scope'] as const;
 
 /**
  * Read a durable provenance trace, or refuse it.
  *
- * Closed on both levels: a key the builder never writes means this is not a
- * builder trace. `run_id` and `time_scope` are accepted as valid contract keys
- * and deliberately NOT surfaced — the run is the one the user is already on,
- * and a time scope is structured technical metadata that belongs in the
- * Inspector, not in a product-surface provenance reference.
+ * This mirrors the literal dictionary `FinalBuilder.build` constructs, key for
+ * key. An incomplete trace is not "a field with less provenance" — it is a
+ * field whose sourcing cannot be established, and showing it as verified would
+ * be the exact claim this surface exists to avoid making.
+ *
+ * `run_id` and `time_scope` are REQUIRED and VALIDATED, and deliberately not
+ * surfaced: the run is the one the user is already on (`SwarmRunCard` shows
+ * it), and a time scope is structured technical metadata that belongs in the
+ * Inspector. Validating what is not displayed is the point — a trace that
+ * fails there is not a builder trace.
  */
 function toProvenance(value: unknown): Refusable<ProvenanceReference> {
-  if (!isObject(value)) return null;
-  for (const [key, item] of ownEntries(value)) {
-    if (!PROVENANCE_KEYS.has(key)) return null;
-    if (key === 'scope') {
-      if (!isObject(item)) return null;
-      for (const [scopeKey] of ownEntries(item)) {
-        if (!PROVENANCE_SCOPE_KEYS.has(scopeKey)) return null;
-      }
-    }
-  }
-  const scope = isObject(value.scope) ? value.scope : undefined;
-  return {
-    claimId: reference(value.claim_id),
-    sourceId: reference(value.source_id),
-    taskId: reference(value.task_id),
-    entity: scope ? reference(scope.entity) : undefined,
-    field: scope ? reference(scope.field) : undefined,
-    geography: scope ? reference(scope.geography) : undefined,
-    market: scope ? reference(scope.market) : undefined,
-  };
+  if (!isObject(value) || !hasExactKeys(value, PROVENANCE_KEYS)) return null;
+
+  const claimId = requiredId(value.claim_id, BACKEND_BOUNDS.claimId);
+  const sourceId = requiredId(value.source_id, BACKEND_BOUNDS.sourceId);
+  const runId = requiredId(value.run_id, BACKEND_BOUNDS.runId);
+  const taskId = requiredId(value.task_id, BACKEND_BOUNDS.taskId);
+  if (claimId === null || sourceId === null || runId === null || taskId === null) return null;
+
+  const scope = value.scope;
+  if (!isObject(scope) || !hasExactKeys(scope, PROVENANCE_SCOPE_KEYS)) return null;
+
+  const entity = requiredId(scope.entity, BACKEND_BOUNDS.entity);
+  const field = requiredId(scope.field, BACKEND_BOUNDS.field);
+  if (entity === null || field === null) return null;
+
+  const geography = optionalScopeText(scope.geography, BACKEND_BOUNDS.geography);
+  const market = optionalScopeText(scope.market, BACKEND_BOUNDS.market);
+  if (geography === null || market === null) return null;
+
+  if (!isValidTimeScope(scope.time_scope)) return null;
+
+  return { claimId, sourceId, taskId, entity, field, geography, market };
 }
 
 /** Exactly these keys, no more and no fewer. */
@@ -386,6 +487,23 @@ const COVERAGE_GAP_CODES: ReadonlySet<string> = new Set([
 /** The exact key sets `FinalBuilder` and the engine write. */
 const VERDICT_REVIEW_KEYS = ['field', 'value', 'reason', 'provenance'] as const;
 const TASK_SCOPED_KEYS = ['task_id', 'code'] as const;
+/** One verified value entry: exactly `{value, provenance}`. */
+const FIELD_ENTRY_KEYS = ['value', 'provenance'] as const;
+
+/**
+ * Why a payload's interior was refused.
+ *
+ * Returned in place of the parsed shape so the caller reports the RIGHT
+ * reason. Telling "this is not a builder entry" apart from "this value could
+ * never have survived JSON" and "this provenance is not a builder trace" is
+ * what makes an invalid result diagnosable instead of merely refused.
+ */
+type EntryRefusal = 'FIELD_ENTRY_INVALID' | 'REVIEW_ITEM_INVALID' | 'VALUE_NOT_JSON'
+  | 'PROVENANCE_INVALID';
+
+function isRefusal<T>(value: T | EntryRefusal): value is EntryRefusal {
+  return typeof value === 'string';
+}
 
 /**
  * Classify one `needs_review` entry, or refuse it.
@@ -401,52 +519,59 @@ const TASK_SCOPED_KEYS = ['task_id', 'code'] as const;
  * key, a wrong type — is refused, and refusing one entry invalidates the whole
  * outcome. There is no lenient path: an outstanding item nobody can classify
  * must not be rendered beside verified fields as though the result were sound.
+ *
+ * Classification reads the RAW reason and code; only the DISPLAY text is
+ * redacted, so a redaction can never change which group an item lands in.
  */
-function toReviewItem(item: Record<string, unknown>): Refusable<ReviewItem> {
+function toReviewItem(item: Record<string, unknown>): ReviewItem | EntryRefusal {
   if (isEmptyMarker(item)) return { kind: 'empty_marker', code: NO_USABLE_RESULT_CODE };
 
   if (hasExactKeys(item, VERDICT_REVIEW_KEYS)) {
-    const fieldKey = reference(item.field);
-    const reason = reference(item.reason);
-    if (fieldKey === undefined || reason === undefined) return null;
+    const rawField = item.field;
+    const rawReason = item.reason;
+    if (typeof rawField !== 'string' || rawField.length === 0 ||
+        rawField.length > BACKEND_BOUNDS.field) return 'REVIEW_ITEM_INVALID';
+    if (typeof rawReason !== 'string' || rawReason.length === 0 ||
+        rawReason.length > BACKEND_BOUNDS.reason) return 'REVIEW_ITEM_INVALID';
     const value = toDisplayValue(item.value);
-    if (value === null) return null;
+    if (value === null) return 'VALUE_NOT_JSON';
     const provenance = toProvenance(item.provenance);
-    if (provenance === null) return null;
+    if (provenance === null) return 'PROVENANCE_INVALID';
+    const fieldKey = safeDurableText(rawField, BACKEND_BOUNDS.field);
     return {
-      kind: CONFLICT_REASONS.has(reason) ? 'conflict' : 'needs_review',
+      kind: CONFLICT_REASONS.has(rawReason) ? 'conflict' : 'needs_review',
       fieldKey,
       fieldLabel: humanizeKey(fieldKey),
-      reason,
+      reason: safeDurableText(rawReason, BACKEND_BOUNDS.reason),
       value,
       provenance,
     };
   }
 
   if (hasExactKeys(item, TASK_SCOPED_KEYS)) {
-    const taskId = reference(item.task_id);
-    const code = reference(item.code);
-    if (taskId === undefined || code === undefined) return null;
+    const rawTaskId = item.task_id;
+    const rawCode = item.code;
+    if (typeof rawTaskId !== 'string' || rawTaskId.length === 0 ||
+        rawTaskId.length > BACKEND_BOUNDS.taskId) return 'REVIEW_ITEM_INVALID';
+    if (typeof rawCode !== 'string' || rawCode.length === 0) return 'REVIEW_ITEM_INVALID';
+    const taskId = safeDurableText(rawTaskId, BACKEND_BOUNDS.taskId);
     return {
-      kind: COVERAGE_GAP_CODES.has(code) ? 'coverage_gap' : 'task_failure',
+      kind: COVERAGE_GAP_CODES.has(rawCode) ? 'coverage_gap' : 'task_failure',
       taskId,
       taskLabel: humanizeKey(taskId),
-      code,
+      code: safeDurableText(rawCode),
     };
   }
 
-  return null;
+  return 'REVIEW_ITEM_INVALID';
 }
 
-/** One verified value entry: exactly `{value, provenance}`, or a refusal. */
-const FIELD_ENTRY_KEYS = ['value', 'provenance'] as const;
-
-function toVerifiedValue(entry: unknown): Refusable<VerifiedValue> {
-  if (!isObject(entry) || !hasExactKeys(entry, FIELD_ENTRY_KEYS)) return null;
+function toVerifiedValue(entry: unknown): VerifiedValue | EntryRefusal {
+  if (!isObject(entry) || !hasExactKeys(entry, FIELD_ENTRY_KEYS)) return 'FIELD_ENTRY_INVALID';
   const value = toDisplayValue(entry.value);
-  if (value === null) return null;
+  if (value === null) return 'VALUE_NOT_JSON';
   const provenance = toProvenance(entry.provenance);
-  if (provenance === null) return null;
+  if (provenance === null) return 'PROVENANCE_INVALID';
   return { value, provenance };
 }
 
@@ -549,26 +674,25 @@ export function parseFinalResult(output: unknown, options: ParseOptions = {}): F
     if (!Array.isArray(value) || value.length === 0) {
       return { state: 'invalid', code: 'FIELD_ENTRY_INVALID' };
     }
+    if (key.length === 0 || key.length > BACKEND_BOUNDS.field) {
+      return { state: 'invalid', code: 'FIELD_ENTRY_INVALID' };
+    }
     const values: VerifiedValue[] = [];
     for (const entry of value) {
       const parsedEntry = toVerifiedValue(entry);
-      if (parsedEntry === null) {
-        // Tell "this is not a builder entry" apart from "this value is not
-        // something JSON could ever have carried": both are refusals, but the
-        // second says the payload was not written by the durable path at all.
-        const badValue = isObject(entry) && hasExactKeys(entry, FIELD_ENTRY_KEYS) &&
-          toDisplayValue(entry.value) === null;
-        return { state: 'invalid', code: badValue ? 'VALUE_NOT_JSON' : 'FIELD_ENTRY_INVALID' };
-      }
+      if (isRefusal(parsedEntry)) return { state: 'invalid', code: parsedEntry };
       values.push(parsedEntry);
     }
-    parsedFields.push({ key, label: humanizeKey(key), values });
+    // The field KEY is durable text and is redacted like any other; the label
+    // is derived from the redacted key so the two can never disagree.
+    const displayKey = safeDurableText(key, BACKEND_BOUNDS.field);
+    parsedFields.push({ key: displayKey, label: humanizeKey(displayKey), values });
   }
 
   const review: ReviewItem[] = [];
   for (const item of needsReview) {
     const parsedItem = toReviewItem(item);
-    if (parsedItem === null) return { state: 'invalid', code: 'REVIEW_ITEM_INVALID' };
+    if (isRefusal(parsedItem)) return { state: 'invalid', code: parsedItem };
     review.push(parsedItem);
   }
 
@@ -621,8 +745,12 @@ const OUTCOMES: Readonly<Record<FinalResultKind, OutcomeDescriptor>> = {
     tone: 'caution',
     label: 'Partial result',
     symbol: '!',
+    // Deliberately promises no LIST. A rejected verdict makes a run partial
+    // without producing a `needs_review` row of its own, so a valid
+    // `partial_result` can carry no itemized entries at all — and a summary
+    // that said "the items below" would then point at nothing.
     summary:
-      'The run verified some fields but did not finish: the items below are still outstanding. This is not a completed result.',
+      'The run verified the fields below but did not finish: not every claim it gathered was verified. This is not a completed result.',
   },
   no_usable_result: {
     tone: 'negative',
@@ -650,16 +778,23 @@ export function describeOutcome(kind: FinalResultKind): OutcomeDescriptor {
  * — because hiding an outstanding item would misreport the result. Nothing is
  * invented for an unknown code.
  */
-const REVIEW_CODE_LABELS: Readonly<Record<string, string>> = {
-  NO_USABLE_RESULT: 'No usable result was produced',
-  REQUIRED_OUTPUT_MISSING: 'A required output was missing',
-  EVIDENCE_REQUIREMENTS_UNMET: 'Evidence requirements were not met',
-  TASK_FAILED: 'The task did not complete',
-};
+const REVIEW_CODE_LABELS: ReadonlyMap<string, string> = new Map([
+  ['NO_USABLE_RESULT', 'No usable result was produced'],
+  ['REQUIRED_OUTPUT_MISSING', 'A required output was missing'],
+  ['EVIDENCE_REQUIREMENTS_UNMET', 'Evidence requirements were not met'],
+  ['TASK_FAILED', 'The task did not complete'],
+]);
 
+/**
+ * A Map, not a plain object, because the key comes from the PAYLOAD.
+ * `labels['constructor']` on an object literal returns a function off the
+ * prototype chain, and React throws when handed a function as a child — so a
+ * payload carrying `code: "constructor"` would have crashed the surface it was
+ * meant to fail closed on. A Map has no prototype keys to reach.
+ */
 export function describeReviewCode(code?: string): string | undefined {
   if (code === undefined) return undefined;
-  return REVIEW_CODE_LABELS[code];
+  return REVIEW_CODE_LABELS.get(code);
 }
 
 /** Section headings for the outstanding-item groups, in display order. */

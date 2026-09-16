@@ -108,6 +108,27 @@ test('F4-4. an empty result is reported as empty, never as a success', async ({ 
   await expect(result.getByRole('heading', { name: 'Verified fields' })).toHaveCount(0);
 });
 
+test('F4-4b. a partial result with no itemized rows stays honest about having no list', async ({ page }) => {
+  // A REJECTED verdict makes the run partial without writing a needs_review
+  // row, so this backend-valid payload has an EMPTY needs_review.
+  await runTask(page, 'Gamma Swarm', 'f4-rejected', 'a rejected claim please');
+  const result = page.getByRole('region', { name: 'Final result' });
+
+  await expect(result.getByText('Partial result')).toBeVisible(TERMINAL);
+  await expect(result.getByText(/not a completed result/)).toBeVisible();
+  await expect(result.getByText(/not every claim it gathered was verified/)).toBeVisible();
+  // The verified half is still reported…
+  await expect(result.getByText('Fuel type')).toBeVisible();
+  // …and the surface says plainly that no itemized entries exist, rather than
+  // pointing at a list that was never recorded.
+  await expect(result.getByText(/No itemized entries were recorded/)).toBeVisible();
+  await expect(result.getByRole('heading', { name: 'Outstanding items' })).toBeVisible();
+  await expect(result.getByRole('heading', { name: /Conflicts/ })).toHaveCount(0);
+  await expect(result.getByRole('heading', { name: /Task failures/ })).toHaveCount(0);
+  // Nothing is invented about the rejected claim.
+  await expect(result.getByText('horsepower_hp')).toHaveCount(0);
+});
+
 test('F4-5. refresh reconstructs the identical result from the durable run output', async ({ page }) => {
   await runTask(page, 'Gamma Swarm', 'f4-refresh', 'produce a partial report please');
   const result = page.getByRole('region', { name: 'Final result' });

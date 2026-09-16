@@ -19,10 +19,17 @@ import {
   MAX_VALUE_ITEMS,
   NO_USABLE_RESULT_CODE,
   describeOutcome,
+  describeReviewCode,
   parseFinalResult,
 } from '../lib/finalResult';
 import fixtures from './fixtures/swarmV2FinalResult.json';
-import { API_KEY_SENTINEL, BEARER_SENTINEL, JWT_SENTINEL } from './secretSentinels';
+import {
+  ALL_SECRET_SENTINELS,
+  API_KEY_SENTINEL,
+  BEARER_SENTINEL,
+  JWT_SENTINEL,
+  SECRET_FRAGMENTS,
+} from './secretSentinels';
 
 /** Narrow to a successful parse, failing loudly (not silently) otherwise. */
 function ok(output: unknown, runStatus?: string): FinalResult {
@@ -43,6 +50,40 @@ function invalidCode(output: unknown, runStatus?: string): string {
 /** A minimal contract-valid payload, used as the base for mutation tests. */
 function usablePayload() {
   return JSON.parse(JSON.stringify(fixtures.usable_result));
+}
+
+/** Exactly the trace `FinalBuilder.build` writes. Every key, every scope key. */
+function validProvenance(overrides: Record<string, unknown> = {}) {
+  return {
+    claim_id: 'claim-fuel',
+    source_id: 'src-gov-1',
+    run_id: 'cccccccc-1111-4111-8111-000000000f04',
+    task_id: 'government_record_2026',
+    scope: {
+      entity: 'toyota_rav4_phev',
+      field: 'fuel_type',
+      geography: 'IL',
+      market: 'IL',
+      time_scope: { model_year: 2026 },
+    },
+    ...overrides,
+  };
+}
+
+/** A whole contract-valid payload built around one field entry. */
+function payloadWithEntry(entry: unknown): Record<string, unknown> & { fields: Record<string, unknown> } {
+  return {
+    status: 'complete',
+    result_kind: 'usable_result',
+    fields: { fuel_type: [entry] },
+    needs_review: [],
+  };
+}
+
+/** Assert that no sentinel — whole or fragmentary — survives into `text`. */
+function assertNoSecret(text: string, label: string) {
+  for (const secret of ALL_SECRET_SENTINELS) expect(text, label).not.toContain(secret);
+  for (const fragment of SECRET_FRAGMENTS) expect(text, label).not.toContain(fragment);
 }
 
 describe('1. the four result kinds, from real backend payloads', () => {
@@ -297,11 +338,11 @@ describe('5. absent, malformed and hostile payloads', () => {
   it('5f. a provenance trace carrying a key the builder never writes is refused', () => {
     const smuggled = usablePayload();
     smuggled.fields.fuel_type[0].provenance.fragment = 'the source text, verbatim';
-    expect(invalidCode(smuggled)).toBe('FIELD_ENTRY_INVALID');
+    expect(invalidCode(smuggled)).toBe('PROVENANCE_INVALID');
 
     const smuggledScope = usablePayload();
     smuggledScope.fields.fuel_type[0].provenance.scope.locator = 'sha256:deadbeef';
-    expect(invalidCode(smuggledScope)).toBe('FIELD_ENTRY_INVALID');
+    expect(invalidCode(smuggledScope)).toBe('PROVENANCE_INVALID');
   });
 
   it('5g. a value JSON could never have carried is refused, not bounded', () => {
@@ -315,14 +356,24 @@ describe('5. absent, malformed and hostile payloads', () => {
   });
 
   it('5h. a hostile __proto__ key is inert data, never a prototype mutation', () => {
-    const hostile = JSON.parse(
-      '{"status":"complete","result_kind":"usable_result","needs_review":[],' +
-      '"fields":{"__proto__":[{"value":"polluted","provenance":{}}]}}',
-    );
+    // The provenance is complete and valid: this test is about the KEY, and a
+    // trace that failed validation would refuse before the key ever mattered.
+    const hostile = JSON.parse(JSON.stringify(
+      payloadWithEntry({ value: 'polluted', provenance: validProvenance() }),
+    ).replace('"fuel_type"', '"__proto__"'));
     const result = ok(hostile, 'completed');
     expect(result.fields.map((f) => f.key)).toEqual(['__proto__']);
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
     expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'value')).toBe(false);
+
+    // The same key nested inside a structured VALUE is equally inert.
+    const nested = JSON.parse(
+      '{"status":"complete","result_kind":"usable_result","needs_review":[],' +
+      '"fields":{"dimensions":[{"value":{"__proto__":{"polluted":true}},' +
+      '"provenance":' + JSON.stringify(validProvenance()) + '}]}}',
+    );
+    ok(nested, 'completed');
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
 
   it('5i. unknown TOP-LEVEL keys are never rendered and never invent a field', () => {
@@ -336,16 +387,16 @@ describe('5. absent, malformed and hostile payloads', () => {
 });
 
 describe('6. secret and redaction sentinels', () => {
-  it('6a. a secret smuggled into a verified value is never promoted to a field of its own', () => {
-    // Redaction is defense in depth; the CONTRACT is what keeps secrets out of
-    // the shape. A secret-looking string is still just one field's value, and
-    // the surface renders it through safeText — it is never a new key, never a
-    // provenance reference and never an unrendered passthrough.
+  it('6a. a secret in a verified value is REDACTED, never displayed', () => {
+    // The typed contract stops an unknown FIELD being rendered; it proves
+    // nothing about what is inside a string the contract legitimately allows.
+    // Redaction is the second barrier, and this asserts it actually fires.
     const payload = usablePayload();
     payload.fields.fuel_type[0].value = API_KEY_SENTINEL;
     const result = ok(payload, 'completed');
     expect(result.fields.find((f) => f.key === 'fuel_type')?.values[0].value)
-      .toEqual({ display: 'text', text: API_KEY_SENTINEL });
+      .toEqual({ display: 'text', text: '[REDACTED]' });
+    assertNoSecret(JSON.stringify(result), 'verified value');
   });
 
   it('6b. secret-shaped top-level keys are dropped by the closed contract', () => {
@@ -486,5 +537,340 @@ describe('9. refresh and resume determinism', () => {
     const before = JSON.stringify(payload);
     parseFinalResult(payload, { runStatus: 'partial_success' });
     expect(JSON.stringify(payload)).toBe(before);
+  });
+});
+
+describe('10. redaction is a real boundary, in EVERY durable string position', () => {
+  // The contract closes the SHAPE; it says nothing about what is inside a
+  // string it allows. Each case below puts a credential in a position the
+  // contract permits and asserts it does not survive into the display model.
+
+  it('10a. a scalar verified value', () => {
+    for (const secret of ALL_SECRET_SENTINELS) {
+      const payload = usablePayload();
+      payload.fields.fuel_type[0].value = secret;
+      assertNoSecret(JSON.stringify(ok(payload, 'completed')), `scalar ${secret}`);
+    }
+  });
+
+  it('10b. a string nested inside a structured value', () => {
+    for (const secret of ALL_SECRET_SENTINELS) {
+      const payload = usablePayload();
+      payload.fields.fuel_type[0].value = { spec: { notes: [secret] } };
+      assertNoSecret(JSON.stringify(ok(payload, 'completed')), `nested ${secret}`);
+    }
+  });
+
+  it('10c. a structured-value KEY', () => {
+    for (const secret of ALL_SECRET_SENTINELS) {
+      const payload = usablePayload();
+      payload.fields.fuel_type[0].value = { [secret]: 'value' };
+      assertNoSecret(JSON.stringify(ok(payload, 'completed')), `record key ${secret}`);
+    }
+  });
+
+  it('10d. a field key — and the label derived from it', () => {
+    for (const secret of ALL_SECRET_SENTINELS) {
+      const payload = payloadWithEntry({ value: 'petrol', provenance: validProvenance() });
+      payload.fields = { [secret]: payload.fields.fuel_type };
+      const result = ok(payload, 'completed');
+      assertNoSecret(JSON.stringify(result), `field key ${secret}`);
+      // The label is derived from the REDACTED key, so the two cannot diverge.
+      assertNoSecret(result.fields[0].label, `field label ${secret}`);
+    }
+  });
+
+  it('10e. a review reason and a review code', () => {
+    for (const secret of ALL_SECRET_SENTINELS) {
+      const withReason = JSON.parse(JSON.stringify(fixtures.partial_result));
+      withReason.needs_review[0].reason = secret;
+      assertNoSecret(JSON.stringify(ok(withReason, 'partial_success')), `reason ${secret}`);
+
+      const withCode = JSON.parse(JSON.stringify(fixtures.partial_result));
+      withCode.needs_review[1].code = secret;
+      assertNoSecret(JSON.stringify(ok(withCode, 'partial_success')), `code ${secret}`);
+    }
+  });
+
+  it('10f. a task identifier', () => {
+    for (const secret of ALL_SECRET_SENTINELS) {
+      const payload = JSON.parse(JSON.stringify(fixtures.partial_result));
+      // `task_id` is bounded at 80 chars by the backend contract; keep inside it.
+      payload.needs_review[1].task_id = secret.slice(0, 80);
+      assertNoSecret(JSON.stringify(ok(payload, 'partial_success')), `task id ${secret}`);
+    }
+  });
+
+  it('10g. provenance identifiers and displayed scope values', () => {
+    const positions = [
+      ['claim_id', (p: any, v: string) => { p.claim_id = v; }],
+      ['source_id', (p: any, v: string) => { p.source_id = v; }],
+      ['task_id', (p: any, v: string) => { p.task_id = v.slice(0, 80); }],
+      ['scope.entity', (p: any, v: string) => { p.scope.entity = v; }],
+      ['scope.field', (p: any, v: string) => { p.scope.field = v; }],
+      ['scope.geography', (p: any, v: string) => { p.scope.geography = v; }],
+      ['scope.market', (p: any, v: string) => { p.scope.market = v; }],
+    ] as const;
+    for (const secret of ALL_SECRET_SENTINELS) {
+      for (const [name, place] of positions) {
+        const provenance = validProvenance();
+        place(provenance, secret);
+        const payload = payloadWithEntry({ value: 'petrol', provenance });
+        assertNoSecret(JSON.stringify(ok(payload, 'completed')), `${name} ${secret}`);
+      }
+    }
+  });
+
+  it('10h. redaction never changes how an item is CLASSIFIED', () => {
+    // Classification reads the raw reason/code; only display text is redacted.
+    // A conflict whose reason were redacted before classification would be
+    // silently demoted to an ordinary review item.
+    const payload = JSON.parse(JSON.stringify(fixtures.partial_result));
+    expect(ok(payload, 'partial_success').conflictCount).toBe(1);
+    expect(ok(payload, 'partial_success').coverageGapCount).toBe(1);
+  });
+
+  it('10i. an ordinary product value is left completely untouched', () => {
+    // Over-redaction is the safe direction, but it must not be the common one.
+    const result = ok(fixtures.partial_result, 'partial_success');
+    expect(result.fields[0].values[0].value).toEqual({ display: 'text', text: 'plug-in hybrid' });
+    expect(result.review[0].reason).toBe('unresolved conflict');
+    expect(result.review[1].code).toBe('R5_GOV_RECORD_AMBIGUOUS');
+    expect(result.fields[0].values[0].provenance.sourceId).toBe('src-gov-1');
+  });
+});
+
+describe('11. provenance is fail-closed, mirroring FinalBuilder exactly', () => {
+  const REQUIRED = ['claim_id', 'source_id', 'run_id', 'task_id', 'scope'] as const;
+  const SCOPE_REQUIRED = ['entity', 'field', 'geography', 'market', 'time_scope'] as const;
+
+  it('11a. a complete builder trace parses, and surfaces only the safe references', () => {
+    const result = ok(payloadWithEntry({ value: 'petrol', provenance: validProvenance() }), 'completed');
+    expect(result.fields[0].values[0].provenance).toEqual({
+      claimId: 'claim-fuel',
+      sourceId: 'src-gov-1',
+      taskId: 'government_record_2026',
+      entity: 'toyota_rav4_phev',
+      field: 'fuel_type',
+      geography: 'IL',
+      market: 'IL',
+    });
+  });
+
+  it('11b. a MISSING provenance key refuses the whole outcome', () => {
+    for (const key of REQUIRED) {
+      const provenance: Record<string, unknown> = validProvenance();
+      delete provenance[key];
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance })), key)
+        .toBe('PROVENANCE_INVALID');
+    }
+  });
+
+  it('11c. an EMPTY or whole-object-missing provenance refuses', () => {
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: {} })))
+      .toBe('PROVENANCE_INVALID');
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: null })))
+      .toBe('PROVENANCE_INVALID');
+  });
+
+  it('11d. an EMPTY required identifier refuses', () => {
+    for (const key of ['claim_id', 'source_id', 'run_id', 'task_id'] as const) {
+      const provenance: Record<string, unknown> = validProvenance();
+      provenance[key] = '';
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance })), key)
+        .toBe('PROVENANCE_INVALID');
+    }
+  });
+
+  it('11e. a MISTYPED identifier refuses', () => {
+    for (const bad of [42, null, [], {}, true] as const) {
+      const provenance: Record<string, unknown> = validProvenance();
+      provenance.claim_id = bad;
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance })), String(bad))
+        .toBe('PROVENANCE_INVALID');
+    }
+  });
+
+  it('11f. an identifier past the backend bound refuses rather than truncating', () => {
+    const tooLongClaim: Record<string, unknown> = validProvenance();
+    tooLongClaim.claim_id = 'c'.repeat(201); // EvidenceReference: max_length=200
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: tooLongClaim })))
+      .toBe('PROVENANCE_INVALID');
+
+    const tooLongTask: Record<string, unknown> = validProvenance();
+    tooLongTask.task_id = 't'.repeat(81); // task_id: max_length=80
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: tooLongTask })))
+      .toBe('PROVENANCE_INVALID');
+
+    // Exactly at the bound is fine.
+    const atBound: Record<string, unknown> = validProvenance();
+    atBound.task_id = 't'.repeat(80);
+    expect(ok(payloadWithEntry({ value: 'petrol', provenance: atBound }), 'completed')
+      .fields[0].values[0].provenance.taskId).toHaveLength(80);
+  });
+
+  it('11g. an EXTRA provenance or scope key refuses', () => {
+    const extra: Record<string, unknown> = validProvenance();
+    extra.content_hash = 'sha256:deadbeef';
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: extra })))
+      .toBe('PROVENANCE_INVALID');
+
+    const extraScope = validProvenance();
+    (extraScope.scope as Record<string, unknown>).unit = 'hp';
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: extraScope })))
+      .toBe('PROVENANCE_INVALID');
+  });
+
+  it('11h. a MISSING or malformed scope key refuses', () => {
+    for (const key of SCOPE_REQUIRED) {
+      const provenance = validProvenance();
+      delete (provenance.scope as Record<string, unknown>)[key];
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance })), key)
+        .toBe('PROVENANCE_INVALID');
+    }
+    const notAnObject = validProvenance({ scope: 'IL' });
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: notAnObject })))
+      .toBe('PROVENANCE_INVALID');
+  });
+
+  it('11i. entity and field are REQUIRED; geography and market may be null', () => {
+    for (const key of ['entity', 'field'] as const) {
+      const provenance = validProvenance();
+      (provenance.scope as Record<string, unknown>)[key] = null;
+      expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance })), key)
+        .toBe('PROVENANCE_INVALID');
+    }
+    // `EvidenceReference` types these as `str | None`.
+    const nullable = validProvenance();
+    (nullable.scope as Record<string, unknown>).geography = null;
+    (nullable.scope as Record<string, unknown>).market = null;
+    const provenance = ok(payloadWithEntry({ value: 'petrol', provenance: nullable }), 'completed')
+      .fields[0].values[0].provenance;
+    expect(provenance.geography).toBeUndefined();
+    expect(provenance.market).toBeUndefined();
+    expect(provenance.entity).toBe('toyota_rav4_phev');
+  });
+
+  it('11j. time_scope is validated even though it is never displayed', () => {
+    const notAnObject = validProvenance();
+    (notAnObject.scope as Record<string, unknown>).time_scope = 2026;
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: notAnObject })))
+      .toBe('PROVENANCE_INVALID');
+
+    const tooManyKeys = validProvenance();
+    (tooManyKeys.scope as Record<string, unknown>).time_scope =
+      Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`k${i}`, i])); // bound is 8
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: tooManyKeys })))
+      .toBe('PROVENANCE_INVALID');
+
+    const tooLarge = validProvenance();
+    (tooLarge.scope as Record<string, unknown>).time_scope = { note: 'x'.repeat(600) };
+    expect(invalidCode(payloadWithEntry({ value: 'petrol', provenance: tooLarge })))
+      .toBe('PROVENANCE_INVALID');
+
+    // An empty time_scope is what `EvidenceReference` defaults to.
+    const empty = validProvenance();
+    (empty.scope as Record<string, unknown>).time_scope = {};
+    expect(ok(payloadWithEntry({ value: 'petrol', provenance: empty }), 'completed')
+      .fields[0].values).toHaveLength(1);
+  });
+
+  it('11k. a review item with malformed provenance refuses too', () => {
+    const payload = JSON.parse(JSON.stringify(fixtures.partial_result));
+    delete payload.needs_review[0].provenance.scope.market;
+    expect(invalidCode(payload, 'partial_success')).toBe('PROVENANCE_INVALID');
+  });
+});
+
+describe('12. a valid partial result with NO itemized review rows', () => {
+  // Generated by the real FinalBuilder from one verified and one REJECTED
+  // verdict: a rejection makes the run partial without writing a review row.
+  const PAYLOAD = fixtures.partial_result_no_review_items;
+
+  it('12a. the fixture really is a backend-valid partial_result with empty needs_review', () => {
+    expect(PAYLOAD.status).toBe('partial_success');
+    expect(PAYLOAD.result_kind).toBe('partial_result');
+    expect(PAYLOAD.needs_review).toEqual([]);
+    expect(Object.keys(PAYLOAD.fields)).toEqual(['fuel_type']);
+  });
+
+  it('12b. it parses as a result — not as invalid, and not as a completed success', () => {
+    const result = ok(PAYLOAD, 'partial_success');
+    expect(result.kind).toBe('partial_result');
+    expect(result.fields).toHaveLength(1);
+    expect(result.review).toHaveLength(0);
+    expect(result.conflictCount + result.coverageGapCount + result.taskFailureCount).toBe(0);
+  });
+
+  it('12c. the outcome summary promises no list it cannot show', () => {
+    const summary = describeOutcome('partial_result').summary;
+    expect(summary).not.toMatch(/items below|listed below|below are/i);
+    expect(summary).toMatch(/not a completed result/i);
+    expect(summary).toMatch(/not every claim/i);
+  });
+});
+
+describe('13. undefined is refused inside a durable value', () => {
+  it('13a. as a field entry value', () => {
+    expect(invalidCode(payloadWithEntry({ value: undefined, provenance: validProvenance() })))
+      .toBe('VALUE_NOT_JSON');
+  });
+
+  it('13b. inside a list', () => {
+    expect(invalidCode(payloadWithEntry({ value: [1, undefined, 3], provenance: validProvenance() })))
+      .toBe('VALUE_NOT_JSON');
+    // A sparse array reads its hole as undefined and is refused the same way.
+    // eslint-disable-next-line no-sparse-arrays
+    expect(invalidCode(payloadWithEntry({ value: [1, , 3], provenance: validProvenance() })))
+      .toBe('VALUE_NOT_JSON');
+  });
+
+  it('13c. inside a structured object', () => {
+    expect(invalidCode(
+      payloadWithEntry({ value: { length_mm: 4600, width_mm: undefined }, provenance: validProvenance() }),
+    )).toBe('VALUE_NOT_JSON');
+  });
+
+  it('13d. and inside a review item value', () => {
+    const payload = JSON.parse(JSON.stringify(fixtures.partial_result));
+    // Assigning after the clone leaves an OWN `value` key holding `undefined`,
+    // so the item still matches the verdict-review shape and reaches the value.
+    payload.needs_review[0].value = undefined;
+    expect(invalidCode(payload, 'partial_success')).toBe('VALUE_NOT_JSON');
+  });
+
+  it('13e. but an explicit JSON null is still a recorded absence, not a refusal', () => {
+    const result = ok(payloadWithEntry({ value: null, provenance: validProvenance() }), 'completed');
+    expect(result.fields[0].values[0].value).toEqual({ display: 'empty' });
+  });
+
+  it('13f. and a top-level undefined output is still the ABSENT state', () => {
+    expect(parseFinalResult(undefined)).toEqual({ state: 'absent' });
+  });
+});
+
+describe('14. payload-controlled keys never reach a prototype', () => {
+  it('14a. a review code naming an Object.prototype member resolves to nothing', () => {
+    // A plain-object lookup would return a FUNCTION here, and React throws when
+    // handed one as a child — so the surface built to fail closed would have
+    // crashed instead. The label table is a Map for exactly this reason.
+    for (const key of ['constructor', 'toString', 'hasOwnProperty', 'valueOf', '__proto__']) {
+      expect(describeReviewCode(key), key).toBeUndefined();
+    }
+    // The real codes still resolve.
+    expect(describeReviewCode('TASK_FAILED')).toBe('The task did not complete');
+    expect(describeReviewCode('EVIDENCE_REQUIREMENTS_UNMET')).toBe('Evidence requirements were not met');
+    expect(describeReviewCode('NOT_A_KNOWN_CODE')).toBeUndefined();
+  });
+
+  it('14b. such a code parses as an ordinary task failure and carries no function', () => {
+    const payload = JSON.parse(JSON.stringify(fixtures.partial_result));
+    payload.needs_review[1].code = 'constructor';
+    const result = ok(payload, 'partial_success');
+    const item = result.review.find((entry) => entry.kind === 'task_failure');
+    expect(item?.code).toBe('constructor');
+    for (const entry of result.review) {
+      expect(typeof entry.code === 'string' || entry.code === undefined).toBe(true);
+    }
   });
 });

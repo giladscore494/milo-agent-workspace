@@ -136,6 +136,19 @@ describe('result-surface routing', () => {
     expect((await screen.findByRole('region', { name: 'Final result' })).innerHTML).toBe(before);
   });
 
+  it('6b. a partial result with NO itemized rows also survives a refresh unchanged', async () => {
+    await openTerminalRun(SWARM_PROJECT, fixtures.partial_result_no_review_items, 'partial_success');
+    const before = (await screen.findByRole('region', { name: 'Final result' })).innerHTML;
+    expect(before).toContain('No itemized entries were recorded');
+
+    cleanup();
+    render(<Page/>);
+    fireEvent.click(await screen.findByText(SWARM_PROJECT.name));
+    fireEvent.click(await screen.findByText('Result'));
+    await waitFor(() => expect(screen.getByText('Partial result')).toBeInTheDocument());
+    expect((await screen.findByRole('region', { name: 'Final result' })).innerHTML).toBe(before);
+  });
+
   it('7. an invalid durable payload reaches the browser as unavailable, never as a success', async () => {
     await openTerminalRun(SWARM_PROJECT, { status: 'complete', result_kind: 'partial_result', fields: {}, needs_review: [] });
     expect(await screen.findByText('Result unavailable')).toBeInTheDocument();

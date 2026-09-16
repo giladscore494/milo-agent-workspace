@@ -194,6 +194,21 @@ function ResultBody({ result }: { result: FinalResult }) {
         </p>
       )}
 
+      {/* A backend-VALID partial result can carry no itemized review rows: a
+          rejected verdict makes the run partial without writing one. Saying so
+          is the honest reading — it neither invents a reason or a field, nor
+          leaves the reader looking for a list that was never recorded. */}
+      {result.kind === 'partial_result' && outstanding === 0 && (
+        <section className="final-result-section" aria-labelledby="final-result-noitems-title">
+          <h4 className="section-title" id="final-result-noitems-title">Outstanding items</h4>
+          <p className="note">
+            No itemized entries were recorded. A claim the verifier rejected leaves the result
+            unfinished without producing a review row of its own, so there is nothing further to
+            list — and nothing here is being inferred about which claim or why.
+          </p>
+        </section>
+      )}
+
       {outstanding > 0 && (
         <section className="final-result-section" aria-labelledby="final-result-review-title">
           <h4 className="section-title" id="final-result-review-title">

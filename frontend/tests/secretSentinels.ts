@@ -22,3 +22,13 @@ export const JWT_SENTINEL = ['eyJhbGciOiJIUzI1NiJ9', 'eyJyb2xlIjoic2VydmljZSJ9',
 
 /** The prefix a leak assertion greps for; kept below the scanner's threshold. */
 export const API_KEY_PREFIX = 'sk-live-';
+
+/**
+ * Every sentinel, for the sweeps that place a credential in EVERY durable
+ * string position the product surface can render and then assert that none of
+ * them survives into the display model or the DOM.
+ */
+export const ALL_SECRET_SENTINELS = [API_KEY_SENTINEL, BEARER_SENTINEL, JWT_SENTINEL] as const;
+
+/** Fragments that must not survive even partially redacted. */
+export const SECRET_FRAGMENTS = [API_KEY_PREFIX, 'eyJhbGciOiJIUzI1NiJ9', 'Bearer '] as const;
