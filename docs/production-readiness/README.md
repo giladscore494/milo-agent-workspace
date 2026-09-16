@@ -22,6 +22,8 @@ this set wins and the older document carries an archive banner.
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Immutable images, deployment order, IAM matrix |
 | [STAGED_ACTIVATION.md](STAGED_ACTIVATION.md) | Stages A–D activation runbook |
 | [SMOKE_TESTING.md](SMOKE_TESTING.md) | Read-only and execution-disabled smoke tests |
+| [FRONTEND_ACCEPTANCE.md](FRONTEND_ACCEPTANCE.md) | Stage F5 frontend acceptance matrix (A–G), classifications and evidence |
+| [FRONTEND_PRE_RELEASE.md](FRONTEND_PRE_RELEASE.md) | Operator UI verification pass before a release is accepted |
 | [MONITORING_AND_INCIDENTS.md](MONITORING_AND_INCIDENTS.md) | Signals, alerts, incident response, kill switches |
 | [ROLLBACK.md](ROLLBACK.md) | Forward-safe rollback for every component |
 | [FINAL_ACCEPTANCE.md](FINAL_ACCEPTANCE.md) | Phases 9–11 acceptance audit and classifications |
@@ -59,6 +61,15 @@ Every major item in this documentation set is classified as exactly one of:
 
 The consolidated classification table is in
 [FINAL_ACCEPTANCE.md](FINAL_ACCEPTANCE.md).
+
+[FRONTEND_ACCEPTANCE.md](FRONTEND_ACCEPTANCE.md) uses a different set
+(`IMPLEMENTED_AND_PROVEN`, `IMPLEMENTED_TEST_GAP`, `CONFIRMED_DEFECT`, plus the
+manual/deferred/out-of-scope labels above) because it answers a different
+question: whether a browser behaviour is proven by a test that exercises the
+production path, rather than whether an external service is configured. Where it
+records a live-posture question — Cloud Run privacy, the real Vercel
+environment — it defers to this set and to the operator audit in
+[SMOKE_TESTING.md](SMOKE_TESTING.md).
 
 ## Non-negotiable safety invariants
 
