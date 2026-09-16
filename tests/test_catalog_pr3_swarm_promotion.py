@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import socket
+import uuid
 from pathlib import Path
 from uuid import uuid4
 
@@ -39,7 +40,6 @@ from backend.catalog.government.evidence import (GOVERNMENT_FIELD_SOURCES,
                                                  GovernmentVariantEvidenceMapper,
                                                  government_entity_key, government_record_id)
 from backend.catalog.government.ingest import GovernmentCatalogIngestor
-from backend.catalog.government.projection import GovernmentProjectionError
 from backend.catalog.government.query import GovernmentCatalogQuery
 from backend.catalog.government.reconcile import (AliasRule, CatalogReconciliationError,
                                                   ReconcilableVariant, normalize_identity_text,
@@ -49,6 +49,8 @@ from backend.catalog.diff import MAX_DIFF_ITEMS, diff_rows, is_count_row
 from backend.catalog.government.refresh import (GovernmentCatalogRefresh,
                                                 diff_candidate_sets)
 from backend.catalog.keys import CatalogKeyError
+from backend.catalog.pipeline import (MAX_PROMOTIONS_PER_RUN, CatalogEvidenceLedger,
+                                      CatalogPromotionPipeline)
 from backend.catalog.promotion import (LEASE_FAILURE_CODES, CanonicalPromotion,
                                        CatalogPromotionError, build_promotion_plan,
                                        field_evidence_for)
@@ -61,6 +63,9 @@ from backend.engines.swarm_v2.evidence_mapping import (NO_EVIDENCE,
                                                        RegisteredOperationEvidenceSink,
                                                        TrustedEvidenceAcquisition,
                                                        production_evidence_mappers)
+from backend.engines.swarm_v2.evidence_contracts import (SourceVersion,
+                                                         record_field_locator,
+                                                         structured_projection)
 from backend.engines.swarm_v2.support import VERIFIER_CONTRACT_VERSION
 from backend.engines.swarm_v2.tool_calls import ToolCallRecord
 from backend.engines.swarm_v2.validation import (PlanValidationError, SOURCE_FIRST_TOOL_POLICY,
@@ -220,6 +225,123 @@ def verify_and_link(repository, lease, board, acquired, candidate, *,
     return links, claims, verdicts
 
 
+def production_path(repository, lease, *, year: int = PINNED_YEAR,
+                    verdict: str = "verified", operation: str = "resolve_variant"):
+    """The PRODUCTION orchestration, driven exactly as `backend/worker/main.py` does.
+
+    No step is assembled by hand. The ledger is fed through the two trusted
+    seams the worker wires -- the tool-result sink and the verdict sink -- and
+    then `CatalogPromotionPipeline.promote` does the linking, the reviewed
+    status transition, the planning and the guarded promotion itself.
+
+    That is the whole point of this helper: a test that performed those four
+    steps itself would prove the steps work and prove nothing about whether
+    anything in production ever performs them.
+    """
+    board = EvidenceBoard(repository, lease)
+    sink = RegisteredOperationEvidenceSink(
+        TrustedEvidenceAcquisition(board=board, mappers=production_evidence_mappers()))
+    ledger = CatalogEvidenceLedger(sink, verdict_sink=board.record_verification_verdict)
+
+    code = one_code(repository, year)
+    result = resolve(repository, code=code, year=year)
+    # The worker's tool loop calls the sink with a Registry-validated record.
+    ledger(ToolCallRecord(task_id="task-1", call_id="call-1", tool=GOVERNMENT_TOOL_NAME,
+                          operation=operation, result=result))
+    # The engine hands every settled verdict to the same sink the worker wired.
+    fragments = {row["locator_key"]: row for row in board_fragments(repository, lease)}
+    for claim in claims_of(repository, lease):
+        fragment = fragments[claim["evidence_locator"]]
+        ledger.record_verdict(VerificationVerdict(
+            claim_id=str(claim["id"]), verdict=verdict, reason="R4_STRUCTURED_MATCH",
+            mode="deterministic_structured", contract_version=VERIFIER_CONTRACT_VERSION,
+            support=[SupportLink(source_id=str(claim["source_id"]),
+                                 content_hash=fragment["content_hash"],
+                                 fragment_id=str(fragment["id"]),
+                                 locator=fragment["locator_key"])]))
+    attempts = CatalogPromotionPipeline(repository, lease).promote(ledger)
+    return ledger, attempts
+
+
+#: Every WRONG-SCOPE refusal the promotion gate states, with the one thing each
+#: case changes about an otherwise complete, verified chain. The SQL trigger in
+#: `20260916120000_catalog_field_level_promotion.sql` raises exactly these
+#: sentences; `tests/test_catalog_migration_static.py` pins the two copies
+#: together, so this table is parity rather than a second opinion.
+PROMOTION_SCOPE_REFUSALS = (
+    ("wrong-vehicle", "claim is about another vehicle", {"entity": "cm1." + "a" * 32 + ":2024"}),
+    ("wrong-year", "scoped to another model year", {"time_scope": {"model_year": 1999}}),
+    ("no-year", "states no model year scope", {"time_scope": {"as_of": "2026-08"}}),
+    ("no-market", "states no market scope", {"market": None}),
+    ("wrong-identity", "scoped to another vehicle identity", {"identity": {"trim": "LIMITED"}}),
+    ("wrong-locator", "read from another source record", {"record_id": "cs1." + "b" * 32 + ":1"}),
+)
+
+
+def forged_chain(repository, lease, board, candidate, *, label, field_key, value,
+                 entity, time_scope, market="IL", identity=None, record_id=None,
+                 register_field="shnat_yitzur"):
+    """A COMPLETE, valid R3/R4 chain that states the wrong thing on purpose.
+
+    Every rule below the scope gate is satisfied -- a real versioned source, a
+    real focused fragment at the locator, a real claim citing it, a real
+    `verified` verdict supported by that fragment, and a real evidence link for
+    this candidate. So when the promotion is refused, the ONLY thing that can
+    have refused it is the gate the case is named after.
+    """
+    from backend.schemas import ClaimCreate, SourceCreate
+
+    record_id = record_id or government_record_id(
+        next(row["snapshot_key"] for row in repository.catalog_snapshots.values()
+             if row["id"] == candidate["snapshot_id"]),
+        next(row["upstream_record_id"] for row in repository.catalog_raw_records.values()
+             if row["id"] == candidate["raw_record_id"]))
+    locator = record_field_locator(record_id, (register_field,))
+    projection = structured_projection(record={register_field: value}, fields=(register_field,),
+                                       locator=locator, fragment_index=0)
+    source = board.record_source(
+        SourceCreate(agent="catalog.government",
+                     url=f"https://{src.DATA_GOV_HOST}/dataset/x/resource/{label}",
+                     title=label, domain=src.DATA_GOV_HOST, source_type="government_register",
+                     source_strength="strong", query=record_id,
+                     tool_operation="catalog.government_vehicle.resolve_variant"),
+        task_key="task-1",
+        version=SourceVersion(kind="dataset_version", identifier="2026.09.1"))
+    fragment = board.record_focused_fragment(source["id"], projection, task_key="task-1")
+    claim = board.record_claim(
+        ClaimCreate(entity_key=entity, field_key=field_key, value=value,
+                    unit="year" if field_key.startswith("model_year") else None,
+                    time_scope=dict(time_scope), geography=market, market=market,
+                    source_id=uuid.UUID(str(source["id"])), source_strength="strong",
+                    confidence=0.95, agent="catalog.government"),
+        task_key="task-1", evidence_locator=locator.locator_key, identity=identity)
+    verdict = board.record_verification_verdict(VerificationVerdict(
+        claim_id=str(claim["id"]), verdict="verified", reason="R4_STRUCTURED_MATCH",
+        mode="deterministic_structured", contract_version=VERIFIER_CONTRACT_VERSION,
+        support=[SupportLink(source_id=str(source["id"]),
+                             content_hash=fragment["content_hash"],
+                             fragment_id=str(fragment["id"]),
+                             locator=projection.locator.locator_key)]))
+    return repository.link_catalog_candidate_evidence(lease.run_id, {
+        "candidate_key": candidate["candidate_key"], "candidate_id": candidate["id"],
+        "source_id": source["id"], "claim_id": claim["id"],
+        "verdict_id": verdict["id"]}, **lease_kwargs(lease))
+
+
+def claims_of(repository, lease):
+    """The durable claim rows this run wrote, in write order."""
+    return [row for row in repository.tool_rows
+            if repository.evidence_kinds.get(str(row.get("id"))) == "claim"
+            and str(row.get("run_id")) == str(lease.run_id)]
+
+
+def board_fragments(repository, lease):
+    """The durable focused-fragment rows this run wrote."""
+    return [row for row in repository.tool_rows
+            if repository.evidence_kinds.get(str(row.get("id"))) == "evidence_fragment"
+            and str(row.get("run_id")) == str(lease.run_id)]
+
+
 def promoted(repository, lease, *, year: int = PINNED_YEAR):
     """The WHOLE path, once: tool -> evidence -> verdict -> link -> promotion."""
     code = one_code(repository, year)
@@ -310,6 +432,120 @@ def test_the_source_first_policy_appears_exactly_when_the_tool_is_registered(rep
 # =============================================================================
 # 2. the end-to-end path
 # =============================================================================
+
+def test_the_production_path_promotes_without_anyone_assembling_the_steps(repository, landed):
+    """Catalog PR3's actual deliverable: the connection, exercised end to end.
+
+    Nothing here links evidence, moves a status, builds a plan or calls the
+    promotion RPC. A Government resolution goes into the trusted tool-result
+    sink and verdicts go into the trusted verdict sink -- the two seams
+    `backend/worker/main.py` wires -- and `CatalogPromotionPipeline.promote`
+    does the rest. If any arrow of the production path were missing, the
+    canonical catalog would still be empty at the end of this test.
+    """
+    lease, _report = landed
+    assert not repository.catalog_model_variants
+
+    ledger, attempts = production_path(repository, lease)
+
+    # The ledger observed ONE candidate, from the server-produced tool result.
+    assert len(ledger.observations) == 1
+    observation = ledger.observations[0]
+    assert observation.candidate["manufacturer"] == TOYOTA
+    assert observation.claims and all(row["source_id"] for row in observation.claims)
+
+    assert len(attempts) == 1 and attempts[0].promoted
+    outcome = attempts[0].outcome
+
+    # 1. The REVIEWED status transition happened, durably, and is what the
+    #    promotion required -- it was not a status the test wrote.
+    candidate = next(row for row in repository.catalog_candidates.values()
+                     if row["id"] == observation.candidate_id)
+    assert candidate["status"] == "ready_for_review"
+    # The attempt names the DURABLE candidate key, which the tool result never
+    # carried: the pipeline read the row back rather than trusting the payload.
+    assert attempts[0].candidate_key == candidate["candidate_key"]
+
+    # 2. The evidence LINKS exist, one per verified claim, each citing the
+    #    claim's own source and a verified verdict.
+    links = [row for row in repository.catalog_evidence_links.values()
+             if row["candidate_id"] == observation.candidate_id]
+    assert len(links) == len(observation.claims)
+    assert all(row["verdict_id"] for row in links)
+
+    # 3. The canonical row exists, and every fact on it is traceable.
+    current = CanonicalPromotion(repository, lease).current_canonical(
+        outcome.variant["canonical_key"])
+    assert current["manufacturer"] == TOYOTA and current["commercial_model"] == RAV4
+    assert current["model_year_start"] == PINNED_YEAR
+    assert current["official_model_code"] == candidate["official_model_code"]
+    assert current["trim"] == candidate["trim"]
+    provenance = repository.list_canonical_field_provenance(outcome.variant["id"])
+    assert {row["field_key"] for row in provenance} == set(outcome.promoted_fields)
+    assert all(row["run_id"] == str(lease.run_id) for row in provenance)
+
+    # 4. The event a run would carry is bounded, static and browser-safe.
+    event = attempts[0].as_event()
+    assert event["promoted"] is True and event["canonical_key"] == current["canonical_key"]
+    assert set(event) == {"candidate_key", "promoted", "canonical_key",
+                          "promoted_fields", "unsupported_fields", "replayed"}
+
+
+def test_the_production_path_promotes_nothing_without_a_verified_verdict(repository, landed):
+    """A `needs_review` verdict is a real answer, and it is an answer against.
+
+    Same orchestration, one thing changed: the Verifier did not verify. The
+    pipeline links nothing, transitions no status, and the canonical catalog
+    stays empty -- and it says WHY, with a static code.
+    """
+    lease, _report = landed
+    _ledger, attempts = production_path(repository, lease, verdict="needs_review")
+    assert len(attempts) == 1 and not attempts[0].promoted
+    assert attempts[0].reason_code == "CATALOG_PROMOTION_NO_VERIFIED_EVIDENCE"
+    assert not repository.catalog_model_variants and not repository.catalog_models
+    # The candidate was NOT moved to `ready_for_review` on the way past.
+    assert all(row["status"] != "ready_for_review"
+               for row in repository.catalog_candidates.values())
+    assert not repository.catalog_evidence_links
+
+
+def test_the_production_path_replays_onto_the_same_canonical_row(repository, landed):
+    """Running the whole connection twice writes one canonical row, not two."""
+    lease, _report = landed
+    _first_ledger, first = production_path(repository, lease)
+    variants = len(repository.catalog_model_variants)
+    provenance = len(repository.catalog_canonical_field_provenance)
+    _second_ledger, second = production_path(repository, lease)
+    assert first[0].outcome.variant["id"] == second[0].outcome.variant["id"]
+    assert len(repository.catalog_model_variants) == variants
+    assert len(repository.catalog_canonical_field_provenance) == provenance
+    assert second[0].outcome.replayed
+
+
+def test_the_production_path_is_bounded_and_promotion_is_not_a_tool(repository, landed):
+    """Two properties that must hold however many vehicles a run resolves."""
+    lease, _report = landed
+    board = EvidenceBoard(repository, lease)
+    sink = RegisteredOperationEvidenceSink(
+        TrustedEvidenceAcquisition(board=board, mappers=production_evidence_mappers()))
+    ledger = CatalogEvidenceLedger(sink, verdict_sink=board.record_verification_verdict,
+                                   max_candidates=1)
+    for year in (PINNED_YEAR, PINNED_YEAR + 1):
+        result = resolve(repository, code=one_code(repository, year), year=year)
+        if result["match_count"] == 1:
+            ledger(ToolCallRecord(task_id="task-1", call_id=f"call-{year}",
+                                  tool=GOVERNMENT_TOOL_NAME, operation="resolve_variant",
+                                  result=result))
+    # The ledger stops REMEMBERING past its bound, so the end-of-run promotion
+    # can never become an unbounded write loop.
+    assert len(ledger.observations) <= 1
+    assert MAX_PROMOTIONS_PER_RUN == 25
+    # Promotion is not a registered capability: no operation of the one
+    # registered tool writes anything, so a plan cannot ask for one.
+    operations = {operation.name for operation
+                  in registry(repository).descriptors()[0].operations}
+    assert not any("promote" in name or "write" in name for name in operations)
+
 
 def test_the_whole_path_ends_in_a_canonical_row_backed_by_one_fact_per_field(repository, landed):
     """Catalog PR3's deliverable, proven in one test.
@@ -1125,6 +1361,113 @@ def test_the_pr2_promotion_shape_is_refused_by_the_gate_this_pr_adds():
     assert "one provenance row per promoted FACT" in promotion.replace("\n", " ") or \
         "ONE row per promoted canonical FACT" in promotion
     assert "requires verified provenance for every field it states" in promotion
+
+
+@pytest.mark.parametrize("label,expected,override", PROMOTION_SCOPE_REFUSALS,
+                         ids=[case[0] for case in PROMOTION_SCOPE_REFUSALS])
+def test_evidence_about_another_vehicle_scope_or_record_is_never_promoted(repository, landed,
+                                                                          label, expected,
+                                                                          override):
+    """Sound evidence about the WRONG THING is still refused.
+
+    Everything above the scope gate is satisfied in each case -- a versioned
+    government source, a focused fragment at the locator, a claim citing it,
+    a `verified` verdict supported by that fragment, an evidence link for this
+    exact candidate, and a field/value that matches the canonical row exactly.
+    The ONE thing each case changes is what the claim is ABOUT.
+
+    Without these gates a verified fact about a 1999 Corolla, or about another
+    market, or read out of a different register row, could become a canonical
+    fact about this vehicle -- which is the worst failure the canonical catalog
+    has, and the only one its own provenance could not later reveal.
+    """
+    lease, _report = landed
+    result = resolve(repository, code=one_code(repository))
+    board, acquired = acquire(repository, lease, result)
+    candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
+    links, claims, verdicts = verify_and_link(repository, lease, board, acquired, candidate)
+    snapshot = next(row for row in repository.catalog_snapshots.values()
+                    if row["id"] == candidate["snapshot_id"])
+    plan = build_promotion_plan(
+        candidate=candidate, snapshot=snapshot,
+        evidence=field_evidence_for(candidate=candidate, links=links, claims=claims,
+                                    verdicts=verdicts))
+
+    # The honest chain for `model_year_start`, rebuilt with ONE thing wrong.
+    scope = {"entity": government_entity_key(candidate["manufacturer"],
+                                             candidate["commercial_model"],
+                                             candidate["model_year_start"]),
+             "time_scope": {"model_year": candidate["model_year_start"]},
+             "market": src.GOVERNMENT_DATASET_MARKET,
+             # The identity the real mapper emits for this row, from the same
+             # builder, so only the case's own override is ever wrong.
+             "identity": GovernmentVariantEvidenceMapper._identity(candidate)}
+    forged = forged_chain(repository, lease, board, candidate, label=label,
+                          field_key="model_year_start", value=candidate["model_year_start"],
+                          **{**scope, **override})
+    payload = plan.as_payload()
+    payload["fields"] = [{**entry, "evidence_link_id": forged["id"]}
+                         if entry["field_key"] == "model_year_start" else entry
+                         for entry in payload["fields"]]
+    with pytest.raises(AppError) as failure:
+        repository.promote_catalog_variant(lease.run_id, payload, **lease_kwargs(lease))
+    assert expected in str(failure.value)
+    # A refused promotion leaves the canonical catalog exactly as it was.
+    assert not repository.catalog_model_variants and not repository.catalog_models
+    assert not repository.catalog_canonical_field_provenance
+
+
+def test_every_scope_refusal_is_spelled_the_same_way_in_sql_and_in_memory():
+    """Parity as a STRING comparison, because a mirror that drifts is not one.
+
+    The in-memory repository is a mirror of the database's rules, so a refusal
+    it raises must be the refusal PostgreSQL raises -- not a paraphrase a
+    reviewer would have to translate. Every sentence the table above asserts
+    offline is asserted to exist in the migration and in the mirror.
+    """
+    migration = Path("supabase/migrations/"
+                     "20260916120000_catalog_field_level_promotion.sql").read_text(encoding="utf-8")
+    memory = Path("backend/testing/memory_repository.py").read_text(encoding="utf-8")
+    for _label, sentence, _override in PROMOTION_SCOPE_REFUSALS:
+        assert sentence in migration, sentence
+        assert sentence in memory, sentence
+    # The run-consistency and identity refusals, same rule.
+    for sentence in ("catalog promotion states an identity its candidate does not",
+                     "catalog canonical variant identity conflict",
+                     "was not promoted by its linking run",
+                     "support chain spans more than one run",
+                     "catalog promotion is not one act of one run",
+                     "scope disagrees with this variant"):
+        assert sentence in migration, sentence
+        assert sentence in memory, sentence
+
+
+def test_a_promotion_may_not_cite_another_runs_evidence(repository, landed):
+    """One promotion is one leased act, all the way down to the stored fact.
+
+    The link, the source, the claim, the verdict and the provenance row must
+    all name the run that holds the lease. A run that reused an earlier run's
+    verified evidence would be attributing a promotion to a lease that never
+    covered it.
+    """
+    lease, _report = landed
+    result = resolve(repository, code=one_code(repository))
+    board, acquired = acquire(repository, lease, result)
+    candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
+    links, claims, verdicts = verify_and_link(repository, lease, board, acquired, candidate)
+    snapshot = next(row for row in repository.catalog_snapshots.values()
+                    if row["id"] == candidate["snapshot_id"])
+    plan = build_promotion_plan(
+        candidate=candidate, snapshot=snapshot,
+        evidence=field_evidence_for(candidate=candidate, links=links, claims=claims,
+                                    verdicts=verdicts))
+    # A SECOND run, with its own lease, presenting the first run's links.
+    other = leased_run(repository, worker="worker-2")
+    with pytest.raises(AppError) as failure:
+        repository.promote_catalog_variant(other.run_id, plan.as_payload(),
+                                           **lease_kwargs(other))
+    assert "not promoted by its linking run" in str(failure.value)
+    assert not repository.catalog_canonical_field_provenance
 
 
 def test_the_memory_repository_applies_the_same_promotion_invariants(repository, landed):

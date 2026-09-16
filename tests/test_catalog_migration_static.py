@@ -11,6 +11,7 @@ It opens no connection and applies no migration -- `tests/test_migrations_postgr
 does that executably against real PostgreSQL.
 """
 
+import inspect
 from pathlib import Path
 
 from backend.catalog.contracts import (CANDIDATE_IDENTITY_DIMENSIONS, CANDIDATE_STATUSES,
@@ -23,11 +24,15 @@ from backend.catalog.contracts import (CANDIDATE_IDENTITY_DIMENSIONS, CANDIDATE_
                                        MAX_RAW_RECORD_LOCATOR_POSITION,
                                        MAX_RETRIEVAL_METADATA_CHARS, RAW_RECORD_LOCATOR_KEYS,
                                        SNAPSHOT_VALIDATION_STATES, TRUST_STATE_BY_FAMILY,
-                                       is_evidence_family, stated_canonical_fields,
+                                       claim_entity_key, is_evidence_family,
+                                       record_locator_id, stated_canonical_fields,
                                        stated_identity_dimensions, stated_source_locator,
                                        trust_state_for)
+from backend.catalog.diff import DIFF_IDENTITY, MAX_DIFF_ITEMS
+from backend.catalog.keys import canonical_variant_key
 from backend.catalog.government.normalize import RAW_ONLY_CONTRACT
 from backend.catalog.government.projection import MAX_RESULT_ITEMS
+from backend.catalog.government.query import TOTAL_COUNT_FIELD
 
 import pytest
 
@@ -528,6 +533,87 @@ def test_the_two_triggers_that_hold_for_every_writer_are_present():
                     "requires verified provenance for every field it states",
                     "requires at least one promoted variant"):
         assert refusal in text, refusal
+
+
+def test_the_locator_and_entity_conventions_are_one_definition_in_both_languages():
+    """A promoted fact is bound to its vehicle by two assembled strings.
+
+    If SQL spelled either of them differently the gate would refuse every
+    honest promotion, so the two copies are pinned rather than reviewed.
+    """
+    text = promotion()
+    assert "create or replace function public.catalog_record_locator_id(" in text
+    assert "create or replace function public.catalog_claim_entity_key(" in text
+    # Python assembles them here, and the SQL body must be the same two joins.
+    assert record_locator_id("cs1.aa", "36327") == "cs1.aa:36327"
+    assert claim_entity_key("cm1.bb", 2021) == "cm1.bb:2021"
+    assert "p_snapshot_key || ':' || p_upstream_record_id" in text
+    assert "p_model_canonical_key || ':' || p_model_year::text" in text
+    # And the R4 scope normalization, whose four steps must be the four
+    # `_normalize_text` applies, in that order.
+    assert "normalize(p_value, NFKC)" in text
+    assert "translate(lower(" in text and "'_-', '  '" in text
+    assert "regexp_replace(" in text
+
+
+def test_the_scope_and_run_gates_name_every_refusal_they_make():
+    """Every WRONG-VEHICLE, WRONG-SCOPE and WRONG-RUN refusal, by name."""
+    text = promotion()
+    for refusal in ("cites a candidate for another vehicle",
+                    "cites a candidate for another variant",
+                    "claim states no model year scope",
+                    "claim is scoped to another model year",
+                    "claim is about another vehicle",
+                    "claim states no market scope",
+                    "claim is scoped to another vehicle identity",
+                    "cites evidence read from another source record",
+                    "locator does not match its cited claim",
+                    "was not promoted by its linking run",
+                    "support chain spans more than one run",
+                    "catalog promotion is not one act of one run",
+                    "scope disagrees with this variant",
+                    "catalog promotion states an identity its candidate does not",
+                    "catalog canonical variant identity conflict"):
+        assert refusal in text, refusal
+    # `identity_dimensions` is a REVISABLE FACT, in all four places that decide
+    # what a canonical variant IS.
+    assert "identity_dimensions" not in text.split(
+        "create or replace function public.catalog_canonical_identity_field", 1)[1].split("$$;", 1)[0]
+    natural = text.split("create unique index if not exists "
+                         "catalog_model_variants_natural_uidx", 1)[1].split(";", 1)[0]
+    assert "identity_dimensions" not in natural
+    assert "identity_dimensions" not in inspect.signature(canonical_variant_key).parameters
+
+
+def test_the_snapshot_diff_is_bounded_in_its_list_and_exact_in_its_counts():
+    """The comparison runs in the database, and says so in its shape."""
+    text = queries()
+    assert "create or replace function public.catalog_snapshot_candidate_diff(" in text
+    body = text.split("create or replace function public.catalog_snapshot_candidate_diff",
+                      1)[1].split("$$;", 1)[0]
+    # Both sides pass the SAME readability gate every other answer passes.
+    assert body.count("perform public.catalog_readable_snapshot(") == 2
+    # The counts are aggregates over the whole paired set, never over the page.
+    assert "count(*) filter (where p.state = 'added')" in body
+    assert "full outer join before b" in body
+    # The list is bounded by the page bound, and dropped WHOLE past it.
+    assert "least(coalesce(p_limit, 100), public.catalog_page_limit())" in body
+    assert "from counted c) <= v_limit" in body
+    assert MAX_DIFF_ITEMS == 100
+    # The identity is the COMPLETE stated identity, dimensions included.
+    for name in DIFF_IDENTITY:
+        assert name in body, name
+
+
+def test_every_aggregation_states_its_total_even_with_no_rows():
+    """A page past the last row must state the total, not infer zero from its
+    own emptiness."""
+    text = queries()
+    # One anchored left join per paged aggregation, so an empty page is still
+    # exactly one COUNT ROW.
+    assert text.count("left join page p on true") == 4
+    assert text.count("from (select 1) as anchor") == 4
+    assert TOTAL_COUNT_FIELD == "total_count"
 
 
 def test_the_promotion_rpc_is_lease_guarded_and_names_no_dynamic_object():

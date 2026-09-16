@@ -71,6 +71,17 @@ Status: `COMPLETED_IN_CODE` (application architecture) /
   promotion is deliberately NOT a tool: it is a lease-guarded repository RPC
   that trusted server code calls, so a model can neither request nor authorize
   one.
+- **Canonical promotion path** — `backend/catalog/pipeline.py`, constructed in
+  `backend/worker/main.py` and run ONCE after the Swarm V2 engine has settled
+  every verdict and before the run is finalized, while the worker still holds
+  the lease each write is guarded by. It links each verified claim to its
+  candidate, moves that candidate to `ready_for_review`, plans the promotion and
+  calls the guarded RPC. A model can cause the Government READ that starts it
+  and nothing beyond: the path is trusted server code, promotes at most 25
+  candidates per run, reads only what the run itself produced, starts no
+  capture, opens no socket and schedules nothing. A refusal is emitted as a run
+  event and never fails the run; a lost lease propagates to the worker's lease
+  handling so a stale worker writes nothing.
 - **Redis (Upstash REST)** — shared rate-limit store for gateway and API;
   production fails closed on limited surfaces when unavailable.
 - **Provider (Kimi/Moonshot)** — reached only by the worker, only when

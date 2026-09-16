@@ -579,10 +579,19 @@ Done כאשר: פרויקט עם workflow_key=swarm_v2 מסיים Run במצב c
 >   plan policy, keyed by the registered tool name. It is not a workflow: the
 >   taxonomy and the task graph stay the Commander's.
 >
+> **Connected after PR3.** The production worker runs the promotion path
+> (`backend/catalog/pipeline.py`) once, after the engine has settled every
+> verdict and while it still holds the run's lease: it links each verified
+> claim to its candidate, moves that candidate to `ready_for_review`, plans the
+> promotion and calls the guarded RPC. Promotion is still not a Tool, so a model
+> can cause the Government READ that starts it and nothing beyond.
+>
 > **Still not activated after PR3.** No production entrypoint constructs a
 > transport, so no release can reach `data.gov.il`; the refresh operation exists
-> and no schedule runs it; no reviewed alias rule ships; and nothing in the
-> production worker calls the promotion path.
+> and no schedule runs it; no reviewed alias rule ships; and nothing starts a
+> run for the purpose of promoting — the path runs only at the end of a run that
+> already resolved a vehicle through the registered read, over that run's own
+> resolutions, bounded to 25 candidates.
 >
 > **The old JSON remains an unverified `legacy_reference`.** PR2 imports none
 > of it, seeds none of it, and adds no code that reads it. The canonical

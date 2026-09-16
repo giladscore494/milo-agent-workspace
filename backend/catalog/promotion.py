@@ -41,13 +41,14 @@ what the candidate IS.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from backend.errors import AppError
 
 from .contracts import (CANONICAL_DIMENSION_PREFIX, CANONICAL_VARIANT_FIELDS,
                         is_evidence_family, stated_canonical_fields)
+from .payloads import prepare_promotion
 
 #: The repository codes that mean "this worker no longer holds the run".
 #:
@@ -330,9 +331,20 @@ class CanonicalPromotion:
         refusal from the database collapses to one static reason here, because
         its message can quote a row.
         """
+        payload = plan.as_payload()
+        # The identities the repository will derive, derived HERE too, by the
+        # same pure preparer: a plan states structural fields only, and the
+        # canonical and promotion keys are never a caller's to name.
+        prepared = prepare_promotion(payload)
+        # Whether this promotion is a REPLAY, read before the write. It is
+        # reported, never enforced: the repository's own idempotency key is
+        # what makes a replay a no-op, and a concurrent writer landing between
+        # this read and that write would change the label on the outcome
+        # without changing what was written.
+        replayed = self._already_promoted(prepared)
         try:
             variant = self._repository.promote_catalog_variant(
-                self._lease.run_id, plan.as_payload(), **self._lease_kwargs)
+                self._lease.run_id, payload, **self._lease_kwargs)
         except AppError as failure:
             if failure.code in LEASE_FAILURE_CODES:
                 # A stale worker is an infrastructure outcome, never a
@@ -342,7 +354,20 @@ class CanonicalPromotion:
             raise CatalogPromotionError("CATALOG_PROMOTION_REFUSED") from None
         return PromotionOutcome(variant=variant,
                                 promoted_fields=tuple(item.field_key for item in plan.fields),
-                                plan=plan)
+                                plan=plan, replayed=replayed)
+
+    def _already_promoted(self, payload: Mapping[str, Any]) -> bool:
+        """Whether THIS exact promotion is already durable, field for field."""
+        variant = self._repository.get_canonical_catalog_variant(
+            str(payload["canonical_key"]))
+        if variant is None:
+            return False
+        promoted = {str(row["field_key"]): row["field_value"]
+                    for row in self._repository.list_canonical_field_provenance(
+                        variant["variant_id"])
+                    if str(row.get("promotion_key")) == str(payload["promotion_key"])}
+        return promoted == {str(entry["field_key"]): entry["value"]
+                            for entry in payload["fields"]}
 
     def current_canonical(self, canonical_key: str) -> Mapping[str, Any] | None:
         """One canonical variant's CURRENT state, from the authoritative view."""

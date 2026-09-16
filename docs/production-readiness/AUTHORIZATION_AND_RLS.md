@@ -117,12 +117,16 @@ provenance rather than a substitute for it.
 **Catalog PR3's read functions** (`catalog_readable_snapshot`,
 `catalog_candidate_manufacturers`, `catalog_candidate_models`,
 `catalog_candidate_model_years`, `catalog_candidate_variant_page`,
-`catalog_raw_record_by_upstream_id`, `catalog_page_limit`) take no lease,
-because a lease authorizes a durable WRITE. They are `SECURITY INVOKER`, have a
-fixed `search_path`, name every relation as a literal, order deterministically,
-bound every page with a server-owned constant and return the exact total. Each
-has `EXECUTE` revoked from `PUBLIC`/`anon`/`authenticated` before the narrow
-`service_role` grant, exactly like every other function in this namespace.
+`catalog_raw_record_by_upstream_id`, `catalog_snapshot_candidate_diff`,
+`catalog_page_limit`) take no lease, because a lease authorizes a durable WRITE.
+They are `SECURITY INVOKER`, have a fixed `search_path`, name every relation as
+a literal, order deterministically, bound every page with a server-owned
+constant and return the exact total — including on an EMPTY page, which comes
+back as one COUNT ROW rather than as no rows at all. Each has `EXECUTE` revoked
+from `PUBLIC`/`anon`/`authenticated` before the narrow `service_role` grant,
+exactly like every other function in this namespace, and so do the three
+IMMUTABLE pure helpers PR3 adds (`catalog_record_locator_id`,
+`catalog_claim_entity_key`, `r4_normalized_scope_text`).
 
 **The repository's catalog write path** goes through six lease-guarded RPCs
 (`record_catalog_snapshot_guarded`, `record_catalog_raw_record_guarded`,

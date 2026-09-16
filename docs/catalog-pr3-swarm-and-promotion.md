@@ -21,7 +21,8 @@ is fixture-backed rather than production-exercised, it says so.
 | New migrations | `20260916090000_catalog_bounded_candidate_queries.sql`, `20260916120000_catalog_field_level_promotion.sql` |
 | Production tool registrations | **one** — `catalog.government_vehicle`, read mode, eight bounded operations |
 | Production evidence mappers | **one** — `catalog.government_vehicle.resolve_variant` |
-| Canonical rows a release can create | only through one lease-guarded RPC, only with a verified verdict per promoted field |
+| Canonical rows a release can create | only through one lease-guarded RPC, only with a verified verdict per promoted field, only for the vehicle the candidate names |
+| Production promotion path | **connected** — `backend/catalog/pipeline.py`, run by the worker after the engine settles its verdicts |
 | Live syncs activated | **none** — no production entrypoint constructs a transport or calls the refresh |
 
 ## 2. Before and after
@@ -30,7 +31,9 @@ is fixture-backed rather than production-exercised, it says so.
 into Python and refused anything past 5 000 candidates. `ToolRegistry()` was
 constructed empty, `PRODUCTION_EVIDENCE_MAPPERS` was empty, the worker's
 `tool_result_sink` was unwired, and `catalog_models` / `catalog_model_variants`
-were `SELECT`-only for every role and immutable outright.
+were `SELECT`-only for every role and immutable outright. Nothing anywhere
+linked evidence to a candidate, moved a candidate to `ready_for_review`, planned
+a promotion or called one.
 
 **After (Catalog PR3).**
 
@@ -62,8 +65,15 @@ versioned source + focused fragments + located claims   (R3, existing)
 verified verdicts                                       (R4, existing)
         │
         ▼
-catalog_candidate_evidence_links                        (PR1, existing)
+CatalogEvidenceLedger                      (the two trusted seams, observed)
+        │   read by the worker once the engine has settled every verdict
+        ▼
+CatalogPromotionPipeline                   (trusted server code; NOT a Tool)
         │
+        ├─▶ link_catalog_candidate_evidence_guarded
+        │       → catalog_candidate_evidence_links      (PR1, existing)
+        ├─▶ record_catalog_candidate_guarded            (reviewed status)
+        ├─▶ build_promotion_plan                        (the refusal matrix)
         ▼
 promote_catalog_variant_guarded            (PR3 migration 2, lease-guarded)
         │
@@ -210,11 +220,39 @@ them exactly. The two are not two definitions of one thing: the table says WHICH
 vehicle and what was first established, the view says what is currently
 believed, and a constraint keeps them identical where they overlap.
 
-A later, better source revises a fact by APPENDING revision 2. The identity
-fields (`model_year_start`, `model_year_end`, `official_model_code`, `trim`) are
-part of the canonical variant key, so a revision of one of them is a different
-variant by construction; only `identity_dimensions` is revisable in place, and
-for it the view is the only place a reader should look.
+**What a canonical variant IS, decided once.** Its model, its model year range,
+its official model code and its trim — and nothing else. Four places say so and
+they say the same thing: `canonical_variant_key` in `backend/catalog/keys.py`
+derives from exactly those four, `catalog_canonical_identity_field()` freezes
+exactly those four, `catalog_model_variants_natural_uidx` is unique on exactly
+those four, and `promote_catalog_variant_guarded` refuses a promotion whose
+identity is not its candidate's.
+
+`identity_dimensions` is a FACT ABOUT the variant, not part of who it is. A
+better source revising the fuel type APPENDS revision 2 to that same variant
+rather than naming a second one under a different key. The
+`identity_dimensions` column on `catalog_model_variants` is what revision 1
+established and never changes, exactly like the other columns; the view is where
+a dimension's current value is read.
+
+**Every promoted fact is bound to its VEHICLE, not only to its own soundness.**
+`catalog_check_field_provenance` additionally requires, for every field:
+
+| It must match | Checked against |
+| --- | --- |
+| the candidate's entity | the candidate's marque and model are the canonical model's; the claim's `entity_key` is `catalog_claim_entity_key(<model key>, <model year>)` |
+| the model-year / time scope | `time_scope.model_year` is stated, is a four-digit year, and lies inside the variant's range |
+| the market / geography scope | both stated, and identical across every fact of the variant |
+| the vehicle identity scope | the claim's `identity_scope` keys are EXACTLY the candidate's (dimensions ∩ R4 vocabulary, plus `model_code` and `trim` when stated), and every value is the candidate's under the same normalization R4 stored it with |
+| the source-record locator | the locator's record component is `catalog_record_locator_id(<snapshot key>, <upstream record id>)` of the candidate's OWN captured row |
+
+**One promotion is one leased act.** The evidence link, its source, its claim,
+its verdict and the provenance row must all name the run that holds the lease,
+and every field of one promotion shares its run, worker, attempt, candidate and
+variant. A trigger cannot assert a lease — it does not hold the token — but it
+can refuse to let a promotion be attributed to a run other than the one that
+gathered and verified the evidence, which is what carries the RPC's lease check
+down to the stored fact for every writer, direct INSERT included.
 
 ## 7. Reconciliation with the legacy reference
 
@@ -267,6 +305,35 @@ server code calls, so `write_approved` and a `tool:write:<name>` capability
 never enter this path. The worker grants exactly one read scope, `write_approved`
 stays `False`, and no capability is granted at all.
 
+**The production path, connected.** `backend/catalog/pipeline.py` joins what was
+previously six unconnected pieces:
+
+    Government tool result  (server-produced, Registry-validated)
+      -> R3 evidence        (the registered mapper, through the Evidence Board)
+      -> R4 verdict         (the Verifier, through the same Board)
+      -> evidence LINK      (link_catalog_candidate_evidence_guarded)
+      -> REVIEWED status    (record_catalog_candidate_guarded)
+      -> promotion PLAN     (backend/catalog/promotion.py)
+      -> canonical row      (promote_catalog_variant_guarded)
+
+`CatalogEvidenceLedger` wraps the two trusted seams the worker already wires —
+the tool-result sink and the verdict sink — because a claim row does not say
+which candidate it is evidence FOR, and the server-produced tool result is the
+only place that is known. It writes nothing of its own.
+`CatalogPromotionPipeline.promote` then reads the durable candidate and record
+rows BACK from the repository (so the internal keys a promotion needs never have
+to appear in a model-visible tool output), links each verified claim, builds the
+plan, and only then moves the candidate to `ready_for_review` — so the reviewed
+status is written when a complete evidenced promotion is already in hand, never
+hopefully on the way past.
+
+A model can cause the FIRST arrow and nothing else. The pipeline runs once, at
+the end of a run that already happened, over that run's own resolutions; it
+promotes at most `MAX_PROMOTIONS_PER_RUN` (25) candidates, starts no capture,
+opens no socket, holds no credential and schedules nothing. Every refusal is a
+static reason code emitted as a run event and never fails the run; a LOST LEASE
+is not a refusal and propagates to the worker's own lease handling.
+
 ## 9. Refresh and diff
 
 `GovernmentCatalogRefresh.sync_if_changed` reads the resource's published
@@ -278,10 +345,28 @@ version through one bounded `package_show` request and ingests only if it moved.
   previous one is untouched, because activation is the last step and an active
   snapshot is immutable — so a partial or failed refresh never replaces the last
   usable snapshot.
-* **Diff** → bounded added / changed / removed candidates, compared on the
-  candidate's COMPLETE stated identity (dimensions included, because the register
-  publishes rows that differ only in them). Counts are always exact; the item
-  lists are dropped WHOLE rather than truncated when they exceed the bound.
+* **Diff** → added / changed / removed candidates, compared on the candidate's
+  COMPLETE stated identity (dimensions included, because the register publishes
+  rows that differ only in them).
+
+**Where the comparison runs.** Inside PostgreSQL, in
+`public.catalog_snapshot_candidate_diff`. The real resource is ~101 000
+candidate rows per side, so comparing them by reading both into the worker would
+materialize 200 000 rows to answer one question. The three COUNTS come back
+EXACT for the whole resource — computed over every matching row of both
+snapshots, never over a page, and never refused for size. What is bounded is the
+ITEM LIST: at most `MAX_DIFF_ITEMS` (100) deltas, dropped WHOLE rather than
+truncated when more than that changed, because a truncated list is a diff
+claiming a completeness it does not have. `SnapshotDiff.bounded` says which
+happened.
+
+`backend/catalog/diff.py` is the one definition of the comparison — the
+identity, the first-wins reduction, the deterministic order and the bound — and
+`MemoryRepository` mirrors the SQL function through it, so the offline and the
+PostgreSQL answers are the same rule rather than two implementations. A
+comparison that cannot run never undoes the capture: the snapshot has already
+landed and is already readable, so the refusal is reported
+(`RefreshOutcome.diff_unavailable`) and nothing is guessed.
 
 **Rollback, stated exactly.** There is no "active pointer" to move and this PR
 does not invent one. A snapshot is active or it is not, an active one is
@@ -310,9 +395,11 @@ creating a socket an error.
   schedule exists.
 * `REVIEWED_ALIAS_RULES` is empty, so tier 3 of reconciliation never fires in a
   release.
-* Nothing in the production worker calls `CanonicalPromotion`. The promotion
-  path, its RPC and its gates are complete and proven against real PostgreSQL;
-  which run promotes what, and when, is a separate reviewed decision.
+* The promotion path IS connected in the worker (§8). What is not activated is
+  anything that would make it run on its own: no schedule, no capture, no
+  entrypoint that starts a run for the purpose of promoting. It runs only at the
+  end of a Swarm V2 run that already resolved a vehicle through the registered
+  Government read, and only over that run's own resolutions.
 
 **Not proven here.**
 
@@ -320,20 +407,32 @@ creating a socket an error.
   of one resource (233 rows). The code is generic enough for bounded complete
   pagination of a whole resource, and that has not been executed against the
   live service from this repository.
-* The database-side aggregation has not been measured against a ~101 000-row
-  snapshot. It is bounded and indexed for it; it has been exercised against
-  snapshots of one and of 233 candidates.
+* The database-side aggregations have not been measured against a ~101 000-row
+  snapshot on production hardware. They are bounded and indexed for it, and the
+  whole-snapshot comparison is exercised against real PostgreSQL over snapshots
+  of 140 and 13 candidates — more than one page, and past the item bound, so the
+  "exact counts, bounded list" property is proven rather than asserted. The
+  aggregations themselves have been exercised against snapshots of one and of
+  233 candidates.
 * No paid model call, no live source capture, no deployment and no remote
   migration was performed by this PR.
 
 **Memory-repository parity, stated exactly.** `MemoryRepository` mirrors the
 RULES the database applies — the lease, the derived keys, the support chain, the
-field/value gate, the coverage check and the replay conflict — and does not
-reproduce PostgreSQL. Two protections are deliberately DATABASE-ONLY: the
-DEFERRED timing of the coverage trigger (the in-memory implementation checks
-coverage before it appends anything, so there is no window at all rather than
-one that closes at COMMIT), and the concurrency semantics of the unique indexes
-under simultaneous writers.
+field/value gate, the scope gates, the run-consistency gate, the coverage check,
+the count row and the replay conflict — and does not reproduce PostgreSQL.
+Parity is tested rather than claimed: the same table of wrong-vehicle,
+wrong-scope and wrong-locator cases is driven through the in-memory repository in
+`tests/test_catalog_pr3_swarm_promotion.py` and through real PostgreSQL in
+`tests/test_migrations_postgres.py`, and a third test asserts that each refusal
+is spelled the same way in the migration and in the mirror — because a mirror
+that paraphrases is one a reviewer has to translate.
+
+Two protections are deliberately DATABASE-ONLY: the DEFERRED timing of the
+coverage trigger (the in-memory implementation checks coverage before it appends
+anything, so there is no window at all rather than one that closes at COMMIT),
+and the concurrency semantics of the unique indexes under simultaneous
+writers.
 
 ## 11. This completes the catalog workstream
 

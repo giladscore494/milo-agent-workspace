@@ -5425,6 +5425,49 @@ def _pr3_promotion_json(candidate: str, links: dict, make: str, *, key: str,
     return json.dumps(payload)
 
 
+def _pr3_diff_snapshot(db, suffix: str, rows, *, make: str = "Toyota-diff") -> tuple[str, str]:
+    """One ACTIVATED snapshot holding `rows` candidates, in ONE psql round trip.
+
+    `rows` is a sequence of `(official_model_code, status)`. Batched because a
+    diff test needs more candidates than a page holds, and a round trip per row
+    would make the test's own setup the slowest thing in the suite.
+    """
+    lease, _other = _evidence_fixture(db, f"pr3-{suffix}")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    snapshot = _rpc_as_service(
+        db, "select id from public.record_catalog_snapshot_guarded("
+            f"{args},'{_catalog_snapshot_json(f'pr3-diff-{suffix}', declared=len(rows), retrieval_metadata=PR3_READ_METADATA)}'::jsonb)")
+    statements = ["set role service_role"]
+    for index, (code, status) in enumerate(rows):
+        record = _catalog_record_json(snapshot, f"pr3-diff-{suffix}-{index}",
+                                      upstream=str(100000 + index),
+                                      payload={"_id": 100000 + index, "kinuy_mishari": "RAV4"})
+        statements.append("select public.record_catalog_raw_record_guarded("
+                          f"{args},'{record}'::jsonb)")
+        candidate = _catalog_candidate_json(
+            snapshot, "00000000-0000-0000-0000-000000000000",
+            f"pr3-diff-{suffix}-{index}", make=make, code=code, status=status, dimensions={})
+        # The raw record id is only known inside the database, so the candidate
+        # payload is completed there rather than round-tripped out and back.
+        statements.append(
+            "select public.record_catalog_candidate_guarded("
+            f"{args}, jsonb_set(jsonb_set('{candidate}'::jsonb, '{{raw_record_id}}', "
+            f"to_jsonb(r.id::text)), '{{snapshot_id}}', to_jsonb(r.snapshot_id::text))) "
+            "from public.catalog_raw_records r "
+            f"where r.snapshot_id='{snapshot}' and r.upstream_record_id='{100000 + index}'")
+    statements.append("select public.activate_catalog_snapshot_guarded("
+                      f"{args},'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
+    statements.append("reset role")
+    # Through a FILE, not `-c`: a hundred-odd statements exceed the argument
+    # length a process may be started with, and the failure would read as a
+    # PostgreSQL problem rather than as this helper's.
+    script = Path(tempfile.mkdtemp()) / f"pr3-diff-{suffix}.sql"
+    script.write_text(";\n".join(statements) + ";\n", encoding="utf-8")
+    db.psql(file=script)
+    return args, snapshot
+
+
 def _promote(db, args: str, promotion: str) -> str:
     return _rpc_as_service(
         db, f"select id from public.promote_catalog_variant_guarded({args},'{promotion}'::jsonb)")
@@ -5534,6 +5577,71 @@ def test_a_snapshot_with_an_unread_row_answers_only_under_acknowledgement(pr3_db
 
 
 # --- the promotion transaction ----------------------------------------------
+
+def test_the_snapshot_diff_is_computed_here_and_states_exact_counts(pr3_db):
+    """A whole-resource comparison, with no row leaving the database.
+
+    The COUNTS are exact over every matching row of both snapshots; only the
+    ITEM LIST is bounded, and it is dropped WHOLE rather than truncated. Both
+    cases are proven against real PostgreSQL, because "it scales" is a claim
+    about this function and not about the Python that calls it.
+    """
+    db = pr3_db
+    previous_rows = [(f"CODE-{index:06d}", "candidate") for index in range(140)]
+    _args, previous = _pr3_diff_snapshot(db, "diff-a", previous_rows)
+    # The newer capture: 10 of the same identities (one of them re-READ), 3 new.
+    current_rows = [(f"CODE-{index:06d}", "ambiguous" if index == 0 else "candidate")
+                    for index in range(10)] + \
+                   [(f"CODE-{900 + index:06d}", "candidate") for index in range(3)]
+    _other, current = _pr3_diff_snapshot(db, "diff-b", current_rows)
+
+    counts = db.psql("select distinct added_count || '|' || changed_count || '|' || removed_count "
+                     "from public.catalog_snapshot_candidate_diff("
+                     f"'{previous}','{current}')")
+    # 3 added, 1 re-read, 130 gone -- and 134 items is past the 100 bound, so
+    # the list is dropped whole while the counts stay exact.
+    assert counts == "3|1|130"
+    assert db.psql("select count(*) || '|' || count(state) from "
+                   f"public.catalog_snapshot_candidate_diff('{previous}','{current}')") == "1|0"
+
+    # Within the bound the items ARE listed, ordered deterministically, and the
+    # counts are the same three numbers.
+    small = [(f"CODE-{index:06d}", "candidate") for index in range(5)]
+    _third, only_five = _pr3_diff_snapshot(db, "diff-c", small)
+    assert db.psql("select string_agg(state || ':' || official_model_code, ',' order by state, "
+                   "official_model_code) from public.catalog_snapshot_candidate_diff("
+                   f"'{only_five}','{current}')") == (
+        "added:CODE-000005,added:CODE-000006,added:CODE-000007,added:CODE-000008,"
+        "added:CODE-000009,added:CODE-000900,added:CODE-000901,added:CODE-000902,"
+        "changed:CODE-000000")
+    assert db.psql("select distinct added_count || '|' || changed_count || '|' || removed_count "
+                   f"from public.catalog_snapshot_candidate_diff('{only_five}','{current}')") \
+        == "8|1|0"
+    # A FIRST ingestion has no previous side, which is not a refusal.
+    assert db.psql("select distinct added_count || '|' || removed_count from "
+                   f"public.catalog_snapshot_candidate_diff(null,'{only_five}')") == "5|0"
+    # And the same readability gate every other answer passes.
+    with pytest.raises(AssertionError, match="catalog snapshot is not active"):
+        db.psql("select * from public.catalog_snapshot_candidate_diff("
+                f"'{previous}','{uuid.uuid4()}')")
+
+
+def test_the_sql_scope_normalization_is_the_one_r4_stored_the_identity_with(pr3_db):
+    """A mirror that drifts is worse than no mirror.
+
+    `claims.identity_scope` is stored NORMALIZED, so the promotion gate has to
+    normalize the candidate's raw text the same way to compare them. The two
+    implementations are compared over a real vocabulary -- Hebrew marques,
+    hyphenated model codes, padded trims -- rather than asserted to look alike.
+    """
+    db = pr3_db
+    vocabulary = ["AXAP54L-ANXGBW", "PRIME AWD SE", "  Hybrid   Premium ", "4WD_A",
+                  "טויוטה", "קורולה קרוס", "GR-Sport", "E-CVT", "front-wheel drive", "X１"]
+    rendered = ", ".join(f"public.r4_normalized_scope_text('{value}')" for value in vocabulary)
+    assert db.psql(f"select concat_ws('|', {rendered})") \
+        == "|".join(normalize_field_key(value) for value in vocabulary)
+    assert db.psql("select public.r4_normalized_scope_text(null) is null") == "t"
+
 
 def test_a_promotion_writes_one_provenance_row_per_field_and_the_read_model(pr3_db):
     """The whole point of Catalog PR3, against real PostgreSQL.
@@ -5758,6 +5866,82 @@ def test_the_promotion_refusal_matrix(pr3_db):
     stale = f"'{run_id}','ghost',1,'not-the-token'"
     with pytest.raises(AssertionError, match="lease"):
         _promote(db, stale, _pr3_promotion_json(candidate, links, make, key="pr3-stale"))
+
+
+#: The same table `tests/test_catalog_pr3_swarm_promotion.py` drives the
+#: in-memory mirror with. One honest, fully verified chain per case, with
+#: exactly one thing about WHAT IT IS ABOUT changed.
+PR3_SCOPE_REFUSALS = (
+    ("wrong-vehicle", "claim is about another vehicle",
+     {"entity": "cm1." + "a" * 32 + ":2024"}),
+    ("wrong-year", "scoped to another model year", {"time_scope": {"model_year": 1999}}),
+    ("no-year", "states no model year scope", {"time_scope": {"as_of": "2026-08"}}),
+    ("no-market", "states no market scope", {"market": None}),
+    ("wrong-identity", "scoped to another vehicle identity",
+     {"identity": {"model_code": "OTHER-CODE", "trim": "PRIME AWD SE"}}),
+    ("extra-identity", "scoped to another vehicle identity",
+     {"identity": {"model_code": "AXAP54L-ANXGBW", "trim": "PRIME AWD SE",
+                   "generation": "XA50"}}),
+)
+
+
+def test_evidence_about_another_vehicle_scope_or_record_is_never_promoted(pr3_db):
+    """Sound evidence about the WRONG THING is still refused, by the database.
+
+    Each case below builds a COMPLETE chain -- a versioned government source,
+    a focused fragment at the locator, a claim citing it, a `verified` verdict
+    supported by that fragment, an evidence link for this exact candidate, and
+    a field and value that match the canonical row exactly. The one thing that
+    varies is what the claim is ABOUT.
+
+    Without these gates a verified fact about a 1999 Corolla, about another
+    market, about a different trim, or read out of a different register row
+    could become a canonical fact about this vehicle -- the worst failure this
+    table has, and the only one its own provenance could not later reveal.
+    """
+    db = pr3_db
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "scope")
+    record_id, scope = _pr3_context("scope", make)
+    for label, expected, override in PR3_SCOPE_REFUSALS:
+        forged = _pr3_field_evidence(db, args, f"pr3-scope-{label}", "model_year_start",
+                                     2021, "year", "shnat_yitzur", record_id=record_id,
+                                     scope={**scope, **override})
+        link = _rpc_as_service(
+            db, "select id from public.link_catalog_candidate_evidence_guarded("
+                f"{args},'{_catalog_link_json(candidate, forged['source'], f'pr3-scope-{label}-link', claim_id=forged['claim'], verdict_id=forged['verdict'], locator=None, version=None, kind=None)}'::jsonb)")
+        entries = [{"field_key": field_key, "value": value,
+                    "evidence_link_id": link if field_key == "model_year_start"
+                                        else links[field_key]["link"]}
+                   for field_key, value, _u, _r in PR3_FIELDS]
+        with pytest.raises(AssertionError, match=expected):
+            _promote(db, args, _pr3_promotion_json(candidate, links, make,
+                                                   key=f"pr3-scope-{label}", entries=entries))
+
+    # WRONG RECORD: the same claim, read out of a different register row of the
+    # same snapshot. A candidate is a reading of ONE captured row, and evidence
+    # from another row proves nothing about it.
+    elsewhere = _pr3_field_evidence(db, args, "pr3-scope-elsewhere", "model_year_start", 2021,
+                                    "year", "shnat_yitzur",
+                                    record_id=record_locator_id(
+                                        _catalog_key("catalog.snapshot", "pr3-snap-scope"),
+                                        "99999"),
+                                    scope=scope)
+    link = _rpc_as_service(
+        db, "select id from public.link_catalog_candidate_evidence_guarded("
+            f"{args},'{_catalog_link_json(candidate, elsewhere['source'], 'pr3-scope-elsewhere-link', claim_id=elsewhere['claim'], verdict_id=elsewhere['verdict'], locator=None, version=None, kind=None)}'::jsonb)")
+    entries = [{"field_key": field_key, "value": value,
+                "evidence_link_id": link if field_key == "model_year_start"
+                                    else links[field_key]["link"]}
+               for field_key, value, _u, _r in PR3_FIELDS]
+    with pytest.raises(AssertionError, match="read from another source record"):
+        _promote(db, args, _pr3_promotion_json(candidate, links, make,
+                                               key="pr3-scope-elsewhere", entries=entries))
+    # Nothing was written by any of it. Scoped to THIS case's own marque: the
+    # module shares one database, and earlier tests legitimately promoted their
+    # own vehicles into it.
+    assert db.psql(f"select count(*) from public.catalog_models where manufacturer='{make}'") == "0"
+    assert db.psql("select count(*) from public.catalog_canonical_field_provenance p "
+                   f"where p.candidate_id='{candidate}'") == "0"
 
 
 def test_a_canonical_fact_is_never_promoted_out_of_an_unresolved_conflict(pr3_db):

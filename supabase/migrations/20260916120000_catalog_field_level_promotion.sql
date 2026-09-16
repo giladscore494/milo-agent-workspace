@@ -605,7 +605,7 @@ begin
     raise exception 'canonical field provenance cites no source' using errcode = '23503';
   end if;
   if new.run_id is distinct from v_link.run_id then
-    raise exception 'canonical field provenance was not promoted by the run that linked its evidence'
+    raise exception 'canonical field provenance was not promoted by its linking run'
       using errcode = '22023';
   end if;
   if v_source.run_id is distinct from new.run_id

@@ -63,7 +63,7 @@ existing immutable contracts permit, and this module does not add it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 from . import source as src

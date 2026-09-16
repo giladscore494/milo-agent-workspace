@@ -59,12 +59,13 @@ writing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 from backend.errors import AppError
 
 from .government.evidence import GOVERNMENT_TOOL_NAME, RESOLVE_VARIANT_OPERATION
+from .government.source import GOVERNMENT_SOURCE_FAMILY
 from .promotion import (LEASE_FAILURE_CODES, PROMOTION_REASONS, CanonicalPromotion,
                         CatalogPromotionError, PromotionOutcome, PROMOTABLE_CANDIDATE_STATUS,
                         build_promotion_plan, field_evidence_for)
@@ -91,18 +92,20 @@ class CandidateEvidence:
     """One unambiguous Government resolution, and what it wrote for it.
 
     `candidate` is the durable row the Tool read, as the server produced it --
-    never a model's restatement of it. `claims` are the claim ids the
-    registered mapper's bundle became, in write order.
+    never a model's restatement of it. `claims` are the durable claim rows the
+    registered mapper's bundle became, in write order, exactly as the Evidence
+    Board returned them.
     """
 
     candidate: Mapping[str, Any]
     snapshot_key: str
-    source_id: str
-    claim_ids: tuple[str, ...] = ()
+    resource_id: str
+    claims: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def candidate_id(self) -> str:
         return str(self.candidate["candidate_id"])
+
 
 
 @dataclass(frozen=True)
@@ -188,24 +191,25 @@ class CatalogEvidenceLedger:
         candidate_id = str(candidate.get("candidate_id") or "")
         if not candidate_id:
             return
-        claims = tuple(str(row["id"]) for row in acquired.claims)
+        claims = tuple(dict(row) for row in acquired.claims)
         held = self._observed.get(candidate_id)
         if held is not None:
-            # A later resolution of the same candidate adds its claims rather
-            # than replacing them. The SOURCE stays the first one: a second
-            # source's claims are linked separately by the promotion step,
-            # which reads each claim's own source from the claim itself.
+            # A later resolution of the same candidate ADDS its claims rather
+            # than replacing them, so a run that read one vehicle twice cites
+            # both readings. Each claim carries its own source, so a second
+            # source is linked correctly without being remembered separately.
+            seen = {str(row["id"]) for row in held.claims}
             self._observed[candidate_id] = CandidateEvidence(
                 candidate=held.candidate, snapshot_key=held.snapshot_key,
-                source_id=held.source_id,
-                claim_ids=held.claim_ids + tuple(item for item in claims
-                                                 if item not in held.claim_ids))
+                resource_id=held.resource_id,
+                claims=held.claims + tuple(row for row in claims
+                                           if str(row["id"]) not in seen))
             return
         if len(self._observed) >= self._max:
             return
         self._observed[candidate_id] = CandidateEvidence(
             candidate=dict(candidate), snapshot_key=str(provenance.get("snapshot_key") or ""),
-            source_id=str(acquired.source["id"]), claim_ids=claims)
+            resource_id=str(provenance.get("resource_id") or ""), claims=claims)
 
     @property
     def sink(self) -> Any:
@@ -270,8 +274,7 @@ class CatalogPromotionPipeline:
                 if failure.code in LEASE_FAILURE_CODES:
                     raise
                 attempts.append(PromotionAttempt(
-                    candidate_id=observation.candidate_id,
-                    candidate_key=str(observation.candidate.get("candidate_key") or ""),
+                    candidate_id=observation.candidate_id, candidate_key="",
                     reason_code="CATALOG_PROMOTION_REFUSED"))
         return tuple(attempts)
 
@@ -279,17 +282,24 @@ class CatalogPromotionPipeline:
 
     def _promote_one(self, observation: CandidateEvidence,
                      ledger: CatalogEvidenceLedger) -> PromotionAttempt:
-        candidate_key = str(observation.candidate.get("candidate_key") or "")
+        # 0. The DURABLE rows, read back by the server. The tool result names
+        #    the candidate and the record it read; everything the promotion is
+        #    built from is then read from the database rather than taken from
+        #    the result, so the internal keys a promotion needs never have to
+        #    appear in a model-visible tool output at all.
         snapshot = self._snapshot(observation)
-        if snapshot is None:
+        record = self._record(snapshot, observation)
+        candidate = self._candidate(snapshot, observation)
+        if snapshot is None or record is None or candidate is None:
             return PromotionAttempt(candidate_id=observation.candidate_id,
-                                    candidate_key=candidate_key,
+                                    candidate_key="",
                                     reason_code="CATALOG_PROMOTION_SNAPSHOT_UNUSABLE")
+        candidate_key = str(candidate["candidate_key"])
 
         # 1. LINK. Only a claim whose verdict is exactly `verified` is cited:
         #    a `needs_review` or `rejected` verdict is a real answer, and it is
         #    an answer AGAINST promoting.
-        links = self._link(observation, ledger)
+        links = self._link(candidate, observation, ledger)
         if not links:
             return PromotionAttempt(candidate_id=observation.candidate_id,
                                     candidate_key=candidate_key,
@@ -302,13 +312,12 @@ class CatalogPromotionPipeline:
         #    what keeps `ready_for_review` from becoming a status this code
         #    writes hopefully -- the transition below happens only when a
         #    complete, evidenced promotion is already in hand.
-        proposed = {**dict(observation.candidate), "id": observation.candidate_id,
-                    "candidate_key": candidate_key, "status": PROMOTABLE_CANDIDATE_STATUS}
+        proposed = {**dict(candidate), "status": PROMOTABLE_CANDIDATE_STATUS}
         try:
             evidence = field_evidence_for(
-                candidate=proposed, links=links,
-                claims={str(row["id"]): row for row in self._claims(links)},
-                verdicts={str(row["id"]): row for row in self._verdicts(links)})
+                candidate=proposed, links=[link for link, _ in links],
+                claims={str(row["id"]): row for row in observation.claims},
+                verdicts={str(verdict["id"]): verdict for _, verdict in links})
             plan = build_promotion_plan(candidate=proposed, snapshot=snapshot,
                                         evidence=evidence)
         except CatalogPromotionError as refusal:
@@ -320,7 +329,7 @@ class CatalogPromotionPipeline:
         #    RPC that created the candidate: it holds the re-presented row to
         #    the identity already stored under that key, so this can move the
         #    status and can never quietly become a different vehicle.
-        reviewed = self._review(observation, snapshot)
+        reviewed = self._review(candidate, snapshot, record)
         if reviewed.get("status") != PROMOTABLE_CANDIDATE_STATUS:
             return PromotionAttempt(candidate_id=observation.candidate_id,
                                     candidate_key=candidate_key,
@@ -337,58 +346,99 @@ class CatalogPromotionPipeline:
                                 candidate_key=candidate_key, outcome=outcome)
 
     def _snapshot(self, observation: CandidateEvidence) -> Mapping[str, Any] | None:
-        """The snapshot the candidate was read from, or None when unusable."""
+        """The snapshot the candidate was read from, or None when unusable.
+
+        Looked up by the family, the resource and the snapshot key the TOOL
+        RESULT stated, through the repository's own active-snapshot read -- so
+        an inactive, incomplete or `legacy_reference` snapshot simply does not
+        come back and nothing is promoted from it.
+        """
         if not observation.snapshot_key:
             return None
         try:
             return self._repository.find_active_catalog_snapshot(
-                str(observation.candidate.get("source_family") or "government"),
-                str(observation.candidate.get("resource_id") or ""),
-                observation.snapshot_key)
+                GOVERNMENT_SOURCE_FAMILY, observation.resource_id, observation.snapshot_key)
         except AppError:
             return None
 
-    def _link(self, observation: CandidateEvidence,
-              ledger: CatalogEvidenceLedger) -> list[dict[str, Any]]:
-        """One evidence link per VERIFIED claim, idempotent on a derived key."""
-        linked: list[dict[str, Any]] = []
-        for claim_id in observation.claim_ids:
-            verdict = ledger.verdict_for(claim_id)
+    def _link(self, candidate: Mapping[str, Any], observation: CandidateEvidence,
+              ledger: CatalogEvidenceLedger
+              ) -> list[tuple[Mapping[str, Any], Mapping[str, Any]]]:
+        """One evidence link per VERIFIED claim, idempotent on a derived key.
+
+        Returns each link paired with the verdict it cites, which is what
+        `field_evidence_for` reads to decide the promoted field set.
+        """
+        linked: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+        for claim in observation.claims:
+            verdict = ledger.verdict_for(claim["id"])
             if verdict is None or verdict.get("verdict") != "verified":
                 continue
             row = self._repository.link_catalog_candidate_evidence(
                 self._lease.run_id,
-                {"candidate_id": observation.candidate_id,
-                 "candidate_key": str(observation.candidate.get("candidate_key") or ""),
-                 "source_id": str(verdict.get("source_id") or observation.source_id),
-                 "claim_id": str(claim_id), "verdict_id": str(verdict["id"])},
+                {"candidate_id": str(candidate["id"]),
+                 "candidate_key": str(candidate["candidate_key"]),
+                 "source_id": str(claim["source_id"]), "claim_id": str(claim["id"]),
+                 "verdict_id": str(verdict["id"])},
                 **self._lease_kwargs)
-            linked.append({**dict(row), "_claim": claim_id, "_verdict": dict(verdict)})
+            linked.append((dict(row), dict(verdict)))
         return linked
 
-    @staticmethod
-    def _claims(links: list[dict[str, Any]]) -> list[Mapping[str, Any]]:
-        """The claims the links cite, as `field_evidence_for` reads them.
+    def _record(self, snapshot: Mapping[str, Any] | None,
+                observation: CandidateEvidence) -> Mapping[str, Any] | None:
+        """The captured upstream row the candidate is a reading of."""
+        if snapshot is None:
+            return None
+        try:
+            return self._repository.catalog_raw_record_by_upstream_id(
+                snapshot["id"], str(observation.candidate["upstream_record_id"]),
+                allow_incomplete=False)
+        except AppError:
+            return None
 
-        Assembled from each link's own verdict row rather than re-queried: the
-        verdict names the claim, the field and the value it settled, and a
-        second read could only disagree with the evidence already cited.
+    def _candidate(self, snapshot: Mapping[str, Any] | None,
+                   observation: CandidateEvidence) -> Mapping[str, Any] | None:
+        """The durable candidate row, read back by its own stated identity.
+
+        One bounded page, filtered by exactly the identity the resolution
+        settled on -- which matched a single row, or the mapper would have
+        declined it. The row is then matched by ID, so a filter that somehow
+        returned more than one cannot pick the wrong one.
         """
-        return [{"id": link["_claim"], "field_key": link["_verdict"]["field_key"],
-                 "value": link["_verdict"]["value"],
-                 "source_id": link["source_id"]} for link in links]
+        if snapshot is None:
+            return None
+        try:
+            rows = self._repository.catalog_candidate_variant_page(
+                snapshot["id"],
+                manufacturer=observation.candidate["manufacturer"],
+                commercial_model=observation.candidate["commercial_model"],
+                model_year=observation.candidate.get("model_year_start"),
+                official_model_code=observation.candidate.get("official_model_code"),
+                trim=observation.candidate.get("trim"),
+                identity_dimensions=dict(observation.candidate.get("identity_dimensions") or {})
+                                    or None,
+                limit=MAX_PROMOTIONS_PER_RUN, offset=0, allow_incomplete=False)
+        except AppError:
+            return None
+        return next((dict(row) for row in rows
+                     if str(row.get("id")) == observation.candidate_id), None)
 
-    @staticmethod
-    def _verdicts(links: list[dict[str, Any]]) -> list[Mapping[str, Any]]:
-        return [link["_verdict"] for link in links]
+    def _review(self, candidate: Mapping[str, Any], snapshot: Mapping[str, Any],
+                record: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Move the candidate to `ready_for_review`, through the guarded RPC.
 
-    def _review(self, observation: CandidateEvidence,
-                snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
-        """Move the candidate to `ready_for_review`, through the guarded RPC."""
-        candidate = observation.candidate
+        The payload restates the durable row exactly, with one field changed.
+        The RPC holds a re-presented candidate to the identity already stored
+        under its key, so this can move the status and can never quietly
+        become a different vehicle -- and `candidate_key` is DERIVED from the
+        record key and that identity, so a drift would be refused rather than
+        written.
+        """
         payload = {
+            "snapshot_key": str(snapshot["snapshot_key"]),
+            "record_key": str(record["record_key"]),
             "snapshot_id": str(snapshot["id"]),
-            "raw_record_id": str(candidate["raw_record_id"]),
+            "raw_record_id": str(record["id"]),
             "candidate_key": str(candidate["candidate_key"]),
             "manufacturer": candidate["manufacturer"],
             "commercial_model": candidate["commercial_model"],

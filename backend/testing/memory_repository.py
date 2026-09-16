@@ -1309,10 +1309,16 @@ class MemoryRepository:
     def _aggregate_page(items: list[dict[str, Any]], limit: int, offset: int) -> list[dict[str, Any]]:
         """Attach the EXACT total to every returned row, then cut the page.
 
-        An EMPTY page still returns one row -- every item column null, the
-        total real. Mirrors the COUNT ROW the SQL aggregations emit, and for
-        the same reason: an offset past the last matching row must report the
-        total the filter matched, not the zero its emptiness would suggest.
+        An EMPTY page still returns one row: the COUNT ROW the SQL aggregations
+        emit, for the same reason they emit it -- an offset past the last
+        matching row must report the total the filter matched, not the zero its
+        emptiness would suggest.
+
+        Its item columns are null where they are known. When the filter matched
+        NOTHING AT ALL there is no row to take the column names from, so the
+        count row carries only `total_count`; `is_count_row` in
+        `backend/catalog/government/query.py` recognises both shapes, and no
+        caller ever sees one -- `_read` drops it and keeps the total.
         """
         total = len(items)
         bounded = max(1, min(int(limit), MemoryRepository.MAX_CATALOG_AGGREGATE_ROWS))
@@ -1533,6 +1539,15 @@ class MemoryRepository:
         if str(link["candidate_id"]) != str(candidate["id"]):
             raise AppError("CATALOG_PROMOTION_LINK_CANDIDATE",
                            "canonical field provenance cites evidence of another candidate", 400)
+        # ONE RUN, checked before anything that looks a row up BY run: a
+        # cross-run promotion must be refused for the reason it actually
+        # failed, not for a lookup that happens to filter on the same column.
+        # `promote_catalog_variant` proved the run holds a valid worker lease,
+        # so binding the link to that run carries the lease's authority down to
+        # the stored fact.
+        if str(link.get("run_id")) != str(run_id):
+            raise AppError("CATALOG_PROMOTION_RUN_MISMATCH",
+                           "canonical field provenance was not promoted by its linking run", 409)
         snapshot = self._catalog_snapshot_by_id(link["snapshot_id"])
         if str(candidate["snapshot_id"]) != str(link["snapshot_id"]):
             raise AppError("CATALOG_PROMOTION_SNAPSHOT_MISMATCH",
@@ -1645,10 +1660,6 @@ class MemoryRepository:
         # authority down to the stored fact. (`_catalog_evidence_row` already
         # required the claim and the verdict to be this run's.)
         source = self._catalog_evidence_row(link["source_id"], run_id, "SOURCE")
-        if str(link.get("run_id")) != str(run_id):
-            raise AppError("CATALOG_PROMOTION_RUN_MISMATCH",
-                           "canonical field provenance was not promoted by the run that "
-                           "linked its evidence", 409)
         if str(source.get("run_id")) != str(run_id) or str(claim.get("run_id")) != str(run_id) \
                 or str(verdict.get("run_id")) != str(run_id):
             raise AppError("CATALOG_PROMOTION_RUN_MISMATCH",
