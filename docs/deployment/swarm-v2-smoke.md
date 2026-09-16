@@ -25,6 +25,13 @@ read-only against `big-cabinet-457321-t7` / `us-central1` on 2026-08-24:
   (`MILO_MAX_CONCURRENT_RUNS_PER_USER/PROJECT=1`).
 - All execution flags `false` at rest; `JOB_LAUNCHER=disabled`;
   provider keys bound to NOTHING at rest.
+- `MILO_ENABLE_CATALOG_EXECUTION=false` in **every** posture this controller
+  knows about, including an ACTIVE smoke window: it is in `FLAGS_AT_REST` and
+  is NOT overridden by `WORKER_FLAGS_SMOKE` or `API_FLAGS_SMOKE`, and
+  `stage-c/verify_caps.py` refuses the run if either surface has it enabled.
+  Stage C is one controlled paid run, not an authorization to write canonical
+  catalog rows; enabling the catalog is a separate explicit operator decision
+  (`docs/production-readiness/STAGED_ACTIVATION.md`).
 - Worker job: `taskCount=1`, `maxRetries=1`, `timeoutSeconds=3600`.
 
 The same test module cross-checks every `MILO_*` name in the contract
@@ -43,8 +50,11 @@ code cannot silently drift.
 | `post-verify` | no | at-rest posture: flags off, provider key unbound, zero active executions |
 
 `kill` is never a single-execution cancel: it reuses the hardened Stage C
-kill switch verbatim, which disables all six API execution flags, sets
-`JOB_LAUNCHER=disabled`, disables Worker paid execution, removes both
+kill switch verbatim, which disables every API execution flag (the catalog
+switch included), sets
+`JOB_LAUNCHER=disabled`, disables Worker paid execution AND Worker catalog
+execution (independently verified on the worker afterwards, and deleting or
+mutating no catalog row), removes both
 provider-key aliases (secret and literal) from API and Worker, cancels
 every active Worker execution with a bounded settle loop, and
 independently verifies each postcondition — including that the serving
@@ -118,6 +128,15 @@ Any failure still triggers the automatic shutdown.
 
 A future change that gives the smoke plan real tools and real evidence owns
 updating this contract deliberately, alongside the plan itself.
+
+With `MILO_ENABLE_CATALOG_EXECUTION=false` the Swarm V2 tool registry is empty,
+which is exactly the posture this fixed no-tool plan already assumed — the plan
+firewall's own rule is that when `allowed_tools` is empty every task must use
+`tools: []`. So the catalog switch does not change this acceptance contract: the
+smoke still settles on `partial_success` / `no_usable_result`, and it emits no
+`catalog_variant_promoted` and no `catalog_promotion_refused`. If either event
+appears in a smoke run, the deployed worker is not in the posture the contract
+describes.
 
 Kimi IAM is evaluated across both the secret resource policy and inherited
 project IAM. During an active smoke the pinned Worker accessor is required;

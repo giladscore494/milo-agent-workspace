@@ -3,7 +3,9 @@ import { KeyboardEvent, useRef } from 'react';
 import { INTERNET_POLICIES, InternetBadge } from '@/components/common/InternetBadge';
 import { redactSecrets, safeText } from '@/lib/sanitize';
 import { normalizeRunUsage } from '@/lib/runUsage';
-import { SwarmRunViewModel, summarizeSwarmRun } from '@/lib/swarmViewModel';
+import { CatalogAction, UNKNOWN_CATALOG_REFUSAL,
+         catalogRefusalReasonLabel } from '@/lib/catalogStatus';
+import { SwarmCatalogStatus, SwarmRunViewModel, summarizeSwarmRun } from '@/lib/swarmViewModel';
 import { AgentState, WorkspaceState } from '@/lib/types';
 
 export const INSPECTOR_TABS = ['Agents', 'Workflow', 'Sources', 'Claims', 'Conflicts', 'Costs', 'Developer'] as const;
@@ -70,6 +72,12 @@ export function RunInspector({ executionUi, tab, onTabChange, agents, state, swa
         <InspectorPanel tab={tab} agents={agents} state={state} swarm={swarm} />
       </div>
 
+      {/* CODE-2: the operator-facing catalog status. It renders only for a
+          project whose TRUSTED workflow_key is swarm_v2 — `swarm.isSwarmV2` is
+          derived from the project row, never from an event payload — and only
+          once a catalog event has actually been observed. */}
+      {swarm.isSwarmV2 && swarm.catalog.observed && <CatalogStatusPanel catalog={swarm.catalog} />}
+
       <section className="event-stream">
         <h3 className="section-title">Live event stream</h3>
         {state.events.length === 0 && (
@@ -88,6 +96,101 @@ export function RunInspector({ executionUi, tab, onTabChange, agents, state, swa
       </section>
     </div>
   );
+}
+
+/**
+ * Catalog status: what this run wrote into the canonical catalog, or why not.
+ *
+ * Deliberately small and deliberately not a redesign — it sits beside the
+ * existing event stream in the rail that already answers operational
+ * questions.
+ *
+ * Three rules it holds:
+ *
+ *  - **state is text and structure, never colour alone.** Every outcome is
+ *    spelled out in words ("Promoted", "Refused") and in a count, so the panel
+ *    reads identically to someone who cannot distinguish the badge colours;
+ *  - **keyboard reachable.** It is a labelled region with a heading and a
+ *    definition list; there is no control to trap focus and nothing that is
+ *    reachable only by pointer;
+ *  - **static text only.** A refusal renders through `catalogRefusalLabel`,
+ *    which answers from a closed allowlist; keys are already bounded and
+ *    sanitized in the projection and pass through `safeText` again here. No
+ *    payload object is ever rendered.
+ *
+ * A refusal is NOT presented as a failed run. It is a legitimate outcome of a
+ * research run — a field with no verified evidence, an unresolved conflict, a
+ * candidate the ingestion left ambiguous — and the wording says so.
+ */
+function CatalogStatusPanel({ catalog }: { catalog: SwarmCatalogStatus }) {
+  return (
+    <section className="catalog-status" aria-labelledby="catalog-status-title">
+      <h3 className="section-title" id="catalog-status-title">Catalog status</h3>
+      <p className="muted">
+        Canonical catalog outcomes for this run. A refusal is an operational outcome, not a failed run.
+      </p>
+      <dl className="catalog-status-counts">
+        <div>
+          <dt>Promoted</dt>
+          <dd>{catalog.promotedCount}</dd>
+        </div>
+        <div>
+          <dt>Refused</dt>
+          <dd>{catalog.refusedCount}</dd>
+        </div>
+        <div>
+          <dt>Replayed</dt>
+          <dd>{catalog.replayedCount}</dd>
+        </div>
+      </dl>
+      {catalog.lastRefusalLabel && (
+        <p className="catalog-status-reason">
+          <b>Latest refusal:</b> {safeText(catalog.lastRefusalLabel)}
+        </p>
+      )}
+      <ul className="catalog-status-actions">
+        {catalog.actions.map((action) => (
+          <li key={String(action.eventId)} className={`catalog-action is-${action.outcome}`}>
+            <span className="catalog-action-outcome">
+              {action.outcome === 'promoted' ? 'Promoted' : 'Refused'}
+              {action.replayed ? ' (replay)' : ''}
+            </span>
+            <span className="catalog-action-key">{safeText(action.candidateKey ?? 'unnamed candidate')}</span>
+            <small className="catalog-action-detail">
+              {/* Both branches are repository-authored static text — a label
+                  from the closed allowlist, or a sentence built from bounded
+                  counts — and both still go through `safeText`, so the
+                  invariant holds uniformly rather than per branch. A refused
+                  action always carries a reason; the shared sentinel is the
+                  defensive default rather than an ad-hoc literal. */}
+              {safeText(action.outcome === 'promoted'
+                ? promotedFieldsText(action)
+                : catalogRefusalReasonLabel(action.reason ?? UNKNOWN_CATALOG_REFUSAL))}
+            </small>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/**
+ * What a promotion did, in field counts — or that the counts are unavailable.
+ *
+ * `promotedFieldCount` is absent when the event's list broke its declared
+ * contract (not an array, not an array of strings, or longer than
+ * `MAX_CANONICAL_FIELDS`). Rendering that as "0 fields promoted" would state a
+ * number nothing established, so the surface says the count is unavailable
+ * instead. The promotion itself is still reported — the event type is what
+ * establishes that, and it is trusted.
+ */
+function promotedFieldsText(action: CatalogAction): string {
+  const promotedCount = action.promotedFieldCount;
+  if (promotedCount === undefined) return 'Field count unavailable';
+  const unsupported = action.unsupportedFieldCount;
+  const promotedText = `${promotedCount} field${promotedCount === 1 ? '' : 's'} promoted`;
+  if (unsupported === undefined) return `${promotedText}, unsupported count unavailable`;
+  return unsupported > 0 ? `${promotedText}, ${unsupported} unsupported` : promotedText;
 }
 
 function InspectorPanel({ tab, agents, state, swarm }: { tab: InspectorTab; agents: AgentState[]; state: WorkspaceState; swarm: SwarmRunViewModel }) {

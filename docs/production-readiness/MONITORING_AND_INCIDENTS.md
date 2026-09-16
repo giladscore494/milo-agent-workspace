@@ -32,6 +32,11 @@ group chosen in the manifest copy.
 | RLS denials from service paths | DB logs | HIGH | misconfigured policy or credential misuse |
 | Unexpected public access (Cloud Run IAM change) | audit logs on `allUsers` bindings | CRITICAL | remove binding immediately; incident review |
 | Secret-access denials | Secret Manager audit logs | HIGH | binding drift or intrusion attempt |
+| `catalog_promotion_refused` rate (share of catalog outcomes in a run) | `run_events` | LOW→MEDIUM | expected while the catalog is sparse; investigate a SUSTAINED high share (see below) |
+| The SAME refusal code repeating across unrelated runs | `run_events` | MEDIUM | a systematic evidence, conflict or snapshot defect rather than a per-vehicle gap |
+| `catalog_variant_promoted` with `replayed=true` on runs that are not resumes | `run_events` | MEDIUM | promotion is idempotent, so a replay is normal after a resume; a replay without one means a re-derived candidate |
+| Zero catalog events on runs where the catalog is ENABLED and a snapshot exists | `run_events` | MEDIUM | the path is not being reached; check `MILO_ENABLE_CATALOG_EXECUTION` on the worker revision |
+| Worker `AppError` from the pending-promotion read (run left retryable, NOT terminal) | worker logs, `runs` | HIGH | an infrastructure failure, never a refusal — the run is deliberately not finalized; restore the read |
 
 ## Severity definitions
 
@@ -51,6 +56,70 @@ group chosen in the manifest copy.
 3. `JOB_LAUNCHER=disabled` — no worker launches;
 4. remove worker provider-secret binding — no provider access at all;
 5. Cloud Run traffic to a known-good revision — full code rollback.
+
+**Independent catalog kill switch.** `MILO_ENABLE_CATALOG_EXECUTION=false` on
+the worker job closes the catalog path ON ITS OWN, without stopping the product
+and without a code rollback. It is not part of the ordered escalation above: it
+is the NARROW response to a catalog-specific defect, and the exact command and
+its verification evidence are in [ROLLBACK.md](ROLLBACK.md). Disabling it
+deletes and mutates no catalog row.
+
+## Catalog signals — what the two events mean
+
+The catalog path emits exactly two event types, from trusted server code in
+`backend/worker/main.py` carrying the bounded payload
+`PromotionAttempt.as_event()` builds (ids, counts, booleans and static reason
+codes — never a SQL message, a row, an evidence fragment or model text):
+
+| Event | Meaning |
+| --- | --- |
+| `catalog_variant_promoted` | one candidate's verified, supported fields were written to a canonical variant under this run's lease. `replayed=true` means an earlier attempt had already written it and this one changed nothing — the promotion is idempotent |
+| `catalog_promotion_refused` | one candidate was NOT promoted, with a static reason code. This is an OPERATIONAL CATALOG OUTCOME, not a failed run |
+
+**A refusal is not a failure.** A field with no verified evidence, an
+unresolved conflict and a candidate the ingestion left `ambiguous` are all
+legitimate outcomes of a research run — that is what the durable catalog is
+for. The run's own result is untouched, and a run whose every candidate was
+refused can still be a completely successful run.
+
+**An infrastructure failure is not a refusal, and never becomes one.** A lost
+lease or a failed pending-promotion read raises out of the worker: NO catalog
+event is emitted, the run is not marked complete, and the attempt stays
+retryable. If you see catalog refusals you are looking at decisions; if you see
+a worker `AppError` and a non-terminal run you are looking at an outage. Do not
+read one as the other.
+
+### Raw developer telemetry vs. typed operator status
+
+Two different things, deliberately:
+
+- **raw telemetry** — every event, recognised or not, is appended to the Run
+  Inspector's event stream with its type and message. That has existed since
+  Catalog PR3 and is unchanged. It is for a developer reading a specific run;
+- **typed operator status** — the bounded "Catalog status" panel in the Run
+  Inspector (`frontend/lib/catalogStatus.ts`): promoted/refused/replayed counts,
+  the latest refusal as static allowlisted text, and a bounded recent-action
+  list. It renders only for a project whose trusted `workflow_key` is
+  `swarm_v2`, and only once a catalog event has been observed.
+
+Neither is an alert. **Binding these signals to a real monitoring system
+remains operator work** — this repository creates no dashboard, no alert policy
+and no notification channel, and nothing here has been verified against a
+deployed environment.
+
+### When to investigate
+
+- a refusal rate that stays high across runs, rather than tracking how sparse
+  the catalog currently is;
+- the SAME reason code repeating across unrelated vehicles or runs — that
+  points at a systematic evidence, conflict or snapshot defect rather than a
+  per-vehicle gap;
+- `CATALOG_PROMOTION_SNAPSHOT_UNUSABLE` at any sustained rate — the snapshot
+  behind the candidates cannot support canonical facts at all;
+- any refusal at all while `MILO_ENABLE_CATALOG_EXECUTION` is supposed to be
+  OFF. That is a posture defect: with the flag off no catalog event can be
+  emitted, so one existing means the deployed worker revision does not carry
+  the configuration you believe it does.
 
 ## Incident response skeleton
 

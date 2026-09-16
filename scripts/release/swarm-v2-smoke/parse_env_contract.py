@@ -65,6 +65,11 @@ FLAGS_AT_REST = {
     "MILO_ENABLE_RUN_CANCELLATION": "false",
     "MILO_ENABLE_EXECUTION_CONTROL": "false",
     "MILO_ENABLE_PAID_EXECUTION": "false",
+    # The catalog switch stays OFF in every posture this controller knows
+    # about, including an ACTIVE paid smoke: Stage C is one controlled paid
+    # run, not an authorization to write canonical catalog rows. Enabling it
+    # is a separate, explicitly authorized operator step.
+    "MILO_ENABLE_CATALOG_EXECUTION": "false",
 }
 WORKER_FLAGS_SMOKE = {**FLAGS_AT_REST, "MILO_ENABLE_PAID_EXECUTION": "true"}
 API_FLAGS_SMOKE = {**FLAGS_AT_REST, "MILO_ENABLE_RUN_CREATION": "true",

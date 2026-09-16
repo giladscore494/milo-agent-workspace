@@ -827,7 +827,12 @@ def provider_env_list(**overrides):
 
 
 def worker_env_list(**overrides):
-    env = caps_env_list(MILO_ENABLE_PAID_EXECUTION="tru" + "e")
+    # CODE-2: Stage C turns paid execution ON and leaves catalog execution OFF.
+    # One controlled paid run is not an authorization to write canonical
+    # catalog rows, and `verify_caps.py` refuses the run if this is enabled on
+    # either surface.
+    env = caps_env_list(MILO_ENABLE_PAID_EXECUTION="tru" + "e",
+                        MILO_ENABLE_CATALOG_EXECUTION="false")
     env.update(provider_env_list())
     env.update(overrides)
     return env
@@ -852,6 +857,7 @@ def api_spec(env=None, image=None):
         MILO_ENABLE_PROPOSAL_READS="false",
         MILO_ENABLE_RUN_CANCELLATION="false",
         MILO_ENABLE_EXECUTION_CONTROL="false",
+        MILO_ENABLE_CATALOG_EXECUTION="false",
     )
     entries = [{"name": k, "value": v} for k, v in (env or defaults).items()]
     return {"spec": {"template": {"spec": {"containers": [
@@ -910,6 +916,7 @@ def test_verify_caps_fails_on_changed_value_on_either_surface(tmp_path):
             MILO_ENABLE_PROPOSAL_READS="false",
             MILO_ENABLE_RUN_CANCELLATION="false",
             MILO_ENABLE_EXECUTION_CONTROL="false",
+            MILO_ENABLE_CATALOG_EXECUTION="false",
         ).items()
     ]
     result = run_verify_caps(tmp_path, worker_spec(), loosened_api)
@@ -1832,13 +1839,13 @@ case "${args}" in
     esac
     ;;
   *"run jobs describe milo-agent-worker"*)
-    echo '{"metadata":{"name":"milo-agent-worker"},"spec":{"template":{"spec":{"template":{"spec":{"serviceAccountName":"milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com","containers":[{"env":[{"name":"MILO_ENABLE_PAID_EXECUTION","value":"__WORKER_PAID__"}]}]}}}}}}'
+    echo '{"metadata":{"name":"milo-agent-worker"},"spec":{"template":{"spec":{"template":{"spec":{"serviceAccountName":"milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com","containers":[{"env":[{"name":"MILO_ENABLE_PAID_EXECUTION","value":"__WORKER_PAID__"},{"name":"MILO_ENABLE_CATALOG_EXECUTION","value":"false"}]}]}}}}}}'
     ;;
   *"run revisions describe api-safe"*)
-    echo '{"metadata":{"name":"api-safe"},"spec":{"containers":[{"env":[{"name":"MILO_ENABLE_RUN_CREATION","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_MUTATIONS","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_READS","value":"false"},{"name":"MILO_ENABLE_RUN_CANCELLATION","value":"false"},{"name":"MILO_ENABLE_EXECUTION_CONTROL","value":"false"},{"name":"MILO_ENABLE_PAID_EXECUTION","value":"false"},{"name":"JOB_LAUNCHER","value":"disabled"}]}]}}'
+    echo '{"metadata":{"name":"api-safe"},"spec":{"containers":[{"env":[{"name":"MILO_ENABLE_RUN_CREATION","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_MUTATIONS","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_READS","value":"false"},{"name":"MILO_ENABLE_RUN_CANCELLATION","value":"false"},{"name":"MILO_ENABLE_EXECUTION_CONTROL","value":"false"},{"name":"MILO_ENABLE_PAID_EXECUTION","value":"false"},{"name":"MILO_ENABLE_CATALOG_EXECUTION","value":"false"},{"name":"JOB_LAUNCHER","value":"disabled"}]}]}}'
     ;;
   *"run services describe milo-agent-api"*)
-    echo '{"status":{"latestReadyRevisionName":"api-safe","traffic":[{"revisionName":"api-safe","percent":100}]},"spec":{"template":{"spec":{"containers":[{"env":[{"name":"MILO_ENABLE_RUN_CREATION","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_MUTATIONS","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_READS","value":"false"},{"name":"MILO_ENABLE_RUN_CANCELLATION","value":"false"},{"name":"MILO_ENABLE_EXECUTION_CONTROL","value":"false"},{"name":"MILO_ENABLE_PAID_EXECUTION","value":"false"},{"name":"JOB_LAUNCHER","value":"disabled"}]}]}}}}'
+    echo '{"status":{"latestReadyRevisionName":"api-safe","traffic":[{"revisionName":"api-safe","percent":100}]},"spec":{"template":{"spec":{"containers":[{"env":[{"name":"MILO_ENABLE_RUN_CREATION","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_MUTATIONS","value":"false"},{"name":"MILO_ENABLE_PROPOSAL_READS","value":"false"},{"name":"MILO_ENABLE_RUN_CANCELLATION","value":"false"},{"name":"MILO_ENABLE_EXECUTION_CONTROL","value":"false"},{"name":"MILO_ENABLE_PAID_EXECUTION","value":"false"},{"name":"MILO_ENABLE_CATALOG_EXECUTION","value":"false"},{"name":"JOB_LAUNCHER","value":"disabled"}]}]}}}}'
     ;;
   *"run jobs describe stagec-"*)
     if [[ "${args}" =~ (stagec-db-probe|stagec-gw-probe) ]]; then job="${BASH_REMATCH[1]}"; else exit 1; fi

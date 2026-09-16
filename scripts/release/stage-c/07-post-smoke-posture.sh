@@ -8,10 +8,14 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck source=stage-c-env.sh
 source ./stage-c-env.sh
 
-echo "== 1. Paid execution OFF + provider-key binding removed (worker)"
+echo "== 1. Paid + catalog execution OFF, provider-key binding removed (worker)"
+# The at-rest posture includes the catalog switch (parse_env_contract.py
+# FLAGS_AT_REST). Stage C never enables it -- verify_caps.py refuses the run
+# if it is on -- so this restores it rather than turning it off, and it
+# deletes and mutates no catalog row either way.
 gcloud run jobs update "${STAGE_C_WORKER_JOB}" \
   --project="${STAGE_C_PROJECT}" --region="${STAGE_C_REGION}" \
-  --update-env-vars="MILO_ENABLE_PAID_EXECUTION=false" \
+  --update-env-vars="MILO_ENABLE_PAID_EXECUTION=false,MILO_ENABLE_CATALOG_EXECUTION=false" \
   --remove-secrets="KIMI_API_KEY"
 
 echo "== 2. Run creation OFF + launcher disabled (API)"
@@ -42,7 +46,8 @@ c = json.load(sys.stdin)["spec"]["template"]["spec"]["template"]["spec"]["contai
 env = {e["name"]: e.get("value") for e in c["env"] if "value" in e}
 secret_refs = {e["name"] for e in c["env"] if "valueFrom" in e}
 assert env.get("MILO_ENABLE_PAID_EXECUTION") == "false"
+assert env.get("MILO_ENABLE_CATALOG_EXECUTION") == "false"
 assert "KIMI_API_KEY" not in secret_refs, "provider key still bound!"
-print("OK: worker fail-closed, provider key unbound")
+print("OK: worker fail-closed, catalog execution off, provider key unbound")
 '
 echo "Post-smoke posture restored. Record every mutation in STAGE_C_ACCEPTANCE.md."

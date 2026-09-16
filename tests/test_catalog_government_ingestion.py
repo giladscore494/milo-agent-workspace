@@ -1201,8 +1201,14 @@ def test_the_projection_is_still_not_a_tool_and_the_registration_is_a_wrapper():
             assert not hasattr(reader, attribute), (reader, attribute)
     # The worker registers the TOOL, not the reader: a plan can name
     # `catalog.government_vehicle`, and nothing else in this package.
+    #
+    # CODE-2 made the registration conditional on
+    # `MILO_ENABLE_CATALOG_EXECUTION`, so the enabled branch is what this pins.
+    # What the flag cannot change is WHICH object gets registered: disabled it
+    # is nothing at all, enabled it is the Tool wrapper and never the reader.
     worker = Path("backend/worker/main.py").read_text(encoding="utf-8")
-    assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in worker
+    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if catalog_enabled else [])"
+            in worker)
     assert "GovernmentCatalogProjection" not in worker
     assert "GovernmentCatalogQuery" not in worker
     assert "DataGovClient" not in worker

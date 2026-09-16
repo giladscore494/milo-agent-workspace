@@ -214,6 +214,15 @@ def main() -> int:
     for flag in ("MILO_ENABLE_PROPOSAL_MUTATIONS", "MILO_ENABLE_PROPOSAL_READS", "MILO_ENABLE_RUN_CANCELLATION", "MILO_ENABLE_EXECUTION_CONTROL"):
         if api_env.get(flag) != DISABLED:
             problems.append(f"api: {flag}={api_env.get(flag)!r}, expected 'false'")
+    # Stage C is ONE controlled paid run. It is not an authorization to write
+    # canonical catalog rows, so the catalog switch stays off on both surfaces:
+    # enabling it is a separate, explicitly authorized operator decision.
+    for surface, env in (("worker", worker_env), ("api", api_env)):
+        if env.get("MILO_ENABLE_CATALOG_EXECUTION") != DISABLED:
+            problems.append(
+                f"{surface}: MILO_ENABLE_CATALOG_EXECUTION="
+                f"{env.get('MILO_ENABLE_CATALOG_EXECUTION')!r}, expected 'false' — "
+                "catalog execution requires its own explicit authorization")
 
     if problems:
         print("STAGE C CAP VERIFICATION FAILED — do NOT create the run:")

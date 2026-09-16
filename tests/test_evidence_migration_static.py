@@ -444,7 +444,11 @@ def test_r3_provenance_stays_internal_and_the_production_mapping_is_one_pair():
     # words the grant would.
     worker = "\n".join(line.split("#", 1)[0] for line
                        in Path("backend/worker/main.py").read_text().splitlines())
-    assert "tools = ToolRegistry([GovernmentVehicleTool(repo)])" in worker
+    # CODE-2 gates all three constructions on the catalog execution flag; the
+    # enabled shape is unchanged, and the enabled/disabled behaviour is proven
+    # in `tests/test_catalog_execution_flag.py`.
+    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if catalog_enabled else [])"
+            in worker)
     assert "tool_result_sink=evidence_sink" in worker
     assert "RegisteredOperationEvidenceSink(" in worker
     # Catalog PR3's promotion path OBSERVES nothing here: it reads what the run

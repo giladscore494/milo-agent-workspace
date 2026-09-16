@@ -69,6 +69,29 @@ turn execution flags off (see step 0).
          --role roles/secretmanager.secretAccessor
 6. API remains read-only where safe.
 
+### Catalog-only incident — the narrow rollback
+
+A defect in the catalog path does NOT require the full order above and does
+not require a code rollback. Disable the catalog capability on its own:
+
+    gcloud run jobs update <CLOUD_RUN_WORKER_JOB> \\
+      --project <GCP_PROJECT_ID> --region <GCP_REGION> \\
+      --update-env-vars MILO_ENABLE_CATALOG_EXECUTION=false
+
+Verification evidence — describe the job and read its worker container env:
+
+    gcloud run jobs describe <CLOUD_RUN_WORKER_JOB> \\
+      --project <GCP_PROJECT_ID> --region <GCP_REGION> --format json
+
+It must show MILO_ENABLE_CATALOG_EXECUTION=false, and the next swarm_v2 run
+must emit neither catalog_variant_promoted nor catalog_promotion_refused.
+
+Subsequent runs then register no Government tool, grant no catalog scope and
+construct no promotion pipeline. Runs already in flight finish under the
+configuration they started with. This DELETES AND MUTATES NO catalog row:
+snapshots, candidates and canonical variants are left exactly as they are, so
+re-enabling resumes from the same durable state.
+
 Flags are changed by updating the Cloud Run service env (see below) — there
 is no enable-all or disable-all script by design; each flag is explicit.
 

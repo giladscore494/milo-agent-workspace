@@ -76,6 +76,14 @@ EXECUTION_FLAGS = (
     "MILO_ENABLE_RUN_CANCELLATION",
     "MILO_ENABLE_EXECUTION_CONTROL",
     "MILO_ENABLE_PAID_EXECUTION",
+    # Worker-only. Gates the catalog capability INSIDE a Swarm V2 run that is
+    # already happening: the Government tool's registration, its scope, its
+    # evidence mapper and the canonical promotion pipeline
+    # (`backend/catalog/execution.py`). It creates no run, opens no route and
+    # authorizes no paid call, and it is listed here so every deployment
+    # contract, plan and inventory that enumerates execution flags pins it off
+    # like the rest.
+    "MILO_ENABLE_CATALOG_EXECUTION",
 )
 
 # NEXT_PUBLIC_* values ship to the browser bundle: secret material is banned.

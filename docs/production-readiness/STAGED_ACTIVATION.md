@@ -19,6 +19,9 @@ Operator actions (in order):
 8. keep every execution flag off (`MILO_ENABLE_*`,
    `GATEWAY_ALLOW_EXECUTION_ROUTES`);
 9. keep paid execution off (`MILO_ENABLE_PAID_EXECUTION` unset/false);
+9b. keep catalog execution off (`MILO_ENABLE_CATALOG_EXECUTION` unset/false on
+    the worker job). The Stage A deployment contract already pins it, so this
+    is a verification step, not a change;
 10. verify authentication (sign-in on the production domain);
 11. verify project membership (member reads succeed);
 12. verify proposal ownership (unowned proposals are invisible);
@@ -30,7 +33,9 @@ Operator actions (in order):
 Acceptance: workspace reads operate; unauthorized reads/writes fail; no
 worker execution occurred (`gcloud run jobs executions list` shows none);
 no provider call occurred; no paid budget reservation exists; execution
-remains disabled.
+remains disabled; `MILO_ENABLE_CATALOG_EXECUTION` is `false` on the deployed
+worker job (`gcloud run jobs describe --format json`), so no Government tool is
+registered and no canonical promotion pipeline is constructed in any run.
 
 ## Stage B — Infrastructure connection without paid execution
 
@@ -45,6 +50,8 @@ remains disabled.
    configuration, so lifecycle rehearsal happens in staging;
 7. keep the provider key absent or inaccessible;
 8. keep paid execution off;
+8b. keep catalog execution off — the mocked lifecycle rehearsal needs no
+    catalog capability, and Stage B is not the stage that authorizes one;
 9. test the lifecycle with mocked dependencies only;
 10. verify cancellation; 11. verify stale-worker rejection;
 12. verify retry and budget blocking; 13. verify launch-state
@@ -67,7 +74,11 @@ duration/retry caps, `MILO_DAILY_USER_BUDGET`,
 operator-controlled test user and project exist; cost monitoring ready;
 rollback commands prepared (`generate-rollback-plan.sh`).
 
-Actions: 1. enable only the minimum run-creation surface
+Actions: 0. leave `MILO_ENABLE_CATALOG_EXECUTION` **off**. Stage C is one
+controlled paid run, not an authorization to write canonical catalog rows;
+`scripts/release/stage-c/verify_caps.py` refuses the run if the flag is enabled
+on either surface, and `parse_env_contract.py` keeps it `false` in the
+smoke-active posture too; 1. enable only the minimum run-creation surface
 (`MILO_ENABLE_RUN_CREATION` plus `GATEWAY_ALLOW_EXECUTION_ROUTES`);
 2. restrict access to the operator-controlled test user/project;
 3. keep broad access disabled; 4. execute exactly one controlled run;
@@ -81,12 +92,44 @@ any invariant fails.
 
 Acceptance record (no secret values): run ID, release SHA, image digests,
 start/end time, model identifier, token totals, actual cost, budget
-decision, terminal state, operator identity.
+decision, terminal state, operator identity, and the observed value of
+`MILO_ENABLE_CATALOG_EXECUTION` on the worker revision (expected `false`).
+
+### Catalog execution — a separate stage, separately authorized
+
+Enabling `MILO_ENABLE_CATALOG_EXECUTION` is **not** part of Stage A, B, C or D
+and is never a side effect of a release. It is its own decision, and it needs
+its own explicit authorization, because it is what turns a durable Government
+snapshot into canonical catalog writes.
+
+Prerequisites before it may even be proposed:
+
+1. Stages A and B signed off, and a Stage C acceptance record that shows the
+   flag was `false` throughout;
+2. a read-only inspection establishing what the target database actually holds
+   (schema, functions, RLS, snapshot/candidate/canonical row counts) — an
+   enabled catalog over an unverified schema is exactly the posture this flag
+   exists to prevent;
+3. the rollback rehearsed: set the flag `false` and verify per
+   [ROLLBACK.md](ROLLBACK.md) §"Catalog execution";
+4. monitoring for the two catalog events bound to a real system
+   ([MONITORING_AND_INCIDENTS.md](MONITORING_AND_INCIDENTS.md)) — which remains
+   operator work; this repository configures no alert.
+
+Acceptance, when it is eventually authorized (no secret values): the worker
+revision digest, the observed flag value, the run ID, the count of
+`catalog_variant_promoted` and `catalog_promotion_refused` events, the distinct
+refusal codes seen, and the canonical row count before and after. A refusal is
+an operational outcome and does not fail that acceptance; an unexplained
+promotion does.
 
 ## Stage D — Gradual expansion
 
 1. one project; 2. small allowlist; 3. limited daily budget; 4. monitored
 expansion; 5. periodic security review; 6. periodic cost review;
+6b. periodic catalog review where catalog execution has been separately
+authorized (refusal-code distribution, canonical row growth, any promotion
+nobody expected);
 7. periodic stale-run and launch-reconciliation review; 8. rollback
 rehearsal; 9. wider access only after explicit approval.
 

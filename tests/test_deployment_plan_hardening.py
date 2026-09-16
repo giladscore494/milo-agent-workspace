@@ -37,6 +37,11 @@ EXECUTION_FLAGS = (
     "MILO_ENABLE_RUN_CANCELLATION",
     "MILO_ENABLE_EXECUTION_CONTROL",
     "MILO_ENABLE_PAID_EXECUTION",
+    # CODE-2: the independent catalog switch. It is a Stage A execution
+    # flag like the rest, so the deployment pins it false on BOTH
+    # surfaces and this fixture must carry it or the deployer's own
+    # env-name verification refuses the deployment.
+    "MILO_ENABLE_CATALOG_EXECUTION",
 )
 
 

@@ -18,6 +18,8 @@
  *   swarm_v2/executor.py                  task_ready, task_started,
  *                                         task_completed, task_failed
  *   swarm_v2/worker.py                    tool_called, worker_output_repair_started
+ *   backend/worker/main.py                catalog_variant_promoted,
+ *   (catalog/pipeline.py payload)         catalog_promotion_refused
  *
  * Three structural rules hold for every branch:
  *
@@ -36,7 +38,9 @@
  * That makes a replayed or duplicated event a no-op by construction.
  */
 
+import { reduceCatalogEvent } from './catalogStatus';
 import { EventId, compareEventIds, normalizeEventId } from './eventId';
+import { ownsCatalogProjection } from './eventVocabulary';
 import {
   MAX_SWARM_ACTIVITY_ITEMS,
   SwarmActivityItem,
@@ -368,6 +372,25 @@ export function reduceSwarmEvent(state: SwarmRunState, event: RunEvent): SwarmRu
       break;
 
     default:
+      if (ownsCatalogProjection(type)) {
+        // CODE-2. Recognised through `lib/eventVocabulary.ts` rather than
+        // through case labels here, so the catalog type names live in exactly
+        // one place and this reducer cannot drift from the vocabulary the
+        // backend mirrors.
+        //
+        // Folded INSIDE the ordering guard at the top, so a catalog counter
+        // inherits the determinism every other Swarm V2 counter has: the slice
+        // advances strictly by event id, which makes a replayed or duplicated
+        // event a no-op by construction rather than by a check written
+        // specially for the catalog.
+        //
+        // It reaches the catalog slice and NOTHING else. No `withTask`, no
+        // `withLifecycle`, no verification state — so `agent`, `phase`,
+        // `progress`, `task_id`, `tokens` and `cost_usd` on one of these
+        // events are read by nothing at all.
+        next = { ...next, catalog: reduceCatalogEvent(next.catalog, event, eventId) };
+        break;
+      }
       recognized = false;
       break;
   }

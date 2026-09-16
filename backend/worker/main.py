@@ -353,14 +353,25 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     PlanLimits, PlanValidator, RemainingBudget, SwarmV2Adapter, Verifier)
                 from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
                 from backend.engines.swarm_v2.evidence_mapping import (
-                    RegisteredOperationEvidenceSink, TrustedEvidenceAcquisition,
-                    production_evidence_mappers)
+                    EvidenceMapperRegistry, RegisteredOperationEvidenceSink,
+                    TrustedEvidenceAcquisition, production_evidence_mappers)
                 from backend.engines.swarm_v2.grounding import RepositoryEvidenceResolver
                 from backend.provider_scheduler import ProviderScheduler
                 from backend.tools import ToolContext, ToolRegistry
                 from backend.tools.government_vehicle import (GOVERNMENT_TOOL_SCOPE,
                                                               GovernmentVehicleTool)
+                from backend.catalog.execution import catalog_execution_enabled
                 from backend.catalog.pipeline import CatalogPromotionPipeline
+
+                # CODE-2: the ONE independent catalog switch, read once here
+                # from the process environment. Default off, and off for any
+                # value the repository's shared convention does not recognise.
+                #
+                # It is read ONCE, at construction, so every decision below
+                # comes from the same answer: a registry, a scope, a mapper and
+                # a pipeline that disagreed about whether the catalog is on
+                # would be a worse posture than having no switch at all.
+                catalog_enabled = catalog_execution_enabled()
 
                 allowed = tuple(filter(None, (item.strip() for item in
                     os.getenv("MILO_COMMANDER_MODEL_ALLOWLIST", "").split(","))))
@@ -379,7 +390,14 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # registered at all: canonical promotion is a lease-guarded
                 # repository RPC that trusted server code calls, not a
                 # capability a model can request.
-                tools = ToolRegistry([GovernmentVehicleTool(repo)])
+                #
+                # CODE-2 gates the REGISTRATION itself rather than hiding a
+                # registered tool. With the catalog off the registry is empty,
+                # so there is no descriptor for Commander to see, nothing for
+                # the plan firewall to admit, and no Government name in the
+                # provider-visible policy -- the capability is ABSENT, not
+                # merely unreachable.
+                tools = ToolRegistry([GovernmentVehicleTool(repo)] if catalog_enabled else [])
                 scheduler = ProviderScheduler(provider_limits,
                     cancellation_checker=is_cancelled,
                     backpressure_callback=record_provider_backpressure)
@@ -406,8 +424,16 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # would still be impossible even if one were registered. A
                 # plan can request a registered capability; it can never
                 # authorize one.
-                tool_context = ToolContext(scopes=frozenset({GOVERNMENT_TOOL_SCOPE}),
-                                           cancellation_checker=is_cancelled)
+                #
+                # With the catalog off NO scope is granted at all. That is
+                # belt-and-braces on top of the empty registry above -- the
+                # Registry refuses an unregistered tool before scope is even
+                # consulted -- but a granted scope with nothing to unlock is
+                # exactly the kind of leftover that survives a later refactor.
+                tool_context = ToolContext(
+                    scopes=frozenset({GOVERNMENT_TOOL_SCOPE}) if catalog_enabled
+                           else frozenset(),
+                    cancellation_checker=is_cancelled)
                 # The run's lease-guarded Evidence Board, built BEFORE the
                 # executor because the worker's trusted tool-result sink writes
                 # through it. Same board the Verifier's verdicts and the
@@ -420,16 +446,32 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # tool's seven other reads record nothing at all rather than
                 # failing the task that called them, and the pre-R3 generic
                 # text extractor stays unreachable either way.
+                #
+                # CODE-2: with the catalog off the sink is built over an EMPTY
+                # mapper registry -- `production_evidence_mappers()` is not
+                # even called, so the Government mapper is never constructed
+                # and no operation can become durable evidence. The sink itself
+                # stays wired so its refusal of anything that is not a
+                # `ToolCallRecord` keeps holding for every other caller.
                 evidence_sink = RegisteredOperationEvidenceSink(
-                    TrustedEvidenceAcquisition(board=board,
-                                               mappers=production_evidence_mappers()))
+                    TrustedEvidenceAcquisition(
+                        board=board,
+                        mappers=production_evidence_mappers() if catalog_enabled
+                                else EvidenceMapperRegistry()))
                 # Catalog PR3: the trusted promotion path. It observes NOTHING
                 # here and holds no state: when it runs it asks the database
                 # which candidates this run still owes, deriving the
                 # association from rows the server itself wrote. That is what
                 # makes it behave identically in a worker that gathered the
                 # evidence and in one that replaced a worker which did.
-                catalog_promotion["pipeline"] = CatalogPromotionPipeline(repo, board.lease)
+                #
+                # CODE-2: with the catalog off it is never CONSTRUCTED, which
+                # is what the call site below reads. Not constructed means no
+                # pending-promotion read, no canonical write and no catalog
+                # event -- and a database that already holds a usable snapshot
+                # stays inert for a chat run instead of being live by accident.
+                if catalog_enabled:
+                    catalog_promotion["pipeline"] = CatalogPromotionPipeline(repo, board.lease)
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
                     cancellation_checker=is_cancelled, event_sink=forward_event,
@@ -539,6 +581,13 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # owes no promotion", and finalizing the run on one would strand a
             # run whose verified evidence is durable and whose canonical
             # promotion never happened, with no later scheduler to revisit it.
+            #
+            # CODE-2: the `is not None` guard is now load-bearing rather than
+            # defensive. With `MILO_ENABLE_CATALOG_EXECUTION` off the wiring
+            # above never puts a pipeline here, so `promote()` is not called,
+            # no candidate is read, nothing is written and neither catalog
+            # event is emitted. The catalog path is skipped whole; the run's
+            # own outcome and finalization are untouched by the skip.
             if workflow_key == "swarm_v2" and catalog_promotion.get("pipeline") is not None:
                 for attempt in catalog_promotion["pipeline"].promote():
                     sink.emit(RunEventRecord(

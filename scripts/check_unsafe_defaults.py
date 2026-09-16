@@ -24,6 +24,10 @@ EXECUTION_FLAGS = [
     "MILO_ENABLE_RUN_CANCELLATION",
     "MILO_ENABLE_EXECUTION_CONTROL",
     "MILO_ENABLE_PAID_EXECUTION",
+    # The independent catalog switch. It must never be committed as enabled:
+    # the Government tool and the canonical promotion pipeline are built from
+    # it, and a repository default is not a deliberate operator decision.
+    "MILO_ENABLE_CATALOG_EXECUTION",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
     "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI",
     # Test-only adapters must never be switched on outside the isolated
