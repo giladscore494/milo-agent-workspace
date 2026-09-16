@@ -13,6 +13,19 @@ export const PROJECT_GAMMA = 'bbbbbbbb-1111-4111-8111-000000000003';
 /** Every project Alice is a member of, in the order the repository seeds them. */
 export const ALICE_PROJECTS = [PROJECT_ALPHA, PROJECT_GAMMA];
 
+/**
+ * The only `NEXT_PUBLIC_*` variables the browser may hold.
+ *
+ * Kept in step with `frontend/scripts/no-secret-bundle-check.mjs` and
+ * `docs/production-readiness/ENVIRONMENT_MATRIX.md`. The script checks the
+ * built bundle on disk; the E2E checks what the running server actually serves.
+ */
+export const APPROVED_PUBLIC_VARS = [
+  'NEXT_PUBLIC_SUPABASE_URL',
+  'NEXT_PUBLIC_SUPABASE_ANON_KEY',
+  'NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI',
+];
+
 const MOCK_SUPABASE = 'http://127.0.0.1:9998';
 
 export async function loginViaUi(page: Page, user: keyof typeof USERS): Promise<void> {

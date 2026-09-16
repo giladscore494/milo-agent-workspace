@@ -1,7 +1,10 @@
 'use client';
+import { useRef } from 'react';
 import { safeText } from '@/lib/sanitize';
 import { LaunchState } from '@/lib/types';
 import { PollingMode } from '@/lib/useRunRealtime';
+import { CancelRunControl } from './CancelRunControl';
+import { LaunchStateNote } from './LaunchStateNote';
 
 export type CurrentRunPanelProps = {
   executionUi: boolean;
@@ -47,6 +50,10 @@ export function CurrentRunPanel({
   onConfirmCancel,
   onKeepRunning,
 }: CurrentRunPanelProps) {
+  // Where focus lands if the cancellation control is withdrawn from under it
+  // because the run reached a terminal state.
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+
   if (!executionUi || !hasConversation) {
     return (
       <section className="panel panel--quiet">
@@ -71,41 +78,36 @@ export function CurrentRunPanel({
 
   return (
     <section className="panel">
-      <h3 className="panel-title">Live run</h3>
+      <h3 className="panel-title" ref={headingRef} tabIndex={-1}>Live run</h3>
       <dl className="run-facts">
         <div className="run-fact"><dt>Run</dt><dd className="identifier">{safeText(runId)}</dd></div>
         <div className="run-fact"><dt>Status</dt><dd>{safeText(runStatus ?? 'loading…')}</dd></div>
         <div className="run-fact"><dt>Phase</dt><dd>{safeText(phase)}</dd></div>
         <div className="run-fact"><dt>Connection</dt><dd>{connection === 'reconnecting' ? 'reconnecting…' : connection}</dd></div>
       </dl>
-      {!isTerminal && !confirmingCancel && (
-        <button type="button" className="button button--quiet" onClick={onRequestCancel}>Cancel run</button>
-      )}
-      {confirmingCancel && (
-        <div className="cancel-form">
-          <div className="field">
-            <label className="field-label sr-only" htmlFor="cancel-reason">Cancellation reason</label>
-            <input id="cancel-reason" value={cancelReason} onChange={(event) => onCancelReasonChange(event.target.value)} placeholder="Reason (optional)" />
-          </div>
-          <div className="button-row">
-            <button type="button" className="button button--danger" onClick={onConfirmCancel}>Confirm cancellation</button>
-            <button type="button" className="button button--quiet" onClick={onKeepRunning}>Keep running</button>
-          </div>
-        </div>
-      )}
-      {cancelError && <p className="alert" role="alert">{safeText(cancelError)}</p>}
+      <CancelRunControl
+        idPrefix="run"
+        available={!isTerminal}
+        confirming={confirmingCancel}
+        reason={cancelReason}
+        error={cancelError}
+        onReasonChange={onCancelReasonChange}
+        onRequestCancel={onRequestCancel}
+        onConfirm={onConfirmCancel}
+        onKeepRunning={onKeepRunning}
+        focusFallbackRef={headingRef}
+      />
       {isTerminal && (
         <p className="run-verdict">
           Run finished with status <b>{safeText(runStatus)}</b>.
           {isPartialSuccess && ' Partial success is not a completed run: some tasks, coverage gaps, conflicts or verdicts remain outstanding.'}
         </p>
       )}
-      {launchState && (
-        <p className="muted">
-          Launch state <b>{safeText(launchState)}</b>
-          {launchReconciliationRequired ? ' — reconciliation required.' : '.'}
-        </p>
-      )}
+      <LaunchStateNote
+        launchState={launchState}
+        launchReconciliationRequired={launchReconciliationRequired}
+        tone="muted"
+      />
     </section>
   );
 }

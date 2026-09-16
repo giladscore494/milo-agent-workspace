@@ -1,5 +1,8 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import Page from '../app/page';
+// The MOCKED ApiError below: `lib/errorText.ts` resolves the same module, so
+// `instanceof` matches and the classification path is the real one.
+import { ApiError as ApiErrorMock } from '../lib/api';
 import { getCurrentSession } from '../lib/supabaseClient';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -91,9 +94,13 @@ describe('authenticated workspace (execution UI disabled)', () => {
   });
 
   it('shows a retryable error state when project loading fails', async () => {
+    // A plain Error carries upstream words. The surface shows the caller's own
+    // sentence instead, and stays retryable.
     apiMocks.api.projects.mockRejectedValueOnce(new Error('403 gateway rejected'));
     render(<Page/>);
-    expect(await screen.findByRole('alert')).toHaveTextContent('403 gateway rejected');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Failed to load projects.');
+    expect(alert).not.toHaveTextContent('403 gateway rejected');
     apiMocks.api.projects.mockResolvedValue([PROJECT]);
     fireEvent.click(screen.getByRole('button', { name: 'Retry loading projects' }));
     expect(await screen.findByText('MILO Vehicle Catalog')).toBeInTheDocument();
@@ -144,7 +151,9 @@ describe('authenticated workspace (execution UI disabled)', () => {
     render(<Page/>);
     fireEvent.click(await screen.findByText('MILO Vehicle Catalog'));
     fireEvent.click(screen.getByRole('button', { name: 'New conversation' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('403 blocked');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Failed to create the conversation.');
+    expect(alert).not.toHaveTextContent('403 blocked');
   });
 
   it('exposes no execution, proposal, run or cancel controls while the flag is off', async () => {
@@ -209,12 +218,19 @@ describe('authenticated workspace (execution UI enabled)', () => {
     await waitFor(() => expect(apiMocks.api.run).toHaveBeenCalledWith(RUN.id));
   });
 
-  it('shows backend rejection reasons for run creation', async () => {
-    apiMocks.api.startRun.mockRejectedValue(new Error('run creation is disabled (EXECUTION_SURFACE_DISABLED)'));
+  it('shows the classified reason for a run-creation rejection', async () => {
+    // The backend's own sentence is never shown; its CLASSIFICATION is, in
+    // copy authored in lib/errorText.ts, with the code kept as the handle.
+    apiMocks.api.startRun.mockRejectedValue(
+      new ApiErrorMock(403, 'EXECUTION_SURFACE_DISABLED', 'conversation run creation is disabled'),
+    );
     await openConversation();
     fireEvent.change(screen.getByLabelText('Task content'), { target: { value: 'Go' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('EXECUTION_SURFACE_DISABLED');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('EXECUTION_SURFACE_DISABLED');
+    expect(alert).toHaveTextContent('turned off at the current activation stage');
+    expect(alert).not.toHaveTextContent('conversation run creation is disabled');
   });
 
   it('cancels an active run after confirmation with a reason', async () => {
@@ -266,14 +282,18 @@ describe('authenticated workspace (execution UI enabled)', () => {
     await waitFor(() => expect(apiMocks.api.decideProposal).toHaveBeenCalledWith(proposal.id, 'reject'));
   });
 
-  it('shows proposal errors from the backend', async () => {
-    apiMocks.api.createProposal.mockRejectedValue(new Error('workflow proposal creation is disabled (EXECUTION_SURFACE_DISABLED)'));
+  it('shows the classified reason for a proposal rejection', async () => {
+    apiMocks.api.createProposal.mockRejectedValue(
+      new ApiErrorMock(403, 'EXECUTION_SURFACE_DISABLED', 'workflow proposal creation is disabled'),
+    );
     render(<Page/>);
     fireEvent.click(await screen.findByText('MILO Vehicle Catalog'));
     fireEvent.click(screen.getByRole('button', { name: 'Workflow proposal' }));
     fireEvent.change(screen.getByLabelText('Proposal request'), { target: { value: 'X' } });
     fireEvent.click(screen.getByRole('button', { name: 'Generate proposal' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('EXECUTION_SURFACE_DISABLED');
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('EXECUTION_SURFACE_DISABLED');
+    expect(alert).not.toHaveTextContent('workflow proposal creation is disabled');
   });
 });
 

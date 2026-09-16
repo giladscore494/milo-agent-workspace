@@ -55,6 +55,43 @@ function withWorkspace(body: (workspace: string) => void): void {
   }
 }
 
+describe('state-ownership and F5 markers', () => {
+  it('fails when an ownership guard is removed from the page', () => {
+    withWorkspace((workspace) => {
+      const file = join(workspace, 'app/page.tsx');
+      const body = readFileSync(file, 'utf8');
+      // Removing the guard is exactly the regression that would let one
+      // conversation's late answer render under another.
+      writeFileSync(file, body.replace(/ownsConversation/g, 'alwaysTrue'));
+      const result = spawnSync('node', [SCRIPT], { cwd: workspace, encoding: 'utf8' });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('Missing state-ownership marker: ownsConversation');
+    });
+  });
+
+  it('fails when the run-row verification is removed from the polling hook', () => {
+    withWorkspace((workspace) => {
+      const file = join(workspace, 'lib/useRunRealtime.ts');
+      const body = readFileSync(file, 'utf8');
+      writeFileSync(file, body.replace(/runBelongsToScope/g, 'trustTheServer'));
+      const result = spawnSync('node', [SCRIPT], { cwd: workspace, encoding: 'utf8' });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('Missing state-ownership marker: runBelongsToScope');
+    });
+  });
+
+  it('fails when launch_unknown stops saying that nothing retries it', () => {
+    withWorkspace((workspace) => {
+      const file = join(workspace, 'components/run/LaunchStateNote.tsx');
+      const body = readFileSync(file, 'utf8');
+      writeFileSync(file, body.replace('will <b>not</b> be relaunched automatically', 'is being retried'));
+      const result = spawnSync('node', [SCRIPT], { cwd: workspace, encoding: 'utf8' });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('Missing F5 marker');
+    });
+  });
+});
+
 describe('final-result surface construct guard', () => {
   it('requires the final-result surface to exist at all', () => {
     withWorkspace((workspace) => {

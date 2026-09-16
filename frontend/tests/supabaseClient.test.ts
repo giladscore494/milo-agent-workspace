@@ -8,6 +8,7 @@ import {
   signInWithSupabase,
   signOutFromSupabase,
 } from '../lib/supabaseClient';
+import { AuthFailure } from '../lib/errorText';
 
 function client(session: any) {
   return {
@@ -55,17 +56,53 @@ describe('Supabase browser auth client helpers', () => {
 
 
 
-  it('surfaces Supabase session restoration errors safely', async () => {
+  it('raises a classification for a session-restoration failure, never the SDK message', async () => {
     const broken = {
       auth: {
-        getSession: vi.fn().mockResolvedValue({ data: {}, error: { message: 'invalid JSON in stored session' } }),
+        getSession: vi.fn().mockResolvedValue({ data: {}, error: { message: 'invalid JSON in stored session', status: 500 } }),
         onAuthStateChange: vi.fn(),
         signInWithPassword: vi.fn(),
         signOut: vi.fn(),
       },
     };
     setSupabaseClientForTests(broken as any);
-    await expect(getCurrentSession()).rejects.toThrow('invalid JSON in stored session');
+    // The SDK's own sentence is upstream prose about an upstream system. Only
+    // the status is read, and only to choose our own copy.
+    const error = await getCurrentSession().then(() => undefined, (e) => e);
+    expect(error).toBeInstanceOf(AuthFailure);
+    expect(error.reason).toBe('unavailable');
+    expect(JSON.stringify(error.message)).not.toContain('invalid JSON in stored session');
+  });
+
+  it('maps a rejected sign-in to invalid_credentials without the SDK message', async () => {
+    const rejecting = {
+      auth: {
+        getSession: vi.fn(),
+        onAuthStateChange: vi.fn(),
+        signInWithPassword: vi.fn().mockResolvedValue({ data: {}, error: { message: 'Invalid login credentials', status: 400 } }),
+        signOut: vi.fn(),
+      },
+    };
+    setSupabaseClientForTests(rejecting as any);
+    const error = await signInWithSupabase('a@example.com', 'wrong').then(() => undefined, (e) => e);
+    expect(error).toBeInstanceOf(AuthFailure);
+    expect(error.reason).toBe('invalid_credentials');
+    expect(error.message).not.toContain('Invalid login credentials');
+  });
+
+  it('maps a throttled sign-in to rate_limited', async () => {
+    const throttled = {
+      auth: {
+        getSession: vi.fn(),
+        onAuthStateChange: vi.fn(),
+        signInWithPassword: vi.fn().mockResolvedValue({ data: {}, error: { message: 'over_request_rate_limit', status: 429 } }),
+        signOut: vi.fn(),
+      },
+    };
+    setSupabaseClientForTests(throttled as any);
+    const error = await signInWithSupabase('a@example.com', 'x').then(() => undefined, (e) => e);
+    expect(error).toBeInstanceOf(AuthFailure);
+    expect(error.reason).toBe('rate_limited');
   });
 
   it('performs real Supabase sign-out through the auth client', async () => {

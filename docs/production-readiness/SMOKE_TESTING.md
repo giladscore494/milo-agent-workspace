@@ -89,3 +89,25 @@ a terminal run whose product payload is built by the shipped
 `durable_run_status`, asserted for the usable / partial / empty outcomes,
 refresh reconstruction, mobile width, keyboard operation and the
 `vehicle_catalog_v1` control (see `docs/swarm-v2-final-result.md`).
+
+Stage F5 adds to that suite: every one of the six durable terminal states
+asserted as a literal status; the `launch_unknown` path driven through the
+production `JobLaunchUncertain` condition at a test-only launcher seam (parked
+run, safe error, idempotent replay returning the same run, exactly one launch
+attempt, no automatic relaunch); sign-out clearing the browser's stored
+active-run keys; and a secret scan over **every** script the running server
+serves, including a check that only the approved `NEXT_PUBLIC_*` variables
+appear. The full acceptance matrix, with the classification and evidence for
+each requirement, is [FRONTEND_ACCEPTANCE.md](FRONTEND_ACCEPTANCE.md).
+
+## Operator UI verification before a release
+
+These scripts and the E2E suite prove behavior against an isolated stack. They
+cannot see the deployed browser. [FRONTEND_PRE_RELEASE.md](FRONTEND_PRE_RELEASE.md)
+is the short operator pass that can: disabled-by-default posture, session
+behavior, project/conversation isolation, run creation and idempotency,
+refresh/reconnect, cancellation and focus, every terminal state,
+`launch_unknown`, the Final Result variants, keyboard and mobile layout, and a
+served-page/bundle secret inspection — plus its own rollback and stop
+conditions. Run it after the Stage A smoke tests above and record the result
+with the release evidence.
