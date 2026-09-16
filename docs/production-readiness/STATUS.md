@@ -1,5 +1,18 @@
 # Production readiness — persistent status
 
+> **SUPERSEDED as a statement of the CURRENT state (noted 2026-09-16).** The
+> branch, pull request and test counts below describe the Phase 9–11 corrective
+> round, which has long since merged into `main`; `origin/main` is now
+> `75f1590d2e6edb78fc2886aa9b6535e681038066` (F5, PR #90), and the counts
+> recorded on that head are 2 597 backend and 501 frontend tests. In particular,
+> the deployment-posture paragraph at the end of this document names a
+> prerequisite — merging PR #33 into `claude/production-readiness-j0hhni` — that
+> no longer exists, so it must not be read as the current blocker. The current
+> blocking state is recorded in
+> [`../roadmap/MILO_GAP_AUDIT_2026-09-16.md`](../roadmap/MILO_GAP_AUDIT_2026-09-16.md).
+> Everything below is retained as the historical record of that corrective
+> round, and the read-only audit command it documents is still the correct one.
+
 - **Scope:** Corrective pass on the Phase 9–11 operator/release tooling after
   a live read-only Google Cloud Shell inspection exposed production-operator
   defects that the mocked Phase 9–11 CI did not catch.
