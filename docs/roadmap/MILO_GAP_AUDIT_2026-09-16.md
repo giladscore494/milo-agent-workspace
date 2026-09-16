@@ -223,6 +223,25 @@ Status vocabulary — exactly the eight allowed labels:
 through the intended production code path. Test-only registration, an exported
 but uncalled function, or an isolated class is never sufficient.
 
+### The epistemic standard this audit holds itself to
+
+Review round 1 caught three overclaims and review round 2 caught a further
+class of them, all of the same shape: an absence of evidence reported as an
+established fact. The standard is therefore stated explicitly, and every
+sentence in this document is meant to sit in exactly one of three categories.
+
+| Category | What may be asserted | How it reads here |
+| --- | --- | --- |
+| **1. Repository fact** | anything a code search, a file read or `git` can settle | stated flatly, with the file and symbol: *"`DataGovClient(` appears only under `tests/` and `backend/testing/`"*, *"no production caller exists in the repository"*, *"an unregistered source cannot become evidence under the contract"*. Absolute words like "never" are legitimate here because the contract or the call graph makes them true |
+| **2. Absence of an accepted record** | that no evidence of an event exists in the repository or in the production records supplied to this audit | stated as absence, not as non-occurrence: *"no accepted production record demonstrates X"*. **It never licenses "X never happened."** |
+| **3. Externally unknown state** | that the audit does not know | `BLOCKED_EXTERNAL`, named as unknown in both directions, with the read-only step that would settle it |
+
+The rule that generated every correction in round 2: **missing evidence of an
+external event is category 2, never category 1.** This audit reads a
+repository, a migration-history ledger and a set of GitHub records. It has
+never connected to the production database, and it therefore cannot say what
+has or has not happened there — only what it can and cannot find.
+
 ---
 
 ## 4. Requirement / evidence / status matrix
@@ -247,12 +266,12 @@ evidence** · **Test evidence** · **Deployment/activation evidence** ·
 | S1-09 | §1.7 | Every model call passes one BudgetTracker + ProviderScheduler | `swarm_v2/model_gateway.py:24-80`; `worker/main.py:386-396` | `tests/test_provider_scheduler.py`, `tests/test_provider_backpressure.py`, `tests/test_budget.py` | not proven for V2 | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S1-10 | §1.8 | Bounded generic worker pool, dependency-ordered | `swarm_v2/executor.py`, `worker.py`; `worker/main.py:433-446` | `tests/test_swarm_v2.py`, `tests/test_swarm_v2_stage1_e2e.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S1-11 | §1.9 | Tool Registry as an allowlist with schema/scope/mode enforcement | `backend/tools/registry.py` (`ToolRegistry.execute` re-validates scope, mode, input and output) | `tests/test_swarm_v2_tool_contract.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
-| S1-12 | §1.9 | Stage-1 mock tools for testing | `backend/tools/mock.py` | `tests/test_swarm_v2_tool_contract.py` | never registered in production (correct) | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
+| S1-12 | §1.9 | Stage-1 mock tools for testing | `backend/tools/mock.py` | `tests/test_swarm_v2_tool_contract.py` | not registered in the production registry — the only `ToolRegistry(` construction outside tests is `worker/main.py:382` and it holds one tool, which is the intended outcome | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S1-13 | §1.10 | Every V2 durable evidence/tool write is lease-guarded | migration `20260823000100_lease_guarded_evidence_writes.sql`; `repository/supabase.py` `_guarded_rpc` | `tests/test_migrations_postgres.py::test_stale_worker_full_scenario_every_mutation_rejected` (real PostgreSQL) | `20260823000100` is **recorded in the linked project's migration history** (§2.3), the newest version that is; whether its objects are present and intact is unverified | `COMPLETED_AND_CONNECTED` | none for the rule itself | `NONE` | none | the rule is implemented and connected in code. Whether the R3 fragment and R4 verdict relations the current evidence path writes through (`20260828000200`, `20260902000100`, `20260907000100`) exist in the target database is unverified (OPS-01); if they do not, those writes fail closed rather than bypassing the lease |
 | S1-14 | §1.11 | Evidence Board on the existing sources/claims/conflicts | `swarm_v2/evidence.py` (`EvidenceBoard`, `WorkerLease`), constructed `worker/main.py:415-418` | `tests/test_swarm_v2_evidence.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S1-15 | §1.12 | Commander replanning loop with hard caps | `swarm_v2/commander.py`, `engine.py`, `validation.py` `PlanLimits` | `tests/test_swarm_v2.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S1-16 | §1.13 | Verifier issues structured verdicts; deterministic builder assembles the result | `swarm_v2/verifier.py`, `builder.py`, `outcome.py`; wired `worker/main.py:475-476` | `tests/test_swarm_v2_r4_deterministic_verification.py`, `tests/test_swarm_v2_outcome_contract.py` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
-| S1-17 | §1.14 | Real checkpoint/resume: completed tasks are not re-run | `swarm_v2/state.py`; `worker/main.py:502-519` restores the component-wise max of run row and checkpoint usage | `tests/test_swarm_v2_resume_budget.py` | not proven against a real Cloud Run task restart | `COMPLETED_IN_CODE_NOT_ACTIVATED` | a real restart has never been observed | `OPERATOR` | part of OPERATOR-3 | low risk; proven in memory + PostgreSQL |
+| S1-17 | §1.14 | Real checkpoint/resume: completed tasks are not re-run | `swarm_v2/state.py`; `worker/main.py:502-519` restores the component-wise max of run row and checkpoint usage | `tests/test_swarm_v2_resume_budget.py` | no repository evidence and no accepted production record demonstrates a real Cloud Run task restart of a `swarm_v2` run | `COMPLETED_IN_CODE_NOT_ACTIVATED` | the resume path is proven in memory and against real PostgreSQL; whether it has ever run through an actual task restart is not established either way | `OPERATOR` | part of OPERATOR-3 | low risk; the code-level property is proven, only the live rehearsal is unrecorded |
 | S1-18 | §1.15 | Swarm event vocabulary visible without a new dashboard | `swarm_v2/engine.py` emits `commander_plan_created`, `task_*`, `tool_called`, `evidence_added`, `conflict_found`, `verification_*`; `frontend/lib/eventVocabulary.ts:57-63` mirrors them | `tests/test_swarm_v2_runtime.py`, `frontend/tests/eventProjection.test.ts` | not proven | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | `backend/runtime.py` `EVENT_TYPES` does **not** list the V2 vocabulary; `SupabaseEventSink` does not validate against it, so this is a naming gap, not a block (see §10) |
 
 ### 4.2 Stage 2 — "ידע רכב" / Yeda (roadmap §2.1–§2.9)
@@ -281,23 +300,23 @@ on the strength of a stated decision **and** a named successor — not on absenc
 
 | ID | Source | Requirement | Production evidence | Test evidence | Activation evidence | Status | Gap | Work | Follow-up | Dependencies / risk |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| S3-01 | §3.1 | Deterministic bounded CKAN client (pagination, envelope, schema, timeouts, retries) | `backend/catalog/government/client.py:203-400`; `transport.py` is the only socket-capable module | `tests/test_catalog_government_ingestion.py` (fixture-backed, sockets disabled at module level) | **never constructed outside tests** — verified by grep: `DataGovClient(` appears only in `tests/` and `backend/testing/` | `COMPLETED_IN_CODE_NOT_ACTIVATED` | no caller | `CODE` | CODE-1 | see S3-02 |
+| S3-01 | §3.1 | Deterministic bounded CKAN client (pagination, envelope, schema, timeouts, retries) | `backend/catalog/government/client.py:203-400`; `transport.py` is the only socket-capable module | `tests/test_catalog_government_ingestion.py` (fixture-backed, sockets disabled at module level) | **never constructed outside tests** — verified by grep: `DataGovClient(` appears only in `tests/` and `backend/testing/` | `COMPLETED_IN_CODE_NOT_ACTIVATED` | no caller in this repository | `CODE` | CODE-1 | see S3-02a |
 | S3-02a | §3.2 | **A supported, guarded live Government capture entrypoint exists in the repository** | ingestion code `backend/catalog/government/ingest.py:188-225` exists; **nothing constructs it outside tests** — `DataGovClient(` and `GovernmentCatalogIngestor(` appear only under `tests/` and `backend/testing/`, and `backend/catalog/` contains no `__main__` and no `argparse` | `tests/test_catalog_government_ingestion.py` over the pinned `q=RAV4` 233-row capture | n/a — there is nothing to activate | `MISSING` | no operator or production entrypoint can perform a capture | `CODE` | **CODE-1** | proven from the repository alone; the code half of §14 |
 | S3-02b | §3.2 | **A durable Government snapshot exists in the target database, so chat does not depend on `data.gov.il`** | nothing in this repository observes the production database; §2.3 is a migration-history ledger, not a schema or row observation | fixture-backed tests prove the shape of a snapshot, never the existence of one in production | **not proven either way.** No repository evidence and no accepted production record demonstrates a durable live catalog snapshot; equally, this audit cannot assert that none exists | `BLOCKED_EXTERNAL` | the state is unknown until OPERATOR-0 reads it | `OPERATOR` | **OPERATOR-0**, then OPERATOR-3 if none is found | **the state half of §14** — do not read this row as either presence or absence |
-| S3-03 | §3.2 | Capture is idempotent, checksum/row-count verified, never active while partial | `client.py:330-360` (`GOV_PAGINATION_INCOMPLETE`), `snapshot.py`, `activate_catalog_snapshot_guarded` | `tests/test_catalog_government_ingestion.py`, `tests/test_migrations_postgres.py` | not activated | `COMPLETED_IN_CODE_NOT_ACTIVATED` | never exercised against live pagination | `OPERATOR` | OPERATOR-3 | live CKAN paging behaviour is unproven |
+| S3-03 | §3.2 | Capture is idempotent, checksum/row-count verified, never active while partial | `client.py:330-360` (`GOV_PAGINATION_INCOMPLETE`), `snapshot.py`, `activate_catalog_snapshot_guarded` | `tests/test_catalog_government_ingestion.py`, `tests/test_migrations_postgres.py` | **no production caller in this repository** (S3-01, proven by grep), and no accepted production record demonstrates a live paginated capture. Whether one was ever executed externally is unverified | `COMPLETED_IN_CODE_NOT_ACTIVATED` | the guarantees are proven against the pinned fixture; live CKAN paging behaviour is unproven by any evidence available here | `OPERATOR` | OPERATOR-3 | the repository half is certain; the external half is not |
 | S3-04 | §3.2 | A whole ~101 000-row resource can actually be captured | bounds `source.py:97-107`: `DEFAULT_PAGE_LIMIT=100`, `MAX_PAGE_LIMIT=1000`, `MAX_PAGES_PER_CAPTURE=200`, `MAX_RECORDS_PER_CAPTURE=120_000` | pagination bounds tested on 233 rows | none | `COMPLETED_IN_CODE_NOT_ACTIVATED` | **at the default page size a ~101 000-row resource is refused** (`ceil(101000/100)=1010 > 200` → `GOV_PAGE_BUDGET_EXCEEDED`); it fits only when the client is constructed with `page_limit=1000`, and whether a 1 000-record page stays under `MAX_RESPONSE_BYTES` (8 MiB) is unproven | `CODE` | CODE-1 must set and justify the page size | a wrong page size turns the first authorized capture into a guaranteed refusal |
-| S3-05 | §3.3 | Deterministic normalization into a manufacturer→model→year→variant structure | `backend/catalog/government/normalize.py`; candidates land in `catalog_candidate_variants` | `tests/test_catalog_government_ingestion.py` | not activated | `COMPLETED_IN_CODE_NOT_ACTIVATED` | no rows exist | `OPERATOR` | OPERATOR-3 | depends on S3-02 |
+| S3-05 | §3.3 | Deterministic normalization into a manufacturer→model→year→variant structure | `backend/catalog/government/normalize.py`; candidates land in `catalog_candidate_variants` | `tests/test_catalog_government_ingestion.py` | no supported repository producer exists (S3-02a) and no accepted production record demonstrates a normalization run. **The current row state of `catalog_candidate_variants` in the target database is unknown** (S3-02b) | `COMPLETED_IN_CODE_NOT_ACTIVATED` | the normalizer is deterministic and tested; what, if anything, it has produced in the target database must be read by OPERATOR-0 rather than assumed | `OPERATOR` | OPERATOR-0, then OPERATOR-3 | depends on S3-02a and S3-02b |
 | S3-06 | §3.3 | Dedicated `government_vehicle_model_years` / `government_vehicle_variants` tables | none, deliberately | n/a | n/a | `REPLACED_BY_NEW_ARCHITECTURE` | none — successor is `catalog_candidate_variants` plus query layers (`projection.py`, `query.py`), stated in the roadmap's own §3 banner | `NONE` | none | — |
 | S3-07 | §3.3 | The quantity resource builds manufacturer/model/year counts | none, deliberately; `QUANTITY_RESOURCE_ID` is allowlisted for capture (`source.py:72-73`) but has a raw-only contract and no normalization | n/a | n/a | `REPLACED_BY_NEW_ARCHITECTURE` | none — explicit decision recorded in the roadmap §3 banner ("captured and preserved, never read for identity") | `NONE` | none | — |
-| S3-08 | §3 scope | **Both** approved CKAN resources are synced deterministically | both allowlisted; only `WLTP_RESOURCE_ID` is bound to the tool (`government_vehicle.py:250`) | n/a | none | `COMPLETED_IN_CODE_NOT_ACTIVATED` | neither resource has been synced; the quantity resource has no reviewed use | `OPERATOR` | OPERATOR-3 (WLTP only) | capturing quantity is not required to finish §3.2 |
+| S3-08 | §3 scope | **Both** approved CKAN resources are synced deterministically | both allowlisted; only `WLTP_RESOURCE_ID` is bound to the tool (`government_vehicle.py:250`) | n/a | no supported repository entrypoint can sync either resource (S3-02a) and no accepted production record demonstrates a sync of either; current database contents remain unknown (S3-02b) | `COMPLETED_IN_CODE_NOT_ACTIVATED` | the quantity resource additionally has no reviewed use — a repository fact, unlike the sync state | `OPERATOR` | OPERATOR-0, then OPERATOR-3 (WLTP only) | capturing quantity is not required to finish §3.2 |
 | S3-09 | §3.4 | A registered, bounded, read-only `GovernmentVehicleTool` | `backend/tools/government_vehicle.py`; registered `worker/main.py:382`; scope granted `worker/main.py:409` | `tests/test_catalog_pr3_swarm_promotion.py`, `tests/test_swarm_v2_tool_contract.py` | registered in the release path, but answers nothing without a snapshot | `COMPLETED_AND_CONNECTED` | none in wiring | `NONE` | none | inert until S3-02 |
 | S3-10 | §3.4 | No operation returns a whole raw resource; every page is bounded and exactly totalled | `MAX_TOOL_PAGE_ITEMS = MAX_RESULT_ITEMS` (200); `resolve_variant` quotes seven identity fields of one row only | `tests/test_catalog_pr3_swarm_promotion.py`; SQL bound `catalog_page_limit()` | the SQL side's version is not recorded in the linked project's migration history (§2.3); whether the functions exist is unverified | `COMPLETED_IN_CODE_NOT_ACTIVATED` | the deployed SQL state is unknown | `OPERATOR` | OPERATOR-0 | — |
-| S3-11 | §3.4/PR3 | The complete dataset is queryable database-side, not by Python materialization | migration `20260916090000` (7 read functions, 3 collate-"C" indexes); `government/query.py` | `tests/test_migrations_postgres.py` against real PostgreSQL over 140 and 13 candidates | version not in the linked project's migration history (§2.3), deployed state unverified; and never run over ~101 000 rows anywhere | `COMPLETED_IN_CODE_NOT_ACTIVATED` | index/plan behaviour at real scale is unmeasured | `OPERATOR` | OPERATOR-0, then OPERATOR-4 | a slow plan at 101 k rows would surface only after S3-02b |
+| S3-11 | §3.4/PR3 | The complete dataset is queryable database-side, not by Python materialization | migration `20260916090000` (7 read functions, 3 collate-"C" indexes); `government/query.py` | `tests/test_migrations_postgres.py` against real PostgreSQL over 140 and 13 candidates | version not in the linked project's migration history (§2.3), deployed state unverified. Repository tests cover only the documented smaller fixtures (140, 13, 233 and 1 candidates) and no accepted production record demonstrates execution at ~101 000 rows | `COMPLETED_IN_CODE_NOT_ACTIVATED` | index and plan behaviour at real scale is unmeasured by any evidence available here | `OPERATOR` | OPERATOR-0, then OPERATOR-4 | a slow plan at 101 k rows would surface only once S3-02b is settled and a snapshot of that size is queried |
 | S3-12 | §3.5 | Deterministic tiered Government ↔ legacy crosswalk producing structured gaps | `backend/catalog/government/reconcile.py:258-380` | `tests/test_catalog_government_ingestion.py` | **no production caller** — `reconcile_catalog` is exported from `__init__.py` and called only by tests | `COMPLETED_IN_CODE_NOT_ACTIVATED` | nothing invokes it; `REVIEWED_ALIAS_RULES` is `()` (`reconcile.py:71`), so tier 3 never fires; and no legacy side exists (S2-10) | `CODE` | CODE-4 | not required to finish §3.2 |
 | S3-13 | §3.6 | Government facts become versioned, located evidence with field-specific authority | `backend/catalog/government/evidence.py` (`GovernmentVariantEvidenceMapper`); registered `evidence_mapping.py:226-256`; wired `worker/main.py:423-425` | `tests/test_swarm_v2_r3_evidence_contract.py`, `tests/test_catalog_pr3_swarm_promotion.py` | connected in the release path; produces nothing without a snapshot | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | inert until S3-02 |
 | S3-14 | §3.6 | `koah_sus` is never mapped to horsepower; no semantic guessing | the mapper does not read the field; no promotable entry exists (`contracts.py:127-145`) | `tests/test_catalog_pr3_swarm_promotion.py` | n/a | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | — |
 | S3-15 | §3.7 | Government-first Commander policy keyed by the registered tool | `swarm_v2/validation.py:156-174` `SOURCE_FIRST_TOOL_POLICY`, surfaced through `provider_plan_policy` into `ModelGateway` | `tests/test_israel_source_policy.py` | not proven live | `COMPLETED_AND_CONNECTED` | none | `NONE` | none | the policy tells the Commander to plan "targeted research" for gaps, but **no research tool is registered**, so such a task can produce no evidence (see S3-17) |
-| S3-16 | §3.8 | End-to-end: plan → tool → evidence → verdict → promotion → canonical read | `backend/catalog/pipeline.py`; called `worker/main.py:542-550` under the lease, after verdicts settle | `tests/test_catalog_pr3_swarm_promotion.py` (incl. six crash windows, replacement worker, pending-read outage) — memory repository; derivation also against real PostgreSQL | **fixture/offline only**; never run in production | `FIXTURE_ONLY` | the whole chain has never executed against live data | `OPERATOR` + `AUTHORIZATION` | OPERATOR-3 then AUTH-1 | depends on S3-02 and OPERATOR-1 |
+| S3-16 | §3.8 | End-to-end: plan → tool → evidence → verdict → promotion → canonical read | `backend/catalog/pipeline.py`; called `worker/main.py:542-550` under the lease, after verdicts settle | `tests/test_catalog_pr3_swarm_promotion.py` (incl. six crash windows, replacement worker, pending-read outage) — memory repository; derivation also against real PostgreSQL | the repository and the accepted records available here demonstrate **fixture/offline execution only**; whether an unrecorded external production execution occurred is not established | `FIXTURE_ONLY` | no evidence available here demonstrates the chain running against live data | `OPERATOR` + `AUTHORIZATION` | OPERATOR-3 then AUTH-1 | depends on S3-02a, S3-02b and OPERATOR-0 |
 | S3-17 | §5 | A `web_research` read capability exists in the Tool Registry | **none** — the production registry holds one tool (`worker/main.py:382`) | R5 web tool/mapper exist only under `backend/testing/r5_proof/` | none | `MISSING` | no production Web research capability; a worker's model text can never become evidence | `CODE` | CODE-5 (conditional, §9.1 of the handoff) | required before any "targeted research for gaps" is real |
 | S3-18 | §3.9 | `sync_if_changed` refresh with a bounded diff and no duplicate work on no-change | `backend/catalog/government/refresh.py:225-300`; DB diff `catalog_snapshot_candidate_diff` | `tests/test_catalog_pr3_swarm_promotion.py`; diff against real PostgreSQL | **no schedule and no caller** — a static test asserts `sync_if_changed` appears nowhere in `backend/`, `scripts/` or `.github/workflows/` | `COMPLETED_IN_CODE_NOT_ACTIVATED` | no scheduler is configured or authorized | `OPERATOR` + `AUTHORIZATION` | deferred to handoff §9.4 | must not be scheduled before a controlled bootstrap |
 
@@ -332,7 +351,7 @@ on the strength of a stated decision **and** a named successor — not on absenc
 | FE-07 | F5 | Unknown/hostile events cannot manufacture state | `frontend/lib/eventVocabulary.ts`; `reduceRunEvent` | `tests/eventProjection.test.ts` (15 cases) | isolated stack | `COMPLETED_AND_CONNECTED` | none | `NONE` |
 | FE-08 | F5 | Every one of the six terminal states proven E2E | `frontend/e2e/*` | Playwright 47 cases | isolated stack, mocked auth/worker/provider | `COMPLETED_AND_CONNECTED` | none | `NONE` |
 | FE-09 | F5 | Browser bundle carries no secret; only approved `NEXT_PUBLIC_*` | `frontend/scripts/no-secret-bundle-check.mjs` with `MILO_REQUIRE_BUNDLE_SCAN=1` in CI | `npm run test:secrets`, `tests/secretBundleCheck.test.ts`, E2E 28 | scans artifacts this repository builds | `COMPLETED_AND_CONNECTED` | none | `NONE` |
-| FE-10 | F5 | Live browser posture on the deployed site | `docs/production-readiness/FRONTEND_PRE_RELEASE.md` | none possible | never run | `BLOCKED_EXTERNAL` | operator pass required | `OPERATOR` |
+| FE-10 | F5 | Live browser posture on the deployed site | `docs/production-readiness/FRONTEND_PRE_RELEASE.md` | none possible — no fixture can observe a deployed browser | no accepted operator record demonstrates that the live-browser pass was run | `BLOCKED_EXTERNAL` | operator pass required, and its result recorded | `OPERATOR` |
 | FE-11 | F5 | Automatic `launch_unknown` reconciliation | `scripts/release/reconcile-launch-unknown.sh` (manual, list-only by default) | `tests/test_release_tooling_cli.py` | n/a | `INTENTIONALLY_DEFERRED` | deliberate, with a stated condition | `NONE` |
 
 ### 4.6 Production readiness, deployment and activation
@@ -344,12 +363,12 @@ on the strength of a stated decision **and** a named successor — not on absenc
 | OPS-03 | STAGED_ACTIVATION.md | Stage A completed on the current release | no Stage A record for this SHA | `BLOCKED_EXTERNAL` | run the two smoke suites | `OPERATOR` | OPERATOR-2 |
 | OPS-04 | STAGE_C_ACCEPTANCE.md | Stage C closed PASSED, one-run authorization consumed | `STAGE_C_ACCEPTANCE.md:3-20` (run `8b4a4277-…`, 84 calls, 312 018 tokens, $0.252069) | `COMPLETED_AND_CONNECTED` | none | `NONE` | none |
 | OPS-05 | STAGE_C_ACCEPTANCE.md:884 | Stage D remains unauthorized and blocked | "Stage D requires its own fresh, separate, explicit operator authorization" | `BLOCKED_EXTERNAL` | only a fresh explicit operator authorization can lift it | `AUTHORIZATION` | AUTH-2 |
-| OPS-06 | swarm-v2-smoke.md | A Swarm V2 controlled production smoke has been executed and accepted | controller and contract exist; **no acceptance record exists anywhere in the repository** | `COMPLETED_IN_CODE_NOT_ACTIVATED` | the smoke has never been run | `OPERATOR` + `AUTHORIZATION` | OPERATOR-2 |
+| OPS-06 | swarm-v2-smoke.md | A Swarm V2 controlled production smoke has been executed and accepted | the controller and its acceptance contract exist in the repository; **no accepted production-smoke record exists in the repository or in the production records supplied to this audit** | `BLOCKED_EXTERNAL` | the requirement is about an external execution and its acceptance, so missing evidence does not establish non-occurrence — reclassified from `COMPLETED_IN_CODE_NOT_ACTIVATED` in review round 2 for exactly that reason | `OPERATOR` + `AUTHORIZATION` | OPERATOR-2 |
 | OPS-07 | swarm-v2-smoke.md | Zero dangling budget reservations before the next smoke acceptance | one named dangling reservation: run `0d44d491-bc40-404e-9642-a5b8f77f3441`, reservation `8b05de80-fa01-4614-bec1-37f72ca63acc`, `status=reserved`, `estimated_cost=0.02`, unsettled, deliberately not mutated by any code | `BLOCKED_EXTERNAL` | a separately authorized production recovery must settle or void it | `OPERATOR` + `AUTHORIZATION` | OPERATOR-5 |
 | OPS-08 | AUTHORIZATION_AND_RLS.md | The anon-EXECUTE hardening reaches production | the doc states both migrations are on staging only and that "the anon-EXECUTE gap should be assumed present in production until then". §2.3 shows `20260810000100` and `20260810000200` **recorded in the linked project's migration history**, which is evidence they ran — but a history row is not an ACL observation, and only OPERATOR-0's grant/RLS inspection settles whether `anon` still holds EXECUTE | `BLOCKED_EXTERNAL` | the doc's warning is probably stale, and "probably" is not a security finding. Verify the ACLs directly | `OPERATOR` | **OPERATOR-0** |
 | OPS-09 | FINAL_ACCEPTANCE.md | Every major item carries a classification | the table classifies no catalog, Government, Swarm V2 or frontend-stage item | `MISSING` | the authoritative classification set does not cover the last four stages | `CODE` (documentation) | CODE-2 |
 | OPS-10 | MONITORING_AND_INCIDENTS.md | External monitoring/alerting is configured | operator territory, unchanged | `BLOCKED_EXTERNAL` | operator action | `OPERATOR` | OPERATOR-6 |
-| OPS-11 | handoff §9.2 | A controlled full Government capture with counts, checksums and a normalization issue report | none | `MISSING` | blocked on S3-02 | `OPERATOR` + `AUTHORIZATION` | OPERATOR-3 |
+| OPS-11 | handoff §9.2 | A controlled full Government capture with counts, checksums and a normalization issue report | no such report exists in the repository or in the production records supplied here | `MISSING` | the artefact is absent; producing it is blocked on S3-02a, and OPERATOR-0 may change what it needs to cover | `OPERATOR` + `AUTHORIZATION` | OPERATOR-0, then OPERATOR-3 |
 | OPS-12 | handoff §9.3 | Bootstrap metrics (verified rate, ambiguity rate, conflict rate, cost per 1 000 candidates) | none | `MISSING` | cannot be measured before a capture | `OPERATOR` | after OPERATOR-3 |
 | OPS-13 | handoff §9.4 | Scheduled refresh with alerting and operator rollback | `sync_if_changed` exists; no scheduler | `INTENTIONALLY_DEFERRED` | deliberately deferred until a controlled bootstrap succeeds | `AUTHORIZATION` | not now |
 
@@ -360,11 +379,11 @@ CAT-12.
 | Status | Count | Where |
 | --- | ---: | --- |
 | `COMPLETED_AND_CONNECTED` | 32 | S1 ×17, S3 ×4, CAT ×3, FE ×7, OPS ×1 |
-| `COMPLETED_IN_CODE_NOT_ACTIVATED` | 19 | S1 ×1, S3 ×9, CAT ×7, FE ×1, OPS ×1 |
+| `COMPLETED_IN_CODE_NOT_ACTIVATED` | 18 | S1 ×1, S3 ×9, CAT ×7, FE ×1 |
 | `FIXTURE_ONLY` | 1 | S3-16 |
 | `REPLACED_BY_NEW_ARCHITECTURE` | 8 | S2 ×6, S3 ×2 |
 | `INTENTIONALLY_DEFERRED` | 3 | FE ×2, OPS ×1 |
-| `BLOCKED_EXTERNAL` | 9 | S3-02b, FE-10, OPS-01/02/03/05/07/08/10 |
+| `BLOCKED_EXTERNAL` | 10 | S3-02b, FE-10, OPS-01/02/03/05/06/07/08/10 |
 | `MISSING` | 9 | S2-10, S3-02a, S3-17, CAT-10/11/13, OPS-09/11/12 |
 | `OBSOLETE` | 3 | S2-07/08/09 |
 
@@ -379,6 +398,14 @@ nine, but its membership changed: CAT-12 left it — the events are observable
 after all — and CAT-13 entered for the typed, operational surface that genuinely
 does not exist. Two rows were added by splitting compound claims (S3-02a/b,
 CAT-12/13).
+
+**What moved in review round 2.** One row: **OPS-06**
+(`COMPLETED_IN_CODE_NOT_ACTIVATED` → `BLOCKED_EXTERNAL`). Its requirement is
+that a controlled production smoke *has been executed and accepted* — a
+statement about external history. Calling it "not activated" asserted
+non-occurrence from missing evidence, which is exactly the error the epistemic
+standard in §3 forbids. No other classification changed; round 2 was a wording
+pass over statements that had drifted from category 2 into category 1.
 
 ---
 
@@ -404,11 +431,13 @@ moves the aggregation into PostgreSQL with fixed ordering, server-owned page
 bounds, exact totals (including a COUNT ROW on an empty page) and three
 `collate "C"` indexes. The *proof* is bounded: `tests/test_migrations_postgres.py`
 exercises it against real PostgreSQL over snapshots of 140, 13, 233 and 1
-candidates. Nothing anywhere has run it over ~101 000 rows, and that migration's
-version is not recorded in the linked project's migration history (§2.3) —
-whether the functions and indexes exist there is unverified. So: bounded and
-indexed by construction, **unproven at real scale**, and of unknown
-availability in production until OPERATOR-0 reads it.
+candidates — the documented smaller fixtures, and the only scales this
+repository covers. **No accepted production record demonstrates execution at
+~101 000 rows**, and that migration's version is not recorded in the linked
+project's migration history (§2.3), so whether the functions and indexes exist
+there is unverified. So: bounded and indexed by construction, **unproven at
+real scale by any evidence available here**, and of unknown availability in
+production until OPERATOR-0 reads it.
 
 **3. Has a complete live Government capture ever been proven?** No — and note
 carefully what that does and does not assert. **No repository or accepted
@@ -616,11 +645,13 @@ code and its real caller:
 
 ---
 
-## 7. Code present but not activated
+## 7. Code present in the repository but not run from it
 
-"Not activated" here means *this repository does not run it*. Where the
-statement would be about the production database instead, it appears in §11 as
-an external unknown rather than here.
+The heading is deliberately not "not activated": every bullet below is a
+**category 1** repository fact about what this repository does and does not
+run. None of them claims anything about whether the corresponding operation has
+ever occurred in production — those statements live in §11 as external
+unknowns.
 
 - Government CKAN client, ingestion, refresh/diff and reconciliation — complete,
   tested, and **constructed only in tests**;
@@ -630,7 +661,9 @@ an external unknown rather than here.
 - database-side bounded aggregation and the canonical read model — code and SQL
   exist in the repository; their deployed state is unverified;
 - the Swarm V2 controlled production smoke — controller, env contract and
-  acceptance gate exist; no acceptance record exists anywhere in the repository;
+  acceptance gate exist in the repository, and no accepted production-smoke
+  record exists here or in the production records supplied to this audit
+  (OPS-06 keeps whether one was ever executed externally as unknown);
 - the F4/F5 surfaces, and with them the Run Inspector's raw event stream that is
   the only place a catalog promotion or refusal currently appears — built and
   tested, hidden behind an execution-UI flag that is off by default.
@@ -638,6 +671,10 @@ an external unknown rather than here.
 ---
 
 ## 8. Fixture-only or test-only capabilities
+
+What follows describes **the evidence available to this audit**, not the
+history of the production system: "proven only against a fixture" means no
+stronger proof exists here, not that nothing stronger ever happened elsewhere.
 
 - every catalog and Government test reads the committed R5 capture
   (`q=RAV4&limit=100`, offsets 0/100/200, 233 rows) through a manifest checksum
@@ -666,7 +703,7 @@ The nine rows classified `MISSING`, by severity.
 | CAT-13 | Typed recognition and an operational signal for a promotion or refusal | **High** | both events are outside every typed vocabulary, so there is no projection, metric, alert or operator-facing status. They ARE readable as raw developer telemetry in the Run Inspector (CAT-12), which is why this row is about signalling rather than visibility |
 | CAT-10 | Any operator or product read/approval surface for the canonical catalog | Medium | nobody can inspect, review or use what promotion produces |
 | S3-17 | A production targeted-Web research capability | Medium | the Government-first policy directs the Commander to research gaps with no capability that can turn research into evidence |
-| S2-10 | Any producer of a bounded `legacy_reference` side | Low | reconciliation has one input and can never run |
+| S2-10 | Any producer of a bounded `legacy_reference` side | Low | no code in this repository creates a `legacy_reference` snapshot, so reconciliation has one input and cannot run meaningfully from here |
 | OPS-09 | Catalog/Swarm/frontend rows in `FINAL_ACCEPTANCE.md` | Low | the authoritative classification set silently omits four merged stages |
 
 Two rows are deliberately **not** in this list, and the distinction is the point
@@ -777,9 +814,11 @@ authorized operator:
 4. **The Swarm V2 smoke cannot be accepted while reservation `8b05de80-…` is
    dangling**, and its acceptance contract predates the registration of a
    production tool.
-5. **Scale is unmeasured.** The database-side aggregation is proven over
-   hundreds of rows, not over 101 000; index and plan behaviour at real scale is
-   unknown until a usable snapshot exists and is queried.
+5. **Scale is unmeasured by any evidence available here.** The database-side
+   aggregation is proven over the documented fixtures of hundreds of rows, and
+   no accepted production record demonstrates it at ~101 000. Index and plan
+   behaviour at that scale stays unknown until a snapshot of that size is
+   observed and queried.
 6. **Expansion metrics are unobtainable** (handoff §9.3) until a capture exists,
    so no gate on verified rate, ambiguity rate or cost per 1 000 candidates can
    be evaluated yet.
@@ -946,7 +985,34 @@ corrected above:
 
 Totals were recomputed by parsing the matrix, not by hand: 82 rows became 84.
 
-**Both revisions.**
+**Revision 3 (review round 2).** A second review found that, having fixed the
+three blockers, the document still carried unsupported absolutes about
+production and external history — statements that contradicted its own
+`BLOCKED_EXTERNAL` conclusion. Each said that something had *never happened*
+where the honest claim was that *no accepted record demonstrates it*. The
+standard now stated in §3 was added, and every such statement was rewritten:
+
+| Row | Was | Now |
+| --- | --- | --- |
+| S1-17 | "a real restart has never been observed" | no repository evidence or accepted production record demonstrates one |
+| S3-03 | "not activated" / "never exercised against live pagination" | no production caller in the repository; no accepted record of a live paginated capture; external execution unverified |
+| S3-05 | "no rows exist" | the target database's row state is unknown (S3-02b) and is read by OPERATOR-0 |
+| S3-08 | "neither resource has been synced" | no supported repository entrypoint and no accepted record demonstrates a sync; contents unknown |
+| S3-11 + §5 Q2 | "never run over ~101 000 rows anywhere" / "nothing anywhere has run it" | repository tests cover the documented smaller fixtures; no accepted record demonstrates that scale |
+| S3-16 | "never run in production" / "has never executed against live data" | the repository and accepted records demonstrate fixture/offline execution only; an unrecorded external execution is not established either way |
+| FE-10 | "never run" | no accepted operator record demonstrates the live-browser pass was run |
+| OPS-06 | "the smoke has never been run" | no accepted production-smoke record exists here or in supplied production records — **and the row is reclassified `BLOCKED_EXTERNAL`** |
+| §7 heading | "Code present but not activated" | "Code present in the repository but not run from it" |
+| S1-12, S2-10 | bare absolutes | the same facts, with the code evidence that makes them true |
+
+Absolute wording was deliberately **kept** wherever a code search or a contract
+makes it true — "`DataGovClient(` appears only under `tests/`", "no production
+caller exists in the repository", "a `legacy_reference` snapshot can never carry
+a verdict", "`koah_sus` is never mapped to horsepower", "promotion is never a
+tool". Those are category 1, and weakening them would make the audit less
+accurate, not more careful.
+
+**All three revisions.**
 
 No code, test, migration, schema, workflow, dependency, configuration value,
 deployment file or activation flag was changed. No migration was applied. No
