@@ -252,3 +252,197 @@ It intentionally preserves the distinction between:
 - **what the later independent authorized production inspection proved** — exact target verified, migration tail absent in both history and schema, producing the final `NORMAL_ORDERED_APPLY_CANDIDATE` classification.
 
 This PR is documentation-only and contains no code, migration or configuration changes.
+
+---
+
+## 14. Post-PR #96 Verification
+
+A short, independent, **read-only** re-verification performed after PR #96 merged, to establish
+whether the *corrected* migration-state tooling — run as a tool, against fresh Production reads —
+reaches the same conclusion the earlier manual inspection (§3–§4, §10) reached through a separate
+channel. This is a verification pass, not a full OPERATOR-0 rerun: §1–§13 above are preserved
+unchanged as the original inspection record.
+
+`No production mutation occurred during this verification.`
+
+### 14.1 Repository state
+
+| Item | Value |
+| --- | --- |
+| Repository | `giladscore494/milo-agent-workspace` |
+| Verified `main` SHA | `c6fe271dde5f818788c97baef15fa83356c87f07` |
+| Obtained by | fresh `git fetch origin main` |
+| PR #96 | **merged**; `main` is its merge commit |
+| Migration-state fixes present | `scripts/release/check-migration-state.sh`, `scripts/release/migration_state.py`, `docs/production-readiness/MIGRATIONS.md` |
+| Code changed by this verification | none — read-only; this report is the only file touched |
+
+The §1 inspection above was taken at `9af24c3c…`; `main` has since advanced through PR #95 and
+PR #96. The complete local migration set was therefore re-derived from the current `main` rather
+than carried over.
+
+### 14.2 Corrected classifier used
+
+The classification below is **not** a hand judgement. It is the output of the corrected helper
+merged in PR #96, run offline against the current repository:
+
+```
+python3 scripts/release/migration_state.py local    --migrations-dir supabase/migrations
+python3 scripts/release/migration_state.py markers  --migrations-dir supabase/migrations
+python3 scripts/release/migration_state.py classify --migrations-dir supabase/migrations \
+        --observation <observation file outside the repository>
+```
+
+This is the classifier whose authoritative comparison is the **complete local migration set**
+(3-digit and 14-digit alike) against `supabase_migrations.schema_migrations` — the correction for
+the marker-only false green recorded in §8.1. It is the defect-fixed tool that §10 required to be
+corrected before any apply action, now exercised against real Production reads.
+
+| Local derivation | Value |
+| --- | --- |
+| Total local migrations at `c6fe271` | **34** |
+| Ordering | validated, unique, strictly ordered; no malformed or duplicate version |
+| Marker probe plan | **27** stable markers (7 migrations correctly carry no marker) |
+
+### 14.3 Fresh Production migration history
+
+Read through the `Supabase — MILO Production Read-Only` connector only. The concrete Production
+project reference is intentionally **not** committed to this repository.
+
+The history relation `supabase_migrations.schema_migrations` was confirmed to exist and its rows
+were read successfully — a completed read, not an assumed-empty one.
+
+| Observation | Value |
+| --- | --- |
+| Applied versions recorded | **25** |
+| Applied history ends at | `20260823000100` |
+| Public relations | **26** |
+| Legacy baseline tables present | all four (`conversations`, `messages`, `runs`, `run_events`) |
+| Relations with no matching local migration | none |
+| Marker probes attempted / answered | **27 / 27** |
+| Failed probes | **0** — the inspection completed, so classification is permitted |
+
+The applied set is exactly the first 25 versions of the local sequence, in order: `001`–`015`,
+then `20260706192500`, `20260810000100`, `20260810000200`, `20260810000300`, `20260810000400`,
+`20260810000500`, `20260810000600`, `20260818000100`, `20260818000200`, `20260823000100`.
+
+### 14.4 Fresh classifier result
+
+| Field | Value |
+| --- | --- |
+| `state` | **`partially-migrated`** |
+| `blocked` | **`false`** |
+| `applied_count` / `local_total` | **25 / 34** |
+| `missing_count` | **9** |
+| `unexpected` | *(empty)* |
+| `marker_disagreements` | *(empty)* |
+| `summary` | `25 of 34 local migrations applied; 9 pending` |
+
+The applied history is a clean ordered **prefix** of the local sequence — no gap, no out-of-order
+record, no duplicate row, and no remote version without a local file. Every marker belonging to an
+applied migration was observed **present**, so the tool reports no history↔object disagreement.
+
+This is the corrected tool's equivalent of `NORMAL_ORDERED_APPLY_CANDIDATE`: a contiguous pending
+tail over an otherwise coherent database.
+
+### 14.5 Missing migrations (fresh)
+
+The nine pending migrations, in canonical apply order:
+
+1. `20260828000100_canonical_scope_conflict_identity.sql`
+2. `20260828000200_source_evidence_fragments.sql`
+3. `20260902000100_r3_versioned_focused_evidence.sql`
+4. `20260907000100_r4_deterministic_verification.sql`
+5. `20260914200000_catalog_evidence_foundation.sql`
+6. `20260915120000_catalog_integrity_corrections.sql`
+7. `20260915180000_catalog_raw_record_source_locator.sql`
+8. `20260916090000_catalog_bounded_candidate_queries.sql`
+9. `20260916120000_catalog_field_level_promotion.sql`
+
+Identical to the nine recorded in §3 — same versions, same order, same filenames.
+
+### 14.6 Representative schema confirmation
+
+Purpose: distinguish a **normal missing tail** from a **migration-history / schema disagreement**.
+Per §6 of the verification brief, the full function/RLS/security audit of §6 and §9 was **not**
+repeated; no fresh evidence contradicted it.
+
+**Catalog surface — all absent.** The public schema contains **zero** `catalog%` relations.
+
+| Object | Present |
+| --- | --- |
+| `catalog_source_snapshots` | **absent** |
+| `catalog_raw_records` | **absent** |
+| `catalog_candidate_variants` | **absent** |
+| `catalog_candidate_evidence_links` | **absent** |
+| `catalog_models` | **absent** |
+| `catalog_model_variants` | **absent** |
+| `catalog_canonical_field_provenance` | **absent** |
+| `catalog_canonical_field_current` | **absent** |
+| `catalog_canonical_variant_current` | **absent** |
+
+**R3/R4 representative changes — all absent**, while their base tables exist:
+
+| Migration | Representative object | Present |
+| --- | --- | --- |
+| `20260828000100` | column `claims.canonical_scope_hash` | **absent** |
+| `20260828000100` | column `claims.scope_normalization_version` | **absent** |
+| `20260828000200` | table `source_evidence_fragments` | **absent** |
+| `20260828000200` | function `record_evidence_fragment_guarded` | **absent** |
+| `20260828000200` | function `forbid_evidence_fragment_mutation` | **absent** |
+| `20260902000100` | column `sources.source_version_kind` | **absent** |
+| `20260902000100` | column `sources.source_version_id` | **absent** |
+| `20260902000100` | column `claims.evidence_locator` | **absent** |
+| `20260902000100` | functions `r3_source_version_valid`, `r3_canonical_locator`, `r3_focus_valid` | **absent** |
+| `20260907000100` | column `claims.identity_scope` | **absent** |
+| `20260907000100` | tables `claim_verdicts`, `claim_verdict_supports`, `conflict_resolutions` | **absent** |
+| `20260907000100` | functions `r4_identity_scope_valid`, `record_claim_verdict_guarded`, `record_conflict_resolution_guarded`, `forbid_verification_mutation` | **absent** |
+| `20260916090000` | function `catalog_snapshot_candidate_diff` | **absent** |
+
+Base tables `claims` and `sources` **are** present, and `sources.evidence_key` — introduced by the
+last applied migration `20260823000100` — **is** present. The absences above are therefore genuine
+missing columns on existing tables, not an artefact of a missing parent table.
+
+**In-place redefinitions behave exactly as a missing tail predicts.** Three functions the pending
+tail would `create or replace` are present in Production: `create_conflict_guarded`,
+`upsert_source_guarded` and `create_claim_with_source_guarded`. All three were **first created by
+`20260823000100_lease_guarded_evidence_writes.sql`**, which *is* applied. Their installed
+definitions were inspected and contain **none** of the tokens the pending versions introduce — no
+`canonical_scope_hash`, no `source_version_kind`, no call to `r3_canonical_locator`. They are the
+pre-tail definitions. This is also why the classifier correctly assigns them no marker: a migration
+that only redefines an existing function in place has no stable unique object to probe.
+
+### 14.7 Verdict
+
+| Question | Result |
+| --- | --- |
+| Does the corrected tooling independently reproduce the earlier finding? | **YES** |
+| History applied through `20260823000100`? | **YES** |
+| Exactly nine migrations missing afterward? | **YES** |
+| Corresponding late schema objects absent? | **YES** |
+| Any history↔schema disagreement? | **NO** |
+| Any migration applied without a history row, or vice versa? | **NO** |
+| Previous §10 conclusion | **CONFIRMED — not contradicted** |
+
+**`CONFIRMED — NORMAL_ORDERED_APPLY_CANDIDATE`**
+
+The conclusion §10 reached through a separate manual channel is now reproduced by the corrected,
+unit-tested tooling reading Production directly. The §11 requirement that OPERATOR-0 be refreshed
+against the corrected tooling is satisfied for the migration-state question.
+
+This remains **not authorization to apply migrations.** Nothing was applied.
+
+### 14.8 Non-actions during this verification
+
+- no migration was applied, repaired, reconciled or marked;
+- no migration history was modified;
+- no DDL or DML was executed — every statement issued was a `SELECT` against
+  `information_schema`, `pg_proc`/`pg_namespace`, or `supabase_migrations.schema_migrations`;
+- no application row was read for content, inserted, updated or deleted;
+- no mutating RPC was invoked;
+- the `Supabase — MILO Staging` connector was **not** used;
+- no deploy, no execution flag, no Government capture, no MILO/Swarm run, no paid model or
+  provider call;
+- no change to Supabase, GCP, Vercel, Redis, IAM or any configuration;
+- `test_websearch.py` was not run;
+- the temporary observation file was written outside the repository and is not committed;
+- the concrete Production project reference is not recorded in this repository.
