@@ -45,6 +45,35 @@ def workflow_text() -> str:
     return WORKFLOW.read_text()
 
 
+def job_header() -> str:
+    """Everything from the job declaration down to its first step.
+
+    This is exactly the region a job-level `env:` lives in. GitHub materialises
+    a job-level `env:` into the environment of EVERY step, so a credential
+    declared here is present before the authorization gate runs.
+    """
+    text = workflow_text()
+    return text.split("  deploy-supabase-migrations:", 1)[1].split("    steps:", 1)[0]
+
+
+def step_block(name: str) -> str:
+    """The YAML block of one step, from its `- name:` to the next step's."""
+    steps = workflow_text().split("    steps:", 1)[1]
+    start = steps.index(f"- name: {name}")
+    rest = steps[start + 1 :]
+    end = rest.find("\n      - name: ")
+    return steps[start:] if end == -1 else steps[start : start + 1 + end]
+
+
+def secret_names(block: str) -> set[str]:
+    """Names bound to a `secrets.*` expression inside a block."""
+    return {
+        line.split(":", 1)[0].strip()
+        for line in block.splitlines()
+        if "${{ secrets." in line and ":" in line
+    }
+
+
 # ---------------------------------------------------------------------------
 # static: the gate exists, and it runs before anything can reach production
 # ---------------------------------------------------------------------------
@@ -92,6 +121,117 @@ def test_gate_fails_closed_rather_than_skipping():
     assert 'if [ "${GITHUB_SHA}" != "${EXPECTED_SHA_INPUT}" ]' in gate
     # The gate is scoped to manual dispatch, leaving push behaviour untouched.
     assert "github.event_name == 'workflow_dispatch'" in gate
+
+
+PRODUCTION_SECRETS = (
+    "SUPABASE_ACCESS_TOKEN",
+    "SUPABASE_DB_PASSWORD",
+    "SUPABASE_PROJECT_ID",
+)
+
+
+def test_no_production_secret_is_declared_at_job_scope():
+    """A job-level `env:` reaches every step, including the gate.
+
+    Declaring the Supabase credentials there puts them in front of an
+    unauthorized dispatch even when no step reads them -- which is the
+    boundary this workflow claims to hold. They belong on individual steps.
+    """
+    header = job_header()
+
+    assert "secrets." not in header, (
+        "no production credential may be declared at job scope; "
+        "a job-level env: is materialised into every step's environment"
+    )
+    for name in PRODUCTION_SECRETS:
+        assert f"{name}: ${{{{ secrets.{name} }}}}" not in header
+
+    # The two non-credential values may stay at job scope.
+    assert "SUPABASE_MIGRATIONS_AUTO_APPLY" in header
+    assert "SAFE_FAILURE_MESSAGE" in header
+
+
+def test_no_production_secret_appears_anywhere_before_the_gate():
+    """The strongest form of the claim, and the cheapest to keep true.
+
+    Because a job-level `env:` is textually above `steps:`, a single ordering
+    assertion over the whole file covers both the job block and any step that
+    might later be inserted ahead of the gate.
+    """
+    text = workflow_text()
+    gate = text.index(GATE_STEP)
+
+    assert "secrets." not in text[:gate], (
+        "a production credential is introduced before the authorization gate"
+    )
+    # ...and they really are used later, so the assertion above is not vacuous.
+    assert "secrets." in text[gate:]
+
+
+def test_authorization_gate_receives_only_the_three_dispatch_inputs():
+    block = step_block(GATE_STEP)
+    env = block.split("env:", 1)[1].split("run:", 1)[0]
+    bound = {line.split(":", 1)[0].strip() for line in env.splitlines() if ":" in line}
+
+    assert bound == {"EXPECTED_SHA_INPUT", "MODE_INPUT", "CONFIRMATION_INPUT"}
+    assert secret_names(block) == set()
+    assert "secrets." not in block
+
+
+@pytest.mark.parametrize(
+    ("step", "required"),
+    [
+        (SECRETS_STEP, {"SUPABASE_ACCESS_TOKEN", "SUPABASE_DB_PASSWORD", "SUPABASE_PROJECT_ID"}),
+        (LINK_STEP, {"SUPABASE_ACCESS_TOKEN", "SUPABASE_DB_PASSWORD", "SUPABASE_PROJECT_ID"}),
+        ("Display remote migration history", {"SUPABASE_ACCESS_TOKEN", "SUPABASE_DB_PASSWORD"}),
+        ("Run mandatory production dry-run preflight", {"SUPABASE_ACCESS_TOKEN", "SUPABASE_DB_PASSWORD"}),
+        (APPLY_STEP, {"SUPABASE_ACCESS_TOKEN", "SUPABASE_DB_PASSWORD"}),
+        ("Display remote migration history after apply", {"SUPABASE_ACCESS_TOKEN", "SUPABASE_DB_PASSWORD"}),
+    ],
+)
+def test_production_steps_still_receive_the_credentials_they_need(step, required):
+    """Scoping the secrets down must not starve the Supabase CLI.
+
+    Each of these steps is a separate process: linking earlier does not carry
+    the access token or database password into a later one. Anything a step's
+    script names must be in that step's own environment.
+    """
+    block = step_block(step)
+    assert secret_names(block) == required
+
+    # Whatever the script dereferences must actually be bound in the step.
+    body = block.split("run:", 1)[1]
+    for name in PRODUCTION_SECRETS:
+        if f"${name}" in body or f"${{{name}}}" in body:
+            assert name in required, f"{step} dereferences {name} without binding it"
+
+
+def test_dry_run_and_apply_carry_an_identical_credential_environment():
+    """So the dry-run is a genuine canary for the apply.
+
+    If this scoping were ever insufficient, the preflight fails first and
+    nothing is pushed -- which is only true while the two environments match.
+    """
+    assert secret_names(step_block("Run mandatory production dry-run preflight")) == secret_names(
+        step_block(APPLY_STEP)
+    )
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "Checkout repository",
+        GATE_STEP,
+        "Set up Python",
+        "Validate repository migrations",
+        CLI_STEP,
+        "Report push dry-run-only bootstrap state",
+        "Report manual dry-run completion",
+    ],
+)
+def test_unrelated_steps_receive_no_production_credential(step):
+    assert secret_names(step_block(step)) == set()
+    assert "secrets." not in step_block(step)
 
 
 def test_gate_consults_no_repository_or_environment_variable():

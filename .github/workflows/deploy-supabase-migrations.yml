@@ -39,10 +39,14 @@ jobs:
     name: Deploy Supabase Migrations
     runs-on: ubuntu-latest
     environment: production
+    # NO production credential is declared at job scope. A job-level `env:`
+    # is materialised into EVERY step's environment, including checkout and
+    # the authorization gate -- so declaring the Supabase secrets here would
+    # put them in front of an unauthorized dispatch even though no step reads
+    # them, contradicting the boundary this workflow claims. Each secret is
+    # therefore attached to the individual steps that need it, all of which
+    # run after the gate. Neither value below is a credential.
     env:
-      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
-      SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
       SUPABASE_MIGRATIONS_AUTO_APPLY: ${{ vars.SUPABASE_MIGRATIONS_AUTO_APPLY }}
       SAFE_FAILURE_MESSAGE: >-
         The production schema may already contain objects that are not recorded in Supabase migration history.
@@ -53,11 +57,18 @@ jobs:
         uses: actions/checkout@v4
 
       # The manual authorization gate. It runs FIRST -- before the Supabase CLI
-      # exists, before any secret is read and before the project is linked -- so
-      # a dispatch that is not explicitly authorized for THIS commit can never
-      # reach a mutation-capable action. A backup taken from one SHA must never
-      # be able to authorize migrations from another, which is exactly the
-      # pattern .github/workflows/backup-supabase-production.yml already uses.
+      # exists, before any production credential is present in ANY step
+      # environment, and before the project is linked -- so a dispatch that is
+      # not explicitly authorized for THIS commit can never reach a
+      # mutation-capable action, and an unauthorized dispatch is refused
+      # without the credentials ever being materialised on the runner. A
+      # backup taken from one SHA must never be able to authorize migrations
+      # from another, which is exactly the pattern
+      # .github/workflows/backup-supabase-production.yml already uses.
+      #
+      # This step's `env:` is deliberately exhaustive: the three dispatch
+      # inputs and nothing else. See the note on the job-level `env:` above
+      # for why no credential may be declared at job scope.
       #
       # Every gate fails CLOSED with a nonzero exit; none of them is expressed
       # as a step-level `if:`, because a false `if:` SKIPS a step (a green run)
@@ -104,8 +115,21 @@ jobs:
         with:
           version: 2.31.8
 
+      # From here down, and only from here down, production credentials exist
+      # in a step environment. Every step below runs after the gate above.
+      #
+      # SUPABASE_PROJECT_ID is supplied only to the two steps whose scripts
+      # name it. Once `supabase link` has run, the CLI resolves the project
+      # from `supabase/.temp/` in the workspace rather than the environment,
+      # so the later commands do not need it. If that were ever wrong, the
+      # dry-run preflight -- which carries exactly the same environment as the
+      # apply step -- fails first and nothing is pushed.
       - name: Verify required Supabase secrets are configured
         shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
         run: |
           set -euo pipefail
           missing=0
@@ -123,12 +147,19 @@ jobs:
 
       - name: Link production Supabase project
         shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
         run: |
           set -euo pipefail
           supabase link --project-ref "$SUPABASE_PROJECT_ID"
 
       - name: Display remote migration history
         shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
           set -euo pipefail
           if ! supabase migration list; then
@@ -138,6 +169,9 @@ jobs:
 
       - name: Run mandatory production dry-run preflight
         shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
           set -euo pipefail
           if ! supabase db push --linked --dry-run; then
@@ -162,6 +196,9 @@ jobs:
       - name: Apply production migrations
         if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'apply' && inputs.confirmation == 'APPLY_PRODUCTION_MIGRATIONS' && inputs.expected_sha == github.sha) || (github.event_name == 'push' && vars.SUPABASE_MIGRATIONS_AUTO_APPLY == 'true') }}
         shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
           set -euo pipefail
           supabase db push --linked
@@ -169,6 +206,9 @@ jobs:
       - name: Display remote migration history after apply
         if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'apply' && inputs.confirmation == 'APPLY_PRODUCTION_MIGRATIONS' && inputs.expected_sha == github.sha) || (github.event_name == 'push' && vars.SUPABASE_MIGRATIONS_AUTO_APPLY == 'true') }}
         shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
         run: |
           set -euo pipefail
           if ! supabase migration list; then
