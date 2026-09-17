@@ -118,7 +118,9 @@ INVENTORY=(
   "CLOUD_RUN_AUTH_MODE|local-test-only|no|frontend/lib/server/cloudRunAuth.ts"
   "MILO_E2E_INPROCESS_WORKER|local-test-only|no|backend/production_config.py"
   "MILO_WORKER_ENGINE|local-test-only|no|backend/production_config.py"
-  "MILO_EXPECTED_SUPABASE_PROJECT_REF|staging-only|no|backend/production_config.py"
+  # Required in production AND in staging: each pins its runtime to one
+  # Supabase project and fails startup closed on any other.
+  "MILO_EXPECTED_SUPABASE_PROJECT_REF|shared-api-worker|no|backend/production_config.py"
   "MILO_EXPECTED_REDIS_HOST|staging-only|no|backend/production_config.py"
   "MILO_REQUIRE_PG_TESTS|local-test-only|no|tests/test_migrations_postgres.py"
   "NEXT_PUBLIC_API_URL|deprecated|no|.github/workflows/ci.yml"
@@ -330,6 +332,63 @@ else
     record_check BLOCKED "gateway-auth" "MILO_GATEWAY_AUDIENCE and MILO_APPROVED_GATEWAY_IDENTITIES are required; the API fails closed (503) without them"
   else
     record_check PASS "gateway-auth" "gateway audience and identity allowlist configured"
+  fi
+
+  # Supabase target pin. Production must declare the project it is allowed to
+  # talk to, and the supplied SUPABASE_URL must be that project's hosted URL.
+  # Neither value is ever printed — only the verdict.
+  #
+  # supabase_url_is_hosted_root URL EXPECTED_HOST — success ONLY for the
+  # project's API base URL:
+  #
+  #     https://<EXPECTED_HOST>      https://<EXPECTED_HOST>/
+  #
+  # This mirrors supabase_url_matches_project_ref() in
+  # backend/production_config.py component for component. The checker must
+  # never accept a URL the runtime would refuse, so it does not extract a
+  # hostname and compare that: matching the host alone would pass
+  # `…supabase.co/evil`, `…?foo=bar`, `…#x`, `…:444` and `…:bad`, none of
+  # which are a usable base URL for the expected project.
+  supabase_url_is_hosted_root() {
+    local url="${1:-}" expected_host="${2:-}" rest authority
+    [[ -n "${expected_host}" ]] || return 1
+    # Scheme must be https (case-insensitive), nothing else.
+    [[ "${url,,}" == https://* ]] || return 1
+    rest="${url:8}"
+    # A query or a fragment anywhere disqualifies the value.
+    if [[ "${rest}" == *"?"* || "${rest}" == *"#"* ]]; then
+      return 1
+    fi
+    authority="${rest%%/*}"
+    # Only the bare authority, or the authority plus one trailing slash.
+    case "${rest}" in
+      "${authority}" | "${authority}/") ;;
+      *) return 1 ;;
+    esac
+    # The authority is compared WHOLE, so userinfo, an explicit port (valid
+    # or malformed) and a stray trailing colon all fail here rather than
+    # being stripped away into a matching hostname.
+    [[ "${authority,,}" == "${expected_host}" ]]
+  }
+
+  if [[ "${environment}" == "production" ]]; then
+    expected_ref="$(env_meta MILO_EXPECTED_SUPABASE_PROJECT_REF M)"
+    supabase_url="$(env_meta SUPABASE_URL M)"
+    if [[ -z "${expected_ref}" ]]; then
+      record_check BLOCKED "supabase-pin" "MILO_EXPECTED_SUPABASE_PROJECT_REF is required in production; without it the runtime cannot refuse a wrong Supabase project (PRODUCTION_DEPENDENCY_UNPINNED)"
+    elif is_placeholder "${expected_ref}"; then
+      record_check BLOCKED "supabase-pin" "MILO_EXPECTED_SUPABASE_PROJECT_REF is still a placeholder"
+    elif is_wildcard "${expected_ref}"; then
+      record_check BLOCKED "supabase-pin" "MILO_EXPECTED_SUPABASE_PROJECT_REF must be one explicit project ref; wildcards are forbidden"
+    elif [[ ! "${expected_ref}" =~ ^[a-z0-9]{20}$ ]]; then
+      record_check BLOCKED "supabase-pin" "MILO_EXPECTED_SUPABASE_PROJECT_REF is not a well-formed Supabase project ref (value not shown)"
+    elif [[ -z "${supabase_url}" ]]; then
+      record_check BLOCKED "supabase-pin" "SUPABASE_URL is required so the expected Supabase project ref can be verified"
+    elif ! supabase_url_is_hosted_root "${supabase_url}" "${expected_ref}.supabase.co"; then
+      record_check BLOCKED "supabase-pin" "SUPABASE_URL is not the hosted root URL of the expected production Supabase project ref; a path, query, fragment, port or embedded credential is refused (values not shown)"
+    else
+      record_check PASS "supabase-pin" "production is pinned to its expected Supabase project and SUPABASE_URL matches it (values not shown)"
+    fi
   fi
 
   # Gateway and worker identities must not overlap.

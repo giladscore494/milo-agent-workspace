@@ -338,7 +338,10 @@ def test_apply_rejects_wrong_account_and_project(mock_bin, tmp_path):
 def _env_file(tmp_path: Path, **overrides) -> Path:
     base = {
         "ENVIRONMENT": "production",
-        "SUPABASE_URL": "https://abcd1234.supabase.co",
+        # A synthetic 20-character Supabase project ref and its matching hosted
+        # URL. The real production ref is operator configuration, never here.
+        "SUPABASE_URL": "https://abcdefghijklmnopqrst.supabase.co",
+        "MILO_EXPECTED_SUPABASE_PROJECT_REF": "abcdefghijklmnopqrst",
         "SUPABASE_SERVICE_ROLE_KEY": "metadata-present",
         "ALLOWED_CORS_ORIGINS": "https://milo.example-workspace.app",
         "MILO_GATEWAY_AUDIENCE": "https://milo-api.a.run.app",
@@ -666,3 +669,147 @@ def test_all_release_scripts_have_help_and_strict_mode():
         result = run_script(script.name, "--help")
         assert result.returncode == 0, f"{script.name} --help failed"
         assert "Usage:" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# production Supabase target pinning (check-production-config.sh)
+# ---------------------------------------------------------------------------
+# The inventory used to describe MILO_EXPECTED_SUPABASE_PROJECT_REF as
+# staging-only, so a production environment audit passed with no pin at all —
+# exactly the configuration that lets a production runtime point at the wrong
+# Supabase project. The checker now requires it and verifies SUPABASE_URL
+# against it, without ever printing either value.
+
+PIN_VAR = "MILO_EXPECTED_SUPABASE_PROJECT_REF"
+APPROVED_REF = "abcdefghijklmnopqrst"
+OTHER_REF = "zyxwvutsrqponmlkjihg"
+
+
+def test_inventory_no_longer_calls_the_supabase_pin_staging_only():
+    text = (REPO / "scripts" / "release" / "check-production-config.sh").read_text()
+    assert f'"{PIN_VAR}|staging-only|' not in text
+    assert f'"{PIN_VAR}|shared-api-worker|no|backend/production_config.py"' in text
+
+
+def test_production_metadata_with_a_matching_pin_passes(tmp_path):
+    result = run_script("check-production-config.sh", "--env-file", str(_env_file(tmp_path)))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[PASS] supabase-pin" in result.stdout
+
+
+def test_production_metadata_without_the_pin_is_blocked(tmp_path):
+    env_file = _env_file(tmp_path)
+    env_file.write_text(
+        "".join(line + "\n" for line in env_file.read_text().splitlines() if not line.startswith(f"{PIN_VAR}="))
+    )
+    result = run_script("check-production-config.sh", "--env-file", str(env_file))
+
+    assert result.returncode != 0
+    assert "[BLOCKED] supabase-pin" in result.stdout
+    assert "is required in production" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("pin", "url", "reason"),
+    [
+        ("not-a-ref", f"https://{APPROVED_REF}.supabase.co", "not a well-formed"),
+        ("ABCDEFGHIJKLMNOPQRST", f"https://{APPROVED_REF}.supabase.co", "not a well-formed"),
+        ("".join(["*"]), f"https://{APPROVED_REF}.supabase.co", "wildcards are forbidden"),
+        ("<SUPABASE_PROJECT_REF>", f"https://{APPROVED_REF}.supabase.co", "still a placeholder"),
+    ],
+)
+def test_production_metadata_with_a_malformed_pin_is_blocked(tmp_path, pin, url, reason):
+    env_file = _env_file(tmp_path, **{PIN_VAR: pin, "SUPABASE_URL": url})
+    result = run_script("check-production-config.sh", "--env-file", str(env_file))
+
+    assert result.returncode != 0
+    assert "[BLOCKED] supabase-pin" in result.stdout
+    assert reason in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# the checker and the runtime must accept exactly the same URL shape
+# ---------------------------------------------------------------------------
+# The release checker is what an operator runs BEFORE deploying. If it accepts
+# a URL the runtime will refuse, the deployment fails at startup; if it accepts
+# one the runtime would wrongly allow, the pin is not pinning anything. Either
+# way the two must not drift, so the same URLs are run through both and the
+# verdicts compared — rather than each side being spot-checked on its own.
+SUPABASE_URL_CASES = [
+    pytest.param(f"https://{APPROVED_REF}.supabase.co", True, id="root"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/", True, id="root-trailing-slash"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/evil", False, id="path"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/rest/v1", False, id="api-path"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co?foo=bar", False, id="query"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/?foo=bar", False, id="root-query"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/?", False, id="empty-query"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co#fragment", False, id="fragment"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/#fragment", False, id="root-fragment"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co:444", False, id="explicit-port"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co:443", False, id="default-port-explicit"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co:bad", False, id="malformed-port"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co:", False, id="empty-port"),
+    pytest.param(f"https://user@{APPROVED_REF}.supabase.co", False, id="userinfo"),
+    pytest.param(f"https://user:pw@{APPROVED_REF}.supabase.co", False, id="credentials"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co.evil.test", False, id="suffix-smuggling"),
+    pytest.param(f"https://evil.test/{APPROVED_REF}.supabase.co", False, id="ref-in-path"),
+    pytest.param(f"https://{APPROVED_REF}.pooler.supabase.com", False, id="pooler"),
+    pytest.param(f"postgresql://user@{APPROVED_REF}.supabase.co:5432/postgres", False, id="postgresql"),
+    pytest.param(f"http://{APPROVED_REF}.supabase.co", False, id="http"),
+    pytest.param(f"https://{OTHER_REF}.supabase.co", False, id="other-project"),
+    pytest.param("https://db.internal.example", False, id="not-supabase"),
+]
+
+
+@pytest.mark.parametrize(("url", "accepted"), SUPABASE_URL_CASES)
+def test_the_checker_accepts_exactly_the_urls_the_runtime_accepts(tmp_path, url, accepted):
+    from backend.production_config import supabase_url_matches_project_ref
+
+    env_file = _env_file(tmp_path, **{PIN_VAR: APPROVED_REF, "SUPABASE_URL": url})
+    result = run_script("check-production-config.sh", "--env-file", str(env_file))
+    checker_accepted = "[PASS] supabase-pin" in result.stdout
+
+    assert supabase_url_matches_project_ref(url, APPROVED_REF) is accepted, url
+    assert checker_accepted is accepted, (
+        f"checker and runtime disagree on {url!r}: "
+        f"checker={'accept' if checker_accepted else 'reject'}, runtime={'accept' if accepted else 'reject'}"
+    )
+    if not accepted:
+        assert result.returncode != 0
+        assert "[BLOCKED] supabase-pin" in result.stdout
+
+
+def test_the_checker_never_prints_the_compared_supabase_values(tmp_path):
+    env_file = _env_file(tmp_path, **{PIN_VAR: APPROVED_REF, "SUPABASE_URL": f"https://{OTHER_REF}.supabase.co"})
+    report = tmp_path / "report.json"
+    result = run_script(
+        "check-production-config.sh", "--env-file", str(env_file), "--json-output", str(report)
+    )
+
+    assert result.returncode != 0
+    for stream in (result.stdout, result.stderr, report.read_text()):
+        assert APPROVED_REF not in stream
+        assert OTHER_REF not in stream
+    assert json.loads(report.read_text())["script"] == "check-production-config"
+
+
+def test_a_pinned_production_audit_enables_no_execution_flag(tmp_path):
+    result = run_script("check-production-config.sh", "--env-file", str(_env_file(tmp_path)))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "execution flag is enabled" not in result.stdout
+    for flag in (
+        "MILO_ENABLE_RUN_CREATION",
+        "MILO_ENABLE_PAID_EXECUTION",
+        "MILO_ENABLE_CATALOG_EXECUTION",
+        "GATEWAY_ALLOW_EXECUTION_ROUTES",
+    ):
+        assert f"[PASS] flag:{flag} — disabled" in result.stdout
+
+
+def test_staging_metadata_is_not_held_to_the_production_pin(tmp_path):
+    """The production pin must not start failing a staging audit."""
+    env_file = _env_file(tmp_path, ENVIRONMENT="staging")
+    result = run_script("check-production-config.sh", "--env-file", str(env_file))
+
+    assert "[BLOCKED] supabase-pin" not in result.stdout
