@@ -6,9 +6,21 @@ Status: migration content `COMPLETED_IN_CODE`; production application is
 workflow exists (`.github/workflows/deploy-supabase-migrations.yml`): on
 push to `main` it runs a dry-run preflight only (auto-apply requires the
 repository variable `SUPABASE_MIGRATIONS_AUTO_APPLY=true`, which must stay
-unset), and a manual `workflow_dispatch` apply additionally requires
-typing `APPLY_PRODUCTION_MIGRATIONS`. Pull-request CI never touches
-production.
+unset). A manual `workflow_dispatch` must always supply `expected_sha` —
+the full 40-character lowercase SHA of the reviewed commit — and the run
+refuses to continue unless `GITHUB_SHA` equals it. A manual **apply**
+additionally requires `mode=apply` and typing `APPLY_PRODUCTION_MIGRATIONS`;
+all four gates are checked before the Supabase CLI is installed and before the
+project is linked, and each one fails the run rather than skipping a step. No
+repository or environment variable can relax the manual SHA gate.
+
+The Supabase credentials are declared on the individual steps that use them,
+never at job scope, so an unauthorized dispatch is refused **before any
+production credential exists in a step environment at all** — a job-level
+`env:` would otherwise place them in front of the gate even though no step
+there reads them. `SUPABASE_PROJECT_ID` reaches only the two steps whose
+scripts name it; after `supabase link` the CLI resolves the project from the
+workspace. Pull-request CI never touches production.
 
 ## Order (apply strictly in this sequence)
 
