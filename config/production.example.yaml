@@ -25,6 +25,13 @@ identities:
   deploy_operator: "<OPERATOR_EMAIL>"
 
 supabase:
+  # Non-secret. This is the APPROVED production Supabase project, and it is
+  # the source of the deployment's MILO_EXPECTED_SUPABASE_PROJECT_REF binding
+  # on BOTH the API service and the worker job. The runtime refuses to start
+  # if it is absent, malformed, or if SUPABASE_URL is not this project's
+  # hosted https://<ref>.supabase.co URL — so a production deployment can
+  # never silently point at another Supabase project. Fill it in on your
+  # private copy only; the concrete ref never enters this repository.
   project_ref: "<SUPABASE_PROJECT_REF>"
 
 vercel:

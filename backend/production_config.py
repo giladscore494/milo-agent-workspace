@@ -15,13 +15,50 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Callable
+from urllib.parse import urlparse
 
 from backend.budget import BudgetConfig
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
+
+# A hosted Supabase project ref: 20 lowercase alphanumerics. The shape is
+# validated rather than trusted so a placeholder, a wildcard, a URL pasted
+# into the wrong variable or an empty-after-strip value can never become the
+# thing a production runtime pins itself to.
+SUPABASE_PROJECT_REF_PATTERN = re.compile(r"^[a-z0-9]{20}$")
+
+# The ONLY Supabase URL form this pin understands. Anything else — a custom
+# domain, a pooler host, a bare hostname, a direct database URL — cannot be
+# proven to belong to the expected project, so it fails closed rather than
+# being accepted on a substring match.
+SUPABASE_HOSTED_URL_SUFFIX = ".supabase.co"
+
+
+def supabase_url_matches_project_ref(supabase_url: str, expected_ref: str) -> bool:
+    """True only when `supabase_url` is the hosted URL of exactly `expected_ref`.
+
+    The whole URL is checked, not just its host. `https` is required, and any
+    embedded credential rejects the value outright: a
+    `postgresql://user@<ref>.supabase.co/postgres` connection string carries
+    the right host while being a different kind of endpoint entirely, and
+    accepting it would let the pin pass on a value the runtime cannot use.
+
+    Parsing is defensive: a malformed URL is a mismatch, never an exception
+    that escapes configuration validation. Neither argument is ever logged.
+    """
+    try:
+        parsed = urlparse(supabase_url)
+        host = (parsed.hostname or "").lower()
+        has_credentials = bool(parsed.username or parsed.password)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() != "https" or has_credentials:
+        return False
+    return bool(host) and host == f"{expected_ref.lower()}{SUPABASE_HOSTED_URL_SUFFIX}"
 
 
 class ProductionConfigError(RuntimeError):
@@ -170,24 +207,57 @@ def validate(env: dict[str, str] | None = None) -> ConfigReport:
     # a staging deployment must never be able to silently point at the
     # production Supabase or Redis environment. Values are never echoed.
     if (env.get("ENVIRONMENT") or "").strip().lower() == "staging":
-        from urllib.parse import urlparse
-
         expected_ref = (env.get("MILO_EXPECTED_SUPABASE_PROJECT_REF") or "").strip()
         supabase_url = (env.get("SUPABASE_URL") or "").strip()
         if not expected_ref:
             error("STAGING_DEPENDENCY_UNPINNED", "ENVIRONMENT=staging requires MILO_EXPECTED_SUPABASE_PROJECT_REF so the runtime refuses any non-staging Supabase project")
-        elif supabase_url:
-            host = (urlparse(supabase_url).hostname or "").lower()
-            if host != f"{expected_ref.lower()}.supabase.co":
-                error("STAGING_DEPENDENCY_MISMATCH", "SUPABASE_URL does not match the expected staging Supabase project ref (values not shown)")
+        elif supabase_url and not supabase_url_matches_project_ref(supabase_url, expected_ref):
+            error("STAGING_DEPENDENCY_MISMATCH", "SUPABASE_URL does not match the expected staging Supabase project ref (values not shown)")
         expected_redis_host = (env.get("MILO_EXPECTED_REDIS_HOST") or "").strip().lower()
         redis_url = (env.get("UPSTASH_REDIS_REST_URL") or "").strip()
         if not expected_redis_host:
             error("STAGING_DEPENDENCY_UNPINNED", "ENVIRONMENT=staging requires MILO_EXPECTED_REDIS_HOST so the runtime refuses any non-staging Redis endpoint")
         elif redis_url:
-            host = (urlparse(redis_url).hostname or "").lower()
+            try:
+                host = (urlparse(redis_url).hostname or "").lower()
+            except ValueError:
+                host = ""
             if host != expected_redis_host:
                 error("STAGING_DEPENDENCY_MISMATCH", "UPSTASH_REDIS_REST_URL host does not match the expected staging Redis host (values not shown)")
+
+    # 5f. Production must be pinned to its declared Supabase project, for the
+    # same reason staging is — and with the same deliberateness. Until now
+    # only staging carried this pin, so a production runtime handed the wrong
+    # SUPABASE_URL (a copy-paste, a stale secret version, a restored
+    # snapshot's project) would have started and written to it happily. The
+    # expected ref is non-secret operator configuration supplied by the
+    # approved release manifest (`supabase.project_ref`); it is never
+    # hard-coded here, and neither it nor the observed host is ever echoed.
+    if production:
+        expected_ref = (env.get("MILO_EXPECTED_SUPABASE_PROJECT_REF") or "").strip()
+        supabase_url = (env.get("SUPABASE_URL") or "").strip()
+        if not expected_ref:
+            error(
+                "PRODUCTION_DEPENDENCY_UNPINNED",
+                "ENVIRONMENT=production requires MILO_EXPECTED_SUPABASE_PROJECT_REF so the runtime refuses any non-production Supabase project",
+            )
+        elif not SUPABASE_PROJECT_REF_PATTERN.match(expected_ref):
+            error(
+                "PRODUCTION_DEPENDENCY_MALFORMED",
+                "MILO_EXPECTED_SUPABASE_PROJECT_REF is not a well-formed Supabase project ref (value not shown)",
+            )
+        elif not supabase_url:
+            # MISSING_BACKEND_SETTING already reports the absent URL; the pin
+            # adds that an absent URL can never satisfy it.
+            error(
+                "PRODUCTION_DEPENDENCY_UNPINNED",
+                "ENVIRONMENT=production requires SUPABASE_URL so the expected Supabase project ref can be verified",
+            )
+        elif not supabase_url_matches_project_ref(supabase_url, expected_ref):
+            error(
+                "PRODUCTION_DEPENDENCY_MISMATCH",
+                "SUPABASE_URL is not the hosted URL of the expected production Supabase project ref (values not shown)",
+            )
 
     # 6. Public execution UI cannot imply backend run creation.
     public_ui = _flag(env, "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI")

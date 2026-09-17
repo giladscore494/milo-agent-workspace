@@ -41,6 +41,9 @@ WORKER_SA = "milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
 DIGEST = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 GATEWAY_AUDIENCE = "https://milo-agent-api.mock.run.app"
 GATEWAY_IDENTITIES = "milo-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"
+# A synthetic 20-character Supabase project ref. The real production ref is
+# operator configuration from the approved manifest and is never in this repo.
+EXPECTED_SUPABASE_PROJECT_REF = "abcdefghijklmnopqrst"
 PROVIDER_KEYS = ("KIMI_API_KEY", "MOONSHOT_API_KEY")
 
 EXECUTION_FLAGS = (
@@ -169,6 +172,7 @@ def api_service_doc() -> dict:
         env_entry("ALLOWED_CORS_ORIGINS", "https://app.example.test"),
         env_entry("MILO_GATEWAY_AUDIENCE", GATEWAY_AUDIENCE),
         env_entry("MILO_APPROVED_GATEWAY_IDENTITIES", GATEWAY_IDENTITIES),
+        env_entry("MILO_EXPECTED_SUPABASE_PROJECT_REF", EXPECTED_SUPABASE_PROJECT_REF),
         *stage_a_flag_entries(),
         secret_entry("SUPABASE_URL", "SUPABASE_URL"),
         secret_entry("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SECRET_KEY"),
@@ -193,6 +197,7 @@ def worker_job_doc() -> dict:
         env_entry("ENVIRONMENT", "production"),
         env_entry("GCP_PROJECT_ID", PROJECT),
         env_entry("GCP_REGION", REGION),
+        env_entry("MILO_EXPECTED_SUPABASE_PROJECT_REF", EXPECTED_SUPABASE_PROJECT_REF),
         *stage_a_flag_entries(),
         secret_entry("SUPABASE_URL", "SUPABASE_URL"),
         secret_entry("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_SECRET_KEY"),
@@ -276,6 +281,7 @@ class Deployment:
                 "ALLOWED_CORS_ORIGINS": "https://app.example.test,https://admin.example.test",
                 "MILO_GATEWAY_AUDIENCE": GATEWAY_AUDIENCE,
                 "MILO_APPROVED_GATEWAY_IDENTITIES": GATEWAY_IDENTITIES,
+                "MILO_EXPECTED_SUPABASE_PROJECT_REF": EXPECTED_SUPABASE_PROJECT_REF,
             }
         )
         env.update(env_overrides)
@@ -824,3 +830,118 @@ def test_wildcard_cors_is_rejected_before_anything_runs(deployment):
     assert result.returncode != 0
     assert "must not contain '*'" in result.stderr
     assert "builds submit" not in "\n".join(deployment.invocations())
+
+
+# ---------------------------------------------------------------------------
+# the Supabase target pin is a Stage A prerequisite on BOTH resources
+# ---------------------------------------------------------------------------
+# backend/production_config.py refuses to start production without this pin,
+# so a deployment that omits it produces a service that cannot boot. Worse,
+# --update-env-vars is non-destructive: a deployment that left the pin out
+# would silently keep whatever project the resource was already pinned to.
+# Both failures are caught before anything is built.
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", "must be set to the approved production Supabase project ref"),
+        ("".join(["*"]), "wildcards are forbidden"),
+        ("<SUPABASE_PROJECT_REF>", "still a manifest placeholder"),
+        ("not-a-valid-ref", "not a well-formed Supabase project ref"),
+        ("ABCDEFGHIJKLMNOPQRST", "not a well-formed Supabase project ref"),
+        ("tooshort", "not a well-formed Supabase project ref"),
+        ("abcdefghijklmnopqrst;evil", "not a well-formed Supabase project ref"),
+    ],
+)
+def test_missing_or_invalid_supabase_project_ref_fails_preflight(deployment, value, expected):
+    result = deployment.run(MILO_EXPECTED_SUPABASE_PROJECT_REF=value)
+
+    assert result.returncode != 0
+    assert expected in result.stderr
+    # Preflight fails before any build, deploy or IAM change.
+    invocations = "\n".join(deployment.invocations())
+    assert "builds submit" not in invocations
+    assert "run deploy" not in invocations
+    assert "run jobs deploy" not in invocations
+    assert "add-iam-policy-binding" not in invocations
+
+
+def test_the_preflight_failure_never_prints_the_rejected_ref(deployment):
+    result = deployment.run(MILO_EXPECTED_SUPABASE_PROJECT_REF="zyxwvutsrqponmlkjihg")
+
+    # A well-formed but unapproved ref passes preflight shape validation; the
+    # deployed-value comparison is what catches it, and it names neither value.
+    if result.returncode != 0:
+        assert "zyxwvutsrqponmlkjihg" not in result.stderr
+        assert EXPECTED_SUPABASE_PROJECT_REF not in result.stderr
+
+
+@pytest.mark.parametrize("resource", ["service", "job"])
+def test_deployment_fails_when_a_resource_lacks_the_supabase_pin(deployment, resource):
+    doc = {"service": deployment.service_after, "job": deployment.job_after}[resource]
+    env = _container_env(doc)
+    env[:] = [entry for entry in env if entry.get("name") != "MILO_EXPECTED_SUPABASE_PROJECT_REF"]
+
+    result = deployment.run()
+
+    assert result.returncode != 0
+    assert "MILO_EXPECTED_SUPABASE_PROJECT_REF" in result.stderr
+
+
+@pytest.mark.parametrize("resource", ["service", "job"])
+def test_deployment_fails_when_a_resource_carries_a_stale_supabase_pin(deployment, resource):
+    """Presence alone would pass on a pin left behind by an older release."""
+    doc = {"service": deployment.service_after, "job": deployment.job_after}[resource]
+    for entry in _container_env(doc):
+        if entry.get("name") == "MILO_EXPECTED_SUPABASE_PROJECT_REF":
+            entry["value"] = "zyxwvutsrqponmlkjihg"
+
+    result = deployment.run()
+
+    assert result.returncode != 0
+    assert "pinned to the wrong Supabase project" in result.stderr
+    # The comparison names the problem without naming either project.
+    assert "zyxwvutsrqponmlkjihg" not in result.stderr
+    assert EXPECTED_SUPABASE_PROJECT_REF not in result.stderr
+
+
+@pytest.mark.parametrize("resource", ["service", "job"])
+def test_deployment_fails_when_a_resource_carries_an_empty_supabase_pin(deployment, resource):
+    doc = {"service": deployment.service_after, "job": deployment.job_after}[resource]
+    for entry in _container_env(doc):
+        if entry.get("name") == "MILO_EXPECTED_SUPABASE_PROJECT_REF":
+            entry["value"] = ""
+
+    result = deployment.run()
+
+    assert result.returncode != 0
+    assert "empty MILO_EXPECTED_SUPABASE_PROJECT_REF" in result.stderr
+
+
+def test_a_clean_deployment_confirms_the_pin_without_printing_it(deployment):
+    result = deployment.run()
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("Supabase target: pinned to the approved project ref") == 2
+    assert EXPECTED_SUPABASE_PROJECT_REF not in result.stdout
+
+
+def test_both_deploy_commands_carry_the_pin(deployment):
+    result = deployment.run()
+    assert result.returncode == 0, result.stderr
+
+    for needle in ("run deploy ", "run jobs deploy"):
+        command = deployment.command(needle)
+        assert f"MILO_EXPECTED_SUPABASE_PROJECT_REF={EXPECTED_SUPABASE_PROJECT_REF}" in command
+
+
+def test_pinning_does_not_enable_any_execution_flag(deployment):
+    result = deployment.run()
+    assert result.returncode == 0, result.stderr
+
+    for needle in ("run deploy ", "run jobs deploy"):
+        command = deployment.command(needle)
+        for flag in EXECUTION_FLAGS:
+            assert f"{flag}=false" in command
+            assert f"{flag}=true" not in command

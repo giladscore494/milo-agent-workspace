@@ -128,8 +128,12 @@ fi
 
 # Non-secret variables, in the same order both tools set them. Stage A binds
 # NO provider key on either resource, so none appears in either command.
-API_ENV_ARGS="ENVIRONMENT=production${DELIM}GCP_PROJECT_ID=<GCP_PROJECT_ID>${DELIM}GCP_REGION=<GCP_REGION>${DELIM}CLOUD_RUN_WORKER_JOB=<CLOUD_RUN_WORKER_JOB>${DELIM}ALLOWED_CORS_ORIGINS=<PRODUCTION_ORIGINS>${DELIM}MILO_GATEWAY_AUDIENCE=<CLOUD_RUN_API_URL>${DELIM}MILO_APPROVED_GATEWAY_IDENTITIES=<GATEWAY_IDENTITY_EMAIL>${DELIM}${STAGE_A_FLAGS}"
-WORKER_ENV_ARGS="ENVIRONMENT=production${DELIM}GCP_PROJECT_ID=<GCP_PROJECT_ID>${DELIM}GCP_REGION=<GCP_REGION>${DELIM}${EXECUTION_FLAG_ARGS}"
+# The Supabase target pin, bound on BOTH resources from the approved
+# manifest's supabase.project_ref. The concrete ref is operator configuration
+# and never appears in this repository, so the plan renders the placeholder.
+SUPABASE_PIN="${MILO_SUPABASE_PROJECT_REF_ENV_NAME}=${MILO_SUPABASE_PROJECT_REF_PLACEHOLDER}"
+API_ENV_ARGS="ENVIRONMENT=production${DELIM}GCP_PROJECT_ID=<GCP_PROJECT_ID>${DELIM}GCP_REGION=<GCP_REGION>${DELIM}CLOUD_RUN_WORKER_JOB=<CLOUD_RUN_WORKER_JOB>${DELIM}ALLOWED_CORS_ORIGINS=<PRODUCTION_ORIGINS>${DELIM}MILO_GATEWAY_AUDIENCE=<CLOUD_RUN_API_URL>${DELIM}MILO_APPROVED_GATEWAY_IDENTITIES=<GATEWAY_IDENTITY_EMAIL>${DELIM}${SUPABASE_PIN}${DELIM}${STAGE_A_FLAGS}"
+WORKER_ENV_ARGS="ENVIRONMENT=production${DELIM}GCP_PROJECT_ID=<GCP_PROJECT_ID>${DELIM}GCP_REGION=<GCP_REGION>${DELIM}${SUPABASE_PIN}${DELIM}${EXECUTION_FLAG_ARGS}"
 
 API_IMAGE_REF="<GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/${MILO_API_IMAGE_REPO}:${SHA}"
 WORKER_IMAGE_REF="<GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/${MILO_WORKER_IMAGE_REPO}:${SHA}"
@@ -185,6 +189,16 @@ gateway identity variables (\`MILO_GATEWAY_AUDIENCE\`,
 values: production refuses to start without them even while execution is
 disabled, because the read-only routes must never trust a bare browser
 header.
+
+\`${MILO_SUPABASE_PROJECT_REF_ENV_NAME}\` is set on BOTH the API service and
+the worker job, to the approved manifest's \`supabase.project_ref\`. It pins
+each runtime to one Supabase project: production fails startup closed
+(\`PRODUCTION_DEPENDENCY_UNPINNED\`) without it, and refuses to start
+(\`PRODUCTION_DEPENDENCY_MISMATCH\`) if the \`SUPABASE_URL\` it is handed is
+not that project's hosted URL. Staging has refused a wrong Supabase target
+since it was built; this is the same protection for production. Substitute
+the real ref from the approved manifest — it is deliberately not in the
+repository — and never a wildcard or a leftover placeholder.
 
 ## 0. Prerequisites (verify, do not skip)
 

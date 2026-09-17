@@ -67,6 +67,18 @@ MILO_PROVIDER_KEY_ENV_NAMES=(KIMI_API_KEY MOONSHOT_API_KEY)
 # without a verified gateway identity the API would be trusting bare browser
 # headers on its read-only routes. They are deployed with approved values,
 # never left to whatever happens to be on the service already.
+#
+# MILO_EXPECTED_SUPABASE_PROJECT_REF pins BOTH runtimes to the approved
+# production Supabase project. Staging has refused a wrong Supabase target
+# since it was built; production did not, so a runtime handed the wrong
+# SUPABASE_URL — a stale secret version, a restored snapshot's project, a
+# copy-paste — started and wrote to it. backend/production_config.py now
+# fails startup closed without it (PRODUCTION_DEPENDENCY_UNPINNED), which is
+# only a real guarantee if the deployment actually binds it, on the worker as
+# well as the API: the worker holds the same Supabase credentials and does the
+# durable writes. The VALUE is non-secret operator configuration taken from
+# the approved manifest's `supabase.project_ref`; it is never hard-coded in
+# this repository.
 MILO_API_REQUIRED_ENV_NAMES=(
   ENVIRONMENT
   JOB_LAUNCHER
@@ -76,12 +88,19 @@ MILO_API_REQUIRED_ENV_NAMES=(
   ALLOWED_CORS_ORIGINS
   MILO_GATEWAY_AUDIENCE
   MILO_APPROVED_GATEWAY_IDENTITIES
+  MILO_EXPECTED_SUPABASE_PROJECT_REF
 )
 MILO_WORKER_REQUIRED_ENV_NAMES=(
   ENVIRONMENT
   GCP_PROJECT_ID
   GCP_REGION
+  MILO_EXPECTED_SUPABASE_PROJECT_REF
 )
+
+# The one name both deployment tools bind for the Supabase target pin, and the
+# manifest placeholder the generated plan renders for its value.
+MILO_SUPABASE_PROJECT_REF_ENV_NAME="MILO_EXPECTED_SUPABASE_PROJECT_REF"
+MILO_SUPABASE_PROJECT_REF_PLACEHOLDER="<SUPABASE_PROJECT_REF>"
 
 # Secret-backed environment variable names. Both tools bind exactly these,
 # to the same environment names, at the same version. The Secret Manager

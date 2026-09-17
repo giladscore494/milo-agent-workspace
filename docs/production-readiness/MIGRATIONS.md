@@ -12,6 +12,13 @@ production.
 
 ## Order (apply strictly in this sequence)
 
+This table is the authoritative strict apply order and is **executably
+checked**: `tests/test_migration_state_verification.py` fails if any file in
+`supabase/migrations/` is missing from it, listed twice, listed under a name
+that is not a real file, or listed out of canonical order. Adding a
+migration without adding its row here breaks the build rather than silently
+producing an incomplete sequence.
+
 | # | File | Adds |
 | --- | --- | --- |
 | 001 | `001_project_workspace.sql` | projects, conversations/messages reconciliation with the legacy baseline |
@@ -29,7 +36,7 @@ production.
 | 013 | `013_usage_ledger.sql` | append-only run_usage_ledger |
 | 014 | `014_atomic_daily_budget_reservations.sql` | legacy daily RPCs (deprecated, execute revoked) |
 | 015 | `015_atomic_model_call_budget_lifecycle.sql` | model_call_budget_reservations + reserve/settle RPCs, portable grants |
-| ts | `20260706192500_grant_…_schema_privileges.sql` | service-role schema privileges (timestamped) |
+| ts | `20260706192500_grant_service_role_schema_privileges.sql` | service-role schema privileges (timestamped) |
 | ts | `20260810000100_revoke_anon_execute_on_service_rpcs.sql` | revoke anon EXECUTE on all service-only RPCs + default-privilege hardening |
 | ts | `20260810000200_enable_rls_on_service_only_tables.sql` | explicit RLS on service-only tables from 002/004/005/015 |
 | ts | `20260810000300_lease_guarded_worker_writes.sql` | assert_worker_lease + lease-guarded RPCs for every worker durable write |
@@ -38,6 +45,11 @@ production.
 | ts | `20260810000600_corrective_lease_and_attempt_hardening.sql` | attempt-aware reservation identity (run_id, attempt, call_seq); cross-run-safe guarded settle; DB-clock guarded usage/heartbeat/worker-transition RPCs |
 | ts | `20260818000100_stage_c_service_role_rpc_acl.sql` | service_role EXECUTE on the create_message_and_run / create_project_from_proposal_with_owner base RPCs (Stage C Attempt 4 corrective) |
 | ts | `20260818000200_claim_run_lease_service_role_acl.sql` | service_role EXECUTE on claim_run_lease (Stage C Attempt 5 corrective; full worker-path ACL contract now enforced by `tests/test_worker_rpc_acl_postgres.py`) |
+| ts | `20260823000100_lease_guarded_evidence_writes.sql` | S1-PR4: retry-safe, lease-guarded Evidence Board writes — `idempotency_key`/`task_key` provenance columns on `tool_usage`, and `evidence_key`/`task_key` on `sources`, `claims` and `conflicts`, with per-run partial unique indexes; the `*_guarded` RPCs (`create_tool_usage_guarded`, `create_source_guarded`, `create_claim_with_source_guarded`, `create_conflict_guarded`) that take and validate the full run lease, reject unsafe payloads and make a replayed write idempotent rather than duplicated |
+| ts | `20260828000100_canonical_scope_conflict_identity.sql` | B1 correction: `claims.canonical_scope_hash` + `claims.scope_normalization_version`, the trusted canonical scope identity computed by the backend (never recomputed in SQL) and stored beside the untouched original scope fields, so `create_conflict_guarded` compares canonical identity instead of raw text. Fail-closed on unknown, cross-run, mixed-scope, mixed-version, single-value or identity-less claim groups; legacy claims keep a NULL identity and can never join a canonical-scope conflict group |
+| ts | `20260828000200_source_evidence_fragments.sql` | B2: `source_evidence_fragments` — the first durable home for the actual source TEXT a claim rests on (`fragment_text`, `content_hash`, `fragment_index`), with the character/count bounds enforced in the database so no backend release or direct RPC call can store a whole page. A service-only relation with RLS and zero policies: fragment text is verifier-internal and never becomes browser payload via a run event |
+| ts | `20260902000100_r3_versioned_focused_evidence.sql` | R3: WHICH version of a source was read and WHERE inside it the quote came from — `sources.source_version_kind`/`source_version_id`, `claims.evidence_locator`, `source_evidence_fragments.fragment_type`/`locator_key`, plus three immutable predicate functions holding one SQL definition of the shape rules that BOTH the guarded RPCs and the table CHECK constraints call, so a direct insert is held to the same contract. Additive and nullable: pre-R3 rows keep NULLs and are never retro-invalidated |
+| ts | `20260907000100_r4_deterministic_verification.sql` | R4: deterministic verification made durable — `claims.identity_scope` (closed identity dimensions), and the new service-only relations `claim_verdicts` (one verdict per claim per run), `claim_verdict_supports` (the exact fragments behind it) and `conflict_resolutions` (one typed, append-only decision per contradicting scope). New relations rather than columns on `claims`/`conflicts`, because those are already browser-visible through run events and verdict support is verifier-internal provenance |
 | ts | `20260914200000_catalog_evidence_foundation.sql` | Catalog PR1: the durable catalog namespace — `catalog_source_snapshots`, `catalog_raw_records`, `catalog_candidate_variants`, `catalog_candidate_evidence_links` plus the **empty** canonical `catalog_models` / `catalog_model_variants`, their lease-guarded RPCs, append-only triggers, RLS and least-privilege grants |
 | ts | `20260915120000_catalog_integrity_corrections.sql` | Catalog PR1 corrective round: derived evidence-link provenance (verified verdicts only, locator/version read from the cited claim and source), required `claim_id`, terminal `failed` snapshots, creating-run snapshot ownership, derived payload digests, domain-separated identity keys with natural uniqueness, composite cross-table foreign keys and their indexes, and fully immutable canonical rows |
 | ts | `20260915180000_catalog_raw_record_source_locator.sql` | Catalog PR2: one generic `source_locator` jsonb column on `catalog_raw_records` (closed key vocabulary `capture_index` / `page_index` / `page_number` / `page_offset`, bounded, position-unique per snapshot) so a stored record states WHERE in a paginated retrieval it came from; the raw-record RPC carries and replay-checks it |
@@ -164,17 +176,42 @@ progress_percent`) whose presence is enforced by
 ## Supported remote states
 
 `scripts/release/check-migration-state.sh` classifies a remote schema
-(read-only, operator-supplied connection) as one of:
+(read-only, operator-supplied connection) against the **complete** ordered
+migration set in the table above — every 3-digit migration and every
+14-digit timestamped one. The authoritative applied history is
+`supabase_migrations.schema_migrations`.
 
-- **empty-schema** — apply 001→015 in order;
-- **legacy-baseline** — the confirmed baseline above; apply 001→015 in
-  order (reconciliation clauses handle the existing rows);
-- **partially-migrated** — apply only the missing tail, in order, after
-  reviewing the reported markers;
-- **fully-migrated** — nothing to apply; rerunning is safe (idempotent).
+- **empty-schema** — no public schema objects and no applied history; apply
+  the whole ordered set above, in order;
+- **legacy-baseline** — exactly the confirmed four-table baseline below with
+  no applied history; apply the whole ordered set in order (the
+  reconciliation clauses in 001/002 handle the existing rows);
+- **partially-migrated** — the applied history is an exact ordered PREFIX of
+  the set above and a tail remains. Every pending migration is reported by
+  version AND filename; apply only that tail, in order;
+- **fully-migrated** — every migration version in the table above is present
+  in the remote applied history and no drift condition holds. Nothing to
+  apply; rerunning is safe (idempotent);
+- **drift / unrecognized (BLOCKED)** — the tool refuses to guess. A gap or
+  non-prefix history, a remote version with no local migration file, a
+  duplicate history row, a populated schema with absent or empty history, an
+  uninspectable history past the supported baseline, or a history row whose
+  migration's object is provably missing all fail closed.
 
-All four states (plus rerun/idempotency) are executably tested against
-real PostgreSQL in CI (`tests/test_migrations_postgres.py`,
+Object markers are **secondary evidence only**. They can add a drift finding
+— "history says this migration is applied, but the object it creates is not
+there" — and can never establish that a database is fully migrated. A
+database is fully migrated when the history says every local version is
+applied, and never because a subset of objects happens to exist.
+
+The classification itself lives in the pure helper
+`scripts/release/migration_state.py` and is unit-tested in
+`tests/test_migration_state_verification.py`, including a fixture
+reproducing the real production history (applied through `20260823000100`,
+nine timestamped migrations pending) that must classify as
+`partially-migrated` and must never classify as `fully-migrated`. The
+underlying states (plus rerun/idempotency) are also executably tested
+against real PostgreSQL in CI (`tests/test_migrations_postgres.py`,
 `MILO_REQUIRE_PG_TESTS=1`, zero skips allowed).
 
 ## Manual database sequence

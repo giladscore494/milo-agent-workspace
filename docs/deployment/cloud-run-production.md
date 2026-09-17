@@ -130,6 +130,13 @@ MILO_GATEWAY_AUDIENCE=<https URL of the milo-agent-api Cloud Run service>
 MILO_APPROVED_GATEWAY_IDENTITIES=<the Vercel gateway's Google service account email>
 ```
 
+The deployment additionally binds `MILO_EXPECTED_SUPABASE_PROJECT_REF` to the
+approved manifest's `supabase.project_ref` on the API service **and** the
+worker job. It pins each runtime to one Supabase project: production fails
+startup closed without it, and refuses to start if `SUPABASE_URL` is not that
+project's hosted `https://<ref>.supabase.co` URL. The ref is non-secret but
+is operator configuration — it is never committed to this repository.
+
 The gateway service account must be distinct from the worker service
 account: shared identities are rejected by
 `backend/production_config.py`, worker identities cannot mint browser

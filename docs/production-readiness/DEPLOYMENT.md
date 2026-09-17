@@ -256,6 +256,40 @@ post-deployment verification fails if either variable is missing from the
 running service. Preserving an unknown existing value is not sufficient and
 is not relied on.
 
+### The Supabase target is pinned on both resources
+
+`MILO_EXPECTED_SUPABASE_PROJECT_REF` is deployed to the API service **and**
+the worker job, with the value recorded in the approved manifest as
+`supabase.project_ref`. It states the one Supabase project this deployment is
+allowed to talk to.
+
+`backend/production_config.py` fails startup closed when it is missing
+(`PRODUCTION_DEPENDENCY_UNPINNED`), when it is not a well-formed hosted
+project ref (`PRODUCTION_DEPENDENCY_MALFORMED`), and when the `SUPABASE_URL`
+the runtime is handed is not that project's `https://<ref>.supabase.co` URL
+(`PRODUCTION_DEPENDENCY_MISMATCH`). No message echoes the expected ref, the
+observed host or the URL.
+
+Staging has refused a wrong Supabase target since it was built. Production
+did not: the pin was explicitly staging-only, so a production runtime pointed
+at another project — by a stale secret version, a restored snapshot, or a
+copy-paste — started and wrote to it. The worker matters at least as much as
+the API here: it carries the same Supabase credentials and performs the
+durable writes.
+
+`cloud-run.sh` fails preflight, before anything is built, when the ref is
+unset, wildcarded, still a manifest placeholder, or not a well-formed project
+ref. Post-deployment verification compares the deployed VALUE on both
+resources, because `--update-env-vars` is non-destructive: presence alone
+would pass on a stale pin left behind by an earlier release. The generated
+plan binds `MILO_EXPECTED_SUPABASE_PROJECT_REF=<SUPABASE_PROJECT_REF>` on
+both resources, and `tests/test_deployment_tool_alignment.py` fails if the
+plan and the executable script ever disagree about it.
+
+`check-production-config.sh` requires the pin in production environment
+metadata and verifies the supplied `SUPABASE_URL` against it, printing
+neither value.
+
 ## Private Cloud Run configuration
 
 Proven by the templates in the generated plan plus

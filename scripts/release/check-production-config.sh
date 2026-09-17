@@ -118,7 +118,9 @@ INVENTORY=(
   "CLOUD_RUN_AUTH_MODE|local-test-only|no|frontend/lib/server/cloudRunAuth.ts"
   "MILO_E2E_INPROCESS_WORKER|local-test-only|no|backend/production_config.py"
   "MILO_WORKER_ENGINE|local-test-only|no|backend/production_config.py"
-  "MILO_EXPECTED_SUPABASE_PROJECT_REF|staging-only|no|backend/production_config.py"
+  # Required in production AND in staging: each pins its runtime to one
+  # Supabase project and fails startup closed on any other.
+  "MILO_EXPECTED_SUPABASE_PROJECT_REF|shared-api-worker|no|backend/production_config.py"
   "MILO_EXPECTED_REDIS_HOST|staging-only|no|backend/production_config.py"
   "MILO_REQUIRE_PG_TESTS|local-test-only|no|tests/test_migrations_postgres.py"
   "NEXT_PUBLIC_API_URL|deprecated|no|.github/workflows/ci.yml"
@@ -330,6 +332,48 @@ else
     record_check BLOCKED "gateway-auth" "MILO_GATEWAY_AUDIENCE and MILO_APPROVED_GATEWAY_IDENTITIES are required; the API fails closed (503) without them"
   else
     record_check PASS "gateway-auth" "gateway audience and identity allowlist configured"
+  fi
+
+  # Supabase target pin. Production must declare the project it is allowed to
+  # talk to, and the supplied SUPABASE_URL must be that project's hosted URL.
+  # Neither value is ever printed — only the verdict.
+  #
+  # supabase_host URL — the hostname, applying exactly the rules
+  # supabase_url_matches_project_ref() applies in backend/production_config.py:
+  # https only, no embedded credential, host without port or path. An input
+  # that breaks any of them yields the empty string, which never matches.
+  supabase_host() {
+    local url="${1:-}" rest
+    local lowered="${url,,}"
+    [[ "${lowered}" == https://* ]] || return 0
+    rest="${url#[Hh][Tt][Tt][Pp][Ss]://}"
+    rest="${rest%%/*}"
+    rest="${rest%%\?*}"
+    rest="${rest%%#*}"
+    # An embedded credential means this is not the hosted API URL.
+    [[ "${rest}" == *"@"* ]] && return 0
+    rest="${rest%%:*}"
+    printf '%s' "${rest,,}"
+  }
+
+  if [[ "${environment}" == "production" ]]; then
+    expected_ref="$(env_meta MILO_EXPECTED_SUPABASE_PROJECT_REF M)"
+    supabase_url="$(env_meta SUPABASE_URL M)"
+    if [[ -z "${expected_ref}" ]]; then
+      record_check BLOCKED "supabase-pin" "MILO_EXPECTED_SUPABASE_PROJECT_REF is required in production; without it the runtime cannot refuse a wrong Supabase project (PRODUCTION_DEPENDENCY_UNPINNED)"
+    elif is_placeholder "${expected_ref}"; then
+      record_check BLOCKED "supabase-pin" "MILO_EXPECTED_SUPABASE_PROJECT_REF is still a placeholder"
+    elif is_wildcard "${expected_ref}"; then
+      record_check BLOCKED "supabase-pin" "MILO_EXPECTED_SUPABASE_PROJECT_REF must be one explicit project ref; wildcards are forbidden"
+    elif [[ ! "${expected_ref}" =~ ^[a-z0-9]{20}$ ]]; then
+      record_check BLOCKED "supabase-pin" "MILO_EXPECTED_SUPABASE_PROJECT_REF is not a well-formed Supabase project ref (value not shown)"
+    elif [[ -z "${supabase_url}" ]]; then
+      record_check BLOCKED "supabase-pin" "SUPABASE_URL is required so the expected Supabase project ref can be verified"
+    elif [[ "$(supabase_host "${supabase_url}")" != "${expected_ref}.supabase.co" ]]; then
+      record_check BLOCKED "supabase-pin" "SUPABASE_URL is not the hosted URL of the expected production Supabase project ref (values not shown)"
+    else
+      record_check PASS "supabase-pin" "production is pinned to its expected Supabase project and SUPABASE_URL matches it (values not shown)"
+    fi
   fi
 
   # Gateway and worker identities must not overlap.

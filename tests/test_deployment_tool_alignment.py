@@ -204,13 +204,14 @@ def test_both_tools_set_the_same_required_api_variables(script_commands, plan_co
         "ALLOWED_CORS_ORIGINS",
         "MILO_GATEWAY_AUDIENCE",
         "MILO_APPROVED_GATEWAY_IDENTITIES",
+        "MILO_EXPECTED_SUPABASE_PROJECT_REF",
     }
     assert required <= env_names(script_commands["api"])
     assert required <= env_names(plan_commands["api"])
 
 
 def test_both_tools_set_the_same_required_worker_variables(script_commands, plan_commands):
-    required = {"ENVIRONMENT", "GCP_PROJECT_ID", "GCP_REGION"}
+    required = {"ENVIRONMENT", "GCP_PROJECT_ID", "GCP_REGION", "MILO_EXPECTED_SUPABASE_PROJECT_REF"}
     assert required <= env_names(script_commands["worker"])
     assert required <= env_names(plan_commands["worker"])
 
@@ -323,3 +324,90 @@ def test_generated_plan_reports_the_alignment_checks_as_passing(tmp_path):
     statuses = {check["name"]: check["status"] for check in json.loads(report.read_text())["checks"]}
     for name in ("image-repository", "secret-bindings", "gateway-identity", "provider-key-scope"):
         assert statuses.get(name) == "PASS", f"{name} -> {statuses.get(name)}"
+
+
+# ---------------------------------------------------------------------------
+# production Supabase target pinning
+# ---------------------------------------------------------------------------
+# Staging has refused a wrong Supabase project since it was built; production
+# did not, because the pin was explicitly staging-only and nothing in the
+# deployment bound it. backend/production_config.py now fails production
+# startup closed without it — which is only a real guarantee if BOTH tools
+# actually deploy it, on the worker as well as the API. The worker holds the
+# same Supabase credentials and performs the durable writes, so a worker
+# pointed at the wrong project is the more dangerous half of the pair.
+PIN = "MILO_EXPECTED_SUPABASE_PROJECT_REF"
+PIN_PLACEHOLDER = "<SUPABASE_PROJECT_REF>"
+
+
+@pytest.mark.parametrize("resource", ["api", "worker"])
+def test_the_shared_contract_requires_the_supabase_pin_on_both_resources(resource):
+    contract = CONTRACT.read_text()
+    array = {"api": "MILO_API_REQUIRED_ENV_NAMES", "worker": "MILO_WORKER_REQUIRED_ENV_NAMES"}[resource]
+    block = contract.split(f"{array}=(", 1)[1].split(")", 1)[0]
+    assert PIN in block.split(), f"{array} does not require {PIN}"
+
+
+def test_the_contract_owns_one_name_and_one_placeholder_for_the_pin():
+    contract = CONTRACT.read_text()
+    assert f'MILO_SUPABASE_PROJECT_REF_ENV_NAME="{PIN}"' in contract
+    assert f'MILO_SUPABASE_PROJECT_REF_PLACEHOLDER="{PIN_PLACEHOLDER}"' in contract
+
+
+@pytest.mark.parametrize("resource", ["api", "worker"])
+def test_the_generated_plan_binds_the_pin_on_both_resources(plan_commands, resource):
+    bindings = env_bindings(plan_commands[resource])
+    assert PIN in bindings, f"the plan does not bind {PIN} on the {resource}"
+    assert bindings[PIN] == PIN_PLACEHOLDER, (
+        f"the plan must bind {PIN} from the approved manifest placeholder, not a literal ref"
+    )
+
+
+@pytest.mark.parametrize("resource", ["api", "worker"])
+def test_the_executable_deploy_binds_the_pin_on_both_resources(script_commands, resource):
+    bindings = env_bindings(script_commands[resource])
+    assert PIN in bindings, f"cloud-run.sh does not bind {PIN} on the {resource}"
+    assert bindings[PIN], f"cloud-run.sh binds an empty {PIN} on the {resource}"
+
+
+@pytest.mark.parametrize("resource", ["api", "worker"])
+def test_plan_and_executable_deployment_agree_on_the_pin(script_commands, plan_commands, resource):
+    """Both tools bind the same NAME; only the value differs (real vs placeholder)."""
+    assert PIN in env_names(script_commands[resource])
+    assert PIN in env_names(plan_commands[resource])
+
+
+def test_the_api_and_worker_are_pinned_to_the_same_project(script_commands):
+    """Two runtimes pinned to different projects is two sources of truth."""
+    assert env_bindings(script_commands["api"])[PIN] == env_bindings(script_commands["worker"])[PIN]
+
+
+def test_no_concrete_production_project_ref_is_committed():
+    """The plan carries a placeholder; the real ref is operator configuration."""
+    for path in (
+        CONTRACT,
+        REPO / "scripts" / "deploy" / "cloud-run.sh",
+        REPO / "scripts" / "release" / "generate-deployment-plan.sh",
+        REPO / "config" / "production.example.yaml",
+    ):
+        text = path.read_text()
+        for line in text.splitlines():
+            if PIN not in line and "project_ref" not in line:
+                continue
+            # A 20-character hosted ref literal must never appear next to the
+            # pin: the only permitted values are the placeholder and a shell
+            # expansion of operator-supplied configuration.
+            assert not re.search(r"=\s*[\"']?[a-z0-9]{20}[\"']?\s*$", line), (
+                f"{path.name} appears to hard-code a Supabase project ref: {line.strip()}"
+            )
+
+
+@pytest.mark.parametrize("resource", ["api", "worker"])
+def test_pinning_enables_no_execution_flag(script_commands, plan_commands, resource):
+    """The pin is a refusal. It must not switch anything on as a side effect."""
+    for commands in (script_commands, plan_commands):
+        bindings = env_bindings(commands[resource])
+        for name, value in bindings.items():
+            if name.startswith("MILO_ENABLE_") or name == "GATEWAY_ALLOW_EXECUTION_ROUTES":
+                assert value == "false", f"{resource}: {name}={value}"
+        assert bindings.get("JOB_LAUNCHER", "disabled") == "disabled"

@@ -47,7 +47,7 @@ disabled (Stage A).
 | `CLOUD_RUN_AUTH_MODE` | test | no | no | forbidden (`e2e-test`) | forbidden | never in production | `TEST_ADAPTER_IN_PRODUCTION` error; hard-disabled in prod builds | unset | remove immediately |
 | `MILO_E2E_INPROCESS_WORKER` | test | no | no | forbidden | forbidden | never in production | `TEST_ADAPTER_IN_PRODUCTION` error | off | remove immediately |
 | `MILO_WORKER_ENGINE` | worker (staging only) | no | no | forbidden | forbidden | isolated staging only (`mock` = zero-cost lifecycle engine) | `TEST_ADAPTER_IN_PRODUCTION` error | unset | remove immediately |
-| `MILO_EXPECTED_SUPABASE_PROJECT_REF` | api+worker (staging only) | no | no | n/a | n/a | required when `ENVIRONMENT=staging`: runtime refuses any other Supabase project (`STAGING_DEPENDENCY_UNPINNED`/`_MISMATCH`) | fail-closed startup | unset | n/a |
+| `MILO_EXPECTED_SUPABASE_PROJECT_REF` | api+worker | no | no | yes | yes | approved manifest `supabase.project_ref`; bound by the deployment to BOTH the API service and the worker job | fail-closed startup: required in production (`PRODUCTION_DEPENDENCY_UNPINNED`), rejected if malformed (`PRODUCTION_DEPENDENCY_MALFORMED`) or if `SUPABASE_URL` is not that project's hosted URL (`PRODUCTION_DEPENDENCY_MISMATCH`); same contract in staging under `STAGING_DEPENDENCY_*` | none (startup fails) | update the manifest ref, redeploy both resources |
 | `MILO_EXPECTED_REDIS_HOST` | api+worker (staging only) | no | no | n/a | n/a | required when `ENVIRONMENT=staging`: runtime refuses any other Redis endpoint | fail-closed startup | unset | n/a |
 | `MILO_REQUIRE_PG_TESTS` | test | no | no | n/a (CI only) | n/a | CI | CI job | unset | n/a |
 | `NEXT_PUBLIC_API_URL` | deprecated | yes | no | no | no | legacy CI env only | inventory marks deprecated | unset | remove from CI when convenient |
@@ -70,6 +70,19 @@ Notes:
   It creates no run, opens no execution route, authorizes no paid call, starts
   no capture and schedules nothing, and every existing kill switch remains
   authoritative above it. There is deliberately no `NEXT_PUBLIC_` twin.
+- **`MILO_EXPECTED_SUPABASE_PROJECT_REF` pins each runtime to ONE Supabase
+  project.** It was previously staging-only, so a production runtime handed
+  the wrong `SUPABASE_URL` — a stale secret version, a restored snapshot's
+  project, a copy-paste — started and wrote to it. Production now refuses the
+  same way staging always has: the ref is required, must be a well-formed
+  hosted project ref, and `SUPABASE_URL` must be exactly that project's
+  `https://<ref>.supabase.co` URL. It is required on the **worker job as well
+  as the API service** — the worker holds the same Supabase credentials and
+  performs the durable writes. The value is non-secret and comes from the
+  approved manifest's `supabase.project_ref`; the concrete production ref is
+  operator configuration and is deliberately not in this repository. No
+  validation failure ever echoes the expected ref, the observed host, or the
+  URL.
 - **No server secret uses the `NEXT_PUBLIC_` prefix** — enforced by
   `scripts/check_unsafe_defaults.py`, `backend/production_config.py`
   (`PUBLIC_CONTAINS_SECRET`) and the frontend bundle secret check.

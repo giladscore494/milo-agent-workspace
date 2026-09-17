@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # Safe migration-state inspection.
 #
-# Local mode (default, fully offline): validates migration file naming
-# order, duplicate numbers, and stable content hashes, and prints the
-# ordered migration plan.
+# Local mode (default, fully offline): validates every migration filename,
+# rejects duplicate or malformed migration versions, computes stable content
+# hashes, and prints the ordered migration plan.
 #
 # Remote mode (only with an explicit operator-supplied read-only
 # connection): classifies the remote schema as one of
 #   empty-schema | legacy-baseline | partially-migrated | fully-migrated
-# and reports missing/unexpected migrations. Never applies a migration.
-# Never prints or stores the database password.
+# or fails closed (drift / unrecognized) when a safe ordered state cannot be
+# proven. Never applies a migration. Never prints or stores the database
+# password.
+#
+# The authoritative comparison is the COMPLETE local migration set (3-digit
+# and 14-digit timestamped alike) against the remote applied history in
+# supabase_migrations.schema_migrations. Object markers are secondary
+# evidence only: they can add a drift finding, never establish that a
+# database is fully migrated. The comparison itself lives in the pure,
+# unit-tested helper scripts/release/migration_state.py.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,6 +26,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
 
 MIGRATIONS_DIR="${REPO_ROOT}/supabase/migrations"
+STATE_HELPER="${SCRIPT_DIR}/migration_state.py"
 
 usage() {
   cat << 'EOF'
@@ -71,33 +80,25 @@ if [[ "${#files[@]}" -eq 0 ]]; then
 fi
 record_check PASS "local:count" "${#files[@]} migration files found"
 
-# Naming order and duplicate detection for NNN_*.sql files. Timestamped
-# files (e.g. 20260706192500_*.sql) sort after numeric ones and are allowed.
-declare -A seen_numbers=()
-prev_number=-1
-order_ok=1
-numbered=()
-for f in "${files[@]}"; do
-  if [[ "${f}" =~ ^([0-9]{3})_ ]]; then
-    num="${BASH_REMATCH[1]}"
-    numbered+=("${f}")
-    if [[ -n "${seen_numbers[${num}]:-}" ]]; then
-      record_check BLOCKED "local:duplicate" "duplicate migration number ${num}: ${seen_numbers[${num}]} and ${f}"
-      order_ok=0
-    fi
-    seen_numbers["${num}"]="${f}"
-    if (( 10#${num} <= prev_number )); then
-      record_check BLOCKED "local:order" "migration numbering is not strictly increasing at ${f}"
-      order_ok=0
-    fi
-    prev_number=$((10#${num}))
-  elif [[ ! "${f}" =~ ^[0-9]{14}_ ]]; then
-    record_check WARN "local:naming" "unrecognized migration filename pattern: ${f}"
-  fi
-done
-if [[ "${order_ok}" -eq 1 ]]; then
-  record_check PASS "local:order" "numeric migrations are strictly increasing with no duplicates"
+# The complete ordered local set — 3-digit and 14-digit timestamped versions
+# together. This is the ONLY local side of the comparison; a subset of object
+# markers can never stand in for it. The helper fails closed on a malformed
+# filename or a duplicate version anywhere in the directory.
+if ! tool_available python3; then
+  record_check BLOCKED "local:versions" "python3 is required to validate migration versions; a safe ordered state cannot be proven without it"
+  finish_checks "check-migration-state" "${JSON_OUTPUT}"
+  exit 1
 fi
+local_error=""
+if ! local_set="$(python3 "${STATE_HELPER}" local --migrations-dir "${MIGRATIONS_DIR}" 2>&1)"; then
+  local_error="${local_set}"
+  record_check BLOCKED "local:versions" "${local_error}"
+  finish_checks "check-migration-state" "${JSON_OUTPUT}"
+  exit 1
+fi
+mapfile -t ordered_versions < <(printf '%s\n' "${local_set}" | awk -F'\t' 'NF{print $1}')
+mapfile -t ordered_files < <(printf '%s\n' "${local_set}" | awk -F'\t' 'NF{print $2}')
+record_check PASS "local:versions" "${#ordered_versions[@]} migration versions parsed, unique and strictly ordered (3-digit and timestamped)"
 
 # Stable content hashes (sha256).
 hash_tool=""
@@ -114,10 +115,8 @@ fi
 
 # Ordered migration plan.
 printf '\nOrdered migration plan:\n'
-idx=1
-for f in "${files[@]}"; do
-  printf '  %2d. %s %s\n' "${idx}" "${f}" "${hashes[${f}]:-}"
-  idx=$((idx + 1))
+for i in "${!ordered_files[@]}"; do
+  printf '  %2d. %-14s %s %s\n' "$((i + 1))" "${ordered_versions[${i}]}" "${ordered_files[${i}]}" "${hashes[${ordered_files[${i}]}]:-}"
 done
 
 if [[ -n "${PLAN_OUTPUT}" ]]; then
@@ -125,10 +124,11 @@ if [[ -n "${PLAN_OUTPUT}" ]]; then
   chmod 600 "${tmp}"
   {
     printf '{\n  "migrations": [\n'
-    last=$(( ${#files[@]} - 1 ))
-    for i in "${!files[@]}"; do
-      printf '    {"order": %d, "file": "%s", "sha256": "%s"}' \
-        "$((i + 1))" "$(json_escape "${files[${i}]}")" "${hashes[${files[${i}]}]:-}"
+    last=$(( ${#ordered_files[@]} - 1 ))
+    for i in "${!ordered_files[@]}"; do
+      printf '    {"order": %d, "version": "%s", "file": "%s", "sha256": "%s"}' \
+        "$((i + 1))" "$(json_escape "${ordered_versions[${i}]}")" \
+        "$(json_escape "${ordered_files[${i}]}")" "${hashes[${ordered_files[${i}]}]:-}"
       [[ "${i}" -lt "${last}" ]] && printf ','
       printf '\n'
     done
@@ -139,38 +139,21 @@ if [[ -n "${PLAN_OUTPUT}" ]]; then
 fi
 
 # Static content safety checks (defer to scripts/check_migrations.py).
-if tool_available python3 && [[ -f "${REPO_ROOT}/scripts/check_migrations.py" ]]; then
+if [[ -f "${REPO_ROOT}/scripts/check_migrations.py" ]]; then
   if (cd "${REPO_ROOT}" && python3 scripts/check_migrations.py > /dev/null 2>&1); then
     record_check PASS "local:static-safety" "scripts/check_migrations.py passed (no destructive clauses, baseline reconciliation intact)"
   else
     record_check BLOCKED "local:static-safety" "scripts/check_migrations.py failed"
   fi
 else
-  record_check MANUAL "local:static-safety" "python3 unavailable; run scripts/check_migrations.py manually"
+  record_check MANUAL "local:static-safety" "scripts/check_migrations.py not found; static migration safety must be verified manually"
 fi
 
 # ---------------------------------------------------------------------------
 # Remote inspection (explicit read-only connection only).
 # ---------------------------------------------------------------------------
-# Marker objects created by each numeric migration; used to classify the
-# remote state without a migration-history table.
-MARKERS=(
-  "001_project_workspace.sql|table|projects"
-  "002_durable_runtime.sql|table|run_checkpoints"
-  "003_workflow_proposals.sql|table|workflow_proposals"
-  "004_supervisor_shadow_mode.sql|table|supervisor_decisions"
-  "005_internet_governance.sql|table|tool_access_requests"
-  "006_deployment_hardening.sql|view|stuck_runs"
-  "007_project_members.sql|table|project_members"
-  "008_workflow_proposal_ownership.sql|column|workflow_proposals.project_id"
-  "009_run_idempotency_lifecycle.sql|column|runs.launch_state"
-  "010_run_usage.sql|column|runs.usage"
-  "011_proposal_ownership_protection.sql|function|create_project_from_proposal_with_owner"
-  "012_atomic_run_operations.sql|function|claim_run_lease"
-  "013_usage_ledger.sql|table|run_usage_ledger"
-  "014_atomic_daily_budget_reservations.sql|function|reserve_daily_user_budget"
-  "015_atomic_model_call_budget_lifecycle.sql|table|model_call_budget_reservations"
-)
+# Every statement below is a SELECT against catalog views or the Supabase
+# migration-history table. Nothing is created, altered, dropped or written.
 LEGACY_BASELINE_TABLES=(conversations messages runs run_events)
 
 if [[ -z "${DB_URL_ENV}" ]]; then
@@ -183,60 +166,114 @@ else
     record_check MANUAL "remote:psql" "psql is unavailable; remote migration state must be inspected manually"
   else
     run_sql() {
-      # -X: no psqlrc; -A -t: unaligned tuples only; read-only queries only.
+      # -X: no psqlrc; -A -t: unaligned tuples only; SELECT statements only.
       psql -X -A -t -v ON_ERROR_STOP=1 "${db_url}" -c "$1" 2> /dev/null
     }
     if ! run_sql "select 1" > /dev/null; then
       record_check BLOCKED "remote:connection" "unable to connect with the connection provided in ${DB_URL_ENV} (connection string is never printed)"
     else
       record_check PASS "remote:connection" "read-only connection established via ${DB_URL_ENV}"
-      applied=()
-      missing=()
-      for marker in "${MARKERS[@]}"; do
-        IFS='|' read -r mig kind obj <<< "${marker}"
-        case "${kind}" in
-          table) q="select 1 from information_schema.tables where table_schema='public' and table_name='${obj}'" ;;
-          view) q="select 1 from information_schema.views where table_schema='public' and table_name='${obj}'" ;;
-          column) q="select 1 from information_schema.columns where table_schema='public' and table_name='${obj%%.*}' and column_name='${obj##*.}'" ;;
-          function) q="select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='${obj}'" ;;
-        esac
-        if [[ -n "$(run_sql "${q}")" ]]; then
-          applied+=("${mig}")
-        else
-          missing+=("${mig}")
-        fi
-      done
 
-      baseline_present=0
+      milo_tmpdir_init
+      observation="$(milo_tmpdir)/observation.tsv"
+      : > "${observation}"
+
+      # 1. Applied migration history — the authoritative applied side.
+      history_exists="$(run_sql "select 1 from information_schema.tables where table_schema='supabase_migrations' and table_name='schema_migrations'")"
+      if [[ -n "${history_exists}" ]]; then
+        printf 'history_available\t1\n' >> "${observation}"
+        while IFS= read -r version; do
+          [[ -n "${version}" ]] || continue
+          printf 'applied\t%s\n' "${version}" >> "${observation}"
+        done < <(run_sql "select version from supabase_migrations.schema_migrations order by version")
+      else
+        printf 'history_available\t0\n' >> "${observation}"
+      fi
+
+      # 2. Public schema shape.
+      table_count="$(run_sql "select count(*) from information_schema.tables where table_schema='public'" | tr -d '[:space:]')"
+      printf 'public_table_count\t%s\n' "${table_count:-0}" >> "${observation}"
       for t in "${LEGACY_BASELINE_TABLES[@]}"; do
         if [[ -n "$(run_sql "select 1 from information_schema.tables where table_schema='public' and table_name='${t}'")" ]]; then
-          baseline_present=$((baseline_present + 1))
+          printf 'legacy_baseline\t%s\n' "${t}" >> "${observation}"
         fi
       done
-      table_count="$(run_sql "select count(*) from information_schema.tables where table_schema='public'")"
 
-      if [[ "${table_count}" == "0" ]]; then
-        state="empty-schema"
-      elif [[ "${#applied[@]}" -eq 0 && "${baseline_present}" -eq "${#LEGACY_BASELINE_TABLES[@]}" ]]; then
-        state="legacy-baseline"
-      elif [[ "${#missing[@]}" -eq 0 ]]; then
-        state="fully-migrated"
-      elif [[ "${#applied[@]}" -gt 0 ]]; then
-        state="partially-migrated"
+      # 3. Secondary object markers. These NEVER establish that a migration
+      #    is applied; they only expose a history row whose object is absent.
+      while IFS=$'\t' read -r mversion mkind mobj; do
+        [[ -n "${mversion}" ]] || continue
+        case "${mkind}" in
+          table) q="select 1 from information_schema.tables where table_schema='public' and table_name='${mobj}'" ;;
+          view) q="select 1 from information_schema.views where table_schema='public' and table_name='${mobj}'" ;;
+          column) q="select 1 from information_schema.columns where table_schema='public' and table_name='${mobj%%.*}' and column_name='${mobj##*.}'" ;;
+          function) q="select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='${mobj}'" ;;
+          *) continue ;;
+        esac
+        if [[ -n "$(run_sql "${q}")" ]]; then
+          printf 'marker\t%s\t1\n' "${mversion}" >> "${observation}"
+        else
+          printf 'marker\t%s\t0\n' "${mversion}" >> "${observation}"
+        fi
+      done < <(python3 "${STATE_HELPER}" markers --migrations-dir "${MIGRATIONS_DIR}")
+
+      # 4. Classify. The helper owns every decision.
+      if ! classification="$(python3 "${STATE_HELPER}" classify --migrations-dir "${MIGRATIONS_DIR}" --observation "${observation}" 2>&1)"; then
+        record_check BLOCKED "remote:state" "migration-state comparison failed: ${classification}"
       else
-        state="unrecognized"
+        state="$(json_field "${classification}" "state")"
+        blocked="$(json_field "${classification}" "blocked")"
+        applied_count="$(json_field "${classification}" "applied_count")"
+        local_total="$(json_field "${classification}" "local_total")"
+        summary="$(json_field "${classification}" "summary")"
+
+        if [[ "${blocked}" == "true" ]]; then
+          record_check BLOCKED "remote:state" "remote schema classified as ${state}: ${summary}"
+        else
+          record_check PASS "remote:state" "remote schema classified as ${state} (${applied_count}/${local_total} local migrations applied): ${summary}"
+        fi
+
+        # Report EVERY pending migration, timestamped ones included.
+        mapfile -t pending < <(
+          MILO_CLASSIFICATION="${classification}" python3 -c 'import json, os
+report = json.loads(os.environ["MILO_CLASSIFICATION"])
+for entry in report.get("missing", []):
+    print(entry["version"], entry["file"])
+'
+        )
+        if [[ "${#pending[@]}" -gt 0 ]]; then
+          record_check WARN "remote:missing" "${#pending[@]} local migration(s) not present in remote migration history: ${pending[*]}"
+        elif [[ "${state}" == "fully-migrated" ]]; then
+          record_check PASS "remote:missing" "no local migration is missing from remote migration history"
+        fi
+
+        mapfile -t unexpected < <(
+          MILO_CLASSIFICATION="${classification}" python3 -c 'import json, os
+report = json.loads(os.environ["MILO_CLASSIFICATION"])
+for version in report.get("unexpected", []):
+    print(version)
+'
+        )
+        if [[ "${#unexpected[@]}" -gt 0 ]]; then
+          record_check BLOCKED "remote:unexpected-version" "remote migration history records versions with no local migration file: ${unexpected[*]}"
+        fi
+
+        mapfile -t disagreements < <(
+          MILO_CLASSIFICATION="${classification}" python3 -c 'import json, os
+report = json.loads(os.environ["MILO_CLASSIFICATION"])
+for finding in report.get("marker_disagreements", []):
+    print(finding)
+'
+        )
+        if [[ "${#disagreements[@]}" -gt 0 ]]; then
+          record_check BLOCKED "remote:history-object-disagreement" "${disagreements[*]}"
+        fi
       fi
-      record_check PASS "remote:state" "remote schema classified as ${state} (${#applied[@]}/${#MARKERS[@]} migration markers present; legacy baseline tables present: ${baseline_present}/${#LEGACY_BASELINE_TABLES[@]})"
-      if [[ "${state}" == "partially-migrated" ]]; then
-        record_check WARN "remote:missing" "migrations without markers (pending or partially applied): ${missing[*]}"
-      fi
-      if [[ "${state}" == "unrecognized" ]]; then
-        record_check BLOCKED "remote:state-unrecognized" "remote schema matches neither empty, legacy baseline, partial, nor fully migrated state; manual review required"
-      fi
-      # Unexpected remote objects that no local migration creates.
-      unexpected="$(run_sql "select string_agg(table_name, ',') from information_schema.tables where table_schema='public' and table_name like 'milo_%'")"
-      if [[ -n "${unexpected}" ]]; then
-        record_check WARN "remote:unexpected" "remote tables with no matching local migration: ${unexpected}"
+
+      # Remote objects that no local migration creates (advisory only).
+      unexpected_tables="$(run_sql "select string_agg(table_name, ',') from information_schema.tables where table_schema='public' and table_name like 'milo_%'")"
+      if [[ -n "${unexpected_tables}" ]]; then
+        record_check WARN "remote:unexpected" "remote tables with no matching local migration: ${unexpected_tables}"
       fi
     fi
   fi

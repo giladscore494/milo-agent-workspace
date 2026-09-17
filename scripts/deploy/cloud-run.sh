@@ -42,6 +42,14 @@ STAGE_A_FLAG_NAMES=("${MILO_STAGE_A_FLAG_NAMES[@]}")
 MILO_GATEWAY_AUDIENCE=${MILO_GATEWAY_AUDIENCE:-}
 MILO_APPROVED_GATEWAY_IDENTITIES=${MILO_APPROVED_GATEWAY_IDENTITIES:-}
 
+# Supabase target pin. The expected project ref is non-secret operator
+# configuration read from the approved manifest (`supabase.project_ref`) and
+# supplied in the environment — never a default baked into this repository.
+# backend/production_config.py refuses to start production without it, so a
+# deployment that omits it would produce a service that cannot boot; the
+# preflight below stops before anything is built instead.
+MILO_EXPECTED_SUPABASE_PROJECT_REF=${MILO_EXPECTED_SUPABASE_PROJECT_REF:-}
+
 # Environment variables this release owns. Anything else already configured on
 # the service or job is preserved: the deploy uses --update-env-vars /
 # --update-secrets, never the destructive --set-* variants.
@@ -54,12 +62,14 @@ API_ENV_VARS=(
   "ALLOWED_CORS_ORIGINS=${ALLOWED_CORS_ORIGINS:-}"
   "MILO_GATEWAY_AUDIENCE=$MILO_GATEWAY_AUDIENCE"
   "MILO_APPROVED_GATEWAY_IDENTITIES=$MILO_APPROVED_GATEWAY_IDENTITIES"
+  "$MILO_SUPABASE_PROJECT_REF_ENV_NAME=$MILO_EXPECTED_SUPABASE_PROJECT_REF"
   "${STAGE_A_EXECUTION_FLAGS[@]}"
 )
 WORKER_ENV_VARS=(
   "ENVIRONMENT=production"
   "GCP_PROJECT_ID=$PROJECT_ID"
   "GCP_REGION=$REGION"
+  "$MILO_SUPABASE_PROJECT_REF_ENV_NAME=$MILO_EXPECTED_SUPABASE_PROJECT_REF"
   "${STAGE_A_EXECUTION_FLAGS[@]}"
 )
 # Stage A binds NO provider key — not to the API, not to the worker. The API
@@ -157,6 +167,31 @@ require_gateway_identity_config() {
   done
 }
 
+# The Supabase target pin must be a real, well-formed project ref before
+# anything is built. A missing, placeholder or wildcarded value would either
+# deploy a service that cannot start, or — worse, if a stale value were left
+# in place by the non-destructive update — leave production pinned to whatever
+# it was pinned to before. The value itself is never printed.
+require_supabase_project_ref_pin() {
+  if [[ -z "${MILO_EXPECTED_SUPABASE_PROJECT_REF:-}" ]]; then
+    fail "$MILO_SUPABASE_PROJECT_REF_ENV_NAME must be set to the approved production Supabase project ref (manifest 'supabase.project_ref') before deployment. Production fails startup closed without it."
+  fi
+  if [[ "$MILO_EXPECTED_SUPABASE_PROJECT_REF" == *"*"* ]]; then
+    fail "$MILO_SUPABASE_PROJECT_REF_ENV_NAME must be one explicit project ref; wildcards are forbidden."
+  fi
+  if [[ "$MILO_EXPECTED_SUPABASE_PROJECT_REF" == "$MILO_SUPABASE_PROJECT_REF_PLACEHOLDER" || "$MILO_EXPECTED_SUPABASE_PROJECT_REF" == \<*\> ]]; then
+    fail "$MILO_SUPABASE_PROJECT_REF_ENV_NAME is still a manifest placeholder. Substitute the approved production project ref."
+  fi
+  # The hosted Supabase project-ref form, matching
+  # SUPABASE_PROJECT_REF_PATTERN in backend/production_config.py.
+  if [[ ! "$MILO_EXPECTED_SUPABASE_PROJECT_REF" =~ ^[a-z0-9]{20}$ ]]; then
+    fail "$MILO_SUPABASE_PROJECT_REF_ENV_NAME is not a well-formed Supabase project ref (20 lowercase alphanumerics). Value not shown."
+  fi
+  if [[ "$MILO_EXPECTED_SUPABASE_PROJECT_REF" == *"$ENV_VAR_DELIMITER"* ]]; then
+    fail "$MILO_SUPABASE_PROJECT_REF_ENV_NAME must not contain the gcloud env-var delimiter '$ENV_VAR_DELIMITER'."
+  fi
+}
+
 # Stage A binds no provider key anywhere. This guards the binding arrays
 # themselves, so a future edit that reintroduces a provider key fails before
 # anything is built rather than after it is deployed.
@@ -182,6 +217,7 @@ preflight() {
   require_full_release_sha
   require_allowed_cors_origins
   require_gateway_identity_config
+  require_supabase_project_ref_pin
   require_no_provider_key_bindings
 
   local account
@@ -240,6 +276,7 @@ API image: $API_IMAGE
 Worker image: $WORKER_IMAGE
 Stage A execution flags: ${STAGE_A_FLAG_NAMES[*]} (all false)
 Stage A provider keys: ${MILO_PROVIDER_KEY_ENV_NAMES[*]} bound to NOTHING (Stage C introduces them)
+Supabase target pin: $MILO_SUPABASE_PROJECT_REF_ENV_NAME set (approved project ref; value not shown)
 Gateway audience: $MILO_GATEWAY_AUDIENCE
 Approved gateway identities: $MILO_APPROVED_GATEWAY_IDENTITIES
 Env/secret update mode: --update-env-vars / --update-secrets (non-destructive)
@@ -336,9 +373,14 @@ describe_json() {
 #   flag\t<NAME>\t<VALUE>   (only for JOB_LAUNCHER / MILO_ENABLE_* flags)
 GATEWAY_IDENTITY_VAR_NAMES=(MILO_GATEWAY_AUDIENCE MILO_APPROVED_GATEWAY_IDENTITIES)
 
+# Non-secret values the inspection is allowed to read back, so the deployment
+# can compare what it INTENDED to set against what the resource now carries.
+# The Supabase project ref joins them: presence alone would pass on a stale
+# pin left behind by the non-destructive update.
 report_from_json() {
   printf '%s' "$1" | python3 -c "$CONTAINER_REPORT_PY" \
-    JOB_LAUNCHER "${STAGE_A_FLAG_NAMES[@]}" "${GATEWAY_IDENTITY_VAR_NAMES[@]}"
+    JOB_LAUNCHER "${STAGE_A_FLAG_NAMES[@]}" "${GATEWAY_IDENTITY_VAR_NAMES[@]}" \
+    "$MILO_SUPABASE_PROJECT_REF_ENV_NAME"
 }
 
 binding_report() {
@@ -604,6 +646,26 @@ verify_gateway_identity() {
   echo "  gateway identity: audience=$MILO_GATEWAY_AUDIENCE, approved=$MILO_APPROVED_GATEWAY_IDENTITIES"
 }
 
+# The expected Supabase project ref is not secret, but it is also not
+# something a deployment may leave to whatever the resource already carried:
+# the update is non-destructive, so a stale pin would survive silently and
+# keep production pointed at the previous project. The deployed value is
+# therefore compared, and neither value is printed.
+verify_supabase_project_pin() {
+  local label="$1" report="$2" kind name value seen=""
+  while IFS=$'\t' read -r kind name value; do
+    [[ "$kind" == "flag" ]] || continue
+    [[ "$name" == "$MILO_SUPABASE_PROJECT_REF_ENV_NAME" ]] || continue
+    [[ -n "$value" ]] || fail "$label has an empty $MILO_SUPABASE_PROJECT_REF_ENV_NAME; production would fail startup closed."
+    [[ "$value" == "$MILO_EXPECTED_SUPABASE_PROJECT_REF" ]] || \
+      fail "$label carries a $MILO_SUPABASE_PROJECT_REF_ENV_NAME other than the approved one (values not shown). Production would be pinned to the wrong Supabase project."
+    seen=1
+  done <<<"$report"
+  [[ -n "$seen" ]] || \
+    fail "$label is missing $MILO_SUPABASE_PROJECT_REF_ENV_NAME; production requires the Supabase target pin on the API service and the worker job alike."
+  echo "  Supabase target: pinned to the approved project ref (value not shown)"
+}
+
 verify_no_public_access() {
   local kind="$1" name="$2" policy
   case "$kind" in
@@ -689,6 +751,7 @@ verify_env_names "Worker job '$WORKER_JOB'" "$WORKER_REPORT" "${MILO_WORKER_REQU
 verify_secret_refs "Worker job '$WORKER_JOB'" "$WORKER_REPORT" "${WORKER_SECRETS[@]}"
 verify_no_provider_key "Worker job '$WORKER_JOB'" "$WORKER_REPORT"
 verify_stage_a_flags "Worker job '$WORKER_JOB'" "$WORKER_REPORT"
+verify_supabase_project_pin "Worker job '$WORKER_JOB'" "$WORKER_REPORT"
 assert_bindings_preserved "Worker job '$WORKER_JOB'" "$WORKER_BINDINGS_BEFORE" "$(binding_identities "$WORKER_REPORT")"
 verify_no_public_access job "$WORKER_JOB"
 
@@ -700,6 +763,7 @@ verify_secret_refs "API service '$API_SERVICE'" "$API_REPORT" "${API_SECRETS[@]}
 verify_no_provider_key "API service '$API_SERVICE'" "$API_REPORT"
 verify_gateway_identity "API service '$API_SERVICE'" "$API_REPORT"
 verify_stage_a_flags "API service '$API_SERVICE'" "$API_REPORT"
+verify_supabase_project_pin "API service '$API_SERVICE'" "$API_REPORT"
 assert_bindings_preserved "API service '$API_SERVICE'" "$API_BINDINGS_BEFORE" "$(binding_identities "$API_REPORT")"
 verify_no_public_access service "$API_SERVICE"
 
