@@ -165,42 +165,87 @@ else
   elif ! tool_available psql; then
     record_check MANUAL "remote:psql" "psql is unavailable; remote migration state must be inspected manually"
   else
-    run_sql() {
-      # -X: no psqlrc; -A -t: unaligned tuples only; SELECT statements only.
-      psql -X -A -t -v ON_ERROR_STOP=1 "${db_url}" -c "$1" 2> /dev/null
+    milo_tmpdir_init
+    SQL_OUT="$(milo_tmpdir)/sql.out"
+    # run_sql_to SQL — execute ONE read-only SELECT, writing its rows to
+    # ${SQL_OUT} and returning psql's exit status.
+    #
+    # This exists so that every caller can distinguish "the database
+    # answered, and the answer was nothing" from "the query failed". The
+    # previous shape could not: rows were read through a process
+    # substitution, whose exit status the parent shell never sees, and
+    # single-value probes ran inside `$( )` in a condition, where a failure
+    # is indistinguishable from an empty result. Both silently turned a
+    # failed inspection into an observation — an empty applied history, or
+    # an absent object — and an empty applied history legitimately
+    # classifies a real database as the supported legacy baseline.
+    #
+    # psql's stderr is discarded and the connection string is never echoed.
+    # -X: no psqlrc; -A -t: unaligned tuples only; SELECT statements only.
+    run_sql_to() {
+      psql -X -A -t -v ON_ERROR_STOP=1 "${db_url}" -c "$1" > "${SQL_OUT}" 2> /dev/null
     }
-    if ! run_sql "select 1" > /dev/null; then
+    if ! run_sql_to "select 1"; then
       record_check BLOCKED "remote:connection" "unable to connect with the connection provided in ${DB_URL_ENV} (connection string is never printed)"
     else
       record_check PASS "remote:connection" "read-only connection established via ${DB_URL_ENV}"
 
-      milo_tmpdir_init
       observation="$(milo_tmpdir)/observation.tsv"
       : > "${observation}"
 
+      # Any probe that cannot be answered makes the whole inspection
+      # incomplete. An incomplete inspection is never classified: a state
+      # inferred from observations the database never gave us is a guess
+      # wearing the clothes of a measurement.
+      inspection_ok=1
+      probe_failed() {
+        record_check BLOCKED "remote:$1" "$2"
+        inspection_ok=0
+      }
+
       # 1. Applied migration history — the authoritative applied side.
-      history_exists="$(run_sql "select 1 from information_schema.tables where table_schema='supabase_migrations' and table_name='schema_migrations'")"
-      if [[ -n "${history_exists}" ]]; then
+      #    Whether the relation exists is itself a question that can fail,
+      #    and a failure to answer it is not an answer of "no history".
+      if ! run_sql_to "select 1 from information_schema.tables where table_schema='supabase_migrations' and table_name='schema_migrations'"; then
+        probe_failed "history-probe" "could not determine whether supabase_migrations.schema_migrations exists; migration state is not classified from an inspection that did not complete"
+      elif [[ -s "${SQL_OUT}" ]]; then
         printf 'history_available\t1\n' >> "${observation}"
-        while IFS= read -r version; do
-          [[ -n "${version}" ]] || continue
-          printf 'applied\t%s\n' "${version}" >> "${observation}"
-        done < <(run_sql "select version from supabase_migrations.schema_migrations order by version")
+        # The rows themselves. A failed SELECT must NEVER be read as an
+        # empty history: "could not read" and "is empty" are different
+        # states, and an empty history legitimately classifies a real
+        # database as the supported legacy baseline.
+        if ! run_sql_to "select version from supabase_migrations.schema_migrations order by version"; then
+          probe_failed "history-read" "supabase_migrations.schema_migrations exists but its rows could not be read; refusing to classify from an assumed-empty applied history"
+        else
+          while IFS= read -r version; do
+            [[ -n "${version}" ]] || continue
+            printf 'applied\t%s\n' "${version}" >> "${observation}"
+          done < "${SQL_OUT}"
+        fi
       else
         printf 'history_available\t0\n' >> "${observation}"
       fi
 
       # 2. Public schema shape.
-      table_count="$(run_sql "select count(*) from information_schema.tables where table_schema='public'" | tr -d '[:space:]')"
-      printf 'public_table_count\t%s\n' "${table_count:-0}" >> "${observation}"
+      if ! run_sql_to "select count(*) from information_schema.tables where table_schema='public'"; then
+        probe_failed "schema-shape" "could not count the relations in the public schema"
+      else
+        table_count="$(tr -d '[:space:]' < "${SQL_OUT}")"
+        printf 'public_table_count\t%s\n' "${table_count:-0}" >> "${observation}"
+      fi
       for t in "${LEGACY_BASELINE_TABLES[@]}"; do
-        if [[ -n "$(run_sql "select 1 from information_schema.tables where table_schema='public' and table_name='${t}'")" ]]; then
+        if ! run_sql_to "select 1 from information_schema.tables where table_schema='public' and table_name='${t}'"; then
+          probe_failed "baseline-probe" "could not determine whether the legacy baseline table '${t}' exists"
+        elif [[ -s "${SQL_OUT}" ]]; then
           printf 'legacy_baseline\t%s\n' "${t}" >> "${observation}"
         fi
       done
 
       # 3. Secondary object markers. These NEVER establish that a migration
       #    is applied; they only expose a history row whose object is absent.
+      #    A probe that FAILED is not an observed absence: recording it as
+      #    absent would manufacture drift, and dropping it silently would let
+      #    a green classification rest on an inspection that did not finish.
       while IFS=$'\t' read -r mversion mkind mobj; do
         [[ -n "${mversion}" ]] || continue
         case "${mkind}" in
@@ -210,15 +255,31 @@ else
           function) q="select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='${mobj}'" ;;
           *) continue ;;
         esac
-        if [[ -n "$(run_sql "${q}")" ]]; then
+        if ! run_sql_to "${q}"; then
+          probe_failed "marker-probe" "could not probe the ${mkind} '${mobj}' expected by migration ${mversion}; an unanswered probe is not an observed absence"
+        elif [[ -s "${SQL_OUT}" ]]; then
           printf 'marker\t%s\t1\n' "${mversion}" >> "${observation}"
         else
           printf 'marker\t%s\t0\n' "${mversion}" >> "${observation}"
         fi
       done < <(python3 "${STATE_HELPER}" markers --migrations-dir "${MIGRATIONS_DIR}")
 
-      # 4. Classify. The helper owns every decision.
-      if ! classification="$(python3 "${STATE_HELPER}" classify --migrations-dir "${MIGRATIONS_DIR}" --observation "${observation}" 2>&1)"; then
+      # 4. Remote objects that no local migration creates (advisory, but an
+      #    unanswered question is still an unanswered question).
+      if ! run_sql_to "select string_agg(table_name, ',') from information_schema.tables where table_schema='public' and table_name like 'milo_%'"; then
+        probe_failed "unexpected-probe" "could not inspect the public schema for relations with no matching local migration"
+      else
+        unexpected_tables="$(tr -d '[:space:]' < "${SQL_OUT}")"
+        if [[ -n "${unexpected_tables}" ]]; then
+          record_check WARN "remote:unexpected" "remote tables with no matching local migration: ${unexpected_tables}"
+        fi
+      fi
+
+      # 5. Classify — ONLY from a complete inspection. The helper owns every
+      #    decision, but it can only decide from what was actually observed.
+      if [[ "${inspection_ok}" -ne 1 ]]; then
+        record_check BLOCKED "remote:state" "remote inspection did not complete; no migration-state classification is reported and no state is inferred from partial observations"
+      elif ! classification="$(python3 "${STATE_HELPER}" classify --migrations-dir "${MIGRATIONS_DIR}" --observation "${observation}" 2>&1)"; then
         record_check BLOCKED "remote:state" "migration-state comparison failed: ${classification}"
       else
         state="$(json_field "${classification}" "state")"
@@ -268,12 +329,6 @@ for finding in report.get("marker_disagreements", []):
         if [[ "${#disagreements[@]}" -gt 0 ]]; then
           record_check BLOCKED "remote:history-object-disagreement" "${disagreements[*]}"
         fi
-      fi
-
-      # Remote objects that no local migration creates (advisory only).
-      unexpected_tables="$(run_sql "select string_agg(table_name, ',') from information_schema.tables where table_schema='public' and table_name like 'milo_%'")"
-      if [[ -n "${unexpected_tables}" ]]; then
-        record_check WARN "remote:unexpected" "remote tables with no matching local migration: ${unexpected_tables}"
       fi
     fi
   fi

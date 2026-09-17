@@ -348,6 +348,15 @@ with open(os.environ["MOCK_PSQL_LOG"], "a") as handle:
 state = json.load(open(os.environ["MOCK_PSQL_STATE"]))
 normalized = " ".join(query.split())
 
+# Injected failure: this is how a real psql reports a query it could not
+# run (permission denied, a revoked grant, a dropped relation mid-read).
+# The tool must never read a nonzero exit as "the database answered
+# nothing".
+for needle in state.get("fail_on", []):
+    if needle in normalized:
+        print("ERROR:  permission denied for relation", file=sys.stderr)
+        raise SystemExit(1)
+
 
 def emit(*rows):
     for row in rows:
@@ -416,8 +425,9 @@ class RemoteRun:
 
     def __init__(self, tmp_path: Path, state: dict) -> None:
         self.dir = tmp_path
+        self.dir.mkdir(parents=True, exist_ok=True)
         self.bin = tmp_path / "bin"
-        self.bin.mkdir()
+        self.bin.mkdir(exist_ok=True)
         psql = self.bin / "psql"
         psql.write_text(MOCK_PSQL)
         psql.chmod(psql.stat().st_mode | stat.S_IEXEC)
@@ -728,3 +738,145 @@ def test_omitting_a_migration_from_the_table_is_actually_detected(local):
     weakened = [name for name in documented if name != documented[-1]]
 
     assert set(entry["file"] for entry in local) - set(weakened)
+
+
+# ---------------------------------------------------------------------------
+# a failed inspection is never an observation
+# ---------------------------------------------------------------------------
+# "Could not read the migration history" and "the migration history is empty"
+# are different states, and the tool used to be unable to tell them apart:
+# rows were read through a process substitution, whose exit status the parent
+# shell never sees, and single-value probes ran inside `$( )` in a condition,
+# where a failure looks exactly like an empty result.
+#
+# That mattered most for the case below: an empty applied history over the
+# four baseline tables legitimately classifies a database as `legacy-baseline`
+# — the state whose documented remedy is "apply the whole ordered set". A
+# SELECT that merely FAILED must never be able to produce that answer.
+HISTORY_READ = "from supabase_migrations.schema_migrations"
+HISTORY_EXISTS_PROBE = "table_schema='supabase_migrations'"
+CLASSIFICATIONS = ("legacy-baseline", "partially-migrated", "fully-migrated", "empty-schema")
+
+
+def failing_run(tmp_path: Path, state: dict, fail_on: list[str]) -> tuple[subprocess.CompletedProcess, RemoteRun]:
+    run = RemoteRun(tmp_path, {**state, "fail_on": list(fail_on)})
+    return run.run(), run
+
+
+def assert_refused_to_classify(result: subprocess.CompletedProcess) -> None:
+    """Nonzero, BLOCKED, and no state claimed from an incomplete inspection."""
+    assert result.returncode != 0, result.stdout
+    assert "[BLOCKED]" in result.stdout
+    assert "remote inspection did not complete" in result.stdout
+    for state in CLASSIFICATIONS:
+        assert f"classified as {state}" not in result.stdout, (
+            f"classified as {state} from an inspection that did not complete"
+        )
+    # Never leak the connection string on a failure path.
+    for stream in (result.stdout, result.stderr):
+        assert SECRET_PASSWORD not in stream
+        assert DB_URL not in stream
+
+
+def production_like_state() -> dict:
+    return {"history_exists": True, "applied": list(PRODUCTION_APPLIED), **catalog_for(PRODUCTION_APPLIED)}
+
+
+def legacy_baseline_state() -> dict:
+    """Exactly the supported four-table baseline — and nothing else."""
+    return {
+        "history_exists": True,
+        "applied": [],
+        "tables": sorted(LEGACY_BASELINE_TABLES),
+        "views": [],
+        "columns": [],
+        "functions": [],
+    }
+
+
+def test_history_read_failure_over_a_production_like_schema_fails_closed(tmp_path):
+    """The relation exists; reading its rows fails. Not an empty history."""
+    result, _ = failing_run(tmp_path, production_like_state(), [HISTORY_READ])
+
+    assert "[BLOCKED] remote:history-read" in result.stdout
+    assert_refused_to_classify(result)
+
+
+def test_history_read_failure_over_a_legacy_baseline_schema_fails_closed(tmp_path):
+    """The dangerous one: an assumed-empty history would say `legacy-baseline`."""
+    result, _ = failing_run(tmp_path, legacy_baseline_state(), [HISTORY_READ])
+
+    assert "[BLOCKED] remote:history-read" in result.stdout
+    assert "legacy-baseline" not in result.stdout
+    assert_refused_to_classify(result)
+
+
+def test_history_existence_probe_failure_fails_closed(tmp_path):
+    """Failing to learn WHETHER history exists is not 'there is no history'."""
+    result, _ = failing_run(tmp_path, production_like_state(), [HISTORY_EXISTS_PROBE])
+
+    assert "[BLOCKED] remote:history-probe" in result.stdout
+    assert_refused_to_classify(result)
+
+
+def test_a_failed_marker_probe_fails_closed(tmp_path, local):
+    """A probe that failed is not an observed absence.
+
+    Recording it as absent would manufacture drift against a complete
+    history; dropping it silently would let `fully-migrated` stand on an
+    inspection that did not finish.
+    """
+    complete = [entry["version"] for entry in local]
+    state = {"history_exists": True, "applied": complete, **catalog_for(complete)}
+    result, _ = failing_run(tmp_path, state, ["p.proname='claim_run_lease'"])
+
+    assert "[BLOCKED] remote:marker-probe" in result.stdout
+    assert "fully-migrated" not in result.stdout
+    assert_refused_to_classify(result)
+
+
+def test_a_failed_baseline_table_probe_fails_closed(tmp_path):
+    result, _ = failing_run(tmp_path, legacy_baseline_state(), ["table_name='run_events'"])
+
+    assert "[BLOCKED] remote:baseline-probe" in result.stdout
+    assert_refused_to_classify(result)
+
+
+def test_a_failed_relation_count_fails_closed(tmp_path):
+    result, _ = failing_run(tmp_path, production_like_state(), ["select count(*)"])
+
+    assert "[BLOCKED] remote:schema-shape" in result.stdout
+    assert_refused_to_classify(result)
+
+
+def test_a_failed_unexpected_relation_probe_fails_closed(tmp_path):
+    """Even the advisory probe: an unanswered question stays unanswered."""
+    result, _ = failing_run(tmp_path, production_like_state(), ["like 'milo_%'"])
+
+    assert "[BLOCKED] remote:unexpected-probe" in result.stdout
+    assert_refused_to_classify(result)
+
+
+def test_connectivity_failure_fails_closed(tmp_path):
+    result, _ = failing_run(tmp_path, production_like_state(), ["select 1"])
+
+    assert result.returncode != 0
+    assert "[BLOCKED] remote:connection" in result.stdout
+    for state in CLASSIFICATIONS:
+        assert f"classified as {state}" not in result.stdout
+    for stream in (result.stdout, result.stderr):
+        assert SECRET_PASSWORD not in stream
+
+
+def test_the_failure_injection_is_real(tmp_path):
+    """Without an injected failure these same fixtures classify normally.
+
+    Otherwise the assertions above could pass for the wrong reason.
+    """
+    production, _ = failing_run(tmp_path / "production", production_like_state(), [])
+    assert production.returncode == 0
+    assert "classified as partially-migrated" in production.stdout
+
+    baseline, _ = failing_run(tmp_path / "baseline", legacy_baseline_state(), [])
+    assert baseline.returncode == 0
+    assert "classified as legacy-baseline" in baseline.stdout

@@ -712,25 +712,71 @@ def test_production_metadata_without_the_pin_is_blocked(tmp_path):
 @pytest.mark.parametrize(
     ("pin", "url", "reason"),
     [
-        (OTHER_REF, f"https://{APPROVED_REF}.supabase.co", "not the hosted URL"),
-        (APPROVED_REF, f"https://{OTHER_REF}.supabase.co", "not the hosted URL"),
-        (APPROVED_REF, "https://db.internal.example", "not the hosted URL"),
-        (APPROVED_REF, f"https://{APPROVED_REF}.supabase.co.evil.test", "not the hosted URL"),
-        (APPROVED_REF, f"https://user@{APPROVED_REF}.supabase.co", "not the hosted URL"),
-        (APPROVED_REF, f"http://{APPROVED_REF}.supabase.co", "not the hosted URL"),
         ("not-a-ref", f"https://{APPROVED_REF}.supabase.co", "not a well-formed"),
         ("ABCDEFGHIJKLMNOPQRST", f"https://{APPROVED_REF}.supabase.co", "not a well-formed"),
         ("".join(["*"]), f"https://{APPROVED_REF}.supabase.co", "wildcards are forbidden"),
         ("<SUPABASE_PROJECT_REF>", f"https://{APPROVED_REF}.supabase.co", "still a placeholder"),
     ],
 )
-def test_production_metadata_with_a_mismatched_or_malformed_pin_is_blocked(tmp_path, pin, url, reason):
+def test_production_metadata_with_a_malformed_pin_is_blocked(tmp_path, pin, url, reason):
     env_file = _env_file(tmp_path, **{PIN_VAR: pin, "SUPABASE_URL": url})
     result = run_script("check-production-config.sh", "--env-file", str(env_file))
 
     assert result.returncode != 0
     assert "[BLOCKED] supabase-pin" in result.stdout
     assert reason in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# the checker and the runtime must accept exactly the same URL shape
+# ---------------------------------------------------------------------------
+# The release checker is what an operator runs BEFORE deploying. If it accepts
+# a URL the runtime will refuse, the deployment fails at startup; if it accepts
+# one the runtime would wrongly allow, the pin is not pinning anything. Either
+# way the two must not drift, so the same URLs are run through both and the
+# verdicts compared — rather than each side being spot-checked on its own.
+SUPABASE_URL_CASES = [
+    pytest.param(f"https://{APPROVED_REF}.supabase.co", True, id="root"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/", True, id="root-trailing-slash"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/evil", False, id="path"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/rest/v1", False, id="api-path"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co?foo=bar", False, id="query"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/?foo=bar", False, id="root-query"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/?", False, id="empty-query"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co#fragment", False, id="fragment"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co/#fragment", False, id="root-fragment"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co:444", False, id="explicit-port"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co:443", False, id="default-port-explicit"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co:bad", False, id="malformed-port"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co:", False, id="empty-port"),
+    pytest.param(f"https://user@{APPROVED_REF}.supabase.co", False, id="userinfo"),
+    pytest.param(f"https://user:pw@{APPROVED_REF}.supabase.co", False, id="credentials"),
+    pytest.param(f"https://{APPROVED_REF}.supabase.co.evil.test", False, id="suffix-smuggling"),
+    pytest.param(f"https://evil.test/{APPROVED_REF}.supabase.co", False, id="ref-in-path"),
+    pytest.param(f"https://{APPROVED_REF}.pooler.supabase.com", False, id="pooler"),
+    pytest.param(f"postgresql://user@{APPROVED_REF}.supabase.co:5432/postgres", False, id="postgresql"),
+    pytest.param(f"http://{APPROVED_REF}.supabase.co", False, id="http"),
+    pytest.param(f"https://{OTHER_REF}.supabase.co", False, id="other-project"),
+    pytest.param("https://db.internal.example", False, id="not-supabase"),
+]
+
+
+@pytest.mark.parametrize(("url", "accepted"), SUPABASE_URL_CASES)
+def test_the_checker_accepts_exactly_the_urls_the_runtime_accepts(tmp_path, url, accepted):
+    from backend.production_config import supabase_url_matches_project_ref
+
+    env_file = _env_file(tmp_path, **{PIN_VAR: APPROVED_REF, "SUPABASE_URL": url})
+    result = run_script("check-production-config.sh", "--env-file", str(env_file))
+    checker_accepted = "[PASS] supabase-pin" in result.stdout
+
+    assert supabase_url_matches_project_ref(url, APPROVED_REF) is accepted, url
+    assert checker_accepted is accepted, (
+        f"checker and runtime disagree on {url!r}: "
+        f"checker={'accept' if checker_accepted else 'reject'}, runtime={'accept' if accepted else 'reject'}"
+    )
+    if not accepted:
+        assert result.returncode != 0
+        assert "[BLOCKED] supabase-pin" in result.stdout
 
 
 def test_the_checker_never_prints_the_compared_supabase_values(tmp_path):

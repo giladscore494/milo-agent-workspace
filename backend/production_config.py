@@ -37,28 +37,65 @@ SUPABASE_PROJECT_REF_PATTERN = re.compile(r"^[a-z0-9]{20}$")
 # being accepted on a substring match.
 SUPABASE_HOSTED_URL_SUFFIX = ".supabase.co"
 
+# The accepted shape is the project's API BASE URL and nothing else:
+#
+#     https://<20-char-project-ref>.supabase.co
+#     https://<20-char-project-ref>.supabase.co/     (equivalent)
+#
+# The two root forms are genuinely equivalent to this runtime, not merely
+# similar: `backend/config.py` types SUPABASE_URL as a pydantic `HttpUrl`,
+# which normalises both to `https://<ref>.supabase.co/` before
+# `backend/repository/supabase.py` ever sees it.
+SUPABASE_ROOT_PATHS = ("", "/")
+
 
 def supabase_url_matches_project_ref(supabase_url: str, expected_ref: str) -> bool:
-    """True only when `supabase_url` is the hosted URL of exactly `expected_ref`.
+    """True only when `supabase_url` is the hosted API base URL of `expected_ref`.
 
-    The whole URL is checked, not just its host. `https` is required, and any
-    embedded credential rejects the value outright: a
-    `postgresql://user@<ref>.supabase.co/postgres` connection string carries
-    the right host while being a different kind of endpoint entirely, and
-    accepting it would let the pin pass on a value the runtime cannot use.
+    Every component is checked, not only the hostname. Matching the host
+    alone would accept `…supabase.co/evil`, `…supabase.co?foo=bar`,
+    `…supabase.co#x`, `…supabase.co:444` and `…supabase.co:bad` — all of
+    which carry the expected host while being a different endpoint, or not a
+    usable base URL at all. A pin that accepts them is not pinning the target.
+
+    The authority is compared as a whole (`netloc`), which is what makes
+    userinfo and an explicit port — valid or malformed — impossible to smuggle
+    past: no `.port` access is needed, so a malformed port cannot raise here
+    either.
 
     Parsing is defensive: a malformed URL is a mismatch, never an exception
     that escapes configuration validation. Neither argument is ever logged.
     """
+    ref = (expected_ref or "").strip().lower()
+    if not ref:
+        return False
+    expected_authority = f"{ref}{SUPABASE_HOSTED_URL_SUFFIX}"
+
+    raw = (supabase_url or "").strip()
+    # Checked on the RAW value, before parsing: a trailing `?` or `#` parses
+    # to an EMPTY query/fragment, which is falsy, so testing the parsed
+    # components alone would accept `https://<ref>.supabase.co/?`. The
+    # accepted forms contain neither delimiter at all.
+    if "?" in raw or "#" in raw:
+        return False
+
     try:
-        parsed = urlparse(supabase_url)
-        host = (parsed.hostname or "").lower()
-        has_credentials = bool(parsed.username or parsed.password)
+        parsed = urlparse(raw)
     except ValueError:
         return False
-    if parsed.scheme.lower() != "https" or has_credentials:
+
+    if parsed.scheme.lower() != "https":
         return False
-    return bool(host) and host == f"{expected_ref.lower()}{SUPABASE_HOSTED_URL_SUFFIX}"
+    # Exact authority: no userinfo, no port (well-formed or not), no
+    # trailing-colon or other odd form that still yields the right hostname.
+    if parsed.netloc.lower() != expected_authority:
+        return False
+    # Root only — a path under the project is an endpoint, not the base URL.
+    if parsed.path not in SUPABASE_ROOT_PATHS:
+        return False
+    if parsed.query or parsed.fragment or parsed.params:
+        return False
+    return True
 
 
 class ProductionConfigError(RuntimeError):

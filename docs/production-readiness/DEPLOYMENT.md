@@ -265,10 +265,27 @@ allowed to talk to.
 
 `backend/production_config.py` fails startup closed when it is missing
 (`PRODUCTION_DEPENDENCY_UNPINNED`), when it is not a well-formed hosted
-project ref (`PRODUCTION_DEPENDENCY_MALFORMED`), and when the `SUPABASE_URL`
-the runtime is handed is not that project's `https://<ref>.supabase.co` URL
-(`PRODUCTION_DEPENDENCY_MISMATCH`). No message echoes the expected ref, the
-observed host or the URL.
+project ref (`PRODUCTION_DEPENDENCY_MALFORMED`), and when `SUPABASE_URL` is
+not that project's API base URL (`PRODUCTION_DEPENDENCY_MISMATCH`). No message
+echoes the expected ref, the observed host or the URL.
+
+The accepted `SUPABASE_URL` is the project root and nothing else:
+
+    https://<project-ref>.supabase.co
+    https://<project-ref>.supabase.co/
+
+Both are accepted because they are genuinely equivalent to this runtime, not
+merely similar: `backend/config.py` types the variable as a pydantic
+`HttpUrl`, which normalises both to the trailing-slash form before
+`backend/repository/supabase.py` sees it.
+
+Everything else is refused, including forms that carry the expected hostname:
+a path (`…supabase.co/rest/v1`), a query (`…supabase.co?foo=bar`), a fragment,
+an explicit port (`…supabase.co:444`), a malformed port (`…supabase.co:bad`),
+embedded credentials (`https://user@…`), a pooler or database URL, and a
+host that merely ends with the expected one (`…supabase.co.evil.test`). The
+authority is compared whole rather than reduced to a hostname, which is what
+makes userinfo and ports impossible to strip away into a match.
 
 Staging has refused a wrong Supabase target since it was built. Production
 did not: the pin was explicitly staging-only, so a production runtime pointed

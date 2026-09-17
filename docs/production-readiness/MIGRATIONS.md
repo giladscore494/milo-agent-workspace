@@ -198,6 +198,16 @@ migration set in the table above — every 3-digit migration and every
   uninspectable history past the supported baseline, or a history row whose
   migration's object is provably missing all fail closed.
 
+An **incomplete inspection is never classified.** Every read the tool makes
+is status-checked, and a query that fails is recorded as a blocking finding
+rather than folded into an observation. "Could not read the migration
+history" and "the migration history is empty" are different states: an empty
+applied history over the four baseline tables legitimately classifies a
+database as `legacy-baseline`, whose documented remedy is to apply the whole
+ordered set, so a `SELECT` that merely failed must never be able to produce
+that answer. The same holds for the object markers — a probe that failed is
+not an observed absence.
+
 Object markers are **secondary evidence only**. They can add a drift finding
 — "history says this migration is applied, but the object it creates is not
 there" — and can never establish that a database is fully migrated. A

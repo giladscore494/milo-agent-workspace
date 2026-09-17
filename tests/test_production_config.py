@@ -284,33 +284,90 @@ def test_production_with_a_missing_supabase_url_fails_closed():
         validate_production_config(env)
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://db.internal.example",                      # not a hosted Supabase URL
-        f"https://{PROD_PROJECT_REF}.supabase.co.evil.test",  # suffix smuggling
-        f"https://evil.test/{PROD_PROJECT_REF}.supabase.co",  # ref in the path
-        f"https://{PROD_PROJECT_REF}.pooler.supabase.com",    # unsupported hosted form
-        f"postgresql://user@{PROD_PROJECT_REF}.supabase.co:5432/postgres",
-        "not a url at all",
-        "",
-    ],
-)
+# The pin must validate the WHOLE URL, not merely its hostname. Matching the
+# host alone accepted every one of these — each carries the expected host
+# while being a different endpoint, or not a usable API base URL at all. A pin
+# that accepts them is not pinning the target.
+REJECTED_URLS = [
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co/evil", id="path"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co/rest/v1", id="api-path"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co/?", id="empty-query"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co?foo=bar", id="query"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co/?foo=bar", id="root-query"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co#fragment", id="fragment"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co/#fragment", id="root-fragment"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co:444", id="explicit-port"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co:443", id="default-port-explicit"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co:bad", id="malformed-port"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co:", id="empty-port"),
+    pytest.param(f"https://user@{PROD_PROJECT_REF}.supabase.co", id="userinfo"),
+    pytest.param(f"https://user:pw@{PROD_PROJECT_REF}.supabase.co", id="credentials"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co.evil.test", id="suffix-smuggling"),
+    pytest.param(f"https://evil.test/{PROD_PROJECT_REF}.supabase.co", id="ref-in-path"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.pooler.supabase.com", id="pooler"),
+    pytest.param(f"postgresql://user@{PROD_PROJECT_REF}.supabase.co:5432/postgres", id="postgresql"),
+    pytest.param(f"http://{PROD_PROJECT_REF}.supabase.co", id="http"),
+    pytest.param(f"https://{OTHER_PROJECT_REF}.supabase.co", id="other-project"),
+    pytest.param("https://db.internal.example", id="not-supabase"),
+    pytest.param("not a url at all", id="not-a-url"),
+    pytest.param("", id="empty"),
+]
+
+# The project's API base URL. Both forms are equivalent to this runtime, not
+# merely similar: backend/config.py types SUPABASE_URL as a pydantic HttpUrl,
+# which normalises both to `https://<ref>.supabase.co/`.
+ACCEPTED_URLS = [
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co", id="root"),
+    pytest.param(f"https://{PROD_PROJECT_REF}.supabase.co/", id="root-trailing-slash"),
+]
+
+
+@pytest.mark.parametrize("url", REJECTED_URLS)
 def test_production_rejects_every_url_form_it_cannot_prove(url):
-    """An ambiguous or non-hosted URL form is never accepted on a near match."""
     env = {**BASE_PROD, "SUPABASE_URL": url}
     report = validate(env)
     assert not report.ok(), url
     assert {"PRODUCTION_DEPENDENCY_MISMATCH", "PRODUCTION_DEPENDENCY_UNPINNED"} & codes(report), url
 
 
-def test_the_url_matcher_accepts_only_the_exact_hosted_host():
-    assert supabase_url_matches_project_ref(f"https://{PROD_PROJECT_REF}.supabase.co", PROD_PROJECT_REF)
-    # Case-insensitive on both sides, as hostnames are.
-    assert supabase_url_matches_project_ref(f"https://{PROD_PROJECT_REF.upper()}.SUPABASE.CO", PROD_PROJECT_REF)
-    assert not supabase_url_matches_project_ref(f"https://{OTHER_PROJECT_REF}.supabase.co", PROD_PROJECT_REF)
-    # A malformed URL is a mismatch, never an exception that escapes validation.
-    assert not supabase_url_matches_project_ref("http://[oops", PROD_PROJECT_REF)
+@pytest.mark.parametrize("url", ACCEPTED_URLS)
+def test_production_accepts_the_hosted_root_url(url):
+    report = validate({**BASE_PROD, "SUPABASE_URL": url})
+    assert report.ok(), [i.message for i in report.errors]
+
+
+@pytest.mark.parametrize("url", REJECTED_URLS)
+def test_the_url_matcher_rejects_everything_but_the_hosted_root(url):
+    assert not supabase_url_matches_project_ref(url, PROD_PROJECT_REF), url
+
+
+@pytest.mark.parametrize("url", ACCEPTED_URLS)
+def test_the_url_matcher_accepts_the_hosted_root(url):
+    assert supabase_url_matches_project_ref(url, PROD_PROJECT_REF), url
+
+
+def test_the_url_matcher_is_case_insensitive_on_scheme_and_host():
+    """Hostnames are case-insensitive; the pin must not fail on casing alone."""
+    assert supabase_url_matches_project_ref(
+        f"HTTPS://{PROD_PROJECT_REF.upper()}.SUPABASE.CO", PROD_PROJECT_REF
+    )
+
+
+def test_the_url_matcher_never_raises_on_a_malformed_url():
+    """A malformed URL is a mismatch, never an exception escaping validation.
+
+    `:bad` is the important one: reading `urlparse(...).port` raises
+    ValueError, so an implementation that reached for the port to reject it
+    would crash instead of failing closed.
+    """
+    for url in ("http://[oops", f"https://{PROD_PROJECT_REF}.supabase.co:bad", "://", "https://"):
+        assert supabase_url_matches_project_ref(url, PROD_PROJECT_REF) is False, url
+
+
+def test_the_url_matcher_requires_an_expected_ref():
+    """An empty expected ref must never make `https://.supabase.co` a match."""
+    assert not supabase_url_matches_project_ref("https://.supabase.co", "")
+    assert not supabase_url_matches_project_ref(f"https://{PROD_PROJECT_REF}.supabase.co", "")
 
 
 def test_the_production_pin_does_not_weaken_staging():
@@ -335,11 +392,22 @@ def test_pinning_production_enables_no_execution_flag():
 # ---------------------------------------------------------------------------
 # secret scan
 # ---------------------------------------------------------------------------
-# The scan exempts one thing: a match that is the tail of a real repository
-# filename. Migration filenames legitimately contain `service_role`, and
-# docs/production-readiness/MIGRATIONS.md must name them EXACTLY because its
-# strict apply order is machine-checked against the directory. The exemption
-# is only safe if it still catches everything that is not a filename.
+# The scanner has NO allowlist, and in particular nothing is exempt because of
+# what a file is named. An earlier revision exempted any match that was the
+# tail of a real repository filename, to stop the `service_role` heuristic
+# firing on the legitimate migration filename that MIGRATIONS.md must name
+# exactly. That was too broad for a security scanner: filenames are
+# contributor-controlled, so adding one file could switch off detection for
+# credential-shaped text anywhere else in the tree.
+#
+# The false positive is fixed in the pattern instead — key material contains a
+# long unbroken alphanumeric run; a snake_case filename does not.
+#
+# Every sample below is assembled at runtime rather than written literally, so
+# this file does not itself become a finding.
+_ROLE = "service" + "_role"
+_PEM = "-----BEGIN " + "PRIVATE KEY" + "-----"
+BENIGN_MIGRATION = "20260706192500_grant_" + _ROLE + "_schema_privileges.sql"
 
 
 def _scanner():
@@ -355,35 +423,97 @@ def test_secret_scan_passes_on_the_repository():
     assert "secret scan passed" in result.stdout
 
 
-# Every sample below is assembled at runtime rather than written literally,
-# so this file does not itself become a secret-scan finding — the same trick
-# the wildcard fixtures in tests/test_release_tooling.py use.
-_ROLE = "service" + "_role"
-_PEM = "-----BEGIN " + "PRIVATE KEY" + "-----"
-
-
 def test_secret_scan_still_catches_real_credential_material():
     scanner = _scanner()
-    names = scanner.filename_tails(scanner.scanned_files(REPO))
 
     for leaked in (
         _ROLE + "_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abc",
+        _ROLE + "." + "a" * 24,
+        # A key sitting behind another word — the old pattern missed this one.
+        _ROLE + "_key_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
         "sk-" + "a" * 40,
         _PEM,
         f'SUPABASE_SERVICE_ROLE_KEY="{_ROLE}.' + "a" * 24 + '"',
     ):
-        assert scanner.findings_for(leaked, names), f"scanner missed: {leaked[:16]}…"
+        assert scanner.findings_for(leaked), f"scanner missed: {leaked[:16]}…"
 
 
-def test_secret_scan_exempts_only_real_repository_filenames():
+def test_the_benign_migration_filename_is_not_credential_shaped():
+    """It is allowed because of its SHAPE, not because a file by that name exists."""
     scanner = _scanner()
-    names = scanner.filename_tails(scanner.scanned_files(REPO))
 
-    # The real migration filename the docs must name exactly.
-    real = "20260706192500_grant_" + _ROLE + "_schema_privileges.sql"
-    assert (REPO / "supabase" / "migrations" / real).exists()
-    assert not scanner.findings_for(f"see `{real}` for the grants", names)
+    assert (REPO / "supabase" / "migrations" / BENIGN_MIGRATION).exists()
+    assert not scanner.findings_for(f"see `{BENIGN_MIGRATION}` for the grants")
+    # …and it is really in the docs, where the strict-order check needs it.
+    assert BENIGN_MIGRATION in (REPO / "docs" / "production-readiness" / "MIGRATIONS.md").read_text()
 
-    # A credential dressed up to look like a filename is NOT exempt, because
-    # no such file exists.
-    assert scanner.findings_for(_ROLE + "_" + "a" * 24 + ".sql", names)
+
+def test_a_credential_spelled_like_a_filename_is_still_caught():
+    """Dressing key material up with a .sql suffix does not make it benign."""
+    scanner = _scanner()
+
+    assert scanner.findings_for(_ROLE + "_" + "a" * 24 + ".sql")
+
+
+def _old_filename_exemption_would_suppress(secret: str, decoy_name: str) -> bool:
+    """Would the REMOVED rule have exempted `secret` given a file `decoy_name`?
+
+    The rule was: skip a match that is the tail of any real filename. This
+    reproduces it so the tests below can prove they are exercising the actual
+    hole, rather than a decoy that never exploited it (a filename ending in
+    `.sql` does not, because the matched text stops before the extension).
+    """
+    return decoy_name.endswith(secret)
+
+
+def test_no_filename_can_exempt_credential_text_elsewhere(tmp_path):
+    """The adversarial case the filename-based exemption made possible.
+
+    A contributor adds a file whose basename ENDS WITH credential-shaped text.
+    Under the removed rule that text became exempt repository-wide, so the same
+    string in a real file stopped being reported at all.
+    """
+    scanner = _scanner()
+    secret = _ROLE + "_" + "a" * 24
+    decoy = f"x_{secret}"
+
+    # Precondition: this decoy really does exploit the removed rule.
+    assert _old_filename_exemption_would_suppress(secret, decoy)
+
+    (tmp_path / decoy).write_text("select 1;\n")
+    (tmp_path / "config.env").write_text(f"SUPABASE_KEY={secret}\n")
+
+    findings = scanner.scan(tmp_path)
+
+    assert any(finding.endswith("config.env") for finding in findings), (
+        f"a decoy filename suppressed a real finding: {findings}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("leak_file", "secret"),
+    [
+        pytest.param("jwt.env", _ROLE + "_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abc", id="service-role-jwt"),
+        pytest.param("openai.env", "sk-" + "b" * 40, id="sk-key"),
+        pytest.param("key.pem", _PEM, id="pem"),
+    ],
+)
+def test_every_pattern_survives_a_decoy_filename(tmp_path, leak_file, secret):
+    """No pattern may be switched off by naming a file after its match."""
+    scanner = _scanner()
+    decoy = f"x{secret}"
+    assert _old_filename_exemption_would_suppress(secret, decoy)
+
+    (tmp_path / decoy).write_text("select 1;\n")
+    (tmp_path / leak_file).write_text(secret + "\n")
+
+    findings = {Path(f).name for f in scanner.scan(tmp_path)}
+
+    assert leak_file in findings, f"{leak_file} was not reported; findings={findings}"
+
+
+def test_the_scanner_reports_a_clean_tree_as_clean(tmp_path):
+    scanner = _scanner()
+    (tmp_path / "notes.md").write_text(f"The migration is `{BENIGN_MIGRATION}`.\n")
+
+    assert scanner.scan(tmp_path) == []
