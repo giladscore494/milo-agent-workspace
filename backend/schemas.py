@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 from uuid import UUID
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
 DEFAULT_CONVERSATION_TITLE = "New conversation"
 
@@ -283,3 +283,149 @@ class WorkerRunCompleteRequest(BaseModel):
 class WorkerRunFailRequest(BaseModel):
     code: str = Field(min_length=1)
     message: str = Field(min_length=1)
+
+
+# ---------------------------------------------------------------------------
+# CODE-3: the bounded, read-only catalog review contracts.
+# ---------------------------------------------------------------------------
+#
+# Explicit response models rather than `dict[str, Any]`, because these are the
+# only catalog rows that reach a browser. `extra="forbid"` is the point of
+# them: `backend/catalog/review.py` builds each item key by key from a closed
+# allowlist, and this is the second, independent check that nothing else got in
+# -- a stored column that somehow reached the projection fails validation here
+# instead of being serialized.
+#
+# Every optional field means ABSENT, never zero and never empty text. A field
+# the durable row does not state is `null`, which is a different answer from
+# "it states nothing", and neither is ever rendered as a value.
+
+
+class CatalogIdentityDimensions(BaseModel):
+    """The closed R4 identity dimensions a catalog row may state.
+
+    Named fields rather than a free map: a jsonb column reaching a browser as
+    an open object is exactly the unprojected blob the CODE-3 contract forbids,
+    and this makes the vocabulary a property of the response schema.
+    Mirrors `CANDIDATE_IDENTITY_DIMENSIONS` in `backend/catalog/contracts.py`.
+
+    A dimension the row does not state is an ABSENT KEY, not a null -- the same
+    rule `stated_identity_dimensions` enforces on the way in, held to on the way
+    out. There is no "unknown" value here, because an unstated dimension and a
+    dimension stated as nothing are not the same thing and neither is a guess.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    body_style: str | None = None
+    drivetrain: str | None = None
+    engine_code: str | None = None
+    fuel_type: str | None = None
+    generation: str | None = None
+    market: str | None = None
+    propulsion_technology: str | None = None
+    transmission: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _only_stated_dimensions(self, handler: Any) -> dict[str, Any]:
+        return {name: value for name, value in handler(self).items() if value is not None}
+
+
+class CanonicalCatalogItem(BaseModel):
+    """One canonical variant as the review surface states it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    canonical_key: str
+    model_canonical_key: str | None = None
+    manufacturer: str | None = None
+    commercial_model: str | None = None
+    model_year_start: int | None = None
+    model_year_end: int | None = None
+    official_model_code: str | None = None
+    trim: str | None = None
+    identity_dimensions: CatalogIdentityDimensions = Field(
+        default_factory=CatalogIdentityDimensions)
+    promoted_at: str | None = None
+    revised_at: str | None = None
+
+
+class CatalogReviewCandidateItem(BaseModel):
+    """One candidate awaiting review. NOT a canonical row, and never shown as one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidate_key: str
+    status: str
+    manufacturer: str | None = None
+    commercial_model: str | None = None
+    model_year_start: int | None = None
+    model_year_end: int | None = None
+    official_model_code: str | None = None
+    trim: str | None = None
+    identity_dimensions: CatalogIdentityDimensions = Field(
+        default_factory=CatalogIdentityDimensions)
+
+
+class CatalogReviewSnapshot(BaseModel):
+    """What is being reviewed: the active Government snapshot's safe metadata."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    snapshot_key: str
+    resource_id: str | None = None
+    package_id: str | None = None
+    publisher: str | None = None
+    dataset_title: str | None = None
+    dataset_market_scope: str | None = None
+    upstream_version: str | None = None
+    upstream_version_kind: str | None = None
+    activated_at: str | None = None
+    declared_record_count: int | None = None
+    stored_record_count: int | None = None
+    normalization_contract: str | None = None
+    normalization_issue_count: int | None = None
+
+
+class CatalogPageMeta(BaseModel):
+    """The page itself: what was asked for, and what the database said.
+
+    `total` and `has_more` are `null` for "the database did not state one".
+    Neither is ever inferred from the page length, and neither is ever reported
+    as `0`/`false` to fill a gap -- an unknown total that rendered as zero would
+    be the claim that the catalog is empty.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: int
+    offset: int
+    total: int | None = None
+    has_more: bool | None = None
+
+
+class CatalogCanonicalPage(BaseModel):
+    """One bounded page of the current canonical catalog."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    page: CatalogPageMeta
+    items: list[CanonicalCatalogItem] = Field(default_factory=list)
+
+
+class CatalogReviewPage(BaseModel):
+    """One bounded page of `ready_for_review` candidates, or why there is none.
+
+    `available` false is an HONEST unavailable state, not an empty catalog: the
+    items are empty, the snapshot is null and `page.total` is null rather than
+    zero, and `unavailable_reason` says which condition held.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool
+    unavailable_reason: str | None = None
+    status: str
+    snapshot: CatalogReviewSnapshot | None = None
+    page: CatalogPageMeta
+    items: list[CatalogReviewCandidateItem] = Field(default_factory=list)

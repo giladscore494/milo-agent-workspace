@@ -34,6 +34,7 @@ from backend.dependencies import get_job_launcher, get_repository
 from backend.gateway_auth import get_gateway_token_verifier
 from backend.job_launcher import JobLaunchUncertain
 from backend.main import app
+from backend.testing.catalog_review_seed import seed_catalog_review_state
 from backend.testing.memory_repository import MemoryRepository
 from backend.worker_auth import get_token_verifier
 
@@ -59,6 +60,19 @@ def build_repository() -> MemoryRepository:
     repo.seed_project(PROJECT_BETA, "beta-catalog", "Beta Catalog", [BOB])
     repo.seed_project(PROJECT_GAMMA, "gamma-swarm", "Gamma Swarm", [ALICE],
                       workflow_key="swarm_v2")
+    # CODE-3: durable catalog state for the read-only review surface. The
+    # catalog is GLOBAL rather than project-owned, so this is seeded once and is
+    # readable by any member of any project -- which is exactly the property the
+    # E2E suite checks, along with a non-member being refused. Offline: the
+    # committed R5 capture fixtures, no socket, no model call.
+    #
+    # A seed that cannot run must not take the stack down: an empty catalog is a
+    # state the surface is required to present honestly, and leaving the backend
+    # up means the E2E suite exercises that path instead of failing to start.
+    try:
+        seed_catalog_review_state(repo, user_id=ALICE, project_id=PROJECT_ALPHA)
+    except Exception:  # pragma: no cover - test harness resilience only
+        pass
     return repo
 
 

@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.budget import BudgetConfig
+from backend.catalog import review as catalog_review
 from backend.config import get_settings
 from backend.auth import AuthenticatedUser, get_authenticated_user
 from backend.dependencies import get_job_launcher, get_repository
@@ -19,6 +20,9 @@ from backend.job_launcher import JobLauncher, JobLaunchUncertain
 from backend.errors import AppError, install_error_handlers
 from backend.repository import Repository
 from backend.schemas import (
+    CatalogCanonicalPage,
+    CatalogPageMeta,
+    CatalogReviewPage,
     Conversation,
     ConversationCreate,
     HealthResponse,
@@ -113,6 +117,19 @@ def _safe_run_usage(raw: object) -> RunUsage | None:
         return None
     # An object carrying only unrecognized keys projects onto nothing.
     return usage if usage.model_dump(exclude_none=True) else None
+
+
+def _catalog_page_meta(page: catalog_review.CatalogPage) -> CatalogPageMeta:
+    """The page metadata a bounded catalog read states.
+
+    `total` and `has_more` come straight from the page, which took the total
+    from the database's own exact count and left it `None` when the database
+    stated none. Neither is derived from `len(items)` here, and neither is
+    defaulted to `0`/`False`: an unknown total rendered as zero would be the
+    claim that the catalog is empty.
+    """
+    return CatalogPageMeta(limit=page.limit, offset=page.offset, total=page.total,
+                           has_more=page.has_more)
 
 
 def _safe_run_response(run: dict) -> dict:
@@ -265,6 +282,89 @@ def get_project(project_id: UUID, user: AuthenticatedUser = Depends(get_authenti
 def list_conversations(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> list[dict]:
     repo.get_project(project_id, user.user_id)
     return repo.list_conversations(project_id)
+
+
+# --- CODE-3: the bounded, read-only catalog review surface -------------------
+#
+# Two GETs, and nothing else. There is no POST/PUT/PATCH/DELETE counterpart
+# anywhere in this file, no catalog write is reachable from either handler, and
+# neither is listed in `execution_guard.SURFACE_RULES` -- DELIBERATELY.
+#
+# Reading durable state is not execution. `MILO_ENABLE_CATALOG_EXECUTION` stops
+# the catalog WRITE path so an operator can roll back without stopping the
+# product, and it is explicitly non-destructive: the rows stay. The operator who
+# just pulled that switch is the one who most needs to see what is there, so
+# gating this read behind it would make the rollback blind. The same reasoning
+# rules out the paid-execution flag, run creation and promotion enablement.
+#
+# The project id is an AUTHORIZATION ANCHOR, not an owner. The durable catalog
+# is global; `repo.get_project(project_id, user.user_id)` is the repository's
+# normal membership check and raises the same non-disclosing 404 a non-member
+# receives everywhere else, and only then does the global read happen. Nothing
+# below pretends a canonical row belongs to the project.
+
+
+# Neither handler DECLARES its query parameters, and that is load-bearing.
+#
+# A declared `limit: int` is bound and validated by FastAPI BEFORE the handler
+# body runs, so `?limit=abc` answers 422 before the membership check -- and a
+# non-member would then receive a different response depending on what they
+# sent, which is a disclosure through the authorization boundary. Reading the
+# raw query string inside the handler is what keeps the four steps in order:
+#
+#     1. authenticate        (the dependency below)
+#     2. authorize membership (`repo.get_project`, the non-disclosing 404)
+#     3. validate the query contract (names, duplicates, then values)
+#     4. read the catalog
+#
+# The accepted names are `catalog_review.CANONICAL_QUERY_PARAMETERS` and
+# `REVIEW_QUERY_PARAMETERS`; anything else fails closed on one static code.
+
+
+@app.get("/projects/{project_id}/catalog/canonical", response_model=CatalogCanonicalPage)
+def get_catalog_canonical_page(
+    project_id: UUID,
+    request: Request,
+    user: AuthenticatedUser = Depends(get_authenticated_user),
+    repo: Repository = Depends(get_repository),
+) -> CatalogCanonicalPage:
+    """A bounded page of the CURRENT canonical catalog.
+
+    Accepts `limit`, `offset`, `manufacturer`, `commercial_model`, `model_year`
+    and `canonical_key`, each at most once. There is no parameter for a table, a
+    column, an ordering, a page bound or a status -- those are server data in
+    `backend/catalog/review.py` and in the repository method it calls -- and a
+    name outside the allowlist is refused rather than ignored.
+    """
+    repo.get_project(project_id, user.user_id)
+    query = catalog_review.canonical_query(request.query_params)
+    page = catalog_review.canonical_catalog(repo, **query)
+    return CatalogCanonicalPage(page=_catalog_page_meta(page), items=page.items)
+
+
+@app.get("/projects/{project_id}/catalog/review-candidates", response_model=CatalogReviewPage)
+def get_catalog_review_candidates(
+    project_id: UUID,
+    request: Request,
+    user: AuthenticatedUser = Depends(get_authenticated_user),
+    repo: Repository = Depends(get_repository),
+) -> CatalogReviewPage:
+    """A bounded page of candidates whose durable status is `ready_for_review`.
+
+    Accepts `limit`, `offset`, `manufacturer`, `commercial_model` and
+    `model_year`, each at most once. The snapshot is resolved by the
+    repository's own trusted rule against the pinned WLTP resource constant, and
+    the status is fixed: `resource_id`, `snapshot_key`, `snapshot_id`, `status`
+    and `allow_incomplete` are not accepted here, so a browser cannot point this
+    anywhere else and cannot be told it inspected something it did not.
+    """
+    repo.get_project(project_id, user.user_id)
+    query = catalog_review.review_query(request.query_params)
+    page = catalog_review.review_candidates(repo, **query)
+    return CatalogReviewPage(
+        available=page.available, unavailable_reason=page.unavailable_reason,
+        status=catalog_review.REVIEW_CANDIDATE_STATUS, snapshot=page.snapshot,
+        page=_catalog_page_meta(page), items=page.items)
 
 
 @app.post("/projects/{project_id}/conversations", response_model=Conversation, status_code=201)
