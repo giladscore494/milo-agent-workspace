@@ -137,11 +137,14 @@ export function CatalogReviewPanel({
           />
         </div>
 
+        {/* `aria-busy` rather than a blanked region: a refresh in flight is a
+            property of the view, not a replacement for it. */}
         <div
           className="catalog-view"
           id={`catalog-panel-${view}`}
           role="tabpanel"
           aria-labelledby={`catalog-tab-${view}`}
+          aria-busy={loading}
           data-surface={view}
         >
           <CatalogViewBody
@@ -220,7 +223,14 @@ function CatalogViewBody({
   const page = view === 'canonical' ? canonical : review;
   // `undefined` is "not read yet", which is a different statement from "the
   // catalog is empty" and never borrows its message.
-  if (loading || page === undefined) {
+  //
+  // Only the FIRST read blanks the surface. A page already on screen stays
+  // there while the next one loads, marked busy by the region above: blanking
+  // the table on every page turn hides the thing the operator is reading, and
+  // it also removes the pagination control mid-turn, which is how two page
+  // requests could never be in flight at once. They can now, and
+  // `tests/catalogReviewRace.test.tsx` proves the newest one wins.
+  if (page === undefined) {
     return (
       <StatusNote
         symbol="…"

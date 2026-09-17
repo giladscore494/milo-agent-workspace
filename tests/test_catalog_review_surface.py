@@ -446,27 +446,195 @@ def test_review_pagination_ordering_is_deterministic(surface):
 # 5. filters are an allowlist, never query control
 # =============================================================================
 
-@pytest.mark.parametrize("path", CODE3_PATHS)
-@pytest.mark.parametrize("param", [
+#: Names a caller might reach for that this surface does not accept. Several are
+#: real query controls of the layers underneath -- `p_limit`/`p_status` are
+#: arguments of `catalog_candidate_variant_page`, `allow_incomplete` is the
+#: acknowledgement that lets an incomplete snapshot answer -- which is exactly
+#: why being SILENT about them was the defect: a request naming one was answered
+#: as though it had been honoured.
+UNSUPPORTED_QUERY_PARAMETERS = (
     "order", "sort", "select", "table", "columns", "status", "snapshot_key",
     "snapshot_id", "resource_id", "allow_incomplete", "p_limit", "p_status",
     "q", "filter", "where", "limit_override",
-])
-def test_unsupported_query_parameters_are_not_query_control(surface, path, param):
-    """An unsupported parameter is INERT: the route never reads it.
+)
 
-    The handler declares every parameter it accepts by name, so a name it does
-    not declare cannot reach the repository at all. The answer is therefore the
-    unfiltered page -- identical to the request without it -- rather than a
-    page the parameter steered.
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+@pytest.mark.parametrize("param", UNSUPPORTED_QUERY_PARAMETERS)
+def test_an_unsupported_query_parameter_fails_closed(surface, path, param):
+    """A name this route does not accept is REFUSED, never quietly dropped.
+
+    Silently ignoring one is how `?snapshot_key=X` returns the ACTIVE snapshot
+    while the operator believes X was inspected, and how `?status=promoted`
+    returns `ready_for_review` rows under a heading the caller did not ask for.
+    An answer to a question nobody asked is worse than no answer.
     """
     client, _recording, _repository, user, project = surface
-    target = path.format(project_id=project)
-    baseline = client.get(target, headers=member(user))
-    steered = client.get(target, params={param: "catalog_raw_records"},
-                         headers=member(user))
-    assert steered.status_code == 200
-    assert steered.json() == baseline.json()
+    response = client.get(path.format(project_id=project),
+                          params={param: "catalog_raw_records"}, headers=member(user))
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "CATALOG_REVIEW_QUERY_PARAMETER_UNSUPPORTED"
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+@pytest.mark.parametrize("param", UNSUPPORTED_QUERY_PARAMETERS)
+def test_the_refusal_echoes_neither_the_name_nor_the_value(surface, path, param):
+    """A static, code-owned sentence. Nothing the caller sent comes back.
+
+    An error that quoted the parameter would turn the refusal into a probe: a
+    caller could enumerate which names the server recognises by reading its own
+    input back, and a value echoed into an error is a reflection surface.
+    """
+    client, _recording, _repository, user, project = surface
+    secret_value = "reflected-value-8d41f2"
+    response = client.get(path.format(project_id=project),
+                          params={param: secret_value}, headers=member(user))
+    assert response.status_code == 400
+    assert secret_value not in response.text
+    # The message is the module's own authored constant, character for
+    # character. Asserting `param not in body` would be unsound -- a
+    # one-character name like `q` occurs in ordinary English -- and weaker:
+    # equality with a constant proves nothing the caller sent can be in it.
+    assert response.json()["error"]["message"] == catalog_review.UNSUPPORTED_PARAMETER_MESSAGE
+    # ...and the refusal is identical whatever was sent, so it carries no signal
+    # about which names the server recognises.
+    other = client.get(path.format(project_id=project),
+                       params={"totally-different-name": "x"}, headers=member(user))
+    assert other.json() == response.json()
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+def test_an_unsupported_parameter_stops_before_any_catalog_read(surface, path):
+    """Membership is checked, then the contract, then nothing.
+
+    The ordering matters in both directions: the membership check must still
+    run (so a non-member is refused as a non-member), and no catalog method may
+    run after it (so a malformed request costs the database nothing).
+    """
+    client, recording, _repository, user, project = surface
+    recording.calls.clear()
+    response = client.get(path.format(project_id=project),
+                          params={"order": "manufacturer.desc"}, headers=member(user))
+    assert response.status_code == 400
+    assert recording.calls == ["get_project"]
+    assert recording.writes == []
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+@pytest.mark.parametrize("param", UNSUPPORTED_QUERY_PARAMETERS)
+def test_a_non_member_sending_an_unsupported_parameter_still_learns_nothing(surface, path, param):
+    """The authorization answer comes FIRST and is unchanged.
+
+    If the query contract were checked before membership, a stranger could tell
+    a real project from an imaginary one by which error came back. It is not,
+    so a non-member receives the same non-disclosing 404 whatever they send.
+    """
+    client, recording, _repository, _user, project = surface
+    stranger = str(uuid4())
+    plain = client.get(path.format(project_id=project), headers=member(stranger))
+    steered = client.get(path.format(project_id=project), params={param: "x"},
+                         headers=member(stranger))
+    assert plain.status_code == steered.status_code == 404
+    assert plain.json() == steered.json()
+    assert steered.json()["error"]["code"] == "PROJECT_NOT_FOUND"
+    assert recording.writes == []
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+def test_a_repeated_query_parameter_fails_closed(surface, path):
+    """`?limit=10&limit=20` is ambiguous, so it is refused rather than guessed.
+
+    No repository-wide policy defines a reviewed behaviour for a repeated query
+    parameter -- `after_event_id` on the run-events route is the only other one
+    in the API and states none -- so there is nothing to follow here, and
+    silently selecting the first or the last would answer a question the caller
+    did not unambiguously ask.
+    """
+    client, recording, _repository, user, project = surface
+    recording.calls.clear()
+    response = client.get(f"{path.format(project_id=project)}?limit=10&limit=20",
+                          headers=member(user))
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "CATALOG_REVIEW_QUERY_PARAMETER_UNSUPPORTED"
+    assert recording.calls == ["get_project"]
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+def test_a_repeated_filter_fails_closed_too(surface, path):
+    client, _recording, _repository, user, project = surface
+    response = client.get(
+        f"{path.format(project_id=project)}?manufacturer=A&manufacturer=B",
+        headers=member(user))
+    assert response.status_code == 400
+
+
+#: The allowlists the CODE-3 contract states, written out HERE rather than read
+#: from the module under test. Reading them from `review.py` would make the
+#: acceptance test tautological -- it would pass for any allowlist the code
+#: happened to hold, including a wrong one.
+EXPECTED_CANONICAL_PARAMETERS = ("limit", "offset", "manufacturer",
+                                 "commercial_model", "model_year", "canonical_key")
+EXPECTED_REVIEW_PARAMETERS = ("limit", "offset", "manufacturer",
+                              "commercial_model", "model_year")
+
+
+def test_the_per_route_allowlists_are_exactly_the_contract():
+    assert catalog_review.CANONICAL_QUERY_PARAMETERS == EXPECTED_CANONICAL_PARAMETERS
+    assert catalog_review.REVIEW_QUERY_PARAMETERS == EXPECTED_REVIEW_PARAMETERS
+    # The review route accepts a strict subset: it names no canonical key,
+    # because a candidate has none.
+    assert set(EXPECTED_REVIEW_PARAMETERS) < set(EXPECTED_CANONICAL_PARAMETERS)
+
+
+@pytest.mark.parametrize("path, allowed", [
+    (CANONICAL_PATH, EXPECTED_CANONICAL_PARAMETERS),
+    (REVIEW_PATH, EXPECTED_REVIEW_PARAMETERS),
+])
+def test_every_allowlisted_parameter_is_accepted(surface, path, allowed):
+    """The allowlist is exactly what the route accepts -- no more, no less."""
+    client, _recording, _repository, user, project = surface
+    values = {"limit": "5", "offset": "0", "manufacturer": "Toyota",
+              "commercial_model": "RAV4", "model_year": "2022",
+              "canonical_key": "cv1." + "a" * 32}
+    for name in allowed:
+        response = client.get(path.format(project_id=project),
+                              params={name: values[name]}, headers=member(user))
+        assert response.status_code == 200, (name, response.text)
+
+
+def test_canonical_key_is_canonical_only_and_is_refused_on_the_review_route(surface):
+    """A parameter of the OTHER route is still an unsupported parameter here."""
+    client, _recording, _repository, user, project = surface
+    response = client.get(REVIEW_PATH.format(project_id=project),
+                          params={"canonical_key": "cv1." + "a" * 32},
+                          headers=member(user))
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "CATALOG_REVIEW_QUERY_PARAMETER_UNSUPPORTED"
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+@pytest.mark.parametrize("param, value", [
+    ("resource_id", src.QUANTITY_RESOURCE_ID),
+    ("snapshot_key", "cs1." + "f" * 32),
+    ("status", "promoted"),
+    ("status", "candidate"),
+    ("table", "catalog_raw_records"),
+    ("select", "*"),
+    ("order", "manufacturer.desc"),
+    ("allow_incomplete", "true"),
+])
+def test_the_named_steering_parameters_can_never_reach_the_query(surface, path, param, value):
+    """The eight the review named, each refused before any read happens.
+
+    Refusal is the proof that matters. An inert parameter and a honoured one are
+    indistinguishable from the caller's side when both return 200.
+    """
+    client, recording, _repository, user, project = surface
+    recording.calls.clear()
+    response = client.get(path.format(project_id=project), params={param: value},
+                          headers=member(user))
+    assert response.status_code == 400
+    assert recording.calls == ["get_project"]
 
 
 @pytest.mark.parametrize("path", CODE3_PATHS)
@@ -721,15 +889,26 @@ def test_candidate_review_uses_the_active_government_wltp_snapshot(surface):
 
 
 def test_the_review_surface_names_no_resource_and_cannot_be_pointed_elsewhere(surface):
-    """The resource is a constant. A caller has no parameter that names one."""
-    client, _recording, _repository, user, project = surface
-    baseline = client.get(REVIEW_PATH.format(project_id=project), headers=member(user))
+    """The resource is a constant, and naming one is REFUSED rather than ignored.
+
+    The original version of this test asserted the redirected request returned
+    the same page as the plain one -- true, but the wrong property: a caller who
+    sent `snapshot_key` was told nothing, and a 200 carrying the ACTIVE
+    snapshot reads as confirmation that the named one was inspected. Refusing
+    is what makes the answer honest.
+    """
+    client, recording, _repository, user, project = surface
+    recording.calls.clear()
     redirected = client.get(REVIEW_PATH.format(project_id=project),
                             params={"resource_id": src.QUANTITY_RESOURCE_ID,
                                     "snapshot_key": "cs1." + "f" * 32},
                             headers=member(user))
-    assert redirected.status_code == 200
-    assert redirected.json() == baseline.json()
+    assert redirected.status_code == 400
+    assert redirected.json()["error"]["code"] == "CATALOG_REVIEW_QUERY_PARAMETER_UNSUPPORTED"
+    # Refused before any catalog read, so neither name reached the resolver.
+    assert recording.calls == ["get_project"]
+    # And the quantity resource is never named back to the caller either.
+    assert src.QUANTITY_RESOURCE_ID not in redirected.text
 
 
 def test_no_active_snapshot_is_an_explicit_unavailable_state_not_an_empty_catalog(surface):
@@ -1010,3 +1189,208 @@ def test_a_page_reports_unknown_rather_than_zero_when_the_total_is_not_stated():
     page = catalog_review.CatalogPage(items=(), limit=25, offset=0, total=None)
     assert page.total is None
     assert page.has_more is None
+
+
+# =============================================================================
+# 12. the RESPONSE BOUNDARY: a secret never reaches the browser at all
+# =============================================================================
+#
+# The frontend parser redacts every durable string before it renders one, and
+# that stays. It is not sufficient on its own: by the time it runs, the HTTP
+# response has already been delivered to the browser, sat in the network panel,
+# and been handled by whatever else observes traffic. "Hidden from the DOM" is
+# not "never sent".
+#
+# So redaction happens on the way OUT of the API too, and these tests read the
+# RAW response body rather than a parsed projection.
+
+#: Credential-shaped sentinels, assembled at runtime so no key-shaped literal is
+#: committed -- the same rule `frontend/tests/secretSentinels.ts` follows, and
+#: the same four shapes, so the two boundaries are swept against one vocabulary.
+API_KEY_SENTINEL = "-".join(["sk", "live", "A" * 8 + "B" * 8 + "9876"])
+BEARER_SENTINEL = f"Bearer {API_KEY_SENTINEL}"
+JWT_SENTINEL = ".".join(["eyJhbGciOiJIUzI1NiJ9", "eyJyb2xlIjoic2VydmljZSJ9",
+                         "not-a-real-signature"])
+SUPABASE_SECRET_SENTINEL = "_".join(["sb", "secret", "A" * 10 + "B" * 10 + "1234"])
+ALL_SECRET_SENTINELS = (API_KEY_SENTINEL, BEARER_SENTINEL, JWT_SENTINEL,
+                        SUPABASE_SECRET_SENTINEL)
+
+#: The same four, carried as pytest params under LABELS rather than values.
+#: A parametrized value becomes a node id, and pytest writes node ids into
+#: `.pytest_cache`; CI runs the suite before `scripts/secret_scan.py`, so a raw
+#: sentinel in an id would fail the scan on a generated file. The label keeps
+#: the value out of every artifact and makes the test output readable.
+SENTINEL_PARAMS = (
+    pytest.param(API_KEY_SENTINEL, id="provider_api_key"),
+    pytest.param(BEARER_SENTINEL, id="bearer_token"),
+    pytest.param(JWT_SENTINEL, id="legacy_jwt"),
+    pytest.param(SUPABASE_SECRET_SENTINEL, id="supabase_secret_key"),
+)
+
+#: Fragments that must not survive even partially redacted.
+SECRET_FRAGMENTS = ("sk-live-", "eyJhbGciOiJIUzI1NiJ9", "Bearer ", "sb_secret_")
+
+
+def poison_canonical(repository: MemoryRepository, value: str) -> None:
+    """Put credential-shaped text in every canonical string CODE-3 may project.
+
+    Durable columns the projection is otherwise ALLOWED to carry -- not fields
+    it already drops. A test that poisoned a dropped column would prove only
+    that the field allowlist works, which is a different property and is
+    already covered above.
+    """
+    for row in repository.catalog_models:
+        row["manufacturer"] = f"Toyota {value}"
+        row["commercial_model"] = f"RAV4 {value}"
+    for row in repository.catalog_canonical_field_provenance:
+        if row["field_key"] in ("trim", "official_model_code"):
+            row["field_value"] = f"TRIM {value}"
+
+
+def poison_review(repository: MemoryRepository, value: str) -> None:
+    """The same, for the candidate rows and the snapshot metadata."""
+    for row in repository.catalog_candidates.values():
+        row["manufacturer"] = f"Toyota {value}"
+        row["trim"] = f"TRIM {value}"
+    for row in repository.catalog_snapshots.values():
+        metadata = dict(row["retrieval_metadata"])
+        metadata["dataset_title"] = f"WLTP {value}"
+        metadata["publisher"] = f"ministry {value}"
+        row["retrieval_metadata"] = metadata
+
+
+@pytest.mark.parametrize("sentinel", SENTINEL_PARAMS)
+def test_a_credential_in_a_canonical_column_never_reaches_the_response(surface, sentinel):
+    client, _recording, repository, user, project = surface
+    poison_canonical(repository, sentinel)
+    response = client.get(CANONICAL_PATH.format(project_id=project), headers=member(user))
+    assert response.status_code == 200
+    assert sentinel not in response.text
+    for fragment in SECRET_FRAGMENTS:
+        assert fragment not in response.text
+
+
+@pytest.mark.parametrize("sentinel", SENTINEL_PARAMS)
+def test_a_credential_in_a_candidate_or_snapshot_never_reaches_the_response(surface, sentinel):
+    client, _recording, repository, user, project = surface
+    poison_review(repository, sentinel)
+    response = client.get(REVIEW_PATH.format(project_id=project), headers=member(user))
+    assert response.status_code == 200
+    assert sentinel not in response.text
+    for fragment in SECRET_FRAGMENTS:
+        assert fragment not in response.text
+
+
+def test_the_row_is_still_readable_after_its_credential_is_removed(surface):
+    """Redaction, not rejection. A poisoned row is still a reviewable row.
+
+    Refusing the whole page over one odd-looking value would be a denial of
+    inspection on the surface an operator reaches for during an incident, so
+    the credential is replaced and the rest of the identity survives.
+    """
+    client, _recording, repository, user, project = surface
+    poison_canonical(repository, API_KEY_SENTINEL)
+    body = client.get(CANONICAL_PATH.format(project_id=project), headers=member(user)).json()
+    item = body["items"][0]
+    assert body["page"]["total"] == 1
+    assert item["manufacturer"].startswith("Toyota")
+    assert item["canonical_key"].startswith("cv1.")
+    assert item["model_year_start"] == 2022
+
+
+def test_ordinary_register_identity_text_is_never_over_redacted(surface):
+    """The real pinned capture, unpoisoned, survives byte for byte.
+
+    Over-redaction is the safe failure direction, but it is still a failure if
+    it fires on ordinary data -- a marque or a trim that happened to trip a
+    pattern would quietly corrupt the catalog an operator is reviewing.
+    """
+    client, _recording, repository, user, project = surface
+    mark_every_candidate_ready(repository)
+    canonical = client.get(CANONICAL_PATH.format(project_id=project),
+                           headers=member(user)).json()
+    review = client.get(REVIEW_PATH.format(project_id=project),
+                        params={"limit": 100}, headers=member(user)).json()
+    assert canonical["items"][0]["trim"] == "ADVENTURE"
+    assert canonical["items"][0]["official_model_code"] == "AXAA54L-ANZVB"
+    assert review["snapshot"]["publisher"] == src.GOVERNMENT_PUBLISHER
+    assert "[REDACTED]" not in client.get(CANONICAL_PATH.format(project_id=project),
+                                          headers=member(user)).text
+
+
+def test_the_backend_redactor_neutralizes_the_reviewed_marker_vocabulary():
+    """The repository already has ONE reviewed secret-marker vocabulary.
+
+    `_FRAGMENT_SECRET_MARKERS` (`backend/engines/swarm_v2/evidence.py`) is the
+    evidence-fragment PERSISTENCE boundary: it REJECTS, it is mirrored by
+    `supabase/migrations/20260828000200_source_evidence_fragments.sql`, and it
+    is a marker set rather than a shape matcher. It is deliberately left where
+    it is -- moving it would mean editing a migration's comment.
+
+    This is the drift alarm that keeps the two from disagreeing: every marker
+    that vocabulary names must be something the response-boundary redactor also
+    neutralizes, so a value the durable boundary would refuse can never be the
+    value this boundary prints.
+    """
+    from backend.engines.swarm_v2.evidence import _FRAGMENT_SECRET_MARKERS
+    from backend.redaction import REDACTED, redact_secret_text
+
+    value = "AKIAIOSFODNN7EXAMPLEabc"
+    for marker in _FRAGMENT_SECRET_MARKERS:
+        # Each marker, in the form it actually occurs. Gluing a token straight
+        # onto `-----begin` would build a string that is neither a PEM block
+        # nor a labelled secret, and proving the redactor ignores THAT would
+        # prove nothing about the vocabulary.
+        if marker.startswith("-----"):
+            # Assembled, never written literally: a committed PEM header is
+            # what `scripts/secret_scan.py` blocks, and a test fixture is not
+            # an exemption -- a key-shaped literal trains reviewers and
+            # scanners to expect false positives.
+            dashes = "-" * 5
+            text = (f"prefix {dashes}BEGIN PRIVATE KEY{dashes}\n{value}\n"
+                    f"{dashes}END PRIVATE KEY{dashes} suffix")
+        elif marker.endswith(("=", ":")):
+            text = f"prefix {marker}{value} suffix"
+        else:
+            text = f"prefix {marker}={value} suffix"
+        redacted = redact_secret_text(text)
+        assert REDACTED in redacted, marker
+        assert value not in redacted, marker
+
+
+@pytest.mark.parametrize("sentinel", SENTINEL_PARAMS)
+def test_the_backend_and_frontend_redactors_agree_on_every_sentinel(sentinel):
+    """Two independent boundaries, one vocabulary.
+
+    The frontend sentinels are the authority (`frontend/tests/secretSentinels.ts`)
+    because the browser sweep is the one a reviewer can see in a bundle scan.
+    The backend must neutralize each of them too, or the response would carry
+    something only the browser knows to hide.
+    """
+    from backend.redaction import REDACTED, redact_secret_text
+
+    redacted = redact_secret_text(f"value {sentinel} tail")
+    assert sentinel not in redacted
+    assert REDACTED in redacted
+    assert redacted.endswith("tail")
+
+
+def test_the_redactor_leaves_public_supabase_configuration_alone():
+    """`sb_publishable_…` is public configuration the browser is MEANT to hold.
+
+    Anchoring on `sb_` rather than `sb_secret_` would hide a legitimate value
+    while protecting nothing -- the same distinction
+    `frontend/lib/sanitize.ts` draws, held to here so the two cannot diverge.
+    """
+    from backend.redaction import redact_secret_text
+
+    public = "_".join(["sb", "publishable", "C" * 10 + "D" * 10 + "5678"])
+    assert redact_secret_text(f"key {public}") == f"key {public}"
+
+
+def test_the_redactor_is_total_over_unusable_input():
+    """It is a boundary, so it never raises: anything in, a string out."""
+    from backend.redaction import redact_secret_text
+
+    assert redact_secret_text("") == ""
+    assert redact_secret_text("ordinary text") == "ordinary text"

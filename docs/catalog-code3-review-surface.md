@@ -38,20 +38,58 @@ not the same fact, so they are two contracts and never one reducer.
 There is no `POST`, `PUT`, `PATCH` or `DELETE` counterpart of either path
 anywhere in `backend/main.py`, and none is reachable through the gateway.
 
-### Query parameters
+### Query parameters — a per-route allowlist, and everything else fails closed
 
-Every parameter is declared by name and typed on the handler, so an
-unsupported one is never read and a value of the wrong type is refused by
-FastAPI before the handler runs.
+The **set of parameter names** is part of the contract. A name outside the
+route's allowlist is refused; a name stated twice is refused.
 
-| Parameter | Both routes | Canonical only | Semantics |
-| --- | --- | --- | --- |
-| `limit` | ✓ | | whole number in `[1, 100]`; default `25` |
-| `offset` | ✓ | | whole number in `[0, 1 000 000]`; default `0` |
-| `manufacturer` | ✓ | | exact match, ≤ 120 characters |
-| `commercial_model` | ✓ | | exact match, ≤ 120 characters |
-| `model_year` | ✓ | | whole number in `[1900, 2200]`; selects rows whose stated range CONTAINS it |
-| `canonical_key` | | ✓ | exact match, ≤ 120 characters |
+| Parameter | Canonical | Review | Semantics |
+| --- | :---: | :---: | --- |
+| `limit` | ✓ | ✓ | whole number in `[1, 100]`; default `25` |
+| `offset` | ✓ | ✓ | whole number in `[0, 1 000 000]`; default `0` |
+| `manufacturer` | ✓ | ✓ | exact match, ≤ 120 characters |
+| `commercial_model` | ✓ | ✓ | exact match, ≤ 120 characters |
+| `model_year` | ✓ | ✓ | whole number in `[1900, 2200]`; selects rows whose stated range CONTAINS it |
+| `canonical_key` | ✓ | | exact match, ≤ 120 characters |
+
+Anything else — including `order`, `sort`, `select`, `table`, `columns`,
+`status`, `snapshot_key`, `snapshot_id`, `resource_id`, `allow_incomplete`,
+`p_limit`, `p_status`, `q`, `filter`, `where` — is `400
+CATALOG_REVIEW_QUERY_PARAMETER_UNSUPPORTED`. The message is static and authored
+in `backend/catalog/review.py`; it echoes neither the name nor the value, so the
+refusal cannot be used to enumerate what the server recognises and cannot
+reflect a caller's input.
+
+**Why refusal rather than silence.** The first implementation declared its
+parameters and let Starlette discard the rest, and its tests asserted that an
+undeclared parameter returned the same page as omitting it. Independent review
+rejected that, correctly: "never read" and "refused" are not the same thing to
+the person reading the answer. `?snapshot_key=X` returned the ACTIVE snapshot
+while the operator believed X had been inspected, and `?status=promoted`
+returned `ready_for_review` rows under a heading nobody asked for. Several of
+those names are real query controls one layer down — `p_limit` and `p_status`
+are arguments of `catalog_candidate_variant_page`, `allow_incomplete` is the
+acknowledgement that lets an incomplete snapshot answer at all — which is
+exactly why silence was the wrong answer.
+
+**A repeated parameter fails closed.** `?limit=10&limit=20` is ambiguous. No
+repository-wide policy defines a reviewed behaviour for a repeated query
+parameter (`after_event_id` on the run-events route is the only other query
+parameter in the API and states none), so there is nothing to follow, and
+selecting the first or the last would answer a question the caller did not
+unambiguously ask.
+
+**Neither handler declares its query parameters**, and that is load-bearing. A
+declared `limit: int` is bound and validated by FastAPI *before* the handler
+body runs, so `?limit=abc` would answer `422` before the membership check — and
+a non-member would then receive a different response depending on what they
+sent, which is a disclosure through the authorization boundary. Reading the raw
+query string inside the handler is what keeps the four steps in order:
+
+1. authenticate;
+2. authorize membership (the non-disclosing 404);
+3. validate the query contract (names, duplicates, then values);
+4. read the catalog.
 
 There is **no** parameter for a table, a column, an ordering, a page bound, a
 status, a resource, a snapshot or an acknowledgement. Those are all server data
@@ -178,6 +216,37 @@ jsonb, and an unstated dimension is an **absent key** — the same rule
 | Lease tokens, worker ids, credentials, service keys | ❌ | never read; swept by test and by the bundle scan |
 | `content_sha256`, `page_chain_sha256`, the retrieval query | ❌ | not needed to review an identity |
 
+### Redaction happens on the way OUT of the API, not only in the browser
+
+Every projected string passes `backend.redaction.redact_secret_text` before the
+response is serialized, in `review._text()`, ahead of the 120-character bound
+(truncating first could split a credential across the bound and leave a fragment
+the patterns no longer match).
+
+Independent review required this, and the reasoning is worth stating: the
+frontend parser redacts before it renders, but by then the response has already
+been delivered to the browser. It has sat in the network panel, in whatever
+proxies and extensions observe traffic, and in any log that captured it. *Hidden
+from the DOM is not never sent*, and only the server can make the second
+statement true. `frontend/lib/catalogReview.ts` remains the second, independent
+defense.
+
+It **redacts** rather than rejects. The repository's other secret boundary,
+`safe_fragment_text` / `_FRAGMENT_SECRET_MARKERS`
+(`backend/engines/swarm_v2/evidence.py`), guards PERSISTENCE and rejects — a
+caller writing a credential into durable evidence is a bug that should stop. A
+READ surface is the opposite case: refusing a whole page because one stored trim
+happens to look like a token would be a denial of inspection on the surface an
+operator reaches for during an incident. Over-redaction is the intended failure
+direction.
+
+That marker vocabulary is deliberately left exactly where it is — it is named in
+a migration's comment, and moving it would mean editing `supabase/`. The two are
+pinned together by test instead: every marker it names must be something the
+response-boundary redactor also neutralizes, so a value the durable boundary
+would refuse can never be the value a response prints. A second test holds the
+backend and browser redactors to the same sentinel set.
+
 Every browser-visible string additionally passes `redactSecretText` and a
 120-character bound in `frontend/lib/catalogReview.ts`, and reaches the DOM only
 through `safeText`. There is no `JSON.stringify` of server data and no
@@ -226,6 +295,40 @@ An unavailable page states `available: false`, **no** items, **no** snapshot and
 found empty. A repository failure is a different condition and stays
 distinguishable: it is a `502`, not an unavailable page, so "there is no
 snapshot" and "the database could not answer" never collapse into one answer.
+
+## 10a. Which catalog response may become visible state
+
+The browser can have more than one catalog read in flight — switching views,
+switching projects, closing and reopening the panel, retrying after a failure,
+and turning pages all issue one — so "which answer wins" is a correctness
+question, not a detail.
+
+Every request carries a monotonic identity from `beginPending`
+(`frontend/lib/ownership.ts`), wrapped with the `view` and `offset` it stands
+for. The token is recorded **synchronously**, before the call is issued, exactly
+as `scope.current` is. An answer may write state only if BOTH hold:
+
+1. it is still the newest catalog request (`pending.id` matches), and
+2. the workspace scope it was issued under still owns the surface
+   (`ownsProject`).
+
+Both are needed. The identity is what a project-scope check cannot provide —
+two requests inside one project share a scope — and the scope check is what
+catches a project switch made while the panel is closed, where no superseding
+request is issued and the token would otherwise still match.
+
+A superseded request is a **complete no-op** on every path: it writes no page,
+sets no error, and does not clear the loading state its replacement set.
+`frontend/tests/catalogReviewRace.test.tsx` drives each interleaving with
+deferred promises, so the ordering is written down rather than timed.
+
+There is deliberately no `AbortController` as a correctness boundary.
+Cancellation races too, and a request already past the wire still settles;
+aborting could only ever be an optimization.
+
+A page already on screen stays visible while the next one loads, with the region
+marked `aria-busy`. Blanking the table on every page turn hid what the operator
+was reading and removed the pagination control mid-turn.
 
 ## 11. Gateway
 

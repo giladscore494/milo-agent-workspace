@@ -59,6 +59,20 @@ const STORED_RUN_REJECTED = 'The run stored for this conversation could not be v
 
 const ACTIVE_RUN_KEY_PREFIX = 'milo.activeRun.';
 
+/**
+ * One catalog read in flight, and which page it is.
+ *
+ * The smallest wrapper that `lib/ownership.ts`'s `PendingRequest` needs to
+ * become a catalog request: the monotonic identity and the workspace scope come
+ * from `beginPending`, and `view`/`offset` say which page the token stands for
+ * so a superseded answer can be reasoned about rather than merely dropped.
+ */
+type CatalogRequest = {
+  readonly pending: PendingRequest;
+  readonly view: CatalogReviewView;
+  readonly offset: number;
+};
+
 /** Sentinel for "this page has not observed an authenticated identity yet". */
 const NO_SESSION_YET = Symbol('no session observed yet');
 
@@ -174,6 +188,16 @@ export default function WorkspacePage() {
   const [catalogError, setCatalogError] = useState('');
   const [canonicalPage, setCanonicalPage] = useState<CanonicalCatalogPage>();
   const [reviewPage, setReviewPage] = useState<CatalogReviewPageData>();
+  /**
+   * The catalog request whose answer is still allowed to become visible state.
+   *
+   * A ref, not state: it is compared by every settle path and must describe
+   * what is CURRENT at that moment, not what React last rendered — the same
+   * reason `scope` below is a ref. `view` and `offset` travel with it so a
+   * reader can see which page a token belongs to; the monotonic
+   * `pending.id` is what decides.
+   */
+  const catalogRequest = useRef<CatalogRequest>();
 
   // The live ownership scope. Updated synchronously by the handlers below, so
   // it always describes what is selected now rather than what React last
@@ -293,6 +317,7 @@ export default function WorkspacePage() {
       // Durable catalog rows the previous identity was authorized to see. They
       // are membership-authorized server-side, so a new or absent identity must
       // not inherit a rendered page from the old one.
+      catalogRequest.current = undefined;
       setCatalogOpen(false);
       setCatalogView('canonical');
       setCatalogOffset(0);
@@ -313,12 +338,40 @@ export default function WorkspacePage() {
   }, [session, loadProjects]);
 
   /**
+   * Is this the catalog request whose answer may still become visible state?
+   *
+   * TWO facts, and neither implies the other:
+   *
+   *  1. it is the NEWEST catalog request. `PendingRequest.id` is monotonic for
+   *     the life of the page, so a superseded request can always be recognised
+   *     as superseded — which a project-scope check cannot do, because two
+   *     requests inside one project share a scope. Without this an older page
+   *     could overwrite a newer one, an older `.finally()` could clear a
+   *     loading state its replacement had just set, and an older failure could
+   *     replace a newer success with an error;
+   *  2. the workspace scope it was issued under still owns the surface. This
+   *     is the existing cross-boundary rule and it is still needed on its own:
+   *     a project switch while the panel is CLOSED issues no superseding
+   *     request, so the token would still match while the answer belongs to a
+   *     project nobody is looking at.
+   */
+  const ownsCatalogRequest = useCallback((issued: CatalogRequest) => (
+    catalogRequest.current?.pending.id === issued.pending.id
+    && ownsProject(issued.pending.owner, scope.current)
+  ), []);
+
+  /**
    * Read one bounded catalog page for the selected project.
    *
-   * Ownership is checked exactly as every other asynchronous read here checks
-   * it: the answer is applied only while the project it was issued under is
-   * still selected, so a page belonging to a project the user has moved away
-   * from is dropped rather than rendered under the new one.
+   * The request identity is recorded SYNCHRONOUSLY, before the call is issued
+   * and before React re-renders — exactly as `scope.current` is — so the newer
+   * request has already superseded the older one by the time either can
+   * settle. A superseded request is a complete no-op on every path: no page,
+   * no error, no loading clear.
+   *
+   * There is deliberately no `AbortController` here. Aborting would be an
+   * optimization at best: cancellation races too, and a request that is
+   * already past the wire still settles. Identity is the authority.
    *
    * The response is parsed, never trusted: `parseCanonicalPage` /
    * `parseReviewPage` build UI state field by field, so nothing the server sent
@@ -331,26 +384,28 @@ export default function WorkspacePage() {
     owner: WorkspaceScope,
   ) => {
     const requested = { limit: CATALOG_PAGE_SIZE, offset };
+    const issued: CatalogRequest = { pending: beginPending(owner), view, offset };
+    catalogRequest.current = issued;
     setCatalogLoading(true);
     setCatalogError('');
-    const pending = view === 'canonical'
+    const inFlight = view === 'canonical'
       ? api.catalogCanonical(project.id, requested)
       : api.catalogReviewCandidates(project.id, requested);
-    pending
+    inFlight
       .then(body => {
-        if (!ownsProject(owner, scope.current)) return; // another project now
+        if (!ownsCatalogRequest(issued)) return; // superseded, or another project
         if (view === 'canonical') setCanonicalPage(parseCanonicalPage(body, requested));
         else setReviewPage(parseReviewPage(body, requested));
       })
       .catch(error => {
-        if (!ownsProject(owner, scope.current)) return;
+        if (!ownsCatalogRequest(issued)) return;
         setCatalogError(safeErrorText(error, 'Failed to load the catalog page.'));
       })
       .finally(() => {
-        if (!ownsProject(owner, scope.current)) return;
+        if (!ownsCatalogRequest(issued)) return;
         setCatalogLoading(false);
       });
-  }, []);
+  }, [ownsCatalogRequest]);
 
   // The catalog is read when the panel is open and a project is selected, and
   // again whenever the view or the page changes. Closing the panel issues no
@@ -361,8 +416,16 @@ export default function WorkspacePage() {
     loadCatalog(selectedProject, catalogView, catalogOffset, scope.current);
   }, [catalogOpen, selectedProject, catalogView, catalogOffset, loadCatalog]);
 
-  /** Switching views starts at the first page and drops the other view's rows. */
+  /**
+   * Switching views starts at the first page and drops the other view's rows.
+   *
+   * The request token is invalidated HERE rather than left to the effect that
+   * follows: between this handler and that effect there is a window in which an
+   * answer for the view the user just left could still settle, and the honest
+   * reading of a view switch is that the previous view's read no longer matters.
+   */
   const changeCatalogView = useCallback((next: CatalogReviewView) => {
+    catalogRequest.current = undefined;
     setCatalogView(next);
     setCatalogOffset(0);
     setCatalogError('');
@@ -370,8 +433,9 @@ export default function WorkspacePage() {
     setReviewPage(undefined);
   }, []);
 
-  /** Every piece of rendered catalog state, dropped. */
+  /** Every piece of rendered catalog state, and the request that would fill it. */
   const clearCatalogState = useCallback(() => {
+    catalogRequest.current = undefined;
     setCatalogOffset(0);
     setCatalogError('');
     setCatalogLoading(false);

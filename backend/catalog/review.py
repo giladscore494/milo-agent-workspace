@@ -64,6 +64,7 @@ from typing import Any, Mapping
 
 from backend.catalog.contracts import CANDIDATE_IDENTITY_DIMENSIONS
 from backend.errors import AppError
+from backend.redaction import redact_secret_text
 
 from .government import source as src
 from .government.projection import DatasetProvenance, GovernmentProjectionError
@@ -230,6 +231,129 @@ class CatalogReviewError(AppError):
 # Request validation. Malformed is REFUSED, never silently ignored.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The query contract: which parameter NAMES each route accepts.
+# ---------------------------------------------------------------------------
+#
+# Independent review found the original surface treated an undeclared parameter
+# as INERT -- the handlers declared their parameters, so anything else was
+# discarded and the request answered as though it had not been sent. "Never
+# read" was mistaken for "refused", and the two are not the same thing to the
+# person reading the answer:
+#
+#     /catalog/review-candidates?snapshot_key=X
+#
+# returned the ACTIVE snapshot while the operator believed X had been
+# inspected, and `?status=promoted` returned `ready_for_review` rows under a
+# heading nobody asked for. Several of these names are real query controls one
+# layer down -- `p_limit` and `p_status` are arguments of
+# `catalog_candidate_variant_page`, `allow_incomplete` is the acknowledgement
+# that lets an incomplete snapshot answer at all -- which is exactly why
+# silence was the wrong answer.
+#
+# So the SET of names is now part of the contract, and anything outside it
+# fails closed.
+
+#: Everything the canonical route accepts. Nothing else, in any casing.
+CANONICAL_QUERY_PARAMETERS = ("limit", "offset", "manufacturer",
+                              "commercial_model", "model_year", "canonical_key")
+
+#: Everything the review route accepts. A strict subset: a candidate has no
+#: canonical key, so naming one here would be accepting a parameter that could
+#: never mean anything.
+REVIEW_QUERY_PARAMETERS = ("limit", "offset", "manufacturer",
+                           "commercial_model", "model_year")
+
+#: The ONE refusal an unsupported or ambiguous parameter produces. Static and
+#: code-owned: the message below never quotes the name or the value, so the
+#: refusal cannot be used to enumerate what the server recognises and cannot
+#: reflect a caller's input back at it.
+UNSUPPORTED_PARAMETER_CODE = "CATALOG_REVIEW_QUERY_PARAMETER_UNSUPPORTED"
+UNSUPPORTED_PARAMETER_MESSAGE = (
+    "this catalog review route accepts only its documented query parameters, "
+    "each stated at most once"
+)
+
+
+def supported_query(params: Any, allowed: tuple[str, ...]) -> dict[str, str]:
+    """The raw values of a request's query parameters, or a refusal.
+
+    Two things are checked, and both fail onto the SAME static refusal so the
+    answer carries no signal about which rule was broken:
+
+    *   every name is in `allowed`. An unknown name is refused rather than
+        dropped, because a dropped name is answered as though it had been
+        honoured;
+    *   no name is stated twice. `?limit=10&limit=20` is ambiguous, and no
+        repository-wide policy defines a reviewed behaviour for a repeated
+        query parameter -- `after_event_id` on the run-events route is the only
+        other query parameter in the API and states none -- so there is nothing
+        to follow, and selecting the first or the last would answer a question
+        the caller did not unambiguously ask.
+
+    Takes the multidict Starlette hands the handler, so it sees EVERY pair the
+    client sent rather than the one value a declared parameter would have bound.
+    """
+    seen: dict[str, str] = {}
+    for name, value in params.multi_items():
+        if name not in allowed or name in seen:
+            raise CatalogReviewError(UNSUPPORTED_PARAMETER_CODE,
+                                     UNSUPPORTED_PARAMETER_MESSAGE)
+        seen[name] = value
+    return seen
+
+
+def _whole_parameter(raw: str | None, label: str, code: str) -> int | None:
+    """One query parameter as a whole number, or a refusal.
+
+    Strict decimal text only. `int()` would accept `' 10 '`, `'+10'`, `'10_0'`
+    and a Unicode digit, and a page bound that depends on Python's parsing
+    quirks is not a bound anybody reviewed. Absent stays absent so the caller
+    below can apply its own default.
+    """
+    if raw is None:
+        return None
+    if not raw.isascii() or not raw.lstrip("-").isdigit() or raw in ("-", ""):
+        raise CatalogReviewError(code, f"{label} must be a whole number")
+    return int(raw)
+
+
+def canonical_query(params: Any) -> dict[str, Any]:
+    """Validate and parse the canonical route's query string.
+
+    Names first, then values. The ranges are applied further down by
+    `canonical_catalog`, which is also reachable directly, so this layer adds
+    parsing rather than replacing the bounds.
+    """
+    raw = supported_query(params, CANONICAL_QUERY_PARAMETERS)
+    return {
+        "limit": _whole_parameter(raw.get("limit"), "page size",
+                                  "CATALOG_REVIEW_PAGE_INVALID"),
+        "offset": _whole_parameter(raw.get("offset"), "offset",
+                                   "CATALOG_REVIEW_PAGE_INVALID"),
+        "manufacturer": raw.get("manufacturer"),
+        "commercial_model": raw.get("commercial_model"),
+        "model_year": _whole_parameter(raw.get("model_year"), "model year filter",
+                                       "CATALOG_REVIEW_FILTER_INVALID"),
+        "canonical_key": raw.get("canonical_key"),
+    }
+
+
+def review_query(params: Any) -> dict[str, Any]:
+    """Validate and parse the review route's query string."""
+    raw = supported_query(params, REVIEW_QUERY_PARAMETERS)
+    return {
+        "limit": _whole_parameter(raw.get("limit"), "page size",
+                                  "CATALOG_REVIEW_PAGE_INVALID"),
+        "offset": _whole_parameter(raw.get("offset"), "offset",
+                                   "CATALOG_REVIEW_PAGE_INVALID"),
+        "manufacturer": raw.get("manufacturer"),
+        "commercial_model": raw.get("commercial_model"),
+        "model_year": _whole_parameter(raw.get("model_year"), "model year filter",
+                                       "CATALOG_REVIEW_FILTER_INVALID"),
+    }
+
+
 def bounded_page_size(limit: Any) -> int:
     """The page size for a request, or a refusal.
 
@@ -310,15 +434,31 @@ def bounded_model_year(value: Any) -> int | None:
 # ---------------------------------------------------------------------------
 
 def _text(value: Any) -> str | None:
-    """A stored value as browser text, or absent.
+    """A stored value as browser text, redacted and bounded, or absent.
 
     Absent rather than `''` for anything that is not a non-empty string: an
     empty string renders as a field the row states and does not, which is the
     false-claim shape §9 of the CODE-3 contract forbids.
+
+    `redact_secret_text` runs on the way OUT of the API, not only in the
+    browser. Independent review made the reason explicit: the frontend parser
+    redacts before it renders, but by then the response has already been
+    delivered -- it has sat in the network panel and in anything else that
+    observes traffic. A credential must not be SENT and then hidden.
+
+    Redaction runs BEFORE truncation on purpose: truncating first could split a
+    credential across the 120-character bound and leave a fragment the patterns
+    no longer match. The same ordering, for the same reason, as the browser
+    counterpart in `frontend/lib/sanitize.ts`.
+
+    This is defense in depth over the closed field allowlists above, not a
+    substitute for them. A manufacturer, a trim, a model code and a dataset
+    title are all ordinary product data as far as the contract is concerned,
+    and none of them is proof that a credential cannot be inside one.
     """
     if not isinstance(value, str):
         return None
-    stripped = value.strip()
+    stripped = redact_secret_text(value).strip()
     if not stripped:
         return None
     return stripped[:MAX_REVIEW_FILTER_CHARS]
@@ -550,12 +690,16 @@ def _stated_total(rows: Any) -> int | None:
     return _whole(rows[0].get(TOTAL_COUNT_FIELD))
 
 
-__all__ = ["CANONICAL_ITEM_FIELDS", "CatalogPage", "CatalogReviewError",
+__all__ = ["CANONICAL_ITEM_FIELDS", "CANONICAL_QUERY_PARAMETERS", "CatalogPage",
+           "CatalogReviewError",
            "DEFAULT_REVIEW_PAGE_ITEMS", "MAX_REVIEW_FILTER_CHARS",
            "MAX_REVIEW_MODEL_YEAR", "MAX_REVIEW_OFFSET", "MAX_REVIEW_PAGE_ITEMS",
            "MIN_REVIEW_MODEL_YEAR", "READ_ONLY_REPOSITORY_METHODS",
            "REVIEW_CANDIDATE_ITEM_FIELDS", "REVIEW_CANDIDATE_STATUS",
+           "REVIEW_QUERY_PARAMETERS",
            "REVIEW_SNAPSHOT_FIELDS", "REVIEW_UNAVAILABLE_REASONS",
+           "UNSUPPORTED_PARAMETER_CODE", "UNSUPPORTED_PARAMETER_MESSAGE",
            "bounded_filter", "bounded_model_year", "bounded_offset",
            "bounded_page_size", "canonical_catalog", "canonical_item",
-           "review_candidate_item", "review_candidates", "review_snapshot"]
+           "canonical_query", "review_candidate_item", "review_candidates",
+           "review_query", "review_snapshot", "supported_query"]

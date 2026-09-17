@@ -138,20 +138,73 @@ test('C7. pagination is bounded by the server, not by the caller', async ({ requ
   expect(body.page.total).toBeGreaterThan(5);
 });
 
-test('C8. an unsupported query parameter is inert, not query control', async ({
+test('C8. an unsupported query parameter fails closed through the gateway', async ({
   request,
   baseURL,
 }) => {
+  // The original version of this test asserted the steered request returned the
+  // same page as the plain one. That was the defect: `?snapshot_key=X` answering
+  // 200 with the ACTIVE snapshot reads as confirmation that X was inspected, and
+  // `?status=promoted` answering with `ready_for_review` rows is an answer to a
+  // question nobody asked. Refusing is what makes the answer honest.
   const token = await apiToken(request, 'alice');
-  const baseline = await request.get(`${baseURL}${CANONICAL(PROJECT_ALPHA)}?limit=3`, {
+
+  for (const query of [
+    'order=manufacturer.desc',
+    'select=*',
+    'table=catalog_raw_records',
+    'status=promoted',
+    'snapshot_key=cs1.ffffffffffffffffffffffffffffffff',
+    'resource_id=5e87a7a1-2f6f-41c1-8aec-7216d52a6cf6',
+    'allow_incomplete=true',
+    'p_limit=9999',
+  ]) {
+    for (const path of [CANONICAL(PROJECT_ALPHA), REVIEW(PROJECT_ALPHA)]) {
+      const response = await request.get(`${baseURL}${path}?limit=3&${query}`, {
+        headers: authHeaders(token),
+      });
+      expect(response.status(), `${query} on ${path}`).toBe(400);
+      expect((await response.json()).error.code)
+        .toBe('CATALOG_REVIEW_QUERY_PARAMETER_UNSUPPORTED');
+      // The refusal quotes nothing the caller sent.
+      expect(await response.text()).not.toContain(query.split('=')[1]);
+    }
+  }
+
+  // A repeated parameter is ambiguous and is refused rather than guessed. The
+  // gateway forwards every pair, so the backend really does see both.
+  const repeated = await request.get(`${baseURL}${CANONICAL(PROJECT_ALPHA)}?limit=10&limit=20`, {
     headers: authHeaders(token),
   });
-  const steered = await request.get(
-    `${baseURL}${CANONICAL(PROJECT_ALPHA)}?limit=3&order=manufacturer.desc&select=*&table=catalog_raw_records&status=promoted`,
+  expect(repeated.status()).toBe(400);
+  expect((await repeated.json()).error.code)
+    .toBe('CATALOG_REVIEW_QUERY_PARAMETER_UNSUPPORTED');
+
+  // ...and the supported parameters still work, so the allowlist is a contract
+  // rather than a blanket refusal.
+  const supported = await request.get(
+    `${baseURL}${CANONICAL(PROJECT_ALPHA)}?limit=3&offset=0&manufacturer=Toyota`,
     { headers: authHeaders(token) },
   );
-  expect(steered.status()).toBe(200);
-  expect(await steered.json()).toEqual(await baseline.json());
+  expect(supported.status()).toBe(200);
+});
+
+test('C8b. a non-member sending an unsupported parameter still learns nothing', async ({
+  request,
+  baseURL,
+}) => {
+  // The query contract is checked AFTER membership, so a stranger cannot tell a
+  // real project from an imaginary one by which error comes back.
+  const token = await apiToken(request, 'alice');
+  for (const path of [CANONICAL(PROJECT_BETA), REVIEW(PROJECT_BETA)]) {
+    const plain = await request.get(`${baseURL}${path}`, { headers: authHeaders(token) });
+    const steered = await request.get(`${baseURL}${path}?snapshot_key=X&order=desc`, {
+      headers: authHeaders(token),
+    });
+    expect(plain.status()).toBe(404);
+    expect(steered.status()).toBe(404);
+    expect(await steered.text()).toBe(await plain.text());
+  }
 });
 
 test('C9. no raw register row, evidence, SQL or credential reaches the browser', async ({

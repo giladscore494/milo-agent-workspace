@@ -304,55 +304,63 @@ def list_conversations(project_id: UUID, user: AuthenticatedUser = Depends(get_a
 # below pretends a canonical row belongs to the project.
 
 
+# Neither handler DECLARES its query parameters, and that is load-bearing.
+#
+# A declared `limit: int` is bound and validated by FastAPI BEFORE the handler
+# body runs, so `?limit=abc` answers 422 before the membership check -- and a
+# non-member would then receive a different response depending on what they
+# sent, which is a disclosure through the authorization boundary. Reading the
+# raw query string inside the handler is what keeps the four steps in order:
+#
+#     1. authenticate        (the dependency below)
+#     2. authorize membership (`repo.get_project`, the non-disclosing 404)
+#     3. validate the query contract (names, duplicates, then values)
+#     4. read the catalog
+#
+# The accepted names are `catalog_review.CANONICAL_QUERY_PARAMETERS` and
+# `REVIEW_QUERY_PARAMETERS`; anything else fails closed on one static code.
+
+
 @app.get("/projects/{project_id}/catalog/canonical", response_model=CatalogCanonicalPage)
 def get_catalog_canonical_page(
     project_id: UUID,
-    limit: int | None = None,
-    offset: int | None = None,
-    manufacturer: str | None = None,
-    commercial_model: str | None = None,
-    model_year: int | None = None,
-    canonical_key: str | None = None,
+    request: Request,
     user: AuthenticatedUser = Depends(get_authenticated_user),
     repo: Repository = Depends(get_repository),
 ) -> CatalogCanonicalPage:
     """A bounded page of the CURRENT canonical catalog.
 
-    Every query parameter is declared here by name and typed, so an unsupported
-    one is never read and a value of the wrong type is refused by FastAPI before
-    the handler runs. There is no parameter for a table, a column, an ordering,
-    a page bound or a status: those are all server data in
-    `backend/catalog/review.py` and in the repository method it calls.
+    Accepts `limit`, `offset`, `manufacturer`, `commercial_model`, `model_year`
+    and `canonical_key`, each at most once. There is no parameter for a table, a
+    column, an ordering, a page bound or a status -- those are server data in
+    `backend/catalog/review.py` and in the repository method it calls -- and a
+    name outside the allowlist is refused rather than ignored.
     """
     repo.get_project(project_id, user.user_id)
-    page = catalog_review.canonical_catalog(
-        repo, manufacturer=manufacturer, commercial_model=commercial_model,
-        model_year=model_year, canonical_key=canonical_key, limit=limit, offset=offset)
+    query = catalog_review.canonical_query(request.query_params)
+    page = catalog_review.canonical_catalog(repo, **query)
     return CatalogCanonicalPage(page=_catalog_page_meta(page), items=page.items)
 
 
 @app.get("/projects/{project_id}/catalog/review-candidates", response_model=CatalogReviewPage)
 def get_catalog_review_candidates(
     project_id: UUID,
-    limit: int | None = None,
-    offset: int | None = None,
-    manufacturer: str | None = None,
-    commercial_model: str | None = None,
-    model_year: int | None = None,
+    request: Request,
     user: AuthenticatedUser = Depends(get_authenticated_user),
     repo: Repository = Depends(get_repository),
 ) -> CatalogReviewPage:
     """A bounded page of candidates whose durable status is `ready_for_review`.
 
-    The snapshot is resolved by the repository's own trusted rule against the
-    pinned WLTP resource constant. No parameter names a resource, a host, a
-    table or a snapshot, so a browser cannot point this anywhere else, and the
-    status is fixed rather than filtered.
+    Accepts `limit`, `offset`, `manufacturer`, `commercial_model` and
+    `model_year`, each at most once. The snapshot is resolved by the
+    repository's own trusted rule against the pinned WLTP resource constant, and
+    the status is fixed: `resource_id`, `snapshot_key`, `snapshot_id`, `status`
+    and `allow_incomplete` are not accepted here, so a browser cannot point this
+    anywhere else and cannot be told it inspected something it did not.
     """
     repo.get_project(project_id, user.user_id)
-    page = catalog_review.review_candidates(
-        repo, manufacturer=manufacturer, commercial_model=commercial_model,
-        model_year=model_year, limit=limit, offset=offset)
+    query = catalog_review.review_query(request.query_params)
+    page = catalog_review.review_candidates(repo, **query)
     return CatalogReviewPage(
         available=page.available, unavailable_reason=page.unavailable_reason,
         status=catalog_review.REVIEW_CANDIDATE_STATUS, snapshot=page.snapshot,
