@@ -1914,6 +1914,42 @@ class MemoryRepository:
                     **scopes[entry["field_key"]], "created_at": _now()})
             return dict(variant)
 
+    def _canonical_variant_current(self, variant: dict[str, Any]) -> dict[str, Any]:
+        """One variant as `catalog_canonical_variant_current` would state it.
+
+        Shared by the single lookup and the bounded listing, so the two cannot
+        drift: the view is ONE definition of "the current canonical value" and a
+        second assembly of it here would be a second definition. Caller holds
+        the lock.
+        """
+        model = next(row for row in self.catalog_models if row["id"] == variant["model_id"])
+        current: dict[str, dict[str, Any]] = {}
+        for row in self.catalog_canonical_field_provenance:
+            if row["variant_id"] != variant["id"]:
+                continue
+            held = current.get(row["field_key"])
+            if held is None or row["revision"] > held["revision"]:
+                current[row["field_key"]] = row
+        dimensions = {name[len(CANONICAL_DIMENSION_PREFIX):]: row["field_value"]
+                      for name, row in current.items()
+                      if name.startswith(CANONICAL_DIMENSION_PREFIX)}
+        return {"variant_id": variant["id"], "model_id": model["id"],
+                "canonical_key": variant["canonical_key"],
+                "model_canonical_key": model["canonical_key"],
+                "manufacturer": model["manufacturer"],
+                "commercial_model": model["commercial_model"],
+                "promoted_from_candidate_id": variant["promoted_from_candidate_id"],
+                "promoted_from_verdict_id": variant["promoted_from_verdict_id"],
+                "model_year_start": current["model_year_start"]["field_value"],
+                "model_year_end": current["model_year_end"]["field_value"],
+                "official_model_code": (current["official_model_code"]["field_value"]
+                                        if "official_model_code" in current else None),
+                "trim": current["trim"]["field_value"] if "trim" in current else None,
+                "identity_dimensions": dimensions,
+                "field_revisions": {name: row["revision"] for name, row in current.items()},
+                "promoted_at": variant["created_at"],
+                "revised_at": max(row["created_at"] for row in current.values())}
+
     def get_canonical_catalog_variant(self, canonical_key: str) -> dict[str, Any] | None:
         """ONE canonical variant's CURRENT state, assembled exactly as the
         authoritative view assembles it: the HIGHEST revision of every promoted
@@ -1923,33 +1959,47 @@ class MemoryRepository:
                             if row["canonical_key"] == str(canonical_key)), None)
             if variant is None:
                 return None
-            model = next(row for row in self.catalog_models if row["id"] == variant["model_id"])
-            current: dict[str, dict[str, Any]] = {}
-            for row in self.catalog_canonical_field_provenance:
-                if row["variant_id"] != variant["id"]:
-                    continue
-                held = current.get(row["field_key"])
-                if held is None or row["revision"] > held["revision"]:
-                    current[row["field_key"]] = row
-            dimensions = {name[len(CANONICAL_DIMENSION_PREFIX):]: row["field_value"]
-                          for name, row in current.items()
-                          if name.startswith(CANONICAL_DIMENSION_PREFIX)}
-            return {"variant_id": variant["id"], "model_id": model["id"],
-                    "canonical_key": variant["canonical_key"],
-                    "model_canonical_key": model["canonical_key"],
-                    "manufacturer": model["manufacturer"],
-                    "commercial_model": model["commercial_model"],
-                    "promoted_from_candidate_id": variant["promoted_from_candidate_id"],
-                    "promoted_from_verdict_id": variant["promoted_from_verdict_id"],
-                    "model_year_start": current["model_year_start"]["field_value"],
-                    "model_year_end": current["model_year_end"]["field_value"],
-                    "official_model_code": (current["official_model_code"]["field_value"]
-                                            if "official_model_code" in current else None),
-                    "trim": current["trim"]["field_value"] if "trim" in current else None,
-                    "identity_dimensions": dimensions,
-                    "field_revisions": {name: row["revision"] for name, row in current.items()},
-                    "promoted_at": variant["created_at"],
-                    "revised_at": max(row["created_at"] for row in current.values())}
+            return self._canonical_variant_current(variant)
+
+    #: The canonical listing's own page bound, mirroring
+    #: `SupabaseRepository.MAX_CANONICAL_LIST_ROWS`.
+    MAX_CANONICAL_LIST_ROWS = 100
+
+    def list_canonical_catalog_variants(self, *, manufacturer: str | None = None,
+                                        commercial_model: str | None = None,
+                                        model_year: int | None = None,
+                                        canonical_key: str | None = None,
+                                        limit: int = 50,
+                                        offset: int = 0) -> list[dict[str, Any]]:
+        """CODE-3's bounded canonical page, with the same row contract as SQL.
+
+        `total_count` on every row and one COUNT ROW for an empty page, exactly
+        as `_aggregate_page` does for the candidate aggregations and as
+        `SupabaseRepository.list_canonical_catalog_variants` does over
+        PostgREST's `count=exact`. Ordering is `canonical_key`, which is the
+        ordering the view is read under.
+        """
+        with self.lock:
+            rows = [self._canonical_variant_current(variant)
+                    for variant in self.catalog_model_variants]
+        matched = [row for row in rows
+                   if (manufacturer is None or row["manufacturer"] == str(manufacturer))
+                   and (commercial_model is None
+                        or row["commercial_model"] == str(commercial_model))
+                   and (canonical_key is None or row["canonical_key"] == str(canonical_key))
+                   and (model_year is None
+                        or (row["model_year_start"] is not None
+                            and row["model_year_start"] <= int(model_year)
+                            <= row["model_year_end"]))]
+        matched.sort(key=lambda row: str(row["canonical_key"]))
+        total = len(matched)
+        bounded = max(1, min(int(limit), self.MAX_CANONICAL_LIST_ROWS))
+        start = max(0, int(offset))
+        page = matched[start:start + bounded]
+        if not page:
+            columns = matched[0] if matched else {}
+            return [{name: None for name in columns} | {"total_count": total}]
+        return [{**row, "total_count": total} for row in page]
 
     def list_canonical_field_provenance(self, variant_id: Any, *,
                                         limit: int = 200) -> list[dict[str, Any]]:

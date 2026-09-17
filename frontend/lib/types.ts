@@ -21,5 +21,120 @@ export type ConflictRecord = { id: string; entity_key: string; field_key: string
 export type WorkspaceState = { run?: Run; events: RunEvent[]; lastEventId?: EventId; agents: Record<string, AgentState>; sources: SourceRecord[]; claims: any[]; conflicts: ConflictRecord[]; currentPhase: string; progress: number; tokens: number; cost: number; supervisor: string[]; validationErrors: any[]; checkpoints: any[]; rawErrors: any[]; swarm: SwarmRunState };
 export type Proposal = { id: UUID; status: string; user_request: string; draft: any; task_spec: any; estimates: any; critiques: any[] };
 
+// ---------------------------------------------------------------------------
+// CODE-3 — the read-only catalog review contracts.
+// ---------------------------------------------------------------------------
+//
+// The shapes the backend's `CatalogCanonicalPage` / `CatalogReviewPage`
+// response models produce. They are what the server is EXPECTED to send, never
+// what the UI trusts: `lib/catalogReview.ts` validates a response into UI state
+// field by field, so a key outside these types can never be rendered.
+//
+// This is a different question from CODE-2's `lib/catalogStatus.ts`, and the
+// two are deliberately not merged. `catalogStatus` answers "what did THIS RUN
+// do to the catalog?" from that run's events. These answer "what durable
+// catalog state EXISTS now?" from durable rows. A run that promoted nothing and
+// a catalog that holds nothing are not the same fact.
+
+/** Identity dimensions a row STATES. An unstated one is an absent key. */
+export type CatalogIdentityDimensions = {
+  body_style?: string;
+  drivetrain?: string;
+  engine_code?: string;
+  fuel_type?: string;
+  generation?: string;
+  market?: string;
+  propulsion_technology?: string;
+  transmission?: string;
+};
+
+/**
+ * Page metadata, as the server states it.
+ *
+ * `total` and `hasMore` are `null` for "the server did not state one". They are
+ * never derived from the item count here, and `null` is never rendered as `0`
+ * or `false`: an unknown total shown as zero is the claim that the catalog is
+ * empty.
+ */
+export type CatalogPageMeta = {
+  limit: number;
+  offset: number;
+  total: number | null;
+  hasMore: boolean | null;
+};
+
+export type CanonicalCatalogItem = {
+  canonicalKey: string;
+  modelCanonicalKey?: string;
+  manufacturer?: string;
+  commercialModel?: string;
+  modelYearStart?: number;
+  modelYearEnd?: number;
+  officialModelCode?: string;
+  trim?: string;
+  identityDimensions: CatalogIdentityDimensions;
+  promotedAt?: string;
+  revisedAt?: string;
+};
+
+export type CatalogReviewCandidateItem = {
+  candidateKey: string;
+  status: string;
+  manufacturer?: string;
+  commercialModel?: string;
+  modelYearStart?: number;
+  modelYearEnd?: number;
+  officialModelCode?: string;
+  trim?: string;
+  identityDimensions: CatalogIdentityDimensions;
+};
+
+export type CatalogReviewSnapshot = {
+  snapshotKey: string;
+  resourceId?: string;
+  packageId?: string;
+  publisher?: string;
+  datasetTitle?: string;
+  datasetMarketScope?: string;
+  upstreamVersion?: string;
+  upstreamVersionKind?: string;
+  activatedAt?: string;
+  declaredRecordCount?: number;
+  storedRecordCount?: number;
+  normalizationContract?: string;
+  normalizationIssueCount?: number;
+};
+
+export type CanonicalCatalogPage = {
+  page: CatalogPageMeta;
+  items: CanonicalCatalogItem[];
+};
+
+/**
+ * A review page, or an honest statement that there is nothing to review from.
+ *
+ * `available: false` is NOT an empty catalog: `items` is empty, `snapshot` is
+ * undefined and `page.total` is `null` rather than `0`, and `unavailableReason`
+ * says which condition held.
+ */
+export type CatalogReviewPage = {
+  available: boolean;
+  unavailableReason?: CatalogUnavailableReason;
+  status: string;
+  snapshot?: CatalogReviewSnapshot;
+  page: CatalogPageMeta;
+  items: CatalogReviewCandidateItem[];
+};
+
+/** The closed vocabulary `REVIEW_UNAVAILABLE_REASONS` (backend) states. */
+export type CatalogUnavailableReason =
+  | 'no_active_snapshot'
+  | 'snapshot_not_read'
+  | 'snapshot_not_normalized'
+  | 'snapshot_incomplete'
+  | 'snapshot_state_invalid'
+  | 'snapshot_unknown'
+  | 'snapshot_unavailable';
+
 export type { EventId } from './eventId';
 export type { RunUsage } from './runUsage';

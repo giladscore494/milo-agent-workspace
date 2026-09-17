@@ -33,6 +33,31 @@ const SAFE_RULES: GatewayRule[] = [
   },
   { method: 'GET', path: new RegExp(`^/runs/${UUID}$`, 'i') },
   { method: 'GET', path: new RegExp(`^/runs/${UUID}/events$`, 'i') },
+
+  /**
+   * CODE-3 — the read-only catalog review surface.
+   *
+   * SAFE rather than EXECUTION, deliberately. These are durable reads: they
+   * write nothing, launch nothing and need no flag, and the backend gates them
+   * on project membership exactly like every other read here. Putting them
+   * behind `GATEWAY_ALLOW_EXECUTION_ROUTES` would hide the catalog whenever
+   * the execution stage is off — which is precisely when an operator rolling
+   * back most needs to see what the catalog holds.
+   *
+   * Two exact paths, not a `/catalog/*` prefix: a prefix rule would proxy any
+   * catalog route a later release adds, including a mutating one, without
+   * anyone revisiting this list. `GatewayRule.method` admits only GET and POST,
+   * and only GET is named here, so PUT/PATCH/DELETE cannot match either — nor
+   * can a POST to the same path.
+   */
+  {
+    method: 'GET',
+    path: new RegExp(`^/projects/${UUID}/catalog/canonical$`, 'i'),
+  },
+  {
+    method: 'GET',
+    path: new RegExp(`^/projects/${UUID}/catalog/review-candidates$`, 'i'),
+  },
 ];
 
 const EXECUTION_RULES: GatewayRule[] = [

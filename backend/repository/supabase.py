@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Protocol
 from uuid import UUID
+from postgrest.types import CountMethod
 from supabase import create_client
 from backend.catalog.diff import MAX_DIFF_ITEMS
 from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
@@ -108,6 +109,7 @@ class Repository(Protocol):
     def promote_catalog_variant(self, run_id: UUID, promotion: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def get_canonical_catalog_variant(self, canonical_key: str) -> dict[str, Any] | None: ...
     def list_canonical_field_provenance(self, variant_id: Any, *, limit: int = 200) -> list[dict[str, Any]]: ...
+    def list_canonical_catalog_variants(self, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, canonical_key: str | None = None, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -134,6 +136,22 @@ class SupabaseRepository:
             return query.execute().data or []
         except Exception as exc:
             raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+
+    def _many_with_count(self, query: Any) -> tuple[list[dict[str, Any]], int | None]:
+        """Rows PLUS the exact count PostgREST reported, or None for "not said".
+
+        Deliberately not folded into `_many`: a count is only present when the
+        query asked for one, and a caller that did not ask must not receive a
+        number it cannot account for.  The sanitized message is the same one
+        `_many` raises -- a PostgREST detail can quote SQL values, so it never
+        becomes the message.
+        """
+        try:
+            response = query.execute()
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        count = getattr(response, "count", None)
+        return (response.data or []), (None if count is None else int(count))
 
     def list_projects(self, user_id: UUID | None = None) -> list[dict[str, Any]]:
         if user_id is None:
@@ -1052,6 +1070,66 @@ class SupabaseRepository:
             .select(self.CANONICAL_PROVENANCE_COLUMNS)
             .eq("variant_id", str(variant_id))
             .order("field_key").order("revision").limit(bounded))
+
+    # --- the bounded canonical LISTING (CODE-3) ------------------------------
+    #
+    # The only canonical read that was missing.  `get_canonical_catalog_variant`
+    # answers for one named key, which cannot answer "what is in the catalog";
+    # this does, one explicitly bounded page at a time.
+    #
+    # No migration: the authoritative view already assembles exactly the shape a
+    # reviewer needs, and every degree of freedom a caller could otherwise have
+    # is spelled out HERE as server data -- the column list, the filter columns,
+    # the ordering and the page bound are all literals in this method.  A caller
+    # passes values, never columns, never an ordering and never a table.
+    #
+    # Ordering is `canonical_key`: `cv1.` plus 32 hex characters
+    # (`backend/catalog/keys.py`), so it is unique, ASCII and therefore
+    # collation-free -- the same reason every other catalog listing orders by a
+    # derived key rather than by the Hebrew identity text.
+    MAX_CANONICAL_LIST_ROWS = 100
+
+    def list_canonical_catalog_variants(self, *, manufacturer: str | None = None,
+                                        commercial_model: str | None = None,
+                                        model_year: int | None = None,
+                                        canonical_key: str | None = None,
+                                        limit: int = 50,
+                                        offset: int = 0) -> list[dict[str, Any]]:
+        """One bounded canonical page, each row carrying the EXACT total.
+
+        Mirrors the row contract of the PR3 aggregations rather than inventing a
+        second one: `total_count` travels on every row, and a page past the last
+        matching row returns ONE count row whose item columns are all null --
+        the shape `government.query.is_count_row` already recognises.  That is
+        what lets an out-of-range page report the real total instead of zero.
+
+        The total is PostgREST's `count=exact`, so it is the database's own
+        count over every matching row, never a guess from the page length.  When
+        the server declines to report one, `total_count` is None -- "not
+        reported", which the layer above carries as unknown rather than as zero.
+        """
+        bounded = max(1, min(int(limit), self.MAX_CANONICAL_LIST_ROWS))
+        start = max(0, int(offset))
+        query = (self.client.table("catalog_canonical_variant_current")
+                 .select(self.CANONICAL_VARIANT_COLUMNS, count=CountMethod.exact))
+        if manufacturer is not None:
+            query = query.eq("manufacturer", str(manufacturer))
+        if commercial_model is not None:
+            query = query.eq("commercial_model", str(commercial_model))
+        if canonical_key is not None:
+            query = query.eq("canonical_key", str(canonical_key))
+        if model_year is not None:
+            # A variant states a RANGE; the filter selects the variants whose
+            # range contains the year, exactly as `p_model_year` does for
+            # candidates in `catalog_candidate_variant_page`.
+            year = int(model_year)
+            query = query.lte("model_year_start", year).gte("model_year_end", year)
+        rows, total = self._many_with_count(
+            query.order("canonical_key").range(start, start + bounded - 1))
+        if not rows:
+            empty = {name.strip(): None for name in self.CANONICAL_VARIANT_COLUMNS.split(",")}
+            return [{**empty, "total_count": total}]
+        return [{**row, "total_count": total} for row in rows]
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_resolution": resolution}

@@ -6268,3 +6268,126 @@ def test_a_revision_appends_and_the_read_model_moves_but_the_row_never_does(pr3_
                 f"where variant_id='{variant}'")
     with pytest.raises(AssertionError, match="append-only"):
         db.psql(f"delete from public.catalog_canonical_field_provenance where variant_id='{variant}'")
+
+
+# =============================================================================
+# CODE-3 -- the bounded, read-only catalog REVIEW surface, against real SQL
+# =============================================================================
+#
+# The in-memory mirror is exercised by `tests/test_catalog_review_surface.py`.
+# What CANNOT be proved there is the half that is SQL: that the database itself
+# filters `ready_for_review`, that its `total_count` is exact past the end of a
+# page, and that `catalog_canonical_variant_current` answers the bounded
+# canonical listing under exactly the columns, filters, ordering and range the
+# repository asks for. Those are proved here, against a real cluster.
+
+
+def test_code3_the_candidate_review_page_is_filtered_to_ready_for_review_in_sql(pr3_db):
+    """`p_status` is a DATABASE filter, and every other status is held out.
+
+    Two candidates of the same snapshot, one `ready_for_review` and one not.
+    The review page must carry exactly the first, and `total_count` must be the
+    count of the FILTERED set -- not of the snapshot.
+    """
+    db = pr3_db
+    args, snapshot, record, ready, _links, _make = _pr3_promotable(db, "code3-status")
+    # A SECOND candidate of the same snapshot, left as an ordinary `candidate`.
+    # On the same captured row: the snapshot is already active and an active
+    # snapshot's raw records are immutable, while a candidate reading of one is
+    # exactly what the reconciliation round still writes. A different
+    # commercial model gives it its own derived candidate key.
+    plain = _rpc_as_service(
+        db, "select id from public.record_catalog_candidate_guarded("
+            f"{args},'{_catalog_candidate_json(snapshot, record, 'code3-cand-2', status='candidate', make='Toyota-code3-status', model='COROLLA')}'::jsonb)")
+    assert db.psql(f"select count(*) from public.catalog_candidate_variants where snapshot_id='{snapshot}'") == "2"
+
+    # The review page: one row, the ready one, and an exact total of 1.
+    assert db.psql("select id || '|' || status || '|' || total_count from "
+                   "public.catalog_candidate_variant_page("
+                   f"'{snapshot}', p_status => 'ready_for_review')") == f"{ready}|ready_for_review|1"
+    # The other candidate is in the snapshot and is NOT in the review page.
+    assert db.psql("select count(*) from public.catalog_candidate_variant_page("
+                   f"'{snapshot}', p_status => 'ready_for_review') where id='{plain}'") == "0"
+    # Unfiltered, the snapshot really does hold both -- so the absence above is
+    # the filter working, not an empty snapshot.
+    assert db.psql("select count(*) from public.catalog_candidate_variant_page("
+                   f"'{snapshot}')") == "2"
+
+
+def test_code3_the_review_page_states_the_exact_total_past_the_end_of_a_page(pr3_db):
+    """An offset past the last matching row reports the REAL total, not zero.
+
+    This is what makes CODE-3's `has_more` a fact. Without the count row the
+    surface would report `total: 0` for a filter that matched, and would then
+    tell an operator there is nothing more to review.
+    """
+    db = pr3_db
+    _args, snapshot, _record, _ready, _links, _make = _pr3_promotable(db, "code3-total")
+    assert db.psql("select count(*) || '|' || max(total_count) || '|' || count(id) "
+                   "from public.catalog_candidate_variant_page("
+                   f"'{snapshot}', p_status => 'ready_for_review', p_offset => 500)") == "1|1|0"
+    # A status that matches nothing is a real zero, and is distinguishable.
+    assert db.psql("select count(*) || '|' || max(total_count) || '|' || count(id) "
+                   "from public.catalog_candidate_variant_page("
+                   f"'{snapshot}', p_status => 'rejected')") == "1|0|0"
+
+
+def test_code3_the_canonical_view_answers_the_repositorys_bounded_listing(pr3_db):
+    """Exactly the query `SupabaseRepository.list_canonical_catalog_variants`
+    builds: this column list, these filter columns, this ordering, this range,
+    and an exact count -- run against the real view.
+
+    The column list is read from the repository rather than restated, so a
+    column added there without a reviewed migration fails HERE.
+    """
+    db = pr3_db
+    from backend.repository.supabase import SupabaseRepository
+
+    columns = SupabaseRepository.CANONICAL_VARIANT_COLUMNS
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "code3-canon")
+    variant = _promote(db, args, _pr3_promotion_json(candidate, links, make,
+                                                     key="pr3-code3-canon"))
+
+    # Every column the repository selects exists on the view and is readable.
+    assert db.psql(f"select count(*) from (select {columns} from "
+                   f"public.catalog_canonical_variant_current where variant_id='{variant}') t") == "1"
+    # The exact-match filters the repository applies.
+    key = db.psql(f"select canonical_key from public.catalog_canonical_variant_current where variant_id='{variant}'")
+    assert db.psql("select count(*) from public.catalog_canonical_variant_current "
+                   f"where canonical_key='{key}'") == "1"
+    assert db.psql("select count(*) from public.catalog_canonical_variant_current "
+                   f"where manufacturer='{make}' and commercial_model='RAV4'") == "1"
+    # The model-year filter is range CONTAINMENT, exactly as the repository's
+    # `lte(model_year_start)` + `gte(model_year_end)` pair expresses it.
+    assert db.psql("select count(*) from public.catalog_canonical_variant_current "
+                   f"where manufacturer='{make}' and model_year_start <= 2021 "
+                   "and model_year_end >= 2021") == "1"
+    assert db.psql("select count(*) from public.catalog_canonical_variant_current "
+                   f"where manufacturer='{make}' and model_year_start <= 1999 "
+                   "and model_year_end >= 1999") == "0"
+    # The ordering is by `canonical_key`, which is ASCII by construction, so the
+    # page order does not depend on the cluster's text collation -- the reason
+    # every other catalog listing orders by a derived key rather than by the
+    # Hebrew identity text.
+    assert db.psql(f"select canonical_key ~ '^cv1\\.[0-9a-f]{{32}}$' from "
+                   f"public.catalog_canonical_variant_current where variant_id='{variant}'") == "t"
+    # And the range the repository applies really does bound the answer.
+    bounded = int(db.psql("select count(*) from (select 1 from "
+                          "public.catalog_canonical_variant_current order by canonical_key "
+                          f"limit {SupabaseRepository.MAX_CANONICAL_LIST_ROWS} offset 0) t"))
+    assert bounded <= SupabaseRepository.MAX_CANONICAL_LIST_ROWS
+
+
+def test_code3_the_canonical_view_is_security_invoker_and_grants_nothing_extra(pr3_db):
+    """A view is a SHAPE, never a privilege.
+
+    `security_invoker` is what keeps the review surface from reading more than
+    its caller could, and `anon` holding no privilege on it is what keeps the
+    browser's own Supabase key from reading the canonical catalog directly --
+    every CODE-3 read goes through the membership-authorized API instead.
+    """
+    db = pr3_db
+    assert db.psql("select 'security_invoker=true' = any(reloptions) from pg_class "
+                   "where relname='catalog_canonical_variant_current'") == "t"
+    assert db.psql("select count(*) from information_schema.role_table_grants where "
+                   "table_name='catalog_canonical_variant_current' and grantee='anon'") == "0"

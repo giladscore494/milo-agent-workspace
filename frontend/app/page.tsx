@@ -20,8 +20,23 @@ import {
 import { getCurrentSession, onAuthStateChange, signInWithSupabase, signOutFromSupabase, SupabaseSession } from '@/lib/supabaseClient';
 import { isTerminalRunStatus, isPartialSuccessRunStatus } from '@/lib/runStatus';
 import { useRunRealtime } from '@/lib/useRunRealtime';
-import { Conversation, Project, Proposal } from '@/lib/types';
+import {
+  CanonicalCatalogPage,
+  CatalogReviewPage as CatalogReviewPageData,
+  Conversation,
+  Project,
+  Proposal,
+} from '@/lib/types';
+import {
+  CATALOG_PAGE_SIZE,
+  parseCanonicalPage,
+  parseReviewPage,
+} from '@/lib/catalogReview';
 import { AuthScreen, SessionRestoreScreen } from '@/components/auth/AuthScreen';
+import {
+  CatalogReviewPanel,
+  CatalogReviewView,
+} from '@/components/catalog/CatalogReviewPanel';
 import { ConversationView } from '@/components/conversation/ConversationView';
 import { TaskComposer } from '@/components/conversation/TaskComposer';
 import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector';
@@ -149,6 +164,17 @@ export default function WorkspacePage() {
 
   const [tab, setTab] = useState<InspectorTab>('Agents');
 
+  // CODE-3 — durable catalog review state. Deliberately separate from every
+  // run-scoped piece of state above: this answers "what does the catalog hold
+  // now?", which outlives any run and belongs to the PROJECT selection.
+  const [catalogOpen, setCatalogOpen] = useState(false);
+  const [catalogView, setCatalogView] = useState<CatalogReviewView>('canonical');
+  const [catalogOffset, setCatalogOffset] = useState(0);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogError, setCatalogError] = useState('');
+  const [canonicalPage, setCanonicalPage] = useState<CanonicalCatalogPage>();
+  const [reviewPage, setReviewPage] = useState<CatalogReviewPageData>();
+
   // The live ownership scope. Updated synchronously by the handlers below, so
   // it always describes what is selected now rather than what React last
   // rendered; a response that resolves after a switch compares against this.
@@ -264,6 +290,16 @@ export default function WorkspacePage() {
       setTaskContent('');
       setConfirmingCancel(false);
       setCancelReason('');
+      // Durable catalog rows the previous identity was authorized to see. They
+      // are membership-authorized server-side, so a new or absent identity must
+      // not inherit a rendered page from the old one.
+      setCatalogOpen(false);
+      setCatalogView('canonical');
+      setCatalogOffset(0);
+      setCatalogError('');
+      setCatalogLoading(false);
+      setCanonicalPage(undefined);
+      setReviewPage(undefined);
       // The replacement owner inherits no busy state. An old request settling
       // afterwards cannot clear the new owner's, because `settlePending`
       // compares request identity, not truthiness.
@@ -275,6 +311,73 @@ export default function WorkspacePage() {
     }
     loadProjects(scope.current);
   }, [session, loadProjects]);
+
+  /**
+   * Read one bounded catalog page for the selected project.
+   *
+   * Ownership is checked exactly as every other asynchronous read here checks
+   * it: the answer is applied only while the project it was issued under is
+   * still selected, so a page belonging to a project the user has moved away
+   * from is dropped rather than rendered under the new one.
+   *
+   * The response is parsed, never trusted: `parseCanonicalPage` /
+   * `parseReviewPage` build UI state field by field, so nothing the server sent
+   * outside the contract can reach the screen.
+   */
+  const loadCatalog = useCallback((
+    project: Project,
+    view: CatalogReviewView,
+    offset: number,
+    owner: WorkspaceScope,
+  ) => {
+    const requested = { limit: CATALOG_PAGE_SIZE, offset };
+    setCatalogLoading(true);
+    setCatalogError('');
+    const pending = view === 'canonical'
+      ? api.catalogCanonical(project.id, requested)
+      : api.catalogReviewCandidates(project.id, requested);
+    pending
+      .then(body => {
+        if (!ownsProject(owner, scope.current)) return; // another project now
+        if (view === 'canonical') setCanonicalPage(parseCanonicalPage(body, requested));
+        else setReviewPage(parseReviewPage(body, requested));
+      })
+      .catch(error => {
+        if (!ownsProject(owner, scope.current)) return;
+        setCatalogError(safeErrorText(error, 'Failed to load the catalog page.'));
+      })
+      .finally(() => {
+        if (!ownsProject(owner, scope.current)) return;
+        setCatalogLoading(false);
+      });
+  }, []);
+
+  // The catalog is read when the panel is open and a project is selected, and
+  // again whenever the view or the page changes. Closing the panel issues no
+  // request; opening it re-reads, so what is shown is never a stale page from
+  // an earlier visit.
+  useEffect(() => {
+    if (!catalogOpen || !selectedProject) return;
+    loadCatalog(selectedProject, catalogView, catalogOffset, scope.current);
+  }, [catalogOpen, selectedProject, catalogView, catalogOffset, loadCatalog]);
+
+  /** Switching views starts at the first page and drops the other view's rows. */
+  const changeCatalogView = useCallback((next: CatalogReviewView) => {
+    setCatalogView(next);
+    setCatalogOffset(0);
+    setCatalogError('');
+    setCanonicalPage(undefined);
+    setReviewPage(undefined);
+  }, []);
+
+  /** Every piece of rendered catalog state, dropped. */
+  const clearCatalogState = useCallback(() => {
+    setCatalogOffset(0);
+    setCatalogError('');
+    setCatalogLoading(false);
+    setCanonicalPage(undefined);
+    setReviewPage(undefined);
+  }, []);
 
   const loadConversations = useCallback((project: Project, owner: WorkspaceScope) => {
     setConversations(undefined);
@@ -324,6 +427,11 @@ export default function WorkspacePage() {
     setRunError('');
     setCancelError('');
     setSidebarOpen(false);
+    // The catalog read is authorized against the project, so one project's page
+    // may never stay on screen under another. It is dropped here rather than
+    // left to be overwritten, so there is no moment where the previous
+    // project's rows are shown beside the new project's name.
+    clearCatalogState();
     loadConversations(project, owner);
   }
 
@@ -596,6 +704,29 @@ export default function WorkspacePage() {
           output={state.run?.output}
         />
         <RunOutputPanel visible={executionUi && activeRunId !== undefined && !swarm.isSwarmV2} output={state.run?.output} />
+        {/* CODE-3 — durable catalog state, not run state. It is shown for any
+            selected project regardless of `executionUi`: the execution UI flag
+            hides EXECUTION controls, and there are none here. Hiding a
+            read-only inspection surface behind it would make the catalog
+            invisible in exactly the posture an operator inspects it from. */}
+        <CatalogReviewPanel
+          visible={selectedProject !== undefined}
+          open={catalogOpen}
+          onOpenChange={setCatalogOpen}
+          view={catalogView}
+          onViewChange={changeCatalogView}
+          loading={catalogLoading}
+          error={catalogError}
+          canonical={canonicalPage}
+          review={reviewPage}
+          offset={catalogOffset}
+          onOffsetChange={setCatalogOffset}
+          onRetry={() => {
+            if (selectedProject) {
+              loadCatalog(selectedProject, catalogView, catalogOffset, scope.current);
+            }
+          }}
+        />
       </ConversationView>
     </WorkspaceShell>
   );

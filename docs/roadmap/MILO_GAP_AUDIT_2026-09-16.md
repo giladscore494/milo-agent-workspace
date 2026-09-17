@@ -7,6 +7,29 @@ after Catalog PR3 (#88), F4 (#89) and F5 (#90).
 
 ---
 
+> ## Completion note — added 2026-09-17, after CODE-3
+>
+> **Same rule as the note below: this audit is a dated observation and is not
+> rewritten.** `CAT-10` was `MISSING` when it was written and that reading was
+> correct at the time.
+>
+> | Row | As audited | Since, in code | Still open |
+> | --- | --- | --- | --- |
+> | `CAT-10` / §13.1 `CODE-3` — "there is no human review or read surface for the canonical catalog at all" | `MISSING` | **closed by CODE-3**: two GET routes — `/projects/{project_id}/catalog/canonical` and `/projects/{project_id}/catalog/review-candidates` — membership-authorized through the existing `repo.get_project` contract, bounded and deterministic, projected through closed allowlists, plus a read-only workspace surface. No mutation endpoint and no mutation control exists. `backend/catalog/review.py`, `../catalog-code3-review-surface.md` | **nothing has been reviewed**: no production database was read, no live snapshot exists to review, and OPERATOR-0 then AUTH-1/OPERATOR-3 still gate one |
+>
+> **CODE-3 added no migration.** The canonical read reuses
+> `catalog_canonical_variant_current` (PR3) and the `ready_for_review` read
+> reuses `catalog_candidate_variant_page`, both already merged. It adds one
+> read-only repository method over the existing view and nothing else.
+>
+> **CODE-3 proves no production catalog row exists.** Every row in every test
+> and in the E2E stack is in-memory, in an ephemeral local PostgreSQL, or
+> derived from the committed R5 capture fixtures. `S3-02b` is unchanged: whether
+> a durable snapshot exists in the target database is still **not proven either
+> way**, and §15's stop conditions all still stand.
+>
+> ---
+>
 > ## Completion note — added 2026-09-16, after CODE-2 (#92) and CODE-1
 >
 > **This audit is a dated, point-in-time observation and is not rewritten.**

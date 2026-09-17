@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  executionRoutesEnabled,
   isGatewayRequestAllowed,
   isRunCreationRequest,
 } from '@/lib/server/gatewayPolicy';
@@ -59,6 +60,67 @@ describe('gateway policy', () => {
     expect(
       isGatewayRequestAllowed('GET', `/projects/${PROJECT_ID}/conversations`),
     ).toBe(true);
+  });
+
+  /**
+   * CODE-3 — the read-only catalog review routes.
+   *
+   * SAFE, not EXECUTION: they must answer while the execution stage is off,
+   * because that is exactly the posture an operator inspects the catalog from
+   * during a rollback.
+   */
+  describe('CODE-3 catalog review routes', () => {
+    const CANONICAL = `/projects/${PROJECT_ID}/catalog/canonical`;
+    const REVIEW = `/projects/${PROJECT_ID}/catalog/review-candidates`;
+
+    it('allowlists exactly the two GET routes', () => {
+      expect(isGatewayRequestAllowed('GET', CANONICAL)).toBe(true);
+      expect(isGatewayRequestAllowed('GET', REVIEW)).toBe(true);
+    });
+
+    it('allows them while execution routes stay disabled', () => {
+      // No GATEWAY_ALLOW_EXECUTION_ROUTES is set in this suite, so this is the
+      // default deployed posture — and the reads still go through.
+      expect(executionRoutesEnabled()).toBe(false);
+      expect(isGatewayRequestAllowed('GET', CANONICAL)).toBe(true);
+      expect(isGatewayRequestAllowed('GET', REVIEW)).toBe(true);
+      // ...while an execution route is still refused in the same breath.
+      expect(isGatewayRequestAllowed('POST', `/runs/${RUN_ID}/cancel`)).toBe(false);
+    });
+
+    it.each(['POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])(
+      'blocks the %s counterpart of both paths', (method) => {
+        expect(isGatewayRequestAllowed(method, CANONICAL)).toBe(false);
+        expect(isGatewayRequestAllowed(method, REVIEW)).toBe(false);
+      });
+
+    it('is not a generic catalog proxy', () => {
+      // A path the two rules do not name is refused, including a plausible
+      // mutating one a later release might add.
+      for (const path of [
+        `/projects/${PROJECT_ID}/catalog`,
+        `/projects/${PROJECT_ID}/catalog/`,
+        `/projects/${PROJECT_ID}/catalog/promote`,
+        `/projects/${PROJECT_ID}/catalog/canonical/promote`,
+        `/projects/${PROJECT_ID}/catalog/review-candidates/approve`,
+        `/projects/${PROJECT_ID}/catalog/candidates`,
+        '/catalog/canonical',
+      ]) {
+        expect(isGatewayRequestAllowed('GET', path)).toBe(false);
+        expect(isGatewayRequestAllowed('POST', path)).toBe(false);
+      }
+    });
+
+    it('requires a well-formed project id', () => {
+      expect(isGatewayRequestAllowed('GET', '/projects/not-a-uuid/catalog/canonical'))
+        .toBe(false);
+      expect(isGatewayRequestAllowed('GET', '/projects/../catalog/canonical')).toBe(false);
+    });
+
+    it('does not treat a catalog read as run creation', () => {
+      expect(isRunCreationRequest('GET', CANONICAL)).toBe(false);
+      expect(isRunCreationRequest('POST', REVIEW)).toBe(false);
+    });
   });
 
   it('blocks execution and internal worker routes by default', () => {

@@ -150,4 +150,60 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ reason }),
     }),
+
+  /**
+   * CODE-3 — the read-only catalog review surface.
+   *
+   * Both methods are GET with no body, and there is no mutating counterpart in
+   * this client: no approve, no reject, no promote, no capture. That is not
+   * only a convention — `tests/catalogReviewApi.test.ts` asserts the request
+   * `fetch` actually received, and the gateway allowlists only GET for these
+   * paths.
+   *
+   * The returned value is `unknown` ON PURPOSE. A typed return here would be a
+   * claim about a response nobody has checked, and the workspace must not
+   * render a value merely because the server sent it. `lib/catalogReview.ts`
+   * turns it into trusted state field by field.
+   */
+  catalogCanonical: (projectId: string, params: CatalogPageParams = {}) =>
+    request<unknown>(
+      `/projects/${projectId}/catalog/canonical${catalogQuery(params)}`,
+    ),
+
+  catalogReviewCandidates: (projectId: string, params: CatalogPageParams = {}) =>
+    request<unknown>(
+      `/projects/${projectId}/catalog/review-candidates${catalogQuery(params)}`,
+    ),
 };
+
+/** Exactly the query parameters the CODE-3 routes declare. Nothing else. */
+export type CatalogPageParams = {
+  limit?: number;
+  offset?: number;
+  manufacturer?: string;
+  commercialModel?: string;
+  modelYear?: number;
+  canonicalKey?: string;
+};
+
+/**
+ * The query string for a catalog page request.
+ *
+ * Built from a CLOSED set of names: a caller cannot add a parameter through
+ * this, so the client cannot ask the server for an ordering, a column, a table
+ * or a status even by accident. Every value is encoded, and an absent one
+ * contributes no parameter at all — `?manufacturer=` is a filter the server
+ * refuses, and sending one for an unset field would turn "no filter" into a
+ * request that matches nothing.
+ */
+function catalogQuery(params: CatalogPageParams): string {
+  const query = new URLSearchParams();
+  if (params.limit !== undefined) query.set('limit', String(params.limit));
+  if (params.offset !== undefined) query.set('offset', String(params.offset));
+  if (params.manufacturer) query.set('manufacturer', params.manufacturer);
+  if (params.commercialModel) query.set('commercial_model', params.commercialModel);
+  if (params.modelYear !== undefined) query.set('model_year', String(params.modelYear));
+  if (params.canonicalKey) query.set('canonical_key', params.canonicalKey);
+  const encoded = query.toString();
+  return encoded === '' ? '' : `?${encoded}`;
+}

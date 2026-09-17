@@ -1253,6 +1253,20 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # holds it to that. It is NOT a worker, a route, a tool or a schedule:
         # the assertions below and in that module are what keep it one.
         "backend/catalog/operator_capture.py",
+        # CODE-3: the bounded READ-ONLY review layer. It names the WLTP resource
+        # constant and reads through `GovernmentCatalogQuery`, which is the
+        # existing bounded database-side reader -- it constructs no transport,
+        # no `DataGovClient` and no live capture path of any kind, and
+        # `tests/test_catalog_review_surface.py` proves that by making both
+        # constructions an outright error during a request. It is a read: no
+        # lease, no write, no flag.
+        "backend/catalog/review.py",
+        # CODE-3, test-only: the durable catalog the isolated E2E stack reads.
+        # It lands the committed R5 capture fixtures through the real ingestion
+        # path with `FixtureTransport`, exactly as `government_capture.py`
+        # above does for the offline suites. Imported only by
+        # `backend/testing/e2e_app.py`, which is never deployed.
+        "backend/testing/catalog_review_seed.py",
     }
     for path in sorted(Path("backend").rglob("*.py")):
         text = str(path)

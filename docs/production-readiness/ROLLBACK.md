@@ -77,6 +77,21 @@ state. There is deliberately no automated catalog data rollback: a canonical
 row written in error is corrected by forward review, under the migration policy
 below, never by an automatic delete.
 
+**And it does not blind you.** CODE-3's read-only review surface
+(`GET /projects/{project_id}/catalog/canonical` and
+`GET /projects/{project_id}/catalog/review-candidates`) stays available with
+this switch off, and with run creation, proposal mutations, cancellation,
+execution control and `GATEWAY_ALLOW_EXECUTION_ROUTES` all off as well. Reading
+durable state is not execution, and the operator who has just pulled a kill
+switch is the one who most needs to see what the catalog already holds — so
+neither route appears in `execution_guard.SURFACE_RULES` and both sit in the
+gateway's SAFE allowlist rather than its execution one. Both are GET-only,
+membership-authorized, and reach no catalog write method
+(`tests/test_catalog_review_surface.py`,
+`frontend/e2e/disabled.catalog-review.spec.ts`, which runs entirely against the
+execution-disabled stack). Its contract is in
+[`../catalog-code3-review-surface.md`](../catalog-code3-review-surface.md).
+
 **What the two events mean** when you are reading a run during an incident is
 in [MONITORING_AND_INCIDENTS.md](MONITORING_AND_INCIDENTS.md): a
 `catalog_promotion_refused` is an operational catalog outcome, not a failed
