@@ -1115,6 +1115,146 @@ def test_012_launch_cas_only_one_winner(ownership_db):
     assert len(winners) == 1, results
 
 
+def test_012_create_message_and_run_reports_created_and_writes_no_replay_message(ownership_db):
+    """The creation contract CODE-1's `--prepare` depends on, in the database.
+
+    Three properties, all load-bearing for operator preparation:
+
+    1.  a first call reports `created = true`;
+    2.  a replay on the same (conversation, requested_by, idempotency key)
+        reports `created = false` and returns the SAME run;
+    3.  the replay writes **no second message and no second run** -- the
+        idempotency lookup precedes every insert, which is what stops a
+        preparation replay leaving an orphan message behind.
+
+    Without (1) and (2), `--prepare` cannot tell "I created this" from "an
+    ordinary product run already held this key", and would win the launch CAS
+    for a run it did not create.
+    """
+    _seed_atomic_fixture(ownership_db)
+    messages_before = ownership_db.psql("select count(*) from public.messages")
+    runs_before = ownership_db.psql("select count(*) from public.runs")
+
+    first = ownership_db.psql(_create_run_sql("operator-parity-key", content="prepared"))
+    assert '"created": true' in first.replace("'", '"'), first
+    run_id = ownership_db.psql(
+        "select id from public.runs where idempotency_key = 'operator-parity-key'")
+    assert run_id
+
+    messages_after = ownership_db.psql("select count(*) from public.messages")
+    runs_after = ownership_db.psql("select count(*) from public.runs")
+    assert int(messages_after) == int(messages_before) + 1
+    assert int(runs_after) == int(runs_before) + 1
+
+    replay = ownership_db.psql(_create_run_sql("operator-parity-key", content="prepared"))
+    assert '"created": false' in replay.replace("'", '"'), replay
+    assert run_id in replay
+    # The decisive half: a replay inserts nothing at all.
+    assert ownership_db.psql("select count(*) from public.messages") == messages_after
+    assert ownership_db.psql("select count(*) from public.runs") == runs_after
+
+
+def test_012_an_idempotency_collision_never_yields_two_runs(ownership_db):
+    """Concurrent creation on one idempotency key: exactly one run exists.
+
+    The race operator preparation must survive. Whoever wins, the loser is
+    told `created = false` and is handed the winner's run -- which is precisely
+    the signal `--prepare` uses to refuse rather than adopt a run it did not
+    create.
+    """
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    key = "concurrent-collision-key"
+
+    def create(index):
+        try:
+            return ownership_db.psql(_create_run_sql(key, content=f"body-{index}"))
+        except AssertionError as failure:  # a unique-violation loser
+            return f"ERROR {failure}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(create, range(6)))
+
+    rows = ownership_db.psql(
+        f"select count(*) from public.runs where idempotency_key = '{key}'")
+    assert rows == "1", results
+    created_true = [row for row in results if '"created": true' in row.replace("'", '"')]
+    assert len(created_true) == 1, results
+    # Every other caller was told it did not create the run.
+    others = [row for row in results if row not in created_true]
+    assert all('"created": false' in row.replace("'", '"') or row.startswith("ERROR")
+               for row in others), results
+
+
+def test_012_operator_owned_launch_state_is_unacquirable_by_the_launch_cas(ownership_db):
+    """CODE-1's operator ownership, proven against real PostgreSQL.
+
+    An operator capture run comes to rest in `launch_state = 'none'`. That is
+    the value migration 009 already defaults to and already constrains, so
+    nothing is invented here -- what matters is that the launch CAS in
+    `backend/main.py` (`launch_state in ('pending','launch_failed')`) can never
+    acquire it. If that were false, an ordinary `JobLauncher` could start a
+    model worker on a run the operator is capturing with.
+    """
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', "
+        f"""'{{"metadata": {{"milo_operation": "catalog.government.capture"}}}}'::jsonb, """
+        f"'none') returning id"
+    )
+    acquired = ownership_db.psql(
+        f"update public.runs set launch_state='launching' "
+        f"where id='{run_id}' and status='queued' "
+        "and launch_state in ('pending','launch_failed') returning id"
+    )
+    assert acquired.strip() == "", "the launch CAS acquired an operator-owned run"
+    assert ownership_db.psql(
+        f"select launch_state from public.runs where id='{run_id}'") == "none"
+
+
+def test_012_operator_preparation_and_launch_contend_at_one_cas(ownership_db):
+    """Exactly one winner, and the loser can never take it afterwards.
+
+    This is the atomic boundary CODE-1's `--prepare` competes at: several
+    ordinary launchers and one operator preparation all issue the SAME
+    single-statement CAS against one freshly created run. One wins. The
+    operator then rests the run in 'none', after which no further launcher --
+    winner or loser -- can acquire it.
+    """
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'pending') returning id"
+    )
+
+    def acquire(_):
+        return ownership_db.psql(
+            f"update public.runs set launch_state='launching' "
+            f"where id='{run_id}' and status='queued' "
+            "and launch_state in ('pending','launch_failed') returning id"
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(acquire, range(6)))
+    winners = [row for row in results if row.strip()]
+    assert len(winners) == 1, results
+
+    # The winner is the operator: it rests the run in the unacquirable state.
+    ownership_db.psql(f"update public.runs set launch_state='none' where id='{run_id}'")
+    assert acquire(None).strip() == "", "a launcher acquired an operator-owned run"
+
+    # And a lease is still claimable by the operator afterwards: ownership of
+    # the LAUNCH and ownership of the LEASE are different boundaries, which is
+    # exactly why the launch one has to be settled first.
+    claimed = ownership_db.psql(
+        f"select launch_state from public.claim_run_lease('{run_id}', 'operator-capture', 300)")
+    assert claimed == "none"
+
+
 def test_012_lease_claim_single_holder_under_concurrency(ownership_db):
     import concurrent.futures
 

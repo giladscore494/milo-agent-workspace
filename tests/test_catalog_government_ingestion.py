@@ -1222,7 +1222,7 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
 
     PR2 asserted here that nothing outside the package imported it at all.
     PR3 makes that false on purpose, so the assertion becomes the list of
-    places it is now reachable from -- and stays a test failure if a sixth
+    places it is now reachable from -- and stays a test failure if another
     module starts importing the Government catalog without a reviewer noticing.
 
     `backend/testing/r5_proof/government.py` reads the shared code/label
@@ -1246,6 +1246,13 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         "backend/catalog/pipeline.py",
         "backend/engines/swarm_v2/evidence_mapping.py",
         "backend/engines/swarm_v2/validation.py",
+        # CODE-1: the ONE operator-invoked capture entrypoint. It is the first
+        # module in this repository that constructs the live capture path, and
+        # it is orchestration only -- it refuses by default, it is gated on
+        # `MILO_ENABLE_CATALOG_EXECUTION`, and `tests/test_catalog_operator_capture.py`
+        # holds it to that. It is NOT a worker, a route, a tool or a schedule:
+        # the assertions below and in that module are what keep it one.
+        "backend/catalog/operator_capture.py",
     }
     for path in sorted(Path("backend").rglob("*.py")):
         text = str(path)

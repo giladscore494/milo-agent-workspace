@@ -92,6 +92,16 @@ configuration they started with. This DELETES AND MUTATES NO catalog row:
 snapshots, candidates and canonical variants are left exactly as they are, so
 re-enabling resumes from the same durable state.
 
+The same flag closes the operator Government capture entrypoint
+(backend/catalog/operator_capture.py). While it is off, an invocation refuses
+before constructing a transport or a repository: no request reaches
+data.gov.il, no run is claimed, and nothing is captured, ingested or activated.
+It prevents the NEXT capture and undoes no previous one. A capture already in
+flight holds a lease and is stopped by cancelling its run, after which
+activation cannot occur — activation is the last step and is gated on complete
+persistence, so an interrupted capture leaves a non-active snapshot that no
+reader reads.
+
 Flags are changed by updating the Cloud Run service env (see below) — there
 is no enable-all or disable-all script by design; each flag is explicit.
 

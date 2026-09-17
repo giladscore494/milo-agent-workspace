@@ -54,6 +54,12 @@ disabled (Stage A).
 
 Notes:
 
+- **`MILO_ENABLE_CATALOG_EXECUTION` also gates the CODE-1 operator capture
+  entrypoint** (`backend/catalog/operator_capture.py`). With the flag off, unset,
+  empty or malformed, that entrypoint constructs no transport, connects to no
+  database, claims no run and captures, ingests and activates nothing. It is the
+  same flag and the same true-value parser — there is no second catalog switch.
+  See [../catalog-code1-operator-capture.md](../catalog-code1-operator-capture.md).
 - **`MILO_ENABLE_CATALOG_EXECUTION` is worker-only and is never browser
   controlled.** It gates the catalog capability INSIDE a Swarm V2 run that is
   already happening: the `GovernmentVehicleTool` registration, the

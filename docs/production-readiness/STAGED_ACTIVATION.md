@@ -123,6 +123,40 @@ refusal codes seen, and the canonical row count before and after. A refusal is
 an operational outcome and does not fail that acceptance; an unexplained
 promotion does.
 
+### The first live Government capture — a further separate step
+
+**As of 2026-09-16 the capture entrypoint exists in code and no live capture
+has been executed.** `backend/catalog/operator_capture.py` (CODE-1) is an
+operator-invoked controller that refuses by default; the same
+`MILO_ENABLE_CATALOG_EXECUTION` flag gates it, so with the flag off it
+constructs no transport, connects to no database, claims no run and captures,
+ingests and activates nothing. Enabling the flag does **not** start a capture:
+nothing invokes the entrypoint automatically, and it has no schedule.
+
+Running it is its own step, after the flag stage above, and it needs:
+
+1. **AUTH-1** — explicit, current authorization for one bounded live capture
+   (outbound read-only, no model spend);
+2. **OPERATOR-0's read-only schema report**, completed and read — the
+   entrypoint requires an explicit acknowledgement of this and refuses without
+   it;
+3. `MILO_ENABLE_PAID_EXECUTION` off — a capture requires no model spend and
+   must not be bundled with one;
+4. a prepared operator capture run, because every durable catalog write is
+   lease-guarded. Preparing one is a supported, server-side, operator-only
+   command in the same entrypoint (`--prepare`); it takes atomic ownership of
+   the run's launch so no model worker can ever execute it, and it captures
+   nothing. **Preparing a run is not authorization to capture**, and capturing
+   is not authorization to run MILO against the result.
+
+The exact arguments, the prepared-run contract, the fixed resource and bounds,
+the sanitized report fields and the stop conditions are in
+[../catalog-code1-operator-capture.md](../catalog-code1-operator-capture.md).
+Acceptance for the capture itself (no secret values): the outcome, the snapshot
+key and id, the content checksum, the schema fingerprint, the declared and
+stored record counts, the page count, the candidate and status counts, the
+normalization contract and issue counts, and whether the snapshot activated.
+
 ## Stage D — Gradual expansion
 
 1. one project; 2. small allowlist; 3. limited daily budget; 4. monitored

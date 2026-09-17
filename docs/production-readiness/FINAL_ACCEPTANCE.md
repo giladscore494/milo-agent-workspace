@@ -77,7 +77,9 @@ what is deployed or enabled in any production environment.
 | **Catalog monitoring signals, rollback procedure and staged-activation position** | COMPLETED_IN_CODE (documentation) | MONITORING_AND_INCIDENTS.md, ROLLBACK.md, STAGED_ACTIVATION.md |
 | Catalog alerting bound to a real monitoring system | REQUIRES_MANUAL_OPERATOR_CONFIGURATION | MONITORING_AND_INCIDENTS.md |
 | Enabling catalog execution in a deployed environment | REQUIRES_MANUAL_OPERATOR_CONFIGURATION (separate explicit authorization) | STAGED_ACTIVATION.md |
-| Live Government capture entrypoint (operator CLI / job) | INTENTIONALLY_DEFERRED (not implemented; no production caller exists) | `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` (S3-02a) |
+| **Guarded operator Government capture entrypoint (CODE-1)** | COMPLETED_IN_CODE — refuses by default; **no live capture has been executed** | `backend/catalog/operator_capture.py`, `tests/test_catalog_operator_capture.py`, `../catalog-code1-operator-capture.md` |
+| Performing the first live Government capture | REQUIRES_MANUAL_OPERATOR_CONFIGURATION (OPERATOR-0 first, then AUTH-1) | `../catalog-code1-operator-capture.md`, `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` (OPERATOR-3) |
+| A durable Government snapshot in the target database | **not claimed either way** — unobserved from this repository | `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` (S3-02b) |
 | Bounded membership-authorized catalog read/review API and UI | INTENTIONALLY_DEFERRED (not implemented) | `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` (CAT-10) |
 | Manufacturer/importer source and targeted-Web evidence tool | INTENTIONALLY_DEFERRED (test-only implementations) | `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` |
 | Reconciliation / refresh scheduling and a `legacy_reference` producer | INTENTIONALLY_DEFERRED (no production caller or schedule) | `../roadmap/MILO_GAP_AUDIT_2026-09-16.md` |
