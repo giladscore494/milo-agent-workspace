@@ -1115,6 +1115,78 @@ def test_012_launch_cas_only_one_winner(ownership_db):
     assert len(winners) == 1, results
 
 
+def test_012_create_message_and_run_reports_created_and_writes_no_replay_message(ownership_db):
+    """The creation contract CODE-1's `--prepare` depends on, in the database.
+
+    Three properties, all load-bearing for operator preparation:
+
+    1.  a first call reports `created = true`;
+    2.  a replay on the same (conversation, requested_by, idempotency key)
+        reports `created = false` and returns the SAME run;
+    3.  the replay writes **no second message and no second run** -- the
+        idempotency lookup precedes every insert, which is what stops a
+        preparation replay leaving an orphan message behind.
+
+    Without (1) and (2), `--prepare` cannot tell "I created this" from "an
+    ordinary product run already held this key", and would win the launch CAS
+    for a run it did not create.
+    """
+    _seed_atomic_fixture(ownership_db)
+    messages_before = ownership_db.psql("select count(*) from public.messages")
+    runs_before = ownership_db.psql("select count(*) from public.runs")
+
+    first = ownership_db.psql(_create_run_sql("operator-parity-key", content="prepared"))
+    assert '"created": true' in first.replace("'", '"'), first
+    run_id = ownership_db.psql(
+        "select id from public.runs where idempotency_key = 'operator-parity-key'")
+    assert run_id
+
+    messages_after = ownership_db.psql("select count(*) from public.messages")
+    runs_after = ownership_db.psql("select count(*) from public.runs")
+    assert int(messages_after) == int(messages_before) + 1
+    assert int(runs_after) == int(runs_before) + 1
+
+    replay = ownership_db.psql(_create_run_sql("operator-parity-key", content="prepared"))
+    assert '"created": false' in replay.replace("'", '"'), replay
+    assert run_id in replay
+    # The decisive half: a replay inserts nothing at all.
+    assert ownership_db.psql("select count(*) from public.messages") == messages_after
+    assert ownership_db.psql("select count(*) from public.runs") == runs_after
+
+
+def test_012_an_idempotency_collision_never_yields_two_runs(ownership_db):
+    """Concurrent creation on one idempotency key: exactly one run exists.
+
+    The race operator preparation must survive. Whoever wins, the loser is
+    told `created = false` and is handed the winner's run -- which is precisely
+    the signal `--prepare` uses to refuse rather than adopt a run it did not
+    create.
+    """
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    key = "concurrent-collision-key"
+
+    def create(index):
+        try:
+            return ownership_db.psql(_create_run_sql(key, content=f"body-{index}"))
+        except AssertionError as failure:  # a unique-violation loser
+            return f"ERROR {failure}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(create, range(6)))
+
+    rows = ownership_db.psql(
+        f"select count(*) from public.runs where idempotency_key = '{key}'")
+    assert rows == "1", results
+    created_true = [row for row in results if '"created": true' in row.replace("'", '"')]
+    assert len(created_true) == 1, results
+    # Every other caller was told it did not create the run.
+    others = [row for row in results if row not in created_true]
+    assert all('"created": false' in row.replace("'", '"') or row.startswith("ERROR")
+               for row in others), results
+
+
 def test_012_operator_owned_launch_state_is_unacquirable_by_the_launch_cas(ownership_db):
     """CODE-1's operator ownership, proven against real PostgreSQL.
 

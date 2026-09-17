@@ -109,15 +109,20 @@ are **not** echoed back.
    by the repository exactly as it is for a browser request. An operator who is
    not a member of the conversation's project gets the same not-found a browser
    user would, and **nothing is created**.
-2. **`create_user_message` + `create_queued_run`** — the ordinary creation
-   pair, so the run is a real run with real ownership, a real idempotency key
-   and the operator marker. It is born `queued`/`pending`, which is
-   **launchable**, and stays that way for exactly as long as step 3 takes.
-3. **`try_acquire_launch`** — **the atomic boundary.** This is the same
-   single-statement compare-and-set `backend/main.py` uses, so the operator and
-   the ordinary launch path compete at one authoritative transition and exactly
-   one can win. Losing it is a refusal (`CAPTURE_LAUNCH_OWNERSHIP_LOST`), never
-   a retry, and the run is left alone.
+2. **`create_message_and_run`** — the product's own transactional creation
+   contract (migration 012, reached through the `create_message_and_run_v2`
+   wrapper). Under the per-user and per-project advisory locks it performs the
+   idempotency lookup **first**, applies the same concurrency admission the
+   product applies, and inserts the message and the run in one transaction. It
+   returns the run **and whether it created it**. A created run is born
+   `queued`/`pending`, which is **launchable**, and stays that way for exactly
+   as long as step 3 takes.
+3. **`try_acquire_launch`** — **the atomic boundary**, and only ever on a run
+   this call created. This is the same single-statement compare-and-set
+   `backend/main.py` uses, so the operator and the ordinary launch path compete
+   at one authoritative transition and exactly one can win. Losing it is a
+   refusal (`CAPTURE_LAUNCH_OWNERSHIP_LOST`), never a retry, and the run is
+   left alone.
 4. **`set_launch_state('none')`** — rest the run in a launch state
    `try_acquire_launch` can never acquire from. This is safe as a plain UPDATE
    *only because* step 3 already established exclusivity; doing it without step
@@ -144,17 +149,55 @@ A real-PostgreSQL test
 (`test_012_operator_owned_launch_state_is_unacquirable_by_the_launch_cas`)
 holds the database itself to the first property.
 
-### Replay, and interruption
+### An existing idempotency key is never adopted
+
+`create_message_and_run` says whether it **created** the run, and that flag —
+not the run's contents — decides what happens next.
+
+| Result | What `--prepare` does |
+| --- | --- |
+| **created** | continues to the launch CAS (step 3) and, if it wins, rests the run in the operator-owned state |
+| **not created**, and the existing run is one `--prepare` already made and nothing has consumed | reports it as a replay: `already_prepared: true`, and **acquires nothing, writes nothing** |
+| **not created**, anything else | refuses `CAPTURE_IDEMPOTENCY_KEY_IN_USE` and leaves the existing run exactly as it was |
+
+That third row is the point. An ordinary product run can hold the same
+`(conversation, requested_by, idempotency key)` identity, and preparation must
+never take it over: doing so would make somebody's chat run permanently
+unlaunchable, and — if that run happened to carry a browser-supplied
+`milo_operation` value — capturable as well. **No preparation call can upgrade
+an existing ordinary run into an operator capture run.**
+
+The replay decision reads `launch_state`, which is **server-owned and
+unreachable from any browser path**, together with `status` and the marker. The
+marker is never load-bearing on its own.
+
+### Replay, interruption and refusal
 
 - **Replay** — re-running `--prepare` with the same `--idempotency-key`,
-  conversation and user returns **the same run**, reports
-  `already_prepared: true`, and creates no second run.
+  conversation and user returns **the same run** and reports
+  `already_prepared: true`. It creates **no second run and no second
+  preparation message**, and it does not re-acquire or change launch
+  ownership: the idempotency lookup happens before every insert, so a replay
+  writes nothing at all.
+- **A consumed run is not a replay** — once the prepared run has been captured
+  it is no longer `queued`, so replaying its key refuses
+  (`CAPTURE_IDEMPOTENCY_KEY_IN_USE`) rather than implying a run you can still
+  capture with.
 - **Interruption** — a crash between steps 3 and 4 leaves the run at
-  `launching`, which is fail-closed in both directions: no launcher can acquire
-  it, and the capture refuses it (`CAPTURE_RUN_NOT_ELIGIBLE`). It is inert, and
-  it is not a model run.
-- **Refusal before creation** — a membership failure creates no run and no
-  message at all.
+  `launching`, which is fail-closed in every direction: no launcher can acquire
+  it, the capture refuses it (`CAPTURE_RUN_NOT_ELIGIBLE`), and replaying its
+  key refuses too rather than adopting it.
+- **Refusal before creation** — a membership failure, or the product's own
+  concurrency ceiling, creates no run and no message at all.
+
+### Arguments belong to one mode
+
+`--prepare` takes `--conversation-id`, `--requested-by` and
+`--idempotency-key`. `--execute` takes the egress acknowledgement, `--run-id`,
+the package and resource, and the bounds. Giving either mode the other's
+arguments refuses with `CAPTURE_ARGUMENT_NOT_VALID_IN_MODE` rather than
+accepting and ignoring them. `--project-ref`, the schema-report
+acknowledgement and `--report-path` are universal.
 
 ## 4 — executing the capture
 

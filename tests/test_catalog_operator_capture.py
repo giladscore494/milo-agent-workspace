@@ -1348,17 +1348,60 @@ def test_an_operator_owned_run_can_never_be_launched(monkeypatch, repository, ca
     assert repository.try_acquire_launch(run_id) is None
 
     # And the ordinary route itself, reaching the very same run by its
-    # idempotency key, returns without ever invoking the launcher.
+    # idempotency key, returns without ever invoking the launcher. The payload
+    # is byte-identical to what preparation stored, so the route's own
+    # idempotency-fingerprint check PASSES and it really does reach
+    # `try_acquire_launch` -- which is the step that must refuse. (A different
+    # payload is refused earlier, as its own case below.)
     launcher = RecordingLauncher()
     created = _create_and_launch_run(
         repository, launcher, AuthenticatedUser(user_id=user_id), conversation_id,
-        entrypoint.PREPARED_RUN_CONTENT, {"milo_operation": "chat"}, key)
+        entrypoint.PREPARED_RUN_CONTENT,
+        {"milo_operation": entrypoint.OPERATOR_CAPTURE_OPERATION}, key)
 
     assert launcher.calls == []
     assert str(created.run_id) == str(run_id)
     run = repository.runs[str(run_id)]
     assert run["launch_state"] == entrypoint.OPERATOR_OWNED_LAUNCH_STATE
     assert run["status"] == entrypoint.ELIGIBLE_RUN_STATUS
+
+
+def test_the_ordinary_route_rejects_a_different_payload_on_a_prepared_key(monkeypatch,
+                                                                          repository, capsys):
+    """Preparation stores a real request fingerprint, so the product's own
+    idempotency-conflict check now covers an operator-prepared key too."""
+    from backend.auth import AuthenticatedUser
+    from backend.errors import AppError as ApiError
+    from backend.main import _create_and_launch_run
+
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    conversation_id, user_id = seed_conversation(repository)
+    key = "operator-capture-fingerprint"
+    status = entrypoint.main(prepare_argv(conversation_id, user_id,
+                                          **{"--idempotency-key": key}), env=capture_env())
+    document = json.loads(capsys.readouterr().out)
+    assert status == entrypoint.EXIT_OK, document
+
+    launcher = RecordingLauncher()
+    with pytest.raises(ApiError) as failure:
+        _create_and_launch_run(repository, launcher, AuthenticatedUser(user_id=user_id),
+                               conversation_id, "a different prompt entirely",
+                               {"milo_operation": "chat"}, key)
+    assert failure.value.code == "IDEMPOTENCY_CONFLICT"
+    assert launcher.calls == []
+    run = next(iter(repository.runs.values()))
+    assert run["launch_state"] == entrypoint.OPERATOR_OWNED_LAUNCH_STATE
+
+
+def test_the_preparation_fingerprint_mirrors_the_api_helper():
+    """The mirror cannot drift silently: same input, same output."""
+    from backend.main import _request_fingerprint
+
+    assert entrypoint._preparation_fingerprint() == _request_fingerprint(
+        entrypoint.PREPARED_RUN_CONTENT,
+        {"milo_operation": entrypoint.OPERATOR_CAPTURE_OPERATION})
+    # Deterministic across calls, so a replay stores nothing new.
+    assert entrypoint._preparation_fingerprint() == entrypoint._preparation_fingerprint()
 
 
 def test_the_legacy_launch_fallback_is_not_laxer_than_the_cas():
@@ -1556,3 +1599,325 @@ def test_preparation_never_starts_a_capture(monkeypatch, repository, capsys):
     assert repository.catalog_raw_records == {}
     assert repository.catalog_candidates == {}
     assert repository.runs[str(run_id)].get("lease_token") is None
+
+
+# =============================================================================
+# 6. idempotency: preparation may never adopt a run it did not create
+#
+# The defect these close: `create_queued_run` returns an EXISTING run when the
+# (conversation, requested_by, idempotency key) identity is already taken, and
+# says nothing about which happened -- so preparation could win the launch CAS
+# for an ordinary product run and convert it into an operator capture run.
+# =============================================================================
+
+def ordinary_run_in(repository: MemoryRepository, conversation_id: UUID, user_id: UUID, *,
+                    key: str, metadata: Mapping[str, Any] | None = None) -> UUID:
+    """An ordinary product run occupying one idempotency identity.
+
+    Created through `create_message_and_run`, which is the transactional pair
+    the product's own route uses -- so this is a genuine product run, not a
+    state manufactured for the test.
+    """
+    result = repository.create_message_and_run(
+        conversation_id, "an ordinary user prompt", dict(metadata or {}), user_id, key,
+        "fingerprint-of-an-ordinary-request")
+    assert result["created"] is True
+    return UUID(str(result["run"]["id"]))
+
+
+def ordinary_run_state(repository: MemoryRepository, run_id: UUID) -> dict[str, Any]:
+    run = repository.runs[str(run_id)]
+    return {key: run.get(key) for key in
+            ("status", "launch_state", "worker_id", "attempt", "lease_token",
+             "requested_by", "idempotency_key", "request_fingerprint", "input")}
+
+
+@pytest.mark.parametrize("metadata", [
+    {},
+    {"milo_operation": "chat"},
+    # THE ONE THAT MATTERS: the exact operator marker, browser-supplied, on an
+    # ordinary run that also collides on the idempotency key.
+    {"milo_operation": entrypoint.OPERATOR_CAPTURE_OPERATION},
+])
+def test_preparation_refuses_an_idempotency_collision_with_an_ordinary_run(
+        monkeypatch, repository, transport, capsys, metadata):
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
+    conversation_id, user_id = seed_conversation(repository)
+    key = "a-key-the-product-already-used"
+    ordinary = ordinary_run_in(repository, conversation_id, user_id, key=key,
+                               metadata=metadata)
+    before = ordinary_run_state(repository, ordinary)
+    messages_before = len(repository.messages)
+
+    status = entrypoint.main(prepare_argv(conversation_id, user_id,
+                                          **{"--idempotency-key": key}), env=capture_env())
+    document = json.loads(capsys.readouterr().out)
+
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_IDEMPOTENCY_KEY_IN_USE"
+    assert "preparation" not in document
+
+    # The ordinary run is untouched, field for field.
+    assert ordinary_run_state(repository, ordinary) == before
+    assert before["launch_state"] == "pending"
+    assert before["lease_token"] is None
+    # No second run and no second message were created.
+    assert len(repository.runs) == 1
+    assert len(repository.messages) == messages_before
+    # It is STILL an ordinary run the launcher can take.
+    assert repository.try_acquire_launch(ordinary) is not None
+    # Nothing was captured, and no Government transport was constructed.
+    assert transport.calls == []
+    assert repository.catalog_snapshots == {} and repository.catalog_raw_records == {}
+
+
+def test_a_collided_ordinary_run_is_still_not_capturable(monkeypatch, repository, transport,
+                                                          capsys):
+    """Even carrying the marker, and even after a refused preparation."""
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
+    conversation_id, user_id = seed_conversation(repository)
+    key = "collision-then-capture"
+    ordinary = ordinary_run_in(
+        repository, conversation_id, user_id, key=key,
+        metadata={"milo_operation": entrypoint.OPERATOR_CAPTURE_OPERATION})
+
+    entrypoint.main(prepare_argv(conversation_id, user_id,
+                                 **{"--idempotency-key": key}), env=capture_env())
+    capsys.readouterr()
+
+    status, document, _ = run_main(authorized_argv(ordinary), capture_env(), capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_RUN_NOT_ELIGIBLE"
+    assert transport.calls == []
+    assert repository.runs[str(ordinary)]["launch_state"] == "pending"
+    assert repository.runs[str(ordinary)].get("lease_token") is None
+
+
+def test_preparation_replay_writes_no_second_run_and_no_second_message(monkeypatch,
+                                                                        repository, capsys):
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    conversation_id, user_id = seed_conversation(repository)
+    argv = prepare_argv(conversation_id, user_id, **{"--idempotency-key": "prepare-twice"})
+
+    first_status = entrypoint.main(argv, env=capture_env())
+    first = json.loads(capsys.readouterr().out)
+    runs_after_first = {key: dict(value) for key, value in repository.runs.items()}
+    messages_after_first = len(repository.messages)
+
+    second_status = entrypoint.main(argv, env=capture_env())
+    second = json.loads(capsys.readouterr().out)
+
+    assert (first_status, second_status) == (entrypoint.EXIT_OK, entrypoint.EXIT_OK)
+    assert first["preparation"]["run_id"] == second["preparation"]["run_id"]
+    assert first["preparation"]["already_prepared"] is False
+    assert second["preparation"]["already_prepared"] is True
+    # Byte-for-byte: the replay re-acquired nothing and rewrote nothing.
+    assert {key: dict(value) for key, value in repository.runs.items()} == runs_after_first
+    assert len(repository.messages) == messages_after_first == 1
+    assert len(repository.runs) == 1
+
+
+def test_a_consumed_operator_run_is_not_replayable(monkeypatch, repository, transport,
+                                                    capsys):
+    """Once captured, the run is no longer a valid preparation replay.
+
+    `_run_is_eligible` requires `status == 'queued'`, so a prepared run that
+    has already been captured and finalized is refused rather than reported as
+    an idempotent replay of something still usable.
+    """
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
+    conversation_id, user_id = seed_conversation(repository)
+    key = "prepare-then-capture"
+    argv = prepare_argv(conversation_id, user_id, **{"--idempotency-key": key})
+    entrypoint.main(argv, env=capture_env())
+    run_id = UUID(json.loads(capsys.readouterr().out)["preparation"]["run_id"])
+
+    status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
+    assert status == entrypoint.EXIT_OK, document
+    assert repository.runs[str(run_id)]["status"] == "completed"
+
+    replay_status = entrypoint.main(argv, env=capture_env())
+    replay = json.loads(capsys.readouterr().out)
+    assert replay_status == entrypoint.EXIT_REFUSED
+    assert replay["reason_code"] == "CAPTURE_IDEMPOTENCY_KEY_IN_USE"
+    assert len(repository.runs) == 1
+
+
+def test_an_interrupted_preparation_is_not_replayable_either(monkeypatch, repository,
+                                                              capsys):
+    """A run left mid-transition is not an operator-owned run, so a replay of
+    its key must refuse rather than adopt it."""
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    conversation_id, user_id = seed_conversation(repository)
+    key = "interrupted-preparation"
+    argv = prepare_argv(conversation_id, user_id, **{"--idempotency-key": key})
+
+    def refuse_rest(*_args, **_kwargs):
+        raise AppError("REPOSITORY_ERROR", "rest failed", 502)
+
+    monkeypatch.setattr(repository, "set_launch_state", refuse_rest)
+    assert entrypoint.main(argv, env=capture_env()) == entrypoint.EXIT_FAILED
+    capsys.readouterr()
+    monkeypatch.undo()
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+
+    run_id = UUID(next(iter(repository.runs)))
+    assert repository.runs[str(run_id)]["launch_state"] == "launching"
+
+    replay_status = entrypoint.main(argv, env=capture_env())
+    replay = json.loads(capsys.readouterr().out)
+    assert replay_status == entrypoint.EXIT_REFUSED
+    assert replay["reason_code"] == "CAPTURE_IDEMPOTENCY_KEY_IN_USE"
+    assert repository.runs[str(run_id)]["launch_state"] == "launching"
+    assert len(repository.runs) == 1
+
+
+def test_preparation_uses_the_transactional_creation_contract(monkeypatch, repository,
+                                                               capsys):
+    """The `created` flag is what the ownership decision reads.
+
+    `create_queued_run` cannot answer "did I create this", which is precisely
+    why it is no longer the creation call here.
+    """
+    calls: list[str] = []
+    real = repository.create_message_and_run
+
+    def recording(*args, **kwargs):
+        calls.append("create_message_and_run")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(repository, "create_message_and_run", recording)
+
+    run_id, _document = prepared(repository, capsys)
+    assert calls == ["create_message_and_run"]
+    assert repository.runs[str(run_id)]["request_fingerprint"] == \
+        entrypoint._preparation_fingerprint()
+
+    # And `_prepare` reaches the pair only THROUGH that transactional method:
+    # it names neither half itself. (The in-memory mirror calls them inside
+    # its own transaction, which is why this is a source assertion and not a
+    # patched-method one.)
+    body = entrypoint_code().split("def _prepare(")[1].split("\ndef ")[0]
+    assert "create_message_and_run" in body
+    assert "create_queued_run" not in body
+    assert "create_user_message" not in body
+
+
+def test_preparation_honours_the_products_concurrency_admission(monkeypatch, repository,
+                                                                 capsys):
+    """An operator preparation does not get to skip the product's own ceiling."""
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setenv("MILO_MAX_CONCURRENT_RUNS_PER_USER", "1")
+    conversation_id, user_id = seed_conversation(repository)
+    ordinary_run_in(repository, conversation_id, user_id, key="occupies-the-ceiling")
+
+    status = entrypoint.main(prepare_argv(conversation_id, user_id), env=capture_env())
+    document = json.loads(capsys.readouterr().out)
+
+    assert status == entrypoint.EXIT_FAILED
+    assert document["reason_code"] == "CAPTURE_PREPARATION_FAILED"
+    assert len(repository.runs) == 1
+
+
+def test_the_in_memory_creation_contract_matches_production(monkeypatch, repository):
+    """Parity for every field the ownership decision depends on.
+
+    The fake must not be safer than production: same `created` semantics, same
+    uniqueness scope, same lookup-before-insert ordering, same stored run
+    fields. The PostgreSQL side of this parity is
+    `test_012_create_message_and_run_reports_created_and_writes_no_replay_message`.
+    """
+    conversation_id, user_id = seed_conversation(repository)
+    first = repository.create_message_and_run(
+        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp")
+    assert first["created"] is True
+    assert first["run"]["status"] == "queued"
+    assert first["run"]["launch_state"] == "pending"
+    assert first["run"]["requested_by"] == str(user_id)
+    assert first["run"]["idempotency_key"] == "parity-key"
+    assert first["run"]["request_fingerprint"] == "fp"
+    messages_after_create = len(repository.messages)
+
+    replay = repository.create_message_and_run(
+        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp")
+    assert replay["created"] is False
+    assert replay["run"]["id"] == first["run"]["id"]
+    # No message is written on a replay -- the lookup precedes every insert.
+    assert len(repository.messages) == messages_after_create
+
+    # A different user with the same key is a DIFFERENT identity.
+    other_user = uuid4()
+    repository.seed_user(str(other_user))
+    project_id = repository.conversations[str(conversation_id)]["project_id"]
+    repository.members.add((project_id, str(other_user)))
+    distinct = repository.create_message_and_run(
+        conversation_id, "content", {"k": "v"}, other_user, "parity-key", "fp")
+    assert distinct["created"] is True
+    assert distinct["run"]["id"] != first["run"]["id"]
+
+
+# --- mode argument hardening -------------------------------------------------
+
+@pytest.mark.parametrize("extra", [
+    ["--page-limit", "1000"],
+    ["--resource-id", src.WLTP_RESOURCE_ID],
+    ["--package-id", src.CKAN_PACKAGE_ID],
+    ["--run-id", "0d44d491-bc40-404e-9642-a5b8f77f3441"],
+    ["--max-pages", "200"],
+    ["--max-records", "120000"],
+    ["--acknowledge-live-government-egress", entrypoint.EGRESS_ACKNOWLEDGEMENT],
+])
+def test_prepare_refuses_capture_only_arguments(tripwire, capsys, extra):
+    """They used to be accepted and silently ignored."""
+    argv = prepare_argv(uuid4(), uuid4()) + extra
+    status, document, _ = run_main(argv, capture_env(), capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_ARGUMENT_NOT_VALID_IN_MODE"
+
+
+@pytest.mark.parametrize("extra", [
+    ["--conversation-id", "0d44d491-bc40-404e-9642-a5b8f77f3441"],
+    ["--requested-by", "0d44d491-bc40-404e-9642-a5b8f77f3441"],
+    ["--idempotency-key", "k"],
+])
+def test_execute_refuses_preparation_only_arguments(tripwire, capsys, extra):
+    argv = authorized_argv(uuid4()) + extra
+    status, document, _ = run_main(argv, capture_env(), capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_ARGUMENT_NOT_VALID_IN_MODE"
+
+
+@pytest.mark.parametrize("extra", [
+    ["--conversation-id", "0d44d491-bc40-404e-9642-a5b8f77f3441"],
+    ["--page-limit", "1000"],
+])
+def test_plan_refuses_mode_specific_arguments(tripwire, capsys, extra):
+    """A plan is a constant document about the CAPTURE, so accepting either
+    set would answer a question nobody asked."""
+    status, document, _ = run_main(["--plan"] + extra, capture_env(), capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_ARGUMENT_NOT_VALID_IN_MODE"
+
+
+def test_an_empty_mode_specific_value_is_supplied_not_absent(tripwire, capsys):
+    """`--run-id ""` was typed, so it is refused rather than ignored."""
+    argv = prepare_argv(uuid4(), uuid4()) + ["--run-id", ""]
+    status, document, _ = run_main(argv, capture_env(), capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_ARGUMENT_NOT_VALID_IN_MODE"
+
+
+def test_the_two_mode_argument_sets_are_disjoint_and_cover_the_parser():
+    """No argument is in both sets, and the universal ones are deliberate."""
+    capture_only = {flag for _name, flag in entrypoint.CAPTURE_ONLY_ARGUMENTS}
+    prepare_only = {flag for _name, flag in entrypoint.PREPARE_ONLY_ARGUMENTS}
+    assert capture_only.isdisjoint(prepare_only)
+    universal = {"--execute", "--plan", "--prepare", "--project-ref", "--report-path",
+                 "--acknowledge-schema-report-reviewed", "-h"}
+    declared = {action.option_strings[0]
+                for action in entrypoint.build_parser()._actions if action.option_strings}
+    assert declared == capture_only | prepare_only | universal

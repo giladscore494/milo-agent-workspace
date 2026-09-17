@@ -172,6 +172,7 @@ another capture from starting and deletes or deactivates nothing.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -310,6 +311,10 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "that conversation does not exist or that user is not a member of its project",
     "CAPTURE_PREPARATION_FAILED":
         "the operator capture run could not be prepared",
+    "CAPTURE_IDEMPOTENCY_KEY_IN_USE":
+        "a run this entrypoint did not prepare already holds that idempotency identity",
+    "CAPTURE_ARGUMENT_NOT_VALID_IN_MODE":
+        "that argument belongs to a different mode of this entrypoint",
     "CAPTURE_CANCELLED":
         "the run was cancelled before the capture finished",
     "CAPTURE_LEASE_LOST":
@@ -515,6 +520,40 @@ def _prepare_refusal(args: argparse.Namespace, env: Mapping[str, str]) -> str:
     return ""
 
 
+#: Which arguments belong to which mode. One parser serves both modes, so an
+#: argument that means nothing in the mode it was given used to be accepted
+#: and silently ignored -- `--prepare --page-limit 1000` looked honoured and
+#: was not, and `--execute --conversation-id ...` looked like it scoped the
+#: capture and did not. Both now fail closed.
+#:
+#: `--project-ref`, the schema-report acknowledgement and `--report-path` are
+#: deliberately universal: identity and output are not mode-specific.
+CAPTURE_ONLY_ARGUMENTS: tuple[tuple[str, str], ...] = (
+    ("acknowledge_live_government_egress", "--acknowledge-live-government-egress"),
+    ("run_id", "--run-id"),
+    ("package_id", "--package-id"),
+    ("resource_id", "--resource-id"),
+    ("page_limit", "--page-limit"),
+    ("max_pages", "--max-pages"),
+    ("max_records", "--max-records"),
+)
+PREPARE_ONLY_ARGUMENTS: tuple[tuple[str, str], ...] = (
+    ("conversation_id", "--conversation-id"),
+    ("requested_by", "--requested-by"),
+    ("idempotency_key", "--idempotency-key"),
+)
+
+
+def _supplied(args: argparse.Namespace, arguments: Sequence[tuple[str, str]]) -> bool:
+    """Whether any of those arguments was given at all.
+
+    `None` is "absent"; an EMPTY string is supplied, because an operator who
+    wrote `--run-id ""` did type the argument and deserves to be told it does
+    not belong in this mode rather than have it ignored.
+    """
+    return any(getattr(args, name, None) is not None for name, _flag in arguments)
+
+
 def _refusal(args: argparse.Namespace, extra: Sequence[str],
              env: Mapping[str, str]) -> str:
     """The reason this capture must not proceed, or an empty string.
@@ -531,6 +570,21 @@ def _refusal(args: argparse.Namespace, extra: Sequence[str],
     # not decide which one they wanted.
     if sum(bool(mode) for mode in (args.plan, args.execute, args.prepare)) > 1:
         return "CAPTURE_MODE_CONTRADICTORY"
+    # Mode-incompatible arguments fail closed rather than being ignored. A
+    # plan describes the CAPTURE and is a constant document, so it accepts
+    # neither set: `--plan --conversation-id ...` would otherwise print the
+    # capture plan to somebody who asked about preparation.
+    if args.prepare and _supplied(args, CAPTURE_ONLY_ARGUMENTS):
+        return "CAPTURE_ARGUMENT_NOT_VALID_IN_MODE"
+    if not args.prepare and _supplied(args, PREPARE_ONLY_ARGUMENTS):
+        return "CAPTURE_ARGUMENT_NOT_VALID_IN_MODE"
+    if args.plan and _supplied(args, CAPTURE_ONLY_ARGUMENTS):
+        return "CAPTURE_ARGUMENT_NOT_VALID_IN_MODE"
+    if args.plan:
+        # A plan has no further prerequisites: it constructs nothing, reads no
+        # project, no run and no flag, and prints a constant document. The
+        # checks below are about doing something, and a plan does nothing.
+        return ""
     if args.prepare:
         return _prepare_refusal(args, env)
     if not args.execute:
@@ -894,6 +948,27 @@ def _finalize(repository: Any, lease: WorkerLease, *, document: Mapping[str, Any
 PREPARED_RUN_CONTENT = "operator catalog capture run; not executed by a model worker"
 
 
+def _preparation_fingerprint() -> str:
+    """The request fingerprint a prepared run is stored with.
+
+    A deliberate MIRROR of `backend.main._request_fingerprint`, not an import:
+    importing `backend.main` would pull FastAPI, the execution guard and the
+    whole API surface into an entrypoint whose import has to stay inert.
+    `tests/test_catalog_operator_capture.py` holds the two to the same output
+    for the same input, so the mirror cannot drift silently.
+
+    It is computed over FIXED content and metadata, so every preparation
+    produces the same value and a replay stores nothing new. It is recorded,
+    never used to decide ownership -- that decision rests on server-owned
+    launch state alone.
+    """
+    canonical = json.dumps(
+        {"content": PREPARED_RUN_CONTENT,
+         "metadata": {"milo_operation": OPERATOR_CAPTURE_OPERATION}},
+        sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dict[str, Any]]:
     """Create a capture run and take operator ownership of its launch.
 
@@ -906,20 +981,59 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     no table name, no direct insert, no migration, and `JobLauncher` is never
     imported, constructed or called.
 
-    The ORDER is the safety property:
+    Creation is ONE transactional call, and it says whether it created
+    --------------------------------------------------------------------
+
+    An earlier round of this function used `create_user_message` followed by
+    `create_queued_run(idempotency_key=K)`. That had two defects, and the
+    first was serious.
+
+    `create_queued_run` RETURNS AN EXISTING RUN when `(conversation,
+    requested_by, idempotency_key)` already identifies one, and says nothing
+    about which happened. So a key collision with an ORDINARY product run
+    handed this function a `queued`/`pending` run it had not created -- and it
+    went on to win `try_acquire_launch` for that run and rest it in the
+    operator-owned state. An ordinary run would have been silently converted
+    into an operator capture run and made permanently unlaunchable, purely
+    because a key collided. If that run also carried a browser-supplied
+    `milo_operation` marker, the result satisfied the capture predicate too.
+
+    `create_message_and_run` is the contract that fixes it, and repository
+    inspection confirms it rather than assuming it. Migration 012's function
+    (reached through the `create_message_and_run_v2` SETOF wrapper) takes the
+    per-user and per-project advisory locks, performs the idempotency lookup
+    FIRST, and on a hit returns `{'run': ..., 'created': false}` **before
+    inserting anything** -- which also removes the second defect, the orphan
+    preparation message a replay used to leave behind. Otherwise it applies
+    the same admission limits the product applies and inserts the message and
+    the run in ONE transaction, returning `created: true`.
+    `MemoryRepository.create_message_and_run` mirrors all of that exactly.
+
+    The ownership rule follows directly from that flag:
+
+    *   **`created` is true** -- this run is this call's own work. It is born
+        `queued`/`pending`, which is LAUNCHABLE, and it stays that way for
+        exactly as long as the CAS below takes.
+    *   **`created` is false** -- something else already holds this identity.
+        Launch ownership is NEVER acquired in this branch. The run is reported
+        as a replay only when it is one this entrypoint already prepared and
+        has not yet consumed (`_run_is_eligible`), and that predicate is
+        anchored on `OPERATOR_OWNED_LAUNCH_STATE` -- server-owned, unreachable
+        from any browser path -- so the marker is never load-bearing. Anything
+        else is refused and left exactly as it was found.
+
+    The ORDER of the rest is the safety property:
 
     1.  `get_conversation(id, requested_by)` -- membership, enforced by the
         repository exactly as it is for a browser request. An operator who is
         not a member of the conversation's project gets the same not-found the
         browser would, and nothing is created.
-    2.  `create_user_message` + `create_queued_run` -- the ordinary creation
-        pair, so the run is a real run with real ownership, an idempotency key
-        and the operator marker. It is born `queued`/`pending`, which is
-        LAUNCHABLE, and it stays that way for exactly as long as step 3 takes.
-    3.  `try_acquire_launch` -- THE atomic boundary. This is the same
-        single-statement CAS `backend/main.py` uses, so the operator and the
-        ordinary launch path compete at one authoritative transition and
-        exactly one can win. Losing it is a refusal, not a retry.
+    2.  `create_message_and_run` -- as above.
+    3.  `try_acquire_launch` -- THE atomic boundary, and only ever on a run
+        this call created. This is the same single-statement CAS
+        `backend/main.py` uses, so the operator and the ordinary launch path
+        compete at one authoritative transition and exactly one can win.
+        Losing it is a refusal, not a retry.
     4.  `set_launch_state(OPERATOR_OWNED_LAUNCH_STATE)` -- rest the run in a
         state the launcher can never acquire again. Safe as a plain UPDATE
         precisely because step 3 already established exclusivity; doing it
@@ -931,6 +1045,8 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     so no worker is ever launched for it, and `_run_is_eligible` refuses it,
     so it is not capturable either. It is inert, and it is not a model run.
     """
+    from backend.budget import BudgetConfig
+
     repository = _open_repository()
     conversation_id = UUID(str(args.conversation_id))
     requested_by = UUID(str(args.requested_by))
@@ -943,34 +1059,43 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         # whether a conversation this operator cannot see exists.
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_CONVERSATION_UNAVAILABLE")
 
-    metadata = {"milo_operation": OPERATOR_CAPTURE_OPERATION}
     idempotency_key = str(args.idempotency_key) if args.idempotency_key else None
+    # The product's own admission limits, read the same way the API reads
+    # them. An operator preparation is a real run and does not get to skip the
+    # concurrency ceiling the product enforces.
+    limits = BudgetConfig.from_env()
     try:
-        message = repository.create_user_message(conversation_id, PREPARED_RUN_CONTENT,
-                                                 dict(metadata))
-        run = repository.create_queued_run(
-            conversation_id, message["id"], PREPARED_RUN_CONTENT, dict(metadata),
-            requested_by=requested_by, idempotency_key=idempotency_key)
+        result = repository.create_message_and_run(
+            conversation_id, PREPARED_RUN_CONTENT,
+            {"milo_operation": OPERATOR_CAPTURE_OPERATION}, requested_by,
+            idempotency_key, _preparation_fingerprint(),
+            limits.max_concurrent_runs_per_user, limits.max_concurrent_runs_per_project)
+        run = result["run"]
+        created = bool(result["created"])
     except Exception:
         return EXIT_FAILED, _envelope("failed", "CAPTURE_PREPARATION_FAILED")
 
     run_id = UUID(str(run["id"]))
-    if _operator_owns_launch(run):
-        # A replay of an identical preparation. `create_queued_run` returns the
-        # EXISTING run for a repeated (user, conversation, idempotency key), so
-        # this is the same run that was already prepared, already owned and
-        # already at rest. Reporting it is idempotent; re-acquiring would fail,
-        # because the state it rests in is the one the CAS cannot acquire.
-        return EXIT_OK, _envelope("prepared", "", preparation=_preparation_document(
-            run_id, already_prepared=True))
+    if not created:
+        # Nothing was written by the call above -- the lookup happens before
+        # every insert -- and nothing is written here either, in either branch.
+        if _run_is_eligible(run):
+            # A genuine replay: the same run, already prepared, already owned
+            # and already at rest. Idempotent, and it re-acquires nothing.
+            return EXIT_OK, _envelope("prepared", "", preparation=_preparation_document(
+                run_id, already_prepared=True))
+        # An ordinary run -- or one already consumed, or one left mid-transition
+        # -- holds this identity. Adopting it would convert somebody else's run
+        # into an operator capture run and make it permanently unlaunchable.
+        return EXIT_REFUSED, _envelope("refused", "CAPTURE_IDEMPOTENCY_KEY_IN_USE")
 
     try:
         acquired = repository.try_acquire_launch(run_id)
     except Exception:
         return EXIT_FAILED, _envelope("failed", "CAPTURE_PREPARATION_FAILED")
     if acquired is None:
-        # The ordinary launch path won, or this run was never acquirable. Do
-        # not touch its launch state: it belongs to whoever holds it.
+        # The ordinary launch path won. Do not touch its launch state: it
+        # belongs to whoever holds it.
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_LAUNCH_OWNERSHIP_LOST")
 
     try:
@@ -981,6 +1106,7 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
 
     return EXIT_OK, _envelope("prepared", "", preparation=_preparation_document(
         run_id, already_prepared=False))
+
 
 
 def _preparation_document(run_id: UUID, *, already_prepared: bool) -> dict[str, Any]:
@@ -1098,7 +1224,7 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     args, extra = build_parser().parse_known_args(list(argv or []))
 
     reason = _refusal(args, extra, environment)
-    if args.plan and not args.execute and not args.prepare and not extra:
+    if args.plan and not reason:
         # A plan states what an execution would construct and performs none of
         # it. It is reported as a plan whether or not the other prerequisites
         # are satisfied, and it never reads the project, the run or the flags
@@ -1123,6 +1249,7 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
 
 
 __all__ = ["CAPTURE_ENTRYPOINT", "CAPTURE_MAX_PAGES", "CAPTURE_MAX_RECORDS",
+           "CAPTURE_ONLY_ARGUMENTS", "PREPARE_ONLY_ARGUMENTS",
            "CAPTURE_PAGE_LIMIT", "CAPTURE_REASONS", "EGRESS_ACKNOWLEDGEMENT",
            "ELIGIBLE_RUN_STATUS", "EXIT_FAILED", "EXIT_OK", "EXIT_REFUSED",
            "LAUNCH_ACQUIRABLE_STATES", "OPERATOR_CAPTURE_OPERATION",
