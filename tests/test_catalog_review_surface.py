@@ -1394,3 +1394,159 @@ def test_the_redactor_is_total_over_unusable_input():
 
     assert redact_secret_text("") == ""
     assert redact_secret_text("ordinary text") == "ordinary text"
+
+
+# =============================================================================
+# 13. the numeric parser is TOTAL over caller-controlled text
+# =============================================================================
+#
+# `_whole_parameter` reached `int()` with whatever the caller sent. Two inputs
+# escaped the static refusal path and became an uncaught `ValueError` -- which
+# `install_error_handlers` does not handle, so the request answered 500:
+#
+#   * a syntactically numeric string longer than CPython's integer-conversion
+#     limit (4300 digits) -- `ValueError: Exceeds the limit ...`;
+#   * a repeated leading minus (`--5`), because `lstrip("-")` strips EVERY
+#     leading minus, so the digit check passed and `int()` could not parse what
+#     was left.
+#
+# Malformed input must never become an internal error just because it is
+# unusual. A caller-facing parser is either total or it is a liability, and the
+# fix is in the parser itself -- not a broad `except` around the handler, and
+# not a reliance on a proxy, a browser or the ASGI server to have refused the
+# request first.
+
+#: Comfortably past CPython's 4300-digit conversion limit.
+OVERSIZED_DIGITS = "9" * 5000
+
+#: Every numeric query parameter, with the classification its own field owns.
+NUMERIC_PARAMETERS = (
+    pytest.param("limit", "CATALOG_REVIEW_PAGE_INVALID", id="limit"),
+    pytest.param("offset", "CATALOG_REVIEW_PAGE_INVALID", id="offset"),
+    pytest.param("model_year", "CATALOG_REVIEW_FILTER_INVALID", id="model_year"),
+)
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+@pytest.mark.parametrize("param, code", NUMERIC_PARAMETERS)
+@pytest.mark.parametrize("value", [
+    pytest.param(OVERSIZED_DIGITS, id="oversized_digits"),
+    pytest.param("-" + OVERSIZED_DIGITS, id="oversized_negative"),
+    pytest.param("--5", id="repeated_minus"),
+    pytest.param("---7", id="many_minuses"),
+])
+def test_an_unparseable_numeric_parameter_is_refused_not_a_server_error(
+        surface, path, param, code, value):
+    """400 with the field's own classification -- never 500, never a traceback."""
+    client, recording, _repository, user, project = surface
+    recording.calls.clear()
+    response = client.get(path.format(project_id=project), params={param: value},
+                          headers=member(user))
+    assert response.status_code == 400, response.status_code
+    assert response.json()["error"]["code"] == code
+    # Membership ran; no catalog method did; nothing was written.
+    assert recording.calls == ["get_project"]
+    assert recording.writes == []
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+@pytest.mark.parametrize("param, code", NUMERIC_PARAMETERS)
+def test_an_oversized_numeric_parameter_is_never_echoed(surface, path, param, code):
+    """The refusal carries none of a 5 000-character value back to the caller."""
+    client, _recording, _repository, user, project = surface
+    response = client.get(path.format(project_id=project),
+                          params={param: OVERSIZED_DIGITS}, headers=member(user))
+    assert response.status_code == 400
+    body = response.text
+    assert OVERSIZED_DIGITS not in body
+    # Not even a fragment of it: a truncated echo is still an echo.
+    assert "9" * 32 not in body
+    assert len(body) < 400
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+def test_a_non_member_sending_an_oversized_numeric_parameter_still_learns_nothing(surface, path):
+    """Authorization still answers FIRST, whatever the value looks like."""
+    client, recording, _repository, _user, project = surface
+    stranger = str(uuid4())
+    plain = client.get(path.format(project_id=project), headers=member(stranger))
+    oversized = client.get(path.format(project_id=project),
+                           params={"limit": OVERSIZED_DIGITS}, headers=member(stranger))
+    assert plain.status_code == oversized.status_code == 404
+    assert plain.json() == oversized.json()
+    assert recording.writes == []
+
+
+@pytest.mark.parametrize("path", CODE3_PATHS)
+@pytest.mark.parametrize("param, code", NUMERIC_PARAMETERS)
+def test_a_large_but_convertible_number_reaches_the_RANGE_refusal(surface, path, param, code):
+    """`999999999` is parseable, so it must fail on its RANGE, not its length.
+
+    This is what keeps the length bound honest. A bound tight enough to reject
+    an ordinary out-of-range number would answer "that is not a whole number"
+    about something that plainly is, and the operator would be told the wrong
+    thing about their own request.
+    """
+    client, _recording, _repository, user, project = surface
+    response = client.get(path.format(project_id=project), params={param: "999999999"},
+                          headers=member(user))
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == code
+    message = response.json()["error"]["message"]
+    assert "between" in message, message
+    assert "whole number" not in message, message
+
+
+def test_the_numeric_bound_is_far_above_every_accepted_domain():
+    """The bound is server-owned, explicit, and comfortably clear of real values.
+
+    Every accepted domain is tiny -- 3 digits for the page size, 7 for the
+    offset, 4 for a model year -- so there is never a reason to hand `int()` a
+    long string. The bound also has to sit well below CPython's conversion
+    limit, or it would not be the thing doing the refusing.
+    """
+    import sys
+
+    assert catalog_review.MAX_REVIEW_NUMERIC_CHARS >= len(str(catalog_review.MAX_REVIEW_OFFSET))
+    assert catalog_review.MAX_REVIEW_NUMERIC_CHARS >= len("999999999")
+    assert catalog_review.MAX_REVIEW_NUMERIC_CHARS < sys.int_info.str_digits_check_threshold
+    assert catalog_review.MAX_REVIEW_NUMERIC_CHARS < 4300
+
+
+@pytest.mark.parametrize("raw", [
+    pytest.param("9" * 5000, id="oversized"),
+    pytest.param("--5", id="repeated_minus"),
+    pytest.param("-" * 100 + "5", id="many_minuses"),
+    pytest.param("", id="empty"),
+    pytest.param("-", id="bare_minus"),
+    pytest.param(" 10 ", id="padded"),
+    pytest.param("+10", id="plus_sign"),
+    pytest.param("10_0", id="underscore"),
+    pytest.param("١٢٣", id="non_ascii_digits"),
+    pytest.param("1e3", id="exponent"),
+    pytest.param("0x10", id="hex"),
+    pytest.param("10.5", id="fraction"),
+    pytest.param("​10", id="zero_width"),
+    pytest.param("10\n", id="trailing_newline"),
+])
+def test_the_parser_itself_is_total(raw):
+    """Directly, at the unit: every one of these is a refusal, never a raise.
+
+    Driving the parser rather than the route, because totality is a property of
+    the function. A handler-level `try` would hide exactly the cases this is
+    checking, which is why the correction is here and not around the caller.
+    """
+    with pytest.raises(catalog_review.CatalogReviewError):
+        catalog_review._whole_parameter(raw, "page size", "CATALOG_REVIEW_PAGE_INVALID")
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("0", 0), ("1", 1), ("25", 25), ("100", 100), ("-1", -1),
+    ("1000000", 1_000_000), ("2200", 2200), ("999999999", 999999999),
+])
+def test_the_parser_still_reads_every_value_it_should(raw, expected):
+    """The refusals above cost nothing legitimate."""
+    assert catalog_review._whole_parameter(
+        raw, "page size", "CATALOG_REVIEW_PAGE_INVALID") == expected
+    assert catalog_review._whole_parameter(
+        None, "page size", "CATALOG_REVIEW_PAGE_INVALID") is None

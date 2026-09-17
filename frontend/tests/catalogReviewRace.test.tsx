@@ -374,9 +374,10 @@ describe('the existing cross-boundary ownership still holds', () => {
   });
 
   it('a project switch while the panel is closed still invalidates the answer', async () => {
-    // The one case the request identity alone cannot catch: no superseding
-    // request is issued, so the old token is still the current one — and the
-    // project scope check is what drops the answer.
+    // Both rules cover this now: closing the panel and selecting another
+    // project each drop the token, and `ownsProject` would catch it even if
+    // neither did. The assertion is on the OUTCOME, so it holds whichever rule
+    // fires first.
     await openCatalog();
     fireEvent.click(within(panel()).getByRole('button', { name: 'Hide' }));
     fireEvent.click(screen.getByText(OTHER_PROJECT.name));
@@ -386,5 +387,154 @@ describe('the existing cross-boundary ownership still holds', () => {
     await waitFor(() => expect(canonicalCalls).toHaveLength(2));
     expect(canonicalCalls[1].projectId).toBe(OTHER_PROJECT.id);
     expect(screen.queryByText('MODEL-AT-OFFSET-0')).toBeNull();
+  });
+});
+
+describe('a new intent invalidates the old answer BEFORE the effect runs', () => {
+  /**
+   * The window the monotonic token alone does not close.
+   *
+   * The token protects "an old request settling after its replacement exists".
+   * It says nothing about "an old request settling after the user expressed a
+   * new intent but before React's effect created that replacement" — and that
+   * window is real, because `setCatalogOffset` only schedules a render while a
+   * settled promise runs on the microtask queue.
+   *
+   * Reaching it deterministically takes care. `fireEvent` is wrapped in `act`,
+   * which flushes passive effects synchronously, so a click followed by a
+   * settle steps straight over the gap — the replacement already exists. Doing
+   * both inside ONE outer `act` scope is what holds the gap open: the click
+   * records the intent, the effect flush is deferred to the scope's exit, and
+   * the microtask in between is exactly where the old answer lands. Each test
+   * asserts the call count inside the scope so the window is proved open
+   * rather than assumed.
+   */
+
+  it('pagination: the old page cannot land in the gap between the click and the effect', async () => {
+    await openCatalog();
+    await settle(() => canonicalCalls[0].deferred.resolve(canonicalPage(0)));
+    expect(await screen.findByText('MODEL-AT-OFFSET-0')).toBeInTheDocument();
+
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Next page' }));
+    await waitFor(() => expect(canonicalCalls).toHaveLength(2));
+    expect(canonicalCalls[1].offset).toBe(25);
+
+    await act(async () => {
+      // New intent: back to offset 0.
+      fireEvent.click(within(panel()).getByRole('button', { name: 'Previous page' }));
+      // The window is open — the replacement has NOT been created yet.
+      expect(canonicalCalls).toHaveLength(2);
+      // ...and the offset-25 answer arrives right here, inside it.
+      canonicalCalls[1].deferred.resolve(canonicalPage(25));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // It belongs to a page the user has already navigated away from, so it may
+    // not become visible state. Without invalidation at the intent it would:
+    // `catalogRequest.current` is still its own token and `ownsProject` passes.
+    expect(screen.queryByText('MODEL-AT-OFFSET-25')).toBeNull();
+    expect(screen.getByText('MODEL-AT-OFFSET-0')).toBeInTheDocument();
+
+    // Only the replacement's answer may.
+    await waitFor(() => expect(canonicalCalls).toHaveLength(3));
+    expect(canonicalCalls[2].offset).toBe(0);
+    await settle(() => canonicalCalls[2].deferred.resolve(canonicalPage(0)));
+    expect(screen.getByText('MODEL-AT-OFFSET-0')).toBeInTheDocument();
+    expect(within(panel()).getByText(`Showing from row 1 of ${TOTAL}.`)).toBeInTheDocument();
+  });
+
+  it('pagination: an old FAILURE cannot land in the gap either', async () => {
+    const { ApiError } = await import('../lib/api');
+    await openCatalog();
+    await settle(() => canonicalCalls[0].deferred.resolve(canonicalPage(0)));
+    await screen.findByText('MODEL-AT-OFFSET-0');
+
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Next page' }));
+    await waitFor(() => expect(canonicalCalls).toHaveLength(2));
+
+    await act(async () => {
+      fireEvent.click(within(panel()).getByRole('button', { name: 'Previous page' }));
+      expect(canonicalCalls).toHaveLength(2);
+      canonicalCalls[1].deferred.reject(new ApiError(502, 'CATALOG_REVIEW_UNAVAILABLE', 'x'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // An error note here would replace a page the user is still reading with a
+    // failure belonging to a page they already left.
+    //
+    // Stated honestly: this one is a GUARD rather than a discriminating proof.
+    // The replacement's own `setCatalogError('')` runs when the effect flushes,
+    // so a failure written in the gap is masked in every reachable
+    // interleaving. It is kept because the invariant is real and a future
+    // change that stopped clearing the error on a new read would make it
+    // discriminating; the page assertion above is the one that fails without
+    // intent invalidation.
+    expect(screen.queryByText('Not loaded')).toBeNull();
+    expect(screen.getByText('MODEL-AT-OFFSET-0')).toBeInTheDocument();
+  });
+
+  it('closing the panel ends the intent, and its `.finally` cannot clear the next one', async () => {
+    await openCatalog();
+    expect(within(panel()).getByText('Loading')).toBeInTheDocument();
+
+    await act(async () => {
+      // New intent: closed. No replacement request is issued for it, which is
+      // what makes BOTH halves of the old settle observable here — the page it
+      // would have written, and the busy state its `.finally` would have
+      // cleared. In the pagination gap above only the page is observable,
+      // because the replacement immediately re-sets loading.
+      fireEvent.click(within(panel()).getByRole('button', { name: 'Hide' }));
+      expect(canonicalCalls).toHaveLength(1);
+      canonicalCalls[0].deferred.resolve(canonicalPage(0));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Reopening re-reads. Nothing from the closed visit is waiting to appear,
+    // and the surface is busy for the NEW read rather than resting on a
+    // loading state the old request cleared.
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Show' }));
+    expect(screen.queryByText('MODEL-AT-OFFSET-0')).toBeNull();
+    expect(within(panel()).getByText('Loading')).toBeInTheDocument();
+    expect(panel().querySelector('[role="tabpanel"]')).toHaveAttribute('aria-busy', 'true');
+
+    await waitFor(() => expect(canonicalCalls).toHaveLength(2));
+    await settle(() => canonicalCalls[1].deferred.resolve(canonicalPage(0)));
+    expect(await screen.findByText('MODEL-AT-OFFSET-0')).toBeInTheDocument();
+  });
+
+  it('reopening shows no stale page from the previous visit', async () => {
+    await openCatalog();
+    await settle(() => canonicalCalls[0].deferred.resolve(canonicalPage(0)));
+    expect(await screen.findByText('MODEL-AT-OFFSET-0')).toBeInTheDocument();
+
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Hide' }));
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Show' }));
+
+    // The panel's own contract says opening re-reads. A page retained from the
+    // last visit would make that claim false while looking like current state —
+    // and it became retainable when the surface started keeping a page visible
+    // during a refresh, so the claim and the behaviour are reconciled here.
+    expect(screen.queryByText('MODEL-AT-OFFSET-0')).toBeNull();
+    expect(within(panel()).getByText('Loading')).toBeInTheDocument();
+  });
+
+  it('reopening returns to the same page rather than silently jumping to the first', async () => {
+    await openCatalog();
+    await settle(() => canonicalCalls[0].deferred.resolve(canonicalPage(0)));
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Next page' }));
+    await waitFor(() => expect(canonicalCalls).toHaveLength(2));
+    await settle(() => canonicalCalls[1].deferred.resolve(canonicalPage(25)));
+    expect(await screen.findByText('MODEL-AT-OFFSET-25')).toBeInTheDocument();
+
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Hide' }));
+    fireEvent.click(within(panel()).getByRole('button', { name: 'Show' }));
+
+    // Closing drops the rendered rows but keeps WHERE the operator was; the
+    // re-read is for that same page, freshly.
+    await waitFor(() => expect(canonicalCalls).toHaveLength(3));
+    expect(canonicalCalls[2].offset).toBe(25);
   });
 });

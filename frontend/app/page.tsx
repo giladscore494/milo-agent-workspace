@@ -317,6 +317,9 @@ export default function WorkspacePage() {
       // Durable catalog rows the previous identity was authorized to see. They
       // are membership-authorized server-side, so a new or absent identity must
       // not inherit a rendered page from the old one.
+      // Same rule as `endCatalogIntent`, written inline: this handler is
+      // declared above that callback, so calling it here would read a
+      // `const` before its initializer.
       catalogRequest.current = undefined;
       setCatalogOpen(false);
       setCatalogView('canonical');
@@ -349,16 +352,69 @@ export default function WorkspacePage() {
    *     could overwrite a newer one, an older `.finally()` could clear a
    *     loading state its replacement had just set, and an older failure could
    *     replace a newer success with an error;
-   *  2. the workspace scope it was issued under still owns the surface. This
-   *     is the existing cross-boundary rule and it is still needed on its own:
-   *     a project switch while the panel is CLOSED issues no superseding
-   *     request, so the token would still match while the answer belongs to a
-   *     project nobody is looking at.
+   *  2. the workspace scope it was issued under still owns the surface. Every
+   *     intent boundary now drops the token too (see `endCatalogIntent`), so
+   *     this is DEFENSE IN DEPTH rather than the sole catcher of any currently
+   *     reachable case — stated plainly because an earlier version of this
+   *     comment claimed otherwise. It is kept because it is a second,
+   *     independent rule: a future path that changed the selected project
+   *     without going through `selectProject` would still be caught here.
    */
   const ownsCatalogRequest = useCallback((issued: CatalogRequest) => (
     catalogRequest.current?.pending.id === issued.pending.id
     && ownsProject(issued.pending.owner, scope.current)
   ), []);
+
+  /**
+   * End the current catalog intent, synchronously.
+   *
+   * The correctness boundary begins at the USER'S INTENT, not at the effect
+   * that follows it. `setCatalogOffset` only schedules a render, so between the
+   * click and the effect that issues the replacement there is a window in which
+   * `catalogRequest.current` still holds the OLD token — and an answer settling
+   * in that window passes `ownsCatalogRequest` and writes a page, an error or a
+   * loading clear that belongs to a page the user has already left.
+   *
+   * So every handler that changes what the surface is asking for calls this
+   * FIRST. Dropping the token makes the old request a no-op immediately, with
+   * no replacement needed: `undefined?.pending.id` matches nothing.
+   *
+   * This does not issue a request. The effect below remains the only thing that
+   * creates one, so there is exactly one request owner.
+   */
+  const endCatalogIntent = useCallback(() => {
+    catalogRequest.current = undefined;
+  }, []);
+
+  /** A new page is a new intent: the previous page's answer no longer applies. */
+  const changeCatalogOffset = useCallback((next: number) => {
+    endCatalogIntent();
+    setCatalogOffset(next);
+  }, [endCatalogIntent]);
+
+  /**
+   * Opening or closing the panel is a new intent too.
+   *
+   * CLOSING drops the rendered pages as well as the token. That is deliberate,
+   * and it is what makes the panel's own contract true: it documents that
+   * opening re-reads, and a page retained from the previous visit would render
+   * instantly on reopen and look like current state. Keeping it would only be
+   * honest as stale-while-revalidate, visibly marked — a larger behaviour than
+   * this surface needs.
+   *
+   * `view` and `offset` are KEPT, so reopening re-reads the same page the
+   * operator was on rather than silently jumping back to the first.
+   */
+  const changeCatalogOpen = useCallback((open: boolean) => {
+    endCatalogIntent();
+    if (!open) {
+      setCatalogError('');
+      setCatalogLoading(false);
+      setCanonicalPage(undefined);
+      setReviewPage(undefined);
+    }
+    setCatalogOpen(open);
+  }, [endCatalogIntent]);
 
   /**
    * Read one bounded catalog page for the selected project.
@@ -425,23 +481,23 @@ export default function WorkspacePage() {
    * reading of a view switch is that the previous view's read no longer matters.
    */
   const changeCatalogView = useCallback((next: CatalogReviewView) => {
-    catalogRequest.current = undefined;
+    endCatalogIntent();
     setCatalogView(next);
     setCatalogOffset(0);
     setCatalogError('');
     setCanonicalPage(undefined);
     setReviewPage(undefined);
-  }, []);
+  }, [endCatalogIntent]);
 
   /** Every piece of rendered catalog state, and the request that would fill it. */
   const clearCatalogState = useCallback(() => {
-    catalogRequest.current = undefined;
+    endCatalogIntent();
     setCatalogOffset(0);
     setCatalogError('');
     setCatalogLoading(false);
     setCanonicalPage(undefined);
     setReviewPage(undefined);
-  }, []);
+  }, [endCatalogIntent]);
 
   const loadConversations = useCallback((project: Project, owner: WorkspaceScope) => {
     setConversations(undefined);
@@ -776,7 +832,7 @@ export default function WorkspacePage() {
         <CatalogReviewPanel
           visible={selectedProject !== undefined}
           open={catalogOpen}
-          onOpenChange={setCatalogOpen}
+          onOpenChange={changeCatalogOpen}
           view={catalogView}
           onViewChange={changeCatalogView}
           loading={catalogLoading}
@@ -784,7 +840,7 @@ export default function WorkspacePage() {
           canonical={canonicalPage}
           review={reviewPage}
           offset={catalogOffset}
-          onOffsetChange={setCatalogOffset}
+          onOffsetChange={changeCatalogOffset}
           onRetry={() => {
             if (selectedProject) {
               loadCatalog(selectedProject, catalogView, catalogOffset, scope.current);

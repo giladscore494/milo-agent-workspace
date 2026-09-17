@@ -91,6 +91,37 @@ query string inside the handler is what keeps the four steps in order:
 3. validate the query contract (names, duplicates, then values);
 4. read the catalog.
 
+**A numeric value is bounded before it is converted, and the parser is total.**
+`limit`, `offset` and `model_year` are matched against one anchored pattern —
+an optional single leading minus and at least one ASCII digit — and the raw
+text is length-checked against `MAX_REVIEW_NUMERIC_CHARS` (16) *first*, so the
+conversion is only ever reached on text already proven convertible.
+
+The earlier parser assembled its rule out of `str` predicates
+(`raw.isascii() and raw.lstrip("-").isdigit()`), and those do not agree with
+`int()` in either direction. Two inputs escaped it as an unhandled
+`ValueError`, which is a `500`, not a refusal:
+
+| Input | Why it escaped |
+| --- | --- |
+| `?limit=--5` | `lstrip("-")` strips *every* leading minus, so `'5'.isdigit()` passed and `int('--5')` then raised |
+| `?limit=` + 5 000 digits | every predicate passed; `int()` refuses an integer literal past `sys.int_info.str_digits_check_threshold` (4 300 digits) |
+
+Both now return `400 CATALOG_REVIEW_PAGE_INVALID` (`model_year` keeps its own
+`CATALOG_REVIEW_FILTER_INVALID`) with a static message that echoes no input.
+A `500` here would also have been a disclosure: the two refusals a non-member
+and a member receive must not differ, and an unhandled exception is a third
+response shape that only the malformed request produces.
+
+16 characters is chosen to sit far above every domain this surface accepts — a
+page size is at most 3 digits, an offset 7, a model year 4 — so a plainly
+out-of-range value such as `?offset=999999999` still reaches its honest
+**range** refusal rather than being reported as malformed text; and far below
+any parser threshold.
+`test_the_numeric_bound_is_far_above_every_accepted_domain` pins both sides,
+and `test_the_parser_itself_is_total` drives the parser directly over the
+hostile inputs above.
+
 There is **no** parameter for a table, a column, an ordering, a page bound, a
 status, a resource, a snapshot or an acknowledgement. Those are all server data
 in `backend/catalog/review.py` and in the repository method it calls.
@@ -321,6 +352,35 @@ A superseded request is a **complete no-op** on every path: it writes no page,
 sets no error, and does not clear the loading state its replacement set.
 `frontend/tests/catalogReviewRace.test.tsx` drives each interleaving with
 deferred promises, so the ordering is written down rather than timed.
+
+**An intent invalidates the request in flight synchronously, in the same event
+as the click.** Recording the new token is the effect's job, and an effect runs
+*after* the render the state change causes — so between "the operator turned the
+page" and "the replacement request exists" there is a window in which the token
+of the request now being replaced is still the newest. An answer settling in
+that window would pass the identity check and paint a page the operator had
+already navigated away from.
+
+So every catalog intent — turning a page (`changeCatalogOffset`), switching
+views (`changeCatalogView`), opening or closing the panel (`changeCatalogOpen`),
+and clearing the surface (`clearCatalogState`) — calls `endCatalogIntent` first,
+which drops the current token in the same synchronous turn as the click. The
+window is then owned by nobody: the old answer no longer matches and the new one
+does not exist yet, so both are no-ops. `ownsProject` remains as defence in
+depth rather than the check that catches this.
+
+Holding that window open is itself the hard part of testing it: React Testing
+Library's `fireEvent` is wrapped in `act()`, which flushes passive effects
+synchronously, so the replacement token exists again before the next assertion
+can run. The five tests in *"a new intent invalidates the old answer BEFORE the
+effect runs"* put the click and the resolution inside **one outer
+`await act(async () => { … })`** scope, which defers the flush, and assert
+`canonicalCalls` has not grown inside that scope — so each test proves the window
+it claims to test was genuinely open. One of the five is labelled in the file as
+a **guard rather than a discriminating proof**: an old *failure* settling in the
+window is masked in every reachable interleaving by the replacement's own
+`setCatalogError('')`, so that test would pass without the fix and is kept to
+pin the behaviour, not to demonstrate it.
 
 There is deliberately no `AbortController` as a correctness boundary.
 Cancellation races too, and a request already past the wire still settles;

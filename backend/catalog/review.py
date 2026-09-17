@@ -59,6 +59,7 @@ credentials, internal row ids, or any jsonb this module has not itself walked.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -102,6 +103,20 @@ MAX_REVIEW_FILTER_CHARS = 120
 #: no register states.
 MIN_REVIEW_MODEL_YEAR = 1900
 MAX_REVIEW_MODEL_YEAR = 2200
+
+#: The longest a numeric query parameter's RAW TEXT may be, checked before any
+#: attempt to convert it. Conversion itself has limits -- CPython refuses an
+#: integer literal past `sys.int_info.str_digits_check_threshold` (4300) digits
+#: -- and a limit that announces itself by raising out of the parser is a 500,
+#: not a refusal. So the text is bounded first and the conversion is only ever
+#: reached on something that cannot fail.
+#:
+#: 16 is far above every domain this surface accepts (a page size is at most 3
+#: digits, an offset 7, a model year 4), so an out-of-range value like
+#: `999999999` still reaches its honest RANGE refusal and is not mistaken for
+#: malformed text; and far below any parser threshold.
+#: `test_the_numeric_bound_is_far_above_every_accepted_domain` pins both sides.
+MAX_REVIEW_NUMERIC_CHARS = 16
 
 #: The ONE candidate status this surface reads. Not a default and not a
 #: caller-supplied filter: CODE-3 reviews what is waiting for review, and a
@@ -303,17 +318,34 @@ def supported_query(params: Any, allowed: tuple[str, ...]) -> dict[str, str]:
     return seen
 
 
+#: The ONLY shape this surface converts to an integer: an optional single
+#: leading minus and at least one ASCII digit, anchored end to end.
+#:
+#: Explicit rather than assembled from `str` predicates. `int()` accepts
+#: `' 10 '`, `'+10'`, `'10_0'` and Unicode digits, and `isdigit()` disagrees
+#: with it in both directions -- it accepts `'\u0663'` and superscripts that
+#: `int()` does not, while `'--5'` passes an `lstrip("-")` test and then fails
+#: `int()`. A bound that depends on where two parsers happen to agree is not a
+#: bound anybody reviewed. `[0-9]` is ASCII by construction, so no separate
+#: `isascii()` check has to hold the line.
+_WHOLE_NUMBER = re.compile(r"-?[0-9]+")
+
+
 def _whole_parameter(raw: str | None, label: str, code: str) -> int | None:
     """One query parameter as a whole number, or a refusal.
 
-    Strict decimal text only. `int()` would accept `' 10 '`, `'+10'`, `'10_0'`
-    and a Unicode digit, and a page bound that depends on Python's parsing
-    quirks is not a bound anybody reviewed. Absent stays absent so the caller
-    below can apply its own default.
+    Total on every string: length first, then shape, and `int()` only on text
+    that has already been proven convertible. Nothing a caller can send reaches
+    this function and leaves by raising something other than a refusal. Absent
+    stays absent so the caller below can apply its own default.
+
+    The length bound is checked BEFORE the match, so a five-thousand-digit
+    string is never matched against at all -- neither the regex nor `int()`
+    ever sees it.
     """
     if raw is None:
         return None
-    if not raw.isascii() or not raw.lstrip("-").isdigit() or raw in ("-", ""):
+    if len(raw) > MAX_REVIEW_NUMERIC_CHARS or not _WHOLE_NUMBER.fullmatch(raw):
         raise CatalogReviewError(code, f"{label} must be a whole number")
     return int(raw)
 
@@ -693,7 +725,8 @@ def _stated_total(rows: Any) -> int | None:
 __all__ = ["CANONICAL_ITEM_FIELDS", "CANONICAL_QUERY_PARAMETERS", "CatalogPage",
            "CatalogReviewError",
            "DEFAULT_REVIEW_PAGE_ITEMS", "MAX_REVIEW_FILTER_CHARS",
-           "MAX_REVIEW_MODEL_YEAR", "MAX_REVIEW_OFFSET", "MAX_REVIEW_PAGE_ITEMS",
+           "MAX_REVIEW_MODEL_YEAR", "MAX_REVIEW_NUMERIC_CHARS",
+           "MAX_REVIEW_OFFSET", "MAX_REVIEW_PAGE_ITEMS",
            "MIN_REVIEW_MODEL_YEAR", "READ_ONLY_REPOSITORY_METHODS",
            "REVIEW_CANDIDATE_ITEM_FIELDS", "REVIEW_CANDIDATE_STATUS",
            "REVIEW_QUERY_PARAMETERS",
