@@ -57,10 +57,13 @@ not merely hidden. Runs already in flight finish under the configuration they
 started with.
 
 **It also closes the capture entrypoint.** The same flag gates CODE-1's
-operator capture entrypoint (`backend/catalog/operator_capture.py`): with it
-off, unset, empty or malformed, an invocation refuses before constructing a
-transport or a repository, so no request reaches `data.gov.il`, no run is
-claimed, and nothing is captured, ingested or activated. There is no separate
+operator capture entrypoint (`backend/catalog/operator_capture.py`) in **both**
+its modes: with it off, unset, empty or malformed, neither `--prepare` nor
+`--execute` will construct a transport or a repository, so no capture run is
+prepared, no request reaches `data.gov.il`, no run is claimed, and nothing is
+captured, ingested or activated. A run prepared before the flag was turned off
+is left exactly as it is: inert, un-launchable by any worker, and capturable
+only once the flag is deliberately turned back on. There is no separate
 catalog switch to set. A capture already in flight is not killed by this — it
 holds a lease and finishes or fails on its own terms; stopping one in progress
 is a run cancellation, after which activation cannot occur.

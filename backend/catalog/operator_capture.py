@@ -16,6 +16,17 @@ or relax the capture, the pagination arithmetic, normalization, the snapshot
 identity, activation, the diff, provenance or the lease contract -- every one
 of those stays exactly where it already lives and is exercised unmodified.
 
+Two modes, and neither is the default
+-------------------------------------
+
+``--prepare`` makes an operator capture run and takes ownership of its launch.
+It opens no socket, sends no request and captures nothing.
+
+``--execute`` performs the capture, and must be given a prepared run's identity
+explicitly. Preparing a run never starts a capture, and capturing never
+prepares one: they are separate invocations, separately gated, so neither can
+be a side effect of the other.
+
 Refusal is the default, and it is structural
 --------------------------------------------
 
@@ -26,7 +37,12 @@ That is not a policy the code checks late: the repository and the transport are
 CONSTRUCTED by `_open_repository()` and `_open_transport()`, and both are
 called only after every prerequisite in `_refusal()` has passed.
 
-The nine prerequisites, all required together, in this order:
+``--prepare`` is gated too: it requires the OPERATOR-0 acknowledgement, the
+project identity, the catalog flag and paid execution off -- everything below
+except the live-egress acknowledgement, which it does not ask for because it
+performs no egress, and the resource/bounds arguments, which it has no use for.
+
+The nine prerequisites of a CAPTURE, all required together, in this order:
 
 1.  ``--execute``. Absent -- including under ``--plan`` -- is a refusal.
 2.  ``--acknowledge-live-government-egress`` matching `EGRESS_ACKNOWLEDGEMENT`
@@ -43,7 +59,8 @@ The nine prerequisites, all required together, in this order:
     the operator did not name is refused before anything is opened, and
     neither value is ever printed.
 5.  ``--run-id``, because every durable catalog write in this repository is
-    lease-guarded and a lease belongs to a run. See "the lease boundary".
+    lease-guarded and a lease belongs to a run. The run is one ``--prepare``
+    made and owns; see "the lease boundary, the launch boundary".
 6.  `MILO_ENABLE_CATALOG_EXECUTION` explicitly enabled, through CODE-2's
     `catalog_execution_enabled()` -- the same flag, the same true-value
     parser, no second overlapping switch.
@@ -75,8 +92,8 @@ activation-after-complete-persistence are all untouched. A live page that
 exceeds `MAX_RESPONSE_BYTES` fails closed, and this module does not raise that
 limit to make a future capture succeed.
 
-The lease boundary, and the call-graph blocker
------------------------------------------------
+The lease boundary, the launch boundary, and why they are different
+-------------------------------------------------------------------
 
 Catalog writes are lease-guarded, so this controller needs an AUTHENTIC lease:
 it calls the existing `claim_run` (the single-statement CAS in migration 012),
@@ -84,27 +101,48 @@ builds `WorkerLease` from what the database returned, and heartbeats through
 the existing guarded RPC. It invents no lease, holds no direct insert, and
 never passes or prints lease material.
 
-That leaves one real problem, and it is worth stating exactly rather than
-working around. **There is no way in this repository to create a run that is
-not an ordinary model run.** Every creation route reaches
+But the lease is the WRONG boundary for the question "may an ordinary model
+worker execute this run". `claim_run_lease` predicates its CAS on status,
+worker and lease expiry only -- not on `launch_state`, not on run metadata --
+so it hands a lease to whoever asks first, launcher or operator alike. The
+launch boundary is a DIFFERENT CAS, `try_acquire_launch`, and that is the one
+that decides who owns a run.
+
+**There is no way in this repository to create a run that is not an ordinary
+model run.** Every creation route reaches
 `backend.main._create_and_launch_run`, which creates the run and immediately
 hands it to `JobLauncher.launch()`; the launched worker resolves an engine from
-`project.workflow_key` and runs a model. A controller that claimed any run the
-operator named would therefore race that worker for the same lease and finalize
-somebody's chat run with a catalog output.
+`project.workflow_key` and runs a model. So an operator needs a supported way
+to make a run no launcher will ever take -- and `--prepare` is it (see
+`_prepare`), through existing repository methods, with no migration, no new
+repository method and no direct table write.
 
-The seam that closes it needs no migration and no new repository method,
-because the run row already carries a server-owned discriminator. Both creation
-paths insert `launch_state = 'pending'`, and `try_acquire_launch` moves it to
-`'launching'` before the HTTP response returns. So a run that is simultaneously
-`status = 'queued'`, `launch_state = 'pending'` and carries
-`input.metadata.milo_operation = OPERATOR_CAPTURE_OPERATION` is one an operator
-prepared deliberately and no launcher has ever touched. All three are checked
-in `_run_is_eligible`, server-side, BEFORE the claim -- so a mistyped run id
-refuses rather than hijacking a run. The marker alone would not be enough (a
-browser request's metadata reaches `input.metadata`); the launch state alone
-would not be enough (there is a sub-request window where it is still pending);
-together they are.
+`--prepare` creates the run the ordinary way and then wins
+`try_acquire_launch` -- the SAME single-statement CAS the ordinary path uses.
+That is the one authoritative transition, and exactly one side can win it:
+
+*   **The operator wins.** The run is rested in `OPERATOR_OWNED_LAUNCH_STATE`,
+    which `try_acquire_launch` cannot acquire from, so
+    `_create_and_launch_run` can never call `JobLauncher.launch()` for it.
+*   **The launcher wins.** `try_acquire_launch` returns `None` to the
+    operator, preparation refuses with `CAPTURE_LAUNCH_OWNERSHIP_LOST`, and
+    the run is left entirely alone -- no claim, no transport, no request, no
+    write.
+
+An earlier round of this module checked `status`, `launch_state` and the
+marker with a read and then called `claim_run`. That is a read-then-act
+window: the launcher could take the run between the two, and `claim_run` would
+not notice. The window is closed twice over. Eligibility now requires a launch
+state the ordinary path can neither produce nor acquire, and it is re-verified
+on the row `claim_run` ITSELF returned (`returning *`), so the check and the
+claim are one step. The pre-claim read survives only as a cheap early refusal
+for a wrong run id, and nothing depends on it still being true afterwards.
+
+The marker alone is still not enough, and was never meant to be: a browser
+request's `metadata` reaches `input.metadata`, so a user can put the string on
+an ordinary run. What a user cannot do is give that run
+`OPERATOR_OWNED_LAUNCH_STATE`.
+
 
 Stopping safely
 ---------------
@@ -170,11 +208,33 @@ PAID_EXECUTION_FLAG = "MILO_ENABLE_PAID_EXECUTION"
 EGRESS_ACKNOWLEDGEMENT = "I ACKNOWLEDGE LIVE GOVERNMENT EGRESS"
 SCHEMA_REPORT_ACKNOWLEDGEMENT = "I ACKNOWLEDGE OPERATOR-0 SCHEMA REPORT REVIEWED"
 
-#: What the operator must have put in the prepared run's input metadata, and
-#: the two server-owned run fields that prove no launcher ever touched it.
+#: What `--prepare` writes into the run's input metadata, and the two
+#: server-owned run fields that prove the operator -- not a launcher -- owns
+#: this run's launch.
 OPERATOR_CAPTURE_OPERATION = "catalog.government.capture"
 ELIGIBLE_RUN_STATUS = "queued"
-ELIGIBLE_LAUNCH_STATE = "pending"
+
+#: The launch state an operator-prepared run comes to rest in, and the set
+#: `try_acquire_launch` is able to acquire from.
+#:
+#: `'none'` is migration 009's own default and is inside the
+#: `runs_launch_state_check` constraint, so nothing here invents a state or
+#: needs a migration. Two properties make it the right one, and both are
+#: repository facts rather than conventions:
+#:
+#: *   **Unacquirable.** `try_acquire_launch` moves a run only from
+#:     `pending` or `launch_failed`, so a run resting in `'none'` can never be
+#:     acquired by the ordinary launch path again. Its single caller is
+#:     `backend/main.py`, and `set_launch_state`'s single caller only ever
+#:     writes `launching`/`launched`/`launch_failed`/`launch_unknown` -- so
+#:     nothing in the product can move a run back out of `'none'` either.
+#: *   **Truthful.** It asserts the ABSENCE of a launch, which is exactly what
+#:     an operator capture run is. `launching`, `launched` and
+#:     `launch_unknown` would each claim a launch that never happened, and
+#:     `launch_unknown` would additionally park the run for an operator
+#:     reconciliation that is not owed.
+OPERATOR_OWNED_LAUNCH_STATE = "none"
+LAUNCH_ACQUIRABLE_STATES: frozenset[str] = frozenset({"pending", "launch_failed"})
 
 #: The reviewed capture bounds. `CAPTURE_PAGE_LIMIT` is `MAX_PAGE_LIMIT`, not
 #: an increase of it; the other two RESTATE the existing ceilings so the
@@ -242,6 +302,14 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "that run is not a prepared operator capture run",
     "CAPTURE_RUN_UNAVAILABLE":
         "that run could not be read or claimed",
+    "CAPTURE_LAUNCH_OWNERSHIP_LOST":
+        "the ordinary launch path owns this run, so the operator may not take it",
+    "CAPTURE_CONVERSATION_IDENTITY_INVALID":
+        "preparation requires an existing conversation and the operator's own user identity",
+    "CAPTURE_CONVERSATION_UNAVAILABLE":
+        "that conversation does not exist or that user is not a member of its project",
+    "CAPTURE_PREPARATION_FAILED":
+        "the operator capture run could not be prepared",
     "CAPTURE_CANCELLED":
         "the run was cancelled before the capture finished",
     "CAPTURE_LEASE_LOST":
@@ -353,6 +421,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="actually perform the capture (required; refuses without it)")
     parser.add_argument("--plan", action="store_true",
                         help="describe what an execution would do and exit; no side effects")
+    parser.add_argument("--prepare", action="store_true",
+                        help="create and take operator ownership of a capture run; captures nothing")
+    parser.add_argument("--conversation-id", default=None,
+                        help="--prepare only: the existing conversation the run belongs to")
+    parser.add_argument("--requested-by", default=None,
+                        help="--prepare only: the operator's own user id, checked for membership")
+    parser.add_argument("--idempotency-key", default=None,
+                        help="--prepare only: replaying it returns the same prepared run")
     parser.add_argument("--acknowledge-live-government-egress", default=None,
                         help="must be exactly the live-egress acknowledgement")
     parser.add_argument("--acknowledge-schema-report-reviewed", default=None,
@@ -392,6 +468,53 @@ def _exact_int(value: Any, expected: int) -> bool:
     return text.isdigit() and int(text) == expected
 
 
+def _shared_refusal(args: argparse.Namespace, env: Mapping[str, str]) -> str:
+    """What `--prepare` and `--execute` BOTH require.
+
+    Preparation is a catalog operation that writes a durable run, so it is
+    gated on the operator's acknowledgement of OPERATOR-0, on the configured
+    project identity and on CODE-2's flag exactly as the capture is. It is NOT
+    gated on the live-egress acknowledgement, because it performs no egress --
+    demanding an egress acknowledgement for an operation that sends nothing
+    would train an operator to supply it without meaning it.
+    """
+    if args.acknowledge_schema_report_reviewed != SCHEMA_REPORT_ACKNOWLEDGEMENT:
+        return "CAPTURE_SCHEMA_REPORT_NOT_ACKNOWLEDGED"
+    configured = configured_project_ref(env)
+    if not configured:
+        return "CAPTURE_PROJECT_NOT_CONFIGURED"
+    if not args.project_ref or str(args.project_ref) != configured:
+        return "CAPTURE_PROJECT_MISMATCH"
+    if not catalog_execution_enabled(env):
+        return "CAPTURE_CATALOG_EXECUTION_DISABLED"
+    if (env.get(PAID_EXECUTION_FLAG) or "").strip().lower() in TRUE_VALUES:
+        return "CAPTURE_PAID_EXECUTION_ENABLED"
+    try:
+        _lease_settings(env)
+    except (TypeError, ValueError):
+        return "CAPTURE_LEASE_CONFIG_INVALID"
+    return ""
+
+
+def _prepare_refusal(args: argparse.Namespace, env: Mapping[str, str]) -> str:
+    """The reason a PREPARATION must not proceed, or an empty string.
+
+    Pure, like `_refusal`, and evaluated to completion before the repository
+    exists. Preparation takes no resource, bound, page size or run identity:
+    it MAKES the run identity, and the capture still has to be given one
+    explicitly afterwards.
+    """
+    shared = _shared_refusal(args, env)
+    if shared:
+        return shared
+    for identity in (args.conversation_id, args.requested_by):
+        try:
+            UUID(str(identity))
+        except (AttributeError, TypeError, ValueError):
+            return "CAPTURE_CONVERSATION_IDENTITY_INVALID"
+    return ""
+
+
 def _refusal(args: argparse.Namespace, extra: Sequence[str],
              env: Mapping[str, str]) -> str:
     """The reason this capture must not proceed, or an empty string.
@@ -403,27 +526,24 @@ def _refusal(args: argparse.Namespace, extra: Sequence[str],
     """
     if extra:
         return "CAPTURE_ARGUMENT_NOT_SUPPORTED"
-    if args.plan and args.execute:
+    # The three modes are mutually exclusive. Two at once is a contradiction
+    # rather than a precedence question: an operator who asked for both did
+    # not decide which one they wanted.
+    if sum(bool(mode) for mode in (args.plan, args.execute, args.prepare)) > 1:
         return "CAPTURE_MODE_CONTRADICTORY"
+    if args.prepare:
+        return _prepare_refusal(args, env)
     if not args.execute:
         return "CAPTURE_NOT_AUTHORIZED"
     if args.acknowledge_live_government_egress != EGRESS_ACKNOWLEDGEMENT:
         return "CAPTURE_EGRESS_NOT_ACKNOWLEDGED"
-    if args.acknowledge_schema_report_reviewed != SCHEMA_REPORT_ACKNOWLEDGEMENT:
-        return "CAPTURE_SCHEMA_REPORT_NOT_ACKNOWLEDGED"
-    configured = configured_project_ref(env)
-    if not configured:
-        return "CAPTURE_PROJECT_NOT_CONFIGURED"
-    if not args.project_ref or str(args.project_ref) != configured:
-        return "CAPTURE_PROJECT_MISMATCH"
+    shared = _shared_refusal(args, env)
+    if shared:
+        return shared
     try:
         UUID(str(args.run_id))
     except (AttributeError, TypeError, ValueError):
         return "CAPTURE_RUN_IDENTITY_INVALID"
-    if not catalog_execution_enabled(env):
-        return "CAPTURE_CATALOG_EXECUTION_DISABLED"
-    if (env.get(PAID_EXECUTION_FLAG) or "").strip().lower() in TRUE_VALUES:
-        return "CAPTURE_PAID_EXECUTION_ENABLED"
     if args.package_id != src.CKAN_PACKAGE_ID:
         return "CAPTURE_PACKAGE_NOT_SUPPORTED"
     if args.resource_id != src.WLTP_RESOURCE_ID:
@@ -434,13 +554,6 @@ def _refusal(args: argparse.Namespace, extra: Sequence[str],
         return "CAPTURE_BOUNDS_NOT_SUPPORTED"
     if args.max_records is not None and not _exact_int(args.max_records, CAPTURE_MAX_RECORDS):
         return "CAPTURE_BOUNDS_NOT_SUPPORTED"
-    try:
-        _lease_settings(env)
-    except (TypeError, ValueError):
-        # A lease this process cannot size is a lease it must not take. Read
-        # here, with the rest of the prerequisites, so it refuses before the
-        # repository exists rather than after the run has been claimed.
-        return "CAPTURE_LEASE_CONFIG_INVALID"
     return ""
 
 
@@ -458,22 +571,45 @@ def _lease_settings(env: Mapping[str, str]) -> tuple[int, float]:
     return lease_seconds, max(1.0, min(interval, lease_seconds / 3))
 
 
-def _run_is_eligible(run: Mapping[str, Any]) -> bool:
-    """Whether this run is one an operator prepared for a capture.
+def _carries_operator_marker(run: Mapping[str, Any]) -> bool:
+    """Whether this run's input metadata states the operator capture intent.
 
-    All three conditions, together. See the module docstring: the marker alone
-    can come from a browser request's metadata, and the launch state alone has
-    a sub-request window where it is still `pending`.
+    NEVER sufficient on its own. A browser request's `metadata` reaches
+    `input.metadata`, so a user can put this string on an ordinary run. What
+    it cannot do is give that run `OPERATOR_OWNED_LAUNCH_STATE`, because the
+    only way to reach that state is `--prepare` winning the launch CAS.
     """
-    if str(run.get("status")) != ELIGIBLE_RUN_STATUS:
-        return False
-    if str(run.get("launch_state")) != ELIGIBLE_LAUNCH_STATE:
-        return False
     run_input = run.get("input")
     metadata = run_input.get("metadata") if isinstance(run_input, Mapping) else None
     if not isinstance(metadata, Mapping):
         return False
     return str(metadata.get("milo_operation")) == OPERATOR_CAPTURE_OPERATION
+
+
+def _operator_owns_launch(run: Mapping[str, Any]) -> bool:
+    """Whether the OPERATOR, not a launcher, owns this run's launch.
+
+    The launch state is the load-bearing half and the marker is the intent
+    half, and they are checked together. The state cannot be reached from the
+    ordinary path at all: `try_acquire_launch` acquires only from
+    `LAUNCH_ACQUIRABLE_STATES` and `set_launch_state` never writes this value,
+    so `OPERATOR_OWNED_LAUNCH_STATE` is reachable only through `--prepare`
+    winning that CAS, and is terminal with respect to the launcher once
+    reached.
+    """
+    return (str(run.get("launch_state")) == OPERATOR_OWNED_LAUNCH_STATE
+            and _carries_operator_marker(run))
+
+
+def _run_is_eligible(run: Mapping[str, Any]) -> bool:
+    """Whether this run is one `--prepare` produced and still owns.
+
+    `status` is checked too, so a prepared run that has since been started,
+    cancelled or finished is not captured a second time. The CLAIM re-checks
+    the ownership half on its own returned row (`_execute`), which is what
+    removes the read-then-claim window rather than narrowing it.
+    """
+    return str(run.get("status")) == ELIGIBLE_RUN_STATUS and _operator_owns_launch(run)
 
 
 # =============================================================================
@@ -753,6 +889,115 @@ def _finalize(repository: Any, lease: WorkerLease, *, document: Mapping[str, Any
         return
 
 
+#: What the prepared run's message and input carry. Fixed text: nothing an
+#: operator types reaches the run body, so a run cannot carry a prompt.
+PREPARED_RUN_CONTENT = "operator catalog capture run; not executed by a model worker"
+
+
+def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dict[str, Any]]:
+    """Create a capture run and take operator ownership of its launch.
+
+    This is the supported answer to "where does the run come from". Before it
+    existed, the only way to reach the required state was a manual row edit --
+    an unsupported, unreviewable workaround for a capability whose whole point
+    is that it is reviewable.
+
+    Everything here goes through existing repository methods. There is no SQL,
+    no table name, no direct insert, no migration, and `JobLauncher` is never
+    imported, constructed or called.
+
+    The ORDER is the safety property:
+
+    1.  `get_conversation(id, requested_by)` -- membership, enforced by the
+        repository exactly as it is for a browser request. An operator who is
+        not a member of the conversation's project gets the same not-found the
+        browser would, and nothing is created.
+    2.  `create_user_message` + `create_queued_run` -- the ordinary creation
+        pair, so the run is a real run with real ownership, an idempotency key
+        and the operator marker. It is born `queued`/`pending`, which is
+        LAUNCHABLE, and it stays that way for exactly as long as step 3 takes.
+    3.  `try_acquire_launch` -- THE atomic boundary. This is the same
+        single-statement CAS `backend/main.py` uses, so the operator and the
+        ordinary launch path compete at one authoritative transition and
+        exactly one can win. Losing it is a refusal, not a retry.
+    4.  `set_launch_state(OPERATOR_OWNED_LAUNCH_STATE)` -- rest the run in a
+        state the launcher can never acquire again. Safe as a plain UPDATE
+        precisely because step 3 already established exclusivity; doing it
+        WITHOUT step 3 would be the defect, since `set_launch_state` is
+        unconditional and would happily overwrite a launcher's `launching`.
+
+    A failure or a crash between 3 and 4 leaves the run at `launching`, which
+    is fail-closed in both directions: `try_acquire_launch` cannot acquire it,
+    so no worker is ever launched for it, and `_run_is_eligible` refuses it,
+    so it is not capturable either. It is inert, and it is not a model run.
+    """
+    repository = _open_repository()
+    conversation_id = UUID(str(args.conversation_id))
+    requested_by = UUID(str(args.requested_by))
+
+    try:
+        repository.get_conversation(conversation_id, requested_by)
+    except Exception:
+        # Membership and existence collapse to one answer here for the same
+        # reason they do for the browser: distinguishing them would say
+        # whether a conversation this operator cannot see exists.
+        return EXIT_REFUSED, _envelope("refused", "CAPTURE_CONVERSATION_UNAVAILABLE")
+
+    metadata = {"milo_operation": OPERATOR_CAPTURE_OPERATION}
+    idempotency_key = str(args.idempotency_key) if args.idempotency_key else None
+    try:
+        message = repository.create_user_message(conversation_id, PREPARED_RUN_CONTENT,
+                                                 dict(metadata))
+        run = repository.create_queued_run(
+            conversation_id, message["id"], PREPARED_RUN_CONTENT, dict(metadata),
+            requested_by=requested_by, idempotency_key=idempotency_key)
+    except Exception:
+        return EXIT_FAILED, _envelope("failed", "CAPTURE_PREPARATION_FAILED")
+
+    run_id = UUID(str(run["id"]))
+    if _operator_owns_launch(run):
+        # A replay of an identical preparation. `create_queued_run` returns the
+        # EXISTING run for a repeated (user, conversation, idempotency key), so
+        # this is the same run that was already prepared, already owned and
+        # already at rest. Reporting it is idempotent; re-acquiring would fail,
+        # because the state it rests in is the one the CAS cannot acquire.
+        return EXIT_OK, _envelope("prepared", "", preparation=_preparation_document(
+            run_id, already_prepared=True))
+
+    try:
+        acquired = repository.try_acquire_launch(run_id)
+    except Exception:
+        return EXIT_FAILED, _envelope("failed", "CAPTURE_PREPARATION_FAILED")
+    if acquired is None:
+        # The ordinary launch path won, or this run was never acquirable. Do
+        # not touch its launch state: it belongs to whoever holds it.
+        return EXIT_REFUSED, _envelope("refused", "CAPTURE_LAUNCH_OWNERSHIP_LOST")
+
+    try:
+        repository.set_launch_state(run_id, OPERATOR_OWNED_LAUNCH_STATE)
+    except Exception:
+        # The run stays at `launching`: inert, unlaunchable and uncapturable.
+        return EXIT_FAILED, _envelope("failed", "CAPTURE_PREPARATION_FAILED")
+
+    return EXIT_OK, _envelope("prepared", "", preparation=_preparation_document(
+        run_id, already_prepared=False))
+
+
+def _preparation_document(run_id: UUID, *, already_prepared: bool) -> dict[str, Any]:
+    """The minimum an operator needs to invoke the capture, and nothing else.
+
+    The run id only. No conversation, no project, no user, no message, no
+    idempotency key, no lease material -- the capture invocation needs none of
+    them, and a preparation report is not a place to widen what is printed.
+    """
+    return {
+        "run_id": _text(run_id),
+        "already_prepared": bool(already_prepared),
+        "launch_owner": "operator",
+        "captured": False,
+    }
+
+
 def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dict[str, Any]]:
     """The authorized path. Every prerequisite has already passed."""
     # Already validated by `_refusal`, which every caller evaluates first.
@@ -786,6 +1031,23 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
                             lease_token=str(claimed.get("lease_token") or ""))
     except Exception:
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_UNAVAILABLE")
+
+    # Ownership is re-checked on the row THE CLAIM ITSELF RETURNED, not on the
+    # row read before it. `claim_run_lease` is `returning *`, so that row is
+    # the run as it exists at the instant this process took the lease -- which
+    # closes the read-then-claim window rather than narrowing it. The earlier
+    # read is only a cheap early refusal for a wrong run id; it is not the
+    # exclusivity mechanism, and nothing here depends on it still being true.
+    #
+    # `status` is deliberately not re-checked: the claim moved it to
+    # `starting`, which is the claim working. What must still hold is that the
+    # OPERATOR owns the launch, and that cannot have changed under us --
+    # reaching `OPERATOR_OWNED_LAUNCH_STATE` requires winning the launch CAS,
+    # and no product path can move a run back out of it.
+    if not _operator_owns_launch(claimed):
+        _finalize(repository, lease, document={},
+                  reason_code="CAPTURE_LAUNCH_OWNERSHIP_LOST", cancelled=False)
+        return EXIT_FAILED, _envelope("failed", "CAPTURE_LAUNCH_OWNERSHIP_LOST")
 
     supervisor = _CaptureSupervisor(repository, lease, lease_seconds=lease_seconds,
                                     interval=interval)
@@ -836,7 +1098,7 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     args, extra = build_parser().parse_known_args(list(argv or []))
 
     reason = _refusal(args, extra, environment)
-    if args.plan and not args.execute and not extra:
+    if args.plan and not args.execute and not args.prepare and not extra:
         # A plan states what an execution would construct and performs none of
         # it. It is reported as a plan whether or not the other prerequisites
         # are satisfied, and it never reads the project, the run or the flags
@@ -844,6 +1106,11 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         status, document = EXIT_OK, _envelope("planned", "", plan=plan_document())
     elif reason:
         status, document = EXIT_REFUSED, _envelope("refused", reason)
+    elif args.prepare:
+        # Preparation, and ONLY preparation. It opens no transport, sends no
+        # request and captures nothing; the capture is a separate invocation
+        # that must be given the run identity explicitly.
+        status, document = _prepare(args, environment)
     else:
         status, document = _execute(args, environment)
 
@@ -857,10 +1124,12 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
 
 __all__ = ["CAPTURE_ENTRYPOINT", "CAPTURE_MAX_PAGES", "CAPTURE_MAX_RECORDS",
            "CAPTURE_PAGE_LIMIT", "CAPTURE_REASONS", "EGRESS_ACKNOWLEDGEMENT",
-           "ELIGIBLE_LAUNCH_STATE", "ELIGIBLE_RUN_STATUS", "EXIT_FAILED", "EXIT_OK",
-           "EXIT_REFUSED", "OPERATOR_CAPTURE_OPERATION", "PAID_EXECUTION_FLAG",
-           "SCHEMA_REPORT_ACKNOWLEDGEMENT", "build_parser", "capture_document",
-           "configured_project_ref", "main", "plan_document", "safe_message"]
+           "ELIGIBLE_RUN_STATUS", "EXIT_FAILED", "EXIT_OK", "EXIT_REFUSED",
+           "LAUNCH_ACQUIRABLE_STATES", "OPERATOR_CAPTURE_OPERATION",
+           "OPERATOR_OWNED_LAUNCH_STATE", "PAID_EXECUTION_FLAG",
+           "PREPARED_RUN_CONTENT", "SCHEMA_REPORT_ACKNOWLEDGEMENT", "build_parser",
+           "capture_document", "configured_project_ref", "main", "plan_document",
+           "safe_message"]
 
 
 if __name__ == "__main__":  # pragma: no cover - the process entry point

@@ -1,14 +1,16 @@
 # CODE-1 — the guarded operator Government capture entrypoint
 
-**Status as of 2026-09-16:** the entrypoint is **implemented in code and
+**Status as of 2026-09-17:** the entrypoint is **implemented in code and
 tested**. **No live capture has been executed**, from this repository or
-anywhere else that this repository can observe. Nothing here claims a durable
-production snapshot, a deployment, a migration, an activation or an enabled
-flag.
+anywhere else that this repository can observe, and **no capture run has been
+prepared** in any real environment. Nothing here claims a durable production
+snapshot, a deployment, a migration, an activation or an enabled flag.
 
 | Fact | State |
 | --- | --- |
 | CODE-1 implemented in code | **yes** — `backend/catalog/operator_capture.py`, `tests/test_catalog_operator_capture.py` |
+| A supported way to prepare a capture run exists | **yes** — `--prepare`, in the same entrypoint; no manual SQL, dashboard edit or migration |
+| A capture run has been prepared anywhere real | **no** |
 | A live Government capture has been executed | **no** |
 | OPERATOR-0 (read-only schema inspection) | **still required before execution** |
 | AUTH-1 (authorization for the first live capture) | **still required** |
@@ -22,8 +24,11 @@ state rows, which are external and unobserved.
 
 ## What it is
 
-One operator-invoked controller that connects the reviewed components in the
-reviewed order and adds no capture logic of its own:
+One operator-invoked controller with **two modes** — `--prepare`, which makes a
+capture run nothing else will ever launch, and `--execute`, which performs the
+capture against it. Neither implies the other. The capture connects the
+reviewed components in the reviewed order and adds no capture logic of its
+own:
 
 ```
 HttpsDataGovTransport  ->  DataGovClient(page_limit=1000)
@@ -41,7 +46,117 @@ database-side bounded diff.
 
 It is not a route, a UI, a tool, a job, a schedule or a model caller.
 
-## Running it
+## Five separate things, and none implies another
+
+This is the distinction the whole design rests on. Doing any one of these does
+**not** do, authorize or imply any other:
+
+| # | Act | What it does | What it does **not** do |
+| --: | --- | --- | --- |
+| 1 | **Enabling `MILO_ENABLE_CATALOG_EXECUTION`** | opens the catalog path for the worker, and lets this entrypoint be invoked at all | starts nothing; prepares nothing; captures nothing |
+| 2 | **Preparing an operator capture run** (`--prepare`) | creates one run and takes operator ownership of its launch, so no model worker can ever run it | sends no request; claims no lease; writes no catalog row; captures nothing |
+| 3 | **Authorizing a live capture** (AUTH-1) | a human decision, recorded outside this repository | changes no code, no flag and no run |
+| 4 | **Executing the capture** (`--execute`) | performs one bounded live capture against the prepared run | promotes nothing to canonical; enables nothing |
+| 5 | **Running MILO against the result** | ordinary Swarm V2 work over a snapshot that now exists | is a separate, separately authorized activity |
+
+A snapshot existing is not permission to use it. Preparation existing is not
+permission to capture. The flag being on is not a capture.
+
+## 1 & 2 — preparing an operator capture run
+
+Every durable catalog write is lease-guarded and a lease belongs to a run, so
+the capture needs one — and it must be a run **no model worker will ever
+execute**. Every ordinary creation path (`backend/main.py`
+`_create_and_launch_run`) hands its new run straight to `JobLauncher.launch()`,
+so an ordinary run is exactly the wrong thing.
+
+`--prepare` is the supported way to make the right thing. It is the same
+module, the same CLI, and it uses only existing repository methods — no SQL, no
+direct table write, no dashboard edit, no migration, and `JobLauncher` is never
+imported, constructed or called.
+
+```
+python -m backend.catalog.operator_capture \
+  --prepare \
+  --acknowledge-schema-report-reviewed "I ACKNOWLEDGE OPERATOR-0 SCHEMA REPORT REVIEWED" \
+  --project-ref <the project reference this process is configured for> \
+  --conversation-id <an existing conversation you are a member of> \
+  --requested-by <your own user id> \
+  --idempotency-key <optional; replaying it returns the same run>
+```
+
+It prints exactly one thing you need:
+
+```json
+{
+  "entrypoint": "catalog.government.capture",
+  "status": "prepared",
+  "reason_code": "",
+  "reason": "",
+  "preparation": {
+    "run_id": "…", "already_prepared": false,
+    "launch_owner": "operator", "captured": false
+  }
+}
+```
+
+The conversation id, the user id, the project reference and the idempotency key
+are **not** echoed back.
+
+### What it does, in order — and why the order is the safety property
+
+1. **`get_conversation(conversation_id, requested_by)`** — membership, enforced
+   by the repository exactly as it is for a browser request. An operator who is
+   not a member of the conversation's project gets the same not-found a browser
+   user would, and **nothing is created**.
+2. **`create_user_message` + `create_queued_run`** — the ordinary creation
+   pair, so the run is a real run with real ownership, a real idempotency key
+   and the operator marker. It is born `queued`/`pending`, which is
+   **launchable**, and stays that way for exactly as long as step 3 takes.
+3. **`try_acquire_launch`** — **the atomic boundary.** This is the same
+   single-statement compare-and-set `backend/main.py` uses, so the operator and
+   the ordinary launch path compete at one authoritative transition and exactly
+   one can win. Losing it is a refusal (`CAPTURE_LAUNCH_OWNERSHIP_LOST`), never
+   a retry, and the run is left alone.
+4. **`set_launch_state('none')`** — rest the run in a launch state
+   `try_acquire_launch` can never acquire from. This is safe as a plain UPDATE
+   *only because* step 3 already established exclusivity; doing it without step
+   3 would be the defect, since `set_launch_state` is unconditional and would
+   happily overwrite a launcher's `launching`.
+
+### Why `launch_state = 'none'`
+
+It is migration 009's own default and is already inside the
+`runs_launch_state_check` constraint, so nothing is invented and no migration
+is added. Two repository facts make it the right value:
+
+- **Unacquirable.** `try_acquire_launch` moves a run only from `pending` or
+  `launch_failed`. Its single caller is `backend/main.py`, and
+  `set_launch_state`'s single caller only ever writes
+  `launching`/`launched`/`launch_failed`/`launch_unknown` — so nothing in the
+  product can move a run *into* `none`, or back *out* of it.
+- **Truthful.** It asserts the *absence* of a launch, which is exactly what an
+  operator capture run is. `launching` and `launched` would each claim a launch
+  that never happened, and `launch_unknown` would additionally park the run for
+  a reconciliation nobody owes.
+
+A real-PostgreSQL test
+(`test_012_operator_owned_launch_state_is_unacquirable_by_the_launch_cas`)
+holds the database itself to the first property.
+
+### Replay, and interruption
+
+- **Replay** — re-running `--prepare` with the same `--idempotency-key`,
+  conversation and user returns **the same run**, reports
+  `already_prepared: true`, and creates no second run.
+- **Interruption** — a crash between steps 3 and 4 leaves the run at
+  `launching`, which is fail-closed in both directions: no launcher can acquire
+  it, and the capture refuses it (`CAPTURE_RUN_NOT_ELIGIBLE`). It is inert, and
+  it is not a model run.
+- **Refusal before creation** — a membership failure creates no run and no
+  message at all.
+
+## 4 — executing the capture
 
 ```
 python -m backend.catalog.operator_capture \
@@ -49,7 +164,7 @@ python -m backend.catalog.operator_capture \
   --acknowledge-live-government-egress "I ACKNOWLEDGE LIVE GOVERNMENT EGRESS" \
   --acknowledge-schema-report-reviewed "I ACKNOWLEDGE OPERATOR-0 SCHEMA REPORT REVIEWED" \
   --project-ref <the project reference this process is configured for> \
-  --run-id <the prepared operator capture run> \
+  --run-id <the run id `--prepare` printed> \
   --package-id degem-rechev-wltp \
   --resource-id 142afde2-6228-49f9-8a29-9b6c3a0cbe40 \
   --page-limit 1000 \
@@ -57,7 +172,7 @@ python -m backend.catalog.operator_capture \
 ```
 
 `--plan` prints what an execution would construct and performs none of it.
-`--help` and a bare invocation refuse.
+`--help`, a bare invocation, and any two modes together all refuse.
 
 ### Every execution prerequisite
 
@@ -69,16 +184,17 @@ unrecognised is a refusal with a static reason code and a non-zero exit,
 2. `--acknowledge-live-government-egress` **exactly** equal to
    `I ACKNOWLEDGE LIVE GOVERNMENT EGRESS`. Not a boolean: a boolean is what a
    shell alias or a copied command supplies without anybody deciding anything.
+   `--prepare` does **not** ask for this one, because it performs no egress.
 3. `--acknowledge-schema-report-reviewed` **exactly** equal to
    `I ACKNOWLEDGE OPERATOR-0 SCHEMA REPORT REVIEWED`. Separate from (2) because
-   they are separate facts.
+   they are separate facts. Both `--prepare` and `--execute` require it.
 4. `--project-ref` equal to the first host label of this process's
    `SUPABASE_URL`. Neither value is ever printed.
-5. `--run-id` — a prepared operator capture run (see below).
+5. `--run-id` — the run `--prepare` produced and still owns.
 6. `MILO_ENABLE_CATALOG_EXECUTION` enabled, read through CODE-2's
    `catalog_execution_enabled()`. Unset, empty, `false` and any unrecognised
-   value are all off.
-7. `MILO_ENABLE_PAID_EXECUTION` **disabled**.
+   value are all off. `--prepare` is gated on it too.
+7. `MILO_ENABLE_PAID_EXECUTION` **disabled**, for both modes.
 8. `--package-id degem-rechev-wltp` and
    `--resource-id 142afde2-6228-49f9-8a29-9b6c3a0cbe40` (the pinned WLTP
    resource). The quantity resource is allowlisted in `source.py` and is **not**
@@ -89,25 +205,26 @@ unrecognised is a refusal with a static reason code and a non-zero exit,
 There is no `--url`, `--host`, `--action`, `--query`, `--filters`, `--offset`
 or `--limit`: an unrecognised argument is `CAPTURE_ARGUMENT_NOT_SUPPORTED`.
 
-### Preparing the run — remaining operator work
+### The run the capture will accept
 
-Every durable catalog write is lease-guarded and a lease belongs to a run, so
-the capture needs one. **This entrypoint does not create it**, deliberately:
-every run-creation path in this repository (`backend/main.py`
-`_create_and_launch_run`) hands the new run straight to `JobLauncher.launch()`,
-which starts an ordinary model run. A capture run is therefore prepared out of
-band, and the entrypoint refuses anything that does not look exactly like one:
-
-| Field | Required value | Why |
+| Field | Required value | Established by |
 | --- | --- | --- |
-| `status` | `queued` | never started |
-| `launch_state` | `pending` | both creation paths insert `pending`, and `try_acquire_launch` moves it to `launching` before the HTTP response returns — so `pending` means **no launcher ever touched it** |
-| `input.metadata.milo_operation` | `catalog.government.capture` | explicit operator intent |
+| `status` | `queued` | the run was never started |
+| `launch_state` | `none` | `--prepare` winning `try_acquire_launch`, then resting the run |
+| `input.metadata.milo_operation` | `catalog.government.capture` | `--prepare` |
 
-All three together. The marker alone is not enough (a browser request's
-metadata reaches `input.metadata`); the launch state alone is not enough (there
-is a sub-request window where it is still `pending`). The gate runs **before**
-the claim, so a mistyped run id refuses rather than hijacking somebody's run.
+The marker **alone buys nothing**: a browser request's `metadata` reaches
+`input.metadata`, so a user can put that string on an ordinary run — and a test
+proves such a run is still refused and stays launchable. What a user cannot do
+is give a run the operator-owned launch state.
+
+Ownership is verified **on the row `claim_run` itself returned**, not on the
+row read before it. `claim_run_lease` is `returning *`, so that row is the run
+as it existed at the instant the lease was taken — the check and the claim are
+one step, rather than a read followed by a hopeful claim. If ownership does not
+hold there, the capture refuses (`CAPTURE_LAUNCH_OWNERSHIP_LOST`), sends no
+Government request and writes no catalog row.
+
 
 ### Stop conditions
 
@@ -122,7 +239,9 @@ Do not run it until **all** of these hold:
    §"Catalog execution").
 4. `MILO_ENABLE_PAID_EXECUTION` is off. A capture requires no model spend and
    must not be bundled with one.
-5. A capture run has been prepared as above.
+5. A capture run has been prepared with `--prepare`, and its run id is in
+   hand. Preparation is itself gated on (3) and on the OPERATOR-0
+   acknowledgement, so it cannot be done ahead of those.
 6. The rollback is understood: it prevents the **next** capture and undoes
    nothing (see below).
 
@@ -199,7 +318,7 @@ boundary failure is reduced to `CAPTURE_UNEXPECTED_FAILURE`.
 
 | Status | Meaning |
 | ---: | --- |
-| `0` | the capture succeeded, or `--plan` printed a plan |
+| `0` | the capture succeeded, `--prepare` prepared a run, or `--plan` printed a plan |
 | `2` | refused — nothing was captured, claimed or mutated |
 | `1` | started and stopped — a capture, ingestion, lease or repository failure |
 
@@ -235,6 +354,10 @@ snapshot that no reader reads, and the previous usable snapshot keeps
 answering.
 
 ## What this does not authorize
+
+Preparing a run is not authorization to capture, and capturing is not
+authorization to run MILO against the result.
+
 
 Capturing and activating a Government snapshot is **not** authorization to run
 MILO against it or to promote canonical facts. This entrypoint enables and

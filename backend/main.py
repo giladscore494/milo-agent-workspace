@@ -209,7 +209,14 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
             return RunCreated(run_id=current["id"], status=current["status"])
         run = acquired
     elif hasattr(repo, "set_launch_state"):
-        if run.get("launch_state") in {"launching", "launched"}:
+        # Legacy two-step path for simple test fakes without the CAS. It now
+        # mirrors try_acquire_launch's acquirable set exactly rather than
+        # naming the two states it happened to think of, so a fake can never
+        # be laxer than production: only a pending or previously-failed launch
+        # may be started. In particular 'none' -- the state an operator
+        # capture run rests in -- is not launchable here either. A fake that
+        # models no launch_state at all keeps its previous behaviour.
+        if run.get("launch_state") not in {None, "pending", "launch_failed"}:
             return RunCreated(run_id=run["id"], status=run["status"])
         repo.set_launch_state(run_id, "launching")
     try:

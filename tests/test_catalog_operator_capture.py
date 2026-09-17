@@ -24,6 +24,7 @@ The suite is in four parts, matching the four properties this stage claims:
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -37,6 +38,7 @@ from backend.catalog import operator_capture as entrypoint
 from backend.catalog.government import source as src
 from backend.catalog.government.ingest import IngestionReport
 from backend.catalog.government.refresh import RefreshOutcome, SnapshotDiff
+from backend import job_launcher as job_launcher_module
 from backend.errors import AppError
 from backend.production_config import TRUE_VALUES
 from backend.testing import government_capture as capture_fixtures
@@ -264,26 +266,68 @@ def repository() -> MemoryRepository:
     return MemoryRepository()
 
 
-def prepare_run(repository: MemoryRepository, *, metadata: Mapping[str, Any] | None = None
-                ) -> UUID:
-    """One run prepared exactly as an operator prepares a capture run.
-
-    `create_queued_run` is the repository method both production creation paths
-    reach, and it inserts `launch_state='pending'`. Nothing launches it here,
-    which is the state the entrypoint requires and which the API route leaves
-    behind only for a run it never handed to a launcher.
-    """
+def seed_conversation(repository: MemoryRepository) -> tuple[UUID, UUID]:
+    """One project, one member, one conversation. Returns `(conversation, user)`."""
     project_id, user_id = str(uuid4()), str(uuid4())
     repository.seed_user(user_id)
     repository.seed_project(project_id, "catalog-ops", "Catalog ops", [user_id],
                             workflow_key="swarm_v2")
     conversation = repository.create_conversation(UUID(project_id), "operator capture",
                                                   UUID(user_id))
-    message = repository.create_user_message(UUID(conversation["id"]), "operator capture", {})
-    payload = {"milo_operation": entrypoint.OPERATOR_CAPTURE_OPERATION}
+    return UUID(conversation["id"]), UUID(user_id)
+
+
+def prepare_argv(conversation_id: Any, requested_by: Any, **overrides: Any) -> list[str]:
+    values: dict[str, Any] = {
+        "--prepare": True,
+        "--acknowledge-schema-report-reviewed": entrypoint.SCHEMA_REPORT_ACKNOWLEDGEMENT,
+        "--project-ref": PROJECT_REF,
+        "--conversation-id": str(conversation_id),
+        "--requested-by": str(requested_by),
+    }
+    values.update(overrides)
+    argv: list[str] = []
+    for name, value in values.items():
+        if value is None:
+            continue
+        if value is True:
+            argv.append(name)
+            continue
+        argv.extend([name, str(value)])
+    return argv
+
+
+def prepare_run(repository: MemoryRepository, capsys, **overrides: Any) -> UUID:
+    """A capture run produced by THE SUPPORTED OPERATOR WORKFLOW.
+
+    This drives `--prepare` itself rather than manufacturing the run state, so
+    every capture test below rests on the same path an operator actually has.
+    An earlier round of this suite built the state with a direct
+    `create_queued_run`, which proved the capture worked over a state nothing
+    in the repository could produce.
+    """
+    conversation_id, user_id = seed_conversation(repository)
+    status = entrypoint.main(prepare_argv(conversation_id, user_id, **overrides),
+                             env=capture_env())
+    document = json.loads(capsys.readouterr().out)
+    assert status == entrypoint.EXIT_OK, document
+    return UUID(document["preparation"]["run_id"])
+
+
+def ordinary_run(repository: MemoryRepository, *,
+                 metadata: Mapping[str, Any] | None = None) -> UUID:
+    """A run created the way the PRODUCT creates one, and never prepared.
+
+    `create_queued_run` is the repository method both production creation paths
+    reach; it inserts `launch_state='pending'`, which is the launchable state.
+    `metadata` is the browser-supplied metadata, so a test can put the operator
+    marker on an ordinary run and prove the marker alone changes nothing.
+    """
+    conversation_id, user_id = seed_conversation(repository)
+    message = repository.create_user_message(conversation_id, "ordinary run", {})
     run = repository.create_queued_run(
-        UUID(conversation["id"]), message["id"], "operator capture",
-        dict(payload if metadata is None else metadata))
+        conversation_id, message["id"], "ordinary run", dict(metadata or {}),
+        requested_by=user_id, idempotency_key=str(uuid4()))
     return UUID(run["id"])
 
 
@@ -557,13 +601,16 @@ def test_an_unknown_run_refuses_without_claiming(wired, capsys):
 @pytest.mark.parametrize("mutate, field", [
     (lambda run: run.update({"launch_state": "launching"}), "launch_state"),
     (lambda run: run.update({"launch_state": "launched"}), "launch_state"),
+    (lambda run: run.update({"launch_state": "pending"}), "launch_state"),
     (lambda run: run.update({"status": "running"}), "status"),
 ])
-def test_a_run_a_launcher_touched_refuses_without_claiming(wired, capsys, mutate, field):
-    """The blocker this gate exists for: a run that was handed to a launcher is
-    an ordinary model run, and claiming it would race its worker."""
+def test_a_run_the_operator_does_not_own_refuses_without_claiming(wired, capsys, mutate, field):
+    """The blocker this gate exists for: a run in any launch state the ordinary
+    path can reach is an ordinary model run, and claiming it would race its
+    worker. Each state here is forced onto an already-prepared run, which is
+    the only way to reach them from an operator-owned run at all."""
     repository, transport = wired
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
     mutate(repository.runs[str(run_id)])
     status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_REFUSED
@@ -577,15 +624,22 @@ def test_a_run_a_launcher_touched_refuses_without_claiming(wired, capsys, mutate
     {"milo_operation": "chat"},
     {"milo_operation": ""},
     {"other": "catalog.government.capture"},
+    # THE ONE THAT MATTERS: the exact operator marker, browser-supplied. A
+    # user controls the `metadata` of a run-creation request and that metadata
+    # reaches `input.metadata`, so the marker on its own must buy nothing.
+    {"milo_operation": entrypoint.OPERATOR_CAPTURE_OPERATION},
 ])
-def test_a_run_without_the_operator_marker_refuses(wired, capsys, metadata):
+def test_an_unprepared_run_is_never_capturable_whatever_its_metadata(wired, capsys, metadata):
     repository, transport = wired
-    run_id = prepare_run(repository, metadata=metadata)
+    run_id = ordinary_run(repository, metadata=metadata)
     status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_REFUSED
     assert document["reason_code"] == "CAPTURE_RUN_NOT_ELIGIBLE"
     assert transport.calls == []
     assert repository.runs[str(run_id)].get("lease_token") is None
+    # It is still an ordinary, launchable run -- this refusal took nothing.
+    assert repository.runs[str(run_id)]["launch_state"] == "pending"
+    assert repository.try_acquire_launch(run_id) is not None
 
 
 # =============================================================================
@@ -594,7 +648,7 @@ def test_a_run_without_the_operator_marker_refuses(wired, capsys, metadata):
 
 def test_the_execution_branch_constructs_the_approved_transport_and_client(wired, capsys):
     repository, transport = wired
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
     status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_OK, document
     assert document["status"] == "succeeded"
@@ -662,7 +716,7 @@ def test_only_the_pinned_wltp_resource_and_the_whole_resource_query_are_reachabl
 
 def test_the_capture_lands_a_complete_activated_snapshot(wired, capsys, records):
     repository, _transport = wired
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
     status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_OK, document
 
@@ -684,14 +738,14 @@ def test_the_capture_lands_a_complete_activated_snapshot(wired, capsys, records)
 def test_an_unchanged_source_is_a_no_op(wired, capsys):
     """The refresh path's own property, reached through the entrypoint."""
     repository, transport = wired
-    first = prepare_run(repository)
+    first = prepare_run(repository, capsys)
     status, document, _ = run_main(authorized_argv(first), capture_env(), capsys)
     assert status == entrypoint.EXIT_OK, document
     assert document["capture"]["outcome"] == "changed"
     snapshots_after_first = dict(repository.catalog_snapshots)
     records_after_first = dict(repository.catalog_raw_records)
 
-    second = prepare_run(repository)
+    second = prepare_run(repository, capsys)
     status, document, _ = run_main(authorized_argv(second), capture_env(), capsys)
     assert status == entrypoint.EXIT_OK, document
     assert document["capture"]["outcome"] == "unchanged"
@@ -742,7 +796,7 @@ def test_every_durable_write_carries_the_claimed_lease(monkeypatch, transport, c
     repository = LeaseWatchingRepository()
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
 
     status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_OK, document
@@ -772,7 +826,7 @@ def test_cancellation_stops_the_path_before_any_write(monkeypatch, transport, ca
     repository = CancellingRepository()
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
 
     status, document, stderr = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_FAILED
@@ -804,7 +858,7 @@ def test_lease_loss_prevents_subsequent_writes_and_activation(monkeypatch, trans
     repository = LeaseStealingRepository()
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
 
     status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_FAILED
@@ -827,7 +881,7 @@ def test_an_invalid_capture_response_creates_no_snapshot(monkeypatch, repository
     monkeypatch.setattr(entrypoint, "_open_transport",
                         lambda: FixtureTransport(bodies={0: broken}))
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
 
     status, document, stderr = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_FAILED
@@ -851,7 +905,7 @@ def test_an_interruption_after_opening_a_snapshot_never_activates_it(monkeypatch
     repository = FailingAfterSnapshotRepository()
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
 
     status, document, stderr = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_FAILED
@@ -866,7 +920,7 @@ def test_a_previous_snapshot_remains_usable_after_a_failed_refresh(monkeypatch, 
                                                                    transport, capsys, records):
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
-    first = prepare_run(repository)
+    first = prepare_run(repository, capsys)
     status, document, _ = run_main(authorized_argv(first), capture_env(), capsys)
     assert status == entrypoint.EXIT_OK, document
     good_key = document["capture"]["snapshot"]["snapshot_key"]
@@ -874,7 +928,7 @@ def test_a_previous_snapshot_remains_usable_after_a_failed_refresh(monkeypatch, 
     # A later refresh whose metadata read fails outright.
     monkeypatch.setattr(entrypoint, "_open_transport",
                         lambda: FixtureTransport(transport_failures=9))
-    second = prepare_run(repository)
+    second = prepare_run(repository, capsys)
     status, failure, _ = run_main(authorized_argv(second), capture_env(), capsys)
     assert status == entrypoint.EXIT_FAILED
     assert failure["reason_code"] == "GOV_TRANSPORT_FAILED"
@@ -893,7 +947,7 @@ def test_an_unexpected_exception_is_reduced_to_static_safe_output(monkeypatch, t
 
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
     monkeypatch.setattr(repository, "record_catalog_snapshot", explode)
 
     status, document, stderr = run_main(authorized_argv(run_id), capture_env(), capsys)
@@ -911,7 +965,7 @@ def test_an_unexpected_exception_is_reduced_to_static_safe_output(monkeypatch, t
 
 def test_the_success_report_is_bounded_and_deterministic(wired, capsys, tmp_path):
     repository, _transport = wired
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
     report_path = tmp_path / "capture.json"
     argv = authorized_argv(run_id, **{"--report-path": str(report_path)})
 
@@ -959,7 +1013,7 @@ def test_the_report_carries_normalization_issues_and_never_a_raw_row(monkeypatch
     monkeypatch.setattr(entrypoint, "_open_transport",
                         lambda: FixtureTransport(bodies={0: whole_resource_page(hostile)}))
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
 
     status, document, stderr = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_OK, document
@@ -977,7 +1031,7 @@ def test_the_report_carries_normalization_issues_and_never_a_raw_row(monkeypatch
 
 def test_no_lease_material_or_url_reaches_stdout_stderr_or_the_report(wired, capsys, tmp_path):
     repository, _transport = wired
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
     report_path = tmp_path / "capture.json"
     argv = authorized_argv(run_id, **{"--report-path": str(report_path)})
 
@@ -1014,7 +1068,7 @@ def test_no_lease_material_or_url_reaches_stdout_stderr_or_the_report(wired, cap
 
 def test_a_report_path_is_the_only_file_written(wired, capsys, tmp_path):
     repository, _transport = wired
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
     status, _document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_OK
     assert list(tmp_path.iterdir()) == []
@@ -1022,7 +1076,7 @@ def test_a_report_path_is_the_only_file_written(wired, capsys, tmp_path):
 
 def test_an_unwritable_report_path_is_a_non_zero_outcome(wired, capsys, tmp_path):
     repository, _transport = wired
-    run_id = prepare_run(repository)
+    run_id = prepare_run(repository, capsys)
     argv = authorized_argv(run_id, **{"--report-path": str(tmp_path / "absent" / "r.json")})
     status = entrypoint.main(argv, env=capture_env())
     captured = capsys.readouterr()
@@ -1099,3 +1153,406 @@ def test_bounded_helpers_drop_what_they_cannot_read():
     assert entrypoint._identifiers(list(range(500)), limit=4) == ["0", "1", "2", "3"]
     assert entrypoint._identifiers("not a list", limit=4) == []
     assert entrypoint._text("x" * 500) == "x" * entrypoint.MAX_REPORT_TEXT_CHARS
+
+
+# =============================================================================
+# 5. the operator preparation seam, and the launch-vs-capture race
+#
+# This section is about LIFECYCLE SEMANTICS, not about the final state: every
+# test here reaches the state through the supported path and then interferes
+# with it, rather than constructing the state it wants to see. An earlier round
+# of this suite proved the capture worked over a run state nothing in the
+# repository could actually produce, which is exactly the gap these close.
+# =============================================================================
+
+class RecordingLauncher:
+    """A `JobLauncher` that records every call and launches nothing."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def launch(self, run_id: UUID) -> dict[str, str]:
+        self.calls.append(str(run_id))
+        return {"mode": "recording", "run_id": str(run_id)}
+
+
+def prepared(repository: MemoryRepository, capsys, **overrides: Any) -> tuple[UUID, dict]:
+    """Prepare a run and return `(run_id, the preparation document)`."""
+    conversation_id, user_id = seed_conversation(repository)
+    status = entrypoint.main(prepare_argv(conversation_id, user_id, **overrides),
+                             env=capture_env())
+    document = json.loads(capsys.readouterr().out)
+    assert status == entrypoint.EXIT_OK, document
+    return UUID(document["preparation"]["run_id"]), document
+
+
+# --- 1. a supported preparation path exists, and it launches nothing ---------
+
+def test_preparation_produces_a_capture_run_without_any_launcher(monkeypatch, repository,
+                                                                 capsys):
+    """The blocker this seam closes: before it, the required state was
+    reachable only by a manual row edit nothing in the repository supported."""
+    launcher = RecordingLauncher()
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: (_ for _ in ()).throw(
+        AssertionError("preparation constructed a network transport")))
+    monkeypatch.setattr(job_launcher_module, "build_job_launcher",
+                        lambda _settings: launcher)
+
+    run_id, document = prepared(repository, capsys)
+
+    assert document["status"] == "prepared"
+    assert document["reason_code"] == ""
+    assert document["preparation"]["already_prepared"] is False
+    assert document["preparation"]["launch_owner"] == "operator"
+    assert document["preparation"]["captured"] is False
+    # No launcher was built, let alone called.
+    assert launcher.calls == []
+
+    run = repository.runs[str(run_id)]
+    assert run["status"] == entrypoint.ELIGIBLE_RUN_STATUS
+    assert run["launch_state"] == entrypoint.OPERATOR_OWNED_LAUNCH_STATE
+    assert run["input"]["metadata"]["milo_operation"] == entrypoint.OPERATOR_CAPTURE_OPERATION
+    # Nothing was captured: no snapshot, no raw record, no candidate.
+    assert repository.catalog_snapshots == {} and repository.catalog_raw_records == {}
+    assert run.get("lease_token") is None
+
+
+def test_preparation_reports_only_the_run_identity(monkeypatch, repository, capsys):
+    """A preparation report is not a place to widen what is printed."""
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    conversation_id, user_id = seed_conversation(repository)
+    status = entrypoint.main(prepare_argv(conversation_id, user_id), env=capture_env())
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert status == entrypoint.EXIT_OK
+
+    assert set(document) == {"entrypoint", "status", "reason_code", "reason", "preparation"}
+    assert set(document["preparation"]) == {"run_id", "already_prepared", "launch_owner",
+                                            "captured"}
+    rendered = json.dumps(document) + captured.err
+    assert str(conversation_id) not in rendered
+    assert str(user_id) not in rendered
+    assert PROJECT_REF not in rendered
+    assert "lease_token" not in rendered and "worker_id" not in rendered
+
+
+def test_preparation_sends_no_government_request_and_reads_no_provider(monkeypatch,
+                                                                       repository, capsys):
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: (_ for _ in ()).throw(
+        AssertionError("preparation constructed a network transport")))
+    for name in ("MOONSHOT_API_KEY", "OPENAI_API_KEY", "MILO_PROVIDER_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    run_id, _ = prepared(repository, capsys)
+    assert run_id
+    # The construction seam for egress was never reached, and the module names
+    # no provider at all (asserted in section 0).
+    code = entrypoint_code()
+    prepare_body = code.split("def _prepare(")[1].split("\ndef ")[0]
+    assert "_open_transport" not in prepare_body
+    assert "JobLauncher" not in code and "build_job_launcher" not in code
+
+
+# --- 5. the launch CAS wins after the read, before ownership is acquired -----
+
+class LauncherStealsLaunchOwnership(MemoryRepository):
+    """The ordinary launch path wins the CAS the instant the run exists.
+
+    This is the exact interleaving the review named: the run is created, and
+    before the operator can take launch ownership, `try_acquire_launch` has
+    already moved it to `launching` for a real launcher.
+    """
+
+    def create_queued_run(self, conversation_id, user_message_id, content, metadata,
+                          requested_by=None, idempotency_key=None, request_fingerprint=None):
+        run = super().create_queued_run(conversation_id, user_message_id, content, metadata,
+                                        requested_by=requested_by,
+                                        idempotency_key=idempotency_key,
+                                        request_fingerprint=request_fingerprint)
+        # The ordinary path gets there first, through the same CAS.
+        assert super().try_acquire_launch(UUID(str(run["id"]))) is not None
+        return run
+
+
+def test_preparation_refuses_when_the_ordinary_launch_path_wins_the_cas(monkeypatch, capsys):
+    repository = LauncherStealsLaunchOwnership()
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: (_ for _ in ()).throw(
+        AssertionError("a refused preparation constructed a network transport")))
+    conversation_id, user_id = seed_conversation(repository)
+
+    status = entrypoint.main(prepare_argv(conversation_id, user_id), env=capture_env())
+    document = json.loads(capsys.readouterr().out)
+
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_LAUNCH_OWNERSHIP_LOST"
+    assert "preparation" not in document
+    # The run is left exactly as the launcher holds it: not stolen back.
+    run = next(iter(repository.runs.values()))
+    assert run["launch_state"] == "launching"
+    assert run.get("lease_token") is None
+    assert repository.catalog_snapshots == {}
+
+
+class LauncherStealsAfterTheRead(MemoryRepository):
+    """Launch ownership changes between the capture's read and its claim.
+
+    The capture's pre-claim read sees an operator-owned run; by the time the
+    lease is claimed, the run's launch state has moved. Only a check on the
+    row the CLAIM returned can see that.
+    """
+
+    def get_run(self, run_id, user_id=None):
+        run = super().get_run(run_id, user_id)
+        self.runs[str(run_id)]["launch_state"] = "launching"
+        return run
+
+
+def test_capture_refuses_when_ownership_changes_between_the_read_and_the_claim(
+        monkeypatch, transport, capsys):
+    repository = LauncherStealsAfterTheRead()
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
+    run_id = prepare_run(repository, capsys)
+
+    status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
+
+    assert status == entrypoint.EXIT_FAILED
+    assert document["reason_code"] == "CAPTURE_LAUNCH_OWNERSHIP_LOST"
+    # Nothing was captured and nothing was written.
+    assert transport.calls == []
+    assert repository.catalog_snapshots == {}
+    assert repository.catalog_raw_records == {}
+    assert "capture" not in document
+    assert repository.runs[str(run_id)]["status"] == "failed"
+
+
+# --- 6. operator ownership blocks the ordinary launch path -------------------
+
+def test_an_operator_owned_run_can_never_be_launched(monkeypatch, repository, capsys):
+    """Through the production call path, not through an assertion about it."""
+    from backend.auth import AuthenticatedUser
+    from backend.main import _create_and_launch_run
+
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    conversation_id, user_id = seed_conversation(repository)
+    key = "operator-capture-idempotency"
+    status = entrypoint.main(prepare_argv(conversation_id, user_id,
+                                          **{"--idempotency-key": key}), env=capture_env())
+    document = json.loads(capsys.readouterr().out)
+    assert status == entrypoint.EXIT_OK, document
+    run_id = UUID(document["preparation"]["run_id"])
+
+    # The CAS the ordinary launch path depends on now refuses this run.
+    assert repository.try_acquire_launch(run_id) is None
+
+    # And the ordinary route itself, reaching the very same run by its
+    # idempotency key, returns without ever invoking the launcher.
+    launcher = RecordingLauncher()
+    created = _create_and_launch_run(
+        repository, launcher, AuthenticatedUser(user_id=user_id), conversation_id,
+        entrypoint.PREPARED_RUN_CONTENT, {"milo_operation": "chat"}, key)
+
+    assert launcher.calls == []
+    assert str(created.run_id) == str(run_id)
+    run = repository.runs[str(run_id)]
+    assert run["launch_state"] == entrypoint.OPERATOR_OWNED_LAUNCH_STATE
+    assert run["status"] == entrypoint.ELIGIBLE_RUN_STATUS
+
+
+def test_the_legacy_launch_fallback_is_not_laxer_than_the_cas():
+    """`backend/main.py`'s non-CAS branch mirrors the acquirable set exactly.
+
+    A repository fake without `try_acquire_launch` must not be able to launch
+    a run the production CAS would refuse -- including an operator-owned one.
+    """
+    api = Path("backend/main.py").read_text(encoding="utf-8")
+    assert 'if run.get("launch_state") not in {None, "pending", "launch_failed"}:' in api
+    assert '{"launching", "launched"}' not in api
+    # The two sets agree: the fallback's allowed states are the CAS's.
+    assert entrypoint.LAUNCH_ACQUIRABLE_STATES == {"pending", "launch_failed"}
+    assert entrypoint.OPERATOR_OWNED_LAUNCH_STATE not in entrypoint.LAUNCH_ACQUIRABLE_STATES
+
+
+def test_the_operator_owned_state_is_one_the_product_never_writes():
+    """The state's whole value is that nothing else can produce it."""
+    api = Path("backend/main.py").read_text(encoding="utf-8")
+    written = set(re.findall(r'set_launch_state\(run_id, "([a-z_]+)"', api))
+    assert written == {"launching", "launched", "launch_failed", "launch_unknown"}
+    assert entrypoint.OPERATOR_OWNED_LAUNCH_STATE not in written
+    repository_source = Path("backend/repository/supabase.py").read_text(encoding="utf-8")
+    # Both creation paths insert the LAUNCHABLE state, never the operator one.
+    assert '"launch_state": "pending"' in repository_source
+    assert f'"launch_state": "{entrypoint.OPERATOR_OWNED_LAUNCH_STATE}"' not in repository_source
+
+
+# --- 7. preparation then capture reaches the authentic lease -----------------
+
+def test_preparation_then_capture_uses_the_authentic_claim_and_lease(monkeypatch, transport,
+                                                                     capsys):
+    repository = LeaseWatchingRepository()
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
+    run_id = prepare_run(repository, capsys)
+
+    status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
+    assert status == entrypoint.EXIT_OK, document
+
+    run = repository.runs[str(run_id)]
+    assert run["lease_token"] and run["worker_id"].startswith("operator-capture-")
+    assert repository.write_leases
+    for name, worker_id, attempt, lease_token in repository.write_leases:
+        assert (worker_id, attempt, lease_token) == (
+            run["worker_id"], int(run["attempt"]), run["lease_token"]), name
+    assert document["capture"]["snapshot"]["activated"] is True
+
+
+# --- 8. an interrupted preparation is fail-closed in both directions ---------
+
+class PreparationInterrupted(MemoryRepository):
+    """The process dies between winning the CAS and coming to rest."""
+
+    def set_launch_state(self, run_id, state, error=None):
+        raise AppError("REPOSITORY_ERROR", f"{SQL_SENTINEL} {SECRET_SENTINEL}", 502)
+
+
+def test_an_interrupted_preparation_is_neither_launchable_nor_capturable(monkeypatch,
+                                                                         transport, capsys):
+    repository = PreparationInterrupted()
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: transport)
+    conversation_id, user_id = seed_conversation(repository)
+
+    status = entrypoint.main(prepare_argv(conversation_id, user_id), env=capture_env())
+    captured = capsys.readouterr()
+    document = json.loads(captured.out)
+    assert status == entrypoint.EXIT_FAILED
+    assert document["reason_code"] == "CAPTURE_PREPARATION_FAILED"
+    rendered = json.dumps(document) + captured.err
+    assert SQL_SENTINEL not in rendered and SECRET_SENTINEL not in rendered
+
+    run_id = UUID(next(iter(repository.runs)))
+    run = repository.runs[str(run_id)]
+    # Stuck where the CAS left it: a launcher cannot acquire it...
+    assert run["launch_state"] == "launching"
+    assert repository.try_acquire_launch(run_id) is None
+    # ...and the capture refuses it, because the operator never took ownership.
+    status, refusal, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert refusal["reason_code"] == "CAPTURE_RUN_NOT_ELIGIBLE"
+    assert transport.calls == []
+    assert repository.catalog_snapshots == {}
+
+
+def test_a_refused_preparation_creates_no_run_at_all(monkeypatch, repository, capsys):
+    """A membership failure happens before anything is created."""
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    conversation_id, _user_id = seed_conversation(repository)
+    outsider = uuid4()
+
+    status = entrypoint.main(prepare_argv(conversation_id, outsider), env=capture_env())
+    document = json.loads(capsys.readouterr().out)
+
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_CONVERSATION_UNAVAILABLE"
+    assert repository.runs == {}
+    assert repository.messages == []
+
+
+# --- 9. replay of a preparation is defined and idempotent --------------------
+
+def test_replaying_a_preparation_returns_the_same_run_and_creates_no_second_one(
+        monkeypatch, repository, capsys):
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    conversation_id, user_id = seed_conversation(repository)
+    argv = prepare_argv(conversation_id, user_id,
+                        **{"--idempotency-key": "prepare-once"})
+
+    first_status = entrypoint.main(argv, env=capture_env())
+    first = json.loads(capsys.readouterr().out)
+    second_status = entrypoint.main(argv, env=capture_env())
+    second = json.loads(capsys.readouterr().out)
+
+    assert (first_status, second_status) == (entrypoint.EXIT_OK, entrypoint.EXIT_OK)
+    assert first["preparation"]["run_id"] == second["preparation"]["run_id"]
+    assert first["preparation"]["already_prepared"] is False
+    assert second["preparation"]["already_prepared"] is True
+    assert len(repository.runs) == 1
+    run = next(iter(repository.runs.values()))
+    assert run["launch_state"] == entrypoint.OPERATOR_OWNED_LAUNCH_STATE
+    assert run["status"] == entrypoint.ELIGIBLE_RUN_STATUS
+
+
+def test_preparation_without_an_idempotency_key_makes_a_distinct_run(monkeypatch, repository,
+                                                                     capsys):
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    first = prepare_run(repository, capsys)
+    second = prepare_run(repository, capsys)
+    assert first != second
+    assert len(repository.runs) == 2
+
+
+# --- the preparation gate refuses before anything is constructed -------------
+
+@pytest.mark.parametrize("override, expected", [
+    ({"--acknowledge-schema-report-reviewed": None},
+     "CAPTURE_SCHEMA_REPORT_NOT_ACKNOWLEDGED"),
+    ({"--acknowledge-schema-report-reviewed": "yes"},
+     "CAPTURE_SCHEMA_REPORT_NOT_ACKNOWLEDGED"),
+    ({"--project-ref": "another-project"}, "CAPTURE_PROJECT_MISMATCH"),
+    ({"--conversation-id": None}, "CAPTURE_CONVERSATION_IDENTITY_INVALID"),
+    ({"--conversation-id": "not-a-uuid"}, "CAPTURE_CONVERSATION_IDENTITY_INVALID"),
+    ({"--requested-by": None}, "CAPTURE_CONVERSATION_IDENTITY_INVALID"),
+    ({"--requested-by": "not-a-uuid"}, "CAPTURE_CONVERSATION_IDENTITY_INVALID"),
+])
+def test_preparation_refuses_before_constructing_anything(tripwire, capsys, override,
+                                                          expected):
+    argv = prepare_argv(uuid4(), uuid4(), **override)
+    status, document, _ = run_main(argv, capture_env(), capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == expected
+
+
+@pytest.mark.parametrize("value", [None, "", "false", "enabled", "1;true"])
+def test_preparation_honours_the_catalog_flag(tripwire, capsys, value):
+    env = capture_env()
+    if value is None:
+        env.pop("MILO_ENABLE_CATALOG_EXECUTION")
+    else:
+        env["MILO_ENABLE_CATALOG_EXECUTION"] = value
+    status, document, _ = run_main(prepare_argv(uuid4(), uuid4()), env, capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_CATALOG_EXECUTION_DISABLED"
+
+
+@pytest.mark.parametrize("value", sorted(TRUE_VALUES))
+def test_preparation_refuses_while_paid_execution_is_enabled(tripwire, capsys, value):
+    env = capture_env(MILO_ENABLE_PAID_EXECUTION=value)
+    status, document, _ = run_main(prepare_argv(uuid4(), uuid4()), env, capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_PAID_EXECUTION_ENABLED"
+
+
+@pytest.mark.parametrize("extra", [
+    ["--execute"],
+    ["--plan"],
+])
+def test_preparation_and_another_mode_together_refuse(tripwire, capsys, extra):
+    argv = prepare_argv(uuid4(), uuid4()) + extra
+    status, document, _ = run_main(argv, capture_env(), capsys)
+    assert status == entrypoint.EXIT_REFUSED
+    assert document["reason_code"] == "CAPTURE_MODE_CONTRADICTORY"
+
+
+def test_preparation_never_starts_a_capture(monkeypatch, repository, capsys):
+    """Preparing is not capturing: the two are separate invocations."""
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repository)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: (_ for _ in ()).throw(
+        AssertionError("preparation started a capture")))
+    run_id, document = prepared(repository, capsys)
+    assert document["preparation"]["captured"] is False
+    assert repository.catalog_snapshots == {}
+    assert repository.catalog_raw_records == {}
+    assert repository.catalog_candidates == {}
+    assert repository.runs[str(run_id)].get("lease_token") is None

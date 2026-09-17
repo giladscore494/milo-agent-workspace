@@ -1115,6 +1115,74 @@ def test_012_launch_cas_only_one_winner(ownership_db):
     assert len(winners) == 1, results
 
 
+def test_012_operator_owned_launch_state_is_unacquirable_by_the_launch_cas(ownership_db):
+    """CODE-1's operator ownership, proven against real PostgreSQL.
+
+    An operator capture run comes to rest in `launch_state = 'none'`. That is
+    the value migration 009 already defaults to and already constrains, so
+    nothing is invented here -- what matters is that the launch CAS in
+    `backend/main.py` (`launch_state in ('pending','launch_failed')`) can never
+    acquire it. If that were false, an ordinary `JobLauncher` could start a
+    model worker on a run the operator is capturing with.
+    """
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', "
+        f"""'{{"metadata": {{"milo_operation": "catalog.government.capture"}}}}'::jsonb, """
+        f"'none') returning id"
+    )
+    acquired = ownership_db.psql(
+        f"update public.runs set launch_state='launching' "
+        f"where id='{run_id}' and status='queued' "
+        "and launch_state in ('pending','launch_failed') returning id"
+    )
+    assert acquired.strip() == "", "the launch CAS acquired an operator-owned run"
+    assert ownership_db.psql(
+        f"select launch_state from public.runs where id='{run_id}'") == "none"
+
+
+def test_012_operator_preparation_and_launch_contend_at_one_cas(ownership_db):
+    """Exactly one winner, and the loser can never take it afterwards.
+
+    This is the atomic boundary CODE-1's `--prepare` competes at: several
+    ordinary launchers and one operator preparation all issue the SAME
+    single-statement CAS against one freshly created run. One wins. The
+    operator then rests the run in 'none', after which no further launcher --
+    winner or loser -- can acquire it.
+    """
+    import concurrent.futures
+
+    _seed_atomic_fixture(ownership_db)
+    run_id = ownership_db.psql(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'pending') returning id"
+    )
+
+    def acquire(_):
+        return ownership_db.psql(
+            f"update public.runs set launch_state='launching' "
+            f"where id='{run_id}' and status='queued' "
+            "and launch_state in ('pending','launch_failed') returning id"
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(acquire, range(6)))
+    winners = [row for row in results if row.strip()]
+    assert len(winners) == 1, results
+
+    # The winner is the operator: it rests the run in the unacquirable state.
+    ownership_db.psql(f"update public.runs set launch_state='none' where id='{run_id}'")
+    assert acquire(None).strip() == "", "a launcher acquired an operator-owned run"
+
+    # And a lease is still claimable by the operator afterwards: ownership of
+    # the LAUNCH and ownership of the LEASE are different boundaries, which is
+    # exactly why the launch one has to be settled first.
+    claimed = ownership_db.psql(
+        f"select launch_state from public.claim_run_lease('{run_id}', 'operator-capture', 300)")
+    assert claimed == "none"
+
+
 def test_012_lease_claim_single_holder_under_concurrency(ownership_db):
     import concurrent.futures
 

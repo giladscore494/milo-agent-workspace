@@ -143,7 +143,11 @@ Running it is its own step, after the flag stage above, and it needs:
 3. `MILO_ENABLE_PAID_EXECUTION` off — a capture requires no model spend and
    must not be bundled with one;
 4. a prepared operator capture run, because every durable catalog write is
-   lease-guarded.
+   lease-guarded. Preparing one is a supported, server-side, operator-only
+   command in the same entrypoint (`--prepare`); it takes atomic ownership of
+   the run's launch so no model worker can ever execute it, and it captures
+   nothing. **Preparing a run is not authorization to capture**, and capturing
+   is not authorization to run MILO against the result.
 
 The exact arguments, the prepared-run contract, the fixed resource and bounds,
 the sanitized report fields and the stop conditions are in
