@@ -1,0 +1,417 @@
+# Stage D expansion step 1 — PROPOSED authorization for one bounded paid run
+
+> ## STATUS: PROPOSED. NOT AUTHORIZED. NOT EXECUTED.
+>
+> **Nothing in this proposal has been executed against production.** No run
+> was created, no Worker execution was launched, no flag was changed, no
+> secret was bound, no probe job was created, no Cloud Run job or service
+> was mutated, and no database row was written, updated or deleted. Every
+> number in this document was obtained **read-only** on 2026-09-18.
+>
+> **Merging this PR authorizes nothing.** This document is a *request* for
+> one bounded paid production run, together with the toolkit that would
+> execute it. Running it requires a **fresh, explicit, separate operator
+> authorization**. Stage C passing does not supply that authorization: the
+> Stage C Attempt 7 authorization is **consumed**, and
+> [`STAGE_C_ACCEPTANCE.md`](STAGE_C_ACCEPTANCE.md) states in terms that
+> Stage D remains unauthorized.
+>
+> **This is not a record of a completed stage.** No acceptance record
+> exists for this stage and none may be written until the run has actually
+> happened and the executable gate has passed. The results tables below are
+> deliberately empty.
+
+- **Classification:** `REQUIRES_MANUAL_OPERATOR_CONFIGURATION`
+- **Toolkit:** [`scripts/release/stage-d/`](../../scripts/release/stage-d/)
+  (see its [`README.md`](../../scripts/release/stage-d/README.md))
+- **Executable safety proofs:** `tests/test_stage_d_toolkit.py`
+- **Runbook context:** [`STAGED_ACTIVATION.md`](STAGED_ACTIVATION.md), Stage D
+- **Pinned release:** `84cd8696119c24662a954d0f0e23195268dab23f`
+- **Production project / region:** `big-cabinet-457321-t7` / `us-central1`
+- **Proposed run identity:** `stage-d-expansion-1-20260918-01` (fresh; zero
+  pre-existing rows)
+
+## 1. What this expansion step is — and what it deliberately is not
+
+`STAGED_ACTIVATION.md` describes Stage D as gradual expansion whose steps
+"raise limits explicitly and individually — never all at once". **This
+first step raises no limit at all.**
+
+The only dimension it expands is *the number of authorized production runs*,
+by exactly one, at the current reviewed release. Every budget cap is held or
+**tightened** relative to Stage C. The provider envelope is **restored** to
+the Stage C Attempt 7 values, which is a tightening of what production
+carries today. Widening the allowlist, raising the daily budget, and adding
+projects are separate later steps and are **not** proposed here.
+
+| Dimension | Stage C (consumed) | This step |
+| --- | --- | --- |
+| Authorized paid runs | 1 (Attempt 7, spent) | exactly 1, new key |
+| Projects | 1 (`Stage C smoke`) | 1 (`stage-d-smoke`, new) |
+| Budget caps | baseline | **tightened, never raised** |
+| Provider envelope | concurrency 2 | concurrency 2 (**restores** the live drift to 8) |
+| Catalog execution | `false` throughout | `false` throughout |
+| Browser / Vercel execution surface | disabled | disabled |
+| Government capture | n/a | **never executed; invariant enforced** |
+
+Explicitly **out of scope**, and not authorized by this document: enabling
+`MILO_ENABLE_CATALOG_EXECUTION`; executing the prepared Government capture;
+enabling `GATEWAY_ALLOW_EXECUTION_ROUTES` or any browser execution surface;
+a second paid run; any change to the Stage C toolkit or its consumed
+constants.
+
+## 2. Discovered production baselines (read-only, 2026-09-18)
+
+Every pinned value was **measured**, not assumed. Method: the read-only
+Supabase production connection for database facts, and `gcloud … describe` /
+`… list` for Cloud Run, IAM and Secret Manager facts. No mutating command
+was issued.
+
+### 2.1 Database — `public.runs` holds exactly **7** rows
+
+| Run ID | Status | Idempotency key |
+| --- | --- | --- |
+| `37912575-f9ce-4437-893d-7dfa45c53aa9` | `failed` | `stage-c-smoke-0001` |
+| `8b4a4277-fdf0-41b2-8515-d7e1d50e441b` | `completed` | `stage-c-smoke-attempt-7-20260819` |
+| `0d44d491-bc40-404e-9642-a5b8f77f3441` | `cancelled` | `swarm-v2-smoke-20260824-04c1094` |
+| `986ac9ec-a423-4da7-81d3-4a84ffabc181` | `failed` | `swarm-v2-smoke-attempt-2-20260824-04c1094` |
+| `0b1b7329-3a88-4155-b422-5e89bf5e01bc` | `failed` | `swarm-v2-smoke-20260824-4fecdfe-01` |
+| `5bd80a2e-ae7b-4c8c-aa0d-624ec28931ec` | `completed` | `swarm-v2-smoke-20260825-4dbdcd6-01` |
+| `555101dc-46f6-4048-bd67-efccbc98f528` | `queued` | `catalog-government-capture-20260919-01` |
+
+Rows under the proposed key `stage-d-expansion-1-20260918-01`: **0**.
+
+### 2.2 Cloud Run — exactly **7** Worker executions, every one terminal, **0 active**
+
+`milo-agent-worker-mcfrx`, `-gggdc`, `-dk4xv`, `-gnj5d`, `-fvfcb`, `-2tckh`,
+`-bw8kj`.
+
+### 2.3 Runtime posture
+
+| Fact | Live value |
+| --- | --- |
+| Worker image | `…/milo-agent/worker:84cd8696119c24662a954d0f0e23195268dab23f` |
+| API image | `…/milo-agent/api:84cd8696119c24662a954d0f0e23195268dab23f` |
+| API URL / ready revision | `https://milo-agent-api-beplbca7yq-uc.a.run.app` / `milo-agent-api-00080-nm8` |
+| `MILO_ENABLE_RUN_CREATION` (API) | `false` |
+| `JOB_LAUNCHER` (API, Worker) | `disabled` |
+| `MILO_ENABLE_PAID_EXECUTION` (both) | `false` |
+| `MILO_ENABLE_PROPOSAL_MUTATIONS` / `_READS` / `_RUN_CANCELLATION` / `_EXECUTION_CONTROL` | `false` |
+| `MILO_ENABLE_CATALOG_EXECUTION` (both) | `false` |
+| `KIMI_API_KEY` / `MOONSHOT_API_KEY` bound to a runtime | **neither**, in any form |
+| `KIMI_API_KEY` secret accessor IAM | `milo-worker-runtime@…` only (exactly one binding) |
+| Worker job `roles/run.jobsExecutorWithOverrides` | `milo-api-runtime@…` only |
+| Worker job `timeoutSeconds` / `maxRetries` / `taskCount` | `3600` / `1` / `1` |
+| Cloud Run jobs present | `milo-agent-worker` only — **no stale probe jobs** |
+| `MILO_PROVIDER_MAX_CONCURRENCY` (Worker) | **`8`** — drift from the Attempt 7 value of `2` |
+
+**Both surfaces already serve the pinned release SHA**, so toolkit steps 1
+and 2 are expected to be idempotent no-ops that re-prove the pin rather than
+change anything.
+
+### 2.4 One drift found, and it is a tightening to fix
+
+The Worker carries `MILO_PROVIDER_MAX_CONCURRENCY=8`, introduced by the
+later swarm-v2 smoke work. Stage C Attempt 7 succeeded under `2`. This
+proposal restores `2`, and `verify_caps.py` refuses the run while the live
+value is anything else. Nothing else in the live posture deviates from what
+the proposal requires.
+
+### 2.5 Expected post-run baselines
+
+| Quantity | Before | After exactly one authorized run |
+| --- | --- | --- |
+| `public.runs` rows | **7** | exactly **8** |
+| Rows under `stage-d-expansion-1-20260918-01` | **0** | exactly **1** |
+| Visible Worker executions | **7**, all terminal, 0 active | exactly **8**, all terminal, 0 active |
+
+A count **below** a pinned baseline fails exactly like a count above it: a
+row or execution that vanished is as much a drift as one that appeared. No
+gate ever deletes or hides history to make an increment look right.
+
+## 3. Proposed caps — derived from Stage C Attempt 7 evidence
+
+### 3.1 The evidence base (read from production, read-only)
+
+Stage C Attempt 7, run `8b4a4277-fdf0-41b2-8515-d7e1d50e441b`, terminal
+`completed`, actually consumed:
+
+| Quantity | Observed |
+| --- | --- |
+| Model calls | **84** |
+| Input tokens | 277,882 |
+| Output tokens | 34,136 |
+| Total tokens | **312,018** |
+| Tracked `actual_cost` | **$0.252069** (unrounded reservations $0.2520692) |
+| `estimated_cost` | $1.68 (84 × $0.02) |
+| Agent steps | 32 |
+| Elapsed | 934.235 s |
+| Retries / backpressure events | 0 / 0 |
+| Reservations | 84, all settled, **0 dangling** |
+
+### 3.2 Derivation rule
+
+**Cap = the smallest round value ≥ 1.75 × the Attempt 7 observation, and
+never above the Stage C cap.** Two deliberate exceptions are documented
+below. Nothing is raised.
+
+| Variable | Stage C | A7 actual | **Stage D** | Change |
+| --- | --- | --- | --- | --- |
+| `MILO_MAX_MODEL_CALLS_PER_RUN` | 200 | 84 | **150** | −25% |
+| `MILO_MAX_INPUT_TOKENS_PER_RUN` | 700000 | 277,882 | **500000** | −29% |
+| `MILO_MAX_OUTPUT_TOKENS_PER_RUN` | 250000 | 34,136 | **120000** | −52% |
+| `MILO_MAX_TOTAL_TOKENS_PER_RUN` | 900000 | 312,018 | **600000** | −33% |
+| `MILO_MAX_ESTIMATED_COST_PER_RUN` | 4.00 | 1.68 | **3.00** | −25% |
+| `MILO_MAX_COST_PER_RUN` | 3.00 | 0.252069 | **1.00** | −67% |
+| `MILO_MAX_RUN_DURATION_SECONDS` | 3300 | 934.235 | **1800** | −45% |
+| `MILO_MAX_RETRIES` | 15 | 0 | **15** | **held — see below** |
+| `MILO_MAX_AGENT_STEPS` | 60 | 32 | **56** | −7% |
+| `MILO_MAX_CONCURRENT_RUNS_PER_USER` | 1 | — | **1** | held |
+| `MILO_MAX_CONCURRENT_RUNS_PER_PROJECT` | 1 | — | **1** | held |
+| `MILO_DAILY_USER_BUDGET` | 5.00 | — | **4.00** | −20% |
+| `MILO_DAILY_PROJECT_BUDGET` | 5.00 | — | **4.00** | −20% |
+| `MILO_ESTIMATED_COST_PER_CALL` | 0.02 | — | **0.02** | held (reservation size, not a limit) |
+
+### 3.3 The two documented exceptions
+
+**`MILO_MAX_OUTPUT_TOKENS_PER_RUN` keeps a 3.5× margin rather than 1.75×.**
+Output volume is the most variable dimension of the preserved pipeline
+(verifier chunks plus the Hebrew summary), and 34,136 is a single small
+observation. A 1.75× cap on it would be a likely false `budget_exhausted` —
+which would waste the one authorization and prove nothing. It is still a
+52% tightening.
+
+**`MILO_MAX_RETRIES` is held at 15, not tightened, although Attempt 7 used
+0.** Stage C Attempt 6 **FAILED at `RETRY_LIMIT_REACHED`** after repeated
+provider 429s. Fifteen retries *together with* the worker-only provider
+envelope is the pair that produced the successful Attempt 7. Tightening the
+retry allowance would reintroduce the Attempt 6 failure mode for no exposure
+benefit: the cost caps, not the retry count, bound spend.
+
+### 3.4 Structural invariants the numbers preserve
+
+- `MILO_MAX_ESTIMATED_COST_PER_RUN` = 150 × 0.02 = **3.00 exactly**, so the
+  estimated-cost ceiling admits exactly the 150 reservations the call cap
+  allows and not one more (`backend/budget.py` rejects when
+  `estimated_cost + estimated_cost_per_call > cap`).
+- `MILO_MAX_TOTAL_TOKENS_PER_RUN` (600000) sits just under input+output
+  (620000), so the joint ceiling binds first — the same relationship Stage C
+  used.
+- The daily budgets (4.00) stay **above** the 3.00 estimated-reservation
+  ceiling, so a daily budget can never fail the run before the per-run cap
+  does.
+- `MILO_MAX_RUN_DURATION_SECONDS` (1800) stays far below the Worker job's
+  `timeoutSeconds` of 3600.
+
+Each of these is asserted by a test in `tests/test_stage_d_toolkit.py`,
+including a per-cap assertion that **no Stage D cap exceeds its Stage C
+counterpart** and that no cap Stage C pinned has been silently dropped.
+
+### 3.5 Worker-only provider envelope (unchanged from Attempt 7)
+
+| Variable | Pinned | Tier 2 ceiling |
+| --- | --- | --- |
+| `MILO_PROVIDER_MAX_CONCURRENCY` | 2 (preserved V1 parallelism; no V2 concurrency) | 100 |
+| `MILO_PROVIDER_RPM_LIMIT` | 350 | 500 |
+| `MILO_PROVIDER_TPM_LIMIT` | 2400000 | 3,000,000 |
+| `MILO_PROVIDER_MAX_RATE_LIMIT_RETRIES` | 5 | — |
+| `MILO_PROVIDER_MAX_BACKPRESSURE_WAIT_SECONDS` | 240 | — |
+| `MILO_PROVIDER_BACKOFF_BASE_SECONDS` | 2 | — |
+| `MILO_PROVIDER_BACKOFF_MAX_SECONDS` | 30 | — |
+
+Applied to the **Worker only**; `verify_caps.py` fails on any
+`MILO_PROVIDER_*` variable found on the API. The Tier 2 confirmation
+authorizes no provider call.
+
+### 3.6 Cost ceiling — what $1.00 does and does not bound
+
+`MILO_MAX_COST_PER_RUN` bounds **tracked token-derived cost only**.
+Moonshot's `$web_search` builtin tool is billed per invocation, outside
+MILO's accounting, and never enters `actual_cost`, the reservation ledger or
+the daily budgets.
+
+| Component | Bound | Basis |
+| --- | --- | --- |
+| Token-billed (tracked) | ≤ $1.00 hard | tracker hard-stops at the cap; Attempt 7's comparable run cost $0.252069 |
+| Web-search tool fees (UNTRACKED) | ≤ $4.50 | ≤ 150 call rounds × ≤ 3 invocations × $0.01 (2× safety factor over the documented ≈$0.005 fee) |
+| **Conservative maximum total** | **≤ $5.50** | down from Stage C's ≤ $9.00 |
+
+Operator obligations no MILO cap can replace: verify the current
+per-invocation web-search fee in the Moonshot console **before** the run
+(recompute this table if it changed), and verify the **actual billed total**
+in the Moonshot console **after** the run.
+
+## 4. The prepared Government capture run — an invariant, never a Stage D run
+
+`555101dc-46f6-4048-bd67-efccbc98f528`
+(`catalog-government-capture-20260919-01`) is an operator-prepared capture
+run: `status=queued`, `launch_state=none`, `worker_id=NULL`,
+`started_at=NULL`, `attempt=1`, and **zero rows** in `run_events`,
+`run_usage_ledger`, `model_call_budget_reservations`, `worker_heartbeats`,
+`run_invocations`, `run_checkpoints` and `run_blackboards`. Its
+`input.metadata.milo_operation` is `catalog.government.capture`, the marker
+`operator_capture.py --prepare` writes.
+
+**Stage D never executes it, never claims it, and never counts it as
+authorization for a Government capture.** Preparing a run is not
+authorization to capture (`STAGED_ACTIVATION.md`), and this proposal does
+not become one.
+
+### 4.1 Why it is already unreachable — and why Stage D still proves it
+
+- `try_acquire_launch` (`backend/repository/supabase.py`) acquires only from
+  `launch_state` `pending` or `launch_failed`, so a run resting in `none`
+  can never be taken by the ordinary launcher.
+- The Worker resolves its target from the `RUN_ID` environment variable and
+  never polls for queued rows (`backend/worker/main.py` `resolve_run_id`),
+  so nothing sweeps it up.
+- `MILO_ENABLE_CATALOG_EXECUTION` stays `false`, so the Government tool is
+  not registered in any run.
+
+Stage D treats all three as **invariants to prove**, not assumptions.
+`probe_db.py` re-reads the row in `preflight`, in `evidence` and in a
+standalone `govcheck` mode, and fails closed unless it is still either
+*prepared* (`queued`/`none`) or *retired* (`cancelled`/`none`) with no
+worker, no lease, no start, `attempt = 1` and zero trace rows.
+`probe_gateway.py` refuses before any API call if the Stage D key or the run
+request would borrow the capture's identity, and `06-collect-evidence.sh`
+refuses to accept that run id at all.
+
+### 4.2 Two facts that argue for retiring it
+
+1. `claim_run_lease` (migration 012) predicates its CAS on status, worker
+   and lease expiry **only** — not on `launch_state`. A `queued` row is
+   therefore claimable by anything that calls the RPC with that run id. A
+   `cancelled` row is not: terminal states are outside that `WHERE` clause
+   entirely. Retiring converts a convention into an enforced database fact.
+2. `queued` is an **active** run state (`ACTIVE_RUN_STATES`), so the row
+   counts against `MILO_MAX_CONCURRENT_RUNS_PER_USER`/`_PER_PROJECT` = 1 for
+   its user and project indefinitely — a standing invitation for a future
+   operator to "clear it" in a hurry, unguarded.
+
+### 4.3 The reviewed resolution
+
+`scripts/release/stage-d/resolve-government-capture.sh`. Default mode is
+**read-only** and prints the exact SQL. Apply mode, behind the full
+protected operator guard (`--apply --environment production
+--expected-project … --expected-account … --expected-sha …
+--confirm-production-change` plus
+`MILO_OPERATOR_ACK=I_UNDERSTAND_THIS_CHANGES_PRODUCTION`), offers two
+reviewed outcomes:
+
+- **`retire`** (recommended) — two **guarded compare-and-set** statements in
+  **one transaction**, following the repository's own state machine
+  (`backend/runtime.py` `VALID_TRANSITIONS`: `queued →
+  cancellation_requested → cancelled`; a direct `queued → cancelled` is not
+  a supported transition and is deliberately not forged). Each statement
+  restates the full expected pre-state in its `WHERE` clause and asserts
+  `row_count = 1`; anything else raises and rolls the whole transaction
+  back, leaving the row untouched. Both steps share one transaction on
+  purpose: `claim_run_lease` **can** acquire from `cancellation_requested`,
+  so that intermediate state is never allowed to become externally visible.
+- **`leave-prepared`** — no database mutation; an audited operator decision
+  to leave the run prepared for a future capture under its own AUTH-1
+  authorization.
+
+There is **no unconditional `UPDATE`** anywhere, no run row is ever deleted,
+no other run is touched, and the capture is never executed. This is not
+merely asserted: `tests/test_stage_d_toolkit.py` **executes the emitted SQL
+against a real ephemeral PostgreSQL** with production's actual `runs`
+constraints and proves it applies exactly once, refuses and fully rolls back
+on twelve different drifted pre-states, leaves other rows untouched, and
+deletes nothing.
+
+## 5. Safety posture held throughout
+
+| Control | Posture |
+| --- | --- |
+| `MILO_ENABLE_CATALOG_EXECUTION` | `false` on both surfaces, verified before the run and restored by the lockdown |
+| Vercel / browser execution surface | untouched; `GATEWAY_ALLOW_EXECUTION_ROUTES` never enabled |
+| Run-creation caller | only `stage-d-gw-probe`, running as the operator-controlled approved gateway service account |
+| Authorized user/project | the dedicated `stage-d-smoke` identity; the setup probe refuses a forbidden project id or a non-`vehicle_catalog_v1` workflow key |
+| Provider secret | Worker-only, as a Secret Manager binding, never a literal, never on the API |
+| Paid-execution enforcement | the Worker alone; the API keeps `MILO_ENABLE_PAID_EXECUTION=false` |
+| Probe jobs | disposable, deleted by the lockdown and **proven absent** |
+| Kill switch | available at every step; the lockdown runs it and verifies every postcondition |
+
+## 6. Procedure (operator, manual, in order)
+
+| Step | Script | Mutates |
+| --- | --- | --- |
+| 0 | `resolve-government-capture.sh` | no by default; apply mode does one guarded CAS |
+| 1 | `01-build-images.sh` | registry only (expected no-op) |
+| 2 | `02-deploy-images.sh` | images only, flags off; gates before and after |
+| 3 | `03-enable-stage-d.md` (manual) → `03b-verify-stage-d-posture.sh` | flags, caps, envelope, secret binding |
+| 4 | `04-create-probes.sh` | creates 2 disposable jobs |
+| 5 | `05-execute-run.sh` | **the one run** |
+| 6 | `06-collect-evidence.sh` | no (executable acceptance gate) |
+| 7 | `07-post-run-lockdown.sh` | kill switch + probe deletion, both verified |
+| any | `kill-switch.sh` | immediate fail-closed |
+
+## 7. The evidence gate
+
+The run is acceptable **only** if `06-collect-evidence.sh` exits zero. It
+verifies: terminal state `completed`; `usage.model_calls > 0` with matching
+tokens and a non-empty reservation set; all three cost views (ledger,
+`run.usage`, unrounded reservations) within `MILO_MAX_COST_PER_RUN` with no
+rounding tolerance; every reservation settled with **zero dangling** and a
+one-to-one `call_seq` reconciliation against the ledger; at least one
+heartbeat matching the claiming worker and attempt; a real bounded lease;
+`attempt = 1`, `launch_state = launched`, exactly one `run_invocations` row;
+an idempotent replay returning the **same** run id with no new run and no
+new Worker execution; exactly **8** database rows and exactly **1** under
+the Stage D key; exactly **8** visible Worker executions, all terminal, zero
+active; the Government-capture invariant intact; and zero secret markers in
+database events and worker logs.
+
+Acceptance policy: **`completed` only**. `failed`, `cancelled`, `timed_out`,
+`budget_exhausted` and `partial_success` are controlled fail-closed
+terminals — they prove the safety rails held, but they FAIL this step.
+
+## 8. Remaining manual operator steps
+
+None of these can be performed by repository automation:
+
+1. **Grant the authorization.** A human operator must decide that this one
+   bounded paid run is authorized, and record that decision. Nothing in this
+   PR constitutes it.
+2. **Choose the Government-capture resolution** (`retire` or
+   `leave-prepared`) and run step 0 with the full operator guard.
+3. **Verify the current `$web_search` per-invocation fee** in the Moonshot
+   console before the run and recompute §3.6 if it changed.
+4. **Run steps 1–7** from an authenticated `gcloud` shell owning
+   `big-cabinet-457321-t7`. Step 3 is typed by hand: by policy no committed
+   script enables an execution flag.
+5. **Restore `MILO_PROVIDER_MAX_CONCURRENCY` to 2** as part of step 3; the
+   run is refused while the live value is 8.
+6. **Verify the actual billed total** (tokens *and* tool fees) in the
+   Moonshot console after the run.
+7. **Record the outcome** in §9 below — including a failure, if that is what
+   happens.
+
+## 9. Results — EMPTY (the run has not happened)
+
+| Field | Value |
+| --- | --- |
+| Authorization granted by / date | *(not granted)* |
+| Run ID | *(none — no run was created)* |
+| Worker execution name | *(none — no execution was launched)* |
+| Start / end time | *(n/a)* |
+| Model identifier | *(n/a)* |
+| Model calls / tokens / tracked cost | *(n/a)* |
+| Terminal state | *(n/a)* |
+| Evidence gate verdict | *(not run)* |
+| `MILO_ENABLE_CATALOG_EXECUTION` observed on the worker revision | *(n/a — expected `false`)* |
+| Government capture posture after the step | *(n/a — expected prepared or retired, never claimed)* |
+| Moonshot console billed total | *(n/a)* |
+| Post-run lockdown verdict | *(not run)* |
+| Operator identity | *(n/a)* |
+
+## 10. Verdict
+
+- **Stage D expansion step 1 is PROPOSED and UNAUTHORIZED.** It has not
+  been executed and this document records no outcome.
+- The toolkit, the caps, the baselines and the Government-capture
+  resolution are reviewable now; the run is not.
+- Merging this PR changes no production state and grants no authorization.
+  Stage C's consumed authorization and its retained toolkit are untouched.

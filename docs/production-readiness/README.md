@@ -28,6 +28,9 @@ this set wins and the older document carries an archive banner.
 | [ROLLBACK.md](ROLLBACK.md) | Forward-safe rollback for every component |
 | [FINAL_ACCEPTANCE.md](FINAL_ACCEPTANCE.md) | Phases 9–11 acceptance audit and classifications |
 | [STATUS.md](STATUS.md) | Live branch/PR/test status |
+| [STAGE_B_ACCEPTANCE.md](STAGE_B_ACCEPTANCE.md) | Stage B acceptance record |
+| [STAGE_C_ACCEPTANCE.md](STAGE_C_ACCEPTANCE.md) | Stage C acceptance record — **PASSED 2026-08-22; the one-run authorization is consumed** |
+| [STAGE_D_AUTHORIZATION.md](STAGE_D_AUTHORIZATION.md) | Stage D expansion step 1 — **PROPOSED authorization for one bounded paid run; NOT authorized and NOT executed** |
 | [../catalog-code1-operator-capture.md](../catalog-code1-operator-capture.md) | CODE-1: the guarded operator Government capture entrypoint — arguments, prerequisites, stop conditions, report contract and rollback. Implemented in code; **no live capture has been executed** |
 | [../roadmap/MILO_GAP_AUDIT_2026-09-16.md](../roadmap/MILO_GAP_AUDIT_2026-09-16.md) | Gap audit after Catalog PR3 / F4 / F5: what is production-connected, what exists but is not activated, what is fixture-only, and what remains missing |
 
