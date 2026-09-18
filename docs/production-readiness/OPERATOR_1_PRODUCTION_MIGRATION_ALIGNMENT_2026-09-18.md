@@ -264,14 +264,33 @@ Read-only inspection only. Nothing was remediated, and no change was made.
 | Public tables with RLS enabled | **36** |
 | Public tables with RLS disabled | **0** |
 | Materialized views | 0 |
-| Public objects granted to `anon`, `authenticated` or `PUBLIC` | **0** |
+| New `catalog_*` tables granted to `anon`, `authenticated` or `PUBLIC` | **0** |
 | Functions executable by `anon` that are not trigger functions | **0** |
 | Remote tables with no matching local migration | 0 |
 
-Every one of the eleven tables created by this tail has RLS enabled and
-carries **no table grant to any role at all**. They are reachable only by
+Every one of the eleven tables created by this tail has RLS enabled. The new
+`catalog_*` / service-only catalog tables carry **no grants to `anon`,
+`authenticated` or `PUBLIC`**. Trusted backend access remains through
 `service_role`, which bypasses RLS — the service-only posture established by
 `20260810000200_enable_rls_on_service_only_tables.sql`.
+
+This is intentionally narrower than a schema-wide "zero grants" claim.
+Pre-existing browser-facing tables retain limited DML grants to
+`authenticated`, constrained by their RLS policies:
+
+| Table | `authenticated` DML grants |
+| --- | --- |
+| `conversations` | `SELECT`, `INSERT` |
+| `messages` | `SELECT` |
+| `project_members` | `SELECT` |
+| `projects` | `SELECT` |
+| `run_events` | `SELECT` |
+| `runs` | `SELECT` |
+| `workflow_proposals` | `SELECT`, `INSERT` |
+
+`anon` has no browser-facing DML grant in this verified set. Pre-existing
+non-DML privileges such as `REFERENCES`, `TRIGGER` and `TRUNCATE` may exist on
+non-catalog objects and are not evidence of browser Data API access.
 
 ### Views
 
@@ -336,6 +355,11 @@ introduced or worsened by it.
    `006_deployment_hardening.sql`, is not referenced by any of the nine, and
    grants `SELECT` to neither `anon` nor `authenticated`, so it is not
    reachable by an untrusted role regardless.
+
+**Documentation correction:** the earlier blanket wording that no `public`
+object had grants to `anon`, `authenticated` or `PUBLIC` was over-generalized.
+The verified security invariant is the narrower service-only/catalog posture
+described above. No new OPERATOR-1 database regression was identified.
 
 No regression attributable to OPERATOR-1 was found.
 
