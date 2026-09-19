@@ -446,15 +446,38 @@ def forbidden_project_ids() -> set[str]:
     return {p.strip() for p in raw.split(",") if p.strip()}
 
 
-def setup() -> None:
-    """Create/reuse the DEDICATED Stage D test identity.
+#: The immutable configuration the Stage D project must carry. A reused
+#: project whose configuration differs is NOT the project this
+#: authorization describes, so it is refused rather than adopted.
+EXPECTED_PROJECT_CONFIGURATION = {"stage": "stage-d"}
 
-    Deliberately its own project: the Government capture's project and the
-    two smoke projects are on the forbidden list, because 'queued' is an
-    active run state and the prepared capture row would otherwise count
-    against MILO_MAX_CONCURRENT_RUNS_PER_PROJECT=1.
+#: Every run state that counts as ACTIVE for the concurrency caps
+#: (mirrors backend/repository/supabase.py ACTIVE_RUN_STATES).
+ACTIVE_RUN_STATES = ("queued", "launching", "starting", "running", "waiting", "cancellation_requested")
+
+
+def active_state_filter() -> str:
+    return "in.(" + ",".join(ACTIVE_RUN_STATES) + ")"
+
+
+def setup() -> None:
+    """Create/reuse the DEDICATED Stage D test identity, and PROVE it.
+
+    A reused project is never adopted on the strength of its slug. Every
+    property this authorization depends on is queried and proved:
+    the engine (workflow key), the immutable configuration, the exact
+    membership set, and zero active runs for BOTH the user and the
+    project. Any deviation fails closed rather than printing a claim.
+
+    The project is deliberately its own: the Government capture's project
+    and the prior smoke projects are on the forbidden list, because
+    'queued' is an active run state and the prepared capture row would
+    otherwise count against MILO_MAX_CONCURRENT_RUNS_PER_PROJECT=1.
     """
     forbidden = forbidden_project_ids()
+    problems: list[str] = []
+    evidence: dict = {}
+
     # 1. Operator-controlled test user (admin API; no password flow used).
     status, body = call("POST", "/auth/v1/admin/users", {"email": TEST_EMAIL, "email_confirm": True})
     if status in (200, 201):
@@ -466,6 +489,8 @@ def setup() -> None:
         if not matches:
             fail(f"test user creation failed (HTTP {status}) and no existing user found")
         user_id = matches[0]["id"]
+    evidence["user_id"] = user_id
+
     # 2. Dedicated project (only the test user will be a member).
     status, body = call(
         "POST",
@@ -475,30 +500,52 @@ def setup() -> None:
             "name": "Stage D smoke",
             "description": "Operator-controlled Stage D expansion-step project",
             "workflow_key": WORKFLOW_KEY,
-            "configuration": {"stage": "stage-d"},
+            "configuration": EXPECTED_PROJECT_CONFIGURATION,
         },
         headers={"Prefer": "return=representation"},
     )
-    if status == 201:
+    created = status == 201
+    if created:
         project = body[0]
     else:
-        status, rows = call("GET", f"/rest/v1/projects?slug=eq.{PROJECT_SLUG}&select=id,workflow_key")
+        status, rows = call(
+            "GET", f"/rest/v1/projects?slug=eq.{PROJECT_SLUG}&select=id,workflow_key,configuration")
         if status != 200 or not rows:
             fail(f"project create/lookup failed (HTTP {status})")
         project = rows[0]
     project_id = project["id"]
-    # 2a. Fail closed if this resolved to a project Stage D must never use,
-    # or to one whose engine is not the pipeline the caps were derived from.
+    evidence["project_id"] = project_id
+    evidence["project_created"] = created
+
+    # 2a. The project must not be one Stage D may never use.
     if project_id in forbidden:
         fail(
             f"resolved project {project_id} is on the Stage D forbidden list — it is the Government "
             "capture's project or a prior smoke project; refusing to create the run there"
         )
+    # 2b. The engine must be the pipeline the caps were derived from.
+    evidence["workflow_key"] = project.get("workflow_key")
     if str(project.get("workflow_key")) != WORKFLOW_KEY:
-        fail(
+        problems.append(
             f"project {project_id} has workflow_key {project.get('workflow_key')!r}, expected {WORKFLOW_KEY!r} — "
-            "the Stage D caps are derived from Stage C Attempt 7 evidence for that pipeline; failing closed"
+            "the Stage D caps are derived from Stage C Attempt 7 evidence for that pipeline"
         )
+    # 2c. The configuration must be the expected immutable value. A reused
+    # project carrying something else is a different project wearing the
+    # same slug.
+    configuration = project.get("configuration")
+    if isinstance(configuration, str):
+        try:
+            configuration = json.loads(configuration)
+        except json.JSONDecodeError:
+            configuration = None
+    evidence["configuration"] = configuration
+    if configuration != EXPECTED_PROJECT_CONFIGURATION:
+        problems.append(
+            f"project {project_id} configuration is {configuration!r}, expected "
+            f"{EXPECTED_PROJECT_CONFIGURATION!r} — refusing to adopt a project this authorization does not describe"
+        )
+
     # 3. Membership (idempotent upsert).
     status, _ = call(
         "POST",
@@ -508,6 +555,24 @@ def setup() -> None:
     )
     if status not in (200, 201):
         fail(f"membership upsert failed (HTTP {status})")
+
+    # 3a. PROVE the membership set — do not print a claim. Exactly one
+    # member, and it must be the dedicated test user. Any other member
+    # could create a run in this project and break the one-run guarantee.
+    members = fetch_rows(
+        f"/rest/v1/project_members?project_id=eq.{project_id}&select=user_id,role",
+        "project_members", problems)
+    if members is None:
+        members = []
+        problems.append("membership set could not be read — failing closed")
+    member_ids = sorted({str(m.get("user_id")) for m in members})
+    evidence["members"] = member_ids
+    if member_ids != [str(user_id)]:
+        problems.append(
+            f"project {project_id} membership is {member_ids}, expected exactly [{str(user_id)!r}] — "
+            "another member could create a run and break the one-run guarantee"
+        )
+
     # 4. Conversation (reuse if present).
     status, rows = call("GET", f"/rest/v1/conversations?project_id=eq.{project_id}&select=id&limit=1")
     if status == 200 and rows:
@@ -522,30 +587,59 @@ def setup() -> None:
         if status != 201:
             fail(f"conversation creation failed (HTTP {status})")
         conversation_id = body[0]["id"]
-    # 5. The concurrency caps are 1 per user AND 1 per project. Prove the
-    # dedicated identity currently has zero active runs, so the authorized
-    # run cannot be refused by its own cap.
-    active_states = "(queued,launching,starting,running,waiting,cancellation_requested)"
-    active = count_exact(
-        f"/rest/v1/runs?select=id&requested_by=eq.{user_id}&status=in.{active_states}"
-    )
-    if active is None:
-        fail("exact active-run count for the Stage D test user unavailable — failing closed")
-    if active != 0:
-        fail(
-            f"the Stage D test user already has {active} active run(s); "
+    evidence["conversation_id"] = conversation_id
+
+    # 5. Zero active runs for the USER *and* for the PROJECT. The
+    # concurrency caps are 1 per user AND 1 per project, so an active run
+    # under either would refuse the authorized run — and would mean this
+    # is not the exclusive identity the authorization assumes.
+    active_filter = active_state_filter()
+    user_active = count_exact(
+        f"/rest/v1/runs?select=id&requested_by=eq.{user_id}&status={active_filter}")
+    evidence["active_runs_for_user"] = user_active
+    if user_active is None:
+        problems.append("exact active-run count for the Stage D test user unavailable — failing closed")
+    elif user_active != 0:
+        problems.append(
+            f"the Stage D test user already has {user_active} active run(s); "
             "MILO_MAX_CONCURRENT_RUNS_PER_USER=1 would refuse the authorized run"
         )
-    print(json.dumps({
+
+    # Project-scoped active runs: runs reach a project through their
+    # conversation, so resolve the project's conversations first rather
+    # than relying on an embedded-resource filter.
+    project_conversations = fetch_rows(
+        f"/rest/v1/conversations?project_id=eq.{project_id}&select=id&limit=1000",
+        "conversations", problems)
+    if project_conversations is None:
+        problems.append("the project's conversations could not be read — failing closed")
+    else:
+        conversation_ids = [str(row.get("id")) for row in project_conversations if row.get("id")]
+        evidence["project_conversations"] = len(conversation_ids)
+        if conversation_ids:
+            joined = ",".join(conversation_ids)
+            project_active = count_exact(
+                f"/rest/v1/runs?select=id&conversation_id=in.({joined})&status={active_filter}")
+            evidence["active_runs_for_project"] = project_active
+            if project_active is None:
+                problems.append("exact active-run count for the Stage D project unavailable — failing closed")
+            elif project_active != 0:
+                problems.append(
+                    f"the Stage D project already has {project_active} active run(s); "
+                    "MILO_MAX_CONCURRENT_RUNS_PER_PROJECT=1 would refuse the authorized run"
+                )
+        else:
+            evidence["active_runs_for_project"] = 0
+
+    evidence.update({
         "stage_d_probe": "setup",
-        "ok": True,
-        "user_id": user_id,
-        "project_id": project_id,
-        "conversation_id": conversation_id,
-        "workflow_key": WORKFLOW_KEY,
-        "active_runs_for_user": active,
-        "members": "test user only",
-    }))
+        "workflow_key_expected": WORKFLOW_KEY,
+        "problems": problems,
+        "ok": not problems,
+    })
+    print(json.dumps(evidence, default=str))
+    if problems:
+        sys.exit(1)
 
 
 SECRET_MARKERS = ("sk-", "KIMI_API_KEY", "MOONSHOT_API_KEY", "service_role", "sb_secret")

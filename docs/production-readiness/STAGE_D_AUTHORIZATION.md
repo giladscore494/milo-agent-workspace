@@ -90,8 +90,10 @@ Rows under the proposed key `stage-d-expansion-1-20260918-01`: **0**.
 
 | Fact | Live value |
 | --- | --- |
-| Worker image | `…/milo-agent/worker:84cd8696119c24662a954d0f0e23195268dab23f` |
-| API image | `…/milo-agent/api:84cd8696119c24662a954d0f0e23195268dab23f` |
+| API image digest (accepted) | `sha256:04275e81995d7bbaf23d0e71e71c2ac83adf37f45eca8686ddb812050a18caa6` |
+| Worker image digest (accepted) | `sha256:d3743e5a8dabc3f663970abe83886ea91b030ad7b339e1178d0ab5efad8f64b5` |
+| Serving API revision runs the accepted API digest | yes (`milo-agent-api-00080-nm8`) |
+| Worker job image reference | the **mutable tag** `:84cd8696…`, which currently resolves to the accepted digest |
 | API URL / ready revision | `https://milo-agent-api-beplbca7yq-uc.a.run.app` / `milo-agent-api-00080-nm8` |
 | `MILO_ENABLE_RUN_CREATION` (API) | `false` |
 | `JOB_LAUNCHER` (API, Worker) | `disabled` |
@@ -105,9 +107,8 @@ Rows under the proposed key `stage-d-expansion-1-20260918-01`: **0**.
 | Cloud Run jobs present | `milo-agent-worker` only — **no stale probe jobs** |
 | `MILO_PROVIDER_MAX_CONCURRENCY` (Worker) | **`8`** — drift from the Attempt 7 value of `2` |
 
-**Both surfaces already serve the pinned release SHA**, so toolkit steps 1
-and 2 are expected to be idempotent no-ops that re-prove the pin rather than
-change anything.
+**Both surfaces already serve the accepted release**, so Stage D neither
+builds nor deploys anything — see §2.6.
 
 ### 2.4 One drift found, and it is a tightening to fix
 
@@ -128,6 +129,57 @@ the proposal requires.
 A count **below** a pinned baseline fails exactly like a count above it: a
 row or execution that vanished is as much a drift as one that appeared. No
 gate ever deletes or hides history to make an increment look right.
+
+### 2.6 Why Stage D verifies digests and never rebuilds
+
+An earlier revision of this proposal carried a build step and a deploy
+step, described as idempotent no-ops that would "re-prove" the pinned
+release. **That was wrong and has been removed.** Rebuilding this release
+is not byte-reproducible:
+
+- `Dockerfile.api` and `Dockerfile.worker` both start `FROM
+  python:3.12-slim`, a **mutable** upstream tag that is re-published;
+- `backend/requirements.txt` pins most packages but carries
+  `openai>=1.30.0`, an **unpinned floor** that resolves to whatever is
+  newest at build time;
+- there is no lockfile and no `--require-hashes`, so transitive
+  dependencies float as well.
+
+A rebuild of commit `84cd8696…` can therefore produce different image
+bytes. Pushed under the same `:<sha>` Artifact Registry tag, those bytes
+would **replace** the accepted, Stage-A-accepted image — while every
+tag-based check continued to report success. A rebuild is a new release
+wearing the old label, and "re-proving" a release by rebuilding it proves
+nothing.
+
+So the accepted release is identified by **digest**:
+
+| Image | Accepted digest |
+| --- | --- |
+| api | `sha256:04275e81995d7bbaf23d0e71e71c2ac83adf37f45eca8686ddb812050a18caa6` |
+| worker | `sha256:d3743e5a8dabc3f663970abe83886ea91b030ad7b339e1178d0ab5efad8f64b5` |
+
+`01-verify-release-images.sh` and `verify_images.py` verify, read-only,
+that the registry tag still resolves to those digests, that the immutable
+serving API revision runs the API digest, and that the Worker job
+resolves to the Worker digest. **A tag match alone is never acceptance,
+and a digest mismatch blocks Stage D** — it means production is no longer
+serving the accepted release, which requires a separate reviewed release.
+Nothing in the toolkit rebuilds, pushes, deploys or moves a tag.
+
+**This risk is already realised in this project.** A Cloud Run *service*
+resolves the tag once, at revision creation, and the revision is
+immutable — which is why the API check is strong. A Cloud Run *job* is
+not a revision: its template holds the tag and resolves it afresh at
+**every execution**. The Worker tag has already resolved to several
+distinct digests over this project's history — Worker execution
+`milo-agent-worker-bw8kj` (2026-08-24) ran
+`sha256:2314852868a8…`, which is not the accepted digest. The Worker
+check is therefore point-in-time, and the toolkit says so and closes the
+window: `05-execute-run.sh` re-verifies immediately before run creation,
+and the evidence gate verifies the digest the authorized execution
+**actually ran**, read off the execution record itself, where a tag moved
+afterwards cannot hide it.
 
 ## 3. Proposed caps — derived from Stage C Attempt 7 evidence
 
@@ -223,23 +275,69 @@ Applied to the **Worker only**; `verify_caps.py` fails on any
 `MILO_PROVIDER_*` variable found on the API. The Tier 2 confirmation
 authorizes no provider call.
 
-### 3.6 Cost ceiling — what $1.00 does and does not bound
+### 3.6 Cost ceiling — what the caps bound, and what they do NOT
 
-`MILO_MAX_COST_PER_RUN` bounds **tracked token-derived cost only**.
-Moonshot's `$web_search` builtin tool is billed per invocation, outside
-MILO's accounting, and never enters `actual_cost`, the reservation ledger or
-the daily budgets.
+There are two different kinds of spend here, and only one of them is
+capped by anything in this repository.
+
+**Tracked, token-derived cost — HARD-CAPPED at $1.00.**
+`MILO_MAX_COST_PER_RUN` is enforced by `backend/budget.py` before every
+model call and is verified after the run against three independent views
+(the per-row-rounded ledger total, the `run.usage` snapshot and the
+unrounded reservation total). Attempt 7's comparable run cost $0.252069.
+This is a real ceiling.
+
+**Provider-side `$web_search` tool fees — NOT CAPPED BY MILO AT ALL.**
+Moonshot bills the builtin `$web_search` tool per invocation, separately
+from tokens. Those charges never enter `actual_cost`, the reservation
+ledger or the daily budgets, and **no MILO cap bounds the number of
+invocations.**
+
+An earlier revision of this proposal claimed a conservative total
+exposure of "≤ $5.50", derived from an assumed maximum of three search
+invocations per model response. **That claim was wrong and has been
+withdrawn.** The assumption is not established by the provider
+documentation and is not enforced by the runtime:
+
+- `backend/engines/vehicle_catalog_v1/core.py` bounds the number of
+  tool-echo *rounds* per model call at `MAX_TOOL_ROUNDS = 15`;
+- within each round it iterates **every** entry of
+  `message.tool_calls` (`core.py:554` and `core.py:601`) and echoes each
+  one back. The number of `tool_calls` in a single response is chosen by
+  the provider and is **not bounded by the runtime**;
+- so the per-run invocation count is `rounds × tool_calls_per_round`, and
+  only the first factor has a ceiling. There is no arithmetic that turns
+  that into a dollar bound.
+
+**Current official provider pricing (verify before authorizing).** Kimi's
+documentation currently states **$0.005 per legacy `$web_search` call**,
+and states that the legacy `$web_search` tool is **retired on
+2026-10-20**. Both figures are the provider's and must be re-checked
+against the console immediately before the run — this document is not a
+pricing source, and the retirement date falls close enough to this
+proposal to matter.
 
 | Component | Bound | Basis |
 | --- | --- | --- |
-| Token-billed (tracked) | ≤ $1.00 hard | tracker hard-stops at the cap; Attempt 7's comparable run cost $0.252069 |
-| Web-search tool fees (UNTRACKED) | ≤ $4.50 | ≤ 150 call rounds × ≤ 3 invocations × $0.01 (2× safety factor over the documented ≈$0.005 fee) |
-| **Conservative maximum total** | **≤ $5.50** | down from Stage C's ≤ $9.00 |
+| Token-billed (tracked) | **≤ $1.00, hard** | enforced by the budget tracker and verified three ways after the run |
+| `$web_search` tool fees (untracked) | **UNBOUNDED by MILO** | billed per invocation at the provider's stated $0.005; invocations per run are not capped by the runtime |
+| Total | **not bounded by this repository** | see the mandatory control below |
 
-Operator obligations no MILO cap can replace: verify the current
-per-invocation web-search fee in the Moonshot console **before** the run
-(recompute this table if it changed), and verify the **actual billed total**
-in the Moonshot console **after** the run.
+**Mandatory control before authorization.** Because the repository cannot
+bound the second row, the bound must come from the provider account. A
+**verified hard spending/wallet ceiling on the Moonshot account** is a
+**prerequisite** of this authorization, not an optional precaution. The
+operator must confirm the configured ceiling, and its value, before
+granting the authorization, and record it in §9.
+
+**No runtime change is proposed here.** Adding an enforceable
+per-run web-search invocation cap would mean changing
+`backend/engines/vehicle_catalog_v1/core.py` — that is a runtime change
+to the preserved pipeline, it would invalidate the pinned accepted image
+digests, and it must be proposed and reviewed as its own release. It is
+deliberately **not** bundled into this authorization request. Until such
+a cap exists, the provider-account ceiling is the only enforceable bound
+on tool-fee exposure.
 
 ## 4. The prepared Government capture run — an invariant, never a Stage D run
 
@@ -339,14 +437,23 @@ deletes nothing.
 | Step | Script | Mutates |
 | --- | --- | --- |
 | 0 | `resolve-government-capture.sh` | no by default; apply mode does one guarded CAS |
-| 1 | `01-build-images.sh` | registry only (expected no-op) |
-| 2 | `02-deploy-images.sh` | images only, flags off; gates before and after |
+| 1 | `01-verify-release-images.sh` | **no** — digest verification only |
+| 2 | `02-guarded-run.md` (one pasteable manual block) | drives 3–7 under an armed cleanup trap |
 | 3 | `03-enable-stage-d.md` (manual) → `03b-verify-stage-d-posture.sh` | flags, caps, envelope, secret binding |
 | 4 | `04-create-probes.sh` | creates 2 disposable jobs |
 | 5 | `05-execute-run.sh` | **the one run** |
 | 6 | `06-collect-evidence.sh` | no (executable acceptance gate) |
-| 7 | `07-post-run-lockdown.sh` | kill switch + probe deletion, both verified |
+| 7 | `07-post-run-lockdown.sh` | kill switch + capture proof + probe deletion, all verified |
 | any | `kill-switch.sh` | immediate fail-closed |
+
+Steps 3–7 are driven by the single guarded block in step 2. Its cleanup
+trap is armed **before the first mutation** and fires on `EXIT`, `ERR`,
+`INT` and `TERM`, so every exit path — success, failure, a failed enable
+command, a half-created probe pair, Ctrl-C during the poll — ends with
+the kill switch applied and both probe jobs deleted **and proven absent**.
+The run id and working directory are persisted to `state.json` as they
+come into existence, so neither the evidence gate nor the cleanup depends
+on an operator copying an id out of a terminal.
 
 ## 7. The evidence gate
 
@@ -361,8 +468,9 @@ heartbeat matching the claiming worker and attempt; a real bounded lease;
 an idempotent replay returning the **same** run id with no new run and no
 new Worker execution; exactly **8** database rows and exactly **1** under
 the Stage D key; exactly **8** visible Worker executions, all terminal, zero
-active; the Government-capture invariant intact; and zero secret markers in
-database events and worker logs.
+active; **the digest the authorized execution actually ran equals the
+accepted Worker digest**; the Government-capture invariant intact; and zero
+secret markers in database events and worker logs.
 
 Acceptance policy: **`completed` only**. `failed`, `cancelled`, `timed_out`,
 `budget_exhausted` and `partial_success` are controlled fail-closed
@@ -377,8 +485,12 @@ None of these can be performed by repository automation:
    PR constitutes it.
 2. **Choose the Government-capture resolution** (`retire` or
    `leave-prepared`) and run step 0 with the full operator guard.
-3. **Verify the current `$web_search` per-invocation fee** in the Moonshot
-   console before the run and recompute §3.6 if it changed.
+3. **Verify a hard provider-account spending/wallet ceiling is configured**
+   on the Moonshot account, and record its value. This is a PREREQUISITE,
+   not a precaution: MILO caps tracked token cost only, and nothing in
+   this repository bounds `$web_search` tool fees (§3.6). Also re-check
+   the current per-invocation fee (officially $0.005) and the announced
+   2026-10-20 retirement of the legacy `$web_search` tool.
 4. **Run steps 1–7** from an authenticated `gcloud` shell owning
    `big-cabinet-457321-t7`. Step 3 is typed by hand: by policy no committed
    script enables an execution flag.
@@ -403,6 +515,7 @@ None of these can be performed by repository automation:
 | Evidence gate verdict | *(not run)* |
 | `MILO_ENABLE_CATALOG_EXECUTION` observed on the worker revision | *(n/a — expected `false`)* |
 | Government capture posture after the step | *(n/a — expected prepared or retired, never claimed)* |
+| Provider-account spending/wallet ceiling (value, verified by) | *(not verified — required before authorization)* |
 | Moonshot console billed total | *(n/a)* |
 | Post-run lockdown verdict | *(not run)* |
 | Operator identity | *(n/a)* |

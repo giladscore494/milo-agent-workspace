@@ -16,19 +16,34 @@
 #   - tracked cost <= configured cap; token/call caps respected;
 #   - post-completion idempotent replay returns the same run;
 #   - the prepared Government capture run is STILL untouched;
+#   - the authorized Worker execution RAN the accepted release digest;
 #   - zero secret-marker hits (DB events AND worker logs).
-# Usage: ./06-collect-evidence.sh <RUN_ID>
-#   (set STAGE_D_WORKDIR to the directory 05-execute-run.sh printed, so the
-#    replay reuses the same test identity)
+# Usage: STAGE_D_WORKDIR=<dir> ./06-collect-evidence.sh [RUN_ID]
+#   STAGE_D_WORKDIR is the directory 05-execute-run.sh printed. The run id
+#   is read from its state.json, so it never has to be copied by hand; an
+#   explicit argument is accepted only if it AGREES with that record.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck source=stage-d-env.sh
 source ./stage-d-env.sh
 
-RUN_ID="${1:?usage: 06-collect-evidence.sh <RUN_ID>}"
-STAGE_D_WORKDIR="${STAGE_D_WORKDIR:?STAGE_D_WORKDIR must point at the directory 05-execute-run.sh printed (it holds setup.log)}"
+STAGE_D_WORKDIR="${STAGE_D_WORKDIR:?STAGE_D_WORKDIR must point at the directory 05-execute-run.sh printed (it holds state.json and setup.log)}"
 test -r "${STAGE_D_WORKDIR}/setup.log" \
   || { echo "STAGE D REFUSED: ${STAGE_D_WORKDIR}/setup.log is missing — the replay cannot reuse the authorized test identity; failing closed" >&2; exit 1; }
+
+# The run id comes from the machine-readable state 05-execute-run.sh wrote,
+# so the gate can never be pointed at a mistyped or stale id. An explicit
+# argument is still accepted, but it must AGREE with the recorded state.
+RECORDED_RUN_ID="$(python3 ./state_file.py "${STAGE_D_WORKDIR}/state.json" read run_id)"
+RUN_ID="${1:-${RECORDED_RUN_ID}}"
+if [ -z "${RUN_ID}" ]; then
+  echo "STAGE D REFUSED: no run id — ${STAGE_D_WORKDIR}/state.json records none and none was given; failing closed" >&2
+  exit 1
+fi
+if [ -n "${RECORDED_RUN_ID}" ] && [ "${RUN_ID}" != "${RECORDED_RUN_ID}" ]; then
+  echo "STAGE D REFUSED: the run id given (${RUN_ID}) disagrees with the recorded authorized run (${RECORDED_RUN_ID}); failing closed" >&2
+  exit 1
+fi
 
 # The gate must never be pointed at the prepared Government capture run.
 if [ "${RUN_ID}" = "${STAGE_D_GOV_CAPTURE_RUN_ID}" ]; then
@@ -222,7 +237,48 @@ gcloud run jobs executions list --job="${STAGE_D_WORKER_JOB}" \
   | python3 ./verify_executions.py --expected-total "${expected_total_executions}" \
   || fail "worker execution posture is not exactly ${expected_total_executions} terminal executions (pinned baseline ${STAGE_D_EXPECTED_PRIOR_EXECUTIONS} + the one authorized Stage D launch)"
 
-echo "== 4. Worker log secret-marker scan (counts only; no values printed)"
+echo "== 4. The authorized execution must have RUN the accepted release digest"
+# The strongest image proof available: a Cloud Run execution records the
+# digest it resolved, so this cannot be invalidated by the tag moving
+# afterwards. It closes the window left by the job template referencing a
+# mutable tag.
+exec_registry_json="$(mktemp)"; exec_api_json="$(mktemp)"
+exec_api_rev_json="$(mktemp)"; exec_job_json="$(mktemp)"; exec_exec_json="$(mktemp)"
+trap 'rm -f "${exec_registry_json}" "${exec_api_json}" "${exec_api_rev_json}" "${exec_job_json}" "${exec_exec_json}"' EXIT
+latest_execution="$(gcloud run jobs describe "${STAGE_D_WORKER_JOB}" \
+  --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" \
+  --format='value(status.latestCreatedExecution.name)')" || latest_execution=""
+test -n "${latest_execution}" \
+  || fail "could not establish the latest Worker execution name — the digest it ran cannot be proved"
+gcloud run jobs executions describe "${latest_execution}" \
+  --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" --format=json > "${exec_exec_json}"
+gcloud artifacts docker images list "${STAGE_D_REGISTRY}" \
+  --project="${STAGE_D_PROJECT}" --include-tags \
+  --filter="tags:${STAGE_D_RELEASE_SHA}" --format=json > "${exec_registry_json}"
+gcloud run services describe "${STAGE_D_API_SERVICE}" \
+  --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" --format=json > "${exec_api_json}"
+exec_ready_revision="$(python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    status = json.load(fh).get("status") or {}
+name = status.get("latestReadyRevisionName") or ""
+if not name:
+    raise SystemExit("the API service has no latest ready revision")
+print(name)
+' "${exec_api_json}")" || fail "could not establish the serving API revision"
+gcloud run revisions describe "${exec_ready_revision}" \
+  --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" --format=json > "${exec_api_rev_json}"
+gcloud run jobs describe "${STAGE_D_WORKER_JOB}" \
+  --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" --format=json > "${exec_job_json}"
+python3 ./verify_images.py \
+  --registry-json "${exec_registry_json}" \
+  --api-service-json "${exec_api_json}" \
+  --api-revision-json "${exec_api_rev_json}" \
+  --worker-job-json "${exec_job_json}" \
+  --execution-json "${exec_exec_json}" \
+  || fail "the authorized Worker execution ${latest_execution} did not run the accepted release digest"
+
+echo "== 5. Worker log secret-marker scan (counts only; no values printed)"
 hits="$(gcloud logging read \
   "resource.type=cloud_run_job AND resource.labels.job_name=${STAGE_D_WORKER_JOB}" \
   --project="${STAGE_D_PROJECT}" --format='json(textPayload,jsonPayload)' --limit=5000 \

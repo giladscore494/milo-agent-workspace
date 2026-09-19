@@ -38,17 +38,53 @@ stage_d_pin() { # VAR AUTHORIZED_VALUE — export VAR, failing closed on conflic
 # The one authorized production target and release.
 #
 # STAGE_D_RELEASE_SHA is the reviewed main commit that production ALREADY
-# serves on both surfaces (verified read-only 2026-09-18: worker image
-# .../worker:84cd8696…, API image .../api:84cd8696…). It is deliberately
-# NOT the merge commit of this preparation PR: pinning the pin's own merge
-# would be self-referential and would ship runtime code that was
-# unreviewed at pin time.
+# serves on both surfaces. It names the release; the digests below ARE the
+# release. Stage D verifies both and builds neither. The SHA is
+# deliberately NOT the merge commit of this preparation PR: pinning the
+# pin's own merge would be self-referential and would ship runtime code
+# that was unreviewed at pin time.
 # ---------------------------------------------------------------------------
 stage_d_pin STAGE_D_PROJECT "big-cabinet-457321-t7"
 stage_d_pin STAGE_D_REGION "us-central1"
 stage_d_pin STAGE_D_RELEASE_SHA "84cd8696119c24662a954d0f0e23195268dab23f"
-stage_d_pin STAGE_D_REPO_URL "https://github.com/giladscore494/milo-agent-workspace.git"
 stage_d_pin STAGE_D_REGISTRY "us-central1-docker.pkg.dev/${STAGE_D_PROJECT}/milo-agent"
+
+# ---------------------------------------------------------------------------
+# The IMMUTABLE accepted image digests — the real identity of the release.
+#
+# Stage D NEVER rebuilds and NEVER redeploys. It verifies these digests
+# read-only and BLOCKS on any mismatch, because a rebuild of the same Git
+# SHA is NOT guaranteed to reproduce the same image bytes in this
+# repository:
+#
+#   * Dockerfile.api and Dockerfile.worker both start FROM the MUTABLE base
+#     tag `python:3.12-slim`, which upstream re-publishes;
+#   * backend/requirements.txt pins most packages but carries
+#     `openai>=1.30.0`, an unpinned floor that resolves to whatever is
+#     newest at build time;
+#   * there is no lockfile and no --require-hashes, so transitive
+#     dependencies float too.
+#
+# So `docker build` at commit 84cd8696… today can produce different bytes
+# than the accepted build did, and pushing them would silently move the
+# mutable Artifact Registry tag `:84cd8696…` onto a DIFFERENT image while
+# every tag-based check still "passed". This is not hypothetical here: the
+# Worker tag has already resolved to several distinct digests over this
+# project's history (e.g. execution milo-agent-worker-bw8kj ran
+# sha256:2314852868a8…, which is NOT the digest below).
+#
+# A tag match is therefore NOT acceptance. The digest is.
+#
+# Verified read-only against Artifact Registry on 2026-09-18: the tag
+# 84cd8696119c24662a954d0f0e23195268dab23f currently resolves to exactly
+# these digests, and the serving API revision milo-agent-api-00080-nm8
+# runs the pinned API digest.
+#
+# Changing either digest is a NEW RELEASE and requires its own review. It
+# is never a Stage D action.
+# ---------------------------------------------------------------------------
+stage_d_pin STAGE_D_API_IMAGE_DIGEST "sha256:04275e81995d7bbaf23d0e71e71c2ac83adf37f45eca8686ddb812050a18caa6"
+stage_d_pin STAGE_D_WORKER_IMAGE_DIGEST "sha256:d3743e5a8dabc3f663970abe83886ea91b030ad7b339e1178d0ab5efad8f64b5"
 stage_d_pin STAGE_D_API_SERVICE "milo-agent-api"
 stage_d_pin STAGE_D_WORKER_JOB "milo-agent-worker"
 stage_d_pin STAGE_D_API_SA "milo-api-runtime@${STAGE_D_PROJECT}.iam.gserviceaccount.com"
@@ -124,6 +160,14 @@ stage_d_pin STAGE_D_ACCEPTABLE_TERMINAL_STATES "completed"
 # ---------------------------------------------------------------------------
 stage_d_pin STAGE_D_GOV_CAPTURE_RUN_ID "555101dc-46f6-4048-bd67-efccbc98f528"
 stage_d_pin STAGE_D_GOV_CAPTURE_KEY "catalog-government-capture-20260919-01"
+# The rest of that row's identity, verified read-only 2026-09-18. The
+# retirement transaction asserts ALL of it — id, key, the operator-capture
+# marker, the owning conversation and the requesting user — before it
+# changes anything, so a row that merely shares the id cannot be retired
+# by mistake.
+stage_d_pin STAGE_D_GOV_CAPTURE_OPERATION "catalog.government.capture"
+stage_d_pin STAGE_D_GOV_CAPTURE_CONVERSATION_ID "79ee2539-511c-4485-b470-c5539a22eba8"
+stage_d_pin STAGE_D_GOV_CAPTURE_REQUESTED_BY "35e3c271-e2f0-44f1-b69a-066f13121e56"
 
 # ---------------------------------------------------------------------------
 # The dedicated Stage D test identity.

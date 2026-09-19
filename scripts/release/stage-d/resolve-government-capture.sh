@@ -14,10 +14,14 @@
 #   * It NEVER executes, launches, claims or resumes the capture. It makes
 #     no outbound Government request, constructs no transport, and touches
 #     no catalog table. `MILO_ENABLE_CATALOG_EXECUTION` stays false.
-#   * It NEVER issues an unconditional UPDATE. Every write carries the full
-#     expected pre-state in its WHERE clause and asserts an affected-row
-#     count of exactly 1; anything else raises and rolls the transaction
-#     back, leaving the row untouched.
+#   * It NEVER issues an unconditional UPDATE. The transaction first asserts
+#     the COMPLETE invariant — run id, idempotency key, the operator-capture
+#     metadata marker, the owning conversation, the requesting user, the
+#     queued/none/unclaimed/unstarted posture, attempt 1, and ZERO rows in
+#     all seven execution-trace tables — and every write then carries that
+#     same pre-state in its WHERE clause and asserts an affected-row count of
+#     exactly 1. Anything else raises and rolls the whole transaction back,
+#     leaving the row untouched.
 #   * It NEVER deletes a run row, and it never touches any run other than
 #     the one pinned id.
 #
@@ -64,6 +68,9 @@ source "${SCRIPT_DIR}/stage-d-env.sh"
 
 RUN_ID="${STAGE_D_GOV_CAPTURE_RUN_ID}"
 CAPTURE_KEY="${STAGE_D_GOV_CAPTURE_KEY}"
+CAPTURE_OPERATION="${STAGE_D_GOV_CAPTURE_OPERATION}"
+CAPTURE_CONVERSATION_ID="${STAGE_D_GOV_CAPTURE_CONVERSATION_ID}"
+CAPTURE_REQUESTED_BY="${STAGE_D_GOV_CAPTURE_REQUESTED_BY}"
 
 usage() {
   cat << 'EOF'
@@ -155,16 +162,68 @@ begin;
 do \$\$
 declare
   v_rows integer;
+  v_traces integer;
 begin
+  -- ------------------------------------------------------------------
+  -- Step 0: assert the COMPLETE invariant, inside the transaction and
+  -- before anything changes. A row that merely shares the primary key is
+  -- not the prepared capture: the identity is the id AND the idempotency
+  -- key AND the operator-capture metadata marker AND the owning
+  -- conversation AND the requesting user AND the untouched posture.
+  -- ------------------------------------------------------------------
+  select count(*) into v_rows
+    from public.runs
+   where id                                    = '${RUN_ID}'::uuid
+     and idempotency_key                       = '${CAPTURE_KEY}'
+     and input->'metadata'->>'milo_operation'  = '${CAPTURE_OPERATION}'
+     and conversation_id                       = '${CAPTURE_CONVERSATION_ID}'::uuid
+     and requested_by                          = '${CAPTURE_REQUESTED_BY}'::uuid
+     and status                                = 'queued'
+     and launch_state                          = 'none'
+     and worker_id                             is null
+     and lease_token                           is null
+     and lease_expires_at                      is null
+     and started_at                            is null
+     and finished_at                           is null
+     and attempt                               = 1;
+  if v_rows <> 1 then
+    raise exception
+      'STAGE_D_GOV_GUARD_IDENTITY: the prepared-capture identity/posture invariant matched % rows, expected exactly 1 — rolling back, the run is unchanged', v_rows;
+  end if;
+
+  -- Step 0b: the capture must never have EXECUTED. A single row in any
+  -- of the seven trace tables means a worker touched it, and retiring it
+  -- would then be destroying evidence rather than closing an unused
+  -- preparation. Counted inside the transaction so a concurrent write
+  -- cannot slip between the check and the transition.
+  select
+      (select count(*) from public.run_events                   where run_id = '${RUN_ID}'::uuid)
+    + (select count(*) from public.run_usage_ledger             where run_id = '${RUN_ID}'::uuid)
+    + (select count(*) from public.model_call_budget_reservations where run_id = '${RUN_ID}'::uuid)
+    + (select count(*) from public.worker_heartbeats            where run_id = '${RUN_ID}'::uuid)
+    + (select count(*) from public.run_invocations              where run_id = '${RUN_ID}'::uuid)
+    + (select count(*) from public.run_checkpoints              where run_id = '${RUN_ID}'::uuid)
+    + (select count(*) from public.run_blackboards              where run_id = '${RUN_ID}'::uuid)
+    into v_traces;
+  if v_traces <> 0 then
+    raise exception
+      'STAGE_D_GOV_GUARD_TRACE: the capture run has % execution trace row(s) across run_events/run_usage_ledger/model_call_budget_reservations/worker_heartbeats/run_invocations/run_checkpoints/run_blackboards — it was EXECUTED; rolling back, the run is unchanged', v_traces;
+  end if;
+
+  -- ------------------------------------------------------------------
   -- Step 1 (supported transition queued -> cancellation_requested).
-  -- Guarded on the FULL prepared pre-state: identity, never-launched,
-  -- never-claimed, never-started.
+  -- Guarded again on the FULL prepared pre-state, so the transition is
+  -- atomic with its own precondition rather than trusting step 0.
+  -- ------------------------------------------------------------------
   update public.runs set
     status                    = 'cancellation_requested',
     cancellation_requested_at = now(),
     cancellation_reason       = '${CANCELLATION_REASON}'
   where id              = '${RUN_ID}'::uuid
     and idempotency_key = '${CAPTURE_KEY}'
+    and input->'metadata'->>'milo_operation' = '${CAPTURE_OPERATION}'
+    and conversation_id = '${CAPTURE_CONVERSATION_ID}'::uuid
+    and requested_by    = '${CAPTURE_REQUESTED_BY}'::uuid
     and status          = 'queued'
     and launch_state    = 'none'
     and worker_id       is null
@@ -179,10 +238,12 @@ begin
       'STAGE_D_GOV_GUARD_1: expected exactly 1 row in the prepared pre-state, matched % — rolling back, the run is unchanged', v_rows;
   end if;
 
+  -- ------------------------------------------------------------------
   -- Step 2 (supported transition cancellation_requested -> cancelled).
   -- Re-guarded on never-claimed. 'cancelled' is terminal and therefore
-  -- outside claim_run_lease's acquirable set: after this the run can never
-  -- be claimed by any worker.
+  -- outside claim_run_lease's acquirable set: after this the run can
+  -- never be claimed by any worker.
+  -- ------------------------------------------------------------------
   update public.runs set
     status      = 'cancelled',
     finished_at = now()

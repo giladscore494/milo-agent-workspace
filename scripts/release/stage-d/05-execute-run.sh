@@ -24,9 +24,21 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck source=stage-d-env.sh
 source ./stage-d-env.sh
 
+# The working directory is the machine-readable handoff between this step,
+# the evidence gate and the cleanup trap. Nothing downstream may depend on
+# an operator copying an id out of a terminal.
 STAGE_D_WORKDIR="${STAGE_D_WORKDIR:-$(mktemp -d)}"
 mkdir -p "${STAGE_D_WORKDIR}"
+STAGE_D_STATE_FILE="${STAGE_D_WORKDIR}/state.json"
 echo "Stage D working directory: ${STAGE_D_WORKDIR}"
+
+# write_state KEY VALUE — merge one key into state.json atomically.
+write_state() {
+  python3 ./state_file.py "${STAGE_D_STATE_FILE}" write "$1" "$2"
+}
+
+write_state stage_d_workdir "${STAGE_D_WORKDIR}"
+write_state idempotency_key "${STAGE_D_IDEMPOTENCY_KEY}"
 
 fail() { echo "STAGE D FAIL: $1"; echo "Operator action: ./kill-switch.sh, then record the failure in docs/production-readiness/STAGE_D_AUTHORIZATION.md."; exit 1; }
 
@@ -83,7 +95,7 @@ for record in json.load(sys.stdin):
 '
 }
 
-echo "== 1. Launch invariants (images, exact caps + worker provider envelope, IAM, exact terminal execution baseline)"
+echo "== 1. Launch invariants (accepted release DIGESTS, exact caps + worker provider envelope, IAM, exact terminal execution baseline)"
 # Exactly the pinned live executions, every one terminal, zero active.
 # More or fewer executions than the baseline, any active execution, or an
 # unparseable listing fails closed BEFORE run creation — this proves the
@@ -95,11 +107,38 @@ gcloud run jobs executions list --job="${STAGE_D_WORKER_JOB}" \
   || fail "worker execution posture does not match the pinned live baseline (expected exactly ${STAGE_D_EXPECTED_PRIOR_EXECUTIONS} terminal executions, zero active) — an unexpected or active execution blocks the run"
 
 worker_json="$(mktemp)"; api_json="$(mktemp)"
-trap 'rm -f "${worker_json}" "${api_json}"' EXIT
+registry_json="$(mktemp)"; api_revision_json="$(mktemp)"
+trap 'rm -f "${worker_json}" "${api_json}" "${registry_json}" "${api_revision_json}"' EXIT
 gcloud run jobs describe "${STAGE_D_WORKER_JOB}" \
   --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" --format=json > "${worker_json}"
 gcloud run services describe "${STAGE_D_API_SERVICE}" \
   --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" --format=json > "${api_json}"
+
+# Re-verify the ACCEPTED RELEASE DIGESTS immediately before run creation.
+# Step 1 proved them, but the Worker job may reference a mutable tag that
+# Cloud Run resolves afresh at every execution, so the proof is repeated
+# at the last possible moment. Stage D never rebuilds or re-tags: a
+# mismatch here means the accepted release is gone and the run is refused.
+gcloud artifacts docker images list "${STAGE_D_REGISTRY}" \
+  --project="${STAGE_D_PROJECT}" --include-tags \
+  --filter="tags:${STAGE_D_RELEASE_SHA}" --format=json > "${registry_json}"
+ready_revision="$(python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    status = json.load(fh).get("status") or {}
+name = status.get("latestReadyRevisionName") or ""
+if not name:
+    raise SystemExit("the API service has no latest ready revision")
+print(name)
+' "${api_json}")" || fail "could not establish the serving API revision"
+gcloud run revisions describe "${ready_revision}" \
+  --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" --format=json > "${api_revision_json}"
+python3 ./verify_images.py \
+  --registry-json "${registry_json}" \
+  --api-service-json "${api_json}" \
+  --api-revision-json "${api_revision_json}" \
+  --worker-job-json "${worker_json}" \
+  || fail "accepted release digests no longer match — do NOT create the run; this requires a separate reviewed release"
 # Every Stage D cap compared against the exact expected value from
 # stage-d-env.sh, on worker AND API, and every worker-only provider limit
 # (STAGE_D_WORKER_PROVIDER_LIMITS) exact on the Worker, immediately before
@@ -133,6 +172,8 @@ run_probe "${STAGE_D_DB_PROBE_JOB}" "STAGE_D_MODE=setup" \
 grep -q '"ok": true' "${STAGE_D_WORKDIR}/setup.log" || fail "test-data setup failed (see log above)"
 USER_ID="$(python3 -c 'import json,sys;print(json.loads(open(sys.argv[1]).readlines()[-1])["user_id"])' "${STAGE_D_WORKDIR}/setup.log")"
 CONVERSATION_ID="$(python3 -c 'import json,sys;print(json.loads(open(sys.argv[1]).readlines()[-1])["conversation_id"])' "${STAGE_D_WORKDIR}/setup.log")"
+write_state user_id "${USER_ID}"
+write_state conversation_id "${CONVERSATION_ID}"
 echo "test user=${USER_ID} conversation=${CONVERSATION_ID}"
 
 echo "== 3. Create the ONE run (with immediate idempotent replay)"
@@ -143,6 +184,9 @@ run_probe "${STAGE_D_GW_PROBE_JOB}" \
   "STAGE_D_GOV_CAPTURE_KEY=${STAGE_D_GOV_CAPTURE_KEY}" \
   | tee "${STAGE_D_WORKDIR}/create.log"
 RUN_ID="$(python3 -c 'import json,sys;print(json.loads(open(sys.argv[1]).readlines()[-1])["run_id"])' "${STAGE_D_WORKDIR}/create.log")"
+# Persisted BEFORE the poll: a cleanup triggered mid-run must still be
+# able to name the run that was created.
+write_state run_id "${RUN_ID}"
 echo "RUN_ID=${RUN_ID}"
 test "${RUN_ID}" != "${STAGE_D_GOV_CAPTURE_RUN_ID}" \
   || fail "run creation returned the prepared Government capture run id — Stage D never executes the capture"
@@ -183,5 +227,6 @@ fi
 
 echo
 echo "Run ${RUN_ID} reached an ACCEPTABLE terminal state."
-echo "Next (mandatory acceptance gate):"
-echo "  STAGE_D_WORKDIR=${STAGE_D_WORKDIR} ./06-collect-evidence.sh ${RUN_ID}"
+echo "Next (mandatory acceptance gate) — the run id is read from state.json,"
+echo "so it never has to be copied by hand:"
+echo "  STAGE_D_WORKDIR=${STAGE_D_WORKDIR} ./06-collect-evidence.sh"

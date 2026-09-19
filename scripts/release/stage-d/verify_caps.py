@@ -17,10 +17,10 @@ the later swarm-v2 smoke work), while the pinned Stage D envelope is the
 Attempt 7 value of 2. This module is what refuses the run until the
 operator has actually restored it.
 
-Also verifies both surfaces run the pinned release images (the
-production-image blocker: Stage D must serve the exact
-STAGE_D_RELEASE_SHA runtime images before enabling any execution
-surface), the exact flag posture, and the provider-secret posture: the
+Also verifies both surfaces reference the accepted release (by pinned
+digest or by the pinned release tag — verify_images.py is the authority
+on whether a tag still resolves to the accepted digest), the exact flag
+posture, and the provider-secret posture: the
 Worker holds KIMI_API_KEY only as a Secret Manager binding (never a
 literal value) and the API holds neither KIMI_API_KEY nor
 MOONSHOT_API_KEY in any form. Error messages name variables only — secret
@@ -34,7 +34,8 @@ Usage:
     gcloud run services describe <api> --format=json
 
 Env (all exported by stage-d-env.sh): STAGE_D_CAPS,
-STAGE_D_WORKER_PROVIDER_LIMITS, STAGE_D_REGISTRY, STAGE_D_RELEASE_SHA.
+STAGE_D_WORKER_PROVIDER_LIMITS, STAGE_D_REGISTRY, STAGE_D_RELEASE_SHA,
+STAGE_D_API_IMAGE_DIGEST, STAGE_D_WORKER_IMAGE_DIGEST.
 Exit 0 only if every check passes.
 """
 
@@ -178,8 +179,14 @@ def main() -> int:
 
     registry = os.environ.get("STAGE_D_REGISTRY", "")
     release_sha = os.environ.get("STAGE_D_RELEASE_SHA", "")
+    api_digest = os.environ.get("STAGE_D_API_IMAGE_DIGEST", "")
+    worker_digest = os.environ.get("STAGE_D_WORKER_IMAGE_DIGEST", "")
     if not registry or not release_sha:
         problems.append("STAGE_D_REGISTRY / STAGE_D_RELEASE_SHA not set — cannot verify release images; failing closed")
+    if not api_digest or not worker_digest:
+        problems.append(
+            "STAGE_D_API_IMAGE_DIGEST / STAGE_D_WORKER_IMAGE_DIGEST not set — the accepted release is identified "
+            "by DIGEST, not by tag; failing closed")
 
     with open(args.worker_json, encoding="utf-8") as fh:
         worker = container_of(json.load(fh), "worker")
@@ -189,16 +196,26 @@ def main() -> int:
     worker_env, worker_secrets = env_of(worker)
     api_env, api_secrets = env_of(api)
 
-    # Production-image blocker: both surfaces MUST run the pinned release
-    # images (the exact STAGE_D_RELEASE_SHA runtime commit) before any
-    # execution surface is enabled.
-    if registry and release_sha:
-        expected_worker_image = f"{registry}/worker:{release_sha}"
-        expected_api_image = f"{registry}/api:{release_sha}"
-        if worker.get("image") != expected_worker_image:
-            problems.append(f"worker: image {worker.get('image')!r} is not the signed-off release {expected_worker_image!r}")
-        if api.get("image") != expected_api_image:
-            problems.append(f"api: image {api.get('image')!r} is not the signed-off release {expected_api_image!r}")
+    # Production-image blocker: both surfaces MUST reference the accepted
+    # release before any execution surface is enabled.
+    #
+    # Accepted forms are the pinned DIGEST (`repo@sha256:…`, strongest) or
+    # the pinned release tag (`repo:<sha>`). A tag reference is accepted
+    # here only as a reference; whether that tag still RESOLVES to the
+    # accepted digest is decided by verify_images.py, which 01 and 05 both
+    # run — a tag match alone is never acceptance.
+    if registry and release_sha and api_digest and worker_digest:
+        for surface, spec, repo, digest in (
+            ("worker", worker, f"{registry}/worker", worker_digest),
+            ("api", api, f"{registry}/api", api_digest),
+        ):
+            image = spec.get("image")
+            if not isinstance(image, str) or not image:
+                problems.append(f"{surface}: image reference is missing — failing closed")
+            elif image not in (f"{repo}:{release_sha}", f"{repo}@{digest}"):
+                problems.append(
+                    f"{surface}: image {image!r} is neither the accepted release digest {repo}@{digest} "
+                    f"nor the pinned release tag {repo}:{release_sha}")
 
     # Exact cap values on BOTH surfaces.
     check_caps("worker", worker_env, caps, problems)
@@ -245,7 +262,7 @@ def main() -> int:
     print(
         f"OK: all {len(caps)} caps exact on worker+api, "
         f"all {len(provider_limits)} provider limits exact on worker only, "
-        f"release images {release_sha[:12]}… deployed, flag posture correct"
+        f"release {release_sha[:12]}… referenced, flag posture correct"
     )
     return 0
 

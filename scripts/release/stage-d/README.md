@@ -50,8 +50,8 @@ Everything the gates pin was measured, not assumed.
 | `public.runs` rows | **7** | exactly **8** |
 | Rows under the Stage D key `stage-d-expansion-1-20260918-01` | **0** | exactly **1** |
 | Visible Worker executions | **7**, every one terminal, **0 active** | exactly **8**, every one terminal |
-| Worker image | `…/worker:84cd8696…` (already the pinned release) | unchanged |
-| API image | `…/api:84cd8696…` (already the pinned release) | unchanged |
+| API image digest | `sha256:04275e81…` (accepted; serving revision runs it) | unchanged — never rebuilt |
+| Worker image digest | `sha256:d3743e5a…` (accepted; tag resolves to it) | unchanged — never rebuilt |
 | API `MILO_ENABLE_RUN_CREATION` / `JOB_LAUNCHER` | `false` / `disabled` | restored to `false` / `disabled` |
 | Worker + API `MILO_ENABLE_PAID_EXECUTION` | `false` | restored to `false` |
 | Worker + API `MILO_ENABLE_CATALOG_EXECUTION` | `false` | **`false` throughout** |
@@ -117,14 +117,52 @@ identity is read-only in production by design; these steps are why.
 | Step | Script | Mutates | Purpose |
 | --- | --- | --- | --- |
 | 0 | `resolve-government-capture.sh` (read-only by default) | no (apply mode: one guarded CAS) | resolve the unused prepared capture run — retire it, or record an audited leave-prepared decision |
-| 1 | `01-build-images.sh` | registry only | build `api`+`worker` at the pinned SHA via Cloud Build (public repo cloned at the exact commit, SHA verified in-build). Expected to be a no-op: production already serves that SHA |
-| 2 | `02-deploy-images.sh` | worker job, API service | deploy the release images, **flags unchanged/off**; verifies the exact execution baseline and the fail-closed posture **before** any mutation and again after |
-| 3 | `03-enable-stage-d.md` (**manual commands** — by policy no committed script enables an execution flag) then `03b-verify-stage-d-posture.sh` (read-only) | worker job, API service | strict caps; worker: paid flag on + `KIMI_API_KEY` binding + the pinned worker-only provider envelope; API: launcher + run creation on, **no** `MILO_PROVIDER_*` |
-| 4 | `04-create-probes.sh` | creates 2 disposable jobs | `stage-d-db-probe` (as `milo-api-runtime@`; DB checks/setup/evidence) and `stage-d-gw-probe` (as `milo-vercel-gateway@`; drives the API). Probe sources ship as deterministic gzip+base64, size- and delimiter-checked before any gcloud call |
-| 5 | `05-execute-run.sh` | one run | re-verifies every launch invariant, runs the DB preflight (baseline + fresh key + Government-capture invariant) and setup, creates exactly ONE run through API → launcher → worker → provider → Supabase, and polls; exits non-zero (kill switch!) on any terminal state outside the acceptance policy |
-| 6 | `06-collect-evidence.sh` | no | **executable acceptance gate** — exits non-zero unless every criterion holds |
-| 7 | `07-post-run-lockdown.sh` | worker job, API service, deletes probes | immediate lockdown: runs the kill switch, deletes both probes and **proves they are absent**, re-checks the capture invariant |
+| 1 | `01-verify-release-images.sh` | **no** | prove, BY DIGEST, that production still serves the accepted release. Never builds, pushes, deploys or re-tags |
+| 2 | `02-guarded-run.md` (**one pasteable manual block**) | drives steps 3–7 | arms an `EXIT`/`ERR`/`INT`/`TERM` cleanup trap **before the first mutation**, then runs enable → verify → probes → run → evidence → lockdown. Every exit path ends fail-closed with both probes proven absent |
+| 3 | `03-enable-stage-d.md` (**manual commands**) then `03b-verify-stage-d-posture.sh` (read-only) | worker job, API service | strict caps; worker: paid flag on + `KIMI_API_KEY` binding + the pinned worker-only provider envelope; API: launcher + run creation on, **no** `MILO_PROVIDER_*` |
+| 4 | `04-create-probes.sh` | creates 2 disposable jobs | `stage-d-db-probe` (as `milo-api-runtime@`) and `stage-d-gw-probe` (as `milo-vercel-gateway@`). Sources ship as deterministic gzip+base64, size- and delimiter-checked before any gcloud call |
+| 5 | `05-execute-run.sh` | one run | re-verifies every launch invariant **including the accepted digests**, runs the DB preflight and setup, creates exactly ONE run, polls; persists the run id to `state.json` before polling |
+| 6 | `06-collect-evidence.sh` | no | **executable acceptance gate**; reads the run id from `state.json` |
+| 7 | `07-post-run-lockdown.sh` | worker job, API service, deletes probes | kill switch → **prove the capture was never claimed (while the probe still exists)** → delete both probes → **prove them absent** |
 | any | `kill-switch.sh` | worker job, API service | immediate fail-closed (use at ANY sign of trouble) |
+
+Steps 3–7 are normally driven by the single guarded block in step 2
+rather than run one at a time; running them individually forfeits the
+automatic cleanup that block provides.
+
+### There is no build step, and that is deliberate
+
+A smoke-run toolkit would normally build and deploy the release. Stage D
+does neither, because **rebuilding this release is not byte-reproducible**:
+`Dockerfile.api` and `Dockerfile.worker` start `FROM python:3.12-slim` (a
+mutable upstream tag), `backend/requirements.txt` carries the unpinned
+floor `openai>=1.30.0`, and there is no lockfile or `--require-hashes`.
+A rebuild of commit `84cd8696…` can therefore produce different bytes,
+and pushing them under the same `:<sha>` Artifact Registry tag would
+**replace** the accepted image while every tag-based check still reported
+success. "Re-proving" a release by rebuilding it is not a proof.
+
+So the accepted release is identified by **digest**, not by tag:
+
+| Image | Accepted digest |
+| --- | --- |
+| api | `sha256:04275e81995d7bbaf23d0e71e71c2ac83adf37f45eca8686ddb812050a18caa6` |
+| worker | `sha256:d3743e5a8dabc3f663970abe83886ea91b030ad7b339e1178d0ab5efad8f64b5` |
+
+`verify_images.py` checks that the registry tag still resolves to those
+digests, that the immutable serving API revision runs the API digest, and
+that the Worker job resolves to the Worker digest. **A digest mismatch
+blocks Stage D and requires a separate reviewed release** — it is never
+auto-repaired by re-pushing the tag.
+
+This is not a hypothetical risk in this project. A Cloud Run *job* is not
+a revision: its template holds a tag that is resolved afresh at every
+execution, and the Worker tag has already resolved to several distinct
+digests over time (execution `milo-agent-worker-bw8kj` ran
+`sha256:2314852868a8…`). So the job check is point-in-time: step 5
+re-verifies immediately before run creation, and the evidence gate
+verifies the digest the authorized execution **actually ran**, which is
+recorded on the execution and cannot be invalidated afterwards.
 
 ## The acceptance gate
 
@@ -151,6 +189,8 @@ checklist. It exits non-zero unless **all** of the following hold:
 * **exact one-run/one-execution increment**: exactly `7 + 1 = 8` database
   rows, exactly **1** row under the Stage D key, and exactly `7 + 1 = 8`
   visible Worker executions, every one terminal with zero active;
+* **the authorized execution RAN the accepted Worker digest** — read off
+  the execution itself, so a tag moved afterwards cannot hide it;
 * **Government-capture invariant** still intact;
 * **zero secret markers** in DB events and in worker logs.
 
@@ -184,11 +224,19 @@ checklist. It exits non-zero unless **all** of the following hold:
   vehicle_catalog_v1`, because the caps are derived from Stage C evidence
   about that pipeline; the setup probe refuses a forbidden project id or a
   mismatched workflow key.
-- **Cost ceiling caveat.** `MILO_MAX_COST_PER_RUN=1.00` bounds tracked
-  token-derived cost only. Moonshot's `$web_search` tool is billed per
-  invocation outside MILO's accounting — conservative total exposure for
-  the one run is **≤ $5.50** (down from Stage C's ≤ $9.00). Verify the
-  actual billed total in the Moonshot console after the run.
+- **Cost ceiling — read this before authorizing.**
+  `MILO_MAX_COST_PER_RUN=1.00` is a hard cap on **tracked token-derived
+  cost only**. Moonshot bills the builtin `$web_search` tool per
+  invocation, outside MILO's accounting, and **nothing in this repository
+  caps the number of invocations**: `core.py` bounds tool-echo rounds at
+  `MAX_TOOL_ROUNDS = 15` but iterates every `message.tool_calls` entry
+  within a round, and that count is the provider's to choose. Total spend
+  is therefore **not bounded by this repository**. A verified hard
+  spending/wallet ceiling on the provider account is a **prerequisite**
+  of the authorization. The official per-call fee is currently $0.005 and
+  the legacy `$web_search` tool is announced for retirement on
+  2026-10-20; re-check both before the run, and verify the actual billed
+  total after it. See `STAGE_D_AUTHORIZATION.md` §3.6.
 - **Acceptance policy**: only `completed` is a PASS.
   `failed`/`cancelled`/`timed_out`/`budget_exhausted`/`partial_success`
   fail the run — the poll and evidence gates exit non-zero and instruct
