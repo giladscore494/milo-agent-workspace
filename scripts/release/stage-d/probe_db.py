@@ -17,10 +17,19 @@ Modes (env STAGE_D_MODE):
   govcheck  — the Government-capture invariant ALONE, read-only. Safe to
               run at any time; used by the post-run lockdown and by
               resolve-government-capture.sh's verification
-  setup     — idempotently create the operator test user, the dedicated
-              stage-d-smoke project (workflow_key pinned), membership and
-              conversation; refuses to hand back any pre-existing project
-              on the forbidden list
+  setup     — two phases. PHASE A is read-only: validate any
+              pre-existing stage-d-smoke project (forbidden ids,
+              workflow key, exact configuration, membership set, zero
+              active user/project runs). A rejected project is never
+              written to, and the verdict reports an empty mutation
+              list. PHASE B mutates, then re-reads and proves the exact
+              final membership and zero active runs
+  terminalize — drive the authorized Stage D run to a terminal state
+              with guarded, identity-checked transitions along the
+              supported lifecycle, release any dangling budget
+              reservation through the supported RPC, and prove the run
+              is terminal with zero active user/project runs and zero
+              reservations left in the reserved status
   evidence  — executable acceptance gate for env STAGE_D_RUN_ID: exits
               non-zero unless EVERY acceptance criterion holds, including
               exactly one new authorized run over the pinned prior
@@ -460,79 +469,54 @@ def active_state_filter() -> str:
     return "in.(" + ",".join(ACTIVE_RUN_STATES) + ")"
 
 
-def setup() -> None:
-    """Create/reuse the DEDICATED Stage D test identity, and PROVE it.
+TERMINAL_RUN_STATES = ("completed", "partial_success", "failed", "cancelled",
+                       "timed_out", "budget_exhausted")
 
-    A reused project is never adopted on the strength of its slug. Every
-    property this authorization depends on is queried and proved:
-    the engine (workflow key), the immutable configuration, the exact
-    membership set, and zero active runs for BOTH the user and the
-    project. Any deviation fails closed rather than printing a claim.
 
-    The project is deliberately its own: the Government capture's project
-    and the prior smoke projects are on the forbidden list, because
-    'queued' is an active run state and the prepared capture row would
-    otherwise count against MILO_MAX_CONCURRENT_RUNS_PER_PROJECT=1.
+def project_conversation_ids(project_id: str, problems: list[str]) -> list[str] | None:
+    """Conversation ids belonging to a project, or None on a read failure."""
+    rows = fetch_rows(
+        f"/rest/v1/conversations?project_id=eq.{project_id}&select=id&limit=1000",
+        "conversations", problems)
+    if rows is None:
+        return None
+    return [str(row.get("id")) for row in rows if row.get("id")]
+
+
+def count_active_runs(*, user_id: str | None = None, conversation_ids: list[str] | None = None):
+    """Exact active-run count for a user or for a set of conversations."""
+    active = active_state_filter()
+    if user_id is not None:
+        return count_exact(f"/rest/v1/runs?select=id&requested_by=eq.{user_id}&status={active}")
+    if not conversation_ids:
+        return 0
+    joined = ",".join(conversation_ids)
+    return count_exact(f"/rest/v1/runs?select=id&conversation_id=in.({joined})&status={active}")
+
+
+def validate_existing_project(project: dict, user_id: str | None, problems: list[str]) -> dict:
+    """READ-ONLY validation of a project Stage D is about to reuse.
+
+    Called BEFORE any membership or conversation write. An earlier revision
+    recorded these problems but went on to upsert membership and create a
+    conversation anyway, leaving rows behind in a project it had just
+    rejected. Validation and mutation are now separate phases.
     """
-    forbidden = forbidden_project_ids()
-    problems: list[str] = []
     evidence: dict = {}
-
-    # 1. Operator-controlled test user (admin API; no password flow used).
-    status, body = call("POST", "/auth/v1/admin/users", {"email": TEST_EMAIL, "email_confirm": True})
-    if status in (200, 201):
-        user_id = body["id"]
-    else:
-        status, body = call("GET", "/auth/v1/admin/users?per_page=1000")
-        users = body.get("users", body) if isinstance(body, dict) else body
-        matches = [u for u in users if isinstance(u, dict) and u.get("email") == TEST_EMAIL]
-        if not matches:
-            fail(f"test user creation failed (HTTP {status}) and no existing user found")
-        user_id = matches[0]["id"]
-    evidence["user_id"] = user_id
-
-    # 2. Dedicated project (only the test user will be a member).
-    status, body = call(
-        "POST",
-        "/rest/v1/projects",
-        {
-            "slug": PROJECT_SLUG,
-            "name": "Stage D smoke",
-            "description": "Operator-controlled Stage D expansion-step project",
-            "workflow_key": WORKFLOW_KEY,
-            "configuration": EXPECTED_PROJECT_CONFIGURATION,
-        },
-        headers={"Prefer": "return=representation"},
-    )
-    created = status == 201
-    if created:
-        project = body[0]
-    else:
-        status, rows = call(
-            "GET", f"/rest/v1/projects?slug=eq.{PROJECT_SLUG}&select=id,workflow_key,configuration")
-        if status != 200 or not rows:
-            fail(f"project create/lookup failed (HTTP {status})")
-        project = rows[0]
-    project_id = project["id"]
+    project_id = str(project.get("id"))
     evidence["project_id"] = project_id
-    evidence["project_created"] = created
 
-    # 2a. The project must not be one Stage D may never use.
-    if project_id in forbidden:
-        fail(
+    if project_id in forbidden_project_ids():
+        problems.append(
             f"resolved project {project_id} is on the Stage D forbidden list — it is the Government "
-            "capture's project or a prior smoke project; refusing to create the run there"
-        )
-    # 2b. The engine must be the pipeline the caps were derived from.
+            "capture's project or a prior smoke project; refusing to use it")
+
     evidence["workflow_key"] = project.get("workflow_key")
     if str(project.get("workflow_key")) != WORKFLOW_KEY:
         problems.append(
             f"project {project_id} has workflow_key {project.get('workflow_key')!r}, expected {WORKFLOW_KEY!r} — "
-            "the Stage D caps are derived from Stage C Attempt 7 evidence for that pipeline"
-        )
-    # 2c. The configuration must be the expected immutable value. A reused
-    # project carrying something else is a different project wearing the
-    # same slug.
+            "the Stage D caps are derived from Stage C Attempt 7 evidence for that pipeline")
+
     configuration = project.get("configuration")
     if isinstance(configuration, str):
         try:
@@ -543,22 +527,12 @@ def setup() -> None:
     if configuration != EXPECTED_PROJECT_CONFIGURATION:
         problems.append(
             f"project {project_id} configuration is {configuration!r}, expected "
-            f"{EXPECTED_PROJECT_CONFIGURATION!r} — refusing to adopt a project this authorization does not describe"
-        )
+            f"{EXPECTED_PROJECT_CONFIGURATION!r} — refusing to adopt a project this authorization does not describe")
 
-    # 3. Membership (idempotent upsert).
-    status, _ = call(
-        "POST",
-        "/rest/v1/project_members",
-        {"project_id": project_id, "user_id": user_id, "role": "owner"},
-        headers={"Prefer": "resolution=merge-duplicates"},
-    )
-    if status not in (200, 201):
-        fail(f"membership upsert failed (HTTP {status})")
-
-    # 3a. PROVE the membership set — do not print a claim. Exactly one
-    # member, and it must be the dedicated test user. Any other member
-    # could create a run in this project and break the one-run guarantee.
+    # The membership set must already be exactly the dedicated test user
+    # (or empty, for a project created by a previous run whose membership
+    # upsert is still owed). Any OTHER member could create a run in this
+    # project and break the one-run guarantee.
     members = fetch_rows(
         f"/rest/v1/project_members?project_id=eq.{project_id}&select=user_id,role",
         "project_members", problems)
@@ -566,80 +540,408 @@ def setup() -> None:
         members = []
         problems.append("membership set could not be read — failing closed")
     member_ids = sorted({str(m.get("user_id")) for m in members})
-    evidence["members"] = member_ids
-    if member_ids != [str(user_id)]:
+    evidence["members_before"] = member_ids
+    allowed = [] if user_id is None else [str(user_id)]
+    if member_ids not in ([], allowed):
         problems.append(
-            f"project {project_id} membership is {member_ids}, expected exactly [{str(user_id)!r}] — "
-            "another member could create a run and break the one-run guarantee"
-        )
+            f"project {project_id} membership is {member_ids}, expected empty or exactly {allowed} — "
+            "another member could create a run and break the one-run guarantee")
 
-    # 4. Conversation (reuse if present).
+    # Zero active runs, for the user AND anywhere in the project.
+    if user_id is not None:
+        user_active = count_active_runs(user_id=user_id)
+        evidence["active_runs_for_user"] = user_active
+        if user_active is None:
+            problems.append("exact active-run count for the Stage D test user unavailable — failing closed")
+        elif user_active != 0:
+            problems.append(
+                f"the Stage D test user already has {user_active} active run(s); "
+                "MILO_MAX_CONCURRENT_RUNS_PER_USER=1 would refuse the authorized run")
+
+    conversation_ids = project_conversation_ids(project_id, problems)
+    if conversation_ids is None:
+        problems.append("the project's conversations could not be read — failing closed")
+    else:
+        evidence["project_conversations"] = len(conversation_ids)
+        project_active = count_active_runs(conversation_ids=conversation_ids)
+        evidence["active_runs_for_project"] = project_active
+        if project_active is None:
+            problems.append("exact active-run count for the Stage D project unavailable — failing closed")
+        elif project_active != 0:
+            problems.append(
+                f"the Stage D project already has {project_active} active run(s); "
+                "MILO_MAX_CONCURRENT_RUNS_PER_PROJECT=1 would refuse the authorized run")
+    return evidence
+
+
+def setup() -> None:
+    """Create/reuse the DEDICATED Stage D test identity in two phases.
+
+    PHASE A is strictly read-only: look up the test user and the project,
+    and — if the project already exists — validate every property this
+    authorization depends on. If anything is wrong, NOTHING is created,
+    written or upserted, and the verdict reports an empty mutation list so
+    the absence of side effects is provable rather than assumed.
+
+    PHASE B runs only once Phase A passed, and afterwards RE-READS the
+    membership and the active-run counts to prove the authorized end state.
+    """
+    problems: list[str] = []
+    mutations: list[str] = []
+    evidence: dict = {"stage_d_probe": "setup"}
+
+    # ---------------- PHASE A — read-only ----------------
+    status, body = call("GET", "/auth/v1/admin/users?per_page=1000")
+    if status != 200:
+        fail(f"could not list users (HTTP {status}) — failing closed before any mutation")
+    users = body.get("users", body) if isinstance(body, dict) else body
+    matches = [u for u in (users or []) if isinstance(u, dict) and u.get("email") == TEST_EMAIL]
+    user_id = matches[0]["id"] if matches else None
+    evidence["user_existed"] = user_id is not None
+
+    status, rows = call(
+        "GET", f"/rest/v1/projects?slug=eq.{PROJECT_SLUG}&select=id,workflow_key,configuration")
+    if status != 200:
+        fail(f"could not look up the project (HTTP {status}) — failing closed before any mutation")
+    existing = rows[0] if rows else None
+    evidence["project_existed"] = existing is not None
+
+    if existing is not None:
+        evidence.update(validate_existing_project(existing, user_id, problems))
+
+    if problems:
+        # Refused during read-only validation: prove nothing was written.
+        evidence.update({"mutations": mutations, "problems": problems, "ok": False})
+        print(json.dumps(evidence, default=str))
+        sys.exit(1)
+
+    # ---------------- PHASE B — mutations ----------------
+    if user_id is None:
+        status, body = call("POST", "/auth/v1/admin/users",
+                            {"email": TEST_EMAIL, "email_confirm": True})
+        if status not in (200, 201):
+            fail(f"test user creation failed (HTTP {status})")
+        user_id = body["id"]
+        mutations.append("created_test_user")
+    evidence["user_id"] = user_id
+
+    if existing is None:
+        status, body = call(
+            "POST", "/rest/v1/projects",
+            {
+                "slug": PROJECT_SLUG,
+                "name": "Stage D smoke",
+                "description": "Operator-controlled Stage D expansion-step project",
+                "workflow_key": WORKFLOW_KEY,
+                "configuration": EXPECTED_PROJECT_CONFIGURATION,
+            },
+            headers={"Prefer": "return=representation"})
+        if status != 201 or not body:
+            fail(f"project creation failed (HTTP {status})")
+        project_id = body[0]["id"]
+        mutations.append("created_project")
+        # A freshly created project still must not be a forbidden id.
+        if project_id in forbidden_project_ids():
+            fail(f"created project {project_id} is on the Stage D forbidden list — refusing to proceed")
+    else:
+        project_id = str(existing["id"])
+    evidence["project_id"] = project_id
+
+    status, _ = call(
+        "POST", "/rest/v1/project_members",
+        {"project_id": project_id, "user_id": user_id, "role": "owner"},
+        headers={"Prefer": "resolution=merge-duplicates"})
+    if status not in (200, 201):
+        fail(f"membership upsert failed (HTTP {status})")
+    mutations.append("upserted_membership")
+
     status, rows = call("GET", f"/rest/v1/conversations?project_id=eq.{project_id}&select=id&limit=1")
     if status == 200 and rows:
         conversation_id = rows[0]["id"]
     else:
         status, body = call(
-            "POST",
-            "/rest/v1/conversations",
+            "POST", "/rest/v1/conversations",
             {"project_id": project_id, "title": "stage-d-smoke"},
-            headers={"Prefer": "return=representation"},
-        )
-        if status != 201:
+            headers={"Prefer": "return=representation"})
+        if status != 201 or not body:
             fail(f"conversation creation failed (HTTP {status})")
         conversation_id = body[0]["id"]
+        mutations.append("created_conversation")
     evidence["conversation_id"] = conversation_id
+    evidence["workflow_key_expected"] = WORKFLOW_KEY
 
-    # 5. Zero active runs for the USER *and* for the PROJECT. The
-    # concurrency caps are 1 per user AND 1 per project, so an active run
-    # under either would refuse the authorized run — and would mean this
-    # is not the exclusive identity the authorization assumes.
-    active_filter = active_state_filter()
-    user_active = count_exact(
-        f"/rest/v1/runs?select=id&requested_by=eq.{user_id}&status={active_filter}")
-    evidence["active_runs_for_user"] = user_active
-    if user_active is None:
-        problems.append("exact active-run count for the Stage D test user unavailable — failing closed")
-    elif user_active != 0:
+    # ---------------- PHASE C — prove the authorized end state ----------
+    members = fetch_rows(
+        f"/rest/v1/project_members?project_id=eq.{project_id}&select=user_id,role",
+        "project_members", problems)
+    member_ids = sorted({str(m.get("user_id")) for m in (members or [])})
+    evidence["members"] = member_ids
+    if member_ids != [str(user_id)]:
         problems.append(
-            f"the Stage D test user already has {user_active} active run(s); "
-            "MILO_MAX_CONCURRENT_RUNS_PER_USER=1 would refuse the authorized run"
-        )
+            f"after the authorized mutation the membership is {member_ids}, expected exactly "
+            f"[{str(user_id)!r}] — the project is not exclusive to the test user")
 
-    # Project-scoped active runs: runs reach a project through their
-    # conversation, so resolve the project's conversations first rather
-    # than relying on an embedded-resource filter.
-    project_conversations = fetch_rows(
-        f"/rest/v1/conversations?project_id=eq.{project_id}&select=id&limit=1000",
-        "conversations", problems)
-    if project_conversations is None:
-        problems.append("the project's conversations could not be read — failing closed")
+    user_active = count_active_runs(user_id=user_id)
+    evidence["active_runs_for_user"] = user_active
+    if user_active != 0:
+        problems.append(f"the Stage D test user has {user_active} active run(s) after setup")
+
+    conversation_ids = project_conversation_ids(project_id, problems)
+    if conversation_ids is None:
+        problems.append("the project's conversations could not be re-read — failing closed")
     else:
-        conversation_ids = [str(row.get("id")) for row in project_conversations if row.get("id")]
+        project_active = count_active_runs(conversation_ids=conversation_ids)
+        evidence["active_runs_for_project"] = project_active
         evidence["project_conversations"] = len(conversation_ids)
-        if conversation_ids:
-            joined = ",".join(conversation_ids)
-            project_active = count_exact(
-                f"/rest/v1/runs?select=id&conversation_id=in.({joined})&status={active_filter}")
-            evidence["active_runs_for_project"] = project_active
-            if project_active is None:
-                problems.append("exact active-run count for the Stage D project unavailable — failing closed")
-            elif project_active != 0:
-                problems.append(
-                    f"the Stage D project already has {project_active} active run(s); "
-                    "MILO_MAX_CONCURRENT_RUNS_PER_PROJECT=1 would refuse the authorized run"
-                )
-        else:
-            evidence["active_runs_for_project"] = 0
+        if project_active != 0:
+            problems.append(f"the Stage D project has {project_active} active run(s) after setup")
 
-    evidence.update({
-        "stage_d_probe": "setup",
-        "workflow_key_expected": WORKFLOW_KEY,
-        "problems": problems,
-        "ok": not problems,
-    })
+    evidence.update({"mutations": mutations, "problems": problems, "ok": not problems})
     print(json.dumps(evidence, default=str))
     if problems:
         sys.exit(1)
+
+
+def terminalize() -> None:
+    """Drive the authorized Stage D run to a terminal state and PROVE it.
+
+    Cancelling a Cloud Run execution does NOT make the database run
+    terminal: the Worker installs no SIGTERM handler, so an interrupted
+    run can be left `running` forever, holding its lease and its budget
+    reservations. Cleanup that only cancels the execution therefore leaves
+    the concurrency caps consumed and the daily budget reserved against a
+    run that will never finish.
+
+    This mode closes that. It is IDENTITY-CHECKED — it refuses to touch
+    anything that is not the authorized Stage D run, and it can never
+    touch the prepared Government capture — and it uses the repository's
+    own supported lifecycle: active -> cancellation_requested -> cancelled
+    (backend/runtime.py VALID_TRANSITIONS), each step a guarded
+    compare-and-set on the observed status, plus the supported
+    service-role `settle_model_call_budget` RPC to release any dangling
+    reservation. It then PROVES the postconditions:
+
+      * the run is terminal;
+      * zero active runs remain for its user and for its project;
+      * zero reservations remain in status 'reserved'.
+
+    Nothing is deleted, and no other run is touched.
+    """
+    run_id = (os.environ.get("STAGE_D_RUN_ID") or "").strip()
+    expected_key = os.environ.get("STAGE_D_IDEMPOTENCY_KEY")
+    capture_run_id = os.environ.get("STAGE_D_GOV_CAPTURE_RUN_ID")
+    problems: list[str] = []
+    actions: list[str] = []
+    out: dict = {"stage_d_probe": "terminalize", "run_id": run_id or None, "actions": actions}
+
+    if not expected_key:
+        problems.append("STAGE_D_IDEMPOTENCY_KEY is missing — the run's identity cannot be checked; failing closed")
+        out.update({"problems": problems, "ok": False})
+        print(json.dumps(out, default=str))
+        sys.exit(1)
+
+    if not run_id:
+        # No run was recorded. Prove the wider invariant anyway: no run
+        # under the Stage D key may be active.
+        out["no_run_recorded"] = True
+        key_active = count_exact(
+            f"/rest/v1/runs?select=id&idempotency_key=eq.{expected_key}&status={active_state_filter()}")
+        out["active_runs_under_key"] = key_active
+        if key_active is None:
+            problems.append("exact active-run count under the Stage D key unavailable — failing closed")
+        elif key_active != 0:
+            problems.append(
+                f"{key_active} run(s) under the Stage D key are still active although no run id was recorded — "
+                "investigate before closing Stage D")
+        out.update({"problems": problems, "ok": not problems})
+        print(json.dumps(out, default=str))
+        if problems:
+            sys.exit(1)
+        return
+
+    if capture_run_id and run_id == capture_run_id:
+        problems.append("the recorded run id is the prepared Government capture — refusing to touch it")
+        out.update({"problems": problems, "ok": False})
+        print(json.dumps(out, default=str))
+        sys.exit(1)
+
+    select = ("id,status,launch_state,worker_id,attempt,started_at,finished_at,"
+              "idempotency_key,requested_by,conversation_id")
+    rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={select}", "runs", problems)
+    if rows is None or not rows:
+        problems.append(f"run {run_id} was not found — failing closed")
+        out.update({"problems": problems, "ok": False})
+        print(json.dumps(out, default=str))
+        sys.exit(1)
+    run = rows[0]
+    out["run_before"] = run
+
+    # IDENTITY CHECK: only the authorized Stage D run may be terminalized.
+    if run.get("idempotency_key") != expected_key:
+        problems.append(
+            f"run {run_id} carries idempotency_key {run.get('idempotency_key')!r}, not the authorized Stage D key "
+            f"{expected_key!r} — refusing to terminalize a run this authorization does not own")
+        out.update({"problems": problems, "ok": False})
+        print(json.dumps(out, default=str))
+        sys.exit(1)
+
+    # -- Guarded, identity-checked transitions along the supported path.
+    #
+    # Bounded re-read loop rather than a straight line: losing the CAS is
+    # NOT itself a failure. The usual cause is the worker writing its own
+    # terminal result concurrently, which is exactly the outcome wanted —
+    # so a lost race is re-read and retried, and the POSTCONDITION PROOF
+    # below is what decides. What the CAS guarantees is that this probe
+    # never overwrites somebody else's result and never touches a run this
+    # authorization does not own.
+    observed = str(run.get("status"))
+    for _attempt in range(MAX_TERMINALIZE_ATTEMPTS):
+        if observed in TERMINAL_RUN_STATES:
+            break
+        target, extra = (
+            ("cancelled", {"finished_at": "now()"})
+            if observed == "cancellation_requested"
+            else ("cancellation_requested",
+                  {"cancellation_requested_at": "now()",
+                   "cancellation_reason": "stage-d cleanup: run terminalized by the post-run lockdown"}))
+        moved = guarded_transition(run_id, observed, target, expected_key, actions, extra=extra)
+        if moved is not None:
+            observed = moved
+            continue
+        # The CAS matched no row: re-read and decide from what is now true.
+        actions.append(f"cas_lost_at_{observed}")
+        rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={select}", "runs", problems)
+        if not rows:
+            problems.append(f"run {run_id} disappeared while being terminalized — failing closed")
+            break
+        current = str(rows[0].get("status"))
+        if current == observed:
+            problems.append(
+                f"the guarded transition {observed} -> {target} matched no row although the run is still "
+                f"{observed!r} — it may not be the authorized run; failing closed")
+            break
+        observed = current
+    out["status_after_transition"] = observed
+
+    # -- Release any dangling reservation through the supported RPC.
+    reserved = fetch_rows(
+        f"/rest/v1/model_call_budget_reservations?run_id=eq.{run_id}&status=eq.reserved&select=id,call_seq",
+        "model_call_budget_reservations", problems)
+    released = 0
+    for row in (reserved or []):
+        reservation_id = row.get("id")
+        if not reservation_id:
+            problems.append("a reserved reservation has no id — cannot release it; failing closed")
+            continue
+        status, _body = call("POST", "/rest/v1/rpc/settle_model_call_budget", {
+            "p_reservation_id": reservation_id,
+            # A row still in 'reserved' was never settled with a real cost,
+            # so 0 is the only defensible value; the reason records why.
+            "p_actual_cost": 0,
+            "p_status": "released",
+            "p_rejection_reason": "stage-d cleanup: reservation released when the run was terminalized",
+        })
+        if status not in (200, 201, 204):
+            problems.append(f"releasing reservation {reservation_id} failed (HTTP {status}) — failing closed")
+        else:
+            released += 1
+    out["reservations_released"] = released
+    if released:
+        actions.append(f"released_{released}_dangling_reservations")
+
+    # ---------------- PROVE the postconditions ----------------
+    rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={select}", "runs", problems)
+    final = rows[0] if rows else {}
+    out["run_after"] = final
+    final_status = str(final.get("status"))
+    out["terminal"] = final_status in TERMINAL_RUN_STATES
+    if final_status not in TERMINAL_RUN_STATES:
+        problems.append(
+            f"run {run_id} is still {final_status!r}, which is not terminal — the database run was NOT closed")
+
+    user_id = final.get("requested_by")
+    if user_id:
+        user_active = count_active_runs(user_id=str(user_id))
+        out["active_runs_for_user"] = user_active
+        if user_active is None:
+            problems.append("exact active-run count for the run's user unavailable — failing closed")
+        elif user_active != 0:
+            problems.append(f"{user_active} active run(s) remain for the run's user — failing closed")
+    else:
+        problems.append("the run has no requested_by — its user's active-run count cannot be proved; failing closed")
+
+    conversation_id = final.get("conversation_id")
+    project_id = None
+    if conversation_id:
+        conv_rows = fetch_rows(
+            f"/rest/v1/conversations?id=eq.{conversation_id}&select=project_id", "conversations", problems)
+        if conv_rows:
+            project_id = conv_rows[0].get("project_id")
+    if project_id:
+        conversation_ids = project_conversation_ids(str(project_id), problems)
+        if conversation_ids is None:
+            problems.append("the run's project conversations could not be read — failing closed")
+        else:
+            project_active = count_active_runs(conversation_ids=conversation_ids)
+            out["active_runs_for_project"] = project_active
+            if project_active is None:
+                problems.append("exact active-run count for the run's project unavailable — failing closed")
+            elif project_active != 0:
+                problems.append(f"{project_active} active run(s) remain in the run's project — failing closed")
+    else:
+        problems.append("the run's project could not be resolved — its active-run count cannot be proved; failing closed")
+
+    still_reserved = count_exact(
+        f"/rest/v1/model_call_budget_reservations?select=id&run_id=eq.{run_id}&status=eq.reserved")
+    out["reservations_still_reserved"] = still_reserved
+    if still_reserved is None:
+        problems.append("exact dangling-reservation count unavailable — failing closed")
+    elif still_reserved != 0:
+        problems.append(f"{still_reserved} reservation(s) remain in status 'reserved' — the budget is still held")
+
+    out.update({"problems": problems, "ok": not problems})
+    print(json.dumps(out, default=str))
+    if problems:
+        sys.exit(1)
+
+
+#: Bounded: a benign race is retried, a pathological one is never looped on.
+MAX_TERMINALIZE_ATTEMPTS = 5
+
+
+def guarded_transition(run_id: str, observed: str, target: str, expected_key: str,
+                       actions: list[str], extra: dict | None = None) -> str | None:
+    """One guarded, identity-checked compare-and-set on a run's status.
+
+    The PATCH matches on the run id, the OBSERVED status and the
+    authorized idempotency key, so a concurrent transition (a worker
+    writing its own terminal result) matches zero rows instead of being
+    overwritten, and a run this authorization does not own is never
+    touched.
+
+    Returns the new status on success, or None when the CAS matched no
+    row. None is a signal to re-read, not a verdict: the caller decides.
+    """
+    # PostgREST cannot evaluate now(); the sentinel becomes an explicit
+    # UTC timestamp.
+    payload = {"status": target}
+    for key, value in (extra or {}).items():
+        payload[key] = utc_now_iso() if value == "now()" else value
+    status, body = call(
+        "PATCH",
+        f"/rest/v1/runs?id=eq.{run_id}&status=eq.{observed}&idempotency_key=eq.{expected_key}",
+        payload,
+        headers={"Prefer": "return=representation"},
+    )
+    if status not in (200, 204) or not isinstance(body, list) or len(body) != 1:
+        return None
+    actions.append(f"{observed}->{target}")
+    return target
+
+
+def utc_now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 SECRET_MARKERS = ("sk-", "KIMI_API_KEY", "MOONSHOT_API_KEY", "service_role", "sb_secret")
@@ -1054,6 +1356,8 @@ def main() -> None:
         govcheck()
     elif mode == "setup":
         setup()
+    elif mode == "terminalize":
+        terminalize()
     elif mode == "evidence":
         evidence()
     else:

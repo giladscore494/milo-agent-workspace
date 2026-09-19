@@ -120,10 +120,10 @@ identity is read-only in production by design; these steps are why.
 | 1 | `01-verify-release-images.sh` | **no** | prove, BY DIGEST, that production still serves the accepted release. Never builds, pushes, deploys or re-tags |
 | 2 | `02-guarded-run.md` (**one pasteable manual block**) | drives steps 3–7 | arms an `EXIT`/`ERR`/`INT`/`TERM` cleanup trap **before the first mutation**, then runs enable → verify → probes → run → evidence → lockdown. Every exit path ends fail-closed with both probes proven absent |
 | 3 | `03-enable-stage-d.md` (**manual commands**) then `03b-verify-stage-d-posture.sh` (read-only) | worker job, API service | strict caps; worker: paid flag on + `KIMI_API_KEY` binding + the pinned worker-only provider envelope; API: launcher + run creation on, **no** `MILO_PROVIDER_*` |
-| 4 | `04-create-probes.sh` | creates 2 disposable jobs | `stage-d-db-probe` (as `milo-api-runtime@`) and `stage-d-gw-probe` (as `milo-vercel-gateway@`). Sources ship as deterministic gzip+base64, size- and delimiter-checked before any gcloud call |
+| 4 | `04-create-probes.sh` | creates 2 disposable jobs | `stage-d-db-probe` (as `milo-api-runtime@`) and `stage-d-gw-probe` (as `milo-vercel-gateway@`). Both run the **digest-pinned** probe image; the probe **sources are SHA-256 verified** before any gcloud call; the created templates are verified afterwards |
 | 5 | `05-execute-run.sh` | one run | re-verifies every launch invariant **including the accepted digests**, runs the DB preflight and setup, creates exactly ONE run, polls; persists the run id to `state.json` before polling |
 | 6 | `06-collect-evidence.sh` | no | **executable acceptance gate**; reads the run id from `state.json` |
-| 7 | `07-post-run-lockdown.sh` | worker job, API service, deletes probes | kill switch → **prove the capture was never claimed (while the probe still exists)** → delete both probes → **prove them absent** |
+| 7 | `07-post-run-lockdown.sh` | worker job, API service, deletes probes | kill switch → **terminalize the DATABASE run and prove it clean** → **prove the capture was never claimed** (both while the probe still exists) → delete both probes → **prove them absent** |
 | any | `kill-switch.sh` | worker job, API service | immediate fail-closed (use at ANY sign of trouble) |
 
 Steps 3–7 are normally driven by the single guarded block in step 2
@@ -164,6 +164,67 @@ re-verifies immediately before run creation, and the evidence gate
 verifies the digest the authorized execution **actually ran**, which is
 recorded on the execution and cannot be invalidated afterwards.
 
+### The probe jobs are a privileged supply chain
+
+`stage-d-db-probe` runs with `SUPABASE_SERVICE_ROLE_KEY` bound, so whatever
+that job runs executes arbitrary code with service-role access to
+production. Two inputs decide what it runs, and **both are pinned and
+verified before any credentialed job exists**:
+
+| Input | Pin | Checked |
+| --- | --- | --- |
+| Runtime image | `python@sha256:78387bc3…` (digest, never the mutable `python:3.12-slim` tag) | after creation, and again **before every execution** |
+| `probe_db.py` source | `STAGE_D_PROBE_DB_SHA256` | before any gcloud call |
+| `probe_gateway.py` source | `STAGE_D_PROBE_GW_SHA256` | before any gcloud call |
+
+`verify_probe_jobs.py` also checks each job's service account and its
+exact secret bindings (db probe: only the two Supabase secrets that
+identity already accesses; gateway probe: **none**), and refuses a
+provider-key alias on either.
+
+An approved Artifact Registry mirror would be preferable to pulling a
+privileged runtime from a public registry. None exists today — the
+project has exactly one Artifact Registry repository, `milo-agent`, and
+it is a STANDARD repository, not a REMOTE one (verified read-only). That
+is a production mutation and is deliberately outside this PR. Switching
+later is a **one-line** change to `STAGE_D_PROBE_IMAGE_REPO`, because
+mirroring preserves the manifest digest: the pin stays byte-identical.
+
+### Cancelling an execution is not closing a run
+
+Cancelling a Cloud Run execution does **not** make the database run
+terminal. The Worker installs no `SIGTERM` handler, so an interrupted run
+can sit in `running` indefinitely — holding its lease, its
+`MILO_MAX_CONCURRENT_RUNS_PER_{USER,PROJECT}` slot and its budget
+reservations. A cleanup that only cancels the execution leaves all of
+that behind.
+
+So the lockdown terminalizes the **database** run too, through
+`probe_db.py --terminalize`: identity-checked (it refuses any run not
+carrying the authorized Stage D key, and can never touch the prepared
+capture), using the repository's own supported lifecycle
+(`active → cancellation_requested → cancelled`, each step a guarded
+compare-and-set on the observed status), and releasing any dangling
+reservation through the supported `settle_model_call_budget` RPC. Losing
+a compare-and-set to a worker writing its own terminal result is fine and
+is retried; what must hold is the **proof**:
+
+* the run is terminal;
+* zero active runs remain for its user **and** its project;
+* zero reservations remain in status `reserved`.
+
+`LOCKDOWN COMPLETE` is impossible unless those hold **and** the
+Government-capture invariant is proven.
+
+### Probe logs are attributed to one execution
+
+Every probe execution is launched with `--async` so its name is captured
+before completion, and its logs are filtered by
+`labels."run.googleapis.com/execution_name"`. Filtering by job name alone
+can match retained records from an older, deleted-and-recreated job of the
+same name — a stale PASS satisfying a gate that is really looking at
+nothing. A missing record for the current execution fails closed.
+
 ## The acceptance gate
 
 `06-collect-evidence.sh` plus `probe_db.py --evidence` is a gate, not a
@@ -191,6 +252,8 @@ checklist. It exits non-zero unless **all** of the following hold:
   visible Worker executions, every one terminal with zero active;
 * **the authorized execution RAN the accepted Worker digest** — read off
   the execution itself, so a tag moved afterwards cannot hide it;
+* **the probe jobs were still the reviewed jobs** at every execution —
+  pinned image digest, expected identity, expected secret bindings;
 * **Government-capture invariant** still intact;
 * **zero secret markers** in DB events and in worker logs.
 

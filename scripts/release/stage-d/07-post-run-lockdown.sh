@@ -1,29 +1,39 @@
 #!/usr/bin/env bash
-# Stage D step 7: IMMEDIATE post-run lockdown. Returns production to the
-# safest documented posture, PROVES the prepared Government capture was
-# never claimed, removes every disposable resource, and PROVES that too.
+# Stage D step 7: IMMEDIATE post-run lockdown.
 #
-# Ordering is deliberate and load-bearing:
-#   1. kill switch — flags off, provider keys unbound, zero active
-#      executions, every postcondition verified;
-#   2. Government-capture proof — run through the db-probe WHILE IT STILL
-#      EXISTS. The probe is the only credentialed database reader here, so
-#      checking after deleting it would be checking with nothing;
-#   3. delete both probes — unconditionally, even if step 2 failed: a
+# Ordering is deliberate and load-bearing. Everything that needs the db
+# probe happens WHILE IT STILL EXISTS; the probe is the only credentialed
+# database reader here, so checking after deleting it would be checking
+# with nothing.
+#
+#   1. kill switch — flags off, provider keys unbound, zero ACTIVE CLOUD
+#      RUN EXECUTIONS, every postcondition verified;
+#   2. terminalize the DATABASE run — cancelling a Cloud Run execution does
+#      NOT make the database run terminal (the Worker installs no SIGTERM
+#      handler), so an interrupted run can sit in `running` forever holding
+#      its lease, its concurrency slot and its budget reservations. This
+#      step drives it terminal through guarded, identity-checked
+#      transitions and proves: terminal run, zero active runs for its user
+#      and project, zero reservations left in status 'reserved';
+#   3. Government-capture proof — the prepared capture must still be
+#      unclaimed;
+#   4. delete both probes — unconditionally, even if 2 or 3 failed: a
 #      failed check is never a reason to leave a credentialed probe job
 #      standing;
-#   4. prove both probes absent from a fresh listing;
-#   5. verdict — LOCKDOWN COMPLETE only if every step above was PROVEN.
+#   5. prove both probes absent from a fresh listing;
+#   6. verdict — LOCKDOWN COMPLETE only if EVERY proof above succeeded.
 #
-# "LOCKDOWN COMPLETE" is never printed on an unverified capture posture.
-# A missing read-only check is a BLOCKING failure, not a MANUAL note —
-# the one documented exception is stated and enforced in step 2.
+# Both probe executions are launched asynchronously and their logs are
+# filtered by the EXACT execution name, so a retained record from an older
+# deleted-and-recreated job of the same name can never satisfy a gate.
 #
 # Safe and idempotent to rerun.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck source=stage-d-env.sh
 source ./stage-d-env.sh
+# shellcheck source=probe_exec.sh
+source ./probe_exec.sh
 
 lockdown_failures=0
 note_failure() {
@@ -31,24 +41,23 @@ note_failure() {
   echo "LOCKDOWN CRITICAL: $1" >&2
 }
 
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+
 echo "== 1. Kill switch (paid off, catalog off, run creation off, launcher disabled, provider keys unbound, zero active executions)"
-# One authoritative fail-closed implementation, reused rather than
-# re-spelled: kill-switch.sh verifies every postcondition itself and exits
-# non-zero if any of them is unproven.
 if ! ./kill-switch.sh; then
   note_failure "kill-switch.sh did not complete — production may NOT be fully fail-closed"
 fi
 
-echo "== 2. Prepared Government capture run — PROVEN never claimed (before the probe is deleted)"
-# Does a run exist that could conceivably have touched anything? The only
-# way the capture could be claimed is a Worker launched for some run, so
-# the recorded run id decides whether an unavailable check is fatal.
+# What the cleanup knows about the run, from the machine-readable state.
 recorded_run_id=""
 if [ -n "${STAGE_D_WORKDIR:-}" ] && [ -r "${STAGE_D_WORKDIR}/state.json" ]; then
   recorded_run_id="$(python3 ./state_file.py "${STAGE_D_WORKDIR}/state.json" read run_id)"
 fi
 
-# Is the db probe still present to ask?
+# Is the db probe still present to ask? Absence is not an error by itself
+# (a rerun after a completed lockdown is normal), but it decides whether
+# an unprovable check is fatal.
 db_probe_present=0
 probe_listing="$(gcloud run jobs list --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" \
   --format='value(metadata.name)' 2>/dev/null)" || probe_listing="__LISTING_FAILED__"
@@ -56,31 +65,48 @@ if [ "${probe_listing}" != "__LISTING_FAILED__" ] && printf '%s\n' "${probe_list
   db_probe_present=1
 fi
 
+echo "== 2. Terminalize the DATABASE run and prove the database is clean"
+run_terminal_proven=0
+if [ "${db_probe_present}" -eq 1 ]; then
+  terminalize_status=0
+  execute_probe_attributed "${STAGE_D_DB_PROBE_JOB}" \
+    "STAGE_D_MODE=terminalize" \
+    "STAGE_D_RUN_ID=${recorded_run_id}" \
+    "STAGE_D_IDEMPOTENCY_KEY=${STAGE_D_IDEMPOTENCY_KEY}" \
+    "STAGE_D_GOV_CAPTURE_RUN_ID=${STAGE_D_GOV_CAPTURE_RUN_ID}" \
+    > "${WORK}/terminalize.log" || terminalize_status=$?
+  cat "${WORK}/terminalize.log"
+  if probe_verdict "${WORK}/terminalize.log" terminalize; then
+    run_terminal_proven=1
+    echo "OK: the Stage D database run is terminal; zero active runs and zero dangling reservations remain"
+  else
+    note_failure "the database run could not be proven terminal and clean (probe exit=${terminalize_status}) — the run may still hold its lease, concurrency slot and budget reservations"
+  fi
+elif [ -z "${recorded_run_id}" ]; then
+  echo "NOT APPLICABLE: no run id is recorded and the db probe is already absent, so there is no"
+  echo "                database run to terminalize and no credentialed reader remains."
+else
+  note_failure "run ${recorded_run_id} was created but the db probe is gone, so the database run cannot be terminalized or proven clean — UNVERIFIED"
+fi
+
+echo "== 3. Prepared Government capture run — PROVEN never claimed"
 capture_proven=0
 if [ "${db_probe_present}" -eq 1 ]; then
-  govcheck_log="$(mktemp)"
-  if gcloud run jobs execute "${STAGE_D_DB_PROBE_JOB}" \
-      --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" \
-      --update-env-vars="^:::^STAGE_D_MODE=govcheck:::STAGE_D_GOV_CAPTURE_RUN_ID=${STAGE_D_GOV_CAPTURE_RUN_ID}:::STAGE_D_GOV_CAPTURE_KEY=${STAGE_D_GOV_CAPTURE_KEY}:::STAGE_D_IDEMPOTENCY_KEY=${STAGE_D_IDEMPOTENCY_KEY}" \
-      --wait > /dev/null 2>&1; then
-    # The job's exit status alone is not the verdict: read the structured
-    # record, exactly as the evidence gate does.
-    gcloud logging read \
-      "resource.type=cloud_run_job AND resource.labels.job_name=${STAGE_D_DB_PROBE_JOB}" \
-      --project="${STAGE_D_PROJECT}" --format='json(textPayload,jsonPayload)' \
-      --order=desc --limit=50 > "${govcheck_log}" 2>/dev/null || true
-    if python3 ./govcheck_verdict.py < "${govcheck_log}"; then
-      capture_proven=1
-      echo "OK: the Government capture run is proven prepared-and-unclaimed or retired-and-unclaimed"
-    else
-      note_failure "the Government capture posture check FAILED — investigate immediately, the capture may have been claimed"
-    fi
+  govcheck_status=0
+  execute_probe_attributed "${STAGE_D_DB_PROBE_JOB}" \
+    "STAGE_D_MODE=govcheck" \
+    "STAGE_D_GOV_CAPTURE_RUN_ID=${STAGE_D_GOV_CAPTURE_RUN_ID}" \
+    "STAGE_D_GOV_CAPTURE_KEY=${STAGE_D_GOV_CAPTURE_KEY}" \
+    "STAGE_D_IDEMPOTENCY_KEY=${STAGE_D_IDEMPOTENCY_KEY}" \
+    > "${WORK}/govcheck.log" || govcheck_status=$?
+  cat "${WORK}/govcheck.log"
+  if probe_verdict "${WORK}/govcheck.log" govcheck; then
+    capture_proven=1
+    echo "OK: the Government capture run is proven prepared-and-unclaimed or retired-and-unclaimed"
   else
-    note_failure "the Government capture posture check could not be executed — the posture is UNVERIFIED"
+    note_failure "the Government capture posture check FAILED or produced no record for this execution (probe exit=${govcheck_status}) — investigate immediately"
   fi
-  rm -f "${govcheck_log}"
 elif [ -n "${STAGE_D_READONLY_DATABASE_URL_ENV:-}" ] && [ -n "${!STAGE_D_READONLY_DATABASE_URL_ENV:-}" ] && command -v psql > /dev/null 2>&1; then
-  # Fallback: the operator's own read-only connection.
   gov_state="$(psql -X -A -t -v ON_ERROR_STOP=1 "${!STAGE_D_READONLY_DATABASE_URL_ENV}" \
     -c "select status || '|' || launch_state || '|' || coalesce(worker_id, 'none') || '|' || coalesce(started_at::text, 'none') from public.runs where id = '${STAGE_D_GOV_CAPTURE_RUN_ID}'::uuid;" 2> /dev/null | tr -d '[:space:]')" \
     || gov_state="READ_FAILED"
@@ -93,31 +119,25 @@ elif [ -n "${STAGE_D_READONLY_DATABASE_URL_ENV:-}" ] && [ -n "${!STAGE_D_READONL
       note_failure "the Government capture run is '${gov_state:-unreadable}' — expected prepared or retired and unclaimed" ;;
   esac
 elif [ -z "${recorded_run_id}" ]; then
-  # The ONE documented exception. No run was ever created, so nothing
-  # could have been launched and nothing could have claimed the capture;
-  # and with the probe already gone there is no credentialed reader left
-  # to ask. This is stated, not silently skipped, and it does NOT count as
-  # a proof — the verdict below downgrades accordingly.
-  echo "NOT APPLICABLE: no run was created (state.json records no run id) and the db probe is already absent,"
-  echo "                so nothing could have claimed the capture and no credentialed reader remains."
+  # The ONE documented exception. No run was created, so nothing could have
+  # been launched and nothing could have claimed the capture; and with the
+  # probe already gone there is no credentialed reader left to ask. Stated,
+  # never silently skipped, and it does NOT count as a proof.
+  echo "NOT APPLICABLE: no run was created and the db probe is already absent, so nothing could have"
+  echo "                claimed the capture and no credentialed reader remains."
   echo "                To verify anyway, set STAGE_D_READONLY_DATABASE_URL_ENV and rerun."
 else
   note_failure "run ${recorded_run_id} was created but the Government capture posture cannot be checked (the db probe is gone and no read-only database URL was supplied) — UNVERIFIED"
 fi
 
-echo "== 3. Delete the disposable probe jobs"
-# Unconditional: a failed capture check is never a reason to leave a
-# credentialed probe job standing.
+echo "== 4. Delete the disposable probe jobs"
 for job in "${STAGE_D_DB_PROBE_JOB}" "${STAGE_D_GW_PROBE_JOB}"; do
   gcloud run jobs delete "${job}" \
     --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" --quiet \
     || echo "note: deleting ${job} failed (may already be absent); the postcondition verifies."
 done
 
-echo "== 4. PROVE both probe jobs are absent (missing cleanup fails this step)"
-# Never infer absence from the delete command's exit status. List what
-# Cloud Run actually holds and fail closed if either probe is still there
-# OR if the listing itself could not be obtained.
+echo "== 5. PROVE both probe jobs are absent (missing cleanup fails this step)"
 final_listing="$(gcloud run jobs list --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" \
   --format='value(metadata.name)' 2>/dev/null)" || final_listing="__LISTING_FAILED__"
 if [ "${final_listing}" = "__LISTING_FAILED__" ]; then
@@ -132,19 +152,27 @@ else
   done
 fi
 
-echo "== 5. Verdict"
+echo "== 6. Verdict"
 if [ "${lockdown_failures}" -gt 0 ]; then
   echo "STAGE D LOCKDOWN INCOMPLETE: ${lockdown_failures} critical step(s) failed — production may NOT be fully locked down. Investigate and re-run immediately." >&2
   exit 1
 fi
-if [ "${capture_proven}" -ne 1 ]; then
-  # Flags are off and the probes are gone, but the capture posture was not
-  # PROVEN. Say exactly that instead of claiming a complete lockdown.
-  echo "STAGE D LOCKDOWN PARTIAL: fail-closed posture verified and both probes proven absent, but the Government"
-  echo "capture posture was NOT proven (see step 2). Verify it before closing Stage D:"
+if [ "${capture_proven}" -ne 1 ] || { [ -n "${recorded_run_id}" ] && [ "${run_terminal_proven}" -ne 1 ]; }; then
+  # Flags are off and the probes are gone, but a required database proof
+  # was not obtained. Say exactly that instead of claiming a complete
+  # lockdown.
+  echo "STAGE D LOCKDOWN PARTIAL: fail-closed posture verified and both probes proven absent, but a required"
+  echo "database proof was NOT obtained (see steps 2 and 3). Verify before closing Stage D:"
+  if [ -n "${recorded_run_id}" ]; then
+    echo "  select status, worker_id, lease_expires_at from public.runs where id = '${recorded_run_id}';"
+    echo "    expected: a terminal status"
+    echo "  select count(*) from public.model_call_budget_reservations"
+    echo "   where run_id = '${recorded_run_id}' and status = 'reserved';   expected: 0"
+  fi
   echo "  select status, launch_state, worker_id, started_at from public.runs where id = '${STAGE_D_GOV_CAPTURE_RUN_ID}';"
-  echo "  expected: (queued, none, NULL, NULL) or (cancelled, none, NULL, NULL)"
+  echo "    expected: (queued, none, NULL, NULL) or (cancelled, none, NULL, NULL)"
   exit 2
 fi
-echo "STAGE D LOCKDOWN COMPLETE: fail-closed posture verified, Government capture proven unclaimed, both disposable probes deleted and proven absent."
+echo "STAGE D LOCKDOWN COMPLETE: fail-closed posture verified, database run terminal with zero active runs and zero"
+echo "dangling reservations, Government capture proven unclaimed, both disposable probes deleted and proven absent."
 echo "Record every mutation in docs/production-readiness/STAGE_D_AUTHORIZATION.md."

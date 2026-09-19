@@ -1140,7 +1140,7 @@ def test_lockdown_proves_the_capture_before_deleting_the_probe(tmp_path):
 
 
 def test_lockdown_refuses_to_claim_success_when_the_capture_check_fails(tmp_path):
-    world = StageDWorld(tmp_path, state={"govcheck_ok": False})
+    world = StageDWorld(tmp_path, state={"probe_verdicts": {"govcheck": False, "terminalize": True}})
     world.enable_execution_surface()
     result = world.run("07-post-run-lockdown.sh")
     assert result.returncode != 0
@@ -1153,12 +1153,15 @@ def test_lockdown_refuses_to_claim_success_when_the_capture_check_fails(tmp_path
 
 
 def test_lockdown_refuses_to_claim_success_when_the_capture_check_cannot_run(tmp_path):
+    """An execution that cannot even run proves nothing."""
     world = StageDWorld(tmp_path, state={"govcheck_available": False})
     world.enable_execution_surface()
     result = world.run("07-post-run-lockdown.sh")
     assert result.returncode != 0
     assert "STAGE D LOCKDOWN COMPLETE" not in result.stdout
-    assert "UNVERIFIED" in result.stderr
+    assert "LOCKDOWN CRITICAL" in result.stderr
+    assert "Government capture posture check" in result.stderr
+    # The probes are still removed even though the checks could not run.
     world.assert_probes_absent()
 
 
@@ -1879,10 +1882,14 @@ def test_there_is_no_build_or_deploy_step_at_all():
             assert not [line for line in code if verb in line and "--image" in line], \
                 f"{path.name} updates a Cloud Run image via {verb}"
 
-    # The probe image must stay the stock one, never anything from the
-    # release registry.
+    # The probe image is the pinned DIGEST of the reviewed probe runtime,
+    # never the release registry and never a tag.
     probes = (STAGE_D / "04-create-probes.sh").read_text()
-    assert "--image=python:3.12-slim" in probes
+    assert '--image="${PROBE_IMAGE}"' in probes
+    # The mutable tag may be DISCUSSED in comments but never used in code.
+    probe_code = [line for line in probes.splitlines()
+                  if line.strip() and not line.lstrip().startswith("#")]
+    assert not [line for line in probe_code if "python:3.12-slim" in line]
     assert f"--image={REGISTRY}" not in probes
 
 
@@ -2225,7 +2232,8 @@ _DEFAULT = object()
 
 def wire_setup(db, monkeypatch, *, workflow_key="vehicle_catalog_v1",
                configuration=_DEFAULT, members=_DEFAULT, user_active=0, project_active=0,
-               project_id=STAGE_D_PROJECT_ID, conversations=_DEFAULT):
+               project_id=STAGE_D_PROJECT_ID, conversations=_DEFAULT,
+               user_exists=True, project_exists=True, record=None):
     """Route probe_db.setup()'s HTTP layer at a deterministic fake."""
     if configuration is _DEFAULT:
         configuration = {"stage": "stage-d"}
@@ -2235,14 +2243,19 @@ def wire_setup(db, monkeypatch, *, workflow_key="vehicle_catalog_v1",
         conversations = [{"id": STAGE_D_CONVERSATION}]
 
     def fake_call(method, path, body=None, headers=None):
-        if path == "/auth/v1/admin/users":
+        if record is not None:
+            record.append((method, path))
+        if path.startswith("/auth/v1/admin/users") and method == "GET":
+            return 200, {"users": [{"id": STAGE_D_USER_ID, "email": db.TEST_EMAIL}] if user_exists else []}
+        if path.startswith("/auth/v1/admin/users") and method == "POST":
             return 201, {"id": STAGE_D_USER_ID}
-        if path.startswith("/rest/v1/projects") and method == "POST":
-            # Simulate the "already exists" path so the REUSE branch, which
-            # is the one that must prove everything, is exercised.
-            return 409, {"code": "23505"}
         if path.startswith("/rest/v1/projects") and method == "GET":
+            if not project_exists:
+                return 200, []
             return 200, [{"id": project_id, "workflow_key": workflow_key,
+                          "configuration": configuration}]
+        if path.startswith("/rest/v1/projects") and method == "POST":
+            return 201, [{"id": project_id, "workflow_key": workflow_key,
                           "configuration": configuration}]
         if path.startswith("/rest/v1/project_members") and method == "POST":
             return 201, None
@@ -2250,6 +2263,8 @@ def wire_setup(db, monkeypatch, *, workflow_key="vehicle_catalog_v1",
             return 200, members
         if path.startswith("/rest/v1/conversations") and method == "GET":
             return 200, conversations
+        if path.startswith("/rest/v1/conversations") and method == "POST":
+            return 201, [{"id": STAGE_D_CONVERSATION}]
         return 200, []
 
     def fake_count(path):
@@ -2415,3 +2430,696 @@ def test_this_pr_proposes_no_runtime_change():
         pytest.skip("the pinned release SHA is not available in this checkout")
     touched = [f for f in changed.stdout.split() if f.startswith("backend/")]
     assert not touched, f"this PR changes runtime code: {touched}"
+
+
+# ---------------------------------------------------------------------------
+# O. The PRIVILEGED probe runtime is pinned by digest (round-3 finding 1)
+# ---------------------------------------------------------------------------
+
+PROBE_REPO = "python"
+PROBE_DIGEST = "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea"
+PROBE_IMAGE = f"{PROBE_REPO}@{PROBE_DIGEST}"
+API_SA = "milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
+GATEWAY_SA = "milo-vercel-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"
+DB_PROBE_SECRETS = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
+
+
+def probe_job_doc(image=PROBE_IMAGE, sa=API_SA, secrets=None):
+    secrets = DB_PROBE_SECRETS if secrets is None else secrets
+    env = [{"name": "PROBE_SOURCE_GZIP_B64", "value": "<elided>"}]
+    env += [{"name": s, "valueFrom": {"secretKeyRef": {"key": "latest", "name": s}}} for s in secrets]
+    return {"spec": {"template": {"spec": {"template": {"spec": {
+        "serviceAccountName": sa,
+        "containers": [{"image": image, "env": env}],
+    }}}}}}
+
+
+def run_verify_probe_jobs(tmp_path, *, db=None, gw=None, repo=PROBE_REPO, digest=PROBE_DIGEST):
+    argv = [sys.executable, str(STAGE_D / "verify_probe_jobs.py")]
+    for flag, doc in (("--db-json", db), ("--gw-json", gw)):
+        if doc is None:
+            continue
+        path = tmp_path / f"{flag.strip('-')}.json"
+        path.write_text(doc if isinstance(doc, str) else json.dumps(doc))
+        argv += [flag, str(path)]
+    return subprocess.run(
+        argv, capture_output=True, text=True,
+        env={**os.environ, "STAGE_D_PROBE_IMAGE_REPO": repo, "STAGE_D_PROBE_IMAGE_DIGEST": digest,
+             "STAGE_D_API_SA": API_SA, "STAGE_D_GATEWAY_SA": GATEWAY_SA},
+        timeout=60)
+
+
+def test_probe_job_gate_passes_on_the_reviewed_jobs(tmp_path):
+    result = run_verify_probe_jobs(
+        tmp_path, db=probe_job_doc(), gw=probe_job_doc(sa=GATEWAY_SA, secrets=[]))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["ok"] is True
+
+
+def test_probe_job_gate_refuses_a_tag_only_image(tmp_path):
+    """The exact defect: a credentialed job created from a mutable tag."""
+    result = run_verify_probe_jobs(tmp_path, db=probe_job_doc(image="python:3.12-slim"))
+    assert result.returncode != 0
+    assert "is a TAG reference" in result.stdout
+    assert "production credentials" in result.stdout
+    assert "service-role access" in result.stderr
+
+
+def test_probe_job_gate_refuses_a_moved_digest(tmp_path):
+    result = run_verify_probe_jobs(tmp_path, db=probe_job_doc(image=f"{PROBE_REPO}@sha256:" + "a" * 64))
+    assert result.returncode != 0
+    assert "not the reviewed probe runtime digest" in result.stdout
+
+
+def test_probe_job_gate_refuses_a_missing_image(tmp_path):
+    doc = probe_job_doc()
+    doc["spec"]["template"]["spec"]["template"]["spec"]["containers"][0].pop("image")
+    result = run_verify_probe_jobs(tmp_path, db=doc)
+    assert result.returncode != 0
+    assert "image reference is missing" in result.stdout
+
+
+@pytest.mark.parametrize("foreign", [
+    f"ghcr.io/attacker/python@{PROBE_DIGEST}",
+    f"us-central1-docker.pkg.dev/attacker/evil/python@{PROBE_DIGEST}",
+    f"python-evil@{PROBE_DIGEST}",
+])
+def test_probe_job_gate_refuses_a_foreign_image(tmp_path, foreign):
+    result = run_verify_probe_jobs(tmp_path, db=probe_job_doc(image=foreign))
+    assert result.returncode != 0
+    assert "not the reviewed probe repository" in result.stdout
+
+
+def test_probe_job_gate_refuses_an_unexpected_identity(tmp_path):
+    result = run_verify_probe_jobs(tmp_path, db=probe_job_doc(sa="attacker@evil.iam.gserviceaccount.com"))
+    assert result.returncode != 0
+    assert "operator-controlled" in result.stdout
+
+
+@pytest.mark.parametrize("secrets", [
+    [],
+    ["SUPABASE_URL"],
+    ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "KIMI_API_KEY"],
+])
+def test_probe_job_gate_refuses_unexpected_secret_bindings(tmp_path, secrets):
+    result = run_verify_probe_jobs(tmp_path, db=probe_job_doc(secrets=secrets))
+    assert result.returncode != 0
+    assert "secret bindings" in result.stdout or "provider alias" in result.stdout
+
+
+def test_probe_job_gate_refuses_a_provider_alias_on_a_probe(tmp_path):
+    result = run_verify_probe_jobs(
+        tmp_path, db=probe_job_doc(secrets=DB_PROBE_SECRETS + ["KIMI_API_KEY"]))
+    assert result.returncode != 0
+    assert "provider alias KIMI_API_KEY must NEVER be present" in result.stdout
+
+
+def test_probe_job_gate_requires_the_gateway_probe_to_hold_no_secrets(tmp_path):
+    result = run_verify_probe_jobs(
+        tmp_path, gw=probe_job_doc(sa=GATEWAY_SA, secrets=["SUPABASE_SERVICE_ROLE_KEY"]))
+    assert result.returncode != 0
+    assert "secret bindings" in result.stdout
+
+
+def test_probe_job_gate_fails_closed_without_a_pinned_digest(tmp_path):
+    assert run_verify_probe_jobs(tmp_path, db=probe_job_doc(), digest="").returncode != 0
+    assert run_verify_probe_jobs(tmp_path, db=probe_job_doc(), repo="").returncode != 0
+    assert run_verify_probe_jobs(tmp_path, db=probe_job_doc(), digest="3.12-slim").returncode != 0
+
+
+def test_probe_creation_uses_the_pinned_digest_and_never_a_tag():
+    text = (STAGE_D / "04-create-probes.sh").read_text()
+    assert 'PROBE_IMAGE="${STAGE_D_PROBE_IMAGE_REPO}@${STAGE_D_PROBE_IMAGE_DIGEST}"' in text
+    assert text.count('--image="${PROBE_IMAGE}"') == 2
+    code = [line for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+    assert not [line for line in code if "python:3.12-slim" in line]
+
+
+def test_probe_jobs_are_verified_after_creation_and_before_every_execution():
+    creation = (STAGE_D / "04-create-probes.sh").read_text()
+    assert "verify_probe_jobs.py --db-json" in creation
+    assert creation.index("gcloud run jobs create") < creation.index("Post-creation verification")
+    for name in ("05-execute-run.sh", "06-collect-evidence.sh"):
+        text = (STAGE_D / name).read_text()
+        assert "source ./probe_exec.sh" in text
+        assert 'verify_probe_job "${job}"' in text
+        # The verification precedes the execution within run_probe.
+        assert text.index('verify_probe_job "${job}"') < text.index("gcloud run jobs execute")
+    lockdown = (STAGE_D / "07-post-run-lockdown.sh").read_text()
+    assert "execute_probe_attributed" in lockdown
+    assert 'verify_probe_job "${job}"' in (STAGE_D / "probe_exec.sh").read_text()
+
+
+def test_the_env_documents_the_mirror_posture_honestly():
+    text = (STAGE_D / "stage-d-env.sh").read_text()
+    assert "STANDARD repository, not a REMOTE one" in text
+    assert "mirroring preserves the manifest digest" in text
+    assert PROBE_DIGEST in text
+
+
+# ---------------------------------------------------------------------------
+# P. The reviewed probe SOURCE is pinned by hash (round-3 finding 5)
+# ---------------------------------------------------------------------------
+
+
+def pinned_source_hashes() -> dict[str, str]:
+    text = (STAGE_D / "stage-d-env.sh").read_text()
+    out = {}
+    for var, name in (("STAGE_D_PROBE_DB_SHA256", "probe_db.py"),
+                      ("STAGE_D_PROBE_GW_SHA256", "probe_gateway.py")):
+        match = re.search(rf'stage_d_pin {var} "([0-9a-f]{{64}})"', text)
+        assert match, f"{var} is not pinned to a sha256"
+        out[name] = match.group(1)
+    return out
+
+
+def test_the_pinned_probe_source_hashes_match_the_committed_files():
+    """A stale pin would block the operator; a missing one would ship
+    unreviewed privileged code. CI keeps them honest."""
+    import hashlib
+    for name, expected in pinned_source_hashes().items():
+        actual = hashlib.sha256((STAGE_D / name).read_bytes()).hexdigest()
+        assert actual == expected, (
+            f"{name} changed but STAGE_D_PROBE_*_SHA256 was not regenerated: {actual}")
+
+
+def run_probe_creation(tmp_path, *, tamper=None, env_overrides=None):
+    """Run 04-create-probes.sh far enough to reach (or refuse before) gcloud."""
+    world = StageDWorld(tmp_path)
+    if tamper:
+        target = world.dir / tamper
+        target.write_text(target.read_text() + "\n# tampered\n")
+    return world, subprocess.run(
+        ["bash", str(world.dir / "04-create-probes.sh")],
+        capture_output=True, text=True, cwd=str(world.dir),
+        env=world.env(**(env_overrides or {})), timeout=300)
+
+
+@pytest.mark.parametrize("tampered", ["probe_db.py", "probe_gateway.py"])
+def test_probe_creation_refuses_tampered_source_before_any_mutation(tmp_path, tampered):
+    """TAMPER TEST — an edited privileged probe must never be shipped."""
+    world, result = run_probe_creation(tmp_path, tamper=tampered)
+    assert result.returncode != 0
+    assert "is NOT the reviewed source" in result.stderr
+    assert "refusing before any gcloud mutation" in result.stderr
+    # Nothing was created: the refusal precedes every gcloud call.
+    assert world.read_state()["jobs"] == ["milo-agent-worker"]
+    assert not world.log.exists() or "jobs create" not in world.log.read_text()
+
+
+def test_the_source_pin_cannot_be_cleared_from_the_environment(tmp_path):
+    """Clearing the pin from the shell must not disable the check."""
+    world, result = run_probe_creation(
+        tmp_path, env_overrides={"STAGE_D_PROBE_DB_SHA256": ""})
+    # An empty inherited value is treated as unset, so the committed pin is
+    # used and the reviewed source still verifies.
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "matches its reviewed SHA-256" in result.stdout
+
+
+def test_a_forged_source_hash_cannot_be_supplied_from_the_environment(tmp_path):
+    """The real attack: tamper with the file AND supply its new hash."""
+    import hashlib
+    world = StageDWorld(tmp_path)
+    target = world.dir / "probe_db.py"
+    target.write_text(target.read_text() + "\n# tampered\n")
+    forged = hashlib.sha256(target.read_bytes()).hexdigest()
+    result = subprocess.run(
+        ["bash", str(world.dir / "04-create-probes.sh")],
+        capture_output=True, text=True, cwd=str(world.dir),
+        env=world.env(STAGE_D_PROBE_DB_SHA256=forged), timeout=300)
+    assert result.returncode != 0
+    # stage-d-env.sh refuses the conflicting override before anything runs.
+    assert "STAGE D REFUSED" in result.stderr
+    assert world.read_state()["jobs"] == ["milo-agent-worker"]
+
+
+def test_probe_creation_succeeds_on_the_reviewed_source(tmp_path):
+    world, result = run_probe_creation(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "matches its reviewed SHA-256" in result.stdout
+    assert sorted(world.read_state()["jobs"]) == ["milo-agent-worker", "stage-d-db-probe", "stage-d-gw-probe"]
+    # Created from the pinned digest, never a tag.
+    created = [line for line in world.log.read_text().splitlines() if "jobs create" in line]
+    assert len(created) == 2
+    for line in created:
+        assert PROBE_IMAGE in line
+        assert "python:3.12-slim" not in line
+
+
+def test_probe_creation_verifies_the_templates_it_created(tmp_path):
+    """A job that was created wrong must be caught, not assumed correct."""
+    world = StageDWorld(tmp_path)
+    world.set_state(probe_jobs={"stage-d-db-probe": {
+        "image": "python:3.12-slim", "sa": API_SA, "secrets": DB_PROBE_SECRETS}})
+    result = subprocess.run(
+        ["bash", str(world.dir / "04-create-probes.sh")],
+        capture_output=True, text=True, cwd=str(world.dir), env=world.env(), timeout=300)
+    assert result.returncode != 0
+    assert "is a TAG reference" in result.stdout
+    assert "not what was reviewed" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Q. The DATABASE run is terminalized and proved (round-3 finding 2)
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(REPO / "tests" / "fixtures" / "stage_d"))
+from fake_postgrest import FakePostgrest, wire as wire_postgrest  # noqa: E402
+
+STAGE_D_RUN_ID = "aaaa1111-2222-3333-4444-555566667777"
+RUN_USER = "ffffffff-1111-2222-3333-444444444444"
+RUN_CONVERSATION = "99999999-8888-7777-6666-555555555555"
+RUN_PROJECT = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def stage_d_run(status="running", **overrides):
+    row = {
+        "id": STAGE_D_RUN_ID,
+        "status": status,
+        "launch_state": "launched",
+        "worker_id": "worker-1",
+        "attempt": 1,
+        "started_at": "2026-09-19T00:00:00Z",
+        "finished_at": None,
+        "idempotency_key": STAGE_D_KEY,
+        "requested_by": RUN_USER,
+        "conversation_id": RUN_CONVERSATION,
+    }
+    row.update(overrides)
+    return row
+
+
+def reservation(seq, status="reserved"):
+    return {"id": f"res-{seq}", "run_id": STAGE_D_RUN_ID, "call_seq": seq, "status": status}
+
+
+def wire_terminalize(db, monkeypatch, *, runs=None, reservations=None, run_id=STAGE_D_RUN_ID):
+    monkeypatch.setenv("STAGE_D_RUN_ID", run_id)
+    monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
+    monkeypatch.setenv("STAGE_D_GOV_CAPTURE_RUN_ID", GOV_RUN_ID)
+    fake = FakePostgrest(
+        runs=runs if runs is not None else [stage_d_run()],
+        reservations=reservations or [],
+        conversations=[{"id": RUN_CONVERSATION, "project_id": RUN_PROJECT}],
+    )
+    return wire_postgrest(db, monkeypatch, fake)
+
+
+def terminalize_verdict(capsys):
+    return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+
+@pytest.mark.parametrize("status", ["queued", "launching", "starting", "running", "waiting"])
+def test_terminalize_drives_an_interrupted_run_to_cancelled(db, monkeypatch, capsys, status):
+    """Cancelling the Cloud Run execution does not close the DB run.
+
+    The Worker has no SIGTERM handler, so an interrupted run stays in an
+    active state holding its lease and its concurrency slot until
+    something terminalizes it.
+    """
+    fake = wire_terminalize(db, monkeypatch, runs=[stage_d_run(status=status)])
+    db.terminalize()
+    verdict = terminalize_verdict(capsys)
+    assert verdict["ok"] is True, verdict["problems"]
+    assert verdict["terminal"] is True
+    # The ROW really changed — this is state, not a canned response.
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "cancelled"
+    assert fake.run(STAGE_D_RUN_ID)["finished_at"]
+    assert verdict["active_runs_for_user"] == 0
+    assert verdict["active_runs_for_project"] == 0
+
+
+def test_terminalize_follows_the_supported_two_step_lifecycle(db, monkeypatch, capsys):
+    """running -> cancellation_requested -> cancelled, not a forged jump."""
+    fake = wire_terminalize(db, monkeypatch)
+    db.terminalize()
+    verdict = terminalize_verdict(capsys)
+    assert verdict["actions"][:2] == ["running->cancellation_requested", "cancellation_requested->cancelled"]
+    patches = [p for m, p in fake.calls if m == "PATCH"]
+    assert len(patches) == 2
+    # Every PATCH is guarded on the observed status AND the authorized key.
+    for path in patches:
+        assert f"id=eq.{STAGE_D_RUN_ID}" in path
+        assert "status=eq." in path
+        assert f"idempotency_key=eq.{STAGE_D_KEY}" in path
+
+
+def test_terminalize_releases_dangling_reservations_and_proves_zero(db, monkeypatch, capsys):
+    """A dangling reservation keeps the daily budget consumed forever."""
+    fake = wire_terminalize(
+        db, monkeypatch,
+        reservations=[reservation(1), reservation(2), reservation(3, status="settled")])
+    assert fake.reserved_count(STAGE_D_RUN_ID) == 2
+    db.terminalize()
+    verdict = terminalize_verdict(capsys)
+    assert verdict["ok"] is True, verdict["problems"]
+    assert verdict["reservations_released"] == 2
+    assert verdict["reservations_still_reserved"] == 0
+    assert fake.reserved_count(STAGE_D_RUN_ID) == 0
+    # Released through the SUPPORTED RPC, not a raw table write.
+    assert len(fake.rpc_calls) == 2
+    for call in fake.rpc_calls:
+        assert call["p_status"] == "released"
+        assert call["p_actual_cost"] == 0
+        assert "stage-d cleanup" in call["p_rejection_reason"]
+    assert not [p for m, p in fake.calls
+                if m == "PATCH" and "model_call_budget_reservations" in p]
+
+
+def test_terminalize_interruption_with_running_row_and_dangling_reservation(db, monkeypatch, capsys):
+    """The full interruption shape: mid-run row plus held budget."""
+    fake = wire_terminalize(
+        db, monkeypatch,
+        runs=[stage_d_run(status="running")],
+        reservations=[reservation(i) for i in range(1, 6)])
+    db.terminalize()
+    verdict = terminalize_verdict(capsys)
+    assert verdict["ok"] is True, verdict["problems"]
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "cancelled"
+    assert fake.reserved_count(STAGE_D_RUN_ID) == 0
+    assert verdict["active_runs_for_user"] == 0
+    assert verdict["active_runs_for_project"] == 0
+
+
+def test_terminalize_leaves_an_already_terminal_run_alone(db, monkeypatch, capsys):
+    fake = wire_terminalize(db, monkeypatch, runs=[stage_d_run(status="completed",
+                                                              finished_at="2026-09-19T01:00:00Z")])
+    db.terminalize()
+    verdict = terminalize_verdict(capsys)
+    assert verdict["ok"] is True, verdict["problems"]
+    assert verdict["actions"] == []
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "completed"
+    assert not [c for c in fake.mutating_calls()]
+
+
+def test_terminalize_refuses_a_run_this_authorization_does_not_own(db, monkeypatch, capsys):
+    """IDENTITY CHECK — never terminalize somebody else's run."""
+    fake = wire_terminalize(db, monkeypatch,
+                            runs=[stage_d_run(idempotency_key="swarm-v2-smoke-20260825-4dbdcd6-01")])
+    with pytest.raises(SystemExit):
+        db.terminalize()
+    verdict = terminalize_verdict(capsys)
+    assert "not the authorized Stage D key" in " ".join(verdict["problems"])
+    assert fake.mutating_calls() == []
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "running"
+
+
+def test_terminalize_refuses_the_government_capture_run(db, monkeypatch, capsys):
+    monkeypatch.setenv("STAGE_D_RUN_ID", GOV_RUN_ID)
+    monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
+    monkeypatch.setenv("STAGE_D_GOV_CAPTURE_RUN_ID", GOV_RUN_ID)
+    fake = wire_postgrest(db, monkeypatch, FakePostgrest(runs=[stage_d_run(id=GOV_RUN_ID)]))
+    with pytest.raises(SystemExit):
+        db.terminalize()
+    assert "refusing to touch it" in " ".join(terminalize_verdict(capsys)["problems"])
+    assert fake.mutating_calls() == []
+
+
+def test_terminalize_never_overwrites_a_concurrent_terminal_result(db, monkeypatch, capsys):
+    """A worker writing its own terminal result must win the race.
+
+    Losing the CAS is not a failure — the desired end state is exactly
+    what the other writer produced. The probe re-reads, sees a terminal
+    run, and the POSTCONDITION PROOF is what decides.
+    """
+    fake = wire_terminalize(db, monkeypatch)
+    original_call = fake.call
+    raced = {"done": False}
+
+    def racing_call(method, path, body=None, headers=None):
+        if method == "PATCH" and not raced["done"]:
+            # Someone else finishes the run first: the guarded CAS matches 0.
+            fake.run(STAGE_D_RUN_ID)["status"] = "failed"
+            fake.run(STAGE_D_RUN_ID)["finished_at"] = "2026-09-19T02:00:00Z"
+            raced["done"] = True
+        return original_call(method, path, body, headers)
+
+    monkeypatch.setattr(db, "call", racing_call)
+    db.terminalize()
+    verdict = terminalize_verdict(capsys)
+    # The other writer's result stands, untouched.
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "failed"
+    # And the cleanup still succeeds, because the postcondition holds.
+    assert verdict["ok"] is True, verdict["problems"]
+    assert verdict["terminal"] is True
+    assert any(a.startswith("cas_lost_at_") for a in verdict["actions"])
+
+
+def test_terminalize_fails_closed_when_the_cas_keeps_matching_nothing(db, monkeypatch, capsys):
+    """A CAS that matches nothing while the row is unchanged is a real
+    problem: it means the row is not the authorized run."""
+    fake = wire_terminalize(db, monkeypatch)
+    original_call = fake.call
+
+    def refusing_call(method, path, body=None, headers=None):
+        if method == "PATCH":
+            return 200, []  # matched no row, and nothing changed
+        return original_call(method, path, body, headers)
+
+    monkeypatch.setattr(db, "call", refusing_call)
+    with pytest.raises(SystemExit):
+        db.terminalize()
+    verdict = terminalize_verdict(capsys)
+    assert "matched no row although the run is still" in " ".join(verdict["problems"])
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "running"
+
+
+def test_terminalize_reports_remaining_active_runs_as_a_failure(db, monkeypatch, capsys):
+    other = stage_d_run(id="bbbb1111-2222-3333-4444-555566667777", status="running",
+                        idempotency_key="other-key")
+    fake = wire_terminalize(db, monkeypatch, runs=[stage_d_run(), other])
+    with pytest.raises(SystemExit):
+        db.terminalize()
+    problems = " ".join(terminalize_verdict(capsys)["problems"])
+    assert "active run(s) remain" in problems
+    # The authorized run was still closed; only the proof failed.
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "cancelled"
+
+
+def test_terminalize_without_a_recorded_run_still_proves_the_key_is_idle(db, monkeypatch, capsys):
+    monkeypatch.setenv("STAGE_D_RUN_ID", "")
+    monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
+    wire_postgrest(db, monkeypatch, FakePostgrest(runs=[]))
+    db.terminalize()
+    verdict = terminalize_verdict(capsys)
+    assert verdict["ok"] is True and verdict["no_run_recorded"] is True
+    assert verdict["active_runs_under_key"] == 0
+
+
+def test_terminalize_without_a_recorded_run_fails_on_a_stray_active_run(db, monkeypatch, capsys):
+    monkeypatch.setenv("STAGE_D_RUN_ID", "")
+    monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
+    wire_postgrest(db, monkeypatch, FakePostgrest(runs=[stage_d_run(status="running")]))
+    with pytest.raises(SystemExit):
+        db.terminalize()
+    assert "still active" in " ".join(terminalize_verdict(capsys)["problems"])
+
+
+def test_lockdown_runs_terminalize_before_deleting_the_probe(tmp_path):
+    world = StageDWorld(tmp_path)
+    world.enable_execution_surface()
+    (world.workdir / "state.json").write_text(json.dumps({"run_id": STAGE_D_RUN_ID}))
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "STAGE D LOCKDOWN COMPLETE" in result.stdout
+    calls = world.log.read_text().splitlines()
+    terminalize_at = next(i for i, c in enumerate(calls) if "STAGE_D_MODE=terminalize" in c)
+    delete_at = next(i for i, c in enumerate(calls) if "jobs delete stage-d-db-probe" in c)
+    assert terminalize_at < delete_at
+
+
+def test_lockdown_is_not_complete_when_the_database_run_cannot_be_closed(tmp_path):
+    world = StageDWorld(tmp_path, state={
+        "probe_verdicts": {"govcheck": True, "terminalize": False}})
+    world.enable_execution_surface()
+    (world.workdir / "state.json").write_text(json.dumps({"run_id": STAGE_D_RUN_ID}))
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode != 0
+    assert "STAGE D LOCKDOWN COMPLETE" not in result.stdout
+    assert "could not be proven terminal and clean" in result.stderr
+    # Probes are still removed.
+    world.assert_probes_absent()
+    world.assert_fail_closed()
+
+
+def test_lockdown_is_partial_when_a_run_existed_but_no_probe_remains(tmp_path):
+    world = StageDWorld(tmp_path)
+    (world.workdir / "state.json").write_text(json.dumps({"run_id": STAGE_D_RUN_ID}))
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode != 0
+    assert "STAGE D LOCKDOWN COMPLETE" not in result.stdout
+    assert "cannot be terminalized" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# R. Setup mutates NOTHING when it rejects a project (round-3 finding 3)
+# ---------------------------------------------------------------------------
+
+
+def rejected_setup_calls(db, monkeypatch, **kwargs):
+    record: list[tuple[str, str]] = []
+    wire_setup(db, monkeypatch, record=record, **kwargs)
+    with pytest.raises(SystemExit):
+        db.setup()
+    return record
+
+
+def mutating(record):
+    return [(m, p) for m, p in record if m in ("POST", "PATCH", "PUT", "DELETE")]
+
+
+@pytest.mark.parametrize("bad", [
+    {"workflow_key": "swarm_v2"},
+    {"configuration": {"stage": "stage-c"}},
+    {"configuration": None},
+    {"members": [{"user_id": "someone-else", "role": "owner"}]},
+    {"user_active": 1},
+    {"project_active": 1},
+])
+def test_rejected_setup_writes_nothing_at_all(db, monkeypatch, capsys, bad):
+    """The defect: problems were recorded, then membership was upserted
+    and a conversation created in the project that had just been rejected."""
+    record = rejected_setup_calls(db, monkeypatch, **bad)
+    verdict = setup_verdict(capsys)
+    assert verdict["ok"] is False and verdict["mutations"] == []
+    writes = mutating(record)
+    assert writes == [], f"a rejected setup still wrote: {writes}"
+    assert not [p for _m, p in record if "project_members" in p and _m == "POST"]
+    assert not [p for _m, p in record if "conversations" in p and _m == "POST"]
+    # It must not even create the test user before validating.
+    assert not [p for _m, p in record if "admin/users" in p and _m == "POST"]
+
+
+def test_rejected_setup_reports_an_empty_mutation_list(db, monkeypatch, capsys):
+    rejected_setup_calls(db, monkeypatch, workflow_key="swarm_v2")
+    assert setup_verdict(capsys)["mutations"] == []
+
+
+def test_setup_validates_before_it_mutates(db, monkeypatch, capsys):
+    """Ordering proof on the happy path.
+
+    Every validation read must happen BEFORE the first write. (The
+    membership set is read again afterwards, as the post-mutation proof —
+    that later read is not part of validation.)
+    """
+    record: list[tuple[str, str]] = []
+    wire_setup(db, monkeypatch, record=record)
+    db.setup()
+    assert setup_verdict(capsys)["ok"] is True
+    writes = [i for i, (m, _p) in enumerate(record) if m == "POST"]
+    assert writes, "the happy path performed no mutation at all"
+    first_write = min(writes)
+    before = [p for m, p in record[:first_write] if m == "GET"]
+    # The three validation reads all precede the first write.
+    assert any("admin/users" in p for p in before), "the user was not looked up before writing"
+    assert any("projects?slug" in p for p in before), "the project was not validated before writing"
+    assert any("project_members" in p for p in before), "membership was not validated before writing"
+
+
+def test_setup_reproves_membership_after_the_authorized_mutation(db, monkeypatch, capsys):
+    record: list[tuple[str, str]] = []
+    wire_setup(db, monkeypatch, record=record)
+    db.setup()
+    verdict = setup_verdict(capsys)
+    assert verdict["members"] == [STAGE_D_USER_ID]
+    member_reads = [i for i, (m, p) in enumerate(record) if m == "GET" and "project_members" in p]
+    member_write = next(i for i, (m, p) in enumerate(record) if m == "POST" and "project_members" in p)
+    # Read before (validation) AND after (proof) the upsert.
+    assert any(i < member_write for i in member_reads)
+    assert any(i > member_write for i in member_reads)
+
+
+def test_setup_creates_everything_for_a_brand_new_project(db, monkeypatch, capsys):
+    record: list[tuple[str, str]] = []
+    wire_setup(db, monkeypatch, project_exists=False, user_exists=False,
+               members=[{"user_id": STAGE_D_USER_ID, "role": "owner"}], record=record)
+    db.setup()
+    verdict = setup_verdict(capsys)
+    assert verdict["ok"] is True, verdict.get("problems")
+    assert "created_project" in verdict["mutations"]
+    assert "created_test_user" in verdict["mutations"]
+    assert "upserted_membership" in verdict["mutations"]
+
+
+# ---------------------------------------------------------------------------
+# S. govcheck logs are attributed to the exact execution (round-3 finding 4)
+# ---------------------------------------------------------------------------
+
+STALE_PASS = {"stage_d_probe": "govcheck", "ok": True}
+
+
+def test_a_stale_pass_from_an_older_job_cannot_satisfy_govcheck(tmp_path):
+    """The defect: filtering by job NAME alone.
+
+    A deleted-and-recreated job of the same name leaves retained logs. An
+    old PASS plus a current execution that emits nothing must FAIL.
+    """
+    world = StageDWorld(tmp_path, state={
+        "stale_logs": [STALE_PASS],
+        "probe_silent_modes": ["govcheck"],
+    })
+    world.enable_execution_surface()
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode != 0
+    assert "STAGE D LOCKDOWN COMPLETE" not in result.stdout
+    assert "Government capture posture check" in result.stderr
+
+
+def test_a_stale_pass_cannot_mask_a_current_failure(tmp_path):
+    world = StageDWorld(tmp_path, state={
+        "stale_logs": [STALE_PASS],
+        "probe_verdicts": {"govcheck": False, "terminalize": True},
+    })
+    world.enable_execution_surface()
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode != 0
+    assert "STAGE D LOCKDOWN COMPLETE" not in result.stdout
+
+
+def test_a_stale_pass_cannot_mask_a_missing_terminalize_record(tmp_path):
+    world = StageDWorld(tmp_path, state={
+        "stale_logs": [{"stage_d_probe": "terminalize", "ok": True}],
+        "probe_silent_modes": ["terminalize"],
+    })
+    world.enable_execution_surface()
+    (world.workdir / "state.json").write_text(json.dumps({"run_id": STAGE_D_RUN_ID}))
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode != 0
+    assert "could not be proven terminal and clean" in result.stderr
+
+
+def test_lockdown_filters_probe_logs_by_the_exact_execution_name(tmp_path):
+    world = StageDWorld(tmp_path)
+    world.enable_execution_surface()
+    world.run("07-post-run-lockdown.sh")
+    reads = [c for c in world.log.read_text().splitlines() if "logging read" in c]
+    assert reads, "the lockdown read no probe logs at all"
+    for call in reads:
+        assert 'execution_name"=' in call, f"unattributed log query: {call}"
+        assert 'execution_name"= ' not in call
+
+
+def test_the_attributed_helper_launches_async_and_waits_on_that_execution():
+    text = (STAGE_D / "probe_exec.sh").read_text()
+    assert "--async --format='value(metadata.name)'" in text
+    assert 'execution_name\\"=${exec_name}' in text
+    assert "execution_state.py" in text
+    assert "could not establish the execution name" in text
+    # probe_verdict must fail closed when no record exists.
+    assert "no structured" in text and "failing closed" in text
+
+
+def test_probe_verdict_fails_closed_on_a_missing_record(tmp_path):
+    log = tmp_path / "probe.log"
+    log.write_text('{"stage_d_probe": "something-else", "ok": true}\n')
+    script = (
+        f'set -euo pipefail\n'
+        f'cd "{STAGE_D}"\n'
+        f'STAGE_D_PROJECT=p STAGE_D_REGION=r source ./probe_exec.sh\n'
+        f'probe_verdict "{log}" govcheck\n'
+    )
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    assert result.returncode != 0
+    assert "failing closed" in result.stderr

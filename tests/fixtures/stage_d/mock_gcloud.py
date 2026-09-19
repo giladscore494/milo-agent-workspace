@@ -33,6 +33,12 @@ WORKER_DIGEST = "sha256:d3743e5a8dabc3f663970abe83886ea91b030ad7b339e1178d0ab5ef
 WORKER_JOB = "milo-agent-worker"
 API_SERVICE = "milo-agent-api"
 READY_REVISION = "milo-agent-api-00080-nm8"
+DB_PROBE = "stage-d-db-probe"
+GW_PROBE = "stage-d-gw-probe"
+PROBE_IMAGE_REPO = "python"
+PROBE_IMAGE_DIGEST = "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea"
+API_SA = "milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
+GATEWAY_SA = "milo-vercel-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"
 
 DEFAULT_FLAGS = {
     "MILO_ENABLE_RUN_CREATION": "false",
@@ -61,6 +67,21 @@ def default_state() -> dict:
         "govcheck_ok": True,
         "govcheck_available": True,
         "fail_commands": [],
+        # Per-mode verdicts the probe executions report.
+        "probe_verdicts": {"govcheck": True, "terminalize": True},
+        # Modes whose execution deliberately emits NO structured record.
+        "probe_silent_modes": [],
+        # Retained records from an OLDER, deleted-and-recreated job of
+        # the same name. Only an UNATTRIBUTED (job-name-only) log query
+        # can see these — which is exactly the bug the attributed query
+        # fixes.
+        "stale_logs": [],
+        # execution name -> structured records produced by it.
+        "execution_logs": {},
+        "probe_executions": {},
+        "next_execution": 1,
+        # Probe job templates, keyed by job name.
+        "probe_jobs": {},
     }
 
 
@@ -135,6 +156,24 @@ def api_revision_json(state: dict) -> dict:
             "env": container_env(state["api_env"], state["api_secrets"]),
         }]},
     }
+
+
+def default_probe_job(name: str) -> dict:
+    if name == DB_PROBE:
+        return {"image": f"{PROBE_IMAGE_REPO}@{PROBE_IMAGE_DIGEST}", "sa": API_SA,
+                "secrets": ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]}
+    return {"image": f"{PROBE_IMAGE_REPO}@{PROBE_IMAGE_DIGEST}", "sa": GATEWAY_SA, "secrets": []}
+
+
+def probe_job_json(state: dict, name: str) -> dict:
+    spec = (state.get("probe_jobs") or {}).get(name) or default_probe_job(name)
+    env = [{"name": "PROBE_SOURCE_GZIP_B64", "value": "<elided>"}]
+    env += [{"name": s, "valueFrom": {"secretKeyRef": {"key": "latest", "name": s}}}
+            for s in spec.get("secrets", [])]
+    return {"spec": {"template": {"spec": {"template": {"spec": {
+        "serviceAccountName": spec.get("sa"),
+        "containers": [{"image": spec.get("image"), "env": env}],
+    }}}}}}
 
 
 def executions_json(state: dict) -> list[dict]:
@@ -238,10 +277,31 @@ def main() -> int:
         return 0
 
     if has("run jobs execute"):
-        # Only the govcheck probe execution is modelled.
+        job = args[args.index("execute") + 1]
         if not state.get("govcheck_available", True):
             print("ERROR: probe execution failed", file=sys.stderr)
             return 1
+        mode = ""
+        for arg in args:
+            if "STAGE_D_MODE=" in arg:
+                mode = arg.split("STAGE_D_MODE=", 1)[1].split(":::", 1)[0].strip()
+        index = int(state.get("next_execution", 1))
+        state["next_execution"] = index + 1
+        exec_name = f"{job}-exec{index}"
+        verdicts = state.get("probe_verdicts") or {}
+        ok = bool(verdicts.get(mode, True))
+        state.setdefault("probe_executions", {})[exec_name] = {
+            "job": job, "mode": mode, "ok": ok,
+        }
+        records = []
+        if mode and mode not in (state.get("probe_silent_modes") or []):
+            record = {"stage_d_probe": mode, "ok": ok}
+            if not ok:
+                record["problems"] = [f"injected {mode} failure"]
+            records.append(record)
+        state.setdefault("execution_logs", {})[exec_name] = records
+        save(state)
+        print(exec_name)
         return 0
 
     # ---- reads ---------------------------------------------------------
@@ -251,6 +311,15 @@ def main() -> int:
 
     if has("run jobs executions describe"):
         name = args[args.index("describe") + 1]
+        probe = (state.get("probe_executions") or {}).get(name)
+        if probe is not None:
+            print(json.dumps({
+                "metadata": {"name": name},
+                "status": {"completionTime": "2026-09-19T00:00:00Z",
+                           "conditions": [{"type": "Completed",
+                                           "status": "True" if probe["ok"] else "False"}]},
+            }))
+            return 0
         print(json.dumps({
             "metadata": {"name": name},
             "spec": {"template": {"spec": {"containers": [
@@ -268,6 +337,15 @@ def main() -> int:
     if has("run jobs describe", WORKER_JOB):
         print(json.dumps(worker_job_json(state)))
         return 0
+
+    if has("run jobs describe"):
+        name = args[args.index("describe") + 1]
+        if name in (DB_PROBE, GW_PROBE):
+            if name not in state["jobs"]:
+                print(f"ERROR: job {name} not found", file=sys.stderr)
+                return 1
+            print(json.dumps(probe_job_json(state, name)))
+            return 0
 
     if has("run services describe", API_SERVICE):
         if "value(status.conditions" in joined:
@@ -302,10 +380,26 @@ def main() -> int:
         return 0
 
     if has("logging read"):
-        verdict = {"stage_d_probe": "govcheck", "ok": bool(state.get("govcheck_ok", True))}
-        if not verdict["ok"]:
-            verdict["problems"] = ["Government capture run has worker_id=worker-x — it was CLAIMED"]
-        print(json.dumps([{"textPayload": json.dumps(verdict)}]))
+        # An ATTRIBUTED query names one execution and may see only that
+        # execution's records. An UNATTRIBUTED (job-name-only) query also
+        # sees retained records from older jobs of the same name — the
+        # stale-log hazard the attributed form exists to eliminate.
+        exec_name = ""
+        for arg in args:
+            if 'execution_name"=' in arg:
+                exec_name = arg.split('execution_name"=', 1)[1].split()[0].strip()
+        if exec_name:
+            records = (state.get("execution_logs") or {}).get(exec_name, [])
+        else:
+            records = list(state.get("stale_logs") or [])
+            for entries in (state.get("execution_logs") or {}).values():
+                records.extend(entries)
+            if not records:
+                legacy = {"stage_d_probe": "govcheck", "ok": bool(state.get("govcheck_ok", True))}
+                if not legacy["ok"]:
+                    legacy["problems"] = ["Government capture run was CLAIMED"]
+                records = [legacy]
+        print(json.dumps([{"textPayload": json.dumps(r)} for r in records]))
         return 0
 
     # An unrecognised invocation must never be a silent success.

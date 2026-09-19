@@ -23,6 +23,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck source=stage-d-env.sh
 source ./stage-d-env.sh
+# shellcheck source=probe_exec.sh
+source ./probe_exec.sh
 
 # The working directory is the machine-readable handoff between this step,
 # the evidence gate and the cleanup trap. Nothing downstream may depend on
@@ -56,6 +58,11 @@ run_probe() { # job [KEY=VALUE ...] — execute, wait, print the execution log
     fi
     env_overrides+="${env_overrides:+${delim}}${kv}"
   done
+  # The db probe holds SUPABASE_SERVICE_ROLE_KEY, and a Cloud Run job
+  # template can be updated between creation and execution, so the
+  # pinned image digest, identity and secret bindings are re-verified
+  # immediately before every execution.
+  verify_probe_job "${job}" || return 1
   local exec_name
   exec_name="$(gcloud run jobs execute "${job}" \
     --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" \

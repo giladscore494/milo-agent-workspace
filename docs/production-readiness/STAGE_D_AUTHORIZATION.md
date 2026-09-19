@@ -181,6 +181,64 @@ and the evidence gate verifies the digest the authorized execution
 **actually ran**, read off the execution record itself, where a tag moved
 afterwards cannot hide it.
 
+### 2.7 The probe jobs are a privileged supply chain
+
+`stage-d-db-probe` runs with `SUPABASE_SERVICE_ROLE_KEY` bound. Whatever
+image and source that job runs therefore executes arbitrary code with
+service-role access to production, so both are pinned:
+
+| Input | Pin |
+| --- | --- |
+| Probe runtime image | `python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea` |
+| `probe_db.py` | `STAGE_D_PROBE_DB_SHA256` |
+| `probe_gateway.py` | `STAGE_D_PROBE_GW_SHA256` |
+
+An earlier revision created both probes from the **mutable** tag
+`python:3.12-slim`, which Docker Hub re-publishes: the job could have
+begun executing different code with those credentials between one
+execution and the next, with nothing noticing. It also transported
+whatever probe source happened to be on disk, so a dirty or unreviewed
+checkout would have shipped unreviewed privileged code.
+
+Now the sources are hash-verified **before any gcloud call**, both jobs
+are created from the digest, the created templates are verified, and the
+image, identity and secret bindings are re-verified **immediately before
+every probe execution** — a Cloud Run job template can be updated between
+creation and execution, and the credentials are what make that worth
+checking.
+
+**Mirror posture.** An approved Artifact Registry mirror is preferable to
+pulling a privileged runtime from a public registry. None exists today:
+the project has exactly one Artifact Registry repository, `milo-agent`,
+and it is a STANDARD repository, not a REMOTE one (verified read-only
+2026-09-19). Creating one is a production mutation and is deliberately
+outside this PR. Switching to it later is a one-line reviewed change to
+`STAGE_D_PROBE_IMAGE_REPO`, because mirroring preserves the manifest
+digest — the pin above stays byte-identical either way.
+
+### 2.8 Cancelling an execution does not close a database run
+
+Cancelling a Cloud Run execution does **not** make the database run
+terminal: `backend/worker/main.py` installs no `SIGTERM` handler. An
+interrupted run can therefore sit in `running` indefinitely, holding its
+lease, its `MILO_MAX_CONCURRENT_RUNS_PER_{USER,PROJECT}` slot and its
+budget reservations. An earlier revision's cleanup cancelled the
+execution and stopped there, and never read the recorded `run_id` at all.
+
+The lockdown now terminalizes the database run as well, while the db
+probe still exists. It is identity-checked — it refuses any run not
+carrying the authorized Stage D key, and refuses the prepared Government
+capture outright — and it uses the repository's own supported lifecycle
+(`active → cancellation_requested → cancelled`, each step a guarded
+compare-and-set on the observed status, so a worker writing its own
+terminal result is never overwritten) plus the supported service-role
+`settle_model_call_budget` RPC to release any dangling reservation.
+
+It then PROVES: the run is terminal; zero active runs remain for its user
+and for its project; zero reservations remain in status `reserved`.
+`LOCKDOWN COMPLETE` is impossible unless those hold **and** the
+Government-capture invariant is proven.
+
 ## 3. Proposed caps — derived from Stage C Attempt 7 evidence
 
 ### 3.1 The evidence base (read from production, read-only)
@@ -466,7 +524,8 @@ one-to-one `call_seq` reconciliation against the ledger; at least one
 heartbeat matching the claiming worker and attempt; a real bounded lease;
 `attempt = 1`, `launch_state = launched`, exactly one `run_invocations` row;
 an idempotent replay returning the **same** run id with no new run and no
-new Worker execution; exactly **8** database rows and exactly **1** under
+new Worker execution; the probe jobs still being the reviewed jobs at
+every execution; exactly **8** database rows and exactly **1** under
 the Stage D key; exactly **8** visible Worker executions, all terminal, zero
 active; **the digest the authorized execution actually ran equals the
 accepted Worker digest**; the Government-capture invariant intact; and zero

@@ -95,6 +95,50 @@ stage_d_pin STAGE_D_DB_PROBE_JOB "stage-d-db-probe"
 stage_d_pin STAGE_D_GW_PROBE_JOB "stage-d-gw-probe"
 
 # ---------------------------------------------------------------------------
+# The PRIVILEGED probe runtime — pinned by digest, never by tag.
+#
+# stage-d-db-probe runs with SUPABASE_SERVICE_ROLE_KEY bound, so whatever
+# image it runs executes arbitrary code with service-role access to
+# production. An earlier revision created both probes from the MUTABLE tag
+# `python:3.12-slim`, which Docker Hub re-publishes: the job could have
+# begun executing different code with those credentials between one
+# execution and the next, with nothing noticing.
+#
+# The digest below is `python:3.12-slim` as it resolved on 2026-09-19,
+# read-only, from the registry API. It is an OCI image index carrying a
+# linux/amd64 manifest, which is what Cloud Run pulls.
+#
+# MIRROR POSTURE. An approved Artifact Registry mirror is preferable to
+# pulling a privileged runtime from a public registry. No mirror exists
+# today: the project has exactly one Artifact Registry repository,
+# `milo-agent`, and it is a STANDARD repository, not a REMOTE one
+# (verified read-only 2026-09-19). Creating one is a production mutation
+# and is deliberately outside this PR. Switching to it later is a
+# ONE-LINE reviewed change to STAGE_D_PROBE_IMAGE_REPO and nothing else,
+# because mirroring preserves the manifest digest — the pin below stays
+# byte-identical either way. Until then the digest pin is what makes the
+# public pull safe.
+# ---------------------------------------------------------------------------
+stage_d_pin STAGE_D_PROBE_IMAGE_REPO "python"
+stage_d_pin STAGE_D_PROBE_IMAGE_DIGEST "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea"
+
+# ---------------------------------------------------------------------------
+# The reviewed probe SOURCE, pinned by content hash.
+#
+# 04-create-probes.sh transports whatever probe_db.py / probe_gateway.py
+# happen to be on disk into a job that holds production credentials. A
+# dirty working tree, a bad merge or an edited checkout would therefore
+# ship unreviewed code with service-role access. The encoder compares
+# these SHA-256 hashes BEFORE any gcloud mutation and refuses on any
+# mismatch.
+#
+# Regenerate deliberately, in a reviewed commit, after an intended change:
+#   sha256sum scripts/release/stage-d/probe_db.py scripts/release/stage-d/probe_gateway.py
+# ---------------------------------------------------------------------------
+stage_d_pin STAGE_D_PROBE_DB_SHA256 "7602e328615ad372255cdf381b3727abd3e62a0f27fcef61026c0217e9728378"
+stage_d_pin STAGE_D_PROBE_GW_SHA256 "359d7cbfc7195f9fee333480af0f7fe1ae09ca8ce339a0a7942bfe823dde4bce"
+
+# ---------------------------------------------------------------------------
 # The ONE authorized run identity.
 #
 # A brand-new key. Every key production has ever seen is consumed history

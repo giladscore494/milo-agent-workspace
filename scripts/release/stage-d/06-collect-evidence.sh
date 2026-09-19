@@ -26,6 +26,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck source=stage-d-env.sh
 source ./stage-d-env.sh
+# shellcheck source=probe_exec.sh
+source ./probe_exec.sh
 
 STAGE_D_WORKDIR="${STAGE_D_WORKDIR:?STAGE_D_WORKDIR must point at the directory 05-execute-run.sh printed (it holds state.json and setup.log)}"
 test -r "${STAGE_D_WORKDIR}/setup.log" \
@@ -70,6 +72,11 @@ PROBE_LOG_RETRIES="${PROBE_LOG_RETRIES:-10}"
 PROBE_LOG_RETRY_DELAY_SECONDS="${PROBE_LOG_RETRY_DELAY_SECONDS:-10}"
 
 wait_for_probe_execution() { # exec_name
+  # The db probe holds SUPABASE_SERVICE_ROLE_KEY, and a Cloud Run job
+  # template can be updated between creation and execution, so the
+  # pinned image digest, identity and secret bindings are re-verified
+  # immediately before every execution.
+  verify_probe_job "${job}" || return 1
   local exec_name="$1" waited=0 state
   while :; do
     state="$(gcloud run jobs executions describe "${exec_name}" \

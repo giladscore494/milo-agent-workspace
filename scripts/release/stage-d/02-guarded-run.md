@@ -144,14 +144,16 @@ cleanup never depend on you copying an id out of the terminal.
 | Probe creation, after only the db probe exists | one credentialed job standing | deletes **both** by name and proves absence from a fresh listing |
 | Preflight / setup | probes exist | full lockdown |
 | Run creation | a run may exist | full lockdown; the run id is already in `state.json` |
-| Polling (including Ctrl-C) | a run is executing | kill switch cancels any active execution and re-verifies zero active |
+| Polling (including Ctrl-C) | a run is executing, and its DB row is `running` with reservations held | kill switch cancels the execution; the lockdown then **terminalizes the database run** and proves it terminal with zero active runs and zero dangling reservations |
 | Evidence gate / replay | run finished, probes exist | full lockdown |
 | Lockdown itself | — | block exits non-zero and tells you to rerun `./07-post-run-lockdown.sh` |
 
 In every row the end state is: paid execution off, catalog execution off,
 run creation off, launcher disabled, **both** provider aliases unbound on
-both surfaces, zero active Worker executions, and **both** probe jobs
-proven absent from a fresh `gcloud run jobs list`.
+both surfaces, zero active Worker executions, **both** probe jobs proven
+absent from a fresh `gcloud run jobs list`, and — whenever a run was
+created — the database run terminal with zero active runs for its user
+and project and zero reservations left in `reserved`.
 
 `tests/test_stage_d_toolkit.py` injects a failure at **every** mutation
 boundary in the table above and asserts exactly that end state each time.
