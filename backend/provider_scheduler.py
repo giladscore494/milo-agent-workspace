@@ -313,10 +313,19 @@ class _LeaseWatchdog:
         return self.lost_reason is None
 
     def mark_lost(self, reason: str) -> None:
-        if self.lost_reason is None:
-            self.lost_reason = reason
-            if self.on_lost is not None:
-                self.on_lost(reason)
+        # The reason is recorded BEFORE anyone is told, and telling anyone can
+        # never undo it: a reporting sink that raises must not turn "we lost
+        # the permit" into an unhandled traceback from a daemon thread, which
+        # is the same invisibility this whole handle exists to remove.
+        if self.lost_reason is not None:
+            return
+        self.lost_reason = reason
+        if self.on_lost is None:
+            return
+        try:
+            self.on_lost(reason)
+        except BaseException:  # noqa: BLE001 - a failed report is not a failure
+            pass
 
     def stop(self) -> None:
         self.done.set()

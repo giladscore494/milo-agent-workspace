@@ -561,3 +561,27 @@ def test_a_failure_to_start_the_renewal_thread_strands_nothing():
     lease.release()
     assert scheduler._slots.acquire(blocking=False), "the local slot leaked"
     scheduler._slots.release()
+
+
+def test_a_failing_diagnostic_sink_never_becomes_a_traceback():
+    """Reporting the loss must not itself become an unhandled failure.
+
+    The handle exists to make lost ownership visible; a sink that raises
+    inside a daemon thread would replace the diagnostic with a stderr
+    traceback and lose the very signal it was meant to carry.
+    """
+    worker_a, _ = coordinators("raises")
+    worker_a._diagnostic = lambda kind, payload: (_ for _ in ()).throw(
+        RuntimeError("the event sink is down"))
+    scheduler = ProviderScheduler(
+        ProviderLimitsConfig(max_concurrency=1, rpm_limit=None, tpm_limit=None),
+        coordinator=worker_a,
+        backpressure_callback=lambda *_a: (_ for _ in ()).throw(
+            RuntimeError("the callback is down too")))
+
+    # The request still completes, and the permit is still released.
+    assert scheduler.execute(lambda: time.sleep(TTL), estimated_tokens=10,
+                             reserved_tokens=10) is None
+    lease = worker_a.try_acquire_inference()
+    assert lease is not None, "a failing diagnostic stranded the permit"
+    lease.release()
