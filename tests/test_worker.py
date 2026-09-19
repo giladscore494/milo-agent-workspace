@@ -316,7 +316,8 @@ def test_default_registry_routes_trusted_swarm_v2_and_reaches_a_truthful_outcome
             return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, cost=0),
                 choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
     client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
-    monkeypatch.setattr(worker_main, "build_guarded_client_factory", lambda tracker: lambda *_: client)
+    monkeypatch.setattr(worker_main, "build_guarded_client_factory",
+                        lambda tracker, **_kw: lambda *_: client)
     monkeypatch.setenv("MILO_COMMANDER_MODEL_ALLOWLIST", "fake")
     monkeypatch.setenv("MILO_COMMANDER_MODEL", "fake")
     monkeypatch.setenv("MILO_SWARM_WORKER_MODEL", "fake")

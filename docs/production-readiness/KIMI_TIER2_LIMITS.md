@@ -167,6 +167,74 @@ provider attempt is admitted against the organization ceiling**.
 | search `rate_limited` | Respect `X-RateLimit-*` when present; never exceed the reviewed 80%/fallback |
 | search `rate_limit_unavailable` | Back off safely; never bypass the limiter |
 
+## 8a. The request deadline / lease TTL invariant
+
+A concurrency permit is only worth holding if the request it admits cannot
+outlive it. The guarantee is:
+
+> **A real provider request can never still be in flight at the moment its
+> organization concurrency permit becomes reclaimable by another process.**
+
+It is established by arithmetic, not by hoping a background thread stays alive:
+
+```
+provider_request_deadline + lease_safety_margin <= lease_ttl
+```
+
+| Value | Default | Where |
+| --- | --- | --- |
+| Lease TTL | **120 s** | `MILO_PROVIDER_LEASE_TTL_SECONDS` |
+| Safety margin | **30 s** (25 % of TTL, floor 15 s) | derived |
+| Request deadline | **90 s** | derived; `MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS` may only tighten it |
+| Heartbeat interval | **30 s** (TTL ÷ 4) | derived |
+
+`QuotaConfig.__post_init__` calls `assert_request_deadline_safe` for every
+configuration — defaults, environment, or a caller constructing one directly —
+so an unsafe pair cannot be built at all and no later code has to remember to
+re-check before a paid call. It **refuses** rather than clamping: quietly
+shortening a deadline would hide the fact that somebody believed a longer
+request was allowed.
+
+### Why the heartbeat is not the safety mechanism
+
+Renewal runs in a daemon thread and can stop for reasons the request never
+learns about: the coordinator answers "not yours", the shared store is briefly
+unreachable and the call raises, the process stalls. Under this invariant the
+worst case — the watchdog dying at the instant the permit is granted — is
+still safe: the permit stands for the whole TTL and the request is over by
+`deadline`, a full margin earlier. Renewal is **defence in depth and
+visibility**, and losing it is now recorded (`PROVIDER_LEASE_OWNERSHIP_LOST`,
+`PROVIDER_LEASE_HEARTBEAT_FAILED`) with a static code and nothing else — no
+URL, credential, provider body or exception text.
+
+### What the margin absorbs
+
+* the gap between permit grant and first byte — milliseconds, because the
+  scheduler takes its **process-local slot first** and the shared permit
+  second, so local queueing never happens inside the window;
+* **clock skew**: each process stamps lease expiry with its own clock and
+  prunes peers' leases with that same clock, so a process running `d` seconds
+  fast prunes `d` seconds early. Safety needs `deadline < ttl - d`, which is
+  what the margin buys. NTP-disciplined hosts hold `d` far below a second;
+* a GC or scheduler pause in the holder;
+* the client's slop in firing the timeout, plus TLS teardown.
+
+### What the client timeout does and does not bound
+
+`httpx`'s `read` is a limit on the gap **between bytes**, not a guaranteed
+total wall-clock ceiling, and nothing in the httpx/OpenAI contract lets one
+thread abort another thread's in-flight request. MILO issues **non-streaming**
+completions with a bounded `max_tokens`, so the provider computes the whole
+answer and sends a small body: silence longer than the deadline is the failure
+mode, and the deadline catches it. The residual case — a server trickling one
+byte every `deadline − ε` — is precisely why renewal is kept as well as the
+deadline, rather than either alone.
+
+> The SDK default was the original defect: `read=600 s` against a 120 s lease,
+> **five times the TTL**. Both client constructions now pass an explicit
+> timeout, checked by
+> `test_the_shipped_clients_carry_the_derived_deadline`.
+
 ## 9. Two different numbers: ceiling vs active profile
 
 `MILO_ORG_*` are the **organization ceilings** above. `MILO_PROVIDER_*` are one

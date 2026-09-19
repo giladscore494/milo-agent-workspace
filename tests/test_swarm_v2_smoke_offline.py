@@ -164,7 +164,7 @@ class InlineWorkerLauncher:
 def patch_client(monkeypatch, completions):
     monkeypatch.setattr(
         worker_main, "build_guarded_client_factory",
-        lambda tracker: build_guarded_client_factory(
+        lambda tracker, **_kw: build_guarded_client_factory(
             tracker, inner_factory=lambda api_key, base_url: fake_kimi_client(completions)),
     )
 

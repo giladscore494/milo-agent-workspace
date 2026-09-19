@@ -719,7 +719,40 @@ class GuardedModelClient:
         self.chat = _GuardedChat(inner.chat, tracker)
 
 
-def build_guarded_client_factory(tracker: BudgetTracker, inner_factory: Callable[[str, str], Any] | None = None) -> Callable[[str, str], Any]:
+def provider_request_timeout(deadline_seconds: float | None = None) -> Any:
+    """The client-side deadline that keeps a request inside its permit's life.
+
+    Resolved from the organization quota configuration when not supplied, so a
+    caller cannot accidentally build a client with no bound: an un-timed client
+    is exactly how a request outlives the concurrency permit it was admitted
+    under. The value has already been checked against the lease TTL by
+    ``QuotaConfig`` (see the invariant in ``backend.provider_quota``).
+
+    WHAT THIS BOUNDS, PRECISELY. ``read`` is httpx's limit on the gap between
+    bytes, not a guaranteed total wall-clock ceiling. MILO issues NON-streaming
+    chat completions with a bounded ``max_tokens``, so the provider computes the
+    whole answer and then sends a small body: silence longer than the deadline
+    is the failure mode, and the deadline catches it. The residual case -- a
+    server trickling a byte every ``deadline - epsilon`` seconds -- is what the
+    heartbeat is still there for, which is why both mechanisms are kept rather
+    than either alone.
+
+    ``connect`` stays short: waiting minutes for a TCP handshake is never
+    useful, and a slow connect should free the permit for someone else.
+    """
+    import httpx
+
+    if deadline_seconds is None:
+        from backend.provider_quota import QuotaConfig
+
+        deadline_seconds = QuotaConfig.from_env().request_deadline_seconds
+    deadline = float(deadline_seconds)
+    return httpx.Timeout(deadline, connect=min(10.0, deadline), read=deadline,
+                         write=deadline, pool=deadline)
+
+
+def build_guarded_client_factory(tracker: BudgetTracker, inner_factory: Callable[[str, str], Any] | None = None,
+                                 request_timeout: Any | None = None) -> Callable[[str, str], Any]:
     """Produce a model_client_factory enforcing the budget gate.
 
     Preserves the existing MILO engine behavior: the wrapped client is the
@@ -732,10 +765,19 @@ def build_guarded_client_factory(tracker: BudgetTracker, inner_factory: Callable
         else:
             from openai import OpenAI
 
-            # See the note in vehicle_catalog_v1/core.py: the SDK's default of
-            # two silent retries would spend organization RPM and concurrency
-            # that no MILO counter or shared limiter ever observes.
-            inner = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+            # max_retries=0: see the note in vehicle_catalog_v1/core.py -- the
+            # SDK's default of two silent retries would spend organization RPM
+            # and concurrency that no MILO counter or shared limiter observes.
+            #
+            # timeout: the SDK's default read timeout is 600s, FIVE TIMES the
+            # 120s concurrency lease TTL. An un-timed request can therefore
+            # outlive the permit it was admitted under, and once that permit is
+            # reclaimed another process starts a second real request against a
+            # ceiling that now counts one holder too few. The deadline is
+            # derived from the TTL and validated against it.
+            inner = OpenAI(api_key=api_key, base_url=base_url, max_retries=0,
+                           timeout=request_timeout if request_timeout is not None
+                           else provider_request_timeout())
         return GuardedModelClient(inner, tracker)
 
     return factory

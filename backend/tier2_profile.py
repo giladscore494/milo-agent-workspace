@@ -41,7 +41,7 @@ from typing import Any
 from backend.provider_quota import (KIMI_TIER2_PROVIDER_LIMITS, MAX_INFERENCE_CONCURRENCY,
                                     MAX_RPM, MAX_TPD, MAX_TPM, SAFETY_FACTOR,
                                     SEARCH_BASIC, SEARCH_PRO, SEARCH_QPS_FALLBACK,
-                                    SEARCH_QPS_VERIFIED, WINDOW_SECONDS)
+                                    SEARCH_QPS_VERIFIED, WINDOW_SECONDS, QuotaConfig)
 from backend.engines.swarm_v2.model_gateway import ROLE_OUTPUT_CAPS
 
 #: Where the account-specific Tier evidence came from and when.
@@ -64,6 +64,34 @@ FIRST_PAID_RUN_EXECUTION_CAP = 1
 #: ceiling and the recorded-cost ceiling is tighter still, because the V1
 #: evidence run cost $0.34 and no evidence says more is needed.
 HARD_MONETARY_CAP_USD = 3.00
+
+
+def _request_lease_invariant() -> dict[str, Any]:
+    """The permit/request relationship, as shipped.
+
+    Stated here because it is the thing an operator has to be able to check
+    without reading the scheduler: a request deadline that is not strictly
+    inside the lease TTL means a request can outlive its own permit.
+    """
+    config = QuotaConfig()
+    return {
+        "statement": ("a real provider request can never still be in flight when "
+                      "its organization concurrency permit becomes reclaimable"),
+        "rule": "provider_request_deadline + lease_safety_margin <= lease_ttl",
+        "provider_request_deadline_seconds": config.request_deadline_seconds,
+        "lease_safety_margin_seconds": config.safety_margin_seconds,
+        "lease_ttl_seconds": config.lease_ttl_seconds,
+        "heartbeat_interval_seconds": config.heartbeat_interval_seconds,
+        "heartbeat_is_load_bearing": False,
+        "heartbeat_role": ("defence in depth and visibility; the deadline alone "
+                           "satisfies the invariant even if renewal never runs"),
+        "enforced_by": "QuotaConfig.__post_init__ -> assert_request_deadline_safe",
+        "acquisition_order": ("process-local slot first, organization permit "
+                              "second, so the permit is taken immediately before "
+                              "the request"),
+        "sdk_default_read_timeout_seconds": 600,
+        "sdk_default_would_be_unsafe": True,
+    }
 
 
 def _search_profile() -> dict[str, Any]:
@@ -116,6 +144,9 @@ def tier2_first_run_profile() -> dict[str, Any]:
                 "unique lease id per acquisition, TTL + heartbeat, deterministic "
                 "release on success/failure/timeout/cancellation; an expired "
                 "lease can never release a replacement holder's lease"),
+            # The one relationship that keeps a real request inside the life of
+            # the permit it was admitted under, whatever the heartbeat does.
+            "request_lease_invariant": _request_lease_invariant(),
             "tpm_admission_value": "estimated_input_tokens + explicit max_completion_tokens",
             "tpm_release_policy": (
                 "never released early on lower actual output — the provider "
@@ -153,6 +184,10 @@ def tier2_first_run_profile() -> dict[str, Any]:
             "max_retries": 15,
             "max_provider_attempts_per_call": 1 + 5,
             "sdk_automatic_retries": 0,
+            "provider_request_timeout_seconds": QuotaConfig().request_deadline_seconds,
+            "provider_lease_ttl_seconds": QuotaConfig().lease_ttl_seconds,
+            "provider_lease_heartbeat_interval_seconds":
+                QuotaConfig().heartbeat_interval_seconds,
             "max_run_duration_seconds": 1800,
             "worker_lease_seconds": 300,
             "worker_heartbeat_interval_seconds": 30,

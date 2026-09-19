@@ -16,6 +16,7 @@ try:
 except ModuleNotFoundError:  # optional until live engine execution
     OpenAI = None
 
+from backend.budget import provider_request_timeout
 from backend.provider_scheduler import (
     ProviderBackpressureExceeded,
     ProviderLimitsConfig,
@@ -527,8 +528,18 @@ def moonshot_chat(
     # attempt accounting and distributed limiter never see them, so the account
     # can be over its ceiling while every MILO counter reads clean. Retries
     # here are MILO-owned, bounded, and re-enter the shared admission gate.
+    #
+    # The explicit timeout is load-bearing too: the SDK default is a 600s read
+    # timeout against a 120s concurrency lease, so an un-timed request could
+    # still be talking to Kimi long after another process had taken over its
+    # organization permit. Production reaches this engine through the guarded
+    # factory in backend.budget, which applies the same derived deadline; this
+    # fallback is what local and test runs get, and it must not be the one
+    # place that forgets.
     client_factory = MODEL_CLIENT_FACTORY or (
-        lambda api_key, base_url: OpenAI(api_key=api_key, base_url=base_url, max_retries=0))
+        lambda api_key, base_url: OpenAI(
+            api_key=api_key, base_url=base_url, max_retries=0,
+            timeout=provider_request_timeout()))
     client = client_factory(api_key, MOONSHOT_BASE_URL)
     history = list(messages)
     total_input = 0

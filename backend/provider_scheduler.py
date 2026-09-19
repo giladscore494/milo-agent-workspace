@@ -298,6 +298,30 @@ _WAIT_CHUNK_SECONDS = 1.0
 _SLOT_POLL_SECONDS = 0.05
 
 
+class _LeaseWatchdog:
+    """Handle for one request's renewal loop, and whether it is still healthy."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.lost_reason: str | None = None
+        self.thread: threading.Thread | None = None
+        self.on_lost: Callable[[str], None] | None = None
+
+    @property
+    def ownership_proven(self) -> bool:
+        """False once MILO can no longer show it holds this permit."""
+        return self.lost_reason is None
+
+    def mark_lost(self, reason: str) -> None:
+        if self.lost_reason is None:
+            self.lost_reason = reason
+            if self.on_lost is not None:
+                self.on_lost(reason)
+
+    def stop(self) -> None:
+        self.done.set()
+
+
 class ProviderScheduler:
     """One shared scheduler guards every provider request in a Worker run."""
 
@@ -465,29 +489,70 @@ class ProviderScheduler:
             self._wait(delay)
             waited += delay
 
-    def _start_lease_watchdog(self, lease: Any) -> threading.Event | None:
-        """Renew ``lease`` in the background until the returned event is set.
+    def _start_lease_watchdog(self, lease: Any, agent: str, phase: str) -> "_LeaseWatchdog | None":
+        """Renew ``lease`` for as long as its request runs, and say so if it stops.
 
-        Returns None when there is no lease to keep (no coordinator wired), so
-        the caller's teardown stays a single unconditional branch.
+        Renewal is defence in depth, NOT the safety mechanism: the request
+        deadline is already a whole safety margin shorter than the lease TTL,
+        so a permit outlives its request even if this thread never beats once
+        (see the invariant in ``backend.provider_quota``). What this adds is
+        cover for the one case a read timeout does not strictly bound -- a
+        provider trickling bytes -- and, just as importantly, VISIBILITY.
+
+        Losing renewal used to be silent twice over: a ``False`` return ended
+        the loop with no record, and an exception from the shared store killed
+        the daemon thread outright. Both now stop the loop deliberately, mark
+        ownership as unproven and emit a bounded diagnostic, because "MILO can
+        no longer prove it owns this permit" is exactly the condition an
+        operator needs to see.
         """
         if lease is None:
             return None
-        ttl = getattr(getattr(lease, "coordinator", None), "config", None)
-        interval = max(1.0, getattr(ttl, "lease_ttl_seconds", 120.0) / 3.0)
-        done = threading.Event()
+        config = getattr(getattr(lease, "coordinator", None), "config", None)
+        interval = getattr(config, "heartbeat_interval_seconds", None)
+        if not interval:
+            interval = max(1.0, getattr(config, "lease_ttl_seconds", 120.0) / 4.0)
+        watchdog = _LeaseWatchdog()
 
         def beat() -> None:
-            while not done.wait(interval):
-                if not lease.heartbeat():
-                    # The lease is already gone. Nothing useful is left to
-                    # renew, and re-acquiring here would silently take a
-                    # SECOND permit for one call.
+            while not watchdog.done.wait(interval):
+                try:
+                    renewed = lease.heartbeat()
+                except BaseException:  # noqa: BLE001 - reported, never re-raised
+                    # The shared store is unreachable, or refused. Re-raising
+                    # here would only kill this daemon thread, which is what
+                    # used to make the loss invisible.
+                    watchdog.mark_lost("PROVIDER_LEASE_HEARTBEAT_FAILED")
+                    return
+                if not renewed:
+                    # The coordinator says this permit is no longer ours.
+                    # Re-acquiring here would quietly take a SECOND permit for
+                    # one request, so the loop ends and the loss is recorded.
+                    watchdog.mark_lost("PROVIDER_LEASE_OWNERSHIP_LOST")
                     return
 
-        threading.Thread(target=beat, name="provider-lease-heartbeat",
-                         daemon=True).start()
-        return done
+        watchdog.on_lost = lambda reason: self._report_lease_loss(reason, agent, phase)
+        watchdog.thread = threading.Thread(target=beat, name="provider-lease-heartbeat",
+                                           daemon=True)
+        watchdog.thread.start()
+        return watchdog
+
+    def _report_lease_loss(self, reason: str, agent: str, phase: str) -> None:
+        """Announce lost permit ownership with a static code and nothing else.
+
+        No URL, no credential, no provider body and no exception text: the
+        reason is one of two constants, and agent/phase are server-chosen
+        identifiers. A diagnostic about losing the limiter must not become the
+        thing that leaks what the limiter is talking to.
+        """
+        if self._backpressure_callback:
+            self._backpressure_callback(agent, phase, reason.lower(), 0.0)
+        coordinator = self._coordinator
+        emit = getattr(coordinator, "_emit", None) if coordinator is not None else None
+        if callable(emit):
+            emit("provider_lease_ownership_lost",
+                 {"reason": reason, "agent": str(agent or "")[:64],
+                  "phase": str(phase or "")[:64]})
 
     # -- the guarded call path -------------------------------------------------
     def execute(self, call: Callable[[], Any], *, estimated_tokens: int = 0, agent: str = "", phase: str = "",
@@ -507,29 +572,33 @@ class ProviderScheduler:
         while True:
             waited_total += self._admit(estimated_tokens, waited_total, agent, phase)
             self._check_cancelled()
+            # ORDER MATTERS. The process-local slot is taken FIRST and the
+            # shared organization permit second, so the permit is acquired
+            # immediately before the request goes out.
+            #
+            # The other way round, a caller could hold an account-wide permit
+            # while queueing behind its own process -- starving every other
+            # process of capacity it was not using, and stretching the window
+            # the permit has to stay valid for by up to the whole backpressure
+            # bound. The safety invariant is stated over "permit granted ->
+            # request finished", so that window is exactly what must stay
+            # small; local queueing is not allowed inside it.
+            waited_total += self._acquire_slot(waited_total, agent, phase)
             lease = None
+            watchdog = None
             try:
                 if self._coordinator is not None:
                     lease, waited = self._acquire_global(
                         max(1, int(admission_tokens)), waited_total, agent, phase)
                     waited_total += waited
-                # Inside the guard: this can exhaust the backpressure bound or
-                # be cancelled, and an organization permit held by a caller
-                # that then gives up is account capacity nobody is using --
-                # for the whole lease TTL, and compounding under load.
-                waited_total += self._acquire_slot(waited_total, agent, phase)
             except BaseException:
-                if lease is not None:
-                    lease.release()
+                self._slots.release()
                 raise
-            # Keep the organization permit alive for as long as THIS call
-            # actually runs. The lease TTL exists to recover a permit from a
-            # crashed holder, not to bound a call: a provider request slower
-            # than the TTL would otherwise let its own permit expire while it
-            # is still in flight, and a second caller could then take a slot
-            # the account is already using. Observed V1 calls ran ~45s, so
-            # this is not hypothetical under a slow provider.
-            watchdog = self._start_lease_watchdog(lease)
+            # Renew the permit for as long as THIS request runs. Defence in
+            # depth only: the request deadline is already a safety margin
+            # shorter than the lease TTL, so the permit outlives the request
+            # even if this never beats (see backend.provider_quota).
+            watchdog = self._start_lease_watchdog(lease, agent, phase)
             try:
                 return call()
             except Exception as exc:  # noqa: BLE001 - classified below; others re-raise
@@ -567,7 +636,7 @@ class ProviderScheduler:
                     ) from exc
             finally:
                 if watchdog is not None:
-                    watchdog.set()
+                    watchdog.stop()
                 self._slots.release()
                 # Deterministic release on EVERY path -- success, provider
                 # failure, backpressure exhaustion, quota refusal and

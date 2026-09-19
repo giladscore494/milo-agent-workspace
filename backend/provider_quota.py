@@ -111,6 +111,130 @@ SEARCH_QPS_FALLBACK: dict[str, int] = {SEARCH_BASIC: 1, SEARCH_PRO: 1}
 SEARCH_QPS_VERIFIED: dict[str, bool] = {SEARCH_BASIC: False, SEARCH_PRO: False}
 
 
+# --- the request-deadline / lease-TTL relationship ---------------------------
+#
+# THE SAFETY INVARIANT
+# --------------------
+#
+#     A real provider request can never still be in flight at the moment its
+#     organization concurrency permit becomes reclaimable by another process.
+#
+# It is established STRUCTURALLY, by arithmetic that holds whatever the network
+# is doing:
+#
+#     provider_request_deadline + lease_safety_margin <= lease_ttl
+#
+# combined with taking the permit immediately before issuing the request (the
+# scheduler queues for its process-local slot FIRST, so the shared permit is
+# never held while waiting for something local).
+#
+# Why it cannot depend on the heartbeat. A renewal loop lives in a daemon
+# thread and can stop for reasons the request never learns about: the
+# coordinator returns "you no longer own this", the shared store is briefly
+# unreachable and the call raises, the process stalls. If the request outlived
+# its permit in any of those cases, a second process could take the freed slot
+# while the first request was still running, and real provider concurrency
+# would exceed the ceiling even though every NEW request entered the limiter
+# correctly.
+#
+# Under this invariant the worst case is the heartbeat dying at the instant the
+# permit is granted: the permit still stands for the whole TTL, and the request
+# is already over by `deadline`, which is a whole margin earlier. The heartbeat
+# is therefore DEFENCE IN DEPTH, not the safety mechanism.
+#
+# Why it cannot depend on cancelling the request either. Nothing in the
+# httpx/OpenAI contract lets one thread abort another thread's in-flight
+# request, so the deadline is enforced by the client's own timeout rather than
+# by anyone interrupting it. See `budget.provider_request_timeout` for what
+# that timeout does and does not bound.
+#
+# What the margin has to absorb (see docs/production-readiness/
+# KIMI_TIER2_LIMITS.md for the full budget):
+#
+#   * the gap between the permit being granted and the first byte leaving --
+#     milliseconds, now that local queueing happens first;
+#   * CLOCK SKEW between processes. Each process stamps its lease expiry with
+#     its own clock and prunes other processes' leases with that same clock, so
+#     a process running `d` seconds fast can prune a peer's lease `d` seconds
+#     early. The invariant therefore needs `deadline < ttl - d`, which is
+#     exactly what the margin buys. NTP-disciplined hosts hold `d` far below a
+#     second; the margin is sized for orders of magnitude more;
+#   * a garbage-collection or scheduler pause inside the holder;
+#   * the client's own slop in firing the timeout, plus TLS teardown.
+
+#: Fraction of the lease TTL held back as safety margin.
+LEASE_SAFETY_MARGIN_RATIO = 0.25
+
+#: Floor on that margin, so a short TTL cannot shrink it to nothing.
+MIN_LEASE_SAFETY_MARGIN_SECONDS = 15.0
+
+#: How many renewals fit inside one TTL. Four gives three renewals inside a
+#: full-length request, so a single lost beat is not decisive -- which is the
+#: only thing a non-load-bearing mechanism needs.
+HEARTBEAT_INTERVALS_PER_TTL = 4
+
+
+#: The shortest TTL that can carry the absolute floor above and still leave a
+#: request any time at all. Below it the proportional rule governs on its own:
+#: such a TTL is not a production value (production is 120s), and forcing a
+#: 15s floor onto, say, a 3s TTL would make the derived deadline NEGATIVE --
+#: a rule that cannot be satisfied is not a safety rule.
+MIN_TTL_FOR_MARGIN_FLOOR = MIN_LEASE_SAFETY_MARGIN_SECONDS / LEASE_SAFETY_MARGIN_RATIO
+
+
+def lease_safety_margin(lease_ttl_seconds: float) -> float:
+    """The part of the TTL that is deliberately NOT available to a request.
+
+    Proportional, with an absolute floor that applies once the TTL is long
+    enough to carry it. The proportional term is what keeps the margin
+    meaningful as the TTL changes; the floor is what stops a production-sized
+    TTL from having a margin too small to absorb clock skew and pauses.
+    """
+    ttl = float(lease_ttl_seconds)
+    proportional = ttl * LEASE_SAFETY_MARGIN_RATIO
+    if ttl >= MIN_TTL_FOR_MARGIN_FLOOR:
+        return max(MIN_LEASE_SAFETY_MARGIN_SECONDS, proportional)
+    return proportional
+
+
+def default_request_deadline(lease_ttl_seconds: float) -> float:
+    """The longest a provider request may run under a given lease TTL.
+
+    Derived rather than configured, so the relationship cannot drift: raising
+    the TTL raises the deadline with it, and neither can be set independently
+    into an unsafe pair.
+    """
+    return float(lease_ttl_seconds) - lease_safety_margin(lease_ttl_seconds)
+
+
+def heartbeat_interval(lease_ttl_seconds: float) -> float:
+    """How often to renew a held permit."""
+    return max(1.0, float(lease_ttl_seconds) / HEARTBEAT_INTERVALS_PER_TTL)
+
+
+def assert_request_deadline_safe(request_deadline_seconds: float,
+                                 lease_ttl_seconds: float) -> None:
+    """THE authoritative check. Every path that resolves the pair calls this.
+
+    Refuses rather than clamping: a deployment that asked for a deadline it
+    cannot have is a misconfiguration, and quietly shortening it would hide
+    the fact that somebody believed a longer request was allowed.
+    """
+    deadline = float(request_deadline_seconds)
+    ttl = float(lease_ttl_seconds)
+    if not deadline > 0:
+        raise ValueError("provider request timeout must be positive")
+    if not ttl > 0:
+        raise ValueError("provider lease TTL must be positive")
+    margin = lease_safety_margin(ttl)
+    if deadline + margin > ttl:
+        raise ValueError(
+            f"unsafe provider timeout/lease pair: a {deadline:g}s request "
+            f"deadline plus a {margin:g}s safety margin exceeds the {ttl:g}s "
+            "lease TTL, so a request could still be running after its "
+            "organization concurrency permit became reclaimable")
+
+
 class ProviderQuotaUnavailable(AppError):
     """The shared coordinator is required but unconfigured or unreachable."""
 
@@ -388,7 +512,27 @@ class QuotaConfig:
     search_qps: tuple[int, int] = (SEARCH_QPS_FALLBACK[SEARCH_BASIC],
                                    SEARCH_QPS_FALLBACK[SEARCH_PRO])
     lease_ttl_seconds: float = 120.0
+    #: The longest ONE provider request may run. None means "derive it from
+    #: the TTL", which is what every production path does; an explicit value
+    #: is still checked against the same invariant, so it can only ever be
+    #: tighter, never unsafe.
+    provider_request_timeout_seconds: float | None = None
     scope: str = "kimi-org"
+
+    @property
+    def request_deadline_seconds(self) -> float:
+        """The resolved per-request deadline for this configuration."""
+        if self.provider_request_timeout_seconds is None:
+            return default_request_deadline(self.lease_ttl_seconds)
+        return float(self.provider_request_timeout_seconds)
+
+    @property
+    def heartbeat_interval_seconds(self) -> float:
+        return heartbeat_interval(self.lease_ttl_seconds)
+
+    @property
+    def safety_margin_seconds(self) -> float:
+        return lease_safety_margin(self.lease_ttl_seconds)
 
     def __post_init__(self) -> None:
         for name, value in (("max_concurrency", self.max_concurrency),
@@ -411,6 +555,12 @@ class QuotaConfig:
                 raise ValueError(
                     f"{endpoint} qps exceeds the conservative fallback while the "
                     "authoritative Tier 2 Web Search QPS is unverified")
+        # The safety invariant, checked wherever a configuration comes from --
+        # defaults, environment, or a caller constructing one directly. An
+        # unsafe pair cannot be built at all, so no later code has to remember
+        # to re-check it before a paid call.
+        assert_request_deadline_safe(self.request_deadline_seconds,
+                                     self.lease_ttl_seconds)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "QuotaConfig":
@@ -440,6 +590,10 @@ class QuotaConfig:
             search_qps=(_int("MILO_SEARCH_BASIC_QPS", SEARCH_QPS_FALLBACK[SEARCH_BASIC]),
                         _int("MILO_SEARCH_PRO_QPS", SEARCH_QPS_FALLBACK[SEARCH_PRO])),
             lease_ttl_seconds=float(_int("MILO_PROVIDER_LEASE_TTL_SECONDS", 120)),
+            provider_request_timeout_seconds=(
+                float(_int("MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS", 0)) or None
+                if (source.get("MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS") or "").strip()
+                else None),
             scope=(source.get("MILO_PROVIDER_QUOTA_SCOPE") or "kimi-org").strip() or "kimi-org",
         )
 
@@ -649,6 +803,9 @@ def resolve_coordinator(config: QuotaConfig | None = None, *,
 
 
 __all__ = [
+    "HEARTBEAT_INTERVALS_PER_TTL", "LEASE_SAFETY_MARGIN_RATIO",
+    "MIN_LEASE_SAFETY_MARGIN_SECONDS", "assert_request_deadline_safe",
+    "default_request_deadline", "heartbeat_interval", "lease_safety_margin",
     "KIMI_TIER2_PROVIDER_LIMITS", "MAX_INFERENCE_CONCURRENCY", "MAX_RPM", "MAX_TPM",
     "MAX_TPD", "SAFETY_FACTOR", "SEARCH_BASIC", "SEARCH_PRO", "SEARCH_ENDPOINTS",
     "SEARCH_QPS_FALLBACK", "SEARCH_QPS_VERIFIED", "WINDOW_SECONDS",
