@@ -20,7 +20,7 @@ from backend.provider_scheduler import (
     ProviderBackpressureExceeded,
     ProviderLimitsConfig,
     ProviderScheduler,
-    estimate_request_tokens,
+    estimate_admission_tokens,
     is_provider_rate_limit_error,
 )
 
@@ -476,10 +476,14 @@ def _scheduled_provider_call(client: Any, kwargs: Dict[str, Any], agent_name: st
     """The single guarded path for EVERY provider request (initial calls,
     tool rounds, fallbacks and summaries). No raw create call may bypass it."""
     scheduler = _provider_scheduler()
-    estimated = estimate_request_tokens(kwargs.get("messages"), kwargs.get("max_tokens"))
+    # Strict: V1 has always required a numeric cap on every call, so the
+    # organization admission value (input + requested cap) is always
+    # computable here and never degrades to "input only".
+    estimated = estimate_admission_tokens(kwargs.get("messages"), kwargs.get("max_tokens"))
     return scheduler.execute(
         lambda: client.chat.completions.create(**kwargs),
         estimated_tokens=estimated,
+        reserved_tokens=estimated,
         agent=agent_name,
         phase=phase_name,
     )
@@ -516,7 +520,15 @@ def moonshot_chat(
         raise ValueError("moonshot_chat requires max_tokens for every model call")
     if MODEL_CLIENT_FACTORY is None and OpenAI is None:
         raise RuntimeError("openai package is required for live Kimi/Moonshot calls")
-    client_factory = MODEL_CLIENT_FACTORY or (lambda api_key, base_url: OpenAI(api_key=api_key, base_url=base_url))
+    # max_retries=0 is load-bearing, not tidiness. The OpenAI SDK retries
+    # retryable failures TWICE by default, turning one logical request into up
+    # to three provider attempts. Those attempts consume organization RPM and
+    # concurrency, but they happen inside the SDK: MILO's scheduler, budget,
+    # attempt accounting and distributed limiter never see them, so the account
+    # can be over its ceiling while every MILO counter reads clean. Retries
+    # here are MILO-owned, bounded, and re-enter the shared admission gate.
+    client_factory = MODEL_CLIENT_FACTORY or (
+        lambda api_key, base_url: OpenAI(api_key=api_key, base_url=base_url, max_retries=0))
     client = client_factory(api_key, MOONSHOT_BASE_URL)
     history = list(messages)
     total_input = 0

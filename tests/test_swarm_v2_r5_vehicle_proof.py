@@ -418,7 +418,7 @@ def test_none_of_r5s_proof_tools_reached_the_production_registry():
     that none of R5's own fixtures is it, at EITHER flag value.
     """
     worker_main = Path("backend/worker/main.py").read_text()
-    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if catalog_enabled else [])"
+    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])"
             in worker_main)
     for name in ("yeda.vehicle_catalog", "gov_il.vehicle_registry",
                  "toyota.archived_model_document"):

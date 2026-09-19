@@ -28,6 +28,10 @@ EXECUTION_FLAGS = [
     # the Government tool and the canonical promotion pipeline are built from
     # it, and a repository default is not a deliberate operator decision.
     "MILO_ENABLE_CATALOG_EXECUTION",
+    # Read and promotion are separate capabilities under that switch, and
+    # neither may be committed as enabled.
+    "MILO_ENABLE_GOVERNMENT_CATALOG_READ",
+    "MILO_ENABLE_CATALOG_PROMOTION",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
     "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI",
     # Test-only adapters must never be switched on outside the isolated

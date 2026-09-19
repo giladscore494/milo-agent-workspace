@@ -23,7 +23,22 @@ class BoundedTaskExecutor:
         self._worker_factory, self._limit, self._cancelled = worker_factory, max_active_workers, cancellation_checker
 
     @staticmethod
-    def configured_limit(env: dict[str, str] | None = None) -> int:
+    def configured_limit(env: dict[str, str] | None = None,
+                         provider_capacity: int | None = None) -> int:
+        """How many logical workers may run at once, bounded by real capacity.
+
+        A worker that cannot get a provider slot is not doing work: it is
+        holding a thread, burning run duration and lease time, and counting
+        toward the bounded backpressure wait that eventually fails its task
+        with PROVIDER_BACKPRESSURE_EXCEEDED. Production carried
+        ``MILO_SWARM_MAX_ACTIVE_WORKERS=8`` against a provider concurrency of
+        2, so six of every eight workers could only ever be queueing.
+
+        ``provider_capacity`` is what the engine may really use concurrently,
+        so the effective limit is never "the local semaphore says so" -- more
+        engine parallelism than provider capacity buys nothing and costs
+        timeout risk.
+        """
         raw = (env or os.environ).get("MILO_SWARM_MAX_ACTIVE_WORKERS", "4")
         try:
             value = int(raw)
@@ -31,6 +46,10 @@ class BoundedTaskExecutor:
             raise ValueError("MILO_SWARM_MAX_ACTIVE_WORKERS must be an integer") from None
         if not 1 <= value <= 32:
             raise ValueError("MILO_SWARM_MAX_ACTIVE_WORKERS must be between 1 and 32")
+        if provider_capacity is not None:
+            if provider_capacity < 1:
+                raise ValueError("provider capacity must be positive")
+            value = min(value, provider_capacity)
         return value
 
     def _check_cancelled(self) -> None:

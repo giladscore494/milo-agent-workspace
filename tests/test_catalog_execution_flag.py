@@ -40,7 +40,10 @@ import backend.catalog.pipeline as pipeline_module
 import backend.engines.swarm_v2.evidence_mapping as mapping_module
 import backend.tools as tools_package
 import backend.worker.main as worker_main
-from backend.catalog.execution import CATALOG_EXECUTION_FLAG, catalog_execution_enabled
+from backend.catalog.execution import (CATALOG_EXECUTION_FLAG, CATALOG_PROMOTION_FLAG,
+                                       GOVERNMENT_READ_FLAG, CatalogPostureInvalid,
+                                       catalog_execution_enabled, catalog_posture,
+                                       catalog_promotion_enabled, government_read_enabled)
 from backend.tools.government_vehicle import GOVERNMENT_TOOL_NAME, GOVERNMENT_TOOL_SCOPE
 
 from test_swarm_v2_smoke_offline import (FakeKimiCompletions, build_repo,
@@ -186,14 +189,23 @@ def record_wiring(monkeypatch) -> WiringRecord:
     return record
 
 
-def run_swarm_with_catalog_flag(monkeypatch, flag):
-    """One real Swarm V2 run through `execute_run`, at a given flag value."""
+def run_swarm_with_catalog_flag(monkeypatch, flag, *, read=None, promotion=None):
+    """One real Swarm V2 run through `execute_run`, at a given catalog posture.
+
+    `flag` is the master switch. `read` and `promotion` are the two capability
+    flags under it; both default to following the master switch, so every
+    existing caller keeps describing the same "all on" / "all off" postures it
+    always did, and a test that wants the SPLIT states names them explicitly.
+    """
     record = record_wiring(monkeypatch)
     swarm_env(monkeypatch)
-    if flag is None:
-        monkeypatch.delenv(CATALOG_EXECUTION_FLAG, raising=False)
-    else:
-        monkeypatch.setenv(CATALOG_EXECUTION_FLAG, flag)
+    for name, value in ((CATALOG_EXECUTION_FLAG, flag),
+                        (GOVERNMENT_READ_FLAG, flag if read is None else read),
+                        (CATALOG_PROMOTION_FLAG, flag if promotion is None else promotion)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
     repo, conversation_id = build_repo()
     completions = FakeKimiCompletions()
     run_id = run_worker_directly(repo, conversation_id, monkeypatch, completions,
@@ -270,7 +282,8 @@ def test_an_enabled_flag_registers_exactly_the_existing_government_tool(monkeypa
     server-owned scope; exactly the existing registered mapper and its single
     allowed operation; and the pipeline constructed and called once.
     """
-    record, repo, run_id, _ = run_swarm_with_catalog_flag(monkeypatch, "true")
+    record, repo, run_id, _ = run_swarm_with_catalog_flag(
+        monkeypatch, "true", read="true", promotion="true")
 
     assert record.registered_tools == frozenset({GOVERNMENT_TOOL_NAME})
     assert record.descriptor_names == (GOVERNMENT_TOOL_NAME,)
@@ -292,7 +305,8 @@ def test_an_enabled_flag_adds_no_transport_capture_or_write_tool(monkeypatch):
     """
     from backend.tools.contracts import ToolMode
 
-    record, *_ = run_swarm_with_catalog_flag(monkeypatch, "true")
+    record, *_ = run_swarm_with_catalog_flag(
+        monkeypatch, "true", read="true", promotion="true")
     registry = record.registries[0]
     assert registry.allowed_names == frozenset({GOVERNMENT_TOOL_NAME})
     for descriptor in registry.descriptors():
@@ -642,3 +656,131 @@ def test_an_enabled_catalog_run_emits_only_recognised_event_types(monkeypatch):
                   "grounding_context_resolved", "verification_batch_completed",
                   "verification_completed", "provider_backpressure_wait"}
     assert not (set(unknown) - swarm_only), unknown
+
+
+# =============================================================================
+# 4. reading the register and promoting into the catalog are SEPARATE
+# =============================================================================
+#
+# Before the split there was exactly one flag, so the only configuration that
+# let a run read the government register also armed canonical promotion in the
+# same breath. There was therefore no posture in which a first, deliberately
+# read-only run could be performed at all. These tests are that posture.
+
+
+def test_read_on_promotion_off_reads_the_register_and_writes_nothing(monkeypatch):
+    """The read-only posture, proven end to end through a real run.
+
+    Everything the read capability is supposed to provide is present -- the one
+    bounded read tool, its server-owned scope, its single registered mapper --
+    and everything promotion would need is absent: no pipeline is constructed,
+    so `promote()` cannot have run, no canonical write can have happened and
+    neither catalog event is emitted.
+    """
+    from backend.tools.contracts import ToolMode
+
+    record, repo, run_id, completions = run_swarm_with_catalog_flag(
+        monkeypatch, "true", read="true", promotion="false")
+
+    # READ is fully wired.
+    assert record.registered_tools == frozenset({GOVERNMENT_TOOL_NAME})
+    assert record.granted_scopes == [frozenset({GOVERNMENT_TOOL_SCOPE})]
+    assert record.production_mapper_calls == 1
+    assert record.mapper_registries == [
+        frozenset({(GOVERNMENT_TOOL_NAME, "resolve_variant")})]
+    for descriptor in record.registries[0].descriptors():
+        assert descriptor.mode == ToolMode.READ.value
+
+    # PROMOTION is absent -- not merely refused at call time.
+    assert record.pipelines == 0
+    assert record.promote_calls == 0
+    assert "catalog_variant_promoted" not in event_types(repo, run_id)
+    assert "catalog_promotion_refused" not in event_types(repo, run_id)
+
+    # No write scope or capability came along with the read grant.
+    assert all(not scope.startswith("tool:write:")
+               for scope in record.granted_scopes[0])
+
+
+def test_read_on_promotion_off_performs_no_canonical_catalog_write(monkeypatch):
+    """The same posture, proven at the repository boundary.
+
+    The read tool may legitimately read durable catalog rows. What must not
+    happen is a canonical WRITE, so every mutating catalog entry point on the
+    repository is counted and must stay at zero.
+    """
+    from backend.testing.memory_repository import MemoryRepository
+
+    writes: list[str] = []
+    mutators = [name for name in dir(MemoryRepository)
+                if name.startswith(("promote_", "upsert_catalog", "insert_catalog",
+                                    "update_catalog", "apply_catalog"))]
+    assert mutators, "no catalog mutation entry points were found to guard"
+    for name in mutators:
+        original = getattr(MemoryRepository, name)
+
+        def counted(self, *args, _name=name, _original=original, **kwargs):
+            writes.append(_name)
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(MemoryRepository, name, counted)
+
+    record, *_ = run_swarm_with_catalog_flag(
+        monkeypatch, "true", read="true", promotion="false")
+    assert record.pipelines == 0
+    assert writes == [], f"a read-only catalog posture performed writes: {writes}"
+
+
+def test_promotion_on_read_off_fails_closed(monkeypatch):
+    """Promotion without read is a refusal, never a quiet downgrade.
+
+    Silently reading it as "promotion off" would leave an operator believing a
+    posture they do not have. It is a contradiction, so it is named.
+    """
+    monkeypatch.setenv(CATALOG_EXECUTION_FLAG, "true")
+    monkeypatch.setenv(GOVERNMENT_READ_FLAG, "false")
+    monkeypatch.setenv(CATALOG_PROMOTION_FLAG, "true")
+    with pytest.raises(CatalogPostureInvalid):
+        catalog_posture()
+    assert catalog_promotion_enabled() is False
+
+
+def test_promotion_requires_read_and_read_never_implies_promotion():
+    """The ordering property, stated directly over the predicates."""
+    on, off = "true", "false"
+    # read alone
+    env = {CATALOG_EXECUTION_FLAG: on, GOVERNMENT_READ_FLAG: on, CATALOG_PROMOTION_FLAG: off}
+    assert government_read_enabled(env) is True
+    assert catalog_promotion_enabled(env) is False
+    # both
+    env = {CATALOG_EXECUTION_FLAG: on, GOVERNMENT_READ_FLAG: on, CATALOG_PROMOTION_FLAG: on}
+    assert government_read_enabled(env) is True
+    assert catalog_promotion_enabled(env) is True
+    # the master switch still outranks both
+    env = {CATALOG_EXECUTION_FLAG: off, GOVERNMENT_READ_FLAG: on, CATALOG_PROMOTION_FLAG: on}
+    assert government_read_enabled(env) is False
+    assert catalog_promotion_enabled(env) is False
+
+
+@pytest.mark.parametrize("value", [None, "false", "0", "off", "maybe", "", "truthy"])
+def test_both_capability_flags_default_off_for_anything_unrecognised(monkeypatch, value):
+    monkeypatch.setenv(CATALOG_EXECUTION_FLAG, "true")
+    for name in (GOVERNMENT_READ_FLAG, CATALOG_PROMOTION_FLAG):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert government_read_enabled() is False
+    assert catalog_promotion_enabled() is False
+
+
+def test_neither_capability_flag_has_a_browser_facing_twin():
+    """Server-only, exactly like the master switch."""
+    for flag in (GOVERNMENT_READ_FLAG, CATALOG_PROMOTION_FLAG):
+        assert not flag.startswith("NEXT_PUBLIC_")
+        frontend = REPO / "frontend"
+        hits = [path for path in frontend.rglob("*")
+                if path.is_file() and path.suffix in {".ts", ".tsx", ".mjs", ".js"}
+                and "node_modules" not in path.parts
+                and flag in path.read_text(errors="ignore")]
+        assert hits == [], f"{flag} is referenced in the browser tree: {hits}"

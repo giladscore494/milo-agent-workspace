@@ -239,12 +239,30 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
 
         engine_mode = (os.getenv("MILO_WORKER_ENGINE") or "").strip().lower()
         provider_limits = None
+        provider_coordinator = None
         if engine is None and engine_mode != "mock":
             try:
                 provider_limits = ProviderLimitsConfig.from_env()
-            except ValueError as exc:
-                sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider limit configuration invalid; refusing execution", payload={"code": "PROVIDER_LIMITS_CONFIG_INVALID", "message": str(exc)}))
-                repo.mark_run_failed(run_id, "PROVIDER_LIMITS_CONFIG_INVALID", str(exc), worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+                # ONE coordinator per worker process, shared by whichever engine
+                # runs. The Kimi allowance is account-wide, so this is the only
+                # thing that can see the other Cloud Run executions, processes
+                # and replicas drawing on it. Fails closed in production when
+                # the shared store is unconfigured: an unmetered fallback there
+                # would let each execution admit a full ceiling of its own.
+                from backend.provider_quota import (ProviderQuotaUnavailable,
+                                                    resolve_coordinator)
+
+                provider_coordinator = resolve_coordinator(
+                    diagnostic_sink=lambda kind, payload: sink.emit(RunEventRecord(
+                        run_id=run_id, type=kind,
+                        message="provider quota signal", payload=payload)))
+            except (ValueError, ProviderQuotaUnavailable) as exc:
+                code = ("PROVIDER_QUOTA_UNAVAILABLE"
+                        if isinstance(exc, ProviderQuotaUnavailable)
+                        else "PROVIDER_LIMITS_CONFIG_INVALID")
+                message = exc.message if isinstance(exc, ProviderQuotaUnavailable) else str(exc)
+                sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider limit configuration invalid; refusing execution", payload={"code": code, "message": message}))
+                repo.mark_run_failed(run_id, code, message, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
                 return 0 if workflow_key == "swarm_v2" else 1
 
         def emit_budget_event(event_type, payload):
@@ -346,6 +364,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 checkpoint_sink=save_checkpoint, cancellation_checker=is_cancelled,
                 agent_step_callback=record_agent_step, retry_callback=record_retry,
                 provider_limits=provider_limits, provider_backpressure_callback=record_provider_backpressure,
+                # The SAME coordinator instance the Swarm V2 wiring uses: the
+                # Kimi allowance is one organization-wide pool, so V1 and V2
+                # must draw from one gate, not two that each believe they own
+                # the account.
+                provider_coordinator=provider_coordinator,
             )
             def make_swarm_engine():
                 from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander,
@@ -360,18 +383,27 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 from backend.tools import ToolContext, ToolRegistry
                 from backend.tools.government_vehicle import (GOVERNMENT_TOOL_SCOPE,
                                                               GovernmentVehicleTool)
-                from backend.catalog.execution import catalog_execution_enabled
+                from backend.catalog.execution import catalog_posture
                 from backend.catalog.pipeline import CatalogPromotionPipeline
 
-                # CODE-2: the ONE independent catalog switch, read once here
-                # from the process environment. Default off, and off for any
+                # The catalog posture, read ONCE here from the process
+                # environment. Every value is default off, and off for any
                 # value the repository's shared convention does not recognise.
                 #
                 # It is read ONCE, at construction, so every decision below
                 # comes from the same answer: a registry, a scope, a mapper and
-                # a pipeline that disagreed about whether the catalog is on
-                # would be a worse posture than having no switch at all.
-                catalog_enabled = catalog_execution_enabled()
+                # a pipeline that disagreed about which capabilities this
+                # process has would be a worse posture than having no switch.
+                #
+                # Reading the register and promoting into the canonical catalog
+                # are now SEPARATE capabilities. They used to be one flag, so
+                # the only way to let a run read government data was to arm
+                # canonical writes at the same time -- which meant there was no
+                # configuration at all for a genuinely read-only first run.
+                # Promotion still requires read; read never implies promotion.
+                posture = catalog_posture()
+                government_read_enabled = posture["government_read"]
+                promotion_enabled = posture["promotion"]
 
                 allowed = tuple(filter(None, (item.strip() for item in
                     os.getenv("MILO_COMMANDER_MODEL_ALLOWLIST", "").split(","))))
@@ -397,14 +429,23 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # the plan firewall to admit, and no Government name in the
                 # provider-visible policy -- the capability is ABSENT, not
                 # merely unreachable.
-                tools = ToolRegistry([GovernmentVehicleTool(repo)] if catalog_enabled else [])
+                tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])
                 scheduler = ProviderScheduler(provider_limits,
                     cancellation_checker=is_cancelled,
-                    backpressure_callback=record_provider_backpressure)
+                    backpressure_callback=record_provider_backpressure,
+                    coordinator=provider_coordinator)
                 # ONE PlanLimits instance feeds both the provider-visible
                 # policy (ModelGateway) and the deterministic firewall
                 # (PlanValidator): contract parity cannot drift silently.
-                limits = PlanLimits()
+                #
+                # Derived from THIS run's envelope rather than the broad
+                # defaults. Wiring `PlanLimits()` unconditionally let the
+                # firewall admit a 64-task plan inside a 56-agent-step budget,
+                # which the run then could not finish; the plan ceiling now
+                # shrinks to what the budget can actually pay for.
+                limits = PlanLimits.from_envelope(
+                    max_agent_steps=budget_config.max_agent_steps,
+                    max_model_calls=budget_config.max_model_calls_per_run)
                 gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker),
                     scheduler=scheduler, api_key=worker_provider_api_key(),
                     base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
@@ -431,7 +472,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # consulted -- but a granted scope with nothing to unlock is
                 # exactly the kind of leftover that survives a later refactor.
                 tool_context = ToolContext(
-                    scopes=frozenset({GOVERNMENT_TOOL_SCOPE}) if catalog_enabled
+                    scopes=frozenset({GOVERNMENT_TOOL_SCOPE}) if government_read_enabled
                            else frozenset(),
                     cancellation_checker=is_cancelled)
                 # The run's lease-guarded Evidence Board, built BEFORE the
@@ -456,7 +497,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 evidence_sink = RegisteredOperationEvidenceSink(
                     TrustedEvidenceAcquisition(
                         board=board,
-                        mappers=production_evidence_mappers() if catalog_enabled
+                        mappers=production_evidence_mappers() if government_read_enabled
                                 else EvidenceMapperRegistry()))
                 # Catalog PR3: the trusted promotion path. It observes NOTHING
                 # here and holds no state: when it runs it asks the database
@@ -470,7 +511,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # pending-promotion read, no canonical write and no catalog
                 # event -- and a database that already holds a usable snapshot
                 # stays inert for a chat run instead of being live by accident.
-                if catalog_enabled:
+                if promotion_enabled:
                     catalog_promotion["pipeline"] = CatalogPromotionPipeline(repo, board.lease)
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
@@ -486,7 +527,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     # Commander repair does. Provider 429 backpressure is
                     # absorbed by the scheduler and never reaches here.
                     retry_callback=record_retry),
-                    max_active_workers=BoundedTaskExecutor.configured_limit(),
+                    # Bounded by what the organization will actually admit
+                    # concurrently: extra logical workers beyond that only
+                    # queue, consuming run duration and lease time.
+                    max_active_workers=BoundedTaskExecutor.configured_limit(
+                        provider_capacity=provider_limits.max_concurrency),
                     cancellation_checker=is_cancelled)
                 def remaining():
                     cfg = tracker.config
@@ -501,12 +546,21 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     retries = (RemainingBudget.model_fields["retries"].default
                                if cfg.max_retries is None else
                                max(0, cfg.max_retries - tracker.retries))
+                    # Every guarded gateway call records one agent step, so a
+                    # plan whose worst case needs more steps than remain cannot
+                    # finish no matter how much call/token/cost budget it has.
+                    # This dimension was missing, which is how a 54+ task plan
+                    # passed preflight against a 56-step ceiling.
+                    agent_steps = (RemainingBudget.model_fields["agent_steps"].default
+                                   if cfg.max_agent_steps is None else
+                                   max(0, cfg.max_agent_steps - tracker.agent_steps))
                     return RemainingBudget(
                         cost_units=limits.max_cost_units,
                         tool_calls=limits.max_tool_calls,
                         tasks=limits.max_tasks,
                         model_calls=model_calls,
                         retries=retries,
+                        agent_steps=agent_steps,
                     )
                 return SwarmV2Adapter(commander=commander, executor=executor,
                     # The resolver is the Verifier's ONLY route to durable

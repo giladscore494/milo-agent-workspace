@@ -11,6 +11,7 @@ from .correction import (correction_allowance, correction_issues, correction_pat
                          correction_summary)
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
+from .feasibility import envelope_supports_a_run, plan_worst_case
 from .grounding import VERIFIER_GROUNDING_VERSION
 from .state import SwarmState
 from .support import VERIFIER_CONTRACT_VERSION
@@ -122,19 +123,16 @@ class SwarmV2Engine:
             0, remaining.tool_calls - sum(len(task.tools) for task in completed_specs)
         )
         available_tasks = max(0, remaining.tasks - len(completed_specs))
-        # The MINIMUM each pending task costs is one worker-model call; a
-        # structurally invalid completion may add one bounded repair call
-        # (see worker.MAX_WORKER_OUTPUT_MODEL_ATTEMPTS). This gate stays a
-        # pre-flight floor deliberately -- BudgetTracker remains the sole
-        # authority that refuses a call. Keep two slots for the next
-        # Commander decision and at least one verifier batch. The EXACT
-        # remaining verifier batch count is unknowable here (no evidence set
-        # yet) and is checked separately in _run_verification.
-        required_model_calls = len(pending) + 2
+        # The WORST case, not a floor: repairs, replan decisions, a verifier
+        # batch and the correction round are all things this plan may really
+        # need, and a preflight that ignores them is not a proof of anything.
+        worst = plan_worst_case(len(pending), max_replans=plan.max_replans)
         if (sum(task.estimated_cost_units for task in pending) > available_cost or
                 sum(len(task.tools) for task in pending) > available_tools or
                 len(pending) > available_tasks or
-                required_model_calls > remaining.model_calls):
+                worst.model_calls > remaining.model_calls or
+                worst.agent_steps > remaining.agent_steps or
+                worst.retries > remaining.retries):
             raise ValueError("plan exceeds remaining budget")
 
     @staticmethod
@@ -360,6 +358,13 @@ class SwarmV2Engine:
             state = SwarmState.resume(raw, run_id=str(run.get("id", "")))
             plan = self._commander.validate_saved_plan(state.approved_plan or {})
         else:
+            # Refuse an envelope that could not pay for the cheapest possible
+            # successful run BEFORE asking the Commander to plan. Planning
+            # first would spend a real paid call -- and, when the derived plan
+            # ceiling then rejects the result, a second one on a repair --
+            # to discover something arithmetic already knew.
+            if not envelope_supports_a_run(self._remaining_budget()):
+                raise ValueError("run budget cannot support any plan")
             plan = self._commander.plan(requested_model=requested_model, objective=objective,
                 context=run_input.get("context", {}))
             state = SwarmState(run_id=str(run.get("id", "")), objective=objective,

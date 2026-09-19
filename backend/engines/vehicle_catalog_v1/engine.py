@@ -35,6 +35,10 @@ class VehicleCatalogEngine:
     retry_callback: Callable[[str, str, str], None] | None = None
     provider_limits: ProviderLimitsConfig | None = None
     provider_backpressure_callback: Callable[[str, str, str, float], None] | None = None
+    # The organization-wide admission gate, shared with Swarm V2. None keeps
+    # the pre-existing process-local behaviour for tests and local runs; the
+    # worker always supplies one, and it fails closed in production.
+    provider_coordinator: Any | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     _previous_client_factory: Any = field(default=None, init=False)
@@ -93,6 +97,7 @@ class VehicleCatalogEngine:
             sleep_fn=lambda seconds: core.SLEEP_FN(seconds),
             cancellation_checker=self.cancellation_checker,
             backpressure_callback=core._notify_backpressure,
+            coordinator=self.provider_coordinator,
         )
 
     def _restore_injections(self) -> None:

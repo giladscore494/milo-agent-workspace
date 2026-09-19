@@ -110,6 +110,55 @@ class PlanLimits:
         if any(value < 0 for value in self.__dict__.values()):
             raise ValueError("plan limits cannot be negative")
 
+    @classmethod
+    def from_envelope(cls, *, max_agent_steps: int | None = None,
+                      max_model_calls: int | None = None,
+                      max_tool_calls: int | None = None,
+                      base: "PlanLimits | None" = None) -> "PlanLimits":
+        """Shrink the plan ceiling to what the RUN's envelope can actually pay.
+
+        The defaults above describe what the plan firewall is willing to admit
+        in principle -- 64 tasks, 3 replans, 100 tool calls. Production wired
+        exactly those, whatever the deployment's real budget was, so the
+        firewall would approve a 64-task plan inside an envelope of 56 agent
+        steps: admissible by the firewall, impossible for the run.
+
+        This derives ``max_tasks`` from the tightest binding dimension instead,
+        using the SAME worst-case model the pre-flight check uses, so "the plan
+        validator admitted it" and "the run can finish it" cannot disagree.
+        Nothing here ever widens a limit: the result is bounded by ``base``.
+        """
+        from .feasibility import plan_worst_case
+
+        reference = base or cls()
+        tasks = reference.max_tasks
+        for budget in (max_agent_steps, max_model_calls):
+            if budget is None:
+                continue
+            # Largest N whose worst case still fits. Both dimensions grow
+            # linearly in N, so walking down from the current bound terminates
+            # immediately for a healthy envelope and cannot loop.
+            # Floored at one task, deliberately. This limit describes what plan
+            # SHAPES the firewall admits; whether the envelope can afford even
+            # one task is the pre-flight feasibility gate's judgement, and it
+            # reports that as a budget refusal rather than as a malformed plan.
+            while tasks > 1:
+                worst = plan_worst_case(tasks, max_replans=reference.max_replans)
+                if max(worst.agent_steps, worst.model_calls) <= budget:
+                    break
+                tasks -= 1
+        return cls(
+            max_tasks=tasks,
+            max_graph_depth=reference.max_graph_depth,
+            max_recursion_depth=reference.max_recursion_depth,
+            max_replans=reference.max_replans,
+            max_cost_units=reference.max_cost_units,
+            max_tool_calls_per_task=reference.max_tool_calls_per_task,
+            max_tool_calls=min(reference.max_tool_calls,
+                               max_tool_calls if max_tool_calls is not None
+                               else reference.max_tool_calls),
+        )
+
 
 # Semantic firewall rules that CommanderPlan.model_json_schema() cannot
 # express. Static, code-owned text: no model output, no taxonomies.
