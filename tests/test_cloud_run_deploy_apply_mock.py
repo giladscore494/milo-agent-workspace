@@ -58,6 +58,12 @@ EXECUTION_FLAGS = (
     # surfaces and this fixture must carry it or the deployer's own
     # env-name verification refuses the deployment.
     "MILO_ENABLE_CATALOG_EXECUTION",
+    # The two catalog CAPABILITY flags under that master switch: reading the
+    # government register, and canonical promotion. Both are Stage A execution
+    # flags pinned false on BOTH surfaces, so this fixture must carry them or
+    # the deployer's own env-name verification refuses the deployment.
+    "MILO_ENABLE_GOVERNMENT_CATALOG_READ",
+    "MILO_ENABLE_CATALOG_PROMOTION",
 )
 
 MOCK_GCLOUD = r"""#!/usr/bin/env bash

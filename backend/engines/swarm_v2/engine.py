@@ -127,12 +127,22 @@ class SwarmV2Engine:
         # batch and the correction round are all things this plan may really
         # need, and a preflight that ignores them is not a proof of anything.
         worst = plan_worst_case(len(pending), max_replans=plan.max_replans)
+        # Model calls and agent steps are spent UNCONDITIONALLY as work
+        # proceeds, so a plan whose worst case does not fit can strand the run
+        # mid-way having already paid. Those are preconditions.
+        #
+        # Retries are deliberately NOT one. They are spent only when something
+        # goes wrong, the retry limiter is its own fail-closed gate, and
+        # requiring the worst case up front would refuse every plan on a
+        # healthy deployment: 23 tasks can need 24 repairs in the worst case
+        # against a configured allowance of 15. `worst.retries` and
+        # `worst.provider_attempts` are computed for capacity planning
+        # (see `backend.tier2_profile`), not as an admission test.
         if (sum(task.estimated_cost_units for task in pending) > available_cost or
                 sum(len(task.tools) for task in pending) > available_tools or
                 len(pending) > available_tasks or
                 worst.model_calls > remaining.model_calls or
-                worst.agent_steps > remaining.agent_steps or
-                worst.retries > remaining.retries):
+                worst.agent_steps > remaining.agent_steps):
             raise ValueError("plan exceeds remaining budget")
 
     @staticmethod

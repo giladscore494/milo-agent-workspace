@@ -1095,16 +1095,63 @@ def merge_chunk_results(agent_name: str, chunk_results: List[Dict[str, Any]]) ->
     }
 
 
+def technical_parallelism(env: Optional[Dict[str, str]] = None) -> int:
+    """How many technical-enrichment calls may be in flight at once.
+
+    Default 1, which is byte-for-byte the historical sequential behaviour. The
+    original policy note said sequential execution avoided "Kimi org
+    concurrency=3 failures" -- a real constraint at the time, and a stale one
+    now that the account is verified Tier 2 (concurrency 40, MILO ceiling 32).
+
+    Keeping it at 1 cost run 3772fc84 its completion: that phase made 36
+    sequential calls at ~45s each, 1621s of an 1808s run, and the run timed out
+    at 1800s having used 0 retries and hit 0 backpressure events. It was not
+    being throttled; it was queueing behind itself.
+
+    This is configuration rather than a new default because raising it is a
+    deliberate operator decision with its own evidence (see
+    `backend.tier2_profile`), and because the shared coordinator -- not this
+    number -- is what actually protects the account: whatever is set here is
+    still admitted one organization slot at a time.
+    """
+    raw = ((env or os.environ).get("MILO_V1_TECHNICAL_PARALLELISM") or "1").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("MILO_V1_TECHNICAL_PARALLELISM must be an integer") from None
+    if not 1 <= value <= 32:
+        raise ValueError("MILO_V1_TECHNICAL_PARALLELISM must be between 1 and 32")
+    return value
+
+
 def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Stable policy: run Phase 3 technical agents sequentially to avoid Kimi org concurrency=3 failures.
-    results = []
-    for agent in TECHNICAL_AGENTS:
-        chunk_results = []
-        for i in range(0, len(canonical_models), TECHNICAL_MODEL_CHUNK_SIZE):
-            chunk = canonical_models[i:i + TECHNICAL_MODEL_CHUNK_SIZE]
-            chunk_results.append(run_technical_agent(api_key, agent, manufacturer, market, period, chunk))
-        results.append(merge_chunk_results(agent.key, chunk_results))
-    return results
+    """Enrich every canonical model chunk, per technical agent.
+
+    Results keep their original per-agent order and per-agent chunk order
+    whatever the parallelism, so the deterministic merge downstream sees
+    exactly the input it always did.
+    """
+    units = [(agent, canonical_models[i:i + TECHNICAL_MODEL_CHUNK_SIZE])
+             for agent in TECHNICAL_AGENTS
+             for i in range(0, len(canonical_models), TECHNICAL_MODEL_CHUNK_SIZE)]
+    width = min(technical_parallelism(), max(1, len(units)))
+    if width == 1:
+        # The preserved path, unchanged: no pool, no futures, no reordering.
+        completed = [run_technical_agent(api_key, agent, manufacturer, market, period, chunk)
+                     for agent, chunk in units]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=width, thread_name_prefix="v1-technical") as pool:
+            futures = [pool.submit(run_technical_agent, api_key, agent, manufacturer,
+                                   market, period, chunk) for agent, chunk in units]
+            # Indexed, not as-completed: ordering is part of the preserved
+            # merge contract.
+            completed = [future.result() for future in futures]
+    by_agent: Dict[str, List[Dict[str, Any]]] = {agent.key: [] for agent in TECHNICAL_AGENTS}
+    for (agent, _chunk), result in zip(units, completed):
+        by_agent[agent.key].append(result)
+    return [merge_chunk_results(agent.key, by_agent[agent.key]) for agent in TECHNICAL_AGENTS]
 
 
 def compact_verifier_input(normalized: Any, technical: Dict[str, Any], failed_summaries: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:

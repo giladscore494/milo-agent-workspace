@@ -1795,7 +1795,8 @@ def swarm_run_reaching_completion(monkeypatch):
     smoke fixture settles on `partial_success`, where blocking the completion
     branch would prove nothing.
     """
-    from backend.catalog.execution import CATALOG_EXECUTION_FLAG
+    from backend.catalog.execution import (CATALOG_EXECUTION_FLAG,
+                                           CATALOG_PROMOTION_FLAG, GOVERNMENT_READ_FLAG)
     from test_swarm_v2_smoke_offline import (FakeKimiCompletions, build_repo,
                                              run_worker_directly, swarm_env)
     import backend.engines.swarm_v2 as swarm_pkg
@@ -1806,7 +1807,11 @@ def swarm_run_reaching_completion(monkeypatch):
     # pass the "never marked complete" assertion for the wrong reason -- by
     # never reaching a promotion at all. `tests/test_catalog_execution_flag.py`
     # owns the disabled posture; this one owns the enabled one.
-    swarm_env(monkeypatch, **{CATALOG_EXECUTION_FLAG: "true"})
+    # Promotion is its own capability now: the master switch alone arms
+    # nothing, and promotion additionally requires read.
+    swarm_env(monkeypatch, **{CATALOG_EXECUTION_FLAG: "true",
+                              GOVERNMENT_READ_FLAG: "true",
+                              CATALOG_PROMOTION_FLAG: "true"})
     monkeypatch.setattr(swarm_pkg.SwarmV2Adapter, "run",
                         lambda self, run: dict(USABLE_PRODUCT_OUTCOME))
     repo, conversation_id = build_repo()

@@ -1,5 +1,32 @@
 # Stage D expansion step 1 — PROPOSED authorization for one bounded paid run
 
+> ## SUPERSEDED BY A RUNTIME RELEASE. RE-AUTHORIZATION REQUIRED.
+>
+> This document was written on the premise, stated in §7 below, that **no
+> runtime change is proposed here** — and therefore that the accepted image
+> digests it pins stay valid. That premise no longer holds.
+>
+> The provider-quota release (organization-wide Kimi admission, per-role
+> output caps, the government read/promotion split, real feasibility) is
+> exactly the "separate reviewed release" §7 said such a change would have
+> to be. It changes `backend/` runtime code, so:
+>
+> * every **accepted image digest pinned in this document is invalidated**
+>   and must be rebuilt and re-pinned from the new release SHA;
+> * the **Attempt 7 envelope recorded here was measured against the old
+>   runtime** and must be re-derived — in particular
+>   `MILO_PROVIDER_RPM_LIMIT=350`, pinned in
+>   `scripts/release/stage-d/stage-d-env.sh`, now **exceeds** the verified
+>   organization ceiling of 80 RPM and the worker refuses to start with it;
+> * `MILO_SWARM_MAX_ACTIVE_WORKERS` was never pinned by this toolkit and
+>   was observed live at `8` against a provider concurrency of `2`;
+> * the Stage D run must be **re-authorized against the new SHA**. Nothing
+>   in the release grants that authorization.
+>
+> See `docs/production-readiness/KIMI_TIER2_LIMITS.md` for the verified
+> limits and the enforcement table.
+
+
 > ## STATUS: PROPOSED. NOT AUTHORIZED. NOT EXECUTED.
 >
 > **Nothing in this proposal has been executed against production.** No run

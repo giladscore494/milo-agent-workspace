@@ -240,6 +240,10 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         engine_mode = (os.getenv("MILO_WORKER_ENGINE") or "").strip().lower()
         provider_limits = None
         provider_coordinator = None
+        # Imported before the try: a ValueError from limit parsing must not
+        # leave the handler unable to name its own exception type.
+        from backend.provider_quota import ProviderQuotaUnavailable, resolve_coordinator
+
         if engine is None and engine_mode != "mock":
             try:
                 provider_limits = ProviderLimitsConfig.from_env()
@@ -249,9 +253,6 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # and replicas drawing on it. Fails closed in production when
                 # the shared store is unconfigured: an unmetered fallback there
                 # would let each execution admit a full ceiling of its own.
-                from backend.provider_quota import (ProviderQuotaUnavailable,
-                                                    resolve_coordinator)
-
                 provider_coordinator = resolve_coordinator(
                     diagnostic_sink=lambda kind, payload: sink.emit(RunEventRecord(
                         run_id=run_id, type=kind,
@@ -658,8 +659,20 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), finished_at=datetime.now(UTC).isoformat())
             return 0
         except BudgetExceeded as exc:
+            # `_persist_budget_terminal` returning means the terminal state is
+            # durable under this lease, so the run is FINISHED -- a timeout, a
+            # budget stop or a cost stop is an answer, not a crash.
+            #
+            # This used to exit 1 for V1, which Cloud Run reads as a failed
+            # task and relaunches (maxRetries=1). Run
+            # 3772fc84-420c-4a66-9e79-d58649d4e9b4 timed out, exited 1, and the
+            # relaunched task found the run already finalized and exited 0 --
+            # so the execution reported "completed successfully in 33m42s"
+            # while the product outcome was `timed_out`. A second paid
+            # execution that raced the finalization instead would have been
+            # worse than misleading.
             _persist_budget_terminal(repo, run_id, exc, tracker, lease_ctx)
-            return 0 if workflow_key == "swarm_v2" else 1
+            return 0
         except Exception as exc:
             # Preserve V1 behavior. V2 validation/factory/provider failures are
             # terminal and sanitized, but a stale worker is never allowed to
@@ -696,9 +709,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         if tracker.stop is not None:
             # The engine absorbed per-agent failures, but a hard limit tripped:
             # never report success and record the terminal budget status.
+            # Zero for the same reason as the BudgetExceeded handler above: the
+            # terminal state is durable, so the task is done and Cloud Run must
+            # not relaunch it into a second paid execution.
             stop = tracker.stop
             _persist_budget_terminal(repo, run_id, stop, tracker, lease_ctx)
-            return 0 if workflow_key == "swarm_v2" else 1
+            return 0
         # Product outcome -> durable run status.
         #
         # Swarm V2 owns a validated product-outcome contract, so the worker
