@@ -591,14 +591,21 @@ class ProviderScheduler:
                     lease, waited = self._acquire_global(
                         max(1, int(admission_tokens)), waited_total, agent, phase)
                     waited_total += waited
+                # Renew the permit for as long as THIS request runs. Defence in
+                # depth only: the request deadline is already a safety margin
+                # shorter than the lease TTL, so the permit outlives the request
+                # even if this never beats (see backend.provider_quota).
+                #
+                # Started inside the same guard as the acquisition: spawning a
+                # thread can fail, and a permit stranded because its renewal
+                # thread could not start would be the same capacity leak by a
+                # different route.
+                watchdog = self._start_lease_watchdog(lease, agent, phase)
             except BaseException:
+                if lease is not None:
+                    lease.release()
                 self._slots.release()
                 raise
-            # Renew the permit for as long as THIS request runs. Defence in
-            # depth only: the request deadline is already a safety margin
-            # shorter than the lease TTL, so the permit outlives the request
-            # even if this never beats (see backend.provider_quota).
-            watchdog = self._start_lease_watchdog(lease, agent, phase)
             try:
                 return call()
             except Exception as exc:  # noqa: BLE001 - classified below; others re-raise

@@ -61,12 +61,18 @@ class SimulatedProvider:
         self.entered = 0
         self._active = 0
         self._lock = threading.Lock()
+        #: Set the first time anyone is actually inside the provider. Without
+        #: it the race below is decided by who wins the permit first, which
+        #: makes the whole harness order-dependent -- and an order-dependent
+        #: concurrency test is worth nothing.
+        self.first_entry = threading.Event()
 
     def call(self, duration: float):
         with self._lock:
             self._active += 1
             self.entered += 1
             self.peak = max(self.peak, self._active)
+        self.first_entry.set()
         try:
             deadline_at = time.monotonic() + self.deadline
             finish_at = time.monotonic() + duration
@@ -125,12 +131,16 @@ def coordinators(kind, *, ceiling=1):
 
 
 def race(provider, sched_a, sched_b, *, a_duration, b_duration=0.05):
-    """A starts a long call; B tries to enter for as long as A is running."""
+    """A is INSIDE a long call; only then does B try to enter.
+
+    B waits for A to be genuinely in the provider rather than merely started,
+    so the outcome cannot depend on which thread won the permit first. That
+    makes the question asked here exactly the one that matters: while a real
+    request is in flight, can a second one begin?
+    """
     errors: dict[str, BaseException] = {}
-    started = threading.Event()
 
     def worker_a():
-        started.set()
         try:
             sched_a.execute(lambda: provider.call(a_duration),
                             estimated_tokens=10, reserved_tokens=10)
@@ -138,7 +148,9 @@ def race(provider, sched_a, sched_b, *, a_duration, b_duration=0.05):
             errors["a"] = exc
 
     def worker_b():
-        started.wait()
+        if not provider.first_entry.wait(timeout=10.0):
+            errors["b"] = AssertionError("worker A never entered the provider")
+            return
         # Keep attempting for longer than A's call could possibly run, so B
         # really does get a chance the instant a permit becomes available.
         deadline = time.monotonic() + a_duration + TTL + 1.0
@@ -530,3 +542,22 @@ def test_the_race_harness_detects_the_pre_fix_behaviour(kind):
     assert unbounded.peak == 2, (
         "the harness failed to observe the known-bad overlap, so it cannot be "
         "trusted to observe its absence either")
+
+
+def test_a_failure_to_start_the_renewal_thread_strands_nothing():
+    """Spawning a thread can fail; a stranded permit is the same leak."""
+    backend = MemoryQuotaBackend()
+    coordinator = ProviderQuotaCoordinator(
+        backend, QuotaConfig(max_concurrency=1, lease_ttl_seconds=TTL))
+    scheduler = scheduler_for(coordinator)
+    scheduler._start_lease_watchdog = lambda *_a, **_k: (_ for _ in ()).throw(
+        RuntimeError("can't start new thread"))
+
+    with pytest.raises(RuntimeError):
+        scheduler.execute(lambda: "ok", estimated_tokens=10, reserved_tokens=10)
+
+    lease = coordinator.try_acquire_inference()
+    assert lease is not None, "the permit leaked when renewal could not start"
+    lease.release()
+    assert scheduler._slots.acquire(blocking=False), "the local slot leaked"
+    scheduler._slots.release()
