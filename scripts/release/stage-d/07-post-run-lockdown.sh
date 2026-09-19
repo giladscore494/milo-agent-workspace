@@ -51,8 +51,15 @@ fi
 
 # What the cleanup knows about the run, from the machine-readable state.
 recorded_run_id=""
+recorded_user_id=""
+recorded_conversation_id=""
 if [ -n "${STAGE_D_WORKDIR:-}" ] && [ -r "${STAGE_D_WORKDIR}/state.json" ]; then
   recorded_run_id="$(python3 ./state_file.py "${STAGE_D_WORKDIR}/state.json" read run_id)"
+  # 05-execute-run.sh records these BEFORE the run is created, so they
+  # survive the window in which run_id does not. They are what lets a
+  # recovered run be checked against the identity Stage D actually used.
+  recorded_user_id="$(python3 ./state_file.py "${STAGE_D_WORKDIR}/state.json" read user_id)"
+  recorded_conversation_id="$(python3 ./state_file.py "${STAGE_D_WORKDIR}/state.json" read conversation_id)"
 fi
 
 # Is the db probe still present to ask? Absence is not an error by itself
@@ -73,7 +80,10 @@ if [ "${db_probe_present}" -eq 1 ]; then
     "STAGE_D_MODE=terminalize" \
     "STAGE_D_RUN_ID=${recorded_run_id}" \
     "STAGE_D_IDEMPOTENCY_KEY=${STAGE_D_IDEMPOTENCY_KEY}" \
+    "STAGE_D_EXPECTED_USER_ID=${recorded_user_id}" \
+    "STAGE_D_EXPECTED_CONVERSATION_ID=${recorded_conversation_id}" \
     "STAGE_D_GOV_CAPTURE_RUN_ID=${STAGE_D_GOV_CAPTURE_RUN_ID}" \
+    "STAGE_D_GOV_CAPTURE_OPERATION=${STAGE_D_GOV_CAPTURE_OPERATION}" \
     > "${WORK}/terminalize.log" || terminalize_status=$?
   cat "${WORK}/terminalize.log"
   if probe_verdict "${WORK}/terminalize.log" terminalize; then
@@ -84,7 +94,10 @@ if [ "${db_probe_present}" -eq 1 ]; then
   fi
 elif [ -z "${recorded_run_id}" ]; then
   echo "NOT APPLICABLE: no run id is recorded and the db probe is already absent, so there is no"
-  echo "                database run to terminalize and no credentialed reader remains."
+  echo "                credentialed reader left to look for one."
+  echo "                NOTE: an absent run id does not prove no run exists — 05-execute-run.sh"
+  echo "                records it only after the run is created. With the probe gone, verify by hand:"
+  echo "                  select id, status from public.runs where idempotency_key = '${STAGE_D_IDEMPOTENCY_KEY}';"
 else
   note_failure "run ${recorded_run_id} was created but the db probe is gone, so the database run cannot be terminalized or proven clean — UNVERIFIED"
 fi
@@ -157,7 +170,7 @@ if [ "${lockdown_failures}" -gt 0 ]; then
   echo "STAGE D LOCKDOWN INCOMPLETE: ${lockdown_failures} critical step(s) failed — production may NOT be fully locked down. Investigate and re-run immediately." >&2
   exit 1
 fi
-if [ "${capture_proven}" -ne 1 ] || { [ -n "${recorded_run_id}" ] && [ "${run_terminal_proven}" -ne 1 ]; }; then
+if [ "${capture_proven}" -ne 1 ] || { [ "${db_probe_present}" -eq 1 ] && [ "${run_terminal_proven}" -ne 1 ]; }; then
   # Flags are off and the probes are gone, but a required database proof
   # was not obtained. Say exactly that instead of claiming a complete
   # lockdown.

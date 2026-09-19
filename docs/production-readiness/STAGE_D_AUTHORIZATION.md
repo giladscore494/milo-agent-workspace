@@ -189,7 +189,7 @@ service-role access to production, so both are pinned:
 
 | Input | Pin |
 | --- | --- |
-| Probe runtime image | `python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea` |
+| Probe runtime image | `docker.io/library/python@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea` |
 | `probe_db.py` | `STAGE_D_PROBE_DB_SHA256` |
 | `probe_gateway.py` | `STAGE_D_PROBE_GW_SHA256` |
 
@@ -202,8 +202,15 @@ checkout would have shipped unreviewed privileged code.
 
 Now the sources are hash-verified **before any gcloud call**, both jobs
 are created from the digest, the created templates are verified, and the
-image, identity and secret bindings are re-verified **immediately before
-every probe execution** — a Cloud Run job template can be updated between
+image, identity and secret **references** are re-verified **immediately
+before every probe execution**. The references are checked, not just the
+env names — `SUPABASE_URL` must be backed by `SUPABASE_URL:latest` and
+`SUPABASE_SERVICE_ROLE_KEY` by `SUPABASE_SECRET_KEY:latest`, with no
+extras and none at all on the gateway probe — because the name is only a
+label and the reference is what is actually read. The repository is
+spelled canonically (`docker.io/library/python`) and both sides are
+normalised before comparison, so Cloud Run's own rewriting cannot fail the
+check spuriously while the digest stays exactly enforced. — a Cloud Run job template can be updated between
 creation and execution, and the credentials are what make that worth
 checking.
 
@@ -238,6 +245,48 @@ It then PROVES: the run is terminal; zero active runs remain for its user
 and for its project; zero reservations remain in status `reserved`.
 `LOCKDOWN COMPLETE` is impossible unless those hold **and** the
 Government-capture invariant is proven.
+
+### 2.9 The run id can go missing, and an absent id is not "no run"
+
+`05-execute-run.sh` creates the run inside the gateway probe and writes
+`run_id` to `state.json` only after parsing the probe's structured output.
+If the shell, the Cloud Shell session, the pipeline or probe-log retrieval
+dies in between, the run **exists** but the automatic cleanup is handed an
+empty id. An earlier revision then merely *counted* active rows under the
+key and failed without terminalizing anything — and the lockdown went on
+to delete the credentialed db probe, leaving an active run holding its
+lease, its concurrency slot and its budget reservations, with no reader
+left to fix it.
+
+`terminalize` now recovers instead of assuming:
+
+| Rows under the pinned idempotency key | Behaviour |
+| --- | --- |
+| 0 | proved no-run verdict |
+| 1 | **recovered**, then the full identity gate, terminalization, reservation cleanup and proofs |
+| >1 | fails closed, having mutated nothing |
+
+A recovered row is checked as strictly as a recorded one: the idempotency
+key, the run-request metadata marker (`stage: stage-d-smoke`), the
+`user_id` and `conversation_id` that `state.json` recorded **before** the
+run was created, an explicit refusal of the prepared Government capture,
+and a refusal of anything carrying the operator-capture marker. Dangling
+reservations are released even when the recovered run is already terminal,
+because a finished run can still hold reserved budget.
+
+### 2.10 The preflight verifies the cleanup RPC
+
+`terminalize` releases reservations through
+`settle_model_call_budget(p_reservation_id, p_actual_cost, p_status,
+p_rejection_reason)`. Verified read-only against production on 2026-09-19:
+the function exists with exactly that signature, is `SECURITY DEFINER`,
+`service_role` may execute it, and `anon`/`authenticated` may not.
+
+The preflight now requires it alongside the guarded RPCs, so a missing
+function, a changed signature or a probe that cannot reach it refuses the
+run **before any production enable** — a cleanup that cannot release a
+reservation would leave the daily budget held against a run that will
+never finish.
 
 ## 3. Proposed caps — derived from Stage C Attempt 7 evidence
 
@@ -484,7 +533,7 @@ deletes nothing.
 | `MILO_ENABLE_CATALOG_EXECUTION` | `false` on both surfaces, verified before the run and restored by the lockdown |
 | Vercel / browser execution surface | untouched; `GATEWAY_ALLOW_EXECUTION_ROUTES` never enabled |
 | Run-creation caller | only `stage-d-gw-probe`, running as the operator-controlled approved gateway service account |
-| Authorized user/project | the dedicated `stage-d-smoke` identity; the setup probe refuses a forbidden project id or a non-`vehicle_catalog_v1` workflow key |
+| Authorized user/project | the dedicated `stage-d-smoke` identity; before any write the setup probe refuses a forbidden project id, a non-`vehicle_catalog_v1` workflow key, an unexpected configuration, any membership other than exactly the test user **as `owner`**, or any active run for that user or project |
 | Provider secret | Worker-only, as a Secret Manager binding, never a literal, never on the API |
 | Paid-execution enforcement | the Worker alone; the API keeps `MILO_ENABLE_PAID_EXECUTION=false` |
 | Probe jobs | disposable, deleted by the lockdown and **proven absent** |

@@ -294,6 +294,16 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
         "p_reservation_id", "p_actual_cost", "p_run_id",
         "p_worker_id", "p_attempt", "p_lease_token",
     },
+    # The cleanup path depends on this one: terminalize() releases dangling
+    # reservations through it. Verified read-only against production on
+    # 2026-09-19 — SECURITY DEFINER, service_role may execute, anon and
+    # authenticated may not. Preflight must refuse the run BEFORE any
+    # production enable if it is missing, has a different signature, or is
+    # not exposed to the service-role probe, because a cleanup that cannot
+    # release a reservation would leave the budget held.
+    "settle_model_call_budget": {
+        "p_reservation_id", "p_actual_cost", "p_status", "p_rejection_reason",
+    },
 }
 
 
@@ -460,6 +470,18 @@ def forbidden_project_ids() -> set[str]:
 #: authorization describes, so it is refused rather than adopted.
 EXPECTED_PROJECT_CONFIGURATION = {"stage": "stage-d"}
 
+#: The role the sole member must hold. Comparing user ids alone would
+#: accept the right person with the wrong (or a missing) role, and role is
+#: what authorization actually reads.
+EXPECTED_MEMBER_ROLE = "owner"
+
+
+def membership_tuples(members: list) -> list[tuple[str, str]]:
+    """(user_id, role) for every member, sorted — the exact comparison set."""
+    return sorted(
+        (str(m.get("user_id")), str(m.get("role")) if m.get("role") is not None else "<null>")
+        for m in (members or []) if isinstance(m, dict))
+
 #: Every run state that counts as ACTIVE for the concurrency caps
 #: (mirrors backend/repository/supabase.py ACTIVE_RUN_STATES).
 ACTIVE_RUN_STATES = ("queued", "launching", "starting", "running", "waiting", "cancellation_requested")
@@ -539,13 +561,15 @@ def validate_existing_project(project: dict, user_id: str | None, problems: list
     if members is None:
         members = []
         problems.append("membership set could not be read — failing closed")
-    member_ids = sorted({str(m.get("user_id")) for m in members})
-    evidence["members_before"] = member_ids
-    allowed = [] if user_id is None else [str(user_id)]
-    if member_ids not in ([], allowed):
+    actual = membership_tuples(members)
+    evidence["members_before"] = [f"{u}:{r}" for u, r in actual]
+    allowed = [] if user_id is None else [(str(user_id), EXPECTED_MEMBER_ROLE)]
+    if actual not in ([], allowed):
+        expected_text = "empty" if user_id is None else f"exactly [{str(user_id)}:{EXPECTED_MEMBER_ROLE}]"
         problems.append(
-            f"project {project_id} membership is {member_ids}, expected empty or exactly {allowed} — "
-            "another member could create a run and break the one-run guarantee")
+            f"project {project_id} membership is {[f'{u}:{r}' for u, r in actual]}, expected empty or "
+            f"{expected_text} — another member, or the right member with the wrong role, could create a run "
+            "and break the one-run guarantee")
 
     # Zero active runs, for the user AND anywhere in the project.
     if user_id is not None:
@@ -674,12 +698,13 @@ def setup() -> None:
     members = fetch_rows(
         f"/rest/v1/project_members?project_id=eq.{project_id}&select=user_id,role",
         "project_members", problems)
-    member_ids = sorted({str(m.get("user_id")) for m in (members or [])})
-    evidence["members"] = member_ids
-    if member_ids != [str(user_id)]:
+    actual = membership_tuples(members)
+    evidence["members"] = [f"{u}:{r}" for u, r in actual]
+    if actual != [(str(user_id), EXPECTED_MEMBER_ROLE)]:
         problems.append(
-            f"after the authorized mutation the membership is {member_ids}, expected exactly "
-            f"[{str(user_id)!r}] — the project is not exclusive to the test user")
+            f"after the authorized mutation the membership is {[f'{u}:{r}' for u, r in actual]}, expected "
+            f"exactly [{str(user_id)}:{EXPECTED_MEMBER_ROLE}] — the project is not exclusively owned by the "
+            "test user")
 
     user_active = count_active_runs(user_id=user_id)
     evidence["active_runs_for_user"] = user_active
@@ -702,88 +727,159 @@ def setup() -> None:
         sys.exit(1)
 
 
+#: The run request's own marker. probe_gateway.py sends
+#: metadata {"stage": "stage-d-smoke"}, which the API stores at
+#: input.metadata. A recovered row that does not carry it is not the
+#: Stage D run, whatever its idempotency key says.
+STAGE_D_RUN_METADATA_STAGE = "stage-d-smoke"
+
+#: Every column the identity gate and the proofs need.
+RUN_SELECT = ("id,status,launch_state,worker_id,attempt,started_at,finished_at,"
+              "idempotency_key,requested_by,conversation_id,input")
+
+
+def run_metadata(run: dict) -> dict:
+    payload = run.get("input")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            payload = None
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def check_stage_d_run_identity(run: dict, expected_key: str, problems: list[str]) -> None:
+    """Every identity property the authorized Stage D run must have.
+
+    Applied to a run id read from state.json AND to one recovered by
+    idempotency key, because a recovered row is exactly the case where
+    nothing else has vouched for it.
+    """
+    run_id = str(run.get("id"))
+    capture_run_id = os.environ.get("STAGE_D_GOV_CAPTURE_RUN_ID")
+    capture_operation = os.environ.get("STAGE_D_GOV_CAPTURE_OPERATION", "catalog.government.capture")
+
+    if capture_run_id and run_id == capture_run_id:
+        problems.append(f"run {run_id} is the prepared Government capture — refusing to touch it")
+    if run.get("idempotency_key") != expected_key:
+        problems.append(
+            f"run {run_id} carries idempotency_key {run.get('idempotency_key')!r}, not the authorized Stage D key "
+            f"{expected_key!r} — refusing to terminalize a run this authorization does not own")
+
+    metadata = run_metadata(run)
+    if metadata.get("milo_operation") == capture_operation:
+        problems.append(f"run {run_id} carries the operator-capture marker — refusing to touch it")
+    if str(metadata.get("stage")) != STAGE_D_RUN_METADATA_STAGE:
+        problems.append(
+            f"run {run_id} metadata stage is {metadata.get('stage')!r}, expected "
+            f"{STAGE_D_RUN_METADATA_STAGE!r} — this is not the Stage D smoke run")
+
+    # The recorded identity, when state.json preserved it, must match. This
+    # is what stops a recovered row from being some other run that happens
+    # to share the key.
+    expected_user = (os.environ.get("STAGE_D_EXPECTED_USER_ID") or "").strip()
+    if expected_user and str(run.get("requested_by")) != expected_user:
+        problems.append(
+            f"run {run_id} was requested by {run.get('requested_by')!r}, not the recorded Stage D test user "
+            f"{expected_user!r}")
+    expected_conversation = (os.environ.get("STAGE_D_EXPECTED_CONVERSATION_ID") or "").strip()
+    if expected_conversation and str(run.get("conversation_id")) != expected_conversation:
+        problems.append(
+            f"run {run_id} belongs to conversation {run.get('conversation_id')!r}, not the recorded Stage D "
+            f"conversation {expected_conversation!r}")
+
+
 def terminalize() -> None:
     """Drive the authorized Stage D run to a terminal state and PROVE it.
 
     Cancelling a Cloud Run execution does NOT make the database run
     terminal: the Worker installs no SIGTERM handler, so an interrupted
-    run can be left `running` forever, holding its lease and its budget
-    reservations. Cleanup that only cancels the execution therefore leaves
-    the concurrency caps consumed and the daily budget reserved against a
-    run that will never finish.
+    run can be left `running` forever, holding its lease, its concurrency
+    slot and its budget reservations.
 
-    This mode closes that. It is IDENTITY-CHECKED — it refuses to touch
-    anything that is not the authorized Stage D run, and it can never
-    touch the prepared Government capture — and it uses the repository's
-    own supported lifecycle: active -> cancellation_requested -> cancelled
-    (backend/runtime.py VALID_TRANSITIONS), each step a guarded
-    compare-and-set on the observed status, plus the supported
+    THE LOST-RUN WINDOW. 05-execute-run.sh creates the run inside the
+    gateway probe and only writes `run_id` to state.json after parsing the
+    probe's structured output. If the shell, the session, the pipeline or
+    log retrieval dies in between, the run EXISTS but the cleanup is handed
+    an empty run id. Treating that as "no run" would delete the
+    credentialed probe and walk away from an active run. So an absent
+    recorded id is RECOVERED by querying the pinned idempotency key:
+
+      * zero rows  — genuinely no run; prove it and return;
+      * one row    — recover it and apply the SAME identity gate,
+                     terminalization, reservation cleanup and proofs;
+      * many rows  — ambiguous; fail closed having mutated nothing.
+
+    Every path is identity-checked: the key, the run-request metadata
+    marker, the recorded user and conversation, and an explicit refusal of
+    the prepared Government capture. Terminalization uses the repository's
+    own supported lifecycle (active -> cancellation_requested ->
+    cancelled), each step a guarded compare-and-set, plus the supported
     service-role `settle_model_call_budget` RPC to release any dangling
-    reservation. It then PROVES the postconditions:
+    reservation — including on a run that was ALREADY terminal, because a
+    finished run can still hold reserved budget.
 
-      * the run is terminal;
-      * zero active runs remain for its user and for its project;
-      * zero reservations remain in status 'reserved'.
-
+    It then PROVES: the run is terminal; zero active runs remain for its
+    user and project; zero reservations remain in status 'reserved'.
     Nothing is deleted, and no other run is touched.
     """
-    run_id = (os.environ.get("STAGE_D_RUN_ID") or "").strip()
+    recorded_run_id = (os.environ.get("STAGE_D_RUN_ID") or "").strip()
     expected_key = os.environ.get("STAGE_D_IDEMPOTENCY_KEY")
-    capture_run_id = os.environ.get("STAGE_D_GOV_CAPTURE_RUN_ID")
     problems: list[str] = []
     actions: list[str] = []
-    out: dict = {"stage_d_probe": "terminalize", "run_id": run_id or None, "actions": actions}
+    out: dict = {"stage_d_probe": "terminalize", "recorded_run_id": recorded_run_id or None,
+                 "actions": actions}
+
+    def emit_and_exit() -> None:
+        out.update({"problems": problems, "ok": not problems})
+        print(json.dumps(out, default=str))
+        sys.exit(1 if problems else 0)
 
     if not expected_key:
         problems.append("STAGE_D_IDEMPOTENCY_KEY is missing — the run's identity cannot be checked; failing closed")
-        out.update({"problems": problems, "ok": False})
-        print(json.dumps(out, default=str))
-        sys.exit(1)
+        emit_and_exit()
 
-    if not run_id:
-        # No run was recorded. Prove the wider invariant anyway: no run
-        # under the Stage D key may be active.
-        out["no_run_recorded"] = True
-        key_active = count_exact(
-            f"/rest/v1/runs?select=id&idempotency_key=eq.{expected_key}&status={active_state_filter()}")
-        out["active_runs_under_key"] = key_active
-        if key_active is None:
-            problems.append("exact active-run count under the Stage D key unavailable — failing closed")
-        elif key_active != 0:
+    # ---------------- resolve the run, recovering if necessary ----------
+    if recorded_run_id:
+        rows = fetch_rows(f"/rest/v1/runs?id=eq.{recorded_run_id}&select={RUN_SELECT}", "runs", problems)
+        if rows is None:
+            emit_and_exit()
+        if not rows:
+            problems.append(f"run {recorded_run_id} was not found — failing closed")
+            emit_and_exit()
+        run = rows[0]
+        out["recovered"] = False
+    else:
+        # NEVER infer "no run" from an empty state field: ask the database.
+        rows = fetch_rows(
+            f"/rest/v1/runs?idempotency_key=eq.{expected_key}&select={RUN_SELECT}", "runs", problems)
+        if rows is None:
+            emit_and_exit()
+        out["rows_under_key"] = len(rows)
+        if len(rows) == 0:
+            out.update({"no_run_recorded": True, "recovered": False, "terminal": True,
+                        "reservations_still_reserved": 0})
+            actions.append("no_run_under_key")
+            emit_and_exit()
+        if len(rows) > 1:
             problems.append(
-                f"{key_active} run(s) under the Stage D key are still active although no run id was recorded — "
-                "investigate before closing Stage D")
-        out.update({"problems": problems, "ok": not problems})
-        print(json.dumps(out, default=str))
-        if problems:
-            sys.exit(1)
-        return
+                f"{len(rows)} runs carry the Stage D idempotency key {expected_key!r} — the authorized run is "
+                "ambiguous; refusing to terminalize anything")
+            emit_and_exit()
+        run = rows[0]
+        out["recovered"] = True
+        out["recovered_run_id"] = str(run.get("id"))
+        actions.append("recovered_run_id_from_idempotency_key")
 
-    if capture_run_id and run_id == capture_run_id:
-        problems.append("the recorded run id is the prepared Government capture — refusing to touch it")
-        out.update({"problems": problems, "ok": False})
-        print(json.dumps(out, default=str))
-        sys.exit(1)
+    run_id = str(run.get("id"))
+    out["run_id"] = run_id
+    out["run_before"] = {k: v for k, v in run.items() if k != "input"}
 
-    select = ("id,status,launch_state,worker_id,attempt,started_at,finished_at,"
-              "idempotency_key,requested_by,conversation_id")
-    rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={select}", "runs", problems)
-    if rows is None or not rows:
-        problems.append(f"run {run_id} was not found — failing closed")
-        out.update({"problems": problems, "ok": False})
-        print(json.dumps(out, default=str))
-        sys.exit(1)
-    run = rows[0]
-    out["run_before"] = run
-
-    # IDENTITY CHECK: only the authorized Stage D run may be terminalized.
-    if run.get("idempotency_key") != expected_key:
-        problems.append(
-            f"run {run_id} carries idempotency_key {run.get('idempotency_key')!r}, not the authorized Stage D key "
-            f"{expected_key!r} — refusing to terminalize a run this authorization does not own")
-        out.update({"problems": problems, "ok": False})
-        print(json.dumps(out, default=str))
-        sys.exit(1)
+    # ---------------- identity gate ----------------
+    check_stage_d_run_identity(run, expected_key, problems)
+    if problems:
+        emit_and_exit()
 
     # -- Guarded, identity-checked transitions along the supported path.
     #
@@ -808,9 +904,8 @@ def terminalize() -> None:
         if moved is not None:
             observed = moved
             continue
-        # The CAS matched no row: re-read and decide from what is now true.
         actions.append(f"cas_lost_at_{observed}")
-        rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={select}", "runs", problems)
+        rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={RUN_SELECT}", "runs", problems)
         if not rows:
             problems.append(f"run {run_id} disappeared while being terminalized — failing closed")
             break
@@ -823,7 +918,10 @@ def terminalize() -> None:
         observed = current
     out["status_after_transition"] = observed
 
-    # -- Release any dangling reservation through the supported RPC.
+    # -- Release any dangling reservation through the supported RPC. This
+    # runs even when the run was ALREADY terminal: a finished run can still
+    # hold reserved budget, and leaving it reserved keeps the daily budget
+    # consumed forever.
     reserved = fetch_rows(
         f"/rest/v1/model_call_budget_reservations?run_id=eq.{run_id}&status=eq.reserved&select=id,call_seq",
         "model_call_budget_reservations", problems)
@@ -850,9 +948,9 @@ def terminalize() -> None:
         actions.append(f"released_{released}_dangling_reservations")
 
     # ---------------- PROVE the postconditions ----------------
-    rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={select}", "runs", problems)
+    rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={RUN_SELECT}", "runs", problems)
     final = rows[0] if rows else {}
-    out["run_after"] = final
+    out["run_after"] = {k: v for k, v in final.items() if k != "input"}
     final_status = str(final.get("status"))
     out["terminal"] = final_status in TERMINAL_RUN_STATES
     if final_status not in TERMINAL_RUN_STATES:
@@ -899,10 +997,7 @@ def terminalize() -> None:
     elif still_reserved != 0:
         problems.append(f"{still_reserved} reservation(s) remain in status 'reserved' — the budget is still held")
 
-    out.update({"problems": problems, "ok": not problems})
-    print(json.dumps(out, default=str))
-    if problems:
-        sys.exit(1)
+    emit_and_exit()
 
 
 #: Bounded: a benign race is retried, a pathological one is never looped on.

@@ -2287,7 +2287,7 @@ def test_setup_passes_and_reports_the_proved_isolation(db, monkeypatch, capsys):
     db.setup()
     verdict = setup_verdict(capsys)
     assert verdict["ok"] is True, verdict.get("problems")
-    assert verdict["members"] == [STAGE_D_USER_ID]
+    assert verdict["members"] == [f"{STAGE_D_USER_ID}:owner"]
     assert verdict["active_runs_for_user"] == 0
     assert verdict["active_runs_for_project"] == 0
     assert verdict["configuration"] == {"stage": "stage-d"}
@@ -2436,18 +2436,26 @@ def test_this_pr_proposes_no_runtime_change():
 # O. The PRIVILEGED probe runtime is pinned by digest (round-3 finding 1)
 # ---------------------------------------------------------------------------
 
-PROBE_REPO = "python"
+PROBE_REPO = "docker.io/library/python"
 PROBE_DIGEST = "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea"
 PROBE_IMAGE = f"{PROBE_REPO}@{PROBE_DIGEST}"
 API_SA = "milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
 GATEWAY_SA = "milo-vercel-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"
-DB_PROBE_SECRETS = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
+#: env name -> (Secret Manager secret, version). The env NAME is only a
+#: label; the reference is what is actually read.
+DB_PROBE_SECRET_REFS = {
+    "SUPABASE_URL": ("SUPABASE_URL", "latest"),
+    "SUPABASE_SERVICE_ROLE_KEY": ("SUPABASE_SECRET_KEY", "latest"),
+}
 
 
 def probe_job_doc(image=PROBE_IMAGE, sa=API_SA, secrets=None):
-    secrets = DB_PROBE_SECRETS if secrets is None else secrets
+    secrets = DB_PROBE_SECRET_REFS if secrets is None else secrets
     env = [{"name": "PROBE_SOURCE_GZIP_B64", "value": "<elided>"}]
-    env += [{"name": s, "valueFrom": {"secretKeyRef": {"key": "latest", "name": s}}} for s in secrets]
+    for env_name, ref in dict(secrets).items():
+        secret, version = ref if isinstance(ref, (list, tuple)) else (ref, "latest")
+        env.append({"name": env_name,
+                    "valueFrom": {"secretKeyRef": {"name": secret, "key": version}}})
     return {"spec": {"template": {"spec": {"template": {"spec": {
         "serviceAccountName": sa,
         "containers": [{"image": image, "env": env}],
@@ -2471,7 +2479,7 @@ def run_verify_probe_jobs(tmp_path, *, db=None, gw=None, repo=PROBE_REPO, digest
 
 def test_probe_job_gate_passes_on_the_reviewed_jobs(tmp_path):
     result = run_verify_probe_jobs(
-        tmp_path, db=probe_job_doc(), gw=probe_job_doc(sa=GATEWAY_SA, secrets=[]))
+        tmp_path, db=probe_job_doc(), gw=probe_job_doc(sa=GATEWAY_SA, secrets={}))
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)["ok"] is True
 
@@ -2516,29 +2524,67 @@ def test_probe_job_gate_refuses_an_unexpected_identity(tmp_path):
     assert "operator-controlled" in result.stdout
 
 
-@pytest.mark.parametrize("secrets", [
-    [],
-    ["SUPABASE_URL"],
-    ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "KIMI_API_KEY"],
+@pytest.mark.parametrize("secrets,marker", [
+    ({}, "is missing"),
+    ({"SUPABASE_URL": ("SUPABASE_URL", "latest")}, "is missing"),
+    ({**DB_PROBE_SECRET_REFS, "EXTRA": ("SOMETHING", "latest")}, "unexpected secret reference"),
 ])
-def test_probe_job_gate_refuses_unexpected_secret_bindings(tmp_path, secrets):
+def test_probe_job_gate_refuses_unexpected_secret_bindings(tmp_path, secrets, marker):
     result = run_verify_probe_jobs(tmp_path, db=probe_job_doc(secrets=secrets))
     assert result.returncode != 0
-    assert "secret bindings" in result.stdout or "provider alias" in result.stdout
+    assert marker in result.stdout
+
+
+@pytest.mark.parametrize("wrong_ref,marker", [
+    # The interesting attack: right env NAME, wrong backing secret.
+    ({"SUPABASE_SERVICE_ROLE_KEY": ("SOME_OTHER_SECRET", "latest")}, "SOME_OTHER_SECRET:latest"),
+    ({"SUPABASE_SERVICE_ROLE_KEY": ("KIMI_API_KEY", "latest")}, "KIMI_API_KEY:latest"),
+    ({"SUPABASE_URL": ("SUPABASE_SECRET_KEY", "latest")}, "SUPABASE_SECRET_KEY:latest"),
+    # Wrong version pins the probe to a stale or attacker-chosen value.
+    ({"SUPABASE_SERVICE_ROLE_KEY": ("SUPABASE_SECRET_KEY", "3")}, "SUPABASE_SECRET_KEY:3"),
+    ({"SUPABASE_URL": ("SUPABASE_URL", "1")}, "SUPABASE_URL:1"),
+])
+def test_probe_job_gate_refuses_a_wrong_secret_reference_or_version(tmp_path, wrong_ref, marker):
+    """Checking env NAMES alone would accept a variable wired elsewhere."""
+    result = run_verify_probe_jobs(
+        tmp_path, db=probe_job_doc(secrets={**DB_PROBE_SECRET_REFS, **wrong_ref}))
+    assert result.returncode != 0
+    assert marker in result.stdout
+    assert "the reference is what is actually read" in result.stdout
+
+
+def test_probe_job_gate_refuses_an_unreadable_secret_reference(tmp_path):
+    doc = probe_job_doc()
+    env = doc["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["env"]
+    for entry in env:
+        if entry.get("name") == "SUPABASE_SERVICE_ROLE_KEY":
+            entry["valueFrom"] = {"somethingElse": {}}
+    result = run_verify_probe_jobs(tmp_path, db=doc)
+    assert result.returncode != 0
+    assert "<unreadable>" in result.stdout
+
+
+@pytest.mark.parametrize("spelling", ["python", "docker.io/library/python", "index.docker.io/library/python"])
+def test_probe_job_gate_accepts_every_canonical_spelling_of_the_same_image(tmp_path, spelling):
+    """Cloud Run may rewrite the repository; the DIGEST is what is enforced."""
+    result = run_verify_probe_jobs(tmp_path, db=probe_job_doc(image=f"{spelling}@{PROBE_DIGEST}"))
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_probe_job_gate_refuses_a_provider_alias_on_a_probe(tmp_path):
     result = run_verify_probe_jobs(
-        tmp_path, db=probe_job_doc(secrets=DB_PROBE_SECRETS + ["KIMI_API_KEY"]))
+        tmp_path, db=probe_job_doc(
+            secrets={**DB_PROBE_SECRET_REFS, "KIMI_API_KEY": ("KIMI_API_KEY", "latest")}))
     assert result.returncode != 0
     assert "provider alias KIMI_API_KEY must NEVER be present" in result.stdout
 
 
 def test_probe_job_gate_requires_the_gateway_probe_to_hold_no_secrets(tmp_path):
     result = run_verify_probe_jobs(
-        tmp_path, gw=probe_job_doc(sa=GATEWAY_SA, secrets=["SUPABASE_SERVICE_ROLE_KEY"]))
+        tmp_path, gw=probe_job_doc(sa=GATEWAY_SA,
+                                   secrets={"SUPABASE_SERVICE_ROLE_KEY": ("SUPABASE_SECRET_KEY", "latest")}))
     assert result.returncode != 0
-    assert "secret bindings" in result.stdout
+    assert "unexpected secret reference" in result.stdout
 
 
 def test_probe_job_gate_fails_closed_without_a_pinned_digest(tmp_path):
@@ -2672,7 +2718,8 @@ def test_probe_creation_verifies_the_templates_it_created(tmp_path):
     """A job that was created wrong must be caught, not assumed correct."""
     world = StageDWorld(tmp_path)
     world.set_state(probe_jobs={"stage-d-db-probe": {
-        "image": "python:3.12-slim", "sa": API_SA, "secrets": DB_PROBE_SECRETS}})
+        "image": "python:3.12-slim", "sa": API_SA,
+        "secrets": {k: list(v) for k, v in DB_PROBE_SECRET_REFS.items()}}})
     result = subprocess.run(
         ["bash", str(world.dir / "04-create-probes.sh")],
         capture_output=True, text=True, cwd=str(world.dir), env=world.env(), timeout=300)
@@ -2694,9 +2741,11 @@ RUN_CONVERSATION = "99999999-8888-7777-6666-555555555555"
 RUN_PROJECT = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 
-def stage_d_run(status="running", **overrides):
+def stage_d_run(status="running", metadata_stage="stage-d-smoke", **overrides):
     row = {
         "id": STAGE_D_RUN_ID,
+        "input": {"content": "Stage D expansion step 1",
+                  "metadata": ({"stage": metadata_stage} if metadata_stage is not None else {})},
         "status": status,
         "launch_state": "launched",
         "worker_id": "worker-1",
@@ -2727,6 +2776,19 @@ def wire_terminalize(db, monkeypatch, *, runs=None, reservations=None, run_id=ST
     return wire_postgrest(db, monkeypatch, fake)
 
 
+def run_terminalize(db) -> int:
+    """Run terminalize and return its exit code.
+
+    The probe always exits — 0 when every proof held, 1 otherwise — the way
+    a CLI gate should, so the shell can read the status.
+    """
+    try:
+        db.terminalize()
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    return 0
+
+
 def terminalize_verdict(capsys):
     return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
 
@@ -2740,7 +2802,7 @@ def test_terminalize_drives_an_interrupted_run_to_cancelled(db, monkeypatch, cap
     something terminalizes it.
     """
     fake = wire_terminalize(db, monkeypatch, runs=[stage_d_run(status=status)])
-    db.terminalize()
+    assert run_terminalize(db) == 0
     verdict = terminalize_verdict(capsys)
     assert verdict["ok"] is True, verdict["problems"]
     assert verdict["terminal"] is True
@@ -2754,7 +2816,7 @@ def test_terminalize_drives_an_interrupted_run_to_cancelled(db, monkeypatch, cap
 def test_terminalize_follows_the_supported_two_step_lifecycle(db, monkeypatch, capsys):
     """running -> cancellation_requested -> cancelled, not a forged jump."""
     fake = wire_terminalize(db, monkeypatch)
-    db.terminalize()
+    assert run_terminalize(db) == 0
     verdict = terminalize_verdict(capsys)
     assert verdict["actions"][:2] == ["running->cancellation_requested", "cancellation_requested->cancelled"]
     patches = [p for m, p in fake.calls if m == "PATCH"]
@@ -2772,7 +2834,7 @@ def test_terminalize_releases_dangling_reservations_and_proves_zero(db, monkeypa
         db, monkeypatch,
         reservations=[reservation(1), reservation(2), reservation(3, status="settled")])
     assert fake.reserved_count(STAGE_D_RUN_ID) == 2
-    db.terminalize()
+    assert run_terminalize(db) == 0
     verdict = terminalize_verdict(capsys)
     assert verdict["ok"] is True, verdict["problems"]
     assert verdict["reservations_released"] == 2
@@ -2794,7 +2856,7 @@ def test_terminalize_interruption_with_running_row_and_dangling_reservation(db, 
         db, monkeypatch,
         runs=[stage_d_run(status="running")],
         reservations=[reservation(i) for i in range(1, 6)])
-    db.terminalize()
+    assert run_terminalize(db) == 0
     verdict = terminalize_verdict(capsys)
     assert verdict["ok"] is True, verdict["problems"]
     assert fake.run(STAGE_D_RUN_ID)["status"] == "cancelled"
@@ -2806,7 +2868,7 @@ def test_terminalize_interruption_with_running_row_and_dangling_reservation(db, 
 def test_terminalize_leaves_an_already_terminal_run_alone(db, monkeypatch, capsys):
     fake = wire_terminalize(db, monkeypatch, runs=[stage_d_run(status="completed",
                                                               finished_at="2026-09-19T01:00:00Z")])
-    db.terminalize()
+    assert run_terminalize(db) == 0
     verdict = terminalize_verdict(capsys)
     assert verdict["ok"] is True, verdict["problems"]
     assert verdict["actions"] == []
@@ -2818,8 +2880,7 @@ def test_terminalize_refuses_a_run_this_authorization_does_not_own(db, monkeypat
     """IDENTITY CHECK — never terminalize somebody else's run."""
     fake = wire_terminalize(db, monkeypatch,
                             runs=[stage_d_run(idempotency_key="swarm-v2-smoke-20260825-4dbdcd6-01")])
-    with pytest.raises(SystemExit):
-        db.terminalize()
+    assert run_terminalize(db) != 0
     verdict = terminalize_verdict(capsys)
     assert "not the authorized Stage D key" in " ".join(verdict["problems"])
     assert fake.mutating_calls() == []
@@ -2831,8 +2892,7 @@ def test_terminalize_refuses_the_government_capture_run(db, monkeypatch, capsys)
     monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
     monkeypatch.setenv("STAGE_D_GOV_CAPTURE_RUN_ID", GOV_RUN_ID)
     fake = wire_postgrest(db, monkeypatch, FakePostgrest(runs=[stage_d_run(id=GOV_RUN_ID)]))
-    with pytest.raises(SystemExit):
-        db.terminalize()
+    assert run_terminalize(db) != 0
     assert "refusing to touch it" in " ".join(terminalize_verdict(capsys)["problems"])
     assert fake.mutating_calls() == []
 
@@ -2857,7 +2917,7 @@ def test_terminalize_never_overwrites_a_concurrent_terminal_result(db, monkeypat
         return original_call(method, path, body, headers)
 
     monkeypatch.setattr(db, "call", racing_call)
-    db.terminalize()
+    assert run_terminalize(db) == 0
     verdict = terminalize_verdict(capsys)
     # The other writer's result stands, untouched.
     assert fake.run(STAGE_D_RUN_ID)["status"] == "failed"
@@ -2879,8 +2939,7 @@ def test_terminalize_fails_closed_when_the_cas_keeps_matching_nothing(db, monkey
         return original_call(method, path, body, headers)
 
     monkeypatch.setattr(db, "call", refusing_call)
-    with pytest.raises(SystemExit):
-        db.terminalize()
+    assert run_terminalize(db) != 0
     verdict = terminalize_verdict(capsys)
     assert "matched no row although the run is still" in " ".join(verdict["problems"])
     assert fake.run(STAGE_D_RUN_ID)["status"] == "running"
@@ -2898,23 +2957,163 @@ def test_terminalize_reports_remaining_active_runs_as_a_failure(db, monkeypatch,
     assert fake.run(STAGE_D_RUN_ID)["status"] == "cancelled"
 
 
-def test_terminalize_without_a_recorded_run_still_proves_the_key_is_idle(db, monkeypatch, capsys):
+# ---------------------------------------------------------------------------
+# Q2. The LOST-RUN window (round-4 finding 1)
+#
+# 05-execute-run.sh creates the run inside the gateway probe and writes
+# run_id to state.json only after parsing the probe's structured output. If
+# anything dies in between, the run EXISTS but the cleanup is handed an
+# empty id. Treating that as "no run" would delete the credentialed probe
+# and walk away from an active run holding a lease, a concurrency slot and
+# budget reservations.
+# ---------------------------------------------------------------------------
+
+
+def wire_lost_run(db, monkeypatch, *, runs, reservations=None,
+                  expected_user=RUN_USER, expected_conversation=RUN_CONVERSATION):
+    """The crash window: state.json has the identity but NOT the run id."""
     monkeypatch.setenv("STAGE_D_RUN_ID", "")
     monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
-    wire_postgrest(db, monkeypatch, FakePostgrest(runs=[]))
-    db.terminalize()
+    monkeypatch.setenv("STAGE_D_GOV_CAPTURE_RUN_ID", GOV_RUN_ID)
+    monkeypatch.setenv("STAGE_D_GOV_CAPTURE_OPERATION", GOV_OPERATION)
+    if expected_user is not None:
+        monkeypatch.setenv("STAGE_D_EXPECTED_USER_ID", expected_user)
+    if expected_conversation is not None:
+        monkeypatch.setenv("STAGE_D_EXPECTED_CONVERSATION_ID", expected_conversation)
+    return wire_postgrest(db, monkeypatch, FakePostgrest(
+        runs=runs, reservations=reservations or [],
+        conversations=[{"id": RUN_CONVERSATION, "project_id": RUN_PROJECT}]))
+
+
+def test_a_lost_run_id_is_recovered_from_the_idempotency_key(db, monkeypatch, capsys):
+    """THE crash window: an active run exists, its id never reached state."""
+    fake = wire_lost_run(db, monkeypatch,
+                         runs=[stage_d_run(status="running")],
+                         reservations=[reservation(1)])
+    assert run_terminalize(db) == 0
     verdict = terminalize_verdict(capsys)
-    assert verdict["ok"] is True and verdict["no_run_recorded"] is True
-    assert verdict["active_runs_under_key"] == 0
+    assert verdict["ok"] is True, verdict["problems"]
+    assert verdict["recovered"] is True
+    assert verdict["recovered_run_id"] == STAGE_D_RUN_ID
+    assert "recovered_run_id_from_idempotency_key" in verdict["actions"]
+    # The recovered run really was closed and its budget really released.
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "cancelled"
+    assert fake.reserved_count(STAGE_D_RUN_ID) == 0
+    assert verdict["active_runs_for_user"] == 0
+    assert verdict["active_runs_for_project"] == 0
 
 
-def test_terminalize_without_a_recorded_run_fails_on_a_stray_active_run(db, monkeypatch, capsys):
-    monkeypatch.setenv("STAGE_D_RUN_ID", "")
-    monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
-    wire_postgrest(db, monkeypatch, FakePostgrest(runs=[stage_d_run(status="running")]))
-    with pytest.raises(SystemExit):
-        db.terminalize()
-    assert "still active" in " ".join(terminalize_verdict(capsys)["problems"])
+def test_a_recovered_terminal_run_still_has_its_reservations_released(db, monkeypatch, capsys):
+    """A finished run can still hold reserved budget forever."""
+    fake = wire_lost_run(db, monkeypatch,
+                         runs=[stage_d_run(status="failed", finished_at="2026-09-19T01:00:00Z")],
+                         reservations=[reservation(1), reservation(2)])
+    assert run_terminalize(db) == 0
+    verdict = terminalize_verdict(capsys)
+    assert verdict["ok"] is True, verdict["problems"]
+    assert verdict["recovered"] is True
+    assert verdict["reservations_released"] == 2
+    assert fake.reserved_count(STAGE_D_RUN_ID) == 0
+    # The terminal status was not rewritten.
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "failed"
+
+
+def test_no_rows_under_the_key_is_a_proved_no_run_verdict(db, monkeypatch, capsys):
+    wire_lost_run(db, monkeypatch, runs=[])
+    assert run_terminalize(db) == 0
+    verdict = terminalize_verdict(capsys)
+    assert verdict["ok"] is True
+    assert verdict["no_run_recorded"] is True
+    assert verdict["rows_under_key"] == 0
+    assert verdict["recovered"] is False
+
+
+def test_two_rows_under_the_key_fails_closed_without_mutating(db, monkeypatch, capsys):
+    second = stage_d_run(id="bbbb1111-2222-3333-4444-555566667777", status="running")
+    fake = wire_lost_run(db, monkeypatch, runs=[stage_d_run(status="running"), second])
+    assert run_terminalize(db) != 0
+    verdict = terminalize_verdict(capsys)
+    assert verdict["rows_under_key"] == 2
+    assert "ambiguous" in " ".join(verdict["problems"])
+    assert fake.mutating_calls() == []
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "running"
+
+
+@pytest.mark.parametrize("mismatch,marker", [
+    ({"requested_by": "11111111-1111-1111-1111-111111111111"}, "not the recorded Stage D test user"),
+    ({"conversation_id": "22222222-2222-2222-2222-222222222222"}, "not the recorded Stage D conversation"),
+    ({"metadata_stage": "something-else"}, "not the Stage D smoke run"),
+    ({"metadata_stage": None}, "not the Stage D smoke run"),
+])
+def test_a_recovered_row_must_match_the_recorded_identity(db, monkeypatch, capsys, mismatch, marker):
+    """A row sharing the key is not automatically the authorized run."""
+    fake = wire_lost_run(db, monkeypatch, runs=[stage_d_run(status="running", **mismatch)])
+    assert run_terminalize(db) != 0
+    verdict = terminalize_verdict(capsys)
+    assert marker in " ".join(verdict["problems"])
+    assert fake.mutating_calls() == []
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "running"
+
+
+def test_a_recovered_row_colliding_with_the_government_capture_is_refused(db, monkeypatch, capsys):
+    """Belt and braces: even under the Stage D key, never touch the capture."""
+    capture = stage_d_run(id=GOV_RUN_ID, status="queued")
+    fake = wire_lost_run(db, monkeypatch, runs=[capture],
+                         expected_user=None, expected_conversation=None)
+    assert run_terminalize(db) != 0
+    verdict = terminalize_verdict(capsys)
+    assert "prepared Government capture" in " ".join(verdict["problems"])
+    assert fake.mutating_calls() == []
+
+
+def test_a_recovered_row_carrying_the_capture_marker_is_refused(db, monkeypatch, capsys):
+    marked = stage_d_run(status="running")
+    marked["input"] = {"metadata": {"stage": "stage-d-smoke",
+                                    "milo_operation": GOV_OPERATION}}
+    fake = wire_lost_run(db, monkeypatch, runs=[marked])
+    assert run_terminalize(db) != 0
+    assert "operator-capture marker" in " ".join(terminalize_verdict(capsys)["problems"])
+    assert fake.mutating_calls() == []
+
+
+def test_an_absent_run_id_is_never_read_as_no_run(db, monkeypatch, capsys):
+    """The regression itself: the old code only COUNTED and never recovered."""
+    fake = wire_lost_run(db, monkeypatch, runs=[stage_d_run(status="running")])
+    assert run_terminalize(db) == 0
+    verdict = terminalize_verdict(capsys)
+    assert verdict.get("no_run_recorded") is not True
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "cancelled"
+
+
+def test_lockdown_recovers_a_lost_run_end_to_end(tmp_path):
+    """state.json has user_id and conversation_id but NO run_id."""
+    world = StageDWorld(tmp_path)
+    world.enable_execution_surface()
+    (world.workdir / "state.json").write_text(json.dumps({
+        "stage_d_workdir": str(world.workdir),
+        "idempotency_key": STAGE_D_KEY,
+        "user_id": RUN_USER,
+        "conversation_id": RUN_CONVERSATION,
+    }))
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "STAGE D LOCKDOWN COMPLETE" in result.stdout
+    # The recorded identity was handed to the probe so a recovered row can
+    # be checked against it.
+    calls = world.log.read_text()
+    assert f"STAGE_D_EXPECTED_USER_ID={RUN_USER}" in calls
+    assert f"STAGE_D_EXPECTED_CONVERSATION_ID={RUN_CONVERSATION}" in calls
+
+
+def test_lockdown_still_requires_the_terminalize_proof_with_no_recorded_run(tmp_path):
+    """An empty run id must not become a free pass."""
+    world = StageDWorld(tmp_path, state={
+        "probe_verdicts": {"govcheck": True, "terminalize": False}})
+    world.enable_execution_surface()
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode != 0
+    assert "STAGE D LOCKDOWN COMPLETE" not in result.stdout
+    assert "could not be proven terminal and clean" in result.stderr
 
 
 def test_lockdown_runs_terminalize_before_deleting_the_probe(tmp_path):
@@ -3023,7 +3222,7 @@ def test_setup_reproves_membership_after_the_authorized_mutation(db, monkeypatch
     wire_setup(db, monkeypatch, record=record)
     db.setup()
     verdict = setup_verdict(capsys)
-    assert verdict["members"] == [STAGE_D_USER_ID]
+    assert verdict["members"] == [f"{STAGE_D_USER_ID}:owner"]
     member_reads = [i for i, (m, p) in enumerate(record) if m == "GET" and "project_members" in p]
     member_write = next(i for i, (m, p) in enumerate(record) if m == "POST" and "project_members" in p)
     # Read before (validation) AND after (proof) the upsert.
@@ -3123,3 +3322,123 @@ def test_probe_verdict_fails_closed_on_a_missing_record(tmp_path):
     result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
     assert result.returncode != 0
     assert "failing closed" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# T. Preflight verifies the cleanup RPC it depends on (round-4 finding 2)
+# ---------------------------------------------------------------------------
+
+#: The live signature, verified read-only against production 2026-09-19:
+#: SECURITY DEFINER, service_role may execute, anon/authenticated may not.
+SETTLE_RPC = "settle_model_call_budget"
+SETTLE_RPC_ARGS = {"p_reservation_id", "p_actual_cost", "p_status", "p_rejection_reason"}
+
+
+def test_preflight_requires_the_cleanup_rpc_terminalize_calls(db):
+    """terminalize() releases reservations through it, so a missing or
+    mismatched signature must block BEFORE any production enable."""
+    assert SETTLE_RPC in db.REQUIRED_RPC_ARGS
+    assert db.REQUIRED_RPC_ARGS[SETTLE_RPC] == SETTLE_RPC_ARGS
+    # And the probe really does call it.
+    assert f"/rest/v1/rpc/{SETTLE_RPC}" in (STAGE_D / "probe_db.py").read_text()
+
+
+def test_preflight_refuses_when_the_cleanup_rpc_is_absent(db, monkeypatch, capsys):
+    monkeypatch.setenv("STAGE_D_EXPECTED_PRIOR_RUNS", EXPECTED_PRIOR_RUNS)
+    original = db.REQUIRED_RPC_ARGS
+
+    def fake_call(method, path, body=None, headers=None):
+        if path == "/rest/v1/":
+            paths = {f"/rpc/{rpc}": {"post": {"parameters": [
+                {"in": "body", "schema": {"properties": {a: {} for a in args}}}]}}
+                for rpc, args in original.items() if rpc != SETTLE_RPC}
+            return 200, {"paths": paths}
+        if path.startswith(f"/rest/v1/runs?id=eq.{GOV_RUN_ID}"):
+            return 200, [PREPARED_CAPTURE_ROW]
+        return 200, []
+
+    monkeypatch.setattr(db, "call", fake_call)
+    monkeypatch.setattr(db, "count_exact", lambda path: 7 if path == "/rest/v1/runs?select=id" else 0)
+    with pytest.raises(SystemExit):
+        db.preflight()
+    verdict = preflight_output(db, capsys)
+    assert f"rpc_{SETTLE_RPC} is MISSING" in " ".join(verdict["problems"])
+
+
+@pytest.mark.parametrize("dropped", sorted(SETTLE_RPC_ARGS))
+def test_preflight_refuses_a_mismatched_cleanup_rpc_signature(db, monkeypatch, capsys, dropped):
+    monkeypatch.setenv("STAGE_D_EXPECTED_PRIOR_RUNS", EXPECTED_PRIOR_RUNS)
+    original = db.REQUIRED_RPC_ARGS
+
+    def fake_call(method, path, body=None, headers=None):
+        if path == "/rest/v1/":
+            paths = {}
+            for rpc, args in original.items():
+                advertised = set(args) - ({dropped} if rpc == SETTLE_RPC else set())
+                paths[f"/rpc/{rpc}"] = {"post": {"parameters": [
+                    {"in": "body", "schema": {"properties": {a: {} for a in advertised}}}]}}
+            return 200, {"paths": paths}
+        if path.startswith(f"/rest/v1/runs?id=eq.{GOV_RUN_ID}"):
+            return 200, [PREPARED_CAPTURE_ROW]
+        return 200, []
+
+    monkeypatch.setattr(db, "call", fake_call)
+    monkeypatch.setattr(db, "count_exact", lambda path: 7 if path == "/rest/v1/runs?select=id" else 0)
+    with pytest.raises(SystemExit):
+        db.preflight()
+    problems = " ".join(preflight_output(db, capsys)["problems"])
+    assert f"rpc_{SETTLE_RPC}" in problems and dropped in problems
+
+
+def test_the_guarded_and_unguarded_settle_rpcs_are_both_required(db):
+    """They are different functions with different signatures and callers."""
+    assert "settle_model_call_budget_guarded" in db.REQUIRED_RPC_ARGS
+    assert db.REQUIRED_RPC_ARGS["settle_model_call_budget_guarded"] != SETTLE_RPC_ARGS
+
+
+# ---------------------------------------------------------------------------
+# U. Exact membership includes the ROLE (round-4 finding 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("role", ["viewer", "member", "admin", "", None])
+def test_setup_refuses_the_right_user_with_the_wrong_role(db, monkeypatch, capsys, role):
+    """Comparing user ids alone would accept the right person with a role
+    that authorization reads differently."""
+    record = rejected_setup_calls(
+        db, monkeypatch, members=[{"user_id": STAGE_D_USER_ID, "role": role}])
+    verdict = setup_verdict(capsys)
+    assert verdict["ok"] is False
+    assert "membership" in " ".join(verdict["problems"])
+    # Refused during the READ-ONLY phase: nothing was written.
+    assert verdict["mutations"] == []
+    assert mutating(record) == []
+
+
+def test_setup_reports_membership_with_roles_not_bare_ids(db, monkeypatch, capsys):
+    wire_setup(db, monkeypatch)
+    db.setup()
+    verdict = setup_verdict(capsys)
+    assert verdict["members"] == [f"{STAGE_D_USER_ID}:owner"]
+    assert verdict["members_before"] == [f"{STAGE_D_USER_ID}:owner"]
+
+
+def test_setup_proves_the_owner_role_after_the_authorized_mutation(db, monkeypatch, capsys):
+    """The post-mutation proof must also require owner, not just presence."""
+    wire_setup(db, monkeypatch, members=[{"user_id": STAGE_D_USER_ID, "role": "viewer"}],
+               project_exists=False)
+    with pytest.raises(SystemExit):
+        db.setup()
+    verdict = setup_verdict(capsys)
+    assert "expected exactly" in " ".join(verdict["problems"])
+    assert f"{STAGE_D_USER_ID}:owner" in " ".join(verdict["problems"])
+    # A brand-new project is created, so the write DID happen — what failed
+    # is the proof, which is the point.
+    assert "created_project" in verdict["mutations"]
+
+
+def test_membership_comparison_is_a_tuple_not_a_set_of_ids(db):
+    assert db.EXPECTED_MEMBER_ROLE == "owner"
+    assert db.membership_tuples([{"user_id": "u", "role": "owner"}]) == [("u", "owner")]
+    assert db.membership_tuples([{"user_id": "u", "role": None}]) == [("u", "<null>")]
+    assert db.membership_tuples([{"user_id": "u"}]) == [("u", "<null>")]

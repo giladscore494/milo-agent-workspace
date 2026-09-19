@@ -173,14 +173,21 @@ verified before any credentialed job exists**:
 
 | Input | Pin | Checked |
 | --- | --- | --- |
-| Runtime image | `python@sha256:78387bc3…` (digest, never the mutable `python:3.12-slim` tag) | after creation, and again **before every execution** |
+| Runtime image | `docker.io/library/python@sha256:78387bc3…` (digest, never the mutable `python:3.12-slim` tag; the repository is spelled canonically so Cloud Run's own normalisation cannot fail the check spuriously) | after creation, and again **before every execution** |
 | `probe_db.py` source | `STAGE_D_PROBE_DB_SHA256` | before any gcloud call |
 | `probe_gateway.py` source | `STAGE_D_PROBE_GW_SHA256` | before any gcloud call |
 
 `verify_probe_jobs.py` also checks each job's service account and its
-exact secret bindings (db probe: only the two Supabase secrets that
-identity already accesses; gateway probe: **none**), and refuses a
-provider-key alias on either.
+exact secret **references** — not merely the env names, because the name
+is only a label and the reference is what is actually read:
+
+| Env variable | Must be backed by |
+| --- | --- |
+| `SUPABASE_URL` | `SUPABASE_URL:latest` |
+| `SUPABASE_SERVICE_ROLE_KEY` | `SUPABASE_SECRET_KEY:latest` |
+
+No extra reference is allowed, the gateway probe must hold **none**, and a
+provider-key alias on either is refused.
 
 An approved Artifact Registry mirror would be preferable to pulling a
 privileged runtime from a public registry. None exists today — the
@@ -199,6 +206,23 @@ can sit in `running` indefinitely — holding its lease, its
 reservations. A cleanup that only cancels the execution leaves all of
 that behind.
 
+**And the run id can go missing.** `05-execute-run.sh` creates the run
+inside the gateway probe and writes `run_id` to `state.json` only after
+parsing the probe's structured output. If the shell, the session, the
+pipeline or log retrieval dies in between, the run EXISTS but the cleanup
+is handed an empty id. An absent id is therefore never read as "no run":
+`terminalize` queries the pinned idempotency key — zero rows is a proved
+no-run verdict, exactly one row is **recovered** and put through the full
+identity gate and cleanup, and more than one fails closed having mutated
+nothing.
+
+The identity gate applies to a recovered row as strictly as to a recorded
+one: the idempotency key, the run-request metadata marker
+(`stage: stage-d-smoke`), the `user_id` and `conversation_id` recorded in
+`state.json` **before** the run was created, and an explicit refusal of
+the prepared Government capture and of anything carrying the
+operator-capture marker.
+
 So the lockdown terminalizes the **database** run too, through
 `probe_db.py --terminalize`: identity-checked (it refuses any run not
 carrying the authorized Stage D key, and can never touch the prepared
@@ -211,7 +235,16 @@ is retried; what must hold is the **proof**:
 
 * the run is terminal;
 * zero active runs remain for its user **and** its project;
-* zero reservations remain in status `reserved`.
+* zero reservations remain in status `reserved` — checked and cleaned even
+  when the run was **already** terminal, because a finished run can still
+  hold reserved budget.
+
+The preflight verifies the RPC this depends on:
+`settle_model_call_budget(p_reservation_id, p_actual_cost, p_status,
+p_rejection_reason)`. If it is missing, has a different signature, or is
+not exposed to the service-role probe, the run is refused **before any
+production enable** — a cleanup that cannot release a reservation would
+leave the budget held.
 
 `LOCKDOWN COMPLETE` is impossible unless those hold **and** the
 Government-capture invariant is proven.

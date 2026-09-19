@@ -35,7 +35,7 @@ API_SERVICE = "milo-agent-api"
 READY_REVISION = "milo-agent-api-00080-nm8"
 DB_PROBE = "stage-d-db-probe"
 GW_PROBE = "stage-d-gw-probe"
-PROBE_IMAGE_REPO = "python"
+PROBE_IMAGE_REPO = "docker.io/library/python"
 PROBE_IMAGE_DIGEST = "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea"
 API_SA = "milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com"
 GATEWAY_SA = "milo-vercel-gateway@big-cabinet-457321-t7.iam.gserviceaccount.com"
@@ -161,15 +161,19 @@ def api_revision_json(state: dict) -> dict:
 def default_probe_job(name: str) -> dict:
     if name == DB_PROBE:
         return {"image": f"{PROBE_IMAGE_REPO}@{PROBE_IMAGE_DIGEST}", "sa": API_SA,
-                "secrets": ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]}
-    return {"image": f"{PROBE_IMAGE_REPO}@{PROBE_IMAGE_DIGEST}", "sa": GATEWAY_SA, "secrets": []}
+                # env name -> (Secret Manager secret, version)
+                "secrets": {"SUPABASE_URL": ["SUPABASE_URL", "latest"],
+                            "SUPABASE_SERVICE_ROLE_KEY": ["SUPABASE_SECRET_KEY", "latest"]}}
+    return {"image": f"{PROBE_IMAGE_REPO}@{PROBE_IMAGE_DIGEST}", "sa": GATEWAY_SA, "secrets": {}}
 
 
 def probe_job_json(state: dict, name: str) -> dict:
     spec = (state.get("probe_jobs") or {}).get(name) or default_probe_job(name)
     env = [{"name": "PROBE_SOURCE_GZIP_B64", "value": "<elided>"}]
-    env += [{"name": s, "valueFrom": {"secretKeyRef": {"key": "latest", "name": s}}}
-            for s in spec.get("secrets", [])]
+    for env_name, ref in (spec.get("secrets") or {}).items():
+        secret, version = (ref if isinstance(ref, (list, tuple)) else (ref, "latest"))
+        env.append({"name": env_name,
+                    "valueFrom": {"secretKeyRef": {"name": secret, "key": version}}})
     return {"spec": {"template": {"spec": {"template": {"spec": {
         "serviceAccountName": spec.get("sa"),
         "containers": [{"image": spec.get("image"), "env": env}],

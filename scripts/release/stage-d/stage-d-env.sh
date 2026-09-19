@@ -108,6 +108,12 @@ stage_d_pin STAGE_D_GW_PROBE_JOB "stage-d-gw-probe"
 # read-only, from the registry API. It is an OCI image index carrying a
 # linux/amd64 manifest, which is what Cloud Run pulls.
 #
+# The repository is spelled CANONICALLY (docker.io/library/python, not
+# the shorthand `python`) so that Cloud Run's own normalisation of the
+# stored template cannot make the exact-template check fail spuriously.
+# verify_probe_jobs.py normalises both sides anyway, so the digest — not
+# the spelling — is what is enforced.
+#
 # MIRROR POSTURE. An approved Artifact Registry mirror is preferable to
 # pulling a privileged runtime from a public registry. No mirror exists
 # today: the project has exactly one Artifact Registry repository,
@@ -119,7 +125,7 @@ stage_d_pin STAGE_D_GW_PROBE_JOB "stage-d-gw-probe"
 # byte-identical either way. Until then the digest pin is what makes the
 # public pull safe.
 # ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_PROBE_IMAGE_REPO "python"
+stage_d_pin STAGE_D_PROBE_IMAGE_REPO "docker.io/library/python"
 stage_d_pin STAGE_D_PROBE_IMAGE_DIGEST "sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea"
 
 # ---------------------------------------------------------------------------
@@ -135,7 +141,7 @@ stage_d_pin STAGE_D_PROBE_IMAGE_DIGEST "sha256:78387bc3881b8273120a12ebe6c1ab22b
 # Regenerate deliberately, in a reviewed commit, after an intended change:
 #   sha256sum scripts/release/stage-d/probe_db.py scripts/release/stage-d/probe_gateway.py
 # ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_PROBE_DB_SHA256 "7602e328615ad372255cdf381b3727abd3e62a0f27fcef61026c0217e9728378"
+stage_d_pin STAGE_D_PROBE_DB_SHA256 "fab71a9e3af6108c4475359cde20e27f035967e56a46bf1dfe3517a45967fa62"
 stage_d_pin STAGE_D_PROBE_GW_SHA256 "359d7cbfc7195f9fee333480af0f7fe1ae09ca8ce339a0a7942bfe823dde4bce"
 
 # ---------------------------------------------------------------------------

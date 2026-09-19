@@ -17,8 +17,11 @@ This module checks, for both jobs:
     reference is refused outright, a different digest is refused, and an
     image from any other repository is refused;
   * the service account is the expected operator-controlled identity;
-  * the db probe binds exactly the two Supabase secrets that identity
-    already accesses, and the gateway probe binds NO secrets at all;
+  * the db probe's secret REFERENCES are exactly the reviewed ones —
+    SUPABASE_URL -> SUPABASE_URL:latest and SUPABASE_SERVICE_ROLE_KEY ->
+    SUPABASE_SECRET_KEY:latest, with no extras — because the env name is
+    only a label and the reference is what is actually read; the gateway
+    probe holds NO secret reference at all;
   * neither job carries a provider-key alias in any form.
 
 It runs after the jobs are created AND again immediately before every
@@ -41,9 +44,16 @@ import json
 import os
 import sys
 
-#: The exact secret bindings the db probe may hold — the two the API
-#: runtime identity already accesses. No new grant, and nothing else.
-DB_PROBE_EXPECTED_SECRETS = {"SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"}
+#: The exact secret REFERENCES the db probe may hold: env name -> the
+#: Secret Manager secret and version behind it. Checking only the env
+#: names would accept `SUPABASE_SERVICE_ROLE_KEY` wired to some other
+#: secret entirely, which is the interesting attack — the name is the
+#: label, the reference is what is actually read. These are the two the
+#: API runtime identity already accesses; no new grant, and nothing else.
+DB_PROBE_EXPECTED_SECRET_REFS = {
+    "SUPABASE_URL": ("SUPABASE_URL", "latest"),
+    "SUPABASE_SERVICE_ROLE_KEY": ("SUPABASE_SECRET_KEY", "latest"),
+}
 
 #: Every provider-key alias the Worker accepts. A probe must never hold one.
 PROVIDER_SECRET_ALIASES = ("KIMI_API_KEY", "MOONSHOT_API_KEY")
@@ -73,6 +83,61 @@ def service_account_of(job: object) -> str:
         return ""
 
 
+#: Registry prefixes Docker Hub images may legitimately carry. Cloud Run
+#: may render `python@sha256:…` in its canonical `docker.io/library/…`
+#: form (or the reverse), so both sides are normalised before comparison.
+#: This makes the check robust to that rewriting WITHOUT loosening it:
+#: the digest is still compared exactly, and any other repository is
+#: still refused.
+_DOCKER_HUB_PREFIXES = ("docker.io/library/", "index.docker.io/library/", "registry-1.docker.io/library/")
+
+
+def canonical_repo(repo: str) -> str:
+    """One spelling for a repository, so normalisation cannot fail a check."""
+    for prefix in _DOCKER_HUB_PREFIXES:
+        if repo.startswith(prefix):
+            return "docker.io/library/" + repo[len(prefix):]
+    # A bare, single-segment name is a Docker Hub official image.
+    if "/" not in repo and "." not in repo.split(":")[0]:
+        return "docker.io/library/" + repo
+    return repo
+
+
+def secret_refs_of(env: list) -> dict[str, tuple[str, str]]:
+    """env name -> (secret name, version) for every secret-backed variable."""
+    refs: dict[str, tuple[str, str]] = {}
+    for entry in env:
+        if not isinstance(entry, dict) or "valueFrom" not in entry:
+            continue
+        source = entry.get("valueFrom")
+        if not isinstance(source, dict):
+            continue
+        ref = source.get("secretKeyRef")
+        if not isinstance(ref, dict):
+            # A secret-backed variable whose reference cannot be read is
+            # not a variable whose reference has been verified.
+            refs[str(entry.get("name"))] = ("<unreadable>", "<unreadable>")
+            continue
+        refs[str(entry.get("name"))] = (str(ref.get("name") or ""), str(ref.get("key") or ""))
+    return refs
+
+
+def check_secret_refs(label: str, refs: dict[str, tuple[str, str]],
+                      expected: dict[str, tuple[str, str]], problems: list[str]) -> None:
+    for name, (secret, version) in sorted(expected.items()):
+        actual = refs.get(name)
+        if actual is None:
+            problems.append(f"{label}: expected secret-backed variable {name} is missing")
+            continue
+        if actual != (secret, version):
+            problems.append(
+                f"{label}: {name} is backed by {actual[0]}:{actual[1]}, expected {secret}:{version} — "
+                "the env NAME is only a label; the reference is what is actually read")
+    for name in sorted(set(refs) - set(expected)):
+        problems.append(
+            f"{label}: unexpected secret reference {name} -> {refs[name][0]}:{refs[name][1]}")
+
+
 def check_image(label: str, container: dict, expected: str, repo: str, problems: list[str]) -> str:
     image = container.get("image")
     if not isinstance(image, str) or not image:
@@ -84,18 +149,19 @@ def check_image(label: str, container: dict, expected: str, repo: str, problems:
             f"be pinned by digest — expected {expected!r}")
         return image
     ref_repo, _, digest = image.partition("@")
-    if ref_repo != repo:
+    if canonical_repo(ref_repo) != canonical_repo(repo):
         problems.append(
             f"{label}: image {image!r} comes from {ref_repo!r}, not the reviewed probe repository {repo!r}")
         return image
-    if image != expected:
+    if digest != expected.partition("@")[2]:
         problems.append(
             f"{label}: image digest {digest} is not the reviewed probe runtime digest — expected {expected!r}")
     return image
 
 
 def check_job(label: str, job: object, expected_image: str, repo: str,
-              expected_sa: str, expected_secrets: set[str], problems: list[str]) -> dict:
+              expected_sa: str, expected_secret_refs: dict[str, tuple[str, str]],
+              problems: list[str]) -> dict:
     evidence: dict = {}
     container = container_of(job, label, problems)
     if container is None:
@@ -109,13 +175,11 @@ def check_job(label: str, job: object, expected_image: str, repo: str,
 
     env = container.get("env") or []
     values = {e["name"] for e in env if isinstance(e, dict) and "value" in e}
-    secrets = {e["name"] for e in env if isinstance(e, dict) and "valueFrom" in e}
-    evidence["secret_bindings"] = sorted(secrets)
-    if secrets != expected_secrets:
-        problems.append(
-            f"{label}: secret bindings {sorted(secrets)} differ from the reviewed set {sorted(expected_secrets)}")
+    refs = secret_refs_of(env)
+    evidence["secret_references"] = {k: f"{v[0]}:{v[1]}" for k, v in sorted(refs.items())}
+    check_secret_refs(label, refs, expected_secret_refs, problems)
     for alias in PROVIDER_SECRET_ALIASES:
-        if alias in secrets or alias in values:
+        if alias in refs or alias in values:
             problems.append(f"{label}: provider alias {alias} must NEVER be present on a probe job")
     return evidence
 
@@ -149,14 +213,15 @@ def main() -> int:
     if db_job is not None:
         verdict["jobs"]["db"] = check_job(
             "db probe", db_job, expected_image, repo,
-            os.environ.get("STAGE_D_API_SA", ""), DB_PROBE_EXPECTED_SECRETS, problems)
+            os.environ.get("STAGE_D_API_SA", ""), DB_PROBE_EXPECTED_SECRET_REFS, problems)
 
     if args.gw_json:
         gw_job = load(args.gw_json, "gw probe", problems)
         if gw_job is not None:
             verdict["jobs"]["gw"] = check_job(
                 "gw probe", gw_job, expected_image, repo,
-                os.environ.get("STAGE_D_GATEWAY_SA", ""), set(), problems)
+                # The gateway probe must hold ZERO secret references.
+                os.environ.get("STAGE_D_GATEWAY_SA", ""), {}, problems)
 
     verdict["problems"] = problems
     verdict["ok"] = not problems
