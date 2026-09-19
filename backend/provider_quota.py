@@ -185,7 +185,6 @@ class MemoryQuotaBackend:
                 if expiry <= now_ms:
                     del holders[held]
             if len(holders) >= limit:
-                soonest = min(holders.values()) if holders else now_ms
                 return False, len(holders)
             holders[lease_id] = now_ms + ttl_ms
             return True, len(holders)

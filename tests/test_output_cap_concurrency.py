@@ -362,3 +362,107 @@ def test_engine_parallelism_is_clamped_to_available_provider_capacity():
     assert BoundedTaskExecutor.configured_limit(env, provider_capacity=2) == 2
     assert BoundedTaskExecutor.configured_limit({"MILO_SWARM_MAX_ACTIVE_WORKERS": "1"},
                                                 provider_capacity=8) == 1
+
+
+# =============================================================================
+# 5. an abandoned acquisition never strands organization capacity
+# =============================================================================
+
+def test_a_lease_is_released_when_the_local_slot_wait_gives_up():
+    """Acquiring the shared permit and then failing must not hold the account.
+
+    The global permit is taken before the process-local slot. If that second
+    wait exhausts its bound or is cancelled, a permit nobody is using would sit
+    held for the whole lease TTL -- and compound under load.
+    """
+    from backend.provider_quota import ProviderQuotaExhausted
+    from backend.provider_scheduler import ProviderBackpressureExceeded
+    from backend.runtime import CancellationRequested
+
+    for failure in (ProviderBackpressureExceeded("no local slot"),
+                    CancellationRequested("RUN_CANCELLED")):
+        backend = MemoryQuotaBackend()
+        coordinator = ProviderQuotaCoordinator(backend, QuotaConfig(max_concurrency=1))
+        scheduler = ProviderScheduler(
+            ProviderLimitsConfig(max_concurrency=1, rpm_limit=None, tpm_limit=None),
+            coordinator=coordinator)
+
+        def refuse(*_a, **_k):
+            raise failure
+
+        scheduler._acquire_slot = refuse
+        with pytest.raises(type(failure)):
+            scheduler.execute(lambda: None, estimated_tokens=10, reserved_tokens=10)
+
+        assert coordinator.try_acquire_inference() is not None, (
+            f"the organization permit leaked after {type(failure).__name__}")
+
+
+def test_every_provider_attempt_re_enters_the_shared_admission_gate():
+    """A 429 retry is a real provider request and must be admitted again.
+
+    Admitting only the first attempt is how bounded retries quietly push the
+    account over its RPM ceiling.
+    """
+    admitted: list[int] = []
+    backend = MemoryQuotaBackend()
+
+    class Counting(ProviderQuotaCoordinator):
+        def try_admit_request(self, reserved_tokens):
+            admitted.append(reserved_tokens)
+            return super().try_admit_request(reserved_tokens)
+
+    # A hand-wound clock the fake sleep advances, so the pause a 429 installs
+    # really does elapse without the test waiting on wall time.
+    now = [1_000.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    coordinator = Counting(backend, QuotaConfig(), clock=lambda: now[0])
+    scheduler = ProviderScheduler(
+        ProviderLimitsConfig(max_concurrency=2, rpm_limit=None, tpm_limit=None,
+                             backoff_base_seconds=0.001, backoff_max_seconds=0.001),
+        coordinator=coordinator, sleep_fn=sleep)
+
+    attempts = {"n": 0}
+
+    def flaky():
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError("Error code: 429 rate_limit_reached_error")
+        return "ok"
+
+    assert scheduler.execute(flaky, estimated_tokens=10, reserved_tokens=10) == "ok"
+    assert attempts["n"] == 3
+    assert len(admitted) == 3, "retried provider attempts bypassed the shared gate"
+
+
+def test_a_long_call_keeps_its_permit_alive_instead_of_letting_it_expire():
+    """A provider request slower than the lease TTL must not lose its permit.
+
+    The TTL recovers a permit from a CRASHED holder; it is not a call-duration
+    budget. Without renewal, a slow call's own permit expires mid-flight and a
+    second caller can take a slot the account is already using.
+    """
+    import time as real_time
+
+    backend = MemoryQuotaBackend()
+    coordinator = ProviderQuotaCoordinator(
+        backend, QuotaConfig(max_concurrency=1, lease_ttl_seconds=3))
+    scheduler = ProviderScheduler(
+        ProviderLimitsConfig(max_concurrency=1, rpm_limit=None, tpm_limit=None),
+        coordinator=coordinator)
+
+    observed: list[object] = []
+
+    def slow_call():
+        # Longer than the whole TTL, so an unrenewed lease would be gone.
+        real_time.sleep(2.5)
+        observed.append(coordinator.try_acquire_inference())
+        return "done"
+
+    assert scheduler.execute(slow_call, estimated_tokens=10, reserved_tokens=10) == "done"
+    assert observed == [None], "the permit expired while its own call was still running"
+    # ...and it is released cleanly once the call finishes.
+    assert coordinator.try_acquire_inference() is not None

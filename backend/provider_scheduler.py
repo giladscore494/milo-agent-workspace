@@ -465,6 +465,30 @@ class ProviderScheduler:
             self._wait(delay)
             waited += delay
 
+    def _start_lease_watchdog(self, lease: Any) -> threading.Event | None:
+        """Renew ``lease`` in the background until the returned event is set.
+
+        Returns None when there is no lease to keep (no coordinator wired), so
+        the caller's teardown stays a single unconditional branch.
+        """
+        if lease is None:
+            return None
+        ttl = getattr(getattr(lease, "coordinator", None), "config", None)
+        interval = max(1.0, getattr(ttl, "lease_ttl_seconds", 120.0) / 3.0)
+        done = threading.Event()
+
+        def beat() -> None:
+            while not done.wait(interval):
+                if not lease.heartbeat():
+                    # The lease is already gone. Nothing useful is left to
+                    # renew, and re-acquiring here would silently take a
+                    # SECOND permit for one call.
+                    return
+
+        threading.Thread(target=beat, name="provider-lease-heartbeat",
+                         daemon=True).start()
+        return done
+
     # -- the guarded call path -------------------------------------------------
     def execute(self, call: Callable[[], Any], *, estimated_tokens: int = 0, agent: str = "", phase: str = "",
                 reserved_tokens: int | None = None) -> Any:
@@ -484,11 +508,28 @@ class ProviderScheduler:
             waited_total += self._admit(estimated_tokens, waited_total, agent, phase)
             self._check_cancelled()
             lease = None
-            if self._coordinator is not None:
-                lease, waited = self._acquire_global(
-                    max(1, int(admission_tokens)), waited_total, agent, phase)
-                waited_total += waited
-            waited_total += self._acquire_slot(waited_total, agent, phase)
+            try:
+                if self._coordinator is not None:
+                    lease, waited = self._acquire_global(
+                        max(1, int(admission_tokens)), waited_total, agent, phase)
+                    waited_total += waited
+                # Inside the guard: this can exhaust the backpressure bound or
+                # be cancelled, and an organization permit held by a caller
+                # that then gives up is account capacity nobody is using --
+                # for the whole lease TTL, and compounding under load.
+                waited_total += self._acquire_slot(waited_total, agent, phase)
+            except BaseException:
+                if lease is not None:
+                    lease.release()
+                raise
+            # Keep the organization permit alive for as long as THIS call
+            # actually runs. The lease TTL exists to recover a permit from a
+            # crashed holder, not to bound a call: a provider request slower
+            # than the TTL would otherwise let its own permit expire while it
+            # is still in flight, and a second caller could then take a slot
+            # the account is already using. Observed V1 calls ran ~45s, so
+            # this is not hypothetical under a slow provider.
+            watchdog = self._start_lease_watchdog(lease)
             try:
                 return call()
             except Exception as exc:  # noqa: BLE001 - classified below; others re-raise
@@ -525,6 +566,8 @@ class ProviderScheduler:
                         last_error=exc,
                     ) from exc
             finally:
+                if watchdog is not None:
+                    watchdog.set()
                 self._slots.release()
                 # Deterministic release on EVERY path -- success, provider
                 # failure, backpressure exhaustion, quota refusal and
