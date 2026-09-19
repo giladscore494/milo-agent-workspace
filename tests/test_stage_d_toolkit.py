@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import gzip
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -1069,6 +1070,7 @@ class StageDWorld:
             "HOME": str(self.root.parent),
             "MOCK_STATE": str(self.state_path),
             "MOCK_LOG": str(self.log),
+            "MOCK_PROBE_DIR": str(self.dir),
             "STAGE_D_WORKDIR": str(self.workdir),
             **extra,
         }
@@ -1080,6 +1082,24 @@ class StageDWorld:
         state = self.read_state()
         state.update(kwargs)
         self.state_path.write_text(json.dumps(state))
+
+    # -- a REAL database behind the db probe -----------------------------
+    def seed_db(self, *, runs, reservations=(), conversations=None):
+        """Put real rows behind the terminalize probe. The mock then runs the
+        REAL probe_db.py against the fake PostgREST, with exactly the env the
+        shell passed, instead of reporting a canned verdict."""
+        self.set_state(db={
+            "runs": list(runs), "reservations": list(reservations),
+            "conversations": (conversations if conversations is not None
+                              else [{"id": RUN_CONVERSATION, "project_id": RUN_PROJECT}]),
+        })
+
+    def db(self):
+        return self.read_state()["db"]
+
+    def db_probe_runs(self):
+        """Every real terminalize execution: exit, verdict, env, mutations."""
+        return self.read_state().get("db_probe_runs", [])
 
     def enable_execution_surface(self):
         """Put production in the mid-run, fully enabled, dirty posture."""
@@ -1115,6 +1135,16 @@ class StageDWorld:
         jobs = self.read_state()["jobs"]
         for probe in ("stage-d-db-probe", "stage-d-gw-probe"):
             assert probe not in jobs, f"{probe} survived cleanup"
+
+
+def recorded_state(**overrides):
+    """What state.json holds once 05-execute-run.sh has created the run: the
+    identity is written BEFORE the run, the run id after. A None value
+    removes the key."""
+    state = {"stage_d_workdir": "<workdir>", "idempotency_key": STAGE_D_KEY,
+             "user_id": RUN_USER, "conversation_id": RUN_CONVERSATION, "run_id": STAGE_D_RUN_ID}
+    state.update(overrides)
+    return {k: v for k, v in state.items() if v is not None}
 
 
 def test_lockdown_reaches_the_full_fail_closed_end_state(tmp_path):
@@ -2764,10 +2794,22 @@ def reservation(seq, status="reserved"):
     return {"id": f"res-{seq}", "run_id": STAGE_D_RUN_ID, "call_seq": seq, "status": status}
 
 
-def wire_terminalize(db, monkeypatch, *, runs=None, reservations=None, run_id=STAGE_D_RUN_ID):
+def set_recorded_identity(monkeypatch, expected_user, expected_conversation):
+    """None models a lockdown that could not read the field from state.json."""
+    for name, value in (("STAGE_D_EXPECTED_USER_ID", expected_user),
+                        ("STAGE_D_EXPECTED_CONVERSATION_ID", expected_conversation)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+def wire_terminalize(db, monkeypatch, *, runs=None, reservations=None, run_id=STAGE_D_RUN_ID,
+                     expected_user=RUN_USER, expected_conversation=RUN_CONVERSATION):
     monkeypatch.setenv("STAGE_D_RUN_ID", run_id)
     monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
     monkeypatch.setenv("STAGE_D_GOV_CAPTURE_RUN_ID", GOV_RUN_ID)
+    set_recorded_identity(monkeypatch, expected_user, expected_conversation)
     fake = FakePostgrest(
         runs=runs if runs is not None else [stage_d_run()],
         reservations=reservations or [],
@@ -2891,6 +2933,7 @@ def test_terminalize_refuses_the_government_capture_run(db, monkeypatch, capsys)
     monkeypatch.setenv("STAGE_D_RUN_ID", GOV_RUN_ID)
     monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
     monkeypatch.setenv("STAGE_D_GOV_CAPTURE_RUN_ID", GOV_RUN_ID)
+    set_recorded_identity(monkeypatch, RUN_USER, RUN_CONVERSATION)
     fake = wire_postgrest(db, monkeypatch, FakePostgrest(runs=[stage_d_run(id=GOV_RUN_ID)]))
     assert run_terminalize(db) != 0
     assert "refusing to touch it" in " ".join(terminalize_verdict(capsys)["problems"])
@@ -2976,10 +3019,7 @@ def wire_lost_run(db, monkeypatch, *, runs, reservations=None,
     monkeypatch.setenv("STAGE_D_IDEMPOTENCY_KEY", STAGE_D_KEY)
     monkeypatch.setenv("STAGE_D_GOV_CAPTURE_RUN_ID", GOV_RUN_ID)
     monkeypatch.setenv("STAGE_D_GOV_CAPTURE_OPERATION", GOV_OPERATION)
-    if expected_user is not None:
-        monkeypatch.setenv("STAGE_D_EXPECTED_USER_ID", expected_user)
-    if expected_conversation is not None:
-        monkeypatch.setenv("STAGE_D_EXPECTED_CONVERSATION_ID", expected_conversation)
+    set_recorded_identity(monkeypatch, expected_user, expected_conversation)
     return wire_postgrest(db, monkeypatch, FakePostgrest(
         runs=runs, reservations=reservations or [],
         conversations=[{"id": RUN_CONVERSATION, "project_id": RUN_PROJECT}]))
@@ -3056,7 +3096,9 @@ def test_a_recovered_row_must_match_the_recorded_identity(db, monkeypatch, capsy
 
 
 def test_a_recovered_row_colliding_with_the_government_capture_is_refused(db, monkeypatch, capsys):
-    """Belt and braces: even under the Stage D key, never touch the capture."""
+    """Belt and braces: even under the Stage D key, never touch the capture —
+    and the capture refusal is named explicitly even when the recorded
+    identity is ALSO missing (which is a refusal in its own right)."""
     capture = stage_d_run(id=GOV_RUN_ID, status="queued")
     fake = wire_lost_run(db, monkeypatch, runs=[capture],
                          expected_user=None, expected_conversation=None)
@@ -3119,7 +3161,7 @@ def test_lockdown_still_requires_the_terminalize_proof_with_no_recorded_run(tmp_
 def test_lockdown_runs_terminalize_before_deleting_the_probe(tmp_path):
     world = StageDWorld(tmp_path)
     world.enable_execution_surface()
-    (world.workdir / "state.json").write_text(json.dumps({"run_id": STAGE_D_RUN_ID}))
+    (world.workdir / "state.json").write_text(json.dumps(recorded_state()))
     result = world.run("07-post-run-lockdown.sh")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "STAGE D LOCKDOWN COMPLETE" in result.stdout
@@ -3133,7 +3175,7 @@ def test_lockdown_is_not_complete_when_the_database_run_cannot_be_closed(tmp_pat
     world = StageDWorld(tmp_path, state={
         "probe_verdicts": {"govcheck": True, "terminalize": False}})
     world.enable_execution_surface()
-    (world.workdir / "state.json").write_text(json.dumps({"run_id": STAGE_D_RUN_ID}))
+    (world.workdir / "state.json").write_text(json.dumps(recorded_state()))
     result = world.run("07-post-run-lockdown.sh")
     assert result.returncode != 0
     assert "STAGE D LOCKDOWN COMPLETE" not in result.stdout
@@ -3145,7 +3187,7 @@ def test_lockdown_is_not_complete_when_the_database_run_cannot_be_closed(tmp_pat
 
 def test_lockdown_is_partial_when_a_run_existed_but_no_probe_remains(tmp_path):
     world = StageDWorld(tmp_path)
-    (world.workdir / "state.json").write_text(json.dumps({"run_id": STAGE_D_RUN_ID}))
+    (world.workdir / "state.json").write_text(json.dumps(recorded_state()))
     result = world.run("07-post-run-lockdown.sh")
     assert result.returncode != 0
     assert "STAGE D LOCKDOWN COMPLETE" not in result.stdout
@@ -3283,7 +3325,7 @@ def test_a_stale_pass_cannot_mask_a_missing_terminalize_record(tmp_path):
         "probe_silent_modes": ["terminalize"],
     })
     world.enable_execution_surface()
-    (world.workdir / "state.json").write_text(json.dumps({"run_id": STAGE_D_RUN_ID}))
+    (world.workdir / "state.json").write_text(json.dumps(recorded_state()))
     result = world.run("07-post-run-lockdown.sh")
     assert result.returncode != 0
     assert "could not be proven terminal and clean" in result.stderr
@@ -3442,3 +3484,398 @@ def test_membership_comparison_is_a_tuple_not_a_set_of_ids(db):
     assert db.membership_tuples([{"user_id": "u", "role": "owner"}]) == [("u", "owner")]
     assert db.membership_tuples([{"user_id": "u", "role": None}]) == [("u", "<null>")]
     assert db.membership_tuples([{"user_id": "u"}]) == [("u", "<null>")]
+
+
+# ---------------------------------------------------------------------------
+# V. The cleanup RPC signature must match EXACTLY (round-5 finding 1)
+# ---------------------------------------------------------------------------
+#
+# PostgREST resolves a function by name AND argument keys. The cleanup calls
+# settle_model_call_budget with exactly four keys, so a deployed signature
+# with an ADDITIONAL argument is as disqualifying as one with a missing
+# argument: a required extra makes the cleanup's call fail (PGRST202) and
+# leaves the reservation held; a defaulted extra routes the call into a
+# function body this authorization never reviewed. Subset semantics remain
+# for the other RPCs, which the toolkit never invokes itself.
+
+
+def rpc_surface(db, overrides=None):
+    """An OpenAPI document advertising every required RPC, with per-RPC
+    argument-set overrides."""
+    paths = {}
+    for rpc, args in db.REQUIRED_RPC_ARGS.items():
+        advertised = (overrides or {}).get(rpc, set(args))
+        paths[f"/rpc/{rpc}"] = {"post": {"parameters": [
+            {"in": "body", "schema": {"properties": {a: {} for a in advertised}}}]}}
+    return {"paths": paths}
+
+
+def rpc_surface_checks(db, monkeypatch, overrides=None):
+    invocations = []
+
+    def fake_call(method, path, body=None, headers=None):
+        if method != "GET":
+            invocations.append((method, path))
+        if path == "/rest/v1/":
+            return 200, rpc_surface(db, overrides)
+        return 200, []
+
+    monkeypatch.setattr(db, "call", fake_call)
+    checks, problems = {}, []
+    db.check_rpc_surface(checks, problems)
+    assert invocations == [], "the surface check must never invoke an RPC"
+    return checks, problems
+
+
+def test_the_cleanup_rpc_is_held_to_an_exact_signature(db):
+    assert SETTLE_RPC in db.EXACT_RPC_SIGNATURES
+    assert db.REQUIRED_RPC_ARGS[SETTLE_RPC] == SETTLE_RPC_ARGS
+
+
+def test_the_exact_four_argument_cleanup_signature_passes(db, monkeypatch):
+    checks, problems = rpc_surface_checks(db, monkeypatch)
+    assert checks[f"rpc_{SETTLE_RPC}"] == "present"
+    assert problems == []
+
+
+@pytest.mark.parametrize("dropped", sorted(SETTLE_RPC_ARGS))
+def test_every_missing_cleanup_argument_fails_the_surface_check(db, monkeypatch, dropped):
+    checks, problems = rpc_surface_checks(db, monkeypatch, {SETTLE_RPC: SETTLE_RPC_ARGS - {dropped}})
+    assert checks[f"rpc_{SETTLE_RPC}"] == "SIGNATURE_MISMATCH"
+    text = " ".join(problems)
+    assert f"rpc_{SETTLE_RPC}" in text and dropped in text and "exactly" in text
+
+
+@pytest.mark.parametrize("extra", ["p_run_id", "p_lease_token", "p_note"])
+def test_one_additional_cleanup_argument_fails_the_surface_check(db, monkeypatch, extra):
+    """A superset used to pass the subset check — that is the finding."""
+    checks, problems = rpc_surface_checks(db, monkeypatch, {SETTLE_RPC: SETTLE_RPC_ARGS | {extra}})
+    assert checks[f"rpc_{SETTLE_RPC}"] == "SIGNATURE_MISMATCH"
+    text = " ".join(problems)
+    assert f"rpc_{SETTLE_RPC}" in text and extra in text and "unexpected" in text
+
+
+@pytest.mark.parametrize("extras", [
+    {"p_run_id", "p_worker_id"},
+    # The guarded overload's extra arguments grafted onto the plain one.
+    {"p_run_id", "p_worker_id", "p_attempt", "p_lease_token"},
+    {"p_a", "p_b", "p_c", "p_d", "p_e"},
+])
+def test_multiple_additional_cleanup_arguments_fail_the_surface_check(db, monkeypatch, extras):
+    checks, problems = rpc_surface_checks(db, monkeypatch, {SETTLE_RPC: SETTLE_RPC_ARGS | extras})
+    assert checks[f"rpc_{SETTLE_RPC}"] == "SIGNATURE_MISMATCH"
+    text = " ".join(problems)
+    for extra in extras:
+        assert extra in text
+
+
+def test_a_renamed_cleanup_argument_is_reported_as_missing_and_unexpected(db, monkeypatch):
+    swapped = (SETTLE_RPC_ARGS - {"p_rejection_reason"}) | {"p_reason"}
+    checks, problems = rpc_surface_checks(db, monkeypatch, {SETTLE_RPC: swapped})
+    assert checks[f"rpc_{SETTLE_RPC}"] == "SIGNATURE_MISMATCH"
+    text = " ".join(problems)
+    assert "p_rejection_reason" in text and "p_reason" in text
+
+
+def test_the_other_rpcs_keep_tolerant_subset_semantics(db, monkeypatch):
+    """A migration adding an OPTIONAL parameter to an RPC the toolkit never
+    calls itself must not fail the preflight — but a missing one still must."""
+    others = [rpc for rpc in db.REQUIRED_RPC_ARGS if rpc not in db.EXACT_RPC_SIGNATURES]
+    assert others, "the exact-signature rule is scoped to the cleanup RPC, not universal"
+    widened = {rpc: set(db.REQUIRED_RPC_ARGS[rpc]) | {"p_new_optional"} for rpc in others}
+    checks, problems = rpc_surface_checks(db, monkeypatch, widened)
+    assert problems == []
+    assert all(checks[f"rpc_{rpc}"] == "present" for rpc in others)
+    narrowed = {rpc: set(sorted(db.REQUIRED_RPC_ARGS[rpc])[1:]) for rpc in others}
+    checks, problems = rpc_surface_checks(db, monkeypatch, narrowed)
+    assert all(checks[f"rpc_{rpc}"] == "SIGNATURE_MISMATCH" for rpc in others)
+
+
+@pytest.mark.parametrize("advertised", [
+    pytest.param(SETTLE_RPC_ARGS | {"p_run_id"}, id="one-extra"),
+    pytest.param(SETTLE_RPC_ARGS | {"p_run_id", "p_worker_id", "p_attempt", "p_lease_token"},
+                 id="many-extra"),
+])
+def test_preflight_refuses_an_additional_cleanup_argument_end_to_end(db, monkeypatch, capsys, advertised):
+    """Through preflight() itself, the way the shell runs it."""
+    monkeypatch.setenv("STAGE_D_EXPECTED_PRIOR_RUNS", EXPECTED_PRIOR_RUNS)
+
+    def fake_call(method, path, body=None, headers=None):
+        if path == "/rest/v1/":
+            return 200, rpc_surface(db, {SETTLE_RPC: advertised})
+        if path.startswith(f"/rest/v1/runs?id=eq.{GOV_RUN_ID}"):
+            return 200, [PREPARED_CAPTURE_ROW]
+        return 200, []
+
+    monkeypatch.setattr(db, "call", fake_call)
+    monkeypatch.setattr(db, "count_exact", lambda path: 7 if path == "/rest/v1/runs?select=id" else 0)
+    with pytest.raises(SystemExit):
+        db.preflight()
+    verdict = preflight_output(db, capsys)
+    assert verdict["checks"][f"rpc_{SETTLE_RPC}"] == "SIGNATURE_MISMATCH"
+    assert "unexpected" in " ".join(verdict["problems"])
+
+
+# ---------------------------------------------------------------------------
+# W. The recorded identity is MANDATORY before terminalize touches a run
+#    (round-5 finding 2)
+# ---------------------------------------------------------------------------
+#
+# 05-execute-run.sh records user_id and conversation_id in state.json BEFORE
+# the run is created, so the run this authorization created always has both
+# on record. A cleanup that cannot produce them has lost the only evidence
+# tying a row to that run. Sharing the idempotency key and the metadata
+# marker is not enough: the probe refuses — recorded or recovered alike —
+# before any PATCH or settlement RPC. Zero rows under the key stays a
+# proved no-run verdict, because there is nothing to mutate.
+
+MISSING_IDENTITY_CASES = [
+    pytest.param({"expected_user": None}, ["STAGE_D_EXPECTED_USER_ID"], id="user-absent"),
+    pytest.param({"expected_conversation": None}, ["STAGE_D_EXPECTED_CONVERSATION_ID"],
+                 id="conversation-absent"),
+    pytest.param({"expected_user": None, "expected_conversation": None},
+                 ["STAGE_D_EXPECTED_USER_ID", "STAGE_D_EXPECTED_CONVERSATION_ID"], id="both-absent"),
+    pytest.param({"expected_user": ""}, ["STAGE_D_EXPECTED_USER_ID"], id="user-empty"),
+    pytest.param({"expected_conversation": "   "}, ["STAGE_D_EXPECTED_CONVERSATION_ID"],
+                 id="conversation-blank"),
+]
+
+
+def assert_refused_without_a_write(fake, verdict, named):
+    text = " ".join(verdict["problems"])
+    for name in named:
+        assert name in text, f"{name} not named in {text!r}"
+    assert "refusing to terminalize" in text
+    assert verdict["ok"] is False
+    assert verdict.get("terminal") is not True
+    assert verdict["recorded_identity_present"] == {
+        "STAGE_D_EXPECTED_USER_ID": "STAGE_D_EXPECTED_USER_ID" not in named,
+        "STAGE_D_EXPECTED_CONVERSATION_ID": "STAGE_D_EXPECTED_CONVERSATION_ID" not in named,
+    }
+    # Nothing was written: no PATCH, no settlement RPC.
+    assert fake.mutating_calls() == []
+    assert fake.rpc_calls == []
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "running"
+    assert fake.reserved_count(STAGE_D_RUN_ID) == 1
+
+
+@pytest.mark.parametrize("missing,named", MISSING_IDENTITY_CASES)
+def test_a_recovered_row_is_refused_when_the_recorded_identity_is_missing(
+        db, monkeypatch, capsys, missing, named):
+    """The row matches the key and the marker — and is still refused."""
+    fake = wire_lost_run(db, monkeypatch, runs=[stage_d_run(status="running")],
+                         reservations=[reservation(1)], **missing)
+    assert run_terminalize(db) != 0
+    verdict = terminalize_verdict(capsys)
+    assert verdict["recovered"] is True
+    assert verdict["recovered_run_id"] == STAGE_D_RUN_ID
+    assert_refused_without_a_write(fake, verdict, named)
+
+
+@pytest.mark.parametrize("missing,named", MISSING_IDENTITY_CASES)
+def test_a_recorded_run_id_is_refused_when_the_recorded_identity_is_missing(
+        db, monkeypatch, capsys, missing, named):
+    """The same rule for a run id that state.json DID preserve."""
+    fake = wire_terminalize(db, monkeypatch, runs=[stage_d_run(status="running")],
+                            reservations=[reservation(1)], **missing)
+    assert run_terminalize(db) != 0
+    verdict = terminalize_verdict(capsys)
+    assert verdict["recovered"] is False
+    assert_refused_without_a_write(fake, verdict, named)
+
+
+def test_a_recovered_row_with_the_recorded_identity_is_terminalized(db, monkeypatch, capsys):
+    """The positive control for the refusals above."""
+    fake = wire_lost_run(db, monkeypatch, runs=[stage_d_run(status="running")],
+                         reservations=[reservation(1)])
+    assert run_terminalize(db) == 0
+    verdict = terminalize_verdict(capsys)
+    assert verdict["recorded_identity_present"] == {
+        "STAGE_D_EXPECTED_USER_ID": True, "STAGE_D_EXPECTED_CONVERSATION_ID": True}
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "cancelled"
+    assert fake.reserved_count(STAGE_D_RUN_ID) == 0
+
+
+def test_zero_rows_with_no_recorded_identity_is_still_a_proved_no_run_verdict(db, monkeypatch, capsys):
+    fake = wire_lost_run(db, monkeypatch, runs=[], expected_user=None, expected_conversation=None)
+    assert run_terminalize(db) == 0
+    verdict = terminalize_verdict(capsys)
+    assert verdict["ok"] is True
+    assert verdict["no_run_recorded"] is True
+    assert verdict["rows_under_key"] == 0
+    assert fake.mutating_calls() == []
+
+
+def test_two_rows_with_no_recorded_identity_still_fail_closed_without_mutating(db, monkeypatch, capsys):
+    second = stage_d_run(id="bbbb1111-2222-3333-4444-555566667777", status="running")
+    fake = wire_lost_run(db, monkeypatch, runs=[stage_d_run(status="running"), second],
+                         expected_user=None, expected_conversation=None)
+    assert run_terminalize(db) != 0
+    verdict = terminalize_verdict(capsys)
+    assert "ambiguous" in " ".join(verdict["problems"])
+    assert fake.mutating_calls() == []
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "running"
+
+
+def test_the_identity_gate_names_a_missing_field_as_a_refusal(db, monkeypatch):
+    """Unit: the gate itself, with nothing else wrong with the row."""
+    monkeypatch.setenv("STAGE_D_GOV_CAPTURE_RUN_ID", GOV_RUN_ID)
+    set_recorded_identity(monkeypatch, None, RUN_CONVERSATION)
+    problems = []
+    db.check_stage_d_run_identity(stage_d_run(), STAGE_D_KEY, problems)
+    assert len(problems) == 1 and "STAGE_D_EXPECTED_USER_ID" in problems[0]
+    set_recorded_identity(monkeypatch, RUN_USER, None)
+    problems = []
+    db.check_stage_d_run_identity(stage_d_run(), STAGE_D_KEY, problems)
+    assert len(problems) == 1 and "STAGE_D_EXPECTED_CONVERSATION_ID" in problems[0]
+    set_recorded_identity(monkeypatch, RUN_USER, RUN_CONVERSATION)
+    problems = []
+    db.check_stage_d_run_identity(stage_d_run(), STAGE_D_KEY, problems)
+    assert problems == []
+
+
+def test_the_identity_gate_precedes_every_write_in_terminalize(db):
+    """Structural: the gate, and its exit, come before the first PATCH and
+    before the settlement RPC."""
+    source = inspect.getsource(db.terminalize)
+    gate = source.index("check_stage_d_run_identity(")
+    assert gate < source.index("guarded_transition(")
+    assert gate < source.index('"/rest/v1/rpc/settle_model_call_budget"')
+    after_gate = source[gate:gate + 160]
+    assert "if problems:" in after_gate and "emit_and_exit()" in after_gate
+
+
+def test_the_lockdown_hands_the_probe_only_what_state_json_recorded():
+    """No fallback, no default, no operator input for the identity."""
+    script = (STAGE_D / "07-post-run-lockdown.sh").read_text()
+    assert 'STAGE_D_EXPECTED_USER_ID=${recorded_user_id}' in script
+    assert 'STAGE_D_EXPECTED_CONVERSATION_ID=${recorded_conversation_id}' in script
+    assert 'read user_id)' in script and 'read conversation_id)' in script
+    assert "read -r" not in script and "read -p" not in script
+
+
+# -- end to end: the lockdown, the shell's REAL argument passing, the REAL
+#    probe against a real (fake-PostgREST) database -----------------------
+
+
+def live_run_world(tmp_path, *, runs=None, reservations=None, state=None):
+    world = StageDWorld(tmp_path, state=state)
+    world.enable_execution_surface()
+    world.seed_db(runs=[stage_d_run(status="running")] if runs is None else runs,
+                  reservations=[reservation(1)] if reservations is None else reservations)
+    return world
+
+
+def real_probe_outcome(world):
+    runs = world.db_probe_runs()
+    assert runs, "the lockdown never executed the terminalize probe"
+    return runs[-1]
+
+
+LOST_IDENTITY_STATE_FILES = [
+    pytest.param(None, id="state-json-missing"),
+    pytest.param("{not json", id="state-json-malformed"),
+    pytest.param("[1, 2, 3]", id="state-json-not-an-object"),
+    pytest.param(json.dumps({"run_id": STAGE_D_RUN_ID}), id="both-identity-fields-missing"),
+    pytest.param(json.dumps({"run_id": STAGE_D_RUN_ID, "user_id": RUN_USER}), id="conversation-missing"),
+    pytest.param(json.dumps({"run_id": STAGE_D_RUN_ID, "conversation_id": RUN_CONVERSATION}),
+                 id="user-missing"),
+    pytest.param(json.dumps({"user_id": RUN_USER}), id="run-id-and-conversation-missing"),
+    pytest.param(json.dumps({"run_id": STAGE_D_RUN_ID, "user_id": "", "conversation_id": ""}),
+                 id="identity-fields-empty"),
+]
+
+
+@pytest.mark.parametrize("state_json", LOST_IDENTITY_STATE_FILES)
+def test_lockdown_cannot_complete_when_the_recorded_identity_is_lost(tmp_path, state_json):
+    """A live run exists; state.json cannot vouch for it. The REAL probe,
+    under the shell's real argument passing, must refuse without a write,
+    and the lockdown must not print COMPLETE."""
+    world = live_run_world(tmp_path)
+    if state_json is not None:
+        (world.workdir / "state.json").write_text(state_json)
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode != 0
+    assert "STAGE D LOCKDOWN COMPLETE" not in result.stdout
+    assert "could not be proven terminal and clean" in result.stderr
+    assert "did not yield both user_id and conversation_id" in result.stdout
+    probe = real_probe_outcome(world)
+    assert probe["exit"] != 0
+    assert probe["mutating_calls"] == []
+    assert probe["rpc_calls"] == []
+    assert probe["verdict"]["ok"] is False
+    assert "STAGE_D_EXPECTED_" in " ".join(probe["verdict"]["problems"])
+    db = world.db()
+    assert db["runs"][0]["status"] == "running"
+    assert db["reservations"][0]["status"] == "reserved"
+    # The rest of the lockdown still happened: posture fail-closed, probes gone.
+    world.assert_fail_closed()
+    world.assert_probes_absent()
+
+
+def test_lockdown_terminalizes_a_recorded_run_through_the_real_probe(tmp_path):
+    """Positive control: with the identity on record the same path closes the
+    run, releases the reservation and prints COMPLETE."""
+    world = live_run_world(tmp_path)
+    (world.workdir / "state.json").write_text(json.dumps(recorded_state()))
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "STAGE D LOCKDOWN COMPLETE" in result.stdout
+    assert "did not yield both user_id and conversation_id" not in result.stdout
+    probe = real_probe_outcome(world)
+    assert probe["exit"] == 0 and probe["verdict"]["ok"] is True
+    assert probe["verdict"]["recovered"] is False
+    assert len(probe["rpc_calls"]) == 1
+    db = world.db()
+    assert db["runs"][0]["status"] == "cancelled"
+    assert db["reservations"][0]["status"] == "released"
+
+
+def test_lockdown_recovers_a_lost_run_through_the_real_probe(tmp_path):
+    world = live_run_world(tmp_path)
+    (world.workdir / "state.json").write_text(json.dumps(recorded_state(run_id=None)))
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "STAGE D LOCKDOWN COMPLETE" in result.stdout
+    probe = real_probe_outcome(world)
+    assert probe["verdict"]["recovered"] is True
+    assert probe["verdict"]["recovered_run_id"] == STAGE_D_RUN_ID
+    assert world.db()["runs"][0]["status"] == "cancelled"
+    assert world.db()["reservations"][0]["status"] == "released"
+
+
+def test_lockdown_with_no_state_and_no_run_is_a_proved_no_run_verdict(tmp_path):
+    """Zero rows under the key needs no identity: there is nothing to mutate."""
+    world = live_run_world(tmp_path, runs=[], reservations=[])
+    result = world.run("07-post-run-lockdown.sh")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "STAGE D LOCKDOWN COMPLETE" in result.stdout
+    probe = real_probe_outcome(world)
+    assert probe["verdict"]["no_run_recorded"] is True
+    assert probe["verdict"]["rows_under_key"] == 0
+    assert probe["mutating_calls"] == []
+
+
+def test_the_real_probe_saw_exactly_the_environment_the_shell_passed(tmp_path):
+    """The refusal is caused by the shell's argument passing, not by the
+    mock: the env the probe received is recorded."""
+    world = live_run_world(tmp_path)
+    (world.workdir / "state.json").write_text("{not json")
+    world.run("07-post-run-lockdown.sh")
+    env = real_probe_outcome(world)["env"]
+    assert env["STAGE_D_MODE"] == "terminalize"
+    assert env["STAGE_D_RUN_ID"] == ""
+    assert env["STAGE_D_EXPECTED_USER_ID"] == ""
+    assert env["STAGE_D_EXPECTED_CONVERSATION_ID"] == ""
+    assert env["STAGE_D_IDEMPOTENCY_KEY"] == STAGE_D_KEY
+    assert env["STAGE_D_GOV_CAPTURE_RUN_ID"] == GOV_RUN_ID
+
+
+def test_the_docs_state_the_mandatory_identity_and_the_exact_rpc_signature():
+    readme = " ".join((STAGE_D / "README.md").read_text().split())
+    doc = " ".join(AUTHORIZATION_DOC.read_text().split())
+    for text in (readme, doc):
+        assert "identity fields are mandatory" in text
+        assert "before any PATCH or settlement RPC" in text
+        assert "additional" in text and "exactly" in text
+        assert "zero-row" in text

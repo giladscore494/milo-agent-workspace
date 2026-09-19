@@ -18,6 +18,15 @@ a permissive mock would hide exactly the bugs these tests exist to catch.
 Driven by two environment variables:
   MOCK_STATE  — path to the JSON state file (created on first use)
   MOCK_LOG    — path to an invocation log (one argv line per call)
+
+A REAL database behind the db probe. When a test seeds state["db"]
+(runs / reservations / conversations), a `terminalize` execution no longer
+reports a canned verdict: the mock runs the REAL probe_db.py — found via
+MOCK_PROBE_DIR — against the stateful fake PostgREST, with exactly the env
+overrides the shell passed to `gcloud run jobs execute` and nothing
+inherited. The verdict, the exit code, the rows afterwards and every
+mutating call are recorded in state, so an end-to-end test proves what
+the toolkit's own argument passing makes the probe DO.
 """
 
 from __future__ import annotations
@@ -104,6 +113,71 @@ def save(state: dict) -> None:
 
 def flag_value(arg: str) -> str:
     return arg.split("=", 1)[1] if "=" in arg else ""
+
+
+def parse_env_overrides(args: list[str]) -> dict[str, str]:
+    """KEY=VALUE pairs from --update-env-vars, honouring gcloud's ^DELIM^
+    custom-delimiter prefix (the toolkit passes ^:::^)."""
+    overrides: dict[str, str] = {}
+    for arg in args:
+        if not arg.startswith("--update-env-vars"):
+            continue
+        raw = flag_value(arg)
+        delim = ","
+        if raw.startswith("^"):
+            delim, _, raw = raw[1:].partition("^")
+        for pair in raw.split(delim):
+            if "=" in pair:
+                key, value = pair.split("=", 1)
+                overrides[key] = value
+    return overrides
+
+
+REAL_PROBE_DRIVER = r'''
+import contextlib, io, json, os, sys
+probe_dir, fixtures = sys.argv[1], sys.argv[2]
+sys.path.insert(0, probe_dir)
+sys.path.insert(0, fixtures)
+os.environ.setdefault("SUPABASE_URL", "https://stage-d-fake.invalid")
+os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "not-a-real-key")
+import probe_db
+from fake_postgrest import FakePostgrest
+seed = json.load(sys.stdin)
+fake = FakePostgrest(runs=seed.get("runs"), reservations=seed.get("reservations"),
+                     conversations=seed.get("conversations"))
+probe_db.call = fake.call
+probe_db.count_exact = fake.count_exact
+captured = io.StringIO()
+code = 0
+with contextlib.redirect_stdout(captured):
+    try:
+        probe_db.main()
+    except SystemExit as exc:
+        code = int(exc.code or 0)
+records = [json.loads(line) for line in captured.getvalue().splitlines() if line.strip()]
+print(json.dumps({"exit": code, "records": records, "runs": fake.runs,
+                  "reservations": fake.reservations, "conversations": fake.conversations,
+                  "mutating_calls": fake.mutating_calls(), "rpc_calls": fake.rpc_calls}))
+'''
+
+
+def run_real_probe(state: dict, overrides: dict[str, str]) -> dict:
+    """Run the REAL probe_db.py against the fake PostgREST seeded in state["db"].
+
+    The probe sees exactly the env overrides the shell passed — nothing
+    inherited from the test process — so what it does is caused by the
+    toolkit's own argument passing, not by this mock.
+    """
+    import subprocess
+    probe_dir = os.environ.get("MOCK_PROBE_DIR") or os.getcwd()
+    fixtures = os.path.dirname(os.path.abspath(__file__))
+    env = {"PATH": os.environ.get("PATH", ""), **overrides}
+    result = subprocess.run(
+        [sys.executable, "-c", REAL_PROBE_DRIVER, probe_dir, fixtures],
+        input=json.dumps(state["db"]), capture_output=True, text=True, env=env, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise SystemExit(f"mock gcloud: the real probe driver crashed:\n{result.stderr}")
+    return json.loads(result.stdout.strip().splitlines()[-1])
 
 
 def apply_env_updates(env: dict, raw: str) -> None:
@@ -285,24 +359,36 @@ def main() -> int:
         if not state.get("govcheck_available", True):
             print("ERROR: probe execution failed", file=sys.stderr)
             return 1
-        mode = ""
-        for arg in args:
-            if "STAGE_D_MODE=" in arg:
-                mode = arg.split("STAGE_D_MODE=", 1)[1].split(":::", 1)[0].strip()
+        overrides = parse_env_overrides(args)
+        mode = overrides.get("STAGE_D_MODE", "").strip()
         index = int(state.get("next_execution", 1))
         state["next_execution"] = index + 1
         exec_name = f"{job}-exec{index}"
-        verdicts = state.get("probe_verdicts") or {}
-        ok = bool(verdicts.get(mode, True))
+        if mode == "terminalize" and state.get("db") is not None:
+            # A real database was seeded: run the REAL probe against it.
+            outcome = run_real_probe(state, overrides)
+            ok = outcome["exit"] == 0
+            records = outcome["records"]
+            state["db"] = {"runs": outcome["runs"], "reservations": outcome["reservations"],
+                           "conversations": outcome["conversations"]}
+            state.setdefault("db_probe_runs", []).append({
+                "execution": exec_name, "exit": outcome["exit"],
+                "verdict": records[-1] if records else None,
+                "mutating_calls": outcome["mutating_calls"], "rpc_calls": outcome["rpc_calls"],
+                "env": overrides,
+            })
+        else:
+            verdicts = state.get("probe_verdicts") or {}
+            ok = bool(verdicts.get(mode, True))
+            records = []
+            if mode and mode not in (state.get("probe_silent_modes") or []):
+                record = {"stage_d_probe": mode, "ok": ok}
+                if not ok:
+                    record["problems"] = [f"injected {mode} failure"]
+                records.append(record)
         state.setdefault("probe_executions", {})[exec_name] = {
             "job": job, "mode": mode, "ok": ok,
         }
-        records = []
-        if mode and mode not in (state.get("probe_silent_modes") or []):
-            record = {"stage_d_probe": mode, "ok": ok}
-            if not ok:
-                record["problems"] = [f"injected {mode} failure"]
-            records.append(record)
         state.setdefault("execution_logs", {})[exec_name] = records
         save(state)
         print(exec_name)

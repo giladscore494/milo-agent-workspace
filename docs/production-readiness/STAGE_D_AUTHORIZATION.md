@@ -274,6 +274,18 @@ and a refusal of anything carrying the operator-capture marker. Dangling
 reservations are released even when the recovered run is already terminal,
 because a finished run can still hold reserved budget.
 
+**Both recorded identity fields are mandatory** (review round 5). The
+`user_id` and `conversation_id` are read from `state.json`; if that file is
+missing, unreadable or malformed and either field cannot be supplied
+non-empty, `terminalize` refuses to touch any run candidate — recorded or
+recovered alike — **before any PATCH or settlement RPC**, and its verdict
+names the missing field. A row that merely shares the idempotency key and
+the metadata marker is not acted on. The zero-row case remains a proved
+no-run verdict without them, because there is nothing to mutate; more than
+one row still fails closed having mutated nothing. The lockdown then ends
+`PARTIAL`/`INCOMPLETE` with the manual verification SQL and never prints
+`LOCKDOWN COMPLETE`. An operator never types the identity in.
+
 ### 2.10 The preflight verifies the cleanup RPC
 
 `terminalize` releases reservations through
@@ -287,6 +299,16 @@ function, a changed signature or a probe that cannot reach it refuses the
 run **before any production enable** — a cleanup that cannot release a
 reservation would leave the daily budget held against a run that will
 never finish.
+
+The check is **exact** (review round 5): the advertised argument set must
+equal `{p_reservation_id, p_actual_cost, p_status, p_rejection_reason}`,
+so an **additional** argument fails the preflight exactly as a missing one
+does. PostgREST resolves a function by name and argument keys and the
+cleanup calls it with exactly those four: a required extra would make that
+call fail and leave the reservation held, and a defaulted extra would
+route it into a function body this authorization never reviewed. The
+other required RPCs keep tolerant subset semantics because the toolkit
+never invokes them itself.
 
 ## 3. Proposed caps — derived from Stage C Attempt 7 evidence
 

@@ -223,6 +223,18 @@ one: the idempotency key, the run-request metadata marker
 the prepared Government capture and of anything carrying the
 operator-capture marker.
 
+**Both recorded identity fields are mandatory.** If `state.json` is
+missing, unreadable or malformed and the lockdown cannot hand the probe a
+non-empty `user_id` **and** `conversation_id`, the probe refuses to touch
+any run candidate — recorded or recovered alike — before any PATCH or
+settlement RPC, and names the missing field in its verdict. Sharing the
+key and the marker is not enough to act on. Only the zero-row case (no
+run under the key) can pass without them, because there is nothing to
+mutate; more than one row still fails closed having mutated nothing. The
+lockdown never types an identity in: it is read from `state.json`, or the
+run is left for a human to account for and `LOCKDOWN COMPLETE` is not
+printed.
+
 So the lockdown terminalizes the **database** run too, through
 `probe_db.py --terminalize`: identity-checked (it refuses any run not
 carrying the authorized Stage D key, and can never touch the prepared
@@ -241,10 +253,17 @@ is retried; what must hold is the **proof**:
 
 The preflight verifies the RPC this depends on:
 `settle_model_call_budget(p_reservation_id, p_actual_cost, p_status,
-p_rejection_reason)`. If it is missing, has a different signature, or is
-not exposed to the service-role probe, the run is refused **before any
-production enable** — a cleanup that cannot release a reservation would
-leave the budget held.
+p_rejection_reason)`. Its advertised argument set must **equal that set
+exactly**: a missing argument fails, and so does an **additional** one,
+because PostgREST resolves a function by name and argument keys and the
+cleanup calls it with exactly those four — a required extra would make
+the cleanup's call fail and leave the reservation held, and a defaulted
+extra would route it into a function body this authorization never
+reviewed. (The other required RPCs keep tolerant subset semantics; the
+toolkit never invokes them itself.) If the function is missing, differs
+in signature, or is not exposed to the service-role probe, the run is
+refused **before any production enable** — a cleanup that cannot release
+a reservation would leave the budget held.
 
 `LOCKDOWN COMPLETE` is impossible unless those hold **and** the
 Government-capture invariant is proven.

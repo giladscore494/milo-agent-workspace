@@ -29,7 +29,9 @@ Modes (env STAGE_D_MODE):
               supported lifecycle, release any dangling budget
               reservation through the supported RPC, and prove the run
               is terminal with zero active user/project runs and zero
-              reservations left in the reserved status
+              reservations left in the reserved status. Refuses ANY run
+              candidate, recorded or recovered, unless the recorded
+              user and conversation identity is supplied and matches
   evidence  — executable acceptance gate for env STAGE_D_RUN_ID: exits
               non-zero unless EVERY acceptance criterion holds, including
               exactly one new authorized run over the pinned prior
@@ -278,7 +280,9 @@ def assert_stage_d_key_is_not_the_capture_key(problems: list[str]) -> None:
 # defined by the release migrations (000400 for create_message_and_run_v2,
 # 000600 for the guarded worker RPCs). Optional (defaulted) arguments are
 # deliberately excluded so a migration adding an optional parameter does
-# not fail the check, while a missing/renamed required argument does.
+# not fail the check, while a missing/renamed required argument does —
+# EXCEPT for the RPCs in EXACT_RPC_SIGNATURES below, whose advertised set
+# must match exactly.
 REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "create_message_and_run_v2": {
         "p_conversation_id", "p_content", "p_metadata",
@@ -305,6 +309,19 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
         "p_reservation_id", "p_actual_cost", "p_status", "p_rejection_reason",
     },
 }
+
+# RPCs whose advertised argument set must EQUAL the pinned set: a missing
+# argument AND an additional one both fail the preflight. The cleanup calls
+# settle_model_call_budget with exactly these four keys, and PostgREST
+# resolves a function by name AND argument keys. A deployed signature with
+# a required extra argument would answer the cleanup's call with PGRST202,
+# leaving the reservation held against the daily budget forever; one with
+# a defaulted extra would route the call into a function body this
+# authorization never reviewed. The OpenAPI document shows one signature
+# per function name, so exact equality is the strongest read-only check
+# available. Subset semantics remain for the other RPCs, which the Stage D
+# toolkit never invokes itself.
+EXACT_RPC_SIGNATURES: frozenset[str] = frozenset({"settle_model_call_budget"})
 
 
 def advertised_rpc_args(post_spec: dict) -> set[str] | None:
@@ -339,9 +356,9 @@ def check_rpc_surface(checks: dict[str, str], problems: list[str]) -> None:
     is NOT proof of absence, and probing by invoking mutating RPCs is
     unsafe by construction. Instead the service-role GET of the PostgREST
     root returns the OpenAPI document; each required RPC must be exposed
-    as /rpc/<name> and advertise every required argument name. Any
-    unavailable, malformed, unauthorized or ambiguous metadata fails
-    closed.
+    as /rpc/<name> and advertise every required argument name — and, for
+    EXACT_RPC_SIGNATURES, no other argument at all. Any unavailable,
+    malformed, unauthorized or ambiguous metadata fails closed.
     """
     status, spec = call("GET", "/rest/v1/")
     paths = spec.get("paths") if isinstance(spec, dict) else None
@@ -366,6 +383,15 @@ def check_rpc_surface(checks: dict[str, str], problems: list[str]) -> None:
             problems.append(
                 f"rpc_{rpc}: argument metadata malformed/ambiguous — "
                 "cannot verify the callable surface; failing closed"
+            )
+        elif rpc in EXACT_RPC_SIGNATURES and advertised != required_args:
+            missing = sorted(required_args - advertised)
+            unexpected = sorted(advertised - required_args)
+            checks[f"rpc_{rpc}"] = "SIGNATURE_MISMATCH"
+            problems.append(
+                f"rpc_{rpc}: the advertised argument set must equal {sorted(required_args)} exactly — "
+                f"missing {missing}, unexpected {unexpected}; the cleanup calls this function with "
+                "exactly those arguments, so any other deployed signature could leave reservations held"
             )
         elif not required_args <= advertised:
             missing = sorted(required_args - advertised)
@@ -749,12 +775,43 @@ def run_metadata(run: dict) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
+#: Both must be supplied non-empty before terminalize may touch ANY run
+#: candidate, recorded or recovered. The lockdown reads them from
+#: state.json (user_id and conversation_id, written BEFORE the run was
+#: created); an operator never types them in.
+REQUIRED_RECORDED_IDENTITY = ("STAGE_D_EXPECTED_USER_ID", "STAGE_D_EXPECTED_CONVERSATION_ID")
+
+
+def recorded_identity_present() -> dict[str, bool]:
+    return {name: bool((os.environ.get(name) or "").strip()) for name in REQUIRED_RECORDED_IDENTITY}
+
+
+def required_recorded_identity(name: str, run_id: str, problems: list[str]) -> str | None:
+    """A recorded identity field, or None with a fail-closed problem recorded.
+
+    Absence is a refusal, not a skipped check: without the recorded
+    identity nothing ties the candidate row to the run this authorization
+    created, and sharing the idempotency key and the metadata marker is not
+    enough to act on.
+    """
+    value = (os.environ.get(name) or "").strip()
+    if not value:
+        problems.append(
+            f"{name} is missing or empty — the recorded identity of the Stage D run is unknown, so run "
+            f"{run_id} cannot be tied to this authorization; refusing to terminalize it before any write")
+        return None
+    return value
+
+
 def check_stage_d_run_identity(run: dict, expected_key: str, problems: list[str]) -> None:
     """Every identity property the authorized Stage D run must have.
 
     Applied to a run id read from state.json AND to one recovered by
     idempotency key, because a recovered row is exactly the case where
-    nothing else has vouched for it.
+    nothing else has vouched for it. Both recorded identity fields
+    (REQUIRED_RECORDED_IDENTITY) are mandatory for either: an absent field
+    is a refusal, and terminalize() applies this gate before any PATCH or
+    settlement RPC.
     """
     run_id = str(run.get("id"))
     capture_run_id = os.environ.get("STAGE_D_GOV_CAPTURE_RUN_ID")
@@ -775,16 +832,21 @@ def check_stage_d_run_identity(run: dict, expected_key: str, problems: list[str]
             f"run {run_id} metadata stage is {metadata.get('stage')!r}, expected "
             f"{STAGE_D_RUN_METADATA_STAGE!r} — this is not the Stage D smoke run")
 
-    # The recorded identity, when state.json preserved it, must match. This
-    # is what stops a recovered row from being some other run that happens
-    # to share the key.
-    expected_user = (os.environ.get("STAGE_D_EXPECTED_USER_ID") or "").strip()
-    if expected_user and str(run.get("requested_by")) != expected_user:
+    # The recorded identity is REQUIRED, not merely honoured when present.
+    # 05-execute-run.sh writes user_id and conversation_id to state.json
+    # BEFORE the run is created, so the run this authorization created
+    # always has both on record. A cleanup that cannot produce them has
+    # lost the only evidence tying a row to that run; the candidate is
+    # refused, recorded or recovered alike, before any write. Only the
+    # zero-row case can pass without them, because there is nothing to
+    # mutate.
+    expected_user = required_recorded_identity("STAGE_D_EXPECTED_USER_ID", run_id, problems)
+    if expected_user is not None and str(run.get("requested_by")) != expected_user:
         problems.append(
             f"run {run_id} was requested by {run.get('requested_by')!r}, not the recorded Stage D test user "
             f"{expected_user!r}")
-    expected_conversation = (os.environ.get("STAGE_D_EXPECTED_CONVERSATION_ID") or "").strip()
-    if expected_conversation and str(run.get("conversation_id")) != expected_conversation:
+    expected_conversation = required_recorded_identity("STAGE_D_EXPECTED_CONVERSATION_ID", run_id, problems)
+    if expected_conversation is not None and str(run.get("conversation_id")) != expected_conversation:
         problems.append(
             f"run {run_id} belongs to conversation {run.get('conversation_id')!r}, not the recorded Stage D "
             f"conversation {expected_conversation!r}")
@@ -812,8 +874,9 @@ def terminalize() -> None:
       * many rows  — ambiguous; fail closed having mutated nothing.
 
     Every path is identity-checked: the key, the run-request metadata
-    marker, the recorded user and conversation, and an explicit refusal of
-    the prepared Government capture. Terminalization uses the repository's
+    marker, the recorded user and conversation — both REQUIRED; an absent
+    field refuses the candidate before any write — and an explicit refusal
+    of the prepared Government capture. Terminalization uses the repository's
     own supported lifecycle (active -> cancellation_requested ->
     cancelled), each step a guarded compare-and-set, plus the supported
     service-role `settle_model_call_budget` RPC to release any dangling
@@ -877,6 +940,10 @@ def terminalize() -> None:
     out["run_before"] = {k: v for k, v in run.items() if k != "input"}
 
     # ---------------- identity gate ----------------
+    # Runs BEFORE the first PATCH and before the settlement RPC. A missing
+    # recorded identity field is a refusal here, for a recorded run id and
+    # a recovered row alike.
+    out["recorded_identity_present"] = recorded_identity_present()
     check_stage_d_run_identity(run, expected_key, problems)
     if problems:
         emit_and_exit()

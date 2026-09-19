@@ -62,6 +62,16 @@ if [ -n "${STAGE_D_WORKDIR:-}" ] && [ -r "${STAGE_D_WORKDIR}/state.json" ]; then
   recorded_conversation_id="$(python3 ./state_file.py "${STAGE_D_WORKDIR}/state.json" read conversation_id)"
 fi
 
+# The probe REQUIRES both recorded identity fields before it will touch any
+# run candidate, recorded or recovered; the lockdown never types them in.
+# Say so here when they are absent, so a refusal is explicable from this
+# output alone. The probe remains the enforcement point.
+if [ -z "${recorded_user_id}" ] || [ -z "${recorded_conversation_id}" ]; then
+  echo "NOTE: state.json did not yield both user_id and conversation_id (file missing, unreadable or malformed)."
+  echo "      The terminalize probe refuses to touch ANY run candidate without them; only a proved"
+  echo "      zero-row no-run verdict can pass. If a run exists, this lockdown will NOT complete."
+fi
+
 # Is the db probe still present to ask? Absence is not an error by itself
 # (a rerun after a completed lockdown is normal), but it decides whether
 # an unprovable check is fatal.
