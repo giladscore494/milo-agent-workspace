@@ -169,3 +169,34 @@ rehearsal; 9. wider access only after explicit approval.
 
 Each expansion step raises limits explicitly and individually — never all
 at once.
+
+### Stage D is currently UNAUTHORIZED; expansion step 1 is PROPOSED
+
+Stage C passing did not enable, authorize or schedule any Stage D activity:
+the Stage C Attempt 7 authorization is **consumed**
+([STAGE_C_ACCEPTANCE.md](STAGE_C_ACCEPTANCE.md)). Every Stage D step needs
+its own fresh, separate, explicit operator authorization.
+
+**Expansion step 1 — one bounded paid run — exists as a reviewable
+PROPOSAL and has NOT been executed.** The request, the read-only discovered
+production baselines, the caps derived from Stage C Attempt 7 evidence and
+the remaining manual operator steps are in
+[STAGE_D_AUTHORIZATION.md](STAGE_D_AUTHORIZATION.md); the operator toolkit
+that would execute it is `scripts/release/stage-d/`, with its executable
+safety proofs in `tests/test_stage_d_toolkit.py`. Neither the document nor
+the toolkit is an authorization, and merging them changes no production
+state.
+
+Note what that first step deliberately does NOT do, against the "raises
+limits" framing above: **it raises no limit at all.** The only thing it
+expands is the number of authorized production runs, by exactly one, at the
+current reviewed release. Every budget cap is held or tightened relative to
+Stage C, and the worker-only provider envelope is restored to the Stage C
+Attempt 7 values. Raising a limit is a later, separate step.
+
+That toolkit also carries the reviewed resolution for the unused prepared
+Government capture run
+(`scripts/release/stage-d/resolve-government-capture.sh`). Preparing that
+run was never authorization to capture, and a Stage D model run neither
+executes it nor becomes one: the Stage D gates re-prove on every step that
+it has not been claimed.
