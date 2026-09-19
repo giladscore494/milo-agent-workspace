@@ -55,6 +55,33 @@ DURABLE_RUN_STATUS: Mapping[str, str] = {
     "partial_success": "partial_success",
 }
 
+#: The outcomes that DID produce something worth having, as
+#: ``(durable_run_status, result_kind)``.
+#:
+#: This exists because acceptance kept being written as ``status ==
+#: "completed"``, which reads a truthful ``partial_success`` -- a run that
+#: verified real fields and also found something outstanding -- as a failure.
+#: A first government run is overwhelmingly likely to land there, so an
+#: acceptance check that rejects it would reject the normal case.
+#:
+#: ``no_usable_result``, and every non-product terminal state (timeout,
+#: cancellation, failure, budget exhaustion), stay deliberately outside.
+USEFUL_TERMINAL_OUTCOMES: frozenset[tuple[str, str]] = frozenset({
+    ("completed", "usable_result"),
+    ("partial_success", "usable_result"),
+    ("partial_success", "partial_result"),
+})
+
+
+def is_useful_outcome(durable_status: Any, result_kind: Any) -> bool:
+    """Did this terminal run produce a usable product result?
+
+    A process exiting zero is not an answer to this question, and neither is
+    reaching a terminal state: only the pair of durable status and result kind
+    is.
+    """
+    return (str(durable_status), str(result_kind)) in USEFUL_TERMINAL_OUTCOMES
+
 #: The bounded, static empty-result marker. It carries no prompt, provider
 #: response, exception text, source fragment or reasoning -- only this code.
 NO_USABLE_RESULT_CODE = "NO_USABLE_RESULT"
@@ -242,6 +269,7 @@ def durable_run_status(result: Any) -> str:
 
 
 __all__ = ["ALLOWED_OUTCOMES", "DURABLE_RUN_STATUS", "NO_USABLE_RESULT_CODE",
+           "USEFUL_TERMINAL_OUTCOMES", "is_useful_outcome",
            "PRODUCT_STATUSES", "RESULT_KINDS", "TRUSTED_NEGATIVE_CODES",
            "ProductOutcome", "ProductOutcomeError", "TrustedNegativeResult",
            "decide_outcome", "durable_run_status", "finalize_product_outcome",

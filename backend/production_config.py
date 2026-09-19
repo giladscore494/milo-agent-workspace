@@ -158,6 +158,11 @@ EXECUTION_FLAGS = (
     # contract, plan and inventory that enumerates execution flags pins it off
     # like the rest.
     "MILO_ENABLE_CATALOG_EXECUTION",
+    # The two catalog CAPABILITY flags under that master switch. Reading the
+    # government register and promoting into the canonical catalog are
+    # separate decisions; both default off and both are pinned off here.
+    "MILO_ENABLE_GOVERNMENT_CATALOG_READ",
+    "MILO_ENABLE_CATALOG_PROMOTION",
 )
 
 # NEXT_PUBLIC_* values ship to the browser bundle: secret material is banned.

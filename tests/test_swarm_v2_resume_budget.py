@@ -114,17 +114,19 @@ def test_the_newer_usage_is_what_the_remaining_model_call_budget_is_computed_fro
     """The consequence that matters: capacity that WOULD suffice under the
     stale checkpoint is correctly refused under the newer run usage.
 
-    The plan has two pending tasks, so the Swarm pre-flight needs 2 + 2 = 4
-    remaining model calls. Against a ceiling of 7, restoring the checkpoint's
-    3 would leave exactly 4 and the run would proceed; restoring the run
-    row's 4 leaves 3, and the run is refused before it reaches the provider.
+    The plan has two pending tasks and one replan, so the Swarm pre-flight
+    needs its WORST case -- 11 model calls (two worker calls, their two bounded
+    repairs, two Commander decisions, a verifier batch, the correction round
+    and the Commander plan repair). Against a ceiling of 14, restoring the
+    checkpoint's 3 would leave exactly 11 and the run would proceed; restoring
+    the run row's 4 leaves 10, and the run is refused before the provider.
     """
     repo = offline
     run_id = seeded_run(repo)
     stale_checkpoint(repo, run_id, model_calls=3)
     repo.runs[run_id]["usage"] = snapshot(4)
 
-    tracker = tracker_for(7)
+    tracker = tracker_for(14)
     completions, _ = run_worker(monkeypatch, repo, run_id, tracker)
 
     assert tracker.model_calls == 4
@@ -145,7 +147,7 @@ def test_the_same_run_proceeds_when_only_the_stale_checkpoint_usage_exists(
     stale_checkpoint(repo, run_id, model_calls=3)
     repo.runs[run_id]["usage"] = {}          # nothing newer was ever recorded
 
-    tracker = tracker_for(7)
+    tracker = tracker_for(14)
     completions, _ = run_worker(monkeypatch, repo, run_id, tracker)
 
     assert tracker.model_calls == 3 + len(completions.calls)

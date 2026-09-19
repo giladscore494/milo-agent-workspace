@@ -100,10 +100,25 @@ def test_config_defaults_stay_conservative():
 def test_config_parses_explicit_tier_values():
     config = ProviderLimitsConfig.from_env({
         "MILO_PROVIDER_MAX_CONCURRENCY": "4",
-        "MILO_PROVIDER_RPM_LIMIT": "500",
-        "MILO_PROVIDER_TPM_LIMIT": "3000000",
+        "MILO_PROVIDER_RPM_LIMIT": "60",
+        "MILO_PROVIDER_TPM_LIMIT": "1500000",
     })
-    assert (config.max_concurrency, config.rpm_limit, config.tpm_limit) == (4, 500, 3_000_000)
+    assert (config.max_concurrency, config.rpm_limit, config.tpm_limit) == (4, 60, 1_500_000)
+
+
+@pytest.mark.parametrize("key,value", [
+    # These are the raw PROVIDER Tier 2 numbers. A single process claiming them
+    # is claiming the whole organization's allowance, which is exactly what the
+    # 80% ceiling exists to prevent -- production carried RPM=350 against an
+    # 80 RPM ceiling until this check existed.
+    ("MILO_PROVIDER_MAX_CONCURRENCY", "40"),
+    ("MILO_PROVIDER_RPM_LIMIT", "100"),
+    ("MILO_PROVIDER_RPM_LIMIT", "350"),
+    ("MILO_PROVIDER_TPM_LIMIT", "3000000"),
+])
+def test_per_process_profile_may_never_exceed_the_organization_ceiling(key, value):
+    with pytest.raises(ValueError, match="organization ceiling"):
+        ProviderLimitsConfig.from_env({key: value})
 
 
 @pytest.mark.parametrize("key,value", [

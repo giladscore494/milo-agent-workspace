@@ -245,6 +245,51 @@ DailySettlement = Callable[[ModelCallReservation, float, str, str | None], Any]
 # Conservative chars-per-token heuristic for pre-call input estimation.
 CHARS_PER_TOKEN = 4
 
+# --- the provider output-cap contract ---------------------------------------
+#
+# Kimi admits a request against request tokens PLUS the requested completion
+# cap, so the cap must be a number the provider can see BEFORE the call, not
+# something inferred afterwards from usage. These three helpers are the single
+# place that knows how the cap is spelled on the wire, so a test can assert on
+# the exact provider request and a future provider-side rename is one edit.
+#
+# `max_tokens` is what the Moonshot/Kimi OpenAI-compatible endpoint accepts
+# today; `max_completion_tokens` is the newer OpenAI spelling. Callers may use
+# either name and the wire field is emitted once, never both (sending both is
+# rejected by some OpenAI-compatible servers).
+PROVIDER_OUTPUT_CAP_FIELD = "max_tokens"
+OUTPUT_CAP_ALIASES = ("max_completion_tokens", "max_tokens")
+
+#: Server-owned cap for a caller that supplied none. It exists so that an
+#: un-capped call FAILS SAFE to a bounded number instead of inheriting the
+#: whole remaining run allowance; it is deliberately small, and a role that
+#: needs more must declare it.
+DEFAULT_OUTPUT_CAP = 1024
+
+
+def read_output_cap(kwargs: dict[str, Any]) -> int | None:
+    """Return the caller's requested output cap under either spelling."""
+    for name in OUTPUT_CAP_ALIASES:
+        value = kwargs.get(name)
+        if value is None:
+            continue
+        try:
+            cap = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be an integer") from None
+        if cap <= 0:
+            raise ValueError(f"{name} must be positive")
+        return cap
+    return None
+
+
+def apply_output_cap(kwargs: dict[str, Any], cap: int) -> dict[str, Any]:
+    """Put exactly ONE numeric output cap on the outgoing provider request."""
+    for name in OUTPUT_CAP_ALIASES:
+        kwargs.pop(name, None)
+    kwargs[PROVIDER_OUTPUT_CAP_FIELD] = int(cap)
+    return kwargs
+
 
 def estimate_message_tokens(messages: Any) -> int:
     try:
@@ -280,11 +325,19 @@ class BudgetTracker:
     retries: int = 0
     provider_backpressure_events: int = 0
     agent_steps: int = 0
+    #: Telemetry only: how many calls reached the gate with no declared cap.
+    #: Deliberately NOT a cumulative snapshot field -- it is a code-health
+    #: signal, not run capacity, and it must not gate a resume.
+    missing_output_cap_calls: int = 0
     stop: BudgetExceeded | None = None
     _started_at: float = field(default=None, init=False)  # type: ignore[assignment]
     _warned: set = field(default_factory=set, init=False)
     _lock: Any = field(default=None, init=False)
     _reservations: dict[int, ModelCallReservation] = field(default_factory=dict, init=False)
+    #: call_seq -> (reserved_input_tokens, reserved_output_tokens) still in
+    #: flight. Popped by settle_call, so a reservation is released exactly once
+    #: and by the amount that was actually taken.
+    _open_reservations: dict[int, tuple[int, int]] = field(default_factory=dict, init=False)
 
     def __post_init__(self):
         import threading
@@ -456,21 +509,33 @@ class BudgetTracker:
             if requested_max_tokens is not None:
                 allowed_output = requested_max_tokens if allowed_output is None else min(allowed_output, requested_max_tokens)
             # Reserve the capacity this call may consume. Output capacity is
-            # only held as an in-flight reservation when the caller declared
-            # a max_tokens request (the guarded client settles exactly that
-            # amount back); the legacy before_call/after_call path reserves
-            # input estimates only.
+            # held as an in-flight reservation WHENEVER an allowance exists --
+            # including when the caller declared no cap of its own.
+            #
+            # It used to be held only for a declared cap, and the allowance was
+            # still injected into the provider request either way. Two calls in
+            # flight therefore each received the whole remaining allowance and
+            # the ceiling was breached by a factor of the provider concurrency,
+            # with the budget stop arriving only AFTER both had settled -- that
+            # is, after the tokens were already bought. Reserving here is what
+            # makes the ceiling a ceiling rather than an after-the-fact alarm.
+            #
+            # The amount is recorded against this call's sequence so settlement
+            # releases exactly what THIS call reserved, whatever the caller
+            # passes back, on every terminal path and exactly once.
             self.model_calls += 1
             self.estimated_cost += cfg.estimated_cost_per_call
             self.reserved_input_tokens += estimated_input_tokens
-            if requested_max_tokens is not None and allowed_output is not None:
-                self.reserved_output_tokens += allowed_output
+            held_output = int(allowed_output) if allowed_output is not None else 0
+            if held_output > 0:
+                self.reserved_output_tokens += held_output
+            self._open_reservations[next_call_seq] = (estimated_input_tokens, held_output)
             if reservation is not None:
                 self._reservations[next_call_seq] = reservation
             self._ledger(
                 "reserved",
                 reserved_input_tokens=estimated_input_tokens,
-                reserved_output_tokens=(allowed_output or 0) if requested_max_tokens is not None else 0,
+                reserved_output_tokens=held_output,
                 estimated_cost=round(cfg.estimated_cost_per_call, 6),
             )
             return next_call_seq, allowed_output
@@ -492,9 +557,21 @@ class BudgetTracker:
                 except Exception as exc:
                     self._reservations[settled_seq] = reservation
                     raise self._stop("BUDGET_SETTLEMENT_FAILED", "model-call budget settlement failed", "budget_exhausted", "failed") from exc
-            self.reserved_input_tokens = max(0, self.reserved_input_tokens - max(0, int(reserved_input_tokens or 0)))
-            if reserved_output_tokens:
-                self.reserved_output_tokens = max(0, self.reserved_output_tokens - int(reserved_output_tokens))
+            # Release exactly what THIS call reserved. Popping the record is
+            # what makes a double settlement a no-op instead of a refund: a
+            # second release would hand back capacity the run never held, and
+            # an over-released ceiling is indistinguishable from no ceiling.
+            # The caller's own numbers are honoured only for callers that
+            # predate the per-sequence record.
+            held = self._open_reservations.pop(settled_seq, None)
+            if held is not None:
+                held_input, held_output = held
+            else:
+                held_input = max(0, int(reserved_input_tokens or 0))
+                held_output = max(0, int(reserved_output_tokens or 0))
+            self.reserved_input_tokens = max(0, self.reserved_input_tokens - held_input)
+            if held_output:
+                self.reserved_output_tokens = max(0, self.reserved_output_tokens - held_output)
             self.input_tokens += max(0, int(input_tokens or 0))
             self.output_tokens += max(0, int(output_tokens or 0))
             if cost is not None and cost > 0:
@@ -545,6 +622,21 @@ class BudgetTracker:
             if self.config.max_retries is not None and self.retries > self.config.max_retries:
                 raise self._reject("RETRY_LIMIT_REACHED", "retry limit reached", "retry_limit_reached", "failed")
 
+    def note_missing_output_cap(self, model: str) -> None:
+        """Record that a caller reached the gate without declaring a cap.
+
+        It is not fatal -- the guarded client resolves an explicit server-owned
+        cap so admission still has a number -- but it means some role is not
+        declaring its own budget, and a silent fallback is how that stays
+        unnoticed until it shows up as a truncated completion.
+        """
+        with self._lock:
+            self.missing_output_cap_calls += 1
+        self._emit("model_output_cap_missing",
+                   {"message": "model call had no explicit output cap; a server cap was applied",
+                    "payload": {"model": str(model or "")[:64],
+                                "applied_cap": DEFAULT_OUTPUT_CAP}})
+
     def record_provider_backpressure(self) -> None:
         """Count a provider 429/backpressure event for telemetry only.
 
@@ -562,15 +654,23 @@ class _GuardedCompletions:
 
     def create(self, **kwargs: Any) -> Any:
         estimated_input = estimate_message_tokens(kwargs.get("messages"))
-        requested_max = kwargs.get("max_tokens")
+        requested_max = read_output_cap(kwargs)
+        if requested_max is None:
+            # A caller that declared no cap is resolved to an explicit
+            # server-owned number BEFORE admission rather than being handed the
+            # whole remaining allowance. Every role is supposed to declare its
+            # own cap, so this is a fail-safe, and it is announced instead of
+            # being silent.
+            requested_max = DEFAULT_OUTPUT_CAP
+            self._tracker.note_missing_output_cap(kwargs.get("model", ""))
         # Hard pre-call gate: reserve capacity FIRST; the adapter is only
-        # reached after the reservation succeeds, and max_tokens is clamped
+        # reached after the reservation succeeds, and the cap is clamped
         # to the remaining safe allowance. The reservation sequence travels
         # with this call so concurrent workers settle their own reservations.
         call_seq, allowed_output = self._tracker.open_call(estimated_input, requested_max)
-        reserved_output = allowed_output if requested_max is not None else None
-        if allowed_output is not None:
-            kwargs["max_tokens"] = allowed_output
+        effective_cap = allowed_output if allowed_output is not None else requested_max
+        reserved_output = effective_cap
+        apply_output_cap(kwargs, effective_cap)
         try:
             response = self._inner.create(**kwargs)
         except Exception as exc:
@@ -632,7 +732,10 @@ def build_guarded_client_factory(tracker: BudgetTracker, inner_factory: Callable
         else:
             from openai import OpenAI
 
-            inner = OpenAI(api_key=api_key, base_url=base_url)
+            # See the note in vehicle_catalog_v1/core.py: the SDK's default of
+            # two silent retries would spend organization RPM and concurrency
+            # that no MILO counter or shared limiter ever observes.
+            inner = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
         return GuardedModelClient(inner, tracker)
 
     return factory

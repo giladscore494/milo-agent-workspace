@@ -62,21 +62,97 @@ from collections.abc import Mapping
 
 from backend.production_config import TRUE_VALUES
 
-#: The single server-side name. It is spelled once, here, and every deployment
+#: The MASTER kill switch. It is spelled once, here, and every deployment
 #: contract, validator, kill switch and readiness document refers to this one.
+#:
+#: Since the read/promotion split below it is a kill switch and ONLY a kill
+#: switch: turning it on arms nothing by itself, and turning it off stops
+#: everything. That keeps the original rationale -- one place an operator can
+#: reach mid-incident, with no posture where "the catalog is off" is true of
+#: one switch and false of another -- while removing the part that was wrong:
+#: it used to be the only control, so reading the government register at all
+#: required arming canonical promotion in the same breath.
 CATALOG_EXECUTION_FLAG = "MILO_ENABLE_CATALOG_EXECUTION"
+
+#: Registers the bounded READ-ONLY Government tool, grants its read scope and
+#: constructs its evidence mapper. It authorizes no write of any kind.
+GOVERNMENT_READ_FLAG = "MILO_ENABLE_GOVERNMENT_CATALOG_READ"
+
+#: Constructs the lease-guarded canonical promotion pipeline. Promotion is
+#: server-side trusted code, never a Tool a model can request.
+CATALOG_PROMOTION_FLAG = "MILO_ENABLE_CATALOG_PROMOTION"
+
+
+def _on(source: Mapping[str, str], name: str) -> bool:
+    return (source.get(name) or "").strip().lower() in TRUE_VALUES
 
 
 def catalog_execution_enabled(env: Mapping[str, str] | None = None) -> bool:
-    """Is the catalog execution path enabled for this process?
+    """Is the catalog master switch on?
 
     `env` exists so a validator can ask the same question of a deployment's
     recorded environment without mutating its own. Production calls this with
     no argument, which reads `os.environ` and nothing else -- in particular not
     anything a model, a plan or an event payload could have influenced.
     """
+    return _on(os.environ if env is None else env, CATALOG_EXECUTION_FLAG)
+
+
+def government_read_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """May this process READ the durable government register?
+
+    Requires the master switch as well: the kill switch stays authoritative
+    above both capability flags.
+    """
     source = os.environ if env is None else env
-    return (source.get(CATALOG_EXECUTION_FLAG) or "").strip().lower() in TRUE_VALUES
+    return _on(source, CATALOG_EXECUTION_FLAG) and _on(source, GOVERNMENT_READ_FLAG)
 
 
-__all__ = ["CATALOG_EXECUTION_FLAG", "catalog_execution_enabled"]
+def catalog_promotion_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """May this process PROMOTE candidates into the canonical catalog?
+
+    Promotion requires read, and read does NOT imply promotion. Promotion
+    without read is refused rather than quietly granted: a pipeline that could
+    write facts a run was never allowed to look at is a worse posture than a
+    misconfiguration that fails closed, and there is no legitimate deployment
+    that wants it.
+    """
+    source = os.environ if env is None else env
+    return (_on(source, CATALOG_EXECUTION_FLAG) and
+            _on(source, GOVERNMENT_READ_FLAG) and
+            _on(source, CATALOG_PROMOTION_FLAG))
+
+
+class CatalogPostureInvalid(ValueError):
+    """A catalog configuration that cannot be honoured safely."""
+
+
+def catalog_posture(env: Mapping[str, str] | None = None) -> dict[str, bool]:
+    """The whole catalog posture as ONE answer, read once.
+
+    Every decision in the worker wiring comes from a single call to this, so a
+    registry, a scope, a mapper and a pipeline can never disagree about which
+    capabilities this process has.
+
+    Asking for promotion WITHOUT read is refused loudly rather than quietly
+    downgraded to "promotion off". Silently ignoring half a configuration is
+    how an operator ends up believing promotion is armed when it is not (or
+    the reverse), and either belief is worse than a startup failure that names
+    the contradiction.
+    """
+    source = dict(os.environ if env is None else env)
+    master = catalog_execution_enabled(source)
+    if master and _on(source, CATALOG_PROMOTION_FLAG) and not _on(source, GOVERNMENT_READ_FLAG):
+        raise CatalogPostureInvalid(
+            f"{CATALOG_PROMOTION_FLAG} requires {GOVERNMENT_READ_FLAG}: promotion "
+            "may never be armed for data this process is not allowed to read")
+    return {
+        "master": master,
+        "government_read": government_read_enabled(source),
+        "promotion": catalog_promotion_enabled(source),
+    }
+
+
+__all__ = ["CATALOG_EXECUTION_FLAG", "CATALOG_PROMOTION_FLAG", "CatalogPostureInvalid",
+           "GOVERNMENT_READ_FLAG", "catalog_execution_enabled", "catalog_posture",
+           "catalog_promotion_enabled", "government_read_enabled"]

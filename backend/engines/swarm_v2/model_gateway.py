@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Iterable, Mapping
 
-from backend.provider_scheduler import ProviderScheduler, estimate_request_tokens
+from backend.budget import apply_output_cap
+from backend.provider_scheduler import ProviderScheduler, estimate_admission_tokens
 from backend.runtime import CancellationRequested
 from backend.tools import ToolDescriptor
 
@@ -18,6 +19,47 @@ from .validation import VALIDATION_REASONS, PlanLimits, provider_plan_policy
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+class MissingRoleOutputCap(ValueError):
+    """A Swarm V2 role reached the gateway without a declared output cap."""
+
+
+#: The explicit, server-owned output cap for every Swarm V2 role, keyed by
+#: ``(agent_kind, phase)``. V1 has required a numeric cap on every model call
+#: since it shipped (``core.moonshot_chat`` raises without one) and sizes it
+#: per agent; these are the V2 equivalents, sized from V1's proven per-role
+#: numbers for the comparable work:
+#:
+#:   * planning    -- the largest structured output a run produces (a whole
+#:                    task graph), so it gets the most room;
+#:   * replanning  -- a decision plus an optional replacement plan;
+#:   * execute     -- one task's structured output (V1 technical: 2500);
+#:   * verification-- one batch of grounded verdicts (V1 verifier: 3500).
+#:
+#: A role that is not listed here is a programming error and fails closed
+#: rather than inheriting the run's whole remaining allowance.
+ROLE_OUTPUT_CAPS: Mapping[tuple[str, str], int] = {
+    ("commander", "planning"): 4000,
+    ("commander", "replanning"): 2000,
+    ("worker", "execute"): 2500,
+    ("verifier", "verification"): 3500,
+}
+
+
+def role_output_cap(agent: str, phase: str) -> int:
+    """Resolve ONE role's numeric output cap, or refuse the call.
+
+    ``agent`` carries a task id for workers (``worker:<task_id>``), so the role
+    is the part before the colon: the cap belongs to the ROLE, never to a
+    model-chosen identifier, and a task cannot name itself into a bigger cap.
+    """
+    kind = str(agent or "").split(":", 1)[0]
+    cap = ROLE_OUTPUT_CAPS.get((kind, str(phase or "")))
+    if cap is None:
+        raise MissingRoleOutputCap(
+            "no server-owned output cap is declared for this role")
+    return cap
 
 
 class ModelGateway:
@@ -70,12 +112,22 @@ class ModelGateway:
             raise CancellationRequested("RUN_CANCELLED")
         if self._agent_step:
             self._agent_step(agent, phase)
-        request = {"model": model, "messages": messages, **kwargs}
+        # EVERY Swarm V2 provider request carries an explicit numeric output
+        # cap. A caller may tighten the role's cap but never omit it and never
+        # exceed it: the organization admits a request against
+        # `input + requested cap`, so a request without one cannot be counted
+        # correctly and must not be sent at all.
+        cap = role_output_cap(agent, phase)
         if max_tokens is not None:
-            request["max_tokens"] = max_tokens
+            cap = min(cap, int(max_tokens))
+            if cap <= 0:
+                raise MissingRoleOutputCap("output cap must be positive")
+        request = {"model": model, "messages": messages, **kwargs}
+        apply_output_cap(request, cap)
         return self._scheduler.execute(
             lambda: self._client.chat.completions.create(**request),
-            estimated_tokens=estimate_request_tokens(messages, max_tokens),
+            estimated_tokens=estimate_admission_tokens(messages, cap),
+            reserved_tokens=estimate_admission_tokens(messages, cap),
             agent=agent,
             phase=phase,
         )
