@@ -302,19 +302,26 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
 
     # --- plan shape, enforced by the deterministic PlanValidator ------------
     _d("max_tasks", 23, env_key="MILO_MAX_TASKS_PER_RUN", runtime_default=64,
-       enforced_by=PLAN, why="the largest plan the 56-agent-step envelope can finish under the "
+       enforced_by=PLAN,
+       why="the largest plan the 56-agent-step envelope can finish under the "
            "worst case; the firewall used to admit 64 into it"),
     _d("max_tool_calls", 24, env_key="MILO_MAX_TOOL_CALLS_PER_RUN", runtime_default=100,
-       enforced_by=PLAN, why="the aggregate planned-call ceiling for the run; the firewall used "
+       enforced_by=PLAN,
+       why="the aggregate planned-call ceiling for the run; the firewall used "
            "to admit 100 into a profile that advertised 24"),
     _d("max_replans", 1, env_key="MILO_MAX_REPLANS_PER_RUN", runtime_default=3,
-       enforced_by=PLAN, why="one bounded replan, which the correction round also consumes; the "
+       enforced_by=PLAN,
+       why="one bounded replan, which the correction round also consumes; the "
            "firewall used to admit 3 into a profile that advertised 1"),
-    _d("max_tool_calls_per_task", 4, runtime_default=4, enforced_by=PLAN, why="a low fixed per-task ceiling charged against the EXACT planned "
+    _d("max_tool_calls_per_task", 4, runtime_default=4, enforced_by=PLAN,
+       why="a low fixed per-task ceiling charged against the EXACT planned "
            "call list, independent of the aggregate ceiling"),
-    _d("max_graph_depth", 12, runtime_default=12, enforced_by=PLAN, why="bounds dependency chaining"),
-    _d("max_recursion_depth", 4, runtime_default=4, enforced_by=PLAN, why="bounds task self-similarity"),
-    _d("max_cost_units", 100_000, runtime_default=100_000, enforced_by=PLAN, why="the plan's own declared cost units; not model-call slots"),
+    _d("max_graph_depth", 12, runtime_default=12, enforced_by=PLAN,
+       why="bounds dependency chaining"),
+    _d("max_recursion_depth", 4, runtime_default=4, enforced_by=PLAN,
+       why="bounds task self-similarity"),
+    _d("max_cost_units", 100_000, runtime_default=100_000, enforced_by=PLAN,
+       why="the plan's own declared cost units; not model-call slots"),
 
     # --- provider admission, enforced by ProviderLimitsConfig/the coordinator
     _d("provider_max_concurrency", 2, env_key="MILO_PROVIDER_MAX_CONCURRENCY",
@@ -460,7 +467,11 @@ def _parse(dimension: PolicyDimension, raw: str) -> int | float:
 
 @dataclass(frozen=True)
 class RuntimePolicy:
-    """The resolved, enforceable envelope of a run. Immutable and serializable."""
+    """The resolved, enforceable envelope of a DEPLOYMENT.
+
+    Immutable and serializable. Every dimension is resolved and validated
+    whichever engine a given run uses -- see POLICY_SCOPE.
+    """
 
     paid: bool
     values: Mapping[str, int | float | None]
