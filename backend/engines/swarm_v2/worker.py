@@ -208,6 +208,7 @@ class GenericWorker:
                  event_sink: Callable[[str, dict[str, Any]], None] | None = None,
                  retry_callback: Callable[[str, str, str], None] | None = None,
                  tool_result_sink: ToolResultCallback | None = None,
+                 tool_call_callback: Callable[[], None] | None = None,
                  task_output_strategy: TaskOutputStrategy | None = None):
         self._gateway, self._tools, self._model = gateway, tools, model
         self._tool_context = (replace(tool_context, cancellation_checker=cancellation_checker)
@@ -219,6 +220,9 @@ class GenericWorker:
         # Unwired in production until Y4/G3 connect a domain mapping to a real
         # evidence grant; a validated result is material, never a fact.
         self._tool_result_sink = tool_result_sink
+        # Reports each planned Tool invocation to the run's usage ledger
+        # BEFORE it runs, so a call that fails is still a call that was made.
+        self._tool_call_callback = tool_call_callback
         # R5: the OPTIONAL deterministic task-output strategy. `None` -- the
         # production default -- keeps the model-backed behaviour exactly as it
         # is; nothing outside this constructor can set it.
@@ -304,6 +308,8 @@ class GenericWorker:
             # and never from the wider run -- and the resolver bounds the
             # FINAL payload's shape and size before it can reach a tool.
             arguments = resolve_tool_arguments(call, dependency_outputs)
+            if self._tool_call_callback is not None:
+                self._tool_call_callback()
             result = self._tools.execute(call.name, call.operation,
                                          self._tool_context, arguments)
             check_material(result, MAX_TOOL_OUTPUT_JSON_BYTES, "TOOL_OUTPUT_TOO_LARGE")

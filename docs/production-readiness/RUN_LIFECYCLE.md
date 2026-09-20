@@ -52,6 +52,20 @@ on every one of these paths — proven end-to-end by
 `tests/test_migrations_postgres.py::test_stale_worker_full_scenario_every_mutation_rejected`.
 Lease loss also short-circuits execution (`backend/worker/main.py`).
 
+The heartbeat thread distinguishes a DEFINITIVE loss -- the database
+answering that the lease, attempt or token is no longer current, or that the
+run is gone -- from a transient failure (transport, 5xx). A transient
+failure is retried sooner than the normal interval and the lease is treated
+as lost only once the last proven extension has lapsed; ownership is never
+widened by this, because every durable write is still fenced at the
+database boundary and `holds_lease` re-reads the run row.
+
+Usage consumed under a lease is recorded in the ExecutionUsageLedger
+(`run_execution_usage`, migration `20260920000100`) after every consumption
+and restored -- as the maximum of every durable record -- by the next
+worker, so a resume, a replay or a replacement never regains capacity. See
+`BUDGETS_AND_COSTS.md`.
+
 ## Checkpoints and events
 
 `run_checkpoints` and `run_events` (migration `002`) persist progress;

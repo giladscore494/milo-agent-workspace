@@ -186,13 +186,19 @@ def test_budget_warning_emitted_once_at_80_percent():
 
 
 def test_usage_recorded_after_each_call():
+    """Usage is durable at BOTH ends of a call: the admission (before the
+    request is sent, so a process that dies mid-request is still charged for
+    it) and the settlement. Two calls therefore leave four records, each one
+    never below the record before it."""
     usage = []
     tracker = make_tracker(usage=usage, estimated_cost_per_call=0.02)
     tracker.before_call()
     tracker.after_call(100, 50)
     tracker.before_call()
     tracker.after_call(10, 5)
-    assert len(usage) == 2
+    assert len(usage) == 4
+    assert [u["model_calls"] for u in usage] == [1, 1, 2, 2]
+    assert [u["input_tokens"] for u in usage] == [0, 100, 100, 110]
     assert usage[-1]["input_tokens"] == 110
     assert usage[-1]["output_tokens"] == 55
     assert usage[-1]["model_calls"] == 2
@@ -649,10 +655,22 @@ def usage(**overrides) -> dict:
 
 def test_the_merge_covers_every_snapshot_field_the_tracker_writes():
     """No cumulative dimension may be left out of the monotonic rule: a field
-    the merge does not know about is a field a stale snapshot could refund."""
-    assert USAGE_SNAPSHOT_FIELDS == set(BudgetTracker(BudgetConfig()).snapshot())
-    assert USAGE_SNAPSHOT_FIELDS == {
-        *CUMULATIVE_USAGE_COUNTERS, *CUMULATIVE_USAGE_AMOUNTS, "total_tokens"}
+    the merge does not know about is a field a stale snapshot could refund.
+
+    The tracker writes TWO shapes: the full ledger (`ledger_snapshot`) and
+    the bounded public projection (`snapshot`, the `runs.usage` contract).
+    The merge must know every field of the full ledger, and the public shape
+    must be a strict projection of it -- never a field of its own."""
+    from backend.execution_usage import LEDGER_METADATA, LEDGER_SNAPSHOT_FIELDS
+
+    tracker = BudgetTracker(BudgetConfig())
+    assert USAGE_SNAPSHOT_FIELDS == set(tracker.snapshot())
+    assert LEDGER_SNAPSHOT_FIELDS == set(tracker.ledger_snapshot())
+    assert LEDGER_SNAPSHOT_FIELDS == {
+        *CUMULATIVE_USAGE_COUNTERS, *CUMULATIVE_USAGE_AMOUNTS, *LEDGER_METADATA, "total_tokens"}
+    assert USAGE_SNAPSHOT_FIELDS < LEDGER_SNAPSHOT_FIELDS
+    assert all(tracker.snapshot()[name] == tracker.ledger_snapshot()[name]
+               for name in USAGE_SNAPSHOT_FIELDS)
 
 
 def test_a_stale_checkpoint_never_lowers_the_newer_durable_run_usage():

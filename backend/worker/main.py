@@ -5,7 +5,8 @@ import time
 from typing import Any
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
-from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, merge_usage_snapshots, paid_execution_enabled
+from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, paid_execution_enabled
+from backend.execution_usage import merge_usage_snapshots, public_usage_projection
 from backend.runtime_policy import RuntimePolicyError, policy_failure_code, resolve_runtime_policy
 from backend.config import get_settings
 from backend.errors import AppError
@@ -21,6 +22,27 @@ def resolve_run_id(cli_run_id: str | None) -> UUID:
     if not value:
         raise AppError("MISSING_RUN_ID", "RUN_ID must be provided by environment or --run-id", 2)
     return UUID(value)
+
+
+#: Repository error codes that PROVE the lease is no longer this worker's:
+#: the guarded RPCs' STALE_WORKER_WRITE (surfaced as RUN_LEASE_LOST), the
+#: in-memory repository's conflict, and a run that no longer exists.
+DEFINITIVE_LEASE_LOSS_CODES = frozenset({
+    "RUN_LEASE_LOST", "RUN_TRANSITION_CONFLICT", "STALE_WORKER_WRITE", "RUN_NOT_FOUND",
+})
+
+
+def _is_definitive_lease_loss(exc: BaseException) -> bool:
+    """Whether a heartbeat failure proves the lease is gone.
+
+    Only an answer FROM the database about ownership counts: a lease/attempt/
+    token mismatch or a missing run. A transport failure, a 5xx or an unknown
+    exception says nothing about ownership and is treated as transient; the
+    lease is then considered lost only once the last proven extension lapses.
+    """
+    if isinstance(exc, AppError):
+        return exc.code in DEFINITIVE_LEASE_LOSS_CODES or exc.status_code in {404, 409}
+    return False
 
 
 def _persist_budget_terminal(repo: Repository, run_id: UUID,
@@ -124,19 +146,41 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
     lease_lost = threading.Event()
     stop_heartbeat = threading.Event()
     heartbeat_thread: threading.Thread | None = None
+    # The local view of when the lease this worker LAST PROVABLY extended
+    # lapses. A heartbeat that fails for a transient reason (network, 5xx)
+    # does not by itself mean the lease is gone: the database still holds the
+    # extension the previous heartbeat obtained. Ownership is never widened by
+    # this -- every durable write is still fenced at the database boundary,
+    # and `holds_lease` still re-reads the run row -- it only stops a
+    # transient blip from ending a paid run as `failed` when it could resume.
+    # A DEFINITIVE rejection (the lease was reclaimed or the run is gone)
+    # marks the lease lost at once, and so does the lease lapsing locally
+    # without a successful extension.
+    lease_deadline = [time.monotonic() + lease_seconds]
+    heartbeat_degraded = threading.Event()
 
     def heartbeat_once() -> bool:
         if not hasattr(repo, "heartbeat"):
             return True
         try:
             repo.heartbeat(run_id, worker_id, lease_seconds=lease_seconds, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+        except Exception as exc:
+            if _is_definitive_lease_loss(exc) or time.monotonic() >= lease_deadline[0]:
+                lease_lost.set()
+                return False
+            heartbeat_degraded.set()
             return True
-        except Exception:
-            lease_lost.set()
-            return False
+        lease_deadline[0] = time.monotonic() + lease_seconds
+        heartbeat_degraded.clear()
+        return True
 
     def heartbeat_loop() -> None:
-        while not stop_heartbeat.wait(heartbeat_interval):
+        while True:
+            # Retry sooner while degraded, so a transient failure is retried
+            # well inside the lease instead of once per full interval.
+            wait = min(heartbeat_interval, 5.0) if heartbeat_degraded.is_set() else heartbeat_interval
+            if stop_heartbeat.wait(wait):
+                return
             if not heartbeat_once():
                 return
 
@@ -219,7 +263,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             artifacts = latest_checkpoint.get("artifacts") or {}
             if latest_checkpoint.get("phase") == "summary" and artifacts.get("final_builder"):
                 final = artifacts["final_builder"].get("parsed", {})
-                result = {"status": final.get("status", "success"), "result": final, "summary": (artifacts.get("hebrew_summary") or {}).get("parsed", {}).get("summary"), "results": artifacts, **(latest_checkpoint.get("token_usage") or {})}
+                # The V1 result contract carries the two token counts; the
+                # checkpoint's token_usage may also hold the full ledger
+                # record (the worker consolidates it there), which belongs
+                # to runs.usage / run_execution_usage, not to the output.
+                checkpoint_tokens = latest_checkpoint.get("token_usage") or {}
+                result = {"status": final.get("status", "success"), "result": final, "summary": (artifacts.get("hebrew_summary") or {}).get("parsed", {}).get("summary"), "results": artifacts, **{k: checkpoint_tokens[k] for k in ("input_tokens", "output_tokens") if k in checkpoint_tokens}}
                 sink.emit(RunEventRecord(run_id=run_id, type="run_completed", message="Run completed from checkpoint", payload={"checkpoint_id": str(latest_checkpoint.get("id", ""))}))
                 shadow_observe("run_completed", {"checkpoint_id": str(latest_checkpoint.get("id", ""))})
                 repo.mark_run_complete(run_id, result, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
@@ -230,7 +279,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             repo.heartbeat(run_id, worker_id, lease_seconds=lease_seconds, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
         def save_checkpoint(_phase, checkpoint):
             if hasattr(repo, "save_checkpoint"):
-                checkpoint = {**checkpoint, "run_id": str(run_id), "attempt": run.get("attempt", 1), "workflow_key": workflow_key}
+                # A checkpoint's token_usage is CONSOLIDATED from the ledger
+                # rather than trusted as the engine wrote it. Engines count
+                # process-locally (V1 restarts its own token counters on
+                # every replay, the mock engine derives them from its phase
+                # count); the tracker is cumulative across attempts, and the
+                # merge is never lower than either -- so a checkpoint can
+                # never carry less usage than the run has durably spent.
+                checkpoint = {**checkpoint, "run_id": str(run_id), "attempt": run.get("attempt", 1), "workflow_key": workflow_key,
+                              "token_usage": merge_usage_snapshots(checkpoint.get("token_usage"), tracker.ledger_snapshot())}
                 repo.save_checkpoint(checkpoint, **lease_ctx)
                 shadow_observe("checkpoint_saved", checkpoint)
         def is_cancelled():
@@ -328,9 +385,23 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             sink.emit(RunEventRecord(run_id=run_id, type=event_type, message=payload.get("message", event_type), payload=payload.get("payload", payload)))
             shadow_observe(event_type, payload)
 
-        def record_usage(usage):
+        def record_usage(ledger):
+            """Make the tracker's ledger durable under the active lease.
+
+            The canonical path is `record_run_usage` (migration
+            20260920000100): a merging, versioned, lease-guarded write that
+            also projects the public aggregate into runs.usage. A repository
+            without it still receives the public projection through the
+            (now monotonic) `update_run_usage`. Either way a stale lease is
+            rejected at the database boundary and the failure propagates:
+            a worker that cannot record consumption must not keep consuming.
+            """
+            if hasattr(repo, "record_run_usage"):
+                row = repo.record_run_usage(run_id, ledger, **lease_ctx)
+                return row.get("version") if isinstance(row, dict) else None
             if hasattr(repo, "update_run_usage"):
-                repo.update_run_usage(run_id, usage, **lease_ctx)
+                repo.update_run_usage(run_id, public_usage_projection(ledger), **lease_ctx)
+            return None
 
         def holds_lease():
             if lease_lost.is_set():
@@ -382,6 +453,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             daily_project_reserver=None,
             daily_settler=(lambda reservation, actual_cost, status, reason: repo.settle_model_call_budget(reservation.id if isinstance(reservation, ModelCallReservation) else str(reservation), actual_cost, status, reason, run_id=run_id, **lease_ctx)) if hasattr(repo, "settle_model_call_budget") else None,
         )
+        if tracker.usage_recorder is None:
+            # An injected tracker (tests, harnesses) still records through
+            # THIS worker's lease: durable accounting is a property of the
+            # run, not of whoever constructed the tracker.
+            tracker.usage_recorder = record_usage
 
         def forward_event(t, p):
             sink.emit(RunEventRecord(run_id=run_id, type=t, message=p.get("message", t), payload=p, phase=p.get("phase"), agent=p.get("agent"), progress=p.get("progress")))
@@ -408,6 +484,24 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             provider_backpressure_events counter is incremented once per 429
             by the guarded client, so this callback only records the event."""
             forward_event("provider_backpressure_wait", {"agent": agent, "phase": phase, "reason": reason, "wait_seconds": wait_seconds, "message": f"Provider backpressure for {agent}/{phase}: waiting {wait_seconds}s ({reason})"})
+
+        def record_ledger_consumption(kind: str) -> None:
+            """Swarm V2's non-provider consumption, made durable as it happens.
+
+            The engine names WHAT was consumed with a static kind; the ledger
+            is the only place it is counted. Nothing here is derived from the
+            plan, the checkpoint or the event stream afterwards.
+            """
+            if kind == "task_completed":
+                tracker.record_task_result("completed")
+            elif kind == "task_failed":
+                tracker.record_task_result("failed")
+            elif kind == "replan":
+                tracker.record_replan()
+            elif kind == "correction_round":
+                tracker.record_replan(correction=True)
+            else:
+                raise ValueError(f"unknown ledger consumption kind {kind!r}")
 
         if engine is None and engine_registry is None and engine_mode == "mock":
             from backend.worker.mock_engine import MockLifecycleEngine
@@ -575,6 +669,10 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
                     gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
                     cancellation_checker=is_cancelled, event_sink=forward_event,
+                    # Every planned Tool invocation is a durable, cumulative
+                    # consumption BEFORE it runs: a failed call is still a
+                    # call, and a resumed run does not get it back.
+                    tool_call_callback=tracker.record_tool_call,
                     # The trusted post-execution seam, wired. It is reached
                     # only with a Registry-validated result and server-resolved
                     # identity; the worker model cannot call it, cannot choose
@@ -617,10 +715,19 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     agent_steps = (RemainingBudget.model_fields["agent_steps"].default
                                    if cfg.max_agent_steps is None else
                                    max(0, cfg.max_agent_steps - tracker.agent_steps))
+                    # Tool calls and task executions are CUMULATIVE ledger
+                    # dimensions, like model calls and agent steps: what a
+                    # failed task spent, what an earlier attempt spent and
+                    # what a superseded plan spent all stay spent. The
+                    # remaining capacity is therefore the reviewed plan-shape
+                    # ceiling minus what the ledger shows, never a value
+                    # rebuilt from the current plan's completed tasks.
+                    tool_calls = max(0, limits.max_tool_calls - tracker.tool_calls)
+                    tasks = max(0, limits.max_tasks - (tracker.tasks_completed + tracker.tasks_failed))
                     return RemainingBudget(
                         cost_units=limits.max_cost_units,
-                        tool_calls=limits.max_tool_calls,
-                        tasks=limits.max_tasks,
+                        tool_calls=tool_calls,
+                        tasks=tasks,
                         model_calls=model_calls,
                         retries=retries,
                         agent_steps=agent_steps,
@@ -636,7 +743,10 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     # Completed tasks only: see `evidence_of_completed_tasks`.
                     evidence_loader=lambda results: evidence_of_completed_tasks(board, results),
                     checkpoint_sink=save_checkpoint, event_sink=forward_event,
-                    usage_snapshot=tracker.snapshot, remaining_budget=remaining,
+                    # The checkpoint carries the FULL ledger, not only the
+                    # public aggregate, so a resume restores every dimension.
+                    usage_snapshot=tracker.ledger_snapshot, remaining_budget=remaining,
+                    ledger_sink=record_ledger_consumption,
                     # R4 durable provenance. The engine still holds no
                     # repository handle: it hands each settled verdict and each
                     # conflict decision to the run's own lease-guarded Evidence
@@ -646,31 +756,44 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     resolution_sink=board.record_conflict_resolution)
             swarm_engine_builder = make_swarm_engine
         try:
-            # Restore cumulative V2 usage before constructing any model path.
-            # A restarted worker must not regain per-run budget capacity, so
-            # the restore takes the MOST ADVANCED durable snapshot rather than
-            # simply the checkpoint's. runs.usage is rewritten after every
-            # settled provider call, while a checkpoint is only written at
-            # task and verifier-batch boundaries: a crash in that window
-            # leaves the checkpoint STALER than the run row, and trusting it
-            # alone would refund calls, tokens and cost the run had already
-            # durably spent. The component-wise maximum is never lower than
-            # either source on any dimension, so it holds whichever one is
-            # ahead -- including a run row that a stale-lease rejection left
-            # BEHIND its own checkpoint.
-            if workflow_key == "swarm_v2":
-                checkpoint_usage: dict[str, Any] = {}
-                if latest_checkpoint:
-                    checkpoint_usage = latest_checkpoint.get("token_usage") or {}
-                    if not checkpoint_usage:
-                        checkpoint_usage = (((latest_checkpoint.get("artifacts") or {})
-                                             .get("swarm_state") or {})
-                                            .get("usage_snapshot") or {})
-                # A run that never spent anything stores {} in both places, so
-                # a first attempt merges to nothing and restores nothing.
-                restored = merge_usage_snapshots(run.get("usage"), checkpoint_usage)
-                if restored:
-                    tracker.restore_snapshot(restored)
+            # Restore the run's cumulative usage BEFORE constructing any model
+            # path -- for EVERY engine. A restarted worker must not regain
+            # per-run capacity, so the restore takes the MOST ADVANCED durable
+            # record rather than any single one:
+            #
+            #   * the run_execution_usage ledger row, written after every
+            #     recorded consumption under the lease (the canonical record);
+            #   * runs.usage, the public projection of it (and the only record
+            #     a run that predates the ledger row carries);
+            #   * the latest checkpoint's token_usage (and, for Swarm V2, the
+            #     usage_snapshot inside the checkpointed state).
+            #
+            # They advance at different rates and a crash can leave any of
+            # them staler than the others; the component-wise maximum holds
+            # whichever is ahead on each dimension, so nothing durably spent is
+            # ever refunded.
+            #
+            # V1 has no partial-phase resume: unless its checkpoint is the
+            # final one (the fast path above), it deliberately REPLAYS the
+            # pipeline from the start. That replay is now charged ON TOP of
+            # everything the earlier attempts consumed -- the tracker starts
+            # from the restored record, never from zero -- so a relaunched V1
+            # run cannot spend a second full budget.
+            checkpoint_usage: dict[str, Any] = {}
+            swarm_state_usage: dict[str, Any] = {}
+            if latest_checkpoint:
+                checkpoint_usage = latest_checkpoint.get("token_usage") or {}
+                swarm_state_usage = (((latest_checkpoint.get("artifacts") or {})
+                                      .get("swarm_state") or {})
+                                     .get("usage_snapshot") or {})
+            ledger_row = repo.get_run_usage_ledger(run_id) if hasattr(repo, "get_run_usage_ledger") else None
+            durable_ledger = (ledger_row or {}).get("ledger") or {}
+            # A run that never spent anything stores {} everywhere, so a
+            # first attempt merges to nothing and restores nothing.
+            restored = merge_usage_snapshots(run.get("usage"), checkpoint_usage,
+                                             swarm_state_usage, durable_ledger)
+            if restored:
+                tracker.restore_snapshot(restored)
             selected_engine = resolved_engine.factory()
             # V2 owns its versioned checkpoint compatibility checks. V1 keeps
             # its existing artifact-based resume path above unchanged.

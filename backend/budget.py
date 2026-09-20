@@ -23,12 +23,15 @@ The tracker never sees or stores API keys; configuration is numeric only.
 
 from __future__ import annotations
 
-import math
 import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from backend.execution_usage import (LEDGER_AMOUNTS, LEDGER_COUNTERS, LEDGER_SCHEMA_VERSION,
+                                     LEDGER_SNAPSHOT_FIELDS, PUBLIC_USAGE_FIELDS,
+                                     merge_usage_snapshots, public_usage_projection,
+                                     validate_usage_snapshot)
 from backend.provider_scheduler import is_provider_rate_limit_error
 from backend.runtime import CancellationRequested
 from backend.runtime_policy import BUDGET as _POLICY_BUDGET_SURFACE
@@ -50,93 +53,22 @@ def paid_execution_enabled() -> bool:
     return os.getenv("MILO_ENABLE_PAID_EXECUTION", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-# The cumulative dimensions of a run's durable usage snapshot. EVERY one of
-# them only ever grows while a run executes, which is what makes a
-# component-wise maximum of two snapshots of the same run safe: it can never
-# hand back capacity a snapshot already recorded as spent.
+# The cumulative dimensions of a run's durable usage record live in ONE
+# place, `backend.execution_usage` (the ExecutionUsageLedger contract), and
+# are re-exported here under their historical names. EVERY one of them only
+# ever grows while a run executes, which is what makes a component-wise
+# maximum of two records of the same run safe: it can never hand back
+# capacity a record already shows as spent.
 #
-# `total_tokens` is deliberately NOT here: it is derived (input + output) and
-# is recomputed from the merged components rather than maximised on its own.
-# `reserved_input_tokens` / `reserved_output_tokens` are not here either --
-# they are in-flight reservations the previous process no longer owns, and
-# they never enter a snapshot at all.
-CUMULATIVE_USAGE_COUNTERS = (
-    "model_calls", "input_tokens", "output_tokens", "retries",
-    "provider_backpressure_events", "agent_steps",
-)
-# elapsed_seconds is wall-clock rather than a counter, but it behaves the same
-# way for budget purposes: a LARGER elapsed time leaves LESS run duration, so
-# taking the maximum stays the conservative direction here too.
-CUMULATIVE_USAGE_AMOUNTS = ("estimated_cost", "actual_cost", "elapsed_seconds")
-USAGE_SNAPSHOT_FIELDS = frozenset(
-    {*CUMULATIVE_USAGE_COUNTERS, *CUMULATIVE_USAGE_AMOUNTS, "total_tokens"})
-
-
-def _usage_counter(value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError("budget snapshot contains an invalid counter")
-    return value
-
-
-def _usage_amount(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("budget snapshot contains an invalid amount")
-    numeric = float(value)
-    if not math.isfinite(numeric) or numeric < 0:
-        raise ValueError("budget snapshot contains an invalid amount")
-    return numeric
-
-
-def merge_usage_snapshots(*snapshots: Any) -> dict[str, Any]:
-    """Fold durable usage snapshots of ONE run into the most advanced of them.
-
-    A run records its usage in more than one durable place and they advance at
-    different rates: ``runs.usage`` is rewritten after every settled provider
-    call, while an engine checkpoint is only written at task and batch
-    boundaries. A crash between the two therefore leaves the checkpoint
-    STALER than the run row, and restoring the checkpoint alone would hand
-    back model calls, tokens and cost the run had already durably spent.
-
-    The merge is a component-wise maximum over the cumulative dimensions, so
-    the result is never lower than ANY input on any dimension, whichever
-    source happens to be ahead. Empty and absent snapshots contribute nothing
-    (a run that never spent anything stores ``{}``), and an empty result means
-    there is nothing to restore.
-
-    Fail-closed on the way in: an invalid counter or amount raises rather than
-    being treated as absent, because silently dropping a corrupt value is
-    indistinguishable from refunding it. Keys outside the known cumulative set
-    are ignored rather than rejected, so a snapshot written by a future
-    release cannot brick a resume -- this release simply cannot enforce a
-    dimension it does not know about.
-    """
-    merged: dict[str, float] = {}
-    contributed = False
-    for snapshot in snapshots:
-        if not isinstance(snapshot, dict) or not snapshot:
-            continue
-        contributed = True
-        for name in CUMULATIVE_USAGE_COUNTERS:
-            if name in snapshot:
-                merged[name] = max(merged.get(name, 0), _usage_counter(snapshot[name]))
-        for name in CUMULATIVE_USAGE_AMOUNTS:
-            if name in snapshot:
-                merged[name] = max(merged.get(name, 0.0), _usage_amount(snapshot[name]))
-        declared = snapshot.get("total_tokens")
-        if declared is not None and _usage_counter(declared) != (
-                _usage_counter(snapshot.get("input_tokens", 0)) +
-                _usage_counter(snapshot.get("output_tokens", 0))):
-            raise ValueError("budget snapshot token total is inconsistent")
-    if not contributed:
-        return {}
-    restored: dict[str, Any] = {name: int(merged.get(name, 0))
-                                for name in CUMULATIVE_USAGE_COUNTERS}
-    restored.update({name: float(merged.get(name, 0.0))
-                     for name in CUMULATIVE_USAGE_AMOUNTS})
-    # Derived, never maximised independently: restore_snapshot requires the
-    # declared total to equal the components it is restoring.
-    restored["total_tokens"] = restored["input_tokens"] + restored["output_tokens"]
-    return restored
+# `USAGE_SNAPSHOT_FIELDS` is the bounded PUBLIC shape written to `runs.usage`
+# (`BudgetTracker.snapshot()`); `LEDGER_SNAPSHOT_FIELDS` is the full ledger
+# (`BudgetTracker.ledger_snapshot()`), of which the public shape is a strict
+# projection. `reserved_input_tokens` / `reserved_output_tokens` are in
+# neither: they are in-flight reservations the previous process no longer
+# owns, and they never enter a durable record at all.
+CUMULATIVE_USAGE_COUNTERS = LEDGER_COUNTERS
+CUMULATIVE_USAGE_AMOUNTS = LEDGER_AMOUNTS
+USAGE_SNAPSHOT_FIELDS = PUBLIC_USAGE_FIELDS
 
 
 class BudgetExceeded(Exception):
@@ -249,7 +181,10 @@ class BudgetConfig:
 
 
 EventEmitter = Callable[[str, dict[str, Any]], None]
-UsageRecorder = Callable[[dict[str, Any]], None]
+#: Receives the FULL ledger snapshot after every recorded consumption. It may
+#: return the durable record (or its ``ledger_version``) so the tracker can
+#: carry the database's write sequence number; None is accepted.
+UsageRecorder = Callable[[dict[str, Any]], Any]
 LedgerRecorder = Callable[[dict[str, Any]], None]
 CostProvider = Callable[[], float]
 @dataclass(frozen=True)
@@ -347,6 +282,22 @@ class BudgetTracker:
     retries: int = 0
     provider_backpressure_events: int = 0
     agent_steps: int = 0
+    # --- ledger-only dimensions (backend.execution_usage) ------------------
+    # Durable and cumulative like everything above, but outside the bounded
+    # public `runs.usage` contract: they reach the database through
+    # `ledger_snapshot()`, never through `snapshot()`.
+    provider_attempts: int = 0
+    provider_failures: int = 0
+    tool_calls: int = 0
+    tasks_completed: int = 0
+    tasks_failed: int = 0
+    search_invocations: int = 0
+    search_cost: float = 0.0
+    replans: int = 0
+    correction_rounds: int = 0
+    #: The durable record's write sequence number, as last reported by the
+    #: recorder. 0 until the first accepted durable write.
+    ledger_version: int = 0
     #: Telemetry only: how many calls reached the gate with no declared cap.
     #: Deliberately NOT a cumulative snapshot field -- it is a code-health
     #: signal, not run capacity, and it must not gate a resume.
@@ -380,8 +331,22 @@ class BudgetTracker:
         return exceeded
 
     def snapshot(self) -> dict[str, Any]:
+        """The bounded PUBLIC aggregate: exactly the `runs.usage` contract."""
+        return public_usage_projection(self.ledger_snapshot())
+
+    def ledger_snapshot(self) -> dict[str, Any]:
+        """The FULL cumulative ledger of this run, as this process knows it.
+
+        Every value is cumulative across attempts: a resumed tracker starts
+        from the merged durable record (`restore_snapshot`) and only ever adds
+        to it. In-flight reservations are deliberately absent.
+        """
         return {
+            "schema_version": LEDGER_SCHEMA_VERSION,
+            "ledger_version": self.ledger_version,
             "model_calls": self.model_calls,
+            "provider_attempts": self.provider_attempts,
+            "provider_failures": self.provider_failures,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.input_tokens + self.output_tokens,
@@ -390,41 +355,60 @@ class BudgetTracker:
             "retries": self.retries,
             "provider_backpressure_events": self.provider_backpressure_events,
             "agent_steps": self.agent_steps,
+            "tool_calls": self.tool_calls,
+            "tasks_completed": self.tasks_completed,
+            "tasks_failed": self.tasks_failed,
+            "search_invocations": self.search_invocations,
+            "search_cost": round(self.search_cost, 6),
+            "replans": self.replans,
+            "correction_rounds": self.correction_rounds,
             "elapsed_seconds": round(self.clock() - self._started_at, 3),
         }
 
-    def restore_snapshot(self, snapshot: dict[str, Any]) -> None:
-        """Restore a trusted checkpoint's cumulative usage before resume.
+    def _record(self) -> None:
+        """Make the current ledger durable through the injected recorder.
 
-        A resumed worker must not regain per-run model, token, cost, retry or
-        agent-step capacity. In-flight reservations are deliberately not
-        restored; the previous process no longer owns them.
+        Called after EVERY consumption, not only after a settled provider
+        call, so a crash between two provider calls cannot lose the retry,
+        agent step, tool call, task or replan recorded in between. A recorder
+        failure propagates: a worker whose lease was reclaimed must not keep
+        consuming against a record it can no longer write.
+        """
+        if not self.usage_recorder:
+            return
+        reported = self.usage_recorder(self.ledger_snapshot())
+        version = reported.get("ledger_version") if isinstance(reported, dict) else reported
+        if isinstance(version, bool) or not isinstance(version, int):
+            return
+        # The database only ever moves the sequence forward.
+        self.ledger_version = max(self.ledger_version, version)
+
+    def restore_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Restore a trusted durable ledger record before resume.
+
+        A resumed worker must not regain per-run capacity on ANY cumulative
+        dimension. The record may be the public `runs.usage` shape, a
+        checkpoint's `token_usage`, the `run_execution_usage` row or their
+        merge (`merge_usage_snapshots`); a field the record does not carry is
+        restored as 0. In-flight reservations are deliberately not restored;
+        the previous process no longer owns them.
         """
         if not isinstance(snapshot, dict):
             raise ValueError("budget snapshot must be an object")
-        if set(snapshot) - USAGE_SNAPSHOT_FIELDS:
+        if set(snapshot) - LEDGER_SNAPSHOT_FIELDS:
             raise ValueError("budget snapshot contains unknown fields")
-        parsed_ints = {name: _usage_counter(snapshot.get(name, 0))
-                       for name in CUMULATIVE_USAGE_COUNTERS}
-        declared_total = snapshot.get(
-            "total_tokens", parsed_ints["input_tokens"] + parsed_ints["output_tokens"]
-        )
-        if (isinstance(declared_total, bool) or not isinstance(declared_total, int) or
-                declared_total != parsed_ints["input_tokens"] + parsed_ints["output_tokens"]):
-            raise ValueError("budget snapshot token total is inconsistent")
-        parsed_floats = {name: _usage_amount(snapshot.get(name, 0))
-                         for name in CUMULATIVE_USAGE_AMOUNTS}
+        parsed = validate_usage_snapshot(snapshot)
         with self._lock:
-            if any((self.model_calls, self.input_tokens, self.output_tokens,
-                    self.estimated_cost, self.actual_cost, self.retries,
-                    self.provider_backpressure_events, self.agent_steps,
-                    self.reserved_input_tokens, self.reserved_output_tokens)):
+            if any(getattr(self, name) for name in (*LEDGER_COUNTERS, *LEDGER_AMOUNTS)
+                   if name != "elapsed_seconds") or self.reserved_input_tokens or self.reserved_output_tokens:
                 raise ValueError("budget usage can only be restored into a fresh tracker")
-            for name, value in parsed_ints.items():
-                setattr(self, name, value)
-            self.estimated_cost = parsed_floats["estimated_cost"]
-            self.actual_cost = parsed_floats["actual_cost"]
-            self._started_at = self.clock() - parsed_floats["elapsed_seconds"]
+            for name in LEDGER_COUNTERS:
+                setattr(self, name, int(parsed.get(name, 0)))
+            for name in LEDGER_AMOUNTS:
+                if name != "elapsed_seconds":
+                    setattr(self, name, float(parsed.get(name, 0.0)))
+            self.ledger_version = int(parsed.get("ledger_version", 0))
+            self._started_at = self.clock() - float(parsed.get("elapsed_seconds", 0.0))
 
     def elapsed(self) -> float:
         return self.clock() - self._started_at
@@ -546,6 +530,9 @@ class BudgetTracker:
             # releases exactly what THIS call reserved, whatever the caller
             # passes back, on every terminal path and exactly once.
             self.model_calls += 1
+            # Every admitted request is an ATTEMPT whether or not it settles:
+            # a provider exception, a 429 or a deadline still consumed it.
+            self.provider_attempts += 1
             self.estimated_cost += cfg.estimated_cost_per_call
             self.reserved_input_tokens += estimated_input_tokens
             held_output = int(allowed_output) if allowed_output is not None else 0
@@ -560,6 +547,11 @@ class BudgetTracker:
                 reserved_output_tokens=held_output,
                 estimated_cost=round(cfg.estimated_cost_per_call, 6),
             )
+            # The admission itself is durable BEFORE the request is sent. A
+            # process that dies mid-request may already have been charged for
+            # it; recording only at settlement would let the replacement
+            # worker start one call short of what was really attempted.
+            self._record()
             return next_call_seq, allowed_output
 
     def settle_call(self, reserved_input_tokens: int = 0, reserved_output_tokens: int | None = None, input_tokens: int = 0, output_tokens: int = 0, cost: float | None = None, status: str = "settled", rejection_reason: str | None = None, call_seq: int | None = None) -> None:
@@ -598,6 +590,10 @@ class BudgetTracker:
             self.output_tokens += max(0, int(output_tokens or 0))
             if cost is not None and cost > 0:
                 self.actual_cost += actual_cost
+            if status != "settled":
+                # A released or rejected settlement is an attempt that bought
+                # no response; it stays counted, it is never refunded.
+                self.provider_failures += 1
             cfg = self.config
             self._warn_if_close("model_calls", self.model_calls, cfg.max_model_calls_per_run)
             self._warn_if_close("total_tokens", self.input_tokens + self.output_tokens, cfg.max_total_tokens_per_run)
@@ -610,8 +606,7 @@ class BudgetTracker:
                 actual_output_tokens=int(output_tokens or 0),
                 actual_cost=actual_cost if cost else None,
             )
-            if self.usage_recorder:
-                self.usage_recorder(self.snapshot())
+            self._record()
             if cfg.max_input_tokens_per_run is not None and self.input_tokens > cfg.max_input_tokens_per_run:
                 self._ledger("overage", call_seq=settled_seq, rejection_reason="INPUT_TOKEN_LIMIT_EXCEEDED")
                 raise self._stop("INPUT_TOKEN_LIMIT_EXCEEDED", "actual input token limit exceeded", "token_limit_reached", "budget_exhausted")
@@ -635,14 +630,62 @@ class BudgetTracker:
     def record_agent_step(self) -> None:
         with self._lock:
             self.agent_steps += 1
+            self._record()
             if self.config.max_agent_steps is not None and self.agent_steps > self.config.max_agent_steps:
                 raise self._reject("AGENT_STEP_LIMIT_REACHED", "agent step limit reached", "budget_exhausted", "budget_exhausted")
 
     def record_retry(self) -> None:
         with self._lock:
             self.retries += 1
+            self._record()
             if self.config.max_retries is not None and self.retries > self.config.max_retries:
                 raise self._reject("RETRY_LIMIT_REACHED", "retry limit reached", "retry_limit_reached", "failed")
+
+    # -- ledger-only consumption ------------------------------------------
+    # None of these enforces a limit of its own: the Swarm plan firewall and
+    # feasibility gate bound tasks, tool calls and replans by SHAPE before
+    # execution, and RuntimePolicy stays the authority for limits. What they
+    # do is make the consumption DURABLE and cumulative, so a resumed run's
+    # remaining tool-call, task and replan capacity is computed from what was
+    # really spent rather than rebuilt from the current plan.
+    def record_tool_call(self) -> None:
+        """One registered Tool operation is about to be invoked."""
+        with self._lock:
+            self.tool_calls += 1
+            self._record()
+
+    def record_task_result(self, status: str) -> None:
+        """One logical task execution ended with ``status``."""
+        with self._lock:
+            if status == "completed":
+                self.tasks_completed += 1
+            elif status == "failed":
+                self.tasks_failed += 1
+            else:
+                return
+            self._record()
+
+    def record_search(self, cost: float = 0.0) -> None:
+        """One search invocation, with its recorded or estimated cost.
+
+        The interface exists so a search tool can be accounted for the day
+        one is registered; no production code path calls it today.
+        """
+        amount = float(cost or 0.0)
+        if amount < 0:
+            raise ValueError("search cost cannot be negative")
+        with self._lock:
+            self.search_invocations += 1
+            self.search_cost += amount
+            self._record()
+
+    def record_replan(self, *, correction: bool = False) -> None:
+        """One Commander replan was ACCEPTED; a correction round is one too."""
+        with self._lock:
+            self.replans += 1
+            if correction:
+                self.correction_rounds += 1
+            self._record()
 
     def note_missing_output_cap(self, model: str) -> None:
         """Record that a caller reached the gate without declaring a cap.
@@ -667,6 +710,7 @@ class BudgetTracker:
         (max_retries), so this counter enforces no limit of its own."""
         with self._lock:
             self.provider_backpressure_events += 1
+            self._record()
 
 
 class _GuardedCompletions:

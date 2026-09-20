@@ -30,7 +30,8 @@ class SwarmV2Engine:
                  usage_snapshot: Callable[[], Mapping[str, Any]] | None = None,
                  remaining_budget: Callable[[], RemainingBudget] | None = None,
                  verdict_sink: Callable[[VerificationVerdict], None] | None = None,
-                 resolution_sink: Callable[[ConflictResolution], None] | None = None):
+                 resolution_sink: Callable[[ConflictResolution], None] | None = None,
+                 ledger_sink: Callable[[str], None] | None = None):
         self._commander = commander
         self._executor, self._verifier = executor, verifier
         self._builder = builder or FinalBuilder()
@@ -47,6 +48,19 @@ class SwarmV2Engine:
         # deployment that has not wired them keeps the checkpoint as the only
         # durable home of a verdict, exactly as before R4.
         self._verdict_sink, self._resolution_sink = verdict_sink, resolution_sink
+        # The run's ExecutionUsageLedger, for the consumption only THIS engine
+        # can see happen: a task execution ending, a replan being accepted, a
+        # correction round starting. Each is reported with a static kind, at
+        # the moment it happens and BEFORE the checkpoint that follows, so the
+        # durable record is never behind the checkpoint. The engine holds no
+        # counter of its own for any of them: `state.replans` and
+        # `state.correction_rounds` bound the PLAN, the ledger is what the
+        # run has SPENT, and a resume reads the latter from the database.
+        self._ledger_sink = ledger_sink
+
+    def _consume(self, kind: str) -> None:
+        if self._ledger_sink is not None:
+            self._ledger_sink(kind)
 
     @staticmethod
     def _canonical(value: Any) -> str:
@@ -144,10 +158,18 @@ class SwarmV2Engine:
         # Tool-call budgeting is charged against the EXACT planned call list:
         # `len(task.tools)` is both what the firewall approved and what the
         # worker executes, so the reservation can never disagree with the run.
-        available_tools = max(
-            0, remaining.tool_calls - sum(len(task.tools) for task in completed_specs)
-        )
-        available_tasks = max(0, remaining.tasks - len(completed_specs))
+        #
+        # Tool calls and tasks are charged against what REMAINS, and what
+        # remains is the provider's answer, not something reconstructed here
+        # from the current plan's completed tasks. The worker derives it from
+        # the run's cumulative ledger -- completed tasks, FAILED tasks, earlier
+        # attempts and superseded plans all already subtracted -- so charging
+        # completed tasks again here would double-count them, and rebuilding
+        # it from `completed` alone would refund every failed execution.
+        # `cost_units` stays plan-relative: it is the Commander's own estimate
+        # of the plan, not a consumption the ledger records.
+        available_tools = max(0, remaining.tool_calls)
+        available_tasks = max(0, remaining.tasks)
         # The WORST case, not a floor: repairs, replan decisions, a verifier
         # batch and the correction round are all things this plan may really
         # need, and a preflight that ignores them is not a proof of anything.
@@ -374,6 +396,10 @@ class SwarmV2Engine:
         state.correction_rounds += 1
         state.graph_revision += 1
         state.approved_plan = replacement.model_dump(mode="json")
+        # Durable FIRST, then checkpointed: the ledger records the round the
+        # moment it is accepted, so a crash before the checkpoint cannot make
+        # a resume believe the run still has its correction allowance.
+        self._consume("correction_round")
         state.usage_snapshot = dict(self._usage_snapshot())
         self._emit("commander_replanned", {"decision": decision.decision,
                                            "graph_revision": state.graph_revision})
@@ -427,11 +453,18 @@ class SwarmV2Engine:
                     state, self._evidence_loader(dict(persisted_results)),
                     set(persisted_results),
                 )
+                self._consume("task_completed")
                 state.usage_snapshot = dict(self._usage_snapshot())
                 self._save(state)  # result, evidence and usage are durable together
 
             execution = self._executor.execute(plan.graph, completed=completed,
                 event_sink=self._emit, task_completed=persist)
+            # A task that ran and FAILED spent its tool calls and its model
+            # calls; it is a consumption of the run, not a rewind. (A task
+            # BLOCKED by a failed dependency never ran and spent nothing.)
+            for task_id in sorted(execution.tasks):
+                if execution.tasks[task_id].status == "failed":
+                    self._consume("task_failed")
             completed = {key: value for key, value in execution.tasks.items()
                          if value.status == "completed"}
             evidence = self._merge_evidence(
@@ -506,6 +539,7 @@ class SwarmV2Engine:
                                       "reason": decision.reason})
                 state.graph_revision += 1
                 state.approved_plan = replacement.model_dump(mode="json")
+                self._consume("replan")
                 state.usage_snapshot = dict(self._usage_snapshot())
                 plan = replacement
                 self._emit("commander_replanned", {"decision": decision.decision,

@@ -298,6 +298,12 @@ class MemoryRepository:
                     validate_transition(current, status)
                 except InvalidTransition as exc:
                     raise AppError("INVALID_RUN_TRANSITION", str(exc), 409) from exc
+            if fields.get("usage") is not None:
+                # Parity with transition_run_worker_guarded: a terminal usage
+                # snapshot merges into the aggregate, it never lowers it.
+                from backend.execution_usage import merge_usage_snapshots
+
+                fields = {**fields, "usage": merge_usage_snapshots(run.get("usage"), fields["usage"])}
             run.update({"status": status, "updated_at": _now(), **fields})
             return dict(run)
 
@@ -316,11 +322,54 @@ class MemoryRepository:
         return dict(row)
 
     def update_run_usage(self, run_id: UUID, usage: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
-        run = self.runs[str(run_id)]
-        if worker_id is not None:
+        # Parity with update_run_usage_guarded (migration 20260920000100):
+        # the aggregate is MERGED component-wise, never overwritten, so a
+        # snapshot that is merely behind cannot lower a counter.
+        from backend.execution_usage import merge_usage_snapshots
+
+        with self.lock:
+            run = self.runs[str(run_id)]
+            if worker_id is not None:
+                self._assert_active_lease(run, worker_id, attempt, lease_token)
+            run["usage"] = merge_usage_snapshots(run.get("usage"), usage)
+            return dict(run)
+
+    def record_run_usage(self, run_id: UUID, ledger: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Parity with record_run_usage_guarded: lease-guarded, merging,
+        versioned (a duplicate never advances the version), and projecting
+        the public aggregate into runs.usage in the same step."""
+        from backend.execution_usage import merge_usage_snapshots, public_usage_projection
+
+        with self.lock:
+            run = self.runs.get(str(run_id))
+            if run is None:
+                raise NotFoundError("run", str(run_id))
             self._assert_active_lease(run, worker_id, attempt, lease_token)
-        run["usage"] = usage
-        return dict(run)
+            if not isinstance(ledger, dict):
+                raise AppError("REPOSITORY_ERROR", "guarded persistence operation failed", 502)
+            ledgers = self.__dict__.setdefault("run_usage_ledgers", {})
+            existing = ledgers.get(str(run_id)) or {
+                "run_id": str(run_id), "schema_version": 1, "version": 0,
+                "attempt": int(attempt or 1), "worker_id": worker_id, "ledger": {},
+                "created_at": _now(), "updated_at": _now(),
+            }
+            incoming = {k: v for k, v in ledger.items() if k != "ledger_version"}
+            merged = merge_usage_snapshots(existing["ledger"], incoming)
+            if merged != existing["ledger"] or existing["version"] == 0:
+                version = existing["version"] + 1
+                merged["ledger_version"] = version
+                merged["schema_version"] = max(int(merged.get("schema_version", 1)), int(existing["schema_version"]))
+                existing = {**existing, "ledger": merged, "version": version,
+                            "schema_version": merged["schema_version"],
+                            "attempt": max(int(existing["attempt"]), int(attempt or 1)),
+                            "worker_id": worker_id, "updated_at": _now()}
+            ledgers[str(run_id)] = existing
+            run["usage"] = merge_usage_snapshots(run.get("usage"), public_usage_projection(existing["ledger"]))
+            return {**existing, "ledger": dict(existing["ledger"])}
+
+    def get_run_usage_ledger(self, run_id: UUID) -> dict[str, Any] | None:
+        row = self.__dict__.get("run_usage_ledgers", {}).get(str(run_id))
+        return {**row, "ledger": dict(row["ledger"])} if row else None
 
     def append_usage_ledger(self, entry: dict[str, Any]) -> dict[str, Any]:
         row = {"id": len(getattr(self, "usage_ledger", [])) + 1, "created_at": _now(), **entry}

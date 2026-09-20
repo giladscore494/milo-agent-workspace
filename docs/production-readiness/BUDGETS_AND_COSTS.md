@@ -54,3 +54,74 @@ Aggregate usage is persisted on the run (`runs.usage`, migration `010`).
 
 `run_usage_ledger` (migration `013`) is append-only: every reservation,
 settlement, release and overage leaves an auditable row. No deletes.
+
+## Execution usage ledger: durable, monotonic, resume-safe
+
+`RuntimePolicy` (`backend/runtime_policy.py`) is the authority for what a
+run's limits ARE. The **ExecutionUsageLedger** is the single authority for
+what a run has CONSUMED against them, and it is what every resume is held
+to. Its contract lives in `backend/execution_usage.py`; `BudgetTracker` is
+the live, in-process ledger; migration `20260920000100` is its durable home.
+
+Core invariant, on every cumulative dimension:
+
+    remaining_budget_after_resume <= remaining_budget_before_crash
+
+**Dimensions** (all cumulative across attempts, replans and corrections):
+model calls, provider attempts (admitted requests, including ones that
+raised), provider failures, input/output/total tokens, estimated and
+recorded cost, semantic retries, provider backpressure events, agent steps,
+tool calls, task executions (completed / failed), search invocations and
+search cost (interface only; no search tool is registered), replans and
+correction rounds, elapsed seconds.
+
+**Durable record.** `run_execution_usage` holds one row per run: the full
+ledger (`jsonb`), a `version` the database advances on every accepted
+CHANGE (never on an idempotent replay), the last writing `attempt` and
+worker. It is written only through `record_run_usage_guarded`, which
+verifies the lease under the database clock (runs row `FOR UPDATE`, so
+concurrent settles and a concurrent reclaim serialize), **merges** by
+component-wise maximum (`merge_execution_usage`) so no accepted write can
+lower a counter, and projects the bounded public aggregate into
+`runs.usage` in the same transaction. A `BEFORE UPDATE` trigger enforces the
+invariant at the storage boundary even against a direct service-path
+write. `update_run_usage_guarded` and `transition_run_worker_guarded` keep
+their signatures and merge instead of overwrite.
+
+**Recording.** The tracker records after EVERY consumption -- the admission
+of a provider request (before it is sent, so a process that dies
+mid-request is still charged for it), its settlement, each retry,
+backpressure event, agent step, tool call, task result, replan and
+correction round -- not only after a settled call. A rejected write (stale
+lease) propagates: a worker that cannot record consumption does not keep
+consuming.
+
+**Resume.** Before constructing any model path, for EVERY engine, the
+worker restores the component-wise maximum of every durable record of the
+run: the ledger row, `runs.usage` and the latest checkpoint's `token_usage`
+(plus the Swarm V2 state's `usage_snapshot`). They advance at different
+rates and a crash can leave any one of them staler; the maximum holds
+whichever is ahead on each dimension, so nothing durably spent is refunded.
+
+* **V1 (`vehicle_catalog_v1`)** has no partial-phase resume. From the final
+  checkpoint it completes without spending (the fast path); from any other
+  checkpoint it deliberately REPLAYS the pipeline -- and the replay is
+  charged on top of everything earlier attempts consumed. A relaunched V1
+  run cannot spend a second full budget: it trips the same limits at the
+  same cumulative totals.
+* **V2 (`swarm_v2`)** resumes from its versioned checkpoint. Its checkpoint
+  bounds the PLAN (`replans`, `correction_rounds`, completed tasks); the
+  ledger records what the run SPENT. Remaining tool-call and task capacity
+  handed to the feasibility gate is `PlanLimits` minus the ledger, never a
+  value rebuilt from the current plan's completed tasks -- a failed task, an
+  earlier attempt and a superseded plan all stay spent.
+
+Checkpoints carry the consolidated ledger as `token_usage` (the merge of
+what the engine wrote and the tracker's ledger), so a checkpoint is never
+below the run's durable usage. `runs.usage` remains exactly the
+`backend.schemas.RunUsage` contract; ledger-only dimensions never reach the
+browser.
+
+Regression coverage: `tests/test_execution_usage_ledger.py` (offline) and
+the `20260920000100` section of `tests/test_migrations_postgres.py` (real
+PostgreSQL).
