@@ -369,11 +369,13 @@ def test_engine_parallelism_is_clamped_to_available_provider_capacity():
 # =============================================================================
 
 def test_a_lease_is_released_when_the_local_slot_wait_gives_up():
-    """Acquiring the shared permit and then failing must not hold the account.
+    """Failing to enter after taking the shared permit must not hold it.
 
-    The global permit is taken before the process-local slot. If that second
-    wait exhausts its bound or is cancelled, a permit nobody is using would sit
-    held for the whole lease TTL -- and compound under load.
+    Nothing was sent, so completion is PROVEN and the permit goes straight
+    back. This is the one class of failure that legitimately releases: the
+    request never started, so there is no uncertainty to be conservative
+    about. Anything that fails AFTER the request is on the wire is settled the
+    other way -- see test_provider_concurrency_ownership.py.
     """
     from backend.provider_quota import ProviderQuotaExhausted
     from backend.provider_scheduler import ProviderBackpressureExceeded
@@ -438,12 +440,13 @@ def test_every_provider_attempt_re_enters_the_shared_admission_gate():
     assert len(admitted) == 3, "retried provider attempts bypassed the shared gate"
 
 
-def test_a_long_call_keeps_its_permit_alive_instead_of_letting_it_expire():
-    """A provider request slower than the lease TTL must not lose its permit.
+def test_a_long_call_keeps_its_permit_for_as_long_as_it_runs():
+    """A slow provider request must not lose its permit mid-flight.
 
-    The TTL recovers a permit from a CRASHED holder; it is not a call-duration
-    budget. Without renewal, a slow call's own permit expires mid-flight and a
-    second caller can take a slot the account is already using.
+    Reclaim is CRASH RECOVERY, on a horizon derived from the worker process
+    lifetime; it is not a call-duration budget and nothing renews anything.
+    A permit that expired under a running call would let a second caller take
+    a slot the account is already using.
     """
     import time as real_time
 
@@ -457,7 +460,8 @@ def test_a_long_call_keeps_its_permit_alive_instead_of_letting_it_expire():
     observed: list[object] = []
 
     def slow_call():
-        # Longer than the whole TTL, so an unrenewed lease would be gone.
+        # Longer than the whole nominal lease window, which under the
+        # superseded design WAS the reclaim trigger.
         real_time.sleep(2.5)
         observed.append(coordinator.try_acquire_inference())
         return "done"

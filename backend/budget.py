@@ -667,7 +667,16 @@ class _GuardedCompletions:
         # reached after the reservation succeeds, and the cap is clamped
         # to the remaining safe allowance. The reservation sequence travels
         # with this call so concurrent workers settle their own reservations.
-        call_seq, allowed_output = self._tracker.open_call(estimated_input, requested_max)
+        # MILO-side, BEFORE anything is sent. The scheduler settles the
+        # organization concurrency permit on whether the provider request can
+        # be proven finished, and an exception from here proves it never
+        # started -- so it must be marked, or an ordinary budget refusal would
+        # quarantine a shared slot it never used.
+        try:
+            call_seq, allowed_output = self._tracker.open_call(estimated_input, requested_max)
+        except BaseException as exc:
+            exc.provider_request_completed = True
+            raise
         effective_cap = allowed_output if allowed_output is not None else requested_max
         reserved_output = effective_cap
         apply_output_cap(kwargs, effective_cap)
@@ -675,11 +684,23 @@ class _GuardedCompletions:
             response = self._inner.create(**kwargs)
         except Exception as exc:
             rate_limited = is_provider_rate_limit_error(exc)
-            self._tracker.settle_call(
-                estimated_input, reserved_output, 0, 0, 0.0, status="released",
-                rejection_reason="PROVIDER_RATE_LIMITED" if rate_limited else "PROVIDER_EXCEPTION",
-                call_seq=call_seq,
-            )
+            try:
+                self._tracker.settle_call(
+                    estimated_input, reserved_output, 0, 0, 0.0, status="released",
+                    rejection_reason="PROVIDER_RATE_LIMITED" if rate_limited else "PROVIDER_EXCEPTION",
+                    call_seq=call_seq,
+                )
+            except BaseException as settlement:
+                # Settling can itself refuse, and that refusal would REPLACE
+                # the provider error the scheduler settles the concurrency
+                # permit on. An accounting failure must not change what is
+                # known about the request, so the original verdict is carried
+                # across -- otherwise an ordinary 429 could start holding a
+                # shared slot for the whole crash-recovery horizon.
+                from backend.provider_scheduler import request_completion_is_proven
+
+                settlement.provider_request_completed = request_completion_is_proven(exc)[0]
+                raise
             if rate_limited:
                 # A 429 is provider backpressure, not a semantic model
                 # failure: it must never consume the semantic retry
@@ -695,14 +716,21 @@ class _GuardedCompletions:
         if provider_cost is None:
             from backend.model_pricing import calculate_model_cost
             provider_cost = calculate_model_cost(kwargs.get("model", ""), input_tokens, output_tokens)
-        self._tracker.settle_call(
-            reserved_input_tokens=estimated_input,
-            reserved_output_tokens=reserved_output,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost=float(provider_cost or 0),
-            call_seq=call_seq,
-        )
+        # Likewise AFTER a response was read to completion: a budget refusal
+        # raised here is about accounting, not about a request whose fate is
+        # unknown, so it must not hold the permit either.
+        try:
+            self._tracker.settle_call(
+                reserved_input_tokens=estimated_input,
+                reserved_output_tokens=reserved_output,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost=float(provider_cost or 0),
+                call_seq=call_seq,
+            )
+        except BaseException as exc:
+            exc.provider_request_completed = True
+            raise
         return response
 
 
@@ -724,9 +752,13 @@ def resolved_request_deadline(deadline_seconds: float | None = None) -> float:
 
     Resolved from the organization quota configuration when not supplied, so a
     caller cannot accidentally build a client with no bound: an unbounded
-    client is exactly how a request outlives the concurrency permit it was
-    admitted under. The value has already been checked against the lease TTL by
-    ``QuotaConfig`` (see the invariant in ``backend.provider_quota``).
+    client is how one request wedges a worker for good. The value has already
+    been validated by ``QuotaConfig``.
+
+    This is a LIVENESS bound, not the concurrency one. The organization permit
+    is settled on whether completion can be PROVEN -- see the ownership
+    invariant in ``backend.provider_quota`` -- and a fired deadline is
+    explicitly not such a proof.
     """
     if deadline_seconds is None:
         from backend.provider_quota import QuotaConfig
@@ -782,12 +814,11 @@ def build_guarded_client_factory(tracker: BudgetTracker, inner_factory: Callable
             # SDK's default of two silent retries would spend organization RPM
             # and concurrency that no MILO counter or shared limiter observes.
             #
-            # http_client: the SDK's default read timeout is 600s, FIVE TIMES
-            # the 120s lease TTL -- and a read timeout would not have bounded
-            # the request anyway, because it measures silence rather than
-            # duration. This client carries a transport that enforces a TOTAL
-            # deadline, which is what keeps a request inside the life of the
-            # permit it was admitted under.
+            # http_client: the SDK's default read timeout is 600s, and a
+            # read timeout would not have bounded the request anyway, because
+            # it measures silence rather than duration. This client carries a
+            # transport that enforces a TOTAL deadline, so a worker cannot
+            # block on one request indefinitely.
             deadline = resolved_request_deadline(request_deadline_seconds)
             inner = OpenAI(api_key=api_key, base_url=base_url, max_retries=0,
                            http_client=build_provider_http_client(deadline),

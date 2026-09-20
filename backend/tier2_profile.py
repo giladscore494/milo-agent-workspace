@@ -67,25 +67,65 @@ HARD_MONETARY_CAP_USD = 3.00
 
 
 def _request_lease_invariant() -> dict[str, Any]:
-    """The permit/request relationship, as shipped.
+    """Who owns a unit of organization concurrency, and when it comes back.
 
     Stated here because it is the thing an operator has to be able to check
-    without reading the scheduler: a request deadline that is not strictly
-    inside the lease TTL means a request can outlive its own permit.
+    without reading the scheduler: which outcomes return a shared slot, and
+    how long one is held when MILO cannot tell.
     """
     config = QuotaConfig()
     return {
-        "statement": ("a real provider request can never still be in flight when "
-                      "its organization concurrency permit becomes reclaimable"),
-        "rule": "provider_request_deadline + lease_safety_margin <= lease_ttl",
+        "statement": ("a unit of organization inference concurrency is returned "
+                      "to the pool ONLY when MILO can prove the request that "
+                      "took it is over; uncertainty reduces available capacity, "
+                      "never increases it"),
+        "rule": ("acquire stamps the crash-recovery horizon; only a "
+                 "PROVEN-FINISHED request releases early; every other outcome, "
+                 "including a dead process, leaves the slot held"),
+        "quarantine_is_the_absence_of_an_action": True,
+        "completion_is_proven_when": [
+            "the call returned",
+            "the provider produced a complete HTTP response (any status)",
+            "the failure occurred before anything was sent",
+        ],
+        "completion_is_not_proven_when": [
+            "the total request deadline fired",
+            "a read timed out",
+            "the outcome is anything else not listed as proof",
+        ],
+        # --- the crash-recovery horizon, and where its number comes from ----
+        "worker_max_lifetime_seconds": config.worker_max_lifetime_seconds,
+        "worker_max_lifetime_source": ("Cloud Run Job --task-timeout 3600 "
+                                       "(scripts/deploy/cloud-run.sh:728; "
+                                       "scripts/release/generate-deployment-plan.sh:297; "
+                                       "asserted live in tests/test_stage_d_toolkit.py:418)"),
+        "worker_installs_no_sigterm_handler": True,
+        "why_that_matters": ("the process cannot trap the platform's termination "
+                             "signal and keep its socket open, so the task "
+                             "timeout really does bound how long a MILO process "
+                             "can hold a provider request"),
+        "run_duration_cap_is_not_the_bound": ("MILO_MAX_RUN_DURATION_SECONDS is "
+                                              "checked cooperatively inside the "
+                                              "worker, so it does not guarantee "
+                                              "the process or its socket is gone"),
+        "reclaim_horizon_seconds": config.reclaim_horizon_seconds,
+        "reclaim_horizon_rule": ("worker_max_lifetime + lease_safety_margin"
+                                 "(worker_max_lifetime)"),
+        "reclaim_horizon_is_crash_recovery_only": True,
+        "enforced_by": ("QuotaConfig.__post_init__ and resolve_coordinator -> "
+                        "assert_reclaim_horizon_safe"),
+        "configuration_may_only_lengthen_the_worker_lifetime": True,
+        # --- the nominal request window, a liveness bound and not the above --
         "provider_request_deadline_seconds": config.request_deadline_seconds,
+        "provider_request_deadline_is_a_liveness_bound": True,
         "lease_safety_margin_seconds": config.safety_margin_seconds,
         "lease_ttl_seconds": config.lease_ttl_seconds,
-        "heartbeat_interval_seconds": config.heartbeat_interval_seconds,
-        "heartbeat_is_load_bearing": False,
-        "heartbeat_role": ("defence in depth and visibility; the deadline alone "
-                           "satisfies the invariant even if renewal never runs"),
-        "enforced_by": "QuotaConfig.__post_init__ -> assert_request_deadline_safe",
+        "lease_ttl_is_not_a_reclaim_trigger": True,
+        "ownership_probe_interval_seconds": config.ownership_probe_interval_seconds,
+        "ownership_probe_is_load_bearing": False,
+        "ownership_probe_renews_nothing": True,
+        "ownership_probe_role": ("visibility only; the invariant holds if it "
+                                 "never runs, fails every time, or never starts"),
         "acquisition_order": ("process-local slot first, organization permit "
                               "second, so the permit is taken immediately before "
                               "the request"),
@@ -98,9 +138,10 @@ def _request_lease_invariant() -> dict[str, Any]:
         "guarantees": ("no MILO thread still awaiting the response after the "
                        "deadline, and the connection closed"),
         "does_not_claim": ("provider-side cancellation, or cancellation from "
-                           "another thread; a server may keep computing after "
-                           "a client disconnects, which is part of why the "
-                           "ceiling is 80% rather than 100%"),
+                           "another thread; a server may keep computing after a "
+                           "client disconnects, which is why a fired deadline "
+                           "quarantines the slot instead of releasing it, and "
+                           "part of why the ceiling is 80% rather than 100%"),
     }
 
 
@@ -151,7 +192,8 @@ def tier2_first_run_profile() -> dict[str, Any]:
                 "sorted-set rolling window over the last 60s for RPM and TPM; "
                 "no burst allowance above the ceiling is assumed"),
             "concurrency_lease": (
-                "unique lease id per acquisition, TTL + heartbeat, deterministic "
+                "unique lease id per acquisition, held to the crash-recovery "
+                "horizon unless completion is proven, deterministic "
                 "release on success/failure/timeout/cancellation; an expired "
                 "lease can never release a replacement holder's lease"),
             # The one relationship that keeps a real request inside the life of
@@ -196,8 +238,10 @@ def tier2_first_run_profile() -> dict[str, Any]:
             "sdk_automatic_retries": 0,
             "provider_request_timeout_seconds": QuotaConfig().request_deadline_seconds,
             "provider_lease_ttl_seconds": QuotaConfig().lease_ttl_seconds,
-            "provider_lease_heartbeat_interval_seconds":
-                QuotaConfig().heartbeat_interval_seconds,
+            "provider_lease_ownership_probe_interval_seconds":
+                QuotaConfig().ownership_probe_interval_seconds,
+            "provider_lease_reclaim_horizon_seconds":
+                QuotaConfig().reclaim_horizon_seconds,
             "max_run_duration_seconds": 1800,
             "worker_lease_seconds": 300,
             "worker_heartbeat_interval_seconds": 30,

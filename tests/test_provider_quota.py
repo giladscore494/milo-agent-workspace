@@ -161,16 +161,27 @@ def test_a_released_lease_frees_capacity_and_a_second_release_is_a_no_op():
     assert coordinator.try_acquire_inference() is not None
 
 
-def test_a_stale_lease_expires_and_is_recovered_by_someone_else():
-    """A crashed worker must not hold organization capacity forever."""
+def test_a_stale_lease_is_recovered_only_at_the_crash_recovery_horizon():
+    """A crashed worker must not hold capacity forever -- nor lose it early.
+
+    The horizon is derived from the worker process lifetime, so it is the one
+    moment at which an unreleased lease can be reclaimed without the risk that
+    the process holding it is still alive with its request in flight.
+    """
     backend = MemoryQuotaBackend()
     clock = Clock()
-    crashed = build({"max_concurrency": 1, "lease_ttl_seconds": 30}, backend=backend, clock=clock)
-    replacement = build({"max_concurrency": 1, "lease_ttl_seconds": 30}, backend=backend, clock=clock)
+    limits = {"max_concurrency": 1, "lease_ttl_seconds": 30,
+              "worker_max_lifetime_seconds": 40}
+    crashed = build(limits, backend=backend, clock=clock)
+    replacement = build(limits, backend=backend, clock=clock)
+    horizon = crashed.config.reclaim_horizon_seconds      # 40 + 10
 
     crashed.try_acquire_inference()               # and then the process dies
     assert replacement.try_acquire_inference() is None
-    clock.advance(31)
+    clock.advance(31)                             # past the nominal window
+    assert replacement.try_acquire_inference() is None, (
+        "the slot was reclaimed on a request timescale")
+    clock.advance(horizon - 31 + 1)
     assert replacement.try_acquire_inference() is not None
 
 
@@ -184,11 +195,13 @@ def test_an_expired_lease_can_never_release_its_replacements_lease():
     """
     backend = MemoryQuotaBackend()
     clock = Clock()
-    crashed = build({"max_concurrency": 1, "lease_ttl_seconds": 30}, backend=backend, clock=clock)
-    replacement = build({"max_concurrency": 1, "lease_ttl_seconds": 30}, backend=backend, clock=clock)
+    limits = {"max_concurrency": 1, "lease_ttl_seconds": 30,
+              "worker_max_lifetime_seconds": 40}
+    crashed = build(limits, backend=backend, clock=clock)
+    replacement = build(limits, backend=backend, clock=clock)
 
     stale = crashed.try_acquire_inference()
-    clock.advance(31)
+    clock.advance(crashed.config.reclaim_horizon_seconds + 1)
     fresh = replacement.try_acquire_inference()
     assert fresh is not None
 
@@ -198,20 +211,29 @@ def test_an_expired_lease_can_never_release_its_replacements_lease():
     assert fresh.release() is True
 
 
-def test_a_heartbeat_keeps_a_live_lease_but_cannot_resurrect_an_expired_one():
+def test_the_ownership_probe_reports_but_never_extends():
+    """It answers "is this still mine", and that is all it can do.
+
+    A probe that could extend a lease would be able to push a slot past the
+    life of the process holding it, so a wedged worker would leak capacity
+    permanently. The lease therefore ends at the horizon it was stamped with,
+    however many times it is probed.
+    """
     backend = MemoryQuotaBackend()
     clock = Clock()
-    coordinator = build({"max_concurrency": 1, "lease_ttl_seconds": 30},
+    coordinator = build({"max_concurrency": 1, "lease_ttl_seconds": 30,
+                         "worker_max_lifetime_seconds": 40},
                         backend=backend, clock=clock)
+    horizon = coordinator.config.reclaim_horizon_seconds      # 50
     lease = coordinator.try_acquire_inference()
 
-    clock.advance(20)
-    assert lease.heartbeat() is True
-    clock.advance(20)                              # would have expired without it
+    for _ in range(5):
+        clock.advance(8)
+        assert lease.verify_ownership() is True
     assert coordinator.try_acquire_inference() is None
 
-    clock.advance(31)                              # now it really has expired
-    assert lease.heartbeat() is False
+    clock.advance(horizon - 40 + 1)                # past the original horizon
+    assert lease.verify_ownership() is False, "probing extended the lease"
     assert coordinator.try_acquire_inference() is not None
 
 

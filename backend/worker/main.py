@@ -253,8 +253,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # and replicas drawing on it. Fails closed in production when
                 # the shared store is unconfigured: an unmetered fallback there
                 # would let each execution admit a full ceiling of its own.
-                # The client deadline comes from the SAME configuration that
-                # validated it against the lease TTL, so the timeout a request
+                # The client deadline comes from the SAME validated
+                # configuration that owns the permits, so the timeout a request
                 # actually gets and the permit it runs under can never be
                 # resolved from two different places.
                 provider_coordinator = resolve_coordinator(
@@ -270,7 +270,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 repo.mark_run_failed(run_id, code, message, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
                 return 0 if workflow_key == "swarm_v2" else 1
 
-        # Resolved once, from the coordinator that owns the lease TTL.
+        # Resolved once, from the coordinator that owns the permits.
         provider_request_deadline = (provider_coordinator.config.request_deadline_seconds
                                      if provider_coordinator is not None else None)
 

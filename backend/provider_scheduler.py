@@ -106,6 +106,82 @@ def classify_provider_error(exc: Any) -> str | None:
     return None
 
 
+#: httpx failures that happen BEFORE a request is on the wire. For these,
+#: and only these, "it failed" really does prove "it is not running".
+_NEVER_SENT = ("ConnectError", "ConnectTimeout", "PoolTimeout",
+               "UnsupportedProtocol", "InvalidURL", "ProxyError")
+
+
+def _failed_before_the_request_was_sent(exc: BaseException) -> bool:
+    """Walk the cause chain: the OpenAI SDK wraps transport errors."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ in _NEVER_SENT:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def request_completion_is_proven(exc: BaseException | None) -> tuple[bool, str]:
+    """Can MILO PROVE the request that held a permit is no longer running?
+
+    This is the question the organization concurrency ceiling actually turns
+    on, and it is not the same as "did MILO stop waiting". A permit may be
+    returned to the shared pool only on a YES, so the default here is NO: an
+    outcome this function does not recognise holds the slot rather than
+    freeing it.
+
+    YES has a small, closed set of sources, and each is a positive proof
+    rather than an inference:
+
+    * the call RETURNED. The response was read to completion, so the exchange
+      is over.
+    * the exception carries a response with a status code. The provider
+      produced a complete HTTP response -- 400, 429, 500 alike -- so the
+      exchange is over whatever the status says. (This is what keeps ordinary
+      backpressure fast: a 429 releases immediately and the retry proceeds.)
+    * the failure happened before anything was sent -- a connect timeout, a
+      refused connection, an unusable URL. Nothing was ever started.
+    * the exception carries ``provider_request_completed``, set by code that
+      knows which side of the request it ran on.
+    * :func:`classify_provider_error` recognises it as a Kimi failure class.
+      Those are things the provider SAID, so it answered.
+
+    Everything else is NO. Most importantly
+    :class:`~backend.provider_transport.ProviderRequestDeadlineExceeded` and
+    read timeouts: those mean MILO stopped waiting, and nothing in the httpx
+    or OpenAI contract turns that into the provider stopping work.
+    """
+    if exc is None:
+        return True, ""
+    # An explicit statement from code that KNOWS, because it sits on one side
+    # of the request or the other: `backend.budget` marks a budget refusal
+    # raised before the request was sent, or after the response was read.
+    declared = getattr(exc, "provider_request_completed", None)
+    if declared is not None:
+        return bool(declared), "" if declared else "PROVIDER_REQUEST_OUTCOME_DECLARED_UNKNOWN"
+    status = (getattr(exc, "status_code", None)
+              or getattr(getattr(exc, "response", None), "status_code", None))
+    if status is not None:
+        return True, ""
+    # Checked BEFORE the classifier below, so a deadline can never be talked
+    # into looking like a provider response by the text of its message.
+    if type(exc).__name__ == "ProviderRequestDeadlineExceeded":
+        return False, "PROVIDER_REQUEST_DEADLINE_EXCEEDED"
+    if classify_provider_error(exc) is not None:
+        # A recognised Kimi failure class -- rate limited, overloaded, out of
+        # quota. Each is something the PROVIDER said, so it answered and the
+        # exchange is over. This also keeps the classifier and the settlement
+        # rule from disagreeing: an error the scheduler is willing to retry as
+        # backpressure must be one whose slot it is willing to give back.
+        return True, ""
+    if _failed_before_the_request_was_sent(exc):
+        return True, ""
+    return False, "PROVIDER_REQUEST_OUTCOME_UNKNOWN"
+
+
 def rate_limit_headers(exc: Any) -> dict[str, int]:
     """Read the numeric X-RateLimit-* values a 429 may publish.
 
@@ -298,8 +374,15 @@ _WAIT_CHUNK_SECONDS = 1.0
 _SLOT_POLL_SECONDS = 0.05
 
 
-class _LeaseWatchdog:
-    """Handle for one request's renewal loop, and whether it is still healthy."""
+class _OwnershipProbe:
+    """Handle for one request's read-only ownership probe.
+
+    Renamed from a renewal watchdog because it no longer renews anything. A
+    lease is stamped to the crash-recovery horizon when it is acquired, so
+    re-stamping it would push a slot past the life of the process holding it.
+    All this does is notice, and say, when MILO can no longer show it owns a
+    permit it is using.
+    """
 
     def __init__(self) -> None:
         self.done = threading.Event()
@@ -309,7 +392,12 @@ class _LeaseWatchdog:
 
     @property
     def ownership_proven(self) -> bool:
-        """False once MILO can no longer show it holds this permit."""
+        """False once MILO can no longer show it holds this permit.
+
+        Nothing in the concurrency invariant reads this. It is observability:
+        the safety argument holds if this probe never runs, fails every time,
+        or never manages to start its thread.
+        """
         return self.lost_reason is None
 
     def mark_lost(self, reason: str) -> None:
@@ -466,6 +554,11 @@ class ProviderScheduler:
         concurrency it is not using -- that is how a few waiting callers would
         otherwise deadlock every other engine out of the account.
 
+        Both releases below are PRE-REQUEST: the lease is given up before
+        anything is sent, so completion is proven and returning the slot at
+        once is correct. Settlement on proof (``lease.settle``) governs only
+        the path where a request has actually been issued.
+
         Bounded and cancellable like every other wait here.
         """
         cfg = self.config
@@ -498,53 +591,52 @@ class ProviderScheduler:
             self._wait(delay)
             waited += delay
 
-    def _start_lease_watchdog(self, lease: Any, agent: str, phase: str) -> "_LeaseWatchdog | None":
-        """Renew ``lease`` for as long as its request runs, and say so if it stops.
+    def _start_ownership_probe(self, lease: Any, agent: str,
+                               phase: str) -> "_OwnershipProbe | None":
+        """Watch whether ``lease`` is still recorded as ours, and say if not.
 
-        Renewal is defence in depth, NOT the safety mechanism: the request
-        deadline is already a whole safety margin shorter than the lease TTL,
-        so a permit outlives its request even if this thread never beats once
-        (see the invariant in ``backend.provider_quota``). What this adds is
-        cover for the one case a read timeout does not strictly bound -- a
-        provider trickling bytes -- and, just as importantly, VISIBILITY.
+        PURELY OBSERVABILITY. It renews nothing, and the concurrency invariant
+        does not reference it: a lease is held to the crash-recovery horizon
+        from the moment it is acquired, and only a PROVEN-FINISHED request
+        shortens that. So this may never run, fail on every pass, or fail to
+        start its thread, and the ceiling still holds.
 
-        Losing renewal used to be silent twice over: a ``False`` return ended
-        the loop with no record, and an exception from the shared store killed
-        the daemon thread outright. Both now stop the loop deliberately, mark
-        ownership as unproven and emit a bounded diagnostic, because "MILO can
-        no longer prove it owns this permit" is exactly the condition an
-        operator needs to see.
+        What it buys is that losing ownership is not silent. It used to be
+        silent twice over: a ``False`` return ended the loop with no record,
+        and an exception from the shared store killed the daemon thread
+        outright. Both now stop the loop deliberately, mark ownership as
+        unproven and emit a bounded diagnostic.
         """
         if lease is None:
             return None
         config = getattr(getattr(lease, "coordinator", None), "config", None)
-        interval = getattr(config, "heartbeat_interval_seconds", None)
+        interval = getattr(config, "ownership_probe_interval_seconds", None)
         if not interval:
             interval = max(1.0, getattr(config, "lease_ttl_seconds", 120.0) / 4.0)
-        watchdog = _LeaseWatchdog()
+        probe = _OwnershipProbe()
 
-        def beat() -> None:
-            while not watchdog.done.wait(interval):
+        def watch() -> None:
+            while not probe.done.wait(interval):
                 try:
-                    renewed = lease.heartbeat()
+                    still_ours = lease.verify_ownership()
                 except BaseException:  # noqa: BLE001 - reported, never re-raised
                     # The shared store is unreachable, or refused. Re-raising
                     # here would only kill this daemon thread, which is what
                     # used to make the loss invisible.
-                    watchdog.mark_lost("PROVIDER_LEASE_HEARTBEAT_FAILED")
+                    probe.mark_lost("PROVIDER_LEASE_PROBE_FAILED")
                     return
-                if not renewed:
-                    # The coordinator says this permit is no longer ours.
+                if not still_ours:
+                    # The coordinator no longer records this permit as ours.
                     # Re-acquiring here would quietly take a SECOND permit for
                     # one request, so the loop ends and the loss is recorded.
-                    watchdog.mark_lost("PROVIDER_LEASE_OWNERSHIP_LOST")
+                    probe.mark_lost("PROVIDER_LEASE_OWNERSHIP_LOST")
                     return
 
-        watchdog.on_lost = lambda reason: self._report_lease_loss(reason, agent, phase)
-        watchdog.thread = threading.Thread(target=beat, name="provider-lease-heartbeat",
-                                           daemon=True)
-        watchdog.thread.start()
-        return watchdog
+        probe.on_lost = lambda reason: self._report_lease_loss(reason, agent, phase)
+        probe.thread = threading.Thread(target=watch, name="provider-lease-probe",
+                                        daemon=True)
+        probe.thread.start()
+        return probe
 
     def _report_lease_loss(self, reason: str, agent: str, phase: str) -> None:
         """Announce lost permit ownership with a static code and nothing else.
@@ -594,30 +686,39 @@ class ProviderScheduler:
             # small; local queueing is not allowed inside it.
             waited_total += self._acquire_slot(waited_total, agent, phase)
             lease = None
-            watchdog = None
+            probe = None
+            # Default to NOT proven. Every path out of the call below either
+            # establishes proof or leaves this alone, so an outcome nobody
+            # thought about holds the slot instead of freeing it.
+            proven_finished = False
+            settle_reason = "PROVIDER_REQUEST_OUTCOME_UNKNOWN"
             try:
                 if self._coordinator is not None:
                     lease, waited = self._acquire_global(
                         max(1, int(admission_tokens)), waited_total, agent, phase)
                     waited_total += waited
-                # Renew the permit for as long as THIS request runs. Defence in
-                # depth only: the request deadline is already a safety margin
-                # shorter than the lease TTL, so the permit outlives the request
-                # even if this never beats (see backend.provider_quota).
-                #
-                # Started inside the same guard as the acquisition: spawning a
-                # thread can fail, and a permit stranded because its renewal
-                # thread could not start would be the same capacity leak by a
+                # Observability only -- it renews nothing (see
+                # _start_ownership_probe). Still started inside the same guard
+                # as the acquisition: a thread spawn can fail, and a permit
+                # stranded because of that would be a capacity leak by a
                 # different route.
-                watchdog = self._start_lease_watchdog(lease, agent, phase)
+                probe = self._start_ownership_probe(lease, agent, phase)
             except BaseException:
+                # Nothing was sent: acquiring a permit is the step before the
+                # request, so completion IS proven here, and releasing is
+                # correct rather than merely convenient.
                 if lease is not None:
                     lease.release()
                 self._slots.release()
                 raise
             try:
-                return call()
-            except Exception as exc:  # noqa: BLE001 - classified below; others re-raise
+                result = call()
+            except BaseException as exc:  # noqa: BLE001 - classified below; others re-raise
+                proven_finished, settle_reason = request_completion_is_proven(exc)
+                if not isinstance(exc, Exception):
+                    # KeyboardInterrupt / SystemExit: not ours to classify, and
+                    # the settlement above has already been decided.
+                    raise
                 kind = classify_provider_error(exc)
                 if kind == EXCEEDED_CURRENT_QUOTA:
                     # Not transient. Retrying cannot create quota, so this fails
@@ -650,16 +751,26 @@ class ProviderScheduler:
                         waited_seconds=round(waited_total, 3),
                         last_error=exc,
                     ) from exc
+            else:
+                proven_finished, settle_reason = True, ""
+                return result
             finally:
-                if watchdog is not None:
-                    watchdog.stop()
+                if probe is not None:
+                    probe.stop()
                 self._slots.release()
-                # Deterministic release on EVERY path -- success, provider
-                # failure, backpressure exhaustion, quota refusal and
-                # cancellation -- keyed by this acquisition's unique lease id,
-                # so it can never free a replacement holder's slot.
+                # Deterministic SETTLEMENT on every path -- success, provider
+                # failure, backpressure exhaustion, quota refusal, cancellation
+                # -- keyed by this acquisition's unique lease id, so it can
+                # never free a replacement holder's slot.
+                #
+                # Settlement is not release. The shared permit goes back only
+                # when this request is PROVEN over; when it is not, the slot
+                # stays held to the crash-recovery horizon. The local slot
+                # above is a different thing and is always released: it bounds
+                # this process's own threads, not organization concurrency.
                 if lease is not None:
-                    lease.release()
+                    lease.settle(proven_finished=proven_finished,
+                                 reason=settle_reason)
             # Only reached when a rate-limited attempt will be retried: wait
             # (Retry-After or backoff+jitter) and re-enter capacity scheduling.
             # The retry re-enters _acquire_global, so EVERY provider attempt is

@@ -1,4 +1,4 @@
-"""The permit/request invariant, proven against the REAL transport.
+"""How long ONE provider request may keep a MILO thread, proven for real.
 
 Review of PR #102 established two things, and both were correct:
 
@@ -6,15 +6,20 @@ Review of PR #102 established two things, and both were correct:
    of a request. A response that keeps producing bytes never trips it. On
    loopback, a server emitting one chunk every 0.2s ran for **30.1s** under a
    1.5s read timeout, and stopped only because the SERVER gave up.
-2. The previous race regression proved nothing about that, because its
+2. The race regression of the time proved nothing about that, because its
    simulated provider imposed its own wall-clock deadline -- it baked in the
    property it was supposed to demonstrate.
 
 So these tests use a real ``httpx`` client, a real loopback HTTP server that
 continuously produces chunks past the nominal deadline, and the real
-``backend.provider_transport``. Concurrency is measured **server-side**: the
-number of requests actually being served at once is the ground truth, not
-anything the client believes.
+``backend.provider_transport``.
+
+SCOPE. What is proven here is a LIVENESS property: MILO stops waiting by a
+known time. A later review established that this is not the organization
+concurrency property and must not be mistaken for it -- a fired deadline says
+nothing about whether the PROVIDER stopped. That property, and its negative
+control, live in ``test_provider_concurrency_ownership.py``, measured
+server-side against a provider that keeps working after its client leaves.
 
 Nothing here leaves the loopback interface and no provider is called.
 """
@@ -28,8 +33,7 @@ import time
 import pytest
 
 from backend.provider_quota import (MemoryQuotaBackend, ProviderQuotaCoordinator,
-                                    ProviderQuotaUnavailable, QuotaConfig,
-                                    default_request_deadline)
+                                    QuotaConfig, default_request_deadline)
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.provider_transport import (ProviderRequestDeadlineExceeded,
                                         build_deadline_http_client)
@@ -226,150 +230,24 @@ def test_a_deadline_exceeded_is_not_mistaken_for_provider_backpressure():
 
 
 # =============================================================================
-# 2. the two-coordinator heartbeat-loss race, over the real transport
+# 3. what a fired deadline settles, and what it deliberately does not
 # =============================================================================
 
-def coordinators(kind):
-    """Two 'processes' over ONE shared store, with A's heartbeat sabotaged."""
-    backend = MemoryQuotaBackend()
-    config = QuotaConfig(max_concurrency=1, lease_ttl_seconds=TTL)
+def test_a_deadline_frees_the_local_slot_but_keeps_the_shared_permit(trickle):
+    """Two resources, two rules, and the difference is the correction.
 
-    class WorkerA(ProviderQuotaCoordinator):
-        def heartbeat_inference(self, lease_id):
-            if kind == "returns_false":
-                return False
-            if kind == "raises":
-                raise ProviderQuotaUnavailable()
-            return super().heartbeat_inference(lease_id)
-
-    return WorkerA(backend, config), ProviderQuotaCoordinator(backend, config)
-
-
-def scheduler_for(coordinator):
-    return ProviderScheduler(
-        ProviderLimitsConfig(max_concurrency=1, rpm_limit=None, tpm_limit=None,
-                             max_backpressure_wait_seconds=30.0),
-        coordinator=coordinator)
-
-
-class ClientSideConcurrency:
-    """How many requests MILO itself has outstanding, at once.
-
-    This is the quantity MILO can actually guarantee. Whether a provider keeps
-    computing after its client disconnects is outside any client's control and
-    is why the organization ceiling is 80% of the provider's rather than 100%.
+    The process-local slot bounds THIS process's threads; the thread is gone,
+    so it goes back. The organization permit stands for a request whose state
+    is now unknown -- the provider may still be working -- so it is held to
+    the crash-recovery horizon instead of being handed to someone else.
     """
-
-    def __init__(self):
-        self.peak = 0
-        self._active = 0
-        self._lock = threading.Lock()
-
-    def __enter__(self):
-        with self._lock:
-            self._active += 1
-            self.peak = max(self.peak, self._active)
-        return self
-
-    def __exit__(self, *exc):
-        with self._lock:
-            self._active -= 1
-
-
-def run_race(server, client_factory, kind):
-    """A holds a real request; B tries to enter while A is being served."""
-    worker_a, worker_b = coordinators(kind)
-    sched_a, sched_b = scheduler_for(worker_a), scheduler_for(worker_b)
-    errors: dict[str, BaseException] = {}
-    a_inside = threading.Event()
-    milo_side = ClientSideConcurrency()
-
-    def worker(label, scheduler, event=None):
-        def call():
-            if event is not None:
-                event.set()
-            with milo_side, client_factory() as client:
-                return client.post(server.url, json={})
-        try:
-            scheduler.execute(call, estimated_tokens=10, reserved_tokens=10)
-        except BaseException as exc:  # noqa: BLE001 - recorded, asserted by caller
-            errors[label] = exc
-
-    def worker_b_thread():
-        # Only attempt once A is genuinely being served, so the result cannot
-        # depend on which thread won the permit first.
-        if not a_inside.wait(timeout=10.0):
-            errors["b"] = AssertionError("worker A never reached the server")
-            return
-        worker("b", sched_b)
-
-    threads = [threading.Thread(target=worker, args=("a", sched_a, a_inside)),
-               threading.Thread(target=worker_b_thread)]
-    [t.start() for t in threads]
-    [t.join(timeout=40) for t in threads]
-    assert not any(t.is_alive() for t in threads), "a worker never finished"
-    return errors, milo_side
-
-
-@pytest.mark.parametrize("kind", ["returns_false", "raises"])
-def test_lost_ownership_cannot_produce_two_real_concurrent_requests(trickle, kind):
-    """The HIGH from review, closed against the real mechanism.
-
-    Worker A's permit renewal fails -- the coordinator disowns it, or the
-    shared store is unreachable -- while A has a genuinely long-running
-    request open. Worker B is waiting to enter under a ceiling of ONE.
-    """
-    errors, milo_side = run_race(
-        trickle, lambda: build_deadline_http_client(DEADLINE), kind)
-
-    assert trickle.served >= 1
-    # What MILO owns, and the assertion that matters: never two of its own
-    # requests outstanding at once, under a ceiling of one.
-    assert milo_side.peak == 1, (
-        f"MILO had {milo_side.peak} requests outstanding under a ceiling of 1")
-    # And at the other end, no SUSTAINED overlap -- only the few milliseconds
-    # between MILO closing its connection and the server noticing. Whether a
-    # provider keeps computing after a client disconnects is outside any
-    # client's control, which is why the ceiling is 80% and not 100%.
-    assert trickle.overlap_seconds < 0.5, (
-        f"two requests were served together for {trickle.overlap_seconds:.3f}s, "
-        "which is sustained overlap rather than a teardown tail")
-    assert isinstance(errors.get("a"), ProviderRequestDeadlineExceeded), errors
-
-
-@pytest.mark.parametrize("kind", ["returns_false", "raises"])
-def test_the_race_harness_detects_the_unbounded_client(trickle, kind):
-    """Guard against a test that would pass however the client behaved.
-
-    The only change is the client: an ordinary one with the same numeric
-    timeout, which is what PR #102 shipped. Under it the harness MUST observe
-    two requests being served at once -- if it cannot see the failure, it
-    cannot be trusted to certify its absence.
-    """
-    import httpx
-
-    _errors, milo_side = run_race(
-        trickle,
-        lambda: httpx.Client(timeout=httpx.Timeout(DEADLINE, connect=DEADLINE)),
-        kind)
-
-    assert milo_side.peak == 2, (
-        "MILO did not even hold two requests open, so the harness is not "
-        "exercising the failure it is meant to detect")
-    assert trickle.overlap_seconds > 1.0, (
-        f"only {trickle.overlap_seconds:.3f}s of overlap was observed under the "
-        "known-bad client, so this harness cannot certify its absence either")
-
-
-# =============================================================================
-# 3. the permit is still released cleanly when the deadline fires
-# =============================================================================
-
-def test_a_deadline_releases_both_the_permit_and_the_local_slot(trickle):
     backend = MemoryQuotaBackend()
     coordinator = ProviderQuotaCoordinator(
         backend, QuotaConfig(max_concurrency=1, lease_ttl_seconds=TTL))
-    scheduler = scheduler_for(coordinator)
+    scheduler = ProviderScheduler(
+        ProviderLimitsConfig(max_concurrency=1, rpm_limit=None, tpm_limit=None,
+                             max_backpressure_wait_seconds=30.0),
+        coordinator=coordinator)
 
     def call():
         with build_deadline_http_client(DEADLINE) as client:
@@ -378,9 +256,9 @@ def test_a_deadline_releases_both_the_permit_and_the_local_slot(trickle):
     with pytest.raises(ProviderRequestDeadlineExceeded):
         scheduler.execute(call, estimated_tokens=10, reserved_tokens=10)
 
-    lease = coordinator.try_acquire_inference()
-    assert lease is not None, "the permit leaked after a deadline"
-    lease.release()
+    assert coordinator.try_acquire_inference() is None, (
+        "a fired deadline handed the organization permit to the next caller, "
+        "although it proves only that MILO stopped waiting")
     assert scheduler._slots.acquire(blocking=False), "the local slot leaked"
     scheduler._slots.release()
 

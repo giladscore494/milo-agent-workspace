@@ -3,9 +3,15 @@
 Why this exists
 ---------------
 
-The organization concurrency permit is only worth holding if the request it
-admits cannot outlive it, so the safety argument needs a real ceiling on how
-long ONE request can run. An httpx timeout is not that ceiling.
+A worker that waits forever makes no progress, so there has to be a real
+ceiling on how long ONE request can keep a MILO thread. An httpx timeout is
+not that ceiling.
+
+What this is NOT is the organization-concurrency mechanism. Read the next
+section carefully before relying on it for that: a fired deadline says MILO
+stopped waiting, and says nothing about whether the provider stopped working.
+``backend.provider_quota`` therefore treats a fired deadline as an UNPROVEN
+outcome and keeps holding the permit, rather than returning it.
 
 ``httpx.Timeout(read=...)`` bounds the wait for *a chunk of data*, not the
 duration of the request. A response that keeps producing bytes faster than the
@@ -30,11 +36,16 @@ What it does NOT claim
 
 * It does not cancel the request **provider-side**. Nothing in the httpx or
   OpenAI contract offers that, and a server may keep computing after a client
-  disconnects. MILO's ceiling is 80% of the provider's precisely so that
-  effects it cannot observe have headroom.
+  disconnects. This is the reason a fired deadline is not treated as proof of
+  completion: the request's real state at that moment is UNKNOWN, and
+  ``InferenceLease.quarantine`` keeps the slot rather than reusing it.
 * It does not cancel from another thread. The deadline is enforced by the
   thread performing the request, on its own next read -- which is why it needs
-  no cross-thread cancellation primitive to be correct.
+  no cross-thread cancellation primitive to be correct. Equally, wrapping the
+  call in ``future.result(timeout=)``, ``ThreadPoolExecutor``,
+  ``thread.join(timeout=)`` or ``asyncio.wait_for`` would NOT add anything
+  here: those return control to MILO while the socket and the provider-side
+  work continue, and returning control is not termination.
 
 How the two phases are covered
 ------------------------------
@@ -60,6 +71,11 @@ class ProviderRequestDeadlineExceeded(Exception):
 
     Deliberately NOT a rate-limit signal: the scheduler must not absorb it as
     backpressure and retry it as though the provider had asked us to wait.
+
+    And deliberately NOT proof that the request is over. It means MILO gave
+    up waiting; the provider may still be working.
+    ``provider_scheduler.request_completion_is_proven`` classifies it as
+    unproven, so the organization concurrency slot stays held.
     """
 
     def __init__(self, deadline_seconds: float, elapsed_seconds: float):
