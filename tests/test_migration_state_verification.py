@@ -4,7 +4,7 @@ The defect this file exists to prevent: `check-migration-state.sh` used to
 classify a remote database from a hard-coded list of object markers covering
 only migrations `001`–`015`. Every migration added since is timestamped, so a
 database carrying all fifteen numeric markers was reported `fully-migrated`
-even when nine real migrations had never been applied. The production
+even when ten real migrations had never been applied. The production
 database is exactly that shape, which means the tool's green answer was the
 most dangerous possible answer: it said "nothing to apply" about a database
 missing a third of its schema.
@@ -63,7 +63,7 @@ PRODUCTION_APPLIED = [
     "20260823000100",
 ]
 
-# The nine local migrations production has never applied.
+# The ten local migrations production has never applied.
 PRODUCTION_PENDING = [
     "20260828000100",
     "20260828000200",
@@ -74,6 +74,7 @@ PRODUCTION_PENDING = [
     "20260915180000",
     "20260916090000",
     "20260916120000",
+    "20260920000100",
 ]
 
 
@@ -162,11 +163,11 @@ def test_production_history_is_partially_migrated_and_never_fully_migrated(local
     assert report["blocked"] is False
 
 
-def test_production_history_reports_exactly_the_nine_pending_migrations(local):
+def test_production_history_reports_exactly_the_ten_pending_migrations(local):
     report = classify(local, observation(applied=PRODUCTION_APPLIED))
 
     assert [entry["version"] for entry in report["missing"]] == PRODUCTION_PENDING
-    assert report["missing_count"] == 9
+    assert report["missing_count"] == len(PRODUCTION_PENDING) == 10
     # Every pending migration is reported by FILE too, so the operator can
     # apply the tail without reconstructing filenames from versions.
     assert [entry["file"] for entry in report["missing"]] == [
@@ -181,14 +182,14 @@ def test_production_history_is_not_fully_migrated_even_with_every_numeric_marker
     """The exact false green this redesign removes.
 
     All fifteen 001–015 markers present, every one of their objects really
-    there — and nine timestamped migrations absent. The old marker-only
+    there — and ten timestamped migrations absent. The old marker-only
     comparison answered `fully-migrated` here.
     """
     numeric_markers = {version: True for version in MARKERS if len(version) == 3}
     report = classify(local, observation(applied=PRODUCTION_APPLIED, markers=numeric_markers))
 
     assert report["state"] == "partially-migrated"
-    assert report["missing_count"] == 9
+    assert report["missing_count"] == len(PRODUCTION_PENDING) == 10
 
 
 def test_complete_local_history_is_fully_migrated(local):
@@ -480,13 +481,13 @@ def test_shell_reports_production_history_as_partially_migrated(tmp_path):
     assert result.returncode == 0
 
 
-def test_shell_names_every_one_of_the_nine_pending_migrations(tmp_path):
+def test_shell_names_every_one_of_the_ten_pending_migrations(tmp_path):
     result, _ = remote_run(tmp_path, PRODUCTION_APPLIED)
 
     missing_line = next(line for line in result.stdout.splitlines() if "remote:missing" in line)
     for version in PRODUCTION_PENDING:
         assert version in missing_line, f"{version} not reported as pending"
-    assert "9 local migration(s) not present" in missing_line
+    assert f"{len(PRODUCTION_PENDING)} local migration(s) not present" in missing_line
 
 
 def test_shell_reports_complete_history_as_fully_migrated(tmp_path, local):

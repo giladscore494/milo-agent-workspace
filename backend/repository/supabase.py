@@ -28,6 +28,8 @@ class Repository(Protocol):
     def count_active_runs_for_user(self, user_id: UUID) -> int: ...
     def count_active_runs_for_project(self, project_id: UUID) -> int: ...
     def update_run_usage(self, run_id: UUID, usage: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def record_run_usage(self, run_id: UUID, ledger: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def get_run_usage_ledger(self, run_id: UUID) -> dict[str, Any] | None: ...
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -300,6 +302,29 @@ class SupabaseRepository:
         if not rows:
             raise NotFoundError("run", str(run_id))
         return rows[0]
+
+    def record_run_usage(self, run_id: UUID, ledger: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Record the run's cumulative ExecutionUsageLedger (migration
+        20260920000100). The database MERGES component-wise (no accepted
+        write can lower a counter), advances `version` only on a real change,
+        verifies the lease under the database clock and projects the public
+        aggregate into `runs.usage` in the same transaction. Returns the
+        durable row: `ledger` (with its `ledger_version`) and `version`."""
+        row = self._guarded_rpc("record_run_usage_guarded", {
+            "p_run_id": str(run_id),
+            "p_worker_id": worker_id,
+            "p_attempt": attempt,
+            "p_lease_token": lease_token,
+            "p_ledger": ledger,
+        }, "run_execution_usage")
+        return row
+
+    def get_run_usage_ledger(self, run_id: UUID) -> dict[str, Any] | None:
+        """The durable ledger row of a run, or None before its first write."""
+        rows = self._many(
+            self.client.table("run_execution_usage").select("*").eq("run_id", str(run_id)).limit(1)
+        )
+        return rows[0] if rows else None
 
     LEDGER_FIELDS = (
         "run_id", "project_id", "user_id", "provider", "model", "call_seq", "decision",

@@ -1602,6 +1602,8 @@ def _guarded_calls(run_id: str, worker: str, attempt: str, token: str) -> dict[s
         "agent_message": f"select id from public.create_agent_message_guarded({lease}, '{{\"message_type\": \"progress\", \"sender\": \"a\", \"recipient\": \"supervisor\"}}'::jsonb)",
         "supervisor_decision": f"select id from public.create_supervisor_decision_guarded({lease}, '{{\"assessment\": \"ok\", \"rationale_summary\": \"r\"}}'::jsonb)",
         "reserve": f"select status from public.reserve_model_call_budget_guarded('{run_id}', {attempt}00, null, null, 0.01, null, null, '{worker}', {attempt}, '{token}')",
+        "usage_ledger": f"select version from public.record_run_usage_guarded({lease}, '{{\"model_calls\": 1, \"provider_attempts\": 1}}'::jsonb)",
+        "usage_snapshot": f"select id from public.update_run_usage_guarded({lease}, '{{\"model_calls\": 1}}'::jsonb)",
     }
 
 
@@ -6391,3 +6393,179 @@ def test_code3_the_canonical_view_is_security_invoker_and_grants_nothing_extra(p
                    "where relname='catalog_canonical_variant_current'") == "t"
     assert db.psql("select count(*) from information_schema.role_table_grants where "
                    "table_name='catalog_canonical_variant_current' and grantee='anon'") == "0"
+
+
+# --- migration 20260920000100 (execution usage ledger) ---------------------
+#
+# The ExecutionUsageLedger invariants, executed against real PostgreSQL:
+# component-wise monotonic merge, a versioned and idempotent lease-guarded
+# write, the public projection into runs.usage, monotonic legacy writers, the
+# storage-level trigger, and service-path-only ACLs.
+
+def _ledger(**values) -> str:
+    return json.dumps(values)
+
+
+def _ledger_worker(db, worker: str):
+    run_id = _seed_stale_worker_run(db)
+    attempt, token = db.psql(
+        f"select attempt, lease_token from public.claim_run_lease('{run_id}', '{worker}', 300)"
+    ).split("|")
+    return run_id, f"'{run_id}', '{worker}', {attempt}, '{token}'", attempt, token
+
+
+def test_merge_execution_usage_is_a_component_wise_maximum(db):
+    merged = json.loads(db.psql(
+        "select public.merge_execution_usage("
+        "'{\"model_calls\": 5, \"input_tokens\": 10, \"output_tokens\": 1, \"actual_cost\": 0.5, \"retries\": 0}'::jsonb, "
+        "'{\"model_calls\": 2, \"input_tokens\": 3, \"output_tokens\": 9, \"actual_cost\": 0.9, \"retries\": 3, \"tool_calls\": 4}'::jsonb)"
+    ))
+    assert merged["model_calls"] == 5 and merged["input_tokens"] == 10 and merged["output_tokens"] == 9
+    assert float(merged["actual_cost"]) == 0.9 and merged["retries"] == 3 and merged["tool_calls"] == 4
+    assert merged["total_tokens"] == 19                       # derived, never maximised alone
+    # Order-independent and idempotent.
+    reverse = json.loads(db.psql(
+        "select public.merge_execution_usage("
+        "'{\"model_calls\": 2, \"input_tokens\": 3, \"output_tokens\": 9, \"actual_cost\": 0.9, \"retries\": 3, \"tool_calls\": 4}'::jsonb, "
+        "'{\"model_calls\": 5, \"input_tokens\": 10, \"output_tokens\": 1, \"actual_cost\": 0.5, \"retries\": 0}'::jsonb)"
+    ))
+    assert reverse == merged
+    again = json.loads(db.psql(
+        f"select public.merge_execution_usage('{json.dumps(merged)}'::jsonb, '{json.dumps(merged)}'::jsonb)"))
+    assert again == merged
+    # Null and empty contribute nothing; a negative value is refused.
+    assert json.loads(db.psql("select public.merge_execution_usage(null, '{}'::jsonb)")) == {}
+    with pytest.raises(AssertionError, match="USAGE_LEDGER_INVALID"):
+        db.psql("select public.merge_execution_usage('{}'::jsonb, '{\"model_calls\": -1}'::jsonb)")
+
+
+def test_record_run_usage_guarded_is_versioned_idempotent_and_never_lowers(db):
+    run_id, lease, attempt, token = _ledger_worker(db, "worker-LEDGER")
+    first = _ledger(model_calls=3, provider_attempts=3, input_tokens=30, output_tokens=5,
+                    actual_cost=0.3, tool_calls=2, replans=1, elapsed_seconds=4.5)
+    v1 = db.psql(f"select version from public.record_run_usage_guarded({lease}, '{first}'::jsonb)")
+    assert v1 == "1"
+    # An identical replay advances nothing.
+    assert db.psql(f"select version from public.record_run_usage_guarded({lease}, '{first}'::jsonb)") == "1"
+    # A record that is BEHIND on every dimension but one merges monotonically:
+    # only the advanced dimension moves, and the version moves exactly once.
+    behind = _ledger(model_calls=1, provider_attempts=1, input_tokens=2, output_tokens=0,
+                     actual_cost=0.01, tool_calls=2, replans=0, elapsed_seconds=1.0, tasks_failed=1)
+    row = db.psql(f"select version, ledger from public.record_run_usage_guarded({lease}, '{behind}'::jsonb)")
+    version, ledger = row.split("|", 1)
+    ledger = json.loads(ledger)
+    assert version == "2"
+    assert (ledger["model_calls"], ledger["input_tokens"], ledger["tool_calls"], ledger["replans"]) == (3, 30, 2, 1)
+    assert float(ledger["actual_cost"]) == 0.3 and float(ledger["elapsed_seconds"]) == 4.5
+    assert ledger["tasks_failed"] == 1 and ledger["total_tokens"] == 35
+    assert ledger["ledger_version"] == 2 and ledger["schema_version"] == 1
+    # The caller never owns the sequence number.
+    forged = _ledger(model_calls=3, ledger_version=99)
+    assert json.loads(db.psql(
+        f"select ledger from public.record_run_usage_guarded({lease}, '{forged}'::jsonb)"))["ledger_version"] == 2
+    # runs.usage carries EXACTLY the public projection, merged, never a
+    # ledger-only key.
+    usage = json.loads(db.psql(f"select usage from public.runs where id='{run_id}'"))
+    assert set(usage) == {"model_calls", "input_tokens", "output_tokens", "total_tokens",
+                          "estimated_cost", "actual_cost", "retries",
+                          "provider_backpressure_events", "agent_steps", "elapsed_seconds"} & set(usage)
+    assert usage["model_calls"] == 3 and usage["total_tokens"] == 35
+    assert "tool_calls" not in usage and "ledger_version" not in usage
+    assert db.psql(f"select attempt, worker_id from public.run_execution_usage where run_id='{run_id}'") == f"{attempt}|worker-LEDGER"
+
+
+def test_a_stale_worker_cannot_write_the_ledger_and_the_replacement_continues_it(db):
+    run_id, lease_a, attempt_a, token_a = _ledger_worker(db, "worker-LA")
+    db.psql(f"select public.record_run_usage_guarded({lease_a}, '{_ledger(model_calls=4, tool_calls=1)}'::jsonb)")
+    before = db.psql(f"select version, ledger from public.run_execution_usage where run_id='{run_id}'")
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+    attempt_b, token_b = db.psql(
+        f"select attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-LB', 300)").split("|")
+    assert int(attempt_b) == int(attempt_a) + 1
+    for stale in (_ledger(model_calls=99), _ledger(model_calls=0)):
+        with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+            db.psql(f"select public.record_run_usage_guarded({lease_a}, '{stale}'::jsonb)")
+    assert db.psql(f"select version, ledger from public.run_execution_usage where run_id='{run_id}'") == before
+    lease_b = f"'{run_id}', 'worker-LB', {attempt_b}, '{token_b}'"
+    row = db.psql(f"select version, attempt, ledger->>'model_calls' from public.record_run_usage_guarded({lease_b}, '{_ledger(model_calls=5)}'::jsonb)")
+    assert row == f"2|{attempt_b}|5"
+    assert db.psql(f"select ledger->>'tool_calls' from public.run_execution_usage where run_id='{run_id}'") == "1"
+
+
+def _ledger_migration():
+    return next(m for m in MIGRATIONS if "execution_usage_ledger" in m.name)
+
+
+def test_reapplying_the_corrective_migration_out_of_order_needs_the_ledger_migration_again(db):
+    """`20260810000600` (re)defines `update_run_usage_guarded` and
+    `transition_run_worker_guarded` with their old OVERWRITE bodies, and this
+    module proves that migration rerun-safe. Migrations are applied strictly
+    in sequence (`MIGRATIONS.md`), so the shipped end state is the monotonic
+    one -- but an operator who re-runs `000600` AFTER `20260920000100` would
+    quietly get the overwrite back. That hazard is stated here, and so is its
+    remedy: `20260920000100` is rerun-safe and must be re-applied last."""
+    corrective = next(m for m in MIGRATIONS if "corrective_lease_and_attempt_hardening" in m.name)
+    run_id, lease, _, _ = _ledger_worker(db, "worker-ORDER")
+    db.psql(file=corrective)
+    db.psql(f"select public.update_run_usage_guarded({lease}, '{_ledger(model_calls=6)}'::jsonb)")
+    db.psql(f"select public.update_run_usage_guarded({lease}, '{_ledger(model_calls=2)}'::jsonb)")
+    assert db.psql(f"select usage->>'model_calls' from public.runs where id='{run_id}'") == "2"   # reverted
+    db.psql(file=_ledger_migration())
+    db.psql(f"select public.update_run_usage_guarded({lease}, '{_ledger(model_calls=1)}'::jsonb)")
+    assert db.psql(f"select usage->>'model_calls' from public.runs where id='{run_id}'") == "2"   # monotonic again
+
+
+def test_legacy_usage_writers_are_monotonic_too(db):
+    # Order-independent within this module: the test above deliberately
+    # reverts the writers and restores them; this one states the shipped end
+    # state, so it re-applies the (rerun-safe) ledger migration first.
+    db.psql(file=_ledger_migration())
+    run_id, lease, attempt, token = _ledger_worker(db, "worker-MONO")
+    db.psql(f"select public.update_run_usage_guarded({lease}, '{_ledger(model_calls=6, input_tokens=60, output_tokens=0, actual_cost=0.6)}'::jsonb)")
+    db.psql(f"select public.update_run_usage_guarded({lease}, '{_ledger(model_calls=2, input_tokens=5, output_tokens=7, actual_cost=0.1)}'::jsonb)")
+    usage = json.loads(db.psql(f"select usage from public.runs where id='{run_id}'"))
+    assert (usage["model_calls"], usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]) == (6, 60, 7, 67)
+    assert float(usage["actual_cost"]) == 0.6
+    db.psql(f"select public.transition_run_worker_guarded('{run_id}', 'running', 'starting', 'worker-MONO', {attempt}, '{token}')")
+    db.psql(
+        f"select public.transition_run_worker_guarded('{run_id}', 'budget_exhausted', 'running', 'worker-MONO', {attempt}, '{token}', "
+        f"null, '{{\"code\": \"MODEL_CALL_LIMIT_REACHED\"}}'::jsonb, false, '{_ledger(model_calls=1, actual_cost=0.05)}'::jsonb, null, now())")
+    usage = json.loads(db.psql(f"select usage from public.runs where id='{run_id}'"))
+    assert usage["model_calls"] == 6 and float(usage["actual_cost"]) == 0.6
+    assert db.psql(f"select status from public.runs where id='{run_id}'") == "budget_exhausted"
+
+
+def test_the_ledger_row_refuses_any_direct_update_that_lowers_a_counter(db):
+    run_id, lease, _, _ = _ledger_worker(db, "worker-TRIG")
+    db.psql(f"select public.record_run_usage_guarded({lease}, '{_ledger(model_calls=3, actual_cost=0.3)}'::jsonb)")
+    with pytest.raises(AssertionError, match="USAGE_LEDGER_NOT_MONOTONIC"):
+        db.psql(f"update public.run_execution_usage set ledger = ledger || '{{\"model_calls\": 2}}'::jsonb, version = version + 1 where run_id='{run_id}'")
+    with pytest.raises(AssertionError, match="USAGE_LEDGER_NOT_MONOTONIC"):
+        db.psql(f"update public.run_execution_usage set ledger = ledger - 'actual_cost', version = version + 1 where run_id='{run_id}'")
+    with pytest.raises(AssertionError, match="USAGE_LEDGER_NOT_MONOTONIC"):
+        db.psql(f"update public.run_execution_usage set ledger = ledger || '{{\"model_calls\": 4}}'::jsonb where run_id='{run_id}'")
+    with pytest.raises(AssertionError, match="USAGE_LEDGER_NOT_MONOTONIC"):
+        db.psql(f"update public.run_execution_usage set version = 0 where run_id='{run_id}'")
+    assert db.psql(f"select version, ledger->>'model_calls' from public.run_execution_usage where run_id='{run_id}'") == "1|3"
+
+
+def test_execution_usage_ledger_is_service_path_only_and_rerun_safe(db):
+    for signature in [
+        "public.merge_execution_usage(jsonb, jsonb)",
+        "public.execution_usage_public_projection(jsonb)",
+        "public.record_run_usage_guarded(uuid, text, integer, text, jsonb)",
+        "public.update_run_usage_guarded(uuid, text, integer, text, jsonb)",
+        "public.transition_run_worker_guarded(uuid, text, text, text, integer, text, jsonb, jsonb, boolean, jsonb, timestamptz, timestamptz)",
+    ]:
+        assert not _has_execute(db, "anon", signature), signature
+        assert not _has_execute(db, "authenticated", signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+    assert db.psql(
+        "select relrowsecurity from pg_class where oid = 'public.run_execution_usage'::regclass") == "t"
+    assert db.psql("select count(*) from pg_policies where tablename = 'run_execution_usage'") == "0"
+    for role in ("anon", "authenticated"):
+        assert db.psql(f"select has_table_privilege('{role}', 'public.run_execution_usage', 'select')") == "f"
+    db.psql(file=_ledger_migration())
+    db.psql(file=_ledger_migration())
+    assert db.psql("select count(*) from pg_proc where proname='record_run_usage_guarded'") == "1"
+    assert db.psql("select count(*) from pg_trigger where tgname='run_execution_usage_monotonic'") == "1"
