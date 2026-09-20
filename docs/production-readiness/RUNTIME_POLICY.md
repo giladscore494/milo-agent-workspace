@@ -122,14 +122,33 @@ fail closed:
    constant**, changed in a reviewed commit exactly like an image digest. Every
    selector refuses unless the checkout's policy digest matches it, so a
    drifted checkout cannot even print a pin. CI fails if the two diverge.
-2. `release_binding_problems()` proves the checkout **is** the accepted
-   release: `HEAD` equals `STAGE_D_RELEASE_SHA` and the policy source is
-   unmodified. `verify_caps.py` and both step scripts run it before any run is
-   created. Being unable to prove it — no git metadata, a shallow clone, an
-   unreadable tree — is a refusal, never a pass.
+2. `release_binding_problems()` proves `backend/runtime_policy.py` **is
+   byte-for-byte the file at `STAGE_D_RELEASE_SHA`** — and, because the
+   checkout's digest must also equal the pin, that the reviewed pin is
+   provably a statement about that release's policy. `verify_caps.py`, both
+   step scripts and both enable paths run it before anything is mutated or a
+   run is created. Being unable to prove it — no git metadata, a shallow clone
+   lacking the commit, a release without the policy source, an unreadable
+   file — is a refusal, never a pass.
 
-With `STAGE_D_RELEASE_SHA` still naming the pre-policy release, Stage D now
-**refuses**, which is the correct executable form of the supersession
+**The checkout does not have to BE the release.** An earlier revision required
+`HEAD == STAGE_D_RELEASE_SHA`, which made re-authorization impossible: the
+reviewed commit that updates the pin to a new release R cannot itself be R. A
+later authorization or runbook commit may reference R freely, as long as it
+does not change the policy — and if it does, that is a new release, which is
+exactly what the refusal says.
+
+The chain, end to end:
+
+```
+this toolkit's policy  ==(bytes)==  policy at R
+R  ==(verify_images.py)==  accepted image digests
+accepted digests  ==(verify_caps.py)==  the images the run will execute
+```
+
+With `STAGE_D_RELEASE_SHA` still naming the pre-policy release — a commit that
+does not contain `backend/runtime_policy.py` at all — Stage D now **refuses**,
+which is the correct executable form of the supersession
 `STAGE_D_AUTHORIZATION.md` already documents in prose.
 
 The number of new paid worker executions Stage D will accept is the policy's

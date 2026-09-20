@@ -45,12 +45,17 @@ THE CANONICAL POLICY IS THE AUTHORITY — AND IT IS BOUND TO THE RELEASE
 Before any of the comparisons below, this module proves that the policy it is
 about to verify against actually comes from the accepted release: the
 checkout's policy digest must equal the literal reviewed fingerprint pinned in
-policy_envelope.py, and the checkout must BE the commit STAGE_D_RELEASE_SHA
-names, with the policy source unmodified. Without that, generating and
-verifying the envelope from the same local checkout would only ever prove the
-checkout agrees with itself, while the run executes separately pinned release
-IMAGES that may carry a different policy entirely. Being unable to prove the
-binding — no git metadata, a shallow clone, an unreadable tree — is a refusal.
+policy_envelope.py, and backend/runtime_policy.py must be byte-for-byte the
+file at STAGE_D_RELEASE_SHA. Without that, generating and verifying the
+envelope from the same local checkout would only ever prove the checkout
+agrees with itself, while the run executes separately pinned release IMAGES
+that may carry a different policy entirely.
+
+It is deliberately a statement about the policy CONTENT, not about which
+commit is checked out: a reviewed authorization commit must be able to
+reference release R without being R. Being unable to prove the binding — no
+git metadata, a shallow clone lacking the commit, a release without the policy
+source, an unreadable file — is a refusal.
 
 
 This module no longer trusts the strings it is handed. Every expected value
@@ -288,10 +293,10 @@ def main() -> int:
             "one disagree; failing closed")
 
     # THE RELEASE BINDING. Everything else here compares the deployment against
-    # a policy read from THIS CHECKOUT; this is what proves the checkout IS the
-    # accepted release, so that policy is the one the pinned images enforce.
-    # Without it, generating and verifying the envelope from one checkout only
-    # proves the checkout agrees with itself.
+    # a policy read from THIS CHECKOUT; this is what proves that policy is
+    # byte-for-byte the one at the accepted release, and therefore the one the
+    # pinned images enforce. Without it, generating and verifying the envelope
+    # from one checkout only proves the checkout agrees with itself.
     problems.extend(release_binding_problems(os.environ.get("STAGE_D_RELEASE_SHA")))
 
     registry = os.environ.get("STAGE_D_REGISTRY", "")

@@ -321,6 +321,8 @@ stage_d_pin STAGE_D_AUTHORIZED_EXECUTION_INCREMENT "$(stage_d_policy execution-i
 # print when it matches the reviewed fingerprint pinned there as a literal --
 # the same kind of reviewed constant as the accepted image digests. So this
 # value cannot be produced at all by a checkout whose policy has drifted, and
-# verify_caps.py additionally proves the checkout IS the accepted release
-# before any run is created.
+# verify_caps.py additionally proves that policy is byte-for-byte the one at
+# STAGE_D_RELEASE_SHA before any run is created. The checkout does NOT have
+# to be the release commit: a reviewed authorization commit references a
+# release without being it.
 stage_d_pin STAGE_D_POLICY_FINGERPRINT "$(stage_d_policy fingerprint)"

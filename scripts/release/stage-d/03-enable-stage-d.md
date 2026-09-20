@@ -28,11 +28,13 @@ source scripts/release/stage-d/stage-d-env.sh   # generates STAGE_D_CAPS, STAGE_
                                                 # STAGE_D_WORKER_ENGINE_LIMITS from backend/runtime_policy.py
 
 # REQUIRED FIRST. The envelope below is generated from THIS CHECKOUT, while
-# the run executes separately pinned release images. This proves the checkout
-# IS the accepted release with the policy source unmodified, so the caps you
-# are about to apply are the ones those images enforce. It refuses — and you
-# must stop — if the checkout is any other commit, if the policy source is
-# modified, or if the binding cannot be proven at all.
+# the run executes separately pinned release images. This proves
+# backend/runtime_policy.py here is byte-for-byte the file at
+# STAGE_D_RELEASE_SHA, so the caps you are about to apply are the ones those
+# images enforce. Your checkout does NOT have to be the release commit — a
+# reviewed authorization commit may reference release R without being R — but
+# it must not change the policy: that needs a new release. It refuses, and you
+# must stop, if the policy differs or the binding cannot be proven at all.
 (cd scripts/release/stage-d && python3 ./policy_envelope.py binding)
 
 gcloud run jobs update milo-agent-worker \

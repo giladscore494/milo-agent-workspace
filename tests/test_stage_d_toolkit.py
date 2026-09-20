@@ -49,10 +49,13 @@ STAGE_D = REPO / "scripts" / "release" / "stage-d"
 STAGE_C = REPO / "scripts" / "release" / "stage-c"
 
 RELEASE_SHA = "84cd8696119c24662a954d0f0e23195268dab23f"
-# The commit this checkout is actually at. verify_caps.py now REFUSES unless
-# the checkout is the accepted release, so an operator running Stage D has
-# STAGE_D_RELEASE_SHA == their HEAD. These tests reproduce that posture rather
-# than pretending a checkout can verify an envelope it did not generate.
+# The commit this checkout is actually at. verify_caps.py REFUSES unless
+# backend/runtime_policy.py here is byte-for-byte the file at
+# STAGE_D_RELEASE_SHA; HEAD is simply the most convenient commit that
+# satisfies that, since the working tree is committed in CI. It is NOT a
+# requirement that the checkout BE the release --
+# `test_a_later_authorization_commit_may_reference_an_earlier_release` proves
+# the opposite, which is what makes re-authorization possible at all.
 CHECKOUT_SHA = subprocess.run(
     ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
     capture_output=True, text=True, timeout=60).stdout.strip()
@@ -144,6 +147,12 @@ def load_module(name: str, path: Path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def git_sha(rev: str) -> str:
+    """Resolve a revision in THIS repository to a full 40-character SHA."""
+    return subprocess.run(["git", "-C", str(REPO), "rev-parse", rev],
+                          capture_output=True, text=True, timeout=60).stdout.strip()
 
 
 def parse_pairs(raw: str) -> dict[str, str]:
@@ -691,18 +700,31 @@ def test_verify_caps_requires_the_worker_secret_binding(tmp_path):
 
 # --- the release binding: the policy Stage D verifies must BE the release ---
 
-def test_verify_caps_refuses_a_checkout_that_is_not_the_accepted_release(tmp_path):
+def test_verify_caps_refuses_a_release_whose_policy_is_not_this_one(tmp_path):
     """CHECKOUT-POLICY DRIFT — the whole reason the binding exists.
 
     Generating the envelope from the local checkout and verifying against the
     same local checkout only ever proves the checkout agrees with itself. The
     run executes separately pinned release IMAGES, which may carry a different
-    policy entirely, so Stage D refuses unless the checkout IS the release.
+    policy entirely, so Stage D refuses unless the policy here is byte-for-byte
+    the policy at the accepted release. `447b421…` is a real commit on this
+    branch whose runtime policy differs (it still carried `applies_to` and an
+    `engine` field in the document).
     """
-    result = run_verify_caps(tmp_path, worker_spec(release_sha=RELEASE_SHA),
-                             api_spec(release_sha=RELEASE_SHA), release_sha=RELEASE_SHA)
+    older_policy = git_sha("447b421")
+    result = run_verify_caps(tmp_path, worker_spec(release_sha=older_policy),
+                             api_spec(release_sha=older_policy), release_sha=older_policy)
     assert result.returncode != 0
-    assert "is not the policy the accepted images enforce" in result.stdout
+    assert "is not byte-for-byte the policy at the accepted release" in result.stdout
+
+
+def test_verify_caps_refuses_a_release_that_predates_the_policy(tmp_path):
+    """The currently pinned Stage D release is exactly this case."""
+    base = git_sha("a42e73bfefa24ca2603e9b5aa09d5cde732c93d2")
+    result = run_verify_caps(tmp_path, worker_spec(release_sha=base),
+                             api_spec(release_sha=base), release_sha=base)
+    assert result.returncode != 0
+    assert "does not contain backend/runtime_policy.py" in result.stdout
 
 
 @pytest.mark.parametrize("bad_sha", ["", "not-a-sha", "84cd8696", "z" * 40])
@@ -711,6 +733,12 @@ def test_verify_caps_refuses_an_unprovable_release_sha(tmp_path, bad_sha):
     result = run_verify_caps(tmp_path, worker_spec(), api_spec(), release_sha=bad_sha)
     assert result.returncode != 0
     assert "not a full 40-character commit SHA" in result.stdout
+
+
+def test_verify_caps_refuses_a_release_commit_this_checkout_cannot_read(tmp_path):
+    result = run_verify_caps(tmp_path, worker_spec(), api_spec(), release_sha="f" * 40)
+    assert result.returncode != 0
+    assert "is not a commit this checkout can read" in result.stdout
 
 
 def test_the_pinned_policy_fingerprint_is_the_checkouts_policy():
@@ -743,37 +771,141 @@ def test_the_binding_refuses_when_it_cannot_read_the_checkout(monkeypatch):
     sys.path.insert(0, str(STAGE_D))
     import policy_envelope
 
-    monkeypatch.setattr(policy_envelope, "_git", lambda *a: None)
+    monkeypatch.setattr(policy_envelope, "_git", lambda *a, **k: None)
     problems = policy_envelope.release_binding_problems(CHECKOUT_SHA)
-    assert any("could not be read" in problem for problem in problems)
+    assert any("is not a commit this checkout can read" in problem
+               for problem in problems)
 
 
-def test_the_binding_refuses_a_modified_policy_source(monkeypatch):
+def test_the_binding_refuses_a_policy_imported_from_outside_the_checkout(monkeypatch):
+    """The bytes compared must be the bytes in use."""
     sys.path.insert(0, str(STAGE_D))
     import policy_envelope
 
-    def fake_git(*args):
-        if args[0] == "status":
-            return " M backend/runtime_policy.py"
-        return CHECKOUT_SHA
-
-    monkeypatch.setattr(policy_envelope, "_git", fake_git)
+    monkeypatch.setattr(policy_envelope, "_imported_policy_source",
+                        lambda: Path("/somewhere/else/runtime_policy.py"))
     problems = policy_envelope.release_binding_problems(CHECKOUT_SHA)
-    assert any("modified in this working tree" in problem for problem in problems)
+    assert any("imported from outside this checkout" in problem for problem in problems)
 
 
-def test_the_binding_accepts_this_checkout_at_its_own_head():
-    """A committed checkout verifying against its own HEAD is the accept path.
+def test_the_binding_accepts_this_checkout_against_its_own_head():
+    """A committed checkout verifying against its own HEAD is one accept path.
 
     This fails on a working tree with uncommitted changes to
-    `backend/runtime_policy.py`, and that is the point: an envelope may only
-    be generated from committed, reviewed code. Commit the policy change and
-    it passes; CI always runs against a clean checkout.
+    `backend/runtime_policy.py`, and that is the point: the envelope may only
+    be generated from a policy that is identical to a released one. CI always
+    runs against a clean checkout.
     """
     sys.path.insert(0, str(STAGE_D))
     import policy_envelope
 
     assert policy_envelope.release_binding_problems(CHECKOUT_SHA) == []
+
+
+# --- re-authorization: a later commit may reference an earlier release ------
+
+def build_release_repo(tmp_path, *, change_policy_after=False):
+    """A miniature repo with release R, then a LATER authorization commit.
+
+    Deterministic and independent of this repository's own history: R carries
+    the real policy source, and the commit after it edits a runbook — exactly
+    the shape of a reviewed authorization commit that pins R.
+    """
+    root = tmp_path / "release-repo"
+    (root / "backend").mkdir(parents=True)
+    (root / "scripts" / "release" / "stage-d").mkdir(parents=True)
+
+    def run(*args):
+        subprocess.run(("git", "-C", str(root), *args), check=True,
+                       capture_output=True, timeout=60)
+
+    subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=60)
+    run("config", "user.email", "release@invalid")
+    run("config", "user.name", "Release")
+    policy = root / "backend" / "runtime_policy.py"
+    policy.write_bytes((REPO / "backend" / "runtime_policy.py").read_bytes())
+    (root / "scripts" / "release" / "stage-d" / "03-enable-stage-d.md").write_text("# v1\n")
+    run("add", "-A")
+    run("commit", "-qm", "release R")
+    release_sha = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, timeout=60).stdout.strip()
+
+    # The later, reviewed authorization commit. It references R; it is not R.
+    (root / "scripts" / "release" / "stage-d" / "03-enable-stage-d.md").write_text(
+        "# v2 — pins release R\n")
+    if change_policy_after:
+        policy.write_bytes(policy.read_bytes() + b"\n# an authorization commit changed the policy\n")
+    run("add", "-A")
+    run("commit", "-qm", "authorize release R")
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, timeout=60).stdout.strip()
+    assert head != release_sha
+    return root, release_sha
+
+
+def test_a_later_authorization_commit_may_reference_an_earlier_release(tmp_path):
+    """THE re-authorization property.
+
+    Requiring HEAD == STAGE_D_RELEASE_SHA made the binding self-referential:
+    the reviewed commit that updates the pin to release R cannot itself be R,
+    so no authorization commit could ever satisfy its own pin. What has to
+    hold is that the POLICY is the released one, and it does here.
+    """
+    sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    root, release_sha = build_release_repo(tmp_path)
+    assert policy_envelope.release_binding_problems(release_sha, repo_root=root) == []
+
+
+def test_an_authorization_commit_that_changes_the_policy_is_refused(tmp_path):
+    """Changing the policy needs a new release, not a new authorization."""
+    sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    root, release_sha = build_release_repo(tmp_path, change_policy_after=True)
+    problems = policy_envelope.release_binding_problems(release_sha, repo_root=root)
+    assert any("is not byte-for-byte the policy at the accepted release" in problem
+               for problem in problems)
+    assert any("requires a new reviewed release" in problem for problem in problems)
+
+
+def test_an_earlier_real_commit_with_the_same_policy_is_accepted():
+    """The same property over this repository's OWN history.
+
+    The sandbox test proves the rule; this proves it holds for a real
+    ancestor, which is what an authorization commit pinning the previous
+    release actually looks like. Skipped only when the policy was changed in
+    HEAD itself, in which case no ancestor can carry identical bytes.
+    """
+    sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    current = (REPO / "backend" / "runtime_policy.py").read_bytes()
+    ancestors = subprocess.run(
+        ["git", "-C", str(REPO), "rev-list", "--max-count=25", "HEAD~1"],
+        capture_output=True, text=True, timeout=60).stdout.split()
+    match = next(
+        (sha for sha in ancestors
+         if subprocess.run(["git", "-C", str(REPO), "show", f"{sha}:backend/runtime_policy.py"],
+                           capture_output=True, timeout=60).stdout == current),
+        None)
+    if match is None:
+        pytest.skip("HEAD itself changed backend/runtime_policy.py; no ancestor carries it")
+    assert match != CHECKOUT_SHA
+    assert policy_envelope.release_binding_problems(match) == []
+
+
+def test_the_binding_never_asks_which_commit_is_checked_out():
+    """Stated over the parsed source, so prose cannot pass or fail it."""
+    import inspect
+
+    sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    source = inspect.getsource(policy_envelope.release_binding_problems)
+    assert "rev-parse" not in source or "HEAD" not in source
+    assert "HEAD" not in source, "the binding is back to comparing checkout HEAD"
 
 
 def test_the_step_scripts_gate_on_the_binding_before_creating_a_run():
@@ -1569,9 +1701,9 @@ def run_guarded_block(tmp_path, fail_at=None):
     mock, so the asserted end state is the one the real cleanup produced.
 
     `policy_envelope.py binding` is stubbed for the same reason as 01: it
-    proves the checkout IS the accepted release, and this sandbox is a partial
-    copy of the toolkit with no `backend/` tree and no git history, so it is
-    neither. That the block CONTAINS that gate before it mutates anything is
+    proves the policy here is the released one, and this sandbox is a partial
+    copy of the toolkit with no `backend/` tree and no git history, so it can
+    prove nothing. That the block CONTAINS that gate before it mutates anything is
     asserted directly by
     `test_the_enable_runbooks_gate_on_the_binding_before_applying_an_envelope`,
     and the gate's own accept/refuse behaviour by the binding tests above.

@@ -368,6 +368,24 @@ def test_the_reviewed_provider_envelope_is_one_the_runtime_accepts():
         ProviderLimitsConfig.from_env({"MILO_PROVIDER_RPM_LIMIT": "350"})
 
 
+def test_stage_d_binds_the_policy_by_content_not_by_checkout():
+    """Re-authorization must be possible: a reviewed commit that pins release
+    R cannot itself be R, so the binding is a statement about the policy
+    CONTENT at R, never about which commit is checked out."""
+    import inspect
+    import sys as _sys
+
+    _sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    source = inspect.getsource(policy_envelope.release_binding_problems)
+    assert "HEAD" not in source
+    assert policy_envelope.POLICY_SOURCE_PATH == "backend/runtime_policy.py"
+    # And it is the file the policy in use was really imported from.
+    assert policy_envelope._imported_policy_source() == (
+        REPO / "backend" / "runtime_policy.py").resolve()
+
+
 def test_the_first_run_profile_is_the_policy_rather_than_a_document_about_it():
     profile = tier2_first_run_profile()
     active = profile["active_profile"]
