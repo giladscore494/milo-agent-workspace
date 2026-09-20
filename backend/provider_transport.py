@@ -28,7 +28,8 @@ request starts, on every chunk the response yields.
 What it guarantees, exactly
 ---------------------------
 
-* No MILO thread is still awaiting this response after the deadline.
+* No MILO thread is still awaiting this response after the deadline, ONCE
+  the response headers have arrived.
 * The connection for it is closed rather than left to drain.
 
 What it does NOT claim
@@ -47,17 +48,38 @@ What it does NOT claim
   here: those return control to MILO while the socket and the provider-side
   work continue, and returning control is not termination.
 
-How the two phases are covered
-------------------------------
+How the two phases are covered, and how well
+--------------------------------------------
 
-1. **Waiting for response headers.** Genuinely silent: the provider sends
-   nothing while it computes. That is exactly the case an inactivity timeout
-   bounds correctly, so the client's ``read`` timeout covers it, and this
-   transport re-checks the clock the moment headers arrive.
-2. **Reading the body.** Not necessarily silent -- this is the trickle case --
-   so the stream wrapper below bounds it by elapsed time instead.
+1. **Reading the body.** Bounded by ELAPSED time. The stream wrapper below
+   checks the deadline before handing on each chunk, so a response that keeps
+   producing data cannot walk past the deadline one chunk at a time.
+2. **Waiting for response headers.** Bounded only by INACTIVITY -- the
+   client's ``read`` timeout -- because ``handle_request`` cannot return
+   before the headers are complete, so the elapsed check below runs after that
+   phase rather than during it.
 
-Together: total ≲ deadline, whatever the peer does.
+The honest statement is therefore narrower than "total <= deadline":
+
+    Once headers are in, the response is bounded by elapsed time. The header
+    phase is bounded by silence, not by duration.
+
+For the case this exists for that is enough: a provider computing an answer is
+genuinely silent, so ``read`` bounds it correctly. But a peer that trickles
+HEADER bytes evades it, and this was measured rather than assumed -- a server
+emitting one padding header every 0.05s against a 1.5s deadline held the
+caller for **6.16s**, and ``ProviderRequestDeadlineExceeded`` was raised only
+when the headers finally completed. See
+``test_a_trickled_header_phase_is_bounded_by_silence_not_by_elapsed_time``.
+
+So during the header phase the deadline DETECTS an overrun; it does not
+prevent one. That is a liveness limit -- a worker can block longer than the
+number says -- and deliberately not a concurrency one: nothing reclaims a held
+lease on a clock (see ``backend.provider_quota``), so a late detection cannot
+let a second worker in. Closing that gap properly would need a bound the
+transport does not have: httpx exposes no total-request deadline, and reaching
+across threads to close the socket is the cross-thread cancellation this
+module declines to claim.
 """
 
 from __future__ import annotations

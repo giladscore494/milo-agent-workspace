@@ -296,3 +296,94 @@ def test_the_deadline_client_carries_the_configured_deadline():
     with build_provider_http_client() as client:
         assert client.timeout.read == config.request_deadline_seconds
         assert client.timeout.connect <= client.timeout.read
+
+
+# =============================================================================
+# 4. what the deadline does NOT bound: a trickled header phase
+# =============================================================================
+
+def test_a_trickled_header_phase_is_bounded_by_silence_not_by_elapsed_time():
+    """The limit review found, pinned so the claim cannot drift back.
+
+    `handle_request` cannot return before the response headers are complete,
+    so the transport's elapsed check runs AFTER that phase rather than during
+    it. The header phase therefore has only the inactivity (`read`) timeout
+    guarding it -- and a peer that trickles HEADER bytes never trips that,
+    exactly as a peer trickling BODY bytes never tripped it (section 1).
+
+    The docstring used to say "total <= deadline, whatever the peer does".
+    This is the measurement that makes that false, and the reason it now says
+    something narrower: once headers are in, the response is bounded by
+    elapsed time; the header phase is bounded by silence.
+
+    It is a LIVENESS limit, not a concurrency one. Nothing reclaims a held
+    lease on a clock, so detecting the overrun late cannot let a second worker
+    in -- see `test_provider_concurrency_ownership.py`.
+    """
+    import socket
+
+    header_trickle = TRICKLE_SECONDS
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def serve():
+        try:
+            connection, _ = listener.accept()
+        except OSError:
+            return
+        try:
+            connection.recv(65536)
+            connection.sendall(b"HTTP/1.1 200 OK\r\n")
+            started = time.monotonic()
+            sent = 0
+            # One padding header at a time: never silent for long enough to
+            # trip `read`, and the header phase simply never ends.
+            while time.monotonic() - started < header_trickle:
+                connection.sendall(b"X-Pad-%d: 1\r\n" % sent)
+                sent += 1
+                time.sleep(CHUNK_INTERVAL)
+            connection.sendall(
+                b"Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+        except OSError:
+            pass
+        finally:
+            connection.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        started = time.monotonic()
+        with build_deadline_http_client(DEADLINE) as client:
+            with pytest.raises(Exception):  # noqa: B017 - any end; the timing is the point
+                client.post(f"http://127.0.0.1:{port}/v1/chat/completions", json={})
+        blocked = time.monotonic() - started
+    finally:
+        listener.close()
+        thread.join(timeout=10)
+
+    # The claim under test: the caller really is held well past the deadline.
+    assert blocked > DEADLINE * 2, (
+        f"the caller was released after {blocked:.2f}s against a {DEADLINE:g}s "
+        "deadline, so this server no longer defeats the header-phase bound and "
+        "the docstring's narrower claim would be understating the mechanism")
+    # ...and it ends when the headers do, rather than running forever.
+    assert blocked < header_trickle + 2.0, f"never terminated: {blocked:.2f}s"
+
+
+def test_the_transport_docstring_does_not_claim_an_absolute_total_bound():
+    """Three reviews have now caught an over-claim about bounding a request.
+
+    The wording is load-bearing: an operator reading "total <= deadline" would
+    size a worker's liveness expectations on a guarantee the transport does
+    not provide during the header phase.
+    """
+    from backend import provider_transport
+
+    doc = provider_transport.__doc__ or ""
+    assert "total ≲ deadline, whatever the peer does" not in doc
+    assert "bounded by silence, not by duration" in doc
+    assert "DETECTS an overrun; it does not" in doc

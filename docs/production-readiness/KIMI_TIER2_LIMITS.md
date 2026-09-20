@@ -420,16 +420,35 @@ gave up. The bound comes from `backend/provider_transport.py`, which fixes a
 deadline when the request starts and checks it on every chunk. Both client
 constructions are built on it (`http_client=`).
 
-| Phase | Behaviour | Bounded by |
-| --- | --- | --- |
-| waiting for response headers | genuinely silent while the provider computes | the `read` inactivity timeout — the case it *does* bound correctly |
-| reading the body | may trickle | the transport's total-elapsed check |
+| Phase | Behaviour | Bounded by | Strength |
+| --- | --- | --- | --- |
+| waiting for response headers | usually silent while the provider computes | the `read` **inactivity** timeout | bounded by *silence*, not by duration |
+| reading the body | may trickle | the transport's **total-elapsed** check | bounded by duration |
 
-**What it guarantees:** no MILO thread is still awaiting the response after the
-deadline, and the connection is closed rather than left to drain.
-**What it does not claim:** provider-side cancellation, or cancellation from
-another thread. That is precisely why a fired deadline **quarantines** the slot
-instead of releasing it, and part of why the ceiling is 80 % rather than 100 %.
+**What it guarantees:** once the response headers have arrived, no MILO thread
+is still awaiting the response after the deadline, and the connection is closed
+rather than left to drain.
+
+**What it does not claim:**
+
+* provider-side cancellation, or cancellation from another thread — which is
+  why a fired deadline **quarantines** the slot rather than releasing it, and
+  part of why the ceiling is 80 % rather than 100 %;
+* an absolute total bound during the **header phase**. `handle_request` cannot
+  return before the headers are complete, so the elapsed check runs after that
+  phase rather than during it, and only the inactivity timeout guards it. A
+  peer that trickles *header* bytes evades that exactly as one trickling
+  *body* bytes did — measured, one padding header every 0.05 s against a 1.5 s
+  deadline held the caller for **6.16 s**, with the exception raised only once
+  the headers completed.
+
+  During the header phase the deadline therefore **detects** an overrun rather
+  than preventing one. That is a **liveness** limit — a worker can block longer
+  than the number says — and deliberately not a concurrency one: nothing
+  reclaims a held lease on a clock, so a late detection cannot let a second
+  worker in. Closing it would need a bound the transport does not have (httpx
+  exposes no total-request deadline, and reaching across threads to close the
+  socket is the cross-thread cancellation this design declines to claim).
 
 ### Measured, server-side, against a provider that keeps working
 
