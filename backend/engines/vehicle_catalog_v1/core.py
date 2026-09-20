@@ -1126,14 +1126,30 @@ def technical_parallelism(env: Optional[Dict[str, str]] = None) -> int:
     number -- is what actually protects the account: whatever is set here is
     still admitted one organization slot at a time.
     """
-    raw = ((env or os.environ).get("MILO_V1_TECHNICAL_PARALLELISM") or "1").strip()
+    source = dict(os.environ if env is None else env)
+    raw = (source.get("MILO_V1_TECHNICAL_PARALLELISM") or "1").strip()
     try:
         value = int(raw)
     except ValueError:
         raise ValueError("MILO_V1_TECHNICAL_PARALLELISM must be an integer") from None
+    # This engine's own STRUCTURAL bound, checked before the policy and
+    # deliberately kept: 32 threads is the widest pool this phase is built to
+    # drive, whatever any envelope says. A local refusal stricter than the
+    # policy is always allowed; a local value wider than it is not.
     if not 1 <= value <= 32:
         raise ValueError("MILO_V1_TECHNICAL_PARALLELISM must be between 1 and 32")
-    return value
+    # The width this phase ACTUALLY runs at is the one the canonical runtime
+    # policy resolved, for both postures -- not a clamp applied here.
+    #
+    # Clamping unconditionally to the reviewed 4 was wrong in the unpaid
+    # posture: the policy RECORDS a wider unpaid value (an unpaid run cannot
+    # spend, so nothing is protected by narrowing it) and this function would
+    # then have run the phase at a width the policy did not describe. Now the
+    # policy decides: in the paid posture it refuses a wider deployment before
+    # any engine is built, and its resolved value never exceeds the reviewed 4.
+    from backend.runtime_policy import resolved_dimension
+
+    return int(resolved_dimension("v1_technical_parallelism", source))
 
 
 def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

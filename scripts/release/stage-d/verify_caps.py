@@ -34,9 +34,42 @@ Usage:
     gcloud run services describe <api> --format=json
 
 Env (all exported by stage-d-env.sh): STAGE_D_CAPS,
-STAGE_D_WORKER_PROVIDER_LIMITS, STAGE_D_REGISTRY, STAGE_D_RELEASE_SHA,
+STAGE_D_WORKER_PROVIDER_LIMITS, STAGE_D_WORKER_ENGINE_LIMITS,
+STAGE_D_POLICY_FINGERPRINT, STAGE_D_REGISTRY, STAGE_D_RELEASE_SHA,
 STAGE_D_API_IMAGE_DIGEST, STAGE_D_WORKER_IMAGE_DIGEST.
 Exit 0 only if every check passes.
+
+THE CANONICAL POLICY IS THE AUTHORITY — AND IT IS BOUND TO THE RELEASE
+----------------------------------------------------------------------
+
+Before any of the comparisons below, this module proves that the policy it is
+about to verify against actually comes from the accepted release: the
+checkout's policy digest must equal the literal reviewed fingerprint pinned in
+policy_envelope.py, and backend/runtime_policy.py must be byte-for-byte the
+file at STAGE_D_RELEASE_SHA. Without that, generating and verifying the
+envelope from the same local checkout would only ever prove the checkout
+agrees with itself, while the run executes separately pinned release IMAGES
+that may carry a different policy entirely.
+
+It is deliberately a statement about the policy CONTENT, not about which
+commit is checked out: a reviewed authorization commit must be able to
+reference release R without being R. Being unable to prove the binding — no
+git metadata, a shallow clone lacking the commit, a release without the policy
+source, an unreadable file — is a refusal.
+
+
+This module no longer trusts the strings it is handed. Every expected value
+is re-derived from `backend/runtime_policy.py` and compared against what
+stage-d-env.sh exported, so a hand edit to a pinned cap — or a stale
+transcription of one — fails the run instead of being verified against
+itself. That is the check that was missing when the toolkit pinned
+MILO_PROVIDER_RPM_LIMIT=350 against an organization ceiling of 80: the
+posture was internally consistent and the runtime would still have refused
+to start a worker under it.
+
+The policy also decides which VARIABLES exist, so the prefix sweeps below
+catch an unpinned policy variable rather than a name somebody remembered to
+add to a list.
 """
 
 from __future__ import annotations
@@ -45,33 +78,35 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from policy_envelope import (  # noqa: E402  (path bootstrap must run first)
+    CAP_ENV_PREFIXES, ENGINE_ENV_PREFIXES, PINNED_POLICY_FINGERPRINT, POLICY,
+    PROVIDER_ENV_PREFIXES, release_binding_problems)
+from policy_envelope import expected as policy_expected  # noqa: E402
 
 ENABLED = "true"  # expected value of a deliberately operator-enabled flag
 DISABLED = "false"
 
-# Every variable that participates in budget/cap enforcement. Any live env
-# key matching these prefixes must appear in STAGE_D_CAPS with the exact
+# The variable prefixes the canonical policy owns. Any live env key matching
+# one of them must appear in the matching pinned group with the exact
 # expected value — unknown extras are treated as tampering, not tolerated.
-CAP_PREFIXES = ("MILO_MAX_", "MILO_DAILY_", "MILO_ESTIMATED_COST")
-
+CAP_PREFIXES = CAP_ENV_PREFIXES
 # Provider scheduling configuration is WORKER-ONLY: every MILO_PROVIDER_*
 # variable on the Worker must appear in STAGE_D_WORKER_PROVIDER_LIMITS with
 # the exact pinned value, and none may exist on the API at all.
-PROVIDER_PREFIX = "MILO_PROVIDER_"
+PROVIDER_PREFIX = PROVIDER_ENV_PREFIXES
+# Engine parallelism is WORKER-ONLY for the same reason.
+ENGINE_PREFIX = ENGINE_ENV_PREFIXES
 
-# The exact seven settings of the pinned Stage D operating envelope (the
-# proven Attempt 7 envelope, deliberately below the operator-confirmed
-# Kimi Tier 2 ceiling). A STAGE_D_WORKER_PROVIDER_LIMITS missing any of
-# them fails closed.
-REQUIRED_PROVIDER_LIMIT_KEYS = (
-    "MILO_PROVIDER_MAX_CONCURRENCY",
-    "MILO_PROVIDER_RPM_LIMIT",
-    "MILO_PROVIDER_TPM_LIMIT",
-    "MILO_PROVIDER_MAX_RATE_LIMIT_RETRIES",
-    "MILO_PROVIDER_MAX_BACKPRESSURE_WAIT_SECONDS",
-    "MILO_PROVIDER_BACKOFF_BASE_SECONDS",
-    "MILO_PROVIDER_BACKOFF_MAX_SECONDS",
-)
+# DERIVED, never listed by hand: the policy decides which settings make up
+# the operating envelope, so a new dimension is pinned and verified by
+# existing here rather than by somebody remembering to add its name.
+REQUIRED_PROVIDER_LIMIT_KEYS = tuple(policy_expected("provider-limits"))
+REQUIRED_ENGINE_LIMIT_KEYS = tuple(policy_expected("engine-limits"))
+REQUIRED_CAP_KEYS = tuple(policy_expected("caps"))
 
 # Every provider-key alias the Worker accepts (see kill-switch.sh).
 PROVIDER_SECRET_ALIASES = ("KIMI_API_KEY", "MOONSHOT_API_KEY")
@@ -104,6 +139,36 @@ def expected_caps() -> dict[str, str]:
 
 def expected_provider_limits() -> dict[str, str]:
     return parse_pairs(os.environ.get("STAGE_D_WORKER_PROVIDER_LIMITS", ""))
+
+
+def expected_engine_limits() -> dict[str, str]:
+    return parse_pairs(os.environ.get("STAGE_D_WORKER_ENGINE_LIMITS", ""))
+
+
+def check_against_canonical_policy(group: str, variable: str,
+                                   pinned: dict[str, str], problems: list[str]) -> None:
+    """The pinned group must BE the canonical policy, value for value.
+
+    Verifying the live environment against a transcription only proves the
+    deployment matches the transcription. This proves the transcription
+    matches the runtime's own policy, which is the property Stage D actually
+    needs and the one that was missing.
+    """
+    canonical = policy_expected(group)
+    for key, value in canonical.items():
+        if key not in pinned:
+            problems.append(
+                f"{variable}: {key} is missing; the canonical runtime policy "
+                f"requires {key}={value}")
+        elif pinned[key] != value:
+            problems.append(
+                f"{variable}: {key}={pinned[key]!r} disagrees with the canonical "
+                f"runtime policy value {value!r} — the policy is the authority")
+    for key in sorted(set(pinned) - set(canonical)):
+        problems.append(
+            f"{variable}: {key} is pinned but is not a canonical runtime policy "
+            "variable — an envelope value that the runtime does not read cannot "
+            "be verified")
 
 
 def check_caps(surface: str, env: dict[str, str], caps: dict[str, str], problems: list[str]) -> None:
@@ -143,6 +208,30 @@ def check_provider_limits(worker_env: dict[str, str], worker_secrets: set[str], 
             problems.append(f"api: provider variable {key} must NEVER be set on the API service")
 
 
+def check_engine_limits(worker_env: dict[str, str], worker_secrets: set[str],
+                        api_env: dict[str, str], api_secrets: set[str],
+                        limits: dict[str, str], problems: list[str]) -> None:
+    """Engine parallelism, exact on the Worker and absent on the API.
+
+    Newly verified. MILO_SWARM_MAX_ACTIVE_WORKERS was never pinned by this
+    toolkit, and its code default of 4 is WIDER than the reviewed width of 2:
+    a paid Worker could have run a Swarm V2 plan at twice the authorized
+    queueing width with every Stage D check passing.
+    """
+    for key, value in limits.items():
+        actual = worker_env.get(key)
+        if actual is None:
+            problems.append(f"worker: engine limit {key} is MISSING (expected {value!r})")
+        elif actual != value:
+            problems.append(f"worker: engine limit {key}={actual!r} differs from pinned {value!r}")
+    for key in sorted(set(worker_env) | worker_secrets):
+        if key.startswith(ENGINE_PREFIX) and key not in limits:
+            problems.append(f"worker: unexpected engine variable {key} is not pinned in STAGE_D_WORKER_ENGINE_LIMITS")
+    for key in sorted(set(api_env) | api_secrets):
+        if key.startswith(ENGINE_PREFIX):
+            problems.append(f"api: engine variable {key} must NEVER be set on the API service")
+
+
 def check_provider_secret_posture(worker_env: dict[str, str], worker_secrets: set[str], api_env: dict[str, str], api_secrets: set[str], problems: list[str]) -> None:
     # Worker holds the provider key ONLY as a Secret Manager binding during
     # the enabled posture — never as a literal env value. The API holds it
@@ -168,6 +257,8 @@ def main() -> int:
     problems: list[str] = []
     if not caps:
         problems.append("STAGE_D_CAPS is empty — no expected cap values to verify against; failing closed")
+    else:
+        check_against_canonical_policy("caps", "STAGE_D_CAPS", caps, problems)
 
     provider_limits = expected_provider_limits()
     if not provider_limits:
@@ -176,6 +267,37 @@ def main() -> int:
         missing_limit_keys = [k for k in REQUIRED_PROVIDER_LIMIT_KEYS if k not in provider_limits]
         if missing_limit_keys:
             problems.append(f"STAGE_D_WORKER_PROVIDER_LIMITS is missing pinned setting(s) {missing_limit_keys} — failing closed")
+        check_against_canonical_policy("provider-limits", "STAGE_D_WORKER_PROVIDER_LIMITS",
+                                       provider_limits, problems)
+
+    engine_limits = expected_engine_limits()
+    if not engine_limits:
+        problems.append("STAGE_D_WORKER_ENGINE_LIMITS is empty — engine parallelism is part of the reviewed envelope; failing closed")
+    else:
+        missing_engine_keys = [k for k in REQUIRED_ENGINE_LIMIT_KEYS if k not in engine_limits]
+        if missing_engine_keys:
+            problems.append(f"STAGE_D_WORKER_ENGINE_LIMITS is missing pinned setting(s) {missing_engine_keys} — failing closed")
+        check_against_canonical_policy("engine-limits", "STAGE_D_WORKER_ENGINE_LIMITS",
+                                       engine_limits, problems)
+
+    # The whole policy document, by digest, against the LITERAL reviewed pin.
+    # Comparing it against the checkout's own fingerprint would only prove the
+    # checkout agrees with itself.
+    pinned_fingerprint = os.environ.get("STAGE_D_POLICY_FINGERPRINT", "").strip()
+    if not pinned_fingerprint:
+        problems.append("STAGE_D_POLICY_FINGERPRINT is not set — the release toolkit cannot prove it is verifying the runtime's own policy; failing closed")
+    elif pinned_fingerprint != PINNED_POLICY_FINGERPRINT:
+        problems.append(
+            "STAGE_D_POLICY_FINGERPRINT does not match the reviewed policy digest "
+            "pinned in policy_envelope.py — the pinned envelope and the reviewed "
+            "one disagree; failing closed")
+
+    # THE RELEASE BINDING. Everything else here compares the deployment against
+    # a policy read from THIS CHECKOUT; this is what proves that policy is
+    # byte-for-byte the one at the accepted release, and therefore the one the
+    # pinned images enforce. Without it, generating and verifying the envelope
+    # from one checkout only proves the checkout agrees with itself.
+    problems.extend(release_binding_problems(os.environ.get("STAGE_D_RELEASE_SHA")))
 
     registry = os.environ.get("STAGE_D_REGISTRY", "")
     release_sha = os.environ.get("STAGE_D_RELEASE_SHA", "")
@@ -225,6 +347,10 @@ def main() -> int:
     if provider_limits:
         check_provider_limits(worker_env, worker_secrets, api_env, api_secrets, provider_limits, problems)
 
+    # Engine parallelism: exact on the Worker, absent on the API.
+    if engine_limits:
+        check_engine_limits(worker_env, worker_secrets, api_env, api_secrets, engine_limits, problems)
+
     # Provider-secret posture: worker binding only, no literals anywhere,
     # nothing on the API.
     check_provider_secret_posture(worker_env, worker_secrets, api_env, api_secrets, problems)
@@ -261,7 +387,9 @@ def main() -> int:
         return 1
     print(
         f"OK: all {len(caps)} caps exact on worker+api, "
-        f"all {len(provider_limits)} provider limits exact on worker only, "
+        f"all {len(provider_limits)} provider limits and {len(engine_limits)} engine "
+        f"limits exact on worker only, canonical policy "
+        f"{POLICY.fingerprint()[:12]}… verified and bound to the accepted release, "
         f"release {release_sha[:12]}… referenced, flag posture correct"
     )
     return 0

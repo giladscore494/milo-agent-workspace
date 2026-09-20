@@ -5,7 +5,8 @@
 #   - exactly one new authorized run / one new worker execution over the
 #     pinned prior baseline (post-run totals of exactly
 #     STAGE_D_EXPECTED_PRIOR_RUNS+1 database runs and
-#     STAGE_D_EXPECTED_PRIOR_EXECUTIONS+1 VISIBLE executions — a second
+#     STAGE_D_EXPECTED_PRIOR_EXECUTIONS + the policy's authorized
+#     increment VISIBLE executions — a second
 #     new run or execution cannot pass unnoticed, and no historical row
 #     can satisfy the new run's acceptance);
 #   - expected terminal state;
@@ -231,18 +232,23 @@ probe_ok "${STAGE_D_WORKDIR}/replay.log" replay \
 
 echo "== 3. Worker execution total must be exactly baseline+1, all terminal"
 # One-execution increment over the pinned VISIBLE baseline: exactly
-# STAGE_D_EXPECTED_PRIOR_EXECUTIONS+1 executions in total, every one
+# STAGE_D_EXPECTED_PRIOR_EXECUTIONS + the policy's authorized increment
+# executions in total, every one
 # terminal, zero active. A second new execution, a still-active execution
 # or an unparseable listing fails the gate closed. Structured JSON, not a
 # line count, decides terminal state.
-expected_total_executions=$((STAGE_D_EXPECTED_PRIOR_EXECUTIONS + 1))
+# The increment comes from the canonical runtime policy
+# (first_paid_run_execution_cap), not from a literal here: Stage D and the
+# policy must not be able to authorize different numbers of paid executions.
+expected_total_executions=$((STAGE_D_EXPECTED_PRIOR_EXECUTIONS + STAGE_D_AUTHORIZED_EXECUTION_INCREMENT))
 gcloud run jobs executions list --job="${STAGE_D_WORKER_JOB}" \
   --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" \
   --format='table(metadata.name,status.startTime,status.completionTime,status.succeededCount,status.failedCount)'
 gcloud run jobs executions list --job="${STAGE_D_WORKER_JOB}" \
   --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" --format=json \
   | python3 ./verify_executions.py --expected-total "${expected_total_executions}" \
-  || fail "worker execution posture is not exactly ${expected_total_executions} terminal executions (pinned baseline ${STAGE_D_EXPECTED_PRIOR_EXECUTIONS} + the one authorized Stage D launch)"
+      --baseline "${STAGE_D_EXPECTED_PRIOR_EXECUTIONS}" \
+  || fail "worker execution posture is not exactly ${expected_total_executions} terminal executions (pinned baseline ${STAGE_D_EXPECTED_PRIOR_EXECUTIONS} + the ${STAGE_D_AUTHORIZED_EXECUTION_INCREMENT} execution(s) the runtime policy authorizes)"
 
 echo "== 4. The authorized execution must have RUN the accepted release digest"
 # The strongest image proof available: a Cloud Run execution records the

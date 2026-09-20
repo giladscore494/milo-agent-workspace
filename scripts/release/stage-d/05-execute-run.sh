@@ -154,6 +154,9 @@ python3 ./verify_images.py \
 # MILO_ENABLE_CATALOG_EXECUTION=false on both surfaces. Fails on any
 # missing/changed/unexpected value, including any MILO_PROVIDER_* variable
 # on the API and the live MILO_PROVIDER_MAX_CONCURRENCY=8 drift.
+echo "== The runtime policy is the reviewed one AND is identical to the release's"
+python3 ./policy_envelope.py binding
+
 python3 ./verify_caps.py --worker-json "${worker_json}" --api-json "${api_json}" \
   || fail "cap/image/posture verification failed — do NOT create the run"
 

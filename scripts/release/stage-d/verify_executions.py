@@ -29,9 +29,19 @@ Listing or parsing failures exit non-zero (fail closed). Prints one
 structured JSON verdict line; never prints secret values. Exit 0 only
 when every check passes.
 
+With --baseline, the gate additionally proves that the INCREMENT implied by
+--expected-total is exactly the one the canonical runtime policy authorizes
+(`first_paid_run_execution_cap`). Stage D used to compute `baseline + 1` in
+shell arithmetic, which meant the number of paid executions the toolkit would
+accept and the number the policy authorized were two independent statements
+of one rule. Now the verifier reads the policy itself, so a widened shell
+expression is caught here rather than accepted.
+
 Usage:
   gcloud run jobs executions list ... --format=json \
     | python3 verify_executions.py --expected-total 7
+  gcloud run jobs executions list ... --format=json \
+    | python3 verify_executions.py --expected-total 8 --baseline 7
 """
 
 from __future__ import annotations
@@ -39,6 +49,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from policy_envelope import (  # noqa: E402  (path bootstrap must run first)
+    authorized_execution_increment, fingerprint_problems)
 
 
 def is_terminal(execution: object) -> bool:
@@ -76,6 +92,14 @@ def main() -> int:
         type=int,
         help="exact number of executions that must exist, all terminal",
     )
+    parser.add_argument(
+        "--baseline",
+        type=int,
+        default=None,
+        help=("the pinned pre-run execution count; when given, the implied "
+              "increment must equal the increment the canonical runtime "
+              "policy authorizes"),
+    )
     args = parser.parse_args()
     if args.expected_total < 0:
         print(json.dumps({
@@ -84,6 +108,35 @@ def main() -> int:
             "reason": f"--expected-total {args.expected_total} is invalid — failing closed",
         }))
         return 1
+
+    if args.baseline is not None:
+        # The policy is the authority for how many NEW paid executions this
+        # authorization covers. A checkout whose policy has drifted from the
+        # reviewed one cannot answer that question, so it refuses.
+        drift = fingerprint_problems()
+        if drift:
+            print(json.dumps({
+                "stage_d_execution_gate": "BLOCKED",
+                "ok": False,
+                "reason": drift[0],
+            }))
+            return 1
+        authorized = authorized_execution_increment()
+        implied = args.expected_total - args.baseline
+        if implied != authorized:
+            print(json.dumps({
+                "stage_d_execution_gate": "BLOCKED",
+                "ok": False,
+                "baseline": args.baseline,
+                "expected_total": args.expected_total,
+                "implied_increment": implied,
+                "authorized_increment": authorized,
+                "reason": (
+                    f"--expected-total implies an increment of {implied} over the "
+                    f"pinned baseline, but the canonical runtime policy authorizes "
+                    f"{authorized} — failing closed"),
+            }))
+            return 1
 
     try:
         executions = json.load(sys.stdin)
@@ -120,6 +173,9 @@ def main() -> int:
     print(json.dumps({
         "stage_d_execution_gate": "verify",
         "expected_total": args.expected_total,
+        "baseline": args.baseline,
+        "authorized_increment": (None if args.baseline is None
+                                 else authorized_execution_increment()),
         "total": len(executions),
         "terminal": len(terminal),
         "nonterminal": len(nonterminal),

@@ -35,6 +35,7 @@ from backend.budget import build_guarded_client_factory
 from backend.dependencies import get_job_launcher, get_repository
 from backend.errors import AppError
 from backend.main import app
+from backend.runtime_policy import reviewed_first_run_policy
 from backend.testing.memory_repository import MemoryRepository
 
 USER = "aaaaaaaa-2222-4222-8222-000000000001"
@@ -106,7 +107,16 @@ def fake_kimi_client(completions):
 # --- offline stack ----------------------------------------------------------
 
 def swarm_env(monkeypatch, **overrides):
-    """The deployed worker contract, minus real credentials and pacing."""
+    """The deployed worker contract, minus real credentials and pacing.
+
+    The whole operating envelope is READ from the one canonical runtime
+    policy rather than transcribed. This fixture used to carry its own copy
+    of a WIDER envelope -- 200 model calls, 900,000 tokens, $4.00, 3300s,
+    8 logical workers, provider concurrency 8 -- which is the spent
+    swarm-v2-smoke authorization, not the reviewed first-run profile. A paid
+    posture that wide is now refused at startup, which is the point: the
+    offline smoke exercises the SAME envelope a paid run would really get.
+    """
     values = {
         "MILO_ENABLE_PAID_EXECUTION": "true",
         "KIMI_API_KEY": "offline-test-key-not-a-secret",
@@ -114,17 +124,7 @@ def swarm_env(monkeypatch, **overrides):
         "MILO_COMMANDER_MODEL": "kimi-k2.6",
         "MILO_SWARM_WORKER_MODEL": "kimi-k2.6",
         "MILO_MODEL_BASE_URL": "https://api.moonshot.ai/v1",
-        "MILO_MAX_MODEL_CALLS_PER_RUN": "200",
-        "MILO_MAX_TOTAL_TOKENS_PER_RUN": "900000",
-        "MILO_MAX_ESTIMATED_COST_PER_RUN": "4.00",
-        "MILO_MAX_COST_PER_RUN": "3.00",
-        "MILO_MAX_RUN_DURATION_SECONDS": "3300",
-        "MILO_MAX_RETRIES": "15",
-        "MILO_ESTIMATED_COST_PER_CALL": "0.02",
-        "MILO_DAILY_USER_BUDGET": "5.00",
-        "MILO_SWARM_MAX_ACTIVE_WORKERS": "8",
-        "MILO_PROVIDER_MAX_CONCURRENCY": "8",
-        "MILO_PROVIDER_RPM_LIMIT": "80",
+        **reviewed_first_run_policy().env_expectations(),
         "MILO_ENABLE_RUN_CREATION": "true",
         # The in-memory API limiter is keyed by the module-constant user;
         # raise the per-minute cap so unrelated tests never trip it.

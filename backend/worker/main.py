@@ -6,6 +6,7 @@ from typing import Any
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, merge_usage_snapshots, paid_execution_enabled
+from backend.runtime_policy import RuntimePolicyError, policy_failure_code, resolve_runtime_policy
 from backend.config import get_settings
 from backend.errors import AppError
 from backend.repository import Repository, SupabaseRepository
@@ -235,15 +236,39 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         def is_cancelled():
             return repo.get_run(run_id).get("status") == "cancellation_requested"
 
-        # Hard budget/cost gate. Fail closed: paid execution requires both the
-        # global kill switch and complete mandatory budget configuration; the
-        # tracker also blocks every call while MILO_ENABLE_PAID_EXECUTION is off.
+        # Hard budget/cost gate, checked first so the established
+        # BUDGET_CONFIG_INVALID code still names an incomplete budget. The
+        # mandatory set it checks is now DERIVED from the canonical runtime
+        # policy, so it covers every dimension the reviewed first-run profile
+        # advertises rather than the five it used to name.
         budget_config = BudgetConfig.from_env()
         if paid_execution_enabled() and budget_config.missing_mandatory():
             missing = ", ".join(budget_config.missing_mandatory())
             sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Budget configuration incomplete; refusing paid execution", payload={"code": "BUDGET_CONFIG_INVALID", "missing": missing}))
             repo.mark_run_failed(run_id, "BUDGET_CONFIG_INVALID", f"mandatory budget settings missing: {missing}", worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
             return 0 if workflow_key == "swarm_v2" else 1
+
+        # The ONE canonical runtime policy for this DEPLOYMENT. It is resolved
+        # ONCE, here, and every enforcement surface below is derived from it:
+        # the
+        # budget tracker, the provider scheduler, the Swarm V2 plan firewall,
+        # the provider-visible planning policy, the feasibility gate and the
+        # executor width. Two surfaces cannot describe different effective
+        # safety envelopes because there is only one envelope to describe.
+        #
+        # Fail closed: in the paid posture an absent, unparseable, wider-than-
+        # reviewed or self-contradictory dimension refuses the run rather than
+        # resolving to a generic default. The tracker additionally blocks every
+        # call while MILO_ENABLE_PAID_EXECUTION is off.
+        try:
+            policy = resolve_runtime_policy()
+        except RuntimePolicyError as exc:
+            code = policy_failure_code(exc)
+            detail = "; ".join(f"{v.dimension}: {v.message}" for v in exc.violations)
+            sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Runtime policy incomplete or wider than the reviewed envelope; refusing execution", payload={"code": code, "codes": ", ".join(exc.codes), "detail": detail}))
+            repo.mark_run_failed(run_id, code, detail, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+            return 0 if workflow_key == "swarm_v2" else 1
+        budget_config = policy.budget_config()
         # Provider credentials are worker-only (env/Secret Manager). Paid
         # execution fails closed when the key is absent; the key value itself is
         # never logged, persisted or echoed into events.
@@ -255,11 +280,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             return 0 if workflow_key == "swarm_v2" else 1
 
         # Provider-side scheduling limits (concurrency/RPM/TPM/backpressure
-        # bounds) are numeric deployment configuration validated fail-closed:
-        # an invalid value refuses the run instead of degrading into
-        # unlimited capacity.
-        from backend.provider_scheduler import ProviderLimitsConfig
-
+        # bounds) come from the canonical runtime policy resolved above, which
+        # validated them fail-closed: an invalid value refuses the run instead
+        # of degrading into unlimited capacity.
         engine_mode = (os.getenv("MILO_WORKER_ENGINE") or "").strip().lower()
         provider_limits = None
         provider_coordinator = None
@@ -269,7 +292,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
 
         if engine is None and engine_mode != "mock":
             try:
-                provider_limits = ProviderLimitsConfig.from_env()
+                # Same policy object, so the provider envelope a paid run
+                # actually admits against cannot differ from the one the
+                # reviewed profile, Stage D and configuration validation all
+                # name.
+                provider_limits = policy.provider_limits()
                 # ONE coordinator per worker process, shared by whichever engine
                 # runs. The Kimi allowance is account-wide, so this is the only
                 # thing that can see the other Cloud Run executions, processes
@@ -405,7 +432,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             def make_swarm_engine():
                 from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander,
                     CommanderModelResolver, GenericWorker, ModelGateway,
-                    PlanLimits, PlanValidator, RemainingBudget, SwarmV2Adapter, Verifier)
+                    PlanValidator, RemainingBudget, SwarmV2Adapter, Verifier)
                 from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
                 from backend.engines.swarm_v2.evidence_mapping import (
                     EvidenceMapperRegistry, RegisteredOperationEvidenceSink,
@@ -470,14 +497,14 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # policy (ModelGateway) and the deterministic firewall
                 # (PlanValidator): contract parity cannot drift silently.
                 #
-                # Derived from THIS run's envelope rather than the broad
-                # defaults. Wiring `PlanLimits()` unconditionally let the
+                # Derived from the canonical runtime policy, not from the broad
+                # `PlanLimits()` defaults. Wiring those unconditionally let the
                 # firewall admit a 64-task plan inside a 56-agent-step budget,
-                # which the run then could not finish; the plan ceiling now
-                # shrinks to what the budget can actually pay for.
-                limits = PlanLimits.from_envelope(
-                    max_agent_steps=budget_config.max_agent_steps,
-                    max_model_calls=budget_config.max_model_calls_per_run)
+                # and admit 3 replans and 100 tool calls into a reviewed
+                # profile that authorized 1 and 24. The ceiling is now the
+                # reviewed plan shape, narrowed again to what this run's
+                # agent-step and model-call envelope can actually pay for.
+                limits = policy.plan_limits()
                 gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker, request_deadline_seconds=provider_request_deadline),
                     scheduler=scheduler, api_key=worker_provider_api_key(),
                     base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
@@ -559,11 +586,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     # Commander repair does. Provider 429 backpressure is
                     # absorbed by the scheduler and never reaches here.
                     retry_callback=record_retry),
-                    # Bounded by what the organization will actually admit
-                    # concurrently: extra logical workers beyond that only
-                    # queue, consuming run duration and lease time.
-                    max_active_workers=BoundedTaskExecutor.configured_limit(
-                        provider_capacity=provider_limits.max_concurrency),
+                    # Bounded three ways and widened by none: the deployment's
+                    # own setting, the canonical policy's reviewed width, and
+                    # what the organization will really admit concurrently.
+                    # Extra logical workers beyond that only queue, consuming
+                    # run duration and lease time.
+                    max_active_workers=min(
+                        BoundedTaskExecutor.configured_limit(
+                            provider_capacity=provider_limits.max_concurrency),
+                        policy.swarm_max_active_workers),
                     cancellation_checker=is_cancelled)
                 def remaining():
                     cfg = tracker.config

@@ -28,6 +28,19 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from backend.runtime_policy import (  # noqa: E402  (path bootstrap must run first)
+    MANDATORY_FOR_PAID_EXECUTION, POLICY_ENV_KEYS)
+
+#: The budget/cap variables a manifest must DECLARE, derived from the one
+#: canonical runtime policy rather than listed here. A manifest that omits a
+#: mandatory dimension is describing a deployment that cannot legally run
+#: paid, and saying so at manifest-validation time is cheaper than
+#: discovering it when the worker refuses.
+MANDATORY_BUDGET_NAMES = tuple(sorted(POLICY_ENV_KEYS[name]
+                                      for name in MANDATORY_FOR_PAID_EXECUTION))
+
 PLACEHOLDER_RE = re.compile(r"^<.*>$")
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MUTABLE_TAGS = {"latest", "prod", "stable", "main", "master", "production"}
@@ -243,10 +256,20 @@ def validate(data: dict, mode: str) -> list[str]:
             elif mode == "apply" and not FULL_SHA_RE.match(value.strip()):
                 errors.append(f"release.{key}: must be a full 40-character commit SHA in apply mode")
 
-    # Budgets.
+    # Budgets. The declared list must COVER the canonical runtime policy's
+    # mandatory set: the manifest is what a reviewer reads to know which caps
+    # a production deployment carries, and a list that has fallen behind the
+    # policy is exactly the drift this validation exists to catch.
     budgets = get(data, "budgets")
     if not isinstance(budgets, list) or not budgets:
         errors.append("budgets: the list of budget variable names is required")
+    else:
+        declared = {str(name).strip() for name in budgets}
+        for name in MANDATORY_BUDGET_NAMES:
+            if name not in declared:
+                errors.append(
+                    f"budgets: {name} is mandatory for paid execution in the "
+                    "canonical runtime policy and must be declared")
 
     # Execution flags: must all exist and be false.
     flags = get(data, "execution_flags")

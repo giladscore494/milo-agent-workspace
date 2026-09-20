@@ -23,8 +23,27 @@
 > * the Stage D run must be **re-authorized against the new SHA**. Nothing
 >   in the release grants that authorization.
 >
+> **Update — the envelope drift above is fixed in code.** Stage D no longer
+> keeps its own transcription of the operating envelope: `stage-d-env.sh`
+> now GENERATES `STAGE_D_CAPS`, `STAGE_D_WORKER_PROVIDER_LIMITS` and the new
+> `STAGE_D_WORKER_ENGINE_LIMITS` from the one canonical runtime policy
+> (`backend/runtime_policy.py`), and `verify_caps.py` re-derives the same
+> values and refuses the run on any disagreement. Concretely:
+> `MILO_PROVIDER_RPM_LIMIT` is now `40` (half the 80 ceiling) rather than a
+> value the worker refuses to start under, `MILO_PROVIDER_TPM_LIMIT` is
+> `1200000`, and `MILO_SWARM_MAX_ACTIVE_WORKERS` is pinned at `2` and is
+> mandatory for paid execution, so it can no longer be left unpinned at its
+> wider code default of `4`. The numeric tables further down this document
+> are the values as they were pinned at the time of writing and are kept as
+> a record; `python3 scripts/release/stage-d/policy_envelope.py caps` (and
+> `provider-limits` / `engine-limits`) prints what Stage D would apply today.
+>
+> The image digests remain invalidated and the run still requires
+> re-authorization against a new release SHA. Nothing here grants it.
+
 > See `docs/production-readiness/KIMI_TIER2_LIMITS.md` for the verified
-> limits and the enforcement table.
+> limits and the enforcement table, and
+> `docs/production-readiness/RUNTIME_POLICY.md` for the canonical policy.
 
 
 > ## STATUS: PROPOSED. NOT AUTHORIZED. NOT EXECUTED.

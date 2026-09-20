@@ -96,20 +96,68 @@ INVENTORY=(
   "MILO_ENABLE_PAID_EXECUTION|cloud-run-api-only|no|backend/production_config.py"
   # Worker-only: the catalog capability inside a Swarm V2 run.
   "MILO_ENABLE_CATALOG_EXECUTION|cloud-run-worker-only|no|backend/catalog/execution.py"
-  "MILO_DAILY_USER_BUDGET|shared-api-worker|no|backend/budget.py"
-  "MILO_DAILY_PROJECT_BUDGET|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_COST_PER_RUN|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_ESTIMATED_COST_PER_RUN|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_MODEL_CALLS_PER_RUN|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_INPUT_TOKENS_PER_RUN|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_OUTPUT_TOKENS_PER_RUN|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_TOTAL_TOKENS_PER_RUN|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_AGENT_STEPS|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_RETRIES|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_RUN_DURATION_SECONDS|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_CONCURRENT_RUNS_PER_USER|shared-api-worker|no|backend/budget.py"
-  "MILO_MAX_CONCURRENT_RUNS_PER_PROJECT|shared-api-worker|no|backend/budget.py"
-  "MILO_ESTIMATED_COST_PER_CALL|shared-api-worker|no|backend/budget.py"
+  "MILO_DAILY_USER_BUDGET|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_DAILY_PROJECT_BUDGET|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_COST_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_ESTIMATED_COST_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_MODEL_CALLS_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_INPUT_TOKENS_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_OUTPUT_TOKENS_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_TOTAL_TOKENS_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_AGENT_STEPS|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_RETRIES|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_RUN_DURATION_SECONDS|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_CONCURRENT_RUNS_PER_USER|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_CONCURRENT_RUNS_PER_PROJECT|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_ESTIMATED_COST_PER_CALL|shared-api-worker|no|backend/runtime_policy.py"
+  # The plan-SHAPE dimensions of the canonical runtime policy. Nothing pinned
+  # them before, so the Swarm V2 firewall ran on its own wider defaults.
+  "MILO_MAX_TASKS_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_TOOL_CALLS_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
+  "MILO_MAX_REPLANS_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
+  # Provider scheduling and engine parallelism: WORKER-ONLY, and verified as
+  # worker-only by scripts/release/stage-d/verify_caps.py.
+  "MILO_PROVIDER_MAX_CONCURRENCY|cloud-run-worker-only|no|backend/provider_scheduler.py"
+  "MILO_PROVIDER_RPM_LIMIT|cloud-run-worker-only|no|backend/provider_scheduler.py"
+  "MILO_PROVIDER_TPM_LIMIT|cloud-run-worker-only|no|backend/provider_scheduler.py"
+  "MILO_PROVIDER_MAX_RATE_LIMIT_RETRIES|cloud-run-worker-only|no|backend/provider_scheduler.py"
+  "MILO_PROVIDER_MAX_BACKPRESSURE_WAIT_SECONDS|cloud-run-worker-only|no|backend/provider_scheduler.py"
+  "MILO_PROVIDER_BACKOFF_BASE_SECONDS|cloud-run-worker-only|no|backend/provider_scheduler.py"
+  "MILO_PROVIDER_BACKOFF_MAX_SECONDS|cloud-run-worker-only|no|backend/provider_scheduler.py"
+  "MILO_V1_TECHNICAL_PARALLELISM|cloud-run-worker-only|no|backend/engines/vehicle_catalog_v1/core.py"
+  "MILO_SWARM_MAX_ACTIVE_WORKERS|cloud-run-worker-only|no|backend/engines/swarm_v2/executor.py"
+  "MILO_SWARM_WORKER_MODEL|cloud-run-worker-only|no|backend/worker/main.py"
+  "MILO_COMMANDER_MODEL|cloud-run-worker-only|no|backend/worker/main.py"
+  "MILO_COMMANDER_MODEL_ALLOWLIST|cloud-run-worker-only|no|backend/worker/main.py"
+  # The two catalog CAPABILITY flags under the master switch.
+  "MILO_ENABLE_GOVERNMENT_CATALOG_READ|cloud-run-worker-only|no|backend/catalog/execution.py"
+  "MILO_ENABLE_CATALOG_PROMOTION|cloud-run-worker-only|no|backend/catalog/execution.py"
+  # The shared ORGANIZATION ceiling, deliberately spelled MILO_ORG_* rather
+  # than MILO_PROVIDER_*: those configure ONE process's active profile, these
+  # are the account-wide ceiling every process shares. QuotaConfig refuses any
+  # value above the verified Tier 2 ceiling, so these can only ever tighten.
+  "MILO_ORG_MAX_CONCURRENCY|cloud-run-worker-only|no|backend/provider_quota.py"
+  "MILO_ORG_RPM_LIMIT|cloud-run-worker-only|no|backend/provider_quota.py"
+  "MILO_ORG_TPM_LIMIT|cloud-run-worker-only|no|backend/provider_quota.py"
+  "MILO_SEARCH_BASIC_QPS|cloud-run-worker-only|no|backend/provider_quota.py"
+  "MILO_SEARCH_PRO_QPS|cloud-run-worker-only|no|backend/provider_quota.py"
+  "MILO_PROVIDER_QUOTA_SCOPE|cloud-run-worker-only|no|backend/provider_quota.py"
+  "MILO_PROVIDER_LEASE_TTL_SECONDS|cloud-run-worker-only|no|backend/provider_quota.py"
+  "MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS|cloud-run-worker-only|no|backend/provider_quota.py"
+  # Refused outright in production (TIMED_LEASE_RECLAIM_IN_PRODUCTION).
+  "MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS|cloud-run-worker-only|no|backend/provider_quota.py"
+  "MILO_WORKER_MAX_LIFETIME_SECONDS|cloud-run-worker-only|no|backend/provider_quota.py"
+  "MILO_WORKER_CLAIM_WAIT_SECONDS|cloud-run-worker-only|no|backend/worker/main.py"
+  "MILO_MODEL_BASE_URL|cloud-run-worker-only|no|backend/worker/main.py"
+  # Namespace PREFIXES, not variables: the canonical policy sweeps on these
+  # so an unpinned policy variable is caught by shape rather than by somebody
+  # remembering to add its name to a list.
+  "MILO_MAX_|prefix-namespace|no|backend/runtime_policy.py"
+  "MILO_DAILY_|prefix-namespace|no|backend/runtime_policy.py"
+  "MILO_ESTIMATED_COST|prefix-namespace|no|backend/runtime_policy.py"
+  "MILO_PROVIDER_|prefix-namespace|no|backend/runtime_policy.py"
+  "MILO_SWARM_MAX_|prefix-namespace|no|backend/runtime_policy.py"
+  "MILO_V1_|prefix-namespace|no|backend/runtime_policy.py"
   "KIMI_API_KEY|cloud-run-worker-only|yes|backend/production_config.py"
   "MOONSHOT_API_KEY|cloud-run-worker-only|yes|backend/production_config.py"
   "MILO_WORKER_LEASE_SECONDS|cloud-run-worker-only|no|backend/worker/main.py"
@@ -138,14 +186,25 @@ EXECUTION_FLAGS=(
   NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI
 )
 
-MANDATORY_BUDGETS=(
-  MILO_MAX_COST_PER_RUN
-  MILO_DAILY_USER_BUDGET
-  MILO_DAILY_PROJECT_BUDGET
-  MILO_MAX_MODEL_CALLS_PER_RUN
-  MILO_MAX_TOTAL_TOKENS_PER_RUN
-  MILO_MAX_RUN_DURATION_SECONDS
+# DERIVED from the ONE canonical runtime policy, never restated here: a
+# variable is mandatory exactly when leaving it unset would let a paid
+# deployment operate wider than the reviewed first-run envelope. This used to
+# be a sixth hand-kept copy of the same list, and it had fallen behind the
+# profile it was supposed to guarantee. Fails closed if the policy cannot be
+# read: an empty mandatory list would silently check nothing.
+mapfile -t MANDATORY_BUDGETS < <(
+  python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from backend.runtime_policy import MANDATORY_FOR_PAID_EXECUTION, POLICY_ENV_KEYS
+for name in MANDATORY_FOR_PAID_EXECUTION:
+    print(POLICY_ENV_KEYS[name])
+' "${REPO_ROOT}"
 )
+if [[ "${#MANDATORY_BUDGETS[@]}" -eq 0 ]]; then
+  echo "could not read the canonical runtime policy (backend/runtime_policy.py); refusing to validate against an empty mandatory set" >&2
+  exit 1
+fi
 
 SECRET_VARS=(SUPABASE_SERVICE_ROLE_KEY SUPABASE_SECRET_KEY KIMI_API_KEY MOONSHOT_API_KEY UPSTASH_REDIS_REST_TOKEN)
 
