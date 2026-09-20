@@ -275,15 +275,24 @@ def main() -> int:
         check_against_canonical_policy("engine-limits", "STAGE_D_WORKER_ENGINE_LIMITS",
                                        engine_limits, problems)
 
-    # The whole policy document, by digest. Two surfaces that print the same
-    # fingerprint are provably talking about the same envelope.
+    # The whole policy document, by digest, against the LITERAL reviewed pin.
+    # Comparing it against the checkout's own fingerprint would only prove the
+    # checkout agrees with itself.
     pinned_fingerprint = os.environ.get("STAGE_D_POLICY_FINGERPRINT", "").strip()
     if not pinned_fingerprint:
         problems.append("STAGE_D_POLICY_FINGERPRINT is not set — the release toolkit cannot prove it is verifying the runtime's own policy; failing closed")
-    elif pinned_fingerprint != POLICY.fingerprint():
+    elif pinned_fingerprint != PINNED_POLICY_FINGERPRINT:
         problems.append(
-            "STAGE_D_POLICY_FINGERPRINT does not match the canonical runtime policy "
-            "document — the pinned envelope and the runtime disagree; failing closed")
+            "STAGE_D_POLICY_FINGERPRINT does not match the reviewed policy digest "
+            "pinned in policy_envelope.py — the pinned envelope and the reviewed "
+            "one disagree; failing closed")
+
+    # THE RELEASE BINDING. Everything else here compares the deployment against
+    # a policy read from THIS CHECKOUT; this is what proves the checkout IS the
+    # accepted release, so that policy is the one the pinned images enforce.
+    # Without it, generating and verifying the envelope from one checkout only
+    # proves the checkout agrees with itself.
+    problems.extend(release_binding_problems(os.environ.get("STAGE_D_RELEASE_SHA")))
 
     registry = os.environ.get("STAGE_D_REGISTRY", "")
     release_sha = os.environ.get("STAGE_D_RELEASE_SHA", "")

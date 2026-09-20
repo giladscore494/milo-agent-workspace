@@ -532,8 +532,11 @@ def api_spec(*, caps=CAPS, image=None, extra=None, release_sha=None):
     ]}}}}
 
 
+_UNSET = object()
+
+
 def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_LIMITS,
-                    engine_limits=ENGINE_LIMITS, fingerprint=None, release_sha=None):
+                    engine_limits=ENGINE_LIMITS, fingerprint=None, release_sha=_UNSET):
     worker_path = tmp_path / "worker.json"
     api_path = tmp_path / "api.json"
     worker_path.write_text(json.dumps(worker))
@@ -546,7 +549,8 @@ def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_L
              "STAGE_D_WORKER_ENGINE_LIMITS": engine_limits,
              "STAGE_D_POLICY_FINGERPRINT": fingerprint or POLICY_FINGERPRINT,
              "STAGE_D_REGISTRY": REGISTRY,
-             "STAGE_D_RELEASE_SHA": release_sha or CHECKOUT_SHA,
+             "STAGE_D_RELEASE_SHA": (CHECKOUT_SHA if release_sha is _UNSET
+                                     else release_sha),
              "STAGE_D_API_IMAGE_DIGEST": API_DIGEST, "STAGE_D_WORKER_IMAGE_DIGEST": WORKER_DIGEST},
         timeout=60,
     )
@@ -703,8 +707,10 @@ def test_verify_caps_refuses_a_checkout_that_is_not_the_accepted_release(tmp_pat
 
 @pytest.mark.parametrize("bad_sha", ["", "not-a-sha", "84cd8696", "z" * 40])
 def test_verify_caps_refuses_an_unprovable_release_sha(tmp_path, bad_sha):
+    """Cannot PROVE the binding is a refusal, never a pass."""
     result = run_verify_caps(tmp_path, worker_spec(), api_spec(), release_sha=bad_sha)
     assert result.returncode != 0
+    assert "not a full 40-character commit SHA" in result.stdout
 
 
 def test_the_pinned_policy_fingerprint_is_the_checkouts_policy():
