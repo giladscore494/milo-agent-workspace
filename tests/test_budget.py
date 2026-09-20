@@ -186,13 +186,19 @@ def test_budget_warning_emitted_once_at_80_percent():
 
 
 def test_usage_recorded_after_each_call():
+    """Usage is durable at BOTH ends of a call: the admission (before the
+    request is sent, so a process that dies mid-request is still charged for
+    it) and the settlement. Two calls therefore leave four records, each one
+    never below the record before it."""
     usage = []
     tracker = make_tracker(usage=usage, estimated_cost_per_call=0.02)
     tracker.before_call()
     tracker.after_call(100, 50)
     tracker.before_call()
     tracker.after_call(10, 5)
-    assert len(usage) == 2
+    assert len(usage) == 4
+    assert [u["model_calls"] for u in usage] == [1, 1, 2, 2]
+    assert [u["input_tokens"] for u in usage] == [0, 100, 100, 110]
     assert usage[-1]["input_tokens"] == 110
     assert usage[-1]["output_tokens"] == 55
     assert usage[-1]["model_calls"] == 2
