@@ -27,6 +27,14 @@ gcloud secrets get-iam-policy KIMI_API_KEY --project big-cabinet-457321-t7
 source scripts/release/stage-d/stage-d-env.sh   # generates STAGE_D_CAPS, STAGE_D_WORKER_PROVIDER_LIMITS,
                                                 # STAGE_D_WORKER_ENGINE_LIMITS from backend/runtime_policy.py
 
+# REQUIRED FIRST. The envelope below is generated from THIS CHECKOUT, while
+# the run executes separately pinned release images. This proves the checkout
+# IS the accepted release with the policy source unmodified, so the caps you
+# are about to apply are the ones those images enforce. It refuses — and you
+# must stop — if the checkout is any other commit, if the policy source is
+# modified, or if the binding cannot be proven at all.
+(cd scripts/release/stage-d && python3 ./policy_envelope.py binding)
+
 gcloud run jobs update milo-agent-worker \
   --project "${STAGE_D_PROJECT}" --region "${STAGE_D_REGION}" \
   --update-env-vars "MILO_ENABLE_PAID_EXECUTION=${STAGE_D_ON},${STAGE_D_CAPS},${STAGE_D_WORKER_PROVIDER_LIMITS},${STAGE_D_WORKER_ENGINE_LIMITS}" \

@@ -784,6 +784,19 @@ def test_the_step_scripts_gate_on_the_binding_before_creating_a_run():
                 < text.index("python3 ./verify_caps.py")), name
 
 
+def test_the_enable_runbooks_gate_on_the_binding_before_applying_an_envelope():
+    """Applying the caps MUTATES the deployment, so it is bound too.
+
+    03b and 05 would refuse the run afterwards, but by then a drifted envelope
+    would already be on the job.
+    """
+    for name in ("03-enable-stage-d.md", "02-guarded-run.md"):
+        text = (STAGE_D / name).read_text()
+        assert "policy_envelope.py binding" in text, name
+        assert text.index("policy_envelope.py binding") < text.index(
+            "--update-env-vars"), name
+
+
 # --- the execution increment has ONE authority -----------------------------
 
 def test_the_authorized_execution_increment_comes_from_the_runtime_policy():
@@ -1554,6 +1567,14 @@ def run_guarded_block(tmp_path, fail_at=None):
     not exist here — but the ENABLE commands, kill-switch.sh and
     07-post-run-lockdown.sh are the REAL ones running against the stateful
     mock, so the asserted end state is the one the real cleanup produced.
+
+    `policy_envelope.py binding` is stubbed for the same reason as 01: it
+    proves the checkout IS the accepted release, and this sandbox is a partial
+    copy of the toolkit with no `backend/` tree and no git history, so it is
+    neither. That the block CONTAINS that gate before it mutates anything is
+    asserted directly by
+    `test_the_enable_runbooks_gate_on_the_binding_before_applying_an_envelope`,
+    and the gate's own accept/refuse behaviour by the binding tests above.
     """
     world = StageDWorld(tmp_path)
     stubs = {
@@ -1563,6 +1584,8 @@ def run_guarded_block(tmp_path, fail_at=None):
         "05-execute-run.sh": STUB_OK,
         "06-collect-evidence.sh": STUB_OK,
     }
+    (world.dir / "policy_envelope.py").write_text(
+        "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n")
     injected = MUTATION_BOUNDARIES.get(fail_at) if fail_at else None
     gcloud_failures = []
     if injected == "__PARTIAL_PROBES__":

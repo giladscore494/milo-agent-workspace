@@ -99,6 +99,11 @@ cleanup never depend on you copying an id out of the terminal.
   # ======================================================================
   trap on_exit EXIT ERR INT TERM
 
+  echo "== 3.1b The envelope below is generated from THIS CHECKOUT — prove it is the release"
+  # Applying the caps MUTATES the job. 03b and 05 would refuse the run
+  # afterwards, but by then a drifted envelope would already be on it.
+  python3 ./policy_envelope.py binding
+
   echo "== 3.2 Worker: paid flag + strict caps + provider envelope + provider key (worker only)"
   gcloud run jobs update "${STAGE_D_WORKER_JOB}" \
     --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" \
