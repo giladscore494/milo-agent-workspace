@@ -64,10 +64,17 @@ DURABLE_RUN_STATUS: Mapping[str, str] = {
 #: A first government run is overwhelmingly likely to land there, so an
 #: acceptance check that rejects it would reject the normal case.
 #:
+#: ``not_found`` belongs here: a trusted typed signal PROVING there is no match
+#: is a complete, actionable answer, and it is what the canonical
+#: ``backend.product_outcome`` reader independently calls usable. Leaving it out
+#: made this table and that reader disagree about one (unreachable) case, which
+#: is exactly the kind of drift a single authority exists to prevent.
+#:
 #: ``no_usable_result``, and every non-product terminal state (timeout,
 #: cancellation, failure, budget exhaustion), stay deliberately outside.
 USEFUL_TERMINAL_OUTCOMES: frozenset[tuple[str, str]] = frozenset({
     ("completed", "usable_result"),
+    ("completed", "not_found"),
     ("partial_success", "usable_result"),
     ("partial_success", "partial_result"),
 })

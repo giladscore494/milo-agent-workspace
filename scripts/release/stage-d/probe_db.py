@@ -38,7 +38,10 @@ Modes (env STAGE_D_MODE):
               baseline (total = STAGE_D_EXPECTED_PRIOR_RUNS + 1) carrying
               the Stage D idempotency key, and the Government-capture
               invariant still intact. Historical runs never satisfy the
-              new run's acceptance and are never deleted or hidden
+              new run's acceptance and are never deleted or hidden. The
+              canonical ProductOutcome the worker recorded is copied into
+              the verdict as `product_outcome` for the host-side semantic
+              gate; this probe never derives or re-judges one
 
 Exit codes: 0 = PASS, 1 = a check failed (fail closed).
 """
@@ -1371,6 +1374,42 @@ def evidence() -> None:
     out["event_types"] = [e["event_type"] for e in (events or [])]
     if not events:
         failures.append("no lifecycle events recorded for the run")
+
+    # The canonical ProductOutcome the WORKER recorded when it finalized the
+    # run (backend/product_outcome.py, written by backend/finalization.py).
+    #
+    # This probe deliberately does NOT derive one. Deriving it here would be a
+    # second implementation of the semantic rule, free to disagree with the one
+    # that actually decided the run's terminal status -- exactly the drift that
+    # made Stage D transcribe its own copy of the runtime envelope. The record
+    # is copied through verbatim and JUDGED on the operator host by
+    # semantic_acceptance.py, which imports the one canonical module.
+    #
+    # It is a bounded record by construction: static status vocabulary, integer
+    # counts, allowlisted blocking codes and a payload DIGEST. No fragment of
+    # the product payload travels with it.
+    product_outcome = None
+    for event in (events or []):
+        if event.get("event_type") not in ("run_completed", "run_partial_success"):
+            continue
+        payload = event.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("product_outcome"), dict):
+            product_outcome = payload["product_outcome"]
+    out["product_outcome"] = product_outcome
+    if state in ("completed", "partial_success") and product_outcome is None:
+        # A run that reached a PRODUCT terminal state without recording what it
+        # produced has not been shown to have produced anything. Technical
+        # success is not a product result, so this fails closed here as well as
+        # in the semantic gate.
+        failures.append(
+            "the run reached a product terminal state but recorded no canonical "
+            "ProductOutcome on its terminal event — semantic acceptance cannot "
+            "be judged; failing closed")
     blob = json.dumps(events or [])
     hits = {m: blob.count(m) for m in SECRET_MARKERS if blob.count(m)}
     out["secret_marker_hits"] = hits

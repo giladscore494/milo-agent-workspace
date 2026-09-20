@@ -9,12 +9,15 @@ The two engines finish differently and the envelope keeps that difference
 visible rather than flattening it:
 
 * ``swarm_v2`` owns a validated product-outcome contract, so its ``runs.output``
-  is re-validated through ``outcome.validate_product_outcome`` and carried
-  through unchanged. A payload that is not exactly one that
+  is re-validated through that contract (inside the canonical reader) and
+  carried through unchanged. A payload that is not exactly one that
   ``finalize_product_outcome`` could have produced is refused, not exported.
 * ``vehicle_catalog_v1`` predates that contract. Its durable final output is
-  wrapped as-is and classified from its own recorded status. Nothing rewrites,
-  summarizes or re-judges it.
+  wrapped as-is and classified by the canonical
+  :mod:`backend.product_outcome` reader -- the same one the finalizer used to
+  decide the run's terminal status, so the exported ``result_kind`` and the
+  durable status can never disagree. Nothing rewrites, summarizes or re-judges
+  the payload itself.
 
 Terminal honesty is the point of the ``terminal_status`` field. A Cloud Run
 process exiting zero is not a product result, and neither is a timeout or a
@@ -39,11 +42,6 @@ NON_PRODUCT_TERMINAL_STATES = frozenset({"failed", "timed_out", "cancelled",
                                          "budget_exhausted"})
 
 TERMINAL_STATES = USEFUL_TERMINAL_STATES | NON_PRODUCT_TERMINAL_STATES
-
-#: V1 records its own product status inside its output. These are the values
-#: that mean "this run produced something usable".
-_V1_USABLE_STATUSES = frozenset({"complete", "success"})
-_V1_PARTIAL_STATUSES = frozenset({"partial_success", "partial"})
 
 
 class ExportRefused(ValueError):
@@ -96,25 +94,19 @@ def build_export_envelope(run: Mapping[str, Any], *,
 
     result_kind: str | None = None
     if status in USEFUL_TERMINAL_STATES:
-        if engine == "swarm_v2":
-            from backend.engines.swarm_v2.outcome import (ProductOutcomeError,
-                                                          validate_product_outcome)
-            try:
-                outcome = validate_product_outcome(output)
-            except ProductOutcomeError as exc:
-                # A stored payload that the contract would not have produced is
-                # not exportable: exporting it would launder an invalid result
-                # into a document that looks authoritative.
-                raise ExportRefused("stored Swarm V2 outcome is not contract-valid") from exc
-            result_kind = outcome.result_kind
-        else:
-            declared = (output or {}).get("status") if isinstance(output, Mapping) else None
-            if declared in _V1_USABLE_STATUSES:
-                result_kind = "usable_result"
-            elif declared in _V1_PARTIAL_STATUSES:
-                result_kind = "partial_result"
-            else:
-                result_kind = "no_usable_result"
+        from backend.product_outcome import derive_product_outcome
+
+        # ONE classification, the same one the finalizer decided the run's
+        # terminal status with. This projection used to re-derive its own --
+        # a third reading of the same payload, free to disagree with both the
+        # engine's contract and the durable status.
+        outcome = derive_product_outcome(engine, output)
+        if outcome.semantic_status == "refused":
+            # A stored payload that the contract would not have produced is
+            # not exportable: exporting it would launder an invalid result
+            # into a document that looks authoritative.
+            raise ExportRefused("stored Swarm V2 outcome is not contract-valid")
+        result_kind = outcome.result_kind or "no_usable_result"
 
     return {
         "schema_version": SCHEMA_VERSION,

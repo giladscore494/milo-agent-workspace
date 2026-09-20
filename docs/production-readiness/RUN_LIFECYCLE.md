@@ -72,6 +72,19 @@ worker, so a resume, a replay or a replacement never regains capacity. See
 events power UI polling (`GET /runs/{id}/events`). Checkpoint writes are
 lease-guarded like every other worker mutation.
 
+## Terminal decisions
+
+Every terminal path — V1 and V2 success, partial success, engine failure,
+pre-execution refusal, cancellation, timeout and budget exhaustion, and the
+summary-checkpoint resume — converges on ONE finalizer
+(`backend/finalization.py`), and no branch writes a durable status itself.
+The status is derived from a terminal REASON plus the canonical
+`ProductOutcome` (`backend/product_outcome.py`); terminal statuses are
+ordered by authority so a late `completed` can never overwrite a cancellation
+or a safety-rail stop; terminalization is idempotent, and a terminal state
+another legitimate path already won is adopted rather than rewritten. See
+`RUN_FINALIZATION.md`.
+
 ## Cancellation
 
 `POST /runs/{id}/cancel` is membership-authorized, rate-limited, gated by
@@ -80,7 +93,9 @@ already-cancelled run is a no-op. A run cancelled before start emits no
 `run_started` event and never calls the engine
 (`tests/test_corrective_blockers.py`). The worker observes
 `cancellation_requested` at its next heartbeat/step boundary and transitions
-to `cancelled` under its lease.
+to `cancelled` under its lease. A product the engine finished anyway is kept
+as the run's output, and the run is still recorded as `cancelled`: the
+decision to stop outranks a late result (`RUN_CANCELLED_AFTER_RESULT`).
 
 ## Retries and duration
 
