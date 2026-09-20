@@ -219,21 +219,48 @@ URL, credential, provider body or exception text.
 * a GC or scheduler pause in the holder;
 * the client's slop in firing the timeout, plus TLS teardown.
 
-### What the client timeout does and does not bound
+### How the deadline is actually enforced
 
-`httpx`'s `read` is a limit on the gap **between bytes**, not a guaranteed
-total wall-clock ceiling, and nothing in the httpx/OpenAI contract lets one
-thread abort another thread's in-flight request. MILO issues **non-streaming**
-completions with a bounded `max_tokens`, so the provider computes the whole
-answer and sends a small body: silence longer than the deadline is the failure
-mode, and the deadline catches it. The residual case — a server trickling one
-byte every `deadline − ε` — is precisely why renewal is kept as well as the
-deadline, rather than either alone.
+An httpx timeout **cannot** enforce it. `read` bounds the gap *between bytes*,
+not the duration of a request, so a response that keeps producing data never
+trips it. Measured on loopback, a server emitting one chunk every 0.2 s ran for
+**30.1 s** under a 1.5 s read timeout — and stopped only because the *server*
+gave up.
+
+So the bound comes from `backend/provider_transport.py`, which fixes a deadline
+when the request starts and checks it on **every chunk the response yields**.
+Both client constructions are built on it (`http_client=`), verified by
+`test_the_shipped_clients_are_built_on_the_deadline_transport`.
+
+The two phases are covered by different instruments, deliberately:
+
+| Phase | Behaviour | Bounded by |
+| --- | --- | --- |
+| waiting for response headers | genuinely silent while the provider computes | the `read` inactivity timeout — the case it *does* bound correctly |
+| reading the body | may trickle | the transport's total-elapsed check |
+
+**What this guarantees:** no MILO thread is still awaiting the response after
+the deadline, and the connection is closed rather than left to drain.
+
+**What it does not claim:** it does not cancel the request *provider-side* —
+nothing in the httpx or OpenAI contract offers that, and a server may keep
+computing after a client disconnects. Nor does it cancel from another thread;
+the deadline is enforced by the thread making the request, on its own next
+read, which is why it needs no cross-thread cancellation primitive to be
+correct. MILO's ceiling is 80 % of the provider's precisely so that effects it
+cannot observe have headroom.
+
+Measured in the two-coordinator heartbeat-loss race
+(`test_provider_deadline_transport.py`), ceiling of one, real server:
+
+| client | MILO requests outstanding | sustained server-side overlap |
+| --- | --- | --- |
+| deadline transport | **1** | **0.003 s** (teardown tail) |
+| ordinary client, same numbers | **2** | **4.016 s** |
 
 > The SDK default was the original defect: `read=600 s` against a 120 s lease,
-> **five times the TTL**. Both client constructions now pass an explicit
-> timeout, checked by
-> `test_the_shipped_clients_carry_the_derived_deadline`.
+> **five times the TTL** — and a read timeout would not have bounded the
+> request even had it been shorter.
 
 ## 9. Two different numbers: ceiling vs active profile
 

@@ -91,6 +91,16 @@ def _request_lease_invariant() -> dict[str, Any]:
                               "the request"),
         "sdk_default_read_timeout_seconds": 600,
         "sdk_default_would_be_unsafe": True,
+        # An inactivity timeout does not bound a request at all: measured on
+        # loopback, a trickling server ran 30.1s under a 1.5s read timeout.
+        "deadline_enforced_by": "backend/provider_transport.py (total elapsed, per chunk)",
+        "inactivity_timeout_bounds": "the silent header phase only",
+        "guarantees": ("no MILO thread still awaiting the response after the "
+                       "deadline, and the connection closed"),
+        "does_not_claim": ("provider-side cancellation, or cancellation from "
+                           "another thread; a server may keep computing after "
+                           "a client disconnects, which is part of why the "
+                           "ceiling is 80% rather than 100%"),
     }
 
 

@@ -5,7 +5,7 @@ import time
 from typing import Any
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
-from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, merge_usage_snapshots, paid_execution_enabled, provider_request_timeout
+from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, merge_usage_snapshots, paid_execution_enabled
 from backend.config import get_settings
 from backend.errors import AppError
 from backend.repository import Repository, SupabaseRepository
@@ -271,9 +271,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 return 0 if workflow_key == "swarm_v2" else 1
 
         # Resolved once, from the coordinator that owns the lease TTL.
-        provider_request_deadline = (
-            provider_request_timeout(provider_coordinator.config.request_deadline_seconds)
-            if provider_coordinator is not None else None)
+        provider_request_deadline = (provider_coordinator.config.request_deadline_seconds
+                                     if provider_coordinator is not None else None)
 
         def emit_budget_event(event_type, payload):
             sink.emit(RunEventRecord(run_id=run_id, type=event_type, message=payload.get("message", event_type), payload=payload.get("payload", payload)))
@@ -370,7 +369,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             )
         elif engine is None and engine_registry is None:
             engine_builder = lambda: VehicleCatalogV1Adapter(
-                model_client_factory=build_guarded_client_factory(tracker, request_timeout=provider_request_deadline), event_sink=forward_event,
+                model_client_factory=build_guarded_client_factory(tracker, request_deadline_seconds=provider_request_deadline), event_sink=forward_event,
                 checkpoint_sink=save_checkpoint, cancellation_checker=is_cancelled,
                 agent_step_callback=record_agent_step, retry_callback=record_retry,
                 provider_limits=provider_limits, provider_backpressure_callback=record_provider_backpressure,
@@ -456,7 +455,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 limits = PlanLimits.from_envelope(
                     max_agent_steps=budget_config.max_agent_steps,
                     max_model_calls=budget_config.max_model_calls_per_run)
-                gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker, request_timeout=provider_request_deadline),
+                gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker, request_deadline_seconds=provider_request_deadline),
                     scheduler=scheduler, api_key=worker_provider_api_key(),
                     base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
                     # Sanitized, server-owned descriptors: Commander sees each

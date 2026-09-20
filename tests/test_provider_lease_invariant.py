@@ -11,10 +11,11 @@ still running, and a second process could take the freed slot. Real provider
 concurrency then exceeded the ceiling even though every NEW request entered the
 limiter correctly.
 
-What these tests measure is the thing that actually matters: **simultaneous
-in-flight simulated provider calls**, not the number of rows in the lease set.
-A test that only counted leases would have passed against the broken code,
-because the lease count was never the problem.
+These tests cover the COORDINATOR side: leases, renewal, configuration and
+cleanup. The proof that a real request cannot outlive its permit lives in
+``test_provider_deadline_transport.py``, against a real httpx client and a
+real server -- because a simulated provider that imposes its own deadline
+cannot demonstrate a transport property, it only assumes it.
 
 "Two processes" is two ``ProviderQuotaCoordinator`` objects over one shared
 backend, which is the production shape: two Cloud Run executions, one Upstash
@@ -41,49 +42,6 @@ from backend.runtime import CancellationRequested
 TTL = 2.0
 DEADLINE = default_request_deadline(TTL)        # 1.5s
 MARGIN = lease_safety_margin(TTL)               # 0.5s
-
-
-class SimulatedProvider:
-    """A provider call that honours a deadline, and counts real overlap.
-
-    ``peak`` is the maximum number of calls that were *simultaneously inside*
-    the provider. That is the quantity the organization ceiling is about, and
-    the quantity a lease-counting test cannot see.
-
-    The deadline models what an httpx read timeout does to a non-streaming
-    request: past it, the client gives up and the call ends. It is enforced
-    here rather than by real HTTP because these tests must not touch a network.
-    """
-
-    def __init__(self, deadline: float):
-        self.deadline = deadline
-        self.peak = 0
-        self.entered = 0
-        self._active = 0
-        self._lock = threading.Lock()
-        #: Set the first time anyone is actually inside the provider. Without
-        #: it the race below is decided by who wins the permit first, which
-        #: makes the whole harness order-dependent -- and an order-dependent
-        #: concurrency test is worth nothing.
-        self.first_entry = threading.Event()
-
-    def call(self, duration: float):
-        with self._lock:
-            self._active += 1
-            self.entered += 1
-            self.peak = max(self.peak, self._active)
-        self.first_entry.set()
-        try:
-            deadline_at = time.monotonic() + self.deadline
-            finish_at = time.monotonic() + duration
-            while time.monotonic() < min(finish_at, deadline_at):
-                time.sleep(0.005)
-            if duration > self.deadline:
-                raise TimeoutError("provider request deadline exceeded")
-            return "ok"
-        finally:
-            with self._lock:
-                self._active -= 1
 
 
 class FakeClock:
@@ -130,46 +88,6 @@ def coordinators(kind, *, ceiling=1):
     return WorkerA(backend, config), ProviderQuotaCoordinator(backend, config)
 
 
-def race(provider, sched_a, sched_b, *, a_duration, b_duration=0.05):
-    """A is INSIDE a long call; only then does B try to enter.
-
-    B waits for A to be genuinely in the provider rather than merely started,
-    so the outcome cannot depend on which thread won the permit first. That
-    makes the question asked here exactly the one that matters: while a real
-    request is in flight, can a second one begin?
-    """
-    errors: dict[str, BaseException] = {}
-
-    def worker_a():
-        try:
-            sched_a.execute(lambda: provider.call(a_duration),
-                            estimated_tokens=10, reserved_tokens=10)
-        except BaseException as exc:  # noqa: BLE001 - recorded, asserted below
-            errors["a"] = exc
-
-    def worker_b():
-        if not provider.first_entry.wait(timeout=10.0):
-            errors["b"] = AssertionError("worker A never entered the provider")
-            return
-        # Keep attempting for longer than A's call could possibly run, so B
-        # really does get a chance the instant a permit becomes available.
-        deadline = time.monotonic() + a_duration + TTL + 1.0
-        while time.monotonic() < deadline:
-            try:
-                sched_b.execute(lambda: provider.call(b_duration),
-                                estimated_tokens=10, reserved_tokens=10)
-                return
-            except BaseException as exc:  # noqa: BLE001 - recorded, asserted below
-                errors["b"] = exc
-                return
-
-    threads = [threading.Thread(target=worker_a), threading.Thread(target=worker_b)]
-    [t.start() for t in threads]
-    [t.join(timeout=30) for t in threads]
-    assert not any(t.is_alive() for t in threads), "a worker never finished"
-    return errors
-
-
 # =============================================================================
 # A. the healthy case still holds its permit for a long call
 # =============================================================================
@@ -179,7 +97,6 @@ def test_a_long_call_keeps_its_permit_while_the_heartbeat_is_healthy():
     backend = MemoryQuotaBackend()
     config = QuotaConfig(max_concurrency=1, lease_ttl_seconds=TTL)
     healthy = ProviderQuotaCoordinator(backend, config)
-    provider = SimulatedProvider(DEADLINE)
     observed: list[object] = []
 
     def call():
@@ -192,31 +109,6 @@ def test_a_long_call_keeps_its_permit_while_the_heartbeat_is_healthy():
     assert scheduler.execute(call, estimated_tokens=10, reserved_tokens=10) == "done"
     assert observed == [None], "the permit expired while its own call was running"
     assert healthy.try_acquire_inference() is not None, "the permit was not released"
-    assert provider.peak == 0
-
-
-# =============================================================================
-# B. heartbeat returns False
-# =============================================================================
-
-def test_lost_ownership_cannot_produce_two_simultaneous_provider_calls():
-    """A's coordinator disowns its permit mid-request; B is waiting to enter.
-
-    Before the deadline existed, A's request ran for the SDK's 600s default
-    while its permit expired at the TTL, so B entered and two real calls ran
-    against a ceiling of one.
-    """
-    worker_a, worker_b = coordinators("returns_false")
-    provider = SimulatedProvider(DEADLINE)
-
-    errors = race(provider, scheduler_for(worker_a), scheduler_for(worker_b),
-                  a_duration=TTL * 4)
-
-    assert provider.entered >= 1
-    assert provider.peak == 1, (
-        f"{provider.peak} real provider calls overlapped under a ceiling of 1")
-    # A's call was ended by its deadline rather than being allowed to run on.
-    assert isinstance(errors.get("a"), TimeoutError), errors
 
 
 def test_lost_ownership_is_recorded_rather_than_swallowed():
@@ -235,24 +127,6 @@ def test_lost_ownership_is_recorded_rather_than_swallowed():
     assert "provider_lease_ownership_lost" in kinds, signals
     payload = next(p for k, p in signals if k == "provider_lease_ownership_lost")
     assert payload["reason"] == "PROVIDER_LEASE_OWNERSHIP_LOST"
-
-
-# =============================================================================
-# C. the heartbeat call itself fails
-# =============================================================================
-
-def test_an_unreachable_coordinator_cannot_produce_two_provider_calls():
-    """The store raises mid-request, which used to kill the daemon thread."""
-    worker_a, worker_b = coordinators("raises")
-    provider = SimulatedProvider(DEADLINE)
-
-    errors = race(provider, scheduler_for(worker_a), scheduler_for(worker_b),
-                  a_duration=TTL * 4)
-
-    assert provider.entered >= 1
-    assert provider.peak == 1, (
-        f"{provider.peak} real provider calls overlapped under a ceiling of 1")
-    assert isinstance(errors.get("a"), TimeoutError), errors
 
 
 def test_a_raising_heartbeat_never_escapes_into_the_caller():
@@ -517,31 +391,6 @@ def test_a_refused_shared_permit_releases_the_local_slot():
         scheduler.execute(lambda: "ok", estimated_tokens=10, reserved_tokens=10)
     assert scheduler._slots.acquire(blocking=False), "the local slot leaked"
     scheduler._slots.release()
-
-
-# =============================================================================
-# the regression is not vacuous
-# =============================================================================
-
-@pytest.mark.parametrize("kind", ["returns_false", "raises"])
-def test_the_race_harness_detects_the_pre_fix_behaviour(kind):
-    """Guard against a test that would pass however the code behaved.
-
-    The only difference here is the deadline: 5x the lease TTL is the ratio
-    PR #102 actually shipped, because it left the OpenAI SDK's 600s default
-    read timeout against a 120s lease. Under that ratio the harness must see
-    two real provider calls overlap beneath a ceiling of one -- if it does
-    not, the passing tests above prove nothing.
-    """
-    worker_a, worker_b = coordinators(kind)
-    unbounded = SimulatedProvider(TTL * 5)
-
-    race(unbounded, scheduler_for(worker_a), scheduler_for(worker_b),
-         a_duration=TTL * 4)
-
-    assert unbounded.peak == 2, (
-        "the harness failed to observe the known-bad overlap, so it cannot be "
-        "trusted to observe its absence either")
 
 
 def test_a_failure_to_start_the_renewal_thread_strands_nothing():

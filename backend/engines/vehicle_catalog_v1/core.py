@@ -16,7 +16,7 @@ try:
 except ModuleNotFoundError:  # optional until live engine execution
     OpenAI = None
 
-from backend.budget import provider_request_timeout
+from backend.budget import build_provider_http_client, provider_request_timeout
 from backend.provider_scheduler import (
     ProviderBackpressureExceeded,
     ProviderLimitsConfig,
@@ -539,6 +539,7 @@ def moonshot_chat(
     client_factory = MODEL_CLIENT_FACTORY or (
         lambda api_key, base_url: OpenAI(
             api_key=api_key, base_url=base_url, max_retries=0,
+            http_client=build_provider_http_client(),
             timeout=provider_request_timeout()))
     client = client_factory(api_key, MOONSHOT_BASE_URL)
     history = list(messages)
