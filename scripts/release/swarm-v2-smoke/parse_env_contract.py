@@ -23,7 +23,22 @@ from __future__ import annotations
 import json
 import sys
 
-# Expected non-secret variable VALUES for the production Swarm V2 smoke.
+# SPENT HISTORICAL AUTHORIZATION — NOT a live operating envelope.
+#
+# These are the values the production Swarm V2 smoke window was authorized
+# and executed under. That authorization is consumed, and the envelope below
+# is deliberately WIDER than the reviewed first-run policy that governs any
+# new paid run (200 model calls vs 150, $4.00 vs $3.00, 900,000 tokens vs
+# 600,000, 3300s vs 1800s, provider concurrency 8 vs 2, 8 logical workers
+# vs 2). It is kept verbatim because rewriting it would falsify what
+# production actually ran, and it is NOT consolidated into
+# `backend/runtime_policy.py` for the same reason.
+#
+# Nothing derives a live limit from this file. The authority for what a run
+# may do today is `backend/runtime_policy.py`; Stage D generates its pins
+# from there, and a paid deployment carrying the values below would now be
+# refused at startup as wider than the reviewed envelope.
+#
 # tests/test_release_tooling_swarm_smoke.py cross-checks every name here
 # against the names the backend actually reads (BudgetConfig.ENV_KEYS,
 # ProviderLimitsConfig.ENV_KEYS and the worker's os.getenv calls), so this

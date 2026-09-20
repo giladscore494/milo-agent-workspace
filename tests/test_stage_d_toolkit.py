@@ -39,6 +39,11 @@ from pathlib import Path
 
 import pytest
 
+from backend.provider_scheduler import ProviderLimitsConfig
+from backend.runtime_policy import (CAP_ENV_PREFIXES, DIMENSIONS, ENGINE_ENV_PREFIXES,
+                                    PROVIDER, PROVIDER_ENV_PREFIXES,
+                                    reviewed_first_run_policy)
+
 REPO = Path(__file__).resolve().parents[1]
 STAGE_D = REPO / "scripts" / "release" / "stage-d"
 STAGE_C = REPO / "scripts" / "release" / "stage-c"
@@ -77,23 +82,24 @@ CONSUMED_KEYS = (
     GOV_KEY,
 )
 
-CAPS = (
-    "MILO_MAX_MODEL_CALLS_PER_RUN=150,MILO_MAX_INPUT_TOKENS_PER_RUN=500000,"
-    "MILO_MAX_OUTPUT_TOKENS_PER_RUN=120000,MILO_MAX_TOTAL_TOKENS_PER_RUN=600000,"
-    "MILO_MAX_ESTIMATED_COST_PER_RUN=3.00,MILO_MAX_COST_PER_RUN=1.00,"
-    "MILO_MAX_RUN_DURATION_SECONDS=1800,MILO_MAX_RETRIES=15,MILO_MAX_AGENT_STEPS=56,"
-    "MILO_MAX_CONCURRENT_RUNS_PER_USER=1,MILO_MAX_CONCURRENT_RUNS_PER_PROJECT=1,"
-    "MILO_DAILY_USER_BUDGET=4.00,MILO_DAILY_PROJECT_BUDGET=4.00,MILO_ESTIMATED_COST_PER_CALL=0.02"
-)
+# The operating envelope, READ from the ONE canonical runtime policy exactly
+# as `stage-d-env.sh` now generates it. This file used to carry its own
+# transcription of all three groups, which made the whole suite a proof that
+# one transcription matched another: it passed while the toolkit pinned
+# MILO_PROVIDER_RPM_LIMIT=350 against MILO's organization ceiling of 80 --
+# a posture `ProviderLimitsConfig.from_env` refuses, so no Worker could have
+# started under it.
+POLICY = reviewed_first_run_policy()
 
-# Byte-for-byte the Stage C Attempt 7 envelope. Production currently
-# carries MILO_PROVIDER_MAX_CONCURRENCY=8; restoring 2 is a tightening.
-PROVIDER_LIMITS = (
-    "MILO_PROVIDER_MAX_CONCURRENCY=2,MILO_PROVIDER_RPM_LIMIT=350,"
-    "MILO_PROVIDER_TPM_LIMIT=2400000,MILO_PROVIDER_MAX_RATE_LIMIT_RETRIES=5,"
-    "MILO_PROVIDER_MAX_BACKPRESSURE_WAIT_SECONDS=240,"
-    "MILO_PROVIDER_BACKOFF_BASE_SECONDS=2,MILO_PROVIDER_BACKOFF_MAX_SECONDS=30"
-)
+
+def _rendered(prefixes) -> str:
+    return ",".join(f"{k}={v}" for k, v in POLICY.env_expectations(prefixes=prefixes).items())
+
+
+CAPS = _rendered(CAP_ENV_PREFIXES)
+PROVIDER_LIMITS = _rendered(PROVIDER_ENV_PREFIXES)
+ENGINE_LIMITS = _rendered(ENGINE_ENV_PREFIXES)
+POLICY_FINGERPRINT = POLICY.fingerprint()
 
 # The Stage C caps, as the consumed Stage C authorization pinned them. No
 # Stage D cap may ever exceed its Stage C counterpart.
@@ -184,7 +190,8 @@ AUTHORIZED = {
     "STAGE_D_WORKFLOW_KEY": "vehicle_catalog_v1",
 }
 
-EXTRA_DUMPED = ["STAGE_D_CAPS", "STAGE_D_REGISTRY", "STAGE_D_API_URL",
+EXTRA_DUMPED = ["STAGE_D_CAPS", "STAGE_D_WORKER_ENGINE_LIMITS",
+                "STAGE_D_POLICY_FINGERPRINT", "STAGE_D_REGISTRY", "STAGE_D_API_URL",
                 "STAGE_D_PROJECT_SLUG", "STAGE_D_FORBIDDEN_PROJECT_IDS"]
 
 
@@ -209,25 +216,42 @@ def test_env_exports_the_exact_authorized_constants():
     assert f"STAGE_D_CAPS={CAPS}" in result.stdout
 
 
-def test_env_pins_all_seven_provider_limits_exactly():
+def test_env_pins_every_provider_limit_the_runtime_actually_reads():
+    """Pinned by DERIVATION: every provider dimension the policy declares.
+
+    The old version of this test listed the seven names and their values by
+    hand, which is how it certified an RPM of 350 that the runtime refuses.
+    """
     result = source_stage_d_env()
     assert result.returncode == 0, result.stderr
     line = next(r for r in result.stdout.splitlines() if r.startswith("STAGE_D_WORKER_PROVIDER_LIMITS="))
     pinned = parse_pairs(line.split("=", 1)[1])
-    assert pinned == {
-        # Restores the Attempt 7 value; production currently carries 8.
-        "MILO_PROVIDER_MAX_CONCURRENCY": "2",
-        "MILO_PROVIDER_RPM_LIMIT": "350",
-        "MILO_PROVIDER_TPM_LIMIT": "2400000",
-        "MILO_PROVIDER_MAX_RATE_LIMIT_RETRIES": "5",
-        "MILO_PROVIDER_MAX_BACKPRESSURE_WAIT_SECONDS": "240",
-        "MILO_PROVIDER_BACKOFF_BASE_SECONDS": "2",
-        "MILO_PROVIDER_BACKOFF_MAX_SECONDS": "30",
-    }
+    assert pinned == POLICY.env_expectations(prefixes=PROVIDER_ENV_PREFIXES)
+    assert set(pinned) == {DIMENSIONS[d].env_key for d in DIMENSIONS
+                           if DIMENSIONS[d].enforced_by == PROVIDER}
+    # Restores the Attempt 7 concurrency; production currently carries 8.
+    assert pinned["MILO_PROVIDER_MAX_CONCURRENCY"] == "2"
+    # And the pinned envelope is one the runtime will actually accept.
+    ProviderLimitsConfig.from_env(dict(pinned))
     # Provider scheduling must NOT ride along in STAGE_D_CAPS (caps are
     # applied and verified on BOTH surfaces; the envelope is worker-only).
     caps_line = next(r for r in result.stdout.splitlines() if r.startswith("STAGE_D_CAPS="))
     assert "MILO_PROVIDER_" not in caps_line
+
+
+def test_env_pins_the_engine_parallelism_and_the_policy_fingerprint():
+    """Newly pinned, because both were reachable ways to widen a paid run.
+
+    MILO_SWARM_MAX_ACTIVE_WORKERS was never pinned by this toolkit and its
+    code default of 4 is WIDER than the reviewed width of 2.
+    """
+    result = source_stage_d_env()
+    assert result.returncode == 0, result.stderr
+    line = next(r for r in result.stdout.splitlines()
+                if r.startswith("STAGE_D_WORKER_ENGINE_LIMITS="))
+    assert parse_pairs(line.split("=", 1)[1]) == POLICY.env_expectations(
+        prefixes=ENGINE_ENV_PREFIXES)
+    assert f"STAGE_D_POLICY_FINGERPRINT={POLICY_FINGERPRINT}" in result.stdout
 
 
 @pytest.mark.parametrize("var,hostile", [
@@ -358,10 +382,11 @@ def stage_d_caps() -> dict[str, float]:
     return {k: float(v) for k, v in parse_pairs(CAPS).items()}
 
 
-def test_env_caps_match_the_documented_stage_d_values():
+def test_env_caps_are_the_canonical_runtime_policy_value_for_value():
     result = source_stage_d_env()
     line = next(r for r in result.stdout.splitlines() if r.startswith("STAGE_D_CAPS="))
-    assert parse_pairs(line.split("=", 1)[1]) == parse_pairs(CAPS)
+    assert parse_pairs(line.split("=", 1)[1]) == POLICY.env_expectations(
+        prefixes=CAP_ENV_PREFIXES)
 
 
 @pytest.mark.parametrize("name,stage_c_value", sorted(STAGE_C_CAPS.items()))
@@ -372,7 +397,20 @@ def test_no_stage_d_cap_exceeds_its_stage_c_counterpart(name, stage_c_value):
 
 def test_every_cap_stage_c_pinned_is_still_pinned_by_stage_d():
     """No cap may be silently dropped — an absent cap is an unbounded one."""
-    assert set(stage_d_caps()) == set(STAGE_C_CAPS)
+    assert set(STAGE_C_CAPS) <= set(stage_d_caps())
+
+
+def test_stage_d_additionally_pins_the_plan_shape_stage_c_never_did():
+    """The three dimensions the reviewed profile advertised and nothing pinned.
+
+    Stage C bounded model calls, tokens, cost and duration. It bounded
+    nothing about plan SHAPE, so the Swarm V2 firewall ran on its own
+    defaults -- 64 tasks, 3 replans, 100 tool calls -- inside a profile that
+    advertised 23, 1 and 24.
+    """
+    added = set(stage_d_caps()) - set(STAGE_C_CAPS)
+    assert added == {"MILO_MAX_TASKS_PER_RUN", "MILO_MAX_TOOL_CALLS_PER_RUN",
+                     "MILO_MAX_REPLANS_PER_RUN"}
 
 
 @pytest.mark.parametrize("name,observed", [
@@ -430,12 +468,21 @@ def test_retry_allowance_is_held_not_tightened():
     assert stage_d_caps()["MILO_MAX_RETRIES"] == STAGE_C_CAPS["MILO_MAX_RETRIES"]
 
 
-def test_env_documents_the_reason_for_every_non_tightened_cap():
-    text = (STAGE_D / "stage-d-env.sh").read_text()
+def test_the_policy_documents_the_reason_for_every_non_tightened_cap():
+    """The reasons live with the numbers, which now live in ONE place.
+
+    They used to be a comment block in stage-d-env.sh beside a second copy of
+    the envelope. Moving the numbers into the canonical policy without moving
+    their justification would have left the reviewed values unexplained.
+    """
+    text = (REPO / "backend" / "runtime_policy.py").read_text()
     assert "RETRY_LIMIT_REACHED" in text
-    assert "MILO_MAX_OUTPUT_TOKENS_PER_RUN keeps a 3.5x margin" in text
+    assert "3.5x rather than 1.75x" in text
     for observed in ("84", "277,882", "34,136", "312,018", "0.252069", "934.235"):
         assert observed in text, f"the Attempt 7 evidence value {observed} is not cited"
+    env_text = (STAGE_D / "stage-d-env.sh").read_text()
+    assert "backend/runtime_policy.py" in env_text, (
+        "stage-d-env.sh no longer points at the authority its envelope comes from")
 
 
 # ---------------------------------------------------------------------------
@@ -446,8 +493,9 @@ def env_entries(pairs: str) -> list[dict]:
     return [{"name": k, "value": v} for k, v in parse_pairs(pairs).items()]
 
 
-def worker_spec(*, caps=CAPS, provider=PROVIDER_LIMITS, image=None, bind_key=True, extra=None):
-    env = env_entries(caps) + env_entries(provider) + [
+def worker_spec(*, caps=CAPS, provider=PROVIDER_LIMITS, engine=ENGINE_LIMITS,
+                image=None, bind_key=True, extra=None):
+    env = env_entries(caps) + env_entries(provider) + env_entries(engine) + [
         {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "true"},
         {"name": "MILO_ENABLE_CATALOG_EXECUTION", "value": "false"},
     ]
@@ -476,7 +524,8 @@ def api_spec(*, caps=CAPS, image=None, extra=None):
     ]}}}}
 
 
-def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_LIMITS):
+def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_LIMITS,
+                    engine_limits=ENGINE_LIMITS, fingerprint=None):
     worker_path = tmp_path / "worker.json"
     api_path = tmp_path / "api.json"
     worker_path.write_text(json.dumps(worker))
@@ -486,6 +535,8 @@ def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_L
          "--worker-json", str(worker_path), "--api-json", str(api_path)],
         capture_output=True, text=True,
         env={**os.environ, "STAGE_D_CAPS": caps, "STAGE_D_WORKER_PROVIDER_LIMITS": provider_limits,
+             "STAGE_D_WORKER_ENGINE_LIMITS": engine_limits,
+             "STAGE_D_POLICY_FINGERPRINT": fingerprint or POLICY_FINGERPRINT,
              "STAGE_D_REGISTRY": REGISTRY, "STAGE_D_RELEASE_SHA": RELEASE_SHA,
              "STAGE_D_API_IMAGE_DIGEST": API_DIGEST, "STAGE_D_WORKER_IMAGE_DIGEST": WORKER_DIGEST},
         timeout=60,
@@ -531,6 +582,8 @@ def test_verify_caps_fails_closed_without_the_accepted_digests(tmp_path):
          "--worker-json", str(tmp_path / "w.json"), "--api-json", str(tmp_path / "a.json")],
         capture_output=True, text=True,
         env={**os.environ, "STAGE_D_CAPS": CAPS, "STAGE_D_WORKER_PROVIDER_LIMITS": PROVIDER_LIMITS,
+             "STAGE_D_WORKER_ENGINE_LIMITS": ENGINE_LIMITS,
+             "STAGE_D_POLICY_FINGERPRINT": POLICY_FINGERPRINT,
              "STAGE_D_REGISTRY": REGISTRY, "STAGE_D_RELEASE_SHA": RELEASE_SHA,
              "STAGE_D_API_IMAGE_DIGEST": "", "STAGE_D_WORKER_IMAGE_DIGEST": ""},
         timeout=60,
@@ -623,13 +676,35 @@ def test_verify_caps_requires_the_worker_secret_binding(tmp_path):
 
 
 def test_verify_caps_tolerates_unrelated_live_worker_variables(tmp_path):
-    """The live worker carries swarm/model variables that are not caps."""
+    """Model selection is not part of the envelope, so it is not verified."""
     extra = [
-        {"name": "MILO_SWARM_MAX_ACTIVE_WORKERS", "value": "8"},
         {"name": "MILO_COMMANDER_MODEL", "value": "kimi-k2.6"},
         {"name": "MILO_MODEL_BASE_URL", "value": "https://api.moonshot.ai/v1"},
     ]
     assert run_verify_caps(tmp_path, worker_spec(extra=extra), api_spec()).returncode == 0
+
+
+def test_verify_caps_refuses_the_swarm_width_that_used_to_be_unverified(tmp_path):
+    """MILO_SWARM_MAX_ACTIVE_WORKERS=8 was tolerated as "unrelated".
+
+    It is not unrelated: it is the Swarm V2 queueing width, the canonical
+    policy reviews it at 2, and a paid Worker carrying 8 would have run at
+    four times the reviewed width with every Stage D check passing.
+    """
+    extra = [{"name": "MILO_SWARM_MAX_ACTIVE_WORKERS", "value": "8"}]
+    result = run_verify_caps(tmp_path, worker_spec(extra=extra), api_spec())
+    assert result.returncode != 0
+    assert "MILO_SWARM_MAX_ACTIVE_WORKERS" in result.stdout
+
+
+def test_verify_caps_refuses_an_engine_variable_on_the_api(tmp_path):
+    """Engine parallelism belongs to the Worker alone, like provider limits."""
+    api = api_spec()
+    api["spec"]["template"]["spec"]["containers"][0]["env"].append(
+        {"name": "MILO_SWARM_MAX_ACTIVE_WORKERS", "value": "2"})
+    result = run_verify_caps(tmp_path, worker_spec(), api)
+    assert result.returncode != 0
+    assert "must NEVER be set on the API service" in result.stdout
 
 
 # ---------------------------------------------------------------------------

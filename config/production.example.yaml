@@ -51,15 +51,30 @@ release:
   # Last known-good release SHA used as the rollback target.
   rollback_sha: "<PREVIOUS_RELEASE_SHA>"
 
-# Environment-variable NAMES that carry budget caps (values are configured
-# on the Cloud Run services, not here).
+# Environment-variable NAMES that carry the run's enforceable limits (values
+# are configured on the Cloud Run services, not here). This list must cover
+# every dimension backend/runtime_policy.py marks mandatory for paid
+# execution; validate_production_manifest.py derives that set from the policy
+# and rejects a manifest that has fallen behind it.
 budgets:
-  - MILO_MAX_COST_PER_RUN
-  - MILO_DAILY_USER_BUDGET
   - MILO_DAILY_PROJECT_BUDGET
+  - MILO_DAILY_USER_BUDGET
+  - MILO_MAX_AGENT_STEPS
+  - MILO_MAX_CONCURRENT_RUNS_PER_PROJECT
+  - MILO_MAX_CONCURRENT_RUNS_PER_USER
+  - MILO_MAX_COST_PER_RUN
+  - MILO_MAX_ESTIMATED_COST_PER_RUN
+  - MILO_MAX_INPUT_TOKENS_PER_RUN
   - MILO_MAX_MODEL_CALLS_PER_RUN
-  - MILO_MAX_TOTAL_TOKENS_PER_RUN
+  - MILO_MAX_OUTPUT_TOKENS_PER_RUN
+  - MILO_MAX_REPLANS_PER_RUN
+  - MILO_MAX_RETRIES
   - MILO_MAX_RUN_DURATION_SECONDS
+  - MILO_MAX_TASKS_PER_RUN
+  - MILO_MAX_TOOL_CALLS_PER_RUN
+  - MILO_MAX_TOTAL_TOKENS_PER_RUN
+  - MILO_PROVIDER_TPM_LIMIT
+  - MILO_SWARM_MAX_ACTIVE_WORKERS
 
 # Execution flags with their required Stage A values. Validation rejects a
 # manifest that turns any of these on during Stage A.

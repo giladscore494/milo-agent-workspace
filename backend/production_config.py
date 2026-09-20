@@ -22,8 +22,12 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from backend.budget import BudgetConfig
+from backend.runtime_policy import TRUE_VALUES as _POLICY_TRUE_VALUES
+from backend.runtime_policy import catalog_posture_violations, policy_violations
 
-TRUE_VALUES = {"1", "true", "yes", "on"}
+#: Re-exported from the canonical runtime policy so "an operator turned this
+#: on" has exactly ONE spelling in the repository.
+TRUE_VALUES = set(_POLICY_TRUE_VALUES)
 
 # A hosted Supabase project ref: 20 lowercase alphanumerics. The shape is
 # validated rather than trusted so a placeholder, a wildcard, a URL pasted
@@ -196,22 +200,42 @@ def validate(env: dict[str, str] | None = None) -> ConfigReport:
     if production and not origins:
         error("CORS_MISSING", "ALLOWED_CORS_ORIGINS must be set in production")
 
-    # 3. Execution requires budget caps.
+    # 3. Unpaid run creation requires the budget floor. This is deliberately
+    # the SMALLER set: an unpaid run cannot spend, because the paid-execution
+    # kill switch refuses every provider call while it is off.
     budget = BudgetConfig.from_env(env)
     execution_enabled = _flag(env, "MILO_ENABLE_RUN_CREATION")
     paid_enabled = _flag(env, "MILO_ENABLE_PAID_EXECUTION")
     if execution_enabled:
-        missing = budget.missing_mandatory()
+        missing = budget.missing_for_run_creation()
         if missing:
             (error if production else warn)("EXECUTION_WITHOUT_BUDGET", f"run creation enabled without mandatory budget caps: {', '.join(missing)}")
 
-    # 4. Paid execution requires a provider key AND budget caps.
+    # 4. Paid execution requires a provider key AND the WHOLE canonical
+    # runtime policy. This is the gate the architecture exists for: the
+    # reviewed first-run envelope is one machine-readable document, and a
+    # deployment that cannot satisfy it never starts. A deployment may
+    # TIGHTEN any reviewed limit; a wider, absent, unparseable or
+    # self-contradictory one is refused here, before any run exists.
     if paid_enabled:
         if not (env.get("KIMI_API_KEY") or env.get("MOONSHOT_API_KEY")):
             # We never read the value; only assert the variable name is present.
             (error if production else warn)("PAID_WITHOUT_PROVIDER_KEY", "paid execution enabled without a provider API key configured")
         if budget.missing_mandatory():
             error("PAID_WITHOUT_BUDGET", "paid execution enabled without mandatory budget caps")
+        for violation in policy_violations(env, paid=True):
+            # Policy messages name variables and reviewed bounds, never the
+            # configured value.
+            error(violation.code, violation.message)
+
+    # 4b. Catalog capability combinations that cannot be honoured are refused
+    # HERE, whatever the paid posture, rather than at worker construction
+    # after a run has been created and a lease acquired. Arming canonical
+    # promotion for data a deployment is not allowed to READ is the case that
+    # matters: it is a contradiction in the configuration itself, and the
+    # master kill switch masking it does not make it coherent.
+    for violation in catalog_posture_violations(env):
+        error(violation.code, violation.message)
 
     # 5. Worker mutations require service-to-service auth configuration.
     if _flag(env, "MILO_ENABLE_EXECUTION_CONTROL"):

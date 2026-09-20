@@ -102,7 +102,7 @@ cleanup never depend on you copying an id out of the terminal.
   echo "== 3.2 Worker: paid flag + strict caps + provider envelope + provider key (worker only)"
   gcloud run jobs update "${STAGE_D_WORKER_JOB}" \
     --project="${STAGE_D_PROJECT}" --region="${STAGE_D_REGION}" \
-    --update-env-vars "MILO_ENABLE_PAID_EXECUTION=${STAGE_D_ON},${STAGE_D_CAPS},${STAGE_D_WORKER_PROVIDER_LIMITS}" \
+    --update-env-vars "MILO_ENABLE_PAID_EXECUTION=${STAGE_D_ON},${STAGE_D_CAPS},${STAGE_D_WORKER_PROVIDER_LIMITS},${STAGE_D_WORKER_ENGINE_LIMITS}" \
     --update-secrets "KIMI_API_KEY=KIMI_API_KEY:latest"
 
   echo "== 3.3 API: run creation + launcher + caps (paid flag STAYS false)"

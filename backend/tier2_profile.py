@@ -43,6 +43,17 @@ from backend.provider_quota import (KIMI_TIER2_PROVIDER_LIMITS, MAX_INFERENCE_CO
                                     SEARCH_BASIC, SEARCH_PRO, SEARCH_QPS_FALLBACK,
                                     SEARCH_QPS_VERIFIED, WINDOW_SECONDS, QuotaConfig)
 from backend.engines.swarm_v2.model_gateway import ROLE_OUTPUT_CAPS
+from backend.runtime_policy import (CAP_ENV_PREFIXES, ENGINE_ENV_PREFIXES,
+                                    MANDATORY_FOR_PAID_EXECUTION, POLICY_ENV_KEYS,
+                                    PROVIDER_ENV_PREFIXES, reviewed_first_run_policy)
+
+#: The ONE canonical runtime policy, resolved at its reviewed values. Every
+#: number in ``active_profile`` below is READ from it rather than restated:
+#: this module is a document ABOUT the policy, and a document that can
+#: disagree with the thing it documents is the defect
+#: ``backend.runtime_policy`` exists to remove.
+REVIEWED_POLICY = reviewed_first_run_policy()
+_P = REVIEWED_POLICY.values
 
 #: Where the account-specific Tier evidence came from and when.
 TIER_VERIFICATION = {
@@ -58,12 +69,14 @@ TIER_VERIFICATION = {
 }
 
 #: The one authorized paid worker execution for the first paid stage.
-FIRST_PAID_RUN_EXECUTION_CAP = 1
+#: Declared by the canonical policy; re-exported here for the callers that
+#: have always imported it from this module.
+FIRST_PAID_RUN_EXECUTION_CAP = int(_P["first_paid_run_execution_cap"])
 
 #: Hard monetary cap. Kept well under USD 10; USD 3 is the estimated-cost
 #: ceiling and the recorded-cost ceiling is tighter still, because the V1
 #: evidence run cost $0.34 and no evidence says more is needed.
-HARD_MONETARY_CAP_USD = 3.00
+HARD_MONETARY_CAP_USD = float(_P["hard_monetary_cap_usd"])
 
 
 def _request_lease_invariant() -> dict[str, Any]:
@@ -245,22 +258,35 @@ def tier2_first_run_profile() -> dict[str, Any]:
             "search_qps": "minimum interval between globally admitted requests per endpoint",
             "key_scope": "server-owned (MILO_PROVIDER_QUOTA_SCOPE); never client-supplied",
         },
+        # Every value below is READ from the canonical runtime policy.
+        # Nothing here is a second, independently maintained copy of a limit.
+        "runtime_policy": {
+            "authority": "backend/runtime_policy.py",
+            "schema_version": REVIEWED_POLICY.document()["schema_version"],
+            "fingerprint": REVIEWED_POLICY.fingerprint(),
+            "required_environment": REVIEWED_POLICY.env_expectations(),
+            "mandatory_for_paid_execution": sorted(
+                POLICY_ENV_KEYS[name] for name in MANDATORY_FOR_PAID_EXECUTION),
+            "deployment_may": "tighten any reviewed limit",
+            "deployment_may_never": "widen one, silently or otherwise",
+        },
         "active_profile": {
             "engine_active_concurrency": {
                 # Bounded by the coordinator either way; these are the
                 # per-engine values the first paid run should be configured with.
-                "vehicle_catalog_v1_technical_parallelism": 4,
-                "swarm_v2_max_active_workers": 2,
+                "vehicle_catalog_v1_technical_parallelism":
+                    int(_P["v1_technical_parallelism"]),
+                "swarm_v2_max_active_workers": int(_P["v2_max_active_workers"]),
                 # These are QUEUEING widths, not provider-concurrency grants.
-                # The scheduler admits `ProviderLimitsConfig.max_concurrency`
-                # at a time, which defaults to 2 and which Stage D pins at 2 --
-                # so a "parallelism 4" profile still makes two simultaneous
-                # provider calls, and reading 4 as a throughput estimate would
-                # overstate the speed-up by 2x.
-                "effective_simultaneous_provider_calls": 2,
+                # The scheduler admits `provider_max_concurrency` at a time,
+                # which the policy pins at 2 -- so a "parallelism 4" profile
+                # still makes two simultaneous provider calls, and reading 4 as
+                # a throughput estimate would overstate the speed-up by 2x.
+                "effective_simultaneous_provider_calls":
+                    int(_P["provider_max_concurrency"]),
                 "effective_simultaneous_provider_calls_source": (
-                    "ProviderLimitsConfig.max_concurrency default 2; Stage D pins "
-                    "MILO_PROVIDER_MAX_CONCURRENCY=2"),
+                    "the canonical runtime policy's provider_max_concurrency, "
+                    "which ProviderLimitsConfig and Stage D both derive from"),
                 "note": ("engine parallelism is a queueing width, additionally "
                          "clamped to the provider capacity actually available; "
                          "more logical workers than provider slots only queue "
@@ -269,22 +295,23 @@ def tier2_first_run_profile() -> dict[str, Any]:
             "max_simultaneous_provider_using_worker_executions": FIRST_PAID_RUN_EXECUTION_CAP,
             "first_paid_run_execution_cap": FIRST_PAID_RUN_EXECUTION_CAP,
             "no_automatic_relaunch_after_terminal_failure": True,
-            "rpm": 40,
-            "tpm": 1_200_000,
-            "search_basic_qps": SEARCH_QPS_FALLBACK[SEARCH_BASIC],
-            "search_pro_qps": SEARCH_QPS_FALLBACK[SEARCH_PRO],
+            "rpm": int(_P["provider_rpm_limit"]),
+            "tpm": int(_P["provider_tpm_limit"]),
+            "search_basic_qps": int(_P["search_basic_qps"]),
+            "search_pro_qps": int(_P["search_pro_qps"]),
             "role_output_caps": {f"{kind}:{phase}": cap
                                  for (kind, phase), cap in sorted(ROLE_OUTPUT_CAPS.items())},
-            "max_model_calls_per_run": 150,
-            "max_input_tokens_per_run": 500_000,
-            "max_output_tokens_per_run": 120_000,
-            "max_total_tokens_per_run": 600_000,
-            "max_tasks": 23,
-            "max_agent_steps": 56,
-            "max_tool_calls": 24,
-            "max_replans": 1,
-            "max_retries": 15,
-            "max_provider_attempts_per_call": 1 + 5,
+            "max_model_calls_per_run": int(_P["max_model_calls_per_run"]),
+            "max_input_tokens_per_run": int(_P["max_input_tokens_per_run"]),
+            "max_output_tokens_per_run": int(_P["max_output_tokens_per_run"]),
+            "max_total_tokens_per_run": int(_P["max_total_tokens_per_run"]),
+            "max_tasks": int(_P["max_tasks"]),
+            "max_agent_steps": int(_P["max_agent_steps"]),
+            "max_tool_calls": int(_P["max_tool_calls"]),
+            "max_tool_calls_per_task": int(_P["max_tool_calls_per_task"]),
+            "max_replans": int(_P["max_replans"]),
+            "max_retries": int(_P["max_retries"]),
+            "max_provider_attempts_per_call": REVIEWED_POLICY.max_provider_attempts_per_call,
             "sdk_automatic_retries": 0,
             "provider_request_timeout_seconds": QuotaConfig().request_deadline_seconds,
             "provider_lease_ttl_seconds": QuotaConfig().lease_ttl_seconds,
@@ -292,13 +319,19 @@ def tier2_first_run_profile() -> dict[str, Any]:
                 QuotaConfig().ownership_probe_interval_seconds,
             "provider_lease_abandoned_reclaim_seconds":
                 QuotaConfig().abandoned_lease_reclaim_seconds,
-            "max_run_duration_seconds": 1800,
+            "max_run_duration_seconds": int(_P["max_run_duration_seconds"]),
+            "max_concurrent_runs_per_user": int(_P["max_concurrent_runs_per_user"]),
+            "max_concurrent_runs_per_project": int(_P["max_concurrent_runs_per_project"]),
             "worker_lease_seconds": 300,
             "worker_heartbeat_interval_seconds": 30,
-            "provider_backpressure_stall_limit_seconds": 240,
-            "estimated_cost_usd": 3.00,
+            "provider_backpressure_stall_limit_seconds":
+                int(_P["provider_max_backpressure_wait_seconds"]),
+            "estimated_cost_usd": float(_P["max_estimated_cost_per_run"]),
             "hard_monetary_cap_usd": HARD_MONETARY_CAP_USD,
-            "recorded_cost_cap_usd": 1.00,
+            "recorded_cost_cap_usd": float(_P["max_cost_per_run"]),
+            "daily_user_budget_usd": float(_P["daily_user_budget"]),
+            "daily_project_budget_usd": float(_P["daily_project_budget"]),
+            "estimated_cost_per_call_usd": float(_P["estimated_cost_per_call"]),
         },
         "evidence": {
             "run_id": "3772fc84-420c-4a66-9e79-d58649d4e9b4",
@@ -323,5 +356,16 @@ def tier2_first_run_profile() -> dict[str, Any]:
     }
 
 
+#: The exact environment a deployment must carry to BE the reviewed profile,
+#: grouped the way the release toolkit pins it. Generated, never transcribed.
+def reviewed_environment() -> dict[str, dict[str, str]]:
+    return {
+        "caps": REVIEWED_POLICY.env_expectations(prefixes=CAP_ENV_PREFIXES),
+        "provider_limits": REVIEWED_POLICY.env_expectations(prefixes=PROVIDER_ENV_PREFIXES),
+        "engine_limits": REVIEWED_POLICY.env_expectations(prefixes=ENGINE_ENV_PREFIXES),
+    }
+
+
 __all__ = ["FIRST_PAID_RUN_EXECUTION_CAP", "HARD_MONETARY_CAP_USD",
-           "TIER_VERIFICATION", "tier2_first_run_profile"]
+           "REVIEWED_POLICY", "TIER_VERIFICATION", "reviewed_environment",
+           "tier2_first_run_profile"]

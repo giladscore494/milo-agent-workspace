@@ -10,6 +10,7 @@ import pytest
 
 from backend.budget import BudgetConfig, BudgetTracker, GuardedModelClient
 from backend.engines.vehicle_catalog_v1 import core
+from backend.runtime_policy import reviewed_first_run_policy
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 
 
@@ -246,13 +247,13 @@ def test_worker_refuses_invalid_provider_limit_configuration(monkeypatch):
         def mark_run_complete(self, run_id, output, worker_id=None, attempt=None, lease_token=None):
             raise AssertionError("must not complete")
 
+    # The COMPLETE reviewed envelope, so the ONLY thing wrong with this
+    # deployment is the provider limit -- and the refusal still names the
+    # provider surface rather than collapsing into a generic policy error.
     monkeypatch.delenv("MILO_WORKER_ENGINE", raising=False)
     monkeypatch.setenv("MILO_ENABLE_PAID_EXECUTION", "true")
-    monkeypatch.setenv("MILO_MAX_MODEL_CALLS_PER_RUN", "10")
-    monkeypatch.setenv("MILO_MAX_TOTAL_TOKENS_PER_RUN", "1000")
-    monkeypatch.setenv("MILO_MAX_ESTIMATED_COST_PER_RUN", "1")
-    monkeypatch.setenv("MILO_MAX_RUN_DURATION_SECONDS", "60")
-    monkeypatch.setenv("MILO_MAX_RETRIES", "1")
+    for key, value in reviewed_first_run_policy().env_expectations().items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setenv("MOONSHOT_API_KEY", "test-worker-only-key")
     monkeypatch.setenv("MILO_PROVIDER_RPM_LIMIT", "unlimited")
     repo = MiniRepo()

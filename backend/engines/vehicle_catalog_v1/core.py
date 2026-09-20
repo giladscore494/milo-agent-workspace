@@ -1133,7 +1133,13 @@ def technical_parallelism(env: Optional[Dict[str, str]] = None) -> int:
         raise ValueError("MILO_V1_TECHNICAL_PARALLELISM must be an integer") from None
     if not 1 <= value <= 32:
         raise ValueError("MILO_V1_TECHNICAL_PARALLELISM must be between 1 and 32")
-    return value
+    # Bounded by the ONE canonical runtime policy as well, so this engine and
+    # the reviewed first-run profile cannot describe different widths. The
+    # policy only ever narrows: a deployment may run this phase more
+    # sequentially than the reviewed 4, never more widely.
+    from backend.runtime_policy import DIMENSIONS
+
+    return min(value, int(DIMENSIONS["v1_technical_parallelism"].reviewed))
 
 
 def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

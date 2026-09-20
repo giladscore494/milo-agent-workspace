@@ -25,6 +25,11 @@ stage_d_refuse() {
   exit 1
 }
 
+# Where this file lives, so the generated envelope below can find the
+# canonical policy regardless of the operator's working directory.
+STAGE_D_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export STAGE_D_DIR
+
 stage_d_pin() { # VAR AUTHORIZED_VALUE — export VAR, failing closed on conflict
   local var="$1" authorized="$2" current
   current="${!var-}"
@@ -252,89 +257,61 @@ stage_d_pin STAGE_D_FORBIDDEN_PROJECT_IDS "677db6c2-b44c-41c1-b4e1-b51229d697df,
 export STAGE_D_ON="true"
 
 # ---------------------------------------------------------------------------
-# Strict caps, DERIVED FROM the successful Stage C Attempt 7 evidence.
+# The OPERATING ENVELOPE — generated, never transcribed.
 #
-# Attempt 7 (run 8b4a4277…, terminal `completed`, verified read-only
-# against production 2026-09-18) actually consumed:
-#   84 model calls · 277,882 input + 34,136 output = 312,018 tokens ·
-#   tracked actual_cost $0.252069 · estimated_cost $1.68 · 32 agent steps ·
-#   934.235s elapsed · 0 retries · 0 backpressure events ·
-#   84 reservations, 84 settled, 0 dangling.
+# Every cap, provider limit and engine-parallelism value below is READ from
+# the ONE canonical runtime policy (`backend/runtime_policy.py`) through
+# `policy_envelope.py`. Stage D no longer keeps its own copy of the envelope,
+# for a concrete reason: the copy it used to keep had drifted into a posture
+# the runtime refuses. It pinned MILO_PROVIDER_RPM_LIMIT=350 against an
+# organization ceiling of 80, and `ProviderLimitsConfig.from_env` raises on
+# exactly that — so the pinned Stage D posture could not have started a
+# worker, and nothing in the toolkit could see it, because the toolkit was
+# verifying its own transcription rather than the runtime's policy.
 #
-# Derivation rule: cap = smallest round value >= 1.75x the Attempt 7
-# observation, and NEVER above the Stage C cap. Every value below is
-# therefore lower than or equal to Stage C's; NOTHING is increased.
-# Two deliberate exceptions to the 1.75x rule, both documented:
+# Where the numbers come from is documented once, on the dimensions
+# themselves in `backend/runtime_policy.py`: the run-level caps are the
+# smallest round value at or above 1.75x the Stage C Attempt 7 observation
+# and never above the Stage C cap (run 8b4a4277…, terminal `completed`,
+# 84 model calls · 277,882 + 34,136 tokens · $0.252069 · 32 agent steps ·
+# 934.235s · 0 retries · 0 backpressure), with the two deliberate exceptions
+# — a 3.5x margin on output tokens and a HELD 15 retries — recorded there.
 #
-#   MILO_MAX_OUTPUT_TOKENS_PER_RUN keeps a 3.5x margin instead of 1.75x.
-#   Output volume is the most variable dimension of the preserved pipeline
-#   (verifier chunks plus the Hebrew summary), and Attempt 7's 34,136 is a
-#   single small observation — a 1.75x cap on it would be a likely
-#   false `budget_exhausted`, which wastes the one authorization.
+# Changing a value is a reviewed edit to the policy registry, which changes
+# it for the runtime, for production configuration validation, for the
+# Swarm V2 plan firewall, for the first-run profile and for Stage D at the
+# same time. It cannot be changed for one of them alone.
 #
-#   MILO_MAX_RETRIES is HELD at 15, not tightened, although Attempt 7 used
-#   0. Stage C Attempt 6 FAILED at RETRY_LIMIT_REACHED after repeated
-#   provider 429s; 15 retries TOGETHER WITH the worker-only provider
-#   envelope below is the pair that produced the successful Attempt 7.
-#   Tightening the retry allowance would reintroduce the Attempt 6 failure
-#   mode for no exposure benefit — the cost caps, not the retry count,
-#   bound spend.
-#
-# | Variable                          | Stage C | A7 actual | Stage D | delta |
-# | MILO_MAX_MODEL_CALLS_PER_RUN      |     200 |        84 |     150 |  -25% |
-# | MILO_MAX_INPUT_TOKENS_PER_RUN     |  700000 |   277,882 |  500000 |  -29% |
-# | MILO_MAX_OUTPUT_TOKENS_PER_RUN    |  250000 |    34,136 |  120000 |  -52% |
-# | MILO_MAX_TOTAL_TOKENS_PER_RUN     |  900000 |   312,018 |  600000 |  -33% |
-# | MILO_MAX_ESTIMATED_COST_PER_RUN   |    4.00 |      1.68 |    3.00 |  -25% |
-# | MILO_MAX_COST_PER_RUN             |    3.00 |  0.252069 |    1.00 |  -67% |
-# | MILO_MAX_RUN_DURATION_SECONDS     |    3300 |   934.235 |    1800 |  -45% |
-# | MILO_MAX_RETRIES                  |      15 |         0 |      15 |  hold |
-# | MILO_MAX_AGENT_STEPS              |      60 |        32 |      56 |   -7% |
-# | MILO_MAX_CONCURRENT_RUNS_PER_*    |       1 |         - |       1 |  hold |
-# | MILO_DAILY_{USER,PROJECT}_BUDGET  |    5.00 |         - |    4.00 |  -20% |
-# | MILO_ESTIMATED_COST_PER_CALL      |    0.02 |         - |    0.02 |  hold |
-#
-# Structural invariants the numbers above preserve:
-#   * MILO_MAX_ESTIMATED_COST_PER_RUN = 150 x 0.02 = 3.00 exactly, so the
-#     estimated-cost ceiling admits exactly the 150 reservations the call
-#     cap allows and not one more (backend/budget.py checks
-#     estimated_cost + estimated_cost_per_call > cap).
-#   * MILO_MAX_TOTAL_TOKENS_PER_RUN (600000) sits just under input+output
-#     (620000), so the joint ceiling binds first — the same relationship
-#     Stage C used (900000 < 700000+250000).
-#   * The daily budgets (4.00) stay ABOVE the 3.00 estimated-reservation
-#     ceiling, so a daily budget can never fail the run before the
-#     per-run cap does.
-#   * MILO_MAX_RUN_DURATION_SECONDS (1800) stays far below the Cloud Run
-#     worker job timeoutSeconds of 3600.
-#
-# Comma-separated for gcloud --update-env-vars. Pinned: an inherited
-# STAGE_D_CAPS cannot loosen a cap.
+# Fail closed: if the policy cannot be read, Stage D refuses rather than
+# proceeding with an empty or partial envelope. Pinned with stage_d_pin, so
+# an inherited shell override still cannot loosen anything.
 # ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_CAPS "MILO_MAX_MODEL_CALLS_PER_RUN=150,MILO_MAX_INPUT_TOKENS_PER_RUN=500000,MILO_MAX_OUTPUT_TOKENS_PER_RUN=120000,MILO_MAX_TOTAL_TOKENS_PER_RUN=600000,MILO_MAX_ESTIMATED_COST_PER_RUN=3.00,MILO_MAX_COST_PER_RUN=1.00,MILO_MAX_RUN_DURATION_SECONDS=1800,MILO_MAX_RETRIES=15,MILO_MAX_AGENT_STEPS=56,MILO_MAX_CONCURRENT_RUNS_PER_USER=1,MILO_MAX_CONCURRENT_RUNS_PER_PROJECT=1,MILO_DAILY_USER_BUDGET=4.00,MILO_DAILY_PROJECT_BUDGET=4.00,MILO_ESTIMATED_COST_PER_CALL=0.02"
+stage_d_policy() { # SELECTOR — print one generated envelope group
+  local rendered
+  rendered="$(python3 "${STAGE_D_DIR}/policy_envelope.py" "$1")" || \
+    stage_d_refuse "could not read the canonical runtime policy (policy_envelope.py $1) — refusing to proceed on a partial envelope"
+  [ -n "${rendered}" ] || \
+    stage_d_refuse "the canonical runtime policy produced an EMPTY ${1} group — failing closed"
+  printf '%s' "${rendered}"
+}
 
-# ---------------------------------------------------------------------------
-# WORKER-ONLY provider operating envelope.
-#
-# Byte-for-byte the envelope Stage C Attempt 7 ran under and succeeded with
-# (0 retries, 0 backpressure events). It is NOT re-derived and NOT widened:
-# it is the proven-good configuration, and the production Kimi organization
-# is operator-confirmed Tier 2 (concurrency 100 / RPM 500 / TPM 3,000,000 /
-# TPD unlimited), so the envelope sits far below the account ceiling.
-#
-# MILO_PROVIDER_MAX_CONCURRENCY=2 is a TIGHTENING of the current live
-# value. Production currently carries MILO_PROVIDER_MAX_CONCURRENCY=8 on
-# the Worker (drift introduced by the later swarm-v2 smoke work, verified
-# read-only 2026-09-18). Stage D restores the Attempt 7 value of 2, which
-# matches the preserved V1 engine parallelism
-# (vehicle_catalog_v1/core.MAX_PARALLEL_KIMI_CALLS); no V2 concurrency is
-# introduced, and 03b/verify_caps.py refuse the run while the live value is
-# anything other than 2.
-#
-# Kept SEPARATE from STAGE_D_CAPS because STAGE_D_CAPS is deliberately
-# applied and verified on BOTH the API and the Worker, while provider
-# scheduling belongs to the Worker alone (verify_caps.py fails on any
-# MILO_PROVIDER_* variable found on the API). Pinned: an inherited
-# override cannot loosen the envelope.
-# ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_WORKER_PROVIDER_LIMITS "MILO_PROVIDER_MAX_CONCURRENCY=2,MILO_PROVIDER_RPM_LIMIT=350,MILO_PROVIDER_TPM_LIMIT=2400000,MILO_PROVIDER_MAX_RATE_LIMIT_RETRIES=5,MILO_PROVIDER_MAX_BACKPRESSURE_WAIT_SECONDS=240,MILO_PROVIDER_BACKOFF_BASE_SECONDS=2,MILO_PROVIDER_BACKOFF_MAX_SECONDS=30"
+# Applied and verified on BOTH the API and the Worker.
+stage_d_pin STAGE_D_CAPS "$(stage_d_policy caps)"
+
+# WORKER-ONLY provider operating envelope. Kept separate from STAGE_D_CAPS
+# because provider scheduling belongs to the Worker alone: verify_caps.py
+# fails on any MILO_PROVIDER_* variable found on the API.
+stage_d_pin STAGE_D_WORKER_PROVIDER_LIMITS "$(stage_d_policy provider-limits)"
+
+# WORKER-ONLY engine parallelism. Newly pinned: MILO_SWARM_MAX_ACTIVE_WORKERS
+# was never pinned by this toolkit at all, and its code default of 4 is WIDER
+# than the reviewed width of 2 — so a paid worker could have run a Swarm V2
+# plan at twice the authorized queueing width with every Stage D check
+# passing. The canonical policy makes it mandatory for paid execution, which
+# is what makes leaving it unpinned impossible rather than merely unwise.
+stage_d_pin STAGE_D_WORKER_ENGINE_LIMITS "$(stage_d_policy engine-limits)"
+
+# The digest of the whole policy document. verify_caps.py recomputes it and
+# refuses on any mismatch, so the release toolkit and the runtime can be
+# shown to be talking about the same envelope rather than assumed to be.
+stage_d_pin STAGE_D_POLICY_FINGERPRINT "$(stage_d_policy fingerprint)"

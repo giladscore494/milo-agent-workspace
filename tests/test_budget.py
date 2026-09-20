@@ -21,6 +21,7 @@ from backend.budget import (
 from backend.dependencies import get_job_launcher, get_repository
 from backend.main import app
 from backend.runtime import CancellationRequested
+from backend.runtime_policy import reviewed_first_run_policy
 
 
 def make_tracker(monkeypatch=None, enabled=True, cancellation=None, events=None, usage=None, ledger=None, clock=None, **cfg):
@@ -261,8 +262,17 @@ def test_budget_config_from_env_parses_and_validates(monkeypatch):
     }
     config = BudgetConfig.from_env(env)
     assert config.max_model_calls_per_run == 40
-    assert config.missing_mandatory() == []
+    # Two different floors, deliberately. Unpaid run creation spends nothing,
+    # so it needs these five. PAID execution needs every dimension the
+    # reviewed first-run profile advertises, which is the set the canonical
+    # runtime policy derives -- and it used to name only these five, so a paid
+    # deployment could start with neither an agent-step ceiling nor a
+    # recorded-cost cap.
+    assert config.missing_for_run_creation() == []
+    assert "MILO_MAX_AGENT_STEPS" in config.missing_mandatory()
+    assert "MILO_MAX_COST_PER_RUN" in config.missing_mandatory()
     incomplete = BudgetConfig.from_env({"MILO_MAX_MODEL_CALLS_PER_RUN": "40"})
+    assert "MILO_MAX_TOTAL_TOKENS_PER_RUN" in incomplete.missing_for_run_creation()
     assert "MILO_MAX_TOTAL_TOKENS_PER_RUN" in incomplete.missing_mandatory()
     with pytest.raises(ValueError):
         BudgetConfig.from_env({"MILO_MAX_RETRIES": "-1"})
@@ -513,12 +523,11 @@ def test_worker_refuses_paid_execution_without_provider_key(monkeypatch):
         def latest_checkpoint(self, run_id, workflow_key=None):
             return None
 
+    # The COMPLETE reviewed envelope, so the run reaches the provider-key gate
+    # instead of being refused earlier for an incomplete policy.
     monkeypatch.setenv("MILO_ENABLE_PAID_EXECUTION", "true")
-    monkeypatch.setenv("MILO_MAX_MODEL_CALLS_PER_RUN", "10")
-    monkeypatch.setenv("MILO_MAX_TOTAL_TOKENS_PER_RUN", "1000")
-    monkeypatch.setenv("MILO_MAX_ESTIMATED_COST_PER_RUN", "1")
-    monkeypatch.setenv("MILO_MAX_RUN_DURATION_SECONDS", "60")
-    monkeypatch.setenv("MILO_MAX_RETRIES", "1")
+    for key, value in reviewed_first_run_policy().env_expectations().items():
+        monkeypatch.setenv(key, value)
     monkeypatch.delenv("KIMI_API_KEY", raising=False)
     monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
     repo = MiniRepo()

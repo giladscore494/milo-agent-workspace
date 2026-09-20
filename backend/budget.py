@@ -31,6 +31,19 @@ from typing import Any, Callable
 
 from backend.provider_scheduler import is_provider_rate_limit_error
 from backend.runtime import CancellationRequested
+from backend.runtime_policy import BUDGET as _POLICY_BUDGET_SURFACE
+from backend.runtime_policy import dimensions_for as _policy_dimensions_for
+
+
+def _policy_budget_dimensions():
+    """The budget dimensions of the ONE canonical runtime policy.
+
+    `backend.runtime_policy` is the authority for what a run's enforceable
+    limits ARE; this module is the authority for how they are enforced. The
+    env-variable names and the mandatory-for-paid set therefore come from
+    there rather than being written down a second time.
+    """
+    return _policy_dimensions_for(_POLICY_BUDGET_SURFACE)
 
 
 def paid_execution_enabled() -> bool:
@@ -178,30 +191,32 @@ class BudgetConfig:
     daily_project_budget: float | None = None
     estimated_cost_per_call: float = 0.05
 
-    # Paid execution may never be enabled without these.
-    MANDATORY_FOR_PAID_EXECUTION = (
+    # DERIVED from the canonical runtime policy, never restated here.
+    #
+    # `MANDATORY_FOR_PAID_EXECUTION` used to be a hand-kept list of five
+    # names, and it had fallen behind the profile it was supposed to
+    # guarantee: neither `max_agent_steps` nor the recorded-cost cap was on
+    # it, so a paid deployment could start with the two dimensions the
+    # reviewed first-run profile advertises most loudly simply absent. The
+    # registry derives membership instead -- a dimension is mandatory exactly
+    # when leaving it unset lets the runtime operate WIDER than the reviewed
+    # value -- so the set cannot fall behind the profile again.
+    #
+    # `MANDATORY_FOR_RUN_CREATION` is the separate, smaller floor for
+    # UNPAID run creation, which spends nothing: it is the historical
+    # five-value set and is deliberately not widened here.
+    ENV_KEYS = {dimension.name: dimension.env_key
+                for dimension in _policy_budget_dimensions()}
+    MANDATORY_FOR_PAID_EXECUTION = tuple(
+        dimension.name for dimension in _policy_budget_dimensions()
+        if dimension.mandatory_for_paid)
+    MANDATORY_FOR_RUN_CREATION = (
         "max_model_calls_per_run",
         "max_total_tokens_per_run",
         "max_estimated_cost_per_run",
         "max_run_duration_seconds",
         "max_retries",
     )
-
-    ENV_KEYS = {
-        "max_model_calls_per_run": "MILO_MAX_MODEL_CALLS_PER_RUN",
-        "max_input_tokens_per_run": "MILO_MAX_INPUT_TOKENS_PER_RUN",
-        "max_output_tokens_per_run": "MILO_MAX_OUTPUT_TOKENS_PER_RUN",
-        "max_total_tokens_per_run": "MILO_MAX_TOTAL_TOKENS_PER_RUN",
-        "max_estimated_cost_per_run": "MILO_MAX_ESTIMATED_COST_PER_RUN",
-        "max_cost_per_run": "MILO_MAX_COST_PER_RUN",
-        "max_run_duration_seconds": "MILO_MAX_RUN_DURATION_SECONDS",
-        "max_agent_steps": "MILO_MAX_AGENT_STEPS",
-        "max_retries": "MILO_MAX_RETRIES",
-        "max_concurrent_runs_per_user": "MILO_MAX_CONCURRENT_RUNS_PER_USER",
-        "max_concurrent_runs_per_project": "MILO_MAX_CONCURRENT_RUNS_PER_PROJECT",
-        "daily_user_budget": "MILO_DAILY_USER_BUDGET",
-        "daily_project_budget": "MILO_DAILY_PROJECT_BUDGET",
-    }
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "BudgetConfig":
@@ -223,7 +238,14 @@ class BudgetConfig:
         return cls(**values)
 
     def missing_mandatory(self) -> list[str]:
-        return [self.ENV_KEYS[name] for name in self.MANDATORY_FOR_PAID_EXECUTION if getattr(self, name) is None]
+        """Dimensions PAID execution may never start without."""
+        return [self.ENV_KEYS[name] for name in self.MANDATORY_FOR_PAID_EXECUTION
+                if getattr(self, name) is None]
+
+    def missing_for_run_creation(self) -> list[str]:
+        """The smaller floor for UNPAID run creation, which spends nothing."""
+        return [self.ENV_KEYS[name] for name in self.MANDATORY_FOR_RUN_CREATION
+                if getattr(self, name) is None]
 
 
 EventEmitter = Callable[[str, dict[str, Any]], None]

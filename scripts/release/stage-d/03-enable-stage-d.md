@@ -24,11 +24,12 @@ gcloud secrets get-iam-policy KIMI_API_KEY --project big-cabinet-457321-t7
 ## 3.2 Worker job — paid flag + strict caps + provider envelope + provider key (worker only)
 
 ```bash
-source scripts/release/stage-d/stage-d-env.sh   # exports STAGE_D_CAPS, STAGE_D_WORKER_PROVIDER_LIMITS etc.
+source scripts/release/stage-d/stage-d-env.sh   # generates STAGE_D_CAPS, STAGE_D_WORKER_PROVIDER_LIMITS,
+                                                # STAGE_D_WORKER_ENGINE_LIMITS from backend/runtime_policy.py
 
 gcloud run jobs update milo-agent-worker \
   --project "${STAGE_D_PROJECT}" --region "${STAGE_D_REGION}" \
-  --update-env-vars "MILO_ENABLE_PAID_EXECUTION=${STAGE_D_ON},${STAGE_D_CAPS},${STAGE_D_WORKER_PROVIDER_LIMITS}" \
+  --update-env-vars "MILO_ENABLE_PAID_EXECUTION=${STAGE_D_ON},${STAGE_D_CAPS},${STAGE_D_WORKER_PROVIDER_LIMITS},${STAGE_D_WORKER_ENGINE_LIMITS}" \
   --update-secrets "KIMI_API_KEY=KIMI_API_KEY:latest"
 ```
 
@@ -36,19 +37,34 @@ gcloud run jobs update milo-agent-worker \
 the literal enable value never appears in a committed executable line.)
 
 The Worker — and ONLY the Worker — receives the pinned provider operating
-envelope (`STAGE_D_WORKER_PROVIDER_LIMITS`): concurrency 2, RPM 350,
-TPM 2,400,000, 5 rate-limit retries, 240s max backpressure wait, 2s/30s
-backoff. That is byte-for-byte the envelope Stage C Attempt 7 succeeded
-under (0 retries, 0 backpressure events). The production Kimi organization
-is operator-confirmed Tier 2 (concurrency 100 / RPM 500 / TPM 3,000,000 /
-TPD unlimited); the envelope is deliberately far below that ceiling. That
-Tier 2 confirmation authorizes NO provider call and NO paid run.
+envelope (`STAGE_D_WORKER_PROVIDER_LIMITS`) and the pinned engine
+parallelism (`STAGE_D_WORKER_ENGINE_LIMITS`). Both are GENERATED from
+`backend/runtime_policy.py`, the one canonical runtime policy, so the exact
+values are whatever `python3 scripts/release/stage-d/policy_envelope.py
+provider-limits` and `… engine-limits` print — not a number transcribed
+into this runbook, which is how they drift. Print them before you run the
+command; `verify_caps.py` re-derives the same values and refuses the run on
+any disagreement.
 
-> **This command is a TIGHTENING, not a widening.** Production currently
-> carries `MILO_PROVIDER_MAX_CONCURRENCY=8` on the Worker (drift from the
-> later swarm-v2 smoke work, verified read-only 2026-09-18). The command
-> above restores the Attempt 7 value of `2`, and `verify_caps.py` refuses
-> the run while the live value is anything else.
+> **This command is a TIGHTENING, not a widening.** Three of the values it
+> applies are strictly tighter than what production or the previous Stage D
+> transcription carried:
+>
+> * `MILO_PROVIDER_MAX_CONCURRENCY` — production carries `8` (drift from
+>   the later swarm-v2 smoke work, verified read-only 2026-09-18); the
+>   policy value is `2`.
+> * `MILO_PROVIDER_RPM_LIMIT` — the previous transcription pinned `350`
+>   against MILO's organization ceiling of `80`.
+>   `ProviderLimitsConfig.from_env` raises on exactly that, so the pinned
+>   posture could not have started a Worker at all; the policy value is
+>   `40`.
+> * `MILO_SWARM_MAX_ACTIVE_WORKERS` — never pinned by this toolkit before,
+>   and its code default of `4` is wider than the reviewed width of `2`.
+>
+> The production Kimi organization is operator-confirmed Tier 2
+> (concurrency 100 / RPM 500 / TPM 3,000,000 / TPD unlimited) and the
+> envelope sits far below that ceiling. That Tier 2 confirmation
+> authorizes NO provider call and NO paid run.
 
 ## 3.3 API service — run creation + launcher + caps (paid flag STAYS false)
 
