@@ -11,6 +11,7 @@ from .correction import (correction_allowance, correction_issues, correction_pat
                          correction_summary)
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
+from .feasibility import envelope_supports_a_run, plan_worst_case
 from .grounding import VERIFIER_GROUNDING_VERSION
 from .state import SwarmState
 from .support import VERIFIER_CONTRACT_VERSION
@@ -90,13 +91,38 @@ class SwarmV2Engine:
     def _merge_evidence(self, state: SwarmState,
                         incoming: Iterable[EvidenceReference | Mapping[str, Any]],
                         completed_task_ids: set[str]) -> list[EvidenceReference]:
-        """Merge checkpoint and live evidence without losing resume provenance."""
+        """Merge checkpoint and live evidence without losing resume provenance.
+
+        Two different rules for two different origins, on purpose:
+
+        * a CHECKPOINTED reference was written by this method for a completed
+          task, so one that names another run or a task that is not completed
+          is a corrupt checkpoint, and the resume is refused;
+        * a LIVE reference names a task that has not completed when the
+          board recorded its claim during that task's tool phase -- before the
+          task's model call, and while sibling tasks run on other threads --
+          or when the task later failed. That evidence is simply NOT YET (or
+          not) part of the run's evidence, which is stated over completed
+          tasks only. It is left out here and picked up by the merge that
+          follows the task's own completion. It is never a reason to fail a
+          run that has already paid for the work: the previous rule raised on
+          it, which turned every Government-read plan with two independent
+          register reads into a deterministic failure on every resume.
+
+        A live reference from another run is still a violation.
+        """
         merged: dict[str, tuple[str, EvidenceReference]] = {}
-        for raw in [*state.evidence_references, *list(incoming)]:
+        checkpointed = [(raw, True) for raw in state.evidence_references]
+        live = [(raw, False) for raw in list(incoming)]
+        for raw, from_checkpoint in [*checkpointed, *live]:
             item = raw if isinstance(raw, EvidenceReference) else EvidenceReference.model_validate(raw)
             payload = safe_durable_value(item.model_dump(mode="json"))
-            if item.run_id != state.run_id or item.task_id not in completed_task_ids:
+            if item.run_id != state.run_id:
                 raise ValueError("incompatible evidence provenance")
+            if item.task_id not in completed_task_ids:
+                if from_checkpoint:
+                    raise ValueError("incompatible evidence provenance")
+                continue
             encoded = self._canonical(payload)
             previous = merged.get(item.claim_id)
             if previous is not None and previous[0] != encoded:
@@ -122,19 +148,26 @@ class SwarmV2Engine:
             0, remaining.tool_calls - sum(len(task.tools) for task in completed_specs)
         )
         available_tasks = max(0, remaining.tasks - len(completed_specs))
-        # The MINIMUM each pending task costs is one worker-model call; a
-        # structurally invalid completion may add one bounded repair call
-        # (see worker.MAX_WORKER_OUTPUT_MODEL_ATTEMPTS). This gate stays a
-        # pre-flight floor deliberately -- BudgetTracker remains the sole
-        # authority that refuses a call. Keep two slots for the next
-        # Commander decision and at least one verifier batch. The EXACT
-        # remaining verifier batch count is unknowable here (no evidence set
-        # yet) and is checked separately in _run_verification.
-        required_model_calls = len(pending) + 2
+        # The WORST case, not a floor: repairs, replan decisions, a verifier
+        # batch and the correction round are all things this plan may really
+        # need, and a preflight that ignores them is not a proof of anything.
+        worst = plan_worst_case(len(pending), max_replans=plan.max_replans)
+        # Model calls and agent steps are spent UNCONDITIONALLY as work
+        # proceeds, so a plan whose worst case does not fit can strand the run
+        # mid-way having already paid. Those are preconditions.
+        #
+        # Retries are deliberately NOT one. They are spent only when something
+        # goes wrong, the retry limiter is its own fail-closed gate, and
+        # requiring the worst case up front would refuse every plan on a
+        # healthy deployment: 23 tasks can need 24 repairs in the worst case
+        # against a configured allowance of 15. `worst.retries` and
+        # `worst.provider_attempts` are computed for capacity planning
+        # (see `backend.tier2_profile`), not as an admission test.
         if (sum(task.estimated_cost_units for task in pending) > available_cost or
                 sum(len(task.tools) for task in pending) > available_tools or
                 len(pending) > available_tasks or
-                required_model_calls > remaining.model_calls):
+                worst.model_calls > remaining.model_calls or
+                worst.agent_steps > remaining.agent_steps):
             raise ValueError("plan exceeds remaining budget")
 
     @staticmethod
@@ -360,6 +393,13 @@ class SwarmV2Engine:
             state = SwarmState.resume(raw, run_id=str(run.get("id", "")))
             plan = self._commander.validate_saved_plan(state.approved_plan or {})
         else:
+            # Refuse an envelope that could not pay for the cheapest possible
+            # successful run BEFORE asking the Commander to plan. Planning
+            # first would spend a real paid call -- and, when the derived plan
+            # ceiling then rejects the result, a second one on a repair --
+            # to discover something arithmetic already knew.
+            if not envelope_supports_a_run(self._remaining_budget()):
+                raise ValueError("run budget cannot support any plan")
             plan = self._commander.plan(requested_model=requested_model, objective=objective,
                 context=run_input.get("context", {}))
             state = SwarmState(run_id=str(run.get("id", "")), objective=objective,

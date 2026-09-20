@@ -329,3 +329,12 @@ class RemainingBudget(StrictContract):
     # exactly as it did: a deployment that sets no retry limit is not
     # retroactively given one.
     retries: int = Field(default=1_000, ge=0)
+    # The remaining AGENT-STEP allowance (MILO_MAX_AGENT_STEPS minus the steps
+    # already recorded). Every guarded gateway call costs one, so a plan whose
+    # worst case needs more steps than remain cannot finish however much model
+    # call, token and cost budget it has. It was absent from this contract, so
+    # feasibility could not see it at all: a 64-task plan passed preflight
+    # against a 56-step ceiling and then tripped AGENT_STEP_LIMIT_REACHED
+    # mid-run, after ~56 calls had already been paid for. The permissive
+    # default keeps deployments that set no step limit behaving as they did.
+    agent_steps: int = Field(default=1_000, ge=0)

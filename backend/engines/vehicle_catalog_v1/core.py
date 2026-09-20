@@ -16,11 +16,12 @@ try:
 except ModuleNotFoundError:  # optional until live engine execution
     OpenAI = None
 
+from backend.budget import build_provider_http_client, provider_request_timeout
 from backend.provider_scheduler import (
     ProviderBackpressureExceeded,
     ProviderLimitsConfig,
     ProviderScheduler,
-    estimate_request_tokens,
+    estimate_admission_tokens,
     is_provider_rate_limit_error,
 )
 
@@ -476,10 +477,14 @@ def _scheduled_provider_call(client: Any, kwargs: Dict[str, Any], agent_name: st
     """The single guarded path for EVERY provider request (initial calls,
     tool rounds, fallbacks and summaries). No raw create call may bypass it."""
     scheduler = _provider_scheduler()
-    estimated = estimate_request_tokens(kwargs.get("messages"), kwargs.get("max_tokens"))
+    # Strict: V1 has always required a numeric cap on every call, so the
+    # organization admission value (input + requested cap) is always
+    # computable here and never degrades to "input only".
+    estimated = estimate_admission_tokens(kwargs.get("messages"), kwargs.get("max_tokens"))
     return scheduler.execute(
         lambda: client.chat.completions.create(**kwargs),
         estimated_tokens=estimated,
+        reserved_tokens=estimated,
         agent=agent_name,
         phase=phase_name,
     )
@@ -516,7 +521,26 @@ def moonshot_chat(
         raise ValueError("moonshot_chat requires max_tokens for every model call")
     if MODEL_CLIENT_FACTORY is None and OpenAI is None:
         raise RuntimeError("openai package is required for live Kimi/Moonshot calls")
-    client_factory = MODEL_CLIENT_FACTORY or (lambda api_key, base_url: OpenAI(api_key=api_key, base_url=base_url))
+    # max_retries=0 is load-bearing, not tidiness. The OpenAI SDK retries
+    # retryable failures TWICE by default, turning one logical request into up
+    # to three provider attempts. Those attempts consume organization RPM and
+    # concurrency, but they happen inside the SDK: MILO's scheduler, budget,
+    # attempt accounting and distributed limiter never see them, so the account
+    # can be over its ceiling while every MILO counter reads clean. Retries
+    # here are MILO-owned, bounded, and re-enter the shared admission gate.
+    #
+    # The explicit timeout is load-bearing too: the SDK default is a 600s read
+    # timeout against a 120s concurrency lease, so an un-timed request could
+    # still be talking to Kimi long after another process had taken over its
+    # organization permit. Production reaches this engine through the guarded
+    # factory in backend.budget, which applies the same derived deadline; this
+    # fallback is what local and test runs get, and it must not be the one
+    # place that forgets.
+    client_factory = MODEL_CLIENT_FACTORY or (
+        lambda api_key, base_url: OpenAI(
+            api_key=api_key, base_url=base_url, max_retries=0,
+            http_client=build_provider_http_client(),
+            timeout=provider_request_timeout()))
     client = client_factory(api_key, MOONSHOT_BASE_URL)
     history = list(messages)
     total_input = 0
@@ -1083,16 +1107,63 @@ def merge_chunk_results(agent_name: str, chunk_results: List[Dict[str, Any]]) ->
     }
 
 
+def technical_parallelism(env: Optional[Dict[str, str]] = None) -> int:
+    """How many technical-enrichment calls may be in flight at once.
+
+    Default 1, which is byte-for-byte the historical sequential behaviour. The
+    original policy note said sequential execution avoided "Kimi org
+    concurrency=3 failures" -- a real constraint at the time, and a stale one
+    now that the account is verified Tier 2 (concurrency 40, MILO ceiling 32).
+
+    Keeping it at 1 cost run 3772fc84 its completion: that phase made 36
+    sequential calls at ~45s each, 1621s of an 1808s run, and the run timed out
+    at 1800s having used 0 retries and hit 0 backpressure events. It was not
+    being throttled; it was queueing behind itself.
+
+    This is configuration rather than a new default because raising it is a
+    deliberate operator decision with its own evidence (see
+    `backend.tier2_profile`), and because the shared coordinator -- not this
+    number -- is what actually protects the account: whatever is set here is
+    still admitted one organization slot at a time.
+    """
+    raw = ((env or os.environ).get("MILO_V1_TECHNICAL_PARALLELISM") or "1").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("MILO_V1_TECHNICAL_PARALLELISM must be an integer") from None
+    if not 1 <= value <= 32:
+        raise ValueError("MILO_V1_TECHNICAL_PARALLELISM must be between 1 and 32")
+    return value
+
+
 def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str, period: str, canonical_models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Stable policy: run Phase 3 technical agents sequentially to avoid Kimi org concurrency=3 failures.
-    results = []
-    for agent in TECHNICAL_AGENTS:
-        chunk_results = []
-        for i in range(0, len(canonical_models), TECHNICAL_MODEL_CHUNK_SIZE):
-            chunk = canonical_models[i:i + TECHNICAL_MODEL_CHUNK_SIZE]
-            chunk_results.append(run_technical_agent(api_key, agent, manufacturer, market, period, chunk))
-        results.append(merge_chunk_results(agent.key, chunk_results))
-    return results
+    """Enrich every canonical model chunk, per technical agent.
+
+    Results keep their original per-agent order and per-agent chunk order
+    whatever the parallelism, so the deterministic merge downstream sees
+    exactly the input it always did.
+    """
+    units = [(agent, canonical_models[i:i + TECHNICAL_MODEL_CHUNK_SIZE])
+             for agent in TECHNICAL_AGENTS
+             for i in range(0, len(canonical_models), TECHNICAL_MODEL_CHUNK_SIZE)]
+    width = min(technical_parallelism(), max(1, len(units)))
+    if width == 1:
+        # The preserved path, unchanged: no pool, no futures, no reordering.
+        completed = [run_technical_agent(api_key, agent, manufacturer, market, period, chunk)
+                     for agent, chunk in units]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=width, thread_name_prefix="v1-technical") as pool:
+            futures = [pool.submit(run_technical_agent, api_key, agent, manufacturer,
+                                   market, period, chunk) for agent, chunk in units]
+            # Indexed, not as-completed: ordering is part of the preserved
+            # merge contract.
+            completed = [future.result() for future in futures]
+    by_agent: Dict[str, List[Dict[str, Any]]] = {agent.key: [] for agent in TECHNICAL_AGENTS}
+    for (agent, _chunk), result in zip(units, completed):
+        by_agent[agent.key].append(result)
+    return [merge_chunk_results(agent.key, by_agent[agent.key]) for agent in TECHNICAL_AGENTS]
 
 
 def compact_verifier_input(normalized: Any, technical: Dict[str, Any], failed_summaries: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:

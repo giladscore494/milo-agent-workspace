@@ -890,16 +890,19 @@ def test_production_registers_exactly_one_read_tool_and_routes_the_seam():
     from backend.tools.government_vehicle import GovernmentVehicleTool
 
     source = _worker_wiring_source()
-    assert "catalog_enabled = catalog_execution_enabled()" in source
-    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if catalog_enabled else [])"
+    assert "posture = catalog_posture()" in source
+    assert 'government_read_enabled = posture["government_read"]' in source
+    assert 'promotion_enabled = posture["promotion"]' in source
+    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])"
             in source)
-    assert "scopes=frozenset({GOVERNMENT_TOOL_SCOPE}) if catalog_enabled" in source
+    assert "scopes=frozenset({GOVERNMENT_TOOL_SCOPE}) if government_read_enabled" in source
     assert "tool_result_sink=evidence_sink" in source
     assert "RegisteredOperationEvidenceSink(" in source
     # Catalog PR3's promotion path OBSERVES nothing here: it reads what the run
     # still owes from the database, so a resumed worker promotes what a crashed
     # one would have. CODE-2 only decides WHETHER it is built.
-    assert "if catalog_enabled:" in source
+    # Promotion is gated SEPARATELY: reading the register never builds it.
+    assert "if promotion_enabled:" in source
     assert "CatalogPromotionPipeline(repo, board.lease)" in source
     assert "catalog_promotion[\"pipeline\"].promote()" in source
     assert "write_approved" not in source

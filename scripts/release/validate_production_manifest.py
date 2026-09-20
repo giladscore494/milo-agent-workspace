@@ -59,6 +59,10 @@ EXECUTION_FLAGS = [
     "MILO_ENABLE_PAID_EXECUTION",
     # Worker-only: the catalog capability inside a Swarm V2 run.
     "MILO_ENABLE_CATALOG_EXECUTION",
+    # Worker-only capabilities under that switch: register read, and
+    # canonical promotion. Promotion additionally requires read.
+    "MILO_ENABLE_GOVERNMENT_CATALOG_READ",
+    "MILO_ENABLE_CATALOG_PROMOTION",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
 ]
 

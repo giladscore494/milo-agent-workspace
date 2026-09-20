@@ -158,6 +158,11 @@ EXECUTION_FLAGS = (
     # contract, plan and inventory that enumerates execution flags pins it off
     # like the rest.
     "MILO_ENABLE_CATALOG_EXECUTION",
+    # The two catalog CAPABILITY flags under that master switch. Reading the
+    # government register and promoting into the canonical catalog are
+    # separate decisions; both default off and both are pinned off here.
+    "MILO_ENABLE_GOVERNMENT_CATALOG_READ",
+    "MILO_ENABLE_CATALOG_PROMOTION",
 )
 
 # NEXT_PUBLIC_* values ship to the browser bundle: secret material is banned.
@@ -239,6 +244,15 @@ def validate(env: dict[str, str] | None = None) -> ConfigReport:
             error("TEST_ADAPTER_IN_PRODUCTION", "MILO_E2E_INPROCESS_WORKER is a test-only adapter and is forbidden in production")
         if (env.get("MILO_WORKER_ENGINE") or "").strip():
             error("TEST_ADAPTER_IN_PRODUCTION", "MILO_WORKER_ENGINE selects a non-production engine (e.g. the zero-cost mock) and is forbidden in production")
+        # 5d'. The provider-concurrency guarantee may not be traded away by
+        # configuration. Unknown provider occupancy is returned by proven
+        # completion or by an explicit operator reclaim, never on a timer,
+        # because no provider-side bound exists to derive a timer from.
+        # `backend.provider_quota.resolve_coordinator` refuses it on the
+        # worker path as well; this names it wherever production config is
+        # validated.
+        if (env.get("MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS") or "").strip():
+            error("TIMED_LEASE_RECLAIM_IN_PRODUCTION", "MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS reclaims unknown provider occupancy on a clock and is forbidden in production; held leases are returned only by proven completion or an explicit operator reclaim")
 
     # 5e. Staging must be pinned to its declared dependencies (fail closed):
     # a staging deployment must never be able to silently point at the

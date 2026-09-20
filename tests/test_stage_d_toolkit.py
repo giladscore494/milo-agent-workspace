@@ -2449,8 +2449,15 @@ def test_a_provider_wallet_ceiling_is_a_prerequisite_not_a_suggestion():
     assert "wallet ceiling" in results
 
 
-def test_this_pr_proposes_no_runtime_change():
-    """Adding an enforceable web-search cap is a separate reviewed release."""
+def test_runtime_changes_since_the_pinned_release_are_declared_superseding():
+    """Stage D pinned image digests on a "no runtime change" premise.
+
+    That premise is checkable: if `backend/` has moved since the pinned
+    release SHA, the digests this document pins no longer describe what would
+    run, and the document must say so rather than reading as still-valid.
+    A release that changes runtime code is exactly the "separate reviewed
+    release" §7 anticipated, and it owes Stage D a re-authorization.
+    """
     doc = AUTHORIZATION_DOC.read_text()
     assert "No runtime change is proposed here" in doc
     changed = subprocess.run(
@@ -2459,7 +2466,13 @@ def test_this_pr_proposes_no_runtime_change():
     if changed.returncode != 0:
         pytest.skip("the pinned release SHA is not available in this checkout")
     touched = [f for f in changed.stdout.split() if f.startswith("backend/")]
-    assert not touched, f"this PR changes runtime code: {touched}"
+    if not touched:
+        return
+    assert "SUPERSEDED BY A RUNTIME RELEASE" in doc, (
+        f"backend runtime moved since the pinned release ({touched}) but the "
+        "Stage D authorization still presents its pinned digests as valid")
+    assert "RE-AUTHORIZATION REQUIRED" in doc
+    assert "invalidated" in doc
 
 
 # ---------------------------------------------------------------------------

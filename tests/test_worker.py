@@ -268,7 +268,9 @@ def test_mock_engine_budget_loop_trips_model_call_limit(monkeypatch):
 
     repo = BudgetRepo()
     code = execute_run(repo.run_id, repo)
-    assert code == 1
+    # Zero: the budget stop was recorded durably, so the task is finished and
+    # Cloud Run must not relaunch it.
+    assert code == 0
     assert repo.terminal is not None
     status, error = repo.terminal
     assert status == "budget_exhausted"
@@ -314,7 +316,8 @@ def test_default_registry_routes_trusted_swarm_v2_and_reaches_a_truthful_outcome
             return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, cost=0),
                 choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
     client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
-    monkeypatch.setattr(worker_main, "build_guarded_client_factory", lambda tracker: lambda *_: client)
+    monkeypatch.setattr(worker_main, "build_guarded_client_factory",
+                        lambda tracker, **_kw: lambda *_: client)
     monkeypatch.setenv("MILO_COMMANDER_MODEL_ALLOWLIST", "fake")
     monkeypatch.setenv("MILO_COMMANDER_MODEL", "fake")
     monkeypatch.setenv("MILO_SWARM_WORKER_MODEL", "fake")
@@ -507,7 +510,17 @@ def test_swarm_v2_budget_terminal_transition_failure_propagates(stop_path):
 
 
 @pytest.mark.parametrize("stop_path", ["exception", "tracker"])
-def test_v1_durable_budget_terminal_exit_code_remains_nonzero(stop_path):
+def test_v1_durable_budget_terminal_exits_zero_so_cloud_run_does_not_relaunch(stop_path):
+    """A recorded timeout or budget stop is an ANSWER, not a crashed task.
+
+    This used to exit 1, which Cloud Run reads as a failed task and retries
+    (the worker job runs with maxRetries=1). Run
+    3772fc84-420c-4a66-9e79-d58649d4e9b4 timed out, exited 1, and the
+    relaunched task found the run already finalized and exited 0 -- so the
+    execution reported "completed successfully in 33m42s" over a `timed_out`
+    product outcome. A second paid execution racing the finalization instead
+    would have been worse than merely misleading.
+    """
     repo = _BudgetTerminalRepo("vehicle_catalog_v1")
-    assert _execute_budget_terminal(repo, "vehicle_catalog_v1", stop_path) == 1
+    assert _execute_budget_terminal(repo, "vehicle_catalog_v1", stop_path) == 0
     assert len(repo.terminal_transitions) == 1

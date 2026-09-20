@@ -75,6 +75,12 @@ execution_flags:
   # Enabling it is a separate, explicitly authorized operator decision and is
   # never part of a release — see docs/production-readiness/STAGED_ACTIVATION.md.
   MILO_ENABLE_CATALOG_EXECUTION: false
+  # Read-only access to the durable government register. Grants the bounded
+  # read tool, its scope and its evidence mapper, and authorizes NO write.
+  MILO_ENABLE_GOVERNMENT_CATALOG_READ: false
+  # Canonical catalog promotion. Requires the read flag above; read alone
+  # never implies promotion.
+  MILO_ENABLE_CATALOG_PROMOTION: false
   GATEWAY_ALLOW_EXECUTION_ROUTES: false
 
 # Secret Manager RESOURCE NAMES (never values) and their sole consumers.

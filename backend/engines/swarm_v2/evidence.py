@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
@@ -179,6 +180,18 @@ class EvidenceBoard:
         self._sources: dict[str, dict[str, Any]] = {}
         self._claims: dict[str, dict[str, Any]] = {}
         self._conflicts: dict[str, dict[str, Any]] = {}
+        # ONE board serves every logical worker of a run, and the executor
+        # runs them on a thread pool: a worker's tool-result sink records a
+        # claim here while the engine thread reads `references()` to persist
+        # a sibling that just completed. The durable writes were always safe
+        # (idempotent, lease-guarded RPCs); this guards the in-memory index
+        # they are mirrored into, so a read never iterates a dict another
+        # thread is inserting into.
+        self._lock = threading.Lock()
+
+    def _snapshot(self, table: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(table.values())
 
     @property
     def _lease_kwargs(self) -> dict[str, Any]:
@@ -223,7 +236,8 @@ class EvidenceBoard:
         payload.update(task_key=self._task(task_key),
                        evidence_key=_key("source", _identity({"task_key": task_key, **payload})))
         row = self._repository.create_source(self.lease.run_id, payload, **self._lease_kwargs)
-        self._sources[str(row["id"])] = dict(row)
+        with self._lock:
+            self._sources[str(row["id"])] = dict(row)
         return row
 
     def record_source_with_evidence(self, source: SourceCreate, tool_result: Mapping[str, Any], *,
@@ -355,7 +369,8 @@ class EvidenceBoard:
                        scope_normalization_version=SCOPE_NORMALIZATION_VERSION,
                        task_key=self._task(task_key), evidence_key=evidence_key)
         row = self._repository.create_claim(self.lease.run_id, payload, **self._lease_kwargs)
-        self._claims[str(row["id"])] = dict(row)
+        with self._lock:
+            self._claims[str(row["id"])] = dict(row)
         return row
 
     def record_evidence_bundle(self, bundle: EvidenceBundle, *,
@@ -427,7 +442,7 @@ class EvidenceBoard:
         # engine and the verifier also use.  A pre-R4 claim states no identity
         # dimension, so its grouping is byte-identical to what it was.
         groups: dict[ScopeIdentity, list[dict[str, Any]]] = {}
-        for claim in self._claims.values():
+        for claim in self._snapshot(self._claims):
             identity = scope_identity(entity=claim["entity_key"], field=claim["field_key"],
                                       geography=claim.get("geography"), market=claim.get("market"),
                                       time_scope=claim.get("time_scope") or {},
@@ -450,7 +465,8 @@ class EvidenceBoard:
             payload = safe_durable_value(conflict.model_dump(mode="json"))
             payload.update(task_key=self._task(task_key), evidence_key=_key("conflict", payload))
             row = self._repository.create_conflict(self.lease.run_id, payload, **self._lease_kwargs)
-            self._conflicts[str(row["id"])] = dict(row)
+            with self._lock:
+                self._conflicts[str(row["id"])] = dict(row)
             recorded.append(row)
         return recorded
 
@@ -511,15 +527,15 @@ class EvidenceBoard:
                    "entity_key": row["entity_key"], "field_key": row["field_key"],
                    "market": row.get("market"), "time_scope": row.get("time_scope") or {},
                    "source_strength": row["source_strength"], "confidence": row["confidence"]}
-                  for row in self._claims.values()]
+                  for row in self._snapshot(self._claims)]
         summaries = [{"conflict_id": row["id"], "claim_ids": row["claim_ids"],
                       "task_key": row["task_key"], "rationale": row.get("rationale")}
-                     for row in self._conflicts.values()]
+                     for row in self._snapshot(self._conflicts)]
         safe_durable_value(goal)  # validate caller text, but never overwrite blackboard goal/state
         summary = {"known_entities": claims, "claims_conflict_summaries": summaries}
         return self._repository.patch_run_blackboard_evidence(self.lease.run_id, summary, **self._lease_kwargs)
 
-    def references(self) -> list[dict[str, Any]]:
+    def references(self, *, task_ids: Any = None) -> list[dict[str, Any]]:
         """Return compact references from the existing claim/source records.
 
         R3 adds three provenance fields the grounding layer previously had no
@@ -528,7 +544,16 @@ class EvidenceBoard:
         the closed identity dimensions the record stated.  All four are
         optional, so a reference rebuilt from a pre-R3 claim carries an empty
         identity and behaves exactly as it did before.
+
+        ``task_ids`` restricts the answer to claims recorded under those task
+        keys. The board records a claim the moment a trusted tool result is
+        mapped -- BEFORE that task's model call, and while sibling tasks run
+        on other threads -- so "every claim on the board" is not the same
+        set as "the evidence of the tasks that have completed", and the
+        engine's evidence merge is stated over the latter. ``None`` keeps the
+        historical unfiltered answer.
         """
+        wanted = None if task_ids is None else {str(item) for item in task_ids}
         return [{"claim_id": str(row["id"]), "source_id": str(row["source_id"]),
                  "run_id": str(self.lease.run_id), "task_id": row["task_key"],
                  "entity": row["entity_key"], "field": row["field_key"],
@@ -538,11 +563,13 @@ class EvidenceBoard:
                  "identity": dict(row.get("identity_scope") or {}),
                  "source_version": self._source_version(row.get("source_id")),
                  "confidence": row["confidence"], "supported": True}
-                for row in self._claims.values()]
+                for row in self._snapshot(self._claims)
+                if wanted is None or str(row["task_key"]) in wanted]
 
     def _source_version(self, source_id: Any) -> str | None:
         """The canonical `kind:identifier` of a recorded source, if it has one."""
-        row = self._sources.get(str(source_id)) or {}
+        with self._lock:
+            row = self._sources.get(str(source_id)) or {}
         kind, identifier = row.get("source_version_kind"), row.get("source_version_id")
         return f"{kind}:{identifier}" if kind and identifier else None
 

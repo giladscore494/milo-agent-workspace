@@ -1033,13 +1033,13 @@ def test_no_yeda_or_web_tool_is_registered_or_mapped_and_the_sink_is_routed():
     # ENABLED shape is unchanged -- same one tool, same sink, same pipeline --
     # and the behavioural enabled/disabled contract is proven against the real
     # worker in `tests/test_catalog_execution_flag.py`.
-    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if catalog_enabled else [])"
+    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])"
             in worker_main)
     assert "tool_result_sink=evidence_sink" in worker_main
     assert "RegisteredOperationEvidenceSink(" in worker_main
     # With the catalog off the sink is built over an EMPTY mapper registry, so
     # no operation at all can become durable evidence.
-    assert "production_evidence_mappers() if catalog_enabled" in worker_main
+    assert "production_evidence_mappers() if government_read_enabled" in worker_main
     assert "else EvidenceMapperRegistry()" in worker_main
     # Catalog PR3's promotion path OBSERVES nothing here: it reads what the run
     # still owes from the database, so a resumed worker promotes what a crashed
@@ -1048,7 +1048,7 @@ def test_no_yeda_or_web_tool_is_registered_or_mapped_and_the_sink_is_routed():
     assert "catalog_promotion[\"pipeline\"].promote()" in worker_main
     # Read scope only, granted only when the catalog is on, and no write
     # approval anywhere in the wiring.
-    assert "scopes=frozenset({GOVERNMENT_TOOL_SCOPE}) if catalog_enabled" in worker_main
+    assert "scopes=frozenset({GOVERNMENT_TOOL_SCOPE}) if government_read_enabled" in worker_main
     assert "else frozenset()" in worker_main
     assert "write_approved" not in worker_main
 

@@ -124,7 +124,7 @@ def swarm_env(monkeypatch, **overrides):
         "MILO_DAILY_USER_BUDGET": "5.00",
         "MILO_SWARM_MAX_ACTIVE_WORKERS": "8",
         "MILO_PROVIDER_MAX_CONCURRENCY": "8",
-        "MILO_PROVIDER_RPM_LIMIT": "100000",
+        "MILO_PROVIDER_RPM_LIMIT": "80",
         "MILO_ENABLE_RUN_CREATION": "true",
         # The in-memory API limiter is keyed by the module-constant user;
         # raise the per-minute cap so unrelated tests never trip it.
@@ -164,7 +164,7 @@ class InlineWorkerLauncher:
 def patch_client(monkeypatch, completions):
     monkeypatch.setattr(
         worker_main, "build_guarded_client_factory",
-        lambda tracker: build_guarded_client_factory(
+        lambda tracker, **_kw: build_guarded_client_factory(
             tracker, inner_factory=lambda api_key, base_url: fake_kimi_client(completions)),
     )
 
@@ -464,9 +464,9 @@ def test_checkpoint_persistence_failure_escapes_and_is_never_handled(monkeypatch
 
 
 def test_infeasible_model_call_budget_fails_before_spending_on_tasks(monkeypatch):
-    """With one model-call slot the plan cannot fit (tasks + replan +
-    verifier), so the engine's feasibility gate stops the run after the
-    single Commander call instead of burning task calls."""
+    """With one model-call slot no plan can fit, so the run is refused
+    BEFORE the Commander is asked -- not after paying for a plan it could
+    never afford to execute."""
     swarm_env(monkeypatch, MILO_MAX_MODEL_CALLS_PER_RUN="1")
     repo, conversation_id = build_repo()
     completions = FakeKimiCompletions()
@@ -475,7 +475,7 @@ def test_infeasible_model_call_budget_fails_before_spending_on_tasks(monkeypatch
     run = repo.get_run(run_id)
     assert run["status"] == "failed"
     assert run["error"]["code"] == "SWARM_V2_EXECUTION_FAILED"
-    assert len(completions.calls) == 1
+    assert completions.calls == [], "an unaffordable run still paid for a plan"
 
 
 def test_token_budget_trip_produces_durable_budget_terminal(monkeypatch):

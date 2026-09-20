@@ -28,6 +28,7 @@ group chosen in the manifest copy.
 | Redis failures / 503 `RATE_LIMITER_UNAVAILABLE` | gateway+API logs | HIGH | store outage — limited surfaces fail closed; restore store |
 | Rate-limit rejections (429 rate) | gateway+API logs | LOW→MEDIUM | tune limits or investigate abuse |
 | Provider errors | worker logs | MEDIUM | provider degradation; retries capped |
+| Held provider leases (`provider_lease_quarantined` events; `provider_quota_leases.py list`) | run events + shared store | MEDIUM→HIGH as they accumulate | each one is capacity MILO will not use until a human recovers it; never auto-reclaimed. Investigate the cause; recover ONE at a time with `scripts/release/provider_quota_leases.py recover` only after verifying provider-side completion (KIMI_TIER2_LIMITS.md §8a) |
 | Migration drift | `check-migration-state.sh` in scheduled audit | HIGH | unexpected remote objects/missing markers — investigate before any deploy |
 | RLS denials from service paths | DB logs | HIGH | misconfigured policy or credential misuse |
 | Unexpected public access (Cloud Run IAM change) | audit logs on `allUsers` bindings | CRITICAL | remove binding immediately; incident review |
