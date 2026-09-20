@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, paid_execution_enabled
 from backend.execution_usage import merge_usage_snapshots, public_usage_projection
+from backend.finalization import RunFinalizer, TerminalClaim
 from backend.runtime_policy import RuntimePolicyError, policy_failure_code, resolve_runtime_policy
 from backend.config import get_settings
 from backend.errors import AppError
@@ -43,34 +44,6 @@ def _is_definitive_lease_loss(exc: BaseException) -> bool:
     if isinstance(exc, AppError):
         return exc.code in DEFINITIVE_LEASE_LOSS_CODES or exc.status_code in {404, 409}
     return False
-
-
-def _persist_budget_terminal(repo: Repository, run_id: UUID,
-                             stop: BudgetExceeded, tracker: BudgetTracker,
-                             lease_ctx: dict[str, Any]) -> None:
-    """Persist a budget stop or fail so the job remains retryable.
-
-    Returning from this helper means the terminal transition completed under
-    the active lease. A missing repository capability is an infrastructure
-    failure, not a handled run outcome.
-    """
-    transition = getattr(repo, "transition_run", None)
-    if not callable(transition):
-        raise AppError(
-            "RUN_FINALIZATION_UNAVAILABLE",
-            "terminal run transition is unavailable",
-            503,
-        )
-    transition(
-        run_id,
-        stop.terminal_status,
-        expected_worker_id=lease_ctx["worker_id"],
-        expected_attempt=lease_ctx["attempt"],
-        expected_lease_token=lease_ctx["lease_token"],
-        error={"code": stop.code, "message": stop.message},
-        finished_at=datetime.now(UTC).isoformat(),
-        usage=tracker.snapshot(),
-    )
 
 
 def _claim_run_with_recovery(repo: Repository, run_id: UUID, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
@@ -143,6 +116,20 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
     # atomically at the database boundary.
     lease_ctx = {"worker_id": worker_id, "attempt": run.get("attempt"), "lease_token": run.get("lease_token")}
     sink = SupabaseEventSink(repo, **lease_ctx)
+    # THE finalization authority for this run. Every terminal branch below --
+    # success, partial success, refusal, failure, cancellation, timeout and
+    # budget exhaustion, in both engines and on the resume fast path -- closes
+    # the run through this object and none of them writes a terminal status
+    # itself.
+    #
+    # It starts with NO engine and is told the resolved workflow once routing
+    # has answered from server-owned relations. Reading the engine off run
+    # input to label it earlier would be taking a routing answer from an
+    # untrusted source; the two terminal paths that can run before routing --
+    # a cancellation observed before start, and a routing refusal -- have no
+    # product to read anyway.
+    finalizer = RunFinalizer(repo=repo, run_id=run_id, engine="",
+                             lease_ctx=lease_ctx, event_sink=sink)
     lease_lost = threading.Event()
     stop_heartbeat = threading.Event()
     heartbeat_thread: threading.Thread | None = None
@@ -198,9 +185,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
     start_heartbeat()
     try:
         if run.get("status") == "cancellation_requested":
-            sink.emit(RunEventRecord(run_id=run_id, type="run_cancelled", message="Run cancelled before worker execution", payload={"code": "RUN_CANCELLED_BEFORE_START"}))
-            if hasattr(repo, "transition_run"):
-                repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), finished_at=datetime.now(UTC).isoformat())
+            finalizer.finalize(TerminalClaim.cancelled(
+                finalizer.engine, code="RUN_CANCELLED_BEFORE_START",
+                message="Run cancelled before worker execution"))
             return 0
         # Routing is resolved from server-owned relations only. Do this before
         # checkpoint access and before invoking any engine factory.
@@ -228,10 +215,10 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         try:
             resolved_engine = EngineResolver(repo, registry).resolve(run)
         except AppError as exc:
-            sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message=exc.message, payload={"code": exc.code}))
-            repo.mark_run_failed(run_id, exc.code, exc.message, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+            finalizer.finalize(TerminalClaim.refusal(finalizer.engine, exc.code, exc.message))
             return 1
         workflow_key = resolved_engine.workflow_key
+        finalizer.engine = workflow_key
 
         shadow_blackboard = initial_blackboard(str((run.get("input") or {}).get("content") or "MILO vehicle catalog run"))
 
@@ -254,6 +241,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # text can carry provider/database details into run_events.
                 sink.emit(RunEventRecord(run_id=run_id, type="supervisor_shadow_failed", message="Supervisor shadow observation failed without altering execution", payload={"code": "SUPERVISOR_SHADOW_FAILED", "error_type": type(exc).__name__}))
 
+        finalizer.observer = shadow_observe
         sink.emit(RunEventRecord(run_id=run_id, type="run_started", message="Run started", payload={"worker_id": worker_id, "attempt": run.get("attempt", 1)}))
         shadow_observe("run_started", {"worker_id": worker_id, "attempt": run.get("attempt", 1)})
         latest_checkpoint = repo.latest_checkpoint(run_id, workflow_key) if hasattr(repo, "latest_checkpoint") else None
@@ -268,10 +256,22 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # record (the worker consolidates it there), which belongs
                 # to runs.usage / run_execution_usage, not to the output.
                 checkpoint_tokens = latest_checkpoint.get("token_usage") or {}
-                result = {"status": final.get("status", "success"), "result": final, "summary": (artifacts.get("hebrew_summary") or {}).get("parsed", {}).get("summary"), "results": artifacts, **{k: checkpoint_tokens[k] for k in ("input_tokens", "output_tokens") if k in checkpoint_tokens}}
-                sink.emit(RunEventRecord(run_id=run_id, type="run_completed", message="Run completed from checkpoint", payload={"checkpoint_id": str(latest_checkpoint.get("id", ""))}))
-                shadow_observe("run_completed", {"checkpoint_id": str(latest_checkpoint.get("id", ""))})
-                repo.mark_run_complete(run_id, result, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+                # The envelope status is the final builder's own, with NO
+                # "success" default. The default was the upgrade: a checkpoint
+                # whose final document recorded `partial_success`, or recorded
+                # no status at all, resumed straight into durable `completed`
+                # because this path called mark_run_complete unconditionally.
+                result = {"status": final.get("status"), "result": final, "summary": (artifacts.get("hebrew_summary") or {}).get("parsed", {}).get("summary"), "results": artifacts, **{k: checkpoint_tokens[k] for k in ("input_tokens", "output_tokens") if k in checkpoint_tokens}}
+                # The checkpoint also records the failures the crashed attempt
+                # had already absorbed. They are facts about THIS run that the
+                # final document may not carry, and folding them in can only
+                # lower the outcome -- a resumed run can never be worth more
+                # than the run it resumes.
+                claim = TerminalClaim.product(
+                    workflow_key, result,
+                    extra_blocking={"FAILED_AGENTS": len(latest_checkpoint.get("failures") or [])},
+                    event_payload={"checkpoint_id": str(latest_checkpoint.get("id", ""))})
+                finalizer.finalize(claim)
                 return 0
         if hasattr(repo, "transition_run"):
             repo.transition_run(run_id, "running", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), started_at=run.get("started_at") or datetime.now(UTC).isoformat())
@@ -301,8 +301,10 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         budget_config = BudgetConfig.from_env()
         if paid_execution_enabled() and budget_config.missing_mandatory():
             missing = ", ".join(budget_config.missing_mandatory())
-            sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Budget configuration incomplete; refusing paid execution", payload={"code": "BUDGET_CONFIG_INVALID", "missing": missing}))
-            repo.mark_run_failed(run_id, "BUDGET_CONFIG_INVALID", f"mandatory budget settings missing: {missing}", worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+            finalizer.finalize(TerminalClaim.refusal(
+                workflow_key, "BUDGET_CONFIG_INVALID",
+                f"mandatory budget settings missing: {missing}",
+                event_payload={"missing": missing}))
             return 0 if workflow_key == "swarm_v2" else 1
 
         # The ONE canonical runtime policy for this DEPLOYMENT. It is resolved
@@ -322,8 +324,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         except RuntimePolicyError as exc:
             code = policy_failure_code(exc)
             detail = "; ".join(f"{v.dimension}: {v.message}" for v in exc.violations)
-            sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Runtime policy incomplete or wider than the reviewed envelope; refusing execution", payload={"code": code, "codes": ", ".join(exc.codes), "detail": detail}))
-            repo.mark_run_failed(run_id, code, detail, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+            finalizer.finalize(TerminalClaim.refusal(
+                workflow_key, code, detail,
+                event_payload={"codes": ", ".join(exc.codes), "detail": detail}))
             return 0 if workflow_key == "swarm_v2" else 1
         budget_config = policy.budget_config()
         # Provider credentials are worker-only (env/Secret Manager). Paid
@@ -332,8 +335,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         from backend.engines.vehicle_catalog_v1.adapter import worker_provider_api_key
 
         if paid_execution_enabled() and not worker_provider_api_key():
-            sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider API key not configured for this worker; refusing paid execution", payload={"code": "PROVIDER_KEY_MISSING"}))
-            repo.mark_run_failed(run_id, "PROVIDER_KEY_MISSING", "worker provider API key (KIMI_API_KEY/MOONSHOT_API_KEY) is not configured", worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+            finalizer.finalize(TerminalClaim.refusal(
+                workflow_key, "PROVIDER_KEY_MISSING",
+                "worker provider API key (KIMI_API_KEY/MOONSHOT_API_KEY) is not configured"))
             return 0 if workflow_key == "swarm_v2" else 1
 
         # Provider-side scheduling limits (concurrency/RPM/TPM/backpressure
@@ -373,8 +377,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                         if isinstance(exc, ProviderQuotaUnavailable)
                         else "PROVIDER_LIMITS_CONFIG_INVALID")
                 message = exc.message if isinstance(exc, ProviderQuotaUnavailable) else str(exc)
-                sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message="Provider limit configuration invalid; refusing execution", payload={"code": code, "message": message}))
-                repo.mark_run_failed(run_id, code, message, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+                finalizer.finalize(TerminalClaim.refusal(workflow_key, code, message))
                 return 0 if workflow_key == "swarm_v2" else 1
 
         # Resolved once, from the coordinator that owns the permits.
@@ -453,6 +456,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             daily_project_reserver=None,
             daily_settler=(lambda reservation, actual_cost, status, reason: repo.settle_model_call_budget(reservation.id if isinstance(reservation, ModelCallReservation) else str(reservation), actual_cost, status, reason, run_id=run_id, **lease_ctx)) if hasattr(repo, "settle_model_call_budget") else None,
         )
+        # The tracker is a LIVE source of terminal claims. A rail that trips on
+        # a worker thread while the main thread is assembling a product is a
+        # true terminal fact about this run, and the finalizer asks for it
+        # inside its decision lock -- so the run's terminal status is decided
+        # from everything true at that moment, never from whichever branch
+        # reached the writer last.
+        finalizer.add_claim_source(
+            lambda: None if tracker.stop is None else TerminalClaim.budget_stop(
+                workflow_key, tracker.stop, usage=tracker.snapshot()))
         if tracker.usage_recorder is None:
             # An injected tracker (tests, harnesses) still records through
             # THIS worker's lease: durable accounting is a property of the
@@ -838,15 +850,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                                  if attempt.promoted else attempt.safe_message),
                         payload=attempt.as_event()))
         except CancellationRequested:
-            sink.emit(RunEventRecord(run_id=run_id, type="run_cancelled", message="Run cancelled", payload={}))
-            shadow_observe("run_cancelled", {})
-            if hasattr(repo, "transition_run"):
-                repo.transition_run(run_id, "cancelled", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), finished_at=datetime.now(UTC).isoformat())
+            finalizer.finalize(TerminalClaim.cancelled(workflow_key))
             return 0
         except BudgetExceeded as exc:
-            # `_persist_budget_terminal` returning means the terminal state is
-            # durable under this lease, so the run is FINISHED -- a timeout, a
-            # budget stop or a cost stop is an answer, not a crash.
+            # Returning from the finalizer means the terminal state is durable
+            # under this lease, so the run is FINISHED -- a timeout, a budget
+            # stop or a cost stop is an answer, not a crash.
             #
             # This used to exit 1 for V1, which Cloud Run reads as a failed
             # task and relaunches (maxRetries=1). Run
@@ -856,7 +865,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # while the product outcome was `timed_out`. A second paid
             # execution that raced the finalization instead would have been
             # worse than misleading.
-            _persist_budget_terminal(repo, run_id, exc, tracker, lease_ctx)
+            finalizer.finalize(TerminalClaim.budget_stop(
+                workflow_key, exc, usage=tracker.snapshot()))
             return 0
         except Exception as exc:
             # Preserve V1 behavior. V2 validation/factory/provider failures are
@@ -881,12 +891,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             else:
                 code, message = "SWARM_V2_EXECUTION_FAILED", "Swarm V2 execution failed"
                 failure_payload = {"code": code}
-            sink.emit(RunEventRecord(run_id=run_id, type="run_failed",
-                                     message=message, payload=failure_payload))
-            shadow_observe("run_failed", dict(failure_payload))
-            repo.mark_run_failed(run_id, code, message, worker_id=worker_id,
-                                 attempt=run.get("attempt"),
-                                 lease_token=run.get("lease_token"))
+            finalizer.finalize(TerminalClaim.failure(
+                workflow_key, code, message,
+                event_payload={k: v for k, v in failure_payload.items() if k != "code"}))
             # A terminal failure committed under this lease is a handled job
             # outcome. Non-zero is reserved for exceptions above (lease loss
             # or inability to durably write the terminal state).
@@ -897,66 +904,49 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # Zero for the same reason as the BudgetExceeded handler above: the
             # terminal state is durable, so the task is done and Cloud Run must
             # not relaunch it into a second paid execution.
-            stop = tracker.stop
-            _persist_budget_terminal(repo, run_id, stop, tracker, lease_ctx)
+            #
+            # This check is no longer the only thing standing between a tripped
+            # rail and a `completed` run: the finalizer consults the tracker
+            # again inside its decision lock (see the claim source registered
+            # with the tracker), so a rail that trips after this line still
+            # outranks the product claim below.
+            finalizer.finalize(TerminalClaim.budget_stop(
+                workflow_key, tracker.stop, usage=tracker.snapshot()))
             return 0
-        # Product outcome -> durable run status.
+        # Product outcome -> durable run status, through the ONE finalizer.
         #
-        # Swarm V2 owns a validated product-outcome contract, so the worker
-        # LOOKS IT UP instead of guessing usefulness from dictionary
-        # truthiness: `status` and `result_kind` must be allowlisted, must
-        # agree with each other and must agree with the verified fields, or
-        # the run is a contract violation rather than a quiet success. In
-        # particular `no_usable_result` can only ever reach `partial_success`
-        # and can never emit run_completed.
+        # Neither engine decides its own durable status here any more, and
+        # neither is read by truthiness. `backend.product_outcome` derives the
+        # canonical ProductOutcome -- semantic status, coverage, blocking
+        # items, usability and a safe payload reference -- and the finalizer
+        # maps THAT to a terminal state. So:
         #
-        # V1 (and the mock lifecycle engine) keep their existing mapping
-        # unchanged, including the generic `result` fallback they rely on.
-        if workflow_key == "swarm_v2":
-            from backend.engines.swarm_v2 import ProductOutcomeError, durable_run_status
-            try:
-                status = durable_run_status(result)
-            except ProductOutcomeError:
-                # Static classification only: the offending payload never
-                # reaches an event, run.error or the browser.
-                code, message = "SWARM_V2_OUTCOME_INVALID", "Swarm V2 product outcome is invalid"
-                sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message=message,
-                                         payload={"code": code}))
-                shadow_observe("run_failed", {"code": code})
-                repo.mark_run_failed(run_id, code, message, worker_id=worker_id,
-                                     attempt=run.get("attempt"), lease_token=run.get("lease_token"))
-                return 0
-            sink.emit(RunEventRecord(run_id=run_id, type="run_partial_success" if status == "partial_success" else "run_completed", message=f"Run {status}", payload={"status": result.get("status"), "result_kind": result.get("result_kind")}))
-            shadow_observe("run_partial_success" if status == "partial_success" else "run_completed", {"status": result.get("status"), "result_kind": result.get("result_kind")})
-            if status == "partial_success":
-                # Never silently downgrade to mark_run_complete when the
-                # repository cannot express partial_success: reporting an
-                # unusable result as `completed` is the exact defect this
-                # contract exists to prevent, so a missing capability is an
-                # infrastructure failure (as it already is for budget stops).
-                if not callable(getattr(repo, "transition_run", None)):
-                    raise AppError("RUN_FINALIZATION_UNAVAILABLE",
-                                   "terminal run transition is unavailable", 503)
-                repo.transition_run(run_id, "partial_success", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), output=result, error=None, finished_at=datetime.now(UTC).isoformat())
-            else:
-                repo.mark_run_complete(run_id, result, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
-            return 0
-        if result.get("status") in {"complete", "partial_success", "success"} or (result.get("status") != "failed" and result.get("result")):
-            status = "partial_success" if result.get("status") == "partial_success" else "completed"
-            sink.emit(RunEventRecord(run_id=run_id, type="run_partial_success" if status == "partial_success" else "run_completed", message=f"Run {status}", payload={"status": result.get("status")}))
-            shadow_observe("run_partial_success" if status == "partial_success" else "run_completed", {"status": result.get("status")})
-            if hasattr(repo, "transition_run") and status == "partial_success":
-                repo.transition_run(run_id, "partial_success", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), output=result, error=None, finished_at=datetime.now(UTC).isoformat())
-            else:
-                repo.mark_run_complete(run_id, result, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
-            return 0
-        error = result.get("error", {}) if isinstance(result, dict) else {}
-        code = error.get("code", "ENGINE_FAILED")
-        message = error.get("message", "vehicle_catalog_v1 engine failed")
-        sink.emit(RunEventRecord(run_id=run_id, type="run_failed", message=message, payload={"code": code}))
-        shadow_observe("run_failed", {"code": code})
-        repo.mark_run_failed(run_id, code, message, worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
-        return 0 if workflow_key == "swarm_v2" else 1
+        #   * Swarm V2's validated contract still decides V2 (the canonical
+        #     derivation validates through it), and `no_usable_result` still
+        #     can only ever reach `partial_success`;
+        #   * V1 is classified from what its deterministic assembly actually
+        #     recorded -- settled models, review items, rejected candidates,
+        #     failed agents, degraded stages -- with its declared status used
+        #     only as a floor, never as a lift;
+        #   * an engine with no contract of its own keeps the declared-status
+        #     reading, downwards only.
+        claim = TerminalClaim.product(workflow_key, result)
+        if workflow_key == "swarm_v2" and "OUTCOME_CONTRACT_VIOLATION" in claim.outcome.blocking_codes:
+            # Static classification only: the offending payload never reaches
+            # an event, run.error or the browser.
+            claim = TerminalClaim.failure(workflow_key, "SWARM_V2_OUTCOME_INVALID",
+                                          "Swarm V2 product outcome is invalid")
+        elif claim.durable_status == "failed":
+            # The engine ran and reported that it produced nothing. Its own
+            # error code and message are the truthful ones.
+            error = result.get("error", {}) if isinstance(result, dict) else {}
+            claim = TerminalClaim.failure(
+                workflow_key, error.get("code", "ENGINE_FAILED"),
+                error.get("message", f"{workflow_key} engine failed"))
+        decision = finalizer.finalize(claim)
+        # Cloud Run reads a non-zero exit as a failed task and relaunches it,
+        # so only V1's engine-reported failure keeps its historical exit code.
+        return 0 if (workflow_key == "swarm_v2" or decision.status != "failed") else 1
     finally:
         cleanup_heartbeat()
 

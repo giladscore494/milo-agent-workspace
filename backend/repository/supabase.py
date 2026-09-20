@@ -9,7 +9,7 @@ from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
                                       prepare_snapshot)
 from backend.config import Settings
 from backend.errors import AppError, NotFoundError
-from backend.runtime import RUN_STATES, InvalidTransition, validate_transition
+from backend.runtime import RUN_STATES, TERMINAL_STATES, InvalidTransition, validate_transition
 from backend.schemas import normalize_conversation_title
 
 
@@ -36,6 +36,7 @@ class Repository(Protocol):
     def save_checkpoint(self, checkpoint: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None: ...
     def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]: ...
+    def finalize_run(self, run_id: UUID, status: str, expected_status: str, event: dict[str, Any] | None = None, *, worker_id: str, attempt: int | None, lease_token: str | None, **fields: Any) -> dict[str, Any]: ...
     def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
     def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]: ...
@@ -569,6 +570,55 @@ class SupabaseRepository:
         if not rows:
             raise AppError("RUN_TRANSITION_CONFLICT", "run was modified concurrently or the lease is no longer held", 409)
         return rows[0] if isinstance(rows, list) else rows
+
+    #: The fields a terminal finalization may carry. `started_at` is absent on
+    #: purpose: a run being finalized has started, and a terminal write that
+    #: could also rewrite when it started would be two decisions in one call.
+    FINALIZATION_FIELDS = {"output", "error", "usage", "finished_at"}
+
+    def finalize_run(self, run_id: UUID, status: str, expected_status: str, event: dict[str, Any] | None = None, *, worker_id: str, attempt: int | None, lease_token: str | None, **fields: Any) -> dict[str, Any]:
+        """Make a run terminal AND record its terminal event, atomically.
+
+        Migration 20260920000200's `finalize_run_guarded` performs the
+        lease-guarded, compare-and-set transition and the terminal event
+        insert in ONE transaction, so a terminal event can never exist for a
+        decision that did not become the run's durable state, and a terminal
+        run can never be left without the evidence its event carries. The CAS
+        is against `expected_status`, the state the decision was taken under:
+        a run that moved since (a cancellation request, a reclaim) rejects the
+        finalization with RUN_LEASE_LOST, exactly like a stale lease, so the
+        caller re-reads and decides again rather than overwriting.
+
+        `event` is `{"type", "message", "payload"}` or None (a budget stop's
+        cause event was already emitted by the tracker).
+        """
+        if status not in TERMINAL_STATES:
+            raise AppError("INVALID_RUN_TRANSITION", f"{status!r} is not a terminal run status", 409)
+        if expected_status in RUN_STATES:
+            try:
+                validate_transition(expected_status, status)
+            except InvalidTransition as exc:
+                raise AppError("INVALID_RUN_TRANSITION", str(exc), 409) from exc
+        unsupported = set(fields) - self.FINALIZATION_FIELDS
+        if unsupported:
+            raise AppError("REPOSITORY_ERROR", f"unsupported finalization fields: {sorted(unsupported)}", 502)
+        event = event or {}
+        return self._guarded_rpc("finalize_run_guarded", {
+            "p_run_id": str(run_id),
+            "p_status": status,
+            "p_expected_status": expected_status,
+            "p_worker_id": worker_id,
+            "p_attempt": attempt,
+            "p_lease_token": lease_token,
+            "p_output": fields.get("output"),
+            "p_error": fields.get("error"),
+            "p_clear_error": "error" in fields and fields["error"] is None,
+            "p_usage": fields.get("usage"),
+            "p_finished_at": fields.get("finished_at"),
+            "p_event_type": event.get("type"),
+            "p_event_message": event.get("message"),
+            "p_event_payload": event.get("payload") or {},
+        }, "run")
 
     def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]:
         """Atomic lease claim via migration 012's single-statement CAS."""

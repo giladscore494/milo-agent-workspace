@@ -6569,3 +6569,132 @@ def test_execution_usage_ledger_is_service_path_only_and_rerun_safe(db):
     db.psql(file=_ledger_migration())
     assert db.psql("select count(*) from pg_proc where proname='record_run_usage_guarded'") == "1"
     assert db.psql("select count(*) from pg_trigger where tgname='run_execution_usage_monotonic'") == "1"
+
+
+# ---------------------------------------------------------------------------
+# 20260920000200: atomic run finalization -- the terminal transition and the
+# terminal event commit together, or neither does.
+# ---------------------------------------------------------------------------
+
+
+def _finalizing_worker(db, worker: str):
+    """A leased worker whose run is `running`, ready to be finalized."""
+    run_id, _lease, attempt, token = _ledger_worker(db, worker)
+    db.psql(f"select public.transition_run_worker_guarded('{run_id}', 'running', 'starting', '{worker}', {attempt}, '{token}')")
+    return run_id, attempt, token
+
+
+def _finalize(run_id, status, expected, worker, attempt, token, *, event_type=None,
+              message="m", payload='{"product_outcome": {"semantic_status": "partial"}}',
+              output="null", error="null", clear_error="false", usage="null"):
+    event = "null" if event_type is None else f"'{event_type}'"
+    return (
+        "select status from public.finalize_run_guarded("
+        f"p_run_id => '{run_id}', p_status => '{status}', p_expected_status => {expected}, "
+        f"p_worker_id => '{worker}', p_attempt => {attempt}, p_lease_token => '{token}', "
+        f"p_output => {output}, p_error => {error}, p_clear_error => {clear_error}, p_usage => {usage}, "
+        f"p_finished_at => now(), p_event_type => {event}, p_event_message => '{message}', "
+        f"p_event_payload => '{payload}'::jsonb)"
+    )
+
+
+def _terminal_events(db, run_id):
+    return db.psql(
+        f"select event_type from public.run_events where run_id='{run_id}' "
+        "and event_type in ('run_completed','run_partial_success','run_failed','run_cancelled') order by id"
+    ).splitlines()
+
+
+def test_finalize_run_guarded_commits_the_transition_and_the_event_together(db):
+    run_id, attempt, token = _finalizing_worker(db, "worker-FIN1")
+    status = db.psql(_finalize(run_id, "partial_success", "'running'", "worker-FIN1", attempt, token,
+                               event_type="run_partial_success", output='\'{"fields": {"a": 1}}\'::jsonb',
+                               error="null", clear_error="true",
+                               usage='\'{"model_calls": 2, "input_tokens": 5}\'::jsonb'))
+    assert status == "partial_success"
+    row = db.psql(f"select status, output, error, finished_at is not null, usage->>'model_calls' from public.runs where id='{run_id}'")
+    assert row.startswith("partial_success|") and '"fields"' in row and row.endswith("|t|2")
+    assert _terminal_events(db, run_id) == ["run_partial_success"]
+    stored = json.loads(db.psql(
+        f"select payload from public.run_events where run_id='{run_id}' and event_type='run_partial_success'"))
+    assert stored == {"product_outcome": {"semantic_status": "partial"}}
+
+
+def test_finalize_run_guarded_rejects_a_moved_status_and_records_no_event(db):
+    """The blocker at the database boundary: a cancellation request between
+    the decision and the write makes the compare-and-set fail, and because
+    the event insert comes after it in the same function, nothing is written."""
+    run_id, attempt, token = _finalizing_worker(db, "worker-FIN2")
+    db.psql(f"update public.runs set status='cancellation_requested' where id='{run_id}'")
+    with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+        db.psql(_finalize(run_id, "completed", "'running'", "worker-FIN2", attempt, token,
+                          event_type="run_completed"))
+    assert db.psql(f"select status from public.runs where id='{run_id}'") == "cancellation_requested"
+    assert _terminal_events(db, run_id) == []
+    # Re-decided under the state that holds, both land together and agree.
+    assert db.psql(_finalize(run_id, "cancelled", "'cancellation_requested'", "worker-FIN2", attempt, token,
+                             event_type="run_cancelled", payload='{"code": "RUN_CANCELLED_AFTER_RESULT"}',
+                             output='\'{"kept": true}\'::jsonb')) == "cancelled"
+    assert db.psql(f"select status, output->>'kept' from public.runs where id='{run_id}'") == "cancelled|true"
+    assert _terminal_events(db, run_id) == ["run_cancelled"]
+
+
+def test_finalize_run_guarded_rejects_a_stale_lease_and_records_no_event(db):
+    run_id, attempt, token = _finalizing_worker(db, "worker-FIN3")
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+    with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+        db.psql(_finalize(run_id, "completed", "'running'", "worker-FIN3", attempt, token,
+                          event_type="run_completed"))
+    assert db.psql(f"select status from public.runs where id='{run_id}'") == "running"
+    assert _terminal_events(db, run_id) == []
+
+
+def test_finalize_run_guarded_rolls_the_transition_back_when_the_event_cannot_be_written(db):
+    """Both or neither: an event insert that fails takes the transition down
+    with it, so a terminal run can never be left without its evidence."""
+    run_id, attempt, token = _finalizing_worker(db, "worker-FIN4")
+    db.psql(
+        "create or replace function public._test_refuse_terminal_event() returns trigger language plpgsql as $$ "
+        "begin if new.message = 'BOOM' then raise exception 'TEST_EVENT_STORE_DOWN'; end if; return new; end $$; "
+        "create trigger _test_refuse_terminal_event before insert on public.run_events "
+        "for each row execute function public._test_refuse_terminal_event()"
+    )
+    try:
+        with pytest.raises(AssertionError, match="TEST_EVENT_STORE_DOWN"):
+            db.psql(_finalize(run_id, "completed", "'running'", "worker-FIN4", attempt, token,
+                              event_type="run_completed", message="BOOM"))
+        assert db.psql(f"select status, finished_at is null from public.runs where id='{run_id}'") == "running|t"
+        assert _terminal_events(db, run_id) == []
+    finally:
+        db.psql("drop trigger if exists _test_refuse_terminal_event on public.run_events; "
+                "drop function if exists public._test_refuse_terminal_event()")
+    # With the store back, the same finalization lands whole.
+    assert db.psql(_finalize(run_id, "completed", "'running'", "worker-FIN4", attempt, token,
+                             event_type="run_completed")) == "completed"
+    assert _terminal_events(db, run_id) == ["run_completed"]
+
+
+def test_finalize_run_guarded_refuses_non_terminal_and_blind_finalization(db):
+    run_id, attempt, token = _finalizing_worker(db, "worker-FIN5")
+    with pytest.raises(AssertionError, match="RUN_FINALIZATION_INVALID"):
+        db.psql(_finalize(run_id, "waiting", "'running'", "worker-FIN5", attempt, token))
+    with pytest.raises(AssertionError, match="RUN_FINALIZATION_INVALID"):
+        db.psql(_finalize(run_id, "completed", "null", "worker-FIN5", attempt, token))
+    with pytest.raises(AssertionError, match="RUN_FINALIZATION_INVALID"):
+        db.psql(_finalize(run_id, "completed", "'running'", "worker-FIN5", attempt, token,
+                          event_type="run_completed", payload='[1, 2]'))
+    assert db.psql(f"select status from public.runs where id='{run_id}'") == "running"
+    assert _terminal_events(db, run_id) == []
+    # A budget stop owes no event of its own: the transition alone is fine.
+    assert db.psql(_finalize(run_id, "budget_exhausted", "'running'", "worker-FIN5", attempt, token,
+                             error='\'{"code": "COST_LIMIT_REACHED", "message": "m"}\'::jsonb')) == "budget_exhausted"
+    assert _terminal_events(db, run_id) == []
+
+
+def test_finalize_run_guarded_is_service_path_only(db):
+    signature = "public.finalize_run_guarded(uuid, text, text, text, integer, text, jsonb, jsonb, boolean, jsonb, timestamptz, text, text, jsonb)"
+    assert db.psql(f"select has_function_privilege('anon', '{signature}', 'EXECUTE')") == "f"
+    assert db.psql(f"select has_function_privilege('authenticated', '{signature}', 'EXECUTE')") == "f"
+    assert db.psql(f"select has_function_privilege('service_role', '{signature}', 'EXECUTE')") == "t"
+    assert db.psql("select count(*) from pg_proc where proname='finalize_run_guarded'") == "1"
+

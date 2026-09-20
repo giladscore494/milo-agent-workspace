@@ -201,10 +201,43 @@ class VehicleCatalogEngine:
             results["hebrew_summary"] = summary
             self._emit("phase_completed", {"phase": "summary", "result": summary})
             self._checkpoint("summary", results, failed_summaries)
-            status = final["parsed"].get("status", "success")
+            status = self._semantic_status(final["parsed"], failed_summaries)
             return {"status": status, "result": final["parsed"], "summary": summary.get("parsed", {}).get("summary") if summary.get("status") == "success" else None, "results": results, "input_tokens": self.input_tokens, "output_tokens": self.output_tokens, "elapsed_seconds": time.perf_counter() - start}
         finally:
             self._restore_injections()
+
+    @staticmethod
+    def _semantic_status(final_json: Any, failed_summaries: list[dict[str, Any]]) -> str:
+        """The run's real semantic outcome, as a floor over the declared one.
+
+        The deterministic builder decides `status` from the failures it was
+        handed, and then TWO things happened after that decision:
+
+        * `_apply_source_policy` recomputes `needs_review` and `rejected` from
+          the Israel evidence rules, so a run can acquire outstanding items
+          after its status was already written as `complete`;
+        * the Hebrew summary phase runs, and this method used to read
+          `parsed.get("status", "success")` -- so a final document carrying no
+          status at all left the engine claiming success.
+
+        Neither of those is allowed to make a run worth more than it is. The
+        declared status is believed only DOWNWARDS: an outstanding item, an
+        absorbed agent failure or an unrecognised claim lands on
+        `partial_success`, and only an explicit completeness claim with
+        nothing outstanding stays `complete`. The pipeline's own computation
+        is untouched -- this reports it, it does not redo it.
+        """
+        declared = final_json.get("status") if isinstance(final_json, dict) else None
+        if declared == "failed":
+            return "failed"
+        outstanding = bool(failed_summaries)
+        if isinstance(final_json, dict):
+            for key in ("needs_review", "rejected", "failed_agents"):
+                value = final_json.get(key)
+                outstanding = outstanding or bool(isinstance(value, list) and value)
+        if outstanding or declared not in {"complete", "success"}:
+            return "partial_success"
+        return declared
 
     def _apply_source_policy(self, final: dict[str, Any], config: VehicleCatalogRunConfig) -> None:
         """Deterministic Israel evidence policy on the merged final output:

@@ -1,5 +1,12 @@
 """Terminal-state verdict for ONE Cloud Run job execution (Stage D).
 
+This answers a TECHNICAL question only: did the process terminate, and did
+Cloud Run call it a success? It says nothing whatsoever about what the run
+PRODUCED. A worker that exits zero having verified nothing, refused its own
+outcome or produced an empty catalog is "succeeded" here and is not an
+acceptable product result -- `semantic_acceptance.py` is the gate that asks
+that question, and Stage D requires both.
+
 Reads the JSON of
   gcloud run jobs executions describe <name> --format=json
 from stdin and prints exactly one verdict word:

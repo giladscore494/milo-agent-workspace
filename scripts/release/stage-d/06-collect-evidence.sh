@@ -10,6 +10,9 @@
 #     new run or execution cannot pass unnoticed, and no historical row
 #     can satisfy the new run's acceptance);
 #   - expected terminal state;
+#   - SEMANTIC acceptance of the product result: a technically clean
+#     execution whose canonical ProductOutcome is unusable, refused or
+#     absent does NOT pass (see semantic_acceptance.py);
 #   - model calls actually happened, with tokens and tracked cost;
 #   - attempt/claim/heartbeat/lease invariants;
 #   - zero dangling reservations;
@@ -291,7 +294,22 @@ python3 ./verify_images.py \
   --execution-json "${exec_exec_json}" \
   || fail "the authorized Worker execution ${latest_execution} did not run the accepted release digest"
 
-echo "== 5. Worker log secret-marker scan (counts only; no values printed)"
+echo "== 5. SEMANTIC acceptance: the PRODUCT result, not the process exit"
+# Everything above this line answers a technical question: did the execution
+# terminate cleanly, exactly once, inside its caps, against the accepted
+# digest. None of them asks whether the run produced anything worth having.
+#
+# This gate asks that, of the one canonical authority
+# (backend/product_outcome.py), using the ProductOutcome the worker itself
+# recorded when it finalized the run. A run that is `completed` with an
+# unusable, refused or unrecorded outcome fails HERE -- which is the whole
+# point: "the worker executed successfully" and "the product result was
+# semantically acceptable" are different statements, and Stage D now requires
+# both.
+python3 ./semantic_acceptance.py < "${STAGE_D_WORKDIR}/evidence.log" \
+  || fail "the run's PRODUCT result was not semantically acceptable (see the stage_d_semantic_gate verdict above); a clean execution is not a product"
+
+echo "== 6. Worker log secret-marker scan (counts only; no values printed)"
 hits="$(gcloud logging read \
   "resource.type=cloud_run_job AND resource.labels.job_name=${STAGE_D_WORKER_JOB}" \
   --project="${STAGE_D_PROJECT}" --format='json(textPayload,jsonPayload)' --limit=5000 \

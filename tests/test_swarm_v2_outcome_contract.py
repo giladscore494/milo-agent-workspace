@@ -649,10 +649,9 @@ def test_worker_never_leaks_the_offending_payload_when_it_refuses(payload):
 # --- 12 / 13 / 14: V1, cancellation and terminal states are untouched --------
 
 def test_v1_completion_behavior_is_unchanged():
+    """A V1 result that CLAIMS completeness still completes, unchanged."""
     for result in ({"status": "success", "result": {"models": [1]}},
-                   {"status": "complete", "result": {"models": [1]}},
-                   # the generic non-failed `result` fallback V1 relies on
-                   {"status": "partial", "result": {"models": [1]}}):
+                   {"status": "complete", "result": {"models": [1]}}):
         repo = WorkerRepo()
 
         class V1Engine:
@@ -664,6 +663,25 @@ def test_v1_completion_behavior_is_unchanged():
         assert worker_main.execute_run(repo.run_id, repo, V1Engine()) == 0
         assert repo.completed is not None and repo.completed[1] == result
         assert [event[1] for event in repo.events][-1] == "run_completed"
+
+
+def test_a_v1_result_that_never_claimed_completeness_is_not_completed():
+    """The generic fallback used to read "not failed and has a result" as
+    `completed`. That is inferring semantic success from technical completion:
+    a declared status the contract does not recognise as a completeness claim
+    is now `partial_success`, never `completed`."""
+    repo = WorkerRepo()
+
+    class V1Engine:
+        workflow_key = "vehicle_catalog_v1"
+
+        def run(self, run):
+            return {"status": "partial", "result": {"models": [1]}}
+
+    assert worker_main.execute_run(repo.run_id, repo, V1Engine()) == 0
+    assert repo.completed is None
+    assert repo.partial is not None and repo.partial[1]["status"] == "partial"
+    assert [event[1] for event in repo.events][-1] == "run_partial_success"
 
 
 def test_v1_partial_success_behavior_is_unchanged():
