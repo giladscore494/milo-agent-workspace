@@ -707,24 +707,36 @@ def test_verify_caps_refuses_a_release_whose_policy_is_not_this_one(tmp_path):
     same local checkout only ever proves the checkout agrees with itself. The
     run executes separately pinned release IMAGES, which may carry a different
     policy entirely, so Stage D refuses unless the policy here is byte-for-byte
-    the policy at the accepted release. `447b421…` is a real commit on this
-    branch whose runtime policy differs (it still carried `applies_to` and an
-    `engine` field in the document).
+    the policy at the accepted release.
+
+    Run end to end against a purpose-built repository rather than a commit of
+    this one: CI checks out at depth 1, so a test that names a real historical
+    SHA asserts a message the environment cannot produce and proves nothing
+    about the case it claims to cover.
     """
-    older_policy = git_sha("447b421")
-    result = run_verify_caps(tmp_path, worker_spec(release_sha=older_policy),
-                             api_spec(release_sha=older_policy), release_sha=older_policy)
-    assert result.returncode != 0
+    root, release_sha = build_release_toolkit_repo(tmp_path, change_policy_after=True)
+    result = run_verify_caps_in(root, tmp_path, release_sha)
+    assert result.returncode != 0, result.stdout + result.stderr
     assert "is not byte-for-byte the policy at the accepted release" in result.stdout
 
 
 def test_verify_caps_refuses_a_release_that_predates_the_policy(tmp_path):
     """The currently pinned Stage D release is exactly this case."""
-    base = git_sha("a42e73bfefa24ca2603e9b5aa09d5cde732c93d2")
-    result = run_verify_caps(tmp_path, worker_spec(release_sha=base),
-                             api_spec(release_sha=base), release_sha=base)
-    assert result.returncode != 0
+    root, release_sha = build_release_toolkit_repo(tmp_path, policy_at_release=False)
+    result = run_verify_caps_in(root, tmp_path, release_sha)
+    assert result.returncode != 0, result.stdout + result.stderr
     assert "does not contain backend/runtime_policy.py" in result.stdout
+
+
+def test_verify_caps_accepts_a_later_authorization_commit_end_to_end(tmp_path):
+    """The re-authorization property, proven through verify_caps itself."""
+    root, release_sha = build_release_toolkit_repo(tmp_path)
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, timeout=60).stdout.strip()
+    assert head != release_sha
+    result = run_verify_caps_in(root, tmp_path, release_sha)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "bound to the accepted release" in result.stdout
 
 
 @pytest.mark.parametrize("bad_sha", ["", "not-a-sha", "84cd8696", "z" * 40])
@@ -843,6 +855,78 @@ def build_release_repo(tmp_path, *, change_policy_after=False):
     return root, release_sha
 
 
+def build_release_toolkit_repo(tmp_path, *, policy_at_release=True,
+                               change_policy_after=False):
+    """A miniature repo carrying BOTH the policy and the Stage D verifiers.
+
+    `verify_caps.py` resolves its repository root from its own location, so a
+    copy of the toolkit inside this repo imports THIS repo's policy and binds
+    against THIS repo's history. That makes the end-to-end refusal paths
+    testable without depending on how deeply the CI runner cloned us.
+    """
+    root = tmp_path / "release-toolkit"
+    toolkit = root / "scripts" / "release" / "stage-d"
+    (root / "backend").mkdir(parents=True)
+    toolkit.mkdir(parents=True)
+
+    def run(*args):
+        subprocess.run(("git", "-C", str(root), *args), check=True,
+                       capture_output=True, timeout=60)
+
+    subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=60)
+    run("config", "user.email", "release@invalid")
+    run("config", "user.name", "Release")
+    for name in ("policy_envelope.py", "verify_caps.py"):
+        (toolkit / name).write_bytes((STAGE_D / name).read_bytes())
+    (root / "backend" / "__init__.py").write_bytes(
+        (REPO / "backend" / "__init__.py").read_bytes())
+    policy = root / "backend" / "runtime_policy.py"
+    released_policy = (REPO / "backend" / "runtime_policy.py").read_bytes()
+    if policy_at_release:
+        policy.write_bytes(released_policy)
+    (toolkit / "03-enable-stage-d.md").write_text("# v1\n")
+    run("add", "-A")
+    run("commit", "-qm", "release R")
+    release_sha = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, timeout=60).stdout.strip()
+
+    # The later, reviewed authorization commit. It references R; it is not R.
+    (toolkit / "03-enable-stage-d.md").write_text("# v2 — pins release R\n")
+    if not policy_at_release:
+        # The policy only appears AFTER the release, so R cannot carry it.
+        policy.write_bytes(released_policy)
+    if change_policy_after:
+        # A comment-only change: the DOCUMENT is identical, so the fingerprint
+        # pin still matches and only the byte comparison can refuse. That
+        # isolates the message this test is about.
+        policy.write_bytes(released_policy + b"\n# an authorization commit touched the policy\n")
+    run("add", "-A")
+    run("commit", "-qm", "authorize release R")
+    return root, release_sha
+
+
+def run_verify_caps_in(root, tmp_path, release_sha, *, caps=CAPS,
+                       provider_limits=PROVIDER_LIMITS, engine_limits=ENGINE_LIMITS):
+    """Run the COPY of verify_caps.py that lives inside `root`."""
+    worker_path = tmp_path / "sandbox-worker.json"
+    api_path = tmp_path / "sandbox-api.json"
+    worker_path.write_text(json.dumps(worker_spec(release_sha=release_sha)))
+    api_path.write_text(json.dumps(api_spec(release_sha=release_sha)))
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env.update({
+        "STAGE_D_CAPS": caps, "STAGE_D_WORKER_PROVIDER_LIMITS": provider_limits,
+        "STAGE_D_WORKER_ENGINE_LIMITS": engine_limits,
+        "STAGE_D_POLICY_FINGERPRINT": POLICY_FINGERPRINT,
+        "STAGE_D_REGISTRY": REGISTRY, "STAGE_D_RELEASE_SHA": release_sha,
+        "STAGE_D_API_IMAGE_DIGEST": API_DIGEST,
+        "STAGE_D_WORKER_IMAGE_DIGEST": WORKER_DIGEST,
+    })
+    return subprocess.run(
+        [sys.executable, str(root / "scripts" / "release" / "stage-d" / "verify_caps.py"),
+         "--worker-json", str(worker_path), "--api-json", str(api_path)],
+        capture_output=True, text=True, env=env, cwd=str(root), timeout=120)
+
+
 def test_a_later_authorization_commit_may_reference_an_earlier_release(tmp_path):
     """THE re-authorization property.
 
@@ -891,7 +975,11 @@ def test_an_earlier_real_commit_with_the_same_policy_is_accepted():
                            capture_output=True, timeout=60).stdout == current),
         None)
     if match is None:
-        pytest.skip("HEAD itself changed backend/runtime_policy.py; no ancestor carries it")
+        pytest.skip(
+            "no readable ancestor carries this policy — either HEAD changed it, "
+            "or this is a shallow clone (CI checks out at depth 1). The same "
+            "property is proven without history by "
+            "test_a_later_authorization_commit_may_reference_an_earlier_release")
     assert match != CHECKOUT_SHA
     assert policy_envelope.release_binding_problems(match) == []
 
