@@ -20,6 +20,7 @@ import threading
 import time
 
 import pytest
+from types import SimpleNamespace
 
 from backend.provider_quota import (MIN_TTL_FOR_MARGIN_FLOOR, MemoryQuotaBackend,
                                     ProviderQuotaCoordinator, ProviderQuotaUnavailable,
@@ -28,6 +29,25 @@ from backend.provider_quota import (MIN_TTL_FOR_MARGIN_FLOOR, MemoryQuotaBackend
                                     ownership_probe_interval)
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
+
+class StructuralRateLimit(Exception):
+    """A 429 the way the OpenAI SDK actually raises one: with a response.
+
+    The bare ``RuntimeError("Error code: 429 ...")`` these tests used to raise
+    is no longer accepted as proof that a request finished -- message text is
+    not evidence that anything reached the provider. Retry CLASSIFICATION
+    still reads text (see `classify_provider_error`), but a permit is only
+    returned on structure, so a fixture standing in for a real 429 has to
+    carry one.
+    """
+
+    status_code = 429
+
+    def __init__(self, message="Error code: 429 rate_limit_reached_error",
+                 headers=None):
+        super().__init__(message)
+        self.response = SimpleNamespace(status_code=429, headers=headers or {})
+
 
 # Short enough to run in a couple of seconds, long enough that the derived
 # deadline and margin are still meaningfully separated.
@@ -89,8 +109,8 @@ def test_a_long_call_keeps_its_permit_with_no_renewal_at_all():
 
     The call runs well past the nominal lease window. Under the superseded
     design that window WAS the reclaim trigger, so surviving it depended on a
-    renewal thread; now the lease is stamped to the crash-recovery horizon at
-    acquisition and the window has no reclaiming power at all.
+    renewal thread; now the lease is simply held from acquisition and the
+    window has no reclaiming power at all.
     """
     backend = MemoryQuotaBackend()
     config = QuotaConfig(max_concurrency=1, lease_ttl_seconds=TTL)
@@ -281,7 +301,7 @@ def _run_and_return_permit_state(outcome):
             return "ok"
         if outcome == "retry_then_success":
             if attempts["n"] == 1:
-                raise RuntimeError("Error code: 429 rate_limit_reached_error")
+                raise StructuralRateLimit()
             return "ok"
         raise AssertionError(outcome)
 
@@ -329,8 +349,8 @@ def test_an_unproven_request_keeps_holding_its_permit(outcome):
 
     Under the superseded design every one of these released the slot, and a
     second worker could take it while the real request might still be running.
-    Uncertainty must reduce available capacity, so the slot stays held until
-    the crash-recovery horizon -- which is far beyond this test.
+    Uncertainty must reduce available capacity, so the slot stays held --
+    by default until a human deliberately returns it.
     """
     coordinator, _scheduler, _attempts = _run_and_return_permit_state(outcome)
     assert coordinator.try_acquire_inference() is None, (
@@ -359,7 +379,8 @@ def test_a_held_permit_is_announced_rather_than_silently_missing(outcome):
 
     held = [p for k, p in signals if k == "provider_lease_quarantined"]
     assert held, signals
-    assert held[0]["held_for_seconds"] == coordinator.config.reclaim_horizon_seconds
+    assert held[0]["held_until"] == "operator_reclaim", (
+        "the diagnostic implies something will return the slot on its own")
     assert held[0]["reason"]
     for value in held[0].values():
         text = str(value).lower()
@@ -393,7 +414,7 @@ def test_a_retry_takes_a_fresh_permit_and_never_inherits_the_expired_one():
     def flaky():
         attempts["n"] += 1
         if attempts["n"] < 3:
-            raise RuntimeError("Error code: 429 rate_limit_reached_error")
+            raise StructuralRateLimit()
         return "ok"
 
     assert scheduler.execute(flaky, estimated_tokens=10, reserved_tokens=10) == "ok"

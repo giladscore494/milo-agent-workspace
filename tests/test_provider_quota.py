@@ -161,12 +161,12 @@ def test_a_released_lease_frees_capacity_and_a_second_release_is_a_no_op():
     assert coordinator.try_acquire_inference() is not None
 
 
-def test_a_stale_lease_is_recovered_only_at_the_crash_recovery_horizon():
-    """A crashed worker must not hold capacity forever -- nor lose it early.
+def test_a_stale_lease_is_never_recovered_without_a_human():
+    """A crashed worker's slot does not come back on a clock.
 
-    The horizon is derived from the worker process lifetime, so it is the one
-    moment at which an unreleased lease can be reclaimed without the risk that
-    the process holding it is still alive with its request in flight.
+    Nothing MILO can observe proves the provider stopped counting the request,
+    so nothing returns the slot on a timer. An operator who has checked does
+    it deliberately, and that is the only other way.
     """
     backend = MemoryQuotaBackend()
     clock = Clock()
@@ -174,14 +174,15 @@ def test_a_stale_lease_is_recovered_only_at_the_crash_recovery_horizon():
               "worker_max_lifetime_seconds": 40}
     crashed = build(limits, backend=backend, clock=clock)
     replacement = build(limits, backend=backend, clock=clock)
-    horizon = crashed.config.reclaim_horizon_seconds      # 40 + 10
 
-    crashed.try_acquire_inference()               # and then the process dies
-    assert replacement.try_acquire_inference() is None
-    clock.advance(31)                             # past the nominal window
-    assert replacement.try_acquire_inference() is None, (
-        "the slot was reclaimed on a request timescale")
-    clock.advance(horizon - 31 + 1)
+    lease = crashed.try_acquire_inference()       # and then the process dies
+    for step in (0, 31, 500, 86_400):
+        clock.advance(step)
+        assert replacement.try_acquire_inference() is None, (
+            f"the slot came back on its own after {step}s")
+
+    assert replacement.operator_reclaim_inference(
+        lease.lease_id, reason="verified out of band")
     assert replacement.try_acquire_inference() is not None
 
 
@@ -201,7 +202,9 @@ def test_an_expired_lease_can_never_release_its_replacements_lease():
     replacement = build(limits, backend=backend, clock=clock)
 
     stale = crashed.try_acquire_inference()
-    clock.advance(crashed.config.reclaim_horizon_seconds + 1)
+    # The crashed holder's slot is reclaimed deliberately, by a human, because
+    # nothing else ever reclaims it.
+    replacement.operator_reclaim_inference(stale.lease_id, reason="verified out of band")
     fresh = replacement.try_acquire_inference()
     assert fresh is not None
 
@@ -211,29 +214,26 @@ def test_an_expired_lease_can_never_release_its_replacements_lease():
     assert fresh.release() is True
 
 
-def test_the_ownership_probe_reports_but_never_extends():
+def test_the_ownership_probe_reports_but_never_changes_anything():
     """It answers "is this still mine", and that is all it can do.
 
-    A probe that could extend a lease would be able to push a slot past the
-    life of the process holding it, so a wedged worker would leak capacity
-    permanently. The lease therefore ends at the horizon it was stamped with,
-    however many times it is probed.
+    Read-only by construction -- no TTL argument, no write in the Lua -- so
+    however often a lease is probed, it is neither extended nor shortened.
     """
     backend = MemoryQuotaBackend()
     clock = Clock()
     coordinator = build({"max_concurrency": 1, "lease_ttl_seconds": 30,
                          "worker_max_lifetime_seconds": 40},
                         backend=backend, clock=clock)
-    horizon = coordinator.config.reclaim_horizon_seconds      # 50
     lease = coordinator.try_acquire_inference()
 
     for _ in range(5):
-        clock.advance(8)
+        clock.advance(1_000)
         assert lease.verify_ownership() is True
-    assert coordinator.try_acquire_inference() is None
+        assert coordinator.try_acquire_inference() is None
 
-    clock.advance(horizon - 40 + 1)                # past the original horizon
-    assert lease.verify_ownership() is False, "probing extended the lease"
+    assert lease.release() is True
+    assert lease.verify_ownership() is False
     assert coordinator.try_acquire_inference() is not None
 
 

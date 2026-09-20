@@ -239,7 +239,7 @@ def test_a_deadline_frees_the_local_slot_but_keeps_the_shared_permit(trickle):
     The process-local slot bounds THIS process's threads; the thread is gone,
     so it goes back. The organization permit stands for a request whose state
     is now unknown -- the provider may still be working -- so it is held to
-    the crash-recovery horizon instead of being handed to someone else.
+    held, rather than being handed to someone else.
     """
     backend = MemoryQuotaBackend()
     coordinator = ProviderQuotaCoordinator(

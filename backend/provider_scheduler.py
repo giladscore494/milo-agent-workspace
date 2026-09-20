@@ -133,26 +133,41 @@ def request_completion_is_proven(exc: BaseException | None) -> tuple[bool, str]:
     outcome this function does not recognise holds the slot rather than
     freeing it.
 
-    YES has a small, closed set of sources, and each is a positive proof
-    rather than an inference:
+    Every YES is STRUCTURAL -- an object the transport or the SDK built, or a
+    statement from code that ran on one side of the request. None of them is
+    the TEXT of a message:
 
     * the call RETURNED. The response was read to completion, so the exchange
       is over.
     * the exception carries a response with a status code. The provider
       produced a complete HTTP response -- 400, 429, 500 alike -- so the
       exchange is over whatever the status says. (This is what keeps ordinary
-      backpressure fast: a 429 releases immediately and the retry proceeds.)
+      backpressure fast: a real 429 releases immediately and the retry
+      proceeds.)
     * the failure happened before anything was sent -- a connect timeout, a
       refused connection, an unusable URL. Nothing was ever started.
     * the exception carries ``provider_request_completed``, set by code that
-      knows which side of the request it ran on.
-    * :func:`classify_provider_error` recognises it as a Kimi failure class.
-      Those are things the provider SAID, so it answered.
+      knows which side of the request it ran on (``backend.budget``).
 
     Everything else is NO. Most importantly
     :class:`~backend.provider_transport.ProviderRequestDeadlineExceeded` and
     read timeouts: those mean MILO stopped waiting, and nothing in the httpx
     or OpenAI contract turns that into the provider stopping work.
+
+    WHY :func:`classify_provider_error` IS NOT CONSULTED HERE
+    ---------------------------------------------------------
+
+    A previous revision released the slot whenever that classifier recognised
+    the exception, and review rightly called it out. The classifier matches
+    raw message TEXT -- ``rate_limit_reached_error``, ``error code: 429``,
+    ``overloaded`` -- deliberately, because for RETRY decisions a permissive
+    reading is the safe direction: treating something as backpressure only
+    costs a wait. For CONCURRENCY it is the opposite. Text is not evidence
+    that a request reached the provider, let alone that it finished, so any
+    exception whose message happened to contain "429" could free an
+    organization slot. The two questions want opposite defaults, so they are
+    answered by different code: the classifier stays permissive for retries,
+    and settlement requires structure.
     """
     if exc is None:
         return True, ""
@@ -166,17 +181,8 @@ def request_completion_is_proven(exc: BaseException | None) -> tuple[bool, str]:
               or getattr(getattr(exc, "response", None), "status_code", None))
     if status is not None:
         return True, ""
-    # Checked BEFORE the classifier below, so a deadline can never be talked
-    # into looking like a provider response by the text of its message.
     if type(exc).__name__ == "ProviderRequestDeadlineExceeded":
         return False, "PROVIDER_REQUEST_DEADLINE_EXCEEDED"
-    if classify_provider_error(exc) is not None:
-        # A recognised Kimi failure class -- rate limited, overloaded, out of
-        # quota. Each is something the PROVIDER said, so it answered and the
-        # exchange is over. This also keeps the classifier and the settlement
-        # rule from disagreeing: an error the scheduler is willing to retry as
-        # backpressure must be one whose slot it is willing to give back.
-        return True, ""
     if _failed_before_the_request_was_sent(exc):
         return True, ""
     return False, "PROVIDER_REQUEST_OUTCOME_UNKNOWN"
@@ -378,8 +384,8 @@ class _OwnershipProbe:
     """Handle for one request's read-only ownership probe.
 
     Renamed from a renewal watchdog because it no longer renews anything. A
-    lease is stamped to the crash-recovery horizon when it is acquired, so
-    re-stamping it would push a slot past the life of the process holding it.
+    held lease has no expiry to renew, and under the opt-in reclaim timer
+    re-stamping would push a slot past the life of the process holding it.
     All this does is notice, and say, when MILO can no longer show it owns a
     permit it is using.
     """
@@ -596,9 +602,9 @@ class ProviderScheduler:
         """Watch whether ``lease`` is still recorded as ours, and say if not.
 
         PURELY OBSERVABILITY. It renews nothing, and the concurrency invariant
-        does not reference it: a lease is held to the crash-recovery horizon
-        from the moment it is acquired, and only a PROVEN-FINISHED request
-        shortens that. So this may never run, fail on every pass, or fail to
+        does not reference it: a lease is HELD from the moment it is acquired,
+        and only a PROVEN-FINISHED request -- or a deliberate operator reclaim
+        -- returns it. So this may never run, fail on every pass, or fail to
         start its thread, and the ceiling still holds.
 
         What it buys is that losing ownership is not silent. It used to be
@@ -765,7 +771,7 @@ class ProviderScheduler:
                 #
                 # Settlement is not release. The shared permit goes back only
                 # when this request is PROVEN over; when it is not, the slot
-                # stays held to the crash-recovery horizon. The local slot
+                # stays held until a human returns it. The local slot
                 # above is a different thing and is always released: it bounds
                 # this process's own threads, not organization concurrency.
                 if lease is not None:

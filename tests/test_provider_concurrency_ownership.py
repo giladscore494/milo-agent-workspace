@@ -35,18 +35,39 @@ import time
 from pathlib import Path
 
 import pytest
+from types import SimpleNamespace
 
-from backend.provider_quota import (WORKER_MAX_LIFETIME_SECONDS, MemoryQuotaBackend,
+from backend.provider_quota import (GUARANTEE_PROVEN_COMPLETION, GUARANTEE_TIMED_RECLAIM,
+                                    WORKER_MAX_LIFETIME_SECONDS, MemoryQuotaBackend,
                                     ProviderQuotaCoordinator, ProviderQuotaUnavailable,
-                                    QuotaConfig, assert_reclaim_horizon_safe,
-                                    lease_safety_margin, reclaim_horizon,
-                                    resolve_coordinator)
+                                    QuotaConfig, assert_abandoned_lease_reclaim_safe,
+                                    lease_safety_margin,
+                                    minimum_abandoned_lease_reclaim, resolve_coordinator)
 from backend.provider_scheduler import (ProviderBackpressureExceeded, ProviderLimitsConfig,
                                         ProviderScheduler, request_completion_is_proven)
 from backend.provider_transport import (ProviderRequestDeadlineExceeded,
                                         build_deadline_http_client)
 
 REPO = Path(__file__).resolve().parents[1]
+
+class StructuralRateLimit(Exception):
+    """A 429 the way the OpenAI SDK actually raises one: with a response.
+
+    The bare ``RuntimeError("Error code: 429 ...")`` these tests used to raise
+    is no longer accepted as proof that a request finished -- message text is
+    not evidence that anything reached the provider. Retry CLASSIFICATION
+    still reads text (see `classify_provider_error`), but a permit is only
+    returned on structure, so a fixture standing in for a real 429 has to
+    carry one.
+    """
+
+    status_code = 429
+
+    def __init__(self, message="Error code: 429 rate_limit_reached_error",
+                 headers=None):
+        super().__init__(message)
+        self.response = SimpleNamespace(status_code=429, headers=headers or {})
+
 
 #: MILO's total wall-clock deadline for one request.
 DEADLINE = 1.5
@@ -180,16 +201,16 @@ class SupersededOwnership(ProviderQuotaCoordinator):
         self.release_inference(lease_id)
 
 
-class RequestScaleReclaim(ProviderQuotaCoordinator):
-    """The other half of the old design: reclaim on a REQUEST timescale.
+class TimedReclaim(ProviderQuotaCoordinator):
+    """A deployment that opted into reclaiming abandoned leases on a clock.
 
-    `try_acquire_inference` stamped the lease with `lease_ttl_seconds`, so a
-    holder that never settled -- a killed process -- had its slot reclaimed
-    while a 600s-capable request could still be running. Passing that same
-    value here reproduces it, scaled to the test's seconds.
+    This is a SUPPORTED configuration, not a bug -- but it trades the proven
+    guarantee for an assumption about provider-side behaviour that MILO cannot
+    check, and the tests below show exactly what that assumption buys and
+    costs. Scaled to the test's seconds.
     """
 
-    def _reclaim_horizon_ms(self):
+    def _abandoned_reclaim_ms(self):
         return int(self.config.lease_ttl_seconds * 1000)
 
 
@@ -328,15 +349,70 @@ def test_a_fired_deadline_is_not_proof_that_the_request_stopped():
 
 
 @pytest.mark.parametrize("exc,expected", [
-    (None, True),                                             # the call returned
-    (RuntimeError("Error code: 429 rate_limit_reached_error"), True),
+    (None, True),                                    # the call returned
+    (StructuralRateLimit(), True),                   # a real 429, with a response
+    (RuntimeError("Error code: 429 rate_limit_reached_error"), False),
+    (RuntimeError("max organization concurrency reached"), False),
     (TimeoutError("read timed out"), False),
     (RuntimeError("something nobody enumerated"), False),
     (ProviderRequestDeadlineExceeded(5.0, 5.1), False),
 ])
-def test_only_a_positive_proof_releases_a_slot(exc, expected):
-    """The default is NO. An outcome nobody thought about holds the slot."""
+def test_only_structural_evidence_releases_a_slot(exc, expected):
+    """The default is NO, and message text is never a yes."""
     assert request_completion_is_proven(exc)[0] is expected
+
+
+@pytest.mark.parametrize("text", [
+    "Error code: 429 rate_limit_reached_error",
+    "max organization concurrency reached",
+    "engine_overloaded_error",
+    "http 429",
+])
+def test_a_text_only_429_is_quarantined_while_a_structural_one_releases(text):
+    """The exact confusion review found, pinned from both sides.
+
+    `classify_provider_error` recognises all of these, deliberately: for a
+    RETRY decision, reading text permissively only ever costs a wait. For a
+    CONCURRENCY decision the same permissiveness would let any exception whose
+    message happened to contain "429" hand an organization slot to another
+    worker. So the classifier still matches...
+    """
+    from backend.provider_scheduler import classify_provider_error
+
+    text_only = RuntimeError(text)
+    assert classify_provider_error(text_only) is not None
+
+    # ...and settlement still refuses it.
+    proven, reason = request_completion_is_proven(text_only)
+    assert proven is False
+    assert reason == "PROVIDER_REQUEST_OUTCOME_UNKNOWN"
+
+    # The same failure WITH a response object is a real provider answer.
+    assert request_completion_is_proven(StructuralRateLimit(text))[0] is True
+
+
+def test_a_text_only_429_really_does_hold_the_slot_end_to_end():
+    """Not just the predicate: the slot itself, through the scheduler."""
+    backend = MemoryQuotaBackend()
+    config = QuotaConfig(max_concurrency=1, lease_ttl_seconds=2.0,
+                         worker_max_lifetime_seconds=3.0)
+    coordinator = ProviderQuotaCoordinator(backend, config)
+    scheduler = ProviderScheduler(
+        ProviderLimitsConfig(max_concurrency=1, rpm_limit=None, tpm_limit=None,
+                             max_rate_limit_retries=1, backoff_base_seconds=0.001,
+                             backoff_max_seconds=0.001,
+                             max_backpressure_wait_seconds=0.5),
+        coordinator=coordinator, sleep_fn=lambda _s: None)
+
+    with pytest.raises(BaseException):  # noqa: B017 - the outcome under test
+        scheduler.execute(
+            lambda: (_ for _ in ()).throw(
+                RuntimeError("Error code: 429 rate_limit_reached_error")),
+            estimated_tokens=10, reserved_tokens=10)
+
+    assert coordinator.try_acquire_inference() is None, (
+        "an exception whose only 429 evidence was its message text released "
+        "an organization concurrency slot")
 
 
 def test_a_complete_http_response_is_proof_whatever_its_status():
@@ -360,7 +436,92 @@ def test_a_connect_failure_is_proof_that_nothing_was_sent():
 
 
 # =============================================================================
-# 3. crash recovery: the ONLY thing that reclaims an unreleased slot
+# 3. the provider stays busy past ANY horizon; the slot stays held
+# =============================================================================
+
+def test_a_slot_is_not_reused_while_the_provider_is_still_busy_however_long(provider):
+    """The reviewer's regression, and the one the previous design failed.
+
+    Worker A's deadline fires at 1.5s; the provider keeps working until 6s.
+    The test then waits past the point at which the superseded timed design
+    WOULD have reclaimed the slot (the scaled 3.75s horizon) and keeps asking.
+    Because nothing reclaims an unreleased lease by default, worker B is never
+    admitted, and the provider -- the only witness that can see its own
+    occupancy -- never serves two MILO requests at once.
+    """
+    worker_a, worker_b = two_workers()
+    assert worker_a.config.reclaims_abandoned_leases is False
+    superseded_horizon = worker_a.config.lease_ttl_seconds + 1.75   # 3.75s
+
+    def a_request():
+        with build_deadline_http_client(DEADLINE) as client:
+            try:
+                client.post(provider.url, json={})
+            except Exception:  # noqa: BLE001 - A gives up; the provider does not
+                pass
+
+    lease = worker_a.try_acquire_inference()
+    assert lease is not None
+    threading.Thread(target=a_request, daemon=True).start()
+    while provider.served < 1:
+        time.sleep(0.02)
+    lease.quarantine("PROVIDER_REQUEST_DEADLINE_EXCEEDED")
+
+    started = time.monotonic()
+    refusals = 0
+    while time.monotonic() - started < superseded_horizon + 1.0:
+        assert worker_b.try_acquire_inference() is None, (
+            f"the slot was reclaimed {time.monotonic() - started:.2f}s after "
+            "quarantine, while the provider was still serving the request")
+        refusals += 1
+        time.sleep(0.1)
+
+    assert refusals > 10, "the loop did not actually keep asking"
+    assert provider._active == 1, "the provider stopped; nothing was proven"
+    assert provider.peak == 1
+    assert provider.overlap_seconds == 0.0
+
+
+def test_the_timed_reclaim_opt_in_does_admit_a_second_worker(provider):
+    """The negative control, and an honest account of the opt-in.
+
+    Identical harness, one configuration change: a deployment that enabled
+    `MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS`. The slot comes back on
+    the clock and worker B enters WHILE THE PROVIDER IS STILL WORKING. That is
+    the guarantee being traded away, measured rather than described -- and it
+    is why it is not the default.
+    """
+    worker_a, worker_b = two_workers(TimedReclaim)
+
+    def a_request():
+        with build_deadline_http_client(DEADLINE) as client:
+            try:
+                client.post(provider.url, json={})
+            except Exception:  # noqa: BLE001 - A gives up; the provider does not
+                pass
+
+    assert worker_a.try_acquire_inference() is not None
+    threading.Thread(target=a_request, daemon=True).start()
+    while provider.served < 1:
+        time.sleep(0.02)
+
+    time.sleep(worker_a.config.lease_ttl_seconds + 0.3)
+    stolen = worker_b.try_acquire_inference()
+    assert stolen is not None, (
+        "the opt-in timer did not reclaim, so this control cannot show what "
+        "the default is protecting against")
+
+    with build_deadline_http_client(DEADLINE) as client:
+        try:
+            client.post(provider.url, json={})
+        except Exception:  # noqa: BLE001 - the measurement is server-side
+            pass
+    assert provider.peak == 2, (
+        "the timed reclaim did not produce concurrent provider requests")
+
+
+# =============================================================================
+# 4. what returns a held slot: a proven release, or a human
 # =============================================================================
 
 class Clock:
@@ -381,101 +542,101 @@ class Clock:
         self.now += max(float(seconds), 0.001)
 
 
-def test_a_crashed_worker_is_neither_reclaimed_early_nor_leaked_forever():
+def test_a_crashed_worker_holds_its_slot_until_a_human_returns_it():
     """A process SIGKILLed mid-request settles nothing at all.
 
     Which is the design: quarantine is the absence of an action, so a worker
-    that cannot run any code still holds its slot. Recovery is the horizon,
-    and only the horizon.
+    that cannot run any code still holds its slot. Nothing gives it back on a
+    clock, because nothing MILO can observe proves the provider stopped.
     """
     clock = Clock()
     backend = MemoryQuotaBackend()
     config = QuotaConfig(max_concurrency=1, lease_ttl_seconds=2.0,
                          worker_max_lifetime_seconds=3.0)
-    horizon = config.reclaim_horizon_seconds        # 3.75s
-    assert horizon > config.lease_ttl_seconds, "the test would prove nothing"
-
     dead = ProviderQuotaCoordinator(backend, config, clock=clock)
     survivor = ProviderQuotaCoordinator(backend, config, clock=clock)
 
-    assert dead.try_acquire_inference() is not None
+    lease = dead.try_acquire_inference()
+    assert lease is not None
     # ...and now the process dies. Nothing releases, nothing quarantines.
 
-    # Immediately: held.
-    assert survivor.try_acquire_inference() is None
+    for elapsed in (0.0, config.lease_ttl_seconds + 1,
+                    minimum_abandoned_lease_reclaim(3.0) + 1, 86_400.0):
+        clock.now = 10_000.0 + elapsed
+        assert survivor.try_acquire_inference() is None, (
+            f"the slot came back on its own after {elapsed:g}s")
 
-    # Past the NOMINAL request window, which used to be the reclaim trigger.
-    clock.now += config.lease_ttl_seconds + 0.5
-    assert survivor.try_acquire_inference() is None, (
-        "the slot was reclaimed on a request timescale; the dead worker's "
-        "process could still have been alive with the request in flight")
+    held = survivor.held_inference_leases()
+    assert [lease_id for lease_id, _ in held] == [lease.lease_id]
+    assert held[0][1] == float("inf"), (
+        "the held lease carries a finite expiry, so something will eventually "
+        "reclaim it without proof")
 
-    # Just before the horizon: still held.
-    clock.now = 10_000.0 + horizon - 0.01
-    assert survivor.try_acquire_inference() is None
-
-    # Past it: recovered, so a crash does not strand capacity for good.
-    clock.now = 10_000.0 + horizon + 0.01
+    # The manual half of the design.
+    assert survivor.operator_reclaim_inference(
+        lease.lease_id, reason="checked the provider console; request is gone")
     recovered = survivor.try_acquire_inference()
-    assert recovered is not None, "a crashed worker's slot was leaked forever"
+    assert recovered is not None
     recovered.release()
 
 
-def test_the_superseded_reclaim_lets_a_crashed_worker_be_overtaken(provider):
-    """The negative control for crash recovery, over the real transport.
+def test_an_operator_reclaim_announces_itself_and_demands_a_reason():
+    """It asserts something MILO cannot check, so it leaves a record."""
+    signals: list[tuple] = []
+    backend = MemoryQuotaBackend()
+    coordinator = ProviderQuotaCoordinator(
+        backend, QuotaConfig(max_concurrency=1),
+        diagnostic_sink=lambda kind, payload: signals.append((kind, payload)))
+    lease = coordinator.try_acquire_inference()
 
-    `RequestScaleReclaim` stamps the lease with the request-sized window, as
-    PR #102 did. Worker A is killed mid-request -- modelled by settling
-    nothing -- and B waits out that window. The provider is still working, so
-    B entering is two real concurrent requests.
-    """
-    worker_a, worker_b = two_workers(RequestScaleReclaim)
-    assert worker_a.try_acquire_inference() is not None   # A holds it, then dies
+    with pytest.raises(ValueError):
+        coordinator.operator_reclaim_inference(lease.lease_id, reason="   ")
 
-    def a_request():
-        with build_deadline_http_client(DEADLINE) as client:
-            try:
-                client.post(provider.url, json={})
-            except Exception:  # noqa: BLE001 - A is the abandoned request
-                pass
+    coordinator.operator_reclaim_inference(lease.lease_id, reason="drained by hand")
+    kinds = [kind for kind, _ in signals]
+    assert "provider_lease_operator_reclaimed" in kinds, signals
+    payload = next(p for k, p in signals if k == "provider_lease_operator_reclaimed")
+    assert payload["reason"] == "drained by hand"
+    assert payload["reclaimed"] is True
 
-    threading.Thread(target=a_request, daemon=True).start()
-    while provider.served < 1:
-        time.sleep(0.02)
 
-    # Wait out the request-sized window the superseded design reclaimed on.
-    time.sleep(worker_a.config.lease_ttl_seconds + 0.3)
-    stolen = worker_b.try_acquire_inference()
-    assert stolen is not None, (
-        "the superseded reclaim did not free the slot, so this control cannot "
-        "detect the failure the real design is certified against")
-
-    with build_deadline_http_client(DEADLINE) as client:
-        try:
-            client.post(provider.url, json={})
-        except Exception:  # noqa: BLE001 - the measurement is server-side
-            pass
-    assert provider.peak == 2, (
-        "the known-bad reclaim did not produce concurrent provider requests")
+def test_a_quarantine_says_whether_anything_will_ever_give_the_slot_back():
+    """The operator burden has to be visible, or it is just missing capacity."""
+    for reclaim, expected in ((None, "operator_reclaim"), (5000.0, "5000s")):
+        signals: list[tuple] = []
+        coordinator = ProviderQuotaCoordinator(
+            MemoryQuotaBackend(),
+            QuotaConfig(max_concurrency=1, abandoned_lease_reclaim_seconds=reclaim),
+            diagnostic_sink=lambda kind, payload: signals.append((kind, payload)))
+        coordinator.try_acquire_inference().quarantine("PROVIDER_REQUEST_OUTCOME_UNKNOWN")
+        payload = next(p for k, p in signals if k == "provider_lease_quarantined")
+        assert payload["held_until"] == expected
+        assert payload["guarantee"] == (
+            GUARANTEE_PROVEN_COMPLETION if reclaim is None else GUARANTEE_TIMED_RECLAIM)
 
 
 # =============================================================================
-# 4. the horizon is DERIVED, and cannot be configured away
+# 4b. the guarantee is stated, and no timer is invented
 # =============================================================================
+
+def test_the_default_makes_the_guarantee_milo_can_actually_keep():
+    config = QuotaConfig()
+    assert config.abandoned_lease_reclaim_seconds is None
+    assert config.reclaims_abandoned_leases is False
+    assert config.concurrency_guarantee == GUARANTEE_PROVEN_COMPLETION
+
 
 def test_the_worker_lifetime_matches_the_deployed_cloud_run_contract():
     """The number is read off the deployment, not chosen.
 
-    If a future deployment lengthens the job's task timeout without moving
-    this constant, the horizon silently stops covering the process -- so the
-    constant is tied to the artifact it was derived from.
+    It no longer licenses a reclaim -- it only floors one a deployment opts
+    into. But if the job's task timeout ever moves, the floor must move with
+    it, so the constant stays tied to the artifact it came from.
     """
     script = (REPO / "scripts/deploy/cloud-run.sh").read_text()
     timeouts = {int(v) for v in re.findall(r"--task-timeout[= ](\d+)", script)}
     assert timeouts, "the worker job no longer declares a task timeout"
-    assert max(timeouts) == WORKER_MAX_LIFETIME_SECONDS, (
-        f"the deployed Cloud Run task timeout is {max(timeouts)}s but the "
-        f"reclaim horizon is derived from {WORKER_MAX_LIFETIME_SECONDS:g}s")
+    assert max(timeouts) == WORKER_MAX_LIFETIME_SECONDS
 
 
 def test_the_release_plan_pins_the_same_task_timeout():
@@ -483,23 +644,40 @@ def test_the_release_plan_pins_the_same_task_timeout():
     assert f"--task-timeout {int(WORKER_MAX_LIFETIME_SECONDS)}" in plan
 
 
-def test_the_production_horizon_is_the_lifetime_plus_its_margin():
-    config = QuotaConfig()
-    assert config.worker_max_lifetime_seconds == 3600.0
+def test_the_process_lifetime_is_only_a_floor_never_a_licence():
+    """3600+900 is the SHORTEST a timer may be, not a time it may run."""
+    assert minimum_abandoned_lease_reclaim(3600.0) == 4500.0
     assert lease_safety_margin(3600.0) == 900.0
-    assert config.reclaim_horizon_seconds == 4500.0
-    assert config.reclaim_horizon_seconds == reclaim_horizon(3600.0)
+    # And by itself it enables nothing.
+    assert QuotaConfig(worker_max_lifetime_seconds=3600.0).reclaims_abandoned_leases is False
 
 
-def test_the_horizon_is_not_the_run_duration_budget():
-    """A budget MILO checks is not a guarantee the process is gone.
+def test_no_timer_at_all_is_always_accepted():
+    """The configuration that makes no unverifiable assumption needs no check."""
+    for lifetime in (1.0, 60.0, 3600.0, 7200.0):
+        assert_abandoned_lease_reclaim_safe(None, lifetime)
 
-    `MILO_MAX_RUN_DURATION_SECONDS` is 1800s and is enforced cooperatively
-    inside the worker, so a wedged process can sail past it. Deriving the
-    horizon from it would be deriving a platform guarantee from a MILO
-    intention.
-    """
-    assert QuotaConfig().reclaim_horizon_seconds > 1800.0
+
+@pytest.mark.parametrize("configured,lifetime", [
+    (120.0, 3600.0),      # the superseded request-scale value
+    (3600.0, 3600.0),     # the lifetime with no margin at all
+    (4499.0, 3600.0),     # one second short of the margin
+])
+def test_a_timer_below_the_process_lifetime_is_refused(configured, lifetime):
+    with pytest.raises(ValueError):
+        assert_abandoned_lease_reclaim_safe(configured, lifetime)
+    with pytest.raises(ValueError):
+        QuotaConfig(worker_max_lifetime_seconds=lifetime,
+                    abandoned_lease_reclaim_seconds=configured)
+
+
+def test_opting_in_is_explicit_and_says_what_it_gives_up():
+    config = QuotaConfig.from_env(
+        {"MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS": "5400"})
+    assert config.abandoned_lease_reclaim_seconds == 5400.0
+    assert config.concurrency_guarantee == GUARANTEE_TIMED_RECLAIM
+    # And an absent variable means absent, not a default timer.
+    assert QuotaConfig.from_env({}).abandoned_lease_reclaim_seconds is None
 
 
 @pytest.mark.parametrize("lifetime", ["120", "1800", "3599"])
@@ -508,26 +686,10 @@ def test_an_environment_cannot_shorten_the_worker_lifetime(lifetime):
         QuotaConfig.from_env({"MILO_WORKER_MAX_LIFETIME_SECONDS": lifetime})
 
 
-def test_an_environment_may_declare_a_longer_lifetime():
-    """Longer holds slots longer, which is the safe direction."""
-    config = QuotaConfig.from_env({"MILO_WORKER_MAX_LIFETIME_SECONDS": "7200"})
-    assert config.reclaim_horizon_seconds == reclaim_horizon(7200.0)
-    assert config.reclaim_horizon_seconds > QuotaConfig().reclaim_horizon_seconds
-
-
-@pytest.mark.parametrize("horizon,lifetime", [
-    (120.0, 3600.0),      # the superseded request-scale value
-    (3600.0, 3600.0),     # the lifetime with no margin at all
-    (4499.0, 3600.0),     # one second short of the margin
-])
-def test_an_unsafe_horizon_is_refused(horizon, lifetime):
-    with pytest.raises(ValueError):
-        assert_reclaim_horizon_safe(horizon, lifetime)
-
-
-def test_production_refuses_a_short_horizon_handed_in_directly():
+def test_production_refuses_a_short_timer_handed_in_directly():
     """`from_env` is not the only way a config reaches the coordinator."""
-    unsafe = QuotaConfig(worker_max_lifetime_seconds=60.0)
+    unsafe = QuotaConfig(worker_max_lifetime_seconds=60.0,
+                         abandoned_lease_reclaim_seconds=75.0)
     with pytest.raises(ValueError):
         resolve_coordinator(unsafe, env={
             "ENVIRONMENT": "production",
@@ -536,9 +698,26 @@ def test_production_refuses_a_short_horizon_handed_in_directly():
         })
 
 
-def test_the_derived_horizon_is_safe_for_any_lifetime():
-    for lifetime in (1.0, 3.0, 60.0, 900.0, 3600.0, 7200.0):
-        assert_reclaim_horizon_safe(reclaim_horizon(lifetime), lifetime)
+def test_a_held_lease_is_stored_with_no_expiry_and_in_a_key_with_none_either():
+    """Both halves, because either one alone would be an auto-reclaim.
+
+    An infinite member score keeps the LEASE from expiring; persisting the key
+    keeps the whole set -- every held lease in it -- from expiring underneath.
+    A hygiene TTL on the key would have been a timed reclaim by the back door.
+    """
+    calls: list[list[str]] = []
+
+    from backend.provider_quota import UpstashQuotaBackend
+
+    backend = UpstashQuotaBackend(
+        "https://example.invalid", "unused",
+        http_post=lambda _url, body: calls.append(body) or {"result": [1, 1]})
+    backend.acquire_concurrency("k", "lease", 1, None, 1_000)
+
+    script, args = calls[0][1], calls[0][4:]
+    assert args[2] == "+inf", f"the lease carries a finite score: {args[2]}"
+    assert args[4] == "0", f"the key carries a TTL: {args[4]}"
+    assert "PERSIST" in script, "nothing removes a stale TTL from the key"
 
 
 # =============================================================================
@@ -569,7 +748,13 @@ def test_the_upstash_probe_script_performs_no_write():
         assert write not in script, f"the ownership probe issues a {write}"
 
 
-def test_repeated_probes_do_not_move_the_horizon():
+def test_probing_never_shortens_or_extends_a_held_lease():
+    """Read-only in both directions.
+
+    Under the default there is no expiry to extend, so the thing to pin is
+    that probing changes nothing at all: the lease stays ours however often it
+    is asked about, and stays HELD against everyone else.
+    """
     clock = Clock()
     backend = MemoryQuotaBackend()
     config = QuotaConfig(max_concurrency=1, lease_ttl_seconds=2.0,
@@ -580,13 +765,25 @@ def test_repeated_probes_do_not_move_the_horizon():
     lease = coordinator.try_acquire_inference()
     assert lease is not None
     for _ in range(10):
-        clock.now += 0.3
+        clock.now += 600.0
         assert lease.verify_ownership() is True
+        assert other.try_acquire_inference() is None
 
-    clock.now = 10_000.0 + config.reclaim_horizon_seconds + 0.01
-    assert lease.verify_ownership() is False
-    assert other.try_acquire_inference() is not None, (
-        "probing extended the lease past the horizon it was stamped with")
+    # Under an opt-in timer the probe still cannot push the expiry out.
+    timed = QuotaConfig(max_concurrency=1, worker_max_lifetime_seconds=3.0,
+                        abandoned_lease_reclaim_seconds=3.75)
+    clock2 = Clock()
+    backend2 = MemoryQuotaBackend()
+    owner = ProviderQuotaCoordinator(backend2, timed, clock=clock2)
+    rival = ProviderQuotaCoordinator(backend2, timed, clock=clock2)
+    held = owner.try_acquire_inference()
+    for _ in range(5):
+        clock2.now += 0.5
+        assert held.verify_ownership() is True
+    clock2.now = 10_000.0 + 3.76
+    assert held.verify_ownership() is False
+    assert rival.try_acquire_inference() is not None, (
+        "probing extended the lease past the timer it was stamped with")
 
 
 # =============================================================================
@@ -629,7 +826,7 @@ def test_a_provider_429_releases_at_once_so_backpressure_still_works():
     def flaky():
         attempts["n"] += 1
         if attempts["n"] < 3:
-            raise RuntimeError("Error code: 429 rate_limit_reached_error")
+            raise StructuralRateLimit()
         return "ok"
 
     assert scheduler.execute(flaky, estimated_tokens=10, reserved_tokens=10) == "ok"
@@ -680,7 +877,7 @@ def test_every_retry_settles_before_it_re_admits_and_takes_a_new_lease():
     def flaky():
         attempts["n"] += 1
         if attempts["n"] < 3:
-            raise RuntimeError("Error code: 429 rate_limit_reached_error")
+            raise StructuralRateLimit()
         return "ok"
 
     assert scheduler.execute(flaky, estimated_tokens=10, reserved_tokens=10) == "ok"
@@ -780,13 +977,13 @@ def test_a_settlement_failure_does_not_change_what_is_known_about_a_429():
     The guarded client settles its budget reservation inside the handler for a
     provider error. If that settlement refuses, its exception REPLACES the
     429 -- and an unmarked replacement would hold a shared slot for the whole
-    crash-recovery horizon over a request the provider demonstrably answered.
+    indefinitely over a request the provider demonstrably answered.
     """
     from backend.budget import BudgetConfig, BudgetTracker, _GuardedCompletions
 
     class Inner:
         def create(self, **_kwargs):
-            raise RuntimeError("Error code: 429 rate_limit_reached_error")
+            raise StructuralRateLimit()
 
     def refuse_to_settle(*_a, **_k):
         raise RuntimeError("the daily settler is down")
@@ -800,3 +997,56 @@ def test_a_settlement_failure_does_not_change_what_is_known_about_a_429():
 
     assert request_completion_is_proven(raised.value)[0] is True, (
         "a failed settlement erased the fact that the provider had answered")
+
+
+def test_a_pause_key_carries_a_duration_not_an_absolute_deadline():
+    """PX takes a DURATION; the absolute deadline was ~55,000 years of TTL.
+
+    Nothing malfunctioned -- `pause_remaining` computed zero correctly once
+    the moment passed -- so the only symptom was pause keys that never left
+    the shared store. A limiter that quietly accumulates keys in the store it
+    depends on is worth not shipping.
+    """
+    from backend.provider_quota import UpstashQuotaBackend
+
+    calls: list[list[str]] = []
+    backend = UpstashQuotaBackend(
+        "https://example.invalid", "unused",
+        http_post=lambda _url, body: calls.append(body) or {"result": 1})
+
+    now_ms = 1_700_000_000_000
+    backend.set_pause("milo:pq:test:pause:inference", now_ms + 30_000, now_ms)
+
+    px = int(calls[0][-1])
+    assert px == 30_000, f"PX was {px}, not the 30s pause duration"
+    assert px < now_ms, "PX is an absolute timestamp, so the key outlives the pause"
+
+
+def test_the_profile_states_the_effective_provider_parallelism():
+    """A queueing width of 4 is not four simultaneous provider calls."""
+    from backend.provider_scheduler import ProviderLimitsConfig
+    from backend.tier2_profile import tier2_first_run_profile
+
+    engines = tier2_first_run_profile()["active_profile"]["engine_active_concurrency"]
+    assert engines["effective_simultaneous_provider_calls"] == (
+        ProviderLimitsConfig().max_concurrency)
+    assert (engines["effective_simultaneous_provider_calls"]
+            < engines["vehicle_catalog_v1_technical_parallelism"]), (
+        "the profile no longer distinguishes queueing width from provider "
+        "concurrency, so the number can be read as a throughput estimate")
+
+
+def test_the_profile_does_not_claim_the_search_limiter_guards_v1():
+    """V1's search happens inside a chat call, so chat quota paces it."""
+    import inspect
+
+    from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend.tier2_profile import tier2_first_run_profile
+
+    # V1 really does use the built-in tool rather than the standalone endpoint.
+    assert '"builtin_function"' in inspect.getsource(v1_core)
+    assert "admit_search" not in inspect.getsource(v1_core)
+
+    for endpoint in tier2_first_run_profile()["web_search_qps"].values():
+        assert endpoint["guards_the_builtin_web_search_path"] is False
+        assert endpoint["called_by_a_production_engine_today"] is False

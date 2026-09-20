@@ -204,10 +204,10 @@ By making **holding the default** and **releasing the deliberate act**:
 
 | Event | Effect on the shared slot |
 | --- | --- |
-| acquire | stamped with the **crash-recovery horizon**, not a request-sized TTL |
+| acquire | stamped as **held**, with no expiry at all by default |
 | the request is **proven** over | released immediately |
-| deadline fired / read timed out / anything unrecognised | **held** to the horizon |
-| the process is killed mid-request | **held** to the horizon |
+| deadline fired / read timed out / anything unrecognised | **held** until an operator returns it |
+| the process is killed mid-request | **held** until an operator returns it |
 
 Quarantine is therefore not an operation that has to run — **it is the absence
 of one**. A process `SIGKILL`ed between issuing a request and returning cannot
@@ -215,91 +215,115 @@ fail to quarantine its slot, because quarantining is what happens when nothing
 happens. There is no failure mode in which "uncertain" degrades to "free".
 
 `request_completion_is_proven` (`backend/provider_scheduler.py`) decides, and
-its default is **NO**. Proof has exactly four sources:
+its default is **NO**. Every proof is **structural** — an object the transport
+or the SDK built, or a statement from code that ran on one side of the
+request. None of them is the **text** of a message:
 
 1. the call **returned** — the response was read to completion;
-2. the exception carries a response with a **status code** — the provider
-   answered; 400, 429 and 500 alike mean the exchange is over (this is what
-   keeps ordinary backpressure fast);
-3. `classify_provider_error` recognises a Kimi failure class — those are things
-   the provider *said*;
-4. the failure happened **before anything was sent** — connect timeout, refused
-   connection, unusable URL — or the exception carries
-   `provider_request_completed`, set by code that knows which side of the
-   request it ran on (`backend/budget.py` marks budget refusals).
+2. the exception carries a response **object** with a status code — the
+   provider answered; 400, 429 and 500 alike mean the exchange is over (this
+   is what keeps ordinary backpressure fast);
+3. the failure happened **before anything was sent** — connect timeout,
+   refused connection, unusable URL;
+4. the exception carries `provider_request_completed`, set by code that knows
+   which side of the request it ran on (`backend/budget.py` marks budget
+   refusals, including one raised while settling a provider error).
 
-### Where the horizon's number comes from
+**`classify_provider_error` is deliberately not consulted here.** A previous
+revision released the slot whenever that classifier recognised the exception,
+and review rightly called it out. The classifier matches raw message text —
+`rate_limit_reached_error`, `error code: 429`, `overloaded` — on purpose,
+because for a **retry** decision a permissive reading is the safe direction:
+treating something as backpressure only costs a wait. For **concurrency** it
+is the opposite. Text is not evidence that a request reached the provider, let
+alone that it finished, so any exception whose message happened to contain
+"429" could have freed an organization slot. The two questions want opposite
+defaults, so different code answers them: the classifier stays permissive for
+retries, and settlement requires structure.
 
-Holding forever is not an option either: a worker that dies mid-request would
-strand its slot for good. The horizon must come from a real upper bound on *a
-MILO process could still have this request on the wire* — and **MILO's own run
-budget is not that bound**. `MILO_MAX_RUN_DURATION_SECONDS` (1800 s) is checked
-cooperatively inside the worker, so a process wedged in a syscall can sail past
-it. A number MILO checks is not a guarantee the process and its socket are gone.
+### Nothing reclaims a held slot by itself
 
-The trustworthy bound is the container lifetime the **platform** enforces from
-outside the process:
+An earlier revision reclaimed an unreleased slot after
+`worker_max_lifetime + margin = 3600 + 900 = 4500 s`, derived from the Cloud
+Run task timeout. Review found the flaw, and it is the same species of error
+as the two before it.
 
-| Evidence | Where |
+That evidence bounds **MILO's process**. The ceiling is stated over whether
+**Kimi** is still counting the request. Those are different propositions:
+
+> `MILO's process and socket are definitely dead`
+> does **not** entail
+> `the provider is definitely no longer counting this request in-flight`
+
+The provider's own documentation does not close the gap. It defines
+concurrency as "the maximum number of requests from you that we can process at
+the same time" and says concurrency is "released as requests finish" — but it
+never defines when a request finishes from the **server's** side, promises no
+cancellation on client disconnect, and states no maximum server-side request
+lifetime. The one adjacent signal points the other way: HTTP **499** is logged
+for client disconnects, and 499 means by definition that the client went away
+*while the server-side process is still running*.
+
+So there is no authoritative provider-side bound to derive a timer from, and
+inventing one is exactly what this document must not do. A timer would not be
+a proof; it would be an assumption wearing a derivation's clothes.
+
+**Therefore nothing reclaims an unreleased slot automatically.** A lease not
+released by a proven-finished request is held until a human returns it. That
+makes the guarantee one MILO can actually keep:
+
+> MILO never admits more concurrent requests than it can prove have finished —
+> whatever the provider does after a disconnect.
+
+Mechanically: the lease's score is `+inf`, and the Redis key is `PERSIST`ed.
+Both halves matter — a hygiene TTL on the key would have been a timed reclaim
+by the back door, expiring every held lease in the set at once.
+
+### The cost, and why it is the right one
+
+A worker SIGKILLed mid-request **permanently** consumes one of the 32 slots
+until an operator reclaims it. That is a real operational burden and it is
+deliberate: the alternative is handing the slot to a second worker on an
+assumption nobody can check.
+
+The burden is visible and actionable rather than mysterious:
+
+| | |
 | --- | --- |
-| production worker job `--task-timeout 3600` | `scripts/deploy/cloud-run.sh:728` |
-| generated release plan pins `--task-timeout 3600` | `scripts/release/generate-deployment-plan.sh:297` |
-| live job `timeoutSeconds` is 3600 (verified read-only) | `tests/test_stage_d_toolkit.py:418` |
-| the Worker installs **no `SIGTERM` handler**| `scripts/release/stage-d/README.md`, `STAGE_D_AUTHORIZATION.md`, `07-post-run-lockdown.sh` |
+| list what is held, and since when | `ProviderQuotaCoordinator.held_inference_leases()` — an `inf` expiry is a slot nothing will ever return on its own |
+| return one | `operator_reclaim_inference(lease_id, reason=…)` — refuses a blank reason and emits `provider_lease_operator_reclaimed` |
+| every hold | `provider_lease_quarantined`, carrying the reason, the lease id, and whether anything will ever return it without a human |
 
-Every paid provider call is made from that job: `backend/worker/main.py` is the
-only module that builds a quota coordinator or a guarded client factory, and
-the API Cloud Run **service** (`--timeout 300`) builds neither. Everywhere else
-in MILO the missing `SIGTERM` handler is a liability — it is why a cancelled
-execution leaves a run sitting in `running`. Here it is exactly what makes the
-bound trustworthy: the process cannot trap the platform's termination signal and
-keep its socket open. `--max-retries 1` does not extend it either; a retried
-task is a **new** process with a **new** lease.
+### The opt-in timer, and what it gives up
 
-```
-reclaim_horizon = worker_max_lifetime + lease_safety_margin(worker_max_lifetime)
-                = 3600 + 900 = 4500 s
-```
+An operator who has independently established a provider-side bound may set
+`MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS`. Doing so **replaces** the
+guarantee above with a weaker one, and says so — `QuotaConfig.concurrency_guarantee`
+reports which is in force and the first-run profile carries it.
 
-| Value | Default | Where |
+| | default | opted in |
 | --- | --- | --- |
-| Worker max lifetime | **3600 s** | `MILO_WORKER_MAX_LIFETIME_SECONDS` — may only ever be **lengthened** |
-| **Crash-recovery horizon** | **4500 s** | derived; the only thing that reclaims an unreleased slot |
-| Nominal lease window | **120 s** | `MILO_PROVIDER_LEASE_TTL_SECONDS` — **not** a reclaim trigger |
-| Request deadline (liveness) | **90 s** | derived; `MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS` may only tighten it |
-| Ownership probe interval | **30 s** | derived; observability only |
+| guarantee | no slot is reused until its request is **proven** finished | …**or** the configured timer elapses, which assumes a provider-side bound MILO cannot verify |
+| a held slot returns on | proven release, or operator reclaim | those, plus the clock |
 
-`QuotaConfig.__post_init__` calls `assert_reclaim_horizon_safe` for every
-configuration, and `resolve_coordinator` re-checks it in production against the
-pinned task-timeout contract — so a config handed in directly cannot bypass it
-either. Both **refuse** rather than clamp. The environment may declare a
-**longer** lifetime (which holds slots longer, the safe direction); a shorter
-one is rejected, because it would assert processes die sooner than the
-deployment guarantees.
+The Cloud Run evidence survives as a **floor** on that timer, never a licence
+for one: `--task-timeout 3600` (`scripts/deploy/cloud-run.sh:728`, re-pinned at
+`generate-deployment-plan.sh:297`, asserted live at
+`tests/test_stage_d_toolkit.py:418`) plus no `SIGTERM` handler means a value
+below `4500 s` would reclaim a slot while MILO's *own* process could still be
+running — a defect on top of the assumption it is already making. Both
+`QuotaConfig` and `resolve_coordinator` refuse that.
 
-The 900 s margin absorbs the platform's `SIGTERM`→`SIGKILL` grace, **clock
-skew** between processes (each stamps its own leases and prunes peers' with its
-own clock, so a process running `d` seconds fast prunes `d` seconds early), and
-scheduler/GC pauses in the reclaiming process. It is conservative before the
-margin too: a lease is stamped `acquired_at + lifetime` while the process dies
-at `process_start + lifetime <= acquired_at + lifetime`.
-
-### The cost, stated plainly
-
-A slot whose request ended in an unknown state is unavailable for **75
-minutes**. That is deliberate, it is paid only on failure paths — a
-proven-finished request releases in milliseconds and that path is not slowed at
-all — and it is loud: every quarantine emits `provider_lease_quarantined`
-carrying the reason and when the slot returns. If quarantines accumulate to the
-point of refusing new work, refusing new paid work is the correct behaviour.
+`MILO_MAX_RUN_DURATION_SECONDS` (1800 s) is not a candidate either: it is
+checked cooperatively inside the worker, so a process wedged in a syscall
+sails past it. A number MILO checks is not a guarantee the process is gone.
 
 ### The ownership probe renews nothing
 
 The previous design had a renewal loop, and its failure was the reported HIGH.
-There is nothing left for renewal to do: a lease is stamped to the horizon at
-acquisition, and re-stamping it would push a slot **past the life of the
-process holding it**, turning a wedged worker into a permanent capacity leak.
-So renewal is gone. What remains is a read-only probe — no TTL parameter in the
+There is nothing left for renewal to do: a held lease has no expiry to renew,
+and under the opt-in timer re-stamping would push a slot past the life of the
+process holding it. So renewal is gone. What remains is a read-only probe — no TTL parameter in the
 backend signature, no `ZADD`/`PEXPIRE`/`ZREM` in the Lua — that asks *is this
 lease still recorded as mine?* and reports when it is not
 (`PROVIDER_LEASE_OWNERSHIP_LOST`, `PROVIDER_LEASE_PROBE_FAILED`, static codes
@@ -347,6 +371,17 @@ store-unreachable):
 The second row is a **negative control** that must keep failing the first row's
 assertion: it restores the superseded behaviour with a single override, so a
 harness that could not see the defect could not certify its absence either.
+
+Two further tests take the same measurement **past** the point any timer would
+have fired, which is what the previous revision never tested:
+
+| test | what it does | result |
+| --- | --- | --- |
+| `…not_reused_while_the_provider_is_still_busy_however_long` | keeps asking for the slot for longer than the scaled timer, while the provider is still serving | refused every time; peak **1**, overlap **0.000 s** |
+| `…timed_reclaim_opt_in_does_admit_a_second_worker` | same harness, timer enabled | B enters while the provider is still working; peak **2** |
+
+The second is the guarantee being traded away, measured rather than described
+— and the reason it is not the default.
 
 > The SDK default was the original defect: `read=600 s` against a 120 s lease,
 > **five times the TTL** — and a read timeout would not have bounded the

@@ -170,86 +170,62 @@ SEARCH_QPS_VERIFIED: dict[str, bool] = {SEARCH_BASIC: False, SEARCH_PRO: False}
 #     provider-side work continue. Returning control is not termination, and
 #     treating it as termination is exactly the error above.
 #
-# THE CRASH-RECOVERY HORIZON
-# --------------------------
+# WHY NOTHING RECLAIMS AN UNRELEASED SLOT BY ITSELF
+# -------------------------------------------------
 #
-# Holding forever is not an option either: a worker that dies mid-request
-# would strand its slot for good. So there has to be SOME horizon at which an
-# unreleased lease is reclaimed. It must be derived from a real upper bound on
-# "a MILO process could still have this request on the wire", not chosen for
-# convenience -- and MILO's own run budget is not that bound. A run budget is
-# a number MILO checks; it is not a guarantee that the process and its socket
-# are gone. `MILO_MAX_RUN_DURATION_SECONDS` (1800s) is enforced cooperatively
-# inside the worker, so a worker wedged in a syscall can sail past it.
+# The obvious next move is a timer: hold the slot, but reclaim it eventually,
+# so a crashed worker cannot strand capacity for good. A previous revision did
+# exactly that, deriving the timer from the Cloud Run task timeout -- the
+# platform really does kill the worker at `--task-timeout 3600`, and the
+# worker installs no SIGTERM handler, so the MILO process and its socket are
+# demonstrably gone by then.
 #
-# The bound that IS trustworthy is the container lifetime the platform
-# enforces from outside the process. In this repository, every paid provider
-# call is made from the Cloud Run **Job** worker (`backend/worker/main.py` is
-# the only module that builds a quota coordinator or a guarded client
-# factory; the API Cloud Run *Service* builds neither), and that job is
-# deployed with an explicit task timeout:
+# Review found the flaw, and it is the same species of error as the two before
+# it. That evidence bounds MILO'S PROCESS. The quantity the ceiling is stated
+# over is whether KIMI is still counting the request. Those are different
+# propositions, and:
 #
-#   scripts/deploy/cloud-run.sh:728           --task-timeout 3600
-#   scripts/release/generate-deployment-plan.sh:297  --task-timeout 3600
-#   tests/test_stage_d_toolkit.py:418         asserts the live job's
-#                                             timeoutSeconds is 3600 and that
-#                                             the run duration cap is below it
+#     "MILO's process and socket are definitely dead"
+#         does NOT entail
+#     "the provider is definitely no longer counting this request in-flight"
 #
-# and the worker installs NO `SIGTERM` handler -- documented in
-# `scripts/release/stage-d/README.md`, `STAGE_D_AUTHORIZATION.md` and
-# `07-post-run-lockdown.sh`. Everywhere else in MILO that absence is a
-# liability (it is why a cancelled execution leaves a run sitting in
-# `running`). Here it is precisely what makes the bound trustworthy: the
-# process cannot trap the platform's termination signal and keep its socket
-# open, so Python's default disposition ends it. A MILO process therefore
-# cannot outlive the task timeout, and neither can any socket it owns.
+# The provider's own documentation does not close the gap. It defines
+# concurrency as "the maximum number of requests from you that we can process
+# at the same time" and says concurrency is "released as requests finish" --
+# but it never defines when a request finishes from the SERVER's side, never
+# promises cancellation on client disconnect, and states no maximum
+# server-side request lifetime. The one adjacent signal points the other way:
+# HTTP 499 is logged for client disconnects, and 499 by definition means the
+# client went away "while the server-side process is still running".
 #
-# `--max-retries 1` on the production job does not extend this. A retried task
-# is a NEW process with a NEW lease; it does not lengthen any single process's
-# life.
+# So there is no authoritative provider-side bound to derive a timer from, and
+# inventing one is exactly what this module must not do. A timer would not be
+# a proof; it would be an assumption wearing a derivation's clothes.
 #
-# So:
+# Hence the default: **nothing reclaims an unreleased slot automatically.**
+# A lease that is not released by a proven-finished request is held until a
+# human deliberately returns it (see `operator_reclaim_inference`). That makes
+# the guarantee one MILO can actually keep:
 #
-#     reclaim_horizon = worker_max_lifetime + margin(worker_max_lifetime)
-#                     = 3600 + 900 = 4500s
+#     MILO never admits more concurrent requests than it can prove have
+#     finished -- whatever the provider does after a disconnect.
 #
-# using the same proportional margin rule as everything else in this module.
-# What that 900s absorbs:
+# THE COST, AND WHY IT IS THE RIGHT ONE
+# -------------------------------------
 #
-#   * the platform's SIGTERM -> SIGKILL grace after the task timeout;
-#   * CLOCK SKEW between processes. Each process stamps its own lease and
-#     prunes other processes' leases with its own clock, so a process running
-#     `d` seconds fast prunes a peer `d` seconds early; the margin must exceed
-#     any plausible `d`;
-#   * scheduler/GC pauses in the reclaiming process.
+# A worker that is SIGKILLed mid-request permanently consumes one of the 32
+# slots until an operator reclaims it. That is a real operational burden and
+# it is deliberate: the alternative is handing the slot to a second worker on
+# an assumption nobody can check. `held_inference_leases` lists what is held
+# and since when, and every quarantine emits `provider_lease_quarantined`, so
+# the burden is visible and actionable rather than mysterious.
 #
-# It is already conservative before the margin: a lease is stamped
-# `acquired_at + lifetime`, while the process dies at `process_start +
-# lifetime <= acquired_at + lifetime`. Every lease therefore outlives its own
-# process by however long that process had already been running.
-#
-# THE COST, STATED PLAINLY
-# ------------------------
-#
-# A slot whose request ended in an unknown state is unavailable for 75
-# minutes. That is deliberate. It is the price of the invariant, it is paid
-# only on failure paths (a proven-finished request releases in milliseconds,
-# and that path is not slowed down at all), and it is loud: every quarantine
-# emits `provider_lease_quarantined` carrying the reason and when the slot
-# returns. If quarantines accumulate to the point of refusing new work, the
-# correct behaviour IS to refuse new paid work.
-#
-# WHAT THE OWNERSHIP PROBE IS FOR NOW
-# -----------------------------------
-#
-# The previous design had a renewal loop, and its failure was the reported
-# HIGH. There is nothing left for renewal to do: the lease is already stamped
-# to the horizon at acquisition, and re-stamping it would push a slot PAST the
-# life of the process holding it -- turning a wedged process into a permanent
-# capacity leak. So renewal is gone. What remains is a read-only probe that
-# asks "is this lease still recorded as mine?" and reports when it is not.
-# The safety argument does not reference it: it holds if the probe never runs,
-# if it fails every time, and if the thread running it never starts.
+# An operator who has independently established a provider-side bound can opt
+# into a timer with `MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS`. Doing so
+# REPLACES the guarantee above with a weaker one, and says so: the value is
+# floored at the process-lifetime bound, `QuotaConfig.concurrency_guarantee`
+# reports which of the two is in force, and the first-run profile carries it.
+# It is off unless a deployment sets it.
 
 #: Fraction of a horizon held back as safety margin.
 LEASE_SAFETY_MARGIN_RATIO = 0.25
@@ -269,12 +245,23 @@ MIN_TTL_FOR_MARGIN_FLOOR = MIN_LEASE_SAFETY_MARGIN_SECONDS / LEASE_SAFETY_MARGIN
 
 
 #: The longest a MILO process that can hold a provider socket may live, taken
-#: from the deployed Cloud Run Job task timeout (see the derivation above).
-#: This is a CONTRACT WITH THE PLATFORM, not a preference: lowering it claims
-#: processes die sooner than the deployment actually guarantees, so
-#: :meth:`QuotaConfig.from_env` and :func:`resolve_coordinator` both refuse a
-#: smaller value rather than accept a shorter, unsafe horizon.
+#: from the deployed Cloud Run Job task timeout
+#: (``scripts/deploy/cloud-run.sh`` ``--task-timeout 3600``; the worker
+#: installs no SIGTERM handler, so it cannot outlive it).
+#:
+#: This does NOT bound provider-side execution, and nothing here treats it as
+#: if it did. It is a FLOOR on the opt-in timer below: a deployment that
+#: chooses to reclaim on a timer may not choose a value at which its own
+#: process could still be alive with the request on the wire.
 WORKER_MAX_LIFETIME_SECONDS = 3600.0
+
+#: The two guarantees this module can be configured to make. The first is
+#: proven; the second rests on an operator's own assumption about the provider.
+GUARANTEE_PROVEN_COMPLETION = "no slot is reused until its request is proven finished"
+GUARANTEE_TIMED_RECLAIM = (
+    "no slot is reused until its request is proven finished OR the configured "
+    "abandoned-lease reclaim elapses; the latter assumes a provider-side bound "
+    "MILO cannot verify")
 
 
 def lease_safety_margin(window_seconds: float) -> float:
@@ -292,13 +279,14 @@ def lease_safety_margin(window_seconds: float) -> float:
     return proportional
 
 
-def reclaim_horizon(worker_max_lifetime_seconds: float) -> float:
-    """When an UNRELEASED lease may be reclaimed, as crash recovery only.
+def minimum_abandoned_lease_reclaim(worker_max_lifetime_seconds: float) -> float:
+    """The SHORTEST a timed reclaim may be set to, if one is enabled at all.
 
-    Derived from the platform-enforced process lifetime rather than from any
-    request-sized number, because the question it answers is "could a MILO
-    process still have this request on the wire?" and only the container
-    lifetime bounds that.
+    Not a safe reclaim time -- there is no such thing, because no provider-side
+    bound exists to derive one from (see the section above). This only rules
+    out the clearly-wrong values: below it, a deployment would be reclaiming a
+    slot while the process that took it could still be running, which is a
+    defect on top of the assumption it is already making.
     """
     lifetime = float(worker_max_lifetime_seconds)
     return lifetime + lease_safety_margin(lifetime)
@@ -344,25 +332,26 @@ def assert_request_deadline_safe(request_deadline_seconds: float,
             "window its own accounting is stated over")
 
 
-def assert_reclaim_horizon_safe(reclaim_horizon_seconds: float,
-                                worker_max_lifetime_seconds: float) -> None:
-    """THE authoritative concurrency check. Every config path calls this.
+def assert_abandoned_lease_reclaim_safe(reclaim_seconds: float | None,
+                                        worker_max_lifetime_seconds: float) -> None:
+    """Check an OPT-IN timed reclaim. ``None`` -- the default -- always passes.
 
-    A horizon shorter than the process lifetime plus margin would let one
-    process's slot be reclaimed while that very process could still be alive
-    with the request on the wire -- which is the reported HIGH, restated.
+    ``None`` means nothing reclaims automatically, which needs no check: it is
+    the configuration that makes no unverifiable assumption at all.
     """
-    horizon = float(reclaim_horizon_seconds)
     lifetime = float(worker_max_lifetime_seconds)
     if not lifetime > 0:
         raise ValueError("worker max lifetime must be positive")
-    required = reclaim_horizon(lifetime)
-    if horizon < required:
+    if reclaim_seconds is None:
+        return
+    configured = float(reclaim_seconds)
+    required = minimum_abandoned_lease_reclaim(lifetime)
+    if configured < required:
         raise ValueError(
-            f"unsafe reclaim horizon: {horizon:g}s is shorter than the "
-            f"{required:g}s a {lifetime:g}s worker lifetime requires, so an "
-            "unreleased permit could be reclaimed while the process holding "
-            "it is still alive and its request may still be in flight")
+            f"unsafe abandoned-lease reclaim: {configured:g}s is shorter than "
+            f"the {required:g}s a {lifetime:g}s worker lifetime requires, so a "
+            "permit could be reclaimed while the process holding it is still "
+            "alive and its request may still be in flight")
 
 
 class ProviderQuotaUnavailable(AppError):
@@ -395,9 +384,12 @@ class QuotaBackend(Protocol):
     threads."""
 
     def acquire_concurrency(self, key: str, lease_id: str, limit: int,
-                            ttl_ms: int, now_ms: int) -> tuple[bool, int]: ...
+                            ttl_ms: int | None, now_ms: int) -> tuple[bool, int]: ...
 
     def verify_concurrency(self, key: str, lease_id: str, now_ms: int) -> bool: ...
+
+    def held_concurrency(self, key: str,
+                         now_ms: int) -> list[tuple[str, float]]: ...
 
     def release_concurrency(self, key: str, lease_id: str) -> bool: ...
 
@@ -407,7 +399,7 @@ class QuotaBackend(Protocol):
     def admit_interval(self, key: str, interval_ms: int,
                        now_ms: int) -> tuple[bool, float]: ...
 
-    def set_pause(self, key: str, until_ms: int) -> None: ...
+    def set_pause(self, key: str, until_ms: int, now_ms: int) -> None: ...
 
     def pause_remaining(self, key: str, now_ms: int) -> float: ...
 
@@ -432,6 +424,12 @@ class MemoryQuotaBackend:
         self._pauses: dict[str, int] = {}
 
     def acquire_concurrency(self, key, lease_id, limit, ttl_ms, now_ms):
+        """``ttl_ms=None`` holds the lease with no expiry of any kind.
+
+        That is the default, and it is the whole point: an unreleased lease
+        must not come back on its own, because nothing MILO can observe proves
+        the provider has stopped counting the request.
+        """
         with self._lock:
             holders = self._leases.setdefault(key, {})
             for held, expiry in list(holders.items()):
@@ -439,8 +437,14 @@ class MemoryQuotaBackend:
                     del holders[held]
             if len(holders) >= limit:
                 return False, len(holders)
-            holders[lease_id] = now_ms + ttl_ms
+            holders[lease_id] = math.inf if ttl_ms is None else now_ms + ttl_ms
             return True, len(holders)
+
+    def held_concurrency(self, key, now_ms):
+        with self._lock:
+            return sorted((lease_id, expiry)
+                          for lease_id, expiry in self._leases.get(key, {}).items()
+                          if expiry > now_ms)
 
     def verify_concurrency(self, key, lease_id, now_ms):
         """Read-only. Is this lease still recorded, and not past its horizon?
@@ -480,7 +484,7 @@ class MemoryQuotaBackend:
             self._intervals[key] = now_ms
             return True, 0.0
 
-    def set_pause(self, key, until_ms):
+    def set_pause(self, key, until_ms, now_ms=0):
         with self._lock:
             self._pauses[key] = max(self._pauses.get(key, 0), until_ms)
 
@@ -495,13 +499,27 @@ class MemoryQuotaBackend:
 # Each script is ONE atomic Redis execution. Expiries are set on every write so
 # an abandoned key cannot leak capacity forever.
 
+# ARGV[3] is the lease's score: '+inf' when nothing may reclaim it, otherwise
+# the moment the configured timer allows it back.
+#
+# ARGV[5] is the KEY's own expiry, and it matters more than it looks. A PEXPIRE
+# on a set full of held leases would be an auto-reclaim by the back door: the
+# whole key would vanish and every held slot with it. So '0' means PERSIST --
+# remove any expiry the key may be carrying from an earlier configuration --
+# and the key then disappears only when its last lease is released, which
+# Redis does for an empty sorted set on its own.
 _LUA_ACQUIRE = """
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[4])
 local active = redis.call('ZCARD', KEYS[1])
-if active > 0 then redis.call('PEXPIRE', KEYS[1], ARGV[5]) end
+local keyttl = tonumber(ARGV[5])
+if active > 0 then
+  if keyttl > 0 then redis.call('PEXPIRE', KEYS[1], keyttl)
+  else redis.call('PERSIST', KEYS[1]) end
+end
 if active >= tonumber(ARGV[2]) then return {0, active} end
 redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
-redis.call('PEXPIRE', KEYS[1], ARGV[5])
+if keyttl > 0 then redis.call('PEXPIRE', KEYS[1], keyttl)
+else redis.call('PERSIST', KEYS[1]) end
 return {1, active + 1}
 """
 
@@ -589,10 +607,20 @@ class UpstashQuotaBackend:
         return result
 
     def acquire_concurrency(self, key, lease_id, limit, ttl_ms, now_ms):
+        # No timed reclaim -> an infinite score and a persisted key, so neither
+        # the member nor the key it lives in can expire on its own.
+        score = "+inf" if ttl_ms is None else str(now_ms + ttl_ms)
+        key_ttl = "0" if ttl_ms is None else str(ttl_ms * 4)
         out = self._eval(_LUA_ACQUIRE, [key],
-                         [lease_id, str(limit), str(now_ms + ttl_ms), str(now_ms),
-                          str(ttl_ms * 4)])
+                         [lease_id, str(limit), score, str(now_ms), key_ttl])
         return bool(int(out[0])), int(out[1])
+
+    def held_concurrency(self, key, now_ms):
+        out = self._eval(
+            "return redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[1], '+inf', 'WITHSCORES')",
+            [key], [f"({now_ms}"])
+        rows = list(out or [])
+        return [(str(rows[i]), float(rows[i + 1])) for i in range(0, len(rows) - 1, 2)]
 
     def verify_concurrency(self, key, lease_id, now_ms):
         return bool(int(self._eval(_LUA_VERIFY, [key], [lease_id, str(now_ms)])))
@@ -611,9 +639,12 @@ class UpstashQuotaBackend:
                          [str(now_ms), str(interval_ms), str(interval_ms * 4)])
         return bool(int(out[0])), max(0.0, float(out[1]) / 1000.0)
 
-    def set_pause(self, key, until_ms):
+    def set_pause(self, key, until_ms, now_ms):
+        # PX takes a DURATION. Passing the absolute deadline left pause keys
+        # resident for ~55,000 years: `pause_remaining` still returned zero, so
+        # nothing malfunctioned, but the keys never went away.
         self._eval("redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2]); return 1",
-                   [key], [str(until_ms), str(max(1, until_ms))])
+                   [key], [str(until_ms), str(max(1, until_ms - now_ms))])
 
     def pause_remaining(self, key, now_ms):
         raw = self._eval("return redis.call('GET', KEYS[1])", [key], [])
@@ -645,9 +676,15 @@ class QuotaConfig:
     #: production path does.
     provider_request_timeout_seconds: float | None = None
     #: The platform-enforced ceiling on how long a process that can hold a
-    #: provider socket may live. THIS is what the reclaim horizon is derived
-    #: from, and the only thing that governs when an unreleased slot returns.
+    #: provider socket may live. It bounds MILO, NOT the provider, so it only
+    #: floors the opt-in timer below -- it never licenses one.
     worker_max_lifetime_seconds: float = WORKER_MAX_LIFETIME_SECONDS
+    #: OPT-IN. ``None`` (the default) means an unreleased lease is never
+    #: reclaimed automatically: a slot comes back on a proven release or an
+    #: explicit operator reclaim, and on nothing else. Setting it substitutes
+    #: an assumption about provider-side behaviour for a proof, and downgrades
+    #: :attr:`concurrency_guarantee` accordingly.
+    abandoned_lease_reclaim_seconds: float | None = None
     scope: str = "kimi-org"
 
     @property
@@ -658,9 +695,19 @@ class QuotaConfig:
         return float(self.provider_request_timeout_seconds)
 
     @property
-    def reclaim_horizon_seconds(self) -> float:
-        """When an UNRELEASED lease may be reclaimed. Crash recovery only."""
-        return reclaim_horizon(self.worker_max_lifetime_seconds)
+    def reclaims_abandoned_leases(self) -> bool:
+        return self.abandoned_lease_reclaim_seconds is not None
+
+    @property
+    def concurrency_guarantee(self) -> str:
+        """Which of the two guarantees this configuration actually makes."""
+        return (GUARANTEE_TIMED_RECLAIM if self.reclaims_abandoned_leases
+                else GUARANTEE_PROVEN_COMPLETION)
+
+    @property
+    def minimum_abandoned_lease_reclaim_seconds(self) -> float:
+        """The floor a timed reclaim would have to clear, were one enabled."""
+        return minimum_abandoned_lease_reclaim(self.worker_max_lifetime_seconds)
 
     @property
     def ownership_probe_interval_seconds(self) -> float:
@@ -699,8 +746,8 @@ class QuotaConfig:
                                      self.lease_ttl_seconds)
         # And THE concurrency invariant: an unreleased permit must never be
         # reclaimable while the process that took it could still be alive.
-        assert_reclaim_horizon_safe(self.reclaim_horizon_seconds,
-                                    self.worker_max_lifetime_seconds)
+        assert_abandoned_lease_reclaim_safe(self.abandoned_lease_reclaim_seconds,
+                                            self.worker_max_lifetime_seconds)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "QuotaConfig":
@@ -717,6 +764,15 @@ class QuotaConfig:
             if value <= 0:
                 raise ValueError(f"{key} must be positive")
             return value
+
+        def _abandoned_reclaim() -> float | None:
+            # Absent means absent. There is no default timer, because there is
+            # no provider-side bound to derive one from; a deployment that
+            # sets this is making an assumption of its own and saying so.
+            key = "MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS"
+            if not (source.get(key) or "").strip():
+                return None
+            return float(_int(key, 0))
 
         def _lifetime() -> float:
             # A deployment may only ever declare a LONGER process lifetime
@@ -747,6 +803,7 @@ class QuotaConfig:
                         _int("MILO_SEARCH_PRO_QPS", SEARCH_QPS_FALLBACK[SEARCH_PRO])),
             lease_ttl_seconds=float(_int("MILO_PROVIDER_LEASE_TTL_SECONDS", 120)),
             worker_max_lifetime_seconds=_lifetime(),
+            abandoned_lease_reclaim_seconds=_abandoned_reclaim(),
             provider_request_timeout_seconds=(
                 float(_int("MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS", 0)) or None
                 if (source.get("MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS") or "").strip()
@@ -767,13 +824,13 @@ class InferenceLease:
     Three states, and the middle one is the point of this class:
 
     ``open``
-        acquired; the request may be in flight. The store holds it to the
-        crash-recovery horizon.
+        acquired; the request may be in flight. The store simply holds it.
     ``released``
         the request is PROVEN over, so the slot went back immediately.
     ``quarantined``
         the request's completion could not be proven. The slot is NOT
-        returned; it stays held until the horizon.
+        returned -- by default, not until an operator deliberately reclaims
+        it (see :meth:`ProviderQuotaCoordinator.operator_reclaim_inference`).
 
     The id is unique per acquisition, so settling an already-reclaimed lease
     can never free a replacement holder's slot, and a double settle is a no-op
@@ -820,9 +877,9 @@ class InferenceLease:
         """Keep holding the slot: MILO cannot prove the request is over.
 
         Note what this does NOT do -- it does not touch the shared store. The
-        lease was stamped to the crash-recovery horizon when it was acquired,
-        so holding it is the store's existing state and quarantining is simply
-        declining to remove it. That is why a process killed mid-request
+        lease was stamped as held when it was acquired, so holding it is the
+        store's existing state and quarantining is simply declining to remove
+        it. That is why a process killed mid-request
         cannot fail to quarantine: not acting IS quarantining.
         """
         if self.settled:
@@ -861,14 +918,16 @@ class ProviderQuotaCoordinator:
             self._diagnostic(kind, payload)
 
     # -- inference concurrency ------------------------------------------------
-    def _reclaim_horizon_ms(self) -> int:
-        """How long an UNRELEASED lease is held for. Crash recovery only.
+    def _abandoned_reclaim_ms(self) -> int | None:
+        """How long an UNRELEASED lease is held for, or None for indefinitely.
 
-        A seam, so a regression can model the superseded request-timescale
-        reclaim and show it produces the defect. Production reads the
-        validated configuration and nothing else.
+        None is the default and the whole safety argument: nothing MILO can
+        observe proves the provider stopped, so nothing returns the slot on a
+        clock. A seam as well, so a regression can model a deployment that
+        opted into a timer and show what it costs.
         """
-        return int(self.config.reclaim_horizon_seconds * 1000)
+        configured = self.config.abandoned_lease_reclaim_seconds
+        return None if configured is None else int(configured * 1000)
 
     def try_acquire_inference(self) -> InferenceLease | None:
         now = self._now_ms()
@@ -877,11 +936,11 @@ class ProviderQuotaCoordinator:
             return None
         lease_id = uuid.uuid4().hex
         granted, _active = self._backend.acquire_concurrency(
-            # Stamped with the CRASH-RECOVERY horizon, not with a
-            # request-sized TTL. Holding is the default state of an acquired
-            # lease; only a proven-finished release shortens it.
+            # Held, with no expiry unless a deployment opted into one. Holding
+            # is the default state of an acquired lease; only a proven-finished
+            # release, or a deliberate operator reclaim, returns it.
             self._key("conc"), lease_id, self.config.max_concurrency,
-            self._reclaim_horizon_ms(), now)
+            self._abandoned_reclaim_ms(), now)
         return InferenceLease(lease_id, self) if granted else None
 
     def verify_inference_ownership(self, lease_id: str) -> bool:
@@ -896,17 +955,50 @@ class ProviderQuotaCoordinator:
     def quarantine_inference(self, lease_id: str, reason: str) -> None:
         """Record that a slot is held because completion could not be proven.
 
-        Deliberately does NOT write to the shared store. The lease already
-        sits at the crash-recovery horizon; quarantine is the absence of a
-        release, so there is no store round-trip to fail on a failure path
-        (the store may be the very thing that broke). What this adds is the
-        diagnostic, so a held slot is never mysterious: the reason and the
-        moment it returns both travel with it.
+        Deliberately does NOT write to the shared store. The lease is already
+        held; quarantine is the absence of a release, so there is no store
+        round-trip to fail on a failure path (the store may be the very thing
+        that broke). What this adds is the diagnostic, so a held slot is never
+        mysterious: the reason travels with it, and so does whether anything
+        will ever return it without a human.
         """
+        configured = self.config.abandoned_lease_reclaim_seconds
         self._emit("provider_lease_quarantined", {
             "reason": str(reason or "")[:64],
-            "held_for_seconds": round(self.config.reclaim_horizon_seconds, 3),
+            "lease_id": str(lease_id or "")[:64],
+            "held_until": ("operator_reclaim" if configured is None
+                           else f"{configured:g}s"),
+            "guarantee": self.config.concurrency_guarantee,
         })
+
+    def held_inference_leases(self) -> list[tuple[str, float]]:
+        """Every slot currently held, newest expiry last. Read-only.
+
+        What an operator looks at before deciding whether to reclaim one: an
+        ``inf`` expiry is a slot nothing will ever return on its own.
+        """
+        return self._backend.held_concurrency(self._key("conc"), self._now_ms())
+
+    def operator_reclaim_inference(self, lease_id: str, *, reason: str) -> bool:
+        """Return a held slot because a HUMAN says the request is over.
+
+        The manual half of the fail-closed design, and the only thing besides
+        a proven release that frees a slot by default. Calling this is an
+        assertion by the operator -- MILO has no way to check it -- so it is
+        deliberately separate from :meth:`release_inference`, demands a
+        reason, and announces itself.
+        """
+        if not str(reason or "").strip():
+            raise ValueError(
+                "an operator reclaim must record why the request is believed "
+                "finished; MILO cannot verify it and will not record a blank")
+        reclaimed = self._backend.release_concurrency(self._key("conc"), lease_id)
+        self._emit("provider_lease_operator_reclaimed", {
+            "lease_id": str(lease_id or "")[:64],
+            "reason": str(reason)[:200],
+            "reclaimed": reclaimed,
+        })
+        return reclaimed
 
     # -- RPM / TPM ------------------------------------------------------------
     def try_admit_request(self, reserved_tokens: int) -> tuple[bool, str, float]:
@@ -971,8 +1063,9 @@ class ProviderQuotaCoordinator:
         seconds = max(0.0, float(seconds))
         if seconds <= 0:
             return
+        now = self._now_ms()
         self._backend.set_pause(self._key(f"pause:{dimension}"),
-                                self._now_ms() + int(seconds * 1000))
+                                now + int(seconds * 1000), now)
         self._emit("provider_quota_paused",
                    {"dimension": dimension, "seconds": round(seconds, 3), "reason": reason})
 
@@ -1041,8 +1134,8 @@ def resolve_coordinator(config: QuotaConfig | None = None, *,
         # against the deployed task-timeout contract regardless of how the
         # configuration was built, so there is no construction path into an
         # unsafe horizon.
-        assert_reclaim_horizon_safe(resolved.reclaim_horizon_seconds,
-                                    WORKER_MAX_LIFETIME_SECONDS)
+        assert_abandoned_lease_reclaim_safe(
+            resolved.abandoned_lease_reclaim_seconds, WORKER_MAX_LIFETIME_SECONDS)
     if url and token:
         backend: QuotaBackend = UpstashQuotaBackend(url, token)
     elif source.get("ENVIRONMENT", "local").strip().lower() == "production":
@@ -1057,8 +1150,10 @@ __all__ = [
     "OWNERSHIP_PROBE_INTERVALS_PER_TTL", "LEASE_SAFETY_MARGIN_RATIO",
     "MIN_LEASE_SAFETY_MARGIN_SECONDS", "WORKER_MAX_LIFETIME_SECONDS",
     "LEASE_QUARANTINED", "LEASE_RELEASED",
-    "assert_reclaim_horizon_safe", "assert_request_deadline_safe",
-    "default_request_deadline", "ownership_probe_interval", "reclaim_horizon",
+    "GUARANTEE_PROVEN_COMPLETION", "GUARANTEE_TIMED_RECLAIM",
+    "assert_abandoned_lease_reclaim_safe", "assert_request_deadline_safe",
+    "default_request_deadline", "ownership_probe_interval",
+    "minimum_abandoned_lease_reclaim",
     "lease_safety_margin",
     "KIMI_TIER2_PROVIDER_LIMITS", "MAX_INFERENCE_CONCURRENCY", "MAX_RPM", "MAX_TPM",
     "MAX_TPD", "SAFETY_FACTOR", "SEARCH_BASIC", "SEARCH_PRO", "SEARCH_ENDPOINTS",

@@ -696,7 +696,7 @@ class _GuardedCompletions:
                 # permit on. An accounting failure must not change what is
                 # known about the request, so the original verdict is carried
                 # across -- otherwise an ordinary 429 could start holding a
-                # shared slot for the whole crash-recovery horizon.
+                # shared slot until a human reclaimed it.
                 from backend.provider_scheduler import request_completion_is_proven
 
                 settlement.provider_request_completed = request_completion_is_proven(exc)[0]

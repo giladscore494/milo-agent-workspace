@@ -79,41 +79,65 @@ def _request_lease_invariant() -> dict[str, Any]:
                       "to the pool ONLY when MILO can prove the request that "
                       "took it is over; uncertainty reduces available capacity, "
                       "never increases it"),
-        "rule": ("acquire stamps the crash-recovery horizon; only a "
-                 "PROVEN-FINISHED request releases early; every other outcome, "
-                 "including a dead process, leaves the slot held"),
+        "rule": ("acquire stamps the lease as held; only a PROVEN-FINISHED "
+                 "request releases it; every other outcome, including a dead "
+                 "process, leaves the slot held"),
         "quarantine_is_the_absence_of_an_action": True,
         "completion_is_proven_when": [
             "the call returned",
-            "the provider produced a complete HTTP response (any status)",
+            "the provider produced a complete HTTP response object (any status)",
             "the failure occurred before anything was sent",
+            "code on one side of the request set provider_request_completed",
         ],
         "completion_is_not_proven_when": [
             "the total request deadline fired",
             "a read timed out",
+            "only the MESSAGE TEXT of an exception looks like a provider error",
             "the outcome is anything else not listed as proof",
         ],
-        # --- the crash-recovery horizon, and where its number comes from ----
+        "proof_is_structural_never_textual": True,
+        "retry_classification_is_separate_and_stays_permissive": (
+            "classify_provider_error still matches message text, because for a "
+            "RETRY decision a permissive reading only costs a wait; it is not "
+            "consulted for settlement, where the same permissiveness would free "
+            "an organization slot on the strength of a string"),
+        # --- what returns a held slot, and what deliberately does not ------
+        "guarantee": config.concurrency_guarantee,
+        "reclaims_abandoned_leases_automatically": config.reclaims_abandoned_leases,
+        "a_held_slot_is_returned_by": (
+            ["a proven-finished release", "an explicit operator reclaim"]
+            if not config.reclaims_abandoned_leases else
+            ["a proven-finished release", "an explicit operator reclaim",
+             f"the configured {config.abandoned_lease_reclaim_seconds:g}s timer"]),
+        "no_provider_side_bound_exists": (
+            "the provider documents concurrency as released 'as requests finish' "
+            "but defines no server-side request lifetime, promises no "
+            "cancellation on client disconnect, and logs 499 for a client that "
+            "left 'while the server-side process is still running'; so no timer "
+            "can be DERIVED, and none is invented"),
+        "why_the_worker_lifetime_is_not_that_bound": (
+            "Cloud Run --task-timeout 3600 plus no SIGTERM handler proves MILO's "
+            "process and socket are gone; it says nothing about whether Kimi is "
+            "still counting the request, which is what the ceiling is about"),
+        "run_duration_cap_is_not_the_bound_either": (
+            "MILO_MAX_RUN_DURATION_SECONDS is checked cooperatively inside the "
+            "worker, so it does not guarantee the process or its socket is gone"),
         "worker_max_lifetime_seconds": config.worker_max_lifetime_seconds,
         "worker_max_lifetime_source": ("Cloud Run Job --task-timeout 3600 "
                                        "(scripts/deploy/cloud-run.sh:728; "
                                        "scripts/release/generate-deployment-plan.sh:297; "
                                        "asserted live in tests/test_stage_d_toolkit.py:418)"),
-        "worker_installs_no_sigterm_handler": True,
-        "why_that_matters": ("the process cannot trap the platform's termination "
-                             "signal and keep its socket open, so the task "
-                             "timeout really does bound how long a MILO process "
-                             "can hold a provider request"),
-        "run_duration_cap_is_not_the_bound": ("MILO_MAX_RUN_DURATION_SECONDS is "
-                                              "checked cooperatively inside the "
-                                              "worker, so it does not guarantee "
-                                              "the process or its socket is gone"),
-        "reclaim_horizon_seconds": config.reclaim_horizon_seconds,
-        "reclaim_horizon_rule": ("worker_max_lifetime + lease_safety_margin"
-                                 "(worker_max_lifetime)"),
-        "reclaim_horizon_is_crash_recovery_only": True,
+        "worker_max_lifetime_role": ("a FLOOR on an opt-in timer, never a licence "
+                                     "for one"),
+        "minimum_abandoned_lease_reclaim_seconds":
+            config.minimum_abandoned_lease_reclaim_seconds,
+        "opt_in_variable": "MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS",
+        "opting_in_downgrades_the_guarantee": True,
+        "operator_recovery": ("ProviderQuotaCoordinator.held_inference_leases lists "
+                              "held slots; operator_reclaim_inference returns one "
+                              "and records who asserted what"),
         "enforced_by": ("QuotaConfig.__post_init__ and resolve_coordinator -> "
-                        "assert_reclaim_horizon_safe"),
+                        "assert_abandoned_lease_reclaim_safe"),
         "configuration_may_only_lengthen_the_worker_lifetime": True,
         # --- the nominal request window, a liveness bound and not the above --
         "provider_request_deadline_seconds": config.request_deadline_seconds,
@@ -155,6 +179,16 @@ def _search_profile() -> dict[str, Any]:
                            "recoverable from the official tier table and is not invented"),
             "bucket": "independent per endpoint; shared by V1 and V2",
             "consumes_chat_quota": False,
+            # No production engine calls `admit_search` today. V1 searches
+            # through the BUILT-IN `$web_search` tool inside a Chat Completions
+            # request (vehicle_catalog_v1/core.py WEB_SEARCH_TOOL), so that
+            # search runs server-side INSIDE a chat call and is paced by the
+            # chat concurrency/RPM/TPM gate. These limiters guard the
+            # standalone /v1/tools/* endpoints, for whenever something calls
+            # them -- they are not what guards the path V1 actually uses.
+            "guards_the_builtin_web_search_path": False,
+            "builtin_web_search_is_paced_by": "the chat concurrency/RPM/TPM gate",
+            "called_by_a_production_engine_today": False,
         }
         for endpoint in (SEARCH_BASIC, SEARCH_PRO)
     }
@@ -192,8 +226,8 @@ def tier2_first_run_profile() -> dict[str, Any]:
                 "sorted-set rolling window over the last 60s for RPM and TPM; "
                 "no burst allowance above the ceiling is assumed"),
             "concurrency_lease": (
-                "unique lease id per acquisition, held to the crash-recovery "
-                "horizon unless completion is proven, deterministic "
+                "unique lease id per acquisition, held until completion is "
+                "proven or an operator reclaims it, deterministic "
                 "release on success/failure/timeout/cancellation; an expired "
                 "lease can never release a replacement holder's lease"),
             # The one relationship that keeps a real request inside the life of
@@ -212,9 +246,20 @@ def tier2_first_run_profile() -> dict[str, Any]:
                 # per-engine values the first paid run should be configured with.
                 "vehicle_catalog_v1_technical_parallelism": 4,
                 "swarm_v2_max_active_workers": 2,
-                "note": ("engine parallelism is additionally clamped to the provider "
-                         "capacity actually available; more logical workers than "
-                         "provider slots only queue and burn run duration"),
+                # These are QUEUEING widths, not provider-concurrency grants.
+                # The scheduler admits `ProviderLimitsConfig.max_concurrency`
+                # at a time, which defaults to 2 and which Stage D pins at 2 --
+                # so a "parallelism 4" profile still makes two simultaneous
+                # provider calls, and reading 4 as a throughput estimate would
+                # overstate the speed-up by 2x.
+                "effective_simultaneous_provider_calls": 2,
+                "effective_simultaneous_provider_calls_source": (
+                    "ProviderLimitsConfig.max_concurrency default 2; Stage D pins "
+                    "MILO_PROVIDER_MAX_CONCURRENCY=2"),
+                "note": ("engine parallelism is a queueing width, additionally "
+                         "clamped to the provider capacity actually available; "
+                         "more logical workers than provider slots only queue "
+                         "and burn run duration"),
             },
             "max_simultaneous_provider_using_worker_executions": FIRST_PAID_RUN_EXECUTION_CAP,
             "first_paid_run_execution_cap": FIRST_PAID_RUN_EXECUTION_CAP,
@@ -240,8 +285,8 @@ def tier2_first_run_profile() -> dict[str, Any]:
             "provider_lease_ttl_seconds": QuotaConfig().lease_ttl_seconds,
             "provider_lease_ownership_probe_interval_seconds":
                 QuotaConfig().ownership_probe_interval_seconds,
-            "provider_lease_reclaim_horizon_seconds":
-                QuotaConfig().reclaim_horizon_seconds,
+            "provider_lease_abandoned_reclaim_seconds":
+                QuotaConfig().abandoned_lease_reclaim_seconds,
             "max_run_duration_seconds": 1800,
             "worker_lease_seconds": 300,
             "worker_heartbeat_interval_seconds": 30,
