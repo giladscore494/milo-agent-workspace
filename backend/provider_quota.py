@@ -375,6 +375,36 @@ class ProviderQuotaExhausted(Exception):
         self.retry_after = max(0.0, float(retry_after))
 
 
+class LeaseRecoveryRefused(ValueError):
+    """An operator asked to reclaim a held lease and MILO said no.
+
+    ``code`` is one of:
+
+    * ``LEASE_NOT_HELD`` -- no lease with that id is held (already released,
+      already reclaimed, or never existed);
+    * ``LEASE_TOO_YOUNG`` -- the lease is younger than the process-lifetime
+      floor (or its age is unknown), so the process that took it may still be
+      alive and may still settle it itself;
+    * ``REASON_REQUIRED`` -- a reclaim without a recorded reason is not offered.
+    """
+
+    def __init__(self, code: str, detail: str = ""):
+        super().__init__(detail or code)
+        self.code = code
+
+
+#: Outcomes of :meth:`QuotaBackend.recover_concurrency`, decided atomically in
+#: the store so an operator cannot race a live holder.
+RECOVERY_REMOVED = 1
+RECOVERY_NOT_HELD = 0
+RECOVERY_TOO_YOUNG = -1
+
+
+def _acquired_key(concurrency_key: str) -> str:
+    """The companion hash recording when each held lease was taken."""
+    return f"{concurrency_key}:acquired"
+
+
 # --- backend protocol --------------------------------------------------------
 
 
@@ -389,9 +419,12 @@ class QuotaBackend(Protocol):
     def verify_concurrency(self, key: str, lease_id: str, now_ms: int) -> bool: ...
 
     def held_concurrency(self, key: str,
-                         now_ms: int) -> list[tuple[str, float]]: ...
+                         now_ms: int) -> list[tuple[str, float, int]]: ...
 
     def release_concurrency(self, key: str, lease_id: str) -> bool: ...
+
+    def recover_concurrency(self, key: str, lease_id: str,
+                            acquired_before_ms: int) -> int: ...
 
     def admit_window(self, key: str, entry_id: str, limit: int, window_ms: int,
                      now_ms: int, weight: int) -> tuple[bool, int, float]: ...
@@ -419,6 +452,10 @@ class MemoryQuotaBackend:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._leases: dict[str, dict[str, int]] = {}
+        #: key -> lease_id -> acquired_at_ms. Recorded beside every lease so an
+        #: operator can see how old a held slot is, and so a reclaim can be
+        #: refused while the process that took it could still be alive.
+        self._acquired: dict[str, dict[str, int]] = {}
         self._windows: dict[str, list[tuple[int, str, int]]] = {}
         self._intervals: dict[str, int] = {}
         self._pauses: dict[str, int] = {}
@@ -432,19 +469,42 @@ class MemoryQuotaBackend:
         """
         with self._lock:
             holders = self._leases.setdefault(key, {})
+            acquired = self._acquired.setdefault(key, {})
             for held, expiry in list(holders.items()):
                 if expiry <= now_ms:
                     del holders[held]
+                    acquired.pop(held, None)
             if len(holders) >= limit:
                 return False, len(holders)
             holders[lease_id] = math.inf if ttl_ms is None else now_ms + ttl_ms
+            acquired[lease_id] = now_ms
             return True, len(holders)
 
     def held_concurrency(self, key, now_ms):
         with self._lock:
-            return sorted((lease_id, expiry)
+            acquired = self._acquired.get(key, {})
+            return sorted((lease_id, expiry, acquired.get(lease_id, 0))
                           for lease_id, expiry in self._leases.get(key, {}).items()
                           if expiry > now_ms)
+
+    def recover_concurrency(self, key, lease_id, acquired_before_ms):
+        """An operator's reclaim, with the age check in the same critical section.
+
+        ``RECOVERY_TOO_YOUNG`` covers an UNKNOWN acquisition time as well: a
+        lease whose age cannot be shown is a lease whose process cannot be
+        shown to be gone, and that is refused, not assumed.
+        """
+        with self._lock:
+            holders = self._leases.get(key, {})
+            if lease_id not in holders:
+                self._acquired.get(key, {}).pop(lease_id, None)
+                return RECOVERY_NOT_HELD
+            acquired = self._acquired.get(key, {}).get(lease_id)
+            if acquired is None or acquired > acquired_before_ms:
+                return RECOVERY_TOO_YOUNG
+            del holders[lease_id]
+            self._acquired[key].pop(lease_id, None)
+            return RECOVERY_REMOVED
 
     def verify_concurrency(self, key, lease_id, now_ms):
         """Read-only. Is this lease still recorded, and not past its horizon?
@@ -461,6 +521,7 @@ class MemoryQuotaBackend:
         with self._lock:
             # Keyed by the unique lease id, so an expired lease's late release
             # can never free a DIFFERENT owner's replacement lease.
+            self._acquired.get(key, {}).pop(lease_id, None)
             return self._leases.get(key, {}).pop(lease_id, None) is not None
 
     def admit_window(self, key, entry_id, limit, window_ms, now_ms, weight):
@@ -508,18 +569,26 @@ class MemoryQuotaBackend:
 # remove any expiry the key may be carrying from an earlier configuration --
 # and the key then disappears only when its last lease is released, which
 # Redis does for an empty sorted set on its own.
+#
+# KEYS[2] is a hash of lease id -> the moment it was acquired. It is written in
+# the same atomic step as the lease, carries the same (absent) expiry, and is
+# what lets an operator see how old a held slot is -- and what lets a reclaim
+# be REFUSED while the process that took the lease could still be alive.
 _LUA_ACQUIRE = """
+local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[4])
+for _, member in ipairs(expired) do redis.call('HDEL', KEYS[2], member) end
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[4])
 local active = redis.call('ZCARD', KEYS[1])
 local keyttl = tonumber(ARGV[5])
 if active > 0 then
-  if keyttl > 0 then redis.call('PEXPIRE', KEYS[1], keyttl)
-  else redis.call('PERSIST', KEYS[1]) end
+  if keyttl > 0 then redis.call('PEXPIRE', KEYS[1], keyttl) redis.call('PEXPIRE', KEYS[2], keyttl)
+  else redis.call('PERSIST', KEYS[1]) redis.call('PERSIST', KEYS[2]) end
 end
 if active >= tonumber(ARGV[2]) then return {0, active} end
 redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
-if keyttl > 0 then redis.call('PEXPIRE', KEYS[1], keyttl)
-else redis.call('PERSIST', KEYS[1]) end
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[4])
+if keyttl > 0 then redis.call('PEXPIRE', KEYS[1], keyttl) redis.call('PEXPIRE', KEYS[2], keyttl)
+else redis.call('PERSIST', KEYS[1]) redis.call('PERSIST', KEYS[2]) end
 return {1, active + 1}
 """
 
@@ -532,7 +601,37 @@ if not score or tonumber(score) <= tonumber(ARGV[2]) then return 0 end
 return 1
 """
 
-_LUA_RELEASE = "return redis.call('ZREM', KEYS[1], ARGV[1])"
+_LUA_RELEASE = """
+redis.call('HDEL', KEYS[2], ARGV[1])
+return redis.call('ZREM', KEYS[1], ARGV[1])
+"""
+
+# Read-only: every held lease with its expiry and the moment it was acquired.
+_LUA_HELD = """
+local rows = redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[1], '+inf', 'WITHSCORES')
+local out = {}
+for i = 1, #rows, 2 do
+  out[#out + 1] = rows[i]
+  out[#out + 1] = rows[i + 1]
+  out[#out + 1] = redis.call('HGET', KEYS[2], rows[i]) or '0'
+end
+return out
+"""
+
+# An operator's reclaim. The age check and the removal are ONE atomic
+# execution, so an operator can never race a live holder: a lease that is too
+# young -- or whose acquisition time is unknown -- is refused in the same step
+# that would have removed it.
+_LUA_RECOVER = """
+if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+  redis.call('HDEL', KEYS[2], ARGV[1])
+  return 0
+end
+local acquired = redis.call('HGET', KEYS[2], ARGV[1])
+if not acquired or tonumber(acquired) > tonumber(ARGV[2]) then return -1 end
+redis.call('HDEL', KEYS[2], ARGV[1])
+return redis.call('ZREM', KEYS[1], ARGV[1])
+"""
 
 _LUA_ADMIT_WINDOW = """
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[4])
@@ -611,22 +710,25 @@ class UpstashQuotaBackend:
         # the member nor the key it lives in can expire on its own.
         score = "+inf" if ttl_ms is None else str(now_ms + ttl_ms)
         key_ttl = "0" if ttl_ms is None else str(ttl_ms * 4)
-        out = self._eval(_LUA_ACQUIRE, [key],
+        out = self._eval(_LUA_ACQUIRE, [key, _acquired_key(key)],
                          [lease_id, str(limit), score, str(now_ms), key_ttl])
         return bool(int(out[0])), int(out[1])
 
     def held_concurrency(self, key, now_ms):
-        out = self._eval(
-            "return redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[1], '+inf', 'WITHSCORES')",
-            [key], [f"({now_ms}"])
+        out = self._eval(_LUA_HELD, [key, _acquired_key(key)], [f"({now_ms}"])
         rows = list(out or [])
-        return [(str(rows[i]), float(rows[i + 1])) for i in range(0, len(rows) - 1, 2)]
+        return [(str(rows[i]), float(rows[i + 1]), int(float(rows[i + 2] or 0)))
+                for i in range(0, len(rows) - 2, 3)]
+
+    def recover_concurrency(self, key, lease_id, acquired_before_ms):
+        return int(self._eval(_LUA_RECOVER, [key, _acquired_key(key)],
+                              [lease_id, str(acquired_before_ms)]))
 
     def verify_concurrency(self, key, lease_id, now_ms):
         return bool(int(self._eval(_LUA_VERIFY, [key], [lease_id, str(now_ms)])))
 
     def release_concurrency(self, key, lease_id):
-        return bool(int(self._eval(_LUA_RELEASE, [key], [lease_id])))
+        return bool(int(self._eval(_LUA_RELEASE, [key, _acquired_key(key)], [lease_id])))
 
     def admit_window(self, key, entry_id, limit, window_ms, now_ms, weight):
         out = self._eval(_LUA_ADMIT_WINDOW, [key],
@@ -817,6 +919,21 @@ LEASE_RELEASED = "released"
 LEASE_QUARANTINED = "quarantined"
 
 
+@dataclass(frozen=True)
+class HeldLease:
+    """One held unit of organization concurrency, as an operator sees it."""
+
+    lease_id: str
+    #: ``inf`` unless a deployment opted into a timer.
+    expires_at: float
+    acquired_at_ms: int
+    #: None when the store carries no acquisition time for it.
+    age_seconds: float | None
+    #: Older than the process-lifetime floor: the process that took it is
+    #: provably gone. Says NOTHING about the provider.
+    recovery_eligible: bool
+
+
 @dataclass
 class InferenceLease:
     """One held unit of organization inference concurrency.
@@ -971,13 +1088,25 @@ class ProviderQuotaCoordinator:
             "guarantee": self.config.concurrency_guarantee,
         })
 
-    def held_inference_leases(self) -> list[tuple[str, float]]:
-        """Every slot currently held, newest expiry last. Read-only.
+    def held_inference_leases(self) -> list["HeldLease"]:
+        """Every slot currently held, oldest first. Read-only.
 
         What an operator looks at before deciding whether to reclaim one: an
-        ``inf`` expiry is a slot nothing will ever return on its own.
+        ``inf`` expiry is a slot nothing will ever return on its own, and
+        ``recovery_eligible`` says whether the process that took it is
+        provably gone -- which is necessary for a reclaim and never sufficient.
         """
-        return self._backend.held_concurrency(self._key("conc"), self._now_ms())
+        now = self._now_ms()
+        floor_ms = int(self.config.minimum_abandoned_lease_reclaim_seconds * 1000)
+        held = []
+        for lease_id, expires_at, acquired_at in self._backend.held_concurrency(
+                self._key("conc"), now):
+            age = max(0, now - acquired_at) / 1000.0 if acquired_at else None
+            held.append(HeldLease(
+                lease_id=lease_id, expires_at=expires_at, acquired_at_ms=int(acquired_at),
+                age_seconds=None if age is None else round(age, 3),
+                recovery_eligible=bool(acquired_at) and (now - acquired_at) >= floor_ms))
+        return sorted(held, key=lambda item: (item.acquired_at_ms or 0, item.lease_id))
 
     def operator_reclaim_inference(self, lease_id: str, *, reason: str) -> bool:
         """Return a held slot because a HUMAN says the request is over.
@@ -987,18 +1116,45 @@ class ProviderQuotaCoordinator:
         assertion by the operator -- MILO has no way to check it -- so it is
         deliberately separate from :meth:`release_inference`, demands a
         reason, and announces itself.
+
+        It also refuses what MILO CAN check. A lease younger than the
+        process-lifetime floor (``worker_max_lifetime + margin``) may belong
+        to a process that is still alive and will still settle it on proof;
+        reclaiming it would put two real requests under one admission. So
+        that floor is a precondition here -- the age check and the removal
+        are one atomic store operation -- and never a licence: past it, MILO
+        can say the process is gone and can say nothing about the provider,
+        which is exactly what the operator's reason records. A lease whose
+        acquisition time is unknown is refused too.
+
+        Never called by MILO itself: not by the scheduler, not by acquisition,
+        not by a background thread, not by a deployment hook. Its only caller
+        is the operator tool ``scripts/release/provider_quota_leases.py``.
         """
-        if not str(reason or "").strip():
-            raise ValueError(
+        recorded = " ".join(str(reason or "").split())
+        recorded = "".join(ch for ch in recorded if ch.isprintable())[:200]
+        if not recorded:
+            raise LeaseRecoveryRefused(
+                "REASON_REQUIRED",
                 "an operator reclaim must record why the request is believed "
                 "finished; MILO cannot verify it and will not record a blank")
-        reclaimed = self._backend.release_concurrency(self._key("conc"), lease_id)
+        now = self._now_ms()
+        cutoff = now - int(self.config.minimum_abandoned_lease_reclaim_seconds * 1000)
+        outcome = self._backend.recover_concurrency(self._key("conc"), str(lease_id), cutoff)
+        if outcome == RECOVERY_NOT_HELD:
+            raise LeaseRecoveryRefused("LEASE_NOT_HELD", "no lease with that id is held")
+        if outcome == RECOVERY_TOO_YOUNG:
+            raise LeaseRecoveryRefused(
+                "LEASE_TOO_YOUNG",
+                "the lease is younger than the process-lifetime floor, or its age "
+                "is unknown; the process that took it may still be alive")
         self._emit("provider_lease_operator_reclaimed", {
             "lease_id": str(lease_id or "")[:64],
-            "reason": str(reason)[:200],
-            "reclaimed": reclaimed,
+            "reason": recorded,
+            "reclaimed": True,
+            "minimum_age_seconds": round(self.config.minimum_abandoned_lease_reclaim_seconds, 3),
         })
-        return reclaimed
+        return True
 
     # -- RPM / TPM ------------------------------------------------------------
     def try_admit_request(self, reserved_tokens: int) -> tuple[bool, str, float]:
@@ -1129,11 +1285,18 @@ def resolve_coordinator(config: QuotaConfig | None = None, *,
     token = (source.get("UPSTASH_REDIS_REST_TOKEN") or "").strip()
     resolved = config or QuotaConfig.from_env(source)
     if source.get("ENVIRONMENT", "local").strip().lower() == "production":
-        # `from_env` already refuses a short lifetime, but a caller can hand a
-        # QuotaConfig in directly. Production checks the resulting horizon
-        # against the deployed task-timeout contract regardless of how the
-        # configuration was built, so there is no construction path into an
-        # unsafe horizon.
+        # In production there is no timer at all. The reviewed model is that
+        # unknown occupancy is returned by proof or by a human, never by a
+        # clock, because no provider-side bound exists to derive one from --
+        # and a single environment variable is not the separate review that
+        # trading that guarantee away would require. The worker does not run
+        # `validate_production_config`, so this is enforced here, on the path
+        # that actually builds the coordinator, however the config was built.
+        if resolved.abandoned_lease_reclaim_seconds is not None:
+            raise ValueError(
+                "MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS is forbidden in "
+                "production: unknown provider occupancy is returned only by proven "
+                "completion or an explicit operator reclaim, never on a timer")
         assert_abandoned_lease_reclaim_safe(
             resolved.abandoned_lease_reclaim_seconds, WORKER_MAX_LIFETIME_SECONDS)
     if url and token:
@@ -1151,6 +1314,8 @@ __all__ = [
     "MIN_LEASE_SAFETY_MARGIN_SECONDS", "WORKER_MAX_LIFETIME_SECONDS",
     "LEASE_QUARANTINED", "LEASE_RELEASED",
     "GUARANTEE_PROVEN_COMPLETION", "GUARANTEE_TIMED_RECLAIM",
+    "HeldLease", "LeaseRecoveryRefused",
+    "RECOVERY_NOT_HELD", "RECOVERY_REMOVED", "RECOVERY_TOO_YOUNG",
     "assert_abandoned_lease_reclaim_safe", "assert_request_deadline_safe",
     "default_request_deadline", "ownership_probe_interval",
     "minimum_abandoned_lease_reclaim",

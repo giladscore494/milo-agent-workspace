@@ -203,7 +203,9 @@ def test_an_expired_lease_can_never_release_its_replacements_lease():
 
     stale = crashed.try_acquire_inference()
     # The crashed holder's slot is reclaimed deliberately, by a human, because
-    # nothing else ever reclaims it.
+    # nothing else ever reclaims it -- and only once its process is provably
+    # gone (past the worker lifetime plus margin).
+    clock.advance(crashed.config.minimum_abandoned_lease_reclaim_seconds + 1)
     replacement.operator_reclaim_inference(stale.lease_id, reason="verified out of band")
     fresh = replacement.try_acquire_inference()
     assert fresh is not None

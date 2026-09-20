@@ -112,16 +112,46 @@ _NEVER_SENT = ("ConnectError", "ConnectTimeout", "PoolTimeout",
                "UnsupportedProtocol", "InvalidURL", "ProxyError")
 
 
-def _failed_before_the_request_was_sent(exc: BaseException) -> bool:
-    """Walk the cause chain: the OpenAI SDK wraps transport errors."""
+def _cause_chain(exc: BaseException):
+    """Walk ``__cause__``/``__context__`` once each: the SDK wraps transport errors."""
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if type(current).__name__ in _NEVER_SENT:
-            return True
+        yield current
         current = current.__cause__ or current.__context__
-    return False
+
+
+def _failed_before_the_request_was_sent(exc: BaseException) -> bool:
+    return any(type(link).__name__ in _NEVER_SENT for link in _cause_chain(exc))
+
+
+def _fired_a_total_deadline(exc: BaseException) -> bool:
+    """The transport's deadline, whether raised bare or wrapped by the SDK."""
+    return any(type(link).__name__ == "ProviderRequestDeadlineExceeded"
+               for link in _cause_chain(exc))
+
+
+def _carries_a_complete_provider_response(exc: BaseException) -> bool:
+    """STRUCTURAL evidence that the provider answered.
+
+    True only for an exception that carries a response OBJECT with an integer
+    HTTP status code. That is the shape of the OpenAI SDK's ``APIStatusError``
+    family, which the SDK raises only after ``response.read()`` -- so the
+    exchange is over whatever the status says.
+
+    A bare ``status_code`` attribute with no response object is deliberately
+    NOT enough: MILO's own ``AppError`` carries one (an HTTP status for MILO's
+    API, not the provider's), and any wrapper can set one. An attribute is a
+    claim; a response is evidence.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return False
+    status = getattr(response, "status_code", None)
+    if isinstance(status, bool) or not isinstance(status, int):
+        return False
+    return 100 <= status <= 599
 
 
 def request_completion_is_proven(exc: BaseException | None) -> tuple[bool, str]:
@@ -139,9 +169,10 @@ def request_completion_is_proven(exc: BaseException | None) -> tuple[bool, str]:
 
     * the call RETURNED. The response was read to completion, so the exchange
       is over.
-    * the exception carries a response with a status code. The provider
-      produced a complete HTTP response -- 400, 429, 500 alike -- so the
-      exchange is over whatever the status says. (This is what keeps ordinary
+    * the exception carries a provider response OBJECT with a status code.
+      The provider produced a complete HTTP response -- 400, 429, 500 alike --
+      so the exchange is over whatever the status says. A bare
+      ``status_code`` attribute with no response object is not this. (This is what keeps ordinary
       backpressure fast: a real 429 releases immediately and the retry
       proceeds.)
     * the failure happened before anything was sent -- a connect timeout, a
@@ -177,12 +208,13 @@ def request_completion_is_proven(exc: BaseException | None) -> tuple[bool, str]:
     declared = getattr(exc, "provider_request_completed", None)
     if declared is not None:
         return bool(declared), "" if declared else "PROVIDER_REQUEST_OUTCOME_DECLARED_UNKNOWN"
-    status = (getattr(exc, "status_code", None)
-              or getattr(getattr(exc, "response", None), "status_code", None))
-    if status is not None:
-        return True, ""
-    if type(exc).__name__ == "ProviderRequestDeadlineExceeded":
+    # Checked BEFORE the response test: the deadline exception never carries
+    # a response, but the order makes the intent explicit -- a fired deadline
+    # can never be talked into looking like an answer, however it is wrapped.
+    if _fired_a_total_deadline(exc):
         return False, "PROVIDER_REQUEST_DEADLINE_EXCEEDED"
+    if _carries_a_complete_provider_response(exc):
+        return True, ""
     if _failed_before_the_request_was_sent(exc):
         return True, ""
     return False, "PROVIDER_REQUEST_OUTCOME_UNKNOWN"

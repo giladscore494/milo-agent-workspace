@@ -89,6 +89,29 @@ When an authoritative limit `L` is verified for an endpoint:
 endpoint remains unverified, so the number cannot drift upward by
 configuration alone.
 
+### What the standalone limiter does NOT cover: the built-in `$web_search`
+
+`admit_search` gates the **standalone** `/v1/tools/search` and
+`/v1/tools/search_pro` endpoints. **No production engine calls either endpoint
+today.** What V1 actually uses is the provider-side built-in `$web_search`
+tool (`builtin_function` in a Chat Completions request,
+`vehicle_catalog_v1/core.py`), which the standalone limiter never sees.
+
+Whether a built-in `$web_search` invocation draws on the same Web Search QPS
+quota as the standalone endpoints, on a separate quota, or on none, was **not
+recoverable** from the official documentation reachable during this research.
+It is recorded as **UNVERIFIED** (the first-run profile carries
+`guards_the_builtin_web_search_path: false`), and this document makes no claim
+that the 1 QPS gate protects the built-in path. What does bound it: every chat
+request that may invoke it is admitted against organization concurrency, RPM
+and TPM (at most two simultaneous V1 calls under the first-run profile, §9),
+and a provider refusal of the built-in search surfaces as a chat-level 429,
+which the scheduler treats as bounded backpressure. That is the honest scope
+of the guarantee. It is not judged a blocker for the first-run scope, because
+the first run does not exceed the pacing the last observed run
+(`3772fc84`, 0 backpressure events) already exercised; it *is* a gap to close
+before any wider fan-out.
+
 ## 5. No assumed burst allowance
 
 No authoritative burst allowance or complete provider window algorithm was
@@ -220,9 +243,13 @@ or the SDK built, or a statement from code that ran on one side of the
 request. None of them is the **text** of a message:
 
 1. the call **returned** — the response was read to completion;
-2. the exception carries a response **object** with a status code — the
-   provider answered; 400, 429 and 500 alike mean the exchange is over (this
-   is what keeps ordinary backpressure fast);
+2. the exception carries a response **object** with an integer status code —
+   the provider answered; 400, 429 and 500 alike mean the exchange is over
+   (this is what keeps ordinary backpressure fast). This is the shape of the
+   OpenAI SDK's `APIStatusError` family, raised only after `response.read()`.
+   A bare `status_code` **attribute** with no response object is not this:
+   MILO's own `AppError` carries one (its API status, not the provider's), and
+   any wrapper can set one. An attribute is a claim; a response is evidence;
 3. the failure happened **before anything was sent** — connect timeout,
    refused connection, unusable URL;
 4. the exception carries `provider_request_completed`, set by code that knows
@@ -290,16 +317,66 @@ The burden is visible and actionable rather than mysterious:
 
 | | |
 | --- | --- |
-| list what is held, and since when | `ProviderQuotaCoordinator.held_inference_leases()` — an `inf` expiry is a slot nothing will ever return on its own |
-| return one | `operator_reclaim_inference(lease_id, reason=…)` — refuses a blank reason and emits `provider_lease_operator_reclaimed` |
+| list what is held, and since when | `ProviderQuotaCoordinator.held_inference_leases()` — each lease with its acquisition time, age, an `inf` expiry (nothing will ever return it on its own) and whether it is `recovery_eligible` |
+| return one | `operator_reclaim_inference(lease_id, reason=…)` — refuses a blank reason, refuses a lease younger than the process-lifetime floor, and emits `provider_lease_operator_reclaimed` |
 | every hold | `provider_lease_quarantined`, carrying the reason, the lease id, and whether anything will ever return it without a human |
 
-### The opt-in timer, and what it gives up
+### Operator reclaim: what MILO checks, and what only the human can
 
-An operator who has independently established a provider-side bound may set
-`MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS`. Doing so **replaces** the
-guarantee above with a weaker one, and says so — `QuotaConfig.concurrency_guarantee`
-reports which is in force and the first-run profile carries it.
+The acquisition time is written beside every lease in the **same atomic Lua
+step** (a companion hash, persisted like the lease set). It buys two things.
+
+**The floor.** A lease younger than `worker_max_lifetime + margin` (3600 + 900
+= **4500 s**) may belong to a process that is still alive and will still
+settle it on proof; reclaiming it would put two real requests under one
+admission. So `operator_reclaim_inference` refuses it — `LEASE_TOO_YOUNG` —
+and the age check and the removal are **one atomic store operation**, so an
+operator cannot race a live holder. A lease whose acquisition time is unknown
+is refused the same way. This is the Cloud Run evidence used for the one thing
+it proves: a **necessary** condition, never a sufficient one.
+
+**The judgement.** Past the floor MILO can say the process is gone and can say
+nothing about the provider. Whether Kimi has stopped counting the request —
+the provider console, elapsed time against any provider-side lifetime the
+operator is willing to assume — is the operator's call, and that judgement is
+what the recorded reason is for. The tool cannot check it and does not claim
+to.
+
+The only caller is the operator tool, asserted over the source tree by
+`test_nothing_in_milo_reclaims_a_held_lease_on_its_own`:
+
+```
+python3 scripts/release/provider_quota_leases.py list
+python3 scripts/release/provider_quota_leases.py recover \
+    --lease-id <hex> \
+    --justification "console shows 0 in-flight; worker task killed 2h ago" \
+    --i-have-verified-provider-side-completion
+```
+
+`list` is read-only. `recover` removes **one** lease per invocation, by id,
+with a recorded reason and an explicit attestation flag; the store token never
+prints; exit 2 names the refusal (`ATTESTATION_REQUIRED`, `REASON_REQUIRED`,
+`LEASE_TOO_YOUNG`, `LEASE_NOT_HELD`). Held leases and the tool are also listed
+in `MONITORING_AND_INCIDENTS.md`.
+
+### The opt-in timer: refused in production
+
+A non-production deployment that has independently established a
+provider-side bound may set `MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS`.
+Doing so **replaces** the guarantee above with a weaker one, and says so —
+`QuotaConfig.concurrency_guarantee` reports which is in force and the
+first-run profile carries it.
+
+**In production it is refused outright**, however the configuration was built:
+`resolve_coordinator` raises on the worker path (the worker never runs
+`validate_production_config`, so the check lives where the coordinator is
+actually built), and `production_config.validate` reports
+`TIMED_LEASE_RECLAIM_IN_PRODUCTION`. The reviewed model is that unknown
+occupancy is returned by proof or by a human, never by a clock, because no
+provider-side bound exists to derive one from — and one environment variable
+is not the separate review that trading that guarantee away would require.
+Outside production the timer remains what it is: explicit, reported, and
+floored as below.
 
 | | default | opted in |
 | --- | --- | --- |
@@ -401,3 +478,22 @@ that exceeds the ceiling.
 
 The recommended first-run values live in `backend/tier2_profile.py`
 (`TIER2_FIRST_RUN_PROFILE`). Approaching the ceiling is **not** a goal.
+
+### Logical parallelism is not provider concurrency
+
+The first-run profile documents V1 technical parallelism **4** and V2 active
+workers **2**. Those are *logical* widths. Every one of those threads still goes
+through the one process-local `ProviderScheduler`, whose slot count is
+`MILO_PROVIDER_MAX_CONCURRENCY` — default **2**, and pinned to **2** by the
+Stage D envelope. So under the documented profile:
+
+| Engine | Logical width | Effective simultaneous Kimi calls |
+| --- | --- | --- |
+| `vehicle_catalog_v1` technical phase | 4 | **2** |
+| `swarm_v2` workers | 2 | **2** |
+
+The technical-phase estimate of ~405 s assumed four simultaneous calls; at the
+effective two it is roughly **810 s**, which still fits the unchanged 1800 s
+duration cap. Four simultaneous calls require raising
+`MILO_PROVIDER_MAX_CONCURRENCY` to 4 as a deliberate, separately reviewed
+change. Nothing here does that.

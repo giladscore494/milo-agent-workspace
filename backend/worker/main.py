@@ -79,6 +79,29 @@ def _claim_run_with_recovery(repo: Repository, run_id: UUID, worker_id: str, lea
         time.sleep(min(5.0, max(0.5, deadline - time.monotonic())))
 
 
+def evidence_of_completed_tasks(board: Any, results: Any) -> list[Any]:
+    """The run's evidence, as the Swarm V2 engine defines it: completed tasks only.
+
+    The Evidence Board records a claim the moment a trusted tool result is
+    mapped, which is BEFORE that task's model call and, under the bounded
+    executor, while sibling tasks are running on other threads. So the board
+    holds claims for tasks that are in flight, and keeps claims for tasks that
+    later failed. The engine's evidence merge is stated over the tasks that
+    COMPLETED, and it is handed exactly the results it should read evidence
+    for -- this loader used to ignore that argument and hand back every claim
+    on the board, which made the merge refuse the run (and every resume of it)
+    as soon as one register-read task completed before another, or one failed
+    after its tool call. Evidence of a task that has not completed is not lost:
+    it is durable, and it enters the run on that task's own completion.
+    """
+    from backend.engines.swarm_v2 import EvidenceReference
+
+    completed = {str(task_id) for task_id, result in dict(results or {}).items()
+                 if getattr(result, "status", None) == "completed"}
+    return [EvidenceReference.model_validate(item)
+            for item in board.references(task_ids=completed)]
+
+
 def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, budget_tracker: "BudgetTracker | None" = None, engine_registry: EngineRegistry | None = None) -> int:
     worker_id = os.getenv("WORKER_ID", f"worker-{uuid4()}")
     lease_seconds = int(os.getenv("MILO_WORKER_LEASE_SECONDS", "300"))
@@ -381,7 +404,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             )
             def make_swarm_engine():
                 from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander,
-                    CommanderModelResolver, EvidenceReference, GenericWorker, ModelGateway,
+                    CommanderModelResolver, GenericWorker, ModelGateway,
                     PlanLimits, PlanValidator, RemainingBudget, SwarmV2Adapter, Verifier)
                 from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
                 from backend.engines.swarm_v2.evidence_mapping import (
@@ -579,8 +602,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     # access of its own.
                     verifier=Verifier(gateway=gateway, model=commander_model,
                                       resolver=RepositoryEvidenceResolver(repo, run_id=run_id)),
-                    evidence_loader=lambda _: [EvidenceReference.model_validate(item)
-                                               for item in board.references()],
+                    # Completed tasks only: see `evidence_of_completed_tasks`.
+                    evidence_loader=lambda results: evidence_of_completed_tasks(board, results),
                     checkpoint_sink=save_checkpoint, event_sink=forward_event,
                     usage_snapshot=tracker.snapshot, remaining_budget=remaining,
                     # R4 durable provenance. The engine still holds no

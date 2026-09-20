@@ -91,13 +91,38 @@ class SwarmV2Engine:
     def _merge_evidence(self, state: SwarmState,
                         incoming: Iterable[EvidenceReference | Mapping[str, Any]],
                         completed_task_ids: set[str]) -> list[EvidenceReference]:
-        """Merge checkpoint and live evidence without losing resume provenance."""
+        """Merge checkpoint and live evidence without losing resume provenance.
+
+        Two different rules for two different origins, on purpose:
+
+        * a CHECKPOINTED reference was written by this method for a completed
+          task, so one that names another run or a task that is not completed
+          is a corrupt checkpoint, and the resume is refused;
+        * a LIVE reference names a task that has not completed when the
+          board recorded its claim during that task's tool phase -- before the
+          task's model call, and while sibling tasks run on other threads --
+          or when the task later failed. That evidence is simply NOT YET (or
+          not) part of the run's evidence, which is stated over completed
+          tasks only. It is left out here and picked up by the merge that
+          follows the task's own completion. It is never a reason to fail a
+          run that has already paid for the work: the previous rule raised on
+          it, which turned every Government-read plan with two independent
+          register reads into a deterministic failure on every resume.
+
+        A live reference from another run is still a violation.
+        """
         merged: dict[str, tuple[str, EvidenceReference]] = {}
-        for raw in [*state.evidence_references, *list(incoming)]:
+        checkpointed = [(raw, True) for raw in state.evidence_references]
+        live = [(raw, False) for raw in list(incoming)]
+        for raw, from_checkpoint in [*checkpointed, *live]:
             item = raw if isinstance(raw, EvidenceReference) else EvidenceReference.model_validate(raw)
             payload = safe_durable_value(item.model_dump(mode="json"))
-            if item.run_id != state.run_id or item.task_id not in completed_task_ids:
+            if item.run_id != state.run_id:
                 raise ValueError("incompatible evidence provenance")
+            if item.task_id not in completed_task_ids:
+                if from_checkpoint:
+                    raise ValueError("incompatible evidence provenance")
+                continue
             encoded = self._canonical(payload)
             previous = merged.get(item.claim_id)
             if previous is not None and previous[0] != encoded:

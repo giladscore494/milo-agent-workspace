@@ -133,9 +133,14 @@ def _request_lease_invariant() -> dict[str, Any]:
             config.minimum_abandoned_lease_reclaim_seconds,
         "opt_in_variable": "MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS",
         "opting_in_downgrades_the_guarantee": True,
+        "opt_in_is_refused_in_production": True,
         "operator_recovery": ("ProviderQuotaCoordinator.held_inference_leases lists "
-                              "held slots; operator_reclaim_inference returns one "
-                              "and records who asserted what"),
+                              "held slots with their age; operator_reclaim_inference "
+                              "returns one and records who asserted what"),
+        "operator_tool": "scripts/release/provider_quota_leases.py (one lease per invocation)",
+        "operator_reclaim_minimum_age_seconds": config.minimum_abandoned_lease_reclaim_seconds,
+        "operator_reclaim_minimum_age_is_sufficient": False,
+        "operator_reclaim_age_check_is_atomic_with_removal": True,
         "enforced_by": ("QuotaConfig.__post_init__ and resolve_coordinator -> "
                         "assert_abandoned_lease_reclaim_safe"),
         "configuration_may_only_lengthen_the_worker_lifetime": True,

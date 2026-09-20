@@ -38,13 +38,14 @@ import pytest
 from types import SimpleNamespace
 
 from backend.provider_quota import (GUARANTEE_PROVEN_COMPLETION, GUARANTEE_TIMED_RECLAIM,
-                                    WORKER_MAX_LIFETIME_SECONDS, MemoryQuotaBackend,
-                                    ProviderQuotaCoordinator, ProviderQuotaUnavailable,
-                                    QuotaConfig, assert_abandoned_lease_reclaim_safe,
-                                    lease_safety_margin,
+                                    WORKER_MAX_LIFETIME_SECONDS, LeaseRecoveryRefused,
+                                    MemoryQuotaBackend, ProviderQuotaCoordinator,
+                                    ProviderQuotaUnavailable, QuotaConfig,
+                                    assert_abandoned_lease_reclaim_safe, lease_safety_margin,
                                     minimum_abandoned_lease_reclaim, resolve_coordinator)
-from backend.provider_scheduler import (ProviderBackpressureExceeded, ProviderLimitsConfig,
-                                        ProviderScheduler, request_completion_is_proven)
+from backend.provider_scheduler import (RATE_LIMIT_REACHED, ProviderBackpressureExceeded,
+                                        ProviderLimitsConfig, ProviderScheduler,
+                                        classify_provider_error, request_completion_is_proven)
 from backend.provider_transport import (ProviderRequestDeadlineExceeded,
                                         build_deadline_http_client)
 
@@ -137,6 +138,11 @@ class PersistentProvider:
         self._server = Server(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}/v1/chat/completions"
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def active(self) -> int:
+        with self._lock:
+            return self._active
 
     @property
     def overlap_seconds(self) -> float:
@@ -239,8 +245,13 @@ def scheduler_for(coordinator, *, patience=B_PATIENCE):
         coordinator=coordinator)
 
 
-def run_race(server, coordinator_class, probe):
-    """A's request outlives A's patience; B tries to take the freed slot."""
+def run_race(server, coordinator_class, probe, *, b_delay=0.0, b_patience=B_PATIENCE):
+    """A's request outlives A's patience; B tries to take the freed slot.
+
+    ``b_delay`` is how long B waits AFTER A is genuinely inside the provider
+    before attempting admission, so a test can place B's attempt on either
+    side of a horizon.
+    """
     worker_a, worker_b = two_workers(coordinator_class, probe=probe)
     errors: dict[str, BaseException] = {}
     a_inside = threading.Event()
@@ -262,7 +273,10 @@ def run_race(server, coordinator_class, probe):
         if not a_inside.wait(timeout=10.0):
             errors["b"] = AssertionError("worker A never reached the provider")
             return
-        issue("b", scheduler_for(worker_b))
+        while server.served < 1:
+            time.sleep(0.01)
+        time.sleep(b_delay)
+        issue("b", scheduler_for(worker_b, patience=b_patience))
 
     threads = [threading.Thread(target=issue,
                                 args=("a", scheduler_for(worker_a), a_inside)),
@@ -270,6 +284,7 @@ def run_race(server, coordinator_class, probe):
     [t.start() for t in threads]
     [t.join(timeout=60) for t in threads]
     assert not any(t.is_alive() for t in threads), "a worker never finished"
+    errors["_worker_b"] = worker_b
     return errors
 
 
@@ -413,6 +428,179 @@ def test_a_text_only_429_really_does_hold_the_slot_end_to_end():
     assert coordinator.try_acquire_inference() is None, (
         "an exception whose only 429 evidence was its message text released "
         "an organization concurrency slot")
+
+
+def test_a_bare_status_code_without_a_response_object_is_not_proof():
+    """Any wrapper can set an attribute. Only a response object is evidence."""
+
+    class LooksLikeAStatusError(Exception):
+        status_code = 429
+
+    assert classify_provider_error(LooksLikeAStatusError("x")) == RATE_LIMIT_REACHED
+    assert request_completion_is_proven(LooksLikeAStatusError("x"))[0] is False
+
+
+def test_milos_own_http_status_is_not_provider_proof():
+    """`AppError.status_code` is MILO's API status, not the provider's."""
+    from backend.errors import AppError
+
+    assert request_completion_is_proven(AppError("PROVIDER_QUOTA_UNAVAILABLE", "x", 503))[0] is False
+
+
+def test_a_response_object_without_an_integer_status_is_not_proof():
+    class NoStatus(Exception):
+        response = SimpleNamespace(status_code=None)
+
+    class BoolStatus(Exception):
+        response = SimpleNamespace(status_code=True)
+
+    assert request_completion_is_proven(NoStatus("x"))[0] is False
+    assert request_completion_is_proven(BoolStatus("x"))[0] is False
+
+
+def test_a_deadline_wrapped_by_the_sdk_is_still_a_deadline():
+    """The OpenAI SDK re-raises transport failures as APIConnectionError."""
+    wrapper = RuntimeError("Connection error.")
+    wrapper.__cause__ = ProviderRequestDeadlineExceeded(90.0, 91.2)
+    proven, reason = request_completion_is_proven(wrapper)
+    assert proven is False
+    assert reason == "PROVIDER_REQUEST_DEADLINE_EXCEEDED"
+
+
+def test_the_real_sdk_status_error_is_structural_proof():
+    """The proof rule is written against the SDK's actual error shape."""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://example.invalid/v1/chat/completions")
+    response = httpx.Response(429, request=request,
+                              text='{"error":{"type":"rate_limit_reached_error"}}')
+    error = openai.RateLimitError("Error code: 429", response=response, body=None)
+    assert classify_provider_error(error) == RATE_LIMIT_REACHED
+    assert request_completion_is_proven(error)[0] is True
+    # ...and its connection-error sibling, which carries no response, is not.
+    assert request_completion_is_proven(openai.APIConnectionError(request=request))[0] is False
+
+
+def _retrying_scheduler(coordinator, clock, *, ceiling_local=1, patience=5.0):
+    return ProviderScheduler(
+        ProviderLimitsConfig(max_concurrency=ceiling_local, rpm_limit=None, tpm_limit=None,
+                             max_rate_limit_retries=3, backoff_base_seconds=0.001,
+                             backoff_max_seconds=0.001, max_backpressure_wait_seconds=patience),
+        coordinator=coordinator, sleep_fn=clock.sleep)
+
+
+def test_a_text_only_429_backs_off_but_its_permit_stays_held():
+    """Retry classification stays tolerant; settlement does not.
+
+    Ceiling of TWO so the retry can proceed: the first attempt's permit stays
+    held (its fate is unknown), the retry takes the SECOND unit, succeeds and
+    releases that one. One lease remains held afterwards, and it is announced.
+    """
+    backend = MemoryQuotaBackend()
+    signals: list[tuple] = []
+    clock = Clock()
+    coordinator = ProviderQuotaCoordinator(
+        backend, QuotaConfig(max_concurrency=2, lease_ttl_seconds=2.0,
+                             worker_max_lifetime_seconds=3.0),
+        clock=clock, diagnostic_sink=lambda kind, payload: signals.append((kind, payload)))
+    waits: list[str] = []
+    scheduler = ProviderScheduler(
+        ProviderLimitsConfig(max_concurrency=2, rpm_limit=None, tpm_limit=None,
+                             max_rate_limit_retries=3, backoff_base_seconds=0.001,
+                             backoff_max_seconds=0.001),
+        coordinator=coordinator, sleep_fn=clock.sleep,
+        backpressure_callback=lambda _a, _p, reason, _d: waits.append(reason))
+    attempts = {"n": 0}
+
+    def flaky():
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("Error code: 429 rate_limit_reached_error")
+        return "ok"
+
+    assert scheduler.execute(flaky, estimated_tokens=10, reserved_tokens=10) == "ok"
+    assert attempts["n"] == 2 and "provider_rate_limited" in waits
+    held = coordinator.held_inference_leases()
+    assert len(held) == 1, held
+    quarantined = [p for k, p in signals if k == "provider_lease_quarantined"]
+    assert len(quarantined) == 1 and quarantined[0]["lease_id"] == held[0].lease_id
+
+
+def test_a_retry_cannot_take_capacity_that_an_unproven_attempt_still_holds():
+    """Ceiling of ONE. The text-only 429 quarantines the only unit, so the
+    retry must be REFUSED rather than run under a slot whose previous request
+    may still be executing. Retryable and finished are different questions."""
+    backend = MemoryQuotaBackend()
+    clock = Clock()
+    coordinator = ProviderQuotaCoordinator(
+        backend, QuotaConfig(max_concurrency=1, lease_ttl_seconds=2.0,
+                             worker_max_lifetime_seconds=3.0), clock=clock)
+    scheduler = _retrying_scheduler(coordinator, clock, patience=2.0)
+    attempts = {"n": 0}
+
+    def flaky():
+        attempts["n"] += 1
+        raise RuntimeError("Error code: 429 rate_limit_reached_error")
+
+    with pytest.raises(ProviderBackpressureExceeded):
+        scheduler.execute(flaky, estimated_tokens=10, reserved_tokens=10)
+    assert attempts["n"] == 1, "the retry ran under a permit whose request was unproven"
+    assert len(coordinator.held_inference_leases()) == 1
+    assert coordinator.try_acquire_inference() is None
+
+
+def test_the_second_unit_is_counted_not_created():
+    """Ceiling of TWO, two text-only 429s in a row: both units end up held and
+    the THIRD attempt is refused. Every unit the provider might be using is
+    counted; none is invented."""
+    backend = MemoryQuotaBackend()
+    clock = Clock()
+    coordinator = ProviderQuotaCoordinator(
+        backend, QuotaConfig(max_concurrency=2, lease_ttl_seconds=2.0,
+                             worker_max_lifetime_seconds=3.0), clock=clock)
+    scheduler = _retrying_scheduler(coordinator, clock, ceiling_local=2, patience=2.0)
+    attempts = {"n": 0}
+
+    def flaky():
+        attempts["n"] += 1
+        raise RuntimeError("Error code: 429 rate_limit_reached_error")
+
+    with pytest.raises(ProviderBackpressureExceeded):
+        scheduler.execute(flaky, estimated_tokens=10, reserved_tokens=10)
+    assert attempts["n"] == 2
+    assert len(coordinator.held_inference_leases()) == 2
+
+
+def test_a_second_worker_is_refused_after_the_process_lifetime_floor_through_the_scheduler():
+    """The reclaim boundary, driven through the REAL scheduler rather than a
+    manual quarantine: A's deadline fires and settles UNPROVEN, the provider
+    keeps serving A's request past the process-lifetime floor, and B is
+    admitted through its own scheduler only after that floor. The provider
+    must never see two requests at once."""
+    floor = minimum_abandoned_lease_reclaim(3.0)          # 3.75s
+    with PersistentProvider(work_seconds=8.0) as server:
+        errors = run_race(server, ProviderQuotaCoordinator, "healthy",
+                          b_delay=floor + 0.5, b_patience=0.5)
+        assert server.active >= 1, "the provider had already finished when B tried"
+        assert server.peak == 1
+        assert server.overlap_seconds == 0.0
+        assert isinstance(errors.get("a"), ProviderRequestDeadlineExceeded), errors
+        assert isinstance(errors.get("b"), ProviderBackpressureExceeded), errors
+        held = errors["_worker_b"].held_inference_leases()
+        assert len(held) == 1 and held[0].recovery_eligible is True, (
+            "the slot is offered to a human, never taken by the next process")
+
+
+def test_the_timed_reclaim_admits_a_second_worker_through_the_scheduler_too():
+    """Negative control for the test above, same harness, one override."""
+    with PersistentProvider(work_seconds=8.0) as server:
+        errors = run_race(server, TimedReclaim, "healthy",
+                          b_delay=2.0 + 0.5, b_patience=0.5)
+        assert isinstance(errors.get("b"), ProviderRequestDeadlineExceeded), (
+            f"under the timer B should have been ADMITTED and then hit its own deadline; got {errors}")
+        assert server.peak == 2
+        assert server.overlap_seconds > 1.0
 
 
 def test_a_complete_http_response_is_proof_whatever_its_status():
@@ -567,30 +755,126 @@ def test_a_crashed_worker_holds_its_slot_until_a_human_returns_it():
             f"the slot came back on its own after {elapsed:g}s")
 
     held = survivor.held_inference_leases()
-    assert [lease_id for lease_id, _ in held] == [lease.lease_id]
-    assert held[0][1] == float("inf"), (
+    assert [item.lease_id for item in held] == [lease.lease_id]
+    assert held[0].expires_at == float("inf"), (
         "the held lease carries a finite expiry, so something will eventually "
         "reclaim it without proof")
+    assert held[0].acquired_at_ms == 10_000_000
+    assert held[0].recovery_eligible is True
 
     # The manual half of the design.
     assert survivor.operator_reclaim_inference(
         lease.lease_id, reason="checked the provider console; request is gone")
     recovered = survivor.try_acquire_inference()
     assert recovered is not None
+    # The zombie's late cleanup frees nothing: its id is gone from the store.
+    assert lease.release() is False
+    assert survivor.try_acquire_inference() is None
     recovered.release()
+
+
+def test_an_operator_reclaim_is_refused_while_the_holders_process_could_be_alive():
+    """The one thing MILO CAN check before a human takes a slot back.
+
+    Below the process-lifetime floor the lease's own process may still be
+    running and may still settle it on proof; reclaiming it would put two
+    real requests under one admission. The refusal and the removal are one
+    atomic store step, so the operator cannot race a live holder.
+    """
+    clock = Clock()
+    backend = MemoryQuotaBackend()
+    config = QuotaConfig(max_concurrency=1, lease_ttl_seconds=2.0,
+                         worker_max_lifetime_seconds=3.0)
+    floor = minimum_abandoned_lease_reclaim(3.0)          # 3.75s
+    holder = ProviderQuotaCoordinator(backend, config, clock=clock)
+    operator = ProviderQuotaCoordinator(backend, config, clock=clock)
+    lease = holder.try_acquire_inference()
+
+    clock.now = 10_000.0 + floor - 0.01
+    assert operator.held_inference_leases()[0].recovery_eligible is False
+    with pytest.raises(LeaseRecoveryRefused) as young:
+        operator.operator_reclaim_inference(lease.lease_id, reason="impatient")
+    assert young.value.code == "LEASE_TOO_YOUNG"
+    assert operator.try_acquire_inference() is None, "a refused reclaim freed the slot"
+
+    clock.now = 10_000.0 + floor + 0.01
+    assert operator.held_inference_leases()[0].recovery_eligible is True
+    assert operator.operator_reclaim_inference(lease.lease_id, reason="now eligible")
+    with pytest.raises(LeaseRecoveryRefused) as gone:
+        operator.operator_reclaim_inference(lease.lease_id, reason="again")
+    assert gone.value.code == "LEASE_NOT_HELD"
+
+
+def test_a_lease_of_unknown_age_is_refused_not_assumed_old():
+    backend = MemoryQuotaBackend()
+    config = QuotaConfig(max_concurrency=1, lease_ttl_seconds=2.0,
+                         worker_max_lifetime_seconds=3.0)
+    clock = Clock()
+    coordinator = ProviderQuotaCoordinator(backend, config, clock=clock)
+    lease = coordinator.try_acquire_inference()
+    # A lease written by a store revision that recorded no acquisition time.
+    backend._acquired["milo:pq:kimi-org:conc"].pop(lease.lease_id)
+    clock.now += 10 * 86_400
+    assert coordinator.held_inference_leases()[0].recovery_eligible is False
+    with pytest.raises(LeaseRecoveryRefused) as refused:
+        coordinator.operator_reclaim_inference(lease.lease_id, reason="surely old")
+    assert refused.value.code == "LEASE_TOO_YOUNG"
+
+
+def test_recovery_and_the_age_check_are_one_atomic_store_operation():
+    from backend import provider_quota
+
+    script = provider_quota._LUA_RECOVER
+    assert "HGET" in script and "ZREM" in script and "return -1" in script
+    assert script.index("HGET") < script.index("ZREM")
+
+
+def test_the_acquisition_time_is_recorded_in_the_same_atomic_step_as_the_lease():
+    from backend import provider_quota
+
+    assert "HSET" in provider_quota._LUA_ACQUIRE
+    assert provider_quota._LUA_ACQUIRE.index("ZADD") < provider_quota._LUA_ACQUIRE.index("HSET")
+
+
+def test_nothing_in_milo_reclaims_a_held_lease_on_its_own():
+    """The operator tool is the only caller. Checked over the source tree."""
+    callers = []
+    for path in sorted((REPO / "backend").rglob("*.py")):
+        text = path.read_text()
+        if "operator_reclaim_inference(" in text and path.name != "provider_quota.py":
+            callers.append(str(path.relative_to(REPO)))
+    assert callers == [], f"MILO code reclaims held leases on its own: {callers}"
+    tool = (REPO / "scripts/release/provider_quota_leases.py").read_text()
+    assert tool.count("operator_reclaim_inference(") == 1
+    assert "--all" not in tool, "the operator tool must reclaim one lease per invocation"
+    # And acquisition never calls into recovery: checked over the AST, so a
+    # comment cannot trip it and a call cannot hide from it.
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(ProviderQuotaCoordinator.try_acquire_inference)))
+    called = {node.func.attr for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+    assert not called & {"operator_reclaim_inference", "recover_concurrency",
+                         "release_concurrency", "release_inference"}, called
 
 
 def test_an_operator_reclaim_announces_itself_and_demands_a_reason():
     """It asserts something MILO cannot check, so it leaves a record."""
     signals: list[tuple] = []
     backend = MemoryQuotaBackend()
+    clock = Clock()
     coordinator = ProviderQuotaCoordinator(
-        backend, QuotaConfig(max_concurrency=1),
+        backend, QuotaConfig(max_concurrency=1), clock=clock,
         diagnostic_sink=lambda kind, payload: signals.append((kind, payload)))
     lease = coordinator.try_acquire_inference()
+    clock.now += QuotaConfig().minimum_abandoned_lease_reclaim_seconds + 1
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as blank:
         coordinator.operator_reclaim_inference(lease.lease_id, reason="   ")
+    assert isinstance(blank.value, LeaseRecoveryRefused)
+    assert blank.value.code == "REASON_REQUIRED"
 
     coordinator.operator_reclaim_inference(lease.lease_id, reason="drained by hand")
     kinds = [kind for kind, _ in signals]
@@ -714,10 +998,37 @@ def test_a_held_lease_is_stored_with_no_expiry_and_in_a_key_with_none_either():
         http_post=lambda _url, body: calls.append(body) or {"result": [1, 1]})
     backend.acquire_concurrency("k", "lease", 1, None, 1_000)
 
-    script, args = calls[0][1], calls[0][4:]
+    body = calls[0]
+    script, nkeys = body[1], int(body[2])
+    keys, args = body[3:3 + nkeys], body[3 + nkeys:]
+    assert keys == ["k", "k:acquired"], keys
     assert args[2] == "+inf", f"the lease carries a finite score: {args[2]}"
     assert args[4] == "0", f"the key carries a TTL: {args[4]}"
     assert "PERSIST" in script, "nothing removes a stale TTL from the key"
+    assert script.count("PERSIST") >= 2, "the acquisition-time hash can expire on its own"
+
+
+def test_the_timer_is_refused_in_production_however_the_config_was_built():
+    """One environment variable is not the separate review that trading the
+    guarantee away would require. The worker builds its coordinator through
+    `resolve_coordinator` and never runs `validate_production_config`, so the
+    refusal lives on that path -- and in production config validation too."""
+    from backend.production_config import validate
+
+    env = {"ENVIRONMENT": "production",
+           "UPSTASH_REDIS_REST_URL": "https://example.invalid",
+           "UPSTASH_REDIS_REST_TOKEN": "unused-in-this-test",
+           "MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS": "7200"}
+    with pytest.raises(ValueError, match="forbidden in production"):
+        resolve_coordinator(env=env)
+    with pytest.raises(ValueError, match="forbidden in production"):
+        resolve_coordinator(QuotaConfig(abandoned_lease_reclaim_seconds=7200.0), env=env)
+    # Outside production the opt-in stays what it is: explicit and reported.
+    assert resolve_coordinator(env={**env, "ENVIRONMENT": "local"}).config.reclaims_abandoned_leases
+    report = validate({**env, "MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS": "7200"})
+    assert any(getattr(item, "code", item) == "TIMED_LEASE_RECLAIM_IN_PRODUCTION"
+               or "TIMED_LEASE_RECLAIM_IN_PRODUCTION" in str(item)
+               for item in report.errors)
 
 
 # =============================================================================
