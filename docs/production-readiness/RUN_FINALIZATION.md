@@ -115,8 +115,11 @@ the decision lock.
 * A run found already terminal in the database — a previous attempt, a
   replacement worker, the operator — is **adopted**, not rewritten.
 * A write rejected at the database boundary triggers a re-read: if the run is
-  now terminal, that decision is adopted; if it is not, this worker has lost
-  the run and the error escapes, so a stale worker never reports an outcome.
+  now terminal, that decision is adopted; if the state moved to one that
+  changes the legal target, the claim is decided again under it (once); if it
+  did not move, this worker has lost the run and the error escapes, so a stale
+  worker never reports an outcome — and, because the event follows the write,
+  never leaves a terminal event behind.
 * A `cancellation_requested` run admits only `cancelled` and `failed`. A
   product that finished anyway keeps its payload as the run's output, and the
   run is recorded as `cancelled` with `RUN_CANCELLED_AFTER_RESULT`. This
@@ -130,7 +133,7 @@ Fencing is unchanged and remains the outer boundary: every durable write and
 every event append still carries the active lease, so only the lease holder
 can terminalize at all.
 
-### Terminal events
+### Terminal events, and when they may exist
 
 The finalizer is the only emitter of `run_completed`, `run_partial_success`,
 `run_failed` and `run_cancelled`, and a product event carries the canonical
@@ -140,6 +143,35 @@ extra terminal event: the tracker already emitted the cause event
 tripped. A failure or refusal event carries its static code **only** — no
 fragment of a refused payload, not even its key names, rides out on the event
 that rejects it.
+
+**A terminal event exists only for the decision that durably won.** The
+terminal state is written first, under the lease and under a compare-and-set
+on the state the decision was taken under; the event is recorded only after
+that write has won. Two paths implement this:
+
+* **Atomic (production):** `Repository.finalize_run` →
+  `finalize_run_guarded` (migration `20260920000200`) performs the
+  transition and the event insert in ONE transaction. The CAS on the observed
+  status is mandatory; an event insert failure rolls the transition back with
+  it. Neither a false terminal event nor an evidence-less terminal run can
+  exist.
+* **Fallback (repositories without the primitive):** the state is written
+  through the legacy verbs, then the event is appended; the append is
+  idempotent (the event stream is re-read before the one retry, and no retry
+  happens when it cannot be) and bounded. If a **product** claim's evidence
+  still cannot be recorded, `TerminalEvidenceUnavailable`
+  (`RUN_EVIDENCE_UNAVAILABLE`, 503) is raised: the run's state stays, the
+  execution is honestly marked failed, a relaunch finds the run terminal and
+  exits 0, and Stage D refuses the evidence-less run (fail closed). A
+  non-product claim's missing event is reported on the result
+  (`evidence_recorded=False`) and not raised — `runs.error` already carries
+  that truth.
+
+A cancellation that lands **between the decision and the write** therefore
+cannot leave a `run_completed` behind: the write is rejected by the CAS, the
+run is re-read once, the claim is re-legalized under `cancellation_requested`
+(product payload kept, status `cancelled`, `RUN_CANCELLED_AFTER_RESULT`), and
+the status and the only terminal event agree.
 
 ## Stage D: technical success is not semantic acceptance
 
@@ -175,6 +207,12 @@ government run); `--require-complete` tightens that.
   partial, and a checkpoint with no status at all;
 * `completed` losing to a noted stop, to a live rail, to an accepted
   cancellation and to a terminal state already in the database;
+* a cancellation injected between the decision and the commit, on both the
+  atomic and the fallback path: no `run_completed` survives, the status and
+  the only terminal event both say `cancelled`, and the Stage D gate cannot
+  consume a superseded outcome; terminal-event persistence failure on both
+  paths; the PostgreSQL suite proves `finalize_run_guarded` commits both or
+  neither;
 * duplicate finalization idempotent, a different later claim superseded, six
   concurrent finalizations producing exactly one decision and at most one
   terminal event;

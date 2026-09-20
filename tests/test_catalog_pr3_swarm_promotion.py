@@ -1857,14 +1857,20 @@ def test_a_run_whose_pending_promotion_read_failed_is_never_marked_complete(monk
     monkeypatch.setattr(MemoryRepository, "catalog_run_pending_promotions", counted_read)
 
     finalized: list[str] = []
-    for name in ("mark_run_complete", "mark_run_failed", "transition_run"):
+    # Every verb a terminal write can take: the legacy completion/failure
+    # verbs, a terminal `transition_run`, and the atomic `finalize_run` the
+    # canonical finalizer uses when the repository offers it (the production
+    # path since migration 20260920000200).
+    for name in ("mark_run_complete", "mark_run_failed", "transition_run", "finalize_run"):
         original = getattr(MemoryRepository, name)
 
         def record(self, *args, _name=name, _original=original, **kwargs):
             # Only the TERMINAL transitions matter; `running` is not one.
-            if _name != "transition_run" or (args and args[0] in
-                                             {"completed", "partial_success", "failed",
-                                              "cancelled"}):
+            if _name == "finalize_run":
+                finalized.append(f"finalize:{args[1]}")
+            elif _name != "transition_run" or (args and args[0] in
+                                               {"completed", "partial_success", "failed",
+                                                "cancelled"}):
                 finalized.append(_name if _name != "transition_run" else f"transition:{args[0]}")
             return _original(self, *args, **kwargs)
 
@@ -1874,7 +1880,7 @@ def test_a_run_whose_pending_promotion_read_failed_is_never_marked_complete(monk
     control_repo, control_id = swarm_run_reaching_completion(monkeypatch)
     assert worker_main.execute_run(control_id, control_repo) == 0
     assert "run_completed" in run_event_types(control_repo, control_id)
-    assert finalized == ["mark_run_complete"]
+    assert finalized == ["finalize:completed"]
     assert control_repo.get_run(control_id)["status"] == "completed"
     # The promotion really did run on this stack: the read WAS reached, so the
     # subject below fails at a step this run genuinely performs.
@@ -1899,7 +1905,8 @@ def test_a_run_whose_pending_promotion_read_failed_is_never_marked_complete(monk
     assert "run_completed" not in events and "run_partial_success" not in events
     assert "run_failed" not in events
     # No terminal write of any shape: not `mark_run_complete`, not
-    # `mark_run_failed`, and not a terminal `transition_run` either.
+    # `mark_run_failed`, not a terminal `transition_run`, and not an atomic
+    # `finalize_run` either.
     assert not finalized, finalized
     # No catalog event was invented in its place: an outage is not a refusal.
     assert "catalog_promotion_refused" not in events

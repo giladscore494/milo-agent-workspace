@@ -82,8 +82,10 @@ The status is derived from a terminal REASON plus the canonical
 `ProductOutcome` (`backend/product_outcome.py`); terminal statuses are
 ordered by authority so a late `completed` can never overwrite a cancellation
 or a safety-rail stop; terminalization is idempotent, and a terminal state
-another legitimate path already won is adopted rather than rewritten. See
-`RUN_FINALIZATION.md`.
+another legitimate path already won is adopted rather than rewritten. The
+terminal transition and the terminal event commit in ONE transaction
+(`finalize_run_guarded`, migration `20260920000200`), so a terminal event
+exists only for the decision that durably won. See `RUN_FINALIZATION.md`.
 
 ## Cancellation
 

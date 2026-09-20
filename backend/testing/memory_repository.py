@@ -307,6 +307,55 @@ class MemoryRepository:
             run.update({"status": status, "updated_at": _now(), **fields})
             return dict(run)
 
+    def finalize_run(self, run_id: UUID, status: str, expected_status: str, event: dict[str, Any] | None = None, *, worker_id: str, attempt: int | None, lease_token: str | None, **fields: Any) -> dict[str, Any]:
+        """Parity with `finalize_run_guarded` (migration 20260920000200).
+
+        The transition and the terminal event are ONE step under the lock:
+        every check runs before anything is mutated, so a rejected
+        finalization leaves neither a status change nor an event behind, and
+        an accepted one leaves both. The compare-and-set on `expected_status`
+        is mandatory, exactly as in the database.
+        """
+        from backend.execution_usage import merge_usage_snapshots
+        from backend.runtime import TERMINAL_STATES
+
+        with self.lock:
+            run = self.runs.get(str(run_id))
+            if run is None:
+                raise NotFoundError("run", str(run_id))
+            if status not in TERMINAL_STATES:
+                raise AppError("INVALID_RUN_TRANSITION", f"{status!r} is not a terminal run status", 409)
+            self._assert_active_lease(run, worker_id, attempt, lease_token)
+            if run["status"] != expected_status:
+                # The state the decision was taken under has moved; the
+                # database rejects this with STALE_WORKER_WRITE, which the
+                # repository surfaces as a lease-class conflict.
+                raise AppError("RUN_TRANSITION_CONFLICT", "run status moved before finalization", 409)
+            try:
+                validate_transition(run["status"], status)
+            except InvalidTransition as exc:
+                raise AppError("INVALID_RUN_TRANSITION", str(exc), 409) from exc
+            if event is not None and not isinstance(event.get("payload", {}), dict):
+                raise AppError("REPOSITORY_ERROR", "a terminal event payload must be an object", 502)
+            if fields.get("usage") is not None:
+                fields = {**fields, "usage": merge_usage_snapshots(run.get("usage"), fields["usage"])}
+            run.update({"status": status, "updated_at": _now(),
+                        "finished_at": fields.get("finished_at") or run.get("finished_at") or _now(),
+                        **{k: v for k, v in fields.items() if k != "finished_at"}})
+            if event is not None:
+                self.run_events.append({
+                    "id": len(self.run_events) + 1,
+                    "run_id": str(run_id),
+                    "event_type": event.get("type"),
+                    "payload": event.get("payload") or {},
+                    "message": event.get("message"),
+                    "agent": None,
+                    "phase": None,
+                    "progress": None,
+                    "created_at": _now(),
+                })
+            return dict(run)
+
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]:
         return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=_now(), cancellation_reason=reason)
 

@@ -110,11 +110,13 @@ export type SwarmLifecyclePresentation = {
    * The canonical terminal outcome, present exactly when `finished`.
    *
    * This is the ONE value every terminal label in the card must use. The run
-   * row can lag a terminal event by a poll or two — `run_completed` is written
-   * before `runs.status` settles — so `run.status` is not a safe source for a
-   * finished run's wording: it would read "finished with status running".
-   * `viewModel.lifecycle` has already reconciled the two, with the durable
-   * status winning whenever it is itself terminal.
+   * row and the event stream are read in separate polls, so either can be a
+   * poll ahead of the other (the worker commits `runs.status` and the terminal
+   * event together, but the browser still fetches them in two requests) — so
+   * `run.status` alone is not a safe source for a finished run's wording: it
+   * could read "finished with status running". `viewModel.lifecycle` has
+   * already reconciled the two, with the durable status winning whenever it
+   * is itself terminal.
    */
   outcome?: SwarmTerminalPhase;
   /** Human label for `outcome`, e.g. "Partial success". */

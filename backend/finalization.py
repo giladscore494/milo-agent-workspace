@@ -37,6 +37,21 @@ them with one mechanism that answers three questions in one place.
    in the database -- because a previous attempt, a replacement worker or the
    operator got there first -- is adopted rather than rewritten.
 
+4. WHEN may the decision be CLAIMED?  Only once it has durably won. The
+   terminal state is written first, under the lease and under a
+   compare-and-set on the state the decision was taken under; the terminal
+   event -- the only place the canonical ProductOutcome is recorded, and the
+   place Stage D reads it from -- is recorded after that write has won, never
+   before. Where the repository offers the atomic primitive
+   (``finalize_run``, migration 20260920000200) the two commit in one
+   transaction; otherwise the event follows the write, and a failure to record
+   a product's evidence is surfaced as ``TerminalEvidenceUnavailable`` rather
+   than hidden. So no ``run_completed`` and no ProductOutcome can exist for a
+   decision that did not become the run's durable state, and a cancellation
+   that lands between the decision and the write wins: the run is re-read
+   once, decided again under the state that actually holds, and both the
+   status and the event say ``cancelled``.
+
 Fencing is unchanged and still the outer boundary: every durable write carries
 the active lease, so a worker that lost its lease cannot terminalize at all.
 This module adds the decision layer above that; it never widens what a lease
@@ -116,6 +131,21 @@ class FinalizationUnavailable(AppError):
 
     def __init__(self, message: str) -> None:
         super().__init__("RUN_FINALIZATION_UNAVAILABLE", message, 503)
+
+
+class TerminalEvidenceUnavailable(AppError):
+    """The run is durably terminal, but its terminal event could not be recorded.
+
+    Raised only on the fallback (non-atomic) path, and only for a PRODUCT
+    claim, whose canonical ProductOutcome lives on that event and nowhere
+    else. The run's state is the truth and stays; what failed is the job's
+    duty to record what it produced, and Stage D refuses a product-terminal
+    run that carries no recorded outcome (fail closed), so this is surfaced
+    rather than swallowed. A relaunch finds the run terminal and exits 0.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__("RUN_EVIDENCE_UNAVAILABLE", message, 503)
 
 
 #: Repository errors that mean "this write did not happen because the world
@@ -255,6 +285,11 @@ class FinalizationResult:
     superseded: bool = False
     #: The run was already terminal in the database when this call ran.
     already_terminal: bool = False
+    #: The terminal event this decision owes (the canonical ProductOutcome, for
+    #: a product) is durably recorded. Always true on the atomic path, where
+    #: it commits with the transition; on the fallback path it can be false,
+    #: and a product claim then raises TerminalEvidenceUnavailable.
+    evidence_recorded: bool = True
 
     @property
     def idempotent(self) -> bool:
@@ -334,7 +369,7 @@ class RunFinalizer:
             adopted = self._adopt(observed)
             if adopted is not None:
                 return adopted
-            return self._commit(self._legalize(winner, observed))
+            return self._commit(self._legalize(winner, observed), observed)
 
     def finalize_product(self, output: Any) -> FinalizationResult:
         """Convenience: finalize from an engine's final payload."""
@@ -351,7 +386,8 @@ class RunFinalizer:
         return FinalizationResult(status=decided.status, claim=self._decision,
                                   outcome=decided.outcome, wrote=False,
                                   duplicate=same, superseded=not same,
-                                  already_terminal=decided.already_terminal)
+                                  already_terminal=decided.already_terminal,
+                                  evidence_recorded=decided.evidence_recorded)
 
     def _winner(self, claim: TerminalClaim) -> TerminalClaim:
         """The highest-authority claim among everything known about this run.
@@ -417,31 +453,91 @@ class RunFinalizer:
                               "cancellation is preserved"},
             usage=claim.usage)
 
-    def _commit(self, claim: TerminalClaim) -> FinalizationResult:
+    def _commit(self, claim: TerminalClaim, observed: str | None,
+                redecisions_left: int = 1) -> FinalizationResult:
+        """Make the decision durable, then -- and only then -- claim it.
+
+        The order is the whole point. The terminal state is written FIRST,
+        under the lease and under a compare-and-set on the state the decision
+        was taken under; the terminal event that claims the decision is
+        recorded only once that write has won. So no `run_completed` and no
+        ProductOutcome can ever exist for a decision that did not become the
+        run's durable state. Where the repository offers the atomic primitive
+        (`finalize_run`, migration 20260920000200) the two are one
+        transaction; otherwise the event follows the write and a failure to
+        record it is surfaced, never hidden.
+
+        A rejected write means the world moved between the read and the
+        write. The run is re-read ONCE: a terminal state another path won is
+        adopted; a state that changed the legal target (a cancellation
+        request) re-decides and commits under the new state; anything else
+        means this worker no longer owns the run, and the error escapes.
+        """
         status = claim.durable_status
-        self._emit(claim, status)
         try:
-            self._write(claim, status)
+            evidence_recorded = self._persist(claim, status, observed)
         except AppError as exc:
             if exc.code not in _RACE_CODES:
                 raise
-            adopted = self._adopt(self._observed_status())
+            current = self._observed_status()
+            adopted = self._adopt(current)
             if adopted is not None:
                 return adopted
+            if redecisions_left > 0 and current is not None and current != observed:
+                # The state moved under us but the run is still ours to
+                # finish: decide again under the state that actually holds.
+                # Bounded to one re-decision, so a run that keeps moving
+                # cannot keep this worker writing.
+                return self._commit(self._legalize(claim, current), current,
+                                    redecisions_left - 1)
             # The write was rejected and the run is NOT terminal: this worker
             # no longer owns the run. Reporting an outcome now would be a stale
             # worker speaking for a run someone else is executing.
             raise
         result = FinalizationResult(status=status, claim=claim,
-                                    outcome=claim.outcome, wrote=True)
+                                    outcome=claim.outcome, wrote=True,
+                                    evidence_recorded=evidence_recorded)
         self._decision = claim
         self._result = result
+        if not evidence_recorded and claim.reason == "product":
+            # The state is durable and truthful; the evidence Stage D needs
+            # is not. Never pretend otherwise -- and never undo the state.
+            raise TerminalEvidenceUnavailable(
+                "run is terminal but its product outcome could not be recorded")
         return result
 
-    def _emit(self, claim: TerminalClaim, status: str) -> None:
+    def _persist(self, claim: TerminalClaim, status: str,
+                 observed: str | None) -> bool:
+        """Write the terminal state, then record its event. Returns whether
+        the event this decision owes is durably recorded."""
+        event = self._terminal_event(claim, status)
+        atomic = getattr(self.repo, "finalize_run", None)
+        if callable(atomic):
+            expected = observed if observed is not None else self._observed_status()
+            if expected is None:
+                raise FinalizationUnavailable(
+                    "run state could not be read; refusing to finalize blind")
+            atomic(self.run_id, status, expected, event, **self._lease_kwargs(),
+                   **self._terminal_fields(claim))
+            self._observe(event)
+            return True
+        # Fallback for repositories without the atomic primitive: the state
+        # first, the event only after the state has won.
+        self._write(claim, status)
+        recorded = self._append_terminal_event(event)
+        if recorded:
+            self._observe(event)
+        return recorded
+
+    def _terminal_event(self, claim: TerminalClaim, status: str) -> dict[str, Any] | None:
+        """The event this decision owes, or None when it owes none.
+
+        Budget and timeout stops owe none: the tracker already emitted the
+        cause event when the rail tripped.
+        """
         event_type = _TERMINAL_EVENT.get(status)
-        if claim.event_emitted or event_type is None or self.event_sink is None:
-            return
+        if claim.event_emitted or event_type is None:
+            return None
         payload: dict[str, Any] = {}
         if claim.reason == "product":
             # The canonical outcome record is durable evidence about a product
@@ -458,14 +554,72 @@ class RunFinalizer:
         if claim.event_payload:
             payload.update(dict(claim.event_payload))
         message = (claim.error or {}).get("message") or f"Run {status}"
-        self.event_sink.emit(RunEventRecord(run_id=self.run_id, type=event_type,
-                                            message=message, payload=payload))
-        if self.observer is not None:
-            self.observer(event_type, dict(payload))
+        return {"type": event_type, "message": message, "payload": payload}
+
+    def _observe(self, event: dict[str, Any] | None) -> None:
+        """Tell the supervisor shadow about an event that is now durable."""
+        if event is None or self.observer is None:
+            return
+        try:
+            self.observer(event["type"], dict(event["payload"]))
+        except Exception:
+            # The observer is shadow-mode telemetry; it never alters a
+            # decision that is already durable.
+            pass
+
+    def _append_terminal_event(self, event: dict[str, Any] | None) -> bool:
+        """Record the terminal event after the state has won (fallback path).
+
+        Idempotent and bounded: an append that raised may still have
+        committed, so before the one retry the event stream is re-read, and
+        without a way to re-read it there is no retry -- a duplicate terminal
+        claim would be its own integrity problem.
+        """
+        if event is None:
+            return True
+        if self.event_sink is None:
+            # No sink means this finalizer is not the evidence recorder
+            # (harness use); the worker always supplies one.
+            return True
+        record = RunEventRecord(run_id=self.run_id, type=event["type"],
+                                message=event["message"], payload=event["payload"])
+        try:
+            self.event_sink.emit(record)
+            return True
+        except Exception:
+            pass
+        if self._terminal_event_exists(event["type"]):
+            return True
+        if not callable(getattr(self.repo, "list_run_events", None)):
+            return False
+        try:
+            self.event_sink.emit(record)
+            return True
+        except Exception:
+            return self._terminal_event_exists(event["type"])
+
+    def _terminal_event_exists(self, event_type: str) -> bool:
+        lister = getattr(self.repo, "list_run_events", None)
+        if not callable(lister):
+            return False
+        try:
+            return any(item.get("event_type") == event_type
+                       for item in lister(self.run_id))
+        except Exception:
+            return False
+
+    def _terminal_fields(self, claim: TerminalClaim) -> dict[str, Any]:
+        fields: dict[str, Any] = {"finished_at": datetime.now(UTC).isoformat()}
+        if claim.output is not None:
+            fields["output"] = claim.output
+        fields["error"] = claim.error
+        if claim.usage is not None:
+            fields["usage"] = claim.usage
+        return fields
 
     def _write(self, claim: TerminalClaim, status: str) -> None:
+        """The terminal state through the legacy verbs (fallback path)."""
         transition = getattr(self.repo, "transition_run", None)
-        finished_at = datetime.now(UTC).isoformat()
         if status == "completed":
             # Preserved as the repository's own completion verb; it is
             # ``transition_run(completed, ...)`` underneath.
@@ -487,17 +641,11 @@ class RunFinalizer:
             # stopped run as a success is the exact defect this module exists
             # to prevent.
             raise FinalizationUnavailable("terminal run transition is unavailable")
-        fields: dict[str, Any] = {"finished_at": finished_at}
-        if claim.output is not None:
-            fields["output"] = claim.output
-        fields["error"] = claim.error
-        if claim.usage is not None:
-            fields["usage"] = claim.usage
         transition(self.run_id, status,
                    expected_worker_id=self.lease_ctx.get("worker_id"),
                    expected_attempt=self.lease_ctx.get("attempt"),
                    expected_lease_token=self.lease_ctx.get("lease_token"),
-                   **fields)
+                   **self._terminal_fields(claim))
 
     def _lease_kwargs(self) -> dict[str, Any]:
         return {"worker_id": self.lease_ctx.get("worker_id"),
@@ -506,4 +654,5 @@ class RunFinalizer:
 
 
 __all__ = ["CLAIM_REASONS", "FinalizationResult", "FinalizationUnavailable",
-           "RunFinalizer", "TERMINAL_AUTHORITY", "TerminalClaim"]
+           "RunFinalizer", "TERMINAL_AUTHORITY", "TerminalClaim",
+           "TerminalEvidenceUnavailable"]

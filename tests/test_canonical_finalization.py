@@ -31,7 +31,8 @@ from backend import finalization as finalization_module
 from backend.errors import AppError
 from backend.budget import BudgetExceeded
 from backend.finalization import (TERMINAL_AUTHORITY, FinalizationUnavailable,
-                                  RunFinalizer, TerminalClaim)
+                                  RunFinalizer, TerminalClaim,
+                                  TerminalEvidenceUnavailable)
 from backend.product_outcome import (BLOCKING_CODES, SEMANTIC_STATUSES,
                                      ProductOutcomeError, acceptance_problems,
                                      derive_product_outcome, not_produced_outcome,
@@ -51,15 +52,7 @@ STAGE_D = REPO_ROOT / "scripts" / "release" / "stage-d"
 
 
 def seeded_run(workflow_key: str = "vehicle_catalog_v1"):
-    repo = MemoryRepository()
-    project_id, user_id = uuid4(), uuid4()
-    repo.seed_user(str(user_id))
-    repo.seed_project(str(project_id), "finalization", "Finalization", [str(user_id)])
-    repo.projects[str(project_id)]["workflow_key"] = workflow_key
-    conversation = repo.create_conversation(project_id, "finalization")
-    created = repo.create_message_and_run(
-        conversation["id"], "finalize me", {}, user_id, f"key-{uuid4()}", "fingerprint")
-    return repo, created["run"]["id"]
+    return seeded_run_with(MemoryRepository, workflow_key)
 
 
 def catalog_document(*, status="complete", settled=2, review=0, rejected=0,
@@ -129,6 +122,69 @@ def finalizer_for(repo, run_id, engine="vehicle_catalog_v1"):
 class Stop(BudgetExceeded):
     def __init__(self, code="RUN_DURATION_EXCEEDED", terminal="timed_out"):
         super().__init__(code, "limit reached", "run_timed_out", terminal)
+
+
+TERMINAL_EVENT_TYPES = ("run_completed", "run_partial_success", "run_failed",
+                        "run_cancelled")
+PRODUCT_EVENT_TYPES = ("run_completed", "run_partial_success")
+
+
+def terminal_events(repo):
+    return [e for e in repo.run_events if e["event_type"] in TERMINAL_EVENT_TYPES]
+
+
+class LegacyRepository(MemoryRepository):
+    """A repository from before the atomic primitive existed.
+
+    The finalizer must be correct against this too: it is the shape of every
+    harness double, and of any deployment whose migrations trail its images.
+    """
+
+    finalize_run = None  # type: ignore[assignment]
+
+
+def seeded_run_with(repo_class, workflow_key="swarm_v2"):
+    repo = repo_class()
+    project_id, user_id = uuid4(), uuid4()
+    repo.seed_user(str(user_id))
+    repo.seed_project(str(project_id), "finalization", "Finalization", [str(user_id)])
+    repo.projects[str(project_id)]["workflow_key"] = workflow_key
+    conversation = repo.create_conversation(project_id, "finalization")
+    created = repo.create_message_and_run(
+        conversation["id"], "finalize me", {}, user_id, f"key-{uuid4()}", "fingerprint")
+    return repo, created["run"]["id"]
+
+
+def inject_cancellation_after_the_decision_read(repo, run_id):
+    """Land a cancellation request AFTER the finalizer reads the run's state
+    and BEFORE it writes: exactly the window the blocker named."""
+    original = repo.get_run
+    injected = []
+
+    def racing_get_run(candidate, user_id=None):
+        row = original(candidate, user_id)
+        if not injected:
+            injected.append(row["status"])
+            repo.request_cancellation(run_id)
+        return row
+
+    repo.get_run = racing_get_run
+    return injected
+
+
+def probe_style_record(repo, run_id):
+    """The evidence record exactly as probe_db.py builds it: the run row, and
+    the ProductOutcome copied from the LAST product terminal event."""
+    outcome = None
+    for event in repo.run_events:
+        if event["event_type"] in PRODUCT_EVENT_TYPES and isinstance(
+                event["payload"].get("product_outcome"), dict):
+            outcome = event["payload"]["product_outcome"]
+    record = {"stage_d_probe": "evidence", "ok": True, "run_id": str(run_id),
+              "run": {"id": str(run_id), "status": repo.get_run(run_id)["status"]}}
+    if outcome is not None:
+        record["product_outcome"] = outcome
+    return record
 
 
 # ===========================================================================
@@ -458,6 +514,8 @@ def test_a_stale_worker_whose_write_is_rejected_never_reports_an_outcome():
     with pytest.raises(AppError):
         finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload()))
     assert repo.get_run(run_id)["status"] == "running"
+    # The claim lost, so it never got to claim anything: no terminal event.
+    assert terminal_events(repo) == []
 
 
 def test_a_repository_that_cannot_express_the_decision_is_an_infrastructure_failure():
@@ -765,3 +823,292 @@ def test_the_worker_records_the_canonical_outcome_the_stage_d_gate_reads(monkeyp
 
     done = run_semantic_gate(evidence_record("partial_success", recorded))
     assert done.returncode == 1
+
+
+# ===========================================================================
+# E. the terminal event exists only for the decision that durably won
+# ===========================================================================
+#
+# Every test here runs against BOTH the atomic path (the repository offers
+# `finalize_run`, as production does through migration 20260920000200) and the
+# fallback path (it does not, as every harness double does not).
+
+PATHS = [pytest.param(MemoryRepository, id="atomic"),
+         pytest.param(LegacyRepository, id="fallback")]
+
+
+@pytest.mark.parametrize("repo_class", PATHS)
+def test_a_cancellation_between_the_decision_and_the_commit_wins(repo_class):
+    """The blocker, replayed deterministically.
+
+    1. the finalizer reads `running` and decides `completed`;
+    2. a cancellation request lands;
+    3. the `completed` write is rejected -- and because the event follows the
+       write, no `run_completed` was ever recorded;
+    4. the run is re-read once and decided again under the state that holds.
+    """
+    repo, run_id = seeded_run_with(repo_class)
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+    injected = inject_cancellation_after_the_decision_read(repo, run_id)
+    payload = v2_payload(kind="usable_result")
+
+    result = finalizer.finalize(TerminalClaim.product("swarm_v2", payload))
+
+    assert injected == ["running"], "the cancellation must land after the decision read"
+    # 2/3. cancellation wins, and the durable event and status AGREE.
+    run = repo.get_run(run_id)
+    assert result.status == run["status"] == "cancelled"
+    assert result.wrote and result.evidence_recorded
+    assert [e["event_type"] for e in terminal_events(repo)] == ["run_cancelled"]
+    assert terminal_events(repo)[0]["payload"]["code"] == "RUN_CANCELLED_AFTER_RESULT"
+    # the product was not thrown away, and it never claimed to have won.
+    assert run["output"] == payload
+    assert not any(e["event_type"] in PRODUCT_EVENT_TYPES for e in repo.run_events)
+    assert not any("product_outcome" in e["payload"] for e in repo.run_events)
+
+
+@pytest.mark.parametrize("repo_class", PATHS)
+def test_a_losing_product_claim_leaves_no_product_terminal_event(repo_class):
+    """A claim that loses to a state it cannot legally follow records nothing.
+
+    Here the write is rejected because the lease is gone; there is no legal
+    re-decision, the error escapes, and the event stream holds NO terminal
+    claim -- which is the whole difference from emitting first.
+    """
+    repo, run_id = seeded_run_with(repo_class)
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+    finalizer.lease_ctx = {**finalizer.lease_ctx, "lease_token": "reclaimed"}
+
+    with pytest.raises(AppError):
+        finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="usable_result")))
+
+    assert repo.get_run(run_id)["status"] == "running"
+    assert terminal_events(repo) == []
+    assert not finalizer.decided
+
+
+@pytest.mark.parametrize("repo_class", PATHS)
+def test_the_race_is_closed_end_to_end_through_the_worker(monkeypatch, repo_class):
+    """Through execute_run: the worker exits 0, the run is cancelled, and the
+    event stream carries exactly one terminal claim that agrees with it."""
+    monkeypatch.delenv("MILO_ENABLE_PAID_EXECUTION", raising=False)
+    repo, run_id = seeded_run_with(repo_class)
+    original_get_run = repo.get_run
+    armed = {"after_engine": False}
+
+    def racing_get_run(candidate, user_id=None):
+        row = original_get_run(candidate, user_id)
+        if armed["after_engine"] and row["status"] == "running":
+            armed["after_engine"] = False
+            repo.request_cancellation(run_id)
+        return row
+
+    repo.get_run = racing_get_run
+
+    class RacingEngine:
+        workflow_key = "swarm_v2"
+
+        def run(self, run):
+            armed["after_engine"] = True   # the next read is the decision read
+            return v2_payload(kind="usable_result")
+
+    assert execute_run(run_id, repo, RacingEngine()) == 0
+    run = repo.get_run(run_id)
+    assert run["status"] == "cancelled"
+    assert [e["event_type"] for e in terminal_events(repo)] == ["run_cancelled"]
+    assert run["output"] == v2_payload(kind="usable_result")
+
+
+@pytest.mark.parametrize("repo_class", PATHS)
+def test_stage_d_cannot_consume_a_superseded_product_outcome(repo_class):
+    """The probe copies the ProductOutcome from the last product terminal
+    event, and the host gate judges it. After the race there IS no such
+    event, the run is `cancelled`, and the gate refuses -- there is nothing
+    superseded left to consume."""
+    repo, run_id = seeded_run_with(repo_class)
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+    inject_cancellation_after_the_decision_read(repo, run_id)
+    finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="usable_result")))
+
+    record = probe_style_record(repo, run_id)
+    assert "product_outcome" not in record
+    done = run_semantic_gate(record)
+    assert done.returncode == 1
+    verdict = json.loads(done.stdout.strip().splitlines()[-1])
+    assert verdict["terminal_status"] == "cancelled"
+    assert "is not a product outcome" in verdict["reason"]
+    # The mirror above must match the probe's own extraction rule.
+    probe = (STAGE_D / "probe_db.py").read_text()
+    assert 'event.get("event_type") not in ("run_completed", "run_partial_success")' in probe
+
+
+def test_the_atomic_primitive_is_preferred_and_the_sink_is_not_used_for_it():
+    repo, run_id = seeded_run("swarm_v2")
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+    atomic_calls = []
+    original = repo.finalize_run
+
+    def spying(*args, **kwargs):
+        atomic_calls.append((args[1], args[2], (args[3] or {}).get("type")))
+        return original(*args, **kwargs)
+
+    repo.finalize_run = spying
+    sink_calls = []
+    finalizer.event_sink = type("Sink", (), {"emit": lambda self, e: sink_calls.append(e)})()
+
+    result = finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")))
+
+    assert atomic_calls == [("partial_success", "running", "run_partial_success")]
+    assert sink_calls == [], "on the atomic path the event commits with the transition"
+    assert result.evidence_recorded and result.wrote
+    assert [e["event_type"] for e in terminal_events(repo)] == ["run_partial_success"]
+
+
+def test_an_atomic_finalization_that_fails_leaves_nothing_behind():
+    """The primitive commits both or neither: a failure inside it is not a
+    half-terminal run and not a dangling event."""
+    repo, run_id = seeded_run("swarm_v2")
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+
+    def broken(*args, **kwargs):
+        raise AppError("REPOSITORY_ERROR", "guarded persistence operation failed", 502)
+
+    repo.finalize_run = broken
+    with pytest.raises(AppError) as excinfo:
+        finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="usable_result")))
+    assert excinfo.value.code == "REPOSITORY_ERROR"
+    assert repo.get_run(run_id)["status"] == "running"
+    assert terminal_events(repo) == []
+    assert not finalizer.decided
+
+
+class CommittingThenFailingSink:
+    """The append reaches the database and the acknowledgement is lost."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def emit(self, event):
+        self.inner.emit(event)
+        raise ConnectionError("acknowledgement lost")
+
+
+class NeverCommittingSink:
+    def __init__(self):
+        self.attempts = 0
+
+    def emit(self, event):
+        self.attempts += 1
+        raise ConnectionError("event store unavailable")
+
+
+def test_fallback_event_persistence_that_committed_is_recognised_not_duplicated():
+    repo, run_id = seeded_run_with(LegacyRepository)
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+    finalizer.event_sink = CommittingThenFailingSink(finalizer.event_sink)
+
+    result = finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")))
+
+    assert result.status == "partial_success" and result.evidence_recorded
+    assert [e["event_type"] for e in terminal_events(repo)] == ["run_partial_success"]
+
+
+def test_fallback_event_persistence_failure_on_a_product_is_surfaced_not_hidden():
+    """The state is durable and stays; the missing evidence is raised, the
+    decision is in force for every later call, and Stage D refuses the run."""
+    repo, run_id = seeded_run_with(LegacyRepository)
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+    sink = NeverCommittingSink()
+    finalizer.event_sink = sink
+    payload = v2_payload(kind="partial_result")
+
+    with pytest.raises(TerminalEvidenceUnavailable) as excinfo:
+        finalizer.finalize(TerminalClaim.product("swarm_v2", payload))
+
+    assert excinfo.value.code == "RUN_EVIDENCE_UNAVAILABLE"
+    assert sink.attempts == 2, "one bounded retry, guarded by a re-read"
+    run = repo.get_run(run_id)
+    assert run["status"] == "partial_success" and run["output"] == payload
+    assert terminal_events(repo) == []
+    # The decision is in force: a repeat is idempotent and writes nothing.
+    again = finalizer.finalize(TerminalClaim.product("swarm_v2", dict(payload)))
+    assert again.duplicate and not again.wrote and not again.evidence_recorded
+    # And Stage D fails closed on the evidence-less product terminal.
+    done = run_semantic_gate(probe_style_record(repo, run_id))
+    assert done.returncode == 1
+    assert "recorded NO canonical ProductOutcome" in json.loads(
+        done.stdout.strip().splitlines()[-1])["reason"]
+
+
+def test_fallback_event_persistence_failure_on_a_non_product_is_reported_not_raised():
+    """`runs.error` already carries a failure's truth; the missing event is
+    reported on the result, and the run is not relaunched over it."""
+    repo, run_id = seeded_run_with(LegacyRepository)
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+    finalizer.event_sink = NeverCommittingSink()
+
+    result = finalizer.finalize(TerminalClaim.failure("swarm_v2", "X_FAILED", "x failed"))
+
+    assert result.status == "failed" and result.wrote and not result.evidence_recorded
+    assert repo.get_run(run_id)["error"]["code"] == "X_FAILED"
+    assert terminal_events(repo) == []
+
+
+def test_fallback_never_retries_an_append_it_cannot_prove_did_not_commit():
+    """Without a way to re-read the event stream, a retry could double-claim."""
+    repo, run_id = seeded_run_with(LegacyRepository)
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+    sink = NeverCommittingSink()
+    finalizer.event_sink = sink
+    repo.list_run_events = None  # type: ignore[assignment]
+
+    with pytest.raises(TerminalEvidenceUnavailable):
+        finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")))
+    assert sink.attempts == 1
+
+
+def test_the_supervisor_shadow_observes_only_durable_terminal_events():
+    repo, run_id = seeded_run_with(LegacyRepository)
+    finalizer = finalizer_for(repo, run_id, "swarm_v2")
+    observed = []
+    finalizer.observer = lambda kind, payload: observed.append(kind)
+    finalizer.event_sink = NeverCommittingSink()
+    with pytest.raises(TerminalEvidenceUnavailable):
+        finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")))
+    assert observed == [], "an event that never became durable was observed"
+
+    repo2, run_id2 = seeded_run_with(MemoryRepository)
+    finalizer2 = finalizer_for(repo2, run_id2, "swarm_v2")
+    observed2 = []
+    finalizer2.observer = lambda kind, payload: observed2.append(kind)
+    finalizer2.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")))
+    assert observed2 == ["run_partial_success"]
+
+
+def test_the_memory_primitive_matches_the_database_contract():
+    """Parity checks for the in-memory `finalize_run`, so the atomic path the
+    suite exercises is the one production runs."""
+    repo, run_id = seeded_run("swarm_v2")
+    run = repo.claim_run(run_id, "worker-1", lease_seconds=300)
+    lease = {"worker_id": "worker-1", "attempt": run["attempt"], "lease_token": run["lease_token"]}
+    repo.transition_run(run_id, "running", expected_worker_id="worker-1",
+                        expected_attempt=lease["attempt"], expected_lease_token=lease["lease_token"])
+    # a non-terminal target is refused outright
+    with pytest.raises(AppError, match="not a terminal"):
+        repo.finalize_run(run_id, "waiting", "running", None, **lease)
+    # a moved status is a conflict, and NOTHING is written
+    repo.request_cancellation(run_id)
+    with pytest.raises(AppError) as excinfo:
+        repo.finalize_run(run_id, "completed", "running",
+                          {"type": "run_completed", "message": "m", "payload": {}}, **lease,
+                          output={"x": 1})
+    assert excinfo.value.code == "RUN_TRANSITION_CONFLICT"
+    assert repo.get_run(run_id)["status"] == "cancellation_requested"
+    assert repo.get_run(run_id).get("output") is None and terminal_events(repo) == []
+    # under the right expectation both land together
+    repo.finalize_run(run_id, "cancelled", "cancellation_requested",
+                      {"type": "run_cancelled", "message": "m", "payload": {"code": "C"}}, **lease,
+                      output={"x": 1}, error={"code": "C", "message": "c"})
+    assert repo.get_run(run_id)["status"] == "cancelled"
+    assert [e["event_type"] for e in terminal_events(repo)] == ["run_cancelled"]
+    assert terminal_events(repo)[0]["payload"] == {"code": "C"}
