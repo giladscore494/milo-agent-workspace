@@ -43,6 +43,17 @@ is armed. The zero-cost staging stack really does carry a $5.00 daily budget
 and a $0.001 per-call reservation rate; narrowing it would protect nothing
 and break something.
 
+## Scope: the deployment, not the run's engine
+
+One worker image serves both engines and the environment is per-deployment, so
+a Cloud Run job carrying a Swarm V2 width wider than the reviewed one is
+misconfigured even while it happens to be executing a V1 run — the next run on
+the same job may be V2. **Every dimension is therefore resolved and validated
+for every deployment**, the mandatory-for-paid set is engine-independent, and
+no dimension carries engine-scope metadata. What a dimension binds is stated by
+the surface that enforces it (`enforced_by`) and by its own name
+(`v1_technical_parallelism` / `v2_max_active_workers`).
+
 ## How a dimension is declared
 
 Each dimension is declared exactly once, in `POLICY_DIMENSIONS`, with:
@@ -98,7 +109,32 @@ deployment is not allowed to **read** is a contradiction, and it is now
 refused during configuration validation rather than at worker construction,
 after a run has been created and a lease acquired.
 
-## Stage D
+## Stage D, and the release binding
+
+Generating the envelope from the policy removes the second transcription but
+introduces a different way to be wrong: the generator reads the **local
+checkout**, while Stage D verifies separately pinned release **image digests**.
+Comparing a checkout against itself proves nothing about what the running
+images enforce. So the policy is bound to the release twice, and both bindings
+fail closed:
+
+1. `PINNED_POLICY_FINGERPRINT` in `policy_envelope.py` is a **literal reviewed
+   constant**, changed in a reviewed commit exactly like an image digest. Every
+   selector refuses unless the checkout's policy digest matches it, so a
+   drifted checkout cannot even print a pin. CI fails if the two diverge.
+2. `release_binding_problems()` proves the checkout **is** the accepted
+   release: `HEAD` equals `STAGE_D_RELEASE_SHA` and the policy source is
+   unmodified. `verify_caps.py` and both step scripts run it before any run is
+   created. Being unable to prove it — no git metadata, a shallow clone, an
+   unreadable tree — is a refusal, never a pass.
+
+With `STAGE_D_RELEASE_SHA` still naming the pre-policy release, Stage D now
+**refuses**, which is the correct executable form of the supersession
+`STAGE_D_AUTHORIZATION.md` already documents in prose.
+
+The number of new paid worker executions Stage D will accept is the policy's
+`first_paid_run_execution_cap`, read by `verify_executions.py --baseline`;
+the shell no longer computes `baseline + 1` on its own.
 
 `stage-d-env.sh` no longer transcribes anything. It generates
 `STAGE_D_CAPS`, `STAGE_D_WORKER_PROVIDER_LIMITS`,

@@ -11,6 +11,9 @@ echo "== Provider secret IAM (worker-only)"
 gcloud secrets get-iam-policy KIMI_API_KEY --project="${STAGE_D_PROJECT}" --format=json \
   | python3 -c 'import json,sys; p=json.load(sys.stdin); a=[m for b in p["bindings"] if b["role"]=="roles/secretmanager.secretAccessor" for m in b["members"]]; assert a==["serviceAccount:'"${STAGE_D_WORKER_SA}"'"], a; print("OK: worker-only")'
 
+echo "== The runtime policy is the reviewed one AND comes from the accepted release"
+python3 ./policy_envelope.py binding
+
 echo "== Exact cap/image/flag/provider-envelope posture on BOTH surfaces (verify_caps.py)"
 worker_json="$(mktemp)"; api_json="$(mktemp)"
 trap 'rm -f "${worker_json}" "${api_json}"' EXIT

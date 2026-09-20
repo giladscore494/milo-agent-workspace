@@ -311,7 +311,16 @@ stage_d_pin STAGE_D_WORKER_PROVIDER_LIMITS "$(stage_d_policy provider-limits)"
 # is what makes leaving it unpinned impossible rather than merely unwise.
 stage_d_pin STAGE_D_WORKER_ENGINE_LIMITS "$(stage_d_policy engine-limits)"
 
-# The digest of the whole policy document. verify_caps.py recomputes it and
-# refuses on any mismatch, so the release toolkit and the runtime can be
-# shown to be talking about the same envelope rather than assumed to be.
+# How many NEW paid worker executions this authorization covers, read from
+# the canonical policy's first_paid_run_execution_cap. 06-collect-evidence.sh
+# used to compute `baseline + 1` in shell arithmetic, which was a second
+# authority for a rule the policy already states.
+stage_d_pin STAGE_D_AUTHORIZED_EXECUTION_INCREMENT "$(stage_d_policy execution-increment)"
+
+# The digest of the whole policy document, which policy_envelope.py will only
+# print when it matches the reviewed fingerprint pinned there as a literal --
+# the same kind of reviewed constant as the accepted image digests. So this
+# value cannot be produced at all by a checkout whose policy has drifted, and
+# verify_caps.py additionally proves the checkout IS the accepted release
+# before any run is created.
 stage_d_pin STAGE_D_POLICY_FINGERPRINT "$(stage_d_policy fingerprint)"

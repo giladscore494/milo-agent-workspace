@@ -248,8 +248,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             repo.mark_run_failed(run_id, "BUDGET_CONFIG_INVALID", f"mandatory budget settings missing: {missing}", worker_id=worker_id, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
             return 0 if workflow_key == "swarm_v2" else 1
 
-        # The ONE canonical runtime policy for this run. It is resolved ONCE,
-        # here, and every enforcement surface below is derived from it: the
+        # The ONE canonical runtime policy for this DEPLOYMENT. It is resolved
+        # ONCE, here, and every enforcement surface below is derived from it:
+        # the
         # budget tracker, the provider scheduler, the Swarm V2 plan firewall,
         # the provider-visible planning policy, the feasibility gate and the
         # executor width. Two surfaces cannot describe different effective
@@ -260,7 +261,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # resolving to a generic default. The tracker additionally blocks every
         # call while MILO_ENABLE_PAID_EXECUTION is off.
         try:
-            policy = resolve_runtime_policy(engine=workflow_key)
+            policy = resolve_runtime_policy()
         except RuntimePolicyError as exc:
             code = policy_failure_code(exc)
             detail = "; ".join(f"{v.dimension}: {v.message}" for v in exc.violations)

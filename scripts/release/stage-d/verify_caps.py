@@ -39,8 +39,19 @@ STAGE_D_POLICY_FINGERPRINT, STAGE_D_REGISTRY, STAGE_D_RELEASE_SHA,
 STAGE_D_API_IMAGE_DIGEST, STAGE_D_WORKER_IMAGE_DIGEST.
 Exit 0 only if every check passes.
 
-THE CANONICAL POLICY IS THE AUTHORITY
--------------------------------------
+THE CANONICAL POLICY IS THE AUTHORITY — AND IT IS BOUND TO THE RELEASE
+----------------------------------------------------------------------
+
+Before any of the comparisons below, this module proves that the policy it is
+about to verify against actually comes from the accepted release: the
+checkout's policy digest must equal the literal reviewed fingerprint pinned in
+policy_envelope.py, and the checkout must BE the commit STAGE_D_RELEASE_SHA
+names, with the policy source unmodified. Without that, generating and
+verifying the envelope from the same local checkout would only ever prove the
+checkout agrees with itself, while the run executes separately pinned release
+IMAGES that may carry a different policy entirely. Being unable to prove the
+binding — no git metadata, a shallow clone, an unreadable tree — is a refusal.
+
 
 This module no longer trusts the strings it is handed. Every expected value
 is re-derived from `backend/runtime_policy.py` and compared against what
@@ -67,7 +78,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from policy_envelope import (  # noqa: E402  (path bootstrap must run first)
-    CAP_ENV_PREFIXES, ENGINE_ENV_PREFIXES, POLICY, PROVIDER_ENV_PREFIXES)
+    CAP_ENV_PREFIXES, ENGINE_ENV_PREFIXES, PINNED_POLICY_FINGERPRINT, POLICY,
+    PROVIDER_ENV_PREFIXES, release_binding_problems)
 from policy_envelope import expected as policy_expected  # noqa: E402
 
 ENABLED = "true"  # expected value of a deliberately operator-enabled flag
@@ -363,7 +375,7 @@ def main() -> int:
         f"OK: all {len(caps)} caps exact on worker+api, "
         f"all {len(provider_limits)} provider limits and {len(engine_limits)} engine "
         f"limits exact on worker only, canonical policy "
-        f"{POLICY.fingerprint()[:12]}… verified, "
+        f"{POLICY.fingerprint()[:12]}… verified and bound to the accepted release, "
         f"release {release_sha[:12]}… referenced, flag posture correct"
     )
     return 0

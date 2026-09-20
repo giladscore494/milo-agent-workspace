@@ -32,11 +32,11 @@ from backend.production_config import validate
 from backend.provider_scheduler import ProviderLimitsConfig
 from backend.runtime_policy import (BUDGET, CAP_ENV_PREFIXES, DIMENSIONS,
                                     ENGINE_ENV_PREFIXES, MANDATORY_FOR_PAID_EXECUTION,
-                                    POLICY_DIMENSIONS, POLICY_ENV_KEYS,
+                                    POLICY_DIMENSIONS, POLICY_ENV_KEYS, POLICY_SCOPE,
                                     PROVIDER_ENV_PREFIXES, RuntimePolicyError,
                                     dimensions_for, paid_posture, policy_violations,
-                                    resolve_runtime_policy, reviewed_first_run_policy,
-                                    reviewed_policy_violations)
+                                    resolve_runtime_policy, resolved_dimension,
+                                    reviewed_first_run_policy, reviewed_policy_violations)
 from backend.tier2_profile import tier2_first_run_profile
 from backend.tools import ToolContext, ToolMode, ToolOperation, ToolRegistry
 
@@ -479,7 +479,7 @@ def test_an_unpaid_deployment_is_left_exactly_as_it_was():
     switch refuses every one -- so retroactively imposing a first-run policy
     on a development stack would narrow something without protecting anything.
     """
-    policy = resolve_runtime_policy({}, engine="swarm_v2")
+    policy = resolve_runtime_policy({})
     assert policy.paid is False
     assert policy.budget_config() == BudgetConfig.from_env({})
     assert policy.plan_limits() == PlanLimits()
@@ -642,3 +642,149 @@ def test_a_run_duration_the_worker_process_cannot_survive_fails_closed():
          "MILO_MAX_RUN_DURATION_SECONDS": str(WORKER_JOB_TIMEOUT_SECONDS)}, paid=True)]
     assert any(v.code in ("POLICY_INVARIANT_VIOLATED", "POLICY_WIDER_THAN_REVIEWED")
                for v in violations)
+
+
+# =============================================================================
+# The policy is DEPLOYMENT-scoped, and says so rather than implying otherwise
+# =============================================================================
+
+def test_the_policy_carries_no_engine_scope_metadata():
+    """`applies_to` was serialized and never consulted.
+
+    One worker image serves both engines and the environment is per-deployment,
+    so a job carrying a wider Swarm V2 width is misconfigured even while it
+    happens to be executing a V1 run: the next run on the same job may be V2.
+    Metadata that looked like it scoped validation, while validation ignored
+    it, was worse than no metadata at all.
+    """
+    assert POLICY_SCOPE == "deployment"
+    for dimension in POLICY_DIMENSIONS:
+        assert not hasattr(dimension, "applies_to"), dimension.name
+    document = POLICY.document()
+    assert document["scope"] == "deployment"
+    assert "engine" not in document
+    for rendered in document["dimensions"].values():
+        assert "applies_to" not in rendered
+
+
+def test_resolution_takes_no_engine_and_validates_every_dimension():
+    """The mandatory set is engine-independent, in the signature and in fact."""
+    import inspect
+
+    for function in (resolve_runtime_policy, policy_violations,
+                     reviewed_first_run_policy):
+        assert "engine" not in inspect.signature(function).parameters, function.__name__
+    assert not hasattr(POLICY, "engine")
+    # A V1-only deployment is still refused for a wider V2 width, because the
+    # same job runs both engines.
+    env = {**REVIEWED_ENV, "MILO_ENABLE_PAID_EXECUTION": "true",
+           "MILO_SWARM_MAX_ACTIVE_WORKERS": "8"}
+    with pytest.raises(RuntimePolicyError) as excinfo:
+        resolve_runtime_policy(env)
+    assert "POLICY_WIDER_THAN_REVIEWED" in excinfo.value.codes
+    # ...and symmetrically for a V1 dimension.
+    env = {**REVIEWED_ENV, "MILO_ENABLE_PAID_EXECUTION": "true",
+           "MILO_V1_TECHNICAL_PARALLELISM": "8"}
+    with pytest.raises(RuntimePolicyError) as excinfo:
+        resolve_runtime_policy(env)
+    assert "POLICY_WIDER_THAN_REVIEWED" in excinfo.value.codes
+
+
+# =============================================================================
+# V1's ACTUAL width is the resolved policy's, in both postures
+# =============================================================================
+
+@pytest.mark.parametrize("configured,paid,expected", [
+    (None, False, 1),      # nothing set: the engine's own default, unchanged
+    (None, True, 1),
+    ("2", False, 2),       # tighter than reviewed, honoured
+    ("2", True, 2),
+    ("4", True, 4),        # exactly the reviewed value
+    ("8", False, 8),       # unpaid: the policy RECORDS the relaxation, so the
+                           # engine must really run at that width
+    ("8", True, 4),        # paid: the policy refuses it; the run never starts,
+                           # and a direct call never exceeds the reviewed value
+])
+def test_v1_parallelism_is_exactly_what_the_policy_resolved(configured, paid, expected):
+    """It used to clamp unconditionally to the reviewed 4.
+
+    That made the engine disagree with the policy in the unpaid posture: the
+    policy recorded a wider unpaid value (an unpaid run cannot spend, so
+    nothing was protected by narrowing it) while this function silently ran
+    the phase at a different width.
+    """
+    from backend.engines.vehicle_catalog_v1 import core
+
+    env = {}
+    if configured is not None:
+        env["MILO_V1_TECHNICAL_PARALLELISM"] = configured
+    if paid:
+        env["MILO_ENABLE_PAID_EXECUTION"] = "true"
+    assert core.technical_parallelism(env) == expected
+    assert core.technical_parallelism(env) == resolved_dimension(
+        "v1_technical_parallelism", env)
+
+
+def test_v1_keeps_its_own_structural_bound_above_the_policy():
+    """A local refusal stricter than the policy is always allowed."""
+    from backend.engines.vehicle_catalog_v1 import core
+
+    with pytest.raises(ValueError, match="between 1 and 32"):
+        core.technical_parallelism({"MILO_V1_TECHNICAL_PARALLELISM": "64"})
+    with pytest.raises(ValueError, match="must be an integer"):
+        core.technical_parallelism({"MILO_V1_TECHNICAL_PARALLELISM": "wide"})
+
+
+def test_reading_one_dimension_uses_the_same_rules_as_the_whole_policy():
+    """`resolved_dimension` must not be a second, softer resolver."""
+    env = {**REVIEWED_ENV, "MILO_MAX_AGENT_STEPS": "20"}
+    policy = resolve_runtime_policy(env)
+    for name in ("max_agent_steps", "v1_technical_parallelism", "v2_max_active_workers"):
+        assert resolved_dimension(name, env) == policy.values[name], name
+    # Non-raising even when the whole policy would be refused: refusing the
+    # run is the worker's job, and it has already done it by this point.
+    broken = {"MILO_ENABLE_PAID_EXECUTION": "true"}
+    with pytest.raises(RuntimePolicyError):
+        resolve_runtime_policy(broken)
+    assert resolved_dimension("v1_technical_parallelism", broken) == 1
+
+
+# =============================================================================
+# The execution increment has ONE authority
+# =============================================================================
+
+def test_the_execution_increment_is_the_policys_and_nothing_elses():
+    """Stage D used to compute `baseline + 1` in shell arithmetic."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    assert policy_envelope.authorized_execution_increment() == int(
+        POLICY["first_paid_run_execution_cap"]) == 1
+    collect = (STAGE_D / "06-collect-evidence.sh").read_text()
+    assert "STAGE_D_AUTHORIZED_EXECUTION_INCREMENT" in collect
+    assert "STAGE_D_EXPECTED_PRIOR_EXECUTIONS + 1" not in collect
+
+
+def test_the_first_run_profile_reports_the_same_execution_cap():
+    active = tier2_first_run_profile()["active_profile"]
+    assert active["first_paid_run_execution_cap"] == int(
+        POLICY["first_paid_run_execution_cap"])
+    assert active["max_simultaneous_provider_using_worker_executions"] == active[
+        "first_paid_run_execution_cap"]
+
+
+# =============================================================================
+# The reviewed policy is pinned as a literal, so a checkout cannot drift
+# =============================================================================
+
+def test_the_reviewed_policy_fingerprint_is_pinned_for_the_release():
+    import sys as _sys
+
+    _sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    assert policy_envelope.PINNED_POLICY_FINGERPRINT == POLICY.fingerprint(), (
+        "backend/runtime_policy.py changed without re-pinning "
+        "PINNED_POLICY_FINGERPRINT in scripts/release/stage-d/policy_envelope.py")

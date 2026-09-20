@@ -61,10 +61,15 @@ any disagreement.
 > * `MILO_SWARM_MAX_ACTIVE_WORKERS` — never pinned by this toolkit before,
 >   and its code default of `4` is wider than the reviewed width of `2`.
 >
-> The production Kimi organization is operator-confirmed Tier 2
-> (concurrency 100 / RPM 500 / TPM 3,000,000 / TPD unlimited) and the
-> envelope sits far below that ceiling. That Tier 2 confirmation
-> authorizes NO provider call and NO paid run.
+> The verified Kimi Tier 2 limits for this organization are
+> **inference concurrency 40 / RPM 100 / TPM 3,000,000 / TPD Unlimited**
+> (`backend/provider_quota.py :: KIMI_TIER2_PROVIDER_LIMITS`, verified
+> 2026-09-19). MILO's own organization ceiling is 80% of each finite value
+> — concurrency 32 / RPM 80 / TPM 2,400,000 — and the envelope applied above
+> sits at or below half of that. An earlier revision of this runbook quoted
+> "concurrency 100 / RPM 500", which is not what the account was verified at
+> and is what let a pinned RPM of 350 look reasonable. That Tier 2
+> verification authorizes NO provider call and NO paid run.
 
 ## 3.3 API service — run creation + launcher + caps (paid flag STAYS false)
 

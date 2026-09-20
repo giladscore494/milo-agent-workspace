@@ -49,6 +49,13 @@ STAGE_D = REPO / "scripts" / "release" / "stage-d"
 STAGE_C = REPO / "scripts" / "release" / "stage-c"
 
 RELEASE_SHA = "84cd8696119c24662a954d0f0e23195268dab23f"
+# The commit this checkout is actually at. verify_caps.py now REFUSES unless
+# the checkout is the accepted release, so an operator running Stage D has
+# STAGE_D_RELEASE_SHA == their HEAD. These tests reproduce that posture rather
+# than pretending a checkout can verify an envelope it did not generate.
+CHECKOUT_SHA = subprocess.run(
+    ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
+    capture_output=True, text=True, timeout=60).stdout.strip()
 REGISTRY = "us-central1-docker.pkg.dev/big-cabinet-457321-t7/milo-agent"
 STAGE_D_KEY = "stage-d-expansion-1-20260918-01"
 EXPECTED_PRIOR_RUNS = "7"
@@ -191,7 +198,8 @@ AUTHORIZED = {
 }
 
 EXTRA_DUMPED = ["STAGE_D_CAPS", "STAGE_D_WORKER_ENGINE_LIMITS",
-                "STAGE_D_POLICY_FINGERPRINT", "STAGE_D_REGISTRY", "STAGE_D_API_URL",
+                "STAGE_D_POLICY_FINGERPRINT", "STAGE_D_AUTHORIZED_EXECUTION_INCREMENT",
+                "STAGE_D_REGISTRY", "STAGE_D_API_URL",
                 "STAGE_D_PROJECT_SLUG", "STAGE_D_FORBIDDEN_PROJECT_IDS"]
 
 
@@ -494,7 +502,7 @@ def env_entries(pairs: str) -> list[dict]:
 
 
 def worker_spec(*, caps=CAPS, provider=PROVIDER_LIMITS, engine=ENGINE_LIMITS,
-                image=None, bind_key=True, extra=None):
+                image=None, bind_key=True, extra=None, release_sha=None):
     env = env_entries(caps) + env_entries(provider) + env_entries(engine) + [
         {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "true"},
         {"name": "MILO_ENABLE_CATALOG_EXECUTION", "value": "false"},
@@ -503,11 +511,11 @@ def worker_spec(*, caps=CAPS, provider=PROVIDER_LIMITS, engine=ENGINE_LIMITS,
         env.append({"name": "KIMI_API_KEY", "valueFrom": {"secretKeyRef": {"key": "latest", "name": "KIMI_API_KEY"}}})
     env.extend(extra or [])
     return {"spec": {"template": {"spec": {"template": {"spec": {"containers": [
-        {"image": image or f"{REGISTRY}/worker:{RELEASE_SHA}", "env": env}
+        {"image": image or f"{REGISTRY}/worker:{release_sha or CHECKOUT_SHA}", "env": env}
     ]}}}}}}
 
 
-def api_spec(*, caps=CAPS, image=None, extra=None):
+def api_spec(*, caps=CAPS, image=None, extra=None, release_sha=None):
     env = env_entries(caps) + [
         {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "false"},
         {"name": "MILO_ENABLE_RUN_CREATION", "value": "true"},
@@ -520,12 +528,12 @@ def api_spec(*, caps=CAPS, image=None, extra=None):
     ]
     env.extend(extra or [])
     return {"spec": {"template": {"spec": {"containers": [
-        {"image": image or f"{REGISTRY}/api:{RELEASE_SHA}", "env": env}
+        {"image": image or f"{REGISTRY}/api:{release_sha or CHECKOUT_SHA}", "env": env}
     ]}}}}
 
 
 def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_LIMITS,
-                    engine_limits=ENGINE_LIMITS, fingerprint=None):
+                    engine_limits=ENGINE_LIMITS, fingerprint=None, release_sha=None):
     worker_path = tmp_path / "worker.json"
     api_path = tmp_path / "api.json"
     worker_path.write_text(json.dumps(worker))
@@ -537,7 +545,8 @@ def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_L
         env={**os.environ, "STAGE_D_CAPS": caps, "STAGE_D_WORKER_PROVIDER_LIMITS": provider_limits,
              "STAGE_D_WORKER_ENGINE_LIMITS": engine_limits,
              "STAGE_D_POLICY_FINGERPRINT": fingerprint or POLICY_FINGERPRINT,
-             "STAGE_D_REGISTRY": REGISTRY, "STAGE_D_RELEASE_SHA": RELEASE_SHA,
+             "STAGE_D_REGISTRY": REGISTRY,
+             "STAGE_D_RELEASE_SHA": release_sha or CHECKOUT_SHA,
              "STAGE_D_API_IMAGE_DIGEST": API_DIGEST, "STAGE_D_WORKER_IMAGE_DIGEST": WORKER_DIGEST},
         timeout=60,
     )
@@ -546,7 +555,8 @@ def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_L
 def test_verify_caps_passes_on_the_exact_authorized_posture(tmp_path):
     result = run_verify_caps(tmp_path, worker_spec(), api_spec())
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"release {RELEASE_SHA[:12]}" in result.stdout
+    assert f"release {CHECKOUT_SHA[:12]}" in result.stdout
+    assert "bound to the accepted release" in result.stdout
 
 
 @pytest.mark.parametrize("surface,bad", [
@@ -554,7 +564,7 @@ def test_verify_caps_passes_on_the_exact_authorized_posture(tmp_path):
     ("worker", {"image": f"{REGISTRY}/worker:latest"}),
     ("worker", {"image": f"{REGISTRY}/worker@{STALE_WORKER_DIGEST}"}),
     ("api", {"image": f"{REGISTRY}/api:88224bccc836f80f3dc1d173306a1aa63cddcc7a"}),
-    ("api", {"image": "us-central1-docker.pkg.dev/attacker/evil/api:" + RELEASE_SHA}),
+    ("api", {"image": "us-central1-docker.pkg.dev/attacker/evil/api:" + CHECKOUT_SHA}),
     ("api", {"image": f"{REGISTRY}/api@sha256:" + "0" * 64}),
 ])
 def test_verify_caps_refuses_a_wrong_release_image(tmp_path, surface, bad):
@@ -584,7 +594,7 @@ def test_verify_caps_fails_closed_without_the_accepted_digests(tmp_path):
         env={**os.environ, "STAGE_D_CAPS": CAPS, "STAGE_D_WORKER_PROVIDER_LIMITS": PROVIDER_LIMITS,
              "STAGE_D_WORKER_ENGINE_LIMITS": ENGINE_LIMITS,
              "STAGE_D_POLICY_FINGERPRINT": POLICY_FINGERPRINT,
-             "STAGE_D_REGISTRY": REGISTRY, "STAGE_D_RELEASE_SHA": RELEASE_SHA,
+             "STAGE_D_REGISTRY": REGISTRY, "STAGE_D_RELEASE_SHA": CHECKOUT_SHA,
              "STAGE_D_API_IMAGE_DIGEST": "", "STAGE_D_WORKER_IMAGE_DIGEST": ""},
         timeout=60,
     )
@@ -675,6 +685,126 @@ def test_verify_caps_requires_the_worker_secret_binding(tmp_path):
     assert "provider key is not bound" in result.stdout
 
 
+# --- the release binding: the policy Stage D verifies must BE the release ---
+
+def test_verify_caps_refuses_a_checkout_that_is_not_the_accepted_release(tmp_path):
+    """CHECKOUT-POLICY DRIFT — the whole reason the binding exists.
+
+    Generating the envelope from the local checkout and verifying against the
+    same local checkout only ever proves the checkout agrees with itself. The
+    run executes separately pinned release IMAGES, which may carry a different
+    policy entirely, so Stage D refuses unless the checkout IS the release.
+    """
+    result = run_verify_caps(tmp_path, worker_spec(release_sha=RELEASE_SHA),
+                             api_spec(release_sha=RELEASE_SHA), release_sha=RELEASE_SHA)
+    assert result.returncode != 0
+    assert "is not the policy the accepted images enforce" in result.stdout
+
+
+@pytest.mark.parametrize("bad_sha", ["", "not-a-sha", "84cd8696", "z" * 40])
+def test_verify_caps_refuses_an_unprovable_release_sha(tmp_path, bad_sha):
+    result = run_verify_caps(tmp_path, worker_spec(), api_spec(), release_sha=bad_sha)
+    assert result.returncode != 0
+
+
+def test_the_pinned_policy_fingerprint_is_the_checkouts_policy():
+    """The literal reviewed pin, kept honest by CI rather than by a run.
+
+    Editing a reviewed value without re-pinning would otherwise be discovered
+    by a production gate. It is discovered here instead.
+    """
+    sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    assert policy_envelope.PINNED_POLICY_FINGERPRINT == POLICY.fingerprint()
+    assert policy_envelope.fingerprint_problems() == []
+
+
+def test_a_drifted_checkout_policy_cannot_even_print_an_envelope(monkeypatch):
+    """Every selector refuses, so a drifted checkout produces no pins at all."""
+    sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    monkeypatch.setattr(policy_envelope, "PINNED_POLICY_FINGERPRINT", "0" * 64)
+    assert policy_envelope.fingerprint_problems()
+    for selector in ("caps", "provider-limits", "engine-limits", "fingerprint",
+                     "execution-increment", "document", "binding"):
+        assert policy_envelope.main(["policy_envelope.py", selector]) != 0, selector
+
+
+def test_the_binding_refuses_when_it_cannot_read_the_checkout(monkeypatch):
+    """Cannot prove is a refusal, never a pass: no git, no Stage D."""
+    sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    monkeypatch.setattr(policy_envelope, "_git", lambda *a: None)
+    problems = policy_envelope.release_binding_problems(CHECKOUT_SHA)
+    assert any("could not be read" in problem for problem in problems)
+
+
+def test_the_binding_refuses_a_modified_policy_source(monkeypatch):
+    sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    def fake_git(*args):
+        if args[0] == "status":
+            return " M backend/runtime_policy.py"
+        return CHECKOUT_SHA
+
+    monkeypatch.setattr(policy_envelope, "_git", fake_git)
+    problems = policy_envelope.release_binding_problems(CHECKOUT_SHA)
+    assert any("modified in this working tree" in problem for problem in problems)
+
+
+def test_the_binding_accepts_this_checkout_at_its_own_head():
+    """A committed checkout verifying against its own HEAD is the accept path.
+
+    This fails on a working tree with uncommitted changes to
+    `backend/runtime_policy.py`, and that is the point: an envelope may only
+    be generated from committed, reviewed code. Commit the policy change and
+    it passes; CI always runs against a clean checkout.
+    """
+    sys.path.insert(0, str(STAGE_D))
+    import policy_envelope
+
+    assert policy_envelope.release_binding_problems(CHECKOUT_SHA) == []
+
+
+def test_the_step_scripts_gate_on_the_binding_before_creating_a_run():
+    for name in ("03b-verify-stage-d-posture.sh", "05-execute-run.sh"):
+        text = (STAGE_D / name).read_text()
+        assert "python3 ./policy_envelope.py binding" in text, name
+        assert (text.index("python3 ./policy_envelope.py binding")
+                < text.index("python3 ./verify_caps.py")), name
+
+
+# --- the execution increment has ONE authority -----------------------------
+
+def test_the_authorized_execution_increment_comes_from_the_runtime_policy():
+    result = source_stage_d_env()
+    assert result.returncode == 0, result.stderr
+    line = next(r for r in result.stdout.splitlines()
+                if r.startswith("STAGE_D_AUTHORIZED_EXECUTION_INCREMENT="))
+    assert line.split("=", 1)[1] == str(int(POLICY["first_paid_run_execution_cap"]))
+
+
+def test_the_execution_gate_refuses_an_increment_the_policy_did_not_authorize():
+    """A widened shell expression is caught by the verifier, not accepted."""
+    listing = [terminal(n) for n in LIVE_EXECUTION_NAMES]
+    listing += [terminal("milo-agent-worker-a"), terminal("milo-agent-worker-b")]
+    result = run_verify_executions(listing, 9, baseline=7)
+    assert result.returncode != 0
+    verdict = json.loads(result.stdout)
+    assert verdict["implied_increment"] == 2 and verdict["authorized_increment"] == 1
+
+
+def test_the_execution_gate_accepts_exactly_the_authorized_increment():
+    listing = [terminal(n) for n in LIVE_EXECUTION_NAMES] + [terminal("milo-agent-worker-staged1")]
+    result = run_verify_executions(listing, 8, baseline=7)
+    assert result.returncode == 0, result.stdout
+    assert json.loads(result.stdout)["authorized_increment"] == 1
+
+
 def test_verify_caps_tolerates_unrelated_live_worker_variables(tmp_path):
     """Model selection is not part of the envelope, so it is not verified."""
     extra = [
@@ -724,12 +854,13 @@ def terminal(name, ok=True):
                        "conditions": [{"type": "Completed", "status": "True" if ok else "False"}]}}
 
 
-def run_verify_executions(listing, expected_total):
+def run_verify_executions(listing, expected_total, baseline=None):
     payload = listing if isinstance(listing, str) else json.dumps(listing)
-    return subprocess.run(
-        [sys.executable, str(STAGE_D / "verify_executions.py"), "--expected-total", str(expected_total)],
-        input=payload, capture_output=True, text=True, timeout=60,
-    )
+    command = [sys.executable, str(STAGE_D / "verify_executions.py"),
+               "--expected-total", str(expected_total)]
+    if baseline is not None:
+        command += ["--baseline", str(baseline)]
+    return subprocess.run(command, input=payload, capture_output=True, text=True, timeout=60)
 
 
 def test_exactly_seven_visible_terminal_executions_pass_the_pre_run_gate():
@@ -2025,7 +2156,12 @@ def test_collect_evidence_is_a_gate_not_a_checklist():
     code_lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
     assert not any("--wait" in line for line in code_lines)
     assert "probe_ok" in text and "execution_state.py" in text
-    assert "expected_total_executions=$((STAGE_D_EXPECTED_PRIOR_EXECUTIONS + 1))" in text
+    # The increment is the canonical policy's, not a literal in the shell.
+    assert ("expected_total_executions=$((STAGE_D_EXPECTED_PRIOR_EXECUTIONS "
+            "+ STAGE_D_AUTHORIZED_EXECUTION_INCREMENT))") in text
+    assert "STAGE_D_EXPECTED_PRIOR_EXECUTIONS + 1" not in text, (
+        "a literal execution increment is back in the shell")
+    assert '--baseline "${STAGE_D_EXPECTED_PRIOR_EXECUTIONS}"' in text
     assert "is the prepared Government capture run" in text
 
 

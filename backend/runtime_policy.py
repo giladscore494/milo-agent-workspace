@@ -112,11 +112,21 @@ from typing import Any, Iterable, Mapping
 # so a flag cannot mean one thing to the validator and another to the worker.
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
-#: Engine/workflow keys a policy can be resolved for. ``"*"`` means the
-#: dimension binds whichever engine executes the run.
-ENGINE_V1 = "vehicle_catalog_v1"
-ENGINE_V2 = "swarm_v2"
-ALL_ENGINES = (ENGINE_V1, ENGINE_V2)
+#: THE SCOPE OF THIS POLICY IS THE DEPLOYMENT, NOT THE RUN'S ENGINE.
+#:
+#: One worker image serves both engines and the environment is per-deployment,
+#: so a Cloud Run job carrying a Swarm V2 width wider than the reviewed one is
+#: misconfigured even while it happens to be executing a V1 run: the next run
+#: on the same job may be V2. Validating only "this run's engine" would make
+#: the refusal depend on which run happened to arrive first, which is not a
+#: safety property anybody can reason about.
+#:
+#: So EVERY dimension is resolved and validated for EVERY deployment, the
+#: mandatory-for-paid set is engine-independent, and no dimension carries
+#: engine-scope metadata. What a dimension binds is stated by the surface that
+#: enforces it (``enforced_by``) and by its own name
+#: (``v1_technical_parallelism`` / ``v2_max_active_workers``).
+POLICY_SCOPE = "deployment"
 
 # --- which way "tighter" runs ------------------------------------------------
 LOWER_IS_TIGHTER = "lower_is_tighter"
@@ -179,7 +189,6 @@ class PolicyDimension:
     env_key: str | None
     runtime_default: int | float | None
     enforced_by: str
-    applies_to: tuple[str, ...]
     why: str
 
     @property
@@ -223,11 +232,10 @@ class PolicyDimension:
 def _d(name: str, reviewed: int | float, *, kind: type = int,
        direction: str = LOWER_IS_TIGHTER, fmt: str = FMT_INT,
        env_key: str | None = None, runtime_default: int | float | None = None,
-       enforced_by: str, applies_to: tuple[str, ...] = ALL_ENGINES,
-       why: str) -> PolicyDimension:
+       enforced_by: str, why: str) -> PolicyDimension:
     return PolicyDimension(name=name, reviewed=reviewed, kind=kind, direction=direction,
                            fmt=fmt, env_key=env_key, runtime_default=runtime_default,
-                           enforced_by=enforced_by, applies_to=applies_to, why=why)
+                           enforced_by=enforced_by, why=why)
 
 
 # =============================================================================
@@ -294,28 +302,19 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
 
     # --- plan shape, enforced by the deterministic PlanValidator ------------
     _d("max_tasks", 23, env_key="MILO_MAX_TASKS_PER_RUN", runtime_default=64,
-       enforced_by=PLAN, applies_to=(ENGINE_V2,),
-       why="the largest plan the 56-agent-step envelope can finish under the "
+       enforced_by=PLAN, why="the largest plan the 56-agent-step envelope can finish under the "
            "worst case; the firewall used to admit 64 into it"),
     _d("max_tool_calls", 24, env_key="MILO_MAX_TOOL_CALLS_PER_RUN", runtime_default=100,
-       enforced_by=PLAN, applies_to=(ENGINE_V2,),
-       why="the aggregate planned-call ceiling for the run; the firewall used "
+       enforced_by=PLAN, why="the aggregate planned-call ceiling for the run; the firewall used "
            "to admit 100 into a profile that advertised 24"),
     _d("max_replans", 1, env_key="MILO_MAX_REPLANS_PER_RUN", runtime_default=3,
-       enforced_by=PLAN, applies_to=(ENGINE_V2,),
-       why="one bounded replan, which the correction round also consumes; the "
+       enforced_by=PLAN, why="one bounded replan, which the correction round also consumes; the "
            "firewall used to admit 3 into a profile that advertised 1"),
-    _d("max_tool_calls_per_task", 4, runtime_default=4, enforced_by=PLAN,
-       applies_to=(ENGINE_V2,),
-       why="a low fixed per-task ceiling charged against the EXACT planned "
+    _d("max_tool_calls_per_task", 4, runtime_default=4, enforced_by=PLAN, why="a low fixed per-task ceiling charged against the EXACT planned "
            "call list, independent of the aggregate ceiling"),
-    _d("max_graph_depth", 12, runtime_default=12, enforced_by=PLAN,
-       applies_to=(ENGINE_V2,), why="bounds dependency chaining"),
-    _d("max_recursion_depth", 4, runtime_default=4, enforced_by=PLAN,
-       applies_to=(ENGINE_V2,), why="bounds task self-similarity"),
-    _d("max_cost_units", 100_000, runtime_default=100_000, enforced_by=PLAN,
-       applies_to=(ENGINE_V2,),
-       why="the plan's own declared cost units; not model-call slots"),
+    _d("max_graph_depth", 12, runtime_default=12, enforced_by=PLAN, why="bounds dependency chaining"),
+    _d("max_recursion_depth", 4, runtime_default=4, enforced_by=PLAN, why="bounds task self-similarity"),
+    _d("max_cost_units", 100_000, runtime_default=100_000, enforced_by=PLAN, why="the plan's own declared cost units; not model-call slots"),
 
     # --- provider admission, enforced by ProviderLimitsConfig/the coordinator
     _d("provider_max_concurrency", 2, env_key="MILO_PROVIDER_MAX_CONCURRENCY",
@@ -356,12 +355,12 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
 
     # --- engine parallelism -------------------------------------------------
     _d("v1_technical_parallelism", 4, env_key="MILO_V1_TECHNICAL_PARALLELISM",
-       runtime_default=1, enforced_by=ENGINE_PARALLELISM, applies_to=(ENGINE_V1,),
+       runtime_default=1, enforced_by=ENGINE_PARALLELISM,
        why="4 brings the technical phase that cost run 3772fc84 its completion "
            "from ~1621s to ~405s; it is not 32 because provider latency, not "
            "MILO's ceiling, is what the run waits on"),
     _d("v2_max_active_workers", 2, env_key="MILO_SWARM_MAX_ACTIVE_WORKERS",
-       runtime_default=4, enforced_by=ENGINE_PARALLELISM, applies_to=(ENGINE_V2,),
+       runtime_default=4, enforced_by=ENGINE_PARALLELISM,
        why="a queueing width, clamped to real provider capacity anyway; more "
            "logical workers than provider slots only burn run duration"),
 
@@ -463,7 +462,6 @@ def _parse(dimension: PolicyDimension, raw: str) -> int | float:
 class RuntimePolicy:
     """The resolved, enforceable envelope of a run. Immutable and serializable."""
 
-    engine: str
     paid: bool
     values: Mapping[str, int | float | None]
     #: dimension -> "deployment" | "runtime_default" | "unbounded" |
@@ -616,7 +614,7 @@ class RuntimePolicy:
         """
         return {
             "schema_version": POLICY_SCHEMA_VERSION,
-            "engine": self.engine,
+            "scope": POLICY_SCOPE,
             "paid": self.paid,
             "reviewed_catalog_posture": dict(sorted(self.reviewed_catalog_posture.items())),
             "dimensions": {
@@ -628,8 +626,7 @@ class RuntimePolicy:
                     "direction": d.direction,
                     "mandatory_for_paid": d.mandatory_for_paid,
                     "enforced_by": d.enforced_by,
-                    "applies_to": list(d.applies_to),
-                }
+                        }
                 for d in POLICY_DIMENSIONS
             },
             "tightened_by_deployment": list(self.tightened),
@@ -663,6 +660,22 @@ PROVIDER_ENV_PREFIXES = ("MILO_PROVIDER_",)
 ENGINE_ENV_PREFIXES = ("MILO_SWARM_MAX_", "MILO_V1_")
 
 
+def resolved_dimension(name: str, env: Mapping[str, str] | None = None, *,
+                       paid: bool | None = None) -> int | float | None:
+    """The value the runtime must USE for one dimension, by the whole policy's
+    rules.
+
+    Non-raising on purpose. An engine asking "how wide may I run this phase?"
+    must get the policy's answer, not an exception about some unrelated
+    dimension: refusing an incomplete or wider-than-reviewed policy is the
+    worker's job, and it has already done it before any engine is built. This
+    goes through the SAME `_resolve` as the whole policy, so an engine reading
+    one dimension and a deployment validating all of them can never be
+    applying different rules.
+    """
+    return _resolve(env, paid=paid)[0].values[name]
+
+
 def policy_failure_code(error: "RuntimePolicyError") -> str:
     """The operator-facing code for a refused policy, named by SURFACE.
 
@@ -684,16 +697,16 @@ def policy_failure_code(error: "RuntimePolicyError") -> str:
 
 
 def policy_violations(env: Mapping[str, str] | None = None, *,
-                      engine: str = "*", paid: bool | None = None) -> list[PolicyViolation]:
+                      paid: bool | None = None) -> list[PolicyViolation]:
     """Every reason this environment is not a legal runtime policy.
 
     Non-raising, so configuration validation can report all of them at once.
     """
-    return _resolve(env, engine=engine, paid=paid)[1]
+    return _resolve(env, paid=paid)[1]
 
 
 def resolve_runtime_policy(env: Mapping[str, str] | None = None, *,
-                           engine: str = "*", paid: bool | None = None) -> RuntimePolicy:
+                           paid: bool | None = None) -> RuntimePolicy:
     """The canonical policy for this deployment, or a refusal.
 
     Fails closed: an absent mandatory dimension, an unparseable or
@@ -701,14 +714,14 @@ def resolve_runtime_policy(env: Mapping[str, str] | None = None, *,
     cross-dimension invariant or a contradictory catalog posture all refuse in
     the paid posture rather than resolving to something plausible.
     """
-    policy, violations = _resolve(env, engine=engine, paid=paid)
+    policy, violations = _resolve(env, paid=paid)
     if violations:
         raise RuntimePolicyError(violations)
     return policy
 
 
 def _resolve(env: Mapping[str, str] | None,
-             *, engine: str, paid: bool | None) -> tuple[RuntimePolicy, list[PolicyViolation]]:
+             *, paid: bool | None) -> tuple[RuntimePolicy, list[PolicyViolation]]:
     source = dict(os.environ if env is None else env)
     is_paid = paid_posture(source) if paid is None else bool(paid)
     violations: list[PolicyViolation] = []
@@ -785,7 +798,7 @@ def _resolve(env: Mapping[str, str] | None,
         violations.extend(_invariant_violations(values))
         violations.extend(reviewed_policy_violations())
 
-    policy = RuntimePolicy(engine=engine, paid=is_paid, values=values, sources=sources,
+    policy = RuntimePolicy(paid=is_paid, values=values, sources=sources,
                            reviewed_catalog_posture=dict(REVIEWED_CATALOG_POSTURE),
                            tightened=tuple(sorted(tightened)),
                            relaxed=tuple(sorted(relaxed)))
@@ -879,7 +892,7 @@ def reviewed_policy_violations() -> list[PolicyViolation]:
     return out
 
 
-def reviewed_first_run_policy(engine: str = "*") -> RuntimePolicy:
+def reviewed_first_run_policy() -> RuntimePolicy:
     """The reviewed envelope itself: every dimension at its authorized value.
 
     This is the document `backend.tier2_profile` publishes and the envelope
@@ -888,14 +901,14 @@ def reviewed_first_run_policy(engine: str = "*") -> RuntimePolicy:
     """
     values = {d.name: d.reviewed for d in POLICY_DIMENSIONS}
     return RuntimePolicy(
-        engine=engine, paid=True, values=values,
+        paid=True, values=values,
         sources={d.name: "reviewed" for d in POLICY_DIMENSIONS},
         reviewed_catalog_posture=dict(REVIEWED_CATALOG_POSTURE), tightened=(), relaxed=())
 
 
 __all__ = [
-    "ALL_ENGINES", "BUDGET", "CAP_ENV_PREFIXES", "DIMENSIONS", "ENGINE_ENV_PREFIXES",
-    "ENGINE_PARALLELISM", "ENGINE_V1", "ENGINE_V2", "HIGHER_IS_TIGHTER",
+    "BUDGET", "CAP_ENV_PREFIXES", "DIMENSIONS", "ENGINE_ENV_PREFIXES",
+    "ENGINE_PARALLELISM", "HIGHER_IS_TIGHTER", "POLICY_SCOPE",
     "DECLARED_NOT_BOUNDED", "LOWER_IS_TIGHTER", "MANDATORY_FOR_PAID_EXECUTION",
     "PLAN", "POLICY_DIMENSIONS",
     "POLICY_ENV_KEYS", "POLICY_SCHEMA_VERSION", "PROVIDER", "PROVIDER_ENV_PREFIXES",
@@ -903,6 +916,6 @@ __all__ = [
     "RuntimePolicyError", "SEARCH", "TRUE_VALUES", "WORKER_JOB_TIMEOUT_SECONDS",
     "catalog_posture_violations", "dimensions_for", "paid_posture",
     "REVIEWED_CATALOG_POSTURE", "policy_failure_code", "policy_violations",
-    "resolve_runtime_policy",
+    "resolve_runtime_policy", "resolved_dimension",
     "reviewed_first_run_policy", "reviewed_policy_violations",
 ]
