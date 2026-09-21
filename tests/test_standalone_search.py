@@ -353,6 +353,44 @@ def test_a_transport_with_no_credential_is_not_available():
     assert MoonshotStandaloneSearch(api_key="").available() is False
 
 
+def test_the_transport_builds_one_http_client_and_reuses_it(monkeypatch):
+    """A fresh connection pool per search is a socket leak, not isolation."""
+    import backend.budget as budget
+
+    built = []
+
+    class FakeHttp:
+        def post(self, url, *, headers, json):
+            return SimpleNamespace(status_code=200, json=lambda: {"results": []})
+
+    def build(deadline=None):
+        built.append(deadline)
+        return FakeHttp()
+
+    monkeypatch.setattr(budget, "build_provider_http_client", build)
+    transport = MoonshotStandaloneSearch(api_key="k", base_url="https://api.test/v1")
+    for _ in range(3):
+        transport("q", endpoint="search")
+    assert len(built) == 1, f"a client was rebuilt per search: {len(built)}"
+
+
+def test_an_unknown_endpoint_is_refused_by_the_transport():
+    transport = MoonshotStandaloneSearch(api_key="k")
+    with pytest.raises(SearchTransportError):
+        transport("q", endpoint="not_an_endpoint")
+
+
+def test_an_http_error_from_the_search_endpoint_is_a_transport_failure():
+    class Failing:
+        def post(self, url, *, headers, json):
+            return SimpleNamespace(status_code=503, json=lambda: {})
+
+    transport = MoonshotStandaloneSearch(api_key="k", base_url="https://api.test/v1",
+                                         http_client=Failing())
+    with pytest.raises(SearchTransportError):
+        transport("q", endpoint="search")
+
+
 # =============================================================================
 # 3. ADMITTED BEFORE IT EXECUTES
 # =============================================================================

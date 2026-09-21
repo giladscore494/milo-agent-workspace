@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
@@ -353,6 +354,8 @@ class MoonshotStandaloneSearch:
         self._base_url = base_url
         self._deadline_seconds = deadline_seconds
         self._http_client = http_client
+        self._built_client: Any = None
+        self._client_lock = threading.Lock()
 
     def available(self) -> bool:
         """Can this transport actually perform a search RIGHT NOW?
@@ -367,11 +370,22 @@ class MoonshotStandaloneSearch:
         return bool(search_api_key())
 
     def _client(self) -> Any:
+        """ONE http client for this transport, built once.
+
+        Cached rather than rebuilt per search: a fresh client per invocation
+        means a fresh connection pool per invocation, and the sockets of a
+        pool nobody closes are exactly the leak the deadline transport exists
+        to avoid on the chat path.
+        """
         if self._http_client is not None:
             return self._http_client
-        from backend.budget import build_provider_http_client
+        with self._client_lock:
+            if self._built_client is None:
+                from backend.budget import build_provider_http_client
 
-        return build_provider_http_client(self._deadline_seconds)
+                self._built_client = build_provider_http_client(
+                    self._deadline_seconds)
+            return self._built_client
 
     def __call__(self, query: str, *, endpoint: str) -> tuple[SearchResult, ...]:
         path = SEARCH_ENDPOINT_PATHS.get(endpoint)
