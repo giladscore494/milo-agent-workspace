@@ -130,6 +130,11 @@ def build_export_envelope(run: Mapping[str, Any], *,
     engine = identity.workflow_key
     if engine not in PRODUCT_WORKFLOW_KEYS:
         raise ExportRefused("run identity is not an exportable product workflow")
+    if not identity.release_sha:
+        # An authoritative export must state which immutable release admitted
+        # the run. Historical/unpinned identities remain readable as history
+        # but are not exportable as release-bound product documents.
+        raise ExportRefused("run identity is not bound to an immutable release")
     output = run.get("output")
 
     result_kind: str | None = None
