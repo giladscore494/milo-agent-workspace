@@ -265,6 +265,18 @@ class SupabaseRepository:
                 raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429) from exc
             if "CONVERSATION_NOT_FOUND" in message:
                 raise NotFoundError("conversation", str(conversation_id)) from exc
+            if "IDEMPOTENCY_CONFLICT" in message:
+                raise AppError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "idempotency key was already used with a different payload",
+                    409,
+                ) from exc
+            if "IDEMPOTENCY_FINGERPRINT_REQUIRED" in message:
+                raise AppError(
+                    "IDEMPOTENCY_FINGERPRINT_REQUIRED",
+                    "run creation requires a request fingerprint",
+                    409,
+                ) from exc
             if "RUN_IDENTITY_WORKFLOW_DRIFT" in message:
                 raise AppError("RUN_IDENTITY_WORKFLOW_DRIFT",
                                "project workflow changed before the run could be created", 409) from exc
