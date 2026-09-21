@@ -515,6 +515,11 @@ def worker_spec(*, caps=CAPS, provider=PROVIDER_LIMITS, engine=ENGINE_LIMITS,
     env = env_entries(caps) + env_entries(provider) + env_entries(engine) + [
         {"name": "MILO_ENABLE_PAID_EXECUTION", "value": "true"},
         {"name": "MILO_ENABLE_CATALOG_EXECUTION", "value": "false"},
+        # The release this deployment STATES it is serving. It is what
+        # `backend/run_identity.py` binds onto every run the deployment
+        # creates, so an absent value would make every run record no release
+        # and the evidence gate would refuse the run as unbindable.
+        {"name": "MILO_RELEASE_SHA", "value": release_sha or CHECKOUT_SHA},
     ]
     if bind_key:
         env.append({"name": "KIMI_API_KEY", "valueFrom": {"secretKeyRef": {"key": "latest", "name": "KIMI_API_KEY"}}})
@@ -534,6 +539,7 @@ def api_spec(*, caps=CAPS, image=None, extra=None, release_sha=None):
         {"name": "MILO_ENABLE_RUN_CANCELLATION", "value": "false"},
         {"name": "MILO_ENABLE_EXECUTION_CONTROL", "value": "false"},
         {"name": "MILO_ENABLE_CATALOG_EXECUTION", "value": "false"},
+        {"name": "MILO_RELEASE_SHA", "value": release_sha or CHECKOUT_SHA},
     ]
     env.extend(extra or [])
     return {"spec": {"template": {"spec": {"containers": [
@@ -563,6 +569,29 @@ def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_L
              "STAGE_D_API_IMAGE_DIGEST": API_DIGEST, "STAGE_D_WORKER_IMAGE_DIGEST": WORKER_DIGEST},
         timeout=60,
     )
+
+
+def test_verify_caps_refuses_a_deployment_that_states_no_release(tmp_path):
+    """The run identity is the last link of the release chain, and it is bound
+    from `MILO_RELEASE_SHA`. A deployment that states none would create runs
+    recording no release, and an unpinned run cannot be bound to the accepted
+    release -- so it is refused BEFORE the run is created rather than after it
+    has been paid for."""
+    for surface, worker, api in (
+        ("worker", worker_spec(extra=[{"name": "MILO_RELEASE_SHA", "value": ""}]), api_spec()),
+        ("api", worker_spec(), api_spec(extra=[{"name": "MILO_RELEASE_SHA", "value": ""}])),
+    ):
+        result = run_verify_caps(tmp_path, worker, api)
+        assert result.returncode == 1, surface
+        assert f"{surface}: MILO_RELEASE_SHA is MISSING" in result.stdout, surface
+
+
+def test_verify_caps_refuses_a_deployment_pinned_to_another_release(tmp_path):
+    other = "b" * 40
+    result = run_verify_caps(
+        tmp_path, worker_spec(extra=[{"name": "MILO_RELEASE_SHA", "value": other}]), api_spec())
+    assert result.returncode == 1
+    assert "is not the accepted release" in result.stdout
 
 
 def test_verify_caps_passes_on_the_exact_authorized_posture(tmp_path):
@@ -1196,9 +1225,12 @@ def wire_db(db, monkeypatch, *, capture_row=PREPARED_CAPTURE_ROW, counts=None, o
         if path == "/rest/v1/":
             if not openapi:
                 return 503, None
+            # A DEPLOYED signature advertises its defaulted parameters too,
+            # so the exact-checked RPC advertises its exact pin.
             paths = {
                 f"/rpc/{rpc}": {"post": {"parameters": [
-                    {"in": "body", "schema": {"properties": {a: {} for a in args}}}
+                    {"in": "body", "schema": {"properties": {
+                        a: {} for a in (db.EXACT_RPC_SIGNATURES.get(rpc) or args)}}}
                 ]}}
                 for rpc, args in db.REQUIRED_RPC_ARGS.items()
             }
@@ -3900,14 +3932,22 @@ def test_probe_verdict_fails_closed_on_a_missing_record(tmp_path):
 #: The live signature, verified read-only against production 2026-09-19:
 #: SECURITY DEFINER, service_role may execute, anon/authenticated may not.
 SETTLE_RPC = "settle_model_call_budget"
+#: EVERY parameter of the deployed function. This is what the EXACT check
+#: compares against, because an extra deployed parameter is a different
+#: function and the cleanup calls this one with exactly these four keys.
 SETTLE_RPC_ARGS = {"p_reservation_id", "p_actual_cost", "p_status", "p_rejection_reason"}
+#: The subset a caller MUST supply: `p_status` and `p_rejection_reason` carry
+#: defaults. The two sets answer different questions and the inventory now
+#: derives both from the migration rather than conflating them.
+SETTLE_RPC_REQUIRED_ARGS = {"p_reservation_id", "p_actual_cost"}
 
 
 def test_preflight_requires_the_cleanup_rpc_terminalize_calls(db):
     """terminalize() releases reservations through it, so a missing or
     mismatched signature must block BEFORE any production enable."""
     assert SETTLE_RPC in db.REQUIRED_RPC_ARGS
-    assert db.REQUIRED_RPC_ARGS[SETTLE_RPC] == SETTLE_RPC_ARGS
+    assert set(db.REQUIRED_RPC_ARGS[SETTLE_RPC]) == SETTLE_RPC_REQUIRED_ARGS
+    assert set(db.EXACT_RPC_SIGNATURES[SETTLE_RPC]) == SETTLE_RPC_ARGS
     # And the probe really does call it.
     assert f"/rest/v1/rpc/{SETTLE_RPC}" in (STAGE_D / "probe_db.py").read_text()
 
@@ -3919,7 +3959,8 @@ def test_preflight_refuses_when_the_cleanup_rpc_is_absent(db, monkeypatch, capsy
     def fake_call(method, path, body=None, headers=None):
         if path == "/rest/v1/":
             paths = {f"/rpc/{rpc}": {"post": {"parameters": [
-                {"in": "body", "schema": {"properties": {a: {} for a in args}}}]}}
+                {"in": "body", "schema": {"properties": {
+                    a: {} for a in (db.EXACT_RPC_SIGNATURES.get(rpc) or args)}}}]}}
                 for rpc, args in original.items() if rpc != SETTLE_RPC}
             return 200, {"paths": paths}
         if path.startswith(f"/rest/v1/runs?id=eq.{GOV_RUN_ID}"):
@@ -3943,7 +3984,8 @@ def test_preflight_refuses_a_mismatched_cleanup_rpc_signature(db, monkeypatch, c
         if path == "/rest/v1/":
             paths = {}
             for rpc, args in original.items():
-                advertised = set(args) - ({dropped} if rpc == SETTLE_RPC else set())
+                deployed = set(db.EXACT_RPC_SIGNATURES.get(rpc) or args)
+                advertised = deployed - ({dropped} if rpc == SETTLE_RPC else set())
                 paths[f"/rpc/{rpc}"] = {"post": {"parameters": [
                     {"in": "body", "schema": {"properties": {a: {} for a in advertised}}}]}}
             return 200, {"paths": paths}
@@ -4031,7 +4073,11 @@ def rpc_surface(db, overrides=None):
     argument-set overrides."""
     paths = {}
     for rpc, args in db.REQUIRED_RPC_ARGS.items():
-        advertised = (overrides or {}).get(rpc, set(args))
+        # A DEPLOYED signature advertises its defaulted parameters too, so the
+        # default advertisement for an exact-checked RPC is its exact pin, not
+        # the subset a caller is required to supply.
+        deployed = set(db.EXACT_RPC_SIGNATURES.get(rpc) or args)
+        advertised = (overrides or {}).get(rpc, deployed)
         paths[f"/rpc/{rpc}"] = {"post": {"parameters": [
             {"in": "body", "schema": {"properties": {a: {} for a in advertised}}}]}}
     return {"paths": paths}
@@ -4056,7 +4102,7 @@ def rpc_surface_checks(db, monkeypatch, overrides=None):
 
 def test_the_cleanup_rpc_is_held_to_an_exact_signature(db):
     assert SETTLE_RPC in db.EXACT_RPC_SIGNATURES
-    assert db.REQUIRED_RPC_ARGS[SETTLE_RPC] == SETTLE_RPC_ARGS
+    assert set(db.EXACT_RPC_SIGNATURES[SETTLE_RPC]) == SETTLE_RPC_ARGS
 
 
 def test_the_exact_four_argument_cleanup_signature_passes(db, monkeypatch):
@@ -4109,6 +4155,7 @@ def test_the_other_rpcs_keep_tolerant_subset_semantics(db, monkeypatch):
     calls itself must not fail the preflight — but a missing one still must."""
     others = [rpc for rpc in db.REQUIRED_RPC_ARGS if rpc not in db.EXACT_RPC_SIGNATURES]
     assert others, "the exact-signature rule is scoped to the cleanup RPC, not universal"
+    assert len(others) > 40, "the required RPC surface is far smaller than current main's"
     widened = {rpc: set(db.REQUIRED_RPC_ARGS[rpc]) | {"p_new_optional"} for rpc in others}
     checks, problems = rpc_surface_checks(db, monkeypatch, widened)
     assert problems == []
