@@ -30,6 +30,7 @@
  *    down.
  */
 
+import { EVENT_REGISTRY_VERSION } from './eventVocabulary';
 import { SWARM_V2_WORKFLOW_KEY, VEHICLE_CATALOG_V1_WORKFLOW_KEY } from './swarmTypes';
 import { Run } from './types';
 
@@ -48,10 +49,15 @@ const RENDERABLE_WORKFLOW_KEYS: ReadonlySet<string> = new Set([
 export function runIdentityWorkflowKey(run: Run | undefined): string | undefined {
   const identity = run?.run_identity;
   if (!identity || typeof identity !== 'object') return undefined;
+  if (identity.identity_version !== 'milo-run-identity/1') return undefined;
   // A record that names a different run is not this run's identity.
   if (run?.id && identity.run_id && identity.run_id !== run.id) return undefined;
+  if (identity.event_registry_version !== EVENT_REGISTRY_VERSION) return undefined;
   const key = typeof identity.workflow_key === 'string' ? identity.workflow_key.trim() : '';
-  return RENDERABLE_WORKFLOW_KEYS.has(key) ? key : undefined;
+  if (!RENDERABLE_WORKFLOW_KEYS.has(key)) return undefined;
+  if (key === SWARM_V2_WORKFLOW_KEY && identity.engine_version !== 'swarm_v2.1') return undefined;
+  if (key === VEHICLE_CATALOG_V1_WORKFLOW_KEY && identity.engine_version !== 'vehicle_catalog_v1.stage3') return undefined;
+  return key;
 }
 
 /** Did this run record an identity at all? Used only to label, never to infer. */
