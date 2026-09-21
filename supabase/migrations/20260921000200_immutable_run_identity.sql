@@ -448,7 +448,7 @@ create or replace function public.transition_run_worker_guarded(
 ) returns setof public.runs
 language plpgsql
 set search_path = pg_catalog
-as $
+as $$
 declare
   v_row public.runs;
 begin
