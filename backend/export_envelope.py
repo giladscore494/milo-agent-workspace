@@ -58,7 +58,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Mapping
 
-from backend.run_identity import RunIdentity, RunIdentityError, require_identity
+from backend.run_identity import (PRODUCT_WORKFLOW_KEYS, RunIdentity,
+                                  RunIdentityError, require_identity)
 
 SCHEMA_VERSION = "milo-run-export/1"
 
@@ -127,7 +128,7 @@ def build_export_envelope(run: Mapping[str, Any], *,
         raise ExportRefused(
             f"the run's engine identity cannot be established ({exc.code})") from exc
     engine = identity.workflow_key
-    if engine not in {"vehicle_catalog_v1", "swarm_v2"}:
+    if engine not in PRODUCT_WORKFLOW_KEYS:
         raise ExportRefused("run identity is not an exportable product workflow")
     output = run.get("output")
 
