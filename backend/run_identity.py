@@ -125,6 +125,9 @@ RELEASE_SHA_ENV = "MILO_RELEASE_SHA"
 ENGINE_VERSIONS: Mapping[str, str] = {
     "vehicle_catalog_v1": "vehicle_catalog_v1.stage3",
     "swarm_v2": "swarm_v2.1",
+    # Control-plane run identity. It is intentionally NOT registered in the
+    # model EngineRegistry, so an ordinary worker cannot execute it.
+    "operator_capture": "operator_capture.1",
 }
 
 #: Historical engine identities this release knows how to READ truthfully.
@@ -138,6 +141,7 @@ ENGINE_VERSIONS: Mapping[str, str] = {
 SUPPORTED_ENGINE_VERSIONS: Mapping[str, frozenset[str]] = {
     "vehicle_catalog_v1": frozenset({"vehicle_catalog_v1.stage3"}),
     "swarm_v2": frozenset({"swarm_v2.1"}),
+    "operator_capture": frozenset({"operator_capture.1"}),
 }
 
 #: The record's fields, in one place, so a reader and a writer cannot disagree
