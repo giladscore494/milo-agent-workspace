@@ -400,7 +400,11 @@ def execution_identity_problems(
         problems.append("event_registry_version")
     if identity.event_registry_fingerprint != event_registry_fingerprint():
         problems.append("event_registry_fingerprint")
-    if identity.release_sha != release_sha(env):
+    current_release = release_sha(env)
+    # An unstated release is never a wildcard. A run and a worker that both
+    # forgot MILO_RELEASE_SHA must still refuse execution rather than treating
+    # two empty strings as a valid release binding.
+    if not identity.release_sha or not current_release or identity.release_sha != current_release:
         problems.append("release_sha")
     return tuple(problems)
 
