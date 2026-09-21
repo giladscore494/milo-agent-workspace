@@ -733,7 +733,8 @@ class BudgetTracker:
             return self._search_seq
 
     def settle_search(self, reservation_seq: int, actual: int | None = None,
-                      cost: float | None = None) -> None:
+                      cost: float | None = None, *,
+                      pre_execution: bool = False) -> None:
         """Release a search reservation and record what was really spent.
 
         ``actual`` is the number of searches the provider really performed.
@@ -753,20 +754,46 @@ class BudgetTracker:
         recorded -- it really happened and was really billed -- and the run
         then stops: a per-request bound that can be exceeded without
         consequence is a comment, not a bound.
+
+        ``pre_execution`` is used ONLY by MILO-mediated standalone search,
+        where the per-invocation price is known before the HTTP request is
+        sent. In that mode a fixed-cost overage releases the in-flight hold
+        and stops the run WITHOUT incrementing search usage, because no search
+        has happened yet. Provider-executed residual builtin search must leave
+        this False: by settlement time that work already happened and must be
+        recorded truthfully even when it pushes the run over a cap.
         """
         cfg = self.config
         unit = float(cfg.search_cost_per_invocation if cost is None else cost)
         if unit < 0:
             raise ValueError("search cost cannot be negative")
         with self._lock:
-            held = self._open_search_reservations.pop(int(reservation_seq), None)
+            held = self._open_search_reservations.get(int(reservation_seq))
             if held is None:
                 return
+            charged = held if actual is None else max(0, int(actual))
+            amount = unit * charged
+
+            # Standalone search has a FIXED, server-owned price and has not
+            # executed yet. Refuse atomically before turning the reservation
+            # into durable usage if that known charge cannot fit. This keeps
+            # the hard cost gate pre-execution without inventing a search in
+            # the durable ledger that never happened.
+            if (pre_execution and charged
+                    and cfg.max_cost_per_run is not None
+                    and self.actual_cost + amount > cfg.max_cost_per_run):
+                self._open_search_reservations.pop(int(reservation_seq), None)
+                self.reserved_search_invocations = max(
+                    0, self.reserved_search_invocations - held)
+                raise self._stop(
+                    "COST_LIMIT_REACHED",
+                    "recorded cost budget cannot admit another search",
+                    "budget_exhausted", "budget_exhausted")
+
+            self._open_search_reservations.pop(int(reservation_seq), None)
             self.reserved_search_invocations = max(
                 0, self.reserved_search_invocations - held)
-            charged = held if actual is None else max(0, int(actual))
             if charged:
-                amount = unit * charged
                 self.search_invocations += charged
                 self.search_cost += amount
                 if amount:
