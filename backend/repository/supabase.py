@@ -20,8 +20,20 @@ class Repository(Protocol):
     def list_conversations(self, project_id: UUID) -> list[dict[str, Any]]: ...
     def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
-    def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]: ...
-    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None, *, run_id: UUID, run_identity: dict[str, Any]) -> dict[str, Any]: ...
+    def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]:
+        """Legacy split run creation is forbidden after Console 6.
+
+        A run must be inserted atomically with its immutable identity through
+        create_message_and_run_v3. Keeping this method as an explicit refusal
+        preserves interface compatibility without leaving a direct table writer
+        that can create identity-less work.
+        """
+        raise AppError(
+            "RUN_IDENTITY_ATOMIC_CREATION_REQUIRED",
+            "queued runs must be created atomically with immutable identity",
+            503,
+        )
+
     def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None: ...
     def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]: ...
     def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None: ...
@@ -550,6 +562,12 @@ class SupabaseRepository:
     WORKER_TRANSITION_FIELDS = {"output", "error", "usage", "started_at", "finished_at"}
 
     def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
+        if status in TERMINAL_STATES:
+            raise AppError(
+                "CANONICAL_FINALIZER_REQUIRED",
+                "terminal run states must be written through the canonical finalizer",
+                409,
+            )
         current = str(self.get_run(run_id).get("status", ""))
         # Same-status updates (heartbeats, metadata refresh) are no-op
         # transitions; unknown legacy statuses bypass validation so legacy
@@ -678,10 +696,18 @@ class SupabaseRepository:
         return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=datetime.now(UTC).isoformat(), cancellation_reason=reason)
 
     def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "failed", expected_worker_id=worker_id, expected_attempt=attempt, expected_lease_token=lease_token, error={"code": code, "message": message}, finished_at=datetime.now(UTC).isoformat())
+        raise AppError(
+            "CANONICAL_FINALIZER_REQUIRED",
+            "run failure must be written through the canonical finalizer",
+            409,
+        )
 
     def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "completed", expected_worker_id=worker_id, expected_attempt=attempt, expected_lease_token=lease_token, output=output, error=None, finished_at=datetime.now(UTC).isoformat())
+        raise AppError(
+            "CANONICAL_FINALIZER_REQUIRED",
+            "run completion must be written through the canonical finalizer",
+            409,
+        )
 
     def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any], project_id: UUID | None = None, created_by: UUID | None = None) -> dict[str, Any]:
         payload = {"user_request": user_request, **proposal}
