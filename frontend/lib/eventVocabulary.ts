@@ -57,6 +57,7 @@ import registry from './eventRegistry.generated.json';
 
 /** The vocabulary's identity, carried on every run's immutable identity. */
 export const EVENT_REGISTRY_VERSION: string = registry.registry_version;
+export const EVENT_REGISTRY_FINGERPRINT: string = registry.fingerprint;
 
 function group(name: keyof typeof registry.groups): ReadonlySet<string> {
   return new Set(registry.groups[name]);
