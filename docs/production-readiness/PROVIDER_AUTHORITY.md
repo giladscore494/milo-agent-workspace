@@ -148,6 +148,13 @@ uncrossable.
 provider's search endpoints, and the results reach the model in the same
 conversation. Only their *number* became refusable.
 
+The standalone wire contract is pinned to the current official Kimi API
+documentation: `POST /v1/tools/search` / `POST /v1/tools/search_pro` with
+`text_query`, an explicit bounded `limit`, and explicit `timeout_seconds`.
+MILO sends `limit=8` and `timeout_seconds=30`; responses are read from the
+documented `search_results` array (legacy aliases remain read-only
+compatibility). No live paid call is required to define this contract.
+
 Three refusals land at step 1, before anything is spent: a query the model
 did not supply, a process with no search transport configured, and an adapter
 with **no run ledger**. The last is the structural one — the run ceiling is
