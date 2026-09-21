@@ -192,6 +192,7 @@ from backend.catalog.government.source import (GOVERNMENT_SOURCE_REASONS,
 from backend.engines.swarm_v2.evidence import WorkerLease
 from backend.errors import AppError
 from backend.event_registry import CAPTURE_SNAPSHOT_REPLAYED
+from backend.run_identity import RunIdentity
 from backend.production_config import TRUE_VALUES
 from backend.runtime import TERMINAL_STATES, CancellationRequested
 
@@ -1000,14 +1001,11 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     `milo_operation` marker, the result satisfied the capture predicate too.
 
     `create_message_and_run` is the contract that fixes it, and repository
-    inspection confirms it rather than assuming it. Migration 012's function
-    (reached through the `create_message_and_run_v2` SETOF wrapper) takes the
-    per-user and per-project advisory locks, performs the idempotency lookup
-    FIRST, and on a hit returns `{'run': ..., 'created': false}` **before
-    inserting anything** -- which also removes the second defect, the orphan
-    preparation message a replay used to leave behind. Otherwise it applies
-    the same admission limits the product applies and inserts the message and
-    the run in ONE transaction, returning `created: true`.
+    inspection confirms it rather than assuming it. Console 6's atomic creator
+    takes the per-user and per-project advisory locks, performs the idempotency
+    lookup FIRST, and on a hit returns `{'run': ..., 'created': false}` before
+    inserting anything. Otherwise it inserts the message, the run and this
+    control-plane run's immutable identity in ONE transaction.
     `MemoryRepository.create_message_and_run` mirrors all of that exactly.
 
     The ownership rule follows directly from that flag:
@@ -1065,12 +1063,15 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     # them. An operator preparation is a real run and does not get to skip the
     # concurrency ceiling the product enforces.
     limits = BudgetConfig.from_env()
+    new_run_id = uuid4()
+    run_identity = RunIdentity.bind(new_run_id, "operator_capture", env=env).as_record()
     try:
         result = repository.create_message_and_run(
             conversation_id, PREPARED_RUN_CONTENT,
             {"milo_operation": OPERATOR_CAPTURE_OPERATION}, requested_by,
             idempotency_key, _preparation_fingerprint(),
-            limits.max_concurrent_runs_per_user, limits.max_concurrent_runs_per_project)
+            limits.max_concurrent_runs_per_user, limits.max_concurrent_runs_per_project,
+            run_id=new_run_id, run_identity=run_identity)
         run = result["run"]
         created = bool(result["created"])
     except Exception:
