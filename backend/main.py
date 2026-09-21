@@ -280,13 +280,22 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
     # No executable run may cross the launch boundary without a persisted,
     # readable identity. Legacy rows remain history, not runnable work.
     try:
-        require_identity(run)
+        persisted_identity = require_identity(run)
     except RunIdentityError as exc:
         raise AppError(
             "RUN_IDENTITY_REQUIRED",
             "run has no trustworthy immutable identity and cannot be launched",
             409,
         ) from exc
+    if execution_identity_problems(persisted_identity):
+        # Includes idempotent replay of a queued run created by an older
+        # release/policy. Do not launch a Cloud Run execution that the worker
+        # is guaranteed to refuse at its own pre-claim identity gate.
+        raise AppError(
+            "RUN_IDENTITY_RUNTIME_MISMATCH",
+            "run identity does not match this runtime and cannot be launched",
+            409,
+        )
     if run.get("status") not in (None, "queued"):
         # Cancelled-before-launch or an already-progressed duplicate: never launch.
         return RunCreated(run_id=run["id"], status=run["status"])
