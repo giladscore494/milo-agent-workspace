@@ -228,11 +228,12 @@ export default function WorkspacePage() {
     setRunError(STORED_RUN_REJECTED);
   }, [changeActiveRun]);
 
-  // The project's trusted workflow_key selects V2 vs V1 presentation; the
-  // frontend never guesses the engine from event shapes. The conversation id
+  // The project may choose the loading/new-run surface only. Once the run row
+  // exists, its immutable identity alone selects V1 vs V2 presentation. The
+  // conversation id
   // is handed down as the run's expected owner, so a run row that belongs to
   // another conversation is refused before anything is rendered.
-  const { state, mode, swarm } = useRunRealtime(
+  const { state, mode, swarm, identityUnavailable } = useRunRealtime(
     executionUi ? activeRunId : undefined,
     selectedProject?.workflow_key,
     activeConversation?.id,
@@ -254,7 +255,7 @@ export default function WorkspacePage() {
   // stays mounted for the whole run, so its loading, not-finished, absent and
   // invalid states are visible rather than appearing from nowhere.
   const showFinalResult =
-    swarm.isSwarmV2 && executionUi && activeConversation !== undefined && activeRunId !== undefined;
+    !identityUnavailable && swarm.isSwarmV2 && executionUi && activeConversation !== undefined && activeRunId !== undefined;
 
   useEffect(() => {
     let mounted = true;
@@ -812,10 +813,9 @@ export default function WorkspacePage() {
             onKeepRunning={() => setConfirmingCancel(false)}
           />
         )}
-        {/* Two surfaces, never both. Swarm V2 gets the typed final-result
-            contract; every other workflow keeps the existing sanitized-output
-            path unchanged. The choice comes from the project's trusted
-            workflow_key (via swarm.isSwarmV2), never from the payload. */}
+        {/* Engine-specific result surfaces are selected only from the run's
+            immutable identity. Missing/invalid identity gets a bounded alert,
+            never an implicit V1 fallback. */}
         <FinalResultPanel
           visible={showFinalResult}
           runId={activeRunId}
@@ -823,7 +823,15 @@ export default function WorkspacePage() {
           connection={mode}
           output={state.run?.output}
         />
-        <RunOutputPanel visible={executionUi && activeRunId !== undefined && !swarm.isSwarmV2} output={state.run?.output} />
+        {identityUnavailable && executionUi && activeRunId !== undefined && (
+          <p className="alert" role="alert">
+            This run has no trustworthy immutable engine identity. Engine-specific result rendering is disabled.
+          </p>
+        )}
+        <RunOutputPanel
+          visible={executionUi && activeRunId !== undefined && !identityUnavailable && !swarm.isSwarmV2}
+          output={state.run?.output}
+        />
         {/* CODE-3 — durable catalog state, not run state. It is shown for any
             selected project regardless of `executionUi`: the execution UI flag
             hides EXECUTION controls, and there are none here. Hiding a
