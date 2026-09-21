@@ -101,42 +101,32 @@ builds `WorkerLease` from what the database returned, and heartbeats through
 the existing guarded RPC. It invents no lease, holds no direct insert, and
 never passes or prints lease material.
 
-But the lease is the WRONG boundary for the question "may an ordinary model
-worker execute this run". `claim_run_lease` predicates its CAS on status,
-worker and lease expiry only -- not on `launch_state`, not on run metadata --
-so it hands a lease to whoever asks first, launcher or operator alike. The
-launch boundary is a DIFFERENT CAS, `try_acquire_launch`, and that is the one
-that decides who owns a run.
+The lease and the launch boundary answer different questions.
 
-**There is no way in this repository to create a run that is not an ordinary
-model run.** Every creation route reaches
-`backend.main._create_and_launch_run`, which creates the run and immediately
-hands it to `JobLauncher.launch()`; the launched worker resolves an engine from
-`project.workflow_key` and runs a model. So an operator needs a supported way
-to make a run no launcher will ever take -- and `--prepare` is it (see
-`_prepare`), through existing repository methods, with no migration, no new
-repository method and no direct table write.
+Console 6 now gives operator capture its own immutable control-plane identity:
+`operator_capture / operator_capture.1`. `--prepare` creates that run through
+the same atomic V3 creator used by product run creation, so message + run +
+immutable identity are committed together. The product worker rejects this
+control-plane workflow BEFORE lease acquisition, while `--execute` requires
+the persisted identity to match the exact current release/policy/event registry
+before it may claim the run.
 
-`--prepare` creates the run the ordinary way and then wins
-`try_acquire_launch` -- the SAME single-statement CAS the ordinary path uses.
-That is the one authoritative transition, and exactly one side can win it:
+Launch ownership remains a separate CAS. A newly prepared capture is born
+`queued/pending`; `--prepare` must win `try_acquire_launch` before it can
+rest the run in `OPERATOR_OWNED_LAUNCH_STATE`:
 
-*   **The operator wins.** The run is rested in `OPERATOR_OWNED_LAUNCH_STATE`,
-    which `try_acquire_launch` cannot acquire from, so
-    `_create_and_launch_run` can never call `JobLauncher.launch()` for it.
-*   **The launcher wins.** `try_acquire_launch` returns `None` to the
-    operator, preparation refuses with `CAPTURE_LAUNCH_OWNERSHIP_LOST`, and
-    the run is left entirely alone -- no claim, no transport, no request, no
-    write.
+*   **The operator wins.** The run is moved to the unlaunchable `none` launch
+    state and only the capture entrypoint may later claim it.
+*   **The launch CAS is not acquired.** Preparation refuses with
+    `CAPTURE_LAUNCH_OWNERSHIP_LOST` and never adopts or rewrites somebody
+    else's run.
 
-An earlier round of this module checked `status`, `launch_state` and the
-marker with a read and then called `claim_run`. That is a read-then-act
-window: the launcher could take the run between the two, and `claim_run` would
-not notice. The window is closed twice over. Eligibility now requires a launch
-state the ordinary path can neither produce nor acquire, and it is re-verified
-on the row `claim_run` ITSELF returned (`returning *`), so the check and the
-claim are one step. The pre-claim read survives only as a cheap early refusal
-for a wrong run id, and nothing depends on it still being true afterwards.
+`claim_run_lease` itself also refuses legacy rows with no immutable identity.
+The capture entrypoint then re-checks the operator-owned launch posture on the
+row returned by the claim, while immutable runtime identity was already proved
+before claim. The pre-claim read is therefore only an early refusal; neither
+engine routing nor ownership is inferred from current project state or request
+metadata.
 
 The marker alone is still not enough, and was never meant to be: a browser
 request's `metadata` reaches `input.metadata`, so a user can put the string on
