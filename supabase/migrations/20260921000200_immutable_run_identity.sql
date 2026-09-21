@@ -380,7 +380,66 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 5) Service-path-only ACLs, per the repository convention.
+-- 5) Terminalization authority: the general worker transition RPC is
+--    deliberately NON-TERMINAL. Console 3's finalize_run_guarded is the only
+--    worker primitive allowed to commit a terminal status + terminal evidence
+--    atomically.
+-- ---------------------------------------------------------------------------
+create or replace function public.transition_run_worker_guarded(
+  p_run_id uuid,
+  p_status text,
+  p_expected_status text,
+  p_worker_id text,
+  p_attempt integer,
+  p_lease_token text,
+  p_output jsonb default null,
+  p_error jsonb default null,
+  p_clear_error boolean default false,
+  p_usage jsonb default null,
+  p_started_at timestamptz default null,
+  p_finished_at timestamptz default null
+) returns setof public.runs
+language plpgsql
+as $
+declare
+  v_row public.runs;
+begin
+  if p_status in ('completed', 'partial_success', 'failed', 'cancelled',
+                  'timed_out', 'budget_exhausted') then
+    raise exception 'CANONICAL_FINALIZER_REQUIRED: terminal status % must use finalize_run_guarded', p_status
+      using errcode = '55000';
+  end if;
+
+  update public.runs
+     set status = p_status,
+         output = coalesce(p_output, output),
+         error = case when p_clear_error then null else coalesce(p_error, error) end,
+         usage = case when p_usage is null then usage
+                      else public.merge_execution_usage(usage, p_usage) end,
+         started_at = coalesce(p_started_at, started_at),
+         finished_at = coalesce(p_finished_at, finished_at),
+         updated_at = now()
+   where id = p_run_id
+     and worker_id = p_worker_id
+     and (p_attempt is null or attempt = p_attempt)
+     and (p_lease_token is null or lease_token = p_lease_token)
+     and lease_expires_at > now()
+     and (p_expected_status is null or status = p_expected_status)
+   returning * into v_row;
+
+  if v_row is null then
+    raise exception 'STALE_WORKER_WRITE: transition to % rejected; lease (worker %, attempt %) is not current for run %',
+      p_status, p_worker_id, p_attempt, p_run_id
+      using errcode = '55000';
+  end if;
+
+  return next v_row;
+  return;
+end;
+$;
+
+-- ---------------------------------------------------------------------------
+-- 6) Service-path-only ACLs, per the repository convention.
 -- ---------------------------------------------------------------------------
 do $$
 declare fn text;
