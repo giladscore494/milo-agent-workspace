@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from backend.errors import AppError
-from backend.run_identity import RunIdentity, RunIdentityError, persisted_identity
+from backend.run_identity import ENGINE_VERSIONS, RunIdentity, RunIdentityError, persisted_identity
 
 
 class Engine(Protocol):
@@ -68,13 +68,10 @@ class EngineResolver:
     trusted relation, and immutable afterwards. Resume and retry get the same
     answer as the first attempt because they read the same record.
 
-    The project relation remains the resolver's ONLY fallback, and only for a
-    run created before identities existed. That is not an inference: such a run
-    recorded no engine, so there is nothing to preserve, and this is the
-    behaviour it has always had. It is reported as unpinned
-    (``ResolvedEngine.pinned`` is False) rather than passed off as a pinned
-    answer, and nothing writes an identity onto it afterwards -- binding an
-    identity to a run that has already executed would be inventing history.
+    Runs created before immutable identity existed remain readable historical
+    records, but are NOT executable or resumable. Re-reading a project's current
+    workflow for one of those runs would invent the missing history and recreate
+    the cross-attempt engine drift this module exists to prevent.
     """
 
     def __init__(self, repository: Any, registry: EngineRegistry) -> None:
@@ -90,29 +87,29 @@ class EngineResolver:
             # engine, which is the drift this class exists to remove.
             raise AppError("ENGINE_NOT_ALLOWED",
                            "the run's persisted identity cannot be trusted", 403) from exc
-        if identity is not None:
-            return ResolvedEngine(workflow_key=identity.workflow_key,
-                                  factory=self.registry.require(identity.workflow_key),
-                                  identity=identity)
-        workflow_key = self._legacy_workflow_key(run)
-        return ResolvedEngine(workflow_key=workflow_key,
-                              factory=self.registry.require(workflow_key),
-                              identity=None)
-
-    def _legacy_workflow_key(self, run: dict[str, Any]) -> str:
-        """The pre-identity route: trusted server relations only, as before."""
-        conversation_id = run.get("conversation_id")
-        if not conversation_id:
-            raise AppError("ENGINE_NOT_ALLOWED", "run has no trusted conversation", 403)
-        conversation = self.repository.get_conversation(conversation_id)
-        project_id = conversation.get("project_id")
-        if not project_id:
-            raise AppError("ENGINE_NOT_ALLOWED", "conversation has no trusted project", 403)
-        project = self.repository.get_project(project_id)
-        workflow_key = project.get("workflow_key")
-        if not isinstance(workflow_key, str) or not workflow_key:
-            raise AppError("ENGINE_NOT_ALLOWED", "project has no allowed workflow", 403)
-        return workflow_key
+        if identity is None:
+            # Legacy rows remain readable as history, but they are never
+            # executable. Re-deriving an engine from the project's CURRENT
+            # workflow would recreate the exact cross-attempt drift this
+            # authority exists to remove.
+            raise AppError(
+                "RUN_IDENTITY_REQUIRED",
+                "run predates immutable identity and cannot be executed or resumed",
+                409,
+            )
+        current_version = ENGINE_VERSIONS.get(identity.workflow_key)
+        if current_version != identity.engine_version:
+            # Historical identities may remain readable/exportable, but resume
+            # is a stronger claim: this binary may execute only the engine
+            # contract it currently ships.
+            raise AppError(
+                "ENGINE_VERSION_UNSUPPORTED_FOR_EXECUTION",
+                "run engine version is not executable by this release",
+                409,
+            )
+        return ResolvedEngine(workflow_key=identity.workflow_key,
+                              factory=self.registry.require(identity.workflow_key),
+                              identity=identity)
 
 
 __all__ = ["Engine", "EngineFactory", "EngineRegistry", "EngineResolver", "ResolvedEngine"]
