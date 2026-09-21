@@ -148,7 +148,11 @@ INVENTORY=(
   "MILO_PROVIDER_ABANDONED_LEASE_RECLAIM_SECONDS|cloud-run-worker-only|no|backend/provider_quota.py"
   "MILO_WORKER_MAX_LIFETIME_SECONDS|cloud-run-worker-only|no|backend/provider_quota.py"
   "MILO_WORKER_CLAIM_WAIT_SECONDS|cloud-run-worker-only|no|backend/worker/main.py"
-  "MILO_MODEL_BASE_URL|cloud-run-worker-only|no|backend/worker/main.py"
+  # Read by the ONE canonical provider-host resolver, not by the worker: V1
+  # chat, V2 chat and standalone search all consume `provider_base_url()`, so
+  # this knob has exactly one reader and moving one deployment value moves all
+  # three paths together.
+  "MILO_MODEL_BASE_URL|cloud-run-worker-only|no|backend/provider_authority.py"
   # Namespace PREFIXES, not variables: the canonical policy sweeps on these
   # so an unpinned policy variable is caught by shape rather than by somebody
   # remembering to add its name to a list.
