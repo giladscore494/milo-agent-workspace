@@ -579,6 +579,20 @@ class RunFinalizer:
             pass
 
 
+    def _terminal_fields(self, claim: TerminalClaim) -> dict[str, Any]:
+        fields: dict[str, Any] = {"finished_at": datetime.now(UTC).isoformat()}
+        if claim.output is not None:
+            fields["output"] = claim.output
+        fields["error"] = claim.error
+        if claim.usage is not None:
+            fields["usage"] = claim.usage
+        return fields
+
+    def _lease_kwargs(self) -> dict[str, Any]:
+        return {"worker_id": self.lease_ctx.get("worker_id"),
+                "attempt": self.lease_ctx.get("attempt"),
+                "lease_token": self.lease_ctx.get("lease_token")}
+
 
 __all__ = ["CLAIM_REASONS", "FinalizationResult", "FinalizationUnavailable",
            "RunFinalizer", "TERMINAL_AUTHORITY", "TerminalClaim",
