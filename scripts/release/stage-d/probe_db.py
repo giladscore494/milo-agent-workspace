@@ -24,14 +24,13 @@ Modes (env STAGE_D_MODE):
               written to, and the verdict reports an empty mutation
               list. PHASE B mutates, then re-reads and proves the exact
               final membership and zero active runs
-  terminalize — drive the authorized Stage D run to a terminal state
-              with guarded, identity-checked transitions along the
-              supported lifecycle, release any dangling budget
-              reservation through the supported RPC, and prove the run
-              is terminal with zero active user/project runs and zero
-              reservations left in the reserved status. Refuses ANY run
-              candidate, recorded or recovered, unless the recorded
-              user and conversation identity is supplied and matches
+  terminalize — close the authorized Stage D run through the SAME atomic
+              finalize_run_guarded primitive as the runtime: first request
+              cancellation, then acquire a cleanup lease after the stopped
+              worker's lease is reclaimable, atomically commit cancelled +
+              run_cancelled, release dangling reservations, and prove zero
+              active user/project runs. Immutable run identity must match
+              the exact Stage D release pin before any mutation.
   evidence  — executable acceptance gate for env STAGE_D_RUN_ID: exits
               non-zero unless EVERY acceptance criterion holds, including
               exactly one new authorized run over the pinned prior
@@ -1054,15 +1053,14 @@ def terminalize() -> None:
                      terminalization, reservation cleanup and proofs;
       * many rows  — ambiguous; fail closed having mutated nothing.
 
-    Every path is identity-checked: the key, the run-request metadata
-    marker, the recorded user and conversation — both REQUIRED; an absent
-    field refuses the candidate before any write — and an explicit refusal
-    of the prepared Government capture. Terminalization uses the repository's
-    own supported lifecycle (active -> cancellation_requested ->
-    cancelled), each step a guarded compare-and-set, plus the supported
-    service-role `settle_model_call_budget` RPC to release any dangling
-    reservation — including on a run that was ALREADY terminal, because a
-    finished run can still hold reserved budget.
+    Every path is identity-checked: the immutable Console 6 run identity,
+    the key, the run-request metadata marker, and the recorded user and
+    conversation — both REQUIRED. Cleanup never PATCHes a terminal status.
+    It may request the non-terminal cancellation_requested state, then obtains
+    its own legitimate lease only after the stopped worker's lease is
+    reclaimable and calls `finalize_run_guarded` so cancelled + run_cancelled
+    commit atomically. Dangling reservations are released through the supported
+    service-role settlement RPC, including for a run already terminal.
 
     It then PROVES: the run is terminal; zero active runs remain for its
     user and project; zero reservations remain in status 'reserved'.
@@ -1129,41 +1127,66 @@ def terminalize() -> None:
     if problems:
         emit_and_exit()
 
-    # -- Guarded, identity-checked transitions along the supported path.
+    # -- Canonical cleanup finalization.
     #
-    # Bounded re-read loop rather than a straight line: losing the CAS is
-    # NOT itself a failure. The usual cause is the worker writing its own
-    # terminal result concurrently, which is exactly the outcome wanted —
-    # so a lost race is re-read and retried, and the POSTCONDITION PROOF
-    # below is what decides. What the CAS guarantees is that this probe
-    # never overwrites somebody else's result and never touches a run this
-    # authorization does not own.
+    # The kill switch has already proved there is no live Cloud Run execution.
+    # We therefore request cancellation (non-terminal), wait until the stopped
+    # worker's lease is legitimately reclaimable, claim the run as a bounded
+    # cleanup worker, and use finalize_run_guarded for the ONLY terminal write.
+    # No direct PATCH may create a terminal state.
     observed = str(run.get("status"))
-    for _attempt in range(MAX_TERMINALIZE_ATTEMPTS):
-        if observed in TERMINAL_RUN_STATES:
-            break
-        target, extra = (
-            ("cancelled", {"finished_at": "now()"})
-            if observed == "cancellation_requested"
-            else ("cancellation_requested",
-                  {"cancellation_requested_at": "now()",
-                   "cancellation_reason": "stage-d cleanup: run terminalized by the post-run lockdown"}))
-        moved = guarded_transition(run_id, observed, target, expected_key, actions, extra=extra)
+    if observed not in TERMINAL_RUN_STATES and observed != "cancellation_requested":
+        moved = guarded_transition(
+            run_id,
+            observed,
+            "cancellation_requested",
+            expected_key,
+            actions,
+            extra={
+                "cancellation_requested_at": "now()",
+                "cancellation_reason": "stage-d cleanup: cancellation requested after execution lockdown",
+            },
+        )
         if moved is not None:
             observed = moved
-            continue
-        actions.append(f"cas_lost_at_{observed}")
-        rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={RUN_SELECT}", "runs", problems)
-        if not rows:
-            problems.append(f"run {run_id} disappeared while being terminalized — failing closed")
-            break
-        current = str(rows[0].get("status"))
-        if current == observed:
-            problems.append(
-                f"the guarded transition {observed} -> {target} matched no row although the run is still "
-                f"{observed!r} — it may not be the authorized run; failing closed")
-            break
-        observed = current
+        else:
+            rows = fetch_rows(
+                f"/rest/v1/runs?id=eq.{run_id}&select={RUN_SELECT}", "runs", problems)
+            if not rows:
+                problems.append(
+                    f"run {run_id} disappeared while cancellation was requested — failing closed")
+            else:
+                observed = str(rows[0].get("status"))
+
+    if observed not in TERMINAL_RUN_STATES:
+        cleanup = claim_stage_d_cleanup_lease(run_id, actions, problems)
+        if cleanup is not None:
+            observed = str(cleanup.get("status"))
+            status, body = call("POST", "/rest/v1/rpc/finalize_run_guarded", {
+                "p_run_id": run_id,
+                "p_status": "cancelled",
+                "p_expected_status": observed,
+                "p_worker_id": cleanup["worker_id"],
+                "p_attempt": cleanup.get("attempt"),
+                "p_lease_token": cleanup["lease_token"],
+                "p_output": None,
+                "p_error": {
+                    "code": "STAGE_D_CLEANUP_CANCELLED",
+                    "message": "run cancelled by Stage D post-run cleanup",
+                },
+                "p_clear_error": False,
+                "p_usage": None,
+                "p_finished_at": utc_now_iso(),
+                "p_event_type": "run_cancelled",
+                "p_event_message": "Run cancelled by Stage D post-run cleanup",
+                "p_event_payload": {"code": "STAGE_D_CLEANUP_CANCELLED"},
+            })
+            if status not in (200, 201, 204) or not isinstance(body, list) or len(body) != 1:
+                problems.append(
+                    f"canonical cleanup finalization failed (HTTP {status}) — run not proven terminal")
+            else:
+                observed = "cancelled"
+                actions.append("finalize_run_guarded:cancelled")
     out["status_after_transition"] = observed
 
     # -- Release any dangling reservation through the supported RPC. This
@@ -1248,8 +1271,13 @@ def terminalize() -> None:
     emit_and_exit()
 
 
-#: Bounded: a benign race is retried, a pathological one is never looped on.
-MAX_TERMINALIZE_ATTEMPTS = 5
+#: Bounded wait for the stopped worker's database lease to become reclaimable.
+#: The kill switch has already proved zero Cloud Run executions before this
+#: mode is invoked; waiting for lease expiry preserves fencing instead of
+#: force-stealing ownership.
+MAX_CLEANUP_LEASE_ATTEMPTS = 70
+CLEANUP_LEASE_RETRY_SECONDS = 5
+CLEANUP_LEASE_SECONDS = 60
 
 
 def guarded_transition(run_id: str, observed: str, target: str, expected_key: str,
@@ -1280,6 +1308,42 @@ def guarded_transition(run_id: str, observed: str, target: str, expected_key: st
         return None
     actions.append(f"{observed}->{target}")
     return target
+
+
+def claim_stage_d_cleanup_lease(
+    run_id: str, actions: list[str], problems: list[str]
+) -> dict | None:
+    """Acquire a real lease for canonical cleanup, never force-steal one."""
+    worker_id = f"stage-d-cleanup-{run_id[:12]}"
+    for _attempt in range(MAX_CLEANUP_LEASE_ATTEMPTS):
+        status, body = call("POST", "/rest/v1/rpc/claim_run_lease", {
+            "p_run_id": run_id,
+            "p_worker_id": worker_id,
+            "p_lease_seconds": CLEANUP_LEASE_SECONDS,
+        })
+        if status not in (200, 201, 204) or not isinstance(body, list):
+            problems.append(
+                f"cleanup lease claim failed (HTTP {status}) — refusing non-canonical terminalization")
+            return None
+        if len(body) == 1:
+            row = body[0]
+            if not isinstance(row, dict) or not row.get("lease_token"):
+                problems.append("cleanup lease claim returned no usable fenced lease")
+                return None
+            actions.append("claimed_stage_d_cleanup_lease")
+            return row
+        if len(body) > 1:
+            problems.append("cleanup lease claim returned multiple runs — failing closed")
+            return None
+
+        # Another lease still holds. It belongs to an execution the kill switch
+        # already proved absent, so wait for DATABASE-clock expiry rather than
+        # bypassing ownership with a direct terminal PATCH.
+        time.sleep(CLEANUP_LEASE_RETRY_SECONDS)
+
+    problems.append(
+        "the stopped worker lease did not become reclaimable within the bounded cleanup window")
+    return None
 
 
 def utc_now_iso() -> str:
