@@ -232,7 +232,10 @@ class MemoryRepository:
             project = self.projects.get(str(project_id)) or {}
             if run_identity.get("run_id") != str(run_id):
                 raise AppError("RUN_IDENTITY_INVALID", "identity names a different run", 409)
-            if run_identity.get("workflow_key") != project.get("workflow_key"):
+            if run_identity.get("workflow_key") == "operator_capture":
+                if metadata.get("milo_operation") != "catalog.government.capture":
+                    raise AppError("RUN_IDENTITY_INVALID", "operator capture identity requires capture marker", 409)
+            elif run_identity.get("workflow_key") != project.get("workflow_key"):
                 raise AppError("RUN_IDENTITY_WORKFLOW_DRIFT", "project workflow changed before run creation", 409)
             if max_project_active is not None and self.count_active_runs_for_project(project_id) >= max_project_active:
                 raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429)
