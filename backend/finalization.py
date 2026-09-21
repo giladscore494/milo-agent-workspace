@@ -109,12 +109,13 @@ _TERMINAL_EVENT: Mapping[str, str] = {
 
 #: The reasons a claim can exist. The reason is what the caller knows; the
 #: status is what this module decides.
-CLAIM_REASONS = ("product", "cancelled", "budget_stop", "failure", "refusal")
+CLAIM_REASONS = ("product", "control_success", "cancelled", "budget_stop", "failure", "refusal")
 
 #: Reason -> durable status, for the reasons whose status does not depend on a
 #: product outcome. ``product`` and ``budget_stop`` are absent: the first is
 #: derived from the canonical outcome, the second from the stop itself.
 _STATUS_OF_REASON: Mapping[str, str] = {
+    "control_success": "completed",
     "cancelled": "cancelled",
     "failure": "failed",
     "refusal": "failed",
@@ -205,6 +206,18 @@ class TerminalClaim:
             outcome = outcome.demoted_with(extra_blocking)
         return cls(reason="product", outcome=outcome, output=output,
                    event_payload=event_payload)
+
+    @classmethod
+    def control_success(cls, engine: str, output: Any) -> "TerminalClaim":
+        """A trusted non-product control-plane operation completed.
+
+        It may carry a durable output document, but it deliberately records no
+        ProductOutcome: model/product semantics do not apply to operator
+        capture runs. The canonical Finalizer still owns the terminal status,
+        lease fencing and atomic terminal event.
+        """
+        return cls(reason="control_success", outcome=not_produced_outcome(engine),
+                   output=output)
 
     @classmethod
     def cancelled(cls, engine: str, *, code: str = "RUN_CANCELLED",
