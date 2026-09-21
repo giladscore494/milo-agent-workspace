@@ -377,7 +377,44 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 5) Terminalization authority: the general worker transition RPC is
+-- 5) Lease acquisition consumes immutable identity too. Legacy rows with no
+--    identity are history and cannot become executable merely because a
+--    service-role caller invokes the lease primitive directly.
+-- ---------------------------------------------------------------------------
+create or replace function public.claim_run_lease(
+  p_run_id uuid,
+  p_worker_id text,
+  p_lease_seconds integer default 300
+) returns setof public.runs
+language sql
+as $$
+  update public.runs set
+    status = case when status = 'cancellation_requested' then status else 'starting' end,
+    attempt = case
+      when worker_id is not null and worker_id <> p_worker_id
+           and lease_expires_at is not null and lease_expires_at < now()
+      then coalesce(attempt, 1) + 1
+      else coalesce(attempt, 1)
+    end,
+    worker_id = p_worker_id,
+    lease_token = encode(gen_random_bytes(32), 'hex'),
+    lease_expires_at = now() + make_interval(secs => p_lease_seconds),
+    started_at = coalesce(started_at, now()),
+    updated_at = now()
+  where id = p_run_id
+    and run_identity is not null
+    and (
+      (status in ('queued','launching','waiting','cancellation_requested')
+        and (worker_id is null or worker_id = p_worker_id
+             or lease_expires_at is null or lease_expires_at < now()))
+      or (status in ('starting','running')
+        and (worker_id = p_worker_id or lease_expires_at is null or lease_expires_at < now()))
+    )
+  returning *;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 6) Terminalization authority: the general worker transition RPC is
 --    deliberately NON-TERMINAL. Console 3's finalize_run_guarded is the only
 --    worker primitive allowed to commit a terminal status + terminal evidence
 --    atomically.
@@ -436,7 +473,7 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 6) Service-path-only ACLs, per the repository convention.
+-- 7) Service-path-only ACLs, per the repository convention.
 -- ---------------------------------------------------------------------------
 do $$
 declare fn text;
@@ -445,6 +482,7 @@ begin
     'public.create_tool_access_request_guarded(uuid, text, integer, text, jsonb)',
     'public.create_tool_grant_guarded(uuid, text, integer, text, jsonb)',
     'public.append_usage_ledger_guarded(uuid, text, integer, text, jsonb)',
+    'public.claim_run_lease(uuid, text, integer)',
     'public.transition_run_worker_guarded(uuid, text, text, text, integer, text, jsonb, jsonb, boolean, jsonb, timestamptz, timestamptz)'
   ]
   loop
