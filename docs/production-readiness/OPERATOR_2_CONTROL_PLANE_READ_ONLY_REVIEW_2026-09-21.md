@@ -30,7 +30,7 @@ the arguments each one requires.
 | `20260920000100_execution_usage_ledger` | 2 | `run_execution_usage` table, `merge_execution_usage`, `record_run_usage_guarded` |
 | `20260920000200_atomic_run_finalization` | 3 | `finalize_run_guarded` |
 | `20260921000100_current_verdict_authority` | 4 | `claim_current_verdict_state`, `claim_current_verdict_states` |
-| `20260921000200_immutable_run_identity` | 6 (this PR) | `runs.run_identity`, `bind_run_identity`, `create_tool_access_request_guarded`, `create_tool_grant_guarded`, `append_usage_ledger_guarded` |
+| `20260921000200_immutable_run_identity` | 6 (this PR) | `runs.run_identity`, `create_message_and_run_v3`, the INSERT/immutability identity triggers, lease-guarded tool-access/tool-grant/usage-ledger writers, plus the identity-aware `claim_run_lease` and non-terminal `transition_run_worker_guarded` definitions |
 
 Verified absent by direct `pg_proc` / `information_schema` reads, not inferred
 from the migration history alone.
@@ -129,10 +129,12 @@ by this console: `backend/runtime_policy.py` is untouched, and
 ## 6. Immutable run identity
 
 `runs.run_identity` does **not** exist in Production (migration not applied).
-All 8 existing runs are therefore unpinned, which is the state this release
-treats as "created before identities existed": readable and resumable through
-the legacy project route, **not** exportable and **not** release-authorizable.
-Nothing defaults them to V1.
+All 8 existing runs are therefore unpinned, which this release treats as
+historical records created before immutable identity existed: **readable only**,
+not executable/resumable, not exportable and not release-authorizable. Neither
+the API, the product worker nor the lease primitive may infer their engine from
+the project's current workflow. Nothing defaults them to V1 and nothing may
+retrofit an identity onto them.
 
 ---
 
