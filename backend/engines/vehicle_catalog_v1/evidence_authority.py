@@ -760,20 +760,19 @@ class V1EvidenceAuthority:
         # The order is what matters -- a claim's state is still read after its
         # own verdict was settled -- and asking per claim would be one round
         # trip per FIELD of every model of the run.
-        local = {id(claim): decide_verdict(claim, contradicted=contradicted,
-                                           flagged_models=flagged_models,
-                                           israel_required=israel_required)
-                 for claim in claims}
-        settled_rows = {id(claim): self._settle(claim, *local[id(claim)])
-                        for claim in claims if claim.durable}
-        states = self._current_states([claim for claim in claims
-                                       if settled_rows.get(id(claim)) is not None])
-        for claim in claims:
-            verdict, reason = local[id(claim)]
+        proposed = [(claim, *decide_verdict(claim, contradicted=contradicted,
+                                            flagged_models=flagged_models,
+                                            israel_required=israel_required))
+                    for claim in claims]
+        settled_rows = [self._settle(claim, verdict, reason) if claim.durable else None
+                        for claim, verdict, reason in proposed]
+        states = self._current_states([claim for (claim, _v, _r), row
+                                       in zip(proposed, settled_rows) if row is not None])
+        for (claim, verdict, reason), row in zip(proposed, settled_rows):
             if claim.durable:
                 durable_claims += 1
-                verdict, reason, settled = self._durable_answer(
-                    claim, verdict, reason, row=settled_rows.get(id(claim)), states=states)
+                verdict, reason, settled = self._durable_answer(claim, verdict, reason,
+                                                                row=row, states=states)
                 durable_verdicts += 1 if settled else 0
             key = model_key(claim.model_name)
             decided.append((claim.model_name, claim.field_key, verdict, reason))
