@@ -326,8 +326,15 @@ DEFAULT_SEARCH_BASE_URL = "https://api.moonshot.ai/v1"
 
 
 def search_base_url() -> str:
-    return (os.getenv("MILO_SEARCH_BASE_URL")
-            or os.getenv("MILO_MODEL_BASE_URL")
+    """The provider base a standalone search is sent to.
+
+    Deliberately the SAME variable the worker resolves the chat base from,
+    rather than a search-specific one: a second knob is a second thing a
+    deployment can get wrong, and there is no reviewed reason for search and
+    chat to address different hosts. A deployment that ever needs them split
+    adds that as a reviewed change, with an inventory entry.
+    """
+    return (os.getenv("MILO_MODEL_BASE_URL")
             or DEFAULT_SEARCH_BASE_URL).strip().rstrip("/")
 
 
