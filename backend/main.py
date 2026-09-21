@@ -3,7 +3,7 @@
 import hashlib
 import json
 from datetime import UTC, datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,8 +46,9 @@ from backend.schemas import (
 )
 from backend.rate_limit import enforce_rate_limit
 from backend.event_registry import is_known_event_type
-from backend.run_identity import RUN_IDENTITY_FIELD, RunIdentity, RunIdentityError
+from backend.run_identity import RUN_IDENTITY_FIELD, RunIdentity, RunIdentityError, require_identity
 from backend.runtime import TERMINAL_STATES
+from backend.finalization import RunFinalizer, TerminalClaim
 from backend.worker_auth import WorkerIdentity, get_verified_worker
 from backend.workflow_proposals import compile_proposal, ensure_approved
 
@@ -196,46 +197,6 @@ def _enforce_concurrency_limits(repo: Repository, user: AuthenticatedUser, conve
             raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429)
 
 
-def _bind_run_identity(repo: Repository, run: dict, project_id: object) -> dict:
-    """Establish the run's IMMUTABLE identity, before anything can execute it.
-
-    This is the only place a run's identity is ever decided. It is decided
-    HERE, at creation, from the trusted run -> conversation -> project relation
-    -- never from the request's own metadata, and never later by a worker that
-    re-reads whatever the project says at claim time.
-
-    Ordering is load-bearing: the binding happens BEFORE the launch, so a
-    worker can never observe a run whose identity is still open. A run whose
-    identity cannot be bound is NOT launched; it stays queued and launchable
-    again by a retry with the same idempotency key, which is the same posture
-    as any other pre-launch refusal. Launching it would be worse than
-    refusing: an unpinned run is exactly the run whose engine can change
-    underneath it.
-
-    Idempotent by construction. A replay of an existing run re-binds the same
-    record, which the database accepts as a no-op; a DIFFERENT record is
-    refused there and here.
-
-    A repository with no identity support (the simple in-test fakes) is left
-    alone: its runs carry no identity, and every consumer treats an absent one
-    as unpinned rather than guessing.
-    """
-    if not hasattr(repo, "bind_run_identity"):
-        return run
-    if run.get(RUN_IDENTITY_FIELD) is not None:
-        return run
-    try:
-        workflow_key = repo.get_project(project_id).get("workflow_key") if project_id else None
-        identity = RunIdentity.bind(run["id"], str(workflow_key or ""))
-    except RunIdentityError as exc:
-        # A static code only: the offending value never reaches the response.
-        raise AppError("RUN_IDENTITY_NOT_BOUND",
-                       "the run's engine identity could not be established, so it was not launched",
-                       500) from exc
-    bound = repo.bind_run_identity(UUID(str(run["id"])), identity.as_record())
-    return bound if isinstance(bound, dict) and bound.get("id") else run
-
-
 def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: AuthenticatedUser, conversation_id: UUID, content: str, metadata: dict, idempotency_key: str | None = None) -> RunCreated:
     """Create the user message + queued run and request a worker launch.
 
@@ -264,21 +225,60 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
         metadata = {**metadata, "requested_by": str(user.user_id)}
         if idempotency_key:
             metadata["idempotency_key"] = idempotency_key
-        if hasattr(repo, "create_message_and_run"):
-            # Transaction-safe path (migration 012): idempotent replay,
-            # concurrency admission and message+run creation are atomic.
-            result = repo.create_message_and_run(conversation_id, content, metadata, user.user_id, idempotency_key, fingerprint, config.max_concurrent_runs_per_user, config.max_concurrent_runs_per_project)
-            run = result["run"]
-            if not result.get("created", True) and run.get("request_fingerprint") not in (None, fingerprint):
-                raise AppError("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409)
-        else:
-            # Legacy two-step path for simple test fakes only.
-            _enforce_concurrency_limits(repo, user, conversation_id)
-            message = repo.create_user_message(conversation_id, content, metadata)
-            run = repo.create_queued_run(conversation_id, message["id"], content, metadata, requested_by=user.user_id, idempotency_key=idempotency_key, request_fingerprint=fingerprint)
+
+        if not hasattr(repo, "create_message_and_run"):
+            # Console 6 requires identity to be part of the SAME durable
+            # transaction that inserts the run. A repository without that
+            # primitive cannot safely create an executable run.
+            raise AppError(
+                "RUN_IDENTITY_ATOMIC_CREATION_REQUIRED",
+                "repository cannot create a run with immutable identity atomically",
+                503,
+            )
+
+        project = repo.get_project(project_id) if project_id else {}
+        workflow_key = project.get("workflow_key")
+        new_run_id = uuid4()
+        try:
+            identity = RunIdentity.bind(new_run_id, str(workflow_key or ""))
+        except RunIdentityError as exc:
+            raise AppError(
+                "RUN_IDENTITY_NOT_BOUND",
+                "the run's immutable identity could not be established",
+                409,
+            ) from exc
+
+        # Transaction-safe path: idempotent replay, concurrency admission,
+        # message insert, run insert and immutable identity all commit together.
+        # The SQL function re-checks the trusted project workflow inside that
+        # same transaction, closing the read->insert drift window.
+        result = repo.create_message_and_run(
+            conversation_id,
+            content,
+            metadata,
+            user.user_id,
+            idempotency_key,
+            fingerprint,
+            config.max_concurrent_runs_per_user,
+            config.max_concurrent_runs_per_project,
+            run_id=new_run_id,
+            run_identity=identity.as_record(),
+        )
+        run = result["run"]
+        if not result.get("created", True) and run.get("request_fingerprint") not in (None, fingerprint):
+            raise AppError("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409)
+
     run_id = UUID(str(run["id"]))
-    # Identity first: a run must know what it IS before anything can run it.
-    run = _bind_run_identity(repo, run, project_id)
+    # No executable run may cross the launch boundary without a persisted,
+    # readable identity. Legacy rows remain history, not runnable work.
+    try:
+        require_identity(run)
+    except RunIdentityError as exc:
+        raise AppError(
+            "RUN_IDENTITY_REQUIRED",
+            "run has no trustworthy immutable identity and cannot be launched",
+            409,
+        ) from exc
     if run.get("status") not in (None, "queued"):
         # Cancelled-before-launch or an already-progressed duplicate: never launch.
         return RunCreated(run_id=run["id"], status=run["status"])
@@ -644,16 +644,33 @@ def create_worker_run_event(run_id: UUID, request: WorkerRunEventCreate, worker:
 @app.post("/internal/runs/{run_id}/complete")
 def complete_run_from_worker(run_id: UUID, request: WorkerRunCompleteRequest, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "worker run completion")
-    lease = request.lease()
-    run = repo.mark_run_complete(run_id, request.output, **lease)
-    repo.append_run_event(run_id, "run_completed", {"message": "Run completed by worker", "payload": {"worker_identity": worker.service_account_email}}, **lease)
-    return run
+    run = repo.get_run(run_id)
+    try:
+        identity = require_identity(run)
+    except RunIdentityError as exc:
+        raise AppError("RUN_IDENTITY_REQUIRED", "worker completion requires immutable run identity", 409) from exc
+    finalizer = RunFinalizer(repo, run_id, identity.workflow_key, request.lease())
+    result = finalizer.finalize(TerminalClaim.product(
+        identity.workflow_key,
+        request.output,
+        event_payload={"worker_identity": worker.service_account_email},
+    ))
+    return repo.get_run(run_id) if result.status else run
 
 
 @app.post("/internal/runs/{run_id}/fail")
 def fail_run_from_worker(run_id: UUID, request: WorkerRunFailRequest, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "worker run failure")
-    lease = request.lease()
-    run = repo.mark_run_failed(run_id, request.code, request.message, **lease)
-    repo.append_run_event(run_id, "run_failed", {"message": request.message, "payload": {"code": request.code, "worker_identity": worker.service_account_email}}, **lease)
-    return run
+    run = repo.get_run(run_id)
+    try:
+        identity = require_identity(run)
+    except RunIdentityError as exc:
+        raise AppError("RUN_IDENTITY_REQUIRED", "worker failure requires immutable run identity", 409) from exc
+    finalizer = RunFinalizer(repo, run_id, identity.workflow_key, request.lease())
+    result = finalizer.finalize(TerminalClaim.failure(
+        identity.workflow_key,
+        request.code,
+        request.message,
+        event_payload={"worker_identity": worker.service_account_email},
+    ))
+    return repo.get_run(run_id) if result.status else run
