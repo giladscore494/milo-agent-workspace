@@ -46,7 +46,13 @@ from backend.schemas import (
 )
 from backend.rate_limit import enforce_rate_limit
 from backend.event_registry import is_known_event_type
-from backend.run_identity import RUN_IDENTITY_FIELD, RunIdentity, RunIdentityError, require_identity
+from backend.run_identity import (
+    RUN_IDENTITY_FIELD,
+    RunIdentity,
+    RunIdentityError,
+    execution_identity_problems,
+    require_identity,
+)
 from backend.runtime import TERMINAL_STATES
 from backend.finalization import RunFinalizer, TerminalClaim
 from backend.worker_auth import WorkerIdentity, get_verified_worker
@@ -642,6 +648,12 @@ def complete_run_from_worker(run_id: UUID, request: WorkerRunCompleteRequest, wo
         identity = require_identity(run)
     except RunIdentityError as exc:
         raise AppError("RUN_IDENTITY_REQUIRED", "worker completion requires immutable run identity", 409) from exc
+    if execution_identity_problems(identity):
+        raise AppError(
+            "RUN_IDENTITY_RUNTIME_MISMATCH",
+            "worker completion runtime does not match the run identity",
+            409,
+        )
     finalizer = RunFinalizer(repo, run_id, identity.workflow_key, request.lease())
     result = finalizer.finalize(TerminalClaim.product(
         identity.workflow_key,
@@ -659,6 +671,12 @@ def fail_run_from_worker(run_id: UUID, request: WorkerRunFailRequest, worker: Wo
         identity = require_identity(run)
     except RunIdentityError as exc:
         raise AppError("RUN_IDENTITY_REQUIRED", "worker failure requires immutable run identity", 409) from exc
+    if execution_identity_problems(identity):
+        raise AppError(
+            "RUN_IDENTITY_RUNTIME_MISMATCH",
+            "worker failure runtime does not match the run identity",
+            409,
+        )
     finalizer = RunFinalizer(repo, run_id, identity.workflow_key, request.lease())
     result = finalizer.finalize(TerminalClaim.failure(
         identity.workflow_key,
