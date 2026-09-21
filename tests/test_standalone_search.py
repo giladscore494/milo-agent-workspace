@@ -28,7 +28,7 @@ import pytest
 
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker
 from backend.engines.vehicle_catalog_v1 import core
-from backend.provider_authority import (ProviderAdapter,
+from backend.provider_authority import (ProviderAdapter, provider_base_url,
                                         request_offers_builtin_search)
 from backend.provider_quota import (MemoryQuotaBackend, ProviderQuotaCoordinator,
                                     QuotaConfig)
@@ -43,7 +43,8 @@ from backend.standalone_search import (MAX_RESULTS_PER_SEARCH,
                                        MoonshotStandaloneSearch, SearchOutcome,
                                        SearchResult, SearchTransportError,
                                        SearchUnavailable, normalize_results,
-                                       request_offers_provider_executed_search)
+                                       request_offers_provider_executed_search,
+                                       search_base_url)
 
 # =============================================================================
 # helpers
@@ -321,8 +322,46 @@ def test_internet_search_still_happens_through_the_standalone_path(v1):
               final_response('{"models":[]}')])
     assert run.executor.calls == 1, "no internet search was performed"
     assert run.executor.queries == ["hyundai ioniq 5 israel price"]
-    assert run.executor.endpoints == ["search"]
+    assert run.executor.endpoints == ["search_pro"]
     assert run.tracker.search_invocations == 1
+
+
+def test_chat_and_search_share_one_provider_base_url(monkeypatch):
+    """The one deployment knob cannot silently send V1 chat and search apart."""
+    configured = "https://provider-proxy.example/v1"
+    monkeypatch.setenv("MILO_MODEL_BASE_URL", configured + "/")
+
+    scheduler = ProviderScheduler(ProviderLimitsConfig())
+    adapter = ProviderAdapter(scheduler)
+    seen: list[str] = []
+
+    monkeypatch.setattr(core, "PROVIDER_SCHEDULER", scheduler)
+    monkeypatch.setattr(core, "PROVIDER_ADAPTER", adapter)
+    monkeypatch.setattr(core, "MODEL_CLIENT_FACTORY",
+                        lambda api_key, base_url: seen.append(base_url) or object())
+
+    core._provider_client("k")
+
+    assert provider_base_url() == configured
+    assert search_base_url() == configured
+    assert seen == [configured], "V1 chat ignored the canonical provider base URL"
+
+
+def test_search_pro_chunks_become_bounded_model_facing_passages():
+    """Pro's ranked passages, not its thin snippet, are what the agent reads."""
+    results = normalize_results({"search_results": [{
+        "title": "Official source",
+        "url": "https://example.test/model",
+        "snippet": "thin search-engine snippet",
+        "chunks": [
+            {"text": "First query-relevant passage.", "score": 1.2},
+            {"text": "Second query-relevant passage.", "score": 0.9},
+        ],
+    }]})
+    assert len(results) == 1
+    assert "First query-relevant passage." in results[0].snippet
+    assert "Second query-relevant passage." in results[0].snippet
+    assert "thin search-engine snippet" not in results[0].snippet
 
 
 def test_the_standalone_transport_posts_one_request_to_the_search_endpoint():
