@@ -16,8 +16,12 @@ from backend.runtime import TERMINAL_STATES, CancellationRequested, RunEventReco
 from backend.supervisor import SupervisorInput, apply_event_to_blackboard, build_evaluation_report, initial_blackboard, make_shadow_decision, route_event_message
 from backend.engines.vehicle_catalog_v1 import VehicleCatalogV1Adapter
 from backend.worker.engine import Engine, EngineRegistry, EngineResolver
-from backend.run_identity import (RunIdentityError, execution_identity_problems,
-                                  persisted_identity)
+from backend.run_identity import (
+    PRODUCT_WORKFLOW_KEYS,
+    RunIdentityError,
+    execution_identity_problems,
+    persisted_identity,
+)
 
 
 def resolve_run_id(cli_run_id: str | None) -> UUID:
@@ -124,6 +128,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             "RUN_IDENTITY_REQUIRED",
             "run predates immutable identity and cannot be executed or resumed",
             409,
+        )
+    if preclaim_identity.workflow_key not in PRODUCT_WORKFLOW_KEYS:
+        raise AppError(
+            "ENGINE_NOT_ALLOWED",
+            "control-plane run identity cannot be executed by the product worker",
+            403,
         )
     if execution_identity_problems(preclaim_identity):
         raise AppError(
