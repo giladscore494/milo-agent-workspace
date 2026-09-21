@@ -15,6 +15,7 @@ this set wins and the older document carries an archive banner.
 | [AUTHORIZATION_AND_RLS.md](AUTHORIZATION_AND_RLS.md) | Ownership, membership, RLS |
 | [RUN_LIFECYCLE.md](RUN_LIFECYCLE.md) | Run/launch lifecycle, leases, idempotency, cancellation |
 | [RUN_FINALIZATION.md](RUN_FINALIZATION.md) | The one finalizer, the canonical ProductOutcome, terminal races, Stage D semantic acceptance |
+| [EVIDENCE_AUTHORITY.md](EVIDENCE_AUTHORITY.md) | The canonical evidence model, the CURRENT verdict rule, V1's evidence flow and the promotion gates |
 | [BUDGETS_AND_COSTS.md](BUDGETS_AND_COSTS.md) | Hard budgets, reservations, settlement, costs |
 | [RATE_LIMITING.md](RATE_LIMITING.md) | Shared-store rate limiting (gateway + API) |
 | [ENVIRONMENT_MATRIX.md](ENVIRONMENT_MATRIX.md) | Every production variable, classified |

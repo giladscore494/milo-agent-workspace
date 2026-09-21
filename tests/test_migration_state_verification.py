@@ -63,7 +63,7 @@ PRODUCTION_APPLIED = [
     "20260823000100",
 ]
 
-# The eleven local migrations production has never applied.
+# The local migrations production has never applied.
 PRODUCTION_PENDING = [
     "20260828000100",
     "20260828000200",
@@ -76,6 +76,7 @@ PRODUCTION_PENDING = [
     "20260916120000",
     "20260920000100",
     "20260920000200",
+    "20260921000100",
 ]
 
 
@@ -164,11 +165,11 @@ def test_production_history_is_partially_migrated_and_never_fully_migrated(local
     assert report["blocked"] is False
 
 
-def test_production_history_reports_exactly_the_eleven_pending_migrations(local):
+def test_production_history_reports_exactly_the_pending_migrations(local):
     report = classify(local, observation(applied=PRODUCTION_APPLIED))
 
     assert [entry["version"] for entry in report["missing"]] == PRODUCTION_PENDING
-    assert report["missing_count"] == len(PRODUCTION_PENDING) == 11
+    assert report["missing_count"] == len(PRODUCTION_PENDING)
     # Every pending migration is reported by FILE too, so the operator can
     # apply the tail without reconstructing filenames from versions.
     assert [entry["file"] for entry in report["missing"]] == [
@@ -183,14 +184,14 @@ def test_production_history_is_not_fully_migrated_even_with_every_numeric_marker
     """The exact false green this redesign removes.
 
     All fifteen 001–015 markers present, every one of their objects really
-    there — and eleven timestamped migrations absent. The old marker-only
+    there — and every timestamped migration since absent. The old marker-only
     comparison answered `fully-migrated` here.
     """
     numeric_markers = {version: True for version in MARKERS if len(version) == 3}
     report = classify(local, observation(applied=PRODUCTION_APPLIED, markers=numeric_markers))
 
     assert report["state"] == "partially-migrated"
-    assert report["missing_count"] == len(PRODUCTION_PENDING) == 11
+    assert report["missing_count"] == len(PRODUCTION_PENDING)
 
 
 def test_complete_local_history_is_fully_migrated(local):
@@ -482,7 +483,7 @@ def test_shell_reports_production_history_as_partially_migrated(tmp_path):
     assert result.returncode == 0
 
 
-def test_shell_names_every_one_of_the_ten_pending_migrations(tmp_path):
+def test_shell_names_every_pending_migration(tmp_path):
     result, _ = remote_run(tmp_path, PRODUCTION_APPLIED)
 
     missing_line = next(line for line in result.stdout.splitlines() if "remote:missing" in line)

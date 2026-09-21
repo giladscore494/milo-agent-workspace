@@ -20,7 +20,7 @@ locator, for that exact candidate.
 
 The chain each field is held to, end to end:
 
-    candidate  ->  catalog_candidate_evidence_links  ->  claim  ->  verdict
+    candidate  ->  catalog_candidate_evidence_links  ->  claim  ->  CURRENT verdict
                                                      ->  source ->  version + locator
 
 A field with no link is not promoted. A link whose claim states a different
@@ -28,6 +28,20 @@ field, or the same field at a different value, is refused. A link of another
 candidate, of a `legacy_reference` snapshot, or carrying a verdict that is not
 exactly `verified`, is refused. None of that is a judgement call at promotion
 time: it is the same set of facts, read twice, in two places.
+
+R5: "verified" means VERIFIED NOW
+---------------------------------
+
+`public.claim_verdicts` is append-only, so "a verified verdict exists for this
+claim" stays true forever -- including after a re-verification rejected the
+claim, after a contradiction was decided against it, and for a `verified` row
+that cites no durable evidence at all. This module therefore consumes a
+RESOLVED CURRENT state (`backend/engines/swarm_v2/current_verdict.py`) rather
+than verdict rows: a link is evidence for a promotion only when the claim's
+CURRENT state is `supported` and the verdict the link cites is the very row
+that state names. A stale historical `verified` authorizes nothing here, and
+`supabase/migrations/20260921000100_current_verdict_authority.sql` refuses the
+same thing at the durable boundary for every other writer.
 
 What this module never does
 ---------------------------
@@ -44,21 +58,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-from backend.errors import AppError
+from backend.engines.swarm_v2.current_verdict import (CurrentVerdict, CurrentVerdictError,
+                                                      parse_current_verdict)
+from backend.errors import LEASE_FAILURE_CODES, AppError
 
 from .contracts import (CANONICAL_DIMENSION_PREFIX, CANONICAL_VARIANT_FIELDS,
                         is_evidence_family, stated_canonical_fields)
 from .payloads import prepare_promotion
 
-#: The repository codes that mean "this worker no longer holds the run".
-#:
-#: Two spellings for one condition, and both must escape: the Supabase
-#: repository classifies a stale-lease RPC failure as `RUN_LEASE_LOST`, and the
-#: in-memory repository raises `RUN_TRANSITION_CONFLICT` from the same check.
-#: A stale worker is an INFRASTRUCTURE outcome that has to reach the worker's
-#: own lease handling; laundering it into a promotion refusal would make a lost
-#: lease look like a decision about the evidence.
-LEASE_FAILURE_CODES = frozenset({"RUN_LEASE_LOST", "RUN_TRANSITION_CONFLICT"})
+#: Re-exported from `backend/errors.py`, where the one definition lives: more
+#: than one subsystem has to recognise a lost lease, and two copies of the set
+#: would be two answers to "is this worker still the run's writer". Kept under
+#: this name because every caller in this package already imports it from here.
 
 #: The one status a candidate may be promoted from. `candidate` is an unread
 #: reading, `ambiguous` is a first-class answer that promotion must not
@@ -83,6 +94,10 @@ PROMOTION_REASONS: Mapping[str, str] = {
         "an evidence link belongs to another candidate",
     "CATALOG_PROMOTION_LINK_UNVERIFIED":
         "an evidence link carries no verified verdict",
+    "CATALOG_PROMOTION_EVIDENCE_UNSUPPORTED":
+        "the current verdict for that claim does not support a canonical fact",
+    "CATALOG_PROMOTION_EVIDENCE_NOT_CURRENT":
+        "an evidence link cites a verdict that is no longer the current one",
     "CATALOG_PROMOTION_CONFLICT_UNRESOLVED":
         "two verified sources disagree about that field and nothing has resolved it",
     "CATALOG_PROMOTION_REFUSED":
@@ -180,9 +195,26 @@ def _claim_value(claim: Mapping[str, Any]) -> Any:
     return claim.get("value")
 
 
+def current_verdict_for(claim_id: Any,
+                        current_verdicts: Mapping[str, Any]) -> CurrentVerdict:
+    """The resolved CURRENT state of one claim, or a refusal.
+
+    A state this layer cannot read is a refusal, never an assumption: "we could
+    not resolve whether this claim is still verified" and "it is still
+    verified" are different answers, and only one of them may promote.
+    """
+    raw = current_verdicts.get(str(claim_id))
+    if raw is None:
+        raise CatalogPromotionError("CATALOG_PROMOTION_EVIDENCE_NOT_CURRENT")
+    try:
+        return parse_current_verdict(raw)
+    except CurrentVerdictError:
+        raise CatalogPromotionError("CATALOG_PROMOTION_EVIDENCE_NOT_CURRENT") from None
+
+
 def field_evidence_for(*, candidate: Mapping[str, Any], links: Sequence[Mapping[str, Any]],
                        claims: Mapping[str, Mapping[str, Any]],
-                       verdicts: Mapping[str, Mapping[str, Any]]) -> tuple[FieldEvidence, ...]:
+                       current_verdicts: Mapping[str, Any]) -> tuple[FieldEvidence, ...]:
     """Read the field evidence a set of links actually supports, or refuse.
 
     Deterministic and total: every link is examined, and a link this function
@@ -190,6 +222,12 @@ def field_evidence_for(*, candidate: Mapping[str, Any], links: Sequence[Mapping[
     links supporting the SAME field are allowed only when they agree on the
     value -- which is what "one field, one promoted value" means; a
     disagreement is an unresolved conflict and is refused here as one.
+
+    `current_verdicts` is the RESOLVED current state per claim id -- not the
+    run's verdict history. That is the R5 change and it is the whole point:
+    this function can no longer be handed a set of `verified` rows and asked
+    whether one of them exists, because the answer to that question stays yes
+    after the claim has been rejected, superseded or contested.
     """
     by_field: dict[str, FieldEvidence] = {}
     for link in links:
@@ -198,12 +236,18 @@ def field_evidence_for(*, candidate: Mapping[str, Any], links: Sequence[Mapping[
         verdict_id = link.get("verdict_id")
         if not verdict_id:
             raise CatalogPromotionError("CATALOG_PROMOTION_LINK_UNVERIFIED")
-        verdict = verdicts.get(str(verdict_id))
-        if verdict is None or verdict.get("verdict") != "verified":
-            raise CatalogPromotionError("CATALOG_PROMOTION_LINK_UNVERIFIED")
         claim = claims.get(str(link.get("claim_id")))
         if claim is None:
             raise CatalogPromotionError("CATALOG_PROMOTION_FIELD_UNSUPPORTED")
+        # CURRENT truth, in two steps that mean two different things: the claim
+        # must be verified NOW, and the row this link cites must be the very
+        # verdict that says so. A link citing a superseded `verified` fails the
+        # second even when some newer verdict would pass the first.
+        current = current_verdict_for(claim.get("id"), current_verdicts)
+        if not current.supported:
+            raise CatalogPromotionError("CATALOG_PROMOTION_EVIDENCE_UNSUPPORTED")
+        if not current.authorizes(verdict_id):
+            raise CatalogPromotionError("CATALOG_PROMOTION_EVIDENCE_NOT_CURRENT")
         field_key = str(claim.get("field_key"))
         if field_key not in CANONICAL_VARIANT_FIELDS:
             # A verified claim about something the canonical catalog does not
@@ -381,4 +425,4 @@ class CanonicalPromotion:
 __all__ = ["LEASE_FAILURE_CODES", "PROMOTABLE_CANDIDATE_STATUS", "PROMOTION_REASONS",
            "CanonicalPromotion",
            "CatalogPromotionError", "FieldEvidence", "PromotionOutcome", "PromotionPlan",
-           "build_promotion_plan", "field_evidence_for"]
+           "build_promotion_plan", "current_verdict_for", "field_evidence_for"]
