@@ -4,7 +4,9 @@
     "test suites so the two contracts cannot drift apart.",
     "Backend: tests/test_run_usage_contract.py regenerates these through the real",
     "FastAPI app and asserts equality. Frontend: tests/runUsageContract.test.ts",
-    "parses them with lib/runUsage.ts. Ids are fixed placeholders."
+    "parses them with lib/runUsage.ts. Ids are fixed placeholders, and so is",
+    "run_identity.run_id, which names the run it belongs to. Every other identity",
+    "dimension is a property of the running image and is compared strictly."
   ],
   "settled": {
     "id": "1bbde49b-61a0-4378-9ee7-6fca3818060d",
@@ -34,6 +36,17 @@
       "agent_steps": 7,
       "elapsed_seconds": 41.5
     },
+    "run_identity": {
+      "identity_version": "milo-run-identity/1",
+      "run_id": "1bbde49b-61a0-4378-9ee7-6fca3818060d",
+      "workflow_key": "vehicle_catalog_v1",
+      "engine_version": "vehicle_catalog_v1.stage3",
+      "policy_version": "milo-runtime-policy/1",
+      "policy_fingerprint": "7ffc0f6d36220ecdd773955ef4e89289d804fa86e2e279ddd93a6bd6c37ed52b",
+      "release_sha": "84cd8696119c24662a954d0f0e23195268dab23f",
+      "event_registry_version": "milo-event-registry/1",
+      "event_registry_fingerprint": "d8389533a754f0b04f30a1c66254e06ee3df7501c0c85da75423103f0d9fa46d"
+    },
     "created_at": null,
     "updated_at": null
   },
@@ -54,6 +67,17 @@
     "launch_error_class": null,
     "launch_reconciliation_required": false,
     "usage": null,
+    "run_identity": {
+      "identity_version": "milo-run-identity/1",
+      "run_id": "1bbde49b-61a0-4378-9ee7-6fca3818060d",
+      "workflow_key": "vehicle_catalog_v1",
+      "engine_version": "vehicle_catalog_v1.stage3",
+      "policy_version": "milo-runtime-policy/1",
+      "policy_fingerprint": "7ffc0f6d36220ecdd773955ef4e89289d804fa86e2e279ddd93a6bd6c37ed52b",
+      "release_sha": "84cd8696119c24662a954d0f0e23195268dab23f",
+      "event_registry_version": "milo-event-registry/1",
+      "event_registry_fingerprint": "d8389533a754f0b04f30a1c66254e06ee3df7501c0c85da75423103f0d9fa46d"
+    },
     "created_at": null,
     "updated_at": null
   }

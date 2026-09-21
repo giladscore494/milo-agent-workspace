@@ -52,6 +52,7 @@ from backend.testing.evidence_mappers import (StructuredRegistryEvidenceMapper,
                                               offline_evidence_mappers)
 from backend.tools import (MockDocumentArchiveTool, MockStructuredRegistryTool, ToolContext,
                            ToolRegistry)
+from tests.worker_fence import FENCE
 
 # --- deterministic offline fixture data --------------------------------------
 
@@ -421,6 +422,7 @@ def test_resume_after_partial_persistence_is_idempotent(board):
     bundle = offline_evidence_mappers().map(call_record(record_result()))
     # A worker that died after the source and its FIRST fragment were durable.
     partial = evidence.record_source(SourceCreate(
+        **FENCE,
         agent=bundle.source.agent, url=bundle.source.url, title=bundle.source.title,
         domain=bundle.source.domain, source_type=bundle.source.source_type,
         source_strength=bundle.source.source_strength, source_date=bundle.source.source_date,
@@ -457,7 +459,7 @@ def test_a_new_source_version_creates_new_provenance_instead_of_merging(board):
 
 def test_reusing_one_evidence_key_across_versions_fails_closed(board):
     evidence, repository = board
-    source = SourceCreate(agent="a", url="https://example.test/x", title="t",
+    source = SourceCreate(**FENCE, agent="a", url="https://example.test/x", title="t",
                           domain="example.test", source_type="structured",
                           source_strength="strong", query="q", tool_operation="t.op")
     evidence.record_source(source, task_key="task-1",
@@ -505,7 +507,7 @@ def test_an_r3_source_without_a_version_or_a_fragment_without_a_locator_is_rejec
                                 fragment_index=0, content_hash=fragment_content_hash("text"))
     # Half-specified focus provenance fails closed in the board and in the RPC.
     unversioned = evidence.record_source(
-        SourceCreate(agent="a", url="https://example.test/x", title="t", domain="example.test",
+        SourceCreate(**FENCE, agent="a", url="https://example.test/x", title="t", domain="example.test",
                      source_type="structured", source_strength="strong", query="q",
                      tool_operation="t.op"), task_key="task-1")
     with pytest.raises(EvidenceValidationError, match="both a type and a locator"):
@@ -517,7 +519,7 @@ def test_an_r3_source_without_a_version_or_a_fragment_without_a_locator_is_rejec
                                           locator_key=record_field_locator("r", ("f",)).locator_key)
     with pytest.raises(AssertionError, match="requires a versioned source"):
         evidence.record_claim(
-            ClaimCreate(entity_key="e", field_key="f", value="v", source_id=unversioned["id"],
+            ClaimCreate(**FENCE, entity_key="e", field_key="f", value="v", source_id=unversioned["id"],
                         source_strength="strong", confidence=0.9, agent="a"),
             task_key="task-1", evidence_locator=record_field_locator("r", ("f",)).locator_key)
 
@@ -656,7 +658,7 @@ def test_text_count_total_size_depth_and_locator_limits_are_rejected(board):
         fragment(MAX_FRAGMENTS_PER_SOURCE, "fifth")
     # ...and the durable boundary refuses it again if one is forced through.
     versioned = evidence.record_source(
-        SourceCreate(agent="a", url="https://example.test/x", title="t", domain="example.test",
+        SourceCreate(**FENCE, agent="a", url="https://example.test/x", title="t", domain="example.test",
                      source_type="structured", source_strength="strong", query="q",
                      tool_operation="t.op"),
         task_key="task-1", version=SourceVersion(kind="dataset_version", identifier="v1"))
@@ -769,7 +771,7 @@ def test_a_mismatched_content_hash_is_rejected(board):
     assert failure.value.reason_code == "EVIDENCE_FRAGMENT_HASH_MISMATCH"
     # And the durable boundary recomputes it too, exactly as PostgreSQL does.
     versioned = evidence.record_source(
-        SourceCreate(agent="a", url="https://example.test/x", title="t", domain="example.test",
+        SourceCreate(**FENCE, agent="a", url="https://example.test/x", title="t", domain="example.test",
                      source_type="structured", source_strength="strong", query="q",
                      tool_operation="t.op"),
         task_key="task-1", version=SourceVersion(kind="dataset_version", identifier="v1"))
@@ -1074,19 +1076,19 @@ def test_a_pre_r3_source_and_claim_replay_to_their_exact_pre_r3_identity(board):
         return f"{kind}:{hashlib.sha256(encoded.encode()).hexdigest()}"
 
     evidence, repository = board
-    source = SourceCreate(agent="worker", url="https://example.test/a", title="Evidence",
+    source = SourceCreate(**FENCE, agent="worker", url="https://example.test/a", title="Evidence",
                           domain="example.test", source_type="primary",
                           source_strength="strong", query="q", tool_operation="search")
     row = evidence.record_source(source, task_key="task-1")
     assert row["evidence_key"] == pre_r3_key(
-        "source", {"task_key": "task-1", **source.model_dump(mode="json")})
+        "source", {"task_key": "task-1", **source.content()})
 
-    claim = ClaimCreate(entity_key="vehicle:1", field_key="price", value=100,
+    claim = ClaimCreate(**FENCE, entity_key="vehicle:1", field_key="price", value=100,
                         time_scope={"as_of": "2026-08"}, market="IL", source_id=row["id"],
                         source_strength="strong", confidence=0.9, agent="worker")
     stored = evidence.record_claim(claim, task_key="task-1")
     assert stored["evidence_key"] == pre_r3_key(
-        "claim", {"task_key": "task-1", **claim.model_dump(mode="json")})
+        "claim", {"task_key": "task-1", **claim.content()})
 
     # And a pre-R3 fragment keeps its (task, source, content hash) identity.
     fragment = evidence.record_evidence_fragment(row["id"], "legacy text", task_key="task-1")

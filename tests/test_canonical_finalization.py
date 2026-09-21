@@ -40,6 +40,7 @@ from backend.product_outcome import (BLOCKING_CODES, SEMANTIC_STATUSES,
                                      safe_payload_reference)
 from backend.runtime import SupabaseEventSink
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 from backend.worker.main import execute_run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -151,7 +152,8 @@ def seeded_run_with(repo_class, workflow_key="swarm_v2"):
     repo.projects[str(project_id)]["workflow_key"] = workflow_key
     conversation = repo.create_conversation(project_id, "finalization")
     created = repo.create_message_and_run(
-        conversation["id"], "finalize me", {}, user_id, f"key-{uuid4()}", "fingerprint")
+        conversation["id"], "finalize me", {}, user_id, f"key-{uuid4()}", "fingerprint",
+        **identity_kwargs(repo, conversation["id"]))
     return repo, created["run"]["id"]
 
 

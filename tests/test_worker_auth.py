@@ -171,7 +171,11 @@ def test_valid_worker_identity_can_append_events_and_finish_runs(repo):
     # on every task of every run while the durable sink wrote it unchecked.
     swarm = c.post(f"/internal/runs/{repo.run_id}/events", json={**LEASE, "event_type": "task_started", "message": "t"}, headers=headers)
     assert swarm.status_code == 201
-    done = c.post(f"/internal/runs/{repo.run_id}/complete", json={**LEASE, "output": {"status": "success"}}, headers=headers)
+    # A real run ENVELOPE, not a bare status word: the canonical ProductOutcome
+    # reads what was actually produced, so `{"status": "success"}` with no
+    # document is `not_produced` and terminalizes as a failure, never a quiet
+    # success. This is what a worker that finished a run actually sends.
+    done = c.post(f"/internal/runs/{repo.run_id}/complete", json={**LEASE, "output": {"status": "success", "result": {"summary": "done"}}}, headers=headers)
     assert done.status_code == 200
     failed = c.post(f"/internal/runs/{repo.run_id}/fail", json={**LEASE, "code": "ENGINE_FAILED", "message": "boom"}, headers=headers)
     assert failed.status_code == 200

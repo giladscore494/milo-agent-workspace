@@ -44,6 +44,7 @@ from backend.production_config import TRUE_VALUES
 from backend.testing import government_capture as capture_fixtures
 from backend.testing.government_capture import FixtureTransport
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 
 ENTRYPOINT_SOURCE = Path("backend/catalog/operator_capture.py")
 
@@ -1620,7 +1621,8 @@ def ordinary_run_in(repository: MemoryRepository, conversation_id: UUID, user_id
     """
     result = repository.create_message_and_run(
         conversation_id, "an ordinary user prompt", dict(metadata or {}), user_id, key,
-        "fingerprint-of-an-ordinary-request")
+        "fingerprint-of-an-ordinary-request",
+        **identity_kwargs(repository, conversation_id))
     assert result["created"] is True
     return UUID(str(result["run"]["id"]))
 
@@ -1833,7 +1835,8 @@ def test_the_in_memory_creation_contract_matches_production(monkeypatch, reposit
     """
     conversation_id, user_id = seed_conversation(repository)
     first = repository.create_message_and_run(
-        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp")
+        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp",
+        **identity_kwargs(repository, conversation_id))
     assert first["created"] is True
     assert first["run"]["status"] == "queued"
     assert first["run"]["launch_state"] == "pending"
@@ -1843,7 +1846,8 @@ def test_the_in_memory_creation_contract_matches_production(monkeypatch, reposit
     messages_after_create = len(repository.messages)
 
     replay = repository.create_message_and_run(
-        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp")
+        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp",
+        **identity_kwargs(repository, conversation_id))
     assert replay["created"] is False
     assert replay["run"]["id"] == first["run"]["id"]
     # No message is written on a replay -- the lookup precedes every insert.
@@ -1855,7 +1859,8 @@ def test_the_in_memory_creation_contract_matches_production(monkeypatch, reposit
     project_id = repository.conversations[str(conversation_id)]["project_id"]
     repository.members.add((project_id, str(other_user)))
     distinct = repository.create_message_and_run(
-        conversation_id, "content", {"k": "v"}, other_user, "parity-key", "fp")
+        conversation_id, "content", {"k": "v"}, other_user, "parity-key", "fp",
+        **identity_kwargs(repository, conversation_id))
     assert distinct["created"] is True
     assert distinct["run"]["id"] != first["run"]["id"]
 

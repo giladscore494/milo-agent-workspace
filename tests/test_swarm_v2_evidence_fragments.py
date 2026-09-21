@@ -23,6 +23,7 @@ from backend.engines.swarm_v2.fragments import (MAX_FRAGMENT_CHARS, MAX_FRAGMENT
 from backend.repository.supabase import SupabaseRepository
 from backend.runtime import EVENT_TYPES
 from backend.schemas import ClaimCreate, SourceCreate
+from tests.worker_fence import FENCE
 
 
 class GuardedFragmentRepository:
@@ -106,13 +107,13 @@ def board():
 
 
 def source(url="https://example.test/a"):
-    return SourceCreate(agent="worker", url=url, title="Evidence", domain="example.test",
+    return SourceCreate(**FENCE, agent="worker", url=url, title="Evidence", domain="example.test",
                         source_type="primary", source_strength="strong", query="q",
                         tool_operation="search")
 
 
 def claim(source_id, value):
-    return ClaimCreate(entity_key="vehicle:1", field_key="price", value=value,
+    return ClaimCreate(**FENCE, entity_key="vehicle:1", field_key="price", value=value,
                        time_scope={"as_of": "2026-08"}, market="IL", source_id=source_id,
                        source_strength="strong", confidence=0.9, agent="worker")
 

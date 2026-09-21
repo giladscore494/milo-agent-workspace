@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from backend.dependencies import get_job_launcher, get_repository
 from backend.errors import AppError, NotFoundError
 from backend.main import app
+from backend.run_identity import RunIdentity
 
 
 class FakeRepo:
@@ -59,15 +60,41 @@ class FakeRepo:
         self.created_runs += 1
         self.queued_message_id = user_message_id
         return {"id": self.run_id, "conversation_id": conversation_id, "status": "queued", "launch_state": "pending", "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata}, **{k: str(v) for k, v in kwargs.items() if v is not None}}
+    def create_message_and_run(self, conversation_id, content, metadata, requested_by, idempotency_key, request_fingerprint, max_user_active=None, max_project_active=None, *, run_id, run_identity):
+        # Console 6's atomic creator: the message, the run and the run's
+        # immutable identity commit together, so the fake records one message
+        # and one run from the single call that makes both.
+        self.get_conversation(conversation_id)
+        if run_identity.get("run_id") != str(run_id):
+            raise AppError("RUN_IDENTITY_INVALID", "identity names a different run", 409)
+        self.created_messages += 1
+        self.created_runs += 1
+        self.run_id = UUID(str(run_id))
+        return {"created": True, "run": {"id": run_id, "conversation_id": conversation_id,
+                                         "status": "queued", "launch_state": "pending",
+                                         "requested_by": str(requested_by),
+                                         "idempotency_key": idempotency_key,
+                                         "request_fingerprint": request_fingerprint,
+                                         "run_identity": dict(run_identity),
+                                         "input": {"content": content, "metadata": metadata}}}
     def find_run_by_idempotency(self, conversation_id, user_id, idempotency_key):
         return None
     def set_launch_state(self, run_id, state, error=None):
         self.launch_states = getattr(self, "launch_states", []) + [state]
         return {"id": run_id, "launch_state": state}
+    def run_identity(self):
+        """Bound lazily, so it states the RUNNING image the test is exercising.
+
+        Console 6 gives every executable run an immutable identity, and the
+        worker surfaces refuse a run that carries none. A fake whose runs had
+        no identity would be a fake of the product that came before.
+        """
+        return RunIdentity.bind(self.run_id, self.project()["workflow_key"]).as_record()
     def get_run(self, run_id, user_id=None):
         self._fail()
         if (user_id is not None and user_id != self.user_id) or UUID(str(run_id)) != self.run_id: raise NotFoundError("run", str(run_id))
-        return {"id": run_id, "conversation_id": self.conversation_id, "status": "queued"}
+        return {"id": run_id, "conversation_id": self.conversation_id, "status": "queued",
+                "run_identity": self.run_identity()}
     def list_run_events(self, run_id, user_id=None, after_event_id=None):
         self.get_run(run_id, user_id); return []
     def list_conversations(self, project_id):
@@ -116,6 +143,19 @@ class FakeRepo:
     def mark_run_failed(self, run_id, code, message, worker_id=None, attempt=None, lease_token=None):
         self._record_lease(worker_id, attempt, lease_token)
         self.failed_runs += 1; return {"id": run_id, "conversation_id": self.conversation_id, "status": "failed", "error": {"code": code, "message": message}}
+    def finalize_run(self, run_id, status, expected_status, event=None, *, worker_id, attempt, lease_token, **fields):
+        # Parity with `finalize_run_guarded`: the terminal status and the
+        # terminal event are ONE fenced write. The route reaches this through
+        # RunFinalizer, which is the only terminalization authority.
+        self._record_lease(worker_id, attempt, lease_token)
+        if status == "failed":
+            self.failed_runs += 1
+        else:
+            self.completed_runs += 1
+        if event is not None:
+            self.appended_events += 1
+        return {"id": run_id, "conversation_id": self.conversation_id, "status": status,
+                "run_identity": self.run_identity(), **fields}
 
     def assert_no_mutations(self):
         assert self.created_messages == 0

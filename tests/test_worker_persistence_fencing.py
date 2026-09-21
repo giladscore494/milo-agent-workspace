@@ -35,6 +35,7 @@ import pytest
 from backend.errors import AppError
 from backend.repository.supabase import Repository, SupabaseRepository
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 
 LEASE_FIELDS = {"worker_id", "attempt", "lease_token"}
 
@@ -47,7 +48,8 @@ def claimed_run():
     repo.seed_project(str(project_id), "fencing", "Fencing", [str(user_id)])
     conversation = repo.create_conversation(project_id, "fencing")
     created = repo.create_message_and_run(conversation["id"], "go", {}, user_id,
-                                          f"key-{uuid4()}", "fingerprint")
+                                          f"key-{uuid4()}", "fingerprint",
+                                          **identity_kwargs(repo, conversation["id"]))
     run_id = UUID(str(created["run"]["id"]))
     first = repo.claim_run(run_id, "worker-1")
     stale = {"worker_id": "worker-1", "attempt": first["attempt"],

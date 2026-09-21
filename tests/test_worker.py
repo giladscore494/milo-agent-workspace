@@ -4,6 +4,7 @@ import pytest
 from backend.errors import AppError
 from backend.worker.main import execute_run, resolve_run_id
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker
+from tests.run_factory import identity_kwargs
 
 
 class WorkerRepo:
@@ -180,7 +181,8 @@ def test_stale_worker_every_mutation_rejected_via_memory_repository():
     repo.seed_user("aaaaaaaa-1111-4111-8111-000000000001")
     repo.seed_project("bbbbbbbb-1111-4111-8111-000000000001", "stale", "Stale", ["aaaaaaaa-1111-4111-8111-000000000001"])
     conversation = repo.create_conversation("bbbbbbbb-1111-4111-8111-000000000001", "stale run")
-    created = repo.create_message_and_run(conversation["id"], "content", {}, "aaaaaaaa-1111-4111-8111-000000000001", "stale-key", "fp")
+    created = repo.create_message_and_run(conversation["id"], "content", {}, "aaaaaaaa-1111-4111-8111-000000000001", "stale-key", "fp",
+                                          **identity_kwargs(repo, conversation["id"]))
     run_id = created["run"]["id"]
 
     run_a = repo.claim_run(run_id, "worker-A")

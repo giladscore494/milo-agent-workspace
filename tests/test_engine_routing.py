@@ -6,6 +6,7 @@ import pytest
 
 from backend.errors import AppError
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 from backend.worker.engine import EngineRegistry, EngineResolver
 from backend.worker.main import execute_run
 
@@ -28,7 +29,8 @@ def seeded_run(workflow_key="vehicle_catalog_v1", metadata=None):
     repo.projects[str(project_id)]["workflow_key"] = workflow_key
     conversation = repo.create_conversation(project_id, "routing")
     created = repo.create_message_and_run(
-        conversation["id"], "route me", metadata or {}, user_id, "routing-key", "fingerprint"
+        conversation["id"], "route me", metadata or {}, user_id, "routing-key", "fingerprint",
+        **identity_kwargs(repo, conversation["id"])
     )
     return repo, created["run"]["id"], project_id
 

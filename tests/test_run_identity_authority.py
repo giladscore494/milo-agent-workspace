@@ -29,6 +29,7 @@ from backend.run_identity import (ENGINE_VERSIONS, IDENTITY_FIELDS, IDENTITY_VER
                                   reviewed_policy_fingerprint)
 from backend.runtime_policy import POLICY_SCHEMA_VERSION
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 from backend.worker.engine import EngineRegistry, EngineResolver
 
 RUN_A = "11111111-1111-4111-8111-000000000001"
@@ -88,7 +89,7 @@ def test_an_unstated_or_malformed_release_is_recorded_as_unstated_never_as_a_wil
     ({**identity(), "workflow_key": ""}, "RUN_IDENTITY_INCOMPLETE"),
     ({**identity(), "policy_fingerprint": ""}, "RUN_IDENTITY_INCOMPLETE"),
     ({**identity(), "workflow_key": "not_an_engine"}, "RUN_IDENTITY_WORKFLOW_UNKNOWN"),
-    ({**identity(), "engine_version": "swarm_v2.0"}, "RUN_IDENTITY_ENGINE_MISMATCH"),
+    ({**identity(), "engine_version": "swarm_v2.0"}, "RUN_IDENTITY_ENGINE_UNKNOWN"),
 ])
 def test_an_untrustworthy_identity_fails_closed_with_a_static_code(broken, code):
     with pytest.raises(RunIdentityError) as raised:
@@ -125,42 +126,82 @@ def test_an_identity_may_be_rebound_identically_and_never_changed():
 # ---------------------------------------------------------------------------
 # 2. the repository refuses a rewrite (parity with the database trigger)
 # ---------------------------------------------------------------------------
-def seeded_repo(workflow_key="swarm_v2"):
+def seeded_conversation(workflow_key="swarm_v2"):
     repo = MemoryRepository()
     project_id, user_id = uuid4(), uuid4()
     repo.seed_user(str(user_id))
     repo.seed_project(str(project_id), "identity", "Identity", [str(user_id)])
     repo.projects[str(project_id)]["workflow_key"] = workflow_key
     conversation = repo.create_conversation(project_id, "identity")
-    created = repo.create_message_and_run(conversation["id"], "go", {}, user_id,
-                                          f"key-{uuid4()}", "fingerprint")
-    return repo, UUID(str(created["run"]["id"])), project_id
+    return repo, conversation["id"], user_id
+
+
+def seeded_repo(workflow_key="swarm_v2"):
+    """A run created the way the product creates one: message, run and
+    immutable identity in a single transaction."""
+    repo, conversation_id, user_id = seeded_conversation(workflow_key)
+    project_id = repo.get_conversation(conversation_id)["project_id"]
+    created = repo.create_message_and_run(conversation_id, "go", {}, user_id,
+                                          f"key-{uuid4()}", "fingerprint",
+                                          **identity_kwargs(repo, conversation_id))
+    return repo, UUID(str(created["run"]["id"])), UUID(str(project_id))
 
 
 def test_a_bound_run_cannot_be_rebound_to_a_different_engine():
     """REQUIRED REGRESSION 1: workflow/engine identity cannot change after
-    run creation. A V2 run must never later look like a V1 one."""
-    repo, run_id, _ = seeded_repo("swarm_v2")
-    repo.bind_run_identity(run_id, identity(str(run_id), "swarm_v2"))
+    run creation. A V2 run must never later look like a V1 one.
 
-    with pytest.raises(AppError) as raised:
-        repo.bind_run_identity(run_id, identity(str(run_id), "vehicle_catalog_v1"))
-    assert raised.value.code == "RUN_IDENTITY_IMMUTABLE"
+    The application half of this regression is now STRUCTURAL. Identity is
+    established inside the transaction that creates the run, so there is no
+    retrofit verb left to guard: `bind_run_identity` is gone from the
+    repository and dropped by the migration (`scripts/check_migrations.py`
+    asserts the drop). The database half -- `runs_forbid_identity_rewrite`
+    refusing ANY update that changes a non-null identity, including a direct
+    service-role write -- is proven against real PostgreSQL in
+    `tests/test_migrations_postgres.py`.
+    """
+    repo, run_id, _ = seeded_repo("swarm_v2")
+    held = repo.get_run(run_id)["run_identity"]
+    assert held["workflow_key"] == "swarm_v2"
+    assert held["run_id"] == str(run_id)
+
+    # The run was born bound: nothing had to retrofit it afterwards, and no
+    # repository verb exists that could express a rewrite.
+    assert not hasattr(repo, "bind_run_identity")
+
+    # And the guard still refuses the change the deleted verb used to make.
+    problems = identity_mutation_problems(held, identity(str(run_id), "vehicle_catalog_v1"))
+    assert problems and "immutable" in problems[0]
     assert repo.get_run(run_id)["run_identity"]["workflow_key"] == "swarm_v2"
 
 
-def test_rebinding_the_identical_identity_is_a_no_op():
-    repo, run_id, _ = seeded_repo()
-    record = identity(str(run_id), "swarm_v2")
-    first = repo.bind_run_identity(run_id, record)
-    second = repo.bind_run_identity(run_id, dict(record))
-    assert first["run_identity"] == second["run_identity"] == record
+def test_an_idempotent_replay_returns_the_one_run_and_its_one_identity():
+    """The only 're-bind' Console 6 leaves is a REPLAYED CREATION, and it
+    creates no second run and no second identity."""
+    repo, conversation_id, user_id = seeded_conversation("swarm_v2")
+    key = f"key-{uuid4()}"
+
+    first = repo.create_message_and_run(conversation_id, "go", {}, user_id, key, "fingerprint",
+                                        **identity_kwargs(repo, conversation_id))
+    replay = repo.create_message_and_run(conversation_id, "go", {}, user_id, key, "fingerprint",
+                                         **identity_kwargs(repo, conversation_id))
+
+    assert first["created"] is True and replay["created"] is False
+    assert replay["run"]["id"] == first["run"]["id"]
+    # The replay carried a freshly bound identity naming a DIFFERENT run id;
+    # it was discarded rather than written over the one already in force.
+    assert replay["run"]["run_identity"] == first["run"]["run_identity"]
 
 
-def test_an_identity_naming_another_run_is_refused_by_the_binder():
-    repo, run_id, _ = seeded_repo()
+def test_an_identity_naming_another_run_is_refused_at_creation():
+    """An identity is a statement about ONE run, so the creator refuses a
+    record lifted from another -- the check the binder used to make, moved to
+    the only place a run's identity is ever written."""
+    repo, conversation_id, user_id = seeded_conversation("swarm_v2")
     with pytest.raises(AppError) as raised:
-        repo.bind_run_identity(run_id, identity(RUN_B, "swarm_v2"))
+        repo.create_message_and_run(conversation_id, "go", {}, user_id,
+                                    f"key-{uuid4()}", "fingerprint",
+                                    run_id=uuid4(), run_identity=identity(RUN_B, "swarm_v2"))
     assert raised.value.code == "RUN_IDENTITY_INVALID"
 
 
@@ -186,7 +227,6 @@ def test_changing_the_project_workflow_cannot_change_a_bound_run():
     PROJECT's current workflow_key on every claim, so a project switched
     between creation and launch changed what the run was."""
     repo, run_id, project_id = seeded_repo("swarm_v2")
-    repo.bind_run_identity(run_id, identity(str(run_id), "swarm_v2"))
     repo.projects[str(project_id)]["workflow_key"] = "vehicle_catalog_v1"
 
     resolved = EngineResolver(repo, REGISTRY).resolve(repo.get_run(run_id))
@@ -198,8 +238,7 @@ def test_changing_the_project_workflow_cannot_change_a_bound_run():
 def test_resume_and_retry_resolve_the_identical_identity():
     """REQUIRED REGRESSION 2: resume/retry preserves exact run identity."""
     repo, run_id, project_id = seeded_repo("swarm_v2")
-    record = identity(str(run_id), "swarm_v2")
-    repo.bind_run_identity(run_id, record)
+    record = repo.get_run(run_id)["run_identity"]
     resolver = EngineResolver(repo, REGISTRY)
 
     first = resolver.resolve(repo.get_run(run_id))
@@ -224,11 +263,25 @@ def test_a_corrupt_identity_is_never_downgraded_to_the_legacy_project_route():
     assert raised.value.code == "ENGINE_NOT_ALLOWED"
 
 
-def test_a_run_created_before_identities_still_routes_and_says_it_is_unpinned():
-    repo, run_id, _ = seeded_repo("vehicle_catalog_v1")
-    resolved = EngineResolver(repo, REGISTRY).resolve(repo.get_run(run_id))
-    assert resolved.workflow_key == "vehicle_catalog_v1"
-    assert resolved.pinned is False
+def test_a_run_created_before_identities_is_readable_history_but_never_executable():
+    """A run with no identity predates identities, and that is ALL it means.
+
+    Routing such a run used to fall back to the project's CURRENT workflow --
+    the exact re-derivation this authority exists to remove, and the one that
+    let a project switched after creation change what an old run was. It is
+    now a refusal: the row stays readable history, and nothing executes or
+    resumes it.
+    """
+    repo, run_id, project_id = seeded_repo("vehicle_catalog_v1")
+    repo.runs[str(run_id)]["run_identity"] = None
+
+    with pytest.raises(AppError) as raised:
+        EngineResolver(repo, REGISTRY).resolve(repo.get_run(run_id))
+    assert raised.value.code == "RUN_IDENTITY_REQUIRED"
+
+    # Still readable, and still not re-derived from the project it belongs to.
+    assert repo.get_run(run_id)["status"] == "queued"
+    assert persisted_identity(repo.get_run(run_id)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -320,16 +373,21 @@ def test_the_run_read_states_the_identity_and_degrades_instead_of_failing():
     authoritative document. The run read is the endpoint the workspace polls
     several times a second: failing it on one malformed stored field would take
     the workspace down rather than degrade it, so an unreadable identity is
-    simply not stated and the browser falls back to the project."""
+    simply OMITTED. It is never replaced by the project's current workflow --
+    the browser renders a bounded identity-unavailable state instead, because a
+    fallback here would re-derive what a run is from what a project is today.
+    """
     from backend.main import _safe_run_identity
 
     record = identity(RUN_A, "swarm_v2")
-    stated = _safe_run_identity(record)
+    stated = _safe_run_identity(record, RUN_A)
     assert stated is not None and stated.workflow_key == "swarm_v2"
 
+    # Including a record lifted from a DIFFERENT run: the projection binds the
+    # identity to the run it was read from.
     for unreadable in (None, {}, "swarm_v2", [], {"workflow_key": "swarm_v2"},
-                       {**record, "run_id": "not-a-uuid"}):
-        assert _safe_run_identity(unreadable) is None, unreadable
+                       {**record, "run_id": "not-a-uuid"}, identity(RUN_B, "swarm_v2")):
+        assert _safe_run_identity(unreadable, RUN_A) is None, unreadable
 
 
 def test_the_run_read_never_exposes_the_lease_token():
