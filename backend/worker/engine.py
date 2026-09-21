@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from backend.errors import AppError
-from backend.run_identity import ENGINE_VERSIONS, RunIdentity, RunIdentityError, persisted_identity
+from backend.run_identity import (RunIdentity, RunIdentityError,
+                                  execution_identity_problems, persisted_identity)
 
 
 class Engine(Protocol):
@@ -97,14 +98,11 @@ class EngineResolver:
                 "run predates immutable identity and cannot be executed or resumed",
                 409,
             )
-        current_version = ENGINE_VERSIONS.get(identity.workflow_key)
-        if current_version != identity.engine_version:
-            # Historical identities may remain readable/exportable, but resume
-            # is a stronger claim: this binary may execute only the engine
-            # contract it currently ships.
+        mismatches = execution_identity_problems(identity)
+        if mismatches:
             raise AppError(
-                "ENGINE_VERSION_UNSUPPORTED_FOR_EXECUTION",
-                "run engine version is not executable by this release",
+                "RUN_IDENTITY_RUNTIME_MISMATCH",
+                "run identity does not match the runtime attempting to execute it",
                 409,
             )
         return ResolvedEngine(workflow_key=identity.workflow_key,
