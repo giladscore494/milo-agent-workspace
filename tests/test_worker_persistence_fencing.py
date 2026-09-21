@@ -81,7 +81,16 @@ def newly_fenced_writes(repo, run_id):
     }
 
 
-@pytest.mark.parametrize("name", sorted(newly_fenced_writes(*claimed_run()[:2])))
+#: The three names, stated once, so parametrisation does not build a
+#: repository at collection time.
+NEWLY_FENCED = ("append_usage_ledger", "create_tool_access_request", "create_tool_grant")
+
+
+def test_the_newly_fenced_set_is_the_one_the_writes_helper_offers():
+    assert sorted(NEWLY_FENCED) == sorted(newly_fenced_writes(*claimed_run()[:2]))
+
+
+@pytest.mark.parametrize("name", NEWLY_FENCED)
 def test_a_stale_worker_cannot_perform_a_newly_fenced_write(name):
     """REQUIRED REGRESSION 5, for the paths that had no fence at all."""
     repo, run_id, live, stale = claimed_run()
@@ -96,7 +105,7 @@ def test_a_stale_worker_cannot_perform_a_newly_fenced_write(name):
     assert writes[name](live) is not None
 
 
-@pytest.mark.parametrize("name", sorted(newly_fenced_writes(*claimed_run()[:2])))
+@pytest.mark.parametrize("name", NEWLY_FENCED)
 def test_a_partial_lease_is_refused_rather_than_skipping_the_check(name):
     """An absent component must never be read as 'no check required'."""
     repo, run_id, live, _ = claimed_run()

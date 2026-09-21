@@ -310,3 +310,33 @@ def test_the_export_module_has_no_engine_fallback_left_in_its_source():
     source = inspect.getsource(export_envelope.build_export_envelope)
     assert 'or "vehicle_catalog_v1"' not in source
     assert '(run.get("input") or {}).get("workflow_key")' not in source
+
+
+# ---------------------------------------------------------------------------
+# 5. the browser-visible projection
+# ---------------------------------------------------------------------------
+def test_the_run_read_states_the_identity_and_degrades_instead_of_failing():
+    """Strictness belongs where a guess would be laundered into an
+    authoritative document. The run read is the endpoint the workspace polls
+    several times a second: failing it on one malformed stored field would take
+    the workspace down rather than degrade it, so an unreadable identity is
+    simply not stated and the browser falls back to the project."""
+    from backend.main import _safe_run_identity
+
+    record = identity(RUN_A, "swarm_v2")
+    stated = _safe_run_identity(record)
+    assert stated is not None and stated.workflow_key == "swarm_v2"
+
+    for unreadable in (None, {}, "swarm_v2", [], {"workflow_key": "swarm_v2"},
+                       {**record, "run_id": "not-a-uuid"}):
+        assert _safe_run_identity(unreadable) is None, unreadable
+
+
+def test_the_run_read_never_exposes_the_lease_token():
+    from backend.main import _safe_run_response
+
+    safe = _safe_run_response({"id": RUN_A, "status": "running",
+                               "lease_token": "secret-lease",
+                               "run_identity": identity(RUN_A, "swarm_v2")})
+    assert "lease_token" not in safe
+    assert safe["run_identity"].workflow_key == "swarm_v2"

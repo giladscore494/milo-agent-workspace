@@ -38,6 +38,7 @@ from backend.schemas import (
     RunCreate,
     RunCreated,
     RunEvent,
+    RunIdentityRecord,
     RunUsage,
     WorkflowProposal,
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
@@ -121,6 +122,29 @@ def _safe_run_usage(raw: object) -> RunUsage | None:
     return usage if usage.model_dump(exclude_none=True) else None
 
 
+def _safe_run_identity(raw: object) -> RunIdentityRecord | None:
+    """Project the stored run identity onto the bounded public contract.
+
+    Strict where strictness matters and forgiving where it does not. An export
+    or a release gate REFUSES an unreadable identity, because a document that
+    will be read as authoritative must not carry a guessed engine. This is a
+    different surface: it is the endpoint the workspace polls several times a
+    second, and failing the whole run read on one malformed stored field would
+    take the workspace down rather than degrade it.
+
+    So an identity that does not validate is dropped, and the browser falls
+    back to the project's workflow key -- exactly what it does for a run
+    created before identities existed. Nothing is repaired and nothing is
+    defaulted; the field is simply not stated.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return None
+    try:
+        return RunIdentityRecord.model_validate(raw)
+    except ValidationError:
+        return None
+
+
 def _catalog_page_meta(page: catalog_review.CatalogPage) -> CatalogPageMeta:
     """The page metadata a bounded catalog read states.
 
@@ -151,6 +175,9 @@ def _safe_run_response(run: dict) -> dict:
     safe["launch_error_class"] = SAFE_LAUNCH_ERROR_CLASSES.get(launch_state)
     safe["launch_reconciliation_required"] = launch_state == "launch_unknown"
     safe["usage"] = _safe_run_usage(run.get("usage"))
+    # The run's own immutable identity, so the browser can render a historical
+    # run as the engine it WAS rather than as whatever its project is today.
+    safe["run_identity"] = _safe_run_identity(run.get(RUN_IDENTITY_FIELD))
     safe.pop("launch_error", None)
     safe.pop("lease_token", None)
     return safe

@@ -75,27 +75,34 @@ comment on column public.runs.run_identity is
 -- The record's full shape is validated in `backend/run_identity.py`, which is
 -- where the policy fingerprint and the engine registry live; the constraint
 -- here is the part the database can enforce on every path into the column.
+-- TWO blocks, not one, and that is load-bearing. `ADD ... NOT VALID` governs
+-- every future write without inspecting a single existing row, so it cannot
+-- fail on legacy data and must not be wrapped in a handler that would discard
+-- it. VALIDATE is the separate, retrospective step: it reads every row, and it
+-- is the only part that a hypothetical malformed legacy row could fail. If
+-- ADD and VALIDATE shared one block, a failed VALIDATE would roll the ADD back
+-- with it and leave NO constraint at all -- the opposite of what the handler
+-- is there to protect.
+alter table public.runs drop constraint if exists runs_run_identity_shape_check;
+alter table public.runs add constraint runs_run_identity_shape_check check (
+  run_identity is null or (
+    jsonb_typeof(run_identity) = 'object'
+    and nullif(run_identity->>'identity_version', '') is not null
+    and nullif(run_identity->>'workflow_key', '') is not null
+    and nullif(run_identity->>'engine_version', '') is not null
+    and nullif(run_identity->>'policy_fingerprint', '') is not null
+    and (run_identity->>'run_id')::uuid = id
+  )
+) not valid;
+
 do $$
 begin
-  alter table public.runs drop constraint if exists runs_run_identity_shape_check;
-  alter table public.runs add constraint runs_run_identity_shape_check check (
-    run_identity is null or (
-      jsonb_typeof(run_identity) = 'object'
-      and nullif(run_identity->>'identity_version', '') is not null
-      and nullif(run_identity->>'workflow_key', '') is not null
-      and nullif(run_identity->>'engine_version', '') is not null
-      and nullif(run_identity->>'policy_fingerprint', '') is not null
-      and (run_identity->>'run_id')::uuid = id
-    )
-  ) not valid;
-  -- Validated separately so the ADD cannot fail on a legacy row: every
-  -- pre-existing row has run_identity IS NULL and therefore satisfies it.
+  -- Every pre-existing row has run_identity IS NULL and therefore satisfies
+  -- this, so validation is expected to succeed. If some row somehow cannot,
+  -- losing the RETROSPECTIVE proof is acceptable; refusing to migrate
+  -- production is not. The constraint added above stays in force either way.
   alter table public.runs validate constraint runs_run_identity_shape_check;
 exception when others then
-  -- A legacy row that somehow cannot satisfy the constraint must not block the
-  -- migration; the constraint stays NOT VALID and still governs every new
-  -- write. Losing the retrospective proof is acceptable; refusing to migrate
-  -- production is not.
   null;
 end $$;
 
