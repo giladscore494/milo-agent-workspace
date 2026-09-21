@@ -21,7 +21,7 @@ class Repository(Protocol):
     def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
     def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]: ...
-    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]: ...
+    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None, *, run_id: UUID, run_identity: dict[str, Any]) -> dict[str, Any]: ...
     def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None: ...
     def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]: ...
     def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None: ...
@@ -31,6 +31,337 @@ class Repository(Protocol):
     def record_run_usage(self, run_id: UUID, ledger: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def get_run_usage_ledger(self, run_id: UUID) -> dict[str, Any] | None: ...
     def append_usage_ledger(self, entry: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
+    def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
+    def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def save_checkpoint(self, checkpoint: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None: ...
+    def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]: ...
+    def finalize_run(self, run_id: UUID, status: str, expected_status: str, event: dict[str, Any] | None = None, *, worker_id: str, attempt: int | None, lease_token: str | None, **fields: Any) -> dict[str, Any]: ...
+    def claim_run(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
+    def heartbeat(self, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
+    def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]: ...
+    def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any], project_id: UUID | None = None, created_by: UUID | None = None) -> dict[str, Any]: ...
+    def get_workflow_proposal(self, proposal_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
+    def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]: ...
+    def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any], created_by: UUID | None = None) -> dict[str, Any]: ...
+    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_tool_usage(self, run_id: UUID, usage: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_source(self, run_id: UUID, source: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_claim(self, run_id: UUID, claim: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_conflict(self, run_id: UUID, conflict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_evidence_fragment(self, run_id: UUID, fragment: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def list_sources_for_ids(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 50) -> list[dict[str, Any]]: ...
+    def list_evidence_fragments_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 200) -> list[dict[str, Any]]: ...
+    def list_structured_facts_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 200) -> list[dict[str, Any]]: ...
+    def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def claim_current_verdict_states(self, run_id: UUID, claim_ids: Iterable[Any] | None = None, *, limit: int = 200) -> list[dict[str, Any]]: ...
+    def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
+
+    # --- durable catalog staging (PR1: persistence only) ---------------------
+    #
+    # The evidence relations above are RUN-SCOPED and cascade away with their
+    # run.  These five write into the long-lived catalog namespace instead.
+    # Every one is lease-guarded exactly like the evidence writes, and every
+    # one is idempotent on a backend-derived key.  There is deliberately no
+    # canonical-promotion method here: the canonical tables are read-only in
+    # PR1 at the database level, so no repository method could write one.
+    def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_catalog_candidate(self, run_id: UUID, candidate: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def link_catalog_candidate_evidence(self, run_id: UUID, link: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+
+    # --- durable catalog reads (PR2: internal, bounded, no lease) ------------
+    #
+    # READS, so they take no lease: a lease authorizes a durable WRITE, and
+    # requiring one to look at already-durable catalog state would make a
+    # query layer impossible to build without holding a run open.  Each is
+    # bounded, each orders deterministically, and none of them accepts SQL, a
+    # table name, a column name or an ordering from its caller.
+    def list_active_catalog_snapshots(self, source_family: str, *, resource_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]: ...
+    def find_active_catalog_snapshot(self, source_family: str, resource_id: str, snapshot_key: str) -> dict[str, Any] | None: ...
+    def list_catalog_raw_records(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
+    def list_catalog_candidates(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
+
+    # --- bounded database-side catalog aggregation (PR3) ---------------------
+    #
+    # The Python projection reads a whole snapshot and refuses beyond
+    # MAX_PROJECTION_CANDIDATES.  These answer over a snapshot of ANY size by
+    # aggregating in the database: fixed filters, fixed ordering, an explicit
+    # page and the EXACT total, so `has_more` is a fact rather than a guess.
+    # Still reads, so still no lease, and still no SQL, table name, column name
+    # or ordering from a caller.
+    def catalog_candidate_manufacturers(self, snapshot_id: Any, *, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_candidate_models(self, snapshot_id: Any, *, manufacturer: str, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_candidate_model_years(self, snapshot_id: Any, *, manufacturer: str, commercial_model: str, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, official_model_code: str | None = None, trim: str | None = None, identity_dimensions: dict[str, Any] | None = None, status: str | None = None, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_raw_record_by_upstream_id(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None: ...
+    def catalog_snapshot_candidate_diff(self, previous_snapshot_id: Any, snapshot_id: Any, *, limit: int = MAX_DIFF_ITEMS, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_run_pending_promotions(self, run_id: UUID, tool_operation: str, *, limit: int = 25) -> list[dict[str, Any]]: ...
+
+    # --- field-level canonical promotion (PR3) -------------------------------
+    #
+    # The ONE write path into the canonical catalog.  Lease-guarded like every
+    # other durable worker write, idempotent on a derived promotion key, and
+    # atomic: the canonical identity and EVERY field's provenance are created
+    # in one transaction or not at all.
+    def promote_catalog_variant(self, run_id: UUID, promotion: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def get_canonical_catalog_variant(self, canonical_key: str) -> dict[str, Any] | None: ...
+    def list_canonical_field_provenance(self, variant_id: Any, *, limit: int = 200) -> list[dict[str, Any]]: ...
+    def list_canonical_catalog_variants(self, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, canonical_key: str | None = None, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]: ...
+
+    def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def list_unread_agent_messages(self, run_id: UUID, recipient: str = "supervisor") -> list[dict[str, Any]]: ...
+    def create_supervisor_decision(self, run_id: UUID, decision: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
+    def list_supervisor_decisions(self, run_id: UUID) -> list[dict[str, Any]]: ...
+
+
+class SupabaseRepository:
+    def __init__(self, settings: Settings):
+        self.client = create_client(str(settings.supabase_url), settings.supabase_service_role_key)
+
+    def _single(self, query: Any, resource: str, identifier: str) -> dict[str, Any]:
+        try:
+            data = query.execute().data
+        except Exception as exc:  # Supabase boundary only
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        if not data:
+            raise NotFoundError(resource, identifier)
+        return data[0] if isinstance(data, list) else data
+
+    def _many(self, query: Any) -> list[dict[str, Any]]:
+        try:
+            return query.execute().data or []
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+
+    def _many_with_count(self, query: Any) -> tuple[list[dict[str, Any]], int | None]:
+        """Rows PLUS the exact count PostgREST reported, or None for "not said".
+
+        Deliberately not folded into `_many`: a count is only present when the
+        query asked for one, and a caller that did not ask must not receive a
+        number it cannot account for.  The sanitized message is the same one
+        `_many` raises -- a PostgREST detail can quote SQL values, so it never
+        becomes the message.
+        """
+        try:
+            response = query.execute()
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        count = getattr(response, "count", None)
+        return (response.data or []), (None if count is None else int(count))
+
+    def list_projects(self, user_id: UUID | None = None) -> list[dict[str, Any]]:
+        if user_id is None:
+            return self._many(self.client.table("projects").select("*").order("created_at"))
+        return self._many(self.client.table("projects").select("*, project_members!inner(user_id)").eq("project_members.user_id", str(user_id)).order("created_at"))
+
+    def get_project(self, project_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
+        query = self.client.table("projects").select("*").eq("id", str(project_id)).limit(1)
+        if user_id is not None:
+            query = self.client.table("projects").select("*, project_members!inner(user_id)").eq("id", str(project_id)).eq("project_members.user_id", str(user_id)).limit(1)
+        return self._single(query, "project", str(project_id))
+
+    def create_conversation(self, project_id: UUID, title: str | None, user_id: UUID | None = None) -> dict[str, Any]:
+        self.get_project(project_id, user_id)
+        # conversations.title is NOT NULL in production; never insert None.
+        return self._single(self.client.table("conversations").insert({"project_id": str(project_id), "title": normalize_conversation_title(title)}).select("*"), "conversation", "new")
+
+    def list_conversations(self, project_id: UUID) -> list[dict[str, Any]]:
+        # Callers must have already verified project membership.
+        return self._many(self.client.table("conversations").select("*").eq("project_id", str(project_id)).order("created_at", desc=True).limit(200))
+
+    def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
+        query = self.client.table("conversations").select("*").eq("id", str(conversation_id)).limit(1)
+        if user_id is not None:
+            query = self.client.table("conversations").select("*, projects!inner(project_members!inner(user_id))").eq("id", str(conversation_id)).eq("projects.project_members.user_id", str(user_id)).limit(1)
+        return self._single(query, "conversation", str(conversation_id))
+
+    def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        self.get_conversation(conversation_id)
+        payload = {"conversation_id": str(conversation_id), "role": "user", "content": content, "metadata": metadata}
+        return self._single(self.client.table("messages").insert(payload).select("*"), "message", "new")
+
+    def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]:
+        # Production messages.id is bigint; run input stores its string form.
+        key = idempotency_key or metadata.get("idempotency_key") or metadata.get("proposal_id") or str(user_message_id)
+        payload = {
+            "conversation_id": str(conversation_id),
+            "status": "queued",
+            "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata},
+            "idempotency_key": key,
+            "launch_state": "pending",
+        }
+        if requested_by is not None:
+            payload["requested_by"] = str(requested_by)
+        if request_fingerprint is not None:
+            payload["request_fingerprint"] = request_fingerprint
+        if requested_by is not None and idempotency_key:
+            existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
+            if existing is not None:
+                return existing
+        try:
+            return self._single(self.client.table("runs").insert(payload).select("*"), "run", "new")
+        except AppError as exc:
+            # Unique (conversation, requested_by, idempotency_key) index may
+            # reject a concurrent duplicate; return the winner instead.
+            if requested_by is not None and idempotency_key and ("23505" in exc.message or "duplicate" in exc.message.lower()):
+                existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
+                if existing is not None:
+                    return existing
+            raise
+
+    def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None:
+        rows = self._many(
+            self.client.table("runs").select("*")
+            .eq("conversation_id", str(conversation_id))
+            .eq("requested_by", str(user_id))
+            .eq("idempotency_key", idempotency_key)
+            .limit(1)
+        )
+        return rows[0] if rows else None
+
+    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None, *, run_id: UUID, run_identity: dict[str, Any]) -> dict[str, Any]:
+        """Atomically create the message, queued run and immutable identity."""
+        try:
+            response = self.client.rpc("create_message_and_run_v3", {
+                "p_run_id": str(run_id),
+                "p_run_identity": run_identity,
+                "p_conversation_id": str(conversation_id),
+                "p_content": content,
+                "p_metadata": metadata,
+                "p_requested_by": str(requested_by),
+                "p_idempotency_key": idempotency_key,
+                "p_request_fingerprint": request_fingerprint,
+                "p_max_user_active": max_user_active,
+                "p_max_project_active": max_project_active,
+            }).execute()
+        except Exception as exc:
+            message = str(exc)
+            if "USER_CONCURRENCY_LIMIT" in message:
+                raise AppError("USER_CONCURRENCY_LIMIT", "too many active runs for this user", 429) from exc
+            if "PROJECT_CONCURRENCY_LIMIT" in message:
+                raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429) from exc
+            if "CONVERSATION_NOT_FOUND" in message:
+                raise NotFoundError("conversation", str(conversation_id)) from exc
+            if "RUN_IDENTITY_WORKFLOW_DRIFT" in message:
+                raise AppError("RUN_IDENTITY_WORKFLOW_DRIFT",
+                               "project workflow changed before the run could be created", 409) from exc
+            if "RUN_IDENTITY_INVALID" in message or "RUN_IDENTITY_REQUIRED" in message:
+                raise AppError("RUN_IDENTITY_INVALID", "run identity was rejected", 409) from exc
+            raise AppError("REPOSITORY_ERROR", message, 502) from exc
+        data = response.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not data or "run" not in data:
+            raise AppError("REPOSITORY_ERROR", "run creation returned no row", 502)
+        return data
+
+    def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None:
+        """Atomic compare-and-set on launch ownership: only one caller can
+        move pending/launch_failed -> launching for a queued run."""
+        try:
+            rows = self.client.table("runs").update({"launch_state": "launching"}).eq("id", str(run_id)).eq("status", "queued").in_("launch_state", ["pending", "launch_failed"]).select("*").execute().data or []
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        return rows[0] if rows else None
+
+    def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"launch_state": state}
+        if state == "launched":
+            payload["launched_at"] = datetime.now(UTC).isoformat()
+        if error is not None:
+            payload["launch_error"] = error
+        return self._single(self.client.table("runs").update(payload).eq("id", str(run_id)).select("*"), "run", str(run_id))
+
+    ACTIVE_RUN_STATES = ("queued", "launching", "starting", "running", "waiting", "cancellation_requested")
+
+    def count_active_runs_for_user(self, user_id: UUID) -> int:
+        rows = self._many(self.client.table("runs").select("id").eq("requested_by", str(user_id)).in_("status", list(self.ACTIVE_RUN_STATES)).limit(1000))
+        return len(rows)
+
+    def count_active_runs_for_project(self, project_id: UUID) -> int:
+        rows = self._many(self.client.table("runs").select("id, conversations!inner(project_id)").eq("conversations.project_id", str(project_id)).in_("status", list(self.ACTIVE_RUN_STATES)).limit(1000))
+        return len(rows)
+
+    def update_run_usage(self, run_id: UUID, usage: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
+        if worker_id is not None:
+            # Worker-originated usage snapshot: lease validity (including
+            # expiry) is decided by the DATABASE clock inside the guarded
+            # RPC; a stale worker cannot clobber the live worker's accounting.
+            return self._guarded_rpc("update_run_usage_guarded", {
+                "p_run_id": str(run_id),
+                "p_worker_id": worker_id,
+                "p_attempt": attempt,
+                "p_lease_token": lease_token,
+                "p_usage": usage,
+            }, "run")
+        try:
+            rows = self.client.table("runs").update({"usage": usage}).eq("id", str(run_id)).select("*").execute().data or []
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        if not rows:
+            raise NotFoundError("run", str(run_id))
+        return rows[0]
+
+    def record_run_usage(self, run_id: UUID, ledger: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Record the run's cumulative ExecutionUsageLedger (migration
+        20260920000100). The database MERGES component-wise (no accepted
+        write can lower a counter), advances `version` only on a real change,
+        verifies the lease under the database clock and projects the public
+        aggregate into `runs.usage` in the same transaction. Returns the
+        durable row: `ledger` (with its `ledger_version`) and `version`."""
+        row = self._guarded_rpc("record_run_usage_guarded", {
+            "p_run_id": str(run_id),
+            "p_worker_id": worker_id,
+            "p_attempt": attempt,
+            "p_lease_token": lease_token,
+            "p_ledger": ledger,
+        }, "run_execution_usage")
+        return row
+
+    def get_run_usage_ledger(self, run_id: UUID) -> dict[str, Any] | None:
+        """The durable ledger row of a run, or None before its first write."""
+        rows = self._many(
+            self.client.table("run_execution_usage").select("*").eq("run_id", str(run_id)).limit(1)
+        )
+        return rows[0] if rows else None
+
+    LEDGER_FIELDS = (
+        "run_id", "project_id", "user_id", "provider", "model", "call_seq", "decision",
+        "rejection_reason", "reserved_input_tokens", "reserved_output_tokens",
+        "actual_input_tokens", "actual_output_tokens", "estimated_cost", "actual_cost",
+    )
+
+    def append_usage_ledger(self, entry: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Append ONE per-call ledger row, under the worker's lease.
+
+        This was the last unfenced durable write a running worker performed:
+        every other usage surface (runs.usage, run_execution_usage) has been
+        lease-guarded since migration 20260920000100, but the per-call rows the
+        DAILY budget is summed from went straight into the table. A replaced
+        worker could therefore keep charging a run it no longer owned, against
+        the live worker's daily allowance.
+
+        The run id travels as the FENCED argument, not as a payload field, so
+        an entry naming another run cannot charge one.
+        """
+        run_id = entry.get("run_id")
+        if not run_id:
+            raise AppError("REPOSITORY_ERROR", "a usage ledger entry requires its run id", 502)
+        payload = {key: entry[key] for key in self.LEDGER_FIELDS
+                   if key != "run_id" and entry.get(key) is not None}
+        params = {**self._lease_params(UUID(str(run_id)), worker_id, attempt, lease_token),
+                  "p_entry": payload}
+        return self._guarded_rpc("append_usage_ledger_guarded", params, "run_usage_ledger")
+
     def sum_daily_ledger_cost(self, user_id: str | None = None, project_id: str | None = None, run_id: str | None = None, hours: int = 24) -> float:
         """Conservative daily spend: per call, the settled actual cost when
         recorded, otherwise the reserved estimate."""
