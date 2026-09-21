@@ -39,6 +39,7 @@ from tests.test_migrations_postgres import (
     MIGRATIONS,
     EphemeralPostgres,
     _require_pg_bin,
+    run_identity_literal,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -183,7 +184,7 @@ def test_inventory_is_derived_and_covers_known_worker_rpcs():
         "create_agent_message_guarded",
         "create_supervisor_decision_guarded",
         "update_run_usage_guarded",
-        "create_message_and_run_v2",
+        "create_message_and_run_v3",
     ):
         assert known in inventory, f"inventory derivation lost {known}"
     assert EXCLUDED_RPCS <= inventory, "exclusions must reference real call sites"
@@ -283,9 +284,14 @@ def test_worker_lifecycle_executes_under_service_role(acl_db):
         "'acl lifecycle conversation') on conflict do nothing"
     )
 
+    # V3 is the only creator: the run id and its immutable identity are chosen
+    # before the insert, because all three commit in one transaction.
+    new_run_id = "dddddddd-0000-0000-0000-000000000001"
     run_id = _as_role(
         acl_db, "service_role",
-        "select v->'run'->>'id' from public.create_message_and_run_v2("
+        "select v->'run'->>'id' from public.create_message_and_run_v3("
+        f"p_run_id := '{new_run_id}'::uuid, "
+        f"p_run_identity := {run_identity_literal(new_run_id)}, "
         "p_conversation_id := 'bbbbbbbb-0000-0000-0000-000000000001'::uuid, "
         "p_content := 'acl lifecycle prompt', p_metadata := '{}'::jsonb, "
         "p_requested_by := 'aaaaaaaa-0000-0000-0000-000000000001'::uuid, "
@@ -369,9 +375,13 @@ def test_worker_lifecycle_executes_under_service_role(acl_db):
         f"select status from public.update_run_usage_guarded({lease}, "
         "'{\"total_tokens\": 10}'::jsonb)",
     )
+    # The TERMINAL write is the canonical finalizer's: the worker transition
+    # RPC refuses a terminal status outright, so this proves both that
+    # service_role may finalize and that it is the only way to.
     assert _as_role(
         acl_db, "service_role",
-        f"select status from public.transition_run_worker_guarded('{run_id}'::uuid, "
+        f"select status from public.finalize_run_guarded('{run_id}'::uuid, "
         f"'completed', 'running', '{worker_id}', {attempt}, '{lease_token}', "
-        "'{\"status\": \"success\"}'::jsonb, null, true, null, null, now())",
+        "'{\"status\": \"success\"}'::jsonb, null, true, null, now(), "
+        "'run_completed', 'Run completed', '{}'::jsonb)",
     ) == "completed"

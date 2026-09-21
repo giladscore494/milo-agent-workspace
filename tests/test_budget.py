@@ -22,6 +22,8 @@ from backend.dependencies import get_job_launcher, get_repository
 from backend.main import app
 from backend.runtime import CancellationRequested
 from backend.runtime_policy import reviewed_first_run_policy
+from backend.run_identity import RunIdentity
+from tests.run_factory import identity_kwargs
 
 
 def make_tracker(monkeypatch=None, enabled=True, cancellation=None, events=None, usage=None, ledger=None, clock=None, **cfg):
@@ -327,7 +329,12 @@ def test_worker_refuses_paid_execution_without_mandatory_budget(monkeypatch):
             self.failed = []
             self.events = []
             self.conversation_id, self.project_id = uuid4(), uuid4()
-            self.run = {"id": str(uuid4()), "conversation_id": self.conversation_id, "status": "queued", "input": {"content": "x"}, "attempt": 1}
+            run_id = str(uuid4())
+            # Born with its immutable identity, like every executable run: the
+            # worker refuses one without it before it looks at any budget.
+            self.run = {"id": run_id, "conversation_id": self.conversation_id,
+                        "status": "queued", "input": {"content": "x"}, "attempt": 1,
+                        "run_identity": RunIdentity.bind(run_id, "vehicle_catalog_v1").as_record()}
 
         def get_conversation(self, conversation_id):
             return {"id": conversation_id, "project_id": self.project_id}
@@ -344,6 +351,14 @@ def test_worker_refuses_paid_execution_without_mandatory_budget(monkeypatch):
         def append_run_event(self, run_id, event_type, payload, worker_id=None, attempt=None, lease_token=None):
             self.events.append(event_type)
             return {"id": 1}
+
+        def finalize_run(self, run_id, status, expected_status, event=None, *,
+                         worker_id, attempt, lease_token, **fields):
+            # The worker's only terminal write. There is no fallback to a
+            # transition plus a separate event, so a double without this cannot
+            # close a run at all.
+            self.failed.append((fields.get("error") or {}).get("code"))
+            return {"id": run_id, "status": status, **fields}
 
         def mark_run_failed(self, run_id, code, message, worker_id=None, attempt=None, lease_token=None):
             self.failed.append(code)
@@ -505,7 +520,12 @@ def test_worker_refuses_paid_execution_without_provider_key(monkeypatch):
         def __init__(self):
             self.failed = []
             self.conversation_id, self.project_id = uuid4(), uuid4()
-            self.run = {"id": str(uuid4()), "conversation_id": self.conversation_id, "status": "queued", "input": {"content": "x"}, "attempt": 1}
+            run_id = str(uuid4())
+            # Born with its immutable identity, like every executable run: the
+            # worker refuses one without it before it looks at any budget.
+            self.run = {"id": run_id, "conversation_id": self.conversation_id,
+                        "status": "queued", "input": {"content": "x"}, "attempt": 1,
+                        "run_identity": RunIdentity.bind(run_id, "vehicle_catalog_v1").as_record()}
 
         def get_conversation(self, conversation_id):
             return {"id": conversation_id, "project_id": self.project_id}
@@ -521,6 +541,14 @@ def test_worker_refuses_paid_execution_without_provider_key(monkeypatch):
 
         def append_run_event(self, run_id, event_type, payload, worker_id=None, attempt=None, lease_token=None):
             return {"id": 1}
+
+        def finalize_run(self, run_id, status, expected_status, event=None, *,
+                         worker_id, attempt, lease_token, **fields):
+            # The worker's only terminal write. There is no fallback to a
+            # transition plus a separate event, so a double without this cannot
+            # close a run at all.
+            self.failed.append((fields.get("error") or {}).get("code"))
+            return {"id": run_id, "status": status, **fields}
 
         def mark_run_failed(self, run_id, code, message, worker_id=None, attempt=None, lease_token=None):
             self.failed.append(code)
@@ -545,11 +573,22 @@ def test_daily_ledger_cost_prefers_settled_actuals(monkeypatch):
     from backend.testing.memory_repository import MemoryRepository
 
     repo = MemoryRepository()
-    run_id = "11111111-2222-4333-8444-555555555555"
     user = "aaaaaaaa-1111-4111-8111-000000000001"
-    repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 1, "decision": "reserved", "estimated_cost": 0.05})
-    repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 1, "decision": "settled", "actual_cost": 0.02})
-    repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 2, "decision": "reserved", "estimated_cost": 0.05})
+    project = "bbbbbbbb-1111-4111-8111-000000000001"
+    repo.seed_user(user)
+    repo.seed_project(project, "ledger", "Ledger", [user])
+    conversation = repo.create_conversation(project, "ledger", user)
+    created = repo.create_message_and_run(conversation["id"], "go", {}, user, "ledger-key", "fp",
+                                          **identity_kwargs(repo, conversation["id"]))
+    run_id = str(created["run"]["id"])
+    claimed = repo.claim_run(run_id, "worker-ledger")
+    # Ledger rows are fenced writes, so the read is exercised over rows that
+    # were written the way a live worker writes them.
+    lease = {"worker_id": "worker-ledger", "attempt": claimed["attempt"],
+             "lease_token": claimed["lease_token"]}
+    repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 1, "decision": "reserved", "estimated_cost": 0.05}, **lease)
+    repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 1, "decision": "settled", "actual_cost": 0.02}, **lease)
+    repo.append_usage_ledger({"run_id": run_id, "user_id": user, "call_seq": 2, "decision": "reserved", "estimated_cost": 0.05}, **lease)
     assert repo.sum_daily_ledger_cost(user_id=user) == pytest.approx(0.07)
     assert repo.sum_daily_ledger_cost(user_id="someone-else") == 0.0
 

@@ -80,8 +80,10 @@ def test_the_inventory_covers_every_console_1_to_5_runtime_dependency():
         # The lease/fencing core every console builds on.
         "claim_run_lease", "heartbeat_run_guarded", "transition_run_worker_guarded",
         "append_run_event_guarded", "save_checkpoint_guarded",
-        # Console 6 -- run identity and the newly fenced writers.
-        "bind_run_identity", "create_tool_access_request_guarded",
+        # Console 6 -- atomic run creation with immutable identity, and the
+        # writers that had no lease fence before it. There is no binder: a run
+        # is born with its identity inside the creating transaction.
+        "create_message_and_run_v3", "create_tool_access_request_guarded",
         "create_tool_grant_guarded", "append_usage_ledger_guarded",
     }
     missing = sorted(required - set(rpcs))
@@ -122,9 +124,12 @@ def test_a_deployment_missing_a_required_rpc_is_blocked():
     problems = release_inventory.missing_from_deployment(unverifiable)
     assert any("record_run_usage_guarded" in problem for problem in problems)
 
-    renamed = {**observed, "bind_run_identity": ["p_run_id"]}
+    # A deployed RPC that no longer advertises a required argument is as
+    # unusable as a missing one: the atomic creator without its identity
+    # argument could not bind a run's identity at all.
+    renamed = {**observed, "create_message_and_run_v3": ["p_run_id"]}
     problems = release_inventory.missing_from_deployment(renamed)
-    assert any("p_identity" in problem for problem in problems)
+    assert any("p_run_identity" in problem for problem in problems)
 
 
 def test_the_preflight_blocks_on_a_missing_required_rpc_before_any_run(monkeypatch):

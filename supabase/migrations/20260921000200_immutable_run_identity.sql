@@ -141,6 +141,14 @@ drop function if exists public.create_message_and_run_v3(
 -- ---------------------------------------------------------------------------
 -- 3) Atomic user message + run + immutable identity.
 -- ---------------------------------------------------------------------------
+-- Returns SETOF, not a bare jsonb. The pinned supabase-py/postgrest-py client
+-- validates an RPC response body as a LIST (`APIResponse.data: List[JSON]`)
+-- and rejects a bare JSON object -- client-side, AFTER this transaction has
+-- committed the message, the run and its immutable identity. A scalar return
+-- would therefore create the run and then report failure to the caller, which
+-- is the exact split-brain `test_every_http_facing_rpc_returns_a_set` exists
+-- to prevent. The `returns` clause stays on the signature line for the same
+-- reason the others do: the release inventory reads these headers.
 create or replace function public.create_message_and_run_v3(
   p_run_id uuid,
   p_run_identity jsonb,
@@ -152,14 +160,7 @@ create or replace function public.create_message_and_run_v3(
   p_request_fingerprint text,
   p_max_user_active integer default null,
   p_max_project_active integer default null
-)
--- SETOF, not jsonb. The pinned supabase-py/postgrest-py client validates an
--- RPC response body as a LIST (`APIResponse.data: List[JSON]`) and rejects a
--- bare JSON object -- client-side, AFTER this transaction has committed the
--- message, the run and its immutable identity. A scalar return would therefore
--- create the run and then report failure to the caller, which is the exact
--- split-brain `test_every_http_facing_rpc_returns_a_set` exists to prevent.
-returns setof jsonb
+) returns setof jsonb
 language plpgsql
 set search_path = pg_catalog
 as $$

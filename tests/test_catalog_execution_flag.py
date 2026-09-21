@@ -571,10 +571,16 @@ def test_the_catalog_types_do_not_join_the_v1_vocabulary():
     Putting a catalog type in it would hand a catalog event the V1 agent,
     phase, progress and spend projection -- the exact thing F5 closed.
     """
-    from backend.runtime import CATALOG_EVENT_TYPES, EVENT_TYPES, V1_EVENT_TYPES
+    from backend.event_registry import (CATALOG_EVENT_TYPES, EVENT_TYPES,
+                                        OPERATIONAL_EVENT_TYPES,
+                                        SWARM_V2_EVENT_TYPES, V1_EVENT_TYPES)
 
     assert not (CATALOG_EVENT_TYPES & V1_EVENT_TYPES)
-    assert EVENT_TYPES == V1_EVENT_TYPES | CATALOG_EVENT_TYPES
+    # The acceptance set is the union of ALL FOUR groups. It used to be V1 plus
+    # catalog alone, which is why the API refused `task_started` -- an event the
+    # V2 engine emits on every task -- while the durable sink wrote it unchecked.
+    assert EVENT_TYPES == (V1_EVENT_TYPES | SWARM_V2_EVENT_TYPES
+                           | CATALOG_EVENT_TYPES | OPERATIONAL_EVENT_TYPES)
 
 
 def test_the_worker_event_route_now_accepts_the_two_catalog_types():
@@ -593,13 +599,24 @@ def test_recognition_is_exact_and_never_a_substring():
 
 
 def test_the_frontend_mirrors_the_same_two_catalog_types():
-    """One vocabulary, two languages: a drift here is a silent inert event."""
-    from backend.runtime import CATALOG_EVENT_TYPES
+    """One vocabulary, two languages: a drift here is a silent inert event.
+
+    The browser no longer RESTATES the names -- a hand-maintained mirror is how
+    they drifted apart in the first place. It reads the generated manifest, so
+    the mirror is proven by checking that manifest against the backend and that
+    the TypeScript declares no catalog name of its own.
+    """
+    import json
+
+    from backend.event_registry import CATALOG_EVENT_TYPES
+
+    manifest = json.loads((REPO / "frontend/lib/eventRegistry.generated.json").read_text())
+    assert set(manifest["groups"]["catalog"]) == set(CATALOG_EVENT_TYPES)
 
     source = (REPO / "frontend/lib/eventVocabulary.ts").read_text()
-    literal = source.split("CATALOG_EVENT_TYPES: ReadonlySet<string> = new Set([", 1)[1]
-    literal = literal.split("]);", 1)[0]
-    assert set(re.findall(r"'([a-z_]+)'", literal)) == set(CATALOG_EVENT_TYPES)
+    assert "CATALOG_EVENT_TYPES: ReadonlySet<string> = group('catalog')" in source
+    for name in CATALOG_EVENT_TYPES:
+        assert f"'{name}'" not in source, f"the browser restates {name} instead of reading it"
 
 
 def test_the_frontend_bounds_promoted_field_counts_at_the_backend_maximum():

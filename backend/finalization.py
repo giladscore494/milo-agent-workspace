@@ -315,7 +315,6 @@ class RunFinalizer:
     run_id: UUID
     engine: str
     lease_ctx: Mapping[str, Any]
-    event_sink: Any = None
     observer: Callable[[str, dict[str, Any]], None] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _decision: TerminalClaim | None = field(default=None, init=False, repr=False)

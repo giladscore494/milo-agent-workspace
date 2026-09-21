@@ -19,6 +19,7 @@ D. Stage D distinguishes "the worker executed successfully" from "the product
 from __future__ import annotations
 
 import ast
+import inspect
 import json
 import subprocess
 import sys
@@ -116,8 +117,7 @@ def finalizer_for(repo, run_id, engine="vehicle_catalog_v1"):
     repo.transition_run(run_id, "running", expected_worker_id="worker-1",
                         expected_attempt=lease["attempt"],
                         expected_lease_token=lease["lease_token"])
-    return RunFinalizer(repo=repo, run_id=run_id, engine=engine, lease_ctx=lease,
-                        event_sink=SupabaseEventSink(repo, **lease))
+    return RunFinalizer(repo=repo, run_id=run_id, engine=engine, lease_ctx=lease)
 
 
 class Stop(BudgetExceeded):
@@ -831,12 +831,12 @@ def test_the_worker_records_the_canonical_outcome_the_stage_d_gate_reads(monkeyp
 # E. the terminal event exists only for the decision that durably won
 # ===========================================================================
 #
-# Every test here runs against BOTH the atomic path (the repository offers
-# `finalize_run`, as production does through migration 20260920000200) and the
-# fallback path (it does not, as every harness double does not).
+# Every test here runs against the atomic path, because it is the only path
+# there is: the repository offers `finalize_run` (production does, through
+# migration 20260920000200) or the finalizer refuses. A repository without it
+# is covered on its own, below.
 
-PATHS = [pytest.param(MemoryRepository, id="atomic"),
-         pytest.param(LegacyRepository, id="fallback")]
+PATHS = [pytest.param(MemoryRepository, id="atomic")]
 
 
 @pytest.mark.parametrize("repo_class", PATHS)
@@ -944,7 +944,7 @@ def test_stage_d_cannot_consume_a_superseded_product_outcome(repo_class):
     assert 'event.get("event_type") not in ("run_completed", "run_partial_success")' in probe
 
 
-def test_the_atomic_primitive_is_preferred_and_the_sink_is_not_used_for_it():
+def test_the_atomic_primitive_commits_the_status_and_its_event_in_one_call():
     repo, run_id = seeded_run("swarm_v2")
     finalizer = finalizer_for(repo, run_id, "swarm_v2")
     atomic_calls = []
@@ -955,13 +955,12 @@ def test_the_atomic_primitive_is_preferred_and_the_sink_is_not_used_for_it():
         return original(*args, **kwargs)
 
     repo.finalize_run = spying
-    sink_calls = []
-    finalizer.event_sink = type("Sink", (), {"emit": lambda self, e: sink_calls.append(e)})()
 
     result = finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")))
 
+    # The status, the expected status and the terminal event all travel in ONE
+    # call to the primitive: there is no second write to lose.
     assert atomic_calls == [("partial_success", "running", "run_partial_success")]
-    assert sink_calls == [], "on the atomic path the event commits with the transition"
     assert result.evidence_recorded and result.wrote
     assert [e["event_type"] for e in terminal_events(repo)] == ["run_partial_success"]
 
@@ -984,100 +983,59 @@ def test_an_atomic_finalization_that_fails_leaves_nothing_behind():
     assert not finalizer.decided
 
 
-class CommittingThenFailingSink:
-    """The append reaches the database and the acknowledgement is lost."""
+def test_a_repository_without_the_atomic_primitive_cannot_terminalize_at_all():
+    """There is no fallback, and that is the point.
 
-    def __init__(self, inner):
-        self.inner = inner
-
-    def emit(self, event):
-        self.inner.emit(event)
-        raise ConnectionError("acknowledgement lost")
-
-
-class NeverCommittingSink:
-    def __init__(self):
-        self.attempts = 0
-
-    def emit(self, event):
-        self.attempts += 1
-        raise ConnectionError("event store unavailable")
-
-
-def test_fallback_event_persistence_that_committed_is_recognised_not_duplicated():
+    Terminal status and terminal evidence are ONE write. A repository whose
+    migrations trail its images cannot make that write, and the finalizer
+    refuses rather than splitting it into a transition plus a separate event --
+    which is exactly the split-brain terminalization Console 3 removed. The
+    refusal is a 503-class signal, and nothing durable moves.
+    """
     repo, run_id = seeded_run_with(LegacyRepository)
     finalizer = finalizer_for(repo, run_id, "swarm_v2")
-    finalizer.event_sink = CommittingThenFailingSink(finalizer.event_sink)
 
-    result = finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")))
+    for claim in (TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")),
+                  TerminalClaim.failure("swarm_v2", "X_FAILED", "x failed")):
+        with pytest.raises(FinalizationUnavailable) as raised:
+            finalizer.finalize(claim)
+        assert raised.value.code == "RUN_FINALIZATION_UNAVAILABLE"
 
-    assert result.status == "partial_success" and result.evidence_recorded
-    assert [e["event_type"] for e in terminal_events(repo)] == ["run_partial_success"]
+    from backend.runtime import TERMINAL_STATES
 
-
-def test_fallback_event_persistence_failure_on_a_product_is_surfaced_not_hidden():
-    """The state is durable and stays; the missing evidence is raised, the
-    decision is in force for every later call, and Stage D refuses the run."""
-    repo, run_id = seeded_run_with(LegacyRepository)
-    finalizer = finalizer_for(repo, run_id, "swarm_v2")
-    sink = NeverCommittingSink()
-    finalizer.event_sink = sink
-    payload = v2_payload(kind="partial_result")
-
-    with pytest.raises(TerminalEvidenceUnavailable) as excinfo:
-        finalizer.finalize(TerminalClaim.product("swarm_v2", payload))
-
-    assert excinfo.value.code == "RUN_EVIDENCE_UNAVAILABLE"
-    assert sink.attempts == 2, "one bounded retry, guarded by a re-read"
-    run = repo.get_run(run_id)
-    assert run["status"] == "partial_success" and run["output"] == payload
-    assert terminal_events(repo) == []
-    # The decision is in force: a repeat is idempotent and writes nothing.
-    again = finalizer.finalize(TerminalClaim.product("swarm_v2", dict(payload)))
-    assert again.duplicate and not again.wrote and not again.evidence_recorded
-    # And Stage D fails closed on the evidence-less product terminal.
-    done = run_semantic_gate(probe_style_record(repo, run_id))
-    assert done.returncode == 1
-    assert "recorded NO canonical ProductOutcome" in json.loads(
-        done.stdout.strip().splitlines()[-1])["reason"]
-
-
-def test_fallback_event_persistence_failure_on_a_non_product_is_reported_not_raised():
-    """`runs.error` already carries a failure's truth; the missing event is
-    reported on the result, and the run is not relaunched over it."""
-    repo, run_id = seeded_run_with(LegacyRepository)
-    finalizer = finalizer_for(repo, run_id, "swarm_v2")
-    finalizer.event_sink = NeverCommittingSink()
-
-    result = finalizer.finalize(TerminalClaim.failure("swarm_v2", "X_FAILED", "x failed"))
-
-    assert result.status == "failed" and result.wrote and not result.evidence_recorded
-    assert repo.get_run(run_id)["error"]["code"] == "X_FAILED"
+    assert repo.get_run(run_id)["status"] not in TERMINAL_STATES
     assert terminal_events(repo) == []
 
 
-def test_fallback_never_retries_an_append_it_cannot_prove_did_not_commit():
-    """Without a way to re-read the event stream, a retry could double-claim."""
-    repo, run_id = seeded_run_with(LegacyRepository)
-    finalizer = finalizer_for(repo, run_id, "swarm_v2")
-    sink = NeverCommittingSink()
-    finalizer.event_sink = sink
-    repo.list_run_events = None  # type: ignore[assignment]
+def test_the_finalizer_carries_no_second_event_path_to_fall_back_to():
+    """Structural: the sink the fallback used is gone from the source.
 
-    with pytest.raises(TerminalEvidenceUnavailable):
-        finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")))
-    assert sink.attempts == 1
+    A dead `event_sink` left on the finalizer is an invitation to reinstate the
+    split write, so it does not exist -- the terminal event travels with the
+    status through the atomic primitive, or not at all.
+    """
+    source = inspect.getsource(finalization_module)
+    assert "event_sink" not in source
+    assert not hasattr(RunFinalizer(repo=None, run_id=None, engine="", lease_ctx={}),
+                       "event_sink")
 
 
 def test_the_supervisor_shadow_observes_only_durable_terminal_events():
-    repo, run_id = seeded_run_with(LegacyRepository)
+    repo, run_id = seeded_run_with(MemoryRepository)
     finalizer = finalizer_for(repo, run_id, "swarm_v2")
     observed = []
     finalizer.observer = lambda kind, payload: observed.append(kind)
-    finalizer.event_sink = NeverCommittingSink()
-    with pytest.raises(TerminalEvidenceUnavailable):
+
+    # The terminal event is committed by the atomic primitive or not at all, so
+    # a finalization that does not commit has nothing for the shadow to see.
+    def refusing_finalize(*args, **kwargs):
+        raise AppError("RUN_LEASE_LOST", "terminal write rejected", 409)
+
+    finalizer.repo.finalize_run = refusing_finalize
+    with pytest.raises(AppError):
         finalizer.finalize(TerminalClaim.product("swarm_v2", v2_payload(kind="partial_result")))
     assert observed == [], "an event that never became durable was observed"
+    assert terminal_events(repo) == []
 
     repo2, run_id2 = seeded_run_with(MemoryRepository)
     finalizer2 = finalizer_for(repo2, run_id2, "swarm_v2")

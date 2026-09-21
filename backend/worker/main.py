@@ -168,8 +168,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
     # untrusted source; the two terminal paths that can run before routing --
     # a cancellation observed before start, and a routing refusal -- have no
     # product to read anyway.
+    # No event sink is handed to it: the terminal event commits inside
+    # `finalize_run_guarded` with the status it belongs to, so there is no
+    # second write for the finalizer to make and none for it to lose.
     finalizer = RunFinalizer(repo=repo, run_id=run_id, engine="",
-                             lease_ctx=lease_ctx, event_sink=sink)
+                             lease_ctx=lease_ctx)
     lease_lost = threading.Event()
     stop_heartbeat = threading.Event()
     heartbeat_thread: threading.Thread | None = None

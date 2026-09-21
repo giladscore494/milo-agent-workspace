@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import ast
 import json
 import socket
 from pathlib import Path
@@ -1268,11 +1269,25 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # `backend/testing/e2e_app.py`, which is never deployed.
         "backend/testing/catalog_review_seed.py",
     }
+    # An IMPORT is the seam this guards. A bare occurrence of the dotted name
+    # is not: `backend/testing/memory_repository.py` has to know the capture
+    # OPERATION MARKER (`catalog.government.capture`) to mirror the V3 trigger's
+    # operator-capture rule, and knowing a string is not reaching into the
+    # package. So the check is the import graph, read from the parsed module.
     for path in sorted(Path("backend").rglob("*.py")):
         text = str(path)
         if any(text.startswith(prefix) for prefix in allowed):
             continue
-        assert "catalog.government" not in path.read_text(encoding="utf-8"), text
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        assert not [name for name in imported
+                    if name == "backend.catalog.government"
+                    or name.startswith("backend.catalog.government.")], text
 
 
 # =============================================================================

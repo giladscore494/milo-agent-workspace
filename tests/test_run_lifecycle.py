@@ -78,6 +78,13 @@ class StatefulRepo:
             raise AppError("RUN_IDENTITY_INVALID", "identity names a different run", 409)
         if run_identity.get("workflow_key") != self.get_project(self.project_id)["workflow_key"]:
             raise AppError("RUN_IDENTITY_WORKFLOW_DRIFT", "project workflow changed before run creation", 409)
+        # Admission is settled INSIDE this transaction now, under the same
+        # advisory locks, so two concurrent creations cannot both pass a cap
+        # that only one of them may.
+        if max_user_active is not None and self.count_active_runs_for_user(requested_by) >= max_user_active:
+            raise AppError("USER_CONCURRENCY_LIMIT", "too many active runs for this user", 429)
+        if max_project_active is not None and self.count_active_runs_for_project(self.project_id) >= max_project_active:
+            raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429)
         if self.fail_run_insert:
             # One transaction: the run insert failing means no message either.
             raise AppError("REPOSITORY_ERROR", "simulated database write failure", 502)
@@ -91,6 +98,12 @@ class StatefulRepo:
         }
         self.runs[run_id] = run
         return {"run": dict(run), "created": True}
+
+    def count_active_runs_for_user(self, user_id):
+        return sum(1 for r in self.runs.values() if r["status"] == "queued")
+
+    def count_active_runs_for_project(self, project_id):
+        return 0
 
     def find_run_by_idempotency(self, conversation_id, user_id, idempotency_key):
         for run in self.runs.values():
