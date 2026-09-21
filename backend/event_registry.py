@@ -268,37 +268,29 @@ _GROUP_MEMBERS = {
 }
 
 
-def manifest() -> dict[str, object]:
-    """The whole vocabulary as ONE deterministic, serializable document.
-
-    This is what ``config/event_registry.json`` holds and what the frontend's
-    mirror is checked against, in both directions, in CI. It is GENERATED, so
-    the backend and the browser cannot describe two different vocabularies
-    without a test failing -- which is the drift this module exists to remove.
-    """
+def _manifest_core() -> dict[str, object]:
+    """The vocabulary bytes whose digest defines its semantic identity."""
     return {
         "registry_version": REGISTRY_VERSION,
         "groups": {name: sorted(_GROUP_MEMBERS[name]) for name in GROUPS},
-        # The acceptance set, spelled out rather than left to be recomputed:
-        # a reader must not have to know which groups are durable.
         "accepted": sorted(EVENT_TYPES),
     }
+
+
+def fingerprint() -> str:
+    """A stable digest of the vocabulary, excluding only the digest field."""
+    payload = json.dumps(_manifest_core(), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def manifest() -> dict[str, object]:
+    """The generated backend/browser contract, carrying its core digest."""
+    return {**_manifest_core(), "fingerprint": fingerprint()}
 
 
 def serialize() -> str:
     """The manifest's canonical bytes."""
     return json.dumps(manifest(), indent=2, sort_keys=True) + "\n"
-
-
-def fingerprint() -> str:
-    """A stable digest of the whole vocabulary.
-
-    Two surfaces that print the same fingerprint are provably speaking about
-    the same event vocabulary. It is bound onto a run's immutable identity, so
-    a run records which vocabulary produced its durable stream.
-    """
-    payload = json.dumps(manifest(), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 __all__ = [
