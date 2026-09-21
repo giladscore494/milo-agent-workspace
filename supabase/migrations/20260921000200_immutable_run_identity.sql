@@ -447,7 +447,8 @@ begin
   foreach fn in array array[
     'public.create_tool_access_request_guarded(uuid, text, integer, text, jsonb)',
     'public.create_tool_grant_guarded(uuid, text, integer, text, jsonb)',
-    'public.append_usage_ledger_guarded(uuid, text, integer, text, jsonb)'
+    'public.append_usage_ledger_guarded(uuid, text, integer, text, jsonb)',
+    'public.transition_run_worker_guarded(uuid, text, text, text, integer, text, jsonb, jsonb, boolean, jsonb, timestamptz, timestamptz)'
   ]
   loop
     execute format('revoke execute on function %s from public', fn);
