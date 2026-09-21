@@ -130,6 +130,10 @@ ENGINE_VERSIONS: Mapping[str, str] = {
     "operator_capture": "operator_capture.1",
 }
 
+#: Workflows that produce a user product and may be selected for paid
+#: execution/export. Control-plane identities are intentionally excluded.
+PRODUCT_WORKFLOW_KEYS = frozenset({"vehicle_catalog_v1", "swarm_v2"})
+
 #: Historical engine identities this release knows how to READ truthfully.
 #:
 #: This is deliberately distinct from ENGINE_VERSIONS. ENGINE_VERSIONS answers
@@ -420,7 +424,7 @@ def identity_mutation_problems(current: Any, proposed: Any) -> list[str]:
 
 
 __all__ = [
-    "ENGINE_VERSIONS", "SUPPORTED_ENGINE_VERSIONS", "IDENTITY_FIELDS", "IDENTITY_VERSION",
+    "ENGINE_VERSIONS", "PRODUCT_WORKFLOW_KEYS", "SUPPORTED_ENGINE_VERSIONS", "IDENTITY_FIELDS", "IDENTITY_VERSION",
     "RELEASE_SHA_ENV", "RUN_IDENTITY_FIELD", "RunIdentity", "RunIdentityError",
     "engine_version_for", "execution_identity_problems", "identity_mutation_problems", "persisted_identity",
     "release_sha", "require_identity", "reviewed_policy_fingerprint",
