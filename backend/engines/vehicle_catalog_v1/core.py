@@ -11,17 +11,11 @@ from threading import BoundedSemaphore
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    from openai import OpenAI
-except ModuleNotFoundError:  # optional until live engine execution
-    OpenAI = None
-
-from backend.budget import build_provider_http_client, provider_request_timeout
+from backend.provider_authority import ProviderAdapter, classify_outcome
 from backend.provider_scheduler import (
     ProviderBackpressureExceeded,
     ProviderLimitsConfig,
     ProviderScheduler,
-    estimate_admission_tokens,
     is_provider_rate_limit_error,
 )
 
@@ -46,9 +40,22 @@ RETRY_CALLBACK = None
 # wait_seconds). Separate from RETRY_CALLBACK on purpose: provider
 # backpressure must never consume the semantic retry allowance.
 PROVIDER_BACKPRESSURE_CALLBACK = None
-# The ONE scheduler shared by every Kimi call inside a worker execution.
-# Installed per run by the engine; lazily created from env when standalone.
+# THE provider authority for this engine. V1 owns no admission, no retry, no
+# timeout and no provider-error semantics of its own: it hands a request to
+# the adapter and takes what comes back. The SAME adapter instance serves
+# Swarm V2 in a worker process, so both engines draw on one organization
+# allowance rather than two that each believe they own the account.
+#
+# `PROVIDER_SCHEDULER` is the preserved injection point for the mechanism the
+# adapter drives. Installed per run by the engine; lazily created from env
+# when this engine runs standalone.
 PROVIDER_SCHEDULER = None
+PROVIDER_ADAPTER = None
+# PRESERVED DESCRIPTORS, not a retry policy. V1's ExecutionPolicy still
+# publishes these numbers as part of the workflow contract, but nothing
+# retries on them any more: provider attempts are bounded by
+# `provider_max_rate_limit_retries` in the canonical runtime policy and
+# executed by the one provider authority.
 API_CONCURRENCY_RETRY_DELAY_SECONDS = 2
 API_CONCURRENCY_MAX_RETRIES = 2
 MAX_DISCOVERY_TOKENS = 1800
@@ -454,6 +461,12 @@ def _message_content(message: Any) -> str:
 
 
 def is_kimi_concurrency_error(exc: Any) -> bool:
+    """Preserved V1 spelling of the ONE taxonomy's backpressure question.
+
+    It reads the authority's verdict rather than any V1 opinion, so 503 /
+    `engine_overloaded_error` is backpressure here exactly as it is
+    everywhere else.
+    """
     return is_provider_rate_limit_error(exc)
 
 
@@ -473,21 +486,47 @@ def _provider_scheduler() -> ProviderScheduler:
     return PROVIDER_SCHEDULER
 
 
-def _scheduled_provider_call(client: Any, kwargs: Dict[str, Any], agent_name: str, phase_name: str) -> Any:
-    """The single guarded path for EVERY provider request (initial calls,
-    tool rounds, fallbacks and summaries). No raw create call may bypass it."""
+def _provider_authority() -> ProviderAdapter:
+    """THE adapter every V1 provider request goes through.
+
+    Returns the instance the worker installed when there is one. Otherwise it
+    builds one over this engine's scheduler -- which is still the SAME
+    contract, not a V1-private path: the admission rule, the retry policy,
+    the taxonomy, the deadline and the search accounting all live in
+    ``backend.provider_authority`` either way.
+    """
+    global PROVIDER_ADAPTER
     scheduler = _provider_scheduler()
-    # Strict: V1 has always required a numeric cap on every call, so the
-    # organization admission value (input + requested cap) is always
-    # computable here and never degrades to "input only".
-    estimated = estimate_admission_tokens(kwargs.get("messages"), kwargs.get("max_tokens"))
-    return scheduler.execute(
-        lambda: client.chat.completions.create(**kwargs),
-        estimated_tokens=estimated,
-        reserved_tokens=estimated,
-        agent=agent_name,
-        phase=phase_name,
-    )
+    installed = PROVIDER_ADAPTER
+    if installed is None or installed.scheduler is not scheduler:
+        installed = ProviderAdapter(scheduler)
+        PROVIDER_ADAPTER = installed
+    return installed
+
+
+def _authority_call(client: Any, kwargs: Dict[str, Any], agent_name: str, phase_name: str) -> Any:
+    """The single path for EVERY provider request (initial calls, tool rounds,
+    fallbacks and summaries). No raw create call may bypass it.
+
+    The output cap, the conservative token admission, the organization gate,
+    the bounded backpressure retries, the total deadline and the search
+    accounting are all the adapter's. V1 states none of them a second time.
+    """
+    return _provider_authority().chat(kwargs, client=client, agent=agent_name,
+                                      phase=phase_name)
+
+
+def _provider_client(api_key: str) -> Any:
+    """The provider client, built by the ONE factory that knows the deadline.
+
+    ``MODEL_CLIENT_FACTORY`` stays the injection point production and tests
+    use; with none installed the adapter's own factory builds the client --
+    with SDK retries disabled and the total-deadline transport attached,
+    because those are properties of every MILO provider client rather than of
+    one engine's copy of the construction.
+    """
+    return _provider_authority().client(api_key, MOONSHOT_BASE_URL,
+                                        factory=MODEL_CLIENT_FACTORY)
 
 
 def _api_concurrency_payload(exc: Any, attempts: int, *, agent: str = "", phase: str = "") -> Dict[str, Any]:
@@ -519,29 +558,13 @@ def moonshot_chat(
     """Call Kimi and handle Moonshot's server-side builtin $web_search echo loop."""
     if not max_tokens:
         raise ValueError("moonshot_chat requires max_tokens for every model call")
-    if MODEL_CLIENT_FACTORY is None and OpenAI is None:
-        raise RuntimeError("openai package is required for live Kimi/Moonshot calls")
-    # max_retries=0 is load-bearing, not tidiness. The OpenAI SDK retries
-    # retryable failures TWICE by default, turning one logical request into up
-    # to three provider attempts. Those attempts consume organization RPM and
-    # concurrency, but they happen inside the SDK: MILO's scheduler, budget,
-    # attempt accounting and distributed limiter never see them, so the account
-    # can be over its ceiling while every MILO counter reads clean. Retries
-    # here are MILO-owned, bounded, and re-enter the shared admission gate.
-    #
-    # The explicit timeout is load-bearing too: the SDK default is a 600s read
-    # timeout against a 120s concurrency lease, so an un-timed request could
-    # still be talking to Kimi long after another process had taken over its
-    # organization permit. Production reaches this engine through the guarded
-    # factory in backend.budget, which applies the same derived deadline; this
-    # fallback is what local and test runs get, and it must not be the one
-    # place that forgets.
-    client_factory = MODEL_CLIENT_FACTORY or (
-        lambda api_key, base_url: OpenAI(
-            api_key=api_key, base_url=base_url, max_retries=0,
-            http_client=build_provider_http_client(),
-            timeout=provider_request_timeout()))
-    client = client_factory(api_key, MOONSHOT_BASE_URL)
+    # No client is built here, and no retry, timeout or SDK setting is chosen
+    # here. `_authority_call` hands the request to the ONE provider adapter,
+    # which owns the client construction (SDK retries disabled, total-deadline
+    # transport attached), the admission rule, the bounded retries and the
+    # taxonomy. This function's only provider-facing job is Moonshot's
+    # server-side `$web_search` echo loop.
+    client = _provider_client(api_key)
     history = list(messages)
     total_input = 0
     total_output = 0
@@ -563,7 +586,7 @@ def moonshot_chat(
         if response_format:
             kwargs["response_format"] = response_format
 
-        response = _scheduled_provider_call(client, kwargs, agent_name, phase_name)
+        response = _authority_call(client, kwargs, agent_name, phase_name)
         in_tokens, out_tokens = _usage_tokens(response)
         total_input += in_tokens
         total_output += out_tokens
@@ -610,7 +633,7 @@ def moonshot_chat(
             if response_format:
                 kwargs["response_format"] = response_format
 
-            response = _scheduled_provider_call(client, kwargs, agent_name, phase_name)
+            response = _authority_call(client, kwargs, agent_name, phase_name)
             in_tokens, out_tokens = _usage_tokens(response)
             total_input += in_tokens
             total_output += out_tokens
@@ -982,32 +1005,41 @@ def run_safe_agent(
         AGENT_STEP_CALLBACK(agent_name, phase_name)
 
     def attempt(messages: List[Dict[str, Any]], phase: str, token_limit: int) -> Dict[str, Any]:
-        attempts = 0
-        while True:
-            try:
-                return moonshot_chat(api_key, messages, temperature=0.6, use_web_search=use_web_search, response_format=response_format, max_tokens=token_limit, agent_name=agent_name, phase_name=phase)
-            except ProviderBackpressureExceeded as exc:
-                # The shared scheduler already applied its full bounded
-                # backoff budget: fail this agent with a specific provider
-                # backpressure reason instead of retrying further or
-                # consuming the semantic retry allowance.
-                payload = _api_concurrency_payload(exc, attempts + 1, agent=agent_name, phase=phase)
-                payload["api_retry_count"] = attempts
-                payload["backpressure"] = {"attempts": exc.attempts, "waited_seconds": exc.waited_seconds, "reason": "PROVIDER_BACKPRESSURE_EXCEEDED"}
+        """ONE logical model call. It runs no retry loop of its own.
+
+        It used to: a second, V1-private loop retried provider rate limits
+        with its own fixed 2s delay and its own bound, sitting on top of the
+        authority's bounded backoff. Two retry policies for one request is not
+        belt-and-braces, it is two different answers to "how many provider
+        attempts did this call make" -- and the private one paced nothing the
+        organization gate could see. Provider retries now belong to the ONE
+        authority, which re-admits every attempt through the shared gate and
+        counts each one in the ledger.
+
+        What stays here is the TRANSLATION of an exhausted provider into V1's
+        preserved agent-result shape, which the UI and the partial-failure
+        contract depend on.
+        """
+        try:
+            return moonshot_chat(api_key, messages, temperature=0.6, use_web_search=use_web_search, response_format=response_format, max_tokens=token_limit, agent_name=agent_name, phase_name=phase)
+        except ProviderBackpressureExceeded as exc:
+            # The authority already applied its full bounded backoff budget:
+            # fail this agent with a specific provider backpressure reason
+            # instead of retrying further or consuming the semantic retry
+            # allowance.
+            payload = _api_concurrency_payload(exc, exc.attempts or 1, agent=agent_name, phase=phase)
+            payload["api_retry_count"] = exc.attempts
+            payload["backpressure"] = {"attempts": exc.attempts, "waited_seconds": exc.waited_seconds, "reason": "PROVIDER_BACKPRESSURE_EXCEEDED"}
+            return payload
+        except Exception as exc:  # noqa: BLE001 - API errors must be classified for UI/tests.
+            if classify_outcome(exc).is_backpressure:
+                # Backpressure the authority chose not to pace (it can only
+                # reach here already exhausted, or from a path with no
+                # coordinator). Reported, never re-retried.
+                payload = _api_concurrency_payload(exc, 1, agent=agent_name, phase=phase)
+                payload["api_retry_count"] = 0
                 return payload
-            except Exception as exc:  # noqa: BLE001 - API errors must be classified for UI/tests.
-                if is_kimi_concurrency_error(exc):
-                    if attempts < API_CONCURRENCY_MAX_RETRIES:
-                        # Provider backpressure telemetry only — a 429 must
-                        # never increment the semantic retry counter.
-                        _notify_backpressure(agent_name, phase, "provider_concurrency_retry", API_CONCURRENCY_RETRY_DELAY_SECONDS)
-                        attempts += 1
-                        SLEEP_FN(API_CONCURRENCY_RETRY_DELAY_SECONDS)
-                        continue
-                    payload = _api_concurrency_payload(exc, attempts + 1, agent=agent_name, phase=phase)
-                    payload["api_retry_count"] = attempts
-                    return payload
-                raise
+            raise
 
     raw = attempt(prompt, phase_name, max_tokens)
     if raw.get("_error") == "API_CONCURRENCY_LIMIT":

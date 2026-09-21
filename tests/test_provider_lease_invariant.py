@@ -234,14 +234,20 @@ def test_an_environment_cannot_configure_an_unsafe_pair():
 
 
 def test_the_shipped_clients_carry_the_derived_deadline():
-    """Both engines' client constructions, checked over the parsed code."""
+    """Every client construction in the repository, over the parsed code.
+
+    "Both engines'" is no longer the right scope: neither engine constructs a
+    provider client any more. The two places that do are the budget's guarded
+    factory and the one provider authority, and `test_run_safety_contracts`
+    sweeps for a third.
+    """
     import ast
     import inspect
 
     from backend import budget as budget_module
-    from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend import provider_authority
 
-    for module in (budget_module, v1_core):
+    for module in (budget_module, provider_authority):
         tree = ast.parse(inspect.getsource(module))
         constructions = [node for node in ast.walk(tree)
                          if isinstance(node, ast.Call)

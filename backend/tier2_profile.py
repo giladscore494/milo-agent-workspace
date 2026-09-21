@@ -207,6 +207,15 @@ def _search_profile() -> dict[str, Any]:
             "guards_the_builtin_web_search_path": False,
             "builtin_web_search_is_paced_by": "the chat concurrency/RPM/TPM gate",
             "called_by_a_production_engine_today": False,
+            # PACING is the provider's bucket; VOLUME and PRICE are the run's,
+            # and they now exist for both routes. Every search -- builtin or
+            # standalone -- is counted into the ExecutionUsageLedger by the
+            # one provider authority and bounded by the runtime policy's
+            # `max_search_invocations_per_run`, which is what the QPS buckets
+            # never said anything about.
+            "accounted_in_run_ledger": True,
+            "run_volume_bound": _P["max_search_invocations_per_run"],
+            "run_price_per_invocation": _P["search_cost_per_invocation"],
         }
         for endpoint in (SEARCH_BASIC, SEARCH_PRO)
     }

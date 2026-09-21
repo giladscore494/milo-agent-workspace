@@ -144,9 +144,9 @@ def test_hidden_sdk_retries_are_disabled_in_every_client_construction():
     import inspect
 
     from backend import budget as budget_module
-    from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend import provider_authority
 
-    for module in (budget_module, v1_core):
+    for module in (budget_module, provider_authority):
         tree = ast.parse(inspect.getsource(module))
         constructions = [node for node in ast.walk(tree)
                          if isinstance(node, ast.Call)
@@ -156,6 +156,17 @@ def test_hidden_sdk_retries_are_disabled_in_every_client_construction():
             retries = {kw.arg: kw.value for kw in call.keywords}.get("max_retries")
             assert isinstance(retries, ast.Constant) and retries.value == 0, (
                 f"{module.__name__} builds an OpenAI client without max_retries=0")
+
+    # And nowhere else builds one at all. The engines used to keep their own
+    # "for local and test runs" construction beside the real one, which is
+    # precisely the copy that survives a change to the real one.
+    from pathlib import Path as _Path
+
+    repo = _Path(__file__).resolve().parents[1]
+    builders = sorted(
+        str(path.relative_to(repo)) for path in (repo / "backend").rglob("*.py")
+        if "OpenAI(" in path.read_text(encoding="utf-8"))
+    assert builders == ["backend/budget.py", "backend/provider_authority.py"], builders
 
 
 # =============================================================================

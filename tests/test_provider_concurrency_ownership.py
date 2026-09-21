@@ -1207,14 +1207,20 @@ def test_every_retry_settles_before_it_re_admits_and_takes_a_new_lease():
 
 
 def test_the_sdk_never_retries_behind_the_settlement():
-    """A hidden SDK retry would be a second real attempt on one lease."""
+    """A hidden SDK retry would be a second real attempt on one lease.
+
+    The engines no longer construct provider clients at all -- the one
+    provider authority does, alongside the budget factory -- so those are the
+    two places this has to hold, and a THIRD construction anywhere is itself
+    the defect (see the sweep below).
+    """
     import ast
     import inspect
 
     from backend import budget as budget_module
-    from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend import provider_authority
 
-    for module in (budget_module, v1_core):
+    for module in (budget_module, provider_authority):
         tree = ast.parse(inspect.getsource(module))
         constructions = [node for node in ast.walk(tree)
                          if isinstance(node, ast.Call)
@@ -1224,6 +1230,28 @@ def test_the_sdk_never_retries_behind_the_settlement():
             retries = {kw.arg: kw.value for kw in call.keywords}.get("max_retries")
             assert isinstance(retries, ast.Constant) and retries.value == 0, (
                 f"{module.__name__} allows SDK retries behind the lease")
+
+
+def test_no_engine_constructs_a_provider_client_of_its_own():
+    """The sweep that makes the assertion above exhaustive.
+
+    V1 used to carry its own fallback construction, "for local and test
+    runs", with its own copy of the retry and timeout settings -- which is
+    exactly the kind of copy that survives a later change to the real one.
+    """
+    import ast
+    import inspect
+
+    from backend.engines.swarm_v2 import model_gateway
+    from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend.engines.vehicle_catalog_v1 import engine as v1_engine
+
+    for module in (v1_core, v1_engine, model_gateway):
+        tree = ast.parse(inspect.getsource(module))
+        assert not [node for node in ast.walk(tree)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "OpenAI"], (
+            f"{module.__name__} builds a provider client of its own again")
 
 
 def test_a_budget_refusal_never_quarantines_a_slot_it_did_not_use():
@@ -1252,34 +1280,39 @@ def test_a_budget_refusal_never_quarantines_a_slot_it_did_not_use():
 
 
 def test_the_guarded_client_is_the_only_thing_between_execute_and_the_sdk():
-    """Every paid call, in both engines, is one lambda around `create`.
+    """The paid call is ONE lambda around `create`, in ONE place.
 
     Which is what makes the settlement taxonomy exhaustive: an exception
     escaping that lambda came from the guarded client or the SDK, never from
     MILO's own post-processing of a response.
+
+    It used to be one site per engine -- two lambdas that happened to be
+    written the same way. It is now one site for both, in the adapter.
     """
     import ast
     import inspect
 
+    from backend import provider_authority
     from backend.engines.swarm_v2 import model_gateway
     from backend.engines.vehicle_catalog_v1 import core as v1_core
 
     sites = 0
+    for node in ast.walk(ast.parse(inspect.getsource(provider_authority))):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "execute"):
+            continue
+        guarded = node.args[0]
+        assert isinstance(guarded, ast.Lambda), "execute got something other than a lambda"
+        assert isinstance(guarded.body, ast.Call)
+        assert ast.unparse(guarded.body).endswith("chat.completions.create(**payload)"), (
+            "the adapter wraps more than the provider call")
+        sites += 1
+    assert sites == 1, f"expected exactly one guarded call site, found {sites}"
+
+    # And neither engine has one of its own left to drift.
     for module in (model_gateway, v1_core):
-        tree = ast.parse(inspect.getsource(module))
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "execute"):
-                continue
-            guarded = node.args[0]
-            assert isinstance(guarded, ast.Lambda), (
-                f"{module.__name__} passes something other than a bare lambda")
-            assert isinstance(guarded.body, ast.Call), module.__name__
-            assert ast.unparse(guarded.body).endswith("chat.completions.create(**request)") \
-                or ast.unparse(guarded.body).endswith("chat.completions.create(**kwargs)"), (
-                    f"{module.__name__} wraps more than the provider call")
-            sites += 1
-    assert sites == 2, f"expected one guarded call site per engine, found {sites}"
+        assert "chat.completions.create" not in inspect.getsource(module), (
+            f"{module.__name__} calls the provider directly again")
 
 
 def test_a_settlement_failure_does_not_change_what_is_known_about_a_429():

@@ -5,7 +5,7 @@ import json
 from typing import Any, Callable, Iterable, Mapping
 
 from backend.budget import apply_output_cap
-from backend.provider_scheduler import ProviderScheduler, estimate_admission_tokens
+from backend.provider_authority import ProviderAdapter
 from backend.runtime import CancellationRequested
 from backend.tools import ToolDescriptor
 
@@ -63,13 +63,20 @@ def role_output_cap(agent: str, phase: str) -> int:
 
 
 class ModelGateway:
-    """Compose the existing guarded client and per-run provider scheduler."""
+    """Compose the guarded client and THE provider authority.
+
+    It holds no provider mechanics of its own. The admission rule, the retry
+    policy, the error taxonomy, the deadline and the search accounting are
+    the adapter's, and the adapter instance is the SAME one V1 uses, so the
+    two engines cannot end up with two opinions about one account.
+    """
 
     def __init__(
         self,
         *,
         guarded_client_factory: Callable[[str, str], Any],
-        scheduler: ProviderScheduler,
+        adapter: ProviderAdapter | None = None,
+        scheduler: Any = None,
         api_key: str,
         base_url: str,
         tool_descriptors: Iterable[ToolDescriptor] = (),
@@ -78,7 +85,13 @@ class ModelGateway:
         plan_limits: PlanLimits | None = None,
     ):
         self._client = guarded_client_factory(api_key, base_url)
-        self._scheduler = scheduler
+        if adapter is None:
+            if scheduler is None:
+                raise ValueError("ModelGateway requires a provider adapter")
+            # A caller that still supplies only the mechanism gets the same
+            # contract wrapped around it, never a gateway-private path.
+            adapter = ProviderAdapter(scheduler)
+        self._adapter = adapter
         self._cancelled = cancellation_checker
         self._agent_step = agent_step_callback
         # ONE server-owned source for everything tool-related the model sees:
@@ -124,13 +137,8 @@ class ModelGateway:
                 raise MissingRoleOutputCap("output cap must be positive")
         request = {"model": model, "messages": messages, **kwargs}
         apply_output_cap(request, cap)
-        return self._scheduler.execute(
-            lambda: self._client.chat.completions.create(**request),
-            estimated_tokens=estimate_admission_tokens(messages, cap),
-            reserved_tokens=estimate_admission_tokens(messages, cap),
-            agent=agent,
-            phase=phase,
-        )
+        return self._adapter.chat(request, client=self._client, agent=agent,
+                                  phase=phase)
 
     def _tool_authorization_instruction(self) -> str:
         """Describe the registered capabilities, and grant none of them.

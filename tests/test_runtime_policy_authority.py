@@ -249,7 +249,14 @@ def test_the_mandatory_set_is_derived_and_covers_what_the_profile_advertises():
 def test_budget_config_takes_its_mandatory_set_from_the_policy():
     assert BudgetConfig.MANDATORY_FOR_PAID_EXECUTION == tuple(
         d.name for d in dimensions_for(BUDGET) if d.mandatory_for_paid)
-    assert BudgetConfig.ENV_KEYS == {d.name: d.env_key for d in dimensions_for(BUDGET)}
+    # Only the dimensions a DEPLOYMENT may set. A budget dimension with no
+    # env key (the search volume and price bounds) is a reviewed value the
+    # runtime enforces and a deployment does not move, so it belongs in the
+    # policy and NOT in a map of environment variable names.
+    assert BudgetConfig.ENV_KEYS == {d.name: d.env_key for d in dimensions_for(BUDGET)
+                                     if d.env_key is not None}
+    assert {d.name for d in dimensions_for(BUDGET) if d.env_key is None} == {
+        "max_search_invocations_per_run", "search_cost_per_invocation"}
 
 
 # =============================================================================

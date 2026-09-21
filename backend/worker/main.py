@@ -515,6 +515,40 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             else:
                 raise ValueError(f"unknown ledger consumption kind {kind!r}")
 
+        # =============================================================
+        # THE provider authority for this worker process. ONE instance,
+        # built once, handed to WHICHEVER engine runs -- and to both of
+        # them when a process serves both. Everything a provider request
+        # is subject to lives behind it: the error taxonomy, the
+        # conservative token-admission rule, the organization gate, the
+        # bounded retries (each of which re-enters admission and the
+        # ledger), the total request deadline and the search accounting.
+        #
+        # Before this there were two schedulers -- V1 built its own in
+        # `_install_injections`, V2 another in `make_swarm_engine` -- and
+        # V1 additionally ran a private rate-limit retry loop. They shared
+        # the coordinator, so the organization ceiling held, but nothing
+        # else about a provider request was stated in one place, and two
+        # of the four surfaces classified 503 differently.
+        # =============================================================
+        from backend.provider_authority import ProviderAdapter
+        from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
+
+        provider_adapter = None
+        if engine is None and engine_mode != "mock":
+            provider_adapter = ProviderAdapter(
+                ProviderScheduler(
+                    provider_limits or ProviderLimitsConfig.from_env(),
+                    cancellation_checker=is_cancelled,
+                    backpressure_callback=record_provider_backpressure,
+                    coordinator=provider_coordinator),
+                # The run's ledger, so a search the provider performs inside
+                # a chat call is counted and priced like any other spend.
+                tracker=tracker,
+                client_factory=build_guarded_client_factory(
+                    tracker, request_deadline_seconds=provider_request_deadline),
+                request_deadline_seconds=provider_request_deadline)
+
         if engine is None and engine_registry is None and engine_mode == "mock":
             from backend.worker.mock_engine import MockLifecycleEngine
 
@@ -571,6 +605,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # must draw from one gate, not two that each believe they own
                 # the account.
                 provider_coordinator=provider_coordinator,
+                provider_adapter=provider_adapter,
                 evidence_authority=build_v1_evidence_authority(),
             )
             def make_swarm_engine():
@@ -582,7 +617,6 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     EvidenceMapperRegistry, RegisteredOperationEvidenceSink,
                     TrustedEvidenceAcquisition, production_evidence_mappers)
                 from backend.engines.swarm_v2.grounding import RepositoryEvidenceResolver
-                from backend.provider_scheduler import ProviderScheduler
                 from backend.tools import ToolContext, ToolRegistry
                 from backend.tools.government_vehicle import (GOVERNMENT_TOOL_SCOPE,
                                                               GovernmentVehicleTool)
@@ -633,10 +667,6 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # provider-visible policy -- the capability is ABSENT, not
                 # merely unreachable.
                 tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])
-                scheduler = ProviderScheduler(provider_limits,
-                    cancellation_checker=is_cancelled,
-                    backpressure_callback=record_provider_backpressure,
-                    coordinator=provider_coordinator)
                 # ONE PlanLimits instance feeds both the provider-visible
                 # policy (ModelGateway) and the deterministic firewall
                 # (PlanValidator): contract parity cannot drift silently.
@@ -650,7 +680,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # agent-step and model-call envelope can actually pay for.
                 limits = policy.plan_limits()
                 gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker, request_deadline_seconds=provider_request_deadline),
-                    scheduler=scheduler, api_key=worker_provider_api_key(),
+                    # The SAME adapter instance V1 is given above.
+                    adapter=provider_adapter, api_key=worker_provider_api_key(),
                     base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
                     # Sanitized, server-owned descriptors: Commander sees each
                     # registered tool's operations and schemas, and the SAME

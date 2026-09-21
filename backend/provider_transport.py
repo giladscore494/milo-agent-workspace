@@ -47,17 +47,33 @@ What it does NOT claim
   here: those return control to MILO while the socket and the provider-side
   work continue, and returning control is not termination.
 
-How the two phases are covered
-------------------------------
+How the whole lifecycle is covered
+----------------------------------
 
-1. **Waiting for response headers.** Genuinely silent: the provider sends
-   nothing while it computes. That is exactly the case an inactivity timeout
-   bounds correctly, so the client's ``read`` timeout covers it, and this
-   transport re-checks the clock the moment headers arrive.
-2. **Reading the body.** Not necessarily silent -- this is the trickle case --
-   so the stream wrapper below bounds it by elapsed time instead.
+A request is not one operation, it is five: acquiring a pooled connection,
+connecting, writing the request, waiting for response headers, and reading
+the body. httpx gives each its OWN timeout, and that is precisely how a
+request escapes a total deadline while every individual timeout is honoured:
+five sub-operations each allowed D seconds can run for 5D.
 
-Together: total ≲ deadline, whatever the peer does.
+So the deadline is ALLOCATED, not repeated. At the start of each request this
+transport computes one absolute deadline and divides the budget across the
+phases so their SUM cannot exceed it, overriding whatever per-phase numbers
+the client was built with (``request.extensions["timeout"]``, which is how
+httpx hands timeouts to a transport). Then:
+
+1. **Pool, connect, write.** Bounded by their allocated shares, which are
+   small: waiting minutes for a TCP handshake is never useful.
+2. **Waiting for response headers.** Genuinely silent -- the provider sends
+   nothing while it computes -- so an inactivity timeout is the right
+   instrument, and it gets whatever the earlier phases left. The clock is
+   re-checked the moment headers arrive.
+3. **Reading the body.** Not necessarily silent -- this is the trickle case --
+   so the stream wrapper below bounds it by elapsed time against the SAME
+   absolute deadline.
+
+Together: total ≲ deadline, whatever the peer does, and no single phase can
+borrow another's budget.
 """
 
 from __future__ import annotations
@@ -91,13 +107,58 @@ def _import_httpx() -> Any:
     return httpx
 
 
+#: The shares of one request's total deadline that the phases BEFORE the
+#: header wait may consume, between them. They are deliberately small: the
+#: silent header phase is where a provider legitimately spends time, and the
+#: setup phases are where a request that is going nowhere should be abandoned
+#: quickly. Each is also capped in absolute seconds, because a long deadline
+#: is not a reason to wait five minutes for a TCP handshake.
+_SETUP_PHASE_SHARES: tuple[tuple[str, float, float], ...] = (
+    ("pool", 0.05, 5.0),
+    ("connect", 0.10, 10.0),
+    ("write", 0.10, 10.0),
+)
+#: The header wait never drops below this, however the shares fall out.
+_MIN_READ_SECONDS = 0.001
+
+
+def allocate_request_timeouts(deadline_seconds: float,
+                              connect_timeout: float | None = None,
+                              ) -> dict[str, float]:
+    """Divide ONE absolute deadline across the phases of ONE request.
+
+    The contract this function exists to keep is arithmetic, and a test
+    asserts it directly::
+
+        pool + connect + write + read <= deadline
+
+    That is what makes the deadline ABSOLUTE rather than per-operation. A
+    caller-supplied ``connect_timeout`` may tighten its phase, never widen it
+    past its share.
+    """
+    deadline = float(deadline_seconds)
+    if deadline <= 0:
+        raise ValueError("provider request deadline must be positive")
+    allocation: dict[str, float] = {}
+    for name, share, cap in _SETUP_PHASE_SHARES:
+        value = min(deadline * share, cap)
+        if name == "connect" and connect_timeout is not None:
+            value = min(value, float(connect_timeout))
+        allocation[name] = max(_MIN_READ_SECONDS, value)
+    setup = sum(allocation.values())
+    allocation["read"] = max(_MIN_READ_SECONDS, deadline - setup)
+    return allocation
+
+
 def build_deadline_transport(deadline_seconds: float, *, inner: Any = None,
+                             connect_timeout: float | None = None,
                              clock: Callable[[], float] = time.monotonic) -> Any:
     """An httpx transport that enforces a TOTAL deadline per request."""
     httpx = _import_httpx()
     deadline = float(deadline_seconds)
     if deadline <= 0:
         raise ValueError("provider request deadline must be positive")
+    phase_timeouts = allocate_request_timeouts(deadline, connect_timeout)
 
     # Built here rather than at module scope because httpx asserts the stream
     # it is handed really is one of its own -- duck typing is rejected.
@@ -139,11 +200,30 @@ def build_deadline_transport(deadline_seconds: float, *, inner: Any = None,
         def handle_request(self, request: Any) -> Any:
             started = clock()
             deadline_at = started + deadline
+            # The allocation REPLACES whatever per-phase timeouts the client
+            # was built with. Without this the client's numbers survive, each
+            # phase gets the whole deadline, and a request that connects
+            # slowly and then waits for headers runs for multiples of it --
+            # every individual timeout honoured, the total deadline escaped.
+            extensions = dict(getattr(request, "extensions", None) or {})
+            configured = extensions.get("timeout")
+            allocated = dict(phase_timeouts)
+            if isinstance(configured, dict):
+                # A caller may only ever be TIGHTER than the allocation.
+                for name, value in configured.items():
+                    if value is None or name not in allocated:
+                        continue
+                    try:
+                        allocated[name] = min(allocated[name], float(value))
+                    except (TypeError, ValueError):
+                        continue
+            extensions["timeout"] = allocated
+            request.extensions = extensions
             response = self._inner.handle_request(request)
             elapsed = clock() - started
             if elapsed >= deadline:
-                # Headers alone consumed the whole budget; there is no time
-                # left to read a body.
+                # Everything up to and including the headers consumed the
+                # whole budget; there is no time left to read a body.
                 response.close()
                 raise ProviderRequestDeadlineExceeded(deadline, elapsed)
             response.stream = _DeadlineStream(response.stream, deadline_at, started)
@@ -162,18 +242,23 @@ def build_deadline_http_client(deadline_seconds: float, *, inner: Any = None,
                                clock: Callable[[], float] = time.monotonic) -> Any:
     """The httpx client every paid provider call is made through.
 
-    The inactivity timeouts and the total deadline are set from ONE number, so
-    the silent phase and the chunked phase cannot be bounded inconsistently.
+    The client's own timeouts are the OUTER bound, set from the same one
+    number so nothing is configured looser than the deadline. The transport
+    then allocates that number across the phases per request, so the sum of
+    the sub-operations cannot exceed it either -- the client-level values are
+    a ceiling on the allocation, never a second, independent budget.
     """
     httpx = _import_httpx()
     deadline = float(deadline_seconds)
     connect = min(10.0, deadline) if connect_timeout is None else float(connect_timeout)
     return httpx.Client(
-        transport=build_deadline_transport(deadline, inner=inner, clock=clock),
+        transport=build_deadline_transport(deadline, inner=inner,
+                                           connect_timeout=connect_timeout,
+                                           clock=clock),
         timeout=httpx.Timeout(deadline, connect=connect, read=deadline,
                               write=deadline, pool=deadline),
     )
 
 
-__all__ = ["ProviderRequestDeadlineExceeded", "build_deadline_http_client",
-           "build_deadline_transport"]
+__all__ = ["ProviderRequestDeadlineExceeded", "allocate_request_timeouts",
+           "build_deadline_http_client", "build_deadline_transport"]

@@ -379,6 +379,32 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
        why="CONSERVATIVE FALLBACK: the exact Tier 2 Web Search QPS was not "
            "recoverable from the official tier table and is not invented"),
 
+    # --- search VOLUME and PRICE, enforced by backend.budget.BudgetTracker --
+    #
+    # QPS above is the provider's pacing bucket for the STANDALONE endpoints.
+    # It says nothing about how many searches one run may perform in total,
+    # and nothing at all about V1's builtin `$web_search`, which the provider
+    # runs and bills INSIDE a chat call. These two dimensions are that
+    # missing bound: every search a run performs, by either route, is counted
+    # and priced against them.
+    _d("max_search_invocations_per_run", 60, runtime_default=60,
+       enforced_by=BUDGET,
+       why="V1's four discovery/technical phases each run up to ~15 model "
+           "calls that may search; 60 admits the observed shape with room "
+           "and still refuses an unbounded search loop, which no other "
+           "dimension bounded at all. No env key: the reviewed value is the "
+           "bound, and moving it is a reviewed change rather than a "
+           "deployment setting"),
+    _d("search_cost_per_invocation", 0.0, kind=float, fmt=FMT_MONEY,
+       direction=HIGHER_IS_TIGHTER, runtime_default=0.0, enforced_by=BUDGET,
+       why="the PRICE INTERFACE for a search, charged to the run's recorded "
+           "cost like any other spend. 0.00 because no verified Moonshot "
+           "search price was recoverable and a number is not invented; a "
+           "deployment that knows the price configures it, and a LARGER "
+           "value only makes the recorded-cost ceiling bind sooner. No env "
+           "key: publishing a price is a reviewed change, not a deployment "
+           "setting"),
+
     # --- declared posture, enforced by operator process and Stage D --------
     _d("hard_monetary_cap_usd", 3.00, kind=float, fmt=FMT_MONEY, runtime_default=3.00,
        enforced_by=POSTURE,
@@ -523,10 +549,12 @@ class RuntimePolicy:
             fields[dimension.name] = (None if value is None else
                                       int(value) if dimension.kind is int
                                       else float(value))
-        # `estimated_cost_per_call` is a rate with a real code default rather
-        # than an optional ceiling, so it is never None on the dataclass.
-        if fields.get("estimated_cost_per_call") is None:
-            fields.pop("estimated_cost_per_call")
+        # Rates with a real code default rather than an optional ceiling: they
+        # are never None on the dataclass, so an unset policy value leaves the
+        # default in place instead of writing None over it.
+        for rate in ("estimated_cost_per_call", "search_cost_per_invocation"):
+            if fields.get(rate) is None:
+                fields.pop(rate, None)
         return BudgetConfig(**fields)
 
     def plan_limits(self, *, base: Any | None = None) -> Any:

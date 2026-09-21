@@ -149,16 +149,28 @@ def test_semantic_failure_still_consumes_the_retry_callback(engine_globals):
     assert backpressure == []
 
 
-def test_tool_rounds_and_retry_loop_go_through_the_shared_scheduler(engine_globals):
+def test_tool_rounds_and_retry_loop_go_through_the_one_authority(engine_globals):
+    """V1 holds no provider call, no client construction and no retry loop.
+
+    Stronger than the assertion it replaces. It used to be enough that the
+    raw create call appeared once inside V1's own guarded helper; the helper
+    was still V1's, and beside it V1 ran a private rate-limit retry loop with
+    its own delay and its own bound. Now the call belongs to the adapter and
+    V1 has no provider mechanics of its own left to drift.
+    """
     from pathlib import Path
 
     source = (Path(__file__).resolve().parents[1] / "backend" / "engines" / "vehicle_catalog_v1" / "core.py").read_text(encoding="utf-8")
-    # The raw provider call exists exactly once, inside the guarded path.
-    assert source.count("client.chat.completions.create") == 1
-    guarded = source.split("def _scheduled_provider_call", 1)[1].split("\ndef ", 1)[0]
-    assert "client.chat.completions.create" in guarded
-    # Both moonshot_chat rounds route through the guarded path.
-    assert source.count("_scheduled_provider_call(client, kwargs, agent_name, phase_name)") == 2
+    assert "chat.completions.create" not in source
+    assert "OpenAI(" not in source, "V1 builds its own provider client again"
+    guarded = source.split("def _authority_call", 1)[1].split("\ndef ", 1)[0]
+    assert ".chat(" in guarded
+    # Both moonshot_chat rounds route through the one authority.
+    assert source.count("_authority_call(client, kwargs, agent_name, phase_name)") == 2
+    # And no private retry loop survives beside the authority's bounded one.
+    attempt = source.split("    def attempt(", 1)[1].split("\n    raw = attempt", 1)[0]
+    assert "while True" not in attempt
+    assert "SLEEP_FN(API_CONCURRENCY_RETRY_DELAY_SECONDS)" not in source
 
 
 # -- budget guard classification ----------------------------------------------
