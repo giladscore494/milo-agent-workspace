@@ -32,6 +32,7 @@ export type RunIdentity = {
   policy_fingerprint: string;
   release_sha: string;
   event_registry_version: string;
+  event_registry_fingerprint: string;
 };
 export type Run = { id: UUID; conversation_id: UUID; status: string; run_identity?: RunIdentity | null; started_at?: string; finished_at?: string; output?: Record<string, unknown>; error?: Record<string, unknown>; launch_state?: LaunchState; launch_error_class?: string; launch_reconciliation_required?: boolean; usage?: RunUsage | null };
 // run_events.id is production bigint (not UUID); run_id remains UUID. It is
