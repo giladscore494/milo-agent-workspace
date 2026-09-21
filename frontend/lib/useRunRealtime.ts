@@ -4,6 +4,7 @@ import { api } from './api';
 import { EventId, maxEventId, normalizeEventId } from './eventId';
 import { eventBelongsToRun, runBelongsToScope } from './ownership';
 import { initialWorkspaceState, reduceRunEvent } from './runReducer';
+import { runIdentityWorkflowKey } from './runIdentity';
 import { isTerminalRunStatus } from './runStatus';
 import { SwarmRunViewModel, buildSwarmRunViewModel } from './swarmViewModel';
 import { Run, RunEvent, WorkspaceState } from './types';
@@ -184,7 +185,15 @@ export function useRunRealtime(
   // The Swarm V2 view model is derived, never stored, so it resets with the
   // workspace state on every run switch and can never outlive its run.
   const swarm: SwarmRunViewModel = useMemo(
-    () => buildSwarmRunViewModel({ run: state.run, swarm: state.swarm, workflowKey }),
+    () => buildSwarmRunViewModel({
+      run: state.run, swarm: state.swarm,
+      // The RUN's own immutable identity wins over the project's CURRENT
+      // workflow_key. A project switched from V1 to V2 must not re-render a
+      // historical run as the engine the project is today; the project stays
+      // the answer only for a run created before identities existed, and for
+      // the window before the run row has loaded at all.
+      workflowKey: runIdentityWorkflowKey(state.run) ?? workflowKey,
+    }),
     [state.run, state.swarm, workflowKey],
   );
 

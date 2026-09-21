@@ -91,6 +91,22 @@ REQUIRED_PER_FILE = {
         "conflicts enable row level security",
         "model_call_budget_reservations enable row level security",
     ],
+    "20260921000200_immutable_run_identity.sql": [
+        # The identity column, and the two properties only the database can
+        # guarantee: set-once binding and an immutability trigger. Losing
+        # either would turn "a run's engine cannot change" back into a
+        # convention that application code merely tries to keep.
+        "add column if not exists run_identity jsonb",
+        "create or replace function public.runs_forbid_identity_rewrite()",
+        "create trigger runs_forbid_identity_rewrite",
+        "run_identity_immutable",
+        "create or replace function public.bind_run_identity(",
+        # The three worker writes that had no lease fence at all.
+        "create or replace function public.create_tool_access_request_guarded(",
+        "create or replace function public.create_tool_grant_guarded(",
+        "create or replace function public.append_usage_ledger_guarded(",
+        "perform public.assert_worker_lease(",
+    ],
 }
 
 FORBIDDEN_EVERYWHERE = [

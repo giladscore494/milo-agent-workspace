@@ -31,6 +31,7 @@ class FakeRepo:
         self.appended_events = 0
         self.completed_runs = 0
         self.failed_runs = 0
+        self.leases_seen = []
 
     def _fail(self):
         if self.fail:
@@ -85,21 +86,35 @@ class FakeRepo:
         self.proposal_updates += 1; return {**self.get_workflow_proposal(proposal_id), **fields}
     def create_project_from_proposal(self, proposal_id, slug, name, description, configuration, created_by=None):
         self.projects_from_proposals += 1; return {"id": uuid4(), "slug": slug, "name": name, "workflow_key": "chat_architect_v1", "configuration": configuration}
-    def create_tool_access_request(self, run_id, request):
+    # Every worker-side write now takes the run lease, so the fake records it:
+    # `leases_seen` is what proves the ROUTE forwarded the ownership contract
+    # rather than merely accepting it in the request body.
+    def _record_lease(self, worker_id, attempt, lease_token):
+        self.leases_seen.append({"worker_id": worker_id, "attempt": attempt,
+                                 "lease_token": lease_token})
+    def create_tool_access_request(self, run_id, request, *, worker_id, attempt, lease_token):
+        self._record_lease(worker_id, attempt, lease_token)
         self.tool_access_requests += 1; return {"id": str(uuid4()), "run_id": run_id, **request}
-    def create_tool_grant(self, run_id, grant):
+    def create_tool_grant(self, run_id, grant, *, worker_id, attempt, lease_token):
+        self._record_lease(worker_id, attempt, lease_token)
         self.tool_grants += 1; return {"id": str(uuid4()), "run_id": run_id, **grant}
-    def create_tool_usage(self, run_id, usage):
+    def create_tool_usage(self, run_id, usage, *, worker_id, attempt, lease_token):
+        self._record_lease(worker_id, attempt, lease_token)
         self.tool_usage_rows += 1; return {"id": str(uuid4()), "run_id": run_id, **usage}
-    def create_source(self, run_id, source):
+    def create_source(self, run_id, source, *, worker_id, attempt, lease_token):
+        self._record_lease(worker_id, attempt, lease_token)
         self.sources += 1; return {"id": str(uuid4()), "run_id": run_id, **source}
-    def create_claim(self, run_id, claim):
+    def create_claim(self, run_id, claim, *, worker_id, attempt, lease_token):
+        self._record_lease(worker_id, attempt, lease_token)
         self.claims += 1; return {"id": str(uuid4()), "run_id": run_id, **claim}
-    def create_conflict(self, run_id, conflict):
+    def create_conflict(self, run_id, conflict, *, worker_id, attempt, lease_token):
+        self._record_lease(worker_id, attempt, lease_token)
         self.conflicts += 1; return {"id": str(uuid4()), "run_id": run_id, **conflict}
-    def mark_run_complete(self, run_id, output):
+    def mark_run_complete(self, run_id, output, worker_id=None, attempt=None, lease_token=None):
+        self._record_lease(worker_id, attempt, lease_token)
         self.completed_runs += 1; return {"id": run_id, "conversation_id": self.conversation_id, "status": "completed", "output": output}
-    def mark_run_failed(self, run_id, code, message):
+    def mark_run_failed(self, run_id, code, message, worker_id=None, attempt=None, lease_token=None):
+        self._record_lease(worker_id, attempt, lease_token)
         self.failed_runs += 1; return {"id": run_id, "conversation_id": self.conversation_id, "status": "failed", "error": {"code": code, "message": message}}
 
     def assert_no_mutations(self):

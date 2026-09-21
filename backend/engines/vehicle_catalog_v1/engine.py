@@ -7,6 +7,7 @@ from typing import Any
 
 from backend.provider_authority import ProviderAdapter
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
+from backend.run_identity import ENGINE_VERSIONS
 from backend.runtime import CancellationRequested
 from . import core
 from .evidence_authority import V1EvidenceAuthority, apply_evidence_authority
@@ -15,7 +16,11 @@ from .source_policy import apply_israel_source_policy, market_requires_israel_po
 EventSink = Callable[[str, dict[str, Any]], None]
 CheckpointSink = Callable[[str, dict[str, Any]], None]
 CancellationChecker = Callable[[], bool]
-ENGINE_VERSION = "vehicle_catalog_v1.stage3"
+#: This engine's reviewed contract version, read from the ONE registry that
+#: declares it. It used to be a literal here and a second literal inside the
+#: run identity that names it; a workflow whose version is written twice is a
+#: workflow whose identity can disagree with its checkpoints.
+ENGINE_VERSION = ENGINE_VERSIONS["vehicle_catalog_v1"]
 
 
 @dataclass

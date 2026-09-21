@@ -112,7 +112,13 @@ test('16b/18. browser tokens and invalid worker identities are rejected on worke
   expect(spoofed.status()).toBe(401);
 });
 
-test('19. a valid mocked worker identity can write authorized events', async ({ request, baseURL }) => {
+test('19. a valid worker identity without the run lease mutates nothing', async ({ request, baseURL }) => {
+  // Identity answers "is this a worker?". It cannot answer "is this THE worker
+  // of THIS attempt of THIS run?", and only the second question stops a worker
+  // whose lease has been reclaimed from writing to a run another worker is
+  // executing. Every worker mutation route now requires the run + attempt +
+  // worker + lease ownership contract, so an approved identity alone — which
+  // used to be accepted here — is refused before anything is written.
   const token = await apiToken(request, 'alice');
   const conversationId = await createConversation(request, baseURL!, token, PROJECT_ALPHA, 'worker-writes');
   const created = await request.post(`${baseURL}/api/gateway/conversations/${conversationId}/runs`, {
@@ -120,11 +126,22 @@ test('19. a valid mocked worker identity can write authorized events', async ({ 
     data: { content: 'produce the final report', idempotency_key: 'e2e-key-worker-0001' },
   });
   const runId = (await created.json()).run_id;
-  const event = await request.post(`${BACKEND}/internal/runs/${runId}/events`, {
+  const leaseless = await request.post(`${BACKEND}/internal/runs/${runId}/events`, {
     headers: { 'X-Milo-Worker-Token': 'e2e-valid-worker-token' },
     data: { event_type: 'agent_progress', message: 'written by verified worker identity' },
   });
-  expect(event.status()).toBe(201);
+  expect(leaseless.status()).toBe(422);
+
+  // A stale lease is refused by the database, not by the request shape: the
+  // contract is complete here and still does not own the run.
+  const stale = await request.post(`${BACKEND}/internal/runs/${runId}/events`, {
+    headers: { 'X-Milo-Worker-Token': 'e2e-valid-worker-token' },
+    data: {
+      worker_id: 'not-the-worker', attempt: 1, lease_token: 'not-the-lease',
+      event_type: 'agent_progress', message: 'written by a replaced worker',
+    },
+  });
+  expect(stale.status()).not.toBe(201);
 });
 
 test('20+26. polling reconstructs run state and renders final output', async ({ page }) => {

@@ -75,6 +75,14 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20260915180000": ("column", "catalog_raw_records.source_locator"),
     "20260916090000": ("function", "catalog_snapshot_candidate_diff"),
     "20260916120000": ("table", "catalog_canonical_field_provenance"),
+    # Consoles 2-4 and this one. Their absence used to be invisible to the
+    # marker check: a history row claiming them applied could not be
+    # contradicted by anything, because no marker named the object each one
+    # creates.
+    "20260920000100": ("table", "run_execution_usage"),
+    "20260920000200": ("function", "finalize_run_guarded"),
+    "20260921000100": ("function", "claim_current_verdict_states"),
+    "20260921000200": ("column", "runs.run_identity"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")

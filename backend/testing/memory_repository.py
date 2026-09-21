@@ -433,12 +433,51 @@ class MemoryRepository:
         row = self.__dict__.get("run_usage_ledgers", {}).get(str(run_id))
         return {**row, "ledger": dict(row["ledger"])} if row else None
 
-    def append_usage_ledger(self, entry: dict[str, Any]) -> dict[str, Any]:
-        row = {"id": len(getattr(self, "usage_ledger", [])) + 1, "created_at": _now(), **entry}
+    def append_usage_ledger(self, entry: dict[str, Any], *,
+                            worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Parity with `append_usage_ledger_guarded` (migration 20260921000200).
+
+        The per-call rows `sum_daily_ledger_cost` reads were the last durable
+        write a running worker made unfenced, so a replaced worker could keep
+        charging a run it no longer owned against the live worker's daily
+        allowance. The run id comes from the FENCED argument, so an entry
+        naming another run cannot charge one.
+        """
+        run_id = entry.get("run_id")
+        if not run_id:
+            raise AppError("REPOSITORY_ERROR", "a usage ledger entry requires its run id", 502)
+        self._evidence_lease(UUID(str(run_id)), worker_id, attempt, lease_token)
+        row = {"id": len(getattr(self, "usage_ledger", [])) + 1, "created_at": _now(),
+               **entry, "run_id": str(run_id)}
         if not hasattr(self, "usage_ledger"):
             self.usage_ledger = []
         self.usage_ledger.append(row)
         return dict(row)
+
+    def bind_run_identity(self, run_id: UUID, identity: dict[str, Any]) -> dict[str, Any]:
+        """Parity with `bind_run_identity` (migration 20260921000200).
+
+        Set once, under the lock so two binds cannot both see a null column.
+        An identical re-bind is a no-op; a DIFFERENT record is refused, here as
+        in the database -- and once bound, nothing in this repository writes
+        the field again.
+        """
+        with self.lock:
+            run = self.runs.get(str(run_id))
+            if run is None:
+                raise NotFoundError("run", str(run_id))
+            if not isinstance(identity, dict) or not identity:
+                raise AppError("RUN_IDENTITY_INVALID", "a run identity must be an object", 422)
+            if str(identity.get("run_id") or "") != str(run_id):
+                raise AppError("RUN_IDENTITY_INVALID", "the identity names a different run", 422)
+            current = run.get("run_identity")
+            if current is None:
+                run["run_identity"] = dict(identity)
+                run["updated_at"] = _now()
+            elif current != identity:
+                raise AppError("RUN_IDENTITY_IMMUTABLE",
+                               "the run already has a different immutable identity", 409)
+            return dict(run)
 
     def sum_daily_ledger_cost(self, user_id: str | None = None, project_id: str | None = None, run_id: str | None = None, hours: int = 24) -> float:
         rows = getattr(self, "usage_ledger", [])
@@ -671,10 +710,22 @@ class MemoryRepository:
             raise NotFoundError("run", str(run_id))
         self._assert_active_lease(run, worker_id, attempt, lease_token)
 
-    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]:
+    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any], *,
+                                   worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Parity with `create_tool_access_request_guarded` (20260921000200).
+
+        Both of these were direct inserts on either side, so a worker whose
+        lease had been reclaimed could still open tool access on a run it no
+        longer owned. The complete lease is now required here exactly as the
+        RPC requires it: a missing component is a refusal, never a skipped
+        check.
+        """
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
         return self._tool_row(run_id, request)
 
-    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]:
+    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any], *,
+                          worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
         return self._tool_row(run_id, grant)
 
     def create_tool_usage(self, run_id: UUID, usage: dict[str, Any], **lease: Any) -> dict[str, Any]:

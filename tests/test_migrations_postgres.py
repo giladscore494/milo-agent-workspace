@@ -1440,6 +1440,12 @@ SERVICE_ONLY_RPCS = [
     "public.model_call_budget_committed(uuid, uuid, date)",
     "public.reserve_model_call_budget(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text)",
     "public.settle_model_call_budget(uuid, numeric, text, text)",
+    # 20260921000200 -- the run-identity binder and the three worker writes
+    # that had no lease fence before it.
+    "public.bind_run_identity(uuid, jsonb)",
+    "public.create_tool_access_request_guarded(uuid, text, integer, text, jsonb)",
+    "public.create_tool_grant_guarded(uuid, text, integer, text, jsonb)",
+    "public.append_usage_ledger_guarded(uuid, text, integer, text, jsonb)",
 ]
 DEPRECATED_RPCS_WITHOUT_SERVICE_ROLE = {
     "public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text)",
@@ -6968,3 +6974,194 @@ def test_the_current_verdict_functions_are_service_only(db):
                 f"select has_function_privilege('{role}', '{signature}', 'execute')") == "f"
         assert db.psql(
             f"select has_function_privilege('service_role', '{signature}', 'execute')") == "t"
+
+
+# ---------------------------------------------------------------------------
+# 20260921000200: the immutable run identity, and the last unfenced worker
+# writes.
+# ---------------------------------------------------------------------------
+
+
+def _identity_migration():
+    return next(m for m in MIGRATIONS if "immutable_run_identity" in m.name)
+
+
+def _identity_json(run_id: str, workflow_key: str = "swarm_v2", **over) -> str:
+    record = {
+        "identity_version": "milo-run-identity/1",
+        "run_id": run_id,
+        "workflow_key": workflow_key,
+        "engine_version": "swarm_v2.1",
+        "policy_version": "milo-runtime-policy/1",
+        "policy_fingerprint": "f" * 64,
+        "release_sha": "a" * 40,
+        "event_registry_version": "milo-event-registry/1",
+    }
+    record.update(over)
+    return json.dumps(record)
+
+
+def test_bind_run_identity_writes_once_and_is_idempotent(db):
+    run_id = _seed_stale_worker_run(db)
+    record = _identity_json(run_id)
+
+    bound = db.psql(f"select run_identity from public.bind_run_identity('{run_id}', '{record}'::jsonb)")
+    assert json.loads(bound)["workflow_key"] == "swarm_v2"
+    # An identical re-bind is a no-op that returns the same row.
+    again = db.psql(f"select run_identity from public.bind_run_identity('{run_id}', '{record}'::jsonb)")
+    assert json.loads(again) == json.loads(bound)
+
+
+def test_a_bound_identity_can_never_be_changed_by_any_path(db):
+    """REQUIRED REGRESSION 1, at the only boundary that actually holds.
+
+    An application guard is advisory against a second writer; the trigger is
+    not. A V2 run must not be able to become a V1 one through the binder, a
+    direct service-role UPDATE, or an erasure.
+    """
+    run_id = _seed_stale_worker_run(db)
+    db.psql(f"select public.bind_run_identity('{run_id}', '{_identity_json(run_id)}'::jsonb)")
+
+    # 1) Through the binder.
+    with pytest.raises(AssertionError, match="RUN_IDENTITY_IMMUTABLE"):
+        db.psql(f"select public.bind_run_identity('{run_id}', "
+                f"'{_identity_json(run_id, 'vehicle_catalog_v1', engine_version='vehicle_catalog_v1.stage3')}'::jsonb)")
+    # 2) Through a direct service-role table write.
+    with pytest.raises(AssertionError, match="RUN_IDENTITY_IMMUTABLE"):
+        db.psql(f"update public.runs set run_identity = "
+                f"'{_identity_json(run_id, 'vehicle_catalog_v1', engine_version='vehicle_catalog_v1.stage3')}'::jsonb "
+                f"where id='{run_id}'")
+    # 3) By erasing it. Dropping an identity is a rewrite too.
+    with pytest.raises(AssertionError, match="RUN_IDENTITY_IMMUTABLE"):
+        db.psql(f"update public.runs set run_identity = null where id='{run_id}'")
+
+    assert json.loads(db.psql(f"select run_identity from public.runs where id='{run_id}'"))["workflow_key"] == "swarm_v2"
+    # Every other column still updates normally: the trigger fences the
+    # identity, it does not freeze the row.
+    assert db.psql(f"update public.runs set status='queued' where id='{run_id}' returning status") == "queued"
+
+
+def test_an_identity_naming_another_run_or_a_bad_shape_is_refused(db):
+    run_id = _seed_stale_worker_run(db)
+    other = _seed_stale_worker_run(db)
+    with pytest.raises(AssertionError, match="RUN_IDENTITY_INVALID"):
+        db.psql(f"select public.bind_run_identity('{run_id}', '{_identity_json(other)}'::jsonb)")
+    with pytest.raises(AssertionError, match="RUN_IDENTITY_INVALID"):
+        db.psql(f"select public.bind_run_identity('{run_id}', '[]'::jsonb)")
+    with pytest.raises(AssertionError, match="RUN_IDENTITY_INVALID"):
+        db.psql(f"select public.bind_run_identity('{run_id}', null)")
+    with pytest.raises(AssertionError, match="RUN_NOT_FOUND"):
+        db.psql("select public.bind_run_identity('00000000-0000-4000-8000-000000000000', "
+                "'{\"run_id\": \"00000000-0000-4000-8000-000000000000\"}'::jsonb)")
+
+
+def test_the_identity_column_refuses_a_record_that_is_not_one(db):
+    """The shape constraint is the part the database can enforce on EVERY
+    path into the column, including a direct write that bypasses the binder."""
+    run_id = _seed_stale_worker_run(db)
+    for broken in ('\'"a string"\'::jsonb',
+                   "'{}'::jsonb",
+                   f"'{_identity_json(run_id, policy_fingerprint='')}'::jsonb"):
+        with pytest.raises(AssertionError, match="runs_run_identity_shape_check"):
+            db.psql(f"update public.runs set run_identity = {broken} where id='{run_id}'")
+    # A legacy row with no identity at all is untouched by the constraint.
+    assert db.psql(f"select run_identity is null from public.runs where id='{run_id}'") == "t"
+
+
+def _newly_guarded_calls(run_id: str, worker: str, attempt: str, token: str) -> dict[str, str]:
+    """The three worker writes that had NO lease fence before 20260921000200."""
+    lease = f"'{run_id}', '{worker}', {attempt}, '{token}'"
+    return {
+        "tool_access_request": (
+            f"select id from public.create_tool_access_request_guarded({lease}, "
+            "'{\"agent\": \"a\", \"tool\": \"web_search\", \"reason\": \"r\"}'::jsonb)"),
+        "tool_grant": (
+            f"select id from public.create_tool_grant_guarded({lease}, "
+            "'{\"agent\": \"a\", \"tool\": \"web_search\", \"max_searches\": 1, "
+            "\"max_rounds\": 1, \"approver_policy\": \"auto\", "
+            "\"expires_at\": \"2030-01-01T00:00:00+00:00\"}'::jsonb)"),
+        "usage_ledger_row": (
+            f"select id from public.append_usage_ledger_guarded({lease}, "
+            "'{\"provider\": \"moonshot\", \"model\": \"kimi\", \"call_seq\": 7, "
+            "\"decision\": \"settled\", \"actual_cost\": 0.01}'::jsonb)"),
+    }
+
+
+def test_a_stale_worker_cannot_perform_the_newly_guarded_writes(db):
+    """REQUIRED REGRESSION 5, for the three paths that had no fence at all.
+
+    The ledger row is the one that mattered most: it is what
+    `sum_daily_ledger_cost` reads, so an unfenced append let a replaced worker
+    keep charging a run it no longer owned against the live worker's DAILY
+    allowance.
+    """
+    run_id = _seed_stale_worker_run(db)
+    worker_a, attempt_a, token_a = db.psql(
+        f"select worker_id, attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-IDA', 300)").split("|")
+
+    # While current, worker A performs every one of them.
+    for name, sql in _newly_guarded_calls(run_id, worker_a, attempt_a, token_a).items():
+        assert db.psql(sql).strip(), f"live worker blocked on {name}"
+
+    # The lease lapses and a replacement claims it.
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
+    db.psql(f"select public.claim_run_lease('{run_id}', 'worker-IDB', 300)")
+
+    for name, sql in _newly_guarded_calls(run_id, worker_a, attempt_a, token_a).items():
+        with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+            db.psql(sql)
+    # Nothing landed from the stale attempt: one row each, from the live one.
+    assert db.psql(f"select count(*) from public.run_usage_ledger where run_id='{run_id}'") == "1"
+    assert db.psql(f"select count(*) from public.tool_grants where run_id='{run_id}'") == "1"
+
+
+def test_a_guarded_ledger_row_is_charged_to_the_fenced_run_not_the_payload(db):
+    run_id = _seed_stale_worker_run(db)
+    other = _seed_stale_worker_run(db)
+    worker, attempt, token = db.psql(
+        f"select worker_id, attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-LEDGERID', 300)").split("|")
+    row = db.psql(
+        f"select run_id from public.append_usage_ledger_guarded('{run_id}', '{worker}', {attempt}, '{token}', "
+        f"'{{\"run_id\": \"{other}\", \"provider\": \"moonshot\", \"model\": \"kimi\", \"call_seq\": 9, \"decision\": \"settled\"}}'::jsonb)")
+    assert row == run_id
+    assert db.psql(f"select count(*) from public.run_usage_ledger where run_id='{other}'") == "0"
+
+
+def test_a_tool_grant_cannot_mark_another_runs_request_granted(db):
+    """The grant path mutates TWO tables. Both are inside one function body
+    and under one lease, and the request must belong to THIS run."""
+    run_a = _seed_stale_worker_run(db)
+    run_b = _seed_stale_worker_run(db)
+    worker_a, attempt_a, token_a = db.psql(
+        f"select worker_id, attempt, lease_token from public.claim_run_lease('{run_a}', 'worker-GRANTA', 300)").split("|")
+    worker_b, attempt_b, token_b = db.psql(
+        f"select worker_id, attempt, lease_token from public.claim_run_lease('{run_b}', 'worker-GRANTB', 300)").split("|")
+
+    request_b = db.psql(
+        f"select id from public.create_tool_access_request_guarded('{run_b}', '{worker_b}', {attempt_b}, '{token_b}', "
+        "'{\"agent\": \"a\", \"tool\": \"web_search\", \"reason\": \"r\"}'::jsonb)")
+    with pytest.raises(AssertionError, match="TOOL_GRANT_INVALID"):
+        db.psql(
+            f"select id from public.create_tool_grant_guarded('{run_a}', '{worker_a}', {attempt_a}, '{token_a}', "
+            f"'{{\"request_id\": \"{request_b}\", \"agent\": \"a\", \"tool\": \"web_search\", \"max_searches\": 1, "
+            "\"max_rounds\": 1, \"approver_policy\": \"auto\", \"expires_at\": \"2030-01-01T00:00:00+00:00\"}'::jsonb)")
+    # Neither table moved: the refusal rolls the status update back with it.
+    assert db.psql(f"select status from public.tool_access_requests where id='{request_b}'") == "pending"
+    assert db.psql(f"select count(*) from public.tool_grants where run_id='{run_a}'") == "0"
+
+
+def test_the_run_identity_migration_is_service_only_and_rerun_safe(db):
+    for signature in ("public.bind_run_identity(uuid, jsonb)",
+                      "public.create_tool_access_request_guarded(uuid, text, integer, text, jsonb)",
+                      "public.create_tool_grant_guarded(uuid, text, integer, text, jsonb)",
+                      "public.append_usage_ledger_guarded(uuid, text, integer, text, jsonb)"):
+        for role in ("anon", "authenticated"):
+            assert not _has_execute(db, role, signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+    for role in ("anon", "authenticated"):
+        assert db.psql(f"select has_column_privilege('{role}', 'public.runs', 'run_identity', 'update')") == "f"
+
+    db.psql(file=_identity_migration())
+    db.psql(file=_identity_migration())
+    assert db.psql("select count(*) from pg_proc where proname='bind_run_identity'") == "1"
+    assert db.psql("select count(*) from pg_trigger where tgname='runs_forbid_identity_rewrite'") == "1"

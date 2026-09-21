@@ -427,6 +427,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             ledger_project_id = None
 
         def record_ledger(entry):
+            """Append ONE per-call ledger row -- under this worker's lease.
+
+            The per-call rows the daily budget is summed from were the last
+            durable write a running worker made unfenced. Every other usage
+            surface has been lease-guarded since the execution usage ledger
+            landed; this one went straight into the table, so a replaced worker
+            could keep charging a run it no longer owned against the live
+            worker's daily allowance.
+            """
             if hasattr(repo, "append_usage_ledger"):
                 repo.append_usage_ledger({
                     "run_id": str(run_id),
@@ -435,7 +444,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     "provider": "moonshot",
                     "model": "kimi",
                     **entry,
-                })
+                }, **lease_ctx)
 
         # MILO_WORKER_ENGINE=mock (forbidden in production by
         # backend/production_config.py) runs the zero-cost staging engine: no

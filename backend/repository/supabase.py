@@ -30,6 +30,8 @@ class Repository(Protocol):
     def update_run_usage(self, run_id: UUID, usage: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def record_run_usage(self, run_id: UUID, ledger: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def get_run_usage_ledger(self, run_id: UUID) -> dict[str, Any] | None: ...
+    def append_usage_ledger(self, entry: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def bind_run_identity(self, run_id: UUID, identity: dict[str, Any]) -> dict[str, Any]: ...
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -46,8 +48,8 @@ class Repository(Protocol):
     def get_workflow_proposal(self, proposal_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]: ...
     def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any], created_by: UUID | None = None) -> dict[str, Any]: ...
-    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]: ...
-    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]: ...
+    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def create_tool_usage(self, run_id: UUID, usage: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def create_source(self, run_id: UUID, source: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def create_claim(self, run_id: UUID, claim: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
@@ -334,9 +336,49 @@ class SupabaseRepository:
         "actual_input_tokens", "actual_output_tokens", "estimated_cost", "actual_cost",
     )
 
-    def append_usage_ledger(self, entry: dict[str, Any]) -> dict[str, Any]:
-        payload = {key: entry[key] for key in self.LEDGER_FIELDS if entry.get(key) is not None}
-        return self._single(self.client.table("run_usage_ledger").insert(payload).select("*"), "run_usage_ledger", "new")
+    def append_usage_ledger(self, entry: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Append ONE per-call ledger row, under the worker's lease.
+
+        This was the last unfenced durable write a running worker performed:
+        every other usage surface (runs.usage, run_execution_usage) has been
+        lease-guarded since migration 20260920000100, but the per-call rows the
+        DAILY budget is summed from went straight into the table. A replaced
+        worker could therefore keep charging a run it no longer owned, against
+        the live worker's daily allowance.
+
+        The run id travels as the FENCED argument, not as a payload field, so
+        an entry naming another run cannot charge one.
+        """
+        run_id = entry.get("run_id")
+        if not run_id:
+            raise AppError("REPOSITORY_ERROR", "a usage ledger entry requires its run id", 502)
+        payload = {key: entry[key] for key in self.LEDGER_FIELDS
+                   if key != "run_id" and entry.get(key) is not None}
+        params = {**self._lease_params(UUID(str(run_id)), worker_id, attempt, lease_token),
+                  "p_entry": payload}
+        return self._guarded_rpc("append_usage_ledger_guarded", params, "run_usage_ledger")
+
+    def bind_run_identity(self, run_id: UUID, identity: dict[str, Any]) -> dict[str, Any]:
+        """Establish a run's immutable identity, exactly once.
+
+        Set-once in the database (migration 20260921000200): the write lands
+        only while the column is null, an identical re-bind is a no-op, and a
+        DIFFERENT record is refused -- there and again in the trigger that
+        refuses any update changing a bound identity.
+        """
+        try:
+            data = self.client.rpc("bind_run_identity", {
+                "p_run_id": str(run_id), "p_identity": identity}).execute().data
+        except Exception as exc:
+            if "RUN_IDENTITY_IMMUTABLE" in str(exc):
+                raise AppError("RUN_IDENTITY_IMMUTABLE",
+                               "the run already has a different immutable identity", 409) from exc
+            raise AppError("REPOSITORY_ERROR", "run identity binding failed", 502) from exc
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if data is None:
+            raise AppError("REPOSITORY_ERROR", "run identity binding returned no row", 502)
+        return data
 
     def sum_daily_ledger_cost(self, user_id: str | None = None, project_id: str | None = None, run_id: str | None = None, hours: int = 24) -> float:
         """Conservative daily spend: per call, the settled actual cost when
@@ -752,15 +794,24 @@ class SupabaseRepository:
     def list_supervisor_decisions(self, run_id: UUID) -> list[dict[str, Any]]:
         return self._many(self.client.table("supervisor_decisions").select("*").eq("run_id", str(run_id)).order("created_at"))
 
-    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]:
-        payload = {"run_id": str(run_id), **request}
-        return self._single(self.client.table("tool_access_requests").insert(payload).select("*"), "tool_access_request", "new")
+    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Lease-guarded (migration 20260921000200).
 
-    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]:
-        payload = {"run_id": str(run_id), **grant}
-        if payload.get("request_id"):
-            self.client.table("tool_access_requests").update({"status": "granted"}).eq("id", str(payload["request_id"])).execute()
-        return self._single(self.client.table("tool_grants").insert(payload).select("*"), "tool_grant", "new")
+        This was a direct table insert on behalf of a worker, so a replaced
+        worker could still open tool access on a run it no longer owned.
+        """
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_request": request}
+        return self._guarded_rpc("create_tool_access_request_guarded", params, "tool_access_request")
+
+    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Lease-guarded (migration 20260921000200).
+
+        The unfenced version mutated TWO tables -- the grant insert and the
+        referenced request's status -- in two separate unfenced statements.
+        The guarded RPC does both inside one function body, under the lease.
+        """
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_grant": grant}
+        return self._guarded_rpc("create_tool_grant_guarded", params, "tool_grant")
 
     @staticmethod
     def _lease_params(run_id: UUID, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:

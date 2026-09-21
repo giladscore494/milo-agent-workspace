@@ -69,6 +69,7 @@ Usage:
   policy_envelope.py engine-limits        # STAGE_D_WORKER_ENGINE_LIMITS
   policy_envelope.py execution-increment  # STAGE_D_AUTHORIZED_EXECUTION_INCREMENT
   policy_envelope.py fingerprint          # the reviewed policy digest
+  policy_envelope.py run-identity         # STAGE_D_EXPECTED_RUN_IDENTITY
   policy_envelope.py document             # the whole canonical document as JSON
   policy_envelope.py binding              # prove the policy IS the release's
 
@@ -93,8 +94,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend.runtime_policy import (  # noqa: E402  (path bootstrap must run first)
-    CAP_ENV_PREFIXES, ENGINE_ENV_PREFIXES, PROVIDER_ENV_PREFIXES,
-    reviewed_first_run_policy)
+    CAP_ENV_PREFIXES, ENGINE_ENV_PREFIXES, POLICY_SCHEMA_VERSION,
+    PROVIDER_ENV_PREFIXES, reviewed_first_run_policy)
 
 POLICY = reviewed_first_run_policy()
 
@@ -149,6 +150,79 @@ def authorized_execution_increment() -> int:
     same rule.
     """
     return int(POLICY["first_paid_run_execution_cap"])
+
+
+def expected_run_identity(release_sha: str | None = None) -> dict[str, str]:
+    """The identity dimensions every run of this release MUST carry.
+
+    This closes the last open link in the release chain. Stage D already proves
+
+        accepted runtime source  ==(bytes)==  policy at R
+        R                        ==(digests)==  the images production serves
+        those digests            ==(verify_caps)==  the images the run executes
+
+    but nothing proved that the RUN THAT ACTUALLY EXECUTED was admitted under
+    that policy and that release. A run recorded no such thing: its engine was
+    re-derived from a project row at claim time and its policy and release were
+    recorded nowhere at all.
+
+    `backend/run_identity.py` now binds them at run creation, and this is the
+    expectation the evidence gate compares the authorized run's PERSISTED
+    identity against. Every dimension here is a property of the runtime SOURCE
+    (or of the reviewed release pin), never of the operator's environment, so
+    agreeing with it means the run really was admitted by the code this
+    authorization accepted.
+
+    `run_id` is deliberately absent: it is the one dimension that is a property
+    of the run rather than of the release.
+    """
+    from backend.event_registry import REGISTRY_VERSION
+    from backend.run_identity import (ENGINE_VERSIONS, IDENTITY_VERSION,
+                                      engine_version_for)
+
+    workflow_key = os.environ.get("STAGE_D_WORKFLOW_KEY", "vehicle_catalog_v1")
+    if workflow_key not in ENGINE_VERSIONS:
+        raise SystemExit(
+            f"STAGE D REFUSED: STAGE_D_WORKFLOW_KEY={workflow_key!r} has no declared "
+            "engine version, so no run identity can be expected for it")
+    sha = (release_sha if release_sha is not None
+           else os.environ.get("STAGE_D_RELEASE_SHA", "")).strip().lower()
+    return {
+        "identity_version": IDENTITY_VERSION,
+        "workflow_key": workflow_key,
+        "engine_version": engine_version_for(workflow_key),
+        "policy_version": POLICY_SCHEMA_VERSION,
+        "policy_fingerprint": POLICY.fingerprint(),
+        "release_sha": sha,
+        "event_registry_version": REGISTRY_VERSION,
+    }
+
+
+def run_identity_problems(observed: object, *, release_sha: str | None = None) -> list[str]:
+    """Why a run's PERSISTED identity is not this release's. Empty means it is.
+
+    Fail closed in every direction. An absent identity is a refusal, not a
+    legacy allowance: a run created by an authorized Stage D execution is
+    created by THIS release, and a release that did not bind an identity is not
+    the release this gate accepted. An identity that reads as a different
+    policy, engine or release is the whole point of the check.
+    """
+    expected = expected_run_identity(release_sha)
+    if observed is None:
+        return ["the authorized run carries NO immutable identity, so it cannot be "
+                "bound to the accepted release"]
+    if not isinstance(observed, dict):
+        return ["the authorized run's identity is not an object"]
+    problems = []
+    if not expected["release_sha"]:
+        problems.append("STAGE_D_RELEASE_SHA is not set, so the run cannot be bound "
+                        "to an accepted release")
+    for key, want in expected.items():
+        got = str(observed.get(key) or "")
+        if got != want:
+            problems.append(
+                f"the run's {key} is {got or '<absent>'!r} but this release's is {want!r}")
+    return problems
 
 
 def fingerprint_problems() -> list[str]:
@@ -299,6 +373,12 @@ def main(argv: list[str]) -> int:
         return 0
     if what == "document":
         print(json.dumps(POLICY.document(), sort_keys=True, indent=2))
+        return 0
+    if what == "run-identity":
+        # The release half is proven separately by `binding`; this prints the
+        # expectation the evidence gate compares the run's own record against.
+        print(json.dumps(expected_run_identity(), sort_keys=True,
+                         separators=(",", ":")))
         return 0
     print(f"unknown selector: {what}", file=sys.stderr)
     return 64

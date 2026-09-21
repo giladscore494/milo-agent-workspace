@@ -191,6 +191,7 @@ from backend.catalog.government.source import (GOVERNMENT_SOURCE_REASONS,
                                                GovernmentSourceError)
 from backend.engines.swarm_v2.evidence import WorkerLease
 from backend.errors import AppError
+from backend.event_registry import CAPTURE_SNAPSHOT_REPLAYED
 from backend.production_config import TRUE_VALUES
 from backend.runtime import TERMINAL_STATES, CancellationRequested
 
@@ -1182,10 +1183,12 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     def record_event(event_type: str, _payload: Mapping[str, Any]) -> None:
         """The ingestor's own progress signals, kept in memory and bounded.
 
-        Nothing is written to `run_events` here: these names are not in
-        `backend.runtime.EVENT_TYPES`, and inventing durable events for an
-        operator capture is not this stage's work. Only the type is kept, and
-        only to tell a replay from a first capture in the report.
+        Nothing is written to `run_events` here: these names are the capture
+        vocabulary (`event_registry.CAPTURE_PROGRESS_EVENT_TYPES`), which is
+        declared OUTSIDE the durable acceptance set on purpose, and inventing
+        durable events for an operator capture is not this stage's work. Only
+        the type is kept, and only to tell a replay from a first capture in
+        the report.
         """
         if len(observed) < 64:
             observed.append(str(event_type))
@@ -1213,7 +1216,7 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         return EXIT_FAILED, _envelope("failed", reason)
     supervisor.stop()
 
-    document = capture_document(outcome, replayed="catalog_snapshot_replayed" in observed)
+    document = capture_document(outcome, replayed=CAPTURE_SNAPSHOT_REPLAYED in observed)
     _finalize(repository, lease, document=document, reason_code="", cancelled=False)
     return EXIT_OK, _envelope("succeeded", "", capture=document)
 

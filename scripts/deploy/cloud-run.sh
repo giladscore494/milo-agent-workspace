@@ -53,8 +53,16 @@ MILO_EXPECTED_SUPABASE_PROJECT_REF=${MILO_EXPECTED_SUPABASE_PROJECT_REF:-}
 # Environment variables this release owns. Anything else already configured on
 # the service or job is preserved: the deploy uses --update-env-vars /
 # --update-secrets, never the destructive --set-* variants.
+# MILO_RELEASE_SHA is the SAME full commit SHA the images below are tagged
+# with, on BOTH surfaces. `backend/run_identity.py` binds it onto every run
+# this deployment creates, which is what lets a release gate prove the run
+# that executed is a run of the accepted release rather than inferring it
+# from the image a job happened to resolve at execution time. An unset value
+# makes every run record no release, and an unpinned run is refused by the
+# Stage D evidence gate -- so it is set here, next to the tag it must equal.
 API_ENV_VARS=(
   "ENVIRONMENT=production"
+  "MILO_RELEASE_SHA=$RELEASE_SHA"
   "JOB_LAUNCHER=$JOB_LAUNCHER_MODE"
   "GCP_PROJECT_ID=$PROJECT_ID"
   "GCP_REGION=$REGION"
@@ -67,6 +75,7 @@ API_ENV_VARS=(
 )
 WORKER_ENV_VARS=(
   "ENVIRONMENT=production"
+  "MILO_RELEASE_SHA=$RELEASE_SHA"
   "GCP_PROJECT_ID=$PROJECT_ID"
   "GCP_REGION=$REGION"
   "$MILO_SUPABASE_PROJECT_REF_ENV_NAME=$MILO_EXPECTED_SUPABASE_PROJECT_REF"

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, ClassVar
 from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
@@ -95,6 +95,30 @@ class RunUsage(BaseModel):
     elapsed_seconds: float | None = Field(default=None, ge=0)
 
 
+class RunIdentityRecord(BaseModel):
+    """The run's immutable identity, as the browser is allowed to see it.
+
+    A CLOSED shape, like every other browser-visible contract here: the model
+    names exactly the dimensions `backend/run_identity.py` binds, so a column
+    that somehow grew an extra key cannot reach the browser through it. None of
+    it is secret -- an engine version, a policy digest and a release SHA are
+    public facts about which code admitted the run -- and all of it is what
+    lets the browser render a HISTORICAL run as the engine it actually was
+    rather than as whatever its project is today.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    identity_version: str
+    run_id: UUID
+    workflow_key: str
+    engine_version: str
+    policy_version: str
+    policy_fingerprint: str
+    release_sha: str = ""
+    event_registry_version: str
+
+
 class Run(BaseModel):
     id: UUID
     conversation_id: UUID
@@ -114,6 +138,9 @@ class Run(BaseModel):
     # Authoritative aggregate usage for this run. `null` means nothing has been
     # recorded yet; it is never a synonym for zero spend.
     usage: RunUsage | None = None
+    # `null` for a run created before identities existed. It is never
+    # defaulted: an unpinned run is unpinned, and every consumer says so.
+    run_identity: RunIdentityRecord | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -206,7 +233,47 @@ class ProposalRunCreate(BaseModel):
     idempotency_key: str = Field(min_length=8, max_length=128)
 
 
-class ToolAccessRequestCreate(BaseModel):
+class WorkerLeaseFence(BaseModel):
+    """The `run + attempt + worker + lease` ownership contract, on the wire.
+
+    Every worker-side durable mutation inside the process already carries this
+    (``backend/worker/main.py`` builds it once as ``lease_ctx`` and hands it to
+    every repository write). The HTTP surfaces did not: a request authenticated
+    as a worker SERVICE IDENTITY was accepted without any statement about which
+    run, attempt and lease it was acting under -- so a replaced worker whose
+    credentials were still valid could append events, open tool access, and
+    complete or fail a run it no longer owned.
+
+    Identity answers "is this a worker?". This answers "is this THE worker of
+    THIS attempt of THIS run?", and only the database can settle it: these
+    three values are checked against the live lease, under the database clock,
+    inside the guarded RPC. They are required, never defaulted.
+    """
+
+    worker_id: str = Field(min_length=1)
+    attempt: int = Field(ge=1)
+    lease_token: str = Field(min_length=1)
+
+    #: The fence's own keys, so no caller has to remember them.
+    FENCE_FIELDS: ClassVar[tuple[str, ...]] = ("worker_id", "attempt", "lease_token")
+
+    def lease(self) -> dict[str, Any]:
+        """The ownership contract, as the repository's keyword arguments."""
+        return {name: getattr(self, name) for name in self.FENCE_FIELDS}
+
+    def content(self) -> dict[str, Any]:
+        """The request WITHOUT the fence.
+
+        The fence authorizes the write; it is never part of what is written.
+        `lease_token` in particular is a credential: the guarded evidence RPCs
+        refuse outright any payload carrying a `lease_token` or `token` key, so
+        folding the fence into the row would not merely be untidy, it would be
+        rejected by the database.
+        """
+        return self.model_dump(exclude=set(self.FENCE_FIELDS))
+
+
+class ToolAccessRequestCreate(WorkerLeaseFence):
     agent: str
     tool: str
     reason: str
@@ -214,7 +281,7 @@ class ToolAccessRequestCreate(BaseModel):
     requested_limits: dict[str, Any] = Field(default_factory=dict)
     trigger: dict[str, Any] | None = None
 
-class ToolGrantCreate(BaseModel):
+class ToolGrantCreate(WorkerLeaseFence):
     request_id: UUID | None = None
     agent: str
     tool: str
@@ -224,7 +291,7 @@ class ToolGrantCreate(BaseModel):
     expires_at: datetime
     approver_policy: str
 
-class ToolUsageCreate(BaseModel):
+class ToolUsageCreate(WorkerLeaseFence):
     grant_id: UUID
     agent: str
     tool: str
@@ -234,7 +301,7 @@ class ToolUsageCreate(BaseModel):
     status: str = "succeeded"
     error: dict[str, Any] | None = None
 
-class SourceCreate(BaseModel):
+class SourceCreate(WorkerLeaseFence):
     agent: str
     url: str
     title: str
@@ -245,7 +312,7 @@ class SourceCreate(BaseModel):
     query: str
     tool_operation: str
 
-class ClaimCreate(BaseModel):
+class ClaimCreate(WorkerLeaseFence):
     entity_key: str
     field_key: str
     value: Any
@@ -259,7 +326,7 @@ class ClaimCreate(BaseModel):
     agent: str
     status: str = "active"
 
-class ConflictCreate(BaseModel):
+class ConflictCreate(WorkerLeaseFence):
     entity_key: str
     field_key: str
     claim_ids: list[UUID]
@@ -267,7 +334,7 @@ class ConflictCreate(BaseModel):
     rationale: str | None = None
 
 
-class WorkerRunEventCreate(BaseModel):
+class WorkerRunEventCreate(WorkerLeaseFence):
     event_type: str = Field(min_length=1)
     message: str = Field(min_length=1)
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -276,11 +343,11 @@ class WorkerRunEventCreate(BaseModel):
     progress: dict[str, Any] | None = None
 
 
-class WorkerRunCompleteRequest(BaseModel):
+class WorkerRunCompleteRequest(WorkerLeaseFence):
     output: dict[str, Any] = Field(default_factory=dict)
 
 
-class WorkerRunFailRequest(BaseModel):
+class WorkerRunFailRequest(WorkerLeaseFence):
     code: str = Field(min_length=1)
     message: str = Field(min_length=1)
 
