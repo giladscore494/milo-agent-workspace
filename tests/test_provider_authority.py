@@ -476,6 +476,43 @@ def test_one_remaining_invocation_cannot_admit_a_request_that_could_spend_two():
     assert tracker.search_invocations == 4, "a search was billed after the refusal"
 
 
+@pytest.mark.parametrize("per_response", [1, 2, 3, 4])
+def test_actual_searches_never_exceed_the_run_allowance(per_response):
+    """Driven to exhaustion, the ceiling is never crossed -- not once.
+
+    The sweep matters because the one-off case can pass by luck. Every
+    request in the sequence holds the worst case before dispatch, so however
+    many searches each response really performs, the total lands on or under
+    the ceiling and the request that could have crossed it is refused
+    BEFORE it is sent.
+    """
+    ceiling, worst_case = 12, 4
+    tracker = make_tracker(max_model_calls_per_run=200,
+                           max_search_invocations_per_run=ceiling,
+                           max_builtin_searches_per_request=worst_case)
+    adapter, client, inner, _, coordinator = make_adapter(
+        [response_with(searches=per_response)] * 40, tracker=tracker)
+
+    refusals = 0
+    for _ in range(20):
+        try:
+            adapter.chat(SEARCH_REQUEST, client=client)
+        except BudgetExceeded as exc:
+            assert exc.code == "SEARCH_LIMIT_REACHED"
+            refusals += 1
+            break
+        assert tracker.search_invocations <= ceiling, (
+            f"the run crossed its search ceiling: "
+            f"{tracker.search_invocations} > {ceiling}")
+        assert tracker.reserved_search_invocations == 0
+
+    assert refusals == 1, "the sequence never reached the ceiling at all"
+    assert tracker.search_invocations <= ceiling
+    # The refusal happened before dispatch: the provider was called once per
+    # ADMITTED request and not once more.
+    assert inner.calls == tracker.search_invocations // per_response
+
+
 def test_a_refused_search_reservation_never_quarantines_a_provider_permit():
     """The refusal happens before anything is sent, and must say so.
 
@@ -591,6 +628,63 @@ def test_each_retry_reserves_and_settles_its_own_searches():
     assert tracker.reserved_search_invocations == 0
 
 
+def test_a_retry_never_refunds_a_search_that_already_happened():
+    """Settled spend only ever grows across the attempts of one call.
+
+    A retry re-enters the reservation, and a reservation that released by
+    DECREMENTING a shared counter -- rather than by popping its own record --
+    would hand back capacity a previous attempt had really spent. The
+    tracker's view is sampled at the start of every attempt, so a refund
+    anywhere in the loop is visible rather than netted out at the end.
+    """
+    tracker = make_tracker(max_model_calls_per_run=50,
+                           max_search_invocations_per_run=30,
+                           max_builtin_searches_per_request=4)
+    adapter, client, inner, _, coordinator = make_adapter(
+        [status_error("Error code: 429", 429),
+         status_error("Error code: 503 - engine_overloaded_error", 503),
+         response_with(searches=2)], tracker=tracker)
+
+    seen: list[int] = []
+    original = inner.completions.create
+
+    def sampling_create(**kwargs):
+        seen.append(tracker.search_invocations)
+        return original(**kwargs)
+
+    inner.completions.create = sampling_create
+    adapter.chat(SEARCH_REQUEST, client=client)
+
+    # Attempt 1 starts at 0; attempt 2 sees attempt 1's unknown outcome
+    # charged in full; attempt 3 sees both.
+    assert seen == [0, 4, 8], f"an attempt saw refunded search spend: {seen}"
+    assert seen == sorted(seen), "settled search spend went DOWN across a retry"
+    assert tracker.search_invocations == 8 + 2
+    assert tracker.reserved_search_invocations == 0
+
+
+def test_a_resume_cannot_perform_more_searches_than_the_run_had_left():
+    """Restoring is not a refund: the remaining allowance shrinks with it."""
+    ceiling, spent = 6, 4
+    before = make_tracker(max_search_invocations_per_run=ceiling,
+                          max_builtin_searches_per_request=2)
+    for _ in range(spent // 2):
+        before.settle_search(before.reserve_search(2), actual=2)
+    assert before.search_invocations == spent
+
+    after = make_tracker(max_search_invocations_per_run=ceiling,
+                         max_builtin_searches_per_request=2)
+    after.restore_snapshot({k: v for k, v in before.ledger_snapshot().items()})
+    assert after.search_invocations == spent
+
+    # Exactly the remainder is available, and not one more.
+    after.settle_search(after.reserve_search(2), actual=2)
+    assert after.search_invocations == ceiling
+    with pytest.raises(BudgetExceeded) as refused:
+        after.reserve_search(1)
+    assert refused.value.code == "SEARCH_LIMIT_REACHED"
+
+
 def test_an_attempt_that_never_reached_the_provider_is_charged_nothing():
     """Structural, not an assumption: nothing was sent, so nothing ran.
 
@@ -645,6 +739,45 @@ def test_a_standalone_search_consumes_qps_and_run_accounting():
     assert tracker.search_cost == pytest.approx(0.02)
     # The endpoint's own QPS bucket was consumed by that admission.
     assert not coordinator.try_admit_search("search")[0]
+
+
+def test_a_standalone_search_is_bounded_by_the_run_allowance_too():
+    """The QPS bucket paces the endpoint; it says nothing about run volume.
+
+    Both bounds hold, and the RUN bound is taken first: a run with no search
+    allowance left must not burn the organization's QPS bucket to discover
+    that it has none.
+    """
+    tracker = make_tracker(max_search_invocations_per_run=1)
+    adapter, _, _, _, coordinator = make_adapter([], tracker=tracker, quota=QuotaConfig())
+    adapter.search("search")
+    assert tracker.search_invocations == 1
+
+    with pytest.raises(BudgetExceeded) as refused:
+        adapter.search("search")
+    assert refused.value.code == "SEARCH_LIMIT_REACHED"
+    assert tracker.search_invocations == 1, "a refused search was still counted"
+    assert tracker.reserved_search_invocations == 0, "the refusal stranded a hold"
+
+
+def test_a_qps_refusal_releases_the_run_hold_instead_of_charging_for_it():
+    """The other order: the run could pay, the provider bucket said no.
+
+    Nothing was searched, so the hold comes back rather than being charged --
+    and the run's allowance is exactly where it started.
+    """
+    class Refuses:
+        def admit_search(self, endpoint, *, agent="", phase="", max_wait_seconds=None):
+            raise ProviderBackpressureExceeded("search QPS did not clear")
+
+    tracker = make_tracker(max_search_invocations_per_run=3)
+    adapter = ProviderAdapter(Refuses(), tracker=tracker)
+    with pytest.raises(ProviderBackpressureExceeded):
+        adapter.search("search")
+    assert tracker.search_invocations == 0
+    assert tracker.reserved_search_invocations == 0
+    # And the allowance really is intact: three are still available.
+    assert tracker.reserve_search(3)
 
 
 def test_every_ledger_decision_the_tracker_emits_is_one_the_database_accepts():
