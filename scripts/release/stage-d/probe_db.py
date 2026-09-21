@@ -323,7 +323,6 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "append_usage_ledger_guarded": {
         "p_attempt", "p_entry", "p_lease_token", "p_run_id", "p_worker_id"
     },
-    "bind_run_identity": {"p_identity", "p_run_id"},
     "catalog_candidate_manufacturers": {"p_snapshot_id"},
     "catalog_candidate_model_years": {"p_commercial_model", "p_manufacturer", "p_snapshot_id"},
     "catalog_candidate_models": {"p_manufacturer", "p_snapshot_id"},
@@ -342,9 +341,9 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "create_conflict_guarded": {
         "p_attempt", "p_conflict", "p_lease_token", "p_run_id", "p_worker_id"
     },
-    "create_message_and_run_v2": {
+    "create_message_and_run_v3": {
         "p_content", "p_conversation_id", "p_idempotency_key", "p_metadata",
-        "p_request_fingerprint", "p_requested_by"
+        "p_request_fingerprint", "p_requested_by", "p_run_id", "p_run_identity"
     },
     "create_project_from_proposal_with_owner_v2": {
         "p_configuration", "p_description", "p_name", "p_owner", "p_proposal_id",
@@ -448,6 +447,11 @@ EXACT_RPC_SIGNATURES: dict[str, set[str]] = {
     # Every parameter, defaulted ones included: the point of an exact check is
     # that an EXTRA deployed parameter is a different function. Generated from
     # the same inventory as REQUIRED_RPC_ARGS above.
+    "create_message_and_run_v3": {
+        "p_content", "p_conversation_id", "p_idempotency_key", "p_max_project_active",
+        "p_max_user_active", "p_metadata", "p_request_fingerprint", "p_requested_by",
+        "p_run_id", "p_run_identity"
+    },
     "settle_model_call_budget": {
         "p_actual_cost", "p_rejection_reason", "p_reservation_id", "p_status"
     },
