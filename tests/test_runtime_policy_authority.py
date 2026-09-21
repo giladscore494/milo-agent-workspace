@@ -256,7 +256,8 @@ def test_budget_config_takes_its_mandatory_set_from_the_policy():
     assert BudgetConfig.ENV_KEYS == {d.name: d.env_key for d in dimensions_for(BUDGET)
                                      if d.env_key is not None}
     assert {d.name for d in dimensions_for(BUDGET) if d.env_key is None} == {
-        "max_search_invocations_per_run", "search_cost_per_invocation"}
+        "max_search_invocations_per_run", "max_builtin_searches_per_request",
+        "search_cost_per_invocation"}
 
 
 # =============================================================================

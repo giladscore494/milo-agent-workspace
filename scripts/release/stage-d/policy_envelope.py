@@ -110,7 +110,7 @@ POLICY = reviewed_first_run_policy()
 #: `tests/test_runtime_policy_authority.py` fails if this drifts from the
 #: policy in the checkout, so editing a reviewed value without re-pinning is
 #: caught in CI rather than by a production run.
-PINNED_POLICY_FINGERPRINT = "20a48995de154beaa55f39dbcd67b8eed82ada0e2905973318ca9d2b53bb4b35"
+PINNED_POLICY_FINGERPRINT = "d2e293ab62c40fa775de4d19f2d2219f9054ecddf245edcf4d1afae1e9fcc8a6"
 
 #: The ONE source whose content determines the policy document. It imports
 #: nothing from `backend` at module scope and every reviewed value, env key,

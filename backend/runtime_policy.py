@@ -395,6 +395,16 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
            "dimension bounded at all. No env key: the reviewed value is the "
            "bound, and moving it is a reviewed change rather than a "
            "deployment setting"),
+    _d("max_builtin_searches_per_request", 4, runtime_default=4, enforced_by=BUDGET,
+       why="MILO's own ENFORCED per-request ceiling on the builtin "
+           "`$web_search`, not a provider fact. The provider decides how many "
+           "searches one response asks for, so admission has to reserve a "
+           "maximum before dispatch or it is not a ceiling at all -- it is "
+           "post-facto detection of money already spent. 4 is well above the "
+           "one or two searches a reviewed V1/V2 role produces per turn, and "
+           "a response that exceeds it stops the run rather than being paid "
+           "for silently. No env key: a reviewed value, not a deployment "
+           "setting"),
     _d("search_cost_per_invocation", 0.0, kind=float, fmt=FMT_MONEY,
        direction=HIGHER_IS_TIGHTER, runtime_default=0.0, enforced_by=BUDGET,
        why="the PRICE INTERFACE for a search, charged to the run's recorded "

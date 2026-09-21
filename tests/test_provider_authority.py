@@ -21,6 +21,7 @@ from backend.provider_authority import (AUTHORITATIVE_BASIS, BUILTIN_WEB_SEARCH,
                                         CONSERVATIVE_BASIS, ProviderAdapter,
                                         ProviderOutcome, TokenCeilingExceeded,
                                         UnknownTokenDemand, admission_demand,
+                                        builtin_searches_in_response,
                                         classify_outcome,
                                         conservative_input_tokens,
                                         register_token_counter)
@@ -434,15 +435,206 @@ def test_offering_search_without_using_it_accounts_no_search():
 def test_search_invocations_are_bounded_before_the_search_happens():
     """Learning afterwards that a run went over is not a ceiling."""
     tracker = make_tracker(max_model_calls_per_run=50,
-                           max_search_invocations_per_run=2)
+                           max_search_invocations_per_run=4,
+                           max_builtin_searches_per_request=4)
     adapter, client, inner, _, coordinator = make_adapter(
-        [response_with(searches=2), response_with(searches=1)], tracker=tracker)
+        [response_with(searches=4), response_with(searches=1)], tracker=tracker)
     adapter.chat(SEARCH_REQUEST, client=client)
-    assert tracker.search_invocations == 2
+    assert tracker.search_invocations == 4
     with pytest.raises(BudgetExceeded) as refused:
         adapter.chat(SEARCH_REQUEST, client=client)
     assert refused.value.code == "SEARCH_LIMIT_REACHED"
     assert inner.calls == 1, "a search request was sent with no allowance left"
+
+
+def test_one_remaining_invocation_cannot_admit_a_request_that_could_spend_two():
+    """THE hole a check-instead-of-a-reservation leaves open.
+
+    Admission used to reserve ONE invocation while the response parser
+    explicitly supports several `$web_search` tool calls in one response. With
+    one invocation left, the request was admitted, the provider ran and billed
+    two searches, and MILO found out during post-response recording. The money
+    was already spent: that is detection, not a ceiling.
+
+    The request must not be dispatched at all.
+    """
+    tracker = make_tracker(max_model_calls_per_run=50,
+                           max_search_invocations_per_run=5,
+                           max_builtin_searches_per_request=4)
+    # Spend four, leaving exactly one -- less than one request's worst case.
+    adapter, client, inner, _, coordinator = make_adapter(
+        [response_with(searches=4), response_with(searches=2)], tracker=tracker)
+    adapter.chat(SEARCH_REQUEST, client=client)
+    assert tracker.search_invocations == 4
+    assert tracker.config.max_search_invocations_per_run - tracker.search_invocations == 1
+
+    with pytest.raises(BudgetExceeded) as refused:
+        adapter.chat(SEARCH_REQUEST, client=client)
+    assert refused.value.code == "SEARCH_LIMIT_REACHED"
+    assert inner.calls == 1, (
+        "a request that could perform 2 searches was dispatched with 1 left")
+    assert tracker.search_invocations == 4, "a search was billed after the refusal"
+
+
+def test_a_refused_search_reservation_never_quarantines_a_provider_permit():
+    """The refusal happens before anything is sent, and must say so.
+
+    Otherwise an ordinary budget refusal would settle the organization
+    concurrency permit as an UNKNOWN outcome and hold a shared slot for a
+    request that was never made.
+    """
+    tracker = make_tracker(max_model_calls_per_run=50,
+                           max_search_invocations_per_run=1,
+                           max_builtin_searches_per_request=4)
+    adapter, client, inner, _, coordinator = make_adapter(
+        [response_with(searches=1)], tracker=tracker,
+        quota=QuotaConfig(max_concurrency=1, max_rpm=10, max_tpm=1_000_000))
+    with pytest.raises(BudgetExceeded):
+        adapter.chat(SEARCH_REQUEST, client=client)
+    assert inner.calls == 0
+    lease = coordinator.try_acquire_inference()
+    assert lease is not None, "a pre-request refusal stranded an organization permit"
+    lease.release()
+
+
+def test_a_reservation_is_reconciled_to_what_was_really_spent():
+    """Reserve the worst case, charge the actual, release the rest -- once."""
+    tracker = make_tracker(max_model_calls_per_run=50,
+                           max_search_invocations_per_run=10,
+                           max_builtin_searches_per_request=4,
+                           search_cost_per_invocation=0.01)
+    adapter, client, inner, _, coordinator = make_adapter(
+        [response_with(searches=1), response_with(searches=1)], tracker=tracker)
+    adapter.chat(SEARCH_REQUEST, client=client)
+    assert tracker.search_invocations == 1
+    assert tracker.reserved_search_invocations == 0, "the unused hold was not released"
+    assert tracker.search_cost == pytest.approx(0.01), "the reservation was charged, not the usage"
+
+    adapter.chat(SEARCH_REQUEST, client=client)
+    assert tracker.search_invocations == 2
+    assert tracker.reserved_search_invocations == 0
+    assert tracker.search_cost == pytest.approx(0.02)
+
+
+def test_settling_a_reservation_twice_is_a_no_op_not_a_refund():
+    tracker = make_tracker(max_search_invocations_per_run=10)
+    seq = tracker.reserve_search(4)
+    tracker.settle_search(seq, actual=2)
+    assert (tracker.search_invocations, tracker.reserved_search_invocations) == (2, 0)
+    tracker.settle_search(seq, actual=2)
+    assert (tracker.search_invocations, tracker.reserved_search_invocations) == (2, 0)
+
+
+def test_two_concurrent_reservations_cannot_both_take_the_last_slot():
+    """A read-then-check never held across workers; a reservation does."""
+    tracker = make_tracker(max_search_invocations_per_run=4,
+                           max_builtin_searches_per_request=4)
+    assert tracker.reserve_search(4)
+    with pytest.raises(BudgetExceeded) as refused:
+        tracker.reserve_search(4)
+    assert refused.value.code == "SEARCH_LIMIT_REACHED"
+
+
+@pytest.mark.parametrize("response", [
+    SimpleNamespace(choices=None),
+    SimpleNamespace(choices=[SimpleNamespace(message=None)]),
+    SimpleNamespace(choices=object()),
+])
+def test_an_uncountable_response_charges_the_whole_reservation(response):
+    """Unknown multiplicity is not zero spend."""
+    assert builtin_searches_in_response(response) is None
+    tracker = make_tracker(max_model_calls_per_run=50,
+                           max_search_invocations_per_run=10,
+                           max_builtin_searches_per_request=4)
+    adapter, client, _, _, coordinator = make_adapter([response], tracker=tracker,
+                                                      guarded=False)
+    adapter.chat(SEARCH_REQUEST, client=client)
+    assert tracker.search_invocations == 4, (
+        "a response MILO could not count was charged as no spend at all")
+    assert tracker.reserved_search_invocations == 0
+
+
+def test_a_response_that_exceeds_the_per_request_maximum_stops_the_run():
+    """A bound that can be exceeded without consequence is a comment."""
+    tracker = make_tracker(max_model_calls_per_run=50,
+                           max_search_invocations_per_run=50,
+                           max_builtin_searches_per_request=2)
+    adapter, client, _, _, coordinator = make_adapter(
+        [response_with(searches=5)], tracker=tracker, guarded=False)
+    with pytest.raises(BudgetExceeded) as stopped:
+        adapter.chat(SEARCH_REQUEST, client=client)
+    assert stopped.value.code == "SEARCH_MULTIPLICITY_EXCEEDED"
+    # The excess really happened and was really billed, so it is recorded.
+    assert tracker.search_invocations == 5
+    assert tracker.reserved_search_invocations == 0
+
+
+# -- retries and resume ------------------------------------------------------
+
+def test_each_retry_reserves_and_settles_its_own_searches():
+    """A retry is a real provider request that can search on its own.
+
+    Reserving once outside the retry loop would bound the first attempt and
+    nothing after it.
+    """
+    tracker = make_tracker(max_model_calls_per_run=50,
+                           max_search_invocations_per_run=20,
+                           max_builtin_searches_per_request=4)
+    adapter, client, inner, _, coordinator = make_adapter(
+        [status_error("Error code: 429", 429), response_with(searches=1)],
+        tracker=tracker)
+    adapter.chat(SEARCH_REQUEST, client=client)
+    assert inner.calls == 2
+    # The failed attempt could not be counted, so it fails closed onto its
+    # whole reservation; the successful one is charged what it really spent.
+    assert tracker.search_invocations == 4 + 1
+    assert tracker.reserved_search_invocations == 0
+
+
+def test_an_attempt_that_never_reached_the_provider_is_charged_nothing():
+    """Structural, not an assumption: nothing was sent, so nothing ran.
+
+    Charging here would over-report spend, and a ledger that over-reports is
+    as wrong as one that under-reports.
+    """
+    class ConnectError(Exception):
+        pass
+
+    tracker = make_tracker(max_model_calls_per_run=50,
+                           max_search_invocations_per_run=20,
+                           max_builtin_searches_per_request=4)
+    adapter, client, _, _, coordinator = make_adapter(
+        [ConnectError("connection refused")], tracker=tracker, guarded=False)
+    with pytest.raises(ConnectError):
+        adapter.chat(SEARCH_REQUEST, client=client)
+    assert tracker.search_invocations == 0
+    assert tracker.reserved_search_invocations == 0
+
+
+def test_a_resume_inherits_spent_searches_but_never_a_phantom_reservation():
+    """An in-flight hold belongs to the process that took it."""
+    before = make_tracker(max_search_invocations_per_run=10,
+                          max_builtin_searches_per_request=4)
+    before.reserve_search(4)          # deliberately never settled: the worker dies
+    before.settle_search(before.reserve_search(2), actual=2)
+    durable = before.ledger_snapshot()
+    assert durable["search_invocations"] == 2
+
+    after = make_tracker(max_search_invocations_per_run=10,
+                         max_builtin_searches_per_request=4)
+    after.restore_snapshot({k: v for k, v in durable.items()})
+    assert after.search_invocations == 2, "a resume lost searches the run had spent"
+    assert after.reserved_search_invocations == 0, (
+        "a resume inherited a hold the dead process owned")
+    # And the restored run can still use everything it had left.
+    assert after.reserve_search(4)
+
+
+def test_a_restore_into_a_tracker_holding_a_reservation_is_refused():
+    tracker = make_tracker(max_search_invocations_per_run=10)
+    tracker.reserve_search(1)
+    with pytest.raises(ValueError):
+        tracker.restore_snapshot({"search_invocations": 1})
 
 
 def test_a_standalone_search_consumes_qps_and_run_accounting():
@@ -507,9 +699,21 @@ def test_the_search_bound_and_price_come_from_the_runtime_policy():
     policy = reviewed_first_run_policy()
     config = policy.budget_config()
     assert config.max_search_invocations_per_run == policy["max_search_invocations_per_run"]
+    assert config.max_builtin_searches_per_request == policy["max_builtin_searches_per_request"]
     assert config.search_cost_per_invocation == policy["search_cost_per_invocation"]
     names = {d.name for d in dimensions_for(BUDGET)}
-    assert {"max_search_invocations_per_run", "search_cost_per_invocation"} <= names
+    assert {"max_search_invocations_per_run", "max_builtin_searches_per_request",
+            "search_cost_per_invocation"} <= names
+
+
+def test_the_adapter_reserves_the_number_the_policy_publishes():
+    """The reserved worst case and the published bound are one number."""
+    from backend.runtime_policy import reviewed_first_run_policy
+
+    policy = reviewed_first_run_policy()
+    tracker = BudgetTracker(policy.budget_config(), kill_switch=lambda: True)
+    adapter = ProviderAdapter(ProviderScheduler(ProviderLimitsConfig()), tracker=tracker)
+    assert adapter.max_builtin_searches_per_request == policy["max_builtin_searches_per_request"]
 
 
 # =============================================================================

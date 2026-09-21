@@ -609,18 +609,41 @@ def request_offers_builtin_search(request: Mapping[str, Any]) -> bool:
     return False
 
 
-def builtin_searches_in_response(response: Any) -> int:
-    """How many builtin searches the provider actually ran for this response.
+def builtin_searches_in_response(response: Any) -> int | None:
+    """How many builtin searches the provider actually ran, or None.
 
     Counted from the tool calls the provider returned, which is what it
     charges for -- not from the fact that the tool was offered. A request that
     advertised search and got a plain answer performed no search and is
-    accounted as none.
+    counted as none.
+
+    ``None`` means the count is UNKNOWN: the response is not a shape this can
+    walk, so MILO cannot say how much the provider did. That is deliberately
+    NOT the same answer as zero, and the difference is the whole point --
+    settlement charges the full reservation for an unknown count, because an
+    unmeasurable amount of provider spend is not an absence of spend.
     """
+    choices = getattr(response, "choices", None)
+    if choices is None:
+        return None
+    try:
+        iter(choices)
+    except TypeError:
+        return None
     total = 0
-    for choice in (getattr(response, "choices", None) or ()):
+    for choice in choices:
         message = getattr(choice, "message", None)
-        for call in (getattr(message, "tool_calls", None) or ()):
+        if message is None:
+            # A choice with no message at all is not something this can read.
+            return None
+        calls = getattr(message, "tool_calls", None)
+        if calls is None:
+            continue
+        try:
+            iter(calls)
+        except TypeError:
+            return None
+        for call in calls:
             function = getattr(call, "function", None)
             if getattr(function, "name", None) == BUILTIN_WEB_SEARCH:
                 total += 1
@@ -735,23 +758,67 @@ class ProviderAdapter:
         return demand
 
     # -- search accounting -------------------------------------------------
-    def _admit_search_budget(self, count: int = 1) -> None:
-        tracker = self._tracker
-        if tracker is None or count <= 0:
-            return
-        admit = getattr(tracker, "admit_search", None)
-        if callable(admit):
-            admit(count)
+    @property
+    def max_builtin_searches_per_request(self) -> int:
+        """The MOST searches one request may perform, reserved before dispatch.
 
-    def _record_searches(self, count: int, *, endpoint: str = BUILTIN_WEB_SEARCH) -> None:
+        Read from the run's own budget configuration, which derives it from
+        the canonical runtime policy, so the number admission reserves and the
+        number the policy publishes cannot drift.
+        """
+        config = getattr(self._tracker, "config", None)
+        bound = getattr(config, "max_builtin_searches_per_request", None)
+        try:
+            return max(1, int(bound))
+        except (TypeError, ValueError):
+            return 1
+
+    def _reserve_searches(self, count: int) -> int | None:
+        """Hold worst-case search capacity before a request is dispatched."""
         tracker = self._tracker
         if tracker is None or count <= 0:
+            return None
+        reserve = getattr(tracker, "reserve_search", None)
+        if not callable(reserve):
+            return None
+        try:
+            return reserve(count)
+        except BaseException as exc:
+            # A refusal here happens BEFORE anything is sent, exactly like the
+            # guarded client's `open_call`. Saying so is load-bearing: the
+            # scheduler settles the organization permit on whether the request
+            # can be proven finished, and an unmarked refusal would quarantine
+            # a shared slot the request never used.
+            exc.provider_request_completed = True
+            raise
+
+    def _settle_searches(self, reservation: int | None, actual: int | None) -> None:
+        tracker = self._tracker
+        if tracker is None or reservation is None:
             return
-        record = getattr(tracker, "record_search", None)
-        if not callable(record):
-            return
-        for _ in range(count):
-            record()
+        settle = getattr(tracker, "settle_search", None)
+        if callable(settle):
+            settle(reservation, actual=actual)
+
+    def _searches_performed(self, response: Any) -> int | None:
+        return builtin_searches_in_response(response)
+
+    def _searches_after_failure(self, exc: BaseException) -> int | None:
+        """What an attempt that RAISED spent on search. Unknown by default.
+
+        The one case that is genuinely zero is structural, and it is the same
+        structure the concurrency invariant uses: a failure that happened
+        before the request was ever sent. Nothing ran, so charging for it
+        would over-report spend, and a ledger that over-reports is as wrong as
+        one that under-reports.
+
+        Everything else -- a provider error, a fired deadline, an outcome
+        nobody named -- is UNKNOWN, and unknown fails closed onto the whole
+        reservation.
+        """
+        if failed_before_the_request_was_sent(exc):
+            return 0
+        return None
 
     # -- the guarded call path ---------------------------------------------
     def chat(self, request: Mapping[str, Any], *, client: Any = None,
@@ -772,21 +839,36 @@ class ProviderAdapter:
         demand = self.token_demand(payload.get("messages"), cap,
                                    payload.get("tools"))
         searching = request_offers_builtin_search(payload)
-        if searching:
-            # Bounded BEFORE the paid search happens. A run that has spent its
-            # search allowance does not get to send one more search-enabled
-            # request and find out afterwards.
-            self._admit_search_budget(1)
-        response = self._scheduler.execute(
-            lambda: target.chat.completions.create(**payload),
+
+        def attempt() -> Any:
+            """ONE provider attempt, with its own search reservation.
+
+            PER ATTEMPT, not per logical call, because a retry is a real
+            provider request that can perform its own searches. Reserving once
+            outside the retry loop would bound the first attempt and nothing
+            after it.
+            """
+            if not searching:
+                return target.chat.completions.create(**payload)
+            # The WORST CASE this request could spend, held before it is
+            # dispatched. A run that cannot pay for the maximum does not get
+            # to send the request and find out afterwards.
+            reservation = self._reserve_searches(self.max_builtin_searches_per_request)
+            try:
+                response = target.chat.completions.create(**payload)
+            except BaseException as exc:
+                self._settle_searches(reservation, self._searches_after_failure(exc))
+                raise
+            self._settle_searches(reservation, self._searches_performed(response))
+            return response
+
+        return self._scheduler.execute(
+            attempt,
             estimated_tokens=demand.tokens,
             reserved_tokens=demand.tokens,
             agent=agent,
             phase=phase,
         )
-        if searching:
-            self._record_searches(builtin_searches_in_response(response))
-        return response
 
     def search(self, endpoint: str, *, agent: str = "", phase: str = "",
                max_wait_seconds: float | None = None) -> float:
@@ -796,10 +878,18 @@ class ProviderAdapter:
         the run's. Both are consulted, in that order, so a search is never
         performed by a run that has no search allowance left.
         """
-        self._admit_search_budget(1)
-        waited = self._scheduler.admit_search(endpoint, agent=agent, phase=phase,
-                                              max_wait_seconds=max_wait_seconds)
-        self._record_searches(1, endpoint=endpoint)
+        tracker = self._tracker
+        reserve = getattr(tracker, "reserve_search", None) if tracker else None
+        reservation = reserve(1) if callable(reserve) else None
+        try:
+            waited = self._scheduler.admit_search(endpoint, agent=agent, phase=phase,
+                                                  max_wait_seconds=max_wait_seconds)
+        except BaseException:
+            # The QPS bucket refused, so no search happened: release the hold
+            # rather than charging for one MILO never got to perform.
+            self._settle_searches(reservation, 0)
+            raise
+        self._settle_searches(reservation, 1)
         return waited
 
 

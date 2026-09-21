@@ -129,6 +129,10 @@ class BudgetConfig:
     # explicitly; search had no bound of any kind, in any posture, so the
     # safe default here is the reviewed number rather than "unlimited".
     max_search_invocations_per_run: int | None = 60
+    #: The MAXIMUM searches one provider request may perform. Admission
+    #: reserves this much before the request is dispatched, so a request is
+    #: only ever sent when the run can pay for the worst case it could spend.
+    max_builtin_searches_per_request: int = 4
     #: The price interface. 0.00 until a verified provider price exists; a
     #: configured value is charged to the run's recorded cost like any spend.
     search_cost_per_invocation: float = 0.0
@@ -292,6 +296,9 @@ class BudgetTracker:
     output_tokens: int = 0
     reserved_input_tokens: int = 0
     reserved_output_tokens: int = 0
+    #: In-flight search capacity held for requests that have not settled yet.
+    #: Counted against the ceiling alongside what has already been spent.
+    reserved_search_invocations: int = 0
     estimated_cost: float = 0.0
     actual_cost: float = 0.0
     retries: int = 0
@@ -326,6 +333,12 @@ class BudgetTracker:
     #: flight. Popped by settle_call, so a reservation is released exactly once
     #: and by the amount that was actually taken.
     _open_reservations: dict[int, tuple[int, int]] = field(default_factory=dict, init=False)
+    #: search reservations still in flight, keyed by their own sequence.
+    #: IN-FLIGHT, never durable: like the token reservations, a reservation
+    #: belongs to the process that took it, so a resumed worker starts with
+    #: none rather than inheriting a phantom hold from a dead one.
+    _open_search_reservations: dict[int, int] = field(default_factory=dict, init=False)
+    _search_seq: int = field(default=0, init=False)
 
     def __post_init__(self):
         import threading
@@ -414,8 +427,10 @@ class BudgetTracker:
             raise ValueError("budget snapshot contains unknown fields")
         parsed = validate_usage_snapshot(snapshot)
         with self._lock:
-            if any(getattr(self, name) for name in (*LEDGER_COUNTERS, *LEDGER_AMOUNTS)
-                   if name != "elapsed_seconds") or self.reserved_input_tokens or self.reserved_output_tokens:
+            if (any(getattr(self, name) for name in (*LEDGER_COUNTERS, *LEDGER_AMOUNTS)
+                    if name != "elapsed_seconds")
+                    or self.reserved_input_tokens or self.reserved_output_tokens
+                    or self.reserved_search_invocations):
                 raise ValueError("budget usage can only be restored into a fresh tracker")
             for name in LEDGER_COUNTERS:
                 setattr(self, name, int(parsed.get(name, 0)))
@@ -680,50 +695,82 @@ class BudgetTracker:
                 return
             self._record()
 
-    def admit_search(self, count: int = 1) -> None:
-        """Gate ONE (or ``count``) search invocations BEFORE they happen.
+    def reserve_search(self, count: int = 1) -> int:
+        """Hold capacity for the MAXIMUM searches a request could perform.
 
-        Search used to be the one thing a run could do without any bound: the
-        QPS limiter paces the standalone endpoints, but nothing said how many
-        searches a whole run may perform, and V1's builtin `$web_search` does
-        not touch the QPS limiter at all -- the provider runs and bills it
-        inside a chat call.
+        A CHECK is not a ceiling, and that is the whole reason this is a
+        reservation. The first version of this gate admitted a
+        search-enabled request against ONE invocation while the response it
+        would produce can legitimately carry several: with one invocation
+        left, the request was admitted, the provider ran and billed two
+        searches, and MILO discovered it afterwards. Post-facto detection is
+        not a ceiling -- the money is already spent by the time it fires.
 
-        This is the admission half of that bound, and it is checked before the
-        request that would perform the search is sent, because learning
-        afterwards that a run went over is not a ceiling.
+        So a caller reserves the most the request could possibly spend
+        BEFORE dispatch, and settlement reconciles that to what really
+        happened. A reservation also makes the ceiling hold across concurrent
+        workers, which a bare read-then-check never could: two requests could
+        both see the same single remaining invocation and both be admitted.
+
+        Returns the reservation's sequence number, which MUST be passed back
+        to :meth:`settle_search` so each caller releases its own.
         """
         wanted = max(0, int(count or 0))
         if wanted == 0:
-            return
+            return 0
         with self._lock:
             if self.stop is not None:
                 raise self.stop
             cfg = self.config
+            committed = self.search_invocations + self.reserved_search_invocations
             if (cfg.max_search_invocations_per_run is not None
-                    and self.search_invocations + wanted > cfg.max_search_invocations_per_run):
+                    and committed + wanted > cfg.max_search_invocations_per_run):
                 raise self._reject("SEARCH_LIMIT_REACHED", "search invocation limit reached",
                                    "budget_exhausted", "budget_exhausted")
+            self._search_seq += 1
+            self.reserved_search_invocations += wanted
+            self._open_search_reservations[self._search_seq] = wanted
+            return self._search_seq
 
-    def record_search(self, cost: float | None = None) -> None:
-        """One search invocation actually performed, with its price.
+    def settle_search(self, reservation_seq: int, actual: int | None = None,
+                      cost: float | None = None) -> None:
+        """Release a search reservation and record what was really spent.
 
-        ``cost`` defaults to the configured per-invocation price, so the
-        caller does not restate it; a caller that knows the real billed amount
-        passes it. The amount is recorded BOTH as the ledger's own
-        ``search_cost`` and as run cost, because it is money the run spent --
-        which is what makes ``max_cost_per_run`` bind on searches too rather
-        than only on completions.
+        ``actual`` is the number of searches the provider really performed.
+        ``None`` means MILO CANNOT TELL -- an attempt that raised, or a
+        response whose shape does not let the searches be counted -- and that
+        fails closed: the whole reservation is charged. An unknown amount of
+        provider spend is not zero spend, and resolving it to zero is how a
+        ceiling stops being one.
+
+        Releasing pops the record, so a second settlement is a no-op rather
+        than a refund: an over-released ceiling is indistinguishable from no
+        ceiling. Charging ``actual`` and releasing the hold happen together,
+        so nothing is counted twice.
+
+        Charging MORE than was reserved means the request performed more
+        searches than the reviewed per-request maximum. The excess is still
+        recorded -- it really happened and was really billed -- and the run
+        then stops: a per-request bound that can be exceeded without
+        consequence is a comment, not a bound.
         """
         cfg = self.config
-        amount = float(cfg.search_cost_per_invocation if cost is None else cost)
-        if amount < 0:
+        unit = float(cfg.search_cost_per_invocation if cost is None else cost)
+        if unit < 0:
             raise ValueError("search cost cannot be negative")
         with self._lock:
-            self.search_invocations += 1
-            self.search_cost += amount
-            if amount:
-                self.actual_cost += amount
+            held = self._open_search_reservations.pop(int(reservation_seq), None)
+            if held is None:
+                return
+            self.reserved_search_invocations = max(
+                0, self.reserved_search_invocations - held)
+            charged = held if actual is None else max(0, int(actual))
+            if charged:
+                amount = unit * charged
+                self.search_invocations += charged
+                self.search_cost += amount
+                if amount:
+                    self.actual_cost += amount
             # NO per-call `run_usage_ledger` row. That relation's `decision`
             # vocabulary is closed and enforced by a CHECK constraint
             # (reserved/settled/rejected/overage/released), and it has no
@@ -734,6 +781,11 @@ class BudgetTracker:
             # snapshot, whose jsonb already carries `search_invocations` and
             # `search_cost` and merges them component-wise.
             self._record()
+            if charged > held:
+                raise self._stop(
+                    "SEARCH_MULTIPLICITY_EXCEEDED",
+                    "a provider request performed more searches than the reviewed maximum",
+                    "budget_exhausted", "budget_exhausted")
             if (cfg.max_search_invocations_per_run is not None
                     and self.search_invocations > cfg.max_search_invocations_per_run):
                 raise self._reject("SEARCH_LIMIT_EXCEEDED", "search invocation limit exceeded",
@@ -741,6 +793,15 @@ class BudgetTracker:
             if cfg.max_cost_per_run is not None and self.actual_cost > cfg.max_cost_per_run:
                 raise self._stop("COST_LIMIT_EXCEEDED", "actual cost limit exceeded",
                                  "budget_exhausted", "budget_exhausted")
+
+    def record_search(self, cost: float | None = None) -> None:
+        """ONE search that has definitely happened, reserved and settled.
+
+        The standalone-search path, and the historical spelling. It is
+        expressed in terms of the reservation mechanism rather than beside
+        it, so there is exactly one way search capacity is consumed.
+        """
+        self.settle_search(self.reserve_search(1), actual=1, cost=cost)
 
     def record_replan(self, *, correction: bool = False) -> None:
         """One Commander replan was ACCEPTED; a correction round is one too."""

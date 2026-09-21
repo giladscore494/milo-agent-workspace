@@ -215,6 +215,7 @@ def _search_profile() -> dict[str, Any]:
             # never said anything about.
             "accounted_in_run_ledger": True,
             "run_volume_bound": _P["max_search_invocations_per_run"],
+            "per_request_bound": _P["max_builtin_searches_per_request"],
             "run_price_per_invocation": _P["search_cost_per_invocation"],
         }
         for endpoint in (SEARCH_BASIC, SEARCH_PRO)
