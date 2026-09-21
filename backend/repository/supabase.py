@@ -21,12 +21,14 @@ class Repository(Protocol):
     def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
     def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]:
-        """Legacy split run creation is forbidden after Console 6.
+        """Refuse the superseded split run-creation primitive.
 
-        A run must be inserted atomically with its immutable identity through
-        create_message_and_run_v3. Keeping this method as an explicit refusal
-        preserves interface compatibility without leaving a direct table writer
-        that can create identity-less work.
+        Console 6 makes immutable identity an INSERT-time property. Production
+        run creation must therefore go through create_message_and_run_v3, which
+        inserts message + run + identity in one transaction. Keeping a direct
+        runs-table INSERT here would be a second writer whose only possible
+        outcome under the database trigger is failure, and a future caller
+        could mistake it for a supported creation authority.
         """
         raise AppError(
             "RUN_IDENTITY_ATOMIC_CREATION_REQUIRED",
