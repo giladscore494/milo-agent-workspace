@@ -64,7 +64,10 @@ MARKERS: dict[str, tuple[str, str]] = {
     "014": ("function", "reserve_daily_user_budget"),
     "015": ("table", "model_call_budget_reservations"),
     "20260810000300": ("function", "assert_worker_lease"),
-    "20260810000400": ("function", "create_message_and_run_v2"),
+    # 000400 creates four SETOF wrappers. The marker must be one that SURVIVES:
+    # Console 6 drops `create_message_and_run_v2`, so using it here would make
+    # an applied migration look unapplied once the identity migration lands.
+    "20260810000400": ("function", "create_project_from_proposal_with_owner_v2"),
     "20260810000600": ("column", "model_call_budget_reservations.attempt"),
     "20260823000100": ("column", "sources.evidence_key"),
     "20260828000100": ("column", "claims.canonical_scope_hash"),

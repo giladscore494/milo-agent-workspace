@@ -18,6 +18,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Page from '../app/page';
 import { REDACTED, redactSecretText, safeText } from '../lib/sanitize';
 import { API_KEY_PREFIX, API_KEY_SENTINEL, SUPABASE_SECRET_SENTINEL } from './secretSentinels';
+import { identityFor } from './fixtures/runIdentity';
 
 const SESSION = { access_token: 'fresh', user: { id: 'aaaaaaaa-1111-4111-8111-00000000000a', email: 'u@example.com' } };
 
@@ -131,7 +132,11 @@ describe('the inspector and the V1 output path stay redacted', () => {
   });
 
   async function openRunWith(run: Record<string, unknown>) {
-    apiMocks.api.run.mockResolvedValue({ id: RUN_ID, conversation_id: CONVERSATION.id, ...run });
+    apiMocks.api.run.mockResolvedValue({
+      id: RUN_ID, conversation_id: CONVERSATION.id,
+      // The run states its own engine; the V1 output path is chosen from it.
+      run_identity: identityFor(PROJECT.workflow_key, RUN_ID), ...run,
+    });
     window.sessionStorage.setItem(`milo.activeRun.${CONVERSATION.id}`, RUN_ID);
     render(<Page/>);
     fireEvent.click(await screen.findByText('Plain Project'));

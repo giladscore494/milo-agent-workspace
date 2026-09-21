@@ -69,12 +69,29 @@ describe('the generated manifest is the single source', () => {
 });
 
 describe('membership still grants only its own projection', () => {
-  it('never lets a swarm, catalog or operational type write the V1 projection', () => {
+  it('never lets a swarm, catalog or operational type write the V1 AGENT projection', () => {
+    // Membership is about which projection a name may write, not about disjoint
+    // name sets. The canonical worker emits the SAME run lifecycle around either
+    // engine, so those names are deliberately granted to the swarm slice too.
+    // What must never be shared is the ability to create or mutate an agent row
+    // or to report spend against one.
     for (const set of [SWARM_V2_EVENT_TYPES, CATALOG_EVENT_TYPES, OPERATIONAL_EVENT_TYPES]) {
       for (const type of set) {
-        expect(ownsV1Projection(type)).toBe(false);
-        expect(ownsAgentProjection(type)).toBe(false);
-        expect(ownsSpendTelemetry(type)).toBe(false);
+        expect(ownsAgentProjection(type), type).toBe(false);
+        expect(ownsSpendTelemetry(type), type).toBe(false);
+      }
+    }
+    // The catalog and operational slices own nothing of V1 at all.
+    for (const set of [CATALOG_EVENT_TYPES, OPERATIONAL_EVENT_TYPES]) {
+      for (const type of set) {
+        expect(ownsV1Projection(type), type).toBe(false);
+      }
+    }
+    // And the only names the swarm slice shares with V1 are run-level ones.
+    for (const type of SWARM_V2_EVENT_TYPES) {
+      if (ownsV1Projection(type)) {
+        expect(V1_EVENT_TYPES.has(type), type).toBe(true);
+        expect(ownsAgentProjection(type), type).toBe(false);
       }
     }
   });

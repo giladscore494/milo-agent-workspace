@@ -20,10 +20,16 @@
  *    is not rendered as an engine — it returns `undefined` exactly like an
  *    absent identity, so a future engine is inert in the browser until it is
  *    added here on purpose.
- * 2. `undefined` MEANS "THE RUN SAID NOTHING", NEVER "ASSUME V1". The caller
- *    falls back to the project's workflow key, which is the behaviour a run
- *    created before identities existed has always had. Nothing here invents an
- *    engine from an output shape, an event stream or a payload.
+ * 2. `undefined` MEANS "THE RUN SAID NOTHING", NEVER "ASSUME V1" AND NEVER
+ *    "ASK THE PROJECT". Once a run is loaded, its engine comes from its own
+ *    identity or from nowhere: `useRunRealtime` reads the project's workflow
+ *    key only when there is NO run to misattribute, and a loaded run whose
+ *    identity is unreadable renders a bounded identity-unavailable state with
+ *    the engine-specific surfaces switched off. Falling back to the project
+ *    here is the exact drift this module exists to remove -- it is what showed
+ *    a completed V2 run through the V1 surfaces after a project switched.
+ *    Nothing here invents an engine from an output shape, an event stream or a
+ *    payload either.
  * 3. TOTAL. A missing run, a null identity, a non-object, a wrong-run record
  *    and a blank key all return `undefined` rather than throwing: this runs
  *    inside a render path, and a malformed field must not take the workspace

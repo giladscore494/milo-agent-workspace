@@ -1,15 +1,17 @@
 /**
  * Which result surface the workspace mounts, and why.
  *
- * The decision comes from TRUSTED PROJECT STATE — `project.workflow_key` — and
- * never from the run's payload. These tests drive the real page so the routing
- * is proven where it actually lives, not in a re-implementation of it.
+ * The decision comes from the RUN'S OWN IMMUTABLE IDENTITY — never from the
+ * run's payload, and never from what the project's `workflow_key` says today.
+ * These tests drive the real page so the routing is proven where it actually
+ * lives, not in a re-implementation of it.
  */
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Page from '../app/page';
 import fixtures from './fixtures/swarmV2FinalResult.json';
+import { identityFor } from './fixtures/runIdentity';
 
 vi.mock('../lib/supabaseClient', () => ({
   getCurrentSession: vi.fn(() => Promise.resolve({ access_token: 'fresh', user: { email: 'u@example.com' } })),
@@ -52,6 +54,9 @@ async function openTerminalRun(project: typeof SWARM_PROJECT, output: unknown, s
   apiMocks.api.conversations.mockResolvedValue([conversationFor(project)]);
   apiMocks.api.run.mockResolvedValue({
     id: RUN_ID, conversation_id: CONVERSATION_ID, status, output, usage: null,
+    // The run states the engine it WAS created as. The workspace reads the
+    // surface from this, never from the project's workflow key.
+    run_identity: identityFor(project.workflow_key, RUN_ID),
   });
   apiMocks.api.events.mockResolvedValue([]);
   // A stored active run is exactly what a browser refresh restores.
@@ -86,7 +91,7 @@ describe('result-surface routing', () => {
     expect(screen.queryByRole('heading', { name: 'Final result' })).not.toBeInTheDocument();
   });
 
-  it('3. workflow identity comes from project state — a V1 project carrying a V2 payload still uses V1', async () => {
+  it('3. workflow identity comes from the RUN — a V1 run carrying a V2 payload still uses V1', async () => {
     // The payload is a perfectly valid Swarm V2 product outcome. It must NOT
     // be able to promote a V1 project onto the V2 product surface.
     await openTerminalRun(V1_PROJECT, fixtures.usable_result);
