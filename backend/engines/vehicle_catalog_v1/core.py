@@ -11,7 +11,8 @@ from threading import BoundedSemaphore
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.provider_authority import SEARCH_BASIC, ProviderAdapter, classify_outcome
+from backend.provider_authority import (SEARCH_PRO, ProviderAdapter, classify_outcome,
+                                        provider_base_url)
 from backend.standalone_search import (MEDIATED_SEARCH_TOOL_NAME, SearchOutcome,
                                        SearchQueryInvalid, mediated_search_tool)
 from backend.provider_scheduler import (
@@ -548,7 +549,7 @@ def _provider_client(api_key: str) -> Any:
     because those are properties of every MILO provider client rather than of
     one engine's copy of the construction.
     """
-    return _provider_authority().client(api_key, MOONSHOT_BASE_URL,
+    return _provider_authority().client(api_key, provider_base_url(),
                                         factory=MODEL_CLIENT_FACTORY)
 
 
@@ -606,13 +607,17 @@ def _mediated_search(raw_arguments: Any, *, agent_name: str, phase_name: str) ->
     except (TypeError, ValueError):
         parsed = None
     try:
-        return _provider_authority().run_search(parsed, agent=agent_name,
+        # V1 is a research/enrichment agent. Kimi's standalone-search
+        # guidance designates Search Pro for agents/reports/RAG because it
+        # returns query-ranked page passages rather than snippets alone.
+        return _provider_authority().run_search(parsed, endpoint=SEARCH_PRO,
+                                                agent=agent_name,
                                                 phase=phase_name)
     except SearchQueryInvalid as exc:
         # Decided before admission: no search was performed and none was
         # charged. The model is told to ask properly; the run pays nothing for
         # a malformed request, and MAX_TOOL_ROUNDS still bounds the asking.
-        return SearchOutcome(query="", endpoint=SEARCH_BASIC, admitted=False,
+        return SearchOutcome(query="", endpoint=SEARCH_PRO, admitted=False,
                              error=str(exc))
 
 
