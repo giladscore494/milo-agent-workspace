@@ -127,6 +127,19 @@ ENGINE_VERSIONS: Mapping[str, str] = {
     "swarm_v2": "swarm_v2.1",
 }
 
+#: Historical engine identities this release knows how to READ truthfully.
+#:
+#: This is deliberately distinct from ENGINE_VERSIONS. ENGINE_VERSIONS answers
+#: "which version may NEW execution use now?"; this registry answers "is this
+#: persisted historical identity a version we recognise?". Without that
+#: separation, bumping an engine from e.g. swarm_v2.1 to swarm_v2.2 would make
+#: every truthful v2.1 export suddenly unreadable. Execution/resume performs a
+#: stricter current-version check in EngineResolver; history/export does not.
+SUPPORTED_ENGINE_VERSIONS: Mapping[str, frozenset[str]] = {
+    "vehicle_catalog_v1": frozenset({"vehicle_catalog_v1.stage3"}),
+    "swarm_v2": frozenset({"swarm_v2.1"}),
+}
+
 #: The record's fields, in one place, so a reader and a writer cannot disagree
 #: about which keys make a complete identity.
 IDENTITY_FIELDS: tuple[str, ...] = (
@@ -258,15 +271,14 @@ class RunIdentity:
                     "the run identity is missing a required dimension")
             values[field] = value.strip()
         identity = cls(**values)  # type: ignore[arg-type]
-        if identity.workflow_key not in ENGINE_VERSIONS:
+        if identity.workflow_key not in SUPPORTED_ENGINE_VERSIONS:
             raise RunIdentityError(
                 "RUN_IDENTITY_WORKFLOW_UNKNOWN",
-                "the run identity names a workflow this release does not allow")
-        if identity.engine_version != ENGINE_VERSIONS[identity.workflow_key]:
+                "the run identity names a workflow this release does not know")
+        if identity.engine_version not in SUPPORTED_ENGINE_VERSIONS[identity.workflow_key]:
             raise RunIdentityError(
-                "RUN_IDENTITY_ENGINE_MISMATCH",
-                "the run identity's engine version is not the reviewed version "
-                "of the workflow it names")
+                "RUN_IDENTITY_ENGINE_UNKNOWN",
+                "the run identity names an engine version this release cannot read truthfully")
         if run_id is not None and identity.run_id != _run_id_text(run_id):
             raise RunIdentityError(
                 "RUN_IDENTITY_RUN_MISMATCH",
@@ -365,7 +377,7 @@ def identity_mutation_problems(current: Any, proposed: Any) -> list[str]:
 
 
 __all__ = [
-    "ENGINE_VERSIONS", "IDENTITY_FIELDS", "IDENTITY_VERSION",
+    "ENGINE_VERSIONS", "SUPPORTED_ENGINE_VERSIONS", "IDENTITY_FIELDS", "IDENTITY_VERSION",
     "RELEASE_SHA_ENV", "RUN_IDENTITY_FIELD", "RunIdentity", "RunIdentityError",
     "engine_version_for", "identity_mutation_problems", "persisted_identity",
     "release_sha", "require_identity", "reviewed_policy_fingerprint",
