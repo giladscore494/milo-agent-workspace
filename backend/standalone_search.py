@@ -326,6 +326,17 @@ def normalize_results(payload: Any) -> tuple[SearchResult, ...]:
     for row in rows:
         if len(results) >= MAX_RESULTS_PER_SEARCH:
             break
+        # The concrete Moonshot transport already returns bounded SearchResult
+        # objects. ProviderAdapter normalizes executor output once more so
+        # injected transports may return raw payloads; normalization therefore
+        # must be idempotent or the real transport's results disappear.
+        if isinstance(row, SearchResult):
+            results.append(SearchResult(
+                title=_clip(row.title, MAX_RESULT_TITLE_CHARS),
+                url=_clip(row.url, MAX_RESULT_URL_CHARS),
+                snippet=_clip(row.snippet, MAX_RESULT_SNIPPET_CHARS),
+            ))
+            continue
         if isinstance(row, str):
             results.append(SearchResult(snippet=_clip(row, MAX_RESULT_SNIPPET_CHARS)))
             continue
