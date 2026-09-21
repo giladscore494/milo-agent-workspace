@@ -173,8 +173,16 @@ begin
   perform pg_advisory_xact_lock(hashtext('milo_run_user_' || p_requested_by::text));
   perform pg_advisory_xact_lock(hashtext('milo_run_project_' || v_project::text));
 
+  if p_request_fingerprint is null or btrim(p_request_fingerprint) = '' then
+    raise exception 'IDEMPOTENCY_FINGERPRINT_REQUIRED'
+      using errcode = '22023';
+  end if;
+
   -- Idempotent replay returns the original immutable run before consulting
   -- today's project workflow; a later project edit cannot redefine history.
+  -- The key is only idempotent for the SAME logical request. Enforce that in
+  -- the transaction itself so every caller (website, operator capture, future
+  -- service code) gets one contract instead of relying on an API-layer check.
   if p_idempotency_key is not null then
     select * into v_existing
       from public.runs
@@ -182,6 +190,11 @@ begin
        and requested_by = p_requested_by
        and idempotency_key = p_idempotency_key;
     if found then
+      if v_existing.request_fingerprint is null
+         or v_existing.request_fingerprint is distinct from p_request_fingerprint then
+        raise exception 'IDEMPOTENCY_CONFLICT'
+          using errcode = '23505';
+      end if;
       return jsonb_build_object('run', to_jsonb(v_existing), 'created', false);
     end if;
   end if;
