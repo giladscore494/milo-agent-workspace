@@ -525,22 +525,20 @@ class RunFinalizer:
         the event this decision owes is durably recorded."""
         event = self._terminal_event(claim, status)
         atomic = getattr(self.repo, "finalize_run", None)
-        if callable(atomic):
-            expected = observed if observed is not None else self._observed_status()
-            if expected is None:
-                raise FinalizationUnavailable(
-                    "run state could not be read; refusing to finalize blind")
-            atomic(self.run_id, status, expected, event, **self._lease_kwargs(),
-                   **self._terminal_fields(claim))
-            self._observe(event)
-            return True
-        # Fallback for repositories without the atomic primitive: the state
-        # first, the event only after the state has won.
-        self._write(claim, status)
-        recorded = self._append_terminal_event(event)
-        if recorded:
-            self._observe(event)
-        return recorded
+        if not callable(atomic):
+            # Console 3 made terminal state + terminal evidence one atomic
+            # authority. Falling back to a transition followed by an event
+            # recreates the split-brain terminalization path it removed.
+            raise FinalizationUnavailable(
+                "atomic terminal finalization is unavailable")
+        expected = observed if observed is not None else self._observed_status()
+        if expected is None:
+            raise FinalizationUnavailable(
+                "run state could not be read; refusing to finalize blind")
+        atomic(self.run_id, status, expected, event, **self._lease_kwargs(),
+               **self._terminal_fields(claim))
+        self._observe(event)
+        return True
 
     def _terminal_event(self, claim: TerminalClaim, status: str) -> dict[str, Any] | None:
         """The event this decision owes, or None when it owes none.
