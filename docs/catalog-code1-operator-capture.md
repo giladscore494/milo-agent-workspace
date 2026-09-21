@@ -110,11 +110,15 @@ are **not** echoed back.
    not a member of the conversation's project gets the same not-found a browser
    user would, and **nothing is created**.
 2. **`create_message_and_run`** — the product's own transactional creation
-   contract (migration 012, reached through the `create_message_and_run_v2`
-   wrapper). Under the per-user and per-project advisory locks it performs the
-   idempotency lookup **first**, applies the same concurrency admission the
-   product applies, and inserts the message and the run in one transaction. It
-   returns the run **and whether it created it**. A created run is born
+   contract, reached through the atomic `create_message_and_run_v3` RPC
+   (migration `20260921000200`, which replaced migration 012's creator and the
+   `create_message_and_run_v2` wrapper). Under the per-user and per-project
+   advisory locks it performs the idempotency lookup **first**, applies the same
+   concurrency admission the product applies, and inserts the message, the run
+   and the run's **immutable identity** in one transaction — for a capture, the
+   control-plane `operator_capture` identity, which the database accepts only
+   with the capture marker in the run's input. It returns the run **and whether
+   it created it**. A created run is born
    `queued`/`pending`, which is **launchable**, and stays that way for exactly
    as long as step 3 takes.
 3. **`try_acquire_launch`** — **the atomic boundary**, and only ever on a run

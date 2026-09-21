@@ -13,6 +13,7 @@ from backend.engines.swarm_v2.feasibility import (MINIMUM_VIABLE_MODEL_CALLS,
                                                   plan_worst_case)
 from backend.engines.swarm_v2.outcome import (USEFUL_TERMINAL_OUTCOMES, is_useful_outcome)
 from backend.engines.swarm_v2.validation import PlanLimits
+from backend.run_identity import RunIdentity
 from backend.export_envelope import (SCHEMA_VERSION, ExportRefused, build_export_envelope,
                                      validate_export_envelope)
 from backend.provider_scheduler import (ENGINE_OVERLOADED, EXCEEDED_CURRENT_QUOTA,
@@ -200,10 +201,23 @@ def test_the_useful_set_excludes_every_non_product_terminal_state():
 # F. the export envelope
 # =============================================================================
 
+# The export envelope reads the engine from the run's IMMUTABLE IDENTITY. It
+# used to read it from `run["input"]["workflow_key"]` -- the CALLER's own
+# request metadata -- and otherwise default to "vehicle_catalog_v1", so these
+# fixtures used to state a workflow by putting one in the input. They now bind
+# a real identity, exactly as `_bind_run_identity` does at run creation.
+V2_RUN_ID = "11111111-1111-1111-1111-111111111111"
+V1_RUN_ID = "22222222-2222-2222-2222-222222222222"
+
+
+def identity_for(run_id, workflow_key):
+    return RunIdentity.bind(run_id, workflow_key).as_record()
+
+
 def v2_run(status="partial_success", **over):
-    run = {"id": "11111111-1111-1111-1111-111111111111",
+    run = {"id": V2_RUN_ID,
            "status": status,
-           "input": {"workflow_key": "swarm_v2"},
+           "run_identity": identity_for(V2_RUN_ID, "swarm_v2"),
            "output": {"status": "partial_success", "result_kind": "partial_result",
                       "fields": {"engine": [{"value": "1.6T",
                                              "provenance": {"claim_id": "c1",
@@ -239,8 +253,8 @@ def test_a_v2_payload_the_contract_could_not_have_produced_is_refused():
 
 
 def test_a_v1_result_is_wrapped_without_model_post_processing():
-    run = {"id": "22222222-2222-2222-2222-222222222222", "status": "completed",
-           "input": {"workflow_key": "vehicle_catalog_v1"},
+    run = {"id": V1_RUN_ID, "status": "completed",
+           "run_identity": identity_for(V1_RUN_ID, "vehicle_catalog_v1"),
            "output": {"status": "complete", "models": [{"canonical_model_name": "X"}]},
            "usage": {}}
     envelope = build_export_envelope(run)
@@ -251,8 +265,8 @@ def test_a_v1_result_is_wrapped_without_model_post_processing():
 
 
 def test_a_v1_partial_result_is_classified_truthfully():
-    run = {"id": "3", "status": "partial_success",
-           "input": {"workflow_key": "vehicle_catalog_v1"},
+    run = {"id": V1_RUN_ID, "status": "partial_success",
+           "run_identity": identity_for(V1_RUN_ID, "vehicle_catalog_v1"),
            "output": {"status": "partial_success", "models": [{"a": 1}]}}
     assert build_export_envelope(run)["result_kind"] == "partial_result"
 
@@ -261,7 +275,8 @@ def test_a_v1_partial_result_is_classified_truthfully():
 def test_a_non_product_terminal_state_exports_without_claiming_a_result(status):
     """A Cloud Run process exiting is not a product result, and neither is a
     timeout: the envelope must not let one be read as the other."""
-    run = {"id": "4", "status": status, "input": {"workflow_key": "swarm_v2"},
+    run = {"id": V2_RUN_ID, "status": status,
+           "run_identity": identity_for(V2_RUN_ID, "swarm_v2"),
            "output": None, "error": {"code": "RUN_DURATION_EXCEEDED"}}
     envelope = build_export_envelope(run)
     validate_export_envelope(envelope)
@@ -272,12 +287,13 @@ def test_a_non_product_terminal_state_exports_without_claiming_a_result(status):
 
 def test_a_non_terminal_run_cannot_be_exported():
     with pytest.raises(ExportRefused):
-        build_export_envelope({"id": "5", "status": "running"})
+        build_export_envelope({"id": V2_RUN_ID, "status": "running",
+                               "run_identity": identity_for(V2_RUN_ID, "swarm_v2")})
 
 
 def test_validation_rejects_a_result_kind_on_a_non_product_status():
-    envelope = build_export_envelope({"id": "6", "status": "timed_out",
-                                      "input": {"workflow_key": "swarm_v2"}})
+    envelope = build_export_envelope({"id": V2_RUN_ID, "status": "timed_out",
+                                      "run_identity": identity_for(V2_RUN_ID, "swarm_v2")})
     envelope["result_kind"] = "usable_result"
     with pytest.raises(ExportRefused, match="non-product terminal status"):
         validate_export_envelope(envelope)

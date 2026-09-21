@@ -10,7 +10,31 @@ export type LaunchState = 'pending'|'launching'|'launched'|'launch_failed'|'laun
 // `usage` mirrors BudgetTracker.snapshot() and is the authoritative aggregate.
 // GET /runs/{id} returns it as a typed RunUsage object, or null when the run
 // has settled no model call yet; see lib/runUsage.ts.
-export type Run = { id: UUID; conversation_id: UUID; status: string; started_at?: string; finished_at?: string; output?: Record<string, unknown>; error?: Record<string, unknown>; launch_state?: LaunchState; launch_error_class?: string; launch_reconciliation_required?: boolean; usage?: RunUsage | null };
+/**
+ * The run's own immutable identity, as the server states it.
+ *
+ * It exists so a HISTORICAL run renders as the engine it actually was. The V2
+ * vs V1 presentation used to be chosen from `project.workflow_key`, which is
+ * what the project is TODAY — so a project switched from one engine to the
+ * other re-rendered every earlier run of it as the wrong engine.
+ *
+ * `null` means the run was created before identities existed. That is not a
+ * licence to guess: `lib/runIdentity.ts` returns `undefined` for it and the
+ * caller falls back to the project, which is the behaviour such a run has
+ * always had.
+ */
+export type RunIdentity = {
+  identity_version: string;
+  run_id: UUID;
+  workflow_key: string;
+  engine_version: string;
+  policy_version: string;
+  policy_fingerprint: string;
+  release_sha: string;
+  event_registry_version: string;
+  event_registry_fingerprint: string;
+};
+export type Run = { id: UUID; conversation_id: UUID; status: string; run_identity?: RunIdentity | null; started_at?: string; finished_at?: string; output?: Record<string, unknown>; error?: Record<string, unknown>; launch_state?: LaunchState; launch_error_class?: string; launch_reconciliation_required?: boolean; usage?: RunUsage | null };
 // run_events.id is production bigint (not UUID); run_id remains UUID. It is
 // carried as a canonical decimal string (lib/eventId.ts) so identity and
 // ordering survive values above Number.MAX_SAFE_INTEGER.

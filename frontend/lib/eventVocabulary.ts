@@ -1,5 +1,5 @@
 /**
- * Which event types may touch which projection.
+ * Which event types may touch which projection — DERIVED, not transcribed.
  *
  * An event arrives as a `{event_type, agent, phase, progress, payload}` record
  * and the reducer turns it into rendered facts: agents, lifecycle phase,
@@ -14,75 +14,77 @@
  *
  * So recognition comes first, and it is by exact type, never by substring.
  *
- * `V1_EVENT_TYPES` is the frontend mirror of `V1_EVENT_TYPES` in
- * `backend/runtime.py`, exactly as `lib/runStatus.ts` mirrors
- * `TERMINAL_STATES`. It is the ONLY set whose members may write the V1
- * projection. (The backend's `EVENT_TYPES` — what the API accepts from a
- * worker — is that set UNION the catalog set below; acceptance and projection
- * ownership are deliberately two different questions.)
+ * WHERE THE SETS COME FROM
+ * ------------------------
+ * `eventRegistry.generated.json` is written by `backend/event_registry.py`,
+ * which is the ONE place this repository declares an event vocabulary. This
+ * module used to hand-mirror two of the backend's sets and hand-MAINTAIN a
+ * third (`SWARM_V2_EVENT_TYPES`) that had no backend counterpart at all — and
+ * it had drifted: five types `backend/engines/swarm_v2/engine.py` really emits
+ * were missing from it, so they were silently filed as unknown here while the
+ * database recorded them. Nothing is transcribed now. `tests/eventVocabulary`
+ * proves this module's sets are exactly the manifest's groups, and the
+ * backend's `tests/test_event_registry.py` proves the manifest is exactly
+ * `backend/event_registry.py` — so neither side can move without the other.
  *
- * `SWARM_V2_EVENT_TYPES` is the vocabulary `lib/swarmReducer.ts` handles. Its
- * members fold into the swarm slice and are deliberately NOT allowed into the
- * V1 projection: Swarm V2 has no agent concept, so a `task_started` event
- * carrying an `agent` field is a payload making a claim the engine that emitted
- * it cannot make.
+ * WHAT MEMBERSHIP MEANS
+ * ---------------------
+ * Membership grants a PROJECTION, and the groups are separate because they
+ * grant different ones:
  *
- * The two sets overlap on the run-lifecycle types both engines emit. That
- * overlap is intentional and harmless — each side reads only what it owns.
+ * - `V1_EVENT_TYPES` is the ONLY set whose members may write the V1
+ *   projection (agents, phase, progress, sources, claims, conflicts,
+ *   checkpoints, spend telemetry).
+ * - `SWARM_V2_EVENT_TYPES` fold into the swarm slice and are deliberately NOT
+ *   allowed into the V1 projection: Swarm V2 has no agent concept, so a
+ *   `task_started` carrying an `agent` field is a payload making a claim the
+ *   engine that emitted it cannot make.
+ * - `CATALOG_EVENT_TYPES` own exactly the bounded catalog status slice.
+ * - `OPERATIONAL_EVENT_TYPES` own NOTHING. They are durable operator signals
+ *   (provider pacing, retry accounting, a missing output cap) emitted by
+ *   server code with no agent, task, phase or spend concept. Recognising them
+ *   stops them being counted as unknown; it grants them no projection.
  *
- * Forward compatibility is the fail-safe direction: a type this file does not
- * know is recorded as an observation (the raw event list, and
- * `swarm.unknownEventTypes`) and changes nothing else. A new backend event type
- * is therefore inert in the browser until it is added here on purpose.
+ * The V1 and V2 sets overlap on the run-lifecycle types both engines emit.
+ * That overlap is intentional and harmless — each side reads only what it owns.
+ *
+ * Forward compatibility is still the fail-safe direction: a type this release
+ * does not know is recorded as an observation (the raw event list, and
+ * `swarm.unknownEventTypes`) and changes nothing else.
  */
 
+import registry from './eventRegistry.generated.json';
+
+/** The vocabulary's identity, carried on every run's immutable identity. */
+export const EVENT_REGISTRY_VERSION: string = registry.registry_version;
+export const EVENT_REGISTRY_FINGERPRINT: string = registry.fingerprint;
+
+function group(name: keyof typeof registry.groups): ReadonlySet<string> {
+  return new Set(registry.groups[name]);
+}
+
 /**
- * Mirror of `V1_EVENT_TYPES` in `backend/runtime.py`. Keep in step with it.
+ * Mirror of `V1_EVENT_TYPES` in `backend/event_registry.py`.
  *
- * NOT the backend's `EVENT_TYPES`: that is this set UNION
- * `CATALOG_EVENT_TYPES`, and it answers a different question. `EVENT_TYPES` is
- * what the API ACCEPTS from a worker; this set is what OWNS the V1 projection.
- * Mirroring the union here would hand the catalog types the agent, phase,
- * progress and spend projection that membership of this set grants.
+ * NOT the backend's acceptance set: that is this group UNION the Swarm V2,
+ * catalog and operational groups, and it answers a different question.
+ * `ACCEPTED_EVENT_TYPES` below is what the API ACCEPTS from a worker; this set
+ * is what OWNS the V1 projection. Using the union here would hand a provider
+ * pacing signal the agent, phase, progress and spend projection.
  */
-export const V1_EVENT_TYPES: ReadonlySet<string> = new Set([
-  'run_created', 'run_started', 'run_resumed', 'phase_started', 'phase_completed',
-  'agent_created', 'agent_started', 'agent_progress', 'agent_completed', 'agent_failed',
-  'chunk_started', 'chunk_completed', 'chunk_failed', 'fallback_started', 'fallback_completed',
-  'checkpoint_saved', 'cancellation_requested', 'run_completed', 'run_partial_success',
-  'run_failed', 'run_cancelled',
-  'tool_access_requested', 'tool_access_granted', 'tool_access_denied', 'tool_used',
-  'source_recorded', 'claim_recorded', 'conflict_detected',
-  'launch_requested', 'launch_failed', 'run_requeued',
-  'budget_warning', 'budget_exhausted', 'token_limit_reached', 'run_timed_out',
-  'retry_limit_reached', 'kill_switch_activated',
-  'supervisor_shadow_failed',
-]);
+export const V1_EVENT_TYPES: ReadonlySet<string> = group('v1');
+
+/** The Swarm V2 vocabulary `lib/swarmReducer.ts` handles. */
+export const SWARM_V2_EVENT_TYPES: ReadonlySet<string> = group('swarm_v2');
 
 /**
- * The Swarm V2 vocabulary `lib/swarmReducer.ts` handles, minus the run
- * lifecycle types it shares with V1 (those are already above).
- */
-export const SWARM_V2_EVENT_TYPES: ReadonlySet<string> = new Set([
-  'commander_plan_created', 'commander_replanned',
-  'task_ready', 'task_started', 'task_completed', 'task_failed',
-  'tool_called', 'worker_output_repair_started',
-  'evidence_added', 'conflict_found', 'grounding_context_resolved',
-  'verification_batch_completed', 'verification_completed',
-]);
-
-/**
- * The catalog path's two events. Mirror of `CATALOG_EVENT_TYPES` in
- * `backend/runtime.py`.
+ * The catalog path's two events.
  *
  * A DEDICATED closed set, not an addition to either set above, because
- * membership is what grants a projection here. Putting these two in
- * `V1_EVENT_TYPES` would hand a catalog event the agent, phase, progress and
- * spend projection; putting them in `SWARM_V2_EVENT_TYPES` would offer them the
- * task and lifecycle machinery. They own exactly one thing: the bounded catalog
- * slice in `lib/catalogStatus.ts`. They keep the raw event stream they already
- * had — every event is appended to it unconditionally — and they gain nothing
- * else.
+ * membership is what grants a projection here. They own exactly one thing: the
+ * bounded catalog slice in `lib/catalogStatus.ts`. They keep the raw event
+ * stream they already had — every event is appended to it unconditionally —
+ * and they gain nothing else.
  *
  * These events are emitted by trusted server code (`backend/worker/main.py`,
  * from `PromotionAttempt.as_event()`) that has no agent, task, phase or spend
@@ -90,10 +92,19 @@ export const SWARM_V2_EVENT_TYPES: ReadonlySet<string> = new Set([
  * codes. Anything else in one is a payload making a claim its emitter cannot
  * make, and the reducer ignores it.
  */
-export const CATALOG_EVENT_TYPES: ReadonlySet<string> = new Set([
-  'catalog_variant_promoted',
-  'catalog_promotion_refused',
-]);
+export const CATALOG_EVENT_TYPES: ReadonlySet<string> = group('catalog');
+
+/**
+ * Durable operator signals that own no projection at all.
+ *
+ * They are recognised so they stop being counted as unknown types, and they
+ * are kept out of every other set so recognising them cannot hand them a
+ * projection their emitters could not support.
+ */
+export const OPERATIONAL_EVENT_TYPES: ReadonlySet<string> = group('operational');
+
+/** Everything a trusted emitter may durably append. */
+export const ACCEPTED_EVENT_TYPES: ReadonlySet<string> = new Set(registry.accepted);
 
 /**
  * Types that are about the RUN, not about an agent inside it.
@@ -105,18 +116,12 @@ export const CATALOG_EVENT_TYPES: ReadonlySet<string> = new Set([
  * fallback types; a run-level type carrying an `agent` field describes which
  * agent the RUN stopped in, not work that agent did.
  */
-const RUN_LEVEL_EVENT_TYPES: ReadonlySet<string> = new Set([
-  'run_created', 'run_started', 'run_resumed', 'run_completed', 'run_partial_success',
-  'run_failed', 'run_cancelled', 'run_requeued', 'run_timed_out',
-  'cancellation_requested', 'launch_requested', 'launch_failed',
-  'budget_warning', 'budget_exhausted', 'token_limit_reached',
-  'kill_switch_activated', 'supervisor_shadow_failed',
-]);
+const RUN_LEVEL_EVENT_TYPES: ReadonlySet<string> = group('run_level');
 
 /** Recognised at all: it may be folded rather than only observed. */
 export function isKnownEventType(type: string): boolean {
   return V1_EVENT_TYPES.has(type) || SWARM_V2_EVENT_TYPES.has(type)
-    || CATALOG_EVENT_TYPES.has(type);
+    || CATALOG_EVENT_TYPES.has(type) || OPERATIONAL_EVENT_TYPES.has(type);
 }
 
 /**
@@ -130,12 +135,18 @@ export function ownsCatalogProjection(type: string): boolean {
   return CATALOG_EVENT_TYPES.has(type);
 }
 
+/** May this type fold into the Swarm V2 projection? */
+export function ownsSwarmProjection(type: string): boolean {
+  return SWARM_V2_EVENT_TYPES.has(type);
+}
+
 /**
  * May this type write the V1 projection — phase, progress, sources, claims,
  * conflicts, supervisor notes, checkpoints, raw errors and the event-derived
  * token/cost totals?
  *
- * Only a type the backend itself validates. A Swarm V2 type never qualifies.
+ * Only a type the backend itself validates. A Swarm V2 type never qualifies,
+ * and neither does an operational one.
  */
 export function ownsV1Projection(type: string): boolean {
   return V1_EVENT_TYPES.has(type);

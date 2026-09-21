@@ -38,6 +38,7 @@ from test_swarm_v2_resume_budget import seeded_run, snapshot, stale_checkpoint
 from test_swarm_v2_smoke_offline import (PROJECT, USER, FakeKimiCompletions, fake_kimi_client,
                                          kimi_response, minimal_plan, swarm_env)
 from test_worker import WorkerRepo
+from tests.run_factory import identity_kwargs
 
 
 class Crash(BaseException):
@@ -610,7 +611,8 @@ def v1_mock(monkeypatch):
     repo.projects[PROJECT]["workflow_key"] = "vehicle_catalog_v1"
     conversation = repo.create_conversation(UUID(PROJECT), "v1", UUID(USER))
     created = repo.create_message_and_run(UUID(conversation["id"]), "v1 replay regression", {},
-                                          UUID(USER), str(uuid4()), "fp")
+                                          UUID(USER), str(uuid4()), "fp",
+                                          **identity_kwargs(repo, conversation["id"]))
     run_id = str(created["run"]["id"])
     repo.runs[run_id]["workflow_key"] = "vehicle_catalog_v1"
     repo.set_launch_state(UUID(run_id), "launched")

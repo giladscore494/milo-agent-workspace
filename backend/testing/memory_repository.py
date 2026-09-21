@@ -218,22 +218,59 @@ class MemoryRepository:
                 return dict(run)
         return None
 
-    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]:
-        # Mirrors migration 012: replay lookup, admission and both writes
-        # under one lock, so the E2E stack exercises the atomic contract.
+    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None, *, run_id: UUID, run_identity: dict[str, Any]) -> dict[str, Any]:
+        # Mirrors Console 6's atomic creator: replay lookup, admission, message,
+        # run and immutable identity all settle under one lock.
         with self.lock:
+            if not request_fingerprint:
+                raise AppError(
+                    "IDEMPOTENCY_FINGERPRINT_REQUIRED",
+                    "run creation requires a request fingerprint",
+                    409,
+                )
             if idempotency_key:
                 existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
                 if existing is not None:
+                    if existing.get("request_fingerprint") != request_fingerprint:
+                        raise AppError(
+                            "IDEMPOTENCY_CONFLICT",
+                            "idempotency key was already used with a different payload",
+                            409,
+                        )
                     return {"run": existing, "created": False}
             if max_user_active is not None and self.count_active_runs_for_user(requested_by) >= max_user_active:
                 raise AppError("USER_CONCURRENCY_LIMIT", "too many active runs for this user", 429)
             project_id = self._conversation_project(conversation_id)
+            project = self.projects.get(str(project_id)) or {}
+            if run_identity.get("run_id") != str(run_id):
+                raise AppError("RUN_IDENTITY_INVALID", "identity names a different run", 409)
+            if run_identity.get("workflow_key") == "operator_capture":
+                if metadata.get("milo_operation") != "catalog.government.capture":
+                    raise AppError("RUN_IDENTITY_INVALID", "operator capture identity requires capture marker", 409)
+            elif run_identity.get("workflow_key") != project.get("workflow_key"):
+                raise AppError("RUN_IDENTITY_WORKFLOW_DRIFT", "project workflow changed before run creation", 409)
             if max_project_active is not None and self.count_active_runs_for_project(project_id) >= max_project_active:
                 raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429)
             message = self.create_user_message(conversation_id, content, metadata)
-            run = self.create_queued_run(conversation_id, message["id"], content, metadata, requested_by=requested_by, idempotency_key=idempotency_key, request_fingerprint=request_fingerprint)
-            return {"run": run, "created": True}
+            run = {
+                "id": str(run_id),
+                "conversation_id": str(conversation_id),
+                "status": "queued",
+                "attempt": 1,
+                "launch_state": "pending",
+                "requested_by": str(requested_by),
+                "idempotency_key": idempotency_key,
+                "request_fingerprint": request_fingerprint,
+                "input": {"message_id": str(message["id"]), "content": content, "metadata": metadata},
+                "output": None,
+                "error": None,
+                "usage": {},
+                "run_identity": dict(run_identity),
+                "created_at": _now(),
+                "updated_at": _now(),
+            }
+            self.runs[run["id"]] = run
+            return {"run": dict(run), "created": True}
 
     def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None:
         with self.lock:
@@ -433,10 +470,31 @@ class MemoryRepository:
         row = self.__dict__.get("run_usage_ledgers", {}).get(str(run_id))
         return {**row, "ledger": dict(row["ledger"])} if row else None
 
-    def append_usage_ledger(self, entry: dict[str, Any]) -> dict[str, Any]:
-        row = {"id": len(getattr(self, "usage_ledger", [])) + 1, "created_at": _now(), **entry}
+    def append_usage_ledger(self, entry: dict[str, Any], *,
+                            worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Parity with `append_usage_ledger_guarded` (migration 20260921000200).
+
+        The per-call rows `sum_daily_ledger_cost` reads were the last durable
+        write a running worker made unfenced, so a replaced worker could keep
+        charging a run it no longer owned against the live worker's daily
+        allowance. The run id comes from the FENCED argument, so an entry
+        naming another run cannot charge one.
+        """
+        run_id = entry.get("run_id")
+        if not run_id:
+            raise AppError("REPOSITORY_ERROR", "a usage ledger entry requires its run id", 502)
+        self._evidence_lease(UUID(str(run_id)), worker_id, attempt, lease_token)
+        return self._append_usage_ledger_row(entry)
+
+    def _append_usage_ledger_row(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Write the row itself, once the caller's authority is settled."""
+        run_id = entry.get("run_id")
+        if not run_id:
+            raise AppError("REPOSITORY_ERROR", "a usage ledger entry requires its run id", 502)
         if not hasattr(self, "usage_ledger"):
             self.usage_ledger = []
+        row = {"id": len(self.usage_ledger) + 1, "created_at": _now(),
+               **entry, "run_id": str(run_id)}
         self.usage_ledger.append(row)
         return dict(row)
 
@@ -578,7 +636,18 @@ class MemoryRepository:
                 status, reason = "rejected", "DAILY_USER_BUDGET_REACHED"
             elif project_id and daily_project_limit is not None and project_spend + amount > daily_project_limit:
                 status, reason = "rejected", "DAILY_PROJECT_BUDGET_REACHED"
-            return self.append_usage_ledger({"run_id": str(run_id), "call_seq": call_seq, "user_id": user_id, "project_id": project_id, "decision": status, "status": status, "estimated_cost": amount, "rejection_reason": reason})
+            entry = {"run_id": str(run_id), "call_seq": call_seq, "user_id": user_id,
+                     "project_id": project_id, "decision": status, "status": status,
+                     "estimated_cost": amount, "rejection_reason": reason}
+            if worker_id is None:
+                # Parity with production, which takes the UNGUARDED
+                # reserve_model_call_budget_v2 path when the caller states no
+                # lease. The lease was already asserted above when one was
+                # given, so the row is written directly either way rather than
+                # re-entering the fenced writer with a lease it may not have.
+                return self._append_usage_ledger_row(entry)
+            return self.append_usage_ledger(entry, worker_id=worker_id, attempt=attempt,
+                                            lease_token=lease_token)
 
     def settle_model_call_budget(self, reservation_id: str, actual_cost: float, status: str = "settled", rejection_reason: str | None = None, run_id: UUID | None = None, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         with self.lock:
@@ -671,10 +740,22 @@ class MemoryRepository:
             raise NotFoundError("run", str(run_id))
         self._assert_active_lease(run, worker_id, attempt, lease_token)
 
-    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]:
+    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any], *,
+                                   worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Parity with `create_tool_access_request_guarded` (20260921000200).
+
+        Both of these were direct inserts on either side, so a worker whose
+        lease had been reclaimed could still open tool access on a run it no
+        longer owned. The complete lease is now required here exactly as the
+        RPC requires it: a missing component is a refusal, never a skipped
+        check.
+        """
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
         return self._tool_row(run_id, request)
 
-    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]:
+    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any], *,
+                          worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        self._evidence_lease(run_id, worker_id, attempt, lease_token)
         return self._tool_row(run_id, grant)
 
     def create_tool_usage(self, run_id: UUID, usage: dict[str, Any], **lease: Any) -> dict[str, Any]:

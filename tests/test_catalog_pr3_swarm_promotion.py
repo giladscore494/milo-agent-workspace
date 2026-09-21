@@ -80,6 +80,7 @@ from backend.testing.memory_repository import MemoryRepository
 from backend.tools import ToolContext, ToolError, ToolMode, ToolRegistry
 from backend.tools.government_vehicle import (GOVERNMENT_TOOL_NAME, GOVERNMENT_TOOL_SCOPE,
                                               MAX_TOOL_PAGE_ITEMS, GovernmentVehicleTool)
+from tests.worker_fence import FENCE
 
 #: The pinned capture's own identity text, so a test names the same vehicle the
 #: committed R5 fixtures state rather than one invented for the test.
@@ -405,7 +406,7 @@ def forged_chain(repository, lease, board, candidate, *, label, field_key, value
     projection = structured_projection(record={register_field: value}, fields=(register_field,),
                                        locator=locator, fragment_index=0)
     source = board.record_source(
-        SourceCreate(agent="catalog.government",
+        SourceCreate(**FENCE, agent="catalog.government",
                      url=f"https://{src.DATA_GOV_HOST}/dataset/x/resource/{label}",
                      title=label, domain=src.DATA_GOV_HOST, source_type="government_register",
                      source_strength="strong", query=record_id,
@@ -414,7 +415,7 @@ def forged_chain(repository, lease, board, candidate, *, label, field_key, value
         version=SourceVersion(kind="dataset_version", identifier="2026.09.1"))
     fragment = board.record_focused_fragment(source["id"], projection, task_key="task-1")
     claim = board.record_claim(
-        ClaimCreate(entity_key=entity, field_key=field_key, value=value,
+        ClaimCreate(**FENCE, entity_key=entity, field_key=field_key, value=value,
                     unit="year" if field_key.startswith("model_year") else None,
                     time_scope=dict(time_scope), geography=market, market=market,
                     source_id=uuid.UUID(str(source["id"])), source_strength="strong",

@@ -91,6 +91,23 @@ REQUIRED_PER_FILE = {
         "conflicts enable row level security",
         "model_call_budget_reservations enable row level security",
     ],
+    "20260921000200_immutable_run_identity.sql": [
+        # New runs are born with one identity in the same transaction as the
+        # run row; legacy NULL identities can never be retrofitted later.
+        "add column if not exists run_identity jsonb",
+        "event_registry_fingerprint",
+        "create or replace function public.runs_forbid_identity_rewrite()",
+        "create trigger runs_forbid_identity_rewrite",
+        "create or replace function public.runs_require_identity_on_insert()",
+        "create trigger runs_require_identity_on_insert",
+        "drop function if exists public.bind_run_identity(uuid, jsonb)",
+        "create or replace function public.create_message_and_run_v3(",
+        # The three worker writes that had no lease fence at all.
+        "create or replace function public.create_tool_access_request_guarded(",
+        "create or replace function public.create_tool_grant_guarded(",
+        "create or replace function public.append_usage_ledger_guarded(",
+        "perform public.assert_worker_lease(",
+    ],
 }
 
 FORBIDDEN_EVERYWHERE = [

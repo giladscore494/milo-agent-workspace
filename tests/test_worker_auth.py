@@ -82,17 +82,25 @@ def worker_headers(token):
     return {"X-Milo-Worker-Token": token}
 
 
-def worker_routes(repo):
+#: The `run + attempt + worker + lease` ownership contract every worker
+#: mutation route now requires. Worker IDENTITY answers "is this a worker?";
+#: this answers "is this THE worker of THIS attempt of THIS run?", and only the
+#: second one stops a replaced worker whose credentials are still valid.
+LEASE = {"worker_id": "worker-1", "attempt": 1, "lease_token": "lease-token-1"}
+
+
+def worker_routes(repo, lease=True):
+    fence = dict(LEASE) if lease else {}
     return [
-        (f"/runs/{repo.run_id}/tool-access-requests", {"agent": "a", "tool": "web_search", "reason": "r"}),
-        (f"/runs/{repo.run_id}/tool-grants", valid_tool_grant_body()),
-        (f"/runs/{repo.run_id}/tool-usage", {"grant_id": str(uuid4()), "agent": "a", "tool": "web_search", "operation": "search"}),
-        (f"/runs/{repo.run_id}/sources", {"agent": "a", "url": "https://example.com", "title": "t", "domain": "example.com", "source_type": "web", "source_strength": "high", "query": "q", "tool_operation": "search"}),
-        (f"/runs/{repo.run_id}/claims", {"entity_key": "e", "field_key": "f", "value": 1, "source_id": str(uuid4()), "source_strength": "high", "confidence": 0.9, "agent": "a"}),
-        (f"/runs/{repo.run_id}/conflicts", {"entity_key": "e", "field_key": "f", "claim_ids": [str(uuid4())]}),
-        (f"/internal/runs/{repo.run_id}/events", {"event_type": "agent_progress", "message": "m"}),
-        (f"/internal/runs/{repo.run_id}/complete", {"output": {"status": "success"}}),
-        (f"/internal/runs/{repo.run_id}/fail", {"code": "X", "message": "failed"}),
+        (f"/runs/{repo.run_id}/tool-access-requests", {**fence, "agent": "a", "tool": "web_search", "reason": "r"}),
+        (f"/runs/{repo.run_id}/tool-grants", {**fence, **valid_tool_grant_body()}),
+        (f"/runs/{repo.run_id}/tool-usage", {**fence, "grant_id": str(uuid4()), "agent": "a", "tool": "web_search", "operation": "search"}),
+        (f"/runs/{repo.run_id}/sources", {**fence, "agent": "a", "url": "https://example.com", "title": "t", "domain": "example.com", "source_type": "web", "source_strength": "high", "query": "q", "tool_operation": "search"}),
+        (f"/runs/{repo.run_id}/claims", {**fence, "entity_key": "e", "field_key": "f", "value": 1, "source_id": str(uuid4()), "source_strength": "high", "confidence": 0.9, "agent": "a"}),
+        (f"/runs/{repo.run_id}/conflicts", {**fence, "entity_key": "e", "field_key": "f", "claim_ids": [str(uuid4())]}),
+        (f"/internal/runs/{repo.run_id}/events", {**fence, "event_type": "agent_progress", "message": "m"}),
+        (f"/internal/runs/{repo.run_id}/complete", {**fence, "output": {"status": "success"}}),
+        (f"/internal/runs/{repo.run_id}/fail", {**fence, "code": "X", "message": "failed"}),
     ]
 
 
@@ -154,16 +162,76 @@ def test_valid_worker_identity_can_write_tool_and_evidence_records(repo):
 def test_valid_worker_identity_can_append_events_and_finish_runs(repo):
     c = client()
     headers = worker_headers("valid-worker-token")
-    event = c.post(f"/internal/runs/{repo.run_id}/events", json={"event_type": "agent_progress", "message": "step"}, headers=headers)
+    event = c.post(f"/internal/runs/{repo.run_id}/events", json={**LEASE, "event_type": "agent_progress", "message": "step"}, headers=headers)
     assert event.status_code == 201
-    unknown = c.post(f"/internal/runs/{repo.run_id}/events", json={"event_type": "not_a_real_event", "message": "x"}, headers=headers)
+    unknown = c.post(f"/internal/runs/{repo.run_id}/events", json={**LEASE, "event_type": "not_a_real_event", "message": "x"}, headers=headers)
     assert unknown.status_code == 422
-    done = c.post(f"/internal/runs/{repo.run_id}/complete", json={"output": {"status": "success"}}, headers=headers)
+    # A legitimate Swarm V2 type is ACCEPTED. The acceptance set used to be
+    # V1 + catalog only, so this answered 422 to an event the V2 engine emits
+    # on every task of every run while the durable sink wrote it unchecked.
+    swarm = c.post(f"/internal/runs/{repo.run_id}/events", json={**LEASE, "event_type": "task_started", "message": "t"}, headers=headers)
+    assert swarm.status_code == 201
+    # A real run ENVELOPE, not a bare status word: the canonical ProductOutcome
+    # reads what was actually produced, so `{"status": "success"}` with no
+    # document is `not_produced` and terminalizes as a failure, never a quiet
+    # success. This is what a worker that finished a run actually sends.
+    done = c.post(f"/internal/runs/{repo.run_id}/complete", json={**LEASE, "output": {"status": "success", "result": {"summary": "done"}}}, headers=headers)
     assert done.status_code == 200
-    failed = c.post(f"/internal/runs/{repo.run_id}/fail", json={"code": "ENGINE_FAILED", "message": "boom"}, headers=headers)
+    failed = c.post(f"/internal/runs/{repo.run_id}/fail", json={**LEASE, "code": "ENGINE_FAILED", "message": "boom"}, headers=headers)
     assert failed.status_code == 200
     assert repo.completed_runs == 1
     assert repo.failed_runs == 1
+
+
+def test_an_approved_worker_identity_without_the_run_lease_mutates_nothing(repo):
+    """Identity is not the fence.
+
+    Before this, an approved worker service identity was sufficient to append
+    events, open tool access and -- through /complete and /fail -- TERMINALIZE
+    a run. A worker whose lease had been reclaimed still held valid
+    credentials, so it could finish a run another worker was executing.
+    """
+    c = client()
+    headers = worker_headers("valid-worker-token")
+    for path, body in worker_routes(repo, lease=False):
+        response = c.post(path, json=body, headers=headers)
+        assert response.status_code == 422, path
+    repo.assert_no_mutations()
+
+
+@pytest.mark.parametrize("missing", ["worker_id", "attempt", "lease_token"])
+def test_a_partial_lease_is_refused_rather_than_treated_as_none(repo, missing):
+    """An absent component must never be read as 'no check required'."""
+    c = client()
+    headers = worker_headers("valid-worker-token")
+    for path, body in worker_routes(repo):
+        partial = {key: value for key, value in body.items() if key != missing}
+        assert c.post(path, json=partial, headers=headers).status_code == 422, path
+    repo.assert_no_mutations()
+
+
+def test_the_route_forwards_the_lease_to_every_durable_write(repo):
+    """The fence authorizes the write; it must also REACH the database, or the
+    request body is just a form nobody reads."""
+    c = client()
+    headers = worker_headers("valid-worker-token")
+    for path, body in worker_routes(repo):
+        assert c.post(path, json=body, headers=headers).status_code in (200, 201), path
+    assert repo.leases_seen, "no durable write recorded a lease"
+    assert all(seen == LEASE for seen in repo.leases_seen), repo.leases_seen
+
+
+def test_the_lease_token_is_never_written_into_a_durable_payload(repo):
+    """A lease token is a credential. The guarded evidence RPCs refuse any
+    payload carrying one outright, so folding the fence into the row would be
+    rejected by the database as well as unsafe."""
+    c = client()
+    headers = worker_headers("valid-worker-token")
+    for path, body in worker_routes(repo)[:6]:
+        response = c.post(path, json=body, headers=headers)
+        assert response.status_code == 201, path
+        row = response.json()
+        assert "lease_token" not in row and "worker_id" not in row, path
 
 
 def test_valid_worker_identity_with_execution_flag_disabled_is_rejected(repo, monkeypatch):
@@ -193,3 +261,43 @@ def test_flag_alone_is_never_sufficient_authorization(repo):
     response = client().post(f"/runs/{repo.run_id}/claims", json=worker_routes(repo)[4][1])
     assert response.status_code == 401
     repo.assert_no_mutations()
+
+
+def test_every_fenced_payload_is_json_native_for_its_jsonb_argument():
+    """Each worker payload is now ONE `jsonb` argument to a guarded RPC, and a
+    Python-mode dump leaves UUID and datetime objects the PostgREST client
+    cannot serialize. A tool grant carries both, so this would fail on the
+    first real request while every fake that never serializes stayed green."""
+    import json
+
+    from backend.schemas import (ClaimCreate, ConflictCreate, SourceCreate,
+                                 ToolAccessRequestCreate, ToolGrantCreate,
+                                 ToolUsageCreate, WorkerRunCompleteRequest,
+                                 WorkerRunEventCreate, WorkerRunFailRequest)
+
+    models = {
+        ToolAccessRequestCreate: {"agent": "a", "tool": "t", "reason": "r"},
+        ToolGrantCreate: {"request_id": uuid4(), "agent": "a", "tool": "t",
+                          "max_searches": 1, "max_rounds": 1,
+                          "expires_at": "2030-01-01T00:00:00+00:00",
+                          "approver_policy": "auto"},
+        ToolUsageCreate: {"grant_id": uuid4(), "agent": "a", "tool": "t",
+                          "operation": "search"},
+        SourceCreate: {"agent": "a", "url": "https://example.com", "title": "t",
+                       "domain": "example.com", "source_type": "web",
+                       "source_strength": "high", "query": "q",
+                       "tool_operation": "search"},
+        ClaimCreate: {"entity_key": "e", "field_key": "f", "value": 1,
+                      "source_id": uuid4(), "source_strength": "high",
+                      "confidence": 0.9, "agent": "a"},
+        ConflictCreate: {"entity_key": "e", "field_key": "f", "claim_ids": [uuid4()]},
+        WorkerRunEventCreate: {"event_type": "agent_progress", "message": "m"},
+        WorkerRunCompleteRequest: {"output": {"status": "success"}},
+        WorkerRunFailRequest: {"code": "X", "message": "m"},
+    }
+    for model, payload in models.items():
+        built = model(**LEASE, **payload)
+        content = built.content()
+        json.dumps(content)  # would raise on a UUID or a datetime
+        assert not (set(content) & set(LEASE)), f"{model.__name__} leaks the fence"
+        assert built.lease() == LEASE

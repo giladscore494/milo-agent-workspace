@@ -2,6 +2,7 @@
 
 from typing import Any
 from pydantic import ConfigDict, Field
+from backend.run_identity import ENGINE_VERSIONS
 from .contracts import StrictContract
 from .correction import MAX_CORRECTION_ROUNDS
 from .evidence import safe_durable_value
@@ -12,7 +13,7 @@ class SwarmState(StrictContract):
     model_config = ConfigDict(extra="forbid", strict=True)
     run_id: str
     objective: str
-    engine_version: str = "swarm_v2.1"
+    engine_version: str = ENGINE_VERSIONS["swarm_v2"]
     workflow_key: str = "swarm_v2"
     graph_revision: int = 1
     approved_plan: dict[str, Any] | None = None
@@ -57,7 +58,8 @@ class SwarmState(StrictContract):
     def resume(cls, raw: Any, *, run_id: str, workflow_key: str = "swarm_v2") -> "SwarmState":
         safe_durable_value(raw)
         state = cls.model_validate(raw)
-        if state.run_id != run_id or state.workflow_key != workflow_key or state.engine_version != "swarm_v2.1":
+        if (state.run_id != run_id or state.workflow_key != workflow_key
+                or state.engine_version != ENGINE_VERSIONS["swarm_v2"]):
             raise ValueError("incompatible Swarm V2 checkpoint")
         if len(state.completed_task_ids) != len(set(state.completed_task_ids)):
             raise ValueError("checkpoint contains duplicate completed tasks")

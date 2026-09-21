@@ -40,6 +40,7 @@ from test_swarm_v2_grounded_verifier import (RUN_ID, TASK, DurableRepository,
                                              GroundingJudgeGateway, fact_row, fragment_row,
                                              ref, resolver_for, source_row, verifier_with)
 from test_swarm_v2_stage1_e2e import DECLINE_CORRECTION, Plans, Worker, commander
+from tests.worker_fence import FENCE
 
 # The known regression. A source record that states 1,600 cc, and a claim that
 # says 1,798 cc about it. Before R4 a model completion decided this; now
@@ -1128,12 +1129,12 @@ def test_every_conflict_path_shares_one_value_identity_end_to_end():
     lease = WorkerLease(uuid4(), "worker-1", 2, "lease-token")
     board = EvidenceBoard(GuardedEvidenceRepository(lease), lease)
     source = board.record_source(
-        SourceCreate(agent="w", url="https://example.test/a", title="t", domain="example.test",
+        SourceCreate(**FENCE, agent="w", url="https://example.test/a", title="t", domain="example.test",
                      source_type="structured", source_strength="strong", query="q",
                      tool_operation="op"), task_key="task-1")
 
     def claim(value, unit):
-        return ClaimCreate(entity_key="vehicle:1", field_key=FIELD, value=value, unit=unit,
+        return ClaimCreate(**FENCE, entity_key="vehicle:1", field_key=FIELD, value=value, unit=unit,
                            time_scope={"year": 2020}, market="IL",
                            source_id=_UUID(str(source["id"])), source_strength="strong",
                            confidence=.9, agent="w")

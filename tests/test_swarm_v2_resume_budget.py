@@ -25,6 +25,7 @@ import pytest
 import backend.worker.main as worker_main
 from backend.budget import BudgetConfig, BudgetTracker, merge_usage_snapshots
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 from test_swarm_v2_smoke_offline import (USER, PROJECT, FakeKimiCompletions, minimal_plan,
                                          patch_client, swarm_env)
 
@@ -36,7 +37,7 @@ def seeded_run(repo: MemoryRepository) -> str:
     conversation = repo.create_conversation(UUID(PROJECT), "resume", UUID(USER))
     created = repo.create_message_and_run(
         UUID(conversation["id"]), "resume budget regression", {}, UUID(USER),
-        str(uuid4()), "fingerprint")
+        str(uuid4()), "fingerprint", **identity_kwargs(repo, conversation["id"]))
     run_id = str(created["run"]["id"])
     repo.runs[run_id]["workflow_key"] = "swarm_v2"
     repo.set_launch_state(UUID(run_id), "launched")

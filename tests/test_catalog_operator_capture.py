@@ -44,6 +44,7 @@ from backend.production_config import TRUE_VALUES
 from backend.testing import government_capture as capture_fixtures
 from backend.testing.government_capture import FixtureTransport
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 
 ENTRYPOINT_SOURCE = Path("backend/catalog/operator_capture.py")
 
@@ -182,9 +183,18 @@ def test_the_entrypoint_creates_no_schedule():
 SUPABASE_URL = f"https://{PROJECT_REF}.supabase.co"
 
 
+#: The release this capture runtime states it is serving. Console 6 binds a
+#: release into the capture run's own control-plane identity and refuses to
+#: create one when none is stated, so a deployment without it is not a
+#: prerequisite-satisfied environment. An override clears or changes it where a
+#: test proves that gate.
+CAPTURE_RELEASE_SHA = "84cd8696119c24662a954d0f0e23195268dab23f"
+
+
 def capture_env(**overrides: str) -> dict[str, str]:
     """A process environment with every prerequisite satisfied."""
-    env = {"SUPABASE_URL": SUPABASE_URL, "MILO_ENABLE_CATALOG_EXECUTION": "true"}
+    env = {"SUPABASE_URL": SUPABASE_URL, "MILO_ENABLE_CATALOG_EXECUTION": "true",
+           "MILO_RELEASE_SHA": CAPTURE_RELEASE_SHA}
     env.update(overrides)
     return env
 
@@ -1264,15 +1274,17 @@ class LauncherStealsLaunchOwnership(MemoryRepository):
     already moved it to `launching` for a real launcher.
     """
 
-    def create_queued_run(self, conversation_id, user_message_id, content, metadata,
-                          requested_by=None, idempotency_key=None, request_fingerprint=None):
-        run = super().create_queued_run(conversation_id, user_message_id, content, metadata,
-                                        requested_by=requested_by,
-                                        idempotency_key=idempotency_key,
-                                        request_fingerprint=request_fingerprint)
+    def create_message_and_run(self, conversation_id, content, metadata, requested_by,
+                               idempotency_key, request_fingerprint,
+                               max_user_active=None, max_project_active=None, *,
+                               run_id, run_identity):
+        result = super().create_message_and_run(
+            conversation_id, content, metadata, requested_by, idempotency_key,
+            request_fingerprint, max_user_active, max_project_active,
+            run_id=run_id, run_identity=run_identity)
         # The ordinary path gets there first, through the same CAS.
-        assert super().try_acquire_launch(UUID(str(run["id"]))) is not None
-        return run
+        assert super().try_acquire_launch(UUID(str(result["run"]["id"]))) is not None
+        return result
 
 
 def test_preparation_refuses_when_the_ordinary_launch_path_wins_the_cas(monkeypatch, capsys):
@@ -1424,9 +1436,14 @@ def test_the_operator_owned_state_is_one_the_product_never_writes():
     written = set(re.findall(r'set_launch_state\(run_id, "([a-z_]+)"', api))
     assert written == {"launching", "launched", "launch_failed", "launch_unknown"}
     assert entrypoint.OPERATOR_OWNED_LAUNCH_STATE not in written
+    # Run creation is one atomic transaction in the database now, so the state
+    # a new run is born in is written there -- and it is the LAUNCHABLE one.
+    creator = Path("supabase/migrations/20260921000200_immutable_run_identity.sql").read_text(encoding="utf-8")
+    created_body = creator.split("create or replace function public.create_message_and_run_v3(")[1]
+    assert "'queued', 'pending'" in created_body
+    assert entrypoint.OPERATOR_OWNED_LAUNCH_STATE not in created_body
+    # And the repository never writes the operator-owned state either.
     repository_source = Path("backend/repository/supabase.py").read_text(encoding="utf-8")
-    # Both creation paths insert the LAUNCHABLE state, never the operator one.
-    assert '"launch_state": "pending"' in repository_source
     assert f'"launch_state": "{entrypoint.OPERATOR_OWNED_LAUNCH_STATE}"' not in repository_source
 
 
@@ -1620,7 +1637,8 @@ def ordinary_run_in(repository: MemoryRepository, conversation_id: UUID, user_id
     """
     result = repository.create_message_and_run(
         conversation_id, "an ordinary user prompt", dict(metadata or {}), user_id, key,
-        "fingerprint-of-an-ordinary-request")
+        "fingerprint-of-an-ordinary-request",
+        **identity_kwargs(repository, conversation_id))
     assert result["created"] is True
     return UUID(str(result["run"]["id"]))
 
@@ -1833,7 +1851,8 @@ def test_the_in_memory_creation_contract_matches_production(monkeypatch, reposit
     """
     conversation_id, user_id = seed_conversation(repository)
     first = repository.create_message_and_run(
-        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp")
+        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp",
+        **identity_kwargs(repository, conversation_id))
     assert first["created"] is True
     assert first["run"]["status"] == "queued"
     assert first["run"]["launch_state"] == "pending"
@@ -1843,7 +1862,8 @@ def test_the_in_memory_creation_contract_matches_production(monkeypatch, reposit
     messages_after_create = len(repository.messages)
 
     replay = repository.create_message_and_run(
-        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp")
+        conversation_id, "content", {"k": "v"}, user_id, "parity-key", "fp",
+        **identity_kwargs(repository, conversation_id))
     assert replay["created"] is False
     assert replay["run"]["id"] == first["run"]["id"]
     # No message is written on a replay -- the lookup precedes every insert.
@@ -1855,7 +1875,8 @@ def test_the_in_memory_creation_contract_matches_production(monkeypatch, reposit
     project_id = repository.conversations[str(conversation_id)]["project_id"]
     repository.members.add((project_id, str(other_user)))
     distinct = repository.create_message_and_run(
-        conversation_id, "content", {"k": "v"}, other_user, "parity-key", "fp")
+        conversation_id, "content", {"k": "v"}, other_user, "parity-key", "fp",
+        **identity_kwargs(repository, conversation_id))
     assert distinct["created"] is True
     assert distinct["run"]["id"] != first["run"]["id"]
 

@@ -199,7 +199,7 @@ class EvidenceBoard:
                 "lease_token": self.lease.lease_token}
 
     def record_tool_usage(self, usage: ToolUsageCreate, *, task_key: str) -> dict[str, Any]:
-        payload = usage.model_dump(mode="json")
+        payload = usage.content()
         # Reduce potentially hostile provider error objects before the
         # general evidence validator sees them.  Only a bounded code crosses
         # the persistence boundary; messages/details/sentinels are discarded.
@@ -230,7 +230,7 @@ class EvidenceBoard:
         """
         if version is not None and not isinstance(version, SourceVersion):
             raise EvidenceValidationError("a trusted source version contract is required")
-        payload = safe_durable_value(source.model_dump(mode="json"))
+        payload = safe_durable_value(source.content())
         payload.update(source_version_kind=version.kind if version else None,
                        source_version_id=version.identifier if version else None)
         payload.update(task_key=self._task(task_key),
@@ -332,7 +332,7 @@ class EvidenceBoard:
     def record_claim(self, claim: ClaimCreate, *, task_key: str,
                      evidence_locator: str | None = None,
                      identity: Mapping[str, str] | None = None) -> dict[str, Any]:
-        payload = safe_durable_value(claim.model_dump(mode="json"))
+        payload = safe_durable_value(claim.content())
         # R4 `identity`: the closed identity dimensions the record stated.  Like
         # `evidence_locator` it is an INTERNAL durable column added by this
         # trusted board -- never a ClaimCreate field, so it never reaches a
@@ -403,7 +403,8 @@ class EvidenceBoard:
             raise EvidenceValidationError("a validated evidence bundle is required")
         bundle = revalidate_evidence_bundle(bundle)
         descriptor = bundle.source
-        source = SourceCreate(agent=descriptor.agent, url=descriptor.url, title=descriptor.title,
+        source = SourceCreate(**self._lease_kwargs,
+                              agent=descriptor.agent, url=descriptor.url, title=descriptor.title,
                               domain=descriptor.domain, source_type=descriptor.source_type,
                               source_strength=descriptor.source_strength,
                               source_date=descriptor.source_date, query=descriptor.query,
@@ -424,7 +425,8 @@ class EvidenceBoard:
         """
         if not isinstance(fact, StructuredEvidenceFact):
             raise EvidenceValidationError("a validated structured evidence fact is required")
-        claim = ClaimCreate(entity_key=fact.entity_key, field_key=fact.field_key,
+        claim = ClaimCreate(**self._lease_kwargs,
+                            entity_key=fact.entity_key, field_key=fact.field_key,
                             value=fact.value, unit=fact.unit, time_scope=dict(fact.time_scope),
                             geography=fact.geography, market=fact.market,
                             source_id=UUID(str(source_row["id"])),
@@ -460,9 +462,11 @@ class EvidenceBoard:
             # conflict on the lowest claim id keeps it insertion-order independent.
             claims = sorted(claims, key=lambda item: UUID(str(item["id"])))
             ids = [UUID(str(item["id"])) for item in claims]
-            conflict = ConflictCreate(entity_key=claims[0]["entity_key"], field_key=claims[0]["field_key"],
+            conflict = ConflictCreate(**self._lease_kwargs,
+                                      entity_key=claims[0]["entity_key"],
+                                      field_key=claims[0]["field_key"],
                                       claim_ids=ids, rationale=rationale)
-            payload = safe_durable_value(conflict.model_dump(mode="json"))
+            payload = safe_durable_value(conflict.content())
             payload.update(task_key=self._task(task_key), evidence_key=_key("conflict", payload))
             row = self._repository.create_conflict(self.lease.run_id, payload, **self._lease_kwargs)
             with self._lock:

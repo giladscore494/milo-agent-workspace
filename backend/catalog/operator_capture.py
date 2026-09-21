@@ -101,42 +101,32 @@ builds `WorkerLease` from what the database returned, and heartbeats through
 the existing guarded RPC. It invents no lease, holds no direct insert, and
 never passes or prints lease material.
 
-But the lease is the WRONG boundary for the question "may an ordinary model
-worker execute this run". `claim_run_lease` predicates its CAS on status,
-worker and lease expiry only -- not on `launch_state`, not on run metadata --
-so it hands a lease to whoever asks first, launcher or operator alike. The
-launch boundary is a DIFFERENT CAS, `try_acquire_launch`, and that is the one
-that decides who owns a run.
+The lease and the launch boundary answer different questions.
 
-**There is no way in this repository to create a run that is not an ordinary
-model run.** Every creation route reaches
-`backend.main._create_and_launch_run`, which creates the run and immediately
-hands it to `JobLauncher.launch()`; the launched worker resolves an engine from
-`project.workflow_key` and runs a model. So an operator needs a supported way
-to make a run no launcher will ever take -- and `--prepare` is it (see
-`_prepare`), through existing repository methods, with no migration, no new
-repository method and no direct table write.
+Console 6 now gives operator capture its own immutable control-plane identity:
+`operator_capture / operator_capture.1`. `--prepare` creates that run through
+the same atomic V3 creator used by product run creation, so message + run +
+immutable identity are committed together. The product worker rejects this
+control-plane workflow BEFORE lease acquisition, while `--execute` requires
+the persisted identity to match the exact current release/policy/event registry
+before it may claim the run.
 
-`--prepare` creates the run the ordinary way and then wins
-`try_acquire_launch` -- the SAME single-statement CAS the ordinary path uses.
-That is the one authoritative transition, and exactly one side can win it:
+Launch ownership remains a separate CAS. A newly prepared capture is born
+`queued/pending`; `--prepare` must win `try_acquire_launch` before it can
+rest the run in `OPERATOR_OWNED_LAUNCH_STATE`:
 
-*   **The operator wins.** The run is rested in `OPERATOR_OWNED_LAUNCH_STATE`,
-    which `try_acquire_launch` cannot acquire from, so
-    `_create_and_launch_run` can never call `JobLauncher.launch()` for it.
-*   **The launcher wins.** `try_acquire_launch` returns `None` to the
-    operator, preparation refuses with `CAPTURE_LAUNCH_OWNERSHIP_LOST`, and
-    the run is left entirely alone -- no claim, no transport, no request, no
-    write.
+*   **The operator wins.** The run is moved to the unlaunchable `none` launch
+    state and only the capture entrypoint may later claim it.
+*   **The launch CAS is not acquired.** Preparation refuses with
+    `CAPTURE_LAUNCH_OWNERSHIP_LOST` and never adopts or rewrites somebody
+    else's run.
 
-An earlier round of this module checked `status`, `launch_state` and the
-marker with a read and then called `claim_run`. That is a read-then-act
-window: the launcher could take the run between the two, and `claim_run` would
-not notice. The window is closed twice over. Eligibility now requires a launch
-state the ordinary path can neither produce nor acquire, and it is re-verified
-on the row `claim_run` ITSELF returned (`returning *`), so the check and the
-claim are one step. The pre-claim read survives only as a cheap early refusal
-for a wrong run id, and nothing depends on it still being true afterwards.
+`claim_run_lease` itself also refuses legacy rows with no immutable identity.
+The capture entrypoint then re-checks the operator-owned launch posture on the
+row returned by the claim, while immutable runtime identity was already proved
+before claim. The pre-claim read is therefore only an early refusal; neither
+engine routing nor ownership is inferred from current project state or request
+metadata.
 
 The marker alone is still not enough, and was never meant to be: a browser
 request's `metadata` reaches `input.metadata`, so a user can put the string on
@@ -181,6 +171,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
+from backend.errors import AppError
 from backend.catalog.execution import CATALOG_EXECUTION_FLAG, catalog_execution_enabled
 from backend.catalog.government import source as src
 from backend.catalog.government.client import DataGovClient
@@ -191,6 +182,14 @@ from backend.catalog.government.source import (GOVERNMENT_SOURCE_REASONS,
                                                GovernmentSourceError)
 from backend.engines.swarm_v2.evidence import WorkerLease
 from backend.errors import AppError
+from backend.event_registry import CAPTURE_SNAPSHOT_REPLAYED
+from backend.finalization import RunFinalizer, TerminalClaim
+from backend.run_identity import (
+    RunIdentity,
+    RunIdentityError,
+    execution_identity_problems,
+    require_identity,
+)
 from backend.production_config import TRUE_VALUES
 from backend.runtime import TERMINAL_STATES, CancellationRequested
 
@@ -301,6 +300,8 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "the lease configuration of this process is not readable",
     "CAPTURE_RUN_NOT_ELIGIBLE":
         "that run is not a prepared operator capture run",
+    "CAPTURE_RUN_IDENTITY_MISMATCH":
+        "the prepared capture run identity does not match this runtime",
     "CAPTURE_RUN_UNAVAILABLE":
         "that run could not be read or claimed",
     "CAPTURE_LAUNCH_OWNERSHIP_LOST":
@@ -925,17 +926,16 @@ def _finalize(repository: Any, lease: WorkerLease, *, document: Mapping[str, Any
     """
     lease_kwargs = {"worker_id": lease.worker_id, "attempt": lease.attempt,
                     "lease_token": lease.lease_token}
+    finalizer = RunFinalizer(repository, lease.run_id, "operator_capture", lease_kwargs)
     try:
         if cancelled:
-            repository.transition_run(lease.run_id, "cancelled",
-                                      expected_worker_id=lease.worker_id,
-                                      expected_attempt=lease.attempt,
-                                      expected_lease_token=lease.lease_token)
+            finalizer.finalize(TerminalClaim.cancelled("operator_capture"))
         elif reason_code:
-            repository.mark_run_failed(lease.run_id, reason_code, safe_message(reason_code),
-                                       **lease_kwargs)
+            finalizer.finalize(TerminalClaim.failure(
+                "operator_capture", reason_code, safe_message(reason_code)))
         else:
-            repository.mark_run_complete(lease.run_id, dict(document), **lease_kwargs)
+            finalizer.finalize(TerminalClaim.control_success(
+                "operator_capture", dict(document)))
     except Exception:
         # Broad and silent for the same reason the heartbeat is: the message
         # may quote the database, and the capture's own outcome is already
@@ -999,14 +999,11 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     `milo_operation` marker, the result satisfied the capture predicate too.
 
     `create_message_and_run` is the contract that fixes it, and repository
-    inspection confirms it rather than assuming it. Migration 012's function
-    (reached through the `create_message_and_run_v2` SETOF wrapper) takes the
-    per-user and per-project advisory locks, performs the idempotency lookup
-    FIRST, and on a hit returns `{'run': ..., 'created': false}` **before
-    inserting anything** -- which also removes the second defect, the orphan
-    preparation message a replay used to leave behind. Otherwise it applies
-    the same admission limits the product applies and inserts the message and
-    the run in ONE transaction, returning `created: true`.
+    inspection confirms it rather than assuming it. Console 6's atomic creator
+    takes the per-user and per-project advisory locks, performs the idempotency
+    lookup FIRST, and on a hit returns `{'run': ..., 'created': false}` before
+    inserting anything. Otherwise it inserts the message, the run and this
+    control-plane run's immutable identity in ONE transaction.
     `MemoryRepository.create_message_and_run` mirrors all of that exactly.
 
     The ownership rule follows directly from that flag:
@@ -1064,14 +1061,34 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     # them. An operator preparation is a real run and does not get to skip the
     # concurrency ceiling the product enforces.
     limits = BudgetConfig.from_env()
+    new_run_id = uuid4()
+    try:
+        prepared_identity = RunIdentity.bind(new_run_id, "operator_capture", env=env)
+    except RunIdentityError:
+        return EXIT_FAILED, _envelope("failed", "CAPTURE_RUN_IDENTITY_MISMATCH")
+    if execution_identity_problems(prepared_identity, env=env):
+        return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
+    run_identity = prepared_identity.as_record()
     try:
         result = repository.create_message_and_run(
             conversation_id, PREPARED_RUN_CONTENT,
             {"milo_operation": OPERATOR_CAPTURE_OPERATION}, requested_by,
             idempotency_key, _preparation_fingerprint(),
-            limits.max_concurrent_runs_per_user, limits.max_concurrent_runs_per_project)
+            limits.max_concurrent_runs_per_user, limits.max_concurrent_runs_per_project,
+            run_id=new_run_id, run_identity=run_identity)
         run = result["run"]
         created = bool(result["created"])
+    except AppError as exc:
+        # The V3 creator settles idempotency inside its own transaction, so a
+        # key already held by a DIFFERENT request is a conflict raised here
+        # rather than a `created=False` replay handled below. Both mean the
+        # same thing -- this idempotency identity belongs to something that is
+        # not this preparation -- and both must read as the specific refusal,
+        # not as a generic preparation failure an operator cannot act on.
+        # Nothing was written either way.
+        if exc.code in {"IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_FINGERPRINT_REQUIRED"}:
+            return EXIT_REFUSED, _envelope("refused", "CAPTURE_IDEMPOTENCY_KEY_IN_USE")
+        return EXIT_FAILED, _envelope("failed", "CAPTURE_PREPARATION_FAILED")
     except Exception:
         return EXIT_FAILED, _envelope("failed", "CAPTURE_PREPARATION_FAILED")
 
@@ -1080,8 +1097,19 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         # Nothing was written by the call above -- the lookup happens before
         # every insert -- and nothing is written here either, in either branch.
         if _run_is_eligible(run):
-            # A genuine replay: the same run, already prepared, already owned
-            # and already at rest. Idempotent, and it re-acquires nothing.
+            try:
+                replay_identity = require_identity(run)
+            except RunIdentityError:
+                return EXIT_REFUSED, _envelope(
+                    "refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
+            if replay_identity.workflow_key != "operator_capture" or execution_identity_problems(
+                replay_identity, env=env
+            ):
+                return EXIT_REFUSED, _envelope(
+                    "refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
+            # A genuine replay only when the already-prepared run is also a
+            # run of this exact runtime. An old-release capture is history,
+            # not a prepared executable for today's process.
             return EXIT_OK, _envelope("prepared", "", preparation=_preparation_document(
                 run_id, already_prepared=True))
         # An ordinary run -- or one already consumed, or one left mid-transition
@@ -1148,6 +1176,17 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_UNAVAILABLE")
     if not _run_is_eligible(run):
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_NOT_ELIGIBLE")
+    try:
+        capture_identity = require_identity(run)
+    except RunIdentityError:
+        return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
+    if capture_identity.workflow_key != "operator_capture" or execution_identity_problems(
+        capture_identity, env=env
+    ):
+        # Identity is immutable, so proving it before the lease cannot become
+        # stale underneath this process. A capture prepared by another release
+        # or policy is history, not executable work for this runtime.
+        return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
 
     worker_id = f"operator-capture-{uuid4()}"
     try:
@@ -1182,10 +1221,12 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     def record_event(event_type: str, _payload: Mapping[str, Any]) -> None:
         """The ingestor's own progress signals, kept in memory and bounded.
 
-        Nothing is written to `run_events` here: these names are not in
-        `backend.runtime.EVENT_TYPES`, and inventing durable events for an
-        operator capture is not this stage's work. Only the type is kept, and
-        only to tell a replay from a first capture in the report.
+        Nothing is written to `run_events` here: these names are the capture
+        vocabulary (`event_registry.CAPTURE_PROGRESS_EVENT_TYPES`), which is
+        declared OUTSIDE the durable acceptance set on purpose, and inventing
+        durable events for an operator capture is not this stage's work. Only
+        the type is kept, and only to tell a replay from a first capture in
+        the report.
         """
         if len(observed) < 64:
             observed.append(str(event_type))
@@ -1213,7 +1254,7 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         return EXIT_FAILED, _envelope("failed", reason)
     supervisor.stop()
 
-    document = capture_document(outcome, replayed="catalog_snapshot_replayed" in observed)
+    document = capture_document(outcome, replayed=CAPTURE_SNAPSHOT_REPLAYED in observed)
     _finalize(repository, lease, document=document, reason_code="", cancelled=False)
     return EXIT_OK, _envelope("succeeded", "", capture=document)
 

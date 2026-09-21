@@ -6,6 +6,7 @@ import pytest
 
 from backend.engines.swarm_v2.evidence import EvidenceBoard, EvidenceValidationError, WorkerLease
 from backend.schemas import ClaimCreate, SourceCreate, ToolUsageCreate
+from tests.worker_fence import FENCE
 
 
 class GuardedEvidenceRepository:
@@ -51,19 +52,19 @@ def board():
 
 
 def source(url="https://example.test/a"):
-    return SourceCreate(agent="worker", url=url, title="Evidence", domain="example.test",
+    return SourceCreate(**FENCE, agent="worker", url=url, title="Evidence", domain="example.test",
                         source_type="primary", source_strength="strong", query="q", tool_operation="search")
 
 
 def claim(source_id, value, *, market="IL", time_scope=None):
-    return ClaimCreate(entity_key="vehicle:1", field_key="price", value=value,
+    return ClaimCreate(**FENCE, entity_key="vehicle:1", field_key="price", value=value,
                        time_scope=time_scope or {"as_of": "2026-08"}, market=market,
                        source_id=source_id, source_strength="strong", confidence=.9, agent="worker")
 
 
 def test_retry_resume_is_idempotent_and_traceable(board):
     evidence, repo = board
-    usage = ToolUsageCreate(grant_id=uuid4(), agent="worker", tool="search", operation="query")
+    usage = ToolUsageCreate(**FENCE, grant_id=uuid4(), agent="worker", tool="search", operation="query")
     assert evidence.record_tool_usage(usage, task_key="task-1")["id"] == evidence.record_tool_usage(usage, task_key="task-1")["id"]
     first = evidence.record_source(source(), task_key="task-1")
     resumed = EvidenceBoard(repo, evidence.lease)
@@ -108,7 +109,7 @@ def test_invalid_source_and_sensitive_reasoning_are_rejected(board):
 
 def test_tool_error_is_reduced_before_sensitive_payload_validation(board):
     evidence, repo = board
-    usage = ToolUsageCreate(grant_id=uuid4(), agent="worker", tool="search", operation="query",
+    usage = ToolUsageCreate(**FENCE, grant_id=uuid4(), agent="worker", tool="search", operation="query",
                             status="failed", error={"code": "TIMEOUT", "provider_detail": "secret sentinel"})
     row = evidence.record_tool_usage(usage, task_key="task")
     assert row["error"] == {"code": "TIMEOUT"}

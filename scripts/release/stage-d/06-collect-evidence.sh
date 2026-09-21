@@ -216,6 +216,7 @@ run_probe "${STAGE_D_DB_PROBE_JOB}" "STAGE_D_MODE=evidence" "STAGE_D_RUN_ID=${RU
   "STAGE_D_EXPECTED_PRIOR_RUNS=${STAGE_D_EXPECTED_PRIOR_RUNS}" \
   "STAGE_D_GOV_CAPTURE_RUN_ID=${STAGE_D_GOV_CAPTURE_RUN_ID}" \
   "STAGE_D_GOV_CAPTURE_KEY=${STAGE_D_GOV_CAPTURE_KEY}" \
+  "STAGE_D_EXPECTED_RUN_IDENTITY=${STAGE_D_EXPECTED_RUN_IDENTITY}" \
   | tee "${STAGE_D_WORKDIR}/evidence.log" || probe_status=$?
 probe_ok "${STAGE_D_WORKDIR}/evidence.log" evidence \
   || fail "DB evidence gate reported failures (see 'failures' in the log above; probe exit=${probe_status})"

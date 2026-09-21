@@ -24,6 +24,7 @@ import {
   smokeEventStream,
   swarmEvent,
 } from './swarmV2Fixture';
+import { identityFor } from './fixtures/runIdentity';
 
 type ViewModelOptions = {
   events?: RunEvent[];
@@ -795,6 +796,14 @@ describe('13/14. Swarm V1 keeps the existing run panel', () => {
   async function openProject(project: typeof V1_PROJECT) {
     const { default: Page } = await import('../app/page');
     apiMocks.api.projects.mockResolvedValue([project]);
+    // A run of this project was BORN with this project's engine identity, and
+    // the workspace picks the surface from the run's identity -- never from
+    // what the project's workflow key says today. Attaching it here keeps each
+    // test's own run fields while making the run a real one.
+    const run = await apiMocks.api.run();
+    apiMocks.api.run.mockResolvedValue({
+      ...run, run_identity: identityFor(project.workflow_key, SMOKE_RUN_ID),
+    });
     const view = render(<Page />);
     fireEvent.click(await screen.findByText(project.name));
     fireEvent.click(await screen.findByText('Kickoff'));

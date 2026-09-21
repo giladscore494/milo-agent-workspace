@@ -11,6 +11,7 @@ from backend.rate_limit import (
     enforce_rate_limit,
     hash_identifier,
 )
+from tests.worker_fence import worker_fence
 
 
 @pytest.fixture(autouse=True)
@@ -146,7 +147,9 @@ def test_worker_route_rate_limits_by_service_identity(monkeypatch):
     try:
         client = TestClient(app)
         headers = {"X-Milo-Worker-Token": "valid-worker-token"}
-        body = {"event_type": "agent_progress", "message": "m"}
+        # Every worker mutation states the run + worker + attempt + lease it
+        # acts under; without it the route refuses before rate limiting.
+        body = {**worker_fence(), "event_type": "agent_progress", "message": "m"}
         assert client.post(f"/internal/runs/{fake.run_id}/events", json=body, headers=headers).status_code == 201
         assert client.post(f"/internal/runs/{fake.run_id}/events", json=body, headers=headers).status_code == 201
         limited = client.post(f"/internal/runs/{fake.run_id}/events", json=body, headers=headers)

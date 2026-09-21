@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from backend.errors import AppError
 from backend.repository.supabase import SupabaseRepository
 
 
@@ -172,46 +173,38 @@ def test_create_user_message_writes_role_column(repo):
     assert payload["metadata"] == {"a": 1}
 
 
-@pytest.mark.parametrize("message_id,expected", [(1, "1"), (98765432101234, "98765432101234"), ("abc-uuid-like", "abc-uuid-like")])
-def test_create_queued_run_stores_message_id_string_in_input(repo, message_id, expected):
-    conversation_id = uuid4()
-    run = repo.create_queued_run(conversation_id, message_id, "go", {})
-    table, payload = repo.client.inserted[0]
-    assert table == "runs"
-    assert payload["input"] == {"message_id": expected, "content": "go", "metadata": {}}
-    assert payload["idempotency_key"] == expected
-    assert payload["status"] == "queued"
-    assert "user_prompt" not in payload
-    UUID(run["id"])  # run ids remain UUID
+@pytest.mark.parametrize("message_id", [1, 98765432101234, "abc-uuid-like", uuid4()])
+def test_the_split_run_creation_writer_refuses_and_inserts_nothing(repo, message_id):
+    """Console 6 makes immutable identity an INSERT-time property.
+
+    A run's message, the run and its identity commit in ONE transaction
+    (`create_message_and_run_v3`), so a direct runs-table INSERT here would be
+    a second creation authority whose only possible outcome under the database
+    trigger is failure -- and a future caller could mistake it for supported.
+    It refuses instead, and writes nothing on any shape of message id.
+    """
+    with pytest.raises(AppError) as raised:
+        repo.create_queued_run(uuid4(), message_id, "go", {})
+    assert raised.value.code == "RUN_IDENTITY_ATOMIC_CREATION_REQUIRED"
+    assert repo.client.inserted == []
 
 
-def test_create_queued_run_accepts_uuid_message_id(repo):
-    message_id = uuid4()
-    repo.create_queued_run(uuid4(), message_id, "go", {})
-    _, payload = repo.client.inserted[0]
-    assert payload["input"]["message_id"] == str(message_id)
-
-
-def test_mark_run_complete_writes_output_column(repo):
+def test_the_legacy_completion_and_failure_verbs_refuse_and_write_nothing(repo):
+    """`mark_run_complete`/`mark_run_failed` are refusal-only compatibility
+    methods now: terminal status and terminal evidence are one atomic write,
+    and only the canonical finalizer may make it."""
     run_id = uuid4()
     repo.client.select_data["runs"] = [{"id": str(run_id), "status": "running"}]
-    repo.mark_run_complete(run_id, {"models": []})
-    table, payload = repo.client.updated[0]
-    assert table == "runs"
-    assert payload["output"] == {"models": []}
-    assert payload["error"] is None
-    assert payload["status"] == "completed"
-    assert "result" not in payload
 
+    with pytest.raises(AppError) as completed:
+        repo.mark_run_complete(run_id, {"models": []})
+    with pytest.raises(AppError) as failed:
+        repo.mark_run_failed(run_id, "ENGINE_FAILED", "boom")
 
-def test_mark_run_failed_writes_error_column(repo):
-    run_id = uuid4()
-    repo.client.select_data["runs"] = [{"id": str(run_id), "status": "running"}]
-    repo.mark_run_failed(run_id, "ENGINE_FAILED", "boom")
-    table, payload = repo.client.updated[0]
-    assert table == "runs"
-    assert payload["error"] == {"code": "ENGINE_FAILED", "message": "boom"}
-    assert "error_message" not in payload
+    assert completed.value.code == "CANONICAL_FINALIZER_REQUIRED"
+    assert failed.value.code == "CANONICAL_FINALIZER_REQUIRED"
+    # Neither refusal touched the row: no half-terminal run, no stray column.
+    assert repo.client.updated == []
 
 
 def test_append_run_event_passes_json_progress_through(repo):

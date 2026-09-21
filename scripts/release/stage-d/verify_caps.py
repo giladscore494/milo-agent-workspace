@@ -232,6 +232,41 @@ def check_engine_limits(worker_env: dict[str, str], worker_secrets: set[str],
             problems.append(f"api: engine variable {key} must NEVER be set on the API service")
 
 
+def check_release_identity(worker_env: dict[str, str], api_env: dict[str, str],
+                           release_sha: str, problems: list[str]) -> None:
+    """Both surfaces must STATE the accepted release they are serving.
+
+    `MILO_RELEASE_SHA` is what `backend/run_identity.py` binds onto every run
+    created by this deployment, and it is the link this chain was missing.
+    Before it, Stage D could prove the accepted source, the policy bytes, the
+    registry digests, the serving revision and the executing job -- and the RUN
+    still recorded no release at all, so nothing tied the run that actually
+    executed to the release that was authorized.
+
+    An UNSET value is a refusal, not a tolerated omission: `release_sha()`
+    treats an absent or malformed value as "this deployment stated no release",
+    the run's identity then records an empty release, and the evidence gate
+    refuses an unpinned run. Catching that here means catching it BEFORE the
+    run is created rather than after it has been paid for.
+    """
+    expected = (release_sha or "").strip().lower()
+    if not expected:
+        # The missing-release case is already reported by the caller.
+        return
+    for surface, env in (("worker", worker_env), ("api", api_env)):
+        actual = (env.get("MILO_RELEASE_SHA") or "").strip().lower()
+        if not actual:
+            problems.append(
+                f"{surface}: MILO_RELEASE_SHA is MISSING — runs created by this "
+                "deployment would record no release, and an unpinned run cannot be "
+                "bound to the accepted release")
+        elif actual != expected:
+            problems.append(
+                f"{surface}: MILO_RELEASE_SHA={actual!r} is not the accepted release "
+                f"{expected!r} — runs would be bound to a release this authorization "
+                "did not accept")
+
+
 def check_provider_secret_posture(worker_env: dict[str, str], worker_secrets: set[str], api_env: dict[str, str], api_secrets: set[str], problems: list[str]) -> None:
     # Worker holds the provider key ONLY as a Secret Manager binding during
     # the enabled posture — never as a literal env value. The API holds it
@@ -354,6 +389,9 @@ def main() -> int:
     # Provider-secret posture: worker binding only, no literals anywhere,
     # nothing on the API.
     check_provider_secret_posture(worker_env, worker_secrets, api_env, api_secrets, problems)
+    # The release the deployment STATES it is serving, which is what every run
+    # it creates records as its own. Verified here, before run creation.
+    check_release_identity(worker_env, api_env, release_sha, problems)
 
     # Flag posture: worker is the sole paid enforcement point.
     if worker_env.get("MILO_ENABLE_PAID_EXECUTION") != ENABLED:

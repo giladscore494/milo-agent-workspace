@@ -9,13 +9,22 @@
 -- anon role, so each revoke is guarded and becomes a no-op there.
 --
 -- Additive, idempotent, data-preserving: privileges only, no schema or data
--- changes, and no grant that did not already exist is created.
+-- changes, and no grant that did not already exist is created. A revoke whose
+-- function a LATER migration has dropped is skipped rather than raising, so
+-- re-running this migration stays safe after Console 6 removes the V1 creator.
 
 do $$
 begin
   if exists (select 1 from pg_roles where rolname = 'anon') then
     revoke execute on function public.create_project_from_proposal_with_owner(uuid, text, text, text, jsonb, uuid) from anon;
-    revoke execute on function public.create_message_and_run(uuid, text, jsonb, uuid, text, text, integer, integer) from anon;
+    -- Console 6 (20260921000200) drops the V1 creator in favour of the atomic
+    -- V3 one, so this revoke has nothing to revoke from on a re-run. This
+    -- migration is declared idempotent, so it must stay a no-op rather than
+    -- error once a later migration has removed its subject.
+    if exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+                where n.nspname = 'public' and p.proname = 'create_message_and_run') then
+      revoke execute on function public.create_message_and_run(uuid, text, jsonb, uuid, text, text, integer, integer) from anon;
+    end if;
     revoke execute on function public.claim_run_lease(uuid, text, integer) from anon;
     revoke execute on function public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text) from anon;
     revoke execute on function public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text) from anon;
@@ -29,7 +38,14 @@ begin
   -- grant was reintroduced out of band.
   if exists (select 1 from pg_roles where rolname = 'authenticated') then
     revoke execute on function public.create_project_from_proposal_with_owner(uuid, text, text, text, jsonb, uuid) from authenticated;
-    revoke execute on function public.create_message_and_run(uuid, text, jsonb, uuid, text, text, integer, integer) from authenticated;
+    -- Console 6 (20260921000200) drops the V1 creator in favour of the atomic
+    -- V3 one, so this revoke has nothing to revoke from on a re-run. This
+    -- migration is declared idempotent, so it must stay a no-op rather than
+    -- error once a later migration has removed its subject.
+    if exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+                where n.nspname = 'public' and p.proname = 'create_message_and_run') then
+      revoke execute on function public.create_message_and_run(uuid, text, jsonb, uuid, text, text, integer, integer) from authenticated;
+    end if;
     revoke execute on function public.claim_run_lease(uuid, text, integer) from authenticated;
     revoke execute on function public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text) from authenticated;
     revoke execute on function public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text) from authenticated;
@@ -39,7 +55,14 @@ begin
   end if;
 
   revoke execute on function public.create_project_from_proposal_with_owner(uuid, text, text, text, jsonb, uuid) from public;
-  revoke execute on function public.create_message_and_run(uuid, text, jsonb, uuid, text, text, integer, integer) from public;
+  -- Console 6 (20260921000200) drops the V1 creator in favour of the atomic
+  -- V3 one, so this revoke has nothing to revoke from on a re-run. This
+  -- migration is declared idempotent, so it must stay a no-op rather than
+  -- error once a later migration has removed its subject.
+  if exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+              where n.nspname = 'public' and p.proname = 'create_message_and_run') then
+    revoke execute on function public.create_message_and_run(uuid, text, jsonb, uuid, text, text, integer, integer) from public;
+  end if;
   revoke execute on function public.claim_run_lease(uuid, text, integer) from public;
   revoke execute on function public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text) from public;
   revoke execute on function public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text) from public;

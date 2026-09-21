@@ -5,6 +5,7 @@ import Page from '../app/page';
 import { ApiError as ApiErrorMock } from '../lib/api';
 import { getCurrentSession } from '../lib/supabaseClient';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { identityFor } from './fixtures/runIdentity';
 
 let mockSession: any = { access_token: 'fresh', user: { email: 'u@example.com' } };
 
@@ -47,7 +48,14 @@ vi.mock('../lib/api', () => ({
 const PROJECT = { id: '677db6c2-b44c-41c1-b4e1-b51229d697df', slug: 'milo-vehicle-catalog', name: 'MILO Vehicle Catalog', workflow_key: 'vehicle_catalog_v1' };
 const OTHER_PROJECT = { id: '9a1d1b02-0b2f-4a5b-9a24-8f0d5a6f4c31', slug: 'beta-catalog', name: 'Beta Catalog', workflow_key: 'vehicle_catalog_v1' };
 const CONVERSATION = { id: '1f90f4ce-7844-4031-91d6-b74e40e1884e', project_id: PROJECT.id, title: 'Kickoff' };
-const RUN = { id: '2c9e2c11-58c8-4b46-b7d5-3d8de9f4b7aa', conversation_id: CONVERSATION.id, status: 'queued' };
+const RUN_ID = '2c9e2c11-58c8-4b46-b7d5-3d8de9f4b7aa';
+// Born with its immutable identity, like every executable run: the workspace
+// reads a loaded run's engine from this and renders nothing engine-specific
+// without it.
+const RUN = {
+  id: RUN_ID, conversation_id: CONVERSATION.id, status: 'queued',
+  run_identity: identityFor(PROJECT.workflow_key, RUN_ID),
+};
 
 describe('authenticated workspace (execution UI disabled)', () => {
   beforeEach(() => {

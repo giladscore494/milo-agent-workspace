@@ -12,6 +12,7 @@ from backend.budget import BudgetConfig, BudgetTracker, GuardedModelClient
 from backend.engines.vehicle_catalog_v1 import core
 from backend.runtime_policy import reviewed_first_run_policy
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
+from backend.run_identity import RunIdentity
 
 
 class FakeClock:
@@ -232,7 +233,13 @@ def test_worker_refuses_invalid_provider_limit_configuration(monkeypatch):
         def __init__(self):
             self.failed = []
             self.conversation_id, self.project_id = uuid4(), uuid4()
-            self.run = {"id": str(uuid4()), "conversation_id": self.conversation_id, "status": "queued", "input": {"content": "x"}, "attempt": 1}
+            run_id = str(uuid4())
+            # Born with its immutable identity: the worker refuses a run without
+            # one before it reads any provider or budget configuration, so a
+            # fake without it never reaches the refusal this test is about.
+            self.run = {"id": run_id, "conversation_id": self.conversation_id,
+                        "status": "queued", "input": {"content": "x"}, "attempt": 1,
+                        "run_identity": RunIdentity.bind(run_id, "vehicle_catalog_v1").as_record()}
 
         def get_conversation(self, conversation_id):
             return {"id": conversation_id, "project_id": self.project_id}
@@ -248,6 +255,13 @@ def test_worker_refuses_invalid_provider_limit_configuration(monkeypatch):
 
         def append_run_event(self, run_id, event_type, payload, worker_id=None, attempt=None, lease_token=None):
             return {"id": 1}
+
+        def finalize_run(self, run_id, status, expected_status, event=None, *,
+                         worker_id, attempt, lease_token, **fields):
+            # The worker's only terminal write. A fake without it cannot close
+            # a run at all -- there is no fallback to fall back to.
+            self.failed.append((fields.get("error") or {}).get("code"))
+            return dict(self.run, status=status, **fields)
 
         def mark_run_failed(self, run_id, code, message, worker_id=None, attempt=None, lease_token=None):
             self.failed.append(code)

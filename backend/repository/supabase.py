@@ -20,8 +20,22 @@ class Repository(Protocol):
     def list_conversations(self, project_id: UUID) -> list[dict[str, Any]]: ...
     def get_conversation(self, conversation_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def create_user_message(self, conversation_id: UUID, content: str, metadata: dict[str, Any]) -> dict[str, Any]: ...
-    def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]: ...
-    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]: ...
+    def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]:
+        """Refuse the superseded split run-creation primitive.
+
+        Console 6 makes immutable identity an INSERT-time property. Production
+        run creation must therefore go through create_message_and_run_v3, which
+        inserts message + run + identity in one transaction. Keeping a direct
+        runs-table INSERT here would be a second writer whose only possible
+        outcome under the database trigger is failure, and a future caller
+        could mistake it for a supported creation authority.
+        """
+        raise AppError(
+            "RUN_IDENTITY_ATOMIC_CREATION_REQUIRED",
+            "queued runs must be created atomically with immutable identity",
+            503,
+        )
+
     def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None: ...
     def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]: ...
     def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None: ...
@@ -30,6 +44,7 @@ class Repository(Protocol):
     def update_run_usage(self, run_id: UUID, usage: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def record_run_usage(self, run_id: UUID, ledger: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def get_run_usage_ledger(self, run_id: UUID) -> dict[str, Any] | None: ...
+    def append_usage_ledger(self, entry: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -46,8 +61,8 @@ class Repository(Protocol):
     def get_workflow_proposal(self, proposal_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
     def update_workflow_proposal(self, proposal_id: UUID, fields: dict[str, Any]) -> dict[str, Any]: ...
     def create_project_from_proposal(self, proposal_id: UUID, slug: str, name: str, description: str | None, configuration: dict[str, Any], created_by: UUID | None = None) -> dict[str, Any]: ...
-    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]: ...
-    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]: ...
+    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def create_tool_usage(self, run_id: UUID, usage: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def create_source(self, run_id: UUID, source: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def create_claim(self, run_id: UUID, claim: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
@@ -189,33 +204,20 @@ class SupabaseRepository:
         return self._single(self.client.table("messages").insert(payload).select("*"), "message", "new")
 
     def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]:
-        # Production messages.id is bigint; run input stores its string form.
-        key = idempotency_key or metadata.get("idempotency_key") or metadata.get("proposal_id") or str(user_message_id)
-        payload = {
-            "conversation_id": str(conversation_id),
-            "status": "queued",
-            "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata},
-            "idempotency_key": key,
-            "launch_state": "pending",
-        }
-        if requested_by is not None:
-            payload["requested_by"] = str(requested_by)
-        if request_fingerprint is not None:
-            payload["request_fingerprint"] = request_fingerprint
-        if requested_by is not None and idempotency_key:
-            existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
-            if existing is not None:
-                return existing
-        try:
-            return self._single(self.client.table("runs").insert(payload).select("*"), "run", "new")
-        except AppError as exc:
-            # Unique (conversation, requested_by, idempotency_key) index may
-            # reject a concurrent duplicate; return the winner instead.
-            if requested_by is not None and idempotency_key and ("23505" in exc.message or "duplicate" in exc.message.lower()):
-                existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
-                if existing is not None:
-                    return existing
-            raise
+        """Refuse the superseded split run-creation primitive.
+
+        Console 6 makes immutable identity an INSERT-time property. Production
+        run creation must therefore go through create_message_and_run_v3, which
+        inserts message + run + identity in one transaction. Keeping a direct
+        runs-table INSERT here would be a second writer whose only possible
+        outcome under the database trigger is failure, and a future caller
+        could mistake it for a supported creation authority.
+        """
+        raise AppError(
+            "RUN_IDENTITY_ATOMIC_CREATION_REQUIRED",
+            "queued runs must be created atomically with immutable identity",
+            503,
+        )
 
     def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None:
         rows = self._many(
@@ -227,12 +229,12 @@ class SupabaseRepository:
         )
         return rows[0] if rows else None
 
-    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]:
-        """Transactionally create the user message + queued run (migration
-        012): idempotent replay, concurrency admission and both inserts
-        happen in ONE database transaction under advisory locks."""
+    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None, *, run_id: UUID, run_identity: dict[str, Any]) -> dict[str, Any]:
+        """Atomically create the message, queued run and immutable identity."""
         try:
-            response = self.client.rpc("create_message_and_run_v2", {
+            response = self.client.rpc("create_message_and_run_v3", {
+                "p_run_id": str(run_id),
+                "p_run_identity": run_identity,
                 "p_conversation_id": str(conversation_id),
                 "p_content": content,
                 "p_metadata": metadata,
@@ -250,6 +252,23 @@ class SupabaseRepository:
                 raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429) from exc
             if "CONVERSATION_NOT_FOUND" in message:
                 raise NotFoundError("conversation", str(conversation_id)) from exc
+            if "IDEMPOTENCY_CONFLICT" in message:
+                raise AppError(
+                    "IDEMPOTENCY_CONFLICT",
+                    "idempotency key was already used with a different payload",
+                    409,
+                ) from exc
+            if "IDEMPOTENCY_FINGERPRINT_REQUIRED" in message:
+                raise AppError(
+                    "IDEMPOTENCY_FINGERPRINT_REQUIRED",
+                    "run creation requires a request fingerprint",
+                    409,
+                ) from exc
+            if "RUN_IDENTITY_WORKFLOW_DRIFT" in message:
+                raise AppError("RUN_IDENTITY_WORKFLOW_DRIFT",
+                               "project workflow changed before the run could be created", 409) from exc
+            if "RUN_IDENTITY_INVALID" in message or "RUN_IDENTITY_REQUIRED" in message:
+                raise AppError("RUN_IDENTITY_INVALID", "run identity was rejected", 409) from exc
             raise AppError("REPOSITORY_ERROR", message, 502) from exc
         data = response.data
         if isinstance(data, list):
@@ -334,9 +353,27 @@ class SupabaseRepository:
         "actual_input_tokens", "actual_output_tokens", "estimated_cost", "actual_cost",
     )
 
-    def append_usage_ledger(self, entry: dict[str, Any]) -> dict[str, Any]:
-        payload = {key: entry[key] for key in self.LEDGER_FIELDS if entry.get(key) is not None}
-        return self._single(self.client.table("run_usage_ledger").insert(payload).select("*"), "run_usage_ledger", "new")
+    def append_usage_ledger(self, entry: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Append ONE per-call ledger row, under the worker's lease.
+
+        This was the last unfenced durable write a running worker performed:
+        every other usage surface (runs.usage, run_execution_usage) has been
+        lease-guarded since migration 20260920000100, but the per-call rows the
+        DAILY budget is summed from went straight into the table. A replaced
+        worker could therefore keep charging a run it no longer owned, against
+        the live worker's daily allowance.
+
+        The run id travels as the FENCED argument, not as a payload field, so
+        an entry naming another run cannot charge one.
+        """
+        run_id = entry.get("run_id")
+        if not run_id:
+            raise AppError("REPOSITORY_ERROR", "a usage ledger entry requires its run id", 502)
+        payload = {key: entry[key] for key in self.LEDGER_FIELDS
+                   if key != "run_id" and entry.get(key) is not None}
+        params = {**self._lease_params(UUID(str(run_id)), worker_id, attempt, lease_token),
+                  "p_entry": payload}
+        return self._guarded_rpc("append_usage_ledger_guarded", params, "run_usage_ledger")
 
     def sum_daily_ledger_cost(self, user_id: str | None = None, project_id: str | None = None, run_id: str | None = None, hours: int = 24) -> float:
         """Conservative daily spend: per call, the settled actual cost when
@@ -526,6 +563,12 @@ class SupabaseRepository:
     WORKER_TRANSITION_FIELDS = {"output", "error", "usage", "started_at", "finished_at"}
 
     def transition_run(self, run_id: UUID, status: str, expected_worker_id: str | None = None, expected_attempt: int | None = None, expected_lease_token: str | None = None, **fields: Any) -> dict[str, Any]:
+        if status in TERMINAL_STATES:
+            raise AppError(
+                "CANONICAL_FINALIZER_REQUIRED",
+                "terminal run states must be written through the canonical finalizer",
+                409,
+            )
         current = str(self.get_run(run_id).get("status", ""))
         # Same-status updates (heartbeats, metadata refresh) are no-op
         # transitions; unknown legacy statuses bypass validation so legacy
@@ -654,10 +697,18 @@ class SupabaseRepository:
         return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=datetime.now(UTC).isoformat(), cancellation_reason=reason)
 
     def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "failed", expected_worker_id=worker_id, expected_attempt=attempt, expected_lease_token=lease_token, error={"code": code, "message": message}, finished_at=datetime.now(UTC).isoformat())
+        raise AppError(
+            "CANONICAL_FINALIZER_REQUIRED",
+            "run failure must be written through the canonical finalizer",
+            409,
+        )
 
     def mark_run_complete(self, run_id: UUID, output: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "completed", expected_worker_id=worker_id, expected_attempt=attempt, expected_lease_token=lease_token, output=output, error=None, finished_at=datetime.now(UTC).isoformat())
+        raise AppError(
+            "CANONICAL_FINALIZER_REQUIRED",
+            "run completion must be written through the canonical finalizer",
+            409,
+        )
 
     def create_workflow_proposal(self, user_request: str, proposal: dict[str, Any], project_id: UUID | None = None, created_by: UUID | None = None) -> dict[str, Any]:
         payload = {"user_request": user_request, **proposal}
@@ -752,15 +803,24 @@ class SupabaseRepository:
     def list_supervisor_decisions(self, run_id: UUID) -> list[dict[str, Any]]:
         return self._many(self.client.table("supervisor_decisions").select("*").eq("run_id", str(run_id)).order("created_at"))
 
-    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any]) -> dict[str, Any]:
-        payload = {"run_id": str(run_id), **request}
-        return self._single(self.client.table("tool_access_requests").insert(payload).select("*"), "tool_access_request", "new")
+    def create_tool_access_request(self, run_id: UUID, request: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Lease-guarded (migration 20260921000200).
 
-    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any]) -> dict[str, Any]:
-        payload = {"run_id": str(run_id), **grant}
-        if payload.get("request_id"):
-            self.client.table("tool_access_requests").update({"status": "granted"}).eq("id", str(payload["request_id"])).execute()
-        return self._single(self.client.table("tool_grants").insert(payload).select("*"), "tool_grant", "new")
+        This was a direct table insert on behalf of a worker, so a replaced
+        worker could still open tool access on a run it no longer owned.
+        """
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_request": request}
+        return self._guarded_rpc("create_tool_access_request_guarded", params, "tool_access_request")
+
+    def create_tool_grant(self, run_id: UUID, grant: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Lease-guarded (migration 20260921000200).
+
+        The unfenced version mutated TWO tables -- the grant insert and the
+        referenced request's status -- in two separate unfenced statements.
+        The guarded RPC does both inside one function body, under the lease.
+        """
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_grant": grant}
+        return self._guarded_rpc("create_tool_grant_guarded", params, "tool_grant")
 
     @staticmethod
     def _lease_params(run_id: UUID, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:

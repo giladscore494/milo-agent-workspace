@@ -146,7 +146,7 @@ stage_d_pin STAGE_D_PROBE_IMAGE_DIGEST "sha256:78387bc3881b8273120a12ebe6c1ab22b
 # Regenerate deliberately, in a reviewed commit, after an intended change:
 #   sha256sum scripts/release/stage-d/probe_db.py scripts/release/stage-d/probe_gateway.py
 # ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_PROBE_DB_SHA256 "27031d77bc554ca2440db114f3938284edf39c55912048b89ff5a4823acbf427"
+stage_d_pin STAGE_D_PROBE_DB_SHA256 "d3ce221d90da5f08223b5e96bb12df384789e38409fb977689590b74f3db8a5a"
 stage_d_pin STAGE_D_PROBE_GW_SHA256 "359d7cbfc7195f9fee333480af0f7fe1ae09ca8ce339a0a7942bfe823dde4bce"
 
 # ---------------------------------------------------------------------------
@@ -326,3 +326,18 @@ stage_d_pin STAGE_D_AUTHORIZED_EXECUTION_INCREMENT "$(stage_d_policy execution-i
 # to be the release commit: a reviewed authorization commit references a
 # release without being it.
 stage_d_pin STAGE_D_POLICY_FINGERPRINT "$(stage_d_policy fingerprint)"
+
+# The identity dimensions every run of this release must carry, generated from
+# the same policy document. This closes the last open link in the release
+# chain: Stage D proved the accepted source, the policy bytes, the image
+# digests and the executing job, and said NOTHING about the run -- a run
+# recorded no policy, no release and no engine of its own, and re-derived its
+# engine from a project row at claim time. `probe_db.py`'s evidence gate now
+# compares the authorized run's PERSISTED identity (runs.run_identity,
+# migration 20260921000200) with this pin, and refuses a run that is not a run
+# of this release.
+#
+# It carries STAGE_D_RELEASE_SHA, which is the ACCEPTED RELEASE, not this
+# checkout's HEAD: a reviewed authorization commit references a release
+# without being it, exactly as the policy binding already allows.
+stage_d_pin STAGE_D_EXPECTED_RUN_IDENTITY "$(stage_d_policy run-identity)"

@@ -19,6 +19,34 @@ visible rather than flattening it:
   durable status can never disagree. Nothing rewrites, summarizes or re-judges
   the payload itself.
 
+WHICH ENGINE a run was is READ, never inferred
+----------------------------------------------
+
+This projection used to decide the engine like this::
+
+    engine = str((run.get("input") or {}).get("workflow_key")
+                 or run.get("workflow_key") or "vehicle_catalog_v1")
+
+Three separate defects in one expression. The first source is the run's own
+``input`` -- the request metadata the CALLER supplied -- so a caller who put a
+``workflow_key`` in their metadata chose what the exported run claimed to be.
+The second names a column that does not exist. The third is the one that
+mattered: a Swarm V2 run whose input did not happen to name its workflow
+exported as ``vehicle_catalog_v1``, and was then classified by V1's outcome
+rules -- a V2 run, documented as a V1 one, with a V1 reading of its product.
+
+The engine now comes from the run's IMMUTABLE IDENTITY
+(:mod:`backend.run_identity`), bound at creation from the trusted project
+relation and unchangeable afterwards. There is no fallback and no inference
+from output shape, checkpoint contents or event history. A run whose identity
+is absent (created before identities existed) or unreadable is REFUSED, with a
+bounded reason: an export is a document that will be read as authoritative, and
+a guessed engine in one is worse than no document at all.
+
+The envelope carries the identity's release and policy dimensions too, so an
+exported run states which reviewed runtime envelope and which release admitted
+it rather than leaving a reader to assume today's.
+
 Terminal honesty is the point of the ``terminal_status`` field. A Cloud Run
 process exiting zero is not a product result, and neither is a timeout or a
 cancellation: those stay distinct from ``completed`` and from
@@ -29,6 +57,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any, Mapping
+
+from backend.run_identity import (PRODUCT_WORKFLOW_KEYS, RunIdentity,
+                                  RunIdentityError, require_identity)
 
 SCHEMA_VERSION = "milo-run-export/1"
 
@@ -88,8 +119,22 @@ def build_export_envelope(run: Mapping[str, Any], *,
     status = run.get("status")
     if status not in TERMINAL_STATES:
         raise ExportRefused("only a run in a terminal state can be exported")
-    engine = str((run.get("input") or {}).get("workflow_key")
-                 or run.get("workflow_key") or "vehicle_catalog_v1")
+    try:
+        identity = require_identity(run)
+    except RunIdentityError as exc:
+        # Bounded and static: the refusal names the failure class, never the
+        # offending record. Every branch here is a refusal -- there is
+        # deliberately no engine to fall back to.
+        raise ExportRefused(
+            f"the run's engine identity cannot be established ({exc.code})") from exc
+    engine = identity.workflow_key
+    if engine not in PRODUCT_WORKFLOW_KEYS:
+        raise ExportRefused("run identity is not an exportable product workflow")
+    if not identity.release_sha:
+        # An authoritative export must state which immutable release admitted
+        # the run. Historical/unpinned identities remain readable as history
+        # but are not exportable as release-bound product documents.
+        raise ExportRefused("run identity is not bound to an immutable release")
     output = run.get("output")
 
     result_kind: str | None = None
@@ -112,6 +157,11 @@ def build_export_envelope(run: Mapping[str, Any], *,
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "engine": engine,
+        # The whole identity, copied verbatim from the run. An exported run
+        # states which engine version, which reviewed policy envelope and which
+        # release it was admitted under; none of it is recomputed here, so an
+        # export cannot describe a policy or a release the run never ran under.
+        "run_identity": identity.as_record(),
         "terminal_status": status,
         "result_kind": result_kind,
         "generated_at": (generated_at or datetime.now(UTC)).isoformat(),
@@ -126,8 +176,9 @@ def validate_export_envelope(envelope: Any) -> None:
     """Refuse an envelope that is not exactly what this module produces."""
     if not isinstance(envelope, Mapping):
         raise ExportRefused("envelope must be a mapping")
-    required = {"schema_version", "run_id", "engine", "terminal_status",
-                "result_kind", "generated_at", "government_provenance", "result"}
+    required = {"schema_version", "run_id", "engine", "run_identity",
+                "terminal_status", "result_kind", "generated_at",
+                "government_provenance", "result"}
     missing = required - set(envelope)
     if missing:
         raise ExportRefused(f"envelope is missing required fields: {sorted(missing)}")
@@ -148,6 +199,18 @@ def validate_export_envelope(envelope: Any) -> None:
         raise ExportRefused("a non-product terminal status cannot carry a result kind")
     if not isinstance(envelope["government_provenance"], Mapping):
         raise ExportRefused("government provenance must be an object")
+    # The identity must still read as one, and it must still be the identity of
+    # the engine this envelope claims. An envelope whose two statements about
+    # which engine ran disagree is exactly the misclassification this validator
+    # exists to catch.
+    try:
+        identity = RunIdentity.from_record(envelope["run_identity"],
+                                           run_id=envelope["run_id"])
+    except RunIdentityError as exc:
+        raise ExportRefused(
+            f"the envelope's run identity is not a valid one ({exc.code})") from exc
+    if identity.workflow_key != envelope["engine"]:
+        raise ExportRefused("the envelope's engine and its run identity disagree")
 
 
 __all__ = ["ExportRefused", "NON_PRODUCT_TERMINAL_STATES", "SCHEMA_VERSION",

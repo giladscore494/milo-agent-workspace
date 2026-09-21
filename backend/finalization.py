@@ -38,19 +38,13 @@ them with one mechanism that answers three questions in one place.
    operator got there first -- is adopted rather than rewritten.
 
 4. WHEN may the decision be CLAIMED?  Only once it has durably won. The
-   terminal state is written first, under the lease and under a
-   compare-and-set on the state the decision was taken under; the terminal
-   event -- the only place the canonical ProductOutcome is recorded, and the
-   place Stage D reads it from -- is recorded after that write has won, never
-   before. Where the repository offers the atomic primitive
-   (``finalize_run``, migration 20260920000200) the two commit in one
-   transaction; otherwise the event follows the write, and a failure to record
-   a product's evidence is surfaced as ``TerminalEvidenceUnavailable`` rather
-   than hidden. So no ``run_completed`` and no ProductOutcome can exist for a
-   decision that did not become the run's durable state, and a cancellation
-   that lands between the decision and the write wins: the run is re-read
-   once, decided again under the state that actually holds, and both the
-   status and the event say ``cancelled``.
+   canonical ``finalize_run`` primitive (migration 20260920000200) commits
+   the terminal state and its terminal event in ONE lease-guarded,
+   compare-and-set transaction. There is no split persistence fallback. So no
+   ``run_completed`` and no ProductOutcome can exist for a decision that
+   did not become the run's durable state. If the state moves before the
+   atomic commit, the run is re-read once and the decision is re-evaluated
+   under the state that actually holds.
 
 Fencing is unchanged and still the outer boundary: every durable write carries
 the active lease, so a worker that lost its lease cannot terminalize at all.
@@ -109,12 +103,13 @@ _TERMINAL_EVENT: Mapping[str, str] = {
 
 #: The reasons a claim can exist. The reason is what the caller knows; the
 #: status is what this module decides.
-CLAIM_REASONS = ("product", "cancelled", "budget_stop", "failure", "refusal")
+CLAIM_REASONS = ("product", "control_success", "cancelled", "budget_stop", "failure", "refusal")
 
 #: Reason -> durable status, for the reasons whose status does not depend on a
 #: product outcome. ``product`` and ``budget_stop`` are absent: the first is
 #: derived from the canonical outcome, the second from the stop itself.
 _STATUS_OF_REASON: Mapping[str, str] = {
+    "control_success": "completed",
     "cancelled": "cancelled",
     "failure": "failed",
     "refusal": "failed",
@@ -134,14 +129,12 @@ class FinalizationUnavailable(AppError):
 
 
 class TerminalEvidenceUnavailable(AppError):
-    """The run is durably terminal, but its terminal event could not be recorded.
+    """Compatibility error type for historical callers.
 
-    Raised only on the fallback (non-atomic) path, and only for a PRODUCT
-    claim, whose canonical ProductOutcome lives on that event and nowhere
-    else. The run's state is the truth and stays; what failed is the job's
-    duty to record what it produced, and Stage D refuses a product-terminal
-    run that carries no recorded outcome (fail closed), so this is surfaced
-    rather than swallowed. A relaunch finds the run terminal and exits 0.
+    Current Console 6 persistence is atomic-only, so a successful terminal
+    write cannot commit without its terminal event. The class remains exported
+    to avoid an unnecessary API break, but the current persistence path does
+    not intentionally raise it.
     """
 
     def __init__(self, message: str) -> None:
@@ -205,6 +198,18 @@ class TerminalClaim:
             outcome = outcome.demoted_with(extra_blocking)
         return cls(reason="product", outcome=outcome, output=output,
                    event_payload=event_payload)
+
+    @classmethod
+    def control_success(cls, engine: str, output: Any) -> "TerminalClaim":
+        """A trusted non-product control-plane operation completed.
+
+        It may carry a durable output document, but it deliberately records no
+        ProductOutcome: model/product semantics do not apply to operator
+        capture runs. The canonical Finalizer still owns the terminal status,
+        lease fencing and atomic terminal event.
+        """
+        return cls(reason="control_success", outcome=not_produced_outcome(engine),
+                   output=output)
 
     @classmethod
     def cancelled(cls, engine: str, *, code: str = "RUN_CANCELLED",
@@ -286,9 +291,8 @@ class FinalizationResult:
     #: The run was already terminal in the database when this call ran.
     already_terminal: bool = False
     #: The terminal event this decision owes (the canonical ProductOutcome, for
-    #: a product) is durably recorded. Always true on the atomic path, where
-    #: it commits with the transition; on the fallback path it can be false,
-    #: and a product claim then raises TerminalEvidenceUnavailable.
+    #: a product) is durably recorded. Current persistence is atomic-only, so
+    #: this is true for every successful write.
     evidence_recorded: bool = True
 
     @property
@@ -311,7 +315,6 @@ class RunFinalizer:
     run_id: UUID
     engine: str
     lease_ctx: Mapping[str, Any]
-    event_sink: Any = None
     observer: Callable[[str, dict[str, Any]], None] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _decision: TerminalClaim | None = field(default=None, init=False, repr=False)
@@ -459,13 +462,11 @@ class RunFinalizer:
 
         The order is the whole point. The terminal state is written FIRST,
         under the lease and under a compare-and-set on the state the decision
-        was taken under; the terminal event that claims the decision is
-        recorded only once that write has won. So no `run_completed` and no
-        ProductOutcome can ever exist for a decision that did not become the
-        run's durable state. Where the repository offers the atomic primitive
-        (`finalize_run`, migration 20260920000200) the two are one
-        transaction; otherwise the event follows the write and a failure to
-        record it is surfaced, never hidden.
+        was taken under. The canonical `finalize_run` primitive
+        (migration 20260920000200) commits that state and its terminal event in
+        one transaction; there is no split fallback. So no `run_completed`
+        and no ProductOutcome can ever exist for a decision that did not become
+        the run's durable state.
 
         A rejected write means the world moved between the read and the
         write. The run is re-read ONCE: a terminal state another path won is
@@ -508,26 +509,23 @@ class RunFinalizer:
 
     def _persist(self, claim: TerminalClaim, status: str,
                  observed: str | None) -> bool:
-        """Write the terminal state, then record its event. Returns whether
-        the event this decision owes is durably recorded."""
+        """Atomically commit terminal state and the event this decision owes."""
         event = self._terminal_event(claim, status)
         atomic = getattr(self.repo, "finalize_run", None)
-        if callable(atomic):
-            expected = observed if observed is not None else self._observed_status()
-            if expected is None:
-                raise FinalizationUnavailable(
-                    "run state could not be read; refusing to finalize blind")
-            atomic(self.run_id, status, expected, event, **self._lease_kwargs(),
-                   **self._terminal_fields(claim))
-            self._observe(event)
-            return True
-        # Fallback for repositories without the atomic primitive: the state
-        # first, the event only after the state has won.
-        self._write(claim, status)
-        recorded = self._append_terminal_event(event)
-        if recorded:
-            self._observe(event)
-        return recorded
+        if not callable(atomic):
+            # Console 3 made terminal state + terminal evidence one atomic
+            # authority. Falling back to a transition followed by an event
+            # recreates the split-brain terminalization path it removed.
+            raise FinalizationUnavailable(
+                "atomic terminal finalization is unavailable")
+        expected = observed if observed is not None else self._observed_status()
+        if expected is None:
+            raise FinalizationUnavailable(
+                "run state could not be read; refusing to finalize blind")
+        atomic(self.run_id, status, expected, event, **self._lease_kwargs(),
+               **self._terminal_fields(claim))
+        self._observe(event)
+        return True
 
     def _terminal_event(self, claim: TerminalClaim, status: str) -> dict[str, Any] | None:
         """The event this decision owes, or None when it owes none.
@@ -567,46 +565,6 @@ class RunFinalizer:
             # decision that is already durable.
             pass
 
-    def _append_terminal_event(self, event: dict[str, Any] | None) -> bool:
-        """Record the terminal event after the state has won (fallback path).
-
-        Idempotent and bounded: an append that raised may still have
-        committed, so before the one retry the event stream is re-read, and
-        without a way to re-read it there is no retry -- a duplicate terminal
-        claim would be its own integrity problem.
-        """
-        if event is None:
-            return True
-        if self.event_sink is None:
-            # No sink means this finalizer is not the evidence recorder
-            # (harness use); the worker always supplies one.
-            return True
-        record = RunEventRecord(run_id=self.run_id, type=event["type"],
-                                message=event["message"], payload=event["payload"])
-        try:
-            self.event_sink.emit(record)
-            return True
-        except Exception:
-            pass
-        if self._terminal_event_exists(event["type"]):
-            return True
-        if not callable(getattr(self.repo, "list_run_events", None)):
-            return False
-        try:
-            self.event_sink.emit(record)
-            return True
-        except Exception:
-            return self._terminal_event_exists(event["type"])
-
-    def _terminal_event_exists(self, event_type: str) -> bool:
-        lister = getattr(self.repo, "list_run_events", None)
-        if not callable(lister):
-            return False
-        try:
-            return any(item.get("event_type") == event_type
-                       for item in lister(self.run_id))
-        except Exception:
-            return False
 
     def _terminal_fields(self, claim: TerminalClaim) -> dict[str, Any]:
         fields: dict[str, Any] = {"finished_at": datetime.now(UTC).isoformat()}
@@ -616,36 +574,6 @@ class RunFinalizer:
         if claim.usage is not None:
             fields["usage"] = claim.usage
         return fields
-
-    def _write(self, claim: TerminalClaim, status: str) -> None:
-        """The terminal state through the legacy verbs (fallback path)."""
-        transition = getattr(self.repo, "transition_run", None)
-        if status == "completed":
-            # Preserved as the repository's own completion verb; it is
-            # ``transition_run(completed, ...)`` underneath.
-            marker = getattr(self.repo, "mark_run_complete", None)
-            if not callable(marker):
-                raise FinalizationUnavailable("terminal run completion is unavailable")
-            marker(self.run_id, claim.output, **self._lease_kwargs())
-            return
-        if status == "failed" and claim.output is None:
-            marker = getattr(self.repo, "mark_run_failed", None)
-            if not callable(marker):
-                raise FinalizationUnavailable("terminal run failure is unavailable")
-            error = claim.error or {"code": "RUN_FAILED", "message": "run failed"}
-            marker(self.run_id, error["code"], error["message"], **self._lease_kwargs())
-            return
-        if not callable(transition):
-            # Never silently downgrade to "completed" because the repository
-            # cannot express this status: recording an unusable, cancelled or
-            # stopped run as a success is the exact defect this module exists
-            # to prevent.
-            raise FinalizationUnavailable("terminal run transition is unavailable")
-        transition(self.run_id, status,
-                   expected_worker_id=self.lease_ctx.get("worker_id"),
-                   expected_attempt=self.lease_ctx.get("attempt"),
-                   expected_lease_token=self.lease_ctx.get("lease_token"),
-                   **self._terminal_fields(claim))
 
     def _lease_kwargs(self) -> dict[str, Any]:
         return {"worker_id": self.lease_ctx.get("worker_id"),

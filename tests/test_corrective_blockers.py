@@ -10,6 +10,7 @@ from backend.errors import AppError
 from backend.model_pricing import calculate_model_cost
 from backend.testing.memory_repository import MemoryRepository
 from backend.worker.main import execute_run
+from backend.run_identity import RunIdentity
 
 
 class CompleteEngine:
@@ -29,7 +30,15 @@ def test_cancelled_before_start_emits_no_run_started_or_engine_call(monkeypatch)
     conversation = repo.create_conversation(project_id, "Cancel fixture")
     run_id = uuid4()
     conversation_id = conversation["id"]
-    repo.runs[str(run_id)] = {"id": str(run_id), "conversation_id": str(conversation_id), "status": "cancellation_requested", "input": {"content": "x"}, "attempt": 1}
+    # A run already carrying a cancellation request, and -- like every run the
+    # product creates -- born with its immutable identity. Without one the
+    # worker refuses before it can observe the cancellation at all.
+    repo.projects[str(project_id)]["workflow_key"] = "vehicle_catalog_v1"
+    repo.runs[str(run_id)] = {
+        "id": str(run_id), "conversation_id": str(conversation_id),
+        "status": "cancellation_requested", "input": {"content": "x"}, "attempt": 1,
+        "run_identity": RunIdentity.bind(run_id, "vehicle_catalog_v1").as_record(),
+    }
     engine = CompleteEngine()
     assert execute_run(run_id, repo, engine=engine) == 0
     assert engine.calls == 0

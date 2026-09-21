@@ -34,6 +34,13 @@ const backendEnv = {
   SUPABASE_URL: 'https://example.supabase.co',
   SUPABASE_SERVICE_ROLE_KEY: 'e2e-offline-placeholder',
   JOB_LAUNCHER: 'disabled',
+  // Console 6 binds a release into every executable run identity, and an
+  // absent MILO_RELEASE_SHA is a refusal rather than a wildcard: without one
+  // the API refuses run creation with RUN_IDENTITY_RUNTIME_MISMATCH before a
+  // row is written. The E2E stack is a complete runtime, so it states a
+  // release exactly as a deployment does. Both stacks state the SAME one:
+  // the in-process worker must match the API that admitted the run.
+  MILO_RELEASE_SHA: '84cd8696119c24662a954d0f0e23195268dab23f',
   // Gateway identity verification is ON in both stacks: the Next.js
   // gateway presents its (mock-verified) service token, and identity
   // headers are never trusted bare.

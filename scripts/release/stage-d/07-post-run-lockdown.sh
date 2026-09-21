@@ -62,8 +62,9 @@ if [ -n "${STAGE_D_WORKDIR:-}" ] && [ -r "${STAGE_D_WORKDIR}/state.json" ]; then
   recorded_conversation_id="$(python3 ./state_file.py "${STAGE_D_WORKDIR}/state.json" read conversation_id)"
 fi
 
-# The probe REQUIRES both recorded identity fields before it will touch any
-# run candidate, recorded or recovered; the lockdown never types them in.
+# The probe REQUIRES both recorded identity fields -- and the release's pinned
+# run identity, forwarded below -- before it will touch any run candidate,
+# recorded or recovered; the lockdown never types them in.
 # Say so here when they are absent, so a refusal is explicable from this
 # output alone. The probe remains the enforcement point.
 if [ -z "${recorded_user_id}" ] || [ -z "${recorded_conversation_id}" ]; then
@@ -92,6 +93,7 @@ if [ "${db_probe_present}" -eq 1 ]; then
     "STAGE_D_IDEMPOTENCY_KEY=${STAGE_D_IDEMPOTENCY_KEY}" \
     "STAGE_D_EXPECTED_USER_ID=${recorded_user_id}" \
     "STAGE_D_EXPECTED_CONVERSATION_ID=${recorded_conversation_id}" \
+    "STAGE_D_EXPECTED_RUN_IDENTITY=${STAGE_D_EXPECTED_RUN_IDENTITY}" \
     "STAGE_D_GOV_CAPTURE_RUN_ID=${STAGE_D_GOV_CAPTURE_RUN_ID}" \
     "STAGE_D_GOV_CAPTURE_OPERATION=${STAGE_D_GOV_CAPTURE_OPERATION}" \
     > "${WORK}/terminalize.log" || terminalize_status=$?

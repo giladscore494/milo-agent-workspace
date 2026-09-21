@@ -92,6 +92,9 @@ STAGING_BUDGET_ENV=(
 
 API_ENV_VARS=(
   "ENVIRONMENT=staging"
+  # Same release identity contract as production: a staging run records which
+  # release created it too, so an unpinned run is never the normal case.
+  "MILO_RELEASE_SHA=$RELEASE_SHA"
   "JOB_LAUNCHER=cloud_run"
   "GCP_PROJECT_ID=$PROJECT_ID"
   "GCP_REGION=$REGION"
@@ -110,6 +113,7 @@ API_ENV_VARS=(
 )
 WORKER_ENV_VARS=(
   "ENVIRONMENT=staging"
+  "MILO_RELEASE_SHA=$RELEASE_SHA"
   "GCP_PROJECT_ID=$PROJECT_ID"
   "GCP_REGION=$REGION"
   "MILO_WORKER_ENGINE=mock"

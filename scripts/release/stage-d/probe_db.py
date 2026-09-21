@@ -24,14 +24,13 @@ Modes (env STAGE_D_MODE):
               written to, and the verdict reports an empty mutation
               list. PHASE B mutates, then re-reads and proves the exact
               final membership and zero active runs
-  terminalize — drive the authorized Stage D run to a terminal state
-              with guarded, identity-checked transitions along the
-              supported lifecycle, release any dangling budget
-              reservation through the supported RPC, and prove the run
-              is terminal with zero active user/project runs and zero
-              reservations left in the reserved status. Refuses ANY run
-              candidate, recorded or recovered, unless the recorded
-              user and conversation identity is supplied and matches
+  terminalize — close the authorized Stage D run through the SAME atomic
+              finalize_run_guarded primitive as the runtime: first request
+              cancellation, then acquire a cleanup lease after the stopped
+              worker's lease is reclaimable, atomically commit cancelled +
+              run_cancelled, release dangling reservations, and prove zero
+              active user/project runs. Immutable run identity must match
+              the exact Stage D release pin before any mutation.
   evidence  — executable acceptance gate for env STAGE_D_RUN_ID: exits
               non-zero unless EVERY acceptance criterion holds, including
               exactly one new authorized run over the pinned prior
@@ -51,6 +50,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from decimal import Decimal, InvalidOperation
@@ -279,37 +279,156 @@ def assert_stage_d_key_is_not_the_capture_key(problems: list[str]) -> None:
         )
 
 
-# Stage D RPC surface with the REQUIRED argument names of each function as
-# defined by the release migrations (000400 for create_message_and_run_v2,
-# 000600 for the guarded worker RPCs). Optional (defaulted) arguments are
-# deliberately excluded so a migration adding an optional parameter does
-# not fail the check, while a missing/renamed required argument does —
-# EXCEPT for the RPCs in EXACT_RPC_SIGNATURES below, whose advertised set
-# must match exactly.
+# ===========================================================================
+# THE REQUIRED RPC SURFACE, rebuilt from CURRENT main.
+# ===========================================================================
+#
+# This used to be a hand-written list of six RPCs, pinned when the guarded
+# worker writes landed. Everything built afterwards -- the durable
+# execution-usage ledger, atomic guarded finalization, the current-verdict
+# authority, the R3/R4 evidence writers, the catalog writers, and the
+# run-identity and fencing primitives -- became a RUNTIME DEPENDENCY without
+# becoming a PREFLIGHT REQUIREMENT. A production database missing
+# `record_run_usage_guarded` or `finalize_run_guarded` passed every Stage D
+# check and would then have failed on the first paid model call, after the
+# money was spent. That is exactly the failure a preflight exists to prevent.
+#
+# It is now GENERATED. `scripts/release/release_inventory.py` derives the whole
+# inventory from two facts about the repository as it is: every RPC name the
+# runtime actually calls (an AST scan of the repository layer, plus this
+# probe's own `/rest/v1/rpc/` calls), and every function the migrations create,
+# with the arguments each one requires. `tests/test_release_inventory.py` fails
+# if the literal below is not exactly what that derivation produces from
+# current main, so the list cannot fall behind the runtime again.
+#
+# It stays a LITERAL here, and only here, because this probe is transported
+# into a bare pinned image as one SHA-256-pinned file with the standard library
+# alone: it cannot import the deriving module. The arrangement is the same one
+# `policy_envelope.PINNED_POLICY_FINGERPRINT` uses -- generated content,
+# reviewed placement.
+#
+# Optional (defaulted) arguments are deliberately excluded, so a migration that
+# ADDS an optional parameter does not fail the check while a missing or renamed
+# required one does -- EXCEPT for the RPCs in EXACT_RPC_SIGNATURES below.
+#
+# Regenerate with:
+#   python3 scripts/release/release_inventory.py rpcs
 REQUIRED_RPC_ARGS: dict[str, set[str]] = {
-    "create_message_and_run_v2": {
-        "p_conversation_id", "p_content", "p_metadata",
-        "p_requested_by", "p_idempotency_key", "p_request_fingerprint",
+    "activate_catalog_snapshot_guarded": {
+        "p_activation", "p_attempt", "p_lease_token", "p_run_id", "p_worker_id"
     },
-    "transition_run_worker_guarded": {
-        "p_run_id", "p_status", "p_expected_status",
-        "p_worker_id", "p_attempt", "p_lease_token",
+    "append_run_event_guarded": {
+        "p_attempt", "p_event_type", "p_lease_token", "p_run_id", "p_worker_id"
     },
-    "heartbeat_run_guarded": {"p_run_id", "p_worker_id", "p_attempt", "p_lease_token"},
-    "update_run_usage_guarded": {"p_run_id", "p_worker_id", "p_attempt", "p_lease_token", "p_usage"},
+    "append_usage_ledger_guarded": {
+        "p_attempt", "p_entry", "p_lease_token", "p_run_id", "p_worker_id"
+    },
+    "catalog_candidate_manufacturers": {"p_snapshot_id"},
+    "catalog_candidate_model_years": {"p_commercial_model", "p_manufacturer", "p_snapshot_id"},
+    "catalog_candidate_models": {"p_manufacturer", "p_snapshot_id"},
+    "catalog_candidate_variant_page": {"p_snapshot_id"},
+    "catalog_raw_record_by_upstream_id": {"p_snapshot_id", "p_upstream_record_id"},
+    "catalog_run_pending_promotions": {"p_run_id", "p_tool_operation"},
+    "catalog_snapshot_candidate_diff": {"p_previous_snapshot_id", "p_snapshot_id"},
+    "claim_current_verdict_states": {"p_run_id"},
+    "claim_run_lease": {"p_run_id", "p_worker_id"},
+    "create_agent_message_guarded": {
+        "p_attempt", "p_lease_token", "p_message", "p_run_id", "p_worker_id"
+    },
+    "create_claim_with_source_guarded": {
+        "p_attempt", "p_claim", "p_lease_token", "p_run_id", "p_worker_id"
+    },
+    "create_conflict_guarded": {
+        "p_attempt", "p_conflict", "p_lease_token", "p_run_id", "p_worker_id"
+    },
+    "create_message_and_run_v3": {
+        "p_content", "p_conversation_id", "p_idempotency_key", "p_metadata",
+        "p_request_fingerprint", "p_requested_by", "p_run_id", "p_run_identity"
+    },
+    "create_project_from_proposal_with_owner_v2": {
+        "p_configuration", "p_description", "p_name", "p_owner", "p_proposal_id",
+        "p_slug"
+    },
+    "create_supervisor_decision_guarded": {
+        "p_attempt", "p_decision", "p_lease_token", "p_run_id", "p_worker_id"
+    },
+    "create_tool_access_request_guarded": {
+        "p_attempt", "p_lease_token", "p_request", "p_run_id", "p_worker_id"
+    },
+    "create_tool_grant_guarded": {
+        "p_attempt", "p_grant", "p_lease_token", "p_run_id", "p_worker_id"
+    },
+    "create_tool_usage_guarded": {
+        "p_attempt", "p_lease_token", "p_run_id", "p_usage", "p_worker_id"
+    },
+    "finalize_run_guarded": {
+        "p_attempt", "p_expected_status", "p_lease_token", "p_run_id", "p_status",
+        "p_worker_id"
+    },
+    "heartbeat_run_guarded": {"p_attempt", "p_lease_token", "p_run_id", "p_worker_id"},
+    "link_catalog_candidate_evidence_guarded": {
+        "p_attempt", "p_lease_token", "p_link", "p_run_id", "p_worker_id"
+    },
+    "patch_run_blackboard_evidence_guarded": {
+        "p_attempt", "p_lease_token", "p_run_id", "p_summary", "p_worker_id"
+    },
+    "promote_catalog_variant_guarded": {
+        "p_attempt", "p_lease_token", "p_promotion", "p_run_id", "p_worker_id"
+    },
+    "record_catalog_candidate_guarded": {
+        "p_attempt", "p_candidate", "p_lease_token", "p_run_id", "p_worker_id"
+    },
+    "record_catalog_raw_record_guarded": {
+        "p_attempt", "p_lease_token", "p_record", "p_run_id", "p_worker_id"
+    },
+    "record_catalog_snapshot_guarded": {
+        "p_attempt", "p_lease_token", "p_run_id", "p_snapshot", "p_worker_id"
+    },
+    "record_claim_verdict_guarded": {
+        "p_attempt", "p_lease_token", "p_run_id", "p_verdict", "p_worker_id"
+    },
+    "record_conflict_resolution_guarded": {
+        "p_attempt", "p_lease_token", "p_resolution", "p_run_id", "p_worker_id"
+    },
+    "record_evidence_fragment_guarded": {
+        "p_attempt", "p_fragment", "p_lease_token", "p_run_id", "p_worker_id"
+    },
+    "record_run_usage_guarded": {
+        "p_attempt", "p_lease_token", "p_ledger", "p_run_id", "p_worker_id"
+    },
+    "reserve_daily_project_budget": {"p_amount", "p_daily_limit", "p_project_id", "p_run_id"},
+    "reserve_daily_user_budget": {"p_amount", "p_daily_limit", "p_run_id", "p_user_id"},
+    "reserve_model_call_budget_guarded": {
+        "p_attempt", "p_call_seq", "p_daily_project_limit", "p_daily_user_limit",
+        "p_estimated_cost", "p_lease_token", "p_project_id", "p_run_id",
+        "p_user_id", "p_worker_id"
+    },
+    "reserve_model_call_budget_v2": {
+        "p_call_seq", "p_daily_project_limit", "p_daily_user_limit",
+        "p_estimated_cost", "p_project_id", "p_run_id", "p_user_id"
+    },
+    "save_checkpoint_guarded": {
+        "p_attempt", "p_engine_version", "p_lease_token", "p_phase", "p_run_id",
+        "p_worker_id", "p_workflow_key"
+    },
+    "settle_model_call_budget": {"p_actual_cost", "p_reservation_id"},
     "settle_model_call_budget_guarded": {
-        "p_reservation_id", "p_actual_cost", "p_run_id",
-        "p_worker_id", "p_attempt", "p_lease_token",
+        "p_actual_cost", "p_attempt", "p_lease_token", "p_reservation_id",
+        "p_run_id", "p_worker_id"
     },
-    # The cleanup path depends on this one: terminalize() releases dangling
-    # reservations through it. Verified read-only against production on
-    # 2026-09-19 — SECURITY DEFINER, service_role may execute, anon and
-    # authenticated may not. Preflight must refuse the run BEFORE any
-    # production enable if it is missing, has a different signature, or is
-    # not exposed to the service-role probe, because a cleanup that cannot
-    # release a reservation would leave the budget held.
-    "settle_model_call_budget": {
-        "p_reservation_id", "p_actual_cost", "p_status", "p_rejection_reason",
+    "settle_model_call_budget_v2": {"p_actual_cost", "p_reservation_id"},
+    "transition_run_worker_guarded": {
+        "p_attempt", "p_expected_status", "p_lease_token", "p_run_id", "p_status",
+        "p_worker_id"
+    },
+    "update_run_usage_guarded": {
+        "p_attempt", "p_lease_token", "p_run_id", "p_usage", "p_worker_id"
+    },
+    "upsert_run_blackboard_guarded": {
+        "p_attempt", "p_blackboard", "p_lease_token", "p_run_id", "p_worker_id"
+    },
+    "upsert_source_guarded": {
+        "p_attempt", "p_lease_token", "p_run_id", "p_source", "p_worker_id"
     },
 }
 
@@ -324,7 +443,19 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
 # per function name, so exact equality is the strongest read-only check
 # available. Subset semantics remain for the other RPCs, which the Stage D
 # toolkit never invokes itself.
-EXACT_RPC_SIGNATURES: frozenset[str] = frozenset({"settle_model_call_budget"})
+EXACT_RPC_SIGNATURES: dict[str, set[str]] = {
+    # Every parameter, defaulted ones included: the point of an exact check is
+    # that an EXTRA deployed parameter is a different function. Generated from
+    # the same inventory as REQUIRED_RPC_ARGS above.
+    "create_message_and_run_v3": {
+        "p_content", "p_conversation_id", "p_idempotency_key", "p_max_project_active",
+        "p_max_user_active", "p_metadata", "p_request_fingerprint", "p_requested_by",
+        "p_run_id", "p_run_identity"
+    },
+    "settle_model_call_budget": {
+        "p_actual_cost", "p_rejection_reason", "p_reservation_id", "p_status"
+    },
+}
 
 
 def advertised_rpc_args(post_spec: dict) -> set[str] | None:
@@ -387,12 +518,13 @@ def check_rpc_surface(checks: dict[str, str], problems: list[str]) -> None:
                 f"rpc_{rpc}: argument metadata malformed/ambiguous — "
                 "cannot verify the callable surface; failing closed"
             )
-        elif rpc in EXACT_RPC_SIGNATURES and advertised != required_args:
-            missing = sorted(required_args - advertised)
-            unexpected = sorted(advertised - required_args)
+        elif rpc in EXACT_RPC_SIGNATURES and advertised != EXACT_RPC_SIGNATURES[rpc]:
+            exact = EXACT_RPC_SIGNATURES[rpc]
+            missing = sorted(exact - advertised)
+            unexpected = sorted(advertised - exact)
             checks[f"rpc_{rpc}"] = "SIGNATURE_MISMATCH"
             problems.append(
-                f"rpc_{rpc}: the advertised argument set must equal {sorted(required_args)} exactly — "
+                f"rpc_{rpc}: the advertised argument set must equal {sorted(exact)} exactly — "
                 f"missing {missing}, unexpected {unexpected}; the cleanup calls this function with "
                 "exactly those arguments, so any other deployed signature could leave reservations held"
             )
@@ -425,8 +557,13 @@ def govcheck() -> None:
 def preflight() -> None:
     checks: dict[str, str] = {}
     problems: list[str] = []
-    # Migrations 012/000400/000300/000600: full RPC surface, verified
-    # WITHOUT invoking anything (see check_rpc_surface).
+    # The FULL required RPC surface of current main -- every guarded worker
+    # write, the execution-usage ledger, atomic finalization, the
+    # current-verdict authority, the evidence and catalog writers, and the
+    # run-identity/fencing primitives -- verified WITHOUT invoking anything
+    # (see check_rpc_surface). A missing or mis-signed required RPC BLOCKS the
+    # preflight, and the preflight runs before the authorized run is created,
+    # so it blocks before any worker execution.
     check_rpc_surface(checks, problems)
     # Migration 000600: attempt-aware reservation identity.
     status, _ = call("GET", "/rest/v1/model_call_budget_reservations?select=attempt&limit=1")
@@ -437,6 +574,20 @@ def preflight() -> None:
     # Ledger table (013/000500).
     status, _ = call("GET", "/rest/v1/run_usage_ledger?select=id&limit=1")
     checks["run_usage_ledger"] = "present" if status == 200 else "MISSING"
+    # Console 2: the durable ExecutionUsageLedger row (20260920000100). Its
+    # guarded writer is covered by the RPC surface above; this proves the table
+    # the writer projects into actually exists.
+    status, _ = call("GET", "/rest/v1/run_execution_usage?select=run_id&limit=1")
+    checks["run_execution_usage"] = "present" if status == 200 else "MISSING"
+    # Console 4: the current-verdict authority's durable rows (20260907000100
+    # / 20260921000100).
+    status, _ = call("GET", "/rest/v1/claim_verdicts?select=id&limit=1")
+    checks["claim_verdicts"] = "present" if status == 200 else "MISSING"
+    # This console: the immutable run identity (20260921000200). A column that
+    # is absent means runs would be created with NO engine identity, which is
+    # the state every consumer now refuses.
+    status, _ = call("GET", "/rest/v1/runs?select=run_identity&limit=1")
+    checks["runs_identity_column"] = "present" if status == 200 else "MISSING"
     problems.extend(
         f"{k} is MISSING" for k, v in checks.items() if v == "MISSING" and not k.startswith("rpc_")
     )
@@ -764,7 +915,7 @@ STAGE_D_RUN_METADATA_STAGE = "stage-d-smoke"
 
 #: Every column the identity gate and the proofs need.
 RUN_SELECT = ("id,status,launch_state,worker_id,attempt,started_at,finished_at,"
-              "idempotency_key,requested_by,conversation_id,input")
+              "idempotency_key,requested_by,conversation_id,input,run_identity")
 
 
 def run_metadata(run: dict) -> dict:
@@ -854,6 +1005,32 @@ def check_stage_d_run_identity(run: dict, expected_key: str, problems: list[str]
             f"run {run_id} belongs to conversation {run.get('conversation_id')!r}, not the recorded Stage D "
             f"conversation {expected_conversation!r}")
 
+    # Console 6 immutable identity is part of the authorization, not merely
+    # evidence collected after the run. Cleanup must not mutate a row whose
+    # release/policy/engine/event vocabulary differs from the Stage D pin.
+    expected_identity = expected_run_identity()
+    identity = run.get("run_identity")
+    if isinstance(identity, str):
+        try:
+            identity = json.loads(identity)
+        except json.JSONDecodeError:
+            identity = None
+    if expected_identity is None:
+        problems.append(
+            "STAGE_D_EXPECTED_RUN_IDENTITY is missing or invalid — refusing cleanup mutation")
+    elif not isinstance(identity, dict):
+        problems.append(
+            f"run {run_id} has no readable immutable run_identity — refusing cleanup mutation")
+    else:
+        if str(identity.get("run_id") or "") != run_id:
+            problems.append(
+                f"run {run_id} carries an immutable identity for a different run — refusing cleanup mutation")
+        for field, expected in expected_identity.items():
+            actual = identity.get(field)
+            if str(actual or "") != str(expected):
+                problems.append(
+                    f"run {run_id} immutable identity field {field!r} does not match the Stage D release pin")
+
 
 def terminalize() -> None:
     """Drive the authorized Stage D run to a terminal state and PROVE it.
@@ -876,15 +1053,14 @@ def terminalize() -> None:
                      terminalization, reservation cleanup and proofs;
       * many rows  — ambiguous; fail closed having mutated nothing.
 
-    Every path is identity-checked: the key, the run-request metadata
-    marker, the recorded user and conversation — both REQUIRED; an absent
-    field refuses the candidate before any write — and an explicit refusal
-    of the prepared Government capture. Terminalization uses the repository's
-    own supported lifecycle (active -> cancellation_requested ->
-    cancelled), each step a guarded compare-and-set, plus the supported
-    service-role `settle_model_call_budget` RPC to release any dangling
-    reservation — including on a run that was ALREADY terminal, because a
-    finished run can still hold reserved budget.
+    Every path is identity-checked: the immutable Console 6 run identity,
+    the key, the run-request metadata marker, and the recorded user and
+    conversation — both REQUIRED. Cleanup never PATCHes a terminal status.
+    It may request the non-terminal cancellation_requested state, then obtains
+    its own legitimate lease only after the stopped worker's lease is
+    reclaimable and calls `finalize_run_guarded` so cancelled + run_cancelled
+    commit atomically. Dangling reservations are released through the supported
+    service-role settlement RPC, including for a run already terminal.
 
     It then PROVES: the run is terminal; zero active runs remain for its
     user and project; zero reservations remain in status 'reserved'.
@@ -951,41 +1127,66 @@ def terminalize() -> None:
     if problems:
         emit_and_exit()
 
-    # -- Guarded, identity-checked transitions along the supported path.
+    # -- Canonical cleanup finalization.
     #
-    # Bounded re-read loop rather than a straight line: losing the CAS is
-    # NOT itself a failure. The usual cause is the worker writing its own
-    # terminal result concurrently, which is exactly the outcome wanted —
-    # so a lost race is re-read and retried, and the POSTCONDITION PROOF
-    # below is what decides. What the CAS guarantees is that this probe
-    # never overwrites somebody else's result and never touches a run this
-    # authorization does not own.
+    # The kill switch has already proved there is no live Cloud Run execution.
+    # We therefore request cancellation (non-terminal), wait until the stopped
+    # worker's lease is legitimately reclaimable, claim the run as a bounded
+    # cleanup worker, and use finalize_run_guarded for the ONLY terminal write.
+    # No direct PATCH may create a terminal state.
     observed = str(run.get("status"))
-    for _attempt in range(MAX_TERMINALIZE_ATTEMPTS):
-        if observed in TERMINAL_RUN_STATES:
-            break
-        target, extra = (
-            ("cancelled", {"finished_at": "now()"})
-            if observed == "cancellation_requested"
-            else ("cancellation_requested",
-                  {"cancellation_requested_at": "now()",
-                   "cancellation_reason": "stage-d cleanup: run terminalized by the post-run lockdown"}))
-        moved = guarded_transition(run_id, observed, target, expected_key, actions, extra=extra)
+    if observed not in TERMINAL_RUN_STATES and observed != "cancellation_requested":
+        moved = guarded_transition(
+            run_id,
+            observed,
+            "cancellation_requested",
+            expected_key,
+            actions,
+            extra={
+                "cancellation_requested_at": "now()",
+                "cancellation_reason": "stage-d cleanup: cancellation requested after execution lockdown",
+            },
+        )
         if moved is not None:
             observed = moved
-            continue
-        actions.append(f"cas_lost_at_{observed}")
-        rows = fetch_rows(f"/rest/v1/runs?id=eq.{run_id}&select={RUN_SELECT}", "runs", problems)
-        if not rows:
-            problems.append(f"run {run_id} disappeared while being terminalized — failing closed")
-            break
-        current = str(rows[0].get("status"))
-        if current == observed:
-            problems.append(
-                f"the guarded transition {observed} -> {target} matched no row although the run is still "
-                f"{observed!r} — it may not be the authorized run; failing closed")
-            break
-        observed = current
+        else:
+            rows = fetch_rows(
+                f"/rest/v1/runs?id=eq.{run_id}&select={RUN_SELECT}", "runs", problems)
+            if not rows:
+                problems.append(
+                    f"run {run_id} disappeared while cancellation was requested — failing closed")
+            else:
+                observed = str(rows[0].get("status"))
+
+    if observed not in TERMINAL_RUN_STATES:
+        cleanup = claim_stage_d_cleanup_lease(run_id, actions, problems)
+        if cleanup is not None:
+            observed = str(cleanup.get("status"))
+            status, body = call("POST", "/rest/v1/rpc/finalize_run_guarded", {
+                "p_run_id": run_id,
+                "p_status": "cancelled",
+                "p_expected_status": observed,
+                "p_worker_id": cleanup["worker_id"],
+                "p_attempt": cleanup.get("attempt"),
+                "p_lease_token": cleanup["lease_token"],
+                "p_output": None,
+                "p_error": {
+                    "code": "STAGE_D_CLEANUP_CANCELLED",
+                    "message": "run cancelled by Stage D post-run cleanup",
+                },
+                "p_clear_error": False,
+                "p_usage": None,
+                "p_finished_at": utc_now_iso(),
+                "p_event_type": "run_cancelled",
+                "p_event_message": "Run cancelled by Stage D post-run cleanup",
+                "p_event_payload": {"code": "STAGE_D_CLEANUP_CANCELLED"},
+            })
+            if status not in (200, 201, 204) or not isinstance(body, list) or len(body) != 1:
+                problems.append(
+                    f"canonical cleanup finalization failed (HTTP {status}) — run not proven terminal")
+            else:
+                observed = "cancelled"
+                actions.append("finalize_run_guarded:cancelled")
     out["status_after_transition"] = observed
 
     # -- Release any dangling reservation through the supported RPC. This
@@ -1070,8 +1271,13 @@ def terminalize() -> None:
     emit_and_exit()
 
 
-#: Bounded: a benign race is retried, a pathological one is never looped on.
-MAX_TERMINALIZE_ATTEMPTS = 5
+#: Bounded wait for the stopped worker's database lease to become reclaimable.
+#: The kill switch has already proved zero Cloud Run executions before this
+#: mode is invoked; waiting for lease expiry preserves fencing instead of
+#: force-stealing ownership.
+MAX_CLEANUP_LEASE_ATTEMPTS = 70
+CLEANUP_LEASE_RETRY_SECONDS = 5
+CLEANUP_LEASE_SECONDS = 60
 
 
 def guarded_transition(run_id: str, observed: str, target: str, expected_key: str,
@@ -1104,6 +1310,42 @@ def guarded_transition(run_id: str, observed: str, target: str, expected_key: st
     return target
 
 
+def claim_stage_d_cleanup_lease(
+    run_id: str, actions: list[str], problems: list[str]
+) -> dict | None:
+    """Acquire a real lease for canonical cleanup, never force-steal one."""
+    worker_id = f"stage-d-cleanup-{run_id[:12]}"
+    for _attempt in range(MAX_CLEANUP_LEASE_ATTEMPTS):
+        status, body = call("POST", "/rest/v1/rpc/claim_run_lease", {
+            "p_run_id": run_id,
+            "p_worker_id": worker_id,
+            "p_lease_seconds": CLEANUP_LEASE_SECONDS,
+        })
+        if status not in (200, 201, 204) or not isinstance(body, list):
+            problems.append(
+                f"cleanup lease claim failed (HTTP {status}) — refusing non-canonical terminalization")
+            return None
+        if len(body) == 1:
+            row = body[0]
+            if not isinstance(row, dict) or not row.get("lease_token"):
+                problems.append("cleanup lease claim returned no usable fenced lease")
+                return None
+            actions.append("claimed_stage_d_cleanup_lease")
+            return row
+        if len(body) > 1:
+            problems.append("cleanup lease claim returned multiple runs — failing closed")
+            return None
+
+        # Another lease still holds. It belongs to an execution the kill switch
+        # already proved absent, so wait for DATABASE-clock expiry rather than
+        # bypassing ownership with a direct terminal PATCH.
+        time.sleep(CLEANUP_LEASE_RETRY_SECONDS)
+
+    problems.append(
+        "the stopped worker lease did not become reclaimable within the bounded cleanup window")
+    return None
+
+
 def utc_now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
@@ -1114,6 +1356,33 @@ SECRET_MARKERS = ("sk-", "KIMI_API_KEY", "MOONSHOT_API_KEY", "service_role", "sb
 # Cap values the evidence gate verifies against; provided via STAGE_D_CAPS
 # (the exact string from stage-d-env.sh) so there is a single source of
 # expected values. Missing keys fail the gate closed.
+def expected_run_identity():
+    """The identity dimensions this release binds, as Stage D pinned them.
+
+    Produced by `policy_envelope.py run-identity` on the operator host, where
+    the repository is available; this probe runs in a bare image with the
+    standard library alone, so it receives the expectation rather than deriving
+    it. `run_id` is deliberately absent from it -- that dimension is a property
+    of the run, and it is checked separately against STAGE_D_RUN_ID.
+
+    Returns None when the pin is absent or unparseable, which every caller
+    treats as a refusal.
+    """
+    raw = (os.environ.get("STAGE_D_EXPECTED_RUN_IDENTITY") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict) or not parsed:
+        return None
+    # A pin that states no release binds nothing; refuse rather than pass.
+    if not str(parsed.get("release_sha") or "").strip():
+        return None
+    return {key: str(value) for key, value in parsed.items() if key != "run_id"}
+
+
 REQUIRED_CAP_KEYS = (
     "MILO_MAX_MODEL_CALLS_PER_RUN",
     "MILO_MAX_INPUT_TOKENS_PER_RUN",
@@ -1305,7 +1574,8 @@ def evidence() -> None:
     rows = fetch_rows(
         f"/rest/v1/runs?id=eq.{run_id}"
         "&select=id,status,attempt,worker_id,launch_state,started_at,finished_at,"
-        "last_heartbeat_at,lease_expires_at,usage,error,requested_by,idempotency_key",
+        "last_heartbeat_at,lease_expires_at,usage,error,requested_by,idempotency_key,"
+        "run_identity",
         "runs",
         failures,
     )
@@ -1367,6 +1637,58 @@ def evidence() -> None:
     # Lease evidence: the run must have held a real, bounded lease.
     if not run.get("lease_expires_at"):
         failures.append("run.lease_expires_at is missing — no worker lease was ever established")
+
+    # ===================================================================
+    # RELEASE BINDING: the run this authorization actually executed must be
+    # a run of the ACCEPTED RELEASE.
+    # ===================================================================
+    #
+    # Every other link in the chain was already proven -- the accepted runtime
+    # source is byte-identical to the policy this toolkit uses, that policy's
+    # fingerprint is the reviewed one, the release tag resolves to the accepted
+    # digests, the serving revision and the executing job run those digests --
+    # and none of them said anything about the RUN. A run recorded no policy,
+    # no release and no engine of its own: its engine was re-derived from a
+    # project row at claim time.
+    #
+    # `runs.run_identity` (migration 20260921000200) is bound at creation and
+    # immutable, and this compares it with what THIS release would have bound.
+    # The identity is raw JSON from the database, so it is parsed defensively
+    # and every failure mode is a refusal.
+    identity = run.get("run_identity")
+    if isinstance(identity, str):
+        try:
+            identity = json.loads(identity)
+        except json.JSONDecodeError:
+            identity = None
+            failures.append("run.run_identity is not readable JSON — failing closed")
+    if identity is not None and not isinstance(identity, dict):
+        # A stored value that is not an object is not an identity. It is
+        # reduced to "absent" here so the comparison below cannot raise on it,
+        # and the refusal is recorded either way.
+        failures.append("run.run_identity is not an object — failing closed")
+        identity = None
+    out["run_identity"] = identity
+    expected_identity = expected_run_identity()
+    out["expected_run_identity"] = expected_identity
+    if expected_identity is None:
+        failures.append(
+            "STAGE_D_EXPECTED_RUN_IDENTITY is missing or unparseable — the authorized "
+            "run cannot be bound to the accepted release; failing closed")
+    elif identity is None:
+        failures.append(
+            "the authorized run carries NO immutable identity, so it cannot be bound to "
+            "the accepted release; failing closed")
+    else:
+        drift = sorted(key for key, want in expected_identity.items()
+                       if str(identity.get(key) or "") != str(want))
+        if drift:
+            failures.append(
+                f"the run's immutable identity disagrees with the accepted release on "
+                f"{drift} — the run that executed is not a run of this release; failing closed")
+        if str(identity.get("run_id") or "") != str(run_id):
+            failures.append(
+                "the run's immutable identity names a different run; failing closed")
 
     # Lifecycle events + secret-leak scan (counts only; no values printed).
     events = fetch_rows(f"/rest/v1/run_events?run_id=eq.{run_id}&select=event_type,agent,phase,created_at,payload&order=id.asc", "run_events", failures)

@@ -4,6 +4,9 @@ import pytest
 from backend.errors import AppError
 from backend.worker.main import execute_run, resolve_run_id
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker
+from tests.run_factory import identity_kwargs
+from backend.run_identity import RunIdentity
+from backend.runtime import TERMINAL_STATES
 
 
 class WorkerRepo:
@@ -19,8 +22,22 @@ class WorkerRepo:
         self.completed = None
         self.events = []
         self.partial = None
+        #: Every terminal write, as (status, event_type). The worker may only
+        #: reach this through the canonical finalizer.
+        self.terminal_writes = []
+    def run_identity(self, run_id):
+        """The immutable identity this run was BORN with.
+
+        Derived from this fake's own trusted project relation, so a subclass
+        that declares a different workflow gets a run whose identity matches it.
+        A run without one is refused before the lease is claimed, and a run
+        whose identity disagrees with the runtime is refused too -- a fake
+        without an identity would be a fake of the product that came before.
+        """
+        workflow_key = self.get_project(self.project_id)["workflow_key"]
+        return RunIdentity.bind(run_id, workflow_key).as_record()
     def get_run(self, run_id):
-        return {"id": run_id, "conversation_id": self.conversation_id, "status": "running" if self.worker_id else "queued", "input": {}, "worker_id": self.worker_id, "attempt": self.attempt, "lease_token": self.lease_token if self.worker_id else None, "lease_expires_at": self.lease_expires_at}
+        return {"id": run_id, "conversation_id": self.conversation_id, "status": "running" if self.worker_id else "queued", "input": {}, "worker_id": self.worker_id, "attempt": self.attempt, "lease_token": self.lease_token if self.worker_id else None, "lease_expires_at": self.lease_expires_at, "run_identity": self.run_identity(run_id)}
     def get_conversation(self, conversation_id):
         assert conversation_id == self.conversation_id
         return {"id": conversation_id, "project_id": self.project_id}
@@ -48,13 +65,39 @@ class WorkerRepo:
     def append_run_event(self, run_id, event_type, payload, worker_id=None, attempt=None, lease_token=None):
         self.events.append((run_id, event_type, payload)); return {"id": uuid4(), "run_id": run_id, "event_type": event_type, "payload": payload}
     def transition_run(self, run_id, status, expected_worker_id=None, expected_attempt=None, expected_lease_token=None, **fields):
+        # Parity with `transition_run_worker_guarded`, which Console 6 redefined
+        # as NON-TERMINAL: terminal status + terminal event are one atomic write
+        # and only `finalize_run_guarded` may make it. A fake that still allowed
+        # a terminal transition here could not detect a restored bypass.
+        if status in TERMINAL_STATES:
+            raise AppError("CANONICAL_FINALIZER_REQUIRED",
+                           f"terminal status {status!r} must use the canonical finalizer", 409)
         self._assert_lease(expected_worker_id, expected_attempt, expected_lease_token)
-        if status == "partial_success":
-            self.partial = (run_id, fields.get("output"))
         return {"id": run_id, "status": status, **fields}
     def save_checkpoint(self, checkpoint, worker_id=None, attempt=None, lease_token=None):
         self._assert_lease(worker_id, attempt, lease_token)
         return checkpoint
+    def finalize_run(self, run_id, status, expected_status, event=None, *, worker_id, attempt, lease_token, **fields):
+        """Parity with `finalize_run_guarded`: the terminal status and the
+        terminal event are ONE fenced write, and this is the only path by
+        which the worker may terminalize a run at all.
+        """
+        self._assert_lease(worker_id, attempt, lease_token)
+        error = fields.get("error") or {}
+        if status == "partial_success":
+            self.partial = (run_id, fields.get("output"))
+        elif status == "completed":
+            self.completed = (run_id, fields.get("output"))
+        else:
+            self.failed = (run_id, error.get("code"), error.get("message"))
+        if event is not None:
+            # Recorded in the same shape `append_run_event` records, so a test
+            # reads a terminal event exactly as it reads any other one.
+            self.events.append((run_id, event.get("type"),
+                                {"message": event.get("message"),
+                                 "payload": event.get("payload") or {}}))
+        self.terminal_writes.append((status, None if event is None else event.get("type")))
+        return {"id": run_id, "status": status, "run_identity": self.run_identity(run_id), **fields}
     def mark_run_failed(self, run_id, code, message, worker_id=None, attempt=None, lease_token=None):
         self._assert_lease(worker_id)
         self.failed = (run_id, code, message); return {"id": run_id, "status": "failed", "error": {"code": code, "message": message}}
@@ -156,6 +199,15 @@ def test_worker_passes_active_lease_on_every_durable_write():
             self._require_full_lease(worker_id, attempt, lease_token, "fail")
             return super().mark_run_failed(run_id, code, message, worker_id, attempt, lease_token)
 
+        def finalize_run(self, run_id, status, expected_status, event=None, *,
+                         worker_id, attempt, lease_token, **fields):
+            # The terminal write. It is the canonical finalizer's now, and it is
+            # fenced by the same contract as every other durable write.
+            self._require_full_lease(worker_id, attempt, lease_token, f"finalize {status}")
+            return super().finalize_run(run_id, status, expected_status, event,
+                                        worker_id=worker_id, attempt=attempt,
+                                        lease_token=lease_token, **fields)
+
     class CheckpointingEngine:
         workflow_key = "vehicle_catalog_v1"
         def __init__(self):
@@ -180,7 +232,8 @@ def test_stale_worker_every_mutation_rejected_via_memory_repository():
     repo.seed_user("aaaaaaaa-1111-4111-8111-000000000001")
     repo.seed_project("bbbbbbbb-1111-4111-8111-000000000001", "stale", "Stale", ["aaaaaaaa-1111-4111-8111-000000000001"])
     conversation = repo.create_conversation("bbbbbbbb-1111-4111-8111-000000000001", "stale run")
-    created = repo.create_message_and_run(conversation["id"], "content", {}, "aaaaaaaa-1111-4111-8111-000000000001", "stale-key", "fp")
+    created = repo.create_message_and_run(conversation["id"], "content", {}, "aaaaaaaa-1111-4111-8111-000000000001", "stale-key", "fp",
+                                          **identity_kwargs(repo, conversation["id"]))
     run_id = created["run"]["id"]
 
     run_a = repo.claim_run(run_id, "worker-A")
@@ -260,11 +313,14 @@ def test_mock_engine_budget_loop_trips_model_call_limit(monkeypatch):
         def claim_run(self, run_id, worker_id, lease_seconds=300):
             super().claim_run(run_id, worker_id, lease_seconds)
             return self.get_run(run_id)
-        def transition_run(self, run_id, status, expected_worker_id=None, expected_attempt=None, expected_lease_token=None, **fields):
-            self._assert_lease(expected_worker_id, expected_attempt, expected_lease_token)
+        def finalize_run(self, run_id, status, expected_status, event=None, *,
+                         worker_id, attempt, lease_token, **fields):
+            result = super().finalize_run(run_id, status, expected_status, event,
+                                          worker_id=worker_id, attempt=attempt,
+                                          lease_token=lease_token, **fields)
             if status in {"budget_exhausted", "failed", "timed_out"}:
                 self.terminal = (status, fields.get("error"))
-            return {"id": run_id, "status": status, **fields}
+            return result
 
     repo = BudgetRepo()
     code = execute_run(repo.run_id, repo)
@@ -401,7 +457,7 @@ def test_swarm_v2_failure_is_not_handled_when_terminal_write_is_not_durable():
     class UnwritableRepo(WorkerRepo):
         def get_project(self, project_id):
             return {"id": project_id, "workflow_key": "swarm_v2"}
-        def mark_run_failed(self, *args, **kwargs):
+        def finalize_run(self, *args, **kwargs):
             raise AppError("RUN_LEASE_LOST", "lease unavailable", 409)
 
     repo = UnwritableRepo()
@@ -438,12 +494,11 @@ class _BudgetTerminalRepo(WorkerRepo):
     def get_project(self, project_id):
         return {"id": project_id, "workflow_key": self.workflow_key}
 
-    def transition_run(self, run_id, status, expected_worker_id=None,
-                       expected_attempt=None, expected_lease_token=None, **fields):
-        result = super().transition_run(
-            run_id, status, expected_worker_id, expected_attempt,
-            expected_lease_token, **fields
-        )
+    def finalize_run(self, run_id, status, expected_status, event=None, *,
+                     worker_id, attempt, lease_token, **fields):
+        result = super().finalize_run(run_id, status, expected_status, event,
+                                      worker_id=worker_id, attempt=attempt,
+                                      lease_token=lease_token, **fields)
         if status in {"budget_exhausted", "failed", "timed_out"}:
             self.terminal_transitions.append((status, fields.get("error")))
         return result
@@ -471,17 +526,13 @@ def test_swarm_v2_budget_terminal_returns_zero_only_after_durable_transition(sto
 @pytest.mark.parametrize("stop_path", ["exception", "tracker"])
 def test_swarm_v2_budget_terminal_missing_transition_is_not_handled(stop_path):
     class MissingTerminalTransitionRepo(_BudgetTerminalRepo):
-        def transition_run(self, run_id, status, expected_worker_id=None,
-                           expected_attempt=None, expected_lease_token=None,
-                           **fields):
-            if status == "running":
-                result = super().transition_run(
-                    run_id, status, expected_worker_id, expected_attempt,
-                    expected_lease_token, **fields
-                )
-                self.transition_run = None
-                return result
-            raise AssertionError("terminal transition should be unavailable")
+        """A repository with no atomic finalizer at all.
+
+        Falling back to a transition plus a separate event is the split-brain
+        terminalization Console 3 removed, so the worker refuses rather than
+        splitting the write.
+        """
+        finalize_run = None
 
     repo = MissingTerminalTransitionRepo("swarm_v2")
     with pytest.raises(AppError) as failure:
@@ -492,15 +543,9 @@ def test_swarm_v2_budget_terminal_missing_transition_is_not_handled(stop_path):
 @pytest.mark.parametrize("stop_path", ["exception", "tracker"])
 def test_swarm_v2_budget_terminal_transition_failure_propagates(stop_path):
     class FailingTerminalTransitionRepo(_BudgetTerminalRepo):
-        def transition_run(self, run_id, status, expected_worker_id=None,
-                           expected_attempt=None, expected_lease_token=None,
-                           **fields):
-            if status == "budget_exhausted":
-                raise AppError("RUN_LEASE_LOST", "terminal write rejected", 409)
-            return super().transition_run(
-                run_id, status, expected_worker_id, expected_attempt,
-                expected_lease_token, **fields
-            )
+        def finalize_run(self, run_id, status, expected_status, event=None, *,
+                         worker_id, attempt, lease_token, **fields):
+            raise AppError("RUN_LEASE_LOST", "terminal write rejected", 409)
 
     repo = FailingTerminalTransitionRepo("swarm_v2")
     with pytest.raises(AppError) as failure:

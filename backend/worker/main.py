@@ -16,6 +16,12 @@ from backend.runtime import TERMINAL_STATES, CancellationRequested, RunEventReco
 from backend.supervisor import SupervisorInput, apply_event_to_blackboard, build_evaluation_report, initial_blackboard, make_shadow_decision, route_event_message
 from backend.engines.vehicle_catalog_v1 import VehicleCatalogV1Adapter
 from backend.worker.engine import Engine, EngineRegistry, EngineResolver
+from backend.run_identity import (
+    PRODUCT_WORKFLOW_KEYS,
+    RunIdentityError,
+    execution_identity_problems,
+    persisted_identity,
+)
 
 
 def resolve_run_id(cli_run_id: str | None) -> UUID:
@@ -101,6 +107,40 @@ def evidence_of_completed_tasks(board: Any, results: Any) -> list[Any]:
 def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, budget_tracker: "BudgetTracker | None" = None, engine_registry: EngineRegistry | None = None) -> int:
     worker_id = os.getenv("WORKER_ID", f"worker-{uuid4()}")
     lease_seconds = int(os.getenv("MILO_WORKER_LEASE_SECONDS", "300"))
+
+    # Console 6 pre-claim authority: this runtime may not mutate a run until it
+    # has proved that the persisted immutable identity names THIS exact engine
+    # contract, policy, event registry and release. Identity is immutable, so a
+    # read before the lease is not a TOCTOU on the thing being authorized.
+    # Refusal here intentionally writes nothing: a different release must not
+    # take a lease merely to record that the run belongs to another release.
+    preclaim_run = repo.get_run(run_id)
+    try:
+        preclaim_identity = persisted_identity(preclaim_run)
+    except RunIdentityError as exc:
+        raise AppError(
+            "RUN_IDENTITY_INVALID",
+            "run carries an unreadable immutable identity",
+            409,
+        ) from exc
+    if preclaim_identity is None:
+        raise AppError(
+            "RUN_IDENTITY_REQUIRED",
+            "run predates immutable identity and cannot be executed or resumed",
+            409,
+        )
+    if preclaim_identity.workflow_key not in PRODUCT_WORKFLOW_KEYS:
+        raise AppError(
+            "ENGINE_NOT_ALLOWED",
+            "control-plane run identity cannot be executed by the product worker",
+            403,
+        )
+    if execution_identity_problems(preclaim_identity):
+        raise AppError(
+            "RUN_IDENTITY_RUNTIME_MISMATCH",
+            "run identity does not match the runtime attempting to execute it",
+            409,
+        )
     heartbeat_interval = max(1.0, min(float(os.getenv("MILO_WORKER_HEARTBEAT_INTERVAL_SECONDS", "30")), lease_seconds / 3))
     if hasattr(repo, "claim_run"):
         claimed = _claim_run_with_recovery(repo, run_id, worker_id, lease_seconds)
@@ -128,8 +168,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
     # untrusted source; the two terminal paths that can run before routing --
     # a cancellation observed before start, and a routing refusal -- have no
     # product to read anyway.
+    # No event sink is handed to it: the terminal event commits inside
+    # `finalize_run_guarded` with the status it belongs to, so there is no
+    # second write for the finalizer to make and none for it to lose.
     finalizer = RunFinalizer(repo=repo, run_id=run_id, engine="",
-                             lease_ctx=lease_ctx, event_sink=sink)
+                             lease_ctx=lease_ctx)
     lease_lost = threading.Event()
     stop_heartbeat = threading.Event()
     heartbeat_thread: threading.Thread | None = None
@@ -427,6 +470,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             ledger_project_id = None
 
         def record_ledger(entry):
+            """Append ONE per-call ledger row -- under this worker's lease.
+
+            The per-call rows the daily budget is summed from were the last
+            durable write a running worker made unfenced. Every other usage
+            surface has been lease-guarded since the execution usage ledger
+            landed; this one went straight into the table, so a replaced worker
+            could keep charging a run it no longer owned against the live
+            worker's daily allowance.
+            """
             if hasattr(repo, "append_usage_ledger"):
                 repo.append_usage_ledger({
                     "run_id": str(run_id),
@@ -435,7 +487,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     "provider": "moonshot",
                     "model": "kimi",
                     **entry,
-                })
+                }, **lease_ctx)
 
         # MILO_WORKER_ENGINE=mock (forbidden in production by
         # backend/production_config.py) runs the zero-cost staging engine: no

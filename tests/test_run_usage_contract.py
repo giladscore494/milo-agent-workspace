@@ -244,12 +244,25 @@ def _recorded(name):
     return json.loads(CONTRACT_FIXTURE.read_text())[name]
 
 
+def _keyed_to_fixture_ids(body, recorded):
+    """`body`, with the per-run ids replaced by the fixture's placeholders.
+
+    The run identity names the run it belongs to, so its `run_id` is a per-run
+    value exactly as `id` is. EVERY OTHER identity dimension -- workflow,
+    engine version, policy, event registry, release -- is a property of the
+    running image and is compared strictly, so the recorded contract cannot
+    drift from what the app actually serves.
+    """
+    keyed = {**body, "id": recorded["id"], "conversation_id": recorded["conversation_id"]}
+    if isinstance(keyed.get("run_identity"), dict):
+        keyed["run_identity"] = {**keyed["run_identity"], "run_id": recorded["id"]}
+    return keyed
+
+
 def _rendered(repo, recorded):  # noqa: F811
     """Re-render `recorded` through the real app, keyed to this fake's ids."""
     with_stored_run(repo, usage=recorded["usage"], status=recorded["status"])
-    body = read_run(repo).json()
-    # Ids are per-run; the fixture uses fixed placeholders for them.
-    return {**body, "id": recorded["id"], "conversation_id": recorded["conversation_id"]}
+    return _keyed_to_fixture_ids(read_run(repo).json(), recorded)
 
 
 def test_h_recorded_settled_response_still_matches_the_live_app(repo):  # noqa: F811
@@ -261,8 +274,7 @@ def test_h_recorded_unsettled_response_still_matches_the_live_app(repo):  # noqa
     recorded = _recorded("unsettled")
     # The unsettled fixture records `usage: null`; the durable row holds `{}`.
     with_stored_run(repo, usage={}, status=recorded["status"])
-    body = read_run(repo).json()
-    assert {**body, "id": recorded["id"], "conversation_id": recorded["conversation_id"]} == recorded
+    assert _keyed_to_fixture_ids(read_run(repo).json(), recorded) == recorded
 
 
 def test_h_fixture_ids_are_well_formed(repo):  # noqa: F811

@@ -36,6 +36,7 @@ from backend.worker.main import evidence_of_completed_tasks
 from test_swarm_v2 import plan, task
 from test_swarm_v2_evidence import GuardedEvidenceRepository
 from test_swarm_v2_stage1_e2e import Plans, StubResolver, VerifyGateway, commander
+from tests.worker_fence import FENCE
 
 
 def fresh_board():
@@ -48,11 +49,11 @@ def fresh_board():
 def record(board: EvidenceBoard, task_id: str, value: str) -> None:
     """What the trusted tool-result sink does for a mapped operation."""
     source = board.record_source(
-        SourceCreate(agent="w", url=f"https://example.test/{task_id}", title=task_id.upper(),
+        SourceCreate(**FENCE, agent="w", url=f"https://example.test/{task_id}", title=task_id.upper(),
                      domain="example.test", source_type="primary", source_strength="strong",
                      query="q", tool_operation="search.search"),
         task_key=task_id)
-    board.record_claim(ClaimCreate(entity_key=f"vehicle:{task_id}", field_key="answer",
+    board.record_claim(ClaimCreate(**FENCE, entity_key=f"vehicle:{task_id}", field_key="answer",
                                    value=value, source_id=source["id"],
                                    source_strength="strong", confidence=.9, agent="w"),
                        task_key=task_id)

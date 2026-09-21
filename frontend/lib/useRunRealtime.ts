@@ -4,6 +4,7 @@ import { api } from './api';
 import { EventId, maxEventId, normalizeEventId } from './eventId';
 import { eventBelongsToRun, runBelongsToScope } from './ownership';
 import { initialWorkspaceState, reduceRunEvent } from './runReducer';
+import { runIdentityWorkflowKey } from './runIdentity';
 import { isTerminalRunStatus } from './runStatus';
 import { SwarmRunViewModel, buildSwarmRunViewModel } from './swarmViewModel';
 import { Run, RunEvent, WorkspaceState } from './types';
@@ -183,10 +184,20 @@ export function useRunRealtime(
 
   // The Swarm V2 view model is derived, never stored, so it resets with the
   // workspace state on every run switch and can never outlive its run.
+  const persistedWorkflowKey = runIdentityWorkflowKey(state.run);
+  const identityUnavailable = state.run !== undefined && persistedWorkflowKey === undefined;
   const swarm: SwarmRunViewModel = useMemo(
-    () => buildSwarmRunViewModel({ run: state.run, swarm: state.swarm, workflowKey }),
-    [state.run, state.swarm, workflowKey],
+    () => buildSwarmRunViewModel({
+      run: state.run,
+      swarm: state.swarm,
+      // Before the run row loads, the selected project's workflow may choose a
+      // loading surface. Once a run exists, ONLY its persisted immutable
+      // identity may select an engine-specific projection. Missing/invalid
+      // identity therefore stays undefined and is surfaced explicitly.
+      workflowKey: state.run === undefined ? workflowKey : persistedWorkflowKey,
+    }),
+    [state.run, state.swarm, workflowKey, persistedWorkflowKey],
   );
 
-  return { state, mode, swarm };
+  return { state, mode, swarm, identityUnavailable };
 }

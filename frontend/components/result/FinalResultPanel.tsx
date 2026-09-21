@@ -18,9 +18,11 @@ import { PollingMode } from '@/lib/useRunRealtime';
 
 export type FinalResultPanelProps = {
   /**
-   * Whether this surface applies at all. The caller decides from TRUSTED
-   * PROJECT STATE (`project.workflow_key`), never from the payload: a V1 run
-   * keeps its existing path and nothing in `output` may route a run here.
+   * Whether this surface applies at all. The caller decides from the RUN'S OWN
+   * IMMUTABLE IDENTITY, never from the payload and never from what the project
+   * says today: a V1 run keeps its existing path, a run whose identity cannot
+   * be trusted gets a bounded alert instead of a surface, and nothing in
+   * `output` may route a run here.
    */
   visible: boolean;
   runId?: string;

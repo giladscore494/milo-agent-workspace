@@ -24,6 +24,7 @@ from backend.schemas import ClaimCreate, SourceCreate
 from test_swarm_v2 import plan, task
 from test_swarm_v2_evidence import GuardedEvidenceRepository
 from test_swarm_v2_stage1_e2e import Plans, StubResolver, VerifyGateway, Worker, commander
+from tests.worker_fence import FENCE
 
 
 # --- pure normalization contract ---------------------------------------------
@@ -191,14 +192,14 @@ def test_engine_preserves_original_evidence_values():
 # --- EvidenceBoard conflict path ---------------------------------------------
 
 def board_source(url="https://example.test/a"):
-    return SourceCreate(agent="worker", url=url, title="Evidence", domain="example.test",
+    return SourceCreate(**FENCE, agent="worker", url=url, title="Evidence", domain="example.test",
                         source_type="primary", source_strength="strong", query="q",
                         tool_operation="search")
 
 
 def board_claim(source_id, value, *, entity="Toyota Corolla 2020", field="engine-power",
                 market="Israel", geography="IL", time_scope=None):
-    return ClaimCreate(entity_key=entity, field_key=field, value=value,
+    return ClaimCreate(**FENCE, entity_key=entity, field_key=field, value=value,
                        time_scope={"year": 2020} if time_scope is None else time_scope,
                        market=market, geography=geography, source_id=source_id,
                        source_strength="strong", confidence=.9, agent="worker")
@@ -299,7 +300,7 @@ def test_claim_evidence_key_is_independent_of_canonical_metadata(monkeypatch):
     source_id = UUID(board.record_source(board_source(), task_key="task")["id"])
     claim = board_claim(source_id, 100)
     row = board.record_claim(claim, task_key="task")
-    original = json.dumps(safe_durable_value({"task_key": "task", **claim.model_dump(mode="json")}),
+    original = json.dumps(safe_durable_value({"task_key": "task", **claim.content()}),
                           sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     assert "canonical" not in original
     assert row["evidence_key"] == f"claim:{hashlib.sha256(original.encode()).hexdigest()}"

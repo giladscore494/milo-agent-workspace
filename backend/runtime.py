@@ -5,6 +5,9 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
+from backend import event_registry as registry
+from backend.event_registry import require_known_event_type
+
 RUN_STATES = {
     "queued", "launching", "starting", "running", "waiting", "completed", "partial_success",
     "failed", "cancellation_requested", "cancelled", "timed_out", "budget_exhausted",
@@ -26,47 +29,17 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
     "timed_out": set(),
     "budget_exhausted": set(),
 }
-# The V1 engine's own vocabulary. `frontend/lib/eventVocabulary.ts` mirrors
-# THIS set into `V1_EVENT_TYPES`, and `ownsV1Projection` is that membership
-# test: a type in here may write the browser's agent, phase, progress, source,
-# claim, conflict and spend projection. Nothing may be added to it casually.
-V1_EVENT_TYPES = frozenset({
-    "run_created", "run_started", "run_resumed", "phase_started", "phase_completed",
-    "agent_created", "agent_started", "agent_progress", "agent_completed", "agent_failed",
-    "chunk_started", "chunk_completed", "chunk_failed", "fallback_started", "fallback_completed",
-    "checkpoint_saved", "cancellation_requested", "run_completed", "run_partial_success",
-    "run_failed", "run_cancelled",
-    "tool_access_requested", "tool_access_granted", "tool_access_denied", "tool_used",
-    "source_recorded", "claim_recorded", "conflict_detected",
-    "launch_requested", "launch_failed", "run_requeued",
-    "budget_warning", "budget_exhausted", "token_limit_reached", "run_timed_out",
-    "retry_limit_reached", "kill_switch_activated",
-    "supervisor_shadow_failed",
-})
-
-# CODE-2: the catalog path's two events, given typed recognition in their OWN
-# closed set rather than being folded into the V1 vocabulary above.
-#
-# The distinction is the whole point. These types must be RECOGNISED -- so the
-# API accepts them, so the browser can project them, so an operator has
-# something to act on -- without acquiring the V1 projection that membership of
-# `V1_EVENT_TYPES` would hand them. A `catalog_promotion_refused` event is
-# emitted by trusted server code that knows nothing about agents, phases,
-# progress or spend, and a payload claiming otherwise is a payload asserting
-# something its emitter cannot assert. That is the F5 rule, and recognising
-# these two types must not weaken it.
-#
-# Emitted by `backend/worker/main.py` from `PromotionAttempt.as_event()`, whose
-# payload is ids, counts, booleans and static reason codes only.
-CATALOG_EVENT_TYPES = frozenset({
-    "catalog_variant_promoted",
-    "catalog_promotion_refused",
-})
-
-# The authoritative acceptance vocabulary: every type a worker may durably
-# append (`backend/main.py` validates against exactly this). Recognition here
-# is exact set membership, never a substring or prefix test.
-EVENT_TYPES = V1_EVENT_TYPES | CATALOG_EVENT_TYPES
+# The event vocabulary is NOT declared here any more. `backend/event_registry`
+# is its ONE home: this module used to declare `V1_EVENT_TYPES` and
+# `CATALOG_EVENT_TYPES` and call their union the acceptance set, which named no
+# Swarm V2 type at all -- so the API refused `task_started` while the durable
+# sink below wrote it without checking anything. The names are re-exported so
+# every existing importer keeps working; the registry decides what they mean.
+EVENT_TYPES = registry.EVENT_TYPES
+V1_EVENT_TYPES = registry.V1_EVENT_TYPES
+SWARM_V2_EVENT_TYPES = registry.SWARM_V2_EVENT_TYPES
+CATALOG_EVENT_TYPES = registry.CATALOG_EVENT_TYPES
+OPERATIONAL_EVENT_TYPES = registry.OPERATIONAL_EVENT_TYPES
 
 class InvalidTransition(ValueError):
     pass
@@ -120,8 +93,7 @@ class InMemoryEventSink:
     def __init__(self) -> None:
         self.events: list[RunEventRecord] = []
     def emit(self, event: RunEventRecord) -> RunEventRecord:
-        if event.type not in EVENT_TYPES:
-            raise ValueError(f"unknown event type {event.type}")
+        require_known_event_type(event.type)
         self.events.append(event)
         return event
 
@@ -134,6 +106,12 @@ class SupabaseEventSink:
         self.attempt = attempt
         self.lease_token = lease_token
     def emit(self, event: RunEventRecord) -> RunEventRecord:
+        # THE durable boundary. This sink used to write whatever it was handed:
+        # the in-process sink's check above was therefore a test-only
+        # formality, and 27 real emitter types reached `run_events` having
+        # been validated by nothing at all. An unknown type is refused here,
+        # so no emitter can make one durable by going around the API.
+        require_known_event_type(event.type)
         if self.worker_id is not None:
             self.repo.append_run_event(event.run_id, event.type, event.as_payload(), worker_id=self.worker_id, attempt=self.attempt, lease_token=self.lease_token)
         else:

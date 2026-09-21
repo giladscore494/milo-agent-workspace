@@ -3,7 +3,7 @@
 import hashlib
 import json
 from datetime import UTC, datetime
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,13 +38,24 @@ from backend.schemas import (
     RunCreate,
     RunCreated,
     RunEvent,
+    RunIdentityRecord,
     RunUsage,
     WorkflowProposal,
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
     WorkerRunCompleteRequest, WorkerRunEventCreate, WorkerRunFailRequest,
 )
 from backend.rate_limit import enforce_rate_limit
-from backend.runtime import EVENT_TYPES, TERMINAL_STATES
+from backend.event_registry import is_known_event_type
+from backend.run_identity import (
+    PRODUCT_WORKFLOW_KEYS,
+    RUN_IDENTITY_FIELD,
+    RunIdentity,
+    RunIdentityError,
+    execution_identity_problems,
+    require_identity,
+)
+from backend.runtime import TERMINAL_STATES
+from backend.finalization import RunFinalizer, TerminalClaim
 from backend.worker_auth import WorkerIdentity, get_verified_worker
 from backend.workflow_proposals import compile_proposal, ensure_approved
 
@@ -119,6 +130,22 @@ def _safe_run_usage(raw: object) -> RunUsage | None:
     return usage if usage.model_dump(exclude_none=True) else None
 
 
+def _safe_run_identity(raw: object, run_id: object) -> RunIdentityRecord | None:
+    """Project only a TRUSTWORTHY stored identity onto the browser contract.
+
+    Browser reads stay available when legacy/corrupt identity is encountered,
+    but the identity itself is omitted. The frontend then renders a bounded
+    identity-unavailable state; it never falls back to today's project workflow.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return None
+    try:
+        identity = RunIdentity.from_record(raw, run_id=run_id)
+        return RunIdentityRecord.model_validate(identity.as_record())
+    except (RunIdentityError, ValidationError):
+        return None
+
+
 def _catalog_page_meta(page: catalog_review.CatalogPage) -> CatalogPageMeta:
     """The page metadata a bounded catalog read states.
 
@@ -149,6 +176,9 @@ def _safe_run_response(run: dict) -> dict:
     safe["launch_error_class"] = SAFE_LAUNCH_ERROR_CLASSES.get(launch_state)
     safe["launch_reconciliation_required"] = launch_state == "launch_unknown"
     safe["usage"] = _safe_run_usage(run.get("usage"))
+    # The run's own immutable identity, so the browser can render a historical
+    # run as the engine it WAS rather than as whatever its project is today.
+    safe["run_identity"] = _safe_run_identity(run.get(RUN_IDENTITY_FIELD), run.get("id"))
     safe.pop("launch_error", None)
     safe.pop("lease_token", None)
     return safe
@@ -195,19 +225,78 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
         metadata = {**metadata, "requested_by": str(user.user_id)}
         if idempotency_key:
             metadata["idempotency_key"] = idempotency_key
-        if hasattr(repo, "create_message_and_run"):
-            # Transaction-safe path (migration 012): idempotent replay,
-            # concurrency admission and message+run creation are atomic.
-            result = repo.create_message_and_run(conversation_id, content, metadata, user.user_id, idempotency_key, fingerprint, config.max_concurrent_runs_per_user, config.max_concurrent_runs_per_project)
-            run = result["run"]
-            if not result.get("created", True) and run.get("request_fingerprint") not in (None, fingerprint):
-                raise AppError("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409)
-        else:
-            # Legacy two-step path for simple test fakes only.
-            _enforce_concurrency_limits(repo, user, conversation_id)
-            message = repo.create_user_message(conversation_id, content, metadata)
-            run = repo.create_queued_run(conversation_id, message["id"], content, metadata, requested_by=user.user_id, idempotency_key=idempotency_key, request_fingerprint=fingerprint)
+
+        if not hasattr(repo, "create_message_and_run"):
+            # Console 6 requires identity to be part of the SAME durable
+            # transaction that inserts the run. A repository without that
+            # primitive cannot safely create an executable run.
+            raise AppError(
+                "RUN_IDENTITY_ATOMIC_CREATION_REQUIRED",
+                "repository cannot create a run with immutable identity atomically",
+                503,
+            )
+
+        project = repo.get_project(project_id) if project_id else {}
+        workflow_key = project.get("workflow_key")
+        new_run_id = uuid4()
+        try:
+            identity = RunIdentity.bind(new_run_id, str(workflow_key or ""))
+        except RunIdentityError as exc:
+            raise AppError(
+                "RUN_IDENTITY_NOT_BOUND",
+                "the run's immutable identity could not be established",
+                409,
+            ) from exc
+        if execution_identity_problems(identity):
+            # A run must not be born already unable to execute. In particular,
+            # an absent/malformed MILO_RELEASE_SHA is not recorded as an empty
+            # wildcard and left queued for a worker to refuse later.
+            raise AppError(
+                "RUN_IDENTITY_RUNTIME_MISMATCH",
+                "this runtime cannot bind an executable immutable run identity",
+                503,
+            )
+
+        # Transaction-safe path: idempotent replay, concurrency admission,
+        # message insert, run insert and immutable identity all commit together.
+        # The SQL function re-checks the trusted project workflow inside that
+        # same transaction, closing the read->insert drift window.
+        result = repo.create_message_and_run(
+            conversation_id,
+            content,
+            metadata,
+            user.user_id,
+            idempotency_key,
+            fingerprint,
+            config.max_concurrent_runs_per_user,
+            config.max_concurrent_runs_per_project,
+            run_id=new_run_id,
+            run_identity=identity.as_record(),
+        )
+        run = result["run"]
+        if not result.get("created", True) and run.get("request_fingerprint") not in (None, fingerprint):
+            raise AppError("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409)
+
     run_id = UUID(str(run["id"]))
+    # No executable run may cross the launch boundary without a persisted,
+    # readable identity. Legacy rows remain history, not runnable work.
+    try:
+        persisted_identity = require_identity(run)
+    except RunIdentityError as exc:
+        raise AppError(
+            "RUN_IDENTITY_REQUIRED",
+            "run has no trustworthy immutable identity and cannot be launched",
+            409,
+        ) from exc
+    if execution_identity_problems(persisted_identity):
+        # Includes idempotent replay of a queued run created by an older
+        # release/policy. Do not launch a Cloud Run execution that the worker
+        # is guaranteed to refuse at its own pre-claim identity gate.
+        raise AppError(
+            "RUN_IDENTITY_RUNTIME_MISMATCH",
+            "run identity does not match this runtime and cannot be launched",
+            409,
+        )
     if run.get("status") not in (None, "queued"):
         # Cancelled-before-launch or an already-progressed duplicate: never launch.
         return RunCreated(run_id=run["id"], status=run["status"])
@@ -478,69 +567,152 @@ def start_approved_proposal_run(proposal_id: UUID, request: ProposalRunCreate, u
 # execution flag gates the surface, but a verified, allowlisted worker
 # identity is always required in addition: the flag alone never authorizes.
 
+# ---------------------------------------------------------------------------
+# Worker mutation surfaces.
+# ---------------------------------------------------------------------------
+#
+# These nine routes are the HTTP face of the worker's durable writes, and they
+# were the alternate persistence path this repository's fencing did not cover.
+# A request proved it came from an approved worker SERVICE IDENTITY and was
+# then trusted to mutate run-owned state: events, tool access, tool grants,
+# evidence and -- through /complete and /fail -- the run's TERMINAL status. A
+# worker whose lease had been reclaimed still held valid credentials, so it
+# could finish a run another worker was executing.
+#
+# Four of them were additionally dead on arrival: `create_tool_usage`,
+# `create_source`, `create_claim` and `create_conflict` call repository methods
+# whose lease arguments became keyword-only and REQUIRED when the evidence
+# writes were fenced (migration 20260823000100), and the routes never passed
+# them, so every call raised TypeError. They were fenced at the repository and
+# left unfenced at the route.
+#
+# Every one of them now carries the same `run + attempt + worker + lease`
+# contract the in-process worker carries (`WorkerLeaseFence`), and every write
+# travels through the guarded RPC that settles it against the live lease under
+# the DATABASE clock. Identity answers "is this a worker?"; the fence answers
+# "is this THE worker of THIS attempt of THIS run?", and only the second one
+# stops a stale worker.
+#
+# `request.content()` is what gets written and it never includes the fence:
+# the lease token is a credential, and the guarded evidence RPCs refuse any
+# payload carrying one outright.
+
+
 @app.post("/runs/{run_id}/tool-access-requests", status_code=201)
 def create_tool_access_request(run_id: UUID, request: ToolAccessRequestCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "tool access requests")
-    row = repo.create_tool_access_request(run_id, request.model_dump())
-    repo.append_run_event(run_id, "tool_access_requested", {"message": f"{request.agent} requested {request.tool}", "agent": request.agent, "payload": row})
+    lease = request.lease()
+    row = repo.create_tool_access_request(run_id, request.content(), **lease)
+    repo.append_run_event(run_id, "tool_access_requested", {"message": f"{request.agent} requested {request.tool}", "agent": request.agent, "payload": row}, **lease)
     return row
 
 @app.post("/runs/{run_id}/tool-grants", status_code=201)
 def create_tool_grant(run_id: UUID, request: ToolGrantCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "tool grants")
-    payload = request.model_dump()
-    row = repo.create_tool_grant(run_id, payload)
-    repo.append_run_event(run_id, "tool_access_granted", {"message": f"{request.tool} granted to {request.agent}", "agent": request.agent, "payload": row})
+    lease = request.lease()
+    row = repo.create_tool_grant(run_id, request.content(), **lease)
+    repo.append_run_event(run_id, "tool_access_granted", {"message": f"{request.tool} granted to {request.agent}", "agent": request.agent, "payload": row}, **lease)
     return row
 
 @app.post("/runs/{run_id}/tool-usage", status_code=201)
 def create_tool_usage(run_id: UUID, request: ToolUsageCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "tool usage")
-    row = repo.create_tool_usage(run_id, request.model_dump())
-    repo.append_run_event(run_id, "tool_used", {"message": f"{request.agent} used {request.tool}", "agent": request.agent, "payload": row})
+    lease = request.lease()
+    row = repo.create_tool_usage(run_id, request.content(), **lease)
+    repo.append_run_event(run_id, "tool_used", {"message": f"{request.agent} used {request.tool}", "agent": request.agent, "payload": row}, **lease)
     return row
 
 @app.post("/runs/{run_id}/sources", status_code=201)
 def create_source(run_id: UUID, request: SourceCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "source recording")
-    row = repo.create_source(run_id, request.model_dump())
-    repo.append_run_event(run_id, "source_recorded", {"message": request.title, "agent": request.agent, "payload": row})
+    lease = request.lease()
+    row = repo.create_source(run_id, request.content(), **lease)
+    repo.append_run_event(run_id, "source_recorded", {"message": request.title, "agent": request.agent, "payload": row}, **lease)
     return row
 
 @app.post("/runs/{run_id}/claims", status_code=201)
 def create_claim(run_id: UUID, request: ClaimCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "claim recording")
-    row = repo.create_claim(run_id, request.model_dump())
-    repo.append_run_event(run_id, "claim_recorded", {"message": f"{request.entity_key}.{request.field_key}", "agent": request.agent, "payload": row})
+    lease = request.lease()
+    row = repo.create_claim(run_id, request.content(), **lease)
+    repo.append_run_event(run_id, "claim_recorded", {"message": f"{request.entity_key}.{request.field_key}", "agent": request.agent, "payload": row}, **lease)
     return row
 
 @app.post("/runs/{run_id}/conflicts", status_code=201)
 def create_conflict(run_id: UUID, request: ConflictCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "conflict recording")
-    row = repo.create_conflict(run_id, request.model_dump())
-    repo.append_run_event(run_id, "conflict_detected", {"message": f"{request.entity_key}.{request.field_key}", "payload": row})
+    lease = request.lease()
+    row = repo.create_conflict(run_id, request.content(), **lease)
+    repo.append_run_event(run_id, "conflict_detected", {"message": f"{request.entity_key}.{request.field_key}", "payload": row}, **lease)
     return row
 
 
 @app.post("/internal/runs/{run_id}/events", status_code=201)
 def create_worker_run_event(run_id: UUID, request: WorkerRunEventCreate, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "worker run events")
-    if request.event_type not in EVENT_TYPES:
-        raise AppError("UNKNOWN_EVENT_TYPE", f"unknown event type {request.event_type}", 422)
-    return repo.append_run_event(run_id, request.event_type, {"message": request.message, "agent": request.agent, "phase": request.phase, "progress": request.progress, "payload": {**request.payload, "worker_identity": worker.service_account_email}})
+    # The CANONICAL vocabulary (`backend/event_registry.py`). This check used
+    # to run against a set that named no Swarm V2 type at all, so the API
+    # refused `task_started` -- an event the V2 engine emits on every task --
+    # while the durable sink wrote it without checking anything.
+    if not is_known_event_type(request.event_type):
+        raise AppError("UNKNOWN_EVENT_TYPE", "unknown event type", 422)
+    return repo.append_run_event(run_id, request.event_type, {"message": request.message, "agent": request.agent, "phase": request.phase, "progress": request.progress, "payload": {**request.payload, "worker_identity": worker.service_account_email}}, **request.lease())
 
 
 @app.post("/internal/runs/{run_id}/complete")
 def complete_run_from_worker(run_id: UUID, request: WorkerRunCompleteRequest, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "worker run completion")
-    run = repo.mark_run_complete(run_id, request.output)
-    repo.append_run_event(run_id, "run_completed", {"message": "Run completed by worker", "payload": {"worker_identity": worker.service_account_email}})
-    return run
+    run = repo.get_run(run_id)
+    try:
+        identity = require_identity(run)
+    except RunIdentityError as exc:
+        raise AppError("RUN_IDENTITY_REQUIRED", "worker completion requires immutable run identity", 409) from exc
+    if identity.workflow_key not in PRODUCT_WORKFLOW_KEYS:
+        raise AppError(
+            "ENGINE_NOT_ALLOWED",
+            "control-plane run identity cannot use the product worker completion surface",
+            403,
+        )
+    if execution_identity_problems(identity):
+        raise AppError(
+            "RUN_IDENTITY_RUNTIME_MISMATCH",
+            "worker completion runtime does not match the run identity",
+            409,
+        )
+    finalizer = RunFinalizer(repo, run_id, identity.workflow_key, request.lease())
+    result = finalizer.finalize(TerminalClaim.product(
+        identity.workflow_key,
+        request.output,
+        event_payload={"worker_identity": worker.service_account_email},
+    ))
+    return repo.get_run(run_id) if result.status else run
 
 
 @app.post("/internal/runs/{run_id}/fail")
 def fail_run_from_worker(run_id: UUID, request: WorkerRunFailRequest, worker: WorkerIdentity = Depends(get_verified_worker), repo: Repository = Depends(get_repository)) -> dict:
     require_stage_enabled("MILO_ENABLE_EXECUTION_CONTROL", "worker run failure")
-    run = repo.mark_run_failed(run_id, request.code, request.message)
-    repo.append_run_event(run_id, "run_failed", {"message": request.message, "payload": {"code": request.code, "worker_identity": worker.service_account_email}})
-    return run
+    run = repo.get_run(run_id)
+    try:
+        identity = require_identity(run)
+    except RunIdentityError as exc:
+        raise AppError("RUN_IDENTITY_REQUIRED", "worker failure requires immutable run identity", 409) from exc
+    if identity.workflow_key not in PRODUCT_WORKFLOW_KEYS:
+        raise AppError(
+            "ENGINE_NOT_ALLOWED",
+            "control-plane run identity cannot use the product worker failure surface",
+            403,
+        )
+    if execution_identity_problems(identity):
+        raise AppError(
+            "RUN_IDENTITY_RUNTIME_MISMATCH",
+            "worker failure runtime does not match the run identity",
+            409,
+        )
+    finalizer = RunFinalizer(repo, run_id, identity.workflow_key, request.lease())
+    result = finalizer.finalize(TerminalClaim.failure(
+        identity.workflow_key,
+        request.code,
+        request.message,
+        event_payload={"worker_identity": worker.service_account_email},
+    ))
+    return repo.get_run(run_id) if result.status else run

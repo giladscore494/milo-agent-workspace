@@ -40,7 +40,7 @@
 
 import { reduceCatalogEvent } from './catalogStatus';
 import { EventId, compareEventIds, normalizeEventId } from './eventId';
-import { ownsCatalogProjection } from './eventVocabulary';
+import { isKnownEventType, ownsCatalogProjection, ownsSwarmProjection } from './eventVocabulary';
 import {
   MAX_SWARM_ACTIVITY_ITEMS,
   SwarmActivityItem,
@@ -179,6 +179,19 @@ export function reduceSwarmEvent(state: SwarmRunState, event: RunEvent): SwarmRu
   const type = event.event_type;
 
   let next: SwarmRunState = { ...state, lastEventId: eventId };
+
+  // The canonical registry grants projection ownership. A switch case by
+  // itself is never authority: if a name is removed from the registry it
+  // becomes inert here immediately instead of remaining a hidden frontend
+  // vocabulary. Operational events are globally known but own no Swarm
+  // projection, so they advance ordering and otherwise do nothing.
+  if (!ownsSwarmProjection(type) && !ownsCatalogProjection(type)) {
+    if (!isKnownEventType(type)) {
+      next = { ...next, unknownEventTypes: appendUnique(next.unknownEventTypes, type) };
+    }
+    return next;
+  }
+
   let recognized = true;
 
   switch (type) {
