@@ -60,7 +60,7 @@ A run created as V2 can never later look like V1, or the reverse.
 | `engine_version` | the reviewed engine contract version, from `ENGINE_VERSIONS` — the ONE place either engine's version is written down |
 | `policy_version` | `POLICY_SCHEMA_VERSION` |
 | `policy_fingerprint` | the digest of the REVIEWED runtime-policy envelope this image declares |
-| `release_sha` | `MILO_RELEASE_SHA`, the release the API was serving. `""` means "this deployment stated no release", never "any release" |
+| `release_sha` | Full 40-character `MILO_RELEASE_SHA` of the immutable release that created the run. New persisted identities cannot use an empty release; an unpinned historical identity is not executable or exportable. |
 | `event_registry_version` | the event vocabulary this run's durable stream speaks |
 
 The **reviewed** policy fingerprint is bound, not a deployment-resolved one:
@@ -71,18 +71,22 @@ SOURCE, which is exactly what makes it bindable to a release.
 
 ### Where it is enforced
 
-* **Application** — `backend/run_identity.py` cannot express a rewrite, and
-  `_bind_run_identity` in `backend/main.py` binds it once, after the run row
-  exists and BEFORE the worker launch. A run whose identity cannot be bound is
-  **not launched**.
+* **Application** — the API builds the identity before durable creation and
+  calls only the atomic `create_message_and_run_v3` path. It refuses a
+  missing/stale release, policy, event registry or engine identity before
+  launch. The product worker consumes the persisted identity before taking a
+  lease.
 * **Database** — `20260921000200_immutable_run_identity.sql`:
-  * `bind_run_identity` writes only while the column is null, is idempotent for
-    an identical re-bind, and refuses a different record;
-  * `runs_forbid_identity_rewrite` refuses ANY update that changes a non-null
-    `run_identity`, through any path: an RPC, a direct service-role write, or a
-    future writer nobody has written yet. An application guard is advisory
-    against a second writer; a trigger is not;
-  * a shape constraint rejects a stored record that is not an identity.
+  * every NEW run must be INSERTed with a complete identity;
+  * `create_message_and_run_v3` commits the message, run and immutable
+    identity in ONE transaction and re-checks the trusted project workflow;
+  * the superseded `bind_run_identity`, `create_message_and_run` and
+    `create_message_and_run_v2` primitives are removed;
+  * `runs_forbid_identity_rewrite` refuses every post-INSERT identity change,
+    including legacy `NULL → value` retrofits and erasure;
+  * `claim_run_lease` refuses identity-less legacy rows;
+  * the shape constraint requires a full release SHA and the reviewed
+    workflow/engine identity shapes.
 
 ### Legacy runs
 
@@ -91,11 +95,11 @@ before this release. `None` means exactly one thing — "created before
 identities existed" — and it is never a fallback for a record that is present
 and wrong, which raises like any other untrusted identity.
 
-An unpinned legacy run is readable and resumable through the legacy project
-route (reported as `ResolvedEngine.pinned is False`). It is **not exportable**
-and **not release-authorizable**. Nothing writes an identity onto it
-afterwards: binding one to a run that has already executed would be inventing
-history.
+An unpinned legacy run remains **readable history only**. It is not executable,
+not resumable, not exportable and not release-authorizable. Neither the API,
+the product worker nor the lease RPC may infer an engine from the project's
+current workflow, and nothing may retrofit an identity afterwards: doing so
+would invent history.
 
 ---
 
