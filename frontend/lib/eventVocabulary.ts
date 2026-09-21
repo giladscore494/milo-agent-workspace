@@ -134,6 +134,11 @@ export function ownsCatalogProjection(type: string): boolean {
   return CATALOG_EVENT_TYPES.has(type);
 }
 
+/** May this type fold into the Swarm V2 projection? */
+export function ownsSwarmProjection(type: string): boolean {
+  return SWARM_V2_EVENT_TYPES.has(type);
+}
+
 /**
  * May this type write the V1 projection — phase, progress, sources, claims,
  * conflicts, supervisor notes, checkpoints, raw errors and the event-derived
