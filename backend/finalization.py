@@ -38,19 +38,13 @@ them with one mechanism that answers three questions in one place.
    operator got there first -- is adopted rather than rewritten.
 
 4. WHEN may the decision be CLAIMED?  Only once it has durably won. The
-   terminal state is written first, under the lease and under a
-   compare-and-set on the state the decision was taken under; the terminal
-   event -- the only place the canonical ProductOutcome is recorded, and the
-   place Stage D reads it from -- is recorded after that write has won, never
-   before. Where the repository offers the atomic primitive
-   (``finalize_run``, migration 20260920000200) the two commit in one
-   transaction; otherwise the event follows the write, and a failure to record
-   a product's evidence is surfaced as ``TerminalEvidenceUnavailable`` rather
-   than hidden. So no ``run_completed`` and no ProductOutcome can exist for a
-   decision that did not become the run's durable state, and a cancellation
-   that lands between the decision and the write wins: the run is re-read
-   once, decided again under the state that actually holds, and both the
-   status and the event say ``cancelled``.
+   canonical ``finalize_run`` primitive (migration 20260920000200) commits
+   the terminal state and its terminal event in ONE lease-guarded,
+   compare-and-set transaction. There is no split persistence fallback. So no
+   ``run_completed`` and no ProductOutcome can exist for a decision that
+   did not become the run's durable state. If the state moves before the
+   atomic commit, the run is re-read once and the decision is re-evaluated
+   under the state that actually holds.
 
 Fencing is unchanged and still the outer boundary: every durable write carries
 the active lease, so a worker that lost its lease cannot terminalize at all.
@@ -135,14 +129,12 @@ class FinalizationUnavailable(AppError):
 
 
 class TerminalEvidenceUnavailable(AppError):
-    """The run is durably terminal, but its terminal event could not be recorded.
+    """Compatibility error type for historical callers.
 
-    Raised only on the fallback (non-atomic) path, and only for a PRODUCT
-    claim, whose canonical ProductOutcome lives on that event and nowhere
-    else. The run's state is the truth and stays; what failed is the job's
-    duty to record what it produced, and Stage D refuses a product-terminal
-    run that carries no recorded outcome (fail closed), so this is surfaced
-    rather than swallowed. A relaunch finds the run terminal and exits 0.
+    Current Console 6 persistence is atomic-only, so a successful terminal
+    write cannot commit without its terminal event. The class remains exported
+    to avoid an unnecessary API break, but the current persistence path does
+    not intentionally raise it.
     """
 
     def __init__(self, message: str) -> None:
@@ -299,9 +291,8 @@ class FinalizationResult:
     #: The run was already terminal in the database when this call ran.
     already_terminal: bool = False
     #: The terminal event this decision owes (the canonical ProductOutcome, for
-    #: a product) is durably recorded. Always true on the atomic path, where
-    #: it commits with the transition; on the fallback path it can be false,
-    #: and a product claim then raises TerminalEvidenceUnavailable.
+    #: a product) is durably recorded. Current persistence is atomic-only, so
+    #: this is true for every successful write.
     evidence_recorded: bool = True
 
     @property
@@ -472,13 +463,11 @@ class RunFinalizer:
 
         The order is the whole point. The terminal state is written FIRST,
         under the lease and under a compare-and-set on the state the decision
-        was taken under; the terminal event that claims the decision is
-        recorded only once that write has won. So no `run_completed` and no
-        ProductOutcome can ever exist for a decision that did not become the
-        run's durable state. Where the repository offers the atomic primitive
-        (`finalize_run`, migration 20260920000200) the two are one
-        transaction; otherwise the event follows the write and a failure to
-        record it is surfaced, never hidden.
+        was taken under. The canonical `finalize_run` primitive
+        (migration 20260920000200) commits that state and its terminal event in
+        one transaction; there is no split fallback. So no `run_completed`
+        and no ProductOutcome can ever exist for a decision that did not become
+        the run's durable state.
 
         A rejected write means the world moved between the read and the
         write. The run is re-read ONCE: a terminal state another path won is
@@ -521,8 +510,7 @@ class RunFinalizer:
 
     def _persist(self, claim: TerminalClaim, status: str,
                  observed: str | None) -> bool:
-        """Write the terminal state, then record its event. Returns whether
-        the event this decision owes is durably recorded."""
+        """Atomically commit terminal state and the event this decision owes."""
         event = self._terminal_event(claim, status)
         atomic = getattr(self.repo, "finalize_run", None)
         if not callable(atomic):
