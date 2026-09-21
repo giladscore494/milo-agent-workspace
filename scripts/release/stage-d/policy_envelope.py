@@ -176,7 +176,7 @@ def expected_run_identity(release_sha: str | None = None) -> dict[str, str]:
     `run_id` is deliberately absent: it is the one dimension that is a property
     of the run rather than of the release.
     """
-    from backend.event_registry import REGISTRY_VERSION
+    from backend.event_registry import REGISTRY_VERSION, fingerprint as event_registry_fingerprint
     from backend.run_identity import (ENGINE_VERSIONS, IDENTITY_VERSION,
                                       PRODUCT_WORKFLOW_KEYS, engine_version_for)
 
@@ -199,6 +199,7 @@ def expected_run_identity(release_sha: str | None = None) -> dict[str, str]:
         "policy_fingerprint": POLICY.fingerprint(),
         "release_sha": sha,
         "event_registry_version": REGISTRY_VERSION,
+        "event_registry_fingerprint": event_registry_fingerprint(),
     }
 
 
