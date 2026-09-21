@@ -69,7 +69,10 @@ LEDGER_COUNTERS: tuple[str, ...] = (
     # logical task executions that completed / failed (Swarm V2)
     "tasks_completed",
     "tasks_failed",
-    # search-tool invocations (interface only: no search tool is registered)
+    # internet searches the run really performed. V1 offers a model MILO's
+    # own `web_search` function tool and performs each admitted invocation
+    # itself, so this counter is what `max_search_invocations_per_run` is
+    # taken against BEFORE each search runs -- not a total read afterwards.
     "search_invocations",
     # Commander replans, including the correction round (which IS a replan)
     "replans",

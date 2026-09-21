@@ -72,7 +72,10 @@ model calls, provider attempts (admitted requests, including ones that
 raised), provider failures, input/output/total tokens, estimated and
 recorded cost, semantic retries, provider backpressure events, agent steps,
 tool calls, task executions (completed / failed), search invocations and
-search cost (interface only; no search tool is registered), replans and
+search cost (really consumed: V1 performs each admitted internet search
+itself, and `max_search_invocations_per_run` is taken BEFORE each one runs —
+see PROVIDER_AUTHORITY.md; the per-invocation PRICE remains an interface at
+0.00 until a verified provider price is configured), replans and
 correction rounds, elapsed seconds.
 
 **Durable record.** `run_execution_usage` holds one row per run: the full
