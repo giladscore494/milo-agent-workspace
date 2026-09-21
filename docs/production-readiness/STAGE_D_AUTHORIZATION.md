@@ -515,12 +515,20 @@ spending/wallet ceiling on the Moonshot account** therefore remains a
 operator must confirm the configured ceiling, and its value, before granting
 the authorization, and record it in §9.
 
-**This IS a runtime change to the preserved pipeline**, which the superseded
-text said would have to be proposed and reviewed as its own release. It was:
-it is not bundled into this authorization request, it changes
-`backend/engines/vehicle_catalog_v1/core.py`, and it invalidates the pinned
-accepted image digests. Stage D must be re-authorized against the merged
-release SHA with fresh digests before it is relied on.
+**The superseded text ended "No runtime change is proposed here."** It then
+said an enforceable per-run web-search invocation cap would mean changing
+`backend/engines/vehicle_catalog_v1/core.py`, that this is a runtime change to
+the preserved pipeline, that it would invalidate the pinned accepted image
+digests, and that it must be proposed and reviewed as its own release.
+
+All of that was correct, and it is what happened. The cap exists because a
+separate reviewed release built it; it is **not** bundled into this
+authorization request, it **does** change
+`backend/engines/vehicle_catalog_v1/core.py`, and it **does** invalidate the
+pinned accepted image digests — as the banner at the top of this document
+already records for the releases before it. Stage D must be re-authorized
+against the merged release SHA, with digests rebuilt from it, before any of
+this document is relied on.
 
 ## 4. The prepared Government capture run — an invariant, never a Stage D run
 
