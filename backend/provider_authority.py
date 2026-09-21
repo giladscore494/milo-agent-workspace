@@ -810,7 +810,8 @@ class ProviderAdapter:
             raise
 
     def _settle_searches(self, reservation: int | None, actual: int | None,
-                         *, after: BaseException | None = None) -> None:
+                         *, after: BaseException | None = None,
+                         pre_execution: bool = False) -> None:
         """Release a reservation, without changing what is KNOWN about the request.
 
         Settlement can itself refuse -- a tripped search or cost ceiling -- and
@@ -833,7 +834,7 @@ class ProviderAdapter:
         if not callable(settle):
             return
         try:
-            settle(reservation, actual=actual)
+            settle(reservation, actual=actual, pre_execution=pre_execution)
         except BaseException as refusal:
             refusal.provider_request_completed = (
                 True if after is None else classify_outcome(after).completion_proven)
@@ -938,7 +939,7 @@ class ProviderAdapter:
             # rather than charging for one MILO never got to perform.
             self._settle_searches(reservation, 0)
             raise
-        self._settle_searches(reservation, 1)
+        self._settle_searches(reservation, 1, pre_execution=True)
         return waited
 
     def run_search(self, query: Any, *, endpoint: str = SEARCH_BASIC,
