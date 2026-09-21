@@ -129,6 +129,14 @@ RUN_LEVEL_EVENT_TYPES = frozenset({
 #: Supabase sink and filed as unknown by the browser. They are legitimate V2
 #: events and they are declared here.
 SWARM_V2_EVENT_TYPES = frozenset({
+    # Shared run lifecycle emitted by the canonical worker around V2. These
+    # intentionally overlap V1: the registry describes projection ownership,
+    # and the Swarm reducer may only fold names granted here.
+    "run_created", "run_started", "run_resumed", "run_completed",
+    "run_partial_success", "run_failed", "run_cancelled", "run_timed_out",
+    "cancellation_requested", "budget_warning", "budget_exhausted",
+    "token_limit_reached", "checkpoint_saved",
+    # V2 engine/executor events.
     "commander_plan_created", "commander_replanned",
     "task_ready", "task_started", "task_completed", "task_failed",
     "tool_called", "worker_output_repair_started",
