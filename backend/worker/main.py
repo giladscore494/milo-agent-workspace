@@ -531,7 +531,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # else about a provider request was stated in one place, and two
         # of the four surfaces classified 503 differently.
         # =============================================================
-        from backend.provider_authority import ProviderAdapter
+        from backend.provider_authority import ProviderAdapter, provider_base_url
         from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
         from backend.standalone_search import build_default_search_executor
 
@@ -558,6 +558,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # bucket BEFORE calling it. Built here, on the worker's own
                 # deadline, so search shares the request bound chat has.
                 search_executor=build_default_search_executor(
+                    base_url=provider_base_url(),
                     deadline_seconds=provider_request_deadline))
 
         if engine is None and engine_registry is None and engine_mode == "mock":
@@ -693,7 +694,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker, request_deadline_seconds=provider_request_deadline),
                     # The SAME adapter instance V1 is given above.
                     adapter=provider_adapter, api_key=worker_provider_api_key(),
-                    base_url=os.getenv("MILO_MODEL_BASE_URL", "https://api.moonshot.ai/v1"),
+                    base_url=provider_base_url(),
                     # Sanitized, server-owned descriptors: Commander sees each
                     # registered tool's operations and schemas, and the SAME
                     # descriptors are the firewall's only tool authority.
