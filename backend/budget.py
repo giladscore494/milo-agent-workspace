@@ -34,7 +34,6 @@ from backend.execution_usage import (LEDGER_AMOUNTS, LEDGER_COUNTERS, LEDGER_SCH
                                      validate_usage_snapshot)
 from backend.provider_authority import (ProviderOutcome, ProviderVerdict,
                                         classify_outcome)
-from backend.provider_scheduler import is_provider_rate_limit_error
 from backend.runtime import CancellationRequested
 from backend.runtime_policy import BUDGET as _POLICY_BUDGET_SURFACE
 from backend.runtime_policy import dimensions_for as _policy_dimensions_for
@@ -725,8 +724,15 @@ class BudgetTracker:
             self.search_cost += amount
             if amount:
                 self.actual_cost += amount
-            self._ledger("search", search_invocations=self.search_invocations,
-                         search_cost=round(amount, 6))
+            # NO per-call `run_usage_ledger` row. That relation's `decision`
+            # vocabulary is closed and enforced by a CHECK constraint
+            # (reserved/settled/rejected/overage/released), and it has no
+            # search columns, so a "search" row would be refused by the
+            # database and would carry nothing if it were not. Search
+            # consumption becomes durable the same way every other ledger
+            # dimension does: `_record()` writes the whole ExecutionUsageLedger
+            # snapshot, whose jsonb already carries `search_invocations` and
+            # `search_cost` and merges them component-wise.
             self._record()
             if (cfg.max_search_invocations_per_run is not None
                     and self.search_invocations > cfg.max_search_invocations_per_run):

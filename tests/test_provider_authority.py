@@ -455,6 +455,52 @@ def test_a_standalone_search_consumes_qps_and_run_accounting():
     assert not coordinator.try_admit_search("search")[0]
 
 
+def test_every_ledger_decision_the_tracker_emits_is_one_the_database_accepts():
+    """A guard against the class of bug this file nearly shipped.
+
+    `run_usage_ledger.decision` is a CHECK-constrained vocabulary. A tracker
+    that invents a new decision name writes a row the database refuses -- at
+    runtime, mid-run, on a paid call. So the names the tracker can emit are
+    checked against the migration that defines them.
+    """
+    import ast
+    import inspect
+    import re
+    from pathlib import Path as _Path
+
+    from backend import budget as budget_module
+
+    emitted = set()
+    for node in ast.walk(ast.parse(inspect.getsource(budget_module))):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_ledger" and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            emitted.add(node.args[0].value)
+    assert emitted, "no ledger decisions found at all"
+
+    migrations = _Path(__file__).resolve().parents[1] / "supabase" / "migrations"
+    allowed: set[str] = set()
+    for path in sorted(migrations.glob("*.sql")):
+        for match in re.finditer(r"check\s*\(decision in \(([^)]*)\)\)",
+                                 path.read_text(encoding="utf-8")):
+            allowed = {value.strip().strip("'") for value in match.group(1).split(",")}
+    assert allowed, "no decision vocabulary found in the migrations"
+    assert emitted <= allowed, f"the tracker emits decisions the database refuses: {emitted - allowed}"
+
+
+def test_a_search_is_durable_through_the_execution_usage_snapshot():
+    """It has no per-call ledger row, so the snapshot is the durable record."""
+    recorded: list[dict] = []
+    tracker = BudgetTracker(BudgetConfig(estimated_cost_per_call=0.0,
+                                         search_cost_per_invocation=0.03),
+                            kill_switch=lambda: True,
+                            usage_recorder=lambda snapshot: recorded.append(dict(snapshot)))
+    tracker.record_search()
+    assert recorded, "a search recorded nothing durable at all"
+    assert recorded[-1]["search_invocations"] == 1
+    assert recorded[-1]["search_cost"] == pytest.approx(0.03)
+
+
 def test_the_search_bound_and_price_come_from_the_runtime_policy():
     from backend.runtime_policy import BUDGET, dimensions_for, reviewed_first_run_policy
 
