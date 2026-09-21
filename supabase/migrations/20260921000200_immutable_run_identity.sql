@@ -125,6 +125,28 @@ create trigger runs_forbid_identity_rewrite
   for each row
   execute function public.runs_forbid_identity_rewrite();
 
+-- Existing rows may legitimately be NULL because they predate this migration.
+-- New rows may not. A BEFORE INSERT trigger gives exactly that distinction
+-- without making harmless maintenance updates to legacy terminal rows fail.
+create or replace function public.runs_require_identity_on_insert()
+returns trigger
+language plpgsql
+as $
+begin
+  if new.run_identity is null then
+    raise exception 'RUN_IDENTITY_REQUIRED: new runs must be born with immutable identity'
+      using errcode = '23514';
+  end if;
+  return new;
+end;
+$;
+
+drop trigger if exists runs_require_identity_on_insert on public.runs;
+create trigger runs_require_identity_on_insert
+  before insert on public.runs
+  for each row
+  execute function public.runs_require_identity_on_insert();
+
 -- ---------------------------------------------------------------------------
 -- 3) Atomic message + run creation WITH immutable identity.
 -- ---------------------------------------------------------------------------
