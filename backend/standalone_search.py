@@ -43,6 +43,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
+from backend.provider_authority import DEFAULT_PROVIDER_BASE_URL, provider_base_url
+
 # =============================================================================
 # 1. THE TOOL MILO OFFERS
 # =============================================================================
@@ -332,8 +334,26 @@ def normalize_results(payload: Any) -> tuple[SearchResult, ...]:
         title = row.get("title") or row.get("name") or row.get("heading")
         url = (row.get("url") or row.get("link") or row.get("source_url")
                or row.get("href"))
-        snippet = (row.get("snippet") or row.get("content") or row.get("text")
-                   or row.get("summary") or row.get("description"))
+        # Search Pro returns query-ranked page passages in chunks. For MILO's
+        # research/agent path those passages are the useful grounded material;
+        # flatten them into the existing bounded snippet field so the
+        # model-facing contract does not grow a second result schema.
+        chunks = row.get("chunks")
+        chunk_texts: list[str] = []
+        if isinstance(chunks, Sequence) and not isinstance(chunks, (str, bytes)):
+            for chunk in chunks:
+                if isinstance(chunk, Mapping):
+                    text = chunk.get("text")
+                elif isinstance(chunk, str):
+                    text = chunk
+                else:
+                    text = None
+                clipped = _clip(text, MAX_RESULT_SNIPPET_CHARS)
+                if clipped:
+                    chunk_texts.append(clipped)
+        snippet = ("\n".join(chunk_texts) if chunk_texts else
+                   (row.get("snippet") or row.get("content") or row.get("text")
+                    or row.get("summary") or row.get("description")))
         result = SearchResult(title=_clip(title, MAX_RESULT_TITLE_CHARS),
                               url=_clip(url, MAX_RESULT_URL_CHARS),
                               snippet=_clip(snippet, MAX_RESULT_SNIPPET_CHARS))
@@ -351,20 +371,15 @@ def normalize_results(payload: Any) -> tuple[SearchResult, ...]:
 #: paced; until now nothing in production called them.
 SEARCH_ENDPOINT_PATHS = {"search": "/tools/search", "search_pro": "/tools/search_pro"}
 
-DEFAULT_SEARCH_BASE_URL = "https://api.moonshot.ai/v1"
+# Compatibility name for callers/tests that imported the old search-local
+# default. The value now comes from the provider authority; there is only one
+# default and one environment resolver for chat and search.
+DEFAULT_SEARCH_BASE_URL = DEFAULT_PROVIDER_BASE_URL
 
 
 def search_base_url() -> str:
-    """The provider base a standalone search is sent to.
-
-    Deliberately the SAME variable the worker resolves the chat base from,
-    rather than a search-specific one: a second knob is a second thing a
-    deployment can get wrong, and there is no reviewed reason for search and
-    chat to address different hosts. A deployment that ever needs them split
-    adds that as a reviewed change, with an inventory entry.
-    """
-    return (os.getenv("MILO_MODEL_BASE_URL")
-            or DEFAULT_SEARCH_BASE_URL).strip().rstrip("/")
+    """The canonical provider base used by standalone search."""
+    return provider_base_url()
 
 
 def search_api_key() -> str:
