@@ -340,18 +340,18 @@ checklist. It exits non-zero unless **all** of the following hold:
   about that pipeline; the setup probe refuses a forbidden project id or a
   mismatched workflow key.
 - **Cost ceiling — read this before authorizing.**
-  `MILO_MAX_COST_PER_RUN=1.00` is a hard cap on **tracked token-derived
-  cost only**. Moonshot bills the builtin `$web_search` tool per
-  invocation, outside MILO's accounting, and **nothing in this repository
-  caps the number of invocations**: `core.py` bounds tool-echo rounds at
-  `MAX_TOOL_ROUNDS = 15` but iterates every `message.tool_calls` entry
-  within a round, and that count is the provider's to choose. Total spend
-  is therefore **not bounded by this repository**. A verified hard
-  spending/wallet ceiling on the provider account is a **prerequisite**
-  of the authorization. The official per-call fee is currently $0.005 and
-  the legacy `$web_search` tool is announced for retirement on
-  2026-10-20; re-check both before the run, and verify the actual billed
-  total after it. See `STAGE_D_AUTHORIZATION.md` §3.6.
+  `MILO_MAX_COST_PER_RUN=1.00` is the hard **recorded-cost** cap. V1
+  Production search is now MILO-mediated through the standalone REST search
+  API, one admitted invocation at a time, and every admitted search books a
+  conservative **$0.003** into `search_cost` / `actual_cost` before it
+  executes. Current official international Kimi pricing is $0.002/call for
+  Search Basic and $0.003/call for Search Pro when a successful response
+  contains results, so the booked value safely covers both endpoints. The run
+  is also hard-capped at 60 search invocations, so search can contribute at
+  most **$0.18 recorded** and that amount is already inside the $1.00 cap.
+  The legacy `$web_search` remains $0.005/call and is announced for
+  retirement on 2026-10-20, but Production no longer offers it. See
+  `STAGE_D_AUTHORIZATION.md` §3.6.
 - **Acceptance policy**: only `completed` is a PASS.
   `failed`/`cancelled`/`timed_out`/`budget_exhausted`/`partial_success`
   fail the run — the poll and evidence gates exit non-zero and instruct
