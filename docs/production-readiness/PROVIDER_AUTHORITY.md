@@ -130,7 +130,7 @@ V1 decides search is needed
   -> ProviderAdapter.run_search
        1. query + transport resolved      (free: refusals here cost nothing)
        2. run allowance taken             max_search_invocations_per_run
-       3. endpoint QPS bucket taken       /v1/tools/search
+       3. endpoint QPS bucket taken       /v1/tools/search_pro
        4. invocation + cost charged       durable, through the ledger snapshot
        5. exactly ONE standalone search   MoonshotStandaloneSearch
   -> results become the tool message
