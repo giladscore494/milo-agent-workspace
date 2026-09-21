@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from backend import provider_authority
 from backend.engines.vehicle_catalog_v1 import core
 from backend.engines.vehicle_catalog_v1.adapter import VehicleCatalogV1Adapter
 
@@ -24,7 +25,17 @@ def legacy_app():
 
 
 def test_preserved_numeric_limits_and_model_settings():
-    assert core.MOONSHOT_BASE_URL == "https://api.moonshot.ai/v1"
+    # The provider host is still preserved, but it is no longer a V1-LOCAL
+    # constant: `core.MOONSHOT_BASE_URL` was a duplicate of the one canonical
+    # base the whole runtime resolves, and a second copy of a host is a second
+    # thing that can drift. What this guard is for is the VALUE, so it is
+    # asserted where the value now lives.
+    assert provider_authority.DEFAULT_PROVIDER_BASE_URL == "https://api.moonshot.ai/v1"
+    # ...and that V1 reads it through that one resolver rather than keeping
+    # its own again.
+    assert core.provider_base_url is provider_authority.provider_base_url
+    assert not hasattr(core, "MOONSHOT_BASE_URL"), (
+        "V1 grew a second provider host constant back")
     assert core.KIMI_MODEL == "kimi-k2.6"
     assert core.SEARCH_TEMPERATURE == 0.6
     assert core.CONSOLIDATION_TEMPERATURE == 0.6
