@@ -155,6 +155,11 @@ V1_TOOL_OPERATION = f"{V1_EVIDENCE_TOOL}.{V1_EVIDENCE_OPERATION}"
 #: The task provenance every V1 evidence row carries.
 V1_TASK_KEY = "vehicle_catalog_v1.verification"
 
+#: How many claims one AUTHORITATIVE current-state read asks about. Mirrors
+#: the default bound of `claim_current_verdict_states` in both repositories, so
+#: a chunk is never silently truncated by the read it is sent to.
+MAX_CURRENT_VERDICT_CLAIMS = 200
+
 #: The verification mode V1 decides in. A located value compared against the
 #: record it was read from is a deterministic STRUCTURED decision, which is
 #: also the only mode whose `verified` answers may cite durable evidence.
@@ -751,13 +756,24 @@ class V1EvidenceAuthority:
         reasons: dict[str, list[str]] = {}
         verified: dict[str, list[str]] = {}
         durable_claims = durable_verdicts = 0
+        # Settle EVERY verdict first, then ask about all of them in ONE read.
+        # The order is what matters -- a claim's state is still read after its
+        # own verdict was settled -- and asking per claim would be one round
+        # trip per FIELD of every model of the run.
+        local = {id(claim): decide_verdict(claim, contradicted=contradicted,
+                                           flagged_models=flagged_models,
+                                           israel_required=israel_required)
+                 for claim in claims}
+        settled_rows = {id(claim): self._settle(claim, *local[id(claim)])
+                        for claim in claims if claim.durable}
+        states = self._current_states([claim for claim in claims
+                                       if settled_rows.get(id(claim)) is not None])
         for claim in claims:
-            verdict, reason = decide_verdict(claim, contradicted=contradicted,
-                                             flagged_models=flagged_models,
-                                             israel_required=israel_required)
+            verdict, reason = local[id(claim)]
             if claim.durable:
                 durable_claims += 1
-                verdict, reason, settled = self._durable_answer(claim, verdict, reason)
+                verdict, reason, settled = self._durable_answer(
+                    claim, verdict, reason, row=settled_rows.get(id(claim)), states=states)
                 durable_verdicts += 1 if settled else 0
             key = model_key(claim.model_name)
             decided.append((claim.model_name, claim.field_key, verdict, reason))
@@ -773,8 +789,9 @@ class V1EvidenceAuthority:
             verified_fields={key: tuple(sorted(set(value)))
                              for key, value in verified.items()})
 
-    def _durable_answer(self, claim: FieldClaim, verdict: str,
-                        reason: str) -> tuple[str, str, bool]:
+    def _durable_answer(self, claim: FieldClaim, verdict: str, reason: str, *,
+                        row: Mapping[str, Any] | None,
+                        states: Mapping[str, CurrentVerdict] | None) -> tuple[str, str, bool]:
         """What ONE claim's verdict is once durability has been PROVEN.
 
         This is where `verified` stops being a local decision. Three things
@@ -802,14 +819,18 @@ class V1EvidenceAuthority:
         proof: it keeps its own verdict and reason whether or not the durable
         write succeeded. `settled` is reported separately so the report counts
         durable verdicts rather than accepted ones.
+
+        `row` is what the durable verdict write returned (None when nothing
+        was written) and `states` is the batched answer to "which of these is
+        current" -- None when that read could not be made at all, which is the
+        second requirement failing for every claim at once.
         """
-        row = self._settle(claim, verdict, reason)
         settled = row is not None
         if verdict != "verified":
             return (verdict, reason, settled)
         if not settled:
             return ("needs_review", "V1_EVIDENCE_VERDICT_NOT_DURABLE", False)
-        state = self._current_state(claim)
+        state = None if states is None else states.get(str(claim.claim_id))
         if state is None:
             return ("needs_review", "V1_EVIDENCE_CURRENT_STATE_UNAVAILABLE", True)
         if state.authorizes(row.get("id")):
@@ -852,13 +873,21 @@ class V1EvidenceAuthority:
             return None
         return row
 
-    def _current_state(self, claim: FieldClaim) -> CurrentVerdict | None:
-        """The AUTHORITATIVE current state of one claim, or `None`.
+    def _current_states(self,
+                        claims: Sequence[FieldClaim]) -> dict[str, CurrentVerdict] | None:
+        """The AUTHORITATIVE current state of these claims, or `None`.
 
-        `None` means the question could not be answered -- no repository, no
-        such read, no lease, a failed read, a malformed row, or no row for this
-        claim -- and it is never the same thing as an answer. The caller fails
-        closed on it.
+        `None` means the question could not be ASKED or ANSWERED -- no
+        repository, no such read, no lease, a failed read -- and it is never
+        the same thing as an answer: the caller fails closed on it for every
+        claim. A claim simply MISSING from the answer is the same failure for
+        that one claim, because it is absent from the returned map.
+
+        One read per `MAX_CURRENT_VERDICT_CLAIMS` claims rather than one per
+        claim: a V1 run states a handful of fields for every model it found,
+        and a round trip per field would make confirming the evidence cost
+        more than gathering it. A chunk that fails fails the whole answer,
+        which is the fail-closed direction.
 
         A LOST LEASE is the one failure that escapes: this worker is no longer
         the run's writer, and that has to reach the worker's lease handling
@@ -868,24 +897,29 @@ class V1EvidenceAuthority:
         read = getattr(self._repository, "claim_current_verdict_states", None)
         if not callable(read) or lease is None:
             return None
-        try:
-            rows = read(lease.run_id, [str(claim.claim_id)], limit=1)
-        except AppError as failure:
-            if failure.code in LEASE_FAILURE_CODES:
-                raise
-            return None
-        except Exception:
-            return None
-        if not isinstance(rows, (list, tuple)):
-            return None
-        for row in rows:
+        identifiers = [str(claim.claim_id) for claim in claims if claim.claim_id]
+        resolved: dict[str, CurrentVerdict] = {}
+        for start in range(0, len(identifiers), MAX_CURRENT_VERDICT_CLAIMS):
+            chunk = identifiers[start:start + MAX_CURRENT_VERDICT_CLAIMS]
             try:
-                state = parse_current_verdict(row)
-            except CurrentVerdictError:
-                continue
-            if state.claim_id == str(claim.claim_id):
-                return state
-        return None
+                rows = read(lease.run_id, chunk, limit=len(chunk))
+            except AppError as failure:
+                if failure.code in LEASE_FAILURE_CODES:
+                    raise
+                return None
+            except Exception:
+                return None
+            if not isinstance(rows, (list, tuple)):
+                return None
+            for row in rows:
+                try:
+                    state = parse_current_verdict(row)
+                except CurrentVerdictError:
+                    # A malformed answer is not a weaker one: the claim it was
+                    # about stays absent, and absent fails closed.
+                    continue
+                resolved[state.claim_id] = state
+        return resolved
 
 
 def apply_evidence_authority(verifier_data: Any, report: V1EvidenceReport) -> Any:
@@ -925,7 +959,8 @@ def apply_evidence_authority(verifier_data: Any, report: V1EvidenceReport) -> An
     return verifier_data
 
 
-__all__ = ["MAX_SOURCE_URL_CHARS", "V1_ACCEPTED_REASON", "V1_EVIDENCE_FIELDS",
+__all__ = ["MAX_CURRENT_VERDICT_CLAIMS", "MAX_SOURCE_URL_CHARS", "V1_ACCEPTED_REASON",
+           "V1_EVIDENCE_FIELDS",
            "V1_EVIDENCE_OPERATION",
            "V1_EVIDENCE_TOOL", "V1_FIELD_UNITS", "V1_FLAGGED_STATUSES",
            "V1_IDENTITY_FIELDS", "V1_TASK_KEY", "V1_TOOL_OPERATION",

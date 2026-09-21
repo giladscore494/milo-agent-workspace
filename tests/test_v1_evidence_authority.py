@@ -454,6 +454,35 @@ def test_only_the_exact_current_supported_verdict_verifies_a_field(repository):
         assert state["support_count"] == 1
 
 
+def test_the_authoritative_read_is_asked_once_for_the_whole_run(repository):
+    """Confirming the evidence must not cost more than gathering it.
+
+    A V1 run states a handful of fields for every model it found, so a
+    round trip per FIELD would be hundreds of reads. Every verdict is settled
+    first and the whole run is asked about in one bounded, chunked read --
+    which changes no semantics, because a claim's state is still read after
+    its own verdict was settled.
+    """
+    lease = leased_run(repository)
+    asked: list[list[str]] = []
+
+    def counting(run_id, claim_ids, limit):
+        asked.append(list(claim_ids or []))
+        return repository.claim_current_verdict_states(run_id, claim_ids, limit=limit)
+
+    technical = engines_record()
+    technical["transmission_drivetrain_performance_agent"] = {
+        "agent": "transmission_drivetrain_performance_agent",
+        "items": [{"model": "RAV4", "drivetrain": "AWD", "transmission": "eCVT",
+                   "sources": [ISRAELI_URL]}]}
+    report = settle(repository, lease, technical,
+                    reader=RepositoryView(repository, counting))
+
+    assert report.verified("RAV4") and report.durable_verdicts == 6
+    assert len(asked) == 1 and len(asked[0]) == 6
+    assert len(rows_of(repository, "claim_verdict")) == 6
+
+
 def test_every_demotion_reason_is_a_static_bounded_code():
     """A refusal names a PROPERTY, from the closed vocabulary, and nothing else."""
     for code in ("V1_EVIDENCE_VERDICT_NOT_DURABLE", "V1_EVIDENCE_CURRENT_STATE_UNAVAILABLE",
