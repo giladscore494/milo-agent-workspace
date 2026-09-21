@@ -487,33 +487,28 @@ is a ceiling rather than a number observed afterwards.
 
 Search consumption is also no longer untracked: `search_invocations` and
 `search_cost` are durable in the ExecutionUsageLedger snapshot, and recorded
-search cost reaches `actual_cost`, so `MILO_MAX_COST_PER_RUN` binds on it
-once a price is configured.
+search cost reaches `actual_cost`, so `MILO_MAX_COST_PER_RUN` binds on it.
 
-**The dollar figure is still the provider's, and is still unverified here.**
-`search_cost_per_invocation` defaults to **0.00** because no verified price
-for the standalone `/v1/tools/search` endpoints was recoverable; it is a
-price interface, not an invented number. The provider's documentation states
-**$0.005 per legacy `$web_search` call** and that the legacy builtin is
-**retired on 2026-10-20** — both are the provider's figures, both must be
-re-checked against the console immediately before any run, and neither is a
-statement about the standalone endpoints this runtime now calls. Moving off
-the retiring builtin is an independent benefit of the change, not its motive.
+**The standalone dollar price is now verified from the current official
+international Kimi pricing page.** Search Basic is **$0.002/call** and Search
+Pro is **$0.003/call** when the request succeeds with HTTP 200 and returns a
+non-empty `search_results` array. MILO deliberately books the higher
+**$0.003 for every admitted standalone search before execution**, regardless
+of endpoint or eventual result, so failures/empty responses can only
+over-count internally; a billed standalone search cannot be omitted from the
+recorded-cost ceiling. The legacy builtin remains **$0.005/call** and is
+announced for retirement on **2026-10-20**, but Production no longer uses it.
 
 | Component | Bound | Basis |
 | --- | --- | --- |
-| Token-billed (tracked) | **≤ $1.00, hard** | enforced by the budget tracker and verified three ways after the run |
+| Recorded total cost | **≤ $1.00, hard** | `MILO_MAX_COST_PER_RUN`; includes token cost plus conservative standalone-search charges |
 | Search invocations | **≤ 60 per run, hard** | `max_search_invocations_per_run`, admitted before each individual search executes |
-| Search fees in dollars | **60 × the provider's per-search price** | the count is MILO's and enforced; the **price is the provider's and is NOT verified in this repository** |
-| Total | **bounded in count, not proven in dollars** | see the mandatory control below |
+| Search fee booked by MILO | **$0.003 per admitted search** | covers current official international Basic ($0.002) and Pro ($0.003) prices conservatively |
+| Search contribution at the run ceiling | **≤ $0.18 recorded** | 60 × $0.003; this amount is already inside the $1.00 recorded-cost ceiling |
 
-**Mandatory control before authorization — UNCHANGED.** The count is now
-bounded; the price is not established, and the standalone endpoints' billing
-behaviour has not been exercised against the live provider. A **verified hard
-spending/wallet ceiling on the Moonshot account** therefore remains a
-**prerequisite** of this authorization, not an optional precaution. The
-operator must confirm the configured ceiling, and its value, before granting
-the authorization, and record it in §9.
+A provider-account spending/wallet ceiling remains a prudent independent
+operator control, but the repository no longer depends on an unknown search
+price to claim that its own recorded-cost ceiling includes search spend.
 
 **The superseded text ended "No runtime change is proposed here."** It then
 said an enforceable per-run web-search invocation cap would mean changing
