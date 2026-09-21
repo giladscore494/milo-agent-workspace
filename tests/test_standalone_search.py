@@ -37,7 +37,9 @@ from backend.provider_scheduler import (ProviderBackpressureExceeded,
 from backend.standalone_search import (MAX_RESULTS_PER_SEARCH,
                                        MEDIATED_SEARCH_TOOL_NAME,
                                        PROVIDER_BUILTIN_SEARCH_NAME,
+                                       MIN_STANDALONE_SEARCH_TIMEOUT_SECONDS,
                                        STANDALONE_SEARCH_TIMEOUT_SECONDS,
+                                       standalone_search_timeout_seconds,
                                        MoonshotStandaloneSearch, SearchOutcome,
                                        SearchResult, SearchTransportError,
                                        SearchUnavailable, normalize_results,
@@ -357,6 +359,55 @@ def test_the_standalone_transport_posts_one_request_to_the_search_endpoint():
     assert body["timeout_seconds"] == 30
     assert normalize_results({"search_results": []}) == ()
     assert results[0].url == "https://example.co.il"
+
+
+def test_search_pro_posts_the_same_pinned_contract_to_its_own_endpoint():
+    """The Pro endpoint is a second bucket, not a second contract."""
+    posts = []
+
+    class FakeHttp:
+        def post(self, url, *, headers, json):
+            posts.append((url, json))
+            return SimpleNamespace(status_code=200,
+                                   json=lambda: {"search_results": []})
+
+    transport = MoonshotStandaloneSearch(api_key="k", base_url="https://api.test/v1",
+                                         http_client=FakeHttp())
+    transport("tucson israel", endpoint="search_pro")
+    url, body = posts[0]
+    assert url == "https://api.test/v1/tools/search_pro"
+    assert body["text_query"] == "tucson israel"
+    assert "query" not in body, "the pre-documentation field name came back"
+
+
+def test_the_wire_timeout_never_outlives_the_request_deadline():
+    """The constant's own comment says it stays inside the outer deadline.
+
+    That holds at the default 90s deadline, but `QuotaConfig` accepts a 10s
+    provider request timeout, and a fixed 30 there would leave the provider
+    searching -- and billing -- for twenty seconds after MILO's transport had
+    already abandoned the request. The clamp makes the comment true rather
+    than merely usually true.
+    """
+    assert standalone_search_timeout_seconds(90) == STANDALONE_SEARCH_TIMEOUT_SECONDS
+    assert standalone_search_timeout_seconds(10) == 10
+    assert standalone_search_timeout_seconds(0.2) == MIN_STANDALONE_SEARCH_TIMEOUT_SECONDS
+
+
+def test_a_tight_deadline_shortens_the_timeout_on_the_wire():
+    posts = []
+
+    class FakeHttp:
+        def post(self, url, *, headers, json):
+            posts.append(json)
+            return SimpleNamespace(status_code=200,
+                                   json=lambda: {"search_results": []})
+
+    transport = MoonshotStandaloneSearch(api_key="k", base_url="https://api.test/v1",
+                                         deadline_seconds=10, http_client=FakeHttp())
+    transport("q", endpoint="search")
+    assert posts[0]["timeout_seconds"] == 10, (
+        "the provider was asked to outlast MILO's own request deadline")
 
 
 def test_a_transport_with_no_credential_is_not_available():

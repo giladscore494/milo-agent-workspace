@@ -75,6 +75,30 @@ MAX_TOOL_CONTENT_CHARS = 12_000
 #: API accepts 1..60 seconds; 30s is explicit and bounded rather than a
 #: provider default, and remains inside MILO's outer request deadline.
 STANDALONE_SEARCH_TIMEOUT_SECONDS = 30
+#: The floor the clamp below never goes under, and the provider's own minimum.
+MIN_STANDALONE_SEARCH_TIMEOUT_SECONDS = 1
+
+
+def standalone_search_timeout_seconds(deadline_seconds: float | None = None) -> int:
+    """The wire timeout ONE search asks for: never longer than MILO waits.
+
+    `STANDALONE_SEARCH_TIMEOUT_SECONDS` alone is inside the outer request
+    deadline only while that deadline stays above it, and a deployment may
+    legitimately configure one below it -- `QuotaConfig` accepts a 10s
+    provider request timeout. Asking the provider for 30s there would leave
+    it searching, and billing, for twenty seconds after MILO's own transport
+    abandoned the request: spend nobody is waiting for, on a run that has
+    already moved on.
+
+    So the value sent is the reviewed ceiling clamped by the deadline really
+    in force, floored at the provider's own minimum. At the default 90s
+    deadline this is exactly the reviewed 30.
+    """
+    from backend.budget import resolved_request_deadline
+
+    deadline = resolved_request_deadline(deadline_seconds)
+    return int(max(MIN_STANDALONE_SEARCH_TIMEOUT_SECONDS,
+                   min(STANDALONE_SEARCH_TIMEOUT_SECONDS, deadline)))
 
 _SEARCH_TOOL_DESCRIPTION = (
     "Search the public internet for current information and return ranked "
@@ -420,7 +444,8 @@ class MoonshotStandaloneSearch:
                 json={
                     "text_query": query,
                     "limit": MAX_RESULTS_PER_SEARCH,
-                    "timeout_seconds": STANDALONE_SEARCH_TIMEOUT_SECONDS,
+                    "timeout_seconds": standalone_search_timeout_seconds(
+                        self._deadline_seconds),
                 },
             )
             status = int(getattr(response, "status_code", 0) or 0)
@@ -464,7 +489,8 @@ def default_search_executor() -> Callable[..., Any] | None:
 
 __all__ = [
     "DEFAULT_SEARCH_EXECUTOR", "MAX_QUERY_CHARS", "MAX_RESULTS_PER_SEARCH",
-    "STANDALONE_SEARCH_TIMEOUT_SECONDS",
+    "MIN_STANDALONE_SEARCH_TIMEOUT_SECONDS",
+    "STANDALONE_SEARCH_TIMEOUT_SECONDS", "standalone_search_timeout_seconds",
     "MAX_TOOL_CONTENT_CHARS", "MEDIATED_SEARCH_TOOL_NAME", "MEDIATED_TOOL_TYPE",
     "MoonshotStandaloneSearch", "PROVIDER_BUILTIN_SEARCH_NAME",
     "PROVIDER_BUILTIN_TOOL_TYPE", "SEARCH_ENDPOINT_PATHS", "SearchOutcome",
