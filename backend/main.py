@@ -246,6 +246,15 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
                 "the run's immutable identity could not be established",
                 409,
             ) from exc
+        if execution_identity_problems(identity):
+            # A run must not be born already unable to execute. In particular,
+            # an absent/malformed MILO_RELEASE_SHA is not recorded as an empty
+            # wildcard and left queued for a worker to refuse later.
+            raise AppError(
+                "RUN_IDENTITY_RUNTIME_MISMATCH",
+                "this runtime cannot bind an executable immutable run identity",
+                503,
+            )
 
         # Transaction-safe path: idempotent replay, concurrency admission,
         # message insert, run insert and immutable identity all commit together.
