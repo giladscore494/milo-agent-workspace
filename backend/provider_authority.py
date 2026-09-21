@@ -40,6 +40,7 @@ answering them differently.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import dataclass
 from enum import StrEnum
@@ -49,6 +50,24 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from backend.standalone_search import SearchOutcome
 
 from backend.runtime import CancellationRequested
+
+# =============================================================================
+# 0. THE ONE PROVIDER HOST
+# =============================================================================
+
+DEFAULT_PROVIDER_BASE_URL = "https://api.moonshot.ai/v1"
+
+
+def provider_base_url() -> str:
+    """Resolve the one provider host used by chat and standalone search.
+
+    MILO_MODEL_BASE_URL is worker-scoped and already inventoried by the
+    Production configuration audit. Engines and search must consume this
+    resolver rather than restating either the environment lookup or the
+    default, otherwise one deployment knob can silently address two hosts.
+    """
+    return (os.getenv("MILO_MODEL_BASE_URL") or DEFAULT_PROVIDER_BASE_URL).strip().rstrip("/")
+
 
 # =============================================================================
 # 1. THE ONE ERROR TAXONOMY
@@ -1049,12 +1068,12 @@ def build_provider_adapter(limits: Any = None, *, tracker: Any = None,
 __all__ = [
     "AUTHORITATIVE_BASIS", "BUILTIN_WEB_SEARCH", "CONSERVATIVE_BASIS",
     "ENGINE_OVERLOADED", "EXCEEDED_CURRENT_QUOTA", "MissingOutputCap",
-    "ProviderAdapter", "ProviderOutcome", "ProviderVerdict",
+    "DEFAULT_PROVIDER_BASE_URL", "ProviderAdapter", "ProviderOutcome", "ProviderVerdict",
     "RATE_LIMIT_REACHED", "SEARCH_BASIC", "SEARCH_PRO", "SEARCH_RATE_LIMITED",
     "SEARCH_RATE_LIMIT_UNAVAILABLE", "TokenCeilingExceeded", "TokenDemand",
     "UnknownTokenDemand", "admission_demand", "assert_within_token_ceiling",
     "build_provider_adapter", "builtin_searches_in_response",
     "classify_outcome", "completion_is_proven", "conservative_input_tokens",
-    "provider_failure_code", "rate_limit_headers", "register_token_counter",
+    "provider_base_url", "provider_failure_code", "rate_limit_headers", "register_token_counter",
     "request_offers_builtin_search", "retry_after_seconds",
 ]
