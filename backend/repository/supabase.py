@@ -204,33 +204,20 @@ class SupabaseRepository:
         return self._single(self.client.table("messages").insert(payload).select("*"), "message", "new")
 
     def create_queued_run(self, conversation_id: UUID, user_message_id: int | str | UUID, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]:
-        # Production messages.id is bigint; run input stores its string form.
-        key = idempotency_key or metadata.get("idempotency_key") or metadata.get("proposal_id") or str(user_message_id)
-        payload = {
-            "conversation_id": str(conversation_id),
-            "status": "queued",
-            "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata},
-            "idempotency_key": key,
-            "launch_state": "pending",
-        }
-        if requested_by is not None:
-            payload["requested_by"] = str(requested_by)
-        if request_fingerprint is not None:
-            payload["request_fingerprint"] = request_fingerprint
-        if requested_by is not None and idempotency_key:
-            existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
-            if existing is not None:
-                return existing
-        try:
-            return self._single(self.client.table("runs").insert(payload).select("*"), "run", "new")
-        except AppError as exc:
-            # Unique (conversation, requested_by, idempotency_key) index may
-            # reject a concurrent duplicate; return the winner instead.
-            if requested_by is not None and idempotency_key and ("23505" in exc.message or "duplicate" in exc.message.lower()):
-                existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
-                if existing is not None:
-                    return existing
-            raise
+        """Refuse the superseded split run-creation primitive.
+
+        Console 6 makes immutable identity an INSERT-time property. Production
+        run creation must therefore go through create_message_and_run_v3, which
+        inserts message + run + identity in one transaction. Keeping a direct
+        runs-table INSERT here would be a second writer whose only possible
+        outcome under the database trigger is failure, and a future caller
+        could mistake it for a supported creation authority.
+        """
+        raise AppError(
+            "RUN_IDENTITY_ATOMIC_CREATION_REQUIRED",
+            "queued runs must be created atomically with immutable identity",
+            503,
+        )
 
     def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None:
         rows = self._many(
