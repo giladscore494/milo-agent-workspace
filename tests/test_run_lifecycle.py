@@ -57,6 +57,41 @@ class StatefulRepo:
         self.runs[run_id] = run
         return dict(run)
 
+    def create_message_and_run(self, conversation_id, content, metadata, requested_by, idempotency_key, request_fingerprint, max_user_active=None, max_project_active=None, *, run_id, run_identity):
+        """The atomic creator: message, run and immutable identity together.
+
+        Mirrors `create_message_and_run_v3`, including the ordering that makes
+        the idempotency contract what it is -- the replay lookup happens BEFORE
+        any insert, a key already used with a different payload is a conflict,
+        and a failed run insert leaves no message behind because there is only
+        one transaction to fail.
+        """
+        if not request_fingerprint:
+            raise AppError("IDEMPOTENCY_FINGERPRINT_REQUIRED", "run creation requires a request fingerprint", 409)
+        if idempotency_key:
+            existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
+            if existing is not None:
+                if existing.get("request_fingerprint") != request_fingerprint:
+                    raise AppError("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409)
+                return {"run": existing, "created": False}
+        if run_identity.get("run_id") != str(run_id):
+            raise AppError("RUN_IDENTITY_INVALID", "identity names a different run", 409)
+        if run_identity.get("workflow_key") != self.get_project(self.project_id)["workflow_key"]:
+            raise AppError("RUN_IDENTITY_WORKFLOW_DRIFT", "project workflow changed before run creation", 409)
+        if self.fail_run_insert:
+            # One transaction: the run insert failing means no message either.
+            raise AppError("REPOSITORY_ERROR", "simulated database write failure", 502)
+        message = self.create_user_message(conversation_id, content, metadata)
+        run = {
+            "id": run_id, "conversation_id": conversation_id, "status": "queued",
+            "launch_state": "pending", "requested_by": str(requested_by) if requested_by else None,
+            "idempotency_key": idempotency_key, "request_fingerprint": request_fingerprint,
+            "run_identity": dict(run_identity),
+            "input": {"message_id": str(message["id"]), "content": content, "metadata": metadata},
+        }
+        self.runs[run_id] = run
+        return {"run": dict(run), "created": True}
+
     def find_run_by_idempotency(self, conversation_id, user_id, idempotency_key):
         for run in self.runs.values():
             if (str(run["conversation_id"]) == str(conversation_id)

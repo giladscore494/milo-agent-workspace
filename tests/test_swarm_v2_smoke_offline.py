@@ -37,6 +37,7 @@ from backend.errors import AppError
 from backend.main import app
 from backend.runtime_policy import reviewed_first_run_policy
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 
 USER = "aaaaaaaa-2222-4222-8222-000000000001"
 PROJECT = "bbbbbbbb-2222-4222-8222-000000000001"
@@ -436,13 +437,19 @@ def test_provider_429_storm_is_backpressure_not_semantic_retries(monkeypatch, of
 
 def run_worker_directly(repo, conversation_id, monkeypatch, completions,
                         idempotency_key="direct-000001"):
-    """Create a queued run without the API and execute the worker directly."""
+    """Create a run without the API and execute the worker directly.
+
+    Through the ATOMIC creator, because that is the only way an executable run
+    comes into being: the message, the run and the run's immutable identity
+    commit together, and a run without an identity is never launched or
+    resumed. The split `create_user_message` + `create_queued_run` pair this
+    used to build is a run the worker refuses.
+    """
     patch_client(monkeypatch, completions)
-    message = repo.create_user_message(UUID(conversation_id), "smoke", {})
-    run = repo.create_queued_run(UUID(conversation_id), message["id"], "smoke", {},
-                                 requested_by=UUID(USER), idempotency_key=idempotency_key,
-                                 request_fingerprint="f")
-    return UUID(str(run["id"]))
+    created = repo.create_message_and_run(
+        UUID(conversation_id), "smoke", {}, UUID(USER), idempotency_key, "f",
+        **identity_kwargs(repo, conversation_id))
+    return UUID(str(created["run"]["id"]))
 
 
 def test_checkpoint_persistence_failure_escapes_and_is_never_handled(monkeypatch):

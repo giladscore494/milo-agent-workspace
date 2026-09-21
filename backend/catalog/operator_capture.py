@@ -171,6 +171,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
+from backend.errors import AppError
 from backend.catalog.execution import CATALOG_EXECUTION_FLAG, catalog_execution_enabled
 from backend.catalog.government import source as src
 from backend.catalog.government.client import DataGovClient
@@ -1077,6 +1078,17 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
             run_id=new_run_id, run_identity=run_identity)
         run = result["run"]
         created = bool(result["created"])
+    except AppError as exc:
+        # The V3 creator settles idempotency inside its own transaction, so a
+        # key already held by a DIFFERENT request is a conflict raised here
+        # rather than a `created=False` replay handled below. Both mean the
+        # same thing -- this idempotency identity belongs to something that is
+        # not this preparation -- and both must read as the specific refusal,
+        # not as a generic preparation failure an operator cannot act on.
+        # Nothing was written either way.
+        if exc.code in {"IDEMPOTENCY_CONFLICT", "IDEMPOTENCY_FINGERPRINT_REQUIRED"}:
+            return EXIT_REFUSED, _envelope("refused", "CAPTURE_IDEMPOTENCY_KEY_IN_USE")
+        return EXIT_FAILED, _envelope("failed", "CAPTURE_PREPARATION_FAILED")
     except Exception:
         return EXIT_FAILED, _envelope("failed", "CAPTURE_PREPARATION_FAILED")
 

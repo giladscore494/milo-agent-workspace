@@ -484,10 +484,17 @@ class MemoryRepository:
         if not run_id:
             raise AppError("REPOSITORY_ERROR", "a usage ledger entry requires its run id", 502)
         self._evidence_lease(UUID(str(run_id)), worker_id, attempt, lease_token)
-        row = {"id": len(getattr(self, "usage_ledger", [])) + 1, "created_at": _now(),
-               **entry, "run_id": str(run_id)}
+        return self._append_usage_ledger_row(entry)
+
+    def _append_usage_ledger_row(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Write the row itself, once the caller's authority is settled."""
+        run_id = entry.get("run_id")
+        if not run_id:
+            raise AppError("REPOSITORY_ERROR", "a usage ledger entry requires its run id", 502)
         if not hasattr(self, "usage_ledger"):
             self.usage_ledger = []
+        row = {"id": len(self.usage_ledger) + 1, "created_at": _now(),
+               **entry, "run_id": str(run_id)}
         self.usage_ledger.append(row)
         return dict(row)
 
@@ -629,7 +636,18 @@ class MemoryRepository:
                 status, reason = "rejected", "DAILY_USER_BUDGET_REACHED"
             elif project_id and daily_project_limit is not None and project_spend + amount > daily_project_limit:
                 status, reason = "rejected", "DAILY_PROJECT_BUDGET_REACHED"
-            return self.append_usage_ledger({"run_id": str(run_id), "call_seq": call_seq, "user_id": user_id, "project_id": project_id, "decision": status, "status": status, "estimated_cost": amount, "rejection_reason": reason})
+            entry = {"run_id": str(run_id), "call_seq": call_seq, "user_id": user_id,
+                     "project_id": project_id, "decision": status, "status": status,
+                     "estimated_cost": amount, "rejection_reason": reason}
+            if worker_id is None:
+                # Parity with production, which takes the UNGUARDED
+                # reserve_model_call_budget_v2 path when the caller states no
+                # lease. The lease was already asserted above when one was
+                # given, so the row is written directly either way rather than
+                # re-entering the fenced writer with a lease it may not have.
+                return self._append_usage_ledger_row(entry)
+            return self.append_usage_ledger(entry, worker_id=worker_id, attempt=attempt,
+                                            lease_token=lease_token)
 
     def settle_model_call_budget(self, reservation_id: str, actual_cost: float, status: str = "settled", rejection_reason: str | None = None, run_id: UUID | None = None, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         with self.lock:
