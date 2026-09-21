@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import threading
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
@@ -24,6 +24,10 @@ from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILI
                                        trust_state_for)
 from backend.catalog.diff import MAX_DIFF_ITEMS, diff_rows
 from backend.catalog.digest import catalog_payload_digest
+from backend.engines.swarm_v2.current_verdict import (CurrentVerdict,
+                                                      contested_claim_ids,
+                                                      resolve_current_verdict,
+                                                      superseded_claim_ids)
 from backend.engines.swarm_v2.evidence_bounds import FRAGMENT_TYPES
 from backend.engines.swarm_v2.evidence_contracts import (fragment_type_for,
                                                          parse_locator_key)
@@ -102,6 +106,15 @@ class MemoryRepository:
         # caller wrote, while a typed lookup can still refuse a source that is
         # being passed off as a claim.
         self.evidence_kinds: dict[str, str] = {}
+        # A strictly increasing write sequence for durable VERDICT rows.
+        # PostgreSQL stamps `claim_verdicts.created_at` with the transaction
+        # clock, and the CURRENT verdict of a claim is the latest one by that
+        # column (`backend/engines/swarm_v2/current_verdict.py`). Separate
+        # calls here are separate transactions there, so a monotonic counter is
+        # the faithful mirror -- and a faithful one matters: without it every
+        # verdict of a claim would tie, and "the newer verdict wins" could not
+        # be tested against this backend at all.
+        self._verdict_sequence: int = 0
         # The durable catalog namespace (PR1). Keyed by the same idempotency
         # identities the guarded RPCs use, so a replay collapses here exactly
         # as it does in PostgreSQL.
@@ -887,7 +900,11 @@ class MemoryRepository:
         if len(_support_set(support)) != len(support):
             raise AppError("CLAIM_VERDICT_SUPPORT_SET",
                            "verdict support links do not match the cited evidence", 400)
-        return self._replayable_evidence_row(run_id, key, verdict, "claim_verdict",
+        # The write ORDER, made durable. `created_at` is not part of the replay
+        # identity (below), so a replayed verdict keeps the timestamp of the
+        # row it collapses onto -- exactly as `on conflict do nothing` does.
+        stamped = {**verdict, "created_at": self._next_verdict_timestamp()}
+        return self._replayable_evidence_row(run_id, key, stamped, "claim_verdict",
                                              ("claim_id", "verdict", "reason",
                                               "verification_mode",
                                               "verifier_contract_version", "support"),
@@ -901,6 +918,72 @@ class MemoryRepository:
                                    lease_token: str) -> dict[str, Any]:
         self._evidence_lease(run_id, worker_id, attempt, lease_token)
         return self._tool_row(run_id, resolution, kind="conflict_resolution")
+
+    # --- CURRENT verdict authority (R5) -------------------------------------
+    #
+    # Mirrors `public.claim_current_verdict_state` /
+    # `public.claim_current_verdict_states`, and mirrors them by CALLING the
+    # same rule: `backend/engines/swarm_v2/current_verdict.py` is the one
+    # definition, and the SQL function implements exactly it. There is no
+    # second copy of the resolution here to drift.
+
+    def _next_verdict_timestamp(self) -> str:
+        """A strictly increasing durable write time for one verdict row.
+
+        A real ISO timestamp, so the resolution reads it exactly as it reads
+        `claim_verdicts.created_at`. The sequence offset is what makes it
+        STRICTLY increasing: the wall clock can report the same microsecond
+        twice, and two verdicts that tie here would be resolved by the
+        fail-closed tiebreak rather than by the order they were written.
+        """
+        self._verdict_sequence += 1
+        return (datetime.now(UTC) + timedelta(microseconds=self._verdict_sequence)).isoformat()
+
+    def _verdict_rows(self, claim_id: Any) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.tool_rows
+                if self.evidence_kinds.get(str(row.get("id"))) == "claim_verdict"
+                and str(row.get("claim_id")) == str(claim_id)]
+
+    def _claim_row(self, claim_id: Any) -> dict[str, Any] | None:
+        return next((dict(row) for row in self.tool_rows
+                     if self.evidence_kinds.get(str(row.get("id"))) == "claim"
+                     and str(row.get("id")) == str(claim_id)), None)
+
+    def _current_verdict(self, claim_id: Any) -> CurrentVerdict | None:
+        """The resolved CURRENT state of one claim, or None when unknown.
+
+        An unknown claim resolves to NOTHING rather than to "not verified":
+        the SQL function returns no row for one, and a caller must never read
+        the absence of a claim as a statement about a claim.
+        """
+        claim = self._claim_row(claim_id)
+        if claim is None:
+            return None
+        return resolve_current_verdict(
+            claim=claim, verdicts=self._verdict_rows(claim_id),
+            superseded_claim_ids=superseded_claim_ids(
+                row for row in self.tool_rows
+                if self.evidence_kinds.get(str(row.get("id"))) == "conflict_resolution"),
+            contested_claim_ids=contested_claim_ids(
+                row for row in self.tool_rows
+                if self.evidence_kinds.get(str(row.get("id"))) == "conflict"))
+
+    def claim_current_verdict_states(self, run_id: UUID,
+                                     claim_ids: Any = None, *,
+                                     limit: int = 200) -> list[dict[str, Any]]:
+        """Mirrors `public.claim_current_verdict_states`: one bounded READ."""
+        with self.lock:
+            wanted = None if claim_ids is None else {str(item) for item in claim_ids}
+            rows = [row for row in self.tool_rows
+                    if self.evidence_kinds.get(str(row.get("id"))) == "claim"
+                    and str(row.get("run_id")) == str(run_id)
+                    and (wanted is None or str(row.get("id")) in wanted)]
+            resolved = []
+            for claim in sorted(rows, key=lambda row: str(row["id"])):
+                current = self._current_verdict(claim["id"])
+                if current is not None:
+                    resolved.append(current.as_row())
+            return resolved[:max(0, min(int(limit), 500))]
 
     @staticmethod
     def _require_evidence_key(payload: Mapping[str, Any], code: str) -> str:
@@ -1289,6 +1372,15 @@ class MemoryRepository:
                 if verdict.get("verdict") != "verified":
                     raise AppError("CATALOG_LINK_VERDICT_NOT_VERIFIED",
                                    "catalog evidence link verdict is not verified", 409)
+                # R5: and what the claim says NOW. A verdict that some newer
+                # verdict, contradiction or supersession has replaced is
+                # history; a link may not be created citing it. Mirrors the
+                # `catalog_candidate_evidence_links_current_verdict` trigger.
+                current = self._current_verdict(claim["id"])
+                if current is None or not current.authorizes(verdict_id):
+                    raise AppError("CATALOG_LINK_VERDICT_NOT_CURRENT",
+                                   "catalog evidence link verdict is not the claim's "
+                                   "current supported verdict", 409)
 
             resolved = {**link, "record_locator": locator, "source_version": version,
                         "source_version_kind": kind}
@@ -1599,10 +1691,6 @@ class MemoryRepository:
                 snapshot = snapshots[row["snapshot_id"]]
                 by_locator[record_locator_id(str(snapshot["snapshot_key"]),
                                              str(row["upstream_record_id"]))] = row
-            verdicts = {str(row["claim_id"]): row for row in self.tool_rows
-                        if self.evidence_kinds.get(str(row.get("id"))) == "claim_verdict"
-                        and str(row.get("run_id")) == str(run_id)
-                        and row.get("verdict") == "verified"}
             sources = {str(row["id"]): row for row in self.tool_rows
                        if self.evidence_kinds.get(str(row.get("id"))) == "source"
                        and str(row.get("run_id")) == str(run_id)
@@ -1616,8 +1704,11 @@ class MemoryRepository:
                         or str(claim.get("source_id")) not in sources \
                         or not claim.get("evidence_locator"):
                     continue
-                verdict = verdicts.get(str(claim["id"]))
-                if verdict is None:
+                # R5: the CURRENT verdict, never "a verified verdict exists".
+                # An older `verified` row that a newer verdict, contradiction
+                # or supersession has replaced authorizes nothing.
+                current = self._current_verdict(claim["id"])
+                if current is None or not current.supported:
                     continue
                 try:
                     locator = parse_locator_key(claim["evidence_locator"]).record_id
@@ -1657,7 +1748,7 @@ class MemoryRepository:
                     "trim": candidate.get("trim"),
                     "identity_dimensions": dict(candidate.get("identity_dimensions") or {}),
                     "claim_id": claim["id"], "source_id": claim["source_id"],
-                    "verdict_id": verdict["id"], "field_key": claim["field_key"],
+                    "verdict_id": current.verdict_id, "field_key": claim["field_key"],
                     "field_value": claim["value"]})
             # The SAME bound and the SAME order the SQL applies, so a resumed
             # worker sees exactly the set the crashed one would have.
@@ -1763,6 +1854,16 @@ class MemoryRepository:
         if verdict.get("verdict") != "verified":
             raise AppError("CATALOG_PROMOTION_VERDICT_NOT_VERIFIED",
                            "canonical field provenance verdict is not verified", 409)
+        # R5: THE ONE THAT MATTERS. A link created while its verdict was
+        # current, followed by a newer invalidation, is exactly the stale
+        # authorization the link-time gate cannot see -- the link was
+        # legitimate when it was written. Mirrors the
+        # `catalog_canonical_field_provenance_current_verdict` trigger.
+        current = self._current_verdict(link["claim_id"])
+        if current is None or not current.authorizes(link["verdict_id"]):
+            raise AppError("CATALOG_PROMOTION_VERDICT_NOT_CURRENT",
+                           "canonical field provenance cites a verdict that is no "
+                           "longer current", 409)
         claim = self._catalog_evidence_row(link["claim_id"], run_id, "CLAIM")
         if str(verdict.get("claim_id")) != str(claim["id"]):
             raise AppError("CATALOG_PROMOTION_VERDICT_CLAIM_MISMATCH",

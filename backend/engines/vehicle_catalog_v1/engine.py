@@ -8,6 +8,7 @@ from typing import Any
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
 from . import core
+from .evidence_authority import V1EvidenceAuthority, apply_evidence_authority
 from .source_policy import apply_israel_source_policy, market_requires_israel_policy
 
 EventSink = Callable[[str, dict[str, Any]], None]
@@ -39,6 +40,11 @@ class VehicleCatalogEngine:
     # the pre-existing process-local behaviour for tests and local runs; the
     # worker always supplies one, and it fails closed in production.
     provider_coordinator: Any | None = None
+    # R5: the trusted evidence authority. `None` builds one with no Evidence
+    # Board, which still constructs, validates and decides every field's
+    # evidence -- it simply does not persist it. There is no configuration in
+    # which a model's assertion alone makes a field verified.
+    evidence_authority: Any | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     _previous_client_factory: Any = field(default=None, init=False)
@@ -182,6 +188,21 @@ class VehicleCatalogEngine:
                 verifier_data = {"agent": "source_verifier", "status": "failed", "verified_models": [], "rejected_data_points": [], "needs_review": [{"model": "*", "reason": verifier.get("error")}]} 
             self._emit("chunk_completed" if verifier.get("status") in {"success", "partial"} else "chunk_failed", {"phase": "verification", "agent": "source_verifier", "message": "Verifier chunk finished", "result": verifier})
             self._emit("phase_completed", {"phase": "verification", "result": verifier})
+            # R5: the EVIDENCE decides. Trusted server code turns this run's
+            # observed technical records into durable located evidence and
+            # settles a verdict per field; the model's classification is a
+            # proposal that can only take a model down. It runs BEFORE the
+            # checkpoint, so a resumed run restores a verifier document that
+            # has already been held to the evidence rather than one that has
+            # not -- and every durable write it made is idempotent, so the
+            # replacement worker replays onto the same rows.
+            evidence = self._apply_evidence_authority(verifier_data, technical_clean, config)
+            # The bounded summary travels in the run's own ARTIFACTS, and in
+            # nothing else. No run event is emitted for it: `EVENT_TYPES` is a
+            # closed browser contract (`backend/runtime.py`, mirrored in
+            # `frontend/lib/eventVocabulary.ts`), and a new type would be a
+            # change to that contract rather than to this engine.
+            results["evidence_authority"] = evidence.as_event()
             self._checkpoint("verification", results, failed_summaries)
 
             self._emit("phase_started", {"phase": "final_builder"})
@@ -238,6 +259,23 @@ class VehicleCatalogEngine:
         if outstanding or declared not in {"complete", "success"}:
             return "partial_success"
         return declared
+
+    def _apply_evidence_authority(self, verifier_data: dict[str, Any],
+                                  technical: dict[str, Any],
+                                  config: VehicleCatalogRunConfig) -> Any:
+        """Settle this run's field evidence and hold the verifier to it.
+
+        Never fails the run: the authority itself absorbs a contract refusal
+        and a durable-write failure, and a field it could not evidence is
+        simply not verified. That is the safe direction, and it is the only
+        direction this rule moves in.
+        """
+        authority = self.evidence_authority or V1EvidenceAuthority()
+        report = authority.record(manufacturer=config.manufacturer, market=config.market,
+                                  period=config.period, technical=technical,
+                                  verifier=verifier_data)
+        apply_evidence_authority(verifier_data, report)
+        return report
 
     def _apply_source_policy(self, final: dict[str, Any], config: VehicleCatalogRunConfig) -> None:
         """Deterministic Israel evidence policy on the merged final output:

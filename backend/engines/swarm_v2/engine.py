@@ -7,6 +7,7 @@ from .builder import FinalBuilder
 from .commander import Commander
 from .conflict_policy import ConflictResolution, conflict_groups
 from .contracts import EvidenceReference, RemainingBudget, VerificationVerdict
+from .current_verdict import current_verdict_by_claim
 from .correction import (correction_allowance, correction_issues, correction_path_closed,
                          correction_summary)
 from .evidence import safe_durable_value
@@ -282,7 +283,11 @@ class SwarmV2Engine:
                             "claim_count": progress.claim_count})
 
         verdicts = self._verifier.verify_prepared(plan, batch_completed=record)
-        state.verifier_state = {v.claim_id: v.model_dump(mode="json") for v in verdicts}
+        # ONE verdict per claim in durable state, by the shared resolution: a
+        # checkpoint that stored two verdicts for one claim would restore
+        # whichever the dict comprehension happened to keep.
+        state.verifier_state = {claim_id: item.model_dump(mode="json") for claim_id, item
+                                in current_verdict_by_claim(verdicts).items()}
         self._persist_verdicts(verdicts)
         state.usage_snapshot = dict(self._usage_snapshot())
         self._emit("verification_completed", {"status": "completed"})

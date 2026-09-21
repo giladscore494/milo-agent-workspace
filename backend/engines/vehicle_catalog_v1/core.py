@@ -1182,6 +1182,44 @@ def run_technical_enrichment_phase(api_key: str, manufacturer: str, market: str,
     return [merge_chunk_results(agent.key, by_agent[agent.key]) for agent in TECHNICAL_AGENTS]
 
 
+#: How much of one technical VALUE the verifier is shown, and how many values
+#: per record. Bounded because the verifier input is a prompt, not a dump: a
+#: value longer than this is truncated with an ellipsis so the verifier can see
+#: that it was cut rather than read a fragment as the whole statement.
+MAX_VERIFIER_VALUE_CHARS = 40
+MAX_VERIFIER_FIELDS_PER_ITEM = 6
+
+
+def compact_verifier_value(value: Any) -> Any:
+    """One technical value, bounded for the verifier prompt.
+
+    Numbers and booleans travel as themselves -- "218" is the fact, and
+    rendering it as text would make the verifier compare strings. Everything
+    else is rendered and bounded.
+    """
+    if value is None or isinstance(value, bool) or isinstance(value, (int, float)):
+        return value
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":")) if isinstance(value, (list, dict)) else str(value)
+    text = text.strip()
+    return text if len(text) <= MAX_VERIFIER_VALUE_CHARS else text[:MAX_VERIFIER_VALUE_CHARS - 1] + "…"
+
+
+def compact_verifier_fields(item: Dict[str, Any]) -> Dict[str, Any]:
+    """The stated field VALUES of one technical record, bounded and ordered.
+
+    This is the R5 correction and it is the whole of it: the verifier used to
+    receive `sorted(k for k, v in item.items() ...)` -- the NAMES of the fields
+    that happened to be non-empty -- so the phase deciding whether a model was
+    `verified` could not see a single value it was verifying. A record stating
+    `power_hp: 5000` and one stating `power_hp: 218` were the same input.
+    """
+    stated = {key: value for key, value in item.items()
+              if key not in {"model", "canonical_model_name", "confidence", "sources", "notes"}
+              and value not in (None, "", [], {})}
+    return {key: compact_verifier_value(stated[key])
+            for key in sorted(stated)[:MAX_VERIFIER_FIELDS_PER_ITEM]}
+
+
 def compact_verifier_input(normalized: Any, technical: Dict[str, Any], failed_summaries: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     canonical_models = []
     for model in (normalized or {}).get("canonical_models", []) if isinstance(normalized, dict) else []:
@@ -1191,14 +1229,29 @@ def compact_verifier_input(normalized: Any, technical: Dict[str, Any], failed_su
                 "model_name_he": model.get("model_name_he"),
                 "sources": model.get("sources", []),
             })
+    # The models THIS chunk is about. The verifier is chunked over canonical
+    # models while the technical dictionary is not, so every chunk used to be
+    # handed every record of the run. Scoping the records to the chunk is what
+    # pays for showing their values: the verifier sees more about the models it
+    # was asked to verify and nothing at all about the models it was not, and a
+    # record whose model key matches no canonical model could never be merged
+    # into the product anyway (`_technical_index` keys on exactly this).
+    wanted = {key for key in (normalize_model_key(model.get("canonical_model_name"))
+                              for model in canonical_models) if key}
     technical_summaries: Dict[str, Any] = {}
     for agent, parsed in (technical or {}).items():
         if not isinstance(parsed, dict):
             continue
         items = []
         for item in parsed.get("items", []):
-            if isinstance(item, dict):
-                items.append({"model": item.get("model"), "confidence": item.get("confidence"), "sources": item.get("sources", []), "fields": sorted(k for k, v in item.items() if k not in {"sources", "notes"} and v not in (None, "", [], {}))})
+            if not isinstance(item, dict):
+                continue
+            key = normalize_model_key(item.get("model") or item.get("canonical_model_name"))
+            if wanted and key not in wanted:
+                continue
+            items.append({"model": item.get("model"), "confidence": item.get("confidence"),
+                          "sources": item.get("sources", []),
+                          "fields": compact_verifier_fields(item)})
         technical_summaries[agent] = {"agent": parsed.get("agent", agent), "items": items, "missing_data_count": len(parsed.get("missing_data", [])), "extra_candidate_models_count": len(parsed.get("extra_candidate_models", []))}
     return {"canonical_models": canonical_models, "technical_summaries": technical_summaries, "failed_summaries": compact_failed_summaries(failed_summaries or [])}
 
@@ -1207,7 +1260,7 @@ def verifier_prompt(normalized: Any, technical: Dict[str, Any], failed_summaries
     compact_input = compact_verifier_input(normalized, technical, failed_summaries)
     return [
         {"role": "system", "content": "You are source_verifier. JSON only. No broad new research. Review compact structured JSON only; do not invent missing data. Keep output ultra-compact."},
-        {"role": "user", "content": "Verify Israel-market relevance and contradictions. Return schema {\"agent\":\"source_verifier\",\"verified_models\":[],\"rejected_data_points\":[],\"needs_review\":[]}. Each model object must be {\"model\":\"string\",\"status\":\"verified|partial|needs_review|rejected\",\"confidence\":\"high|medium|low\",\"issues\":[\"short\"],\"source_strength\":\"official_israel|israeli_auto_portal|used_market|global_official|foreign_market|weak|unknown\"}. Max 2 issues per model; each issue <=120 chars. Avoid rejected_data_points unless essential. Compact input:\n" + json.dumps(compact_input, ensure_ascii=False, separators=(",", ":"))},
+        {"role": "user", "content": "Verify Israel-market relevance and contradictions in the STATED FIELD VALUES below (each record's `fields` object carries the actual values; judge those values, not which fields are present). Return schema {\"agent\":\"source_verifier\",\"verified_models\":[],\"rejected_data_points\":[],\"needs_review\":[]}. Each model object must be {\"model\":\"string\",\"status\":\"verified|partial|needs_review|rejected\",\"confidence\":\"high|medium|low\",\"issues\":[\"short\"],\"source_strength\":\"official_israel|israeli_auto_portal|used_market|global_official|foreign_market|weak|unknown\"}. Max 2 issues per model; each issue <=120 chars. Avoid rejected_data_points unless essential. Compact input:\n" + json.dumps(compact_input, ensure_ascii=False, separators=(",", ":"))},
     ]
 
 

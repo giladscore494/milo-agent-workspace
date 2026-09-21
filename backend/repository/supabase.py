@@ -57,6 +57,7 @@ class Repository(Protocol):
     def list_evidence_fragments_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 200) -> list[dict[str, Any]]: ...
     def list_structured_facts_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 200) -> list[dict[str, Any]]: ...
     def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def claim_current_verdict_states(self, run_id: UUID, claim_ids: Iterable[Any] | None = None, *, limit: int = 200) -> list[dict[str, Any]]: ...
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
@@ -884,6 +885,31 @@ class SupabaseRepository:
     def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_verdict": verdict}
         return self._guarded_rpc("record_claim_verdict_guarded", params, "claim_verdict")
+
+    #: The durable bound of ONE current-verdict read, mirrored from
+    #: `public.claim_current_verdict_states`, which clamps to the same number.
+    MAX_CURRENT_VERDICT_ROWS = 500
+
+    def claim_current_verdict_states(self, run_id: UUID, claim_ids: Iterable[Any] | None = None,
+                                     *, limit: int = 200) -> list[dict[str, Any]]:
+        """R5: which of a run's claims are verified RIGHT NOW, and on what.
+
+        One bounded READ. It takes no lease because it writes nothing, and it
+        is the ONLY question a consumer of verified evidence should be asking:
+        `public.claim_verdicts` is append-only history, so "a verified verdict
+        exists" stays true forever after a re-verification has rejected the
+        claim. The resolution itself is
+        `backend/engines/swarm_v2/current_verdict.py`, implemented in SQL by
+        `public.claim_current_verdict_state` so the same rule holds for a
+        writer that never came through this process.
+        """
+        identifiers = None if claim_ids is None else [str(item) for item in claim_ids]
+        if identifiers is not None and not identifiers:
+            return []
+        return self._read_rpc("claim_current_verdict_states",
+                              {"p_run_id": str(run_id), "p_claim_ids": identifiers,
+                               "p_limit": max(0, min(int(limit),
+                                                     self.MAX_CURRENT_VERDICT_ROWS))})
 
     # --- durable catalog staging --------------------------------------------
     #

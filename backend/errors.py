@@ -11,6 +11,22 @@ class AppError(Exception):
         super().__init__(message)
 
 
+#: The repository codes that mean "this worker no longer holds the run".
+#:
+#: Two spellings for one condition, and both must escape wherever a caller
+#: absorbs failures: the Supabase repository classifies a stale-lease RPC
+#: failure as `RUN_LEASE_LOST`, and the in-memory repository raises
+#: `RUN_TRANSITION_CONFLICT` from the same check. A stale worker is an
+#: INFRASTRUCTURE outcome that has to reach the worker's own lease handling;
+#: laundering it into a decision about evidence would make a lost lease look
+#: like an answer about the data.
+#:
+#: Defined HERE, in the leaf module, because more than one subsystem has to
+#: recognise it: `backend/catalog/promotion.py` re-exports it under its own
+#: name, and the V1 evidence authority re-raises on it.
+LEASE_FAILURE_CODES = frozenset({"RUN_LEASE_LOST", "RUN_TRANSITION_CONFLICT"})
+
+
 class NotFoundError(AppError):
     def __init__(self, resource: str, identifier: str):
         super().__init__(f"{resource.upper()}_NOT_FOUND", f"{resource} not found: {identifier}", 404)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Any, Iterable, Mapping
 from .contracts import EvidenceReference, VerificationVerdict
+from .current_verdict import current_verdict_by_claim
 from .outcome import TrustedNegativeResult, finalize_product_outcome
 
 
@@ -24,7 +25,10 @@ class FinalBuilder:
               conflict_claim_ids: Iterable[str] = (),
               trusted_negative: TrustedNegativeResult | None = None) -> dict:
         verdict_list = list(verdicts)
-        verdict_by_claim = {item.claim_id: item for item in verdict_list}
+        # ONE verdict per claim, resolved by the shared rule rather than by
+        # "whichever came last in the list": a stray second verdict must not
+        # be able to raise a claim to `verified` by arriving later.
+        verdict_by_claim = current_verdict_by_claim(verdict_list)
         fields, review = {}, []
         for item in sorted(evidence, key=lambda x: (x.field, x.claim_id)):
             verdict = verdict_by_claim.get(item.claim_id)

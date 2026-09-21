@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 from .comparison import reference_identity
+from .current_verdict import current_verdict_by_claim
 from .normalization import canonical_value_key
 
 #: The whole-run allowance.  Not a per-phase or per-issue budget: ONE.
@@ -231,7 +232,8 @@ def correction_issues(references: Iterable[Any], verdicts: Iterable[Any]) -> lis
     a constant from this module.  No fragment text, prompt, provider payload,
     exception message or model prose can reach it.
     """
-    by_claim = {item.claim_id: item for item in verdicts}
+    # The same one-verdict-per-claim resolution the product builder applies.
+    by_claim = current_verdict_by_claim(verdicts)
     grouped: dict[tuple[str, Any], list[Any]] = {}
     for reference in sorted(references, key=lambda item: item.claim_id):
         verdict = by_claim.get(reference.claim_id)

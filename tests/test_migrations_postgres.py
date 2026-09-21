@@ -5392,6 +5392,15 @@ def pr3_db(db):
     for migration in MIGRATIONS:
         if "catalog" in migration.name:
             db.psql(file=migration)
+    # And R5 LAST. Re-applying `20260916120000` above restores its own
+    # `catalog_run_pending_promotions` -- the definition that joined on "a
+    # verified verdict exists" -- so a fixture that stopped there would hand
+    # every promotion test the pre-R5 read. Production applies migrations in
+    # sequence and never hits this; a fixture that re-applies an older one
+    # does, which is exactly the hazard
+    # `test_reapplying_the_catalog_promotion_migration_needs_this_one_again`
+    # states.
+    db.psql(file=next(m for m in MIGRATIONS if "current_verdict_authority" in m.name))
     return db
 
 
@@ -6698,3 +6707,264 @@ def test_finalize_run_guarded_is_service_path_only(db):
     assert db.psql(f"select has_function_privilege('service_role', '{signature}', 'EXECUTE')") == "t"
     assert db.psql("select count(*) from pg_proc where proname='finalize_run_guarded'") == "1"
 
+
+
+# ===========================================================================
+# R5: CURRENT verdict authority -- 20260921000100_current_verdict_authority
+# ===========================================================================
+#
+# `public.claim_verdicts` is append-only, so "a verified verdict exists for
+# this claim" stays true forever, including after a re-verification rejected
+# it. Every consumer of verified evidence asked exactly that question --
+# `catalog_run_pending_promotions` joined on it, and both catalog gates checked
+# only what the CITED row said -- so a stale `verified` could authorize a
+# canonical fact.
+#
+# The rule that replaces it lives in
+# `backend/engines/swarm_v2/current_verdict.py` and in this migration, and the
+# two are pinned together textually by
+# `tests/test_current_verdict_authority.py`. What is proven HERE is that
+# PostgreSQL itself applies it -- for every writer, including a direct
+# `service_role` call that never went through the backend.
+
+def _r5_reverify(db, args: str, claim: str, *, key: str, verdict: str = "rejected",
+                 reason: str = "R4_VALUE_MISMATCH") -> str:
+    """A NEWER verdict for one claim: what a second verification pass writes."""
+    return _rpc_as_service(
+        db, "select id from public.record_claim_verdict_guarded("
+            f"{args},'{_r4_verdict_json(claim, key=key, verdict=verdict, reason=reason)}'::jsonb)")
+
+
+def _r5_state(db, claim: str) -> str:
+    return db.psql("select state || '|' || coalesce(verdict_id::text,'-') || '|' || "
+                   f"support_count from public.claim_current_verdict_state('{claim}')")
+
+
+def test_the_current_verdict_resolution_is_the_databases_own(db):
+    """A newer verdict ends an older `verified`, in the database itself."""
+    lease, _other = _evidence_fixture(db, "r5-current")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    _source, fragment, claim, verdict = _shared_chain(db, args, "r5-current")
+
+    assert _r5_state(db, claim) == f"supported|{verdict}|1"
+    assert db.psql(f"select public.claim_current_verdict_id('{claim}')") == verdict
+    assert db.psql("select public.claim_verdict_is_current_support("
+                   f"'{claim}','{verdict}')") == "t"
+
+    rejection = _r5_reverify(db, args, claim, key="r5-current-rejected")
+
+    assert _r5_state(db, claim) == f"rejected|{rejection}|0"
+    assert db.psql("select public.claim_verdict_is_current_support("
+                   f"'{claim}','{verdict}')") == "f"
+    # The older row is still there. Append-only history did not change -- what
+    # it authorizes did.
+    assert db.psql(f"select count(*) from public.claim_verdicts where claim_id='{claim}'") == "2"
+    assert db.psql("select count(*) from public.claim_verdicts where "
+                   f"claim_id='{claim}' and verdict='verified'") == "1"
+    # An unknown claim resolves to NO ROW: "not verified" is a statement about
+    # a claim, and this is not one.
+    assert db.psql(f"select count(*) from public.claim_current_verdict_state("
+                   f"'{uuid.uuid4()}')") == "0"
+
+
+def test_two_verdicts_of_one_transaction_resolve_fail_closed(db):
+    """`created_at` is the TRANSACTION clock, so an exact tie is reachable.
+
+    Both verdicts are written in one implicit transaction, so both carry the
+    identical `now()`. Resolving that by id -- or by insertion order -- would
+    decide current truth by chance; the non-`verified` verdict wins instead.
+    """
+    lease, _other = _evidence_fixture(db, "r5-tie")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    source = _rpc_as_service(db, "select id from public.upsert_source_guarded("
+                                 f"{args},'{json.dumps(evidence_fixtures.source_payload('r5-tie-source'))}'::jsonb)")
+    fragment = _rpc_as_service(db, "select id from public.record_evidence_fragment_guarded("
+                                   f"{args},'{json.dumps(evidence_fixtures.fragment_payload('r5-tie-fragment', source))}'::jsonb)")
+    claim = _rpc_as_service(db, "select id from public.create_claim_with_source_guarded("
+                                f"{args},'{json.dumps(evidence_fixtures.claim_payload('r5-tie-claim', source))}'::jsonb)")
+    accepted = json.dumps(evidence_fixtures.verdict_payload(
+        "r5-tie-verified", claim, support=[evidence_fixtures.support_link(fragment)]))
+    refused = _r4_verdict_json(claim, key="r5-tie-rejected", verdict="rejected",
+                               reason="R4_VALUE_MISMATCH")
+
+    # ONE statement, so ONE transaction, so ONE `now()`.
+    db.psql("set role service_role; "
+            f"select public.record_claim_verdict_guarded({args},'{accepted}'::jsonb); "
+            f"select public.record_claim_verdict_guarded({args},'{refused}'::jsonb); "
+            "reset role")
+
+    assert db.psql("select count(distinct created_at) from public.claim_verdicts "
+                   f"where claim_id='{claim}'") == "1"
+    assert db.psql(f"select state from public.claim_current_verdict_state('{claim}')") \
+        == "rejected"
+
+
+def test_a_decided_or_open_contradiction_is_not_current_in_the_database(db):
+    """A supersession and an unresolved conflict, both ahead of any verdict."""
+    lease, _other = _evidence_fixture(db, "r5-conflict")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    _source, _fragment, claim, _verdict = _shared_chain(db, args, "r5-conflict")
+    assert _r5_state(db, claim).startswith("supported")
+
+    # An UNRESOLVED conflict covering the claim: nothing is current.
+    conflict_claims = f"array['{claim}']::uuid[]"
+    _rpc_as_service(db, "insert into public.conflicts"
+                        "(run_id, entity_key, field_key, claim_ids, outcome) values "
+                        f"('{run_id}','entity','engine_displacement_cc',{conflict_claims},"
+                        "'unresolved_needs_review')")
+    assert db.psql(f"select state from public.claim_current_verdict_state('{claim}')") \
+        == "contested"
+
+    # A RESOLVED one that superseded it outranks even that.
+    other_claim = _rpc_as_service(
+        db, "select id from public.create_claim_with_source_guarded("
+            f"{args},'{json.dumps(evidence_fixtures.claim_payload('r5-conflict-rival', _source, value=1600))}'::jsonb)")
+    resolution = _r4_resolution_json([claim, other_claim], key="r5-conflict-resolution",
+                                     winner=other_claim, superseded=[claim])
+    _rpc_as_service(db, "select id from public.record_conflict_resolution_guarded("
+                        f"{args},'{resolution}'::jsonb)")
+    assert db.psql(f"select state from public.claim_current_verdict_state('{claim}')") \
+        == "superseded"
+
+
+def test_an_inactive_claim_is_invalidated_in_the_database(db):
+    """A claim that is no longer active carries nothing current."""
+    lease, _other = _evidence_fixture(db, "r5-inactive")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    _source, _fragment, claim, _verdict = _shared_chain(db, args, "r5-inactive")
+
+    _rpc_as_service(db, f"update public.claims set status='superseded' where id='{claim}'")
+
+    assert db.psql(f"select state from public.claim_current_verdict_state('{claim}')") \
+        == "invalidated"
+    assert db.psql("select verdict_id is null from "
+                   f"public.claim_current_verdict_state('{claim}')") == "t"
+
+
+def test_the_current_verdict_read_is_bounded_and_run_scoped(db):
+    lease, other = _evidence_fixture(db, "r5-read")
+    run_id, worker, attempt, token, _ = lease
+    args = f"'{run_id}','{worker}',{attempt},'{token}'"
+    _source, _fragment, claim, _verdict = _shared_chain(db, args, "r5-read")
+
+    assert db.psql("select count(*) from public.claim_current_verdict_states("
+                   f"'{run_id}',null,200)") == "1"
+    assert db.psql("select state from public.claim_current_verdict_states("
+                   f"'{run_id}',array['{claim}']::uuid[],200)") == "supported"
+    assert db.psql("select count(*) from public.claim_current_verdict_states("
+                   f"'{other[0]}',null,200)") == "0"
+    assert db.psql("select count(*) from public.claim_current_verdict_states("
+                   f"'{run_id}',null,0)") == "0"
+    with pytest.raises(AssertionError, match="a run is required"):
+        db.psql("select * from public.claim_current_verdict_states(null,null,200)")
+
+
+def test_a_catalog_link_may_not_cite_a_verdict_that_is_no_longer_current(pr3_db):
+    """The earliest durable gate: a link is provenance, not an opinion."""
+    db = pr3_db
+    args, _snapshot, _record, candidate, links, _make = _pr3_promotable(db, "r5-link")
+    field = sorted(links)[0]
+    claim, verdict = links[field]["claim"], links[field]["verdict"]
+
+    _r5_reverify(db, args, claim, key="r5-link-rejected")
+
+    with pytest.raises(AssertionError, match="current supported verdict"):
+        _rpc_as_service(
+            db, "select id from public.link_catalog_candidate_evidence_guarded("
+                f"{args},'{_catalog_link_json(candidate, links[field]['source'], 'r5-link-late', claim_id=claim, verdict_id=verdict, locator=None, version=None, kind=None)}'::jsonb)")
+
+
+def test_a_stale_verified_verdict_can_never_authorize_a_canonical_fact(pr3_db):
+    """THE regression, against the real promotion transaction.
+
+    Every link here was legitimate when it was written -- the link-time gate
+    passed, because the verdict WAS current then. The re-verification happens
+    afterwards, which is exactly the window a link-time check cannot close.
+    """
+    db = pr3_db
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "r5-stale")
+    for index, field in enumerate(sorted(links)):
+        _r5_reverify(db, args, links[field]["claim"], key=f"r5-stale-rejected-{index}")
+
+    with pytest.raises(AssertionError, match="no longer current"):
+        _promote(db, args, _pr3_promotion_json(candidate, links, make, key="r5-stale"))
+
+    # Nothing was written: the canonical row and its provenance are one
+    # transaction, so a refusal leaves neither.
+    assert db.psql("select count(*) from public.catalog_model_variants v "
+                   "join public.catalog_models m on m.id = v.model_id "
+                   f"where m.manufacturer='{make}'") == "0"
+    assert db.psql("select count(*) from public.catalog_canonical_field_provenance p "
+                   "join public.catalog_candidate_evidence_links l on l.id = p.evidence_link_id "
+                   f"where l.candidate_id='{candidate}'") == "0"
+
+
+def test_the_pending_promotion_read_resolves_current_truth(pr3_db):
+    """The read that drives a resumed worker stops proposing stale work."""
+    db = pr3_db
+    args, _snapshot, _record, _candidate, links, _make = _pr3_promotable(db, "r5-pending")
+    run_id = args.split(",")[0].strip("'")
+    read = ("select count(*) from public.catalog_run_pending_promotions("
+            f"'{run_id}','{PROMOTABLE_TOOL_OPERATION}',25)")
+    assert db.psql(read) == str(len(PR3_FIELDS))
+
+    # ONE field is re-verified as needs_review. That field's claim drops out;
+    # every other field is untouched.
+    field = sorted(links)[0]
+    _r5_reverify(db, args, links[field]["claim"], key="r5-pending-review",
+                 verdict="needs_review", reason="R4_SOURCE_SILENT")
+    assert db.psql(read) == str(len(PR3_FIELDS) - 1)
+    assert db.psql("select string_agg(field_key, ',') from "
+                   "public.catalog_run_pending_promotions("
+                   f"'{run_id}','{PROMOTABLE_TOOL_OPERATION}',25)") == \
+        ",".join(sorted(name for name, _v, _u, _r in PR3_FIELDS)[1:])
+    # And the verdict id the read carries is the CURRENT one for every row.
+    assert db.psql("select count(*) from public.catalog_run_pending_promotions("
+                   f"'{run_id}','{PROMOTABLE_TOOL_OPERATION}',25) p "
+                   "where p.verdict_id = public.claim_current_verdict_id(p.claim_id)") \
+        == str(len(PR3_FIELDS) - 1)
+
+
+def test_reapplying_the_catalog_promotion_migration_needs_this_one_again(db):
+    """The rerun hazard, stated where an operator will find it.
+
+    `20260916120000` defines `catalog_run_pending_promotions` with the "a
+    verified verdict exists" join R5 replaces, and this module deliberately
+    proves that migration rerun-safe. Migrations apply strictly in sequence
+    (`MIGRATIONS.md`), so the shipped end state is the R5 one -- but an
+    operator who re-runs `20260916120000` afterwards would quietly get the old
+    join back. That hazard is stated here, and so is its remedy: this
+    migration is rerun-safe and must be re-applied last.
+    """
+    promotion = next(m for m in MIGRATIONS if "catalog_field_level_promotion" in m.name)
+    current = next(m for m in MIGRATIONS if "current_verdict_authority" in m.name)
+    installed = ("select pg_get_functiondef(p.oid) from pg_proc p "
+                 "join pg_namespace n on n.oid = p.pronamespace "
+                 "where n.nspname='public' and p.proname='catalog_run_pending_promotions'")
+
+    db.psql(file=current)
+    assert "claim_current_verdict_state" in db.psql(installed)
+    db.psql(file=promotion)
+    assert "claim_current_verdict_state" not in db.psql(installed)   # reverted
+    db.psql(file=current)
+    assert "claim_current_verdict_state" in db.psql(installed)       # current again
+
+
+def test_the_current_verdict_functions_are_service_only(db):
+    """A browser role may not ask, let alone answer, this question."""
+    for signature in ("public.claim_current_verdict_id(uuid)",
+                      "public.claim_current_verdict_state(uuid)",
+                      "public.claim_current_verdict_states(uuid,uuid[],integer)",
+                      "public.claim_verdict_is_current_support(uuid,uuid)",
+                      "public.current_verdict_contract_version()",
+                      "public.catalog_check_link_current_verdict()",
+                      "public.catalog_check_provenance_current_verdict()"):
+        for role in ("anon", "authenticated"):
+            assert db.psql(
+                f"select has_function_privilege('{role}', '{signature}', 'execute')") == "f"
+        assert db.psql(
+            f"select has_function_privilege('service_role', '{signature}', 'execute')") == "t"

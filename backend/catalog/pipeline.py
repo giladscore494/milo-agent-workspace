@@ -106,6 +106,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from backend.engines.swarm_v2.current_verdict import (CurrentVerdict, CurrentVerdictError,
+                                                      parse_current_verdict)
+from backend.engines.swarm_v2.evidence_bounds import MAX_FACTS_PER_BUNDLE
 from backend.errors import AppError
 
 from .contracts import MAX_PROMOTIONS_PER_RUN
@@ -120,6 +123,12 @@ from .promotion import (LEASE_FAILURE_CODES, PROMOTION_REASONS, CanonicalPromoti
 #: -- can never be picked up here.
 PROMOTABLE_TOOL_OPERATION = f"{GOVERNMENT_TOOL_NAME}.{RESOLVE_VARIANT_OPERATION}"
 
+#: The bound of ONE current-verdict read, derived rather than chosen: the
+#: pending read returns at most `MAX_PROMOTIONS_PER_RUN` candidates and at most
+#: `MAX_FACTS_PER_BUNDLE` claims each, so this is exactly as many claims as can
+#: reach the promotion path in one run.
+MAX_CURRENT_VERDICT_READ = MAX_PROMOTIONS_PER_RUN * MAX_FACTS_PER_BUNDLE
+
 #: The candidate statuses a promotion may act on. `ambiguous` and `rejected`
 #: are deliberately absent: both are decisions the ingestion made, and a
 #: promotion may not overrule one by writing a canonical row.
@@ -129,6 +138,8 @@ PROMOTABLE_CANDIDATE_STATUSES = ("candidate", PROMOTABLE_CANDIDATE_STATUS)
 PIPELINE_REASONS: Mapping[str, str] = {
     "CATALOG_PROMOTION_NO_VERIFIED_EVIDENCE":
         "no verified verdict was settled for that candidate's evidence",
+    "CATALOG_PROMOTION_VERDICT_STATE_UNAVAILABLE":
+        "the current verification state of that candidate's evidence could not be read",
     "CATALOG_PROMOTION_SNAPSHOT_UNUSABLE":
         "the snapshot that candidate was read from cannot support a canonical fact",
     "CATALOG_PROMOTION_REFUSED":
@@ -361,16 +372,41 @@ class CatalogPromotionPipeline:
                                     candidate_key=candidate_key,
                                     reason_code="CATALOG_PROMOTION_SNAPSHOT_UNUSABLE")
 
-        # 2. LINK, one per verified claim, idempotent on a derived key -- so a
-        #    resume relinks onto the rows a previous attempt created instead of
-        #    duplicating them.
-        links = self._link(candidate, pending)
+        # 2. THE CURRENT VERIFICATION STATE, re-resolved from durable rows at
+        #    the moment of promoting. The pending-promotion read already
+        #    resolves it, and this asks again anyway: the read and the write
+        #    are two moments, and a verdict settled between them -- an
+        #    invalidation, a contradiction, a supersession -- must be able to
+        #    stop a promotion that was already assembled.
+        #
+        #    A state that cannot be READ is not "still verified". It is an
+        #    absence of an answer, and it refuses rather than assuming.
+        current = self._current_verdicts(pending)
+        if current is None:
+            return PromotionAttempt(candidate_id=pending.candidate_id,
+                                    candidate_key=candidate_key,
+                                    reason_code="CATALOG_PROMOTION_VERDICT_STATE_UNAVAILABLE")
+        supported = tuple(claim for claim in pending.claims
+                          if self._supported(current, claim))
+        if not supported:
+            return PromotionAttempt(candidate_id=pending.candidate_id,
+                                    candidate_key=candidate_key,
+                                    reason_code="CATALOG_PROMOTION_NO_VERIFIED_EVIDENCE")
+
+        # 3. LINK, one per CURRENTLY supported claim, idempotent on a derived
+        #    key -- so a resume relinks onto the rows a previous attempt
+        #    created instead of duplicating them. A claim whose current state
+        #    is not `supported` is not linked at all, so its field simply has
+        #    no evidence: an identity field then refuses the promotion and a
+        #    dimension is reported as unsupported, exactly as for a field no
+        #    source ever stated.
+        links = self._link(candidate, supported, current)
         if not links:
             return PromotionAttempt(candidate_id=pending.candidate_id,
                                     candidate_key=candidate_key,
                                     reason_code="CATALOG_PROMOTION_NO_VERIFIED_EVIDENCE")
 
-        # 3. PLAN, against the candidate as if it were reviewed. The plan is
+        # 4. PLAN, against the candidate as if it were reviewed. The plan is
         #    what decides whether the candidate IS reviewable: it refuses
         #    unless every identity field the canonical row would state has its
         #    own verified evidence at exactly that value. Building it first is
@@ -380,9 +416,9 @@ class CatalogPromotionPipeline:
         proposed = {**candidate, "status": PROMOTABLE_CANDIDATE_STATUS}
         try:
             evidence = field_evidence_for(
-                candidate=proposed, links=[link for link, _ in links],
-                claims={str(row["id"]): row for row in pending.claims},
-                verdicts={str(verdict["id"]): verdict for _, verdict in links})
+                candidate=proposed, links=links,
+                claims={str(row["id"]): row for row in supported},
+                current_verdicts=current)
             plan = build_promotion_plan(candidate=proposed, snapshot=snapshot,
                                         evidence=evidence)
         except CatalogPromotionError as refusal:
@@ -390,7 +426,7 @@ class CatalogPromotionPipeline:
                                     candidate_key=candidate_key,
                                     reason_code=refusal.reason_code)
 
-        # 4. REVIEW. The durable status transition, through the same guarded
+        # 5. REVIEW. The durable status transition, through the same guarded
         #    RPC that created the candidate: it holds the re-presented row to
         #    the identity already stored under that key, so this can move the
         #    status and can never quietly become a different vehicle. Already
@@ -401,7 +437,7 @@ class CatalogPromotionPipeline:
                                     candidate_key=candidate_key,
                                     reason_code="CATALOG_PROMOTION_CANDIDATE_NOT_READY")
 
-        # 5. PROMOTE, atomically, through the lease-guarded RPC.
+        # 6. PROMOTE, atomically, through the lease-guarded RPC.
         try:
             outcome = self._promotion.promote(plan)
         except CatalogPromotionError as refusal:
@@ -421,24 +457,78 @@ class CatalogPromotionPipeline:
         except AppError:
             return None
 
-    def _link(self, candidate: Mapping[str, Any], pending: CandidateEvidence
-              ) -> list[tuple[Mapping[str, Any], Mapping[str, Any]]]:
-        """One evidence link per verified claim, paired with its verdict.
+    def _current_verdicts(self, pending: CandidateEvidence) -> dict[str, CurrentVerdict] | None:
+        """The CURRENT verification state of this candidate's claims.
 
-        The verdict is already known to be `verified` -- the durable read joins
-        on it -- so this states the pairing `field_evidence_for` needs rather
-        than deciding anything again.
+        Read from durable rows through the repository, never assembled from
+        what the pending read happened to return: the point of the R5
+        resolution is that no consumer of verified evidence gets to decide for
+        itself what "verified" means.
+
+        Three failure modes, and they are deliberately not one:
+
+        *   a repository that does not offer the read REFUSES the promotion,
+            by answering `None`. This is not the optional-capability case
+            `pending` handles -- that one is a deployment with no catalog
+            schema at all, which owes no promotion. Here a candidate IS
+            pending, and a backend that cannot say whether its evidence is
+            still verified may not promote it;
+        *   an `AppError` from the read propagates UNCHANGED, into the same
+            infrastructure path every other repository failure takes: nothing
+            was learned, so "still verified" is not a fact this process has;
+        *   a state that resolves to nothing for a claim is simply absent from
+            the map, and `field_evidence_for` refuses it there.
         """
-        linked: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
-        for claim in pending.claims:
+        read = getattr(self._repository, "claim_current_verdict_states", None)
+        if not callable(read):
+            return None
+        rows = read(self._lease.run_id,
+                    [str(claim["id"]) for claim in pending.claims],
+                    limit=MAX_CURRENT_VERDICT_READ)
+        resolved: dict[str, CurrentVerdict] = {}
+        for row in rows:
+            try:
+                state = parse_current_verdict(row)
+            except CurrentVerdictError:
+                # A malformed resolved state is not a weaker one. It is
+                # dropped, and the claim it was about has no current state.
+                continue
+            resolved[state.claim_id] = state
+        return resolved
+
+    @staticmethod
+    def _supported(current: Mapping[str, CurrentVerdict],
+                   claim: Mapping[str, Any]) -> bool:
+        """Whether THIS claim is verified now, by the verdict it came with.
+
+        Both halves matter. The claim must be currently supported, and the
+        verdict the pending read named must be the row that supports it --
+        otherwise the link this would create would cite history.
+        """
+        state = current.get(str(claim.get("id")))
+        return state is not None and state.authorizes(claim.get("verdict_id"))
+
+    def _link(self, candidate: Mapping[str, Any],
+              claims: Sequence[Mapping[str, Any]],
+              current: Mapping[str, CurrentVerdict]) -> list[Mapping[str, Any]]:
+        """One evidence link per CURRENTLY supported claim.
+
+        The verdict id written into the link is taken from the resolved
+        current state rather than from the row the read carried, so a link can
+        only ever cite the verdict that is current at the moment it is made.
+        The durable RPC re-checks exactly that, for every writer.
+        """
+        linked: list[Mapping[str, Any]] = []
+        for claim in claims:
+            state = current[str(claim["id"])]
             row = self._repository.link_catalog_candidate_evidence(
                 self._lease.run_id,
                 {"candidate_id": str(candidate["id"]),
                  "candidate_key": str(candidate["candidate_key"]),
                  "source_id": str(claim["source_id"]), "claim_id": str(claim["id"]),
-                 "verdict_id": str(claim["verdict_id"])},
+                 "verdict_id": str(state.verdict_id)},
                 **self._lease_kwargs)
-            linked.append((dict(row), {"id": claim["verdict_id"], "verdict": "verified"}))
+            linked.append(dict(row))
         return linked
 
     def _review(self, pending: CandidateEvidence,
@@ -470,6 +560,7 @@ class CatalogPromotionPipeline:
                                                          **self._lease_kwargs)
 
 
-__all__ = ["MAX_PROMOTIONS_PER_RUN", "PIPELINE_REASONS", "PROMOTABLE_CANDIDATE_STATUSES",
+__all__ = ["MAX_CURRENT_VERDICT_READ", "MAX_PROMOTIONS_PER_RUN", "PIPELINE_REASONS",
+           "PROMOTABLE_CANDIDATE_STATUSES",
            "PROMOTABLE_TOOL_OPERATION", "CandidateEvidence", "CatalogPromotionPipeline",
            "PromotionAttempt", "group_pending_promotions"]

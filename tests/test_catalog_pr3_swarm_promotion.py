@@ -203,27 +203,45 @@ def mark_ready(repository, lease, candidate_id: str) -> dict:
                 if row["id"] == candidate_id)
 
 
+def settle(board, claim, fragment, *, verdict: str = "verified",
+           reason: str = "R4_STRUCTURED_MATCH"):
+    """One durable verdict for one claim, citing one durable fragment."""
+    return board.record_verification_verdict(VerificationVerdict(
+        claim_id=str(claim["id"]), verdict=verdict, reason=reason,
+        mode="deterministic_structured", contract_version=VERIFIER_CONTRACT_VERSION,
+        support=[SupportLink(source_id=str(claim["source_id"]),
+                             content_hash=fragment["content_hash"],
+                             fragment_id=str(fragment["id"]),
+                             locator=fragment["locator_key"])]))
+
+
+def current_states(repository, lease) -> dict:
+    """The RESOLVED CURRENT verdict state of a run's claims, keyed by claim.
+
+    R5: this is what `field_evidence_for` consumes, and it is read from the
+    repository rather than assembled from the verdict rows a test happens to
+    hold -- so a test proves the same thing production does, which is that an
+    older `verified` row stops authorizing anything the moment a newer verdict
+    replaces it.
+    """
+    return {str(row["claim_id"]): row
+            for row in repository.claim_current_verdict_states(lease.run_id)}
+
+
 def verify_and_link(repository, lease, board, acquired, candidate, *,
                     verdict: str = "verified", reason: str = "R4_STRUCTURED_MATCH"):
     """A verified verdict per acquired claim, and the evidence link that cites it."""
     fragments = {item["locator_key"]: item for item in acquired.fragments}
-    links, claims, verdicts = [], {}, {}
+    links, claims = [], {}
     for claim in acquired.claims:
-        fragment = fragments[claim["evidence_locator"]]
-        decision = board.record_verification_verdict(VerificationVerdict(
-            claim_id=str(claim["id"]), verdict=verdict, reason=reason,
-            mode="deterministic_structured", contract_version=VERIFIER_CONTRACT_VERSION,
-            support=[SupportLink(source_id=str(claim["source_id"]),
-                                 content_hash=fragment["content_hash"],
-                                 fragment_id=str(fragment["id"]),
-                                 locator=fragment["locator_key"])]))
+        decision = settle(board, claim, fragments[claim["evidence_locator"]],
+                          verdict=verdict, reason=reason)
         links.append(repository.link_catalog_candidate_evidence(lease.run_id, {
             "candidate_key": candidate["candidate_key"], "candidate_id": candidate["id"],
             "source_id": claim["source_id"], "claim_id": claim["id"],
             "verdict_id": decision["id"]}, **lease_kwargs(lease)))
         claims[str(claim["id"])] = claim
-        verdicts[str(decision["id"])] = decision
-    return links, claims, verdicts
+    return links, claims, current_states(repository, lease)
 
 
 class RecordingRepository:
@@ -435,14 +453,15 @@ def promoted(repository, lease, *, year: int = PINNED_YEAR):
     result = resolve(repository, code=code, year=year)
     board, acquired = acquire(repository, lease, result)
     candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
-    links, claims, verdicts = verify_and_link(repository, lease, board, acquired, candidate)
+    links, claims, current = verify_and_link(repository, lease, board, acquired, candidate)
     snapshot = next(row for row in repository.catalog_snapshots.values()
                     if row["id"] == candidate["snapshot_id"])
     evidence = field_evidence_for(candidate=candidate, links=links, claims=claims,
-                                  verdicts=verdicts)
+                                  current_verdicts=current)
     plan = build_promotion_plan(candidate=candidate, snapshot=snapshot, evidence=evidence)
     promotion = CanonicalPromotion(repository, lease)
-    return promotion, plan, promotion.promote(plan), acquired, candidate, links, claims, verdicts
+    return (promotion, plan, promotion.promote(plan), acquired, candidate, links, claims,
+            current, board)
 
 
 # =============================================================================
@@ -649,7 +668,7 @@ def test_the_whole_path_ends_in_a_canonical_row_backed_by_one_fact_per_field(rep
     source version and the exact locator.
     """
     lease, _report = landed
-    promotion, plan, outcome, acquired, candidate, links, _claims, _verdicts = promoted(
+    promotion, plan, outcome, acquired, candidate, links, _claims, _current, _board = promoted(
         repository, lease)
 
     assert outcome.promoted_fields == tuple(sorted(item.field_key for item in plan.fields))
@@ -918,7 +937,7 @@ def test_an_unverified_or_rejected_verdict_can_never_back_a_canonical_fact(repos
         "source_id": claim["source_id"], "claim_id": claim["id"]}, **lease_kwargs(lease))
     with pytest.raises(CatalogPromotionError) as promotion_failure:
         field_evidence_for(candidate=candidate, links=[link],
-                           claims={str(claim["id"]): claim}, verdicts={})
+                           claims={str(claim["id"]): claim}, current_verdicts={})
     assert promotion_failure.value.reason_code == "CATALOG_PROMOTION_LINK_UNVERIFIED"
 
 
@@ -988,15 +1007,23 @@ def test_two_verified_sources_that_disagree_are_never_promoted(repository, lande
     result = resolve(repository, code=one_code(repository))
     board, acquired = acquire(repository, lease, result)
     candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
-    links, claims, verdicts = verify_and_link(repository, lease, board, acquired, candidate)
+    links, claims, current = verify_and_link(repository, lease, board, acquired, candidate)
     # A SECOND verified link for the same field, at a different value.
     trim_claim = next(claim for claim in acquired.claims if claim["field_key"] == "trim")
     rival = dict(trim_claim, id=str(uuid4()), value="LIMITED")
     rival_link = dict(links[0], id=str(uuid4()), claim_id=rival["id"])
+    # The rival claim is assembled rather than written, so it has no durable
+    # state of its own: state one for it, `supported` and citing the very
+    # verdict its link names, so this test exercises the CONFLICT rule rather
+    # than tripping the current-verdict gate before it.
+    rival_state = {"claim_id": str(rival["id"]), "state": "supported",
+                   "verdict_id": str(rival_link["verdict_id"]), "verdict": "verified",
+                   "support_count": 1}
     with pytest.raises(CatalogPromotionError) as failure:
         field_evidence_for(candidate=candidate,
                            links=[*links, rival_link],
-                           claims={**claims, str(rival["id"]): rival}, verdicts=verdicts)
+                           claims={**claims, str(rival["id"]): rival},
+                           current_verdicts={**current, str(rival["id"]): rival_state})
     assert failure.value.reason_code == "CATALOG_PROMOTION_CONFLICT_UNRESOLVED"
 
 
@@ -1036,7 +1063,7 @@ def test_cancellation_stops_the_tool_between_reads(repository, landed):
 def test_an_exact_replay_writes_nothing_and_a_conflicting_one_fails_closed(repository, landed):
     """Idempotency, both directions, at the promotion boundary."""
     lease, _report = landed
-    promotion, plan, outcome, _acquired, candidate, _links, _claims, _verdicts = promoted(
+    promotion, plan, outcome, _acquired, candidate, _links, _claims, _current, _board = promoted(
         repository, lease)
     before = len(promotion.field_provenance(outcome.variant["id"]))
     assert promotion.promote(plan).variant["id"] == outcome.variant["id"]
@@ -1568,7 +1595,7 @@ def test_every_guarded_write_replays_onto_the_row_it_already_wrote(repository, l
     be.
     """
     lease, _report = landed
-    promotion, plan, outcome, acquired, candidate, links, claims, verdicts = promoted(
+    promotion, plan, outcome, acquired, candidate, links, claims, current, board = promoted(
         repository, lease)
     snapshot_state = json.dumps(repository.catalog_snapshots, sort_keys=True, default=str)
     sources = len([row for row in repository.tool_rows
@@ -1583,7 +1610,7 @@ def test_every_guarded_write_replays_onto_the_row_it_already_wrote(repository, l
     result = resolve(repository, code=candidate["official_model_code"])
     board, replayed = acquire(repository, lease, result, call_id="call-1")
     assert [row["id"] for row in replayed.claims] == [row["id"] for row in acquired.claims]
-    replayed_links, _c, _v = verify_and_link(repository, lease, board, replayed, candidate)
+    replayed_links, _c, _current = verify_and_link(repository, lease, board, replayed, candidate)
     assert sorted(row["id"] for row in replayed_links) == sorted(row["id"] for row in links)
     assert promotion.promote(plan).variant["id"] == outcome.variant["id"]
 
@@ -2016,13 +2043,13 @@ def test_evidence_about_another_vehicle_scope_or_record_is_never_promoted(reposi
     result = resolve(repository, code=one_code(repository))
     board, acquired = acquire(repository, lease, result)
     candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
-    links, claims, verdicts = verify_and_link(repository, lease, board, acquired, candidate)
+    links, claims, current = verify_and_link(repository, lease, board, acquired, candidate)
     snapshot = next(row for row in repository.catalog_snapshots.values()
                     if row["id"] == candidate["snapshot_id"])
     plan = build_promotion_plan(
         candidate=candidate, snapshot=snapshot,
         evidence=field_evidence_for(candidate=candidate, links=links, claims=claims,
-                                    verdicts=verdicts))
+                                    current_verdicts=current))
 
     # The honest chain for `model_year_start`, rebuilt with ONE thing wrong.
     scope = {"entity": government_entity_key(candidate["manufacturer"],
@@ -2085,13 +2112,13 @@ def test_a_promotion_may_not_cite_another_runs_evidence(repository, landed):
     result = resolve(repository, code=one_code(repository))
     board, acquired = acquire(repository, lease, result)
     candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
-    links, claims, verdicts = verify_and_link(repository, lease, board, acquired, candidate)
+    links, claims, current = verify_and_link(repository, lease, board, acquired, candidate)
     snapshot = next(row for row in repository.catalog_snapshots.values()
                     if row["id"] == candidate["snapshot_id"])
     plan = build_promotion_plan(
         candidate=candidate, snapshot=snapshot,
         evidence=field_evidence_for(candidate=candidate, links=links, claims=claims,
-                                    verdicts=verdicts))
+                                    current_verdicts=current))
     # A SECOND run, with its own lease, presenting the first run's links.
     other = leased_run(repository, worker="worker-2")
     with pytest.raises(AppError) as failure:
@@ -2121,9 +2148,9 @@ def test_the_memory_repository_applies_the_same_promotion_invariants(repository,
     result = resolve(repository, code=one_code(repository))
     board, acquired = acquire(repository, lease, result)
     candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
-    links, claims, verdicts = verify_and_link(repository, lease, board, acquired, candidate)
+    links, claims, current = verify_and_link(repository, lease, board, acquired, candidate)
     evidence = field_evidence_for(candidate=candidate, links=links, claims=claims,
-                                  verdicts=verdicts)
+                                  current_verdicts=current)
     snapshot = next(row for row in repository.catalog_snapshots.values()
                     if row["id"] == candidate["snapshot_id"])
     plan = build_promotion_plan(candidate=candidate, snapshot=snapshot, evidence=evidence)
@@ -2134,4 +2161,236 @@ def test_the_memory_repository_applies_the_same_promotion_invariants(repository,
     with pytest.raises(Exception) as failure:
         repository.promote_catalog_variant(lease.run_id, payload, **lease_kwargs(lease))
     assert "do not match the canonical row" in str(failure.value)
+    assert not repository.catalog_model_variants
+
+
+# =============================================================================
+# 12. R5: a promotion consumes CURRENT truth, never verdict history
+# =============================================================================
+#
+# `public.claim_verdicts` is append-only, so "a verified verdict exists for
+# this claim" stays true forever -- including after a re-verification rejected
+# it. Every layer of this path used to ask exactly that question: the durable
+# read joined on it, the link RPC checked only what the CITED row said, and the
+# promotion gate re-checked the same cited row. A stale `verified` could
+# therefore authorize a canonical fact.
+#
+# `backend/engines/swarm_v2/current_verdict.py` is the one resolution that
+# replaces it, and `supabase/migrations/20260921000100_current_verdict_
+# authority.sql` applies the same rule to every writer. The rule itself is
+# proven in `tests/test_current_verdict_authority.py`; what is proven HERE is
+# that this path obeys it, at every layer, end to end.
+
+def reverify(repository, lease, *, verdict: str = "rejected",
+             reason: str = "R4_VALUE_MISMATCH"):
+    """A NEWER verdict for every claim of the run: a re-verification.
+
+    The identity of a durable verdict is its own content, so a different
+    verdict and reason is a NEW row rather than a replay -- which is exactly
+    what a second verification pass writes.
+    """
+    board = EvidenceBoard(repository, lease)
+    for claim in claims_of(repository, lease):
+        board.record_verification_verdict(VerificationVerdict(
+            claim_id=str(claim["id"]), verdict=verdict, reason=reason,
+            mode="deterministic_structured", contract_version=VERIFIER_CONTRACT_VERSION))
+    return board
+
+
+def test_a_stale_verified_verdict_never_authorizes_a_promotion(repository, landed):
+    """THE regression. A complete, legitimate plan, invalidated before it lands.
+
+    Everything about this promotion was correct when it was assembled: the
+    evidence was located, the verdict was `verified`, the link cited it and the
+    plan covered every stated field. Then a re-verification rejected the claims
+    -- and the plan, still in hand, must stop being an authorization.
+    """
+    lease, _report = landed
+    result = resolve(repository, code=one_code(repository))
+    board, acquired = acquire(repository, lease, result)
+    candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
+    links, claims, current = verify_and_link(repository, lease, board, acquired, candidate)
+    snapshot = next(row for row in repository.catalog_snapshots.values()
+                    if row["id"] == candidate["snapshot_id"])
+    plan = build_promotion_plan(
+        candidate=candidate, snapshot=snapshot,
+        evidence=field_evidence_for(candidate=candidate, links=links, claims=claims,
+                                    current_verdicts=current))
+
+    reverify(repository, lease)
+
+    # The DURABLE gate refuses it, naming the property that failed.
+    with pytest.raises(AppError) as durable:
+        repository.promote_catalog_variant(lease.run_id, plan.as_payload(),
+                                           **lease_kwargs(lease))
+    assert durable.value.code == "CATALOG_PROMOTION_VERDICT_NOT_CURRENT"
+    # And the assembly above it collapses that to one static reason.
+    with pytest.raises(CatalogPromotionError) as refusal:
+        CanonicalPromotion(repository, lease).promote(plan)
+    assert refusal.value.reason_code == "CATALOG_PROMOTION_REFUSED"
+    assert not repository.catalog_model_variants
+    assert not repository.catalog_canonical_field_provenance
+    # The `verified` rows are still there. Append-only history is not the
+    # thing that changed -- what it AUTHORIZES is.
+    assert [row for row in repository.tool_rows
+            if repository.evidence_kinds.get(str(row.get("id"))) == "claim_verdict"
+            and row["verdict"] == "verified"]
+
+
+def test_the_pending_promotion_read_drops_a_claim_whose_verdict_was_replaced(repository,
+                                                                             landed):
+    """The read resolves current truth instead of scanning for an old answer."""
+    lease, _report = landed
+    gather_evidence(repository, lease)
+    pipeline = CatalogPromotionPipeline(repository, lease)
+    assert len(pipeline.pending()) == 1
+
+    reverify(repository, lease, verdict="needs_review", reason="R4_SOURCE_SILENT")
+
+    assert pipeline.pending() == ()
+    assert pipeline.promote() == ()
+    assert not repository.catalog_model_variants
+
+
+def test_the_pipeline_re_resolves_current_truth_between_the_read_and_the_write(repository,
+                                                                               landed):
+    """Defence in depth: the read and the write are two different moments.
+
+    A verdict settled between them -- exactly the race a durable read cannot
+    close on its own -- must stop a promotion that is already assembled. The
+    pending read here is frozen to what it returned BEFORE the
+    re-verification, which is what that race looks like from inside the
+    pipeline.
+    """
+    lease, _report = landed
+    gather_evidence(repository, lease)
+    stale_rows = repository.catalog_run_pending_promotions(lease.run_id,
+                                                           PROMOTABLE_TOOL_OPERATION)
+    assert stale_rows
+
+    reverify(repository, lease)
+
+    class FrozenRead:
+        """The repository, with ONE read stuck in the past."""
+
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def catalog_run_pending_promotions(self, *_args, **_kwargs):
+            return list(stale_rows)
+
+    attempts = CatalogPromotionPipeline(FrozenRead(repository), lease).promote()
+
+    assert len(attempts) == 1 and not attempts[0].promoted
+    assert attempts[0].reason_code == "CATALOG_PROMOTION_NO_VERIFIED_EVIDENCE"
+    assert not repository.catalog_model_variants
+
+
+def test_a_link_may_not_be_created_citing_a_verdict_that_is_no_longer_current(repository,
+                                                                              landed):
+    """The earliest gate: a link is provenance, so it may not cite history."""
+    lease, _report = landed
+    result = resolve(repository, code=one_code(repository))
+    board, acquired = acquire(repository, lease, result)
+    candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
+    fragments = {row["locator_key"]: row for row in acquired.fragments}
+    claim = acquired.claims[0]
+    accepted = settle(board, claim, fragments[claim["evidence_locator"]])
+
+    reverify(repository, lease)
+
+    with pytest.raises(AppError) as failure:
+        repository.link_catalog_candidate_evidence(lease.run_id, {
+            "candidate_key": candidate["candidate_key"], "candidate_id": candidate["id"],
+            "source_id": claim["source_id"], "claim_id": claim["id"],
+            "verdict_id": accepted["id"]}, **lease_kwargs(lease))
+    assert failure.value.code == "CATALOG_LINK_VERDICT_NOT_CURRENT"
+
+
+def test_field_evidence_refuses_history_however_verified_it_reads(repository, landed):
+    """The assembly layer, on its own, with the two cases it must separate."""
+    lease, _report = landed
+    result = resolve(repository, code=one_code(repository))
+    board, acquired = acquire(repository, lease, result)
+    candidate = mark_ready(repository, lease, result["variants"][0]["candidate_id"])
+    links, claims, current = verify_and_link(repository, lease, board, acquired, candidate)
+    claim_id = str(links[0]["claim_id"])
+
+    # (a) the claim is verified NOW -- by a DIFFERENT verdict than the one
+    #     this link cites. Still `verified`, and still not this link's.
+    moved = {**current, claim_id: {**current[claim_id],
+                                   "verdict_id": str(uuid4())}}
+    with pytest.raises(CatalogPromotionError) as not_current:
+        field_evidence_for(candidate=candidate, links=links, claims=claims,
+                           current_verdicts=moved)
+    assert not_current.value.reason_code == "CATALOG_PROMOTION_EVIDENCE_NOT_CURRENT"
+
+    # (b) the claim is not verified now at all.
+    for state in ("rejected", "needs_review", "unsupported", "superseded", "contested",
+                  "invalidated", "unverified"):
+        refused = {**current, claim_id: {**current[claim_id], "state": state}}
+        with pytest.raises(CatalogPromotionError) as failure:
+            field_evidence_for(candidate=candidate, links=links, claims=claims,
+                               current_verdicts=refused)
+        assert failure.value.reason_code == "CATALOG_PROMOTION_EVIDENCE_UNSUPPORTED"
+
+    # (c) a state that could not be read at all is not "still verified".
+    with pytest.raises(CatalogPromotionError) as unknown:
+        field_evidence_for(candidate=candidate, links=links, claims=claims,
+                           current_verdicts={})
+    assert unknown.value.reason_code == "CATALOG_PROMOTION_EVIDENCE_NOT_CURRENT"
+
+
+def test_a_promotion_succeeds_from_current_supported_provenance_complete_evidence(
+        repository, landed):
+    """The positive half, asserted against the durable rows it wrote.
+
+    Every promoted fact cites the verdict that is CURRENT for its claim, and
+    carries the complete provenance the canonical catalog is for: the source
+    version it was read at and the exact record locator it was read from.
+    """
+    lease, _report = landed
+    attempts = production_path(repository, lease)
+    assert len(attempts) == 1 and attempts[0].promoted
+
+    states = {row["claim_id"]: row for row
+              in repository.claim_current_verdict_states(lease.run_id)}
+    provenance = repository.list_canonical_field_provenance(
+        attempts[0].outcome.variant["id"])
+    assert provenance
+    for row in provenance:
+        current = states[str(row["claim_id"])]
+        assert current["state"] == "supported"
+        assert str(row["verdict_id"]) == current["verdict_id"]
+        assert row["source_version"] and row["source_version_kind"]
+        assert row["record_locator"]
+
+
+def test_a_backend_that_cannot_read_current_truth_promotes_nothing(repository, landed):
+    """"We could not tell" is not "still verified".
+
+    A repository offering no current-verdict read is a different thing from a
+    deployment with no catalog schema at all: there, a run owes no promotion
+    and the pipeline is silent. Here a candidate IS pending, and a backend that
+    cannot say whether its evidence is still verified may not promote it.
+    """
+    lease, _report = landed
+    gather_evidence(repository, lease)
+
+    class Blind:
+        """The repository, minus the one read this decision needs."""
+
+        def __getattr__(self, name):
+            if name == "claim_current_verdict_states":
+                raise AttributeError(name)
+            return getattr(repository, name)
+
+    attempts = CatalogPromotionPipeline(Blind(), lease).promote()
+
+    assert len(attempts) == 1 and not attempts[0].promoted
+    assert attempts[0].reason_code == "CATALOG_PROMOTION_VERDICT_STATE_UNAVAILABLE"
+    assert attempts[0].safe_message
     assert not repository.catalog_model_variants

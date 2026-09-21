@@ -524,6 +524,43 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 retry_callback=record_retry, budget_tracker=tracker,
             )
         elif engine is None and engine_registry is None:
+            def build_v1_evidence_authority():
+                """R5: V1's evidence authority, on the run's own lease.
+
+                The SAME Evidence Board primitives Swarm V2 writes through --
+                versioned source, located fragment, located claim, verdict with
+                durable support links -- so a V1 verified field is the same
+                durable chain every other verified fact in this repository is,
+                and not a second truth system beside it.
+
+                Every write is lease-guarded and idempotent on an identity
+                derived from the evidence's own content, which is what makes a
+                resumed V1 run replay onto the rows the crashed one wrote
+                instead of appending a second set.
+
+                It arms NO promotion. V1 evidence records its own
+                `tool_operation`, and the canonical promotion read matches only
+                the registered Government one -- so nothing written here can
+                reach the canonical catalog, with every catalog flag off as it
+                is by default and with them on as well.
+                """
+                from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+                from backend.engines.vehicle_catalog_v1.evidence_authority import (
+                    V1EvidenceAuthority)
+
+                # Without a lease there is no writer, so there is no board --
+                # and the authority still decides every field, it simply
+                # persists nothing. A repository with no lease contract is a
+                # local/offline configuration, and it must not turn engine
+                # construction into a crash.
+                token = str(run.get("lease_token") or "")
+                if not token:
+                    return V1EvidenceAuthority(repository=repo)
+                return V1EvidenceAuthority(
+                    board=EvidenceBoard(repo, WorkerLease(
+                        run_id, worker_id, int(run.get("attempt") or 1), token)),
+                    repository=repo)
+
             engine_builder = lambda: VehicleCatalogV1Adapter(
                 model_client_factory=build_guarded_client_factory(tracker, request_deadline_seconds=provider_request_deadline), event_sink=forward_event,
                 checkpoint_sink=save_checkpoint, cancellation_checker=is_cancelled,
@@ -534,6 +571,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # must draw from one gate, not two that each believe they own
                 # the account.
                 provider_coordinator=provider_coordinator,
+                evidence_authority=build_v1_evidence_authority(),
             )
             def make_swarm_engine():
                 from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander,
