@@ -218,9 +218,9 @@ class MemoryRepository:
                 return dict(run)
         return None
 
-    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]:
-        # Mirrors migration 012: replay lookup, admission and both writes
-        # under one lock, so the E2E stack exercises the atomic contract.
+    def create_message_and_run(self, conversation_id: UUID, content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str | None, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None, *, run_id: UUID, run_identity: dict[str, Any]) -> dict[str, Any]:
+        # Mirrors Console 6's atomic creator: replay lookup, admission, message,
+        # run and immutable identity all settle under one lock.
         with self.lock:
             if idempotency_key:
                 existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
@@ -229,11 +229,33 @@ class MemoryRepository:
             if max_user_active is not None and self.count_active_runs_for_user(requested_by) >= max_user_active:
                 raise AppError("USER_CONCURRENCY_LIMIT", "too many active runs for this user", 429)
             project_id = self._conversation_project(conversation_id)
+            project = self.projects.get(str(project_id)) or {}
+            if run_identity.get("run_id") != str(run_id):
+                raise AppError("RUN_IDENTITY_INVALID", "identity names a different run", 409)
+            if run_identity.get("workflow_key") != project.get("workflow_key"):
+                raise AppError("RUN_IDENTITY_WORKFLOW_DRIFT", "project workflow changed before run creation", 409)
             if max_project_active is not None and self.count_active_runs_for_project(project_id) >= max_project_active:
                 raise AppError("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429)
             message = self.create_user_message(conversation_id, content, metadata)
-            run = self.create_queued_run(conversation_id, message["id"], content, metadata, requested_by=requested_by, idempotency_key=idempotency_key, request_fingerprint=request_fingerprint)
-            return {"run": run, "created": True}
+            run = {
+                "id": str(run_id),
+                "conversation_id": str(conversation_id),
+                "status": "queued",
+                "attempt": 1,
+                "launch_state": "pending",
+                "requested_by": str(requested_by),
+                "idempotency_key": idempotency_key,
+                "request_fingerprint": request_fingerprint,
+                "input": {"message_id": str(message["id"]), "content": content, "metadata": metadata},
+                "output": None,
+                "error": None,
+                "usage": {},
+                "run_identity": dict(run_identity),
+                "created_at": _now(),
+                "updated_at": _now(),
+            }
+            self.runs[run["id"]] = run
+            return {"run": dict(run), "created": True}
 
     def try_acquire_launch(self, run_id: UUID) -> dict[str, Any] | None:
         with self.lock:
@@ -453,31 +475,6 @@ class MemoryRepository:
             self.usage_ledger = []
         self.usage_ledger.append(row)
         return dict(row)
-
-    def bind_run_identity(self, run_id: UUID, identity: dict[str, Any]) -> dict[str, Any]:
-        """Parity with `bind_run_identity` (migration 20260921000200).
-
-        Set once, under the lock so two binds cannot both see a null column.
-        An identical re-bind is a no-op; a DIFFERENT record is refused, here as
-        in the database -- and once bound, nothing in this repository writes
-        the field again.
-        """
-        with self.lock:
-            run = self.runs.get(str(run_id))
-            if run is None:
-                raise NotFoundError("run", str(run_id))
-            if not isinstance(identity, dict) or not identity:
-                raise AppError("RUN_IDENTITY_INVALID", "a run identity must be an object", 422)
-            if str(identity.get("run_id") or "") != str(run_id):
-                raise AppError("RUN_IDENTITY_INVALID", "the identity names a different run", 422)
-            current = run.get("run_identity")
-            if current is None:
-                run["run_identity"] = dict(identity)
-                run["updated_at"] = _now()
-            elif current != identity:
-                raise AppError("RUN_IDENTITY_IMMUTABLE",
-                               "the run already has a different immutable identity", 409)
-            return dict(run)
 
     def sum_daily_ledger_cost(self, user_id: str | None = None, project_id: str | None = None, run_id: str | None = None, hours: int = 24) -> float:
         rows = getattr(self, "usage_ledger", [])
