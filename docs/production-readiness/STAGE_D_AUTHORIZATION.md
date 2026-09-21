@@ -673,11 +673,15 @@ None of these can be performed by repository automation:
 2. **Choose the Government-capture resolution** (`retire` or
    `leave-prepared`) and run step 0 with the full operator guard.
 3. **Verify a hard provider-account spending/wallet ceiling is configured**
-   on the Moonshot account, and record its value. This is a PREREQUISITE,
-   not a precaution: MILO caps tracked token cost only, and nothing in
-   this repository bounds `$web_search` tool fees (§3.6). Also re-check
-   the current per-invocation fee (officially $0.005) and the announced
-   2026-10-20 retirement of the legacy `$web_search` tool.
+   on the Moonshot account, and record its value. This remains a
+   PREREQUISITE as an independent provider-side guard. MILO now includes a
+   conservative standalone-search charge inside its own $1.00 recorded-cost
+   ceiling (§3.6), but provider pricing is external state and must still be
+   re-checked immediately before authorization: currently $0.002/call for
+   Search Basic and $0.003/call for Search Pro on the international platform.
+   Also confirm the legacy `$web_search` price ($0.005) and announced
+   2026-10-20 retirement have not changed, even though Production no longer
+   uses that route.
 4. **Run steps 1–7** from an authenticated `gcloud` shell owning
    `big-cabinet-457321-t7`. Step 3 is typed by hand: by policy no committed
    script enables an execution flag.
