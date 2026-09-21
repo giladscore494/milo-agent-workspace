@@ -222,9 +222,21 @@ class MemoryRepository:
         # Mirrors Console 6's atomic creator: replay lookup, admission, message,
         # run and immutable identity all settle under one lock.
         with self.lock:
+            if not request_fingerprint:
+                raise AppError(
+                    "IDEMPOTENCY_FINGERPRINT_REQUIRED",
+                    "run creation requires a request fingerprint",
+                    409,
+                )
             if idempotency_key:
                 existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
                 if existing is not None:
+                    if existing.get("request_fingerprint") != request_fingerprint:
+                        raise AppError(
+                            "IDEMPOTENCY_CONFLICT",
+                            "idempotency key was already used with a different payload",
+                            409,
+                        )
                     return {"run": existing, "created": False}
             if max_user_active is not None and self.count_active_runs_for_user(requested_by) >= max_user_active:
                 raise AppError("USER_CONCURRENCY_LIMIT", "too many active runs for this user", 429)
