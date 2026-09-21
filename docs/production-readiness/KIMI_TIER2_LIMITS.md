@@ -107,14 +107,19 @@ after the money was spent. No production engine offers the built-in any more
 (`builtin_web_search_offered_by_a_production_engine: false`); the provider
 authority keeps accounting for one if any caller ever sends it.
 
-Two facts remain **UNVERIFIED** and are not claimed:
+One provider-capacity fact remains **UNVERIFIED** and is not claimed:
 
 - the exact Tier 2 numeric Web Search QPS (the conservative 1 QPS fallback
-  stands, and `QuotaConfig` refuses a configured value above it);
-- the wire contract of the standalone endpoints. The transport reads the
-  response defensively and treats an unreadable shape as an **empty** result
-  set rather than inventing one, but it has **not** been exercised against
-  the live provider. Confirming it is a prerequisite of the first paid run.
+  stands, and `QuotaConfig` refuses a configured value above it).
+
+The standalone **wire contract is now pinned from current official Kimi API
+documentation**: `POST /v1/tools/search` and `/v1/tools/search_pro` accept
+`text_query`, `limit` (1..20) and `timeout_seconds` (1..60), and return the
+result list as `search_results`. MILO sends explicit server-owned bounds
+(`limit=8`, `timeout_seconds=30`) instead of provider defaults. The transport
+still reads responses defensively and never invents data from an unknown
+shape. Live endpoint reachability/authentication remains a release/probe
+concern; it is not a reason to describe the documented schema as unknown.
 
 What bounds search volume regardless of either: every invocation is admitted
 against `max_search_invocations_per_run` **before** it executes, so the run
