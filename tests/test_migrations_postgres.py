@@ -27,6 +27,7 @@ validation.
 import hashlib
 import json
 import os
+import re
 import uuid
 import shutil
 import subprocess
@@ -253,6 +254,67 @@ end $$;
 alter default privileges in schema public grant execute on functions to anon, authenticated, service_role;
 """
 
+
+# ---------------------------------------------------------------------------
+# Seeding a run the way Console 6 requires
+# ---------------------------------------------------------------------------
+#: The release this suite states it is serving. `runs_run_identity_shape_check`
+#: requires a full 40-character hex SHA, because an unstated release is never a
+#: wildcard.
+IDENTITY_RELEASE_SHA = "84cd8696119c24662a954d0f0e23195268dab23f"
+
+
+def run_identity_literal(run_id: str, workflow_key: str = "vehicle_catalog_v1") -> str:
+    """A valid immutable identity for `run_id`, as a SQL jsonb literal.
+
+    Built from `backend/run_identity.py` -- the same authority the application
+    binds from -- so the policy and event-registry fingerprints this suite
+    writes are the ones the running image actually declares. The release is
+    stated explicitly rather than read from the environment, because these
+    fixtures are module-scoped and must not depend on a per-test env patch.
+    """
+    from backend.run_identity import RunIdentity
+
+    record = RunIdentity.bind(run_id, workflow_key,
+                              env={"MILO_RELEASE_SHA": IDENTITY_RELEASE_SHA}).as_record()
+    return "'" + json.dumps(record).replace("'", "''") + "'::jsonb"
+
+
+_RUN_INSERT = re.compile(
+    r"insert into public\.runs \((?P<cols>[^)]*)\) values \((?P<vals>.*?)\)(?P<rest>.*)$",
+    re.DOTALL)
+
+
+def born_with_identity(sql: str, *, workflow_key: str = "vehicle_catalog_v1",
+                       run_id: str | None = None) -> str:
+    """Add the `id` and `run_identity` a post-Console-6 run insert must carry.
+
+    A run is now BORN with its identity: `runs_require_identity_on_insert`
+    refuses an insert that carries none, `runs_run_identity_shape_check`
+    requires the identity to name the row's OWN id -- so the id is chosen here
+    instead of by the column default -- and `claim_run_lease` refuses an
+    identity-less run outright. A seeded run that a test then claims, fences or
+    finalizes therefore has to be a real run, not the bare row that used to be
+    enough.
+
+    The default workflow is the one every fixture project in this module
+    declares: the trigger compares the identity against the TRUSTED
+    conversation -> project workflow, so an identity naming anything else is
+    refused as drift -- which is the point of the check.
+
+    This keeps each test's own statement intact, so what a test asserts about
+    a constraint, an index or a CAS is unchanged: a rejected insert is still
+    rejected for the reason the test names, rather than for a missing identity.
+    """
+    match = _RUN_INSERT.search(sql)
+    assert match, f"not a single-row run insert: {sql}"
+    run_id = run_id or str(uuid.uuid4())
+    cols = f"id, run_identity, {match.group('cols').strip()}"
+    vals = f"'{run_id}', {run_identity_literal(run_id, workflow_key)}, {match.group('vals').strip()}"
+    return (sql[:match.start()]
+            + f"insert into public.runs ({cols}) values ({vals}){match.group('rest')}")
+
+
 SEED_LEGACY_ROWS = """
 insert into public.conversations (id, title) values
   ('11111111-1111-1111-1111-111111111111', 'legacy conversation');
@@ -332,9 +394,9 @@ def test_runs_legacy_columns_preserved(db):
 
 def test_runs_backend_shape_insert_without_user_prompt(db):
     run_id = db.psql(
-        "insert into public.runs (conversation_id, status, input, idempotency_key) values "
+        born_with_identity("insert into public.runs (conversation_id, status, input, idempotency_key) values "
         "('11111111-1111-1111-1111-111111111111', 'queued', "
-        "'{\"message_id\": \"1\", \"content\": \"go\"}'::jsonb, 'idem-1') returning id"
+        "'{\"message_id\": \"1\", \"content\": \"go\"}'::jsonb, 'idem-1') returning id")
     )
     assert len(run_id) == 36  # run ids remain UUID
     assert db.psql(f"select updated_at is not null from public.runs where id = '{run_id}'") == "t"
@@ -362,8 +424,8 @@ def test_runs_status_check_rejects_new_invalid_status_and_stays_fully_validated(
     ) == "t"
     with pytest.raises(AssertionError, match="runs_status_check"):
         db.psql(
-            "insert into public.runs (conversation_id, status, input) values "
-            "('11111111-1111-1111-1111-111111111111', 'made_up_status', '{}'::jsonb)"
+            born_with_identity("insert into public.runs (conversation_id, status, input) values "
+            "('11111111-1111-1111-1111-111111111111', 'made_up_status', '{}'::jsonb)")
         )
 
 
@@ -415,8 +477,8 @@ def test_runs_progress_check_survives_migration(db):
     ) == "runs_progress_check"
     with pytest.raises(AssertionError, match="runs_progress_check"):
         db.psql(
-            "insert into public.runs (conversation_id, status, progress, input) values "
-            "('11111111-1111-1111-1111-111111111111', 'queued', 250, '{}'::jsonb)"
+            born_with_identity("insert into public.runs (conversation_id, status, progress, input) values "
+            "('11111111-1111-1111-1111-111111111111', 'queued', 250, '{}'::jsonb)")
         )
 
 
@@ -452,8 +514,8 @@ def test_synthetic_migration_leaves_status_check_not_valid_for_unconfirmed_statu
     ) == "f"  # NOT VALID: the synthetic row does not satisfy the expanded constraint
     with pytest.raises(AssertionError, match="runs_status_check"):
         synthetic_invalid_status_db.psql(
-            "insert into public.runs (conversation_id, status, input) values "
-            "('99999999-9999-9999-9999-999999999999', 'still_not_a_real_status', '{}'::jsonb)"
+            born_with_identity("insert into public.runs (conversation_id, status, input) values "
+            "('99999999-9999-9999-9999-999999999999', 'still_not_a_real_status', '{}'::jsonb)")
         )
 
 
@@ -857,40 +919,40 @@ def test_009_legacy_runs_keep_default_launch_state_and_null_ownership(db):
 def test_009_expanded_status_values_are_accepted(db):
     for status in ("launching", "timed_out", "budget_exhausted"):
         run_id = db.psql(
-            f"insert into public.runs (conversation_id, status, input) values "
-            f"('11111111-1111-1111-1111-111111111111', '{status}', '{{}}'::jsonb) returning id"
+            born_with_identity(f"insert into public.runs (conversation_id, status, input) values "
+            f"('11111111-1111-1111-1111-111111111111', '{status}', '{{}}'::jsonb) returning id")
         )
         assert run_id
     with pytest.raises(AssertionError, match="runs_status_check"):
         db.psql(
-            "insert into public.runs (conversation_id, status, input) values "
-            "('11111111-1111-1111-1111-111111111111', 'not_a_state', '{}'::jsonb)"
+            born_with_identity("insert into public.runs (conversation_id, status, input) values "
+            "('11111111-1111-1111-1111-111111111111', 'not_a_state', '{}'::jsonb)")
         )
 
 
 def test_009_launch_state_check_rejects_unknown_values(db):
     with pytest.raises(AssertionError, match="runs_launch_state_check"):
         db.psql(
-            "insert into public.runs (conversation_id, status, input, launch_state) values "
-            "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb, 'bogus')"
+            born_with_identity("insert into public.runs (conversation_id, status, input, launch_state) values "
+            "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb, 'bogus')")
         )
 
 
 def test_009_idempotency_unique_index_blocks_duplicates_per_user(db):
     _seed_membership_fixture(db)
     db.psql(
-        f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
-        f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{MEMBER_USER}', 'idem-dup-1')"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
+        f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{MEMBER_USER}', 'idem-dup-1')")
     )
     with pytest.raises(AssertionError, match="runs_user_conversation_idempotency_uidx"):
         db.psql(
-            f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
-            f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{MEMBER_USER}', 'idem-dup-1')"
+            born_with_identity(f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
+            f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{MEMBER_USER}', 'idem-dup-1')")
         )
     # A different user may reuse the same key in the same conversation.
     db.psql(
-        f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
-        f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{OUTSIDER_USER}', 'idem-dup-1')"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input, requested_by, idempotency_key) values "
+        f"('11111111-1111-1111-1111-111111111111', 'queued', '{{}}'::jsonb, '{OUTSIDER_USER}', 'idem-dup-1')")
     )
 
 
@@ -1002,8 +1064,19 @@ def _seed_atomic_fixture(db) -> None:
 
 
 def _create_run_sql(key: str, content: str = "concurrent content", max_user: str = "null", max_project: str = "null") -> str:
+    """One call to the ONLY creator of an executable run.
+
+    V3 takes the run id and its immutable identity FIRST, because the identity
+    is established inside the same transaction that inserts the message and the
+    run -- so the caller chooses the id before the insert instead of reading it
+    back afterwards. Each call offers its own fresh id: a replay of the same
+    idempotency key must return the run that already exists, not write a second
+    identity over it.
+    """
+    run_id = str(uuid.uuid4())
     return (
-        "select public.create_message_and_run("
+        "select public.create_message_and_run_v3("
+        f"'{run_id}', {run_identity_literal(run_id)}, "
         f"'{ATOMIC_CONVERSATION}', '{content}', '{{}}'::jsonb, '{PROPOSAL_MEMBER_USER}', "
         f"'{key}', 'fp-{key}', {max_user}, {max_project})"
     )
@@ -1087,8 +1160,8 @@ def test_012_message_rolls_back_when_run_insert_fails(ownership_db):
 def test_012_launch_state_check_includes_launch_unknown(ownership_db):
     _seed_atomic_fixture(ownership_db)
     run_id = ownership_db.psql(
-        f"insert into public.runs (conversation_id, status, input, launch_state) values "
-        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'launch_unknown') returning id"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'launch_unknown') returning id")
     )
     assert run_id
 
@@ -1098,8 +1171,8 @@ def test_012_launch_cas_only_one_winner(ownership_db):
 
     _seed_atomic_fixture(ownership_db)
     run_id = ownership_db.psql(
-        f"insert into public.runs (conversation_id, status, input, launch_state) values "
-        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'pending') returning id"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'pending') returning id")
     )
 
     def attempt(_):
@@ -1199,10 +1272,10 @@ def test_012_operator_owned_launch_state_is_unacquirable_by_the_launch_cas(owner
     """
     _seed_atomic_fixture(ownership_db)
     run_id = ownership_db.psql(
-        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        born_with_identity(f"insert into public.runs (conversation_id, status, input, launch_state) values "
         f"('{ATOMIC_CONVERSATION}', 'queued', "
         f"""'{{"metadata": {{"milo_operation": "catalog.government.capture"}}}}'::jsonb, """
-        f"'none') returning id"
+        f"'none') returning id", workflow_key="operator_capture")
     )
     acquired = ownership_db.psql(
         f"update public.runs set launch_state='launching' "
@@ -1227,8 +1300,8 @@ def test_012_operator_preparation_and_launch_contend_at_one_cas(ownership_db):
 
     _seed_atomic_fixture(ownership_db)
     run_id = ownership_db.psql(
-        f"insert into public.runs (conversation_id, status, input, launch_state) values "
-        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'pending') returning id"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb, 'pending') returning id")
     )
 
     def acquire(_):
@@ -1260,8 +1333,8 @@ def test_012_lease_claim_single_holder_under_concurrency(ownership_db):
 
     _seed_atomic_fixture(ownership_db)
     run_id = ownership_db.psql(
-        f"insert into public.runs (conversation_id, status, input) values "
-        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id")
     )
 
     def claim(i):
@@ -1280,8 +1353,8 @@ def test_012_lease_claim_single_holder_under_concurrency(ownership_db):
 def test_012_expired_lease_is_reclaimable_with_incremented_attempt(ownership_db):
     _seed_atomic_fixture(ownership_db)
     run_id = ownership_db.psql(
-        f"insert into public.runs (conversation_id, status, input) values "
-        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id")
     )
     assert ownership_db.psql(f"select worker_id from public.claim_run_lease('{run_id}', 'worker-old', 300)") == "worker-old"
     # A second worker cannot claim while the lease is fresh.
@@ -1294,8 +1367,8 @@ def test_012_expired_lease_is_reclaimable_with_incremented_attempt(ownership_db)
 def test_012_stale_worker_cannot_overwrite_newer_result(ownership_db):
     _seed_atomic_fixture(ownership_db)
     run_id = ownership_db.psql(
-        f"insert into public.runs (conversation_id, status, input) values "
-        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id")
     )
     ownership_db.psql(f"select public.claim_run_lease('{run_id}', 'worker-old', 300)")
     ownership_db.psql(f"update public.runs set lease_expires_at = now() - interval '1 minute' where id='{run_id}'")
@@ -1322,8 +1395,8 @@ def test_012_stale_worker_cannot_overwrite_newer_result(ownership_db):
 def test_012_cancellation_stays_visible_through_lease_claim(ownership_db):
     _seed_atomic_fixture(ownership_db)
     run_id = ownership_db.psql(
-        f"insert into public.runs (conversation_id, status, input) values "
-        f"('{ATOMIC_CONVERSATION}', 'cancellation_requested', '{{}}'::jsonb) returning id"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input) values "
+        f"('{ATOMIC_CONVERSATION}', 'cancellation_requested', '{{}}'::jsonb) returning id")
     )
     claimed = ownership_db.psql(f"select status from public.claim_run_lease('{run_id}', 'worker-c', 300)")
     assert claimed == "cancellation_requested"
@@ -1332,8 +1405,20 @@ def test_012_cancellation_stays_visible_through_lease_claim(ownership_db):
 def test_012_is_rerun_safe(ownership_db):
     migration_012 = next(m for m in MIGRATIONS if m.name.startswith("012"))
     ownership_db.psql(file=migration_012)
+    # Re-running 012 alone re-creates 012's own creator, which is what "rerun
+    # safe" means for THIS migration.
     assert ownership_db.psql("select count(*) from pg_proc where proname='create_message_and_run'") == "1"
     assert ownership_db.psql("select count(*) from pg_proc where proname='claim_run_lease'") == "1"
+
+    # Console 6's migration is what removes it, and re-applying that must leave
+    # exactly ONE run-creation authority. A resurrected V1 creator could not
+    # write a run anyway -- runs_require_identity_on_insert refuses an insert
+    # with no identity -- but a dead alternate creator must not survive either.
+    identity_migration = next(m for m in MIGRATIONS if m.name.startswith("20260921000200"))
+    ownership_db.psql(file=identity_migration)
+    assert ownership_db.psql("select count(*) from pg_proc where proname='create_message_and_run'") == "0"
+    assert ownership_db.psql("select count(*) from pg_proc where proname='create_message_and_run_v2'") == "0"
+    assert ownership_db.psql("select count(*) from pg_proc where proname='create_message_and_run_v3'") == "1"
 
 
 def test_012_authenticated_cannot_execute_run_functions(ownership_db):
@@ -1357,8 +1442,8 @@ def test_013_ledger_table_shape_and_decimal_costs(db):
 
 def test_013_ledger_appends_and_is_append_only(db):
     run_id = db.psql(
-        "insert into public.runs (conversation_id, status, input) values "
-        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+        born_with_identity("insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id")
     )
     entry_id = db.psql(
         f"insert into public.run_usage_ledger (run_id, provider, model, call_seq, decision, reserved_input_tokens, reserved_output_tokens, estimated_cost) "
@@ -1373,8 +1458,8 @@ def test_013_ledger_appends_and_is_append_only(db):
 
 def test_013_ledger_rejects_unknown_decision(db):
     run_id = db.psql(
-        "insert into public.runs (conversation_id, status, input) values "
-        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+        born_with_identity("insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id")
     )
     with pytest.raises(AssertionError, match="decision"):
         db.psql(
@@ -1393,8 +1478,8 @@ def test_013_daily_cost_query_uses_settled_actuals_over_reserved_estimates(db):
     user = "aaaaaaaa-0000-4000-8000-000000000031"
     db.psql(f"insert into auth.users (id) values ('{user}') on conflict do nothing")
     run_id = db.psql(
-        "insert into public.runs (conversation_id, status, input) values "
-        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+        born_with_identity("insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id")
     )
     db.psql(
         f"insert into public.run_usage_ledger (run_id, user_id, call_seq, decision, estimated_cost) values "
@@ -1428,21 +1513,20 @@ def test_013_is_rerun_safe(db):
 # (service_role) keeps EXECUTE except where a migration deliberately revoked
 # it (the deprecated migration-014 daily RPCs).
 SERVICE_ONLY_RPCS = [
-    "public.create_message_and_run_v2(uuid, text, jsonb, uuid, text, text, integer, integer)",
+    "public.create_message_and_run_v3(uuid, jsonb, uuid, text, jsonb, uuid, text, text, integer, integer)",
     "public.create_project_from_proposal_with_owner_v2(uuid, text, text, text, jsonb, uuid)",
     "public.reserve_model_call_budget_v2(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text)",
     "public.settle_model_call_budget_v2(uuid, numeric, text, text)",
     "public.create_project_from_proposal_with_owner(uuid, text, text, text, jsonb, uuid)",
-    "public.create_message_and_run(uuid, text, jsonb, uuid, text, text, integer, integer)",
     "public.claim_run_lease(uuid, text, integer)",
     "public.reserve_daily_user_budget(uuid, uuid, numeric, numeric, text, text)",
     "public.reserve_daily_project_budget(uuid, uuid, numeric, numeric, text, text)",
     "public.model_call_budget_committed(uuid, uuid, date)",
     "public.reserve_model_call_budget(uuid, integer, uuid, uuid, numeric, numeric, numeric, text, text)",
     "public.settle_model_call_budget(uuid, numeric, text, text)",
-    # 20260921000200 -- the run-identity binder and the three worker writes
-    # that had no lease fence before it.
-    "public.bind_run_identity(uuid, jsonb)",
+    # 20260921000200 -- the atomic creator (above) replaced the V1/V2 creators
+    # and the retrofit binder, which this migration drops; these are the three
+    # worker writes that had no lease fence before it.
     "public.create_tool_access_request_guarded(uuid, text, integer, text, jsonb)",
     "public.create_tool_grant_guarded(uuid, text, integer, text, jsonb)",
     "public.append_usage_ledger_guarded(uuid, text, integer, text, jsonb)",
@@ -1592,8 +1676,8 @@ def _seed_stale_worker_run(db) -> str:
         f"('{STALE_CONVERSATION}', 'bbbbbbbb-0000-4000-8000-000000000099', 'stale worker conversation') on conflict (id) do nothing"
     )
     return db.psql(
-        f"insert into public.runs (conversation_id, status, input) values "
-        f"('{STALE_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id"
+        born_with_identity(f"insert into public.runs (conversation_id, status, input) values "
+        f"('{STALE_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id")
     )
 
 
@@ -1746,7 +1830,7 @@ def test_every_http_facing_rpc_returns_a_set(db):
     client-side AFTER the write commits (observed live in staging). Every
     RPC the repository calls over PostgREST must therefore return SETOF."""
     rpcs = [
-        "create_message_and_run_v2",
+        "create_message_and_run_v3",
         "create_project_from_proposal_with_owner_v2",
         "claim_run_lease",
         "reserve_model_call_budget_v2",
@@ -1773,8 +1857,8 @@ def test_ledger_accepts_every_code_written_decision(db):
     overage crashed on the pre-20260810000500 constraint) and still reject
     unknown values."""
     run_id = db.psql(
-        "insert into public.runs (conversation_id, status, input) values "
-        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id"
+        born_with_identity("insert into public.runs (conversation_id, status, input) values "
+        "('11111111-1111-1111-1111-111111111111', 'queued', '{}'::jsonb) returning id")
     )
     for seq, decision in enumerate(["reserved", "settled", "rejected", "overage", "released"], start=900):
         db.psql(
@@ -1814,29 +1898,45 @@ def test_settle_guard_rejects_cross_run_reservation(db):
 
 def test_db_clock_decides_lease_expiry_for_every_guarded_run_write(db):
     """Clock skew must not matter: once the DATABASE considers the lease
-    expired, usage/heartbeat/terminal-transition writes with the correct
-    (worker_id, attempt, lease_token) tuple are rejected — there is no
-    application timestamp anywhere in these predicates."""
+    expired, every guarded write with the correct (worker_id, attempt,
+    lease_token) tuple is rejected — there is no application timestamp
+    anywhere in these predicates.
+
+    The terminal write in that set is `finalize_run_guarded`, not a terminal
+    `transition_run_worker_guarded`: Console 6 made the canonical finalizer the
+    only terminalization authority, and the worker transition RPC refuses a
+    terminal status outright (asserted below, before the lease even matters).
+    """
     run_id = _seed_stale_worker_run(db)
     row = db.psql(f"select attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-CLK', 300)")
     attempt, token = row.split("|")
     lease = f"'{run_id}', 'worker-CLK', {attempt}, '{token}'"
-    # While DB-current, all three writes succeed.
+    # While DB-current, every non-terminal guarded write succeeds.
     assert db.psql(f"select id from public.update_run_usage_guarded({lease}, '{{\"calls\": 1}}'::jsonb)").strip()
     assert db.psql(f"select id from public.heartbeat_run_guarded({lease}, 300)").strip()
     assert db.psql(
         f"select status from public.transition_run_worker_guarded('{run_id}', 'running', 'starting', 'worker-CLK', {attempt}, '{token}')"
     ) == "running"
+    # A terminal status through the worker transition RPC is refused while the
+    # lease is CURRENT, so it can never be the path that terminalizes a run.
+    with pytest.raises(AssertionError, match="CANONICAL_FINALIZER_REQUIRED"):
+        db.psql(
+            f"select public.transition_run_worker_guarded('{run_id}', 'completed', 'running', "
+            f"'worker-CLK', {attempt}, '{token}', null, null, true, null, null, now())")
+
     # DB-expire the lease; the tuple is still 'correct' from the worker's view.
     db.psql(f"update public.runs set lease_expires_at = now() - interval '1 second' where id='{run_id}'")
     for sql in [
         f"select public.update_run_usage_guarded({lease}, '{{\"stale\": true}}'::jsonb)",
         f"select public.heartbeat_run_guarded({lease}, 300)",
-        f"select public.transition_run_worker_guarded('{run_id}', 'completed', 'running', 'worker-CLK', {attempt}, '{token}', null, null, true, null, null, now())",
+        _finalize(run_id, "completed", "'running'", "worker-CLK", attempt, token,
+                  event_type="run_completed"),
     ]:
         with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
             db.psql(sql)
     assert db.psql(f"select status from public.runs where id='{run_id}'") == "running"
+    # The refused finalization left no terminal event behind either.
+    assert _terminal_events(db, run_id) == []
 
 
 def test_heartbeat_guarded_extends_lease_and_records_heartbeat_row(db):
@@ -6986,86 +7086,130 @@ def _identity_migration():
     return next(m for m in MIGRATIONS if "immutable_run_identity" in m.name)
 
 
-def _identity_json(run_id: str, workflow_key: str = "swarm_v2", **over) -> str:
-    record = {
-        "identity_version": "milo-run-identity/1",
-        "run_id": run_id,
-        "workflow_key": workflow_key,
-        "engine_version": "swarm_v2.1",
-        "policy_version": "milo-runtime-policy/1",
-        "policy_fingerprint": "f" * 64,
-        "release_sha": "a" * 40,
-        "event_registry_version": "milo-event-registry/1",
-    }
+def _identity_json(run_id: str, workflow_key: str = "vehicle_catalog_v1", **over) -> str:
+    """A COMPLETE identity record for `run_id`, with overrides for the broken
+    variants below. Built from `backend/run_identity.py`, so the fingerprints
+    are the running image's own and a "valid" case here is genuinely valid."""
+    from backend.run_identity import RunIdentity
+
+    record = RunIdentity.bind(run_id, workflow_key,
+                             env={"MILO_RELEASE_SHA": IDENTITY_RELEASE_SHA}).as_record()
     record.update(over)
     return json.dumps(record)
 
 
-def test_bind_run_identity_writes_once_and_is_idempotent(db):
-    run_id = _seed_stale_worker_run(db)
-    record = _identity_json(run_id)
+def _insert_run_with_identity(db, identity_sql: str, run_id: str | None = None) -> str:
+    """Attempt an INSERT carrying `identity_sql` as the run's identity.
 
-    bound = db.psql(f"select run_identity from public.bind_run_identity('{run_id}', '{record}'::jsonb)")
-    assert json.loads(bound)["workflow_key"] == "swarm_v2"
-    # An identical re-bind is a no-op that returns the same row.
-    again = db.psql(f"select run_identity from public.bind_run_identity('{run_id}', '{record}'::jsonb)")
-    assert json.loads(again) == json.loads(bound)
+    INSERT is now the ONLY path that writes an identity, so it is also the only
+    place the shape constraint and the trusted-workflow check can be exercised.
+    """
+    run_id = run_id or str(uuid.uuid4())
+    return db.psql(
+        f"insert into public.runs (id, run_identity, conversation_id, status, input) values "
+        f"('{run_id}', {identity_sql}, '{STALE_CONVERSATION}', 'queued', '{{}}'::jsonb) returning id")
+
+
+def test_identity_is_written_once_by_the_creator_and_there_is_no_binder(db):
+    """Console 6 removed the retrofit binder instead of guarding it.
+
+    `bind_run_identity` was a second authority over what a run IS: it ran
+    AFTER the run row existed, so between the INSERT and the bind there was a
+    window in which a run had no identity and nothing could tell whether it
+    was legacy or merely unbound. Identity now belongs to the creating
+    transaction, and the migration drops the binder outright.
+    """
+    assert db.psql("select count(*) from pg_proc where proname='bind_run_identity'") == "0"
+
+    run_id = _seed_stale_worker_run(db)
+    held = json.loads(db.psql(f"select run_identity from public.runs where id='{run_id}'"))
+    # Born with it, and naming itself.
+    assert held["workflow_key"] == "vehicle_catalog_v1"
+    assert held["run_id"] == run_id
+
+    # And a run cannot be born without one at all.
+    with pytest.raises(AssertionError, match="RUN_IDENTITY_REQUIRED"):
+        _insert_run_with_identity(db, "null")
 
 
 def test_a_bound_identity_can_never_be_changed_by_any_path(db):
     """REQUIRED REGRESSION 1, at the only boundary that actually holds.
 
     An application guard is advisory against a second writer; the trigger is
-    not. A V2 run must not be able to become a V1 one through the binder, a
-    direct service-role UPDATE, or an erasure.
+    not. A run must not be able to change what it is through a direct
+    service-role UPDATE or an erasure -- and there is no longer a binder to
+    try it through.
     """
     run_id = _seed_stale_worker_run(db)
-    db.psql(f"select public.bind_run_identity('{run_id}', '{_identity_json(run_id)}'::jsonb)")
+    rewritten = _identity_json(run_id, "swarm_v2")
 
-    # 1) Through the binder.
+    # 1) Through a direct service-role table write.
     with pytest.raises(AssertionError, match="RUN_IDENTITY_IMMUTABLE"):
-        db.psql(f"select public.bind_run_identity('{run_id}', "
-                f"'{_identity_json(run_id, 'vehicle_catalog_v1', engine_version='vehicle_catalog_v1.stage3')}'::jsonb)")
-    # 2) Through a direct service-role table write.
-    with pytest.raises(AssertionError, match="RUN_IDENTITY_IMMUTABLE"):
-        db.psql(f"update public.runs set run_identity = "
-                f"'{_identity_json(run_id, 'vehicle_catalog_v1', engine_version='vehicle_catalog_v1.stage3')}'::jsonb "
-                f"where id='{run_id}'")
-    # 3) By erasing it. Dropping an identity is a rewrite too.
+        db.psql(f"update public.runs set run_identity = '{rewritten}'::jsonb where id='{run_id}'")
+    # 2) By erasing it. Dropping an identity is a rewrite too.
     with pytest.raises(AssertionError, match="RUN_IDENTITY_IMMUTABLE"):
         db.psql(f"update public.runs set run_identity = null where id='{run_id}'")
 
-    assert json.loads(db.psql(f"select run_identity from public.runs where id='{run_id}'"))["workflow_key"] == "swarm_v2"
+    assert json.loads(db.psql(
+        f"select run_identity from public.runs where id='{run_id}'"))["workflow_key"] == "vehicle_catalog_v1"
     # Every other column still updates normally: the trigger fences the
     # identity, it does not freeze the row.
     assert db.psql(f"update public.runs set status='queued' where id='{run_id}' returning status") == "queued"
 
 
 def test_an_identity_naming_another_run_or_a_bad_shape_is_refused(db):
-    run_id = _seed_stale_worker_run(db)
+    """All of it now fails at the INSERT, before a row exists to repair."""
     other = _seed_stale_worker_run(db)
+    fresh = str(uuid.uuid4())
+
+    # An identity lifted from another run: the shape constraint requires the
+    # record to name the row's own id.
+    with pytest.raises(AssertionError, match="runs_run_identity_shape_check"):
+        _insert_run_with_identity(db, f"'{_identity_json(other)}'::jsonb", run_id=fresh)
+    # A record that is not an object at all. The BEFORE INSERT trigger runs
+    # before the CHECK constraint, so what rejects it first is the trusted
+    # workflow comparison -- a record with no workflow can never agree with the
+    # project's. Either way nothing is inserted.
+    with pytest.raises(AssertionError, match="RUN_IDENTITY_WORKFLOW_DRIFT"):
+        _insert_run_with_identity(db, "'[]'::jsonb", run_id=fresh)
+    # A well-shaped identity that disagrees with the trusted project workflow.
+    with pytest.raises(AssertionError, match="RUN_IDENTITY_WORKFLOW_DRIFT"):
+        _insert_run_with_identity(db, f"'{_identity_json(fresh, 'swarm_v2')}'::jsonb", run_id=fresh)
+    # A control-plane identity without the capture marker in its input.
     with pytest.raises(AssertionError, match="RUN_IDENTITY_INVALID"):
-        db.psql(f"select public.bind_run_identity('{run_id}', '{_identity_json(other)}'::jsonb)")
-    with pytest.raises(AssertionError, match="RUN_IDENTITY_INVALID"):
-        db.psql(f"select public.bind_run_identity('{run_id}', '[]'::jsonb)")
-    with pytest.raises(AssertionError, match="RUN_IDENTITY_INVALID"):
-        db.psql(f"select public.bind_run_identity('{run_id}', null)")
-    with pytest.raises(AssertionError, match="RUN_NOT_FOUND"):
-        db.psql("select public.bind_run_identity('00000000-0000-4000-8000-000000000000', "
-                "'{\"run_id\": \"00000000-0000-4000-8000-000000000000\"}'::jsonb)")
+        _insert_run_with_identity(db, f"'{_identity_json(fresh, 'operator_capture')}'::jsonb", run_id=fresh)
 
 
 def test_the_identity_column_refuses_a_record_that_is_not_one(db):
     """The shape constraint is the part the database can enforce on EVERY
-    path into the column, including a direct write that bypasses the binder."""
-    run_id = _seed_stale_worker_run(db)
-    for broken in ('\'"a string"\'::jsonb',
-                   "'{}'::jsonb",
-                   f"'{_identity_json(run_id, policy_fingerprint='')}'::jsonb"):
+    path into the column, including a direct write that bypasses the creator.
+
+    It is exercised on INSERT because that is the only path left: an UPDATE
+    that touches the column is refused earlier, by the rewrite trigger.
+    """
+    fresh = str(uuid.uuid4())
+    # A record carrying no workflow at all cannot agree with the project's, so
+    # the INSERT trigger refuses it before the constraint is ever reached.
+    for not_a_record in ('\'"a string"\'::jsonb', "'{}'::jsonb", "'[]'::jsonb"):
+        with pytest.raises(AssertionError, match="RUN_IDENTITY_WORKFLOW_DRIFT"):
+            _insert_run_with_identity(db, not_a_record, run_id=fresh)
+
+    # A record that states the RIGHT workflow and is still not an identity:
+    # past the trigger, and refused by the column's own shape constraint. Each
+    # of these is a dimension a run's later life depends on.
+    for broken in (f"'{_identity_json(fresh, policy_fingerprint='')}'::jsonb",
+                   f"'{_identity_json(fresh, release_sha='')}'::jsonb",
+                   f"'{_identity_json(fresh, event_registry_fingerprint='')}'::jsonb",
+                   f"'{_identity_json(fresh, identity_version='milo-run-identity/99')}'::jsonb",
+                   f"'{_identity_json(fresh, engine_version='swarm_v2.1')}'::jsonb"):
         with pytest.raises(AssertionError, match="runs_run_identity_shape_check"):
-            db.psql(f"update public.runs set run_identity = {broken} where id='{run_id}'")
-    # A legacy row with no identity at all is untouched by the constraint.
-    assert db.psql(f"select run_identity is null from public.runs where id='{run_id}'") == "t"
+            _insert_run_with_identity(db, broken, run_id=fresh)
+
+    # A LEGACY row -- one that predates the column -- is still permitted to
+    # carry no identity at all, which is exactly what `null` is reserved for.
+    assert db.psql(
+        "select run_identity is null from public.runs "
+        "where id='22222222-2222-2222-2222-222222222222'") == "t"
 
 
 def _newly_guarded_calls(run_id: str, worker: str, attempt: str, token: str) -> dict[str, str]:
@@ -7151,7 +7295,7 @@ def test_a_tool_grant_cannot_mark_another_runs_request_granted(db):
 
 
 def test_the_run_identity_migration_is_service_only_and_rerun_safe(db):
-    for signature in ("public.bind_run_identity(uuid, jsonb)",
+    for signature in ("public.create_message_and_run_v3(uuid, jsonb, uuid, text, jsonb, uuid, text, text, integer, integer)",
                       "public.create_tool_access_request_guarded(uuid, text, integer, text, jsonb)",
                       "public.create_tool_grant_guarded(uuid, text, integer, text, jsonb)",
                       "public.append_usage_ledger_guarded(uuid, text, integer, text, jsonb)"):
@@ -7163,5 +7307,7 @@ def test_the_run_identity_migration_is_service_only_and_rerun_safe(db):
 
     db.psql(file=_identity_migration())
     db.psql(file=_identity_migration())
-    assert db.psql("select count(*) from pg_proc where proname='bind_run_identity'") == "1"
+    assert db.psql("select count(*) from pg_proc where proname='bind_run_identity'") == "0"
+    assert db.psql("select count(*) from pg_proc where proname='create_message_and_run_v3'") == "1"
     assert db.psql("select count(*) from pg_trigger where tgname='runs_forbid_identity_rewrite'") == "1"
+    assert db.psql("select count(*) from pg_trigger where tgname='runs_require_identity_on_insert'") == "1"

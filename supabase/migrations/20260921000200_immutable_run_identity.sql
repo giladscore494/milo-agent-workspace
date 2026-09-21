@@ -134,6 +134,9 @@ drop function if exists public.create_message_and_run(
 drop function if exists public.create_message_and_run_v2(
   uuid, text, jsonb, uuid, text, text, integer, integer
 );
+drop function if exists public.create_message_and_run_v3(
+  uuid, jsonb, uuid, text, jsonb, uuid, text, text, integer, integer
+);
 
 -- ---------------------------------------------------------------------------
 -- 3) Atomic user message + run + immutable identity.
@@ -149,7 +152,14 @@ create or replace function public.create_message_and_run_v3(
   p_request_fingerprint text,
   p_max_user_active integer default null,
   p_max_project_active integer default null
-) returns jsonb
+)
+-- SETOF, not jsonb. The pinned supabase-py/postgrest-py client validates an
+-- RPC response body as a LIST (`APIResponse.data: List[JSON]`) and rejects a
+-- bare JSON object -- client-side, AFTER this transaction has committed the
+-- message, the run and its immutable identity. A scalar return would therefore
+-- create the run and then report failure to the caller, which is the exact
+-- split-brain `test_every_http_facing_rpc_returns_a_set` exists to prevent.
+returns setof jsonb
 language plpgsql
 set search_path = pg_catalog
 as $$
@@ -195,7 +205,8 @@ begin
         raise exception 'IDEMPOTENCY_CONFLICT'
           using errcode = '23505';
       end if;
-      return jsonb_build_object('run', to_jsonb(v_existing), 'created', false);
+      return next jsonb_build_object('run', to_jsonb(v_existing), 'created', false);
+      return;
     end if;
   end if;
 
@@ -258,7 +269,8 @@ begin
   )
   returning * into v_run;
 
-  return jsonb_build_object('run', to_jsonb(v_run), 'created', true);
+  return next jsonb_build_object('run', to_jsonb(v_run), 'created', true);
+  return;
 end;
 $$;
 

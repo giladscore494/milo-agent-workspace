@@ -91,6 +91,10 @@ jobs:
         run: python -m pip install -r backend/requirements.txt
       - name: Executable migration + concurrency + RLS suite (skips forbidden)
         run: |
+          # `pytest | tee` returns TEE's status, so without pipefail this job
+          # could only ever fail on a skip -- a failing suite exited 0 and the
+          # check went green. The gate now reports what the suite actually did.
+          set -o pipefail
           pytest -rs tests/test_migrations_postgres.py | tee pg-test-output.txt
           if grep -qE "SKIPPED|skipped" pg-test-output.txt; then
             echo "PostgreSQL tests were skipped; failing the job."
