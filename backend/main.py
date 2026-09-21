@@ -47,6 +47,7 @@ from backend.schemas import (
 from backend.rate_limit import enforce_rate_limit
 from backend.event_registry import is_known_event_type
 from backend.run_identity import (
+    PRODUCT_WORKFLOW_KEYS,
     RUN_IDENTITY_FIELD,
     RunIdentity,
     RunIdentityError,
@@ -666,6 +667,12 @@ def complete_run_from_worker(run_id: UUID, request: WorkerRunCompleteRequest, wo
         identity = require_identity(run)
     except RunIdentityError as exc:
         raise AppError("RUN_IDENTITY_REQUIRED", "worker completion requires immutable run identity", 409) from exc
+    if identity.workflow_key not in PRODUCT_WORKFLOW_KEYS:
+        raise AppError(
+            "ENGINE_NOT_ALLOWED",
+            "control-plane run identity cannot use the product worker completion surface",
+            403,
+        )
     if execution_identity_problems(identity):
         raise AppError(
             "RUN_IDENTITY_RUNTIME_MISMATCH",
@@ -689,6 +696,12 @@ def fail_run_from_worker(run_id: UUID, request: WorkerRunFailRequest, worker: Wo
         identity = require_identity(run)
     except RunIdentityError as exc:
         raise AppError("RUN_IDENTITY_REQUIRED", "worker failure requires immutable run identity", 409) from exc
+    if identity.workflow_key not in PRODUCT_WORKFLOW_KEYS:
+        raise AppError(
+            "ENGINE_NOT_ALLOWED",
+            "control-plane run identity cannot use the product worker failure surface",
+            403,
+        )
     if execution_identity_problems(identity):
         raise AppError(
             "RUN_IDENTITY_RUNTIME_MISMATCH",
