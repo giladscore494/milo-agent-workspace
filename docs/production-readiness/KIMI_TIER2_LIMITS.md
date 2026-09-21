@@ -94,7 +94,10 @@ configuration alone.
 `admit_search` gates the **standalone** `/v1/tools/search` and
 `/v1/tools/search_pro` endpoints, and **that is the path production takes.**
 V1 offers a model MILO's own `web_search` function tool and performs each
-admitted invocation itself against those endpoints
+admitted Production research invocation itself against Web Search Pro
+(`/v1/tools/search_pro`). The Basic endpoint remains supported by the shared
+transport/authority for bounded callers that explicitly select it, but V1
+does not silently downgrade research to snippets-only Basic search.
 (`backend/standalone_search.py`, `ProviderAdapter.run_search`). The first-run
 profile records this as `called_by_a_production_engine_today: true` and
 `guards_the_v1_production_search_path: true`.
