@@ -40,8 +40,8 @@ from backend.engines.vehicle_catalog_v1.engine import (VehicleCatalogEngine,
                                                        VehicleCatalogRunConfig)
 from backend.engines.swarm_v2.fragments import MAX_FRAGMENTS_PER_SOURCE
 from backend.engines.vehicle_catalog_v1.evidence_authority import (
-    V1_ACCEPTED_REASON, V1_TOOL_OPERATION, V1_VERIFICATION_MODE, V1EvidenceAuthority,
-    apply_evidence_authority, model_key, observed_records)
+    V1_ACCEPTED_REASON, V1_TOOL_OPERATION, V1_VERDICT_REASONS, V1_VERIFICATION_MODE,
+    V1EvidenceAuthority, apply_evidence_authority, model_key, observed_records)
 from backend.catalog.pipeline import PROMOTABLE_TOOL_OPERATION
 from backend.errors import LEASE_FAILURE_CODES, AppError
 from backend.testing.memory_repository import MemoryRepository
@@ -101,11 +101,39 @@ def rows_of(repository: MemoryRepository, kind: str) -> list[dict]:
 
 def settle(repository: MemoryRepository, lease: WorkerLease, technical: dict, *,
            verifier: dict | None = None, market: str = "Israel",
-           board: EvidenceBoard | None = None):
+           board: EvidenceBoard | None = None, reader: object | None = None):
+    """One evidence pass. `board` writes; `reader` answers "is it current?".
+
+    The two are separate arguments because they are separate failures: a
+    durable write that did not happen and a current-state answer that could
+    not be read are different things, and a field must fail closed on either.
+    """
     authority = V1EvidenceAuthority(board=board or EvidenceBoard(repository, lease),
-                                    repository=repository)
+                                    repository=repository if reader is None else reader)
     return authority.record(manufacturer="Toyota", market=market, period="2015-2025",
                             technical=technical, verifier=verifier or verifier_document())
+
+
+def reasons_of(report) -> set[str]:
+    return {reason for _model, _field, _verdict, reason in report.fields}
+
+
+def verdicts_of(report) -> set[str]:
+    return {verdict for _model, _field, verdict, _reason in report.fields}
+
+
+class RepositoryView:
+    """The repository, with ONE read replaced. Everything else is the real one."""
+
+    def __init__(self, inner, current):
+        self._inner = inner
+        self._current = current
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def claim_current_verdict_states(self, run_id, claim_ids=None, *, limit: int = 200):
+        return self._current(run_id, claim_ids, limit)
 
 
 @pytest.fixture
@@ -269,6 +297,171 @@ def test_a_field_with_no_durable_row_is_never_verified(repository):
     assert not report.verified("RAV4")
 
 
+# =============================================================================
+# 2b. `verified` requires DURABLE, CURRENT, EXACT support -- or it is demoted
+# =============================================================================
+#
+# Two fail-open paths used to survive here, and they are different ones.
+#
+# THE VERDICT WRITE COULD FAIL AND THE FIELD STAYED VERIFIED. The evidence and
+# the claim were durable, the verdict was not, and the locally decided
+# `verified` was what the report carried -- a field reported verified by a row
+# that does not exist.
+#
+# "WE COULD NOT TELL" WAS READ AS "STILL VERIFIED". When the authoritative
+# current-state read was unavailable or failed, the local decision stood. That
+# is the one answer it may never give: an absence of an answer is not an
+# answer, and another worker may have rejected the claim in between.
+#
+# A `verified` V1 field now requires all four: the verdict and its support
+# persisted, the current-state read SUCCEEDED, the state is `supported`, and
+# the current verdict id is EXACTLY the row just settled.
+
+
+def test_a_verdict_that_could_not_be_persisted_leaves_the_field_unverified(repository):
+    """The evidence IS durable. The verdict is not. So nothing is verified."""
+    lease = leased_run(repository)
+
+    class VerdictRefusingBoard(EvidenceBoard):
+        def record_verification_verdict(self, verdict):
+            raise RuntimeError("durable verdict write failed")
+
+    report = settle(repository, lease, engines_record(),
+                    board=VerdictRefusingBoard(repository, lease))
+
+    # The claims and their fragments landed -- this is NOT the unsupported
+    # case, it is the case where only the decision failed to persist.
+    assert report.durable_claims == 4 and report.recorded is True
+    assert len(rows_of(repository, "claim")) == 4
+    assert rows_of(repository, "claim_verdict") == []
+
+    assert report.durable_verdicts == 0
+    assert verdicts_of(report) == {"needs_review"}
+    assert reasons_of(report) == {"V1_EVIDENCE_VERDICT_NOT_DURABLE"}
+    assert not report.verified("RAV4")
+
+    document = verifier_document()
+    apply_evidence_authority(document, report)
+    assert document["verified_models"][0]["status"] == "needs_review"
+
+
+def test_a_current_state_read_that_failed_never_verifies_a_field(repository):
+    """The verdict persisted. Whether it is CURRENT could not be read.
+
+    The durable row says `verified` -- and the report does not, because
+    nothing confirmed that row is the current one. Reporting the local
+    decision here is exactly the fail-open this test exists to prevent.
+    """
+    lease = leased_run(repository)
+
+    def refuse(_run_id, _claim_ids, _limit):
+        raise AppError("REPOSITORY_ERROR", "bounded catalog read failed", 502)
+
+    report = settle(repository, lease, engines_record(),
+                    reader=RepositoryView(repository, refuse))
+
+    assert report.durable_verdicts == 4
+    assert {row["verdict"] for row in rows_of(repository, "claim_verdict")} == {"verified"}
+    assert verdicts_of(report) == {"needs_review"}
+    assert reasons_of(report) == {"V1_EVIDENCE_CURRENT_STATE_UNAVAILABLE"}
+    assert not report.verified("RAV4")
+
+
+def test_a_backend_with_no_current_state_read_never_verifies_a_field(repository):
+    """Unavailable is the same answer as failed: not an answer."""
+    lease = leased_run(repository)
+
+    class NoSuchRead:
+        """A repository that does not offer the authoritative read at all."""
+
+    report = settle(repository, lease, engines_record(), reader=NoSuchRead())
+
+    assert report.durable_verdicts == 4
+    assert reasons_of(report) == {"V1_EVIDENCE_CURRENT_STATE_UNAVAILABLE"}
+    assert not report.verified("RAV4")
+
+    # And with no board at all -- the strictest case -- nothing is even
+    # durable, so the field fails the FIRST requirement.
+    bare = V1EvidenceAuthority().record(manufacturer="Toyota", market="Israel",
+                                        period="2015-2025", technical=engines_record(),
+                                        verifier=verifier_document())
+    assert reasons_of(bare) == {"V1_EVIDENCE_UNSUPPORTED"} and not bare.verified("RAV4")
+
+
+def test_a_supported_state_naming_another_verdict_never_verifies_this_field(repository):
+    """Current-state DRIFT. Still `supported`, and still not this row.
+
+    The fact being written rests on the verdict this pass settled and on
+    nothing else, so a supported state naming a different row is history --
+    exactly the distinction `CurrentVerdict.authorizes` exists to make.
+    """
+    lease = leased_run(repository)
+    other_verdict = str(uuid4())
+
+    def drift(run_id, claim_ids, limit):
+        return [{**row, "verdict_id": other_verdict}
+                for row in repository.claim_current_verdict_states(run_id, claim_ids,
+                                                                   limit=limit)]
+
+    report = settle(repository, lease, engines_record(),
+                    reader=RepositoryView(repository, drift))
+
+    assert report.durable_verdicts == 4
+    assert verdicts_of(report) == {"needs_review"}
+    assert reasons_of(report) == {"V1_EVIDENCE_CURRENT_STATE_DRIFT"}
+    assert not report.verified("RAV4")
+
+
+def test_a_state_that_is_not_supported_never_verifies_this_field(repository):
+    """The other half of the same gate: `supported`, or nothing."""
+    lease = leased_run(repository)
+
+    def rejected(run_id, claim_ids, limit):
+        return [{**row, "state": "rejected", "verdict": "rejected", "support_count": 0}
+                for row in repository.claim_current_verdict_states(run_id, claim_ids,
+                                                                   limit=limit)]
+
+    report = settle(repository, lease, engines_record(),
+                    reader=RepositoryView(repository, rejected))
+
+    assert reasons_of(report) == {"V1_EVIDENCE_NOT_CURRENTLY_SUPPORTED"}
+    assert not report.verified("RAV4")
+
+
+def test_only_the_exact_current_supported_verdict_verifies_a_field(repository):
+    """The positive half, asserted against the durable rows themselves.
+
+    Every field the report calls verified has a durable verdict row, and the
+    authoritative current state for that claim is `supported` and names THAT
+    row -- not merely some verified row of the claim's history.
+    """
+    lease = leased_run(repository)
+    report = settle(repository, lease, engines_record())
+
+    assert report.verified("RAV4")
+    assert verdicts_of(report) == {"verified"}
+    assert reasons_of(report) == {V1_ACCEPTED_REASON}
+    assert report.durable_verdicts == 4
+
+    states = {row["claim_id"]: row
+              for row in repository.claim_current_verdict_states(lease.run_id)}
+    settled = {str(row["claim_id"]): row for row in rows_of(repository, "claim_verdict")}
+    assert len(states) == 4 and len(settled) == 4
+    for claim in rows_of(repository, "claim"):
+        state = states[str(claim["id"])]
+        assert state["state"] == SUPPORTED_STATE
+        assert state["verdict_id"] == str(settled[str(claim["id"])]["id"])
+        assert state["support_count"] == 1
+
+
+def test_every_demotion_reason_is_a_static_bounded_code():
+    """A refusal names a PROPERTY, from the closed vocabulary, and nothing else."""
+    for code in ("V1_EVIDENCE_VERDICT_NOT_DURABLE", "V1_EVIDENCE_CURRENT_STATE_UNAVAILABLE",
+                 "V1_EVIDENCE_CURRENT_STATE_DRIFT", "V1_EVIDENCE_NOT_CURRENTLY_SUPPORTED"):
+        assert code in V1_VERDICT_REASONS
+        assert 1 <= len(V1_VERDICT_REASONS[code]) <= 120
+
+
 def test_a_lost_lease_escapes_instead_of_becoming_an_answer(repository):
     """A stale worker is infrastructure, never "this field has no evidence".
 
@@ -286,6 +479,27 @@ def test_a_lost_lease_escapes_instead_of_becoming_an_answer(repository):
     with pytest.raises(AppError) as failure:
         settle(repository, lease, engines_record(), board=StaleBoard(repository, lease))
     assert failure.value.code in LEASE_FAILURE_CODES
+
+    # The VERDICT write is the same: a stale worker may not have its lost
+    # lease reported as "this field could not be made durable".
+    class StaleVerdictBoard(EvidenceBoard):
+        def record_verification_verdict(self, verdict):
+            raise AppError("RUN_TRANSITION_CONFLICT", "the run lease moved on", 409)
+
+    with pytest.raises(AppError) as verdict_failure:
+        settle(repository, leased_run(repository, "worker-stale-verdict"),
+               engines_record(), board=StaleVerdictBoard(repository, lease))
+    assert verdict_failure.value.code in LEASE_FAILURE_CODES
+
+    # And so is the authoritative READ: it must reach the worker's lease
+    # handling rather than be absorbed as "the state is unavailable".
+    def stale_read(_run_id, _claim_ids, _limit):
+        raise AppError("RUN_LEASE_LOST", "the run lease is no longer held", 409)
+
+    with pytest.raises(AppError) as read_failure:
+        settle(repository, leased_run(repository, "worker-stale-read"), engines_record(),
+               reader=RepositoryView(repository, stale_read))
+    assert read_failure.value.code in LEASE_FAILURE_CODES
 
 
 # =============================================================================

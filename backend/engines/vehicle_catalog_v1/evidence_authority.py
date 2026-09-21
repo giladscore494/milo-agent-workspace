@@ -74,24 +74,42 @@ Applied by this module, over durable evidence, never by a prompt:
     rather than only annotating the final document.
 4.  **The model's own classification, downwards only.**
 
-WHERE THE ANSWER COMES FROM AFTERWARDS
---------------------------------------
+WHAT A `verified` V1 FIELD REQUIRES
+-----------------------------------
 
-Not from the verdict this module just wrote. Once the verdicts are durable the
-answer is re-read through the CURRENT verdict resolution
-(`backend/engines/swarm_v2/current_verdict.py`), so V1 obeys exactly the rule
-every other consumer of verified evidence obeys: an older `verified` row that a
-newer verdict, contradiction or supersession has replaced authorizes nothing.
+Not the decision this module just made. `verified` survives only when ALL of
+the following are true, and each one of them used to be a way it failed OPEN:
+
+*   the verdict AND its durable support links were persisted successfully;
+*   the AUTHORITATIVE current-state read succeeded. "We could not tell" is
+    never read as "still verified" -- no repository, no such read, no lease, a
+    failed read and a malformed answer all demote the field;
+*   `CurrentVerdict.state` is `supported`;
+*   and the current `verdict_id` is EXACTLY the verdict this pass settled. A
+    supported state naming another row is history, or current-state drift, and
+    the fact being written rests on the row that was settled and on nothing
+    else.
+
+Anything else demotes the field to `needs_review` with a static reason naming
+which requirement failed (`V1_EVIDENCE_VERDICT_NOT_DURABLE`,
+`V1_EVIDENCE_CURRENT_STATE_UNAVAILABLE`, `V1_EVIDENCE_CURRENT_STATE_DRIFT`,
+`V1_EVIDENCE_NOT_CURRENTLY_SUPPORTED`). The research run carries on either
+way; a LOST LEASE still escapes as infrastructure.
+
+So V1 obeys exactly the rule every other consumer of verified evidence obeys
+(`backend/engines/swarm_v2/current_verdict.py`): an older `verified` row that a
+newer verdict, contradiction or supersession has replaced authorizes nothing --
+and neither does a verdict nobody can confirm is durable and current.
 
 WITHOUT A BOARD
 ---------------
 
-The Evidence Board is optional, and its absence is not a loophole. With no
-board (a local run, a test, any wiring with no repository and no run lease)
-every bundle is still built and validated and every verdict is still decided;
-only the durable write does not happen. A field that could not be evidenced is
-never reported as verified either way -- what changes is whether the evidence
-is durable afterwards, never whether the model got to assert its way past it.
+The Evidence Board is optional, and its absence is not a loophole -- it is the
+strictest case. With no board (a local run, a test, any wiring with no
+repository and no run lease) every bundle is still built and validated and
+every field is still decided, nothing is persisted, and therefore NOTHING is
+verified: a field with no durable claim fails the first requirement above
+before the others are even asked.
 
 NO PROMOTION PATH. V1 evidence records `tool_operation` of its own, which is
 not the one `catalog_run_pending_promotions` matches on, so nothing written
@@ -107,7 +125,7 @@ from typing import Any, Mapping, Sequence
 
 from backend.engines.swarm_v2.comparison import value_identity
 from backend.engines.swarm_v2.contracts import SupportLink, VerificationVerdict
-from backend.engines.swarm_v2.current_verdict import (SUPPORTED_STATE, CurrentVerdictError,
+from backend.engines.swarm_v2.current_verdict import (CurrentVerdict, CurrentVerdictError,
                                                       parse_current_verdict)
 from backend.engines.swarm_v2.evidence_bounds import (IDENTITY_DIMENSIONS,
                                                       MAX_FACTS_PER_BUNDLE,
@@ -189,6 +207,14 @@ V1_VERDICT_REASONS: Mapping[str, str] = {
         "the verifier left that model for review",
     "V1_EVIDENCE_UNSUPPORTED":
         "no durable evidence was captured for that value",
+    "V1_EVIDENCE_VERDICT_NOT_DURABLE":
+        "the verdict for that value could not be made durable",
+    "V1_EVIDENCE_CURRENT_STATE_UNAVAILABLE":
+        "the current verification state of that value could not be read",
+    "V1_EVIDENCE_CURRENT_STATE_DRIFT":
+        "the current verdict for that value is not the one just settled",
+    "V1_EVIDENCE_NOT_CURRENTLY_SUPPORTED":
+        "the current verdict does not support that value",
 }
 
 #: The accepted verdict's reason. Named once so nothing can spell it twice.
@@ -731,12 +757,8 @@ class V1EvidenceAuthority:
                                              israel_required=israel_required)
             if claim.durable:
                 durable_claims += 1
-                if self._settle(claim, verdict, reason):
-                    durable_verdicts += 1
-                    # The durable answer is the CURRENT one, re-read rather
-                    # than assumed: an older `verified` that a newer verdict
-                    # replaced authorizes nothing, in V1 exactly as anywhere.
-                    verdict = self._current(claim, verdict)
+                verdict, reason, settled = self._durable_answer(claim, verdict, reason)
+                durable_verdicts += 1 if settled else 0
             key = model_key(claim.model_name)
             decided.append((claim.model_name, claim.field_key, verdict, reason))
             reasons.setdefault(key, [])
@@ -751,52 +773,119 @@ class V1EvidenceAuthority:
             verified_fields={key: tuple(sorted(set(value)))
                              for key, value in verified.items()})
 
-    def _settle(self, claim: FieldClaim, verdict: str, reason: str) -> bool:
-        """Make ONE decision durable, with the exact fragment behind it."""
+    def _durable_answer(self, claim: FieldClaim, verdict: str,
+                        reason: str) -> tuple[str, str, bool]:
+        """What ONE claim's verdict is once durability has been PROVEN.
+
+        This is where `verified` stops being a local decision. Three things
+        have to be true of it, and every one of them is a way it used to fail
+        OPEN:
+
+        1.  the verdict AND its support links are durable. A write that failed
+            left the local `verified` standing, so a field could be reported
+            verified while the row that verifies it does not exist;
+        2.  the authoritative current-state read SUCCEEDS. A read that failed,
+            or a backend that does not offer one, fell back to the local
+            decision -- which is the one answer it may never give: "we could
+            not tell" is not "still verified";
+        3.  the state is `supported` AND names EXACTLY the verdict just
+            settled. A supported state naming another row is history or
+            current-state drift; the field being written rests on the verdict
+            this pass produced and on nothing else.
+
+        Anything else demotes the field to `needs_review` with a static reason
+        saying which of the three failed. The run itself carries on -- an
+        evidence failure is never allowed to fail a research run -- and a LOST
+        LEASE still escapes as infrastructure.
+
+        A decision that is NOT `verified` is already a refusal, so it needs no
+        proof: it keeps its own verdict and reason whether or not the durable
+        write succeeded. `settled` is reported separately so the report counts
+        durable verdicts rather than accepted ones.
+        """
+        row = self._settle(claim, verdict, reason)
+        settled = row is not None
+        if verdict != "verified":
+            return (verdict, reason, settled)
+        if not settled:
+            return ("needs_review", "V1_EVIDENCE_VERDICT_NOT_DURABLE", False)
+        state = self._current_state(claim)
+        if state is None:
+            return ("needs_review", "V1_EVIDENCE_CURRENT_STATE_UNAVAILABLE", True)
+        if state.authorizes(row.get("id")):
+            return (verdict, reason, True)
+        if state.supported:
+            return ("needs_review", "V1_EVIDENCE_CURRENT_STATE_DRIFT", True)
+        return ("needs_review", "V1_EVIDENCE_NOT_CURRENTLY_SUPPORTED", True)
+
+    def _settle(self, claim: FieldClaim, verdict: str,
+                reason: str) -> Mapping[str, Any] | None:
+        """Make ONE decision durable, with the exact fragment behind it.
+
+        Returns the durable ROW -- the caller needs its id to ask whether that
+        exact verdict is the current one -- or `None` when nothing durable was
+        written. A row that cannot state its own id is not a durable row.
+
+        The verdict and its support links are ONE guarded write, so a support
+        link that could not be stored is a failed verdict here rather than a
+        verdict with nothing behind it. The durable state check above closes
+        the remaining case from the other side: a verdict whose support is not
+        durable resolves to `unsupported`, which is not `supported`.
+        """
         if self._board is None or not claim.durable:
-            return False
+            return None
         support = [SupportLink(source_id=str(claim.source_id),
                                content_hash=str(claim.content_hash),
                                fragment_id=str(claim.fragment_id), locator=claim.locator)]
         try:
-            self._board.record_verification_verdict(VerificationVerdict(
+            row = self._board.record_verification_verdict(VerificationVerdict(
                 claim_id=str(claim.claim_id), verdict=verdict, reason=reason,
                 mode=V1_VERIFICATION_MODE, contract_version=VERIFIER_CONTRACT_VERSION,
                 support=support))
         except AppError as failure:
             if failure.code in LEASE_FAILURE_CODES:
                 raise
-            return False
+            return None
         except Exception:
-            return False
-        return True
+            return None
+        if not isinstance(row, Mapping) or not _text(row.get("id")):
+            return None
+        return row
 
-    def _current(self, claim: FieldClaim, decided: str) -> str:
-        """Re-read the CURRENT verdict of a claim, or fall back safely.
+    def _current_state(self, claim: FieldClaim) -> CurrentVerdict | None:
+        """The AUTHORITATIVE current state of one claim, or `None`.
 
-        The repository read is the authority when it is available. When it is
-        not -- an older repository, a backend with no such read -- the locally
-        decided verdict stands, which is the same answer the durable rule would
-        give for a run whose only verdict for this claim is the one just
-        written.
+        `None` means the question could not be answered -- no repository, no
+        such read, no lease, a failed read, a malformed row, or no row for this
+        claim -- and it is never the same thing as an answer. The caller fails
+        closed on it.
+
+        A LOST LEASE is the one failure that escapes: this worker is no longer
+        the run's writer, and that has to reach the worker's lease handling
+        rather than become a statement about the evidence.
         """
         lease = getattr(self._board, "lease", None)
         read = getattr(self._repository, "claim_current_verdict_states", None)
         if not callable(read) or lease is None:
-            return decided
+            return None
         try:
             rows = read(lease.run_id, [str(claim.claim_id)], limit=1)
+        except AppError as failure:
+            if failure.code in LEASE_FAILURE_CODES:
+                raise
+            return None
         except Exception:
-            return decided
+            return None
+        if not isinstance(rows, (list, tuple)):
+            return None
         for row in rows:
             try:
                 state = parse_current_verdict(row)
             except CurrentVerdictError:
                 continue
             if state.claim_id == str(claim.claim_id):
-                return "verified" if state.state == SUPPORTED_STATE else (
-                    state.verdict or "needs_review")
-        return decided
+                return state
+        return None
 
 
 def apply_evidence_authority(verifier_data: Any, report: V1EvidenceReport) -> Any:

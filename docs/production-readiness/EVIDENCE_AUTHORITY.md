@@ -118,8 +118,35 @@ technical record (observed)          model verifier (proposes / classifies)
 Implemented in `backend/engines/vehicle_catalog_v1/evidence_authority.py`,
 wired by `backend/worker/main.py` on the run's own lease.
 
-**The four deterministic rules**, applied over durable evidence, never by a
-prompt:
+### What a `verified` V1 field requires
+
+Four things, and each one of them was a way `verified` used to fail **open**:
+
+1. the verdict **and** its durable support links persisted successfully;
+2. the **authoritative** current-state read succeeded — no repository, no such
+   read, no lease, a failed read or a malformed answer all demote the field.
+   "We could not tell" is never read as "still verified";
+3. `CurrentVerdict.state == supported`;
+4. the current `verdict_id` is **exactly** the verdict that pass settled. A
+   supported state naming another row is history or current-state drift, and
+   the fact being written rests on the row that was settled and nothing else.
+
+Anything else demotes the field to `needs_review` with a static reason naming
+which requirement failed — `V1_EVIDENCE_VERDICT_NOT_DURABLE`,
+`V1_EVIDENCE_CURRENT_STATE_UNAVAILABLE`, `V1_EVIDENCE_CURRENT_STATE_DRIFT`,
+`V1_EVIDENCE_NOT_CURRENTLY_SUPPORTED`. The research run carries on either way;
+a **lost lease** still escapes as infrastructure, from the bundle write, the
+verdict write and the current-state read alike.
+
+> ⚠️ **Rollout consequence, by design.** The authoritative read is
+> `public.claim_current_verdict_states`, which `20260921000100` creates. Until
+> that migration is applied, the read fails and **every V1 field resolves to
+> `needs_review`** — the fail-closed direction, and the one an operator should
+> expect between deploying this code and applying the migration. Apply the
+> migration first, or accept that V1 verifies nothing in that window.
+
+**The four deterministic rules** that decide a field in the first place,
+applied over durable evidence, never by a prompt:
 
 1. **Located support** — the value must be readable at an exact locator of a
    versioned record, with exactly one durable fragment at that locator;
@@ -195,6 +222,10 @@ a routine one.
 
 | Property | Test |
 | --- | --- |
+| A verdict that could not be persisted leaves the field unverified | `tests/test_v1_evidence_authority.py` §2b |
+| A failed or unavailable current-state read never verifies | `tests/test_v1_evidence_authority.py` §2b |
+| A supported state naming another verdict never verifies | `tests/test_v1_evidence_authority.py` §2b |
+| Only the exact current supported verdict verifies | `tests/test_v1_evidence_authority.py` §2b |
 | The rule, every state and the fail-closed tiebreak | `tests/test_current_verdict_authority.py` |
 | The same rule in PostgreSQL, incl. a real same-transaction tie | `tests/test_migrations_postgres.py` |
 | V1 verifies actual field/value identity | `tests/test_v1_evidence_authority.py` §1 |

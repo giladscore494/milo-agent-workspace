@@ -66,6 +66,14 @@
 -- is changed: what changes is which of them is read as CURRENT. Rerun-safe:
 -- every function, index and trigger is created or replaced idempotently.
 --
+-- V1 DEPENDS ON THIS BEING APPLIED. `claim_current_verdict_states` below is
+-- the AUTHORITATIVE read the V1 evidence authority
+-- (backend/engines/vehicle_catalog_v1/evidence_authority.py) must succeed at
+-- before it may report a field `verified`. Until this migration is applied
+-- that read fails, and every V1 field resolves to `needs_review` -- the
+-- fail-closed direction, deliberately, and the window an operator should
+-- expect between deploying the code and applying this file.
+--
 -- ORDER MATTERS, and only for a RE-RUN.
 -- `20260916120000_catalog_field_level_promotion.sql` defines
 -- `catalog_run_pending_promotions` with the "a verified verdict exists" join
