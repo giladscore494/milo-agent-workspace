@@ -1567,6 +1567,12 @@ def evidence() -> None:
         except json.JSONDecodeError:
             identity = None
             failures.append("run.run_identity is not readable JSON — failing closed")
+    if identity is not None and not isinstance(identity, dict):
+        # A stored value that is not an object is not an identity. It is
+        # reduced to "absent" here so the comparison below cannot raise on it,
+        # and the refusal is recorded either way.
+        failures.append("run.run_identity is not an object — failing closed")
+        identity = None
     out["run_identity"] = identity
     expected_identity = expected_run_identity()
     out["expected_run_identity"] = expected_identity
