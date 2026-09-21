@@ -2866,20 +2866,23 @@ def test_the_withdrawn_hard_total_bound_is_not_claimed_anywhere():
     assert "5.50" not in readme
 
 
-def test_the_cost_statement_separates_what_milo_bounds_from_what_it_does_not():
-    """The COUNT is MILO's and enforced; the PRICE is the provider's and unverified.
+def test_the_cost_statement_matches_the_verified_standalone_price():
+    """Search price is now a reviewed runtime input, not an unknown interface.
 
-    The doc may claim exactly the first and must not quietly promise the
-    second: a dollar figure derived from a price this repository never
-    verified would be the same class of claim as the withdrawn "<= $5.50".
+    MILO books the higher of the two current international standalone-search
+    prices before execution, so both Basic and Pro are inside the recorded
+    $1.00 run ceiling even when a failed/empty search is conservatively
+    over-counted.
     """
     doc = AUTHORIZATION_DOC.read_text()
-    assert "Tracked, token-derived cost — HARD-CAPPED at $1.00" in doc
+    assert "Recorded total cost" in doc
+    assert "≤ $1.00, hard" in doc
     assert "Search invocations" in doc
     assert "≤ 60 per run, hard" in doc
     assert "max_search_invocations_per_run" in doc
-    assert "price is the provider's and is NOT verified in this repository" in doc
-    assert "bounded in count, not proven in dollars" in doc
+    assert "$0.002" in doc
+    assert "$0.003" in doc
+    assert "≤ $0.18 recorded" in doc
 
 
 def test_the_superseded_unbounded_claim_is_restated_not_deleted():
@@ -2897,11 +2900,11 @@ def test_the_superseded_unbounded_claim_is_restated_not_deleted():
     assert "provider decided how many" in context
 
 
-def test_the_cost_statement_cites_the_current_official_fee_and_deprecation():
+def test_the_cost_statement_cites_current_standalone_and_legacy_fees():
     doc = AUTHORIZATION_DOC.read_text()
-    assert "$0.005" in doc
-    assert "2026-10-20" in doc
-    for text in (doc, (STAGE_D / "README.md").read_text()):
+    readme = (STAGE_D / "README.md").read_text()
+    for text in (doc, readme):
+        assert "0.002" in text and "0.003" in text
         assert "0.005" in text and "2026-10-20" in text
 
 
@@ -2940,9 +2943,13 @@ def test_the_runtime_claim_in_the_doc_matches_the_actual_runtime():
     # ...and the doc says so, with the number the policy really publishes.
     from backend.runtime_policy import reviewed_first_run_policy
 
-    ceiling = reviewed_first_run_policy().values["max_search_invocations_per_run"]
+    policy_values = reviewed_first_run_policy().values
+    ceiling = policy_values["max_search_invocations_per_run"]
+    search_price = policy_values["search_cost_per_invocation"]
     assert f"≤ {ceiling} per run, hard" in doc, (
         "the authorization doc states a search ceiling the policy does not")
+    assert search_price == 0.003
+    assert "$0.003 per admitted search" in doc
 
 
 def test_a_provider_wallet_ceiling_is_a_prerequisite_not_a_suggestion():
