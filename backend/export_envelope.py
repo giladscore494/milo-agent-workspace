@@ -127,6 +127,8 @@ def build_export_envelope(run: Mapping[str, Any], *,
         raise ExportRefused(
             f"the run's engine identity cannot be established ({exc.code})") from exc
     engine = identity.workflow_key
+    if engine not in {"vehicle_catalog_v1", "swarm_v2"}:
+        raise ExportRefused("run identity is not an exportable product workflow")
     output = run.get("output")
 
     result_kind: str | None = None
