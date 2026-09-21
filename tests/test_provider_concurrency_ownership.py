@@ -1296,23 +1296,91 @@ def test_the_guarded_client_is_the_only_thing_between_execute_and_the_sdk():
     from backend.engines.swarm_v2 import model_gateway
     from backend.engines.vehicle_catalog_v1 import core as v1_core
 
-    sites = 0
-    for node in ast.walk(ast.parse(inspect.getsource(provider_authority))):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "execute"):
-            continue
-        guarded = node.args[0]
-        assert isinstance(guarded, ast.Lambda), "execute got something other than a lambda"
-        assert isinstance(guarded.body, ast.Call)
-        assert ast.unparse(guarded.body).endswith("chat.completions.create(**payload)"), (
-            "the adapter wraps more than the provider call")
-        sites += 1
-    assert sites == 1, f"expected exactly one guarded call site, found {sites}"
+    tree = ast.parse(inspect.getsource(provider_authority))
+    creates = [node for node in ast.walk(tree)
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+               and node.func.attr == "create"]
+    assert len(creates) == 1, f"expected exactly one provider call site, found {len(creates)}"
+    assert ast.unparse(creates[0]).endswith("chat.completions.create(**payload)")
+
+    # What `execute` is handed is the function that holds that one call. It
+    # is no longer a bare lambda, because a search reservation has to be taken
+    # and settled around EACH attempt -- so the rule the bare lambda used to
+    # enforce is enforced directly instead: everything in the callable that is
+    # not the provider call declares which side of the request it ran on, and
+    # the two behavioural tests below prove it.
+    executes = [node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "execute"]
+    assert len(executes) == 1, f"expected exactly one execute call, found {len(executes)}"
+    assert ast.unparse(executes[0].args[0]) == "attempt"
 
     # And neither engine has one of its own left to drift.
     for module in (model_gateway, v1_core):
         assert "chat.completions.create" not in inspect.getsource(module), (
             f"{module.__name__} calls the provider directly again")
+
+
+def test_a_search_settlement_failure_does_not_change_what_is_known():
+    """Accounting must not turn a proven answer into an unknown outcome.
+
+    The adapter settles a search reservation inside the very callable the
+    scheduler settles the organization permit on. If that settlement refuses
+    -- a tripped search or cost ceiling -- its exception REPLACES whatever
+    the request really was, and an unmarked replacement would hold a shared
+    slot indefinitely over a request the provider demonstrably answered.
+    """
+    from types import SimpleNamespace
+
+    from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker
+    from backend.provider_authority import BUILTIN_WEB_SEARCH, ProviderAdapter
+    from backend.provider_quota import (MemoryQuotaBackend, ProviderQuotaCoordinator,
+                                        QuotaConfig)
+    from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
+
+    def searching_response(count):
+        calls = [SimpleNamespace(id=str(i), function=SimpleNamespace(
+            name=BUILTIN_WEB_SEARCH, arguments="{}")) for i in range(count)]
+        return SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            choices=[SimpleNamespace(finish_reason="tool_calls", message=SimpleNamespace(
+                content="", tool_calls=calls))])
+
+    class Client:
+        def __init__(self, response):
+            self.response = response
+            self.chat = SimpleNamespace(completions=self)
+
+        def create(self, **kwargs):
+            return self.response
+
+    backend = MemoryQuotaBackend()
+    coordinator = ProviderQuotaCoordinator(
+        backend, QuotaConfig(max_concurrency=1, max_rpm=10, max_tpm=1_000_000))
+    # A per-request maximum of 2 against a response that performs 5: the
+    # response is read to completion, and THEN settlement refuses.
+    tracker = BudgetTracker(
+        BudgetConfig(estimated_cost_per_call=0.0, max_model_calls_per_run=10,
+                     max_search_invocations_per_run=50,
+                     max_builtin_searches_per_request=2),
+        kill_switch=lambda: True)
+    adapter = ProviderAdapter(
+        ProviderScheduler(ProviderLimitsConfig(rpm_limit=None, tpm_limit=None),
+                          coordinator=coordinator),
+        tracker=tracker)
+    request = {"model": "m", "messages": [{"role": "user", "content": "hi"}],
+               "max_tokens": 100,
+               "tools": [{"type": "builtin_function",
+                          "function": {"name": BUILTIN_WEB_SEARCH}}]}
+
+    with pytest.raises(BudgetExceeded):
+        adapter.chat(request, client=Client(searching_response(5)))
+
+    lease = coordinator.try_acquire_inference()
+    assert lease is not None, (
+        "an accounting refusal after a completed response quarantined the "
+        "organization permit")
+    lease.release()
 
 
 def test_a_settlement_failure_does_not_change_what_is_known_about_a_429():

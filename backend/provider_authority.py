@@ -792,13 +792,35 @@ class ProviderAdapter:
             exc.provider_request_completed = True
             raise
 
-    def _settle_searches(self, reservation: int | None, actual: int | None) -> None:
+    def _settle_searches(self, reservation: int | None, actual: int | None,
+                         *, after: BaseException | None = None) -> None:
+        """Release a reservation, without changing what is KNOWN about the request.
+
+        Settlement can itself refuse -- a tripped search or cost ceiling -- and
+        that refusal escapes the callable the scheduler settles the
+        organization permit on. It must not be allowed to change the verdict:
+
+        * after a response was read to completion, the exchange is over
+          whatever the accounting then says, so the refusal is marked proven;
+        * after a provider failure, the ORIGINAL exception's verdict is
+          carried across, or an ordinary 429 would start holding a shared slot
+          until a human reclaimed it.
+
+        This is the same rule `backend.budget`'s guarded client applies to its
+        own settlement, for the same reason.
+        """
         tracker = self._tracker
         if tracker is None or reservation is None:
             return
         settle = getattr(tracker, "settle_search", None)
-        if callable(settle):
+        if not callable(settle):
+            return
+        try:
             settle(reservation, actual=actual)
+        except BaseException as refusal:
+            refusal.provider_request_completed = (
+                True if after is None else classify_outcome(after).completion_proven)
+            raise
 
     def _searches_performed(self, response: Any) -> int | None:
         return builtin_searches_in_response(response)
@@ -848,16 +870,18 @@ class ProviderAdapter:
             outside the retry loop would bound the first attempt and nothing
             after it.
             """
-            if not searching:
-                return target.chat.completions.create(**payload)
             # The WORST CASE this request could spend, held before it is
             # dispatched. A run that cannot pay for the maximum does not get
-            # to send the request and find out afterwards.
-            reservation = self._reserve_searches(self.max_builtin_searches_per_request)
+            # to send the request and find out afterwards. A request that
+            # offers no search holds nothing, and settling nothing is a no-op,
+            # so there stays exactly ONE provider call site.
+            reservation = (self._reserve_searches(self.max_builtin_searches_per_request)
+                           if searching else None)
             try:
                 response = target.chat.completions.create(**payload)
             except BaseException as exc:
-                self._settle_searches(reservation, self._searches_after_failure(exc))
+                self._settle_searches(reservation, self._searches_after_failure(exc),
+                                      after=exc)
                 raise
             self._settle_searches(reservation, self._searches_performed(response))
             return response
