@@ -1095,8 +1095,19 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         # Nothing was written by the call above -- the lookup happens before
         # every insert -- and nothing is written here either, in either branch.
         if _run_is_eligible(run):
-            # A genuine replay: the same run, already prepared, already owned
-            # and already at rest. Idempotent, and it re-acquires nothing.
+            try:
+                replay_identity = require_identity(run)
+            except RunIdentityError:
+                return EXIT_REFUSED, _envelope(
+                    "refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
+            if replay_identity.workflow_key != "operator_capture" or execution_identity_problems(
+                replay_identity, env=env
+            ):
+                return EXIT_REFUSED, _envelope(
+                    "refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
+            # A genuine replay only when the already-prepared run is also a
+            # run of this exact runtime. An old-release capture is history,
+            # not a prepared executable for today's process.
             return EXIT_OK, _envelope("prepared", "", preparation=_preparation_document(
                 run_id, already_prepared=True))
         # An ordinary run -- or one already consumed, or one left mid-transition
