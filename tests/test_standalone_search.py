@@ -347,6 +347,16 @@ def test_chat_and_search_share_one_provider_base_url(monkeypatch):
     assert seen == [configured], "V1 chat ignored the canonical provider base URL"
 
 
+def test_pre_normalized_transport_results_survive_adapter_normalization():
+    """The real transport returns SearchResult objects; a second normalize is safe."""
+    source = SearchResult(
+        title="Official source",
+        url="https://example.test/model",
+        snippet="grounded passage",
+    )
+    assert normalize_results((source,)) == (source,)
+
+
 def test_search_pro_chunks_become_bounded_model_facing_passages():
     """Pro's ranked passages, not its thin snippet, are what the agent reads."""
     results = normalize_results({"search_results": [{
