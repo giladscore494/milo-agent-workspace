@@ -22,7 +22,6 @@ from backend.provider_scheduler import (
     is_provider_rate_limit_error,
 )
 
-MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
 KIMI_MODEL = "kimi-k2.6"
 SEARCH_TEMPERATURE = 0.6
 CONSOLIDATION_TEMPERATURE = 0.6
