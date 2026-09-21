@@ -145,6 +145,17 @@ POLICY_SCHEMA_VERSION = "milo-runtime-policy/1"
 # --- how a dimension is spelled on the wire ---------------------------------
 FMT_INT = "int"      # 1800, 240 -- printed without a decimal point
 FMT_MONEY = "money"  # 3.00, 0.02 -- always two decimals
+#: For a per-unit PRICE, which is legitimately sub-cent.
+#:
+#: `FMT_MONEY` renders two decimals, so a $0.003 search prints as "0.00": the
+#: canonical document would publish a price of ZERO while the runtime charged
+#: three tenths of a cent, and the prose beside it said $0.003. Worse, the
+#: fingerprint is a digest of that document -- so raising the price from 0.00
+#: to 0.003 would not move the digest at all, and two genuinely different
+#: policies would print the same one. That is the single property the
+#: fingerprint exists to provide, and a formatter is not allowed to quietly
+#: take it away.
+FMT_UNIT_PRICE = "unit_price"  # 0.0030, 0.0025 -- four decimals
 
 # --- the surfaces that consume a dimension ----------------------------------
 BUDGET = "budget"                    # backend.budget.BudgetConfig
@@ -220,6 +231,8 @@ class PolicyDimension:
             return "unbounded"
         if self.fmt == FMT_MONEY:
             return f"{float(value):.2f}"
+        if self.fmt == FMT_UNIT_PRICE:
+            return f"{float(value):.4f}"
         if float(value) != int(value):
             raise ValueError(f"{self.name} is declared integral")
         return str(int(value))
@@ -410,7 +423,7 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
            "already spent. It does not bound the mediated path, where each "
            "search is admitted individually and this number plays no part. "
            "No env key: a reviewed value, not a deployment setting"),
-    _d("search_cost_per_invocation", 0.003, kind=float, fmt=FMT_MONEY,
+    _d("search_cost_per_invocation", 0.003, kind=float, fmt=FMT_UNIT_PRICE,
        direction=HIGHER_IS_TIGHTER, runtime_default=0.003, enforced_by=BUDGET,
        why="a CONSERVATIVE recorded-cost charge for every admitted standalone "
            "search. Current official international Kimi pricing is $0.002 for "
