@@ -257,3 +257,43 @@ def test_flag_alone_is_never_sufficient_authorization(repo):
     response = client().post(f"/runs/{repo.run_id}/claims", json=worker_routes(repo)[4][1])
     assert response.status_code == 401
     repo.assert_no_mutations()
+
+
+def test_every_fenced_payload_is_json_native_for_its_jsonb_argument():
+    """Each worker payload is now ONE `jsonb` argument to a guarded RPC, and a
+    Python-mode dump leaves UUID and datetime objects the PostgREST client
+    cannot serialize. A tool grant carries both, so this would fail on the
+    first real request while every fake that never serializes stayed green."""
+    import json
+
+    from backend.schemas import (ClaimCreate, ConflictCreate, SourceCreate,
+                                 ToolAccessRequestCreate, ToolGrantCreate,
+                                 ToolUsageCreate, WorkerRunCompleteRequest,
+                                 WorkerRunEventCreate, WorkerRunFailRequest)
+
+    models = {
+        ToolAccessRequestCreate: {"agent": "a", "tool": "t", "reason": "r"},
+        ToolGrantCreate: {"request_id": uuid4(), "agent": "a", "tool": "t",
+                          "max_searches": 1, "max_rounds": 1,
+                          "expires_at": "2030-01-01T00:00:00+00:00",
+                          "approver_policy": "auto"},
+        ToolUsageCreate: {"grant_id": uuid4(), "agent": "a", "tool": "t",
+                          "operation": "search"},
+        SourceCreate: {"agent": "a", "url": "https://example.com", "title": "t",
+                       "domain": "example.com", "source_type": "web",
+                       "source_strength": "high", "query": "q",
+                       "tool_operation": "search"},
+        ClaimCreate: {"entity_key": "e", "field_key": "f", "value": 1,
+                      "source_id": uuid4(), "source_strength": "high",
+                      "confidence": 0.9, "agent": "a"},
+        ConflictCreate: {"entity_key": "e", "field_key": "f", "claim_ids": [uuid4()]},
+        WorkerRunEventCreate: {"event_type": "agent_progress", "message": "m"},
+        WorkerRunCompleteRequest: {"output": {"status": "success"}},
+        WorkerRunFailRequest: {"code": "X", "message": "m"},
+    }
+    for model, payload in models.items():
+        built = model(**LEASE, **payload)
+        content = built.content()
+        json.dumps(content)  # would raise on a UUID or a datetime
+        assert not (set(content) & set(LEASE)), f"{model.__name__} leaks the fence"
+        assert built.lease() == LEASE

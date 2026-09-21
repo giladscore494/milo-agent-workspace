@@ -262,15 +262,22 @@ class WorkerLeaseFence(BaseModel):
         return {name: getattr(self, name) for name in self.FENCE_FIELDS}
 
     def content(self) -> dict[str, Any]:
-        """The request WITHOUT the fence.
+        """The request WITHOUT the fence, in JSON-native types.
 
         The fence authorizes the write; it is never part of what is written.
         `lease_token` in particular is a credential: the guarded evidence RPCs
         refuse outright any payload carrying a `lease_token` or `token` key, so
         folding the fence into the row would not merely be untidy, it would be
         rejected by the database.
+
+        `mode="json"` is load-bearing, not tidiness. Every one of these
+        payloads is now handed to a guarded RPC as ONE `jsonb` argument, and a
+        Python-mode dump leaves `UUID` and `datetime` objects in it -- which
+        the PostgREST client cannot serialize. A tool grant carries both
+        (`request_id`, `expires_at`), so the write would fail on the first real
+        request rather than on a test fake that never serializes anything.
         """
-        return self.model_dump(exclude=set(self.FENCE_FIELDS))
+        return self.model_dump(mode="json", exclude=set(self.FENCE_FIELDS))
 
 
 class ToolAccessRequestCreate(WorkerLeaseFence):
