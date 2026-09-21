@@ -435,6 +435,23 @@ def test_an_unconfigured_transport_refuses_before_charging_anything():
     assert tracker.reserved_search_invocations == 0
 
 
+def test_a_search_cannot_happen_where_nothing_can_account_for_it():
+    """NEGATIVE CONTROL: no ledger, no search.
+
+    `max_search_invocations_per_run` is enforced by the run's ledger, so an
+    adapter without one could only perform UNMETERED searches -- the builtin's
+    failure mode wearing different clothes. The production worker always
+    installs the ledger; this makes the guarantee structural rather than a
+    property of the wiring.
+    """
+    executor = RecordingSearch()
+    scheduler = ProviderScheduler(ProviderLimitsConfig())
+    adapter = ProviderAdapter(scheduler, tracker=None, search_executor=executor)
+    with pytest.raises(SearchUnavailable):
+        adapter.run_search({"query": "tucson"})
+    assert executor.calls == 0
+
+
 def test_a_malformed_ask_is_refused_before_admission(v1):
     """An empty query is a malformed request, not a search the run spent."""
     empty = SimpleNamespace(id="c1", function=SimpleNamespace(

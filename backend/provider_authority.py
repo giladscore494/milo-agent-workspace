@@ -977,6 +977,15 @@ class ProviderAdapter:
 
         # -- decided before anything is spent -------------------------------
         text = normalize_query(query)
+        # A search nothing can account for is the exact thing this path
+        # exists to make impossible. `max_search_invocations_per_run` is
+        # enforced by the run's ledger, so an adapter without one cannot
+        # admit a search -- it can only perform unmetered ones, which is the
+        # builtin's failure mode wearing different clothes. `chat` stays
+        # tolerant of a missing tracker; this does not.
+        if not callable(getattr(self._tracker, "reserve_search", None)):
+            raise SearchUnavailable(
+                "a mediated search requires a run ledger to be admitted against")
         execute = executor or self._search_executor or default_search_executor()
         if not callable(execute):
             raise SearchUnavailable(
