@@ -218,7 +218,12 @@ begin
     raise exception 'RUN_IDENTITY_INVALID: identity names a different run'
       using errcode = '22023';
   end if;
-  if (p_run_identity->>'workflow_key') is distinct from v_workflow_key then
+  if p_run_identity->>'workflow_key' = 'operator_capture' then
+    if coalesce(p_metadata->>'milo_operation', '') <> 'catalog.government.capture' then
+      raise exception 'RUN_IDENTITY_INVALID: operator capture identity requires the capture operation marker'
+        using errcode = '22023';
+    end if;
+  elsif (p_run_identity->>'workflow_key') is distinct from v_workflow_key then
     raise exception 'RUN_IDENTITY_WORKFLOW_DRIFT: project workflow changed before creation'
       using errcode = '40001';
   end if;
@@ -651,6 +656,9 @@ end $$;
       or
       (run_identity->>'workflow_key' = 'swarm_v2'
        and run_identity->>'engine_version' = 'swarm_v2.1')
+      or
+      (run_identity->>'workflow_key' = 'operator_capture'
+       and run_identity->>'engine_version' = 'operator_capture.1')
     )
     and (run_identity->>'run_id')::uuid = id
   )
