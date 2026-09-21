@@ -39,12 +39,12 @@ from current defaults, engine availability, checkpoint contents, output shape,
 event history or caller input, and none of them may rewrite it. A run created
 as V2 can never later look like V1, or the reverse.
 
-Mutation fails closed in two places, deliberately: here, so application code
-cannot express it, and in the database, where
-``20260921000200_immutable_run_identity.sql`` refuses any UPDATE that changes a
-non-null ``runs.run_identity``. The trigger is the one that actually holds --
-application guards are advisory against a second writer -- and this module is
-what stops the mistake being written in the first place.
+Mutation fails closed at creation and forever afterwards. New runs are inserted
+with identity inside the same `create_message_and_run_v3` transaction that
+creates the run, and ``20260921000200_immutable_run_identity.sql`` refuses
+every later UPDATE that would change, add or erase ``runs.run_identity``.
+Legacy NULL rows therefore remain historical NULL rows; no service path may
+retrofit an identity and invent their history.
 
 What is bound
 -------------
@@ -77,11 +77,11 @@ What is bound
     record is comparable with the one the release gate verifies.
 
 ``release_sha``
-    The runtime release the API that created the run was serving
-    (``MILO_RELEASE_SHA``, set by the deployer alongside the image tag). Empty
-    when the deployment does not pin one -- ``""`` means "this deployment
-    stated no release", never "any release will do", and the release gate
-    treats an unpinned run as unauthorized rather than as a match.
+    The full 40-character runtime release SHA the API that created the run was
+    serving (``MILO_RELEASE_SHA``, set by the deployer alongside the image
+    tag). New durable identities are not admitted when this value is absent or
+    malformed. The reader can still describe an older/unpinned historical
+    identity, but execution and authoritative export refuse it.
 
 ``event_registry_version`` / ``event_registry_fingerprint``
     The version and exact content digest of the canonical event vocabulary (``backend/event_registry.py``) the run's
@@ -270,8 +270,9 @@ class RunIdentity:
         values: dict[str, str] = {}
         for field in IDENTITY_FIELDS:
             if field == "release_sha":
-                # The only field that may legitimately be empty: a deployment
-                # that pinned no release. It is recorded as stated.
+                # Read compatibility is intentionally broader than execution:
+                # an older/unpinned historical identity can still be described,
+                # but execution_identity_problems and export refuse it.
                 values[field] = str(record.get(field) or "")
                 continue
             value = record.get(field)
@@ -347,11 +348,11 @@ def _run_id_text(run_id: Any) -> str:
 def persisted_identity(run: Any) -> RunIdentity | None:
     """The identity a run row carries, or ``None`` when it carries NONE.
 
-    The ``None`` case is exactly one thing: a run created before this release,
-    whose row predates the ``run_identity`` column. It is NOT a fallback for a
-    record that is present and wrong -- that raises, like any other untrusted
-    identity. Callers decide what an unpinned legacy run may do; they are never
-    handed a guess.
+    The ``None`` case is exactly one thing: a historical run whose row
+    predates immutable identity. It is NOT a fallback for a record that is
+    present and wrong -- that raises, like any other untrusted identity. Legacy
+    NULL rows are readable history only; execution/resume/export authorities
+    refuse them rather than deriving an engine from current project state.
     """
     if not isinstance(run, Mapping):
         raise RunIdentityError("RUN_IDENTITY_MALFORMED", "a run must be an object")
