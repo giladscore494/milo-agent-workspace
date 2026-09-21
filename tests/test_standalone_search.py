@@ -34,8 +34,10 @@ from backend.provider_quota import (MemoryQuotaBackend, ProviderQuotaCoordinator
                                     QuotaConfig)
 from backend.provider_scheduler import (ProviderBackpressureExceeded,
                                         ProviderLimitsConfig, ProviderScheduler)
-from backend.standalone_search import (MEDIATED_SEARCH_TOOL_NAME,
+from backend.standalone_search import (MAX_RESULTS_PER_SEARCH,
+                                       MEDIATED_SEARCH_TOOL_NAME,
                                        PROVIDER_BUILTIN_SEARCH_NAME,
+                                       STANDALONE_SEARCH_TIMEOUT_SECONDS,
                                        MoonshotStandaloneSearch, SearchOutcome,
                                        SearchResult, SearchTransportError,
                                        SearchUnavailable, normalize_results,
@@ -333,7 +335,7 @@ def test_the_standalone_transport_posts_one_request_to_the_search_endpoint():
             posts.append((url, headers, json))
             return SimpleNamespace(
                 status_code=200,
-                json=lambda: {"results": [
+                json=lambda: {"search_results": [
                     {"title": "t", "url": "https://example.co.il", "snippet": "s"}]})
 
     transport = MoonshotStandaloneSearch(api_key="k", base_url="https://api.test/v1",
@@ -344,8 +346,14 @@ def test_the_standalone_transport_posts_one_request_to_the_search_endpoint():
     url, headers, body = posts[0]
     assert url == "https://api.test/v1/tools/search"
     assert headers["Authorization"] == "Bearer k"
-    assert body == {"query": "tucson israel"}
-    assert normalize_results({"results": []}) == ()
+    assert body == {
+        "text_query": "tucson israel",
+        "limit": MAX_RESULTS_PER_SEARCH,
+        "timeout_seconds": STANDALONE_SEARCH_TIMEOUT_SECONDS,
+    }
+    assert body["limit"] == 8
+    assert body["timeout_seconds"] == 30
+    assert normalize_results({"search_results": []}) == ()
     assert results[0].url == "https://example.co.il"
 
 
