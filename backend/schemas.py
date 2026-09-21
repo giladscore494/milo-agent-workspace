@@ -117,6 +117,7 @@ class RunIdentityRecord(BaseModel):
     policy_fingerprint: str
     release_sha: str = ""
     event_registry_version: str
+    event_registry_fingerprint: str
 
 
 class Run(BaseModel):
