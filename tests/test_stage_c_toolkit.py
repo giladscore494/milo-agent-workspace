@@ -274,7 +274,7 @@ def test_preflight_fails_when_one_rpc_genuinely_absent(db, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert '"rpc_heartbeat_run_guarded": "MISSING"' in out
     # The others are still individually verified as present.
-    assert '"rpc_create_message_and_run_v3": "present"' in out
+    assert '"rpc_create_message_and_run_v2": "present"' in out
 
 
 def test_preflight_fails_closed_when_metadata_endpoint_unavailable(db, monkeypatch, capsys):
@@ -336,9 +336,8 @@ def test_required_rpc_args_match_release_migrations(db):
     migrations = REPO / "supabase" / "migrations"
     corrective = (migrations / "20260810000600_corrective_lease_and_attempt_hardening.sql").read_text()
     setof = (migrations / "20260810000400_setof_rpc_returns.sql").read_text()
-    identity = (migrations / "20260921000200_immutable_run_identity.sql").read_text()
     for rpc, args in db.REQUIRED_RPC_ARGS.items():
-        source = identity if rpc == "create_message_and_run_v3" else corrective
+        source = setof if rpc == "create_message_and_run_v2" else corrective
         for arg in args:
             assert arg in source, f"{rpc}: expected arg {arg} not found in the release migration"
 

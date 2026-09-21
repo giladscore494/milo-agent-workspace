@@ -128,17 +128,12 @@ def expected_prior_runs() -> int | None:
 
 
 # Stage C RPC surface with the REQUIRED argument names of each function as
-# defined by the release migrations (20260921000200 for the atomic creator,
+# defined by the release migrations (000400 for create_message_and_run_v2,
 # 000600 for the guarded worker RPCs). Optional (defaulted) arguments are
 # deliberately excluded so a migration adding an optional parameter does
 # not fail the check, while a missing/renamed required argument does.
 REQUIRED_RPC_ARGS: dict[str, set[str]] = {
-    # Console 6's atomic creator, which replaced the V1/V2 creators: the run id
-    # and the run's immutable identity are supplied by the caller because all
-    # three -- message, run and identity -- commit in one transaction. Requiring
-    # a creator this release DROPS would block every Stage C preflight.
-    "create_message_and_run_v3": {
-        "p_run_id", "p_run_identity",
+    "create_message_and_run_v2": {
         "p_conversation_id", "p_content", "p_metadata",
         "p_requested_by", "p_idempotency_key", "p_request_fingerprint",
     },
