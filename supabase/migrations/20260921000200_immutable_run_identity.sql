@@ -126,9 +126,17 @@ create trigger runs_require_identity_on_insert
   for each row
   execute function public.runs_require_identity_on_insert();
 
--- Remove the superseded post-insert binder if a preview/staging database ever
--- received an earlier form of this still-unmerged migration.
+-- Remove superseded run-identity/run-creation primitives if a preview/staging
+-- database received an earlier form of this still-unmerged sequence. The old
+-- creators cannot satisfy the INSERT-time identity trigger and must not remain
+-- as dead alternate authorities beside V3.
 drop function if exists public.bind_run_identity(uuid, jsonb);
+drop function if exists public.create_message_and_run(
+  uuid, text, jsonb, uuid, text, text, integer, integer
+);
+drop function if exists public.create_message_and_run_v2(
+  uuid, text, jsonb, uuid, text, text, integer, integer
+);
 
 -- ---------------------------------------------------------------------------
 -- 3) Atomic user message + run + immutable identity.
