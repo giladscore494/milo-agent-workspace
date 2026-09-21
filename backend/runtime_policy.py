@@ -145,6 +145,17 @@ POLICY_SCHEMA_VERSION = "milo-runtime-policy/1"
 # --- how a dimension is spelled on the wire ---------------------------------
 FMT_INT = "int"      # 1800, 240 -- printed without a decimal point
 FMT_MONEY = "money"  # 3.00, 0.02 -- always two decimals
+#: For a per-unit PRICE, which is legitimately sub-cent.
+#:
+#: `FMT_MONEY` renders two decimals, so a $0.003 search prints as "0.00": the
+#: canonical document would publish a price of ZERO while the runtime charged
+#: three tenths of a cent, and the prose beside it said $0.003. Worse, the
+#: fingerprint is a digest of that document -- so raising the price from 0.00
+#: to 0.003 would not move the digest at all, and two genuinely different
+#: policies would print the same one. That is the single property the
+#: fingerprint exists to provide, and a formatter is not allowed to quietly
+#: take it away.
+FMT_UNIT_PRICE = "unit_price"  # 0.0030, 0.0025 -- four decimals
 
 # --- the surfaces that consume a dimension ----------------------------------
 BUDGET = "budget"                    # backend.budget.BudgetConfig
@@ -220,6 +231,8 @@ class PolicyDimension:
             return "unbounded"
         if self.fmt == FMT_MONEY:
             return f"{float(value):.2f}"
+        if self.fmt == FMT_UNIT_PRICE:
+            return f"{float(value):.4f}"
         if float(value) != int(value):
             raise ValueError(f"{self.name} is declared integral")
         return str(int(value))
@@ -379,6 +392,48 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
        why="CONSERVATIVE FALLBACK: the exact Tier 2 Web Search QPS was not "
            "recoverable from the official tier table and is not invented"),
 
+    # --- search VOLUME and PRICE, enforced by backend.budget.BudgetTracker --
+    #
+    # QPS above is the provider's pacing bucket for the STANDALONE endpoints,
+    # which is the route production now takes: V1 offers a model MILO's own
+    # `web_search` function tool, and MILO admits, performs and accounts each
+    # invocation itself (`ProviderAdapter.run_search`). QPS still says nothing
+    # about how many searches one RUN may perform in total. These two
+    # dimensions are that missing bound: every search a run performs, by
+    # either route, is counted and priced against them.
+    _d("max_search_invocations_per_run", 60, runtime_default=60,
+       enforced_by=BUDGET,
+       why="THE run-level hard ceiling on internet searches, and since the "
+           "mediated path it is structurally enforceable: every invocation is "
+           "admitted against this number BEFORE it executes, so a run cannot "
+           "cross it even by one. V1's four discovery/technical phases each "
+           "run up to ~15 model calls that may search; 60 admits the observed "
+           "shape with room and still refuses an unbounded search loop, which "
+           "no other dimension bounded at all. No env key: the reviewed value "
+           "is the bound, and moving it is a reviewed change rather than a "
+           "deployment setting"),
+    _d("max_builtin_searches_per_request", 4, runtime_default=4, enforced_by=BUDGET,
+       why="THE RESIDUAL bound, for the provider-executed builtin "
+           "`$web_search` that no production engine offers any more. It is "
+           "kept because the provider authority still accounts for a builtin "
+           "search if any caller ever sends one, and a reservation is the "
+           "only ceiling possible there: the provider decides how many "
+           "searches one response asks for, so admission must reserve a "
+           "maximum before dispatch or it is post-facto detection of money "
+           "already spent. It does not bound the mediated path, where each "
+           "search is admitted individually and this number plays no part. "
+           "No env key: a reviewed value, not a deployment setting"),
+    _d("search_cost_per_invocation", 0.003, kind=float, fmt=FMT_UNIT_PRICE,
+       direction=HIGHER_IS_TIGHTER, runtime_default=0.003, enforced_by=BUDGET,
+       why="a CONSERVATIVE recorded-cost charge for every admitted standalone "
+           "search. Current official international Kimi pricing is $0.002 for "
+           "Search Basic and $0.003 for Search Pro when a request succeeds "
+           "with non-empty results. MILO records the higher $0.003 BEFORE "
+           "execution for either endpoint, so failures/empty results may "
+           "over-count internally but a paid search can never be omitted from "
+           "the recorded-cost ceiling. No env key: provider price changes are "
+           "reviewed policy changes, not deployment overrides"),
+
     # --- declared posture, enforced by operator process and Stage D --------
     _d("hard_monetary_cap_usd", 3.00, kind=float, fmt=FMT_MONEY, runtime_default=3.00,
        enforced_by=POSTURE,
@@ -523,10 +578,12 @@ class RuntimePolicy:
             fields[dimension.name] = (None if value is None else
                                       int(value) if dimension.kind is int
                                       else float(value))
-        # `estimated_cost_per_call` is a rate with a real code default rather
-        # than an optional ceiling, so it is never None on the dataclass.
-        if fields.get("estimated_cost_per_call") is None:
-            fields.pop("estimated_cost_per_call")
+        # Rates with a real code default rather than an optional ceiling: they
+        # are never None on the dataclass, so an unset policy value leaves the
+        # default in place instead of writing None over it.
+        for rate in ("estimated_cost_per_call", "search_cost_per_invocation"):
+            if fields.get(rate) is None:
+                fields.pop(rate, None)
         return BudgetConfig(**fields)
 
     def plan_limits(self, *, base: Any | None = None) -> Any:

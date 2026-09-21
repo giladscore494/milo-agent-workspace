@@ -11,21 +11,36 @@ from threading import BoundedSemaphore
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    from openai import OpenAI
-except ModuleNotFoundError:  # optional until live engine execution
-    OpenAI = None
-
-from backend.budget import build_provider_http_client, provider_request_timeout
+from backend.provider_authority import (DEFAULT_PROVIDER_BASE_URL, SEARCH_PRO,
+                                        ProviderAdapter, classify_outcome,
+                                        provider_base_url)
+from backend.standalone_search import (MEDIATED_SEARCH_TOOL_NAME, SearchOutcome,
+                                       SearchQueryInvalid, mediated_search_tool)
 from backend.provider_scheduler import (
     ProviderBackpressureExceeded,
     ProviderLimitsConfig,
     ProviderScheduler,
-    estimate_admission_tokens,
     is_provider_rate_limit_error,
 )
 
-MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1"
+# LEGACY COMPATIBILITY DESCRIPTOR -- NOT A RUNTIME AUTHORITY.
+#
+# V1 used to hold its own hard-coded provider host here while V2 chat and
+# standalone search both honoured MILO_MODEL_BASE_URL. One deployment could
+# therefore point V1's chat at one host and V2/search at another, silently,
+# with nothing in the runtime able to notice the split. That defect is fixed:
+# every provider request -- V1 chat, V2 chat and standalone search -- resolves
+# `provider_base_url()`, and this module's own client construction does too
+# (see `_provider_client`).
+#
+# The NAME survives because the preserved-engine parity contract exports it
+# and deleting a public constant is itself a compatibility break. It is BOUND
+# to the canonical default rather than restating the string, so it cannot
+# drift from it, and nothing at runtime reads it -- a second configurable
+# host is exactly what was removed. `tests/test_vehicle_catalog_engine.py`
+# pins both halves: the value is preserved, and it is not what any provider
+# request consults.
+MOONSHOT_BASE_URL = DEFAULT_PROVIDER_BASE_URL
 KIMI_MODEL = "kimi-k2.6"
 SEARCH_TEMPERATURE = 0.6
 CONSOLIDATION_TEMPERATURE = 0.6
@@ -46,9 +61,22 @@ RETRY_CALLBACK = None
 # wait_seconds). Separate from RETRY_CALLBACK on purpose: provider
 # backpressure must never consume the semantic retry allowance.
 PROVIDER_BACKPRESSURE_CALLBACK = None
-# The ONE scheduler shared by every Kimi call inside a worker execution.
-# Installed per run by the engine; lazily created from env when standalone.
+# THE provider authority for this engine. V1 owns no admission, no retry, no
+# timeout and no provider-error semantics of its own: it hands a request to
+# the adapter and takes what comes back. The SAME adapter instance serves
+# Swarm V2 in a worker process, so both engines draw on one organization
+# allowance rather than two that each believe they own the account.
+#
+# `PROVIDER_SCHEDULER` is the preserved injection point for the mechanism the
+# adapter drives. Installed per run by the engine; lazily created from env
+# when this engine runs standalone.
 PROVIDER_SCHEDULER = None
+PROVIDER_ADAPTER = None
+# PRESERVED DESCRIPTORS, not a retry policy. V1's ExecutionPolicy still
+# publishes these numbers as part of the workflow contract, but nothing
+# retries on them any more: provider attempts are bounded by
+# `provider_max_rate_limit_retries` in the canonical runtime policy and
+# executed by the one provider authority.
 API_CONCURRENCY_RETRY_DELAY_SECONDS = 2
 API_CONCURRENCY_MAX_RETRIES = 2
 MAX_DISCOVERY_TOKENS = 1800
@@ -67,11 +95,32 @@ DEFAULT_MANUFACTURER = "Hyundai"
 DEFAULT_MARKET = "Israel"
 DEFAULT_PERIOD = "2010 to June 2026"
 
-WEB_SEARCH_TOOL = [{"type": "builtin_function", "function": {"name": "$web_search"}}]
+# THE search capability V1 offers a model, and it is MILO's own function tool
+# rather than the provider's builtin `$web_search`.
+#
+# The difference is WHO EXECUTES. A `builtin_function` entry is run by the
+# provider, inside the chat request, as many times as the provider decides:
+# MILO could reserve a worst case before dispatch and reconcile afterwards,
+# but it could never admit one invocation at a time, so a response that
+# searched once more than the reviewed maximum had already spent the money by
+# the time MILO could see it. An ordinary `function` tool the provider CANNOT
+# execute. It can only ask, and every ask returns here, where the run's search
+# allowance and the endpoint's QPS bucket decide -- before anything happens --
+# whether that one search is performed.
+#
+# Internet access is unchanged in kind and in reach: the same searches run,
+# against the same provider's search endpoints, and the results come back into
+# the same conversation. What changed is that their NUMBER became something
+# MILO can refuse.
+WEB_SEARCH_TOOL = mediated_search_tool()
 MANDATORY_WEB_SEARCH_INSTRUCTION = (
-    "IMPORTANT: You MUST call the $web_search tool to find information. "
+    f"IMPORTANT: You MUST call the {MEDIATED_SEARCH_TOOL_NAME} tool to find information. "
     "Do NOT answer from memory. Do NOT describe what you plan to search. "
     "Execute the search immediately.\n\n"
+)
+MISSED_SEARCH_NUDGE = (
+    f"You did not use the {MEDIATED_SEARCH_TOOL_NAME} tool. You MUST search the web now. "
+    "Do not describe what to search — call the tool directly."
 )
 
 ARCHITECTURE_ASCII = """
@@ -454,6 +503,12 @@ def _message_content(message: Any) -> str:
 
 
 def is_kimi_concurrency_error(exc: Any) -> bool:
+    """Preserved V1 spelling of the ONE taxonomy's backpressure question.
+
+    It reads the authority's verdict rather than any V1 opinion, so 503 /
+    `engine_overloaded_error` is backpressure here exactly as it is
+    everywhere else.
+    """
     return is_provider_rate_limit_error(exc)
 
 
@@ -473,21 +528,47 @@ def _provider_scheduler() -> ProviderScheduler:
     return PROVIDER_SCHEDULER
 
 
-def _scheduled_provider_call(client: Any, kwargs: Dict[str, Any], agent_name: str, phase_name: str) -> Any:
-    """The single guarded path for EVERY provider request (initial calls,
-    tool rounds, fallbacks and summaries). No raw create call may bypass it."""
+def _provider_authority() -> ProviderAdapter:
+    """THE adapter every V1 provider request goes through.
+
+    Returns the instance the worker installed when there is one. Otherwise it
+    builds one over this engine's scheduler -- which is still the SAME
+    contract, not a V1-private path: the admission rule, the retry policy,
+    the taxonomy, the deadline and the search accounting all live in
+    ``backend.provider_authority`` either way.
+    """
+    global PROVIDER_ADAPTER
     scheduler = _provider_scheduler()
-    # Strict: V1 has always required a numeric cap on every call, so the
-    # organization admission value (input + requested cap) is always
-    # computable here and never degrades to "input only".
-    estimated = estimate_admission_tokens(kwargs.get("messages"), kwargs.get("max_tokens"))
-    return scheduler.execute(
-        lambda: client.chat.completions.create(**kwargs),
-        estimated_tokens=estimated,
-        reserved_tokens=estimated,
-        agent=agent_name,
-        phase=phase_name,
-    )
+    installed = PROVIDER_ADAPTER
+    if installed is None or installed.scheduler is not scheduler:
+        installed = ProviderAdapter(scheduler)
+        PROVIDER_ADAPTER = installed
+    return installed
+
+
+def _authority_call(client: Any, kwargs: Dict[str, Any], agent_name: str, phase_name: str) -> Any:
+    """The single path for EVERY provider request (initial calls, tool rounds,
+    fallbacks and summaries). No raw create call may bypass it.
+
+    The output cap, the conservative token admission, the organization gate,
+    the bounded backpressure retries, the total deadline and the search
+    accounting are all the adapter's. V1 states none of them a second time.
+    """
+    return _provider_authority().chat(kwargs, client=client, agent=agent_name,
+                                      phase=phase_name)
+
+
+def _provider_client(api_key: str) -> Any:
+    """The provider client, built by the ONE factory that knows the deadline.
+
+    ``MODEL_CLIENT_FACTORY`` stays the injection point production and tests
+    use; with none installed the adapter's own factory builds the client --
+    with SDK retries disabled and the total-deadline transport attached,
+    because those are properties of every MILO provider client rather than of
+    one engine's copy of the construction.
+    """
+    return _provider_authority().client(api_key, provider_base_url(),
+                                        factory=MODEL_CLIENT_FACTORY)
 
 
 def _api_concurrency_payload(exc: Any, attempts: int, *, agent: str = "", phase: str = "") -> Dict[str, Any]:
@@ -505,6 +586,78 @@ def _api_concurrency_payload(exc: Any, attempts: int, *, agent: str = "", phase:
         "raw_preview": message[:RAW_DEBUG_PREVIEW_CHARS],
     }
 
+
+def _refused_tool_content(name: str, search_enabled: bool) -> str:
+    """The answer to a tool call MILO will not perform.
+
+    A refusal is a RESULT, not an echo. The old loop replied to a tool call by
+    handing its own arguments straight back, which is precisely how Moonshot's
+    server-side `$web_search` was triggered -- the echo WAS the search
+    request, and the provider then decided how much of it to run. Nothing here
+    forwards anything: a name V1 does not implement, or a search asked for by
+    an agent that was never granted internet, gets a refusal the model can
+    read and no capability at all.
+    """
+    reason = ("this agent has no internet access in this phase"
+              if name == MEDIATED_SEARCH_TOOL_NAME else "no such tool is available")
+    return json.dumps({
+        "tool": str(name)[:64],
+        "status": "error",
+        "error": reason,
+        "instruction": ("Continue from the material already in this "
+                        "conversation. Do not invent sources or facts."),
+    }, ensure_ascii=False)
+
+
+def _mediated_search(raw_arguments: Any, *, agent_name: str, phase_name: str) -> SearchOutcome:
+    """ONE internet search, admitted by MILO BEFORE it is performed.
+
+    The provider authority takes the run's `max_search_invocations_per_run`
+    allowance first, then the endpoint's QPS bucket, then charges the
+    invocation durably, and only then performs exactly one search. A run with
+    no allowance left never reaches the transport, which is what makes the
+    ceiling structural rather than something MILO reads afterwards -- and a
+    refusal there stops the run rather than being reported to the model as an
+    empty result.
+    """
+    try:
+        parsed = json.loads(raw_arguments or "{}")
+    except (TypeError, ValueError):
+        parsed = None
+    try:
+        # V1 is a research/enrichment agent. Kimi's standalone-search
+        # guidance designates Search Pro for agents/reports/RAG because it
+        # returns query-ranked page passages rather than snippets alone.
+        return _provider_authority().run_search(parsed, endpoint=SEARCH_PRO,
+                                                agent=agent_name,
+                                                phase=phase_name)
+    except SearchQueryInvalid as exc:
+        # Decided before admission: no search was performed and none was
+        # charged. The model is told to ask properly; the run pays nothing for
+        # a malformed request, and MAX_TOOL_ROUNDS still bounds the asking.
+        return SearchOutcome(query="", endpoint=SEARCH_PRO, admitted=False,
+                             error=str(exc))
+
+
+def _tool_result_message(tool_call: Any, *, search_enabled: bool,
+                         agent_name: str, phase_name: str) -> Dict[str, Any]:
+    """The tool message MILO returns for ONE tool call the model asked for."""
+    function = getattr(tool_call, "function", None)
+    name = str(getattr(function, "name", "") or "")
+    arguments = getattr(function, "arguments", "") or "{}"
+    if name == MEDIATED_SEARCH_TOOL_NAME and search_enabled:
+        content = _mediated_search(arguments, agent_name=agent_name,
+                                   phase_name=phase_name).as_tool_content()
+    else:
+        content = _refused_tool_content(name, search_enabled)
+    return {
+        "role": "tool",
+        "tool_call_id": str(getattr(tool_call, "id", "") or ""),
+        "name": name,
+        "content": content,
+    }
+
+
 def moonshot_chat(
     api_key: str,
     messages: List[Dict[str, Any]],
@@ -516,32 +669,24 @@ def moonshot_chat(
     agent_name: str = "",
     phase_name: str = "",
 ) -> Dict[str, Any]:
-    """Call Kimi and handle Moonshot's server-side builtin $web_search echo loop."""
+    """Call Kimi and run MILO's own mediated tool loop.
+
+    The loop used to answer a builtin `$web_search` tool call by echoing its
+    arguments back, which is what asked Moonshot to run the search server-side
+    and bill it. Now the model asks, MILO admits and performs the search
+    itself, and the RESULTS go back into the conversation as the tool message
+    -- so the model still researches over the live internet, one admitted
+    invocation at a time.
+    """
     if not max_tokens:
         raise ValueError("moonshot_chat requires max_tokens for every model call")
-    if MODEL_CLIENT_FACTORY is None and OpenAI is None:
-        raise RuntimeError("openai package is required for live Kimi/Moonshot calls")
-    # max_retries=0 is load-bearing, not tidiness. The OpenAI SDK retries
-    # retryable failures TWICE by default, turning one logical request into up
-    # to three provider attempts. Those attempts consume organization RPM and
-    # concurrency, but they happen inside the SDK: MILO's scheduler, budget,
-    # attempt accounting and distributed limiter never see them, so the account
-    # can be over its ceiling while every MILO counter reads clean. Retries
-    # here are MILO-owned, bounded, and re-enter the shared admission gate.
-    #
-    # The explicit timeout is load-bearing too: the SDK default is a 600s read
-    # timeout against a 120s concurrency lease, so an un-timed request could
-    # still be talking to Kimi long after another process had taken over its
-    # organization permit. Production reaches this engine through the guarded
-    # factory in backend.budget, which applies the same derived deadline; this
-    # fallback is what local and test runs get, and it must not be the one
-    # place that forgets.
-    client_factory = MODEL_CLIENT_FACTORY or (
-        lambda api_key, base_url: OpenAI(
-            api_key=api_key, base_url=base_url, max_retries=0,
-            http_client=build_provider_http_client(),
-            timeout=provider_request_timeout()))
-    client = client_factory(api_key, MOONSHOT_BASE_URL)
+    # No client is built here, and no retry, timeout or SDK setting is chosen
+    # here. `_authority_call` hands the request to the ONE provider adapter,
+    # which owns the client construction (SDK retries disabled, total-deadline
+    # transport attached), the admission rule, the bounded retries and the
+    # taxonomy. This function's only provider-facing job is MILO's own
+    # mediated tool loop, which performs each admitted search itself.
+    client = _provider_client(api_key)
     history = list(messages)
     total_input = 0
     total_output = 0
@@ -559,11 +704,11 @@ def moonshot_chat(
             "extra_body": {"thinking": {"type": "disabled"}},
         }
         if use_web_search:
-            kwargs["tools"] = WEB_SEARCH_TOOL
+            kwargs["tools"] = mediated_search_tool()
         if response_format:
             kwargs["response_format"] = response_format
 
-        response = _scheduled_provider_call(client, kwargs, agent_name, phase_name)
+        response = _authority_call(client, kwargs, agent_name, phase_name)
         in_tokens, out_tokens = _usage_tokens(response)
         total_input += in_tokens
         total_output += out_tokens
@@ -576,13 +721,14 @@ def moonshot_chat(
         if finish_reason == "tool_calls":
             history.append(message.model_dump(exclude_none=True))
             for tool_call in message.tool_calls or []:
-                args = json.loads(tool_call.function.arguments or "{}")
-                history.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": tool_call.function.name,
-                    "content": json.dumps(args, ensure_ascii=False),
-                })
+                # EVERY tool call re-enters MILO admission on its own. Several
+                # in one response are several separate admissions, so a
+                # response asking for more searches than the run can still
+                # afford has the affordable ones performed and is stopped at
+                # the first it cannot pay for -- before that one happens.
+                history.append(_tool_result_message(
+                    tool_call, search_enabled=use_web_search,
+                    agent_name=agent_name, phase_name=phase_name))
             continue
 
         if finish_reason in {"stop", "length"}:
@@ -594,7 +740,7 @@ def moonshot_chat(
     ):
         history.append({
             "role": "user",
-            "content": "You did not use the $web_search tool. You MUST search the web now. Do not describe what to search — call the tool directly.",
+            "content": MISSED_SEARCH_NUDGE,
         })
         finish_reason = None
         while finish_reason not in ("stop", "length") and rounds < MAX_TOOL_ROUNDS:
@@ -605,12 +751,12 @@ def moonshot_chat(
                 "temperature": 0.6 if temperature < 0.6 else temperature,
                 "max_tokens": max_tokens,
                 "extra_body": {"thinking": {"type": "disabled"}},
-                "tools": WEB_SEARCH_TOOL,
+                "tools": mediated_search_tool(),
             }
             if response_format:
                 kwargs["response_format"] = response_format
 
-            response = _scheduled_provider_call(client, kwargs, agent_name, phase_name)
+            response = _authority_call(client, kwargs, agent_name, phase_name)
             in_tokens, out_tokens = _usage_tokens(response)
             total_input += in_tokens
             total_output += out_tokens
@@ -623,13 +769,9 @@ def moonshot_chat(
             if finish_reason == "tool_calls":
                 history.append(message.model_dump(exclude_none=True))
                 for tool_call in message.tool_calls or []:
-                    args = json.loads(tool_call.function.arguments or "{}")
-                    history.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": tool_call.function.name,
-                        "content": json.dumps(args, ensure_ascii=False),
-                    })
+                    history.append(_tool_result_message(
+                        tool_call, search_enabled=use_web_search,
+                        agent_name=agent_name, phase_name=phase_name))
                 continue
 
             if finish_reason in {"stop", "length"}:
@@ -982,32 +1124,41 @@ def run_safe_agent(
         AGENT_STEP_CALLBACK(agent_name, phase_name)
 
     def attempt(messages: List[Dict[str, Any]], phase: str, token_limit: int) -> Dict[str, Any]:
-        attempts = 0
-        while True:
-            try:
-                return moonshot_chat(api_key, messages, temperature=0.6, use_web_search=use_web_search, response_format=response_format, max_tokens=token_limit, agent_name=agent_name, phase_name=phase)
-            except ProviderBackpressureExceeded as exc:
-                # The shared scheduler already applied its full bounded
-                # backoff budget: fail this agent with a specific provider
-                # backpressure reason instead of retrying further or
-                # consuming the semantic retry allowance.
-                payload = _api_concurrency_payload(exc, attempts + 1, agent=agent_name, phase=phase)
-                payload["api_retry_count"] = attempts
-                payload["backpressure"] = {"attempts": exc.attempts, "waited_seconds": exc.waited_seconds, "reason": "PROVIDER_BACKPRESSURE_EXCEEDED"}
+        """ONE logical model call. It runs no retry loop of its own.
+
+        It used to: a second, V1-private loop retried provider rate limits
+        with its own fixed 2s delay and its own bound, sitting on top of the
+        authority's bounded backoff. Two retry policies for one request is not
+        belt-and-braces, it is two different answers to "how many provider
+        attempts did this call make" -- and the private one paced nothing the
+        organization gate could see. Provider retries now belong to the ONE
+        authority, which re-admits every attempt through the shared gate and
+        counts each one in the ledger.
+
+        What stays here is the TRANSLATION of an exhausted provider into V1's
+        preserved agent-result shape, which the UI and the partial-failure
+        contract depend on.
+        """
+        try:
+            return moonshot_chat(api_key, messages, temperature=0.6, use_web_search=use_web_search, response_format=response_format, max_tokens=token_limit, agent_name=agent_name, phase_name=phase)
+        except ProviderBackpressureExceeded as exc:
+            # The authority already applied its full bounded backoff budget:
+            # fail this agent with a specific provider backpressure reason
+            # instead of retrying further or consuming the semantic retry
+            # allowance.
+            payload = _api_concurrency_payload(exc, exc.attempts or 1, agent=agent_name, phase=phase)
+            payload["api_retry_count"] = exc.attempts
+            payload["backpressure"] = {"attempts": exc.attempts, "waited_seconds": exc.waited_seconds, "reason": "PROVIDER_BACKPRESSURE_EXCEEDED"}
+            return payload
+        except Exception as exc:  # noqa: BLE001 - API errors must be classified for UI/tests.
+            if classify_outcome(exc).is_backpressure:
+                # Backpressure the authority chose not to pace (it can only
+                # reach here already exhausted, or from a path with no
+                # coordinator). Reported, never re-retried.
+                payload = _api_concurrency_payload(exc, 1, agent=agent_name, phase=phase)
+                payload["api_retry_count"] = 0
                 return payload
-            except Exception as exc:  # noqa: BLE001 - API errors must be classified for UI/tests.
-                if is_kimi_concurrency_error(exc):
-                    if attempts < API_CONCURRENCY_MAX_RETRIES:
-                        # Provider backpressure telemetry only — a 429 must
-                        # never increment the semantic retry counter.
-                        _notify_backpressure(agent_name, phase, "provider_concurrency_retry", API_CONCURRENCY_RETRY_DELAY_SECONDS)
-                        attempts += 1
-                        SLEEP_FN(API_CONCURRENCY_RETRY_DELAY_SECONDS)
-                        continue
-                    payload = _api_concurrency_payload(exc, attempts + 1, agent=agent_name, phase=phase)
-                    payload["api_retry_count"] = attempts
-                    return payload
-                raise
+            raise
 
     raw = attempt(prompt, phase_name, max_tokens)
     if raw.get("_error") == "API_CONCURRENCY_LIMIT":

@@ -2848,7 +2848,7 @@ def test_setup_never_merely_claims_test_user_only(db, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# N. The web-search cost statement is honest about what is NOT bounded
+# N. The web-search cost statement matches the runtime, in BOTH directions
 # ---------------------------------------------------------------------------
 
 
@@ -2866,36 +2866,90 @@ def test_the_withdrawn_hard_total_bound_is_not_claimed_anywhere():
     assert "5.50" not in readme
 
 
-def test_the_cost_statement_separates_tracked_from_untracked():
+def test_the_cost_statement_matches_the_verified_standalone_price():
+    """Search price is now a reviewed runtime input, not an unknown interface.
+
+    MILO books the higher of the two current international standalone-search
+    prices before execution, so both Basic and Pro are inside the recorded
+    $1.00 run ceiling even when a failed/empty search is conservatively
+    over-counted.
+    """
     doc = AUTHORIZATION_DOC.read_text()
-    assert "Tracked, token-derived cost — HARD-CAPPED at $1.00" in doc
-    assert "NOT CAPPED BY MILO AT ALL" in doc
-    assert "not bounded by this repository" in doc
+    assert "Recorded total cost" in doc
+    assert "≤ $1.00, hard" in doc
+    assert "Search invocations" in doc
+    assert "≤ 60 per run, hard" in doc
+    assert "max_search_invocations_per_run" in doc
+    assert "$0.002" in doc
+    assert "$0.003" in doc
+    assert "≤ $0.18 recorded" in doc
 
 
-def test_the_cost_statement_cites_the_current_official_fee_and_deprecation():
+def test_the_superseded_unbounded_claim_is_restated_not_deleted():
+    """A warning that stops being true is restated, never silently dropped.
+
+    An operator who read the old exposure statement must be able to see what
+    replaced it and why, rather than finding the paragraph simply gone.
+    """
     doc = AUTHORIZATION_DOC.read_text()
-    assert "$0.005" in doc
-    assert "2026-10-20" in doc
-    for text in (doc, (STAGE_D / "README.md").read_text()):
+    lowered = doc.lower()
+    assert "not capped by milo at all" in lowered
+    index = lowered.index("not capped by milo at all")
+    context = lowered[max(0, index - 800):index + 800]
+    assert "superseded" in context
+    assert "provider decided how many" in context
+
+
+def test_the_cost_statement_cites_current_standalone_and_legacy_fees():
+    doc = AUTHORIZATION_DOC.read_text()
+    readme = (STAGE_D / "README.md").read_text()
+    for text in (doc, readme):
+        assert "0.002" in text and "0.003" in text
         assert "0.005" in text and "2026-10-20" in text
 
 
 def test_the_cost_statement_names_the_real_runtime_behaviour():
-    """MAX_TOOL_ROUNDS bounds rounds; tool_calls per round is unbounded."""
+    """It must name the mechanism, not just assert a number.
+
+    "60" on its own is a figure an operator has to take on trust; naming the
+    dimension and the admission path is what makes it checkable.
+    """
     doc = AUTHORIZATION_DOC.read_text()
-    assert "MAX_TOOL_ROUNDS = 15" in doc
-    assert "message.tool_calls" in doc
-    assert "not bounded by the runtime" in doc
+    assert "ProviderAdapter.run_search" in doc
+    assert "before it runs" in doc
+    assert "backend/standalone_search.py" in doc
 
 
 def test_the_runtime_claim_in_the_doc_matches_the_actual_runtime():
-    """If the runtime ever gains a cap, this doc must stop saying it has none."""
+    """The doc and the runtime must agree about whether a cap exists.
+
+    This is the inverse of what this guard used to assert, for exactly the
+    same reason: a document describing an exposure the runtime no longer has
+    misleads an operator just as badly as one hiding an exposure it does.
+    """
     core = (REPO / "backend/engines/vehicle_catalog_v1/core.py").read_text()
+    policy = (REPO / "backend/runtime_policy.py").read_text()
+    authority = (REPO / "backend/provider_authority.py").read_text()
+    doc = AUTHORIZATION_DOC.read_text()
+
+    # The preserved per-call round bound is still there...
     assert "MAX_TOOL_ROUNDS = 15" in core
-    # The loop still iterates every tool call with no per-response ceiling.
-    assert core.count("for tool_call in message.tool_calls or []:") == 2
-    assert "MAX_TOOL_CALLS_PER_RESPONSE" not in core
+    # ...and the second factor, which used to be the provider's alone, is now
+    # bounded too: V1 hands the provider no search capability at all.
+    assert '"builtin_function"' not in core
+    # Every invocation goes through the one admission path...
+    assert "def run_search(" in authority
+    assert "max_search_invocations_per_run" in policy
+    # ...and the doc says so, with the number the policy really publishes.
+    from backend.runtime_policy import reviewed_first_run_policy
+
+    policy_values = reviewed_first_run_policy().values
+    ceiling = policy_values["max_search_invocations_per_run"]
+    search_price = policy_values["search_cost_per_invocation"]
+    assert f"≤ {ceiling} per run, hard" in doc, (
+        "the authorization doc states a search ceiling the policy does not")
+    assert search_price == 0.003
+    assert "$0.003 per admitted search" in doc
 
 
 def test_a_provider_wallet_ceiling_is_a_prerequisite_not_a_suggestion():

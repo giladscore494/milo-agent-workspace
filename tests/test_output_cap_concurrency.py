@@ -33,6 +33,7 @@ from backend.provider_quota import (MemoryQuotaBackend, ProviderQuotaCoordinator
                                     QuotaConfig)
 from backend.provider_scheduler import (MissingOutputCap, ProviderLimitsConfig,
                                         ProviderScheduler, estimate_admission_tokens)
+from backend.provider_authority import conservative_input_tokens
 
 
 class Usage:
@@ -303,9 +304,25 @@ def test_the_guarded_client_applies_a_server_cap_when_a_caller_declares_none():
 # 3. TPM admission uses input + the explicit cap
 # =============================================================================
 
-def test_admission_tokens_are_input_plus_the_requested_cap():
+def test_admission_tokens_are_a_bounded_input_plus_the_requested_cap():
+    """The cap is exact; the input side is a BOUND, not an average.
+
+    This assertion used to read `1_000 + 500`, i.e. `chars // 4` plus the cap.
+    That is an average for English prose and it is not a bound: a byte-level
+    BPE tokenizer can emit one token per UTF-8 byte, so the old value
+    under-counted Hebrew input by up to 8x -- against a hard, shared TPM
+    ceiling that a single under-count breaches for the whole organization.
+    """
+    import json
+
+    from backend.provider_scheduler import estimate_input_tokens
+
     messages = [{"role": "user", "content": "x" * 4_000}]
-    assert estimate_admission_tokens(messages, 500) == 1_000 + 500
+    admission = estimate_admission_tokens(messages, 500)
+    utf8_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+    assert admission >= utf8_bytes + 500, "the admission value is below the byte bound"
+    assert admission > estimate_input_tokens(messages) + 500, (
+        "admission is still using the optimistic average")
 
 
 @pytest.mark.parametrize("cap", [None, 0, -1, "lots"])
@@ -333,8 +350,13 @@ def test_the_coordinator_is_charged_input_plus_cap_not_actual_output():
                  messages=[{"role": "user", "content": "x" * 4_000}])
 
     cap = ROLE_OUTPUT_CAPS[("worker", "execute")]
-    assert charged == [1_000 + cap], (
+    messages = [{"role": "user", "content": "x" * 4_000}]
+    assert charged == [conservative_input_tokens(messages) + cap], (
         "admission was charged on generated output instead of the requested cap")
+    # The output side is the requested cap EXACTLY -- the provider admits
+    # against what was asked for, not against what it generated -- while the
+    # input side is a bound rather than the old `chars // 4` average.
+    assert charged[0] - cap > 4_000 // 4
 
 
 # =============================================================================

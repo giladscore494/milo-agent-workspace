@@ -18,6 +18,7 @@ this set wins and the older document carries an archive banner.
 | [EVIDENCE_AUTHORITY.md](EVIDENCE_AUTHORITY.md) | The canonical evidence model, the CURRENT verdict rule, V1's evidence flow and the promotion gates |
 | [BUDGETS_AND_COSTS.md](BUDGETS_AND_COSTS.md) | Hard budgets, reservations, settlement, costs |
 | [RATE_LIMITING.md](RATE_LIMITING.md) | Shared-store rate limiting (gateway + API) |
+| [PROVIDER_AUTHORITY.md](PROVIDER_AUTHORITY.md) | The one provider adapter: outcome taxonomy, retry/admission, token admission, MILO-mediated standalone search, absolute deadline |
 | [ENVIRONMENT_MATRIX.md](ENVIRONMENT_MATRIX.md) | Every production variable, classified |
 | [MIGRATIONS.md](MIGRATIONS.md) | Migration order, states, backfills |
 | [MANUAL_SERVICE_CONNECTIONS.md](MANUAL_SERVICE_CONNECTIONS.md) | The nine external service connections |

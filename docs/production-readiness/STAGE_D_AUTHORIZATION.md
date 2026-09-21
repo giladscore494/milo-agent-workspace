@@ -462,57 +462,68 @@ model call and is verified after the run against three independent views
 unrounded reservation total). Attempt 7's comparable run cost $0.252069.
 This is a real ceiling.
 
-**Provider-side `$web_search` tool fees — NOT CAPPED BY MILO AT ALL.**
-Moonshot bills the builtin `$web_search` tool per invocation, separately
-from tokens. Those charges never enter `actual_cost`, the reservation
-ledger or the daily budgets, and **no MILO cap bounds the number of
-invocations.**
+**Search invocation COUNT — now hard-capped at 60 per run.**
 
-An earlier revision of this proposal claimed a conservative total
-exposure of "≤ $5.50", derived from an assumed maximum of three search
-invocations per model response. **That claim was wrong and has been
-withdrawn.** The assumption is not established by the provider
-documentation and is not enforced by the runtime:
+The paragraphs this section used to carry are superseded and are restated
+here so the change is legible rather than silently edited away. They said
+search fees were **not capped by MILO at all**, and that was correct at the
+time: V1 reached the internet through Moonshot's builtin `$web_search`, the
+provider decided how many `tool_calls` one response asked for, and the
+per-run invocation count was `rounds × tool_calls_per_round` with only the
+first factor bounded. An earlier revision's "≤ $5.50" exposure claim rested
+on an assumed three-invocations-per-response maximum that neither the
+provider documentation established nor the runtime enforced; it was
+withdrawn, and it stays withdrawn.
 
-- `backend/engines/vehicle_catalog_v1/core.py` bounds the number of
-  tool-echo *rounds* per model call at `MAX_TOOL_ROUNDS = 15`;
-- within each round it iterates **every** entry of
-  `message.tool_calls` (`core.py:554` and `core.py:601`) and echoes each
-  one back. The number of `tool_calls` in a single response is chosen by
-  the provider and is **not bounded by the runtime**;
-- so the per-run invocation count is `rounds × tool_calls_per_round`, and
-  only the first factor has a ceiling. There is no arithmetic that turns
-  that into a dollar bound.
+**What changed.** V1 no longer offers the provider a search capability. It
+offers MILO's own `web_search` function tool, which the provider cannot
+execute, and every invocation the model asks for is admitted against
+`max_search_invocations_per_run` **before it runs**
+(`ProviderAdapter.run_search`, `backend/standalone_search.py`). The second
+factor is now bounded too: a response asking for more searches than the run
+can afford has the affordable ones performed and is stopped at the first it
+cannot pay for. The invocation count per run is therefore **≤ 60**, and that
+is a ceiling rather than a number observed afterwards.
 
-**Current official provider pricing (verify before authorizing).** Kimi's
-documentation currently states **$0.005 per legacy `$web_search` call**,
-and states that the legacy `$web_search` tool is **retired on
-2026-10-20**. Both figures are the provider's and must be re-checked
-against the console immediately before the run — this document is not a
-pricing source, and the retirement date falls close enough to this
-proposal to matter.
+Search consumption is also no longer untracked: `search_invocations` and
+`search_cost` are durable in the ExecutionUsageLedger snapshot, and recorded
+search cost reaches `actual_cost`, so `MILO_MAX_COST_PER_RUN` binds on it.
+
+**The standalone dollar price is now verified from the current official
+international Kimi pricing page.** Search Basic is **$0.002/call** and Search
+Pro is **$0.003/call** when the request succeeds with HTTP 200 and returns a
+non-empty `search_results` array. MILO deliberately books the higher
+**$0.003 for every admitted standalone search before execution**, regardless
+of endpoint or eventual result, so failures/empty responses can only
+over-count internally; a billed standalone search cannot be omitted from the
+recorded-cost ceiling. The legacy builtin remains **$0.005/call** and is
+announced for retirement on **2026-10-20**, but Production no longer uses it.
 
 | Component | Bound | Basis |
 | --- | --- | --- |
-| Token-billed (tracked) | **≤ $1.00, hard** | enforced by the budget tracker and verified three ways after the run |
-| `$web_search` tool fees (untracked) | **UNBOUNDED by MILO** | billed per invocation at the provider's stated $0.005; invocations per run are not capped by the runtime |
-| Total | **not bounded by this repository** | see the mandatory control below |
+| Recorded total cost | **≤ $1.00, hard** | `MILO_MAX_COST_PER_RUN`; includes token cost plus conservative standalone-search charges |
+| Search invocations | **≤ 60 per run, hard** | `max_search_invocations_per_run`, admitted before each individual search executes |
+| Search fee booked by MILO | **$0.003 per admitted search** | covers current official international Basic ($0.002) and Pro ($0.003) prices conservatively |
+| Search contribution at the run ceiling | **≤ $0.18 recorded** | 60 × $0.003; this amount is already inside the $1.00 recorded-cost ceiling |
 
-**Mandatory control before authorization.** Because the repository cannot
-bound the second row, the bound must come from the provider account. A
-**verified hard spending/wallet ceiling on the Moonshot account** is a
-**prerequisite** of this authorization, not an optional precaution. The
-operator must confirm the configured ceiling, and its value, before
-granting the authorization, and record it in §9.
+A provider-account spending/wallet ceiling remains a prudent independent
+operator control, but the repository no longer depends on an unknown search
+price to claim that its own recorded-cost ceiling includes search spend.
 
-**No runtime change is proposed here.** Adding an enforceable
-per-run web-search invocation cap would mean changing
-`backend/engines/vehicle_catalog_v1/core.py` — that is a runtime change
-to the preserved pipeline, it would invalidate the pinned accepted image
-digests, and it must be proposed and reviewed as its own release. It is
-deliberately **not** bundled into this authorization request. Until such
-a cap exists, the provider-account ceiling is the only enforceable bound
-on tool-fee exposure.
+**The superseded text ended "No runtime change is proposed here."** It then
+said an enforceable per-run web-search invocation cap would mean changing
+`backend/engines/vehicle_catalog_v1/core.py`, that this is a runtime change to
+the preserved pipeline, that it would invalidate the pinned accepted image
+digests, and that it must be proposed and reviewed as its own release.
+
+All of that was correct, and it is what happened. The cap exists because a
+separate reviewed release built it; it is **not** bundled into this
+authorization request, it **does** change
+`backend/engines/vehicle_catalog_v1/core.py`, and it **does** invalidate the
+pinned accepted image digests — as the banner at the top of this document
+already records for the releases before it. Stage D must be re-authorized
+against the merged release SHA, with digests rebuilt from it, before any of
+this document is relied on.
 
 ## 4. The prepared Government capture run — an invariant, never a Stage D run
 
@@ -662,11 +673,15 @@ None of these can be performed by repository automation:
 2. **Choose the Government-capture resolution** (`retire` or
    `leave-prepared`) and run step 0 with the full operator guard.
 3. **Verify a hard provider-account spending/wallet ceiling is configured**
-   on the Moonshot account, and record its value. This is a PREREQUISITE,
-   not a precaution: MILO caps tracked token cost only, and nothing in
-   this repository bounds `$web_search` tool fees (§3.6). Also re-check
-   the current per-invocation fee (officially $0.005) and the announced
-   2026-10-20 retirement of the legacy `$web_search` tool.
+   on the Moonshot account, and record its value. This remains a
+   PREREQUISITE as an independent provider-side guard. MILO now includes a
+   conservative standalone-search charge inside its own $1.00 recorded-cost
+   ceiling (§3.6), but provider pricing is external state and must still be
+   re-checked immediately before authorization: currently $0.002/call for
+   Search Basic and $0.003/call for Search Pro on the international platform.
+   Also confirm the legacy `$web_search` price ($0.005) and announced
+   2026-10-20 retirement have not changed, even though Production no longer
+   uses that route.
 4. **Run steps 1–7** from an authenticated `gcloud` shell owning
    `big-cabinet-457321-t7`. Step 3 is typed by hand: by policy no committed
    script enables an execution flag.

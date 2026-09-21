@@ -72,8 +72,12 @@ model calls, provider attempts (admitted requests, including ones that
 raised), provider failures, input/output/total tokens, estimated and
 recorded cost, semantic retries, provider backpressure events, agent steps,
 tool calls, task executions (completed / failed), search invocations and
-search cost (interface only; no search tool is registered), replans and
-correction rounds, elapsed seconds.
+search cost (V1 performs each admitted internet search itself, and
+`max_search_invocations_per_run` is taken BEFORE each one runs — see
+PROVIDER_AUTHORITY.md; the ledger books a conservative **$0.003 per admitted
+search**, the current official international Search Pro price and therefore
+an upper bound for both Search Basic at $0.002 and Search Pro at $0.003),
+replans and correction rounds, elapsed seconds.
 
 **Durable record.** `run_execution_usage` holds one row per run: the full
 ledger (`jsonb`), a `version` the database advances on every accepted

@@ -4,13 +4,14 @@ Stage 2 extracts the preserved MILO vehicle catalog pipeline into `backend/engin
 
 ## Modules
 
-- `core.py` preserves the original constants, prompts, schemas, Kimi/Moonshot `$web_search` loop, validators, discovery merge, normalizer, technical enrichment, verifier merge, deterministic Python final builder, and Hebrew summary functions.
+- `core.py` preserves the original constants, prompts, schemas, tool loop, validators, discovery merge, normalizer, technical enrichment, verifier merge, deterministic Python final builder, and Hebrew summary functions.
+  - **Search is the one deliberate departure.** The loop no longer answers a builtin `$web_search` tool call by echoing its arguments back to Moonshot (which is what asked the provider to run and bill the search). V1 offers MILO's own `web_search` function tool, and each invocation the model asks for is admitted, performed and accounted by the one provider authority before it runs — see `docs/production-readiness/PROVIDER_AUTHORITY.md`. Search still reaches the live internet and the results still return into the same conversation; only the number of searches became something MILO can refuse.
 - `engine.py` provides normal Python orchestration with `VehicleCatalogRunConfig`, lifecycle event sink callbacks, token accounting, injectable model client factory, and injectable sleep function for retry tests.
 - `adapter.py` exposes `VehicleCatalogV1Adapter` for worker usage. It accepts run input, builds configuration, invokes the engine, and returns a structured result.
 
 ## Unchanged behavior
 
-The extracted core preserves the Moonshot base URL, `kimi-k2.6`, temperature `0.6`, disabled thinking payload, maximum tool rounds, Kimi concurrency semaphore, retry policy, token budgets, discovery and technical agent definitions, technical chunk size `4`, verifier chunk size `6`, mandatory web-search enforcement, truncation/loop detection, schema repairs, fallback behavior, partial-failure policies, deterministic Python final builder, and Hebrew summary behavior.
+The extracted core preserves the Moonshot base URL, `kimi-k2.6`, temperature `0.6`, disabled thinking payload, maximum tool rounds, Kimi concurrency semaphore, retry policy, token budgets, discovery and technical agent definitions, technical chunk size `4`, verifier chunk size `6`, mandatory web-search enforcement (now naming MILO's own `web_search` tool), truncation/loop detection, schema repairs, fallback behavior, partial-failure policies, deterministic Python final builder, and Hebrew summary behavior.
 
 ## Retained limitations
 

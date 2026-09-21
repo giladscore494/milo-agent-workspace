@@ -264,7 +264,7 @@ def test_a_deadline_frees_the_local_slot_but_keeps_the_shared_permit(trickle):
 
 
 def test_the_shipped_clients_are_built_on_the_deadline_transport():
-    """Both engines' constructions, checked over the parsed code.
+    """Every construction in the repository, checked over the parsed code.
 
     A `timeout=` keyword is no longer sufficient evidence: the review showed
     that an inactivity timeout does not bound a request at all.
@@ -273,9 +273,9 @@ def test_the_shipped_clients_are_built_on_the_deadline_transport():
     import inspect
 
     from backend import budget as budget_module
-    from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend import provider_authority
 
-    for module in (budget_module, v1_core):
+    for module in (budget_module, provider_authority):
         tree = ast.parse(inspect.getsource(module))
         constructions = [node for node in ast.walk(tree)
                          if isinstance(node, ast.Call)

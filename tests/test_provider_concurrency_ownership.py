@@ -1207,14 +1207,20 @@ def test_every_retry_settles_before_it_re_admits_and_takes_a_new_lease():
 
 
 def test_the_sdk_never_retries_behind_the_settlement():
-    """A hidden SDK retry would be a second real attempt on one lease."""
+    """A hidden SDK retry would be a second real attempt on one lease.
+
+    The engines no longer construct provider clients at all -- the one
+    provider authority does, alongside the budget factory -- so those are the
+    two places this has to hold, and a THIRD construction anywhere is itself
+    the defect (see the sweep below).
+    """
     import ast
     import inspect
 
     from backend import budget as budget_module
-    from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend import provider_authority
 
-    for module in (budget_module, v1_core):
+    for module in (budget_module, provider_authority):
         tree = ast.parse(inspect.getsource(module))
         constructions = [node for node in ast.walk(tree)
                          if isinstance(node, ast.Call)
@@ -1224,6 +1230,28 @@ def test_the_sdk_never_retries_behind_the_settlement():
             retries = {kw.arg: kw.value for kw in call.keywords}.get("max_retries")
             assert isinstance(retries, ast.Constant) and retries.value == 0, (
                 f"{module.__name__} allows SDK retries behind the lease")
+
+
+def test_no_engine_constructs_a_provider_client_of_its_own():
+    """The sweep that makes the assertion above exhaustive.
+
+    V1 used to carry its own fallback construction, "for local and test
+    runs", with its own copy of the retry and timeout settings -- which is
+    exactly the kind of copy that survives a later change to the real one.
+    """
+    import ast
+    import inspect
+
+    from backend.engines.swarm_v2 import model_gateway
+    from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend.engines.vehicle_catalog_v1 import engine as v1_engine
+
+    for module in (v1_core, v1_engine, model_gateway):
+        tree = ast.parse(inspect.getsource(module))
+        assert not [node for node in ast.walk(tree)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "OpenAI"], (
+            f"{module.__name__} builds a provider client of its own again")
 
 
 def test_a_budget_refusal_never_quarantines_a_slot_it_did_not_use():
@@ -1252,34 +1280,107 @@ def test_a_budget_refusal_never_quarantines_a_slot_it_did_not_use():
 
 
 def test_the_guarded_client_is_the_only_thing_between_execute_and_the_sdk():
-    """Every paid call, in both engines, is one lambda around `create`.
+    """The paid call is ONE lambda around `create`, in ONE place.
 
     Which is what makes the settlement taxonomy exhaustive: an exception
     escaping that lambda came from the guarded client or the SDK, never from
     MILO's own post-processing of a response.
+
+    It used to be one site per engine -- two lambdas that happened to be
+    written the same way. It is now one site for both, in the adapter.
     """
     import ast
     import inspect
 
+    from backend import provider_authority
     from backend.engines.swarm_v2 import model_gateway
     from backend.engines.vehicle_catalog_v1 import core as v1_core
 
-    sites = 0
+    tree = ast.parse(inspect.getsource(provider_authority))
+    creates = [node for node in ast.walk(tree)
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+               and node.func.attr == "create"]
+    assert len(creates) == 1, f"expected exactly one provider call site, found {len(creates)}"
+    assert ast.unparse(creates[0]).endswith("chat.completions.create(**payload)")
+
+    # What `execute` is handed is the function that holds that one call. It
+    # is no longer a bare lambda, because a search reservation has to be taken
+    # and settled around EACH attempt -- so the rule the bare lambda used to
+    # enforce is enforced directly instead: everything in the callable that is
+    # not the provider call declares which side of the request it ran on, and
+    # the two behavioural tests below prove it.
+    executes = [node for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "execute"]
+    assert len(executes) == 1, f"expected exactly one execute call, found {len(executes)}"
+    assert ast.unparse(executes[0].args[0]) == "attempt"
+
+    # And neither engine has one of its own left to drift.
     for module in (model_gateway, v1_core):
-        tree = ast.parse(inspect.getsource(module))
-        for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "execute"):
-                continue
-            guarded = node.args[0]
-            assert isinstance(guarded, ast.Lambda), (
-                f"{module.__name__} passes something other than a bare lambda")
-            assert isinstance(guarded.body, ast.Call), module.__name__
-            assert ast.unparse(guarded.body).endswith("chat.completions.create(**request)") \
-                or ast.unparse(guarded.body).endswith("chat.completions.create(**kwargs)"), (
-                    f"{module.__name__} wraps more than the provider call")
-            sites += 1
-    assert sites == 2, f"expected one guarded call site per engine, found {sites}"
+        assert "chat.completions.create" not in inspect.getsource(module), (
+            f"{module.__name__} calls the provider directly again")
+
+
+def test_a_search_settlement_failure_does_not_change_what_is_known():
+    """Accounting must not turn a proven answer into an unknown outcome.
+
+    The adapter settles a search reservation inside the very callable the
+    scheduler settles the organization permit on. If that settlement refuses
+    -- a tripped search or cost ceiling -- its exception REPLACES whatever
+    the request really was, and an unmarked replacement would hold a shared
+    slot indefinitely over a request the provider demonstrably answered.
+    """
+    from types import SimpleNamespace
+
+    from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker
+    from backend.provider_authority import BUILTIN_WEB_SEARCH, ProviderAdapter
+    from backend.provider_quota import (MemoryQuotaBackend, ProviderQuotaCoordinator,
+                                        QuotaConfig)
+    from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
+
+    def searching_response(count):
+        calls = [SimpleNamespace(id=str(i), function=SimpleNamespace(
+            name=BUILTIN_WEB_SEARCH, arguments="{}")) for i in range(count)]
+        return SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            choices=[SimpleNamespace(finish_reason="tool_calls", message=SimpleNamespace(
+                content="", tool_calls=calls))])
+
+    class Client:
+        def __init__(self, response):
+            self.response = response
+            self.chat = SimpleNamespace(completions=self)
+
+        def create(self, **kwargs):
+            return self.response
+
+    backend = MemoryQuotaBackend()
+    coordinator = ProviderQuotaCoordinator(
+        backend, QuotaConfig(max_concurrency=1, max_rpm=10, max_tpm=1_000_000))
+    # A per-request maximum of 2 against a response that performs 5: the
+    # response is read to completion, and THEN settlement refuses.
+    tracker = BudgetTracker(
+        BudgetConfig(estimated_cost_per_call=0.0, max_model_calls_per_run=10,
+                     max_search_invocations_per_run=50,
+                     max_builtin_searches_per_request=2),
+        kill_switch=lambda: True)
+    adapter = ProviderAdapter(
+        ProviderScheduler(ProviderLimitsConfig(rpm_limit=None, tpm_limit=None),
+                          coordinator=coordinator),
+        tracker=tracker)
+    request = {"model": "m", "messages": [{"role": "user", "content": "hi"}],
+               "max_tokens": 100,
+               "tools": [{"type": "builtin_function",
+                          "function": {"name": BUILTIN_WEB_SEARCH}}]}
+
+    with pytest.raises(BudgetExceeded):
+        adapter.chat(request, client=Client(searching_response(5)))
+
+    lease = coordinator.try_acquire_inference()
+    assert lease is not None, (
+        "an accounting refusal after a completed response quarantined the "
+        "organization permit")
+    lease.release()
 
 
 def test_a_settlement_failure_does_not_change_what_is_known_about_a_429():
@@ -1347,17 +1448,37 @@ def test_the_profile_states_the_effective_provider_parallelism():
         "concurrency, so the number can be read as a throughput estimate")
 
 
-def test_the_profile_does_not_claim_the_search_limiter_guards_v1():
-    """V1's search happens inside a chat call, so chat quota paces it."""
+def test_the_profile_says_the_search_limiter_now_guards_the_v1_path():
+    """The inverse of what this test asserted before the mediated path.
+
+    V1's search used to happen INSIDE a chat call, through the provider's
+    builtin tool, so the standalone QPS buckets guarded nothing any engine
+    used and the profile said so. V1 now offers MILO's own function tool and
+    performs each admitted search against the standalone endpoints, so those
+    buckets pace the production path -- and the profile has to say THAT, or it
+    is a document about a system that no longer exists.
+    """
     import inspect
 
     from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend.standalone_search import request_offers_provider_executed_search
     from backend.tier2_profile import tier2_first_run_profile
 
-    # V1 really does use the built-in tool rather than the standalone endpoint.
-    assert '"builtin_function"' in inspect.getsource(v1_core)
-    assert "admit_search" not in inspect.getsource(v1_core)
+    # V1 no longer BUILDS a provider-executed tool. The check is structural
+    # rather than a text sweep: the module documents at length why the builtin
+    # was removed, and prose naming a thing is not the same as code emitting
+    # it. `tests/test_standalone_search.py` proves the same property from the
+    # requests V1 really sends.
+    assert '"builtin_function"' not in inspect.getsource(v1_core)
+    assert not request_offers_provider_executed_search(
+        {"tools": v1_core.WEB_SEARCH_TOOL})
 
     for endpoint in tier2_first_run_profile()["web_search_qps"].values():
+        # Still true, and still worth saying: these buckets never paced the
+        # builtin, which is why it could not be admitted one search at a time.
         assert endpoint["guards_the_builtin_web_search_path"] is False
-        assert endpoint["called_by_a_production_engine_today"] is False
+        assert endpoint["builtin_web_search_offered_by_a_production_engine"] is False
+        # And now the part that changed.
+        assert endpoint["called_by_a_production_engine_today"] is True
+        assert endpoint["guards_the_v1_production_search_path"] is True
+        assert endpoint["run_volume_bound_admitted_before_execution"] is True

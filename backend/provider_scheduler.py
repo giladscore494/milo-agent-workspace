@@ -1,7 +1,14 @@
 """Shared provider-side scheduling and backpressure handling for paid calls.
 
+THE MECHANISM, NOT THE CONTRACT. Engines do not talk to this module: they
+talk to :class:`backend.provider_authority.ProviderAdapter`, which owns the
+call and drives one shared :class:`ProviderScheduler`. The taxonomy, the
+token-admission rule and the search accounting all live in
+``backend.provider_authority`` too, so the classifications below are
+delegations rather than second opinions.
+
 Every provider request a Worker makes (initial calls, tool-call rounds,
-fallback attempts and summaries) must pass through one shared
+fallback attempts and summaries) passes through one shared
 :class:`ProviderScheduler` instance, which enforces:
 
 1. a concurrency ceiling (slots);
@@ -35,7 +42,29 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from backend.provider_authority import (
+    ENGINE_OVERLOADED,
+    EXCEEDED_CURRENT_QUOTA,
+    MissingOutputCap,
+    ProviderOutcome,
+    ProviderVerdict,
+    RATE_LIMIT_REACHED,
+    SEARCH_RATE_LIMIT_UNAVAILABLE,
+    SEARCH_RATE_LIMITED,
+    TokenCeilingExceeded,
+    UnknownTokenDemand,
+    admission_demand,
+    classify_outcome,
+    completion_is_proven,
+    provider_failure_code,
+    rate_limit_headers,
+    retry_after_seconds,
+)
 from backend.runtime import CancellationRequested
+
+# Conservative chars-per-token heuristic, kept ONLY for the legacy size
+# estimates below. Admission does not use it -- see `estimate_admission_tokens`.
+_CHARS_PER_TOKEN = 4
 
 
 class ProviderBackpressureExceeded(Exception):
@@ -49,27 +78,17 @@ class ProviderBackpressureExceeded(Exception):
 
 
 def is_provider_rate_limit_error(exc: Any) -> bool:
-    """Classify provider rate-limit/backpressure signals (never semantic)."""
+    """Is this provider BACKPRESSURE rather than a semantic model failure?
+
+    Delegates to the ONE taxonomy. It used to be a separate text test, and
+    that separateness was the defect: it did not recognise 503 /
+    ``engine_overloaded_error``, so the scheduler paced a 503 as backpressure
+    while the budget ledger charged the SAME event against the run's semantic
+    retry allowance. One provider event, two verdicts, two counters.
+    """
     if isinstance(exc, ProviderBackpressureExceeded):
         return True
-    text = str(exc or "").lower()
-    status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-    return (
-        status_code == 429
-        or "http 429" in text
-        or "error code: 429" in text
-        or "max organization concurrency" in text
-        or "organization max rpm" in text
-        or "rate_limit_reached_error" in text
-    )
-
-
-# The distinct Kimi 429/5xx classes, which must NOT be treated alike.
-RATE_LIMIT_REACHED = "rate_limit_reached_error"
-ENGINE_OVERLOADED = "engine_overloaded_error"
-EXCEEDED_CURRENT_QUOTA = "exceeded_current_quota_error"
-SEARCH_RATE_LIMITED = "rate_limited"
-SEARCH_RATE_LIMIT_UNAVAILABLE = "rate_limit_unavailable"
+    return classify_outcome(exc).is_backpressure
 
 
 class ProviderQuotaExceeded(Exception):
@@ -82,197 +101,38 @@ class ProviderQuotaExceeded(Exception):
 
 
 def classify_provider_error(exc: Any) -> str | None:
-    """Name WHICH Kimi failure class an exception is, or None.
+    """Name WHICH provider failure class an exception is, or None.
 
-    The classes demand different responses -- reconcile the limiter, back off,
-    or fail closed -- so collapsing them into one "rate limited" boolean is how
-    a hard quota exhaustion turns into a retry storm.
+    Kept as the historical spelling of the authority's
+    :func:`~backend.provider_authority.provider_failure_code`; the classes
+    demand different responses -- reconcile the limiter, back off, or fail
+    closed -- so collapsing them into one "rate limited" boolean is how a hard
+    quota exhaustion turns into a retry storm.
     """
-    text = str(exc or "").lower()
-    status = getattr(exc, "status_code", None) or getattr(
-        getattr(exc, "response", None), "status_code", None)
-    for marker in (EXCEEDED_CURRENT_QUOTA, ENGINE_OVERLOADED, RATE_LIMIT_REACHED,
-                   SEARCH_RATE_LIMIT_UNAVAILABLE):
-        if marker in text:
-            return marker
-    if "project qps limit exceeded" in text:
-        return SEARCH_RATE_LIMITED
-    if status == 429 or "http 429" in text or "error code: 429" in text:
-        return RATE_LIMIT_REACHED
-    if status == 503 or "overloaded" in text:
-        return ENGINE_OVERLOADED
-    if "max organization concurrency" in text or "organization max rpm" in text:
-        return RATE_LIMIT_REACHED
-    return None
-
-
-#: httpx failures that happen BEFORE a request is on the wire. For these,
-#: and only these, "it failed" really does prove "it is not running".
-_NEVER_SENT = ("ConnectError", "ConnectTimeout", "PoolTimeout",
-               "UnsupportedProtocol", "InvalidURL", "ProxyError")
-
-
-def _cause_chain(exc: BaseException):
-    """Walk ``__cause__``/``__context__`` once each: the SDK wraps transport errors."""
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        yield current
-        current = current.__cause__ or current.__context__
-
-
-def _failed_before_the_request_was_sent(exc: BaseException) -> bool:
-    return any(type(link).__name__ in _NEVER_SENT for link in _cause_chain(exc))
-
-
-def _fired_a_total_deadline(exc: BaseException) -> bool:
-    """The transport's deadline, whether raised bare or wrapped by the SDK."""
-    return any(type(link).__name__ == "ProviderRequestDeadlineExceeded"
-               for link in _cause_chain(exc))
-
-
-def _carries_a_complete_provider_response(exc: BaseException) -> bool:
-    """STRUCTURAL evidence that the provider answered.
-
-    True only for an exception that carries a response OBJECT with an integer
-    HTTP status code. That is the shape of the OpenAI SDK's ``APIStatusError``
-    family, which the SDK raises only after ``response.read()`` -- so the
-    exchange is over whatever the status says.
-
-    A bare ``status_code`` attribute with no response object is deliberately
-    NOT enough: MILO's own ``AppError`` carries one (an HTTP status for MILO's
-    API, not the provider's), and any wrapper can set one. An attribute is a
-    claim; a response is evidence.
-    """
-    response = getattr(exc, "response", None)
-    if response is None:
-        return False
-    status = getattr(response, "status_code", None)
-    if isinstance(status, bool) or not isinstance(status, int):
-        return False
-    return 100 <= status <= 599
+    return provider_failure_code(exc)
 
 
 def request_completion_is_proven(exc: BaseException | None) -> tuple[bool, str]:
     """Can MILO PROVE the request that held a permit is no longer running?
 
-    This is the question the organization concurrency ceiling actually turns
-    on, and it is not the same as "did MILO stop waiting". A permit may be
-    returned to the shared pool only on a YES, so the default here is NO: an
-    outcome this function does not recognise holds the slot rather than
-    freeing it.
-
-    Every YES is STRUCTURAL -- an object the transport or the SDK built, or a
-    statement from code that ran on one side of the request. None of them is
-    the TEXT of a message:
-
-    * the call RETURNED. The response was read to completion, so the exchange
-      is over.
-    * the exception carries a provider response OBJECT with a status code.
-      The provider produced a complete HTTP response -- 400, 429, 500 alike --
-      so the exchange is over whatever the status says. A bare
-      ``status_code`` attribute with no response object is not this. (This is what keeps ordinary
-      backpressure fast: a real 429 releases immediately and the retry
-      proceeds.)
-    * the failure happened before anything was sent -- a connect timeout, a
-      refused connection, an unusable URL. Nothing was ever started.
-    * the exception carries ``provider_request_completed``, set by code that
-      knows which side of the request it ran on (``backend.budget``).
-
-    Everything else is NO. Most importantly
-    :class:`~backend.provider_transport.ProviderRequestDeadlineExceeded` and
-    read timeouts: those mean MILO stopped waiting, and nothing in the httpx
-    or OpenAI contract turns that into the provider stopping work.
-
-    WHY :func:`classify_provider_error` IS NOT CONSULTED HERE
-    ---------------------------------------------------------
-
-    A previous revision released the slot whenever that classifier recognised
-    the exception, and review rightly called it out. The classifier matches
-    raw message TEXT -- ``rate_limit_reached_error``, ``error code: 429``,
-    ``overloaded`` -- deliberately, because for RETRY decisions a permissive
-    reading is the safe direction: treating something as backpressure only
-    costs a wait. For CONCURRENCY it is the opposite. Text is not evidence
-    that a request reached the provider, let alone that it finished, so any
-    exception whose message happened to contain "429" could free an
-    organization slot. The two questions want opposite defaults, so they are
-    answered by different code: the classifier stays permissive for retries,
-    and settlement requires structure.
+    The #102 ownership invariant, unchanged. It now lives in
+    :mod:`backend.provider_authority` so that ONE classification answers both
+    "should this be retried?" and "may this permit go back?" -- with the
+    opposite defaults each question needs -- instead of two classifiers
+    answering them separately and disagreeing.
     """
-    if exc is None:
-        return True, ""
-    # An explicit statement from code that KNOWS, because it sits on one side
-    # of the request or the other: `backend.budget` marks a budget refusal
-    # raised before the request was sent, or after the response was read.
-    declared = getattr(exc, "provider_request_completed", None)
-    if declared is not None:
-        return bool(declared), "" if declared else "PROVIDER_REQUEST_OUTCOME_DECLARED_UNKNOWN"
-    # Checked BEFORE the response test: the deadline exception never carries
-    # a response, but the order makes the intent explicit -- a fired deadline
-    # can never be talked into looking like an answer, however it is wrapped.
-    if _fired_a_total_deadline(exc):
-        return False, "PROVIDER_REQUEST_DEADLINE_EXCEEDED"
-    if _carries_a_complete_provider_response(exc):
-        return True, ""
-    if _failed_before_the_request_was_sent(exc):
-        return True, ""
-    return False, "PROVIDER_REQUEST_OUTCOME_UNKNOWN"
-
-
-def rate_limit_headers(exc: Any) -> dict[str, int]:
-    """Read the numeric X-RateLimit-* values a 429 may publish.
-
-    These are used to slow MILO down and to explain a refusal. They are NEVER
-    used to widen a ceiling: a header advertising more capacity than the
-    reviewed 80% configuration is ignored, because a capacity increase needs
-    authoritative verification and a reviewed change, not a response header.
-    """
-    headers = getattr(getattr(exc, "response", None), "headers", None)
-    if headers is None:
-        return {}
-    out: dict[str, int] = {}
-    for name, key in (("X-RateLimit-Limit", "limit"),
-                      ("X-RateLimit-Remaining", "remaining"),
-                      ("X-RateLimit-Reset", "reset")):
-        try:
-            raw = headers.get(name)
-            if raw is None:
-                raw = headers.get(name.lower())
-            if raw is None:
-                continue
-            out[key] = int(float(str(raw).strip()))
-        except Exception:  # noqa: BLE001 - unknown header containers fail closed
-            continue
-    return out
-
-
-def retry_after_seconds(exc: Any) -> float | None:
-    """Extract a valid Retry-After value (seconds) from a provider error."""
-    headers = getattr(getattr(exc, "response", None), "headers", None)
-    if headers is None:
-        return None
-    try:
-        raw = headers.get("Retry-After")
-        if raw is None:
-            raw = headers.get("retry-after")
-    except Exception:  # noqa: BLE001 - unknown header container shapes fail closed to backoff
-        return None
-    try:
-        value = float(str(raw).strip())
-    except (TypeError, ValueError):
-        return None
-    if value < 0:
-        return None
-    return value
-
-
-# Conservative chars-per-token heuristic mirroring backend.budget.
-_CHARS_PER_TOKEN = 4
+    return completion_is_proven(exc)
 
 
 def estimate_input_tokens(messages: Any) -> int:
-    """Estimate ONLY the request/input side of a provider request."""
+    """A rough AVERAGE of the request side. NOT an admission value.
+
+    Retained for callers that want a cheap size signal. It must never be used
+    to prove a ceiling: ``chars // 4`` is an average for English prose, and
+    Hebrew (this product's market) is 2 UTF-8 bytes per character, so it can
+    under-count real input several-fold. Admission uses
+    :func:`estimate_admission_tokens`, which is a BOUND.
+    """
     try:
         total_chars = sum(len(str(m.get("content", ""))) if isinstance(m, dict) else len(str(m)) for m in (messages or []))
     except TypeError:
@@ -281,34 +141,22 @@ def estimate_input_tokens(messages: Any) -> int:
 
 
 def estimate_request_tokens(messages: Any, max_tokens: Any = None) -> int:
-    """Estimate a request's total token footprint for TPM pacing."""
+    """The same average, plus a requested cap. NOT an admission value."""
     return estimate_input_tokens(messages) + max(0, int(max_tokens or 0))
 
 
-class MissingOutputCap(ValueError):
-    """A provider request reached admission without an explicit output cap."""
+def estimate_admission_tokens(messages: Any, max_completion_tokens: Any,
+                              tools: Any = None) -> int:
+    """The EXACT value the organization admits a request against.
 
-
-def estimate_admission_tokens(messages: Any, max_completion_tokens: Any) -> int:
-    """The EXACT value Kimi admits a request against, computed before the call.
-
-    Kimi's rate limiter admits on request tokens PLUS ``max_completion_tokens``
-    -- it does not wait to see how much output is actually generated. So the
-    admission value is the input estimate plus the *requested cap*, and a
-    caller that omitted a cap cannot be admitted at all: charging such a
-    request as "input only" would systematically under-count the organization
-    TPM window and is exactly how a shared ceiling gets breached.
+    One line of delegation, and the delegation is the point: the admission
+    rule is stated once, in :func:`backend.provider_authority.admission_demand`,
+    and it is a conservative BOUND rather than an average. A caller that
+    omitted an output cap cannot be admitted at all, and content whose demand
+    cannot be bounded raises :class:`UnknownTokenDemand` instead of resolving
+    to a small number.
     """
-    if max_completion_tokens is None:
-        raise MissingOutputCap(
-            "provider admission requires an explicit max_completion_tokens")
-    try:
-        cap = int(max_completion_tokens)
-    except (TypeError, ValueError):
-        raise MissingOutputCap("max_completion_tokens must be an integer") from None
-    if cap <= 0:
-        raise MissingOutputCap("max_completion_tokens must be positive")
-    return estimate_input_tokens(messages) + cap
+    return admission_demand(messages, max_completion_tokens, tools=tools).tokens
 
 
 def _positive_int(env: dict[str, str], key: str, default: int | None) -> int | None:
@@ -533,8 +381,12 @@ class ProviderScheduler:
         """Wait for RPM/TPM capacity; return seconds waited. Bounded."""
         cfg = self.config
         if cfg.tpm_limit is not None and estimated_tokens > cfg.tpm_limit:
+            # Defense in depth. The adapter already refused this with
+            # TokenCeilingExceeded before any permit was taken; a request that
+            # reaches here without having gone through it still cannot be
+            # admitted, because waiting cannot make it fit.
             raise ProviderBackpressureExceeded(
-                f"estimated request tokens {estimated_tokens} exceed the configured TPM limit {cfg.tpm_limit}",
+                f"bounded request tokens {estimated_tokens} exceed the configured TPM limit {cfg.tpm_limit}",
                 waited_seconds=waited_total,
             )
         waited = 0.0
@@ -752,23 +604,33 @@ class ProviderScheduler:
             try:
                 result = call()
             except BaseException as exc:  # noqa: BLE001 - classified below; others re-raise
-                proven_finished, settle_reason = request_completion_is_proven(exc)
+                # ONE classification answers every question this block asks:
+                # may the permit go back, is this backpressure, is it a hard
+                # quota refusal, and how long should MILO wait. There is no
+                # second opinion here and none anywhere else.
+                verdict = classify_outcome(exc)
+                proven_finished = verdict.completion_proven
+                settle_reason = verdict.unproven_reason
                 if not isinstance(exc, Exception):
                     # KeyboardInterrupt / SystemExit: not ours to classify, and
                     # the settlement above has already been decided.
                     raise
-                kind = classify_provider_error(exc)
-                if kind == EXCEEDED_CURRENT_QUOTA:
+                if verdict.is_quota_exhaustion:
                     # Not transient. Retrying cannot create quota, so this fails
                     # closed for the call instead of burning the retry budget.
                     raise ProviderQuotaExceeded(
                         "provider reported the current quota is exhausted") from exc
-                if kind is None:
+                if not verdict.is_backpressure:
+                    # A semantic/transport failure, a fired deadline, a
+                    # cancellation or an outcome MILO cannot name. None of
+                    # them is capacity, so none of them is paced here; the
+                    # engine's own bounded repair path owns what happens next.
                     raise
+                kind = verdict.provider_code
                 attempts += 1
-                delay = retry_after_seconds(exc)
+                delay = verdict.retry_after
                 if self._coordinator is not None:
-                    headers = rate_limit_headers(exc)
+                    headers = dict(verdict.headers)
                     # Reconcile the shared limiter and, when MILO believed it had
                     # headroom, surface the drift rather than hiding it: Kimi
                     # quota is shared across the organization and another

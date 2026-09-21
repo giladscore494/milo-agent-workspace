@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -249,7 +250,15 @@ def test_the_mandatory_set_is_derived_and_covers_what_the_profile_advertises():
 def test_budget_config_takes_its_mandatory_set_from_the_policy():
     assert BudgetConfig.MANDATORY_FOR_PAID_EXECUTION == tuple(
         d.name for d in dimensions_for(BUDGET) if d.mandatory_for_paid)
-    assert BudgetConfig.ENV_KEYS == {d.name: d.env_key for d in dimensions_for(BUDGET)}
+    # Only the dimensions a DEPLOYMENT may set. A budget dimension with no
+    # env key (the search volume and price bounds) is a reviewed value the
+    # runtime enforces and a deployment does not move, so it belongs in the
+    # policy and NOT in a map of environment variable names.
+    assert BudgetConfig.ENV_KEYS == {d.name: d.env_key for d in dimensions_for(BUDGET)
+                                     if d.env_key is not None}
+    assert {d.name for d in dimensions_for(BUDGET) if d.env_key is None} == {
+        "max_search_invocations_per_run", "max_builtin_searches_per_request",
+        "search_cost_per_invocation"}
 
 
 # =============================================================================
@@ -806,3 +815,41 @@ def test_the_reviewed_policy_fingerprint_is_pinned_for_the_release():
     assert policy_envelope.PINNED_POLICY_FINGERPRINT == POLICY.fingerprint(), (
         "backend/runtime_policy.py changed without re-pinning "
         "PINNED_POLICY_FINGERPRINT in scripts/release/stage-d/policy_envelope.py")
+
+
+def test_a_sub_cent_price_survives_the_canonical_document():
+    """A formatter must not round a real price away to nothing.
+
+    `search_cost_per_invocation` is $0.003. Under the two-decimal money
+    format it printed as "0.00": the canonical document published a price of
+    ZERO while the runtime charged three tenths of a cent and the prose beside
+    it said $0.003. The document is generated precisely so the two cannot
+    disagree, and a formatter that loses the value puts them back in
+    disagreement silently.
+    """
+    dimension = DIMENSIONS["search_cost_per_invocation"]
+    published = POLICY.document()["dimensions"]["search_cost_per_invocation"]
+    value = POLICY.values["search_cost_per_invocation"]
+
+    assert value > 0, "the reviewed search price is no longer positive"
+    assert float(published["value"]) == pytest.approx(value), (
+        f"the document publishes {published['value']!r} for a price of {value!r}")
+    assert float(published["reviewed"]) == pytest.approx(dimension.reviewed)
+    assert published["value"] != "0.00", "a real price was published as zero"
+
+
+def test_raising_a_sub_cent_price_moves_the_fingerprint():
+    """THE property the fingerprint exists for, at sub-cent resolution.
+
+    Two surfaces printing the same fingerprint are supposed to be provably
+    talking about the same policy. While the price was rendered to two
+    decimals, raising it from 0.000 to 0.003 left the digest untouched -- so
+    Stage D's pin still passed, and the release binding could not tell that
+    the money a run may spend had changed.
+    """
+    dimension = DIMENSIONS["search_cost_per_invocation"]
+    cheaper = replace(dimension, reviewed=0.0005)
+    dearer = replace(dimension, reviewed=0.0030)
+    assert cheaper.reviewed_text != dearer.reviewed_text, (
+        "two different sub-cent prices share one canonical spelling, so a "
+        "price change cannot move the policy fingerprint")

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from backend.provider_authority import ProviderAdapter
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
 from . import core
@@ -40,6 +41,11 @@ class VehicleCatalogEngine:
     # the pre-existing process-local behaviour for tests and local runs; the
     # worker always supplies one, and it fails closed in production.
     provider_coordinator: Any | None = None
+    # THE provider authority, shared with Swarm V2. When the worker supplies
+    # one, both engines route every request through the same adapter and the
+    # same organization gate. None builds one over this run's scheduler --
+    # the same contract, just not shared with another engine in-process.
+    provider_adapter: Any | None = None
     # R5: the trusted evidence authority. `None` builds one with no Evidence
     # Board, which still constructs, validates and decides every field's
     # evidence -- it simply does not persist it. There is no configuration in
@@ -52,6 +58,7 @@ class VehicleCatalogEngine:
     _previous_agent_step_callback: Any = field(default=None, init=False)
     _previous_retry_callback: Any = field(default=None, init=False)
     _previous_scheduler: Any = field(default=None, init=False)
+    _previous_adapter: Any = field(default=None, init=False)
     _previous_backpressure_callback: Any = field(default=None, init=False)
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
@@ -87,6 +94,7 @@ class VehicleCatalogEngine:
         self._previous_agent_step_callback = core.AGENT_STEP_CALLBACK
         self._previous_retry_callback = core.RETRY_CALLBACK
         self._previous_scheduler = core.PROVIDER_SCHEDULER
+        self._previous_adapter = core.PROVIDER_ADAPTER
         self._previous_backpressure_callback = core.PROVIDER_BACKPRESSURE_CALLBACK
         if self.model_client_factory is not None:
             core.MODEL_CLIENT_FACTORY = self.model_client_factory
@@ -95,16 +103,23 @@ class VehicleCatalogEngine:
         core.AGENT_STEP_CALLBACK = self.agent_step_callback
         core.RETRY_CALLBACK = self.retry_callback
         core.PROVIDER_BACKPRESSURE_CALLBACK = self.provider_backpressure_callback
-        # One fresh scheduler instance shared by ALL Kimi calls in this run
-        # (initial calls, tool rounds, fallbacks and summaries). Fail-closed:
-        # invalid provider limit configuration raises before any call.
-        core.PROVIDER_SCHEDULER = ProviderScheduler(
-            self.provider_limits or ProviderLimitsConfig.from_env(),
-            sleep_fn=lambda seconds: core.SLEEP_FN(seconds),
-            cancellation_checker=self.cancellation_checker,
-            backpressure_callback=core._notify_backpressure,
-            coordinator=self.provider_coordinator,
-        )
+        # ONE authority for ALL Kimi calls in this run (initial calls, tool
+        # rounds, fallbacks and summaries) -- the worker's shared adapter when
+        # there is one, so V1 and V2 are provably the same provider client,
+        # the same admission rule and the same retry policy, not two copies
+        # that happen to agree today. Fail-closed: invalid provider limit
+        # configuration raises before any call.
+        adapter = self.provider_adapter
+        if adapter is None:
+            adapter = ProviderAdapter(ProviderScheduler(
+                self.provider_limits or ProviderLimitsConfig.from_env(),
+                sleep_fn=lambda seconds: core.SLEEP_FN(seconds),
+                cancellation_checker=self.cancellation_checker,
+                backpressure_callback=core._notify_backpressure,
+                coordinator=self.provider_coordinator,
+            ))
+        core.PROVIDER_ADAPTER = adapter
+        core.PROVIDER_SCHEDULER = adapter.scheduler
 
     def _restore_injections(self) -> None:
         core.MODEL_CLIENT_FACTORY = self._previous_client_factory
@@ -112,6 +127,7 @@ class VehicleCatalogEngine:
         core.AGENT_STEP_CALLBACK = self._previous_agent_step_callback
         core.RETRY_CALLBACK = self._previous_retry_callback
         core.PROVIDER_SCHEDULER = self._previous_scheduler
+        core.PROVIDER_ADAPTER = self._previous_adapter
         core.PROVIDER_BACKPRESSURE_CALLBACK = self._previous_backpressure_callback
 
     def run(self, config: VehicleCatalogRunConfig) -> dict[str, Any]:

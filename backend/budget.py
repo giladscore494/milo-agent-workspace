@@ -32,7 +32,8 @@ from backend.execution_usage import (LEDGER_AMOUNTS, LEDGER_COUNTERS, LEDGER_SCH
                                      LEDGER_SNAPSHOT_FIELDS, PUBLIC_USAGE_FIELDS,
                                      merge_usage_snapshots, public_usage_projection,
                                      validate_usage_snapshot)
-from backend.provider_scheduler import is_provider_rate_limit_error
+from backend.provider_authority import (ProviderOutcome, ProviderVerdict,
+                                        classify_outcome)
 from backend.runtime import CancellationRequested
 from backend.runtime_policy import BUDGET as _POLICY_BUDGET_SURFACE
 from backend.runtime_policy import dimensions_for as _policy_dimensions_for
@@ -122,6 +123,19 @@ class BudgetConfig:
     daily_user_budget: float | None = None
     daily_project_budget: float | None = None
     estimated_cost_per_call: float = 0.05
+    # --- search volume and price ---------------------------------------
+    # Bounded by DEFAULT, unlike the ceilings above. Those are deliberately
+    # None-until-configured because a paid deployment must state them
+    # explicitly; search had no bound of any kind, in any posture, so the
+    # safe default here is the reviewed number rather than "unlimited".
+    max_search_invocations_per_run: int | None = 60
+    #: The MAXIMUM searches one provider request may perform. Admission
+    #: reserves this much before the request is dispatched, so a request is
+    #: only ever sent when the run can pay for the worst case it could spend.
+    max_builtin_searches_per_request: int = 4
+    #: The price interface. 0.00 until a verified provider price exists; a
+    #: configured value is charged to the run's recorded cost like any spend.
+    search_cost_per_invocation: float = 0.0
 
     # DERIVED from the canonical runtime policy, never restated here.
     #
@@ -137,8 +151,13 @@ class BudgetConfig:
     # `MANDATORY_FOR_RUN_CREATION` is the separate, smaller floor for
     # UNPAID run creation, which spends nothing: it is the historical
     # five-value set and is deliberately not widened here.
+    #: Only the dimensions a DEPLOYMENT may set. A policy dimension with no
+    #: env key is not absent from the envelope -- it is a reviewed value that
+    #: a deployment does not get to move, and it must not appear here as a
+    #: name mapped to nothing.
     ENV_KEYS = {dimension.name: dimension.env_key
-                for dimension in _policy_budget_dimensions()}
+                for dimension in _policy_budget_dimensions()
+                if dimension.env_key is not None}
     MANDATORY_FOR_PAID_EXECUTION = tuple(
         dimension.name for dimension in _policy_budget_dimensions()
         if dimension.mandatory_for_paid)
@@ -277,6 +296,9 @@ class BudgetTracker:
     output_tokens: int = 0
     reserved_input_tokens: int = 0
     reserved_output_tokens: int = 0
+    #: In-flight search capacity held for requests that have not settled yet.
+    #: Counted against the ceiling alongside what has already been spent.
+    reserved_search_invocations: int = 0
     estimated_cost: float = 0.0
     actual_cost: float = 0.0
     retries: int = 0
@@ -311,6 +333,12 @@ class BudgetTracker:
     #: flight. Popped by settle_call, so a reservation is released exactly once
     #: and by the amount that was actually taken.
     _open_reservations: dict[int, tuple[int, int]] = field(default_factory=dict, init=False)
+    #: search reservations still in flight, keyed by their own sequence.
+    #: IN-FLIGHT, never durable: like the token reservations, a reservation
+    #: belongs to the process that took it, so a resumed worker starts with
+    #: none rather than inheriting a phantom hold from a dead one.
+    _open_search_reservations: dict[int, int] = field(default_factory=dict, init=False)
+    _search_seq: int = field(default=0, init=False)
 
     def __post_init__(self):
         import threading
@@ -399,8 +427,10 @@ class BudgetTracker:
             raise ValueError("budget snapshot contains unknown fields")
         parsed = validate_usage_snapshot(snapshot)
         with self._lock:
-            if any(getattr(self, name) for name in (*LEDGER_COUNTERS, *LEDGER_AMOUNTS)
-                   if name != "elapsed_seconds") or self.reserved_input_tokens or self.reserved_output_tokens:
+            if (any(getattr(self, name) for name in (*LEDGER_COUNTERS, *LEDGER_AMOUNTS)
+                    if name != "elapsed_seconds")
+                    or self.reserved_input_tokens or self.reserved_output_tokens
+                    or self.reserved_search_invocations):
                 raise ValueError("budget usage can only be restored into a fresh tracker")
             for name in LEDGER_COUNTERS:
                 setattr(self, name, int(parsed.get(name, 0)))
@@ -665,19 +695,140 @@ class BudgetTracker:
                 return
             self._record()
 
-    def record_search(self, cost: float = 0.0) -> None:
-        """One search invocation, with its recorded or estimated cost.
+    def reserve_search(self, count: int = 1) -> int:
+        """Hold capacity for the MAXIMUM searches a request could perform.
 
-        The interface exists so a search tool can be accounted for the day
-        one is registered; no production code path calls it today.
+        A CHECK is not a ceiling, and that is the whole reason this is a
+        reservation. The first version of this gate admitted a
+        search-enabled request against ONE invocation while the response it
+        would produce can legitimately carry several: with one invocation
+        left, the request was admitted, the provider ran and billed two
+        searches, and MILO discovered it afterwards. Post-facto detection is
+        not a ceiling -- the money is already spent by the time it fires.
+
+        So a caller reserves the most the request could possibly spend
+        BEFORE dispatch, and settlement reconciles that to what really
+        happened. A reservation also makes the ceiling hold across concurrent
+        workers, which a bare read-then-check never could: two requests could
+        both see the same single remaining invocation and both be admitted.
+
+        Returns the reservation's sequence number, which MUST be passed back
+        to :meth:`settle_search` so each caller releases its own.
         """
-        amount = float(cost or 0.0)
-        if amount < 0:
+        wanted = max(0, int(count or 0))
+        if wanted == 0:
+            return 0
+        with self._lock:
+            if self.stop is not None:
+                raise self.stop
+            cfg = self.config
+            committed = self.search_invocations + self.reserved_search_invocations
+            if (cfg.max_search_invocations_per_run is not None
+                    and committed + wanted > cfg.max_search_invocations_per_run):
+                raise self._reject("SEARCH_LIMIT_REACHED", "search invocation limit reached",
+                                   "budget_exhausted", "budget_exhausted")
+            self._search_seq += 1
+            self.reserved_search_invocations += wanted
+            self._open_search_reservations[self._search_seq] = wanted
+            return self._search_seq
+
+    def settle_search(self, reservation_seq: int, actual: int | None = None,
+                      cost: float | None = None, *,
+                      pre_execution: bool = False) -> None:
+        """Release a search reservation and record what was really spent.
+
+        ``actual`` is the number of searches the provider really performed.
+        ``None`` means MILO CANNOT TELL -- an attempt that raised, or a
+        response whose shape does not let the searches be counted -- and that
+        fails closed: the whole reservation is charged. An unknown amount of
+        provider spend is not zero spend, and resolving it to zero is how a
+        ceiling stops being one.
+
+        Releasing pops the record, so a second settlement is a no-op rather
+        than a refund: an over-released ceiling is indistinguishable from no
+        ceiling. Charging ``actual`` and releasing the hold happen together,
+        so nothing is counted twice.
+
+        Charging MORE than was reserved means the request performed more
+        searches than the reviewed per-request maximum. The excess is still
+        recorded -- it really happened and was really billed -- and the run
+        then stops: a per-request bound that can be exceeded without
+        consequence is a comment, not a bound.
+
+        ``pre_execution`` is used ONLY by MILO-mediated standalone search,
+        where the per-invocation price is known before the HTTP request is
+        sent. In that mode a fixed-cost overage releases the in-flight hold
+        and stops the run WITHOUT incrementing search usage, because no search
+        has happened yet. Provider-executed residual builtin search must leave
+        this False: by settlement time that work already happened and must be
+        recorded truthfully even when it pushes the run over a cap.
+        """
+        cfg = self.config
+        unit = float(cfg.search_cost_per_invocation if cost is None else cost)
+        if unit < 0:
             raise ValueError("search cost cannot be negative")
         with self._lock:
-            self.search_invocations += 1
-            self.search_cost += amount
+            held = self._open_search_reservations.get(int(reservation_seq))
+            if held is None:
+                return
+            charged = held if actual is None else max(0, int(actual))
+            amount = unit * charged
+
+            # Standalone search has a FIXED, server-owned price and has not
+            # executed yet. Refuse atomically before turning the reservation
+            # into durable usage if that known charge cannot fit. This keeps
+            # the hard cost gate pre-execution without inventing a search in
+            # the durable ledger that never happened.
+            if (pre_execution and charged
+                    and cfg.max_cost_per_run is not None
+                    and self.actual_cost + amount > cfg.max_cost_per_run):
+                self._open_search_reservations.pop(int(reservation_seq), None)
+                self.reserved_search_invocations = max(
+                    0, self.reserved_search_invocations - held)
+                raise self._stop(
+                    "COST_LIMIT_REACHED",
+                    "recorded cost budget cannot admit another search",
+                    "budget_exhausted", "budget_exhausted")
+
+            self._open_search_reservations.pop(int(reservation_seq), None)
+            self.reserved_search_invocations = max(
+                0, self.reserved_search_invocations - held)
+            if charged:
+                self.search_invocations += charged
+                self.search_cost += amount
+                if amount:
+                    self.actual_cost += amount
+            # NO per-call `run_usage_ledger` row. That relation's `decision`
+            # vocabulary is closed and enforced by a CHECK constraint
+            # (reserved/settled/rejected/overage/released), and it has no
+            # search columns, so a "search" row would be refused by the
+            # database and would carry nothing if it were not. Search
+            # consumption becomes durable the same way every other ledger
+            # dimension does: `_record()` writes the whole ExecutionUsageLedger
+            # snapshot, whose jsonb already carries `search_invocations` and
+            # `search_cost` and merges them component-wise.
             self._record()
+            if charged > held:
+                raise self._stop(
+                    "SEARCH_MULTIPLICITY_EXCEEDED",
+                    "a provider request performed more searches than the reviewed maximum",
+                    "budget_exhausted", "budget_exhausted")
+            if (cfg.max_search_invocations_per_run is not None
+                    and self.search_invocations > cfg.max_search_invocations_per_run):
+                raise self._reject("SEARCH_LIMIT_EXCEEDED", "search invocation limit exceeded",
+                                   "budget_exhausted", "budget_exhausted")
+            if cfg.max_cost_per_run is not None and self.actual_cost > cfg.max_cost_per_run:
+                raise self._stop("COST_LIMIT_EXCEEDED", "actual cost limit exceeded",
+                                 "budget_exhausted", "budget_exhausted")
+
+    def record_search(self, cost: float | None = None) -> None:
+        """ONE search that has definitely happened, reserved and settled.
+
+        The standalone-search path, and the historical spelling. It is
+        expressed in terms of the reservation mechanism rather than beside
+        it, so there is exactly one way search capacity is consumed.
+        """
+        self.settle_search(self.reserve_search(1), actual=1, cost=cost)
 
     def record_replan(self, *, correction: bool = False) -> None:
         """One Commander replan was ACCEPTED; a correction round is one too."""
@@ -711,6 +862,25 @@ class BudgetTracker:
         with self._lock:
             self.provider_backpressure_events += 1
             self._record()
+
+
+#: The ledger's own name for why a call settled without a response. One
+#: mapping, derived from the ONE taxonomy, so the durable record and the
+#: scheduler cannot describe the same attempt differently.
+_SETTLEMENT_REASONS = {
+    ProviderOutcome.RATE_LIMIT: "PROVIDER_RATE_LIMITED",
+    ProviderOutcome.RETRYABLE_FAILURE: "PROVIDER_EXCEPTION",
+    ProviderOutcome.NON_RETRYABLE_FAILURE: "PROVIDER_REFUSED",
+    ProviderOutcome.TIMEOUT: "PROVIDER_DEADLINE_EXCEEDED",
+    ProviderOutcome.CANCELLATION: "RUN_CANCELLED",
+    ProviderOutcome.UNKNOWN: "PROVIDER_OUTCOME_UNKNOWN",
+}
+
+
+def _settlement_reason(verdict: ProviderVerdict) -> str:
+    if verdict.is_quota_exhaustion:
+        return "PROVIDER_QUOTA_EXHAUSTED"
+    return _SETTLEMENT_REASONS.get(verdict.outcome, "PROVIDER_EXCEPTION")
 
 
 class _GuardedCompletions:
@@ -749,11 +919,18 @@ class _GuardedCompletions:
         try:
             response = self._inner.create(**kwargs)
         except Exception as exc:
-            rate_limited = is_provider_rate_limit_error(exc)
+            # THE SAME classification the scheduler settles on. It used to be
+            # a different one, and the difference was a real defect: a 503
+            # (`engine_overloaded_error`) was backpressure to the scheduler,
+            # which paced and retried it, and a SEMANTIC failure to this
+            # ledger, which charged it against `max_retries`. One provider
+            # event was counted twice, and a run could die at
+            # RETRY_LIMIT_REACHED without any model having misbehaved.
+            verdict = classify_outcome(exc)
             try:
                 self._tracker.settle_call(
                     estimated_input, reserved_output, 0, 0, 0.0, status="released",
-                    rejection_reason="PROVIDER_RATE_LIMITED" if rate_limited else "PROVIDER_EXCEPTION",
+                    rejection_reason=_settlement_reason(verdict),
                     call_seq=call_seq,
                 )
             except BaseException as settlement:
@@ -763,17 +940,22 @@ class _GuardedCompletions:
                 # known about the request, so the original verdict is carried
                 # across -- otherwise an ordinary 429 could start holding a
                 # shared slot until a human reclaimed it.
-                from backend.provider_scheduler import request_completion_is_proven
-
-                settlement.provider_request_completed = request_completion_is_proven(exc)[0]
+                settlement.provider_request_completed = verdict.completion_proven
                 raise
-            if rate_limited:
-                # A 429 is provider backpressure, not a semantic model
-                # failure: it must never consume the semantic retry
-                # allowance. The shared provider scheduler bounds it.
+            if verdict.is_backpressure:
+                # Provider backpressure -- 429 AND 503 alike -- is a
+                # scheduling outcome, never a semantic model failure: it must
+                # never consume the semantic retry allowance. The shared
+                # provider scheduler bounds it.
                 self._tracker.record_provider_backpressure()
-            else:
+            elif verdict.consumes_semantic_retry:
                 self._tracker.record_retry()
+            # Everything else -- a fired deadline, a cancellation, a hard
+            # quota refusal, an outcome MILO cannot name -- is recorded as a
+            # provider failure by `settle_call` above and charged to no
+            # semantic allowance. A counter that fills up because the account
+            # is out of money, or because MILO stopped waiting, tells nobody
+            # anything true.
             raise
         usage = getattr(response, "usage", None)
         provider_cost = getattr(usage, "cost", None) or getattr(usage, "total_cost", None) or getattr(response, "cost", None)

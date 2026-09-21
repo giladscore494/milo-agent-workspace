@@ -89,28 +89,44 @@ When an authoritative limit `L` is verified for an endpoint:
 endpoint remains unverified, so the number cannot drift upward by
 configuration alone.
 
-### What the standalone limiter does NOT cover: the built-in `$web_search`
+### The standalone limiter now gates the production search path
 
 `admit_search` gates the **standalone** `/v1/tools/search` and
-`/v1/tools/search_pro` endpoints. **No production engine calls either endpoint
-today.** What V1 actually uses is the provider-side built-in `$web_search`
-tool (`builtin_function` in a Chat Completions request,
-`vehicle_catalog_v1/core.py`), which the standalone limiter never sees.
+`/v1/tools/search_pro` endpoints, and **that is the path production takes.**
+V1 offers a model MILO's own `web_search` function tool and performs each
+admitted Production research invocation itself against Web Search Pro
+(`/v1/tools/search_pro`). The Basic endpoint remains supported by the shared
+transport/authority for bounded callers that explicitly select it, but V1
+does not silently downgrade research to snippets-only Basic search.
+(`backend/standalone_search.py`, `ProviderAdapter.run_search`). The first-run
+profile records this as `called_by_a_production_engine_today: true` and
+`guards_the_v1_production_search_path: true`.
 
-Whether a built-in `$web_search` invocation draws on the same Web Search QPS
-quota as the standalone endpoints, on a separate quota, or on none, was **not
-recoverable** from the official documentation reachable during this research.
-It is recorded as **UNVERIFIED** (the first-run profile carries
-`guards_the_builtin_web_search_path: false`), and this document makes no claim
-that the 1 QPS gate protects the built-in path. What does bound it: every chat
-request that may invoke it is admitted against organization concurrency, RPM
-and TPM (at most two simultaneous V1 calls under the first-run profile, §9),
-and a provider refusal of the built-in search surfaces as a chat-level 429,
-which the scheduler treats as bounded backpressure. That is the honest scope
-of the guarantee. It is not judged a blocker for the first-run scope, because
-the first run does not exceed the pacing the last observed run
-(`3772fc84`, 0 backpressure events) already exercised; it *is* a gap to close
-before any wider fan-out.
+This closed the gap this section used to describe. V1 previously used the
+provider-side built-in `$web_search` (`builtin_function` in a Chat Completions
+request), which the standalone limiter never saw and whose multiplicity the
+provider alone decided — so a run's search volume could only be observed
+after the money was spent. No production engine offers the built-in any more
+(`builtin_web_search_offered_by_a_production_engine: false`); the provider
+authority keeps accounting for one if any caller ever sends it.
+
+One provider-capacity fact remains **UNVERIFIED** and is not claimed:
+
+- the exact Tier 2 numeric Web Search QPS (the conservative 1 QPS fallback
+  stands, and `QuotaConfig` refuses a configured value above it).
+
+The standalone **wire contract is now pinned from current official Kimi API
+documentation**: `POST /v1/tools/search` and `/v1/tools/search_pro` accept
+`text_query`, `limit` (1..20) and `timeout_seconds` (1..60), and return the
+result list as `search_results`. MILO sends explicit server-owned bounds
+(`limit=8`, `timeout_seconds=30`) instead of provider defaults. The transport
+still reads responses defensively and never invents data from an unknown
+shape. Live endpoint reachability/authentication remains a release/probe
+concern; it is not a reason to describe the documented schema as unknown.
+
+What bounds search volume regardless of either: every invocation is admitted
+against `max_search_invocations_per_run` **before** it executes, so the run
+ceiling holds whatever the endpoints turn out to charge or pace.
 
 ## 5. No assumed burst allowance
 
