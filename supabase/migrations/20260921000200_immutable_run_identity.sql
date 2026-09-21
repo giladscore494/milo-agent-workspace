@@ -66,7 +66,7 @@ alter table public.runs add column if not exists run_identity jsonb;
 comment on column public.runs.run_identity is
   'Immutable identity established before execution (backend/run_identity.py): '
   'workflow key, engine version, runtime policy version/fingerprint, release '
-  'SHA and event-registry version. Set once, never rewritten. NULL only for '
+  'SHA plus event-registry version/fingerprint. Set once, never rewritten. NULL only for '
   'runs created before this column existed; later retrofit is forbidden.';
 
 -- A stored identity must at least be an object naming the run it belongs to.
@@ -87,7 +87,27 @@ alter table public.runs add constraint runs_run_identity_shape_check check (
     jsonb_typeof(run_identity) = 'object'
     and run_identity->>'identity_version' = 'milo-run-identity/1'
     and nullif(run_identity->>'policy_version', '') is not null
-    and (run_identity->>'policy_fingerprint') ~ '^[0-9a-f]{64}
+    and (run_identity->>'policy_fingerprint') ~ '^[0-9a-f]{64}$'
+    and nullif(run_identity->>'event_registry_version', '') is not null
+    and (run_identity->>'event_registry_fingerprint') ~ '^[0-9a-f]{64}$'
+    and run_identity ? 'release_sha'
+    and (
+      run_identity->>'release_sha' = ''
+      or (run_identity->>'release_sha') ~ '^[0-9a-f]{40}$'
+    )
+    and (
+      (run_identity->>'workflow_key' = 'vehicle_catalog_v1'
+       and run_identity->>'engine_version' = 'vehicle_catalog_v1.stage3')
+      or
+      (run_identity->>'workflow_key' = 'swarm_v2'
+       and run_identity->>'engine_version' = 'swarm_v2.1')
+      or
+      (run_identity->>'workflow_key' = 'operator_capture'
+       and run_identity->>'engine_version' = 'operator_capture.1')
+    )
+    and (run_identity->>'run_id')::uuid = id
+  )
+) not valid;
 
 do $$
 begin
