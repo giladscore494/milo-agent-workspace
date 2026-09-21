@@ -12,16 +12,33 @@ from backend.engines.vehicle_catalog_v1.adapter import VehicleCatalogV1Adapter
 
 @pytest.fixture(scope="module")
 def legacy_app():
-    sys.modules.setdefault("streamlit", types.SimpleNamespace())
-    if "openai" not in sys.modules:
-        sys.modules["openai"] = types.SimpleNamespace(OpenAI=object)
+    """The immutable Streamlit reference, imported for parity assertions.
+
+    The stubs it needs are REMOVED again afterwards. Leaving them installed
+    made `openai` resolve to `SimpleNamespace(OpenAI=object)` for the rest of
+    the session, so any later test that really builds a provider client got
+    `TypeError: object() takes no arguments` -- a failure with nothing to do
+    with the test reporting it, and one that appears or vanishes with the
+    selection, because the stub is only installed when nothing imported the
+    real package first.
+    """
+    installed: list[str] = []
+    for name, stub in (("streamlit", types.SimpleNamespace()),
+                       ("openai", types.SimpleNamespace(OpenAI=object))):
+        if name not in sys.modules:
+            sys.modules[name] = stub
+            installed.append(name)
     path = Path("legacy/milo-streamlit-v1/app.py")
     spec = importlib.util.spec_from_file_location("legacy_milo_app_for_parity", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    return module
+    try:
+        yield module
+    finally:
+        for name in (*installed, spec.name):
+            sys.modules.pop(name, None)
 
 
 def test_preserved_numeric_limits_and_model_settings():
