@@ -533,6 +533,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # =============================================================
         from backend.provider_authority import ProviderAdapter
         from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
+        from backend.standalone_search import build_default_search_executor
 
         provider_adapter = None
         if engine is None and engine_mode != "mock":
@@ -542,12 +543,22 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     cancellation_checker=is_cancelled,
                     backpressure_callback=record_provider_backpressure,
                     coordinator=provider_coordinator),
-                # The run's ledger, so a search the provider performs inside
-                # a chat call is counted and priced like any other spend.
+                # The run's ledger, so every search is counted and priced like
+                # any other spend -- whether it is one MILO performs itself or
+                # (for any caller that still offers it) one the provider runs
+                # inside a chat call.
                 tracker=tracker,
                 client_factory=build_guarded_client_factory(
                     tracker, request_deadline_seconds=provider_request_deadline),
-                request_deadline_seconds=provider_request_deadline)
+                request_deadline_seconds=provider_request_deadline,
+                # THE internet capability, and the only one an engine has.
+                # It performs exactly one search per admitted invocation and
+                # is reached only through `ProviderAdapter.run_search`, which
+                # takes the run's search allowance and the endpoint's QPS
+                # bucket BEFORE calling it. Built here, on the worker's own
+                # deadline, so search shares the request bound chat has.
+                search_executor=build_default_search_executor(
+                    deadline_seconds=provider_request_deadline))
 
         if engine is None and engine_registry is None and engine_mode == "mock":
             from backend.worker.mock_engine import MockLifecycleEngine

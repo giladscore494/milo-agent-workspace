@@ -197,23 +197,32 @@ def _search_profile() -> dict[str, Any]:
                            "recoverable from the official tier table and is not invented"),
             "bucket": "independent per endpoint; shared by V1 and V2",
             "consumes_chat_quota": False,
-            # No production engine calls `admit_search` today. V1 searches
-            # through the BUILT-IN `$web_search` tool inside a Chat Completions
-            # request (vehicle_catalog_v1/core.py WEB_SEARCH_TOOL), so that
-            # search runs server-side INSIDE a chat call and is paced by the
-            # chat concurrency/RPM/TPM gate. These limiters guard the
-            # standalone /v1/tools/* endpoints, for whenever something calls
-            # them -- they are not what guards the path V1 actually uses.
+            # These limiters guard the standalone /v1/tools/* endpoints, and
+            # that IS the production search path now: V1 offers a model MILO's
+            # own `web_search` function tool, and every invocation the model
+            # asks for is admitted, performed and accounted by the one
+            # provider authority (`ProviderAdapter.run_search`).
+            #
+            # They still do not guard the provider-executed builtin
+            # `$web_search`, which runs inside a chat call and is paced by the
+            # chat gate. Nothing in production offers it any more; the
+            # statement is kept because the authority still accounts for one
+            # if any caller ever sends it.
             "guards_the_builtin_web_search_path": False,
             "builtin_web_search_is_paced_by": "the chat concurrency/RPM/TPM gate",
-            "called_by_a_production_engine_today": False,
+            "builtin_web_search_offered_by_a_production_engine": False,
+            "called_by_a_production_engine_today": True,
+            "guards_the_v1_production_search_path": True,
             # PACING is the provider's bucket; VOLUME and PRICE are the run's,
-            # and they now exist for both routes. Every search -- builtin or
-            # standalone -- is counted into the ExecutionUsageLedger by the
-            # one provider authority and bounded by the runtime policy's
+            # and they exist for both routes. Every search -- mediated or
+            # builtin -- is counted into the ExecutionUsageLedger by the one
+            # provider authority and bounded by the runtime policy's
             # `max_search_invocations_per_run`, which is what the QPS buckets
-            # never said anything about.
+            # never said anything about. On the mediated path that bound is
+            # taken BEFORE each individual search executes, so it is a ceiling
+            # the run cannot cross rather than a total it can only report.
             "accounted_in_run_ledger": True,
+            "run_volume_bound_admitted_before_execution": True,
             "run_volume_bound": _P["max_search_invocations_per_run"],
             "per_request_bound": _P["max_builtin_searches_per_request"],
             "run_price_per_invocation": _P["search_cost_per_invocation"],

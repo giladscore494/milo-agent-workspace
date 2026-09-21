@@ -43,7 +43,10 @@ import json
 import threading
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from backend.standalone_search import SearchOutcome
 
 from backend.runtime import CancellationRequested
 
@@ -678,12 +681,14 @@ class ProviderAdapter:
     def __init__(self, scheduler: Any, *, tracker: Any = None,
                  client_factory: Callable[[str, str], Any] | None = None,
                  request_deadline_seconds: float | None = None,
-                 token_counter: TokenCounter | None = None) -> None:
+                 token_counter: TokenCounter | None = None,
+                 search_executor: Callable[..., Any] | None = None) -> None:
         self._scheduler = scheduler
         self._tracker = tracker
         self._client_factory = client_factory
         self._request_deadline_seconds = request_deadline_seconds
         self._token_counter = token_counter
+        self._search_executor = search_executor
         self._clients: dict[tuple[str, str], Any] = {}
         self._client_lock = threading.Lock()
 
@@ -703,6 +708,18 @@ class ProviderAdapter:
     @property
     def tracker(self) -> Any:
         return self._tracker
+
+    @property
+    def search_executor(self) -> Callable[..., Any] | None:
+        """The transport ONE admitted search is performed through, if any.
+
+        ``None`` means this process has no standalone search configured, and
+        `run_search` then refuses BEFORE admission rather than debiting the
+        run for a search it could not perform -- and, far more importantly,
+        rather than falling back to a provider-executed capability whose
+        multiplicity MILO cannot admit.
+        """
+        return self._search_executor
 
     # -- the client, built in ONE place ----------------------------------
     def default_client_factory(self, api_key: str, base_url: str) -> Any:
@@ -901,6 +918,14 @@ class ProviderAdapter:
         The QPS bucket is the provider's; the invocation and cost counters are
         the run's. Both are consulted, in that order, so a search is never
         performed by a run that has no search allowance left.
+
+        This is the ADMISSION half, and it completes BEFORE the search runs
+        (see `run_search`). The charge is committed here on purpose: a
+        settlement that waited for the search to come back could be lost to a
+        crash between the request and the reply, and a performed search that
+        no longer appears in the ledger is a refund by another name. Charging
+        first can only ever over-report -- the fail-closed direction, and the
+        same one an unknown builtin count takes.
         """
         tracker = self._tracker
         reserve = getattr(tracker, "reserve_search", None) if tracker else None
@@ -916,6 +941,74 @@ class ProviderAdapter:
         self._settle_searches(reservation, 1)
         return waited
 
+    def run_search(self, query: Any, *, endpoint: str = SEARCH_BASIC,
+                   agent: str = "", phase: str = "",
+                   executor: Callable[..., Any] | None = None,
+                   max_wait_seconds: float | None = None) -> "SearchOutcome":
+        """Admit, perform and account ONE mediated standalone search.
+
+        This is the whole of MILO's internet capability for an engine that
+        does not hand the provider a builtin search tool, and the ORDER is
+        the reason it is a ceiling rather than a report:
+
+        1. the query and the transport are resolved -- both are decidable
+           without spending anything, so a malformed ask or an unconfigured
+           deployment costs the run nothing;
+        2. the run's own `max_search_invocations_per_run` allowance is taken;
+        3. the endpoint's QPS bucket is taken;
+        4. the invocation and its cost are charged, durably;
+        5. and only then is exactly ONE search performed.
+
+        Steps 2-4 are `search` above. Nothing between here and the provider
+        can multiply step 5: one call to this method is one search, and the
+        next one re-enters at step 1. A model that wants to research more asks
+        again and is admitted again -- or refused, with nothing performed.
+
+        A transport failure after step 4 is NOT refunded. MILO cannot know
+        whether the provider ran the search before the failure, and an unknown
+        amount of provider spend is not an absence of spend; the outcome
+        reports the failure to the caller with `admitted` set, so the model is
+        told the search produced nothing rather than being handed invented
+        results.
+        """
+        from backend.standalone_search import (SearchOutcome, SearchUnavailable,
+                                               default_search_executor,
+                                               normalize_query, normalize_results)
+
+        # -- decided before anything is spent -------------------------------
+        text = normalize_query(query)
+        execute = executor or self._search_executor or default_search_executor()
+        if not callable(execute):
+            raise SearchUnavailable(
+                "no standalone search transport is configured for this process")
+        ready = getattr(execute, "available", None)
+        if callable(ready) and not ready():
+            raise SearchUnavailable(
+                "the configured standalone search transport is not usable")
+
+        # -- admitted, paced and charged, in that order ---------------------
+        self.search(endpoint, agent=agent, phase=phase,
+                    max_wait_seconds=max_wait_seconds)
+
+        # -- exactly one search ---------------------------------------------
+        try:
+            results = execute(text, endpoint=endpoint)
+        except BaseException as exc:
+            # A run-level stop or a cancellation is never a search result: it
+            # is the run ending, and it must not be reported to a model as an
+            # empty search.
+            from backend.budget import BudgetExceeded
+            from backend.runtime import CancellationRequested
+
+            if isinstance(exc, (BudgetExceeded, CancellationRequested)):
+                raise
+            if not isinstance(exc, Exception):
+                raise
+            return SearchOutcome(query=text, endpoint=endpoint, admitted=True,
+                                 error=f"search failed: {type(exc).__name__}")
+        return SearchOutcome(query=text, endpoint=endpoint, admitted=True,
+                             results=normalize_results(results))
+
 
 def build_provider_adapter(limits: Any = None, *, tracker: Any = None,
                            coordinator: Any = None,
@@ -926,6 +1019,7 @@ def build_provider_adapter(limits: Any = None, *, tracker: Any = None,
                            cancellation_checker: Callable[[], bool] | None = None,
                            backpressure_callback: Any = None,
                            token_counter: TokenCounter | None = None,
+                           search_executor: Callable[..., Any] | None = None,
                            ) -> ProviderAdapter:
     """Build THE adapter for a worker process. One per process, not per engine."""
     from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
@@ -938,7 +1032,8 @@ def build_provider_adapter(limits: Any = None, *, tracker: Any = None,
         coordinator=coordinator)
     return ProviderAdapter(scheduler, tracker=tracker, client_factory=client_factory,
                            request_deadline_seconds=request_deadline_seconds,
-                           token_counter=token_counter)
+                           token_counter=token_counter,
+                           search_executor=search_executor)
 
 
 __all__ = [

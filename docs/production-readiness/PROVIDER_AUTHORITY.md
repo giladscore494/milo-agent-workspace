@@ -103,14 +103,64 @@ Fail-closed cases:
 `estimate_input_tokens` / `estimate_request_tokens` survive as rough size
 signals and are documented as **not** admission values.
 
-## Search accounting
+## Search: MILO admits every invocation
 
-QPS is the provider's pacing bucket for the **standalone** `/v1/tools/search`
-and `/v1/tools/search_pro` endpoints. It never said anything about how many
-searches a run may perform, and it does not touch V1's builtin
-`$web_search` at all — the provider runs and bills that inside a chat call.
+**The production search path is standalone and MILO-mediated.** V1 no longer
+offers the provider's builtin `$web_search`, and no production engine does.
 
-The adapter accounts both routes, and it **reserves** rather than checks.
+### Why the builtin had to go
+
+A `builtin_function` tool is executed by the *provider*, inside a Chat
+Completions request, as many times as the provider decides. MILO could
+reserve a worst case before dispatch and reconcile afterwards, but it could
+never admit *one* search: if four were reserved and the response performed
+five, the fifth had already run and been billed by the time MILO could see
+it. `max_search_invocations_per_run` was therefore a number MILO could
+*report*, not a ceiling a run could be stopped at.
+
+### What replaces it
+
+V1 offers a model MILO's own ordinary `function` tool, `web_search`
+(`backend/standalone_search.py`). The provider cannot execute it; it can only
+ask. Every ask returns to MILO:
+
+```
+V1 decides search is needed
+  -> the model emits a `web_search` tool call
+  -> ProviderAdapter.run_search
+       1. query + transport resolved      (free: refusals here cost nothing)
+       2. run allowance taken             max_search_invocations_per_run
+       3. endpoint QPS bucket taken       /v1/tools/search
+       4. invocation + cost charged       durable, through the ledger snapshot
+       5. exactly ONE standalone search   MoonshotStandaloneSearch
+  -> results become the tool message
+  -> the model reads them and continues
+```
+
+Several tool calls in one response are several separate admissions. A
+response asking for more searches than the run can still afford has the
+affordable ones performed and is stopped at the first it cannot pay for —
+**before** that one happens. That is the difference between a ceiling and a
+report, and it is what makes `max_search_invocations_per_run` structurally
+uncrossable.
+
+**Internet access is not reduced.** The same research happens, over the same
+provider's search endpoints, and the results reach the model in the same
+conversation. Only their *number* became refusable.
+
+The charge is committed at step 4, *before* the search runs. A settlement
+that waited for the reply could be lost to a crash mid-search, and a
+performed search that no longer appears in the ledger is a refund by another
+name. Charging first can only ever over-report — the fail-closed direction.
+Correspondingly, a transport failure after step 4 is **never** refunded:
+MILO cannot know whether the provider ran the search before failing, and the
+model is told the search produced nothing rather than being handed invented
+results.
+
+### The residual builtin accounting
+
+Nothing in production offers the builtin, but the adapter still accounts for
+one if any caller ever sends it, and it **reserves** rather than checks.
 
 A check is not a ceiling. The provider decides how many `$web_search` tool
 calls one response asks for, so admitting a request against a single
@@ -120,14 +170,16 @@ recording — detection of money already spent. A reservation also holds across
 concurrent workers, which a read-then-check never could: two requests could
 both see the same single remaining invocation and both be admitted.
 
-* **builtin** — before **each attempt** (not once per logical call: a retry is
-  a real provider request that can search on its own),
+* **builtin (residual)** — before **each attempt** (not once per logical call:
+  a retry is a real provider request that can search on its own),
   `BudgetTracker.reserve_search` holds `max_builtin_searches_per_request`,
   the worst case. The request is dispatched only if the run can pay for that.
   `settle_search` then releases the hold and charges what really happened.
-* **standalone** — `ProviderAdapter.search(endpoint)` reserves one, takes the
-  endpoint's QPS bucket, then settles; a QPS refusal releases the hold rather
-  than charging for a search MILO never performed.
+* **standalone (production)** — `ProviderAdapter.search(endpoint)` reserves
+  one, takes the endpoint's QPS bucket, then settles; a QPS refusal releases
+  the hold rather than charging for a search MILO never performed.
+  `ProviderAdapter.run_search` is that admission plus the one search it
+  admits.
 
 Reconciliation, and what "fail closed" means here:
 
@@ -146,16 +198,27 @@ starts with none instead of inheriting a phantom hold from a dead process,
 while the searches already spent are restored from the ledger snapshot.
 
 Bounds come from the canonical runtime policy:
-`max_search_invocations_per_run` (60), `max_builtin_searches_per_request` (4 —
-MILO's own enforced ceiling, not a provider fact) and
-`search_cost_per_invocation` (0.00 — a price interface, not an invented
-number). Recorded search cost is real money, so it lands in `actual_cost` and
-`max_cost_per_run` binds on it.
+`max_search_invocations_per_run` (60 — the run-level hard ceiling, now taken
+before each individual search executes), `max_builtin_searches_per_request`
+(4 — the residual per-request bound for the builtin, which plays no part on
+the mediated path) and `search_cost_per_invocation` (0.00 — a price
+interface, not an invented number). Recorded search cost is real money, so it
+lands in `actual_cost` and `max_cost_per_run` binds on it.
 
-One deliberate tail effect: when fewer than `max_builtin_searches_per_request`
-invocations remain, a search-enabled request is refused even though it might
-have used only one. That is the fail-closed direction, and the alternative is
-a ceiling that is not one.
+The reviewed policy fingerprint is unchanged by the mediated path: no
+dimension was added, removed or re-valued.
+
+Server-owned material bounds live in `backend/standalone_search.py`: the
+query is normalized and clipped, the result set is capped, and the JSON that
+re-enters a prompt is truncated to a fixed budget with the truncation
+declared. Model-authored text is data on its way back into a prompt and is
+never interpreted as an instruction.
+
+One deliberate tail effect survives on the **residual** builtin route only:
+when fewer than `max_builtin_searches_per_request` invocations remain, a
+builtin-search request is refused even though it might have used only one.
+The mediated path has no such tail — it admits one at a time, so the last
+remaining invocation is usable.
 
 ## The deadline is absolute
 

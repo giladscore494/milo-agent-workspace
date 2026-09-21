@@ -1448,17 +1448,37 @@ def test_the_profile_states_the_effective_provider_parallelism():
         "concurrency, so the number can be read as a throughput estimate")
 
 
-def test_the_profile_does_not_claim_the_search_limiter_guards_v1():
-    """V1's search happens inside a chat call, so chat quota paces it."""
+def test_the_profile_says_the_search_limiter_now_guards_the_v1_path():
+    """The inverse of what this test asserted before the mediated path.
+
+    V1's search used to happen INSIDE a chat call, through the provider's
+    builtin tool, so the standalone QPS buckets guarded nothing any engine
+    used and the profile said so. V1 now offers MILO's own function tool and
+    performs each admitted search against the standalone endpoints, so those
+    buckets pace the production path -- and the profile has to say THAT, or it
+    is a document about a system that no longer exists.
+    """
     import inspect
 
     from backend.engines.vehicle_catalog_v1 import core as v1_core
+    from backend.standalone_search import request_offers_provider_executed_search
     from backend.tier2_profile import tier2_first_run_profile
 
-    # V1 really does use the built-in tool rather than the standalone endpoint.
-    assert '"builtin_function"' in inspect.getsource(v1_core)
-    assert "admit_search" not in inspect.getsource(v1_core)
+    # V1 no longer BUILDS a provider-executed tool. The check is structural
+    # rather than a text sweep: the module documents at length why the builtin
+    # was removed, and prose naming a thing is not the same as code emitting
+    # it. `tests/test_standalone_search.py` proves the same property from the
+    # requests V1 really sends.
+    assert '"builtin_function"' not in inspect.getsource(v1_core)
+    assert not request_offers_provider_executed_search(
+        {"tools": v1_core.WEB_SEARCH_TOOL})
 
     for endpoint in tier2_first_run_profile()["web_search_qps"].values():
+        # Still true, and still worth saying: these buckets never paced the
+        # builtin, which is why it could not be admitted one search at a time.
         assert endpoint["guards_the_builtin_web_search_path"] is False
-        assert endpoint["called_by_a_production_engine_today"] is False
+        assert endpoint["builtin_web_search_offered_by_a_production_engine"] is False
+        # And now the part that changed.
+        assert endpoint["called_by_a_production_engine_today"] is True
+        assert endpoint["guards_the_v1_production_search_path"] is True
+        assert endpoint["run_volume_bound_admitted_before_execution"] is True

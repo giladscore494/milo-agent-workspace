@@ -13,6 +13,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.standalone_search import MEDIATED_SEARCH_TOOL_NAME
+
 from . import core
 
 
@@ -46,11 +48,24 @@ class ToolPolicy(BaseModel):
 
     @model_validator(mode="after")
     def web_search_matches_internet_policy(self) -> "ToolPolicy":
-        has_web_search = "$web_search" in self.allowed_tools
+        """Internet policy and the granted tool must agree, and the tool is
+        MILO's own.
+
+        The name matters structurally, not cosmetically: `$web_search` is the
+        provider's BUILTIN, executed and multiplied by the provider inside a
+        chat request, and a workflow that granted it would be granting a
+        capability MILO cannot admit one invocation at a time. The only search
+        tool this workflow can grant is the mediated one MILO executes itself.
+        """
+        has_web_search = MEDIATED_SEARCH_TOOL_NAME in self.allowed_tools
+        if any(str(tool).startswith("$") for tool in self.allowed_tools):
+            raise ValueError("a provider-executed builtin tool cannot be granted")
         if self.internet_policy == InternetPolicy.REQUIRED and not has_web_search:
-            raise ValueError("required internet policy must allow $web_search")
+            raise ValueError(
+                f"required internet policy must allow {MEDIATED_SEARCH_TOOL_NAME}")
         if self.internet_policy == InternetPolicy.DISABLED and has_web_search:
-            raise ValueError("disabled internet policy cannot allow $web_search")
+            raise ValueError(
+                f"disabled internet policy cannot allow {MEDIATED_SEARCH_TOOL_NAME}")
         return self
 
 
@@ -191,7 +206,7 @@ class CompiledWorkflow(BaseModel):
     agents: tuple[str, ...]
 
 
-KNOWN_TOOLS = frozenset({"$web_search"})
+KNOWN_TOOLS = frozenset({MEDIATED_SEARCH_TOOL_NAME})
 MAX_BUDGET_TOKENS = 100_000
 
 
@@ -236,7 +251,7 @@ def agent_template(
         instructions=instructions,
         input_schema=GENERIC_INPUT_SCHEMA,
         output_schema=output_schema,
-        tools=ToolPolicy(allowed_tools=("$web_search",) if internet_policy == InternetPolicy.REQUIRED else (), internet_policy=internet_policy, max_tool_rounds=core.MAX_TOOL_ROUNDS if internet_policy == InternetPolicy.REQUIRED else 0),
+        tools=ToolPolicy(allowed_tools=(MEDIATED_SEARCH_TOOL_NAME,) if internet_policy == InternetPolicy.REQUIRED else (), internet_policy=internet_policy, max_tool_rounds=core.MAX_TOOL_ROUNDS if internet_policy == InternetPolicy.REQUIRED else 0),
         source_policy=SourcePolicy(preferred_sources=("official local/importer", "local automotive portals", "used-market listings")),
         execution=ExecutionPolicy(max_tokens=max_tokens, fallback_max_tokens=fallback_max_tokens, timeout_seconds=180, max_retries=core.API_CONCURRENCY_MAX_RETRIES, concurrency_limit=core.MAX_PARALLEL_KIMI_CALLS, chunk_size=chunk_size, temperature=core.SEARCH_TEMPERATURE),
         validation=ValidationPolicy(output_schema=output_schema, required_top_keys=required_top_keys or output_schema.required_keys, non_empty_lists=non_empty_lists, validator=validator),

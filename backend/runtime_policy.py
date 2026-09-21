@@ -381,30 +381,35 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
 
     # --- search VOLUME and PRICE, enforced by backend.budget.BudgetTracker --
     #
-    # QPS above is the provider's pacing bucket for the STANDALONE endpoints.
-    # It says nothing about how many searches one run may perform in total,
-    # and nothing at all about V1's builtin `$web_search`, which the provider
-    # runs and bills INSIDE a chat call. These two dimensions are that
-    # missing bound: every search a run performs, by either route, is counted
-    # and priced against them.
+    # QPS above is the provider's pacing bucket for the STANDALONE endpoints,
+    # which is the route production now takes: V1 offers a model MILO's own
+    # `web_search` function tool, and MILO admits, performs and accounts each
+    # invocation itself (`ProviderAdapter.run_search`). QPS still says nothing
+    # about how many searches one RUN may perform in total. These two
+    # dimensions are that missing bound: every search a run performs, by
+    # either route, is counted and priced against them.
     _d("max_search_invocations_per_run", 60, runtime_default=60,
        enforced_by=BUDGET,
-       why="V1's four discovery/technical phases each run up to ~15 model "
-           "calls that may search; 60 admits the observed shape with room "
-           "and still refuses an unbounded search loop, which no other "
-           "dimension bounded at all. No env key: the reviewed value is the "
-           "bound, and moving it is a reviewed change rather than a "
+       why="THE run-level hard ceiling on internet searches, and since the "
+           "mediated path it is structurally enforceable: every invocation is "
+           "admitted against this number BEFORE it executes, so a run cannot "
+           "cross it even by one. V1's four discovery/technical phases each "
+           "run up to ~15 model calls that may search; 60 admits the observed "
+           "shape with room and still refuses an unbounded search loop, which "
+           "no other dimension bounded at all. No env key: the reviewed value "
+           "is the bound, and moving it is a reviewed change rather than a "
            "deployment setting"),
     _d("max_builtin_searches_per_request", 4, runtime_default=4, enforced_by=BUDGET,
-       why="MILO's own ENFORCED per-request ceiling on the builtin "
-           "`$web_search`, not a provider fact. The provider decides how many "
-           "searches one response asks for, so admission has to reserve a "
-           "maximum before dispatch or it is not a ceiling at all -- it is "
-           "post-facto detection of money already spent. 4 is well above the "
-           "one or two searches a reviewed V1/V2 role produces per turn, and "
-           "a response that exceeds it stops the run rather than being paid "
-           "for silently. No env key: a reviewed value, not a deployment "
-           "setting"),
+       why="THE RESIDUAL bound, for the provider-executed builtin "
+           "`$web_search` that no production engine offers any more. It is "
+           "kept because the provider authority still accounts for a builtin "
+           "search if any caller ever sends one, and a reservation is the "
+           "only ceiling possible there: the provider decides how many "
+           "searches one response asks for, so admission must reserve a "
+           "maximum before dispatch or it is post-facto detection of money "
+           "already spent. It does not bound the mediated path, where each "
+           "search is admitted individually and this number plays no part. "
+           "No env key: a reviewed value, not a deployment setting"),
     _d("search_cost_per_invocation", 0.0, kind=float, fmt=FMT_MONEY,
        direction=HIGHER_IS_TIGHTER, runtime_default=0.0, enforced_by=BUDGET,
        why="the PRICE INTERFACE for a search, charged to the run's recorded "

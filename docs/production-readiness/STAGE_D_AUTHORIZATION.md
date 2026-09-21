@@ -462,57 +462,65 @@ model call and is verified after the run against three independent views
 unrounded reservation total). Attempt 7's comparable run cost $0.252069.
 This is a real ceiling.
 
-**Provider-side `$web_search` tool fees — NOT CAPPED BY MILO AT ALL.**
-Moonshot bills the builtin `$web_search` tool per invocation, separately
-from tokens. Those charges never enter `actual_cost`, the reservation
-ledger or the daily budgets, and **no MILO cap bounds the number of
-invocations.**
+**Search invocation COUNT — now hard-capped at 60 per run.**
 
-An earlier revision of this proposal claimed a conservative total
-exposure of "≤ $5.50", derived from an assumed maximum of three search
-invocations per model response. **That claim was wrong and has been
-withdrawn.** The assumption is not established by the provider
-documentation and is not enforced by the runtime:
+The paragraphs this section used to carry are superseded and are restated
+here so the change is legible rather than silently edited away. They said
+search fees were **not capped by MILO at all**, and that was correct at the
+time: V1 reached the internet through Moonshot's builtin `$web_search`, the
+provider decided how many `tool_calls` one response asked for, and the
+per-run invocation count was `rounds × tool_calls_per_round` with only the
+first factor bounded. An earlier revision's "≤ $5.50" exposure claim rested
+on an assumed three-invocations-per-response maximum that neither the
+provider documentation established nor the runtime enforced; it was
+withdrawn, and it stays withdrawn.
 
-- `backend/engines/vehicle_catalog_v1/core.py` bounds the number of
-  tool-echo *rounds* per model call at `MAX_TOOL_ROUNDS = 15`;
-- within each round it iterates **every** entry of
-  `message.tool_calls` (`core.py:554` and `core.py:601`) and echoes each
-  one back. The number of `tool_calls` in a single response is chosen by
-  the provider and is **not bounded by the runtime**;
-- so the per-run invocation count is `rounds × tool_calls_per_round`, and
-  only the first factor has a ceiling. There is no arithmetic that turns
-  that into a dollar bound.
+**What changed.** V1 no longer offers the provider a search capability. It
+offers MILO's own `web_search` function tool, which the provider cannot
+execute, and every invocation the model asks for is admitted against
+`max_search_invocations_per_run` **before it runs**
+(`ProviderAdapter.run_search`, `backend/standalone_search.py`). The second
+factor is now bounded too: a response asking for more searches than the run
+can afford has the affordable ones performed and is stopped at the first it
+cannot pay for. The invocation count per run is therefore **≤ 60**, and that
+is a ceiling rather than a number observed afterwards.
 
-**Current official provider pricing (verify before authorizing).** Kimi's
-documentation currently states **$0.005 per legacy `$web_search` call**,
-and states that the legacy `$web_search` tool is **retired on
-2026-10-20**. Both figures are the provider's and must be re-checked
-against the console immediately before the run — this document is not a
-pricing source, and the retirement date falls close enough to this
-proposal to matter.
+Search consumption is also no longer untracked: `search_invocations` and
+`search_cost` are durable in the ExecutionUsageLedger snapshot, and recorded
+search cost reaches `actual_cost`, so `MILO_MAX_COST_PER_RUN` binds on it
+once a price is configured.
+
+**The dollar figure is still the provider's, and is still unverified here.**
+`search_cost_per_invocation` defaults to **0.00** because no verified price
+for the standalone `/v1/tools/search` endpoints was recoverable; it is a
+price interface, not an invented number. The provider's documentation states
+**$0.005 per legacy `$web_search` call** and that the legacy builtin is
+**retired on 2026-10-20** — both are the provider's figures, both must be
+re-checked against the console immediately before any run, and neither is a
+statement about the standalone endpoints this runtime now calls. Moving off
+the retiring builtin is an independent benefit of the change, not its motive.
 
 | Component | Bound | Basis |
 | --- | --- | --- |
 | Token-billed (tracked) | **≤ $1.00, hard** | enforced by the budget tracker and verified three ways after the run |
-| `$web_search` tool fees (untracked) | **UNBOUNDED by MILO** | billed per invocation at the provider's stated $0.005; invocations per run are not capped by the runtime |
-| Total | **not bounded by this repository** | see the mandatory control below |
+| Search invocations | **≤ 60 per run, hard** | `max_search_invocations_per_run`, admitted before each individual search executes |
+| Search fees in dollars | **60 × the provider's per-search price** | the count is MILO's and enforced; the **price is the provider's and is NOT verified in this repository** |
+| Total | **bounded in count, not proven in dollars** | see the mandatory control below |
 
-**Mandatory control before authorization.** Because the repository cannot
-bound the second row, the bound must come from the provider account. A
-**verified hard spending/wallet ceiling on the Moonshot account** is a
+**Mandatory control before authorization — UNCHANGED.** The count is now
+bounded; the price is not established, and the standalone endpoints' billing
+behaviour has not been exercised against the live provider. A **verified hard
+spending/wallet ceiling on the Moonshot account** therefore remains a
 **prerequisite** of this authorization, not an optional precaution. The
-operator must confirm the configured ceiling, and its value, before
-granting the authorization, and record it in §9.
+operator must confirm the configured ceiling, and its value, before granting
+the authorization, and record it in §9.
 
-**No runtime change is proposed here.** Adding an enforceable
-per-run web-search invocation cap would mean changing
-`backend/engines/vehicle_catalog_v1/core.py` — that is a runtime change
-to the preserved pipeline, it would invalidate the pinned accepted image
-digests, and it must be proposed and reviewed as its own release. It is
-deliberately **not** bundled into this authorization request. Until such
-a cap exists, the provider-account ceiling is the only enforceable bound
-on tool-fee exposure.
+**This IS a runtime change to the preserved pipeline**, which the superseded
+text said would have to be proposed and reviewed as its own release. It was:
+it is not bundled into this authorization request, it changes
+`backend/engines/vehicle_catalog_v1/core.py`, and it invalidates the pinned
+accepted image digests. Stage D must be re-authorized against the merged
+release SHA with fresh digests before it is relied on.
 
 ## 4. The prepared Government capture run — an invariant, never a Stage D run
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from backend.engines.vehicle_catalog_v1 import core
+from backend.standalone_search import MEDIATED_SEARCH_TOOL_NAME
 from backend.engines.vehicle_catalog_v1.engine import VehicleCatalogEngine, VehicleCatalogRunConfig
 from backend.engines.vehicle_catalog_v1.source_policy import (
     FOREIGN_ONLY_NOTE,
@@ -88,8 +89,12 @@ def test_israel_discovery_context_is_injected_into_every_discovery_prompt(retry)
         messages = core.discovery_prompt(agent, "Hyundai", "Israel", "2010 to June 2026", retry=retry)
         system = messages[0]["content"]
         assert core.ISRAEL_DISCOVERY_CONTEXT.strip() in system
-        # The mandatory web-search instruction is not duplicated or lost.
-        assert system.count("You MUST call the $web_search tool") == 1
+        # The mandatory web-search instruction is not duplicated or lost,
+        # and it names MILO's OWN mediated tool -- never the provider's
+        # builtin, which V1 production no longer offers at all.
+        assert system.count(
+            f"You MUST call the {MEDIATED_SEARCH_TOOL_NAME} tool") == 1
+        assert "$web_search" not in system
 
 
 def test_non_israel_market_does_not_get_israel_context():
