@@ -193,7 +193,12 @@ from backend.engines.swarm_v2.evidence import WorkerLease
 from backend.errors import AppError
 from backend.event_registry import CAPTURE_SNAPSHOT_REPLAYED
 from backend.finalization import RunFinalizer, TerminalClaim
-from backend.run_identity import RunIdentity
+from backend.run_identity import (
+    RunIdentity,
+    RunIdentityError,
+    execution_identity_problems,
+    require_identity,
+)
 from backend.production_config import TRUE_VALUES
 from backend.runtime import TERMINAL_STATES, CancellationRequested
 
@@ -304,6 +309,8 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "the lease configuration of this process is not readable",
     "CAPTURE_RUN_NOT_ELIGIBLE":
         "that run is not a prepared operator capture run",
+    "CAPTURE_RUN_IDENTITY_MISMATCH":
+        "the prepared capture run identity does not match this runtime",
     "CAPTURE_RUN_UNAVAILABLE":
         "that run could not be read or claimed",
     "CAPTURE_LAUNCH_OWNERSHIP_LOST":
@@ -1064,7 +1071,13 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     # concurrency ceiling the product enforces.
     limits = BudgetConfig.from_env()
     new_run_id = uuid4()
-    run_identity = RunIdentity.bind(new_run_id, "operator_capture", env=env).as_record()
+    try:
+        prepared_identity = RunIdentity.bind(new_run_id, "operator_capture", env=env)
+    except RunIdentityError:
+        return EXIT_FAILED, _envelope("failed", "CAPTURE_RUN_IDENTITY_MISMATCH")
+    if execution_identity_problems(prepared_identity, env=env):
+        return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
+    run_identity = prepared_identity.as_record()
     try:
         result = repository.create_message_and_run(
             conversation_id, PREPARED_RUN_CONTENT,
@@ -1150,6 +1163,17 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_UNAVAILABLE")
     if not _run_is_eligible(run):
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_NOT_ELIGIBLE")
+    try:
+        capture_identity = require_identity(run)
+    except RunIdentityError:
+        return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
+    if capture_identity.workflow_key != "operator_capture" or execution_identity_problems(
+        capture_identity, env=env
+    ):
+        # Identity is immutable, so proving it before the lease cannot become
+        # stale underneath this process. A capture prepared by another release
+        # or policy is history, not executable work for this runtime.
+        return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
 
     worker_id = f"operator-capture-{uuid4()}"
     try:
