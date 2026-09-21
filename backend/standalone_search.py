@@ -71,6 +71,11 @@ MAX_RESULT_URL_CHARS = 500
 MAX_RESULT_SNIPPET_CHARS = 1_000
 MAX_TOOL_CONTENT_CHARS = 12_000
 
+#: Server-owned wire timeout for one standalone search request. The official
+#: API accepts 1..60 seconds; 30s is explicit and bounded rather than a
+#: provider default, and remains inside MILO's outer request deadline.
+STANDALONE_SEARCH_TIMEOUT_SECONDS = 30
+
 _SEARCH_TOOL_DESCRIPTION = (
     "Search the public internet for current information and return ranked "
     "results with source URLs. One call performs exactly one search. Ask a "
@@ -266,12 +271,12 @@ def normalize_query(raw: Any) -> str:
 
 
 def _result_rows(payload: Any) -> Sequence[Any]:
-    """Find the result rows in a response whose exact shape is not pinned.
+    """Find result rows from the pinned standalone-search response contract.
 
-    The standalone search wire format is not something this repository has
-    verified against the live provider, so the reader accepts the shapes such
-    an endpoint plausibly returns and treats anything else as EMPTY rather
-    than guessing. An empty result set is honest; an invented one is not.
+    Current official Kimi documentation returns rows in ``search_results``.
+    The additional legacy aliases remain read-only compatibility for older
+    fixtures/responses; they do not change the request contract and an
+    unrecognised shape still resolves to EMPTY rather than invented data.
     """
     if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
         return payload
@@ -412,7 +417,11 @@ class MoonshotStandaloneSearch:
                 f"{base.rstrip('/')}{path}",
                 headers={"Authorization": f"Bearer {api_key}",
                          "Content-Type": "application/json"},
-                json={"query": query},
+                json={
+                    "text_query": query,
+                    "limit": MAX_RESULTS_PER_SEARCH,
+                    "timeout_seconds": STANDALONE_SEARCH_TIMEOUT_SECONDS,
+                },
             )
             status = int(getattr(response, "status_code", 0) or 0)
             if status >= 400:
@@ -455,6 +464,7 @@ def default_search_executor() -> Callable[..., Any] | None:
 
 __all__ = [
     "DEFAULT_SEARCH_EXECUTOR", "MAX_QUERY_CHARS", "MAX_RESULTS_PER_SEARCH",
+    "STANDALONE_SEARCH_TIMEOUT_SECONDS",
     "MAX_TOOL_CONTENT_CHARS", "MEDIATED_SEARCH_TOOL_NAME", "MEDIATED_TOOL_TYPE",
     "MoonshotStandaloneSearch", "PROVIDER_BUILTIN_SEARCH_NAME",
     "PROVIDER_BUILTIN_TOOL_TYPE", "SEARCH_ENDPOINT_PATHS", "SearchOutcome",
