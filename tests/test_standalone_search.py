@@ -177,8 +177,10 @@ class OrderLoggingTracker(BudgetTracker):
         self._log.append(("reserve", count))
         return seq
 
-    def settle_search(self, reservation_seq, actual=None, cost=None):
-        super().settle_search(reservation_seq, actual=actual, cost=cost)
+    def settle_search(self, reservation_seq, actual=None, cost=None, *,
+                      pre_execution=False):
+        super().settle_search(reservation_seq, actual=actual, cost=cost,
+                              pre_execution=pre_execution)
         self._log.append(("settle", actual))
 
 
@@ -708,6 +710,47 @@ def test_a_run_level_stop_is_never_reported_to_the_model_as_a_search_result():
                               executor=RecordingSearch(fail_with=stop))
     with pytest.raises(BudgetExceeded):
         adapter.run_search({"query": "tucson"})
+
+def test_fixed_search_cost_refuses_before_execution_without_phantom_usage():
+    """A known search price that cannot fit must stop before HTTP or ledger spend.
+
+    Search is special here: unlike a completion whose final token cost is only
+    known afterwards, the standalone fee MILO books is fixed before dispatch.
+    Refusing it after incrementing search_invocations would leave a durable
+    search that never happened.
+    """
+    tracker = make_tracker(max_search_invocations_per_run=5,
+                           max_cost_per_run=0.002,
+                           search_cost_per_invocation=0.003)
+    executor = RecordingSearch()
+    adapter, _ = make_adapter(tracker=tracker, executor=executor)
+
+    with pytest.raises(BudgetExceeded) as refused:
+        adapter.run_search({"query": "tucson"})
+
+    assert refused.value.code == "COST_LIMIT_REACHED"
+    assert executor.calls == 0, "an unaffordable search reached the transport"
+    assert tracker.search_invocations == 0, "ledger invented an unperformed search"
+    assert tracker.search_cost == 0.0
+    assert tracker.actual_cost == 0.0
+    assert tracker.reserved_search_invocations == 0
+
+
+def test_fixed_search_cost_at_the_boundary_is_charged_before_execution():
+    tracker = make_tracker(max_search_invocations_per_run=5,
+                           max_cost_per_run=0.003,
+                           search_cost_per_invocation=0.003)
+    executor = RecordingSearch()
+    adapter, _ = make_adapter(tracker=tracker, executor=executor)
+
+    outcome = adapter.run_search({"query": "tucson"})
+
+    assert outcome.admitted is True
+    assert executor.calls == 1
+    assert tracker.search_invocations == 1
+    assert tracker.search_cost == pytest.approx(0.003)
+    assert tracker.actual_cost == pytest.approx(0.003)
+    assert tracker.reserved_search_invocations == 0
 
 
 # =============================================================================
