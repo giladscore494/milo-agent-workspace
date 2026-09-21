@@ -148,6 +148,14 @@ uncrossable.
 provider's search endpoints, and the results reach the model in the same
 conversation. Only their *number* became refusable.
 
+Three refusals land at step 1, before anything is spent: a query the model
+did not supply, a process with no search transport configured, and an adapter
+with **no run ledger**. The last is the structural one — the run ceiling is
+enforced by the ledger, so an adapter without one could not admit a search,
+only perform unmetered ones, which is the builtin's failure mode wearing
+different clothes. `chat` stays tolerant of a missing tracker; `run_search`
+does not.
+
 The charge is committed at step 4, *before* the search runs. A settlement
 that waited for the reply could be lost to a crash mid-search, and a
 performed search that no longer appears in the ledger is a refund by another
