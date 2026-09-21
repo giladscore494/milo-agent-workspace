@@ -83,8 +83,8 @@ What is bound
     stated no release", never "any release will do", and the release gate
     treats an unpinned run as unauthorized rather than as a match.
 
-``event_registry_version``
-    The canonical event vocabulary (``backend/event_registry.py``) the run's
+``event_registry_version`` / ``event_registry_fingerprint``
+    The version and exact content digest of the canonical event vocabulary (``backend/event_registry.py``) the run's
     durable event stream speaks. An exported or resumed run states it rather
     than leaving a later reader to assume today's.
 
@@ -100,7 +100,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from uuid import UUID
 
-from backend.event_registry import REGISTRY_VERSION
+from backend.event_registry import REGISTRY_VERSION, fingerprint as event_registry_fingerprint
 from backend.runtime_policy import POLICY_SCHEMA_VERSION, reviewed_first_run_policy
 
 #: The identity record's own schema version. A record that does not carry
@@ -153,7 +153,7 @@ SUPPORTED_ENGINE_VERSIONS: Mapping[str, frozenset[str]] = {
 IDENTITY_FIELDS: tuple[str, ...] = (
     "identity_version", "run_id", "workflow_key", "engine_version",
     "policy_version", "policy_fingerprint", "release_sha",
-    "event_registry_version",
+    "event_registry_version", "event_registry_fingerprint",
 )
 
 
@@ -213,6 +213,7 @@ class RunIdentity:
     policy_fingerprint: str
     release_sha: str
     event_registry_version: str
+    event_registry_fingerprint: str
     identity_version: str = IDENTITY_VERSION
 
     # -- construction ----------------------------------------------------
@@ -239,6 +240,7 @@ class RunIdentity:
             policy_fingerprint=reviewed_policy_fingerprint(),
             release_sha=release_sha(env),
             event_registry_version=REGISTRY_VERSION,
+            event_registry_fingerprint=event_registry_fingerprint(),
         )
 
     @classmethod
@@ -284,6 +286,12 @@ class RunIdentity:
             raise RunIdentityError(
                 "RUN_IDENTITY_POLICY_FINGERPRINT_INVALID",
                 "the run identity carries an invalid policy fingerprint")
+        if len(identity.event_registry_fingerprint) != 64 or any(
+                char not in "0123456789abcdef"
+                for char in identity.event_registry_fingerprint.lower()):
+            raise RunIdentityError(
+                "RUN_IDENTITY_EVENT_REGISTRY_FINGERPRINT_INVALID",
+                "the run identity carries an invalid event-registry fingerprint")
         if identity.release_sha and (
                 len(identity.release_sha) != 40
                 or any(char not in "0123456789abcdef" for char in identity.release_sha.lower())):
@@ -390,6 +398,8 @@ def execution_identity_problems(
         problems.append("policy_fingerprint")
     if identity.event_registry_version != REGISTRY_VERSION:
         problems.append("event_registry_version")
+    if identity.event_registry_fingerprint != event_registry_fingerprint():
+        problems.append("event_registry_fingerprint")
     if identity.release_sha != release_sha(env):
         problems.append("release_sha")
     return tuple(problems)
