@@ -216,9 +216,12 @@ Bounds come from the canonical runtime policy:
 `max_search_invocations_per_run` (60 — the run-level hard ceiling, now taken
 before each individual search executes), `max_builtin_searches_per_request`
 (4 — the residual per-request bound for the builtin, which plays no part on
-the mediated path) and `search_cost_per_invocation` (0.00 — a price
-interface, not an invented number). Recorded search cost is real money, so it
-lands in `actual_cost` and `max_cost_per_run` binds on it.
+the mediated path) and `search_cost_per_invocation` (**$0.003** — a conservative
+server-owned charge). Current official international Kimi pricing is $0.002
+for Search Basic and $0.003 for Search Pro when the request succeeds with
+non-empty results. MILO books the higher $0.003 before execution for either
+endpoint, so failures/empty results may over-count internally but a paid
+standalone search can never disappear from the recorded-cost ceiling.
 
 The reviewed policy fingerprint is unchanged by the mediated path: no
 dimension was added, removed or re-valued.
