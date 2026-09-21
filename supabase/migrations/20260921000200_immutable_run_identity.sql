@@ -131,15 +131,39 @@ create trigger runs_forbid_identity_rewrite
 create or replace function public.runs_require_identity_on_insert()
 returns trigger
 language plpgsql
-as $
+set search_path = pg_catalog
+as $$
+declare
+  v_workflow_key text;
 begin
   if new.run_identity is null then
     raise exception 'RUN_IDENTITY_REQUIRED: new runs must be born with immutable identity'
       using errcode = '23514';
   end if;
+
+  select p.workflow_key
+    into v_workflow_key
+    from public.conversations c
+    join public.projects p on p.id = c.project_id
+   where c.id = new.conversation_id;
+  if v_workflow_key is null then
+    raise exception 'RUN_IDENTITY_INVALID: run conversation has no trusted project workflow'
+      using errcode = '23514';
+  end if;
+
+  if new.run_identity->>'workflow_key' = 'operator_capture' then
+    if coalesce(new.input->'metadata'->>'milo_operation', '') <> 'catalog.government.capture' then
+      raise exception 'RUN_IDENTITY_INVALID: operator capture identity requires the capture operation marker'
+        using errcode = '23514';
+    end if;
+  elsif (new.run_identity->>'workflow_key') is distinct from v_workflow_key then
+    raise exception 'RUN_IDENTITY_WORKFLOW_DRIFT: run identity does not match the trusted project workflow'
+      using errcode = '23514';
+  end if;
+
   return new;
 end;
-$;
+$$;
 
 drop trigger if exists runs_require_identity_on_insert on public.runs;
 create trigger runs_require_identity_on_insert
