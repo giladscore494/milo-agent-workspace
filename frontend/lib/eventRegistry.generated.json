@@ -68,6 +68,7 @@
     "verification_completed",
     "worker_output_repair_started"
   ],
+  "fingerprint": "670238a71f608185d2011391ebe7f41df6b321df516b6af5866f51e0155db647",
   "groups": {
     "capture_progress": [
       "catalog_candidates_skipped",
@@ -97,6 +98,7 @@
       "budget_exhausted",
       "budget_warning",
       "cancellation_requested",
+      "checkpoint_saved",
       "kill_switch_activated",
       "launch_failed",
       "launch_requested",
@@ -186,6 +188,5 @@
       "tool_used"
     ]
   },
-  "registry_version": "milo-event-registry/1",
-  "fingerprint": "d8389533a754f0b04f30a1c66254e06ee3df7501c0c85da75423103f0d9fa46d"
+  "registry_version": "milo-event-registry/1"
 }

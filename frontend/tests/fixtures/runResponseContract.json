@@ -45,7 +45,7 @@
       "policy_fingerprint": "7ffc0f6d36220ecdd773955ef4e89289d804fa86e2e279ddd93a6bd6c37ed52b",
       "release_sha": "84cd8696119c24662a954d0f0e23195268dab23f",
       "event_registry_version": "milo-event-registry/1",
-      "event_registry_fingerprint": "d8389533a754f0b04f30a1c66254e06ee3df7501c0c85da75423103f0d9fa46d"
+      "event_registry_fingerprint": "670238a71f608185d2011391ebe7f41df6b321df516b6af5866f51e0155db647"
     },
     "created_at": null,
     "updated_at": null
@@ -76,7 +76,7 @@
       "policy_fingerprint": "7ffc0f6d36220ecdd773955ef4e89289d804fa86e2e279ddd93a6bd6c37ed52b",
       "release_sha": "84cd8696119c24662a954d0f0e23195268dab23f",
       "event_registry_version": "milo-event-registry/1",
-      "event_registry_fingerprint": "d8389533a754f0b04f30a1c66254e06ee3df7501c0c85da75423103f0d9fa46d"
+      "event_registry_fingerprint": "670238a71f608185d2011391ebe7f41df6b321df516b6af5866f51e0155db647"
     },
     "created_at": null,
     "updated_at": null

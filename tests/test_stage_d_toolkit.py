@@ -1509,6 +1509,12 @@ class StageDWorld:
         shutil.copytree(STAGE_D, self.root / "scripts" / "release" / "stage-d")
         shutil.copytree(REPO / "scripts" / "release" / "lib",
                         self.root / "scripts" / "release" / "lib")
+        # `policy_envelope.py` derives every pinned envelope -- caps, provider
+        # and engine limits, and the run-identity pin the cleanup refuses
+        # without -- from `backend.runtime_policy`. It runs on the OPERATOR
+        # HOST, where the repository is present, so the copied world exposes
+        # the same package rather than making the operator block refuse.
+        (self.root / "backend").symlink_to(REPO / "backend", target_is_directory=True)
         self.dir = self.root / "scripts" / "release" / "stage-d"
         self.bin = tmp_path / "bin"
         self.bin.mkdir()
@@ -3330,9 +3336,32 @@ RUN_CONVERSATION = "99999999-8888-7777-6666-555555555555"
 RUN_PROJECT = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 
+#: The release Stage D is authorizing in these tests. The identity pin is
+#: meaningless without one: `expected_run_identity()` refuses a pin whose
+#: `release_sha` is empty, because a pin that states no release binds nothing.
+STAGE_D_IDENTITY_RELEASE = "84cd8696119c24662a954d0f0e23195268dab23f"
+
+
+def stage_d_expected_identity() -> dict:
+    """The identity dimensions Stage D pins, as the OPERATOR HOST produces them.
+
+    The probe runs in a bare image and receives this expectation rather than
+    deriving it, so the test builds it the same way `stage-d-env.sh` does --
+    through `policy_envelope.py run-identity` -- instead of restating the fields
+    and drifting from the release they describe.
+    """
+    sys.path.insert(0, str(REPO / "scripts" / "release" / "stage-d"))
+    import policy_envelope
+
+    return policy_envelope.expected_run_identity(STAGE_D_IDENTITY_RELEASE)
+
+
 def stage_d_run(status="running", metadata_stage="stage-d-smoke", **overrides):
     row = {
         "id": STAGE_D_RUN_ID,
+        # A run Stage D may clean up is one born with its immutable identity,
+        # and the cleanup refuses unless that identity is this release's.
+        "run_identity": {**stage_d_expected_identity(), "run_id": STAGE_D_RUN_ID},
         "input": {"content": "Stage D expansion step 1",
                   "metadata": ({"stage": metadata_stage} if metadata_stage is not None else {})},
         "status": status,
@@ -3353,10 +3382,19 @@ def reservation(seq, status="reserved"):
     return {"id": f"res-{seq}", "run_id": STAGE_D_RUN_ID, "call_seq": seq, "status": status}
 
 
-def set_recorded_identity(monkeypatch, expected_user, expected_conversation):
-    """None models a lockdown that could not read the field from state.json."""
+def set_recorded_identity(monkeypatch, expected_user, expected_conversation,
+                          expected_run_identity=...):
+    """None models a lockdown that could not read the field from state.json.
+
+    `expected_run_identity` defaults to this release's pin, because a cleanup
+    with no pin refuses before it looks at anything else; pass None to model the
+    lockdown that lost it.
+    """
+    identity = (json.dumps(stage_d_expected_identity())
+                if expected_run_identity is ... else expected_run_identity)
     for name, value in (("STAGE_D_EXPECTED_USER_ID", expected_user),
-                        ("STAGE_D_EXPECTED_CONVERSATION_ID", expected_conversation)):
+                        ("STAGE_D_EXPECTED_CONVERSATION_ID", expected_conversation),
+                        ("STAGE_D_EXPECTED_RUN_IDENTITY", identity)):
         if value is None:
             monkeypatch.delenv(name, raising=False)
         else:
@@ -3415,18 +3453,32 @@ def test_terminalize_drives_an_interrupted_run_to_cancelled(db, monkeypatch, cap
 
 
 def test_terminalize_follows_the_supported_two_step_lifecycle(db, monkeypatch, capsys):
-    """running -> cancellation_requested -> cancelled, not a forged jump."""
+    """running -> cancellation_requested -> cancelled, not a forged jump.
+
+    The two steps are no longer two PATCHes. Cleanup may REQUEST the
+    non-terminal `cancellation_requested` state directly, but the terminal
+    `cancelled` + `run_cancelled` pair is one atomic write that only
+    `finalize_run_guarded` may make -- so the cleanup acquires a real lease and
+    goes through the canonical finalizer instead of PATCHing a terminal status
+    onto a run it does not own.
+    """
     fake = wire_terminalize(db, monkeypatch)
     assert run_terminalize(db) == 0
     verdict = terminalize_verdict(capsys)
-    assert verdict["actions"][:2] == ["running->cancellation_requested", "cancellation_requested->cancelled"]
+    assert verdict["actions"][:3] == ["running->cancellation_requested",
+                                      "claimed_stage_d_cleanup_lease",
+                                      "finalize_run_guarded:cancelled"]
+    # Exactly ONE PATCH, and it is the non-terminal request.
     patches = [p for m, p in fake.calls if m == "PATCH"]
-    assert len(patches) == 2
-    # Every PATCH is guarded on the observed status AND the authorized key.
+    assert len(patches) == 1
+    # It is guarded on the observed status AND the authorized key.
     for path in patches:
         assert f"id=eq.{STAGE_D_RUN_ID}" in path
         assert "status=eq." in path
         assert f"idempotency_key=eq.{STAGE_D_KEY}" in path
+    assert fake.run(STAGE_D_RUN_ID)["status"] == "cancelled"
+    # The terminal event committed with it, from the finalizer.
+    assert [e["event_type"] for e in fake.events] == ["run_cancelled"]
 
 
 def test_terminalize_releases_dangling_reservations_and_proves_zero(db, monkeypatch, capsys):
@@ -3441,9 +3493,12 @@ def test_terminalize_releases_dangling_reservations_and_proves_zero(db, monkeypa
     assert verdict["reservations_released"] == 2
     assert verdict["reservations_still_reserved"] == 0
     assert fake.reserved_count(STAGE_D_RUN_ID) == 0
-    # Released through the SUPPORTED RPC, not a raw table write.
-    assert len(fake.rpc_calls) == 2
-    for call in fake.rpc_calls:
+    # Released through the SUPPORTED RPC, not a raw table write. The cleanup
+    # also calls claim_run_lease and finalize_run_guarded now, so the
+    # settlement calls are the ones carrying a reservation id.
+    settlements = [c for c in fake.rpc_calls if "p_reservation_id" in c]
+    assert len(settlements) == 2
+    for call in settlements:
         assert call["p_status"] == "released"
         assert call["p_actual_cost"] == 0
         assert "stage-d cleanup" in call["p_rejection_reason"]
@@ -3526,25 +3581,37 @@ def test_terminalize_never_overwrites_a_concurrent_terminal_result(db, monkeypat
     # And the cleanup still succeeds, because the postcondition holds.
     assert verdict["ok"] is True, verdict["problems"]
     assert verdict["terminal"] is True
-    assert any(a.startswith("cas_lost_at_") for a in verdict["actions"])
+    # The cleanup claimed nothing and finalized nothing: a run another writer
+    # already closed is left entirely alone, and no action claims otherwise.
+    assert "claimed_stage_d_cleanup_lease" not in verdict["actions"]
+    assert not any(a.startswith("finalize_run_guarded") or a.endswith("->cancelled")
+                   for a in verdict["actions"])
 
 
-def test_terminalize_fails_closed_when_the_cas_keeps_matching_nothing(db, monkeypatch, capsys):
-    """A CAS that matches nothing while the row is unchanged is a real
-    problem: it means the row is not the authorized run."""
+def test_terminalize_fails_closed_when_the_canonical_finalization_cannot_commit(
+        db, monkeypatch, capsys):
+    """The terminal write is the finalizer's, so this is where fail-closed lives.
+
+    A finalization that commits nothing while the run is still active must be a
+    refusal, not a silent pass: the run is NOT proven terminal, and the cleanup
+    must never fall back to writing the status itself.
+    """
     fake = wire_terminalize(db, monkeypatch)
     original_call = fake.call
 
     def refusing_call(method, path, body=None, headers=None):
-        if method == "PATCH":
-            return 200, []  # matched no row, and nothing changed
+        if path == "/rest/v1/rpc/finalize_run_guarded":
+            return 200, []  # committed no row, and nothing changed
         return original_call(method, path, body, headers)
 
     monkeypatch.setattr(db, "call", refusing_call)
     assert run_terminalize(db) != 0
     verdict = terminalize_verdict(capsys)
-    assert "matched no row although the run is still" in " ".join(verdict["problems"])
-    assert fake.run(STAGE_D_RUN_ID)["status"] == "running"
+    assert "run not proven terminal" in " ".join(verdict["problems"])
+    # The non-terminal request stands; nothing forged a terminal status.
+    assert fake.run(STAGE_D_RUN_ID)["status"] not in (
+        "completed", "partial_success", "failed", "cancelled", "timed_out", "budget_exhausted")
+    assert fake.events == []
 
 
 def test_terminalize_reports_remaining_active_runs_as_a_failure(db, monkeypatch, capsys):
@@ -4399,7 +4466,13 @@ def test_lockdown_terminalizes_a_recorded_run_through_the_real_probe(tmp_path):
     probe = real_probe_outcome(world)
     assert probe["exit"] == 0 and probe["verdict"]["ok"] is True
     assert probe["verdict"]["recovered"] is False
-    assert len(probe["rpc_calls"]) == 1
+    calls = probe["rpc_calls"]
+    # Exactly one settlement, and the terminal state reached through the
+    # CANONICAL finalizer under a real cleanup lease -- never a forged PATCH.
+    assert len([c for c in calls if "p_reservation_id" in c]) == 1
+    assert [c for c in calls if "p_lease_seconds" in c], "no cleanup lease was claimed"
+    finalizations = [c for c in calls if c.get("p_event_type") == "run_cancelled"]
+    assert len(finalizations) == 1 and finalizations[0]["p_status"] == "cancelled"
     db = world.db()
     assert db["runs"][0]["status"] == "cancelled"
     assert db["reservations"][0]["status"] == "released"

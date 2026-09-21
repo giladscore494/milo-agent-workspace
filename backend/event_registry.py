@@ -116,6 +116,13 @@ RUN_LEVEL_EVENT_TYPES = frozenset({
     "cancellation_requested", "launch_requested", "launch_failed",
     "budget_warning", "budget_exhausted", "token_limit_reached",
     "kill_switch_activated", "supervisor_shadow_failed",
+    # A checkpoint belongs to the RUN. Both reducers already treat it that way
+    # -- the browser appends it to `checkpoints`, never to an agent -- and the
+    # generated vocabulary names it as the example of a run-level type that
+    # "keeps every other projection it owns". Outside this set it owned the
+    # AGENT projection, so a `checkpoint_saved` carrying an `agent` field could
+    # invent an agent row that did no work.
+    "checkpoint_saved",
 })
 
 # ---------------------------------------------------------------------------

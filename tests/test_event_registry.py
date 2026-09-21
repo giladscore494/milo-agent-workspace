@@ -56,13 +56,30 @@ def test_the_capture_vocabulary_is_declared_and_deliberately_not_durable():
 
 
 def test_membership_grants_a_projection_so_the_groups_stay_separate():
-    """The F5 rule. A catalog, swarm or operational type must never acquire
-    the V1 agent/phase/progress/spend projection."""
+    """The F5 rule. A catalog, swarm or operational type must never acquire the
+    V1 AGENT projection.
+
+    Membership is about which projection a name may write, not about disjoint
+    name sets. The canonical worker emits the SAME run lifecycle around either
+    engine, so those names are deliberately granted to the Swarm slice as well
+    (see SWARM_V2_EVENT_TYPES). What must never be shared is the ability to
+    create or mutate a V1 agent row -- that is what would let an `agent` field
+    on a run-level or Swarm event invent an agent that did no work.
+    """
     for group in (SWARM_V2_EVENT_TYPES, CATALOG_EVENT_TYPES, OPERATIONAL_EVENT_TYPES):
-        assert not (group & V1_EVENT_TYPES)
         for event_type in group:
-            assert not registry.owns_v1_projection(event_type)
-            assert not registry.owns_agent_projection(event_type)
+            assert not registry.owns_agent_projection(event_type), event_type
+
+    # The catalog and operational slices are wholly their own.
+    assert not (CATALOG_EVENT_TYPES & V1_EVENT_TYPES)
+    assert not (OPERATIONAL_EVENT_TYPES & V1_EVENT_TYPES)
+    for group in (CATALOG_EVENT_TYPES, OPERATIONAL_EVENT_TYPES):
+        for event_type in group:
+            assert not registry.owns_v1_projection(event_type), event_type
+
+    # The swarm slice shares ONLY run-level names with V1, and nothing
+    # agent-, phase- or chunk-shaped.
+    assert (SWARM_V2_EVENT_TYPES & V1_EVENT_TYPES) <= RUN_LEVEL_EVENT_TYPES
     assert RUN_LEVEL_EVENT_TYPES <= V1_EVENT_TYPES
 
 
