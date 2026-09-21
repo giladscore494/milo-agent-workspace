@@ -547,10 +547,16 @@ def test_worker_refuses_to_finalize_partial_success_it_cannot_express():
     """A repository that cannot record partial_success must never have an
     unusable result written to it as `completed`."""
     class NoTransitionRepo(SwarmWorkerRepo):
-        """A repository build without the partial_success transition at all."""
+        """A repository built without the atomic finalizer at all.
+
+        Terminalization is one atomic write now, so "cannot record
+        partial_success" means the canonical finalizer is unavailable. Falling
+        back to a status write plus a separate event is the split path Console 3
+        removed, and the worker refuses instead of taking it.
+        """
 
         def __getattribute__(self, name):
-            if name == "transition_run":
+            if name == "finalize_run":
                 raise AttributeError(name)
             return super().__getattribute__(name)
 
@@ -703,14 +709,6 @@ def test_cancellation_remains_cancellation():
     from backend.runtime import CancellationRequested
 
     repo = SwarmWorkerRepo()
-    transitions = []
-    original = repo.transition_run
-
-    def record(run_id, status, **kwargs):
-        transitions.append(status)
-        return original(run_id, status, **kwargs)
-
-    repo.transition_run = record
 
     class CancellingEngine:
         workflow_key = "swarm_v2"
@@ -719,7 +717,9 @@ def test_cancellation_remains_cancellation():
             raise CancellationRequested()
 
     assert worker_main.execute_run(repo.run_id, repo, CancellingEngine()) == 0
-    assert transitions[-1] == "cancelled"
+    # The terminal write is the canonical finalizer's, and it commits the
+    # status and its event together.
+    assert repo.terminal_writes[-1] == ("cancelled", "run_cancelled")
     assert [event[1] for event in repo.events][-1] == "run_cancelled"
     assert repo.completed is None and repo.partial is None
 
@@ -732,10 +732,6 @@ def test_timeout_and_budget_exhaustion_keep_their_terminal_statuses(terminal, co
     from backend.budget import BudgetExceeded
 
     repo = SwarmWorkerRepo()
-    transitions = []
-    original = repo.transition_run
-    repo.transition_run = lambda run_id, status, **kw: (
-        transitions.append(status), original(run_id, status, **kw))[1]
 
     class StoppedEngine:
         workflow_key = "swarm_v2"
@@ -745,7 +741,7 @@ def test_timeout_and_budget_exhaustion_keep_their_terminal_statuses(terminal, co
                                  terminal_status=terminal)
 
     assert worker_main.execute_run(repo.run_id, repo, StoppedEngine()) == 0
-    assert transitions[-1] == terminal
+    assert [status for status, _ in repo.terminal_writes][-1] == terminal
     assert repo.completed is None and repo.partial is None
 
 
