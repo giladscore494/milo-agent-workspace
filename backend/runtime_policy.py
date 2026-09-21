@@ -410,15 +410,16 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
            "already spent. It does not bound the mediated path, where each "
            "search is admitted individually and this number plays no part. "
            "No env key: a reviewed value, not a deployment setting"),
-    _d("search_cost_per_invocation", 0.0, kind=float, fmt=FMT_MONEY,
-       direction=HIGHER_IS_TIGHTER, runtime_default=0.0, enforced_by=BUDGET,
-       why="the PRICE INTERFACE for a search, charged to the run's recorded "
-           "cost like any other spend. 0.00 because no verified Moonshot "
-           "search price was recoverable and a number is not invented; a "
-           "deployment that knows the price configures it, and a LARGER "
-           "value only makes the recorded-cost ceiling bind sooner. No env "
-           "key: publishing a price is a reviewed change, not a deployment "
-           "setting"),
+    _d("search_cost_per_invocation", 0.003, kind=float, fmt=FMT_MONEY,
+       direction=HIGHER_IS_TIGHTER, runtime_default=0.003, enforced_by=BUDGET,
+       why="a CONSERVATIVE recorded-cost charge for every admitted standalone "
+           "search. Current official international Kimi pricing is $0.002 for "
+           "Search Basic and $0.003 for Search Pro when a request succeeds "
+           "with non-empty results. MILO records the higher $0.003 BEFORE "
+           "execution for either endpoint, so failures/empty results may "
+           "over-count internally but a paid search can never be omitted from "
+           "the recorded-cost ceiling. No env key: provider price changes are "
+           "reviewed policy changes, not deployment overrides"),
 
     # --- declared posture, enforced by operator process and Stage D --------
     _d("hard_monetary_cap_usd", 3.00, kind=float, fmt=FMT_MONEY, runtime_default=3.00,
