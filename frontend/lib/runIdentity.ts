@@ -30,7 +30,7 @@
  *    down.
  */
 
-import { EVENT_REGISTRY_VERSION } from './eventVocabulary';
+import { EVENT_REGISTRY_FINGERPRINT, EVENT_REGISTRY_VERSION } from './eventVocabulary';
 import { SWARM_V2_WORKFLOW_KEY, VEHICLE_CATALOG_V1_WORKFLOW_KEY } from './swarmTypes';
 import { Run } from './types';
 
@@ -53,6 +53,7 @@ export function runIdentityWorkflowKey(run: Run | undefined): string | undefined
   // A record that names a different run is not this run's identity.
   if (run?.id && identity.run_id && identity.run_id !== run.id) return undefined;
   if (identity.event_registry_version !== EVENT_REGISTRY_VERSION) return undefined;
+  if (identity.event_registry_fingerprint !== EVENT_REGISTRY_FINGERPRINT) return undefined;
   const key = typeof identity.workflow_key === 'string' ? identity.workflow_key.trim() : '';
   if (!RENDERABLE_WORKFLOW_KEYS.has(key)) return undefined;
   if (key === SWARM_V2_WORKFLOW_KEY && identity.engine_version !== 'swarm_v2.1') return undefined;
