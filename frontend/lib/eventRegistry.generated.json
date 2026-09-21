@@ -186,5 +186,6 @@
       "tool_used"
     ]
   },
-  "registry_version": "milo-event-registry/1"
+  "registry_version": "milo-event-registry/1",
+  "fingerprint": "d8389533a754f0b04f30a1c66254e06ee3df7501c0c85da75423103f0d9fa46d"
 }
