@@ -1021,3 +1021,177 @@ def test_v1_states_no_search_mechanic_of_its_own():
     assert "reserve_search" not in source, "V1 accounts for search itself"
     assert "record_search" not in source
     assert '"builtin_function"' not in source
+
+
+# =============================================================================
+# Search Pro: the Production research endpoint, on its OWN bucket
+# =============================================================================
+
+def test_v1_research_takes_the_pro_bucket_and_leaves_basic_untouched():
+    """Pro and Basic are independent provider buckets, and V1 spends Pro.
+
+    V1 is an autonomous research agent, so it asks the endpoint that returns
+    query-ranked passages. That choice has to reach the LIMITER, not just the
+    URL: if a Pro search paced itself against the Basic bucket, two engines
+    could exceed one endpoint's QPS while MILO believed each was inside it.
+    """
+    tracker = make_tracker(max_search_invocations_per_run=10)
+    executor = RecordingSearch()
+    adapter, coordinator = make_adapter(tracker=tracker, executor=executor,
+                                        quota=QuotaConfig())
+
+    adapter.run_search({"query": "tucson israel"}, endpoint="search_pro")
+
+    assert executor.endpoints == ["search_pro"]
+    assert not coordinator.try_admit_search("search_pro")[0], (
+        "a Pro search did not consume the Pro QPS bucket")
+    assert coordinator.try_admit_search("search")[0], (
+        "a Pro search consumed the Basic bucket as well")
+
+
+def test_a_pro_refusal_is_a_refusal_and_never_a_quiet_downgrade_to_basic():
+    """Running out of Pro capacity must not hand V1 a different capability."""
+    class RefusesPro:
+        config = ProviderLimitsConfig()
+
+        def admit_search(self, endpoint, *, agent="", phase="", max_wait_seconds=None):
+            if endpoint == "search_pro":
+                raise ProviderBackpressureExceeded("pro QPS did not clear")
+            raise AssertionError("V1 fell back to the Basic endpoint")
+
+    tracker = make_tracker(max_search_invocations_per_run=5)
+    executor = RecordingSearch()
+    adapter = ProviderAdapter(RefusesPro(), tracker=tracker, search_executor=executor)
+    with pytest.raises(ProviderBackpressureExceeded):
+        adapter.run_search({"query": "tucson"}, endpoint="search_pro")
+    assert executor.calls == 0
+    assert tracker.search_invocations == 0
+
+
+def test_the_model_supplies_a_query_and_nothing_else(v1):
+    """Endpoint, timeout, limit, host and price are MILO's, not the model's."""
+    smuggle = SimpleNamespace(id="c1", function=SimpleNamespace(
+        name=MEDIATED_SEARCH_TOOL_NAME,
+        arguments=json.dumps({
+            "query": "tucson israel",
+            "endpoint": "search",          # cheaper endpoint
+            "timeout_seconds": 600,        # longer than MILO allows
+            "limit": 500,                  # more material than MILO keeps
+            "base_url": "https://attacker.example/v1",
+        })))
+    run = v1([searching_response(smuggle), final_response()])
+    assert run.executor.queries == ["tucson israel"]
+    # Everything else the model tried to set was ignored.
+    assert run.executor.endpoints == ["search_pro"]
+
+
+# =============================================================================
+# The REAL-shaped path, end to end: provider JSON -> the model's tool message
+# =============================================================================
+
+def test_pro_passages_survive_transport_adapter_and_tool_content(v1):
+    """The defect this covers erased real results between two normalizations.
+
+    `MoonshotStandaloneSearch` already returns bounded SearchResult objects,
+    and `run_search` normalizes executor output a second time. While the
+    second pass understood only strings and mappings, a REAL paid Pro search
+    could return valid passages and have them silently emptied on the way to
+    the model. So the assertion is not on `normalize_results` in isolation --
+    it follows one provider JSON body all the way to the tool message V1
+    actually sends back.
+    """
+    provider_json = {"search_results": [{
+        "title": "Hyundai Israel",
+        "url": "https://hyundai.co.il/tucson",
+        "snippet": "thin search-engine snippet",
+        "chunks": [
+            {"text": "Tucson 2024 list price is ILS 179,900.", "score": 1.4},
+            {"text": "Hybrid trim adds ILS 12,000.", "score": 1.1},
+        ],
+    }]}
+
+    class FakeHttp:
+        def post(self, url, *, headers, json):
+            self.url = url
+            return SimpleNamespace(status_code=200, json=lambda: provider_json)
+
+    http = FakeHttp()
+    transport = MoonshotStandaloneSearch(api_key="k", base_url="https://api.test/v1",
+                                         http_client=http)
+    run = v1([searching_response(tool_call(query="tucson israel price")),
+              final_response('{"models":[{"model_name_en":"Tucson"}]}')],
+             executor=transport)
+
+    # It went to the Pro endpoint...
+    assert http.url == "https://api.test/v1/tools/search_pro"
+    # ...and the passages reached the model, not an empty result set.
+    payload = json.loads(tool_messages(run.client.requests[1])[0]["content"])
+    assert payload["status"] == "ok"
+    assert payload["result_count"] == 1
+    assert payload["results"][0]["source_url"] == "https://hyundai.co.il/tucson"
+    assert "ILS 179,900" in payload["results"][0]["snippet"]
+    assert "ILS 12,000" in payload["results"][0]["snippet"]
+    assert run.result["content"] == '{"models":[{"model_name_en":"Tucson"}]}'
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"search_results": []}, 0),
+    ({"search_results": [{"title": "t", "url": "https://e", "snippet": "s"}]}, 1),
+    ({"search_results": [{"nothing": "usable"}]}, 0),
+    ({"search_results": ["a bare string row"]}, 1),
+    ({"search_results": [{"title": "t", "url": "https://e", "chunks": "not a list"}]}, 1),
+    ({"search_results": [{"title": "t", "url": "https://e", "chunks": [None, 7]}]}, 1),
+    ({"unrecognised": "envelope"}, 0),
+    ("not an envelope at all", 0),
+    (None, 0),
+])
+def test_every_response_shape_degrades_without_inventing_results(payload, expected):
+    results = normalize_results(payload)
+    assert len(results) == expected
+    for result in results:
+        assert len(result.snippet) <= 1_000
+        assert len(result.title) <= 200
+        assert len(result.url) <= 500
+
+
+def test_the_documented_envelope_wins_over_a_generic_alias():
+    """A response carrying both must be read by its contract, not by luck."""
+    results = normalize_results({"data": [{"title": "alias"}],
+                                 "search_results": [{"title": "contract"}]})
+    assert [r.title for r in results] == ["contract"]
+
+
+def test_pro_chunk_material_is_bounded_however_many_chunks_arrive():
+    """The provider chooses how many passages; MILO chooses how much it holds."""
+    huge = {"search_results": [{
+        "title": "t", "url": "https://e",
+        "chunks": [{"text": "passage " * 200} for _ in range(5_000)],
+    }]}
+    results = normalize_results(huge)
+    assert len(results) == 1
+    assert len(results[0].snippet) <= 1_000
+
+
+# =============================================================================
+# The reviewed envelope did not move
+# =============================================================================
+
+def test_this_change_widened_no_runtime_policy_or_budget_ceiling():
+    """Search work must not buy itself more room than the review granted."""
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    from backend.runtime_policy import reviewed_first_run_policy
+
+    policy = reviewed_first_run_policy()
+    assert policy.values["max_search_invocations_per_run"] == 60
+    assert policy.values["search_cost_per_invocation"] == pytest.approx(0.003)
+    assert policy.values["max_cost_per_run"] == pytest.approx(1.00)
+    assert policy.values["max_builtin_searches_per_request"] == 4
+
+    stage_d = _Path("scripts/release/stage-d")
+    _sys.path.insert(0, str(stage_d))
+    import policy_envelope
+
+    assert policy_envelope.PINNED_POLICY_FINGERPRINT == policy.fingerprint(), (
+        "the runtime policy moved without a reviewed re-pin")

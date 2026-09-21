@@ -1,12 +1,14 @@
 import importlib.util
+import inspect
 import sys
 import types
 from pathlib import Path
 
 import pytest
 
-from backend import provider_authority
+from backend import provider_authority, provider_scheduler, standalone_search
 from backend.engines.vehicle_catalog_v1 import core
+from backend.worker import main as worker_main
 from backend.engines.vehicle_catalog_v1.adapter import VehicleCatalogV1Adapter
 
 
@@ -42,17 +44,7 @@ def legacy_app():
 
 
 def test_preserved_numeric_limits_and_model_settings():
-    # The provider host is still preserved, but it is no longer a V1-LOCAL
-    # constant: `core.MOONSHOT_BASE_URL` was a duplicate of the one canonical
-    # base the whole runtime resolves, and a second copy of a host is a second
-    # thing that can drift. What this guard is for is the VALUE, so it is
-    # asserted where the value now lives.
-    assert provider_authority.DEFAULT_PROVIDER_BASE_URL == "https://api.moonshot.ai/v1"
-    # ...and that V1 reads it through that one resolver rather than keeping
-    # its own again.
-    assert core.provider_base_url is provider_authority.provider_base_url
-    assert not hasattr(core, "MOONSHOT_BASE_URL"), (
-        "V1 grew a second provider host constant back")
+    assert core.MOONSHOT_BASE_URL == "https://api.moonshot.ai/v1"
     assert core.KIMI_MODEL == "kimi-k2.6"
     assert core.SEARCH_TEMPERATURE == 0.6
     assert core.CONSOLIDATION_TEMPERATURE == 0.6
@@ -62,6 +54,74 @@ def test_preserved_numeric_limits_and_model_settings():
     assert core.API_CONCURRENCY_MAX_RETRIES == 2
     assert core.TECHNICAL_MODEL_CHUNK_SIZE == 4
     assert core.VERIFIER_MODEL_CHUNK_SIZE == 6
+
+
+def test_the_legacy_host_constant_is_a_descriptor_not_an_authority():
+    """`MOONSHOT_BASE_URL` may exist. It may not DECIDE anything.
+
+    The constant above is a compatibility export the preserved-engine parity
+    contract carries. The defect it used to be was different: V1 read its own
+    hard-coded host while V2 chat and standalone search honoured
+    MILO_MODEL_BASE_URL, so one deployment could address two providers and
+    nothing could tell. Keeping the name is fine; keeping a SECOND
+    configurable host is not.
+    """
+    # It is bound to the canonical default, so it cannot drift from it.
+    assert core.MOONSHOT_BASE_URL is provider_authority.DEFAULT_PROVIDER_BASE_URL
+    # V1's own client construction resolves the canonical function instead.
+    v1_client = inspect.getsource(core._provider_client)
+    assert "provider_base_url()" in v1_client
+    assert "MOONSHOT_BASE_URL" not in v1_client
+
+    # And no runtime module anywhere reads the descriptor. The sweep is over
+    # backend/ rather than this engine alone, because a second authority is
+    # just as harmful imported from somewhere else.
+    readers = []
+    for path in Path("backend").rglob("*.py"):
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if "MOONSHOT_BASE_URL" not in line:
+                continue
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue          # the descriptor's own explanation
+            if stripped.startswith("MOONSHOT_BASE_URL = "):
+                continue          # the descriptor itself
+            readers.append(f"{path}:{number}: {stripped}")
+    assert not readers, f"the legacy host descriptor is being read at runtime: {readers}"
+
+
+def test_one_env_knob_moves_v1_chat_v2_chat_and_search_together(monkeypatch):
+    """The split-brain configuration this PR removed cannot come back.
+
+    Setting MILO_MODEL_BASE_URL must move ALL THREE provider paths, and the
+    legacy descriptor must stay exactly where it was -- proving it is inert
+    rather than a second knob that quietly disagrees with the first.
+    """
+    configured = "https://provider-proxy.example/v1"
+    monkeypatch.setenv("MILO_MODEL_BASE_URL", configured + "/")
+
+    # V1 chat: capture the base URL its client construction really passes.
+    scheduler = provider_scheduler.ProviderScheduler(
+        provider_scheduler.ProviderLimitsConfig())
+    seen: list[str] = []
+    monkeypatch.setattr(core, "PROVIDER_SCHEDULER", scheduler)
+    monkeypatch.setattr(core, "PROVIDER_ADAPTER",
+                        provider_authority.ProviderAdapter(scheduler))
+    monkeypatch.setattr(core, "MODEL_CLIENT_FACTORY",
+                        lambda api_key, base_url: seen.append(base_url) or object())
+    core._provider_client("k")
+    assert seen == [configured], "V1 chat did not follow the deployment knob"
+
+    # Standalone search resolves the same value...
+    assert standalone_search.search_base_url() == configured
+    # ...and V2's gateway is wired from the same resolver rather than its own.
+    worker_source = inspect.getsource(worker_main.execute_run)
+    assert worker_source.count("base_url=provider_base_url()") == 2, (
+        "worker chat/search wiring no longer both read the canonical resolver")
+    assert provider_authority.provider_base_url() == configured
+
+    # The descriptor did NOT move, because it decides nothing.
+    assert core.MOONSHOT_BASE_URL == "https://api.moonshot.ai/v1"
 
 
 def test_new_engine_core_does_not_import_streamlit():

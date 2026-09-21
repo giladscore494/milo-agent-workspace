@@ -11,7 +11,8 @@ from threading import BoundedSemaphore
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.provider_authority import (SEARCH_PRO, ProviderAdapter, classify_outcome,
+from backend.provider_authority import (DEFAULT_PROVIDER_BASE_URL, SEARCH_PRO,
+                                        ProviderAdapter, classify_outcome,
                                         provider_base_url)
 from backend.standalone_search import (MEDIATED_SEARCH_TOOL_NAME, SearchOutcome,
                                        SearchQueryInvalid, mediated_search_tool)
@@ -22,6 +23,24 @@ from backend.provider_scheduler import (
     is_provider_rate_limit_error,
 )
 
+# LEGACY COMPATIBILITY DESCRIPTOR -- NOT A RUNTIME AUTHORITY.
+#
+# V1 used to hold its own hard-coded provider host here while V2 chat and
+# standalone search both honoured MILO_MODEL_BASE_URL. One deployment could
+# therefore point V1's chat at one host and V2/search at another, silently,
+# with nothing in the runtime able to notice the split. That defect is fixed:
+# every provider request -- V1 chat, V2 chat and standalone search -- resolves
+# `provider_base_url()`, and this module's own client construction does too
+# (see `_provider_client`).
+#
+# The NAME survives because the preserved-engine parity contract exports it
+# and deleting a public constant is itself a compatibility break. It is BOUND
+# to the canonical default rather than restating the string, so it cannot
+# drift from it, and nothing at runtime reads it -- a second configurable
+# host is exactly what was removed. `tests/test_vehicle_catalog_engine.py`
+# pins both halves: the value is preserved, and it is not what any provider
+# request consults.
+MOONSHOT_BASE_URL = DEFAULT_PROVIDER_BASE_URL
 KIMI_MODEL = "kimi-k2.6"
 SEARCH_TEMPERATURE = 0.6
 CONSOLIDATION_TEMPERATURE = 0.6

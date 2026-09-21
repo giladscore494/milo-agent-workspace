@@ -308,7 +308,11 @@ def _result_rows(payload: Any) -> Sequence[Any]:
         return payload
     if not isinstance(payload, Mapping):
         return ()
-    for key in ("results", "data", "items", "documents", "search_results", "web_results"):
+    # `search_results` FIRST: it is the documented envelope, and a response
+    # that also carried a generic `data`/`results` key would otherwise have
+    # the alias win over the contract. The rest stay as read-only
+    # compatibility for older fixtures.
+    for key in ("search_results", "results", "data", "items", "documents", "web_results"):
         value = payload.get(key)
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
             return value
@@ -352,16 +356,27 @@ def normalize_results(payload: Any) -> tuple[SearchResult, ...]:
         chunks = row.get("chunks")
         chunk_texts: list[str] = []
         if isinstance(chunks, Sequence) and not isinstance(chunks, (str, bytes)):
+            # The joined material is clipped to MAX_RESULT_SNIPPET_CHARS
+            # anyway, so anything collected past that budget is built only to
+            # be thrown away. Spending the budget DOWN keeps the output
+            # byte-identical while refusing to materialise an arbitrarily
+            # large intermediate from a response that carries thousands of
+            # chunks -- the provider decides how many there are, MILO decides
+            # how much of them it will ever hold.
+            budget = MAX_RESULT_SNIPPET_CHARS
             for chunk in chunks:
+                if budget <= 0:
+                    break
                 if isinstance(chunk, Mapping):
                     text = chunk.get("text")
                 elif isinstance(chunk, str):
                     text = chunk
                 else:
                     text = None
-                clipped = _clip(text, MAX_RESULT_SNIPPET_CHARS)
+                clipped = _clip(text, budget)
                 if clipped:
                     chunk_texts.append(clipped)
+                    budget -= len(clipped) + 1  # + the join separator
         snippet = ("\n".join(chunk_texts) if chunk_texts else
                    (row.get("snippet") or row.get("content") or row.get("text")
                     or row.get("summary") or row.get("description")))
