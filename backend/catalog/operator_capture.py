@@ -192,6 +192,7 @@ from backend.catalog.government.source import (GOVERNMENT_SOURCE_REASONS,
 from backend.engines.swarm_v2.evidence import WorkerLease
 from backend.errors import AppError
 from backend.event_registry import CAPTURE_SNAPSHOT_REPLAYED
+from backend.finalization import RunFinalizer, TerminalClaim
 from backend.run_identity import RunIdentity
 from backend.production_config import TRUE_VALUES
 from backend.runtime import TERMINAL_STATES, CancellationRequested
@@ -927,17 +928,16 @@ def _finalize(repository: Any, lease: WorkerLease, *, document: Mapping[str, Any
     """
     lease_kwargs = {"worker_id": lease.worker_id, "attempt": lease.attempt,
                     "lease_token": lease.lease_token}
+    finalizer = RunFinalizer(repository, lease.run_id, "operator_capture", lease_kwargs)
     try:
         if cancelled:
-            repository.transition_run(lease.run_id, "cancelled",
-                                      expected_worker_id=lease.worker_id,
-                                      expected_attempt=lease.attempt,
-                                      expected_lease_token=lease.lease_token)
+            finalizer.finalize(TerminalClaim.cancelled("operator_capture"))
         elif reason_code:
-            repository.mark_run_failed(lease.run_id, reason_code, safe_message(reason_code),
-                                       **lease_kwargs)
+            finalizer.finalize(TerminalClaim.failure(
+                "operator_capture", reason_code, safe_message(reason_code)))
         else:
-            repository.mark_run_complete(lease.run_id, dict(document), **lease_kwargs)
+            finalizer.finalize(TerminalClaim.control_success(
+                "operator_capture", dict(document)))
     except Exception:
         # Broad and silent for the same reason the heartbeat is: the message
         # may quote the database, and the capture's own outcome is already
