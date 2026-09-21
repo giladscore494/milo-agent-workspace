@@ -275,6 +275,17 @@ class RunIdentity:
                     "the run identity is missing a required dimension")
             values[field] = value.strip()
         identity = cls(**values)  # type: ignore[arg-type]
+        if len(identity.policy_fingerprint) != 64 or any(
+                char not in "0123456789abcdef" for char in identity.policy_fingerprint.lower()):
+            raise RunIdentityError(
+                "RUN_IDENTITY_POLICY_FINGERPRINT_INVALID",
+                "the run identity carries an invalid policy fingerprint")
+        if identity.release_sha and (
+                len(identity.release_sha) != 40
+                or any(char not in "0123456789abcdef" for char in identity.release_sha.lower())):
+            raise RunIdentityError(
+                "RUN_IDENTITY_RELEASE_INVALID",
+                "the run identity carries an invalid release SHA")
         if identity.workflow_key not in SUPPORTED_ENGINE_VERSIONS:
             raise RunIdentityError(
                 "RUN_IDENTITY_WORKFLOW_UNKNOWN",
@@ -352,6 +363,34 @@ def require_identity(run: Any) -> RunIdentity:
     return identity
 
 
+def execution_identity_problems(
+    identity: RunIdentity,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Why this runtime may NOT execute/resume a persisted run identity.
+
+    Historical read/export compatibility is intentionally broader. Execution
+    must match the exact engine contract, reviewed policy, event vocabulary and
+    release that the run recorded when it was created; otherwise a retry after
+    a deploy would silently execute a different runtime while keeping the old
+    identity.
+    """
+    problems: list[str] = []
+    current_engine = ENGINE_VERSIONS.get(identity.workflow_key)
+    if current_engine != identity.engine_version:
+        problems.append("engine_version")
+    if identity.policy_version != POLICY_SCHEMA_VERSION:
+        problems.append("policy_version")
+    if identity.policy_fingerprint != reviewed_policy_fingerprint():
+        problems.append("policy_fingerprint")
+    if identity.event_registry_version != REGISTRY_VERSION:
+        problems.append("event_registry_version")
+    if identity.release_sha != release_sha(env):
+        problems.append("release_sha")
+    return tuple(problems)
+
+
 def identity_mutation_problems(current: Any, proposed: Any) -> list[str]:
     """Why a proposed identity may not replace `current`. Empty means it may.
 
@@ -383,6 +422,6 @@ def identity_mutation_problems(current: Any, proposed: Any) -> list[str]:
 __all__ = [
     "ENGINE_VERSIONS", "SUPPORTED_ENGINE_VERSIONS", "IDENTITY_FIELDS", "IDENTITY_VERSION",
     "RELEASE_SHA_ENV", "RUN_IDENTITY_FIELD", "RunIdentity", "RunIdentityError",
-    "engine_version_for", "identity_mutation_problems", "persisted_identity",
+    "engine_version_for", "execution_identity_problems", "identity_mutation_problems", "persisted_identity",
     "release_sha", "require_identity", "reviewed_policy_fingerprint",
 ]
