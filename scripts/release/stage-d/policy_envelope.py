@@ -178,9 +178,13 @@ def expected_run_identity(release_sha: str | None = None) -> dict[str, str]:
     """
     from backend.event_registry import REGISTRY_VERSION
     from backend.run_identity import (ENGINE_VERSIONS, IDENTITY_VERSION,
-                                      engine_version_for)
+                                      PRODUCT_WORKFLOW_KEYS, engine_version_for)
 
     workflow_key = os.environ.get("STAGE_D_WORKFLOW_KEY", "vehicle_catalog_v1")
+    if workflow_key not in PRODUCT_WORKFLOW_KEYS:
+        raise SystemExit(
+            f"STAGE D REFUSED: STAGE_D_WORKFLOW_KEY={workflow_key!r} is not an "
+            "authorized product workflow")
     if workflow_key not in ENGINE_VERSIONS:
         raise SystemExit(
             f"STAGE D REFUSED: STAGE_D_WORKFLOW_KEY={workflow_key!r} has no declared "
