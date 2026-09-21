@@ -434,7 +434,8 @@ create or replace function public.transition_run_worker_guarded(
   p_finished_at timestamptz default null
 ) returns setof public.runs
 language plpgsql
-as $$
+set search_path = pg_catalog
+as $
 declare
   v_row public.runs;
 begin
@@ -443,6 +444,15 @@ begin
     raise exception 'CANONICAL_FINALIZER_REQUIRED: terminal status % must use finalize_run_guarded', p_status
       using errcode = '55000';
   end if;
+
+  -- Console 6 fencing is the full run + attempt + worker + lease contract.
+  -- NULL attempt/token must never weaken this into "check only the fields that
+  -- happened to be supplied". The canonical assertion refuses missing,
+  -- expired or replaced ownership before the mutation, and the exact WHERE
+  -- below closes the concurrent-reclaim window in the write itself.
+  perform public.assert_worker_lease(
+    p_run_id, p_worker_id, p_attempt, p_lease_token
+  );
 
   update public.runs
      set status = p_status,
@@ -455,8 +465,8 @@ begin
          updated_at = now()
    where id = p_run_id
      and worker_id = p_worker_id
-     and (p_attempt is null or attempt = p_attempt)
-     and (p_lease_token is null or lease_token = p_lease_token)
+     and attempt = p_attempt
+     and lease_token = p_lease_token
      and lease_expires_at > now()
      and (p_expected_status is null or status = p_expected_status)
    returning * into v_row;
