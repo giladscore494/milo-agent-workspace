@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from decimal import Decimal, InvalidOperation
@@ -915,7 +916,7 @@ STAGE_D_RUN_METADATA_STAGE = "stage-d-smoke"
 
 #: Every column the identity gate and the proofs need.
 RUN_SELECT = ("id,status,launch_state,worker_id,attempt,started_at,finished_at,"
-              "idempotency_key,requested_by,conversation_id,input")
+              "idempotency_key,requested_by,conversation_id,input,run_identity")
 
 
 def run_metadata(run: dict) -> dict:
@@ -1004,6 +1005,32 @@ def check_stage_d_run_identity(run: dict, expected_key: str, problems: list[str]
         problems.append(
             f"run {run_id} belongs to conversation {run.get('conversation_id')!r}, not the recorded Stage D "
             f"conversation {expected_conversation!r}")
+
+    # Console 6 immutable identity is part of the authorization, not merely
+    # evidence collected after the run. Cleanup must not mutate a row whose
+    # release/policy/engine/event vocabulary differs from the Stage D pin.
+    expected_identity = expected_run_identity()
+    identity = run.get("run_identity")
+    if isinstance(identity, str):
+        try:
+            identity = json.loads(identity)
+        except json.JSONDecodeError:
+            identity = None
+    if expected_identity is None:
+        problems.append(
+            "STAGE_D_EXPECTED_RUN_IDENTITY is missing or invalid — refusing cleanup mutation")
+    elif not isinstance(identity, dict):
+        problems.append(
+            f"run {run_id} has no readable immutable run_identity — refusing cleanup mutation")
+    else:
+        if str(identity.get("run_id") or "") != run_id:
+            problems.append(
+                f"run {run_id} carries an immutable identity for a different run — refusing cleanup mutation")
+        for field, expected in expected_identity.items():
+            actual = identity.get(field)
+            if str(actual or "") != str(expected):
+                problems.append(
+                    f"run {run_id} immutable identity field {field!r} does not match the Stage D release pin")
 
 
 def terminalize() -> None:
