@@ -375,7 +375,7 @@ class InProcessFakeWorkerLauncher:
             if "exhaust budget" in content:
                 tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=2, estimated_cost_per_call=0.01),
                                         kill_switch=lambda: True, event_emitter=emit,
-                                        usage_recorder=lambda usage: repo.update_run_usage(run_id, usage, lease=lease))
+                                        usage_recorder=lambda usage: repo.update_run_usage(run_id, usage, **lease))
                 try:
                     while True:  # every iteration is a MOCKED call, gated first
                         tracker.before_call()
@@ -402,7 +402,7 @@ class InProcessFakeWorkerLauncher:
             self._emit(run_id, "source_recorded", "Example source", agent="researcher",
                        payload={"id": "src-1", "title": "Example source", "domain": "example.com",
                                 "url": "https://example.com", "source_type": "web", "source_strength": "high"},
-                       **lease)
+                       lease=lease)
 
             if engine == "swarm_v2":
                 # The shipped V2 contract builds the payload; the canonical
