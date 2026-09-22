@@ -647,3 +647,166 @@ class CatalogReviewPage(BaseModel):
     snapshot: CatalogReviewSnapshot | None = None
     page: CatalogPageMeta
     items: list[CatalogReviewCandidateItem] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Mapping plans: the canonical WorkScope (`backend/catalog/scope/`).
+# ---------------------------------------------------------------------------
+#
+# Requests carry EITHER an instruction OR an edit. The edit is deliberately an
+# open object here: every rule about it -- its closed key set, its types, its
+# ranges -- lives in ONE validator (`contract.scope_from_fields`), which the
+# instruction path goes through too, so a click and a sentence are refused for
+# the same reasons in the same words. Responses are closed shapes, a second
+# check over the projection `backend/catalog/scope/service.py` builds key by key.
+
+
+class WorkScopeCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    instruction: str | None = None
+    edit: dict[str, Any] | None = None
+
+
+class WorkScopeRevise(WorkScopeCreate):
+    # The exact head this revision is made against. Both must still match.
+    expected_revision: int = Field(ge=1, strict=True)
+    expected_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class WorkScopeLimits(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_units: int
+    max_items: int
+    default_max_items: int
+    max_batch_size: int
+    default_batch_size: int
+    min_model_year: int
+    max_model_year: int
+    max_instruction_chars: int
+
+
+class WorkScopeCapabilities(BaseModel):
+    """Whether the Mapping Plan applies, and the server's own bounds for it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool
+    reason: str | None = None
+    contract: str
+    directory_version: str
+    limits: WorkScopeLimits
+    can_prepare: bool
+    can_start_batches: bool
+
+
+class WorkScopeOrigin(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    label: str
+
+
+class WorkScopeEntryCoverage(BaseModel):
+    """`canonical_variants` is null unless `state` is `known`; never a zero."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: str
+    canonical_variants: int | None = None
+
+
+class WorkScopeDirectoryEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    name: str
+    name_he: str
+    origin: str
+    register_marque: str | None = None
+    register_marque_verified: bool
+    coverage: WorkScopeEntryCoverage
+
+
+class WorkScopeCoverageSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool
+    catalog_variants: int | None = None
+    attributed_variants: int | None = None
+
+
+class WorkScopeDirectory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    directory_version: str
+    origins: list[WorkScopeOrigin]
+    entries: list[WorkScopeDirectoryEntry]
+    coverage: WorkScopeCoverageSummary
+
+
+class WorkScopeNote(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    terms: list[str] = Field(default_factory=list)
+    units: list[str] = Field(default_factory=list)
+
+
+class WorkScopePlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    contract: str
+    directory_version: str
+    units: list[str]
+    model_year_from: int | None = None
+    model_year_to: int | None = None
+    max_items: int
+    batch_size: int
+
+
+class WorkScopeRevisionView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: int
+    digest: str
+    input_kind: str
+    instruction: str | None = None
+    notes: list[WorkScopeNote] = Field(default_factory=list)
+    created_at: str | None = None
+
+
+class WorkScopeState(BaseModel):
+    """One plan: its head (revision + digest), what it says, and its history."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_scope_id: UUID
+    conversation_id: UUID
+    project_id: UUID
+    status: str
+    revision: int
+    digest: str
+    current: bool
+    plan: WorkScopePlan
+    head: WorkScopeRevisionView
+    history: list[WorkScopeRevisionView] = Field(default_factory=list)
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class WorkScopeOpen(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    work_scope: WorkScopeState | None = None
+
+
+class WorkScopeMutationResult(BaseModel):
+    """`applied` is false when the request was understood and changed nothing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    applied: bool
+    notes: list[WorkScopeNote] = Field(default_factory=list)
+    work_scope: WorkScopeState

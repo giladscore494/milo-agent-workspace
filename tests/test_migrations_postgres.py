@@ -3661,6 +3661,10 @@ CATALOG_CANONICAL_TABLES = ("catalog_models", "catalog_model_variants")
 #: canonical tables above are the frozen revision-1 identity.
 CATALOG_PROVENANCE_TABLES = ("catalog_canonical_field_provenance",)
 CATALOG_VIEWS = ("catalog_canonical_field_current", "catalog_canonical_variant_current")
+#: Scoped catalog PR1: the mapping plan and its append-only revisions. Catalog
+#: relations like the rest -- service-only, RLS on with no policy, every foreign
+#: key RESTRICT and indexed -- so they join every family-wide check below.
+CATALOG_WORK_SCOPE_TABLES = ("catalog_work_scopes", "catalog_work_scope_revisions")
 CATALOG_RPCS = ("record_catalog_snapshot_guarded", "record_catalog_raw_record_guarded",
                 "activate_catalog_snapshot_guarded", "record_catalog_candidate_guarded",
                 "link_catalog_candidate_evidence_guarded")
@@ -3801,14 +3805,16 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
         "20260915120000_catalog_integrity_corrections.sql",
         "20260915180000_catalog_raw_record_source_locator.sql",
         "20260916090000_catalog_bounded_candidate_queries.sql",
-        "20260916120000_catalog_field_level_promotion.sql"]
+        "20260916120000_catalog_field_level_promotion.sql",
+        "20260922000100_catalog_work_scopes.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
     # `information_schema.tables` lists views too, so the expected count is the
     # base relations plus the two canonical read-model views PR3 adds.
     assert before == str(len(CATALOG_STAGING_TABLES) + len(CATALOG_CANONICAL_TABLES)
-                         + len(CATALOG_PROVENANCE_TABLES) + len(CATALOG_VIEWS))
+                         + len(CATALOG_PROVENANCE_TABLES) + len(CATALOG_VIEWS)
+                         + len(CATALOG_WORK_SCOPE_TABLES))
     _reapply_catalog_migrations(db)
     _reapply_catalog_migrations(db)
     assert db.psql(
@@ -7311,3 +7317,263 @@ def test_the_run_identity_migration_is_service_only_and_rerun_safe(db):
     assert db.psql("select count(*) from pg_proc where proname='create_message_and_run_v3'") == "1"
     assert db.psql("select count(*) from pg_trigger where tgname='runs_forbid_identity_rewrite'") == "1"
     assert db.psql("select count(*) from pg_trigger where tgname='runs_require_identity_on_insert'") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Scoped catalog PR1 -- 20260922000100_catalog_work_scopes: the ONE canonical,
+# server-owned mapping plan.
+# ---------------------------------------------------------------------------
+#
+# `tests/test_work_scope.py` proves the backend half against the in-memory
+# mirror. What only SQL can prove is proved here: that the database derives the
+# digest from the stored text and refuses any row where the two disagree; that a
+# stale head fails closed under a row lock; that one conversation holds at most
+# one open plan; that revisions are append-only and numbered without a gap; that
+# membership and the trusted workflow are re-checked in the writer itself; and
+# that the coverage read counts canonical variants exactly.
+
+
+def _work_scope_migration():
+    return next(m for m in MIGRATIONS if m.name.startswith("20260922000100"))
+
+
+def _ws_world(db, workflow_key: str = "swarm_v2") -> tuple[str, str, str]:
+    """A member, a project of `workflow_key`, and one conversation in it."""
+    user, project, conversation = (str(uuid.uuid4()) for _ in range(3))
+    db.psql(
+        f"insert into auth.users (id) values ('{user}'); "
+        f"insert into public.projects (id, slug, name, workflow_key, configuration) values "
+        f"('{project}', 'ws-{project[:12]}', 'Work scope', '{workflow_key}', '{{}}'::jsonb); "
+        f"insert into public.project_members (project_id, user_id, role) values "
+        f"('{project}', '{user}', 'owner'); "
+        f"insert into public.conversations (id, project_id, title) values "
+        f"('{conversation}', '{project}', 'plan')")
+    return user, project, conversation
+
+
+def _ws_scope(**overrides):
+    from backend.catalog.scope import contract as wsc
+
+    fields = {"units": ["toyota", "lexus"], "model_year_from": 2018, "model_year_to": None,
+              "max_items": 800, "batch_size": 10, **overrides}
+    return wsc.scope_from_fields(fields)
+
+
+def _ws_revision(scope, kind: str = "edit", instruction: str | None = None) -> str:
+    payload = {"scope_text": scope.canonical_text(), "input_kind": kind,
+               "instruction": instruction, "notes": []}
+    return "$ws$" + json.dumps(payload) + "$ws$::jsonb"
+
+
+def _ws_create(db, conversation: str, user: str, scope, **kwargs) -> dict:
+    return json.loads(db.psql(
+        f"select public.create_work_scope('{conversation}', '{user}', {_ws_revision(scope, **kwargs)})"))
+
+
+def test_work_scope_migration_is_service_only_and_rerun_safe(db):
+    for table in ("catalog_work_scopes", "catalog_work_scope_revisions"):
+        assert db.psql(f"select relrowsecurity from pg_class where oid='public.{table}'::regclass") == "t"
+        assert db.psql(f"select count(*) from pg_policies where tablename='{table}'") == "0"
+        for role in ("anon", "authenticated"):
+            for privilege in ("select", "insert", "update", "delete"):
+                assert db.psql(f"select has_table_privilege('{role}', 'public.{table}', '{privilege}')") == "f"
+        assert db.psql(f"select has_table_privilege('service_role', 'public.{table}', 'delete')") == "f"
+    # The head advances; a revision never changes.
+    assert db.psql("select has_table_privilege('service_role', 'public.catalog_work_scopes', 'update')") == "t"
+    assert db.psql("select has_table_privilege('service_role', 'public.catalog_work_scope_revisions', 'update')") == "f"
+    for signature in ("public.create_work_scope(uuid, uuid, jsonb)",
+                      "public.revise_work_scope(uuid, integer, text, uuid, jsonb)",
+                      "public.catalog_canonical_manufacturer_coverage(text[])"):
+        for role in ("anon", "authenticated"):
+            assert not _has_execute(db, role, signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+
+    db.psql(file=_work_scope_migration())
+    db.psql(file=_work_scope_migration())
+    for trigger in ("catalog_work_scope_revisions_append_only",
+                    "catalog_work_scope_revisions_in_sequence",
+                    "catalog_work_scopes_identity_immutable",
+                    "catalog_work_scopes_head_is_a_revision"):
+        assert db.psql(f"select count(*) from pg_trigger where tgname='{trigger}'") == "1"
+
+
+def test_a_plan_is_born_with_a_digest_the_database_derives_from_its_text(db):
+    user, project, conversation = _ws_world(db)
+    scope = _ws_scope()
+    created = _ws_create(db, conversation, user, scope)
+
+    revision = created["revision"]
+    # The database's own sha256 of the stored text IS the backend's digest --
+    # the portable identity the browser is shown and must name back.
+    assert revision["digest"] == scope.digest()
+    assert revision["scope_text"] == scope.canonical_text()
+    assert revision["scope"] == scope.as_record()
+    assert revision["revision"] == 1
+    plan = created["work_scope"]
+    assert (plan["head_revision"], plan["head_digest"], plan["status"]) == (1, scope.digest(), "draft")
+    # The project is DERIVED from the conversation, never supplied.
+    assert plan["project_id"] == project
+    assert plan["closed_at"] is None
+
+
+def test_a_revision_must_name_exactly_the_current_head(db):
+    user, _project, conversation = _ws_world(db)
+    first = _ws_scope()
+    plan = _ws_create(db, conversation, user, first)["work_scope"]["id"]
+    second = _ws_scope(units=["toyota"])
+
+    revised = json.loads(db.psql(
+        f"select public.revise_work_scope('{plan}', 1, '{first.digest()}', '{user}', "
+        f"{_ws_revision(second, 'instruction', 'only Toyota')})"))
+    assert revised["work_scope"]["head_revision"] == 2
+    assert revised["work_scope"]["head_digest"] == second.digest()
+    assert revised["revision"]["instruction"] == "only Toyota"
+
+    third = _ws_scope(units=["mazda"])
+    # The old head again -- by revision, and by digest -- is refused, and
+    # nothing is written.
+    for revision, digest in ((1, first.digest()), (2, first.digest()), (1, second.digest())):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+            db.psql(f"select public.revise_work_scope('{plan}', {revision}, '{digest}', '{user}', "
+                    f"{_ws_revision(third)})")
+    assert db.psql(f"select count(*) from public.catalog_work_scope_revisions where work_scope_id='{plan}'") == "2"
+    assert db.psql(f"select head_revision from public.catalog_work_scopes where id='{plan}'") == "2"
+
+
+def test_one_conversation_holds_at_most_one_open_plan(db):
+    user, _project, conversation = _ws_world(db)
+    _ws_create(db, conversation, user, _ws_scope())
+    with pytest.raises(AssertionError, match="WORK_SCOPE_OPEN_EXISTS"):
+        _ws_create(db, conversation, user, _ws_scope(units=["mazda"]))
+    assert db.psql(f"select count(*) from public.catalog_work_scopes where conversation_id='{conversation}'") == "1"
+
+
+def test_the_writers_recheck_membership_and_answer_one_way_for_absent_and_forbidden(db):
+    user, _project, conversation = _ws_world(db)
+    outsider = str(uuid.uuid4())
+    db.psql(f"insert into auth.users (id) values ('{outsider}')")
+    for who, where in ((outsider, conversation), (user, str(uuid.uuid4()))):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_CONVERSATION_NOT_FOUND"):
+            _ws_create(db, where, who, _ws_scope())
+
+    scope = _ws_scope()
+    plan = _ws_create(db, conversation, user, scope)["work_scope"]["id"]
+    for who, which in ((outsider, plan), (user, str(uuid.uuid4()))):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_NOT_FOUND"):
+            db.psql(f"select public.revise_work_scope('{which}', 1, '{scope.digest()}', '{who}', "
+                    f"{_ws_revision(_ws_scope(units=['mazda']))})")
+
+
+def test_only_a_project_whose_trusted_engine_reads_the_catalog_takes_a_plan(db):
+    user, _project, conversation = _ws_world(db, workflow_key="vehicle_catalog_v1")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_WORKFLOW_UNSUPPORTED"):
+        _ws_create(db, conversation, user, _ws_scope())
+    assert db.psql(f"select count(*) from public.catalog_work_scopes where conversation_id='{conversation}'") == "0"
+
+
+def test_no_path_can_store_a_revision_that_disagrees_with_its_own_text(db):
+    """Direct service-role INSERTs, bypassing both writers."""
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope()
+    plan = _ws_create(db, conversation, user, scope)["work_scope"]["id"]
+    text = scope.canonical_text()
+    other = _ws_scope(units=["mazda"])
+
+    def insert(scope_text: str, scope_json: str, digest: str, kind: str = "edit",
+               instruction: str = "null") -> None:
+        db.psql("insert into public.catalog_work_scope_revisions "
+                "(work_scope_id, revision, scope_text, scope, digest, input_kind, instruction, created_by) "
+                f"values ('{plan}', 2, $t${scope_text}$t$, $t${scope_json}$t$::jsonb, '{digest}', "
+                f"'{kind}', {instruction}, '{user}')")
+
+    # A digest that is not the sha256 of the text.
+    with pytest.raises(AssertionError, match="catalog_work_scope_revisions_digest_derived"):
+        insert(other.canonical_text(), other.canonical_text(), scope.digest())
+    # A jsonb record that is not the text.
+    with pytest.raises(AssertionError, match="catalog_work_scope_revisions_scope_is_text"):
+        insert(other.canonical_text(), text, other.digest())
+    # Records outside the contract's hard bounds.
+    for broken in ({**other.as_record(), "batch_size": 21},
+                   {**other.as_record(), "max_items": 2001},
+                   {**other.as_record(), "units": ["toyota", "toyota"]},
+                   {**other.as_record(), "units": []},
+                   {**other.as_record(), "model_years": {"from": 2024, "to": 2018}},
+                   {**other.as_record(), "extra": True},
+                   {**other.as_record(), "contract": "milo-work-scope/2"},
+                   {**other.as_record(), "source": {"family": "government"}}):
+        from backend.catalog.scope import contract as wsc
+        broken_text = wsc.canonical_text(broken)
+        with pytest.raises(AssertionError, match="catalog_work_scope_revisions_record_valid"):
+            insert(broken_text, broken_text, wsc.scope_digest(broken_text))
+    # An instruction revision without its words, and an edit carrying some.
+    with pytest.raises(AssertionError, match="instruction_matches_kind"):
+        insert(other.canonical_text(), other.canonical_text(), other.digest(), kind="instruction")
+    with pytest.raises(AssertionError, match="instruction_matches_kind"):
+        insert(other.canonical_text(), other.canonical_text(), other.digest(), instruction="'x'")
+    assert db.psql(f"select count(*) from public.catalog_work_scope_revisions where work_scope_id='{plan}'") == "1"
+
+
+def test_the_writer_refuses_a_malformed_revision_by_name(db):
+    user, _project, conversation = _ws_world(db)
+    for payload in ("'{}'::jsonb", "'[]'::jsonb",
+                    "'{\"scope_text\": \"{}\", \"input_kind\": \"edit\"}'::jsonb",
+                    "'{\"scope_text\": \"not json\", \"input_kind\": \"edit\"}'::jsonb"):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_REVISION_INVALID"):
+            db.psql(f"select public.create_work_scope('{conversation}', '{user}', {payload})")
+    # Nothing half-written: a refused revision leaves no plan behind.
+    assert db.psql(f"select count(*) from public.catalog_work_scopes where conversation_id='{conversation}'") == "0"
+
+
+def test_revisions_are_append_only_and_a_plan_can_never_be_rewritten(db):
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope()
+    plan = _ws_create(db, conversation, user, scope)["work_scope"]["id"]
+
+    with pytest.raises(AssertionError, match="WORK_SCOPE_REVISION_IMMUTABLE"):
+        db.psql(f"update public.catalog_work_scope_revisions set instruction = 'x' where work_scope_id='{plan}'")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_REVISION_IMMUTABLE"):
+        db.psql(f"delete from public.catalog_work_scope_revisions where work_scope_id='{plan}'")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_IMMUTABLE"):
+        db.psql(f"delete from public.catalog_work_scopes where id='{plan}'")
+    _other_user, _other_project, other_conversation = _ws_world(db)
+    with pytest.raises(AssertionError, match="WORK_SCOPE_IMMUTABLE"):
+        db.psql(f"update public.catalog_work_scopes set conversation_id='{other_conversation}' where id='{plan}'")
+    # The head cannot skip ahead, and cannot name a revision that does not exist.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_IMMUTABLE"):
+        db.psql(f"update public.catalog_work_scopes set head_revision = 3 where id='{plan}'")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_HEAD_INVALID"):
+        db.psql(f"update public.catalog_work_scopes set head_digest = '{'0' * 64}' where id='{plan}'")
+    assert db.psql(f"select head_digest from public.catalog_work_scopes where id='{plan}'") == scope.digest()
+
+
+def test_revisions_are_numbered_without_a_gap(db):
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope()
+    plan = _ws_create(db, conversation, user, scope)["work_scope"]["id"]
+    other = _ws_scope(units=["mazda"])
+    with pytest.raises(AssertionError, match="WORK_SCOPE_REVISION_OUT_OF_SEQUENCE"):
+        db.psql("insert into public.catalog_work_scope_revisions "
+                "(work_scope_id, revision, scope_text, scope, digest, input_kind, created_by) "
+                f"values ('{plan}', 3, $t${other.canonical_text()}$t$, $t${other.canonical_text()}$t$::jsonb, "
+                f"'{other.digest()}', 'edit', '{user}')")
+
+
+def test_canonical_coverage_is_exact_per_marque_and_states_the_catalog_total(pr3_db):
+    db = pr3_db
+    args, _snapshot, _record, candidate, links, make = _pr3_promotable(db, "ws-coverage")
+    _promote(db, args, _pr3_promotion_json(candidate, links, make, key="pr3-ws-coverage"))
+    rows = db.psql("select coalesce(manufacturer, '<total>') || '=' || canonical_variants from "
+                   f"public.catalog_canonical_manufacturer_coverage(array['{make}', 'no-such-marque', '{make}'])"
+                   ).splitlines()
+    counts = dict(row.split("=") for row in rows)
+    # Exact for the promoted marque, a real zero for an absent one, one row per
+    # DISTINCT marque asked about, and the total last.
+    assert counts[make] == "1"
+    assert counts["no-such-marque"] == "0"
+    assert len(rows) == 3 and rows[-1].startswith("<total>=")
+    assert int(counts["<total>"]) == int(db.psql("select count(*) from public.catalog_model_variants"))
+    # Bounded: no more than 64 marques, each 1-120 characters.
+    too_many = ",".join(f"'m{index}'" for index in range(65))
+    for bad in (f"array[{too_many}]", "array['']", f"array['{'x' * 121}']", "null"):
+        with pytest.raises(AssertionError, match="out of bounds"):
+            db.psql(f"select * from public.catalog_canonical_manufacturer_coverage({bad})")

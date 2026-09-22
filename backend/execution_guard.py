@@ -23,6 +23,10 @@ without a separately approved execution stage:
 - ``MILO_ENABLE_PROPOSAL_READS``     gates ``GET /workflow-proposals/{id}``,
   which is membership-scoped since migration 008 but stays default-off like
   every execution surface.
+- ``MILO_ENABLE_WORK_SCOPE_MUTATIONS`` gates the two Mapping Plan writes:
+  creating a conversation's plan and revising it. A plan is a draft that
+  executes nothing, but it is durable state a browser writes, so it is off
+  until a stage enables it deliberately.
 """
 
 import os
@@ -44,6 +48,8 @@ SURFACE_RULES: tuple[tuple[str, str, re.Pattern[str], str], ...] = (
     ("POST", "MILO_ENABLE_EXECUTION_CONTROL", re.compile(rf"^/runs/{_SEGMENT}/(tool-access-requests|tool-grants|tool-usage|sources|claims|conflicts)/?$"), "run execution control"),
     ("POST", "MILO_ENABLE_EXECUTION_CONTROL", re.compile(rf"^/internal/runs/{_SEGMENT}/(events|complete|fail)/?$"), "worker run mutation"),
     ("GET", "MILO_ENABLE_PROPOSAL_READS", re.compile(rf"^/workflow-proposals/{_SEGMENT}/?$"), "workflow proposal read"),
+    ("POST", "MILO_ENABLE_WORK_SCOPE_MUTATIONS", re.compile(rf"^/conversations/{_SEGMENT}/work-scopes/?$"), "work scope creation"),
+    ("POST", "MILO_ENABLE_WORK_SCOPE_MUTATIONS", re.compile(rf"^/work-scopes/{_SEGMENT}/revisions/?$"), "work scope revision"),
 )
 
 

@@ -272,6 +272,22 @@ GATE_CHAIN: tuple[Gate, ...] = (
         stage=2,
     ),
     Gate(
+        name="MILO_ENABLE_WORK_SCOPE_MUTATIONS",
+        surface=API_RUNTIME,
+        current_default="false",
+        required_for_first_run=(
+            "NO for a conversation run — YES only to create or revise a Mapping "
+            "Plan (a draft work scope; it executes nothing)"),
+        when_to_enable="Only when the Mapping Plan surface is being used",
+        requires_redeploy=UPDATE_SERVICE,
+        failure_behavior_when_off=(
+            "POST /conversations/{id}/work-scopes and POST /work-scopes/{id}/"
+            "revisions are rejected by the surface guard. The plan reads still "
+            "answer, and the Mapping Plan stays hidden because the capability "
+            "read reports it unavailable. The Task Composer path is untouched."),
+        stage=2,
+    ),
+    Gate(
         name="MILO_ENABLE_RUN_CANCELLATION",
         surface=API_RUNTIME,
         current_default="false",

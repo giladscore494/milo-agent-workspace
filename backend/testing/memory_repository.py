@@ -34,6 +34,7 @@ from backend.engines.swarm_v2.evidence_contracts import (fragment_type_for,
                                                          parse_locator_key)
 from backend.engines.swarm_v2.fragments import fragment_content_hash
 from backend.engines.swarm_v2.support import VERIFICATION_MODES, VERIFIER_CONTRACT_VERSION
+from backend.catalog.scope import contract as work_scope_contract
 from backend.catalog.payloads import (CANONICAL_VARIANT_KEY_FIELDS, prepare_candidate,
                                       prepare_evidence_link, prepare_promotion,
                                       prepare_raw_record, prepare_snapshot)
@@ -133,6 +134,11 @@ class MemoryRepository:
         self.catalog_model_variants: list[dict[str, Any]] = []
         self.catalog_canonical_field_provenance: list[dict[str, Any]] = []
         self.checkpoints: list[dict[str, Any]] = []
+        # Mapping plans (`20260922000100_catalog_work_scopes.sql`): one row per
+        # plan and an append-only revision list, written only by the two
+        # methods that mirror `create_work_scope` / `revise_work_scope`.
+        self.work_scopes: dict[str, dict[str, Any]] = {}
+        self.work_scope_revisions: list[dict[str, Any]] = []
 
     # -- seeding -------------------------------------------------------------
     def seed_user(self, user_id: str) -> None:
@@ -2338,3 +2344,128 @@ class MemoryRepository:
         if snapshot is None:
             raise AppError("CATALOG_SNAPSHOT_INVALID", "invalid catalog snapshot", 400)
         return snapshot
+
+    # -- mapping plans ---------------------------------------------------------------
+    #
+    # Mirrors `20260922000100_catalog_work_scopes.sql`: the digest is derived
+    # here from the canonical TEXT exactly as the CHECK constraint derives it,
+    # the record is held to the same shape and bounds
+    # (`work_scope_contract.stored_record_valid` is the Python twin of
+    # `catalog_work_scope_record_valid`), membership and the trusted project
+    # workflow are re-checked, and a revision lands only against the head the
+    # caller names. `tests/test_work_scope.py` and the PostgreSQL suite hold the
+    # two to the same expectations.
+
+    def _work_scope_revision(self, work_scope_id: str, number: int, created_by: UUID,
+                             revision: Any) -> dict[str, Any]:
+        if not isinstance(revision, Mapping) or not isinstance(revision.get("scope_text"), str) \
+                or not isinstance(revision.get("input_kind"), str) \
+                or not isinstance(revision.get("instruction"), (str, type(None))) \
+                or not isinstance(revision.get("notes", []), list):
+            raise AppError("WORK_SCOPE_REVISION_INVALID", "invalid work scope revision", 422)
+        text = revision["scope_text"]
+        instruction = revision.get("instruction")
+        notes = revision.get("notes", [])
+        try:
+            record = json.loads(text)
+        except ValueError:
+            raise AppError("WORK_SCOPE_REVISION_INVALID", "invalid work scope revision", 422) from None
+        if not 2 <= len(text) <= work_scope_contract.MAX_SCOPE_TEXT_CHARS \
+                or not work_scope_contract.stored_record_valid(record) \
+                or revision["input_kind"] not in ("instruction", "edit") \
+                or (revision["input_kind"] == "instruction") != (instruction is not None) \
+                or (instruction is not None and not 1 <= len(instruction) <= 500) \
+                or len(json.dumps(notes, ensure_ascii=False)) > 4000:
+            raise AppError("WORK_SCOPE_REVISION_INVALID", "invalid work scope revision", 422)
+        row = {"id": str(uuid4()), "work_scope_id": work_scope_id, "revision": number,
+               "scope_text": text, "scope": record,
+               "digest": work_scope_contract.scope_digest(text),
+               "input_kind": revision["input_kind"], "instruction": instruction,
+               "notes": copy.deepcopy(notes), "created_by": str(created_by),
+               "created_at": _now()}
+        self.work_scope_revisions.append(row)
+        return row
+
+    def create_work_scope(self, conversation_id: UUID, created_by: UUID,
+                          revision: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            conversation = self.conversations.get(str(conversation_id))
+            if conversation is None or not self._is_member(conversation["project_id"], created_by):
+                raise NotFoundError("conversation", str(conversation_id))
+            project = self.projects[conversation["project_id"]]
+            if project.get("workflow_key") != "swarm_v2":
+                raise AppError("WORK_SCOPE_WORKFLOW_UNSUPPORTED",
+                               "this project's engine does not read a mapping plan", 409)
+            if any(row["conversation_id"] == str(conversation_id) and row["closed_at"] is None
+                   for row in self.work_scopes.values()):
+                raise AppError("WORK_SCOPE_OPEN_EXISTS",
+                               "this conversation already has an open mapping plan", 409)
+            scope_id = str(uuid4())
+            row = self._work_scope_revision(scope_id, 1, created_by, revision)
+            scope = {"id": scope_id, "project_id": conversation["project_id"],
+                     "conversation_id": str(conversation_id), "created_by": str(created_by),
+                     "status": "draft", "head_revision": 1, "head_digest": row["digest"],
+                     "created_at": row["created_at"], "updated_at": row["created_at"],
+                     "closed_at": None}
+            self.work_scopes[scope_id] = scope
+            return {"work_scope": dict(scope), "revision": copy.deepcopy(row)}
+
+    def revise_work_scope(self, work_scope_id: UUID, expected_revision: int,
+                          expected_digest: str, created_by: UUID,
+                          revision: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            scope = self.work_scopes.get(str(work_scope_id))
+            if scope is None or not self._is_member(scope["project_id"], created_by):
+                raise NotFoundError("work_scope", str(work_scope_id))
+            if self.projects[scope["project_id"]].get("workflow_key") != "swarm_v2":
+                raise AppError("WORK_SCOPE_WORKFLOW_UNSUPPORTED",
+                               "this project's engine does not read a mapping plan", 409)
+            if scope["closed_at"] is not None or scope["status"] != "draft":
+                raise AppError("WORK_SCOPE_NOT_EDITABLE", "the mapping plan is not editable", 409)
+            if scope["head_revision"] != expected_revision or scope["head_digest"] != expected_digest:
+                raise AppError("WORK_SCOPE_STALE",
+                               "the plan changed since it was read; reload it and try again", 409)
+            row = self._work_scope_revision(scope["id"], scope["head_revision"] + 1,
+                                            created_by, revision)
+            scope.update(head_revision=row["revision"], head_digest=row["digest"],
+                         updated_at=row["created_at"])
+            return {"work_scope": dict(scope), "revision": copy.deepcopy(row)}
+
+    def get_work_scope(self, work_scope_id: UUID) -> dict[str, Any] | None:
+        with self.lock:
+            scope = self.work_scopes.get(str(work_scope_id))
+            return dict(scope) if scope is not None else None
+
+    def open_work_scope(self, conversation_id: UUID) -> dict[str, Any] | None:
+        with self.lock:
+            return next((dict(row) for row in self.work_scopes.values()
+                         if row["conversation_id"] == str(conversation_id)
+                         and row["closed_at"] is None), None)
+
+    def list_work_scope_revisions(self, work_scope_id: UUID, *,
+                                  limit: int = 11) -> list[dict[str, Any]]:
+        """Newest first, bounded -- the order and bound of the PostgREST read."""
+        with self.lock:
+            rows = [copy.deepcopy(row) for row in self.work_scope_revisions
+                    if row["work_scope_id"] == str(work_scope_id)]
+        rows.sort(key=lambda row: row["revision"], reverse=True)
+        return rows[:max(1, min(int(limit), self.MAX_WORK_SCOPE_REVISION_ROWS))]
+
+    #: Mirrors `SupabaseRepository.MAX_WORK_SCOPE_REVISION_ROWS`.
+    MAX_WORK_SCOPE_REVISION_ROWS = 50
+
+    def catalog_canonical_manufacturer_coverage(self, manufacturers: list[str]) -> list[dict[str, Any]]:
+        """Mirrors `catalog_canonical_manufacturer_coverage`: an exact count per
+        requested marque, zero included, plus one NULL-marque total row."""
+        if not isinstance(manufacturers, list) or len(manufacturers) > 64 \
+                or any(not isinstance(name, str) or not 1 <= len(name) <= 120
+                       for name in manufacturers):
+            raise AppError("REPOSITORY_ERROR", "bounded catalog read failed", 502)
+        with self.lock:
+            models = {row["id"]: row["manufacturer"] for row in self.catalog_models}
+            variants = [models.get(row["model_id"]) for row in self.catalog_model_variants]
+        rows: list[dict[str, Any]] = [
+            {"manufacturer": name, "canonical_variants": variants.count(name)}
+            for name in sorted(set(manufacturers))]
+        rows.append({"manufacturer": None, "canonical_variants": len(variants)})
+        return rows

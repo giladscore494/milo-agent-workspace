@@ -71,6 +71,7 @@ producing an incomplete sequence.
 | ts | `20260920000200_atomic_run_finalization.sql` | Atomic run finalization: `finalize_run_guarded` performs the run's TERMINAL transition and its terminal event insert in ONE transaction — lease under the database clock, attempt and token, and a MANDATORY compare-and-set on the status the decision was taken under — so a terminal event can never exist for a decision that did not durably win, and a terminal run can never be left without the evidence its event carries (the canonical ProductOutcome Stage D reads). Terminal statuses only; `runs.usage` merges monotonically. Service-path only. Depends on `merge_execution_usage` from `20260920000100`, which orders before it |
 | ts | `20260921000100_current_verdict_authority.sql` | R5: CURRENT verdict authority — `claim_current_verdict_id` / `claim_current_verdict_state` / `claim_current_verdict_states` / `claim_verdict_is_current_support` resolve which verdict of an append-only history is TRUE NOW (latest by `created_at`, a non-`verified` row winning an exact tie, then id; `invalidated` / `superseded` / `contested` ahead of it; a `verified` citing no durable support row is `unsupported`), plus two BEFORE-INSERT triggers holding every writer to it — an evidence link may not cite a non-current verdict, and canonical field provenance may not be written from one — and `catalog_run_pending_promotions` rewritten to resolve current truth instead of joining "a verified verdict exists". Additive and forward-only: no verdict already durable is changed, only which of them is read as current. Mirrors `backend/engines/swarm_v2/current_verdict.py` |
 | ts | `20260921000200_immutable_run_identity.sql` | Console 6 control-plane boundary. `runs.run_identity` stays nullable only for historical rows, while every NEW run must be born with a complete immutable identity including a full release SHA. `create_message_and_run_v3` commits the user message, run and identity atomically and re-checks the trusted project workflow; the superseded `bind_run_identity`, `create_message_and_run` and `create_message_and_run_v2` RPCs are removed. `runs_forbid_identity_rewrite` rejects every post-INSERT identity change (including legacy NULL→value retrofit), and `claim_run_lease` refuses identity-less legacy rows. `transition_run_worker_guarded` is redefined as NON-TERMINAL so `finalize_run_guarded` remains the only worker terminalization primitive. The migration also adds lease-guarded tool-access, tool-grant and per-call usage-ledger writers. Service-path only; forward-only and data-preserving, but deliberately not purely additive because obsolete RPC definitions are dropped. |
+| ts | `20260922000100_catalog_work_scopes.sql` | Scoped catalog PR1: the canonical, server-owned mapping PLAN. `catalog_work_scopes` (one row per plan, its head revision and digest, at most one OPEN plan per conversation by a partial unique index) and `catalog_work_scope_revisions` (append-only, numbered without gaps, the canonical record stored as TEXT with `digest = sha256(text)` and `scope = text::jsonb` held by CHECK constraints, and the record's shape and hard bounds -- batch size at most 20, limit at most 2000 -- held by `catalog_work_scope_record_valid`). `create_work_scope` and `revise_work_scope` derive the project and digest, re-check membership and the trusted `swarm_v2` workflow, and refuse a revision whose expected head revision or digest is not the current one (`WORK_SCOPE_STALE`). `catalog_canonical_manufacturer_coverage` is a bounded read of exact canonical variant counts per register marque plus the catalog total. Drafts only: no status but `draft`, no snapshot column, no relation to `runs`. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/` |
 
 All migrations are forward-only and data-preserving. Most are additive; Console 6 deliberately removes only superseded RPC definitions so there is one run-creation authority. There are no destructive table/data down-migrations, by policy (`scripts/check_migrations.py` forbids `drop table` and data deletes).
 
@@ -149,6 +150,31 @@ Rollback: the canonical relations are empty before this PR and nothing in a
 release promotes into them, so reverting means not calling the promotion RPC. A
 forward corrective migration could revoke the `INSERT` again; nothing else in
 the schema depends on it.
+
+### Scoped catalog PR1 (work scopes) — migration and rollback impact
+
+`20260922000100_catalog_work_scopes.sql` is purely additive: two new relations,
+eleven functions, four triggers (one of them a DEFERRED constraint trigger that
+holds a plan's head to a revision that exists with that digest), four indexes
+-- one of them `catalog_models_manufacturer_idx` on an existing relation -- and
+explicit privileges. It alters no existing relation, redefines no existing
+function and backfills nothing.
+
+Privileges: both relations have RLS on with no policies; `PUBLIC`, `anon` and
+`authenticated` have nothing. `service_role` gets `SELECT, INSERT` on both and
+`UPDATE` on `catalog_work_scopes` only -- the head advances, a revision never
+changes -- and the triggers bound what that one `UPDATE` may touch. Every
+function is `EXECUTE` for `service_role` alone.
+
+Rerun safety: every `create` is `if not exists` or `create or replace`, and
+every trigger is dropped before it is created. The executable suite applies the
+file a second time over a populated schema.
+
+Rollback: nothing executes from a plan in this release -- there is no
+preparation, queue or batch, and no relation to `runs` -- so turning
+`MILO_ENABLE_WORK_SCOPE_MUTATIONS` off (the default) leaves the relations inert.
+A forward corrective migration could drop them; no other relation, function or
+row depends on them.
 
 ### The corrective round — migration and rollback impact
 

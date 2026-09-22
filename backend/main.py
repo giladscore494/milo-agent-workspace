@@ -12,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.budget import BudgetConfig
 from backend.catalog import review as catalog_review
+from backend.catalog.scope import service as work_scopes
 from backend.config import get_settings
 from backend.auth import AuthenticatedUser, get_authenticated_user
 from backend.dependencies import get_job_launcher, get_repository
@@ -44,6 +45,8 @@ from backend.schemas import (
     WorkflowProposal,
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
     WorkerRunCompleteRequest, WorkerRunEventCreate, WorkerRunFailRequest,
+    WorkScopeCapabilities, WorkScopeCreate, WorkScopeDirectory, WorkScopeMutationResult,
+    WorkScopeOpen, WorkScopeRevise, WorkScopeState,
 )
 from backend.rate_limit import enforce_rate_limit
 from backend.event_registry import is_known_event_type
@@ -602,6 +605,51 @@ def get_catalog_review_candidates(
         available=page.available, unavailable_reason=page.unavailable_reason,
         status=catalog_review.REVIEW_CANDIDATE_STATUS, snapshot=page.snapshot,
         page=_catalog_page_meta(page), items=page.items)
+
+
+# --- Mapping plans: the canonical WorkScope (backend/catalog/scope/) ---------
+#
+# Four reads and two writes. The reads are membership-authorized and ungated,
+# for the reason CODE-3's reads are: reading a plan executes nothing, and the
+# operator who turned the writes off still needs to see what exists. The two
+# writes are behind `MILO_ENABLE_WORK_SCOPE_MUTATIONS`, enforced before the body
+# is read by `ExecutionSurfaceGuardMiddleware` and again here.
+#
+# Nothing below prepares Government data, creates a run, reserves a budget or
+# reaches a provider. A plan is a draft, and `capabilities` says so.
+
+
+@app.get("/projects/{project_id}/work-scope/capabilities", response_model=WorkScopeCapabilities)
+def get_work_scope_capabilities(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return work_scopes.capabilities(repo, user.user_id, project_id)
+
+
+@app.get("/projects/{project_id}/work-scope/directory", response_model=WorkScopeDirectory)
+def get_work_scope_directory(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return work_scopes.directory(repo, user.user_id, project_id)
+
+
+@app.get("/conversations/{conversation_id}/work-scopes/open", response_model=WorkScopeOpen)
+def get_open_work_scope(conversation_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return work_scopes.open_work_scope(repo, user.user_id, conversation_id)
+
+
+@app.post("/conversations/{conversation_id}/work-scopes", response_model=WorkScopeMutationResult, status_code=201)
+def create_work_scope(conversation_id: UUID, request: WorkScopeCreate, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    require_stage_enabled(work_scopes.WORK_SCOPE_MUTATIONS_FLAG, "work scope creation")
+    return work_scopes.create_work_scope(repo, user.user_id, conversation_id, request.instruction, request.edit)
+
+
+@app.get("/work-scopes/{work_scope_id}", response_model=WorkScopeState)
+def get_work_scope(work_scope_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return work_scopes.work_scope(repo, user.user_id, work_scope_id)
+
+
+@app.post("/work-scopes/{work_scope_id}/revisions", response_model=WorkScopeMutationResult)
+def revise_work_scope(work_scope_id: UUID, request: WorkScopeRevise, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    require_stage_enabled(work_scopes.WORK_SCOPE_MUTATIONS_FLAG, "work scope revision")
+    return work_scopes.revise_work_scope(repo, user.user_id, work_scope_id, request.expected_revision,
+                                         request.expected_digest, request.instruction, request.edit)
 
 
 @app.post("/projects/{project_id}/conversations", response_model=Conversation, status_code=201)

@@ -312,6 +312,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_candidate_model_years": {"p_commercial_model", "p_manufacturer", "p_snapshot_id"},
     "catalog_candidate_models": {"p_manufacturer", "p_snapshot_id"},
     "catalog_candidate_variant_page": {"p_snapshot_id"},
+    "catalog_canonical_manufacturer_coverage": {"p_manufacturers"},
     "catalog_raw_record_by_upstream_id": {"p_snapshot_id", "p_upstream_record_id"},
     "catalog_run_pending_promotions": {"p_run_id", "p_tool_operation"},
     "catalog_snapshot_candidate_diff": {"p_previous_snapshot_id", "p_snapshot_id"},
@@ -346,6 +347,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "create_tool_usage_guarded": {
         "p_attempt", "p_lease_token", "p_run_id", "p_usage", "p_worker_id"
     },
+    "create_work_scope": {"p_conversation_id", "p_created_by", "p_revision"},
     "finalize_run_guarded": {
         "p_attempt", "p_expected_status", "p_lease_token", "p_run_id", "p_status",
         "p_worker_id"
@@ -391,6 +393,10 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "reserve_model_call_budget_v2": {
         "p_call_seq", "p_daily_project_limit", "p_daily_user_limit",
         "p_estimated_cost", "p_project_id", "p_run_id", "p_user_id"
+    },
+    "revise_work_scope": {
+        "p_created_by", "p_expected_digest", "p_expected_revision", "p_revision",
+        "p_work_scope_id"
     },
     "save_checkpoint_guarded": {
         "p_attempt", "p_engine_version", "p_lease_token", "p_phase", "p_run_id",
