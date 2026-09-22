@@ -328,16 +328,18 @@ def ordinary_run(repository: MemoryRepository, *,
                  metadata: Mapping[str, Any] | None = None) -> UUID:
     """A run created the way the PRODUCT creates one, and never prepared.
 
-    `create_queued_run` is the repository method both production creation paths
-    reach; it inserts `launch_state='pending'`, which is the launchable state.
+    `create_message_and_run` is the ONE atomic creator every production creation
+    path reaches; it inserts `launch_state='pending'`, which is the launchable
+    state, together with the run's immutable identity.
     `metadata` is the browser-supplied metadata, so a test can put the operator
     marker on an ordinary run and prove the marker alone changes nothing.
     """
     conversation_id, user_id = seed_conversation(repository)
-    message = repository.create_user_message(conversation_id, "ordinary run", {})
-    run = repository.create_queued_run(
-        conversation_id, message["id"], "ordinary run", dict(metadata or {}),
-        requested_by=user_id, idempotency_key=str(uuid4()))
+    run = repository.create_message_and_run(
+        conversation_id, "ordinary run", dict(metadata or {}),
+        requested_by=user_id, idempotency_key=str(uuid4()),
+        request_fingerprint="fp-ordinary",
+        **identity_kwargs(repository, conversation_id))["run"]
     return UUID(run["id"])
 
 
