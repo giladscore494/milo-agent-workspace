@@ -41,6 +41,7 @@ from backend.catalog.government import source as src
 from backend.catalog.government.client import DataGovClient
 from backend.catalog.government.ingest import GovernmentCatalogIngestor
 from backend.engines.swarm_v2.evidence import WorkerLease
+from backend.run_identity import RunIdentity
 from backend.testing.government_capture import (FixtureTransport, PINNED_PAGE_LIMIT,
                                                 PINNED_QUERY)
 from backend.testing.memory_repository import MemoryRepository
@@ -61,11 +62,37 @@ def _leased_run(repository: MemoryRepository, user_id: str, project_id: str,
                 worker: str) -> WorkerLease:
     """One claimed run to write the capture under, exactly as a worker holds it."""
     conversation = repository.create_conversation(project_id, "catalog seed", user_id)
-    message = repository.create_user_message(conversation["id"], "seed", {})
-    run = repository.create_queued_run(conversation["id"], message["id"], "seed", {},
-                                       requested_by=user_id)
+    # The atomic V3 creator is the only run writer, in tests as in production:
+    # the identity is bound from the TRUSTED project relation, never from a
+    # payload, and the run id is chosen first so the identity can name it.
+    run_id = uuid4()
+    identity = RunIdentity.bind(
+        run_id, (repository.projects.get(str(project_id)) or {}).get("workflow_key") or "")
+    run = repository.create_message_and_run(
+        conversation["id"], "seed", {}, requested_by=user_id, idempotency_key=None,
+        request_fingerprint="fp-catalog-seed", run_id=run_id,
+        run_identity=identity.as_record())["run"]
     claimed = repository.claim_run(run["id"], worker)
     return WorkerLease(claimed["id"], worker, int(claimed["attempt"]), claimed["lease_token"])
+
+
+def land_pinned_government_snapshot(repository: MemoryRepository, *, user_id: str,
+                                    project_id: str,
+                                    worker: str = "offline-catalog-capture") -> str:
+    """Land the committed Government capture as ONE usable active snapshot.
+
+    The operator-capture path in miniature, over the pinned fixture transport:
+    a leased run, the real `GovernmentCatalogIngestor`, the guarded writes and
+    activation. It is what an offline test uses when a run must find a usable
+    snapshot -- the product worker itself never imports one. Returns the
+    snapshot key.
+    """
+    lease = _leased_run(repository, user_id, project_id, worker)
+    client = DataGovClient(FixtureTransport(), page_limit=PINNED_PAGE_LIMIT,
+                           sleep_fn=lambda _seconds: None)
+    report = GovernmentCatalogIngestor(repository, lease, client=client).ingest_resource(
+        src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    return str(report.snapshot_key)
 
 
 def seed_catalog_review_state(repository: MemoryRepository, *, user_id: str,

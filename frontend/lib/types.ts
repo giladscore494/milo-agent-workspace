@@ -34,7 +34,17 @@ export type RunIdentity = {
   event_registry_version: string;
   event_registry_fingerprint: string;
 };
-export type Run = { id: UUID; conversation_id: UUID; status: string; run_identity?: RunIdentity | null; started_at?: string; finished_at?: string; output?: Record<string, unknown>; error?: Record<string, unknown>; launch_state?: LaunchState; launch_error_class?: string; launch_reconciliation_required?: boolean; usage?: RunUsage | null };
+/**
+ * The canonical ProductOutcome as the API projects it from the terminal event
+ * the finalizer wrote; `null` when none is recorded. Parsed, never trusted:
+ * see lib/productOutcome.ts.
+ */
+export type ProductOutcomeRecord = Record<string, unknown>;
+/** The per-run ceilings this deployment enforces; `null` when none is stated. */
+export type RunLimitsRecord = Record<string, unknown>;
+export type Run = { id: UUID; conversation_id: UUID; status: string; run_identity?: RunIdentity | null; started_at?: string; finished_at?: string; created_at?: string; output?: Record<string, unknown>; error?: Record<string, unknown>; launch_state?: LaunchState; launch_error_class?: string; launch_reconciliation_required?: boolean; usage?: RunUsage | null; product_outcome?: ProductOutcomeRecord | null; limits?: RunLimitsRecord | null };
+/** One row of GET /conversations/{id}/runs: the run projection without payloads. */
+export type RunSummary = { id: UUID; conversation_id: UUID; status: string; run_identity?: RunIdentity | null; started_at?: string; finished_at?: string; created_at?: string; launch_state?: LaunchState; usage?: RunUsage | null; product_outcome?: ProductOutcomeRecord | null };
 // run_events.id is production bigint (not UUID); run_id remains UUID. It is
 // carried as a canonical decimal string (lib/eventId.ts) so identity and
 // ordering survive values above Number.MAX_SAFE_INTEGER.

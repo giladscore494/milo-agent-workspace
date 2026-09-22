@@ -1,7 +1,7 @@
 import { EventId, eventCursorParam } from './eventId';
 import { parseJsonPreservingBigIntegers } from './losslessJson';
 import { getCurrentAccessToken } from './supabaseClient';
-import { Conversation, Project, Proposal, Run, RunEvent } from './types';
+import { Conversation, Project, Proposal, Run, RunEvent, RunSummary } from './types';
 
 const API = '/api/gateway';
 
@@ -125,6 +125,23 @@ export const api = {
     ),
 
   run: (id: string) => request<Run>(`/runs/${id}`),
+
+  /**
+   * The canonical export envelope of ONE finished run. GET, no body. The
+   * server builds it (`backend/export_envelope.py`) and refuses a run that is
+   * live, identity-less or otherwise not exportable; the browser only
+   * retrieves, summarizes and downloads the document it was given. `unknown`
+   * on purpose: `lib/runExport.ts` reads it field by field.
+   */
+  exportRun: (id: string) => request<unknown>(`/runs/${id}/export`),
+
+  /**
+   * The conversation's durable run history, newest first and bounded by the
+   * server. It is what lets a completed result outlive session storage: after
+   * a browser restart the workspace reopens the latest run from here.
+   */
+  runs: (conversationId: string, limit = 20) =>
+    request<RunSummary[]>(`/conversations/${conversationId}/runs?limit=${limit}`),
 
   /**
    * Incremental event polling.

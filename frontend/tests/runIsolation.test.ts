@@ -5,6 +5,7 @@ import { getTrustedClientIp } from '../lib/server/rateLimit';
 
 const apiMocks = vi.hoisted(() => ({
   run: vi.fn(),
+  runs: vi.fn(() => Promise.resolve([])),
   events: vi.fn(),
 }));
 

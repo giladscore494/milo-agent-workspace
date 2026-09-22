@@ -25,6 +25,7 @@ from backend.schemas import (
     CatalogReviewPage,
     Conversation,
     ConversationCreate,
+    EffectiveConcurrency,
     HealthResponse,
     Project,
     ProposalCreate,
@@ -38,7 +39,7 @@ from backend.schemas import (
     RunCreate,
     RunCreated,
     RunEvent,
-    RunIdentityRecord,
+    RunIdentityRecord, ProductOutcomeRecord, RunLimits, RunSummary,
     RunUsage,
     WorkflowProposal,
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
@@ -56,6 +57,7 @@ from backend.run_identity import (
 )
 from backend.runtime import TERMINAL_STATES
 from backend.finalization import RunFinalizer, TerminalClaim
+from backend.product_outcome import ProductOutcomeError, outcome_from_record
 from backend.worker_auth import WorkerIdentity, get_verified_worker
 from backend.workflow_proposals import compile_proposal, ensure_approved
 
@@ -159,7 +161,121 @@ def _catalog_page_meta(page: catalog_review.CatalogPage) -> CatalogPageMeta:
                            has_more=page.has_more)
 
 
-def _safe_run_response(run: dict) -> dict:
+#: The events the canonical finalizer writes atomically with a terminal status.
+TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_partial_success", "run_failed", "run_cancelled"})
+
+#: "Not supplied": lets a history page hand pre-fetched limits and terminal
+#: events to the projection instead of re-reading them per row.
+_UNSET = object()
+
+
+def _safe_product_outcome(run: dict, repo: Repository | None) -> ProductOutcomeRecord | None:
+    """Project the canonical ProductOutcome the finalizer recorded, or null.
+
+    The record lives on the terminal event `finalize_run_guarded` inserted in
+    the same transaction as the terminal status (backend/finalization.py), so
+    it is read from there and nowhere else: not derived from `output` here,
+    not accepted from a request body, not reconstructed from other events. A
+    live run, a terminal that carries no product (cancellation, timeout,
+    budget stop), a historical run finalized before the canonical path, and a
+    record that does not re-validate through `outcome_from_record` all project
+    `null` -- an absent verdict is stated as absent, never invented.
+    """
+    if repo is None or not hasattr(repo, "terminal_run_event"):
+        return None
+    if str(run.get("status") or "") not in TERMINAL_STATES:
+        return None
+    try:
+        event = repo.terminal_run_event(run.get("id"))
+    except Exception:
+        return None
+    return _project_product_outcome(event)
+
+
+def _project_product_outcome(event: object) -> ProductOutcomeRecord | None:
+    """The pure half of the projection: one terminal event -> record or null."""
+    if not isinstance(event, dict) or event.get("event_type") not in TERMINAL_EVENT_TYPES:
+        return None
+    payload = event.get("payload")
+    record = payload.get("product_outcome") if isinstance(payload, dict) else None
+    if not isinstance(record, dict):
+        return None
+    try:
+        outcome = outcome_from_record(record)
+        return ProductOutcomeRecord.model_validate(outcome.as_record())
+    except (ProductOutcomeError, ValidationError, TypeError, ValueError):
+        return None
+
+
+def _effective_concurrency() -> EffectiveConcurrency | None:
+    """The concurrency this deployment really runs at, from server-owned truth.
+
+    Resolved from the ONE canonical runtime policy (`resolve_runtime_policy`),
+    the provider configuration it yields, and the organization ceiling
+    (`QuotaConfig`). The provider-admitted widths are computed exactly as the
+    engines compute them: Swarm V2 runs
+    ``min(configured active workers, provider concurrency)`` and V1 runs its
+    technical units through the same per-process provider profile. A policy
+    that refuses to resolve (a misconfigured paid deployment) states ``None``
+    rather than a plausible number.
+    """
+    from backend.provider_quota import (SEARCH_BASIC, SEARCH_PRO, SEARCH_QPS_VERIFIED,
+                                        QuotaConfig)
+    from backend.runtime_policy import RuntimePolicyError, resolve_runtime_policy
+
+    try:
+        policy = resolve_runtime_policy()
+        provider = policy.provider_limits()
+        budget = policy.budget_config()
+    except (RuntimePolicyError, ValueError):
+        return None
+    try:
+        organization = QuotaConfig.from_env()
+        ceiling: int | None = int(organization.max_concurrency)
+        search_basic, search_pro = (int(organization.search_qps[0]), int(organization.search_qps[1]))
+    except ValueError:
+        ceiling, search_basic, search_pro = None, None, None
+    v1 = int(policy.v1_technical_parallelism)
+    v2 = int(policy.swarm_max_active_workers)
+    per_process = int(provider.max_concurrency)
+    effective = per_process if ceiling is None else min(per_process, ceiling)
+    return EffectiveConcurrency(
+        v1_technical_parallelism=v1,
+        v2_max_active_workers=v2,
+        provider_max_concurrency=per_process,
+        provider_organization_ceiling=ceiling,
+        provider_effective_concurrency=effective,
+        v1_provider_admitted=min(v1, effective),
+        v2_provider_admitted=min(v2, effective),
+        max_concurrent_runs_per_user=budget.max_concurrent_runs_per_user,
+        max_concurrent_runs_per_project=budget.max_concurrent_runs_per_project,
+        search_basic_qps=search_basic,
+        search_pro_qps=search_pro,
+        search_qps_verified=bool(SEARCH_QPS_VERIFIED[SEARCH_BASIC] and SEARCH_QPS_VERIFIED[SEARCH_PRO]),
+        paid_posture=bool(policy.paid),
+    )
+
+
+def _run_limits() -> RunLimits | None:
+    """The per-run ceilings this deployment enforces, as plain numbers."""
+    try:
+        config = BudgetConfig.from_env()
+    except Exception:
+        return None
+    limits = RunLimits(
+        max_model_calls_per_run=config.max_model_calls_per_run,
+        max_total_tokens_per_run=config.max_total_tokens_per_run,
+        max_cost_per_run=config.max_cost_per_run,
+        max_run_duration_seconds=config.max_run_duration_seconds,
+        max_agent_steps=config.max_agent_steps,
+        concurrency=_effective_concurrency(),
+    )
+    return limits if limits.model_dump(exclude_none=True) else None
+
+
+def _safe_run_response(run: dict, repo: Repository | None = None, *,
+                       limits: RunLimits | None | object = _UNSET,
+                       terminal_event: object = _UNSET) -> dict:
     """Return a browser-safe run shape.
 
     Launch exception messages are operational data and may include provider,
@@ -179,6 +295,15 @@ def _safe_run_response(run: dict) -> dict:
     # The run's own immutable identity, so the browser can render a historical
     # run as the engine it WAS rather than as whatever its project is today.
     safe["run_identity"] = _safe_run_identity(run.get(RUN_IDENTITY_FIELD), run.get("id"))
+    # The canonical product verdict and the ceilings the run executes under.
+    # Both are projections of durable/deployment truth; neither is derived
+    # from the payload or from anything the browser could have supplied.
+    if terminal_event is _UNSET:
+        safe["product_outcome"] = _safe_product_outcome(run, repo)
+    else:
+        terminal = str(run.get("status") or "") in TERMINAL_STATES
+        safe["product_outcome"] = _project_product_outcome(terminal_event) if terminal else None
+    safe["limits"] = _run_limits() if limits is _UNSET else limits
     safe.pop("launch_error", None)
     safe.pop("lease_token", None)
     return safe
@@ -476,7 +601,75 @@ def create_run(conversation_id: UUID, request: RunCreate, user: AuthenticatedUse
 
 @app.get("/runs/{run_id}", response_model=Run)
 def get_run(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
-    return _safe_run_response(repo.get_run(run_id, user_id=user.user_id))
+    return _safe_run_response(repo.get_run(run_id, user_id=user.user_id), repo)
+
+
+@app.get("/runs/{run_id}/export")
+def export_run(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    """The canonical export of ONE finished run, for the browser.
+
+    A READ over exactly the run named, behind the same membership
+    authorization as `GET /runs/{id}` (a non-member sees 404), wrapped by the
+    one export authority `backend.export_envelope.build_export_envelope`. No
+    export logic lives in the browser: the envelope it downloads is the
+    document this route returned, byte for byte.
+
+    Fail closed, with a static reason: a live run, a run whose immutable
+    identity is absent or unreadable, a non-product workflow, an identity
+    not bound to a release, and a stored Swarm V2 product that is not
+    contract-valid are all refused (409 RUN_NOT_EXPORTABLE). The envelope
+    is re-validated before it leaves, and its usage is the same bounded
+    public projection the run read exposes.
+    """
+    from backend.export_envelope import (ExportRefused, build_export_envelope,
+                                         validate_export_envelope)
+
+    run = repo.get_run(run_id, user_id=user.user_id)
+    try:
+        envelope = build_export_envelope(run)
+        validate_export_envelope(envelope)
+    except ExportRefused as exc:
+        # Every ExportRefused message is a static, code-owned reason.
+        raise AppError("RUN_NOT_EXPORTABLE", f"run cannot be exported: {exc}", 409) from None
+    usage = _safe_run_usage(run.get("usage"))
+    envelope["usage"] = usage.model_dump(mode="json") if usage is not None else {}
+    return envelope
+
+
+#: The most runs one history read returns. The list is for choosing a run to
+#: reopen; it is bounded so a busy conversation cannot make the read unbounded.
+MAX_RUN_HISTORY = 50
+
+
+@app.get("/conversations/{conversation_id}/runs", response_model=list[RunSummary])
+def list_conversation_runs(conversation_id: UUID, limit: int = 20, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> list[dict]:
+    """A conversation's run history, newest first, membership-scoped.
+
+    This is what lets a completed result outlive the browser session: the run
+    ids the workspace remembers live in session storage, and a browser restart
+    forgets them. The history is durable truth read back through the same
+    authorization the single-run read uses, and each row carries the run's
+    immutable identity and canonical outcome so the browser can list a
+    historical run as the engine and the verdict it actually was.
+    """
+    if limit < 1 or limit > MAX_RUN_HISTORY:
+        raise AppError("INVALID_LIMIT", f"limit must be between 1 and {MAX_RUN_HISTORY}", 422)
+    if not hasattr(repo, "list_conversation_runs"):
+        raise AppError("RUN_HISTORY_UNAVAILABLE", "run history is not available on this repository", 503)
+    # Membership authorization precedes every read; a non-member sees 404.
+    repo.get_conversation(conversation_id, user.user_id)
+    rows = repo.list_conversation_runs(conversation_id, user_id=user.user_id, limit=limit)
+    # One limits read and ONE terminal-event read for the whole page, never
+    # one of each per row.
+    limits = _run_limits()
+    events: dict[str, dict] = {}
+    if hasattr(repo, "terminal_run_events"):
+        try:
+            events = repo.terminal_run_events([row["id"] for row in rows if row.get("id")]) or {}
+        except Exception:
+            events = {}
+    return [_safe_run_response(row, repo, limits=limits, terminal_event=events.get(str(row.get("id"))))
+            for row in rows]
 
 
 @app.get("/runs/{run_id}/events", response_model=list[RunEvent])
@@ -656,6 +849,12 @@ def create_worker_run_event(run_id: UUID, request: WorkerRunEventCreate, worker:
     # while the durable sink wrote it without checking anything.
     if not is_known_event_type(request.event_type):
         raise AppError("UNKNOWN_EVENT_TYPE", "unknown event type", 422)
+    # The four terminal events are the canonical finalizer's alone: it writes
+    # them in the same transaction as the terminal status, and the run read
+    # projects the ProductOutcome from the latest of them. A worker request
+    # body may not append one, so it cannot shadow the finalizer's record.
+    if request.event_type in TERMINAL_EVENT_TYPES:
+        raise AppError("TERMINAL_EVENT_RESERVED", "terminal events are written only by the canonical finalizer", 422)
     return repo.append_run_event(run_id, request.event_type, {"message": request.message, "agent": request.agent, "phase": request.phase, "progress": request.progress, "payload": {**request.payload, "worker_identity": worker.service_account_email}}, **request.lease())
 
 

@@ -29,6 +29,7 @@ const apiMocks = vi.hoisted(() => ({
     reviseProposal: vi.fn(),
     startRun: vi.fn(),
     run: vi.fn(),
+    runs: vi.fn(() => Promise.resolve([])),
     events: vi.fn(),
     cancel: vi.fn(),
   },
@@ -258,11 +259,17 @@ describe('authenticated workspace (execution UI enabled)', () => {
     await openConversation();
     expect(await screen.findByText(/Run finished with status/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Cancel run' })).not.toBeInTheDocument();
-    // The sanitized output surface stays reachable after the refactor.
-    expect(screen.getByText('Final artifacts')).toBeInTheDocument();
-    // Secrets are redacted from rendered output.
+    // The V1 product surface is the TYPED result panel. A payload that is not
+    // a catalog document is refused there, never dumped.
+    expect(screen.getByRole('heading', { name: 'Final result' })).toBeInTheDocument();
+    expect(screen.getByText('Vehicle Catalog V1 product result')).toBeInTheDocument();
+    expect(screen.getByText('Result unavailable')).toBeInTheDocument();
+    // Secrets never reach the product surface at all.
     expect(screen.queryByText(new RegExp(leak))).not.toBeInTheDocument();
+    // The durable payload is developer telemetry in the Inspector, redacted.
+    fireEvent.click(screen.getByRole('tab', { name: 'Developer' }));
     expect((document.body.textContent ?? '')).toContain('[REDACTED]');
+    expect(screen.queryByText(new RegExp(leak))).not.toBeInTheDocument();
   });
 
   it('generates, displays and decides workflow proposals with backend reasons', async () => {

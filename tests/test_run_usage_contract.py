@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from backend.budget import BudgetConfig, BudgetTracker
 from backend.main import app
 from backend.schemas import RunUsage
+from tests.run_factory import identity_kwargs
 from tests.test_api import repo  # noqa: F401  (pytest fixture)
 
 # The accepted Swarm V2 production-smoke aggregate. The input/output split is
@@ -305,10 +306,10 @@ def memory_repo(monkeypatch):
     repo.seed_user(str(repo.user_id))
     repo.seed_project(project_id, "alpha", "Alpha", [str(repo.user_id)])
     conversation = repo.create_conversation(UUID(project_id), "c", repo.user_id)
-    message = repo.create_user_message(UUID(conversation["id"]), "go", {})
-    run = repo.create_queued_run(
-        UUID(conversation["id"]), message["id"], "go", {}, requested_by=repo.user_id
-    )
+    run = repo.create_message_and_run(
+        UUID(conversation["id"]), "go", {}, requested_by=repo.user_id,
+        idempotency_key=None, request_fingerprint="fp-usage",
+        **identity_kwargs(repo, UUID(conversation["id"])))["run"]
     repo.run_id = UUID(run["id"])
     app.dependency_overrides[get_repository] = lambda: repo
     yield repo
@@ -316,7 +317,7 @@ def memory_repo(monkeypatch):
 
 
 def test_real_repository_defaults_a_new_run_to_no_recorded_usage(memory_repo):
-    """create_queued_run stores `{}`, mirroring the NOT NULL DEFAULT."""
+    """The atomic creator stores `{}`, mirroring the NOT NULL DEFAULT."""
     assert memory_repo.runs[str(memory_repo.run_id)]["usage"] == {}
     body = read_run(memory_repo).json()
     assert body["usage"] is None

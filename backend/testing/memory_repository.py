@@ -195,22 +195,16 @@ class MemoryRepository:
         return dict(message)
 
     def create_queued_run(self, conversation_id: UUID, user_message_id: Any, content: str, metadata: dict[str, Any], requested_by: UUID | None = None, idempotency_key: str | None = None, request_fingerprint: str | None = None) -> dict[str, Any]:
-        with self.lock:
-            if requested_by is not None and idempotency_key:
-                existing = self.find_run_by_idempotency(conversation_id, requested_by, idempotency_key)
-                if existing is not None:
-                    return existing
-            run = {
-                "id": str(uuid4()), "conversation_id": str(conversation_id), "status": "queued",
-                "attempt": 1, "launch_state": "pending",
-                "requested_by": str(requested_by) if requested_by else None,
-                "idempotency_key": idempotency_key, "request_fingerprint": request_fingerprint,
-                "input": {"message_id": str(user_message_id), "content": content, "metadata": metadata},
-                "output": None, "error": None, "usage": {},
-                "created_at": _now(), "updated_at": _now(),
-            }
-            self.runs[run["id"]] = run
-            return dict(run)
+        # Production parity with SupabaseRepository.create_queued_run: Console 6
+        # makes immutable identity an INSERT-time property, so the split
+        # message + run writer is a refusal-only compatibility method here too.
+        # A test that wants a run goes through `create_message_and_run`, the
+        # single atomic creator, exactly as the product does.
+        raise AppError(
+            "RUN_IDENTITY_ATOMIC_CREATION_REQUIRED",
+            "queued runs must be created atomically with immutable identity",
+            503,
+        )
 
     def find_run_by_idempotency(self, conversation_id: UUID, user_id: UUID, idempotency_key: str) -> dict[str, Any] | None:
         for run in self.runs.values():
@@ -304,6 +298,32 @@ class MemoryRepository:
         if after_event_id is not None:
             events = [e for e in events if e["id"] > after_event_id]
         return [dict(e) for e in events]
+
+    TERMINAL_EVENT_TYPES = ("run_completed", "run_partial_success", "run_failed", "run_cancelled")
+
+    def terminal_run_event(self, run_id: UUID) -> dict[str, Any] | None:
+        events = [e for e in self.run_events
+                  if e["run_id"] == str(run_id) and e["event_type"] in self.TERMINAL_EVENT_TYPES]
+        return dict(events[-1]) if events else None
+
+    def terminal_run_events(self, run_ids: list[UUID]) -> dict[str, dict[str, Any]]:
+        wanted = {str(run_id) for run_id in run_ids}
+        latest: dict[str, dict[str, Any]] = {}
+        for event in self.run_events:
+            if event["run_id"] in wanted and event["event_type"] in self.TERMINAL_EVENT_TYPES:
+                latest[event["run_id"]] = dict(event)  # later rows overwrite: newest wins
+        return latest
+
+    def list_conversation_runs(self, conversation_id: UUID, user_id: UUID | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        self.get_conversation(conversation_id, user_id)
+        bounded = max(1, min(int(limit), 50))
+        rows = [run for run in self.runs.values() if run["conversation_id"] == str(conversation_id)]
+        rows.sort(key=lambda run: str(run.get("created_at") or ""), reverse=True)
+        projected = []
+        for run in rows[:bounded]:
+            row = {key: value for key, value in run.items() if key not in ("output", "input", "error")}
+            projected.append(row)
+        return projected
 
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         with self.lock:
@@ -569,6 +589,12 @@ class MemoryRepository:
         from datetime import datetime, UTC, timedelta
         with self.lock:
             run = self.get_run(run_id)
+            # `claim_run_lease` (migration 20260921000200) predicates on
+            # `run_identity is not null`: a legacy identity-less run matches no
+            # rows, stays readable history, and is never executed. Same
+            # outcome here, same code, same status.
+            if run.get("run_identity") is None:
+                raise AppError("RUN_ALREADY_CLAIMED", "run is already claimed by another worker", 409)
             if run["status"] not in self.CLAIMABLE_STATES:
                 raise AppError("RUN_ALREADY_CLAIMED", "run is already claimed by another worker", 409)
             holder = run.get("worker_id")

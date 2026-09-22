@@ -40,6 +40,7 @@ const apiMocks = vi.hoisted(() => ({
     reviseProposal: vi.fn(),
     startRun: vi.fn(),
     run: vi.fn(),
+    runs: vi.fn(() => Promise.resolve([])),
     events: vi.fn(),
     cancel: vi.fn(),
     catalogCanonical: vi.fn(),

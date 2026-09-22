@@ -45,6 +45,7 @@ from backend.testing.government_capture import (FixtureTransport, PINNED_PAGE_CO
                                                 PINNED_RECORD_ID, PINNED_TOTAL, encode,
                                                 page_document)
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 from backend.tools.registry import ToolRegistry
 
 GOVERNMENT_PACKAGE = Path("backend/catalog/government")
@@ -111,9 +112,9 @@ def leased_run(repository: MemoryRepository, worker: str = "worker-1") -> Worker
     repository.seed_user(user)
     repository.seed_project(project, f"p-{worker}", "P", [user])
     conversation = repository.create_conversation(project, "c", user)
-    message = repository.create_user_message(conversation["id"], "go", {})
-    run = repository.create_queued_run(conversation["id"], message["id"], "go", {},
-                                       requested_by=user)
+    run = repository.create_message_and_run(
+        conversation["id"], "go", {}, requested_by=user, idempotency_key=None,
+        request_fingerprint="fp-go", **identity_kwargs(repository, conversation["id"]))["run"]
     claimed = repository.claim_run(run["id"], worker)
     return WorkerLease(claimed["id"], worker, int(claimed["attempt"]), claimed["lease_token"])
 
@@ -1208,8 +1209,12 @@ def test_the_projection_is_still_not_a_tool_and_the_registration_is_a_wrapper():
     # What the flag cannot change is WHICH object gets registered: disabled it
     # is nothing at all, enabled it is the Tool wrapper and never the reader.
     worker = Path("backend/worker/main.py").read_text(encoding="utf-8")
-    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])"
-            in worker)
+    # The registration is PINNED to the snapshot the Government preparation
+    # stage resolved after the lease, so every read of the run answers from
+    # one immutable snapshot; it is still the Tool wrapper, never the reader.
+    collapsed = " ".join(worker.split())
+    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)] "
+            "if government_read_enabled else [])") in collapsed
     assert "GovernmentCatalogProjection" not in worker
     assert "GovernmentCatalogQuery" not in worker
     assert "DataGovClient" not in worker

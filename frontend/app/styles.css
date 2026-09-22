@@ -1182,3 +1182,35 @@ textarea { resize: vertical; min-height: 4.5rem; }
   .catalog-pagination-controls { width: 100%; }
   .catalog-pagination-controls .button { flex: 1 1 auto; }
 }
+
+/* --- Website integration: live execution, typed V1 result, run history --- */
+.live-run { gap: 0.9rem; }
+.live-work { margin: 0; font-size: 0.9rem; }
+.live-active { margin: 0.4rem 0 0; padding-left: 1.1rem; display: grid; gap: 0.25rem; font-size: 0.85rem; }
+.product-outcome { margin-top: 0.5rem; }
+.product-outcome-facts { margin-top: 0.6rem; }
+.product-outcome-blocking { margin: 0.5rem 0 0; padding-left: 1.1rem; display: grid; gap: 0.25rem; font-size: 0.85rem; }
+.vehicle-result-facts { margin-top: 0.4rem; }
+.vehicle-result-summary { margin: 0.6rem 0 0; font-size: 0.9rem; }
+.vehicle-models { list-style: none; margin: 0.6rem 0 0; padding: 0; display: grid; gap: 0.6rem; }
+.vehicle-model { border: 1px solid var(--border); border-radius: 10px; padding: 0.6rem 0.75rem; display: grid; gap: 0.4rem; min-width: 0; }
+.vehicle-model[data-verification="verified"] { border-left: 3px solid var(--success); }
+.vehicle-model[data-verification="needs_review"], .vehicle-model[data-verification="partial"] { border-left: 3px solid var(--warning); }
+.vehicle-model[data-verification="rejected"] { border-left: 3px solid var(--danger); }
+.vehicle-model-head { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; }
+.vehicle-model-name { font-weight: 600; overflow-wrap: anywhere; }
+.vehicle-model-he { color: var(--muted); }
+.vehicle-model-fields { margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0.35rem 0.75rem; font-size: 0.85rem; }
+.vehicle-model-field > dt { color: var(--muted); font-size: 0.74rem; }
+.vehicle-model-field > dd { margin: 0; overflow-wrap: anywhere; }
+.vehicle-model-sources { margin: 0.35rem 0 0; padding-left: 1.1rem; display: grid; gap: 0.2rem; }
+.vehicle-quality .run-fact[data-status="failed"] dd, .vehicle-quality .run-fact[data-status="rejected"] dd { color: var(--danger); }
+.vehicle-quality .run-fact[data-status="partial"] dd, .vehicle-quality .run-fact[data-status="needs_review"] dd { color: var(--warning); }
+.run-history-list { list-style: none; margin: 0.4rem 0 0; padding: 0; display: grid; gap: 0.35rem; }
+.run-history-button { width: 100%; display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; background: transparent; border: 1px solid var(--border); border-radius: 8px; padding: 0.45rem 0.6rem; color: inherit; text-align: left; cursor: pointer; min-width: 0; }
+.run-history-button:hover { border-color: var(--border-strong); }
+.run-history-item[data-active="true"] .run-history-button { border-color: var(--accent); }
+.run-history-status { font-size: 0.85rem; }
+.run-history-verdict { font-size: 0.8rem; color: var(--muted); }
+.run-history-time { font-size: 0.75rem; color: var(--muted); margin-left: auto; }
+.developer-output { margin-top: 0.75rem; }

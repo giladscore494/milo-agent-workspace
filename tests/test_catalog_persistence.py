@@ -33,6 +33,7 @@ from backend.errors import AppError
 from backend.repository.supabase import Repository, SupabaseRepository
 from backend.testing import evidence_fixtures as F
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 
 from tests.test_repository_supabase import FakeClient  # the same fake, one definition
 
@@ -262,12 +263,16 @@ def leased_run(repository: MemoryRepository, key="catalog-key-1") -> tuple[UUID,
     """One run holding an active lease, through the real memory-repo path."""
     user = uuid4()
     repository.users.add(str(user))
-    project = repository.create_project_from_proposal(
-        uuid4(), f"catalog-{key}", "Catalog", None, {}, created_by=user)
-    conversation = repository.create_conversation(UUID(project["id"]), "c", user_id=user)
-    message = repository.create_user_message(UUID(conversation["id"]), "hello", {})
-    run = repository.create_queued_run(UUID(conversation["id"]), message["id"], "hello", {},
-                                       requested_by=user, idempotency_key=key)
+    # A product-workflow project: `create_project_from_proposal` creates a
+    # chat_architect_v1 project, and Console 6 gives no identity to a run of
+    # a workflow that has no reviewed engine version.
+    project_id = str(uuid4())
+    repository.seed_project(project_id, f"catalog-{key}", "Catalog", [str(user)])
+    conversation = repository.create_conversation(UUID(project_id), "c", user_id=user)
+    run = repository.create_message_and_run(
+        UUID(conversation["id"]), "hello", {}, requested_by=user, idempotency_key=key,
+        request_fingerprint=f"fp-{key}",
+        **identity_kwargs(repository, UUID(conversation["id"])))["run"]
     claimed = repository.claim_run(UUID(run["id"]), f"worker-{key}", lease_seconds=300)
     return UUID(run["id"]), {"worker_id": f"worker-{key}", "attempt": claimed["attempt"],
                              "lease_token": claimed["lease_token"]}

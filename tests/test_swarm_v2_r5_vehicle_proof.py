@@ -418,8 +418,10 @@ def test_none_of_r5s_proof_tools_reached_the_production_registry():
     that none of R5's own fixtures is it, at EITHER flag value.
     """
     worker_main = Path("backend/worker/main.py").read_text()
-    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])"
-            in worker_main)
+    # Pinned to the snapshot the Government preparation stage resolved after
+    # the lease: still exactly one READ tool, still the wrapper, never the reader.
+    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)] "
+            "if government_read_enabled else [])") in " ".join(worker_main.split())
     for name in ("yeda.vehicle_catalog", "gov_il.vehicle_registry",
                  "toyota.archived_model_document"):
         assert name not in worker_main

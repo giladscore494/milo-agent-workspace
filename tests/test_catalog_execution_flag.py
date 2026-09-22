@@ -46,7 +46,7 @@ from backend.catalog.execution import (CATALOG_EXECUTION_FLAG, CATALOG_PROMOTION
                                        catalog_promotion_enabled, government_read_enabled)
 from backend.tools.government_vehicle import GOVERNMENT_TOOL_NAME, GOVERNMENT_TOOL_SCOPE
 
-from test_swarm_v2_smoke_offline import (FakeKimiCompletions, build_repo,
+from test_swarm_v2_smoke_offline import (USER, FakeKimiCompletions, build_repo,
                                          run_worker_directly, swarm_env)
 
 REPO = Path(__file__).resolve().parents[1]
@@ -207,6 +207,15 @@ def run_swarm_with_catalog_flag(monkeypatch, flag, *, read=None, promotion=None)
         else:
             monkeypatch.setenv(name, value)
     repo, conversation_id = build_repo()
+    if catalog_execution.government_read_enabled():
+        # A Government-reading run is PREPARED before it may reach the
+        # provider: without a usable snapshot the worker refuses it through
+        # the canonical finalizer, so the wiring under test is never built.
+        # The capture is the committed fixture, landed the way the operator
+        # path lands it; the product worker imports nothing.
+        from backend.testing.catalog_review_seed import land_pinned_government_snapshot
+        project_id = repo.get_conversation(conversation_id)["project_id"]
+        land_pinned_government_snapshot(repo, user_id=USER, project_id=str(project_id))
     completions = FakeKimiCompletions()
     run_id = run_worker_directly(repo, conversation_id, monkeypatch, completions,
                                  idempotency_key=f"catalog-flag-{uuid4().hex[:8]}")

@@ -28,7 +28,7 @@ const apiMocks = vi.hoisted(() => ({
   api: {
     projects: vi.fn(), conversations: vi.fn(), createConversation: vi.fn(),
     createProposal: vi.fn(), proposal: vi.fn(), decideProposal: vi.fn(), reviseProposal: vi.fn(),
-    startRun: vi.fn(), run: vi.fn(), events: vi.fn(), cancel: vi.fn(),
+    startRun: vi.fn(), run: vi.fn(), runs: vi.fn(() => Promise.resolve([])), events: vi.fn(), cancel: vi.fn(),
   },
 }));
 

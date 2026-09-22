@@ -246,5 +246,18 @@ function InspectorPanel({ tab, agents, state, swarm }: { tab: InspectorTab; agen
   // run.usage is the authoritative aggregate; the event-derived totals stay
   // labelled as such and are never presented as the run's model-call count.
   if (tab === 'Costs') return <pre className="code-block">{JSON.stringify({ event_derived_tokens: state.tokens, event_derived_cost: state.cost, usage: normalizeRunUsage(state.run?.usage) }, null, 2)}</pre>;
-  return <pre className="code-block">{JSON.stringify(redactSecrets({ events: state.events.length, checkpoints: state.checkpoints, validationErrors: state.validationErrors, rawErrors: state.rawErrors }), null, 2)}</pre>;
+  // Developer telemetry. The durable payload is shown here, redacted, as
+  // technical detail; it is NOT the product surface (that is the typed result
+  // panel in the centre column, which renders only what its contract names).
+  return (
+    <>
+      <pre className="code-block">{JSON.stringify(redactSecrets({ events: state.events.length, checkpoints: state.checkpoints, validationErrors: state.validationErrors, rawErrors: state.rawErrors }), null, 2)}</pre>
+      <details className="developer-output">
+        <summary>Durable run payload (redacted)</summary>
+        {state.run?.output && Object.keys(state.run.output).length > 0
+          ? <pre className="code-block">{JSON.stringify(redactSecrets(state.run.output), null, 2)}</pre>
+          : <p className="muted">The backend has recorded no output payload for this run.</p>}
+      </details>
+    </>
+  );
 }

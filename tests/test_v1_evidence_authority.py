@@ -45,6 +45,7 @@ from backend.engines.vehicle_catalog_v1.evidence_authority import (
 from backend.catalog.pipeline import PROMOTABLE_TOOL_OPERATION
 from backend.errors import LEASE_FAILURE_CODES, AppError
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 
 ISRAELI_URL = "https://toyota.co.il/rav4"
 FOREIGN_URL = "https://toyota-usa.com/rav4"
@@ -69,9 +70,9 @@ def leased_run(repository: MemoryRepository, worker: str = "worker-1") -> Worker
     repository.seed_user(user)
     repository.seed_project(project, f"p-{worker}", "P", [user])
     conversation = repository.create_conversation(project, "c", user)
-    message = repository.create_user_message(conversation["id"], "go", {})
-    run = repository.create_queued_run(conversation["id"], message["id"], "go", {},
-                                       requested_by=user)
+    run = repository.create_message_and_run(
+        conversation["id"], "go", {}, requested_by=user, idempotency_key=None,
+        request_fingerprint="fp-go", **identity_kwargs(repository, conversation["id"]))["run"]
     claimed = repository.claim_run(run["id"], worker)
     return WorkerLease(claimed["id"], worker, int(claimed["attempt"]), claimed["lease_token"])
 

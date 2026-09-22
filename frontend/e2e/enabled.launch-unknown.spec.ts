@@ -116,7 +116,10 @@ test('F5-L2. the browser shows a safe error, then that reconciliation is require
   // API returns the parked run instead of creating or launching a second one.
   await page.getByRole('button', { name: 'Send task' }).click();
 
-  const note = page.getByRole('status');
+  // The launch note is one of several status regions on the page (the typed
+  // V1 result surface also announces its not-finished state), so it is
+  // selected by what it says.
+  const note = page.getByRole('status').filter({ hasText: 'Launch outcome' });
   await expect(note).toContainText('Launch outcome unknown', { timeout: 20_000 });
   await expect(note).toContainText('operator reconciliation required');
   await expect(note).toContainText('will not be relaunched automatically');

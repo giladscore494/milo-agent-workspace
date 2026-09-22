@@ -77,6 +77,7 @@ from backend.runtime import CancellationRequested
 from backend.testing.government_capture import (FixtureTransport, PINNED_PAGE_LIMIT,
                                                 PINNED_QUERY)
 from backend.testing.memory_repository import MemoryRepository
+from tests.run_factory import identity_kwargs
 from backend.tools import ToolContext, ToolError, ToolMode, ToolRegistry
 from backend.tools.government_vehicle import (GOVERNMENT_TOOL_NAME, GOVERNMENT_TOOL_SCOPE,
                                               MAX_TOOL_PAGE_ITEMS, GovernmentVehicleTool)
@@ -112,9 +113,9 @@ def leased_run(repository: MemoryRepository, worker: str = "worker-1") -> Worker
     repository.seed_user(user)
     repository.seed_project(project, f"p-{worker}", "P", [user])
     conversation = repository.create_conversation(project, "c", user)
-    message = repository.create_user_message(conversation["id"], "go", {})
-    run = repository.create_queued_run(conversation["id"], message["id"], "go", {},
-                                       requested_by=user)
+    run = repository.create_message_and_run(
+        conversation["id"], "go", {}, requested_by=user, idempotency_key=None,
+        request_fingerprint="fp-go", **identity_kwargs(repository, conversation["id"]))["run"]
     claimed = repository.claim_run(run["id"], worker)
     return WorkerLease(claimed["id"], worker, int(claimed["attempt"]), claimed["lease_token"])
 
@@ -1843,6 +1844,13 @@ def swarm_run_reaching_completion(monkeypatch):
     monkeypatch.setattr(swarm_pkg.SwarmV2Adapter, "run",
                         lambda self, run: dict(USABLE_PRODUCT_OUTCOME))
     repo, conversation_id = build_repo()
+    # A Government-reading run is PREPARED after the lease and before the
+    # provider: without a usable snapshot the worker refuses it through the
+    # canonical finalizer and the promotion path is never reached. Land the
+    # committed capture the way the operator path lands it.
+    from backend.testing.catalog_review_seed import land_pinned_government_snapshot
+    from test_swarm_v2_smoke_offline import PROJECT, USER
+    land_pinned_government_snapshot(repo, user_id=USER, project_id=PROJECT)
     run_id = run_worker_directly(repo, conversation_id, monkeypatch, FakeKimiCompletions(),
                                  idempotency_key=f"promotion-read-{uuid4().hex[:8]}")
     return repo, run_id
@@ -1911,14 +1919,24 @@ def test_a_run_whose_pending_promotion_read_failed_is_never_marked_complete(monk
     assert finalized == ["finalize:completed"]
     assert control_repo.get_run(control_id)["status"] == "completed"
     # The promotion really did run on this stack: the read WAS reached, so the
-    # subject below fails at a step this run genuinely performs.
-    assert reads == ["read"]
+    # subject below fails at a step this run genuinely performs. The same
+    # durable read is consulted TWICE on a prepared run: once by the
+    # Government preparation stage (per-item progress, before the engine) and
+    # once by the promotion path (after the engine).
+    assert reads == ["read", "read"]
 
-    # --- the SUBJECT: identical stack, read DOWN ----------------------------
+    # --- the SUBJECT: identical stack, the PROMOTION read DOWN ---------------
     finalized.clear()
     repo, run_id = swarm_run_reaching_completion(monkeypatch)
 
-    def unavailable(self, *_args, **_kwargs):
+    subject_reads: list[str] = []
+
+    def unavailable(self, *args, **kwargs):
+        subject_reads.append("read")
+        if len(subject_reads) == 1:
+            # Preparation's progress read answers; the promotion read is
+            # the one that goes down, after the engine has succeeded.
+            return real_read(self, *args, **kwargs)
         raise AppError(*CATALOG_READ_OUTAGE)
 
     monkeypatch.setattr(MemoryRepository, "catalog_run_pending_promotions", unavailable)

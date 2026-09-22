@@ -46,7 +46,10 @@ class Repository(Protocol):
     def get_run_usage_ledger(self, run_id: UUID) -> dict[str, Any] | None: ...
     def append_usage_ledger(self, entry: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]: ...
+    def list_conversation_runs(self, conversation_id: UUID, user_id: UUID | None = None, limit: int = 20) -> list[dict[str, Any]]: ...
     def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
+    def terminal_run_event(self, run_id: UUID) -> dict[str, Any] | None: ...
+    def terminal_run_events(self, run_ids: list[UUID]) -> dict[str, dict[str, Any]]: ...
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def save_checkpoint(self, checkpoint: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None: ...
@@ -473,6 +476,65 @@ class SupabaseRepository:
         if after_event_id is not None:
             query = query.gt("id", after_event_id)
         return self._many(query.order("id").limit(500))
+
+    #: The events the canonical finalizer writes in the same transaction as
+    #: the terminal status (backend/finalization.py `_TERMINAL_EVENT`).
+    TERMINAL_EVENT_TYPES = ("run_completed", "run_partial_success", "run_failed", "run_cancelled")
+
+    def terminal_run_event(self, run_id: UUID) -> dict[str, Any] | None:
+        """The LATEST terminal event of a run, or None.
+
+        Read separately from the bounded event page because a long run can
+        hold more events than one page returns, and the ProductOutcome the
+        finalizer recorded rides on exactly this event. Callers must already
+        have authorized the run read.
+        """
+        rows = self._many(
+            self.client.table("run_events").select("*")
+            .eq("run_id", str(run_id))
+            .in_("event_type", list(self.TERMINAL_EVENT_TYPES))
+            .order("id", desc=True).limit(1)
+        )
+        return rows[0] if rows else None
+
+    def terminal_run_events(self, run_ids: list[UUID]) -> dict[str, dict[str, Any]]:
+        """The latest terminal event of EACH run in one bounded read.
+
+        One query for a whole history page instead of one per row; the newest
+        event per run wins, exactly as `terminal_run_event` decides for one.
+        """
+        ids = [str(run_id) for run_id in run_ids][:50]
+        if not ids:
+            return {}
+        rows = self._many(
+            self.client.table("run_events").select("*")
+            .in_("run_id", ids)
+            .in_("event_type", list(self.TERMINAL_EVENT_TYPES))
+            .order("id", desc=True).limit(4 * len(ids))
+        )
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            latest.setdefault(str(row.get("run_id")), row)
+        return latest
+
+    def list_conversation_runs(self, conversation_id: UUID, user_id: UUID | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        """A conversation's runs, newest first, bounded.
+
+        Membership is proven through the conversation (conversations ->
+        projects -> project_members) before any run row is read, exactly as
+        the single-run read proves it through the run. The payload columns are
+        not selected: the history is for choosing a run, and the product is
+        read through `get_run` once one is chosen.
+        """
+        self.get_conversation(conversation_id, user_id)
+        bounded = max(1, min(int(limit), 50))
+        columns = ("id, conversation_id, status, attempt, started_at, finished_at, created_at, updated_at, "
+                   "launch_state, usage, run_identity")
+        return self._many(
+            self.client.table("runs").select(columns)
+            .eq("conversation_id", str(conversation_id))
+            .order("created_at", desc=True).limit(bounded)
+        )
 
     @staticmethod
     def _is_stale_lease_error(exc: Exception) -> bool:
