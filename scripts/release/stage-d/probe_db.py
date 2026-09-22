@@ -281,36 +281,20 @@ def assert_stage_d_key_is_not_the_capture_key(problems: list[str]) -> None:
 
 
 # ===========================================================================
-# THE REQUIRED RPC SURFACE, rebuilt from CURRENT main.
+# THE REQUIRED RPC SURFACE, generated from CURRENT main.
 # ===========================================================================
 #
-# This used to be a hand-written list of six RPCs, pinned when the guarded
-# worker writes landed. Everything built afterwards -- the durable
-# execution-usage ledger, atomic guarded finalization, the current-verdict
-# authority, the R3/R4 evidence writers, the catalog writers, and the
-# run-identity and fencing primitives -- became a RUNTIME DEPENDENCY without
-# becoming a PREFLIGHT REQUIREMENT. A production database missing
-# `record_run_usage_guarded` or `finalize_run_guarded` passed every Stage D
-# check and would then have failed on the first paid model call, after the
-# money was spent. That is exactly the failure a preflight exists to prevent.
+# Every RPC the runtime calls is a PREFLIGHT REQUIREMENT, so a database
+# missing one fails here, before any paid call. `release_inventory.py` derives
+# the list (the runtime's RPC call sites, plus this probe's own, and the
+# required arguments of each migration-created function), and
+# `tests/test_release_inventory.py` fails unless this literal is exactly that.
+# It is a literal because this probe cannot import the deriving module
+# (README.md, "The probe source has a size budget", has the full rationale).
 #
-# It is now GENERATED. `scripts/release/release_inventory.py` derives the whole
-# inventory from two facts about the repository as it is: every RPC name the
-# runtime actually calls (an AST scan of the repository layer, plus this
-# probe's own `/rest/v1/rpc/` calls), and every function the migrations create,
-# with the arguments each one requires. `tests/test_release_inventory.py` fails
-# if the literal below is not exactly what that derivation produces from
-# current main, so the list cannot fall behind the runtime again.
-#
-# It stays a LITERAL here, and only here, because this probe is transported
-# into a bare pinned image as one SHA-256-pinned file with the standard library
-# alone: it cannot import the deriving module. The arrangement is the same one
-# `policy_envelope.PINNED_POLICY_FINGERPRINT` uses -- generated content,
-# reviewed placement.
-#
-# Optional (defaulted) arguments are deliberately excluded, so a migration that
-# ADDS an optional parameter does not fail the check while a missing or renamed
-# required one does -- EXCEPT for the RPCs in EXACT_RPC_SIGNATURES below.
+# Optional (defaulted) arguments are excluded, so an ADDED optional parameter
+# passes while a missing or renamed required one fails -- EXCEPT for the RPCs
+# in EXACT_RPC_SIGNATURES below.
 #
 # Regenerate with:
 #   python3 scripts/release/release_inventory.py rpcs
@@ -1645,18 +1629,11 @@ def evidence() -> None:
     # a run of the ACCEPTED RELEASE.
     # ===================================================================
     #
-    # Every other link in the chain was already proven -- the accepted runtime
-    # source is byte-identical to the policy this toolkit uses, that policy's
-    # fingerprint is the reviewed one, the release tag resolves to the accepted
-    # digests, the serving revision and the executing job run those digests --
-    # and none of them said anything about the RUN. A run recorded no policy,
-    # no release and no engine of its own: its engine was re-derived from a
-    # project row at claim time.
-    #
     # `runs.run_identity` (migration 20260921000200) is bound at creation and
-    # immutable, and this compares it with what THIS release would have bound.
-    # The identity is raw JSON from the database, so it is parsed defensively
-    # and every failure mode is a refusal.
+    # immutable; this compares it with what THIS release would have bound
+    # (README.md, "The probe source has a size budget", says why). It is raw
+    # JSON from the database, so it is parsed defensively and every failure
+    # mode is a refusal.
     identity = run.get("run_identity")
     if isinstance(identity, str):
         try:
@@ -1701,17 +1678,12 @@ def evidence() -> None:
 
     # The canonical ProductOutcome the WORKER recorded when it finalized the
     # run (backend/product_outcome.py, written by backend/finalization.py).
-    #
-    # This probe deliberately does NOT derive one. Deriving it here would be a
-    # second implementation of the semantic rule, free to disagree with the one
-    # that actually decided the run's terminal status -- exactly the drift that
-    # made Stage D transcribe its own copy of the runtime envelope. The record
-    # is copied through verbatim and JUDGED on the operator host by
-    # semantic_acceptance.py, which imports the one canonical module.
-    #
-    # It is a bounded record by construction: static status vocabulary, integer
-    # counts, allowlisted blocking codes and a payload DIGEST. No fragment of
-    # the product payload travels with it.
+    # This probe deliberately does NOT derive one: it copies the record
+    # through verbatim, and semantic_acceptance.py JUDGES it on the operator
+    # host with the one canonical module (README.md, "The probe source has a
+    # size budget", says why). The record is bounded by construction: static
+    # status vocabulary, integer counts, allowlisted blocking codes and a
+    # payload DIGEST, and no fragment of the product payload.
     product_outcome = None
     for event in (events or []):
         if event.get("event_type") not in ("run_completed", "run_partial_success"):
