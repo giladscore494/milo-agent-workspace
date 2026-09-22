@@ -76,6 +76,25 @@ def _leased_run(repository: MemoryRepository, user_id: str, project_id: str,
     return WorkerLease(claimed["id"], worker, int(claimed["attempt"]), claimed["lease_token"])
 
 
+def land_pinned_government_snapshot(repository: MemoryRepository, *, user_id: str,
+                                    project_id: str,
+                                    worker: str = "offline-catalog-capture") -> str:
+    """Land the committed Government capture as ONE usable active snapshot.
+
+    The operator-capture path in miniature, over the pinned fixture transport:
+    a leased run, the real `GovernmentCatalogIngestor`, the guarded writes and
+    activation. It is what an offline test uses when a run must find a usable
+    snapshot -- the product worker itself never imports one. Returns the
+    snapshot key.
+    """
+    lease = _leased_run(repository, user_id, project_id, worker)
+    client = DataGovClient(FixtureTransport(), page_limit=PINNED_PAGE_LIMIT,
+                           sleep_fn=lambda _seconds: None)
+    report = GovernmentCatalogIngestor(repository, lease, client=client).ingest_resource(
+        src.WLTP_RESOURCE_ID, query=dict(PINNED_QUERY))
+    return str(report.snapshot_key)
+
+
 def seed_catalog_review_state(repository: MemoryRepository, *, user_id: str,
                               project_id: str) -> dict[str, Any]:
     """Land one active Government snapshot and a small canonical catalog.

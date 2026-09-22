@@ -12,6 +12,7 @@ from backend.runtime_policy import RuntimePolicyError, policy_failure_code, reso
 from backend.config import get_settings
 from backend.errors import AppError
 from backend.repository import Repository, SupabaseRepository
+from backend.catalog.government.preparation import ARTIFACT_KEY as GOVERNMENT_ARTIFACT_KEY
 from backend.runtime import TERMINAL_STATES, CancellationRequested, RunEventRecord, SupabaseEventSink
 from backend.supervisor import SupervisorInput, apply_event_to_blackboard, build_evaluation_report, initial_blackboard, make_shadow_decision, route_event_message
 from backend.engines.vehicle_catalog_v1 import VehicleCatalogV1Adapter
@@ -241,6 +242,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # plain dict rather than a closure variable because the wiring runs
         # inside a nested factory; it holds server objects only.
         catalog_promotion: dict[str, Any] = {}
+        # The Government preparation stage's answer (posture, pinned snapshot,
+        # deterministic work queue and its server-derived progress). Populated
+        # AFTER the lease and BEFORE any paid provider path is constructed; the
+        # Swarm V2 wiring below reads it and never re-decides it.
+        catalog_state: dict[str, Any] = {}
 
         def build_default_engine():
             if engine_builder is None:
@@ -331,6 +337,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # never carry less usage than the run has durably spent.
                 checkpoint = {**checkpoint, "run_id": str(run_id), "attempt": run.get("attempt", 1), "workflow_key": workflow_key,
                               "token_usage": merge_usage_snapshots(checkpoint.get("token_usage"), tracker.ledger_snapshot())}
+                # The Government preparation record rides on EVERY later
+                # checkpoint of a prepared run, so `latest_checkpoint` always
+                # carries the pinned snapshot and the queue whichever phase
+                # wrote it, and an engine checkpoint can never displace them.
+                preparation = catalog_state.get("preparation")
+                if preparation is not None:
+                    artifacts = dict(checkpoint.get("artifacts") or {})
+                    artifacts.setdefault(GOVERNMENT_ARTIFACT_KEY, preparation.as_artifact())
+                    checkpoint = {**checkpoint, "artifacts": artifacts}
                 repo.save_checkpoint(checkpoint, **lease_ctx)
                 shadow_observe("checkpoint_saved", checkpoint)
         def is_cancelled():
@@ -568,6 +583,82 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 raise ValueError(f"unknown ledger consumption kind {kind!r}")
 
         # =============================================================
+        # Government preparation -- AFTER the lease, BEFORE the provider.
+        #
+        # Only a real, trusted Swarm V2 run in a deployment whose catalog
+        # posture allows the Government read reaches this. The order below
+        # is the invariant, not an implementation detail: the run has been
+        # claimed (run + worker + attempt + lease exist and every write is
+        # fenced by them), one usable immutable snapshot is resolved and
+        # PINNED, a deterministic bounded queue is selected from persisted
+        # candidate state and made durable under the lease -- and only
+        # then does execution continue to the block that constructs the
+        # provider adapter and, later, the engine that makes paid calls.
+        #
+        # A run that cannot be prepared is refused through the canonical
+        # finalizer here. No transport to data.gov.il exists on this path:
+        # the product worker never imports, it reads what the operator
+        # capture landed.
+        if workflow_key == "swarm_v2" and engine is None and engine_registry is None \
+                and engine_mode != "mock":
+            from backend.catalog.execution import CatalogPostureInvalid, catalog_posture
+            from backend.catalog.government.preparation import (
+                GovernmentPreparationError, PREPARATION_PHASE, government_work_progress,
+                is_preparation_checkpoint, prepare_government_work)
+
+            try:
+                # Read ONCE for the whole run; the Swarm V2 wiring reuses it.
+                catalog_state["posture"] = catalog_posture()
+            except CatalogPostureInvalid as exc:
+                finalizer.finalize(TerminalClaim.refusal(
+                    workflow_key, "CATALOG_POSTURE_INVALID", str(exc)))
+                return 0
+            if catalog_state["posture"]["government_read"]:
+                try:
+                    preparation = prepare_government_work(
+                        repo, checkpoint=latest_checkpoint, cancellation_checker=is_cancelled)
+                except GovernmentPreparationError as exc:
+                    finalizer.finalize(TerminalClaim.refusal(
+                        workflow_key, exc.code, exc.safe_message,
+                        event_payload={"reason": exc.reason_code} if exc.reason_code else None))
+                    return 0
+                except CancellationRequested:
+                    finalizer.finalize(TerminalClaim.cancelled(workflow_key))
+                    return 0
+                # Progress is DERIVED from durable state (this run's verified
+                # evidence rows and promotion events); nothing is remembered
+                # in the process. A failed read propagates as infrastructure.
+                progress = government_work_progress(repo, run_id, preparation)
+                catalog_state["preparation"] = preparation
+                catalog_state["work_context"] = preparation.work_context(progress)
+                if not preparation.resumed:
+                    # ONE durable record, under the lease, in the existing
+                    # checkpoint authority. Written before any engine
+                    # checkpoint exists; every later one carries it forward.
+                    save_checkpoint(PREPARATION_PHASE, {
+                        "phase": PREPARATION_PHASE,
+                        "engine_version": preclaim_identity.engine_version,
+                        "completed_tasks": [], "failures": [],
+                        "artifacts": {GOVERNMENT_ARTIFACT_KEY: preparation.as_artifact()}})
+                # A registered, run-level event: the checkpoint is a fact
+                # about the RUN, and the payload is keys, counts and booleans.
+                sink.emit(RunEventRecord(
+                    run_id=run_id, type="checkpoint_saved",
+                    message="Government catalog prepared: snapshot pinned and work queue selected",
+                    payload={"phase": PREPARATION_PHASE,
+                             "snapshot_key": preparation.snapshot_key,
+                             "resource_id": preparation.resource_id,
+                             "queued": len(preparation.queue),
+                             "remaining": catalog_state["work_context"]["remaining"],
+                             "total_candidates": preparation.total_candidates,
+                             "bounded": preparation.bounded,
+                             "resumed": preparation.resumed}))
+                if is_preparation_checkpoint(latest_checkpoint):
+                    # The latest checkpoint is the preparation record itself:
+                    # the engine has no state to resume and must start fresh.
+                    latest_checkpoint = None
+
+        # =============================================================
         # THE provider authority for this worker process. ONE instance,
         # built once, handed to WHICHEVER engine runs -- and to both of
         # them when a process serves both. Everything a provider request
@@ -702,9 +793,14 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # canonical writes at the same time -- which meant there was no
                 # configuration at all for a genuinely read-only first run.
                 # Promotion still requires read; read never implies promotion.
-                posture = catalog_posture()
+                posture = catalog_state.get("posture") or catalog_posture()
                 government_read_enabled = posture["government_read"]
                 promotion_enabled = posture["promotion"]
+                preparation = catalog_state.get("preparation")
+                if government_read_enabled and preparation is None:
+                    # The invariant, checked at the seam: a Government-reading
+                    # run reaches the provider only through preparation.
+                    raise RuntimeError("Government read is enabled but the run was not prepared")
 
                 allowed = tuple(filter(None, (item.strip() for item in
                     os.getenv("MILO_COMMANDER_MODEL_ALLOWLIST", "").split(","))))
@@ -730,7 +826,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # the plan firewall to admit, and no Government name in the
                 # provider-visible policy -- the capability is ABSENT, not
                 # merely unreachable.
-                tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])
+                # PINNED to the snapshot preparation resolved: every read this
+                # run makes answers from the same immutable snapshot, and a
+                # resumed attempt from the same one again.
+                tools = ToolRegistry(
+                    [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)]
+                    if government_read_enabled else [])
                 # ONE PlanLimits instance feeds both the provider-visible
                 # policy (ModelGateway) and the deterministic firewall
                 # (PlanValidator): contract parity cannot drift silently.
@@ -944,6 +1045,16 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # its existing artifact-based resume path above unchanged.
             engine_run = ({**run, "checkpoint": latest_checkpoint}
                           if workflow_key == "swarm_v2" and latest_checkpoint else run)
+            if catalog_state.get("work_context") is not None:
+                # The deterministic work selection reaches the Commander
+                # through its existing `context` seam. The API never writes
+                # `input.context`, and it is overwritten here regardless, so
+                # the selection is server-owned end to end.
+                run_input = dict(engine_run.get("input") or {})
+                context = run_input.get("context")
+                context = dict(context) if isinstance(context, dict) else {}
+                context["government_work"] = catalog_state["work_context"]
+                engine_run = {**engine_run, "input": {**run_input, "context": context}}
             result = selected_engine.run(engine_run)
             # Catalog PR3: the trusted promotion path, AFTER the engine has
             # settled every verdict and BEFORE the run is finalized, so it
