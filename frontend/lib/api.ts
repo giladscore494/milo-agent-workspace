@@ -2,6 +2,7 @@ import { EventId, eventCursorParam } from './eventId';
 import { parseJsonPreservingBigIntegers } from './losslessJson';
 import { getCurrentAccessToken } from './supabaseClient';
 import { Conversation, Project, Proposal, Run, RunEvent, RunSummary } from './types';
+import type { WorkScopeEdit } from './workScope';
 
 const API = '/api/gateway';
 
@@ -191,7 +192,54 @@ export const api = {
     request<unknown>(
       `/projects/${projectId}/catalog/review-candidates${catalogQuery(params)}`,
     ),
+
+  /**
+   * The Mapping Plan — the canonical work scope (`backend/catalog/scope/`).
+   *
+   * Three membership-scoped GETs and two writes. A write carries EITHER the
+   * person's words or a complete edit, never both, and a revision names the
+   * exact head (revision AND digest) it was made against, so a plan that
+   * changed underneath is refused rather than overwritten. Nothing here
+   * prepares data or starts a run. Every return is `unknown`:
+   * `lib/workScope.ts` turns it into trusted state field by field.
+   */
+  workScopeCapabilities: (projectId: string) =>
+    request<unknown>(`/projects/${projectId}/work-scope/capabilities`),
+
+  workScopeDirectory: (projectId: string) =>
+    request<unknown>(`/projects/${projectId}/work-scope/directory`),
+
+  openWorkScope: (conversationId: string) =>
+    request<unknown>(`/conversations/${conversationId}/work-scopes/open`),
+
+  createWorkScope: (conversationId: string, input: WorkScopeInput) =>
+    request<unknown>(`/conversations/${conversationId}/work-scopes`, {
+      method: 'POST',
+      body: JSON.stringify(workScopeBody(input)),
+    }),
+
+  reviseWorkScope: (
+    workScopeId: string,
+    head: { revision: number; digest: string },
+    input: WorkScopeInput,
+  ) =>
+    request<unknown>(`/work-scopes/${workScopeId}/revisions`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: head.revision,
+        expected_digest: head.digest,
+        ...workScopeBody(input),
+      }),
+    }),
 };
+
+/** A Mapping Plan write states the person's words OR a complete edit. */
+export type WorkScopeInput = { instruction: string } | { edit: WorkScopeEdit };
+
+/** Exactly one key, whichever input it is — never both. */
+function workScopeBody(input: WorkScopeInput): { instruction: string } | { edit: WorkScopeEdit } {
+  return 'instruction' in input ? { instruction: input.instruction } : { edit: input.edit };
+}
 
 /** Exactly the query parameters the CODE-3 routes declare. Nothing else. */
 export type CatalogPageParams = {

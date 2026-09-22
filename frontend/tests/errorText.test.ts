@@ -125,6 +125,20 @@ describe('approved classifications keep their actionable meaning', () => {
     }
   });
 
+  it('explains a refused Mapping Plan write in its own words', () => {
+    const stale = safeErrorText(new ApiError(409, 'WORK_SCOPE_STALE', 'WORK_SCOPE_STALE: row locked by pid 42'), 'Failed.');
+    expect(stale).toContain('changed since you opened it');
+    expect(stale).toContain('reloaded');
+    expect(stale).not.toContain('pid 42');
+    expect(safeErrorText(new ApiError(422, 'WORK_SCOPE_INSTRUCTION_NOT_UNDERSTOOD', 'x'), 'Failed.'))
+      .toContain('build the plan from the directory');
+    // Internal conditions get the caller's fallback, not a sentence of their own.
+    for (const code of ['WORK_SCOPE_UNREADABLE', 'WORK_SCOPE_UNAVAILABLE', 'WORK_SCOPE_REVISION_INVALID']) {
+      expect(safeErrorText(new ApiError(502, code, 'internal detail'), 'The plan could not be updated.'))
+        .toBe('The plan could not be updated.');
+    }
+  });
+
   it('shows gateway HTTP classifications without inventing a support code', () => {
     // `HTTP_429` is how lib/api.ts labels a gateway body, not a code anyone can
     // look up, so the copy appears and the label does not.

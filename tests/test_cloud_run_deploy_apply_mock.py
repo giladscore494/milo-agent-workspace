@@ -64,6 +64,9 @@ EXECUTION_FLAGS = (
     # the deployer's own env-name verification refuses the deployment.
     "MILO_ENABLE_GOVERNMENT_CATALOG_READ",
     "MILO_ENABLE_CATALOG_PROMOTION",
+    # The Mapping Plan writes. Pinned false on both surfaces like every other
+    # Stage A execution flag, so this fixture must carry it too.
+    "MILO_ENABLE_WORK_SCOPE_MUTATIONS",
 )
 
 MOCK_GCLOUD = r"""#!/usr/bin/env bash

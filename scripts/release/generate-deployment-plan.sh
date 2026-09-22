@@ -447,7 +447,8 @@ fi
 missing_flags=""
 for flag in JOB_LAUNCHER=disabled MILO_ENABLE_RUN_CREATION=false MILO_ENABLE_PROPOSAL_MUTATIONS=false \
   MILO_ENABLE_PROPOSAL_READS=false MILO_ENABLE_RUN_CANCELLATION=false MILO_ENABLE_EXECUTION_CONTROL=false \
-  MILO_ENABLE_PAID_EXECUTION=false MILO_ENABLE_CATALOG_EXECUTION=false; do
+  MILO_ENABLE_PAID_EXECUTION=false MILO_ENABLE_CATALOG_EXECUTION=false \
+  MILO_ENABLE_WORK_SCOPE_MUTATIONS=false; do
   grep -Fq -- "${flag}" <<< "${plan}" || missing_flags="${missing_flags} ${flag}"
 done
 if [[ -n "${missing_flags}" ]]; then

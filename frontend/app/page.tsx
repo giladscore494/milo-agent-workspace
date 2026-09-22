@@ -1,6 +1,6 @@
 'use client';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, executionUiEnabled, newIdempotencyKey } from '@/lib/api';
+import { ApiError, api, executionUiEnabled, newIdempotencyKey, type WorkScopeInput } from '@/lib/api';
 import { safeErrorText } from '@/lib/errorText';
 import {
   INITIAL_WORKSPACE_SCOPE,
@@ -35,6 +35,21 @@ import {
   parseCanonicalPage,
   parseReviewPage,
 } from '@/lib/catalogReview';
+import {
+  WorkScopeCapabilities,
+  WorkScopeDirectory,
+  WorkScopeDraft,
+  WorkScopeEdit,
+  WorkScopeNote,
+  WorkScopeState,
+  draftEdit,
+  draftFromPlan,
+  emptyDraft,
+  parseCapabilities,
+  parseDirectory,
+  parseOpenWorkScope,
+  parseWorkScopeMutation,
+} from '@/lib/workScope';
 import { AuthScreen, SessionRestoreScreen } from '@/components/auth/AuthScreen';
 import {
   CatalogReviewPanel,
@@ -44,6 +59,7 @@ import { ConversationView } from '@/components/conversation/ConversationView';
 import { TaskComposer } from '@/components/conversation/TaskComposer';
 import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector';
 import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
+import { MappingPlanPanel } from '@/components/scope/MappingPlanPanel';
 import { FinalResultPanel } from '@/components/result/FinalResultPanel';
 import { RunExportControl } from '@/components/result/RunExportControl';
 import { VehicleCatalogResultPanel } from '@/components/result/VehicleCatalogResultPanel';
@@ -190,6 +206,21 @@ export default function WorkspacePage() {
   const [cancelError, setCancelError] = useState('');
 
   const [tab, setTab] = useState<InspectorTab>('Agents');
+
+  // The Mapping Plan (backend/catalog/scope/). Whether it applies and which
+  // marques exist are PROJECT facts; the plan itself belongs to the
+  // CONVERSATION. Every piece is server state read back, except the draft,
+  // which is only the form a person is editing.
+  const [planCapabilities, setPlanCapabilities] = useState<WorkScopeCapabilities>();
+  const [planDirectory, setPlanDirectory] = useState<WorkScopeDirectory>();
+  const [planState, setPlanState] = useState<WorkScopeState | null>();
+  const [planOpen, setPlanOpen] = useState(false);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planBusy, setPlanBusy] = useState<PendingRequest>();
+  const [planError, setPlanError] = useState('');
+  const [planNotes, setPlanNotes] = useState<WorkScopeNote[]>([]);
+  const [planInstruction, setPlanInstruction] = useState('');
+  const [planDraft, setPlanDraft] = useState<WorkScopeDraft>();
 
   // CODE-3 — durable catalog review state. Deliberately separate from every
   // run-scoped piece of state above: this answers "what does the catalog hold
@@ -357,6 +388,18 @@ export default function WorkspacePage() {
       // declared above that callback, so calling it here would read a
       // `const` before its initializer.
       catalogRequest.current = undefined;
+      // The Mapping Plan, likewise: every plan, directory and draft the
+      // previous identity read or typed goes, inline for the same reason.
+      setPlanCapabilities(undefined);
+      setPlanDirectory(undefined);
+      setPlanState(undefined);
+      setPlanDraft(undefined);
+      setPlanOpen(false);
+      setPlanNotes([]);
+      setPlanError('');
+      setPlanInstruction('');
+      setPlanLoading(false);
+      setPlanBusy(undefined);
       setCatalogOpen(false);
       setCatalogView('canonical');
       setCatalogOffset(0);
@@ -588,6 +631,111 @@ export default function WorkspacePage() {
     loadRunHistory(activeConversation.id, scope.current, false);
   }, [terminalRunId, activeConversation, loadRunHistory]);
 
+  /**
+   * Drop every piece of Mapping Plan state. A plan read under one conversation
+   * (or one project, or one identity) may never stay on screen under another,
+   * so each of those switches clears it synchronously, exactly like the
+   * catalog. `project` also drops the project-scoped capability and directory.
+   */
+  const clearPlanState = useCallback((project: boolean) => {
+    if (project) {
+      setPlanCapabilities(undefined);
+      setPlanDirectory(undefined);
+      setPlanOpen(false);
+    }
+    setPlanState(undefined);
+    setPlanDraft(undefined);
+    setPlanNotes([]);
+    setPlanError('');
+    setPlanInstruction('');
+    setPlanLoading(false);
+    setPlanBusy(undefined);
+  }, []);
+
+  /** Show a plan the server returned: its state, and a draft reset to it. */
+  const showPlan = useCallback((state: WorkScopeState | null) => {
+    setPlanState(state);
+    setPlanDraft(state ? draftFromPlan(state.plan) : undefined);
+  }, []);
+
+  /**
+   * Whether the Mapping Plan applies to this project, from the SERVER's
+   * capability read. Only a Swarm V2 project is asked -- no other engine reads
+   * a plan -- and any failure, including a client that has no such method,
+   * leaves the surface hidden rather than half-shown.
+   */
+  const loadPlanCapabilities = useCallback((project: Project, owner: WorkspaceScope) => {
+    if (!executionUi || project.workflow_key !== 'swarm_v2') return;
+    Promise.resolve()
+      .then(() => api.workScopeCapabilities(project.id))
+      .then(body => {
+        if (!ownsProject(owner, scope.current)) return;
+        setPlanCapabilities(parseCapabilities(body));
+      })
+      .catch(() => {
+        if (!ownsProject(owner, scope.current)) return;
+        setPlanCapabilities(undefined);
+      });
+  }, [executionUi]);
+
+  /**
+   * The conversation's open plan, applied only while it is still selected.
+   * `keepError` is for the read-back after a refused write: the refusal's
+   * explanation stays on screen while the real plan is fetched.
+   */
+  const loadPlan = useCallback((conversationId: string, owner: WorkspaceScope, keepError = false) => {
+    setPlanLoading(true);
+    if (!keepError) setPlanError('');
+    Promise.resolve()
+      .then(() => api.openWorkScope(conversationId))
+      .then(body => {
+        if (!ownsConversation(owner, scope.current)) return;
+        const parsed = parseOpenWorkScope(body);
+        if (parsed === undefined) {
+          setPlanError('The mapping plan could not be read.');
+          return;
+        }
+        showPlan(parsed);
+      })
+      .catch(error => {
+        if (!ownsConversation(owner, scope.current)) return;
+        setPlanError(safeErrorText(error, 'The mapping plan could not be read.'));
+      })
+      .finally(() => {
+        if (!ownsConversation(owner, scope.current)) return;
+        setPlanLoading(false);
+      });
+  }, [showPlan]);
+
+  /** The project's manufacturer directory, read when the panel is opened. */
+  const loadPlanDirectory = useCallback((projectId: string, owner: WorkspaceScope) => {
+    Promise.resolve()
+      .then(() => api.workScopeDirectory(projectId))
+      .then(body => {
+        if (!ownsProject(owner, scope.current)) return;
+        setPlanDirectory(parseDirectory(body));
+      })
+      .catch(() => {
+        if (!ownsProject(owner, scope.current)) return;
+        setPlanDirectory(undefined);
+      });
+  }, []);
+
+  const planAvailable = executionUi && planCapabilities?.available === true;
+
+  // The plan is read once the capability read says it applies and a
+  // conversation is selected -- in either order, since both arrive async.
+  useEffect(() => {
+    if (!planAvailable || !activeConversation) return;
+    loadPlan(activeConversation.id, scope.current);
+  }, [planAvailable, activeConversation, loadPlan]);
+
+  // The directory is read when the panel is first opened for this project.
+  useEffect(() => {
+    if (!planAvailable || !planOpen || !selectedProject || planDirectory) return;
+    loadPlanDirectory(selectedProject.id, scope.current);
+  }, [planAvailable, planOpen, selectedProject, planDirectory, loadPlanDirectory]);
+
   const loadConversations = useCallback((project: Project, owner: WorkspaceScope) => {
     setConversations(undefined);
     setConversationError('');
@@ -643,11 +791,15 @@ export default function WorkspacePage() {
     // left to be overwritten, so there is no moment where the previous
     // project's rows are shown beside the new project's name.
     clearCatalogState();
+    clearPlanState(true);
     loadConversations(project, owner);
+    loadPlanCapabilities(project, owner);
   }
 
   function selectConversation(conversation: Conversation) {
     scope.current = withConversation(scope.current, conversation.id);
+    // The previous conversation's plan is dropped before this one is read.
+    clearPlanState(false);
     setActiveConversation(conversation);
     setRunError('');
     setCancelError('');
@@ -788,6 +940,64 @@ export default function WorkspacePage() {
     }
   }
 
+  /**
+   * Send ONE Mapping Plan write: the person's words, or the edited draft.
+   *
+   * Both go to the same server contract. A revision names the exact head it
+   * was made against; if the plan changed meanwhile the server refuses it
+   * (`WORK_SCOPE_STALE`) and the current plan is read back, so the person
+   * redoes the change against what is really there instead of overwriting it.
+   */
+  async function writePlan(input: WorkScopeInput) {
+    if (!activeConversation || planBusy || !planAvailable) return;
+    const owner = scope.current;
+    const conversationId = activeConversation.id;
+    const pending = beginPending(owner);
+    setPlanBusy(pending);
+    setPlanError('');
+    try {
+      const body = planState
+        ? await api.reviseWorkScope(planState.id, { revision: planState.revision, digest: planState.digest }, input)
+        : await api.createWorkScope(conversationId, input);
+      if (!ownsConversation(owner, scope.current)) return;
+      const result = parseWorkScopeMutation(body);
+      if (!result) {
+        setPlanError('The mapping plan answer could not be read.');
+        loadPlan(conversationId, owner, true);
+        return;
+      }
+      showPlan(result.state);
+      setPlanNotes(result.notes);
+      if ('instruction' in input) setPlanInstruction('');
+    } catch (error) {
+      if (!ownsConversation(owner, scope.current)) return;
+      setPlanError(safeErrorText(error, 'The mapping plan could not be updated.'));
+      if (error instanceof ApiError && (error.code === 'WORK_SCOPE_STALE' || error.code === 'WORK_SCOPE_OPEN_EXISTS')) {
+        loadPlan(conversationId, owner, true);
+      }
+    } finally {
+      setPlanBusy(current => settlePending(current, pending));
+    }
+  }
+
+  function draftEditOrNothing(): WorkScopeEdit | undefined {
+    if (!planCapabilities || !planDraft) return undefined;
+    const checked = draftEdit(planDraft, planCapabilities.limits);
+    return 'edit' in checked ? checked.edit : undefined;
+  }
+
+  async function submitPlanInstruction() {
+    const instruction = planInstruction.trim();
+    if (instruction === '') return;
+    await writePlan({ instruction });
+  }
+
+  async function savePlanDraft() {
+    const edit = draftEditOrNothing();
+    if (edit === undefined) return;
+    await writePlan({ edit });
+  }
+
   async function confirmCancelRun() {
     if (!activeRunId) return;
     const owner = scope.current;
@@ -884,6 +1094,26 @@ export default function WorkspacePage() {
           onGenerate={generateProposal}
           onRevise={reviseProposal}
           onDecide={decideProposal}
+        />
+        <MappingPlanPanel
+          visible={planAvailable && activeConversation !== undefined}
+          open={planOpen}
+          onOpenChange={setPlanOpen}
+          capabilities={planCapabilities}
+          directory={planDirectory}
+          state={planState}
+          loading={planLoading}
+          busy={planBusy !== undefined}
+          error={planError}
+          notes={planNotes}
+          instruction={planInstruction}
+          onInstructionChange={setPlanInstruction}
+          onSubmitInstruction={submitPlanInstruction}
+          draft={planDraft ?? (planCapabilities ? emptyDraft(planCapabilities.limits) : { units: [], modelYearFrom: '', modelYearTo: '', maxItems: '', batchSize: 1 })}
+          onDraftChange={setPlanDraft}
+          onSaveDraft={savePlanDraft}
+          onDiscardDraft={() => setPlanDraft(planState ? draftFromPlan(planState.plan) : undefined)}
+          onRetry={() => { if (activeConversation) loadPlan(activeConversation.id, scope.current); }}
         />
         {swarmCardRunId ? (
           <SwarmRunCard

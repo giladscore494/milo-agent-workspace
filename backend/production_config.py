@@ -167,6 +167,11 @@ EXECUTION_FLAGS = (
     # separate decisions; both default off and both are pinned off here.
     "MILO_ENABLE_GOVERNMENT_CATALOG_READ",
     "MILO_ENABLE_CATALOG_PROMOTION",
+    # API-only. Gates the two Mapping Plan writes (create / revise a
+    # conversation's work scope). A plan is a draft that executes nothing, but
+    # it is durable state a browser writes, so it is pinned off here like every
+    # other surface a stage has to enable deliberately.
+    "MILO_ENABLE_WORK_SCOPE_MUTATIONS",
 )
 
 # NEXT_PUBLIC_* values ship to the browser bundle: secret material is banned.

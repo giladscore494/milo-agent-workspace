@@ -157,6 +157,11 @@ UNFENCED_BY_DESIGN = {
     # Browser/API surfaces that own no run state.
     "create_conversation", "create_workflow_proposal",
     "create_project_from_proposal",
+    # A Mapping Plan is a membership-authorized draft that belongs to a
+    # CONVERSATION, not to a run; no worker ever writes one, so there is no
+    # lease to present. Its writer re-checks membership in the database, and a
+    # stale head is refused by compare-and-set instead.
+    "create_work_scope",
     # Lease-optional by contract, checked completely whenever one IS supplied:
     # these predate the lease contract and the worker always passes one.
     "append_run_event", "save_checkpoint", "update_run_usage",

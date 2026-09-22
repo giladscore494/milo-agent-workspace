@@ -132,6 +132,13 @@ class Repository(Protocol):
     def get_canonical_catalog_variant(self, canonical_key: str) -> dict[str, Any] | None: ...
     def list_canonical_field_provenance(self, variant_id: Any, *, limit: int = 200) -> list[dict[str, Any]]: ...
     def list_canonical_catalog_variants(self, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, canonical_key: str | None = None, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]: ...
+    # Mapping plans (20260922000100_catalog_work_scopes.sql).
+    def create_work_scope(self, conversation_id: UUID, created_by: UUID, revision: dict[str, Any]) -> dict[str, Any]: ...
+    def revise_work_scope(self, work_scope_id: UUID, expected_revision: int, expected_digest: str, created_by: UUID, revision: dict[str, Any]) -> dict[str, Any]: ...
+    def get_work_scope(self, work_scope_id: UUID) -> dict[str, Any] | None: ...
+    def open_work_scope(self, conversation_id: UUID) -> dict[str, Any] | None: ...
+    def list_work_scope_revisions(self, work_scope_id: UUID, *, limit: int = 11) -> list[dict[str, Any]]: ...
+    def catalog_canonical_manufacturer_coverage(self, manufacturers: list[str]) -> list[dict[str, Any]]: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -1353,6 +1360,90 @@ class SupabaseRepository:
             empty = {name.strip(): None for name in self.CANONICAL_VARIANT_COLUMNS.split(",")}
             return [{**empty, "total_count": total}]
         return [{**row, "total_count": total} for row in rows]
+
+    # --- mapping plans (20260922000100_catalog_work_scopes.sql) ---------------
+    #
+    # Two reviewed writers and three bounded reads. The writers derive the
+    # digest, the project and the revision number in the database and re-check
+    # membership there; this layer passes values, never a column, a table or an
+    # ordering. Every refusal the SQL raises by name is mapped to the same code
+    # the in-memory mirror raises, and anything else becomes one sanitized
+    # classification -- a PostgREST message can quote SQL values.
+    WORK_SCOPE_COLUMNS = ("id, project_id, conversation_id, created_by, status, "
+                          "head_revision, head_digest, created_at, updated_at, closed_at")
+    WORK_SCOPE_REVISION_COLUMNS = ("id, work_scope_id, revision, scope_text, digest, "
+                                   "input_kind, instruction, notes, created_by, created_at")
+    MAX_WORK_SCOPE_REVISION_ROWS = 50
+    _WORK_SCOPE_REFUSALS = (
+        ("WORK_SCOPE_STALE", "the plan changed since it was read; reload it and try again", 409),
+        ("WORK_SCOPE_OPEN_EXISTS", "this conversation already has an open mapping plan", 409),
+        ("WORK_SCOPE_NOT_EDITABLE", "the mapping plan is not editable", 409),
+        ("WORK_SCOPE_WORKFLOW_UNSUPPORTED", "this project's engine does not read a mapping plan", 409),
+        ("WORK_SCOPE_REVISION_INVALID", "invalid work scope revision", 422),
+    )
+
+    def _work_scope_write(self, call: Any, identifier: str) -> dict[str, Any]:
+        """Run one writer RPC and map what it refuses.
+
+        `call` is the RPC itself, spelled out at the method below with its
+        literal name, so the release inventory (`scripts/release/
+        release_inventory.py`) sees every writer as the runtime dependency it
+        is.
+        """
+        try:
+            data = call().execute().data
+        except Exception as exc:
+            message = str(exc)
+            if "WORK_SCOPE_CONVERSATION_NOT_FOUND" in message:
+                raise NotFoundError("conversation", identifier) from None
+            if "WORK_SCOPE_NOT_FOUND" in message:
+                raise NotFoundError("work_scope", identifier) from None
+            for code, safe, status in self._WORK_SCOPE_REFUSALS:
+                if code in message:
+                    raise AppError(code, safe, status) from None
+            raise AppError("REPOSITORY_ERROR", "mapping plan write failed", 502) from None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict) or not isinstance(data.get("work_scope"), dict):
+            raise AppError("REPOSITORY_ERROR", "mapping plan write returned no row", 502)
+        return data
+
+    def create_work_scope(self, conversation_id: UUID, created_by: UUID, revision: dict[str, Any]) -> dict[str, Any]:
+        return self._work_scope_write(lambda: self.client.rpc("create_work_scope", {
+            "p_conversation_id": str(conversation_id), "p_created_by": str(created_by),
+            "p_revision": revision}), str(conversation_id))
+
+    def revise_work_scope(self, work_scope_id: UUID, expected_revision: int, expected_digest: str, created_by: UUID, revision: dict[str, Any]) -> dict[str, Any]:
+        return self._work_scope_write(lambda: self.client.rpc("revise_work_scope", {
+            "p_work_scope_id": str(work_scope_id), "p_expected_revision": int(expected_revision),
+            "p_expected_digest": str(expected_digest), "p_created_by": str(created_by),
+            "p_revision": revision}), str(work_scope_id))
+
+    def get_work_scope(self, work_scope_id: UUID) -> dict[str, Any] | None:
+        """ONE plan by id. Membership is the caller's check, made before this."""
+        rows = self._many(self.client.table("catalog_work_scopes").select(self.WORK_SCOPE_COLUMNS)
+                          .eq("id", str(work_scope_id)).limit(1))
+        return rows[0] if rows else None
+
+    def open_work_scope(self, conversation_id: UUID) -> dict[str, Any] | None:
+        """The conversation's open plan -- at most one, by a partial unique index."""
+        rows = self._many(self.client.table("catalog_work_scopes").select(self.WORK_SCOPE_COLUMNS)
+                          .eq("conversation_id", str(conversation_id))
+                          .is_("closed_at", "null").limit(1))
+        return rows[0] if rows else None
+
+    def list_work_scope_revisions(self, work_scope_id: UUID, *, limit: int = 11) -> list[dict[str, Any]]:
+        """One plan's revisions, newest first, bounded."""
+        bounded = max(1, min(int(limit), self.MAX_WORK_SCOPE_REVISION_ROWS))
+        return self._many(self.client.table("catalog_work_scope_revisions")
+                          .select(self.WORK_SCOPE_REVISION_COLUMNS)
+                          .eq("work_scope_id", str(work_scope_id))
+                          .order("revision", desc=True).limit(bounded))
+
+    def catalog_canonical_manufacturer_coverage(self, manufacturers: list[str]) -> list[dict[str, Any]]:
+        """Exact canonical variant counts per register marque, plus the total."""
+        return self._read_rpc("catalog_canonical_manufacturer_coverage",
+                              {"p_manufacturers": [str(name) for name in manufacturers]})
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_resolution": resolution}

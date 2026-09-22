@@ -89,6 +89,26 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
   ['VEHICLE_CATALOG_SCOPE_NOT_CONFIGURED', 'This vehicle catalog project has no configured manufacturer, market and period, so no run was started. The project configuration must state them first.'],
   ['VEHICLE_CATALOG_SCOPE_INVALID', "This vehicle catalog project's configured manufacturer, market or period is not valid, so no run was started. The project configuration must be corrected first."],
 
+  // The Mapping Plan. A stale plan is refused rather than overwritten, and the
+  // person is told the plan was reloaded so the change can be made again
+  // against what is really there. Internal conditions (an unreadable stored
+  // plan, a repository failure) are deliberately absent: they get the
+  // caller's fallback.
+  ['WORK_SCOPE_STALE', 'The mapping plan changed since you opened it. It has been reloaded; make your change again.'],
+  ['WORK_SCOPE_OPEN_EXISTS', 'This conversation already has a mapping plan. It has been reloaded; change that plan instead.'],
+  ['WORK_SCOPE_NOT_EDITABLE', 'This mapping plan can no longer be edited.'],
+  ['WORK_SCOPE_WORKFLOW_UNSUPPORTED', "This project's engine does not use a mapping plan."],
+  ['WORK_SCOPE_NOT_FOUND', 'That mapping plan is not available to your account.'],
+  ['WORK_SCOPE_REQUEST_INVALID', 'Describe the plan in words or edit it in the form, not both at once.'],
+  ['WORK_SCOPE_FIELDS_INVALID', 'The plan edit was incomplete. Reload the plan and try again.'],
+  ['WORK_SCOPE_UNITS_INVALID', 'A plan names at least one manufacturer from the directory, each once.'],
+  ['WORK_SCOPE_YEARS_INVALID', 'The model years must be whole years in range, the first not after the last.'],
+  ['WORK_SCOPE_MAX_ITEMS_INVALID', 'The candidate limit must be a whole number within the server limit.'],
+  ['WORK_SCOPE_BATCH_SIZE_INVALID', 'The batch size must be a whole number within the server limit.'],
+  ['WORK_SCOPE_INSTRUCTION_INVALID', 'The instruction must be plain text within the length limit.'],
+  ['WORK_SCOPE_INSTRUCTION_NOT_UNDERSTOOD', 'No manufacturer, model year, limit or batch size was recognized in that instruction. Check the spelling, or build the plan from the directory.'],
+  ['WORK_SCOPE_COVERAGE_UNAVAILABLE', 'The catalog coverage that instruction depends on could not be read, so the plan was not changed. Try again shortly.'],
+
   // Run and proposal lifecycle.
   ['RUN_ALREADY_FINISHED', 'That run has already finished.'],
   ['PROPOSAL_NOT_APPROVABLE', 'This proposal cannot be approved in its current state.'],

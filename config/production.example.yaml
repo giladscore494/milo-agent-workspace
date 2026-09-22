@@ -96,6 +96,10 @@ execution_flags:
   # Canonical catalog promotion. Requires the read flag above; read alone
   # never implies promotion.
   MILO_ENABLE_CATALOG_PROMOTION: false
+  # Mapping Plan writes (create / revise a conversation's work scope). A plan
+  # is a draft and executes nothing; the writes still stay off until a stage
+  # enables them deliberately.
+  MILO_ENABLE_WORK_SCOPE_MUTATIONS: false
   GATEWAY_ALLOW_EXECUTION_ROUTES: false
 
 # Secret Manager RESOURCE NAMES (never values) and their sole consumers.

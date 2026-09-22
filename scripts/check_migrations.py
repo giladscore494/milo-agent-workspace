@@ -110,6 +110,21 @@ REQUIRED_PER_FILE = {
     ],
 }
 
+REQUIRED_PER_FILE["20260922000100_catalog_work_scopes.sql"] = [
+    # A plan's digest is derived by the database from its canonical text, and
+    # no path can store a revision that disagrees with it or rewrite one.
+    "enable row level security",
+    "constraint catalog_work_scope_revisions_digest_derived",
+    "constraint catalog_work_scope_revisions_scope_is_text",
+    "constraint catalog_work_scope_revisions_record_valid",
+    "create trigger catalog_work_scope_revisions_append_only",
+    "create constraint trigger catalog_work_scopes_head_is_a_revision",
+    "create unique index if not exists catalog_work_scopes_open_conversation_uidx",
+    # A stale head fails closed inside the database, under a row lock.
+    "raise exception 'work_scope_stale'",
+    "for update",
+]
+
 FORBIDDEN_EVERYWHERE = [
     "drop table",
     "delete from public.conversations",

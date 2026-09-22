@@ -149,7 +149,7 @@ stage_d_pin STAGE_D_PROBE_IMAGE_DIGEST "sha256:78387bc3881b8273120a12ebe6c1ab22b
 # Regenerate deliberately, in a reviewed commit, after an intended change:
 #   sha256sum scripts/release/stage-d/probe_db.py scripts/release/stage-d/probe_gateway.py
 # ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_PROBE_DB_SHA256 "7bdfce611726876f5d89756454c51bc713000bce529c149a992941da40bb9ae2"
+stage_d_pin STAGE_D_PROBE_DB_SHA256 "9f56ab3d6fd5f28e03d290ff1d31926ad0c9cf720951271fc75ccf7c74de2774"
 stage_d_pin STAGE_D_PROBE_GW_SHA256 "359d7cbfc7195f9fee333480af0f7fe1ae09ca8ce339a0a7942bfe823dde4bce"
 
 # ---------------------------------------------------------------------------

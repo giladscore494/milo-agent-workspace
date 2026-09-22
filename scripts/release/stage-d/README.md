@@ -214,6 +214,58 @@ is a production mutation and is deliberately outside this PR. Switching
 later is a **one-line** change to `STAGE_D_PROBE_IMAGE_REPO`, because
 mirroring preserves the manifest digest: the pin stays byte-identical.
 
+### The probe source has a size budget
+
+`probe_db.py` reaches its bare pinned image as ONE Cloud Run env value, the
+deterministic gzip+base64 of the file, and that value may not exceed
+`CLOUD_RUN_ENV_VALUE_MAX=32768` characters
+(`test_probe_sources_fit_the_cloud_run_env_value_limit`). Every required RPC
+the runtime adds grows the pinned literal inside it, so rationale that does
+not need to sit beside its code lives here instead. Moving text here changes
+no check. The notes below were moved out of `probe_db.py` word for word.
+
+**Why the required RPC surface is generated.** This used to be a
+hand-written list of six RPCs, pinned when the guarded worker writes landed.
+Everything built afterwards -- the durable execution-usage ledger, atomic
+guarded finalization, the current-verdict authority, the R3/R4 evidence
+writers, the catalog writers, and the run-identity and fencing primitives --
+became a RUNTIME DEPENDENCY without becoming a PREFLIGHT REQUIREMENT. A
+production database missing `record_run_usage_guarded` or
+`finalize_run_guarded` passed every Stage D check and would then have failed
+on the first paid model call, after the money was spent. That is exactly the
+failure a preflight exists to prevent.
+
+It is now GENERATED. `scripts/release/release_inventory.py` derives the whole
+inventory from two facts about the repository as it is: every RPC name the
+runtime actually calls (an AST scan of the repository layer, plus this
+probe's own `/rest/v1/rpc/` calls), and every function the migrations create,
+with the arguments each one requires. `tests/test_release_inventory.py` fails
+if the literal is not exactly what that derivation produces from current
+main, so the list cannot fall behind the runtime again.
+
+It stays a LITERAL in the probe, and only there, because the probe is
+transported into a bare pinned image as one SHA-256-pinned file with the
+standard library alone: it cannot import the deriving module. The
+arrangement is the same one `policy_envelope.PINNED_POLICY_FINGERPRINT` uses
+-- generated content, reviewed placement.
+
+**Why the run is bound to the release.** Every other link in the chain was
+already proven -- the accepted runtime source is byte-identical to the policy
+this toolkit uses, that policy's fingerprint is the reviewed one, the release
+tag resolves to the accepted digests, the serving revision and the executing
+job run those digests -- and none of them said anything about the RUN. A run
+recorded no policy, no release and no engine of its own: its engine was
+re-derived from a project row at claim time. `runs.run_identity` closes that
+gap.
+
+**Why the probe copies the ProductOutcome instead of deriving one.**
+Deriving it in the probe would be a second implementation of the semantic
+rule, free to disagree with the one that actually decided the run's terminal
+status -- exactly the drift that made Stage D transcribe its own copy of the
+runtime envelope. The record is copied through verbatim and JUDGED on the
+operator host by `semantic_acceptance.py`, which imports the one canonical
+module.
+
 ### Cancelling an execution is not closing a run
 
 Cancelling a Cloud Run execution does **not** make the database run

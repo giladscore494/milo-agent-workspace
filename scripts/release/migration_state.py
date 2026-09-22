@@ -86,6 +86,7 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20260920000200": ("function", "finalize_run_guarded"),
     "20260921000100": ("function", "claim_current_verdict_states"),
     "20260921000200": ("column", "runs.run_identity"),
+    "20260922000100": ("table", "catalog_work_scope_revisions"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")

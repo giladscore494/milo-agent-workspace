@@ -1273,6 +1273,11 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # above does for the offline suites. Imported only by
         # `backend/testing/e2e_app.py`, which is never deployed.
         "backend/testing/catalog_review_seed.py",
+        # Scoped catalog PR1: the WorkScope contract pins the Government SOURCE
+        # a plan reads (package and resource constants) and the model-year
+        # bounds the register reading applies. Two constant modules, and
+        # nothing else: no client, no transport, no capture, no query.
+        "backend/catalog/scope/contract.py",
     }
     # An IMPORT is the seam this guards. A bare occurrence of the dotted name
     # is not: `backend/testing/memory_repository.py` has to know the capture

@@ -76,6 +76,8 @@ EXECUTION_FLAGS = [
     # canonical promotion. Promotion additionally requires read.
     "MILO_ENABLE_GOVERNMENT_CATALOG_READ",
     "MILO_ENABLE_CATALOG_PROMOTION",
+    # API-only: the Mapping Plan writes. Drafts only; still off at Stage A.
+    "MILO_ENABLE_WORK_SCOPE_MUTATIONS",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
 ]
 

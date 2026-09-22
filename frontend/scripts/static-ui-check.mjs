@@ -80,6 +80,18 @@ const requiredCatalogUi = [
   'Field count unavailable',
 ];
 /**
+ * The Mapping Plan. The "planning only" statement must survive while nothing
+ * executes from a plan, and coverage must keep saying "not verified" rather
+ * than collapsing an unknown into a zero.
+ */
+const requiredMappingPlanUi = [
+  'Mapping plan',
+  'Planning only',
+  'Tell MILO what to map',
+  'Manufacturers in priority order',
+  'coverageLabel',
+];
+/**
  * Client state ownership, checked PER FILE.
  *
  * These are the guards that keep one selection's data out of another's. The
@@ -118,6 +130,8 @@ const requiredOwnership = {
   // No upstream text is ever rendered: copy is authored here, allowlisted by
   // classification value.
   'lib/errorText.ts': ['ERROR_COPY', 'AuthFailure', 'classifyError'],
+  // The Mapping Plan parses every answer and closes its note vocabulary.
+  'lib/workScope.ts': ['redactSecretText', 'WORK_SCOPE_NOTE_COPY', 'parseWorkScopeState'],
   'lib/supabaseClient.ts': ['AuthFailure'],
 };
 const requiredReducer = ['some(e => e.id === event.id)', 'reconstructRun', 'tool_access_granted', 'source_recorded'];
@@ -137,6 +151,9 @@ for (const item of requiredF5Ui) {
 }
 for (const item of requiredCatalogUi) {
   if (!ui.includes(item)) throw new Error(`Missing catalog marker: ${item} (searched ${where})`);
+}
+for (const item of requiredMappingPlanUi) {
+  if (!ui.includes(item)) throw new Error(`Missing Mapping Plan marker: ${item} (searched ${where})`);
 }
 for (const [file, markers] of Object.entries(requiredOwnership)) {
   const source = readFileSync(file, 'utf8');
