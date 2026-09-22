@@ -308,6 +308,10 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "append_usage_ledger_guarded": {
         "p_attempt", "p_entry", "p_lease_token", "p_run_id", "p_worker_id"
     },
+    "bind_work_scope_batch_run": {
+        "p_batch_id", "p_bound_by", "p_expected_digest", "p_expected_revision",
+        "p_run_id"
+    },
     "catalog_candidate_manufacturers": {"p_snapshot_id"},
     "catalog_candidate_model_years": {"p_commercial_model", "p_manufacturer", "p_snapshot_id"},
     "catalog_candidate_models": {"p_manufacturer", "p_snapshot_id"},
@@ -361,6 +365,9 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     },
     "promote_catalog_variant_guarded": {
         "p_attempt", "p_lease_token", "p_promotion", "p_run_id", "p_worker_id"
+    },
+    "prepare_work_scope_queue": {
+        "p_attempt", "p_lease_token", "p_preparation", "p_run_id", "p_worker_id"
     },
     "record_catalog_candidate_guarded": {
         "p_attempt", "p_candidate", "p_lease_token", "p_run_id", "p_worker_id"
@@ -421,6 +428,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "upsert_source_guarded": {
         "p_attempt", "p_lease_token", "p_run_id", "p_source", "p_worker_id"
     },
+    "work_scope_batch_for_run": {"p_run_id"},
 }
 
 # RPCs whose advertised argument set must EQUAL the pinned set: a missing

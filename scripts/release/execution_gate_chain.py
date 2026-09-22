@@ -288,6 +288,26 @@ GATE_CHAIN: tuple[Gate, ...] = (
         stage=2,
     ),
     Gate(
+        name="MILO_ENABLE_WORK_SCOPE_PREPARATION",
+        surface=WORKER_RUNTIME,
+        current_default="false",
+        required_for_first_run=(
+            "NO for a conversation run — YES only to PREPARE a Mapping Plan "
+            "revision (scoped Government captures and its durable batch queue), "
+            "in the operator capture job"),
+        when_to_enable=(
+            "Never on a service. One operator execution of the capture job at a "
+            "time (government-production-capture.sh --prepare-work-scope "
+            "--enable-work-scope-preparation), after the vocabulary evidence"),
+        requires_redeploy=UPDATE_JOB,
+        failure_behavior_when_off=(
+            "The capture entrypoint refuses the scoped mode "
+            "(CAPTURE_WORK_SCOPE_PREPARATION_DISABLED) before any transport or "
+            "repository exists. Nothing is captured, queued or batched; the "
+            "whole-resource capture and every run are untouched."),
+        stage=2,
+    ),
+    Gate(
         name="MILO_ENABLE_RUN_CANCELLATION",
         surface=API_RUNTIME,
         current_default="false",

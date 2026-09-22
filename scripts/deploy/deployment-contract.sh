@@ -41,6 +41,7 @@ MILO_STAGE_A_EXECUTION_FLAGS=(
   MILO_ENABLE_GOVERNMENT_CATALOG_READ=false
   MILO_ENABLE_CATALOG_PROMOTION=false
   MILO_ENABLE_WORK_SCOPE_MUTATIONS=false
+  MILO_ENABLE_WORK_SCOPE_PREPARATION=false
 )
 
 MILO_STAGE_A_FLAG_NAMES=()
@@ -202,7 +203,15 @@ MILO_CAPTURE_PINNED_OFF_FLAGS=(
   MILO_ENABLE_GOVERNMENT_CATALOG_READ=false
   MILO_ENABLE_RUN_CREATION=false
   MILO_ENABLE_EXECUTION_CONTROL=false
+  MILO_ENABLE_WORK_SCOPE_PREPARATION=false
 )
+
+# Scoped catalog PR2: the scoped-preparation switch, BY NAME ONLY. The job
+# definition pins it false (above). `government-production-capture.sh
+# --prepare-work-scope --enable-work-scope-preparation` turns it on for ONE
+# execution with --update-env-vars, so a plan is only ever prepared by a
+# recorded, explicit operator command and never by the job's standing posture.
+MILO_WORK_SCOPE_PREPARATION_FLAG_NAME="MILO_ENABLE_WORK_SCOPE_PREPARATION"
 
 # The pinned upstream identity and bounds the capture is allowed to use. These
 # MUST equal the values backend/catalog/government/source.py pins, because

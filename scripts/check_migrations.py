@@ -110,6 +110,20 @@ REQUIRED_PER_FILE = {
     ],
 }
 
+REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
+    # A scoped snapshot's declaration is held to the query it recorded, and the
+    # preparation it feeds is written once, by an operator capture run only.
+    "enable row level security",
+    "constraint catalog_source_snapshots_capture_scope_consistent",
+    "raise exception 'work_scope_preparation_run_invalid'",
+    "raise exception 'work_scope_stale'",
+    # A mostly-ambiguous manufacturer is stated, never queued.
+    "work_scope_vocabulary_insufficient",
+    "raise exception 'work_scope_batch_in_progress'",
+    "create unique index if not exists catalog_work_scope_batch_runs_run_uidx",
+    "forbid_work_scope_preparation_mutation",
+    "for update",
+]
 REQUIRED_PER_FILE["20260922000100_catalog_work_scopes.sql"] = [
     # A plan's digest is derived by the database from its canonical text, and
     # no path can store a revision that disagrees with it or rewrite one.

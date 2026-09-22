@@ -187,6 +187,9 @@ GOVERNMENT_SOURCE_REASONS: Mapping[str, str] = {
     "GOV_RECORDS_FORMAT_UNEXPECTED": "a government page was not served as JSON objects",
     "GOV_METADATA_TOO_LARGE": "the retrieval metadata exceeds the durable bound",
     "GOV_PAYLOAD_TOO_LARGE": "a captured row exceeds the durable raw-record bound",
+    # scoped catalog PR2: a declared capture scope must describe the query sent
+    "GOV_CAPTURE_SCOPE_MISMATCH":
+        "a scoped capture's declared scope does not describe the query it sent",
 }
 
 

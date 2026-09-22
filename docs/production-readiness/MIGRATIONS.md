@@ -72,6 +72,7 @@ producing an incomplete sequence.
 | ts | `20260921000100_current_verdict_authority.sql` | R5: CURRENT verdict authority — `claim_current_verdict_id` / `claim_current_verdict_state` / `claim_current_verdict_states` / `claim_verdict_is_current_support` resolve which verdict of an append-only history is TRUE NOW (latest by `created_at`, a non-`verified` row winning an exact tie, then id; `invalidated` / `superseded` / `contested` ahead of it; a `verified` citing no durable support row is `unsupported`), plus two BEFORE-INSERT triggers holding every writer to it — an evidence link may not cite a non-current verdict, and canonical field provenance may not be written from one — and `catalog_run_pending_promotions` rewritten to resolve current truth instead of joining "a verified verdict exists". Additive and forward-only: no verdict already durable is changed, only which of them is read as current. Mirrors `backend/engines/swarm_v2/current_verdict.py` |
 | ts | `20260921000200_immutable_run_identity.sql` | Console 6 control-plane boundary. `runs.run_identity` stays nullable only for historical rows, while every NEW run must be born with a complete immutable identity including a full release SHA. `create_message_and_run_v3` commits the user message, run and identity atomically and re-checks the trusted project workflow; the superseded `bind_run_identity`, `create_message_and_run` and `create_message_and_run_v2` RPCs are removed. `runs_forbid_identity_rewrite` rejects every post-INSERT identity change (including legacy NULL→value retrofit), and `claim_run_lease` refuses identity-less legacy rows. `transition_run_worker_guarded` is redefined as NON-TERMINAL so `finalize_run_guarded` remains the only worker terminalization primitive. The migration also adds lease-guarded tool-access, tool-grant and per-call usage-ledger writers. Service-path only; forward-only and data-preserving, but deliberately not purely additive because obsolete RPC definitions are dropped. |
 | ts | `20260922000100_catalog_work_scopes.sql` | Scoped catalog PR1: the canonical, server-owned mapping PLAN. `catalog_work_scopes` (one row per plan, its head revision and digest, at most one OPEN plan per conversation by a partial unique index) and `catalog_work_scope_revisions` (append-only, numbered without gaps, the canonical record stored as TEXT with `digest = sha256(text)` and `scope = text::jsonb` held by CHECK constraints, and the record's shape and hard bounds -- batch size at most 20, limit at most 2000 -- held by `catalog_work_scope_record_valid`). `create_work_scope` and `revise_work_scope` derive the project and digest, re-check membership and the trusted `swarm_v2` workflow, and refuse a revision whose expected head revision or digest is not the current one (`WORK_SCOPE_STALE`). `catalog_canonical_manufacturer_coverage` is a bounded read of exact canonical variant counts per register marque plus the catalog total. Drafts only: no status but `draft`, no snapshot column, no relation to `runs`. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/` |
+| ts | `20260923000100_catalog_work_scope_preparation.sql` | Scoped catalog PR2: a Mapping Plan revision becomes durable WORK. A CHECK on `catalog_source_snapshots` (`catalog_capture_scope_consistent`) holds a scoped snapshot's declared `capture_scope` to the query it recorded (one register marque, `scope_key = sha256(query.filters)`); every existing row declares none and passes. `catalog_work_scope_preparations` (one per revision), `catalog_work_scope_units`, `catalog_work_scope_batches` (1-20 candidates, one unit and so one snapshot each), `catalog_work_scope_queue_items` and `catalog_work_scope_batch_runs` -- all append-only by trigger. `prepare_work_scope_queue` is lease-guarded and accepts ONLY an `operator_capture` run, refuses a stale head (`WORK_SCOPE_STALE`), counts every unit from its snapshot's own rows, records a mostly-`ambiguous` unit as `vocabulary_insufficient`, and materializes the deterministic queue in one transaction. `bind_work_scope_batch_run` is the batch<->run compare-and-set (one live batch per plan, never a stale revision, never a completed batch twice); `work_scope_batch_for_run` is the worker's read of its exact batch. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/preparation.py` |
 
 All migrations are forward-only and data-preserving. Most are additive; Console 6 deliberately removes only superseded RPC definitions so there is one run-creation authority. There are no destructive table/data down-migrations, by policy (`scripts/check_migrations.py` forbids `drop table` and data deletes).
 
@@ -175,6 +176,32 @@ preparation, queue or batch, and no relation to `runs` -- so turning
 `MILO_ENABLE_WORK_SCOPE_MUTATIONS` off (the default) leaves the relations inert.
 A forward corrective migration could drop them; no other relation, function or
 row depends on them.
+
+### Scoped catalog PR2 (preparation) — migration and rollback impact
+
+`20260923000100_catalog_work_scope_preparation.sql` is additive: five new
+relations, six functions, five append-only triggers, their indexes, and one
+CHECK constraint plus one expression index on the existing
+`catalog_source_snapshots`. The CHECK constrains only a snapshot that DECLARES a
+capture scope, so every existing row -- none declares one -- satisfies it and
+nothing is rewritten. It redefines no existing function and backfills nothing.
+
+Privileges: every new relation has RLS on with no policies; `PUBLIC`, `anon`
+and `authenticated` have nothing. `service_role` gets `SELECT, INSERT` and
+neither `UPDATE` nor `DELETE`; the triggers refuse both to every role. Every
+function is `EXECUTE` for `service_role` alone, and the one writer additionally
+refuses any lease that is not an `operator_capture` run's.
+
+Rerun safety: every `create` is `if not exists` or `create or replace`, the
+CHECK is dropped before it is re-added, and every trigger is dropped before it
+is created. The executable suite applies the file twice over a populated
+schema.
+
+Rollback: nothing binds a batch to a run in this release (scoped catalog PR3 is
+the caller), and preparing is off unless `MILO_ENABLE_WORK_SCOPE_PREPARATION`
+is supplied to one capture-job execution. Leaving it off leaves every new
+relation inert. A forward corrective migration could drop them and the CHECK;
+no existing relation depends on them.
 
 ### The corrective round — migration and rollback impact
 

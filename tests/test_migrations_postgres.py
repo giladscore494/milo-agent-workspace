@@ -3665,6 +3665,11 @@ CATALOG_VIEWS = ("catalog_canonical_field_current", "catalog_canonical_variant_c
 #: relations like the rest -- service-only, RLS on with no policy, every foreign
 #: key RESTRICT and indexed -- so they join every family-wide check below.
 CATALOG_WORK_SCOPE_TABLES = ("catalog_work_scopes", "catalog_work_scope_revisions")
+#: Scoped catalog PR2 (20260923000100): the durable preparation of a revision.
+CATALOG_WORK_SCOPE_PREPARATION_TABLES = (
+    "catalog_work_scope_preparations", "catalog_work_scope_units",
+    "catalog_work_scope_batches", "catalog_work_scope_queue_items",
+    "catalog_work_scope_batch_runs")
 CATALOG_RPCS = ("record_catalog_snapshot_guarded", "record_catalog_raw_record_guarded",
                 "activate_catalog_snapshot_guarded", "record_catalog_candidate_guarded",
                 "link_catalog_candidate_evidence_guarded")
@@ -3806,7 +3811,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
         "20260915180000_catalog_raw_record_source_locator.sql",
         "20260916090000_catalog_bounded_candidate_queries.sql",
         "20260916120000_catalog_field_level_promotion.sql",
-        "20260922000100_catalog_work_scopes.sql"]
+        "20260922000100_catalog_work_scopes.sql",
+        "20260923000100_catalog_work_scope_preparation.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
@@ -3814,7 +3820,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
     # base relations plus the two canonical read-model views PR3 adds.
     assert before == str(len(CATALOG_STAGING_TABLES) + len(CATALOG_CANONICAL_TABLES)
                          + len(CATALOG_PROVENANCE_TABLES) + len(CATALOG_VIEWS)
-                         + len(CATALOG_WORK_SCOPE_TABLES))
+                         + len(CATALOG_WORK_SCOPE_TABLES)
+                         + len(CATALOG_WORK_SCOPE_PREPARATION_TABLES))
     _reapply_catalog_migrations(db)
     _reapply_catalog_migrations(db)
     assert db.psql(
@@ -7577,3 +7584,377 @@ def test_canonical_coverage_is_exact_per_marque_and_states_the_catalog_total(pr3
     for bad in (f"array[{too_many}]", "array['']", f"array['{'x' * 121}']", "null"):
         with pytest.raises(AssertionError, match="out of bounds"):
             db.psql(f"select * from public.catalog_canonical_manufacturer_coverage({bad})")
+
+
+# =============================================================================
+# Scoped catalog PR2 (20260923000100): scoped preparation, queue and batches.
+# =============================================================================
+
+WSP_TOYOTA = "טויוטה"
+
+
+def _wsp_migration():
+    return next(m for m in MIGRATIONS if m.name.startswith("20260923000100"))
+
+
+def _wsp_filters_text(marque: str) -> str:
+    return json.dumps({"tozar": marque}, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def _wsp_metadata(marque: str | None, *, count: int, issues: int = 0, **override) -> dict:
+    """A snapshot's retrieval metadata: a stated reading, and -- for a scoped
+    capture -- the declaration exactly as `capture_scope.py` writes it."""
+    metadata = {"http_status": 200, "redirect_chain": [],
+                "normalization_contract": "gov.wltp.normalize.1",
+                "normalized_record_count": count - issues,
+                "normalization_issue_count": issues,
+                "normalization_issues": ([{"reason": "GOV_NORM_LABEL_CONTRADICTION",
+                                           "count": issues}] if issues else []),
+                "normalization_issue_records": [str(9000 + i) for i in range(issues)],
+                "query": {}}
+    if marque is not None:
+        text = _wsp_filters_text(marque)
+        metadata["query"] = {"filters": text}
+        metadata["capture_scope"] = {"contract": "gov.capture_scope.1",
+                                     "filters": {"tozar": marque},
+                                     "scope_key": hashlib.sha256(text.encode("utf-8")).hexdigest()}
+    metadata.update(override)
+    return metadata
+
+
+def _wsp_capture_run(db, conversation: str) -> tuple[str, str]:
+    """A LEASED operator capture run: (run_id, the lease argument list)."""
+    run_id = db.psql(born_with_identity(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{conversation}', 'queued', "
+        f"""'{{"metadata": {{"milo_operation": "catalog.government.capture"}}}}'::jsonb, """
+        f"'none') returning id", workflow_key="operator_capture"))
+    worker = f"capture-{run_id[:8]}"
+    attempt, token = db.psql(
+        f"select attempt, lease_token from public.claim_run_lease('{run_id}', '{worker}', 300)"
+    ).split("|")
+    return run_id, f"'{run_id}','{worker}',{attempt},'{token}'"
+
+
+def _wsp_swarm_run(db, conversation: str, status: str = "queued") -> str:
+    return db.psql(born_with_identity(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{conversation}', '{status}', '{{}}'::jsonb) returning id", workflow_key="swarm_v2"))
+
+
+def _wsp_snapshot(db, args: str, label: str, rows: list[tuple[str, int]], *,
+                  marque: str | None = WSP_TOYOTA, issues: int = 0,
+                  make: str = WSP_TOYOTA, **metadata) -> tuple[str, str, list[str]]:
+    """An ACTIVE Government snapshot with one candidate per `(status, year)`.
+
+    Returns (snapshot id, snapshot key, candidate ids in insertion order). The
+    candidates differ by commercial model so their canonical order is known."""
+    payload = json.loads(_catalog_snapshot_json(f"wsp-{label}", declared=len(rows)))
+    payload["retrieval_metadata"] = _wsp_metadata(marque, count=len(rows), issues=issues,
+                                                  **metadata)
+    snapshot = _rpc_as_service(db, "select id from public.record_catalog_snapshot_guarded("
+                                   f"{args}, $j${json.dumps(payload)}$j$::jsonb)")
+    records = []
+    for index, _row in enumerate(rows):
+        record = json.loads(_catalog_record_json(snapshot, f"wsp-{label}-rec-{index}",
+                                                 upstream=str(1000 + index),
+                                                 payload={"_id": 1000 + index}))
+        records.append(_rpc_as_service(db, "select id from public.record_catalog_raw_record_guarded("
+                                           f"{args}, $j${json.dumps(record)}$j$::jsonb)"))
+    _rpc_as_service(db, f"select id from public.activate_catalog_snapshot_guarded({args},"
+                        f"'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
+    candidates = []
+    for index, ((status, year), record) in enumerate(zip(rows, records)):
+        candidate = _catalog_candidate_json(snapshot, record, f"wsp-{label}-cand-{index}",
+                                            status=status, make=make,
+                                            model=f"MODEL-{index:02d}", years=(year, year))
+        candidates.append(_rpc_as_service(db, "select id from public.record_catalog_candidate_guarded("
+                                              f"{args}, $j${candidate}$j$::jsonb)"))
+    key = db.psql(f"select snapshot_key from public.catalog_source_snapshots where id='{snapshot}'")
+    return snapshot, key, candidates
+
+
+def _wsp_prepare(db, args: str, plan: str, revision: int, digest: str, units: list[dict]) -> dict:
+    body = {"work_scope_id": plan, "revision": revision, "scope_digest": digest, "units": units}
+    return json.loads(_rpc_as_service(
+        db, f"select public.prepare_work_scope_queue({args}, $j${json.dumps(body)}$j$::jsonb)"))
+
+
+def _wsp_units(toyota_snapshot: str | None, *, state: str = "captured",
+               reason: str | None = None) -> list[dict]:
+    return [{"unit_key": "toyota", "priority": 1, "state": state, "register_marque": WSP_TOYOTA,
+             "snapshot_id": toyota_snapshot, "reason_code": reason},
+            {"unit_key": "lexus", "priority": 2, "state": "register_unverified",
+             "register_marque": None, "snapshot_id": None, "reason_code": None}]
+
+
+def _wsp_world(db, **scope_overrides) -> dict:
+    """A swarm_v2 plan at revision 1, its operator capture lease, and a scoped
+    Toyota snapshot whose candidates straddle the plan's model years."""
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope(**{"max_items": 25, "batch_size": 10, **scope_overrides})
+    created = _ws_create(db, conversation, user, scope)
+    capture_run, args = _wsp_capture_run(db, conversation)
+    rows = ([("candidate", 2019)] * 23 + [("candidate", 2016)] * 2
+            + [("ambiguous", 2020)] * 3 + [("ready_for_review", 2021)])
+    snapshot, key, candidates = _wsp_snapshot(db, args, f"toyota-{conversation[:8]}", rows)
+    return {"user": user, "conversation": conversation, "scope": scope,
+            "plan": created["work_scope"]["id"], "digest": scope.digest(),
+            "capture_run": capture_run, "args": args, "snapshot": snapshot,
+            "snapshot_key": key, "candidates": candidates}
+
+
+def test_capture_scope_declarations_are_held_consistent_by_the_database(db):
+    user, _project, conversation = _ws_world(db)
+    _run, args = _wsp_capture_run(db, conversation)
+    # A consistent declaration lands; so does a snapshot declaring nothing.
+    _wsp_snapshot(db, args, f"ok-{conversation[:8]}", [("candidate", 2020)])
+    _wsp_snapshot(db, args, f"bare-{conversation[:8]}", [("candidate", 2020)], marque=None)
+    text = _wsp_filters_text(WSP_TOYOTA)
+    good = _wsp_metadata(WSP_TOYOTA, count=1)["capture_scope"]
+    broken = {
+        "wrong key": {"capture_scope": {**good, "scope_key": "0" * 64}},
+        "extra field": {"capture_scope": {**good, "note": "x"}},
+        "other contract": {"capture_scope": {**good, "contract": "gov.capture_scope.2"}},
+        "filters disagree with the query": {"capture_scope": {**good, "filters": {"tozar": "מאזדה"}}},
+        "a q beside the filters": {"query": {"filters": text, "q": "RAV4"}},
+        "a field other than the marque": {
+            "capture_scope": {**good, "filters": {"kinuy_mishari": "RAV4"}}},
+        "a padded marque": {"capture_scope": {**good, "filters": {"tozar": " טויוטה"}}},
+        "a null declaration": {"capture_scope": None},
+    }
+    for label, override in broken.items():
+        payload = json.loads(_catalog_snapshot_json(f"wsp-bad-{label}-{conversation[:8]}"))
+        payload["retrieval_metadata"] = {**_wsp_metadata(WSP_TOYOTA, count=1), **override}
+        with pytest.raises(AssertionError, match="catalog_source_snapshots_capture_scope_consistent"):
+            _rpc_as_service(db, "select id from public.record_catalog_snapshot_guarded("
+                                f"{args}, $j${json.dumps(payload)}$j$::jsonb)")
+        del label
+
+
+def test_a_revision_is_prepared_into_a_deterministic_bounded_queue(db):
+    world = _wsp_world(db)
+    summary = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],
+                           _wsp_units(world["snapshot"]))
+    assert summary["replayed"] is False
+    preparation = summary["preparation"]
+    # 23 in-range `candidate` rows, capped by max_items=25 -> 23 queued; the
+    # 2016 rows are outside the plan's years, ambiguous and ready_for_review
+    # rows are never queued.
+    assert (preparation["unit_count"], preparation["prepared_unit_count"],
+            preparation["queued_item_count"], preparation["batch_count"]) == (2, 1, 23, 3)
+    toyota, lexus = summary["units"]
+    assert (toyota["state"], toyota["readable_count"], toyota["ambiguous_count"],
+            toyota["eligible_count"], toyota["queued_count"]) == ("prepared", 24, 3, 23, 23)
+    assert toyota["snapshot_key"] == world["snapshot_key"] and toyota["reason_code"] is None
+    assert (lexus["state"], lexus["reason_code"], lexus["snapshot_id"]) == (
+        "register_unverified", "WORK_SCOPE_REGISTER_UNVERIFIED", None)
+    # Batches never exceed the plan's size and never span a unit.
+    assert [(b["batch_number"], b["item_count"], b["first_position"], b["unit_key"])
+            for b in summary["batches"]] == [(1, 10, 1, "toyota"), (2, 10, 11, "toyota"),
+                                             (3, 3, 21, "toyota")]
+    # The queue is the catalog's canonical order: here, commercial model order.
+    queued = db.psql(
+        "select i.position || ':' || i.batch_position || ':' || c.commercial_model "
+        "from public.catalog_work_scope_queue_items i "
+        "join public.catalog_candidate_variants c on c.id = i.candidate_id "
+        f"where i.preparation_id = '{preparation['id']}' order by i.position").splitlines()
+    assert [row.split(":")[2] for row in queued] == [f"MODEL-{index:02d}" for index in range(23)]
+    assert [int(row.split(":")[1]) for row in queued] == list(range(1, 11)) * 2 + [1, 2, 3]
+
+    # The same submission again is a replay: the stored decision, nothing new.
+    again = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],
+                         _wsp_units(world["snapshot"]))
+    assert again["replayed"] is True and again["preparation"]["id"] == preparation["id"]
+    assert db.psql("select count(*) from public.catalog_work_scope_queue_items "
+                   f"where preparation_id='{preparation['id']}'") == "23"
+    # A DIFFERENT decision for the same revision is refused, never merged.
+    other, _key, _candidates = _wsp_snapshot(db, world["args"], f"other-{world['plan'][:8]}",
+                                             [("candidate", 2020)])
+    with pytest.raises(AssertionError, match="WORK_SCOPE_ALREADY_PREPARED"):
+        _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"], _wsp_units(other))
+
+
+def test_the_plan_limit_caps_the_queue_across_units(db):
+    world = _wsp_world(db, max_items=12)
+    summary = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],
+                           _wsp_units(world["snapshot"]))
+    assert summary["preparation"]["queued_item_count"] == 12
+    assert [b["item_count"] for b in summary["batches"]] == [10, 2]
+    assert summary["units"][0]["eligible_count"] == 23 and summary["units"][0]["queued_count"] == 12
+
+
+def test_preparation_fails_closed(db):
+    world = _wsp_world(db)
+    args, plan, digest = world["args"], world["plan"], world["digest"]
+    # Only an OPERATOR CAPTURE run prepares: a Swarm V2 lease cannot.
+    swarm = _wsp_swarm_run(db, world["conversation"])
+    attempt, token = db.psql(
+        f"select attempt, lease_token from public.claim_run_lease('{swarm}', 'swarm-w', 300)"
+    ).split("|")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_RUN_INVALID"):
+        _wsp_prepare(db, f"'{swarm}','swarm-w',{attempt},'{token}'", plan, 1, digest,
+                     _wsp_units(world["snapshot"]))
+    # A stale or foreign head never prepares.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+        _wsp_prepare(db, args, plan, 1, "0" * 64, _wsp_units(world["snapshot"]))
+    # Units must be the revision's own, in its order.
+    swapped = list(reversed(_wsp_units(world["snapshot"])))
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_INVALID"):
+        _wsp_prepare(db, args, plan, 1, digest, swapped)
+    # A snapshot that is not this marque's scoped capture is refused.
+    bare, _key, _c = _wsp_snapshot(db, args, f"bare-{plan[:8]}", [("candidate", 2020)],
+                                   marque=None)
+    mazda, _key, _c = _wsp_snapshot(db, args, f"mazda-{plan[:8]}", [("candidate", 2020)],
+                                    marque="מאזדה")
+    for wrong in (bare, mazda):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_UNIT_SNAPSHOT_INVALID"):
+            _wsp_prepare(db, args, plan, 1, digest, _wsp_units(wrong))
+    # A snapshot holding rows its vocabulary could not read is not `captured`.
+    gap, _key, _c = _wsp_snapshot(db, args, f"gap-{plan[:8]}", [("candidate", 2020)] * 2,
+                                  issues=1)
+    with pytest.raises(AssertionError, match="WORK_SCOPE_UNIT_SNAPSHOT_INVALID"):
+        _wsp_prepare(db, args, plan, 1, digest, _wsp_units(gap))
+    # ... it may be recorded as UNUSABLE, with the reason, and queues nothing.
+    summary = _wsp_prepare(db, args, plan, 1, digest,
+                           _wsp_units(gap, state="snapshot_unusable",
+                                      reason="GOV_PROJECTION_SNAPSHOT_INCOMPLETE"))
+    assert summary["units"][0]["state"] == "snapshot_unusable"
+    assert summary["preparation"]["queued_item_count"] == 0 and summary["batches"] == []
+    # Once revised, the old revision is stale.
+    _rpc_as_service(db, f"select public.revise_work_scope('{plan}', 1, '{digest}', "
+                        f"'{world['user']}', {_ws_revision(_ws_scope(units=['toyota']))})")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+        _wsp_prepare(db, args, plan, 1, digest, _wsp_units(world["snapshot"]))
+
+
+def test_a_mostly_ambiguous_unit_is_stated_and_queues_nothing(db):
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope(units=["toyota"], model_year_from=None)
+    plan = _ws_create(db, conversation, user, scope)["work_scope"]["id"]
+    _run, args = _wsp_capture_run(db, conversation)
+    snapshot, _key, _c = _wsp_snapshot(db, args, f"amb-{plan[:8]}",
+                                       [("ambiguous", 2020)] * 3 + [("candidate", 2020)] * 2)
+    summary = _wsp_prepare(db, args, plan, 1, scope.digest(), _wsp_units(snapshot)[:1])
+    unit = summary["units"][0]
+    assert (unit["state"], unit["reason_code"], unit["readable_count"],
+            unit["ambiguous_count"], unit["queued_count"]) == (
+        "vocabulary_insufficient", "WORK_SCOPE_VOCABULARY_INSUFFICIENT", 2, 3, 0)
+    assert summary["preparation"]["prepared_unit_count"] == 0
+    assert summary["batches"] == []
+
+
+def test_batch_binding_is_one_live_batch_per_plan_and_never_stale(db):
+    world = _wsp_world(db)
+    summary = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],
+                           _wsp_units(world["snapshot"]))
+    first, second, third = (batch["id"] for batch in summary["batches"])
+    user, digest = world["user"], world["digest"]
+
+    def bind(batch: str, run: str, *, revision: int = 1, sha: str = digest, by: str = user):
+        return json.loads(_rpc_as_service(
+            db, f"select public.bind_work_scope_batch_run('{batch}', '{run}', {revision}, "
+                f"'{sha}', '{by}')"))
+
+    run_a = _wsp_swarm_run(db, world["conversation"])
+    bound = bind(first, run_a)
+    assert (bound["attempt"], bound["replayed"]) == (1, False)
+    # The same run for the same batch again is the SAME binding.
+    assert bind(first, run_a)["replayed"] is True
+    assert db.psql("select count(*) from public.catalog_work_scope_batch_runs "
+                   f"where run_id='{run_a}'") == "1"
+    # One live batch run per plan; a bound run never takes a second batch.
+    run_b = _wsp_swarm_run(db, world["conversation"])
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_IN_PROGRESS"):
+        bind(second, run_b)
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_RUN_TAKEN"):
+        bind(second, run_a)
+    # Only the plan's members bind, only this conversation's Swarm V2 runs are
+    # bound, and a stated revision must be the batch's own.
+    stranger = str(uuid.uuid4())
+    db.psql(f"insert into auth.users (id) values ('{stranger}')")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_NOT_FOUND"):
+        bind(second, run_b, by=stranger)
+    _u, _p, elsewhere = _ws_world(db)
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_RUN_INVALID"):
+        bind(second, _wsp_swarm_run(db, elsewhere))
+    with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+        bind(second, run_b, sha="0" * 64)
+
+    # When the live run finishes, the next batch may be bound -- by hand. A
+    # completed batch is never run again.
+    db.psql(f"update public.runs set status='completed' where id='{run_a}'")
+    assert bind(second, run_b)["attempt"] == 1
+    db.psql(f"update public.runs set status='failed' where id='{run_b}'")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_ALREADY_COMPLETED"):
+        bind(first, _wsp_swarm_run(db, world["conversation"]))
+    # A failed batch can be retried as a new attempt.
+    assert bind(second, _wsp_swarm_run(db, world["conversation"]))["attempt"] == 2
+    # A terminal run is never bound.
+    finished = _wsp_swarm_run(db, world["conversation"], status="cancelled")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_RUN_INVALID"):
+        bind(third, finished)
+    # A revised plan: every batch of the old revision is stale and never launches.
+    _rpc_as_service(db, f"select public.revise_work_scope('{world['plan']}', 1, '{digest}', "
+                        f"'{user}', {_ws_revision(_ws_scope(units=['toyota']))})")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+        bind(third, _wsp_swarm_run(db, world["conversation"]))
+
+
+def test_a_bound_run_reads_exactly_its_batch(db):
+    world = _wsp_world(db)
+    summary = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],
+                           _wsp_units(world["snapshot"]))
+    run = _wsp_swarm_run(db, world["conversation"])
+    assert db.psql(f"select coalesce(public.work_scope_batch_for_run('{run}')::text, 'null')") \
+        == "null"
+    second = summary["batches"][1]["id"]
+    _rpc_as_service(db, f"select public.bind_work_scope_batch_run('{second}', '{run}', 1, "
+                        f"'{world['digest']}', '{world['user']}')")
+    read = json.loads(_rpc_as_service(db, f"select public.work_scope_batch_for_run('{run}')"))
+    assert read["batch"]["id"] == second and read["binding"]["run_id"] == run
+    assert [item["batch_position"] for item in read["items"]] == list(range(1, 11))
+    assert [item["position"] for item in read["items"]] == list(range(11, 21))
+    assert [item["commercial_model"] for item in read["items"]] == [
+        f"MODEL-{index:02d}" for index in range(10, 20)]
+    assert {item["snapshot_id"] for item in read["items"]} == {world["snapshot"]}
+    assert all(item["manufacturer"] == WSP_TOYOTA and item["status"] == "candidate"
+               for item in read["items"])
+
+
+def test_preparation_rows_are_immutable_service_only_and_rerun_safe(db):
+    world = _wsp_world(db)
+    summary = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],
+                           _wsp_units(world["snapshot"]))
+    run = _wsp_swarm_run(db, world["conversation"])
+    _rpc_as_service(db, f"select public.bind_work_scope_batch_run('{summary['batches'][0]['id']}', "
+                        f"'{run}', 1, '{world['digest']}', '{world['user']}')")
+    for table in CATALOG_WORK_SCOPE_PREPARATION_TABLES:
+        assert db.psql(f"select relrowsecurity from pg_class where oid='public.{table}'::regclass") == "t"
+        assert db.psql(f"select count(*) from pg_policies where tablename='{table}'") == "0"
+        for role in ("anon", "authenticated"):
+            for privilege in ("select", "insert", "update", "delete"):
+                assert db.psql(f"select has_table_privilege('{role}', 'public.{table}', "
+                               f"'{privilege}')") == "f"
+        for privilege in ("update", "delete"):
+            assert db.psql(f"select has_table_privilege('service_role', 'public.{table}', "
+                           f"'{privilege}')") == "f"
+        for statement in (f"update public.{table} set created_at = now()"
+                          if table != "catalog_work_scope_batch_runs"
+                          else f"update public.{table} set bound_at = now()",
+                          f"delete from public.{table}"):
+            with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_IMMUTABLE"):
+                db.psql(statement)
+    for signature in ("public.prepare_work_scope_queue(uuid, text, integer, text, jsonb)",
+                      "public.bind_work_scope_batch_run(uuid, uuid, integer, text, uuid)",
+                      "public.work_scope_batch_for_run(uuid)"):
+        for role in ("anon", "authenticated"):
+            assert not _has_execute(db, role, signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+    before = db.psql("select count(*) from public.catalog_work_scope_queue_items")
+    db.psql(file=_wsp_migration())
+    db.psql(file=_wsp_migration())
+    assert db.psql("select count(*) from public.catalog_work_scope_queue_items") == before
+    assert db.psql("select count(*) from pg_constraint where conname="
+                   "'catalog_source_snapshots_capture_scope_consistent'") == "1"

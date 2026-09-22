@@ -1,9 +1,12 @@
 # Mapping Plan: the canonical WorkScope
 
-Scoped catalog PR1. This adds ONE server-owned contract that states what MILO
-intends to map, and a Mapping Plan surface to state and inspect it. **Nothing
-executes from a plan in this release.** No Government read, queue, batch, run or
-provider call is reachable from any of it. A plan is a durable draft.
+Scoped catalog PR1 added ONE server-owned contract that states what MILO
+intends to map, and a Mapping Plan surface to state and inspect it. Scoped
+catalog PR2 adds its preparation; see "Preparation" below. **Nothing executes
+from a plan in either release.** No run, launch or provider call is reachable
+from any of it. The API and the Mapping Plan reach no Government read at all;
+only the operator capture job prepares a plan, and only when an operator runs
+it explicitly.
 
 - Code: `backend/catalog/scope/` (`contract.py`, `directory.py`, `interpret.py`,
   `coverage.py`, `service.py`).
@@ -158,3 +161,103 @@ The database holds these on every path, not only the API's:
 Leave `MILO_ENABLE_WORK_SCOPE_MUTATIONS` off, which is the default. The plan
 reads keep answering, and nothing executes from a plan in this release. No other
 relation depends on the two new tables. A forward migration could drop them.
+
+## Preparation (scoped catalog PR2)
+
+Scoped catalog PR2 turns ONE exact plan revision into durable, bounded work.
+Nothing in it starts a run: binding a batch to a run and launching it is PR3.
+
+- Code: `backend/catalog/scope/preparation.py`,
+  `backend/catalog/government/capture_scope.py`, and a scoped mode of
+  `backend/catalog/operator_capture.py`.
+- Schema: `supabase/migrations/20260923000100_catalog_work_scope_preparation.sql`.
+- Gate: `MILO_ENABLE_WORK_SCOPE_PREPARATION`. It is read only by the operator
+  capture job. The job definition pins it `false`, and
+  `government-production-capture.sh --prepare-work-scope
+  --enable-work-scope-preparation` turns it on for one execution.
+
+### Where it runs
+
+Only in the operator capture Cloud Run job, under the lease of a prepared
+`operator_capture` run. That job is the one place a Government transport
+exists. The database refuses the preparation write from any other kind of run,
+so a paid Swarm V2 run can never prepare. Government preparation therefore sits
+outside the paid batch-run clock by construction.
+
+### What one preparation does
+
+1. **Checks the head.** It reads the plan and the exact revision named, and
+   refuses unless that revision is still the head with that digest.
+2. **Checks the directory.** It parses the stored canonical text strictly and
+   refuses a plan made under another directory version.
+3. **Captures each unit, in priority order.**
+   - A unit with no verified register spelling is `register_unverified`.
+     Nothing is captured for it, because filtering the register by a guessed
+     spelling would be a query the register never answers.
+   - Otherwise it runs a scoped refresh: the pinned WLTP resource filtered to
+     `{"tozar": "<verified spelling>"}`.
+   - The refresh is query-aware. An unchanged register reuses the unit's last
+     scoped snapshot; a changed one captures a new immutable snapshot through
+     the existing ingestion path, with the same bounds, completeness gate,
+     normalization and activation as every other capture.
+4. **Writes it all at once.** The database re-derives the plan's units, years,
+   limit and batch size, counts every unit from its snapshot's own rows, and
+   materializes the queue in one transaction.
+
+A capture that fails (transport, completeness, schema or lease) fails the whole
+preparation. A revision is prepared exactly once, so it is never prepared from
+a partial read.
+
+### Scoped snapshots are never the register
+
+A scoped snapshot declares itself in `retrieval_metadata.capture_scope`, and a
+database CHECK holds that declaration to the query the snapshot recorded. Every
+unpinned reader skips it, in the database: the projection, the tool's reader,
+the review surface, the worker's preparation and the whole-register refresh.
+
+So a run of per-manufacturer snapshots can never become "the catalog", and can
+never push the register out of the bounded listing window. A scoped refresh
+compares its version and its diff only with the same scope.
+
+### The queue and its batches
+
+The queue is deterministic:
+
+- **Unit order.** Units are taken in plan priority.
+- **Row selection.** Within a unit it takes the snapshot's `candidate` rows
+  inside the plan's model years, in the catalog's one canonical order, until
+  `max_items` is spent.
+- **Batch cutting.** Each unit's items are cut into batches of the plan's
+  `batch_size`, at most 20.
+- **Batch boundaries.** A batch never spans two units, so a batch run pins
+  exactly one snapshot.
+
+**The normalization gate.** A unit whose in-range rows are mostly `ambiguous`
+is recorded `vocabulary_insufficient` and queues nothing. "Mostly" means
+ambiguous rows outnumber readable ones; `ambiguous` rows are the ones the
+reviewed vocabulary cannot read. Nothing in normalization is loosened.
+
+With today's vocabulary, which was built from the committed `q=RAV4` capture
+only, that gate is expected to hold back most of the real register. This is the
+vocabulary-evidence blocker, and it is stated per unit rather than hidden.
+
+### Batch runs (the binding PR3 calls)
+
+`bind_work_scope_batch_run` is the compare-and-set every batch run passes
+through. It refuses:
+
+- a batch of a revision that is not the head (a stale revision never launches);
+- a second live batch run in the plan (one batch at a time, and nothing starts
+  the next one);
+- a batch whose run already completed;
+- a run already bound to another batch;
+- a run of another conversation or another engine;
+- a binder who is not a member.
+
+Binding the same run to the same batch again is the same binding.
+
+A run that the binding table binds to a batch is prepared by the worker from
+exactly that batch: its one scoped snapshot, pinned by key, and its items in
+batch order. It is never prepared from "the newest snapshot" or "the first N
+candidates". The run's preparation record carries the batch identity, and a
+resumed attempt refuses unless the binding still names the same batch.

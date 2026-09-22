@@ -101,7 +101,7 @@ class Repository(Protocol):
     # query layer impossible to build without holding a run open.  Each is
     # bounded, each orders deterministically, and none of them accepts SQL, a
     # table name, a column name or an ordering from its caller.
-    def list_active_catalog_snapshots(self, source_family: str, *, resource_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]: ...
+    def list_active_catalog_snapshots(self, source_family: str, *, resource_id: str | None = None, limit: int = 50, capture_scope_key: str | None = None) -> list[dict[str, Any]]: ...
     def find_active_catalog_snapshot(self, source_family: str, resource_id: str, snapshot_key: str) -> dict[str, Any] | None: ...
     def list_catalog_raw_records(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
     def list_catalog_candidates(self, snapshot_id: Any, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]: ...
@@ -139,6 +139,11 @@ class Repository(Protocol):
     def open_work_scope(self, conversation_id: UUID) -> dict[str, Any] | None: ...
     def list_work_scope_revisions(self, work_scope_id: UUID, *, limit: int = 11) -> list[dict[str, Any]]: ...
     def catalog_canonical_manufacturer_coverage(self, manufacturers: list[str]) -> list[dict[str, Any]]: ...
+    # Plan preparation (20260923000100_catalog_work_scope_preparation.sql).
+    def get_work_scope_revision(self, work_scope_id: UUID, revision: int) -> dict[str, Any] | None: ...
+    def prepare_work_scope_queue(self, run_id: UUID, preparation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def bind_work_scope_batch_run(self, batch_id: UUID, run_id: UUID, expected_revision: int, expected_digest: str, bound_by: UUID) -> dict[str, Any]: ...
+    def work_scope_batch_for_run(self, run_id: UUID) -> dict[str, Any] | None: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -1109,18 +1114,30 @@ class SupabaseRepository:
     MAX_CATALOG_RECORD_ROWS = 500
     MAX_CATALOG_CANDIDATE_ROWS = 500
 
-    def list_active_catalog_snapshots(self, source_family: str, *, resource_id: str | None = None, limit: int = MAX_CATALOG_SNAPSHOT_ROWS) -> list[dict[str, Any]]:
+    def list_active_catalog_snapshots(self, source_family: str, *, resource_id: str | None = None, limit: int = MAX_CATALOG_SNAPSHOT_ROWS, capture_scope_key: str | None = None) -> list[dict[str, Any]]:
         """ACTIVE snapshots of one family, newest activation first.
 
         `activated_at is not null` is the ONLY thing that makes a snapshot
         readable: a pending capture is still being appended to and a failed one
         is the record that a capture was unusable, so neither may answer a
-        query.  The filter is a column predicate, not a convention above it."""
+        query.  The filter is a column predicate, not a convention above it.
+
+        SCOPE (scoped catalog PR2). Without `capture_scope_key` the listing is
+        of snapshots that declare NO capture scope -- the register -- so a run
+        of per-manufacturer snapshots can never answer an unscoped read nor
+        push the register out of this bounded window.  With one, it lists only
+        snapshots declaring exactly that scope.  Both are database predicates
+        on the declaration's JSON path, and `capture_scope_key` is a value, so
+        a caller still names no column, table or ordering."""
         bounded = max(1, min(int(limit), self.MAX_CATALOG_SNAPSHOT_ROWS))
         query = (self.client.table("catalog_source_snapshots").select(self.CATALOG_SNAPSHOT_COLUMNS)
                  .eq("source_family", str(source_family)).not_.is_("activated_at", "null"))
         if resource_id is not None:
             query = query.eq("resource_id", str(resource_id))
+        if capture_scope_key is None:
+            query = query.is_("retrieval_metadata->capture_scope", "null")
+        else:
+            query = query.eq("retrieval_metadata->capture_scope->>scope_key", str(capture_scope_key))
         return self._many(query.order("activated_at", desc=True).order("snapshot_key").limit(bounded))
 
     def find_active_catalog_snapshot(self, source_family: str, resource_id: str, snapshot_key: str) -> dict[str, Any] | None:
@@ -1444,6 +1461,90 @@ class SupabaseRepository:
         """Exact canonical variant counts per register marque, plus the total."""
         return self._read_rpc("catalog_canonical_manufacturer_coverage",
                               {"p_manufacturers": [str(name) for name in manufacturers]})
+
+    # --- plan preparation (20260923000100_catalog_work_scope_preparation.sql) --
+    #
+    # One lease-guarded writer (an OPERATOR CAPTURE run only), one binding
+    # compare-and-set and two reads. Every refusal the SQL raises by name maps
+    # to the code the in-memory mirror raises; anything else is one sanitized
+    # classification, because a PostgREST message can quote SQL values.
+    _WORK_SCOPE_PREPARATION_REFUSALS = (
+        ("WORK_SCOPE_PREPARATION_RUN_INVALID",
+         "only an operator capture run prepares a mapping plan", 409),
+        ("WORK_SCOPE_PREPARATION_INVALID", "invalid mapping plan preparation", 422),
+        ("WORK_SCOPE_UNIT_SNAPSHOT_INVALID",
+         "a unit's snapshot is not that marque's usable scoped capture", 422),
+        ("WORK_SCOPE_ALREADY_PREPARED", "this plan revision was already prepared differently", 409),
+        ("WORK_SCOPE_BATCH_IN_PROGRESS", "another batch of this plan is still running", 409),
+        ("WORK_SCOPE_BATCH_ALREADY_COMPLETED", "this batch already completed", 409),
+        ("WORK_SCOPE_BATCH_RUN_TAKEN", "this run is already bound to another batch", 409),
+        ("WORK_SCOPE_BATCH_RUN_INVALID", "this run cannot execute this batch", 422),
+    ) + _WORK_SCOPE_REFUSALS
+
+    def _work_scope_preparation_call(self, call: Any, identifier: str, *, guarded: bool) -> Any:
+        """Run one preparation-family RPC and map what it refuses.
+
+        `call` is the RPC itself, spelled out at the method below with its
+        literal name, so the release inventory sees each one."""
+        try:
+            data = call().execute().data
+        except Exception as exc:
+            if guarded and self._is_stale_lease_error(exc):
+                raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409) from None
+            message = str(exc)
+            if "WORK_SCOPE_BATCH_NOT_FOUND" in message:
+                raise NotFoundError("work_scope_batch", identifier) from None
+            if "WORK_SCOPE_NOT_FOUND" in message:
+                raise NotFoundError("work_scope", identifier) from None
+            for code, safe, status in self._WORK_SCOPE_PREPARATION_REFUSALS:
+                if code in message:
+                    raise AppError(code, safe, status) from None
+            raise AppError("REPOSITORY_ERROR", "mapping plan preparation failed", 502) from None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data
+
+    def get_work_scope_revision(self, work_scope_id: UUID, revision: int) -> dict[str, Any] | None:
+        """ONE exact revision of one plan, or None. An equality read, not a search."""
+        rows = self._many(self.client.table("catalog_work_scope_revisions")
+                          .select(self.WORK_SCOPE_REVISION_COLUMNS + ", scope")
+                          .eq("work_scope_id", str(work_scope_id))
+                          .eq("revision", int(revision)).limit(1))
+        return rows[0] if rows else None
+
+    def prepare_work_scope_queue(self, run_id: UUID, preparation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_preparation": preparation}
+        data = self._work_scope_preparation_call(
+            lambda: self.client.rpc("prepare_work_scope_queue", params),
+            str(preparation.get("work_scope_id") if isinstance(preparation, dict) else ""),
+            guarded=True)
+        if not isinstance(data, dict) or not isinstance(data.get("preparation"), dict):
+            raise AppError("REPOSITORY_ERROR", "mapping plan preparation returned no row", 502)
+        return data
+
+    def bind_work_scope_batch_run(self, batch_id: UUID, run_id: UUID, expected_revision: int, expected_digest: str, bound_by: UUID) -> dict[str, Any]:
+        data = self._work_scope_preparation_call(
+            lambda: self.client.rpc("bind_work_scope_batch_run", {
+                "p_batch_id": str(batch_id), "p_run_id": str(run_id),
+                "p_expected_revision": int(expected_revision),
+                "p_expected_digest": str(expected_digest), "p_bound_by": str(bound_by)}),
+            str(batch_id), guarded=False)
+        if not isinstance(data, dict) or not data.get("id"):
+            raise AppError("REPOSITORY_ERROR", "batch binding returned no row", 502)
+        return data
+
+    def work_scope_batch_for_run(self, run_id: UUID) -> dict[str, Any] | None:
+        """The run's exact batch and its items, or None when it is unbound."""
+        data = self._work_scope_preparation_call(
+            lambda: self.client.rpc("work_scope_batch_for_run", {"p_run_id": str(run_id)}),
+            str(run_id), guarded=False)
+        if data is None:
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("batch"), dict) \
+                or not isinstance(data.get("items"), list):
+            raise AppError("REPOSITORY_ERROR", "batch read returned an unreadable row", 502)
+        return data
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_resolution": resolution}

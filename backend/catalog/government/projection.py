@@ -50,6 +50,7 @@ from typing import Any, Callable, Mapping, Sequence
 from backend.runtime import CancellationRequested
 
 from . import source as src
+from .capture_scope import CaptureScope, CaptureScopeError, declared_scope, is_scoped
 from .normalize import (GOVERNMENT_NORMALIZATION_REASONS, GovernmentNormalizationError,
                         MAX_DURABLE_ISSUE_RECORDS, NORMALIZATION_CONTRACT,
                         RAW_ONLY_CONTRACT, UNMAPPED_FIELDS, read_wltp_record)
@@ -87,6 +88,9 @@ GOVERNMENT_PROJECTION_REASONS: Mapping[str, str] = {
         "that government snapshot records no reading of its rows at all",
     "GOV_PROJECTION_SNAPSHOT_STATE_INVALID":
         "that government snapshot's recorded reading is malformed or disagrees with its rows",
+    # Scoped catalog PR2: a pinned snapshot read FOR a scope must declare it.
+    "GOV_PROJECTION_SNAPSHOT_SCOPE_MISMATCH":
+        "that government snapshot was not captured for the requested scope",
     # Catalog PR3: the database-side reader (`query.py`) collapses every
     # repository refusal onto ONE static reason. The underlying message can
     # quote SQL values, and a classification is what a caller of that layer is
@@ -435,7 +439,8 @@ def require_usable_snapshot(snapshot: Mapping[str, Any], *, allow_incomplete: bo
 
 
 def resolve_active_snapshot(repository: Any, *, resource_id: str, snapshot_key: str | None,
-                            allow_incomplete: bool) -> Mapping[str, Any]:
+                            allow_incomplete: bool,
+                            capture_scope: CaptureScope | None = None) -> Mapping[str, Any]:
     """The snapshot a Government read answers from, or a refusal.
 
     A PINNED key is resolved by an exact repository lookup, never by searching
@@ -449,6 +454,15 @@ def resolve_active_snapshot(repository: Any, *, resource_id: str, snapshot_key: 
     one -- it is skipped, and the refusal that would otherwise be returned
     names the newest one's gap.
 
+    SCOPE (scoped catalog PR2, `capture_scope.py`). An unpinned read without a
+    `capture_scope` is a read of THE REGISTER, and a snapshot that declares a
+    scope never answers it: the repository excludes declared snapshots in the
+    database, and every row is re-checked here as well, failing closed on a
+    declaration it cannot parse. With a `capture_scope`, only a snapshot
+    declaring exactly that scope answers -- pinned or not. A pin WITHOUT a
+    scope reads whatever that exact key holds, because naming a key is naming
+    the snapshot.
+
     STATED LIMITATION: the unpinned search covers the BOUNDED listing, so a
     usable snapshot sitting behind more than `MAX_CATALOG_SNAPSHOT_ROWS`
     unusable ones is not found by it. That is deliberate -- an unbounded scan
@@ -460,10 +474,17 @@ def resolve_active_snapshot(repository: Any, *, resource_id: str, snapshot_key: 
             src.GOVERNMENT_SOURCE_FAMILY, resource_id, snapshot_key)
         if pinned is None:
             raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_UNKNOWN")
+        if capture_scope is not None and not _declares(pinned, capture_scope):
+            raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_SCOPE_MISMATCH")
         require_usable_snapshot(pinned, allow_incomplete=allow_incomplete)
         return pinned
-    rows = repository.list_active_catalog_snapshots(
-        src.GOVERNMENT_SOURCE_FAMILY, resource_id=resource_id)
+    if capture_scope is None:
+        rows = [row for row in repository.list_active_catalog_snapshots(
+            src.GOVERNMENT_SOURCE_FAMILY, resource_id=resource_id) if not is_scoped(row)]
+    else:
+        rows = [row for row in repository.list_active_catalog_snapshots(
+            src.GOVERNMENT_SOURCE_FAMILY, resource_id=resource_id,
+            capture_scope_key=capture_scope.key()) if _declares(row, capture_scope)]
     if not rows:
         raise GovernmentProjectionError("GOV_PROJECTION_NO_ACTIVE_SNAPSHOT")
     for row in rows:
@@ -475,6 +496,15 @@ def resolve_active_snapshot(repository: Any, *, resource_id: str, snapshot_key: 
     # snapshot rather than an arbitrary older one.
     require_usable_snapshot(rows[0], allow_incomplete=allow_incomplete)
     return rows[0]
+
+
+def _declares(snapshot: Mapping[str, Any], scope: CaptureScope) -> bool:
+    """Whether a snapshot declares exactly this scope. Malformed is False."""
+    try:
+        declared = declared_scope(snapshot)
+    except CaptureScopeError:
+        return False
+    return declared is not None and declared.key() == scope.key()
 
 
 class GovernmentCatalogProjection:

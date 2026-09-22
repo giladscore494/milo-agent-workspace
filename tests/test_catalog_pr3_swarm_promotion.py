@@ -1372,7 +1372,16 @@ def test_the_refresh_has_one_caller_and_no_schedule():
         text = path.read_text(encoding="utf-8")
         if "GovernmentCatalogRefresh" in text or "sync_if_changed" in text:
             callers.add(str(path))
-    assert callers == {"backend/catalog/operator_capture.py"}
+    # Scoped catalog PR2 adds ONE delegate: preparing a Mapping Plan revision
+    # runs a scoped refresh per verified marque. It is the entrypoint's own
+    # delegate -- the operator entrypoint is its ONLY importer -- so the single
+    # operator-invoked entry, gated and refusing by default, is unchanged.
+    delegate = "backend/catalog/scope/preparation.py"
+    assert callers == {"backend/catalog/operator_capture.py", delegate}
+    importers = {str(path) for path in sorted(Path("backend").rglob("*.py"))
+                 if str(path) != delegate
+                 and "backend.catalog.scope.preparation" in path.read_text(encoding="utf-8")}
+    assert importers == {"backend/catalog/operator_capture.py"}
     # No script, no workflow and no job starts one.
     for path in sorted(Path("scripts").rglob("*")):
         if path.is_file() and path.suffix in (".py", ".sh", ".yaml", ".yml"):

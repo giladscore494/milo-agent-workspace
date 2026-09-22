@@ -40,6 +40,7 @@ source "${REPO_ROOT}/scripts/deploy/operator-config.sh"
 source "${REPO_ROOT}/scripts/deploy/deployment-contract.sh"
 
 MODE="plan" MILO_OPERATOR_CONFIG_PATH="" CATALOG_EXECUTION_VALUE="" RUN_ID=""
+WORK_SCOPE_ID="" WORK_SCOPE_REVISION="" WORK_SCOPE_DIGEST="" WORK_SCOPE_PREPARATION_VALUE=""
 TASK_TIMEOUT="${MILO_CAPTURE_TASK_TIMEOUT:-3600s}"
 
 usage() {
@@ -54,6 +55,11 @@ Modes (exactly one; default --plan):
   --ensure-job  Create or update the capture Cloud Run Job (idempotent).
   --prepare     Execute the job in --prepare mode and report the run id.
   --capture     Execute the real capture. Requires --run-id.
+  --prepare-work-scope
+                Scoped catalog PR2: prepare ONE Mapping Plan revision -- a
+                scoped capture per verified manufacturer, then the durable
+                queue and batches. Requires --run-id, the three --work-scope-*
+                values and --enable-work-scope-preparation. Starts no batch.
   --all         ensure-job, prepare, capture, verify — in order.
 
 Options:
@@ -63,7 +69,16 @@ Options:
                 enabled value for it (scripts/check_unsafe_defaults.py enforces
                 that), so turning it on is an explicit operator act, recorded
                 in the command you ran.
-  --run-id <uuid>          The prepared run (for --capture).
+  --run-id <uuid>          The prepared run (for --capture / --prepare-work-scope).
+  --work-scope-id <uuid>   The Mapping Plan to prepare.
+  --work-scope-revision <n>
+                           The plan revision to prepare; it must be the head.
+  --work-scope-digest <hex>
+                           That revision's digest; a stale plan is refused.
+  --enable-work-scope-preparation
+                REQUIRED for --prepare-work-scope. Turns the scoped-preparation
+                switch on for THAT ONE execution only; the job definition keeps
+                it pinned off.
   --operator-config <path> Operator identifier file.
   --task-timeout <dur>     Cloud Run task timeout (default 3600s).
   --help
@@ -78,9 +93,14 @@ while [[ $# -gt 0 ]]; do
     --ensure-job) MODE="ensure-job"; shift ;;
     --prepare) MODE="prepare"; shift ;;
     --capture) MODE="capture"; shift ;;
+    --prepare-work-scope) MODE="prepare-work-scope"; shift ;;
     --all) MODE="all"; shift ;;
     --enable-catalog-execution) CATALOG_EXECUTION_VALUE="true"; shift ;;
+    --enable-work-scope-preparation) WORK_SCOPE_PREPARATION_VALUE="true"; shift ;;
     --run-id) RUN_ID="${2:?}"; shift 2 ;;
+    --work-scope-id) WORK_SCOPE_ID="${2:?}"; shift 2 ;;
+    --work-scope-revision) WORK_SCOPE_REVISION="${2:?}"; shift 2 ;;
+    --work-scope-digest) WORK_SCOPE_DIGEST="${2:?}"; shift 2 ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?}"; shift 2 ;;
     --task-timeout) TASK_TIMEOUT="${2:?}"; shift 2 ;;
     --help) usage; exit 0 ;;
@@ -159,11 +179,20 @@ ensure_job() {
 
 # Runs the job with the given entrypoint arguments and echoes the execution
 # name. --wait blocks until the execution terminalizes.
+#
+# `gcloud run jobs execute --args` REPLACES the container arguments the job was
+# defined with (`-m,${MILO_CAPTURE_ENTRYPOINT_MODULE}`, see ensure_job) rather
+# than appending to them, so an execution that passed only the entrypoint's
+# own arguments ran `python --prepare ...` -- not the entrypoint at all. Every
+# execution therefore restates the module first. Any further arguments are
+# per-execution overrides (the scoped mode's one --update-env-vars).
 execute_job() {
   local args_csv="$1" execution
+  shift
   execution="$(gcloud run jobs execute "$CAPTURE_JOB" \
     --region "$REGION" --project "$PROJECT_ID" \
-    --args "$args_csv" --wait --format='value(metadata.name)' 2>&1 | tail -1)"
+    --args "-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}" "$@" \
+    --wait --format='value(metadata.name)' 2>&1 | tail -1)"
   printf '%s' "$execution"
 }
 
@@ -254,6 +283,42 @@ capture_args() {
     "$MILO_CAPTURE_PAGE_LIMIT" "$MILO_CAPTURE_MAX_PAGES" "$MILO_CAPTURE_MAX_RECORDS"
 }
 
+# The scoped mode's arguments: the capture's own, plus the plan. Validated to
+# the entrypoint's exact shapes first -- which also keeps them comma-free,
+# because gcloud splits --args on commas.
+work_scope_args() {
+  printf -- '%s,--work-scope-id,%s,--work-scope-revision,%s,--work-scope-digest,%s' \
+    "$(capture_args "$1")" "$WORK_SCOPE_ID" "$WORK_SCOPE_REVISION" "$WORK_SCOPE_DIGEST"
+}
+
+do_prepare_work_scope() {
+  [[ -n "$RUN_ID" ]] || fail "--prepare-work-scope requires --run-id (a run made with --prepare)" 2
+  [[ "$WORK_SCOPE_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+    || fail "--work-scope-id must be the plan's lowercase UUID" 2
+  [[ "$WORK_SCOPE_REVISION" =~ ^[1-9][0-9]{0,8}$ ]] \
+    || fail "--work-scope-revision must be a whole revision number" 2
+  [[ "$WORK_SCOPE_DIGEST" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "--work-scope-digest must be the revision's 64-character digest" 2
+  [[ -n "$WORK_SCOPE_PREPARATION_VALUE" ]] \
+    || fail "--enable-work-scope-preparation is required for --prepare-work-scope. The job keeps the scoped-preparation switch pinned off; this execution alone turns it on." 2
+  printf '\n== prepare work scope ==\n'
+  local execution document status
+  execution="$(execute_job "$(work_scope_args "$RUN_ID")" \
+    --update-env-vars "${MILO_WORK_SCOPE_PREPARATION_FLAG_NAME}=${WORK_SCOPE_PREPARATION_VALUE}")"
+  printf 'Execution: %s\n' "$execution"
+  document="$(execution_document "$execution")"
+  status="$(printf '%s' "$document" | json_field status || true)"
+  printf 'WORK_SCOPE_PREPARATION_STATUS=%s\n' "${status:-unknown}"
+  if [[ "$status" != "succeeded" ]]; then
+    printf '%s\n' "$document" >&2
+    fail "work-scope preparation did not succeed; the document above states the outcome"
+  fi
+  printf 'WORK_SCOPE_QUEUED_ITEMS=%s\n' \
+    "$(printf '%s' "$document" | json_field work_scope.queued_item_count || true)"
+  printf 'WORK_SCOPE_BATCHES=%s\n' \
+    "$(printf '%s' "$document" | json_field work_scope.batch_count || true)"
+}
+
 do_prepare() {
   milo_require_op CAPTURE_CONVERSATION_ID CAPTURE_REQUESTED_BY CAPTURE_IDEMPOTENCY_KEY || exit 2
   printf '\n== prepare ==\n'
@@ -302,6 +367,7 @@ case "$MODE" in
   ensure-job) ensure_job ;;
   prepare) do_prepare ;;
   capture) do_capture; verify_snapshot ;;
+  prepare-work-scope) do_prepare_work_scope ;;
   all)
     ensure_job
     do_prepare

@@ -400,6 +400,51 @@ and is gated on complete persistence, so an interruption leaves a non-active
 snapshot that no reader reads, and the previous usable snapshot keeps
 answering.
 
+## Scoped preparation of a Mapping Plan (scoped catalog PR2)
+
+The same `--execute` path has one more mode. It prepares ONE exact Mapping Plan
+revision (`docs/work-scope.md`, "Preparation"):
+
+```
+python -m backend.catalog.operator_capture \
+  --execute <every capture prerequisite above, unchanged> \
+  --work-scope-id <plan uuid> \
+  --work-scope-revision <the head revision> \
+  --work-scope-digest <that revision's digest>
+```
+
+- **Prerequisites.**
+  - All nine capture prerequisites still hold.
+  - The three plan values must be given together, in their exact shapes.
+  - `MILO_ENABLE_WORK_SCOPE_PREPARATION` must be on. Otherwise the refusal is
+    `CAPTURE_WORK_SCOPE_ARGUMENTS_INVALID` or
+    `CAPTURE_WORK_SCOPE_PREPARATION_DISABLED`, before any transport or
+    repository exists.
+  - `--prepare` and `--plan` refuse the plan arguments
+    (`CAPTURE_ARGUMENT_NOT_VALID_IN_MODE`).
+- **What it reads.**
+  - It reads the register only per verified manufacturer, as
+    `filters={"tozar": ...}` on the same pinned resource, under the same client,
+    lease and bounds.
+  - It never sends a `q` and never widens a bound.
+  - A stale revision is refused (`WORK_SCOPE_PREPARATION_STALE`) before a
+    single Government request.
+- **What it reports.**
+  - It reports each unit's state, counts and batches.
+  - The report carries no register text.
+
+**The capture job script.** `scripts/catalog/government-production-capture.sh
+--prepare-work-scope --enable-work-scope-preparation --run-id ...
+--work-scope-id ... --work-scope-revision ... --work-scope-digest ...` runs it.
+The job definition pins `MILO_ENABLE_WORK_SCOPE_PREPARATION=false`, and this
+mode turns it on with `--update-env-vars` for that one execution only.
+
+**`--args` fix.** `gcloud run jobs execute --args` REPLACES the container
+arguments the job was defined with (`-m backend.catalog.operator_capture`), so
+every execution now restates the module first. Before this fix, an execution
+passing only the entrypoint's arguments ran `python --prepare ...` rather than
+the entrypoint.
+
 ## What this does not authorize
 
 Preparing a run is not authorization to capture, and capturing is not

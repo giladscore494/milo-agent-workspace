@@ -100,6 +100,10 @@ execution_flags:
   # is a draft and executes nothing; the writes still stay off until a stage
   # enables them deliberately.
   MILO_ENABLE_WORK_SCOPE_MUTATIONS: false
+  # Mapping Plan PREPARATION (scoped Government captures + the durable queue).
+  # Read only by the operator capture job, where the job definition pins it
+  # false and one explicit operator execution turns it on; never on here.
+  MILO_ENABLE_WORK_SCOPE_PREPARATION: false
   GATEWAY_ALLOW_EXECUTION_ROUTES: false
 
 # Secret Manager RESOURCE NAMES (never values) and their sole consumers.

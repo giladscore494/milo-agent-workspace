@@ -105,6 +105,7 @@ from backend.runtime import CancellationRequested
 
 from . import snapshot as snapshot_module
 from . import source as src
+from .capture_scope import CaptureScope, CaptureScopeError, declared_scope
 from .client import DataGovClient, ResourceCapture
 from .normalize import (CaptureNormalization, RAW_ONLY_CONTRACT, UNMAPPED_FIELDS,
                         read_capture)
@@ -123,6 +124,10 @@ GOVERNMENT_INGESTION_REASONS: Mapping[str, str] = {
         "the capture was written in full but the snapshot did not activate",
     "GOV_SNAPSHOT_NORMALIZATION_DRIFT":
         "this snapshot was read under a different normalization contract than this code applies",
+    # Scoped catalog PR2. The same content under a different declared scope is
+    # a different claim about what the snapshot is, so it is never adopted.
+    "GOV_SNAPSHOT_SCOPE_MISMATCH":
+        "this snapshot declares a different capture scope than this ingestion requested",
 }
 
 
@@ -182,6 +187,9 @@ class IngestionReport:
     reused_existing: bool = False
     #: The run that opened the snapshot, which is this run unless it was reused.
     created_by_run_id: str = ""
+    #: The scope the snapshot DECLARES (`capture_scope.py`), read back off the
+    #: snapshot; empty for an unscoped capture.
+    capture_scope_key: str = ""
     candidates: tuple[Mapping[str, Any], ...] = field(default=(), repr=False)
 
 
@@ -205,17 +213,28 @@ class GovernmentCatalogIngestor:
     # --- the whole path ------------------------------------------------------
 
     def ingest_resource(self, resource_id: str, *, package_id: str = src.CKAN_PACKAGE_ID,
-                        query: Mapping[str, str] | None = None) -> IngestionReport:
-        """Capture one complete bounded query and land it in the catalog."""
+                        query: Mapping[str, str] | None = None,
+                        capture_scope: CaptureScope | None = None) -> IngestionReport:
+        """Capture one complete bounded query and land it in the catalog.
+
+        With a `capture_scope` the query IS the scope's: a caller may restate
+        it, never contradict it, and the snapshot declares the scope durably so
+        no unpinned reader can take it for the register.
+        """
+        if capture_scope is not None:
+            if query is not None and dict(query) != capture_scope.query():
+                raise GovernmentSourceError("GOV_CAPTURE_SCOPE_MISMATCH")
+            query = capture_scope.query()
         # Both source identities are allowlisted at THIS boundary too, so an
         # entry point that is read on its own states the rule it applies rather
         # than relying on a callee to apply it.
         capture = self._client.capture_resource(
             src.require_allowed_resource(resource_id),
             package_id=src.require_allowed_package(package_id), query=query)
-        return self.ingest_capture(capture)
+        return self.ingest_capture(capture, capture_scope=capture_scope)
 
-    def ingest_capture(self, capture: ResourceCapture) -> IngestionReport:
+    def ingest_capture(self, capture: ResourceCapture, *,
+                       capture_scope: CaptureScope | None = None) -> IngestionReport:
         """Land a capture this process already took. AN INTERNAL SEAM.
 
         Stated accurately, because the distinction matters: this method TRUSTS
@@ -243,8 +262,13 @@ class GovernmentCatalogIngestor:
         normalization = read_capture([record for _, record in capture.located_records()],
                                      resource_id=capture.resource_id)
         snapshot = self._repository.record_catalog_snapshot(
-            self._lease.run_id, snapshot_module.snapshot_payload(capture, normalization),
+            self._lease.run_id,
+            snapshot_module.snapshot_payload(capture, normalization, capture_scope),
             **self._lease_kwargs)
+        # A replay or a reuse lands on an EXISTING row. Whatever it declares
+        # must be exactly what this ingestion asked for -- a scoped request is
+        # never satisfied by an unscoped snapshot, nor the reverse.
+        self._check_scope(snapshot, capture_scope)
         owner = str(snapshot.get("created_by_run_id"))
         if owner != str(self._lease.run_id):
             # Another run opened this capture. If it FINISHED it, this run has
@@ -339,6 +363,16 @@ class GovernmentCatalogIngestor:
         return decided
 
     @staticmethod
+    def _check_scope(snapshot: Mapping[str, Any], requested: CaptureScope | None) -> None:
+        """The stored declaration must be the requested one, or nothing lands."""
+        try:
+            stored = declared_scope(snapshot)
+        except CaptureScopeError:
+            raise GovernmentIngestionError("GOV_SNAPSHOT_SCOPE_MISMATCH") from None
+        if (stored.key() if stored else None) != (requested.key() if requested else None):
+            raise GovernmentIngestionError("GOV_SNAPSHOT_SCOPE_MISMATCH")
+
+    @staticmethod
     def _check_normalization(snapshot: Mapping[str, Any],
                              normalization: CaptureNormalization) -> None:
         """A replay or a reuse must RECONSTRUCT the stored gap, not assume it.
@@ -389,6 +423,7 @@ class GovernmentCatalogIngestor:
                 str(record) for record in metadata.get("normalization_issue_records") or ()),
             activated=snapshot.get("activated_at") is not None,
             reused_existing=reused, created_by_run_id=str(snapshot.get("created_by_run_id")),
+            capture_scope_key=_declared_key(snapshot),
             candidates=tuple(dict(candidate) for candidate in candidates))
 
     def _emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
@@ -398,6 +433,12 @@ class GovernmentCatalogIngestor:
     def _check_cancelled(self) -> None:
         if self._cancellation_checker is not None and self._cancellation_checker():
             raise CancellationRequested("RUN_CANCELLED")
+
+
+def _declared_key(snapshot: Mapping[str, Any]) -> str:
+    """The declared scope key of a snapshot `_check_scope` already accepted."""
+    scope = declared_scope(snapshot)
+    return scope.key() if scope is not None else ""
 
 
 __all__ = ["GOVERNMENT_INGESTION_REASONS", "MAX_REPORTED_REJECTIONS",

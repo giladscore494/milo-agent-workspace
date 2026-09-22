@@ -34,6 +34,9 @@ EXECUTION_FLAGS = [
     "MILO_ENABLE_CATALOG_PROMOTION",
     # Mapping Plan writes. Drafts only, and still never enabled by a default.
     "MILO_ENABLE_WORK_SCOPE_MUTATIONS",
+    # Mapping Plan preparation: scoped Government captures. Capture job only,
+    # turned on per execution by an explicit operator command, never a default.
+    "MILO_ENABLE_WORK_SCOPE_PREPARATION",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
     "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI",
     # Test-only adapters must never be switched on outside the isolated

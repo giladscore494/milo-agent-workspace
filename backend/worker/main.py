@@ -616,7 +616,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             if catalog_state["posture"]["government_read"]:
                 try:
                     preparation = prepare_government_work(
-                        repo, checkpoint=latest_checkpoint, cancellation_checker=is_cancelled)
+                        repo, checkpoint=latest_checkpoint, cancellation_checker=is_cancelled,
+                        run_id=run_id)
                 except GovernmentPreparationError as exc:
                     finalizer.finalize(TerminalClaim.refusal(
                         workflow_key, exc.code, exc.safe_message,

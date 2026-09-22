@@ -67,8 +67,10 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 from . import source as src
+from .capture_scope import CaptureScope
 from .client import DataGovClient, ResourceMetadata
 from .ingest import GovernmentCatalogIngestor, IngestionReport
+from .source import GovernmentSourceError
 from backend.runtime import CancellationRequested
 
 from backend.catalog.diff import (DIFF_IDENTITY, MAX_DIFF_ITEMS, candidate_identity,
@@ -223,18 +225,29 @@ def diff_candidate_sets(previous: Sequence[Mapping[str, Any]],
 
 
 class GovernmentCatalogRefresh:
-    """The deterministic, schedulable refresh operation. NOT scheduled here."""
+    """The deterministic, schedulable refresh operation. NOT scheduled here.
+
+    QUERY-AWARE (scoped catalog PR2). A refresh is a refresh OF ONE SCOPE.
+    Without a `capture_scope` it is the register's, and it compares only with
+    snapshots that declare no scope. With one it is that scope's: its version
+    check and its diff are against the newest usable snapshot declaring exactly
+    that scope, never against the register. Otherwise a scoped capture would
+    be skipped as "unchanged" merely because the register's version had not
+    moved, and its diff would report every other marque as removed.
+    """
 
     def __init__(self, repository: Any, lease: Any, *, client: DataGovClient,
                  resource_id: str = src.WLTP_RESOURCE_ID,
                  cancellation_checker: Callable[[], bool] | None = None,
-                 event_sink: Callable[[str, Mapping[str, Any]], None] | None = None) -> None:
+                 event_sink: Callable[[str, Mapping[str, Any]], None] | None = None,
+                 capture_scope: CaptureScope | None = None) -> None:
         self._repository = repository
         self._lease = lease
         self._client = client
         self._resource_id = src.require_allowed_resource(resource_id)
         self._cancellation_checker = cancellation_checker
         self._event_sink = event_sink
+        self._capture_scope = capture_scope
 
     def sync_if_changed(self, *, package_id: str = src.CKAN_PACKAGE_ID,
                         query: Mapping[str, str] | None = None) -> RefreshOutcome:
@@ -245,6 +258,13 @@ class GovernmentCatalogRefresh:
         what makes this safe to run often, and what makes "no change, no
         research" a property rather than an intention.
         """
+        if self._capture_scope is not None:
+            # A scoped refresh captures exactly its scope's query. Restating it
+            # is allowed; stating anything else is a contradiction, refused
+            # before a request is sent.
+            if query is not None and dict(query) != self._capture_scope.query():
+                raise GovernmentSourceError("GOV_CAPTURE_SCOPE_MISMATCH")
+            query = None
         metadata = self._client.package_show(self._resource_id, package_id=package_id)
         active = self._active_snapshot()
         if active is not None and self._matches(active, metadata):
@@ -262,7 +282,8 @@ class GovernmentCatalogRefresh:
             self._repository, self._lease, client=self._client,
             cancellation_checker=self._cancellation_checker,
             event_sink=self._event_sink).ingest_resource(
-                self._resource_id, package_id=package_id, query=query)
+                self._resource_id, package_id=package_id, query=query,
+                capture_scope=self._capture_scope)
         landed = self._repository.find_active_catalog_snapshot(
             src.GOVERNMENT_SOURCE_FAMILY, self._resource_id, report.snapshot_key)
         diff, refusal = self._diff(active, landed, report.snapshot_key)
@@ -288,10 +309,11 @@ class GovernmentCatalogRefresh:
     # --- helpers -------------------------------------------------------------
 
     def _active_snapshot(self) -> Mapping[str, Any] | None:
-        """The newest USABLE snapshot, or None when there is none to compare to."""
+        """The newest USABLE snapshot OF THIS SCOPE, or None when there is none."""
         try:
             return resolve_active_snapshot(self._repository, resource_id=self._resource_id,
-                                           snapshot_key=None, allow_incomplete=False)
+                                           snapshot_key=None, allow_incomplete=False,
+                                           capture_scope=self._capture_scope)
         except GovernmentProjectionError:
             # No active snapshot, or none this catalog may read from. Either
             # way there is nothing to compare against, so the refresh behaves
