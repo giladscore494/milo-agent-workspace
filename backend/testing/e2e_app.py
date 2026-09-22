@@ -274,8 +274,12 @@ class InProcessFakeWorkerLauncher:
         thread.start()
         return {"mode": "e2e-inprocess", "run_id": str(run_id), "execution": f"e2e-{run_id}"}
 
-    def _emit(self, run_id: UUID, event_type: str, message: str, **extra: Any) -> None:
-        self.repo.append_run_event(run_id, event_type, {"message": message, **extra})
+    def _emit(self, run_id: UUID, event_type: str, message: str,
+              lease: dict[str, Any] | None = None, **extra: Any) -> None:
+        """Append one durable event. The lease travels as the repository's
+        keyword arguments -- the ownership contract -- and NEVER inside the
+        payload, so no lease token can be served back by the events read."""
+        self.repo.append_run_event(run_id, event_type, {"message": message, **extra}, **(lease or {}))
 
     def _workflow_key(self, run_id: UUID) -> str:
         """The run's IMMUTABLE identity decides the engine, exactly like
@@ -327,12 +331,20 @@ class InProcessFakeWorkerLauncher:
         """
         from backend.finalization import RunFinalizer, TerminalClaim
 
+        from backend.errors import AppError
+
         repo = self.repo
+        time.sleep(0.2)
         try:
-            time.sleep(0.2)
             lease = self._lease(run_id)
-            engine = self._workflow_key(run_id)
-            finalizer = RunFinalizer(repo=repo, run_id=run_id, engine=engine, lease_ctx=lease)
+        except AppError:
+            # The run is already claimed by another worker or is no longer
+            # claimable. A worker that holds no lease writes NOTHING -- exactly
+            # the fencing rule production enforces at the database.
+            return
+        engine = self._workflow_key(run_id)
+        finalizer = RunFinalizer(repo=repo, run_id=run_id, engine=engine, lease_ctx=lease)
+        try:
             run = repo.get_run(run_id)
             content = str((run.get("input") or {}).get("content") or "").lower()
 
@@ -342,14 +354,14 @@ class InProcessFakeWorkerLauncher:
             if run["status"] == "cancellation_requested":
                 cancel()
                 return
-            self._emit(run_id, "run_started", "Run started", payload={"worker": "e2e"}, **lease)
+            self._emit(run_id, "run_started", "Run started", payload={"worker": "e2e"}, lease=lease)
             if not self._advance(run_id, lease, "running"):
                 cancel()
                 return
 
             def emit(event_type: str, payload: dict[str, Any]) -> None:
                 self._emit(run_id, event_type, payload.get("message", event_type),
-                           payload=payload.get("payload", {}), **lease)
+                           payload=payload.get("payload", {}), lease=lease)
 
             if "timeout" in content:
                 tracker = BudgetTracker(BudgetConfig(max_run_duration_seconds=1), kill_switch=lambda: True,
@@ -363,13 +375,13 @@ class InProcessFakeWorkerLauncher:
             if "exhaust budget" in content:
                 tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=2, estimated_cost_per_call=0.01),
                                         kill_switch=lambda: True, event_emitter=emit,
-                                        usage_recorder=lambda usage: repo.update_run_usage(run_id, usage, **lease))
+                                        usage_recorder=lambda usage: repo.update_run_usage(run_id, usage, lease=lease))
                 try:
                     while True:  # every iteration is a MOCKED call, gated first
                         tracker.before_call()
                         _ = MockModelResponse()
                         tracker.after_call(MockUsage.prompt_tokens, MockUsage.completion_tokens)
-                        self._emit(run_id, "agent_progress", "Mocked model call recorded", agent="researcher", **lease)
+                        self._emit(run_id, "agent_progress", "Mocked model call recorded", agent="researcher", lease=lease)
                 except BudgetExceeded as exc:
                     finalizer.finalize(TerminalClaim.budget_stop(engine, exc, usage=tracker.snapshot()))
                     return
@@ -385,7 +397,7 @@ class InProcessFakeWorkerLauncher:
                     cancel(index)
                     return
                 self._emit(run_id, "agent_progress", f"step {index + 1}/{steps}", agent="researcher",
-                           phase="research", progress={"percent": int(100 * (index + 1) / steps)}, **lease)
+                           phase="research", progress={"percent": int(100 * (index + 1) / steps)}, lease=lease)
                 time.sleep(0.35 if "slow" in content else 0.15)
             self._emit(run_id, "source_recorded", "Example source", agent="researcher",
                        payload={"id": "src-1", "title": "Example source", "domain": "example.com",
@@ -400,8 +412,11 @@ class InProcessFakeWorkerLauncher:
                 output = build_vehicle_catalog_v1_result(content)
             finalizer.finalize(TerminalClaim.product(engine, output))
         except Exception as exc:  # pragma: no cover - defensive
+            # A crash is terminalized through the SAME finalizer, under the
+            # lease this worker holds; a finalizer that cannot write (lease
+            # lost, run moved) raises, and nothing else writes a status.
             try:
-                repo.mark_run_failed(run_id, "E2E_WORKER_CRASH", str(exc)[:200])
+                finalizer.finalize(TerminalClaim.failure(engine, "E2E_WORKER_CRASH", str(exc)[:200]))
             except Exception:
                 pass
 

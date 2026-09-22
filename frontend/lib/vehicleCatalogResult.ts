@@ -48,6 +48,11 @@ const FIELD_LABELS: Record<V1ModelField, string> = {
   seats: 'Seats', trims: 'Trims', currently_sold: 'Currently sold', safety_rating: 'Safety rating',
 };
 
+/**
+ * Above this the document is refused rather than truncated: a truncated
+ * catalog would be a different (smaller) product presented as the whole one.
+ * The engine's discovery bound is 25 models per run, so 200 is generous.
+ */
 export const MAX_V1_MODELS = 200;
 export const MAX_V1_SOURCES_PER_MODEL = 8;
 export const MAX_V1_TEXT = 200;
@@ -122,7 +127,9 @@ function sourcesOf(value: unknown): V1ModelSource[] {
     try {
       const url = new URL(candidate);
       if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
-      out.push({ url: url.toString().slice(0, 500), host: url.hostname });
+      const normalized = url.toString().slice(0, 500);
+      if (out.some((existing) => existing.url === normalized)) continue;
+      out.push({ url: normalized, host: url.hostname });
     } catch {
       // Not a URL; a source that cannot be linked is not listed as one.
     }

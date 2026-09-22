@@ -58,8 +58,8 @@ export function LiveRunPanel({ visible, live, connection }: LiveRunPanelProps) {
         )}
         {live.active.length > 0 ? (
           <ul className="live-active" aria-label="Active workers">
-            {live.active.map((worker) => (
-              <li key={worker.name}><span className="identifier">{safeText(worker.name)}</span> — {safeText(worker.doing)}</li>
+            {live.active.map((worker, index) => (
+              <li key={`${worker.name}-${index}`}><span className="identifier">{safeText(worker.name)}</span> — {safeText(worker.doing)}</li>
             ))}
           </ul>
         ) : (

@@ -423,3 +423,107 @@ def test_runs_are_isolated_per_conversation_and_per_member(world):
     assert v2_rows[0]["run_identity"]["workflow_key"] == "swarm_v2"
     for run_id in (v1_run, v2_run):
         assert TestClient(app).get(f"/runs/{run_id}", headers=member(world["bob"])).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 5. the projection cannot be shadowed, the history reads once, the E2E worker leaks nothing
+# ---------------------------------------------------------------------------
+def test_a_worker_request_cannot_append_a_terminal_event(world, monkeypatch):
+    """The four terminal events belong to the canonical finalizer, which writes
+    them atomically with the status. A lease-holding worker request may append
+    progress, never a terminal event -- so it can never shadow the finalizer's
+    ProductOutcome record with one of its own."""
+    from backend.worker_auth import get_token_verifier
+
+    repo = world["repo"]
+    run_id = create_run(repo, world["v1_conversation"], world["alice"])
+    lease = claim(repo, run_id)
+    monkeypatch.setenv("MILO_APPROVED_WORKER_IDENTITIES", "worker@example.iam.gserviceaccount.com")
+    monkeypatch.setenv("MILO_WORKER_AUDIENCE", "https://api.example")
+
+    class Verifier:
+        def verify(self, token, audience):
+            return {"iss": "https://accounts.google.com", "email": "worker@example.iam.gserviceaccount.com",
+                    "email_verified": True, "aud": audience}
+
+    app.dependency_overrides[get_token_verifier] = lambda: Verifier()
+    try:
+        headers = {"x-milo-worker-token": "t"}
+        body = {"event_type": "run_completed", "message": "shadow", "payload": {"product_outcome": {"semantic_status": "complete"}},
+                **lease}
+        response = TestClient(app).post(f"/internal/runs/{run_id}/events", json=body, headers=headers)
+        assert response.status_code == 422, response.text
+        assert response.json()["error"]["code"] == "TERMINAL_EVENT_RESERVED"
+        assert repo.terminal_run_event(run_id) is None
+        # The same verified worker may still append progress under its lease.
+        progress = TestClient(app).post(f"/internal/runs/{run_id}/events",
+                                        json={**body, "event_type": "agent_progress", "payload": {}}, headers=headers)
+        assert progress.status_code == 201, progress.text
+    finally:
+        app.dependency_overrides.pop(get_token_verifier, None)
+
+
+def test_the_history_page_reads_terminal_events_once_not_per_row(world, monkeypatch):
+    repo = world["repo"]
+    conversation = world["v1_conversation"]
+    for index in range(3):
+        run_id = create_run(repo, conversation, world["alice"], f"run {index}")
+        lease = claim(repo, run_id)
+        RunFinalizer(repo=repo, run_id=run_id, engine="vehicle_catalog_v1", lease_ctx=lease).finalize(
+            TerminalClaim.product("vehicle_catalog_v1", {"status": "complete", "result": V1_DOCUMENT}))
+    calls = {"single": 0, "batch": 0}
+    single, batch = repo.terminal_run_event, repo.terminal_run_events
+
+    def counted_single(run_id):
+        calls["single"] += 1
+        return single(run_id)
+
+    def counted_batch(run_ids):
+        calls["batch"] += 1
+        return batch(run_ids)
+
+    monkeypatch.setattr(repo, "terminal_run_event", counted_single)
+    monkeypatch.setattr(repo, "terminal_run_events", counted_batch)
+    rows = TestClient(app).get(f"/conversations/{conversation}/runs", headers=member(world["alice"])).json()
+    assert len(rows) == 3 and all(row["product_outcome"]["semantic_status"] == "complete" for row in rows)
+    assert calls == {"single": 0, "batch": 1}
+
+
+def test_the_e2e_worker_never_serves_a_lease_token_through_the_events_read(world):
+    from backend.testing.e2e_app import InProcessFakeWorkerLauncher
+
+    repo = world["repo"]
+    app.dependency_overrides[get_repository] = lambda: repo
+    run_id = create_run(repo, world["v1_conversation"], world["alice"], "produce the final report")
+    InProcessFakeWorkerLauncher(repo).launch(run_id)
+    deadline = time.time() + 15
+    while time.time() < deadline and repo.get_run(run_id)["status"] not in {"completed", "partial_success", "failed"}:
+        time.sleep(0.05)
+    token = repo.get_run(run_id)["lease_token"]
+    assert token
+    events = TestClient(app).get(f"/runs/{run_id}/events", headers=member(world["alice"])).json()
+    assert events, "the run produced events"
+    serialized = str(events)
+    assert token not in serialized and "lease_token" not in serialized
+    # Every event the worker appended was fenced by its lease (the memory
+    # repository records the worker on the run; the events carry no lease).
+    for event in events:
+        assert "worker_id" not in event["payload"] and "attempt" not in event["payload"]
+
+
+def test_the_e2e_worker_writes_nothing_when_it_cannot_claim(world):
+    from backend.testing.e2e_app import InProcessFakeWorkerLauncher
+
+    repo = world["repo"]
+    run_id = create_run(repo, world["v1_conversation"], world["alice"], "produce the final report")
+    # Another worker holds an unexpired lease.
+    other = claim(repo, run_id)
+    before = dict(repo.get_run(run_id))
+    events_before = len(repo.list_run_events(run_id))
+    InProcessFakeWorkerLauncher(repo).launch(run_id)
+    time.sleep(1.0)
+    after = repo.get_run(run_id)
+    assert after["status"] == before["status"] == "running"
+    assert after["worker_id"] == other["worker_id"] and after["lease_token"] == other["lease_token"]
+    assert len(repo.list_run_events(run_id)) == events_before
+    assert after.get("error") is None

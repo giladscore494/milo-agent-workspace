@@ -130,6 +130,12 @@ function humanStatus(status?: string): string {
   return status.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
 }
 
+/**
+ * V1 work units are the technical/verifier CHUNKS the engine reports. The
+ * engine emits `chunk_completed` / `chunk_failed` (and `chunk_started` for a
+ * chunk it announces first); it states no queue, so `queued` is 0 and
+ * `running` counts only chunks announced and not yet settled.
+ */
 function v1Work(state: WorkspaceState): WorkCounts | undefined {
   let started = 0; let completed = 0; let failed = 0;
   for (const event of state.events) {
@@ -151,7 +157,7 @@ function v1Active(state: WorkspaceState): ActiveWorker[] {
 
 function finalization(run: Run | undefined, terminal: boolean): FinalizationView {
   if (!run || !terminal) return { state: 'live' };
-  const outcome = parseProductOutcome((run as unknown as Record<string, unknown>).product_outcome);
+  const outcome = parseProductOutcome(run.product_outcome);
   return outcome ? { state: 'finalized', outcome } : { state: 'terminal_without_outcome' };
 }
 
@@ -170,7 +176,7 @@ export function buildLiveRunViewModel(input: {
   const status = run?.status;
   const terminal = isTerminalRunStatus(status);
   const usage = normalizeRunUsage(run?.usage);
-  const limits = parseRunLimits((run as unknown as Record<string, unknown> | undefined)?.limits);
+  const limits = parseRunLimits(run?.limits);
   const cost = usage.actualCost ?? usage.estimatedCost;
   const spendRatio = cost !== undefined && limits.maxCost ? Math.min(1, cost / limits.maxCost) : undefined;
   let pacing = 0;

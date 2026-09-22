@@ -15,6 +15,8 @@ export type RunHistoryListProps = {
 };
 
 const ENGINE_LABELS: Record<string, string> = { vehicle_catalog_v1: 'V1', swarm_v2: 'V2' };
+/** The server bounds the page to 50; the component bounds itself the same way. */
+const MAX_HISTORY_ROWS = 50;
 
 /**
  * The conversation's durable run history.
@@ -41,9 +43,9 @@ export function RunHistoryList({ visible, runs, loading, error, activeRunId, onS
       )}
       {runs !== undefined && runs.length > 0 && (
         <ul className="run-history-list">
-          {runs.map((run) => {
-            const workflow = runIdentityWorkflowKey(run as unknown as Parameters<typeof runIdentityWorkflowKey>[0]);
-            const outcome = parseProductOutcome((run as unknown as Record<string, unknown>).product_outcome);
+          {runs.slice(0, MAX_HISTORY_ROWS).map((run) => {
+            const workflow = runIdentityWorkflowKey(run);
+            const outcome = parseProductOutcome(run.product_outcome);
             const verdict = outcome ? describeProductOutcome(outcome).label : undefined;
             const active = run.id === activeRunId;
             return (

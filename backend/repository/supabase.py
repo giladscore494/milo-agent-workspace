@@ -49,6 +49,7 @@ class Repository(Protocol):
     def list_conversation_runs(self, conversation_id: UUID, user_id: UUID | None = None, limit: int = 20) -> list[dict[str, Any]]: ...
     def list_run_events(self, run_id: UUID, user_id: UUID | None = None) -> list[dict[str, Any]]: ...
     def terminal_run_event(self, run_id: UUID) -> dict[str, Any] | None: ...
+    def terminal_run_events(self, run_ids: list[UUID]) -> dict[str, dict[str, Any]]: ...
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def save_checkpoint(self, checkpoint: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def latest_checkpoint(self, run_id: UUID, workflow_key: str | None = None) -> dict[str, Any] | None: ...
@@ -495,6 +496,26 @@ class SupabaseRepository:
             .order("id", desc=True).limit(1)
         )
         return rows[0] if rows else None
+
+    def terminal_run_events(self, run_ids: list[UUID]) -> dict[str, dict[str, Any]]:
+        """The latest terminal event of EACH run in one bounded read.
+
+        One query for a whole history page instead of one per row; the newest
+        event per run wins, exactly as `terminal_run_event` decides for one.
+        """
+        ids = [str(run_id) for run_id in run_ids][:50]
+        if not ids:
+            return {}
+        rows = self._many(
+            self.client.table("run_events").select("*")
+            .in_("run_id", ids)
+            .in_("event_type", list(self.TERMINAL_EVENT_TYPES))
+            .order("id", desc=True).limit(4 * len(ids))
+        )
+        latest: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            latest.setdefault(str(row.get("run_id")), row)
+        return latest
 
     def list_conversation_runs(self, conversation_id: UUID, user_id: UUID | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """A conversation's runs, newest first, bounded.

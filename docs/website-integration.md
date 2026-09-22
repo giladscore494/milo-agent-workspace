@@ -55,8 +55,9 @@ browser: `_safe_run_response` strips `lease_token` and `launch_error`, and
 `MILO_ENABLE_RUN_CREATION` on the API (403 before body validation,
 `backend/execution_guard.py`), `GATEWAY_ALLOW_EXECUTION_ROUTES` on the
 gateway (the POST is refused before authentication when off), and
-`MILO_ENABLE_EXECUTION_CONTROL` for every worker write. Both are `false` in
-Production today.
+`MILO_ENABLE_EXECUTION_CONTROL` for every worker write. (Operational fact,
+verified read-only on 2026-09-22, not a property of the code: all of them are
+`false` on the Production API and Worker.)
 
 ## 2. Immutable identity decides the engine
 
@@ -79,8 +80,8 @@ never the payload shape:
 | Browser | `runIdentityWorkflowKey` (`frontend/lib/runIdentity.ts`) | `identityUnavailable` → bounded alert, no engine-specific surface |
 | Browser (this change) | `buildLiveRunViewModel` (`frontend/lib/liveRunViewModel.ts`) | `engine: undefined`, "Engine not stated", no work/agent projection |
 
-The 8 Production runs created before Console 6 have `run_identity IS NULL`
-and are therefore readable history only: not executable, not resumable, not
+The 8 Production runs created before Console 6 (verified read-only on
+2026-09-22) have `run_identity IS NULL` and are therefore readable history only: not executable, not resumable, not
 exportable, and rendered with the identity-unavailable state.
 
 ## 3. Live run visualization
@@ -98,7 +99,7 @@ deliberately disabled). Refresh and reconnect rebuild state from
 | Run state, terminal flag | `run.status` |
 | Workflow / engine / engine version | `run.run_identity` |
 | Current phase | V1: last `phase` on an event owning the V1 projection; V2: swarm lifecycle |
-| Work (queued / active / completed / failed) | V1: `chunk_started/completed/failed` events; V2: `taskCounts` from `task_ready/started/completed/failed` (`lib/swarmReducer.ts`) |
+| Work (queued / active / completed / failed) | V1: chunk events — the engine emits `chunk_completed` / `chunk_failed` (`engines/vehicle_catalog_v1/engine.py`), so V1 shows settled chunks and no queue; V2: `taskCounts` from `task_ready/started/completed/failed` (`lib/swarmReducer.ts`) |
 | What each active worker is doing | V1: agents with status `active` and their last message; V2: running tasks and their tool-call count. Swarm V2 has no agent concept and none is invented |
 | Research / evidence progress | V1: `source_recorded`, `claim_recorded`, `conflict_detected`; V2: `evidence_added`, `conflict_found`, `verification_batch_completed`, `verification_completed` |
 | Provider / backpressure | `run.usage.provider_backpressure_events`, `run.usage.retries` (authoritative), plus a count of the durable pacing events `provider_backpressure_wait`, `provider_rate_limited`, `provider_quota_paused` (exact type membership) |
@@ -126,6 +127,14 @@ execution → evidence / current verdict → RunFinalizer (backend/finalization.
         of the engine's deterministic final document: models, verdicts, review/rejected counts,
         pipeline quality, data depth; not a JSON dump)
 ```
+
+A worker request may not append any of the four terminal event types
+(`TERMINAL_EVENT_RESERVED`, `backend/main.py create_worker_run_event`), so
+nothing but the finalizer can write the event the projection reads. Residual:
+a worker process holding the lease could still append one through the
+repository RPC; the projection re-validates the record and drops anything
+outside the vocabulary, so the worst case is a shadowed verdict, never an
+unsafe one.
 
 The raw durable payload is no longer a product surface. It is developer
 telemetry under the Inspector's Developer tab, redacted through
@@ -167,8 +176,9 @@ change connects the website to it and documents it, it does not rebuild it.
 
 Flags (`backend/catalog/execution.py`): `MILO_ENABLE_CATALOG_EXECUTION`
 (master), `MILO_ENABLE_GOVERNMENT_CATALOG_READ`, `MILO_ENABLE_CATALOG_PROMOTION`;
-promotion armed without read is a startup refusal. All are OFF in Production
-and every catalog table holds zero rows. Live Government egress is only the
+promotion armed without read is a startup refusal. Operational fact verified
+read-only on 2026-09-22: all are OFF in Production and every catalog table
+holds zero rows. Live Government egress is only the
 operator-only `catalog.government.capture` run (`backend/catalog/operator_capture.py`),
 which requires `MILO_ENABLE_PAID_EXECUTION` and two typed acknowledgements.
 

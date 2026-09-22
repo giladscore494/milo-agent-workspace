@@ -312,6 +312,14 @@ class MemoryRepository:
                   if e["run_id"] == str(run_id) and e["event_type"] in self.TERMINAL_EVENT_TYPES]
         return dict(events[-1]) if events else None
 
+    def terminal_run_events(self, run_ids: list[UUID]) -> dict[str, dict[str, Any]]:
+        wanted = {str(run_id) for run_id in run_ids}
+        latest: dict[str, dict[str, Any]] = {}
+        for event in self.run_events:
+            if event["run_id"] in wanted and event["event_type"] in self.TERMINAL_EVENT_TYPES:
+                latest[event["run_id"]] = dict(event)  # later rows overwrite: newest wins
+        return latest
+
     def list_conversation_runs(self, conversation_id: UUID, user_id: UUID | None = None, limit: int = 20) -> list[dict[str, Any]]:
         self.get_conversation(conversation_id, user_id)
         bounded = max(1, min(int(limit), 50))

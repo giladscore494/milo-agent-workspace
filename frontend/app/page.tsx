@@ -287,14 +287,6 @@ export default function WorkspacePage() {
     !identityUnavailable && live.engine === 'vehicle_catalog_v1' && executionUi && activeConversation !== undefined && activeRunId !== undefined;
   const showLiveRun = executionUi && activeConversation !== undefined && activeRunId !== undefined;
 
-  // Once the active run is terminal its canonical outcome is durable; the
-  // history row for it is re-read so the list shows the verdict the finalizer
-  // recorded rather than the status it had when the list was loaded.
-  useEffect(() => {
-    if (!runIsTerminal || !activeConversation) return;
-    loadRunHistory(activeConversation.id, scope.current, false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runIsTerminal, activeRunId]);
 
   useEffect(() => {
     let mounted = true;
@@ -580,6 +572,20 @@ export default function WorkspacePage() {
         setRunHistoryLoading(false);
       });
   }, [executionUi, changeActiveRun]);
+
+  // Once the ACTIVE run is terminal its canonical outcome is durable; the
+  // history row for it is re-read once so the list shows the verdict the
+  // finalizer recorded rather than the status it had when the list loaded.
+  // Keyed on the run whose row is loaded: a run switch renders once with the
+  // previous terminal row still in state, and that must not count.
+  const terminalRunId = runIsTerminal && state.run?.id === activeRunId ? activeRunId : undefined;
+  const historyRefreshedFor = useRef<string>();
+  useEffect(() => {
+    if (!terminalRunId || !activeConversation) return;
+    if (historyRefreshedFor.current === terminalRunId) return;
+    historyRefreshedFor.current = terminalRunId;
+    loadRunHistory(activeConversation.id, scope.current, false);
+  }, [terminalRunId, activeConversation, loadRunHistory]);
 
   const loadConversations = useCallback((project: Project, owner: WorkspaceScope) => {
     setConversations(undefined);

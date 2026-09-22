@@ -163,6 +163,10 @@ def _catalog_page_meta(page: catalog_review.CatalogPage) -> CatalogPageMeta:
 #: The events the canonical finalizer writes atomically with a terminal status.
 TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_partial_success", "run_failed", "run_cancelled"})
 
+#: "Not supplied": lets a history page hand pre-fetched limits and terminal
+#: events to the projection instead of re-reading them per row.
+_UNSET = object()
+
 
 def _safe_product_outcome(run: dict, repo: Repository | None) -> ProductOutcomeRecord | None:
     """Project the canonical ProductOutcome the finalizer recorded, or null.
@@ -181,9 +185,14 @@ def _safe_product_outcome(run: dict, repo: Repository | None) -> ProductOutcomeR
     if str(run.get("status") or "") not in TERMINAL_STATES:
         return None
     try:
-        event = repo.terminal_run_event(run["id"])
+        event = repo.terminal_run_event(run.get("id"))
     except Exception:
         return None
+    return _project_product_outcome(event)
+
+
+def _project_product_outcome(event: object) -> ProductOutcomeRecord | None:
+    """The pure half of the projection: one terminal event -> record or null."""
     if not isinstance(event, dict) or event.get("event_type") not in TERMINAL_EVENT_TYPES:
         return None
     payload = event.get("payload")
@@ -213,7 +222,9 @@ def _run_limits() -> RunLimits | None:
     return limits if limits.model_dump(exclude_none=True) else None
 
 
-def _safe_run_response(run: dict, repo: Repository | None = None) -> dict:
+def _safe_run_response(run: dict, repo: Repository | None = None, *,
+                       limits: RunLimits | None | object = _UNSET,
+                       terminal_event: object = _UNSET) -> dict:
     """Return a browser-safe run shape.
 
     Launch exception messages are operational data and may include provider,
@@ -236,8 +247,12 @@ def _safe_run_response(run: dict, repo: Repository | None = None) -> dict:
     # The canonical product verdict and the ceilings the run executes under.
     # Both are projections of durable/deployment truth; neither is derived
     # from the payload or from anything the browser could have supplied.
-    safe["product_outcome"] = _safe_product_outcome(run, repo)
-    safe["limits"] = _run_limits()
+    if terminal_event is _UNSET:
+        safe["product_outcome"] = _safe_product_outcome(run, repo)
+    else:
+        terminal = str(run.get("status") or "") in TERMINAL_STATES
+        safe["product_outcome"] = _project_product_outcome(terminal_event) if terminal else None
+    safe["limits"] = _run_limits() if limits is _UNSET else limits
     safe.pop("launch_error", None)
     safe.pop("lease_token", None)
     return safe
@@ -561,7 +576,17 @@ def list_conversation_runs(conversation_id: UUID, limit: int = 20, user: Authent
     # Membership authorization precedes every read; a non-member sees 404.
     repo.get_conversation(conversation_id, user.user_id)
     rows = repo.list_conversation_runs(conversation_id, user_id=user.user_id, limit=limit)
-    return [_safe_run_response(row, repo) for row in rows]
+    # One limits read and ONE terminal-event read for the whole page, never
+    # one of each per row.
+    limits = _run_limits()
+    events: dict[str, dict] = {}
+    if hasattr(repo, "terminal_run_events"):
+        try:
+            events = repo.terminal_run_events([row["id"] for row in rows if row.get("id")]) or {}
+        except Exception:
+            events = {}
+    return [_safe_run_response(row, repo, limits=limits, terminal_event=events.get(str(row.get("id"))))
+            for row in rows]
 
 
 @app.get("/runs/{run_id}/events", response_model=list[RunEvent])
@@ -741,6 +766,12 @@ def create_worker_run_event(run_id: UUID, request: WorkerRunEventCreate, worker:
     # while the durable sink wrote it without checking anything.
     if not is_known_event_type(request.event_type):
         raise AppError("UNKNOWN_EVENT_TYPE", "unknown event type", 422)
+    # The four terminal events are the canonical finalizer's alone: it writes
+    # them in the same transaction as the terminal status, and the run read
+    # projects the ProductOutcome from the latest of them. A worker request
+    # body may not append one, so it cannot shadow the finalizer's record.
+    if request.event_type in TERMINAL_EVENT_TYPES:
+        raise AppError("TERMINAL_EVENT_RESERVED", "terminal events are written only by the canonical finalizer", 422)
     return repo.append_run_event(run_id, request.event_type, {"message": request.message, "agent": request.agent, "phase": request.phase, "progress": request.progress, "payload": {**request.payload, "worker_identity": worker.service_account_email}}, **request.lease())
 
 
