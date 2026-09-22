@@ -33,7 +33,7 @@ def test_backup_workflow_encrypts_and_verifies_all_public_backup_parts():
 
 def test_backup_workflow_uploads_no_plaintext_and_has_bounded_retention():
     text = WORKFLOW.read_text()
-    upload = text.split("uses: actions/upload-artifact@v4", 1)[1].split(
+    upload = text.split("uses: actions/upload-artifact@v6", 1)[1].split(
         "- name: Cleanup backup workspace", 1
     )[0]
 

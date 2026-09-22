@@ -14,11 +14,11 @@ jobs:
       JOB_LAUNCHER: disabled
       NEXT_PUBLIC_API_URL: http://localhost:8080
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
       - name: Install backend dependencies
@@ -79,8 +79,8 @@ jobs:
       JOB_LAUNCHER: disabled
       MILO_REQUIRE_PG_TESTS: '1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Install PostgreSQL server binaries
@@ -110,11 +110,11 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
       JOB_LAUNCHER: disabled
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
       - name: Install backend dependencies

@@ -26,7 +26,7 @@ jobs:
     environment: production
     steps:
       - name: Checkout exact source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate immutable authorization
         shell: bash
@@ -49,7 +49,7 @@ jobs:
           fi
 
       - name: Set up Supabase CLI
-        uses: supabase/setup-cli@v1
+        uses: supabase/setup-cli@v2
         with:
           version: 2.31.8
 
@@ -174,7 +174,7 @@ jobs:
           echo "Encrypted backup created and decryptability/checksums verified."
 
       - name: Upload encrypted backup only
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: supabase-production-backup-${{ github.run_id }}
           path: |
