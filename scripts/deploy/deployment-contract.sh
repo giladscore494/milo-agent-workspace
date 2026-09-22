@@ -143,3 +143,78 @@ milo_contains() {
   done
   return 1
 }
+
+# ---------------------------------------------------------------------------
+# Government capture job
+# ---------------------------------------------------------------------------
+# The operator capture runs the EXISTING entrypoint
+# (backend/catalog/operator_capture.py) out of the EXISTING worker image. It
+# is a separate Cloud Run Job purely so its posture is separate: the product
+# worker must never carry the catalog master switch, and the capture must
+# never carry a provider credential. Nothing here re-implements the capture.
+MILO_CAPTURE_ENTRYPOINT_MODULE="backend.catalog.operator_capture"
+
+# The capture reads data.gov.il and writes the snapshot through the same
+# service-role repository the worker uses, so it needs the Supabase pair and
+# nothing else. Redis is a rate-limit store for the API and gateway; a capture
+# takes no HTTP traffic, so it binds neither.
+MILO_CAPTURE_SECRET_ENV_NAMES=(
+  SUPABASE_URL
+  SUPABASE_SERVICE_ROLE_KEY
+)
+MILO_CAPTURE_REQUIRED_ENV_NAMES=(
+  ENVIRONMENT
+  GCP_PROJECT_ID
+  GCP_REGION
+  MILO_EXPECTED_SUPABASE_PROJECT_REF
+)
+
+# The capture's master switch, BY NAME ONLY.
+#
+# CODE-2 requires MILO_ENABLE_CATALOG_EXECUTION for the capture to construct
+# anything at all. This repository deliberately does not carry its enabled
+# VALUE anywhere, and scripts/check_unsafe_defaults.py enforces that against
+# operator scripts too ("a repository default is not a deliberate operator
+# decision"). So the name lives here and the value is supplied by the
+# operator, once, on the capture command line
+# (government-production-capture.sh --enable-catalog-execution). Without that
+# explicit argument the capture job is never created and never executed.
+#
+# It is scoped to this job rather than the product worker on purpose: the
+# capture job creates no MILO run, registers no Government tool and builds no
+# promotion pipeline, so the master switch being on inside it grants exactly
+# the capture and nothing else.
+MILO_CAPTURE_MASTER_FLAG_NAME="MILO_ENABLE_CATALOG_EXECUTION"
+
+# The rest of the capture's posture is pinned OFF by the job definition.
+#
+# MILO_ENABLE_PAID_EXECUTION=false is not decoration. operator_capture.py
+# refuses with CAPTURE_PAID_EXECUTION_ENABLED when it is on, so a capture can
+# never be bundled with model spend even by an operator who wanted to.
+#
+# MILO_ENABLE_CATALOG_PROMOTION=false keeps canonical promotion a separate,
+# separately authorized decision; a capture lands raw records and candidates,
+# never canonical facts.
+MILO_CAPTURE_PINNED_OFF_FLAGS=(
+  MILO_ENABLE_PAID_EXECUTION=false
+  MILO_ENABLE_CATALOG_PROMOTION=false
+  MILO_ENABLE_GOVERNMENT_CATALOG_READ=false
+  MILO_ENABLE_RUN_CREATION=false
+  MILO_ENABLE_EXECUTION_CONTROL=false
+)
+
+# The pinned upstream identity and bounds the capture is allowed to use. These
+# MUST equal the values backend/catalog/government/source.py pins, because
+# operator_capture.py refuses any other value
+# (CAPTURE_RESOURCE_NOT_SUPPORTED / CAPTURE_BOUNDS_NOT_SUPPORTED).
+# tests/test_production_operator_bundle.py asserts the equality, so this can
+# never drift from the code it mirrors.
+MILO_CAPTURE_PACKAGE_ID="degem-rechev-wltp"
+MILO_CAPTURE_RESOURCE_ID="142afde2-6228-49f9-8a29-9b6c3a0cbe40"
+MILO_CAPTURE_PAGE_LIMIT="1000"
+MILO_CAPTURE_MAX_PAGES="200"
+MILO_CAPTURE_MAX_RECORDS="120000"
+
+# The two acknowledgements, matched EXACTLY by the entrypoint.
+MILO_CAPTURE_EGRESS_ACK="I ACKNOWLEDGE LIVE GOVERNMENT EGRESS"
+MILO_CAPTURE_SCHEMA_ACK="I ACKNOWLEDGE OPERATOR-0 SCHEMA REPORT REVIEWED"

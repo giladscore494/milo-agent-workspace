@@ -27,3 +27,6 @@ coverage/
 .next-e2e-*/
 frontend/test-results/
 frontend/playwright-report/
+
+# Operator-supplied production identifiers (non-secret, but deployment-specific).
+config/production-operator.env
