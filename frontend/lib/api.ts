@@ -127,6 +127,15 @@ export const api = {
   run: (id: string) => request<Run>(`/runs/${id}`),
 
   /**
+   * The canonical export envelope of ONE finished run. GET, no body. The
+   * server builds it (`backend/export_envelope.py`) and refuses a run that is
+   * live, identity-less or otherwise not exportable; the browser only
+   * retrieves, summarizes and downloads the document it was given. `unknown`
+   * on purpose: `lib/runExport.ts` reads it field by field.
+   */
+  exportRun: (id: string) => request<unknown>(`/runs/${id}/export`),
+
+  /**
    * The conversation's durable run history, newest first and bounded by the
    * server. It is what lets a completed result outlive session storage: after
    * a browser restart the workspace reopens the latest run from here.

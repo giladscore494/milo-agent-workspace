@@ -169,6 +169,48 @@ class ProductOutcomeRecord(BaseModel):
     payload: ProductOutcomePayloadReference
 
 
+class EffectiveConcurrency(BaseModel):
+    """The concurrency this deployment really runs at, from server-owned truth.
+
+    Every number is DERIVED from the canonical `RuntimePolicy`
+    (``backend/runtime_policy.py``), the resolved provider configuration and
+    the organization ceiling -- never typed into the browser. Two widths are
+    stated separately on purpose: the LOGICAL engine width (how many workers
+    or technical units an engine may run at once) and the PROVIDER-ADMITTED
+    width (how many provider requests the reviewed per-process profile and
+    the organization ceiling actually let through). The smaller one binds,
+    and ``*_provider_admitted`` is exactly that minimum, computed the way the
+    executor computes it. An unresolvable policy states ``null``: nothing here
+    is ever invented.
+    """
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    #: vehicle_catalog_v1: technical units executed in parallel (logical).
+    v1_technical_parallelism: int | None = None
+    #: swarm_v2: logical active workers before provider capacity is applied.
+    v2_max_active_workers: int | None = None
+    #: The reviewed per-process provider concurrency (MILO_PROVIDER_MAX_CONCURRENCY).
+    provider_max_concurrency: int | None = None
+    #: The organization-wide inference ceiling every process shares.
+    provider_organization_ceiling: int | None = None
+    #: What the provider admits for this process: min(per-process, ceiling).
+    provider_effective_concurrency: int | None = None
+    #: min(engine width, provider effective) -- the width that binds in practice.
+    v1_provider_admitted: int | None = None
+    v2_provider_admitted: int | None = None
+    #: Server-side admission caps applied before a run row exists.
+    max_concurrent_runs_per_user: int | None = None
+    max_concurrent_runs_per_project: int | None = None
+    #: Web search admission, per endpoint, per second.
+    search_basic_qps: int | None = None
+    search_pro_qps: int | None = None
+    #: Whether the search QPS values are provider-verified or the conservative fallback.
+    search_qps_verified: bool = False
+    #: Whether this deployment resolved the policy in the paid posture.
+    paid_posture: bool = False
+
+
 class RunLimits(BaseModel):
     """The per-run ceilings this deployment enforces, as plain numbers.
 
@@ -185,6 +227,9 @@ class RunLimits(BaseModel):
     max_cost_per_run: float | None = None
     max_run_duration_seconds: int | None = None
     max_agent_steps: int | None = None
+    #: The effective runtime concurrency, from server-owned truth. `null`
+    #: when the canonical policy cannot be resolved for this deployment.
+    concurrency: EffectiveConcurrency | None = None
 
 
 class Run(BaseModel):

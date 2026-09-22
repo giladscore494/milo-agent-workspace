@@ -57,6 +57,11 @@ describe('gateway policy', () => {
   it('allows the authorized run read endpoints needed for polling', () => {
     expect(isGatewayRequestAllowed('GET', `/runs/${RUN_ID}`)).toBe(true);
     expect(isGatewayRequestAllowed('GET', `/runs/${RUN_ID}/events`)).toBe(true);
+    expect(isGatewayRequestAllowed('GET', `/runs/${RUN_ID}/export`)).toBe(true);
+    // The export is a READ of one run: GET only, and nothing under it.
+    expect(isGatewayRequestAllowed('POST', `/runs/${RUN_ID}/export`)).toBe(false);
+    expect(isGatewayRequestAllowed('GET', `/runs/${RUN_ID}/export/anything`)).toBe(false);
+    expect(isGatewayRequestAllowed('GET', `/runs/not-a-uuid/export`)).toBe(false);
     expect(
       isGatewayRequestAllowed('GET', `/projects/${PROJECT_ID}/conversations`),
     ).toBe(true);

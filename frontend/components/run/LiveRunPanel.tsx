@@ -100,6 +100,37 @@ export function LiveRunPanel({ visible, live, connection }: LiveRunPanelProps) {
         {!usage.present && <p className="muted">No usage has been recorded for this run yet.</p>}
       </section>
 
+      <section className="swarm-section" aria-labelledby="live-concurrency-title">
+        <h4 className="section-title" id="live-concurrency-title">Effective concurrency</h4>
+        {limits.concurrency ? (
+          <>
+            <p className="muted">
+              Server-derived from the canonical runtime policy. Logical engine width is what an engine may run at once; provider-admitted is what the provider profile actually lets through. The smaller binds.
+            </p>
+            <dl className="run-facts" data-testid="live-concurrency">
+              {live.engine !== 'swarm_v2' && (
+                <div className="run-fact"><dt>V1 technical parallelism (logical)</dt><dd>{count(limits.concurrency.v1TechnicalParallelism)}</dd></div>
+              )}
+              {live.engine !== 'swarm_v2' && (
+                <div className="run-fact"><dt>V1 provider-admitted</dt><dd>{count(limits.concurrency.v1ProviderAdmitted)}</dd></div>
+              )}
+              {live.engine !== 'vehicle_catalog_v1' && (
+                <div className="run-fact"><dt>V2 active workers (logical)</dt><dd>{count(limits.concurrency.v2MaxActiveWorkers)}</dd></div>
+              )}
+              {live.engine !== 'vehicle_catalog_v1' && (
+                <div className="run-fact"><dt>V2 provider-admitted</dt><dd>{count(limits.concurrency.v2ProviderAdmitted)}</dd></div>
+              )}
+              <div className="run-fact"><dt>Provider concurrency (this process)</dt><dd>{count(limits.concurrency.providerMaxConcurrency)}{limits.concurrency.providerOrganizationCeiling !== undefined ? ` of ${limits.concurrency.providerOrganizationCeiling} organization ceiling` : ''}</dd></div>
+              <div className="run-fact"><dt>Provider effective</dt><dd>{count(limits.concurrency.providerEffectiveConcurrency)}</dd></div>
+              <div className="run-fact"><dt>Concurrent runs per user / project</dt><dd>{count(limits.concurrency.maxConcurrentRunsPerUser)} / {count(limits.concurrency.maxConcurrentRunsPerProject)}</dd></div>
+              <div className="run-fact"><dt>Search QPS basic / pro</dt><dd>{count(limits.concurrency.searchBasicQps)} / {count(limits.concurrency.searchProQps)}{limits.concurrency.searchQpsVerified ? '' : ' (unverified fallback)'}</dd></div>
+            </dl>
+          </>
+        ) : (
+          <p className="muted">The server stated no resolvable concurrency for this deployment.</p>
+        )}
+      </section>
+
     </section>
   );
 }

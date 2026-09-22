@@ -169,7 +169,10 @@ change connects the website to it and documents it, it does not rebuild it.
 | Canonical identity | `backend/catalog/keys.py`, `backend/catalog/contracts.py` | `cm1.<32 hex>` = manufacturer + commercial model; `cv1.<32 hex>` = model key + year range + official model code + trim (identity dimensions deliberately excluded as revisable facts); candidate key excludes status; every key domain-separated and versioned |
 | Reconciliation / deduplication | `backend/catalog/government/reconcile.py` | ≤5,000 variants; match by official model code, then normalized identity + year; `matched` / `ambiguous` / `under_enriched` states; reviewed alias rules empty by default |
 | Persisted pre-agent state | `backend/catalog/government/ingest.py` → `record_catalog_snapshot_guarded`, `record_catalog_raw_record_guarded`, `record_catalog_candidate_guarded`, `activate_catalog_snapshot_guarded` | `catalog_source_snapshots`, `catalog_raw_records` (with `source_locator`), `catalog_candidate_variants`; append-only triggers; lease-guarded |
-| Bounded task selection | `backend/tools/government_vehicle.py` (`catalog.government_vehicle`, scope `catalog:government:read`, 8 read operations, `resolve_variant` is the promotable one), wired in `backend/worker/main.py` only when `government_read_enabled()` | an agent can only READ the persisted candidate state through bounded operations (≤200 items, ≤20 resolution matches); it cannot invent a manufacturer, model or variant identity — identities exist only as persisted `cv1.`/`cm1.` rows |
+| Government preparation (after the lease, before the provider) | `backend/catalog/government/preparation.py` `prepare_government_work`, called from `backend/worker/main.py` between the lease/heartbeat and the block that constructs `ProviderAdapter` | for a trusted `swarm_v2` run with `MILO_ENABLE_GOVERNMENT_CATALOG_READ` on: resolve the newest USABLE snapshot through `resolve_active_snapshot` and PIN it (`GovernmentVehicleTool(snapshot_key=…)`), select the first 25 unread (`status='candidate'`) variants in the repository's deterministic order (codepoint identity text, then `candidate_key` — the same order PostgreSQL and the in-memory mirror return), write ONE `run_checkpoints` row (phase `government_prepared`, `artifacts.government`) under the lease, then continue. No usable snapshot → `RunFinalizer` refusal `GOVERNMENT_SNAPSHOT_UNAVAILABLE` before any paid path exists; the worker never constructs a `data.gov.il` transport |
+| Resumable work queue | `prepared_artifact` / `government_work_progress` (same module); the worker copies `artifacts.government` into every later engine checkpoint | a replacement attempt reads the record from `latest_checkpoint`, resolves the SAME snapshot by exact key (never "newest"), walks the SAME queue, writes no second record, and hands the engine no preparation checkpoint (the Swarm resume path sees only its own `swarm_state`). Per-item progress is reconstructed from durable state: `catalog_run_pending_promotions` (verified evidence of this run) → `evidenced`, a durable `catalog_variant_promoted` event → `promoted`, else `pending`. No new event type was registered; the event-registry fingerprint is unchanged. Residual: with promotion OFF, candidates never leave `candidate`, so every run of the same snapshot selects the same first 25 |
+| Work handoff | `engine_run.input.context.government_work` (server-written; the API never writes `input.context`) → `Commander.plan(context=…)` | the Commander receives the selection (snapshot key, resource, items with identity text, candidate key and progress; `remaining`, `bounded`, `total_candidates`) through its existing context seam; a browser cannot supply it |
+| Bounded task selection | `backend/tools/government_vehicle.py` (`catalog.government_vehicle`, scope `catalog:government:read`, 8 read operations, `resolve_variant` is the promotable one), wired in `backend/worker/main.py` only when `government_read_enabled()`, pinned to the prepared snapshot | an agent can only READ the persisted candidate state through bounded operations (≤200 items, ≤20 resolution matches); it cannot invent a manufacturer, model or variant identity — identities exist only as persisted `cv1.`/`cm1.` rows |
 | MILO execution | Swarm V2 tasks calling the tool; V1 evidence through `V1EvidenceAuthority` | tool calls bounded by `MILO_MAX_TOOL_CALLS_PER_RUN=24`, `max_tool_calls_per_task=4` |
 | Evidence / review | `backend/catalog/government/evidence.py` (`government_register` source, strength `strong`, confidence 0.95) → R3/R4 claims, fragments, verdicts; current verdict via `claim_current_verdict_states` | field-level provenance; only a CURRENT `supported` verdict authorizes |
 | Finalization / ProductOutcome | `backend/catalog/pipeline.py` `CatalogPromotionPipeline` (swarm_v2 only, only when `catalog_promotion_enabled()`), then `RunFinalizer` | `catalog_variant_promoted` / `catalog_promotion_refused` events; ≤25 promotions per run |
@@ -191,6 +194,24 @@ and `/review-candidates` (`backend/catalog/review.py`, ≤100 items per page) in
 Canonical registry: `backend/runtime_policy.py`; rendered by
 `scripts/release/stage-d/policy_envelope.py` (fingerprint
 `7ffc0f6d36220ecdd773955ef4e89289d804fa86e2e279ddd93a6bd6c37ed52b`).
+
+The website does not transcribe any of this. `GET /runs/{id}` (and the
+history read) carry `limits.concurrency`, computed by
+`backend/main.py _effective_concurrency` from `resolve_runtime_policy()`,
+`policy.provider_limits()`, `policy.budget_config()` and the organization
+`QuotaConfig`: V1 technical parallelism, V2 max active workers, per-process
+provider concurrency, the organization ceiling, the provider-effective width
+(`min(per-process, ceiling)`), the provider-ADMITTED width per engine
+(`min(engine width, provider effective)` — the executor's own rule), per-user
+and per-project concurrent-run caps, Search Basic / Pro QPS and whether those
+are verified, and the paid posture. `frontend/lib/liveRunViewModel.ts
+parseEffectiveConcurrency` reads exactly those fields and
+`components/run/LiveRunPanel.tsx` shows the LOGICAL engine width and the
+PROVIDER-ADMITTED width as two separate facts. A policy that refuses to
+resolve states `concurrency: null`; the browser then says so rather than
+showing a default. In the default (unpaid, unset) posture the projection
+states the runtime defaults it really runs with (V1 1, V2 4, provider 2 of
+32), not the reviewed paid profile.
 
 ### Per run (both engines)
 
@@ -261,3 +282,23 @@ production): run creation 5/min per user, 20/min per project; cancellation
 10/min; worker mutations 600/min. Gateway (`frontend/lib/server/rateLimit.ts`):
 unauthenticated 30/min, authenticated 120/min, polling 120/min, run creation
 5/min, cancellation 10/min.
+
+## 7. Canonical export
+
+```
+GET /runs/{id}/export  (backend/main.py export_run; gateway SAFE rule, GET only)
+  → repo.get_run(run_id, user_id)            membership authorization, 404 for a non-member
+  → build_export_envelope(run)               backend/export_envelope.py — the ONE export authority
+  → validate_export_envelope(envelope)       re-validated before it leaves
+  → usage replaced by the bounded public RunUsage projection
+  → 409 RUN_NOT_EXPORTABLE with a static reason for: a live run, an absent or
+    unreadable immutable identity, a non-product workflow, an identity not
+    bound to a release, a stored Swarm V2 product that is not contract-valid
+  → frontend/lib/api.ts exportRun → lib/runExport.ts parseExportEnvelope (closed read of
+    schema_version, run_id, engine, terminal_status, result_kind, generated_at,
+    government_provenance.present; identity must name the same run and engine)
+  → components/result/RunExportControl.tsx: one button for a terminal run with a
+    trustworthy identity; shows the summary and offers the server's document
+    verbatim as `milo-run-<id>.json`. No export logic in React; `result` is
+    downloaded, never rendered.
+```

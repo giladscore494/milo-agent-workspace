@@ -25,12 +25,38 @@ import { Run, WorkspaceState } from './types';
 
 export type LiveEngine = 'vehicle_catalog_v1' | 'swarm_v2';
 
+/**
+ * The effective runtime concurrency, exactly as the server derived it from the
+ * canonical RuntimePolicy, the resolved provider configuration and the
+ * organization ceiling (`backend/main.py _effective_concurrency`). Nothing
+ * here is computed in the browser: the LOGICAL engine width and the
+ * PROVIDER-ADMITTED width are both server numbers, and `undefined` means the
+ * server stated none.
+ */
+export type EffectiveConcurrency = {
+  v1TechnicalParallelism?: number;
+  v2MaxActiveWorkers?: number;
+  providerMaxConcurrency?: number;
+  providerOrganizationCeiling?: number;
+  providerEffectiveConcurrency?: number;
+  v1ProviderAdmitted?: number;
+  v2ProviderAdmitted?: number;
+  maxConcurrentRunsPerUser?: number;
+  maxConcurrentRunsPerProject?: number;
+  searchBasicQps?: number;
+  searchProQps?: number;
+  searchQpsVerified: boolean;
+  paidPosture: boolean;
+};
+
 export type RunLimits = {
   maxModelCalls?: number;
   maxTotalTokens?: number;
   maxCost?: number;
   maxDurationSeconds?: number;
   maxAgentSteps?: number;
+  /** Absent when the server stated no resolvable concurrency. */
+  concurrency?: EffectiveConcurrency;
 };
 
 export type WorkCounts = {
@@ -113,16 +139,39 @@ function nonNegative(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+export function parseEffectiveConcurrency(raw: unknown): EffectiveConcurrency | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const record = raw as Record<string, unknown>;
+  return {
+    v1TechnicalParallelism: nonNegative(record.v1_technical_parallelism),
+    v2MaxActiveWorkers: nonNegative(record.v2_max_active_workers),
+    providerMaxConcurrency: nonNegative(record.provider_max_concurrency),
+    providerOrganizationCeiling: nonNegative(record.provider_organization_ceiling),
+    providerEffectiveConcurrency: nonNegative(record.provider_effective_concurrency),
+    v1ProviderAdmitted: nonNegative(record.v1_provider_admitted),
+    v2ProviderAdmitted: nonNegative(record.v2_provider_admitted),
+    maxConcurrentRunsPerUser: nonNegative(record.max_concurrent_runs_per_user),
+    maxConcurrentRunsPerProject: nonNegative(record.max_concurrent_runs_per_project),
+    searchBasicQps: nonNegative(record.search_basic_qps),
+    searchProQps: nonNegative(record.search_pro_qps),
+    searchQpsVerified: record.search_qps_verified === true,
+    paidPosture: record.paid_posture === true,
+  };
+}
+
 export function parseRunLimits(raw: unknown): RunLimits {
   if (!raw || typeof raw !== 'object') return {};
   const record = raw as Record<string, unknown>;
-  return {
+  const limits: RunLimits = {
     maxModelCalls: nonNegative(record.max_model_calls_per_run),
     maxTotalTokens: nonNegative(record.max_total_tokens_per_run),
     maxCost: nonNegative(record.max_cost_per_run),
     maxDurationSeconds: nonNegative(record.max_run_duration_seconds),
     maxAgentSteps: nonNegative(record.max_agent_steps),
   };
+  const concurrency = parseEffectiveConcurrency(record.concurrency);
+  if (concurrency) limits.concurrency = concurrency;
+  return limits;
 }
 
 function humanStatus(status?: string): string {

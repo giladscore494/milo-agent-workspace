@@ -97,6 +97,26 @@ describe('the unified live-run view model', () => {
     expect(view.usage.present).toBe(false);
     expect(view.spendRatio).toBeUndefined();
     expect(parseRunLimits(null)).toEqual({});
+    // Effective concurrency is read from the server's projection, never computed here.
+    const withConcurrency = parseRunLimits({
+      max_cost_per_run: 1,
+      concurrency: {
+        v1_technical_parallelism: 4, v2_max_active_workers: 3, provider_max_concurrency: 2,
+        provider_organization_ceiling: 32, provider_effective_concurrency: 2,
+        v1_provider_admitted: 2, v2_provider_admitted: 2,
+        max_concurrent_runs_per_user: 1, max_concurrent_runs_per_project: 1,
+        search_basic_qps: 1, search_pro_qps: 1, search_qps_verified: false, paid_posture: false,
+      },
+    });
+    expect(withConcurrency.concurrency).toEqual({
+      v1TechnicalParallelism: 4, v2MaxActiveWorkers: 3, providerMaxConcurrency: 2,
+      providerOrganizationCeiling: 32, providerEffectiveConcurrency: 2,
+      v1ProviderAdmitted: 2, v2ProviderAdmitted: 2,
+      maxConcurrentRunsPerUser: 1, maxConcurrentRunsPerProject: 1,
+      searchBasicQps: 1, searchProQps: 1, searchQpsVerified: false, paidPosture: false,
+    });
+    expect(parseRunLimits({ concurrency: null }).concurrency).toBeUndefined();
+    expect(parseRunLimits({ concurrency: { v2_max_active_workers: -8 } }).concurrency?.v2MaxActiveWorkers).toBeUndefined();
     expect(parseRunLimits({ max_cost_per_run: -1 })).toEqual({ maxModelCalls: undefined, maxTotalTokens: undefined, maxCost: undefined, maxDurationSeconds: undefined, maxAgentSteps: undefined });
     expect(initialWorkspaceState.events).toEqual([]);
   });

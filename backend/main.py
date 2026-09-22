@@ -25,6 +25,7 @@ from backend.schemas import (
     CatalogReviewPage,
     Conversation,
     ConversationCreate,
+    EffectiveConcurrency,
     HealthResponse,
     Project,
     ProposalCreate,
@@ -206,6 +207,55 @@ def _project_product_outcome(event: object) -> ProductOutcomeRecord | None:
         return None
 
 
+def _effective_concurrency() -> EffectiveConcurrency | None:
+    """The concurrency this deployment really runs at, from server-owned truth.
+
+    Resolved from the ONE canonical runtime policy (`resolve_runtime_policy`),
+    the provider configuration it yields, and the organization ceiling
+    (`QuotaConfig`). The provider-admitted widths are computed exactly as the
+    engines compute them: Swarm V2 runs
+    ``min(configured active workers, provider concurrency)`` and V1 runs its
+    technical units through the same per-process provider profile. A policy
+    that refuses to resolve (a misconfigured paid deployment) states ``None``
+    rather than a plausible number.
+    """
+    from backend.provider_quota import (SEARCH_BASIC, SEARCH_PRO, SEARCH_QPS_VERIFIED,
+                                        QuotaConfig)
+    from backend.runtime_policy import RuntimePolicyError, resolve_runtime_policy
+
+    try:
+        policy = resolve_runtime_policy()
+        provider = policy.provider_limits()
+        budget = policy.budget_config()
+    except (RuntimePolicyError, ValueError):
+        return None
+    try:
+        organization = QuotaConfig.from_env()
+        ceiling: int | None = int(organization.max_concurrency)
+        search_basic, search_pro = (int(organization.search_qps[0]), int(organization.search_qps[1]))
+    except ValueError:
+        ceiling, search_basic, search_pro = None, None, None
+    v1 = int(policy.v1_technical_parallelism)
+    v2 = int(policy.swarm_max_active_workers)
+    per_process = int(provider.max_concurrency)
+    effective = per_process if ceiling is None else min(per_process, ceiling)
+    return EffectiveConcurrency(
+        v1_technical_parallelism=v1,
+        v2_max_active_workers=v2,
+        provider_max_concurrency=per_process,
+        provider_organization_ceiling=ceiling,
+        provider_effective_concurrency=effective,
+        v1_provider_admitted=min(v1, effective),
+        v2_provider_admitted=min(v2, effective),
+        max_concurrent_runs_per_user=budget.max_concurrent_runs_per_user,
+        max_concurrent_runs_per_project=budget.max_concurrent_runs_per_project,
+        search_basic_qps=search_basic,
+        search_pro_qps=search_pro,
+        search_qps_verified=bool(SEARCH_QPS_VERIFIED[SEARCH_BASIC] and SEARCH_QPS_VERIFIED[SEARCH_PRO]),
+        paid_posture=bool(policy.paid),
+    )
+
+
 def _run_limits() -> RunLimits | None:
     """The per-run ceilings this deployment enforces, as plain numbers."""
     try:
@@ -218,6 +268,7 @@ def _run_limits() -> RunLimits | None:
         max_cost_per_run=config.max_cost_per_run,
         max_run_duration_seconds=config.max_run_duration_seconds,
         max_agent_steps=config.max_agent_steps,
+        concurrency=_effective_concurrency(),
     )
     return limits if limits.model_dump(exclude_none=True) else None
 
@@ -551,6 +602,38 @@ def create_run(conversation_id: UUID, request: RunCreate, user: AuthenticatedUse
 @app.get("/runs/{run_id}", response_model=Run)
 def get_run(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
     return _safe_run_response(repo.get_run(run_id, user_id=user.user_id), repo)
+
+
+@app.get("/runs/{run_id}/export")
+def export_run(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    """The canonical export of ONE finished run, for the browser.
+
+    A READ over exactly the run named, behind the same membership
+    authorization as `GET /runs/{id}` (a non-member sees 404), wrapped by the
+    one export authority `backend.export_envelope.build_export_envelope`. No
+    export logic lives in the browser: the envelope it downloads is the
+    document this route returned, byte for byte.
+
+    Fail closed, with a static reason: a live run, a run whose immutable
+    identity is absent or unreadable, a non-product workflow, an identity
+    not bound to a release, and a stored Swarm V2 product that is not
+    contract-valid are all refused (409 RUN_NOT_EXPORTABLE). The envelope
+    is re-validated before it leaves, and its usage is the same bounded
+    public projection the run read exposes.
+    """
+    from backend.export_envelope import (ExportRefused, build_export_envelope,
+                                         validate_export_envelope)
+
+    run = repo.get_run(run_id, user_id=user.user_id)
+    try:
+        envelope = build_export_envelope(run)
+        validate_export_envelope(envelope)
+    except ExportRefused as exc:
+        # Every ExportRefused message is a static, code-owned reason.
+        raise AppError("RUN_NOT_EXPORTABLE", f"run cannot be exported: {exc}", 409) from None
+    usage = _safe_run_usage(run.get("usage"))
+    envelope["usage"] = usage.model_dump(mode="json") if usage is not None else {}
+    return envelope
 
 
 #: The most runs one history read returns. The list is for choosing a run to

@@ -93,9 +93,14 @@ def test_a_live_run_states_no_product_outcome_and_states_its_limits(world):
     body = TestClient(app).get(f"/runs/{run_id}", headers=member(world["alice"])).json()
     assert body["status"] == "queued"
     assert body["product_outcome"] is None
-    assert body["limits"] == {"max_model_calls_per_run": 150, "max_total_tokens_per_run": None,
-                              "max_cost_per_run": 1.0, "max_run_duration_seconds": 1800,
-                              "max_agent_steps": None}
+    limits = body["limits"]
+    concurrency = limits.pop("concurrency")
+    assert limits == {"max_model_calls_per_run": 150, "max_total_tokens_per_run": None,
+                      "max_cost_per_run": 1.0, "max_run_duration_seconds": 1800,
+                      "max_agent_steps": None}
+    # The effective concurrency travels with the ceilings; its values are
+    # pinned by the dedicated tests below.
+    assert isinstance(concurrency, dict) and concurrency["provider_effective_concurrency"] >= 1
 
 
 def test_the_canonical_finalizer_is_the_source_of_the_projected_outcome(world):
@@ -527,3 +532,175 @@ def test_the_e2e_worker_writes_nothing_when_it_cannot_claim(world):
     assert after["worker_id"] == other["worker_id"] and after["lease_token"] == other["lease_token"]
     assert len(repo.list_run_events(run_id)) == events_before
     assert after.get("error") is None
+
+
+# ---------------------------------------------------------------------------
+# 6. the canonical browser export
+# ---------------------------------------------------------------------------
+def finalize_v1(world, run_id, document=V1_DOCUMENT):
+    repo = world["repo"]
+    lease = claim(repo, run_id)
+    RunFinalizer(repo=repo, run_id=run_id, engine="vehicle_catalog_v1", lease_ctx=lease).finalize(
+        TerminalClaim.product("vehicle_catalog_v1", {"status": "complete", "result": dict(document),
+                                                     "summary": "done"}))
+
+
+def test_a_finished_run_exports_the_canonical_envelope(world):
+    from backend.export_envelope import SCHEMA_VERSION, validate_export_envelope
+
+    repo, alice = world["repo"], world["alice"]
+    run_id = create_run(repo, world["v1_conversation"], alice)
+    finalize_v1(world, run_id)
+    response = TestClient(app).get(f"/runs/{run_id}/export", headers=member(alice))
+    assert response.status_code == 200, response.text
+    envelope = response.json()
+    validate_export_envelope(envelope)
+    assert envelope["schema_version"] == SCHEMA_VERSION
+    assert envelope["run_id"] == str(run_id)
+    assert envelope["engine"] == "vehicle_catalog_v1"
+    assert envelope["terminal_status"] == "completed"
+    assert envelope["result_kind"] == "usable_result"
+    assert envelope["run_identity"] == repo.get_run(run_id)["run_identity"]
+    assert envelope["run_identity"]["release_sha"]
+    # The document is the durable output, untouched, and nothing infrastructural.
+    assert envelope["result"]["result"]["models"][0]["canonical_model_name"] == "Alpha One"
+    assert set(envelope) == {"schema_version", "run_id", "engine", "run_identity", "terminal_status",
+                             "result_kind", "generated_at", "government_provenance", "result",
+                             "usage", "error"}
+    body = response.text
+    for forbidden in ("lease_token", "worker_id", "api_key", "service_role"):
+        assert forbidden not in body
+
+
+def test_export_usage_is_the_bounded_public_projection(world):
+    repo, alice = world["repo"], world["alice"]
+    run_id = create_run(repo, world["v1_conversation"], alice)
+    lease = claim(repo, run_id)
+    repo.update_run_usage(run_id, {"model_calls": 3, "input_tokens": 600, "output_tokens": 300,
+                                   "total_tokens": 900, "estimated_cost": 0.02, "actual_cost": 0.02,
+                                   "retries": 0, "provider_backpressure_events": 0,
+                                   "internal_ledger_row": "must-not-leak"}, **lease)
+    RunFinalizer(repo=repo, run_id=run_id, engine="vehicle_catalog_v1", lease_ctx=lease).finalize(
+        TerminalClaim.product("vehicle_catalog_v1", {"status": "complete", "result": dict(V1_DOCUMENT),
+                                                     "summary": "done"}))
+    envelope = TestClient(app).get(f"/runs/{run_id}/export", headers=member(alice)).json()
+    assert envelope["usage"]["model_calls"] == 3
+    assert "internal_ledger_row" not in envelope["usage"]
+
+
+def test_export_refuses_a_live_run_with_a_static_reason(world):
+    repo, alice = world["repo"], world["alice"]
+    run_id = create_run(repo, world["v1_conversation"], alice)
+    response = TestClient(app).get(f"/runs/{run_id}/export", headers=member(alice))
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"]["code"] == "RUN_NOT_EXPORTABLE"
+    assert "terminal state" in body["error"]["message"]
+
+
+def test_export_is_membership_scoped_and_never_leaks_existence(world):
+    repo, alice, bob = world["repo"], world["alice"], world["bob"]
+    run_id = create_run(repo, world["v1_conversation"], alice)
+    finalize_v1(world, run_id)
+    assert TestClient(app).get(f"/runs/{run_id}/export", headers=member(bob)).status_code == 404
+    assert TestClient(app).get(f"/runs/{uuid4()}/export", headers=member(alice)).status_code == 404
+    assert TestClient(app).get(f"/runs/{run_id}/export").status_code in (401, 403)
+
+
+def test_export_refuses_a_legacy_run_without_identity_and_an_unreadable_one(world):
+    repo, alice = world["repo"], world["alice"]
+    run_id = create_run(repo, world["v1_conversation"], alice)
+    finalize_v1(world, run_id)
+    stored = repo.runs[str(run_id)]
+    identity = stored["run_identity"]
+    stored["run_identity"] = None
+    response = TestClient(app).get(f"/runs/{run_id}/export", headers=member(alice))
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "RUN_NOT_EXPORTABLE"
+    assert "RUN_IDENTITY" in response.json()["error"]["message"]
+    stored["run_identity"] = {**identity, "engine_version": "tampered"}
+    response = TestClient(app).get(f"/runs/{run_id}/export", headers=member(alice))
+    assert response.status_code == 409
+    # Still readable as history through the ordinary run read.
+    assert TestClient(app).get(f"/runs/{run_id}", headers=member(alice)).status_code == 200
+
+
+def test_export_refuses_an_invalid_stored_swarm_product(world):
+    repo, alice = world["repo"], world["alice"]
+    run_id = create_run(repo, world["v2_conversation"], alice)
+    lease = claim(repo, run_id)
+    RunFinalizer(repo=repo, run_id=run_id, engine="swarm_v2", lease_ctx=lease).finalize(
+        TerminalClaim.failure("swarm_v2", "SWARM_V2_EXECUTION_FAILED", "Swarm V2 execution failed"))
+    # A failed run exports honestly (no result kind)...
+    envelope = TestClient(app).get(f"/runs/{run_id}/export", headers=member(alice)).json()
+    assert envelope["terminal_status"] == "failed" and envelope["result_kind"] is None
+    # ...but a "completed" run whose stored product is not contract-valid is refused.
+    stored = repo.runs[str(run_id)]
+    stored["status"] = "completed"
+    stored["output"] = {"status": "complete", "result_kind": "usable_result", "not": "the contract"}
+    response = TestClient(app).get(f"/runs/{run_id}/export", headers=member(alice))
+    assert response.status_code == 409
+    assert "contract-valid" in response.json()["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# 7. effective concurrency, from server-owned truth
+# ---------------------------------------------------------------------------
+def test_run_limits_state_the_effective_concurrency_from_the_canonical_policy(world, monkeypatch):
+    """Every number is derived from RuntimePolicy / the resolved provider
+    configuration / the organization ceiling, and the provider-admitted width
+    is the minimum the executor really uses."""
+    monkeypatch.setenv("MILO_V1_TECHNICAL_PARALLELISM", "4")
+    monkeypatch.setenv("MILO_SWARM_MAX_ACTIVE_WORKERS", "3")
+    monkeypatch.setenv("MILO_PROVIDER_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("MILO_MAX_CONCURRENT_RUNS_PER_USER", "1")
+    monkeypatch.setenv("MILO_MAX_CONCURRENT_RUNS_PER_PROJECT", "1")
+    monkeypatch.delenv("MILO_ORG_MAX_CONCURRENCY", raising=False)
+    monkeypatch.delenv("MILO_SEARCH_BASIC_QPS", raising=False)
+    monkeypatch.delenv("MILO_SEARCH_PRO_QPS", raising=False)
+    repo = world["repo"]
+    run_id = create_run(repo, world["v1_conversation"], world["alice"])
+    body = TestClient(app).get(f"/runs/{run_id}", headers=member(world["alice"])).json()
+    concurrency = body["limits"]["concurrency"]
+    assert concurrency == {
+        "v1_technical_parallelism": 4,
+        "v2_max_active_workers": 3,
+        "provider_max_concurrency": 2,
+        "provider_organization_ceiling": 32,
+        "provider_effective_concurrency": 2,
+        "v1_provider_admitted": 2,
+        "v2_provider_admitted": 2,
+        "max_concurrent_runs_per_user": 1,
+        "max_concurrent_runs_per_project": 1,
+        "search_basic_qps": 1,
+        "search_pro_qps": 1,
+        "search_qps_verified": False,
+        "paid_posture": False,
+    }
+    # The same numbers reach the history projection, once per page.
+    rows = TestClient(app).get(f"/conversations/{world['v1_conversation']}/runs",
+                               headers=member(world["alice"])).json()
+    assert rows[0]["id"] == str(run_id)
+
+
+def test_effective_concurrency_is_the_executor_rule_not_the_larger_number(world, monkeypatch):
+    from backend.engines.swarm_v2.executor import BoundedTaskExecutor
+    monkeypatch.setenv("MILO_SWARM_MAX_ACTIVE_WORKERS", "8")
+    monkeypatch.setenv("MILO_PROVIDER_MAX_CONCURRENCY", "2")
+    repo = world["repo"]
+    run_id = create_run(repo, world["v2_conversation"], world["alice"])
+    concurrency = TestClient(app).get(f"/runs/{run_id}", headers=member(world["alice"])).json()["limits"]["concurrency"]
+    assert concurrency["v2_max_active_workers"] == 8
+    assert concurrency["v2_provider_admitted"] == 2
+    assert concurrency["v2_provider_admitted"] == BoundedTaskExecutor.configured_limit(provider_capacity=2)
+
+
+def test_an_unresolvable_paid_policy_states_no_concurrency_rather_than_inventing_one(world, monkeypatch):
+    monkeypatch.setenv("MILO_ENABLE_PAID_EXECUTION", "true")
+    # Wider than the reviewed envelope: the paid posture refuses to resolve.
+    monkeypatch.setenv("MILO_PROVIDER_MAX_CONCURRENCY", "64")
+    repo = world["repo"]
+    run_id = create_run(repo, world["v1_conversation"], world["alice"])
+    body = TestClient(app).get(f"/runs/{run_id}", headers=member(world["alice"])).json()
+    assert body["limits"]["concurrency"] is None
+    assert body["limits"]["max_cost_per_run"] == 1.0

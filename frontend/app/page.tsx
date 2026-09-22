@@ -45,6 +45,7 @@ import { TaskComposer } from '@/components/conversation/TaskComposer';
 import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector';
 import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
 import { FinalResultPanel } from '@/components/result/FinalResultPanel';
+import { RunExportControl } from '@/components/result/RunExportControl';
 import { VehicleCatalogResultPanel } from '@/components/result/VehicleCatalogResultPanel';
 import { LiveRunPanel } from '@/components/run/LiveRunPanel';
 import { RunHistoryList } from '@/components/run/RunHistoryList';
@@ -945,6 +946,13 @@ export default function WorkspacePage() {
             This run has no trustworthy immutable engine identity. Engine-specific result rendering is disabled.
           </p>
         )}
+        {/* The canonical export: server-built, retrieved for a terminal run
+            whose identity is trustworthy. The server refuses everything else. */}
+        <RunExportControl
+          visible={executionUi && activeConversation !== undefined && activeRunId !== undefined}
+          runId={activeRunId}
+          eligible={runIsTerminal && live.engine !== undefined}
+        />
         <RunHistoryList
           visible={executionUi && activeConversation !== undefined}
           runs={runHistory}

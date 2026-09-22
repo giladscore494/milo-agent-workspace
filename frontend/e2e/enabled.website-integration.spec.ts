@@ -125,3 +125,27 @@ test('W7. the run history read is a membership-scoped, bounded GET through the g
   });
   expect([404, 422]).toContain(tooMany.status());
 });
+
+test('W8. a finished run exports the canonical server-built envelope through the gateway', async ({ page }) => {
+  await runTask(page, 'Alpha Research', 'w8-export', 'produce the final report');
+  await expect(page.getByRole('region', { name: 'Final result' }).getByText('Canonical verdict: Complete')).toBeVisible(TERMINAL);
+  const exportPanel = page.getByRole('region', { name: 'Export' });
+  await exportPanel.getByRole('button', { name: 'Export run (JSON)' }).click();
+  const ready = exportPanel.getByRole('status');
+  await expect(ready).toContainText('Export ready.');
+  await expect(ready).toContainText('vehicle_catalog_v1');
+  await expect(ready).toContainText('completed');
+  await expect(ready).toContainText('usable_result');
+  await expect(exportPanel.getByRole('link', { name: 'Download JSON' })).toHaveAttribute('download', /^milo-run-.*\.json$/);
+  // The live view states the server-derived effective concurrency, both widths.
+  const live = page.getByRole('region', { name: 'Live execution' });
+  await expect(live.getByText('V1 technical parallelism (logical)')).toBeVisible();
+  await expect(live.getByText('V1 provider-admitted')).toBeVisible();
+});
+
+test('W9. the export is a GET-only, membership-scoped read', async ({ request }) => {
+  const anonymous = await request.get('/api/gateway/runs/00000000-0000-4000-8000-000000000000/export');
+  expect(anonymous.status()).toBe(401);
+  const posted = await request.post('/api/gateway/runs/00000000-0000-4000-8000-000000000000/export');
+  expect([403, 404, 405]).toContain(posted.status());
+});
