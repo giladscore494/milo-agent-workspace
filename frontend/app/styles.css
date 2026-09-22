@@ -1214,3 +1214,48 @@ textarea { resize: vertical; min-height: 4.5rem; }
 .run-history-verdict { font-size: 0.8rem; color: var(--muted); }
 .run-history-time { font-size: 0.75rem; color: var(--muted); margin-left: auto; }
 .developer-output { margin-top: 0.75rem; }
+
+/*
+ * The Mapping Plan. An ordered list, a small form and a directory. Like the
+ * catalog surface above, it reads correctly with this stylesheet absent: the
+ * order, the coverage wording and every control's name are TEXT.
+ */
+.mapping-plan-units,
+.mapping-plan-directory,
+.mapping-plan-history,
+.mapping-plan-notes {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.mapping-plan-notes li,
+.mapping-plan-history li { overflow-wrap: anywhere; font-size: 0.85rem; }
+
+.mapping-plan-unit,
+.mapping-plan-entry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.4rem 0.6rem;
+  min-width: 0;
+}
+
+.mapping-plan-unit-name { font-weight: 600; overflow-wrap: anywhere; }
+.mapping-plan-unit .button-row { margin-left: auto; }
+.mapping-plan-entry > span:first-child { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; }
+
+.mapping-plan-directory { max-height: 22rem; overflow-y: auto; }
+
+.mapping-plan-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.6rem;
+  min-width: 0;
+}

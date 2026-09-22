@@ -71,6 +71,27 @@ const SAFE_RULES: GatewayRule[] = [
     method: 'GET',
     path: new RegExp(`^/projects/${UUID}/catalog/review-candidates$`, 'i'),
   },
+
+  /**
+   * The Mapping Plan's three READS: whether the surface applies to the
+   * project, the reviewed manufacturer directory with its coverage, and the
+   * conversation's open plan. SAFE for the reason the CODE-3 reads are: they
+   * write nothing and launch nothing, and the backend gates each on
+   * membership. Three exact paths, GET only; the two WRITES are execution
+   * rules below.
+   */
+  {
+    method: 'GET',
+    path: new RegExp(`^/projects/${UUID}/work-scope/capabilities$`, 'i'),
+  },
+  {
+    method: 'GET',
+    path: new RegExp(`^/projects/${UUID}/work-scope/directory$`, 'i'),
+  },
+  {
+    method: 'GET',
+    path: new RegExp(`^/conversations/${UUID}/work-scopes/open$`, 'i'),
+  },
 ];
 
 const EXECUTION_RULES: GatewayRule[] = [
@@ -83,6 +104,12 @@ const EXECUTION_RULES: GatewayRule[] = [
   { method: 'POST', path: new RegExp(`^/conversations/${UUID}/runs$`, 'i') },
   { method: 'POST', path: new RegExp(`^/workflow-proposals/${UUID}/runs$`, 'i') },
   { method: 'POST', path: new RegExp(`^/runs/${UUID}/cancel$`, 'i') },
+  // The Mapping Plan writes: create a conversation's plan, and revise it. A
+  // plan is a draft that executes nothing, but it is durable state a browser
+  // writes, so it waits for the execution stage like every other write here
+  // (and the backend's MILO_ENABLE_WORK_SCOPE_MUTATIONS gates it again).
+  { method: 'POST', path: new RegExp(`^/conversations/${UUID}/work-scopes$`, 'i') },
+  { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/revisions$`, 'i') },
 ];
 
 const RUN_CREATION_RULES = [
