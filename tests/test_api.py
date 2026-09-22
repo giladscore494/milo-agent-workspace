@@ -6,6 +6,7 @@ from backend.dependencies import get_job_launcher, get_repository
 from backend.errors import AppError, NotFoundError
 from backend.main import app
 from backend.run_identity import RunIdentity
+from backend.testing.memory_repository import MemoryRepository
 
 
 class FakeRepo:
@@ -41,7 +42,7 @@ class FakeRepo:
     def list_projects(self, user_id=None):
         self._fail(); return [self.project()] if user_id == self.user_id else []
     def project(self):
-        return {"id": self.project_id, "slug": "milo-vehicle-catalog", "name": "MILO Vehicle Catalog", "workflow_key": "vehicle_catalog_v1", "configuration": {}}
+        return {"id": self.project_id, "slug": "milo-vehicle-catalog", "name": "MILO Vehicle Catalog", "workflow_key": "vehicle_catalog_v1", "configuration": dict(MemoryRepository.CANONICAL_V1_CONFIGURATION)}
     def get_project(self, project_id, user_id=None):
         self._fail()
         if (user_id is not None and user_id != self.user_id) or UUID(str(project_id)) != self.project_id: raise NotFoundError("project", str(project_id))

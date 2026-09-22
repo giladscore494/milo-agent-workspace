@@ -57,6 +57,9 @@ from backend.run_identity import (
 )
 from backend.runtime import TERMINAL_STATES
 from backend.finalization import RunFinalizer, TerminalClaim
+from backend.vehicle_catalog_scope import (SCOPE_METADATA_KEY, VehicleCatalogScopeError,
+                                           refuse_supplied_scope,
+                                           scope_from_project_configuration)
 from backend.product_outcome import ProductOutcomeError, outcome_from_record
 from backend.worker_auth import WorkerIdentity, get_verified_worker
 from backend.workflow_proposals import compile_proposal, ensure_approved
@@ -337,6 +340,14 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
     enforce_rate_limit("run_creation_user", str(user.user_id))
     project_id = repo.get_conversation(conversation_id).get("project_id")
     enforce_rate_limit("run_creation_project", str(project_id or conversation_id))
+    # The Vehicle Catalog scope is resolved by the SERVER from the project's
+    # own configuration and bound below. A request that tries to name it is
+    # refused before anything is read or written, so the value a run carries
+    # under that key can only ever be the one this function put there.
+    try:
+        refuse_supplied_scope(metadata)
+    except VehicleCatalogScopeError as exc:
+        raise AppError(exc.code, exc.safe_message, 422) from None
     fingerprint = _request_fingerprint(content, metadata)
     config = BudgetConfig.from_env()
     run = None
@@ -363,6 +374,18 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
 
         project = repo.get_project(project_id) if project_id else {}
         workflow_key = project.get("workflow_key")
+        if workflow_key == "vehicle_catalog_v1":
+            # V1 maps exactly the scope its PROJECT configures -- the trusted
+            # relation, the same one the run's workflow is read from. It is
+            # bound into the run in the creation transaction below, so it is
+            # immutable afterwards. A project that configures no valid scope
+            # is refused HERE, before any message, run or launch exists,
+            # rather than silently mapping the engine defaults.
+            try:
+                scope = scope_from_project_configuration(project.get("configuration"))
+            except VehicleCatalogScopeError as exc:
+                raise AppError(exc.code, exc.safe_message, 409) from None
+            metadata[SCOPE_METADATA_KEY] = scope.as_record()
         new_run_id = uuid4()
         try:
             identity = RunIdentity.bind(new_run_id, str(workflow_key or ""))

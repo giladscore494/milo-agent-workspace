@@ -8,6 +8,7 @@ production entrypoints.
 
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import secrets
@@ -137,14 +138,30 @@ class MemoryRepository:
     def seed_user(self, user_id: str) -> None:
         self.users.add(user_id)
 
+    #: The configuration the canonical V1 project is seeded with in
+    #: `001_project_workspace.sql` -- and carries in Production. A V1 project's
+    #: configuration is the trusted source of what its runs map
+    #: (`backend/vehicle_catalog_scope.py`), so a seeded V1 project states one
+    #: exactly as the real one does.
+    CANONICAL_V1_CONFIGURATION: dict[str, Any] = {
+        "manufacturer": "Hyundai", "market": "Israel",
+        "period": {"from": "2010", "to": "June 2026"},
+    }
+
     def seed_project(self, project_id: str, slug: str, name: str, members: list[str],
-                     workflow_key: str = "vehicle_catalog_v1") -> None:
+                     workflow_key: str = "vehicle_catalog_v1",
+                     configuration: dict[str, Any] | None = None) -> None:
         # `workflow_key` is TRUSTED project state: the frontend selects its run
         # and result surfaces from it and never from a payload. It defaults to
-        # the V1 engine, so every existing caller is unchanged.
+        # the V1 engine, so every existing caller is unchanged. So is
+        # `configuration`: a V1 project defaults to the canonical scope, and a
+        # test that needs an unconfigured one says so explicitly.
+        if configuration is None:
+            configuration = (copy.deepcopy(self.CANONICAL_V1_CONFIGURATION)
+                             if workflow_key == "vehicle_catalog_v1" else {})
         self.projects[project_id] = {
             "id": project_id, "slug": slug, "name": name, "description": None,
-            "workflow_key": workflow_key, "configuration": {},
+            "workflow_key": workflow_key, "configuration": configuration,
             "created_at": _now(), "updated_at": _now(),
         }
         for user_id in members:

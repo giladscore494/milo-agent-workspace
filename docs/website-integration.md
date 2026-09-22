@@ -13,7 +13,9 @@ browser (frontend/app/page.tsx startRun)
   → POST /api/gateway/conversations/{id}/runs        (frontend/app/api/gateway/[...path]/route.ts)
   → POST /conversations/{id}/runs                     (backend/main.py create_run)
   → _create_and_launch_run                            (backend/main.py)
-      rate limit → idempotency lookup → project.workflow_key (TRUSTED relation)
+      rate limit → reserved-scope refusal → idempotency lookup → project.workflow_key (TRUSTED relation)
+      → V1 only: project.configuration → VehicleCatalogScope (backend/vehicle_catalog_scope.py)
+        bound into input.metadata.vehicle_catalog_scope, or 409 before anything is written
       → RunIdentity.bind(run_id, workflow_key)        (backend/run_identity.py)
       → execution_identity_problems(identity)          (release/policy/registry must match the image)
       → repo.create_message_and_run(..., run_id, run_identity)
@@ -28,6 +30,48 @@ browser (frontend/app/page.tsx startRun)
   → GET /runs/{id}  { status, output, run_identity, product_outcome, limits, usage }
   → frontend result surface selected from run_identity only
 ```
+
+### What a Vehicle Catalog V1 run maps
+
+A V1 run maps exactly the manufacturer, market and period its PROJECT
+configures, and nothing else (`backend/vehicle_catalog_scope.py`):
+
+* **Source.** `projects.configuration`
+  `{"manufacturer", "market", "period": {"from", "to"}}` — server-owned, read
+  through the same trusted run → conversation → project relation the workflow
+  key comes from. The typed task (`content`) is the task description and is
+  never parsed for a scope; request `metadata` can never name one.
+* **Bound at creation.** `_create_and_launch_run` validates it and writes the
+  record under the reserved key `input.metadata.vehicle_catalog_scope` inside
+  the same atomic V3 insert as the message, run and identity. A request that
+  supplies that key is refused (`422 VEHICLE_CATALOG_SCOPE_RESERVED`), so the
+  stored value can only be the server's. The request fingerprint is computed
+  over the client's own `(content, metadata)`, so an idempotent replay is still
+  the same logical request, and it returns the run with the scope it was
+  created with even if the project was reconfigured since.
+* **Explicit refusal, never a default.** A V1 project whose configuration
+  states no scope is refused with `409 VEHICLE_CATALOG_SCOPE_NOT_CONFIGURED`,
+  one that states it wrongly with `409 VEHICLE_CATALOG_SCOPE_INVALID`, before
+  any message, run or launch exists.
+* **Executed exactly.** The worker re-validates the bound record and hands it
+  to `VehicleCatalogV1Adapter` explicitly; a V1 run without a readable bound
+  scope is refused through the canonical finalizer
+  (`VEHICLE_CATALOG_SCOPE_MISSING` / `_INVALID`) before any provider path is
+  constructed. The adapter reads no scope from run input and has no default.
+* **Unchanged for the canonical project.** `milo-vehicle-catalog` is seeded
+  with `Hyundai / Israel / 2010 – June 2026` (`001_project_workspace.sql`),
+  which resolves to exactly the configuration the engine always ran with, so
+  its prompts are unchanged.
+
+Before this, the adapter read top-level `input.manufacturer/market/period`,
+which no creator ever wrote, and silently fell back to the engine defaults —
+every website V1 run was a Hyundai run whatever its project said.
+
+**Operator note.** The Production V1 smoke projects `stage-c-smoke` and
+`stage-d-smoke` carry `{"stage": ...}` only. Their V1 runs used to run the
+engine defaults implicitly; they are now refused until their configuration
+states an explicit scope. That is a Production data change for an operator,
+not something a release performs.
 
 There is exactly one creation authority. `create_message_and_run` and
 `create_message_and_run_v2` no longer exist in Production (applied

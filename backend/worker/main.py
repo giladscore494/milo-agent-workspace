@@ -659,6 +659,28 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     latest_checkpoint = None
 
         # =============================================================
+        # Vehicle Catalog V1 scope -- AFTER the lease, BEFORE the provider.
+        #
+        # V1 maps exactly the scope the API bound into the run at creation
+        # from the project's own configuration (`backend/vehicle_catalog_scope`).
+        # It is re-validated here and handed to the adapter explicitly; the
+        # adapter no longer reads a scope from run input and no longer falls
+        # back to the engine defaults. A run without a readable bound scope is
+        # refused through the canonical finalizer before any provider path
+        # exists, so it can never quietly become a run of some other scope.
+        # The zero-cost mock engine maps nothing and is left alone.
+        v1_scope = None
+        if workflow_key == "vehicle_catalog_v1" and engine is None and engine_registry is None \
+                and engine_mode != "mock":
+            from backend.vehicle_catalog_scope import VehicleCatalogScopeError, scope_from_run
+
+            try:
+                v1_scope = scope_from_run(run)
+            except VehicleCatalogScopeError as exc:
+                finalizer.finalize(TerminalClaim.refusal(workflow_key, exc.code, exc.safe_message))
+                return 1
+
+        # =============================================================
         # THE provider authority for this worker process. ONE instance,
         # built once, handed to WHICHEVER engine runs -- and to both of
         # them when a process serves both. Everything a provider request
@@ -762,6 +784,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 provider_coordinator=provider_coordinator,
                 provider_adapter=provider_adapter,
                 evidence_authority=build_v1_evidence_authority(),
+                # The run's bound, re-validated scope -- the ONLY scope source.
+                scope=v1_scope,
             )
             def make_swarm_engine():
                 from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander,

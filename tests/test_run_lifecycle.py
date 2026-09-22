@@ -9,6 +9,7 @@ from backend.dependencies import get_job_launcher, get_repository
 from backend.errors import AppError, NotFoundError
 from backend.main import app
 from backend.runtime import TERMINAL_STATES, VALID_TRANSITIONS, InvalidTransition, validate_transition
+from backend.testing.memory_repository import MemoryRepository
 
 
 class StatefulRepo:
@@ -27,7 +28,9 @@ class StatefulRepo:
     def get_project(self, project_id, user_id=None):
         if user_id is not None and UUID(str(user_id)) != self.user_id:
             raise NotFoundError("project", str(project_id))
-        return {"id": self.project_id, "slug": "p", "name": "P", "workflow_key": "vehicle_catalog_v1", "configuration": {}}
+        return {"id": self.project_id, "slug": "p", "name": "P", "workflow_key": "vehicle_catalog_v1",
+                # A V1 project states the scope its runs map, as the real one does.
+                "configuration": dict(MemoryRepository.CANONICAL_V1_CONFIGURATION)}
 
     def get_conversation(self, conversation_id, user_id=None):
         if user_id is not None and UUID(str(user_id)) != self.user_id:

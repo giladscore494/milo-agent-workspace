@@ -497,6 +497,7 @@ def test_provider_key_only_from_worker_environment(monkeypatch):
 
 def test_run_input_api_key_is_ignored(monkeypatch):
     from backend.engines.vehicle_catalog_v1.adapter import VehicleCatalogV1Adapter
+    from backend.vehicle_catalog_scope import VehicleCatalogScope
 
     monkeypatch.delenv("KIMI_API_KEY", raising=False)
     monkeypatch.setenv("MOONSHOT_API_KEY", "env-key-wins")
@@ -507,7 +508,8 @@ def test_run_input_api_key_is_ignored(monkeypatch):
             captured["api_key"] = config.api_key
             return {"status": "failed", "error": {"code": "SPY", "message": "spy"}}
 
-    adapter = VehicleCatalogV1Adapter()
+    adapter = VehicleCatalogV1Adapter(scope=VehicleCatalogScope(
+        manufacturer="Hyundai", market="Israel", period_from="2010", period_to="June 2026"))
     adapter.engine = SpyEngine()
     adapter.run({"input": {"api_key": "attacker-supplied-key", "content": "x"}})
     assert captured["api_key"] == "env-key-wins"
