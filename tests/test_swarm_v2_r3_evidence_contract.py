@@ -1035,8 +1035,10 @@ def test_no_yeda_or_web_tool_is_registered_or_mapped_and_the_sink_is_routed():
     # ENABLED shape is unchanged -- same one tool, same sink, same pipeline --
     # and the behavioural enabled/disabled contract is proven against the real
     # worker in `tests/test_catalog_execution_flag.py`.
-    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])"
-            in worker_main)
+    # Pinned to the snapshot the Government preparation stage resolved after
+    # the lease: still exactly one READ tool, still the wrapper, never the reader.
+    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)] "
+            "if government_read_enabled else [])") in " ".join(worker_main.split())
     assert "tool_result_sink=evidence_sink" in worker_main
     assert "RegisteredOperationEvidenceSink(" in worker_main
     # With the catalog off the sink is built over an EMPTY mapper registry, so
