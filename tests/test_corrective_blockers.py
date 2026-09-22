@@ -53,7 +53,13 @@ def _seed_memory_run(status="queued"):
     repo.seed_project(str(project_id), "lease-fixture", "Lease fixture", [])
     conversation = repo.create_conversation(project_id, "Lease fixture")
     run_id = uuid4()
-    repo.runs[str(run_id)] = {"id": str(run_id), "conversation_id": conversation["id"], "status": status, "input": {"content": "x"}, "attempt": 1}
+    # Seeded directly because the atomic creator only produces `queued` runs
+    # and these tests need other claimable statuses -- but WITH the immutable
+    # identity every executable run is born with: `claim_run` mirrors
+    # `claim_run_lease`, which matches no identity-less row.
+    repo.runs[str(run_id)] = {"id": str(run_id), "conversation_id": conversation["id"], "status": status,
+                              "input": {"content": "x"}, "attempt": 1,
+                              "run_identity": RunIdentity.bind(run_id, "vehicle_catalog_v1").as_record()}
     return repo, run_id
 
 

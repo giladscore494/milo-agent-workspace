@@ -1209,8 +1209,12 @@ def test_the_projection_is_still_not_a_tool_and_the_registration_is_a_wrapper():
     # What the flag cannot change is WHICH object gets registered: disabled it
     # is nothing at all, enabled it is the Tool wrapper and never the reader.
     worker = Path("backend/worker/main.py").read_text(encoding="utf-8")
-    assert ("tools = ToolRegistry([GovernmentVehicleTool(repo)] if government_read_enabled else [])"
-            in worker)
+    # The registration is PINNED to the snapshot the Government preparation
+    # stage resolved after the lease, so every read of the run answers from
+    # one immutable snapshot; it is still the Tool wrapper, never the reader.
+    collapsed = " ".join(worker.split())
+    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)] "
+            "if government_read_enabled else [])") in collapsed
     assert "GovernmentCatalogProjection" not in worker
     assert "GovernmentCatalogQuery" not in worker
     assert "DataGovClient" not in worker
