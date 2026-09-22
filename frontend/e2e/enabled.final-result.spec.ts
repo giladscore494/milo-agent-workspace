@@ -208,13 +208,18 @@ test('F4-7. the result is reachable by keyboard alone', async ({ page }) => {
   await expect(result.locator('details.final-result-provenance').first()).toHaveAttribute('open', '');
 });
 
-test('F4-8. V1 regression: a vehicle_catalog_v1 run keeps its existing output path', async ({ page }) => {
+test('F4-8. V1 routing: a vehicle_catalog_v1 run gets the typed Vehicle Catalog surface, never the Swarm V2 one', async ({ page }) => {
   await runTask(page, 'Alpha Research', 'f4-v1-control', 'produce the final report');
 
   await expect(page.getByText(/Run finished with status/)).toBeVisible(TERMINAL);
-  // The V1 sanitized-output panel is untouched…
-  await expect(page.getByRole('heading', { name: 'Final artifacts' })).toBeVisible();
-  await expect(page.getByText(/E2E mocked output/)).toBeVisible();
-  // …and the typed Swarm V2 surface never appears for it.
-  await expect(page.getByRole('region', { name: 'Final result' })).toHaveCount(0);
+  // The V1 product surface is the typed catalog panel, selected from the
+  // run's immutable identity…
+  const result = page.getByRole('region', { name: 'Final result' });
+  await expect(result.getByText('Vehicle Catalog V1 product result')).toBeVisible();
+  await expect(result.getByText(/E2E mocked output/)).toBeVisible();
+  await expect(result.getByRole('heading', { name: 'Models (2)' })).toBeVisible();
+  // …the raw JSON dump is gone from the product surface…
+  await expect(page.getByRole('heading', { name: 'Final artifacts' })).toHaveCount(0);
+  // …and the Swarm V2 surface never appears for it.
+  await expect(page.getByText('Swarm V2 product result')).toHaveCount(0);
 });

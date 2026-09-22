@@ -1,5 +1,5 @@
 'use client';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, executionUiEnabled, newIdempotencyKey } from '@/lib/api';
 import { safeErrorText } from '@/lib/errorText';
 import {
@@ -19,6 +19,8 @@ import {
 } from '@/lib/ownership';
 import { getCurrentSession, onAuthStateChange, signInWithSupabase, signOutFromSupabase, SupabaseSession } from '@/lib/supabaseClient';
 import { isTerminalRunStatus, isPartialSuccessRunStatus } from '@/lib/runStatus';
+import { buildLiveRunViewModel } from '@/lib/liveRunViewModel';
+import { parseProductOutcome } from '@/lib/productOutcome';
 import { useRunRealtime } from '@/lib/useRunRealtime';
 import {
   CanonicalCatalogPage,
@@ -26,6 +28,7 @@ import {
   Conversation,
   Project,
   Proposal,
+  RunSummary,
 } from '@/lib/types';
 import {
   CATALOG_PAGE_SIZE,
@@ -42,8 +45,10 @@ import { TaskComposer } from '@/components/conversation/TaskComposer';
 import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector';
 import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
 import { FinalResultPanel } from '@/components/result/FinalResultPanel';
+import { VehicleCatalogResultPanel } from '@/components/result/VehicleCatalogResultPanel';
+import { LiveRunPanel } from '@/components/run/LiveRunPanel';
+import { RunHistoryList } from '@/components/run/RunHistoryList';
 import { CurrentRunPanel } from '@/components/run/CurrentRunPanel';
-import { RunOutputPanel } from '@/components/run/RunOutputPanel';
 import { SwarmRunCard } from '@/components/swarm/SwarmRunCard';
 import { WorkspaceShell } from '@/components/workspace/WorkspaceShell';
 import { WorkspaceSidebar } from '@/components/workspace/WorkspaceSidebar';
@@ -168,6 +173,13 @@ export default function WorkspacePage() {
   const [runError, setRunError] = useState('');
   const [submittingRun, setSubmittingRun] = useState<PendingRequest>();
   const [activeRunId, setActiveRunId] = useState<string>();
+  // The conversation's DURABLE run history (GET /conversations/{id}/runs).
+  // Session storage only remembers the run this browser started; the history
+  // is what survives a browser restart and lets any earlier result be
+  // reopened. Scoped to the conversation, like the run itself.
+  const [runHistory, setRunHistory] = useState<RunSummary[]>();
+  const [runHistoryLoading, setRunHistoryLoading] = useState(false);
+  const [runHistoryError, setRunHistoryError] = useState('');
   // One key per LOGICAL submission: this session, this conversation, this
   // content. A key held for a different one is not a retry of this one.
   const idempotencyKey = useRef<{ key: string; owner: WorkspaceScope; content: string }>();
@@ -241,6 +253,17 @@ export default function WorkspacePage() {
   );
   const agents = Object.values(state.agents);
   const runStatus = state.run?.status;
+  // The unified live view and the canonical verdict, both derived (never
+  // stored) from the run row and the reduced event projections, so they reset
+  // with the workspace state on every run switch.
+  const live = useMemo(
+    () => buildLiveRunViewModel({ runId: activeRunId, state, swarm }),
+    [activeRunId, state, swarm],
+  );
+  const productOutcome = useMemo(
+    () => parseProductOutcome(state.run?.product_outcome),
+    [state.run?.product_outcome],
+  );
   const launchState = state.run?.launch_state;
   const launchReconciliationRequired = state.run?.launch_reconciliation_required;
   const runIsTerminal = isTerminalRunStatus(runStatus);
@@ -256,6 +279,22 @@ export default function WorkspacePage() {
   // invalid states are visible rather than appearing from nowhere.
   const showFinalResult =
     !identityUnavailable && swarm.isSwarmV2 && executionUi && activeConversation !== undefined && activeRunId !== undefined;
+  // The V1 typed result surface, selected by the SAME rule with the other
+  // engine: identity trustworthy, identity says vehicle_catalog_v1. Nothing
+  // in the payload can route a run here, and an untrustworthy identity gets
+  // the bounded alert below instead of either surface.
+  const showVehicleResult =
+    !identityUnavailable && live.engine === 'vehicle_catalog_v1' && executionUi && activeConversation !== undefined && activeRunId !== undefined;
+  const showLiveRun = executionUi && activeConversation !== undefined && activeRunId !== undefined;
+
+  // Once the active run is terminal its canonical outcome is durable; the
+  // history row for it is re-read so the list shows the verdict the finalizer
+  // recorded rather than the status it had when the list was loaded.
+  useEffect(() => {
+    if (!runIsTerminal || !activeConversation) return;
+    loadRunHistory(activeConversation.id, scope.current, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runIsTerminal, activeRunId]);
 
   useEffect(() => {
     let mounted = true;
@@ -307,6 +346,9 @@ export default function WorkspacePage() {
       setConversations(undefined);
       setActiveConversation(undefined);
       setActiveRunId(undefined);
+      setRunHistory(undefined);
+      setRunHistoryError('');
+      setRunHistoryLoading(false);
       setProposal(undefined);
       setProposalError('');
       setConversationError('');
@@ -500,6 +542,45 @@ export default function WorkspacePage() {
     setReviewPage(undefined);
   }, [endCatalogIntent]);
 
+  /**
+   * Read the conversation's durable run history.
+   *
+   * Applied only while the conversation it was issued under is still selected
+   * (`ownsConversation`), exactly like every other conversation-scoped read.
+   * When `openLatest` is set and the workspace holds no run for the
+   * conversation, the newest run is opened — that is how a completed result
+   * is reachable again after a browser restart emptied session storage. The
+   * polling hook then verifies the run against this conversation before
+   * anything is rendered, as it does for a stored id.
+   */
+  const loadRunHistory = useCallback((conversationId: string, owner: WorkspaceScope, openLatest: boolean) => {
+    if (!executionUi) return;
+    setRunHistoryLoading(true);
+    setRunHistoryError('');
+    // Issued inside a resolved promise so a synchronous failure in the client
+    // is a rejection handled below, never an exception thrown from a handler
+    // that would take the rest of the workspace down with it.
+    Promise.resolve()
+      .then(() => api.runs(conversationId))
+      .then(list => {
+        if (!ownsConversation(owner, scope.current)) return;
+        const rows = Array.isArray(list) ? list.filter(row => row && typeof row.id === 'string' && row.conversation_id === conversationId) : [];
+        setRunHistory(rows);
+        if (openLatest && scope.current.runId === undefined && rows.length > 0) {
+          storeRunId(conversationId, rows[0].id);
+          changeActiveRun(rows[0].id);
+        }
+      })
+      .catch(error => {
+        if (!ownsConversation(owner, scope.current)) return;
+        setRunHistoryError(safeErrorText(error, 'Failed to load the run history.'));
+      })
+      .finally(() => {
+        if (!ownsConversation(owner, scope.current)) return;
+        setRunHistoryLoading(false);
+      });
+  }, [executionUi, changeActiveRun]);
+
   const loadConversations = useCallback((project: Project, owner: WorkspaceScope) => {
     setConversations(undefined);
     setConversationError('');
@@ -542,6 +623,8 @@ export default function WorkspacePage() {
     setSelectedProject(project);
     setActiveConversation(undefined);
     setActiveRunId(undefined);
+    setRunHistory(undefined);
+    setRunHistoryError('');
     setProposal(undefined);
     setProposalError('');
     setConversationError('');
@@ -565,7 +648,24 @@ export default function WorkspacePage() {
     // Reopen an existing run after refresh or navigation. The stored id is a
     // request, not a fact: the polling hook verifies the run it names against
     // this conversation before anything is rendered.
-    changeActiveRun(readStoredRunId(conversation.id));
+    const stored = readStoredRunId(conversation.id);
+    changeActiveRun(stored);
+    setRunHistory(undefined);
+    setRunHistoryError('');
+    // The durable history is read regardless; when nothing is stored (a new
+    // browser, a restart) the newest run is reopened from it.
+    loadRunHistory(conversation.id, scope.current, stored === undefined);
+  }
+
+  /** Open a run chosen from the durable history of the active conversation. */
+  function selectHistoricalRun(runId: string) {
+    const conversationId = scope.current.conversationId;
+    if (!conversationId) return;
+    storeRunId(conversationId, runId);
+    setRunError('');
+    setCancelError('');
+    setConfirmingCancel(false);
+    changeActiveRun(runId);
   }
 
   async function createConversation() {
@@ -672,6 +772,7 @@ export default function WorkspacePage() {
       if (!ownsConversation(owner, scope.current)) return;
       changeActiveRun(created.run_id);
       setTaskContent('');
+      loadRunHistory(conversationId, owner, false);
     } catch (error) {
       if (!ownsConversation(owner, scope.current)) return;
       setRunError(safeErrorText(error, 'Run creation failed.'));
@@ -816,21 +917,36 @@ export default function WorkspacePage() {
         {/* Engine-specific result surfaces are selected only from the run's
             immutable identity. Missing/invalid identity gets a bounded alert,
             never an implicit V1 fallback. */}
+        <LiveRunPanel visible={showLiveRun} live={live} connection={mode} />
         <FinalResultPanel
           visible={showFinalResult}
           runId={activeRunId}
           runStatus={runStatus}
           connection={mode}
           output={state.run?.output}
+          outcome={productOutcome}
+        />
+        <VehicleCatalogResultPanel
+          visible={showVehicleResult}
+          runId={activeRunId}
+          runStatus={runStatus}
+          connection={mode}
+          output={state.run?.output}
+          outcome={productOutcome}
         />
         {identityUnavailable && executionUi && activeRunId !== undefined && (
           <p className="alert" role="alert">
             This run has no trustworthy immutable engine identity. Engine-specific result rendering is disabled.
           </p>
         )}
-        <RunOutputPanel
-          visible={executionUi && activeRunId !== undefined && !identityUnavailable && !swarm.isSwarmV2}
-          output={state.run?.output}
+        <RunHistoryList
+          visible={executionUi && activeConversation !== undefined}
+          runs={runHistory}
+          loading={runHistoryLoading}
+          error={runHistoryError}
+          activeRunId={activeRunId}
+          onSelect={selectHistoricalRun}
+          onRetry={() => { if (activeConversation) loadRunHistory(activeConversation.id, scope.current, false); }}
         />
         {/* CODE-3 — durable catalog state, not run state. It is shown for any
             selected project regardless of `executionUi`: the execution UI flag

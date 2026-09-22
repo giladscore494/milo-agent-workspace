@@ -26,7 +26,7 @@ const apiMocks = vi.hoisted(() => ({
   api: {
     projects: vi.fn(), conversations: vi.fn(), createConversation: vi.fn(),
     createProposal: vi.fn(), proposal: vi.fn(), decideProposal: vi.fn(), reviseProposal: vi.fn(),
-    startRun: vi.fn(), run: vi.fn(), events: vi.fn(), cancel: vi.fn(),
+    startRun: vi.fn(), run: vi.fn(), runs: vi.fn(() => Promise.resolve([])), events: vi.fn(), cancel: vi.fn(),
   },
 }));
 
@@ -84,19 +84,35 @@ describe('result-surface routing', () => {
     expect(document.querySelector('.final-result pre')).toBeNull();
   });
 
-  it('2. a V1 project keeps the existing sanitized-output path and never sees the new surface', async () => {
-    await openTerminalRun(V1_PROJECT, { summary: 'V1 mocked output', artifacts: { report: 'body' } });
-    expect(await screen.findByRole('heading', { name: 'Final artifacts' })).toBeInTheDocument();
+  it('2. a V1 project gets the typed Vehicle Catalog surface and never the Swarm V2 one', async () => {
+    await openTerminalRun(V1_PROJECT, {
+      status: 'complete',
+      summary: 'V1 mocked output',
+      result: {
+        manufacturer: 'Alpha', market: 'IL', period: '2020-2024', status: 'complete',
+        models: [{ canonical_model_name: 'Alpha One', verification_status: 'verified', fuel_type: 'petrol' }],
+        needs_review: [], rejected: [], failed_agents: [],
+        pipeline_quality: { discovery: 'success', normalizer: 'success', technical_enrichment: 'success', verifier: 'success', final_builder: 'success', data_depth: 'full_technical' },
+      },
+    });
+    expect(await screen.findByText('Vehicle Catalog V1 product result')).toBeInTheDocument();
     expect(screen.getByText(/V1 mocked output/)).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: 'Final result' })).not.toBeInTheDocument();
+    expect(screen.getByText('Alpha One')).toBeInTheDocument();
+    expect(screen.getByText('Models (1)')).toBeInTheDocument();
+    expect(screen.queryByText('Swarm V2 product result')).not.toBeInTheDocument();
+    // The raw-payload dump is gone from the product surface.
+    expect(screen.queryByRole('heading', { name: 'Final artifacts' })).not.toBeInTheDocument();
   });
 
   it('3. workflow identity comes from the RUN — a V1 run carrying a V2 payload still uses V1', async () => {
     // The payload is a perfectly valid Swarm V2 product outcome. It must NOT
-    // be able to promote a V1 project onto the V2 product surface.
+    // be able to promote a V1 project onto the V2 product surface, and the V1
+    // surface refuses it because it is not a catalog document.
     await openTerminalRun(V1_PROJECT, fixtures.usable_result);
-    expect(await screen.findByRole('heading', { name: 'Final artifacts' })).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: 'Final result' })).not.toBeInTheDocument();
+    expect(await screen.findByText('Vehicle Catalog V1 product result')).toBeInTheDocument();
+    expect(screen.getByText('Result unavailable')).toBeInTheDocument();
+    expect(screen.getByText('V1_NOT_A_CATALOG_DOCUMENT')).toBeInTheDocument();
+    expect(screen.queryByText('Swarm V2 product result')).not.toBeInTheDocument();
     expect(screen.queryByText('Usable result')).not.toBeInTheDocument();
   });
 

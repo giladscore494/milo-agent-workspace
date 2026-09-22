@@ -48,7 +48,9 @@
       "event_registry_fingerprint": "670238a71f608185d2011391ebe7f41df6b321df516b6af5866f51e0155db647"
     },
     "created_at": null,
-    "updated_at": null
+    "updated_at": null,
+    "product_outcome": null,
+    "limits": null
   },
   "unsettled": {
     "id": "1bbde49b-61a0-4378-9ee7-6fca3818060d",
@@ -79,6 +81,8 @@
       "event_registry_fingerprint": "670238a71f608185d2011391ebe7f41df6b321df516b6af5866f51e0155db647"
     },
     "created_at": null,
-    "updated_at": null
+    "updated_at": null,
+    "product_outcome": null,
+    "limits": null
   }
 }

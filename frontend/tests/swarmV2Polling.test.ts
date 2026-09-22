@@ -5,6 +5,7 @@ import { SMOKE_USAGE } from './swarmV2Fixture';
 
 const apiMocks = vi.hoisted(() => ({
   run: vi.fn(),
+  runs: vi.fn(() => Promise.resolve([])),
   events: vi.fn(),
 }));
 

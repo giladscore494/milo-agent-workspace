@@ -33,6 +33,13 @@ const SAFE_RULES: GatewayRule[] = [
   },
   { method: 'GET', path: new RegExp(`^/runs/${UUID}$`, 'i') },
   { method: 'GET', path: new RegExp(`^/runs/${UUID}/events$`, 'i') },
+  /**
+   * The conversation's durable run history. A bounded, membership-gated READ
+   * (GET only; the POST to the same path is the run-creation EXECUTION rule
+   * below and stays behind GATEWAY_ALLOW_EXECUTION_ROUTES). It is what lets a
+   * completed result be reopened after session storage is gone.
+   */
+  { method: 'GET', path: new RegExp(`^/conversations/${UUID}/runs$`, 'i') },
 
   /**
    * CODE-3 — the read-only catalog review surface.

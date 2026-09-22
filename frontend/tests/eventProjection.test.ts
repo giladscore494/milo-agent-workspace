@@ -208,7 +208,7 @@ describe('the vocabulary itself', () => {
 /* The same properties, through the polling path the browser runs.     */
 /* ------------------------------------------------------------------ */
 
-const apiMocks = vi.hoisted(() => ({ run: vi.fn(), events: vi.fn() }));
+const apiMocks = vi.hoisted(() => ({ run: vi.fn(), runs: vi.fn(() => Promise.resolve([])), events: vi.fn() }));
 vi.mock('../lib/api', () => ({ api: apiMocks }));
 
 describe('through useRunRealtime', () => {

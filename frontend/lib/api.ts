@@ -1,7 +1,7 @@
 import { EventId, eventCursorParam } from './eventId';
 import { parseJsonPreservingBigIntegers } from './losslessJson';
 import { getCurrentAccessToken } from './supabaseClient';
-import { Conversation, Project, Proposal, Run, RunEvent } from './types';
+import { Conversation, Project, Proposal, Run, RunEvent, RunSummary } from './types';
 
 const API = '/api/gateway';
 
@@ -125,6 +125,14 @@ export const api = {
     ),
 
   run: (id: string) => request<Run>(`/runs/${id}`),
+
+  /**
+   * The conversation's durable run history, newest first and bounded by the
+   * server. It is what lets a completed result outlive session storage: after
+   * a browser restart the workspace reopens the latest run from here.
+   */
+  runs: (conversationId: string, limit = 20) =>
+    request<RunSummary[]>(`/conversations/${conversationId}/runs?limit=${limit}`),
 
   /**
    * Incremental event polling.

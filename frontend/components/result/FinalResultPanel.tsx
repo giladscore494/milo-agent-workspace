@@ -1,4 +1,6 @@
 'use client';
+import { ProductOutcomeBanner } from '@/components/result/ProductOutcomeBanner';
+import { ProductOutcome } from '@/lib/productOutcome';
 import { safeText } from '@/lib/sanitize';
 import {
   DisplayValue,
@@ -31,6 +33,13 @@ export type FinalResultPanelProps = {
   connection: PollingMode;
   /** The durable `run.output`, untouched. This component never mutates it. */
   output?: Record<string, unknown>;
+  /**
+   * The canonical ProductOutcome the finalizer recorded (`run.product_outcome`,
+   * parsed by lib/productOutcome.ts). Shown once, above the product, as the
+   * verdict; the payload below is what that verdict is about. Optional so the
+   * surface renders exactly as before when a caller states none.
+   */
+  outcome?: ProductOutcome;
 };
 
 /**
@@ -53,7 +62,7 @@ export type FinalResultPanelProps = {
  * a usable result, a partial result WITH what is outstanding, an empty result,
  * a confirmed not-found, and a payload that cannot be trusted at all.
  */
-export function FinalResultPanel({ visible, runId, runStatus, connection, output }: FinalResultPanelProps) {
+export function FinalResultPanel({ visible, runId, runStatus, connection, output, outcome }: FinalResultPanelProps) {
   if (!visible) return null;
 
   return (
@@ -64,6 +73,7 @@ export function FinalResultPanel({ visible, runId, runStatus, connection, output
           <p className="eyebrow">Swarm V2 product result</p>
         </div>
       </header>
+      {outcome && isTerminalRunStatus(runStatus) && <ProductOutcomeBanner outcome={outcome} terminal />}
       <FinalResultBody runId={runId} runStatus={runStatus} connection={connection} output={output} />
     </section>
   );

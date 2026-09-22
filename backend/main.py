@@ -38,7 +38,7 @@ from backend.schemas import (
     RunCreate,
     RunCreated,
     RunEvent,
-    RunIdentityRecord,
+    RunIdentityRecord, ProductOutcomeRecord, RunLimits, RunSummary,
     RunUsage,
     WorkflowProposal,
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
@@ -56,6 +56,7 @@ from backend.run_identity import (
 )
 from backend.runtime import TERMINAL_STATES
 from backend.finalization import RunFinalizer, TerminalClaim
+from backend.product_outcome import ProductOutcomeError, outcome_from_record
 from backend.worker_auth import WorkerIdentity, get_verified_worker
 from backend.workflow_proposals import compile_proposal, ensure_approved
 
@@ -159,7 +160,60 @@ def _catalog_page_meta(page: catalog_review.CatalogPage) -> CatalogPageMeta:
                            has_more=page.has_more)
 
 
-def _safe_run_response(run: dict) -> dict:
+#: The events the canonical finalizer writes atomically with a terminal status.
+TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_partial_success", "run_failed", "run_cancelled"})
+
+
+def _safe_product_outcome(run: dict, repo: Repository | None) -> ProductOutcomeRecord | None:
+    """Project the canonical ProductOutcome the finalizer recorded, or null.
+
+    The record lives on the terminal event `finalize_run_guarded` inserted in
+    the same transaction as the terminal status (backend/finalization.py), so
+    it is read from there and nowhere else: not derived from `output` here,
+    not accepted from a request body, not reconstructed from other events. A
+    live run, a terminal that carries no product (cancellation, timeout,
+    budget stop), a historical run finalized before the canonical path, and a
+    record that does not re-validate through `outcome_from_record` all project
+    `null` -- an absent verdict is stated as absent, never invented.
+    """
+    if repo is None or not hasattr(repo, "terminal_run_event"):
+        return None
+    if str(run.get("status") or "") not in TERMINAL_STATES:
+        return None
+    try:
+        event = repo.terminal_run_event(run["id"])
+    except Exception:
+        return None
+    if not isinstance(event, dict) or event.get("event_type") not in TERMINAL_EVENT_TYPES:
+        return None
+    payload = event.get("payload")
+    record = payload.get("product_outcome") if isinstance(payload, dict) else None
+    if not isinstance(record, dict):
+        return None
+    try:
+        outcome = outcome_from_record(record)
+        return ProductOutcomeRecord.model_validate(outcome.as_record())
+    except (ProductOutcomeError, ValidationError, TypeError, ValueError):
+        return None
+
+
+def _run_limits() -> RunLimits | None:
+    """The per-run ceilings this deployment enforces, as plain numbers."""
+    try:
+        config = BudgetConfig.from_env()
+    except Exception:
+        return None
+    limits = RunLimits(
+        max_model_calls_per_run=config.max_model_calls_per_run,
+        max_total_tokens_per_run=config.max_total_tokens_per_run,
+        max_cost_per_run=config.max_cost_per_run,
+        max_run_duration_seconds=config.max_run_duration_seconds,
+        max_agent_steps=config.max_agent_steps,
+    )
+    return limits if limits.model_dump(exclude_none=True) else None
+
+
+def _safe_run_response(run: dict, repo: Repository | None = None) -> dict:
     """Return a browser-safe run shape.
 
     Launch exception messages are operational data and may include provider,
@@ -179,6 +233,11 @@ def _safe_run_response(run: dict) -> dict:
     # The run's own immutable identity, so the browser can render a historical
     # run as the engine it WAS rather than as whatever its project is today.
     safe["run_identity"] = _safe_run_identity(run.get(RUN_IDENTITY_FIELD), run.get("id"))
+    # The canonical product verdict and the ceilings the run executes under.
+    # Both are projections of durable/deployment truth; neither is derived
+    # from the payload or from anything the browser could have supplied.
+    safe["product_outcome"] = _safe_product_outcome(run, repo)
+    safe["limits"] = _run_limits()
     safe.pop("launch_error", None)
     safe.pop("lease_token", None)
     return safe
@@ -476,7 +535,33 @@ def create_run(conversation_id: UUID, request: RunCreate, user: AuthenticatedUse
 
 @app.get("/runs/{run_id}", response_model=Run)
 def get_run(run_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
-    return _safe_run_response(repo.get_run(run_id, user_id=user.user_id))
+    return _safe_run_response(repo.get_run(run_id, user_id=user.user_id), repo)
+
+
+#: The most runs one history read returns. The list is for choosing a run to
+#: reopen; it is bounded so a busy conversation cannot make the read unbounded.
+MAX_RUN_HISTORY = 50
+
+
+@app.get("/conversations/{conversation_id}/runs", response_model=list[RunSummary])
+def list_conversation_runs(conversation_id: UUID, limit: int = 20, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> list[dict]:
+    """A conversation's run history, newest first, membership-scoped.
+
+    This is what lets a completed result outlive the browser session: the run
+    ids the workspace remembers live in session storage, and a browser restart
+    forgets them. The history is durable truth read back through the same
+    authorization the single-run read uses, and each row carries the run's
+    immutable identity and canonical outcome so the browser can list a
+    historical run as the engine and the verdict it actually was.
+    """
+    if limit < 1 or limit > MAX_RUN_HISTORY:
+        raise AppError("INVALID_LIMIT", f"limit must be between 1 and {MAX_RUN_HISTORY}", 422)
+    if not hasattr(repo, "list_conversation_runs"):
+        raise AppError("RUN_HISTORY_UNAVAILABLE", "run history is not available on this repository", 503)
+    # Membership authorization precedes every read; a non-member sees 404.
+    repo.get_conversation(conversation_id, user.user_id)
+    rows = repo.list_conversation_runs(conversation_id, user_id=user.user_id, limit=limit)
+    return [_safe_run_response(row, repo) for row in rows]
 
 
 @app.get("/runs/{run_id}/events", response_model=list[RunEvent])

@@ -305,6 +305,24 @@ class MemoryRepository:
             events = [e for e in events if e["id"] > after_event_id]
         return [dict(e) for e in events]
 
+    TERMINAL_EVENT_TYPES = ("run_completed", "run_partial_success", "run_failed", "run_cancelled")
+
+    def terminal_run_event(self, run_id: UUID) -> dict[str, Any] | None:
+        events = [e for e in self.run_events
+                  if e["run_id"] == str(run_id) and e["event_type"] in self.TERMINAL_EVENT_TYPES]
+        return dict(events[-1]) if events else None
+
+    def list_conversation_runs(self, conversation_id: UUID, user_id: UUID | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        self.get_conversation(conversation_id, user_id)
+        bounded = max(1, min(int(limit), 50))
+        rows = [run for run in self.runs.values() if run["conversation_id"] == str(conversation_id)]
+        rows.sort(key=lambda run: str(run.get("created_at") or ""), reverse=True)
+        projected = []
+        for run in rows[:bounded]:
+            row = {key: value for key, value in run.items() if key not in ("output", "input", "error")}
+            projected.append(row)
+        return projected
+
     def append_run_event(self, run_id: UUID, event_type: str, payload: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         with self.lock:
             if worker_id is not None:

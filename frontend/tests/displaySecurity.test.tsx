@@ -35,7 +35,7 @@ const apiMocks = vi.hoisted(() => ({
   api: {
     projects: vi.fn(), conversations: vi.fn(), createConversation: vi.fn(),
     createProposal: vi.fn(), proposal: vi.fn(), decideProposal: vi.fn(), reviseProposal: vi.fn(),
-    startRun: vi.fn(), run: vi.fn(), events: vi.fn(), cancel: vi.fn(),
+    startRun: vi.fn(), run: vi.fn(), runs: vi.fn(() => Promise.resolve([])), events: vi.fn(), cancel: vi.fn(),
   },
 }));
 
@@ -144,11 +144,17 @@ describe('the inspector and the V1 output path stay redacted', () => {
     await waitFor(() => expect(apiMocks.api.run).toHaveBeenCalledWith(RUN_ID));
   }
 
-  it('the V1 sanitized-output panel redacts a credential in the durable payload', async () => {
+  it('the V1 product surface never renders a credential, and the Developer payload view redacts it', async () => {
     await openRunWith({
       status: 'completed',
       output: { summary: 'done', api_key: API_KEY_SENTINEL, nested: { authorization: `Bearer ${API_KEY_SENTINEL}` } },
     });
+    // The typed V1 surface renders only what its contract names, so the
+    // credential is simply never on screen.
+    expect(await screen.findByText('Vehicle Catalog V1 product result')).toBeInTheDocument();
+    expect(document.body.textContent ?? '').not.toContain(API_KEY_PREFIX);
+    // The raw durable payload is developer telemetry in the Inspector, redacted.
+    fireEvent.click(screen.getByRole('tab', { name: 'Developer' }));
     const body = document.body.textContent ?? '';
     expect(body).toContain(REDACTED);
     expect(body).not.toContain(API_KEY_PREFIX);

@@ -197,6 +197,50 @@ def build_swarm_v2_product_result(content: str) -> dict[str, Any]:
 UNCERTAIN_LAUNCH_MARKER = "uncertain launch"
 
 
+def build_vehicle_catalog_v1_result(content: str) -> dict[str, Any]:
+    """A vehicle_catalog_v1 RUN ENVELOPE shaped exactly like the engine's.
+
+    `backend/engines/vehicle_catalog_v1/engine.py` returns
+    ``{"status", "result", "summary", ...}`` where ``result`` is the
+    deterministic final document from ``core.build_final_json_python``:
+    ``manufacturer``, ``market``, ``period``, ``status``, ``models`` (each with
+    a ``verification_status``), ``needs_review``, ``rejected``,
+    ``failed_agents`` and ``pipeline_quality``. The canonical outcome reader
+    counts THIS document, so the E2E product path exercises the same V1
+    derivation production uses. "partial" in the task text yields a
+    needs_review model, which the reader demotes to `partial`.
+    """
+    partial = "partial" in content
+    models = [
+        {"canonical_model_name": "Alpha One", "model_name_he": "אלפא 1", "verification_status": "verified",
+         "confidence": "high", "source_strength": "official_israel", "years": "2021-2024",
+         "engine": "1.5 turbo", "fuel_type": "petrol", "power_hp": 150, "transmission": "automatic",
+         "sources": ["https://example.com/alpha-one"]},
+        {"canonical_model_name": "Alpha Two", "model_name_he": "אלפא 2",
+         "verification_status": "needs_review" if partial else "verified",
+         "confidence": "medium", "source_strength": "israeli_auto_portal", "years": "2019-2023",
+         "engine": "2.0", "fuel_type": "hybrid", "power_hp": 180, "transmission": "automatic",
+         "sources": ["https://example.com/alpha-two"]},
+    ]
+    final = {
+        "manufacturer": "Alpha", "market": "IL", "period": "2019-2024",
+        "status": "partial_success" if partial else "complete",
+        "models": models,
+        "needs_review": [m for m in models if m["verification_status"] == "needs_review"],
+        "rejected": [],
+        "failed_agents": [],
+        "pipeline_quality": {"discovery": "success", "normalizer": "success",
+                             "technical_enrichment": "success", "verifier": "success",
+                             "final_builder": "success", "data_depth": "full_technical"},
+        "token_usage": {},
+        "final_builder_method": "python_merge_success",
+        "technical_items_merged_count": 8,
+    }
+    return {"status": final["status"], "result": final,
+            "summary": "E2E mocked output: two Alpha models were catalogued for the Israeli market.",
+            "input_tokens": 1200, "output_tokens": 300, "elapsed_seconds": 1.0}
+
+
 class InProcessFakeWorkerLauncher:
     """Simulates the Cloud Run worker in a daemon thread with mocked model
     calls. Exercises polling, cancellation, budget exhaustion, timeout,
@@ -233,113 +277,128 @@ class InProcessFakeWorkerLauncher:
     def _emit(self, run_id: UUID, event_type: str, message: str, **extra: Any) -> None:
         self.repo.append_run_event(run_id, event_type, {"message": message, **extra})
 
-    def _cancel(self, run_id: UUID) -> None:
-        self._emit(run_id, "run_cancelled", "Run cancelled", payload={})
-        self.repo.transition_run(run_id, "cancelled", finished_at=None)
+    def _workflow_key(self, run_id: UUID) -> str:
+        """The run's IMMUTABLE identity decides the engine, exactly like
+        `EngineResolver`. The project's current workflow and the run's own
+        input never select it: a run born as V1 finalizes as V1 even if its
+        project were switched to V2 while it ran."""
+        from backend.run_identity import require_identity
 
-    def _advance_or_cancel(self, run_id: UUID, status: str, **fields: Any) -> bool:
+        return require_identity(self.repo.get_run(run_id)).workflow_key
+
+    def _lease(self, run_id: UUID) -> dict[str, Any]:
+        """Claim the run the way the real worker does, and hold its lease.
+
+        Every durable write below carries this lease, and the canonical
+        finalizer commits the terminal status and the terminal event under it
+        -- so what the browser polls in E2E is produced by the same fenced,
+        atomic path as production, not by a test-only shortcut."""
+        claimed = self.repo.claim_run(run_id, "e2e-worker")
+        return {"worker_id": "e2e-worker", "attempt": claimed.get("attempt", 1),
+                "lease_token": claimed.get("lease_token")}
+
+    def _advance(self, run_id: UUID, lease: dict[str, Any], status: str, **fields: Any) -> bool:
         """Mirror the real worker's claim-time semantics: a cancellation that
         lands before/between the startup transitions must finalize the run as
-        cancelled, never crash into a failed terminal (the invalid
-        cancellation_requested -> starting/running transition race)."""
+        cancelled through the canonical finalizer, never crash into a failed
+        terminal (the invalid cancellation_requested -> running race)."""
         from backend.errors import AppError
 
         if self.repo.get_run(run_id)["status"] == "cancellation_requested":
-            self._cancel(run_id)
             return False
         try:
-            self.repo.transition_run(run_id, status, **fields)
+            self.repo.transition_run(run_id, status, expected_worker_id=lease["worker_id"],
+                                     expected_attempt=lease["attempt"],
+                                     expected_lease_token=lease["lease_token"], **fields)
             return True
         except AppError:
             if self.repo.get_run(run_id)["status"] == "cancellation_requested":
-                self._cancel(run_id)
                 return False
             raise
 
-    def _workflow_key(self, run_id: UUID) -> str:
-        """Resolve run -> conversation -> project, exactly like EngineResolver.
-
-        Trusted records only. The run's own input never selects a workflow.
-        """
-        run = self.repo.get_run(run_id)
-        conversation = self.repo.get_conversation(run["conversation_id"])
-        return str(self.repo.get_project(conversation["project_id"]).get("workflow_key") or "")
-
-    def _finalize_swarm_v2(self, run_id: UUID, content: str) -> None:
-        """Finalize a Swarm V2 run through the PRODUCTION outcome contract.
-
-        `durable_run_status` is the same lookup `backend/worker/main.py` uses,
-        so the durable status and the recorded payload cannot disagree here in
-        a way they could not disagree in production -- and a payload that
-        failed `validate_product_outcome` would raise rather than quietly
-        complete, exactly as the real worker treats it.
-        """
-        from backend.engines.swarm_v2 import durable_run_status
-
-        result = build_swarm_v2_product_result(content)
-        status = durable_run_status(result)
-        payload = {"status": result["status"], "result_kind": result["result_kind"]}
-        if status == "partial_success":
-            self._emit(run_id, "run_partial_success", "Run partial_success", payload=payload)
-            self.repo.transition_run(run_id, "partial_success", output=result, error=None,
-                                     finished_at=None)
-        else:
-            self._emit(run_id, "run_completed", "Run completed", payload=payload)
-            self.repo.mark_run_complete(run_id, result)
-
     def _run(self, run_id: UUID) -> None:
+        """One mocked execution, terminalized ONLY through `RunFinalizer`.
+
+        The finalizer derives the durable status from the canonical
+        ProductOutcome (backend/product_outcome.py) and records that outcome on
+        the terminal event in the same transaction as the status -- which is
+        exactly what `GET /runs/{id}` projects back as `product_outcome`. No
+        branch here writes a terminal status itself.
+        """
+        from backend.finalization import RunFinalizer, TerminalClaim
+
         repo = self.repo
         try:
             time.sleep(0.2)
+            lease = self._lease(run_id)
+            engine = self._workflow_key(run_id)
+            finalizer = RunFinalizer(repo=repo, run_id=run_id, engine=engine, lease_ctx=lease)
             run = repo.get_run(run_id)
             content = str((run.get("input") or {}).get("content") or "").lower()
-            if not self._advance_or_cancel(run_id, "starting", started_at=run.get("started_at")):
+
+            def cancel(step: int | None = None) -> None:
+                finalizer.finalize(TerminalClaim.cancelled(engine))
+
+            if run["status"] == "cancellation_requested":
+                cancel()
                 return
-            self._emit(run_id, "run_started", "Run started", payload={"worker": "e2e"})
-            if not self._advance_or_cancel(run_id, "running"):
+            self._emit(run_id, "run_started", "Run started", payload={"worker": "e2e"}, **lease)
+            if not self._advance(run_id, lease, "running"):
+                cancel()
                 return
 
+            def emit(event_type: str, payload: dict[str, Any]) -> None:
+                self._emit(run_id, event_type, payload.get("message", event_type),
+                           payload=payload.get("payload", {}), **lease)
+
             if "timeout" in content:
-                tracker = BudgetTracker(BudgetConfig(max_run_duration_seconds=1), kill_switch=lambda: True, clock=time.monotonic, event_emitter=lambda t, p: self._emit(run_id, t, p.get("message", t), payload=p.get("payload", {})))
+                tracker = BudgetTracker(BudgetConfig(max_run_duration_seconds=1), kill_switch=lambda: True,
+                                        clock=time.monotonic, event_emitter=emit)
                 tracker._started_at = time.monotonic() - 5
                 try:
                     tracker.before_call()
                 except BudgetExceeded as exc:
-                    repo.transition_run(run_id, exc.terminal_status, error={"code": exc.code, "message": exc.message}, finished_at=None, usage=tracker.snapshot())
+                    finalizer.finalize(TerminalClaim.budget_stop(engine, exc, usage=tracker.snapshot()))
                     return
             if "exhaust budget" in content:
-                tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=2, estimated_cost_per_call=0.01), kill_switch=lambda: True, event_emitter=lambda t, p: self._emit(run_id, t, p.get("message", t), payload=p.get("payload", {})), usage_recorder=lambda usage: repo.update_run_usage(run_id, usage))
+                tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=2, estimated_cost_per_call=0.01),
+                                        kill_switch=lambda: True, event_emitter=emit,
+                                        usage_recorder=lambda usage: repo.update_run_usage(run_id, usage, **lease))
                 try:
                     while True:  # every iteration is a MOCKED call, gated first
                         tracker.before_call()
                         _ = MockModelResponse()
                         tracker.after_call(MockUsage.prompt_tokens, MockUsage.completion_tokens)
-                        self._emit(run_id, "agent_progress", "Mocked model call recorded", agent="researcher")
+                        self._emit(run_id, "agent_progress", "Mocked model call recorded", agent="researcher", **lease)
                 except BudgetExceeded as exc:
-                    repo.transition_run(run_id, exc.terminal_status, error={"code": exc.code, "message": exc.message}, usage=tracker.snapshot())
+                    finalizer.finalize(TerminalClaim.budget_stop(engine, exc, usage=tracker.snapshot()))
                     return
             if "fail" in content:
-                self._emit(run_id, "run_failed", "The worker hit an internal error. Diagnostics were recorded server-side.", payload={"code": "ENGINE_FAILED"})
-                repo.mark_run_failed(run_id, "ENGINE_FAILED", "The worker hit an internal error. Diagnostics were recorded server-side.")
+                finalizer.finalize(TerminalClaim.failure(
+                    engine, "ENGINE_FAILED",
+                    "The worker hit an internal error. Diagnostics were recorded server-side."))
                 return
 
             steps = 40 if "slow" in content else 3
             for index in range(steps):
-                current = repo.get_run(run_id)
-                if current["status"] == "cancellation_requested":
-                    self._emit(run_id, "run_cancelled", "Run cancelled", payload={"step": index})
-                    repo.transition_run(run_id, "cancelled", finished_at=None)
+                if repo.get_run(run_id)["status"] == "cancellation_requested":
+                    cancel(index)
                     return
-                self._emit(run_id, "agent_progress", f"step {index + 1}/{steps}", agent="researcher", phase="research", progress={"percent": int(100 * (index + 1) / steps)})
+                self._emit(run_id, "agent_progress", f"step {index + 1}/{steps}", agent="researcher",
+                           phase="research", progress={"percent": int(100 * (index + 1) / steps)}, **lease)
                 time.sleep(0.35 if "slow" in content else 0.15)
-            self._emit(run_id, "source_recorded", "Example source", agent="researcher", payload={"id": "src-1", "title": "Example source", "domain": "example.com", "url": "https://example.com", "source_type": "web", "source_strength": "high"})
+            self._emit(run_id, "source_recorded", "Example source", agent="researcher",
+                       payload={"id": "src-1", "title": "Example source", "domain": "example.com",
+                                "url": "https://example.com", "source_type": "web", "source_strength": "high"},
+                       **lease)
 
-            if self._workflow_key(run_id) == "swarm_v2":
-                self._finalize_swarm_v2(run_id, content)
-                return
-
-            self._emit(run_id, "run_completed", "Run completed", payload={})
-            repo.mark_run_complete(run_id, {"summary": "E2E mocked output", "artifacts": {"report": "final report body"}})
+            if engine == "swarm_v2":
+                # The shipped V2 contract builds the payload; the canonical
+                # finalizer decides `completed` vs `partial_success` from it.
+                output: dict[str, Any] = build_swarm_v2_product_result(content)
+            else:
+                output = build_vehicle_catalog_v1_result(content)
+            finalizer.finalize(TerminalClaim.product(engine, output))
         except Exception as exc:  # pragma: no cover - defensive
             try:
                 repo.mark_run_failed(run_id, "E2E_WORKER_CRASH", str(exc)[:200])

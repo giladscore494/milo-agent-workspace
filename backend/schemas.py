@@ -120,6 +120,73 @@ class RunIdentityRecord(BaseModel):
     event_registry_fingerprint: str
 
 
+class ProductOutcomeCoverage(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    produced: int = Field(ge=0)
+    outstanding: int = Field(ge=0)
+    ratio: float | None = Field(default=None, ge=0, le=1)
+
+
+class ProductOutcomeBlockingItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    code: str
+    count: int = Field(ge=1)
+
+
+class ProductOutcomePayloadReference(BaseModel):
+    """Presence, digest, size and top-level shape -- never content."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    present: bool
+    digest: str | None = None
+    byte_size: int | None = Field(default=None, ge=0)
+    # The payload's top-level KEY NAMES (bounded, sorted) -- a shape, not content.
+    shape: list[str] | None = None
+
+
+class ProductOutcomeRecord(BaseModel):
+    """The canonical ProductOutcome, as the browser is allowed to see it.
+
+    This is ``backend/product_outcome.py``'s ``as_record`` form, re-validated
+    on the way out: every field is a static vocabulary entry, a count or a
+    digest. It is read from the terminal event the canonical finalizer wrote
+    in the same transaction as the terminal status, never derived by the API
+    from the payload and never supplied by a worker request body. A run whose
+    terminal event carries no trustworthy record projects ``null``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    engine: str
+    semantic_status: str
+    usability: str
+    result_kind: str | None = None
+    coverage: ProductOutcomeCoverage
+    blocking: list[ProductOutcomeBlockingItem] = Field(default_factory=list)
+    payload: ProductOutcomePayloadReference
+
+
+class RunLimits(BaseModel):
+    """The per-run ceilings this deployment enforces, as plain numbers.
+
+    They come from the API's own ``BudgetConfig`` (the canonical runtime
+    policy applied to this deployment), so the browser can show spend AGAINST
+    a limit instead of a bare number. Nothing here is a secret or an
+    infrastructure detail: an unset ceiling is ``null``, never invented.
+    """
+
+    model_config = ConfigDict(extra="ignore", protected_namespaces=())
+
+    max_model_calls_per_run: int | None = None
+    max_total_tokens_per_run: int | None = None
+    max_cost_per_run: float | None = None
+    max_run_duration_seconds: int | None = None
+    max_agent_steps: int | None = None
+
+
 class Run(BaseModel):
     id: UUID
     conversation_id: UUID
@@ -142,6 +209,37 @@ class Run(BaseModel):
     # `null` for a run created before identities existed. It is never
     # defaulted: an unpinned run is unpinned, and every consumer says so.
     run_identity: RunIdentityRecord | None = None
+    # The canonical ProductOutcome the finalizer recorded with the terminal
+    # status. `null` while the run is live, for a non-product terminal (a
+    # cancellation, a timeout, a budget stop) and for a historical run that
+    # predates canonical finalization. Never derived from `output` here.
+    product_outcome: ProductOutcomeRecord | None = None
+    # The ceilings the run executes under, so spend can be read against them.
+    limits: RunLimits | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class RunSummary(BaseModel):
+    """One row of a conversation's run history.
+
+    The same browser-safe projection as `Run` MINUS the payloads: a history
+    list is for choosing a run to reopen, and the product itself is read
+    through `GET /runs/{id}` once one is chosen. Bounded by the endpoint.
+    """
+
+    id: UUID
+    conversation_id: UUID
+    status: str
+    attempt: int = 1
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    launch_state: str | None = None
+    launch_error_class: str | None = None
+    launch_reconciliation_required: bool = False
+    usage: RunUsage | None = None
+    run_identity: RunIdentityRecord | None = None
+    product_outcome: ProductOutcomeRecord | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
