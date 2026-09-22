@@ -111,6 +111,8 @@ describe('approved classifications keep their actionable meaning', () => {
       ['DAILY_USER_BUDGET_REACHED', 'daily budget'],
       ['RATE_LIMITED', 'Too many requests'],
       ['RUN_ALREADY_FINISHED', 'already finished'],
+      ['VEHICLE_CATALOG_SCOPE_NOT_CONFIGURED', 'no run was started'],
+      ['VEHICLE_CATALOG_SCOPE_INVALID', 'must be corrected first'],
       ['PROPOSAL_NOT_APPROVABLE', 'cannot be approved'],
       ['PROJECT_NOT_FOUND', 'not available to your account'],
       ['AUTHENTICATION_REQUIRED', 'Sign in again'],

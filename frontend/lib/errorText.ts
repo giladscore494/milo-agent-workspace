@@ -82,6 +82,13 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
   ['RATE_LIMITER_UNAVAILABLE', 'The request was refused because the shared rate limiter is unavailable. Try again shortly.'],
   ['HTTP_429', 'Too many requests. Wait a moment and try again.'],
 
+  // Vehicle catalog scope. A vehicle catalog run maps exactly the manufacturer,
+  // market and period its PROJECT configures; the typed task never replaces
+  // it. A project that configures none is refused rather than quietly run
+  // against a default, and the person is told where the fix belongs.
+  ['VEHICLE_CATALOG_SCOPE_NOT_CONFIGURED', 'This vehicle catalog project has no configured manufacturer, market and period, so no run was started. The project configuration must state them first.'],
+  ['VEHICLE_CATALOG_SCOPE_INVALID', "This vehicle catalog project's configured manufacturer, market or period is not valid, so no run was started. The project configuration must be corrected first."],
+
   // Run and proposal lifecycle.
   ['RUN_ALREADY_FINISHED', 'That run has already finished.'],
   ['PROPOSAL_NOT_APPROVABLE', 'This proposal cannot be approved in its current state.'],

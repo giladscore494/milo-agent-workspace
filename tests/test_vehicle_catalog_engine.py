@@ -10,6 +10,7 @@ from backend import provider_authority, provider_scheduler, standalone_search
 from backend.engines.vehicle_catalog_v1 import core
 from backend.worker import main as worker_main
 from backend.engines.vehicle_catalog_v1.adapter import VehicleCatalogV1Adapter
+from backend.vehicle_catalog_scope import VehicleCatalogScope
 
 
 @pytest.fixture(scope="module")
@@ -177,6 +178,12 @@ def test_adapter_uses_fake_client_without_live_calls(monkeypatch):
         calls.append(config)
         return {"status": "partial_success", "result": {"models": []}}
     monkeypatch.setattr("backend.engines.vehicle_catalog_v1.engine.VehicleCatalogEngine.run", fake_run)
-    result = VehicleCatalogV1Adapter(model_client_factory=lambda *_: object(), sleep_fn=lambda _: None).run({"input": {"manufacturer": "Hyundai"}})
+    # The scope is handed over by trusted wiring; run input is never a scope
+    # source, so a top-level `manufacturer` in it changes nothing.
+    scope = VehicleCatalogScope(manufacturer="Hyundai", market="Israel",
+                                period_from="2010", period_to="June 2026")
+    result = VehicleCatalogV1Adapter(model_client_factory=lambda *_: object(), sleep_fn=lambda _: None,
+                                     scope=scope).run({"input": {"manufacturer": "Toyota"}})
     assert result["status"] == "partial_success"
     assert calls[0].manufacturer == "Hyundai"
+    assert (calls[0].market, calls[0].period) == ("Israel", core.DEFAULT_PERIOD)
