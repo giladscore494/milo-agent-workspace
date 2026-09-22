@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Shared Stage D parameters. Sourced by every step script. No secrets here.
 #
-# STATUS: PROPOSED authorization. Nothing in this directory has been
-# executed against production. Merging it authorizes nothing — the one
-# bounded paid run it describes requires a fresh, explicit, separate
-# operator authorization (STAGED_ACTIVATION.md, Stage D).
+# STATUS: attempt 1 of expansion step 1 WAS executed on 2026-09-19 under the
+# key stage-d-expansion-1-20260918-01 and terminalized `timed_out` (a
+# controlled fail-closed terminal, not a pass; see STAGE_D_AUTHORIZATION.md
+# §9.1). Attempt 2 is PROPOSED and has NOT been executed. Merging this
+# authorizes nothing — the one bounded paid run it describes requires a
+# fresh, explicit, separate operator authorization (STAGED_ACTIVATION.md,
+# Stage D) against a NEW reviewed release.
 #
 # AUTHORIZED CONSTANTS — the proposed Stage D authorization covers ONE
 # exact production target, ONE exact release and exactly ONE new paid run.
@@ -146,7 +149,7 @@ stage_d_pin STAGE_D_PROBE_IMAGE_DIGEST "sha256:78387bc3881b8273120a12ebe6c1ab22b
 # Regenerate deliberately, in a reviewed commit, after an intended change:
 #   sha256sum scripts/release/stage-d/probe_db.py scripts/release/stage-d/probe_gateway.py
 # ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_PROBE_DB_SHA256 "d3ce221d90da5f08223b5e96bb12df384789e38409fb977689590b74f3db8a5a"
+stage_d_pin STAGE_D_PROBE_DB_SHA256 "7bdfce611726876f5d89756454c51bc713000bce529c149a992941da40bb9ae2"
 stage_d_pin STAGE_D_PROBE_GW_SHA256 "359d7cbfc7195f9fee333480af0f7fe1ae09ca8ce339a0a7942bfe823dde4bce"
 
 # ---------------------------------------------------------------------------

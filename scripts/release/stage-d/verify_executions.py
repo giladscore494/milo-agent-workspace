@@ -6,11 +6,13 @@ from stdin and verifies an EXACT execution posture instead of a fragile
 line count:
 
   - the total number of executions equals --expected-total exactly
-    (Stage D: 7 visible terminal executions before the run, 8 after the
-    one authorized launch — a one-execution increment over the pinned
-    live baseline, never merely "some execution exists"). The live
-    baseline was discovered read-only on 2026-09-18:
-    milo-agent-worker-{mcfrx,gggdc,dk4xv,gnj5d,fvfcb,2tckh,bw8kj};
+    (Stage D attempt 2: 8 visible terminal executions before the run, 9
+    after the one authorized launch — a one-execution increment over the
+    pinned live baseline, never merely "some execution exists"). The live
+    baseline was re-measured read-only on 2026-09-22 after attempt 1:
+    milo-agent-worker-{mcfrx,gggdc,dk4xv,gnj5d,fvfcb,2tckh,bw8kj,xmd2m};
+    the pinned number itself lives in stage-d-env.sh
+    (STAGE_D_EXPECTED_PRIOR_EXECUTIONS), never here;
   - every execution is verifiably TERMINAL (a non-empty completionTime or
     a Completed condition with status True/False — the same rule the kill
     switch uses);

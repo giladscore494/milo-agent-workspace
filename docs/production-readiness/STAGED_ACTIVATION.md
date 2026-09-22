@@ -170,15 +170,18 @@ rehearsal; 9. wider access only after explicit approval.
 Each expansion step raises limits explicitly and individually — never all
 at once.
 
-### Stage D is currently UNAUTHORIZED; expansion step 1 is PROPOSED
+### Stage D is currently UNAUTHORIZED; expansion step 1 attempt 1 FAILED (`timed_out`), attempt 2 is PROPOSED
 
 Stage C passing did not enable, authorize or schedule any Stage D activity:
 the Stage C Attempt 7 authorization is **consumed**
 ([STAGE_C_ACCEPTANCE.md](STAGE_C_ACCEPTANCE.md)). Every Stage D step needs
 its own fresh, separate, explicit operator authorization.
 
-**Expansion step 1 — one bounded paid run — exists as a reviewable
-PROPOSAL and has NOT been executed.** The request, the read-only discovered
+**Expansion step 1 — one bounded paid run — was executed ONCE (attempt 1,
+2026-09-19, key `stage-d-expansion-1-20260918-01`, run `3772fc84…`) and
+terminalized `timed_out`, which the acceptance policy counts as a controlled
+fail-closed FAILURE; no acceptance record exists. Attempt 2 exists as a
+reviewable PROPOSAL and has NOT been executed.** The request, the read-only discovered
 production baselines, the caps derived from Stage C Attempt 7 evidence and
 the remaining manual operator steps are in
 [STAGE_D_AUTHORIZATION.md](STAGE_D_AUTHORIZATION.md); the operator toolkit

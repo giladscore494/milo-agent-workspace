@@ -66,9 +66,10 @@
 > a NEW release: the pinned release `84cd8696…` predates the immutable run
 > identity contract now enforced by Production (migration
 > `20260921000200`, applied 2026-09-22), which removed the
-> `create_message_and_run` / `_v2` RPCs that release's API calls and which
-> `verify_caps.py` / `probe_db.py` now require (`MILO_RELEASE_SHA` on both
-> surfaces, a persisted `run_identity`). Nothing here grants that
+> `create_message_and_run` / `_v2` RPCs that release's API calls; and the
+> toolkit now requires what that release cannot supply — `verify_caps.py`
+> requires `MILO_RELEASE_SHA` on both surfaces, and `probe_db.py`'s evidence
+> gate requires a persisted `run_identity`. Nothing here grants that
 > authorization or that release.
 >
 > **Merging this PR authorizes nothing.** This document is a *request* for
@@ -125,14 +126,14 @@ enabling `GATEWAY_ALLOW_EXECUTION_ROUTES` or any browser execution surface;
 a second paid run; any change to the Stage C toolkit or its consumed
 constants.
 
-## 2. Discovered production baselines (read-only, 2026-09-18)
+## 2. Discovered production baselines (read-only, 2026-09-18 — the ATTEMPT-1 record; the re-measured attempt-2 baselines are in §2.5)
 
 Every pinned value was **measured**, not assumed. Method: the read-only
 Supabase production connection for database facts, and `gcloud … describe` /
 `… list` for Cloud Run, IAM and Secret Manager facts. No mutating command
 was issued.
 
-### 2.1 Database — `public.runs` holds exactly **7** rows
+### 2.1 Database — `public.runs` held exactly **7** rows before attempt 1 (8 since; see §2.5)
 
 | Run ID | Status | Idempotency key |
 | --- | --- | --- |
@@ -142,11 +143,11 @@ was issued.
 | `986ac9ec-a423-4da7-81d3-4a84ffabc181` | `failed` | `swarm-v2-smoke-attempt-2-20260824-04c1094` |
 | `0b1b7329-3a88-4155-b422-5e89bf5e01bc` | `failed` | `swarm-v2-smoke-20260824-4fecdfe-01` |
 | `5bd80a2e-ae7b-4c8c-aa0d-624ec28931ec` | `completed` | `swarm-v2-smoke-20260825-4dbdcd6-01` |
-| `555101dc-46f6-4048-bd67-efccbc98f528` | `queued` | `catalog-government-capture-20260919-01` |
+| `555101dc-46f6-4048-bd67-efccbc98f528` | `queued` (then; `cancelled` / retired since) | `catalog-government-capture-20260919-01` |
 
-Rows under the proposed key `stage-d-expansion-1-20260918-01`: **0**.
+Rows under the attempt-1 key `stage-d-expansion-1-20260918-01`: **0** at that time; **1** (`timed_out`) since attempt 1 ran. The key is consumed.
 
-### 2.2 Cloud Run — exactly **7** Worker executions, every one terminal, **0 active**
+### 2.2 Cloud Run — exactly **7** Worker executions before attempt 1, every one terminal, **0 active** (8 since; see §2.5)
 
 `milo-agent-worker-mcfrx`, `-gggdc`, `-dk4xv`, `-gnj5d`, `-fvfcb`, `-2tckh`,
 `-bw8kj`.
@@ -562,7 +563,7 @@ this document is relied on.
 
 `555101dc-46f6-4048-bd67-efccbc98f528`
 (`catalog-government-capture-20260919-01`) is an operator-prepared capture
-run: `status=queued`, `launch_state=none`, `worker_id=NULL`,
+run: `status=queued` when measured on 2026-09-18 (`cancelled` / retired since, `launch_state=none` throughout), `worker_id=NULL`,
 `started_at=NULL`, `attempt=1`, and **zero rows** in `run_events`,
 `run_usage_ledger`, `model_call_budget_reservations`, `worker_heartbeats`,
 `run_invocations`, `run_checkpoints` and `run_blackboards`. Its

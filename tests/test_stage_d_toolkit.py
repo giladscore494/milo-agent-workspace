@@ -2514,7 +2514,7 @@ def test_authorization_doc_records_the_discovered_baselines():
     for fact in (GOV_RUN_ID, GOV_KEY, STAGE_D_KEY, RELEASE_SHA,
                  "big-cabinet-457321-t7", "us-central1"):
         assert fact in text
-    assert "8" in text and "9" in text
+    assert "exactly **9**" in text and "**8**, all terminal" in text
     assert CONSUMED_ATTEMPT_1_KEY in text and "timed_out" in text
 
 

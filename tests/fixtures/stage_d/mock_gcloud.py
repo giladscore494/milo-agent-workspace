@@ -67,10 +67,11 @@ def default_state() -> dict:
         "worker_secrets": [],
         "api_env": dict(DEFAULT_FLAGS),
         "api_secrets": [],
-        # Seven terminal executions: the discovered live baseline.
+        # Eight terminal executions: the live baseline re-measured after
+        # attempt 1 (xmd2m is attempt 1's execution).
         "executions": [
             {"name": f"milo-agent-worker-{suffix}", "terminal": True}
-            for suffix in ("mcfrx", "gggdc", "dk4xv", "gnj5d", "fvfcb", "2tckh", "bw8kj")
+            for suffix in ("mcfrx", "gggdc", "dk4xv", "gnj5d", "fvfcb", "2tckh", "bw8kj", "xmd2m")
         ],
         "jobs": [WORKER_JOB],
         "govcheck_ok": True,

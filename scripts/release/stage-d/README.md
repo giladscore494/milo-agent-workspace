@@ -89,9 +89,10 @@ no gate ever deletes or hides history to make an increment look right.
 
 ## The prepared Government capture run is an invariant, never a Stage D run
 
-`555101dc-46f6-4048-bd67-efccbc98f528` (`status=queued`,
-`launch_state=none`, `worker_id=NULL`, `started_at=NULL`, zero rows in every
-trace table) is an operator-prepared capture run. Stage D **never executes
+`555101dc-46f6-4048-bd67-efccbc98f528` (`status=queued` when prepared,
+`cancelled` since it was retired through `resolve-government-capture.sh`;
+`launch_state=none` throughout, `worker_id=NULL`, `started_at=NULL`, zero rows
+in every trace table) is an operator-prepared capture run. Stage D **never executes
 it, never claims it and never counts it as authorization to capture.**
 
 Two repository facts already make it unreachable, and Stage D **proves**
