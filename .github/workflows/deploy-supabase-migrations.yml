@@ -54,7 +54,7 @@ jobs:
         before deciding whether a one-time migration history reconciliation is required.
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # The manual authorization gate. It runs FIRST -- before the Supabase CLI
       # exists, before any production credential is present in ANY step
@@ -103,7 +103,7 @@ jobs:
           echo "Manual authorization validated for mode: ${MODE_INPUT}"
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -111,7 +111,7 @@ jobs:
         run: python scripts/check_migrations.py
 
       - name: Set up Supabase CLI
-        uses: supabase/setup-cli@v1
+        uses: supabase/setup-cli@v2
         with:
           version: 2.31.8
 
