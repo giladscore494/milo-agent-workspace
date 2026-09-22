@@ -141,7 +141,8 @@ def expected_prior_runs() -> int | None:
 
     A missing, empty or non-integer STAGE_D_EXPECTED_PRIOR_RUNS returns
     None so callers fail closed — the gates must never fall back to
-    assuming an empty system. Production holds seven real rows.
+    assuming an empty system. Production holds real rows (eight since
+    attempt 1); the exact count is pinned in stage-d-env.sh, never here.
     """
     raw = os.environ.get("STAGE_D_EXPECTED_PRIOR_RUNS")
     if raw is None or not raw.strip().isdigit():
@@ -593,9 +594,10 @@ def preflight() -> None:
     )
 
     # Stage D precondition: the runs table must hold EXACTLY the pinned
-    # live baseline of 7 rows — enforced with a real server-side exact
-    # count, failing closed if the count OR the baseline configuration is
-    # unavailable/invalid. A count of 6 fails exactly like a count of 8.
+    # live baseline (STAGE_D_EXPECTED_PRIOR_RUNS, 8 since attempt 1) —
+    # enforced with a real server-side exact count, failing closed if the
+    # count OR the baseline configuration is unavailable/invalid. A count
+    # one below the pin fails exactly like a count one above it.
     expected_prior = expected_prior_runs()
     total_runs = count_exact("/rest/v1/runs?select=id")
     checks["existing_runs"] = "UNKNOWN" if total_runs is None else str(total_runs)

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Shared Stage D parameters. Sourced by every step script. No secrets here.
 #
-# STATUS: PROPOSED authorization. Nothing in this directory has been
-# executed against production. Merging it authorizes nothing — the one
-# bounded paid run it describes requires a fresh, explicit, separate
-# operator authorization (STAGED_ACTIVATION.md, Stage D).
+# STATUS: attempt 1 of expansion step 1 WAS executed on 2026-09-19 under the
+# key stage-d-expansion-1-20260918-01 and terminalized `timed_out` (a
+# controlled fail-closed terminal, not a pass; see STAGE_D_AUTHORIZATION.md
+# §9.1). Attempt 2 is PROPOSED and has NOT been executed. Merging this
+# authorizes nothing — the one bounded paid run it describes requires a
+# fresh, explicit, separate operator authorization (STAGED_ACTIVATION.md,
+# Stage D) against a NEW reviewed release.
 #
 # AUTHORIZED CONSTANTS — the proposed Stage D authorization covers ONE
 # exact production target, ONE exact release and exactly ONE new paid run.
@@ -146,7 +149,7 @@ stage_d_pin STAGE_D_PROBE_IMAGE_DIGEST "sha256:78387bc3881b8273120a12ebe6c1ab22b
 # Regenerate deliberately, in a reviewed commit, after an intended change:
 #   sha256sum scripts/release/stage-d/probe_db.py scripts/release/stage-d/probe_gateway.py
 # ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_PROBE_DB_SHA256 "d3ce221d90da5f08223b5e96bb12df384789e38409fb977689590b74f3db8a5a"
+stage_d_pin STAGE_D_PROBE_DB_SHA256 "7bdfce611726876f5d89756454c51bc713000bce529c149a992941da40bb9ae2"
 stage_d_pin STAGE_D_PROBE_GW_SHA256 "359d7cbfc7195f9fee333480af0f7fe1ae09ca8ce339a0a7942bfe823dde4bce"
 
 # ---------------------------------------------------------------------------
@@ -155,38 +158,52 @@ stage_d_pin STAGE_D_PROBE_GW_SHA256 "359d7cbfc7195f9fee333480af0f7fe1ae09ca8ce33
 # A brand-new key. Every key production has ever seen is consumed history
 # and is never reused: stage-c-smoke-0001 (Attempt 5/6),
 # stage-c-smoke-attempt-7-20260819 (Attempt 7 — Stage C PASSED, consumed),
-# the four swarm-v2-smoke-* keys, and the Government capture key. Only zero
-# pre-existing rows under the Stage D key are acceptable.
+# the four swarm-v2-smoke-* keys, the Government capture key, and
+# stage-d-expansion-1-20260918-01 (Stage D expansion step 1, attempt 1 —
+# EXECUTED 2026-09-19 as run 3772fc84-420c-4a66-9e79-d58649d4e9b4, terminal
+# `timed_out` after 1808s / 113 model calls / $0.337535; a controlled
+# fail-closed terminal, NOT a pass; consumed). Only zero pre-existing rows
+# under the Stage D key are acceptable, which is why attempt 2 needs its own
+# key rather than the consumed one.
 # ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_IDEMPOTENCY_KEY "stage-d-expansion-1-20260918-01"
+stage_d_pin STAGE_D_IDEMPOTENCY_KEY "stage-d-expansion-1-attempt-2-20260922-01"
 
 # ---------------------------------------------------------------------------
 # Exact LIVE baselines that must already hold before the Stage D run is
 # created (preflight fails closed on any other exact count). Both were
-# discovered read-only against production on 2026-09-18:
+# re-discovered read-only against production on 2026-09-22, after Stage D
+# expansion step 1 attempt 1 had been executed and had terminalized:
 #
-#   DATABASE — public.runs holds exactly 7 rows:
+#   DATABASE — public.runs holds exactly 8 rows, every one TERMINAL:
 #     37912575…  failed     stage-c-smoke-0001                     (Stage C A6)
 #     8b4a4277…  completed  stage-c-smoke-attempt-7-20260819       (Stage C A7)
 #     0d44d491…  cancelled  swarm-v2-smoke-20260824-04c1094
 #     986ac9ec…  failed     swarm-v2-smoke-attempt-2-20260824-04c1094
 #     0b1b7329…  failed     swarm-v2-smoke-20260824-4fecdfe-01
 #     5bd80a2e…  completed  swarm-v2-smoke-20260825-4dbdcd6-01
-#     555101dc…  queued     catalog-government-capture-20260919-01 (PREPARED
-#                           Government capture — NOT a Stage D run; see the
-#                           Government-capture section below)
+#     555101dc…  cancelled  catalog-government-capture-20260919-01 (PREPARED
+#                           Government capture, RETIRED via
+#                           resolve-government-capture.sh — NOT a Stage D
+#                           run; see the Government-capture section below)
+#     3772fc84…  timed_out  stage-d-expansion-1-20260918-01        (Stage D
+#                           step 1 attempt 1, 2026-09-19 — consumed)
 #
-#   CLOUD RUN — exactly 7 Worker executions, EVERY ONE terminal, zero
-#   active: milo-agent-worker-{mcfrx,gggdc,dk4xv,gnj5d,fvfcb,2tckh,bw8kj}.
+#   CLOUD RUN — exactly 8 Worker executions, EVERY ONE terminal, zero
+#   active: milo-agent-worker-{mcfrx,gggdc,dk4xv,gnj5d,fvfcb,2tckh,bw8kj,
+#   xmd2m}. xmd2m is attempt 1's execution (retriedCount=1: the task exited
+#   1 on the recorded timeout and Cloud Run's one retry found the run
+#   already terminal and exited 0 — see tests/test_worker.py).
 #
+# The previous pin (7/7, discovered 2026-09-18) was correct for attempt 1
+# and is now stale by exactly that one consumed run and its one execution.
 # The gates verify a ONE-run/ONE-execution increment over these exact live
-# baselines (expected post-run totals: 8 database runs and 8 visible
+# baselines (expected post-run totals: 9 database runs and 9 visible
 # terminal executions) — never an empty system, and never "some run
-# exists". A count of 6 is a violation exactly like a count of 8: a row
+# exists". A count of 7 is a violation exactly like a count of 9: a row
 # that vanished is as much a drift as a row that appeared.
 # ---------------------------------------------------------------------------
-stage_d_pin STAGE_D_EXPECTED_PRIOR_RUNS "7"
-stage_d_pin STAGE_D_EXPECTED_PRIOR_EXECUTIONS "7"
+stage_d_pin STAGE_D_EXPECTED_PRIOR_RUNS "8"
+stage_d_pin STAGE_D_EXPECTED_PRIOR_EXECUTIONS "8"
 
 # The ONLY terminal state that counts as a PASS. failed / cancelled /
 # timed_out / budget_exhausted / partial_success are controlled fail-closed

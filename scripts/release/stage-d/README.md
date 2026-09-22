@@ -1,11 +1,22 @@
 # Stage D operator toolkit — PROPOSED authorization for ONE bounded paid run
 
-> ## STATUS: PROPOSED — NOT AUTHORIZED, NOT EXECUTED
+> ## STATUS: ATTEMPT 2 PROPOSED — NOT AUTHORIZED, NOT EXECUTED
 >
-> **Nothing in this directory has been run against production.** No run was
-> created, no Worker execution was launched, no flag was changed, no secret
-> was bound, no probe job was created, and no database row was written or
-> deleted. Every number below was obtained **read-only**.
+> **Attempt 1 of this expansion step WAS executed on 2026-09-19** under the
+> key `stage-d-expansion-1-20260918-01`, as run
+> `3772fc84-420c-4a66-9e79-d58649d4e9b4` / Worker execution
+> `milo-agent-worker-xmd2m`, and terminalized **`timed_out`**
+> (`RUN_DURATION_EXCEEDED`, 1808 s; 113 model calls; $0.337535 tracked). Per
+> the acceptance policy below that is a controlled **fail-closed terminal,
+> not a pass** — Stage D expansion step 1 has **NOT** passed, no acceptance
+> record exists, and the attempt-1 key is **consumed**. The pinned baselines
+> in `stage-d-env.sh` were re-measured on 2026-09-22 and now include that
+> run and that execution (8 / 8). Attempt 2 carries a fresh key
+> (`stage-d-expansion-1-attempt-2-20260922-01`) with zero pre-existing rows.
+>
+> **Attempt 2 has not been run against production.** Every number below was
+> obtained **read-only**; re-pinning the baseline created no run, launched
+> no execution, changed no flag and wrote no row.
 >
 > **Merging this PR authorizes nothing.** The one bounded paid run described
 > here is the first Stage D expansion step of
@@ -41,15 +52,18 @@ or the project count are separate later steps and are not proposed here.
 | Browser/Vercel execution surface | disabled | disabled |
 | Government capture | n/a | **never executed; invariant enforced** |
 
-## Discovered production baselines (read-only, 2026-09-18)
+## Discovered production baselines (read-only, re-measured 2026-09-22)
 
-Everything the gates pin was measured, not assumed.
+Everything the gates pin was measured, not assumed. The 2026-09-18 baseline
+(7 runs / 7 executions) was correct for attempt 1; attempt 1 consumed exactly
+one run and one execution, so the pin moved by exactly that increment.
 
 | Quantity | Live value | After the one authorized run |
 | --- | --- | --- |
-| `public.runs` rows | **7** | exactly **8** |
-| Rows under the Stage D key `stage-d-expansion-1-20260918-01` | **0** | exactly **1** |
-| Visible Worker executions | **7**, every one terminal, **0 active** | exactly **8**, every one terminal |
+| `public.runs` rows | **8**, every one terminal | exactly **9** |
+| Rows under the attempt-2 key `stage-d-expansion-1-attempt-2-20260922-01` | **0** | exactly **1** |
+| Rows under the consumed attempt-1 key `stage-d-expansion-1-20260918-01` | **1** (`timed_out`) | unchanged — never reused |
+| Visible Worker executions | **8**, every one terminal, **0 active** | exactly **9**, every one terminal |
 | API image digest | `sha256:04275e81…` (accepted; serving revision runs it) | unchanged — never rebuilt |
 | Worker image digest | `sha256:d3743e5a…` (accepted; tag resolves to it) | unchanged — never rebuilt |
 | API `MILO_ENABLE_RUN_CREATION` / `JOB_LAUNCHER` | `false` / `disabled` | restored to `false` / `disabled` |
@@ -61,11 +75,13 @@ Everything the gates pin was measured, not assumed.
 | `MILO_PROVIDER_MAX_CONCURRENCY` (worker) | **8** (drift) | **2** (Attempt 7 value) |
 | Disposable probe jobs | **absent** | created, then deleted **and proven absent** |
 
-The seven existing run rows are `stage-c-smoke-0001` (failed),
+The eight existing run rows are `stage-c-smoke-0001` (failed),
 `stage-c-smoke-attempt-7-20260819` (completed), four `swarm-v2-smoke-*`
-rows, and the prepared Government capture
-`catalog-government-capture-20260919-01` (queued). The seven executions are
-`milo-agent-worker-{mcfrx,gggdc,dk4xv,gnj5d,fvfcb,2tckh,bw8kj}`.
+rows, the prepared Government capture
+`catalog-government-capture-20260919-01` (now `cancelled` / `launch_state=none`,
+i.e. retired through `resolve-government-capture.sh`), and attempt 1's
+`stage-d-expansion-1-20260918-01` (`timed_out`). The eight executions are
+`milo-agent-worker-{mcfrx,gggdc,dk4xv,gnj5d,fvfcb,2tckh,bw8kj,xmd2m}`.
 
 A count **below** a pinned baseline fails exactly like a count above it: a
 row or execution that vanished is as much a drift as one that appeared, and
@@ -73,9 +89,10 @@ no gate ever deletes or hides history to make an increment look right.
 
 ## The prepared Government capture run is an invariant, never a Stage D run
 
-`555101dc-46f6-4048-bd67-efccbc98f528` (`status=queued`,
-`launch_state=none`, `worker_id=NULL`, `started_at=NULL`, zero rows in every
-trace table) is an operator-prepared capture run. Stage D **never executes
+`555101dc-46f6-4048-bd67-efccbc98f528` (`status=queued` when prepared,
+`cancelled` since it was retired through `resolve-government-capture.sh`;
+`launch_state=none` throughout, `worker_id=NULL`, `started_at=NULL`, zero rows
+in every trace table) is an operator-prepared capture run. Stage D **never executes
 it, never claims it and never counts it as authorization to capture.**
 
 Two repository facts already make it unreachable, and Stage D **proves**

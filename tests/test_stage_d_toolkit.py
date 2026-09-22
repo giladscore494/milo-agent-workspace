@@ -60,9 +60,10 @@ CHECKOUT_SHA = subprocess.run(
     ["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "HEAD"],
     capture_output=True, text=True, timeout=60).stdout.strip()
 REGISTRY = "us-central1-docker.pkg.dev/big-cabinet-457321-t7/milo-agent"
-STAGE_D_KEY = "stage-d-expansion-1-20260918-01"
-EXPECTED_PRIOR_RUNS = "7"
-EXPECTED_PRIOR_EXECUTIONS = "7"
+STAGE_D_KEY = "stage-d-expansion-1-attempt-2-20260922-01"
+CONSUMED_ATTEMPT_1_KEY = "stage-d-expansion-1-20260918-01"
+EXPECTED_PRIOR_RUNS = "8"
+EXPECTED_PRIOR_EXECUTIONS = "8"
 
 GOV_RUN_ID = "555101dc-46f6-4048-bd67-efccbc98f528"
 GOV_KEY = "catalog-government-capture-20260919-01"
@@ -90,6 +91,7 @@ CONSUMED_KEYS = (
     "swarm-v2-smoke-20260824-4fecdfe-01",
     "swarm-v2-smoke-20260825-4dbdcd6-01",
     GOV_KEY,
+    CONSUMED_ATTEMPT_1_KEY,
 )
 
 # The operating envelope, READ from the ONE canonical runtime policy exactly
@@ -277,11 +279,12 @@ def test_env_pins_the_engine_parallelism_and_the_policy_fingerprint():
     ("STAGE_D_RELEASE_SHA", "791f7af9" + "0" * 32),
     ("STAGE_D_RELEASE_SHA", "88224bccc836f80f3dc1d173306a1aa63cddcc7a"),  # the Stage C release
     ("STAGE_D_EXPECTED_PRIOR_RUNS", "0"),   # pretending the history is empty
-    ("STAGE_D_EXPECTED_PRIOR_RUNS", "6"),   # pretending the capture row is gone
-    ("STAGE_D_EXPECTED_PRIOR_RUNS", "8"),
+    ("STAGE_D_EXPECTED_PRIOR_RUNS", "7"),   # the stale attempt-1 baseline (the consumed run is gone)
+    ("STAGE_D_EXPECTED_PRIOR_RUNS", "9"),
     ("STAGE_D_EXPECTED_PRIOR_EXECUTIONS", "0"),
     ("STAGE_D_EXPECTED_PRIOR_EXECUTIONS", "1"),  # the stale Stage C baseline
-    ("STAGE_D_EXPECTED_PRIOR_EXECUTIONS", "8"),
+    ("STAGE_D_EXPECTED_PRIOR_EXECUTIONS", "7"),  # the stale attempt-1 baseline
+    ("STAGE_D_EXPECTED_PRIOR_EXECUTIONS", "9"),
     ("STAGE_D_ACCEPTABLE_TERMINAL_STATES", "completed,failed,budget_exhausted"),
     ("STAGE_D_GOV_CAPTURE_RUN_ID", "8b4a4277-fdf0-41b2-8515-d7e1d50e441b"),
     ("STAGE_D_WORKFLOW_KEY", "swarm_v2"),
@@ -1060,7 +1063,7 @@ def test_the_execution_gate_refuses_an_increment_the_policy_did_not_authorize():
     """A widened shell expression is caught by the verifier, not accepted."""
     listing = [terminal(n) for n in LIVE_EXECUTION_NAMES]
     listing += [terminal("milo-agent-worker-a"), terminal("milo-agent-worker-b")]
-    result = run_verify_executions(listing, 9, baseline=7)
+    result = run_verify_executions(listing, 10, baseline=8)
     assert result.returncode != 0
     verdict = json.loads(result.stdout)
     assert verdict["implied_increment"] == 2 and verdict["authorized_increment"] == 1
@@ -1068,7 +1071,7 @@ def test_the_execution_gate_refuses_an_increment_the_policy_did_not_authorize():
 
 def test_the_execution_gate_accepts_exactly_the_authorized_increment():
     listing = [terminal(n) for n in LIVE_EXECUTION_NAMES] + [terminal("milo-agent-worker-staged1")]
-    result = run_verify_executions(listing, 8, baseline=7)
+    result = run_verify_executions(listing, 9, baseline=8)
     assert result.returncode == 0, result.stdout
     assert json.loads(result.stdout)["authorized_increment"] == 1
 
@@ -1112,7 +1115,7 @@ def test_verify_caps_refuses_an_engine_variable_on_the_api(tmp_path):
 LIVE_EXECUTION_NAMES = [
     "milo-agent-worker-mcfrx", "milo-agent-worker-gggdc", "milo-agent-worker-dk4xv",
     "milo-agent-worker-gnj5d", "milo-agent-worker-fvfcb", "milo-agent-worker-2tckh",
-    "milo-agent-worker-bw8kj",
+    "milo-agent-worker-bw8kj", "milo-agent-worker-xmd2m",
 ]
 
 
@@ -1131,20 +1134,20 @@ def run_verify_executions(listing, expected_total, baseline=None):
     return subprocess.run(command, input=payload, capture_output=True, text=True, timeout=60)
 
 
-def test_exactly_seven_visible_terminal_executions_pass_the_pre_run_gate():
-    result = run_verify_executions([terminal(n) for n in LIVE_EXECUTION_NAMES], 7)
+def test_exactly_eight_visible_terminal_executions_pass_the_pre_run_gate():
+    result = run_verify_executions([terminal(n) for n in LIVE_EXECUTION_NAMES], 8)
     assert result.returncode == 0, result.stdout
     verdict = json.loads(result.stdout)
-    assert verdict["ok"] is True and verdict["total"] == 7 and verdict["nonterminal"] == 0
+    assert verdict["ok"] is True and verdict["total"] == 8 and verdict["nonterminal"] == 0
 
 
-@pytest.mark.parametrize("count", [0, 1, 6, 8, 9])
+@pytest.mark.parametrize("count", [0, 1, 7, 9, 10])
 def test_pre_run_gate_refuses_any_count_other_than_the_pinned_baseline(count):
     """BASELINE DRIFT — in both directions."""
     listing = [terminal(f"milo-agent-worker-x{i}") for i in range(count)]
-    result = run_verify_executions(listing, 7)
+    result = run_verify_executions(listing, 8)
     assert result.returncode != 0
-    assert "expected exactly 7" in result.stdout
+    assert "expected exactly 8" in result.stdout
 
 
 @pytest.mark.parametrize("status", [
@@ -1158,34 +1161,34 @@ def test_an_unexpected_active_or_unverifiable_execution_refuses(status):
     """UNEXPECTED ACTIVE EXECUTION — and fail-safe on unverifiable status."""
     listing = [terminal(n) for n in LIVE_EXECUTION_NAMES]
     listing.append({"metadata": {"name": "milo-agent-worker-live1"}, "status": status})
-    result = run_verify_executions(listing, 8)  # count is right; state is not
+    result = run_verify_executions(listing, 9)  # count is right; state is not
     assert result.returncode != 0
     verdict = json.loads(result.stdout)
     assert verdict["ok"] is False and verdict["nonterminal"] == 1
     assert "milo-agent-worker-live1" in json.dumps(verdict)
 
 
-def test_exactly_eight_terminal_executions_pass_the_post_run_gate():
+def test_exactly_nine_terminal_executions_pass_the_post_run_gate():
     listing = [terminal(n) for n in LIVE_EXECUTION_NAMES] + [terminal("milo-agent-worker-staged1")]
-    assert run_verify_executions(listing, 8).returncode == 0
+    assert run_verify_executions(listing, 9).returncode == 0
 
 
 @pytest.mark.parametrize("extra", [0, 2, 3])
 def test_post_run_gate_refuses_unless_exactly_one_execution_was_added(extra):
     listing = [terminal(n) for n in LIVE_EXECUTION_NAMES]
     listing += [terminal(f"milo-agent-worker-new{i}") for i in range(extra)]
-    assert run_verify_executions(listing, 8).returncode != 0
+    assert run_verify_executions(listing, 9).returncode != 0
 
 
 @pytest.mark.parametrize("listing", ["not json", '{"not": "a list"}', ""])
 def test_unparseable_listings_fail_closed(listing):
-    result = run_verify_executions(listing, 7)
+    result = run_verify_executions(listing, 8)
     assert result.returncode != 0
     assert "failing closed" in result.stdout
 
 
 def test_execution_gate_never_claims_success_with_problems():
-    verdict = json.loads(run_verify_executions([], 7).stdout)
+    verdict = json.loads(run_verify_executions([], 8).stdout)
     assert verdict["ok"] is False and verdict["problems"]
 
 
@@ -1246,7 +1249,7 @@ def wire_db(db, monkeypatch, *, capture_row=PREPARED_CAPTURE_ROW, counts=None, o
         if "/rest/v1/runs?select=id&idempotency_key=eq." in path:
             return 0
         if path == "/rest/v1/runs?select=id":
-            return 7
+            return int(EXPECTED_PRIOR_RUNS)
         return 0  # every Government-capture trace table
 
     monkeypatch.setattr(db, "call", fake_call)
@@ -1267,7 +1270,7 @@ def test_preflight_passes_on_the_exact_live_baseline(db, monkeypatch, capsys):
     assert verdict["government_capture"]["posture"] == db.GOV_PREPARED
 
 
-@pytest.mark.parametrize("total", [0, 6, 8, 12])
+@pytest.mark.parametrize("total", [0, 7, 9, 12])
 def test_preflight_refuses_on_database_baseline_drift(db, monkeypatch, capsys, total):
     """BASELINE DRIFT — a vanished row fails exactly like an extra one."""
     monkeypatch.setenv("STAGE_D_EXPECTED_PRIOR_RUNS", EXPECTED_PRIOR_RUNS)
@@ -2495,7 +2498,11 @@ AUTHORIZATION_DOC = REPO / "docs" / "production-readiness" / "STAGE_D_AUTHORIZAT
 def test_authorization_doc_is_marked_proposed_not_accepted():
     text = AUTHORIZATION_DOC.read_text()
     assert "PROPOSED" in text
-    assert "Nothing in this proposal has been executed" in text
+    # Attempt 1 WAS executed (2026-09-19) and terminalized `timed_out`; the
+    # document must say so, must record it as a controlled fail-closed
+    # terminal rather than a pass, and must state that attempt 2 is unexecuted.
+    assert "Attempt 1 was executed on 2026-09-19" in text
+    assert "Attempt 2 has NOT been executed" in text
     assert "Merging this PR authorizes nothing" in text
     for false_claim in ("Stage D PASSED", "Stage D is PASSED", "Stage D acceptance record",
                         "STAGE D PASSED"):
@@ -2507,7 +2514,8 @@ def test_authorization_doc_records_the_discovered_baselines():
     for fact in (GOV_RUN_ID, GOV_KEY, STAGE_D_KEY, RELEASE_SHA,
                  "big-cabinet-457321-t7", "us-central1"):
         assert fact in text
-    assert "7" in text and "8" in text
+    assert "exactly **9**" in text and "**8**, all terminal" in text
+    assert CONSUMED_ATTEMPT_1_KEY in text and "timed_out" in text
 
 
 def test_authorization_doc_states_the_cap_derivation_and_the_held_values():
@@ -2520,8 +2528,9 @@ def test_authorization_doc_states_the_cap_derivation_and_the_held_values():
 
 def test_readme_is_marked_proposed_and_not_executed():
     text = (STAGE_D / "README.md").read_text()
-    assert "PROPOSED — NOT AUTHORIZED, NOT EXECUTED" in text
+    assert "ATTEMPT 2 PROPOSED — NOT AUTHORIZED, NOT EXECUTED" in text
     assert "Merging this PR authorizes nothing" in text
+    assert CONSUMED_ATTEMPT_1_KEY in text and "timed_out" in text
 
 
 def test_stage_c_acceptance_record_still_says_stage_c_is_consumed():

@@ -34,9 +34,10 @@ this set wins and the older document carries an archive banner.
 | [STATUS.md](STATUS.md) | Live branch/PR/test status |
 | [STAGE_B_ACCEPTANCE.md](STAGE_B_ACCEPTANCE.md) | Stage B acceptance record |
 | [STAGE_C_ACCEPTANCE.md](STAGE_C_ACCEPTANCE.md) | Stage C acceptance record — **PASSED 2026-08-22; the one-run authorization is consumed** |
-| [STAGE_D_AUTHORIZATION.md](STAGE_D_AUTHORIZATION.md) | Stage D expansion step 1 — **PROPOSED authorization for one bounded paid run; NOT authorized and NOT executed** |
+| [STAGE_D_AUTHORIZATION.md](STAGE_D_AUTHORIZATION.md) | Stage D expansion step 1 — **attempt 1 executed 2026-09-19 and FAILED (`timed_out`); attempt 2 PROPOSED, NOT authorized and NOT executed** |
 | [../catalog-code1-operator-capture.md](../catalog-code1-operator-capture.md) | CODE-1: the guarded operator Government capture entrypoint — arguments, prerequisites, stop conditions, report contract and rollback. Implemented in code; **no live capture has been executed** |
-| [OPERATOR_2_CONTROL_PLANE_READ_ONLY_REVIEW_2026-09-21.md](OPERATOR_2_CONTROL_PLANE_READ_ONLY_REVIEW_2026-09-21.md) | Read-only Production review after Consoles 1-6: required migration/RPC inventory, ACL/RLS posture, catalog state, run baseline. **Four runtime-required migrations are unapplied** |
+| [OPERATOR_2_CONTROL_PLANE_READ_ONLY_REVIEW_2026-09-21.md](OPERATOR_2_CONTROL_PLANE_READ_ONLY_REVIEW_2026-09-21.md) | Read-only Production review after Consoles 1-6: required migration/RPC inventory, ACL/RLS posture, catalog state, run baseline. **Four runtime-required migrations were unapplied at review time — applied 2026-09-22, see OPERATOR_3** |
+| [OPERATOR_3_PRODUCTION_ALIGNMENT_2026-09-22.md](OPERATOR_3_PRODUCTION_ALIGNMENT_2026-09-22.md) | Production migration alignment to Console 6 (38/38, head `20260921000200`): SHA-bound backup / dry-run / apply run ids, the 45/45 derived RPC inventory re-proven from `pg_proc`, run identity, ACLs, and the stale-release prerequisite for any future paid run |
 | [../roadmap/MILO_GAP_AUDIT_2026-09-16.md](../roadmap/MILO_GAP_AUDIT_2026-09-16.md) | Gap audit after Catalog PR3 / F4 / F5: what is production-connected, what exists but is not activated, what is fixture-only, and what remains missing |
 
 Operator tooling lives in `scripts/release/` (read-only by default; see

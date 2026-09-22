@@ -46,13 +46,31 @@
 > `docs/production-readiness/RUNTIME_POLICY.md` for the canonical policy.
 
 
-> ## STATUS: PROPOSED. NOT AUTHORIZED. NOT EXECUTED.
+> ## STATUS: ATTEMPT 1 EXECUTED AND FAILED (`timed_out`). ATTEMPT 2 PROPOSED. NOT AUTHORIZED. NOT EXECUTED.
 >
-> **Nothing in this proposal has been executed against production.** No run
-> was created, no Worker execution was launched, no flag was changed, no
-> secret was bound, no probe job was created, no Cloud Run job or service
-> was mutated, and no database row was written, updated or deleted. Every
-> number in this document was obtained **read-only** on 2026-09-18.
+> **Attempt 1 was executed on 2026-09-19** under the key
+> `stage-d-expansion-1-20260918-01` and terminalized **`timed_out`** — see
+> §9 for the recorded outcome. Under the acceptance policy in §7 that is a
+> controlled fail-closed terminal and **not a pass**: no acceptance record
+> exists for this stage and none may be written. The attempt-1 key is
+> consumed and is never reused.
+>
+> **Attempt 2 has NOT been executed.** Re-pinning the live baselines
+> (2026-09-22, read-only: 8 runs / 8 executions, all terminal) created no
+> run, launched no execution, changed no flag, bound no secret, created no
+> probe job, mutated no Cloud Run job or service and wrote no database row.
+> Every 2026-09-18 number below is retained as the attempt-1 record; the
+> re-measured values are in §2.5 and in `stage-d-env.sh`.
+>
+> **Re-authorization is required before attempt 2**, and it must be against
+> a NEW release: the pinned release `84cd8696…` predates the immutable run
+> identity contract now enforced by Production (migration
+> `20260921000200`, applied 2026-09-22), which removed the
+> `create_message_and_run` / `_v2` RPCs that release's API calls; and the
+> toolkit now requires what that release cannot supply — `verify_caps.py`
+> requires `MILO_RELEASE_SHA` on both surfaces, and `probe_db.py`'s evidence
+> gate requires a persisted `run_identity`. Nothing here grants that
+> authorization or that release.
 >
 > **Merging this PR authorizes nothing.** This document is a *request* for
 > one bounded paid production run, together with the toolkit that would
@@ -74,8 +92,10 @@
 - **Runbook context:** [`STAGED_ACTIVATION.md`](STAGED_ACTIVATION.md), Stage D
 - **Pinned release:** `84cd8696119c24662a954d0f0e23195268dab23f`
 - **Production project / region:** `big-cabinet-457321-t7` / `us-central1`
-- **Proposed run identity:** `stage-d-expansion-1-20260918-01` (fresh; zero
-  pre-existing rows)
+- **Attempt-1 run identity (consumed):** `stage-d-expansion-1-20260918-01`
+  (one row, `timed_out`)
+- **Proposed attempt-2 run identity:** `stage-d-expansion-1-attempt-2-20260922-01`
+  (fresh; zero pre-existing rows, verified read-only 2026-09-22)
 
 ## 1. What this expansion step is — and what it deliberately is not
 
@@ -106,14 +126,14 @@ enabling `GATEWAY_ALLOW_EXECUTION_ROUTES` or any browser execution surface;
 a second paid run; any change to the Stage C toolkit or its consumed
 constants.
 
-## 2. Discovered production baselines (read-only, 2026-09-18)
+## 2. Discovered production baselines (read-only, 2026-09-18 — the ATTEMPT-1 record; the re-measured attempt-2 baselines are in §2.5)
 
 Every pinned value was **measured**, not assumed. Method: the read-only
 Supabase production connection for database facts, and `gcloud … describe` /
 `… list` for Cloud Run, IAM and Secret Manager facts. No mutating command
 was issued.
 
-### 2.1 Database — `public.runs` holds exactly **7** rows
+### 2.1 Database — `public.runs` held exactly **7** rows before attempt 1 (8 since; see §2.5)
 
 | Run ID | Status | Idempotency key |
 | --- | --- | --- |
@@ -123,11 +143,11 @@ was issued.
 | `986ac9ec-a423-4da7-81d3-4a84ffabc181` | `failed` | `swarm-v2-smoke-attempt-2-20260824-04c1094` |
 | `0b1b7329-3a88-4155-b422-5e89bf5e01bc` | `failed` | `swarm-v2-smoke-20260824-4fecdfe-01` |
 | `5bd80a2e-ae7b-4c8c-aa0d-624ec28931ec` | `completed` | `swarm-v2-smoke-20260825-4dbdcd6-01` |
-| `555101dc-46f6-4048-bd67-efccbc98f528` | `queued` | `catalog-government-capture-20260919-01` |
+| `555101dc-46f6-4048-bd67-efccbc98f528` | `queued` (then; `cancelled` / retired since) | `catalog-government-capture-20260919-01` |
 
-Rows under the proposed key `stage-d-expansion-1-20260918-01`: **0**.
+Rows under the attempt-1 key `stage-d-expansion-1-20260918-01`: **0** at that time; **1** (`timed_out`) since attempt 1 ran. The key is consumed.
 
-### 2.2 Cloud Run — exactly **7** Worker executions, every one terminal, **0 active**
+### 2.2 Cloud Run — exactly **7** Worker executions before attempt 1, every one terminal, **0 active** (8 since; see §2.5)
 
 `milo-agent-worker-mcfrx`, `-gggdc`, `-dk4xv`, `-gnj5d`, `-fvfcb`, `-2tckh`,
 `-bw8kj`.
@@ -166,11 +186,25 @@ the proposal requires.
 
 ### 2.5 Expected post-run baselines
 
+Attempt 1 (2026-09-18 baseline, now history):
+
 | Quantity | Before | After exactly one authorized run |
 | --- | --- | --- |
 | `public.runs` rows | **7** | exactly **8** |
 | Rows under `stage-d-expansion-1-20260918-01` | **0** | exactly **1** |
 | Visible Worker executions | **7**, all terminal, 0 active | exactly **8**, all terminal, 0 active |
+
+Attempt 1 produced exactly that increment (8 rows, one of them under the
+attempt-1 key; 8 executions, all terminal). Attempt 2 (re-measured
+read-only 2026-09-22, pinned in `stage-d-env.sh`):
+
+| Quantity | Before | After exactly one authorized run |
+| --- | --- | --- |
+| `public.runs` rows | **8**, all terminal | exactly **9** |
+| Rows under `stage-d-expansion-1-attempt-2-20260922-01` | **0** | exactly **1** |
+| Rows under the consumed `stage-d-expansion-1-20260918-01` | **1** (`timed_out`) | unchanged |
+| Visible Worker executions | **8**, all terminal, 0 active (`…xmd2m` added) | exactly **9**, all terminal, 0 active |
+| Government capture `555101dc…` | `cancelled` / `launch_state=none` (retired) | unchanged |
 
 A count **below** a pinned baseline fails exactly like a count above it: a
 row or execution that vanished is as much a drift as one that appeared. No
@@ -529,7 +563,7 @@ this document is relied on.
 
 `555101dc-46f6-4048-bd67-efccbc98f528`
 (`catalog-government-capture-20260919-01`) is an operator-prepared capture
-run: `status=queued`, `launch_state=none`, `worker_id=NULL`,
+run: `status=queued` when measured on 2026-09-18 (`cancelled` / retired since, `launch_state=none` throughout), `worker_id=NULL`,
 `started_at=NULL`, `attempt=1`, and **zero rows** in `run_events`,
 `run_usage_ledger`, `model_call_budget_reservations`, `worker_heartbeats`,
 `run_invocations`, `run_checkpoints` and `run_blackboards`. Its
@@ -692,29 +726,53 @@ None of these can be performed by repository automation:
 7. **Record the outcome** in §9 below — including a failure, if that is what
    happens.
 
-## 9. Results — EMPTY (the run has not happened)
+## 9. Results
+
+### 9.1 Attempt 1 — executed 2026-09-19, terminal `timed_out` (FAIL)
+
+Recorded read-only on 2026-09-22 from Production (`public.runs`,
+`public.run_events`) and Cloud Run (`gcloud run jobs executions describe`).
+Fields this repository cannot verify from durable state are marked as such
+rather than filled in.
+
+| Field | Value |
+| --- | --- |
+| Run ID | `3772fc84-420c-4a66-9e79-d58649d4e9b4` |
+| Idempotency key | `stage-d-expansion-1-20260918-01` (consumed) |
+| Worker execution name | `milo-agent-worker-xmd2m` (image digest `sha256:d3743e5a…`, the pinned Worker digest) |
+| Created / started / finished (UTC) | 2026-09-19 14:08:38 / 14:10:32 / 14:40:42 |
+| Execution start / completion (UTC) | 14:09:05 / 14:42:47, `retriedCount=1`, `succeededCount=1` |
+| Model identifier | `kimi-k2.6` (execution env `MILO_COMMANDER_MODEL` / `MILO_SWARM_WORKER_MODEL`) |
+| Model calls / tokens / tracked cost | 113 calls; 389,879 in + 41,443 out = 431,322 tokens; $0.337535 actual ($2.26 estimated); 40 agent steps; 0 retries; 0 backpressure events |
+| Terminal state | **`timed_out`** — `RUN_DURATION_EXCEEDED`, "run exceeded 1800s" (elapsed 1808.469 s); 52 run events, last `run_timed_out` |
+| Evidence gate verdict | **not recorded in this repository**; under §7 a `timed_out` terminal fails the gate regardless |
+| `MILO_ENABLE_CATALOG_EXECUTION` observed on the execution | `false` |
+| Government capture posture after the step | `cancelled` / `launch_state=none` (retired, never claimed) |
+| Provider envelope observed on the execution | `MILO_PROVIDER_MAX_CONCURRENCY=2`, **`MILO_PROVIDER_RPM_LIMIT=350`**, `MILO_SWARM_MAX_ACTIVE_WORKERS=8` — the pre-policy drift; the canonical policy now pins 40 / 2 and the current runtime refuses 350 |
+| Post-run lockdown | job template observed 2026-09-22 with `MILO_ENABLE_PAID_EXECUTION=false` and no `KIMI_API_KEY` binding (execution xmd2m had both set); the lockdown script's own verdict is not recorded here |
+| Cloud Run retry note | the task exited 1 on the recorded timeout and the single retry found the run already terminal and exited 0, so the execution reports success over a `timed_out` product — fixed in code (`tests/test_worker.py`, durable budget/timeout terminals now exit 0) |
+| Authorization granted by / date, operator identity, Moonshot console billed total, wallet ceiling | **not recorded in this repository** |
+
+### 9.2 Attempt 2 — EMPTY (the run has not happened)
 
 | Field | Value |
 | --- | --- |
 | Authorization granted by / date | *(not granted)* |
 | Run ID | *(none — no run was created)* |
 | Worker execution name | *(none — no execution was launched)* |
-| Start / end time | *(n/a)* |
-| Model identifier | *(n/a)* |
-| Model calls / tokens / tracked cost | *(n/a)* |
 | Terminal state | *(n/a)* |
 | Evidence gate verdict | *(not run)* |
-| `MILO_ENABLE_CATALOG_EXECUTION` observed on the worker revision | *(n/a — expected `false`)* |
-| Government capture posture after the step | *(n/a — expected prepared or retired, never claimed)* |
-| Provider-account spending/wallet ceiling (value, verified by) | *(not verified — required before authorization)* |
-| Moonshot console billed total | *(n/a)* |
 | Post-run lockdown verdict | *(not run)* |
-| Operator identity | *(n/a)* |
 
 ## 10. Verdict
 
-- **Stage D expansion step 1 is PROPOSED and UNAUTHORIZED.** It has not
-  been executed and this document records no outcome.
+- **Stage D expansion step 1 attempt 1 was executed and FAILED
+  (`timed_out`).** It is a controlled fail-closed terminal: the duration
+  rail stopped the run, the finalizer recorded it, and the post-run posture
+  is restored. It is not a pass and grants nothing.
+- **Attempt 2 is PROPOSED and UNAUTHORIZED.** It has not been executed and
+  this document records no attempt-2 outcome. It requires re-authorization
+  against a new release (see the status banner).
 - The toolkit, the caps, the baselines and the Government-capture
   resolution are reviewable now; the run is not.
 - Merging this PR changes no production state and grants no authorization.
