@@ -1,6 +1,11 @@
 # Production activation runbook
 
-Operational. Four commands, in order, from an authenticated operator shell.
+Operational. Four commands to deploy and verify, then one deliberate step to
+open the website — from an authenticated operator shell.
+
+**PR #111 wired the frontend to the canonical path; Production is still
+locked.** Sections 0–1 bring the backend to a verified, usable state with the
+website OFF. Section 2 is the separate decision that opens it.
 
 Everything below uses the repository's canonical mechanisms. Nothing here is a
 parallel deployment system, and no step re-implements the Government capture —
@@ -37,6 +42,7 @@ The entries with no default, which you must supply:
 | `PRODUCTION_ORIGIN` | the exact browser origin, e.g. `https://milo.example.com` |
 | `CAPTURE_CONVERSATION_ID` | an existing production conversation UUID |
 | `CAPTURE_REQUESTED_BY` | your production user UUID |
+| `MILO_WORKER_AUDIENCE` | audience the worker's ID token carries; **required** before Stage 2 or the API will not start |
 
 If the project has never been provisioned, or you are unsure:
 
@@ -55,7 +61,7 @@ gcloud secrets versions add SUPABASE_URL --data-file=- --project=<PROJECT_ID>
 
 ---
 
-## 1. The four commands
+## 1. Deploy and verify (website stays locked)
 
 ```bash
 ./scripts/deploy/production-preflight.sh
@@ -69,7 +75,13 @@ Or, the same sequence through the thin orchestrator:
 ```bash
 ./scripts/deploy/production-activate.sh --plan                            # read-only dry run first
 ./scripts/deploy/production-activate.sh --all --enable-catalog-execution  # then for real
+./scripts/deploy/production-activate.sh --website                         # Stage 2, separately
 ```
+
+`--all` deliberately **stops before** the website step. Landing the snapshot
+and exposing a paid surface to a human are separate decisions, made at
+separate times, after you have read the verify output — so `--website` refuses
+to be combined with `--capture`.
 
 Run `--plan` first. It performs the full preflight, prints the capture job
 definition and the deployment plan, and mutates nothing.
@@ -111,52 +123,93 @@ count as `KEY=VALUE` lines.
 
 ## 2. Arming the website — a separate, deliberate step
 
-The four commands above deploy and verify. They do **not** arm the website:
-nothing in them enables run creation, paid execution or the Task Composer.
-
-Ordering matters. Arm the backend first, then rebuild the frontend:
+The website is **not** armed by section 1. PR #111 wired the frontend to the
+canonical path, but Production is deliberately still locked behind gates on
+four different surfaces. The full chain, with what each one does when it is
+off, is generated from the repository:
 
 ```bash
-# Backend/runtime flags, on the deployed surfaces.
-gcloud run services update <CLOUD_RUN_API_SERVICE> --region <REGION> \
-  --update-env-vars MILO_ENABLE_RUN_CREATION=true,MILO_ENABLE_EXECUTION_CONTROL=true
-
-gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --region <REGION> \
-  --update-env-vars MILO_ENABLE_PAID_EXECUTION=true,MILO_ENABLE_EXECUTION_CONTROL=true,MILO_ENABLE_CATALOG_EXECUTION=true,MILO_ENABLE_GOVERNMENT_CATALOG_READ=true,MILO_ENABLE_CATALOG_PROMOTION=false
-
-# The worker also needs the provider credential, worker-only, at this point.
-gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --region <REGION> \
-  --update-secrets KIMI_API_KEY=<PROVIDER_KEY_SECRET>:latest
+python3 scripts/release/execution_gate_chain.py            # all stages
+python3 scripts/release/execution_gate_chain.py --stage 2  # what Stage 2 opens
 ```
 
-Then the gateway and the UI, on Vercel:
+### Two gates that are easy to miss
 
-| Variable | Kind | Value |
+Read these before anything else, because each produces a symptom that looks
+like a product bug rather than a configuration gap:
+
+1. **`JOB_LAUNCHER` defaults to `disabled`** and is not an `MILO_ENABLE_*` flag.
+   Left alone, `build_job_launcher()` returns the no-op launcher: the run row
+   **is** created and the website shows it, and **nothing ever executes it**.
+   Run creation being on does not launch anything by itself. It must be
+   `cloud_run`.
+2. **`MILO_ENABLE_EXECUTION_CONTROL` requires `MILO_WORKER_AUDIENCE` and
+   `MILO_APPROVED_WORKER_IDENTITIES`** on the API. With the flag on and either
+   unset, `production_config.py` raises `WORKER_AUTH_AUDIENCE_MISSING` /
+   `WORKER_ALLOWLIST_EMPTY` and **the API fails to start** — enabling the flag
+   alone takes Production down rather than opening a route. Set all three in
+   the same update; `website-execution-activate.sh` refuses to proceed without
+   them.
+
+### Stage 2, in one command
+
+```bash
+./scripts/deploy/website-execution-activate.sh --plan           # prints everything, changes nothing
+./scripts/deploy/website-execution-activate.sh --apply-backend  # applies the Cloud Run half
+```
+
+It re-runs the Stage 1 gate first and **refuses** if the snapshot is unusable
+or the release SHAs disagree — opening the composer over a release that would
+refuse every run is a trap, not an activation. It never enables promotion and
+never starts a run.
+
+The Cloud Run half it applies:
+
+| Surface | Set |
+| --- | --- |
+| API service | `MILO_ENABLE_RUN_CREATION`, `MILO_ENABLE_EXECUTION_CONTROL`, `MILO_ENABLE_RUN_CANCELLATION`, `JOB_LAUNCHER=cloud_run`, `MILO_WORKER_AUDIENCE`, `MILO_APPROVED_WORKER_IDENTITIES` |
+| Worker job | `MILO_ENABLE_EXECUTION_CONTROL`, `MILO_ENABLE_PAID_EXECUTION`, `MILO_ENABLE_CATALOG_EXECUTION`, `MILO_ENABLE_GOVERNMENT_CATALOG_READ`, `MILO_ENABLE_CATALOG_PROMOTION=false`, plus the provider secret **worker-only** |
+
+### The Vercel half — and why it needs a rebuild
+
+The script **prints** these rather than running them: they need Vercel
+credentials that must not live in this repository, and one of them is not an
+environment change at all.
+
+| Variable | Kind | How it takes effect |
 | --- | --- | --- |
-| `CLOUD_RUN_API_URL` | runtime | the API service URL (`production-verify.sh` prints it) |
-| `GCP_PROJECT_NUMBER`, `GCP_WORKLOAD_IDENTITY_POOL_ID`, `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID`, `GCP_SERVICE_ACCOUNT_EMAIL` | runtime | workload-identity federation for the gateway |
-| `GATEWAY_ALLOW_EXECUTION_ROUTES` | runtime | `true` |
-| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | runtime | the shared rate-limit store |
-| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **build-time** | inlined into the browser bundle |
-| `NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI` | **build-time** | `true` |
+| `CLOUD_RUN_API_URL` | runtime | new deployment |
+| `GCP_PROJECT_NUMBER`, `GCP_WORKLOAD_IDENTITY_POOL_ID`, `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID`, `GCP_SERVICE_ACCOUNT_EMAIL` | runtime | new deployment |
+| `GATEWAY_ALLOW_EXECUTION_ROUTES` | runtime | new deployment |
+| `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | runtime | new deployment |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **build-time** | **REBUILD** |
+| `NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI` | **build-time** | **REBUILD** |
 
-`NEXT_PUBLIC_*` values are inlined by Next.js at build time. Changing
-`NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI` on an already-built deployment does
-nothing to the served bundle — you must **redeploy the frontend** after setting
-it, or the Task Composer keeps rendering *"Task submission is disabled until a
-separately approved execution stage."*
+> **`NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI` is inlined into the browser bundle
+> by Next.js at build time.** Setting it in the Vercel dashboard does **not**
+> change an already-built deployment. The Task Composer will keep rendering
+> *"Task submission is disabled until a separately approved execution stage."*
+> until the frontend is **rebuilt and redeployed** (`vercel --prod --force`).
+> This is the single most likely thing to go wrong tomorrow.
 
-Keep `MILO_ENABLE_CATALOG_PROMOTION=false`. Promotion requires read, read does
-not imply promotion, and promotion is a separately authorized decision
-([STAGED_ACTIVATION.md](STAGED_ACTIVATION.md)).
-
-Then re-verify:
+### Confirm — without creating a run
 
 ```bash
-./scripts/deploy/production-verify.sh
+./scripts/deploy/website-execution-check.sh
 ```
 
----
+It reports four facts **separately**, because they fail in different layers:
+
+```
+FRONTEND_CODE_WIRED=YES          # this checkout has the canonical route
+TASK_COMPOSER_VISIBLE=...        # read from the SERVED bundle
+GATEWAY_EXECUTION_ENABLED=...    # Vercel runtime value
+BACKEND_EXECUTION_ARMED=...      # every API + worker gate, read from Cloud Run
+WEBSITE_EXECUTION_STAGE_ACTIVE=  # YES only when all four are satisfied
+```
+
+It never sends the run-creation `POST`. The gate is proved from configuration;
+exercising it would create a run, and the first run is yours.
 
 ## 3. Rollback
 

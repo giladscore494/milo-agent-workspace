@@ -56,6 +56,9 @@ WORKER_JOB="$(milo_op CLOUD_RUN_WORKER_JOB)"
 LOCAL_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 [[ -n "$EXPECTED_SHA" ]] || EXPECTED_SHA="$LOCAL_SHA"
 
+_MILO_VERIFY_TMP="$(mktemp -d "${TMPDIR:-/tmp}/milo-verify.XXXXXX")"
+trap 'rm -rf "${_MILO_VERIFY_TMP}"' EXIT
+
 FAILURES=0
 note_fail() { printf 'FAIL: %s\n' "$1" >&2; FAILURES=$((FAILURES + 1)); }
 
@@ -208,6 +211,35 @@ if [[ -n "$API_URL" && -n "$(milo_op GCP_PROJECT_NUMBER)" && -n "$(milo_op GATEW
 else
   printf 'FRONTEND_BACKEND_BINDING=INCOMPLETE\n'
   note_fail "the gateway binding needs CLOUD_RUN_API_URL, GCP_PROJECT_NUMBER and GATEWAY_SERVICE_ACCOUNT"
+fi
+
+# --- website execution stage, as FOUR separate facts ---------------------
+# Delegated to website-execution-check.sh so there is one implementation of
+# "is the website open", and never collapsed into a single boolean: the four
+# fail in different layers and an operator needs to know which one is shut.
+printf '\n'
+if bash "${SCRIPT_DIR}/website-execution-check.sh" \
+     --operator-config "$CONFIG_PATH" > "${_MILO_VERIFY_TMP}/website.txt" 2>&1; then
+  WEBSITE_OK=1
+else
+  WEBSITE_OK=0
+fi
+grep -E '^(FRONTEND_CODE_WIRED|TASK_COMPOSER_VISIBLE|GATEWAY_EXECUTION_ENABLED|BACKEND_EXECUTION_ARMED|WEBSITE_EXECUTION_STAGE_ACTIVE|DISABLED_MESSAGE_PRESENT)=' \
+  "${_MILO_VERIFY_TMP}/website.txt" || true
+if [[ "$WEBSITE_OK" -eq 0 ]]; then
+  printf 'NOTE: the website execution stage is not fully open. This is EXPECTED\n'
+  printf '      before Stage 2. Detail: %s\n' "${_MILO_VERIFY_TMP}/website.txt"
+fi
+
+# --- activation must not have created anything --------------------------
+# Compared against the count read above, so a run that appeared during this
+# verification is visible rather than assumed away.
+NON_TERMINAL_AFTER="$(psql_value "select count(*) from public.runs where status not in ('completed','failed','cancelled','timed_out');" || true)"
+if [[ "$NON_TERMINAL_AFTER" == "$NON_TERMINAL" ]]; then
+  printf 'NO_RUN_CREATED_BY_ACTIVATION=YES (non-terminal count unchanged at %s)\n' "${NON_TERMINAL:-UNKNOWN}"
+else
+  printf 'NO_RUN_CREATED_BY_ACTIVATION=NO (%s -> %s)\n' "${NON_TERMINAL:-?}" "${NON_TERMINAL_AFTER:-?}"
+  note_fail "the non-terminal run count changed during verification"
 fi
 
 printf 'PAID_CALLS_PERFORMED_BY_THIS_CHECK=NO\n'
