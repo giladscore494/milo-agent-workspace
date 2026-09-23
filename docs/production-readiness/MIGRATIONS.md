@@ -352,10 +352,18 @@ against real PostgreSQL in CI (`tests/test_migrations_postgres.py`,
 1. `scripts/release/check-migration-state.sh --database-url-env
    MILO_READONLY_DB_URL --plan-output migration-plan.json`
 2. Review the plan and hashes; create and verify an encrypted pre-migration backup via [SUPABASE_BACKUP.md](SUPABASE_BACKUP.md), and confirm its matching passphrase remains available in the approved operator secret store.
-3. Apply each pending migration manually, in order, via `psql` or the
-   Supabase SQL editor.
-4. Re-run the state check; validate RLS and function permissions
-   (validation queries in the PostgreSQL test suite mirror these checks).
+3. Apply the pending migrations through the canonical, SHA-bound workflow
+   `.github/workflows/deploy-supabase-migrations.yml` (`mode=dry-run` first;
+   it must propose exactly the pending tail, in order; then `mode=apply` with
+   `confirmation=APPLY_PRODUCTION_MIGRATIONS`). Never paste a subset of a
+   migration's SQL into the SQL editor. The step-by-step for the three
+   scoped-catalog migrations is Stage B of
+   [SCOPED_BATCH_PRODUCTION_RUNBOOK.md](SCOPED_BATCH_PRODUCTION_RUNBOOK.md).
+4. Re-run the state check (it must classify `fully-migrated`); validate RLS
+   and function permissions — for the Mapping Plan batch path,
+   `scripts/deploy/work-scope-readiness.sh --schema-only` checks the tables,
+   RLS, the RPCs and their `service_role`-only EXECUTE grants (the validation
+   queries in the PostgreSQL test suite mirror these checks).
 5. Generate and review the membership backfill
    (`generate-membership-backfill.sh`), check row counts, apply manually,
    validate ownership.

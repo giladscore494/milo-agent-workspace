@@ -128,20 +128,30 @@ def test_check_script_never_sends_the_run_creation_post():
                 f"curl must not send a body: {line.strip()}")
 
 
-def test_check_script_reports_four_separate_facts():
-    text = CHECK.read_text(encoding="utf-8")
-    for key in ("FRONTEND_CODE_WIRED=", "TASK_COMPOSER_VISIBLE=",
-                "GATEWAY_EXECUTION_ENABLED=", "BACKEND_EXECUTION_ARMED="):
-        assert key in text, f"{key} must be reported separately"
+WEBSITE_FACTS = ("FRONTEND_CODE_WIRED", "FRONTEND_RELEASE", "TASK_COMPOSER_VISIBLE",
+                 "GATEWAY_EXECUTION_ENABLED", "GATEWAY_BACKEND_BINDING",
+                 "BACKEND_EXECUTION_ARMED", "MAPPING_PLAN_BATCH_PATH")
 
 
-def test_stage_active_requires_all_four():
-    """WEBSITE_EXECUTION_STAGE_ACTIVE=YES only when every fact is satisfied."""
+def test_check_script_reports_every_fact_separately():
     text = CHECK.read_text(encoding="utf-8")
-    condition = text.split("WEBSITE_EXECUTION_STAGE_ACTIVE=YES", 1)[0]
-    tail = condition.rsplit("if [[", 1)[1]
-    for token in ("WIRED", "COMPOSER", "GATEWAY", "BACKEND"):
-        assert token in tail, f"the stage-active condition must include {token}"
+    for key in WEBSITE_FACTS:
+        assert f"fact {key} " in text or f'"{key}"' in text or f" {key} " in text, (
+            f"{key} must be reported separately")
+
+
+def test_stage_active_requires_every_fact_verified():
+    """WEBSITE_EXECUTION_STAGE_ACTIVE=VERIFIED only when every fact is VERIFIED."""
+    text = CHECK.read_text(encoding="utf-8")
+    final = text.split("Only every fact VERIFIED means the stage is active.", 1)[1]
+    loop = final.split("for name in", 1)[1].split("; do", 1)[0]
+    for key in WEBSITE_FACTS:
+        assert key in loop, f"the stage-active condition must include {key}"
+    verified = final.split("WEBSITE_EXECUTION_STAGE_ACTIVE=VERIFIED", 1)[0]
+    assert 'if [[ "$ALL_VERIFIED" -eq 1 ]]' in verified
+    # There is no YES left to reach by presence alone.
+    assert "WEBSITE_EXECUTION_STAGE_ACTIVE=YES" not in text
+    assert "CONFIGURED_VALUE_UNVERIFIED" not in text and "LIKELY_YES" not in text
 
 
 def test_check_script_is_offline_safe_and_read_only(tmp_path):
@@ -153,9 +163,11 @@ def test_check_script_is_offline_safe_and_read_only(tmp_path):
     result = subprocess.run(
         ["bash", str(CHECK), "--offline", "--operator-config", str(config)],
         capture_output=True, text=True, check=False, cwd=REPO)
-    assert "FRONTEND_CODE_WIRED=YES" in result.stdout
-    assert "TASK_COMPOSER_VISIBLE=UNKNOWN" in result.stdout
-    assert "WEBSITE_EXECUTION_STAGE_ACTIVE=UNKNOWN" in result.stdout
+    assert "FRONTEND_CODE_WIRED=VERIFIED" in result.stdout
+    assert "TASK_COMPOSER_VISIBLE=UNVERIFIED" in result.stdout
+    assert "WEBSITE_EXECUTION_STAGE_ACTIVE=UNVERIFIED" in result.stdout
+    # Offline proves nothing about the deployment, so it never exits 0.
+    assert result.returncode != 0
 
 
 def test_activate_defaults_to_plan_and_never_applies_vercel():
@@ -176,11 +188,18 @@ def test_activate_defaults_to_plan_and_never_applies_vercel():
 
 
 def test_activate_never_enables_promotion():
+    contract = (REPO / "scripts/deploy/deployment-contract.sh").read_text(encoding="utf-8")
+
+    def array(name: str) -> str:
+        return contract.split(f"{name}=(", 1)[1].split(")", 1)[0]
+
+    for pinned in ("MILO_STAGE2_API_PINNED_OFF_FLAGS", "MILO_STAGE2_WORKER_PINNED_OFF_FLAGS"):
+        assert "MILO_ENABLE_CATALOG_PROMOTION" in array(pinned)
+    for enabled in ("MILO_STAGE2_API_ENABLE_FLAGS", "MILO_STAGE2_WORKER_ENABLE_FLAGS",
+                    "MILO_PLAN_AUTHORING_API_ENABLE_FLAGS"):
+        assert "MILO_ENABLE_CATALOG_PROMOTION" not in array(enabled)
     text = ACTIVATE.read_text(encoding="utf-8")
-    pinned = text.split("JOB_PINNED_OFF_FLAGS=(", 1)[1].split(")", 1)[0]
-    assert "MILO_ENABLE_CATALOG_PROMOTION" in pinned
-    enable_block = text.split("JOB_ENABLE_FLAGS=(", 1)[1].split(")", 1)[0]
-    assert "MILO_ENABLE_CATALOG_PROMOTION" not in enable_block
+    assert "MILO_STAGE2_WORKER_PINNED_OFF_FLAGS" in text
 
 
 def test_activate_sets_the_launcher_and_the_worker_identity():

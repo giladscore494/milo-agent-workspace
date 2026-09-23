@@ -60,7 +60,7 @@ import {
   CatalogReviewView,
 } from '@/components/catalog/CatalogReviewPanel';
 import { ConversationView } from '@/components/conversation/ConversationView';
-import { TaskComposer } from '@/components/conversation/TaskComposer';
+import { ComposerRoute, TaskComposer } from '@/components/conversation/TaskComposer';
 import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector';
 import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
 import { MappingPlanPanel } from '@/components/scope/MappingPlanPanel';
@@ -747,6 +747,21 @@ export default function WorkspacePage() {
   const batchesAvailable = planAvailable && planCapabilities?.canStartBatches === true;
 
   /**
+   * Where a typed task may go, from the SERVER's capability read. Only a Swarm
+   * V2 project can be a catalog project; every other project keeps its
+   * ordinary composer. A Swarm V2 project whose capabilities have not answered
+   * is `unconfirmed`, never `direct`: with the Government read on, an ordinary
+   * run there would be refused, and the composer must not pretend otherwise.
+   */
+  const composerRoute: ComposerRoute = selectedProject?.workflow_key !== 'swarm_v2'
+    ? { kind: 'direct' }
+    : planCapabilities === undefined
+      ? { kind: 'unconfirmed' }
+      : planCapabilities.directRuns.allowed
+        ? { kind: 'direct' }
+        : { kind: 'blocked', blockedBy: planCapabilities.directRuns.blockedBy ?? 'unknown', planAvailable };
+
+  /**
    * The plan's progress, applied only while its conversation is still the
    * selected one. `keepError` keeps a refusal's explanation on screen while
    * the real progress is read back after it.
@@ -966,6 +981,9 @@ export default function WorkspacePage() {
 
   async function startRun() {
     if (!activeConversation || submittingRun || !taskContent.trim()) return;
+    // The composer offers no submission unless the route is direct; this
+    // holds the same line for any other caller.
+    if (composerRoute.kind !== 'direct') return;
     const owner = scope.current;
     const conversationId = activeConversation.id;
     const content = taskContent.trim();
@@ -1254,6 +1272,9 @@ export default function WorkspacePage() {
             onSubmit={startRun}
             submitting={submittingRun !== undefined}
             error={runError}
+            route={composerRoute}
+            onOpenMappingPlan={() => setPlanOpen(true)}
+            onRecheck={() => { if (selectedProject) loadPlanCapabilities(selectedProject, scope.current); }}
           />
         }
       >

@@ -804,6 +804,18 @@ def test_the_capture_job_execution_keeps_the_entrypoint_module():
     assert "2>&1" not in execute and "tail" not in execute
 
 
+def _release_worker_image() -> str:
+    import subprocess
+
+    sha = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True,
+                         text=True, check=True).stdout.strip()
+    # The fake operator config's region, project and repository.
+    return f"test-region-docker.pkg.dev/test-project-not-production/test-repo/worker:{sha}"
+
+
+#: The image `government-production-capture.sh` requires the capture job to run.
+RELEASE_WORKER_IMAGE = _release_worker_image()
+
 #: What the mock `gcloud logging read` answers unless a test says otherwise.
 SUCCEEDED_DOCUMENT = {"entrypoint": "catalog.government.capture", "status": "succeeded",
                       "reason_code": "", "reason": "",
@@ -818,7 +830,8 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
                     mode: str = "--prepare-work-scope",
                     execution_stdout: str = "test-capture-execution-1\n",
                     execution_exit: int = 0, document: dict | None = None,
-                    psql: str | None = None, env: dict[str, str] | None = None):
+                    psql: str | None = None, env: dict[str, str] | None = None,
+                    job_image: str | None = None, image_exit: int = 0):
     """Run the capture script as an operator would, with stand-ins on PATH.
 
     `gcloud` puts the mock gcloud first on PATH. `psql`, when given, is the
@@ -863,7 +876,11 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
             "    sys.stderr.flush()\n"
             "    sys.exit(int(os.environ['MOCK_GCLOUD_EXECUTION_EXIT']))\n"
             "elif sys.argv[1:3] == ['logging', 'read']:\n"
-            "    print(os.environ['MOCK_GCLOUD_DOCUMENT'])\n",
+            "    print(os.environ['MOCK_GCLOUD_DOCUMENT'])\n"
+            "elif sys.argv[1:4] == ['run', 'jobs', 'describe']:\n"
+            "    print(os.environ['MOCK_GCLOUD_JOB_IMAGE'])\n"
+            "elif sys.argv[1:5] == ['artifacts', 'docker', 'images', 'describe']:\n"
+            "    sys.exit(int(os.environ['MOCK_GCLOUD_IMAGE_EXIT']))\n",
             encoding="utf-8")
         mock.chmod(0o755)
         env["MOCK_GCLOUD_LOG"] = str(log)
@@ -871,6 +888,10 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
         env["MOCK_GCLOUD_EXECUTION_EXIT"] = str(execution_exit)
         env["MOCK_GCLOUD_ADVISORY"] = GCLOUD_ADVISORY
         env["MOCK_GCLOUD_DOCUMENT"] = json.dumps(document or SUCCEEDED_DOCUMENT)
+        # The capture job runs the RELEASE worker image unless a test says
+        # otherwise, and that image exists unless a test says it does not.
+        env["MOCK_GCLOUD_JOB_IMAGE"] = RELEASE_WORKER_IMAGE if job_image is None else job_image
+        env["MOCK_GCLOUD_IMAGE_EXIT"] = str(image_exit)
     env.update(overrides)
     result = subprocess.run(
         ["bash", str(REPO / "scripts/catalog/government-production-capture.sh"),
@@ -952,7 +973,8 @@ def test_the_scoped_capture_mode_fails_closed_without_one_exact_execution_name(
     assert "printed no single well-formed execution name on stdout" in result.stderr
     assert "WORK_SCOPE_PREPARATION_STATUS" not in result.stdout
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    assert [call[:3] for call in calls] == [["run", "jobs", "execute"]]
+    # The job's image was checked first; then exactly one execution.
+    assert [call[:3] for call in calls] == [["run", "jobs", "describe"], ["run", "jobs", "execute"]]
     # No log is read for an execution that cannot be named exactly.
     assert not any(call[:2] == ["logging", "read"] for call in calls)
 
@@ -974,6 +996,96 @@ def test_a_named_execution_that_gcloud_reports_failed_is_judged_by_its_own_docum
     assert [call[2] for call in reads] == [
         'resource.type=cloud_run_job AND '
         'labels."run.googleapis.com/execution_name"=test-capture-execution-1']
+
+
+def _gcloud_calls(log) -> list[list[str]]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
+
+@pytest.mark.parametrize("mode,extra", [
+    ("--ensure-job", ()),
+    ("--all", ()),
+])
+def test_the_capture_job_is_never_created_before_the_release_worker_image_exists(
+        tmp_path, mode, extra):
+    """production-activate.sh used to run the capture BEFORE the deploy that
+    builds the image the capture job runs. Every job-creating mode now refuses
+    first, and creates, updates and executes nothing."""
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution", *extra, gcloud=True,
+                                  mode=mode, image_exit=1)
+    assert result.returncode != 0
+    assert f"the release worker image {RELEASE_WORKER_IMAGE} does not exist" in result.stderr
+    assert "DEPLOY_MODE=apply scripts/deploy/cloud-run.sh" in result.stderr
+    calls = _gcloud_calls(log)
+    assert calls and calls[0][:4] == ["artifacts", "docker", "images", "describe"]
+    assert calls[0][4] == RELEASE_WORKER_IMAGE
+    assert not any(call[:3] in (["run", "jobs", "create"], ["run", "jobs", "update"],
+                                ["run", "jobs", "execute"]) for call in calls)
+
+
+@pytest.mark.parametrize("mode,extra", [
+    ("--prepare-work-scope", ("--enable-work-scope-preparation", *SCOPED_VALUES)),
+    ("--capture", ("--run-id", "00000000-0000-4000-8000-000000000030")),
+    ("--prepare", ()),
+])
+@pytest.mark.parametrize("job_image", ["", "test-region-docker.pkg.dev/x/y/worker:" + "0" * 40])
+def test_a_capture_job_not_on_the_release_image_is_never_executed(tmp_path, mode, extra, job_image):
+    """A job ensured by an earlier release would silently run THAT release."""
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution", *extra, gcloud=True,
+                                  mode=mode, job_image=job_image)
+    assert result.returncode != 0
+    assert "Re-run with --ensure-job first. Nothing was executed." in result.stderr
+    assert not any(call[:3] == ["run", "jobs", "execute"] for call in _gcloud_calls(log))
+
+
+def test_ensure_job_points_the_job_at_the_release_image(tmp_path):
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution", gcloud=True,
+                                  mode="--ensure-job")
+    assert result.returncode == 0, result.stderr
+    calls = _gcloud_calls(log)
+    create = next(call for call in calls if call[:3] in (["run", "jobs", "create"],
+                                                        ["run", "jobs", "update"]))
+    assert create[create.index("--image") + 1] == RELEASE_WORKER_IMAGE
+    image_check = calls.index(next(c for c in calls if c[:4] == ["artifacts", "docker", "images", "describe"]))
+    assert image_check < calls.index(create)
+
+
+@pytest.mark.parametrize("reason", ["GOV_TRANSPORT_FAILED", "GOV_HTTP_STATUS_UNEXPECTED"])
+def test_an_unreachable_government_source_is_a_stop_never_a_substitute(tmp_path, reason):
+    failed = {"entrypoint": "catalog.government.capture", "status": "failed",
+              "reason_code": reason, "reason": "the government endpoint could not be reached"}
+    result, _log = _capture_script(tmp_path, "--enable-catalog-execution",
+                                   "--enable-work-scope-preparation", *SCOPED_VALUES,
+                                   gcloud=True, execution_exit=1, document=failed)
+    assert result.returncode != 0
+    assert f"STOP: GOVERNMENT_SOURCE_UNREACHABLE ({reason})" in result.stderr
+    assert "no supported alternate import route exists" in result.stderr
+    assert "WORK_SCOPE_PREPARED_AND_VERIFIED" not in result.stdout
+
+
+def test_a_successful_preparation_is_verified_by_the_scoped_readiness_check(tmp_path):
+    """Without a read-only database it is MANUAL, never "ready"."""
+    result, _log = _capture_script(tmp_path, "--enable-catalog-execution",
+                                   "--enable-work-scope-preparation", *SCOPED_VALUES, gcloud=True)
+    assert result.returncode == 0, result.stderr
+    assert "DATABASE_READ=UNVERIFIED" in result.stdout
+    assert "MANUAL: the preparation succeeded but readiness is UNVERIFIED" in result.stdout
+    assert "WORK_SCOPE_PREPARED_AND_VERIFIED=YES" not in result.stdout
+
+
+def test_each_preparation_attempt_can_name_its_own_idempotency_key(tmp_path):
+    prepared = dict(SUCCEEDED_DOCUMENT, preparation={"run_id": "00000000-0000-4000-8000-000000000099"})
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution", "--idempotency-key",
+                                  "work-scope-attempt-20260923T120000Z", gcloud=True,
+                                  mode="--prepare", document=prepared)
+    assert result.returncode == 0, result.stderr
+    execute = next(call for call in _gcloud_calls(log) if call[:3] == ["run", "jobs", "execute"])
+    args = execute[execute.index("--args") + 1].split(",")
+    assert args[args.index("--idempotency-key") + 1] == "work-scope-attempt-20260923T120000Z"
+    (tmp_path / "bad").mkdir()
+    refused, _ = _capture_script(tmp_path / "bad", "--enable-catalog-execution",
+                                 "--idempotency-key", "a,b", gcloud=True, mode="--prepare")
+    assert refused.returncode == 2 and "--idempotency-key must be" in refused.stderr
 
 
 # =============================================================================

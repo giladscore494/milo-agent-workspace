@@ -14,6 +14,7 @@ import {
   draftEdit,
   draftMatchesPlan,
   moveUnit,
+  preparableUnits,
   removeUnit,
 } from '@/lib/workScope';
 import { MappingPlanProgress, MappingPlanProgressProps } from './MappingPlanProgress';
@@ -117,6 +118,11 @@ export function MappingPlanPanel({
   function unitLabel(key: string): string {
     return entries.get(key)?.name ?? key;
   }
+
+  // What preparation can capture for this plan, from the server's directory:
+  // only a unit with a VERIFIED register spelling is captured and queued.
+  const preparable = directory !== undefined ? preparableUnits(draft.units, directory) : undefined;
+  const verifiedInDirectory = (directory?.entries ?? []).filter((entry) => entry.registerMarqueVerified);
 
   return (
     <section className="panel mapping-plan" aria-labelledby="mapping-plan-title">
@@ -235,6 +241,25 @@ export function MappingPlanPanel({
               </ol>
             )}
 
+            {preparable !== undefined && draft.units.length > 0 && (
+              <div className="note" role="note" aria-label="What can be prepared">
+                {preparable.verified.length === 0 ? (
+                  <p>
+                    None of these manufacturers has a verified Government-register spelling, so preparing this plan
+                    would queue nothing and no batch could run.
+                  </p>
+                ) : (
+                  <p>Can be prepared from the Government register: {preparable.verified.map((key) => safeText(unitLabel(key))).join(', ')}.</p>
+                )}
+                {preparable.unverified.length > 0 && (
+                  <p>
+                    Not preparable until their register spelling is verified (recorded as register-unverified; nothing
+                    is queued for them): {preparable.unverified.map((key) => safeText(unitLabel(key))).join(', ')}.
+                  </p>
+                )}
+              </div>
+            )}
+
             <div className="mapping-plan-fields">
               <div className="field">
                 <label className="field-label" htmlFor="mapping-plan-year-from">From model year (optional)</label>
@@ -281,6 +306,11 @@ export function MappingPlanPanel({
                   {directory.coverageAvailable && directory.catalogVariants !== null
                     ? `The canonical catalog holds ${directory.catalogVariants} variant${directory.catalogVariants === 1 ? '' : 's'}${directory.attributedVariants !== null && directory.attributedVariants !== directory.catalogVariants ? `, ${directory.attributedVariants} of them under a verified register spelling` : ''}.`
                     : 'Catalog coverage is unavailable right now; no count is shown rather than a guessed one.'}
+                </p>
+                <p className="note">
+                  {verifiedInDirectory.length === 0
+                    ? 'No manufacturer in the directory has a verified Government-register spelling yet, so no plan can be prepared.'
+                    : safeText(`Verified Government-register spelling: ${verifiedInDirectory.length} of ${directory.entries.length} manufacturers (${verifiedInDirectory.map((entry) => entry.name).join(', ')}). Only those can be prepared and run; the others can be planned but are not captured.`)}
                 </p>
                 <div className="field">
                   <label className="field-label" htmlFor="mapping-plan-filter">Find a manufacturer</label>

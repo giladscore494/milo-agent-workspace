@@ -116,6 +116,10 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
   ['WORK_SCOPE_BATCH_NOT_NEXT', 'That batch is no longer the next one, so nothing was started. The progress has been reloaded.'],
   ['WORK_SCOPE_BATCH_IN_PROGRESS', 'Another batch of this plan is still running, so nothing was started.'],
   ['WORK_SCOPE_BATCH_ALREADY_COMPLETED', 'That batch has already finished, so it was not started again.'],
+  // An ordinary task in a project whose runs read the Government catalog:
+  // catalog work starts only from a prepared Mapping Plan batch. Nothing was
+  // created.
+  ['CATALOG_RUN_REQUIRES_MAPPING_PLAN', 'Catalog runs in this project start from a prepared Mapping Plan batch, not from a task. Nothing was started. Use the Mapping Plan.'],
 
   // Run and proposal lifecycle.
   ['RUN_ALREADY_FINISHED', 'That run has already finished.'],

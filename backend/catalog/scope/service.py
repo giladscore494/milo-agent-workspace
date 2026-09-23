@@ -31,6 +31,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 from uuid import UUID
 
+from backend.catalog.execution import government_read_enabled
 from backend.errors import AppError, NotFoundError
 from backend.execution_guard import is_stage_enabled
 from backend.redaction import redact_secret_text
@@ -53,6 +54,36 @@ RUN_CREATION_FLAG = "MILO_ENABLE_RUN_CREATION"
 #: The engines a plan can feed. Only Swarm V2 reads the Government catalog;
 #: a Vehicle Catalog V1 project maps the one scope its configuration states.
 WORK_SCOPE_WORKFLOWS = frozenset({"swarm_v2"})
+
+#: Why a member may not create an ORDINARY run -- one bound to no Mapping Plan
+#: batch -- in this project right now. Static codes, one sentence each.
+#:
+#: `catalog_batch_required` mirrors the worker's own gate exactly: with the
+#: Government read on (`backend.catalog.execution.government_read_enabled`),
+#: the worker refuses every Swarm V2 run the database binds to no batch
+#: (`GOVERNMENT_BATCH_REQUIRED`). Creating one would only make a run that is
+#: launched to be refused, so the API refuses it first, before anything is
+#: written, and the browser routes the request to the Mapping Plan instead.
+#: With the read off, an unbound Swarm V2 run reads no catalog and is allowed
+#: exactly as before.
+DIRECT_RUN_BLOCKERS: Mapping[str, str] = {
+    "catalog_batch_required":
+        "catalog runs in this project start from a prepared Mapping Plan batch",
+    "run_creation_disabled": "run creation is not enabled on this server",
+}
+
+
+def direct_run_blocker(workflow_key: object) -> str | None:
+    """Whether an ordinary run of this workflow would be a catalog run with no batch.
+
+    Reads the SAME process flags the worker's gate reads, and nothing a
+    request, plan or project can set. Only a Swarm V2 project can be a catalog
+    project; every other workflow is untouched.
+    """
+    if workflow_key in WORK_SCOPE_WORKFLOWS and government_read_enabled():
+        return "catalog_batch_required"
+    return None
+
 
 #: How many earlier revisions a read returns beside the head. The history is
 #: for reading back what was asked; it is bounded like every other list here.
@@ -105,6 +136,9 @@ def capabilities(repo: Any, user_id: UUID, project_id: UUID) -> dict[str, Any]:
                and is_stage_enabled(RUN_CREATION_FLAG))
     reason = None if supported and mutations else (
         "workflow_not_supported" if not supported else "mutations_disabled")
+    direct_blocker = direct_run_blocker(project.get("workflow_key"))
+    if direct_blocker is None and not is_stage_enabled(RUN_CREATION_FLAG):
+        direct_blocker = "run_creation_disabled"
     return {
         "available": supported and mutations,
         "reason": reason,
@@ -122,6 +156,9 @@ def capabilities(repo: Any, user_id: UUID, project_id: UUID) -> dict[str, Any]:
         },
         "can_prepare": False,
         "can_start_batches": supported and batches,
+        # Whether the ordinary composer may create a run here, and if not,
+        # why. The API refuses the same request again at creation.
+        "direct_runs": {"allowed": direct_blocker is None, "blocked_by": direct_blocker},
     }
 
 
@@ -359,6 +396,7 @@ def _state(repo: Any, row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["MAX_HISTORY", "REQUEST_REASONS", "WORK_SCOPE_MUTATIONS_FLAG",
-           "WORK_SCOPE_WORKFLOWS", "capabilities", "create_work_scope", "directory",
+__all__ = ["DIRECT_RUN_BLOCKERS", "MAX_HISTORY", "REQUEST_REASONS", "WORK_SCOPE_MUTATIONS_FLAG",
+           "WORK_SCOPE_WORKFLOWS", "capabilities", "create_work_scope", "direct_run_blocker",
+           "directory",
            "open_work_scope", "revise_work_scope", "work_scope"]

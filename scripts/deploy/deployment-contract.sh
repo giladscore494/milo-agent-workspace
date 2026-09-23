@@ -229,3 +229,111 @@ MILO_CAPTURE_MAX_RECORDS="120000"
 # The two acknowledgements, matched EXACTLY by the entrypoint.
 MILO_CAPTURE_EGRESS_ACK="I ACKNOWLEDGE LIVE GOVERNMENT EGRESS"
 MILO_CAPTURE_SCHEMA_ACK="I ACKNOWLEDGE OPERATOR-0 SCHEMA REPORT REVIEWED"
+
+# ---------------------------------------------------------------------------
+# Activation stages AFTER Stage A — which flag belongs on which component
+# ---------------------------------------------------------------------------
+# NAMES ONLY. The enabled value is assembled at runtime by the one script that
+# applies each stage (website-execution-activate.sh), never committed here:
+# scripts/check_unsafe_defaults.py forbids any committed enabled value, and a
+# repository default is not a deliberate operator decision.
+#
+# Every list is read by the applying script AND by the read-only checks
+# (website-execution-check.sh, production-verify.sh), so "what the stage sets"
+# and "what the check requires" cannot drift apart.
+#
+# Stage P — plan authoring. The Mapping Plan's two WRITES only, on the API.
+# A plan is a draft: it creates no run, launches nothing and reaches no
+# Government source. Everything else stays exactly as Stage A left it; in
+# particular run creation stays OFF, so the website can author a plan but
+# cannot start anything.
+MILO_PLAN_AUTHORING_API_ENABLE_FLAGS=(
+  MILO_ENABLE_WORK_SCOPE_MUTATIONS
+)
+
+# Stage 2 (website execution), API service.
+#
+#   RUN_CREATION + WORK_SCOPE_BATCHES  starting ONE prepared batch
+#                                      (POST /work-scopes/{id}/runs needs both)
+#   WORK_SCOPE_MUTATIONS               revising the plan
+#   EXECUTION_CONTROL                  the worker's mutation surface; needs
+#                                      MILO_WORKER_AUDIENCE + an allowlist
+#   RUN_CANCELLATION                   "Cancel this batch"
+#   CATALOG_EXECUTION + GOVERNMENT_CATALOG_READ
+#                                      NOT a capability on the API: the API
+#                                      constructs no Government tool and reads
+#                                      no register. They mirror the worker's
+#                                      posture so run creation knows Swarm V2
+#                                      runs read the catalog and refuses an
+#                                      ordinary (unbound) one before it exists
+#                                      (CATALOG_RUN_REQUIRES_MAPPING_PLAN)
+#                                      instead of launching a run the worker
+#                                      would refuse (GOVERNMENT_BATCH_REQUIRED).
+MILO_STAGE2_API_ENABLE_FLAGS=(
+  MILO_ENABLE_RUN_CREATION
+  MILO_ENABLE_EXECUTION_CONTROL
+  MILO_ENABLE_RUN_CANCELLATION
+  MILO_ENABLE_WORK_SCOPE_MUTATIONS
+  MILO_ENABLE_WORK_SCOPE_BATCHES
+  MILO_ENABLE_CATALOG_EXECUTION
+  MILO_ENABLE_GOVERNMENT_CATALOG_READ
+)
+# Pinned OFF on the API at Stage 2. Preparation is the capture job's alone
+# (one explicit execution); the API never calls a provider; promotion is a
+# separate, separately authorized decision.
+MILO_STAGE2_API_PINNED_OFF_FLAGS=(
+  MILO_ENABLE_WORK_SCOPE_PREPARATION
+  MILO_ENABLE_PAID_EXECUTION
+  MILO_ENABLE_CATALOG_PROMOTION
+)
+
+# Stage 2, product worker job. The worker reads the batch binding and the
+# batch's one scoped snapshot; it neither authors plans nor starts batches, so
+# the two Mapping Plan API flags are not its concern and stay as Stage A set
+# them (false).
+MILO_STAGE2_WORKER_ENABLE_FLAGS=(
+  MILO_ENABLE_EXECUTION_CONTROL
+  MILO_ENABLE_PAID_EXECUTION
+  MILO_ENABLE_CATALOG_EXECUTION
+  MILO_ENABLE_GOVERNMENT_CATALOG_READ
+)
+MILO_STAGE2_WORKER_PINNED_OFF_FLAGS=(
+  MILO_ENABLE_CATALOG_PROMOTION
+  MILO_ENABLE_WORK_SCOPE_PREPARATION
+  MILO_ENABLE_WORK_SCOPE_MUTATIONS
+  MILO_ENABLE_WORK_SCOPE_BATCHES
+)
+
+# The Vercel half of Stage 2, BY NAME. NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI is
+# inlined at BUILD time (a rebuild is required); GATEWAY_ALLOW_EXECUTION_ROUTES
+# is read by the running gateway.
+MILO_STAGE2_VERCEL_BUILD_FLAG="NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI"
+MILO_STAGE2_VERCEL_RUNTIME_FLAG="GATEWAY_ALLOW_EXECUTION_ROUTES"
+
+# The database surface the Mapping Plan -> prepared batch -> Swarm V2 path
+# calls, created by the three scoped-catalog migrations
+# (20260922000100, 20260923000100, 20260924000100). Each must exist and be
+# EXECUTE-able by service_role and by neither anon nor authenticated.
+# tests/test_scoped_rollout_contract.py holds this list to the migrations and
+# to the repository's own RPC calls.
+MILO_WORK_SCOPE_RPCS=(
+  create_work_scope
+  revise_work_scope
+  catalog_canonical_manufacturer_coverage
+  prepare_work_scope_queue
+  work_scope_batch_for_run
+  bind_work_scope_batch_run
+  create_work_scope_batch_run
+  work_scope_progress
+  set_work_scope_paused
+)
+MILO_WORK_SCOPE_TABLES=(
+  catalog_work_scopes
+  catalog_work_scope_revisions
+  catalog_work_scope_preparations
+  catalog_work_scope_units
+  catalog_work_scope_batches
+  catalog_work_scope_queue_items
+  catalog_work_scope_batch_runs
+  catalog_work_scope_controls
+)

@@ -387,6 +387,18 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
 
         project = repo.get_project(project_id) if project_id else {}
         workflow_key = project.get("workflow_key")
+        # With the Government read on, the worker refuses every Swarm V2 run
+        # that is bound to no Mapping Plan batch (GOVERNMENT_BATCH_REQUIRED).
+        # Such a run is refused HERE instead, before any message, run or
+        # launch exists: catalog work starts only from a prepared batch
+        # (`POST /work-scopes/{id}/runs`). Every other workflow, and Swarm V2
+        # with the read off, is untouched.
+        if work_scopes.direct_run_blocker(workflow_key) is not None:
+            raise AppError(
+                "CATALOG_RUN_REQUIRES_MAPPING_PLAN",
+                "catalog runs in this project start from a prepared Mapping Plan batch",
+                409,
+            )
         if workflow_key == "vehicle_catalog_v1":
             # V1 maps exactly the scope its PROJECT configures -- the trusted
             # relation, the same one the run's workflow is read from. It is
