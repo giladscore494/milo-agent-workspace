@@ -201,7 +201,8 @@ def test_deployment_never_executes_the_worker_job():
     assert "POST /runs" not in SCRIPT
     # Execution count is compared before and after the deployment.
     assert "WORKER_EXECUTIONS_BEFORE=$(worker_execution_count)" in SCRIPT
-    assert 'verify_no_worker_execution "$WORKER_EXECUTIONS_BEFORE" "$(worker_execution_count)"' in SCRIPT
+    assert 'WORKER_EXECUTIONS_AFTER=$(worker_execution_count)' in SCRIPT
+    assert 'verify_no_worker_execution "$WORKER_EXECUTIONS_BEFORE" "$WORKER_EXECUTIONS_AFTER"' in SCRIPT
     assert "Deployment must never execute the worker." in SCRIPT
 
 
