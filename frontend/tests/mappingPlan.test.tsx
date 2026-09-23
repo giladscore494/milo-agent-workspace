@@ -187,12 +187,49 @@ describe('the Mapping Plan surface', () => {
     expect(apiMocks.api.openWorkScope).not.toHaveBeenCalled();
   });
 
-  it('never asks about a project whose engine reads no plan', async () => {
+  it('authors nothing until the conversation\'s plan has been read, so no edit is lost', async () => {
+    // The plan read is slow. An edit made before it answered used to be wiped
+    // when the answer arrived (a real e2e failure: "Add Toyota" vanished).
+    let answer!: (body: unknown) => void;
+    apiMocks.api.openWorkScope.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+    await openConversation();
+    const panel = await openPanel();
+    const directory = await within(panel).findByRole('list', { name: 'Manufacturer directory' });
+    const addToyota = within(directory).getByRole('button', { name: 'Add Toyota' });
+    expect(addToyota).toBeDisabled();
+    expect(within(panel).getByLabelText('Tell MILO what to map')).toBeDisabled();
+    expect(within(panel).getByLabelText(/Candidate limit/)).toBeDisabled();
+
+    await act(async () => { answer({ work_scope: null }); });
+    await waitFor(() => expect(addToyota).not.toBeDisabled());
+    fireEvent.click(addToyota);
+    fireEvent.click(within(directory).getByRole('button', { name: 'Add Lexus' }));
+    const units = within(panel).getByRole('list', { name: 'Manufacturers in priority order' });
+    expect(within(units).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      expect.stringContaining('1. Toyota'), expect.stringContaining('2. Lexus')]);
+  });
+
+  it('keeps authoring locked when the plan could not be read', async () => {
+    apiMocks.api.openWorkScope.mockRejectedValue(new Error('network'));
+    await openConversation();
+    const panel = await openPanel();
+    await within(panel).findByRole('button', { name: 'Reload plan' });
+    const directory = within(panel).getByRole('list', { name: 'Manufacturer directory' });
+    expect(within(directory).getByRole('button', { name: 'Add Toyota' })).toBeDisabled();
+    expect(apiMocks.api.createWorkScope).not.toHaveBeenCalled();
+  });
+
+  it('shows no plan for a project whose engine reads none', async () => {
+    // The project IS asked -- its answer says whether an ordinary run may be
+    // created there -- but a server that says the plan does not apply hides it.
+    apiMocks.api.workScopeCapabilities.mockResolvedValue(
+      { ...CAPABILITIES, available: false, reason: 'workflow_not_supported' });
     apiMocks.api.conversations.mockResolvedValue([{ ...CONV, project_id: V1_PROJECT.id }]);
     await openConversation(V1_PROJECT);
+    await waitFor(() => expect(apiMocks.api.workScopeCapabilities).toHaveBeenCalledWith(V1_PROJECT.id));
     await act(async () => { await Promise.resolve(); });
-    expect(apiMocks.api.workScopeCapabilities).not.toHaveBeenCalled();
     expect(screen.queryByRole('heading', { name: 'Mapping plan' })).toBeNull();
+    expect(apiMocks.api.openWorkScope).not.toHaveBeenCalled();
   });
 
   it('is absent when the execution UI flag is off', async () => {

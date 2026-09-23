@@ -852,25 +852,73 @@ def test_each_batch_runs_as_one_request_and_the_plan_completes(monkeypatch):
 
 def test_a_chat_run_cannot_read_the_catalog_outside_a_batch(monkeypatch):
     """ONE execution scope: with the catalog read on, a run started from the
-    conversation instead of the Mapping Plan is refused by the worker before
-    any provider path exists."""
+    conversation instead of the Mapping Plan is refused by the API before a
+    message, a run or a launch exists (the worker refuses such a run too,
+    `GOVERNMENT_BATCH_REQUIRED`, which `test_government_preparation.py` holds).
+    The same conversation's prepared batch still starts."""
     swarm_env(monkeypatch, **{CATALOG_EXECUTION_FLAG: "true", GOVERNMENT_READ_FLAG: "true",
-                              CATALOG_PROMOTION_FLAG: "false"})
+                              CATALOG_PROMOTION_FLAG: "false", BATCHES: "true",
+                              "MILO_RATE_LIMIT_RUN_CREATION_PROJECT": "1000"})
     patch_client(monkeypatch, FakeKimiCompletions())
     repo, plan = prepared()
     inline = InlineWorkerLauncher(repo)
     app.dependency_overrides[get_job_launcher] = lambda: inline
     try:
+        before = counts(repo, plan)
         response = client(repo).post(f"/conversations/{plan['conversation_id']}/runs",
                                      json={"content": "map every Toyota", "metadata": {},
                                            "idempotency_key": "ui-chat-000002"},
                                      headers=as_user())
-        assert response.status_code == 202
-        run = repo.runs[response.json()["run_id"]]
-        assert run["status"] == "failed"
-        assert run["error"]["code"] == "GOVERNMENT_BATCH_REQUIRED"
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "CATALOG_RUN_REQUIRES_MAPPING_PLAN"
+        # Nothing was written and nothing was launched.
+        assert counts(repo, plan) == before and inline.launches == []
+        capabilities = client(repo).get(
+            f"/projects/{repo.get_conversation(UUID(plan['conversation_id']))['project_id']}"
+            "/work-scope/capabilities", headers=as_user()).json()
+        assert capabilities["direct_runs"] == {"allowed": False,
+                                               "blocked_by": "catalog_batch_required"}
+        # The Mapping Plan's batch is the one catalog execution path, and it starts.
+        started = post_start(repo, plan, batch_ids(plan)[0])
+        assert started.status_code == 202, started.text
+        assert repo.work_scope_batch_for_run(UUID(started.json()["run_id"])) is not None
     finally:
         app.dependency_overrides.clear()
+
+
+def test_the_direct_run_refusal_is_only_for_catalog_reading_swarm_v2(launcher, enabled,
+                                                                     monkeypatch):
+    """A Vehicle Catalog V1 project, and Swarm V2 with the read off, keep their
+    ordinary runs: only a run that WOULD read the catalog is routed away."""
+    monkeypatch.setenv(CATALOG_EXECUTION_FLAG, "true")
+    monkeypatch.setenv(GOVERNMENT_READ_FLAG, "true")
+    v1, v1_project, _v1_conversation = world("vehicle_catalog_v1")
+    answer = client(v1).get(f"/projects/{v1_project}/work-scope/capabilities",
+                            headers=as_user()).json()
+    assert answer["direct_runs"] == {"allowed": True, "blocked_by": None}
+    # The master switch alone (read off) does not route a Swarm V2 run away.
+    monkeypatch.setenv(GOVERNMENT_READ_FLAG, "false")
+    repo, project, conversation = world()
+    assert ws.direct_run_blocker("swarm_v2") is None
+    ordinary = client(repo).post(f"/conversations/{conversation}/runs",
+                                 json={"content": "summarize", "metadata": {},
+                                       "idempotency_key": "ui-plain-000001"}, headers=as_user())
+    assert ordinary.status_code == 202, ordinary.text
+    body = client(repo).get(f"/projects/{project}/work-scope/capabilities",
+                            headers=as_user()).json()
+    assert body["direct_runs"] == {"allowed": True, "blocked_by": None}
+    # Run creation off: the composer is told so, whatever the catalog posture.
+    monkeypatch.setenv(RUN_CREATION, "false")
+    body = client(repo).get(f"/projects/{project}/work-scope/capabilities",
+                            headers=as_user()).json()
+    assert body["direct_runs"] == {"allowed": False, "blocked_by": "run_creation_disabled"}
+    # The read ON names the routing reason first: it is this project's answer
+    # at every stage, not only while run creation is on.
+    monkeypatch.setenv(GOVERNMENT_READ_FLAG, "true")
+    body = client(repo).get(f"/projects/{project}/work-scope/capabilities",
+                            headers=as_user()).json()
+    assert body["direct_runs"] == {"allowed": False, "blocked_by": "catalog_batch_required"}
+    assert set(ws.DIRECT_RUN_BLOCKERS) == {"catalog_batch_required", "run_creation_disabled"}
 
 
 # =============================================================================

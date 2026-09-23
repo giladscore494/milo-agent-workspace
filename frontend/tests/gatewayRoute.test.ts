@@ -43,6 +43,32 @@ describe('private API gateway route', () => {
     expect(mocks.getCloudRunServiceUrl).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['conversations', CONVERSATION_ID, 'runs'],
+    ['workflow-proposals', PROPOSAL_ID, 'runs'],
+    ['work-scopes', CONVERSATION_ID, 'runs'],
+  ])('refuses a run start while plan authoring is open (%s), before authentication', async (...path) => {
+    // Stage P, and every moment while the backend is being armed: the
+    // execution routes are open for plan writes, the run-start flag is not.
+    process.env.GATEWAY_ALLOW_EXECUTION_ROUTES = 'true';
+    delete process.env.GATEWAY_ALLOW_RUN_START_ROUTES;
+    try {
+      const request = new NextRequest(
+        `https://milo-agent-workspace.vercel.app/api/gateway/${path.join('/')}`,
+        { method: 'POST', headers: { authorization: 'Bearer any-user-token' } },
+      );
+      const response = await POST(request, { params: Promise.resolve({ path }) });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({
+        error: 'Run creation is disabled by the gateway safety policy.',
+      });
+      expect(mocks.getCloudRunIdToken).not.toHaveBeenCalled();
+      expect(mocks.getCloudRunServiceUrl).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.GATEWAY_ALLOW_EXECUTION_ROUTES;
+    }
+  });
+
   it('blocks workflow-proposal run creation before authentication', async () => {
     const request = new NextRequest(
       `https://milo-agent-workspace.vercel.app/api/gateway/workflow-proposals/${PROPOSAL_ID}/runs`,

@@ -1,5 +1,14 @@
 # Production activation runbook
 
+> **Superseded for the Mapping Plan → prepared batch → Swarm V2 path.** The
+> gated, copy-paste rollout procedure is
+> [SCOPED_BATCH_PRODUCTION_RUNBOOK.md](SCOPED_BATCH_PRODUCTION_RUNBOOK.md).
+> Two things below changed: `production-activate.sh --all` now deploys (and so
+> builds the worker image) **before** anything can capture, and stops before
+> any capture; and readiness is proved for a NAMED, prepared plan revision
+> (`production-verify.sh --gate prepared --work-scope-*`), never by "an active
+> Government snapshot exists". Sections 0, 3 and 4 remain accurate background.
+
 Operational. Four commands to deploy and verify, then one deliberate step to
 open the website — from an authenticated operator shell.
 
@@ -65,23 +74,25 @@ gcloud secrets versions add SUPABASE_URL --data-file=- --project=<PROJECT_ID>
 
 ```bash
 ./scripts/deploy/production-preflight.sh
-./scripts/catalog/government-production-capture.sh --all --enable-catalog-execution
-DEPLOY_MODE=apply ./scripts/deploy/cloud-run.sh
-./scripts/deploy/production-verify.sh
+./scripts/deploy/production-verify.sh --gate database     # the exact migration set
+DEPLOY_MODE=apply ./scripts/deploy/cloud-run.sh          # builds the worker image FIRST
+./scripts/deploy/production-verify.sh --gate deployed
+# only now may anything run the capture job, which runs that image:
+./scripts/catalog/government-production-capture.sh --all --enable-catalog-execution   # optional whole register
 ```
 
 Or, the same sequence through the thin orchestrator:
 
 ```bash
-./scripts/deploy/production-activate.sh --plan                            # read-only dry run first
-./scripts/deploy/production-activate.sh --all --enable-catalog-execution  # then for real
-./scripts/deploy/production-activate.sh --website                         # Stage 2, separately
+./scripts/deploy/production-activate.sh --plan    # read-only dry run first
+./scripts/deploy/production-activate.sh --all     # preflight, database gate, deploy, verify — then STOP
 ```
 
-`--all` deliberately **stops before** the website step. Landing the snapshot
-and exposing a paid surface to a human are separate decisions, made at
-separate times, after you have read the verify output — so `--website` refuses
-to be combined with `--capture`.
+`--all` deliberately **stops before** any capture, preparation or website
+step. The scoped preparation needs a Mapping Plan a person authors in the
+website first; see the new runbook. The capture script itself now refuses to
+create or execute the capture job unless the release worker image exists and
+the job runs exactly it.
 
 Run `--plan` first. It performs the full preflight, prints the capture job
 definition and the deployment plan, and mutates nothing.
@@ -185,6 +196,7 @@ environment change at all.
 | `CLOUD_RUN_API_URL` | runtime | new deployment |
 | `GCP_PROJECT_NUMBER`, `GCP_WORKLOAD_IDENTITY_POOL_ID`, `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID`, `GCP_SERVICE_ACCOUNT_EMAIL` | runtime | new deployment |
 | `GATEWAY_ALLOW_EXECUTION_ROUTES` | runtime | new deployment |
+| `GATEWAY_ALLOW_RUN_START_ROUTES` (run starts; opened LAST — see SCOPED_BATCH_PRODUCTION_RUNBOOK.md E.3) | runtime | new deployment |
 | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | runtime | new deployment |
 | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **build-time** | **REBUILD** |
 | `NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI` | **build-time** | **REBUILD** |

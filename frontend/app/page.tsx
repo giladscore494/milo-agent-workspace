@@ -60,7 +60,7 @@ import {
   CatalogReviewView,
 } from '@/components/catalog/CatalogReviewPanel';
 import { ConversationView } from '@/components/conversation/ConversationView';
-import { TaskComposer } from '@/components/conversation/TaskComposer';
+import { ComposerRoute, TaskComposer } from '@/components/conversation/TaskComposer';
 import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector';
 import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
 import { MappingPlanPanel } from '@/components/scope/MappingPlanPanel';
@@ -681,13 +681,16 @@ export default function WorkspacePage() {
   }, []);
 
   /**
-   * Whether the Mapping Plan applies to this project, from the SERVER's
-   * capability read. Only a Swarm V2 project is asked -- no other engine reads
-   * a plan -- and any failure, including a client that has no such method,
-   * leaves the surface hidden rather than half-shown.
+   * The project's capabilities, from the SERVER: whether the Mapping Plan
+   * applies (only a Swarm V2 project reads one) AND whether an ordinary run
+   * may be created here at all (`direct_runs`). Every project is asked,
+   * because the second answer is what keeps the composer honest in a posture
+   * such as plan authoring, where the execution UI is on but run creation is
+   * off. Any failure, including a client that has no such method, leaves the
+   * Mapping Plan hidden and the composer unconfirmed rather than half-shown.
    */
   const loadPlanCapabilities = useCallback((project: Project, owner: WorkspaceScope) => {
-    if (!executionUi || project.workflow_key !== 'swarm_v2') return;
+    if (!executionUi) return;
     Promise.resolve()
       .then(() => api.workScopeCapabilities(project.id))
       .then(body => {
@@ -745,6 +748,21 @@ export default function WorkspacePage() {
 
   const planAvailable = executionUi && planCapabilities?.available === true;
   const batchesAvailable = planAvailable && planCapabilities?.canStartBatches === true;
+
+  /**
+   * Where a typed task may go, from the SERVER's capability read, for EVERY
+   * project. A project whose capabilities have not answered is `unconfirmed`,
+   * never `direct`: the server may be refusing ordinary runs (run creation
+   * off during plan authoring, or a catalog project whose work starts from the
+   * Mapping Plan), and the composer must not pretend otherwise.
+   */
+  const composerRoute: ComposerRoute = selectedProject === undefined
+    ? { kind: 'direct' }
+    : planCapabilities === undefined
+      ? { kind: 'unconfirmed' }
+      : planCapabilities.directRuns.allowed
+        ? { kind: 'direct' }
+        : { kind: 'blocked', blockedBy: planCapabilities.directRuns.blockedBy ?? 'unknown', planAvailable };
 
   /**
    * The plan's progress, applied only while its conversation is still the
@@ -966,6 +984,9 @@ export default function WorkspacePage() {
 
   async function startRun() {
     if (!activeConversation || submittingRun || !taskContent.trim()) return;
+    // The composer offers no submission unless the route is direct; this
+    // holds the same line for any other caller.
+    if (composerRoute.kind !== 'direct') return;
     const owner = scope.current;
     const conversationId = activeConversation.id;
     const content = taskContent.trim();
@@ -1254,6 +1275,9 @@ export default function WorkspacePage() {
             onSubmit={startRun}
             submitting={submittingRun !== undefined}
             error={runError}
+            route={composerRoute}
+            onOpenMappingPlan={() => setPlanOpen(true)}
+            onRecheck={() => { if (selectedProject) loadPlanCapabilities(selectedProject, scope.current); }}
           />
         }
       >

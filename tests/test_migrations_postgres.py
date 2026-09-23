@@ -8754,3 +8754,213 @@ def test_batch_run_relations_are_service_only_and_rerun_safe(db):
     db.psql(file=_wsb_migration())
     assert db.psql("select count(*) from public.catalog_work_scope_controls") == before
     assert _wsb_progress(db, world["plan"])["paused"] is True
+
+
+# =============================================================================
+# Production rollout: scoped readiness of the EXACT batch path, in real SQL.
+#
+# `scripts/deploy/work-scope-readiness.sh` is what production-verify.sh and the
+# Stage 2 gate ask whether a plan revision is ready to start its next batch.
+# These tests run the real script, with the real psql, against real migrated
+# schemas: a generic Government snapshot, an unprepared revision, a stale
+# revision, a wrong digest, a live batch and a paused plan must never read as
+# ready, and a database missing the three scoped-catalog migrations (the
+# measured production state: 38 of 41 applied) must say so exactly.
+# =============================================================================
+
+READINESS_SCRIPT = REPO_ROOT / "scripts" / "deploy" / "work-scope-readiness.sh"
+MIGRATION_STATE_SCRIPT = REPO_ROOT / "scripts" / "release" / "check-migration-state.sh"
+SCOPED_MIGRATION_VERSIONS = ("20260922000100", "20260923000100", "20260924000100")
+PARTIAL_PG_PORT = "54995"
+
+
+def _db_url(server, user: str = "postgres") -> str:
+    return f"postgresql:///milo?host={server.dir}&port={server.port}&user={user}"
+
+
+def _readiness(server, *args: str, user: str = "postgres") -> subprocess.CompletedProcess:
+    env = {**os.environ, "MILO_TEST_READONLY_DB_URL": _db_url(server, user)}
+    return subprocess.run(["bash", str(READINESS_SCRIPT), "--database-url-env",
+                           "MILO_TEST_READONLY_DB_URL", *args],
+                          capture_output=True, text=True, env=env, timeout=120)
+
+
+def _triple(world: dict, revision: int = 1, digest: str | None = None) -> list[str]:
+    return ["--work-scope-id", world["plan"], "--work-scope-revision", str(revision),
+            "--work-scope-digest", digest or world["digest"]]
+
+
+def test_scoped_readiness_proves_the_exact_prepared_head_and_its_next_batch(db):
+    world = _wsp_world(db)
+    plan = world["plan"]
+
+    # Nothing prepared yet: NO, even once a WHOLE-REGISTER snapshot is active.
+    _wsp_snapshot(db, world["args"], f"whole-reg-{plan[:8]}", [("candidate", 2020)], marque=None)
+    before = _readiness(db, *_triple(world))
+    assert before.returncode == 1, before.stdout
+    assert "WORK_SCOPE_PREPARED=NO" in before.stdout
+    assert "BATCH_READY=NO" in before.stdout
+    assert "BATCH_READY=VERIFIED" not in before.stdout
+
+    summary = _wsp_prepare(db, world["args"], plan, 1, world["digest"], _wsp_units(world["snapshot"]))
+    first = summary["batches"][0]["id"]
+    ready = _readiness(db, *_triple(world))
+    assert ready.returncode == 0, ready.stdout + ready.stderr
+    for line in ("DATABASE_READ=VERIFIED", "WORK_SCOPE_SCHEMA=VERIFIED", "WORK_SCOPE_PLAN=VERIFIED",
+                 "WORK_SCOPE_PREPARED=VERIFIED", "EVIDENCE_READY=VERIFIED", "BATCH_READY=VERIFIED",
+                 "NEXT_BATCH_NUMBER=1", f"NEXT_BATCH_ID={first}", "NEXT_BATCH_UNIT=toyota",
+                 f"NEXT_BATCH_SNAPSHOT_KEY={world['snapshot_key']}", "WORK_SCOPE_READINESS=VERIFIED"):
+        assert line in ready.stdout, (line, ready.stdout)
+    # The unverified marque is stated, never counted as ready.
+    assert "UNIT 2. lexus state=register_unverified reason=WORK_SCOPE_REGISTER_UNVERIFIED" in ready.stdout
+
+    # A digest or a revision that is not exactly the head is refused.
+    wrong = _readiness(db, *_triple(world, digest="0" * 64))
+    assert wrong.returncode == 1 and "WORK_SCOPE_PLAN=NO" in wrong.stdout
+    missing = _readiness(db, *_triple(world, revision=2))
+    assert missing.returncode == 1 and "revision 2 does not exist" in missing.stdout
+
+    # The listing hands the operator the exact triple.
+    listed = _readiness(db, "--list")
+    assert listed.returncode == 0
+    assert f"work_scope_id={plan} revision=1 digest={world['digest']}" in listed.stdout
+    assert "head_prepared=yes" in listed.stdout.split(plan, 1)[1].splitlines()[0]
+
+    # A live batch run holds the plan: never "ready" for a second paid run.
+    started = _wsb_start(db, world, first, key=f"ready-{plan[:8]}")
+    live = _readiness(db, *_triple(world))
+    assert live.returncode == 1 and "BATCH_READY=NO" in live.stdout
+    assert f"LIVE_BATCH_RUNS={started['run']['id']}:queued" in live.stdout
+    # Settled: batch 2 is next.
+    _wsb_finish(db, started["run"]["id"], "completed")
+    after = _readiness(db, *_triple(world))
+    assert after.returncode == 0 and "NEXT_BATCH_NUMBER=2" in after.stdout
+    assert "WORK_SCOPE_BATCHES_SETTLED=1 of 3" in after.stdout
+
+    # Paused: NO.
+    _wsb_pause(db, world, True)
+    paused = _readiness(db, *_triple(world))
+    assert paused.returncode == 1 and "the plan is paused" in paused.stdout
+    _wsb_pause(db, world, False)
+
+    # A revision past the prepared one makes revision 1 stale and leaves the
+    # new head unprepared: both are NO.
+    revised = _ws_scope(max_items=25, batch_size=5)
+    json.loads(db.psql(
+        f"select public.revise_work_scope('{plan}', 1, '{world['digest']}', "
+        f"'{world['user']}', {_ws_revision(revised)})"))
+    stale = _readiness(db, *_triple(world))
+    assert stale.returncode == 1 and "is not the head (head is 2)" in stale.stdout
+    head = _readiness(db, *_triple(world, revision=2, digest=revised.digest()))
+    assert head.returncode == 1 and "revision 2 has not been prepared" in head.stdout
+
+
+def test_scoped_readiness_refuses_units_that_queued_nothing(db):
+    world = _wsp_world(db)
+    # A scoped snapshot whose in-range rows are mostly unreadable: the
+    # database itself records the unit `vocabulary_insufficient` and queues
+    # nothing for it.
+    unreadable, _key, _candidates = _wsp_snapshot(
+        db, world["args"], f"amb-{world['plan'][:8]}",
+        [("ambiguous", 2020)] * 3 + [("candidate", 2020)])
+    _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"], _wsp_units(unreadable))
+    result = _readiness(db, *_triple(world))
+    assert result.returncode == 1, result.stdout
+    assert "EVIDENCE_READY=NO" in result.stdout and "no unit of this revision was prepared" in result.stdout
+    assert "UNIT 1. toyota state=vocabulary_insufficient" in result.stdout
+
+
+def test_scoped_readiness_never_reads_rls_hidden_emptiness_as_evidence(db):
+    """A role WITHOUT BYPASSRLS sees zero rows in every service-only relation.
+    That is UNVERIFIED, never NO-and-certainly-never-READY."""
+    role = "milo_ro_rls_bound"
+    db.psql(f"do $$ begin if not exists (select 1 from pg_roles where rolname = '{role}') then "
+            f"create role {role} login; end if; end $$; grant pg_read_all_data to {role}")
+    world = _wsb_world(db)
+    result = _readiness(db, *_triple(world), user=role)
+    assert result.returncode == 3, result.stdout
+    assert "DATABASE_READ=UNVERIFIED" in result.stdout
+    assert "WORK_SCOPE_READINESS=UNVERIFIED" in result.stdout
+
+
+def test_scoped_readiness_input_is_validated_and_bound_never_interpolated(db):
+    world = _wsb_world(db)
+    for args in (["--work-scope-id", "x' or '1'='1"], ["--work-scope-revision", "1;drop"],
+                 ["--work-scope-digest", "Z" * 64]):
+        triple = dict(zip(_triple(world)[::2], _triple(world)[1::2]))
+        triple[args[0]] = args[1]
+        flat = [part for pair in triple.items() for part in pair]
+        result = _readiness(db, *flat)
+        assert result.returncode == 2, (args, result.stdout)
+    # No URL at all: UNVERIFIED, not NO.
+    env = {k: v for k, v in os.environ.items() if k != "MILO_TEST_READONLY_DB_URL"}
+    result = subprocess.run(["bash", str(READINESS_SCRIPT), "--database-url-env",
+                             "MILO_TEST_READONLY_DB_URL", *_triple(world)],
+                            capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 3 and "DATABASE_READ=UNVERIFIED" in result.stdout
+
+
+@pytest.fixture(scope="module")
+def production_shaped_db():
+    """The MEASURED production state: every migration through 20260921000200
+    applied and recorded in supabase_migrations.schema_migrations, and the
+    three scoped-catalog migrations absent."""
+    server = EphemeralPostgres(_require_pg_bin(), port=PARTIAL_PG_PORT)
+    server.start()
+    try:
+        server.create_database()
+        server.psql(file=BASELINE)
+        server.psql(sql=SEED_LEGACY_ROWS)
+        server.psql(sql=SUPABASE_AUTH_SHIM)
+        applied = [m for m in MIGRATIONS if not m.name.startswith(SCOPED_MIGRATION_VERSIONS)]
+        assert len(applied) == len(MIGRATIONS) - 3
+        for migration in applied:
+            server.psql(file=migration)
+        versions = ", ".join(f"('{m.name.split('_', 1)[0]}')" for m in applied)
+        server.psql("create schema if not exists supabase_migrations; "
+                    "create table supabase_migrations.schema_migrations (version text primary key); "
+                    f"insert into supabase_migrations.schema_migrations (version) values {versions}")
+        yield server
+    finally:
+        server.stop()
+
+
+def test_the_production_shaped_database_is_named_exactly_as_three_migrations_short(production_shaped_db):
+    schema = _readiness(production_shaped_db, "--schema-only")
+    assert schema.returncode == 1, schema.stdout
+    assert "WORK_SCOPE_SCHEMA=NO" in schema.stdout
+    for table in ("catalog_work_scopes", "catalog_work_scope_batches", "catalog_work_scope_controls"):
+        assert table in schema.stdout
+    for rpc in ("create_work_scope_batch_run", "work_scope_batch_for_run", "prepare_work_scope_queue"):
+        assert rpc in schema.stdout
+    # The scoped check refuses before reading any plan.
+    scoped = _readiness(production_shaped_db, "--work-scope-id", str(uuid.uuid4()),
+                        "--work-scope-revision", "1", "--work-scope-digest", "a" * 64)
+    assert scoped.returncode == 1 and "BATCH_READY=VERIFIED" not in scoped.stdout
+    # The canonical migration-state tool names exactly the three pending
+    # versions -- the check production-verify.sh relies on for DATABASE_READY.
+    env = {**os.environ, "MILO_TEST_READONLY_DB_URL": _db_url(production_shaped_db)}
+    state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
+                            "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
+                           env=env, timeout=300)
+    assert "remote schema classified as partially-migrated" in state.stdout, state.stdout
+    assert "3 local migration(s) not present in remote migration history" in state.stdout
+    for version in SCOPED_MIGRATION_VERSIONS:
+        assert version in state.stdout
+    assert "fully-migrated" not in state.stdout.split("remote:state", 1)[1].splitlines()[0]
+
+    # Applying exactly the three, in order, makes the schema complete and the
+    # migration set exact -- the post-migration verification of Stage B.
+    for migration in MIGRATIONS:
+        if migration.name.startswith(SCOPED_MIGRATION_VERSIONS):
+            production_shaped_db.psql(file=migration)
+            production_shaped_db.psql(
+                "insert into supabase_migrations.schema_migrations (version) values "
+                f"('{migration.name.split('_', 1)[0]}')")
+    schema = _readiness(production_shaped_db, "--schema-only")
+    assert schema.returncode == 0, schema.stdout
+    assert "WORK_SCOPE_SCHEMA=VERIFIED" in schema.stdout
+    state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
+                            "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
+                           env=env, timeout=300)
+    assert "remote schema classified as fully-migrated" in state.stdout, state.stdout

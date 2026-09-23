@@ -93,11 +93,33 @@ GATE_CHAIN: tuple[Gate, ...] = (
         surface=GATEWAY_RUNTIME,
         current_default="unset (falsey)",
         required_for_first_run="YES",
-        when_to_enable="Stage 2, with the UI flag",
+        when_to_enable=(
+            "Stage P (plan authoring), with the UI flag; it opens the execution "
+            "routes (Mapping Plan writes, pause/resume, cancellation) but never a "
+            "run START on its own"),
         requires_redeploy=REDEPLOY_FE,
         failure_behavior_when_off=(
-            "isGatewayRequestAllowed() rejects POST /conversations/{id}/runs at "
-            "the gateway; the request never reaches the Cloud Run API."),
+            "isGatewayRequestAllowed() rejects every execution route, including "
+            "the Mapping Plan writes and every run start; the request never "
+            "reaches the Cloud Run API."),
+        stage=2,
+    ),
+    Gate(
+        name="GATEWAY_ALLOW_RUN_START_ROUTES",
+        surface=GATEWAY_RUNTIME,
+        current_default="unset (falsey)",
+        required_for_first_run="YES — and it is opened LAST",
+        when_to_enable=(
+            "Stage 2, as the very last step: after website-execution-activate.sh "
+            "--apply-backend armed and read back the worker and then the API, and "
+            "after production-verify.sh --gate armed proved every start still "
+            "refused. Requires GATEWAY_ALLOW_EXECUTION_ROUTES as well"),
+        requires_redeploy=REDEPLOY_FE,
+        failure_behavior_when_off=(
+            "isRunCreationRequest() refuses POST /conversations/{id}/runs, "
+            "/workflow-proposals/{id}/runs and /work-scopes/{id}/runs with 403 "
+            "before authentication, so no intermediate activation posture can "
+            "start a run from the website."),
         stage=2,
     ),
     Gate(
@@ -204,28 +226,37 @@ GATE_CHAIN: tuple[Gate, ...] = (
     ),
     Gate(
         name="MILO_ENABLE_CATALOG_EXECUTION",
-        surface=WORKER_RUNTIME,
+        surface=WORKER_RUNTIME + " (mirrored on the " + API_RUNTIME + ")",
         current_default="false",
         required_for_first_run="YES for the vehicle-catalog product path",
-        when_to_enable="Stage 2",
-        requires_redeploy=UPDATE_JOB,
+        when_to_enable=(
+            "Stage 2, on the worker AND the API (website-execution-activate.sh "
+            "--apply-backend sets both)"),
+        requires_redeploy=UPDATE_JOB + "; " + UPDATE_SERVICE,
         failure_behavior_when_off=(
             "catalog_posture() reports master off: no Government tool is "
             "registered and Government preparation is skipped entirely. The run "
-            "executes without the catalog capability."),
+            "executes without the catalog capability. On the API it constructs "
+            "nothing; with the read below it only routes run creation."),
         stage=2,
     ),
     Gate(
         name="MILO_ENABLE_GOVERNMENT_CATALOG_READ",
-        surface=WORKER_RUNTIME,
+        surface=WORKER_RUNTIME + " (mirrored on the " + API_RUNTIME + ")",
         current_default="false",
         required_for_first_run="YES for the vehicle-catalog product path",
-        when_to_enable="Stage 2, and ONLY after a usable snapshot exists",
-        requires_redeploy=UPDATE_JOB,
+        when_to_enable=(
+            "Stage 2, and ONLY after the named Mapping Plan revision is prepared "
+            "(production-verify.sh --gate prepared); a generic Government "
+            "snapshot is not enough"),
+        requires_redeploy=UPDATE_JOB + "; " + UPDATE_SERVICE,
         failure_behavior_when_off=(
-            "Government preparation is skipped. With it ON but no usable "
-            "snapshot, preparation refuses the run with "
-            "GOVERNMENT_SNAPSHOT_UNAVAILABLE before the provider is built."),
+            "Government preparation is skipped, and a batch-bound run is refused "
+            "(GOVERNMENT_READ_REQUIRED). With it ON, the worker refuses every "
+            "Swarm V2 run bound to no batch (GOVERNMENT_BATCH_REQUIRED) before a "
+            "snapshot is read, and the API -- where it is mirrored -- refuses to "
+            "create one (CATALOG_RUN_REQUIRES_MAPPING_PLAN); the website routes "
+            "catalog work to the Mapping Plan."),
         stage=2,
     ),
     Gate(
@@ -278,7 +309,9 @@ GATE_CHAIN: tuple[Gate, ...] = (
         required_for_first_run=(
             "NO for a conversation run — YES only to create or revise a Mapping "
             "Plan (a draft work scope; it executes nothing)"),
-        when_to_enable="Only when the Mapping Plan surface is being used",
+        when_to_enable=(
+            "Stage P (plan authoring: website-execution-activate.sh "
+            "--apply-plan-authoring), and kept on at Stage 2"),
         requires_redeploy=UPDATE_SERVICE,
         failure_behavior_when_off=(
             "POST /conversations/{id}/work-scopes and POST /work-scopes/{id}/"

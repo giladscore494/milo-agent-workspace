@@ -41,6 +41,7 @@ EXECUTION_FLAGS = [
     # turned on per execution by an explicit operator command, never a default.
     "MILO_ENABLE_WORK_SCOPE_PREPARATION",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
+    "GATEWAY_ALLOW_RUN_START_ROUTES",
     "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI",
     # Test-only adapters must never be switched on outside the isolated
     # E2E stacks.

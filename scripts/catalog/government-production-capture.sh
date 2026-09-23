@@ -42,7 +42,7 @@ source "${REPO_ROOT}/scripts/deploy/operator-config.sh"
 # shellcheck source=../deploy/deployment-contract.sh disable=SC1091
 source "${REPO_ROOT}/scripts/deploy/deployment-contract.sh"
 
-MODE="plan" MILO_OPERATOR_CONFIG_PATH="" CATALOG_EXECUTION_VALUE="" RUN_ID=""
+MODE="plan" MILO_OPERATOR_CONFIG_PATH="" CATALOG_EXECUTION_VALUE="" RUN_ID="" IDEMPOTENCY_KEY=""
 WORK_SCOPE_ID="" WORK_SCOPE_REVISION="" WORK_SCOPE_DIGEST="" WORK_SCOPE_PREPARATION_VALUE=""
 TASK_TIMEOUT="${MILO_CAPTURE_TASK_TIMEOUT:-3600s}"
 
@@ -82,9 +82,20 @@ Options:
                 REQUIRED for --prepare-work-scope. Turns the scoped-preparation
                 switch on for THAT ONE execution only; the job definition keeps
                 it pinned off.
+  --idempotency-key <key>  For --prepare / --all: this attempt's key, instead of
+                           CAPTURE_IDEMPOTENCY_KEY. A key already used returns
+                           THAT run (which a finished capture cannot reuse), so
+                           each new capture or preparation attempt names a new
+                           key; production-activate.sh derives one per attempt.
   --operator-config <path> Operator identifier file.
   --task-timeout <dur>     Cloud Run task timeout (default 3600s).
   --help
+
+The release worker image (<region>-docker.pkg.dev/.../worker:<HEAD SHA>) must
+already exist in Artifact Registry -- it is built by
+`DEPLOY_MODE=apply scripts/deploy/cloud-run.sh` -- and every mutating mode
+refuses before touching the job when it does not, or when the job does not run
+that exact image.
 
 Exits nonzero on refusal, on failure, or on a snapshot that is not usable.
 EOF
@@ -101,6 +112,7 @@ while [[ $# -gt 0 ]]; do
     --enable-catalog-execution) CATALOG_EXECUTION_VALUE="true"; shift ;;
     --enable-work-scope-preparation) WORK_SCOPE_PREPARATION_VALUE="true"; shift ;;
     --run-id) RUN_ID="${2:?}"; shift 2 ;;
+    --idempotency-key) IDEMPOTENCY_KEY="${2:?}"; shift 2 ;;
     --work-scope-id) WORK_SCOPE_ID="${2:?}"; shift 2 ;;
     --work-scope-revision) WORK_SCOPE_REVISION="${2:?}"; shift 2 ;;
     --work-scope-digest) WORK_SCOPE_DIGEST="${2:?}"; shift 2 ;;
@@ -127,6 +139,34 @@ CAPTURE_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)"
 [[ -n "$CAPTURE_SA" ]] || CAPTURE_SA="$(milo_op WORKER_SERVICE_ACCOUNT)"
 RELEASE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/$(milo_op ARTIFACT_REGISTRY_REPOSITORY)/${MILO_WORKER_IMAGE_REPO}:${RELEASE_SHA}"
+
+if [[ -n "$IDEMPOTENCY_KEY" && ! "$IDEMPOTENCY_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$ ]]; then
+  fail "--idempotency-key must be 8-128 characters of letters, digits, '.', '_', ':' or '-'" 2
+fi
+
+# The release worker image must EXIST before the capture job is created or
+# executed. The job runs `${WORKER_IMAGE}`, tagged with the checked-out commit,
+# and that tag is pushed only by `DEPLOY_MODE=apply scripts/deploy/cloud-run.sh`.
+# Creating the job first would point it at an image that is not there, and
+# executing it would fail on the pull -- or, for a job ensured by an earlier
+# release, silently run THAT release's code. Both are refused here instead.
+require_worker_image() {
+  if ! gcloud artifacts docker images describe "$WORKER_IMAGE" --project "$PROJECT_ID" \
+       > /dev/null 2>&1; then
+    fail "the release worker image ${WORKER_IMAGE} does not exist (or cannot be read) in Artifact Registry. Build and deploy this commit first: DEPLOY_MODE=apply scripts/deploy/cloud-run.sh (or scripts/deploy/production-activate.sh --deploy). Nothing was created or executed." 1
+  fi
+  printf 'Worker image present: %s\n' "$WORKER_IMAGE"
+}
+
+# The capture job must run EXACTLY the release image before it is executed.
+require_job_on_release_image() {
+  local current
+  current="$(gcloud run jobs describe "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
+    --format='value(spec.template.spec.template.spec.containers[0].image)' 2> /dev/null || true)"
+  if [[ "$current" != "$WORKER_IMAGE" ]]; then
+    fail "the capture job ${CAPTURE_JOB} runs '${current:-<missing>}', not the release image ${WORKER_IMAGE}. Re-run with --ensure-job first. Nothing was executed." 1
+  fi
+}
 
 if [[ "$MODE" != "plan" && -z "$CATALOG_EXECUTION_VALUE" ]]; then
   fail "--enable-catalog-execution is required for ${MODE}. The capture cannot construct anything without the catalog master switch, and this repository stores no enabled value for it by design." 2
@@ -157,6 +197,7 @@ build_secret_args() {
 }
 
 ensure_job() {
+  require_worker_image
   local verb="create"
   if gcloud run jobs describe "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
        > /dev/null 2>&1; then
@@ -203,6 +244,7 @@ MILO_CAPTURE_EXECUTION_NAME_PATTERN='^[a-z]([-a-z0-9]{0,126}[a-z0-9])?$'
 execute_job() {
   local args_csv="$1" execution="" gcloud_status=0
   shift
+  require_job_on_release_image
   execution="$(gcloud run jobs execute "$CAPTURE_JOB" \
     --region "$REGION" --project "$PROJECT_ID" \
     --args "-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}" "$@" \
@@ -342,7 +384,8 @@ SQL
   return 0
 }
 
-PREPARE_ARGS="--prepare,--acknowledge-schema-report-reviewed,${MILO_CAPTURE_SCHEMA_ACK},--project-ref,${PROJECT_REF},--conversation-id,$(milo_op CAPTURE_CONVERSATION_ID),--requested-by,$(milo_op CAPTURE_REQUESTED_BY),--idempotency-key,$(milo_op CAPTURE_IDEMPOTENCY_KEY)"
+[[ -n "$IDEMPOTENCY_KEY" ]] || IDEMPOTENCY_KEY="$(milo_op CAPTURE_IDEMPOTENCY_KEY)"
+PREPARE_ARGS="--prepare,--acknowledge-schema-report-reviewed,${MILO_CAPTURE_SCHEMA_ACK},--project-ref,${PROJECT_REF},--conversation-id,$(milo_op CAPTURE_CONVERSATION_ID),--requested-by,$(milo_op CAPTURE_REQUESTED_BY),--idempotency-key,${IDEMPOTENCY_KEY}"
 capture_args() {
   printf -- '--execute,--acknowledge-live-government-egress,%s,--acknowledge-schema-report-reviewed,%s,--project-ref,%s,--run-id,%s,--package-id,%s,--resource-id,%s,--page-limit,%s,--max-pages,%s,--max-records,%s' \
     "$MILO_CAPTURE_EGRESS_ACK" "$MILO_CAPTURE_SCHEMA_ACK" "$PROJECT_REF" "$1" \
@@ -378,16 +421,54 @@ do_prepare_work_scope() {
   printf 'WORK_SCOPE_PREPARATION_STATUS=%s\n' "${status:-unknown}"
   if [[ "$status" != "succeeded" ]]; then
     printf '%s\n' "$document" >&2
+    report_egress_stop "$document"
     fail "work-scope preparation did not succeed; the document above states the outcome"
   fi
   printf 'WORK_SCOPE_QUEUED_ITEMS=%s\n' \
     "$(printf '%s' "$document" | json_field work_scope.queued_item_count || true)"
   printf 'WORK_SCOPE_BATCHES=%s\n' \
     "$(printf '%s' "$document" | json_field work_scope.batch_count || true)"
+  verify_work_scope
+}
+
+# The prepared revision, verified by the one scoped readiness check -- the same
+# one production-verify.sh and the Stage 2 gate run -- never by "a snapshot
+# exists". With no read-only database URL it says so and stops short of READY.
+verify_work_scope() {
+  local status=0
+  printf '\n== verify the prepared revision (read-only) ==\n'
+  bash "${REPO_ROOT}/scripts/deploy/work-scope-readiness.sh" --operator-config "$CONFIG_PATH" \
+    --work-scope-id "$WORK_SCOPE_ID" --work-scope-revision "$WORK_SCOPE_REVISION" \
+    --work-scope-digest "$WORK_SCOPE_DIGEST" || status=$?
+  case "$status" in
+    0) printf 'WORK_SCOPE_PREPARED_AND_VERIFIED=YES\n' ;;
+    3) printf 'MANUAL: the preparation succeeded but readiness is UNVERIFIED from here (above).\n'
+       printf '        Re-run scripts/deploy/work-scope-readiness.sh with a read-only database URL.\n' ;;
+    *) fail "the preparation reported success but the revision is not ready (above)" ;;
+  esac
+}
+
+# A capture that could not REACH the Government source is a stop, not a retry
+# with other data. This repository has no alternate production import route:
+# scripts/r5_capture_fixtures.py import-capture writes TEST fixtures only and
+# must never be used to land production evidence.
+report_egress_stop() {
+  local reason
+  reason="$(printf '%s' "$1" | json_field reason_code || true)"
+  case "$reason" in
+    GOV_TRANSPORT_FAILED | GOV_HTTP_STATUS_UNEXPECTED | GOV_REDIRECTED_OFF_HOST | GOV_RESPONSE_NOT_JSON)
+      printf '\nSTOP: GOVERNMENT_SOURCE_UNREACHABLE (%s).\n' "$reason" >&2
+      printf '      The capture job could not read data.gov.il from Cloud Run. Record this\n' >&2
+      printf '      execution name and reason. Do NOT substitute fixture, cached or hand-built\n' >&2
+      printf '      evidence: no supported alternate import route exists. Resolve the egress\n' >&2
+      printf '      path (an approved network change, reviewed separately) and re-run.\n' >&2
+      ;;
+  esac
 }
 
 do_prepare() {
-  milo_require_op CAPTURE_CONVERSATION_ID CAPTURE_REQUESTED_BY CAPTURE_IDEMPOTENCY_KEY || exit 2
+  milo_require_op CAPTURE_CONVERSATION_ID CAPTURE_REQUESTED_BY || exit 2
+  [[ -n "$IDEMPOTENCY_KEY" ]] || fail "no idempotency key: set CAPTURE_IDEMPOTENCY_KEY or pass --idempotency-key" 2
   printf '\n== prepare ==\n'
   local execution document prepared
   execution="$(execute_job "$PREPARE_ARGS")"
@@ -415,6 +496,7 @@ do_capture() {
   # `succeeded` (operator_capture's envelope). Nothing else is success.
   if [[ "$status" != "succeeded" ]]; then
     printf '%s\n' "$document" >&2
+    report_egress_stop "$document"
     fail "capture did not succeed; the document above states the outcome"
   fi
   # The snapshot THIS capture names as the register's active one. It is the

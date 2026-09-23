@@ -687,6 +687,15 @@ class WorkScopeLimits(BaseModel):
     max_instruction_chars: int
 
 
+class WorkScopeDirectRuns(BaseModel):
+    """Whether the ordinary composer may create a run in this project, and why not."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    allowed: bool
+    blocked_by: str | None = None
+
+
 class WorkScopeCapabilities(BaseModel):
     """Whether the Mapping Plan applies, and the server's own bounds for it."""
 
@@ -699,6 +708,7 @@ class WorkScopeCapabilities(BaseModel):
     limits: WorkScopeLimits
     can_prepare: bool
     can_start_batches: bool
+    direct_runs: WorkScopeDirectRuns
 
 
 class WorkScopeOrigin(BaseModel):

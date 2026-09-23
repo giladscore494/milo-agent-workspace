@@ -47,12 +47,23 @@ export type WorkScopeLimits = {
   maxInstructionChars: number;
 };
 
+/**
+ * Why the ordinary composer may not create a run in this project, from the
+ * server's capability read. `catalog_batch_required`: the project's runs read
+ * the Government catalog, and the worker refuses such a run unless it is a
+ * prepared Mapping Plan batch, so catalog work starts from the Mapping Plan.
+ * `unknown`: the server did not say, and a composer that cannot be confirmed
+ * is never offered.
+ */
+export type DirectRunBlocker = 'catalog_batch_required' | 'run_creation_disabled' | 'unknown';
+
 export type WorkScopeCapabilities = {
   available: boolean;
   reason?: 'mutations_disabled' | 'workflow_not_supported';
   limits: WorkScopeLimits;
   canPrepare: boolean;
   canStartBatches: boolean;
+  directRuns: { allowed: boolean; blockedBy?: DirectRunBlocker };
 };
 
 export type CoverageState = 'known' | 'unverifiable' | 'unavailable';
@@ -206,7 +217,39 @@ export function parseCapabilities(body: unknown): WorkScopeCapabilities | undefi
     // unlocks a control.
     canPrepare: source.can_prepare === true,
     canStartBatches: source.can_start_batches === true,
+    directRuns: parseDirectRuns(source.direct_runs),
   };
+}
+
+const DIRECT_RUN_BLOCKERS: ReadonlySet<string> = new Set(['catalog_batch_required', 'run_creation_disabled']);
+
+/** The server's answer on ordinary runs. Only an explicit `true` allows one. */
+function parseDirectRuns(value: unknown): WorkScopeCapabilities['directRuns'] {
+  const source = asObject(value);
+  if (source.allowed === true) return { allowed: true };
+  const blockedBy = typeof source.blocked_by === 'string' && DIRECT_RUN_BLOCKERS.has(source.blocked_by)
+    ? source.blocked_by as DirectRunBlocker : 'unknown';
+  return { allowed: false, blockedBy };
+}
+
+/**
+ * The manufacturers of a plan that preparation can capture today, and those
+ * it cannot. Preparation filters the Government register by a unit's VERIFIED
+ * register spelling only; a unit without one is recorded
+ * `register_unverified` and queues nothing. This is stated before the plan is
+ * prepared, from the server's directory, so a plan never looks more runnable
+ * than it is. A key the directory does not know is "cannot", never "can".
+ */
+export function preparableUnits(units: readonly string[], directory?: WorkScopeDirectory):
+    { verified: string[]; unverified: string[] } {
+  const entries = new Map((directory?.entries ?? []).map((entry) => [entry.key, entry]));
+  const verified: string[] = [];
+  const unverified: string[] = [];
+  for (const key of units) {
+    if (entries.get(key)?.registerMarqueVerified === true) verified.push(key);
+    else unverified.push(key);
+  }
+  return { verified, unverified };
 }
 
 function coverageState(value: unknown): CoverageState {

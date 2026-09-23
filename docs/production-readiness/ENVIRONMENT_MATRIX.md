@@ -19,6 +19,7 @@ disabled (Stage A).
 | `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID` | vercel | no | no | yes | yes | manual WIF setup | gateway auth flow | none | recreate provider; update env |
 | `GCP_SERVICE_ACCOUNT_EMAIL` | vercel | no | no | yes | yes | gateway SA email | must be in `MILO_APPROVED_GATEWAY_IDENTITIES` | none | swap SA; update allowlist + env |
 | `GATEWAY_ALLOW_EXECUTION_ROUTES` | vercel | no | no | no | must be off | operator (Stage B/C) | `check_unsafe_defaults.py`; smoke tests | off | unset (routes 403) |
+| `GATEWAY_ALLOW_RUN_START_ROUTES` | vercel | no | no | no | must be off until the last activation step | operator (Stage 2, LAST, after `production-verify.sh --gate armed`) | `check_unsafe_defaults.py`; `website-execution-check.sh` (`GATEWAY_RUN_START_ENABLED`) | off | unset (every run start 403 at the gateway) |
 | `GATEWAY_RATE_LIMIT_<CAT>_REQUESTS` / `_WINDOW_MS` | vercel | no | no | no (defaults) | no | operator tuning | code defaults | built-in limits | unset restores defaults |
 | `UPSTASH_REDIS_REST_URL` | vercel+api+worker | no | no | yes | yes | Upstash console | `check-redis-config.sh` (TLS) | none (fail closed) | point at replacement instance |
 | `UPSTASH_REDIS_REST_TOKEN` | vercel+api+worker | no | **yes** | yes | yes | Upstash console → Vercel env / Secret Manager | name-only checks; never printed | none (fail closed) | rotate in console; update env+secret; revoke old |

@@ -33,8 +33,13 @@ const apiMocks = vi.hoisted(() => ({
     projects: vi.fn(), conversations: vi.fn(), createConversation: vi.fn(),
     createProposal: vi.fn(), proposal: vi.fn(), decideProposal: vi.fn(), reviseProposal: vi.fn(),
     startRun: vi.fn(), run: vi.fn(), runs: vi.fn(() => Promise.resolve([])), events: vi.fn(), cancel: vi.fn(),
+    // The server's answer on ordinary runs; every project is asked.
+    workScopeCapabilities: vi.fn(),
   },
 }));
+
+/** A capability answer that allows ordinary runs (a V1 project, run creation on). */
+const RUNS_ALLOWED = { available: false, reason: 'workflow_not_supported', contract: 'milo-work-scope/1', directory_version: 'milo-manufacturer-directory/1', limits: { max_units: 39, max_items: 2000, default_max_items: 100, max_batch_size: 20, default_batch_size: 10, min_model_year: 1900, max_model_year: 2100, max_instruction_chars: 500 }, can_prepare: false, can_start_batches: false, direct_runs: { allowed: true, blocked_by: null } };
 
 vi.mock('../lib/api', () => ({
   api: apiMocks.api,
@@ -75,6 +80,7 @@ describe('delayed responses never cross a selection boundary', () => {
     mockSession = ALICE;
     apiMocks.executionUi = true;
     for (const fn of Object.values(apiMocks.api)) fn.mockReset();
+    apiMocks.api.workScopeCapabilities.mockResolvedValue(RUNS_ALLOWED);
     apiMocks.api.projects.mockResolvedValue([PROJECT_A, PROJECT_B]);
     apiMocks.api.conversations.mockResolvedValue([]);
     apiMocks.api.run.mockResolvedValue({ id: RUN_A, conversation_id: CONVO_A.id, status: 'running' });
@@ -317,6 +323,7 @@ describe('a durable write needs ownership first', () => {
     apiMocks.keys = 0;
     for (const fn of Object.values(apiMocks.api)) {
       if (typeof fn === 'function') fn.mockReset();
+    apiMocks.api.workScopeCapabilities.mockResolvedValue(RUNS_ALLOWED);
     }
     apiMocks.api.projects.mockResolvedValue([PROJECT_A]);
     apiMocks.api.conversations.mockResolvedValue([CONVO_A, CONVO_A2]);
@@ -416,6 +423,7 @@ describe('pending state belongs to the request that set it', () => {
     apiMocks.keys = 0;
     for (const fn of Object.values(apiMocks.api)) {
       if (typeof fn === 'function') fn.mockReset();
+    apiMocks.api.workScopeCapabilities.mockResolvedValue(RUNS_ALLOWED);
     }
     apiMocks.api.projects.mockResolvedValue([PROJECT_A]);
     apiMocks.api.conversations.mockResolvedValue([]);
@@ -500,6 +508,7 @@ describe('the idempotency key is scoped to its submission', () => {
     apiMocks.keys = 0;
     for (const fn of Object.values(apiMocks.api)) {
       if (typeof fn === 'function') fn.mockReset();
+    apiMocks.api.workScopeCapabilities.mockResolvedValue(RUNS_ALLOWED);
     }
     apiMocks.api.projects.mockResolvedValue([PROJECT_A]);
     apiMocks.api.conversations.mockResolvedValue([CONVO_A, CONVO_A2]);

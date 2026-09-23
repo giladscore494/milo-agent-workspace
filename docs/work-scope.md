@@ -130,7 +130,7 @@ for what is not known about it.
 
 | Route | Gate | Notes |
 | --- | --- | --- |
-| `GET /projects/{id}/work-scope/capabilities` | membership | `available` = `swarm_v2` project AND the mutations flag. `can_start_batches` = `swarm_v2` AND `MILO_ENABLE_WORK_SCOPE_BATCHES` AND `MILO_ENABLE_RUN_CREATION`. `can_prepare` is always false: only the operator capture job prepares. |
+| `GET /projects/{id}/work-scope/capabilities` | membership | `available` = `swarm_v2` project AND the mutations flag. `can_start_batches` = `swarm_v2` AND `MILO_ENABLE_WORK_SCOPE_BATCHES` AND `MILO_ENABLE_RUN_CREATION`. `can_prepare` is always false: only the operator capture job prepares. `direct_runs` says whether the ordinary composer may create a run here (`blocked_by`: `catalog_batch_required` or `run_creation_disabled`). |
 | `GET /projects/{id}/work-scope/directory` | membership | The directory, with coverage per entry. |
 | `GET /conversations/{id}/work-scopes/open` | membership | The conversation's open plan, or `{"work_scope": null}`. |
 | `GET /work-scopes/{id}` | membership | One plan. Absent and not-a-member are the same 404. |
@@ -144,8 +144,11 @@ A write that is understood and changes nothing writes nothing (`applied:
 false`, `WORK_SCOPE_NOTE_NO_CHANGE`).
 
 The gateway proxies the four reads the UI uses as SAFE routes, and the five
-writes as execution routes behind `GATEWAY_ALLOW_EXECUTION_ROUTES`; a batch
-start is also a run-creation route there, rate limited as one. The UI renders
+writes as execution routes behind `GATEWAY_ALLOW_EXECUTION_ROUTES`. A batch
+start is also a run START there: it additionally needs
+`GATEWAY_ALLOW_RUN_START_ROUTES`, the permission an activation opens last, and
+it is rate limited as run creation. Plan authoring therefore never opens
+starting a batch. The UI renders
 the surface only when the execution UI flag is on AND the capability read says
 the plan is available, and the Batches section only where `can_start_batches`
 is true.
@@ -324,7 +327,17 @@ server-owned work context. Nothing the browser sends reaches the run's work.
 
 With the Government read on, every catalog-reading Swarm V2 run is
 BATCH-BOUND: the worker refuses a run the database binds to no batch
-(`GOVERNMENT_BATCH_REQUIRED`) before it reads any snapshot. There is no other
+(`GOVERNMENT_BATCH_REQUIRED`) before it reads any snapshot. The API mirrors
+the same gate: with `MILO_ENABLE_CATALOG_EXECUTION` and
+`MILO_ENABLE_GOVERNMENT_CATALOG_READ` on in ITS environment (Stage 2 sets them
+on both surfaces), `POST /conversations/{id}/runs` and
+`POST /workflow-proposals/{id}/runs` refuse a Swarm V2 run before anything is
+written (`409 CATALOG_RUN_REQUIRES_MAPPING_PLAN`), and the capability read
+says so (`direct_runs: {allowed: false, blocked_by: "catalog_batch_required"}`).
+The website follows that answer: in such a project the task composer offers
+no ordinary task and opens the Mapping Plan instead, and while the answer is
+unknown it offers nothing. Vehicle Catalog V1 projects, and Swarm V2 with the
+read off, keep their ordinary composer. There is no other
 way for a paid run to choose catalog work -- no "newest snapshot, first N
 candidates" -- so a chat request and the Mapping Plan can never be two execution
 scopes. A chat instruction changes the PLAN (the same contract and digest as a

@@ -25,6 +25,7 @@ this set wins and the older document carries an archive banner.
 | [MANUAL_SERVICE_CONNECTIONS.md](MANUAL_SERVICE_CONNECTIONS.md) | The nine external service connections |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Immutable images, deployment order, IAM matrix |
 | [STAGED_ACTIVATION.md](STAGED_ACTIVATION.md) | Stages A–D activation runbook |
+| [SCOPED_BATCH_PRODUCTION_RUNBOOK.md](SCOPED_BATCH_PRODUCTION_RUNBOOK.md) | Gated Production rollout of the Mapping Plan → prepared batch → Swarm V2 path, to the first website-initiated paid batch |
 | [SMOKE_TESTING.md](SMOKE_TESTING.md) | Read-only and execution-disabled smoke tests |
 | [FRONTEND_ACCEPTANCE.md](FRONTEND_ACCEPTANCE.md) | Stage F5 frontend acceptance matrix (A–G), classifications and evidence |
 | [FRONTEND_PRE_RELEASE.md](FRONTEND_PRE_RELEASE.md) | Operator UI verification pass before a release is accepted |

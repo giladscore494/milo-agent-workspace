@@ -342,7 +342,10 @@ describe('what the batch client puts on the wire', () => {
 });
 
 describe('the gateway proxies exactly the batch routes', () => {
-  afterEach(() => { delete process.env.GATEWAY_ALLOW_EXECUTION_ROUTES; });
+  afterEach(() => {
+    delete process.env.GATEWAY_ALLOW_EXECUTION_ROUTES;
+    delete process.env.GATEWAY_ALLOW_RUN_START_ROUTES;
+  });
 
   it('always proxies the progress read, GET only', () => {
     expect(isGatewayRequestAllowed('GET', `/work-scopes/${PLAN}/progress`)).toBe(true);
@@ -357,9 +360,15 @@ describe('the gateway proxies exactly the batch routes', () => {
     expect(isRunCreationRequest('POST', start)).toBe(true);
     expect(isRunCreationRequest('POST', `/work-scopes/${PLAN}/pause`)).toBe(false);
     process.env.GATEWAY_ALLOW_EXECUTION_ROUTES = 'true';
-    for (const path of [start, `/work-scopes/${PLAN}/pause`, `/work-scopes/${PLAN}/resume`]) {
+    // Plan authoring (Stage P): pause and resume open, a START still refused --
+    // starting is the separate, last-opened run-start permission.
+    for (const path of [`/work-scopes/${PLAN}/pause`, `/work-scopes/${PLAN}/resume`]) {
       expect(isGatewayRequestAllowed('POST', path), path).toBe(true);
     }
+    expect(isGatewayRequestAllowed('POST', start)).toBe(false);
+    expect(isRunCreationRequest('POST', start)).toBe(true);
+    process.env.GATEWAY_ALLOW_RUN_START_ROUTES = 'true';
+    expect(isGatewayRequestAllowed('POST', start)).toBe(true);
     expect(isRunCreationRequest('POST', start)).toBe(false);
     for (const [method, path] of [
       ['GET', start], ['POST', `/work-scopes/${PLAN}/runs/next`], ['POST', `/work-scopes/${PLAN}/stop`],
