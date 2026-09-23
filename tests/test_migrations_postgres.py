@@ -7733,6 +7733,63 @@ def test_capture_scope_declarations_are_held_consistent_by_the_database(db):
         del label
 
 
+def test_whole_capture_verification_reads_exactly_the_captured_snapshot(db, tmp_path):
+    """`government-production-capture.sh` verifies the snapshot ITS capture
+    named, by key, in real PostgreSQL. A newer scoped manufacturer snapshot --
+    exactly what "the latest government snapshot" selects -- never satisfies
+    whole-capture verification."""
+    from tests.test_work_scope_preparation import (CAPTURE_RUN, DB_URL_ENV, _capture_script,
+                                                   _captured)
+
+    _user, _project, conversation = _ws_world(db)
+    _run, args = _wsp_capture_run(db, conversation)
+    label = conversation[:8]
+    # The whole register: one active, complete snapshot with a candidate ...
+    _whole, whole_key, _ = _wsp_snapshot(db, args, f"whole-{label}", [("candidate", 2020)],
+                                         marque=None)
+    # ... one recorded but never activated, as a capture that stopped leaves it ...
+    pending = json.loads(_catalog_snapshot_json(f"pending-{label}", declared=1))
+    _rpc_as_service(db, "select id from public.record_catalog_snapshot_guarded("
+                        f"{args}, $j${json.dumps(pending)}$j$::jsonb)")
+    # ... and, NEWEST of all, an active, complete scoped manufacturer snapshot.
+    _scoped, scoped_key, _ = _wsp_snapshot(db, args, f"scoped-{label}", [("candidate", 2021)])
+    assert db.psql("select snapshot_key from public.catalog_source_snapshots "
+                   "where source_family = 'government' order by created_at desc limit 1") \
+        == scoped_key
+
+    real_psql = shutil.which("psql")
+    # A wrapper that records the call, then runs the real client.
+    wrapper = ("#!/usr/bin/env bash\n"
+               "printf '%s\\n' \"$*\" >> \"$MOCK_PSQL_LOG\"\n"
+               f"exec {real_psql} \"$@\"\n")
+    url = f"postgresql:///milo?host={db.dir}&port={db.port}&user=postgres"
+
+    def verify(case: str, key: str):
+        run_dir = tmp_path / case
+        run_dir.mkdir()
+        result, _log = _capture_script(run_dir, *CAPTURE_RUN, gcloud=True, mode="--capture",
+                                       document=_captured(key), psql=wrapper,
+                                       env={DB_URL_ENV: url})
+        calls = (run_dir / "psql.log").read_text(encoding="utf-8").splitlines()
+        return result, calls
+
+    ok, calls = verify("whole", whole_key)
+    assert ok.returncode == 0, ok.stderr
+    assert f"GOVERNMENT_SNAPSHOT_KEY={whole_key}" in ok.stdout
+    assert "USABLE_GOVERNMENT_SNAPSHOT=YES" in ok.stdout
+    assert len(calls) == 1 and f"snapshot_key={whole_key}" in calls[0]
+    # Each of these would have "passed" by verifying the newer scoped snapshot.
+    for case, key, message in (
+            ("pending", pending["snapshot_key"], "is not complete (validation_state=pending)"),
+            ("scoped", scoped_key, "is a scoped manufacturer capture, not the whole register"),
+            ("missing", "cs1." + "0" * 32, "does not exist")):
+        result, calls = verify(case, key)
+        assert result.returncode != 0, (case, result.stdout)
+        assert message in result.stderr, (case, result.stderr)
+        assert "USABLE_GOVERNMENT_SNAPSHOT=YES" not in result.stdout
+        assert len(calls) == 1 and f"snapshot_key={key}" in calls[0]
+
+
 def test_a_revision_is_prepared_into_a_deterministic_bounded_queue(db):
     world = _wsp_world(db)
     summary = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],

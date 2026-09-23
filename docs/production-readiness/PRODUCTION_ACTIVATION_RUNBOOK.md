@@ -100,8 +100,12 @@ missing thing and the exact remediation command.
 **`government-production-capture.sh --all --enable-catalog-execution`** —
 creates (or updates) the bounded capture job, prepares the capture run, runs the
 real capture against `data.gov.il`, waits for it to terminalize, then reads the
-result back out of the database. Exits nonzero unless the snapshot is active,
-`stored == declared`, and candidate variants exist.
+result back out of the database. It verifies exactly the snapshot the capture's
+own execution document names (`capture.active_snapshot_key`), never "the newest
+Government snapshot" (which may be a scoped manufacturer capture). Exits nonzero
+unless the capture reported `succeeded` and that snapshot exists, is the whole
+register (not a scoped capture) of the pinned resource, is complete and active,
+has `stored == declared`, and has candidate variants.
 
 `--enable-catalog-execution` is required and has no default. This repository
 commits no enabled value for the catalog master switch — `check_unsafe_defaults.py`

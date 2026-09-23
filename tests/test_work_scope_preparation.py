@@ -806,19 +806,37 @@ GCLOUD_ADVISORY = ("Or visit https://console.cloud.google.com/run/jobs/execution
 
 
 def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
+                    mode: str = "--prepare-work-scope",
                     execution_stdout: str = "test-capture-execution-1\n",
-                    execution_exit: int = 0, document: dict | None = None):
+                    execution_exit: int = 0, document: dict | None = None,
+                    psql: str | None = None, env: dict[str, str] | None = None):
+    """Run the capture script as an operator would, with stand-ins on PATH.
+
+    `gcloud` puts the mock gcloud first on PATH. `psql`, when given, is the
+    source of a `psql` stand-in placed beside it -- a mock, or a wrapper that
+    logs its call and runs the real client -- which records each call in
+    `psql.log`. `env` adds variables, such as the one the operator config names
+    for the read-only database URL.
+    """
     import os
     import subprocess
 
     from tests.test_production_operator_bundle import _fake_config
 
+    overrides = env or {}
     env = dict(os.environ)
     env["PATH"] = "/usr/bin:/bin"
     env["MILO_OPERATOR_CONFIG"] = ""
+    bin_dir = tmp_path / "bin"
+    if gcloud or psql is not None:
+        bin_dir.mkdir(exist_ok=True)
+        env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
+    if psql is not None:
+        stand_in = bin_dir / "psql"
+        stand_in.write_text(psql, encoding="utf-8")
+        stand_in.chmod(0o755)
+        env["MOCK_PSQL_LOG"] = str(tmp_path / "psql.log")
     if gcloud:
-        bin_dir = tmp_path / "bin"
-        bin_dir.mkdir()
         log = tmp_path / "gcloud.log"
         mock = bin_dir / "gcloud"
         # `run jobs execute` prints its machine-readable answer to STDOUT and
@@ -839,15 +857,15 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
             "    print(os.environ['MOCK_GCLOUD_DOCUMENT'])\n",
             encoding="utf-8")
         mock.chmod(0o755)
-        env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
         env["MOCK_GCLOUD_LOG"] = str(log)
         env["MOCK_GCLOUD_EXECUTION_STDOUT"] = execution_stdout
         env["MOCK_GCLOUD_EXECUTION_EXIT"] = str(execution_exit)
         env["MOCK_GCLOUD_ADVISORY"] = GCLOUD_ADVISORY
         env["MOCK_GCLOUD_DOCUMENT"] = json.dumps(document or SUCCEEDED_DOCUMENT)
+    env.update(overrides)
     result = subprocess.run(
         ["bash", str(REPO / "scripts/catalog/government-production-capture.sh"),
-         "--prepare-work-scope", "--operator-config", str(_fake_config(tmp_path)), *extra],
+         mode, "--operator-config", str(_fake_config(tmp_path)), *extra],
         capture_output=True, text=True, check=False, cwd=REPO, env=env)
     return result, (tmp_path / "gcloud.log") if gcloud else None
 
@@ -947,6 +965,168 @@ def test_a_named_execution_that_gcloud_reports_failed_is_judged_by_its_own_docum
     assert [call[2] for call in reads] == [
         'resource.type=cloud_run_job AND '
         'labels."run.googleapis.com/execution_name"=test-capture-execution-1']
+
+
+# =============================================================================
+# 9. a whole capture: the entrypoint's own success, and exactly its snapshot
+# =============================================================================
+
+#: The resource the capture job is pinned to (scripts/deploy/deployment-contract.sh).
+WHOLE_RESOURCE = "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
+#: A snapshot key in the database's own shape.
+CAPTURED_KEY = "cs1." + "a" * 32
+#: The whole capture's own arguments: the master switch and a prepared run.
+CAPTURE_RUN = ("--enable-catalog-execution", "--run-id", "00000000-0000-4000-8000-000000000030")
+#: The variable the fake operator config names for the read-only database URL.
+DB_URL_ENV = "MILO_TEST_DB_URL_ABSENT"
+
+#: A `psql` stand-in: it records each call and answers ONE row per snapshot
+#: key from MOCK_PSQL_ROWS -- the exact lookup the wrapper must make.
+MOCK_PSQL = (
+    "#!/usr/bin/env python3\n"
+    "import json, os, sys\n"
+    "sql = sys.stdin.read()\n"
+    "with open(os.environ['MOCK_PSQL_LOG'], 'a') as handle:\n"
+    "    handle.write(json.dumps({'argv': sys.argv[1:], 'sql': sql}) + '\\n')\n"
+    "if os.environ.get('MOCK_PSQL_EXIT'):\n"
+    "    sys.exit(int(os.environ['MOCK_PSQL_EXIT']))\n"
+    "keys = [arg.split('=', 1)[1] for arg in sys.argv[1:] if arg.startswith('snapshot_key=')]\n"
+    "row = json.loads(os.environ.get('MOCK_PSQL_ROWS', '{}')).get(keys[0] if keys else '')\n"
+    "if row is not None:\n"
+    "    print('|'.join(str(field) for field in row))\n")
+
+
+def _captured(key: str | None = CAPTURED_KEY, *, status: str = "succeeded") -> dict:
+    """A whole capture's document, as `operator_capture` writes it on success."""
+    capture = {"outcome": "changed", "resource_id": WHOLE_RESOURCE, "upstream_version": "1",
+               "upstream_version_kind": "dataset_version", "no_op": False,
+               "diff_unavailable": False, "research_required": False}
+    if key is not None:
+        capture["active_snapshot_key"] = key
+    return {"entrypoint": "catalog.government.capture", "status": status, "reason_code": "",
+            "reason": "", "capture": capture}
+
+
+def _snapshot_row(key: str = CAPTURED_KEY, *, answered: str | None = None,
+                  resource: str = WHOLE_RESOURCE, state: str = "complete", active: str = "t",
+                  scoped: str = "f", declared: int = 40, stored: int = 40, raws: int = 40,
+                  candidates: int = 40) -> list:
+    """One `catalog_source_snapshots` row, in the order the wrapper selects it."""
+    return ["00000000-0000-4000-8000-0000000000aa", answered or key, resource, state, active,
+            scoped, declared, stored, raws, candidates]
+
+
+def _whole_capture(tmp_path: Path, document: dict, *, rows: dict | None = None,
+                   database: bool = True, **env: str):
+    extra_env = {"MOCK_PSQL_ROWS": json.dumps(rows or {}), **env}
+    if database:
+        extra_env[DB_URL_ENV] = "postgresql://verification.invalid/milo"
+    result, log = _capture_script(tmp_path, *CAPTURE_RUN, gcloud=True, mode="--capture",
+                                  document=document, psql=MOCK_PSQL, env=extra_env)
+    psql_log = tmp_path / "psql.log"
+    psql_calls = ([json.loads(line) for line in psql_log.read_text(encoding="utf-8").splitlines()]
+                  if psql_log.exists() else [])
+    return result, log, psql_calls
+
+
+def test_a_successful_whole_capture_is_accepted_and_verifies_exactly_its_snapshot(tmp_path):
+    result, log, psql_calls = _whole_capture(
+        tmp_path, _captured(), rows={CAPTURED_KEY: _snapshot_row()})
+    assert result.returncode == 0, result.stderr
+    # `succeeded` is the entrypoint's own word for a capture that did its work.
+    assert "CAPTURE_STATUS=succeeded" in result.stdout
+    assert f"CAPTURED_SNAPSHOT_KEY={CAPTURED_KEY}" in result.stdout
+    assert f"GOVERNMENT_SNAPSHOT_KEY={CAPTURED_KEY}" in result.stdout
+    assert "USABLE_GOVERNMENT_SNAPSHOT=YES" in result.stdout
+    # The ONE snapshot the document named, by key -- never "the newest".
+    assert len(psql_calls) == 1
+    assert f"snapshot_key={CAPTURED_KEY}" in psql_calls[0]["argv"]
+    assert "s.snapshot_key = :'snapshot_key'" in psql_calls[0]["sql"]
+    assert "order by" not in psql_calls[0]["sql"] and "limit" not in psql_calls[0]["sql"]
+    # The execution name is still gcloud's stdout alone, and the module still
+    # leads the execution's arguments.
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    execute = next(call for call in calls if call[:3] == ["run", "jobs", "execute"])
+    assert execute[execute.index("--args") + 1].split(",")[:3] == [
+        "-m", "backend.catalog.operator_capture", "--execute"]
+    assert [call[2] for call in calls if call[:2] == ["logging", "read"]] == [
+        'resource.type=cloud_run_job AND '
+        'labels."run.googleapis.com/execution_name"=test-capture-execution-1']
+
+
+def test_without_a_database_the_exact_snapshot_is_named_for_manual_verification(tmp_path):
+    result, _log, psql_calls = _whole_capture(tmp_path, _captured(), database=False)
+    assert result.returncode == 0, result.stderr
+    assert f"verify snapshot {CAPTURED_KEY} here" in result.stdout
+    assert "USABLE_GOVERNMENT_SNAPSHOT" not in result.stdout
+    assert psql_calls == []
+
+
+@pytest.mark.parametrize("status", ["refused", "failed", "captured", "completed", ""])
+def test_a_capture_that_did_not_succeed_is_refused(tmp_path, status):
+    result, _log, psql_calls = _whole_capture(
+        tmp_path, _captured(status=status), rows={CAPTURED_KEY: _snapshot_row()})
+    assert result.returncode != 0
+    assert "capture did not succeed" in result.stderr
+    assert "CAPTURED_SNAPSHOT_KEY" not in result.stdout
+    assert psql_calls == []
+
+
+@pytest.mark.parametrize("key", [
+    None,                        # the document names no snapshot
+    "",                          # names an empty one
+    "cs1." + "A" * 32,           # not the database's key shape
+    "cs2." + "a" * 32,
+    "cs1." + "a" * 31,
+    CAPTURED_KEY + " ",          # trailing text on the key
+    "latest",
+])
+def test_a_successful_capture_without_a_valid_snapshot_key_fails_closed(tmp_path, key):
+    result, _log, psql_calls = _whole_capture(
+        tmp_path, _captured(key), rows={CAPTURED_KEY: _snapshot_row()})
+    assert result.returncode != 0
+    assert "names no valid capture.active_snapshot_key" in result.stderr
+    assert "USABLE_GOVERNMENT_SNAPSHOT=YES" not in result.stdout
+    # Nothing is looked up in its place.
+    assert psql_calls == []
+
+
+def test_a_document_without_a_capture_section_fails_closed(tmp_path):
+    document = _captured()
+    del document["capture"]
+    result, _log, psql_calls = _whole_capture(tmp_path, document)
+    assert result.returncode != 0
+    assert "names no valid capture.active_snapshot_key" in result.stderr
+    assert psql_calls == []
+
+
+@pytest.mark.parametrize("row,message", [
+    (None, f"the captured snapshot {CAPTURED_KEY} does not exist"),
+    (_snapshot_row(scoped="t"), "is a scoped manufacturer capture, not the whole register"),
+    (_snapshot_row(resource="another-resource"), "belongs to resource another-resource"),
+    (_snapshot_row(state="pending"), "is not complete (validation_state=pending)"),
+    (_snapshot_row(state="failed"), "is not complete (validation_state=failed)"),
+    (_snapshot_row(active="f"), "is not active"),
+    (_snapshot_row(stored=39), "stored (39) != declared (40)"),
+    (_snapshot_row(candidates=0), "no candidate variants"),
+    (_snapshot_row(answered="cs1." + "b" * 32), "the database answered for"),
+])
+def test_the_captured_snapshot_itself_must_be_usable_or_the_capture_fails(tmp_path, row, message):
+    rows = {} if row is None else {CAPTURED_KEY: row}
+    result, _log, psql_calls = _whole_capture(tmp_path, _captured(), rows=rows)
+    assert result.returncode != 0
+    assert message in result.stderr, result.stderr
+    assert "USABLE_GOVERNMENT_SNAPSHOT=YES" not in result.stdout
+    assert [f"snapshot_key={CAPTURED_KEY}" in call["argv"] for call in psql_calls] == [True]
+
+
+def test_an_unreadable_database_fails_the_verification(tmp_path):
+    result, _log, psql_calls = _whole_capture(
+        tmp_path, _captured(), rows={CAPTURED_KEY: _snapshot_row()}, MOCK_PSQL_EXIT="2")
+    assert result.returncode != 0
+    assert f"snapshot {CAPTURED_KEY} could not be read from the database" in result.stderr
+    assert "USABLE_GOVERNMENT_SNAPSHOT=YES" not in result.stdout
+    assert len(psql_calls) == 1
 
 
 def test_the_capture_job_definition_pins_scoped_preparation_off():

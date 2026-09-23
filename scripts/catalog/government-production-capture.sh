@@ -248,30 +248,60 @@ print(node)
 ' "$1"
 }
 
+# A snapshot key, exactly the database's own shape (the
+# `catalog_source_snapshots_key_shape` constraint, 20260915120000).
+MILO_CAPTURE_SNAPSHOT_KEY_PATTERN='^cs1\.[0-9a-f]{32}$'
+
+# The snapshot a successful whole capture names as the register's active one,
+# read by do_capture from THAT execution's own document. It is the only
+# snapshot verify_snapshot checks: since scoped catalog PR2 the newest
+# Government snapshot may be a scoped manufacturer capture, so "the latest
+# snapshot" says nothing about what this capture landed.
+CAPTURED_SNAPSHOT_KEY=""
+
 verify_snapshot() {
+  local key="${1:-}"
+  if [[ ! "$key" =~ $MILO_CAPTURE_SNAPSHOT_KEY_PATTERN ]]; then
+    printf 'FAIL: there is no valid captured snapshot key to verify; no other snapshot is verified in its place.\n' >&2
+    return 1
+  fi
   local db_env db_url
   db_env="$(milo_op READONLY_DATABASE_URL_ENV)"
   db_url="${!db_env:-}"
   if [[ -z "$db_url" ]] || ! command -v psql > /dev/null 2>&1; then
-    printf 'MANUAL: set $%s and install psql to verify the snapshot here.\n' "${db_env:-READONLY_DATABASE_URL_ENV}"
-    printf '        Otherwise run: scripts/deploy/production-verify.sh\n'
+    printf 'MANUAL: set $%s and install psql to verify snapshot %s here.\n' "${db_env:-READONLY_DATABASE_URL_ENV}" "$key"
+    printf '        Otherwise verify THAT snapshot by its key: whole register (no capture_scope), complete,\n'
+    printf '        active, stored = declared, with candidates. The newest snapshot proves nothing.\n'
     return 0
   fi
+  # ONE snapshot, named exactly. The key travels as a psql variable and is
+  # quoted by psql (`:'snapshot_key'`); it has been shape-checked above too.
   local row
-  row="$(psql "$db_url" -At -F'|' -c "
-    select s.id, s.snapshot_key, s.validation_state,
-           (s.activated_at is not null) as active,
-           s.declared_record_count, s.stored_record_count,
-           (select count(*) from public.catalog_raw_records r where r.snapshot_id = s.id),
-           (select count(*) from public.catalog_candidate_variants v where v.snapshot_id = s.id)
-    from public.catalog_source_snapshots s
-    where s.source_family = 'government'
-    order by s.created_at desc limit 1;" 2> /dev/null || true)"
-  if [[ -z "$row" ]]; then
-    printf 'FAIL: no government snapshot exists after the capture.\n' >&2
+  if ! row="$(psql "$db_url" -X -At -F'|' -v ON_ERROR_STOP=1 -v snapshot_key="$key" 2> /dev/null <<'SQL'
+select s.id, s.snapshot_key, s.resource_id, s.validation_state,
+       (s.activated_at is not null) as active,
+       (s.retrieval_metadata ? 'capture_scope') as scoped,
+       s.declared_record_count, s.stored_record_count,
+       (select count(*) from public.catalog_raw_records r where r.snapshot_id = s.id),
+       (select count(*) from public.catalog_candidate_variants v where v.snapshot_id = s.id)
+  from public.catalog_source_snapshots s
+ where s.source_family = 'government'
+   and s.snapshot_key = :'snapshot_key';
+SQL
+  )"; then
+    printf 'FAIL: snapshot %s could not be read from the database.\n' "$key" >&2
     return 1
   fi
-  IFS='|' read -r sid skey vstate active declared stored raws cands <<< "$row"
+  if [[ -z "$row" ]]; then
+    printf 'FAIL: the captured snapshot %s does not exist.\n' "$key" >&2
+    return 1
+  fi
+  if [[ "$row" == *$'\n'* ]]; then
+    printf 'FAIL: more than one row answered for snapshot %s.\n' "$key" >&2
+    return 1
+  fi
+  local sid skey resource vstate active scoped declared stored raws cands
+  IFS='|' read -r sid skey resource vstate active scoped declared stored raws cands <<< "$row"
   printf '\nGOVERNMENT_SNAPSHOT_ID=%s\n' "$sid"
   printf 'GOVERNMENT_SNAPSHOT_KEY=%s\n' "$skey"
   printf 'GOVERNMENT_SNAPSHOT_ACTIVE=%s\n' "$active"
@@ -280,6 +310,22 @@ verify_snapshot() {
   printf 'GOVERNMENT_STORED_RECORDS=%s\n' "$stored"
   printf 'GOVERNMENT_RAW_RECORD_COUNT=%s\n' "$raws"
   printf 'GOVERNMENT_CANDIDATE_COUNT=%s\n' "$cands"
+  if [[ "$skey" != "$key" ]]; then
+    printf 'FAIL: the database answered for %s, not for the captured snapshot %s.\n' "$skey" "$key" >&2
+    return 1
+  fi
+  if [[ "$scoped" != "f" ]]; then
+    printf 'FAIL: snapshot %s is a scoped manufacturer capture, not the whole register.\n' "$key" >&2
+    return 1
+  fi
+  if [[ "$resource" != "$MILO_CAPTURE_RESOURCE_ID" ]]; then
+    printf 'FAIL: snapshot %s belongs to resource %s, not to the pinned %s.\n' "$key" "$resource" "$MILO_CAPTURE_RESOURCE_ID" >&2
+    return 1
+  fi
+  if [[ "$vstate" != "complete" ]]; then
+    printf 'FAIL: snapshot %s is not complete (validation_state=%s).\n' "$key" "$vstate" >&2
+    return 1
+  fi
   if [[ "$active" != "t" ]]; then
     printf 'FAIL: snapshot exists but is not active; the activation gate did not pass.\n' >&2
     return 1
@@ -365,10 +411,20 @@ do_capture() {
   document="$(execution_document "$execution")"
   status="$(printf '%s' "$document" | json_field status || true)"
   printf 'CAPTURE_STATUS=%s\n' "${status:-unknown}"
-  if [[ "$status" != "captured" && "$status" != "completed" ]]; then
+  # The entrypoint's own contract: a capture that did its work reports
+  # `succeeded` (operator_capture's envelope). Nothing else is success.
+  if [[ "$status" != "succeeded" ]]; then
     printf '%s\n' "$document" >&2
-    fail "capture did not complete; the document above states the outcome"
+    fail "capture did not succeed; the document above states the outcome"
   fi
+  # The snapshot THIS capture names as the register's active one. It is the
+  # one verify_snapshot checks, so a document that names none fails here.
+  CAPTURED_SNAPSHOT_KEY="$(printf '%s' "$document" | json_field capture.active_snapshot_key || true)"
+  if [[ ! "$CAPTURED_SNAPSHOT_KEY" =~ $MILO_CAPTURE_SNAPSHOT_KEY_PATTERN ]]; then
+    printf '%s\n' "$document" >&2
+    fail "the capture document names no valid capture.active_snapshot_key; no other snapshot is verified in its place"
+  fi
+  printf 'CAPTURED_SNAPSHOT_KEY=%s\n' "$CAPTURED_SNAPSHOT_KEY"
 }
 
 case "$MODE" in
@@ -387,13 +443,13 @@ case "$MODE" in
     ;;
   ensure-job) ensure_job ;;
   prepare) do_prepare ;;
-  capture) do_capture; verify_snapshot ;;
+  capture) do_capture; verify_snapshot "$CAPTURED_SNAPSHOT_KEY" ;;
   prepare-work-scope) do_prepare_work_scope ;;
   all)
     ensure_job
     do_prepare
     do_capture
-    verify_snapshot
+    verify_snapshot "$CAPTURED_SNAPSHOT_KEY"
     ;;
   *) fail "unknown mode ${MODE}" 2 ;;
 esac
