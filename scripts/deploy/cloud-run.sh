@@ -496,9 +496,16 @@ require_no_live_provider_key_bindings() {
   fi
 }
 
+# No lookup below is fed through a pipe. Under pipefail a reader that stops
+# early (grep -q on its first match, awk's exit) can SIGPIPE the writer still
+# feeding it, and the pipeline then reports failure although the entry WAS
+# found: a present binding reads as missing, and a present provider key or
+# public IAM member reads as absent. Extractions read a here-string (a failure
+# there aborts under set -e); yes/no answers are computed in the shell itself,
+# so a check can never quietly answer "absent" because a helper failed.
 report_field() {
   # report_field REPORT KIND -> the value column of the single-valued record
-  printf '%s\n' "$1" | awk -F'\t' -v kind="$2" '$1 == kind { print $2; exit }'
+  awk -F'\t' -v kind="$2" '$1 == kind { print $2; exit }' <<<"$1"
 }
 
 binding_identities() {
@@ -515,12 +522,14 @@ binding_identities() {
 }
 
 has_binding() {
-  printf '%s\n' "$1" | grep -Fxq "$2"
+  # has_binding LINES LINE -> success when LINE is exactly one of LINES
+  # (a literal whole-line match, as grep -Fx; the quoted needle is no glob).
+  [[ $'\n'"$1"$'\n' == *$'\n'"$2"$'\n'* ]]
 }
 
 secret_reference_for() {
   # secret_reference_for IDENTITIES ENV_NAME -> "SECRET:VERSION" (or empty)
-  printf '%s\n' "$1" | awk -F'\t' -v name="$2" '$1 == "secret" && $2 == name { print $3; exit }'
+  awk -F'\t' -v name="$2" '$1 == "secret" && $2 == name { print $3; exit }' <<<"$1"
 }
 
 assert_bindings_preserved() {
@@ -588,9 +597,10 @@ verify_env_names() {
 verify_secret_refs() {
   local label="$1" report="$2"
   shift 2
-  local expected
+  local expected refs
+  refs=$(awk -F'\t' '$1 == "secret" { print $2 "=" $3 }' <<<"$report")
   for expected in "$@"; do
-    printf '%s\n' "$report" | awk -F'\t' '$1 == "secret" { print $2 "=" $3 }' | grep -Fxq "$expected" || \
+    has_binding "$refs" "$expected" || \
       fail "$label is missing the expected secret reference '$expected'."
   done
   echo "  secret references: $(printf '%s\n' "$report" | awk -F'\t' '$1 == "secret" { printf "%s->%s ", $2, $3 }')"
@@ -600,9 +610,10 @@ verify_secret_refs() {
 # reference) and as a plain environment variable, since a key pasted in as a
 # literal value would be just as reachable.
 verify_no_provider_key() {
-  local label="$1" report="$2" name
+  local label="$1" report="$2" name names
+  names=$(awk -F'\t' '$1 == "env" || $1 == "secret" { print $2 }' <<<"$report")
   for name in "${MILO_PROVIDER_KEY_ENV_NAMES[@]}"; do
-    if printf '%s\n' "$report" | awk -F'\t' '$1 == "env" || $1 == "secret" { print $2 }' | grep -Fxq "$name"; then
+    if has_binding "$names" "$name"; then
       fail "$label carries provider key '$name'. Stage A binds no provider key to any runtime; it is introduced only by an explicit Stage C operator action."
     fi
   done
@@ -676,12 +687,12 @@ verify_supabase_project_pin() {
 }
 
 verify_no_public_access() {
-  local kind="$1" name="$2" policy
+  local kind="$1" name="$2" policy public_members='"(allUsers|allAuthenticatedUsers)"'
   case "$kind" in
     service) policy=$(gcloud run services get-iam-policy "$name" --project "$PROJECT_ID" --region "$REGION" --format=json) ;;
     job) policy=$(gcloud run jobs get-iam-policy "$name" --project "$PROJECT_ID" --region "$REGION" --format=json) ;;
   esac
-  if printf '%s' "$policy" | grep -qE '"(allUsers|allAuthenticatedUsers)"'; then
+  if [[ "$policy" =~ $public_members ]]; then
     fail "$kind '$name' grants access to allUsers/allAuthenticatedUsers. Production Cloud Run resources must stay private."
   fi
   echo "  IAM: private (no allUsers / allAuthenticatedUsers)"

@@ -960,3 +960,85 @@ def test_pinning_does_not_enable_any_execution_flag(deployment):
         for flag in EXECUTION_FLAGS:
             assert f"{flag}=false" in command
             assert f"{flag}=true" not in command
+
+
+# ---------------------------------------------------------------------------
+# large live configurations (pipefail / SIGPIPE regression)
+# ---------------------------------------------------------------------------
+#
+# Every lookup in the script used to be a pipeline ending in a reader that
+# stops at its first match (grep -q, or an awk that exits). With the real
+# entry near the top of a configuration larger than a pipe buffer, the writer
+# was SIGPIPEd and pipefail reported the lookup as failed: a present binding
+# read as missing, and a present provider key or public member read as absent.
+# The padding below sorts after every real binding name, so each real entry is
+# an early match. Deterministic: no reliance on CPU load.
+
+LARGE_PADDING = 20_000
+
+
+def _pad_large(doc: dict) -> None:
+    env = _container_env(doc)
+    env.extend(env_entry(f"ZZ_PAD_{i:06d}", "x") for i in range(LARGE_PADDING))
+    env.extend(secret_entry(f"ZZ_PAD_SECRET_{i:06d}", f"ZZ_PAD_SECRET_{i:06d}") for i in range(200))
+
+
+def _pad_large_iam(policy: dict, first_member: str | None = None) -> None:
+    members = [f"serviceAccount:pad-{i:06d}@example.iam.gserviceaccount.com" for i in range(LARGE_PADDING)]
+    if first_member:
+        members.insert(0, first_member)
+    policy["bindings"].insert(0, {"role": "roles/run.invoker", "members": members})
+
+
+@pytest.fixture()
+def large_deployment(deployment: Deployment) -> Deployment:
+    for doc in (deployment.service_after, deployment.job_after):
+        _pad_large(doc)
+    _pad_large_iam(deployment.service_iam)
+    _pad_large_iam(deployment.job_iam)
+    return deployment
+
+
+def test_a_large_live_configuration_with_early_bindings_deploys(large_deployment):
+    result = large_deployment.run()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("preserved bindings: OK") == 2
+    assert result.stdout.count("provider keys absent (KIMI_API_KEY MOONSHOT_API_KEY): OK") == 2
+    assert result.stdout.count("IAM: private (no allUsers / allAuthenticatedUsers)") == 2
+    assert "SUPABASE_SERVICE_ROLE_KEY->SUPABASE_SECRET_KEY:latest" in result.stdout
+
+
+@pytest.mark.parametrize("resource", ["service_after", "job_after"])
+def test_a_large_live_configuration_missing_a_required_variable_is_refused(large_deployment, resource):
+    env = _container_env(getattr(large_deployment, resource))
+    env[:] = [entry for entry in env if entry.get("name") != "GCP_REGION"]
+    result = large_deployment.run()
+    assert result.returncode != 0
+    assert "is missing required environment variable 'GCP_REGION'." in result.stderr
+
+
+def test_a_large_live_configuration_with_a_changed_secret_reference_is_refused(large_deployment):
+    for entry in _container_env(large_deployment.service_after):
+        if entry.get("name") == "SUPABASE_URL":
+            entry["valueFrom"]["secretKeyRef"]["key"] = "7"
+    result = large_deployment.run()
+    assert result.returncode != 0
+    assert "is missing the expected secret reference 'SUPABASE_URL=SUPABASE_URL:latest'." in result.stderr
+
+
+@pytest.mark.parametrize("resource", ["service_after", "job_after"])
+def test_an_early_provider_key_in_a_large_live_configuration_is_refused(large_deployment, resource):
+    _container_env(getattr(large_deployment, resource)).insert(0, secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
+    result = large_deployment.run()
+    assert result.returncode != 0
+    assert "carries provider key 'KIMI_API_KEY'" in result.stderr
+
+
+@pytest.mark.parametrize("policy", ["service_iam", "job_iam"])
+def test_an_early_public_member_in_a_large_iam_policy_is_refused(deployment, policy):
+    for doc in (deployment.service_after, deployment.job_after):
+        _pad_large(doc)
+    _pad_large_iam(getattr(deployment, policy), first_member="allUsers")
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "grants access to allUsers/allAuthenticatedUsers" in result.stderr
