@@ -172,6 +172,11 @@ EXECUTION_FLAGS = (
     # it is durable state a browser writes, so it is pinned off here like every
     # other surface a stage has to enable deliberately.
     "MILO_ENABLE_WORK_SCOPE_MUTATIONS",
+    # Capture-job only (scoped catalog PR2): preparing a Mapping Plan revision
+    # -- scoped Government captures and the durable queue. The capture job
+    # definition pins it false; one explicit operator execution turns it on.
+    # Pinned off on the API and the product worker like every other stage flag.
+    "MILO_ENABLE_WORK_SCOPE_PREPARATION",
 )
 
 # NEXT_PUBLIC_* values ship to the browser bundle: secret material is banned.

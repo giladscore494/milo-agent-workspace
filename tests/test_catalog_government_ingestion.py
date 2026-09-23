@@ -1278,6 +1278,11 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # bounds the register reading applies. Two constant modules, and
         # nothing else: no client, no transport, no capture, no query.
         "backend/catalog/scope/contract.py",
+        # Scoped catalog PR2: preparing one plan revision -- a SCOPED refresh
+        # per verified marque, read back by exact key. It constructs no
+        # transport: its only caller is `operator_capture.py` (listed above),
+        # which hands it the client, inside the capture job.
+        "backend/catalog/scope/preparation.py",
     }
     # An IMPORT is the seam this guards. A bare occurrence of the dotted name
     # is not: `backend/testing/memory_repository.py` has to know the capture

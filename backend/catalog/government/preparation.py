@@ -38,7 +38,18 @@ the engine's own state. Two rules keep them apart:
 
 A resumed attempt therefore re-reads the SAME snapshot by its exact key
 (never "the newest usable one", which may have moved) and the SAME queue in
-the SAME order. Per-item progress is not stored at all: it is reconstructed
+the SAME order.
+
+A BATCH-BOUND run (scoped catalog PR2)
+--------------------------------------
+When the durable binding table (`catalog_work_scope_batch_runs`, read through
+`work_scope_batch_for_run`) binds this run to a Mapping Plan batch, the run is
+handed EXACTLY that batch: its one scoped snapshot, pinned by key, and its
+items in batch order -- never "the newest usable snapshot" and never "the
+first N candidates". The binding is the authority, read from the database; a
+browser, the run input and the model can supply none of it. The record then
+carries the batch's identity, and a resume refuses unless the binding still
+names the same batch. A run bound to nothing behaves exactly as before. Per-item progress is not stored at all: it is reconstructed
 from durable state -- the run's own verified evidence rows
 (`catalog_run_pending_promotions`) and its durable promotion events -- so a
 crash between two writes cannot leave the queue claiming progress the
@@ -66,6 +77,11 @@ ARTIFACT_KEY = "government"
 #: The persisted record's own schema, so a later reader can refuse a shape it
 #: does not know instead of guessing.
 ARTIFACT_SCHEMA = "milo-government-preparation/1"
+#: Where a batch-bound run's record names its batch (scoped catalog PR2).
+BATCH_ARTIFACT_KEY = "work_scope_batch"
+#: The batch identity a record carries, and nothing else.
+BATCH_IDENTITY_FIELDS = ("batch_id", "work_scope_id", "revision", "scope_digest",
+                         "batch_number", "attempt")
 #: The most candidates one run is handed. The same bound the promotion path
 #: works under, so a run is never asked to research more than it could ever
 #: promote.
@@ -94,6 +110,8 @@ PREPARATION_REASONS: Mapping[str, str] = {
         "the Government work queue could not be read from durable candidate state",
     "GOVERNMENT_PREPARATION_RECORD_INVALID":
         "the run's persisted Government preparation record is not readable",
+    "GOVERNMENT_BATCH_INVALID":
+        "the Mapping Plan batch bound to this run is not readable as one exact batch",
 }
 
 
@@ -182,10 +200,14 @@ class GovernmentPreparation:
     #: True when this preparation was read back from the run's own durable
     #: record rather than selected afresh.
     resumed: bool
+    #: The Mapping Plan batch this run executes, when it is batch-bound: its
+    #: identity only (ids, revision, digest, number, attempt) -- never its
+    #: items, which ARE the queue above.
+    work_scope_batch: Mapping[str, Any] | None = None
 
     def as_artifact(self) -> dict[str, Any]:
         """The persisted shape, stored under ``artifacts.government``."""
-        return {
+        artifact = {
             "schema": ARTIFACT_SCHEMA,
             "snapshot_key": self.snapshot_key,
             "snapshot_id": self.snapshot_id,
@@ -196,6 +218,9 @@ class GovernmentPreparation:
             "total_candidates": int(self.total_candidates),
             "bounded": bool(self.bounded),
         }
+        if self.work_scope_batch is not None:
+            artifact[BATCH_ARTIFACT_KEY] = dict(self.work_scope_batch)
+        return artifact
 
     def work_context(self, progress: Mapping[str, str]) -> dict[str, Any]:
         """The server-owned work selection handed to the engine.
@@ -243,23 +268,29 @@ def prepare_government_work(repository: Any, *,
                             checkpoint: Mapping[str, Any] | None = None,
                             limit: int = GOVERNMENT_WORK_QUEUE_LIMIT,
                             cancellation_checker: Callable[[], bool] | None = None,
+                            run_id: Any = None,
                             ) -> GovernmentPreparation:
     """Resolve the pinned snapshot and the work queue for ONE run.
 
     With a prior preparation record (a resumed attempt) the SAME snapshot is
     resolved by its exact key and the SAME queue is returned in the SAME order.
-    Without one, the newest USABLE snapshot is pinned and the queue is the
-    first ``limit`` unread candidates in the repository's deterministic
-    candidate order (codepoint order over identity text, then candidate key --
-    the order both PostgreSQL and the in-memory mirror return).
+    Without one, a run the database binds to a Mapping Plan batch is handed
+    exactly that batch; any other run pins the newest USABLE snapshot and
+    takes the first ``limit`` unread candidates in the repository's
+    deterministic candidate order (codepoint order over identity text, then
+    candidate key -- the order both PostgreSQL and the in-memory mirror
+    return).
 
     Refusals are static and total; a repository failure while reading the
-    queue is a refusal too, never an empty queue.
+    queue -- or the binding -- is a refusal too, never an empty queue.
     """
     _check_cancelled(cancellation_checker)
+    batch = _bound_batch(repository, run_id)
     record = prepared_artifact(checkpoint)
     if record is not None:
-        return _resume(repository, record, cancellation_checker)
+        return _resume(repository, record, cancellation_checker, batch=batch)
+    if batch is not None:
+        return _from_batch(repository, batch, cancellation_checker)
 
     resource_id = src.require_allowed_resource(resource_id)
     try:
@@ -318,9 +349,99 @@ def government_work_progress(repository: Any, run_id: Any,
 
 # --- helpers -----------------------------------------------------------------
 
+def _bound_batch(repository: Any, run_id: Any) -> Mapping[str, Any] | None:
+    """The batch the database binds this run to, or None when it is unbound.
+
+    A repository with no binding read has no Mapping Plan schema behind it, so
+    nothing can be bound there. A read that FAILS is a refusal: "not bound" is
+    not something this function may conclude from an absent answer.
+    """
+    if run_id is None:
+        return None
+    read = getattr(repository, "work_scope_batch_for_run", None)
+    if not callable(read):
+        return None
+    try:
+        bound = read(run_id)
+    except AppError:
+        raise GovernmentPreparationError("GOVERNMENT_QUEUE_UNAVAILABLE") from None
+    if bound is None:
+        return None
+    if not isinstance(bound, Mapping) or not isinstance(bound.get("batch"), Mapping) \
+            or not isinstance(bound.get("binding"), Mapping) \
+            or not isinstance(bound.get("items"), Sequence) \
+            or isinstance(bound.get("items"), (str, bytes)):
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    return bound
+
+
+def _batch_identity(bound: Mapping[str, Any]) -> dict[str, Any]:
+    batch, binding = bound["batch"], bound["binding"]
+    try:
+        identity = {"batch_id": str(batch["id"]), "work_scope_id": str(batch["work_scope_id"]),
+                    "revision": int(batch["revision"]), "scope_digest": str(batch["scope_digest"]),
+                    "batch_number": int(batch["batch_number"]),
+                    "attempt": int(binding["attempt"])}
+    except (KeyError, TypeError, ValueError):
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID") from None
+    if str(binding.get("batch_id")) != identity["batch_id"]:
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    return identity
+
+
+def _from_batch(repository: Any, bound: Mapping[str, Any],
+                cancellation_checker: Callable[[], bool] | None) -> GovernmentPreparation:
+    """EXACTLY the bound batch: its one snapshot, pinned, and its items in order."""
+    batch = bound["batch"]
+    identity = _batch_identity(bound)
+    snapshot_key = str(batch.get("snapshot_key") or "")
+    if not snapshot_key:
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    try:
+        snapshot = resolve_active_snapshot(repository, resource_id=src.WLTP_RESOURCE_ID,
+                                           snapshot_key=snapshot_key, allow_incomplete=False)
+    except GovernmentProjectionError as refusal:
+        raise GovernmentPreparationError("GOVERNMENT_SNAPSHOT_UNAVAILABLE",
+                                         reason_code=refusal.reason_code) from None
+    _check_cancelled(cancellation_checker)
+    items = list(bound["items"])
+    queue: list[GovernmentWorkItem] = []
+    for position, item in enumerate(items, start=1):
+        if not isinstance(item, Mapping) or item.get("batch_position") != position \
+                or str(item.get("snapshot_id")) != str(snapshot["id"]):
+            raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+        try:
+            queue.append(GovernmentWorkItem.from_record(item))
+        except GovernmentPreparationError:
+            raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID") from None
+    if not queue or len(queue) != int(batch.get("item_count") or -1) \
+            or len(queue) > GOVERNMENT_WORK_QUEUE_LIMIT \
+            or len({item.candidate_key for item in queue}) != len(queue):
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    return GovernmentPreparation(
+        snapshot_key=snapshot_key, snapshot_id=str(snapshot["id"]),
+        resource_id=src.WLTP_RESOURCE_ID,
+        upstream_version=str(snapshot.get("upstream_version") or ""),
+        upstream_version_kind=str(snapshot.get("upstream_version_kind") or ""),
+        queue=tuple(queue), total_candidates=len(queue), bounded=False, resumed=False,
+        work_scope_batch=identity)
+
+
 def _resume(repository: Any, record: Mapping[str, Any],
-            cancellation_checker: Callable[[], bool] | None) -> GovernmentPreparation:
+            cancellation_checker: Callable[[], bool] | None, *,
+            batch: Mapping[str, Any] | None = None) -> GovernmentPreparation:
     if record.get("schema") != ARTIFACT_SCHEMA:
+        raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+    # A batch-bound record resumes only while the binding still names the SAME
+    # batch, and an unbound record only while the run is still unbound: the
+    # durable binding is the authority, never the checkpoint alone.
+    recorded_batch = record.get(BATCH_ARTIFACT_KEY)
+    if recorded_batch is not None:
+        if not isinstance(recorded_batch, Mapping) or batch is None \
+                or set(recorded_batch) != set(BATCH_IDENTITY_FIELDS) \
+                or dict(recorded_batch) != _batch_identity(batch):
+            raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+    elif batch is not None:
         raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
     snapshot_key = str(record.get("snapshot_key") or "")
     resource_id = str(record.get("resource_id") or "")
@@ -352,7 +473,8 @@ def _resume(repository: Any, record: Mapping[str, Any],
         upstream_version_kind=str(snapshot.get("upstream_version_kind") or ""),
         queue=queue,
         total_candidates=max(len(queue), _optional_int(record.get("total_candidates")) or 0),
-        bounded=bool(record.get("bounded")), resumed=True)
+        bounded=bool(record.get("bounded")), resumed=True,
+        work_scope_batch=dict(recorded_batch) if recorded_batch is not None else None)
 
 
 def _read_queue(repository: Any, snapshot: Mapping[str, Any],
@@ -422,7 +544,8 @@ def _optional_text(value: Any) -> str | None:
 
 
 __all__ = [
-    "ARTIFACT_KEY", "ARTIFACT_SCHEMA", "GOVERNMENT_WORK_QUEUE_LIMIT", "PREPARATION_PHASE",
+    "ARTIFACT_KEY", "ARTIFACT_SCHEMA", "BATCH_ARTIFACT_KEY", "BATCH_IDENTITY_FIELDS",
+    "GOVERNMENT_WORK_QUEUE_LIMIT", "PREPARATION_PHASE",
     "PREPARATION_REASONS", "PROGRESS_EVIDENCED", "PROGRESS_PENDING", "PROGRESS_PROMOTED",
     "PROGRESS_STATES", "QUEUED_CANDIDATE_STATUS", "GovernmentPreparation",
     "GovernmentPreparationError", "GovernmentWorkItem", "government_work_progress",

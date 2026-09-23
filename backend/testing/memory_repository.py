@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import threading
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -45,6 +46,27 @@ from backend.schemas import normalize_conversation_title
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+#: The pinned WLTP resource, as the preparation SQL pins it.
+_WLTP_RESOURCE_ID = "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _declared_scope_key(row: Mapping[str, Any]) -> tuple[str, str] | None:
+    """What the scope predicate of the snapshot listing sees in one row.
+
+    None when `retrieval_metadata` carries no `capture_scope` key at all;
+    ("key", scope_key) for a declaration stating a string `scope_key`; and
+    ("declared", "") for any other declaration -- present, so excluded from an
+    unscoped listing, but matching no requested key."""
+    metadata = row.get("retrieval_metadata")
+    if not isinstance(metadata, Mapping) or "capture_scope" not in metadata:
+        return None
+    declaration = metadata.get("capture_scope")
+    if isinstance(declaration, Mapping) and isinstance(declaration.get("scope_key"), str):
+        return ("key", declaration["scope_key"])
+    return ("declared", "")
 
 
 def _variant_page_key(row: Mapping[str, Any]) -> tuple:
@@ -139,6 +161,14 @@ class MemoryRepository:
         # methods that mirror `create_work_scope` / `revise_work_scope`.
         self.work_scopes: dict[str, dict[str, Any]] = {}
         self.work_scope_revisions: list[dict[str, Any]] = []
+        # Plan preparation (`20260923000100_catalog_work_scope_preparation.sql`):
+        # append-only, written only by the mirror of `prepare_work_scope_queue`
+        # and, for bindings, of `bind_work_scope_batch_run`.
+        self.work_scope_preparations: dict[str, dict[str, Any]] = {}
+        self.work_scope_units: list[dict[str, Any]] = []
+        self.work_scope_batches: list[dict[str, Any]] = []
+        self.work_scope_queue_items: list[dict[str, Any]] = []
+        self.work_scope_batch_runs: list[dict[str, Any]] = []
 
     # -- seeding -------------------------------------------------------------
     def seed_user(self, user_id: str) -> None:
@@ -1547,12 +1577,22 @@ class MemoryRepository:
     MAX_CATALOG_CANDIDATE_ROWS = 500
 
     def list_active_catalog_snapshots(self, source_family: str, *, resource_id: Any = None,
-                                      limit: int = MAX_CATALOG_SNAPSHOT_ROWS) -> list[dict[str, Any]]:
+                                      limit: int = MAX_CATALOG_SNAPSHOT_ROWS,
+                                      capture_scope_key: str | None = None) -> list[dict[str, Any]]:
+        """Mirror of the Supabase listing, INCLUDING its scope predicate.
+
+        Without `capture_scope_key` only snapshots declaring NO capture scope
+        are listed -- the database's `retrieval_metadata->capture_scope is
+        null`, under which a present-but-null declaration is still a
+        declaration. With one, only snapshots whose declaration states that
+        exact `scope_key`."""
         with self.lock:
             rows = [dict(row) for row in self.catalog_snapshots.values()
                     if row.get("source_family") == str(source_family)
                     and row.get("activated_at") is not None
-                    and (resource_id is None or row.get("resource_id") == str(resource_id))]
+                    and (resource_id is None or row.get("resource_id") == str(resource_id))
+                    and _declared_scope_key(row) == (
+                        None if capture_scope_key is None else ("key", str(capture_scope_key)))]
         # `activated_at` DESC, then `snapshot_key` ASC -- exactly the Supabase
         # ordering.  Sorting the whole tuple in reverse would reverse the
         # TIEBREAK too, so snapshots activated in the same instant came back in
@@ -2453,6 +2493,345 @@ class MemoryRepository:
 
     #: Mirrors `SupabaseRepository.MAX_WORK_SCOPE_REVISION_ROWS`.
     MAX_WORK_SCOPE_REVISION_ROWS = 50
+
+    def get_work_scope_revision(self, work_scope_id: UUID, revision: int) -> dict[str, Any] | None:
+        """ONE exact revision of one plan, or None. Not a search."""
+        with self.lock:
+            row = next((row for row in self.work_scope_revisions
+                        if row["work_scope_id"] == str(work_scope_id)
+                        and row["revision"] == int(revision)), None)
+            return copy.deepcopy(row) if row is not None else None
+
+    # -- mapping plan preparation ------------------------------------------------------
+    #
+    # Mirrors `20260923000100_catalog_work_scope_preparation.sql` decision for
+    # decision: the same refusals under the same codes, the same two passes, the
+    # same in-range counting, the same vocabulary gate and the same canonical
+    # candidate order (`_variant_page_key`, the order the SQL `collate "C"`
+    # ordering produces). The PostgreSQL suite and `tests/test_work_scope_
+    # preparation.py` hold the two to the same answers.
+
+    _WORK_SCOPE_TERMINAL_RUN_STATES = frozenset({
+        "completed", "partial_success", "failed", "cancelled", "timed_out", "budget_exhausted"})
+    _WORK_SCOPE_UNUSABLE_REASONS = frozenset({
+        "GOV_PROJECTION_SNAPSHOT_INCOMPLETE", "GOV_PROJECTION_SNAPSHOT_NOT_READ",
+        "GOV_PROJECTION_RESOURCE_NOT_NORMALIZED", "GOV_PROJECTION_SNAPSHOT_STATE_INVALID"})
+    _WORK_SCOPE_UNIT_FIELDS = frozenset({"priority", "reason_code", "register_marque",
+                                         "snapshot_id", "state", "unit_key"})
+
+    @staticmethod
+    def _in_plan_years(row: Mapping[str, Any], year_from: Any, year_to: Any) -> bool:
+        """`(from is null or start >= from) and (to is null or end <= to)`."""
+        start, end = row.get("model_year_start"), row.get("model_year_end")
+        if year_from is not None and (start is None or start < year_from):
+            return False
+        if year_to is not None and (end is None or end > year_to):
+            return False
+        return True
+
+    def _work_scope_preparation_summary(self, preparation: Mapping[str, Any],
+                                        replayed: bool) -> dict[str, Any]:
+        units = sorted((dict(row) for row in self.work_scope_units
+                        if row["preparation_id"] == preparation["id"]),
+                       key=lambda row: row["priority"])
+        batches = sorted((row for row in self.work_scope_batches
+                          if row["preparation_id"] == preparation["id"]),
+                         key=lambda row: row["batch_number"])
+        return {"replayed": replayed, "preparation": dict(preparation), "units": units,
+                "batches": [{"id": row["id"], "batch_number": row["batch_number"],
+                             "unit_key": row["unit_key"], "snapshot_key": row["snapshot_key"],
+                             "item_count": row["item_count"],
+                             "first_position": row["first_position"]} for row in batches]}
+
+    def prepare_work_scope_queue(self, run_id: UUID, preparation: dict[str, Any], *,
+                                 worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        invalid = AppError("WORK_SCOPE_PREPARATION_INVALID",
+                           "invalid mapping plan preparation", 422)
+        snapshot_invalid = AppError("WORK_SCOPE_UNIT_SNAPSHOT_INVALID",
+                                    "a unit's snapshot is not that marque's usable scoped capture",
+                                    422)
+        stale = AppError("WORK_SCOPE_STALE",
+                         "the plan changed since it was read; reload it and try again", 409)
+        with self.lock:
+            self._catalog_lease(run_id, worker_id, attempt, lease_token)
+            identity = self.runs[str(run_id)].get("run_identity") or {}
+            if identity.get("workflow_key") != "operator_capture":
+                raise AppError("WORK_SCOPE_PREPARATION_RUN_INVALID",
+                               "only an operator capture run prepares a mapping plan", 409)
+            if not isinstance(preparation, Mapping) \
+                    or set(preparation) != {"revision", "scope_digest", "units", "work_scope_id"}:
+                raise invalid
+            revision, digest = preparation["revision"], preparation["scope_digest"]
+            units, scope_id = preparation["units"], preparation["work_scope_id"]
+            if isinstance(revision, bool) or not isinstance(revision, int) \
+                    or not 0 <= revision <= 999_999_999 \
+                    or not isinstance(digest, str) or not _HEX64.fullmatch(digest) \
+                    or not isinstance(units, list) or not isinstance(scope_id, str):
+                raise invalid
+            try:
+                UUID(scope_id)
+            except ValueError:
+                raise invalid from None
+            plan = self.work_scopes.get(scope_id)
+            if plan is None:
+                raise NotFoundError("work_scope", scope_id)
+            if self.projects[plan["project_id"]].get("workflow_key") != "swarm_v2":
+                raise AppError("WORK_SCOPE_WORKFLOW_UNSUPPORTED",
+                               "this project's engine does not read a mapping plan", 409)
+            if plan["closed_at"] is not None:
+                raise AppError("WORK_SCOPE_NOT_EDITABLE", "the mapping plan is not editable", 409)
+            if plan["head_revision"] != revision or plan["head_digest"] != digest:
+                raise stale
+            stored_revision = next((row for row in self.work_scope_revisions
+                                    if row["work_scope_id"] == scope_id
+                                    and row["revision"] == revision), None)
+            if stored_revision is None or stored_revision["digest"] != digest:
+                raise stale
+            scope = stored_revision["scope"]
+            plan_units = list(scope["units"])
+            year_from = scope["model_years"]["from"]
+            year_to = scope["model_years"]["to"]
+            size = int(scope["batch_size"])
+            if len(units) != len(plan_units):
+                raise invalid
+
+            existing = next((row for row in self.work_scope_preparations.values()
+                             if row["work_scope_id"] == scope_id
+                             and row["revision"] == revision), None)
+            if existing is not None:
+                stored = [{"unit_key": row["unit_key"], "snapshot_id": row["snapshot_id"],
+                           "register_marque": row["register_marque"],
+                           "captured": row["state"] in ("prepared", "vocabulary_insufficient")}
+                          for row in sorted((row for row in self.work_scope_units
+                                             if row["preparation_id"] == existing["id"]),
+                                            key=lambda row: row["priority"])]
+                if not all(isinstance(entry, Mapping) for entry in units):
+                    raise invalid
+                submitted = [{"unit_key": entry.get("unit_key"),
+                              "snapshot_id": entry.get("snapshot_id"),
+                              "register_marque": entry.get("register_marque"),
+                              "captured": entry.get("state") == "captured"}
+                             for entry in sorted(units, key=lambda entry: entry.get("priority"))]
+                if stored != submitted:
+                    raise AppError("WORK_SCOPE_ALREADY_PREPARED",
+                                   "this plan revision was already prepared differently", 409)
+                return self._work_scope_preparation_summary(existing, True)
+
+            # Pass 1: decide every unit before writing anything.
+            budget = int(scope["max_items"])
+            decided: list[dict[str, Any]] = []
+            prepared = queued = batch_total = 0
+            seen: set[str] = set()
+            for index, entry in enumerate(units):
+                if not isinstance(entry, Mapping) or set(entry) != self._WORK_SCOPE_UNIT_FIELDS \
+                        or entry["unit_key"] != plan_units[index] \
+                        or isinstance(entry["priority"], bool) \
+                        or entry["priority"] != index + 1:
+                    raise invalid
+                state = entry["state"]
+                marque = entry["register_marque"] if isinstance(entry["register_marque"], str) \
+                    else None
+                readable = ambiguous = eligible = take = 0
+                reason: str | None = None
+                snapshot: dict[str, Any] | None = None
+                if state == "register_unverified":
+                    if entry["register_marque"] is not None or entry["snapshot_id"] is not None \
+                            or entry["reason_code"] is not None:
+                        raise invalid
+                    reason = "WORK_SCOPE_REGISTER_UNVERIFIED"
+                elif state in ("captured", "snapshot_unusable"):
+                    if marque is None or not 1 <= len(marque) <= 120 \
+                            or not isinstance(entry["snapshot_id"], str):
+                        raise invalid
+                    try:
+                        UUID(entry["snapshot_id"])
+                    except ValueError:
+                        raise invalid from None
+                    snapshot = next((row for row in self.catalog_snapshots.values()
+                                     if row["id"] == entry["snapshot_id"]), None)
+                    declaration = ((snapshot or {}).get("retrieval_metadata") or {}) \
+                        .get("capture_scope")
+                    filters = declaration.get("filters") if isinstance(declaration, Mapping) else None
+                    if snapshot is None or snapshot.get("source_family") != "government" \
+                            or snapshot.get("resource_id") != _WLTP_RESOURCE_ID \
+                            or snapshot.get("activated_at") is None \
+                            or not isinstance(filters, Mapping) or filters.get("tozar") != marque:
+                        raise snapshot_invalid
+                    if snapshot["id"] in seen:
+                        raise invalid
+                    seen.add(snapshot["id"])
+                    if state == "snapshot_unusable":
+                        if entry["reason_code"] not in self._WORK_SCOPE_UNUSABLE_REASONS:
+                            raise invalid
+                        reason = entry["reason_code"]
+                    else:
+                        if entry["reason_code"] is not None:
+                            raise invalid
+                        try:
+                            self._readable_snapshot(snapshot["id"], False)
+                        except AppError:
+                            raise snapshot_invalid from None
+                        in_range = [row for row in self._snapshot_candidates(snapshot["id"])
+                                    if self._in_plan_years(row, year_from, year_to)]
+                        readable = sum(1 for row in in_range if row["status"] != "ambiguous")
+                        ambiguous = sum(1 for row in in_range if row["status"] == "ambiguous")
+                        eligible = sum(1 for row in in_range if row["status"] == "candidate")
+                        if ambiguous > readable:
+                            state, reason = "vocabulary_insufficient", \
+                                "WORK_SCOPE_VOCABULARY_INSUFFICIENT"
+                        else:
+                            state = "prepared"
+                            take = min(eligible, budget)
+                            budget -= take
+                            prepared += 1
+                            queued += take
+                            batch_total += -(-take // size)
+                else:
+                    raise invalid
+                decided.append({
+                    "priority": index + 1, "unit_key": entry["unit_key"],
+                    "register_marque": marque, "state": state, "reason_code": reason,
+                    "snapshot_id": snapshot["id"] if snapshot else None,
+                    "snapshot_key": snapshot["snapshot_key"] if snapshot else None,
+                    "capture_scope_key": (snapshot["retrieval_metadata"]["capture_scope"]
+                                          .get("scope_key") if snapshot else None),
+                    "readable": readable, "ambiguous": ambiguous, "eligible": eligible,
+                    "take": take})
+
+            # Pass 2: write the whole decision.
+            now = _now()
+            record = {"id": str(uuid4()), "work_scope_id": scope_id, "revision": revision,
+                      "scope_digest": digest, "prepared_by_run_id": str(run_id),
+                      "unit_count": len(units), "prepared_unit_count": prepared,
+                      "queued_item_count": queued, "batch_count": batch_total, "created_at": now}
+            self.work_scope_preparations[record["id"]] = record
+            position = batch_number = 0
+            for unit in decided:
+                row = {"id": str(uuid4()), "preparation_id": record["id"],
+                       "work_scope_id": scope_id, "revision": revision,
+                       "priority": unit["priority"], "unit_key": unit["unit_key"],
+                       "register_marque": unit["register_marque"], "state": unit["state"],
+                       "reason_code": unit["reason_code"], "snapshot_id": unit["snapshot_id"],
+                       "snapshot_key": unit["snapshot_key"],
+                       "capture_scope_key": unit["capture_scope_key"],
+                       "readable_count": unit["readable"], "ambiguous_count": unit["ambiguous"],
+                       "eligible_count": unit["eligible"], "queued_count": unit["take"],
+                       "created_at": now}
+                self.work_scope_units.append(row)
+                if not unit["take"]:
+                    continue
+                chosen = sorted((candidate for candidate
+                                 in self._snapshot_candidates(unit["snapshot_id"])
+                                 if candidate["status"] == "candidate"
+                                 and self._in_plan_years(candidate, year_from, year_to)),
+                                key=_variant_page_key)[:unit["take"]]
+                for start in range(0, len(chosen), size):
+                    batch_number += 1
+                    members = chosen[start:start + size]
+                    batch = {"id": str(uuid4()), "preparation_id": record["id"],
+                             "work_scope_id": scope_id, "revision": revision,
+                             "scope_digest": digest, "batch_number": batch_number,
+                             "unit_id": row["id"], "unit_key": row["unit_key"],
+                             "snapshot_id": row["snapshot_id"],
+                             "snapshot_key": row["snapshot_key"],
+                             "item_count": len(members), "first_position": position + 1,
+                             "created_at": now}
+                    self.work_scope_batches.append(batch)
+                    for offset, candidate in enumerate(members, start=1):
+                        position += 1
+                        self.work_scope_queue_items.append({
+                            "id": str(uuid4()), "preparation_id": record["id"],
+                            "batch_id": batch["id"], "position": position,
+                            "batch_position": offset, "unit_key": row["unit_key"],
+                            "snapshot_id": row["snapshot_id"], "candidate_id": candidate["id"],
+                            "candidate_key": candidate["candidate_key"], "created_at": now})
+            return self._work_scope_preparation_summary(record, False)
+
+    def bind_work_scope_batch_run(self, batch_id: UUID, run_id: UUID, expected_revision: int,
+                                  expected_digest: str, bound_by: UUID) -> dict[str, Any]:
+        """Mirrors `bind_work_scope_batch_run`, refusal for refusal."""
+        run_invalid = AppError("WORK_SCOPE_BATCH_RUN_INVALID",
+                               "this run cannot execute this batch", 422)
+        if batch_id is None or run_id is None or bound_by is None:
+            raise run_invalid
+        with self.lock:
+            batch = next((row for row in self.work_scope_batches
+                          if row["id"] == str(batch_id)), None)
+            if batch is None:
+                raise NotFoundError("work_scope_batch", str(batch_id))
+            plan = self.work_scopes[batch["work_scope_id"]]
+            if (str(plan["project_id"]), str(bound_by)) not in self.members:
+                raise NotFoundError("work_scope_batch", str(batch_id))
+            if self.projects[plan["project_id"]].get("workflow_key") != "swarm_v2":
+                raise AppError("WORK_SCOPE_WORKFLOW_UNSUPPORTED",
+                               "this project's engine does not read a mapping plan", 409)
+            if plan["closed_at"] is not None:
+                raise AppError("WORK_SCOPE_NOT_EDITABLE", "the mapping plan is not editable", 409)
+            if plan["head_revision"] != batch["revision"] \
+                    or plan["head_digest"] != batch["scope_digest"] \
+                    or expected_revision != batch["revision"] \
+                    or expected_digest != batch["scope_digest"]:
+                raise AppError("WORK_SCOPE_STALE",
+                               "the plan changed since it was read; reload it and try again", 409)
+            run = self.runs.get(str(run_id))
+            if run is None or str(run.get("conversation_id")) != plan["conversation_id"] \
+                    or (run.get("run_identity") or {}).get("workflow_key") != "swarm_v2":
+                raise run_invalid
+            existing = next((row for row in self.work_scope_batch_runs
+                             if row["run_id"] == str(run_id)), None)
+            if existing is not None:
+                if existing["batch_id"] == str(batch_id):
+                    return {**existing, "replayed": True}
+                raise AppError("WORK_SCOPE_BATCH_RUN_TAKEN",
+                               "this run is already bound to another batch", 409)
+            if run.get("status") in self._WORK_SCOPE_TERMINAL_RUN_STATES:
+                raise run_invalid
+            for binding in self.work_scope_batch_runs:
+                if binding["work_scope_id"] != plan["id"]:
+                    continue
+                status = (self.runs.get(binding["run_id"]) or {}).get("status")
+                if status not in self._WORK_SCOPE_TERMINAL_RUN_STATES:
+                    raise AppError("WORK_SCOPE_BATCH_IN_PROGRESS",
+                                   "another batch of this plan is still running", 409)
+            if any(binding["batch_id"] == str(batch_id)
+                   and (self.runs.get(binding["run_id"]) or {}).get("status") == "completed"
+                   for binding in self.work_scope_batch_runs):
+                raise AppError("WORK_SCOPE_BATCH_ALREADY_COMPLETED",
+                               "this batch already completed", 409)
+            attempt = 1 + max((binding["attempt"] for binding in self.work_scope_batch_runs
+                               if binding["batch_id"] == str(batch_id)), default=0)
+            binding = {"id": str(uuid4()), "batch_id": str(batch_id),
+                       "work_scope_id": plan["id"], "run_id": str(run_id), "attempt": attempt,
+                       "bound_by": str(bound_by), "bound_at": _now()}
+            self.work_scope_batch_runs.append(binding)
+            return {**binding, "replayed": False}
+
+    def work_scope_batch_for_run(self, run_id: UUID) -> dict[str, Any] | None:
+        """Mirrors `work_scope_batch_for_run`: None when the run is unbound."""
+        with self.lock:
+            binding = next((row for row in self.work_scope_batch_runs
+                            if row["run_id"] == str(run_id)), None)
+            if binding is None:
+                return None
+            batch = next(row for row in self.work_scope_batches
+                         if row["id"] == binding["batch_id"])
+            candidates = {row["id"]: row for row in self.catalog_candidates.values()}
+            items = []
+            for item in sorted((row for row in self.work_scope_queue_items
+                                if row["batch_id"] == batch["id"]),
+                               key=lambda row: row["batch_position"]):
+                candidate = candidates[item["candidate_id"]]
+                items.append({
+                    "position": item["position"], "batch_position": item["batch_position"],
+                    "candidate_id": item["candidate_id"], "candidate_key": item["candidate_key"],
+                    "manufacturer": candidate["manufacturer"],
+                    "commercial_model": candidate["commercial_model"],
+                    "model_year_start": candidate.get("model_year_start"),
+                    "model_year_end": candidate.get("model_year_end"),
+                    "official_model_code": candidate.get("official_model_code"),
+                    "trim": candidate.get("trim"), "status": candidate["status"],
+                    "snapshot_id": candidate["snapshot_id"]})
+            return {"binding": dict(binding), "batch": dict(batch), "items": items}
 
     def catalog_canonical_manufacturer_coverage(self, manufacturers: list[str]) -> list[dict[str, Any]]:
         """Mirrors `catalog_canonical_manufacturer_coverage`: an exact count per

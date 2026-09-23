@@ -67,6 +67,9 @@ EXECUTION_FLAGS = (
     # The Mapping Plan writes. Pinned false on both surfaces like every other
     # Stage A execution flag, so this fixture must carry it too.
     "MILO_ENABLE_WORK_SCOPE_MUTATIONS",
+    # Mapping Plan preparation (capture job only): pinned false on both
+    # product surfaces like every other Stage A execution flag.
+    "MILO_ENABLE_WORK_SCOPE_PREPARATION",
 )
 
 MOCK_GCLOUD = r"""#!/usr/bin/env bash

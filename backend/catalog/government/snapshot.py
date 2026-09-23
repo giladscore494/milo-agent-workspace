@@ -44,6 +44,8 @@ from typing import Any, Mapping
 from backend.catalog.contracts import MAX_RETRIEVAL_METADATA_CHARS
 
 from . import source as src
+from .capture_scope import METADATA_KEY as CAPTURE_SCOPE_METADATA_KEY
+from .capture_scope import CaptureScope
 from .client import ResourceCapture
 from .normalize import CaptureNormalization
 from .source import GovernmentSourceError
@@ -110,7 +112,8 @@ def snapshot_content_sha256(capture: ResourceCapture) -> str:
 
 
 def retrieval_metadata(capture: ResourceCapture,
-                       normalization: CaptureNormalization) -> dict[str, Any]:
+                       normalization: CaptureNormalization,
+                       capture_scope: CaptureScope | None = None) -> dict[str, Any]:
     """The bounded, safe provenance of one capture -- INCLUDING its reading gap.
 
     Safe means: no credential (none exists on this path and the flag below says
@@ -135,7 +138,14 @@ def retrieval_metadata(capture: ResourceCapture,
     `page_checksums_inline` states plainly which of the two a snapshot holds, so
     a reader never has to infer why a list is absent. The normalization summary
     is never dropped: it decides whether a snapshot may answer a query at all.
+
+    A SCOPED capture (`capture_scope.py`) additionally declares its scope. The
+    declaration must describe the query this capture actually sent -- a
+    snapshot claiming one marque while holding another's rows is refused here,
+    before anything is written, and again by the database's own CHECK.
     """
+    if capture_scope is not None and dict(capture.query) != capture_scope.query():
+        raise GovernmentSourceError("GOV_CAPTURE_SCOPE_MISMATCH")
     checksums = tuple(page.body_sha256 for page in capture.pages)
     metadata: dict[str, Any] = {
         "capture_contract": SNAPSHOT_CONTENT_CONTRACT,
@@ -169,6 +179,8 @@ def retrieval_metadata(capture: ResourceCapture,
         "completed_at": capture.completed_at,
         **normalization.durable_summary(),
     }
+    if capture_scope is not None:
+        metadata[CAPTURE_SCOPE_METADATA_KEY] = capture_scope.as_metadata()
     inline = {**metadata, "page_checksums_inline": True,
               "page_checksums": [{"offset": page.offset, "limit": page.limit,
                                   "record_count": page.record_count,
@@ -198,7 +210,8 @@ def _bounded(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def snapshot_payload(capture: ResourceCapture,
-                     normalization: CaptureNormalization) -> dict[str, Any]:
+                     normalization: CaptureNormalization,
+                     capture_scope: CaptureScope | None = None) -> dict[str, Any]:
     """The `record_catalog_snapshot` payload for one complete capture.
 
     Deliberately NOT carrying `snapshot_key`: the key is DERIVED from these
@@ -216,7 +229,7 @@ def snapshot_payload(capture: ResourceCapture,
         "content_sha256": snapshot_content_sha256(capture),
         "retrieved_at": capture.metadata.retrieved_at,
         "declared_record_count": capture.reported_total,
-        "retrieval_metadata": retrieval_metadata(capture, normalization),
+        "retrieval_metadata": retrieval_metadata(capture, normalization, capture_scope),
     }
 
 

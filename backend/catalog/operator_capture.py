@@ -165,6 +165,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 from typing import Any, Mapping, Sequence
@@ -174,12 +175,19 @@ from uuid import UUID, uuid4
 from backend.errors import AppError
 from backend.catalog.execution import CATALOG_EXECUTION_FLAG, catalog_execution_enabled
 from backend.catalog.government import source as src
+from backend.catalog.government.capture_scope import (CAPTURE_SCOPE_REASONS,
+                                                      CaptureScopeError)
 from backend.catalog.government.client import DataGovClient
 from backend.catalog.government.ingest import (GOVERNMENT_INGESTION_REASONS,
                                                GovernmentIngestionError)
 from backend.catalog.government.refresh import GovernmentCatalogRefresh, RefreshOutcome
 from backend.catalog.government.source import (GOVERNMENT_SOURCE_REASONS,
                                                GovernmentSourceError)
+from backend.catalog.scope.preparation import (PREPARATION_REASONS as
+                                               WORK_SCOPE_PREPARATION_REASONS,
+                                               WorkScopePreparation,
+                                               WorkScopePreparationError,
+                                               prepare_work_scope)
 from backend.engines.swarm_v2.evidence import WorkerLease
 from backend.errors import AppError
 from backend.event_registry import CAPTURE_SNAPSHOT_REPLAYED
@@ -265,6 +273,38 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_REFUSED = 2
 
+#: Scoped catalog PR2: the switch for the SCOPED preparation mode, by name.
+#: Default off and pinned off in every deployment contract. The capture job
+#: definition pins it `false`; an operator who means to prepare a plan supplies
+#: it for ONE execution (`government-production-capture.sh
+#: --prepare-work-scope`), so preparing is a recorded decision, never a default.
+WORK_SCOPE_PREPARATION_FLAG = "MILO_ENABLE_WORK_SCOPE_PREPARATION"
+#: The three arguments of the scoped mode. All three or none.
+WORK_SCOPE_ARGUMENTS: tuple[tuple[str, str], ...] = (
+    ("work_scope_id", "--work-scope-id"),
+    ("work_scope_revision", "--work-scope-revision"),
+    ("work_scope_digest", "--work-scope-digest"),
+)
+_SCOPE_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_SCOPE_REVISION = re.compile(r"^[1-9][0-9]{0,8}$")
+#: The most units and batches the sanitized report lists individually. The
+#: counts are always exact.
+MAX_REPORT_WORK_SCOPE_UNITS = 64
+MAX_REPORT_WORK_SCOPE_BATCHES = 200
+#: The database's own preparation refusals (`prepare_work_scope_queue`),
+#: reported as themselves: static codes the repository layer already maps.
+WORK_SCOPE_REPOSITORY_REASONS: Mapping[str, str] = {
+    "WORK_SCOPE_NOT_FOUND": "the mapping plan named for preparation does not exist",
+    "WORK_SCOPE_STALE": "the mapping plan changed since this preparation was requested",
+    "WORK_SCOPE_NOT_EDITABLE": "the mapping plan is not editable",
+    "WORK_SCOPE_WORKFLOW_UNSUPPORTED": "the mapping plan's project engine does not read a plan",
+    "WORK_SCOPE_ALREADY_PREPARED": "this plan revision was already prepared differently",
+    "WORK_SCOPE_PREPARATION_RUN_INVALID": "only an operator capture run prepares a mapping plan",
+    "WORK_SCOPE_PREPARATION_INVALID": "the preparation handed to the database was not valid",
+    "WORK_SCOPE_UNIT_SNAPSHOT_INVALID":
+        "a unit's snapshot is not that marque's usable scoped capture",
+}
+
 #: This entrypoint's own refusals. Each names the PROPERTY that failed and
 #: carries no value, no path, no URL, no identifier and no exception text. The
 #: capture and ingestion vocabularies (`GOVERNMENT_SOURCE_REASONS`,
@@ -326,6 +366,11 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "the execution report could not be written to the requested path",
     "CAPTURE_UNEXPECTED_FAILURE":
         "the capture stopped on an unexpected condition",
+    # Scoped catalog PR2: the scoped preparation mode.
+    "CAPTURE_WORK_SCOPE_ARGUMENTS_INVALID":
+        "scoped preparation needs a plan id, a whole revision number and its digest, together",
+    "CAPTURE_WORK_SCOPE_PREPARATION_DISABLED":
+        "scoped work-scope preparation is not enabled for this process",
 }
 
 
@@ -337,7 +382,8 @@ def safe_message(reason_code: str) -> str:
     echoed back with whatever produced it.
     """
     for vocabulary in (CAPTURE_REASONS, GOVERNMENT_SOURCE_REASONS,
-                       GOVERNMENT_INGESTION_REASONS):
+                       GOVERNMENT_INGESTION_REASONS, WORK_SCOPE_PREPARATION_REASONS,
+                       WORK_SCOPE_REPOSITORY_REASONS, CAPTURE_SCOPE_REASONS):
         if reason_code in vocabulary:
             return vocabulary[reason_code]
     return CAPTURE_REASONS["CAPTURE_UNEXPECTED_FAILURE"]
@@ -451,6 +497,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"optional; may only restate {CAPTURE_MAX_PAGES}")
     parser.add_argument("--max-records", default=None,
                         help=f"optional; may only restate {CAPTURE_MAX_RECORDS}")
+    parser.add_argument("--work-scope-id", default=None,
+                        help="--execute only: prepare this mapping plan instead of the whole "
+                             "resource (with --work-scope-revision and --work-scope-digest)")
+    parser.add_argument("--work-scope-revision", default=None,
+                        help="--execute only: the plan revision to prepare; must be its head")
+    parser.add_argument("--work-scope-digest", default=None,
+                        help="--execute only: that revision's digest; a stale one refuses")
     parser.add_argument("--report-path", default=None,
                         help="optional path for the sanitized report; the only file written")
     return parser
@@ -537,7 +590,7 @@ CAPTURE_ONLY_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("page_limit", "--page-limit"),
     ("max_pages", "--max-pages"),
     ("max_records", "--max-records"),
-)
+) + WORK_SCOPE_ARGUMENTS
 PREPARE_ONLY_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("conversation_id", "--conversation-id"),
     ("requested_by", "--requested-by"),
@@ -609,7 +662,37 @@ def _refusal(args: argparse.Namespace, extra: Sequence[str],
         return "CAPTURE_BOUNDS_NOT_SUPPORTED"
     if args.max_records is not None and not _exact_int(args.max_records, CAPTURE_MAX_RECORDS):
         return "CAPTURE_BOUNDS_NOT_SUPPORTED"
+    if _supplied(args, WORK_SCOPE_ARGUMENTS):
+        # The scoped mode is the capture PLUS a plan: every prerequisite above
+        # still holds, and these are added to it.
+        if _work_scope_request(args) is None:
+            return "CAPTURE_WORK_SCOPE_ARGUMENTS_INVALID"
+        if (env.get(WORK_SCOPE_PREPARATION_FLAG) or "").strip().lower() not in TRUE_VALUES:
+            return "CAPTURE_WORK_SCOPE_PREPARATION_DISABLED"
     return ""
+
+
+def _work_scope_request(args: argparse.Namespace) -> tuple[UUID, int, str] | None:
+    """The scoped request, or None when it is incomplete or malformed. Pure.
+
+    All three or none: a plan without its revision, or a revision without the
+    digest it was read at, is not a request anyone can check for staleness.
+    """
+    identity, revision, digest = (getattr(args, name, None)
+                                  for name, _flag in WORK_SCOPE_ARGUMENTS)
+    if identity is None or revision is None or digest is None:
+        return None
+    try:
+        plan = UUID(str(identity))
+    except (TypeError, ValueError):
+        return None
+    text = str(revision)
+    # ASCII digits only: `str.isdigit` would accept other scripts' digits.
+    if not _SCOPE_REVISION.fullmatch(text):
+        return None
+    if not _SCOPE_DIGEST.fullmatch(str(digest)):
+        return None
+    return plan, int(text), str(digest)
 
 
 def _lease_settings(env: Mapping[str, str]) -> tuple[int, float]:
@@ -842,6 +925,55 @@ def capture_document(outcome: RefreshOutcome, *, replayed: bool) -> dict[str, An
     return document
 
 
+def work_scope_document(preparation: WorkScopePreparation) -> dict[str, Any]:
+    """What one scoped preparation did, as the bounded record an operator keeps.
+
+    Closed schema, field by field. Unit keys are the directory's own ASCII
+    keys; no register text (a marque's Hebrew spelling, a model name) and no
+    candidate identity travels in it -- the queue itself is durable and read by
+    batch, never printed.
+    """
+    summary = preparation.summary
+    record = summary.get("preparation") if isinstance(summary, Mapping) else None
+    record = record if isinstance(record, Mapping) else {}
+    decided = {str(unit.get("unit_key")): unit for unit in summary.get("units") or ()
+               if isinstance(unit, Mapping)}
+    units = []
+    for capture in preparation.captures[:MAX_REPORT_WORK_SCOPE_UNITS]:
+        unit = decided.get(capture.unit_key, {})
+        units.append({
+            "unit_key": _text(capture.unit_key),
+            "priority": int(capture.priority),
+            "state": _text(unit.get("state") or capture.state),
+            "reason_code": _text(unit.get("reason_code") or ""),
+            "capture": _text(capture.capture),
+            "snapshot_key": _text(capture.snapshot_key),
+            "readable_count": int(unit.get("readable_count") or 0),
+            "ambiguous_count": int(unit.get("ambiguous_count") or 0),
+            "eligible_count": int(unit.get("eligible_count") or 0),
+            "queued_count": int(unit.get("queued_count") or 0),
+        })
+    batches = [{"batch_number": int(batch.get("batch_number") or 0),
+                "unit_key": _text(batch.get("unit_key")),
+                "item_count": int(batch.get("item_count") or 0),
+                "first_position": int(batch.get("first_position") or 0)}
+               for batch in list(summary.get("batches") or ())[:MAX_REPORT_WORK_SCOPE_BATCHES]
+               if isinstance(batch, Mapping)]
+    return {
+        "work_scope_id": _text(preparation.work_scope_id),
+        "revision": int(preparation.revision),
+        "scope_digest": _text(preparation.scope_digest),
+        "replayed": bool(preparation.replayed),
+        "preparation_id": _text(record.get("id") or ""),
+        "unit_count": int(record.get("unit_count") or 0),
+        "prepared_unit_count": int(record.get("prepared_unit_count") or 0),
+        "queued_item_count": int(record.get("queued_item_count") or 0),
+        "batch_count": int(record.get("batch_count") or 0),
+        "units": units,
+        "batches": batches,
+    }
+
+
 def plan_document() -> dict[str, Any]:
     """Exactly what an execution WOULD construct, computed from constants."""
     return {
@@ -909,7 +1041,17 @@ def _classify(failure: BaseException) -> str:
     if isinstance(failure, GovernmentIngestionError):
         if failure.reason_code in GOVERNMENT_INGESTION_REASONS:
             return failure.reason_code
+    if isinstance(failure, WorkScopePreparationError):
+        if failure.reason_code in WORK_SCOPE_PREPARATION_REASONS:
+            return failure.reason_code
+    if isinstance(failure, CaptureScopeError):
+        if failure.reason_code in CAPTURE_SCOPE_REASONS:
+            return failure.reason_code
     if isinstance(failure, AppError):
+        # The preparation's own refusals are static codes the repository layer
+        # already mapped; anything else stays one classification.
+        if failure.code in WORK_SCOPE_REPOSITORY_REASONS:
+            return failure.code
         return "CAPTURE_REPOSITORY_UNAVAILABLE"
     return "CAPTURE_UNEXPECTED_FAILURE"
 
@@ -1231,16 +1373,29 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         if len(observed) < 64:
             observed.append(str(event_type))
 
+    # Already validated by `_refusal`: None for the whole-resource capture.
+    scoped = _work_scope_request(args)
+    preparation: WorkScopePreparation | None = None
     supervisor.start()
     try:
         client = DataGovClient(_open_transport(), page_limit=CAPTURE_PAGE_LIMIT,
                                max_pages=CAPTURE_MAX_PAGES, max_records=CAPTURE_MAX_RECORDS,
                                cancellation_checker=supervisor.should_stop)
-        operation = GovernmentCatalogRefresh(
-            repository, lease, client=client, resource_id=src.WLTP_RESOURCE_ID,
-            cancellation_checker=supervisor.should_stop, event_sink=record_event)
-        # Whole-resource capture: no `q`, no `filters`, no paging argument.
-        outcome = operation.sync_if_changed(package_id=src.CKAN_PACKAGE_ID, query=None)
+        if scoped is not None:
+            # Scoped catalog PR2: prepare ONE exact plan revision. Each unit is
+            # a scoped capture of the same pinned resource under the same
+            # client, lease and bounds; `prepare_work_scope` never widens any.
+            plan_id, revision, digest = scoped
+            preparation = prepare_work_scope(
+                repository, lease, client=client, work_scope_id=str(plan_id),
+                revision=revision, digest=digest,
+                cancellation_checker=supervisor.should_stop, event_sink=record_event)
+        else:
+            operation = GovernmentCatalogRefresh(
+                repository, lease, client=client, resource_id=src.WLTP_RESOURCE_ID,
+                cancellation_checker=supervisor.should_stop, event_sink=record_event)
+            # Whole-resource capture: no `q`, no `filters`, no paging argument.
+            outcome = operation.sync_if_changed(package_id=src.CKAN_PACKAGE_ID, query=None)
     except CancellationRequested:
         reason = supervisor.stop_reason or "CAPTURE_CANCELLED"
         supervisor.stop()
@@ -1254,6 +1409,10 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         return EXIT_FAILED, _envelope("failed", reason)
     supervisor.stop()
 
+    if preparation is not None:
+        prepared = work_scope_document(preparation)
+        _finalize(repository, lease, document=prepared, reason_code="", cancelled=False)
+        return EXIT_OK, _envelope("succeeded", "", work_scope=prepared)
     document = capture_document(outcome, replayed=CAPTURE_SNAPSHOT_REPLAYED in observed)
     _finalize(repository, lease, document=document, reason_code="", cancelled=False)
     return EXIT_OK, _envelope("succeeded", "", capture=document)

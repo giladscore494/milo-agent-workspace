@@ -97,6 +97,8 @@ INVENTORY=(
   "MILO_ENABLE_WORK_SCOPE_MUTATIONS|cloud-run-api-only|no|backend/catalog/scope/service.py"
   # Worker-only: the catalog capability inside a Swarm V2 run.
   "MILO_ENABLE_CATALOG_EXECUTION|cloud-run-worker-only|no|backend/catalog/execution.py"
+  # Capture job only (worker image): preparing a Mapping Plan revision.
+  "MILO_ENABLE_WORK_SCOPE_PREPARATION|cloud-run-worker-only|no|backend/catalog/operator_capture.py"
   "MILO_DAILY_USER_BUDGET|shared-api-worker|no|backend/runtime_policy.py"
   "MILO_DAILY_PROJECT_BUDGET|shared-api-worker|no|backend/runtime_policy.py"
   "MILO_MAX_COST_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
@@ -188,6 +190,7 @@ EXECUTION_FLAGS=(
   MILO_ENABLE_PAID_EXECUTION
   MILO_ENABLE_CATALOG_EXECUTION
   MILO_ENABLE_WORK_SCOPE_MUTATIONS
+  MILO_ENABLE_WORK_SCOPE_PREPARATION
   GATEWAY_ALLOW_EXECUTION_ROUTES
   NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI
 )
