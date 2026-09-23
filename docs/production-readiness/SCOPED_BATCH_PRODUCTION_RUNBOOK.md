@@ -117,8 +117,13 @@ Every script builds, tags and checks `git rev-parse HEAD`, so **the checkout is
 the release**. Keep this one checkout for the whole rollout.
 
 Check CI for that exact commit in GitHub (Actions → `ci` → the run for
-`$RELEASE_SHA`). All three jobs (`offline-checks`, `postgres-checks`, `e2e`)
-must be green. From a shell with `gh` authenticated:
+`$RELEASE_SHA`). All four mandatory jobs must be green — `offline-checks`
+(backend suite and static safety scans), `frontend-and-docker` (API and
+worker image builds, frontend build, type check, Vitest, static UI check and
+the served-bundle secret scan), `postgres-checks` (executable migration and
+RPC ACL suites, skips forbidden) and `e2e`. A run in which any of the four is
+failing, skipped, cancelled or still pending is **not** green; three green
+jobs are not enough. From a shell with `gh` authenticated:
 
 ```bash
 gh run list --workflow ci --commit "$RELEASE_SHA" --repo giladscore494/milo-agent-workspace
