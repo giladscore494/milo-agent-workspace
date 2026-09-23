@@ -402,6 +402,42 @@ describe('the Mapping Plan batches', () => {
       .toBeNull();
   });
 
+  it.each([
+    ['launching', 'The worker for this batch is being started.'],
+    ['launch_unknown', 'Whether a worker was started for this batch is unknown.'],
+  ])('says an unresolved launch (%s) is reconciled by an operator, and offers no Cancel or relaunch', async (launchState, said) => {
+    const body = progressBody();
+    apiMocks.api.workScopeProgress.mockResolvedValue(progressBody({
+      status: 'running',
+      live: { ...LIVE, run_status: 'queued', launch_state: launchState },
+      controls: { ...body.controls,
+                  start: { available: false, blocked_by: 'batch_running', batch: null, retry: false, relaunch: false },
+                  cancel: { available: false, run_id: BATCH_RUN } },
+    }));
+    const batches = await openBatches();
+    const current = await within(batches).findByRole('status', { name: 'Current batch' });
+    expect(current.textContent).toContain(said);
+    expect(current.textContent).toContain('never started again automatically and cannot be cancelled here');
+    expect(current.textContent).toContain('an operator checks Cloud Run and reconciles it');
+    expect(within(batches).queryByRole('button', { name: /Launch batch|Start batch|Continue with batch|Cancel this batch/ }))
+      .toBeNull();
+  });
+
+  it('still offers Cancel for a queued batch whose worker launch is recorded', async () => {
+    const body = progressBody();
+    apiMocks.api.workScopeProgress.mockResolvedValue(progressBody({
+      status: 'running',
+      live: { ...LIVE, run_status: 'queued', launch_state: 'launched' },
+      controls: { ...body.controls,
+                  start: { available: false, blocked_by: 'batch_running', batch: null, retry: false, relaunch: false },
+                  cancel: { available: true, run_id: BATCH_RUN } },
+    }));
+    const batches = await openBatches();
+    const current = await within(batches).findByRole('status', { name: 'Current batch' });
+    expect(current.textContent).not.toContain('reconciles it');
+    expect(within(current).getByRole('button', { name: 'Cancel this batch' })).toBeTruthy();
+  });
+
   it('is absent, and reads no progress, where the server does not let batches start', async () => {
     apiMocks.api.workScopeCapabilities.mockResolvedValue(CAPABILITIES);
     await openConversation();

@@ -8297,6 +8297,182 @@ def test_a_replay_that_would_launch_obeys_the_start_rules_as_they_stand_now(db):
     assert _wsb_counts(db, world) == ("1", "1", "1")
 
 
+LOST_LAUNCH_FN = "public.reconcile_lost_launch(uuid,text,integer,text)"
+#: The launch step's own compare-and-set (`try_acquire_launch`), verbatim.
+LAUNCH_CAS = ("with cas as (update public.runs set launch_state = 'launching' "
+              "where id = '{run}' and status = 'queued' "
+              "and launch_state in ('pending', 'launch_failed') returning id) "
+              "select count(*) from cas")
+
+
+def _lost_launch_run(db, conversation: str, *, status: str = "queued",
+                     launch_state: str = "launching") -> str:
+    """A run in the posture a lost launch leaves: the API's launch
+    compare-and-set took it, and nothing was recorded after."""
+    run = _wsp_swarm_run(db, conversation)
+    db.psql(f"update public.runs set launch_state = '{launch_state}', status = '{status}' "
+            f"where id = '{run}'")
+    return run
+
+
+def _quiet(db, run: str, seconds: int = 3600) -> None:
+    """Backdate the run's last write. `runs_set_updated_at` stamps every UPDATE
+    with now(), so the trigger is set aside for exactly this one statement."""
+    db.psql("alter table public.runs disable trigger runs_set_updated_at")
+    try:
+        db.psql(f"update public.runs set updated_at = now() - make_interval(secs => {seconds}) "
+                f"where id = '{run}'")
+    finally:
+        db.psql("alter table public.runs enable trigger runs_set_updated_at")
+
+
+def _reconcile(db, run: str, outcome: str = "not_launched", *, quiet: int = 900,
+               operator: str = "operator@milo.test") -> dict:
+    return json.loads(_rpc_as_service(
+        db, f"select public.reconcile_lost_launch('{run}', '{outcome}', {quiet}, '{operator}')"))
+
+
+def _posture(db, run: str) -> str:
+    return db.psql(f"select status || '|' || launch_state || '|' || coalesce(worker_id, '-') "
+                   f"|| '|' || (select count(*) from public.run_events e where e.run_id = r.id) "
+                   f"from public.runs r where id = '{run}'")
+
+
+def test_a_lost_launch_is_reconciled_only_when_provably_unclaimed_untraced_and_quiet(db):
+    _user, _project, conversation = _ws_world(db)
+
+    # The one posture it decides on, once quiet: queued + launching, never claimed.
+    lost = _lost_launch_run(db, conversation)
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_NOT_QUIET"):
+        _reconcile(db, lost)
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_THRESHOLD_TOO_SHORT"):
+        _reconcile(db, lost, quiet=60)
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_INVALID"):
+        _reconcile(db, lost, operator=" ")
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_INVALID"):
+        _reconcile(db, lost, "relaunch")
+    assert _posture(db, lost) == "queued|launching|-|0"
+    _quiet(db, lost)
+    decided = _reconcile(db, lost)
+    assert (decided["reconciled"], decided["status"], decided["launch_state"]) == (
+        True, "queued", "launch_failed")
+    assert db.psql(f"select status || '|' || launch_state || '|' || (launch_error->>'code') "
+                   f"|| '|' || (launch_error->>'reconciled_by') || '|' || (worker_id is null) "
+                   f"from public.runs where id = '{lost}'") \
+        == "queued|launch_failed|RUN_LAUNCH_LOST|operator@milo.test|true"
+    event = json.loads(db.psql(f"select payload::text from public.run_events "
+                               f"where run_id = '{lost}' and event_type = 'launch_failed'"))
+    # Who decided is in the operator's audit record, never in a member-readable event.
+    assert event == {"recoverable": True, "reconciled": True,
+                     "previous_launch_state": "launching"}
+    # The same decision again is the same answer, and writes nothing.
+    assert _reconcile(db, lost)["reconciled"] is False
+    assert _posture(db, lost) == "queued|launch_failed|-|1"
+    # The existing requeue path: the launch compare-and-set takes it again,
+    # exactly once.
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "1"
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "0"
+
+    # `launched` records the execution the operator found -- and a launcher
+    # record is evidence FOR it, not against it.
+    found = _lost_launch_run(db, conversation)
+    db.psql(f"insert into public.run_invocations (run_id, launcher) values ('{found}', 'cloud_run')")
+    _quiet(db, found)
+    assert _reconcile(db, found, "launched")["launch_state"] == "launched"
+    assert _posture(db, found) == "queued|launched|-|0"
+    assert db.psql(LAUNCH_CAS.format(run=found)) == "0"
+
+    # Everything else is refused, and a refusal changes nothing.
+    refusals = {}
+    for state in ("launch_unknown", "pending"):
+        refusals[f"{state} is not a lost launch"] = (
+            _lost_launch_run(db, conversation, launch_state=state), "not_launched",
+            "LOST_LAUNCH_WRONG_STATE")
+    refusals["launched is not a lost launch"] = (
+        _lost_launch_run(db, conversation, launch_state="launched"), "not_launched",
+        "LOST_LAUNCH_WRONG_STATE")
+    refusals["a cancellation someone asked for"] = (
+        _lost_launch_run(db, conversation, status="cancellation_requested"), "not_launched",
+        "LOST_LAUNCH_WRONG_STATE")
+    claimed = _lost_launch_run(db, conversation)
+    assert db.psql(f"select count(*) from public.claim_run_lease('{claimed}', 'real-worker', 300)") == "1"
+    refusals["a worker claimed it"] = (claimed, "not_launched", "LOST_LAUNCH_WRONG_STATE")
+    leased = _lost_launch_run(db, conversation)
+    db.psql(f"update public.runs set lease_token = 'held', "
+            f"lease_expires_at = now() + interval '5 minutes' where id = '{leased}'")
+    refusals["an active lease is never taken over"] = (leased, "not_launched", "LOST_LAUNCH_CLAIMED")
+    refusals["an active lease, whatever the decision"] = (leased, "launched", "LOST_LAUNCH_CLAIMED")
+    invoked = _lost_launch_run(db, conversation)
+    db.psql(f"insert into public.run_invocations (run_id, launcher) values ('{invoked}', 'cloud_run')")
+    refusals["the launcher recorded an execution"] = (invoked, "not_launched", "LOST_LAUNCH_TRACED")
+    evented = _lost_launch_run(db, conversation)
+    db.psql(f"insert into public.run_events (run_id, event_type, message) values "
+            f"('{evented}', 'run_started', 'started')")
+    refusals["a worker wrote about it"] = (evented, "not_launched", "LOST_LAUNCH_TRACED")
+    for case, (run, outcome, code) in refusals.items():
+        _quiet(db, run)
+        before = _posture(db, run)
+        with pytest.raises(AssertionError, match=code):
+            _reconcile(db, run, outcome)
+        assert _posture(db, run) == before, case
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_NOT_FOUND"):
+        _reconcile(db, str(uuid.uuid4()))
+
+    # Service-path only.
+    for role, allowed in (("anon", "f"), ("authenticated", "f"), ("service_role", "t")):
+        assert db.psql(f"select has_function_privilege('{role}', '{LOST_LAUNCH_FN}', 'execute')") \
+            == allowed, role
+
+
+def test_a_plan_held_by_a_lost_launch_recovers_through_reconciliation_without_duplicate_execution(db):
+    world = _wsb_world(db)
+    first, second, _third = world["batches"]
+    started = _wsb_start(db, world, first, key="lost-plan-1")
+    lost = started["run"]["id"]
+    # The API took launch ownership -- its own compare-and-set -- and died.
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "1"
+    # The plan is held, and nothing launches the run again: a double submission
+    # answers with the same run, whose launch the compare-and-set refuses.
+    again = _wsb_start(db, world, first, key="lost-plan-1-bis")
+    assert (again["created"], again["run"]["id"]) == (False, lost)
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "0"
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_IN_PROGRESS"):
+        _wsb_start(db, world, second, key="lost-plan-2")
+    assert _wsb_progress(db, world["plan"])["live"]["launch_state"] == "launching"
+
+    # The operator checked Cloud Run, found no execution, and reconciles it once
+    # it is provably quiet: the SAME run returns to the existing requeue path.
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_NOT_QUIET"):
+        _reconcile(db, lost)
+    _quiet(db, lost)
+    assert _reconcile(db, lost)["launch_state"] == "launch_failed"
+    live = _wsb_progress(db, world["plan"])["live"]
+    assert (live["run_id"], live["run_status"], live["launch_state"]) == (
+        lost, "queued", "launch_failed")
+    # A person's "Launch batch 1" answers with that run, and only the launch
+    # compare-and-set launches it -- once.
+    relaunch = _wsb_start(db, world, first, key="lost-plan-1-launch")
+    assert (relaunch["created"], relaunch["run"]["id"]) == (False, lost)
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "1"
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "0"
+    db.psql(f"update public.runs set launch_state = 'launched' where id = '{lost}'")
+    # Exactly one worker ever executes it: one live lease, and a late worker for
+    # the lost launch cannot take it over.
+    assert db.psql(f"select count(*) from public.claim_run_lease('{lost}', 'worker-a', 300)") == "1"
+    assert db.psql(f"select count(*) from public.claim_run_lease('{lost}', 'late-worker', 300)") == "0"
+    _wsb_finish(db, lost, "completed")
+    assert db.psql(f"select count(*) from public.claim_run_lease('{lost}', 'late-worker', 300)") == "0"
+
+    # Continuation, one request at a time.
+    progress = _wsb_progress(db, world["plan"])
+    assert progress["live"] is None
+    assert progress["preparation"]["next"]["batch_id"] == second
+    assert _wsb_counts(db, world) == ("1", "1", "1")
+    continued = _wsb_start(db, world, second, key="lost-plan-2-after")
+    assert continued["created"] is True and continued["run"]["id"] != lost
+    assert _wsb_counts(db, world) == ("2", "2", "2")
+
+
 def test_progress_is_derived_from_bound_runs_and_their_promotion_events(db):
     world = _wsb_world(db)
     first, second, _third = world["batches"]

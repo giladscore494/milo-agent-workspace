@@ -124,6 +124,12 @@ REQUIRED_PER_FILE["20260924000100_catalog_work_scope_batch_runs.sql"] = [
     "create trigger catalog_work_scope_controls_append_only",
     "create trigger catalog_work_scope_controls_in_sequence",
     "for update",
+    # A lost launch is reconciled only by an operator's guarded decision, and
+    # only while no worker ever claimed the run and nothing is in flight.
+    "create or replace function public.reconcile_lost_launch(",
+    "raise exception 'lost_launch_claimed'",
+    "raise exception 'lost_launch_not_quiet'",
+    "raise exception 'lost_launch_traced'",
 ]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the

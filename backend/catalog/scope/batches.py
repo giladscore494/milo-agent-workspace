@@ -411,6 +411,14 @@ def _controls(view: Mapping[str, Any]) -> dict[str, Any]:
     # launched: the launch compare-and-set takes only these two states.
     unlaunched = (live is not None and live["run_status"] == "queued"
                   and live["launch_state"] in ("pending", "launch_failed"))
+    # A worker will finalize a cancellation of this run: one already claimed
+    # it, or its launch is recorded as having started one. Anything else --
+    # never launched, or a launch that is unresolved (`launching` with nothing
+    # recorded after it, `launch_unknown`) -- would rest at
+    # `cancellation_requested` with nobody to finish it, holding the plan.
+    finalizable = (live is not None and (
+        live["run_status"] in ("starting", "running", "waiting")
+        or (live["run_status"] == "queued" and live["launch_state"] == "launched")))
     # Only a batch of the HEAD revision can be named by a start: a stale
     # revision never launches, and the database refuses it too.
     relaunch = (unlaunched and live["revision"] == view["revision"]
@@ -429,12 +437,11 @@ def _controls(view: Mapping[str, Any]) -> dict[str, Any]:
                   "relaunch": relaunch},
         "pause": {"available": batches_on and not view["closed"] and not view["paused"]},
         "resume": {"available": batches_on and not view["closed"] and view["paused"]},
-        # A run no worker was started for has nobody to finalize its
-        # cancellation: cancelling it would leave it `cancellation_requested`,
-        # holding the plan, until an operator resolves it. It is not offered.
-        "cancel": {"available": (live is not None and not unlaunched
-                                 and live["run_status"] != "cancellation_requested"
-                                 and is_stage_enabled(RUN_CANCELLATION_FLAG)),
+        # Cancel is offered only for a run a worker will finalize. A run no
+        # worker was started for, or whose launch is unresolved, is not: an
+        # unresolved launch is reconciled by an operator first
+        # (scripts/release/reconcile-launch-unknown.sh).
+        "cancel": {"available": finalizable and is_stage_enabled(RUN_CANCELLATION_FLAG),
                    "run_id": live["run_id"] if live is not None else None},
     }
 

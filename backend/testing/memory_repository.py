@@ -327,17 +327,81 @@ class MemoryRepository:
             run = self.runs.get(str(run_id))
             if run is None or run["status"] != "queued" or run.get("launch_state") not in {"pending", "launch_failed"}:
                 return None
-            run["launch_state"] = "launching"
+            # `runs_set_updated_at` stamps every UPDATE in the database.
+            run.update(launch_state="launching", updated_at=_now())
             return dict(run)
 
     def set_launch_state(self, run_id: UUID, state: str, error: dict[str, Any] | None = None) -> dict[str, Any]:
         run = self.runs[str(run_id)]
-        run["launch_state"] = state
+        run.update(launch_state=state, updated_at=_now())
         if state == "launched":
             run["launched_at"] = _now()
         if error is not None:
             run["launch_error"] = error
         return dict(run)
+
+    #: `reconcile_lost_launch`'s floor: no lost launch is reconciled sooner.
+    LOST_LAUNCH_MIN_QUIET_SECONDS = 900
+    #: The only event the API writes about a queued run before a worker claims it.
+    LOST_LAUNCH_API_EVENTS = frozenset({"launch_failed"})
+
+    def reconcile_lost_launch(self, run_id: UUID, *, outcome: str, min_quiet_seconds: int,
+                              operator: str) -> dict[str, Any]:
+        """Mirrors `reconcile_lost_launch`: an operator's guarded decision on a
+        launch that was lost before any worker claimed the run -- `launched`
+        (an execution exists) or `not_launched` (none does, and nothing but the
+        API ever wrote about the run). It never launches anything:
+        `not_launched` returns the run to `launch_failed`, the state the launch
+        compare-and-set can take again."""
+        if outcome not in ("launched", "not_launched") or not isinstance(operator, str) \
+                or not operator.strip() or len(operator) > 200:
+            raise AppError("LOST_LAUNCH_INVALID", "invalid lost-launch reconciliation", 422)
+        if not isinstance(min_quiet_seconds, int) or isinstance(min_quiet_seconds, bool) \
+                or min_quiet_seconds < self.LOST_LAUNCH_MIN_QUIET_SECONDS:
+            raise AppError("LOST_LAUNCH_THRESHOLD_TOO_SHORT",
+                           "a lost launch is never reconciled sooner than the floor", 422)
+        target = "launched" if outcome == "launched" else "launch_failed"
+        with self.lock:
+            run = self.runs.get(str(run_id))
+            if run is None:
+                raise NotFoundError("run", str(run_id))
+            if run.get("launch_state") == target:
+                return {"reconciled": False, "run_id": run["id"], "status": run["status"],
+                        "launch_state": target}
+            if run["status"] != "queued" or run.get("launch_state") != "launching":
+                raise AppError("LOST_LAUNCH_WRONG_STATE", "the run is not a lost launch", 409)
+            if any(run.get(field) for field in ("worker_id", "lease_token", "lease_expires_at",
+                                                "started_at", "finished_at")):
+                raise AppError("LOST_LAUNCH_CLAIMED", "a worker claimed the run", 409)
+            quiet_since = datetime.fromisoformat(str(run.get("updated_at") or run["created_at"]))
+            if quiet_since > datetime.now(UTC) - timedelta(seconds=min_quiet_seconds):
+                raise AppError("LOST_LAUNCH_NOT_QUIET", "the run changed too recently", 409)
+            rid = run["id"]
+            traced = (any(row.get("run_id") == rid for row in self.invocations)
+                      or any(row.get("run_id") == rid for row in self.checkpoints)
+                      or bool(run.get("last_heartbeat_at"))
+                      or any(row.get("run_id") == rid for row in getattr(self, "usage_ledger", []))
+                      or rid in self.__dict__.get("run_usage_ledgers", {})
+                      or any(event["run_id"] == rid
+                             and event["event_type"] not in self.LOST_LAUNCH_API_EVENTS
+                             for event in self.run_events))
+            if outcome == "not_launched" and traced:
+                raise AppError("LOST_LAUNCH_TRACED", "more than the API wrote about the run", 409)
+            run.update(launch_state=target, updated_at=_now())
+            if outcome == "not_launched":
+                run["launch_error"] = {
+                    "code": "RUN_LAUNCH_LOST",
+                    "message": "launch ownership was taken but its outcome was never recorded; "
+                               "an operator verified that no worker was started",
+                    "reconciled_by": operator}
+                self.append_run_event(UUID(rid), "launch_failed", {
+                    "message": "The worker launch was never confirmed and an operator verified "
+                               "that no worker was started; the run remains queued and can be "
+                               "launched again",
+                    "payload": {"recoverable": True, "reconciled": True,
+                                "previous_launch_state": "launching"}})
+            return {"reconciled": True, "run_id": rid, "status": run["status"],
+                    "launch_state": target, "previous_launch_state": "launching"}
 
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
         run = self.runs.get(str(run_id))

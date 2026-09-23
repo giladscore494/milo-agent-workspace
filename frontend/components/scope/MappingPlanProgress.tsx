@@ -71,6 +71,12 @@ export function MappingPlanProgress({
   // happened, or definitely failed. Only launching it can move it on.
   const unlaunched = live !== undefined && live.runStatus === 'queued'
     && (live.launchState === 'pending' || live.launchState === 'launch_failed');
+  // The running batch's launch is unresolved: launch ownership was taken and
+  // nothing recorded after it yet, or the launcher's answer was uncertain. A
+  // worker may or may not exist, so it is never started again from here and
+  // never offered Cancel (the server says so too); an operator reconciles it.
+  const unresolved = live !== undefined && live.runStatus === 'queued'
+    && (live.launchState === 'launching' || live.launchState === 'launch_unknown');
 
   return (
     <section className="mapping-plan-progress" aria-labelledby="mapping-plan-progress-title">
@@ -127,6 +133,15 @@ export function MappingPlanProgress({
                   the plan until an operator resolves it: no other batch can start until then.
                 </p>
               ))}
+              {unresolved && (
+                <p className="note">
+                  {live.launchState === 'launch_unknown'
+                    ? 'Whether a worker was started for this batch is unknown.'
+                    : 'The worker for this batch is being started. If that is not confirmed, the launch stays unresolved.'}
+                  {' '}An unresolved launch is never started again automatically and cannot be cancelled here: an
+                  operator checks Cloud Run and reconciles it. No other batch can start until then.
+                </p>
+              )}
               <div className="button-row">
                 <button type="button" className="button button--quiet" onClick={() => onOpenRun(live.runId)}>
                   Show this run

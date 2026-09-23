@@ -356,8 +356,25 @@ its candidates, and unbound runs behave exactly as before.
   the Mapping Plan: nothing would finalize the cancellation of a run no worker
   claims, so it would stay `cancellation_requested` and hold the plan. Known
   gap: when the plan was revised past such a batch it can be neither launched
-  (stale) nor finalized, and it holds the plan until an operator resolves it;
-  the existing reconciliation tooling covers `launch_unknown` only.
+  (stale) nor finalized, and it holds the plan until an operator resolves it.
+- **An unresolved launch** is never cancelled from the Mapping Plan either.
+  Cancel is offered only for a run a worker will finalize: one a worker has
+  claimed, or a queued run whose launch is recorded as `launched`. A queued
+  run whose launch is `launching` or `launch_unknown` may or may not have a
+  worker, so the panel says the launch is unresolved and offers neither Cancel
+  nor a relaunch.
+- **A lost launch** -- the API took launch ownership (`launching`) and died
+  before recording the outcome -- holds the plan too: nothing relaunches it,
+  and `launching` never means "not launched". It is reconciled like
+  `launch_unknown`, with the same tool (`reconcile-launch-unknown.sh`), after
+  the operator has checked Cloud Run for an execution of the run. The tool's
+  `confirmed-launched` and `confirmed-not-launched` go through
+  `reconcile_lost_launch`, which proves under the run's row lock that no worker
+  ever claimed the run and that it has been quiet for at least 15 minutes (and,
+  for "not launched", that nothing but the API ever wrote about it).
+  `confirmed-not-launched` moves the run to `launch_failed`: the Mapping Plan
+  then offers "Launch batch N" for the head revision, which launches the SAME
+  run through the launch compare-and-set, once, when a person confirms it.
 
 ### Progress
 

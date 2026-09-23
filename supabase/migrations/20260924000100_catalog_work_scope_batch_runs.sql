@@ -16,6 +16,8 @@
 --                                   transaction
 --   work_scope_progress()           the plan's progress, derived from the bound
 --                                   runs' own durable status and events
+--   reconcile_lost_launch()         an operator's guarded decision on a launch
+--                                   that was lost before any worker claimed it
 --
 -- and it restates `bind_work_scope_batch_run` with the continuation rules below.
 --
@@ -689,7 +691,139 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 5. RLS and privileges: service-path only.
+-- 5. A lost launch: reconciled by an operator, never relaunched by itself.
+-- ---------------------------------------------------------------------------
+--
+-- The API's launch step takes launch ownership with a compare-and-set (queued +
+-- pending/launch_failed -> launching), calls the launcher, and then records
+-- `launched`, `launch_failed` or `launch_unknown`. If the API process dies
+-- between the compare-and-set and that record, the run rests at `queued` +
+-- `launching`: the compare-and-set takes only pending and launch_failed, so
+-- nothing launches it again; no worker holds its lease; and -- for a batch
+-- run -- it is the plan's one live batch, so the plan is held. `launching` does
+-- NOT mean "not launched": the launcher may have started a worker just before
+-- the process died.
+--
+-- A stale `launching` run is therefore an UNRESOLVED launch, like
+-- `launch_unknown`, and it is resolved the same way: by an operator who checks
+-- Cloud Run for an execution of the run and then applies a decision through
+-- the guarded reconciliation tool (scripts/release/reconcile-launch-unknown.sh),
+-- which calls this function for a lost launch. `launch_unknown` keeps the
+-- tool's own guarded updates, unchanged.
+--
+-- `reconcile_lost_launch` never guesses. Under the run's row lock it requires:
+--
+--   * the posture a lost launch leaves: the run `queued` with launch
+--     `launching`, and NO worker ever claimed it -- no worker, no lease, never
+--     started. A claimed run is not lost, whatever its launch label says, and
+--     a lease is never taken over;
+--   * the row quiet for at least the caller's threshold, and never for less
+--     than 15 minutes -- the launch request itself times out after 15 s -- so
+--     it cannot race a launch request still in flight;
+--   * for `not_launched`, also that nothing but the API ever wrote about the
+--     run: no launcher record (a recorded execution means the launch
+--     happened), no checkpoint, heartbeat, usage, reservation or blackboard
+--     row, and no event beyond the API's own `launch_failed`.
+--
+-- `launched` records what the operator found -- an execution of the run exists
+-- -- and the worker claims and runs it as usual. `not_launched` moves the run
+-- to `launch_failed`, the state the launch step already reads as "no worker
+-- was started": the SAME run can be launched again, and only through the launch
+-- compare-and-set -- from the Mapping Plan by a person, or after the tool's
+-- existing `requeue`. Nothing here launches anything, and whatever the lost
+-- launch did, at most one worker ever executes the run: `claim_run_lease`
+-- grants one live lease.
+create or replace function public.reconcile_lost_launch(
+  p_run_id uuid,
+  p_outcome text,
+  p_min_quiet_seconds integer,
+  p_operator text
+) returns jsonb
+language plpgsql
+set search_path = pg_catalog
+as $$
+declare
+  v_run public.runs;
+  v_target text;
+  v_rows integer;
+  -- The shortest quiet period ever accepted, whatever the caller asks for.
+  v_floor constant integer := 900;
+begin
+  if p_run_id is null or p_outcome is null or p_outcome not in ('launched', 'not_launched')
+     or p_operator is null or btrim(p_operator) = '' or char_length(p_operator) > 200 then
+    raise exception 'LOST_LAUNCH_INVALID' using errcode = '22023';
+  end if;
+  if p_min_quiet_seconds is null or p_min_quiet_seconds < v_floor then
+    raise exception 'LOST_LAUNCH_THRESHOLD_TOO_SHORT' using errcode = '22023';
+  end if;
+  v_target := case p_outcome when 'launched' then 'launched' else 'launch_failed' end;
+
+  select * into v_run from public.runs where id = p_run_id for update;
+  if v_run.id is null then
+    raise exception 'LOST_LAUNCH_NOT_FOUND' using errcode = 'P0002';
+  end if;
+  -- Already where the decision leads: the same answer, and nothing written.
+  if v_run.launch_state = v_target then
+    return jsonb_build_object('reconciled', false, 'run_id', v_run.id,
+                              'status', v_run.status, 'launch_state', v_run.launch_state);
+  end if;
+  -- The posture a lost launch leaves, and only that.
+  if v_run.status is distinct from 'queued' or v_run.launch_state is distinct from 'launching' then
+    raise exception 'LOST_LAUNCH_WRONG_STATE' using errcode = '55000';
+  end if;
+  -- No worker ever claimed it, and no lease is held.
+  if v_run.worker_id is not null or v_run.lease_token is not null
+     or v_run.lease_expires_at is not null or v_run.started_at is not null
+     or v_run.finished_at is not null then
+    raise exception 'LOST_LAUNCH_CLAIMED' using errcode = '55000';
+  end if;
+  -- Quiet for long enough that no launch request can still be in flight.
+  if v_run.updated_at > now() - make_interval(secs => p_min_quiet_seconds) then
+    raise exception 'LOST_LAUNCH_NOT_QUIET' using errcode = '55000';
+  end if;
+  -- "Not launched" only when nothing but the API ever wrote about the run.
+  if p_outcome = 'not_launched' and (
+       exists (select 1 from public.run_invocations where run_id = v_run.id)
+    or exists (select 1 from public.run_checkpoints where run_id = v_run.id)
+    or exists (select 1 from public.worker_heartbeats where run_id = v_run.id)
+    or exists (select 1 from public.run_usage_ledger where run_id = v_run.id)
+    or exists (select 1 from public.model_call_budget_reservations where run_id = v_run.id)
+    or exists (select 1 from public.run_blackboards where run_id = v_run.id)
+    or exists (select 1 from public.run_events e
+                where e.run_id = v_run.id and e.event_type <> 'launch_failed')) then
+    raise exception 'LOST_LAUNCH_TRACED' using errcode = '55000';
+  end if;
+
+  update public.runs
+     set launch_state = v_target,
+         launch_error = case when p_outcome = 'not_launched' then jsonb_build_object(
+           'code', 'RUN_LAUNCH_LOST',
+           'message', 'launch ownership was taken but its outcome was never recorded; '
+                      || 'an operator verified that no worker was started',
+           'reconciled_by', p_operator) else launch_error end
+   where id = v_run.id and status = 'queued' and launch_state = 'launching'
+     and worker_id is null and lease_token is null and started_at is null;
+  get diagnostics v_rows = row_count;
+  if v_rows <> 1 then
+    raise exception 'LOST_LAUNCH_CHANGED' using errcode = '40001';
+  end if;
+  if p_outcome = 'not_launched' then
+    -- The run's own history says why it can be launched again. Who decided is
+    -- in the operator's audit record, not in an event every member can read.
+    insert into public.run_events (run_id, event_type, message, payload)
+    values (v_run.id, 'launch_failed',
+            'The worker launch was never confirmed and an operator verified that no worker '
+            || 'was started; the run remains queued and can be launched again',
+            jsonb_build_object('recoverable', true, 'reconciled', true,
+                               'previous_launch_state', 'launching'));
+  end if;
+  return jsonb_build_object('reconciled', true, 'run_id', v_run.id, 'status', v_run.status,
+                            'launch_state', v_target, 'previous_launch_state', 'launching');
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 6. RLS and privileges: service-path only.
 -- ---------------------------------------------------------------------------
 alter table public.catalog_work_scope_controls enable row level security;
 
@@ -702,7 +836,8 @@ begin
     'public.set_work_scope_paused(uuid,boolean,uuid)',
     'public.bind_work_scope_batch_run(uuid,uuid,integer,text,uuid)',
     'public.create_work_scope_batch_run(uuid,uuid,integer,text,uuid,jsonb,text,jsonb,uuid,text,text,integer,integer)',
-    'public.work_scope_progress(uuid)'
+    'public.work_scope_progress(uuid)',
+    'public.reconcile_lost_launch(uuid,text,integer,text)'
   ] loop
     execute format('revoke execute on function %s from public', fn);
     if exists (select 1 from pg_roles where rolname='anon') then

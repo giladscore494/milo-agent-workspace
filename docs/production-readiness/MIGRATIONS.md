@@ -207,11 +207,23 @@ no existing relation depends on them.
 ### Scoped catalog PR3 (batch runs) — migration and rollback impact
 
 `20260924000100_catalog_work_scope_batch_runs.sql` adds one relation
-(`catalog_work_scope_controls`), its two triggers and five functions, and
+(`catalog_work_scope_controls`), its two triggers and six functions, and
 restates `bind_work_scope_batch_run` with its signature unchanged. It rewrites
 no row and backfills nothing; every existing binding keeps its meaning (a
 `completed` batch was already never re-bound; a `partial_success` one now is
 not either).
+
+One of the six, `reconcile_lost_launch`, writes to `runs`: it is an
+operator's guarded decision on a LOST launch (a run left at `queued` +
+`launching` after the API died mid-launch), called only by
+`scripts/release/reconcile-launch-unknown.sh` under the full protected apply
+guard. Only after proving, under the run's row lock, that no worker ever
+claimed the run and that it has been quiet for at least 15 minutes does it
+record `launched` (an execution exists) or -- when nothing but the API ever
+wrote about the run -- `launch_failed`, the existing requeue path, with one
+`launch_failed` event. It never launches anything and never touches
+`launch_unknown`, which keeps the tool's own guarded updates. No API or worker
+path calls it.
 
 Privileges: the new relation has RLS on with no policies; `PUBLIC`, `anon` and
 `authenticated` have nothing; `service_role` gets `SELECT, INSERT` and neither

@@ -32,6 +32,27 @@ surfaces `launch_state`, `launch_error_class` and
 `launch_reconciliation_required` (`backend/main.py`); the lease token is
 stripped from browser responses.
 
+A **lost launch** is a run left at `queued` + `launching`: the API took launch
+ownership with its compare-and-set and its process died before it recorded
+`launched`, `launch_failed` or `launch_unknown`. It is an unresolved launch,
+like `launch_unknown`: `launching` never means "not launched", so nothing
+relaunches it, nothing treats it as dead, and the Mapping Plan offers no
+Cancel for it (nothing would finalize the cancellation). The same tool
+resolves it: `reconcile-launch-unknown.sh` lists lost launches quiet for at
+least `--min-quiet-seconds` (default 1800, never under 900), and after the
+operator has checked Cloud Run for an execution of the run, it applies
+`confirmed-launched`, `confirmed-not-launched` or `leave-unresolved` under the
+same protected apply mode and audit. The two mutating decisions go through
+`public.reconcile_lost_launch` (migration `20260924000100`), which proves
+under the run's row lock that the run is still queued, that no worker ever
+claimed it (no worker, no lease, never started) and that it has been quiet
+for the threshold; `confirmed-not-launched` also requires that nothing but
+the API ever wrote about the run. It then moves the run to `launch_failed`,
+the existing requeue path: the same run is launched again only through the
+launch compare-and-set, by a person (the Mapping Plan's "Launch batch", or a
+replay of the original request) or after the tool's `requeue`. At most one
+worker ever executes a run: `claim_run_lease` grants one live lease.
+
 ## Worker leases
 
 `claim_run_lease` (migration `012`) atomically assigns worker id, attempt

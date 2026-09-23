@@ -387,12 +387,15 @@ def test_an_unlaunched_batch_is_launched_only_for_the_head_revision_never_cancel
         paused = wsb._progress_view({**raw, "paused": True,
                                      "live": {**live, "launch_state": launch_state}})["controls"]
         assert (paused["start"]["relaunch"], paused["start"]["blocked_by"]) == (False, "paused")
-    # A launch that happened, or may have, is never offered again, and CAN be
-    # cancelled: a worker exists, or may, to finalize the cancellation.
-    for launch_state in ("launching", "launched", "launch_unknown"):
+    # A launch that happened, or may have, is never offered again. Only one a
+    # worker will finalize can be cancelled: `launched`. An unresolved launch
+    # (`launching`, `launch_unknown`) may have no worker at all.
+    for launch_state, cancellable in (("launching", False), ("launched", True),
+                                      ("launch_unknown", False)):
         controls = wsb._progress_view({**raw, "live": {**live, "launch_state": launch_state}})[
             "controls"]
-        assert (controls["start"]["relaunch"], controls["cancel"]["available"]) == (False, True)
+        assert (controls["start"]["relaunch"], controls["cancel"]["available"]) == (
+            False, cancellable)
 
 
 # =============================================================================
@@ -867,6 +870,263 @@ def test_a_chat_run_cannot_read_the_catalog_outside_a_batch(monkeypatch):
         assert run["error"]["code"] == "GOVERNMENT_BATCH_REQUIRED"
     finally:
         app.dependency_overrides.clear()
+
+
+# =============================================================================
+# 6. a lost launch: reconciled by an operator, never relaunched by itself
+# =============================================================================
+
+class ApiProcessDied(BaseException):
+    """The API process died mid-request: no `except Exception` handler of the
+    launch step runs, so nothing after the launch compare-and-set is recorded."""
+
+
+def _died(exc: BaseException) -> bool:
+    # The test client re-raises it inside an exception group.
+    return isinstance(exc, ApiProcessDied) or (
+        isinstance(exc, BaseExceptionGroup) and exc.subgroup(ApiProcessDied) is not None)
+
+
+def _die_mid_launch(repo: MemoryRepository, plan: dict, batch: str, **body) -> str:
+    """The REAL start request: the API takes launch ownership -- its launch
+    compare-and-set -- and its process dies inside the launcher call, before it
+    records launched / launch_failed / launch_unknown."""
+    dying = RecordingLauncher(failure=ApiProcessDied())
+    previous = app.dependency_overrides.get(get_job_launcher)
+    app.dependency_overrides[get_job_launcher] = lambda: dying
+    try:
+        with pytest.raises(BaseException) as died:
+            post_start(repo, plan, batch, **body)
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(get_job_launcher, None)
+        else:
+            app.dependency_overrides[get_job_launcher] = previous
+    assert _died(died.value), died.value
+    run_id = dying.launched[0]
+    assert (repo.runs[run_id]["status"], repo.runs[run_id]["launch_state"]) == (
+        "queued", "launching")
+    return run_id
+
+
+def _quiet(repo: MemoryRepository, run_id: str, seconds: int = 3600) -> None:
+    """Nothing has written the run's row for `seconds`."""
+    from datetime import UTC, datetime, timedelta
+    repo.runs[run_id]["updated_at"] = (datetime.now(UTC) - timedelta(seconds=seconds)).isoformat()
+
+
+def _reconcile(repo: MemoryRepository, run_id: str, outcome: str = "not_launched", *,
+               quiet: int = 1800) -> dict:
+    return repo.reconcile_lost_launch(UUID(run_id), outcome=outcome, min_quiet_seconds=quiet,
+                                      operator="operator@milo-prod.iam.gserviceaccount.com")
+
+
+def test_an_api_that_dies_after_taking_launch_ownership_leaves_a_launch_nothing_relaunches(
+        launcher, enabled, monkeypatch):
+    monkeypatch.setenv(wsb.RUN_CANCELLATION_FLAG, "true")
+    repo, plan = prepared()
+    first, second, _third = batch_ids(plan)
+    lost = _die_mid_launch(repo, plan, first, key="ui-lost-1")
+    # `launching` is not "not launched": replaying the very request, or a new
+    # one for the batch, answers with the same run and launches nothing.
+    for key in ("ui-lost-1", "ui-lost-1-again"):
+        again = post_start(repo, plan, first, key=key)
+        assert (again.status_code, again.json()["run_id"], again.json()["created"]) == (
+            202, lost, False)
+    assert launcher.launched == []
+    # The launch compare-and-set itself refuses it: no second worker.
+    assert repo.try_acquire_launch(UUID(lost)) is None
+    assert repo.runs[lost]["launch_state"] == "launching"
+    held = post_start(repo, plan, second)
+    assert (held.status_code, held.json()["error"]["code"]) == (409, "WORK_SCOPE_BATCH_NOT_NEXT")
+    progress = get_progress(repo, plan).json()
+    assert progress["live"]["launch_state"] == "launching"
+    controls = progress["controls"]
+    # Neither relaunched nor offered Cancel: a cancellation nobody finalizes
+    # would hold the plan for good.
+    assert (controls["start"]["available"], controls["start"]["relaunch"],
+            controls["start"]["blocked_by"], controls["cancel"]["available"]) == (
+        False, False, "batch_running", False)
+    assert counts(repo, plan) == (1, 1, 1)
+
+
+@pytest.mark.parametrize("status,launch_state,cancellable", [
+    ("queued", "pending", False),
+    ("queued", "launch_failed", False),
+    ("queued", "launching", False),
+    ("queued", "launch_unknown", False),
+    ("queued", "launched", True),
+    ("starting", "launching", True),
+    ("running", "launched", True),
+    ("waiting", "launch_unknown", True),
+    ("cancellation_requested", "launched", False),
+])
+def test_cancel_is_offered_only_for_a_run_a_worker_will_finalize(monkeypatch, status,
+                                                                  launch_state, cancellable):
+    for flag in (BATCHES, RUN_CREATION, wsb.RUN_CANCELLATION_FLAG):
+        monkeypatch.setenv(flag, "true")
+    live = {"batch_id": str(uuid4()), "batch_number": 1, "revision": 1, "unit_key": "toyota",
+            "item_count": 10, "attempt": 1, "run_id": str(uuid4()), "run_status": status,
+            "launch_state": launch_state}
+    raw = {"work_scope_id": str(uuid4()), "revision": 1, "digest": "a" * 64, "closed": False,
+           "paused": False, "live": live, "preparation": None}
+    controls = wsb._progress_view(raw)["controls"]
+    assert controls["cancel"] == {"available": cancellable, "run_id": live["run_id"]}
+    # Only a launch that never happened or definitely failed is launched again.
+    assert controls["start"]["relaunch"] is (
+        status == "queued" and launch_state in ("pending", "launch_failed"))
+
+
+def test_an_uncertain_launch_offers_no_cancel_and_a_launched_run_does(launcher, enabled,
+                                                                      monkeypatch):
+    monkeypatch.setenv(wsb.RUN_CANCELLATION_FLAG, "true")
+    repo, plan = prepared()
+    first = batch_ids(plan)[0]
+    uncertain = RecordingLauncher(failure=JobLaunchUncertain("maybe"))
+    app.dependency_overrides[get_job_launcher] = lambda: uncertain
+    response = post_start(repo, plan, first)
+    assert response.json()["error"]["code"] == "JOB_LAUNCH_UNKNOWN"
+    unknown = uncertain.launched[0]
+    assert get_progress(repo, plan).json()["controls"]["cancel"] == {
+        "available": False, "run_id": unknown}
+    # The operator found the execution: `launched`, and now a worker will
+    # finalize a cancellation, so it is offered.
+    repo.runs[unknown]["launch_state"] = "launched"
+    assert get_progress(repo, plan).json()["controls"]["cancel"] == {
+        "available": True, "run_id": unknown}
+
+
+@pytest.mark.parametrize("posture,code", [
+    ({"launch_state": "launch_unknown"}, "LOST_LAUNCH_WRONG_STATE"),
+    ({"launch_state": "pending"}, "LOST_LAUNCH_WRONG_STATE"),
+    ({"launch_state": "launched"}, "LOST_LAUNCH_WRONG_STATE"),
+    ({"status": "starting", "worker_id": "worker-1"}, "LOST_LAUNCH_WRONG_STATE"),
+    ({"status": "cancellation_requested"}, "LOST_LAUNCH_WRONG_STATE"),
+    ({"lease_token": "t" * 64, "lease_expires_at": "2999-01-01T00:00:00+00:00"},
+     "LOST_LAUNCH_CLAIMED"),
+    ({"worker_id": "worker-1"}, "LOST_LAUNCH_CLAIMED"),
+    ({"started_at": "2026-09-23T00:00:00+00:00"}, "LOST_LAUNCH_CLAIMED"),
+])
+def test_only_a_quiet_unclaimed_lost_launch_is_ever_reconciled(launcher, enabled, posture, code):
+    repo, plan = prepared()
+    lost = _die_mid_launch(repo, plan, batch_ids(plan)[0])
+    repo.runs[lost].update(posture)
+    _quiet(repo, lost)
+    before = dict(repo.runs[lost])
+    for outcome in ("not_launched", "launched"):
+        if outcome == "launched" and posture == {"launch_state": "launched"}:
+            continue  # already where that decision leads: an idempotent no-op
+        refused(code, _reconcile, repo, lost, outcome)
+    assert repo.runs[lost] == before
+    assert launcher.launched == []
+
+
+def test_not_launched_is_refused_when_more_than_the_api_wrote_about_the_run(launcher, enabled):
+    repo, plan = prepared()
+    lost = _die_mid_launch(repo, plan, batch_ids(plan)[0])
+    # The launcher's own record: the launch DID happen before the API died.
+    repo.record_run_invocation(UUID(lost), {"mode": "cloud_run", "execution": "exec-1"})
+    _quiet(repo, lost)
+    refused("LOST_LAUNCH_TRACED", _reconcile, repo, lost)
+    assert repo.runs[lost]["launch_state"] == "launching"
+    # ... which is exactly what `launched` records.
+    assert _reconcile(repo, lost, "launched")["launch_state"] == "launched"
+
+
+def test_an_operator_reconciles_a_lost_launch_and_the_plan_continues_without_duplicate_execution(
+        monkeypatch):
+    swarm_env(monkeypatch, **{CATALOG_EXECUTION_FLAG: "true", GOVERNMENT_READ_FLAG: "true",
+                              CATALOG_PROMOTION_FLAG: "false", BATCHES: "true",
+                              wsb.RUN_CANCELLATION_FLAG: "true",
+                              "MILO_RATE_LIMIT_RUN_CREATION_PROJECT": "1000"})
+    completions = FakeKimiCompletions()
+    patch_client(monkeypatch, completions)
+    repo, plan = prepared()
+    first, second, _third = batch_ids(plan)
+    lost = _die_mid_launch(repo, plan, first, key="ui-lost-plan-1")
+
+    # Never while a launch request could still be in flight, never below the floor.
+    refused("LOST_LAUNCH_NOT_QUIET", _reconcile, repo, lost)
+    refused("LOST_LAUNCH_THRESHOLD_TOO_SHORT", _reconcile, repo, lost, quiet=60)
+    _quiet(repo, lost)
+    # The operator checked Cloud Run and found no execution of the run.
+    assert _reconcile(repo, lost) == {"reconciled": True, "run_id": lost, "status": "queued",
+                                      "launch_state": "launch_failed",
+                                      "previous_launch_state": "launching"}
+    assert (repo.runs[lost]["status"], repo.runs[lost]["launch_error"]["code"]) == (
+        "queued", "RUN_LAUNCH_LOST")
+    assert _reconcile(repo, lost)["reconciled"] is False
+    events = [e for e in repo.run_events if e["run_id"] == lost]
+    assert [e["event_type"] for e in events] == ["launch_failed"]
+    assert events[0]["payload"] == {"recoverable": True, "reconciled": True,
+                                    "previous_launch_state": "launching"}
+
+    # The existing retry path: the SAME run is offered for launch, and nothing
+    # launched it by itself.
+    progress = get_progress(repo, plan).json()
+    assert (progress["live"]["run_id"], progress["live"]["launch_state"]) == (lost, "launch_failed")
+    controls = progress["controls"]
+    assert (controls["start"]["available"], controls["start"]["relaunch"],
+            controls["start"]["batch"]["batch_id"], controls["cancel"]["available"]) == (
+        True, True, first, False)
+    assert counts(repo, plan) == (1, 1, 1)
+
+    inline = InlineWorkerLauncher(repo)
+    app.dependency_overrides[get_job_launcher] = lambda: inline
+    try:
+        # A person confirms "Launch batch 1": the same run, launched once, run once.
+        launched = post_start(repo, plan, first)
+        assert launched.status_code == 202, launched.text
+        assert (launched.json()["run_id"], launched.json()["created"]) == (lost, False)
+        assert inline.launches == [lost] and inline.exit_codes == [0]
+        assert repo.runs[lost]["status"] in {"completed", "partial_success"}
+        calls = len(completions.calls)
+        assert calls, "the relaunched run did the batch's work"
+        # The lost launch's own worker, arriving late, finds a finished run and
+        # executes nothing: at most one worker ever executes the run.
+        assert worker_main.execute_run(UUID(lost), repo) == 0
+        assert len(completions.calls) == calls
+        # A second click launches nothing: the batch is settled.
+        again = post_start(repo, plan, first)
+        assert again.status_code == 409 and inline.launches == [lost]
+
+        # Continuation: the next batch starts only on a person's request.
+        progress = get_progress(repo, plan).json()
+        assert progress["live"] is None
+        assert progress["preparation"]["batches"]["settled"] == 1
+        assert progress["controls"]["start"]["batch"]["batch_id"] == second
+        continued = post_start(repo, plan, second)
+        assert continued.status_code == 202, continued.text
+        assert continued.json()["created"] is True and continued.json()["run_id"] != lost
+        assert inline.launches == [lost, continued.json()["run_id"]]
+        assert repo.runs[continued.json()["run_id"]]["status"] in {"completed", "partial_success"}
+    finally:
+        app.dependency_overrides.clear()
+    assert get_progress(repo, plan).json()["preparation"]["batches"]["settled"] == 2
+    assert counts(repo, plan) == (2, 2, 2)
+
+
+def test_a_lost_launch_confirmed_launched_is_run_once_by_its_worker(monkeypatch):
+    swarm_env(monkeypatch, **{CATALOG_EXECUTION_FLAG: "true", GOVERNMENT_READ_FLAG: "true",
+                              CATALOG_PROMOTION_FLAG: "false", BATCHES: "true",
+                              wsb.RUN_CANCELLATION_FLAG: "true",
+                              "MILO_RATE_LIMIT_RUN_CREATION_PROJECT": "1000"})
+    completions = FakeKimiCompletions()
+    patch_client(monkeypatch, completions)
+    repo, plan = prepared()
+    lost = _die_mid_launch(repo, plan, batch_ids(plan)[0])
+    _quiet(repo, lost)
+    # The operator found the execution the dead API had started.
+    assert _reconcile(repo, lost, "launched")["launch_state"] == "launched"
+    controls = get_progress(repo, plan).json()["controls"]
+    # A worker exists to finalize a cancellation now; nothing is relaunched.
+    assert (controls["start"]["relaunch"], controls["cancel"]["available"]) == (False, True)
+    assert worker_main.execute_run(UUID(lost), repo) == 0
+    calls = len(completions.calls)
+    assert calls and repo.runs[lost]["status"] in {"completed", "partial_success"}
+    # A second worker for the same run executes nothing.
+    assert worker_main.execute_run(UUID(lost), repo) == 0
+    assert len(completions.calls) == calls
 
 
 def test_the_seed_starts_through_the_same_service_path():
