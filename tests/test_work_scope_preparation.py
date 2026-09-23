@@ -790,9 +790,24 @@ def test_the_capture_job_execution_keeps_the_entrypoint_module():
     execute = script.split("execute_job() {")[1].split("\n}\n")[0]
     assert '--args "-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}"' in execute
     assert '--args "$args_csv"' not in execute
+    # The execution name is gcloud's STDOUT alone: stderr is never folded into
+    # it, and no line is picked out of mixed output.
+    assert "2>&1" not in execute and "tail" not in execute
 
 
-def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False):
+#: What the mock `gcloud logging read` answers unless a test says otherwise.
+SUCCEEDED_DOCUMENT = {"entrypoint": "catalog.government.capture", "status": "succeeded",
+                      "reason_code": "", "reason": "",
+                      "work_scope": {"queued_item_count": 23, "batch_count": 3}}
+#: The advisory real gcloud prints to STDERR after an execution, which must
+#: never become the execution name.
+GCLOUD_ADVISORY = ("Or visit https://console.cloud.google.com/run/jobs/executions/details/"
+                   "us-central1/test-capture-execution-1?project=test-project")
+
+
+def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
+                    execution_stdout: str = "test-capture-execution-1\n",
+                    execution_exit: int = 0, document: dict | None = None):
     import os
     import subprocess
 
@@ -806,21 +821,30 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False):
         bin_dir.mkdir()
         log = tmp_path / "gcloud.log"
         mock = bin_dir / "gcloud"
+        # `run jobs execute` prints its machine-readable answer to STDOUT and
+        # then, like real gcloud, advisory text to STDERR -- flushed in that
+        # order, so output that mixes the two streams ends with the advisory.
         mock.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, sys\n"
             "with open(os.environ['MOCK_GCLOUD_LOG'], 'a') as handle:\n"
             "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1:4] == ['run', 'jobs', 'execute']:\n"
-            "    print('test-capture-execution-1')\n"
+            "    sys.stdout.write(os.environ['MOCK_GCLOUD_EXECUTION_STDOUT'])\n"
+            "    sys.stdout.flush()\n"
+            "    sys.stderr.write(os.environ['MOCK_GCLOUD_ADVISORY'] + '\\n')\n"
+            "    sys.stderr.flush()\n"
+            "    sys.exit(int(os.environ['MOCK_GCLOUD_EXECUTION_EXIT']))\n"
             "elif sys.argv[1:3] == ['logging', 'read']:\n"
-            "    print(json.dumps({'entrypoint': 'catalog.government.capture',\n"
-            "                      'status': 'succeeded', 'reason_code': '', 'reason': '',\n"
-            "                      'work_scope': {'queued_item_count': 23, 'batch_count': 3}}))\n",
+            "    print(os.environ['MOCK_GCLOUD_DOCUMENT'])\n",
             encoding="utf-8")
         mock.chmod(0o755)
         env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
         env["MOCK_GCLOUD_LOG"] = str(log)
+        env["MOCK_GCLOUD_EXECUTION_STDOUT"] = execution_stdout
+        env["MOCK_GCLOUD_EXECUTION_EXIT"] = str(execution_exit)
+        env["MOCK_GCLOUD_ADVISORY"] = GCLOUD_ADVISORY
+        env["MOCK_GCLOUD_DOCUMENT"] = json.dumps(document or SUCCEEDED_DOCUMENT)
     result = subprocess.run(
         ["bash", str(REPO / "scripts/catalog/government-production-capture.sh"),
          "--prepare-work-scope", "--operator-config", str(_fake_config(tmp_path)), *extra],
@@ -855,7 +879,19 @@ def test_the_scoped_capture_mode_runs_the_entrypoint_with_one_execution_override
     assert result.returncode == 0, result.stderr
     assert "WORK_SCOPE_PREPARATION_STATUS=succeeded" in result.stdout
     assert "WORK_SCOPE_QUEUED_ITEMS=23" in result.stdout
+    assert "WORK_SCOPE_BATCHES=3" in result.stdout
+    # The execution is EXACTLY the name gcloud printed on stdout: the advisory
+    # it printed to stderr afterwards reached the operator, never the name.
+    executions = [line for line in result.stdout.splitlines() if line.startswith("Execution: ")]
+    assert executions == ["Execution: test-capture-execution-1"]
+    assert GCLOUD_ADVISORY in result.stderr
+    assert "Or visit" not in result.stdout
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    # Cloud Logging is read for that exact execution, and only for it.
+    reads = [call for call in calls if call[:2] == ["logging", "read"]]
+    assert [call[2] for call in reads] == [
+        'resource.type=cloud_run_job AND '
+        'labels."run.googleapis.com/execution_name"=test-capture-execution-1']
     execute = next(call for call in calls if call[:3] == ["run", "jobs", "execute"])
     args = execute[execute.index("--args") + 1].split(",")
     # The module FIRST, because --args replaces the job's own container args.
@@ -869,6 +905,48 @@ def test_the_scoped_capture_mode_runs_the_entrypoint_with_one_execution_override
         "MILO_ENABLE_WORK_SCOPE_PREPARATION=true"
     assert not any(call[:3] == ["run", "jobs", "update"] or call[:3] == ["run", "jobs", "create"]
                    for call in calls)
+
+
+@pytest.mark.parametrize("execution_stdout,execution_exit", [
+    ("", 1),                                    # a failed execution: nothing on stdout
+    ("", 0),                                    # nothing at all
+    (GCLOUD_ADVISORY + "\n", 0),                 # prose where the name belongs
+    ("test-capture-execution-1\ntest-capture-execution-2\n", 0),  # two names
+    ("Test-Capture-Execution-1\n", 0),           # not a Cloud Run execution name
+    ("test-capture-execution-1 \n", 0),          # trailing text on the line
+])
+def test_the_scoped_capture_mode_fails_closed_without_one_exact_execution_name(
+        tmp_path, execution_stdout, execution_exit):
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution",
+                                  "--enable-work-scope-preparation", *SCOPED_VALUES, gcloud=True,
+                                  execution_stdout=execution_stdout,
+                                  execution_exit=execution_exit)
+    assert result.returncode != 0
+    assert "printed no single well-formed execution name on stdout" in result.stderr
+    assert "WORK_SCOPE_PREPARATION_STATUS" not in result.stdout
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    assert [call[:3] for call in calls] == [["run", "jobs", "execute"]]
+    # No log is read for an execution that cannot be named exactly.
+    assert not any(call[:2] == ["logging", "read"] for call in calls)
+
+
+def test_a_named_execution_that_gcloud_reports_failed_is_judged_by_its_own_document(tmp_path):
+    refused = {"entrypoint": "catalog.government.capture", "status": "refused",
+               "reason_code": "WORK_SCOPE_STALE", "reason": "the plan changed"}
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution",
+                                  "--enable-work-scope-preparation", *SCOPED_VALUES, gcloud=True,
+                                  execution_exit=1, document=refused)
+    assert result.returncode != 0
+    assert "WARN: gcloud run jobs execute exited 1 for execution test-capture-execution-1" \
+        in result.stderr
+    assert "WORK_SCOPE_PREPARATION_STATUS=refused" in result.stdout
+    assert "work-scope preparation did not succeed" in result.stderr
+    assert "WORK_SCOPE_STALE" in result.stderr
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    reads = [call for call in calls if call[:2] == ["logging", "read"]]
+    assert [call[2] for call in reads] == [
+        'resource.type=cloud_run_job AND '
+        'labels."run.googleapis.com/execution_name"=test-capture-execution-1']
 
 
 def test_the_capture_job_definition_pins_scoped_preparation_off():

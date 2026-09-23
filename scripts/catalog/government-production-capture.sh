@@ -33,10 +33,13 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# Read by operator-config.sh, sourced below. ShellCheck sees that use only when
+# it follows the source (CI runs it with -x); run bare, it would not.
+# shellcheck disable=SC2034
 MILO_REPO_ROOT="$REPO_ROOT"
-# shellcheck source=../deploy/operator-config.sh
+# shellcheck source=../deploy/operator-config.sh disable=SC1091
 source "${REPO_ROOT}/scripts/deploy/operator-config.sh"
-# shellcheck source=../deploy/deployment-contract.sh
+# shellcheck source=../deploy/deployment-contract.sh disable=SC1091
 source "${REPO_ROOT}/scripts/deploy/deployment-contract.sh"
 
 MODE="plan" MILO_OPERATOR_CONFIG_PATH="" CATALOG_EXECUTION_VALUE="" RUN_ID=""
@@ -177,6 +180,10 @@ ensure_job() {
     --tasks 1
 }
 
+# A Cloud Run execution name: lowercase letters, digits and hyphens, starting
+# with a letter and ending with a letter or digit. Nothing else is a name.
+MILO_CAPTURE_EXECUTION_NAME_PATTERN='^[a-z]([-a-z0-9]{0,126}[a-z0-9])?$'
+
 # Runs the job with the given entrypoint arguments and echoes the execution
 # name. --wait blocks until the execution terminalizes.
 #
@@ -186,13 +193,27 @@ ensure_job() {
 # own arguments ran `python --prepare ...` -- not the entrypoint at all. Every
 # execution therefore restates the module first. Any further arguments are
 # per-execution overrides (the scoped mode's one --update-env-vars).
+#
+# The name is read from gcloud's STDOUT alone: `--format='value(metadata.name)'`
+# is its machine-readable answer. Progress and advisory text (such as
+# "Or visit https://console.cloud.google.com/...") goes to stderr, which
+# reaches the operator's terminal and is never read as the name. Anything but
+# exactly one well-formed name -- nothing, several lines, prose -- fails closed:
+# Cloud Logging is only ever read for an execution named exactly.
 execute_job() {
-  local args_csv="$1" execution
+  local args_csv="$1" execution="" gcloud_status=0
   shift
   execution="$(gcloud run jobs execute "$CAPTURE_JOB" \
     --region "$REGION" --project "$PROJECT_ID" \
     --args "-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}" "$@" \
-    --wait --format='value(metadata.name)' 2>&1 | tail -1)"
+    --wait --format='value(metadata.name)')" || gcloud_status=$?
+  if [[ ! "$execution" =~ $MILO_CAPTURE_EXECUTION_NAME_PATTERN ]]; then
+    fail "gcloud run jobs execute (exit ${gcloud_status}) printed no single well-formed execution name on stdout; no Cloud Logging read is attempted for an execution that cannot be named exactly. List this job's executions with: gcloud run jobs executions list --job ${CAPTURE_JOB} --region ${REGION} --project ${PROJECT_ID}"
+  fi
+  if (( gcloud_status != 0 )); then
+    printf 'WARN: gcloud run jobs execute exited %s for execution %s; its own document states the outcome.\n' \
+      "$gcloud_status" "$execution" >&2
+  fi
   printf '%s' "$execution"
 }
 
