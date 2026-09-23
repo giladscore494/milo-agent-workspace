@@ -204,6 +204,11 @@ ensure_job() {
     verb="update"
   fi
   printf 'Capture job: %s (%s)\n' "$CAPTURE_JOB" "$verb"
+  # --args is always written --args=VALUE: the value starts with "-m", and
+  # gcloud's argument parser reads a separate "-m,..." token as a flag, so
+  # `--args "-m,..."` fails with "argument --args: expected one argument"
+  # before anything is created or executed (the stage-c/-d probe scripts
+  # already use the = form for the same reason).
   # --max-retries 0: a capture that failed halfway must be inspected, not
   # silently re-attempted. The snapshot contract already makes a deliberate
   # re-run safe; an automatic one would hide the reason the first failed.
@@ -213,7 +218,7 @@ ensure_job() {
     --project "$PROJECT_ID" \
     --service-account "$CAPTURE_SA" \
     --command python \
-    --args "-m,${MILO_CAPTURE_ENTRYPOINT_MODULE}" \
+    --args="-m,${MILO_CAPTURE_ENTRYPOINT_MODULE}" \
     --set-env-vars "$(build_env_args)" \
     --set-secrets "$(build_secret_args)" \
     --max-retries 0 \
@@ -247,7 +252,7 @@ execute_job() {
   require_job_on_release_image
   execution="$(gcloud run jobs execute "$CAPTURE_JOB" \
     --region "$REGION" --project "$PROJECT_ID" \
-    --args "-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}" "$@" \
+    --args="-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}" "$@" \
     --wait --format='value(metadata.name)')" || gcloud_status=$?
   if [[ ! "$execution" =~ $MILO_CAPTURE_EXECUTION_NAME_PATTERN ]]; then
     fail "gcloud run jobs execute (exit ${gcloud_status}) printed no single well-formed execution name on stdout; no Cloud Logging read is attempted for an execution that cannot be named exactly. List this job's executions with: gcloud run jobs executions list --job ${CAPTURE_JOB} --region ${REGION} --project ${PROJECT_ID}"
