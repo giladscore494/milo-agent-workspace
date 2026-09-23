@@ -291,16 +291,11 @@ done
 
 # No worker execution may be in flight: a capture or deploy during a live run
 # would change the release under a running claim.
-ACTIVE_EXECUTIONS="$(gcloud run jobs executions list --job "$WORKER_JOB" --region "$REGION" \
-  --project "$PROJECT_ID" --filter='status.completionTime:*' --format='value(metadata.name)' \
-  2> /dev/null | wc -l | tr -d ' ' || true)"
-ALL_EXECUTIONS="$(gcloud run jobs executions list --job "$WORKER_JOB" --region "$REGION" \
-  --project "$PROJECT_ID" --format='value(metadata.name)' 2> /dev/null | wc -l | tr -d ' ' || true)"
-if [[ "${ALL_EXECUTIONS:-0}" -eq "${ACTIVE_EXECUTIONS:-0}" ]]; then
-  record_check PASS "cloud-run:no-active-execution" "${ALL_EXECUTIONS:-0} execution(s), all terminal"
+if EXECUTION_CHECK="$(python3 "${SCRIPT_DIR}/check-worker-executions.py" \
+     "$WORKER_JOB" "$REGION" "$PROJECT_ID" 2>&1)"; then
+  record_check PASS "cloud-run:no-active-execution" "$EXECUTION_CHECK"
 else
-  record_check BLOCKED "cloud-run:no-active-execution" \
-    "a worker execution is still running; wait for it to terminalize before capturing or deploying"
+  record_check BLOCKED "cloud-run:no-active-execution" "$EXECUTION_CHECK"
 fi
 
 # Migration head, through the existing canonical checker.
