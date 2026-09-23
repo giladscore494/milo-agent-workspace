@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import socket
 from pathlib import Path
 from typing import Any, Mapping
@@ -797,8 +798,8 @@ def test_the_capture_job_execution_keeps_the_entrypoint_module():
     """
     script = (REPO / "scripts/catalog/government-production-capture.sh").read_text(encoding="utf-8")
     execute = script.split("execute_job() {")[1].split("\n}\n")[0]
-    assert '--args "-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}"' in execute
-    assert '--args "$args_csv"' not in execute
+    assert '--args="-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}"' in execute
+    assert '--args "$args_csv"' not in execute and '--args="$args_csv"' not in execute
     # The execution name is gcloud's STDOUT alone: stderr is never folded into
     # it, and no line is picked out of mixed output.
     assert "2>&1" not in execute and "tail" not in execute
@@ -869,6 +870,13 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
             "import json, os, sys\n"
             "with open(os.environ['MOCK_GCLOUD_LOG'], 'a') as handle:\n"
             "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "argv = sys.argv[1:]\n"
+            "for i, token in enumerate(argv):\n"
+            "    # Like gcloud's parser: a flag's separate value may not start with '-'.\n"
+            "    if token.startswith('--') and '=' not in token and i + 1 < len(argv) \\\n"
+            "            and argv[i + 1].startswith('-') and token in ('--args', '--command'):\n"
+            "        sys.stderr.write('ERROR: (gcloud) argument %s: expected one argument\\n' % token)\n"
+            "        sys.exit(2)\n"
             "if sys.argv[1:4] == ['run', 'jobs', 'execute']:\n"
             "    sys.stdout.write(os.environ['MOCK_GCLOUD_EXECUTION_STDOUT'])\n"
             "    sys.stdout.flush()\n"
@@ -941,7 +949,7 @@ def test_the_scoped_capture_mode_runs_the_entrypoint_with_one_execution_override
         'resource.type=cloud_run_job AND '
         'labels."run.googleapis.com/execution_name"=test-capture-execution-1']
     execute = next(call for call in calls if call[:3] == ["run", "jobs", "execute"])
-    args = execute[execute.index("--args") + 1].split(",")
+    args = _flag_value(execute, "--args").split(",")
     # The module FIRST, because --args replaces the job's own container args.
     assert args[:2] == ["-m", "backend.catalog.operator_capture"]
     assert args[2] == "--execute"
@@ -1002,6 +1010,16 @@ def _gcloud_calls(log) -> list[list[str]]:
     return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
 
 
+def _flag_value(call: list[str], flag: str) -> str:
+    """The value gcloud received for `flag`, whether passed as `flag=V` or `flag V`."""
+    for index, token in enumerate(call):
+        if token.startswith(flag + "="):
+            return token[len(flag) + 1:]
+        if token == flag:
+            return call[index + 1]
+    raise AssertionError(f"{flag} was not passed: {call}")
+
+
 @pytest.mark.parametrize("mode,extra", [
     ("--ensure-job", ()),
     ("--all", ()),
@@ -1046,6 +1064,10 @@ def test_ensure_job_points_the_job_at_the_release_image(tmp_path):
     create = next(call for call in calls if call[:3] in (["run", "jobs", "create"],
                                                         ["run", "jobs", "update"]))
     assert create[create.index("--image") + 1] == RELEASE_WORKER_IMAGE
+    # The job's container args are the entrypoint module, passed in the one
+    # form gcloud's parser accepts for a value that starts with "-".
+    assert "--args" not in create
+    assert _flag_value(create, "--args") == "-m,backend.catalog.operator_capture"
     image_check = calls.index(next(c for c in calls if c[:4] == ["artifacts", "docker", "images", "describe"]))
     assert image_check < calls.index(create)
 
@@ -1080,7 +1102,7 @@ def test_each_preparation_attempt_can_name_its_own_idempotency_key(tmp_path):
                                   mode="--prepare", document=prepared)
     assert result.returncode == 0, result.stderr
     execute = next(call for call in _gcloud_calls(log) if call[:3] == ["run", "jobs", "execute"])
-    args = execute[execute.index("--args") + 1].split(",")
+    args = _flag_value(execute, "--args").split(",")
     assert args[args.index("--idempotency-key") + 1] == "work-scope-attempt-20260923T120000Z"
     (tmp_path / "bad").mkdir()
     refused, _ = _capture_script(tmp_path / "bad", "--enable-catalog-execution",
@@ -1168,7 +1190,7 @@ def test_a_successful_whole_capture_is_accepted_and_verifies_exactly_its_snapsho
     # leads the execution's arguments.
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     execute = next(call for call in calls if call[:3] == ["run", "jobs", "execute"])
-    assert execute[execute.index("--args") + 1].split(",")[:3] == [
+    assert _flag_value(execute, "--args").split(",")[:3] == [
         "-m", "backend.catalog.operator_capture", "--execute"]
     assert [call[2] for call in calls if call[:2] == ["logging", "read"]] == [
         'resource.type=cloud_run_job AND '
@@ -1257,3 +1279,19 @@ def test_the_capture_job_definition_pins_scoped_preparation_off():
     assert 'MILO_WORK_SCOPE_PREPARATION_FLAG_NAME="MILO_ENABLE_WORK_SCOPE_PREPARATION"' in contract
     # Named once, as the entrypoint reads it.
     assert entrypoint.WORK_SCOPE_PREPARATION_FLAG == "MILO_ENABLE_WORK_SCOPE_PREPARATION"
+
+
+def test_no_operator_script_passes_a_dash_leading_args_value_as_a_separate_token():
+    """`gcloud ... --args "-m,..."` is refused by gcloud's own parser
+    ("argument --args: expected one argument"), so every --args whose value
+    starts with "-" must use the --args=VALUE form. This is the production
+    failure of `government-production-capture.sh --ensure-job` on 2026-09-24.
+    """
+    offenders = []
+    for path in sorted((REPO / "scripts").rglob("*.sh")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if re.search(r"""--args\s+["']?-""", line):
+                offenders.append(f"{path.relative_to(REPO)}:{number}: {line.strip()}")
+    assert offenders == []
