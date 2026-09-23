@@ -3812,7 +3812,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
         "20260916090000_catalog_bounded_candidate_queries.sql",
         "20260916120000_catalog_field_level_promotion.sql",
         "20260922000100_catalog_work_scopes.sql",
-        "20260923000100_catalog_work_scope_preparation.sql"]
+        "20260923000100_catalog_work_scope_preparation.sql",
+        "20260924000100_catalog_work_scope_batch_runs.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
@@ -3821,7 +3822,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
     assert before == str(len(CATALOG_STAGING_TABLES) + len(CATALOG_CANONICAL_TABLES)
                          + len(CATALOG_PROVENANCE_TABLES) + len(CATALOG_VIEWS)
                          + len(CATALOG_WORK_SCOPE_TABLES)
-                         + len(CATALOG_WORK_SCOPE_PREPARATION_TABLES))
+                         + len(CATALOG_WORK_SCOPE_PREPARATION_TABLES)
+                         + len(CATALOG_WORK_SCOPE_CONTROL_TABLES))
     _reapply_catalog_migrations(db)
     _reapply_catalog_migrations(db)
     assert db.psql(
@@ -7966,6 +7968,13 @@ def test_a_bound_run_reads_exactly_its_batch(db):
     run = _wsp_swarm_run(db, world["conversation"])
     assert db.psql(f"select coalesce(public.work_scope_batch_for_run('{run}')::text, 'null')") \
         == "null"
+    # Batches run in order (20260924000100): the first one settles before the
+    # second can be bound.
+    first_run = _wsp_swarm_run(db, world["conversation"])
+    _rpc_as_service(db, "select public.bind_work_scope_batch_run("
+                        f"'{summary['batches'][0]['id']}', '{first_run}', 1, "
+                        f"'{world['digest']}', '{world['user']}')")
+    db.psql(f"update public.runs set status='completed' where id='{first_run}'")
     second = summary["batches"][1]["id"]
     _rpc_as_service(db, f"select public.bind_work_scope_batch_run('{second}', '{run}', 1, "
                         f"'{world['digest']}', '{world['user']}')")
@@ -8010,8 +8019,382 @@ def test_preparation_rows_are_immutable_service_only_and_rerun_safe(db):
             assert not _has_execute(db, role, signature), signature
         assert _has_execute(db, "service_role", signature), signature
     before = db.psql("select count(*) from public.catalog_work_scope_queue_items")
-    db.psql(file=_wsp_migration())
-    db.psql(file=_wsp_migration())
+    # Replayed with every LATER catalog migration after it: rerun safety is a
+    # property of the ordered set, and 20260924000100 restates the binding.
+    later = CATALOG_MIGRATIONS[CATALOG_MIGRATIONS.index(_wsp_migration()):]
+    for _ in range(2):
+        for migration in later:
+            db.psql(file=migration)
     assert db.psql("select count(*) from public.catalog_work_scope_queue_items") == before
     assert db.psql("select count(*) from pg_constraint where conname="
                    "'catalog_source_snapshots_capture_scope_consistent'") == "1"
+
+
+# =============================================================================
+# Scoped catalog PR3 (20260924000100): batch runs, continuation and progress.
+# =============================================================================
+
+#: Scoped catalog PR3: the plan's append-only pause / resume history.
+CATALOG_WORK_SCOPE_CONTROL_TABLES = ("catalog_work_scope_controls",)
+
+WSB_TERMINAL = ("completed", "partial_success", "failed", "cancelled", "timed_out",
+                "budget_exhausted")
+
+
+def _wsb_migration():
+    return next(m for m in MIGRATIONS if m.name.startswith("20260924000100"))
+
+
+def _wsb_world(db, **scope_overrides) -> dict:
+    """A prepared plan: batches 1-3 of the Toyota unit (10, 10, 3 candidates)."""
+    world = _wsp_world(db, **scope_overrides)
+    summary = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],
+                           _wsp_units(world["snapshot"]))
+    world["batches"] = [batch["id"] for batch in summary["batches"]]
+    world["preparation"] = summary["preparation"]["id"]
+    return world
+
+
+def _wsb_start(db, world: dict, batch: str, *, key: str, revision: int = 1,
+               digest: str | None = None, by: str | None = None, fingerprint: str | None = None,
+               workflow_key: str = "swarm_v2", max_user: str = "null",
+               max_project: str = "null") -> dict:
+    """ONE call to the batch-run creator, as the API makes it."""
+    run_id = str(uuid.uuid4())
+    identity = _identity_json(run_id, workflow_key)
+    return json.loads(_rpc_as_service(
+        db, "select public.create_work_scope_batch_run("
+            f"'{world['plan']}', '{batch}', {revision}, '{digest or world['digest']}', "
+            f"'{run_id}', $j${identity}$j$::jsonb, 'Mapping plan batch', "
+            f"""'{{"requested_by": "{by or world['user']}"}}'::jsonb, """
+            f"'{by or world['user']}', '{key}', '{fingerprint or 'fp-' + key}', "
+            f"{max_user}, {max_project})"))
+
+
+def _wsb_counts(db, world: dict) -> tuple[str, str, str]:
+    """(Swarm V2 runs, messages, bindings) of the plan's conversation. The
+    operator capture run that prepared the plan is not counted."""
+    conversation = world["conversation"]
+    return (db.psql(f"select count(*) from public.runs where conversation_id='{conversation}' "
+                    "and run_identity->>'workflow_key' = 'swarm_v2'"),
+            db.psql(f"select count(*) from public.messages where conversation_id='{conversation}'"),
+            db.psql("select count(*) from public.catalog_work_scope_batch_runs "
+                    f"where work_scope_id='{world['plan']}'"))
+
+
+def _wsb_progress(db, plan: str) -> dict | None:
+    return json.loads(_rpc_as_service(
+        db, f"select coalesce(public.work_scope_progress('{plan}')::text, 'null')"))
+
+
+def _wsb_finish(db, run: str, status: str) -> None:
+    db.psql(f"update public.runs set status='{status}' where id='{run}'")
+
+
+def _wsb_pause(db, world: dict, paused: bool, *, by: str | None = None) -> dict:
+    return json.loads(_rpc_as_service(
+        db, f"select public.set_work_scope_paused('{world['plan']}', {str(paused).lower()}, "
+            f"'{by or world['user']}')"))
+
+
+def test_a_batch_run_is_created_and_bound_in_one_transaction(db):
+    world = _wsb_world(db)
+    first, second, _third = world["batches"]
+    started = _wsb_start(db, world, first, key="start-1")
+    assert started["created"] is True
+    run, binding = started["run"], started["binding"]
+    # ONE transaction wrote the message, the queued run with its immutable
+    # identity, and the binding.
+    assert (run["status"], run["launch_state"], run["conversation_id"]) == (
+        "queued", "pending", world["conversation"])
+    assert run["run_identity"]["workflow_key"] == "swarm_v2"
+    assert (binding["batch_id"], binding["run_id"], binding["attempt"]) == (first, run["id"], 1)
+    assert db.psql(f"select input->>'content' from public.runs where id='{run['id']}'") \
+        == "Mapping plan batch"
+    assert _wsb_counts(db, world) == ("1", "1", "1")
+
+    # The same request again is the same answer; nothing is written twice.
+    again = _wsb_start(db, world, first, key="start-1")
+    assert (again["created"], again["run"]["id"], again["binding"]["id"]) == (
+        False, run["id"], binding["id"])
+    with pytest.raises(AssertionError, match="IDEMPOTENCY_CONFLICT"):
+        _wsb_start(db, world, first, key="start-1", fingerprint="fp-something-else")
+    # A double submission with a FRESH key answers with the batch run already
+    # running, never a second run.
+    double = _wsb_start(db, world, first, key="start-1-bis")
+    assert (double["created"], double["run"]["id"]) == (False, run["id"])
+    # One batch at a time: the next batch waits for this one.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_IN_PROGRESS"):
+        _wsb_start(db, world, second, key="start-2")
+    assert _wsb_counts(db, world) == ("1", "1", "1")
+    # The worker reads exactly the batch the run was born with.
+    read = json.loads(_rpc_as_service(db, f"select public.work_scope_batch_for_run('{run['id']}')"))
+    assert read["batch"]["id"] == first and len(read["items"]) == 10
+
+
+def test_a_batch_start_fails_closed_and_writes_nothing(db):
+    world = _wsb_world(db)
+    first, second, _third = world["batches"]
+    refusals = {
+        "WORK_SCOPE_STALE": [dict(digest="0" * 64), dict(revision=2)],
+        "WORK_SCOPE_BATCH_NOT_NEXT": [dict(batch=second)],
+        "WORK_SCOPE_NOT_FOUND": [dict(by=str(uuid.uuid4()))],
+        "WORK_SCOPE_BATCH_RUN_INVALID": [dict(workflow_key="vehicle_catalog_v1")],
+        "USER_CONCURRENCY_LIMIT": [dict(max_user="0")],
+        "PROJECT_CONCURRENCY_LIMIT": [dict(max_project="0")],
+    }
+    stranger = refusals["WORK_SCOPE_NOT_FOUND"][0]["by"]
+    db.psql(f"insert into auth.users (id) values ('{stranger}')")
+    for code, cases in refusals.items():
+        for index, case in enumerate(cases):
+            batch = case.pop("batch", first)
+            with pytest.raises(AssertionError, match=code):
+                _wsb_start(db, world, batch, key=f"refused-{code}-{index}", **case)
+    # A batch of another plan is not this plan's batch.
+    other = _wsb_world(db)
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_NOT_FOUND"):
+        _wsb_start(db, world, other["batches"][0], key="foreign-batch")
+    # A start is always idempotent.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_IDEMPOTENCY_REQUIRED"):
+        _rpc_as_service(db, "select public.create_work_scope_batch_run("
+                            f"'{world['plan']}', '{first}', 1, '{world['digest']}', "
+                            f"'{uuid.uuid4()}', '{{}}'::jsonb, 'x', '{{}}'::jsonb, "
+                            f"'{world['user']}', null, 'fp', null, null)")
+    assert _wsb_counts(db, world) == ("0", "0", "0")
+    # A revised plan: the old revision's batches never start, and the new head
+    # has no batch until it is prepared.
+    _rpc_as_service(db, f"select public.revise_work_scope('{world['plan']}', 1, "
+                        f"'{world['digest']}', '{world['user']}', "
+                        f"{_ws_revision(_ws_scope(units=['toyota']))})")
+    head = db.psql(f"select head_digest from public.catalog_work_scopes where id='{world['plan']}'")
+    for revision, digest in ((1, world["digest"]), (2, head)):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+            _wsb_start(db, world, first, key=f"after-revise-{revision}", revision=revision,
+                       digest=digest)
+    assert _wsb_counts(db, world) == ("0", "0", "0")
+
+
+def test_continuation_runs_in_order_settles_and_retries_interrupted_batches(db):
+    world = _wsb_world(db)
+    first, second, third = world["batches"]
+
+    def start(batch: str, key: str) -> dict:
+        return _wsb_start(db, world, batch, key=key)
+
+    one = start(first, "c-1")
+    _wsb_finish(db, one["run"]["id"], "completed")
+    assert _wsb_progress(db, world["plan"])["preparation"]["next"]["batch_id"] == second
+    # Nothing is skipped, and a settled batch never runs again.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_NOT_NEXT"):
+        start(third, "c-3-early")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_ALREADY_COMPLETED"):
+        start(first, "c-1-again")
+    # An INTERRUPTED batch is the next batch again, as its next attempt.
+    two = start(second, "c-2")
+    _wsb_finish(db, two["run"]["id"], "failed")
+    progress = _wsb_progress(db, world["plan"])["preparation"]
+    assert (progress["next"]["batch_id"], progress["next"]["state"],
+            progress["next"]["attempts"]) == (second, "interrupted", 1)
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_NOT_NEXT"):
+        start(third, "c-3-after-failure")
+    retry = start(second, "c-2-retry")
+    assert retry["binding"]["attempt"] == 2
+    # partial_success SETTLES a batch: its run finished its work.
+    _wsb_finish(db, retry["run"]["id"], "partial_success")
+    for status in ("cancelled", "timed_out", "budget_exhausted"):
+        interrupted = start(third, f"c-3-{status}")
+        _wsb_finish(db, interrupted["run"]["id"], status)
+    last = start(third, "c-3-final")
+    assert last["binding"]["attempt"] == 4
+    _wsb_finish(db, last["run"]["id"], "completed")
+    progress = _wsb_progress(db, world["plan"])["preparation"]
+    assert progress["next"] is None
+    assert progress["batches"] == {"total": 3, "settled": 3, "active": 0, "interrupted": 0}
+    for batch in world["batches"]:
+        with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_ALREADY_COMPLETED"):
+            start(batch, f"c-done-{batch[:8]}")
+
+
+def test_pause_and_resume_are_append_only_and_hold_the_plan(db):
+    world = _wsb_world(db)
+    first = world["batches"][0]
+    paused = _wsb_pause(db, world, True)
+    assert (paused["changed"], paused["paused"], paused["control"]["sequence"],
+            paused["control"]["action"]) == (True, True, 1, "pause")
+    # Asking for the state the plan is already in writes nothing.
+    assert _wsb_pause(db, world, True)["changed"] is False
+    # A paused plan starts nothing, through either writer.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PAUSED"):
+        _wsb_start(db, world, first, key="paused-start")
+    run = _wsp_swarm_run(db, world["conversation"])
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PAUSED"):
+        _rpc_as_service(db, f"select public.bind_work_scope_batch_run('{first}', '{run}', 1, "
+                            f"'{world['digest']}', '{world['user']}')")
+    progress = _wsb_progress(db, world["plan"])
+    assert progress["paused"] is True and progress["control"]["action"] == "pause"
+    resumed = _wsb_pause(db, world, False)
+    assert (resumed["changed"], resumed["control"]["sequence"]) == (True, 2)
+    assert _wsb_pause(db, world, False)["changed"] is False
+    started = _wsb_start(db, world, first, key="resumed-start")
+    # Pausing never touches a batch that is already running.
+    _wsb_pause(db, world, True)
+    assert db.psql(f"select status from public.runs where id='{started['run']['id']}'") == "queued"
+    # Members only; and the history is append-only, in sequence, alternating.
+    stranger = str(uuid.uuid4())
+    db.psql(f"insert into auth.users (id) values ('{stranger}')")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_NOT_FOUND"):
+        _wsb_pause(db, world, False, by=stranger)
+    for statement in ("update public.catalog_work_scope_controls set action='resume'",
+                      "delete from public.catalog_work_scope_controls"):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_IMMUTABLE"):
+            db.psql(statement)
+    for sequence, action in ((4, "pause"), (9, "resume")):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_CONTROL_OUT_OF_SEQUENCE"):
+            db.psql("insert into public.catalog_work_scope_controls "
+                    "(work_scope_id, sequence, action, requested_by) values "
+                    f"('{world['plan']}', {sequence}, '{action}', '{world['user']}')")
+    assert db.psql("select string_agg(sequence || action, ',' order by sequence) from "
+                   f"public.catalog_work_scope_controls where work_scope_id='{world['plan']}'") \
+        == "1pause,2resume,3pause"
+
+
+def test_a_replay_that_would_launch_obeys_the_start_rules_as_they_stand_now(db):
+    world = _wsb_world(db)
+    first = world["batches"][0]
+    run = _wsb_start(db, world, first, key="replay-1")["run"]["id"]
+
+    def launch_state(state: str) -> None:
+        db.psql(f"update public.runs set launch_state='{state}' where id='{run}'")
+
+    # Replaying a run no worker was started for LAUNCHES it: that is a start,
+    # and a paused plan starts nothing.
+    _wsb_pause(db, world, True)
+    for state in ("pending", "launch_failed"):
+        launch_state(state)
+        with pytest.raises(AssertionError, match="WORK_SCOPE_PAUSED"):
+            _wsb_start(db, world, first, key="replay-1")
+    # A launch that happened, or may have, is only reported, never repeated.
+    for state in ("launching", "launched", "launch_unknown"):
+        launch_state(state)
+        assert _wsb_start(db, world, first, key="replay-1")["run"]["id"] == run
+    launch_state("launch_failed")
+    _wsb_pause(db, world, False)
+    again = _wsb_start(db, world, first, key="replay-1")
+    assert (again["created"], again["run"]["id"]) == (False, run)
+    # Revised past the batch: a stale revision never launches.
+    _rpc_as_service(db, f"select public.revise_work_scope('{world['plan']}', 1, "
+                        f"'{world['digest']}', '{world['user']}', "
+                        f"{_ws_revision(_ws_scope(units=['toyota']))})")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+        _wsb_start(db, world, first, key="replay-1")
+    launch_state("launched")
+    assert _wsb_start(db, world, first, key="replay-1")["run"]["id"] == run
+    # A closed plan starts nothing either.
+    launch_state("pending")
+    db.psql(f"update public.catalog_work_scopes set closed_at = now() where id='{world['plan']}'")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_NOT_EDITABLE"):
+        _wsb_start(db, world, first, key="replay-1")
+    assert _wsb_counts(db, world) == ("1", "1", "1")
+
+
+def test_progress_is_derived_from_bound_runs_and_their_promotion_events(db):
+    world = _wsb_world(db)
+    first, second, _third = world["batches"]
+    assert _wsb_progress(db, str(uuid.uuid4())) is None
+    progress = _wsb_progress(db, world["plan"])
+    assert (progress["revision"], progress["digest"], progress["paused"], progress["live"]) == (
+        1, world["digest"], False, None)
+    prepared = progress["preparation"]
+    assert prepared["next"] == {"batch_id": first, "batch_number": 1, "unit_key": "toyota",
+                                "item_count": 10, "first_position": 1, "state": "pending",
+                                "attempts": 0}
+    assert prepared["items"] == {"total": 23, "promoted": 0, "refused": 0, "unresolved": 0}
+    assert [unit["unit_key"] for unit in prepared["units"]] == ["toyota", "lexus"]
+    assert (prepared["units"][1]["state"], prepared["units"][1]["batch_count"]) == (
+        "register_unverified", 0)
+
+    run = _wsb_start(db, world, first, key="progress-1")["run"]["id"]
+    live = _wsb_progress(db, world["plan"])
+    assert (live["live"]["batch_id"], live["live"]["run_id"], live["live"]["run_status"],
+            live["live"]["launch_state"], live["live"]["revision"]) == (
+        first, run, "queued", "pending", 1)
+    assert live["preparation"]["batches"]["active"] == 1
+
+    keys = db.psql("select candidate_key from public.catalog_work_scope_queue_items "
+                   f"where batch_id='{first}' order by batch_position").splitlines()
+    outsider = db.psql("select candidate_key from public.catalog_work_scope_queue_items "
+                       f"where batch_id='{second}' order by batch_position limit 1")
+    events = [("catalog_variant_promoted", keys[0], True),
+              ("catalog_variant_promoted", keys[1], True),
+              ("catalog_promotion_refused", keys[2], False),
+              # Refused, then promoted by the same run: promoted.
+              ("catalog_promotion_refused", keys[3], False),
+              ("catalog_variant_promoted", keys[3], True),
+              # A "promoted" event that says it was not is no promotion.
+              ("catalog_variant_promoted", keys[4], False),
+              # A candidate queued in batch 2, promoted by batch 1's run.
+              ("catalog_variant_promoted", outsider, True),
+              # Not a candidate of this plan at all.
+              ("catalog_variant_promoted", "cc1." + "0" * 32, True)]
+    for event_type, key, promoted in events:
+        payload = json.dumps({"candidate_key": key, "promoted": promoted})
+        db.psql("insert into public.run_events (run_id, event_type, message, payload) values "
+                f"('{run}', '{event_type}', 'x', '{payload}'::jsonb)")
+    _wsb_finish(db, run, "completed")
+    progress = _wsb_progress(db, world["plan"])
+    prepared = progress["preparation"]
+    assert progress["live"] is None
+    assert prepared["recent"][0] == {"batch_id": first, "batch_number": 1, "unit_key": "toyota",
+                                     "item_count": 10, "state": "completed", "attempts": 1,
+                                     "run_id": run, "run_status": "completed", "promoted": 3,
+                                     "refused": 1, "unresolved": 6}
+    assert prepared["items"] == {"total": 23, "promoted": 4, "refused": 1, "unresolved": 6}
+    assert prepared["batches"] == {"total": 3, "settled": 1, "active": 0, "interrupted": 0}
+    toyota = prepared["units"][0]
+    assert (toyota["batch_count"], toyota["settled_batches"], toyota["active"],
+            toyota["promoted"], toyota["refused"], toyota["unresolved"]) == (3, 1, False, 4, 1, 6)
+    assert prepared["next"]["batch_id"] == second
+
+    # A batch still running when the plan is revised stays visible as live,
+    # with the revision it belongs to; the new head is not prepared.
+    running = _wsb_start(db, world, second, key="progress-2")["run"]["id"]
+    _rpc_as_service(db, f"select public.revise_work_scope('{world['plan']}', 1, "
+                        f"'{world['digest']}', '{world['user']}', "
+                        f"{_ws_revision(_ws_scope(units=['toyota']))})")
+    revised = _wsb_progress(db, world["plan"])
+    assert (revised["revision"], revised["preparation"]) == (2, None)
+    assert (revised["live"]["run_id"], revised["live"]["revision"]) == (running, 1)
+
+
+def test_batch_run_relations_are_service_only_and_rerun_safe(db):
+    world = _wsb_world(db)
+    _wsb_pause(db, world, True)
+    for table in CATALOG_WORK_SCOPE_CONTROL_TABLES:
+        assert db.psql(f"select relrowsecurity from pg_class where oid='public.{table}'::regclass") == "t"
+        assert db.psql(f"select count(*) from pg_policies where tablename='{table}'") == "0"
+        for role in ("anon", "authenticated"):
+            for privilege in ("select", "insert", "update", "delete"):
+                assert db.psql(f"select has_table_privilege('{role}', 'public.{table}', "
+                               f"'{privilege}')") == "f"
+        for privilege, granted in (("select", "t"), ("insert", "t"), ("update", "f"),
+                                   ("delete", "f")):
+            assert db.psql(f"select has_table_privilege('service_role', 'public.{table}', "
+                           f"'{privilege}')") == granted
+    for signature in (
+            "public.create_work_scope_batch_run(uuid, uuid, integer, text, uuid, jsonb, text, "
+            "jsonb, uuid, text, text, integer, integer)",
+            "public.set_work_scope_paused(uuid, boolean, uuid)",
+            "public.work_scope_progress(uuid)",
+            "public.work_scope_paused(uuid)",
+            "public.bind_work_scope_batch_run(uuid, uuid, integer, text, uuid)"):
+        for role in ("anon", "authenticated"):
+            assert not _has_execute(db, role, signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+    # The creator returns a SET, like the run creator it wraps.
+    assert db.psql("select bool_and(proretset) from pg_proc where proname="
+                   "'create_work_scope_batch_run'") == "t"
+    before = db.psql("select count(*) from public.catalog_work_scope_controls")
+    db.psql(file=_wsb_migration())
+    db.psql(file=_wsb_migration())
+    assert db.psql("select count(*) from public.catalog_work_scope_controls") == before
+    assert _wsb_progress(db, world["plan"])["paused"] is True

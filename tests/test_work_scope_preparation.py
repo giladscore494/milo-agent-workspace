@@ -281,8 +281,11 @@ def test_a_scoped_capture_declares_itself_and_never_answers_for_the_register():
         assert reader()["snapshot_key"] == register.snapshot_key
     assert [row["snapshot_key"] for row in repository.list_active_catalog_snapshots(
         src.GOVERNMENT_SOURCE_FAMILY, resource_id=src.WLTP_RESOURCE_ID)] == [register.snapshot_key]
-    # A run that is not batch-bound pins the register, exactly as before.
-    assert prepare_government_work(repository).snapshot_key == register.snapshot_key
+    # And no run pins either one unless the database binds it to a batch
+    # (scoped catalog PR3): an unbound run reads no snapshot at all.
+    with pytest.raises(GovernmentPreparationError) as unbound:
+        prepare_government_work(repository)
+    assert unbound.value.code == "GOVERNMENT_BATCH_REQUIRED"
 
     # A SCOPED read answers only from that scope, pinned or not.
     assert resolve_active_snapshot(repository, resource_id=src.WLTP_RESOURCE_ID, snapshot_key=None,
@@ -314,9 +317,6 @@ def test_with_only_scoped_snapshots_there_is_no_register_to_read():
         resolve_active_snapshot(repository, resource_id=src.WLTP_RESOURCE_ID, snapshot_key=None,
                                 allow_incomplete=False)
     assert refusal.value.reason_code == "GOV_PROJECTION_NO_ACTIVE_SNAPSHOT"
-    with pytest.raises(GovernmentPreparationError) as refusal:
-        prepare_government_work(repository)
-    assert refusal.value.code == "GOVERNMENT_SNAPSHOT_UNAVAILABLE"
 
 
 def test_a_scoped_capture_sends_its_own_query_and_is_never_adopted_unscoped():
@@ -592,7 +592,12 @@ def prepared_world(capsys) -> tuple[MemoryRepository, dict, dict]:
 
 def test_a_bound_run_is_prepared_from_exactly_its_batch_and_resumes_it(capsys):
     repository, world, summary = prepared_world(capsys)
-    second = summary["batches"][1]
+    first, second = summary["batches"][0], summary["batches"][1]
+    # Batches run in order (scoped catalog PR3): the first one settles first.
+    done = swarm_run(repository, world)
+    repository.bind_work_scope_batch_run(UUID(first["id"]), UUID(done), 1, world["digest"],
+                                         UUID(world["user"]))
+    repository.runs[done]["status"] = "completed"
     run = swarm_run(repository, world)
     repository.bind_work_scope_batch_run(UUID(second["id"]), UUID(run), 1, world["digest"],
                                          UUID(world["user"]))
@@ -611,12 +616,16 @@ def test_a_bound_run_is_prepared_from_exactly_its_batch_and_resumes_it(capsys):
     resumed = prepare_government_work(repository, run_id=run, checkpoint=checkpoint)
     assert resumed.resumed and resumed.queue == preparation.queue
     assert resumed.work_scope_batch == preparation.work_scope_batch
-    # The binding is the authority: another run cannot resume this record, and
-    # an unbound record cannot resume on a bound run.
+    # The binding is the authority: a run bound to another batch cannot resume
+    # this record, an unbound run executes nothing at all, and a record that
+    # names no batch never resumes.
+    with pytest.raises(GovernmentPreparationError) as refusal:
+        prepare_government_work(repository, run_id=done, checkpoint=checkpoint)
+    assert refusal.value.code == "GOVERNMENT_PREPARATION_RECORD_INVALID"
     other = swarm_run(repository, world)
     with pytest.raises(GovernmentPreparationError) as refusal:
         prepare_government_work(repository, run_id=other, checkpoint=checkpoint)
-    assert refusal.value.code == "GOVERNMENT_PREPARATION_RECORD_INVALID"
+    assert refusal.value.code == "GOVERNMENT_BATCH_REQUIRED"
     unbound = dict(artifact)
     unbound.pop(BATCH_ARTIFACT_KEY)
     with pytest.raises(GovernmentPreparationError) as refusal:

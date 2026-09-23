@@ -428,3 +428,26 @@ app.dependency_overrides[get_gateway_token_verifier] = lambda: E2ETokenVerifier(
 if os.getenv("MILO_E2E_INPROCESS_WORKER", "").lower() == "true":
     _launcher = InProcessFakeWorkerLauncher(_repo)
     app.dependency_overrides[get_job_launcher] = lambda: _launcher
+
+    from fastapi import Depends
+
+    from backend.testing.work_scope_seed import prepare_plan_head
+    from backend.worker_auth import WorkerIdentity, get_verified_worker
+
+    @app.post("/e2e/operator/work-scopes/{work_scope_id}/prepare")
+    def e2e_prepare_work_scope(work_scope_id: UUID,
+                               worker: WorkerIdentity = Depends(get_verified_worker)) -> dict:
+        """TEST-ONLY stand-in for the operator capture job's `--prepare-work-scope`.
+
+        In production a plan revision is prepared ONLY by the operator capture
+        job, never through the API; this enabled E2E stack has no capture job,
+        so this route performs the same preparation over the committed register
+        rows (`backend/testing/work_scope_seed.py`). It exists only in this
+        never-deployed module, only in the enabled stack, and answers only an
+        approved WORKER identity -- the gateway cannot reach it and a browser
+        token is refused, exactly like the internal worker routes.
+        """
+        del worker
+        summary = prepare_plan_head(_repo, work_scope_id)
+        return {"work_scope_id": summary["work_scope_id"], "revision": summary["revision"],
+                "batches": len(summary["batches"])}

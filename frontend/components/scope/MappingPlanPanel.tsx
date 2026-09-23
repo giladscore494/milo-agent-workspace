@@ -16,6 +16,7 @@ import {
   moveUnit,
   removeUnit,
 } from '@/lib/workScope';
+import { MappingPlanProgress, MappingPlanProgressProps } from './MappingPlanProgress';
 
 export type MappingPlanPanelProps = {
   /** Whether the surface applies at all: execution UI on, a conversation, and
@@ -41,6 +42,8 @@ export type MappingPlanPanelProps = {
   onSaveDraft: () => void;
   onDiscardDraft: () => void;
   onRetry: () => void;
+  /** The plan's batches, when this server lets a member start them. */
+  batches?: Omit<MappingPlanProgressProps, 'unitName'>;
 };
 
 const PROBLEM_COPY = {
@@ -63,9 +66,12 @@ const PROBLEM_COPY = {
  * ("Toyota first, then Mazda"), and a set of ticks cannot say that. Each entry
  * is moved with a named button, so priority is changeable from the keyboard.
  *
- * It is a PLAN. Nothing here prepares Government data, starts a batch, creates
- * a run or spends anything; the capability read says so and this panel repeats
- * it in words rather than leaving a button that does nothing.
+ * It is a PLAN. Nothing in the plan form prepares Government data, starts a
+ * batch, creates a run or spends anything. Once an operator has prepared the
+ * plan's current revision, and only where the server's capability read says
+ * batches may start, the Batches section shows the plan's progress and lets a
+ * person start the NEXT batch -- one confirmed batch, one run, at a time
+ * (`MappingPlanProgress`).
  *
  * Everything rendered comes from `lib/workScope.ts`'s parsers, through
  * `safeText`. Coverage is shown exactly as the server stated it: a marque whose
@@ -90,6 +96,7 @@ export function MappingPlanPanel({
   onSaveDraft,
   onDiscardDraft,
   onRetry,
+  batches,
 }: MappingPlanPanelProps) {
   const [filter, setFilter] = useState('');
   if (!visible || capabilities === undefined) return null;
@@ -133,8 +140,8 @@ export function MappingPlanPanel({
         {!open ? null : (
           <div className="panel-body">
             <p className="note">
-              {capabilities.canPrepare || capabilities.canStartBatches
-                ? 'Preparing Government data and starting batches are controlled by the server.'
+              {capabilities.canStartBatches
+                ? 'Each batch starts only when you start it, one at a time, and runs as one paid run. Preparing a revision’s Government data is an operator step.'
                 : 'Planning only: preparing Government data and starting batches are not available yet. Nothing here runs or spends anything.'}
             </p>
             {error && <p className="alert" role="alert">{safeText(error)}</p>}
@@ -143,6 +150,10 @@ export function MappingPlanPanel({
               <div className="button-row">
                 <button type="button" className="button button--quiet" onClick={onRetry}>Reload plan</button>
               </div>
+            )}
+
+            {hasPlan && capabilities.canStartBatches && batches !== undefined && (
+              <MappingPlanProgress {...batches} unitName={unitLabel} />
             )}
 
             <div className="field">

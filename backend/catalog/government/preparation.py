@@ -5,10 +5,19 @@ whose posture allows the Government read) reaches the provider in this order,
 and in no other::
 
     worker claims the run (run + worker + attempt + lease exist)
-      -> resolve and PIN one usable immutable Government snapshot
-      -> select a deterministic, bounded, resumable work queue from the
-         PERSISTED candidate state of that snapshot
+      -> read the Mapping Plan batch the database binds the run to
+      -> resolve and PIN that batch's one immutable scoped Government snapshot
+      -> take exactly the batch's candidates, in batch order, as the
+         deterministic, bounded, resumable work queue
       -> only then construct or reach any paid provider path
+
+Every catalog-reading run is BATCH-BOUND (scoped catalog PR3). A run the
+database binds to no batch is refused (`GOVERNMENT_BATCH_REQUIRED`) before any
+snapshot is read: there is no other execution scope for the catalog -- no
+"newest snapshot, first N candidates" -- so a chat request and the Mapping Plan
+can never be two different ways of choosing what a paid run works on. The
+reverse holds too: a batch-bound run in a deployment whose catalog read is off
+is refused (`GOVERNMENT_READ_REQUIRED`) rather than run without its work.
 
 Everything here is a READ of durable state plus one lease-guarded checkpoint.
 No upstream transport exists in this module and none is constructed by the
@@ -40,20 +49,21 @@ A resumed attempt therefore re-reads the SAME snapshot by its exact key
 (never "the newest usable one", which may have moved) and the SAME queue in
 the SAME order.
 
-A BATCH-BOUND run (scoped catalog PR2)
---------------------------------------
-When the durable binding table (`catalog_work_scope_batch_runs`, read through
-`work_scope_batch_for_run`) binds this run to a Mapping Plan batch, the run is
-handed EXACTLY that batch: its one scoped snapshot, pinned by key, and its
-items in batch order -- never "the newest usable snapshot" and never "the
-first N candidates". The binding is the authority, read from the database; a
-browser, the run input and the model can supply none of it. The record then
-carries the batch's identity, and a resume refuses unless the binding still
-names the same batch. A run bound to nothing behaves exactly as before. Per-item progress is not stored at all: it is reconstructed
-from durable state -- the run's own verified evidence rows
-(`catalog_run_pending_promotions`) and its durable promotion events -- so a
-crash between two writes cannot leave the queue claiming progress the
-database does not hold.
+The batch (scoped catalog PR2, required since PR3)
+--------------------------------------------------
+The durable binding table (`catalog_work_scope_batch_runs`, read through
+`work_scope_batch_for_run`) binds the run to ONE Mapping Plan batch, in the same
+transaction that created the run. The run is handed EXACTLY that batch: its one
+scoped snapshot, pinned by key, and its items in batch order -- never "the
+newest usable snapshot" and never "the first N candidates". The binding is the
+authority, read from the database; a browser, the run input and the model can
+supply none of it. The record carries the batch's identity, and a resume
+refuses unless the binding still names the same batch.
+
+Per-item progress is not stored at all: it is reconstructed from durable state
+-- the run's own verified evidence rows (`catalog_run_pending_promotions`) and
+its durable promotion events -- so a crash between two writes cannot leave the
+queue claiming progress the database does not hold.
 """
 
 from __future__ import annotations
@@ -65,7 +75,6 @@ from backend.catalog.contracts import MAX_PROMOTIONS_PER_RUN
 from backend.catalog.government import source as src
 from backend.catalog.government.projection import (GovernmentProjectionError,
                                                    resolve_active_snapshot)
-from backend.catalog.government.query import TOTAL_COUNT_FIELD, is_count_row
 from backend.errors import AppError
 from backend.runtime import CancellationRequested
 
@@ -112,6 +121,12 @@ PREPARATION_REASONS: Mapping[str, str] = {
         "the run's persisted Government preparation record is not readable",
     "GOVERNMENT_BATCH_INVALID":
         "the Mapping Plan batch bound to this run is not readable as one exact batch",
+    "GOVERNMENT_BATCH_REQUIRED":
+        "a catalog-reading run executes exactly one Mapping Plan batch; start it from the "
+        "Mapping Plan",
+    "GOVERNMENT_READ_REQUIRED":
+        "this run executes a Mapping Plan batch, and the Government catalog read is off in "
+        "this deployment",
 }
 
 
@@ -264,51 +279,40 @@ def is_preparation_checkpoint(checkpoint: Any) -> bool:
 
 
 def prepare_government_work(repository: Any, *,
-                            resource_id: str = src.WLTP_RESOURCE_ID,
                             checkpoint: Mapping[str, Any] | None = None,
-                            limit: int = GOVERNMENT_WORK_QUEUE_LIMIT,
                             cancellation_checker: Callable[[], bool] | None = None,
                             run_id: Any = None,
                             ) -> GovernmentPreparation:
-    """Resolve the pinned snapshot and the work queue for ONE run.
+    """Resolve the pinned snapshot and the work queue for ONE batch-bound run.
 
     With a prior preparation record (a resumed attempt) the SAME snapshot is
-    resolved by its exact key and the SAME queue is returned in the SAME order.
-    Without one, a run the database binds to a Mapping Plan batch is handed
-    exactly that batch; any other run pins the newest USABLE snapshot and
-    takes the first ``limit`` unread candidates in the repository's
-    deterministic candidate order (codepoint order over identity text, then
-    candidate key -- the order both PostgreSQL and the in-memory mirror
-    return).
+    resolved by its exact key and the SAME queue is returned in the SAME order,
+    and only while the binding still names the same batch. Without one, the run
+    is handed exactly the batch the database binds it to.
 
-    Refusals are static and total; a repository failure while reading the
-    queue -- or the binding -- is a refusal too, never an empty queue.
+    A run bound to no batch is refused (`GOVERNMENT_BATCH_REQUIRED`) before any
+    snapshot is read. Refusals are static and total; a repository failure while
+    reading the binding is a refusal too, never "unbound".
     """
     _check_cancelled(cancellation_checker)
     batch = _bound_batch(repository, run_id)
+    if batch is None:
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_REQUIRED")
     record = prepared_artifact(checkpoint)
     if record is not None:
         return _resume(repository, record, cancellation_checker, batch=batch)
-    if batch is not None:
-        return _from_batch(repository, batch, cancellation_checker)
+    return _from_batch(repository, batch, cancellation_checker)
 
-    resource_id = src.require_allowed_resource(resource_id)
-    try:
-        snapshot = resolve_active_snapshot(repository, resource_id=resource_id,
-                                           snapshot_key=None, allow_incomplete=False)
-    except GovernmentProjectionError as refusal:
-        raise GovernmentPreparationError("GOVERNMENT_SNAPSHOT_UNAVAILABLE",
-                                         reason_code=refusal.reason_code) from None
-    _check_cancelled(cancellation_checker)
-    rows, total = _read_queue(repository, snapshot, limit)
-    _check_cancelled(cancellation_checker)
-    queue = tuple(_item_from_row(row) for row in rows)
-    return GovernmentPreparation(
-        snapshot_key=str(snapshot["snapshot_key"]), snapshot_id=str(snapshot["id"]),
-        resource_id=resource_id,
-        upstream_version=str(snapshot.get("upstream_version") or ""),
-        upstream_version_kind=str(snapshot.get("upstream_version_kind") or ""),
-        queue=queue, total_candidates=total, bounded=total > len(queue), resumed=False)
+
+def refuse_bound_run_without_read(repository: Any, run_id: Any) -> None:
+    """With the Government read OFF, a batch-bound run must not execute.
+
+    Its work IS its batch: run without the catalog it would be a paid Swarm V2
+    run with an instruction and no candidates. Unbound runs are untouched. A
+    binding that cannot be read is a refusal, never "unbound".
+    """
+    if _bound_batch(repository, run_id) is not None:
+        raise GovernmentPreparationError("GOVERNMENT_READ_REQUIRED")
 
 
 def government_work_progress(repository: Any, run_id: Any,
@@ -432,16 +436,13 @@ def _resume(repository: Any, record: Mapping[str, Any],
             batch: Mapping[str, Any] | None = None) -> GovernmentPreparation:
     if record.get("schema") != ARTIFACT_SCHEMA:
         raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
-    # A batch-bound record resumes only while the binding still names the SAME
-    # batch, and an unbound record only while the run is still unbound: the
-    # durable binding is the authority, never the checkpoint alone.
+    # A record resumes only while the binding still names the SAME batch: the
+    # durable binding is the authority, never the checkpoint alone. A record
+    # that names no batch at all was prepared by no batch and never resumes.
     recorded_batch = record.get(BATCH_ARTIFACT_KEY)
-    if recorded_batch is not None:
-        if not isinstance(recorded_batch, Mapping) or batch is None \
-                or set(recorded_batch) != set(BATCH_IDENTITY_FIELDS) \
-                or dict(recorded_batch) != _batch_identity(batch):
-            raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
-    elif batch is not None:
+    if not isinstance(recorded_batch, Mapping) or batch is None \
+            or set(recorded_batch) != set(BATCH_IDENTITY_FIELDS) \
+            or dict(recorded_batch) != _batch_identity(batch):
         raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
     snapshot_key = str(record.get("snapshot_key") or "")
     resource_id = str(record.get("resource_id") or "")
@@ -474,44 +475,7 @@ def _resume(repository: Any, record: Mapping[str, Any],
         queue=queue,
         total_candidates=max(len(queue), _optional_int(record.get("total_candidates")) or 0),
         bounded=bool(record.get("bounded")), resumed=True,
-        work_scope_batch=dict(recorded_batch) if recorded_batch is not None else None)
-
-
-def _read_queue(repository: Any, snapshot: Mapping[str, Any],
-                limit: int) -> tuple[list[Mapping[str, Any]], int]:
-    bound = max(1, min(int(limit), GOVERNMENT_WORK_QUEUE_LIMIT))
-    try:
-        rows = list(repository.catalog_candidate_variant_page(
-            snapshot["id"], status=QUEUED_CANDIDATE_STATUS, limit=bound, offset=0,
-            allow_incomplete=False))
-    except AppError:
-        raise GovernmentPreparationError("GOVERNMENT_QUEUE_UNAVAILABLE") from None
-    total = 0
-    items: list[Mapping[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, Mapping):
-            raise GovernmentPreparationError("GOVERNMENT_QUEUE_UNAVAILABLE")
-        try:
-            total = max(total, int(row.get(TOTAL_COUNT_FIELD) or 0))
-        except (TypeError, ValueError):
-            raise GovernmentPreparationError("GOVERNMENT_QUEUE_UNAVAILABLE") from None
-        if is_count_row(row):
-            continue
-        items.append(row)
-    return items, max(total, len(items))
-
-
-def _item_from_row(row: Mapping[str, Any]) -> GovernmentWorkItem:
-    try:
-        return GovernmentWorkItem(
-            candidate_key=str(row["candidate_key"]), candidate_id=str(row["id"]),
-            manufacturer=str(row["manufacturer"]), commercial_model=str(row["commercial_model"]),
-            model_year_start=_optional_int(row.get("model_year_start")),
-            model_year_end=_optional_int(row.get("model_year_end")),
-            official_model_code=_optional_text(row.get("official_model_code")),
-            trim=_optional_text(row.get("trim")))
-    except (KeyError, TypeError):
-        raise GovernmentPreparationError("GOVERNMENT_QUEUE_UNAVAILABLE") from None
+        work_scope_batch=dict(recorded_batch))
 
 
 def _promotable_operation() -> str:
@@ -550,4 +514,5 @@ __all__ = [
     "PROGRESS_STATES", "QUEUED_CANDIDATE_STATUS", "GovernmentPreparation",
     "GovernmentPreparationError", "GovernmentWorkItem", "government_work_progress",
     "is_preparation_checkpoint", "prepare_government_work", "prepared_artifact",
+    "refuse_bound_run_without_read",
 ]

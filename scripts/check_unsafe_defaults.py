@@ -34,6 +34,9 @@ EXECUTION_FLAGS = [
     "MILO_ENABLE_CATALOG_PROMOTION",
     # Mapping Plan writes. Drafts only, and still never enabled by a default.
     "MILO_ENABLE_WORK_SCOPE_MUTATIONS",
+    # Mapping Plan batch runs: starting one batch creates a paid run, so it is
+    # never enabled by a default either.
+    "MILO_ENABLE_WORK_SCOPE_BATCHES",
     # Mapping Plan preparation: scoped Government captures. Capture job only,
     # turned on per execution by an explicit operator command, never a default.
     "MILO_ENABLE_WORK_SCOPE_PREPARATION",

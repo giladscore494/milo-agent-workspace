@@ -231,6 +231,42 @@ export const api = {
         ...workScopeBody(input),
       }),
     }),
+
+  /**
+   * A prepared plan's batches (scoped catalog PR3).
+   *
+   * One membership-scoped GET and three writes. Starting a batch names the
+   * head it was read against (revision AND digest) and the batch it means,
+   * all three as PRECONDITIONS the server re-checks under the plan's row
+   * lock; the server alone decides which batch is next, and refuses anything
+   * else. Each start creates at most ONE run, and nothing starts the next
+   * batch automatically. Every return is `unknown`: `lib/workScope.ts`
+   * parses it field by field.
+   */
+  workScopeProgress: (workScopeId: string) =>
+    request<unknown>(`/work-scopes/${workScopeId}/progress`),
+
+  startWorkScopeBatch: (
+    workScopeId: string,
+    head: { revision: number; digest: string },
+    batchId: string,
+    idempotencyKey: string,
+  ) =>
+    request<unknown>(`/work-scopes/${workScopeId}/runs`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: head.revision,
+        expected_digest: head.digest,
+        batch_id: batchId,
+        idempotency_key: idempotencyKey,
+      }),
+    }),
+
+  pauseWorkScope: (workScopeId: string) =>
+    request<unknown>(`/work-scopes/${workScopeId}/pause`, { method: 'POST' }),
+
+  resumeWorkScope: (workScopeId: string) =>
+    request<unknown>(`/work-scopes/${workScopeId}/resume`, { method: 'POST' }),
 };
 
 /** A Mapping Plan write states the person's words OR a complete edit. */

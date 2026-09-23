@@ -810,3 +810,176 @@ class WorkScopeMutationResult(BaseModel):
     applied: bool
     notes: list[WorkScopeNote] = Field(default_factory=list)
     work_scope: WorkScopeState
+
+
+# --- Mapping Plan batch runs (scoped catalog PR3) ----------------------------
+#
+# A start names the head it was made against (revision AND digest) and the batch
+# it means. All three are preconditions the database re-checks under the plan's
+# row lock; none of them chooses anything. Responses are closed shapes over the
+# projection `backend/catalog/scope/batches.py` builds key by key.
+
+
+class WorkScopeBatchStart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1, strict=True)
+    expected_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    batch_id: UUID
+    idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+class WorkScopeBatchRunCreated(RunCreated):
+    """The run a start created -- or, for a replay or a double submission, the
+    run that already executes that batch (`created: false`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_scope_id: UUID
+    batch_id: UUID
+    attempt: int
+    created: bool
+
+
+class WorkScopeProgressUnit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    unit_key: str
+    name: str
+    priority: int
+    state: str
+    reason_code: str | None = None
+    progress: str
+    readable_count: int
+    ambiguous_count: int
+    eligible_count: int
+    queued_count: int
+    batch_count: int
+    settled_batches: int
+    active: bool
+    promoted: int
+    refused: int
+    unresolved: int
+
+
+class WorkScopeProgressBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: UUID
+    batch_number: int
+    unit_key: str
+    item_count: int
+    state: str
+    attempts: int
+    run_id: UUID | None = None
+    run_status: str | None = None
+    promoted: int | None = None
+    refused: int | None = None
+    unresolved: int | None = None
+
+
+class WorkScopeProgressLive(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    batch_id: UUID
+    batch_number: int
+    revision: int
+    unit_key: str
+    item_count: int
+    attempt: int
+    run_id: UUID
+    run_status: str
+    launch_state: str | None = None
+
+
+class WorkScopeProgressBatchTotals(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total: int
+    settled: int
+    active: int
+    interrupted: int
+    remaining: int
+
+
+class WorkScopeProgressItemTotals(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total: int
+    promoted: int
+    refused: int
+    unresolved: int
+    completed: int
+    remaining: int
+
+
+class WorkScopeProgressPreparation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: int
+    prepared_at: str | None = None
+    unit_count: int
+    prepared_unit_count: int
+    units: list[WorkScopeProgressUnit]
+    next: WorkScopeProgressBatch | None = None
+    recent: list[WorkScopeProgressBatch] = Field(default_factory=list)
+    batches: WorkScopeProgressBatchTotals
+    items: WorkScopeProgressItemTotals
+
+
+class WorkScopeStartControl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool
+    blocked_by: str | None = None
+    batch: WorkScopeProgressBatch | None = None
+    retry: bool
+    relaunch: bool
+
+
+class WorkScopeToggleControl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool
+
+
+class WorkScopeCancelControl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    available: bool
+    run_id: UUID | None = None
+
+
+class WorkScopeControls(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start: WorkScopeStartControl
+    pause: WorkScopeToggleControl
+    resume: WorkScopeToggleControl
+    cancel: WorkScopeCancelControl
+
+
+class WorkScopeProgress(BaseModel):
+    """Where one plan stands, derived from durable state only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_scope_id: UUID
+    revision: int
+    digest: str
+    closed: bool
+    paused: bool
+    status: str
+    live: WorkScopeProgressLive | None = None
+    preparation: WorkScopeProgressPreparation | None = None
+    controls: WorkScopeControls
+
+
+class WorkScopeControlResult(BaseModel):
+    """`changed` is false when the plan was already in the requested state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    changed: bool
+    paused: bool
+    progress: WorkScopeProgress

@@ -92,6 +92,15 @@ const SAFE_RULES: GatewayRule[] = [
     method: 'GET',
     path: new RegExp(`^/conversations/${UUID}/work-scopes/open$`, 'i'),
   },
+  /**
+   * The Mapping Plan's progress: where its batches stand, derived by the
+   * server from durable run state. A membership-gated READ, GET only; the
+   * three batch WRITES (start, pause, resume) are execution rules below.
+   */
+  {
+    method: 'GET',
+    path: new RegExp(`^/work-scopes/${UUID}/progress$`, 'i'),
+  },
 ];
 
 const EXECUTION_RULES: GatewayRule[] = [
@@ -110,11 +119,18 @@ const EXECUTION_RULES: GatewayRule[] = [
   // (and the backend's MILO_ENABLE_WORK_SCOPE_MUTATIONS gates it again).
   { method: 'POST', path: new RegExp(`^/conversations/${UUID}/work-scopes$`, 'i') },
   { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/revisions$`, 'i') },
+  // Starting ONE batch of a prepared plan creates a run (so it is also a
+  // RUN_CREATION rule below), and pausing / resuming the plan holds or
+  // releases its next batch. The backend gates all three again
+  // (MILO_ENABLE_WORK_SCOPE_BATCHES, and MILO_ENABLE_RUN_CREATION for a start).
+  { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/runs$`, 'i') },
+  { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/(pause|resume)$`, 'i') },
 ];
 
 const RUN_CREATION_RULES = [
   new RegExp(`^/conversations/${UUID}/runs$`, 'i'),
   new RegExp(`^/workflow-proposals/${UUID}/runs$`, 'i'),
+  new RegExp(`^/work-scopes/${UUID}/runs$`, 'i'),
 ];
 
 export function executionRoutesEnabled(): boolean {

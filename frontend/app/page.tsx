@@ -41,13 +41,17 @@ import {
   WorkScopeDraft,
   WorkScopeEdit,
   WorkScopeNote,
+  WorkScopeProgress,
   WorkScopeState,
   draftEdit,
   draftFromPlan,
   emptyDraft,
+  parseBatchStart,
   parseCapabilities,
   parseDirectory,
   parseOpenWorkScope,
+  parsePauseResult,
+  parseProgress,
   parseWorkScopeMutation,
 } from '@/lib/workScope';
 import { AuthScreen, SessionRestoreScreen } from '@/components/auth/AuthScreen';
@@ -221,6 +225,19 @@ export default function WorkspacePage() {
   const [planNotes, setPlanNotes] = useState<WorkScopeNote[]>([]);
   const [planInstruction, setPlanInstruction] = useState('');
   const [planDraft, setPlanDraft] = useState<WorkScopeDraft>();
+  // The plan's batches (scoped catalog PR3): the server's progress read and
+  // the one start being confirmed. The browser counts nothing and decides
+  // nothing -- which batch is next, and whether it may start, is the
+  // server's answer, checked again by the database at the start itself.
+  const [planProgress, setPlanProgress] = useState<WorkScopeProgress>();
+  const [planProgressLoading, setPlanProgressLoading] = useState(false);
+  const [planProgressError, setPlanProgressError] = useState('');
+  const [batchBusy, setBatchBusy] = useState<PendingRequest>();
+  const [confirmingBatch, setConfirmingBatch] = useState(false);
+  // One key per confirmed start of ONE batch. A retry of the same start (a
+  // lost answer, a failed launch) reuses it, so the server answers with the
+  // run it already created instead of refusing or duplicating it.
+  const batchKey = useRef<{ key: string; owner: WorkspaceScope; batchId: string }>();
 
   // CODE-3 — durable catalog review state. Deliberately separate from every
   // run-scoped piece of state above: this answers "what does the catalog hold
@@ -650,6 +667,11 @@ export default function WorkspacePage() {
     setPlanInstruction('');
     setPlanLoading(false);
     setPlanBusy(undefined);
+    setPlanProgress(undefined);
+    setPlanProgressError('');
+    setPlanProgressLoading(false);
+    setBatchBusy(undefined);
+    setConfirmingBatch(false);
   }, []);
 
   /** Show a plan the server returned: its state, and a draft reset to it. */
@@ -722,6 +744,55 @@ export default function WorkspacePage() {
   }, []);
 
   const planAvailable = executionUi && planCapabilities?.available === true;
+  const batchesAvailable = planAvailable && planCapabilities?.canStartBatches === true;
+
+  /**
+   * The plan's progress, applied only while its conversation is still the
+   * selected one. `keepError` keeps a refusal's explanation on screen while
+   * the real progress is read back after it.
+   */
+  const loadPlanProgress = useCallback((workScopeId: string, owner: WorkspaceScope, keepError = false) => {
+    setPlanProgressLoading(true);
+    if (!keepError) setPlanProgressError('');
+    Promise.resolve()
+      .then(() => api.workScopeProgress(workScopeId))
+      .then(body => {
+        if (!ownsConversation(owner, scope.current)) return;
+        const parsed = parseProgress(body);
+        if (parsed === undefined) {
+          setPlanProgressError('The plan’s progress could not be read.');
+          return;
+        }
+        setPlanProgress(parsed);
+      })
+      .catch(error => {
+        if (!ownsConversation(owner, scope.current)) return;
+        setPlanProgressError(safeErrorText(error, 'The plan’s progress could not be read.'));
+      })
+      .finally(() => {
+        if (!ownsConversation(owner, scope.current)) return;
+        setPlanProgressLoading(false);
+      });
+  }, []);
+
+  // The progress is read when the panel is open on a plan this server lets a
+  // member start batches of, and again whenever the plan's head changes.
+  const planId = planState?.id;
+  const planRevision = planState?.revision;
+  useEffect(() => {
+    if (!batchesAvailable || !planOpen || !planId) return;
+    loadPlanProgress(planId, scope.current);
+  }, [batchesAvailable, planOpen, planId, planRevision, loadPlanProgress]);
+
+  // While a batch is running, its progress is polled -- the same bounded,
+  // membership-scoped read, every few seconds, and only while the panel is
+  // open. Polling reads; it never starts, retries or continues anything.
+  const liveBatchRunId = planProgress?.live?.runId;
+  useEffect(() => {
+    if (!batchesAvailable || !planOpen || !planId || !liveBatchRunId) return;
+    const timer = setInterval(() => loadPlanProgress(planId, scope.current, true), 4000);
+    return () => clearInterval(timer);
+  }, [batchesAvailable, planOpen, planId, liveBatchRunId, loadPlanProgress]);
 
   // The plan is read once the capability read says it applies and a
   // conversation is selected -- in either order, since both arrive async.
@@ -998,6 +1069,112 @@ export default function WorkspacePage() {
     await writePlan({ edit });
   }
 
+  /**
+   * Start the ONE batch the server's progress says may start, after the
+   * person confirmed it. The request names the head the progress was read
+   * against and the batch it means; the server decides whether that is still
+   * the next batch, and the database checks it again under the plan's row lock.
+   * Whatever the answer, the progress is read back so the screen shows what is
+   * really there now.
+   */
+  async function confirmBatchStart() {
+    const progress = planProgress;
+    const batch = progress?.controls.start.batch;
+    if (!activeConversation || !progress || !batch || batchBusy || !progress.controls.start.available) return;
+    const owner = scope.current;
+    const conversationId = activeConversation.id;
+    const pending = beginPending(owner);
+    setBatchBusy(pending);
+    setPlanProgressError('');
+    const held = batchKey.current;
+    if (held && (!ownsConversation(held.owner, owner) || held.batchId !== batch.batchId)) {
+      batchKey.current = undefined;
+    }
+    batchKey.current ??= { key: newIdempotencyKey(), owner, batchId: batch.batchId };
+    const submission = batchKey.current;
+    try {
+      const body = await api.startWorkScopeBatch(
+        progress.workScopeId, { revision: progress.revision, digest: progress.digest },
+        batch.batchId, submission.key);
+      if (!ownsSession(owner, scope.current)) return;
+      if (batchKey.current === submission) batchKey.current = undefined;
+      const started = parseBatchStart(body);
+      if (started === undefined) {
+        if (!ownsConversation(owner, scope.current)) return;
+        setPlanProgressError('The batch answer could not be read. The progress has been reloaded.');
+        loadPlanProgress(progress.workScopeId, owner, true);
+        return;
+      }
+      // The run exists and belongs to the plan's conversation: stored under
+      // that conversation whichever one is selected now...
+      storeRunId(conversationId, started.runId);
+      // ...and shown only if it is still the one on screen.
+      if (!ownsConversation(owner, scope.current)) return;
+      setConfirmingBatch(false);
+      changeActiveRun(started.runId);
+      loadRunHistory(conversationId, owner, false);
+      loadPlanProgress(progress.workScopeId, owner);
+    } catch (error) {
+      if (!ownsConversation(owner, scope.current)) return;
+      setPlanProgressError(safeErrorText(error, 'The batch could not be started.'));
+      setConfirmingBatch(false);
+      loadPlanProgress(progress.workScopeId, owner, true);
+    } finally {
+      setBatchBusy(current => settlePending(current, pending));
+    }
+  }
+
+  /** Pause or resume the plan: the next batch waits while it is paused. */
+  async function setPlanPaused(paused: boolean) {
+    const progress = planProgress;
+    if (!progress || batchBusy) return;
+    const owner = scope.current;
+    const pending = beginPending(owner);
+    setBatchBusy(pending);
+    setPlanProgressError('');
+    try {
+      const body = paused
+        ? await api.pauseWorkScope(progress.workScopeId)
+        : await api.resumeWorkScope(progress.workScopeId);
+      if (!ownsConversation(owner, scope.current)) return;
+      const result = parsePauseResult(body);
+      if (result === undefined) {
+        setPlanProgressError('The plan’s answer could not be read. The progress has been reloaded.');
+        loadPlanProgress(progress.workScopeId, owner, true);
+        return;
+      }
+      setPlanProgress(result.progress);
+    } catch (error) {
+      if (!ownsConversation(owner, scope.current)) return;
+      setPlanProgressError(safeErrorText(error, paused ? 'The plan could not be paused.' : 'The plan could not be resumed.'));
+      loadPlanProgress(progress.workScopeId, owner, true);
+    } finally {
+      setBatchBusy(current => settlePending(current, pending));
+    }
+  }
+
+  /** Cancel the running batch through the existing run cancellation. */
+  async function cancelLiveBatch() {
+    const progress = planProgress;
+    const runId = progress?.controls.cancel.runId;
+    if (!progress || !runId || batchBusy) return;
+    const owner = scope.current;
+    const pending = beginPending(owner);
+    setBatchBusy(pending);
+    setPlanProgressError('');
+    try {
+      await api.cancel(runId, 'Cancelled from the mapping plan');
+      if (!ownsConversation(owner, scope.current)) return;
+      loadPlanProgress(progress.workScopeId, owner);
+    } catch (error) {
+      if (!ownsConversation(owner, scope.current)) return;
+      setPlanProgressError(safeErrorText(error, 'The batch could not be cancelled.'));
+      loadPlanProgress(progress.workScopeId, owner, true);
+    } finally {
+      setBatchBusy(current => settlePending(current, pending));
+    }
+  }
+
   async function confirmCancelRun() {
     if (!activeRunId) return;
     const owner = scope.current;
@@ -1114,6 +1291,21 @@ export default function WorkspacePage() {
           onSaveDraft={savePlanDraft}
           onDiscardDraft={() => setPlanDraft(planState ? draftFromPlan(planState.plan) : undefined)}
           onRetry={() => { if (activeConversation) loadPlan(activeConversation.id, scope.current); }}
+          batches={batchesAvailable ? {
+            progress: planProgress,
+            loading: planProgressLoading,
+            busy: batchBusy !== undefined,
+            error: planProgressError,
+            confirming: confirmingBatch,
+            onRequestStart: () => { setPlanProgressError(''); setConfirmingBatch(true); },
+            onConfirmStart: confirmBatchStart,
+            onCancelStart: () => setConfirmingBatch(false),
+            onPause: () => setPlanPaused(true),
+            onResume: () => setPlanPaused(false),
+            onCancelBatch: cancelLiveBatch,
+            onOpenRun: selectHistoricalRun,
+            onRefresh: () => { if (planState) loadPlanProgress(planState.id, scope.current); },
+          } : undefined}
         />
         {swarmCardRunId ? (
           <SwarmRunCard

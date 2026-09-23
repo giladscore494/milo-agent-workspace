@@ -110,6 +110,9 @@ export default defineConfig({
         MILO_ENABLE_EXECUTION_CONTROL: 'true',
         // The Mapping Plan writes (drafts only; nothing executes from a plan).
         MILO_ENABLE_WORK_SCOPE_MUTATIONS: 'true',
+        // Starting ONE prepared Mapping Plan batch, and pause / resume. The
+        // in-process fake worker executes it; no model is ever called.
+        MILO_ENABLE_WORK_SCOPE_BATCHES: 'true',
         MILO_WORKER_AUDIENCE: 'http://127.0.0.1:8101',
         MILO_APPROVED_WORKER_IDENTITIES: 'e2e-worker@example-project.iam.gserviceaccount.com',
         MILO_RATE_LIMIT_RUN_CREATION_USER: '100',

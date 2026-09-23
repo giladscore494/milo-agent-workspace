@@ -352,6 +352,11 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
         "p_attempt", "p_lease_token", "p_run_id", "p_usage", "p_worker_id"
     },
     "create_work_scope": {"p_conversation_id", "p_created_by", "p_revision"},
+    "create_work_scope_batch_run": {
+        "p_batch_id", "p_content", "p_expected_digest", "p_expected_revision",
+        "p_idempotency_key", "p_metadata", "p_request_fingerprint", "p_requested_by",
+        "p_run_id", "p_run_identity", "p_work_scope_id"
+    },
     "finalize_run_guarded": {
         "p_attempt", "p_expected_status", "p_lease_token", "p_run_id", "p_status",
         "p_worker_id"
@@ -409,6 +414,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
         "p_attempt", "p_engine_version", "p_lease_token", "p_phase", "p_run_id",
         "p_worker_id", "p_workflow_key"
     },
+    "set_work_scope_paused": {"p_paused", "p_requested_by", "p_work_scope_id"},
     "settle_model_call_budget": {"p_actual_cost", "p_reservation_id"},
     "settle_model_call_budget_guarded": {
         "p_actual_cost", "p_attempt", "p_lease_token", "p_reservation_id",
@@ -429,6 +435,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
         "p_attempt", "p_lease_token", "p_run_id", "p_source", "p_worker_id"
     },
     "work_scope_batch_for_run": {"p_run_id"},
+    "work_scope_progress": {"p_work_scope_id"},
 }
 
 # RPCs whose advertised argument set must EQUAL the pinned set: a missing

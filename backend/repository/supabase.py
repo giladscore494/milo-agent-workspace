@@ -144,6 +144,10 @@ class Repository(Protocol):
     def prepare_work_scope_queue(self, run_id: UUID, preparation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def bind_work_scope_batch_run(self, batch_id: UUID, run_id: UUID, expected_revision: int, expected_digest: str, bound_by: UUID) -> dict[str, Any]: ...
     def work_scope_batch_for_run(self, run_id: UUID) -> dict[str, Any] | None: ...
+    # Batch runs, pause / resume and progress (20260924000100_catalog_work_scope_batch_runs.sql).
+    def create_work_scope_batch_run(self, work_scope_id: UUID, batch_id: UUID, expected_revision: int, expected_digest: str, *, run_id: UUID, run_identity: dict[str, Any], content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]: ...
+    def set_work_scope_paused(self, work_scope_id: UUID, paused: bool, requested_by: UUID) -> dict[str, Any]: ...
+    def work_scope_progress(self, work_scope_id: UUID) -> dict[str, Any] | None: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -1479,6 +1483,9 @@ class SupabaseRepository:
         ("WORK_SCOPE_BATCH_ALREADY_COMPLETED", "this batch already completed", 409),
         ("WORK_SCOPE_BATCH_RUN_TAKEN", "this run is already bound to another batch", 409),
         ("WORK_SCOPE_BATCH_RUN_INVALID", "this run cannot execute this batch", 422),
+        # The binding's continuation rules (20260924000100).
+        ("WORK_SCOPE_PAUSED", "the mapping plan is paused; resume it before starting a batch", 409),
+        ("WORK_SCOPE_BATCH_NOT_NEXT", "only the next batch of the plan can start", 409),
     ) + _WORK_SCOPE_REFUSALS
 
     def _work_scope_preparation_call(self, call: Any, identifier: str, *, guarded: bool) -> Any:
@@ -1544,6 +1551,90 @@ class SupabaseRepository:
         if not isinstance(data, dict) or not isinstance(data.get("batch"), dict) \
                 or not isinstance(data.get("items"), list):
             raise AppError("REPOSITORY_ERROR", "batch read returned an unreadable row", 502)
+        return data
+
+    # -- batch runs, pause / resume and progress (scoped catalog PR3) ----------
+    #
+    # `20260924000100_catalog_work_scope_batch_runs.sql`. Starting a batch is ONE
+    # RPC that wraps the run creator and the binding in one transaction; the
+    # refusals it can answer with are the plan's, the binding's and the run
+    # creator's own, each mapped to the same code the API already speaks.
+    _WORK_SCOPE_BATCH_REFUSALS = (
+        ("WORK_SCOPE_BATCH_IDEMPOTENCY_REQUIRED", "starting a batch requires an idempotency key", 422),
+        ("WORK_SCOPE_CONTROL_OUT_OF_SEQUENCE", "the plan's pause state changed; reload it and try again", 409),
+        ("WORK_SCOPE_CONTROL_INVALID", "invalid mapping plan control", 422),
+    ) + _WORK_SCOPE_PREPARATION_REFUSALS
+    _RUN_CREATION_REFUSALS = (
+        ("USER_CONCURRENCY_LIMIT", "too many active runs for this user", 429),
+        ("PROJECT_CONCURRENCY_LIMIT", "too many active runs for this project", 429),
+        ("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409),
+        ("RUN_IDENTITY_WORKFLOW_DRIFT", "project workflow changed before the run could be created", 409),
+        ("RUN_IDENTITY_INVALID", "run identity was rejected", 409),
+        ("RUN_IDENTITY_REQUIRED", "run identity was rejected", 409),
+    )
+
+    def _work_scope_batch_call(self, call: Any, identifier: str) -> Any:
+        """Run one batch-family RPC and map what it refuses to a static code.
+
+        `call` is the RPC itself, spelled out at the method below with its
+        literal name, so the release inventory sees each one."""
+        try:
+            data = call().execute().data
+        except Exception as exc:
+            message = str(exc)
+            if "WORK_SCOPE_BATCH_NOT_FOUND" in message:
+                raise NotFoundError("work_scope_batch", identifier) from None
+            if "WORK_SCOPE_NOT_FOUND" in message:
+                raise NotFoundError("work_scope", identifier) from None
+            for code, safe, status in self._WORK_SCOPE_BATCH_REFUSALS + self._RUN_CREATION_REFUSALS:
+                if code in message:
+                    raise AppError("RUN_IDENTITY_INVALID" if code == "RUN_IDENTITY_REQUIRED" else code,
+                                   safe, status) from None
+            raise AppError("REPOSITORY_ERROR", "mapping plan batch request failed", 502) from None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data
+
+    def create_work_scope_batch_run(self, work_scope_id: UUID, batch_id: UUID, expected_revision: int, expected_digest: str, *, run_id: UUID, run_identity: dict[str, Any], content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]:
+        """ONE batch run: message, queued run, immutable identity and binding,
+        committed together or not at all. A replay answers `created: false`."""
+        data = self._work_scope_batch_call(
+            lambda: self.client.rpc("create_work_scope_batch_run", {
+                "p_work_scope_id": str(work_scope_id), "p_batch_id": str(batch_id),
+                "p_expected_revision": int(expected_revision),
+                "p_expected_digest": str(expected_digest),
+                "p_run_id": str(run_id), "p_run_identity": run_identity,
+                "p_content": content, "p_metadata": metadata,
+                "p_requested_by": str(requested_by), "p_idempotency_key": idempotency_key,
+                "p_request_fingerprint": request_fingerprint,
+                "p_max_user_active": max_user_active,
+                "p_max_project_active": max_project_active}),
+            str(work_scope_id))
+        if not isinstance(data, dict) or not isinstance(data.get("run"), dict) \
+                or not isinstance(data.get("binding"), dict):
+            raise AppError("REPOSITORY_ERROR", "batch run creation returned no row", 502)
+        return data
+
+    def set_work_scope_paused(self, work_scope_id: UUID, paused: bool, requested_by: UUID) -> dict[str, Any]:
+        """Pause or resume one plan: an append-only control, written once."""
+        data = self._work_scope_batch_call(
+            lambda: self.client.rpc("set_work_scope_paused", {
+                "p_work_scope_id": str(work_scope_id), "p_paused": bool(paused),
+                "p_requested_by": str(requested_by)}),
+            str(work_scope_id))
+        if not isinstance(data, dict) or not isinstance(data.get("paused"), bool):
+            raise AppError("REPOSITORY_ERROR", "mapping plan control returned no row", 502)
+        return data
+
+    def work_scope_progress(self, work_scope_id: UUID) -> dict[str, Any] | None:
+        """The plan's progress, derived by the database; None when it does not exist."""
+        data = self._work_scope_batch_call(
+            lambda: self.client.rpc("work_scope_progress", {"p_work_scope_id": str(work_scope_id)}),
+            str(work_scope_id))
+        if data is None:
+            return None
+        if not isinstance(data, dict) or not data.get("work_scope_id"):
+            raise AppError("REPOSITORY_ERROR", "mapping plan progress returned an unreadable row", 502)
         return data
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:

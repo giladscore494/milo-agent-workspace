@@ -169,6 +169,9 @@ class MemoryRepository:
         self.work_scope_batches: list[dict[str, Any]] = []
         self.work_scope_queue_items: list[dict[str, Any]] = []
         self.work_scope_batch_runs: list[dict[str, Any]] = []
+        # Pause / resume (`20260924000100_catalog_work_scope_batch_runs.sql`):
+        # append-only, alternating, written only by `set_work_scope_paused`.
+        self.work_scope_controls: list[dict[str, Any]] = []
 
     # -- seeding -------------------------------------------------------------
     def seed_user(self, user_id: str) -> None:
@@ -2786,25 +2789,319 @@ class MemoryRepository:
                                "this run is already bound to another batch", 409)
             if run.get("status") in self._WORK_SCOPE_TERMINAL_RUN_STATES:
                 raise run_invalid
-            for binding in self.work_scope_batch_runs:
-                if binding["work_scope_id"] != plan["id"]:
-                    continue
-                status = (self.runs.get(binding["run_id"]) or {}).get("status")
-                if status not in self._WORK_SCOPE_TERMINAL_RUN_STATES:
+            # 20260924000100: paused, one live batch, settled, and in order.
+            self._check_batch_continuation(plan, batch)
+            return self._bind_batch(plan, batch, run_id, bound_by)
+
+    #: A batch whose run finished its work (20260924000100). Never bound again.
+    _WORK_SCOPE_SETTLED_RUN_STATES = frozenset({"completed", "partial_success"})
+
+    def _work_scope_paused(self, work_scope_id: str) -> bool:
+        latest = max((row for row in self.work_scope_controls
+                      if row["work_scope_id"] == str(work_scope_id)),
+                     key=lambda row: row["sequence"], default=None)
+        return latest is not None and latest["action"] == "pause"
+
+    def _batch_run_status(self, binding: Mapping[str, Any]) -> Any:
+        return (self.runs.get(binding["run_id"]) or {}).get("status")
+
+    def _live_batch_binding(self, work_scope_id: str) -> dict[str, Any] | None:
+        live = [row for row in self.work_scope_batch_runs
+                if row["work_scope_id"] == str(work_scope_id)
+                and self._batch_run_status(row) not in self._WORK_SCOPE_TERMINAL_RUN_STATES]
+        return max(live, key=lambda row: row["bound_at"], default=None)
+
+    def _batch_settled(self, batch_id: str) -> bool:
+        return any(row["batch_id"] == str(batch_id)
+                   and self._batch_run_status(row) in self._WORK_SCOPE_SETTLED_RUN_STATES
+                   for row in self.work_scope_batch_runs)
+
+    def _next_batch(self, preparation_id: str) -> dict[str, Any] | None:
+        return min((row for row in self.work_scope_batches
+                    if row["preparation_id"] == preparation_id
+                    and not self._batch_settled(row["id"])),
+                   key=lambda row: row["batch_number"], default=None)
+
+    def _check_batch_continuation(self, plan: Mapping[str, Any], batch: Mapping[str, Any]) -> None:
+        """The continuation rules, in the SQL's order (caller holds the lock)."""
+        if self._work_scope_paused(plan["id"]):
+            raise AppError("WORK_SCOPE_PAUSED",
+                           "the mapping plan is paused; resume it before starting a batch", 409)
+        if self._live_batch_binding(plan["id"]) is not None:
+            raise AppError("WORK_SCOPE_BATCH_IN_PROGRESS",
+                           "another batch of this plan is still running", 409)
+        if self._batch_settled(batch["id"]):
+            raise AppError("WORK_SCOPE_BATCH_ALREADY_COMPLETED", "this batch already completed", 409)
+        following = self._next_batch(batch["preparation_id"])
+        if following is None or following["id"] != batch["id"]:
+            raise AppError("WORK_SCOPE_BATCH_NOT_NEXT",
+                           "only the next batch of the plan can start", 409)
+
+    def _bind_batch(self, plan: Mapping[str, Any], batch: Mapping[str, Any], run_id: Any,
+                    bound_by: Any) -> dict[str, Any]:
+        attempt = 1 + max((binding["attempt"] for binding in self.work_scope_batch_runs
+                           if binding["batch_id"] == batch["id"]), default=0)
+        binding = {"id": str(uuid4()), "batch_id": batch["id"],
+                   "work_scope_id": plan["id"], "run_id": str(run_id), "attempt": attempt,
+                   "bound_by": str(bound_by), "bound_at": _now()}
+        self.work_scope_batch_runs.append(binding)
+        return {**binding, "replayed": False}
+
+    # -- batch runs, pause / resume and progress (scoped catalog PR3) ---------
+    #
+    # Mirrors `20260924000100_catalog_work_scope_batch_runs.sql` refusal for
+    # refusal and in the same order. `tests/test_work_scope_batches.py` and the
+    # PostgreSQL suite hold the two to the same answers.
+
+    def set_work_scope_paused(self, work_scope_id: UUID, paused: bool,
+                              requested_by: UUID) -> dict[str, Any]:
+        if work_scope_id is None or not isinstance(paused, bool) or requested_by is None:
+            raise AppError("WORK_SCOPE_CONTROL_INVALID", "invalid mapping plan control", 422)
+        with self.lock:
+            plan = self.work_scopes.get(str(work_scope_id))
+            if plan is None or not self._is_member(plan["project_id"], requested_by):
+                raise NotFoundError("work_scope", str(work_scope_id))
+            if self.projects[plan["project_id"]].get("workflow_key") != "swarm_v2":
+                raise AppError("WORK_SCOPE_WORKFLOW_UNSUPPORTED",
+                               "this project's engine does not read a mapping plan", 409)
+            if plan["closed_at"] is not None:
+                raise AppError("WORK_SCOPE_NOT_EDITABLE", "the mapping plan is not editable", 409)
+            history = [row for row in self.work_scope_controls if row["work_scope_id"] == plan["id"]]
+            last = max(history, key=lambda row: row["sequence"], default=None)
+            if (last is not None and last["action"] == "pause") == paused:
+                return {"changed": False, "paused": paused,
+                        "control": dict(last) if last is not None else None}
+            row = {"id": str(uuid4()), "work_scope_id": plan["id"],
+                   "sequence": (last["sequence"] if last is not None else 0) + 1,
+                   "action": "pause" if paused else "resume",
+                   "requested_by": str(requested_by), "created_at": _now()}
+            self.work_scope_controls.append(row)
+            return {"changed": True, "paused": paused, "control": dict(row)}
+
+    def create_work_scope_batch_run(self, work_scope_id: UUID, batch_id: UUID,
+                                    expected_revision: int, expected_digest: str, *,
+                                    run_id: UUID, run_identity: dict[str, Any], content: str,
+                                    metadata: dict[str, Any], requested_by: UUID,
+                                    idempotency_key: str, request_fingerprint: str,
+                                    max_user_active: int | None = None,
+                                    max_project_active: int | None = None) -> dict[str, Any]:
+        """Mirrors `create_work_scope_batch_run`: the run creator and the binding,
+        together or not at all, under one lock."""
+        run_invalid = AppError("WORK_SCOPE_BATCH_RUN_INVALID",
+                               "this run cannot execute this batch", 422)
+        stale = AppError("WORK_SCOPE_STALE",
+                         "the plan changed since it was read; reload it and try again", 409)
+        if work_scope_id is None or batch_id is None or run_id is None or requested_by is None:
+            raise run_invalid
+        if not idempotency_key or not str(idempotency_key).strip() \
+                or not request_fingerprint or not str(request_fingerprint).strip():
+            raise AppError("WORK_SCOPE_BATCH_IDEMPOTENCY_REQUIRED",
+                           "starting a batch requires an idempotency key", 422)
+        with self.lock:
+            plan = self.work_scopes.get(str(work_scope_id))
+            if plan is None or not self._is_member(plan["project_id"], requested_by):
+                raise NotFoundError("work_scope", str(work_scope_id))
+            existing = self.find_run_by_idempotency(UUID(plan["conversation_id"]), requested_by,
+                                                    idempotency_key)
+            if existing is not None:
+                binding = next((row for row in self.work_scope_batch_runs
+                                if row["run_id"] == existing["id"]), None)
+                if existing.get("request_fingerprint") != request_fingerprint \
+                        or binding is None or binding["work_scope_id"] != plan["id"]:
+                    raise AppError("IDEMPOTENCY_CONFLICT",
+                                   "idempotency key was already used with a different payload", 409)
+                # A replay the caller would LAUNCH is a start: it obeys the
+                # start rules as they stand now.
+                if existing["status"] == "queued" \
+                        and existing.get("launch_state") in {"pending", "launch_failed"}:
+                    if plan["closed_at"] is not None:
+                        raise AppError("WORK_SCOPE_NOT_EDITABLE", "the mapping plan is not editable",
+                                       409)
+                    bound = next(row for row in self.work_scope_batches
+                                 if row["id"] == binding["batch_id"])
+                    if bound["revision"] != plan["head_revision"] \
+                            or bound["scope_digest"] != plan["head_digest"]:
+                        raise stale
+                    if self._work_scope_paused(plan["id"]):
+                        raise AppError("WORK_SCOPE_PAUSED",
+                                       "the mapping plan is paused; resume it before starting a batch",
+                                       409)
+                return {"run": existing, "binding": dict(binding), "created": False}
+            if self.projects[plan["project_id"]].get("workflow_key") != "swarm_v2":
+                raise AppError("WORK_SCOPE_WORKFLOW_UNSUPPORTED",
+                               "this project's engine does not read a mapping plan", 409)
+            if not isinstance(run_identity, Mapping) \
+                    or run_identity.get("workflow_key") != "swarm_v2":
+                raise run_invalid
+            if plan["closed_at"] is not None:
+                raise AppError("WORK_SCOPE_NOT_EDITABLE", "the mapping plan is not editable", 409)
+            if expected_revision != plan["head_revision"] or expected_digest != plan["head_digest"]:
+                raise stale
+            batch = next((row for row in self.work_scope_batches
+                          if row["id"] == str(batch_id) and row["work_scope_id"] == plan["id"]),
+                         None)
+            if batch is None:
+                raise NotFoundError("work_scope_batch", str(batch_id))
+            if batch["revision"] != plan["head_revision"] \
+                    or batch["scope_digest"] != plan["head_digest"]:
+                raise stale
+            if self._work_scope_paused(plan["id"]):
+                raise AppError("WORK_SCOPE_PAUSED",
+                               "the mapping plan is paused; resume it before starting a batch", 409)
+            live = self._live_batch_binding(plan["id"])
+            if live is not None:
+                if live["batch_id"] != batch["id"]:
                     raise AppError("WORK_SCOPE_BATCH_IN_PROGRESS",
                                    "another batch of this plan is still running", 409)
-            if any(binding["batch_id"] == str(batch_id)
-                   and (self.runs.get(binding["run_id"]) or {}).get("status") == "completed"
-                   for binding in self.work_scope_batch_runs):
-                raise AppError("WORK_SCOPE_BATCH_ALREADY_COMPLETED",
-                               "this batch already completed", 409)
-            attempt = 1 + max((binding["attempt"] for binding in self.work_scope_batch_runs
-                               if binding["batch_id"] == str(batch_id)), default=0)
-            binding = {"id": str(uuid4()), "batch_id": str(batch_id),
-                       "work_scope_id": plan["id"], "run_id": str(run_id), "attempt": attempt,
-                       "bound_by": str(bound_by), "bound_at": _now()}
-            self.work_scope_batch_runs.append(binding)
-            return {**binding, "replayed": False}
+                return {"run": dict(self.runs[live["run_id"]]), "binding": dict(live),
+                        "created": False}
+            self._check_batch_continuation(plan, batch)
+            created = self.create_message_and_run(
+                UUID(plan["conversation_id"]), content, metadata, requested_by, idempotency_key,
+                request_fingerprint, max_user_active, max_project_active, run_id=run_id,
+                run_identity=run_identity)
+            if not created.get("created") or created["run"]["id"] != str(run_id):
+                raise run_invalid
+            binding = self._bind_batch(plan, batch, run_id, requested_by)
+            binding.pop("replayed", None)
+            return {"run": created["run"], "binding": binding, "created": True}
+
+    def work_scope_progress(self, work_scope_id: UUID) -> dict[str, Any] | None:
+        """Mirrors `work_scope_progress`: derived from the bound runs' own durable
+        status and promotion events, counts and codes only."""
+        with self.lock:
+            plan = self.work_scopes.get(str(work_scope_id))
+            if plan is None:
+                return None
+            history = [row for row in self.work_scope_controls if row["work_scope_id"] == plan["id"]]
+            control = max(history, key=lambda row: row["sequence"], default=None)
+            live_binding = self._live_batch_binding(plan["id"])
+            live = None
+            if live_binding is not None:
+                batch = next(row for row in self.work_scope_batches
+                             if row["id"] == live_binding["batch_id"])
+                run = self.runs[live_binding["run_id"]]
+                live = {"batch_id": batch["id"], "batch_number": batch["batch_number"],
+                        "revision": batch["revision"], "unit_key": batch["unit_key"],
+                        "item_count": batch["item_count"], "attempt": live_binding["attempt"],
+                        "run_id": run["id"], "run_status": run["status"],
+                        "launch_state": run.get("launch_state"),
+                        "bound_at": live_binding["bound_at"]}
+            preparation = next((row for row in self.work_scope_preparations.values()
+                                if row["work_scope_id"] == plan["id"]
+                                and row["revision"] == plan["head_revision"]), None)
+            return {"work_scope_id": plan["id"], "revision": plan["head_revision"],
+                    "digest": plan["head_digest"], "closed": plan["closed_at"] is not None,
+                    "paused": control is not None and control["action"] == "pause",
+                    "control": ({"sequence": control["sequence"], "action": control["action"],
+                                 "created_at": control["created_at"]}
+                                if control is not None else None),
+                    "live": live,
+                    "preparation": (self._work_scope_preparation_progress(preparation)
+                                    if preparation is not None else None)}
+
+    def _work_scope_preparation_progress(self, preparation: Mapping[str, Any]) -> dict[str, Any]:
+        batches = sorted((row for row in self.work_scope_batches
+                          if row["preparation_id"] == preparation["id"]),
+                         key=lambda row: row["batch_number"])
+        batch_ids = {row["id"] for row in batches}
+        bound = [row for row in self.work_scope_batch_runs if row["batch_id"] in batch_ids]
+        bound_runs = {row["run_id"] for row in bound}
+        items = [row for row in self.work_scope_queue_items
+                 if row["preparation_id"] == preparation["id"]]
+        batch_of = {row["candidate_key"]: row["batch_id"] for row in items}
+        promoted: set[str] = set()
+        refused: set[str] = set()
+        for event in self.run_events:
+            if event["run_id"] not in bound_runs or event["event_type"] not in (
+                    "catalog_variant_promoted", "catalog_promotion_refused"):
+                continue
+            payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+            key = payload.get("candidate_key")
+            if key not in batch_of:
+                continue
+            if event["event_type"] == "catalog_promotion_refused":
+                refused.add(key)
+            elif payload.get("promoted") is True:
+                promoted.add(key)
+        rows = []
+        for batch in batches:
+            runs = sorted((row for row in bound if row["batch_id"] == batch["id"]),
+                          key=lambda row: row["attempt"])
+            statuses = [self._batch_run_status(row) for row in runs]
+            if "completed" in statuses:
+                state = "completed"
+            elif "partial_success" in statuses:
+                state = "partial"
+            elif any(status not in self._WORK_SCOPE_TERMINAL_RUN_STATES for status in statuses):
+                state = "active"
+            elif runs:
+                state = "interrupted"
+            else:
+                state = "pending"
+            keys = [key for key, owner in batch_of.items() if owner == batch["id"]]
+            batch_promoted = sum(1 for key in keys if key in promoted)
+            batch_refused = sum(1 for key in keys if key in refused and key not in promoted)
+            settled = state in ("completed", "partial")
+            rows.append({"batch": batch, "state": state, "attempts": len(runs),
+                         "settled": settled,
+                         "last_bound_at": runs[-1]["bound_at"] if runs else None,
+                         "last_run": runs[-1] if runs else None,
+                         "promoted": batch_promoted, "refused": batch_refused,
+                         "unresolved": (batch["item_count"] - batch_promoted - batch_refused
+                                        if settled else 0)})
+        units = sorted((row for row in self.work_scope_units
+                        if row["preparation_id"] == preparation["id"]),
+                       key=lambda row: row["priority"])
+        unit_rows = []
+        for unit in units:
+            mine = [row for row in rows if row["batch"]["unit_key"] == unit["unit_key"]]
+            unit_rows.append({
+                "priority": unit["priority"], "unit_key": unit["unit_key"],
+                "state": unit["state"], "reason_code": unit["reason_code"],
+                "readable_count": unit["readable_count"],
+                "ambiguous_count": unit["ambiguous_count"],
+                "eligible_count": unit["eligible_count"], "queued_count": unit["queued_count"],
+                "batch_count": len(mine),
+                "settled_batches": sum(1 for row in mine if row["settled"]),
+                "active": any(row["state"] == "active" for row in mine),
+                "promoted": sum(row["promoted"] for row in mine),
+                "refused": sum(row["refused"] for row in mine),
+                "unresolved": sum(row["unresolved"] for row in mine)})
+        following = next((row for row in rows if not row["settled"]), None)
+        recent = sorted((row for row in rows if row["attempts"] > 0),
+                        key=lambda row: row["last_bound_at"], reverse=True)[:5]
+        return {
+            "id": preparation["id"], "revision": preparation["revision"],
+            "created_at": preparation["created_at"], "unit_count": preparation["unit_count"],
+            "prepared_unit_count": preparation["prepared_unit_count"],
+            "queued_item_count": preparation["queued_item_count"],
+            "batch_count": preparation["batch_count"],
+            "units": unit_rows,
+            "next": ({"batch_id": following["batch"]["id"],
+                      "batch_number": following["batch"]["batch_number"],
+                      "unit_key": following["batch"]["unit_key"],
+                      "item_count": following["batch"]["item_count"],
+                      "first_position": following["batch"]["first_position"],
+                      "state": following["state"], "attempts": following["attempts"]}
+                     if following is not None else None),
+            "recent": [{"batch_id": row["batch"]["id"],
+                        "batch_number": row["batch"]["batch_number"],
+                        "unit_key": row["batch"]["unit_key"],
+                        "item_count": row["batch"]["item_count"], "state": row["state"],
+                        "attempts": row["attempts"], "run_id": row["last_run"]["run_id"],
+                        "run_status": self._batch_run_status(row["last_run"]),
+                        "promoted": row["promoted"], "refused": row["refused"],
+                        "unresolved": row["unresolved"]} for row in recent],
+            "batches": {"total": len(rows),
+                        "settled": sum(1 for row in rows if row["settled"]),
+                        "active": sum(1 for row in rows if row["state"] == "active"),
+                        "interrupted": sum(1 for row in rows if row["state"] == "interrupted")},
+            "items": {"total": preparation["queued_item_count"],
+                      "promoted": sum(row["promoted"] for row in rows),
+                      "refused": sum(row["refused"] for row in rows),
+                      "unresolved": sum(row["unresolved"] for row in rows)},
+        }
 
     def work_scope_batch_for_run(self, run_id: UUID) -> dict[str, Any] | None:
         """Mirrors `work_scope_batch_for_run`: None when the run is unbound."""

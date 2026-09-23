@@ -288,6 +288,25 @@ GATE_CHAIN: tuple[Gate, ...] = (
         stage=2,
     ),
     Gate(
+        name="MILO_ENABLE_WORK_SCOPE_BATCHES",
+        surface=API_RUNTIME,
+        current_default="false",
+        required_for_first_run=(
+            "YES for the first paid WEBSITE catalog run -- it is started as ONE "
+            "Mapping Plan batch (with MILO_ENABLE_RUN_CREATION); NO for a "
+            "conversation run that reads no catalog"),
+        when_to_enable=(
+            "Only with the Mapping Plan in use, after the plan's revision has "
+            "been prepared by the operator capture job"),
+        requires_redeploy=UPDATE_SERVICE,
+        failure_behavior_when_off=(
+            "POST /work-scopes/{id}/runs, /pause and /resume are rejected by the "
+            "surface guard. No batch run is created or launched, the plan's "
+            "progress read keeps answering, and a batch already running is "
+            "untouched (it can still be cancelled through the existing route)."),
+        stage=2,
+    ),
+    Gate(
         name="MILO_ENABLE_WORK_SCOPE_PREPARATION",
         surface=WORKER_RUNTIME,
         current_default="false",

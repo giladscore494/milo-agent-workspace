@@ -78,6 +78,8 @@ EXECUTION_FLAGS = [
     "MILO_ENABLE_CATALOG_PROMOTION",
     # API-only: the Mapping Plan writes. Drafts only; still off at Stage A.
     "MILO_ENABLE_WORK_SCOPE_MUTATIONS",
+    # API-only: starting ONE Mapping Plan batch, and pause / resume. Off at Stage A.
+    "MILO_ENABLE_WORK_SCOPE_BATCHES",
     # Capture-job only: Mapping Plan preparation. Off everywhere at Stage A.
     "MILO_ENABLE_WORK_SCOPE_PREPARATION",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",

@@ -30,7 +30,7 @@ import socket
 import uuid
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -1835,8 +1835,7 @@ def swarm_run_reaching_completion(monkeypatch):
     """
     from backend.catalog.execution import (CATALOG_EXECUTION_FLAG,
                                            CATALOG_PROMOTION_FLAG, GOVERNMENT_READ_FLAG)
-    from test_swarm_v2_smoke_offline import (FakeKimiCompletions, build_repo,
-                                             run_worker_directly, swarm_env)
+    from test_swarm_v2_smoke_offline import FakeKimiCompletions, build_repo, swarm_env
     import backend.engines.swarm_v2 as swarm_pkg
 
     # CODE-2: this test is about what the promotion path does when its durable
@@ -1853,15 +1852,16 @@ def swarm_run_reaching_completion(monkeypatch):
     monkeypatch.setattr(swarm_pkg.SwarmV2Adapter, "run",
                         lambda self, run: dict(USABLE_PRODUCT_OUTCOME))
     repo, conversation_id = build_repo()
-    # A Government-reading run is PREPARED after the lease and before the
-    # provider: without a usable snapshot the worker refuses it through the
-    # canonical finalizer and the promotion path is never reached. Land the
-    # committed capture the way the operator path lands it.
-    from backend.testing.catalog_review_seed import land_pinned_government_snapshot
-    from test_swarm_v2_smoke_offline import PROJECT, USER
-    land_pinned_government_snapshot(repo, user_id=USER, project_id=PROJECT)
-    run_id = run_worker_directly(repo, conversation_id, monkeypatch, FakeKimiCompletions(),
-                                 idempotency_key=f"promotion-read-{uuid4().hex[:8]}")
+    # A Government-reading run executes exactly one PREPARED Mapping Plan batch
+    # (scoped catalog PR3): an unbound run is refused through the canonical
+    # finalizer and the promotion path is never reached. Prepare a plan the
+    # way the capture job prepares it -- which finalizes that capture run --
+    # and create the run bound to its first batch.
+    from backend.testing.work_scope_seed import seed_prepared_plan, start_batch_run
+    from test_swarm_v2_smoke_offline import USER, patch_client
+    plan = seed_prepared_plan(repo, user_id=USER, conversation_id=conversation_id)
+    patch_client(monkeypatch, FakeKimiCompletions())
+    run_id = UUID(start_batch_run(repo, plan)["run"]["id"])
     return repo, run_id
 
 
@@ -1923,6 +1923,9 @@ def test_a_run_whose_pending_promotion_read_failed_is_never_marked_complete(monk
 
     # --- the CONTROL: identical stack, read working -> the run COMPLETES -----
     control_repo, control_id = swarm_run_reaching_completion(monkeypatch)
+    # Preparing the plan finalized its operator capture run; only the product
+    # run's own terminal write is under test.
+    finalized.clear()
     assert worker_main.execute_run(control_id, control_repo) == 0
     assert "run_completed" in run_event_types(control_repo, control_id)
     assert finalized == ["finalize:completed"]
@@ -1935,8 +1938,8 @@ def test_a_run_whose_pending_promotion_read_failed_is_never_marked_complete(monk
     assert reads == ["read", "read"]
 
     # --- the SUBJECT: identical stack, the PROMOTION read DOWN ---------------
-    finalized.clear()
     repo, run_id = swarm_run_reaching_completion(monkeypatch)
+    finalized.clear()
 
     subject_reads: list[str] = []
 

@@ -3,7 +3,8 @@
 Every operation authorizes FIRST -- the same non-disclosing membership check
 every other conversation and project route performs -- and only then reads,
 interprets or writes. Nothing here launches, prepares or executes: a plan is a
-draft, and the capability read below says so to the browser in as many words.
+draft. Starting one prepared batch of it is `batches.py`, through the API's one
+run creation and launch path.
 
 One path for chat and clicks
 ----------------------------
@@ -43,6 +44,11 @@ from . import interpret as wi
 #: every deployment contract, and enforced by `ExecutionSurfaceGuardMiddleware`
 #: before a request body is even read.
 WORK_SCOPE_MUTATIONS_FLAG = "MILO_ENABLE_WORK_SCOPE_MUTATIONS"
+
+#: The flags behind starting a batch (`backend/catalog/scope/batches.py`), named
+#: here too so the capability read needs no import of the batch module.
+WORK_SCOPE_BATCHES_FLAG = "MILO_ENABLE_WORK_SCOPE_BATCHES"
+RUN_CREATION_FLAG = "MILO_ENABLE_RUN_CREATION"
 
 #: The engines a plan can feed. Only Swarm V2 reads the Government catalog;
 #: a Vehicle Catalog V1 project maps the one scope its configuration states.
@@ -84,12 +90,19 @@ def capabilities(repo: Any, user_id: UUID, project_id: UUID) -> dict[str, Any]:
     `available` is the one answer the browser needs to decide whether to show
     the surface at all. The limits are the contract's own constants, so a
     browser that renders a batch-size choice renders exactly the server's
-    bound. `can_prepare` and `can_start_batches` are false in this release by
-    construction: there is no preparation and no batch path to enable.
+    bound.
+
+    `can_prepare` is always false here: a plan is prepared only by the operator
+    capture job, never from the API. `can_start_batches` says whether THIS
+    server lets a member start a batch at all (`MILO_ENABLE_WORK_SCOPE_BATCHES`
+    and `MILO_ENABLE_RUN_CREATION`); whether a given batch may start is the
+    progress read's answer, and the database's again at the start itself.
     """
     project = repo.get_project(project_id, user_id)
     supported = project.get("workflow_key") in WORK_SCOPE_WORKFLOWS
     mutations = is_stage_enabled(WORK_SCOPE_MUTATIONS_FLAG)
+    batches = (is_stage_enabled(WORK_SCOPE_BATCHES_FLAG)
+               and is_stage_enabled(RUN_CREATION_FLAG))
     reason = None if supported and mutations else (
         "workflow_not_supported" if not supported else "mutations_disabled")
     return {
@@ -108,7 +121,7 @@ def capabilities(repo: Any, user_id: UUID, project_id: UUID) -> dict[str, Any]:
             "max_instruction_chars": wi.MAX_INSTRUCTION_CHARS,
         },
         "can_prepare": False,
-        "can_start_batches": False,
+        "can_start_batches": supported and batches,
     }
 
 

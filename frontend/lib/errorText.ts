@@ -109,6 +109,14 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
   ['WORK_SCOPE_INSTRUCTION_NOT_UNDERSTOOD', 'No manufacturer, model year, limit or batch size was recognized in that instruction. Check the spelling, or build the plan from the directory.'],
   ['WORK_SCOPE_COVERAGE_UNAVAILABLE', 'The catalog coverage that instruction depends on could not be read, so the plan was not changed. Try again shortly.'],
 
+  // Mapping Plan batches. Each is a refusal a person can act on: the plan's
+  // progress is reloaded after every one, so the screen shows what is really
+  // next. None of them started a run.
+  ['WORK_SCOPE_PAUSED', 'The mapping plan is paused, so no batch was started. Resume it first.'],
+  ['WORK_SCOPE_BATCH_NOT_NEXT', 'That batch is no longer the next one, so nothing was started. The progress has been reloaded.'],
+  ['WORK_SCOPE_BATCH_IN_PROGRESS', 'Another batch of this plan is still running, so nothing was started.'],
+  ['WORK_SCOPE_BATCH_ALREADY_COMPLETED', 'That batch has already finished, so it was not started again.'],
+
   // Run and proposal lifecycle.
   ['RUN_ALREADY_FINISHED', 'That run has already finished.'],
   ['PROPOSAL_NOT_APPROVABLE', 'This proposal cannot be approved in its current state.'],

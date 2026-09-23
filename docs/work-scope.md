@@ -2,17 +2,24 @@
 
 Scoped catalog PR1 added ONE server-owned contract that states what MILO
 intends to map, and a Mapping Plan surface to state and inspect it. Scoped
-catalog PR2 adds its preparation; see "Preparation" below. **Nothing executes
-from a plan in either release.** No run, launch or provider call is reachable
-from any of it. The API and the Mapping Plan reach no Government read at all;
-only the operator capture job prepares a plan, and only when an operator runs
-it explicitly.
+catalog PR2 added its preparation; see "Preparation" below. Scoped catalog PR3
+adds batch runs: a person starts ONE prepared batch at a time from the Mapping
+Plan, and watches the plan's progress; see "Batch runs" below.
+
+**A plan itself executes nothing.** A batch runs only when a person starts it,
+one batch per request, through the one run creation and launch path every run
+uses; nothing starts the next batch. The API and the Mapping Plan reach no
+Government read at all; only the operator capture job prepares a plan, and
+only when an operator runs it explicitly.
 
 - Code: `backend/catalog/scope/` (`contract.py`, `directory.py`, `interpret.py`,
   `coverage.py`, `service.py`).
 - Schema: `supabase/migrations/20260922000100_catalog_work_scopes.sql`.
 - UI: `frontend/components/scope/MappingPlanPanel.tsx` and `frontend/lib/workScope.ts`.
-- Gate: `MILO_ENABLE_WORK_SCOPE_MUTATIONS` (default off, pinned off everywhere).
+- Gates: `MILO_ENABLE_WORK_SCOPE_MUTATIONS` (plan writes) and
+  `MILO_ENABLE_WORK_SCOPE_BATCHES` (starting a batch, with
+  `MILO_ENABLE_RUN_CREATION`; pause / resume). Both default off, pinned off
+  everywhere.
 
 ## The contract (`milo-work-scope/1`)
 
@@ -123,20 +130,25 @@ for what is not known about it.
 
 | Route | Gate | Notes |
 | --- | --- | --- |
-| `GET /projects/{id}/work-scope/capabilities` | membership | `available` = `swarm_v2` project AND the flag. `can_prepare` / `can_start_batches` are always false in this release. |
+| `GET /projects/{id}/work-scope/capabilities` | membership | `available` = `swarm_v2` project AND the mutations flag. `can_start_batches` = `swarm_v2` AND `MILO_ENABLE_WORK_SCOPE_BATCHES` AND `MILO_ENABLE_RUN_CREATION`. `can_prepare` is always false: only the operator capture job prepares. |
 | `GET /projects/{id}/work-scope/directory` | membership | The directory, with coverage per entry. |
 | `GET /conversations/{id}/work-scopes/open` | membership | The conversation's open plan, or `{"work_scope": null}`. |
 | `GET /work-scopes/{id}` | membership | One plan. Absent and not-a-member are the same 404. |
 | `POST /conversations/{id}/work-scopes` | `MILO_ENABLE_WORK_SCOPE_MUTATIONS` | Revision 1. `{instruction}` OR `{edit}`, never both. One open plan per conversation. |
 | `POST /work-scopes/{id}/revisions` | `MILO_ENABLE_WORK_SCOPE_MUTATIONS` | Revision n+1. Must name `expected_revision` AND `expected_digest`; a stale head is `409 WORK_SCOPE_STALE`, and nothing is written. |
+| `GET /work-scopes/{id}/progress` | membership | The plan's progress, derived from durable state, and what the server allows next (`controls`). |
+| `POST /work-scopes/{id}/runs` | `MILO_ENABLE_RUN_CREATION` AND `MILO_ENABLE_WORK_SCOPE_BATCHES` | Starts ONE batch. Names `expected_revision`, `expected_digest`, `batch_id` and an `idempotency_key`. `202` with the run; see "Batch runs". |
+| `POST /work-scopes/{id}/pause` / `resume` | `MILO_ENABLE_WORK_SCOPE_BATCHES` | Holds / releases the plan's next batch. Idempotent (`changed: false`). |
 
 A write that is understood and changes nothing writes nothing (`applied:
 false`, `WORK_SCOPE_NOTE_NO_CHANGE`).
 
-The gateway proxies the three reads the UI uses as SAFE routes, and the two
-writes as execution routes behind `GATEWAY_ALLOW_EXECUTION_ROUTES`. The UI
-renders the surface only when the execution UI flag is on AND the capability
-read says the plan is available.
+The gateway proxies the four reads the UI uses as SAFE routes, and the five
+writes as execution routes behind `GATEWAY_ALLOW_EXECUTION_ROUTES`; a batch
+start is also a run-creation route there, rate limited as one. The UI renders
+the surface only when the execution UI flag is on AND the capability read says
+the plan is available, and the Batches section only where `can_start_batches`
+is true.
 
 ## Database guarantees
 
@@ -261,3 +273,107 @@ exactly that batch: its one scoped snapshot, pinned by key, and its items in
 batch order. It is never prepared from "the newest snapshot" or "the first N
 candidates". The run's preparation record carries the batch identity, and a
 resumed attempt refuses unless the binding still names the same batch.
+
+## Batch runs (scoped catalog PR3)
+
+A prepared revision's batches become runs one at a time, and only when a person
+starts them from the Mapping Plan.
+
+- Code: `backend/catalog/scope/batches.py`, the routes in `backend/main.py`,
+  `frontend/components/scope/MappingPlanProgress.tsx`.
+- Schema: `supabase/migrations/20260924000100_catalog_work_scope_batch_runs.sql`.
+- Gate: `MILO_ENABLE_WORK_SCOPE_BATCHES`, with `MILO_ENABLE_RUN_CREATION` for a
+  start. Both default off, pinned off everywhere.
+
+### One start, one run, one launch path
+
+`POST /work-scopes/{id}/runs` names three PRECONDITIONS: the head revision and
+digest the progress was read against, and the batch the person confirmed. None
+of them chooses anything:
+
+1. The API authorizes membership, refuses a stale head or a batch that is not
+   the next one, and binds the run's immutable identity (the same identity gate
+   as every other run; a runtime that cannot bind one creates nothing).
+2. `create_work_scope_batch_run` runs ONE transaction under the plan's row
+   lock: an idempotent replay answers first -- unless the API would LAUNCH
+   the replayed run (its launch never happened or definitely failed), which is
+   a start and is refused when its batch is stale or the plan is paused or
+   closed; then a stale head
+   (`WORK_SCOPE_STALE`), a paused plan (`WORK_SCOPE_PAUSED`), a second live
+   batch (`WORK_SCOPE_BATCH_IN_PROGRESS`), a settled batch and any batch but the
+   NEXT one (`WORK_SCOPE_BATCH_NOT_NEXT`) are refused, and a refusal writes
+   nothing; then `create_message_and_run_v3` writes the message, the queued run
+   and its identity, with its own concurrency ceilings, and
+   `bind_work_scope_batch_run` binds that run to the batch.
+3. The API's existing launch step launches it: the launch compare-and-set, the
+   launcher, and the same `launch_failed` / `launch_unknown` handling.
+
+A second request for the batch that is already running -- a double click with a
+fresh key, a second tab -- answers with THAT run (`created: false`) and is
+launched only if no worker was ever started for it (its launch never happened,
+or definitely failed), so such a batch is launched as the same run and an
+uncertain launch is never relaunched. The Mapping Plan offers "Launch batch N"
+for it, for the head revision only.
+
+The run's instruction is composed by the server from the batch ("Mapping plan
+batch 2 of 3 ... research the 10 Toyota vehicle variant candidates ..."); the
+candidates reach the engine from the binding, through the worker's
+server-owned work context. Nothing the browser sends reaches the run's work.
+
+### One execution scope for the catalog
+
+With the Government read on, every catalog-reading Swarm V2 run is
+BATCH-BOUND: the worker refuses a run the database binds to no batch
+(`GOVERNMENT_BATCH_REQUIRED`) before it reads any snapshot. There is no other
+way for a paid run to choose catalog work -- no "newest snapshot, first N
+candidates" -- so a chat request and the Mapping Plan can never be two execution
+scopes. A chat instruction changes the PLAN (the same contract and digest as a
+click); the plan's batches are the only catalog work that runs. With the read
+off, a batch run is refused (`GOVERNMENT_READ_REQUIRED`) rather than run without
+its candidates, and unbound runs behave exactly as before.
+
+### Continuation
+
+- **One batch at a time.** Nothing starts the next batch; the Mapping Plan
+  offers "Continue with batch N" once the previous one has settled.
+- **In order.** Only the lowest-numbered unsettled batch of the head revision
+  may start, so no candidate is skipped.
+- **Settled.** A batch whose run ended `completed` or `partial_success` has
+  finished its work and is never run again (its unresolved candidates are
+  counted as unresolved, not re-researched).
+- **Interrupted.** A batch whose run failed, was cancelled, timed out or hit its
+  budget stays the next batch; starting it again is its next attempt.
+- **Pause / resume.** An append-only control history
+  (`catalog_work_scope_controls`, alternating, gap-free) holds the plan: a
+  paused plan starts nothing. A pause does not stop a running batch; the
+  existing run cancellation does, and the Mapping Plan's "Cancel this batch"
+  calls it.
+- **Stale revisions never start.** A revision made while a batch runs leaves
+  that batch running (it is shown as belonging to its revision); the new head
+  starts nothing until the operator has prepared it.
+- **A batch no worker was started for** (its launch never happened or
+  definitely failed) is launched again as the same run, never cancelled from
+  the Mapping Plan: nothing would finalize the cancellation of a run no worker
+  claims, so it would stay `cancellation_requested` and hold the plan. Known
+  gap: when the plan was revised past such a batch it can be neither launched
+  (stale) nor finalized, and it holds the plan until an operator resolves it;
+  the existing reconciliation tooling covers `launch_unknown` only.
+
+### Progress
+
+`work_scope_progress` derives everything from durable state and writes
+nothing: each batch's state from its bound runs' statuses, and its promoted /
+refused counts from those runs' own `catalog_variant_promoted` /
+`catalog_promotion_refused` events matched to the queue by candidate key.
+Unresolved = a settled batch's candidates that were neither promoted nor
+refused. The API adds what the server allows next (`controls.start` with its
+`blocked_by` reason, `pause`, `resume`, `cancel`), and the Mapping Plan polls
+the read every few seconds only while a batch is running. The browser counts
+nothing.
+
+### Rollback
+
+Turn `MILO_ENABLE_WORK_SCOPE_BATCHES` off: no batch starts, pauses or resumes;
+the progress read keeps answering; a running batch is untouched and can still
+be cancelled. Nothing is deleted or rewritten.
+
