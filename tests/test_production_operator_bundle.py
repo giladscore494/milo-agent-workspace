@@ -12,6 +12,7 @@ fabricated operator configuration pointing at obviously non-production names.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -23,6 +24,7 @@ REPO = Path(__file__).resolve().parents[1]
 CONTRACT = REPO / "scripts/deploy/deployment-contract.sh"
 CAPTURE_SCRIPT = REPO / "scripts/catalog/government-production-capture.sh"
 PREFLIGHT = REPO / "scripts/deploy/production-preflight.sh"
+WORKER_EXECUTIONS = REPO / "scripts/deploy/check-worker-executions.py"
 VERIFY = REPO / "scripts/deploy/production-verify.sh"
 ACTIVATE = REPO / "scripts/deploy/production-activate.sh"
 BOOTSTRAP = REPO / "scripts/deploy/gcp-bootstrap.sh"
@@ -206,6 +208,45 @@ def test_preflight_offline_mode_makes_no_remote_call(tmp_path):
     # checked the live project.
     assert "--offline: every live check skipped" in result.stdout
     assert "gcloud:context" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("executions", "gcloud_failure", "expected_code", "expected_message"),
+    [
+        ([{"metadata": {"name": "worker-1"},
+           "status": {"completionTime": "2026-09-23T18:00:00Z"}},
+          {"metadata": {"name": "worker-2"},
+           "status": {"completionTime": "2026-09-23T18:01:00Z"}}],
+         False, 0, "2 execution(s), all terminal"),
+        ([{"metadata": {"name": "worker-1"}, "status": {}}],
+         False, 1, "worker-1"),
+        ([], True, 2, "cannot list worker executions"),
+        ({"unexpected": "object"}, False, 2, "expected a JSON list"),
+    ],
+)
+def test_worker_execution_gate_handles_live_results_and_gcloud_errors(
+        tmp_path, executions, gcloud_failure, expected_code, expected_message):
+    """A failed gcloud filter used to look exactly like an active execution."""
+    fake_gcloud = tmp_path / "gcloud"
+    fake_gcloud.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "assert '--format=json' in sys.argv and not any(a.startswith('--filter') for a in sys.argv)\n"
+        "if os.environ.get('MOCK_GCLOUD_FAILURE') == '1':\n"
+        "    print('simulated gcloud failure', file=sys.stderr)\n"
+        "    sys.exit(1)\n"
+        "print(os.environ['MOCK_EXECUTIONS'])\n"
+    )
+    fake_gcloud.chmod(0o755)
+    env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}",
+               MOCK_EXECUTIONS=json.dumps(executions),
+               MOCK_GCLOUD_FAILURE="1" if gcloud_failure else "0")
+    result = subprocess.run(
+        ["python3", str(WORKER_EXECUTIONS), "test-worker", "test-region", "test-project"],
+        capture_output=True, text=True, check=False, env=env, cwd=REPO,
+    )
+    assert result.returncode == expected_code, result.stdout + result.stderr
+    assert expected_message in result.stdout
 
 
 def test_every_bundle_script_refuses_an_unknown_argument(tmp_path):

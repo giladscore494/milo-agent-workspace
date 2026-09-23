@@ -699,8 +699,10 @@ verify_no_public_access() {
 }
 
 worker_execution_count() {
-  gcloud run jobs executions list --job "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" \
-    --format='value(metadata.name)' 2>/dev/null | grep -c '.' || true
+  local executions
+  executions=$(gcloud run jobs executions list --job "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" \
+    --format='value(metadata.name)') || fail "Cannot list worker executions; cannot verify deployment safety."
+  printf '%s\n' "$executions" | awk 'NF { count++ } END { print count+0 }'
 }
 
 verify_no_worker_execution() {
@@ -788,7 +790,8 @@ assert_bindings_preserved "API service '$API_SERVICE'" "$API_BINDINGS_BEFORE" "$
 verify_no_public_access service "$API_SERVICE"
 
 echo "Verifying that the deployment executed nothing:"
-verify_no_worker_execution "$WORKER_EXECUTIONS_BEFORE" "$(worker_execution_count)"
+WORKER_EXECUTIONS_AFTER=$(worker_execution_count)
+verify_no_worker_execution "$WORKER_EXECUTIONS_BEFORE" "$WORKER_EXECUTIONS_AFTER"
 
 service_url=$(gcloud run services describe "$API_SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')
 echo "API service URL: $service_url"

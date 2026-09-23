@@ -126,8 +126,16 @@ case "$args" in
     echo "build submitted (mock)" ;;
   "run jobs executions list"*)
     if deployed; then
+      if [[ "${MOCK_EXECUTIONS_AFTER_ERROR:-}" == "1" ]]; then
+        echo "mock execution listing failed after deploy" >&2
+        exit 1
+      fi
       cat "$MOCK_DIR/executions-after.txt"
     else
+      if [[ "${MOCK_EXECUTIONS_BEFORE_ERROR:-}" == "1" ]]; then
+        echo "mock execution listing failed before deploy" >&2
+        exit 1
+      fi
       cat "$MOCK_DIR/executions-before.txt"
     fi ;;
   "run services describe"*)
@@ -573,6 +581,15 @@ def test_deployment_fails_when_a_worker_execution_appears(deployment):
     result = deployment.run()
     assert result.returncode != 0
     assert "Worker job executions changed during deployment" in result.stderr
+
+
+@pytest.mark.parametrize("when", ["BEFORE", "AFTER"])
+def test_deployment_fails_when_worker_execution_listing_fails(deployment, when):
+    result = deployment.run(**{f"MOCK_EXECUTIONS_{when}_ERROR": "1"})
+    assert result.returncode != 0
+    assert "Cannot list worker executions; cannot verify deployment safety." in result.stderr
+    if when == "BEFORE":
+        assert_nothing_was_mutated(deployment)
 
 
 # ---------------------------------------------------------------------------
