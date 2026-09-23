@@ -1016,16 +1016,12 @@ def test_an_earlier_real_commit_with_the_same_policy_is_accepted():
     assert policy_envelope.release_binding_problems(match) == []
 
 
-def test_the_binding_never_asks_which_commit_is_checked_out():
-    """Stated over the parsed source, so prose cannot pass or fail it."""
-    import inspect
-
-    sys.path.insert(0, str(STAGE_D))
-    import policy_envelope
-
-    source = inspect.getsource(policy_envelope.release_binding_problems)
-    assert "rev-parse" not in source or "HEAD" not in source
-    assert "HEAD" not in source, "the binding is back to comparing checkout HEAD"
+# "The binding never asks which commit is checked out" is asserted over the
+# parsed source of policy_envelope.release_binding_problems by
+# tests/test_runtime_policy_authority.py::
+# test_stage_d_binds_the_policy_by_content_not_by_checkout, which also pins
+# POLICY_SOURCE_PATH and the file the policy is really imported from. The
+# weaker copy that lived here was removed as a strict subset of it.
 
 
 def test_the_step_scripts_gate_on_the_binding_before_creating_a_run():
@@ -1558,6 +1554,14 @@ class StageDWorld:
             "MOCK_LOG": str(self.log),
             "MOCK_PROBE_DIR": str(self.dir),
             "STAGE_D_WORKDIR": str(self.workdir),
+            # The mock answers every log read instantly, so the operator
+            # scripts' production pause between probe-log retries (10s,
+            # probe_exec.sh / 06-collect-evidence.sh) only burns wall-clock:
+            # a probe that never emits a record used to sleep ~90s per test.
+            # The retry COUNT and the fail-closed verdict are untouched, so
+            # the bounded loop is still exercised end to end. Placed before
+            # **extra so a test can still state its own delay.
+            "PROBE_LOG_RETRY_DELAY_SECONDS": "0",
             **extra,
         }
 

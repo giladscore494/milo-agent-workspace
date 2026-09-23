@@ -5,26 +5,42 @@ on:
   push:
     branches: [main]
 
+# Release acceptance: every job below is MANDATORY for a commit to be a
+# release candidate (docs/production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md
+# lists them by name). None of them is path-filtered or conditional, and
+# tests/test_ci_workflow_static.py pins that contract.
 jobs:
   offline-checks:
+    # Backend unit/contract suite plus the core static safety scans. The two
+    # executable-PostgreSQL modules run ONLY in postgres-checks (strict gate,
+    # skips forbidden); every other PostgreSQL-backed fixture that remains in
+    # this suite (the Stage D capture-SQL fixture) is made mandatory by
+    # MILO_REQUIRE_PG_TESTS, so it can never skip silently here either.
     runs-on: ubuntu-latest
     env:
       SUPABASE_URL: https://example.supabase.co
       SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
       JOB_LAUNCHER: disabled
       NEXT_PUBLIC_API_URL: http://localhost:8080
+      MILO_REQUIRE_PG_TESTS: '1'
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full history (the repository is a few MB): the Stage D release
+          # binding tests compare against a pinned release commit and walk
+          # ancestors of HEAD. On a depth-1 checkout they could only skip.
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '22'
       - name: Install backend dependencies
         run: python -m pip install -r backend/requirements.txt
       - name: Backend offline tests
-        run: pytest -q tests --ignore=MILO-main-original/MILO-main/test_websearch.py
+        run: >-
+          pytest -q -rs tests
+          --ignore=MILO-main-original/MILO-main/test_websearch.py
+          --ignore=tests/test_migrations_postgres.py
+          --ignore=tests/test_worker_rpc_acl_postgres.py
       - name: Migration syntax smoke check
         run: python scripts/check_migrations.py
       - name: Secret scan
@@ -33,13 +49,39 @@ jobs:
         run: python scripts/check_unsafe_defaults.py
       - name: ShellCheck release/operator scripts
         run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
+          # ShellCheck ships in the ubuntu-latest runner image; install it only
+          # if a future image drops it (the lint itself always runs).
+          if ! command -v shellcheck > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
           shellcheck -x -S warning -P scripts/release:scripts/release/stage-d:scripts/deploy:scripts/catalog scripts/release/*.sh scripts/release/lib/common.sh scripts/release/swarm-v2-smoke/*.sh scripts/release/stage-d/*.sh scripts/deploy/*.sh scripts/catalog/*.sh
       - name: Release manifest schema validation
         run: python scripts/release/validate_production_manifest.py --manifest config/production.example.yaml --mode plan
-      - name: Read-only production readiness audit (proves no external calls / no mutation in CI)
+      - name: OFFLINE release-tooling self-check (no credentials; does NOT verify live production)
+        # production-readiness.sh with no operator arguments: proves the
+        # orchestrator runs read-only with no external call and no mutation.
+        # Every GCP / Supabase / Redis / Vercel check reports MANUAL here, so
+        # its "RESULT: OK" is NOT production readiness; that requires the
+        # authenticated operator run described in docs/production-readiness.
         run: bash scripts/release/production-readiness.sh
+
+  frontend-and-docker:
+    # Container images and the complete frontend gate. Split out of
+    # offline-checks so it runs in parallel with the backend suite; it is
+    # exactly as mandatory as before.
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: https://example.supabase.co
+      SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
+      JOB_LAUNCHER: disabled
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
       - name: Docker build API
         run: docker build -f Dockerfile.api -t milo-agent-api:ci .
       - name: Docker build worker
@@ -89,13 +131,15 @@ jobs:
           sudo apt-get install -y postgresql
       - name: Install backend dependencies
         run: python -m pip install -r backend/requirements.txt
-      - name: Executable migration + concurrency + RLS suite (skips forbidden)
+      - name: Executable migration + concurrency + RLS + RPC ACL suite (skips forbidden)
         run: |
           # `pytest | tee` returns TEE's status, so without pipefail this job
           # could only ever fail on a skip -- a failing suite exited 0 and the
           # check went green. The gate now reports what the suite actually did.
+          # These two modules are the executable-PostgreSQL suites; they run
+          # here and ONLY here (offline-checks ignores them).
           set -o pipefail
-          pytest -rs tests/test_migrations_postgres.py | tee pg-test-output.txt
+          pytest -rs tests/test_migrations_postgres.py tests/test_worker_rpc_acl_postgres.py | tee pg-test-output.txt
           if grep -qE "SKIPPED|skipped" pg-test-output.txt; then
             echo "PostgreSQL tests were skipped; failing the job."
             exit 1

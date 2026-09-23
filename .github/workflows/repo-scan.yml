@@ -5,23 +5,80 @@ on:
     branches: [main]
   pull_request:
 
+# MILO-main-original/MILO-main and legacy/milo-streamlit-v1 are IMMUTABLE,
+# byte-identical reference snapshots of the Streamlit prototype. Nothing in
+# the product imports either one (.dockerignore excludes both); the V1 parity
+# tests in the main suite load legacy/milo-streamlit-v1/app.py.
+#
+# The job below ALWAYS runs and ALWAYS reports under the same check name, so
+# a check that is (or later becomes) required can never be left pending:
+#   1. archive integrity (always): every snapshot file matches
+#      archive/SHA256SUMS.txt, and the snapshot directories hold exactly the
+#      files the manifest lists -- nothing added, nothing missing;
+#   2. the prototype's own ruff lint and offline tests (only when a snapshot,
+#      the manifest or this workflow changes). With the bytes proven identical
+#      to the manifest, re-running them on an unrelated change can only fail
+#      for external reasons (unpinned prototype requirements, linter churn).
+# If the changed-file set cannot be determined, step 2 runs (fail-safe).
+# tests/test_ci_workflow_static.py pins this contract.
 jobs:
   scan:
     name: Lint & Test
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: MILO-main-original/MILO-main
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # Needed to diff against the PR base / previous main commit.
+          fetch-depth: 0
+
+      - name: Archive integrity (SHA256 manifest, always)
+        run: |
+          set -euo pipefail
+          sha256sum --strict -c archive/SHA256SUMS.txt
+          expected="$(awk '{print $2}' archive/SHA256SUMS.txt | sort)"
+          actual="$(git ls-files MILO-main-original legacy | sort)"
+          if [ "${expected}" != "${actual}" ]; then
+            echo "Snapshot directories do not hold exactly the files in archive/SHA256SUMS.txt:"
+            diff <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}") || true
+            exit 1
+          fi
+          echo "Archive integrity verified: $(printf '%s\n' "${expected}" | wc -l) files."
+
+      - name: Decide whether the prototype snapshot is affected
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          if [ "${EVENT_NAME:-}" = "pull_request" ]; then
+            base="${PR_BASE_SHA:-}"
+          else
+            base="${PUSH_BEFORE_SHA:-}"
+          fi
+          run_prototype=true
+          if [[ "${base}" =~ ^[0-9a-f]{40}$ ]] && [[ ! "${base}" =~ ^0+$ ]] \
+             && changed="$(git diff --name-only "${base}" HEAD 2>/dev/null)"; then
+            if ! printf '%s\n' "${changed}" | grep -qE '^(MILO-main-original/|legacy/|archive/SHA256SUMS\.txt$|\.github/workflows/repo-scan\.yml$)'; then
+              run_prototype=false
+            fi
+          else
+            echo "Could not determine the changed files; running the prototype checks."
+          fi
+          echo "run_prototype=${run_prototype}" >> "${GITHUB_OUTPUT}"
+          echo "Prototype lint/tests required: ${run_prototype}"
 
       - name: Set up Python
+        if: steps.scope.outputs.run_prototype != 'false'
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        if: steps.scope.outputs.run_prototype != 'false'
+        working-directory: MILO-main-original/MILO-main
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
@@ -34,7 +91,11 @@ jobs:
           pip install ruff==0.15.22 pytest
 
       - name: Lint (ruff)
+        if: steps.scope.outputs.run_prototype != 'false'
+        working-directory: MILO-main-original/MILO-main
         run: ruff check .
 
       - name: Run tests
+        if: steps.scope.outputs.run_prototype != 'false'
+        working-directory: MILO-main-original/MILO-main
         run: pytest -v test_safe_agent_pipeline.py test_safety_guards.py
