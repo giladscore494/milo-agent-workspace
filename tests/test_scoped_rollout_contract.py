@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -960,7 +961,7 @@ def test_the_batch_path_must_be_named_and_ready(tmp_path):
 # =============================================================================
 
 def _verify_tree(tmp_path, *, migration_detail: str, migration_status: str = "PASS",
-                 readiness: str, website: str) -> Tree:
+                 readiness: str, website: str, release_format: str = "{sha}") -> Tree:
     tree = Tree(tmp_path, ("production-verify.sh",))
     report = {"summary": {"blocked": 0 if migration_status == "PASS" else 1},
               "checks": [{"status": migration_status, "name": "remote:state",
@@ -979,7 +980,7 @@ def _verify_tree(tmp_path, *, migration_detail: str, migration_status: str = "PA
                         'case "$*" in\n'
                         f'  *"services describe"*"containers[0].image"*) echo {api_image} ;;\n'
                         f'  *"jobs describe"*"containers[0].image"*) echo {image} ;;\n'
-                        f'  *MILO_RELEASE_SHA*) echo {tree.sha} ;;\n'
+                        f"  *MILO_RELEASE_SHA*) printf '%s\\n' {shlex.quote(release_format.format(sha=tree.sha))} ;;\n"
                         "esac\nexit 0\n")
     return tree
 
@@ -1042,6 +1043,25 @@ def test_the_deployed_gate_passes_on_code_and_the_exact_schema_only(tmp_path):
     result = tree.run("production-verify.sh", "--gate", "deployed")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "RESULT: OK" in result.stdout
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_deployed_gate_accepts_gcloud_quoted_release_sha(tmp_path, quote):
+    tree = _verify_tree(tmp_path, readiness=READY, website=SITE_OFF,
+                        migration_detail="remote schema classified as fully-migrated (41/41)",
+                        release_format=f"{quote}{{sha}}{quote}")
+    result = tree.run("production-verify.sh", "--gate", "deployed")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _verdict(result.stdout)["CODE_DEPLOYED"] == "VERIFIED"
+
+
+def test_deployed_gate_rejects_a_release_sha_with_extra_characters(tmp_path):
+    tree = _verify_tree(tmp_path, readiness=READY, website=SITE_OFF,
+                        migration_detail="remote schema classified as fully-migrated (41/41)",
+                        release_format="'{sha}'-extra")
+    result = tree.run("production-verify.sh", "--gate", "deployed")
+    assert result.returncode == 1
+    assert _verdict(result.stdout)["CODE_DEPLOYED"] == "NO"
 
 
 def test_the_verifier_never_reports_a_generic_snapshot_as_readiness():
