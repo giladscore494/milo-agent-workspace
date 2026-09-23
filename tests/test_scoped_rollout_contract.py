@@ -493,9 +493,25 @@ def test_stage_p_opens_plan_writes_and_proves_run_creation_is_still_off(tmp_path
 # 3. production-activate.sh: the order, and resuming
 # =============================================================================
 
+# What work-scope-readiness.sh prints for a valid, never-prepared head revision.
+UNPREPARED = (
+    "echo 'DATABASE_READ=VERIFIED (read-only role sees service-only rows)'\n"
+    "echo 'WORK_SCOPE_SCHEMA=VERIFIED (7 tables with RLS, 9 RPCs service_role-only)'\n"
+    f"echo 'WORK_SCOPE_ID={WS_ID}'\n"
+    "echo 'WORK_SCOPE_PLAN=VERIFIED (revision 2 is the open head with that exact digest)'\n"
+    "echo 'WORK_SCOPE_PREPARED=NO (revision 2 has not been prepared. Run the scoped preparation)'\n"
+    "echo 'EVIDENCE_READY=NO (no scoped Government snapshot is linked to this revision)'\n"
+    "echo 'BATCH_READY=NO (no batch exists for this revision)'\n"
+    "echo 'WORK_SCOPE_READINESS=NO (3 fact(s) NO, 0 UNVERIFIED)'\n"
+    "exit 1")
+
+
 def _orchestrator(tmp_path, *, deployed: bool = False, database_ok: bool = True,
-                  prepared: bool = False) -> Tree:
-    tree = Tree(tmp_path, ("production-activate.sh",))
+                  prepared: bool = False, readiness: str | None = None,
+                  real_readiness: bool = False) -> Tree:
+    real = ("production-activate.sh", "work-scope-readiness.sh") if real_readiness \
+        else ("production-activate.sh",)
+    tree = Tree(tmp_path, real)
     tree.stub("scripts/deploy/production-preflight.sh")
     verify = ('if [[ "$*" == *"--gate database"* ]]; then exit {db}; fi\n'
               'if [[ "$*" == *"--gate deployed"* ]]; then {deployed}; exit 0; fi\n'
@@ -508,9 +524,11 @@ def _orchestrator(tmp_path, *, deployed: bool = False, database_ok: bool = True,
               '"$DEPLOY_MODE" "$PROJECT_ID" "$JOB_LAUNCHER_MODE" "$MILO_EXPECTED_SUPABASE_PROJECT_REF" '
               '"$ALLOWED_CORS_ORIGINS" >> "$MILO_TEST_LOG"')
     tree.stub("scripts/deploy/website-execution-activate.sh")
-    tree.stub("scripts/deploy/work-scope-readiness.sh",
-              "echo WORK_SCOPE_PREPARED=VERIFIED; exit 0" if prepared
-              else "echo WORK_SCOPE_PLAN=VERIFIED; echo WORK_SCOPE_PREPARED=NO; exit 1")
+    if not real_readiness:
+        tree.stub("scripts/deploy/work-scope-readiness.sh",
+                  readiness if readiness is not None
+                  else "echo WORK_SCOPE_PREPARED=VERIFIED; exit 0" if prepared
+                  else UNPREPARED)
     tree.stub("scripts/catalog/government-production-capture.sh",
               'if [[ "$*" == *"--prepare "* || "$*" == *"--prepare" ]]; then '
               'echo PREPARED_RUN_ID=00000000-0000-4000-8000-0000000000aa; fi')
@@ -585,6 +603,156 @@ def test_a_prepared_revision_is_never_prepared_again(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "SKIPPED: this revision is already prepared" in result.stdout
     assert not any(c.startswith("government-production-capture.sh") for c in tree.calls())
+
+
+PREPARE = ("--prepare-work-scope", *WS_ARGS,
+           "--enable-catalog-execution", "--enable-work-scope-preparation")
+
+
+def _stopped_before_any_capture(tree: Tree, result: subprocess.CompletedProcess) -> None:
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not any(c.startswith("government-production-capture.sh") for c in tree.calls())
+    # Nothing after the stop either: not even the prepared-gate verify.
+    assert not any("--gate prepared" in c for c in tree.calls())
+    assert "Nothing was executed" in result.stderr
+    # The stop names the read-only check that resolves it.
+    assert "read -rs MILO_TEST_RO_DB_URL && export MILO_TEST_RO_DB_URL" in result.stderr
+    assert f"bash scripts/deploy/work-scope-readiness.sh --operator-config {tree.config} " \
+           f"{' '.join(WS_ARGS)}" in result.stderr
+    assert "PROCEEDING" not in result.stdout
+
+
+@pytest.mark.parametrize("readiness", [
+    # no read-only connection string
+    "echo 'DATABASE_READ=UNVERIFIED (set $MILO_TEST_RO_DB_URL)'; "
+    "echo 'WORK_SCOPE_READINESS=UNVERIFIED (1 fact(s) could not be verified)'; exit 3",
+    # the database was read, the plan could not be
+    "echo DATABASE_READ=VERIFIED; echo WORK_SCOPE_SCHEMA=VERIFIED; "
+    "echo 'WORK_SCOPE_PLAN=UNVERIFIED (the plan query failed)'; exit 3",
+    # the plan was read, its preparation could not be
+    "echo DATABASE_READ=VERIFIED; echo WORK_SCOPE_SCHEMA=VERIFIED; "
+    f"echo WORK_SCOPE_ID={WS_ID}; echo WORK_SCOPE_PLAN=VERIFIED; "
+    "echo 'WORK_SCOPE_PREPARED=UNVERIFIED (the preparation query failed)'; exit 3",
+], ids=["no-db-url", "plan-unread", "preparation-unread"])
+def test_unverified_readiness_never_reaches_a_capture_command(tmp_path, readiness):
+    tree = _orchestrator(tmp_path, readiness=readiness)
+    result = tree.run("production-activate.sh", *PREPARE)
+    _stopped_before_any_capture(tree, result)
+    assert "STOP: readiness is UNVERIFIED" in result.stderr
+
+
+FAKE_PSQL = r"""#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+values = {}
+for i, a in enumerate(args):
+    if a == "-v" and "=" in args[i + 1]:
+        k, v = args[i + 1].split("=", 1); values[k] = v
+sql = sys.stdin.read()
+mode = os.environ.get("MILO_TEST_PSQL", "unprepared")
+if mode == "refused":
+    sys.exit(2)
+if "rolbypassrls" in sql:
+    print("false" if mode == "rls-bound" else "true")
+elif ":'tables'" in sql:
+    print("\n".join(f"{t}|true|true" for t in values["tables"].split(",")))
+elif ":'rpcs'" in sql:
+    print("\n".join(f"{r}|1|true|false" for r in values["rpcs"].split(",")))
+elif "from public.catalog_work_scopes s" in sql and "workflow_key" in sql:
+    d = values["ws_digest"]
+    print(f"true|{values['ws_rev']}|{d}|swarm_v2|{d}|false")
+elif "catalog_work_scope_preparations p" in sql and "public.runs" in sql:
+    pass  # never prepared
+else:
+    sys.exit(3)
+"""
+
+
+@pytest.mark.parametrize("env,psql,detail", [
+    ({}, None, "set $MILO_TEST_RO_DB_URL to a read-only connection string"),
+    ({"MILO_TEST_RO_DB_URL": "postgresql://ro@db.test/postgres"}, None, "psql is not installed"),
+    ({"MILO_TEST_RO_DB_URL": "postgresql://ro@db.test/postgres", "MILO_TEST_PSQL": "refused"},
+     FAKE_PSQL, "the read-only connection failed or was refused"),
+    ({"MILO_TEST_RO_DB_URL": "postgresql://ro@db.test/postgres", "MILO_TEST_PSQL": "rls-bound"},
+     FAKE_PSQL, "subject to row-level security"),
+], ids=["no-read-only-url", "no-psql", "connection-refused", "rls-bound-role"])
+def test_the_real_readiness_check_unverified_stops_the_preparation(tmp_path, env, psql, detail):
+    """The real work-scope-readiness.sh, not a stand-in: UNVERIFIED is exit 3."""
+    tree = _orchestrator(tmp_path, real_readiness=True)
+    if psql:
+        tree.tool("psql", psql)
+    result = tree.run("production-activate.sh", *PREPARE, env=env)
+    assert "DATABASE_READ=UNVERIFIED" in result.stdout and detail in result.stdout
+    _stopped_before_any_capture(tree, result)
+    assert "STOP: readiness is UNVERIFIED" in result.stderr
+
+
+def test_the_real_readiness_check_proving_an_unprepared_revision_lets_it_prepare(tmp_path):
+    """The success path is matched against what the real check prints."""
+    tree = _orchestrator(tmp_path, real_readiness=True)
+    tree.tool("psql", FAKE_PSQL)
+    result = tree.run("production-activate.sh", *PREPARE,
+                      env={"MILO_TEST_RO_DB_URL": "postgresql://ro@db.test/postgres"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "WORK_SCOPE_PREPARED=NO (revision 2 has not been prepared." in result.stdout
+    assert "PROCEEDING" in result.stdout
+    capture = [c for c in tree.calls() if c.startswith("government-production-capture.sh")]
+    assert len(capture) == 3
+    assert "--ensure-job" in capture[0] and "--prepare " in capture[1] + " "
+    assert "--prepare-work-scope" in capture[2]
+
+
+BROKEN_PREPARATION = (
+    "echo DATABASE_READ=VERIFIED; echo WORK_SCOPE_SCHEMA=VERIFIED; "
+    f"echo WORK_SCOPE_ID={WS_ID}; echo WORK_SCOPE_PLAN=VERIFIED; "
+    "echo WORK_SCOPE_PREPARATION_ID=99999999-0000-4000-8000-000000000000; "
+    "echo 'WORK_SCOPE_PREPARED=NO (the preparation names another digest)'; exit 1")
+
+
+@pytest.mark.parametrize("readiness,reason", [
+    ("echo 'FAIL: unknown argument'; exit 2", "failed unexpectedly (exit 2"),
+    ("exit 127", "failed unexpectedly (exit 127"),
+    ("echo WORK_SCOPE_READINESS=VERIFIED; exit 0", "failed unexpectedly (exit 0"),
+    ("exit 1", "without proving"),
+    # a NO that is not "never prepared": preparing again would duplicate it
+    (BROKEN_PREPARATION, "without proving"),
+    (BROKEN_PREPARATION.replace("the preparation names another digest",
+                                "more than one preparation answered for one revision")
+     .replace("echo WORK_SCOPE_PREPARATION_ID=99999999-0000-4000-8000-000000000000; ", ""),
+     "without proving"),
+    # every fact present but the database read is not
+    (UNPREPARED.replace("echo 'DATABASE_READ=VERIFIED (read-only role sees service-only rows)'\n", ""),
+     "without proving"),
+    # the answer is about another plan
+    (UNPREPARED.replace(WS_ID, "99999999-2222-4333-8444-555555555555"), "without proving"),
+    # the plan or schema is NO
+    ("echo DATABASE_READ=VERIFIED; echo 'WORK_SCOPE_SCHEMA=NO (missing tables)'; exit 1",
+     "cannot be prepared"),
+    ("echo DATABASE_READ=VERIFIED; echo WORK_SCOPE_SCHEMA=VERIFIED; "
+     "echo 'WORK_SCOPE_PLAN=NO (revision 2 is not the head)'; exit 1", "cannot be prepared"),
+], ids=["usage-error", "crashed", "exit-0-without-facts", "exit-1-without-facts",
+        "broken-preparation", "duplicate-preparation", "no-database-read", "another-plan",
+        "schema-no", "stale-plan"])
+def test_any_readiness_answer_short_of_proof_stops_the_preparation(tmp_path, readiness, reason):
+    tree = _orchestrator(tmp_path, readiness=readiness)
+    result = tree.run("production-activate.sh", *PREPARE)
+    _stopped_before_any_capture(tree, result)
+    assert reason in result.stderr
+
+
+def test_a_prepared_revision_is_skipped_and_verified_even_if_later_facts_are_unverified(tmp_path):
+    """Idempotent: an already-prepared revision creates no capture run; the
+    read-only prepared gate (not this step) decides whether it is usable."""
+    tree = _orchestrator(tmp_path, readiness=(
+        "echo DATABASE_READ=VERIFIED; echo WORK_SCOPE_SCHEMA=VERIFIED; "
+        f"echo WORK_SCOPE_ID={WS_ID}; echo WORK_SCOPE_PLAN=VERIFIED; "
+        "echo WORK_SCOPE_PREPARED=VERIFIED; echo 'EVIDENCE_READY=UNVERIFIED (query failed)'; exit 3"))
+    result = tree.run("production-activate.sh", *PREPARE)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SKIPPED: this revision is already prepared" in result.stdout
+    assert not any(c.startswith("government-production-capture.sh") for c in tree.calls())
+    last = tree.calls()[-1]
+    assert last.startswith("production-verify.sh") and "--gate prepared" in last
 
 
 @pytest.mark.parametrize("args,message", [

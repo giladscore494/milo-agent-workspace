@@ -25,7 +25,12 @@
 #   5. prepare-work-scope the named plan revision: ensure the capture job on the
 #                         release image, prepare an operator capture run, run
 #                         the scoped preparation, verify. Skipped (verify only)
-#                         when that revision is already prepared.
+#                         when that revision is already prepared. Fail-closed:
+#                         nothing capture-related runs unless the read-only
+#                         readiness check PROVES the schema and the named
+#                         revision are valid and that revision was never
+#                         prepared. UNVERIFIED (no read-only URL, no psql, a
+#                         refused connection, an RLS-bound role) stops here.
 #   6. verify (prepared)  read-only, for the named revision
 #   7. website            Stage 2 is applied by website-execution-activate.sh
 #                         --apply-backend, a separate decision; this prints it.
@@ -251,19 +256,65 @@ if [[ "$DO_PREPARE" -eq 1 ]]; then
   readiness="$(cat "${TMPDIR:-/tmp}/milo-prepare-readiness.$$")"
   rm -f "${TMPDIR:-/tmp}/milo-prepare-readiness.$$"
   printf '%s\n' "$readiness"
+  ws_id=""
+  for index in "${!WS_ARGS[@]}"; do
+    [[ "${WS_ARGS[$index]}" == "--work-scope-id" ]] && ws_id="${WS_ARGS[$((index + 1))]}"
+  done
+  # The read-only check that answers the question, printed on every stop.
+  readiness_hint() {
+    local url_env
+    url_env="$(milo_op READONLY_DATABASE_URL_ENV)"
+    url_env="${url_env:-<READONLY_DATABASE_URL_ENV>}"
+    printf '      Resolve it with the read-only check (SELECTs only; it creates nothing):\n' >&2
+    printf '        read -rs %s && export %s\n' "$url_env" "$url_env" >&2
+    printf '        bash scripts/deploy/work-scope-readiness.sh%s %s\n' \
+      "${CONFIG_ARG[*]:+ ${CONFIG_ARG[*]}}" "${WS_ARGS[*]}" >&2
+    printf '      (add --schema-only to check the migrations alone), then re-run this step.\n' >&2
+  }
+  # Fail-closed. A revision already prepared is skipped (nothing capture-
+  # related runs; the read-only verify below decides). A NEW preparation
+  # starts only on POSITIVE proof that the database was read by a role that
+  # sees service-only rows, the schema is in place, the named revision is the
+  # open head with that digest, and that revision was NEVER prepared -- the
+  # exact "has not been prepared" NO, not a broken or duplicate preparation.
+  # Everything else (UNVERIFIED, a usage error, a crash, a missing fact)
+  # stops before any capture command.
+  decision="stop"
   if grep -q '^WORK_SCOPE_PREPARED=VERIFIED' <<< "$readiness"; then
-    printf '\nSKIPPED: this revision is already prepared (a revision is prepared exactly once).\n'
-  elif grep -qE '^(WORK_SCOPE_PLAN|WORK_SCOPE_SCHEMA)=NO' <<< "$readiness"; then
-    printf '\nSTOP: the named revision cannot be prepared (above). Nothing was executed.\n' >&2
-    exit 1
-  else
-    [[ "$readiness_status" -ne 3 ]] || printf '\nNOTE: readiness is UNVERIFIED from here; the preparation itself is idempotent in the database.\n'
+    decision="skip"
+  elif [[ "$readiness_status" -eq 1 ]] \
+       && grep -qx 'DATABASE_READ=VERIFIED.*' <<< "$readiness" \
+       && grep -qx 'WORK_SCOPE_SCHEMA=VERIFIED.*' <<< "$readiness" \
+       && grep -qxF "WORK_SCOPE_ID=${ws_id}" <<< "$readiness" \
+       && grep -qx 'WORK_SCOPE_PLAN=VERIFIED.*' <<< "$readiness" \
+       && grep -qE '^WORK_SCOPE_PREPARED=NO \(revision [0-9]+ has not been prepared\.' <<< "$readiness" \
+       && ! grep -q '^WORK_SCOPE_PREPARATION_ID=' <<< "$readiness" \
+       && ! grep -qE '^[A-Z_]+=UNVERIFIED' <<< "$readiness"; then
+    decision="prepare"
+  fi
+  case "$decision" in
+    skip)
+      printf '\nSKIPPED: this revision is already prepared (a revision is prepared exactly once).\n' ;;
+    prepare)
+      printf '\nPROCEEDING: the schema and this exact revision are VERIFIED and it was never prepared.\n' ;;
+    *)
+      if [[ "$readiness_status" -eq 1 ]] && grep -qE '^(WORK_SCOPE_PLAN|WORK_SCOPE_SCHEMA)=NO' <<< "$readiness"; then
+        reason="the named revision cannot be prepared (see WORK_SCOPE_PLAN / WORK_SCOPE_SCHEMA above)"
+      elif [[ "$readiness_status" -eq 3 ]]; then
+        reason="readiness is UNVERIFIED (above), so nothing proves the plan and schema are valid or that this revision is unprepared"
+      elif [[ "$readiness_status" -eq 1 ]]; then
+        reason="readiness answered NO without proving this exact revision is valid and unprepared (above)"
+      else
+        reason="the readiness check failed unexpectedly (exit ${readiness_status}, above)"
+      fi
+      printf '\nSTOP: %s.\n' "$reason" >&2
+      printf '      Nothing was executed: no capture job, no capture run, no preparation.\n' >&2
+      readiness_hint
+      exit 1 ;;
+  esac
+  if [[ "$decision" == "prepare" ]]; then
     capture=("${REPO_ROOT}/scripts/catalog/government-production-capture.sh" "${CONFIG_ARG[@]}")
     bash "${capture[@]}" --ensure-job --enable-catalog-execution
-    ws_id=""
-    for index in "${!WS_ARGS[@]}"; do
-      [[ "${WS_ARGS[$index]}" == "--work-scope-id" ]] && ws_id="${WS_ARGS[$((index + 1))]}"
-    done
     prepared="$(bash "${capture[@]}" --prepare --enable-catalog-execution \
       --idempotency-key "$(attempt_key "work-scope-${ws_id:0:8}")" | tee /dev/stderr \
       | awk -F= '$1 == "PREPARED_RUN_ID" { print $2 }' | tail -n 1)"

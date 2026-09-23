@@ -459,9 +459,22 @@ bash scripts/deploy/production-activate.sh --prepare-work-scope $WS_ARGS \
 
 In order, this:
 
-1. Checks readiness. If the revision is already prepared, it only verifies,
-   because a revision is prepared exactly once. If the revision is stale or
-   the schema is missing, it stops.
+1. Checks readiness with `work-scope-readiness.sh`. If the revision is
+   already prepared, it only verifies, because a revision is prepared exactly
+   once. It continues to step 2 only when readiness **proves** all of these:
+   `DATABASE_READ=VERIFIED`, `WORK_SCOPE_SCHEMA=VERIFIED`,
+   `WORK_SCOPE_PLAN=VERIFIED` for this plan, and
+   `WORK_SCOPE_PREPARED=NO (revision … has not been prepared …)`. In every
+   other case it stops before any capture command, says why, and prints the
+   read-only check to run. That includes a stale revision, missing schema,
+   any `UNVERIFIED` fact (no read-only URL, no `psql`, a refused connection,
+   or a role subject to row-level security), a broken or duplicate
+   preparation, and a readiness check that fails unexpectedly. The check is:
+
+   ```bash
+   read -rs MILO_READONLY_DB_URL && export MILO_READONLY_DB_URL   # the name READONLY_DATABASE_URL_ENV gives
+   bash scripts/deploy/work-scope-readiness.sh $WS_ARGS          # or --schema-only
+   ```
 2. Runs `government-production-capture.sh --ensure-job`, which refuses unless
    `worker:$RELEASE_SHA` exists, then points the capture job at it.
 3. Runs `--prepare` with a fresh attempt key, which yields one
