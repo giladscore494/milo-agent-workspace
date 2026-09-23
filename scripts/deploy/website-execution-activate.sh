@@ -17,6 +17,23 @@
 #                           component's flags) -- once the named plan revision
 #                           is PREPARED and its next batch is ready.
 #
+# THE ORDER THAT KEEPS EVERY INTERMEDIATE STATE CLOSED:
+#
+#   1. The website's run-start path must be VERIFIED CLOSED before anything is
+#      applied (GATEWAY_ALLOW_RUN_START_ROUTES off: every run start is refused
+#      at the gateway). Plan authoring never opens it.
+#   2. The WORKER is armed first (flags, RuntimePolicy, provider secret) and
+#      read back. With the API's run creation still off, nothing can use it.
+#   3. The API is armed second and read back. Starts are still refused at the
+#      gateway, whatever the API now allows.
+#   4. production-verify.sh --gate armed: the pre-open gate. It requires the
+#      run-start path to be verified CLOSED and everything else ready.
+#   5. Only then does the operator open GATEWAY_ALLOW_RUN_START_ROUTES in
+#      Vercel -- the LAST step -- and check --gate active afterwards.
+#
+# A failure at any step leaves every later step undone: the worker without the
+# API, or both without the gateway, is a posture in which no run can start.
+#
 # WHAT IT DOES AND DOES NOT DO
 #
 # The backend half (Cloud Run API + worker) is applied here, because gcloud is
@@ -213,13 +230,8 @@ EOC
 
 print_backend_commands() {
   cat << EOC
-# --- Stage 2, API: batch starts (run creation + batches), plan revisions,
-# execution control, cancellation, the LAUNCHER, and the catalog posture
-# MIRROR that routes ordinary Swarm V2 runs to the Mapping Plan. Preparation,
-# paid execution and promotion pinned off.
-gcloud run services update ${API_SERVICE} \\
-  --region ${REGION} --project ${PROJECT_ID} \\
-  --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${S2_API_VARS}'
+# Applied in THIS order, each read back before the next: the worker, then the
+# API. The website's run-start path stays closed throughout.
 
 # --- Stage 2, worker: execution control, paid execution, the Government read.
 # Promotion, preparation and the two Mapping Plan API flags pinned off.
@@ -231,6 +243,14 @@ gcloud run jobs update ${WORKER_JOB} \\
 gcloud run jobs update ${WORKER_JOB} \\
   --region ${REGION} --project ${PROJECT_ID} \\
   --update-secrets KIMI_API_KEY=${PROVIDER_SECRET}:latest
+
+# --- Stage 2, API: batch starts (run creation + batches), plan revisions,
+# execution control, cancellation, the LAUNCHER, and the catalog posture
+# MIRROR that routes ordinary Swarm V2 runs to the Mapping Plan. Preparation,
+# paid execution and promotion pinned off.
+gcloud run services update ${API_SERVICE} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${S2_API_VARS}'
 EOC
 }
 
@@ -239,16 +259,21 @@ print_frontend_commands() {
   api_url="$(gcloud run services describe "$API_SERVICE" --region "$REGION" \
     --project "$PROJECT_ID" --format='value(status.url)' 2> /dev/null || true)"
   cat << EOC
-# --- Vercel (production environment). Not a Google Cloud Console operation:
-# use the Vercel dashboard (Project -> Settings -> Environment Variables) or the
-# Vercel CLI from a checkout linked to the project. Replace an existing value
-# by removing it first (vercel env rm NAME production --yes).
-vercel env add ${MILO_STAGE2_VERCEL_RUNTIME_FLAG} production   # value: true
+# --- Vercel (production environment), for PLAN AUTHORING. Not a Google Cloud
+# Console operation: use the Vercel dashboard (Project -> Settings ->
+# Environment Variables) or the Vercel CLI from a checkout linked to the
+# project. Replace an existing value by removing it first
+# (vercel env rm NAME production --yes).
+vercel env add ${MILO_STAGE2_VERCEL_RUNTIME_FLAG} production   # value: true (plan writes)
 vercel env add CLOUD_RUN_API_URL production                # value: ${api_url:-<API service URL>}
 
 # BUILD-TIME value, inlined into the browser bundle. Setting it on an existing
 # deployment does NOT change the served bundle.
 vercel env add ${MILO_STAGE2_VERCEL_BUILD_FLAG} production   # value: true
+
+# ${MILO_STAGE2_VERCEL_RUN_START_FLAG} must NOT be set here: starting a run is
+# opened last, after --apply-backend and the pre-open gate. If it exists:
+vercel env rm ${MILO_STAGE2_VERCEL_RUN_START_FLAG} production --yes
 
 # --- Then REBUILD AND REDEPLOY THE RELEASE COMMIT, without the build cache.
 # Dashboard: Deployments -> the production deployment of the release commit ->
@@ -256,9 +281,20 @@ vercel env add ${MILO_STAGE2_VERCEL_BUILD_FLAG} production   # value: true
 # checkout of the release commit:
 vercel --prod --force
 
-# --- Then prove it (read-only; VERIFIED / DISABLED / UNVERIFIED per fact):
-#   scripts/deploy/website-execution-check.sh --site-url ${SITE} \\
-#     --work-scope-id <id> --work-scope-revision <n> --work-scope-digest <digest>
+# --- Then prove it (read-only). Expect GATEWAY_RUN_START_ENABLED=DISABLED:
+#   scripts/deploy/website-execution-check.sh --site-url ${SITE}
+EOC
+}
+
+print_run_start_commands() {
+  cat << EOC
+# --- THE LAST STEP: open run starts on the website. Only after
+#   scripts/deploy/production-verify.sh --gate armed <the plan's --work-scope-* values>
+# reports RESULT: OK. In Vercel (dashboard or CLI):
+vercel env add ${MILO_STAGE2_VERCEL_RUN_START_FLAG} production   # value: true
+# A runtime value: a NEW deployment picks it up (no rebuild needed). Redeploy
+# the release commit (dashboard -> Redeploy), then confirm the stage is open:
+#   scripts/deploy/production-verify.sh --gate active <the plan's --work-scope-* values>
 EOC
 }
 
@@ -301,6 +337,43 @@ readback() {
 }
 split_pairs() { local IFS="$MILO_ENV_VAR_DELIMITER"; read -r -a SPLIT <<< "$1"; }
 
+# readback_secret KIND NAME ENV_NAME SECRET — the env name is bound to exactly
+# that Secret Manager secret. Only the binding is read, never the value.
+READBACK_SECRET_PY='
+import json, sys
+doc = json.load(sys.stdin)
+def containers(node):
+    if isinstance(node, dict):
+        if isinstance(node.get("containers"), list) and node["containers"]:
+            return node["containers"]
+        for child in node.values():
+            found = containers(child)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for child in node:
+            found = containers(child)
+            if found:
+                return found
+    return []
+env_name, secret = sys.argv[1], sys.argv[2]
+for entry in containers(doc.get("spec", doc))[0].get("env") or []:
+    ref = ((entry.get("valueFrom") or {}).get("secretKeyRef") or {}) if isinstance(entry, dict) else {}
+    if entry.get("name") == env_name and (ref.get("name") or ref.get("secret")) == secret:
+        sys.exit(0)
+print("MISMATCH %s: not bound to the secret %s" % (env_name, secret))
+sys.exit(1)
+'
+readback_secret() {
+  local kind="$1" name="$2" json
+  if [[ "$kind" == "service" ]]; then
+    json="$(gcloud run services describe "$name" --region "$REGION" --project "$PROJECT_ID" --format=json)" || return 1
+  else
+    json="$(gcloud run jobs describe "$name" --region "$REGION" --project "$PROJECT_ID" --format=json)" || return 1
+  fi
+  python3 -c "$READBACK_SECRET_PY" "$3" "$4" <<< "$json"
+}
+
 # ---------------------------------------------------------------------------
 # --plan
 # ---------------------------------------------------------------------------
@@ -312,9 +385,11 @@ if [[ "$MODE" == "plan" ]]; then
   printf '\n== Stage 2 — backend (Cloud Run) ==\n'
   print_backend_commands
   printf '\n== Frontend (Vercel) — printed only, never applied from here ==\n'
-  printf '# Stage P needs the Vercel half too, so the Mapping Plan can be authored in the\n'
-  printf '# website; with run creation off on the API, nothing can start from it.\n'
+  printf '# Stage P needs this Vercel half, so the Mapping Plan can be authored in the\n'
+  printf '# website. Run starts stay refused at the gateway AND at the API.\n'
   print_frontend_commands
+  printf '\n== The last step: open run starts (Vercel), only after --gate armed passes ==\n'
+  print_run_start_commands
   printf '\nPLAN ONLY — nothing was changed.\n'
   exit 0
 fi
@@ -374,33 +449,67 @@ fi
 # ---------------------------------------------------------------------------
 # --apply-backend (Stage 2)
 # ---------------------------------------------------------------------------
-printf '== Gate: the named plan revision is prepared and its next batch is ready ==\n'
+printf '== Pre-check: the website refuses every run start (run-start path CLOSED) ==\n'
+# Read-only. VERIFIED closed is required; open, or not provable (an unreachable
+# site, a website older than this release), refuses before anything changes.
+run_start_state="$(bash "${SCRIPT_DIR}/website-execution-check.sh" --operator-config "$CONFIG_PATH" 2>&1 \
+  | grep -E '^GATEWAY_RUN_START_ENABLED=' | head -n 1 || true)"
+printf '%s\n' "${run_start_state:-GATEWAY_RUN_START_ENABLED=UNVERIFIED (no answer)}"
+if [[ "${run_start_state#*=}" != DISABLED* ]]; then
+  printf '\nFAIL: the website run-start path is not VERIFIED CLOSED. Arming the backend now\n' >&2
+  printf '      would let a person start a run part way through this step. Remove\n' >&2
+  printf '      %s from the Vercel production environment, redeploy,\n' "$MILO_STAGE2_VERCEL_RUN_START_FLAG" >&2
+  printf '      and re-run. Nothing was changed.\n' >&2
+  exit 1
+fi
+
+printf '\n== Gate: the named plan revision is prepared and its next batch is ready ==\n'
 if ! bash "${SCRIPT_DIR}/production-verify.sh" --operator-config "$CONFIG_PATH" \
      --gate prepared "${WS_ARGS[@]}"; then
   printf '\nFAIL: the prepared gate did not pass. Activating the website now would give you a\n' >&2
   printf '      Mapping Plan whose batch the worker refuses. Nothing was changed.\n' >&2
   exit 1
 fi
-printf '\nGate passed.\n\n== Applying Stage 2 (Cloud Run half) ==\n'
+printf '\nGates passed.\n\n== Applying Stage 2 (Cloud Run half): the WORKER first, then the API ==\n'
 print_backend_commands
-gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
-  --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${S2_API_VARS}"
-gcloud run jobs update "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" \
-  --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${S2_JOB_VARS}"
-gcloud run jobs update "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" \
-  --update-secrets "KIMI_API_KEY=${PROVIDER_SECRET}:latest"
 
-split_pairs "$S2_API_VARS"
-API_EXPECTED=("${SPLIT[@]}")
-split_pairs "$S2_JOB_VARS"
-if ! readback service "$API_SERVICE" "${API_EXPECTED[@]}" || ! readback job "$WORKER_JOB" "${SPLIT[@]}"; then
-  printf 'FAIL: a Stage 2 value did not read back as applied (above). Re-run this command,\n' >&2
-  printf '      or roll back per "Stage E rollback" in\n' >&2
+rollback_note() {
+  printf '      Every later step is undone: the website still refuses every run start.\n' >&2
+  printf '      Re-run this command, or roll back per "Stage E rollback" in\n' >&2
   printf '      docs/production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md.\n' >&2
+}
+
+# 1. The worker: flags + RuntimePolicy, then its provider credential, then
+#    read back. The API's run creation is still off, so nothing can use it.
+split_pairs "$S2_JOB_VARS"
+JOB_EXPECTED=("${SPLIT[@]}")
+if ! gcloud run jobs update "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" \
+       --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${S2_JOB_VARS}" \
+   || ! gcloud run jobs update "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" \
+       --update-secrets "KIMI_API_KEY=${PROVIDER_SECRET}:latest" \
+   || ! readback job "$WORKER_JOB" "${JOB_EXPECTED[@]}" \
+   || ! readback_secret job "$WORKER_JOB" KIMI_API_KEY "$PROVIDER_SECRET"; then
+  printf 'FAIL: the worker is not armed as applied (above); the API was NOT changed.\n' >&2
+  rollback_note
   exit 1
 fi
+printf 'Worker armed and read back.\n'
 
-printf '\nBackend applied and read back. The website is still LOCKED until the Vercel half\n'
-printf 'below is applied AND the frontend is rebuilt and redeployed.\n\n'
-print_frontend_commands
+# 2. The API, and read back.
+split_pairs "$S2_API_VARS"
+API_EXPECTED=("${SPLIT[@]}")
+if ! gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+       --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${S2_API_VARS}" \
+   || ! readback service "$API_SERVICE" "${API_EXPECTED[@]}"; then
+  printf 'FAIL: the API is not armed as applied (above).\n' >&2
+  rollback_note
+  exit 1
+fi
+printf 'API armed and read back.\n'
+
+printf '\nBackend armed. The website STILL REFUSES every run start: %s stays off\n' \
+  "$MILO_STAGE2_VERCEL_RUN_START_FLAG"
+printf 'until the pre-open gate passes. Next, read-only:\n'
+printf '  bash scripts/deploy/production-verify.sh --gate armed %s\n\n' "${WS_ARGS[*]}"
+print_run_start_commands
 printf '\nNo run was started and no provider call was made.\n'

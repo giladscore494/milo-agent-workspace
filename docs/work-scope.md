@@ -144,8 +144,11 @@ A write that is understood and changes nothing writes nothing (`applied:
 false`, `WORK_SCOPE_NOTE_NO_CHANGE`).
 
 The gateway proxies the four reads the UI uses as SAFE routes, and the five
-writes as execution routes behind `GATEWAY_ALLOW_EXECUTION_ROUTES`; a batch
-start is also a run-creation route there, rate limited as one. The UI renders
+writes as execution routes behind `GATEWAY_ALLOW_EXECUTION_ROUTES`. A batch
+start is also a run START there: it additionally needs
+`GATEWAY_ALLOW_RUN_START_ROUTES`, the permission an activation opens last, and
+it is rate limited as run creation. Plan authoring therefore never opens
+starting a batch. The UI renders
 the surface only when the execution UI flag is on AND the capability read says
 the plan is available, and the Batches section only where `can_start_batches`
 is true.

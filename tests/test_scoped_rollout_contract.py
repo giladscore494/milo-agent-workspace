@@ -282,10 +282,17 @@ def test_stage2_is_never_applied_without_a_named_prepared_revision(tmp_path, arg
 
 
 STATEFUL_GCLOUD = r'''#!/usr/bin/env python3
-"""A gcloud stand-in whose describes answer what its updates applied."""
+"""A gcloud stand-in whose describes answer what its updates applied.
+
+MILO_TEST_GCLOUD_FAIL names a substring: an update whose arguments contain it
+fails WITHOUT applying (a partial gcloud failure). After every applied update a
+snapshot of the whole state is appended to MILO_TEST_GCLOUD_SNAPSHOTS, so a
+test can inspect every intermediate posture the sequence passed through.
+"""
 import json, os, sys
 state_path = os.environ["MILO_TEST_GCLOUD_STATE"]
 state = json.load(open(state_path)) if os.path.exists(state_path) else {"service": {}, "job": {}}
+state.setdefault("secrets", {"service": {}, "job": {}})
 args = sys.argv[1:]
 with open(os.environ["MILO_TEST_LOG"], "a") as log:
     log.write("gcloud " + " ".join(args) + "\n")
@@ -295,60 +302,173 @@ if args[:3] == ["config", "get-value", "project"]:
     print("test-project"); sys.exit(0)
 kind = "service" if args[:2] == ["run", "services"] else "job" if args[:2] == ["run", "jobs"] else None
 if kind and args[2] == "update":
+    fail = os.environ.get("MILO_TEST_GCLOUD_FAIL")
+    if fail and fail in " ".join(args):
+        sys.stderr.write("ERROR: (gcloud.run) simulated failure\n"); sys.exit(1)
     for flag, value in zip(args, args[1:]):
         if flag == "--update-env-vars":
             delim, body = value[1], value[3:]
             for pair in body.split(delim):
                 k, v = pair.split("=", 1)
                 state[kind][k] = v
+        if flag == "--update-secrets":
+            for pair in value.split(","):
+                k, ref = pair.split("=", 1)
+                state["secrets"][kind][k] = ref.split(":", 1)[0]
     json.dump(state, open(state_path, "w"))
+    snapshots = os.environ.get("MILO_TEST_GCLOUD_SNAPSHOTS")
+    if snapshots:
+        with open(snapshots, "a") as handle:
+            handle.write(json.dumps(state) + "\n")
     sys.exit(0)
 if kind and args[2] == "describe":
     if "--format=json" in args:
         env = [{"name": k, "value": v} for k, v in state[kind].items()]
+        env += [{"name": k, "valueFrom": {"secretKeyRef": {"name": v, "key": "latest"}}}
+                for k, v in state["secrets"][kind].items()]
         doc = {"spec": {"template": {"spec": {"containers": [{"env": env}]}}}}
         print(json.dumps(doc)); sys.exit(0)
     sys.exit(0)
 sys.exit(0)
 '''
 
+#: What the pre-check reads: the website's run-start posture.
+RUN_START_CLOSED = "echo 'GATEWAY_RUN_START_ENABLED=DISABLED (every run start is refused)'; exit 1"
 
-def test_stage2_applies_only_behind_the_prepared_gate_and_reads_every_value_back(tmp_path):
+
+def _stage2_tree(tmp_path, *, website: str = RUN_START_CLOSED, gate: str = "exit 0"):
     tree = Tree(tmp_path, ("website-execution-activate.sh",))
     tree.tool("gcloud", STATEFUL_GCLOUD)
-    env = {"MILO_TEST_GCLOUD_STATE": str(tmp_path / "state.json")}
+    tree.stub("scripts/deploy/production-verify.sh", gate)
+    tree.stub("scripts/deploy/website-execution-check.sh", website)
+    env = {"MILO_TEST_GCLOUD_STATE": str(tmp_path / "state.json"),
+           "MILO_TEST_GCLOUD_SNAPSHOTS": str(tmp_path / "snapshots.jsonl")}
+    return tree, env
+
+
+def _snapshots(tmp_path) -> list[dict]:
+    path = tmp_path / "snapshots.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def _website_could_start_a_run(state: dict, *, run_start_gateway_open: bool) -> bool:
+    # A website start needs the gateway's run-start permission AND the API's
+    # run creation + batches. The activation script never opens the gateway.
+    service = state.get("service", {})
+    return (run_start_gateway_open and service.get("MILO_ENABLE_RUN_CREATION") == "true"
+            and service.get("MILO_ENABLE_WORK_SCOPE_BATCHES") == "true")
+
+
+def test_stage2_applies_only_behind_the_prepared_gate_and_reads_every_value_back(tmp_path):
+    tree, env = _stage2_tree(tmp_path, gate="exit 1")
 
     # The gate refuses: NOTHING is updated.
-    tree.stub("scripts/deploy/production-verify.sh", "exit 1")
     refused = tree.run("website-execution-activate.sh", "--apply-backend", *WS_ARGS, env=env)
     assert refused.returncode == 1 and "Nothing was changed" in refused.stderr
     assert not [c for c in tree.calls() if " update " in c]
     gate = [c for c in tree.calls() if c.startswith("production-verify.sh")]
     assert gate and "--gate prepared" in gate[0] and f"--work-scope-id {WS_ID}" in gate[0]
 
-    # The gate passes: API, worker env, worker secret -- then read back.
+    # The gate passes: the WORKER (env, then secret) first, then the API.
     tree.stub("scripts/deploy/production-verify.sh", "exit 0")
     applied = tree.run("website-execution-activate.sh", "--apply-backend", *WS_ARGS, env=env)
     assert applied.returncode == 0, applied.stdout + applied.stderr
     updates = [c for c in tree.calls() if " update " in c]
-    assert updates[0].startswith("gcloud run services update test-api")
-    assert updates[1].startswith("gcloud run jobs update test-worker") and "--update-env-vars" in updates[1]
-    assert updates[2].endswith("--update-secrets KIMI_API_KEY=TEST_PROVIDER_KEY:latest")
+    assert updates[0].startswith("gcloud run jobs update test-worker") and "--update-env-vars" in updates[0]
+    assert updates[1].endswith("--update-secrets KIMI_API_KEY=TEST_PROVIDER_KEY:latest")
+    assert updates[2].startswith("gcloud run services update test-api")
     state = json.loads((tmp_path / "state.json").read_text())
     assert state["service"]["MILO_ENABLE_WORK_SCOPE_BATCHES"] == "true"
     assert state["service"]["MILO_ENABLE_WORK_SCOPE_PREPARATION"] == "false"
     assert state["job"]["MILO_ENABLE_WORK_SCOPE_PREPARATION"] == "false"
     assert state["job"]["MILO_ENABLE_CATALOG_PROMOTION"] == "false"
-    assert "KIMI_API_KEY" not in state["service"]
-    assert "Backend applied and read back" in applied.stdout
+    assert state["secrets"]["job"] == {"KIMI_API_KEY": "TEST_PROVIDER_KEY"}
+    assert state["secrets"]["service"] == {} and "KIMI_API_KEY" not in state["service"]
+    # The website is still closed: the last step is printed, never applied.
+    assert "The website STILL REFUSES every run start" in applied.stdout
+    assert "--gate armed" in applied.stdout
+    assert "vercel env add GATEWAY_ALLOW_RUN_START_ROUTES production" in applied.stdout
+    assert not any(c.startswith("vercel") for c in tree.calls())
+
+
+@pytest.mark.parametrize("website,why", [
+    ("echo 'GATEWAY_RUN_START_ENABLED=VERIFIED (the gateway proxies run starts)'; exit 0", "open"),
+    ("echo 'GATEWAY_RUN_START_ENABLED=UNVERIFIED (the run-start posture could not be proved)'; exit 1",
+     "unprovable"),
+    ("echo 'FRONTEND_CODE_WIRED=VERIFIED'; exit 1", "absent"),
+])
+def test_stage2_refuses_unless_the_website_run_start_path_is_proved_closed(tmp_path, website, why):
+    tree, env = _stage2_tree(tmp_path, website=website)
+    result = tree.run("website-execution-activate.sh", "--apply-backend", *WS_ARGS, env=env)
+    assert result.returncode == 1, why
+    assert "run-start path is not VERIFIED CLOSED" in result.stderr
+    assert not [c for c in tree.calls() if " update " in c]
+    # Refused before the gate or anything else ran.
+    assert not any(c.startswith("production-verify.sh") for c in tree.calls())
+
+
+def test_no_intermediate_posture_can_start_a_run_from_the_website(tmp_path):
+    '''A person clicking "Start batch" at ANY moment of Stage 2 is refused.
+
+    Every posture the sequence passes through is inspected. The gateway's
+    run-start permission is never opened by the script, so the website
+    refuses every start at every step; and even judged by the backend alone,
+    the API never allows a start before the worker is fully armed.
+    '''
+    tree, env = _stage2_tree(tmp_path)
+    assert tree.run("website-execution-activate.sh", "--apply-backend", *WS_ARGS,
+                    env=env).returncode == 0
+    snapshots = _snapshots(tmp_path)
+    assert len(snapshots) == 3
+    for state in snapshots:
+        assert not _website_could_start_a_run(state, run_start_gateway_open=False)
+        if state["service"].get("MILO_ENABLE_RUN_CREATION") == "true":
+            assert state["job"].get("MILO_ENABLE_PAID_EXECUTION") == "true"
+            assert state["secrets"]["job"].get("KIMI_API_KEY") == "TEST_PROVIDER_KEY"
+    # Only the final posture has the API armed.
+    assert [s["service"].get("MILO_ENABLE_RUN_CREATION") for s in snapshots] == [None, None, "true"]
+
+
+@pytest.mark.parametrize("failing,worker_env,worker_secret", [
+    ("--update-env-vars ^;^MILO_ENABLE_EXECUTION_CONTROL", False, False),  # worker env
+    ("--update-secrets", True, False),                                     # worker secret
+    ("run services update", True, True),                                   # the API
+])
+def test_a_partial_gcloud_failure_never_arms_the_api_ahead_of_the_worker(
+        tmp_path, failing, worker_env, worker_secret):
+    tree, env = _stage2_tree(tmp_path)
+    env["MILO_TEST_GCLOUD_FAIL"] = failing
+    result = tree.run("website-execution-activate.sh", "--apply-backend", *WS_ARGS, env=env)
+    assert result.returncode == 1
+    assert "the website still refuses every run start" in result.stderr
+    state = json.loads((tmp_path / "state.json").read_text()) if (tmp_path / "state.json").exists() \
+        else {"service": {}, "job": {}, "secrets": {"service": {}, "job": {}}}
+    # The API never allows a run start after a failed step.
+    assert state["service"].get("MILO_ENABLE_RUN_CREATION") != "true"
+    assert (state["job"].get("MILO_ENABLE_PAID_EXECUTION") == "true") == worker_env
+    assert ("KIMI_API_KEY" in state.get("secrets", {}).get("job", {})) == worker_secret
+    for snapshot in _snapshots(tmp_path):
+        assert not _website_could_start_a_run(snapshot, run_start_gateway_open=False)
+
+
+def test_a_worker_whose_secret_does_not_read_back_stops_before_the_api(tmp_path):
+    tree, env = _stage2_tree(tmp_path)
+    # gcloud reports success but the binding is not what was asked for.
+    state = tmp_path / "state.json"
+    wrapper = STATEFUL_GCLOUD.replace(
+        'state["secrets"][kind][k] = ref.split(":", 1)[0]',
+        'state["secrets"][kind][k] = "SOME_OTHER_SECRET"')
+    tree.tool("gcloud", wrapper)
+    result = tree.run("website-execution-activate.sh", "--apply-backend", *WS_ARGS, env=env)
+    assert result.returncode == 1
+    assert "MISMATCH KIMI_API_KEY" in result.stdout
+    assert "the API was NOT changed" in result.stderr
+    assert "MILO_ENABLE_RUN_CREATION" not in json.loads(state.read_text())["service"]
 
 
 def test_stage_p_opens_plan_writes_and_proves_run_creation_is_still_off(tmp_path):
-    tree = Tree(tmp_path, ("website-execution-activate.sh",))
-    tree.tool("gcloud", STATEFUL_GCLOUD)
+    tree, env = _stage2_tree(tmp_path)
     state = tmp_path / "state.json"
-    env = {"MILO_TEST_GCLOUD_STATE": str(state)}
-    tree.stub("scripts/deploy/production-verify.sh", "exit 0")
     # A live API with run creation ON is not a Stage P posture: refused on read-back.
     state.write_text(json.dumps({"service": {"MILO_ENABLE_RUN_CREATION": "true",
                                              "MILO_ENABLE_WORK_SCOPE_BATCHES": "false"},
@@ -363,6 +483,10 @@ def test_stage_p_opens_plan_writes_and_proves_run_creation_is_still_off(tmp_path
     assert "--gate deployed" in next(c for c in tree.calls() if c.startswith("production-verify.sh"))
     job_updates = [c for c in tree.calls() if c.startswith("gcloud run jobs update")]
     assert job_updates == [], "Stage P never touches the worker"
+    # Its Vercel half opens plan writes and REMOVES the run-start permission.
+    assert "vercel env add GATEWAY_ALLOW_EXECUTION_ROUTES production" in ok.stdout
+    assert "vercel env rm GATEWAY_ALLOW_RUN_START_ROUTES production --yes" in ok.stdout
+    assert "vercel env add GATEWAY_ALLOW_RUN_START_ROUTES" not in ok.stdout
 
 
 # =============================================================================
@@ -522,12 +646,14 @@ def _armed_envs() -> dict[str, dict[str, str]]:
     return {"service": service, "job": job}
 
 
-def _website(sha: str, *, ui=True, gateway=True, probe=(401, {"error": "Authentication required."}),
+def _website(sha: str, *, ui=True, gateway=True, run_start=True,
+             probe=(401, {"error": "Authentication required."}),
              health=(200, {"status": "ok"}), status_code=200) -> dict:
     return {
         "/api/deployment-status": (status_code, {"contract": "milo-website-deployment/1",
                                                  "execution_ui": ui,
                                                  "gateway_execution_routes": gateway,
+                                                 "gateway_run_start_routes": run_start,
                                                  "commit_sha": sha}),
         "/api/gateway/workflow-proposals/00000000-0000-4000-8000-000000000000": probe,
         "/api/gateway/health": health,
@@ -567,7 +693,7 @@ def test_every_fact_verified_is_the_only_active_stage(tmp_path):
     facts = _facts(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
     for name in ("FRONTEND_CODE_WIRED", "FRONTEND_RELEASE", "TASK_COMPOSER_VISIBLE",
-                 "GATEWAY_EXECUTION_ENABLED", "GATEWAY_BACKEND_BINDING",
+                 "GATEWAY_EXECUTION_ENABLED", "GATEWAY_RUN_START_ENABLED", "GATEWAY_BACKEND_BINDING",
                  "BACKEND_EXECUTION_ARMED", "MAPPING_PLAN_BATCH_PATH"):
         assert facts[name] == "VERIFIED", (name, result.stdout)
     assert facts["WEBSITE_EXECUTION_STAGE_ACTIVE"] == "VERIFIED"
@@ -591,6 +717,13 @@ def test_every_fact_verified_is_the_only_active_stage(tmp_path):
      "UNVERIFIED"),
     # The two sources disagree: UNVERIFIED, never YES.
     (dict(gateway=False), "GATEWAY_EXECUTION_ENABLED", "UNVERIFIED"),
+    # Stage P / Stage 2 arming: plan writes open, run starts CLOSED -- the
+    # pre-open posture, which is exactly not an active stage.
+    (dict(run_start=False), "GATEWAY_RUN_START_ENABLED", "DISABLED"),
+    # The status says run starts are open while the gateway refuses even the
+    # execution routes: a contradiction, never a YES.
+    (dict(gateway=False, probe=(403, {"error": "This API route is not allowed by the gateway policy."})),
+     "GATEWAY_RUN_START_ENABLED", "UNVERIFIED"),
     # The execution UI was off at BUILD time.
     (dict(ui=False), "TASK_COMPOSER_VISIBLE", "DISABLED"),
     # The site predates the status contract, or is unreachable.
@@ -686,16 +819,24 @@ def _verify_tree(tmp_path, *, migration_detail: str, migration_status: str = "PA
 READY = ("echo EVIDENCE_READY=VERIFIED '(scoped)'; echo BATCH_READY=VERIFIED '(batch 1)'; "
          "echo WORK_SCOPE_READINESS=VERIFIED; exit 0")
 SITE_ON = ("echo GATEWAY_EXECUTION_ENABLED=VERIFIED; echo GATEWAY_BACKEND_BINDING=VERIFIED; "
+           "echo GATEWAY_RUN_START_ENABLED=VERIFIED; "
            "echo TASK_COMPOSER_VISIBLE=VERIFIED; echo FRONTEND_RELEASE=VERIFIED; "
            "echo BACKEND_EXECUTION_ARMED=VERIFIED; exit 0")
+#: The pre-open posture: everything armed, run starts proved CLOSED.
+SITE_ARMED = ("echo GATEWAY_EXECUTION_ENABLED=VERIFIED; echo GATEWAY_BACKEND_BINDING=VERIFIED; "
+              "echo GATEWAY_RUN_START_ENABLED=DISABLED; "
+              "echo TASK_COMPOSER_VISIBLE=VERIFIED; echo FRONTEND_RELEASE=VERIFIED; "
+              "echo BACKEND_EXECUTION_ARMED=VERIFIED; exit 1")
 SITE_OFF = ("echo GATEWAY_EXECUTION_ENABLED=DISABLED; echo GATEWAY_BACKEND_BINDING=VERIFIED; "
+            "echo GATEWAY_RUN_START_ENABLED=DISABLED; "
             "echo TASK_COMPOSER_VISIBLE=DISABLED; echo FRONTEND_RELEASE=VERIFIED; "
             "echo BACKEND_EXECUTION_ARMED=NO; exit 1")
 
 
 def _verdict(stdout: str) -> dict[str, str]:
     block = stdout.split("== VERDICT", 1)[1]
-    return {m.group(1): m.group(2) for m in re.finditer(r"^ [* ] ([A-Z_]+)\s+([A-Z]+)$", block, re.M)}
+    return {m.group(1): m.group(2) for m in re.finditer(
+        r"^ [* ] ([A-Z_]+)\s+([A-Z]+)(?:\s+\[needs [A-Z]+\])?$", block, re.M)}
 
 
 def test_the_prepared_gate_needs_the_named_revision_not_a_snapshot(tmp_path):
@@ -740,3 +881,43 @@ def test_the_verifier_never_reports_a_generic_snapshot_as_readiness():
     assert "USABLE_GOVERNMENT_SNAPSHOT=YES" not in text
     assert "DETERMINISTIC_QUEUE_READY=YES" not in text
     assert "informational only" in text
+
+
+def _armed_tree(tmp_path, website: str) -> Tree:
+    tree = _verify_tree(tmp_path, readiness=READY, website=website,
+                        migration_detail="remote schema classified as fully-migrated (41/41)")
+    # The runs table reads as quiescent, and the paid prerequisites resolve.
+    tree.tool("psql", "#!/usr/bin/env bash\necho 0\n")
+    _executable(tree.root / "scripts" / "release" / "runtime_policy_manifest.py",
+                "import sys\nsys.exit(0)\n")
+    tree.tool("gcloud", tree.bin.joinpath("gcloud").read_text().replace(
+        "esac\nexit 0", '  *"secrets describe"*) exit 0 ;;\nesac\nexit 0'))
+    return tree
+
+
+def test_the_pre_open_gate_needs_run_starts_proved_closed(tmp_path):
+    """`armed` is the gate BEFORE the last step: it passes only while every run
+    start is still refused, and `active` is the check AFTER it."""
+    env = {"MILO_TEST_RO_DB_URL": "postgresql://read-only@db.test/postgres"}
+    armed = _armed_tree(tmp_path / "armed", SITE_ARMED)
+    before = armed.run("production-verify.sh", "--gate", "armed", *WS_ARGS, env=env)
+    verdict = _verdict(before.stdout)
+    assert verdict["RUN_START_PATH"] == "DISABLED", before.stdout
+    assert before.returncode == 0, before.stdout + before.stderr
+    # The same posture is NOT active: the website cannot start anything yet.
+    not_yet = armed.run("production-verify.sh", "--gate", "active", *WS_ARGS, env=env)
+    assert not_yet.returncode == 1 and "RUN_START_PATH=DISABLED (needs VERIFIED)" in not_yet.stderr
+
+    # Opened (or opened too early): the pre-open gate refuses, the check passes.
+    opened = _armed_tree(tmp_path / "opened", SITE_ON)
+    too_late = opened.run("production-verify.sh", "--gate", "armed", *WS_ARGS, env=env)
+    assert too_late.returncode == 1 and "RUN_START_PATH=VERIFIED (needs DISABLED)" in too_late.stderr
+    after = opened.run("production-verify.sh", "--gate", "active", *WS_ARGS, env=env)
+    assert after.returncode == 0, after.stdout + after.stderr
+
+    # Unprovable is neither.
+    unknown = _armed_tree(tmp_path / "unknown", SITE_ARMED.replace(
+        "GATEWAY_RUN_START_ENABLED=DISABLED", "GATEWAY_RUN_START_ENABLED=UNVERIFIED"))
+    for gate in ("armed", "active"):
+        result = unknown.run("production-verify.sh", "--gate", gate, *WS_ARGS, env=env)
+        assert result.returncode == 1 and _verdict(result.stdout)["RUN_START_PATH"] == "UNVERIFIED"

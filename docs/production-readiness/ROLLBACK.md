@@ -9,8 +9,9 @@ automatically.
 ## Execution flags — emergency order
 
 1. `MILO_ENABLE_PAID_EXECUTION` off;
-2. `MILO_ENABLE_RUN_CREATION` off (and `GATEWAY_ALLOW_EXECUTION_ROUTES`
-   off);
+2. `MILO_ENABLE_RUN_CREATION` off (and at the gateway
+   `GATEWAY_ALLOW_RUN_START_ROUTES` off, which refuses every run start,
+   then `GATEWAY_ALLOW_EXECUTION_ROUTES` off);
 3. worker launch off (`JOB_LAUNCHER=disabled`);
 4. worker route access restricted (verify
    `MILO_APPROVED_WORKER_IDENTITIES`);

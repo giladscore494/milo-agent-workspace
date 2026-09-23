@@ -58,6 +58,21 @@ they do not assume them.
   | `JOB_LAUNCHER` (API) | `disabled` | `disabled` | `cloud_run` | — | — |
   | `KIMI_API_KEY` secret | none | none | **never** | bound | never |
 
+  The website has two separate gateway permissions (Vercel):
+
+  | Vercel variable | Stage A | Stage P | Stage 2 arming (E.1–E.2) | Last step (E.3) |
+  | --- | --- | --- | --- | --- |
+  | `NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI` (build time) | off | on | on | on |
+  | `GATEWAY_ALLOW_EXECUTION_ROUTES` (plan writes, pause/resume, cancel) | off | on | on | on |
+  | `GATEWAY_ALLOW_RUN_START_ROUTES` (any run start, including "Start batch") | off | **off** | **off** | **on** |
+
+  **Starting a run is the last permission the website gets.** Until E.3, the
+  gateway refuses every run start (`403` before authentication), whatever the
+  API allows. In E.1 the worker is armed and read back before the API, so the
+  API never allows a start that a half-armed worker would receive. E.2 is a
+  pre-open gate that requires run starts to be *proved* closed, and E.3 opens
+  them.
+
   On the API, the two catalog flags build nothing. They only tell run creation
   that Swarm V2 runs read the catalog, so an ordinary run is refused before it
   exists instead of being launched only for the worker to refuse it.
@@ -391,9 +406,11 @@ a Google Cloud operation):
 # In a checkout linked to the Vercel project (or in the Vercel dashboard →
 # Settings → Environment Variables → Production). Replace an existing value
 # with `vercel env rm NAME production --yes` first.
-vercel env add GATEWAY_ALLOW_EXECUTION_ROUTES production        # true
+vercel env add GATEWAY_ALLOW_EXECUTION_ROUTES production        # true (plan writes)
 vercel env add NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI production  # true (inlined at BUILD time)
 vercel env add CLOUD_RUN_API_URL production                     # the API URL printed above
+# Run starts stay CLOSED until E.3. If the variable exists, remove it:
+vercel env rm GATEWAY_ALLOW_RUN_START_ROUTES production --yes
 ```
 
 Then **rebuild without the build cache**: dashboard → Deployments → the
@@ -403,9 +420,15 @@ Cache* **unchecked**. From the CLI, in a clean checkout of `$RELEASE_SHA`, run
 
 **Expected evidence** (`bash scripts/deploy/website-execution-check.sh`):
 `TASK_COMPOSER_VISIBLE=VERIFIED`, `GATEWAY_EXECUTION_ENABLED=VERIFIED`,
-`GATEWAY_BACKEND_BINDING=VERIFIED`, `FRONTEND_RELEASE=VERIFIED`, and
-`BACKEND_EXECUTION_ARMED=NO`. The last one is expected, because run creation
-is still off. Nothing can start from the website at this point.
+**`GATEWAY_RUN_START_ENABLED=DISABLED`**, `GATEWAY_BACKEND_BINDING=VERIFIED`,
+`FRONTEND_RELEASE=VERIFIED`, and `BACKEND_EXECUTION_ARMED=NO`. The last one is
+expected, because run creation is still off. Nothing can start from the
+website at this point: the gateway and the API both refuse. In every project,
+Swarm V2 and Vehicle Catalog V1 alike, the composer says *"Starting runs is
+turned off at the current activation stage"* and offers no task. The Mapping
+Plan can be authored.
+
+**Stop if** `GATEWAY_RUN_START_ENABLED` is anything but `DISABLED`.
 
 ### D.2 Author the plan in the website
 
@@ -497,39 +520,92 @@ the website (the new head is unprepared) and preparing that revision.
 
 ---
 
-## Stage E — open the execution path
+## Stage E — open the execution path, run starts last
 
-### E.1 Backend (Cloud Run)
+### E.1 Backend (Cloud Run): the worker, then the API
 
 ```bash
 bash scripts/deploy/website-execution-activate.sh --apply-backend $WS_ARGS
 ```
 
-It re-runs `production-verify.sh --gate prepared $WS_ARGS` and changes nothing
-unless that passes. It then applies the table at the top: the API flags,
-`JOB_LAUNCHER=cloud_run`, the worker identity and the concurrency caps; the
-worker flags and the reviewed RuntimePolicy; and
-`KIMI_API_KEY=<SECRET_PROVIDER_API_KEY>:latest` on the worker only. Every
-value is read back, and any mismatch fails. Preparation, promotion and paid
-execution on the API stay pinned off.
+In this order, stopping at the first failure:
 
-### E.2 Frontend (Vercel)
+1. **Pre-check.** It runs `website-execution-check.sh` and requires
+   `GATEWAY_RUN_START_ENABLED=DISABLED`, meaning the website provably refuses
+   every run start. If run starts are open or cannot be proved closed, it
+   refuses and changes nothing.
+2. **Gate.** `production-verify.sh --gate prepared $WS_ARGS`. It changes
+   nothing unless this passes.
+3. **The worker.** It sets the worker flags and the reviewed RuntimePolicy,
+   then `KIMI_API_KEY=<SECRET_PROVIDER_API_KEY>:latest` (on the worker only),
+   then reads back every value and the secret binding. If this fails, the API
+   is **not** touched. With the API's run creation still off, nothing can use
+   the armed worker.
+4. **The API.** It sets `JOB_LAUNCHER=cloud_run`, the worker identity, the
+   concurrency caps and the API flags, then reads them back. Preparation,
+   promotion and paid execution on the API stay pinned off.
 
-The Vercel values from D.1 stay in place. If `CLOUD_RUN_API_URL` or either
-flag changed, set it again and redeploy the release commit **without the build
-cache**, as in D.1. This happens in Vercel, not in Google Cloud Console.
+After any of these steps, a click on *Start batch* or *Send task* is refused
+at the gateway, because E.1 never touches `GATEWAY_ALLOW_RUN_START_ROUTES`. A
+gcloud failure part way through leaves every later step undone. The website
+still refuses every start, so re-run the command or use the rollback below.
+Each stage and the partial-failure cases are covered by tests
+(`tests/test_scoped_rollout_contract.py`, gateway tests in
+`frontend/tests/gatewayPolicy.test.ts` and `gatewayRoute.test.ts`).
 
-**Stop if** the gate refuses, or any read-back fails.
+### E.2 The pre-open gate (read-only)
+
+```bash
+bash scripts/deploy/production-verify.sh --gate armed $WS_ARGS 2>&1 | tee "$HOME/stage-e2.txt"
+```
+
+**Expected evidence:** `RESULT: OK — every fact gate armed requires is
+VERIFIED.` The verdict marks each required fact:
+
+```
+ * CODE_DEPLOYED          VERIFIED   [needs VERIFIED]
+ * DATABASE_READY         VERIFIED   [needs VERIFIED]
+ * EVIDENCE_READY         VERIFIED   [needs VERIFIED]
+ * BATCH_READY            VERIFIED   [needs VERIFIED]
+ * RUNS_QUIESCENT         VERIFIED   [needs VERIFIED]
+ * GATEWAY_ENABLED        VERIFIED   [needs VERIFIED]
+ * WEBSITE_ENABLED        VERIFIED   [needs VERIFIED]
+ * PAID_EXECUTION_READY   VERIFIED   [needs VERIFIED]
+ * RUN_START_PATH         DISABLED   [needs DISABLED]
+```
+
+`armed` is the gate **before** opening. It fails if run starts are already
+open (`RUN_START_PATH=VERIFIED (needs DISABLED)`) or cannot be proved closed.
+**Stop if** it does not pass.
+
+### E.3 The last step: open run starts on the website (Vercel)
+
+Only after E.2 passes, and not in Google Cloud Console:
+
+```bash
+vercel env add GATEWAY_ALLOW_RUN_START_ROUTES production   # true
+```
+
+This is a runtime value, so a new deployment picks it up without a rebuild.
+Redeploy the release commit (dashboard → Deployments → the Production
+deployment of `$RELEASE_SHA` → *Redeploy*). Then go straight to Stage F.
 
 ### Stage E rollback (emergency order, from [ROLLBACK.md](ROLLBACK.md))
 
+Close the website first, then the backend:
+
 ```bash
+# 1. Vercel: close run starts (remove GATEWAY_ALLOW_RUN_START_ROUTES, or set it
+#    to false) and redeploy. From then on every start is refused at the gateway.
+vercel env rm GATEWAY_ALLOW_RUN_START_ROUTES production --yes
+# 2. Stop paid execution, then run creation and the launcher.
 gcloud run jobs update milo-agent-worker --region us-central1 \
   --update-env-vars MILO_ENABLE_PAID_EXECUTION=false
 gcloud run services update milo-agent-api --region us-central1 \
   --update-env-vars '^;^MILO_ENABLE_RUN_CREATION=false;MILO_ENABLE_WORK_SCOPE_BATCHES=false;JOB_LAUNCHER=disabled'
+# 3. Remove the provider credential.
 gcloud run jobs update milo-agent-worker --region us-central1 --remove-secrets KIMI_API_KEY
-# Vercel: set GATEWAY_ALLOW_EXECUTION_ROUTES=false and redeploy.
+# 4. Optionally close plan writes too: set GATEWAY_ALLOW_EXECUTION_ROUTES=false in Vercel and redeploy.
 ```
 
 A batch that is running keeps running until its run ends or is cancelled
@@ -547,11 +623,14 @@ redeploying at Stage 2 means going through A.6 and Stage E again, on purpose.
 
 ---
 
-## Stage F — verify the deployed path (not paid, changes nothing)
+## Stage F — the post-open check (not paid, changes nothing)
 
 ```bash
 bash scripts/deploy/production-verify.sh --gate active $WS_ARGS 2>&1 | tee "$HOME/stage-f.txt"
 ```
+
+`active` is a check **after** E.3, not a gate before it. It requires run starts
+to be open (`RUN_START_PATH=VERIFIED`). The pre-open gate is E.2's `armed`.
 
 It makes no provider call and creates no run: its reads are describes, SQL
 SELECTs and unauthenticated GETs. The website probe is a GET of an
@@ -570,6 +649,7 @@ is open. It never sends a POST.
  * GATEWAY_ENABLED        VERIFIED   gateway enabled (behaviour + status agree; reaches the API)
  * WEBSITE_ENABLED        VERIFIED   website enabled (release build, execution UI on)
  * PAID_EXECUTION_READY   VERIFIED   paid-execution ready (flags, key on worker, quota, policy)
+ * RUN_START_PATH         VERIFIED   the website now proxies run starts (opened in E.3)
 RESULT: OK — every fact gate active requires is VERIFIED.
 ```
 
@@ -578,7 +658,9 @@ the plan's conversation, the composer offers **Open the Mapping Plan** and no
 *Send task*, and the Mapping Plan's **Batches** section shows **Start batch 1**.
 
 **Stop if** anything is `NO`, `DISABLED` or `UNVERIFIED`. Each line says what
-is missing. The first paid run is **not** a readiness test.
+is missing. If it fails, close run starts again (step 1 of the Stage E
+rollback) before investigating. The first paid run is **not** a readiness
+test.
 
 ---
 

@@ -309,6 +309,12 @@ MILO_STAGE2_WORKER_PINNED_OFF_FLAGS=(
 # is read by the running gateway.
 MILO_STAGE2_VERCEL_BUILD_FLAG="NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI"
 MILO_STAGE2_VERCEL_RUNTIME_FLAG="GATEWAY_ALLOW_EXECUTION_ROUTES"
+# STARTING a run through the website is a separate gateway permission, opened
+# LAST: after the worker and then the API are armed and read back, and after
+# the pre-open gate (production-verify.sh --gate armed) proves every start is
+# still refused. Plan authoring never sets it, so no intermediate posture can
+# start a run from the website.
+MILO_STAGE2_VERCEL_RUN_START_FLAG="GATEWAY_ALLOW_RUN_START_ROUTES"
 
 # The database surface the Mapping Plan -> prepared batch -> Swarm V2 path
 # calls, created by the three scoped-catalog migrations

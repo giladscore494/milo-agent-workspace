@@ -42,10 +42,12 @@ def test_frontend_gate_names_match_what_the_frontend_reads():
     policy = (REPO / "frontend/lib/server/gatewayPolicy.ts").read_text(encoding="utf-8")
     assert "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI" in api
     assert "GATEWAY_ALLOW_EXECUTION_ROUTES" in policy
+    assert "GATEWAY_ALLOW_RUN_START_ROUTES" in policy
 
     chain_text = CHAIN.read_text(encoding="utf-8")
     assert "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI" in chain_text
     assert "GATEWAY_ALLOW_EXECUTION_ROUTES" in chain_text
+    assert "GATEWAY_ALLOW_RUN_START_ROUTES" in chain_text
 
 
 def test_job_launcher_is_documented_because_it_is_the_silent_one():
@@ -129,7 +131,7 @@ def test_check_script_never_sends_the_run_creation_post():
 
 
 WEBSITE_FACTS = ("FRONTEND_CODE_WIRED", "FRONTEND_RELEASE", "TASK_COMPOSER_VISIBLE",
-                 "GATEWAY_EXECUTION_ENABLED", "GATEWAY_BACKEND_BINDING",
+                 "GATEWAY_EXECUTION_ENABLED", "GATEWAY_RUN_START_ENABLED", "GATEWAY_BACKEND_BINDING",
                  "BACKEND_EXECUTION_ARMED", "MAPPING_PLAN_BATCH_PATH")
 
 

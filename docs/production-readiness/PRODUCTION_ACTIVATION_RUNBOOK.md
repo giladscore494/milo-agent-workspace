@@ -196,6 +196,7 @@ environment change at all.
 | `CLOUD_RUN_API_URL` | runtime | new deployment |
 | `GCP_PROJECT_NUMBER`, `GCP_WORKLOAD_IDENTITY_POOL_ID`, `GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID`, `GCP_SERVICE_ACCOUNT_EMAIL` | runtime | new deployment |
 | `GATEWAY_ALLOW_EXECUTION_ROUTES` | runtime | new deployment |
+| `GATEWAY_ALLOW_RUN_START_ROUTES` (run starts; opened LAST — see SCOPED_BATCH_PRODUCTION_RUNBOOK.md E.3) | runtime | new deployment |
 | `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` | runtime | new deployment |
 | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **build-time** | **REBUILD** |
 | `NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI` | **build-time** | **REBUILD** |

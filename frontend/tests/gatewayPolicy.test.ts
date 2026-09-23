@@ -1,9 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   executionRoutesEnabled,
   isGatewayRequestAllowed,
   isRunCreationRequest,
+  gatewayPosture,
 } from '@/lib/server/gatewayPolicy';
 
 const PROJECT_ID = '677db6c2-b44c-41c1-b4e1-b51229d697df';
@@ -146,6 +147,7 @@ describe('gateway policy', () => {
 
   it('opens execution routes only under the explicit server flag', () => {
     process.env.GATEWAY_ALLOW_EXECUTION_ROUTES = 'true';
+    process.env.GATEWAY_ALLOW_RUN_START_ROUTES = 'true';
     try {
       expect(
         isGatewayRequestAllowed('POST', `/conversations/${CONVERSATION_ID}/runs`),
@@ -167,6 +169,62 @@ describe('gateway policy', () => {
       ).toBe(false);
     } finally {
       delete process.env.GATEWAY_ALLOW_EXECUTION_ROUTES;
+      delete process.env.GATEWAY_ALLOW_RUN_START_ROUTES;
     }
+  });
+
+  /**
+   * The activation sequence, one gateway posture at a time. Starting a run is
+   * the LAST permission the website gets: every earlier posture -- Stage A,
+   * plan authoring, and every moment while the backend is being armed --
+   * refuses every run start at the gateway, whatever the API would do.
+   */
+  describe('a run start is refused in every posture before the last step', () => {
+    const PLAN_ID = '8c1f2e3d-4b5a-4c6d-8e7f-9a0b1c2d3e4f';
+    const RUN_STARTS = [
+      `/conversations/${CONVERSATION_ID}/runs`,
+      `/workflow-proposals/${PROPOSAL_ID}/runs`,
+      `/work-scopes/${PLAN_ID}/runs`,
+    ];
+    const PLAN_WRITES = [
+      `/conversations/${CONVERSATION_ID}/work-scopes`,
+      `/work-scopes/${PLAN_ID}/revisions`,
+    ];
+
+    afterEach(() => {
+      delete process.env.GATEWAY_ALLOW_EXECUTION_ROUTES;
+      delete process.env.GATEWAY_ALLOW_RUN_START_ROUTES;
+    });
+
+    it.each([
+      ['Stage A (nothing open)', undefined, undefined, false],
+      ['Stage P and Stage 2 arming (plan writes open, starts closed)', 'true', undefined, true],
+      ['Stage P with the start flag explicitly false', 'true', 'false', true],
+      ['a start flag without the execution routes is still closed', undefined, 'true', false],
+      ['a malformed start flag is closed', 'true', 'yes', true],
+    ])('%s', (_label, execution, start, planWritesOpen) => {
+      if (execution !== undefined) process.env.GATEWAY_ALLOW_EXECUTION_ROUTES = execution;
+      if (start !== undefined) process.env.GATEWAY_ALLOW_RUN_START_ROUTES = start;
+      for (const path of RUN_STARTS) {
+        expect(isGatewayRequestAllowed('POST', path), path).toBe(false);
+        expect(isRunCreationRequest('POST', path), path).toBe(true);
+      }
+      for (const path of PLAN_WRITES) {
+        expect(isGatewayRequestAllowed('POST', path), path).toBe(planWritesOpen);
+      }
+      expect(gatewayPosture()).toEqual({ executionRoutes: planWritesOpen, runStartRoutes: false });
+    });
+
+    it('opens every run start only as the last step', () => {
+      process.env.GATEWAY_ALLOW_EXECUTION_ROUTES = 'true';
+      process.env.GATEWAY_ALLOW_RUN_START_ROUTES = 'true';
+      for (const path of RUN_STARTS) {
+        expect(isGatewayRequestAllowed('POST', path), path).toBe(true);
+        expect(isRunCreationRequest('POST', path), path).toBe(false);
+      }
+      expect(gatewayPosture()).toEqual({ executionRoutes: true, runStartRoutes: true });
+      // A GET of a run-start path is never a start and never proxied as one.
+      expect(isRunCreationRequest('GET', RUN_STARTS[2])).toBe(false);
+    });
   });
 });

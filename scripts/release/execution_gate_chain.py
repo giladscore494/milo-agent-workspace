@@ -93,11 +93,33 @@ GATE_CHAIN: tuple[Gate, ...] = (
         surface=GATEWAY_RUNTIME,
         current_default="unset (falsey)",
         required_for_first_run="YES",
-        when_to_enable="Stage 2, with the UI flag",
+        when_to_enable=(
+            "Stage P (plan authoring), with the UI flag; it opens the execution "
+            "routes (Mapping Plan writes, pause/resume, cancellation) but never a "
+            "run START on its own"),
         requires_redeploy=REDEPLOY_FE,
         failure_behavior_when_off=(
-            "isGatewayRequestAllowed() rejects POST /conversations/{id}/runs at "
-            "the gateway; the request never reaches the Cloud Run API."),
+            "isGatewayRequestAllowed() rejects every execution route, including "
+            "the Mapping Plan writes and every run start; the request never "
+            "reaches the Cloud Run API."),
+        stage=2,
+    ),
+    Gate(
+        name="GATEWAY_ALLOW_RUN_START_ROUTES",
+        surface=GATEWAY_RUNTIME,
+        current_default="unset (falsey)",
+        required_for_first_run="YES — and it is opened LAST",
+        when_to_enable=(
+            "Stage 2, as the very last step: after website-execution-activate.sh "
+            "--apply-backend armed and read back the worker and then the API, and "
+            "after production-verify.sh --gate armed proved every start still "
+            "refused. Requires GATEWAY_ALLOW_EXECUTION_ROUTES as well"),
+        requires_redeploy=REDEPLOY_FE,
+        failure_behavior_when_off=(
+            "isRunCreationRequest() refuses POST /conversations/{id}/runs, "
+            "/workflow-proposals/{id}/runs and /work-scopes/{id}/runs with 403 "
+            "before authentication, so no intermediate activation posture can "
+            "start a run from the website."),
         stage=2,
     ),
     Gate(

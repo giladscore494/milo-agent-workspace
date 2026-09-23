@@ -138,13 +138,67 @@ describe('the composer follows the server’s answer on ordinary runs', () => {
       CONVERSATION, 'summarize', 'ui-test-idempotency-key'));
   });
 
-  it('never asks a non-catalog project and keeps its ordinary composer', async () => {
+  it('keeps the ordinary composer for a non-catalog project the server allows', async () => {
+    apiMocks.api.workScopeCapabilities.mockResolvedValue(
+      { ...PLAIN_SWARM, available: false, reason: 'workflow_not_supported' });
     apiMocks.api.startRun.mockResolvedValue({ run_id: '6e1f9b68-62a6-4b7d-8b9b-1e2f3a4b5c6d', status: 'queued' });
     await openConversation(V1_PROJECT, V1_CONV);
     fireEvent.change(await screen.findByLabelText('Task content'), { target: { value: 'map it' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send task' }));
     await waitFor(() => expect(apiMocks.api.startRun).toHaveBeenCalled());
-    expect(apiMocks.api.workScopeCapabilities).not.toHaveBeenCalled();
+    expect(apiMocks.api.workScopeCapabilities).toHaveBeenCalledWith(V1_PROJECT.id);
+  });
+});
+
+/**
+ * Stage P (plan authoring): the execution UI is on, the gateway proxies the
+ * Mapping Plan writes, and the API's run creation is OFF. No project may offer
+ * an actionable task; the Mapping Plan stays usable for authoring.
+ */
+describe('plan-authoring posture: plans can be written, nothing can start', () => {
+  const STAGE_P_SWARM = { ...CAPABILITIES, can_start_batches: false,
+    direct_runs: { allowed: false, blocked_by: 'run_creation_disabled' } };
+  const STAGE_P_V1 = { ...STAGE_P_SWARM, available: false, reason: 'workflow_not_supported' };
+
+  beforeEach(() => {
+    apiMocks.executionUi = true;
+    for (const fn of Object.values(apiMocks.api)) fn.mockReset();
+    apiMocks.api.runs.mockResolvedValue([]);
+    apiMocks.api.projects.mockResolvedValue([SWARM_PROJECT, V1_PROJECT]);
+    apiMocks.api.conversations.mockImplementation((projectId: string) =>
+      Promise.resolve(projectId === PROJECT ? [CONV] : [V1_CONV]));
+    apiMocks.api.workScopeCapabilities.mockImplementation((projectId: string) =>
+      Promise.resolve(projectId === PROJECT ? STAGE_P_SWARM : STAGE_P_V1));
+    apiMocks.api.workScopeDirectory.mockResolvedValue(DIRECTORY);
+    apiMocks.api.openWorkScope.mockResolvedValue({ work_scope: null });
+    window.sessionStorage.clear();
+  });
+
+  it('offers no task in a Vehicle Catalog V1 project', async () => {
+    await openConversation(V1_PROJECT, V1_CONV);
+    await waitFor(() => expect(composer().textContent).toContain('turned off at the current activation stage'));
+    expect(screen.queryByRole('button', { name: 'Send task' })).toBeNull();
+    expect(screen.queryByLabelText('Task content')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Mapping plan' })).toBeNull();
+    expect(apiMocks.api.startRun).not.toHaveBeenCalled();
+  });
+
+  it('offers no task in a Swarm V2 project, and its Mapping Plan can be authored but not run', async () => {
+    apiMocks.api.createWorkScope.mockResolvedValue({ applied: true, notes: [], work_scope: stateBody() });
+    await openConversation();
+    await waitFor(() => expect(composer().textContent).toContain('turned off at the current activation stage'));
+    expect(screen.queryByRole('button', { name: 'Send task' })).toBeNull();
+    const panel = (await screen.findByRole('heading', { name: 'Mapping plan' })).closest('section')! as HTMLElement;
+    fireEvent.click(within(panel).getByRole('button', { name: 'Show' }));
+    fireEvent.change(within(panel).getByLabelText('Tell MILO what to map'),
+      { target: { value: 'Map Toyota, starting with 2018+, up to 10 variants.' } });
+    fireEvent.click(within(panel).getByRole('button', { name: 'Create plan' }));
+    await waitFor(() => expect(apiMocks.api.createWorkScope).toHaveBeenCalled());
+    // Planning only: no batch control is offered while starts are off.
+    expect(panel.textContent).toContain('Planning only');
+    expect(within(panel).queryByRole('button', { name: /Start batch/ })).toBeNull();
+    expect(apiMocks.api.startWorkScopeBatch).not.toHaveBeenCalled();
+    expect(apiMocks.api.startRun).not.toHaveBeenCalled();
   });
 });
 

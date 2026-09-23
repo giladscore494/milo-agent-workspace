@@ -20,6 +20,9 @@
 #                          start (no live batch, not paused)
 #   RUNS_QUIESCENT         no non-terminal run exists
 #   GATEWAY_ENABLED        the running gateway proxies execution routes
+#                          (Mapping Plan writes) and reaches the API
+#   RUN_START_PATH         the running gateway proxies a run START: DISABLED
+#                          (proved closed) before the last step, VERIFIED after
 #   WEBSITE_ENABLED        the served build has the execution UI and is the release
 #   PAID_EXECUTION_READY   the backend is armed, the provider credential is
 #                          bound to the worker, quota + RuntimePolicy resolve
@@ -31,7 +34,12 @@
 #   database   DATABASE_READY (before a deploy: the code needs this schema)
 #   deployed   CODE_DEPLOYED, DATABASE_READY
 #   prepared   deployed + EVIDENCE_READY, BATCH_READY, RUNS_QUIESCENT
-#   active     prepared + GATEWAY_ENABLED, WEBSITE_ENABLED, PAID_EXECUTION_READY
+#   armed      PRE-OPEN: prepared + GATEWAY_ENABLED, WEBSITE_ENABLED,
+#              PAID_EXECUTION_READY, and RUN_START_PATH proved DISABLED. It is the
+#              gate BEFORE the operator opens run starts on the website, and it
+#              refuses if they are already open or cannot be proved closed.
+#   active     POST-OPEN: the same, with RUN_START_PATH VERIFIED open. It is a
+#              check AFTER the last step, never a gate before it.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,10 +61,11 @@ Read-only verification of the deployed production state. Makes no paid call
 and creates no run.
 
 Options:
-  --gate database|deployed|prepared|active
+  --gate database|deployed|prepared|armed|active
                      Which facts must be VERIFIED for exit 0 (default: active).
                      database: the exact migration set and the path's schema,
-                     before anything is deployed.
+                     before anything is deployed. armed: the PRE-OPEN gate
+                     (run starts proved closed). active: the POST-OPEN check.
   --work-scope-id <uuid> --work-scope-revision <n> --work-scope-digest <hex>
                      The Mapping Plan revision the first batch run will use.
                      Required for EVIDENCE_READY / BATCH_READY to be VERIFIED.
@@ -83,9 +92,11 @@ case "$GATE" in
   database) REQUIRED=(DATABASE_READY) ;;
   deployed) REQUIRED=(CODE_DEPLOYED DATABASE_READY) ;;
   prepared) REQUIRED=(CODE_DEPLOYED DATABASE_READY EVIDENCE_READY BATCH_READY RUNS_QUIESCENT) ;;
+  armed) REQUIRED=(CODE_DEPLOYED DATABASE_READY EVIDENCE_READY BATCH_READY RUNS_QUIESCENT
+                   GATEWAY_ENABLED WEBSITE_ENABLED PAID_EXECUTION_READY RUN_START_PATH:DISABLED) ;;
   active) REQUIRED=(CODE_DEPLOYED DATABASE_READY EVIDENCE_READY BATCH_READY RUNS_QUIESCENT
-                    GATEWAY_ENABLED WEBSITE_ENABLED PAID_EXECUTION_READY) ;;
-  *) printf 'FAIL: --gate must be database, deployed, prepared or active\n' >&2; exit 2 ;;
+                    GATEWAY_ENABLED WEBSITE_ENABLED PAID_EXECUTION_READY RUN_START_PATH) ;;
+  *) printf 'FAIL: --gate must be database, deployed, prepared, armed or active\n' >&2; exit 2 ;;
 esac
 
 CONFIG_PATH="$(milo_operator_config_path "$REPO_ROOT" "$MILO_OPERATOR_CONFIG_PATH")"
@@ -270,6 +281,12 @@ case "${gateway}|${binding}" in
   *\|NO) fact GATEWAY_ENABLED NO "the gateway cannot reach the API" ;;
   *) fact GATEWAY_ENABLED UNVERIFIED "gateway=${gateway:-?} binding=${binding:-?}" ;;
 esac
+run_start="$(website_fact GATEWAY_RUN_START_ENABLED)"
+case "$run_start" in
+  VERIFIED) fact RUN_START_PATH VERIFIED "the website proxies run starts" ;;
+  DISABLED) fact RUN_START_PATH DISABLED "every run start is refused at the gateway" ;;
+  *) fact RUN_START_PATH UNVERIFIED "the run-start posture could not be proved" ;;
+esac
 ui="$(website_fact TASK_COMPOSER_VISIBLE)"
 release="$(website_fact FRONTEND_RELEASE)"
 case "${ui}|${release}" in
@@ -333,14 +350,20 @@ printf 'PAID_CALLS_PERFORMED_BY_THIS_CHECK=NO\n'
 printf '\n== VERDICT (gate: %s) ==\n' "$GATE"
 missing=()
 for name in CODE_DEPLOYED DATABASE_READY EVIDENCE_READY BATCH_READY RUNS_QUIESCENT \
-            GATEWAY_ENABLED WEBSITE_ENABLED PAID_EXECUTION_READY; do
+            GATEWAY_ENABLED WEBSITE_ENABLED PAID_EXECUTION_READY RUN_START_PATH; do
   value="${FACTS[$name]:-UNVERIFIED}"
-  marker=" "
-  if milo_contains "$name" "${REQUIRED[@]}"; then
-    marker="*"
-    [[ "$value" == "VERIFIED" ]] || missing+=("${name}=${value}")
+  marker=" " expected=""
+  for requirement in "${REQUIRED[@]}"; do
+    if [[ "${requirement%%:*}" == "$name" ]]; then
+      marker="*"
+      expected="VERIFIED"
+      [[ "$requirement" == *:* ]] && expected="${requirement#*:}"
+    fi
+  done
+  if [[ -n "$expected" && "$value" != "$expected" ]]; then
+    missing+=("${name}=${value} (needs ${expected})")
   fi
-  printf ' %s %-22s %s\n' "$marker" "$name" "$value"
+  printf ' %s %-22s %s%s\n' "$marker" "$name" "$value" "${expected:+   [needs ${expected}]}"
 done
 printf '   (* required by this gate)\n'
 if [[ "${#missing[@]}" -gt 0 ]]; then

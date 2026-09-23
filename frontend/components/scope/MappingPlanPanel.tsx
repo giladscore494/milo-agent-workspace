@@ -108,6 +108,11 @@ export function MappingPlanPanel({
   const checked = draftEdit(draft, limits);
   const problem = 'problem' in checked ? checked.problem : undefined;
   const hasPlan = state !== undefined && state !== null;
+  // Nothing is authored before the server has said whether this conversation
+  // already has a plan (`state === undefined` is "not read yet"). An edit made
+  // earlier would be silently replaced when that answer arrives -- or, if the
+  // read failed, written over a plan nobody has seen.
+  const locked = busy || state === undefined;
   const needle = filter.trim().toLowerCase();
   const matches = (directory?.entries ?? []).filter((entry) =>
     needle === ''
@@ -169,6 +174,7 @@ export function MappingPlanPanel({
                 value={instruction}
                 maxLength={limits.maxInstructionChars}
                 rows={2}
+                disabled={locked}
                 onChange={(event) => onInstructionChange(event.target.value)}
                 placeholder="Map Toyota and Lexus, starting with 2018+, up to 800 variants."
               />
@@ -178,7 +184,7 @@ export function MappingPlanPanel({
                 type="button"
                 className="button button--primary"
                 onClick={onSubmitInstruction}
-                disabled={busy || dirty || instruction.trim() === ''}
+                disabled={locked || dirty || instruction.trim() === ''}
               >
                 {busy ? 'Working…' : hasPlan ? 'Update plan' : 'Create plan'}
               </button>
@@ -229,11 +235,11 @@ export function MappingPlanPanel({
                       {!entry && <span className="note">Not in the current manufacturer directory.</span>}
                       <span className="button-row">
                         <button type="button" className="button button--quiet" aria-label={`Move ${name} up`}
-                          disabled={busy || index === 0} onClick={() => onDraftChange(moveUnit(draft, key, -1))}>↑</button>
+                          disabled={locked || index === 0} onClick={() => onDraftChange(moveUnit(draft, key, -1))}>↑</button>
                         <button type="button" className="button button--quiet" aria-label={`Move ${name} down`}
-                          disabled={busy || index === draft.units.length - 1} onClick={() => onDraftChange(moveUnit(draft, key, 1))}>↓</button>
+                          disabled={locked || index === draft.units.length - 1} onClick={() => onDraftChange(moveUnit(draft, key, 1))}>↓</button>
                         <button type="button" className="button button--quiet" aria-label={`Remove ${name}`}
-                          disabled={busy} onClick={() => onDraftChange(removeUnit(draft, key))}>Remove</button>
+                          disabled={locked} onClick={() => onDraftChange(removeUnit(draft, key))}>Remove</button>
                       </span>
                     </li>
                   );
@@ -264,21 +270,24 @@ export function MappingPlanPanel({
               <div className="field">
                 <label className="field-label" htmlFor="mapping-plan-year-from">From model year (optional)</label>
                 <input id="mapping-plan-year-from" inputMode="numeric" value={draft.modelYearFrom}
+                  disabled={locked}
                   onChange={(event) => onDraftChange({ ...draft, modelYearFrom: event.target.value })} />
               </div>
               <div className="field">
                 <label className="field-label" htmlFor="mapping-plan-year-to">To model year (optional)</label>
                 <input id="mapping-plan-year-to" inputMode="numeric" value={draft.modelYearTo}
+                  disabled={locked}
                   onChange={(event) => onDraftChange({ ...draft, modelYearTo: event.target.value })} />
               </div>
               <div className="field">
                 <label className="field-label" htmlFor="mapping-plan-max-items">Candidate limit (at most {limits.maxItems})</label>
                 <input id="mapping-plan-max-items" inputMode="numeric" value={draft.maxItems}
+                  disabled={locked}
                   onChange={(event) => onDraftChange({ ...draft, maxItems: event.target.value })} />
               </div>
               <div className="field">
                 <label className="field-label" htmlFor="mapping-plan-batch-size">Candidates per batch (at most {limits.maxBatchSize})</label>
-                <select id="mapping-plan-batch-size" value={draft.batchSize}
+                <select id="mapping-plan-batch-size" value={draft.batchSize} disabled={locked}
                   onChange={(event) => onDraftChange({ ...draft, batchSize: Number(event.target.value) })}>
                   {Array.from({ length: limits.maxBatchSize }, (_, index) => index + 1).map((size) => (
                     <option key={size} value={size}>{size}{size === limits.defaultBatchSize ? ' (default)' : ''}</option>
@@ -289,10 +298,10 @@ export function MappingPlanPanel({
             {dirty && problem && <p className="muted">{PROBLEM_COPY[problem]}</p>}
             <div className="button-row">
               <button type="button" className="button button--primary" onClick={onSaveDraft}
-                disabled={busy || !dirty || problem !== undefined}>
+                disabled={locked || !dirty || problem !== undefined}>
                 {hasPlan ? 'Save plan' : 'Create plan from these choices'}
               </button>
-              <button type="button" className="button button--quiet" onClick={onDiscardDraft} disabled={busy || !dirty}>
+              <button type="button" className="button button--quiet" onClick={onDiscardDraft} disabled={locked || !dirty}>
                 Discard changes
               </button>
             </div>
@@ -328,7 +337,7 @@ export function MappingPlanPanel({
                         </span>
                         <span className="note">{safeText(coverageLabel(entry))}</span>
                         <button type="button" className="button button--quiet" aria-label={`Add ${entry.name}`}
-                          disabled={busy || inPlan || draft.units.length >= limits.maxUnits}
+                          disabled={locked || inPlan || draft.units.length >= limits.maxUnits}
                           onClick={() => onDraftChange(addUnit(draft, entry.key))}>
                           {inPlan ? 'In plan' : 'Add'}
                         </button>

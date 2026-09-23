@@ -681,13 +681,16 @@ export default function WorkspacePage() {
   }, []);
 
   /**
-   * Whether the Mapping Plan applies to this project, from the SERVER's
-   * capability read. Only a Swarm V2 project is asked -- no other engine reads
-   * a plan -- and any failure, including a client that has no such method,
-   * leaves the surface hidden rather than half-shown.
+   * The project's capabilities, from the SERVER: whether the Mapping Plan
+   * applies (only a Swarm V2 project reads one) AND whether an ordinary run
+   * may be created here at all (`direct_runs`). Every project is asked,
+   * because the second answer is what keeps the composer honest in a posture
+   * such as plan authoring, where the execution UI is on but run creation is
+   * off. Any failure, including a client that has no such method, leaves the
+   * Mapping Plan hidden and the composer unconfirmed rather than half-shown.
    */
   const loadPlanCapabilities = useCallback((project: Project, owner: WorkspaceScope) => {
-    if (!executionUi || project.workflow_key !== 'swarm_v2') return;
+    if (!executionUi) return;
     Promise.resolve()
       .then(() => api.workScopeCapabilities(project.id))
       .then(body => {
@@ -747,13 +750,13 @@ export default function WorkspacePage() {
   const batchesAvailable = planAvailable && planCapabilities?.canStartBatches === true;
 
   /**
-   * Where a typed task may go, from the SERVER's capability read. Only a Swarm
-   * V2 project can be a catalog project; every other project keeps its
-   * ordinary composer. A Swarm V2 project whose capabilities have not answered
-   * is `unconfirmed`, never `direct`: with the Government read on, an ordinary
-   * run there would be refused, and the composer must not pretend otherwise.
+   * Where a typed task may go, from the SERVER's capability read, for EVERY
+   * project. A project whose capabilities have not answered is `unconfirmed`,
+   * never `direct`: the server may be refusing ordinary runs (run creation
+   * off during plan authoring, or a catalog project whose work starts from the
+   * Mapping Plan), and the composer must not pretend otherwise.
    */
-  const composerRoute: ComposerRoute = selectedProject?.workflow_key !== 'swarm_v2'
+  const composerRoute: ComposerRoute = selectedProject === undefined
     ? { kind: 'direct' }
     : planCapabilities === undefined
       ? { kind: 'unconfirmed' }

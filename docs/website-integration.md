@@ -97,8 +97,9 @@ browser: `_safe_run_response` strips `lease_token` and `launch_error`, and
 ### Flags that gate it
 
 `MILO_ENABLE_RUN_CREATION` on the API (403 before body validation,
-`backend/execution_guard.py`), `GATEWAY_ALLOW_EXECUTION_ROUTES` on the
-gateway (the POST is refused before authentication when off), and
+`backend/execution_guard.py`), `GATEWAY_ALLOW_EXECUTION_ROUTES` AND
+`GATEWAY_ALLOW_RUN_START_ROUTES` on the gateway (a run start is refused before
+authentication unless both are on; the second is opened last), and
 `MILO_ENABLE_EXECUTION_CONTROL` for every worker write. (Operational fact,
 verified read-only on 2026-09-22, not a property of the code: all of them are
 `false` on the Production API and Worker.)

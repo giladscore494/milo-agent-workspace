@@ -141,6 +141,9 @@ export default defineConfig({
         CLOUD_RUN_API_URL: 'http://127.0.0.1:8101',
         NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI: 'true',
         GATEWAY_ALLOW_EXECUTION_ROUTES: 'true',
+        // Starting a run is a separate gateway permission; the enabled stack
+        // is the fully armed posture, so both are on.
+        GATEWAY_ALLOW_RUN_START_ROUTES: 'true',
         NEXT_DIST_DIR: '.next-e2e-enabled',
       },
     },

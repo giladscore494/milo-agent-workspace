@@ -29,8 +29,13 @@ const apiMocks = vi.hoisted(() => ({
     projects: vi.fn(), conversations: vi.fn(), createConversation: vi.fn(),
     createProposal: vi.fn(), proposal: vi.fn(), decideProposal: vi.fn(), reviseProposal: vi.fn(),
     startRun: vi.fn(), run: vi.fn(), runs: vi.fn(() => Promise.resolve([])), events: vi.fn(), cancel: vi.fn(),
+    // The server's answer on ordinary runs; every project is asked.
+    workScopeCapabilities: vi.fn(),
   },
 }));
+
+/** A capability answer that allows ordinary runs (a V1 project, run creation on). */
+const RUNS_ALLOWED = { available: false, reason: 'workflow_not_supported', contract: 'milo-work-scope/1', directory_version: 'milo-manufacturer-directory/1', limits: { max_units: 39, max_items: 2000, default_max_items: 100, max_batch_size: 20, default_batch_size: 10, min_model_year: 1900, max_model_year: 2100, max_instruction_chars: 500 }, can_prepare: false, can_start_batches: false, direct_runs: { allowed: true, blocked_by: null } };
 
 vi.mock('../lib/api', () => ({
   api: apiMocks.api,
@@ -62,6 +67,7 @@ describe('cancellation confirmation focus contract', () => {
   beforeEach(() => {
     apiMocks.executionUi = true;
     for (const fn of Object.values(apiMocks.api)) fn.mockReset();
+    apiMocks.api.workScopeCapabilities.mockResolvedValue(RUNS_ALLOWED);
     apiMocks.api.projects.mockResolvedValue([PROJECT]);
     apiMocks.api.conversations.mockResolvedValue([CONVERSATION]);
     apiMocks.api.events.mockResolvedValue([]);
@@ -150,6 +156,7 @@ describe('workspace drawer focus', () => {
   beforeEach(() => {
     apiMocks.executionUi = false;
     for (const fn of Object.values(apiMocks.api)) fn.mockReset();
+    apiMocks.api.workScopeCapabilities.mockResolvedValue(RUNS_ALLOWED);
     apiMocks.api.projects.mockResolvedValue([PROJECT]);
     apiMocks.api.conversations.mockResolvedValue([CONVERSATION]);
     window.sessionStorage.clear();
@@ -222,6 +229,7 @@ describe('announcements stay rare and meaningful', () => {
   beforeEach(() => {
     apiMocks.executionUi = true;
     for (const fn of Object.values(apiMocks.api)) fn.mockReset();
+    apiMocks.api.workScopeCapabilities.mockResolvedValue(RUNS_ALLOWED);
     apiMocks.api.projects.mockResolvedValue([PROJECT]);
     apiMocks.api.conversations.mockResolvedValue([CONVERSATION]);
     apiMocks.api.events.mockResolvedValue([]);

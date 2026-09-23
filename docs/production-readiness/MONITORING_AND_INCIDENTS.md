@@ -54,8 +54,8 @@ group chosen in the manifest copy.
 ## Kill switches (verified order)
 
 1. `MILO_ENABLE_PAID_EXECUTION` off — no provider spend;
-2. `MILO_ENABLE_RUN_CREATION` + `GATEWAY_ALLOW_EXECUTION_ROUTES` off — no
-   new work;
+2. `MILO_ENABLE_RUN_CREATION` + `GATEWAY_ALLOW_RUN_START_ROUTES` (and
+   `GATEWAY_ALLOW_EXECUTION_ROUTES`) off — no new work;
 3. `JOB_LAUNCHER=disabled` — no worker launches;
 4. remove worker provider-secret binding — no provider access at all;
 5. Cloud Run traffic to a known-good revision — full code rollback.

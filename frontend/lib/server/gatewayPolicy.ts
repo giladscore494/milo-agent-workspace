@@ -12,10 +12,19 @@ type GatewayRule = {
  * enforces membership authorization plus its own execution flags.
  *
  * Read routes are always proxied for authenticated users. Execution routes
- * (proposal mutations, run creation, cancellation) are additionally gated
- * by the server-side GATEWAY_ALLOW_EXECUTION_ROUTES flag, which stays OFF
- * by default so the deployed gateway keeps its read-only posture until an
+ * (proposal mutations, Mapping Plan writes, cancellation) are additionally
+ * gated by the server-side GATEWAY_ALLOW_EXECUTION_ROUTES flag, which stays
+ * OFF by default so the deployed gateway keeps its read-only posture until an
  * operator deliberately enables the execution stage.
+ *
+ * STARTING a run is a separate, later permission. The three run-start routes
+ * (a conversation run, a proposal run, a Mapping Plan batch) need
+ * GATEWAY_ALLOW_RUN_START_ROUTES as well. Plan authoring (Stage P) opens the
+ * execution routes so a person can write a plan; nothing can start until the
+ * operator has armed and read back the worker and the API, passed the
+ * pre-open gate, and only then opened this flag -- the LAST step of the
+ * activation. Every intermediate state therefore refuses a start at the
+ * gateway, whatever the backend flags say at that moment.
  */
 
 const SAFE_RULES: GatewayRule[] = [
@@ -139,6 +148,20 @@ export function executionRoutesEnabled(): boolean {
     .toLowerCase() === 'true';
 }
 
+/**
+ * May the gateway proxy a request that STARTS a run? Only when the execution
+ * routes are open AND the separate run-start flag is on: a run start is an
+ * execution route, and never the only one open.
+ */
+export function runStartRoutesEnabled(): boolean {
+  return executionRoutesEnabled()
+    && (process.env.GATEWAY_ALLOW_RUN_START_ROUTES ?? '').trim().toLowerCase() === 'true';
+}
+
+function isRunStartPath(method: string, path: string): boolean {
+  return method.toUpperCase() === 'POST' && RUN_CREATION_RULES.some((rule) => rule.test(path));
+}
+
 function matches(rules: GatewayRule[], method: string, path: string): boolean {
   const normalizedMethod = method.toUpperCase();
   return rules.some(
@@ -148,16 +171,33 @@ function matches(rules: GatewayRule[], method: string, path: string): boolean {
 
 export function isGatewayRequestAllowed(method: string, path: string): boolean {
   if (matches(SAFE_RULES, method, path)) return true;
+  if (isRunStartPath(method, path)) return runStartRoutesEnabled();
   if (executionRoutesEnabled() && matches(EXECUTION_RULES, method, path)) {
     return true;
   }
   return false;
 }
 
+/** A run start the gateway refuses right now (403, before authentication). */
 export function isRunCreationRequest(method: string, path: string): boolean {
-  if (executionRoutesEnabled()) return false;
-  return (
-    method.toUpperCase() === 'POST' &&
-    RUN_CREATION_RULES.some((rule) => rule.test(path))
-  );
+  return isRunStartPath(method, path) && !runStartRoutesEnabled();
+}
+
+/** Representative ids for {@link gatewayPosture}; nil UUIDs match no row. */
+const NIL = '00000000-0000-4000-8000-000000000000';
+
+/**
+ * What THIS gateway would do, computed by the policy functions above on one
+ * representative path of each kind -- the policy's behaviour, not a raw
+ * environment read. `/api/deployment-status` reports it for the operator's
+ * read-only website check.
+ */
+export function gatewayPosture(): { executionRoutes: boolean; runStartRoutes: boolean } {
+  const planWrite = `/conversations/${NIL}/work-scopes`;
+  const runStarts = [`/conversations/${NIL}/runs`, `/workflow-proposals/${NIL}/runs`, `/work-scopes/${NIL}/runs`];
+  return {
+    executionRoutes: isGatewayRequestAllowed('POST', planWrite),
+    runStartRoutes: runStarts.every((path) =>
+      isGatewayRequestAllowed('POST', path) && !isRunCreationRequest('POST', path)),
+  };
 }

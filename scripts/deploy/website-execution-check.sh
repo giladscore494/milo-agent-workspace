@@ -9,6 +9,10 @@
 #   FRONTEND_RELEASE           the deployed website was built from the release
 #   TASK_COMPOSER_VISIBLE      the SERVED build has the execution UI on
 #   GATEWAY_EXECUTION_ENABLED  the running gateway proxies execution routes
+#                              (Mapping Plan writes)
+#   GATEWAY_RUN_START_ENABLED  the running gateway proxies a run START -- the
+#                              separate permission opened LAST (DISABLED is
+#                              what the pre-open gate requires)
 #   GATEWAY_BACKEND_BINDING    the gateway reaches the Cloud Run API
 #   BACKEND_EXECUTION_ARMED    every API + worker gate, read from Cloud Run
 #   MAPPING_PLAN_BATCH_PATH    the named plan revision's next batch is ready
@@ -103,11 +107,13 @@ grep -q "catalog_batch_required" "${REPO_ROOT}/frontend/components/conversation/
 [[ -f "${REPO_ROOT}/frontend/app/api/gateway/[...path]/route.ts" ]] || WIRED=NO
 [[ -f "${REPO_ROOT}/frontend/app/api/deployment-status/route.ts" ]] || WIRED=NO
 grep -q "executionRoutesEnabled" "${REPO_ROOT}/frontend/lib/server/gatewayPolicy.ts" 2> /dev/null || WIRED=NO
+grep -q "runStartRoutesEnabled" "${REPO_ROOT}/frontend/lib/server/gatewayPolicy.ts" 2> /dev/null || WIRED=NO
 fact FRONTEND_CODE_WIRED "$WIRED"
 
 if [[ "$SKIP_REMOTE" -eq 1 ]]; then
   for name in FRONTEND_RELEASE TASK_COMPOSER_VISIBLE GATEWAY_EXECUTION_ENABLED \
-              GATEWAY_BACKEND_BINDING BACKEND_EXECUTION_ARMED MAPPING_PLAN_BATCH_PATH; do
+              GATEWAY_RUN_START_ENABLED GATEWAY_BACKEND_BINDING BACKEND_EXECUTION_ARMED \
+              MAPPING_PLAN_BATCH_PATH; do
     fact "$name" UNVERIFIED "--offline"
   done
   printf 'WEBSITE_EXECUTION_STAGE_ACTIVE=UNVERIFIED (--offline)\n'
@@ -146,7 +152,7 @@ PY
 # references it literally, so it reports the value the served bundle was built
 # with. A Vercel variable changed without a rebuild does not move it.
 # ---------------------------------------------------------------------------
-STATUS_UI="" STATUS_GATEWAY="" STATUS_SHA=""
+STATUS_UI="" STATUS_GATEWAY="" STATUS_RUN_START="" STATUS_SHA=""
 if [[ -z "$SITE_URL" ]]; then
   fact FRONTEND_RELEASE UNVERIFIED "no --site-url and no PRODUCTION_ORIGIN"
   fact TASK_COMPOSER_VISIBLE UNVERIFIED "no website origin to read"
@@ -156,6 +162,7 @@ else
   if [[ "$code" == "200" && "$contract" == '"milo-website-deployment/1"' ]]; then
     STATUS_UI="$(json_get "${_MILO_CHECK_TMP}/body" execution_ui)"
     STATUS_GATEWAY="$(json_get "${_MILO_CHECK_TMP}/body" gateway_execution_routes)"
+    STATUS_RUN_START="$(json_get "${_MILO_CHECK_TMP}/body" gateway_run_start_routes)"
     STATUS_SHA="$(json_get "${_MILO_CHECK_TMP}/body" commit_sha)"
     STATUS_SHA="${STATUS_SHA//\"/}"
   fi
@@ -201,6 +208,21 @@ case "${STATUS_GATEWAY}|${PROBE}" in
   "true|DISABLED" | "false|VERIFIED")
     fact GATEWAY_EXECUTION_ENABLED UNVERIFIED "the deployment status and the gateway's behaviour disagree" ;;
   *) fact GATEWAY_EXECUTION_ENABLED UNVERIFIED "neither the deployment status nor the gateway's behaviour proved the value" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# 3b. GATEWAY_RUN_START_ENABLED — may the website START a run? Reported by the
+#     deployment status, computed by the gateway's own policy functions on the
+#     three run-start paths (no POST is ever sent). A run start requires the
+#     execution routes too, so an execution probe that proves them CLOSED also
+#     proves every start closed.
+# ---------------------------------------------------------------------------
+case "${STATUS_RUN_START}|${PROBE}" in
+  "true|VERIFIED") fact GATEWAY_RUN_START_ENABLED VERIFIED "the gateway proxies run starts" ;;
+  "false|"* | "|DISABLED")
+    fact GATEWAY_RUN_START_ENABLED DISABLED "every run start is refused at the gateway (${MILO_STAGE2_VERCEL_RUN_START_FLAG} off)" ;;
+  "true|DISABLED") fact GATEWAY_RUN_START_ENABLED UNVERIFIED "the status says open while the gateway refuses execution routes" ;;
+  *) fact GATEWAY_RUN_START_ENABLED UNVERIFIED "the run-start posture could not be proved" ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -341,7 +363,8 @@ fi
 # ---------------------------------------------------------------------------
 ALL_VERIFIED=1 ANY_DISABLED=0
 for name in FRONTEND_CODE_WIRED FRONTEND_RELEASE TASK_COMPOSER_VISIBLE GATEWAY_EXECUTION_ENABLED \
-            GATEWAY_BACKEND_BINDING BACKEND_EXECUTION_ARMED MAPPING_PLAN_BATCH_PATH; do
+            GATEWAY_RUN_START_ENABLED GATEWAY_BACKEND_BINDING BACKEND_EXECUTION_ARMED \
+            MAPPING_PLAN_BATCH_PATH; do
   value="${FACTS[$name]:-UNVERIFIED}"
   if [[ "$value" != "VERIFIED" ]]; then ALL_VERIFIED=0; fi
   if [[ "$value" == "DISABLED" || "$value" == "NO" ]]; then ANY_DISABLED=1; fi
