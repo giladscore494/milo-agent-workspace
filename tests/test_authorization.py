@@ -118,6 +118,8 @@ def test_cross_user_run_creation_never_reaches_launcher(repo):
 
 
 def test_member_cancellation_is_authorized_and_recorded(repo):
+    # A run its worker is executing: that worker finalizes the cancellation.
+    repo.run_fields = {"status": "running", "launch_state": "launched"}
     response = client().post(f"/runs/{repo.run_id}/cancel", json={"reason": "stop"}, headers=member_headers(repo))
     assert response.status_code == 200
     assert repo.cancelled_runs == 1

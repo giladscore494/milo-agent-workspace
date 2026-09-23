@@ -73,6 +73,7 @@ producing an incomplete sequence.
 | ts | `20260921000200_immutable_run_identity.sql` | Console 6 control-plane boundary. `runs.run_identity` stays nullable only for historical rows, while every NEW run must be born with a complete immutable identity including a full release SHA. `create_message_and_run_v3` commits the user message, run and identity atomically and re-checks the trusted project workflow; the superseded `bind_run_identity`, `create_message_and_run` and `create_message_and_run_v2` RPCs are removed. `runs_forbid_identity_rewrite` rejects every post-INSERT identity change (including legacy NULL→value retrofit), and `claim_run_lease` refuses identity-less legacy rows. `transition_run_worker_guarded` is redefined as NON-TERMINAL so `finalize_run_guarded` remains the only worker terminalization primitive. The migration also adds lease-guarded tool-access, tool-grant and per-call usage-ledger writers. Service-path only; forward-only and data-preserving, but deliberately not purely additive because obsolete RPC definitions are dropped. |
 | ts | `20260922000100_catalog_work_scopes.sql` | Scoped catalog PR1: the canonical, server-owned mapping PLAN. `catalog_work_scopes` (one row per plan, its head revision and digest, at most one OPEN plan per conversation by a partial unique index) and `catalog_work_scope_revisions` (append-only, numbered without gaps, the canonical record stored as TEXT with `digest = sha256(text)` and `scope = text::jsonb` held by CHECK constraints, and the record's shape and hard bounds -- batch size at most 20, limit at most 2000 -- held by `catalog_work_scope_record_valid`). `create_work_scope` and `revise_work_scope` derive the project and digest, re-check membership and the trusted `swarm_v2` workflow, and refuse a revision whose expected head revision or digest is not the current one (`WORK_SCOPE_STALE`). `catalog_canonical_manufacturer_coverage` is a bounded read of exact canonical variant counts per register marque plus the catalog total. Drafts only: no status but `draft`, no snapshot column, no relation to `runs`. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/` |
 | ts | `20260923000100_catalog_work_scope_preparation.sql` | Scoped catalog PR2: a Mapping Plan revision becomes durable WORK. A CHECK on `catalog_source_snapshots` (`catalog_capture_scope_consistent`) holds a scoped snapshot's declared `capture_scope` to the query it recorded (one register marque, `scope_key = sha256(query.filters)`); every existing row declares none and passes. `catalog_work_scope_preparations` (one per revision), `catalog_work_scope_units`, `catalog_work_scope_batches` (1-20 candidates, one unit and so one snapshot each), `catalog_work_scope_queue_items` and `catalog_work_scope_batch_runs` -- all append-only by trigger. `prepare_work_scope_queue` is lease-guarded and accepts ONLY an `operator_capture` run, refuses a stale head (`WORK_SCOPE_STALE`), counts every unit from its snapshot's own rows, records a mostly-`ambiguous` unit as `vocabulary_insufficient`, and materializes the deterministic queue in one transaction. `bind_work_scope_batch_run` is the batch<->run compare-and-set (one live batch per plan, never a stale revision, never a completed batch twice); `work_scope_batch_for_run` is the worker's read of its exact batch. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/preparation.py` |
+| ts | `20260924000100_catalog_work_scope_batch_runs.sql` | Scoped catalog PR3: a prepared batch becomes a RUN, and a plan's progress is read back. `catalog_work_scope_controls` is the plan's append-only pause / resume history (numbered without gaps, alternating from `pause`, held by a BEFORE-INSERT trigger), written only by `set_work_scope_paused`. `create_work_scope_batch_run` is the ONE start of a batch: under the plan's row lock it replays the same idempotency key, refuses a stale head or batch (`WORK_SCOPE_STALE`), a paused plan (`WORK_SCOPE_PAUSED`), a second live batch (`WORK_SCOPE_BATCH_IN_PROGRESS` -- a request for the batch already running answers with that run), a settled batch and any batch but the NEXT one (`WORK_SCOPE_BATCH_NOT_NEXT`), then calls `create_message_and_run_v3` and `bind_work_scope_batch_run` in the same transaction. `bind_work_scope_batch_run` is restated with the same signature: a paused plan binds nothing, batches bind in order, and a batch whose run ended `completed` OR `partial_success` is settled and never bound again. `work_scope_progress` derives each batch's state from its bound runs' durable status and its promoted / refused counts from their promotion events. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/batches.py` |
 
 All migrations are forward-only and data-preserving. Most are additive; Console 6 deliberately removes only superseded RPC definitions so there is one run-creation authority. There are no destructive table/data down-migrations, by policy (`scripts/check_migrations.py` forbids `drop table` and data deletes).
 
@@ -202,6 +203,61 @@ the caller), and preparing is off unless `MILO_ENABLE_WORK_SCOPE_PREPARATION`
 is supplied to one capture-job execution. Leaving it off leaves every new
 relation inert. A forward corrective migration could drop them and the CHECK;
 no existing relation depends on them.
+
+### Scoped catalog PR3 (batch runs) — migration and rollback impact
+
+`20260924000100_catalog_work_scope_batch_runs.sql` adds one relation
+(`catalog_work_scope_controls`), its two triggers and six functions, and
+restates `bind_work_scope_batch_run` with its signature unchanged. It rewrites
+no row and backfills nothing; every existing binding keeps its meaning (a
+`completed` batch was already never re-bound; a `partial_success` one now is
+not either).
+
+One of the six, `reconcile_lost_launch`, writes to `runs`: it is an
+operator's guarded decision on a LOST launch (a run left at `queued` +
+`launching` after the API died mid-launch), called only by
+`scripts/release/reconcile-launch-unknown.sh` under the full protected apply
+guard. Only after proving, under the run's row lock, that no worker ever
+claimed the run and that it has been quiet for at least 15 minutes does it
+record `launched` (an execution exists) or -- when nothing but the API ever
+wrote about the run -- `launch_failed`, the existing requeue path, with one
+`launch_failed` event. It never launches anything and never touches
+`launch_unknown`, which keeps the tool's own guarded updates. No API or worker
+path calls it.
+
+A second writer to `runs`, `retire_unlaunched_run`, is an operator's guarded
+retirement of a run no worker was ever started for (`pending` /
+`launch_failed`), called only by the same tool's `retire-not-launched`. Only
+after proving, under the row lock, no worker, no lease, no execution or paid
+work and a quiet row does it end the run through queued ->
+cancellation_requested -> cancelled with its `run_cancelled` event, in one
+transaction, as the canonical finalizer ends a cancellation. It never touches
+an uncertain launch and never relaunches anything.
+
+Privileges: the new relation has RLS on with no policies; `PUBLIC`, `anon` and
+`authenticated` have nothing; `service_role` gets `SELECT, INSERT` and neither
+`UPDATE` nor `DELETE`, and the append-only trigger refuses both to every role.
+Every function is `EXECUTE` for `service_role` alone. The batch-run creator
+returns `SETOF jsonb`, like the run creator it wraps.
+
+Rerun safety: `create table if not exists`, `create unique index if not
+exists`, `create or replace` and drop-then-create triggers. It is a property of
+the ORDERED set: re-applying `20260923000100` alone would restore the binding
+body this migration restates, so it is always re-applied followed by this one
+(the executable suite does exactly that).
+
+Deployment order: apply `20260923000100` and then this migration BEFORE the
+backend that calls them serves any Swarm V2 run. The worker now reads the batch
+binding of every real Swarm V2 run (to refuse an unbound catalog-reading run,
+and a batch run whose catalog read is off) and fails closed if that read is
+unavailable. The Stage D preflight's RPC inventory refuses a database missing
+either RPC set.
+
+Rollback: turning `MILO_ENABLE_WORK_SCOPE_BATCHES` off (the default) stops every
+start, pause and resume; the progress read keeps answering. A batch already
+running is untouched and can still be cancelled through the existing run
+cancellation. A forward corrective migration could drop the relation and the
+functions; no other relation depends on them.
 
 ### The corrective round — migration and rollback impact
 

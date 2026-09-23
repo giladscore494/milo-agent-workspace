@@ -17,6 +17,8 @@ group chosen in the manifest copy.
 | Lease loss events | worker logs | MEDIUM | worker starvation or clock issues; check job resources |
 | Stale heartbeats (`worker_heartbeats`, `stuck_runs` view) | DB | HIGH | run stuck; cancel/reclaim per RUN_LIFECYCLE.md |
 | `launch_unknown` count > 0 | `runs.launch_state` | HIGH | reconcile with `reconcile-launch-unknown.sh`; never auto-relaunch |
+| Lost launches (`queued` + `launching`, unclaimed, quiet > 15 min) | `runs.launch_state`, `updated_at` | HIGH | reconcile with `reconcile-launch-unknown.sh` after checking Cloud Run; never auto-relaunch |
+| Never-launched runs that cannot launch again (`pending` / `launch_failed` of a revised Mapping Plan) | `runs.launch_state`, `updated_at` | MEDIUM | `reconcile-launch-unknown.sh --resolution retire-not-launched`; never auto-relaunch or auto-retire |
 | Launch reconciliation age (oldest unresolved) | same | MEDIUM→HIGH with age | operator review SLA |
 | Run duration approaching `MILO_MAX_RUN_DURATION_SECONDS` | run rows/events | MEDIUM | investigate before hard stop triggers |
 | Cancellation latency | events timeline | MEDIUM | worker heartbeat interval too long? |

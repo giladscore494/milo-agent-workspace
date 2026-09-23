@@ -273,6 +273,9 @@ def test_every_non_product_terminal_path_also_goes_through_the_finalizer(
                                              original(self, claim))[1])
 
     repo, run_id = seeded_run(workflow_key)
+    # The worker was launched and has not claimed the run yet: the one unclaimed
+    # run a cancellation request is accepted for, because that worker finalizes it.
+    repo.set_launch_state(run_id, "launched")
     repo.request_cancellation(run_id)
     assert execute_run(run_id, repo, Engine(workflow_key,
                                             CancellationRequested("RUN_CANCELLED"))) == 0

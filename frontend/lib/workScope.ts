@@ -443,3 +443,359 @@ export function coverageLabel(entry: Pick<DirectoryEntry, 'coverageState' | 'can
   if (entry.coverageState === 'unverifiable') return 'Coverage unknown — register spelling not verified';
   return 'Coverage unavailable';
 }
+
+// ---------------------------------------------------------------------------
+// Batches (scoped catalog PR3): progress in, one start / pause / resume out.
+// ---------------------------------------------------------------------------
+//
+// A prepared plan is cut into bounded batches. Each batch is started by ONE
+// person's request and runs as ONE product run; nothing starts the next batch.
+// Everything below is a parsed copy of `GET /work-scopes/{id}/progress`, which
+// the server derives from the bound runs' own durable status and promotion
+// events. The browser never counts, never decides which batch is next and
+// never decides whether a start is allowed: `controls` is the server's answer,
+// and the database checks every start again under the plan's row lock.
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export type BatchState = 'pending' | 'active' | 'completed' | 'partial' | 'interrupted';
+export type UnitProgressState =
+  'not_queued' | 'nothing_queued' | 'pending' | 'active' | 'in_progress' | 'completed';
+export type PlanProgressStatus = 'not_prepared' | 'nothing_queued' | 'ready' | 'running' | 'complete';
+export type StartBlocker =
+  'batches_disabled' | 'closed' | 'paused' | 'not_prepared' | 'nothing_queued' | 'batch_running'
+  | 'complete';
+
+export type ProgressBatch = {
+  batchId: string;
+  batchNumber: number;
+  unitKey: string;
+  itemCount: number;
+  state: BatchState;
+  attempts: number;
+  /** Present on a batch that has run: its latest run and its outcome counts. */
+  runId?: string;
+  runStatus?: string;
+  promoted?: number;
+  refused?: number;
+  unresolved?: number;
+};
+
+export type ProgressUnit = {
+  unitKey: string;
+  name: string;
+  priority: number;
+  state: 'prepared' | 'register_unverified' | 'snapshot_unusable' | 'vocabulary_insufficient';
+  reasonCode?: string;
+  progress: UnitProgressState;
+  queuedCount: number;
+  batchCount: number;
+  settledBatches: number;
+  active: boolean;
+  promoted: number;
+  refused: number;
+  unresolved: number;
+};
+
+export type ProgressLive = {
+  batchId: string;
+  batchNumber: number;
+  revision: number;
+  unitKey: string;
+  itemCount: number;
+  attempt: number;
+  runId: string;
+  runStatus: string;
+  launchState?: string;
+};
+
+export type WorkScopeProgress = {
+  workScopeId: string;
+  revision: number;
+  digest: string;
+  closed: boolean;
+  paused: boolean;
+  status: PlanProgressStatus;
+  live?: ProgressLive;
+  preparation?: {
+    revision: number;
+    preparedAt?: string;
+    unitCount: number;
+    preparedUnitCount: number;
+    units: ProgressUnit[];
+    next?: ProgressBatch;
+    recent: ProgressBatch[];
+    batches: { total: number; settled: number; active: number; interrupted: number; remaining: number };
+    items: { total: number; promoted: number; refused: number; unresolved: number; completed: number; remaining: number };
+  };
+  controls: {
+    start: { available: boolean; blockedBy?: StartBlocker; batch?: ProgressBatch; retry: boolean; relaunch: boolean };
+    pause: { available: boolean };
+    resume: { available: boolean };
+    cancel: { available: boolean; runId?: string };
+  };
+};
+
+export type BatchStart = {
+  runId: string;
+  status: string;
+  batchId: string;
+  attempt: number;
+  /** False for a replay, or for a second request for the batch already running. */
+  created: boolean;
+};
+
+export type PauseResult = { changed: boolean; paused: boolean; progress: WorkScopeProgress };
+
+/** What a person reads for each batch state. Authored here; nothing else renders. */
+export const BATCH_STATE_COPY: Readonly<Record<BatchState, string>> = {
+  pending: 'Not started',
+  active: 'Running',
+  completed: 'Finished',
+  partial: 'Finished — some candidates unresolved',
+  interrupted: 'Stopped before finishing',
+};
+
+export const UNIT_PROGRESS_COPY: Readonly<Record<UnitProgressState, string>> = {
+  not_queued: 'Nothing queued',
+  nothing_queued: 'Nothing queued',
+  pending: 'Not started',
+  active: 'Running now',
+  in_progress: 'Partly done',
+  completed: 'Done',
+};
+
+/** Why a prepared manufacturer queued nothing. Codes outside this are generic. */
+export const UNIT_REASON_COPY: Readonly<Record<string, string>> = {
+  WORK_SCOPE_REGISTER_UNVERIFIED: 'Its register spelling is not verified, so it was not captured.',
+  WORK_SCOPE_VOCABULARY_INSUFFICIENT:
+    'Most of its register rows use codes the catalog cannot read yet, so nothing was queued.',
+  GOV_PROJECTION_SNAPSHOT_INCOMPLETE: 'Its register capture was incomplete, so nothing was queued.',
+  GOV_PROJECTION_SNAPSHOT_NOT_READ: 'Its register capture could not be read, so nothing was queued.',
+  GOV_PROJECTION_RESOURCE_NOT_NORMALIZED: 'Its register capture could not be read, so nothing was queued.',
+  GOV_PROJECTION_SNAPSHOT_STATE_INVALID: 'Its register capture could not be read, so nothing was queued.',
+};
+
+export const START_BLOCKER_COPY: Readonly<Record<StartBlocker, string>> = {
+  batches_disabled: 'Starting batches is turned off at the current activation stage.',
+  closed: 'This mapping plan is closed.',
+  paused: 'The plan is paused. Resume it to start the next batch.',
+  not_prepared:
+    'This revision of the plan has not been prepared yet. An operator prepares a revision; no batch can start until then.',
+  nothing_queued: 'Preparing this revision queued no candidates, so there is no batch to start.',
+  batch_running: 'A batch is running. The next one can start when it finishes.',
+  complete: 'Every batch of this plan has finished.',
+};
+
+const BATCH_STATES: ReadonlySet<string> = new Set(Object.keys(BATCH_STATE_COPY));
+const UNIT_PROGRESS_STATES: ReadonlySet<string> = new Set(Object.keys(UNIT_PROGRESS_COPY));
+const START_BLOCKERS: ReadonlySet<string> = new Set(Object.keys(START_BLOCKER_COPY));
+const PLAN_STATUSES: ReadonlySet<string> = new Set(['not_prepared', 'nothing_queued', 'ready', 'running', 'complete']);
+const UNIT_STATES: ReadonlySet<string> = new Set(['prepared', 'register_unverified', 'snapshot_unusable', 'vocabulary_insufficient']);
+const RUN_STATUS = /^[a-z_]{1,40}$/;
+
+function uuid(value: unknown): string | undefined {
+  return typeof value === 'string' && UUID_PATTERN.test(value) ? value.toLowerCase() : undefined;
+}
+
+function count(value: unknown): number | undefined {
+  const number = whole(value);
+  return number !== undefined && number >= 0 ? number : undefined;
+}
+
+function batch(value: unknown, withOutcome: boolean): ProgressBatch | undefined {
+  const source = asObject(value);
+  const batchId = uuid(source.batch_id);
+  const batchNumber = count(source.batch_number);
+  const itemCount = count(source.item_count);
+  const attempts = count(source.attempts);
+  const unitKey = typeof source.unit_key === 'string' && UNIT_KEY.test(source.unit_key) ? source.unit_key : undefined;
+  if (batchId === undefined || batchNumber === undefined || itemCount === undefined
+      || attempts === undefined || unitKey === undefined
+      || typeof source.state !== 'string' || !BATCH_STATES.has(source.state)) {
+    return undefined;
+  }
+  const parsed: ProgressBatch = {
+    batchId, batchNumber, unitKey, itemCount, attempts, state: source.state as BatchState,
+  };
+  if (withOutcome) {
+    const runId = uuid(source.run_id);
+    const promoted = count(source.promoted);
+    const refused = count(source.refused);
+    const unresolved = count(source.unresolved);
+    if (runId === undefined || promoted === undefined || refused === undefined || unresolved === undefined) {
+      return undefined;
+    }
+    Object.assign(parsed, {
+      runId,
+      runStatus: typeof source.run_status === 'string' && RUN_STATUS.test(source.run_status)
+        ? source.run_status : undefined,
+      promoted, refused, unresolved,
+    });
+  }
+  return parsed;
+}
+
+function progressUnit(value: unknown): ProgressUnit | undefined {
+  const source = asObject(value);
+  const unitKey = typeof source.unit_key === 'string' && UNIT_KEY.test(source.unit_key) ? source.unit_key : undefined;
+  const numbers = {
+    priority: count(source.priority), queuedCount: count(source.queued_count),
+    batchCount: count(source.batch_count), settledBatches: count(source.settled_batches),
+    promoted: count(source.promoted), refused: count(source.refused), unresolved: count(source.unresolved),
+  };
+  const name = text(source.name, MAX_NAME_CHARS);
+  if (unitKey === undefined || name === undefined || Object.values(numbers).some((item) => item === undefined)
+      || typeof source.state !== 'string' || !UNIT_STATES.has(source.state)
+      || typeof source.progress !== 'string' || !UNIT_PROGRESS_STATES.has(source.progress)) {
+    return undefined;
+  }
+  const reason = typeof source.reason_code === 'string' && /^[A-Z][A-Z0-9_]{2,79}$/.test(source.reason_code)
+    ? source.reason_code : undefined;
+  return {
+    unitKey, name, state: source.state as ProgressUnit['state'], reasonCode: reason,
+    progress: source.progress as UnitProgressState, active: source.active === true,
+    ...(numbers as Omit<ProgressUnit, 'unitKey' | 'name' | 'state' | 'reasonCode' | 'progress' | 'active'>),
+  };
+}
+
+function live(value: unknown): ProgressLive | undefined {
+  const source = asObject(value);
+  const read = {
+    batchId: uuid(source.batch_id), runId: uuid(source.run_id),
+    batchNumber: count(source.batch_number), revision: count(source.revision),
+    itemCount: count(source.item_count), attempt: count(source.attempt),
+  };
+  const unitKey = typeof source.unit_key === 'string' && UNIT_KEY.test(source.unit_key) ? source.unit_key : undefined;
+  if (Object.values(read).some((item) => item === undefined) || unitKey === undefined
+      || typeof source.run_status !== 'string' || !RUN_STATUS.test(source.run_status)) {
+    return undefined;
+  }
+  return {
+    ...(read as Omit<ProgressLive, 'unitKey' | 'runStatus' | 'launchState'>),
+    unitKey,
+    runStatus: source.run_status,
+    launchState: typeof source.launch_state === 'string' && RUN_STATUS.test(source.launch_state)
+      ? source.launch_state : undefined,
+  };
+}
+
+function totals<K extends string>(value: unknown, keys: readonly K[]): Record<K, number> | undefined {
+  const source = asObject(value);
+  const read: Partial<Record<K, number>> = {};
+  for (const key of keys) {
+    const number = count(source[key]);
+    if (number === undefined) return undefined;
+    read[key] = number;
+  }
+  return read as Record<K, number>;
+}
+
+/**
+ * The plan's progress, or `undefined` when any part of it cannot be read.
+ * A count shown wrong is worse than a count not shown, so a malformed unit,
+ * batch or total refuses the whole answer rather than rendering around it.
+ */
+export function parseProgress(body: unknown): WorkScopeProgress | undefined {
+  const source = asObject(body);
+  const workScopeId = uuid(source.work_scope_id);
+  const revisionNumber = whole(source.revision);
+  const digest = typeof source.digest === 'string' && DIGEST.test(source.digest) ? source.digest : undefined;
+  if (workScopeId === undefined || revisionNumber === undefined || revisionNumber < 1 || digest === undefined
+      || typeof source.closed !== 'boolean' || typeof source.paused !== 'boolean'
+      || typeof source.status !== 'string' || !PLAN_STATUSES.has(source.status)) {
+    return undefined;
+  }
+  let parsedLive: ProgressLive | undefined;
+  if (source.live !== null && source.live !== undefined) {
+    parsedLive = live(source.live);
+    if (parsedLive === undefined) return undefined;
+  }
+  let preparation: WorkScopeProgress['preparation'];
+  if (source.preparation !== null && source.preparation !== undefined) {
+    const raw = asObject(source.preparation);
+    const unitsRead = Array.isArray(raw.units) ? raw.units.map(progressUnit) : undefined;
+    const recentRead = Array.isArray(raw.recent) ? raw.recent.map((item) => batch(item, true)) : undefined;
+    const nextRead = raw.next === null || raw.next === undefined ? null : batch(raw.next, false);
+    const batchTotals = totals(raw.batches, ['total', 'settled', 'active', 'interrupted', 'remaining'] as const);
+    const itemTotals = totals(raw.items, ['total', 'promoted', 'refused', 'unresolved', 'completed', 'remaining'] as const);
+    const revisionRead = count(raw.revision);
+    const unitCount = count(raw.unit_count);
+    const preparedUnitCount = count(raw.prepared_unit_count);
+    if (unitsRead === undefined || unitsRead.some((unit) => unit === undefined)
+        || recentRead === undefined || recentRead.some((item) => item === undefined)
+        || nextRead === undefined || batchTotals === undefined || itemTotals === undefined
+        || revisionRead === undefined || unitCount === undefined || preparedUnitCount === undefined) {
+      return undefined;
+    }
+    preparation = {
+      revision: revisionRead,
+      preparedAt: text(raw.prepared_at, 64),
+      unitCount,
+      preparedUnitCount,
+      units: unitsRead as ProgressUnit[],
+      next: nextRead ?? undefined,
+      recent: recentRead as ProgressBatch[],
+      batches: batchTotals,
+      items: itemTotals,
+    };
+  }
+  const controls = asObject(source.controls);
+  const start = asObject(controls.start);
+  const startBatch = start.batch === null || start.batch === undefined ? null : batch(start.batch, false);
+  if (typeof start.available !== 'boolean' || startBatch === undefined) return undefined;
+  const blockedBy = typeof start.blocked_by === 'string' && START_BLOCKERS.has(start.blocked_by)
+    ? start.blocked_by as StartBlocker : undefined;
+  const cancel = asObject(controls.cancel);
+  return {
+    workScopeId,
+    revision: revisionNumber,
+    digest,
+    closed: source.closed,
+    paused: source.paused,
+    status: source.status as PlanProgressStatus,
+    live: parsedLive,
+    preparation,
+    controls: {
+      // Anything but an explicit `true`, with a batch to start, is "cannot":
+      // a missing or malformed control never unlocks a button.
+      start: {
+        available: start.available === true && startBatch !== null,
+        blockedBy,
+        batch: startBatch ?? undefined,
+        retry: start.retry === true,
+        relaunch: start.relaunch === true,
+      },
+      pause: { available: asObject(controls.pause).available === true },
+      resume: { available: asObject(controls.resume).available === true },
+      cancel: { available: cancel.available === true && uuid(cancel.run_id) !== undefined, runId: uuid(cancel.run_id) },
+    },
+  };
+}
+
+export function parseBatchStart(body: unknown): BatchStart | undefined {
+  const source = asObject(body);
+  const runId = uuid(source.run_id);
+  const batchId = uuid(source.batch_id);
+  const attempt = count(source.attempt);
+  if (runId === undefined || batchId === undefined || attempt === undefined
+      || typeof source.status !== 'string' || !RUN_STATUS.test(source.status)
+      || typeof source.created !== 'boolean') {
+    return undefined;
+  }
+  return { runId, status: source.status, batchId, attempt, created: source.created };
+}
+
+export function parsePauseResult(body: unknown): PauseResult | undefined {
+  const source = asObject(body);
+  const progress = parseProgress(source.progress);
+  if (typeof source.changed !== 'boolean' || typeof source.paused !== 'boolean' || progress === undefined) {
+    return undefined;
+  }
+  return { changed: source.changed, paused: source.paused, progress };
+}
+
+/** "Candidate" or "candidates", for a count a person reads. */
+export function candidatesLabel(total: number): string {
+  return `${total} candidate${total === 1 ? '' : 's'}`;
+}

@@ -32,6 +32,54 @@ surfaces `launch_state`, `launch_error_class` and
 `launch_reconciliation_required` (`backend/main.py`); the lease token is
 stripped from browser responses.
 
+A **lost launch** is a run left at `queued` + `launching`: the API took launch
+ownership with its compare-and-set and its process died before it recorded
+`launched`, `launch_failed` or `launch_unknown`. It is an unresolved launch,
+like `launch_unknown`: `launching` never means "not launched", so nothing
+relaunches it, nothing treats it as dead, and the Mapping Plan offers no
+Cancel for it (nothing would finalize the cancellation). The same tool
+resolves it: `reconcile-launch-unknown.sh` lists lost launches quiet for at
+least `--min-quiet-seconds` (default 1800, never under 900), and after the
+operator has checked Cloud Run for an execution of the run, it applies
+`confirmed-launched`, `confirmed-not-launched` or `leave-unresolved` under the
+same protected apply mode and audit. The two mutating decisions go through
+`public.reconcile_lost_launch` (migration `20260924000100`), which proves
+under the run's row lock that the run is still queued, that no worker ever
+claimed it (no worker, no lease, never started) and that it has been quiet
+for the threshold; `confirmed-not-launched` also requires that nothing but
+the API ever wrote about the run. It then moves the run to `launch_failed`,
+the existing requeue path: the same run is launched again only through the
+launch compare-and-set, by a person (the Mapping Plan's "Launch batch", or a
+replay of the original request) or after the tool's `requeue`. At most one
+worker ever executes a run: `claim_run_lease` grants one live lease.
+
+A **never-launched run** (`pending` or `launch_failed`: no worker was ever
+started) can be launched again as the same run. When it cannot -- its Mapping
+Plan was revised past its batch, and a stale revision never launches -- it
+would hold the plan and its requester's run slot for good. The same tool's
+`retire-not-launched` decision releases it: `public.retire_unlaunched_run`
+proves under the run's row lock that the launch is known not to have started a
+worker (never `launching` or `launch_unknown`: those are reconciled first),
+that no worker ever claimed it and no lease is held, that no execution or paid
+work exists for it, and that it has been quiet for the threshold. It then ends
+the run the way the canonical finalizer ends a cancellation: `cancelled`
+(`RUN_NOT_LAUNCHED`) and its `run_cancelled` event in one transaction. Nothing
+is relaunched; a batch it held becomes `interrupted`.
+
+## Cancellation
+
+A cancellation is a request the run's worker finalizes. `POST
+/runs/{id}/cancel` accepts it only for a run a worker will finalize: one a
+worker has claimed (`starting`, `running`, `waiting`), or a `queued` run whose
+launch is recorded as `launched`. Anything else is refused with nothing
+written -- `RUN_NOT_LAUNCHED` (no worker was ever started: launch it again, or
+an operator retires it) or `RUN_LAUNCH_UNRESOLVED` (an operator reconciles the
+launch first). The route checks it, and the database write itself re-checks it:
+`request_cancellation` is a compare-and-set on the status read and, for an
+unclaimed run, on `launch_state = 'launched'`, evaluated in the same statement
+as the write (`backend/runtime.py::cancellation_refusal` is the one rule; the
+Mapping Plan's Cancel control uses it too).
+
 ## Worker leases
 
 `claim_run_lease` (migration `012`) atomically assigns worker id, attempt

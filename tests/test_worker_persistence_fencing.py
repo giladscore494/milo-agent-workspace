@@ -162,6 +162,12 @@ UNFENCED_BY_DESIGN = {
     # lease to present. Its writer re-checks membership in the database, and a
     # stale head is refused by compare-and-set instead.
     "create_work_scope",
+    # A Mapping Plan batch run is CREATED by the API like any other run: the
+    # message, the queued run, its identity and its batch binding, in one
+    # transaction, before any worker can claim it -- so there is no lease to
+    # present yet. Membership, the head revision and every continuation rule
+    # are re-checked in the database under the plan's row lock.
+    "create_work_scope_batch_run",
     # Lease-optional by contract, checked completely whenever one IS supplied:
     # these predate the lease contract and the worker always passes one.
     "append_run_event", "save_checkpoint", "update_run_usage",

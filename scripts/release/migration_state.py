@@ -88,6 +88,7 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20260921000200": ("column", "runs.run_identity"),
     "20260922000100": ("table", "catalog_work_scope_revisions"),
     "20260923000100": ("table", "catalog_work_scope_batch_runs"),
+    "20260924000100": ("table", "catalog_work_scope_controls"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")

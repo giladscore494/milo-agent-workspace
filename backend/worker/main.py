@@ -599,12 +599,20 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # finalizer here. No transport to data.gov.il exists on this path:
         # the product worker never imports, it reads what the operator
         # capture landed.
+        #
+        # Scoped catalog PR3: a catalog-reading run executes exactly ONE
+        # Mapping Plan batch, the one the database bound it to when it was
+        # created. An unbound run is refused by `prepare_government_work`
+        # before any snapshot is read, and a BOUND run in a deployment whose
+        # catalog read is off is refused here -- run without its catalog it
+        # would be a paid run with an instruction and no candidates.
         if workflow_key == "swarm_v2" and engine is None and engine_registry is None \
                 and engine_mode != "mock":
             from backend.catalog.execution import CatalogPostureInvalid, catalog_posture
             from backend.catalog.government.preparation import (
                 GovernmentPreparationError, PREPARATION_PHASE, government_work_progress,
-                is_preparation_checkpoint, prepare_government_work)
+                is_preparation_checkpoint, prepare_government_work,
+                refuse_bound_run_without_read)
 
             try:
                 # Read ONCE for the whole run; the Swarm V2 wiring reuses it.
@@ -613,6 +621,13 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 finalizer.finalize(TerminalClaim.refusal(
                     workflow_key, "CATALOG_POSTURE_INVALID", str(exc)))
                 return 0
+            if not catalog_state["posture"]["government_read"]:
+                try:
+                    refuse_bound_run_without_read(repo, run_id)
+                except GovernmentPreparationError as exc:
+                    finalizer.finalize(TerminalClaim.refusal(
+                        workflow_key, exc.code, exc.safe_message))
+                    return 0
             if catalog_state["posture"]["government_read"]:
                 try:
                     preparation = prepare_government_work(

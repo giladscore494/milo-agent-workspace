@@ -1273,6 +1273,13 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # above does for the offline suites. Imported only by
         # `backend/testing/e2e_app.py`, which is never deployed.
         "backend/testing/catalog_review_seed.py",
+        # Scoped catalog PR3, test-only: a PREPARED Mapping Plan for the offline
+        # suites and the enabled E2E stack. It lands committed R5 rows as the
+        # scoped page a per-marque capture reads, through the real ingestion
+        # path with `FixtureTransport` -- no socket, no live transport -- and
+        # prepares the plan through the repository's own lease-guarded write.
+        # Imported by tests and by `backend/testing/e2e_app.py` only.
+        "backend/testing/work_scope_seed.py",
         # Scoped catalog PR1: the WorkScope contract pins the Government SOURCE
         # a plan reads (package and resource constants) and the model-year
         # bounds the register reading applies. Two constant modules, and

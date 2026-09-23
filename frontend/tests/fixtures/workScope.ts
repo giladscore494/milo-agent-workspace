@@ -57,3 +57,55 @@ export function stateBody(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+export const BATCH_ONE = 'aaaaaaaa-1111-4111-8111-000000000001';
+export const BATCH_TWO = 'aaaaaaaa-1111-4111-8111-000000000002';
+export const BATCH_RUN = 'bbbbbbbb-2222-4222-8222-000000000001';
+
+/** A server-shaped progress body (`backend/catalog/scope/batches.py`). */
+export function progressBody(overrides: Record<string, unknown> = {}) {
+  return {
+    work_scope_id: PLAN,
+    revision: 1,
+    digest: DIGEST,
+    closed: false,
+    paused: false,
+    status: 'ready',
+    live: null,
+    preparation: {
+      revision: 1,
+      prepared_at: '2026-09-23T00:00:00Z',
+      unit_count: 2,
+      prepared_unit_count: 1,
+      units: [
+        { unit_key: 'toyota', name: 'Toyota', priority: 1, state: 'prepared', reason_code: null,
+          progress: 'in_progress', readable_count: 40, ambiguous_count: 0, eligible_count: 40,
+          queued_count: 25, batch_count: 3, settled_batches: 1, active: false, promoted: 3,
+          refused: 1, unresolved: 6 },
+        { unit_key: 'lexus', name: 'Lexus', priority: 2, state: 'register_unverified',
+          reason_code: 'WORK_SCOPE_REGISTER_UNVERIFIED', progress: 'not_queued', readable_count: 0,
+          ambiguous_count: 0, eligible_count: 0, queued_count: 0, batch_count: 0,
+          settled_batches: 0, active: false, promoted: 0, refused: 0, unresolved: 0 },
+      ],
+      next: { batch_id: BATCH_TWO, batch_number: 2, unit_key: 'toyota', item_count: 10,
+              state: 'pending', attempts: 0 },
+      recent: [
+        { batch_id: BATCH_ONE, batch_number: 1, unit_key: 'toyota', item_count: 10,
+          state: 'completed', attempts: 1, run_id: BATCH_RUN, run_status: 'completed',
+          promoted: 3, refused: 1, unresolved: 6 },
+      ],
+      batches: { total: 3, settled: 1, active: 0, interrupted: 0, remaining: 2 },
+      items: { total: 25, promoted: 3, refused: 1, unresolved: 6, completed: 10, remaining: 15 },
+    },
+    controls: {
+      start: { available: true, blocked_by: null,
+               batch: { batch_id: BATCH_TWO, batch_number: 2, unit_key: 'toyota', item_count: 10,
+                        state: 'pending', attempts: 0 },
+               retry: false, relaunch: false },
+      pause: { available: true },
+      resume: { available: false },
+      cancel: { available: false, run_id: null },
+    },
+    ...overrides,
+  };
+}

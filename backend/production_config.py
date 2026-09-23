@@ -172,6 +172,11 @@ EXECUTION_FLAGS = (
     # it is durable state a browser writes, so it is pinned off here like every
     # other surface a stage has to enable deliberately.
     "MILO_ENABLE_WORK_SCOPE_MUTATIONS",
+    # API-only (scoped catalog PR3). Gates starting ONE batch of a prepared
+    # Mapping Plan -- together with MILO_ENABLE_RUN_CREATION, since a batch run
+    # IS a run -- and pausing / resuming the plan. Nothing starts a batch
+    # automatically; pinned off here like every other stage flag.
+    "MILO_ENABLE_WORK_SCOPE_BATCHES",
     # Capture-job only (scoped catalog PR2): preparing a Mapping Plan revision
     # -- scoped Government captures and the durable queue. The capture job
     # definition pins it false; one explicit operator execution turns it on.

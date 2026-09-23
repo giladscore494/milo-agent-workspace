@@ -3812,7 +3812,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
         "20260916090000_catalog_bounded_candidate_queries.sql",
         "20260916120000_catalog_field_level_promotion.sql",
         "20260922000100_catalog_work_scopes.sql",
-        "20260923000100_catalog_work_scope_preparation.sql"]
+        "20260923000100_catalog_work_scope_preparation.sql",
+        "20260924000100_catalog_work_scope_batch_runs.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
@@ -3821,7 +3822,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
     assert before == str(len(CATALOG_STAGING_TABLES) + len(CATALOG_CANONICAL_TABLES)
                          + len(CATALOG_PROVENANCE_TABLES) + len(CATALOG_VIEWS)
                          + len(CATALOG_WORK_SCOPE_TABLES)
-                         + len(CATALOG_WORK_SCOPE_PREPARATION_TABLES))
+                         + len(CATALOG_WORK_SCOPE_PREPARATION_TABLES)
+                         + len(CATALOG_WORK_SCOPE_CONTROL_TABLES))
     _reapply_catalog_migrations(db)
     _reapply_catalog_migrations(db)
     assert db.psql(
@@ -7966,6 +7968,13 @@ def test_a_bound_run_reads_exactly_its_batch(db):
     run = _wsp_swarm_run(db, world["conversation"])
     assert db.psql(f"select coalesce(public.work_scope_batch_for_run('{run}')::text, 'null')") \
         == "null"
+    # Batches run in order (20260924000100): the first one settles before the
+    # second can be bound.
+    first_run = _wsp_swarm_run(db, world["conversation"])
+    _rpc_as_service(db, "select public.bind_work_scope_batch_run("
+                        f"'{summary['batches'][0]['id']}', '{first_run}', 1, "
+                        f"'{world['digest']}', '{world['user']}')")
+    db.psql(f"update public.runs set status='completed' where id='{first_run}'")
     second = summary["batches"][1]["id"]
     _rpc_as_service(db, f"select public.bind_work_scope_batch_run('{second}', '{run}', 1, "
                         f"'{world['digest']}', '{world['user']}')")
@@ -8010,8 +8019,738 @@ def test_preparation_rows_are_immutable_service_only_and_rerun_safe(db):
             assert not _has_execute(db, role, signature), signature
         assert _has_execute(db, "service_role", signature), signature
     before = db.psql("select count(*) from public.catalog_work_scope_queue_items")
-    db.psql(file=_wsp_migration())
-    db.psql(file=_wsp_migration())
+    # Replayed with every LATER catalog migration after it: rerun safety is a
+    # property of the ordered set, and 20260924000100 restates the binding.
+    later = CATALOG_MIGRATIONS[CATALOG_MIGRATIONS.index(_wsp_migration()):]
+    for _ in range(2):
+        for migration in later:
+            db.psql(file=migration)
     assert db.psql("select count(*) from public.catalog_work_scope_queue_items") == before
     assert db.psql("select count(*) from pg_constraint where conname="
                    "'catalog_source_snapshots_capture_scope_consistent'") == "1"
+
+
+# =============================================================================
+# Scoped catalog PR3 (20260924000100): batch runs, continuation and progress.
+# =============================================================================
+
+#: Scoped catalog PR3: the plan's append-only pause / resume history.
+CATALOG_WORK_SCOPE_CONTROL_TABLES = ("catalog_work_scope_controls",)
+
+WSB_TERMINAL = ("completed", "partial_success", "failed", "cancelled", "timed_out",
+                "budget_exhausted")
+
+
+def _wsb_migration():
+    return next(m for m in MIGRATIONS if m.name.startswith("20260924000100"))
+
+
+def _wsb_world(db, **scope_overrides) -> dict:
+    """A prepared plan: batches 1-3 of the Toyota unit (10, 10, 3 candidates)."""
+    world = _wsp_world(db, **scope_overrides)
+    summary = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],
+                           _wsp_units(world["snapshot"]))
+    world["batches"] = [batch["id"] for batch in summary["batches"]]
+    world["preparation"] = summary["preparation"]["id"]
+    return world
+
+
+def _wsb_start(db, world: dict, batch: str, *, key: str, revision: int = 1,
+               digest: str | None = None, by: str | None = None, fingerprint: str | None = None,
+               workflow_key: str = "swarm_v2", max_user: str = "null",
+               max_project: str = "null") -> dict:
+    """ONE call to the batch-run creator, as the API makes it."""
+    run_id = str(uuid.uuid4())
+    identity = _identity_json(run_id, workflow_key)
+    return json.loads(_rpc_as_service(
+        db, "select public.create_work_scope_batch_run("
+            f"'{world['plan']}', '{batch}', {revision}, '{digest or world['digest']}', "
+            f"'{run_id}', $j${identity}$j$::jsonb, 'Mapping plan batch', "
+            f"""'{{"requested_by": "{by or world['user']}"}}'::jsonb, """
+            f"'{by or world['user']}', '{key}', '{fingerprint or 'fp-' + key}', "
+            f"{max_user}, {max_project})"))
+
+
+def _wsb_counts(db, world: dict) -> tuple[str, str, str]:
+    """(Swarm V2 runs, messages, bindings) of the plan's conversation. The
+    operator capture run that prepared the plan is not counted."""
+    conversation = world["conversation"]
+    return (db.psql(f"select count(*) from public.runs where conversation_id='{conversation}' "
+                    "and run_identity->>'workflow_key' = 'swarm_v2'"),
+            db.psql(f"select count(*) from public.messages where conversation_id='{conversation}'"),
+            db.psql("select count(*) from public.catalog_work_scope_batch_runs "
+                    f"where work_scope_id='{world['plan']}'"))
+
+
+def _wsb_progress(db, plan: str) -> dict | None:
+    return json.loads(_rpc_as_service(
+        db, f"select coalesce(public.work_scope_progress('{plan}')::text, 'null')"))
+
+
+def _wsb_finish(db, run: str, status: str) -> None:
+    db.psql(f"update public.runs set status='{status}' where id='{run}'")
+
+
+def _wsb_pause(db, world: dict, paused: bool, *, by: str | None = None) -> dict:
+    return json.loads(_rpc_as_service(
+        db, f"select public.set_work_scope_paused('{world['plan']}', {str(paused).lower()}, "
+            f"'{by or world['user']}')"))
+
+
+def test_a_batch_run_is_created_and_bound_in_one_transaction(db):
+    world = _wsb_world(db)
+    first, second, _third = world["batches"]
+    started = _wsb_start(db, world, first, key="start-1")
+    assert started["created"] is True
+    run, binding = started["run"], started["binding"]
+    # ONE transaction wrote the message, the queued run with its immutable
+    # identity, and the binding.
+    assert (run["status"], run["launch_state"], run["conversation_id"]) == (
+        "queued", "pending", world["conversation"])
+    assert run["run_identity"]["workflow_key"] == "swarm_v2"
+    assert (binding["batch_id"], binding["run_id"], binding["attempt"]) == (first, run["id"], 1)
+    assert db.psql(f"select input->>'content' from public.runs where id='{run['id']}'") \
+        == "Mapping plan batch"
+    assert _wsb_counts(db, world) == ("1", "1", "1")
+
+    # The same request again is the same answer; nothing is written twice.
+    again = _wsb_start(db, world, first, key="start-1")
+    assert (again["created"], again["run"]["id"], again["binding"]["id"]) == (
+        False, run["id"], binding["id"])
+    with pytest.raises(AssertionError, match="IDEMPOTENCY_CONFLICT"):
+        _wsb_start(db, world, first, key="start-1", fingerprint="fp-something-else")
+    # A double submission with a FRESH key answers with the batch run already
+    # running, never a second run.
+    double = _wsb_start(db, world, first, key="start-1-bis")
+    assert (double["created"], double["run"]["id"]) == (False, run["id"])
+    # One batch at a time: the next batch waits for this one.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_IN_PROGRESS"):
+        _wsb_start(db, world, second, key="start-2")
+    assert _wsb_counts(db, world) == ("1", "1", "1")
+    # The worker reads exactly the batch the run was born with.
+    read = json.loads(_rpc_as_service(db, f"select public.work_scope_batch_for_run('{run['id']}')"))
+    assert read["batch"]["id"] == first and len(read["items"]) == 10
+
+
+def test_a_batch_start_fails_closed_and_writes_nothing(db):
+    world = _wsb_world(db)
+    first, second, _third = world["batches"]
+    refusals = {
+        "WORK_SCOPE_STALE": [dict(digest="0" * 64), dict(revision=2)],
+        "WORK_SCOPE_BATCH_NOT_NEXT": [dict(batch=second)],
+        "WORK_SCOPE_NOT_FOUND": [dict(by=str(uuid.uuid4()))],
+        "WORK_SCOPE_BATCH_RUN_INVALID": [dict(workflow_key="vehicle_catalog_v1")],
+        "USER_CONCURRENCY_LIMIT": [dict(max_user="0")],
+        "PROJECT_CONCURRENCY_LIMIT": [dict(max_project="0")],
+    }
+    stranger = refusals["WORK_SCOPE_NOT_FOUND"][0]["by"]
+    db.psql(f"insert into auth.users (id) values ('{stranger}')")
+    for code, cases in refusals.items():
+        for index, case in enumerate(cases):
+            batch = case.pop("batch", first)
+            with pytest.raises(AssertionError, match=code):
+                _wsb_start(db, world, batch, key=f"refused-{code}-{index}", **case)
+    # A batch of another plan is not this plan's batch.
+    other = _wsb_world(db)
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_NOT_FOUND"):
+        _wsb_start(db, world, other["batches"][0], key="foreign-batch")
+    # A start is always idempotent.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_IDEMPOTENCY_REQUIRED"):
+        _rpc_as_service(db, "select public.create_work_scope_batch_run("
+                            f"'{world['plan']}', '{first}', 1, '{world['digest']}', "
+                            f"'{uuid.uuid4()}', '{{}}'::jsonb, 'x', '{{}}'::jsonb, "
+                            f"'{world['user']}', null, 'fp', null, null)")
+    assert _wsb_counts(db, world) == ("0", "0", "0")
+    # A revised plan: the old revision's batches never start, and the new head
+    # has no batch until it is prepared.
+    _rpc_as_service(db, f"select public.revise_work_scope('{world['plan']}', 1, "
+                        f"'{world['digest']}', '{world['user']}', "
+                        f"{_ws_revision(_ws_scope(units=['toyota']))})")
+    head = db.psql(f"select head_digest from public.catalog_work_scopes where id='{world['plan']}'")
+    for revision, digest in ((1, world["digest"]), (2, head)):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+            _wsb_start(db, world, first, key=f"after-revise-{revision}", revision=revision,
+                       digest=digest)
+    assert _wsb_counts(db, world) == ("0", "0", "0")
+
+
+def test_continuation_runs_in_order_settles_and_retries_interrupted_batches(db):
+    world = _wsb_world(db)
+    first, second, third = world["batches"]
+
+    def start(batch: str, key: str) -> dict:
+        return _wsb_start(db, world, batch, key=key)
+
+    one = start(first, "c-1")
+    _wsb_finish(db, one["run"]["id"], "completed")
+    assert _wsb_progress(db, world["plan"])["preparation"]["next"]["batch_id"] == second
+    # Nothing is skipped, and a settled batch never runs again.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_NOT_NEXT"):
+        start(third, "c-3-early")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_ALREADY_COMPLETED"):
+        start(first, "c-1-again")
+    # An INTERRUPTED batch is the next batch again, as its next attempt.
+    two = start(second, "c-2")
+    _wsb_finish(db, two["run"]["id"], "failed")
+    progress = _wsb_progress(db, world["plan"])["preparation"]
+    assert (progress["next"]["batch_id"], progress["next"]["state"],
+            progress["next"]["attempts"]) == (second, "interrupted", 1)
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_NOT_NEXT"):
+        start(third, "c-3-after-failure")
+    retry = start(second, "c-2-retry")
+    assert retry["binding"]["attempt"] == 2
+    # partial_success SETTLES a batch: its run finished its work.
+    _wsb_finish(db, retry["run"]["id"], "partial_success")
+    for status in ("cancelled", "timed_out", "budget_exhausted"):
+        interrupted = start(third, f"c-3-{status}")
+        _wsb_finish(db, interrupted["run"]["id"], status)
+    last = start(third, "c-3-final")
+    assert last["binding"]["attempt"] == 4
+    _wsb_finish(db, last["run"]["id"], "completed")
+    progress = _wsb_progress(db, world["plan"])["preparation"]
+    assert progress["next"] is None
+    assert progress["batches"] == {"total": 3, "settled": 3, "active": 0, "interrupted": 0}
+    for batch in world["batches"]:
+        with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_ALREADY_COMPLETED"):
+            start(batch, f"c-done-{batch[:8]}")
+
+
+def test_pause_and_resume_are_append_only_and_hold_the_plan(db):
+    world = _wsb_world(db)
+    first = world["batches"][0]
+    paused = _wsb_pause(db, world, True)
+    assert (paused["changed"], paused["paused"], paused["control"]["sequence"],
+            paused["control"]["action"]) == (True, True, 1, "pause")
+    # Asking for the state the plan is already in writes nothing.
+    assert _wsb_pause(db, world, True)["changed"] is False
+    # A paused plan starts nothing, through either writer.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PAUSED"):
+        _wsb_start(db, world, first, key="paused-start")
+    run = _wsp_swarm_run(db, world["conversation"])
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PAUSED"):
+        _rpc_as_service(db, f"select public.bind_work_scope_batch_run('{first}', '{run}', 1, "
+                            f"'{world['digest']}', '{world['user']}')")
+    progress = _wsb_progress(db, world["plan"])
+    assert progress["paused"] is True and progress["control"]["action"] == "pause"
+    resumed = _wsb_pause(db, world, False)
+    assert (resumed["changed"], resumed["control"]["sequence"]) == (True, 2)
+    assert _wsb_pause(db, world, False)["changed"] is False
+    started = _wsb_start(db, world, first, key="resumed-start")
+    # Pausing never touches a batch that is already running.
+    _wsb_pause(db, world, True)
+    assert db.psql(f"select status from public.runs where id='{started['run']['id']}'") == "queued"
+    # Members only; and the history is append-only, in sequence, alternating.
+    stranger = str(uuid.uuid4())
+    db.psql(f"insert into auth.users (id) values ('{stranger}')")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_NOT_FOUND"):
+        _wsb_pause(db, world, False, by=stranger)
+    for statement in ("update public.catalog_work_scope_controls set action='resume'",
+                      "delete from public.catalog_work_scope_controls"):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_IMMUTABLE"):
+            db.psql(statement)
+    for sequence, action in ((4, "pause"), (9, "resume")):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_CONTROL_OUT_OF_SEQUENCE"):
+            db.psql("insert into public.catalog_work_scope_controls "
+                    "(work_scope_id, sequence, action, requested_by) values "
+                    f"('{world['plan']}', {sequence}, '{action}', '{world['user']}')")
+    assert db.psql("select string_agg(sequence || action, ',' order by sequence) from "
+                   f"public.catalog_work_scope_controls where work_scope_id='{world['plan']}'") \
+        == "1pause,2resume,3pause"
+
+
+def test_a_replay_that_would_launch_obeys_the_start_rules_as_they_stand_now(db):
+    world = _wsb_world(db)
+    first = world["batches"][0]
+    run = _wsb_start(db, world, first, key="replay-1")["run"]["id"]
+
+    def launch_state(state: str) -> None:
+        db.psql(f"update public.runs set launch_state='{state}' where id='{run}'")
+
+    # Replaying a run no worker was started for LAUNCHES it: that is a start,
+    # and a paused plan starts nothing.
+    _wsb_pause(db, world, True)
+    for state in ("pending", "launch_failed"):
+        launch_state(state)
+        with pytest.raises(AssertionError, match="WORK_SCOPE_PAUSED"):
+            _wsb_start(db, world, first, key="replay-1")
+    # A launch that happened, or may have, is only reported, never repeated.
+    for state in ("launching", "launched", "launch_unknown"):
+        launch_state(state)
+        assert _wsb_start(db, world, first, key="replay-1")["run"]["id"] == run
+    launch_state("launch_failed")
+    _wsb_pause(db, world, False)
+    again = _wsb_start(db, world, first, key="replay-1")
+    assert (again["created"], again["run"]["id"]) == (False, run)
+    # Revised past the batch: a stale revision never launches.
+    _rpc_as_service(db, f"select public.revise_work_scope('{world['plan']}', 1, "
+                        f"'{world['digest']}', '{world['user']}', "
+                        f"{_ws_revision(_ws_scope(units=['toyota']))})")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+        _wsb_start(db, world, first, key="replay-1")
+    launch_state("launched")
+    assert _wsb_start(db, world, first, key="replay-1")["run"]["id"] == run
+    # A closed plan starts nothing either.
+    launch_state("pending")
+    db.psql(f"update public.catalog_work_scopes set closed_at = now() where id='{world['plan']}'")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_NOT_EDITABLE"):
+        _wsb_start(db, world, first, key="replay-1")
+    assert _wsb_counts(db, world) == ("1", "1", "1")
+
+
+LOST_LAUNCH_FN = "public.reconcile_lost_launch(uuid,text,integer,text)"
+#: The launch step's own compare-and-set (`try_acquire_launch`), verbatim.
+LAUNCH_CAS = ("with cas as (update public.runs set launch_state = 'launching' "
+              "where id = '{run}' and status = 'queued' "
+              "and launch_state in ('pending', 'launch_failed') returning id) "
+              "select count(*) from cas")
+
+
+def _lost_launch_run(db, conversation: str, *, status: str = "queued",
+                     launch_state: str = "launching") -> str:
+    """A run in the posture a lost launch leaves: the API's launch
+    compare-and-set took it, and nothing was recorded after."""
+    run = _wsp_swarm_run(db, conversation)
+    db.psql(f"update public.runs set launch_state = '{launch_state}', status = '{status}' "
+            f"where id = '{run}'")
+    return run
+
+
+def _quiet(db, run: str, seconds: int = 3600) -> None:
+    """Backdate the run's last write. `runs_set_updated_at` stamps every UPDATE
+    with now(), so the trigger is set aside for exactly this one statement."""
+    db.psql("alter table public.runs disable trigger runs_set_updated_at")
+    try:
+        db.psql(f"update public.runs set updated_at = now() - make_interval(secs => {seconds}) "
+                f"where id = '{run}'")
+    finally:
+        db.psql("alter table public.runs enable trigger runs_set_updated_at")
+
+
+def _reconcile(db, run: str, outcome: str = "not_launched", *, quiet: int = 900,
+               operator: str = "operator@milo.test") -> dict:
+    return json.loads(_rpc_as_service(
+        db, f"select public.reconcile_lost_launch('{run}', '{outcome}', {quiet}, '{operator}')"))
+
+
+def _posture(db, run: str) -> str:
+    return db.psql(f"select status || '|' || launch_state || '|' || coalesce(worker_id, '-') "
+                   f"|| '|' || (select count(*) from public.run_events e where e.run_id = r.id) "
+                   f"from public.runs r where id = '{run}'")
+
+
+def test_a_lost_launch_is_reconciled_only_when_provably_unclaimed_untraced_and_quiet(db):
+    _user, _project, conversation = _ws_world(db)
+
+    # The one posture it decides on, once quiet: queued + launching, never claimed.
+    lost = _lost_launch_run(db, conversation)
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_NOT_QUIET"):
+        _reconcile(db, lost)
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_THRESHOLD_TOO_SHORT"):
+        _reconcile(db, lost, quiet=60)
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_INVALID"):
+        _reconcile(db, lost, operator=" ")
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_INVALID"):
+        _reconcile(db, lost, "relaunch")
+    assert _posture(db, lost) == "queued|launching|-|0"
+    _quiet(db, lost)
+    decided = _reconcile(db, lost)
+    assert (decided["reconciled"], decided["status"], decided["launch_state"]) == (
+        True, "queued", "launch_failed")
+    assert db.psql(f"select status || '|' || launch_state || '|' || (launch_error->>'code') "
+                   f"|| '|' || (launch_error->>'reconciled_by') || '|' || (worker_id is null) "
+                   f"from public.runs where id = '{lost}'") \
+        == "queued|launch_failed|RUN_LAUNCH_LOST|operator@milo.test|true"
+    event = json.loads(db.psql(f"select payload::text from public.run_events "
+                               f"where run_id = '{lost}' and event_type = 'launch_failed'"))
+    # Who decided is in the operator's audit record, never in a member-readable event.
+    assert event == {"recoverable": True, "reconciled": True,
+                     "previous_launch_state": "launching"}
+    # The same decision again is the same answer, and writes nothing.
+    assert _reconcile(db, lost)["reconciled"] is False
+    assert _posture(db, lost) == "queued|launch_failed|-|1"
+    # The existing requeue path: the launch compare-and-set takes it again,
+    # exactly once.
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "1"
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "0"
+
+    # `launched` records the execution the operator found -- and a launcher
+    # record is evidence FOR it, not against it.
+    found = _lost_launch_run(db, conversation)
+    db.psql(f"insert into public.run_invocations (run_id, launcher) values ('{found}', 'cloud_run')")
+    _quiet(db, found)
+    assert _reconcile(db, found, "launched")["launch_state"] == "launched"
+    assert _posture(db, found) == "queued|launched|-|0"
+    assert db.psql(LAUNCH_CAS.format(run=found)) == "0"
+
+    # Everything else is refused, and a refusal changes nothing.
+    refusals = {}
+    for state in ("launch_unknown", "pending"):
+        refusals[f"{state} is not a lost launch"] = (
+            _lost_launch_run(db, conversation, launch_state=state), "not_launched",
+            "LOST_LAUNCH_WRONG_STATE")
+    refusals["launched is not a lost launch"] = (
+        _lost_launch_run(db, conversation, launch_state="launched"), "not_launched",
+        "LOST_LAUNCH_WRONG_STATE")
+    refusals["a cancellation someone asked for"] = (
+        _lost_launch_run(db, conversation, status="cancellation_requested"), "not_launched",
+        "LOST_LAUNCH_WRONG_STATE")
+    claimed = _lost_launch_run(db, conversation)
+    assert db.psql(f"select count(*) from public.claim_run_lease('{claimed}', 'real-worker', 300)") == "1"
+    refusals["a worker claimed it"] = (claimed, "not_launched", "LOST_LAUNCH_WRONG_STATE")
+    leased = _lost_launch_run(db, conversation)
+    db.psql(f"update public.runs set lease_token = 'held', "
+            f"lease_expires_at = now() + interval '5 minutes' where id = '{leased}'")
+    refusals["an active lease is never taken over"] = (leased, "not_launched", "LOST_LAUNCH_CLAIMED")
+    refusals["an active lease, whatever the decision"] = (leased, "launched", "LOST_LAUNCH_CLAIMED")
+    invoked = _lost_launch_run(db, conversation)
+    db.psql(f"insert into public.run_invocations (run_id, launcher) values ('{invoked}', 'cloud_run')")
+    refusals["the launcher recorded an execution"] = (invoked, "not_launched", "LOST_LAUNCH_TRACED")
+    evented = _lost_launch_run(db, conversation)
+    db.psql(f"insert into public.run_events (run_id, event_type, message) values "
+            f"('{evented}', 'run_started', 'started')")
+    refusals["a worker wrote about it"] = (evented, "not_launched", "LOST_LAUNCH_TRACED")
+    for case, (run, outcome, code) in refusals.items():
+        _quiet(db, run)
+        before = _posture(db, run)
+        with pytest.raises(AssertionError, match=code):
+            _reconcile(db, run, outcome)
+        assert _posture(db, run) == before, case
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_NOT_FOUND"):
+        _reconcile(db, str(uuid.uuid4()))
+
+    # Service-path only.
+    for role, allowed in (("anon", "f"), ("authenticated", "f"), ("service_role", "t")):
+        assert db.psql(f"select has_function_privilege('{role}', '{LOST_LAUNCH_FN}', 'execute')") \
+            == allowed, role
+
+
+def test_a_plan_held_by_a_lost_launch_recovers_through_reconciliation_without_duplicate_execution(db):
+    world = _wsb_world(db)
+    first, second, _third = world["batches"]
+    started = _wsb_start(db, world, first, key="lost-plan-1")
+    lost = started["run"]["id"]
+    # The API took launch ownership -- its own compare-and-set -- and died.
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "1"
+    # The plan is held, and nothing launches the run again: a double submission
+    # answers with the same run, whose launch the compare-and-set refuses.
+    again = _wsb_start(db, world, first, key="lost-plan-1-bis")
+    assert (again["created"], again["run"]["id"]) == (False, lost)
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "0"
+    with pytest.raises(AssertionError, match="WORK_SCOPE_BATCH_IN_PROGRESS"):
+        _wsb_start(db, world, second, key="lost-plan-2")
+    assert _wsb_progress(db, world["plan"])["live"]["launch_state"] == "launching"
+
+    # The operator checked Cloud Run, found no execution, and reconciles it once
+    # it is provably quiet: the SAME run returns to the existing requeue path.
+    with pytest.raises(AssertionError, match="LOST_LAUNCH_NOT_QUIET"):
+        _reconcile(db, lost)
+    _quiet(db, lost)
+    assert _reconcile(db, lost)["launch_state"] == "launch_failed"
+    live = _wsb_progress(db, world["plan"])["live"]
+    assert (live["run_id"], live["run_status"], live["launch_state"]) == (
+        lost, "queued", "launch_failed")
+    # A person's "Launch batch 1" answers with that run, and only the launch
+    # compare-and-set launches it -- once.
+    relaunch = _wsb_start(db, world, first, key="lost-plan-1-launch")
+    assert (relaunch["created"], relaunch["run"]["id"]) == (False, lost)
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "1"
+    assert db.psql(LAUNCH_CAS.format(run=lost)) == "0"
+    db.psql(f"update public.runs set launch_state = 'launched' where id = '{lost}'")
+    # Exactly one worker ever executes it: one live lease, and a late worker for
+    # the lost launch cannot take it over.
+    assert db.psql(f"select count(*) from public.claim_run_lease('{lost}', 'worker-a', 300)") == "1"
+    assert db.psql(f"select count(*) from public.claim_run_lease('{lost}', 'late-worker', 300)") == "0"
+    _wsb_finish(db, lost, "completed")
+    assert db.psql(f"select count(*) from public.claim_run_lease('{lost}', 'late-worker', 300)") == "0"
+
+    # Continuation, one request at a time.
+    progress = _wsb_progress(db, world["plan"])
+    assert progress["live"] is None
+    assert progress["preparation"]["next"]["batch_id"] == second
+    assert _wsb_counts(db, world) == ("1", "1", "1")
+    continued = _wsb_start(db, world, second, key="lost-plan-2-after")
+    assert continued["created"] is True and continued["run"]["id"] != lost
+    assert _wsb_counts(db, world) == ("2", "2", "2")
+
+
+RETIRE_FN = "public.retire_unlaunched_run(uuid,integer,text)"
+
+
+def _retire_unlaunched(db, run: str, *, quiet: int = 900, operator: str = "operator@milo.test") -> dict:
+    return json.loads(_rpc_as_service(
+        db, f"select public.retire_unlaunched_run('{run}', {quiet}, '{operator}')"))
+
+
+def _terminal(db, run: str) -> str:
+    return db.psql(f"select status || '|' || launch_state || '|' || coalesce(error->>'code', '-') "
+                   f"|| '|' || (finished_at is not null) || '|' || coalesce(worker_id, '-') "
+                   f"|| '|' || (select count(*) from public.run_events e where e.run_id = r.id "
+                   f"and e.event_type = 'run_cancelled') from public.runs r where id = '{run}'")
+
+
+def test_a_never_launched_run_is_retired_only_when_provably_unclaimed_untraced_and_quiet(db):
+    _user, _project, conversation = _ws_world(db)
+
+    # A run whose launch definitely failed: known not to have started a worker.
+    failed = _lost_launch_run(db, conversation, launch_state="launch_failed")
+    db.psql(f"insert into public.run_events (run_id, event_type, message) values "
+            f"('{failed}', 'launch_failed', 'Worker launch failed')")
+    with pytest.raises(AssertionError, match="UNLAUNCHED_RUN_NOT_QUIET"):
+        _retire_unlaunched(db, failed)
+    with pytest.raises(AssertionError, match="UNLAUNCHED_RUN_THRESHOLD_TOO_SHORT"):
+        _retire_unlaunched(db, failed, quiet=60)
+    with pytest.raises(AssertionError, match="UNLAUNCHED_RUN_INVALID"):
+        _retire_unlaunched(db, failed, operator=" ")
+    _quiet(db, failed)
+    retired = _retire_unlaunched(db, failed)
+    assert (retired["retired"], retired["status"], retired["previous_status"]) == (
+        True, "cancelled", "queued")
+    # Ended as the canonical finalizer ends a cancellation: the terminal state,
+    # the static code, and one run_cancelled event carrying exactly that code.
+    assert _terminal(db, failed) == "cancelled|launch_failed|RUN_NOT_LAUNCHED|true|-|1"
+    event = db.psql(f"select message || '|' || payload::text from public.run_events "
+                    f"where run_id = '{failed}' and event_type = 'run_cancelled'")
+    assert event == ("No worker was ever started for this run; an operator retired it|"
+                     '{"code": "RUN_NOT_LAUNCHED"}')
+    # Idempotent: the same answer, and nothing written again.
+    assert _retire_unlaunched(db, failed)["retired"] is False
+    assert _terminal(db, failed) == "cancelled|launch_failed|RUN_NOT_LAUNCHED|true|-|1"
+    # A terminal run is never claimed: a worker started for it executes nothing.
+    assert db.psql(f"select count(*) from public.claim_run_lease('{failed}', 'late', 300)") == "0"
+
+    # `pending`, and a cancellation request nobody would ever finish, are
+    # released the same way.
+    pending = _lost_launch_run(db, conversation, launch_state="pending")
+    _quiet(db, pending)
+    assert _retire_unlaunched(db, pending)["previous_status"] == "queued"
+    stuck = _lost_launch_run(db, conversation, status="cancellation_requested",
+                             launch_state="launch_failed")
+    _quiet(db, stuck)
+    assert _retire_unlaunched(db, stuck)["previous_status"] == "cancellation_requested"
+    assert _terminal(db, stuck) == "cancelled|launch_failed|RUN_NOT_LAUNCHED|true|-|1"
+
+    # An uncertain launch is never retired, nor anything a worker may hold, nor
+    # anything with execution or paid work; a refusal changes nothing.
+    refusals = {}
+    for state in ("launching", "launch_unknown", "launched"):
+        refusals[f"{state} is not known to be unlaunched"] = (
+            _lost_launch_run(db, conversation, launch_state=state), "UNLAUNCHED_RUN_WRONG_STATE")
+    claimed = _lost_launch_run(db, conversation, launch_state="launch_failed")
+    assert db.psql(f"select count(*) from public.claim_run_lease('{claimed}', 'w', 300)") == "1"
+    refusals["a worker claimed it"] = (claimed, "UNLAUNCHED_RUN_WRONG_STATE")
+    leased = _lost_launch_run(db, conversation, launch_state="launch_failed")
+    db.psql(f"update public.runs set lease_token = 'held', "
+            f"lease_expires_at = now() + interval '5 minutes' where id = '{leased}'")
+    refusals["an active lease"] = (leased, "UNLAUNCHED_RUN_CLAIMED")
+    invoked = _lost_launch_run(db, conversation, launch_state="launch_failed")
+    db.psql(f"insert into public.run_invocations (run_id, launcher) values ('{invoked}', 'cloud_run')")
+    refusals["an execution was recorded"] = (invoked, "UNLAUNCHED_RUN_TRACED")
+    worked = _lost_launch_run(db, conversation, launch_state="pending")
+    db.psql(f"insert into public.run_events (run_id, event_type, message) values "
+            f"('{worked}', 'run_started', 'started')")
+    refusals["a worker wrote about it"] = (worked, "UNLAUNCHED_RUN_TRACED")
+    for case, (run, code) in refusals.items():
+        _quiet(db, run)
+        before = _terminal(db, run)
+        with pytest.raises(AssertionError, match=code):
+            _retire_unlaunched(db, run)
+        assert _terminal(db, run) == before, case
+    with pytest.raises(AssertionError, match="UNLAUNCHED_RUN_NOT_FOUND"):
+        _retire_unlaunched(db, str(uuid.uuid4()))
+
+    # Operator-only: service path alone.
+    for role, allowed in (("anon", "f"), ("authenticated", "f"), ("service_role", "t")):
+        assert db.psql(f"select has_function_privilege('{role}', '{RETIRE_FN}', 'execute')") \
+            == allowed, role
+
+
+def _background_psql(db, sql: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        ["psql", "-h", db.dir, "-p", db.port, "-U", "postgres", "-d", "milo",
+         "-v", "ON_ERROR_STOP=1", "-X", "-q", "-t", "-A", "-c", sql],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def _wait_until_sleeping(db, marker: str) -> None:
+    """Block until the background session is inside its pg_sleep: everything
+    before it in that transaction has run, and its row lock is held."""
+    import time
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if db.psql("select count(*) from pg_stat_activity where state = 'active' "
+                   f"and query like '%{marker}%' and pid <> pg_backend_pid()") == "1":
+            return
+        time.sleep(0.05)
+    raise AssertionError("the background session never reached its sleep")
+
+
+def test_retirement_and_a_worker_claim_serialize_on_the_run_row(db):
+    _user, _project, conversation = _ws_world(db)
+
+    # A worker claims first and holds the row: the retirement waits for it, then
+    # finds a claimed run and refuses. The worker keeps its run.
+    first = _lost_launch_run(db, conversation, launch_state="launch_failed")
+    _quiet(db, first)
+    claimer = _background_psql(
+        db, f"begin; select id from public.claim_run_lease('{first}', 'racing-worker', 300); "
+            f"select pg_sleep(1.5) /* claim-holds-{first} */; commit;")
+    _wait_until_sleeping(db, f"claim-holds-{first}")
+    with pytest.raises(AssertionError, match="UNLAUNCHED_RUN_WRONG_STATE"):
+        _retire_unlaunched(db, first)
+    assert claimer.wait(timeout=30) == 0, claimer.stderr.read()
+    assert db.psql(f"select status || '|' || worker_id from public.runs where id = '{first}'") \
+        == "starting|racing-worker"
+
+    # The retirement holds the row first: the worker's claim waits for it, then
+    # finds a terminal run and gets nothing. Nothing executes.
+    second = _lost_launch_run(db, conversation, launch_state="launch_failed")
+    _quiet(db, second)
+    retirer = _background_psql(
+        db, f"begin; set local role service_role; "
+            f"select public.retire_unlaunched_run('{second}', 900, 'operator@milo.test'); "
+            f"select pg_sleep(1.5) /* retire-holds-{second} */; commit;")
+    _wait_until_sleeping(db, f"retire-holds-{second}")
+    assert db.psql(f"select count(*) from public.claim_run_lease('{second}', 'late-worker', 300)") \
+        == "0"
+    assert retirer.wait(timeout=30) == 0, retirer.stderr.read()
+    assert _terminal(db, second) == "cancelled|launch_failed|RUN_NOT_LAUNCHED|true|-|1"
+
+
+def test_a_stale_revision_held_by_a_never_launched_batch_is_released_and_the_plan_continues(db):
+    world = _wsb_world(db)
+    first = world["batches"][0]
+    held = _wsb_start(db, world, first, key="stale-1")["run"]["id"]
+    # The API took launch ownership and the launcher definitely failed.
+    assert db.psql(LAUNCH_CAS.format(run=held)) == "1"
+    db.psql(f"update public.runs set launch_state = 'launch_failed' where id = '{held}'")
+    # The plan is revised past the batch: its revision can never launch again.
+    _rpc_as_service(db, f"select public.revise_work_scope('{world['plan']}', 1, "
+                        f"'{world['digest']}', '{world['user']}', "
+                        f"{_ws_revision(_ws_scope(units=['toyota']))})")
+    head = db.psql(f"select head_digest from public.catalog_work_scopes where id='{world['plan']}'")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_STALE"):
+        _wsb_start(db, world, first, key="stale-1")
+    live = _wsb_progress(db, world["plan"])["live"]
+    assert (live["run_id"], live["revision"], live["launch_state"]) == (held, 1, "launch_failed")
+
+    # The operator releases it once it is provably dead.
+    _quiet(db, held)
+    assert _retire_unlaunched(db, held)["retired"] is True
+    progress = _wsb_progress(db, world["plan"])
+    assert (progress["live"], progress["revision"], progress["preparation"]) == (None, 2, None)
+
+    # Continuation: the head revision is prepared, and its first batch starts
+    # on request -- a new run; the retired one never runs.
+    units = [unit for unit in _wsp_units(world["snapshot"]) if unit["unit_key"] == "toyota"]
+    revision_two = _wsp_prepare(db, world["args"], world["plan"], 2, head, units)
+    next_batch = revision_two["batches"][0]["id"]
+    assert _wsb_progress(db, world["plan"])["preparation"]["next"]["batch_id"] == next_batch
+    started = _wsb_start(db, world, next_batch, key="stale-continue", revision=2, digest=head)
+    assert started["created"] is True and started["run"]["id"] != held
+    assert db.psql(f"select count(*) from public.claim_run_lease('{held}', 'late', 300)") == "0"
+    assert db.psql(f"select count(*) from public.claim_run_lease('{started['run']['id']}', "
+                   f"'next-worker', 300)") == "1"
+    assert _wsb_counts(db, world) == ("2", "2", "2")
+
+
+def test_progress_is_derived_from_bound_runs_and_their_promotion_events(db):
+    world = _wsb_world(db)
+    first, second, _third = world["batches"]
+    assert _wsb_progress(db, str(uuid.uuid4())) is None
+    progress = _wsb_progress(db, world["plan"])
+    assert (progress["revision"], progress["digest"], progress["paused"], progress["live"]) == (
+        1, world["digest"], False, None)
+    prepared = progress["preparation"]
+    assert prepared["next"] == {"batch_id": first, "batch_number": 1, "unit_key": "toyota",
+                                "item_count": 10, "first_position": 1, "state": "pending",
+                                "attempts": 0}
+    assert prepared["items"] == {"total": 23, "promoted": 0, "refused": 0, "unresolved": 0}
+    assert [unit["unit_key"] for unit in prepared["units"]] == ["toyota", "lexus"]
+    assert (prepared["units"][1]["state"], prepared["units"][1]["batch_count"]) == (
+        "register_unverified", 0)
+
+    run = _wsb_start(db, world, first, key="progress-1")["run"]["id"]
+    live = _wsb_progress(db, world["plan"])
+    assert (live["live"]["batch_id"], live["live"]["run_id"], live["live"]["run_status"],
+            live["live"]["launch_state"], live["live"]["revision"]) == (
+        first, run, "queued", "pending", 1)
+    assert live["preparation"]["batches"]["active"] == 1
+
+    keys = db.psql("select candidate_key from public.catalog_work_scope_queue_items "
+                   f"where batch_id='{first}' order by batch_position").splitlines()
+    outsider = db.psql("select candidate_key from public.catalog_work_scope_queue_items "
+                       f"where batch_id='{second}' order by batch_position limit 1")
+    events = [("catalog_variant_promoted", keys[0], True),
+              ("catalog_variant_promoted", keys[1], True),
+              ("catalog_promotion_refused", keys[2], False),
+              # Refused, then promoted by the same run: promoted.
+              ("catalog_promotion_refused", keys[3], False),
+              ("catalog_variant_promoted", keys[3], True),
+              # A "promoted" event that says it was not is no promotion.
+              ("catalog_variant_promoted", keys[4], False),
+              # A candidate queued in batch 2, promoted by batch 1's run.
+              ("catalog_variant_promoted", outsider, True),
+              # Not a candidate of this plan at all.
+              ("catalog_variant_promoted", "cc1." + "0" * 32, True)]
+    for event_type, key, promoted in events:
+        payload = json.dumps({"candidate_key": key, "promoted": promoted})
+        db.psql("insert into public.run_events (run_id, event_type, message, payload) values "
+                f"('{run}', '{event_type}', 'x', '{payload}'::jsonb)")
+    _wsb_finish(db, run, "completed")
+    progress = _wsb_progress(db, world["plan"])
+    prepared = progress["preparation"]
+    assert progress["live"] is None
+    assert prepared["recent"][0] == {"batch_id": first, "batch_number": 1, "unit_key": "toyota",
+                                     "item_count": 10, "state": "completed", "attempts": 1,
+                                     "run_id": run, "run_status": "completed", "promoted": 3,
+                                     "refused": 1, "unresolved": 6}
+    assert prepared["items"] == {"total": 23, "promoted": 4, "refused": 1, "unresolved": 6}
+    assert prepared["batches"] == {"total": 3, "settled": 1, "active": 0, "interrupted": 0}
+    toyota = prepared["units"][0]
+    assert (toyota["batch_count"], toyota["settled_batches"], toyota["active"],
+            toyota["promoted"], toyota["refused"], toyota["unresolved"]) == (3, 1, False, 4, 1, 6)
+    assert prepared["next"]["batch_id"] == second
+
+    # A batch still running when the plan is revised stays visible as live,
+    # with the revision it belongs to; the new head is not prepared.
+    running = _wsb_start(db, world, second, key="progress-2")["run"]["id"]
+    _rpc_as_service(db, f"select public.revise_work_scope('{world['plan']}', 1, "
+                        f"'{world['digest']}', '{world['user']}', "
+                        f"{_ws_revision(_ws_scope(units=['toyota']))})")
+    revised = _wsb_progress(db, world["plan"])
+    assert (revised["revision"], revised["preparation"]) == (2, None)
+    assert (revised["live"]["run_id"], revised["live"]["revision"]) == (running, 1)
+
+
+def test_batch_run_relations_are_service_only_and_rerun_safe(db):
+    world = _wsb_world(db)
+    _wsb_pause(db, world, True)
+    for table in CATALOG_WORK_SCOPE_CONTROL_TABLES:
+        assert db.psql(f"select relrowsecurity from pg_class where oid='public.{table}'::regclass") == "t"
+        assert db.psql(f"select count(*) from pg_policies where tablename='{table}'") == "0"
+        for role in ("anon", "authenticated"):
+            for privilege in ("select", "insert", "update", "delete"):
+                assert db.psql(f"select has_table_privilege('{role}', 'public.{table}', "
+                               f"'{privilege}')") == "f"
+        for privilege, granted in (("select", "t"), ("insert", "t"), ("update", "f"),
+                                   ("delete", "f")):
+            assert db.psql(f"select has_table_privilege('service_role', 'public.{table}', "
+                           f"'{privilege}')") == granted
+    for signature in (
+            "public.create_work_scope_batch_run(uuid, uuid, integer, text, uuid, jsonb, text, "
+            "jsonb, uuid, text, text, integer, integer)",
+            "public.set_work_scope_paused(uuid, boolean, uuid)",
+            "public.work_scope_progress(uuid)",
+            "public.work_scope_paused(uuid)",
+            "public.bind_work_scope_batch_run(uuid, uuid, integer, text, uuid)"):
+        for role in ("anon", "authenticated"):
+            assert not _has_execute(db, role, signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+    # The creator returns a SET, like the run creator it wraps.
+    assert db.psql("select bool_and(proretset) from pg_proc where proname="
+                   "'create_work_scope_batch_run'") == "t"
+    before = db.psql("select count(*) from public.catalog_work_scope_controls")
+    db.psql(file=_wsb_migration())
+    db.psql(file=_wsb_migration())
+    assert db.psql("select count(*) from public.catalog_work_scope_controls") == before
+    assert _wsb_progress(db, world["plan"])["paused"] is True

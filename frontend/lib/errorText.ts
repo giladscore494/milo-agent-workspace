@@ -109,8 +109,20 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
   ['WORK_SCOPE_INSTRUCTION_NOT_UNDERSTOOD', 'No manufacturer, model year, limit or batch size was recognized in that instruction. Check the spelling, or build the plan from the directory.'],
   ['WORK_SCOPE_COVERAGE_UNAVAILABLE', 'The catalog coverage that instruction depends on could not be read, so the plan was not changed. Try again shortly.'],
 
+  // Mapping Plan batches. Each is a refusal a person can act on: the plan's
+  // progress is reloaded after every one, so the screen shows what is really
+  // next. None of them started a run.
+  ['WORK_SCOPE_PAUSED', 'The mapping plan is paused, so no batch was started. Resume it first.'],
+  ['WORK_SCOPE_BATCH_NOT_NEXT', 'That batch is no longer the next one, so nothing was started. The progress has been reloaded.'],
+  ['WORK_SCOPE_BATCH_IN_PROGRESS', 'Another batch of this plan is still running, so nothing was started.'],
+  ['WORK_SCOPE_BATCH_ALREADY_COMPLETED', 'That batch has already finished, so it was not started again.'],
+
   // Run and proposal lifecycle.
   ['RUN_ALREADY_FINISHED', 'That run has already finished.'],
+  // A cancellation is finished by the run's worker; these two runs have none
+  // that is known to exist, so nothing was changed.
+  ['RUN_NOT_LAUNCHED', 'This run never started, so there is nothing to cancel yet. Start it again, or ask an operator to retire it.'],
+  ['RUN_LAUNCH_UNRESOLVED', 'It is not yet known whether this run started, so it cannot be cancelled until an operator has checked it.'],
   ['PROPOSAL_NOT_APPROVABLE', 'This proposal cannot be approved in its current state.'],
   ['PROPOSAL_NOT_APPROVED', 'This proposal has not been approved.'],
 

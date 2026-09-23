@@ -177,6 +177,8 @@ case "$sql" in
     printf '%s\n' "${MOCK_PSQL_READ-}";;
   *"model_call_budget_reservations"*) printf '%s\n' "${MOCK_PSQL_BUDGET:-0}";;
   *"launch_state = 'launch_unknown'"*) printf '%s\n' "${MOCK_PSQL_LIST-}";;
+  *"status = 'queued' and launch_state = 'launching' and updated_at <="*) printf '%s\n' "${MOCK_PSQL_LOST_LIST-}";;
+  *"launch_state in ('pending', 'launch_failed') and updated_at <="*) printf '%s\n' "${MOCK_PSQL_NEVER_LIST-}";;
   *) printf 'MOCK-UNAUTHORIZED psql query: %s\n' "$sql" >&2; exit 98;;
 esac
 """

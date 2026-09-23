@@ -110,6 +110,33 @@ REQUIRED_PER_FILE = {
     ],
 }
 
+REQUIRED_PER_FILE["20260924000100_catalog_work_scope_batch_runs.sql"] = [
+    # A batch run is created and bound in ONE transaction, through the one run
+    # creator, and only the NEXT batch of an unpaused head revision starts.
+    "enable row level security",
+    "create or replace function public.create_work_scope_batch_run(",
+    "from public.create_message_and_run_v3(",
+    "public.bind_work_scope_batch_run(p_batch_id, p_run_id",
+    "raise exception 'work_scope_stale'",
+    "raise exception 'work_scope_paused'",
+    "raise exception 'work_scope_batch_not_next'",
+    "raise exception 'work_scope_batch_in_progress'",
+    "create trigger catalog_work_scope_controls_append_only",
+    "create trigger catalog_work_scope_controls_in_sequence",
+    "for update",
+    # A lost launch is reconciled only by an operator's guarded decision, and
+    # only while no worker ever claimed the run and nothing is in flight.
+    "create or replace function public.reconcile_lost_launch(",
+    "raise exception 'lost_launch_claimed'",
+    "raise exception 'lost_launch_not_quiet'",
+    "raise exception 'lost_launch_traced'",
+    # A run no worker was ever started for is retired only by an operator's
+    # guarded decision, with its terminal event, never while anything ran.
+    "create or replace function public.retire_unlaunched_run(",
+    "raise exception 'unlaunched_run_claimed'",
+    "raise exception 'unlaunched_run_traced'",
+    "'run_cancelled', v_message, jsonb_build_object('code', 'run_not_launched')",
+]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the
     # preparation it feeds is written once, by an operator capture run only.

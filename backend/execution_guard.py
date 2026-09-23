@@ -27,6 +27,9 @@ without a separately approved execution stage:
   creating a conversation's plan and revising it. A plan is a draft that
   executes nothing, but it is durable state a browser writes, so it is off
   until a stage enables it deliberately.
+- ``MILO_ENABLE_WORK_SCOPE_BATCHES`` gates starting ONE batch of a prepared
+  Mapping Plan (together with ``MILO_ENABLE_RUN_CREATION``: a batch run is a
+  run) and pausing / resuming the plan. Nothing starts a batch automatically.
 """
 
 import os
@@ -50,6 +53,10 @@ SURFACE_RULES: tuple[tuple[str, str, re.Pattern[str], str], ...] = (
     ("GET", "MILO_ENABLE_PROPOSAL_READS", re.compile(rf"^/workflow-proposals/{_SEGMENT}/?$"), "workflow proposal read"),
     ("POST", "MILO_ENABLE_WORK_SCOPE_MUTATIONS", re.compile(rf"^/conversations/{_SEGMENT}/work-scopes/?$"), "work scope creation"),
     ("POST", "MILO_ENABLE_WORK_SCOPE_MUTATIONS", re.compile(rf"^/work-scopes/{_SEGMENT}/revisions/?$"), "work scope revision"),
+    # A batch start IS run creation: both flags must be on, so two rules name it.
+    ("POST", "MILO_ENABLE_RUN_CREATION", re.compile(rf"^/work-scopes/{_SEGMENT}/runs/?$"), "work scope batch run creation"),
+    ("POST", "MILO_ENABLE_WORK_SCOPE_BATCHES", re.compile(rf"^/work-scopes/{_SEGMENT}/runs/?$"), "work scope batch run creation"),
+    ("POST", "MILO_ENABLE_WORK_SCOPE_BATCHES", re.compile(rf"^/work-scopes/{_SEGMENT}/(pause|resume)/?$"), "work scope pause and resume"),
 )
 
 

@@ -12,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.budget import BudgetConfig
 from backend.catalog import review as catalog_review
+from backend.catalog.scope import batches as work_scope_batches
 from backend.catalog.scope import service as work_scopes
 from backend.config import get_settings
 from backend.auth import AuthenticatedUser, get_authenticated_user
@@ -45,8 +46,9 @@ from backend.schemas import (
     WorkflowProposal,
     ToolAccessRequestCreate, ToolGrantCreate, ToolUsageCreate, SourceCreate, ClaimCreate, ConflictCreate,
     WorkerRunCompleteRequest, WorkerRunEventCreate, WorkerRunFailRequest,
-    WorkScopeCapabilities, WorkScopeCreate, WorkScopeDirectory, WorkScopeMutationResult,
-    WorkScopeOpen, WorkScopeRevise, WorkScopeState,
+    WorkScopeBatchRunCreated, WorkScopeBatchStart, WorkScopeCapabilities,
+    WorkScopeControlResult, WorkScopeCreate, WorkScopeDirectory, WorkScopeMutationResult,
+    WorkScopeOpen, WorkScopeProgress, WorkScopeRevise, WorkScopeState,
 )
 from backend.rate_limit import enforce_rate_limit
 from backend.event_registry import is_known_event_type
@@ -58,7 +60,7 @@ from backend.run_identity import (
     execution_identity_problems,
     require_identity,
 )
-from backend.runtime import TERMINAL_STATES
+from backend.runtime import TERMINAL_STATES, cancellation_refusal
 from backend.finalization import RunFinalizer, TerminalClaim
 from backend.vehicle_catalog_scope import (SCOPE_METADATA_KEY, VehicleCatalogScopeError,
                                            refuse_supplied_scope,
@@ -169,6 +171,14 @@ def _catalog_page_meta(page: catalog_review.CatalogPage) -> CatalogPageMeta:
 
 #: The events the canonical finalizer writes atomically with a terminal status.
 TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_partial_success", "run_failed", "run_cancelled"})
+
+#: Why a cancellation request is refused, in static words (never run data).
+CANCELLATION_REFUSALS = {
+    "RUN_NOT_LAUNCHED": "no worker was ever started for this run, so nothing would finalize a "
+                        "cancellation; launch it again, or an operator retires it",
+    "RUN_LAUNCH_UNRESOLVED": "whether a worker was started for this run is not known; an operator "
+                             "reconciles its launch before it can be cancelled",
+}
 
 #: "Not supplied": lets a history page hand pre-fetched limits and terminal
 #: events to the projection instead of re-reading them per row.
@@ -389,24 +399,7 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
             except VehicleCatalogScopeError as exc:
                 raise AppError(exc.code, exc.safe_message, 409) from None
             metadata[SCOPE_METADATA_KEY] = scope.as_record()
-        new_run_id = uuid4()
-        try:
-            identity = RunIdentity.bind(new_run_id, str(workflow_key or ""))
-        except RunIdentityError as exc:
-            raise AppError(
-                "RUN_IDENTITY_NOT_BOUND",
-                "the run's immutable identity could not be established",
-                409,
-            ) from exc
-        if execution_identity_problems(identity):
-            # A run must not be born already unable to execute. In particular,
-            # an absent/malformed MILO_RELEASE_SHA is not recorded as an empty
-            # wildcard and left queued for a worker to refuse later.
-            raise AppError(
-                "RUN_IDENTITY_RUNTIME_MISMATCH",
-                "this runtime cannot bind an executable immutable run identity",
-                503,
-            )
+        new_run_id, identity = _new_run_identity(workflow_key)
 
         # Transaction-safe path: idempotent replay, concurrency admission,
         # message insert, run insert and immutable identity all commit together.
@@ -428,6 +421,45 @@ def _create_and_launch_run(repo: Repository, launcher: JobLauncher, user: Authen
         if not result.get("created", True) and run.get("request_fingerprint") not in (None, fingerprint):
             raise AppError("IDEMPOTENCY_CONFLICT", "idempotency key was already used with a different payload", 409)
 
+    return _launch_created_run(repo, launcher, run)
+
+
+def _new_run_identity(workflow_key: object) -> tuple[UUID, RunIdentity]:
+    """A fresh run id and the immutable identity it will be BORN with.
+
+    Refused before anything is written when this runtime cannot bind an
+    executable identity -- the same gate for every run this API creates.
+    """
+    new_run_id = uuid4()
+    try:
+        identity = RunIdentity.bind(new_run_id, str(workflow_key or ""))
+    except RunIdentityError as exc:
+        raise AppError(
+            "RUN_IDENTITY_NOT_BOUND",
+            "the run's immutable identity could not be established",
+            409,
+        ) from exc
+    if execution_identity_problems(identity):
+        # A run must not be born already unable to execute. In particular,
+        # an absent/malformed MILO_RELEASE_SHA is not recorded as an empty
+        # wildcard and left queued for a worker to refuse later.
+        raise AppError(
+            "RUN_IDENTITY_RUNTIME_MISMATCH",
+            "this runtime cannot bind an executable immutable run identity",
+            503,
+        )
+    return new_run_id, identity
+
+
+def _launch_created_run(repo: Repository, launcher: JobLauncher, run: dict) -> RunCreated:
+    """Launch a run the durable creator returned: THE launch step, for every run.
+
+    The identity gate, the launch compare-and-set, the launcher call and its
+    failure handling are the same whether the run came from a conversation
+    request or from a Mapping Plan batch. A replayed run is launched only if
+    its launch never happened or definitely failed; anything else returns the
+    existing run untouched.
+    """
     run_id = UUID(str(run["id"]))
     # No executable run may cross the launch boundary without a persisted,
     # readable identity. Legacy rows remain history, not runnable work.
@@ -652,6 +684,63 @@ def revise_work_scope(work_scope_id: UUID, request: WorkScopeRevise, user: Authe
                                          request.expected_digest, request.instruction, request.edit)
 
 
+# --- Mapping Plan batch runs (backend/catalog/scope/batches.py) --------------
+#
+# One read and three writes. The read is membership-authorized and ungated, like
+# the plan reads above. Starting a batch is RUN CREATION: it needs
+# `MILO_ENABLE_RUN_CREATION` AND `MILO_ENABLE_WORK_SCOPE_BATCHES`, it is rate
+# limited as run creation, and it goes through the same identity gate and the
+# same launch step as every other run. Pause and resume need the batches flag.
+# Each is enforced by `ExecutionSurfaceGuardMiddleware` before the body is read,
+# and again here. There is no automatic next batch anywhere: one request, one
+# batch run.
+
+
+@app.get("/work-scopes/{work_scope_id}/progress", response_model=WorkScopeProgress)
+def get_work_scope_progress(work_scope_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return work_scope_batches.progress(repo, user.user_id, work_scope_id)
+
+
+@app.post("/work-scopes/{work_scope_id}/runs", response_model=WorkScopeBatchRunCreated, status_code=202)
+def start_work_scope_batch(work_scope_id: UUID, request: WorkScopeBatchStart, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), launcher: JobLauncher = Depends(get_job_launcher)) -> dict:
+    require_stage_enabled("MILO_ENABLE_RUN_CREATION", "work scope batch run creation")
+    require_stage_enabled(work_scope_batches.WORK_SCOPE_BATCHES_FLAG, "work scope batch runs")
+    enforce_rate_limit("run_creation_user", str(user.user_id))
+    # Membership, workflow, a stale head and a batch that is not next are all
+    # refused here, before an identity is bound or anything is written.
+    prepared = work_scope_batches.batch_request(
+        repo, user.user_id, work_scope_id, expected_revision=request.expected_revision,
+        expected_digest=request.expected_digest, batch_id=request.batch_id)
+    enforce_rate_limit("run_creation_project", prepared["project_id"])
+    new_run_id, identity = _new_run_identity(work_scope_batches.BATCH_RUN_WORKFLOW)
+    config = BudgetConfig.from_env()
+    created = work_scope_batches.create_batch_run(
+        repo, user.user_id, work_scope_id, expected_revision=request.expected_revision,
+        expected_digest=request.expected_digest, batch_id=request.batch_id,
+        idempotency_key=request.idempotency_key, content=prepared["content"],
+        fingerprint=prepared["fingerprint"], run_id=new_run_id,
+        run_identity=identity.as_record(),
+        max_user_active=config.max_concurrent_runs_per_user,
+        max_project_active=config.max_concurrent_runs_per_project)
+    binding = created["binding"]
+    launched = _launch_created_run(repo, launcher, created["run"])
+    return {"run_id": launched.run_id, "status": launched.status,
+            "work_scope_id": work_scope_id, "batch_id": binding["batch_id"],
+            "attempt": binding["attempt"], "created": bool(created.get("created"))}
+
+
+@app.post("/work-scopes/{work_scope_id}/pause", response_model=WorkScopeControlResult)
+def pause_work_scope(work_scope_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    require_stage_enabled(work_scope_batches.WORK_SCOPE_BATCHES_FLAG, "work scope pause")
+    return work_scope_batches.set_paused(repo, user.user_id, work_scope_id, True)
+
+
+@app.post("/work-scopes/{work_scope_id}/resume", response_model=WorkScopeControlResult)
+def resume_work_scope(work_scope_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    require_stage_enabled(work_scope_batches.WORK_SCOPE_BATCHES_FLAG, "work scope resume")
+    return work_scope_batches.set_paused(repo, user.user_id, work_scope_id, False)
+
+
 @app.post("/projects/{project_id}/conversations", response_model=Conversation, status_code=201)
 def create_conversation(project_id: UUID, request: ConversationCreate, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
     return repo.create_conversation(project_id, request.title, user.user_id)
@@ -760,6 +849,13 @@ def cancel_run(run_id: UUID, request: RunCancelRequest, user: AuthenticatedUser 
         return RunCancelResponse(run_id=run["id"], status=status)
     if status in TERMINAL_STATES:
         raise AppError("RUN_ALREADY_FINISHED", f"run is already {status} and cannot be cancelled", 409)
+    # A cancellation is a request the run's worker finalizes. A run no worker
+    # was started for, or whose launch is unresolved, has nobody to finalize
+    # it: it would rest at `cancellation_requested` for good. Refused here, and
+    # again by the database write itself (`request_cancellation`).
+    refusal = cancellation_refusal(status, run.get("launch_state"))
+    if refusal is not None:
+        raise AppError(refusal, CANCELLATION_REFUSALS[refusal], 409)
     run = repo.request_cancellation(run_id, request.reason)
     repo.append_run_event(run_id, "cancellation_requested", {"message": request.reason or "Cancellation requested", "payload": {"reason": request.reason, "requested_by": str(user.user_id)}})
     return RunCancelResponse(run_id=run["id"], status=run["status"])
