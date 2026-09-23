@@ -29,6 +29,20 @@
 # launch_failed: the existing requeue path, where the same run can be launched
 # again only through the launch compare-and-set. launch_unknown keeps the
 # guarded updates below, unchanged.
+#
+# A NEVER-LAUNCHED run -- launch_state 'pending' or 'launch_failed', so no
+# worker was ever started -- can be launched again as the same run. When it
+# cannot (its Mapping Plan was revised past its batch, and a stale revision
+# never launches), it holds the plan and its requester's run slot, and a
+# cancellation request is refused because no worker would finalize it. Decision
+# 5, retire-not-launched, is the way out: public.retire_unlaunched_run proves
+# under the run's row lock that the launch is KNOWN not to have started a
+# worker (never 'launching' or 'launch_unknown': reconcile those first), that no
+# worker ever claimed it and no lease is held, that no execution or paid work
+# exists for it, and that the row has been quiet for --min-quiet-seconds; then
+# it ends the run as the canonical finalizer ends a cancellation: 'cancelled'
+# (RUN_NOT_LAUNCHED) with its run_cancelled event, in one transaction. It never
+# relaunches anything.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,7 +64,8 @@ Options:
   --run-id <uuid>                 Scope the plan to one run.
   --resolution <kind>             One of: confirmed-launched,
                                   confirmed-not-launched, requeue,
-                                  leave-unresolved. Required with --apply.
+                                  leave-unresolved, retire-not-launched.
+                                  Required with --apply.
   --min-quiet-seconds <N>         How long a queued + launching run must have
                                   been quiet to count as a LOST launch
                                   (default 1800, never under 900). Listing
@@ -114,7 +129,7 @@ MIN_QUIET_SECONDS="$((10#${MIN_QUIET_SECONDS}))"
 # Listing (read-only).
 # ---------------------------------------------------------------------------
 if [[ -z "${DB_URL_ENV}" ]]; then
-  record_check MANUAL "list" "no --database-url-env supplied; list unresolved runs manually with: select id, created_at, attempt, status, launch_state from public.runs where launch_state = 'launch_unknown' or (status = 'queued' and launch_state = 'launching' and updated_at <= now() - make_interval(secs => ${MIN_QUIET_SECONDS})) order by created_at;"
+  record_check MANUAL "list" "no --database-url-env supplied; list unresolved runs manually with: select id, created_at, attempt, status, launch_state from public.runs where launch_state = 'launch_unknown' or (status = 'queued' and launch_state = 'launching' and updated_at <= now() - make_interval(secs => ${MIN_QUIET_SECONDS})) or (status in ('queued', 'cancellation_requested') and launch_state in ('pending', 'launch_failed') and updated_at <= now() - make_interval(secs => ${MIN_QUIET_SECONDS})) order by created_at;"
 elif ! tool_available psql; then
   record_check MANUAL "list" "psql unavailable; run the listing query manually (read-only)"
 else
@@ -154,6 +169,22 @@ else
         record_check WARN "list:lost-launch" "${lost_count} lost launch(es) (queued + launching, quiet for at least ${MIN_QUIET_SECONDS}s) hold their runs, and any Mapping Plan batch, and require operator review"
         printf '\nLost launches (safe identifiers only):\n%s\n' "${lost_rows}"
       fi
+      # NEVER-LAUNCHED runs: no worker was ever started, quiet for the threshold. Read-only.
+      never_where="status in ('queued', 'cancellation_requested') and launch_state in ('pending', 'launch_failed') and updated_at <= now() - make_interval(secs => ${MIN_QUIET_SECONDS})"
+      if [[ -n "${RUN_ID}" ]]; then
+        never_where="${never_where} and id = '${RUN_ID}'::uuid"
+      fi
+      never_rows="$(psql -X -A -t -v ON_ERROR_STOP=1 "${db_url}" \
+        -c "select id || ' | ' || created_at || ' | status=' || status || ' | launch_state=' || launch_state || ' | quiet_for=' || floor(extract(epoch from now() - updated_at))::bigint || 's' from public.runs where ${never_where} order by created_at" 2> /dev/null || printf 'CONNECTION_FAILED')"
+      if [[ "${never_rows}" == "CONNECTION_FAILED" ]]; then
+        record_check BLOCKED "list:never-launched" "unable to list never-launched runs via ${DB_URL_ENV} (connection string never printed)"
+      elif [[ -z "${never_rows}" ]]; then
+        record_check PASS "list:never-launched" "no never-launched runs (pending or launch_failed, quiet for at least ${MIN_QUIET_SECONDS}s)"
+      else
+        never_count="$(wc -l <<< "${never_rows}" | tr -d ' ')"
+        record_check WARN "list:never-launched" "${never_count} never-launched run(s) (pending or launch_failed, quiet for at least ${MIN_QUIET_SECONDS}s): each can be launched again as the same run, or retired (decision 5)"
+        printf '\nNever-launched runs (safe identifiers only):\n%s\n' "${never_rows}"
+      fi
     fi
   fi
 fi
@@ -188,6 +219,14 @@ run to launch_failed: the same run is then launched again only by a person
 (the Mapping Plan's "Launch batch", or a replay of the original request), or
 after decision 3. Nothing launches it automatically.
 
+5. Retire a run no worker was ever started for (launch_state pending or
+   launch_failed; never launching or launch_unknown -- reconcile those first).
+   Use it when the same run cannot be launched again, e.g. its Mapping Plan
+   was revised past its batch. The database proves no worker, no lease, no
+   execution and no paid work, and a quiet row, then ends it 'cancelled'
+   (RUN_NOT_LAUNCHED) with its terminal event. Nothing is relaunched:
+   $0 --run-id ${rid} --resolution retire-not-launched --apply ... (same guards)
+
 4. Leave unresolved (explicitly documented operator decision; no database
    mutation, but the SAME operator identity guard is required so the audit
    record is trustworthy; a read-only --database-url-env optionally
@@ -203,9 +242,9 @@ EOF
 # ---------------------------------------------------------------------------
 if [[ "${APPLY_MODE}" -eq 1 ]]; then
   case "${RESOLUTION}" in
-    confirmed-launched|confirmed-not-launched|requeue|leave-unresolved) ;;
+    confirmed-launched|confirmed-not-launched|requeue|leave-unresolved|retire-not-launched) ;;
     *)
-      record_check BLOCKED "resolution" "--apply requires --resolution (confirmed-launched | confirmed-not-launched | requeue | leave-unresolved)"
+      record_check BLOCKED "resolution" "--apply requires --resolution (confirmed-launched | confirmed-not-launched | requeue | leave-unresolved | retire-not-launched)"
       finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
       exit $?
       ;;
@@ -325,6 +364,61 @@ if [[ "${APPLY_MODE}" -eq 1 ]]; then
   rest="${read_out#*|}"
   cur_status="${rest%%|*}"
   cur_lease="${rest##*|}"
+
+  # Decision 5: retire a run no worker was ever started for. The database
+  # guard, retire_unlaunched_run, re-proves everything under the row lock.
+  if [[ "${RESOLUTION}" == "retire-not-launched" ]]; then
+    if [[ "${cur_lease}" == "active" ]]; then
+      record_check BLOCKED "apply:lease" "run ${RUN_ID} holds an active worker lease: a worker was started, so it is not a never-launched run. No mutation performed, no audit record written."
+      finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+      exit $?
+    fi
+    printf '\nGuarded retirement (public.retire_unlaunched_run; exactly one run, re-proven under its row lock):\n  run=%s min_quiet_seconds=%s\n' \
+      "${RUN_ID}" "${MIN_QUIET_SECONDS}"
+    retire_err="${_MILO_TMPDIR}/retire-unlaunched-run.err"
+    retire_status=0
+    retire_out="$(psql -X -A -t -v ON_ERROR_STOP=1 -v run_id="${RUN_ID}" \
+      -v quiet="${MIN_QUIET_SECONDS}" -v operator="${EXPECTED_ACCOUNT}" \
+      "${db_url}" 2> "${retire_err}" << 'SQL'
+select (r->>'retired') || '|' || coalesce(r->>'previous_status', '') || '|' || (r->>'status')
+  from (select public.retire_unlaunched_run(:'run_id'::uuid, :'quiet'::integer, :'operator') as r) as retired;
+SQL
+    )" || retire_status=$?
+    if [[ "${retire_status}" -ne 0 ]]; then
+      retire_code="$(grep -oE 'UNLAUNCHED_RUN_[A-Z_]+' "${retire_err}" | head -1 || true)"
+      if [[ -n "${retire_code}" ]]; then
+        record_check BLOCKED "apply:refused" "the database refused to retire run ${RUN_ID}: ${retire_code}. The run is unchanged and no audit record was written."
+      else
+        record_check BLOCKED "apply:db" "the guarded retirement failed (database error; connection string never printed); state unchanged, no audit record written"
+      fi
+      finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+      exit $?
+    fi
+    retire_out="$(printf '%s' "${retire_out}" | tr -d '[:space:]')"
+    retired="${retire_out%%|*}"
+    retire_rest="${retire_out#*|}"
+    previous_status="${retire_rest%%|*}"
+    new_status="${retire_rest##*|}"
+    if [[ "${retired}" == "false" && "${new_status}" == "cancelled" ]]; then
+      record_check NOT_APPLICABLE "apply:retire-not-launched" "run ${RUN_ID} was already retired as never launched; idempotent no-op (no mutation, no audit record)"
+      finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+      exit $?
+    fi
+    if [[ "${retired}" != "true" || "${new_status}" != "cancelled" \
+          || ( "${previous_status}" != "queued" && "${previous_status}" != "cancellation_requested" ) ]]; then
+      record_check BLOCKED "apply:retire-not-launched" "unexpected answer from the database ('${retire_out}'); failing closed, no audit record written"
+      finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+      exit $?
+    fi
+    audit_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    umask 077
+    printf '%s script=reconcile-launch-unknown run=%s resolution=retire-not-launched prev_launch_state=%s prev_status=%s new_status=%s operator=%s project=%s sha=%s min_quiet_seconds=%s\n' \
+      "${audit_ts}" "${RUN_ID}" "${cur_launch}" "${previous_status}" "${new_status}" \
+      "${EXPECTED_ACCOUNT}" "${EXPECTED_PROJECT}" "$(git_head_sha)" "${MIN_QUIET_SECONDS}" >> "${AUDIT_FILE}"
+    record_check PASS "apply:retire-not-launched" "run ${RUN_ID}: retired as never launched (${previous_status} -> cancelled, RUN_NOT_LAUNCHED); nothing was launched; audit appended to ${AUDIT_FILE}"
+    finish_checks "reconcile-launch-unknown" "${JSON_OUTPUT}"
+    exit $?
+  fi
 
   # A LOST launch: decisions 1 and 2 go through the database's own guard,
   # reconcile_lost_launch, which re-proves everything under the run's row lock.

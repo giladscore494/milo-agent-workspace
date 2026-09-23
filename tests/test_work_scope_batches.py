@@ -50,7 +50,8 @@ from backend.main import app
 from backend.repository.supabase import SupabaseRepository
 from backend.run_identity import RunIdentity
 from backend.testing.memory_repository import MemoryRepository
-from backend.testing.work_scope_seed import seed_prepared_plan, start_batch_run
+from backend.testing.work_scope_seed import (prepare_plan_head, seed_prepared_plan,
+                                             start_batch_run)
 from test_swarm_v2_smoke_offline import (FakeKimiCompletions, InlineWorkerLauncher, patch_client,
                                          swarm_env)
 
@@ -1127,6 +1128,260 @@ def test_a_lost_launch_confirmed_launched_is_run_once_by_its_worker(monkeypatch)
     # A second worker for the same run executes nothing.
     assert worker_main.execute_run(UUID(lost), repo) == 0
     assert len(completions.calls) == calls
+
+
+# =============================================================================
+# 7. a never-launched batch of a revised plan, and cancellation nobody finishes
+# =============================================================================
+
+def _retire(repo: MemoryRepository, run_id: str, *, quiet: int = 1800) -> dict:
+    return repo.retire_unlaunched_run(UUID(run_id), min_quiet_seconds=quiet,
+                                      operator="operator@milo-prod.iam.gserviceaccount.com")
+
+
+def _fail_the_launch(repo: MemoryRepository, plan: dict, batch: str, **body) -> str:
+    """The real start request, whose launcher DEFINITELY fails: no worker."""
+    failing = RecordingLauncher(failure=RuntimeError("cloud run said no"))
+    previous = app.dependency_overrides.get(get_job_launcher)
+    app.dependency_overrides[get_job_launcher] = lambda: failing
+    try:
+        response = post_start(repo, plan, batch, **body)
+    finally:
+        if previous is None:
+            app.dependency_overrides.pop(get_job_launcher, None)
+        else:
+            app.dependency_overrides[get_job_launcher] = previous
+    assert response.json()["error"]["code"] == "JOB_LAUNCH_FAILED", response.text
+    run_id = failing.launched[0]
+    assert (repo.runs[run_id]["status"], repo.runs[run_id]["launch_state"]) == (
+        "queued", "launch_failed")
+    return run_id
+
+
+def _cancel(repo, run_id: str):
+    return client(repo).post(f"/runs/{run_id}/cancel", json={"reason": "stop"}, headers=as_user())
+
+
+@pytest.fixture(autouse=True)
+def generous_cancellation_limit(monkeypatch):
+    """These tests cancel as one user many times over; the per-user rate limit
+    is not what they are about."""
+    monkeypatch.setenv("MILO_RATE_LIMIT_CANCELLATION", "1000")
+
+
+@pytest.mark.parametrize("launch_state,code", [
+    ("pending", "RUN_NOT_LAUNCHED"), ("launch_failed", "RUN_NOT_LAUNCHED"),
+    ("none", "RUN_NOT_LAUNCHED"), ("launching", "RUN_LAUNCH_UNRESOLVED"),
+    ("launch_unknown", "RUN_LAUNCH_UNRESOLVED"),
+])
+def test_the_generic_cancellation_refuses_a_run_no_worker_would_finalize(
+        launcher, enabled, monkeypatch, launch_state, code):
+    monkeypatch.setenv(wsb.RUN_CANCELLATION_FLAG, "true")
+    repo, plan = prepared()
+    run_id = start(repo, plan, batch_ids(plan)[0])["run"]["id"]
+    repo.runs[run_id]["launch_state"] = launch_state
+    before = dict(repo.runs[run_id])
+    refused_response = _cancel(repo, run_id)
+    assert (refused_response.status_code, refused_response.json()["error"]["code"]) == (409, code)
+    # Nothing written: no request, no event.
+    assert repo.runs[run_id] == before
+    assert not [e for e in repo.run_events if e["run_id"] == run_id]
+    # The database write refuses it on its own, whoever calls it.
+    refused(code, repo.request_cancellation, UUID(run_id), "stop")
+    assert repo.runs[run_id] == before
+
+
+@pytest.mark.parametrize("status,launch_state", [
+    ("queued", "launched"), ("starting", "launching"), ("running", "launched"),
+    ("waiting", "launch_unknown"),
+])
+def test_the_generic_cancellation_still_stops_a_run_a_worker_will_finalize(
+        launcher, enabled, monkeypatch, status, launch_state):
+    monkeypatch.setenv(wsb.RUN_CANCELLATION_FLAG, "true")
+    repo, plan = prepared()
+    run_id = start(repo, plan, batch_ids(plan)[0])["run"]["id"]
+    repo.runs[run_id].update(status=status, launch_state=launch_state)
+    accepted = _cancel(repo, run_id)
+    assert (accepted.status_code, accepted.json()["status"]) == (200, "cancellation_requested")
+    assert [e["event_type"] for e in repo.run_events if e["run_id"] == run_id] == [
+        "cancellation_requested"]
+    # Idempotent: the same request again records nothing new.
+    assert _cancel(repo, run_id).status_code == 200
+    assert len([e for e in repo.run_events if e["run_id"] == run_id]) == 1
+
+
+class _Query:
+    """A recording PostgREST table query: every filter the write carries."""
+
+    def __init__(self, log: list, rows: list):
+        self.log, self.rows = log, rows
+
+    def update(self, payload):
+        self.log.append(("update", payload["status"]))
+        return self
+
+    def eq(self, column, value):
+        self.log.append(("eq", column, value))
+        return self
+
+    def select(self, *_columns):
+        return self
+
+    def execute(self):
+        return type("Response", (), {"data": self.rows})()
+
+
+def _supabase_cancellation(run: dict, rows: list | None = None) -> tuple[SupabaseRepository, list]:
+    log: list = []
+    repo = SupabaseRepository.__new__(SupabaseRepository)
+    repo.client = type("Client", (), {"table": lambda _self, _name: _Query(
+        log, [dict(run, status="cancellation_requested")] if rows is None else rows)})()
+    repo.get_run = lambda _run_id, user_id=None: run
+    return repo, log
+
+
+def test_the_supabase_cancellation_write_carries_the_guard_itself():
+    run_id = uuid4()
+    # An unclaimed run: the database matches it only while its launch is
+    # recorded `launched`, in the same statement as the write.
+    repo, log = _supabase_cancellation({"id": str(run_id), "status": "queued",
+                                         "launch_state": "launched"})
+    assert repo.request_cancellation(run_id, "stop")["status"] == "cancellation_requested"
+    assert log == [("update", "cancellation_requested"), ("eq", "id", str(run_id)),
+                   ("eq", "status", "queued"), ("eq", "launch_state", "launched")]
+    # A run a worker holds: the status compare-and-set alone.
+    repo, log = _supabase_cancellation({"id": str(run_id), "status": "running",
+                                         "launch_state": "launching"})
+    repo.request_cancellation(run_id, "stop")
+    assert ("eq", "launch_state", "launched") not in log and ("eq", "status", "running") in log
+    # A run no worker would finalize: refused, and no write is even attempted.
+    for launch_state, code in (("pending", "RUN_NOT_LAUNCHED"), ("launch_failed", "RUN_NOT_LAUNCHED"),
+                               ("launching", "RUN_LAUNCH_UNRESOLVED"),
+                               ("launch_unknown", "RUN_LAUNCH_UNRESOLVED")):
+        repo, log = _supabase_cancellation({"id": str(run_id), "status": "queued",
+                                             "launch_state": launch_state})
+        refused(code, repo.request_cancellation, run_id, "stop")
+        assert log == []
+    # The run moved between the read and the write: nothing matched, a conflict.
+    repo, _log = _supabase_cancellation({"id": str(run_id), "status": "queued",
+                                          "launch_state": "launched"}, rows=[])
+    refused("RUN_TRANSITION_CONFLICT", repo.request_cancellation, run_id, "stop")
+
+
+@pytest.mark.parametrize("posture,code", [
+    ({"launch_state": "launching"}, "UNLAUNCHED_RUN_WRONG_STATE"),
+    ({"launch_state": "launch_unknown"}, "UNLAUNCHED_RUN_WRONG_STATE"),
+    ({"launch_state": "launched"}, "UNLAUNCHED_RUN_WRONG_STATE"),
+    ({"status": "running", "worker_id": "worker-1"}, "UNLAUNCHED_RUN_WRONG_STATE"),
+    ({"lease_token": "t" * 64, "lease_expires_at": "2999-01-01T00:00:00+00:00"},
+     "UNLAUNCHED_RUN_CLAIMED"),
+    ({"started_at": "2026-09-23T00:00:00+00:00"}, "UNLAUNCHED_RUN_CLAIMED"),
+    ({"last_heartbeat_at": "2026-09-23T00:00:00+00:00"}, "UNLAUNCHED_RUN_TRACED"),
+])
+def test_retirement_refuses_anything_but_a_quiet_unclaimed_never_launched_run(
+        launcher, enabled, posture, code):
+    repo, plan = prepared()
+    run_id = _fail_the_launch(repo, plan, batch_ids(plan)[0])
+    repo.runs[run_id].update(posture)
+    _quiet(repo, run_id)
+    before = dict(repo.runs[run_id])
+    refused(code, _retire, repo, run_id)
+    assert repo.runs[run_id] == before
+    assert launcher.launched == []
+
+
+def test_retirement_refuses_a_run_with_an_execution_or_paid_work(launcher, enabled):
+    repo, plan = prepared()
+    run_id = _fail_the_launch(repo, plan, batch_ids(plan)[0])
+    repo.record_run_invocation(UUID(run_id), {"mode": "cloud_run", "execution": "exec-1"})
+    _quiet(repo, run_id)
+    refused("UNLAUNCHED_RUN_TRACED", _retire, repo, run_id)
+    assert repo.runs[run_id]["status"] == "queued"
+
+
+def test_a_worker_that_claims_first_keeps_the_run_and_a_retired_run_is_never_claimed(
+        launcher, enabled):
+    repo, plan = prepared()
+    first, second, _third = batch_ids(plan)
+    claimed = _fail_the_launch(repo, plan, first)
+    _quiet(repo, claimed)
+    repo.claim_run(UUID(claimed), "stray-worker")
+    refused("UNLAUNCHED_RUN_WRONG_STATE", _retire, repo, claimed)
+    assert (repo.runs[claimed]["status"], repo.runs[claimed]["worker_id"]) == (
+        "starting", "stray-worker")
+    # The other order: retired first, a late claim gets nothing.
+    repo2, plan2 = prepared()
+    retired = _fail_the_launch(repo2, plan2, batch_ids(plan2)[0])
+    _quiet(repo2, retired)
+    assert _retire(repo2, retired)["retired"] is True
+    refused("RUN_ALREADY_CLAIMED", repo2.claim_run, UUID(retired), "late-worker")
+    assert repo2.runs[retired]["status"] == "cancelled" and not repo2.runs[retired].get("worker_id")
+
+
+def test_an_operator_releases_a_stale_never_launched_batch_and_the_plan_continues(monkeypatch):
+    swarm_env(monkeypatch, **{CATALOG_EXECUTION_FLAG: "true", GOVERNMENT_READ_FLAG: "true",
+                              CATALOG_PROMOTION_FLAG: "false", BATCHES: "true",
+                              wsb.RUN_CANCELLATION_FLAG: "true",
+                              "MILO_RATE_LIMIT_RUN_CREATION_PROJECT": "1000"})
+    completions = FakeKimiCompletions()
+    patch_client(monkeypatch, completions)
+    repo, plan = prepared()
+    first = batch_ids(plan)[0]
+    held = _fail_the_launch(repo, plan, first, key="ui-stale-1")
+    revise(repo, plan)
+
+    # Revised past its batch: it can no longer be launched, nor cancelled, and
+    # it holds the plan.
+    progress = get_progress(repo, plan).json()
+    assert (progress["revision"], progress["live"]["run_id"], progress["live"]["revision"]) == (
+        2, held, 1)
+    controls = progress["controls"]
+    assert (controls["start"]["available"], controls["start"]["relaunch"],
+            controls["start"]["blocked_by"], controls["cancel"]["available"]) == (
+        False, False, "batch_running", False)
+    stale = post_start(repo, plan, first, key="ui-stale-1")
+    assert (stale.status_code, stale.json()["error"]["code"]) == (409, "WORK_SCOPE_STALE")
+    cancel = _cancel(repo, held)
+    assert (cancel.status_code, cancel.json()["error"]["code"]) == (409, "RUN_NOT_LAUNCHED")
+
+    # The operator's guarded retirement: never while anything could be in
+    # flight, never below the floor; then once, and idempotently.
+    refused("UNLAUNCHED_RUN_NOT_QUIET", _retire, repo, held)
+    refused("UNLAUNCHED_RUN_THRESHOLD_TOO_SHORT", _retire, repo, held, quiet=60)
+    _quiet(repo, held)
+    assert _retire(repo, held) == {"retired": True, "run_id": held, "status": "cancelled",
+                                   "previous_status": "queued"}
+    assert _retire(repo, held)["retired"] is False
+    assert (repo.runs[held]["status"], repo.runs[held]["error"]["code"]) == (
+        "cancelled", "RUN_NOT_LAUNCHED")
+    terminal = [e for e in repo.run_events if e["run_id"] == held and e["event_type"] == "run_cancelled"]
+    assert len(terminal) == 1 and terminal[0]["payload"] == {"code": "RUN_NOT_LAUNCHED"}
+    # A worker started for it anyway finds a terminal run and executes nothing.
+    assert worker_main.execute_run(UUID(held), repo) == 0
+    assert completions.calls == []
+
+    # Released: nothing started by itself. The head revision is prepared by the
+    # operator's capture job, and its first batch starts on a person's request.
+    progress = get_progress(repo, plan).json()
+    assert (progress["live"], progress["status"]) == (None, "not_prepared")
+    head = prepare_plan_head(repo, plan["work_scope_id"], user_id=str(USER))
+    assert head["revision"] == 2
+    head_plan = {**plan, "revision": head["revision"], "digest": head["digest"]}
+    next_batch = head["batches"][0]["id"]
+    assert get_progress(repo, plan).json()["controls"]["start"]["batch"]["batch_id"] == next_batch
+    inline = InlineWorkerLauncher(repo)
+    app.dependency_overrides[get_job_launcher] = lambda: inline
+    try:
+        continued = post_start(repo, head_plan, next_batch)
+        assert continued.status_code == 202, continued.text
+        assert continued.json()["created"] is True and continued.json()["run_id"] != held
+        assert inline.launches == [continued.json()["run_id"]] and inline.exit_codes == [0]
+        assert repo.runs[continued.json()["run_id"]]["status"] in {"completed", "partial_success"}
+        assert completions.calls, "the next batch did its work"
+    finally:
+        app.dependency_overrides.clear()
+    assert get_progress(repo, plan).json()["preparation"]["batches"]["settled"] == 1
+    assert repo.runs[held]["status"] == "cancelled"
 
 
 def test_the_seed_starts_through_the_same_service_path():

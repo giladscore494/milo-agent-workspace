@@ -40,7 +40,8 @@ from backend.catalog.payloads import (CANONICAL_VARIANT_KEY_FIELDS, prepare_cand
                                       prepare_evidence_link, prepare_promotion,
                                       prepare_raw_record, prepare_snapshot)
 from backend.errors import AppError, NotFoundError
-from backend.runtime import RUN_STATES, InvalidTransition, validate_transition
+from backend.runtime import (RUN_STATES, InvalidTransition, cancellation_refusal,
+                             validate_transition)
 from backend.schemas import normalize_conversation_title
 
 
@@ -403,6 +404,62 @@ class MemoryRepository:
             return {"reconciled": True, "run_id": rid, "status": run["status"],
                     "launch_state": target, "previous_launch_state": "launching"}
 
+    #: The only events the API writes about a run no worker was started for.
+    UNLAUNCHED_RUN_API_EVENTS = frozenset({"launch_failed", "cancellation_requested"})
+    UNLAUNCHED_RUN_MESSAGE = "No worker was ever started for this run; an operator retired it"
+
+    def retire_unlaunched_run(self, run_id: UUID, *, min_quiet_seconds: int,
+                              operator: str) -> dict[str, Any]:
+        """Mirrors `retire_unlaunched_run`: an operator's guarded retirement of a
+        run whose launch is KNOWN not to have started a worker (`pending`,
+        `launch_failed`), proven unclaimed, untraced and quiet. It ends the run
+        as the canonical finalizer ends a cancellation -- the terminal state and
+        its `run_cancelled` event together -- and never launches anything."""
+        if not isinstance(operator, str) or not operator.strip() or len(operator) > 200:
+            raise AppError("UNLAUNCHED_RUN_INVALID", "invalid retirement", 422)
+        if not isinstance(min_quiet_seconds, int) or isinstance(min_quiet_seconds, bool) \
+                or min_quiet_seconds < self.LOST_LAUNCH_MIN_QUIET_SECONDS:
+            raise AppError("UNLAUNCHED_RUN_THRESHOLD_TOO_SHORT",
+                           "a run is never retired sooner than the floor", 422)
+        with self.lock:
+            run = self.runs.get(str(run_id))
+            if run is None:
+                raise NotFoundError("run", str(run_id))
+            if run["status"] == "cancelled" and (run.get("error") or {}).get("code") == "RUN_NOT_LAUNCHED":
+                return {"retired": False, "run_id": run["id"], "status": run["status"]}
+            if run["status"] not in {"queued", "cancellation_requested"} \
+                    or run.get("launch_state") not in {"pending", "launch_failed"}:
+                raise AppError("UNLAUNCHED_RUN_WRONG_STATE", "the run's launch is not known to have failed", 409)
+            if any(run.get(field) for field in ("worker_id", "lease_token", "lease_expires_at",
+                                                "started_at", "finished_at")):
+                raise AppError("UNLAUNCHED_RUN_CLAIMED", "a worker claimed the run", 409)
+            rid = run["id"]
+            traced = (any(row.get("run_id") == rid for row in self.invocations)
+                      or any(row.get("run_id") == rid for row in self.checkpoints)
+                      or bool(run.get("last_heartbeat_at"))
+                      or any(row.get("run_id") == rid for row in getattr(self, "usage_ledger", []))
+                      or rid in self.__dict__.get("run_usage_ledgers", {})
+                      or any(event["run_id"] == rid
+                             and event["event_type"] not in self.UNLAUNCHED_RUN_API_EVENTS
+                             for event in self.run_events))
+            if traced:
+                raise AppError("UNLAUNCHED_RUN_TRACED", "more than the API wrote about the run", 409)
+            quiet_since = datetime.fromisoformat(str(run.get("updated_at") or run["created_at"]))
+            if quiet_since > datetime.now(UTC) - timedelta(seconds=min_quiet_seconds):
+                raise AppError("UNLAUNCHED_RUN_NOT_QUIET", "the run changed too recently", 409)
+            previous = run["status"]
+            now = _now()
+            if previous == "queued":
+                run.update(status="cancellation_requested", cancellation_requested_at=now,
+                           cancellation_reason="retired by an operator: no worker was ever started",
+                           updated_at=now)
+            run.update(status="cancelled", finished_at=now, updated_at=now,
+                       error={"code": "RUN_NOT_LAUNCHED", "message": self.UNLAUNCHED_RUN_MESSAGE})
+            self.append_run_event(UUID(rid), "run_cancelled", {
+                "message": self.UNLAUNCHED_RUN_MESSAGE, "payload": {"code": "RUN_NOT_LAUNCHED"}})
+            return {"retired": True, "run_id": rid, "status": "cancelled",
+                    "previous_status": previous}
+
     def get_run(self, run_id: UUID, user_id: UUID | None = None) -> dict[str, Any]:
         run = self.runs.get(str(run_id))
         if run is None:
@@ -547,7 +604,19 @@ class MemoryRepository:
             return dict(run)
 
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=_now(), cancellation_reason=reason)
+        """Parity with the Supabase compare-and-set: a cancellation is accepted
+        only for a run a worker will finalize, decided under the same lock as
+        the write."""
+        with self.lock:
+            run = self.runs.get(str(run_id))
+            if run is None:
+                raise NotFoundError("run", str(run_id))
+            refusal = cancellation_refusal(run["status"], run.get("launch_state"))
+            if refusal is not None:
+                raise AppError(refusal, "a cancellation of this run could never be finalized", 409)
+            return self.transition_run(run_id, "cancellation_requested",
+                                       cancellation_requested_at=_now(),
+                                       cancellation_reason=reason)
 
     def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         return self.transition_run(run_id, "failed", expected_worker_id=worker_id, expected_attempt=attempt, expected_lease_token=lease_token, error={"code": code, "message": message}, finished_at=_now())

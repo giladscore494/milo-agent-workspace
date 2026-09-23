@@ -119,6 +119,10 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
 
   // Run and proposal lifecycle.
   ['RUN_ALREADY_FINISHED', 'That run has already finished.'],
+  // A cancellation is finished by the run's worker; these two runs have none
+  // that is known to exist, so nothing was changed.
+  ['RUN_NOT_LAUNCHED', 'This run never started, so there is nothing to cancel yet. Start it again, or ask an operator to retire it.'],
+  ['RUN_LAUNCH_UNRESOLVED', 'It is not yet known whether this run started, so it cannot be cancelled until an operator has checked it.'],
   ['PROPOSAL_NOT_APPROVABLE', 'This proposal cannot be approved in its current state.'],
   ['PROPOSAL_NOT_APPROVED', 'This proposal has not been approved.'],
 

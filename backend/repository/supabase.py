@@ -9,7 +9,8 @@ from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
                                       prepare_snapshot)
 from backend.config import Settings
 from backend.errors import AppError, NotFoundError
-from backend.runtime import RUN_STATES, TERMINAL_STATES, InvalidTransition, validate_transition
+from backend.runtime import (CLAIMED_RUN_STATES, RUN_STATES, TERMINAL_STATES, InvalidTransition,
+                             cancellation_refusal, validate_transition)
 from backend.schemas import normalize_conversation_title
 
 
@@ -772,7 +773,41 @@ class SupabaseRepository:
         }, "run")
 
     def request_cancellation(self, run_id: UUID, reason: str | None = None) -> dict[str, Any]:
-        return self.transition_run(run_id, "cancellation_requested", cancellation_requested_at=datetime.now(UTC).isoformat(), cancellation_reason=reason)
+        """Request cancellation of a run a worker will finalize -- and only of one.
+
+        The request is a compare-and-set the DATABASE evaluates in the same
+        statement as the write: on the status that was read and, for a run no
+        worker has claimed yet, on its launch being recorded `launched`. A run
+        whose launch never happened or is unresolved is refused
+        (`cancellation_refusal`), and a run that moved between the read and the
+        write matches nothing and is a conflict. So no request can rest at
+        `cancellation_requested` with nobody to finalize it.
+        """
+        run = self.get_run(run_id)
+        status = str(run.get("status") or "")
+        refusal = cancellation_refusal(status, run.get("launch_state"))
+        if refusal is not None:
+            raise AppError(refusal, "a cancellation of this run could never be finalized", 409)
+        try:
+            validate_transition(status, "cancellation_requested")
+        except InvalidTransition as exc:
+            raise AppError("INVALID_RUN_TRANSITION", str(exc), 409) from exc
+        query = (self.client.table("runs")
+                 .update({"status": "cancellation_requested",
+                          "cancellation_requested_at": datetime.now(UTC).isoformat(),
+                          "cancellation_reason": reason})
+                 .eq("id", str(run_id)).eq("status", status))
+        if status not in CLAIMED_RUN_STATES:
+            # No worker holds it yet: only a launch that started one may be
+            # cancelled, and the database checks that at the moment of writing.
+            query = query.eq("launch_state", "launched")
+        try:
+            rows = query.select("*").execute().data or []
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", str(exc), 502) from exc
+        if not rows:
+            raise AppError("RUN_TRANSITION_CONFLICT", "run was modified concurrently", 409)
+        return rows[0] if isinstance(rows, list) else rows
 
     def mark_run_failed(self, run_id: UUID, code: str, message: str, worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         raise AppError(

@@ -352,11 +352,16 @@ its candidates, and unbound runs behave exactly as before.
   that batch running (it is shown as belonging to its revision); the new head
   starts nothing until the operator has prepared it.
 - **A batch no worker was started for** (its launch never happened or
-  definitely failed) is launched again as the same run, never cancelled from
-  the Mapping Plan: nothing would finalize the cancellation of a run no worker
-  claims, so it would stay `cancellation_requested` and hold the plan. Known
-  gap: when the plan was revised past such a batch it can be neither launched
-  (stale) nor finalized, and it holds the plan until an operator resolves it.
+  definitely failed) is launched again as the same run, never cancelled: nothing
+  would finalize the cancellation of a run no worker claims, so it would stay
+  `cancellation_requested` and hold the plan. The generic run cancellation
+  refuses it too (`RUN_NOT_LAUNCHED`), in the route and in the database write.
+  When the plan was revised past such a batch it can no longer be launched
+  (stale): an operator releases it with `reconcile-launch-unknown.sh
+  --resolution retire-not-launched`, which proves no worker, no lease, no
+  execution and no paid work, and ends the run `cancelled` (`RUN_NOT_LAUNCHED`)
+  with its terminal event. The batch becomes `interrupted`, and the plan
+  continues when a person starts the next batch of the prepared head revision.
 - **An unresolved launch** is never cancelled from the Mapping Plan either.
   Cancel is offered only for a run a worker will finalize: one a worker has
   claimed, or a queued run whose launch is recorded as `launched`. A queued

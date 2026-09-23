@@ -14,6 +14,11 @@ ONE run, never launches anything, refuses a run whose worker holds a lease, and
 writes an audit record only after the database reports that exactly that run
 changed. `launch_unknown` keeps its own guarded updates, unchanged.
 
+The same tool's `retire-not-launched` releases a run no worker was ever started
+for (`pending` / `launch_failed`) that cannot be launched again -- a Mapping
+Plan batch the plan was revised past -- through `public.retire_unlaunched_run`,
+under the same guard, one call and one audit record.
+
 The mocks are strict: any command they do not recognise fails loudly.
 """
 
@@ -67,6 +72,13 @@ case "$sql" in
   *"launch_state = 'launch_unknown'"*) printf '%s\n' "${MOCK_LIST_UNKNOWN-}";;
   *"status = 'queued' and launch_state = 'launching' and updated_at <="*)
     printf '%s\n' "${MOCK_LIST_LOST-}";;
+  *"launch_state in ('pending', 'launch_failed') and updated_at <="*)
+    printf '%s\n' "${MOCK_LIST_NEVER-}";;
+  *"public.retire_unlaunched_run("*)
+    if [[ -n "${MOCK_RETIRE_ERROR:-}" ]]; then
+      printf 'ERROR:  %s\n' "$MOCK_RETIRE_ERROR" >&2; exit 3
+    fi
+    printf '%s\n' "${MOCK_RETIRE_OUT:-true|queued|cancelled}";;
   *) printf 'MOCK-UNAUTHORIZED psql: %s\n' "$sql" >&2; exit 98;;
 esac
 """
@@ -278,3 +290,118 @@ def test_launch_unknown_keeps_its_own_guarded_update(tooling):
     assert len(update) == 1 and "launch_state = 'launch_unknown'" in update[0]
     audit = tooling.audit.read_text()
     assert "prev_launch_state=launch_unknown" in audit and "min_quiet_seconds" not in audit
+
+
+# ---------------------------------------------------------------------------
+# retire-not-launched: a run no worker was ever started for
+# ---------------------------------------------------------------------------
+
+def retirements(tooling) -> list[str]:
+    return [block for block in tooling.sql_log.read_text().split("----\n")
+            if "public.retire_unlaunched_run(" in block]
+
+
+def test_never_launched_runs_are_listed_read_only(tooling):
+    never = f"{RUN} | 2026-09-23 | status=queued | launch_state=launch_failed | quiet_for=4000s"
+    result = tooling("--database-url-env", "MILO_DB", MOCK_LIST_NEVER=never)
+    assert_strict(result)
+    assert result.returncode == 0, result.stdout
+    assert "[WARN] list:never-launched" in result.stdout and never in result.stdout
+    sql = tooling.sql_log.read_text()
+    assert "public.retire_unlaunched_run(" not in sql
+    assert "update " not in sql.lower() and "insert " not in sql.lower()
+
+
+def test_retire_not_launched_is_one_guarded_call_audited_only_after_success(tooling):
+    result = tooling(*apply_args(tooling, "retire-not-launched", "--min-quiet-seconds", "2700"),
+                     MILO_OPERATOR_ACK=ACK, MOCK_READ="launch_failed|queued|none",
+                     MOCK_RETIRE_OUT="true|queued|cancelled")
+    assert_strict(result)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[PASS] apply:retire-not-launched" in result.stdout
+    assert "nothing was launched" in result.stdout
+    calls = [line for line in tooling.log.read_text().splitlines()
+             if line.startswith("psql") and "quiet=2700" in line and "operator=" in line]
+    assert len(calls) == 1 and f"run_id={RUN}" in calls[0] and f"operator={ACCOUNT}" in calls[0]
+    (sql,) = retirements(tooling)
+    assert "public.retire_unlaunched_run(:'run_id'::uuid, :'quiet'::integer, :'operator')" in sql
+    # Never the launch_unknown path's blind update, never a lost-launch decision.
+    assert "with upd as (update" not in tooling.sql_log.read_text()
+    assert decisions(tooling) == []
+    audit = tooling.audit.read_text()
+    for field in (f"run={RUN}", "resolution=retire-not-launched", "prev_launch_state=launch_failed",
+                  "prev_status=queued", "new_status=cancelled", f"operator={ACCOUNT}",
+                  "min_quiet_seconds=2700"):
+        assert field in audit
+    gcloud = [line for line in tooling.log.read_text().splitlines() if line.startswith("gcloud")]
+    assert gcloud and all("config get-value" in line for line in gcloud)
+
+
+def test_retire_not_launched_refuses_a_leased_run_before_any_call(tooling):
+    result = tooling(*apply_args(tooling, "retire-not-launched"), MILO_OPERATOR_ACK=ACK,
+                     MOCK_READ="launch_failed|queued|active")
+    assert_strict(result)
+    assert result.returncode != 0
+    assert "[BLOCKED] apply:lease" in result.stdout
+    assert retirements(tooling) == [] and not tooling.audit.exists()
+
+
+@pytest.mark.parametrize("code", ["UNLAUNCHED_RUN_WRONG_STATE", "UNLAUNCHED_RUN_CLAIMED",
+                                  "UNLAUNCHED_RUN_TRACED", "UNLAUNCHED_RUN_NOT_QUIET",
+                                  "UNLAUNCHED_RUN_NOT_FOUND", "UNLAUNCHED_RUN_CHANGED"])
+def test_a_refused_retirement_is_blocked_and_never_audited(tooling, code):
+    result = tooling(*apply_args(tooling, "retire-not-launched"), MILO_OPERATOR_ACK=ACK,
+                     MOCK_READ="launch_failed|queued|none", MOCK_RETIRE_ERROR=code)
+    assert_strict(result)
+    assert result.returncode != 0
+    assert "[BLOCKED] apply:refused" in result.stdout and code in result.stdout
+    assert not tooling.audit.exists()
+
+
+def test_a_repeated_retirement_is_an_idempotent_no_op(tooling):
+    result = tooling(*apply_args(tooling, "retire-not-launched"), MILO_OPERATOR_ACK=ACK,
+                     MOCK_READ="launch_failed|cancelled|none", MOCK_RETIRE_OUT="false||cancelled")
+    assert result.returncode == 0, result.stdout
+    assert "[NOT_APPLICABLE] apply:retire-not-launched" in result.stdout
+    assert not tooling.audit.exists()
+
+
+@pytest.mark.parametrize("answer", ["true|queued|queued", "true|running|cancelled", "garbage"])
+def test_an_unexpected_retirement_answer_fails_closed(tooling, answer):
+    result = tooling(*apply_args(tooling, "retire-not-launched"), MILO_OPERATOR_ACK=ACK,
+                     MOCK_READ="launch_failed|queued|none", MOCK_RETIRE_OUT=answer)
+    assert result.returncode != 0
+    assert "[BLOCKED] apply:retire-not-launched" in result.stdout
+    assert not tooling.audit.exists()
+
+
+@pytest.mark.parametrize("drop,blocked", [
+    ("--confirm-production-change", "apply-guard:confirm"),
+    ("--environment", "apply-guard:environment"),
+    ("--expected-account", "apply-guard:expected-account"),
+    ("ack", "apply-guard:ack"),
+    ("--run-id", "apply:run-id"),
+])
+def test_no_retirement_without_the_operator_s_full_authorization(tooling, drop, blocked):
+    args = apply_args(tooling, "retire-not-launched")
+    env = {"MILO_OPERATOR_ACK": ACK}
+    if drop == "ack":
+        env = {}
+    else:
+        index = args.index(drop)
+        del args[index:index + (1 if drop == "--confirm-production-change" else 2)]
+    result = tooling(*args, **env, MOCK_READ="launch_failed|queued|none")
+    assert_strict(result)
+    assert result.returncode != 0
+    assert f"[BLOCKED] {blocked}" in result.stdout, result.stdout
+    assert retirements(tooling) == [] and not tooling.audit.exists()
+
+
+def test_no_retirement_by_an_identity_other_than_the_named_operator(tooling):
+    result = tooling(*apply_args(tooling, "retire-not-launched"), MILO_OPERATOR_ACK=ACK,
+                     MOCK_READ="launch_failed|queued|none",
+                     MOCK_GCLOUD_ACCOUNT="someone-else@milo-prod.iam.gserviceaccount.com")
+    assert_strict(result)
+    assert result.returncode != 0
+    assert "[BLOCKED] apply-guard:account" in result.stdout
+    assert retirements(tooling) == [] and not tooling.audit.exists()

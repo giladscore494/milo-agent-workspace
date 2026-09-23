@@ -255,14 +255,31 @@ def test_replay_while_launch_in_flight_does_not_double_launch(env):
     assert len(launcher.launched) == 1
 
 
-def test_cancelled_before_launch_is_not_launched(env):
+def test_a_run_whose_launch_failed_is_not_cancelled_into_a_request_nobody_finishes(env):
     repo, launcher = env
     launcher.failures = 1
     failed_launch = create_run(repo)
     assert failed_launch.status_code == 502
     run_id = next(iter(repo.runs))
-    TestClient(app).post(f"/runs/{run_id}/cancel", json={"reason": "changed my mind"}, headers=member(repo))
-    assert repo.runs[run_id]["status"] == "cancellation_requested"
+    refused = TestClient(app).post(f"/runs/{run_id}/cancel", json={"reason": "changed my mind"},
+                                   headers=member(repo))
+    # No worker was ever started, so nothing would finalize the cancellation:
+    # it is refused, and nothing is written.
+    assert (refused.status_code, refused.json()["error"]["code"]) == (409, "RUN_NOT_LAUNCHED")
+    assert (repo.runs[run_id]["status"], repo.runs[run_id]["launch_state"]) == (
+        "queued", "launch_failed")
+    assert not [e for e in repo.events if e["event_type"] == "cancellation_requested"]
+    assert launcher.launched == []
+
+
+def test_a_cancellation_already_requested_is_never_launched(env):
+    """A run that rests at `cancellation_requested` from before the guard
+    existed is still never launched by a replay."""
+    repo, launcher = env
+    launcher.failures = 1
+    assert create_run(repo).status_code == 502
+    run_id = next(iter(repo.runs))
+    repo.runs[run_id]["status"] = "cancellation_requested"
     replay = create_run(repo)
     assert replay.status_code == 202
     assert replay.json()["status"] == "cancellation_requested"

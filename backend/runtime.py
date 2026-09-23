@@ -58,6 +58,42 @@ def validate_transition(current: str, new: str) -> None:
     if new not in VALID_TRANSITIONS[current]:
         raise InvalidTransition(f"invalid run state transition {current!r} -> {new!r}")
 
+
+#: Statuses a worker holds: it observes a cancellation request and finalizes it.
+CLAIMED_RUN_STATES = frozenset({"starting", "running", "waiting"})
+#: Launch states in which a worker may or may not have been started.
+UNRESOLVED_LAUNCH_STATES = frozenset({"launching", "launch_unknown"})
+
+
+def cancellation_refusal(status: str | None, launch_state: str | None) -> str | None:
+    """Why a cancellation request for this run could never be finalized, or None.
+
+    A cancellation is only a REQUEST: the worker that holds the run observes it
+    and finalizes the run as `cancelled`. So a request is accepted only for a
+    run a worker will finalize -- one a worker has claimed, or one still queued
+    whose launch is recorded as having started a worker. Any other queued run
+    has no worker to finish the request, and would rest at
+    `cancellation_requested` for good:
+
+    * `RUN_LAUNCH_UNRESOLVED` -- whether a worker was started is not known
+      (`launching` with nothing recorded after it, `launch_unknown`); an
+      operator reconciles the launch first;
+    * `RUN_NOT_LAUNCHED` -- no worker was ever started (`pending`,
+      `launch_failed`), or the API never launches it (`none`, an operator
+      capture run); it is launched again, or an operator retires it.
+
+    Statuses outside that question (terminal, already `cancellation_requested`)
+    are the caller's to answer and return None here.
+    """
+    if status in CLAIMED_RUN_STATES or status not in ("queued", "launching"):
+        return None
+    if launch_state == "launched":
+        return None
+    if launch_state in UNRESOLVED_LAUNCH_STATES:
+        return "RUN_LAUNCH_UNRESOLVED"
+    return "RUN_NOT_LAUNCHED"
+
+
 @dataclass(frozen=True)
 class RunEventRecord:
     run_id: UUID

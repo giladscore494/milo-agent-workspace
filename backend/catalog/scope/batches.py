@@ -44,6 +44,7 @@ from uuid import UUID
 
 from backend.errors import AppError, NotFoundError
 from backend.execution_guard import is_stage_enabled
+from backend.runtime import CLAIMED_RUN_STATES, cancellation_refusal
 
 from . import directory as mdir
 from . import service as work_scopes
@@ -416,9 +417,10 @@ def _controls(view: Mapping[str, Any]) -> dict[str, Any]:
     # never launched, or a launch that is unresolved (`launching` with nothing
     # recorded after it, `launch_unknown`) -- would rest at
     # `cancellation_requested` with nobody to finish it, holding the plan.
-    finalizable = (live is not None and (
-        live["run_status"] in ("starting", "running", "waiting")
-        or (live["run_status"] == "queued" and live["launch_state"] == "launched")))
+    # The same rule the cancellation route and the database write enforce.
+    finalizable = (live is not None
+                   and live["run_status"] in ("queued", "launching", *CLAIMED_RUN_STATES)
+                   and cancellation_refusal(live["run_status"], live["launch_state"]) is None)
     # Only a batch of the HEAD revision can be named by a start: a stale
     # revision never launches, and the database refuses it too.
     relaunch = (unlaunched and live["revision"] == view["revision"]

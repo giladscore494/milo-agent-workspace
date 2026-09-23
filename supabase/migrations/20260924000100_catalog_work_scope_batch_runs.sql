@@ -18,6 +18,8 @@
 --                                   runs' own durable status and events
 --   reconcile_lost_launch()         an operator's guarded decision on a launch
 --                                   that was lost before any worker claimed it
+--   retire_unlaunched_run()         an operator's guarded retirement of a run no
+--                                   worker was ever started for
 --
 -- and it restates `bind_work_scope_batch_run` with the continuation rules below.
 --
@@ -823,7 +825,138 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 6. RLS and privileges: service-path only.
+-- 6. A run no worker was ever started for: retired by an operator.
+-- ---------------------------------------------------------------------------
+--
+-- A queued run whose launch never happened (`pending`) or definitely failed
+-- (`launch_failed`, including a lost launch an operator reconciled as not
+-- launched) has no worker, and none is started unless it is launched again. At
+-- the plan's head revision the Mapping Plan launches it again as the same run.
+-- Once the plan is revised past its batch it can never be launched (a stale
+-- revision never launches), nothing finalizes it, and a cancellation request
+-- is refused for exactly that reason -- so it holds the plan, and its
+-- requester's and project's run slot, for good.
+--
+-- `retire_unlaunched_run` is the operator's guarded way out, and it never
+-- guesses. Under the run's row lock it requires:
+--
+--   * a launch KNOWN not to have started a worker: `pending` or
+--     `launch_failed`, with the run `queued` (or `cancellation_requested`, a
+--     request no worker will ever finish). Never `launching` or
+--     `launch_unknown` -- an operator reconciles those first -- and never
+--     `launched`;
+--   * that no worker ever claimed it: no worker, no lease, never started;
+--   * that no execution or paid work exists for it: no launcher record, no
+--     checkpoint, heartbeat, usage, reservation or blackboard row, and no event
+--     beyond the API's own `launch_failed` / `cancellation_requested`;
+--   * the row quiet for at least the caller's threshold, never under 15
+--     minutes.
+--
+-- It then ends the run the way the canonical finalizer (`finalize_run_guarded`,
+-- migration 20260920000200) ends a cancellation: through the supported
+-- transitions queued -> cancellation_requested -> cancelled, each re-guarded,
+-- with the terminal state and its `run_cancelled` event in ONE transaction. The
+-- run's error and the event carry the same static code, `RUN_NOT_LAUNCHED`, and
+-- no ProductOutcome, because there is no product. A terminal run can never be
+-- claimed, so a worker started for it anyway exits without executing. Nothing
+-- is relaunched: a batch it held becomes `interrupted`, and the plan continues
+-- only when a person starts its next batch.
+create or replace function public.retire_unlaunched_run(
+  p_run_id uuid,
+  p_min_quiet_seconds integer,
+  p_operator text
+) returns jsonb
+language plpgsql
+set search_path = pg_catalog
+as $$
+declare
+  v_run public.runs;
+  v_rows integer;
+  -- The shortest quiet period ever accepted, whatever the caller asks for.
+  v_floor constant integer := 900;
+  v_message constant text := 'No worker was ever started for this run; an operator retired it';
+begin
+  if p_run_id is null or p_operator is null or btrim(p_operator) = ''
+     or char_length(p_operator) > 200 then
+    raise exception 'UNLAUNCHED_RUN_INVALID' using errcode = '22023';
+  end if;
+  if p_min_quiet_seconds is null or p_min_quiet_seconds < v_floor then
+    raise exception 'UNLAUNCHED_RUN_THRESHOLD_TOO_SHORT' using errcode = '22023';
+  end if;
+
+  select * into v_run from public.runs where id = p_run_id for update;
+  if v_run.id is null then
+    raise exception 'UNLAUNCHED_RUN_NOT_FOUND' using errcode = 'P0002';
+  end if;
+  -- Already retired this way: the same answer, and nothing written again.
+  if v_run.status = 'cancelled' and v_run.error->>'code' = 'RUN_NOT_LAUNCHED' then
+    return jsonb_build_object('retired', false, 'run_id', v_run.id, 'status', v_run.status);
+  end if;
+  -- A launch known not to have started a worker, and only that.
+  if v_run.status not in ('queued', 'cancellation_requested')
+     or v_run.launch_state not in ('pending', 'launch_failed') then
+    raise exception 'UNLAUNCHED_RUN_WRONG_STATE' using errcode = '55000';
+  end if;
+  -- No worker ever claimed it, and no lease is held.
+  if v_run.worker_id is not null or v_run.lease_token is not null
+     or v_run.lease_expires_at is not null or v_run.started_at is not null
+     or v_run.finished_at is not null then
+    raise exception 'UNLAUNCHED_RUN_CLAIMED' using errcode = '55000';
+  end if;
+  -- No execution and no paid work: nothing but the API ever wrote about it.
+  if exists (select 1 from public.run_invocations where run_id = v_run.id)
+     or exists (select 1 from public.run_checkpoints where run_id = v_run.id)
+     or exists (select 1 from public.worker_heartbeats where run_id = v_run.id)
+     or exists (select 1 from public.run_usage_ledger where run_id = v_run.id)
+     or exists (select 1 from public.model_call_budget_reservations where run_id = v_run.id)
+     or exists (select 1 from public.run_blackboards where run_id = v_run.id)
+     or exists (select 1 from public.run_events e
+                 where e.run_id = v_run.id
+                   and e.event_type not in ('launch_failed', 'cancellation_requested')) then
+    raise exception 'UNLAUNCHED_RUN_TRACED' using errcode = '55000';
+  end if;
+  -- Quiet for long enough that no request about it can still be in flight.
+  if v_run.updated_at > now() - make_interval(secs => p_min_quiet_seconds) then
+    raise exception 'UNLAUNCHED_RUN_NOT_QUIET' using errcode = '55000';
+  end if;
+
+  -- The supported transitions, each re-guarded on the never-launched posture.
+  if v_run.status = 'queued' then
+    update public.runs
+       set status = 'cancellation_requested',
+           cancellation_requested_at = now(),
+           cancellation_reason = 'retired by an operator: no worker was ever started'
+     where id = v_run.id and status = 'queued'
+       and launch_state in ('pending', 'launch_failed')
+       and worker_id is null and lease_token is null and started_at is null;
+    get diagnostics v_rows = row_count;
+    if v_rows <> 1 then
+      raise exception 'UNLAUNCHED_RUN_CHANGED' using errcode = '40001';
+    end if;
+  end if;
+  update public.runs
+     set status = 'cancelled',
+         error = jsonb_build_object('code', 'RUN_NOT_LAUNCHED', 'message', v_message),
+         finished_at = now()
+   where id = v_run.id and status = 'cancellation_requested'
+     and launch_state in ('pending', 'launch_failed')
+     and worker_id is null and lease_token is null and started_at is null;
+  get diagnostics v_rows = row_count;
+  if v_rows <> 1 then
+    raise exception 'UNLAUNCHED_RUN_CHANGED' using errcode = '40001';
+  end if;
+  -- The terminal event, in the same transaction, shaped as the canonical
+  -- finalizer shapes a cancellation's: its message and the static code. Who
+  -- decided is in the operator's audit record, not in a member-readable event.
+  insert into public.run_events (run_id, event_type, message, payload)
+  values (v_run.id, 'run_cancelled', v_message, jsonb_build_object('code', 'RUN_NOT_LAUNCHED'));
+  return jsonb_build_object('retired', true, 'run_id', v_run.id, 'status', 'cancelled',
+                            'previous_status', v_run.status);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 7. RLS and privileges: service-path only.
 -- ---------------------------------------------------------------------------
 alter table public.catalog_work_scope_controls enable row level security;
 
@@ -837,7 +970,8 @@ begin
     'public.bind_work_scope_batch_run(uuid,uuid,integer,text,uuid)',
     'public.create_work_scope_batch_run(uuid,uuid,integer,text,uuid,jsonb,text,jsonb,uuid,text,text,integer,integer)',
     'public.work_scope_progress(uuid)',
-    'public.reconcile_lost_launch(uuid,text,integer,text)'
+    'public.reconcile_lost_launch(uuid,text,integer,text)',
+    'public.retire_unlaunched_run(uuid,integer,text)'
   ] loop
     execute format('revoke execute on function %s from public', fn);
     if exists (select 1 from pg_roles where rolname='anon') then

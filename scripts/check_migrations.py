@@ -130,6 +130,12 @@ REQUIRED_PER_FILE["20260924000100_catalog_work_scope_batch_runs.sql"] = [
     "raise exception 'lost_launch_claimed'",
     "raise exception 'lost_launch_not_quiet'",
     "raise exception 'lost_launch_traced'",
+    # A run no worker was ever started for is retired only by an operator's
+    # guarded decision, with its terminal event, never while anything ran.
+    "create or replace function public.retire_unlaunched_run(",
+    "raise exception 'unlaunched_run_claimed'",
+    "raise exception 'unlaunched_run_traced'",
+    "'run_cancelled', v_message, jsonb_build_object('code', 'run_not_launched')",
 ]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the

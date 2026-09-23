@@ -60,7 +60,7 @@ from backend.run_identity import (
     execution_identity_problems,
     require_identity,
 )
-from backend.runtime import TERMINAL_STATES
+from backend.runtime import TERMINAL_STATES, cancellation_refusal
 from backend.finalization import RunFinalizer, TerminalClaim
 from backend.vehicle_catalog_scope import (SCOPE_METADATA_KEY, VehicleCatalogScopeError,
                                            refuse_supplied_scope,
@@ -171,6 +171,14 @@ def _catalog_page_meta(page: catalog_review.CatalogPage) -> CatalogPageMeta:
 
 #: The events the canonical finalizer writes atomically with a terminal status.
 TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_partial_success", "run_failed", "run_cancelled"})
+
+#: Why a cancellation request is refused, in static words (never run data).
+CANCELLATION_REFUSALS = {
+    "RUN_NOT_LAUNCHED": "no worker was ever started for this run, so nothing would finalize a "
+                        "cancellation; launch it again, or an operator retires it",
+    "RUN_LAUNCH_UNRESOLVED": "whether a worker was started for this run is not known; an operator "
+                             "reconciles its launch before it can be cancelled",
+}
 
 #: "Not supplied": lets a history page hand pre-fetched limits and terminal
 #: events to the projection instead of re-reading them per row.
@@ -841,6 +849,13 @@ def cancel_run(run_id: UUID, request: RunCancelRequest, user: AuthenticatedUser 
         return RunCancelResponse(run_id=run["id"], status=status)
     if status in TERMINAL_STATES:
         raise AppError("RUN_ALREADY_FINISHED", f"run is already {status} and cannot be cancelled", 409)
+    # A cancellation is a request the run's worker finalizes. A run no worker
+    # was started for, or whose launch is unresolved, has nobody to finalize
+    # it: it would rest at `cancellation_requested` for good. Refused here, and
+    # again by the database write itself (`request_cancellation`).
+    refusal = cancellation_refusal(status, run.get("launch_state"))
+    if refusal is not None:
+        raise AppError(refusal, CANCELLATION_REFUSALS[refusal], 409)
     run = repo.request_cancellation(run_id, request.reason)
     repo.append_run_event(run_id, "cancellation_requested", {"message": request.reason or "Cancellation requested", "payload": {"reason": request.reason, "requested_by": str(user.user_id)}})
     return RunCancelResponse(run_id=run["id"], status=run["status"])

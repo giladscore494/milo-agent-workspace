@@ -53,6 +53,33 @@ launch compare-and-set, by a person (the Mapping Plan's "Launch batch", or a
 replay of the original request) or after the tool's `requeue`. At most one
 worker ever executes a run: `claim_run_lease` grants one live lease.
 
+A **never-launched run** (`pending` or `launch_failed`: no worker was ever
+started) can be launched again as the same run. When it cannot -- its Mapping
+Plan was revised past its batch, and a stale revision never launches -- it
+would hold the plan and its requester's run slot for good. The same tool's
+`retire-not-launched` decision releases it: `public.retire_unlaunched_run`
+proves under the run's row lock that the launch is known not to have started a
+worker (never `launching` or `launch_unknown`: those are reconciled first),
+that no worker ever claimed it and no lease is held, that no execution or paid
+work exists for it, and that it has been quiet for the threshold. It then ends
+the run the way the canonical finalizer ends a cancellation: `cancelled`
+(`RUN_NOT_LAUNCHED`) and its `run_cancelled` event in one transaction. Nothing
+is relaunched; a batch it held becomes `interrupted`.
+
+## Cancellation
+
+A cancellation is a request the run's worker finalizes. `POST
+/runs/{id}/cancel` accepts it only for a run a worker will finalize: one a
+worker has claimed (`starting`, `running`, `waiting`), or a `queued` run whose
+launch is recorded as `launched`. Anything else is refused with nothing
+written -- `RUN_NOT_LAUNCHED` (no worker was ever started: launch it again, or
+an operator retires it) or `RUN_LAUNCH_UNRESOLVED` (an operator reconciles the
+launch first). The route checks it, and the database write itself re-checks it:
+`request_cancellation` is a compare-and-set on the status read and, for an
+unclaimed run, on `launch_state = 'launched'`, evaluated in the same statement
+as the write (`backend/runtime.py::cancellation_refusal` is the one rule; the
+Mapping Plan's Cancel control uses it too).
+
 ## Worker leases
 
 `claim_run_lease` (migration `012`) atomically assigns worker id, attempt

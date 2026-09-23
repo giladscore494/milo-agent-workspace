@@ -225,6 +225,15 @@ wrote about the run -- `launch_failed`, the existing requeue path, with one
 `launch_unknown`, which keeps the tool's own guarded updates. No API or worker
 path calls it.
 
+A second writer to `runs`, `retire_unlaunched_run`, is an operator's guarded
+retirement of a run no worker was ever started for (`pending` /
+`launch_failed`), called only by the same tool's `retire-not-launched`. Only
+after proving, under the row lock, no worker, no lease, no execution or paid
+work and a quiet row does it end the run through queued ->
+cancellation_requested -> cancelled with its `run_cancelled` event, in one
+transaction, as the canonical finalizer ends a cancellation. It never touches
+an uncertain launch and never relaunches anything.
+
 Privileges: the new relation has RLS on with no policies; `PUBLIC`, `anon` and
 `authenticated` have nothing; `service_role` gets `SELECT, INSERT` and neither
 `UPDATE` nor `DELETE`, and the append-only trigger refuses both to every role.
