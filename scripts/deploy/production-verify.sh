@@ -141,6 +141,15 @@ env_format() {
     printf 'value(spec.template.spec.template.spec.containers[0].env.filter("name:%s").extract("value"))' "$2"
   fi
 }
+release_sha_value() {
+  # gcloud's value() format may wrap a string in single or double quotes.
+  # Accept only the exact expected SHA (possibly quoted), never a substring.
+  local value="$1"
+  case "$value" in
+    "$EXPECTED_SHA" | "'$EXPECTED_SHA'" | "\"$EXPECTED_SHA\"") printf '%s' "$EXPECTED_SHA" ;;
+    *) printf '%s' "$value" ;;
+  esac
+}
 
 if ! command -v gcloud > /dev/null 2>&1; then
   fact CODE_DEPLOYED UNVERIFIED "gcloud is unavailable"
@@ -148,8 +157,8 @@ elif ! API_IMAGE="$(describe_value service 'value(spec.template.spec.containers[
      || ! WORKER_IMAGE="$(describe_value job 'value(spec.template.spec.template.spec.containers[0].image)')"; then
   fact CODE_DEPLOYED UNVERIFIED "the API service or the worker job could not be described"
 else
-  API_RELEASE="$(describe_value service "$(env_format service MILO_RELEASE_SHA)" | tr -d '[]' || true)"
-  WORKER_RELEASE="$(describe_value job "$(env_format job MILO_RELEASE_SHA)" | tr -d '[]' || true)"
+  API_RELEASE="$(release_sha_value "$(describe_value service "$(env_format service MILO_RELEASE_SHA)" | tr -d '[]' || true)")"
+  WORKER_RELEASE="$(release_sha_value "$(describe_value job "$(env_format job MILO_RELEASE_SHA)" | tr -d '[]' || true)")"
   printf 'DEPLOYED_API_IMAGE=%s\nDEPLOYED_WORKER_IMAGE=%s\n' "${API_IMAGE:-<none>}" "${WORKER_IMAGE:-<none>}"
   printf 'API_MILO_RELEASE_SHA=%s\nWORKER_MILO_RELEASE_SHA=%s\n' "${API_RELEASE:-<unset>}" "${WORKER_RELEASE:-<unset>}"
   problems=""
