@@ -832,7 +832,8 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
                     execution_stdout: str = "test-capture-execution-1\n",
                     execution_exit: int = 0, document: dict | None = None,
                     psql: str | None = None, env: dict[str, str] | None = None,
-                    job_image: str | None = None, image_exit: int = 0):
+                    job_image: str | None = None, image_exit: int = 0,
+                    execution_result: str = "succeeded"):
     """Run the capture script as an operator would, with stand-ins on PATH.
 
     `gcloud` puts the mock gcloud first on PATH. `psql`, when given, is the
@@ -877,12 +878,34 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
             "            and argv[i + 1].startswith('-') and token in ('--args', '--command'):\n"
             "        sys.stderr.write('ERROR: (gcloud) argument %s: expected one argument\\n' % token)\n"
             "        sys.exit(2)\n"
+            "results = os.environ['MOCK_GCLOUD_EXECUTION_RESULT'].split(',')\n"
             "if sys.argv[1:4] == ['run', 'jobs', 'execute']:\n"
+            "    # Like real gcloud: --wait answers only for an execution that\n"
+            "    # SUCCEEDED; a failed one prints no name and exits 1. --async\n"
+            "    # answers with the execution the moment it exists.\n"
+            "    if '--wait' in argv and results[-1] != 'succeeded':\n"
+            "        sys.stderr.write('ERROR: (gcloud.run.jobs.execute) The execution failed.\\n')\n"
+            "        sys.exit(1)\n"
             "    sys.stdout.write(os.environ['MOCK_GCLOUD_EXECUTION_STDOUT'])\n"
             "    sys.stdout.flush()\n"
             "    sys.stderr.write(os.environ['MOCK_GCLOUD_ADVISORY'] + '\\n')\n"
             "    sys.stderr.flush()\n"
             "    sys.exit(int(os.environ['MOCK_GCLOUD_EXECUTION_EXIT']))\n"
+            "elif sys.argv[1:5] == ['run', 'jobs', 'executions', 'describe']:\n"
+            "    # One answer per call, the last one repeating: running until the\n"
+            "    # execution completes, then its terminal conditions.\n"
+            "    counter = os.environ['MOCK_GCLOUD_LOG'] + '.describe'\n"
+            "    calls = int(open(counter).read()) if os.path.exists(counter) else 0\n"
+            "    open(counter, 'w').write(str(calls + 1))\n"
+            "    result = results[min(calls, len(results) - 1)]\n"
+            "    status = {}\n"
+            "    if result != 'running':\n"
+            "        status = {'completionTime': '2026-09-24T00:01:51Z',\n"
+            "                  'succeededCount': 1 if result == 'succeeded' else 0,\n"
+            "                  'failedCount': 0 if result == 'succeeded' else 1,\n"
+            "                  'conditions': [{'type': 'Completed',\n"
+            "                                  'status': 'True' if result == 'succeeded' else 'False'}]}\n"
+            "    print(json.dumps({'metadata': {'name': argv[4]}, 'status': status}))\n"
             "elif sys.argv[1:3] == ['logging', 'read']:\n"
             "    print(os.environ['MOCK_GCLOUD_DOCUMENT'])\n"
             "elif sys.argv[1:4] == ['run', 'jobs', 'describe']:\n"
@@ -894,6 +917,10 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
         env["MOCK_GCLOUD_LOG"] = str(log)
         env["MOCK_GCLOUD_EXECUTION_STDOUT"] = execution_stdout
         env["MOCK_GCLOUD_EXECUTION_EXIT"] = str(execution_exit)
+        env["MOCK_GCLOUD_EXECUTION_RESULT"] = execution_result
+        # No real waiting in a test: poll and log re-reads are immediate.
+        env["MILO_CAPTURE_POLL_SECONDS"] = "0"
+        env["MILO_CAPTURE_LOG_RETRY_SECONDS"] = "0"
         env["MOCK_GCLOUD_ADVISORY"] = GCLOUD_ADVISORY
         env["MOCK_GCLOUD_DOCUMENT"] = json.dumps(document or SUCCEEDED_DOCUMENT)
         # The capture job runs the RELEASE worker image unless a test says
@@ -964,7 +991,7 @@ def test_the_scoped_capture_mode_runs_the_entrypoint_with_one_execution_override
 
 
 @pytest.mark.parametrize("execution_stdout,execution_exit", [
-    ("", 1),                                    # a failed execution: nothing on stdout
+    ("", 1),                                    # the execution could not be created
     ("", 0),                                    # nothing at all
     (GCLOUD_ADVISORY + "\n", 0),                 # prose where the name belongs
     ("test-capture-execution-1\ntest-capture-execution-2\n", 0),  # two names
@@ -1004,6 +1031,58 @@ def test_a_named_execution_that_gcloud_reports_failed_is_judged_by_its_own_docum
     assert [call[2] for call in reads] == [
         'resource.type=cloud_run_job AND '
         'labels."run.googleapis.com/execution_name"=test-capture-execution-1']
+
+
+def test_a_failed_execution_is_still_named_and_its_document_read(tmp_path):
+    """Regression, 2026-09-24 (milo-catalog-capture-wwg5p).
+
+    The preparation FAILED inside Cloud Run. `execute --wait` answers only
+    for an execution that succeeded, so it printed no name and the script
+    stopped at "printed no single well-formed execution name" -- the one
+    document that said why the preparation failed was never read. The
+    execution is now started with --async (named the moment it exists),
+    waited on with `executions describe`, and its document is read whatever
+    the execution's outcome.
+    """
+    failed = {"entrypoint": "catalog.government.capture", "status": "failed",
+              "reason_code": "CAPTURE_REPOSITORY_TRANSIENT",
+              "reason": "a durable catalog operation failed transiently"}
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution",
+                                  "--enable-work-scope-preparation", *SCOPED_VALUES, gcloud=True,
+                                  execution_result="running,running,failed", document=failed)
+    assert result.returncode != 0
+    assert "printed no single well-formed execution name" not in result.stderr
+    assert "Execution: test-capture-execution-1" in result.stdout
+    assert "WARN: execution test-capture-execution-1 finished failed" in result.stderr
+    assert "WORK_SCOPE_PREPARATION_STATUS=failed" in result.stdout
+    assert "CAPTURE_REPOSITORY_TRANSIENT" in result.stderr
+    calls = _gcloud_calls(log)
+    execute = next(call for call in calls if call[:3] == ["run", "jobs", "execute"])
+    assert "--async" in execute and "--wait" not in execute
+    assert _flag_value(execute, "--format") == "value(metadata.name)"
+    # Waited on by its exact name until Cloud Run said it had finished...
+    describes = [call for call in calls if call[:4] == ["run", "jobs", "executions", "describe"]]
+    assert [call[4] for call in describes] == ["test-capture-execution-1"] * 3
+    # ...and only then was its document read, for that name alone.
+    order = [tuple(call[:4]) for call in calls]
+    assert order.index(("logging", "read", calls[-1][2], calls[-1][3])) > max(
+        index for index, call in enumerate(order) if call[:4] == ("run", "jobs", "executions", "describe"))
+    reads = [call for call in calls if call[:2] == ["logging", "read"]]
+    assert [call[2] for call in reads] == [
+        'resource.type=cloud_run_job AND '
+        'labels."run.googleapis.com/execution_name"=test-capture-execution-1']
+
+
+def test_an_execution_that_never_finishes_is_not_read_half_way(tmp_path):
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution",
+                                  "--enable-work-scope-preparation", *SCOPED_VALUES,
+                                  "--task-timeout", "0s", gcloud=True,
+                                  execution_result="running",
+                                  env={"MILO_CAPTURE_WAIT_MARGIN_SECONDS": "0"})
+    assert result.returncode != 0
+    assert "did not verifiably finish" in result.stderr
+    assert "WORK_SCOPE_PREPARATION_STATUS" not in result.stdout
+    assert not any(call[:2] == ["logging", "read"] for call in _gcloud_calls(log))
 
 
 def _gcloud_calls(log) -> list[list[str]]:

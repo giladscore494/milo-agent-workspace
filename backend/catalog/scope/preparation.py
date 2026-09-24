@@ -102,8 +102,13 @@ class UnitCapture:
     #: publishes the version of the unit's last usable scoped snapshot, so
     #: nothing was read), `reused` (another run's identical completed
     #: snapshot), `landed` (this run captured the scope and landed or replayed
-    #: its snapshot), or `none` when nothing was captured for the unit.
+    #: its snapshot), `adopted` (this run took over the pending snapshot a
+    #: failed run left for exactly this content and finished it), or `none`
+    #: when nothing was captured for the unit.
     capture: str = "none"
+    #: The run the unit's snapshot was adopted from, when `capture` is
+    #: `adopted`; durable in `catalog_snapshot_adoptions` as well.
+    adopted_from_run_id: str = ""
 
     def submission(self) -> dict[str, Any]:
         """The unit exactly as `prepare_work_scope_queue` accepts it."""
@@ -133,6 +138,8 @@ def _refresh_state(outcome: RefreshOutcome) -> str:
         return "unchanged"
     if outcome.report is not None and outcome.report.reused_existing:
         return "reused"
+    if outcome.report is not None and outcome.report.adopted_from_run_id:
+        return "adopted"
     return "landed"
 
 
@@ -186,7 +193,9 @@ def capture_unit(repository: Any, lease: Any, *, client: Any, unit_key: str, pri
         state="captured" if reason is None else "snapshot_unusable",
         register_marque=entry.register_marque, snapshot_id=str(row["id"]),
         snapshot_key=str(row["snapshot_key"]), reason_code=reason,
-        capture=_refresh_state(outcome))
+        capture=_refresh_state(outcome),
+        adopted_from_run_id=(outcome.report.adopted_from_run_id
+                             if outcome.report is not None else ""))
 
 
 def prepare_work_scope(repository: Any, lease: Any, *, client: Any, work_scope_id: str,

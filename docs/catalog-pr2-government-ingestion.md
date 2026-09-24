@@ -275,9 +275,13 @@ direct insert, and no function or table name assembled from data.
 * **A later run may REUSE an already-active identical snapshot.** It is returned
   by the idempotent snapshot write, recognised as another run's completed work,
   and left completely alone.
-* **A later run may not adopt another run's UNFINISHED capture**
+* **A later run may not adopt another run's LIVE, unfinished capture**
   (`GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN`) — a refusal, not an attempt that fails
-  halfway.
+  halfway. An ORPHANED one — pending, its owner ended `failed` / `cancelled` /
+  `timed_out` with no live lease — is adopted by an operator capture run and
+  finished through the same idempotent writes and completeness gate
+  (`20260924000200_catalog_ingestion_recovery.sql`; the previous owner is kept
+  in `catalog_snapshot_adoptions`).
 * **Changed content is a new snapshot.** A different capture derives a different
   `content_sha256`, so a different `snapshot_key` and a different row; the
   previous snapshot and all its raw records are untouched.

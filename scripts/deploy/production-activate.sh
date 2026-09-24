@@ -289,6 +289,7 @@ if [[ "$DO_PREPARE" -eq 1 ]]; then
        && grep -qx 'WORK_SCOPE_PLAN=VERIFIED.*' <<< "$readiness" \
        && grep -qE '^WORK_SCOPE_PREPARED=NO \(revision [0-9]+ has not been prepared\.' <<< "$readiness" \
        && ! grep -q '^WORK_SCOPE_PREPARATION_ID=' <<< "$readiness" \
+       && ! grep -q '^ORPHANED_SNAPSHOTS=NO' <<< "$readiness" \
        && ! grep -qE '^[A-Z_]+=UNVERIFIED' <<< "$readiness"; then
     decision="prepare"
   fi
@@ -300,6 +301,8 @@ if [[ "$DO_PREPARE" -eq 1 ]]; then
     *)
       if [[ "$readiness_status" -eq 1 ]] && grep -qE '^(WORK_SCOPE_PLAN|WORK_SCOPE_SCHEMA)=NO' <<< "$readiness"; then
         reason="the named revision cannot be prepared (see WORK_SCOPE_PLAN / WORK_SCOPE_SCHEMA above)"
+      elif grep -q '^ORPHANED_SNAPSHOTS=NO' <<< "$readiness"; then
+        reason="a pending scoped snapshot is still owned by a run that is live or did not fail, so this preparation would fail late with GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN (see ORPHANED_SNAPSHOTS above)"
       elif [[ "$readiness_status" -eq 3 ]]; then
         reason="readiness is UNVERIFIED (above), so nothing proves the plan and schema are valid or that this revision is unprepared"
       elif [[ "$readiness_status" -eq 1 ]]; then

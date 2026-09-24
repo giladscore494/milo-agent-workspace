@@ -1,14 +1,19 @@
+import re
+import time
 from datetime import UTC, datetime, timedelta
-from typing import Any, Iterable, Protocol
+from typing import Any, Iterable, Protocol, Sequence
 from uuid import UUID
+import httpx
+from postgrest.exceptions import APIError
 from postgrest.types import CountMethod
 from supabase import create_client
+from backend.catalog.contracts import MAX_CATALOG_WRITE_BATCH
 from backend.catalog.diff import MAX_DIFF_ITEMS
 from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
                                       prepare_promotion, prepare_raw_record,
                                       prepare_snapshot)
 from backend.config import Settings
-from backend.errors import AppError, NotFoundError
+from backend.errors import AppError, NotFoundError, RepositoryFailure
 from backend.runtime import (CLAIMED_RUN_STATES, RUN_STATES, TERMINAL_STATES, InvalidTransition,
                              cancellation_refusal, validate_transition)
 from backend.schemas import normalize_conversation_title
@@ -93,6 +98,10 @@ class Repository(Protocol):
     def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def record_catalog_candidate(self, run_id: UUID, candidate: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    # Ingestion recovery (20260924000200): bounded batches and adoption.
+    def record_catalog_raw_records(self, run_id: UUID, records: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> list[dict[str, Any]]: ...
+    def record_catalog_candidates(self, run_id: UUID, candidates: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> list[dict[str, Any]]: ...
+    def adopt_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def link_catalog_candidate_evidence(self, run_id: UUID, link: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
 
     # --- durable catalog reads (PR2: internal, bounded, no lease) ------------
@@ -157,7 +166,66 @@ class Repository(Protocol):
     def list_supervisor_decisions(self, run_id: UUID) -> list[dict[str, Any]]: ...
 
 
+#: HTTP statuses a gateway or PostgREST answers when the request may not have
+#: been processed, or could not be right now. As PostgREST reports them when
+#: the body is not its own JSON (`generate_default_error_message` puts the
+#: status in `code`).
+_TRANSIENT_HTTP_STATUSES = frozenset({"408", "425", "429", "500", "502", "503", "504"})
+#: PostgREST's own "could not reach / use the database" codes.
+_TRANSIENT_POSTGREST_CODES = frozenset({"PGRST000", "PGRST001", "PGRST002", "PGRST003"})
+#: SQLSTATEs that say "not now" rather than "not this": serialization failure,
+#: deadlock, lock timeout, statement timeout and the admin-shutdown family.
+_TRANSIENT_SQLSTATES = frozenset({"40001", "40P01", "55P03", "57014", "57P01", "57P02",
+                                  "57P03", "57P05"})
+#: SQLSTATE classes that are transient as a whole: connection exception (08)
+#: and insufficient resources (53).
+_TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "53"})
+#: SQLSTATE classes that mean the database refused the CONTENT: data
+#: exception (22) and integrity constraint violation (23).
+_REJECTED_SQLSTATE_CLASSES = frozenset({"22", "23"})
+_SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
+
+#: The bounded retry of the catalog ingestion writes. Four attempts in all,
+#: 0.5 + 1 + 2 = 3.5 s of backoff at most per write, and ONLY for a
+#: `transient` failure: a lost lease, a rejection and an unknown failure are
+#: never repeated. Every write it applies to is idempotent on a key derived
+#: from content, so a retry of a write that did land collapses onto its row.
+CATALOG_WRITE_ATTEMPTS = 4
+CATALOG_WRITE_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+
+
+def classify_repository_failure(exc: BaseException) -> str:
+    """`transient`, `rejected` or `unavailable` -- from the failure's shape only.
+
+    Reads the exception TYPE and the error CODE, never the message: a
+    PostgREST message or detail can quote SQL values and URLs.
+    """
+    if isinstance(exc, httpx.TransportError):
+        # Connect/read/write/pool timeouts, network errors and protocol
+        # errors: the request may not have reached the database at all.
+        return "transient"
+    if not isinstance(exc, APIError):
+        return "unavailable"
+    code = "" if exc.code is None else str(exc.code).strip()
+    if code in _TRANSIENT_HTTP_STATUSES or code.upper() in _TRANSIENT_POSTGREST_CODES:
+        return "transient"
+    if _SQLSTATE.fullmatch(code):
+        if code in _TRANSIENT_SQLSTATES or code[:2] in _TRANSIENT_SQLSTATE_CLASSES:
+            return "transient"
+        if code[:2] in _REJECTED_SQLSTATE_CLASSES:
+            return "rejected"
+    return "unavailable"
+
+
+#: The database's own adoption refusals (20260924000200), reported as one
+#: static code. The marker is matched; the message is never carried.
+CATALOG_ADOPTION_REFUSED = "CATALOG_SNAPSHOT_ADOPTION_REFUSED"
+
+
 class SupabaseRepository:
+    #: Seam for tests: the backoff between retried catalog writes.
+    _retry_sleep = staticmethod(time.sleep)
+
     def __init__(self, settings: Settings):
         self.client = create_client(str(settings.supabase_url), settings.supabase_service_role_key)
 
@@ -557,19 +625,44 @@ class SupabaseRepository:
     def _is_stale_lease_error(exc: Exception) -> bool:
         return "STALE_WORKER_WRITE" in str(exc)
 
-    def _guarded_rpc(self, function: str, params: dict[str, Any], resource: str) -> dict[str, Any]:
+    def _guarded_rpc(self, function: str, params: dict[str, Any], resource: str, *,
+                     retry_transient: bool = False, many: bool = False,
+                     refusals: tuple[str, ...] = ()) -> Any:
         """Call a lease-guarded RPC (migration 20260810000300); a stale lease
         surfaces as RUN_LEASE_LOST so worker code paths treat it exactly like
-        a failed heartbeat."""
-        try:
-            data = self.client.rpc(function, params).execute().data
-        except Exception as exc:
-            if self._is_stale_lease_error(exc):
-                raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409) from exc
-            # Provider/PostgREST details can contain SQL values, URLs, or
-            # credentials.  Keep the original exception only as an internal
-            # cause; durable/API-visible errors are deliberately generic.
-            raise AppError("REPOSITORY_ERROR", "guarded persistence operation failed", 502) from exc
+        a failed heartbeat.
+
+        Every other failure is a `RepositoryFailure` carrying ONE static class
+        (`classify_repository_failure`): same code, same generic message as
+        before, plus the class. With `retry_transient` -- only ever set for
+        the idempotent catalog ingestion writes -- a `transient` failure is
+        retried within `CATALOG_WRITE_ATTEMPTS`; nothing else is. `refusals`
+        names static markers a function raises on purpose; one found in the
+        failure becomes an AppError of exactly that code, never its text.
+        `many` returns every row of a SETOF answer instead of the first."""
+        attempts = CATALOG_WRITE_ATTEMPTS if retry_transient else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                data = self.client.rpc(function, params).execute().data
+                break
+            except Exception as exc:
+                if self._is_stale_lease_error(exc):
+                    raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409) from exc
+                for marker in refusals:
+                    if marker in str(exc):
+                        raise AppError(marker, "the database refused this operation", 409) from exc
+                failure = classify_repository_failure(exc)
+                if failure == "transient" and attempt < attempts:
+                    self._retry_sleep(CATALOG_WRITE_BACKOFF_SECONDS[attempt - 1])
+                    continue
+                # Provider/PostgREST details can contain SQL values, URLs, or
+                # credentials.  Keep the original exception only as an internal
+                # cause; durable/API-visible errors are deliberately generic.
+                raise RepositoryFailure(failure) from exc
+        if many:
+            if not isinstance(data, list):
+                raise RepositoryFailure("unavailable", f"{resource} guarded batch returned no rows")
+            return data
         if isinstance(data, list):
             data = data[0] if data else None
         if data is None:
@@ -1103,24 +1196,80 @@ class SupabaseRepository:
     # (`backend/catalog/payloads.py`), and a caller-supplied key that disagrees
     # is refused rather than trusted.  The memory repository shares these
     # preparers, so the two implementations cannot drift.
+    #
+    # The ingestion writes below retry a TRANSIENT failure (`_guarded_rpc`).
+    # Each is idempotent on its derived key -- the snapshot on `snapshot_key`,
+    # a raw record on `(snapshot, record_key)`, a candidate on `(snapshot,
+    # candidate_key)`, activation on the decided state, adoption on the owner
+    # -- so a retry of a write whose response was lost lands on the same row
+    # and never counts a record twice (tests/test_migrations_postgres.py).
     def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
                   "p_snapshot": prepare_snapshot(snapshot)}
-        return self._guarded_rpc("record_catalog_snapshot_guarded", params, "catalog_snapshot")
+        return self._guarded_rpc("record_catalog_snapshot_guarded", params, "catalog_snapshot",
+                                 retry_transient=True)
 
     def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
                   "p_record": prepare_raw_record(record)}
-        return self._guarded_rpc("record_catalog_raw_record_guarded", params, "catalog_raw_record")
+        return self._guarded_rpc("record_catalog_raw_record_guarded", params, "catalog_raw_record",
+                                 retry_transient=True)
 
     def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_activation": activation}
-        return self._guarded_rpc("activate_catalog_snapshot_guarded", params, "catalog_snapshot")
+        return self._guarded_rpc("activate_catalog_snapshot_guarded", params, "catalog_snapshot",
+                                 retry_transient=True)
 
     def record_catalog_candidate(self, run_id: UUID, candidate: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
                   "p_candidate": prepare_candidate(candidate)}
-        return self._guarded_rpc("record_catalog_candidate_guarded", params, "catalog_candidate")
+        return self._guarded_rpc("record_catalog_candidate_guarded", params, "catalog_candidate",
+                                 retry_transient=True)
+
+    @staticmethod
+    def _catalog_batch(rows: Sequence[dict[str, Any]], prepare: Any) -> list[dict[str, Any]]:
+        prepared = [prepare(row) for row in rows]
+        if not 1 <= len(prepared) <= MAX_CATALOG_WRITE_BATCH:
+            raise AppError("CATALOG_BATCH_INVALID",
+                           f"a catalog write batch holds 1 to {MAX_CATALOG_WRITE_BATCH} rows", 400)
+        return prepared
+
+    def record_catalog_raw_records(self, run_id: UUID, records: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> list[dict[str, Any]]:
+        """Up to `MAX_CATALOG_WRITE_BATCH` raw records of ONE snapshot, in one
+        transaction, each through the unchanged single-row RPC; rows answer
+        in input order."""
+        prepared = self._catalog_batch(records, prepare_raw_record)
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_records": prepared}
+        rows = self._guarded_rpc("record_catalog_raw_records_batch_guarded", params,
+                                 "catalog_raw_record", retry_transient=True, many=True)
+        if len(rows) != len(prepared):
+            raise RepositoryFailure("unavailable", "catalog raw record batch answered the wrong row count")
+        return rows
+
+    def record_catalog_candidates(self, run_id: UUID, candidates: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> list[dict[str, Any]]:
+        """Up to `MAX_CATALOG_WRITE_BATCH` candidates of ONE snapshot this run
+        owns and has not decided, in one transaction."""
+        prepared = self._catalog_batch(candidates, prepare_candidate)
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_candidates": prepared}
+        rows = self._guarded_rpc("record_catalog_candidates_batch_guarded", params,
+                                 "catalog_candidate", retry_transient=True, many=True)
+        if len(rows) != len(prepared):
+            raise RepositoryFailure("unavailable", "catalog candidate batch answered the wrong row count")
+        return rows
+
+    def adopt_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Take over a PENDING snapshot whose owning run ended unsuccessfully.
+
+        The database decides (`adopt_catalog_snapshot_guarded` and the trigger
+        on `catalog_snapshot_adoptions`); a refusal is the static
+        `CATALOG_SNAPSHOT_ADOPTION_REFUSED`. Idempotent: the adopter's replay
+        returns the row."""
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_snapshot": prepare_snapshot(snapshot)}
+        return self._guarded_rpc("adopt_catalog_snapshot_guarded", params, "catalog_snapshot",
+                                 retry_transient=True, refusals=(CATALOG_ADOPTION_REFUSED,))
 
     def link_catalog_candidate_evidence(self, run_id: UUID, link: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token),

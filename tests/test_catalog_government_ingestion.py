@@ -24,6 +24,7 @@ from uuid import uuid4
 import pytest
 
 from backend.catalog.contracts import stated_source_locator
+from backend.catalog.government import ingest as ingest_module
 from backend.catalog.government import normalize, projection, snapshot as snapshot_module
 from backend.catalog.government import source as src
 from backend.catalog.government import vocabulary as vocab
@@ -602,13 +603,15 @@ def test_a_partial_snapshot_cannot_activate(repository):
     assert repository.catalog_snapshots[snapshot["snapshot_key"]]["activated_at"] is None
 
 
-def test_a_cancelled_ingestion_leaves_no_active_snapshot(repository):
+def test_a_cancelled_ingestion_leaves_no_active_snapshot(repository, monkeypatch):
+    # Rows are written in batches and cancellation is observed between them;
+    # small batches make the interruption land part-way through the records.
+    monkeypatch.setattr(ingest_module, "CATALOG_WRITE_BATCH_SIZE", 10)
     lease = leased_run(repository)
-    written: list[int] = []
 
     def cancelled() -> bool:
-        written.append(1)
-        return len(written) > 30
+        # Cancelled once five batches of raw records are durable.
+        return len(repository.catalog_raw_records) >= 50
 
     ingestor = GovernmentCatalogIngestor(repository, lease, client=client(),
                                          cancellation_checker=cancelled)

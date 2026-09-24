@@ -251,6 +251,24 @@ else
   printf 'REGISTER_SNAPSHOTS_ACTIVE=UNVERIFIED (informational only)\n'
 fi
 
+# --- informational: orphaned scoped snapshots ------------------------------
+# A pending scoped Government snapshot whose owning run ended. The next
+# preparation of the same register content ADOPTS it (20260924000200) when that
+# run ended failed/cancelled/timed_out with no live lease; work-scope-readiness
+# states each one, and refuses a preparation it would collide with.
+if orphaned="$(psql_value "select count(*) || '|' || count(*) filter (where r.status in ('failed','cancelled','timed_out')
+            and (r.lease_expires_at is null or r.lease_expires_at <= now()))
+       from public.catalog_source_snapshots s
+       left join public.runs r on r.id = s.created_by_run_id
+      where s.source_family = 'government' and s.activated_at is null
+        and s.validation_state = 'pending' and s.retrieval_metadata ? 'capture_scope'
+        and (r.id is null or r.status in ('completed','partial_success','failed','cancelled','timed_out','budget_exhausted'));")"; then
+  printf 'ORPHANED_SCOPED_SNAPSHOTS=%s (adoptable: %s; informational: pending scoped snapshots whose owning run ended, listed one by one by work-scope-readiness.sh for an unprepared revision)\n' \
+    "${orphaned%%|*}" "${orphaned#*|}"
+else
+  printf 'ORPHANED_SCOPED_SNAPSHOTS=UNVERIFIED (informational only)\n'
+fi
+
 # --- RUNS_QUIESCENT -------------------------------------------------------
 if NON_TERMINAL="$(psql_value "select count(*) from public.runs where status not in ('completed','partial_success','failed','cancelled','timed_out','budget_exhausted');")" \
    && [[ "$NON_TERMINAL" =~ ^[0-9]+$ ]]; then

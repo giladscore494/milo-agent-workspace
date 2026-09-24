@@ -137,6 +137,26 @@ REQUIRED_PER_FILE["20260924000100_catalog_work_scope_batch_runs.sql"] = [
     "raise exception 'unlaunched_run_traced'",
     "'run_cancelled', v_message, jsonb_build_object('code', 'run_not_launched')",
 ]
+REQUIRED_PER_FILE["20260924000200_catalog_ingestion_recovery.sql"] = [
+    # An orphaned pending snapshot changes owner only through an audited,
+    # append-only adoption row of the same transaction, and only when its
+    # owner is over; the batches reuse the unchanged single-row writes.
+    "enable row level security",
+    "create table if not exists public.catalog_snapshot_adoptions (",
+    "create trigger catalog_snapshot_adoptions_checked",
+    "create trigger catalog_snapshot_adoptions_append_only",
+    "v_previous.status not in ('failed', 'cancelled', 'timed_out')",
+    "v_adopter.run_identity->>'workflow_key' is distinct from 'operator_capture'",
+    "a.adoption_txid = txid_current()",
+    "create or replace function public.adopt_catalog_snapshot_guarded(",
+    "create or replace function public.record_catalog_raw_records_batch_guarded(",
+    "create or replace function public.record_catalog_candidates_batch_guarded(",
+    "public.record_catalog_raw_record_guarded(",
+    "public.record_catalog_candidate_guarded(",
+    "not between 1 and 500",
+    "perform public.assert_worker_lease(",
+    "for update",
+]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the
     # preparation it feeds is written once, by an operator capture run only.

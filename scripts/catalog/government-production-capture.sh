@@ -140,6 +140,12 @@ CAPTURE_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)"
 RELEASE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/$(milo_op ARTIFACT_REGISTRY_REPOSITORY)/${MILO_WORKER_IMAGE_REPO}:${RELEASE_SHA}"
 
+# One whole number of seconds, minutes or hours: the wait for an execution is
+# bounded by it, so a value this script cannot read is refused, never guessed.
+if [[ ! "$TASK_TIMEOUT" =~ ^[0-9]{1,6}[smh]?$ ]]; then
+  fail "--task-timeout must be a whole number of seconds, minutes or hours (for example 3600s, 60m, 1h)" 2
+fi
+
 if [[ -n "$IDEMPOTENCY_KEY" && ! "$IDEMPOTENCY_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$ ]]; then
   fail "--idempotency-key must be 8-128 characters of letters, digits, '.', '_', ':' or '-'" 2
 fi
@@ -231,7 +237,7 @@ ensure_job() {
 MILO_CAPTURE_EXECUTION_NAME_PATTERN='^[a-z]([-a-z0-9]{0,126}[a-z0-9])?$'
 
 # Runs the job with the given entrypoint arguments and echoes the execution
-# name. --wait blocks until the execution terminalizes.
+# name once THAT execution has terminated.
 #
 # `gcloud run jobs execute --args` REPLACES the container arguments the job was
 # defined with (`-m,${MILO_CAPTURE_ENTRYPOINT_MODULE}`, see ensure_job) rather
@@ -240,12 +246,58 @@ MILO_CAPTURE_EXECUTION_NAME_PATTERN='^[a-z]([-a-z0-9]{0,126}[a-z0-9])?$'
 # execution therefore restates the module first. Any further arguments are
 # per-execution overrides (the scoped mode's one --update-env-vars).
 #
+# The execution is started with --async, which answers with the execution the
+# moment it EXISTS. It used to be started with --wait, which answers only when
+# the execution SUCCEEDS: a failed execution printed no name at all, so the
+# one document that says why it failed (2026-09-24, milo-catalog-capture-wwg5p)
+# could not be read from here. The name is then waited on with
+# `gcloud run jobs executions describe` until it states completion, within a
+# bound (the task timeout plus a margin); an execution that cannot be seen to
+# finish fails closed rather than being read half-way.
+#
 # The name is read from gcloud's STDOUT alone: `--format='value(metadata.name)'`
 # is its machine-readable answer. Progress and advisory text (such as
 # "Or visit https://console.cloud.google.com/...") goes to stderr, which
 # reaches the operator's terminal and is never read as the name. Anything but
 # exactly one well-formed name -- nothing, several lines, prose -- fails closed:
 # Cloud Logging is only ever read for an execution named exactly.
+MILO_CAPTURE_POLL_SECONDS="${MILO_CAPTURE_POLL_SECONDS:-15}"
+MILO_CAPTURE_WAIT_MARGIN_SECONDS="${MILO_CAPTURE_WAIT_MARGIN_SECONDS:-600}"
+
+# Seconds, from a Cloud Run duration such as 3600s, 60m, 1h or 3600 (the
+# shape is validated where --task-timeout is read). Base 10 explicitly, so a
+# leading zero is never read as octal.
+duration_seconds() {
+  local value="$1"
+  case "$value" in
+    *h) printf '%s' "$(( 10#${value%h} * 3600 ))" ;;
+    *m) printf '%s' "$(( 10#${value%m} * 60 ))" ;;
+    *s) printf '%s' "$(( 10#${value%s} ))" ;;
+    *) printf '%s' "$(( 10#${value} ))" ;;
+  esac
+}
+
+# The state of one execution from its `describe --format=json` document:
+# succeeded, failed or running. Terminal only when Cloud Run says so.
+execution_state() {
+  python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    print("running"); sys.exit(0)
+status = doc.get("status") or {}
+conditions = {c.get("type"): c.get("status") for c in status.get("conditions") or []
+              if isinstance(c, dict)}
+if not status.get("completionTime") and conditions.get("Completed") not in ("True", "False"):
+    print("running")
+elif conditions.get("Completed") == "True" or (status.get("succeededCount") or 0) >= 1:
+    print("succeeded")
+else:
+    print("failed")
+'
+}
+
 execute_job() {
   local args_csv="$1" execution="" gcloud_status=0
   shift
@@ -253,7 +305,7 @@ execute_job() {
   execution="$(gcloud run jobs execute "$CAPTURE_JOB" \
     --region "$REGION" --project "$PROJECT_ID" \
     --args="-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}" "$@" \
-    --wait --format='value(metadata.name)')" || gcloud_status=$?
+    --async --format='value(metadata.name)')" || gcloud_status=$?
   if [[ ! "$execution" =~ $MILO_CAPTURE_EXECUTION_NAME_PATTERN ]]; then
     fail "gcloud run jobs execute (exit ${gcloud_status}) printed no single well-formed execution name on stdout; no Cloud Logging read is attempted for an execution that cannot be named exactly. List this job's executions with: gcloud run jobs executions list --job ${CAPTURE_JOB} --region ${REGION} --project ${PROJECT_ID}"
   fi
@@ -261,18 +313,49 @@ execute_job() {
     printf 'WARN: gcloud run jobs execute exited %s for execution %s; its own document states the outcome.\n' \
       "$gcloud_status" "$execution" >&2
   fi
+  local deadline waited=0 state="running"
+  deadline=$(( $(duration_seconds "$TASK_TIMEOUT") + MILO_CAPTURE_WAIT_MARGIN_SECONDS ))
+  while :; do
+    state="$(gcloud run jobs executions describe "$execution" \
+      --region "$REGION" --project "$PROJECT_ID" --format=json 2> /dev/null \
+      | execution_state)" || state="running"
+    [[ "$state" == "running" ]] || break
+    if (( waited >= deadline )); then
+      fail "execution ${execution} did not verifiably finish within ${deadline}s; its document is not read half-way. Inspect it with: gcloud run jobs executions describe ${execution} --region ${REGION} --project ${PROJECT_ID}"
+    fi
+    sleep "$MILO_CAPTURE_POLL_SECONDS"
+    waited=$(( waited + MILO_CAPTURE_POLL_SECONDS ))
+  done
+  if [[ "$state" != "succeeded" ]]; then
+    printf 'WARN: execution %s finished %s; its own document states the outcome.\n' \
+      "$execution" "$state" >&2
+  fi
   printf '%s' "$execution"
 }
 
 # The entrypoint prints exactly one JSON document to stdout, which Cloud Run
 # sends to Cloud Logging. Reading it back is how the operator learns the run
 # id without the capture having to write anywhere else.
+#
+# Cloud Logging ingests with a delay, so a document not yet visible is read
+# again, a bounded number of times, for the same exact execution name.
+MILO_CAPTURE_LOG_RETRIES="${MILO_CAPTURE_LOG_RETRIES:-6}"
+MILO_CAPTURE_LOG_RETRY_SECONDS="${MILO_CAPTURE_LOG_RETRY_SECONDS:-10}"
 execution_document() {
-  local execution="$1"
-  gcloud logging read \
-    "resource.type=cloud_run_job AND labels.\"run.googleapis.com/execution_name\"=${execution}" \
-    --project "$PROJECT_ID" --format='value(textPayload)' --limit 400 2> /dev/null \
-    | tac
+  local execution="$1" document="" attempt=0
+  while :; do
+    document="$(gcloud logging read \
+      "resource.type=cloud_run_job AND labels.\"run.googleapis.com/execution_name\"=${execution}" \
+      --project "$PROJECT_ID" --format='value(textPayload)' --limit 400 2> /dev/null \
+      | tac)" || document=""
+    if printf '%s' "$document" | json_field entrypoint > /dev/null 2>&1; then
+      break
+    fi
+    attempt=$(( attempt + 1 ))
+    (( attempt < MILO_CAPTURE_LOG_RETRIES )) || break
+    sleep "$MILO_CAPTURE_LOG_RETRY_SECONDS"
+  done
+  printf '%s\n' "$document"
 }
 
 json_field() {

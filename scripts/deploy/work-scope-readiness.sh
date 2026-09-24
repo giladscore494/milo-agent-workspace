@@ -204,9 +204,55 @@ check_schema() {
   [[ -z "$rpc_ungranted" ]] || problems+="not EXECUTE-able by service_role: ${rpc_ungranted}; "
   [[ -z "$rpc_exposed" ]] || problems+="EXECUTE-able by anon/authenticated: ${rpc_exposed}; "
   if [[ -n "$problems" ]]; then
-    fact WORK_SCOPE_SCHEMA NO "${problems%; }. Apply the pending migrations (20260922000100, 20260923000100, 20260924000100) through the Deploy Supabase Migrations workflow"
+    fact WORK_SCOPE_SCHEMA NO "${problems%; }. Apply the pending migrations (${MILO_WORK_SCOPE_MIGRATIONS}) through the Deploy Supabase Migrations workflow"
   else
     fact WORK_SCOPE_SCHEMA VERIFIED "${#MILO_WORK_SCOPE_TABLES[@]} tables with RLS, ${#MILO_WORK_SCOPE_RPCS[@]} RPCs service_role-only"
+  fi
+}
+
+# An ORPHANED scoped snapshot: a Government WLTP capture declaring a scope that
+# was opened and never finished -- pending, not activated -- by a run. Because
+# a snapshot key is derived from content, the next capture of the same
+# register content lands on that very row, so an unprepared revision's
+# preparation either ADOPTS it (its owner ended failed / cancelled / timed_out
+# and holds no live lease: 20260924000200) or fails late with
+# GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN (its owner is still live, or ended any
+# other way). Stated BEFORE a capture is attempted, never discovered after one.
+check_orphaned_snapshots() {
+  local rows sid skey scope_key owner owner_status stored declared adoptable n=0 blocked=""
+  if ! rows="$(q "
+    select s.id, s.snapshot_key,
+           left(coalesce(s.retrieval_metadata->'capture_scope'->>'scope_key', ''), 16),
+           s.created_by_run_id, coalesce(r.status, 'missing'),
+           s.stored_record_count::text, s.declared_record_count::text,
+           (coalesce(r.status in ('failed', 'cancelled', 'timed_out'), false)
+            and (r.lease_expires_at is null or r.lease_expires_at <= now()))::text
+      from public.catalog_source_snapshots s
+      left join public.runs r on r.id = s.created_by_run_id
+     where s.source_family = 'government'
+       and s.resource_id = :'resource_id'
+       and s.retrieval_metadata ? 'capture_scope'
+       and s.activated_at is null
+       and s.validation_state = 'pending'
+     order by s.created_at
+     limit 20;")"; then
+    fact ORPHANED_SNAPSHOTS UNVERIFIED "the pending scoped snapshot query failed"
+    return
+  fi
+  while IFS='|' read -r sid skey scope_key owner owner_status stored declared adoptable; do
+    [[ -n "$sid" ]] || continue
+    n=$((n + 1))
+    printf 'ORPHANED_SCOPED_SNAPSHOT id=%s key=%s scope_key=%s owner_run=%s owner_status=%s stored=%s declared=%s adoptable=%s\n' \
+      "$sid" "$skey" "$scope_key" "$owner" "$owner_status" "$stored" "$declared" \
+      "$([[ "$adoptable" == "true" ]] && echo yes || echo no)"
+    [[ "$adoptable" == "true" ]] || blocked+="${skey} (owner ${owner} is ${owner_status}); "
+  done <<< "$rows"
+  if [[ -n "$blocked" ]]; then
+    fact ORPHANED_SNAPSHOTS NO "a pending scoped snapshot is owned by a run that is still live or did not fail, so a capture of the same content cannot land or adopt it (GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN): ${blocked%; }. Let that run finish, or resolve it through the run lifecycle tools, before preparing"
+  elif [[ "$n" -gt 0 ]]; then
+    fact ORPHANED_SNAPSHOTS VERIFIED "${n} orphaned pending scoped snapshot(s), each owned by a run that ended failed/cancelled/timed_out with no live lease: the next preparation ADOPTS one if its capture reproduces that content, and completes it through the same idempotent writes and completeness gate"
+  else
+    fact ORPHANED_SNAPSHOTS VERIFIED "no pending scoped Government snapshot is waiting"
   fi
 }
 
@@ -299,6 +345,7 @@ if ! prep="$(q "
 fi
 if [[ -z "$prep" ]]; then
   fact WORK_SCOPE_PREPARED NO "revision ${WS_REV} has not been prepared. Run the scoped preparation (government-production-capture.sh --prepare-work-scope) for exactly this revision and digest"
+  check_orphaned_snapshots
   fact EVIDENCE_READY NO "no scoped Government snapshot is linked to this revision"
   fact BATCH_READY NO "no batch exists for this revision"
   finish

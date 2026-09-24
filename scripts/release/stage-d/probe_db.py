@@ -302,6 +302,9 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "activate_catalog_snapshot_guarded": {
         "p_activation", "p_attempt", "p_lease_token", "p_run_id", "p_worker_id"
     },
+    "adopt_catalog_snapshot_guarded": {
+        "p_attempt", "p_lease_token", "p_run_id", "p_snapshot", "p_worker_id"
+    },
     "append_run_event_guarded": {
         "p_attempt", "p_event_type", "p_lease_token", "p_run_id", "p_worker_id"
     },
@@ -374,11 +377,17 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "prepare_work_scope_queue": {
         "p_attempt", "p_lease_token", "p_preparation", "p_run_id", "p_worker_id"
     },
+    "record_catalog_candidates_batch_guarded": {
+        "p_attempt", "p_candidates", "p_lease_token", "p_run_id", "p_worker_id"
+    },
     "record_catalog_candidate_guarded": {
         "p_attempt", "p_candidate", "p_lease_token", "p_run_id", "p_worker_id"
     },
     "record_catalog_raw_record_guarded": {
         "p_attempt", "p_lease_token", "p_record", "p_run_id", "p_worker_id"
+    },
+    "record_catalog_raw_records_batch_guarded": {
+        "p_attempt", "p_lease_token", "p_records", "p_run_id", "p_worker_id"
     },
     "record_catalog_snapshot_guarded": {
         "p_attempt", "p_lease_token", "p_run_id", "p_snapshot", "p_worker_id"

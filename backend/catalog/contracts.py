@@ -87,6 +87,14 @@ MAX_RAW_PAYLOAD_CHARS = 16384
 #: source content.
 MAX_RETRIEVAL_METADATA_CHARS = 4096
 
+#: The most rows ONE batched raw-record or candidate write may carry, and the
+#: size an ingestion actually sends. The ceiling is enforced again by
+#: `record_catalog_raw_records_batch_guarded` / `record_catalog_candidates_
+#: batch_guarded` (20260924000200); the batch size stays well under it so one
+#: call's request body stays in the hundreds of kilobytes.
+MAX_CATALOG_WRITE_BATCH = 500
+CATALOG_WRITE_BATCH_SIZE = 250
+
 #: Where a raw record sat in the retrieval that captured it. Closed and
 #: GENERIC: these four describe any paginated read, and none of them names a
 #: source family, a publisher, an API or a vehicle.
@@ -349,6 +357,7 @@ ABSENT = _Absent()
 
 
 __all__ = ["ABSENT", "CANDIDATE_IDENTITY_DIMENSIONS", "CANDIDATE_STATUSES",
+           "CATALOG_WRITE_BATCH_SIZE", "MAX_CATALOG_WRITE_BATCH",
            "MAX_PROMOTIONS_PER_RUN",
            "CANONICAL_DIMENSION_PREFIX", "CANONICAL_OPTIONAL_FIELDS",
            "CANONICAL_REQUIRED_FIELDS", "CANONICAL_VARIANT_FIELDS",

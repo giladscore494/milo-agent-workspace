@@ -47,9 +47,19 @@ Replay, refresh and ownership
     completed work, and left completely alone -- this module never attempts to
     fill or decide a capture it did not open, which the database would refuse
     anyway.
-*   **A later run may not adopt another run's UNFINISHED capture.** That is a
-    refusal here, with its own reason, rather than an attempt that fails
+*   **A later run may not adopt another run's LIVE, unfinished capture.** That
+    is a refusal here, with its own reason, rather than an attempt that fails
     halfway.
+*   **An ORPHANED capture is adopted, never duplicated.** The key is derived
+    from content, so a re-capture of unchanged content lands on the pending
+    snapshot a failed run left behind. The database lets an operator capture
+    run take it over only while it is pending and its owner ended `failed`,
+    `cancelled` or `timed_out` with no live lease
+    (`20260924000200_catalog_ingestion_recovery.sql`), and records the
+    previous owner durably. The adopter then re-submits EVERY row through the
+    same idempotent writes -- a row already stored collapses onto its key and
+    must match it exactly, a missing one is written -- and activation still
+    passes the completeness gate.
 *   **Changed content is a new snapshot.** A different capture derives a
     different `content_sha256`, so it is a different `snapshot_key` and a
     different row; the previous snapshot and all its raw records are untouched.
@@ -99,8 +109,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
+from backend.catalog.contracts import CATALOG_WRITE_BATCH_SIZE
 from backend.engines.swarm_v2.evidence import WorkerLease
-from backend.errors import AppError
+from backend.errors import LEASE_FAILURE_CODES, AppError, RepositoryFailure
 from backend.runtime import CancellationRequested
 
 from . import snapshot as snapshot_module
@@ -119,7 +130,7 @@ MAX_REPORTED_REJECTIONS = 100
 #: Ingestion-level refusals, beyond the capture and normalization vocabularies.
 GOVERNMENT_INGESTION_REASONS: Mapping[str, str] = {
     "GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN":
-        "this capture was opened by another run and is not finished; it cannot be adopted",
+        "this capture was opened by another run that is live or did not fail; it cannot be adopted",
     "GOV_SNAPSHOT_NOT_ACTIVATED":
         "the capture was written in full but the snapshot did not activate",
     "GOV_SNAPSHOT_NORMALIZATION_DRIFT":
@@ -190,6 +201,9 @@ class IngestionReport:
     #: The scope the snapshot DECLARES (`capture_scope.py`), read back off the
     #: snapshot; empty for an unscoped capture.
     capture_scope_key: str = ""
+    #: The run this ingestion ADOPTED the pending snapshot from, or empty. The
+    #: database keeps the same fact durably in `catalog_snapshot_adoptions`.
+    adopted_from_run_id: str = ""
     candidates: tuple[Mapping[str, Any], ...] = field(default=(), repr=False)
 
 
@@ -261,24 +275,25 @@ class GovernmentCatalogIngestor:
         # than being discovered halfway through writing it.
         normalization = read_capture([record for _, record in capture.located_records()],
                                      resource_id=capture.resource_id)
+        payload = snapshot_module.snapshot_payload(capture, normalization, capture_scope)
         snapshot = self._repository.record_catalog_snapshot(
-            self._lease.run_id,
-            snapshot_module.snapshot_payload(capture, normalization, capture_scope),
-            **self._lease_kwargs)
+            self._lease.run_id, payload, **self._lease_kwargs)
         # A replay or a reuse lands on an EXISTING row. Whatever it declares
         # must be exactly what this ingestion asked for -- a scoped request is
         # never satisfied by an unscoped snapshot, nor the reverse.
         self._check_scope(snapshot, capture_scope)
         owner = str(snapshot.get("created_by_run_id"))
+        adopted_from = ""
         if owner != str(self._lease.run_id):
             # Another run opened this capture. If it FINISHED it, this run has
-            # nothing to do and must not touch it; if it did not, this run may
-            # not adopt it either -- the database refuses both, and refusing
-            # here keeps a half-written attempt out of the report.
-            if snapshot.get("activated_at") is None:
-                raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN")
-            self._check_normalization(snapshot, normalization)
-            return self._report(capture, snapshot, candidates=(), reused=True)
+            # nothing to do and must not touch it. If it did not, this run may
+            # continue it only by ADOPTING it, which the database allows only
+            # when that run is over and the capture is still pending.
+            if snapshot.get("activated_at") is not None:
+                self._check_normalization(snapshot, normalization)
+                return self._report(capture, snapshot, candidates=(), reused=True)
+            snapshot = self._adopt(snapshot, payload, normalization)
+            adopted_from = owner
 
         if snapshot.get("activated_at") is not None:
             # Exact replay of our own completed capture: the records and the
@@ -292,9 +307,33 @@ class GovernmentCatalogIngestor:
         candidates, rejected = self._write_candidates(normalization, records)
         snapshot = self._activate(snapshot)
         return self._report(capture, snapshot, candidates=candidates, reused=False,
-                            rejected=rejected)
+                            rejected=rejected, adopted_from=adopted_from)
 
     # --- steps ---------------------------------------------------------------
+
+    def _adopt(self, snapshot: Mapping[str, Any], payload: Mapping[str, Any],
+               normalization: CaptureNormalization) -> Mapping[str, Any]:
+        """Take over an ORPHANED pending capture of exactly this content.
+
+        The database decides whether the owner is over and the snapshot still
+        pending; this side only refuses early what can never be adopted, and
+        holds the stored reading gap to the one this capture reconstructs
+        before asking. A refusal is the same static reason as before.
+        """
+        adopt = getattr(self._repository, "adopt_catalog_snapshot", None)
+        if not callable(adopt) or snapshot.get("validation_state") == "failed":
+            raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN")
+        self._check_normalization(snapshot, normalization)
+        try:
+            adopted = adopt(self._lease.run_id, dict(payload), **self._lease_kwargs)
+        except AppError as refusal:
+            if refusal.code == "CATALOG_SNAPSHOT_ADOPTION_REFUSED":
+                raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN") from None
+            raise
+        if str(adopted.get("created_by_run_id")) != str(self._lease.run_id) \
+                or adopted.get("id") != snapshot.get("id"):
+            raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN")
+        return adopted
 
     def _write_records(self, capture: ResourceCapture, snapshot: Mapping[str, Any]
                        ) -> list[tuple[dict[str, Any], Mapping[str, Any]]]:
@@ -302,12 +341,26 @@ class GovernmentCatalogIngestor:
 
         Returns each stored row PAIRED with the register row it came from, so
         the reading step never has to re-establish that pairing by index.
+
+        Rows travel in bounded batches (`CATALOG_WRITE_BATCH_SIZE`) when the
+        repository offers them: one lease-guarded, all-or-nothing call per
+        batch instead of one per row, through the same per-row validation. A
+        repository without batches is written row by row, as before.
         """
         stored: list[tuple[dict[str, Any], Mapping[str, Any]]] = []
-        for payload, record in snapshot_module.raw_record_payloads(capture, snapshot):
-            self._check_cancelled()
-            stored.append((self._repository.record_catalog_raw_record(
-                self._lease.run_id, payload, **self._lease_kwargs), record))
+        pairs = list(snapshot_module.raw_record_payloads(capture, snapshot))
+        batch = getattr(self._repository, "record_catalog_raw_records", None)
+        if callable(batch):
+            for chunk in _chunks(pairs):
+                self._check_cancelled()
+                rows = batch(self._lease.run_id, [payload for payload, _ in chunk],
+                             **self._lease_kwargs)
+                stored.extend(zip(rows, (record for _, record in chunk)))
+        else:
+            for payload, record in pairs:
+                self._check_cancelled()
+                stored.append((self._repository.record_catalog_raw_record(
+                    self._lease.run_id, payload, **self._lease_kwargs), record))
         self._emit("catalog_records_written", {"snapshot_key": snapshot["snapshot_key"],
                                                "count": len(stored)})
         return stored
@@ -331,12 +384,19 @@ class GovernmentCatalogIngestor:
                                                       "records": len(records)})
             return [], []
         candidates: list[dict[str, Any]] = []
-        for (record_row, _raw), reading in zip(records, normalization.entries):
-            self._check_cancelled()
-            if reading is None:
-                continue
-            candidates.append(self._repository.record_catalog_candidate(
-                self._lease.run_id, reading.candidate_payload(record_row), **self._lease_kwargs))
+        payloads = [reading.candidate_payload(record_row)
+                    for (record_row, _raw), reading in zip(records, normalization.entries)
+                    if reading is not None]
+        batch = getattr(self._repository, "record_catalog_candidates", None)
+        if callable(batch):
+            for chunk in _chunks(payloads):
+                self._check_cancelled()
+                candidates.extend(batch(self._lease.run_id, chunk, **self._lease_kwargs))
+        else:
+            for candidate in payloads:
+                self._check_cancelled()
+                candidates.append(self._repository.record_catalog_candidate(
+                    self._lease.run_id, candidate, **self._lease_kwargs))
         self._emit("catalog_candidates_written", {"count": len(candidates),
                                                   "rejected": normalization.issue_count})
         return candidates, list(normalization.issues)
@@ -344,16 +404,25 @@ class GovernmentCatalogIngestor:
     def _activate(self, snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
         """Decide the snapshot, and record a failure AS a failure.
 
-        The completeness gate lives in the database. If it refuses, this
+        The completeness gate lives in the database. If it REFUSES, this
         capture did not establish what it claimed, so the snapshot is marked
         `failed` -- terminal, and never activatable afterwards -- rather than
         left pending for a later attempt to finish with different material.
+
+        Only a refusal does that. A lost lease, a transient failure (after the
+        repository's bounded retry) or an unclassified one says nothing about
+        the capture, and `failed` cannot be undone: that content could then
+        never be activated again under its content-derived key. So those
+        propagate and leave the snapshot PENDING, which no reader reads and
+        which a later operator capture run can adopt and finish.
         """
         self._check_cancelled()
         try:
             decided = self._repository.activate_catalog_snapshot(
                 self._lease.run_id, {"snapshot_id": snapshot["id"]}, **self._lease_kwargs)
-        except AppError:
+        except AppError as failure:
+            if not _is_refusal(failure):
+                raise
             self._repository.activate_catalog_snapshot(
                 self._lease.run_id, {"snapshot_id": snapshot["id"], "validation_state": "failed"},
                 **self._lease_kwargs)
@@ -393,7 +462,8 @@ class GovernmentCatalogIngestor:
 
     def _report(self, capture: ResourceCapture, snapshot: Mapping[str, Any], *,
                 candidates: Sequence[Mapping[str, Any]], reused: bool,
-                rejected: Sequence[tuple[str, str]] = ()) -> IngestionReport:
+                rejected: Sequence[tuple[str, str]] = (),
+                adopted_from: str = "") -> IngestionReport:
         statuses: dict[str, int] = {}
         for candidate in candidates:
             status = str(candidate.get("status"))
@@ -423,7 +493,7 @@ class GovernmentCatalogIngestor:
                 str(record) for record in metadata.get("normalization_issue_records") or ()),
             activated=snapshot.get("activated_at") is not None,
             reused_existing=reused, created_by_run_id=str(snapshot.get("created_by_run_id")),
-            capture_scope_key=_declared_key(snapshot),
+            capture_scope_key=_declared_key(snapshot), adopted_from_run_id=adopted_from,
             candidates=tuple(dict(candidate) for candidate in candidates))
 
     def _emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
@@ -433,6 +503,27 @@ class GovernmentCatalogIngestor:
     def _check_cancelled(self) -> None:
         if self._cancellation_checker is not None and self._cancellation_checker():
             raise CancellationRequested("RUN_CANCELLED")
+
+
+def _chunks(items: Sequence[Any]):
+    """`items` in consecutive, order-preserving slices of at most
+    `CATALOG_WRITE_BATCH_SIZE` (read at call time)."""
+    size = CATALOG_WRITE_BATCH_SIZE
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def _is_refusal(failure: AppError) -> bool:
+    """Whether the database REFUSED an activation, as opposed to failing it.
+
+    A classified repository failure is a refusal only when it is `rejected`
+    (SQLSTATE 22/23, which is how the completeness gate refuses). A lost lease
+    is never one. Any other `AppError` is a repository's own static refusal
+    (the in-memory repository's `CATALOG_SNAPSHOT_INCOMPLETE`, for instance).
+    """
+    if isinstance(failure, RepositoryFailure):
+        return failure.failure_class == "rejected"
+    return failure.code not in LEASE_FAILURE_CODES and failure.code != "REPOSITORY_ERROR"
 
 
 def _declared_key(snapshot: Mapping[str, Any]) -> str:

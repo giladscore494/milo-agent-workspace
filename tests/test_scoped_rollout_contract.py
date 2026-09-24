@@ -128,7 +128,8 @@ def test_the_readiness_rpc_inventory_is_the_migrations_and_the_repositorys():
     migrations = "\n".join((REPO / "supabase" / "migrations" / name).read_text(encoding="utf-8")
                            for name in ("20260922000100_catalog_work_scopes.sql",
                                         "20260923000100_catalog_work_scope_preparation.sql",
-                                        "20260924000100_catalog_work_scope_batch_runs.sql"))
+                                        "20260924000100_catalog_work_scope_batch_runs.sql",
+                                        "20260924000200_catalog_ingestion_recovery.sql"))
     repository = (REPO / "backend" / "repository" / "supabase.py").read_text(encoding="utf-8")
     for rpc in rpcs:
         assert f"create or replace function public.{rpc}(" in migrations, rpc
@@ -664,6 +665,13 @@ elif "from public.catalog_work_scopes s" in sql and "workflow_key" in sql:
     print(f"true|{values['ws_rev']}|{d}|swarm_v2|{d}|false")
 elif "catalog_work_scope_preparations p" in sql and "public.runs" in sql:
     pass  # never prepared
+elif "s.validation_state = 'pending'" in sql and "capture_scope" in sql:
+    orphan = os.environ.get("MILO_TEST_ORPHAN", "")
+    if orphan:
+        print("701ea334-beb6-4e66-afe8-ca3df4be3d2d|cs1." + "a" * 32 + "|" + "b" * 16
+              + "|bbff131a-4ba3-4e79-9796-a7edb7df314c|"
+              + ("failed" if orphan == "adoptable" else "running")
+              + "|6368|6368|" + ("true" if orphan == "adoptable" else "false"))
 else:
     sys.exit(3)
 """
@@ -686,6 +694,34 @@ def test_the_real_readiness_check_unverified_stops_the_preparation(tmp_path, env
     assert "DATABASE_READ=UNVERIFIED" in result.stdout and detail in result.stdout
     _stopped_before_any_capture(tree, result)
     assert "STOP: readiness is UNVERIFIED" in result.stderr
+
+
+def test_an_adoptable_orphaned_snapshot_is_stated_and_the_preparation_proceeds(tmp_path):
+    """The 2026-09-24 state: a pending Toyota snapshot owned by a FAILED run.
+    Readiness names it before any capture, and the preparation goes ahead,
+    because this release's preparation adopts it."""
+    tree = _orchestrator(tmp_path, real_readiness=True)
+    tree.tool("psql", FAKE_PSQL)
+    result = tree.run("production-activate.sh", *PREPARE,
+                      env={"MILO_TEST_RO_DB_URL": "postgresql://ro@db.test/postgres",
+                           "MILO_TEST_ORPHAN": "adoptable"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("ORPHANED_SCOPED_SNAPSHOT id=701ea334-beb6-4e66-afe8-ca3df4be3d2d" in result.stdout)
+    assert "owner_status=failed stored=6368 declared=6368 adoptable=yes" in result.stdout
+    assert "ORPHANED_SNAPSHOTS=VERIFIED (1 orphaned pending scoped snapshot(s)" in result.stdout
+    assert "PROCEEDING" in result.stdout
+
+
+def test_an_orphaned_snapshot_owned_by_a_live_run_stops_before_any_capture(tmp_path):
+    tree = _orchestrator(tmp_path, real_readiness=True)
+    tree.tool("psql", FAKE_PSQL)
+    result = tree.run("production-activate.sh", *PREPARE,
+                      env={"MILO_TEST_RO_DB_URL": "postgresql://ro@db.test/postgres",
+                           "MILO_TEST_ORPHAN": "live"})
+    assert "owner_status=running" in result.stdout and "adoptable=no" in result.stdout
+    assert "ORPHANED_SNAPSHOTS=NO" in result.stdout
+    _stopped_before_any_capture(tree, result)
+    assert "GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN" in result.stderr
 
 
 def test_the_real_readiness_check_proving_an_unprepared_revision_lets_it_prepare(tmp_path):
