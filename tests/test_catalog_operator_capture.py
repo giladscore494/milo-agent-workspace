@@ -783,10 +783,11 @@ class LeaseWatchingRepository(MemoryRepository):
     def _note(self, name: str, worker_id: str, attempt: int, lease_token: str) -> None:
         self.write_leases.append((name, worker_id, attempt, lease_token))
 
-    def record_catalog_snapshot(self, run_id, snapshot, *, worker_id, attempt, lease_token):
+    def record_catalog_snapshot(self, run_id, snapshot, *, worker_id, attempt, lease_token,
+                                **extra):
         self._note("snapshot", worker_id, attempt, lease_token)
         return super().record_catalog_snapshot(run_id, snapshot, worker_id=worker_id,
-                                               attempt=attempt, lease_token=lease_token)
+                                               attempt=attempt, lease_token=lease_token, **extra)
 
     def record_catalog_raw_record(self, run_id, record, *, worker_id, attempt, lease_token):
         self._note("raw_record", worker_id, attempt, lease_token)
@@ -798,10 +799,11 @@ class LeaseWatchingRepository(MemoryRepository):
         return super().record_catalog_candidate(run_id, candidate, worker_id=worker_id,
                                                 attempt=attempt, lease_token=lease_token)
 
-    def activate_catalog_snapshot(self, run_id, activation, *, worker_id, attempt, lease_token):
+    def activate_catalog_snapshot(self, run_id, activation, *, worker_id, attempt, lease_token,
+                                  **extra):
         self._note("activate", worker_id, attempt, lease_token)
         return super().activate_catalog_snapshot(run_id, activation, worker_id=worker_id,
-                                                 attempt=attempt, lease_token=lease_token)
+                                                 attempt=attempt, lease_token=lease_token, **extra)
 
 
 def test_every_durable_write_carries_the_claimed_lease(monkeypatch, transport, capsys):
@@ -874,7 +876,10 @@ def test_lease_loss_prevents_subsequent_writes_and_activation(monkeypatch, trans
 
     status, document, _ = run_main(authorized_argv(run_id), capture_env(), capsys)
     assert status == entrypoint.EXIT_FAILED
-    assert document["reason_code"] == "CAPTURE_REPOSITORY_UNAVAILABLE"
+    # A write refused for a stale lease is reported as the lost lease it is,
+    # not as a repository outage (it used to collapse into
+    # CAPTURE_REPOSITORY_UNAVAILABLE).
+    assert document["reason_code"] == "CAPTURE_LEASE_LOST"
     assert "capture" not in document
     # The snapshot exists and is NOT active: a partial capture is invisible.
     assert len(repository.catalog_snapshots) == 1
@@ -997,7 +1002,7 @@ def test_the_success_report_is_bounded_and_deterministic(wired, capsys, tmp_path
         "stored_record_count", "page_count", "candidate_count", "candidate_status_counts",
         "normalization_contract", "normalized_record_count", "normalization_issue_count",
         "normalization_issues", "normalization_issue_records", "rejected_record_count",
-        "activated", "reused_existing"}
+        "activated", "reused_existing", "adopted_from_run_id", "ingestion"}
     assert len(snapshot["content_sha256"]) == 64
     assert snapshot["schema_fingerprint"].startswith("gov.schema.")
     assert len(snapshot["schema_fingerprint"]) <= entrypoint.MAX_REPORT_TEXT_CHARS

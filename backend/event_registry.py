@@ -189,6 +189,11 @@ OPERATIONAL_EVENT_TYPES = frozenset({
     "provider_lease_ownership_lost",
     # backend/budget.py -- a model call admitted without a usable output cap.
     "model_output_cap_missing",
+    # supabase/migrations/20260924000200 -- `adopt_catalog_snapshot_guarded`
+    # records, on the adopting operator capture run and in the same
+    # transaction as the adoption row, that it took over an orphaned pending
+    # catalog snapshot (ids and counts only).
+    "catalog_snapshot_adopted",
 })
 
 #: THE acceptance vocabulary: every type a trusted emitter may durably append.

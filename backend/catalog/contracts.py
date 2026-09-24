@@ -87,6 +87,22 @@ MAX_RAW_PAYLOAD_CHARS = 16384
 #: source content.
 MAX_RETRIEVAL_METADATA_CHARS = 4096
 
+#: The most rows ONE batched raw-record or candidate write may carry (a hard
+#: cap, enforced again by `record_catalog_raw_records_batch_guarded` /
+#: `record_catalog_candidates_batch_guarded`, 20260924000200), and the size an
+#: ingestion actually sends. Server constants: no environment variable or
+#: argument can change either. A clean ingestion (no retry, no split) costs
+#: ceil(raw / 200) + ceil(candidates / 200) + 3 fixed calls (snapshot,
+#: adoption when adopting, activation): a Toyota preparation (6 368 rows) is
+#: 32 + 32 + 3 = 67 calls at most. One set-based 200-row call with
+#: Production-sized rows measured 0.07-0.11 s (raw) / 0.04-0.05 s (candidates)
+#: on PostgreSQL 16 against the 8 s statement timeout
+#: (`docs/production-readiness/MIGRATIONS.md`, ingestion recovery section). A
+#: call that times out, or whose body is refused as too large (HTTP 413), is
+#: split by the repository.
+MAX_CATALOG_WRITE_BATCH = 500
+CATALOG_WRITE_BATCH_SIZE = 200
+
 #: Where a raw record sat in the retrieval that captured it. Closed and
 #: GENERIC: these four describe any paginated read, and none of them names a
 #: source family, a publisher, an API or a vehicle.
@@ -349,6 +365,7 @@ ABSENT = _Absent()
 
 
 __all__ = ["ABSENT", "CANDIDATE_IDENTITY_DIMENSIONS", "CANDIDATE_STATUSES",
+           "CATALOG_WRITE_BATCH_SIZE", "MAX_CATALOG_WRITE_BATCH",
            "MAX_PROMOTIONS_PER_RUN",
            "CANONICAL_DIMENSION_PREFIX", "CANONICAL_OPTIONAL_FIELDS",
            "CANONICAL_REQUIRED_FIELDS", "CANONICAL_VARIANT_FIELDS",

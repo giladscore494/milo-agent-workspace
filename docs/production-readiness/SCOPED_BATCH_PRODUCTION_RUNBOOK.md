@@ -166,21 +166,27 @@ bash scripts/deploy/production-activate.sh --plan 2>&1 | tee "$HOME/stage-a-plan
 This runs the preflight, the database gate, `DEPLOY_MODE=check cloud-run.sh`,
 the capture plan, the gate chain and the activation plan. It changes nothing.
 
-### A.4 Migration state: exactly three pending
+### A.4 Migration state: exactly one pending
 
 ```bash
 bash scripts/release/check-migration-state.sh --database-url-env MILO_READONLY_DB_URL
 bash scripts/deploy/work-scope-readiness.sh --schema-only
 ```
 
-**Expected evidence** (from the last recorded audit):
+**Expected evidence** (Production after the 2026-09-24 Stage B apply, with
+this release checked out):
 
-- `remote schema classified as partially-migrated (38/41 …)`
-- `3 local migration(s) not present in remote migration history:` naming
-  `20260922000100 …catalog_work_scopes.sql`,
-  `20260923000100 …catalog_work_scope_preparation.sql` and
-  `20260924000100 …catalog_work_scope_batch_runs.sql`
-- `WORK_SCOPE_SCHEMA=NO (missing tables: … missing RPCs: …)`
+- `remote schema classified as partially-migrated (41/42 …)`
+- `1 local migration(s) not present in remote migration history:` naming
+  `20260924000200 …catalog_ingestion_recovery.sql`
+- `WORK_SCOPE_SCHEMA=NO (missing tables: catalog_snapshot_adoptions; missing RPCs:
+  record_catalog_raw_records_batch_guarded record_catalog_candidates_batch_guarded
+  adopt_catalog_snapshot_guarded …)`
+
+(A database that never had Stage B applied shows `38/42` and four pending:
+the three scoped-catalog migrations `20260922000100`, `20260923000100`,
+`20260924000100`, then `20260924000200`. Stage B applies whatever is pending,
+in order.)
 
 **Stop if** any other version is missing or unexpected, the history is not an
 exact prefix (`drift`), or a marker disagrees. Those are drift. Do not apply
@@ -248,7 +254,7 @@ Neither rule is to be disabled. Each has a safe fix.
 
 ---
 
-## Stage B — apply the three pending migrations
+## Stage B — apply the pending migrations
 
 Migrations are applied only through the repository's GitHub Actions
 workflows: `.github/workflows/backup-supabase-production.yml`, then
@@ -283,8 +289,9 @@ gh workflow run deploy-supabase-migrations.yml --repo giladscore494/milo-agent-w
 ```
 
 **Expected evidence:** the step *Run mandatory production dry-run preflight*
-(`supabase db push --linked --dry-run`) proposes **exactly** the three
-migrations above, in that order, and nothing else. The run ends with
+(`supabase db push --linked --dry-run`) proposes **exactly** the pending
+migrations A.4 named, in that order, and nothing else (today:
+`20260924000200_catalog_ingestion_recovery.sql` alone). The run ends with
 `Manual dry-run completed. No production migrations were applied.`
 
 **Stop if** it proposes anything else, or fails. The workflow prints its
@@ -302,7 +309,7 @@ gh workflow run deploy-supabase-migrations.yml --repo giladscore494/milo-agent-w
 ```
 
 **Expected evidence:** *Apply production migrations* succeeds, and *Display
-remote migration history after apply* lists all 41 versions.
+remote migration history after apply* lists all 42 versions.
 
 ### B.4 Verify in Cloud Shell (read-only)
 
@@ -312,17 +319,19 @@ bash scripts/deploy/work-scope-readiness.sh --schema-only
 bash scripts/deploy/production-verify.sh --gate database
 ```
 
-**Expected evidence:** `remote schema classified as fully-migrated (41/41 …)`,
-then `WORK_SCOPE_SCHEMA=VERIFIED` (8 tables with RLS on, and 9 RPCs that only
-`service_role` can execute; neither `anon` nor `authenticated` can), then
+**Expected evidence:** `remote schema classified as fully-migrated (42/42 …)`,
+then `WORK_SCOPE_SCHEMA=VERIFIED (9 tables with RLS, 12 RPCs service_role-only)`
+(neither `anon` nor `authenticated` can execute any of them), then
 `DATABASE_READY=VERIFIED` and `RESULT: OK`.
 
-The executable test suite applies the same three files to a database shaped
-like Production (38/41) and asserts exactly this transition
-(`tests/test_migrations_postgres.py::test_the_production_shaped_database_is_named_exactly_as_three_migrations_short`).
+The executable test suite applies the same file to a database shaped like
+Production (41/42) and asserts exactly this transition
+(`tests/test_migrations_postgres.py::test_the_production_shaped_database_is_named_exactly_as_one_migration_short`).
 
-**Recovery / rollback.** All three migrations only add objects; they alter no
-existing relation's rows. If the apply fails part way, re-run B.2: the history
+**Recovery / rollback.** The migrations only add objects; they alter no
+existing relation's rows. (`20260924000200` also restates one trigger
+function, `forbid_catalog_snapshot_rewrite`, with a single audited exception:
+see [MIGRATIONS.md](MIGRATIONS.md).) If the apply fails part way, re-run B.2: the history
 shows exactly what was applied, and the next apply continues from there. The
 live release does not call these objects until Stage C deploys the new code.
 There is no down-migration (see [ROLLBACK.md](ROLLBACK.md) §Migrations).
@@ -531,6 +540,170 @@ snapshot and the exact batch.
 - Any `UNVERIFIED`: the check could not see something, such as a missing
   `MILO_READONLY_DB_URL` or a role affected by RLS. Fix that access and re-run.
   It is never "good enough".
+- `ORPHANED_SNAPSHOTS=NO`: a pending scoped snapshot is still written by a run (its creator, or its latest adopter)
+  that is live (or ended some way other than failed / cancelled / timed out).
+  The orchestrator stops before any capture, because a capture of the same
+  register content would land on that row and fail
+  `GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN`. Let the run finish (its lease expires at
+  most `MILO_WORKER_LEASE_SECONDS`, 300 s, after it ends), or resolve it through
+  the run lifecycle tools, then re-run D.4. `ORPHANED_SNAPSHOTS=VERIFIED` with an
+  `ORPHANED_SCOPED_SNAPSHOT … adoptable=yes` line is not a stop: the preparation
+  adopts it (D.5).
+- A failed preparation now names its failure class. The capture document's
+  `reason_code` is one of these, never database or URL text:
+
+  | `reason_code` | Meaning | What to do |
+  | --- | --- | --- |
+  | `CAPTURE_REPOSITORY_TRANSIENT` | a catalog write failed on the network, a timeout, HTTP 408/425/429/5xx, a PostgREST connection code, or SQLSTATE 08xxx / 53xxx / 40001 / 40P01 / 55P03 / 57014 / 57P0x, **after** its bounded retry (4 attempts, 0.5 s + 1 s + 2 s backoff) | infrastructure: check Supabase and Cloud Run egress health, then re-run D.4. The pending snapshot is adopted by the next run (D.5). Each failed attempt is logged by the capture job as `guarded rpc failed function=… cause=… code=… http_status=… class=… attempt=n/4 action=retry\|split\|raise run_id=… snapshot_id=… phase=snapshot\|adopt\|raw\|candidates\|activate batch=… rows=…-… capture_index=…-…` (no message, details, hint, payload, URL or token) |
+  | `CAPTURE_REPOSITORY_REJECTED` | the database refused a write's content (SQLSTATE class 22 / 23, or a repository idempotency / ownership refusal) | **stop**: a code or data defect, never retried. Keep the execution name and escalate |
+  | `CAPTURE_REPOSITORY_REQUEST_TOO_LARGE` | a catalog write batch drew HTTP 413 (request body too large) at every split down to 25 rows; nothing of it was written | **stop**: a 25-row raw batch is about 80 KB, so the gateway is refusing ordinary bodies; keep the execution name and the `code=413 … phase=… batch=…` log lines, and escalate |
+  | `CAPTURE_REPOSITORY_UNAVAILABLE` | a catalog write failed for any other reason (unclassified) | inspect the execution and the Supabase logs at that time before re-running |
+  | `CAPTURE_LEASE_LOST` | the database refused a write or a heartbeat for a stale lease, or no heartbeat could be proved for the lease duration | another worker holds the run, or the lease lapsed; re-run D.4 (the snapshot stays pending and is adoptable once this run's lease expires) |
+
+**D.5 Recovery: resume a preparation whose capture failed mid-ingestion.**
+This is the procedure for the 2026-09-24 incident: Mapping Plan
+`526b5c52-4ae3-432c-9fea-990921723151` revision 1 (digest
+`82798894bae434d77c7bfa3844b698c0e9de398bf5568ba9dc8e87b0bafa1028`; Toyota,
+2018+, max 10, batch 10). Its preparation (execution
+`milo-catalog-capture-wwg5p`, run `bbff131a-4ba3-4e79-9796-a7edb7df314c`)
+captured all 6 368 register rows, wrote every raw record into snapshot
+`701ea334-beb6-4e66-afe8-ca3df4be3d2d` and 3 579 of its candidates, then failed
+with `CAPTURE_REPOSITORY_UNAVAILABLE` (the release before this one had no finer
+class; the root cause of that one write is **unknown** and only the new
+logging -- `guarded rpc failed function=… cause=… code=… http_status=…` in the
+capture job's logs -- will show it next time). The snapshot is pending and
+its key is derived from its content, so an unchanged register resolves to it
+again. The revision was **never prepared** (the queue is written only after
+every unit is captured), so it is resumed, not revised.
+
+**What to expect, verified read-only in Production:** among the 3 579
+candidates already written, `model_year_start >= 2018` holds 1 259 ambiguous
+vs 933 readable. The reviewed vocabulary reads only the body style
+`פנאי-שטח`; sedan, hatchback, MPV, station and pickup rows stay `ambiguous`.
+So revision 1 will end with its unit `vocabulary_insufficient` and **nothing
+queued**. That is the vocabulary gate working, not a failure of this change,
+and the fix is NOT a normalization or vocabulary change here: it is a plan
+range the reviewed vocabulary can read (per year, readable > ambiguous only in
+2025, 175/109, and 2026, 249/121, in that partial count). The capture itself
+must still finish: adopting and activating the snapshot is what lets the
+next revision reuse it without capturing again.
+
+1. Backup, dry run, apply (Stage B), with `$RELEASE_SHA` = the merge commit of
+   this change. B.2 must propose exactly
+   `20260924000200_catalog_ingestion_recovery.sql`; B.4 must end
+   `fully-migrated (42/42 …)` and `WORK_SCOPE_SCHEMA=VERIFIED (9 tables with
+   RLS, 12 RPCs service_role-only)`. The release still serving (36b3da86)
+   keeps working against the migrated schema.
+2. Redeploy (Stage C): `bash scripts/deploy/production-activate.sh --all`.
+3. Plan authoring (D.1): `bash scripts/deploy/website-execution-activate.sh --apply-plan-authoring`;
+   confirm `GATEWAY_RUN_START_ENABLED=DISABLED`.
+4. Read-only check before any capture:
+
+   ```bash
+   export WS_ARGS="--work-scope-id 526b5c52-4ae3-432c-9fea-990921723151 --work-scope-revision 1 \
+     --work-scope-digest 82798894bae434d77c7bfa3844b698c0e9de398bf5568ba9dc8e87b0bafa1028"
+   bash scripts/deploy/work-scope-readiness.sh $WS_ARGS
+   ```
+
+   **Expected:** `WORK_SCOPE_PREPARED=NO (revision 1 has not been prepared. …)`,
+   `ORPHANED_SCOPED_SNAPSHOT id=701ea334-beb6-4e66-afe8-ca3df4be3d2d … writer_run=bbff131a-4ba3-4e79-9796-a7edb7df314c writer_status=failed stored=6368 declared=6368 adoptable=yes`
+   and `ORPHANED_SNAPSHOTS=VERIFIED (…)`. **Stop if** `adoptable=no` or
+   `ORPHANED_SNAPSHOTS=NO`.
+5. Prepare revision 1 (D.4):
+
+   ```bash
+   bash scripts/deploy/production-activate.sh --prepare-work-scope $WS_ARGS \
+     --enable-catalog-execution --enable-work-scope-preparation 2>&1 | tee "$HOME/stage-d-resume.txt"
+   ```
+
+   **Expected:**
+   - the capture ADOPTS `701ea334`: the unit's document shows
+     `"capture": "adopted"`, `"adopted_from_run_id": "bbff131a-…"`, and the
+     script prints `INGESTION unit=toyota adoption_seq=1 previous_writer_run_id=bbff131a-…`;
+   - it writes only what is missing:
+     `INGESTION unit=toyota phase=raw calls=32 … inserted=0 already_present=6368`
+     and `phase=candidates … inserted=<rest> already_present=3579` (plus
+     rows the vocabulary cannot read at all, which have no candidate);
+   - it ACTIVATES the snapshot (`phase=activate calls=1`), and
+     `INGESTION_TOTAL_DB_CALLS`, `INGESTION_TOTAL_SECONDS`,
+     `INGESTION_TOTAL_REQUEST_BYTES` and `INGESTION_MAX_CALL_SECONDS` state
+     the cost. Every PostgREST call runs under an 8 s statement and lock
+     timeout; `INGESTION_MAX_CALL_SECONDS` is the slowest single call and must
+     stay far below it (a 200-row set-based raw batch measured 0.07-0.11 s
+     on local PostgreSQL; a batch that does hit the timeout, or draws HTTP 413,
+     is split in halves down to 25 rows automatically, which shows up as extra
+     `calls`). With no retry and no split the whole ingestion is
+     `ceil(raw/200) + ceil(candidates/200) + 3` calls -- here at most
+     32 + 32 + 3 = 67, so expect `INGESTION_TOTAL_DB_CALLS` ≤ 70. The write
+     phase's target is under 2 minutes; `INGESTION_TOTAL_SECONDS` is the
+     measurement that decides it;
+   - `WORK_SCOPE_PREPARATION_STATUS=succeeded` with
+     `UNIT 1. toyota state=vocabulary_insufficient … queued=0`, then the
+     prepared gate FAILS on `EVIDENCE_READY=NO (no unit of this revision was
+     prepared …)` and the script stops. That stop is expected here.
+
+   A `CAPTURE_REPOSITORY_TRANSIENT` failure is resumed by repeating this
+   step; the next run adopts from the run that just failed once that run's
+   lease has expired (≤ 300 s), with `adoption_seq=2`.
+
+   If the script stops with "printed no single well-formed execution name",
+   an execution may still have been created and be RUNNING UNATTENDED: run the
+   `gcloud run jobs executions list --job … --region … --project …` command it
+   prints before anything else, and never start a second preparation while one
+   is running.
+6. Choose a range the vocabulary can read, from the now ACTIVE snapshot
+   (read-only):
+
+   ```bash
+   bash scripts/deploy/work-scope-readiness.sh --year-coverage \
+     --snapshot-key <the cs1.… key the UNIT line printed>
+   ```
+
+   It prints, per model year, `YEAR y readable=… ambiguous=… eligible=…` and
+   `FROM_y_ONWARD … gate=passes|vocabulary_insufficient|passes_but_queues_nothing`
+   -- the same counts `prepare_work_scope_queue` takes. Equivalent psql, for a
+   role with BYPASSRLS:
+
+   ```sql
+   select c.model_year_start as year,
+          count(*) filter (where c.status <> 'ambiguous') as readable,
+          count(*) filter (where c.status = 'ambiguous')  as ambiguous,
+          count(*) filter (where c.status = 'candidate')  as eligible
+     from public.catalog_candidate_variants c
+     join public.catalog_source_snapshots s on s.id = c.snapshot_id
+    where s.snapshot_key = '<cs1.… key>'
+    group by c.model_year_start
+    order by c.model_year_start;
+   ```
+7. In the website, save a **new revision** of the plan whose model-year range
+   passes (for example `2025+`, if step 6 says `FROM_2025_ONWARD … gate=passes`),
+   then read its triple with `work-scope-readiness.sh --list`.
+8. Prepare that revision (D.4 again, with the new `$WS_ARGS`). **Expected:**
+   the snapshot is REUSED -- `"capture": "unchanged"` or `"reused"`, no
+   `INGESTION` lines with writes (a new capture of unchanged content lands on
+   the active snapshot and writes nothing) -- and
+   `UNIT 1. toyota state=prepared queued=…`.
+9. Gate: `bash scripts/deploy/production-verify.sh --gate prepared $WS_ARGS`
+   → `RESULT: OK`, `EVIDENCE_READY=VERIFIED`, `NEXT_BATCH_NUMBER=1`.
+
+The adoption is on record (read-only):
+
+```sql
+select adoption_seq, previous_writer_run_id, adopted_by_run_id, adopted_at
+  from public.catalog_snapshot_adoptions
+ where snapshot_id = '701ea334-beb6-4e66-afe8-ca3df4be3d2d';
+select event_type, payload from public.run_events
+ where event_type = 'catalog_snapshot_adopted'
+   and payload->>'snapshot_id' = '701ea334-beb6-4e66-afe8-ca3df4be3d2d';
+```
+
+`created_by_run_id` of the snapshot stays `bbff131a-…`: it records who opened
+it; the adoption row records who finished it.
+
+Root-cause evidence for the ORIGINAL failure (read-only; not required to
+proceed): the heartbeat history of the failed run --
+`select heartbeat_at, lease_expires_at from public.worker_heartbeats where run_id = 'bbff131a-4ba3-4e79-9796-a7edb7df314c' order by heartbeat_at;`
+-- and the Supabase API / Postgres logs around 2026-09-24 00:01:50 UTC.
 
 **Rollback.** Preparation writes only append-only rows and executes nothing.
 To stop, do not continue to Stage E. A wrong plan is fixed by revising it in

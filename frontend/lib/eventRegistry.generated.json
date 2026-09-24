@@ -9,6 +9,7 @@
     "budget_warning",
     "cancellation_requested",
     "catalog_promotion_refused",
+    "catalog_snapshot_adopted",
     "catalog_variant_promoted",
     "checkpoint_saved",
     "chunk_completed",
@@ -68,7 +69,7 @@
     "verification_completed",
     "worker_output_repair_started"
   ],
-  "fingerprint": "670238a71f608185d2011391ebe7f41df6b321df516b6af5866f51e0155db647",
+  "fingerprint": "501a1b106fa360bbc12480a59b64e88b641d62b9343ac61f189183bd908f2c36",
   "groups": {
     "capture_progress": [
       "catalog_candidates_skipped",
@@ -84,6 +85,7 @@
       "catalog_variant_promoted"
     ],
     "operational": [
+      "catalog_snapshot_adopted",
       "model_output_cap_missing",
       "provider_backpressure_wait",
       "provider_lease_operator_reclaimed",

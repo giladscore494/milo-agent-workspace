@@ -12,6 +12,7 @@ import copy
 import json
 import re
 import threading
+import time
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
@@ -19,6 +20,7 @@ from uuid import UUID, uuid4
 
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
                                        CANONICAL_DIMENSION_PREFIX,
+                                       MAX_CATALOG_WRITE_BATCH,
                                        MAX_PROMOTIONS_PER_RUN, candidate_identity_scope,
                                        claim_entity_key, record_locator_id,
                                        stated_canonical_fields,
@@ -147,6 +149,9 @@ class MemoryRepository:
         self.catalog_raw_records: dict[tuple[str, str], dict[str, Any]] = {}
         self.catalog_candidates: dict[tuple[str, str], dict[str, Any]] = {}
         self.catalog_evidence_links: dict[tuple[str, str], dict[str, Any]] = {}
+        # Snapshot adoptions (`20260924000200_catalog_ingestion_recovery.sql`):
+        # append-only, written only by `adopt_catalog_snapshot`.
+        self.catalog_snapshot_adoptions: list[dict[str, Any]] = []
         # Canonical state (PR3). Written ONLY by `promote_catalog_variant`,
         # which mirrors the promotion transaction: the canonical identity and
         # every field's provenance are created together or not at all, and a
@@ -1444,7 +1449,8 @@ class MemoryRepository:
         return dict(existing)
 
     def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *,
-                                worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+                                worker_id: str, attempt: int, lease_token: str,
+                                diagnostics: Any = None) -> dict[str, Any]:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
             snapshot = prepare_snapshot(snapshot)
@@ -1482,16 +1488,35 @@ class MemoryRepository:
             self.catalog_snapshots[key] = row
             return dict(row)
 
-    def _catalog_owned_snapshot(self, snapshot_id: Any, run_id: UUID) -> dict[str, Any]:
-        """The snapshot this run opened, or fail closed.
+    def _catalog_current_writer(self, snapshot: Mapping[str, Any]) -> str:
+        """Mirror of `catalog_snapshot_current_writer`: the latest adopter, else
+        the run that opened the snapshot (whose `created_by_run_id` never moves)."""
+        adoptions = [row for row in self.catalog_snapshot_adoptions
+                     if row["snapshot_id"] == snapshot["id"]]
+        if adoptions:
+            return max(adoptions, key=lambda row: row["adoption_seq"])["adopted_by_run_id"]
+        return snapshot["created_by_run_id"]
 
-        A snapshot belongs to the run that opened it: holding SOME valid lease
-        is not enough to fill or decide another run's capture.
+    def _catalog_write_authority(self, snapshot_id: Any, run_id: UUID, *,
+                                 allow_decided: bool = False) -> dict[str, Any]:
+        """Mirror of `assert_snapshot_write_authority`: the ONE decision of who
+        may write a snapshot, used by every catalog write that needs it.
+
+        Holding SOME valid lease is not enough to fill or decide another run's
+        capture: only its current writer may, and only while it is pending
+        (activation's idempotent replay aside, `allow_decided`).
         """
         snapshot = self._catalog_snapshot_by_id(snapshot_id)
-        if snapshot["created_by_run_id"] != str(run_id):
+        if self._catalog_current_writer(snapshot) != str(run_id):
             raise AppError("CATALOG_SNAPSHOT_NOT_OWNED",
                            "this catalog snapshot does not belong to this run", 409)
+        if not allow_decided:
+            if snapshot["validation_state"] == "failed":
+                raise AppError("CATALOG_SNAPSHOT_FAILED",
+                               "a failed catalog snapshot is terminal", 409)
+            if snapshot["activated_at"] is not None:
+                raise AppError("CATALOG_SNAPSHOT_ACTIVE",
+                               "an active catalog snapshot is immutable", 409)
         return snapshot
 
     def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *,
@@ -1499,14 +1524,7 @@ class MemoryRepository:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
             record = prepare_raw_record(record)
-            snapshot = self._catalog_owned_snapshot(record.get("snapshot_id"), run_id)
-            # Both decided states are terminal.
-            if snapshot["validation_state"] == "failed":
-                raise AppError("CATALOG_SNAPSHOT_FAILED",
-                               "a failed catalog snapshot is terminal", 409)
-            if snapshot["activated_at"] is not None:
-                raise AppError("CATALOG_SNAPSHOT_ACTIVE",
-                               "an active catalog snapshot is immutable", 409)
+            snapshot = self._catalog_write_authority(record.get("snapshot_id"), run_id)
             if record.get("resource_id") != snapshot["resource_id"]:
                 raise AppError("CATALOG_RECORD_INVALID",
                                "catalog raw record resource mismatch", 400)
@@ -1541,10 +1559,12 @@ class MemoryRepository:
             return dict(row)
 
     def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *,
-                                  worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+                                  worker_id: str, attempt: int, lease_token: str,
+                                  diagnostics: Any = None) -> dict[str, Any]:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
-            snapshot = self._catalog_owned_snapshot(activation.get("snapshot_id"), run_id)
+            snapshot = self._catalog_write_authority(activation.get("snapshot_id"), run_id,
+                                                     allow_decided=True)
             state = activation.get("validation_state") or "complete"
             if state not in ("complete", "failed"):
                 raise AppError("CATALOG_SNAPSHOT_INVALID",
@@ -1611,6 +1631,181 @@ class MemoryRepository:
                    "created_at": _now()}
             self.catalog_candidates[key] = row
             return dict(row)
+
+    # -- ingestion recovery (20260924000200) ------------------------------------
+    #
+    # `diagnostics` (a `CatalogWriteDiagnostics`) is accepted for parity with the
+    # Supabase repository, which writes it to its server log on a failed call;
+    # nothing here fails that way, so it is unused.
+    #
+    # The database runs a batch as SET statements under one lease check and
+    # one authority lock, restating the single-row rules. Here each row goes
+    # through the single-row rules in order, ALL OR NOTHING, which is the same
+    # outcome: the same refusals, the same replay, the same counts, and none
+    # of the batch left behind when any row is refused.
+
+    def _catalog_all_or_nothing(self, write):
+        with self.lock:
+            # Rows are only ever added, except a snapshot's counters and a
+            # candidate's status, so row-level copies are a complete undo.
+            saved = ({key: dict(row) for key, row in self.catalog_snapshots.items()},
+                     dict(self.catalog_raw_records),
+                     {key: dict(row) for key, row in self.catalog_candidates.items()})
+            try:
+                return write()
+            except BaseException:
+                (self.catalog_snapshots, self.catalog_raw_records,
+                 self.catalog_candidates) = saved
+                raise
+
+    @staticmethod
+    def _catalog_batch_snapshot(rows: Any) -> str:
+        rows = list(rows or [])
+        if not 1 <= len(rows) <= MAX_CATALOG_WRITE_BATCH or any(
+                not isinstance(row, Mapping) for row in rows):
+            raise AppError("CATALOG_BATCH_INVALID",
+                           f"a catalog write batch holds 1 to {MAX_CATALOG_WRITE_BATCH} rows", 400)
+        snapshots = {str(row.get("snapshot_id") or "") for row in rows}
+        if len(snapshots) != 1 or "" in snapshots:
+            raise AppError("CATALOG_BATCH_INVALID", "one snapshot per catalog write batch", 400)
+        return snapshots.pop()
+
+    #: The LEAN row a batch answers with, per key field (20260924000200).
+    _CATALOG_BATCH_ROW_FIELDS = {
+        "record_key": ("id", "snapshot_id", "record_key", "upstream_record_id", "payload_sha256"),
+        "candidate_key": ("id", "snapshot_id", "raw_record_id", "candidate_key", "status"),
+    }
+
+    def _catalog_batch(self, run_id: UUID, rows: list[Mapping[str, Any]], key_field: str,
+                       prepare, existing: dict, write) -> dict[str, Any]:
+        """One all-or-nothing batch: `{rows, inserted, already_present}` with
+        lean rows, plus the cost fields the Supabase repository reports."""
+        snapshot_id = self._catalog_batch_snapshot(rows)
+        fields = self._CATALOG_BATCH_ROW_FIELDS[key_field]
+        started = time.monotonic()
+
+        def run() -> dict[str, Any]:
+            snapshot = self._catalog_write_authority(snapshot_id, run_id)
+            present = 0
+            keys = []
+            for row in rows:
+                # The derived key decides "already present", as in the RPC: a
+                # key repeated in the batch is present the second time.
+                key = (snapshot["id"], prepare(dict(row))[key_field])
+                if key in existing:
+                    present += 1
+                write(dict(row))
+                keys.append(key)
+            # Every row answers with what is stored under its key AFTER the
+            # whole batch, as the set-based RPC does (a repeated candidate key
+            # shows its last status on both rows).
+            written = [{field: existing[key].get(field) for field in fields} for key in keys]
+            return {"rows": written, "inserted": len(written) - present,
+                    "already_present": present}
+        answer = self._catalog_all_or_nothing(run)
+        prepared = [prepare(dict(row)) for row in rows]
+        return {**answer, "rpc_calls": 1,
+                "request_bytes": len(json.dumps(prepared, default=str).encode("utf-8")),
+                "max_call_seconds": time.monotonic() - started}
+
+    def record_catalog_raw_records(self, run_id: UUID, records: Any, *, worker_id: str,
+                                   attempt: int, lease_token: str,
+                                   diagnostics: Any = None) -> dict[str, Any]:
+        records = [dict(record) for record in list(records or [])]
+        lease = {"worker_id": worker_id, "attempt": attempt, "lease_token": lease_token}
+        with self.lock:
+            self._catalog_lease(run_id, worker_id, attempt, lease_token)
+            return self._catalog_batch(run_id, records, "record_key", prepare_raw_record,
+                                       self.catalog_raw_records,
+                                       lambda row: self.record_catalog_raw_record(run_id, row, **lease))
+
+    def record_catalog_candidates(self, run_id: UUID, candidates: Any, *, worker_id: str,
+                                  attempt: int, lease_token: str,
+                                  diagnostics: Any = None) -> dict[str, Any]:
+        candidates = [dict(row) for row in list(candidates or [])]
+        lease = {"worker_id": worker_id, "attempt": attempt, "lease_token": lease_token}
+        with self.lock:
+            self._catalog_lease(run_id, worker_id, attempt, lease_token)
+            # Stricter than the single-row write, exactly as the batch RPC is:
+            # readings land only on a capture this run may write, while pending.
+            return self._catalog_batch(run_id, candidates, "candidate_key", prepare_candidate,
+                                       self.catalog_candidates,
+                                       lambda row: self.record_catalog_candidate(run_id, row, **lease))
+
+    #: The metadata an adopter's capture must reproduce exactly.
+    _CATALOG_ADOPTION_METADATA = ("capture_scope", "capture_contract", "page_chain_sha256",
+                                  "normalization_contract", "normalized_record_count",
+                                  "normalization_issue_count", "normalization_issues",
+                                  "normalization_issue_records")
+
+    def adopt_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *,
+                               worker_id: str, attempt: int, lease_token: str,
+                               diagnostics: Any = None) -> dict[str, Any]:
+        """Mirror of `adopt_catalog_snapshot_guarded` and its adoption trigger.
+
+        `created_by_run_id` never moves: the adoption row makes this run the
+        snapshot's CURRENT writer, and a `catalog_snapshot_adopted` event is
+        appended to this run in the same step."""
+        refused = AppError("CATALOG_SNAPSHOT_ADOPTION_REFUSED",
+                           "the database refused this operation", 409)
+        with self.lock:
+            self._catalog_lease(run_id, worker_id, attempt, lease_token)
+            adopter = self.runs[str(run_id)]
+            if (adopter.get("run_identity") or {}).get("workflow_key") != "operator_capture":
+                raise refused
+            snapshot = prepare_snapshot(snapshot)
+            if "activated_at" in snapshot or "stored_record_count" in snapshot:
+                raise AppError("CATALOG_SNAPSHOT_INVALID",
+                               "catalog snapshot activation is not a caller-supplied field", 400)
+            existing = self.catalog_snapshots.get(snapshot["snapshot_key"])
+            if existing is None:
+                raise refused
+            self._catalog_replay(existing, snapshot, self._CATALOG_SNAPSHOT_IDENTITY, "SNAPSHOT")
+            stored = existing.get("retrieval_metadata") or {}
+            offered = snapshot.get("retrieval_metadata") or {}
+            if any(stored.get(field) != offered.get(field)
+                   for field in self._CATALOG_ADOPTION_METADATA):
+                raise refused
+            writer = self._catalog_current_writer(existing)
+            if writer == str(run_id):
+                adoption = next((dict(row) for row in self.catalog_snapshot_adoptions
+                                 if row["snapshot_id"] == existing["id"]
+                                 and row["adopted_by_run_id"] == str(run_id)), None)
+                return {"snapshot": dict(existing), "adoption": adoption}
+            previous = self.runs.get(writer)
+            now = _now()
+            if (adopter.get("status") not in ("starting", "running")
+                    or not adopter.get("lease_expires_at") or adopter["lease_expires_at"] <= now):
+                raise refused
+            if (previous is None or previous.get("status") not in ("failed", "cancelled", "timed_out")
+                    or (previous.get("lease_expires_at") and previous["lease_expires_at"] > now)):
+                raise refused
+            if existing["activated_at"] is not None or existing["validation_state"] != "pending":
+                raise refused
+            if any(row["snapshot_id"] == existing["id"] and row["adopted_by_run_id"] == str(run_id)
+                   for row in self.catalog_snapshot_adoptions):
+                raise refused
+            adoption = {
+                "snapshot_id": existing["id"],
+                "adoption_seq": 1 + max((row["adoption_seq"] for row in self.catalog_snapshot_adoptions
+                                         if row["snapshot_id"] == existing["id"]), default=0),
+                "adopted_by_run_id": str(run_id), "previous_writer_run_id": writer,
+                "adopted_at": now}
+            self.catalog_snapshot_adoptions.append(adoption)
+            self.run_events.append({
+                "id": len(self.run_events) + 1, "run_id": str(run_id),
+                "event_type": "catalog_snapshot_adopted",
+                "message": "adopted an orphaned pending catalog snapshot",
+                "agent": None, "phase": None, "progress": None,
+                "payload": {"snapshot_id": existing["id"], "snapshot_key": existing["snapshot_key"],
+                            "adoption_seq": adoption["adoption_seq"],
+                            "previous_writer_run_id": writer,
+                            "stored_record_count": existing["stored_record_count"],
+                            "declared_record_count": existing["declared_record_count"]},
+                "created_at": now})
+            return {"snapshot": dict(existing), "adoption": {
+                key: adoption[key] for key in ("adoption_seq", "adopted_by_run_id",
+                                               "previous_writer_run_id", "adopted_at")}}
 
     def link_catalog_candidate_evidence(self, run_id: UUID, link: dict[str, Any], *,
                                         worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:

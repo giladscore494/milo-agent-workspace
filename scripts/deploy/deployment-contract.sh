@@ -318,8 +318,11 @@ MILO_STAGE2_VERCEL_RUN_START_FLAG="GATEWAY_ALLOW_RUN_START_ROUTES"
 
 # The database surface the Mapping Plan -> prepared batch -> Swarm V2 path
 # calls, created by the three scoped-catalog migrations
-# (20260922000100, 20260923000100, 20260924000100). Each must exist and be
-# EXECUTE-able by service_role and by neither anon nor authenticated.
+# (20260922000100, 20260923000100, 20260924000100) and by the ingestion
+# recovery migration (20260924000200: the batched raw-record and candidate
+# writes a preparation's scoped capture lands through, and the adoption of an
+# orphaned pending snapshot). Each must exist and be EXECUTE-able by
+# service_role and by neither anon nor authenticated.
 # tests/test_scoped_rollout_contract.py holds this list to the migrations and
 # to the repository's own RPC calls.
 MILO_WORK_SCOPE_RPCS=(
@@ -332,6 +335,9 @@ MILO_WORK_SCOPE_RPCS=(
   create_work_scope_batch_run
   work_scope_progress
   set_work_scope_paused
+  record_catalog_raw_records_batch_guarded
+  record_catalog_candidates_batch_guarded
+  adopt_catalog_snapshot_guarded
 )
 MILO_WORK_SCOPE_TABLES=(
   catalog_work_scopes
@@ -342,4 +348,7 @@ MILO_WORK_SCOPE_TABLES=(
   catalog_work_scope_queue_items
   catalog_work_scope_batch_runs
   catalog_work_scope_controls
+  catalog_snapshot_adoptions
 )
+# The migrations that create that surface, named in the readiness remedy.
+MILO_WORK_SCOPE_MIGRATIONS="20260922000100, 20260923000100, 20260924000100, 20260924000200"

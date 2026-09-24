@@ -168,6 +168,7 @@ import os
 import re
 import sys
 import threading
+import time
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -189,7 +190,7 @@ from backend.catalog.scope.preparation import (PREPARATION_REASONS as
                                                WorkScopePreparationError,
                                                prepare_work_scope)
 from backend.engines.swarm_v2.evidence import WorkerLease
-from backend.errors import AppError
+from backend.errors import LEASE_FAILURE_CODES, AppError, RepositoryFailure
 from backend.event_registry import CAPTURE_SNAPSHOT_REPLAYED
 from backend.finalization import RunFinalizer, TerminalClaim
 from backend.run_identity import (
@@ -360,8 +361,22 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "the run was cancelled before the capture finished",
     "CAPTURE_LEASE_LOST":
         "the worker lease was lost before the capture finished",
+    # A durable catalog operation failed. One reason per static failure class
+    # (`backend.errors.REPOSITORY_FAILURE_CLASSES`), decided from the
+    # failure's shape and never from its text; a write refused for a stale
+    # lease is `CAPTURE_LEASE_LOST` above.
+    "CAPTURE_REPOSITORY_TRANSIENT":
+        "a durable catalog operation failed transiently (network, timeout, 429 or 5xx) "
+        "after its bounded retries",
+    "CAPTURE_REPOSITORY_REJECTED":
+        "the database refused the content of a durable catalog operation",
     "CAPTURE_REPOSITORY_UNAVAILABLE":
-        "a durable catalog operation could not be completed",
+        "a durable catalog operation could not be completed for an unclassified reason",
+    # HTTP 413 on a catalog write batch that was already split down to its
+    # floor (`CATALOG_BATCH_SPLIT_FLOOR` rows): the request body is refused as
+    # too large before the database sees it, and nothing was written.
+    "CAPTURE_REPOSITORY_REQUEST_TOO_LARGE":
+        "a durable catalog write batch was refused as too large (HTTP 413) even at its smallest split",
     "CAPTURE_REPORT_NOT_WRITTEN":
         "the execution report could not be written to the requested path",
     "CAPTURE_UNEXPECTED_FAILURE":
@@ -371,6 +386,14 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "scoped preparation needs a plan id, a whole revision number and its digest, together",
     "CAPTURE_WORK_SCOPE_PREPARATION_DISABLED":
         "scoped work-scope preparation is not enabled for this process",
+}
+
+
+#: `RepositoryFailure.failure_class` -> the reason this entrypoint reports.
+REPOSITORY_FAILURE_REASONS: Mapping[str, str] = {
+    "transient": "CAPTURE_REPOSITORY_TRANSIENT",
+    "rejected": "CAPTURE_REPOSITORY_REJECTED",
+    "unavailable": "CAPTURE_REPOSITORY_UNAVAILABLE",
 }
 
 
@@ -766,18 +789,46 @@ class _CaptureSupervisor:
     re-checks the lease atomically on every guarded write and on activation, so
     a stale process simply stops being accepted. This stops it sooner, and
     tells the operator which of the two happened.
+
+    One failed heartbeat is not a lost lease. The database REFUSING the
+    heartbeat (`RUN_LEASE_LOST`: another worker holds it, or it expired) is,
+    at once. Any other failure -- a network blip, a 5xx -- only means this
+    beat did not land: the lease the last successful beat set is still live in
+    the database, so the capture continues and the next beat comes sooner
+    (`RETRY_INTERVAL_SECONDS`). The lease is declared lost when this process
+    can no longer PROVE it: when no beat has succeeded for the lease duration
+    minus one interval of margin. Before this, one transient heartbeat error
+    stopped the heartbeat thread for good and failed a healthy ingestion as
+    `CAPTURE_LEASE_LOST`.
     """
 
+    #: How soon a failed beat is retried, at most. Never later than the
+    #: regular interval.
+    RETRY_INTERVAL_SECONDS = 5.0
+
     def __init__(self, repository: Any, lease: WorkerLease, *, lease_seconds: int,
-                 interval: float) -> None:
+                 interval: float, clock: Any = time.monotonic) -> None:
         self._repository = repository
         self._lease = lease
         self._lease_seconds = lease_seconds
         self._interval = interval
+        self._clock = clock
+        # The claim that produced `lease` set the lease's expiry, so it is the
+        # first proof this process holds the lease.
+        self._last_proof = clock()
+        self._failed_beats = 0
         self._lease_lost = threading.Event()
         self._cancelled = threading.Event()
         self._stopping = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def _unproven(self) -> bool:
+        """A beat did not land. False once the lease can no longer be proved."""
+        self._failed_beats += 1
+        if self._clock() - self._last_proof >= self._lease_seconds - self._interval:
+            self._lease_lost.set()
+            return False
+        return True
 
     def beat(self) -> bool:
         """One heartbeat. False once the lease is gone."""
@@ -786,12 +837,17 @@ class _CaptureSupervisor:
                 self._lease.run_id, self._lease.worker_id,
                 lease_seconds=self._lease_seconds, attempt=self._lease.attempt,
                 lease_token=self._lease.lease_token)
+        except AppError as failure:
+            # Deliberately silent: the exception may quote a URL, a row or a
+            # database message. Only its static code is read.
+            if failure.code in LEASE_FAILURE_CODES:
+                self._lease_lost.set()
+                return False
+            return self._unproven()
         except Exception:
-            # Deliberately broad and deliberately silent: whatever the cause,
-            # this process can no longer prove it holds the lease, and the
-            # exception may quote a URL, a row or a database message.
-            self._lease_lost.set()
-            return False
+            return self._unproven()
+        self._last_proof = self._clock()
+        self._failed_beats = 0
         status = str((run or {}).get("status") or "")
         if status == "cancellation_requested" or status in TERMINAL_STATES:
             self._cancelled.set()
@@ -838,9 +894,14 @@ class _CaptureSupervisor:
             self._thread = None
 
     def _loop(self) -> None:
-        while not self._stopping.wait(self._interval):
+        while not self._stopping.wait(self._next_wait()):
             if not self.beat():
                 return
+
+    def _next_wait(self) -> float:
+        if self._failed_beats:
+            return min(self._interval, self.RETRY_INTERVAL_SECONDS)
+        return self._interval
 
 
 # =============================================================================
@@ -878,7 +939,57 @@ def _snapshot_document(report: Any) -> dict[str, Any]:
         "rejected_record_count": int(report.rejected_record_count),
         "activated": bool(report.activated),
         "reused_existing": bool(report.reused_existing),
+        # The run whose orphaned pending snapshot this capture adopted, or "".
+        "adopted_from_run_id": _text(getattr(report, "adopted_from_run_id", "") or ""),
+        "ingestion": ingestion_document(getattr(report, "ingestion", None)),
     }
+
+
+def _count(value: Any) -> int | None:
+    """A reported count: a non-negative whole number, or None ("not reported")."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _seconds(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return round(float(value), 3)
+    return 0.0
+
+
+def ingestion_document(metrics: Any) -> dict[str, Any]:
+    """What one ingestion cost, from a closed schema: per phase the database
+    calls actually sent, the wall time, the request bytes and the slowest
+    single call (the figure the 8 s statement timeout applies to), for the row
+    writes the rows inserted and those already present, and the adoption's
+    number and previous writer. Counts, seconds and one run id only -- no row,
+    no key, no register text."""
+    from backend.catalog.government.ingest import INGESTION_PHASES
+
+    metrics = metrics if isinstance(metrics, Mapping) else {}
+    document: dict[str, Any] = {}
+    for name in INGESTION_PHASES:
+        phase = metrics.get(name) if isinstance(metrics.get(name), Mapping) else {}
+        entry: dict[str, Any] = {
+            "calls": _count(phase.get("calls")) or 0,
+            "seconds": _seconds(phase.get("seconds")),
+            "request_bytes": _count(phase.get("request_bytes")) or 0,
+            "max_call_seconds": _seconds(phase.get("max_call_seconds"))}
+        if name in ("raw", "candidates"):
+            entry["inserted"] = _count(phase.get("inserted"))
+            entry["already_present"] = _count(phase.get("already_present"))
+        document[name] = entry
+    document["total_calls"] = sum(document[name]["calls"] for name in INGESTION_PHASES)
+    document["total_seconds"] = round(sum(document[name]["seconds"]
+                                          for name in INGESTION_PHASES), 3)
+    document["total_request_bytes"] = sum(document[name]["request_bytes"]
+                                          for name in INGESTION_PHASES)
+    document["max_call_seconds"] = max(document[name]["max_call_seconds"]
+                                       for name in INGESTION_PHASES)
+    document["adoption_seq"] = _count(metrics.get("adoption_seq")) or 0
+    document["previous_writer_run_id"] = _text(metrics.get("previous_writer_run_id") or "", 64)
+    return document
 
 
 def capture_document(outcome: RefreshOutcome, *, replayed: bool) -> dict[str, Any]:
@@ -947,6 +1058,8 @@ def work_scope_document(preparation: WorkScopePreparation) -> dict[str, Any]:
             "state": _text(unit.get("state") or capture.state),
             "reason_code": _text(unit.get("reason_code") or ""),
             "capture": _text(capture.capture),
+            "adopted_from_run_id": _text(capture.adopted_from_run_id),
+            "ingestion": ingestion_document(capture.ingestion),
             "snapshot_key": _text(capture.snapshot_key),
             "readable_count": int(unit.get("readable_count") or 0),
             "ambiguous_count": int(unit.get("ambiguous_count") or 0),
@@ -1049,9 +1162,22 @@ def _classify(failure: BaseException) -> str:
             return failure.reason_code
     if isinstance(failure, AppError):
         # The preparation's own refusals are static codes the repository layer
-        # already mapped; anything else stays one classification.
+        # already mapped.
         if failure.code in WORK_SCOPE_REPOSITORY_REASONS:
             return failure.code
+        # A guarded write refused for a stale lease: this process no longer
+        # holds the run, which is not a repository outage.
+        if failure.code in LEASE_FAILURE_CODES:
+            return "CAPTURE_LEASE_LOST"
+        if isinstance(failure, RepositoryFailure):
+            if getattr(failure, "too_large", False):
+                return "CAPTURE_REPOSITORY_REQUEST_TOO_LARGE"
+            return REPOSITORY_FAILURE_REASONS.get(failure.failure_class,
+                                                  "CAPTURE_REPOSITORY_UNAVAILABLE")
+        # A repository's own static catalog refusal (an idempotency conflict,
+        # an ownership refusal): the content was refused, not the connection.
+        if failure.code.startswith("CATALOG_"):
+            return "CAPTURE_REPOSITORY_REJECTED"
         return "CAPTURE_REPOSITORY_UNAVAILABLE"
     return "CAPTURE_UNEXPECTED_FAILURE"
 
@@ -1454,7 +1580,8 @@ __all__ = ["CAPTURE_ENTRYPOINT", "CAPTURE_MAX_PAGES", "CAPTURE_MAX_RECORDS",
            "ELIGIBLE_RUN_STATUS", "EXIT_FAILED", "EXIT_OK", "EXIT_REFUSED",
            "LAUNCH_ACQUIRABLE_STATES", "OPERATOR_CAPTURE_OPERATION",
            "OPERATOR_OWNED_LAUNCH_STATE", "PAID_EXECUTION_FLAG",
-           "PREPARED_RUN_CONTENT", "SCHEMA_REPORT_ACKNOWLEDGEMENT", "build_parser",
+           "PREPARED_RUN_CONTENT", "REPOSITORY_FAILURE_REASONS",
+           "SCHEMA_REPORT_ACKNOWLEDGEMENT", "build_parser",
            "capture_document", "configured_project_ref", "main", "plan_document",
            "safe_message"]
 
