@@ -11,6 +11,7 @@ from postgrest.exceptions import APIError
 from postgrest.types import CountMethod
 from supabase import create_client
 from backend.catalog.contracts import MAX_CATALOG_WRITE_BATCH
+from backend.catalog.write_diagnostics import CATALOG_INGESTION_RPCS, CatalogWriteDiagnostics
 from backend.catalog.diff import MAX_DIFF_ITEMS
 from backend.catalog.payloads import (prepare_candidate, prepare_evidence_link,
                                       prepare_promotion, prepare_raw_record,
@@ -97,14 +98,14 @@ class Repository(Protocol):
     # one is idempotent on a backend-derived key.  There is deliberately no
     # canonical-promotion method here: the canonical tables are read-only in
     # PR1 at the database level, so no repository method could write one.
-    def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]: ...
     def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
-    def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]: ...
     def record_catalog_candidate(self, run_id: UUID, candidate: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     # Ingestion recovery (20260924000200): bounded batches and adoption.
-    def record_catalog_raw_records(self, run_id: UUID, records: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
-    def record_catalog_candidates(self, run_id: UUID, candidates: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
-    def adopt_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_catalog_raw_records(self, run_id: UUID, records: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]: ...
+    def record_catalog_candidates(self, run_id: UUID, candidates: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]: ...
+    def adopt_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]: ...
     def link_catalog_candidate_evidence(self, run_id: UUID, link: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
 
     # --- durable catalog reads (PR2: internal, bounded, no lease) ------------
@@ -193,10 +194,18 @@ _SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
 #: authenticator role's 8 s statement AND lock timeouts (verified on
 #: Production, read-only, 2026-09-24), so an over-long batch fails with one of
 #: these -- and would fail the same way if merely repeated. A batch that hits
-#: one is SPLIT instead (`_split_catalog_batch`); nothing else is.
+#: one is SPLIT instead (`_split_catalog_batch`); so is an HTTP 413, and
+#: nothing else is.
 _TIMEOUT_SQLSTATES = frozenset({"57014", "55P03"})
-#: The smallest batch a timed-out batch is split down to. A batch of this size
-#: that still times out is reported as the transient failure it is.
+#: HTTP 413 Payload Too Large: a gateway in front of PostgREST refused the
+#: request BODY before the database saw it. No limit is assumed here -- none is
+#: documented for this project -- so the batch size is not tuned to one; a
+#: batch that draws a 413 is SPLIT exactly like a timed-out one, and nothing
+#: else is.
+_REQUEST_TOO_LARGE = "413"
+#: The smallest batch a timed-out (or too large) batch is split down to. A
+#: batch of this size that still times out is reported as the transient
+#: failure it is; one still refused as too large, as `too_large`.
 CATALOG_BATCH_SPLIT_FLOOR = 25
 
 #: The bounded retry of the catalog ingestion writes. Four attempts in all,
@@ -224,6 +233,15 @@ def failure_code(exc: BaseException) -> str:
 def is_statement_timeout(exc: BaseException) -> bool:
     """Whether the database cancelled the statement for a statement or lock timeout."""
     return failure_code(exc) in _TIMEOUT_SQLSTATES
+
+
+def is_request_too_large(exc: BaseException, http_status: Any = None) -> bool:
+    """Whether the request body was refused as too large (HTTP 413).
+
+    Read from the code PostgREST's client puts on a non-JSON error (the
+    status) or from the response's own status, which a JSON 413 from a gateway
+    carries only there. Never from a message."""
+    return failure_code(exc) == _REQUEST_TOO_LARGE or http_status == int(_REQUEST_TOO_LARGE)
 
 
 def classify_repository_failure(exc: BaseException) -> str:
@@ -300,7 +318,9 @@ class SupabaseRepository:
             pass
 
     def _log_guarded_failure(self, function: str, exc: BaseException, failure: str,
-                             attempt: int, attempts: int, *, retrying: bool) -> None:
+                             attempt: int, attempts: int, *, retrying: bool = False,
+                             action: str | None = None,
+                             diagnostics: CatalogWriteDiagnostics | None = None) -> None:
         """One server-log line per failed guarded RPC attempt.
 
         Static fields only: the RPC's own name (a code constant), the CHAINED
@@ -310,14 +330,26 @@ class SupabaseRepository:
         details, the hint or the payload -- those can quote SQL values, URLs
         and credentials. No brace appears in the line, so a log reader that
         looks for the capture's JSON document can never mistake it for one.
+
+        A catalog ingestion write adds WHERE it failed -- run, snapshot, phase
+        and batch position -- from a `CatalogWriteDiagnostics` its reviewed
+        caller built (identifiers and whole numbers only). Every other guarded
+        RPC logs exactly the line above and nothing more.
         """
+        status = self._last_http_status()
+        line = ("guarded rpc failed function=%s cause=%s code=%s http_status=%s class=%s "
+                "attempt=%d/%d action=%s")
+        values: list[Any] = [function, type(exc).__name__, failure_code(exc) or "none",
+                             status if isinstance(status, int) else "none", failure, attempt,
+                             attempts, action or ("retry" if retrying else "raise")]
+        if isinstance(diagnostics, CatalogWriteDiagnostics):
+            line += " %s"
+            values.append(diagnostics.log_fields())
+        _LOG.warning(line, *values)
+
+    def _last_http_status(self) -> int | None:
         status = getattr(getattr(self, "_http", None), "status", None)
-        _LOG.warning(
-            "guarded rpc failed function=%s cause=%s code=%s http_status=%s class=%s "
-            "attempt=%d/%d action=%s",
-            function, type(exc).__name__, failure_code(exc) or "none",
-            status if isinstance(status, int) else "none", failure, attempt, attempts,
-            "retry" if retrying else "raise")
+        return status if isinstance(status, int) else None
 
     def _single(self, query: Any, resource: str, identifier: str) -> dict[str, Any]:
         try:
@@ -718,8 +750,10 @@ class SupabaseRepository:
     def _guarded_rpc(self, function: str, params: dict[str, Any], resource: str, *,
                      retry_transient: bool = False,
                      refusals: tuple[str, ...] = (),
-                     split_on_timeout: bool = False,
-                     stats: dict[str, Any] | None = None) -> Any:
+                     split_oversize: bool = False,
+                     at_split_floor: bool = False,
+                     stats: dict[str, Any] | None = None,
+                     diagnostics: CatalogWriteDiagnostics | None = None) -> Any:
         """Call a lease-guarded RPC (migration 20260810000300); a stale lease
         surfaces as RUN_LEASE_LOST so worker code paths treat it exactly like
         a failed heartbeat.
@@ -733,12 +767,21 @@ class SupabaseRepository:
         failure becomes an AppError of exactly that code, never its text.
         Every failed attempt is logged by `_log_guarded_failure`.
 
-        With `split_on_timeout` (the batch writes), a statement or lock
-        timeout is NOT retried here: repeating the same over-long batch would
-        time out again, so it is raised at once as a timed-out
-        `RepositoryFailure` for the caller to split. `stats`, when given,
-        accumulates every attempt actually sent: `calls`, `request_bytes` and
-        `max_call_seconds`."""
+        With `split_oversize` (the batch writes), a statement or lock timeout
+        and an HTTP 413 are NOT retried here: repeating the same batch would
+        fail the same way, so each is raised at once -- a timed-out or a
+        too-large `RepositoryFailure` -- for the caller to split
+        (`at_split_floor` says it can split no further, and the log says
+        `raise` rather than `split`). No other failure is ever split: a lost
+        lease, a refusal and a content rejection are raised as before.
+        `stats`, when given, accumulates every attempt actually sent: `calls`,
+        `request_bytes` and `max_call_seconds`.
+
+        `diagnostics` is accepted only for the catalog ingestion RPCs, and
+        only reaches the server log (`_log_guarded_failure`)."""
+        if diagnostics is not None and (not isinstance(diagnostics, CatalogWriteDiagnostics)
+                                        or function not in CATALOG_INGESTION_RPCS):
+            raise ValueError("write diagnostics are accepted only for the catalog ingestion RPCs")
         attempts = CATALOG_WRITE_ATTEMPTS if retry_transient else 1
         request_bytes = _request_bytes(params) if stats is not None else 0
         for attempt in range(1, attempts + 1):
@@ -752,23 +795,28 @@ class SupabaseRepository:
                 break
             except Exception as exc:
                 _observe(stats, request_bytes, time.monotonic() - started)
-                if split_on_timeout and is_statement_timeout(exc):
+                oversize = "raise" if at_split_floor else "split"
+                if split_oversize and is_statement_timeout(exc):
                     self._log_guarded_failure(function, exc, "transient", attempt, attempts,
-                                              retrying=False)
+                                              action=oversize, diagnostics=diagnostics)
                     raise RepositoryFailure("transient", timed_out=True) from exc
+                if split_oversize and is_request_too_large(exc, self._last_http_status()):
+                    self._log_guarded_failure(function, exc, "unavailable", attempt, attempts,
+                                              action=oversize, diagnostics=diagnostics)
+                    raise RepositoryFailure("unavailable", too_large=True) from exc
                 if self._is_stale_lease_error(exc):
                     self._log_guarded_failure(function, exc, "lease_lost", attempt, attempts,
-                                              retrying=False)
+                                              diagnostics=diagnostics)
                     raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409) from exc
                 for marker in refusals:
                     if marker in str(exc):
                         self._log_guarded_failure(function, exc, "refused", attempt, attempts,
-                                                  retrying=False)
+                                                  diagnostics=diagnostics)
                         raise AppError(marker, "the database refused this operation", 409) from exc
                 failure = classify_repository_failure(exc)
                 retrying = failure == "transient" and attempt < attempts
                 self._log_guarded_failure(function, exc, failure, attempt, attempts,
-                                          retrying=retrying)
+                                          retrying=retrying, diagnostics=diagnostics)
                 if retrying:
                     self._retry_sleep(CATALOG_WRITE_BACKOFF_SECONDS[attempt - 1])
                     continue
@@ -1316,11 +1364,11 @@ class SupabaseRepository:
     # candidate_key)`, activation on the decided state, adoption on the owner
     # -- so a retry of a write whose response was lost lands on the same row
     # and never counts a record twice (tests/test_migrations_postgres.py).
-    def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+    def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
                   "p_snapshot": prepare_snapshot(snapshot)}
         return self._guarded_rpc("record_catalog_snapshot_guarded", params, "catalog_snapshot",
-                                 retry_transient=True)
+                                 retry_transient=True, diagnostics=diagnostics)
 
     def record_catalog_raw_record(self, run_id: UUID, record: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
@@ -1328,10 +1376,10 @@ class SupabaseRepository:
         return self._guarded_rpc("record_catalog_raw_record_guarded", params, "catalog_raw_record",
                                  retry_transient=True)
 
-    def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+    def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_activation": activation}
         return self._guarded_rpc("activate_catalog_snapshot_guarded", params, "catalog_snapshot",
-                                 retry_transient=True)
+                                 retry_transient=True, diagnostics=diagnostics)
 
     def record_catalog_candidate(self, run_id: UUID, candidate: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
@@ -1370,24 +1418,32 @@ class SupabaseRepository:
         return {"rows": rows, "inserted": inserted, "already_present": present}
 
     def _split_catalog_batch(self, prepared: list[dict[str, Any]], call: Any,
-                             resource: str, stats: dict[str, Any]) -> dict[str, Any]:
-        """One batch, or -- when it hit a statement or lock timeout -- its two
-        halves, recursively, down to `CATALOG_BATCH_SPLIT_FLOOR` rows.
+                             resource: str, stats: dict[str, Any],
+                             offset: int = 0) -> dict[str, Any]:
+        """One batch, or -- when it hit a statement or lock timeout, or its
+        body was refused as too large (HTTP 413) -- its two halves,
+        recursively, down to `CATALOG_BATCH_SPLIT_FLOOR` rows. Bounded: a
+        200-row batch is at most 15 calls.
 
-        Safe because a timed-out statement committed nothing, and because every
-        row write is idempotent on its key: a half that DID land (its answer
-        lost after commit, then retried by `_guarded_rpc`) replays onto the
-        same rows and reports them as already present. Rows come back in input
-        order, and the counts are the sums of what each call reported.
+        Safe because a timed-out statement committed nothing and a refused
+        body never reached the database, and because every row write is
+        idempotent on its key: a half that DID land (its answer lost after
+        commit, then retried by `_guarded_rpc`) replays onto the same rows and
+        reports them as already present. Rows come back in input order, and
+        the counts are the sums of what each call reported. `offset` is the
+        part's position in the original batch, for the log line only.
         """
         try:
-            return self._catalog_batch_result(call(prepared, stats), len(prepared), resource)
+            return self._catalog_batch_result(call(prepared, stats, offset), len(prepared),
+                                              resource)
         except RepositoryFailure as failure:
-            if not failure.timed_out or len(prepared) <= CATALOG_BATCH_SPLIT_FLOOR:
+            if not (failure.timed_out or failure.too_large) \
+                    or len(prepared) <= CATALOG_BATCH_SPLIT_FLOOR:
                 raise
         middle = len(prepared) // 2
-        first = self._split_catalog_batch(prepared[:middle], call, resource, stats)
-        second = self._split_catalog_batch(prepared[middle:], call, resource, stats)
+        first = self._split_catalog_batch(prepared[:middle], call, resource, stats, offset)
+        second = self._split_catalog_batch(prepared[middle:], call, resource, stats,
+                                           offset + middle)
         return {"rows": first["rows"] + second["rows"],
                 "inserted": first["inserted"] + second["inserted"],
                 "already_present": first["already_present"] + second["already_present"]}
@@ -1398,23 +1454,30 @@ class SupabaseRepository:
                 "request_bytes": int(stats.get("request_bytes") or 0),
                 "max_call_seconds": float(stats.get("max_call_seconds") or 0.0)}
 
-    def record_catalog_raw_records(self, run_id: UUID, records: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+    def _part_diagnostics(self, diagnostics: CatalogWriteDiagnostics | None, offset: int,
+                          part: list[dict[str, Any]]) -> CatalogWriteDiagnostics | None:
+        return None if diagnostics is None else diagnostics.for_part(offset, part)
+
+    def record_catalog_raw_records(self, run_id: UUID, records: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]:
         """Up to `MAX_CATALOG_WRITE_BATCH` raw records of ONE snapshot, in one
-        transaction, each through the unchanged single-row RPC. Answers
-        `{rows (lean, input order), inserted, already_present}` plus what it
-        cost: `rpc_calls`, `request_bytes`, `max_call_seconds`."""
+        set-based, all-or-nothing call. Answers `{rows (lean, input order),
+        inserted, already_present}` plus what it cost: `rpc_calls`,
+        `request_bytes`, `max_call_seconds`."""
         prepared = self._catalog_batch(records, prepare_raw_record)
         lease = self._lease_params(run_id, worker_id, attempt, lease_token)
         stats: dict[str, Any] = {}
 
-        def call(part: list[dict[str, Any]], observed: dict[str, Any]) -> Any:
+        def call(part: list[dict[str, Any]], observed: dict[str, Any], offset: int) -> Any:
             return self._guarded_rpc("record_catalog_raw_records_batch_guarded",
                                      {**lease, "p_records": part}, "catalog_raw_record",
-                                     retry_transient=True, split_on_timeout=True, stats=observed)
+                                     retry_transient=True, split_oversize=True,
+                                     at_split_floor=len(part) <= CATALOG_BATCH_SPLIT_FLOOR,
+                                     stats=observed,
+                                     diagnostics=self._part_diagnostics(diagnostics, offset, part))
         return self._with_stats(
             self._split_catalog_batch(prepared, call, "catalog raw record", stats), stats)
 
-    def record_catalog_candidates(self, run_id: UUID, candidates: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+    def record_catalog_candidates(self, run_id: UUID, candidates: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]:
         """Up to `MAX_CATALOG_WRITE_BATCH` candidates of ONE snapshot this run
         may write and has not decided, in one transaction; answered and split
         exactly as `record_catalog_raw_records`."""
@@ -1422,14 +1485,17 @@ class SupabaseRepository:
         lease = self._lease_params(run_id, worker_id, attempt, lease_token)
         stats: dict[str, Any] = {}
 
-        def call(part: list[dict[str, Any]], observed: dict[str, Any]) -> Any:
+        def call(part: list[dict[str, Any]], observed: dict[str, Any], offset: int) -> Any:
             return self._guarded_rpc("record_catalog_candidates_batch_guarded",
                                      {**lease, "p_candidates": part}, "catalog_candidate",
-                                     retry_transient=True, split_on_timeout=True, stats=observed)
+                                     retry_transient=True, split_oversize=True,
+                                     at_split_floor=len(part) <= CATALOG_BATCH_SPLIT_FLOOR,
+                                     stats=observed,
+                                     diagnostics=self._part_diagnostics(diagnostics, offset, part))
         return self._with_stats(
             self._split_catalog_batch(prepared, call, "catalog candidate", stats), stats)
 
-    def adopt_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+    def adopt_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str, diagnostics: CatalogWriteDiagnostics | None = None) -> dict[str, Any]:
         """Become the writer of a PENDING snapshot whose writer ended unsuccessfully.
 
         The database decides (`adopt_catalog_snapshot_guarded` and the trigger
@@ -1439,7 +1505,8 @@ class SupabaseRepository:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
                   "p_snapshot": prepare_snapshot(snapshot)}
         data = self._guarded_rpc("adopt_catalog_snapshot_guarded", params, "catalog_snapshot",
-                                 retry_transient=True, refusals=(CATALOG_ADOPTION_REFUSED,))
+                                 retry_transient=True, refusals=(CATALOG_ADOPTION_REFUSED,),
+                                 diagnostics=diagnostics)
         if not isinstance(data, dict) or not isinstance(data.get("snapshot"), dict):
             raise RepositoryFailure("unavailable", "catalog snapshot adoption answered the wrong shape")
         return data

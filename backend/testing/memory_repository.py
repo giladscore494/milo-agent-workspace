@@ -1449,7 +1449,8 @@ class MemoryRepository:
         return dict(existing)
 
     def record_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *,
-                                worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+                                worker_id: str, attempt: int, lease_token: str,
+                                diagnostics: Any = None) -> dict[str, Any]:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
             snapshot = prepare_snapshot(snapshot)
@@ -1558,7 +1559,8 @@ class MemoryRepository:
             return dict(row)
 
     def activate_catalog_snapshot(self, run_id: UUID, activation: dict[str, Any], *,
-                                  worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+                                  worker_id: str, attempt: int, lease_token: str,
+                                  diagnostics: Any = None) -> dict[str, Any]:
         with self.lock:
             self._catalog_lease(run_id, worker_id, attempt, lease_token)
             snapshot = self._catalog_write_authority(activation.get("snapshot_id"), run_id,
@@ -1632,9 +1634,15 @@ class MemoryRepository:
 
     # -- ingestion recovery (20260924000200) ------------------------------------
     #
-    # The batches apply the unchanged single-row writes to each row, in order,
-    # ALL OR NOTHING -- the database runs them in one transaction, so a refusal
-    # of any row leaves none of the batch behind here either.
+    # `diagnostics` (a `CatalogWriteDiagnostics`) is accepted for parity with the
+    # Supabase repository, which writes it to its server log on a failed call;
+    # nothing here fails that way, so it is unused.
+    #
+    # The database runs a batch as SET statements under one lease check and
+    # one authority lock, restating the single-row rules. Here each row goes
+    # through the single-row rules in order, ALL OR NOTHING, which is the same
+    # outcome: the same refusals, the same replay, the same counts, and none
+    # of the batch left behind when any row is refused.
 
     def _catalog_all_or_nothing(self, write):
         with self.lock:
@@ -1679,13 +1687,19 @@ class MemoryRepository:
         def run() -> dict[str, Any]:
             snapshot = self._catalog_write_authority(snapshot_id, run_id)
             present = 0
-            written = []
+            keys = []
             for row in rows:
-                # The derived key decides "already present", as in the RPC.
-                if (snapshot["id"], prepare(dict(row))[key_field]) in existing:
+                # The derived key decides "already present", as in the RPC: a
+                # key repeated in the batch is present the second time.
+                key = (snapshot["id"], prepare(dict(row))[key_field])
+                if key in existing:
                     present += 1
-                stored = write(dict(row))
-                written.append({field: stored.get(field) for field in fields})
+                write(dict(row))
+                keys.append(key)
+            # Every row answers with what is stored under its key AFTER the
+            # whole batch, as the set-based RPC does (a repeated candidate key
+            # shows its last status on both rows).
+            written = [{field: existing[key].get(field) for field in fields} for key in keys]
             return {"rows": written, "inserted": len(written) - present,
                     "already_present": present}
         answer = self._catalog_all_or_nothing(run)
@@ -1695,7 +1709,8 @@ class MemoryRepository:
                 "max_call_seconds": time.monotonic() - started}
 
     def record_catalog_raw_records(self, run_id: UUID, records: Any, *, worker_id: str,
-                                   attempt: int, lease_token: str) -> dict[str, Any]:
+                                   attempt: int, lease_token: str,
+                                   diagnostics: Any = None) -> dict[str, Any]:
         records = [dict(record) for record in list(records or [])]
         lease = {"worker_id": worker_id, "attempt": attempt, "lease_token": lease_token}
         with self.lock:
@@ -1705,7 +1720,8 @@ class MemoryRepository:
                                        lambda row: self.record_catalog_raw_record(run_id, row, **lease))
 
     def record_catalog_candidates(self, run_id: UUID, candidates: Any, *, worker_id: str,
-                                  attempt: int, lease_token: str) -> dict[str, Any]:
+                                  attempt: int, lease_token: str,
+                                  diagnostics: Any = None) -> dict[str, Any]:
         candidates = [dict(row) for row in list(candidates or [])]
         lease = {"worker_id": worker_id, "attempt": attempt, "lease_token": lease_token}
         with self.lock:
@@ -1723,7 +1739,8 @@ class MemoryRepository:
                                   "normalization_issue_records")
 
     def adopt_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *,
-                               worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+                               worker_id: str, attempt: int, lease_token: str,
+                               diagnostics: Any = None) -> dict[str, Any]:
         """Mirror of `adopt_catalog_snapshot_guarded` and its adoption trigger.
 
         `created_by_run_id` never moves: the adoption row makes this run the

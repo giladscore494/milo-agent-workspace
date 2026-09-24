@@ -554,8 +554,9 @@ snapshot and the exact batch.
 
   | `reason_code` | Meaning | What to do |
   | --- | --- | --- |
-  | `CAPTURE_REPOSITORY_TRANSIENT` | a catalog write failed on the network, a timeout, HTTP 408/425/429/5xx, a PostgREST connection code, or SQLSTATE 08xxx / 53xxx / 40001 / 40P01 / 55P03 / 57014 / 57P0x, **after** its bounded retry (4 attempts, 0.5 s + 1 s + 2 s backoff) | infrastructure: check Supabase and Cloud Run egress health, then re-run D.4. The pending snapshot is adopted by the next run (D.5). Each failed attempt is logged by the capture job as `guarded rpc failed function=… cause=… code=… http_status=… class=… attempt=n/4` (no message, details or payload) |
+  | `CAPTURE_REPOSITORY_TRANSIENT` | a catalog write failed on the network, a timeout, HTTP 408/425/429/5xx, a PostgREST connection code, or SQLSTATE 08xxx / 53xxx / 40001 / 40P01 / 55P03 / 57014 / 57P0x, **after** its bounded retry (4 attempts, 0.5 s + 1 s + 2 s backoff) | infrastructure: check Supabase and Cloud Run egress health, then re-run D.4. The pending snapshot is adopted by the next run (D.5). Each failed attempt is logged by the capture job as `guarded rpc failed function=… cause=… code=… http_status=… class=… attempt=n/4 action=retry\|split\|raise run_id=… snapshot_id=… phase=snapshot\|adopt\|raw\|candidates\|activate batch=… rows=…-… capture_index=…-…` (no message, details, hint, payload, URL or token) |
   | `CAPTURE_REPOSITORY_REJECTED` | the database refused a write's content (SQLSTATE class 22 / 23, or a repository idempotency / ownership refusal) | **stop**: a code or data defect, never retried. Keep the execution name and escalate |
+  | `CAPTURE_REPOSITORY_REQUEST_TOO_LARGE` | a catalog write batch drew HTTP 413 (request body too large) at every split down to 25 rows; nothing of it was written | **stop**: a 25-row raw batch is about 80 KB, so the gateway is refusing ordinary bodies; keep the execution name and the `code=413 … phase=… batch=…` log lines, and escalate |
   | `CAPTURE_REPOSITORY_UNAVAILABLE` | a catalog write failed for any other reason (unclassified) | inspect the execution and the Supabase logs at that time before re-running |
   | `CAPTURE_LEASE_LOST` | the database refused a write or a heartbeat for a stale lease, or no heartbeat could be proved for the lease duration | another worker holds the run, or the lease lapsed; re-run D.4 (the snapshot stays pending and is adoptable once this run's lease expires) |
 
@@ -628,9 +629,14 @@ next revision reuse it without capturing again.
      `INGESTION_TOTAL_REQUEST_BYTES` and `INGESTION_MAX_CALL_SECONDS` state
      the cost. Every PostgREST call runs under an 8 s statement and lock
      timeout; `INGESTION_MAX_CALL_SECONDS` is the slowest single call and must
-     stay far below it (a 200-row raw batch measured 0.17-0.24 s on local
-     PostgreSQL; a batch that does hit the timeout is split in halves down to
-     25 rows automatically, which shows up as extra `calls`);
+     stay far below it (a 200-row set-based raw batch measured 0.07-0.11 s
+     on local PostgreSQL; a batch that does hit the timeout, or draws HTTP 413,
+     is split in halves down to 25 rows automatically, which shows up as extra
+     `calls`). With no retry and no split the whole ingestion is
+     `ceil(raw/200) + ceil(candidates/200) + 3` calls -- here at most
+     32 + 32 + 3 = 67, so expect `INGESTION_TOTAL_DB_CALLS` ≤ 70. The write
+     phase's target is under 2 minutes; `INGESTION_TOTAL_SECONDS` is the
+     measurement that decides it;
    - `WORK_SCOPE_PREPARATION_STATUS=succeeded` with
      `UNIT 1. toyota state=vocabulary_insufficient … queued=0`, then the
      prepared gate FAILS on `EVIDENCE_READY=NO (no unit of this revision was

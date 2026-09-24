@@ -9068,7 +9068,7 @@ def _rec_writer(db, snapshot: str) -> str:
     return db.psql(f"select public.catalog_snapshot_current_writer('{snapshot}')")
 
 
-def test_recovery_batches_are_the_single_row_writes_all_or_nothing(db):
+def test_recovery_batches_are_bounded_all_or_nothing_and_replayable(db):
     _user, _project, conversation = _ws_world(db)
     _run, args = _wsp_capture_run(db, conversation)
     label = f"batch-{conversation[:8]}"
@@ -9140,6 +9140,191 @@ def test_recovery_batches_are_the_single_row_writes_all_or_nothing(db):
                   lambda: _rec_raw_batch(db, args, _rec_records(pending, f"o2-{label}", [1]))):
         with pytest.raises(AssertionError, match="this catalog snapshot does not belong to this run"):
             write()
+
+
+def _rec_counted_batch(db, tmp_path, args: str, function: str, rows: list[dict],
+                       name: str) -> tuple[dict, dict[str, int]]:
+    """One batch call, and how many times each guarded function ran inside it.
+
+    `pg_stat_xact_user_functions` counts every function invocation of the
+    CURRENT transaction, nested ones included, so it states exactly what the
+    batch did internally: one lease check and one authority lock per batch,
+    and never a call of a single-row write.
+    """
+    sql = tmp_path / f"{name}.sql"
+    sql.write_text(
+        "set track_functions = 'all';\n"
+        "begin;\n"
+        "set local role service_role;\n"
+        f"select public.{function}({args}, $j${json.dumps(rows)}$j$::jsonb) as answer \\gset\n"
+        "reset role;\n"
+        "select coalesce(string_agg(funcname || '=' || calls, ',' order by funcname), '') "
+        "from pg_stat_xact_user_functions where schemaname = 'public';\n"
+        "commit;\n"
+        "select :'answer';\n", encoding="utf-8")
+    counts, answer = db.psql(file=sql).splitlines()[-2:]
+    calls = dict((item.split("=")[0], int(item.split("=")[1])) for item in counts.split(",") if item)
+    return json.loads(answer), calls
+
+
+def _rec_stored(db, snapshot: str) -> str:
+    return db.psql("select stored_record_count || '/' || (select count(*) from public.catalog_raw_records "
+                   f"where snapshot_id='{snapshot}') from public.catalog_source_snapshots where id='{snapshot}'")
+
+
+def test_set_based_batches_hold_every_single_row_rule(db, tmp_path):
+    """The batches are SET statements over one lease check and one authority
+    lock -- and still hold every rule the single-row writes hold: validation
+    with the same messages, replay onto the same rows, a conflict anywhere
+    failing the WHOLE batch, and a stored-record counter that is exact."""
+    _user, _project, conversation = _ws_world(db)
+    run, args = _wsp_capture_run(db, conversation)
+    label = f"set-{conversation[:8]}"
+    snapshot, _payload = _rec_pending_snapshot(db, args, label, 8, marque=None)
+    records = _rec_records(snapshot, label, range(10))
+
+    # SET-BASED: one lease check, one authority lock, no single-row write.
+    answer, calls = _rec_counted_batch(db, tmp_path, args, "record_catalog_raw_records_batch_guarded",
+                                       records[:5], "raw-first")
+    assert (answer["inserted"], answer["already_present"]) == (5, 0)
+    assert calls.get("assert_worker_lease") == 1
+    assert calls.get("assert_snapshot_write_authority") == 1
+    assert "record_catalog_raw_record_guarded" not in calls
+    first = {row["record_key"]: row["id"] for row in answer["rows"]}
+    assert _rec_stored(db, snapshot) == "5/5"
+
+    # PARTIAL replay: two present, two new -- rows in input order, the present
+    # ones on their existing ids, the counter moved by exactly two.
+    partial = _rec_raw_batch_answer(db, args, records[3:7])
+    assert (partial["inserted"], partial["already_present"]) == (2, 2)
+    assert [row["record_key"] for row in partial["rows"]] == [r["record_key"] for r in records[3:7]]
+    assert [row["id"] for row in partial["rows"][:2]] == [first[r["record_key"]] for r in records[3:5]]
+    assert _rec_stored(db, snapshot) == "7/7"
+    # A row repeated inside one batch is one row, present the second time.
+    twice = _rec_raw_batch_answer(db, args, [records[7], records[7]])
+    assert (twice["inserted"], twice["already_present"]) == (1, 1)
+    assert twice["rows"][0]["id"] == twice["rows"][1]["id"]
+    assert _rec_stored(db, snapshot) == "8/8"
+    # FULL replay changes nothing.
+    full = _rec_raw_batch_answer(db, args, records[:8])
+    assert (full["inserted"], full["already_present"]) == (0, 8)
+    assert _rec_stored(db, snapshot) == "8/8"
+
+    # A conflict ANYWHERE fails the WHOLE batch: the new row beside it is not
+    # written and the counter does not move.
+    conflicts = (
+        ([records[8], {**records[0], "upstream_record_id": "99999"}], "idempotency conflict"),
+        ([records[8], {**records[0], "source_locator": {"capture_index": 77}}], "idempotency conflict"),
+        ([records[8], {**records[0], "payload": {"_id": 42000, "changed": True}}], "idempotency conflict"),
+        # The same new key twice with different content.
+        ([records[8], {**records[8], "payload": {"_id": 42008, "changed": True}}], "idempotency conflict"),
+        # A new key claiming an upstream id another row holds.
+        ([records[8], {**records[9], "upstream_record_id": records[0]["upstream_record_id"]}],
+         "duplicate key value"),
+        # A new key claiming a capture position another row holds.
+        ([records[8], {**records[9], "source_locator": {"capture_index": 0}}], "duplicate key value"),
+        # Validation, reported for the first offending row, after a valid one.
+        ([records[8], {**records[9], "payload": None}], "identity or payload is missing"),
+        ([records[8], {**records[9], "payload_sha256": "0" * 64}], "derived, not supplied"),
+        ([records[8], {**records[9], "payload": {"x": "y" * 17000}}], "exceeds the durable bound"),
+        ([records[8], {**records[9], "source_locator": {"row": 1}}], "source locator"),
+        ([records[8], {**records[9], "resource_id": "another-resource"}], "resource mismatch"),
+    )
+    for batch, message in conflicts:
+        with pytest.raises(AssertionError, match=message):
+            _rec_raw_batch(db, args, batch)
+        assert _rec_stored(db, snapshot) == "8/8", message
+
+    record_ids = [row["id"] for row in full["rows"]]
+    candidates = _rec_candidates(snapshot, label, record_ids)
+    written, calls = _rec_counted_batch(db, tmp_path, args, "record_catalog_candidates_batch_guarded",
+                                        candidates[:5], "cand-first")
+    assert (written["inserted"], written["already_present"]) == (5, 0)
+    assert calls.get("assert_worker_lease") == 1
+    assert calls.get("assert_snapshot_write_authority") == 1
+    assert "record_catalog_candidate_guarded" not in calls
+    assert [row["candidate_key"] for row in written["rows"]] == [c["candidate_key"] for c in candidates[:5]]
+
+    def statuses() -> str:
+        return db.psql("select string_agg(candidate_key || '=' || status, ',' order by candidate_key) "
+                       f"from public.catalog_candidate_variants where snapshot_id='{snapshot}'")
+
+    # Partial replay: a stored candidate's READING moves (to the key's last
+    # status in the batch), a new one is stored once with its last status.
+    revised = {**candidates[0], "status": "ready_for_review"}
+    new_first = {**candidates[5], "status": "ambiguous"}
+    new_last = {**candidates[5], "status": "rejected"}
+    replay = _rec_candidate_batch_answer(db, args, [revised, new_first, new_last])
+    assert (replay["inserted"], replay["already_present"]) == (1, 2)
+    assert replay["rows"][0]["id"] == written["rows"][0]["id"]
+    assert replay["rows"][0]["status"] == "ready_for_review"
+    assert replay["rows"][1]["id"] == replay["rows"][2]["id"]
+    assert replay["rows"][2]["status"] == "rejected"
+    before = statuses()
+
+    _other, other_args = _wsp_capture_run(db, conversation)
+    foreign_snapshot, _ = _rec_pending_snapshot(db, other_args, f"set-foreign-{conversation[:8]}", 1,
+                                                marque=None)
+    foreign_record = _rec_raw_batch(db, other_args, _rec_records(foreign_snapshot, f"f-{label}", [0]))[0]
+    extra = candidates[6]
+    candidate_refusals = (
+        # A reading of ANOTHER snapshot's record, filed under this snapshot.
+        ([extra, {**candidates[7], "raw_record_id": foreign_record}], "catalog candidate snapshot mismatch"),
+        ([extra, {**candidates[7], "raw_record_id": str(uuid.uuid4())}], "invalid catalog candidate raw record"),
+        ([extra, {**candidates[0], "commercial_model": "OTHER"}], "catalog candidate idempotency conflict"),
+        ([extra, {**candidates[7], "candidate_key": extra["candidate_key"]}],
+         "catalog candidate idempotency conflict"),
+        ([extra, {**candidates[7], "model_year_start": "twenty"}], "malformed model year"),
+        ([extra, {**candidates[7], "model_year_start": 2021.5}], "malformed model year"),
+        ([extra, {**candidates[7], "model_year_end": None}], "model year range must be whole"),
+        ([extra, {**candidates[7], "status": "promoted"}], "invalid catalog candidate status"),
+        ([extra, {**candidates[7], "manufacturer": ""}], "identity is incomplete"),
+        ([extra, {**candidates[7], "lease_token": "x"}], "unsafe catalog payload rejected"),
+    )
+    for batch, message in candidate_refusals:
+        with pytest.raises(AssertionError, match=message):
+            _rec_candidate_batch(db, args, batch)
+        assert statuses() == before, message
+    stale = args.rsplit(",", 1)[0] + ",'not-the-token'"
+    with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+        _rec_candidate_batch(db, stale, [extra])
+    # The wrong writer, on both batches.
+    with pytest.raises(AssertionError, match="this catalog snapshot does not belong to this run"):
+        _rec_candidate_batch(db, other_args, [extra])
+    with pytest.raises(AssertionError, match="this catalog snapshot does not belong to this run"):
+        _rec_raw_batch(db, other_args, [records[8]])
+    assert statuses() == before and _rec_stored(db, snapshot) == "8/8"
+
+    # Active: frozen for both batches.
+    assert _rec_activate(db, args, snapshot) == "complete|true"
+    for write in (lambda: _rec_raw_batch(db, args, [records[8]]),
+                  lambda: _rec_candidate_batch(db, args, [extra])):
+        with pytest.raises(AssertionError, match="an active catalog snapshot is immutable"):
+            write()
+    # Failed: terminal for both batches.
+    failing, _ = _rec_pending_snapshot(db, args, f"set-failed-{conversation[:8]}", 2, marque=None)
+    failing_ids = _rec_raw_batch(db, args, _rec_records(failing, f"fl-{label}", [0]))
+    with pytest.raises(AssertionError, match="catalog snapshot is incomplete"):
+        _rec_activate(db, args, failing)
+    assert _rec_activate(db, args, failing, "failed") == "failed|false"
+    for write in (lambda: _rec_raw_batch(db, args, _rec_records(failing, f"fl-{label}", [1])),
+                  lambda: _rec_candidate_batch(db, args, _rec_candidates(failing, f"fl-{label}", failing_ids))):
+        with pytest.raises(AssertionError, match="a failed catalog snapshot is terminal"):
+            write()
+    assert db.psql(f"select created_by_run_id from public.catalog_source_snapshots where id='{snapshot}'") == run
+
+
+def test_the_batches_never_loop_over_a_single_row_write(db):
+    """Structural: the effective batch definitions call neither single-row
+    write and hold no per-row loop."""
+    for function in ("record_catalog_raw_records_batch_guarded", "record_catalog_candidates_batch_guarded"):
+        source = db.psql(f"select prosrc from pg_proc where proname = '{function}' "
+                         "and pronamespace = 'public'::regnamespace")
+        assert "record_catalog_raw_record_guarded(" not in source, function
+        assert "record_catalog_candidate_guarded(" not in source, function
+        assert not re.search(r"\bloop\b", source, re.IGNORECASE), function
+        assert source.count("assert_worker_lease(") == 1, function
+        assert source.count("assert_snapshot_write_authority(") == 1, function
 
 
 def test_every_ingestion_write_is_safe_to_retry(db):
@@ -9426,12 +9611,20 @@ def test_a_200_row_batch_is_far_inside_the_statement_and_request_bounds(db, tmp_
     candidate_body = json.dumps(candidates)
     written, candidate_seconds, candidate_response = call(
         "record_catalog_candidates_batch_guarded", candidate_body, "candidates")
+    # A full replay of the same 200 rows (a retry after a lost answer): the
+    # set-based replay check, nothing inserted, the counter unchanged.
+    replayed, replay_seconds, _ = call("record_catalog_raw_records_batch_guarded", raw_body, "raw-replay")
+    assert (replayed["inserted"], replayed["already_present"]) == (0, size)
+    assert [row["id"] for row in replayed["rows"]] == record_ids
+    assert db.psql(f"select stored_record_count from public.catalog_source_snapshots where id='{snapshot}'") \
+        == str(size)
     payload_chars = db.psql("select round(avg(char_length(payload::text))) || '|' || "
                             "max(char_length(payload::text)) from public.catalog_raw_records "
                             f"where snapshot_id='{snapshot}'")
     print(f"BATCH_MEASURE size={size} payload_chars_avg|max={payload_chars} "
           f"raw_request_bytes={len(raw_body.encode())} raw_response_bytes={raw_response} "
-          f"raw_server_seconds={raw_seconds:.3f} candidate_request_bytes={len(candidate_body.encode())} "
+          f"raw_server_seconds={raw_seconds:.3f} raw_replay_server_seconds={replay_seconds:.3f} "
+          f"candidate_request_bytes={len(candidate_body.encode())} "
           f"candidate_response_bytes={candidate_response} candidate_server_seconds={candidate_seconds:.3f}")
     assert (raw["inserted"], written["inserted"]) == (size, size)
     # Lean answers, in input order.
@@ -9444,7 +9637,7 @@ def test_a_200_row_batch_is_far_inside_the_statement_and_request_bounds(db, tmp_
     # Production-sized rows: ~2.5 KB of payload JSON each.
     assert 2000 <= float(payload_chars.split("|")[0]) <= 3000
     # Far inside the 8 s ceiling (the committed measurement is in the PR).
-    assert raw_seconds < 4 and candidate_seconds < 4
+    assert raw_seconds < 4 and candidate_seconds < 4 and replay_seconds < 4
     assert len(raw_body.encode()) < 1_000_000
 
 

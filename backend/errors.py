@@ -53,7 +53,7 @@ class RepositoryFailure(AppError):
     """
 
     def __init__(self, failure_class: str, message: str = "guarded persistence operation failed",
-                 *, timed_out: bool = False):
+                 *, timed_out: bool = False, too_large: bool = False):
         if failure_class not in REPOSITORY_FAILURE_CLASSES:
             raise ValueError("repository failure class must come from the static allowlist")
         super().__init__("REPOSITORY_ERROR", message, 502)
@@ -61,6 +61,10 @@ class RepositoryFailure(AppError):
         #: The database cancelled the statement for a statement or lock
         #: timeout (SQLSTATE 57014 / 55P03). Always `transient`.
         self.timed_out = bool(timed_out)
+        #: The request BODY was refused as too large (HTTP 413) before the
+        #: database saw it. Always `unavailable`: repeating the same body
+        #: cannot help, and nothing was written.
+        self.too_large = bool(too_large)
 
 
 class NotFoundError(AppError):

@@ -68,15 +68,18 @@
 --
 -- `record_catalog_raw_records_batch_guarded` and
 -- `record_catalog_candidates_batch_guarded` take 1..500 rows of ONE snapshot
--- the caller may write, assert the lease and the write authority, and apply
--- the unchanged single-row RPC to each row in order inside one transaction:
--- the same validation and the same idempotency, by construction, and all or
--- nothing. Each answers `{rows, inserted, already_present}`, where `rows` is
--- LEAN and in input order: a raw record as (id, snapshot_id, record_key,
+-- the caller may write. Each asserts the lease and the write authority ONCE,
+-- then applies the single-row validation, replay and conflict rules as a
+-- fixed number of SET statements (section 6): bulk insert of the missing
+-- rows, the stored-record counter moved once by the number inserted, and a
+-- whole-batch rollback on any conflict. Neither calls a single-row write.
+-- Each answers `{rows, inserted, already_present}`, where `rows` is LEAN and
+-- in input order: a raw record as (id, snapshot_id, record_key,
 -- upstream_record_id, payload_sha256), a candidate as (id, snapshot_id,
 -- raw_record_id, candidate_key, status). PostgREST runs these under the
 -- authenticator role's 8 s statement and lock timeouts; the repository splits
--- a batch that hits either (`backend/repository/supabase.py`).
+-- a batch that hits either, or that the gateway refuses as too large (HTTP
+-- 413) (`backend/repository/supabase.py`).
 --
 -- Compatibility with the release that is still serving
 -- ----------------------------------------------------
@@ -489,8 +492,33 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- 6. Bounded batches over the unchanged single-row writes.
+-- 6. Bounded, SET-BASED batches.
 -- ---------------------------------------------------------------------------
+--
+-- One lease check and one write-authority lock per batch, then a fixed number
+-- of set statements whatever the batch size -- never a per-row call of the
+-- single-row writes, whose per-row lease check, snapshot lock, lookup, insert
+-- and counter update would all repeat inside one statement that PostgREST
+-- runs under an 8 s statement timeout.
+--
+-- The single-row rules are restated set-wise, and hold exactly:
+--
+--   * each row is validated with the single-row messages, reported for the
+--     FIRST offending row in input order;
+--   * an identity already stored (or repeated in the batch) must carry the
+--     same content -- anything else is the single-row idempotency conflict,
+--     and it fails the WHOLE batch: the exception rolls back every row this
+--     call inserted and the counter with them;
+--   * only missing rows are inserted, and the snapshot's
+--     `stored_record_count` moves ONCE, by exactly the number inserted;
+--   * every table constraint, unique index and foreign key applies as before
+--     (a second row claiming an upstream id or a capture position is still
+--     23505; a candidate filed under another snapshot's record is still
+--     refused).
+--
+-- The answer is one LEAN row per input row, in input order, and
+-- `inserted + already_present` = the number of rows sent (a row repeated in
+-- the batch counts as present the second time, as it did row by row).
 
 create or replace function public.record_catalog_raw_records_batch_guarded(
   p_run_id uuid, p_worker_id text, p_attempt integer, p_lease_token text,
@@ -500,43 +528,109 @@ language plpgsql
 set search_path = pg_catalog
 as $$
 declare
-  v_record jsonb;
-  v_row public.catalog_raw_records;
-  v_snapshot_id uuid;
-  v_rows jsonb := '[]'::jsonb;
-  v_present integer := 0;
+  v_snapshot public.catalog_source_snapshots;
+  v_count integer;
+  v_problem integer;
+  v_inserted integer := 0;
+  v_rows jsonb;
+  v_conflicts integer;
 begin
   perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
   if p_records is null or jsonb_typeof(p_records) <> 'array'
      or jsonb_array_length(p_records) not between 1 and 500 then
     raise exception 'invalid catalog raw record batch: 1 to 500 records' using errcode = '22023';
   end if;
+  v_count := jsonb_array_length(p_records);
   if (select count(distinct e->>'snapshot_id') from jsonb_array_elements(p_records) as e) <> 1
      or exists (select 1 from jsonb_array_elements(p_records) as e
                  where jsonb_typeof(e) <> 'object' or nullif(e->>'snapshot_id', '') is null) then
     raise exception 'invalid catalog raw record batch: one snapshot per batch' using errcode = '22023';
   end if;
-  v_snapshot_id := (p_records->0->>'snapshot_id')::uuid;
-  perform public.assert_snapshot_write_authority(v_snapshot_id, p_run_id);
-  for v_record in
-    select e from jsonb_array_elements(p_records) with ordinality as t(e, n) order by n
-  loop
-    if exists (select 1 from public.catalog_raw_records r
-                where r.snapshot_id = v_snapshot_id
-                  and r.record_key = nullif(v_record->>'record_key', '')) then
-      v_present := v_present + 1;
-    end if;
-    select * into v_row from public.record_catalog_raw_record_guarded(
-      p_run_id, p_worker_id, p_attempt, p_lease_token, v_record);
-    -- A LEAN answer: identity and digest only, never the payload or the
-    -- locator the caller just sent (≈1.6 KB a row would double the response).
-    v_rows := v_rows || jsonb_build_object(
-      'id', v_row.id, 'snapshot_id', v_row.snapshot_id, 'record_key', v_row.record_key,
-      'upstream_record_id', v_row.upstream_record_id, 'payload_sha256', v_row.payload_sha256);
-  end loop;
-  return jsonb_build_object('rows', v_rows,
-                            'inserted', jsonb_array_length(v_rows) - v_present,
-                            'already_present', v_present);
+  -- ONCE: the snapshot is locked FOR UPDATE and held to its current writer
+  -- and to the pending state for the rest of this transaction.
+  v_snapshot := public.assert_snapshot_write_authority(
+    (p_records->0->>'snapshot_id')::uuid, p_run_id);
+
+  -- The single-row validation, in its order, for the first offending row.
+  -- NOTE: as in the single-row write, no credential screen is applied to
+  -- the payload: it is SOURCE CONTENT captured verbatim from a register.
+  select t.problem into v_problem from (
+    select x.n, case
+      when nullif(x.e->>'record_key', '') is null or nullif(x.e->>'upstream_record_id', '') is null
+           or x.e->'payload' is null or jsonb_typeof(x.e->'payload') <> 'object' then 1
+      when x.e ? 'payload_sha256' then 2
+      when char_length((x.e->'payload')::text) > 16384 then 3
+      when not public.catalog_source_locator_valid(coalesce(x.e->'source_locator', '{}'::jsonb)) then 4
+      when nullif(x.e->>'resource_id', '') is distinct from v_snapshot.resource_id then 5
+      else 0 end as problem
+    from jsonb_array_elements(p_records) with ordinality as x(e, n)) t
+  where t.problem <> 0 order by t.n limit 1;
+  if v_problem = 1 then
+    raise exception 'invalid catalog raw record: identity or payload is missing' using errcode = '22023';
+  elsif v_problem = 2 then
+    -- The digest is DERIVED, never supplied.
+    raise exception 'catalog raw record payload digest is derived, not supplied' using errcode = '22023';
+  elsif v_problem = 3 then
+    raise exception 'invalid catalog raw record: payload exceeds the durable bound' using errcode = '22023';
+  elsif v_problem = 4 then
+    raise exception 'invalid catalog raw record source locator' using errcode = '22023';
+  elsif v_problem = 5 then
+    raise exception 'catalog raw record resource mismatch' using errcode = '22023';
+  end if;
+
+  -- Insert only what is missing: one row per record key (the first time it
+  -- appears in the batch), in input order. The conflict target is the replay
+  -- identity; every OTHER unique index still refuses a second claim.
+  insert into public.catalog_raw_records
+    (snapshot_id, resource_id, upstream_record_id, payload, payload_sha256, record_key,
+     source_locator)
+  select v_snapshot.id, v_snapshot.resource_id, f.upstream, f.payload,
+         encode(sha256(convert_to(f.payload::text, 'UTF8')), 'hex'), f.record_key, f.locator
+  from (
+    select distinct on (x.e->>'record_key')
+           x.n, x.e->>'record_key' as record_key, x.e->>'upstream_record_id' as upstream,
+           x.e->'payload' as payload, coalesce(x.e->'source_locator', '{}'::jsonb) as locator
+    from jsonb_array_elements(p_records) with ordinality as x(e, n)
+    where not exists (select 1 from public.catalog_raw_records r
+                       where r.snapshot_id = v_snapshot.id
+                         and r.record_key = x.e->>'record_key')
+    order by x.e->>'record_key', x.n) f
+  order by f.n
+  on conflict (snapshot_id, record_key) do nothing;
+  get diagnostics v_inserted = row_count;
+
+  -- Exactly once, by exactly the number inserted. The snapshot is locked, so
+  -- no other writer moves it in between.
+  if v_inserted > 0 then
+    update public.catalog_source_snapshots
+      set stored_record_count = stored_record_count + v_inserted
+      where id = v_snapshot.id;
+  end if;
+
+  -- Replay check for EVERY input row against what is now stored under its
+  -- key: identical content AND identical position, or the whole batch fails
+  -- (the exception rolls back the insert and the counter above).
+  select jsonb_agg(jsonb_build_object(
+           'id', r.id, 'snapshot_id', r.snapshot_id, 'record_key', r.record_key,
+           'upstream_record_id', r.upstream_record_id, 'payload_sha256', r.payload_sha256)
+           order by x.n),
+         count(*) filter (where r.id is null
+           or r.upstream_record_id is distinct from x.e->>'upstream_record_id'
+           or r.payload_sha256 is distinct from
+                encode(sha256(convert_to((x.e->'payload')::text, 'UTF8')), 'hex')
+           or r.payload is distinct from x.e->'payload'
+           or r.source_locator is distinct from coalesce(x.e->'source_locator', '{}'::jsonb))
+    into v_rows, v_conflicts
+  from jsonb_array_elements(p_records) with ordinality as x(e, n)
+  left join public.catalog_raw_records r
+    on r.snapshot_id = v_snapshot.id and r.record_key = x.e->>'record_key';
+  if v_conflicts > 0 then
+    raise exception 'catalog raw record idempotency conflict' using errcode = '22023';
+  end if;
+  -- A LEAN answer: identity and digest only, never the payload or the
+  -- locator the caller just sent.
+  return jsonb_build_object('rows', v_rows, 'inserted', v_inserted,
+                            'already_present', v_count - v_inserted);
 end;
 $$;
 
@@ -548,45 +642,152 @@ language plpgsql
 set search_path = pg_catalog
 as $$
 declare
-  v_candidate jsonb;
-  v_row public.catalog_candidate_variants;
-  v_snapshot_id uuid;
-  v_rows jsonb := '[]'::jsonb;
-  v_present integer := 0;
+  v_snapshot public.catalog_source_snapshots;
+  v_count integer;
+  v_problem integer;
+  v_inserted integer := 0;
+  v_rows jsonb;
+  v_conflicts integer;
 begin
   perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
   if p_candidates is null or jsonb_typeof(p_candidates) <> 'array'
      or jsonb_array_length(p_candidates) not between 1 and 500 then
     raise exception 'invalid catalog candidate batch: 1 to 500 candidates' using errcode = '22023';
   end if;
+  v_count := jsonb_array_length(p_candidates);
   if (select count(distinct e->>'snapshot_id') from jsonb_array_elements(p_candidates) as e) <> 1
      or exists (select 1 from jsonb_array_elements(p_candidates) as e
                  where jsonb_typeof(e) <> 'object' or nullif(e->>'snapshot_id', '') is null) then
     raise exception 'invalid catalog candidate batch: one snapshot per batch' using errcode = '22023';
   end if;
-  v_snapshot_id := (p_candidates->0->>'snapshot_id')::uuid;
-  -- Stricter than the single-row candidate write (which the promotion
+  -- ONCE. Stricter than the single-row candidate write (which the promotion
   -- pipeline uses to revise a status): an ingestion writes readings only onto
   -- a capture it may write, and only while that capture is pending.
-  perform public.assert_snapshot_write_authority(v_snapshot_id, p_run_id);
-  for v_candidate in
-    select e from jsonb_array_elements(p_candidates) with ordinality as t(e, n) order by n
-  loop
-    if exists (select 1 from public.catalog_candidate_variants c
-                where c.snapshot_id = v_snapshot_id
-                  and c.candidate_key = nullif(v_candidate->>'candidate_key', '')) then
-      v_present := v_present + 1;
-    end if;
-    select * into v_row from public.record_catalog_candidate_guarded(
-      p_run_id, p_worker_id, p_attempt, p_lease_token, v_candidate);
-    -- A LEAN answer: identity and status only.
-    v_rows := v_rows || jsonb_build_object(
-      'id', v_row.id, 'snapshot_id', v_row.snapshot_id, 'raw_record_id', v_row.raw_record_id,
-      'candidate_key', v_row.candidate_key, 'status', v_row.status);
-  end loop;
-  return jsonb_build_object('rows', v_rows,
-                            'inserted', jsonb_array_length(v_rows) - v_present,
-                            'already_present', v_present);
+  v_snapshot := public.assert_snapshot_write_authority(
+    (p_candidates->0->>'snapshot_id')::uuid, p_run_id);
+
+  -- The single-row validation, in its order, for the first offending row. A
+  -- model year must be decimal integer text (a JSON number): anything else is
+  -- the single-row "malformed model year" refusal.
+  select t.problem into v_problem from (
+    select x.n, case
+      when x.e::text ~* '"(chain_of_thought|provider_detail|raw_error|api_key|secret|password|authorization|credentials|exception|lease_token|token)"[[:space:]]*:' then 1
+      when nullif(x.e->>'candidate_key', '') is null or nullif(x.e->>'manufacturer', '') is null
+           or nullif(x.e->>'commercial_model', '') is null then 2
+      when coalesce(nullif(x.e->>'status', ''), 'candidate')
+           not in ('candidate', 'ambiguous', 'rejected', 'ready_for_review') then 3
+      when case when nullif(x.e->>'model_year_start', '') is null then false
+                when x.e->>'model_year_start' !~ '^[[:space:]]*[+-]?[0-9]+[[:space:]]*$' then true
+                else (x.e->>'model_year_start')::numeric not between -2147483648 and 2147483647 end
+        or case when nullif(x.e->>'model_year_end', '') is null then false
+                when x.e->>'model_year_end' !~ '^[[:space:]]*[+-]?[0-9]+[[:space:]]*$' then true
+                else (x.e->>'model_year_end')::numeric not between -2147483648 and 2147483647 end
+        then 4
+      -- A half-stated range is a guess.
+      when (nullif(x.e->>'model_year_start', '') is null)
+           <> (nullif(x.e->>'model_year_end', '') is null) then 5
+      when r.id is null then 6
+      -- A candidate is a reading of ONE record of THIS snapshot.
+      when r.snapshot_id is distinct from v_snapshot.id then 7
+      else 0 end as problem
+    from jsonb_array_elements(p_candidates) with ordinality as x(e, n)
+    left join public.catalog_raw_records r on r.id = (x.e->>'raw_record_id')::uuid) t
+  where t.problem <> 0 order by t.n limit 1;
+  if v_problem = 1 then
+    raise exception 'unsafe catalog payload rejected' using errcode = '22023';
+  elsif v_problem = 2 then
+    raise exception 'invalid catalog candidate: identity is incomplete' using errcode = '22023';
+  elsif v_problem = 3 then
+    raise exception 'invalid catalog candidate status' using errcode = '22023';
+  elsif v_problem = 4 then
+    raise exception 'invalid catalog candidate: malformed model year' using errcode = '22023';
+  elsif v_problem = 5 then
+    raise exception 'invalid catalog candidate: a model year range must be whole' using errcode = '22023';
+  elsif v_problem = 6 then
+    raise exception 'invalid catalog candidate raw record' using errcode = '23503';
+  elsif v_problem = 7 then
+    raise exception 'catalog candidate snapshot mismatch' using errcode = '22023';
+  end if;
+
+  -- Insert only what is missing: one row per candidate key, carrying the
+  -- status of the key's LAST occurrence in the batch (row by row, a later
+  -- occurrence revised the status the earlier one wrote).
+  with items as (
+    select x.n, x.e->>'candidate_key' as candidate_key,
+           (x.e->>'raw_record_id')::uuid as raw_record_id,
+           x.e->>'manufacturer' as manufacturer, x.e->>'commercial_model' as commercial_model,
+           nullif(x.e->>'model_year_start', '')::integer as model_year_start,
+           nullif(x.e->>'model_year_end', '')::integer as model_year_end,
+           nullif(x.e->>'official_model_code', '') as official_model_code,
+           nullif(x.e->>'trim', '') as trim,
+           coalesce(x.e->'identity_dimensions', '{}'::jsonb) as identity_dimensions,
+           coalesce(nullif(x.e->>'status', ''), 'candidate') as status
+    from jsonb_array_elements(p_candidates) with ordinality as x(e, n)),
+  first_seen as (
+    select distinct on (candidate_key) * from items order by candidate_key, n),
+  last_status as (
+    select distinct on (candidate_key) candidate_key, status from items
+    order by candidate_key, n desc)
+  insert into public.catalog_candidate_variants
+    (snapshot_id, raw_record_id, manufacturer, commercial_model, model_year_start,
+     model_year_end, official_model_code, trim, identity_dimensions, status, candidate_key)
+  select v_snapshot.id, f.raw_record_id, f.manufacturer, f.commercial_model,
+         f.model_year_start, f.model_year_end, f.official_model_code, f.trim,
+         f.identity_dimensions, l.status, f.candidate_key
+  from first_seen f join last_status l using (candidate_key)
+  where not exists (select 1 from public.catalog_candidate_variants c
+                     where c.snapshot_id = v_snapshot.id and c.candidate_key = f.candidate_key)
+  order by f.n
+  on conflict (snapshot_id, candidate_key) do nothing;
+  get diagnostics v_inserted = row_count;
+
+  -- A candidate that was already stored takes the batch's last status for
+  -- its key -- the reading may move, WHO the candidate is may not (checked
+  -- below; a mismatch rolls this update back with everything else).
+  with last_status as (
+    select distinct on (x.e->>'candidate_key') x.e->>'candidate_key' as candidate_key,
+           coalesce(nullif(x.e->>'status', ''), 'candidate') as status
+    from jsonb_array_elements(p_candidates) with ordinality as x(e, n)
+    order by x.e->>'candidate_key', x.n desc)
+  update public.catalog_candidate_variants c set status = l.status
+    from last_status l
+    where c.snapshot_id = v_snapshot.id and c.candidate_key = l.candidate_key
+      and c.status is distinct from l.status;
+
+  -- Replay check for EVERY input row: the same key must be the same identity.
+  -- `status` is excluded on purpose, exactly as row by row.
+  with items as (
+    select x.n, x.e->>'candidate_key' as candidate_key,
+           (x.e->>'raw_record_id')::uuid as raw_record_id,
+           x.e->>'manufacturer' as manufacturer, x.e->>'commercial_model' as commercial_model,
+           nullif(x.e->>'model_year_start', '')::integer as model_year_start,
+           nullif(x.e->>'model_year_end', '')::integer as model_year_end,
+           nullif(x.e->>'official_model_code', '') as official_model_code,
+           nullif(x.e->>'trim', '') as trim,
+           coalesce(x.e->'identity_dimensions', '{}'::jsonb) as identity_dimensions
+    from jsonb_array_elements(p_candidates) with ordinality as x(e, n))
+  select jsonb_agg(jsonb_build_object(
+           'id', c.id, 'snapshot_id', c.snapshot_id, 'raw_record_id', c.raw_record_id,
+           'candidate_key', c.candidate_key, 'status', c.status) order by i.n),
+         count(*) filter (where c.id is null
+           or c.raw_record_id is distinct from i.raw_record_id
+           or c.manufacturer is distinct from i.manufacturer
+           or c.commercial_model is distinct from i.commercial_model
+           or c.model_year_start is distinct from i.model_year_start
+           or c.model_year_end is distinct from i.model_year_end
+           or c.official_model_code is distinct from i.official_model_code
+           or c.trim is distinct from i.trim
+           or c.identity_dimensions is distinct from i.identity_dimensions)
+    into v_rows, v_conflicts
+  from items i
+  left join public.catalog_candidate_variants c
+    on c.snapshot_id = v_snapshot.id and c.candidate_key = i.candidate_key;
+  if v_conflicts > 0 then
+    raise exception 'catalog candidate idempotency conflict' using errcode = '22023';
+  end if;
+  -- A LEAN answer: identity and status only.
+  return jsonb_build_object('rows', v_rows, 'inserted', v_inserted,
+                            'already_present', v_count - v_inserted);
 end;
 $$;
 

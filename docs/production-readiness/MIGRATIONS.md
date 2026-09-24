@@ -74,7 +74,7 @@ producing an incomplete sequence.
 | ts | `20260922000100_catalog_work_scopes.sql` | Scoped catalog PR1: the canonical, server-owned mapping PLAN. `catalog_work_scopes` (one row per plan, its head revision and digest, at most one OPEN plan per conversation by a partial unique index) and `catalog_work_scope_revisions` (append-only, numbered without gaps, the canonical record stored as TEXT with `digest = sha256(text)` and `scope = text::jsonb` held by CHECK constraints, and the record's shape and hard bounds -- batch size at most 20, limit at most 2000 -- held by `catalog_work_scope_record_valid`). `create_work_scope` and `revise_work_scope` derive the project and digest, re-check membership and the trusted `swarm_v2` workflow, and refuse a revision whose expected head revision or digest is not the current one (`WORK_SCOPE_STALE`). `catalog_canonical_manufacturer_coverage` is a bounded read of exact canonical variant counts per register marque plus the catalog total. Drafts only: no status but `draft`, no snapshot column, no relation to `runs`. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/` |
 | ts | `20260923000100_catalog_work_scope_preparation.sql` | Scoped catalog PR2: a Mapping Plan revision becomes durable WORK. A CHECK on `catalog_source_snapshots` (`catalog_capture_scope_consistent`) holds a scoped snapshot's declared `capture_scope` to the query it recorded (one register marque, `scope_key = sha256(query.filters)`); every existing row declares none and passes. `catalog_work_scope_preparations` (one per revision), `catalog_work_scope_units`, `catalog_work_scope_batches` (1-20 candidates, one unit and so one snapshot each), `catalog_work_scope_queue_items` and `catalog_work_scope_batch_runs` -- all append-only by trigger. `prepare_work_scope_queue` is lease-guarded and accepts ONLY an `operator_capture` run, refuses a stale head (`WORK_SCOPE_STALE`), counts every unit from its snapshot's own rows, records a mostly-`ambiguous` unit as `vocabulary_insufficient`, and materializes the deterministic queue in one transaction. `bind_work_scope_batch_run` is the batch<->run compare-and-set (one live batch per plan, never a stale revision, never a completed batch twice); `work_scope_batch_for_run` is the worker's read of its exact batch. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/preparation.py` |
 | ts | `20260924000100_catalog_work_scope_batch_runs.sql` | Scoped catalog PR3: a prepared batch becomes a RUN, and a plan's progress is read back. `catalog_work_scope_controls` is the plan's append-only pause / resume history (numbered without gaps, alternating from `pause`, held by a BEFORE-INSERT trigger), written only by `set_work_scope_paused`. `create_work_scope_batch_run` is the ONE start of a batch: under the plan's row lock it replays the same idempotency key, refuses a stale head or batch (`WORK_SCOPE_STALE`), a paused plan (`WORK_SCOPE_PAUSED`), a second live batch (`WORK_SCOPE_BATCH_IN_PROGRESS` -- a request for the batch already running answers with that run), a settled batch and any batch but the NEXT one (`WORK_SCOPE_BATCH_NOT_NEXT`), then calls `create_message_and_run_v3` and `bind_work_scope_batch_run` in the same transaction. `bind_work_scope_batch_run` is restated with the same signature: a paused plan binds nothing, batches bind in order, and a batch whose run ended `completed` OR `partial_success` is settled and never bound again. `work_scope_progress` derives each batch's state from its bound runs' durable status and its promoted / refused counts from their promotion events. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/batches.py` |
-| ts | `20260924000200_catalog_ingestion_recovery.sql` | Catalog ingestion recovery (incident 2026-09-24). ONE snapshot write authority: `assert_snapshot_write_authority(snapshot, run)` locks the snapshot, resolves its CURRENT writer (the latest adopter in `catalog_snapshot_adoptions`, else `created_by_run_id`, which stays immutable), refuses anyone else with the existing message `this catalog snapshot does not belong to this run`, and refuses a failed or active snapshot (activation's idempotent replay aside). `record_catalog_raw_record_guarded` and `activate_catalog_snapshot_guarded` are restated over it with unchanged signatures and messages; `record_catalog_candidate_guarded` is untouched. `catalog_snapshot_adoptions(snapshot_id, adoption_seq, adopted_by_run_id, previous_writer_run_id, adopted_at)` is append-only, unique on (snapshot, seq) and (snapshot, adopter), numbered and admitted by a BEFORE-INSERT trigger only for a pending snapshot whose current writer ended `failed` / `cancelled` / `timed_out` with no live lease, adopted by a live `operator_capture` run. `adopt_catalog_snapshot_guarded` (lease-guarded, idempotent) also writes a `catalog_snapshot_adopted` run event. `record_catalog_raw_records_batch_guarded` / `record_catalog_candidates_batch_guarded` apply the unchanged single-row writes to 1-500 rows of one snapshot in one transaction and answer `{rows, inserted, already_present}`. Service-path only; additive and forward-only. Mirrors `backend/catalog/government/ingest.py` |
+| ts | `20260924000200_catalog_ingestion_recovery.sql` | Catalog ingestion recovery (incident 2026-09-24). ONE snapshot write authority: `assert_snapshot_write_authority(snapshot, run)` locks the snapshot, resolves its CURRENT writer (the latest adopter in `catalog_snapshot_adoptions`, else `created_by_run_id`, which stays immutable), refuses anyone else with the existing message `this catalog snapshot does not belong to this run`, and refuses a failed or active snapshot (activation's idempotent replay aside). `record_catalog_raw_record_guarded` and `activate_catalog_snapshot_guarded` are restated over it with unchanged signatures and messages; `record_catalog_candidate_guarded` is untouched. `catalog_snapshot_adoptions(snapshot_id, adoption_seq, adopted_by_run_id, previous_writer_run_id, adopted_at)` is append-only, unique on (snapshot, seq) and (snapshot, adopter), numbered and admitted by a BEFORE-INSERT trigger only for a pending snapshot whose current writer ended `failed` / `cancelled` / `timed_out` with no live lease, adopted by a live `operator_capture` run. `adopt_catalog_snapshot_guarded` (lease-guarded, idempotent) also writes a `catalog_snapshot_adopted` run event. `record_catalog_raw_records_batch_guarded` / `record_catalog_candidates_batch_guarded` take 1-500 rows of one snapshot, assert the lease and the write authority once, and apply the single-row rules as set statements (bulk insert of missing rows, the stored-record counter moved once, whole-batch rollback on any conflict) in one transaction, answering lean `{rows, inserted, already_present}`. Service-path only; additive and forward-only. Mirrors `backend/catalog/government/ingest.py` |
 
 All migrations are forward-only and data-preserving. Most are additive; Console 6 deliberately removes only superseded RPC definitions so there is one run-creation authority. There are no destructive table/data down-migrations, by policy (`scripts/check_migrations.py` forbids `drop table` and data deletes).
 
@@ -240,8 +240,27 @@ and Production holds `statement_timeout=8s` AND `lock_timeout=8s` there while
 RPC is a hard ceiling. A batch cancelled by either (SQLSTATE 57014 / 55P03) is
 NOT repeated: the repository sends its two halves instead, recursively, down
 to 25 rows, and only a 25-row batch that still times out fails, as
-`CAPTURE_REPOSITORY_TRANSIENT`. Every other transient failure keeps the plain
-bounded retry (4 attempts).
+`CAPTURE_REPOSITORY_TRANSIENT`. A batch whose request body is refused as too
+large (HTTP 413) is split the same way; a 25-row batch still refused fails as
+`CAPTURE_REPOSITORY_REQUEST_TOO_LARGE`. Nothing else is split -- not a content
+rejection (SQLSTATE 22/23), an ownership refusal or a lost lease -- and every
+other transient failure keeps the plain bounded retry (4 attempts). A 200-row
+batch is at most 15 calls when split to the floor.
+
+Set-based batches: each batch RPC asserts the lease ONCE and the snapshot
+write authority ONCE (one `FOR UPDATE` lock), then runs a fixed number of set
+statements whatever the batch size: validation with the single-row messages
+(reported for the first offending row), a bulk insert of the missing rows
+only, ONE update of `stored_record_count` by exactly the number inserted, and a
+replay check of every input row against what is stored under its key. A
+conflict anywhere -- an existing key with another upstream id, digest, payload
+or locator; a key repeated in the batch with different content; a second claim
+on an upstream id or capture position -- raises, and the exception rolls back
+the whole batch, counter included. Neither batch calls a single-row write; the
+executable suite counts the function calls inside one batch
+(`pg_stat_xact_user_functions`: one `assert_worker_lease`, one
+`assert_snapshot_write_authority`, no single-row write) and checks the
+effective definitions hold no loop.
 
 Lean answers: a batch answers per row only `(id, snapshot_id, record_key,
 upstream_record_id, payload_sha256)` for a raw record and `(id, snapshot_id,
@@ -251,16 +270,35 @@ the locator the caller just sent.
 Batch cost, measured on PostgreSQL 16 in the executable suite (local, NOT on
 Supabase), 200 rows with register rows of Production's size (payload JSON
 2 489 chars; Production's snapshot `701ea334` averages 2 470, max 2 497),
-timed by the server's clock around the one statement, three runs:
+timed by the server's clock around the one statement, five runs:
 
-* raw records, 200 rows: request body 622 KB, response 55 KB, server time
-  0.17-0.24 s;
-* candidates, 200 rows: request body 95 KB, response 48 KB, server time
-  0.10-0.11 s.
+* raw records, 200 rows: request body 622 090 bytes, response 54 849 bytes,
+  server time 0.067-0.108 s (the per-row loop it replaces: 0.17-0.24 s);
+* raw records, the same 200 rows replayed: 0.037-0.043 s;
+* candidates, 200 rows: request body 95 090 bytes, response 48 049 bytes,
+  server time 0.035-0.048 s (per-row loop: 0.10-0.11 s).
 
 Well under 1 s, so `CATALOG_WRITE_BATCH_SIZE` stays 200. No request-size limit
 of the Supabase REST gateway is documented, and PostgREST sets none by default;
-a ~0.6 MB body is NOT verified against the Supabase gateway.
+a ~0.6 MB body is NOT verified against the Supabase gateway -- which is why a
+413 splits rather than fails.
+
+Expected cost of a clean Toyota ingestion (no retry, no split):
+`ceil(raw / 200) + ceil(candidates / 200) + 3` calls -- one snapshot write, one
+adoption when adopting, one activation. For 6 368 raw records and at most 6 368
+candidates that is 32 + 32 + 3 = 67, so the acceptance target is **at most 70
+database RPC calls**. The write phase's wall time (target: under 2 minutes) is
+a measurement to take on Production, not a verified claim: the capture job
+prints `INGESTION_TOTAL_DB_CALLS`, `INGESTION_TOTAL_SECONDS`,
+`INGESTION_TOTAL_REQUEST_BYTES` and `INGESTION_MAX_CALL_SECONDS`.
+
+Diagnostics: a failed catalog ingestion write logs, besides the function, the
+cause's class, its code, the HTTP status, the class and the attempt, WHERE it
+failed -- `run_id=… snapshot_id=… phase=snapshot|adopt|raw|candidates|activate
+batch=<ordinal> rows=<first>-<last> capture_index=<first>-<last>` -- from a
+context object only the ingestion caller builds (identifiers and whole numbers;
+never a payload, a message, a URL or a token). Every other guarded RPC logs
+exactly the line it logged before.
 
 **Deferred debt -- the single-row candidate write.**
 `record_catalog_candidate_guarded` (single row) still CREATES candidates

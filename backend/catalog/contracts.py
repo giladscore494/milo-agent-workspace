@@ -91,11 +91,15 @@ MAX_RETRIEVAL_METADATA_CHARS = 4096
 #: cap, enforced again by `record_catalog_raw_records_batch_guarded` /
 #: `record_catalog_candidates_batch_guarded`, 20260924000200), and the size an
 #: ingestion actually sends. Server constants: no environment variable or
-#: argument can change either. At 200 rows a Toyota preparation (6 368 rows)
-#: is 32 + 32 batch calls; one 200-row call with Production-sized rows measured
-#: 0.17-0.24 s (raw) / 0.10-0.11 s (candidates) on PostgreSQL against the 8 s
-#: statement timeout (`docs/production-readiness/MIGRATIONS.md`, ingestion
-#: recovery section). A call that does time out is split by the repository.
+#: argument can change either. A clean ingestion (no retry, no split) costs
+#: ceil(raw / 200) + ceil(candidates / 200) + 3 fixed calls (snapshot,
+#: adoption when adopting, activation): a Toyota preparation (6 368 rows) is
+#: 32 + 32 + 3 = 67 calls at most. One set-based 200-row call with
+#: Production-sized rows measured 0.07-0.11 s (raw) / 0.04-0.05 s (candidates)
+#: on PostgreSQL 16 against the 8 s statement timeout
+#: (`docs/production-readiness/MIGRATIONS.md`, ingestion recovery section). A
+#: call that times out, or whose body is refused as too large (HTTP 413), is
+#: split by the repository.
 MAX_CATALOG_WRITE_BATCH = 500
 CATALOG_WRITE_BATCH_SIZE = 200
 

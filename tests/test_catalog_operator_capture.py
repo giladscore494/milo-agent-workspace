@@ -783,10 +783,11 @@ class LeaseWatchingRepository(MemoryRepository):
     def _note(self, name: str, worker_id: str, attempt: int, lease_token: str) -> None:
         self.write_leases.append((name, worker_id, attempt, lease_token))
 
-    def record_catalog_snapshot(self, run_id, snapshot, *, worker_id, attempt, lease_token):
+    def record_catalog_snapshot(self, run_id, snapshot, *, worker_id, attempt, lease_token,
+                                **extra):
         self._note("snapshot", worker_id, attempt, lease_token)
         return super().record_catalog_snapshot(run_id, snapshot, worker_id=worker_id,
-                                               attempt=attempt, lease_token=lease_token)
+                                               attempt=attempt, lease_token=lease_token, **extra)
 
     def record_catalog_raw_record(self, run_id, record, *, worker_id, attempt, lease_token):
         self._note("raw_record", worker_id, attempt, lease_token)
@@ -798,10 +799,11 @@ class LeaseWatchingRepository(MemoryRepository):
         return super().record_catalog_candidate(run_id, candidate, worker_id=worker_id,
                                                 attempt=attempt, lease_token=lease_token)
 
-    def activate_catalog_snapshot(self, run_id, activation, *, worker_id, attempt, lease_token):
+    def activate_catalog_snapshot(self, run_id, activation, *, worker_id, attempt, lease_token,
+                                  **extra):
         self._note("activate", worker_id, attempt, lease_token)
         return super().activate_catalog_snapshot(run_id, activation, worker_id=worker_id,
-                                                 attempt=attempt, lease_token=lease_token)
+                                                 attempt=attempt, lease_token=lease_token, **extra)
 
 
 def test_every_durable_write_carries_the_claimed_lease(monkeypatch, transport, capsys):

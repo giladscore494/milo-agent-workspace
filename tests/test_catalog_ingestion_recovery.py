@@ -334,6 +334,335 @@ def test_other_transient_failures_keep_the_bounded_retry_and_are_never_split():
     assert sleeps == [0.5, 1.0, 2.0]
 
 
+# --- a request body refused as too large (HTTP 413) splits the batch ---------
+
+class _GatewayDatabase(_TimeoutDatabase):
+    """`_TimeoutDatabase` behind a gateway that refuses a request BODY above
+    `max_bytes` with HTTP 413 -- before the database sees it, so NOTHING of
+    that call lands. No real limit is assumed: the tests pick one."""
+
+    def __init__(self, max_bytes: int, *, lose: tuple[int, ...] = ()) -> None:
+        super().__init__(limit=10_000, lose=lose)
+        self.max_bytes = max_bytes
+
+    def rpc(self, name: str, params: dict) -> _Call:
+        body = len(json.dumps(params["p_records"]).encode("utf-8"))
+        if body > self.max_bytes:
+            self.sizes.append(len(params["p_records"]))
+            self.sent_bytes.append(body)
+            return _Call(_api_error("413", "<html>413 Request Entity Too Large " + URL_SENTINEL))
+        return super().rpc(name, params)
+
+
+def _padded_record(index: int, padding: int) -> dict[str, Any]:
+    return {**_raw_record(index), "payload": {"_id": 42000 + index, "pad": "x" * padding}}
+
+
+def _bytes(records: list[dict[str, Any]]) -> int:
+    from backend.catalog.payloads import prepare_raw_record
+    return len(json.dumps([prepare_raw_record(r) for r in records]).encode("utf-8"))
+
+
+def test_a_413_batch_is_split_in_halves_never_retried_unchanged():
+    records = [_raw_record(i) for i in range(200)]
+    database = _GatewayDatabase(max_bytes=_bytes(records[100:]))
+    sleeps: list[float] = []
+    answer = _split_repository(database, sleeps).record_catalog_raw_records(RUN, records, **LEASE)
+    # 200 is refused once and never re-sent: its two halves go instead.
+    assert database.sizes == [200, 100, 100]
+    assert sleeps == []
+    assert [row["upstream_record_id"] for row in answer["rows"]] == \
+        [record["upstream_record_id"] for record in records]
+    assert (answer["inserted"], answer["already_present"]) == (200, 0)
+    assert answer["rpc_calls"] == 3 and answer["request_bytes"] == sum(database.sent_bytes)
+    assert answer["max_call_seconds"] >= 0
+
+
+def test_a_413_half_that_is_still_too_large_splits_again_while_the_other_lands():
+    # Small rows first, large rows last: the first half fits, the second is
+    # refused again and splits into quarters.
+    records = [_raw_record(i) for i in range(100)] + \
+        [_padded_record(i, 400) for i in range(100, 200)]
+    database = _GatewayDatabase(max_bytes=_bytes(records[100:150]) + 10)
+    answer = _split_repository(database, []).record_catalog_raw_records(RUN, records, **LEASE)
+    assert database.sizes == [200, 100, 100, 50, 50]
+    assert [row["upstream_record_id"] for row in answer["rows"]] == \
+        [record["upstream_record_id"] for record in records]
+    assert (answer["inserted"], answer["already_present"], answer["rpc_calls"]) == (200, 0, 5)
+    assert len(database.ids) == 200
+
+
+def test_a_413_split_half_that_lost_its_answer_replays_idempotently():
+    # Call 1 is the first 100-row half: it commits, its answer is lost, and the
+    # bounded retry sends it again onto the same rows.
+    records = [_raw_record(i) for i in range(200)]
+    database = _GatewayDatabase(max_bytes=_bytes(records[100:]), lose=(1,))
+    sleeps: list[float] = []
+    answer = _split_repository(database, sleeps).record_catalog_raw_records(RUN, records, **LEASE)
+    assert database.sizes == [200, 100, 100, 100]
+    assert sleeps == [0.5] and len(database.ids) == 200
+    assert (answer["inserted"], answer["already_present"]) == (100, 100)
+    assert [row["upstream_record_id"] for row in answer["rows"]] == \
+        [record["upstream_record_id"] for record in records]
+
+
+def test_a_batch_still_too_large_at_the_floor_fails_with_its_own_static_reason():
+    records = [_raw_record(i) for i in range(200)]
+    database = _GatewayDatabase(max_bytes=_bytes(records[:10]))
+    with pytest.raises(RepositoryFailure) as failure:
+        _split_repository(database, []).record_catalog_raw_records(RUN, records, **LEASE)
+    assert database.sizes == [200, 100, 50, 25]            # never split below 25
+    assert failure.value.too_large and not failure.value.timed_out
+    assert failure.value.failure_class == "unavailable" and database.ids == {}
+    assert failure.value.message == "guarded persistence operation failed"
+    assert entrypoint._classify(failure.value) == "CAPTURE_REPOSITORY_REQUEST_TOO_LARGE"
+    assert "413" in entrypoint.safe_message("CAPTURE_REPOSITORY_REQUEST_TOO_LARGE")
+
+
+@pytest.mark.parametrize("outcome,code", [
+    (_api_error("400", "<html>400 Bad Request</html>"), "REPOSITORY_ERROR"),
+    (_api_error("22023", "catalog raw record idempotency conflict"), "REPOSITORY_ERROR"),
+    (_api_error("22023", "this catalog snapshot does not belong to this run"), "REPOSITORY_ERROR"),
+    (_api_error("23505", "duplicate key value violates unique constraint"), "REPOSITORY_ERROR"),
+    (_api_error("PGRST202"), "REPOSITORY_ERROR"),
+    (_api_error("55000", "STALE_WORKER_WRITE: lease is not current"), "RUN_LEASE_LOST"),
+])
+def test_an_ordinary_rejection_is_never_split(outcome, code):
+    client = _ScriptedClient(outcome)
+    sleeps: list[float] = []
+    with pytest.raises(AppError) as failure:
+        _repository(client, sleeps).record_catalog_raw_records(
+            RUN, [_raw_record(i) for i in range(200)], **LEASE)
+    assert failure.value.code == code
+    assert not getattr(failure.value, "too_large", False)
+    assert not getattr(failure.value, "timed_out", False)
+    assert [len(params["p_records"]) for _name, params in client.calls] == [200]
+    assert sleeps == []
+
+
+def test_a_json_413_from_the_gateway_is_recognised_by_its_http_status(caplog):
+    """A gateway can answer 413 with a JSON body that carries no code at all;
+    the response's own status (the httpx hook) still identifies it."""
+    class _Settings:
+        supabase_url = "https://abcdefghijklmnopqrst.supabase.co"
+        supabase_service_role_key = "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.x"
+
+    repository = SupabaseRepository(_Settings())
+    session = repository.client.postgrest.session
+    sizes: list[int] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        rows = json.loads(request.content)["p_records"]
+        sizes.append(len(rows))
+        if len(rows) > 100:
+            return httpx.Response(413, json={"message": "Request size limit exceeded " + URL_SENTINEL})
+        return httpx.Response(200, json={"rows": [
+            {"id": str(uuid4()), "snapshot_id": row["snapshot_id"], "record_key": row["record_key"],
+             "upstream_record_id": row["upstream_record_id"], "payload_sha256": "0" * 64}
+            for row in rows], "inserted": len(rows), "already_present": 0})
+    session._transport = httpx.MockTransport(answer)
+    session._mounts = {}
+    repository._retry_sleep = lambda _seconds: None
+    caplog.set_level("WARNING", logger="milo.repository")
+    result = repository.record_catalog_raw_records(RUN, [_raw_record(i) for i in range(200)], **LEASE)
+    assert sizes == [200, 100, 100]
+    assert (result["inserted"], result["rpc_calls"]) == (200, 3)
+    (line,) = [record.getMessage() for record in caplog.records]
+    assert "http_status=413 class=unavailable attempt=1/4 action=split" in line
+    assert URL_SENTINEL not in line
+
+
+# --- WHERE a catalog ingestion write failed ----------------------------------
+
+SNAPSHOT = ACTIVATION["snapshot_id"]
+PAYLOAD_SENTINEL = "PAYLOAD-SENTINEL-ROW-CONTENT"
+LEASE_SENTINEL = "LEASE-SENTINEL-TOKEN"
+HINT_SENTINEL = "HINT-SENTINEL"
+
+
+def _sentinel_error(code: str) -> APIError:
+    return APIError({"message": SQL_SENTINEL, "code": code, "hint": HINT_SENTINEL,
+                     "details": URL_SENTINEL})
+
+
+def _diagnostics(phase: str, batch: int | None = None):
+    from backend.catalog.write_diagnostics import CatalogWriteDiagnostics
+    return CatalogWriteDiagnostics(run_id=RUN, phase=phase, snapshot_id=SNAPSHOT, batch=batch)
+
+
+def _assert_no_leak(rendered: str) -> None:
+    for secret in (SQL_SENTINEL, URL_SENTINEL, HINT_SENTINEL, PAYLOAD_SENTINEL, LEASE_SENTINEL,
+                   "LEAKED", "{", "apikey", "Bearer"):
+        assert secret not in rendered, secret
+
+
+def test_a_57014_raw_batch_logs_its_sqlstate_and_where_it_failed(caplog):
+    database = _TimeoutDatabase(limit=60, code="57014")
+    database_error = database.rpc
+
+    def rpc(name, params):                          # the real 57014 carries the DB text
+        call = database_error(name, params)
+        if isinstance(call._outcome, APIError):
+            call._outcome = _sentinel_error("57014")
+        return call
+    database.rpc = rpc
+    records = [{**_raw_record(400 + i), "payload": {"_id": i, "note": PAYLOAD_SENTINEL}}
+               for i in range(200)]
+    lease = {**LEASE, "lease_token": LEASE_SENTINEL}
+    caplog.set_level("WARNING", logger="milo.repository")
+    _split_repository(database, []).record_catalog_raw_records(
+        RUN, records, **lease, diagnostics=_diagnostics("raw", batch=3))
+    lines = [record.getMessage() for record in caplog.records]
+    where = f"run_id={RUN} snapshot_id={SNAPSHOT} phase=raw batch=3"
+    assert lines == [
+        "guarded rpc failed function=record_catalog_raw_records_batch_guarded cause=APIError "
+        "code=57014 http_status=none class=transient attempt=1/4 action=split "
+        f"{where} rows=0-199 capture_index=400-599",
+        "guarded rpc failed function=record_catalog_raw_records_batch_guarded cause=APIError "
+        "code=57014 http_status=none class=transient attempt=1/4 action=split "
+        f"{where} rows=0-99 capture_index=400-499",
+        "guarded rpc failed function=record_catalog_raw_records_batch_guarded cause=APIError "
+        "code=57014 http_status=none class=transient attempt=1/4 action=split "
+        f"{where} rows=100-199 capture_index=500-599",
+    ]
+    _assert_no_leak("\n".join(lines))
+
+
+def test_a_candidate_batch_failure_names_its_phase_snapshot_and_batch(caplog):
+    candidates = [{"snapshot_id": SNAPSHOT, "raw_record_id": str(uuid4()),
+                   "record_key": f"cr1.{i:032x}", "manufacturer": "Toyota",
+                   "commercial_model": f"{PAYLOAD_SENTINEL}-{i}", "model_year_start": 2025,
+                   "model_year_end": 2025, "identity_dimensions": {}} for i in range(20)]
+    client = _ScriptedClient(_sentinel_error("57014"))
+    caplog.set_level("WARNING", logger="milo.repository")
+    with pytest.raises(RepositoryFailure) as failure:
+        _repository(client, []).record_catalog_candidates(
+            RUN, candidates, **{**LEASE, "lease_token": LEASE_SENTINEL},
+            diagnostics=_diagnostics("candidates", batch=2))
+    (line,) = [record.getMessage() for record in caplog.records]
+    # 20 rows is below the split floor: raised, not split.
+    assert line == ("guarded rpc failed function=record_catalog_candidates_batch_guarded "
+                    "cause=APIError code=57014 http_status=none class=transient attempt=1/4 "
+                    f"action=raise run_id={RUN} snapshot_id={SNAPSHOT} phase=candidates batch=2 "
+                    "rows=0-19 capture_index=none")
+    _assert_no_leak(line)
+    # Never in the product-facing error.
+    assert failure.value.message == "guarded persistence operation failed"
+    assert "phase=" not in str(failure.value) and str(RUN) not in str(failure.value)
+
+
+@pytest.mark.parametrize("method,argument,phase", [
+    ("activate_catalog_snapshot", ACTIVATION, "activate"),
+    ("record_catalog_snapshot", None, "snapshot"),
+    ("adopt_catalog_snapshot", None, "adopt"),
+])
+def test_every_catalog_ingestion_write_carries_its_context(caplog, method, argument, phase):
+    snapshot = {"source_family": "government", "resource_id": src.WLTP_RESOURCE_ID,
+                "upstream_version": "2026.09.1", "upstream_version_kind": "dataset_version",
+                "content_sha256": "c" * 64, "retrieved_at": "2026-09-24T00:00:00Z",
+                "declared_record_count": 6368, "retrieval_metadata": {"note": PAYLOAD_SENTINEL}}
+    client = _ScriptedClient(_sentinel_error("22023"))
+    caplog.set_level("WARNING", logger="milo.repository")
+    with pytest.raises(AppError):
+        getattr(_repository(client, []), method)(
+            RUN, argument or snapshot, **{**LEASE, "lease_token": LEASE_SENTINEL},
+            diagnostics=_diagnostics(phase))
+    (line,) = [record.getMessage() for record in caplog.records]
+    assert line.endswith(f"class=rejected attempt=1/4 action=raise run_id={RUN} "
+                         f"snapshot_id={SNAPSHOT} phase={phase} batch=none rows=none "
+                         "capture_index=none")
+    _assert_no_leak(line)
+
+
+def test_a_non_catalog_guarded_rpc_logs_exactly_what_it_always_did(caplog):
+    client = _ScriptedClient(_sentinel_error("22023"))
+    repository = _repository(client, [])
+    caplog.set_level("WARNING", logger="milo.repository")
+    with pytest.raises(AppError):
+        repository.append_run_event(RUN, "progress", {"message": PAYLOAD_SENTINEL},
+                                    worker_id="w", attempt=1, lease_token=LEASE_SENTINEL)
+    (line,) = [record.getMessage() for record in caplog.records]
+    assert line == ("guarded rpc failed function=append_run_event_guarded cause=APIError "
+                    "code=22023 http_status=none class=rejected attempt=1/1 action=raise")
+    # The context cannot be attached to any other RPC, even by mistake.
+    with pytest.raises(ValueError):
+        repository._guarded_rpc("append_run_event_guarded", {"p_run_id": str(RUN)}, "run_event",
+                                diagnostics=_diagnostics("raw"))
+    with pytest.raises(ValueError):
+        repository._guarded_rpc("record_catalog_raw_records_batch_guarded", {}, "x",
+                                diagnostics=f"run_id={RUN}")          # not the object
+    assert len(client.calls) == 1
+
+
+def test_the_diagnostic_context_accepts_identifiers_and_whole_numbers_only():
+    from backend.catalog.write_diagnostics import CatalogWriteDiagnostics
+    with pytest.raises(ValueError):
+        CatalogWriteDiagnostics(run_id=RUN, phase=PAYLOAD_SENTINEL)
+    context = CatalogWriteDiagnostics(run_id=URL_SENTINEL, phase="raw", snapshot_id=SQL_SENTINEL,
+                                      batch="3; " + LEASE_SENTINEL, rows=(5, 2),
+                                      capture_index=(True, 1))
+    assert context.log_fields() == ("run_id=none snapshot_id=none phase=raw batch=none "
+                                    "rows=none capture_index=none")
+    part = context.for_part(10, [{"source_locator": {"capture_index": 7}},
+                                 {"source_locator": {"capture_index": "8"}}])
+    assert part.rows == (10, 11) and part.capture_index is None
+
+
+def test_ingestion_hands_every_write_its_run_snapshot_phase_and_batch(monkeypatch):
+    """The reviewed caller builds the context: the snapshot write has no
+    snapshot yet, every later write names it, and batches are numbered 1..n
+    per phase. An adopting run names the adopted snapshot."""
+    seen: list[tuple[str, Any]] = []
+
+    class _Spy(_FailingCandidates):
+        def record_catalog_snapshot(self, run_id, snapshot, **kwargs):
+            seen.append(("snapshot", kwargs.get("diagnostics")))
+            return super().record_catalog_snapshot(run_id, snapshot, **kwargs)
+
+        def adopt_catalog_snapshot(self, run_id, snapshot, **kwargs):
+            seen.append(("adopt", kwargs.get("diagnostics")))
+            return super().adopt_catalog_snapshot(run_id, snapshot, **kwargs)
+
+        def record_catalog_raw_records(self, run_id, records, **kwargs):
+            seen.append(("raw", kwargs.get("diagnostics")))
+            return super().record_catalog_raw_records(run_id, records, **kwargs)
+
+        def record_catalog_candidates(self, run_id, candidates, **kwargs):
+            seen.append(("candidates", kwargs.get("diagnostics")))
+            return super().record_catalog_candidates(run_id, candidates, **kwargs)
+
+        def activate_catalog_snapshot(self, run_id, activation, **kwargs):
+            seen.append(("activate", kwargs.get("diagnostics")))
+            return super().activate_catalog_snapshot(run_id, activation, **kwargs)
+
+    monkeypatch.setattr(ingest_module, "CATALOG_WRITE_BATCH_SIZE", 5)
+    repository = _Spy()
+    repository.fail_on = 2                                   # one candidate batch lands
+    records = committed_records(12)
+    first = _leased(repository)
+    with pytest.raises(RepositoryFailure):
+        _ingest(repository, first, records)
+    snapshot_id = next(iter(repository.catalog_snapshots.values()))["id"]
+    assert [(name, d.phase, d.run_id, d.snapshot_id, d.batch) for name, d in seen] == [
+        ("snapshot", "snapshot", str(first.run_id), None, None),
+        ("raw", "raw", str(first.run_id), snapshot_id, 1),
+        ("raw", "raw", str(first.run_id), snapshot_id, 2),
+        ("raw", "raw", str(first.run_id), snapshot_id, 3),
+        ("candidates", "candidates", str(first.run_id), snapshot_id, 1),
+        ("candidates", "candidates", str(first.run_id), snapshot_id, 2),
+    ]
+    seen.clear()
+    repository.fail = False
+    _expire(repository, first.run_id, "failed")
+    second = _leased(repository)
+    _ingest(repository, second, records)
+    phases = [(d.phase, d.run_id, d.snapshot_id, d.batch) for _name, d in seen]
+    assert phases[:2] == [("snapshot", str(second.run_id), None, None),
+                          ("adopt", str(second.run_id), snapshot_id, None)]
+    assert phases[-1] == ("activate", str(second.run_id), snapshot_id, None)
+    assert [batch for phase, _r, _s, batch in phases if phase == "candidates"] == [1, 2, 3]
+
+
 def test_the_batch_size_is_a_fixed_server_constant():
     from backend.catalog import contracts
     assert contracts.CATALOG_WRITE_BATCH_SIZE == 200
@@ -420,6 +749,7 @@ def test_an_adoption_refusal_is_one_static_code():
 # =============================================================================
 
 @pytest.mark.parametrize("failure,reason", [
+    (RepositoryFailure("unavailable", too_large=True), "CAPTURE_REPOSITORY_REQUEST_TOO_LARGE"),
     (RepositoryFailure("transient"), "CAPTURE_REPOSITORY_TRANSIENT"),
     (RepositoryFailure("rejected"), "CAPTURE_REPOSITORY_REJECTED"),
     (RepositoryFailure("unavailable"), "CAPTURE_REPOSITORY_UNAVAILABLE"),
@@ -782,6 +1112,77 @@ def test_the_incident_replayed_in_the_memory_repository(monkeypatch):
     assert refused.value.message == "this catalog snapshot does not belong to this run"
     assert repository._catalog_write_authority(snapshot["id"], second.run_id,
                                                allow_decided=True)["id"] == snapshot["id"]
+
+
+def test_memory_batches_hold_the_set_based_rules_of_the_database():
+    """Parity with `test_set_based_batches_hold_every_single_row_rule`
+    (PostgreSQL): partial and full replay counts, a repeated row present the
+    second time, the stored counter exact, a conflict anywhere failing the
+    whole batch, a repeated candidate key answering its LAST status on every
+    row, and a candidate of another snapshot's record refused."""
+    from tests.test_catalog_persistence import candidate_payload, record_payload, snapshot_payload
+
+    repository = MemoryRepository()
+    lease = _leased(repository)
+    kwargs = {"worker_id": lease.worker_id, "attempt": lease.attempt, "lease_token": lease.lease_token}
+    snapshot = repository.record_catalog_snapshot(lease.run_id, snapshot_payload(declared=8), **kwargs)
+    records = [record_payload(snapshot, upstream=str(500 + i), body={"_id": 500 + i},
+                              source_locator={"capture_index": i}) for i in range(10)]
+
+    def stored() -> tuple[int, int]:
+        rows = [row for row in repository.catalog_raw_records.values()
+                if row["snapshot_id"] == snapshot["id"]]
+        return repository.catalog_snapshots[snapshot["snapshot_key"]]["stored_record_count"], len(rows)
+
+    first = repository.record_catalog_raw_records(lease.run_id, records[:5], **kwargs)
+    assert (first["inserted"], first["already_present"]) == (5, 0)
+    partial = repository.record_catalog_raw_records(lease.run_id, records[3:7], **kwargs)
+    assert (partial["inserted"], partial["already_present"]) == (2, 2)
+    assert [row["id"] for row in partial["rows"][:2]] == [row["id"] for row in first["rows"][3:5]]
+    twice = repository.record_catalog_raw_records(lease.run_id, [records[7], records[7]], **kwargs)
+    assert (twice["inserted"], twice["already_present"]) == (1, 1)
+    full = repository.record_catalog_raw_records(lease.run_id, records[:8], **kwargs)
+    assert (full["inserted"], full["already_present"]) == (0, 8)
+    assert stored() == (8, 8)
+    for batch in ([records[8], {**records[0], "upstream_record_id": "99999"}],
+                  [records[8], {**records[8], "payload": {"_id": 508, "changed": True}}],
+                  [records[8], {**records[9], "source_locator": {"capture_index": 0}}]):
+        with pytest.raises(AppError):
+            repository.record_catalog_raw_records(lease.run_id, batch, **kwargs)
+        assert stored() == (8, 8)
+
+    record_rows = full["rows"]
+    candidates = [candidate_payload(row, commercial_model=f"RAV4-{i}") for i, row in enumerate(record_rows)]
+    written = repository.record_catalog_candidates(lease.run_id, candidates[:5], **kwargs)
+    assert (written["inserted"], written["already_present"]) == (5, 0)
+    replay = repository.record_catalog_candidates(
+        lease.run_id, [{**candidates[0], "status": "ready_for_review"},
+                       {**candidates[5], "status": "ambiguous"},
+                       {**candidates[5], "status": "rejected"}], **kwargs)
+    assert (replay["inserted"], replay["already_present"]) == (1, 2)
+    assert replay["rows"][0]["id"] == written["rows"][0]["id"]
+    assert replay["rows"][0]["status"] == "ready_for_review"
+    assert [row["status"] for row in replay["rows"][1:]] == ["rejected", "rejected"]
+
+    other = _leased(repository)
+    other_kwargs = {"worker_id": other.worker_id, "attempt": other.attempt,
+                    "lease_token": other.lease_token}
+    foreign = repository.record_catalog_snapshot(
+        other.run_id, snapshot_payload(content="b" * 64), **other_kwargs)
+    foreign_record = repository.record_catalog_raw_records(
+        other.run_id, [record_payload(foreign, upstream="700", body={"_id": 700})],
+        **other_kwargs)["rows"][0]
+    before = {key: dict(row) for key, row in repository.catalog_candidates.items()}
+    # Another snapshot's record, and a stored key restated with another
+    # identity (refused here as a key that disagrees with its identity).
+    for batch in ([candidates[6], {**candidates[7], "raw_record_id": foreign_record["id"]}],
+                  [candidates[6], {**candidates[0], "commercial_model": "OTHER",
+                                   "candidate_key": written["rows"][0]["candidate_key"]}]):
+        with pytest.raises((AppError, ValueError)):
+            repository.record_catalog_candidates(lease.run_id, batch, **kwargs)
+        assert repository.catalog_candidates == before
+    with pytest.raises(AppError, match="does not belong to this run"):
+        repository.record_catalog_candidates(other.run_id, [candidates[6]], **other_kwargs)
 
 
 def test_the_write_authority_follows_the_latest_adoption():

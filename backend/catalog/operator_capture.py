@@ -372,6 +372,11 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "the database refused the content of a durable catalog operation",
     "CAPTURE_REPOSITORY_UNAVAILABLE":
         "a durable catalog operation could not be completed for an unclassified reason",
+    # HTTP 413 on a catalog write batch that was already split down to its
+    # floor (`CATALOG_BATCH_SPLIT_FLOOR` rows): the request body is refused as
+    # too large before the database sees it, and nothing was written.
+    "CAPTURE_REPOSITORY_REQUEST_TOO_LARGE":
+        "a durable catalog write batch was refused as too large (HTTP 413) even at its smallest split",
     "CAPTURE_REPORT_NOT_WRITTEN":
         "the execution report could not be written to the requested path",
     "CAPTURE_UNEXPECTED_FAILURE":
@@ -1165,6 +1170,8 @@ def _classify(failure: BaseException) -> str:
         if failure.code in LEASE_FAILURE_CODES:
             return "CAPTURE_LEASE_LOST"
         if isinstance(failure, RepositoryFailure):
+            if getattr(failure, "too_large", False):
+                return "CAPTURE_REPOSITORY_REQUEST_TOO_LARGE"
             return REPOSITORY_FAILURE_REASONS.get(failure.failure_class,
                                                   "CAPTURE_REPOSITORY_UNAVAILABLE")
         # A repository's own static catalog refusal (an idempotency conflict,

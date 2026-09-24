@@ -115,6 +115,7 @@ from typing import Any, Callable, Mapping, Sequence
 from backend.catalog.contracts import CATALOG_WRITE_BATCH_SIZE
 from backend.engines.swarm_v2.evidence import WorkerLease
 from backend.errors import LEASE_FAILURE_CODES, AppError, RepositoryFailure
+from backend.catalog.write_diagnostics import CatalogWriteDiagnostics
 from backend.runtime import CancellationRequested
 
 from . import snapshot as snapshot_module
@@ -292,7 +293,8 @@ class GovernmentCatalogIngestor:
         payload = snapshot_module.snapshot_payload(capture, normalization, capture_scope)
         with self._phase("snapshot", request=payload):
             snapshot = self._repository.record_catalog_snapshot(
-                self._lease.run_id, payload, **self._lease_kwargs)
+                self._lease.run_id, payload, **self._lease_kwargs,
+                diagnostics=self._diagnostics("snapshot"))
         # A replay or a reuse lands on an EXISTING row. Whatever it declares
         # must be exactly what this ingestion asked for -- a scoped request is
         # never satisfied by an unscoped snapshot, nor the reverse.
@@ -325,7 +327,7 @@ class GovernmentCatalogIngestor:
             return self._report(capture, snapshot, candidates=(), reused=False)
 
         records = self._write_records(capture, snapshot)
-        candidates, rejected = self._write_candidates(normalization, records)
+        candidates, rejected = self._write_candidates(normalization, records, snapshot)
         snapshot = self._activate(snapshot)
         return self._report(capture, snapshot, candidates=candidates, reused=False,
                             rejected=rejected, adopted_from=adopted_from)
@@ -350,7 +352,8 @@ class GovernmentCatalogIngestor:
         self._check_normalization(snapshot, normalization)
         try:
             with self._phase("snapshot", request=payload):
-                answer = adopt(self._lease.run_id, dict(payload), **self._lease_kwargs)
+                answer = adopt(self._lease.run_id, dict(payload), **self._lease_kwargs,
+                               diagnostics=self._diagnostics("adopt", snapshot))
         except AppError as refusal:
             if refusal.code == "CATALOG_SNAPSHOT_ADOPTION_REFUSED":
                 raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN") from None
@@ -372,18 +375,19 @@ class GovernmentCatalogIngestor:
         the reading step never has to re-establish that pairing by index.
 
         Rows travel ONLY in bounded batches (`CATALOG_WRITE_BATCH_SIZE`): one
-        lease-guarded, all-or-nothing call per batch through the same per-row
-        validation -- never the single-row write. Each stored row comes back
+        lease-guarded, set-based, all-or-nothing call per batch that applies
+        the single-row rules -- never the single-row write. Each stored row comes back
         LEAN (id, snapshot, record key, upstream id, payload digest), which is
         all the reading step needs to bind a candidate to it.
         """
         stored: list[tuple[dict[str, Any], Mapping[str, Any]]] = []
         pairs = list(snapshot_module.raw_record_payloads(capture, snapshot))
-        for chunk in _chunks(pairs):
+        for ordinal, chunk in enumerate(_chunks(pairs), start=1):
             self._check_cancelled()
             with self._phase("raw", batch=True):
                 answer = self._repository.record_catalog_raw_records(
-                    self._lease.run_id, [payload for payload, _ in chunk], **self._lease_kwargs)
+                    self._lease.run_id, [payload for payload, _ in chunk], **self._lease_kwargs,
+                    diagnostics=self._diagnostics("raw", snapshot, batch=ordinal))
             self._count_batch("raw", answer)
             stored.extend(zip(answer["rows"], (record for _, record in chunk)))
         self._emit("catalog_records_written", {"snapshot_key": snapshot["snapshot_key"],
@@ -391,7 +395,8 @@ class GovernmentCatalogIngestor:
         return stored
 
     def _write_candidates(self, normalization: CaptureNormalization,
-                          records: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]]
+                          records: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
+                          snapshot: Mapping[str, Any] | None = None
                           ) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
         """Write the readings this capture already produced, in capture order.
 
@@ -415,11 +420,12 @@ class GovernmentCatalogIngestor:
         # ONLY the batch write, which asks the snapshot write authority. The
         # single-row candidate write does not, and ingestion never calls it
         # (tests/test_catalog_ingestion_recovery.py holds that statically).
-        for chunk in _chunks(payloads):
+        for ordinal, chunk in enumerate(_chunks(payloads), start=1):
             self._check_cancelled()
             with self._phase("candidates", batch=True):
                 answer = self._repository.record_catalog_candidates(
-                    self._lease.run_id, chunk, **self._lease_kwargs)
+                    self._lease.run_id, chunk, **self._lease_kwargs,
+                    diagnostics=self._diagnostics("candidates", snapshot, batch=ordinal))
             self._count_batch("candidates", answer)
             candidates.extend(answer["rows"])
         self._emit("catalog_candidates_written", {"count": len(candidates),
@@ -445,7 +451,8 @@ class GovernmentCatalogIngestor:
         try:
             with self._phase("activate", request={"snapshot_id": snapshot["id"]}):
                 decided = self._repository.activate_catalog_snapshot(
-                    self._lease.run_id, {"snapshot_id": snapshot["id"]}, **self._lease_kwargs)
+                    self._lease.run_id, {"snapshot_id": snapshot["id"]}, **self._lease_kwargs,
+                    diagnostics=self._diagnostics("activate", snapshot))
         except AppError as failure:
             if not _is_refusal(failure):
                 raise
@@ -453,7 +460,7 @@ class GovernmentCatalogIngestor:
                 self._repository.activate_catalog_snapshot(
                     self._lease.run_id, {"snapshot_id": snapshot["id"],
                                          "validation_state": "failed"},
-                    **self._lease_kwargs)
+                    **self._lease_kwargs, diagnostics=self._diagnostics("activate", snapshot))
             raise GovernmentIngestionError("GOV_SNAPSHOT_NOT_ACTIVATED") from None
         self._emit("catalog_snapshot_activated", {"snapshot_key": decided["snapshot_key"],
                                                   "records": decided["stored_record_count"]})
@@ -527,6 +534,15 @@ class GovernmentCatalogIngestor:
             candidates=tuple(dict(candidate) for candidate in candidates))
 
     # --- measurement ---------------------------------------------------------
+
+    def _diagnostics(self, phase: str, snapshot: Mapping[str, Any] | None = None, *,
+                     batch: int | None = None) -> CatalogWriteDiagnostics:
+        """WHERE a write happens, for the repository's server-log line if it
+        fails: this run, the snapshot, the phase and the batch ordinal.
+        Identifiers and whole numbers only (`CatalogWriteDiagnostics`); never
+        a payload, and never part of a report."""
+        return CatalogWriteDiagnostics(run_id=self._lease.run_id, phase=phase,
+                                       snapshot_id=(snapshot or {}).get("id"), batch=batch)
 
     def _phase(self, name: str, *, request: Any = None, batch: bool = False) -> "_Phase":
         return _Phase(self._metrics[name], request=request, batch=batch)

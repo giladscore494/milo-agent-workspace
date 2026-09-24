@@ -159,9 +159,16 @@ REQUIRED_PER_FILE["20260924000200_catalog_ingestion_recovery.sql"] = [
     "'catalog_snapshot_adopted'",
     "create or replace function public.record_catalog_raw_records_batch_guarded(",
     "create or replace function public.record_catalog_candidates_batch_guarded(",
-    "perform public.assert_snapshot_write_authority(v_snapshot_id, p_run_id)",
+    # The batches are SET-BASED: the lease and the authority once per batch,
+    # a bulk insert, the stored-record counter moved once by the number
+    # inserted, and one replay check that fails the whole batch.
+    "v_snapshot := public.assert_snapshot_write_authority(",
     "not between 1 and 500",
     "perform public.assert_worker_lease(",
+    "get diagnostics v_inserted = row_count",
+    "set stored_record_count = stored_record_count + v_inserted",
+    "raise exception 'catalog raw record idempotency conflict'",
+    "raise exception 'catalog candidate idempotency conflict'",
 ]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the
