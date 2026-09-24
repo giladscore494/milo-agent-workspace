@@ -1379,15 +1379,20 @@ def test_no_operator_script_passes_a_dash_leading_args_value_as_a_separate_token
 def test_the_capture_script_prints_the_ingestion_measurements(tmp_path):
     """The operator reads the cost of a preparation from the script's own
     output: calls, seconds, inserted vs already present, and the adoption."""
-    phase = {"calls": 32, "seconds": 11.5, "inserted": 0, "already_present": 6368}
+    phase = {"calls": 32, "seconds": 11.5, "request_bytes": 15800000, "max_call_seconds": 0.62,
+             "inserted": 0, "already_present": 6368}
     document = {**SUCCEEDED_DOCUMENT, "work_scope": {
         "queued_item_count": 0, "batch_count": 0,
         "units": [{"unit_key": "toyota", "capture": "adopted", "ingestion": {
-            "snapshot": {"calls": 2, "seconds": 0.4}, "raw": phase,
-            "candidates": {"calls": 32, "seconds": 9.1, "inserted": 2789,
-                           "already_present": 3579},
-            "activate": {"calls": 1, "seconds": 0.2}, "total_calls": 67,
-            "total_seconds": 21.2, "adoption_seq": 1,
+            "snapshot": {"calls": 2, "seconds": 0.4, "request_bytes": 9000,
+                         "max_call_seconds": 0.21},
+            "raw": phase,
+            "candidates": {"calls": 32, "seconds": 9.1, "request_bytes": 2900000,
+                           "max_call_seconds": 0.33, "inserted": 2789, "already_present": 3579},
+            "activate": {"calls": 1, "seconds": 0.2, "request_bytes": 52,
+                         "max_call_seconds": 0.2},
+            "total_calls": 67, "total_seconds": 21.2, "total_request_bytes": 18709052,
+            "max_call_seconds": 0.62, "adoption_seq": 1,
             "previous_writer_run_id": "bbff131a-4ba3-4e79-9796-a7edb7df314c"}},
                   {"unit_key": "lexus", "capture": "none", "ingestion": {"total_calls": 0}}]}}
     result, _log = _capture_script(tmp_path, "--enable-catalog-execution",
@@ -1395,11 +1400,13 @@ def test_the_capture_script_prints_the_ingestion_measurements(tmp_path):
                                    gcloud=True, document=document)
     lines = [line for line in result.stdout.splitlines() if line.startswith("INGESTION")]
     assert lines == [
-        "INGESTION unit=toyota phase=snapshot calls=2 seconds=0.4",
-        "INGESTION unit=toyota phase=raw calls=32 seconds=11.5 inserted=0 already_present=6368",
-        "INGESTION unit=toyota phase=candidates calls=32 seconds=9.1 inserted=2789 already_present=3579",
-        "INGESTION unit=toyota phase=activate calls=1 seconds=0.2",
+        "INGESTION unit=toyota phase=snapshot calls=2 seconds=0.4 request_bytes=9000 max_call_seconds=0.21",
+        "INGESTION unit=toyota phase=raw calls=32 seconds=11.5 request_bytes=15800000 max_call_seconds=0.62 inserted=0 already_present=6368",
+        "INGESTION unit=toyota phase=candidates calls=32 seconds=9.1 request_bytes=2900000 max_call_seconds=0.33 inserted=2789 already_present=3579",
+        "INGESTION unit=toyota phase=activate calls=1 seconds=0.2 request_bytes=52 max_call_seconds=0.2",
         "INGESTION unit=toyota adoption_seq=1 previous_writer_run_id=bbff131a-4ba3-4e79-9796-a7edb7df314c",
         "INGESTION_TOTAL_DB_CALLS=67",
         "INGESTION_TOTAL_SECONDS=21.200",
+        "INGESTION_TOTAL_REQUEST_BYTES=18709052",
+        "INGESTION_MAX_CALL_SECONDS=0.620 (statement timeout 8 s)",
     ]

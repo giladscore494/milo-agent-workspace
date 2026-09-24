@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import threading
@@ -187,6 +188,17 @@ _TRANSIENT_SQLSTATE_CLASSES = frozenset({"08", "53"})
 _REJECTED_SQLSTATE_CLASSES = frozenset({"22", "23"})
 _SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
 
+#: SQLSTATEs of a statement cancelled by `statement_timeout` (57014) or
+#: `lock_timeout` (55P03). PostgREST runs every request under the
+#: authenticator role's 8 s statement AND lock timeouts (verified on
+#: Production, read-only, 2026-09-24), so an over-long batch fails with one of
+#: these -- and would fail the same way if merely repeated. A batch that hits
+#: one is SPLIT instead (`_split_catalog_batch`); nothing else is.
+_TIMEOUT_SQLSTATES = frozenset({"57014", "55P03"})
+#: The smallest batch a timed-out batch is split down to. A batch of this size
+#: that still times out is reported as the transient failure it is.
+CATALOG_BATCH_SPLIT_FLOOR = 25
+
 #: The bounded retry of the catalog ingestion writes. Four attempts in all,
 #: 0.5 + 1 + 2 = 3.5 s of backoff at most per write, and ONLY for a
 #: `transient` failure: a lost lease, a rejection and an unknown failure are
@@ -207,6 +219,11 @@ def failure_code(exc: BaseException) -> str:
         if re.fullmatch(r"[0-9A-Z]{3,8}", code):
             return code
     return ""
+
+
+def is_statement_timeout(exc: BaseException) -> bool:
+    """Whether the database cancelled the statement for a statement or lock timeout."""
+    return failure_code(exc) in _TIMEOUT_SQLSTATES
 
 
 def classify_repository_failure(exc: BaseException) -> str:
@@ -235,6 +252,27 @@ def classify_repository_failure(exc: BaseException) -> str:
 #: The database's own adoption refusals (20260924000200), reported as one
 #: static code. The marker is matched; the message is never carried.
 CATALOG_ADOPTION_REFUSED = "CATALOG_SNAPSHOT_ADOPTION_REFUSED"
+
+
+#: The row-carrying parameter of each batch write, whose JSON size is what
+#: `request_bytes` reports.
+_BATCH_ROW_PARAMETERS = ("p_records", "p_candidates")
+
+
+def _request_bytes(params: dict[str, Any]) -> int:
+    """The JSON-encoded size of the rows one call sends (`p_records` /
+    `p_candidates`; the whole body for any other call), encoded as httpx
+    encodes `json=` -- the default `json.dumps`."""
+    rows = next((params[name] for name in _BATCH_ROW_PARAMETERS if name in params), params)
+    return len(json.dumps(rows, default=str).encode("utf-8"))
+
+
+def _observe(stats: dict[str, Any] | None, request_bytes: int, seconds: float) -> None:
+    if stats is None:
+        return
+    stats["calls"] = int(stats.get("calls") or 0) + 1
+    stats["request_bytes"] = int(stats.get("request_bytes") or 0) + request_bytes
+    stats["max_call_seconds"] = max(float(stats.get("max_call_seconds") or 0.0), seconds)
 
 
 class SupabaseRepository:
@@ -679,7 +717,9 @@ class SupabaseRepository:
 
     def _guarded_rpc(self, function: str, params: dict[str, Any], resource: str, *,
                      retry_transient: bool = False,
-                     refusals: tuple[str, ...] = ()) -> Any:
+                     refusals: tuple[str, ...] = (),
+                     split_on_timeout: bool = False,
+                     stats: dict[str, Any] | None = None) -> Any:
         """Call a lease-guarded RPC (migration 20260810000300); a stale lease
         surfaces as RUN_LEASE_LOST so worker code paths treat it exactly like
         a failed heartbeat.
@@ -691,16 +731,31 @@ class SupabaseRepository:
         retried within `CATALOG_WRITE_ATTEMPTS`; nothing else is. `refusals`
         names static markers a function raises on purpose; one found in the
         failure becomes an AppError of exactly that code, never its text.
-        Every failed attempt is logged by `_log_guarded_failure`."""
+        Every failed attempt is logged by `_log_guarded_failure`.
+
+        With `split_on_timeout` (the batch writes), a statement or lock
+        timeout is NOT retried here: repeating the same over-long batch would
+        time out again, so it is raised at once as a timed-out
+        `RepositoryFailure` for the caller to split. `stats`, when given,
+        accumulates every attempt actually sent: `calls`, `request_bytes` and
+        `max_call_seconds`."""
         attempts = CATALOG_WRITE_ATTEMPTS if retry_transient else 1
+        request_bytes = _request_bytes(params) if stats is not None else 0
         for attempt in range(1, attempts + 1):
             http = getattr(self, "_http", None)
             if http is not None:
                 http.status = None
+            started = time.monotonic()
             try:
                 data = self.client.rpc(function, params).execute().data
+                _observe(stats, request_bytes, time.monotonic() - started)
                 break
             except Exception as exc:
+                _observe(stats, request_bytes, time.monotonic() - started)
+                if split_on_timeout and is_statement_timeout(exc):
+                    self._log_guarded_failure(function, exc, "transient", attempt, attempts,
+                                              retrying=False)
+                    raise RepositoryFailure("transient", timed_out=True) from exc
                 if self._is_stale_lease_error(exc):
                     self._log_guarded_failure(function, exc, "lease_lost", attempt, attempts,
                                               retrying=False)
@@ -1292,38 +1347,87 @@ class SupabaseRepository:
                            f"a catalog write batch holds 1 to {MAX_CATALOG_WRITE_BATCH} rows", 400)
         return prepared
 
-    @staticmethod
-    def _catalog_batch_result(data: Any, sent: int, resource: str) -> dict[str, Any]:
+    #: What one LEAN batch row carries, exactly (20260924000200). Never the
+    #: raw payload or its locator, which the caller sent and holds.
+    CATALOG_BATCH_ROW_FIELDS = {
+        "catalog raw record": ("id", "snapshot_id", "record_key", "upstream_record_id",
+                               "payload_sha256"),
+        "catalog candidate": ("id", "snapshot_id", "raw_record_id", "candidate_key", "status"),
+    }
+
+    @classmethod
+    def _catalog_batch_result(cls, data: Any, sent: int, resource: str) -> dict[str, Any]:
         """`{rows, inserted, already_present}`, held to what was sent."""
         rows = data.get("rows") if isinstance(data, dict) else None
         inserted = data.get("inserted") if isinstance(data, dict) else None
         present = data.get("already_present") if isinstance(data, dict) else None
+        fields = set(cls.CATALOG_BATCH_ROW_FIELDS[resource])
         if not isinstance(rows, list) or len(rows) != sent \
+                or any(not isinstance(row, dict) or set(row) != fields for row in rows) \
                 or not isinstance(inserted, int) or not isinstance(present, int) \
                 or inserted < 0 or present < 0 or inserted + present != sent:
             raise RepositoryFailure("unavailable", f"{resource} batch answered the wrong shape")
         return {"rows": rows, "inserted": inserted, "already_present": present}
 
+    def _split_catalog_batch(self, prepared: list[dict[str, Any]], call: Any,
+                             resource: str, stats: dict[str, Any]) -> dict[str, Any]:
+        """One batch, or -- when it hit a statement or lock timeout -- its two
+        halves, recursively, down to `CATALOG_BATCH_SPLIT_FLOOR` rows.
+
+        Safe because a timed-out statement committed nothing, and because every
+        row write is idempotent on its key: a half that DID land (its answer
+        lost after commit, then retried by `_guarded_rpc`) replays onto the
+        same rows and reports them as already present. Rows come back in input
+        order, and the counts are the sums of what each call reported.
+        """
+        try:
+            return self._catalog_batch_result(call(prepared, stats), len(prepared), resource)
+        except RepositoryFailure as failure:
+            if not failure.timed_out or len(prepared) <= CATALOG_BATCH_SPLIT_FLOOR:
+                raise
+        middle = len(prepared) // 2
+        first = self._split_catalog_batch(prepared[:middle], call, resource, stats)
+        second = self._split_catalog_batch(prepared[middle:], call, resource, stats)
+        return {"rows": first["rows"] + second["rows"],
+                "inserted": first["inserted"] + second["inserted"],
+                "already_present": first["already_present"] + second["already_present"]}
+
+    @staticmethod
+    def _with_stats(result: dict[str, Any], stats: dict[str, Any]) -> dict[str, Any]:
+        return {**result, "rpc_calls": int(stats.get("calls") or 0),
+                "request_bytes": int(stats.get("request_bytes") or 0),
+                "max_call_seconds": float(stats.get("max_call_seconds") or 0.0)}
+
     def record_catalog_raw_records(self, run_id: UUID, records: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         """Up to `MAX_CATALOG_WRITE_BATCH` raw records of ONE snapshot, in one
         transaction, each through the unchanged single-row RPC. Answers
-        `{rows (input order), inserted, already_present}`."""
+        `{rows (lean, input order), inserted, already_present}` plus what it
+        cost: `rpc_calls`, `request_bytes`, `max_call_seconds`."""
         prepared = self._catalog_batch(records, prepare_raw_record)
-        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
-                  "p_records": prepared}
-        data = self._guarded_rpc("record_catalog_raw_records_batch_guarded", params,
-                                 "catalog_raw_record", retry_transient=True)
-        return self._catalog_batch_result(data, len(prepared), "catalog raw record")
+        lease = self._lease_params(run_id, worker_id, attempt, lease_token)
+        stats: dict[str, Any] = {}
+
+        def call(part: list[dict[str, Any]], observed: dict[str, Any]) -> Any:
+            return self._guarded_rpc("record_catalog_raw_records_batch_guarded",
+                                     {**lease, "p_records": part}, "catalog_raw_record",
+                                     retry_transient=True, split_on_timeout=True, stats=observed)
+        return self._with_stats(
+            self._split_catalog_batch(prepared, call, "catalog raw record", stats), stats)
 
     def record_catalog_candidates(self, run_id: UUID, candidates: Sequence[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         """Up to `MAX_CATALOG_WRITE_BATCH` candidates of ONE snapshot this run
-        may write and has not decided, in one transaction."""
+        may write and has not decided, in one transaction; answered and split
+        exactly as `record_catalog_raw_records`."""
         prepared = self._catalog_batch(candidates, prepare_candidate)
-        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
-                  "p_candidates": prepared}
-        data = self._guarded_rpc("record_catalog_candidates_batch_guarded", params,
-                                 "catalog_candidate", retry_transient=True)
-        return self._catalog_batch_result(data, len(prepared), "catalog candidate")
+        lease = self._lease_params(run_id, worker_id, attempt, lease_token)
+        stats: dict[str, Any] = {}
+
+        def call(part: list[dict[str, Any]], observed: dict[str, Any]) -> Any:
+            return self._guarded_rpc("record_catalog_candidates_batch_guarded",
+                                     {**lease, "p_candidates": part}, "catalog_candidate",
+                                     retry_transient=True, split_on_timeout=True, stats=observed)
+        return self._with_stats(
+            self._split_catalog_batch(prepared, call, "catalog candidate", stats), stats)
 
     def adopt_catalog_snapshot(self, run_id: UUID, snapshot: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         """Become the writer of a PENDING snapshot whose writer ended unsuccessfully.

@@ -71,7 +71,12 @@
 -- the caller may write, assert the lease and the write authority, and apply
 -- the unchanged single-row RPC to each row in order inside one transaction:
 -- the same validation and the same idempotency, by construction, and all or
--- nothing. Each answers `{rows, inserted, already_present}`.
+-- nothing. Each answers `{rows, inserted, already_present}`, where `rows` is
+-- LEAN and in input order: a raw record as (id, snapshot_id, record_key,
+-- upstream_record_id, payload_sha256), a candidate as (id, snapshot_id,
+-- raw_record_id, candidate_key, status). PostgREST runs these under the
+-- authenticator role's 8 s statement and lock timeouts; the repository splits
+-- a batch that hits either (`backend/repository/supabase.py`).
 --
 -- Compatibility with the release that is still serving
 -- ----------------------------------------------------
@@ -523,7 +528,11 @@ begin
     end if;
     select * into v_row from public.record_catalog_raw_record_guarded(
       p_run_id, p_worker_id, p_attempt, p_lease_token, v_record);
-    v_rows := v_rows || to_jsonb(v_row);
+    -- A LEAN answer: identity and digest only, never the payload or the
+    -- locator the caller just sent (≈1.6 KB a row would double the response).
+    v_rows := v_rows || jsonb_build_object(
+      'id', v_row.id, 'snapshot_id', v_row.snapshot_id, 'record_key', v_row.record_key,
+      'upstream_record_id', v_row.upstream_record_id, 'payload_sha256', v_row.payload_sha256);
   end loop;
   return jsonb_build_object('rows', v_rows,
                             'inserted', jsonb_array_length(v_rows) - v_present,
@@ -570,7 +579,10 @@ begin
     end if;
     select * into v_row from public.record_catalog_candidate_guarded(
       p_run_id, p_worker_id, p_attempt, p_lease_token, v_candidate);
-    v_rows := v_rows || to_jsonb(v_row);
+    -- A LEAN answer: identity and status only.
+    v_rows := v_rows || jsonb_build_object(
+      'id', v_row.id, 'snapshot_id', v_row.snapshot_id, 'raw_record_id', v_row.raw_record_id,
+      'candidate_key', v_row.candidate_key, 'status', v_row.status);
   end loop;
   return jsonb_build_object('rows', v_rows,
                             'inserted', jsonb_array_length(v_rows) - v_present,

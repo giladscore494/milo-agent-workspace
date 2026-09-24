@@ -21,6 +21,7 @@ contract:
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -192,24 +193,145 @@ def _raw_record(index: int) -> dict[str, Any]:
             "payload": {"_id": 42000 + index}, "source_locator": {"capture_index": index}}
 
 
+def _lean_raw(index: int) -> dict[str, Any]:
+    record = _raw_record(index)
+    return {"id": str(uuid4()), "snapshot_id": record["snapshot_id"],
+            "record_key": f"cr1.{index:032x}", "upstream_record_id": record["upstream_record_id"],
+            "payload_sha256": "0" * 64}
+
+
 def test_a_raw_record_batch_is_one_bounded_call_answered_row_for_row():
-    rows = [{"id": str(uuid4())} for _ in range(3)]
+    rows = [_lean_raw(i) for i in range(3)]
     client = _ScriptedClient({"rows": rows, "inserted": 2, "already_present": 1})
     repository = _repository(client, [])
-    assert repository.record_catalog_raw_records(RUN, [_raw_record(i) for i in range(3)],
-                                                 **LEASE) == \
+    answer = repository.record_catalog_raw_records(RUN, [_raw_record(i) for i in range(3)], **LEASE)
+    assert {key: answer[key] for key in ("rows", "inserted", "already_present")} == \
         {"rows": rows, "inserted": 2, "already_present": 1}
+    # What the call cost is reported with it.
+    assert answer["rpc_calls"] == 1 and answer["request_bytes"] > 0
+    assert answer["max_call_seconds"] >= 0
     (name, params), = client.calls
     assert name == "record_catalog_raw_records_batch_guarded"
     assert len(params["p_records"]) == 3
     assert all(record["record_key"].startswith("cr1.") for record in params["p_records"])
-    # A short or inconsistent answer is never taken as a complete batch.
-    for answer in ({"rows": rows[:2], "inserted": 2, "already_present": 0},
-                   {"rows": rows, "inserted": 3, "already_present": 1},
-                   rows):
-        wrong = _repository(_ScriptedClient(answer), [])
+    # A short, inconsistent or NOT LEAN answer is never taken as a batch: a row
+    # carrying the payload back is refused, not silently accepted.
+    for wrong_answer in ({"rows": rows[:2], "inserted": 2, "already_present": 0},
+                         {"rows": rows, "inserted": 3, "already_present": 1},
+                         {"rows": [{**rows[0], "payload": {"_id": 1}}, *rows[1:]],
+                          "inserted": 3, "already_present": 0},
+                         {"rows": [{k: v for k, v in rows[0].items() if k != "payload_sha256"},
+                                   *rows[1:]], "inserted": 3, "already_present": 0},
+                         rows):
+        wrong = _repository(_ScriptedClient(wrong_answer), [])
         with pytest.raises(RepositoryFailure):
             wrong.record_catalog_raw_records(RUN, [_raw_record(i) for i in range(3)], **LEASE)
+
+
+# --- a statement or lock timeout splits the batch -----------------------------
+
+class _TimeoutDatabase:
+    """A stateful stand-in for `record_catalog_raw_records_batch_guarded`.
+
+    Rows land by record key, exactly once. A call carrying more than `limit`
+    rows is cancelled by the statement timeout -- `code`, 57014 or 55P03 --
+    and lands NOTHING (a cancelled statement rolls back). Call numbers in
+    `lose` COMMIT and then lose their answer on the way back (ReadTimeout).
+    """
+
+    def __init__(self, limit: int, *, code: str = "57014", lose: tuple[int, ...] = ()) -> None:
+        self.limit, self.code, self.lose = limit, code, set(lose)
+        self.ids: dict[str, str] = {}
+        self.sizes: list[int] = []
+        self.sent_bytes: list[int] = []
+
+    def rpc(self, name: str, params: dict) -> _Call:
+        rows = params["p_records"]
+        number = len(self.sizes)
+        self.sizes.append(len(rows))
+        self.sent_bytes.append(len(json.dumps(rows).encode("utf-8")))
+        if len(rows) > self.limit:
+            return _Call(_api_error(self.code, "canceling statement due to statement timeout"))
+        inserted = 0
+        answer = []
+        for row in rows:
+            if row["record_key"] not in self.ids:
+                self.ids[row["record_key"]] = str(uuid4())
+                inserted += 1
+            answer.append({"id": self.ids[row["record_key"]], "snapshot_id": row["snapshot_id"],
+                           "record_key": row["record_key"],
+                           "upstream_record_id": row["upstream_record_id"],
+                           "payload_sha256": "0" * 64})
+        if number in self.lose:
+            return _Call(httpx.ReadTimeout("the answer was lost after the commit"))
+        return _Call({"rows": answer, "inserted": inserted, "already_present": len(rows) - inserted})
+
+
+def _split_repository(database: _TimeoutDatabase, sleeps: list[float]) -> SupabaseRepository:
+    repository = SupabaseRepository.__new__(SupabaseRepository)
+    repository.client = database
+    repository._retry_sleep = sleeps.append
+    return repository
+
+
+@pytest.mark.parametrize("code", ["57014", "55P03"])
+def test_a_timed_out_batch_is_split_in_halves_not_repeated(code):
+    database = _TimeoutDatabase(limit=60, code=code)
+    sleeps: list[float] = []
+    records = [_raw_record(i) for i in range(200)]
+    answer = _split_repository(database, sleeps).record_catalog_raw_records(RUN, records, **LEASE)
+    # 200 and 100 time out; each 100 becomes two 50s, in input order. The same
+    # over-long batch is never sent twice, and a timeout is never "retried".
+    assert database.sizes == [200, 100, 50, 50, 100, 50, 50]
+    assert sleeps == []
+    assert [row["upstream_record_id"] for row in answer["rows"]] == \
+        [record["upstream_record_id"] for record in records]
+    assert (answer["inserted"], answer["already_present"]) == (200, 0)
+    assert answer["rpc_calls"] == 7
+    assert len(database.ids) == 200
+    # Every call actually sent is counted: its rows' JSON size, and the slowest.
+    assert answer["request_bytes"] == sum(database.sent_bytes)
+    assert answer["max_call_seconds"] >= 0
+
+
+def test_a_half_that_committed_but_lost_its_answer_replays_idempotently():
+    # Call 2 is the first 50-row half: it commits, its answer is lost, and
+    # `_guarded_rpc`'s bounded retry sends it again -- onto the same rows.
+    database = _TimeoutDatabase(limit=60, lose=(2,))
+    sleeps: list[float] = []
+    records = [_raw_record(i) for i in range(200)]
+    answer = _split_repository(database, sleeps).record_catalog_raw_records(RUN, records, **LEASE)
+    assert database.sizes == [200, 100, 50, 50, 50, 100, 50, 50]
+    assert sleeps == [0.5]
+    assert len(database.ids) == 200                          # nothing written twice
+    assert [row["id"] for row in answer["rows"]] == \
+        [database.ids[row["record_key"]] for row in answer["rows"]]
+    assert [row["upstream_record_id"] for row in answer["rows"]] == \
+        [record["upstream_record_id"] for record in records]
+    # Exact: the replayed half says its 50 rows were already there.
+    assert (answer["inserted"], answer["already_present"]) == (150, 50)
+    assert answer["inserted"] + answer["already_present"] == 200
+
+
+def test_a_batch_still_timing_out_at_the_floor_fails_as_transient():
+    database = _TimeoutDatabase(limit=10)
+    with pytest.raises(RepositoryFailure) as failure:
+        _split_repository(database, []).record_catalog_raw_records(
+            RUN, [_raw_record(i) for i in range(200)], **LEASE)
+    assert failure.value.failure_class == "transient" and failure.value.timed_out
+    assert database.sizes == [200, 100, 50, 25]            # never split below 25
+    assert min(database.sizes) == 25 and database.ids == {}
+
+
+def test_other_transient_failures_keep_the_bounded_retry_and_are_never_split():
+    client = _ScriptedClient(*[_api_error("503")] * CATALOG_WRITE_ATTEMPTS)
+    sleeps: list[float] = []
+    with pytest.raises(RepositoryFailure) as failure:
+        _repository(client, sleeps).record_catalog_raw_records(
+            RUN, [_raw_record(i) for i in range(200)], **LEASE)
+    assert not failure.value.timed_out
+    assert [len(params["p_records"]) for _name, params in client.calls] == [200] * 4
+    assert sleeps == [0.5, 1.0, 2.0]
 
 
 def test_the_batch_size_is_a_fixed_server_constant():
@@ -483,7 +605,87 @@ def test_ingestion_writes_rows_in_bounded_batches_and_measures_them(monkeypatch)
     assert metrics["candidates"]["inserted"] == len(repository.catalog_candidates)
     assert metrics["total_calls"] == 8
     assert (metrics["adoption_seq"], metrics["previous_writer_run_id"]) == (0, "")
-    assert all(metrics[phase]["seconds"] >= 0 for phase in ingest_module.INGESTION_PHASES)
+    for phase in ingest_module.INGESTION_PHASES:
+        assert metrics[phase]["request_bytes"] > 0
+        assert 0 <= metrics[phase]["max_call_seconds"] <= metrics[phase]["seconds"] + 0.001
+    assert metrics["total_request_bytes"] == sum(
+        metrics[phase]["request_bytes"] for phase in ingest_module.INGESTION_PHASES)
+
+
+def test_candidate_payloads_are_built_exactly_from_the_lean_record_rows():
+    """The raw-record batch answers LEAN rows (no payload). Every candidate
+    must still be bound to exactly its own raw record and carry exactly the
+    reading the full-row path would have produced."""
+    from backend.catalog.government.normalize import read_capture
+    from backend.catalog.payloads import prepare_candidate
+
+    repository = MemoryRepository()
+    records = committed_records(12)
+    report = _ingest(repository, _leased(repository), records)
+    assert report.activated
+    full_rows = {row["upstream_record_id"]: row for row in repository.catalog_raw_records.values()}
+    normalization = read_capture(records, resource_id=src.WLTP_RESOURCE_ID)
+    expected = {}
+    for record, reading in zip(records, normalization.entries):
+        if reading is not None:
+            payload = prepare_candidate(reading.candidate_payload(full_rows[str(record["_id"])]))
+            expected[payload["candidate_key"]] = payload
+    stored = {row["candidate_key"]: row for row in repository.catalog_candidates.values()}
+    assert set(stored) == set(expected) and expected
+    for key, payload in expected.items():
+        for field in ("raw_record_id", "snapshot_id", "manufacturer", "commercial_model",
+                      "model_year_start", "model_year_end", "official_model_code", "trim",
+                      "status"):
+            assert stored[key][field] == payload[field], (key, field)
+    # And what the batches answered is lean.
+    assert all(set(row) == {"id", "snapshot_id", "raw_record_id", "candidate_key", "status"}
+               for row in report.candidates)
+
+
+def test_ingestion_never_calls_a_single_row_catalog_write():
+    """Ingestion writes rows ONLY through the batch writes, which ask the
+    snapshot write authority. The single-row candidate write does not ask it
+    (plan §5.2.4 debt): it is kept for the promotion pipeline alone."""
+    import ast
+
+    root = Path(__file__).resolve().parents[1] / "backend"
+    ingestion = [*sorted((root / "catalog" / "government").glob("*.py")),
+                 *sorted((root / "catalog" / "scope").glob("*.py")),
+                 root / "catalog" / "operator_capture.py"]
+    forbidden = {"record_catalog_candidate", "record_catalog_raw_record"}
+    for path in ingestion:
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Attribute) and node.attr in forbidden:
+                raise AssertionError(f"{path.relative_to(root)} reaches {node.attr} (line {node.lineno})")
+    # The ONE product caller of the single-row candidate write is the
+    # (disabled) promotion pipeline.
+    callers = sorted(str(path.relative_to(root)) for path in root.rglob("*.py")
+                     if "testing" not in path.parts and "repository" not in path.parts
+                     and any(isinstance(node, ast.Attribute) and node.attr == "record_catalog_candidate"
+                             for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))))
+    assert callers == ["catalog/pipeline.py"]
+
+
+def test_ingestion_works_with_the_single_row_writes_unavailable():
+    """A runtime proof of the same: ingestion succeeds when the single-row
+    writes refuse to be called at all."""
+    class _NoSingleRows(MemoryRepository):
+        calls = 0
+
+        def record_catalog_candidate(self, *args, **kwargs):
+            if not getattr(self, "_inside_batch", False):
+                raise AssertionError("ingestion called the single-row candidate write")
+            return super().record_catalog_candidate(*args, **kwargs)
+
+        def record_catalog_candidates(self, *args, **kwargs):
+            self._inside_batch = True
+            try:
+                return super().record_catalog_candidates(*args, **kwargs)
+            finally:
+                self._inside_batch = False
+
+    repository = _NoSingleRows()
+    assert _ingest(repository, _leased(repository), committed_records(6)).activated
 
 
 # =============================================================================

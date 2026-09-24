@@ -234,12 +234,45 @@ behaviour for a snapshot nobody adopted is unchanged (the current writer IS
 the creator). `tests/test_migrations_postgres.py::test_the_serving_release_single_row_ingestion_still_works_on_the_new_schema`
 runs exactly that path on the migrated schema.
 
-Batch cost (measured on PostgreSQL 16 in the executable suite, local, not on
-Supabase): one 200-row raw-record call with register-shaped rows carries a
-~620 KB request body and took 0.36 s end to end; one 200-row candidate call
-~95 KB and 0.16 s. Supabase's documented statement timeout for the role these
-RPCs run as is 8 s (`service_role` inherits `authenticator`'s). No Supabase
-REST request-size limit is documented; PostgREST sets none by default.
+Timeouts: PostgREST runs every call under the `authenticator` role's settings,
+and Production holds `statement_timeout=8s` AND `lock_timeout=8s` there while
+`service_role` has no role config (verified read-only, 2026-09-24). So 8 s per
+RPC is a hard ceiling. A batch cancelled by either (SQLSTATE 57014 / 55P03) is
+NOT repeated: the repository sends its two halves instead, recursively, down
+to 25 rows, and only a 25-row batch that still times out fails, as
+`CAPTURE_REPOSITORY_TRANSIENT`. Every other transient failure keeps the plain
+bounded retry (4 attempts).
+
+Lean answers: a batch answers per row only `(id, snapshot_id, record_key,
+upstream_record_id, payload_sha256)` for a raw record and `(id, snapshot_id,
+raw_record_id, candidate_key, status)` for a candidate -- never the payload or
+the locator the caller just sent.
+
+Batch cost, measured on PostgreSQL 16 in the executable suite (local, NOT on
+Supabase), 200 rows with register rows of Production's size (payload JSON
+2 489 chars; Production's snapshot `701ea334` averages 2 470, max 2 497),
+timed by the server's clock around the one statement, three runs:
+
+* raw records, 200 rows: request body 622 KB, response 55 KB, server time
+  0.17-0.24 s;
+* candidates, 200 rows: request body 95 KB, response 48 KB, server time
+  0.10-0.11 s.
+
+Well under 1 s, so `CATALOG_WRITE_BATCH_SIZE` stays 200. No request-size limit
+of the Supabase REST gateway is documented, and PostgREST sets none by default;
+a ~0.6 MB body is NOT verified against the Supabase gateway.
+
+**Deferred debt -- the single-row candidate write.**
+`record_catalog_candidate_guarded` (single row) still CREATES candidates
+without asking `assert_snapshot_write_authority`: any leased run can file a
+reading under any snapshot's raw record. It is kept unchanged ONLY because
+the promotion pipeline (`backend/catalog/pipeline.py`, disabled by
+`MILO_ENABLE_CATALOG_PROMOTION=false`) revises a candidate's status through
+it. Ingestion never calls it -- only the batch write, which asks the
+authority -- and `tests/test_catalog_ingestion_recovery.py::test_ingestion_never_calls_a_single_row_catalog_write`
+holds that statically. Follow-up (plan §5.2.4): split creation from status
+revision (`set_catalog_candidate_status_guarded`, authority-checked for
+creation), move the promotion pipeline to it, then drop the single-row write.
 
 Privileges: RLS on, no policies; `PUBLIC`, `anon` and `authenticated` have
 nothing; `service_role` gets `SELECT, INSERT` on the new relation and never

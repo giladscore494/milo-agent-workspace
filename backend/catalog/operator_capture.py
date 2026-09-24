@@ -947,22 +947,30 @@ def _count(value: Any) -> int | None:
     return value
 
 
+def _seconds(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return round(float(value), 3)
+    return 0.0
+
+
 def ingestion_document(metrics: Any) -> dict[str, Any]:
     """What one ingestion cost, from a closed schema: per phase the database
-    call count and wall time, for the row writes the rows inserted and those
-    already present, and the adoption's number and previous writer. Counts,
-    seconds and one run id only -- no row, no key, no register text."""
+    calls actually sent, the wall time, the request bytes and the slowest
+    single call (the figure the 8 s statement timeout applies to), for the row
+    writes the rows inserted and those already present, and the adoption's
+    number and previous writer. Counts, seconds and one run id only -- no row,
+    no key, no register text."""
     from backend.catalog.government.ingest import INGESTION_PHASES
 
     metrics = metrics if isinstance(metrics, Mapping) else {}
     document: dict[str, Any] = {}
     for name in INGESTION_PHASES:
         phase = metrics.get(name) if isinstance(metrics.get(name), Mapping) else {}
-        seconds = phase.get("seconds")
         entry: dict[str, Any] = {
             "calls": _count(phase.get("calls")) or 0,
-            "seconds": round(float(seconds), 3)
-            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else 0.0}
+            "seconds": _seconds(phase.get("seconds")),
+            "request_bytes": _count(phase.get("request_bytes")) or 0,
+            "max_call_seconds": _seconds(phase.get("max_call_seconds"))}
         if name in ("raw", "candidates"):
             entry["inserted"] = _count(phase.get("inserted"))
             entry["already_present"] = _count(phase.get("already_present"))
@@ -970,6 +978,10 @@ def ingestion_document(metrics: Any) -> dict[str, Any]:
     document["total_calls"] = sum(document[name]["calls"] for name in INGESTION_PHASES)
     document["total_seconds"] = round(sum(document[name]["seconds"]
                                           for name in INGESTION_PHASES), 3)
+    document["total_request_bytes"] = sum(document[name]["request_bytes"]
+                                          for name in INGESTION_PHASES)
+    document["max_call_seconds"] = max(document[name]["max_call_seconds"]
+                                       for name in INGESTION_PHASES)
     document["adoption_seq"] = _count(metrics.get("adoption_seq")) or 0
     document["previous_writer_run_id"] = _text(metrics.get("previous_writer_run_id") or "", 64)
     return document

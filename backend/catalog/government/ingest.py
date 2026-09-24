@@ -107,6 +107,7 @@ candidate, and evidence mapping is PR3's work.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
@@ -289,7 +290,7 @@ class GovernmentCatalogIngestor:
         normalization = read_capture([record for _, record in capture.located_records()],
                                      resource_id=capture.resource_id)
         payload = snapshot_module.snapshot_payload(capture, normalization, capture_scope)
-        with self._phase("snapshot"):
+        with self._phase("snapshot", request=payload):
             snapshot = self._repository.record_catalog_snapshot(
                 self._lease.run_id, payload, **self._lease_kwargs)
         # A replay or a reuse lands on an EXISTING row. Whatever it declares
@@ -348,7 +349,7 @@ class GovernmentCatalogIngestor:
             raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN")
         self._check_normalization(snapshot, normalization)
         try:
-            with self._phase("snapshot"):
+            with self._phase("snapshot", request=payload):
                 answer = adopt(self._lease.run_id, dict(payload), **self._lease_kwargs)
         except AppError as refusal:
             if refusal.code == "CATALOG_SNAPSHOT_ADOPTION_REFUSED":
@@ -370,29 +371,21 @@ class GovernmentCatalogIngestor:
         Returns each stored row PAIRED with the register row it came from, so
         the reading step never has to re-establish that pairing by index.
 
-        Rows travel in bounded batches (`CATALOG_WRITE_BATCH_SIZE`) when the
-        repository offers them: one lease-guarded, all-or-nothing call per
-        batch instead of one per row, through the same per-row validation. A
-        repository without batches is written row by row, as before.
+        Rows travel ONLY in bounded batches (`CATALOG_WRITE_BATCH_SIZE`): one
+        lease-guarded, all-or-nothing call per batch through the same per-row
+        validation -- never the single-row write. Each stored row comes back
+        LEAN (id, snapshot, record key, upstream id, payload digest), which is
+        all the reading step needs to bind a candidate to it.
         """
         stored: list[tuple[dict[str, Any], Mapping[str, Any]]] = []
         pairs = list(snapshot_module.raw_record_payloads(capture, snapshot))
-        batch = getattr(self._repository, "record_catalog_raw_records", None)
-        if callable(batch):
-            for chunk in _chunks(pairs):
-                self._check_cancelled()
-                with self._phase("raw"):
-                    answer = batch(self._lease.run_id, [payload for payload, _ in chunk],
-                                   **self._lease_kwargs)
-                self._count_rows("raw", answer)
-                stored.extend(zip(answer["rows"], (record for _, record in chunk)))
-        else:
-            for payload, record in pairs:
-                self._check_cancelled()
-                with self._phase("raw"):
-                    row = self._repository.record_catalog_raw_record(
-                        self._lease.run_id, payload, **self._lease_kwargs)
-                stored.append((row, record))
+        for chunk in _chunks(pairs):
+            self._check_cancelled()
+            with self._phase("raw", batch=True):
+                answer = self._repository.record_catalog_raw_records(
+                    self._lease.run_id, [payload for payload, _ in chunk], **self._lease_kwargs)
+            self._count_batch("raw", answer)
+            stored.extend(zip(answer["rows"], (record for _, record in chunk)))
         self._emit("catalog_records_written", {"snapshot_key": snapshot["snapshot_key"],
                                                "count": len(stored)})
         return stored
@@ -419,20 +412,16 @@ class GovernmentCatalogIngestor:
         payloads = [reading.candidate_payload(record_row)
                     for (record_row, _raw), reading in zip(records, normalization.entries)
                     if reading is not None]
-        batch = getattr(self._repository, "record_catalog_candidates", None)
-        if callable(batch):
-            for chunk in _chunks(payloads):
-                self._check_cancelled()
-                with self._phase("candidates"):
-                    answer = batch(self._lease.run_id, chunk, **self._lease_kwargs)
-                self._count_rows("candidates", answer)
-                candidates.extend(answer["rows"])
-        else:
-            for candidate in payloads:
-                self._check_cancelled()
-                with self._phase("candidates"):
-                    candidates.append(self._repository.record_catalog_candidate(
-                        self._lease.run_id, candidate, **self._lease_kwargs))
+        # ONLY the batch write, which asks the snapshot write authority. The
+        # single-row candidate write does not, and ingestion never calls it
+        # (tests/test_catalog_ingestion_recovery.py holds that statically).
+        for chunk in _chunks(payloads):
+            self._check_cancelled()
+            with self._phase("candidates", batch=True):
+                answer = self._repository.record_catalog_candidates(
+                    self._lease.run_id, chunk, **self._lease_kwargs)
+            self._count_batch("candidates", answer)
+            candidates.extend(answer["rows"])
         self._emit("catalog_candidates_written", {"count": len(candidates),
                                                   "rejected": normalization.issue_count})
         return candidates, list(normalization.issues)
@@ -454,13 +443,13 @@ class GovernmentCatalogIngestor:
         """
         self._check_cancelled()
         try:
-            with self._phase("activate"):
+            with self._phase("activate", request={"snapshot_id": snapshot["id"]}):
                 decided = self._repository.activate_catalog_snapshot(
                     self._lease.run_id, {"snapshot_id": snapshot["id"]}, **self._lease_kwargs)
         except AppError as failure:
             if not _is_refusal(failure):
                 raise
-            with self._phase("activate"):
+            with self._phase("activate", request={"snapshot_id": snapshot["id"]}):
                 self._repository.activate_catalog_snapshot(
                     self._lease.run_id, {"snapshot_id": snapshot["id"],
                                          "validation_state": "failed"},
@@ -539,14 +528,21 @@ class GovernmentCatalogIngestor:
 
     # --- measurement ---------------------------------------------------------
 
-    def _phase(self, name: str) -> "_Phase":
-        return _Phase(self._metrics[name])
+    def _phase(self, name: str, *, request: Any = None, batch: bool = False) -> "_Phase":
+        return _Phase(self._metrics[name], request=request, batch=batch)
 
-    def _count_rows(self, name: str, answer: Mapping[str, Any]) -> None:
+    def _count_batch(self, name: str, answer: Mapping[str, Any]) -> None:
+        """Fold what ONE batch write cost -- its actual RPC attempts (a split or
+        a retry is more than one), their request bytes and the slowest of them
+        -- and what it wrote, into the phase."""
         phase = self._metrics[name]
-        phase["inserted"] = int(phase["inserted"] or 0) + int(answer.get("inserted") or 0)
-        phase["already_present"] = (int(phase["already_present"] or 0)
-                                    + int(answer.get("already_present") or 0))
+        phase["calls"] += _whole(answer.get("rpc_calls"))
+        phase["request_bytes"] += _whole(answer.get("request_bytes"))
+        slowest = answer.get("max_call_seconds")
+        if isinstance(slowest, (int, float)) and not isinstance(slowest, bool):
+            phase["max_call_seconds"] = max(phase["max_call_seconds"], float(slowest))
+        phase["inserted"] += _whole(answer.get("inserted"))
+        phase["already_present"] += _whole(answer.get("already_present"))
 
     def _emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
         if self._event_sink is not None:
@@ -562,39 +558,64 @@ INGESTION_PHASES = ("snapshot", "raw", "candidates", "activate")
 
 
 def new_metrics() -> dict[str, Any]:
-    """Zeroed per-phase measurements. `inserted` / `already_present` stay None
-    for a phase whose writes do not report them (the single-row fallback)."""
-    metrics: dict[str, Any] = {name: {"calls": 0, "seconds": 0.0} for name in INGESTION_PHASES}
+    """Zeroed per-phase measurements: database `calls` actually sent,
+    `seconds` of wall time, `request_bytes` sent (the JSON-encoded request
+    bodies) and `max_call_seconds`, the slowest single call -- the number the
+    8 s statement timeout is measured against. The row phases also count rows
+    `inserted` and `already_present`."""
+    metrics: dict[str, Any] = {name: {"calls": 0, "seconds": 0.0, "request_bytes": 0,
+                                      "max_call_seconds": 0.0} for name in INGESTION_PHASES}
     for name in ("raw", "candidates"):
-        metrics[name].update({"inserted": None, "already_present": None})
+        metrics[name].update({"inserted": 0, "already_present": 0})
     metrics.update({"adoption_seq": 0, "previous_writer_run_id": ""})
     return metrics
 
 
+def _whole(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
 def _frozen_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
-    frozen = {name: {**metrics[name], "seconds": round(float(metrics[name]["seconds"]), 3)}
+    frozen = {name: {**metrics[name], "seconds": round(float(metrics[name]["seconds"]), 3),
+                     "max_call_seconds": round(float(metrics[name]["max_call_seconds"]), 3)}
               for name in INGESTION_PHASES}
     frozen["adoption_seq"] = int(metrics.get("adoption_seq") or 0)
     frozen["previous_writer_run_id"] = str(metrics.get("previous_writer_run_id") or "")
     frozen["total_calls"] = sum(int(frozen[name]["calls"]) for name in INGESTION_PHASES)
     frozen["total_seconds"] = round(sum(float(frozen[name]["seconds"])
                                         for name in INGESTION_PHASES), 3)
+    frozen["total_request_bytes"] = sum(int(frozen[name]["request_bytes"])
+                                        for name in INGESTION_PHASES)
+    frozen["max_call_seconds"] = max(float(frozen[name]["max_call_seconds"])
+                                     for name in INGESTION_PHASES)
     return frozen
 
 
 class _Phase:
-    """Counts one database call of a phase and its wall time, even on failure."""
+    """Measures one step of a phase, even on failure.
 
-    def __init__(self, phase: dict[str, Any]) -> None:
+    A single-row step (`request` given) is ONE call: it counts it, its wall
+    time, its JSON request size and whether it was the slowest. A batch step
+    only adds wall time here; the repository reports its actual calls, bytes
+    and slowest call, folded in by `_count_batch`.
+    """
+
+    def __init__(self, phase: dict[str, Any], *, request: Any = None, batch: bool = False) -> None:
         self._phase = phase
+        self._batch = batch
+        self._bytes = 0 if batch else len(json.dumps(request, default=str).encode("utf-8"))
 
     def __enter__(self) -> "_Phase":
         self._started = time.monotonic()
         return self
 
     def __exit__(self, *_exc: Any) -> None:
-        self._phase["calls"] += 1
-        self._phase["seconds"] += time.monotonic() - self._started
+        elapsed = time.monotonic() - self._started
+        self._phase["seconds"] += elapsed
+        if not self._batch:
+            self._phase["calls"] += 1
+            self._phase["request_bytes"] += self._bytes
+            self._phase["max_call_seconds"] = max(self._phase["max_call_seconds"], elapsed)
 
 
 def _chunks(items: Sequence[Any]):

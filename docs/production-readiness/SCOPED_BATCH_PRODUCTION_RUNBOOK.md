@@ -624,7 +624,13 @@ next revision reuse it without capturing again.
      and `phase=candidates … inserted=<rest> already_present=3579` (plus
      rows the vocabulary cannot read at all, which have no candidate);
    - it ACTIVATES the snapshot (`phase=activate calls=1`), and
-     `INGESTION_TOTAL_DB_CALLS` / `INGESTION_TOTAL_SECONDS` state the cost;
+     `INGESTION_TOTAL_DB_CALLS`, `INGESTION_TOTAL_SECONDS`,
+     `INGESTION_TOTAL_REQUEST_BYTES` and `INGESTION_MAX_CALL_SECONDS` state
+     the cost. Every PostgREST call runs under an 8 s statement and lock
+     timeout; `INGESTION_MAX_CALL_SECONDS` is the slowest single call and must
+     stay far below it (a 200-row raw batch measured 0.17-0.24 s on local
+     PostgreSQL; a batch that does hit the timeout is split in halves down to
+     25 rows automatically, which shows up as extra `calls`);
    - `WORK_SCOPE_PREPARATION_STATUS=succeeded` with
      `UNIT 1. toyota state=vocabulary_insufficient … queued=0`, then the
      prepared gate FAILS on `EVIDENCE_READY=NO (no unit of this revision was
@@ -633,6 +639,12 @@ next revision reuse it without capturing again.
    A `CAPTURE_REPOSITORY_TRANSIENT` failure is resumed by repeating this
    step; the next run adopts from the run that just failed once that run's
    lease has expired (≤ 300 s), with `adoption_seq=2`.
+
+   If the script stops with "printed no single well-formed execution name",
+   an execution may still have been created and be RUNNING UNATTENDED: run the
+   `gcloud run jobs executions list --job … --region … --project …` command it
+   prints before anything else, and never start a second preparation while one
+   is running.
 6. Choose a range the vocabulary can read, from the now ACTIVE snapshot
    (read-only):
 

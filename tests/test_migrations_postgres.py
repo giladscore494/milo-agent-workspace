@@ -9385,12 +9385,12 @@ def test_the_incident_replayed_orphan_with_every_raw_record_and_a_candidate_pref
 
 
 def test_a_200_row_batch_is_far_inside_the_statement_and_request_bounds(db, tmp_path):
-    """The batch size is a server constant (200). One 200-row raw-record call
-    and one 200-row candidate call, with register-shaped rows, must stay far
-    below Supabase's statement timeout (8 s for the API roles) and carry a
-    request body of a few hundred kilobytes."""
-    import time as _time
-
+    """The batch size is a server constant (200). PostgREST runs every call
+    under the authenticator role's 8 s statement AND lock timeouts (verified on
+    Production, 2026-09-24). One 200-row raw-record call and one 200-row
+    candidate call, with register rows of the size Production holds (~2.5 KB
+    of payload JSON each), must stay far inside that, and their answers must be
+    LEAN -- a few hundred bytes a row, never the payload sent back."""
     from backend.catalog.contracts import CATALOG_WRITE_BATCH_SIZE
     from backend.testing.government_capture import page_document
 
@@ -9403,29 +9403,49 @@ def test_a_200_row_batch_is_far_inside_the_statement_and_request_bounds(db, tmp_
     records = [{**json.loads(_catalog_record_json(snapshot, f"size-{label}-{i}", upstream=str(90000 + i),
                                                   payload={**template, "_id": 90000 + i})),
                 "source_locator": {"capture_index": i}} for i in range(size)]
-    body = json.dumps(records)
 
-    def call(function: str, payload: str, name: str) -> tuple[dict, float]:
-        # Through a file: a 200-row body is larger than one command argument.
+    def call(function: str, payload: str, name: str) -> tuple[dict, float, int]:
+        # Through a file (a 200-row body is larger than one argument), timed by
+        # the SERVER's clock around exactly the one statement.
         sql = tmp_path / f"{name}.sql"
-        sql.write_text(f"set role service_role;\nselect public.{function}({args}, "
-                       f"$j${payload}$j$::jsonb);\nreset role;\n", encoding="utf-8")
-        started = _time.monotonic()
-        answer = json.loads(db.psql(file=sql))
-        return answer, _time.monotonic() - started
+        sql.write_text(
+            "set role service_role;\n"
+            "select clock_timestamp() as started \\gset\n"
+            f"select public.{function}({args}, $j${payload}$j$::jsonb) as answer \\gset\n"
+            "select extract(epoch from clock_timestamp() - :'started'::timestamptz);\n"
+            "select octet_length(:'answer');\n"
+            "select :'answer';\n"
+            "reset role;\n", encoding="utf-8")
+        seconds, response_bytes, answer = db.psql(file=sql).splitlines()[:3]
+        return json.loads(answer), float(seconds), int(response_bytes)
 
-    raw, raw_seconds = call("record_catalog_raw_records_batch_guarded", body, "raw")
+    raw_body = json.dumps(records)
+    raw, raw_seconds, raw_response = call("record_catalog_raw_records_batch_guarded", raw_body, "raw")
     record_ids = [row["id"] for row in raw["rows"]]
     candidates = _rec_candidates(snapshot, label, record_ids)
-    written, candidate_seconds = call("record_catalog_candidates_batch_guarded",
-                                      json.dumps(candidates), "candidates")
-    assert written["inserted"] == size
-    print(f"BATCH_MEASURE size={size} raw_request_bytes={len(body.encode())} "
-          f"raw_seconds={raw_seconds:.3f} candidate_request_bytes={len(json.dumps(candidates).encode())} "
-          f"candidate_seconds={candidate_seconds:.3f}")
-    assert len(record_ids) == size
+    candidate_body = json.dumps(candidates)
+    written, candidate_seconds, candidate_response = call(
+        "record_catalog_candidates_batch_guarded", candidate_body, "candidates")
+    payload_chars = db.psql("select round(avg(char_length(payload::text))) || '|' || "
+                            "max(char_length(payload::text)) from public.catalog_raw_records "
+                            f"where snapshot_id='{snapshot}'")
+    print(f"BATCH_MEASURE size={size} payload_chars_avg|max={payload_chars} "
+          f"raw_request_bytes={len(raw_body.encode())} raw_response_bytes={raw_response} "
+          f"raw_server_seconds={raw_seconds:.3f} candidate_request_bytes={len(candidate_body.encode())} "
+          f"candidate_response_bytes={candidate_response} candidate_server_seconds={candidate_seconds:.3f}")
+    assert (raw["inserted"], written["inserted"]) == (size, size)
+    # Lean answers, in input order.
+    assert all(set(row) == {"id", "snapshot_id", "record_key", "upstream_record_id", "payload_sha256"}
+               for row in raw["rows"])
+    assert [row["upstream_record_id"] for row in raw["rows"]] == [r["upstream_record_id"] for r in records]
+    assert all(set(row) == {"id", "snapshot_id", "raw_record_id", "candidate_key", "status"}
+               for row in written["rows"])
+    assert raw_response < len(raw_body.encode()) / 5
+    # Production-sized rows: ~2.5 KB of payload JSON each.
+    assert 2000 <= float(payload_chars.split("|")[0]) <= 3000
+    # Far inside the 8 s ceiling (the committed measurement is in the PR).
     assert raw_seconds < 4 and candidate_seconds < 4
-    assert len(body.encode()) < 1_000_000
+    assert len(raw_body.encode()) < 1_000_000
 
 
 def test_only_the_write_authority_compares_a_snapshot_creator_with_the_caller(db):

@@ -52,11 +52,15 @@ class RepositoryFailure(AppError):
     one added, allowlisted fact.
     """
 
-    def __init__(self, failure_class: str, message: str = "guarded persistence operation failed"):
+    def __init__(self, failure_class: str, message: str = "guarded persistence operation failed",
+                 *, timed_out: bool = False):
         if failure_class not in REPOSITORY_FAILURE_CLASSES:
             raise ValueError("repository failure class must come from the static allowlist")
         super().__init__("REPOSITORY_ERROR", message, 502)
         self.failure_class = failure_class
+        #: The database cancelled the statement for a statement or lock
+        #: timeout (SQLSTATE 57014 / 55P03). Always `transient`.
+        self.timed_out = bool(timed_out)
 
 
 class NotFoundError(AppError):

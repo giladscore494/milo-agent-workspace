@@ -12,6 +12,7 @@ import copy
 import json
 import re
 import threading
+import time
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
@@ -1661,10 +1662,19 @@ class MemoryRepository:
             raise AppError("CATALOG_BATCH_INVALID", "one snapshot per catalog write batch", 400)
         return snapshots.pop()
 
+    #: The LEAN row a batch answers with, per key field (20260924000200).
+    _CATALOG_BATCH_ROW_FIELDS = {
+        "record_key": ("id", "snapshot_id", "record_key", "upstream_record_id", "payload_sha256"),
+        "candidate_key": ("id", "snapshot_id", "raw_record_id", "candidate_key", "status"),
+    }
+
     def _catalog_batch(self, run_id: UUID, rows: list[Mapping[str, Any]], key_field: str,
                        prepare, existing: dict, write) -> dict[str, Any]:
-        """One all-or-nothing batch: `{rows, inserted, already_present}`."""
+        """One all-or-nothing batch: `{rows, inserted, already_present}` with
+        lean rows, plus the cost fields the Supabase repository reports."""
         snapshot_id = self._catalog_batch_snapshot(rows)
+        fields = self._CATALOG_BATCH_ROW_FIELDS[key_field]
+        started = time.monotonic()
 
         def run() -> dict[str, Any]:
             snapshot = self._catalog_write_authority(snapshot_id, run_id)
@@ -1674,10 +1684,15 @@ class MemoryRepository:
                 # The derived key decides "already present", as in the RPC.
                 if (snapshot["id"], prepare(dict(row))[key_field]) in existing:
                     present += 1
-                written.append(write(dict(row)))
+                stored = write(dict(row))
+                written.append({field: stored.get(field) for field in fields})
             return {"rows": written, "inserted": len(written) - present,
                     "already_present": present}
-        return self._catalog_all_or_nothing(run)
+        answer = self._catalog_all_or_nothing(run)
+        prepared = [prepare(dict(row)) for row in rows]
+        return {**answer, "rpc_calls": 1,
+                "request_bytes": len(json.dumps(prepared, default=str).encode("utf-8")),
+                "max_call_seconds": time.monotonic() - started}
 
     def record_catalog_raw_records(self, run_id: UUID, records: Any, *, worker_id: str,
                                    attempt: int, lease_token: str) -> dict[str, Any]:

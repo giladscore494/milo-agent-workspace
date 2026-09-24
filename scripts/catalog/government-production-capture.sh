@@ -250,7 +250,21 @@ MILO_CAPTURE_EXECUTION_NAME_PATTERN='^[a-z]([-a-z0-9]{0,126}[a-z0-9])?$'
 # moment it EXISTS. It used to be started with --wait, which answers only when
 # the execution SUCCEEDS: a failed execution printed no name at all, so the
 # one document that says why it failed (2026-09-24, milo-catalog-capture-wwg5p)
-# could not be read from here. The name is then waited on with
+# could not be read from here.
+#
+# Evidence, from the Google Cloud SDK 586.0.0 source
+# (storage.googleapis.com/cloud-sdk-release/google-cloud-cli-linux-x86_64.tar.gz):
+#   * lib/googlecloudsdk/command_lib/run/serverless_operations.py, RunJob():
+#     after the Run API call, `if asyn: return ex` (lines 2164-2165) -- the
+#     Execution resource, before any polling. With --wait it instead polls and,
+#     on a failed execution, `raise serverless_exceptions.ExecutionFailedError`
+#     (line 2196): nothing is returned, so nothing reaches stdout.
+#   * lib/surface/run/jobs/execute.py, Run(): `e = operations.RunJob(...)`
+#     (line 179) and `return e` (line 222); the command's default format is
+#     'none' (line 98), which --format='value(metadata.name)' overrides, so the
+#     returned resource's name is printed on STDOUT. The "started
+#     asynchronously" and console-link messages go through pretty_print /
+#     log.status, i.e. STDERR. The name is then waited on with
 # `gcloud run jobs executions describe` until it states completion, within a
 # bound (the task timeout plus a margin); an execution that cannot be seen to
 # finish fails closed rather than being read half-way.
@@ -307,7 +321,7 @@ execute_job() {
     --args="-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${args_csv}" "$@" \
     --async --format='value(metadata.name)')" || gcloud_status=$?
   if [[ ! "$execution" =~ $MILO_CAPTURE_EXECUTION_NAME_PATTERN ]]; then
-    fail "gcloud run jobs execute (exit ${gcloud_status}) printed no single well-formed execution name on stdout; no Cloud Logging read is attempted for an execution that cannot be named exactly. List this job's executions with: gcloud run jobs executions list --job ${CAPTURE_JOB} --region ${REGION} --project ${PROJECT_ID}"
+    fail "gcloud run jobs execute (exit ${gcloud_status}) printed no single well-formed execution name on stdout; no Cloud Logging read is attempted for an execution that cannot be named exactly. An execution MAY nevertheless have been created and be RUNNING UNATTENDED -- nothing here waits for it or reads its outcome. Check before doing anything else: gcloud run jobs executions list --job ${CAPTURE_JOB} --region ${REGION} --project ${PROJECT_ID}"
   fi
   if (( gcloud_status != 0 )); then
     printf 'WARN: gcloud run jobs execute exited %s for execution %s; its own document states the outcome.\n' \
@@ -399,22 +413,29 @@ for unit in (doc.get("work_scope") or {}).get("units") or []:
     if isinstance(unit, dict) and isinstance(unit.get("ingestion"), dict) \
             and unit["ingestion"].get("total_calls"):
         entries.append((str(unit.get("unit_key")), unit["ingestion"]))
-calls = seconds = 0
+calls = seconds = sent = 0
+slowest = 0.0
 for name, metrics in entries:
     for phase in ("snapshot", "raw", "candidates", "activate"):
         entry = metrics.get(phase) or {}
         rows = ""
         if "inserted" in entry:
             rows = " inserted=%s already_present=%s" % (entry.get("inserted"), entry.get("already_present"))
-        print("INGESTION unit=%s phase=%s calls=%s seconds=%s%s"
-              % (name, phase, entry.get("calls"), entry.get("seconds"), rows))
+        print("INGESTION unit=%s phase=%s calls=%s seconds=%s request_bytes=%s max_call_seconds=%s%s"
+              % (name, phase, entry.get("calls"), entry.get("seconds"),
+                 entry.get("request_bytes"), entry.get("max_call_seconds"), rows))
     print("INGESTION unit=%s adoption_seq=%s previous_writer_run_id=%s"
           % (name, metrics.get("adoption_seq"), metrics.get("previous_writer_run_id") or "none"))
     calls += int(metrics.get("total_calls") or 0)
     seconds += float(metrics.get("total_seconds") or 0)
+    sent += int(metrics.get("total_request_bytes") or 0)
+    slowest = max(slowest, float(metrics.get("max_call_seconds") or 0))
 if entries:
     print("INGESTION_TOTAL_DB_CALLS=%d" % calls)
     print("INGESTION_TOTAL_SECONDS=%.3f" % seconds)
+    print("INGESTION_TOTAL_REQUEST_BYTES=%d" % sent)
+    # The 8 s statement / lock timeout PostgREST runs under applies to ONE call.
+    print("INGESTION_MAX_CALL_SECONDS=%.3f (statement timeout 8 s)" % slowest)
 '
 }
 
