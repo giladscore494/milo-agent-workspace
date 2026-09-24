@@ -6,6 +6,7 @@ project (four pre-existing tables, empty migration history). This is text
 matching only; executable validation lives in tests/test_migrations_postgres.py.
 """
 
+import re
 from pathlib import Path
 
 MIGRATIONS_DIR = Path("supabase/migrations")
@@ -138,24 +139,29 @@ REQUIRED_PER_FILE["20260924000100_catalog_work_scope_batch_runs.sql"] = [
     "'run_cancelled', v_message, jsonb_build_object('code', 'run_not_launched')",
 ]
 REQUIRED_PER_FILE["20260924000200_catalog_ingestion_recovery.sql"] = [
-    # An orphaned pending snapshot changes owner only through an audited,
-    # append-only adoption row of the same transaction, and only when its
-    # owner is over; the batches reuse the unchanged single-row writes.
+    # ONE write authority: the current writer is the latest adopter, else the
+    # creator, whose `created_by_run_id` is never rewritten; every write that
+    # decides who may write a snapshot asks it.
     "enable row level security",
+    "create or replace function public.assert_snapshot_write_authority(",
+    "'this catalog snapshot does not belong to this run'",
     "create table if not exists public.catalog_snapshot_adoptions (",
+    "create unique index if not exists catalog_snapshot_adoptions_seq_uidx",
+    "create unique index if not exists catalog_snapshot_adoptions_adopter_uidx",
     "create trigger catalog_snapshot_adoptions_checked",
     "create trigger catalog_snapshot_adoptions_append_only",
     "v_previous.status not in ('failed', 'cancelled', 'timed_out')",
     "v_adopter.run_identity->>'workflow_key' is distinct from 'operator_capture'",
-    "a.adoption_txid = txid_current()",
+    "create or replace function public.record_catalog_raw_record_guarded(",
+    "create or replace function public.activate_catalog_snapshot_guarded(",
+    "public.assert_snapshot_write_authority(v_snapshot.id, p_run_id, true)",
     "create or replace function public.adopt_catalog_snapshot_guarded(",
+    "'catalog_snapshot_adopted'",
     "create or replace function public.record_catalog_raw_records_batch_guarded(",
     "create or replace function public.record_catalog_candidates_batch_guarded(",
-    "public.record_catalog_raw_record_guarded(",
-    "public.record_catalog_candidate_guarded(",
+    "perform public.assert_snapshot_write_authority(v_snapshot_id, p_run_id)",
     "not between 1 and 500",
     "perform public.assert_worker_lease(",
-    "for update",
 ]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the
@@ -186,6 +192,41 @@ REQUIRED_PER_FILE["20260922000100_catalog_work_scopes.sql"] = [
     "for update",
 ]
 
+# ONE snapshot write authority (20260924000200). From that migration on, a
+# direct ownership comparison of a snapshot's `created_by_run_id` against the
+# calling run may appear ONLY inside `assert_snapshot_write_authority`: every
+# guarded write asks that function, which knows about adoptions. A second,
+# hand-written check elsewhere would silently refuse an adopter (or, written
+# the other way round, admit a run the authority refuses).
+OWNERSHIP_AUTHORITY_SINCE = "20260924000200"
+OWNERSHIP_AUTHORITY_FUNCTION = "assert_snapshot_write_authority"
+_OWNERSHIP_CHECK = re.compile(
+    r"created_by_run_id\s+is\s+(?:not\s+)?distinct\s+from\s+p_run_id"
+    r"|created_by_run_id\s*(?:=|<>|!=)\s*p_run_id"
+    r"|p_run_id\s+is\s+(?:not\s+)?distinct\s+from\s+[a-z_.]*created_by_run_id"
+    r"|p_run_id\s*(?:=|<>|!=)\s*[a-z_.]*created_by_run_id")
+_FUNCTION = re.compile(
+    r"create\s+(?:or\s+replace\s+)?function\s+public\.([a-z0-9_]+)\s*\(.*?\$\$(.*?)\$\$",
+    re.DOTALL)
+
+
+def ownership_check_problems(texts: dict[str, str]) -> list[str]:
+    """Every direct snapshot-ownership comparison outside the one authority,
+    in any migration at or after `OWNERSHIP_AUTHORITY_SINCE`. `texts` maps a
+    migration filename to its lowercased text."""
+    problems = []
+    for name, text in sorted(texts.items()):
+        if name.split("_", 1)[0] < OWNERSHIP_AUTHORITY_SINCE:
+            continue
+        allowed = [(match.start(2), match.end(2)) for match in _FUNCTION.finditer(text)
+                   if match.group(1) == OWNERSHIP_AUTHORITY_FUNCTION]
+        for check in _OWNERSHIP_CHECK.finditer(text):
+            if not any(start <= check.start() < end for start, end in allowed):
+                problems.append(f"{name}: a direct created_by_run_id ownership check outside "
+                                f"{OWNERSHIP_AUTHORITY_FUNCTION}: {check.group(0)!r}")
+    return problems
+
+
 FORBIDDEN_EVERYWHERE = [
     "drop table",
     "delete from public.conversations",
@@ -213,6 +254,7 @@ def main() -> None:
         for clause in clauses:
             if clause not in texts[name]:
                 problems.append(f"{name}: missing required clause {clause!r}")
+    problems.extend(ownership_check_problems(texts))
     for name, text in texts.items():
         for clause in FORBIDDEN_EVERYWHERE:
             if clause in text:

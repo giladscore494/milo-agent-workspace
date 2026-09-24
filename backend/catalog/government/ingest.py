@@ -53,10 +53,11 @@ Replay, refresh and ownership
 *   **An ORPHANED capture is adopted, never duplicated.** The key is derived
     from content, so a re-capture of unchanged content lands on the pending
     snapshot a failed run left behind. The database lets an operator capture
-    run take it over only while it is pending and its owner ended `failed`,
-    `cancelled` or `timed_out` with no live lease
-    (`20260924000200_catalog_ingestion_recovery.sql`), and records the
-    previous owner durably. The adopter then re-submits EVERY row through the
+    run become its writer only while it is pending and its current writer
+    ended `failed`, `cancelled` or `timed_out` with no live lease
+    (`20260924000200_catalog_ingestion_recovery.sql`). `created_by_run_id`
+    never moves; the adoption row (and a `catalog_snapshot_adopted` event)
+    records the previous writer durably. The adopter then re-submits EVERY row through the
     same idempotent writes -- a row already stored collapses onto its key and
     must match it exactly, a missing one is written -- and activation still
     passes the completeness gate.
@@ -106,6 +107,7 @@ candidate, and evidence mapping is PR3's work.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
@@ -201,9 +203,16 @@ class IngestionReport:
     #: The scope the snapshot DECLARES (`capture_scope.py`), read back off the
     #: snapshot; empty for an unscoped capture.
     capture_scope_key: str = ""
-    #: The run this ingestion ADOPTED the pending snapshot from, or empty. The
-    #: database keeps the same fact durably in `catalog_snapshot_adoptions`.
+    #: The run this ingestion ADOPTED the pending snapshot from (its previous
+    #: writer), or empty. The database keeps the same fact durably in
+    #: `catalog_snapshot_adoptions` and as a `catalog_snapshot_adopted` event.
     adopted_from_run_id: str = ""
+    #: That adoption's number in the snapshot's adoption sequence, or 0.
+    adoption_seq: int = 0
+    #: What this ingestion cost, per phase: database calls and wall time, and
+    #: for the row writes how many rows were inserted and how many were
+    #: already present (`new_metrics`). Counts and seconds only.
+    ingestion: Mapping[str, Any] = field(default_factory=dict)
     candidates: tuple[Mapping[str, Any], ...] = field(default=(), repr=False)
 
 
@@ -218,6 +227,9 @@ class GovernmentCatalogIngestor:
         self._client = client
         self._cancellation_checker = cancellation_checker
         self._event_sink = event_sink
+        #: This ingestion's per-phase measurements (`new_metrics`), reset by
+        #: every `ingest_capture`.
+        self._metrics: dict[str, Any] = new_metrics()
 
     @property
     def _lease_kwargs(self) -> dict[str, Any]:
@@ -268,6 +280,7 @@ class GovernmentCatalogIngestor:
         the guarantees call `ingest_resource`.
         """
         self._check_cancelled()
+        self._metrics = new_metrics()
         # Read the WHOLE capture before opening the snapshot. The summary the
         # snapshot carries and the candidates the database receives then come
         # from one computation of one pure function, so they cannot disagree --
@@ -276,12 +289,16 @@ class GovernmentCatalogIngestor:
         normalization = read_capture([record for _, record in capture.located_records()],
                                      resource_id=capture.resource_id)
         payload = snapshot_module.snapshot_payload(capture, normalization, capture_scope)
-        snapshot = self._repository.record_catalog_snapshot(
-            self._lease.run_id, payload, **self._lease_kwargs)
+        with self._phase("snapshot"):
+            snapshot = self._repository.record_catalog_snapshot(
+                self._lease.run_id, payload, **self._lease_kwargs)
         # A replay or a reuse lands on an EXISTING row. Whatever it declares
         # must be exactly what this ingestion asked for -- a scoped request is
         # never satisfied by an unscoped snapshot, nor the reverse.
         self._check_scope(snapshot, capture_scope)
+        # The CREATOR, which never changes. Anything but this run -- including
+        # a snapshot this run already adopted -- goes through `_adopt`, which
+        # asks the database for the current writer and is idempotent for it.
         owner = str(snapshot.get("created_by_run_id"))
         adopted_from = ""
         if owner != str(self._lease.run_id):
@@ -292,8 +309,11 @@ class GovernmentCatalogIngestor:
             if snapshot.get("activated_at") is not None:
                 self._check_normalization(snapshot, normalization)
                 return self._report(capture, snapshot, candidates=(), reused=True)
-            snapshot = self._adopt(snapshot, payload, normalization)
-            adopted_from = owner
+            snapshot, adoption = self._adopt(snapshot, payload, normalization)
+            if adoption:
+                adopted_from = str(adoption.get("previous_writer_run_id") or "")
+                self._metrics["adoption_seq"] = int(adoption.get("adoption_seq") or 0)
+                self._metrics["previous_writer_run_id"] = adopted_from
 
         if snapshot.get("activated_at") is not None:
             # Exact replay of our own completed capture: the records and the
@@ -312,28 +332,36 @@ class GovernmentCatalogIngestor:
     # --- steps ---------------------------------------------------------------
 
     def _adopt(self, snapshot: Mapping[str, Any], payload: Mapping[str, Any],
-               normalization: CaptureNormalization) -> Mapping[str, Any]:
-        """Take over an ORPHANED pending capture of exactly this content.
+               normalization: CaptureNormalization
+               ) -> tuple[Mapping[str, Any], Mapping[str, Any] | None]:
+        """Become the writer of an ORPHANED pending capture of exactly this content.
 
-        The database decides whether the owner is over and the snapshot still
-        pending; this side only refuses early what can never be adopted, and
-        holds the stored reading gap to the one this capture reconstructs
-        before asking. A refusal is the same static reason as before.
+        The database decides whether the previous writer is over and the
+        snapshot still pending; this side only refuses early what can never be
+        adopted, and holds the stored reading gap to the one this capture
+        reconstructs before asking. A refusal is the same static reason as
+        before. Answers the snapshot and the adoption (None when this run
+        already was the writer, which is an idempotent replay).
         """
         adopt = getattr(self._repository, "adopt_catalog_snapshot", None)
         if not callable(adopt) or snapshot.get("validation_state") == "failed":
             raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN")
         self._check_normalization(snapshot, normalization)
         try:
-            adopted = adopt(self._lease.run_id, dict(payload), **self._lease_kwargs)
+            with self._phase("snapshot"):
+                answer = adopt(self._lease.run_id, dict(payload), **self._lease_kwargs)
         except AppError as refusal:
             if refusal.code == "CATALOG_SNAPSHOT_ADOPTION_REFUSED":
                 raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN") from None
             raise
-        if str(adopted.get("created_by_run_id")) != str(self._lease.run_id) \
-                or adopted.get("id") != snapshot.get("id"):
+        adopted = answer.get("snapshot") if isinstance(answer, Mapping) else None
+        adoption = answer.get("adoption") if isinstance(answer, Mapping) else None
+        if not isinstance(adopted, Mapping) or adopted.get("id") != snapshot.get("id"):
             raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN")
-        return adopted
+        if adoption is not None and (not isinstance(adoption, Mapping) or str(
+                adoption.get("adopted_by_run_id")) != str(self._lease.run_id)):
+            raise GovernmentIngestionError("GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN")
+        return adopted, adoption
 
     def _write_records(self, capture: ResourceCapture, snapshot: Mapping[str, Any]
                        ) -> list[tuple[dict[str, Any], Mapping[str, Any]]]:
@@ -353,14 +381,18 @@ class GovernmentCatalogIngestor:
         if callable(batch):
             for chunk in _chunks(pairs):
                 self._check_cancelled()
-                rows = batch(self._lease.run_id, [payload for payload, _ in chunk],
-                             **self._lease_kwargs)
-                stored.extend(zip(rows, (record for _, record in chunk)))
+                with self._phase("raw"):
+                    answer = batch(self._lease.run_id, [payload for payload, _ in chunk],
+                                   **self._lease_kwargs)
+                self._count_rows("raw", answer)
+                stored.extend(zip(answer["rows"], (record for _, record in chunk)))
         else:
             for payload, record in pairs:
                 self._check_cancelled()
-                stored.append((self._repository.record_catalog_raw_record(
-                    self._lease.run_id, payload, **self._lease_kwargs), record))
+                with self._phase("raw"):
+                    row = self._repository.record_catalog_raw_record(
+                        self._lease.run_id, payload, **self._lease_kwargs)
+                stored.append((row, record))
         self._emit("catalog_records_written", {"snapshot_key": snapshot["snapshot_key"],
                                                "count": len(stored)})
         return stored
@@ -391,12 +423,16 @@ class GovernmentCatalogIngestor:
         if callable(batch):
             for chunk in _chunks(payloads):
                 self._check_cancelled()
-                candidates.extend(batch(self._lease.run_id, chunk, **self._lease_kwargs))
+                with self._phase("candidates"):
+                    answer = batch(self._lease.run_id, chunk, **self._lease_kwargs)
+                self._count_rows("candidates", answer)
+                candidates.extend(answer["rows"])
         else:
             for candidate in payloads:
                 self._check_cancelled()
-                candidates.append(self._repository.record_catalog_candidate(
-                    self._lease.run_id, candidate, **self._lease_kwargs))
+                with self._phase("candidates"):
+                    candidates.append(self._repository.record_catalog_candidate(
+                        self._lease.run_id, candidate, **self._lease_kwargs))
         self._emit("catalog_candidates_written", {"count": len(candidates),
                                                   "rejected": normalization.issue_count})
         return candidates, list(normalization.issues)
@@ -418,14 +454,17 @@ class GovernmentCatalogIngestor:
         """
         self._check_cancelled()
         try:
-            decided = self._repository.activate_catalog_snapshot(
-                self._lease.run_id, {"snapshot_id": snapshot["id"]}, **self._lease_kwargs)
+            with self._phase("activate"):
+                decided = self._repository.activate_catalog_snapshot(
+                    self._lease.run_id, {"snapshot_id": snapshot["id"]}, **self._lease_kwargs)
         except AppError as failure:
             if not _is_refusal(failure):
                 raise
-            self._repository.activate_catalog_snapshot(
-                self._lease.run_id, {"snapshot_id": snapshot["id"], "validation_state": "failed"},
-                **self._lease_kwargs)
+            with self._phase("activate"):
+                self._repository.activate_catalog_snapshot(
+                    self._lease.run_id, {"snapshot_id": snapshot["id"],
+                                         "validation_state": "failed"},
+                    **self._lease_kwargs)
             raise GovernmentIngestionError("GOV_SNAPSHOT_NOT_ACTIVATED") from None
         self._emit("catalog_snapshot_activated", {"snapshot_key": decided["snapshot_key"],
                                                   "records": decided["stored_record_count"]})
@@ -494,7 +533,20 @@ class GovernmentCatalogIngestor:
             activated=snapshot.get("activated_at") is not None,
             reused_existing=reused, created_by_run_id=str(snapshot.get("created_by_run_id")),
             capture_scope_key=_declared_key(snapshot), adopted_from_run_id=adopted_from,
+            adoption_seq=int(self._metrics.get("adoption_seq") or 0),
+            ingestion=_frozen_metrics(self._metrics),
             candidates=tuple(dict(candidate) for candidate in candidates))
+
+    # --- measurement ---------------------------------------------------------
+
+    def _phase(self, name: str) -> "_Phase":
+        return _Phase(self._metrics[name])
+
+    def _count_rows(self, name: str, answer: Mapping[str, Any]) -> None:
+        phase = self._metrics[name]
+        phase["inserted"] = int(phase["inserted"] or 0) + int(answer.get("inserted") or 0)
+        phase["already_present"] = (int(phase["already_present"] or 0)
+                                    + int(answer.get("already_present") or 0))
 
     def _emit(self, event_type: str, payload: Mapping[str, Any]) -> None:
         if self._event_sink is not None:
@@ -503,6 +555,46 @@ class GovernmentCatalogIngestor:
     def _check_cancelled(self) -> None:
         if self._cancellation_checker is not None and self._cancellation_checker():
             raise CancellationRequested("RUN_CANCELLED")
+
+
+#: The phases an ingestion is measured in, in order.
+INGESTION_PHASES = ("snapshot", "raw", "candidates", "activate")
+
+
+def new_metrics() -> dict[str, Any]:
+    """Zeroed per-phase measurements. `inserted` / `already_present` stay None
+    for a phase whose writes do not report them (the single-row fallback)."""
+    metrics: dict[str, Any] = {name: {"calls": 0, "seconds": 0.0} for name in INGESTION_PHASES}
+    for name in ("raw", "candidates"):
+        metrics[name].update({"inserted": None, "already_present": None})
+    metrics.update({"adoption_seq": 0, "previous_writer_run_id": ""})
+    return metrics
+
+
+def _frozen_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    frozen = {name: {**metrics[name], "seconds": round(float(metrics[name]["seconds"]), 3)}
+              for name in INGESTION_PHASES}
+    frozen["adoption_seq"] = int(metrics.get("adoption_seq") or 0)
+    frozen["previous_writer_run_id"] = str(metrics.get("previous_writer_run_id") or "")
+    frozen["total_calls"] = sum(int(frozen[name]["calls"]) for name in INGESTION_PHASES)
+    frozen["total_seconds"] = round(sum(float(frozen[name]["seconds"])
+                                        for name in INGESTION_PHASES), 3)
+    return frozen
+
+
+class _Phase:
+    """Counts one database call of a phase and its wall time, even on failure."""
+
+    def __init__(self, phase: dict[str, Any]) -> None:
+        self._phase = phase
+
+    def __enter__(self) -> "_Phase":
+        self._started = time.monotonic()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self._phase["calls"] += 1
+        self._phase["seconds"] += time.monotonic() - self._started
 
 
 def _chunks(items: Sequence[Any]):
@@ -532,6 +624,7 @@ def _declared_key(snapshot: Mapping[str, Any]) -> str:
     return scope.key() if scope is not None else ""
 
 
-__all__ = ["GOVERNMENT_INGESTION_REASONS", "MAX_REPORTED_REJECTIONS",
+__all__ = ["GOVERNMENT_INGESTION_REASONS", "INGESTION_PHASES", "MAX_REPORTED_REJECTIONS",
            "GovernmentCatalogIngestor", "GovernmentIngestionError", "IngestionReport",
+           "new_metrics",
            "GovernmentSourceError"]

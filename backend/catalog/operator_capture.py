@@ -936,7 +936,43 @@ def _snapshot_document(report: Any) -> dict[str, Any]:
         "reused_existing": bool(report.reused_existing),
         # The run whose orphaned pending snapshot this capture adopted, or "".
         "adopted_from_run_id": _text(getattr(report, "adopted_from_run_id", "") or ""),
+        "ingestion": ingestion_document(getattr(report, "ingestion", None)),
     }
+
+
+def _count(value: Any) -> int | None:
+    """A reported count: a non-negative whole number, or None ("not reported")."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def ingestion_document(metrics: Any) -> dict[str, Any]:
+    """What one ingestion cost, from a closed schema: per phase the database
+    call count and wall time, for the row writes the rows inserted and those
+    already present, and the adoption's number and previous writer. Counts,
+    seconds and one run id only -- no row, no key, no register text."""
+    from backend.catalog.government.ingest import INGESTION_PHASES
+
+    metrics = metrics if isinstance(metrics, Mapping) else {}
+    document: dict[str, Any] = {}
+    for name in INGESTION_PHASES:
+        phase = metrics.get(name) if isinstance(metrics.get(name), Mapping) else {}
+        seconds = phase.get("seconds")
+        entry: dict[str, Any] = {
+            "calls": _count(phase.get("calls")) or 0,
+            "seconds": round(float(seconds), 3)
+            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) else 0.0}
+        if name in ("raw", "candidates"):
+            entry["inserted"] = _count(phase.get("inserted"))
+            entry["already_present"] = _count(phase.get("already_present"))
+        document[name] = entry
+    document["total_calls"] = sum(document[name]["calls"] for name in INGESTION_PHASES)
+    document["total_seconds"] = round(sum(document[name]["seconds"]
+                                          for name in INGESTION_PHASES), 3)
+    document["adoption_seq"] = _count(metrics.get("adoption_seq")) or 0
+    document["previous_writer_run_id"] = _text(metrics.get("previous_writer_run_id") or "", 64)
+    return document
 
 
 def capture_document(outcome: RefreshOutcome, *, replayed: bool) -> dict[str, Any]:
@@ -1006,6 +1042,7 @@ def work_scope_document(preparation: WorkScopePreparation) -> dict[str, Any]:
             "reason_code": _text(unit.get("reason_code") or ""),
             "capture": _text(capture.capture),
             "adopted_from_run_id": _text(capture.adopted_from_run_id),
+            "ingestion": ingestion_document(capture.ingestion),
             "snapshot_key": _text(capture.snapshot_key),
             "readable_count": int(unit.get("readable_count") or 0),
             "ambiguous_count": int(unit.get("ambiguous_count") or 0),

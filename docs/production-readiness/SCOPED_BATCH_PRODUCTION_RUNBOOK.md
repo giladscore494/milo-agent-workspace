@@ -540,7 +540,7 @@ snapshot and the exact batch.
 - Any `UNVERIFIED`: the check could not see something, such as a missing
   `MILO_READONLY_DB_URL` or a role affected by RLS. Fix that access and re-run.
   It is never "good enough".
-- `ORPHANED_SNAPSHOTS=NO`: a pending scoped snapshot is still owned by a run
+- `ORPHANED_SNAPSHOTS=NO`: a pending scoped snapshot is still written by a run (its creator, or its latest adopter)
   that is live (or ended some way other than failed / cancelled / timed out).
   The orchestrator stops before any capture, because a capture of the same
   register content would land on that row and fail
@@ -554,7 +554,7 @@ snapshot and the exact batch.
 
   | `reason_code` | Meaning | What to do |
   | --- | --- | --- |
-  | `CAPTURE_REPOSITORY_TRANSIENT` | a catalog write failed on the network, a timeout, HTTP 408/425/429/5xx, a PostgREST connection code, or SQLSTATE 08xxx / 53xxx / 40001 / 40P01 / 55P03 / 57014 / 57P0x, **after** its bounded retry (4 attempts, 0.5 s + 1 s + 2 s backoff) | infrastructure: check Supabase and Cloud Run egress health, then re-run D.4. The pending snapshot is adopted by the next run (D.5) |
+  | `CAPTURE_REPOSITORY_TRANSIENT` | a catalog write failed on the network, a timeout, HTTP 408/425/429/5xx, a PostgREST connection code, or SQLSTATE 08xxx / 53xxx / 40001 / 40P01 / 55P03 / 57014 / 57P0x, **after** its bounded retry (4 attempts, 0.5 s + 1 s + 2 s backoff) | infrastructure: check Supabase and Cloud Run egress health, then re-run D.4. The pending snapshot is adopted by the next run (D.5). Each failed attempt is logged by the capture job as `guarded rpc failed function=… cause=… code=… http_status=… class=… attempt=n/4` (no message, details or payload) |
   | `CAPTURE_REPOSITORY_REJECTED` | the database refused a write's content (SQLSTATE class 22 / 23, or a repository idempotency / ownership refusal) | **stop**: a code or data defect, never retried. Keep the execution name and escalate |
   | `CAPTURE_REPOSITORY_UNAVAILABLE` | a catalog write failed for any other reason (unclassified) | inspect the execution and the Supabase logs at that time before re-running |
   | `CAPTURE_LEASE_LOST` | the database refused a write or a heartbeat for a stale lease, or no heartbeat could be proved for the lease duration | another worker holds the run, or the lease lapsed; re-run D.4 (the snapshot stays pending and is adoptable once this run's lease expires) |
@@ -566,37 +566,37 @@ This is the procedure for the 2026-09-24 incident: Mapping Plan
 2018+, max 10, batch 10). Its preparation (execution
 `milo-catalog-capture-wwg5p`, run `bbff131a-4ba3-4e79-9796-a7edb7df314c`)
 captured all 6 368 register rows, wrote every raw record into snapshot
-`701ea334-beb6-4e66-afe8-ca3df4be3d2d` and failed on candidate #3 580 with
-`CAPTURE_REPOSITORY_UNAVAILABLE` (the release before this one had no finer
-class). The snapshot is pending, owned by the failed run, and its key is
-derived from its content, so an unchanged register resolves to it again. The
-revision was **never prepared** (the queue is written only after every unit is
-captured), so it is resumed, not revised.
+`701ea334-beb6-4e66-afe8-ca3df4be3d2d` and 3 579 of its candidates, then failed
+with `CAPTURE_REPOSITORY_UNAVAILABLE` (the release before this one had no finer
+class; the root cause of that one write is **unknown** and only the new
+logging -- `guarded rpc failed function=… cause=… code=… http_status=…` in the
+capture job's logs -- will show it next time). The snapshot is pending and
+its key is derived from its content, so an unchanged register resolves to it
+again. The revision was **never prepared** (the queue is written only after
+every unit is captured), so it is resumed, not revised.
 
-What this release changes for it: the preparation's scoped capture lands on
-`701ea334`, finds it pending under a run that ended `failed` with no live
-lease, and ADOPTS it (`adopt_catalog_snapshot_guarded`, migration
-`20260924000200`): the previous owner is recorded in
-`catalog_snapshot_adoptions`, every raw record is re-submitted in batches of
-250 (the 6 368 already stored collapse onto their keys, and any row that
-differs fails closed), the candidates are written in batches, and activation
-passes the same completeness gate (`stored = declared = 6 368`). The document
-reports `units[0].capture=adopted` with `adopted_from_run_id=bbff131a-…`. If
-the register changed since, the capture derives a different key and lands a
-new snapshot instead; `701ea334` then stays pending and unread.
+**What to expect, verified read-only in Production:** among the 3 579
+candidates already written, `model_year_start >= 2018` holds 1 259 ambiguous
+vs 933 readable. The reviewed vocabulary reads only the body style
+`פנאי-שטח`; sedan, hatchback, MPV, station and pickup rows stay `ambiguous`.
+So revision 1 will end with its unit `vocabulary_insufficient` and **nothing
+queued**. That is the vocabulary gate working, not a failure of this change,
+and the fix is NOT a normalization or vocabulary change here: it is a plan
+range the reviewed vocabulary can read (per year, readable > ambiguous only in
+2025, 175/109, and 2026, 249/121, in that partial count). The capture itself
+must still finish: adopting and activating the snapshot is what lets the
+next revision reuse it without capturing again.
 
 1. Backup, dry run, apply (Stage B), with `$RELEASE_SHA` = the merge commit of
    this change. B.2 must propose exactly
    `20260924000200_catalog_ingestion_recovery.sql`; B.4 must end
    `fully-migrated (42/42 …)` and `WORK_SCOPE_SCHEMA=VERIFIED (9 tables with
-   RLS, 12 RPCs service_role-only)`.
-2. Redeploy the release (Stage C): `bash scripts/deploy/production-activate.sh --all`
-   (add `--force-redeploy` only if the release is somehow already deployed).
-   A redeploy returns every surface to Stage A.
-3. Plan authoring again (D.1): `bash scripts/deploy/website-execution-activate.sh --apply-plan-authoring`.
-   The Vercel half is unchanged if it is still in place; confirm with
-   `website-execution-check.sh` (`GATEWAY_RUN_START_ENABLED=DISABLED`).
-4. Read-only check of the revision **before** any capture:
+   RLS, 12 RPCs service_role-only)`. The release still serving (36b3da86)
+   keeps working against the migrated schema.
+2. Redeploy (Stage C): `bash scripts/deploy/production-activate.sh --all`.
+3. Plan authoring (D.1): `bash scripts/deploy/website-execution-activate.sh --apply-plan-authoring`;
+   confirm `GATEWAY_RUN_START_ENABLED=DISABLED`.
+4. Read-only check before any capture:
 
    ```bash
    export WS_ARGS="--work-scope-id 526b5c52-4ae3-432c-9fea-990921723151 --work-scope-revision 1 \
@@ -604,52 +604,88 @@ new snapshot instead; `701ea334` then stays pending and unread.
    bash scripts/deploy/work-scope-readiness.sh $WS_ARGS
    ```
 
-   **Expected:** `WORK_SCOPE_PLAN=VERIFIED`,
-   `WORK_SCOPE_PREPARED=NO (revision 1 has not been prepared. …)`,
-   `ORPHANED_SCOPED_SNAPSHOT id=701ea334-beb6-4e66-afe8-ca3df4be3d2d … owner_run=bbff131a-4ba3-4e79-9796-a7edb7df314c owner_status=failed stored=6368 declared=6368 adoptable=yes`
-   and `ORPHANED_SNAPSHOTS=VERIFIED (1 orphaned pending scoped snapshot(s) …)`.
-   **Stop if** it says `adoptable=no` or `ORPHANED_SNAPSHOTS=NO`: something
-   still owns the snapshot; find out what before capturing anything.
-   Also confirm `RUNS_QUIESCENT` (`production-verify.sh --gate deployed`): the
-   failed run is terminal and nothing else should be live.
-5. Prepare (D.4), exactly as before:
+   **Expected:** `WORK_SCOPE_PREPARED=NO (revision 1 has not been prepared. …)`,
+   `ORPHANED_SCOPED_SNAPSHOT id=701ea334-beb6-4e66-afe8-ca3df4be3d2d … writer_run=bbff131a-4ba3-4e79-9796-a7edb7df314c writer_status=failed stored=6368 declared=6368 adoptable=yes`
+   and `ORPHANED_SNAPSHOTS=VERIFIED (…)`. **Stop if** `adoptable=no` or
+   `ORPHANED_SNAPSHOTS=NO`.
+5. Prepare revision 1 (D.4):
 
    ```bash
    bash scripts/deploy/production-activate.sh --prepare-work-scope $WS_ARGS \
      --enable-catalog-execution --enable-work-scope-preparation 2>&1 | tee "$HOME/stage-d-resume.txt"
    ```
 
-   **Expected:** `WORK_SCOPE_PREPARATION_STATUS=succeeded`, the unit line
-   `UNIT 1. toyota state=prepared …` (or `vocabulary_insufficient`, which is
-   a stop as above), and in the execution's document
-   `"capture": "adopted"` with `"adopted_from_run_id": "bbff131a-4ba3-4e79-9796-a7edb7df314c"`.
-   The capture job now finishes in minutes: about 26 raw-record calls and
-   about 26 candidate calls instead of ~12 700 single-row calls. If the
-   execution fails anyway, the script still names it and prints its document
-   (the previous release could not): read its `reason_code` against the table
-   above. A `CAPTURE_REPOSITORY_TRANSIENT` failure is resumed by repeating this
-   step; the next run adopts the snapshot from the run that just failed, once
-   that run's lease has expired (≤ 300 s).
-6. Gate: `bash scripts/deploy/production-verify.sh --gate prepared $WS_ARGS`
-   → `RESULT: OK`, with `EVIDENCE_READY=VERIFIED` pinned to
-   `snapshot=cs1.…` of `701ea334` and `NEXT_BATCH_NUMBER=1`.
-7. The adoption is on record (read-only):
+   **Expected:**
+   - the capture ADOPTS `701ea334`: the unit's document shows
+     `"capture": "adopted"`, `"adopted_from_run_id": "bbff131a-…"`, and the
+     script prints `INGESTION unit=toyota adoption_seq=1 previous_writer_run_id=bbff131a-…`;
+   - it writes only what is missing:
+     `INGESTION unit=toyota phase=raw calls=32 … inserted=0 already_present=6368`
+     and `phase=candidates … inserted=<rest> already_present=3579` (plus
+     rows the vocabulary cannot read at all, which have no candidate);
+   - it ACTIVATES the snapshot (`phase=activate calls=1`), and
+     `INGESTION_TOTAL_DB_CALLS` / `INGESTION_TOTAL_SECONDS` state the cost;
+   - `WORK_SCOPE_PREPARATION_STATUS=succeeded` with
+     `UNIT 1. toyota state=vocabulary_insufficient … queued=0`, then the
+     prepared gate FAILS on `EVIDENCE_READY=NO (no unit of this revision was
+     prepared …)` and the script stops. That stop is expected here.
 
-   ```sql
-   select previous_run_id, adopted_by_run_id, previous_run_status,
-          stored_record_count_at_adoption, adopted_at
-     from public.catalog_snapshot_adoptions
-    where snapshot_id = '701ea334-beb6-4e66-afe8-ca3df4be3d2d';
+   A `CAPTURE_REPOSITORY_TRANSIENT` failure is resumed by repeating this
+   step; the next run adopts from the run that just failed once that run's
+   lease has expired (≤ 300 s), with `adoption_seq=2`.
+6. Choose a range the vocabulary can read, from the now ACTIVE snapshot
+   (read-only):
+
+   ```bash
+   bash scripts/deploy/work-scope-readiness.sh --year-coverage \
+     --snapshot-key <the cs1.… key the UNIT line printed>
    ```
 
-   One row: `bbff131a-…`, the new preparation's run, `failed`, `6368`.
+   It prints, per model year, `YEAR y readable=… ambiguous=… eligible=…` and
+   `FROM_y_ONWARD … gate=passes|vocabulary_insufficient|passes_but_queues_nothing`
+   -- the same counts `prepare_work_scope_queue` takes. Equivalent psql, for a
+   role with BYPASSRLS:
 
-Root-cause evidence to collect while doing this (read-only; not required to
-proceed): the heartbeat history of the failed run shows whether its lease was
-ever at risk —
+   ```sql
+   select c.model_year_start as year,
+          count(*) filter (where c.status <> 'ambiguous') as readable,
+          count(*) filter (where c.status = 'ambiguous')  as ambiguous,
+          count(*) filter (where c.status = 'candidate')  as eligible
+     from public.catalog_candidate_variants c
+     join public.catalog_source_snapshots s on s.id = c.snapshot_id
+    where s.snapshot_key = '<cs1.… key>'
+    group by c.model_year_start
+    order by c.model_year_start;
+   ```
+7. In the website, save a **new revision** of the plan whose model-year range
+   passes (for example `2025+`, if step 6 says `FROM_2025_ONWARD … gate=passes`),
+   then read its triple with `work-scope-readiness.sh --list`.
+8. Prepare that revision (D.4 again, with the new `$WS_ARGS`). **Expected:**
+   the snapshot is REUSED -- `"capture": "unchanged"` or `"reused"`, no
+   `INGESTION` lines with writes (a new capture of unchanged content lands on
+   the active snapshot and writes nothing) -- and
+   `UNIT 1. toyota state=prepared queued=…`.
+9. Gate: `bash scripts/deploy/production-verify.sh --gate prepared $WS_ARGS`
+   → `RESULT: OK`, `EVIDENCE_READY=VERIFIED`, `NEXT_BATCH_NUMBER=1`.
+
+The adoption is on record (read-only):
+
+```sql
+select adoption_seq, previous_writer_run_id, adopted_by_run_id, adopted_at
+  from public.catalog_snapshot_adoptions
+ where snapshot_id = '701ea334-beb6-4e66-afe8-ca3df4be3d2d';
+select event_type, payload from public.run_events
+ where event_type = 'catalog_snapshot_adopted'
+   and payload->>'snapshot_id' = '701ea334-beb6-4e66-afe8-ca3df4be3d2d';
+```
+
+`created_by_run_id` of the snapshot stays `bbff131a-…`: it records who opened
+it; the adoption row records who finished it.
+
+Root-cause evidence for the ORIGINAL failure (read-only; not required to
+proceed): the heartbeat history of the failed run --
 `select heartbeat_at, lease_expires_at from public.worker_heartbeats where run_id = 'bbff131a-4ba3-4e79-9796-a7edb7df314c' order by heartbeat_at;`
-— and the Supabase API / Postgres logs around 2026-09-24 00:01:50 UTC show the
-response the candidate write received.
+-- and the Supabase API / Postgres logs around 2026-09-24 00:01:50 UTC.
 
 **Rollback.** Preparation writes only append-only rows and executes nothing.
 To stop, do not continue to Stage E. A wrong plan is fixed by revising it in

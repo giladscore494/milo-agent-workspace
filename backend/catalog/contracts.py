@@ -87,13 +87,15 @@ MAX_RAW_PAYLOAD_CHARS = 16384
 #: source content.
 MAX_RETRIEVAL_METADATA_CHARS = 4096
 
-#: The most rows ONE batched raw-record or candidate write may carry, and the
-#: size an ingestion actually sends. The ceiling is enforced again by
-#: `record_catalog_raw_records_batch_guarded` / `record_catalog_candidates_
-#: batch_guarded` (20260924000200); the batch size stays well under it so one
-#: call's request body stays in the hundreds of kilobytes.
+#: The most rows ONE batched raw-record or candidate write may carry (a hard
+#: cap, enforced again by `record_catalog_raw_records_batch_guarded` /
+#: `record_catalog_candidates_batch_guarded`, 20260924000200), and the size an
+#: ingestion actually sends. Server constants: no environment variable or
+#: argument can change either. At 200 rows a Toyota preparation (6 368 rows)
+#: is 32 + 32 batch calls; the measured cost of one call is in
+#: `docs/production-readiness/MIGRATIONS.md` (ingestion recovery section).
 MAX_CATALOG_WRITE_BATCH = 500
-CATALOG_WRITE_BATCH_SIZE = 250
+CATALOG_WRITE_BATCH_SIZE = 200
 
 #: Where a raw record sat in the retrieval that captured it. Closed and
 #: GENERIC: these four describe any paginated read, and none of them names a

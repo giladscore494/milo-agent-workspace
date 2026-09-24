@@ -8984,21 +8984,29 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     assert "remote schema classified as fully-migrated (42/42" in state.stdout, state.stdout
 
 
+
 # =============================================================================
-# Ingestion recovery (20260924000200): batches, retry-safety and adoption.
+# Ingestion recovery (20260924000200): ONE write authority, adoption, batches.
 #
 # The 2026-09-24 incident: a scoped Toyota preparation wrote 6368 raw records
 # one RPC per row, failed on candidate #3580, and left a PENDING snapshot owned
 # by a failed run. Its key is content-derived, so every later capture of the
 # same content resolved to that row and was refused. These tests prove, in real
-# SQL, that the batches are the single-row writes (same validation, same
-# idempotency, all or nothing), that every ingestion write is safe to retry,
-# and that an orphan is adopted ONLY under every stated condition.
+# SQL, that:
+#   * who may write a snapshot is decided in ONE place,
+#     `assert_snapshot_write_authority` (latest adopter, else the creator), and
+#     `created_by_run_id` never moves;
+#   * an orphan is adopted ONLY under every stated condition, with an
+#     append-only, numbered adoption row and a run event;
+#   * the batches are the single-row writes (same validation, same
+#     idempotency, all or nothing) and every ingestion write is retry-safe;
+#   * the release still serving (single-row writes only) keeps working;
+#   * the incident itself, replayed, completes exactly.
 # =============================================================================
 
 def _rec_pending_snapshot(db, args: str, label: str, declared: int, *,
                           marque: str | None = WSP_TOYOTA) -> tuple[str, dict]:
-    """A PENDING scoped snapshot (nothing written into it); (id, payload)."""
+    """A PENDING snapshot (nothing written into it); (id, payload)."""
     payload = json.loads(_catalog_snapshot_json(f"rec-{label}", declared=declared))
     payload["retrieval_metadata"] = _wsp_metadata(marque, count=declared)
     snapshot = _rpc_as_service(db, "select id from public.record_catalog_snapshot_guarded("
@@ -9013,10 +9021,14 @@ def _rec_records(snapshot: str, label: str, indices) -> list[dict]:
              "source_locator": {"capture_index": index}} for index in indices]
 
 
+def _rec_raw_batch_answer(db, args: str, records: list[dict]) -> dict:
+    return json.loads(_rpc_as_service(
+        db, "select public.record_catalog_raw_records_batch_guarded("
+            f"{args}, $j${json.dumps(records)}$j$::jsonb)"))
+
+
 def _rec_raw_batch(db, args: str, records: list[dict]) -> list[str]:
-    rows = _rpc_as_service(db, "select id from public.record_catalog_raw_records_batch_guarded("
-                               f"{args}, $j${json.dumps(records)}$j$::jsonb)")
-    return rows.splitlines()
+    return [row["id"] for row in _rec_raw_batch_answer(db, args, records)["rows"]]
 
 
 def _rec_candidates(snapshot: str, label: str, record_ids: list[str]) -> list[dict]:
@@ -9026,15 +9038,25 @@ def _rec_candidates(snapshot: str, label: str, record_ids: list[str]) -> list[di
             for index, record in enumerate(record_ids)]
 
 
+def _rec_candidate_batch_answer(db, args: str, candidates: list[dict]) -> dict:
+    return json.loads(_rpc_as_service(
+        db, "select public.record_catalog_candidates_batch_guarded("
+            f"{args}, $j${json.dumps(candidates)}$j$::jsonb)"))
+
+
 def _rec_candidate_batch(db, args: str, candidates: list[dict]) -> list[str]:
-    rows = _rpc_as_service(db, "select id from public.record_catalog_candidates_batch_guarded("
-                               f"{args}, $j${json.dumps(candidates)}$j$::jsonb)")
-    return rows.splitlines()
+    return [row["id"] for row in _rec_candidate_batch_answer(db, args, candidates)["rows"]]
 
 
-def _rec_adopt(db, args: str, payload: dict) -> str:
-    return _rpc_as_service(db, "select created_by_run_id from public.adopt_catalog_snapshot_guarded("
-                               f"{args}, $j${json.dumps(payload)}$j$::jsonb)")
+def _rec_adopt(db, args: str, payload: dict) -> dict:
+    return json.loads(_rpc_as_service(
+        db, f"select public.adopt_catalog_snapshot_guarded({args}, $j${json.dumps(payload)}$j$::jsonb)"))
+
+
+def _rec_activate(db, args: str, snapshot: str, state: str | None = None) -> str:
+    body = {"snapshot_id": snapshot, **({"validation_state": state} if state else {})}
+    return _rpc_as_service(db, "select validation_state || '|' || (activated_at is not null) "
+                               f"from public.activate_catalog_snapshot_guarded({args}, '{json.dumps(body)}'::jsonb)")
 
 
 def _rec_end(db, run: str, status: str, *, lease_live: bool = False) -> None:
@@ -9042,22 +9064,27 @@ def _rec_end(db, run: str, status: str, *, lease_live: bool = False) -> None:
     db.psql(f"update public.runs set status='{status}', lease_expires_at={expiry} where id='{run}'")
 
 
+def _rec_writer(db, snapshot: str) -> str:
+    return db.psql(f"select public.catalog_snapshot_current_writer('{snapshot}')")
+
+
 def test_recovery_batches_are_the_single_row_writes_all_or_nothing(db):
     _user, _project, conversation = _ws_world(db)
-    run, args = _wsp_capture_run(db, conversation)
-    snapshot, _payload = _rec_pending_snapshot(db, args, f"batch-{conversation[:8]}", 5)
+    _run, args = _wsp_capture_run(db, conversation)
     label = f"batch-{conversation[:8]}"
+    snapshot, _payload = _rec_pending_snapshot(db, args, label, 5)
     records = _rec_records(snapshot, label, range(5))
 
-    first = _rec_raw_batch(db, args, records[:3])
-    assert len(first) == 3
+    answer = _rec_raw_batch_answer(db, args, records[:3])
+    first = [row["id"] for row in answer["rows"]]
+    assert (len(first), answer["inserted"], answer["already_present"]) == (3, 3, 0)
     # Rows answer in INPUT order.
-    keys = db.psql(f"select string_agg(record_key, ',' order by (source_locator->>'capture_index')::int) "
-                   f"from public.catalog_raw_records where snapshot_id='{snapshot}'").split(",")
-    assert keys == [record["record_key"] for record in records[:3]]
+    assert [row["record_key"] for row in answer["rows"]] == [r["record_key"] for r in records[:3]]
     # A retried batch -- e.g. after a response lost in transit -- collapses
-    # onto the same rows and counts nothing twice.
-    assert _rec_raw_batch(db, args, records[:3]) == first
+    # onto the same rows, says so, and counts nothing twice.
+    again = _rec_raw_batch_answer(db, args, records[:3])
+    assert [row["id"] for row in again["rows"]] == first
+    assert (again["inserted"], again["already_present"]) == (0, 3)
     assert db.psql(f"select stored_record_count from public.catalog_source_snapshots where id='{snapshot}'") == "3"
 
     # ALL OR NOTHING: a batch holding a new row and a conflicting replay writes
@@ -9070,7 +9097,7 @@ def test_recovery_batches_are_the_single_row_writes_all_or_nothing(db):
 
     # Bounded, one snapshot per call, and the single-row validation applies.
     with pytest.raises(AssertionError, match="1 to 500"):
-        _rpc_as_service(db, "select id from public.record_catalog_raw_records_batch_guarded("
+        _rpc_as_service(db, "select public.record_catalog_raw_records_batch_guarded("
                             f"{args}, (select jsonb_agg($j${json.dumps(records[3])}$j$::jsonb) "
                             "from generate_series(1, 501)))")
     for bad, message in (([], "1 to 500"),
@@ -9084,13 +9111,13 @@ def test_recovery_batches_are_the_single_row_writes_all_or_nothing(db):
     with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
         _rec_raw_batch(db, stale, records[3:])
 
-    rest = _rec_raw_batch(db, args, records[3:])
-    record_ids = first + rest
+    record_ids = first + _rec_raw_batch(db, args, records[3:])
     candidates = _rec_candidates(snapshot, label, record_ids)
-    written = _rec_candidate_batch(db, args, candidates)
-    assert len(written) == 5
-    assert _rec_candidate_batch(db, args, candidates) == written
-    assert db.psql(f"select count(*) from public.catalog_candidate_variants where snapshot_id='{snapshot}'") == "5"
+    written = _rec_candidate_batch_answer(db, args, candidates)
+    assert (written["inserted"], written["already_present"]) == (5, 0)
+    replay = _rec_candidate_batch_answer(db, args, candidates)
+    assert [row["id"] for row in replay["rows"]] == [row["id"] for row in written["rows"]]
+    assert (replay["inserted"], replay["already_present"]) == (0, 5)
     # A conflicting candidate replay is refused and writes nothing new.
     changed = {**candidates[0], "commercial_model": "OTHER"}
     extra = {**_rec_candidates(snapshot, label + "-x", record_ids[:1])[0],
@@ -9099,23 +9126,20 @@ def test_recovery_batches_are_the_single_row_writes_all_or_nothing(db):
         _rec_candidate_batch(db, args, [extra, changed])
     assert db.psql(f"select count(*) from public.catalog_candidate_variants where snapshot_id='{snapshot}'") == "5"
 
-    # Activation, and its retry, are idempotent too.
-    activation = json.dumps({"snapshot_id": snapshot})
-    once = _rpc_as_service(db, f"select activated_at from public.activate_catalog_snapshot_guarded({args}, '{activation}'::jsonb)")
-    again = _rpc_as_service(db, f"select activated_at from public.activate_catalog_snapshot_guarded({args}, '{activation}'::jsonb)")
-    assert once == again and once
-    # The candidate batch is stricter than the single-row write: readings land
-    # only on the caller's own capture while it is still pending.
+    assert _rec_activate(db, args, snapshot) == "complete|true"
+    # The candidate batch asks the write authority: readings land only on a
+    # capture the caller may write, while it is pending.
     with pytest.raises(AssertionError, match="an active catalog snapshot is immutable"):
         _rec_candidate_batch(db, args, candidates[:1])
-    other, other_args = _wsp_capture_run(db, conversation)
+    _other, other_args = _wsp_capture_run(db, conversation)
     # Unscoped, so no later readiness check reads it as an orphaned scoped one.
     pending, _ = _rec_pending_snapshot(db, other_args, f"batch-other-{conversation[:8]}", 1,
                                        marque=None)
     other_record = _rec_raw_batch(db, other_args, _rec_records(pending, f"o-{label}", [0]))
-    with pytest.raises(AssertionError, match="does not belong to this run"):
-        _rec_candidate_batch(db, args, _rec_candidates(pending, f"o-{label}", other_record))
-    del run, other
+    for write in (lambda: _rec_candidate_batch(db, args, _rec_candidates(pending, f"o-{label}", other_record)),
+                  lambda: _rec_raw_batch(db, args, _rec_records(pending, f"o2-{label}", [1]))):
+        with pytest.raises(AssertionError, match="this catalog snapshot does not belong to this run"):
+            write()
 
 
 def test_every_ingestion_write_is_safe_to_retry(db):
@@ -9141,6 +9165,55 @@ def test_every_ingestion_write_is_safe_to_retry(db):
     c2 = _rpc_as_service(db, "select id from public.record_catalog_candidate_guarded("
                              f"{args}, $j${json.dumps(candidate)}$j$::jsonb)")
     assert c1 == c2
+    assert _rec_activate(db, args, snapshot) == _rec_activate(db, args, snapshot) == "complete|true"
+
+
+def test_the_serving_release_single_row_ingestion_still_works_on_the_new_schema(db):
+    """Mixed-version safety. The migration is applied while release 36b3da86
+    still serves; that release lands a capture ONLY through the single-row
+    RPCs, in this order, and matches their messages. Every one keeps its
+    signature, its answer and its refusals."""
+    _user, _project, conversation = _ws_world(db)
+    run, args = _wsp_capture_run(db, conversation)
+    label = f"old-{conversation[:8]}"
+    snapshot, payload = _rec_pending_snapshot(db, args, label, 3)
+    assert db.psql("select pg_get_function_identity_arguments('public.record_catalog_raw_record_guarded'::regproc)") \
+        == "p_run_id uuid, p_worker_id text, p_attempt integer, p_lease_token text, p_record jsonb"
+    assert db.psql("select pg_get_function_result('public.activate_catalog_snapshot_guarded'::regproc)") \
+        == "SETOF catalog_source_snapshots"
+    record_ids = []
+    for record in _rec_records(snapshot, label, range(3)):
+        record_ids.append(_rpc_as_service(db, "select id from public.record_catalog_raw_record_guarded("
+                                              f"{args}, $j${json.dumps(record)}$j$::jsonb)"))
+    for candidate in _rec_candidates(snapshot, label, record_ids):
+        _rpc_as_service(db, "select id from public.record_catalog_candidate_guarded("
+                            f"{args}, $j${json.dumps(candidate)}$j$::jsonb)")
+    # Another leased run is refused with the SAME message as before.
+    _intruder, intruder_args = _wsp_capture_run(db, conversation)
+    with pytest.raises(AssertionError, match="this catalog snapshot does not belong to this run"):
+        _rpc_as_service(db, "select id from public.record_catalog_raw_record_guarded("
+                            f"{intruder_args}, $j${json.dumps(_rec_records(snapshot, label, [5])[0])}$j$::jsonb)")
+    with pytest.raises(AssertionError, match="this catalog snapshot does not belong to this run"):
+        _rec_activate(db, intruder_args, snapshot)
+    assert _rec_activate(db, args, snapshot) == "complete|true"
+    assert _rec_activate(db, args, snapshot) == "complete|true"          # replay
+    with pytest.raises(AssertionError, match="an active catalog snapshot is immutable"):
+        _rec_activate(db, args, snapshot, "failed")
+    with pytest.raises(AssertionError, match="an active catalog snapshot is immutable"):
+        _rpc_as_service(db, "select id from public.record_catalog_raw_record_guarded("
+                            f"{args}, $j${json.dumps(_rec_records(snapshot, label, [4])[0])}$j$::jsonb)")
+    # The old failure path: an incomplete capture is refused, then declared
+    # failed, which is terminal and replays as a no-op.
+    failing, _ = _rec_pending_snapshot(db, args, f"old-fail-{conversation[:8]}", 2, marque=None)
+    with pytest.raises(AssertionError, match="catalog snapshot is incomplete"):
+        _rec_activate(db, args, failing)
+    assert _rec_activate(db, args, failing, "failed") == "failed|false"
+    assert _rec_activate(db, args, failing, "failed") == "failed|false"
+    with pytest.raises(AssertionError, match="a failed catalog snapshot is terminal"):
+        _rec_activate(db, args, failing)
+    # Nothing about ownership moved for a snapshot nobody adopted.
+    assert db.psql(f"select created_by_run_id from public.catalog_source_snapshots where id='{snapshot}'") == run
+    assert _rec_writer(db, snapshot) == run
 
 
 def test_an_orphaned_pending_snapshot_is_adopted_only_under_every_condition(db):
@@ -9149,17 +9222,17 @@ def test_an_orphaned_pending_snapshot_is_adopted_only_under_every_condition(db):
     owner, owner_args = _wsp_capture_run(db, conversation)
     snapshot, payload = _rec_pending_snapshot(db, owner_args, label, 3)
     records = _rec_records(snapshot, label, range(3))
-    _rec_raw_batch(db, owner_args, records[:2])            # the orphan holds a prefix
+    _rec_raw_batch(db, owner_args, records[:2])             # the orphan holds a prefix
     adopter, adopter_args = _wsp_capture_run(db, conversation)
 
-    # 1. The owner is still LIVE: never adopted.
+    # 1. The writer is still LIVE: never adopted.
     with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ADOPTION_REFUSED"):
         _rec_adopt(db, adopter_args, payload)
-    # 2. The owner ended, but still holds an unexpired lease: never adopted.
+    # 2. The writer ended, but still holds an unexpired lease: never adopted.
     _rec_end(db, owner, "failed", lease_live=True)
     with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ADOPTION_REFUSED"):
         _rec_adopt(db, adopter_args, payload)
-    # 3. The owner SUCCEEDED (a pending snapshot under a completed run is
+    # 3. The writer SUCCEEDED (a pending snapshot under a completed run is
     #    unexplained, not orphaned): never adopted.
     _rec_end(db, owner, "completed")
     with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ADOPTION_REFUSED"):
@@ -9172,8 +9245,7 @@ def test_an_orphaned_pending_snapshot_is_adopted_only_under_every_condition(db):
     ).split("|")
     with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ADOPTION_REFUSED"):
         _rec_adopt(db, f"'{swarm}','swarm-{swarm[:8]}',{attempt},'{token}'", payload)
-    # 5. The capture must BE that snapshot: its identity, its declared scope
-    #    and its reading.
+    # 5. The capture must BE that snapshot: identity, declared scope, reading.
     with pytest.raises(AssertionError, match="catalog snapshot idempotency conflict"):
         _rec_adopt(db, adopter_args, {**payload, "declared_record_count": 4})
     other_scope = {**payload, "retrieval_metadata": _wsp_metadata("מאזדה", count=3)}
@@ -9183,51 +9255,79 @@ def test_an_orphaned_pending_snapshot_is_adopted_only_under_every_condition(db):
                                                  "normalization_issue_count": 1}}
     with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ADOPTION_REFUSED"):
         _rec_adopt(db, adopter_args, drifted)
-    # 6. No shortcut: service_role can neither rewrite the owner directly nor
-    #    forge an adoption for a live owner or for itself.
+    # 6. No shortcut: the creator is immutable, and an adoption row cannot be
+    #    forged for a non-writer, for an adopter that is not a live capture
+    #    run, or with a chosen sequence number.
     with pytest.raises(AssertionError, match="catalog snapshot identity is immutable"):
         db.psql(f"set role service_role; update public.catalog_source_snapshots "
                 f"set created_by_run_id='{adopter}' where id='{snapshot}'")
-    with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ADOPTION_REFUSED"):
-        db.psql(f"set role service_role; insert into public.catalog_snapshot_adoptions "
-                f"(snapshot_id, previous_run_id, adopted_by_run_id, previous_run_status, "
-                f"stored_record_count_at_adoption) values ('{snapshot}', '{adopter}', '{adopter}', "
-                f"'failed', 0)")
-    assert db.psql(f"select created_by_run_id from public.catalog_source_snapshots where id='{snapshot}'") == owner
+    for previous, adopted_by in ((adopter, owner), (swarm, adopter)):
+        with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ADOPTION_REFUSED"):
+            db.psql(f"set role service_role; insert into public.catalog_snapshot_adoptions "
+                    f"(snapshot_id, adoption_seq, adopted_by_run_id, previous_writer_run_id) "
+                    f"values ('{snapshot}', 1, '{adopted_by}', '{previous}')")
     assert db.psql(f"select count(*) from public.catalog_snapshot_adoptions where snapshot_id='{snapshot}'") == "0"
+    assert _rec_writer(db, snapshot) == owner
 
-    # Every condition holds: adopted, and the previous owner recorded durably.
-    assert _rec_adopt(db, adopter_args, payload) == adopter
-    assert db.psql(
-        "select previous_run_id || '|' || adopted_by_run_id || '|' || previous_run_status || '|' "
-        "|| stored_record_count_at_adoption from public.catalog_snapshot_adoptions "
-        f"where snapshot_id='{snapshot}'") == f"{owner}|{adopter}|failed|2"
-    # Idempotent: the adopter's replay returns the row and records nothing more.
-    assert _rec_adopt(db, adopter_args, payload) == adopter
+    # Every condition holds: adopted.
+    answer = _rec_adopt(db, adopter_args, payload)
+    assert answer["adoption"]["adoption_seq"] == 1
+    assert answer["adoption"]["previous_writer_run_id"] == owner
+    assert answer["adoption"]["adopted_by_run_id"] == adopter
+    assert answer["snapshot"]["created_by_run_id"] == owner          # never moves
+    assert _rec_writer(db, snapshot) == adopter
+    assert db.psql(f"select event_type || '|' || (payload->>'previous_writer_run_id') || '|' "
+                   f"|| (payload->>'adoption_seq') from public.run_events where run_id='{adopter}' "
+                   "and event_type='catalog_snapshot_adopted'") == f"catalog_snapshot_adopted|{owner}|1"
+    # Idempotent: the adopter's replay answers the same adoption, adds nothing.
+    assert _rec_adopt(db, adopter_args, payload)["adoption"]["adoption_seq"] == 1
     assert db.psql(f"select count(*) from public.catalog_snapshot_adoptions where snapshot_id='{snapshot}'") == "1"
+    assert db.psql(f"select count(*) from public.run_events where run_id='{adopter}' "
+                   "and event_type='catalog_snapshot_adopted'") == "1"
     # The record is append-only for every role.
-    for statement in (f"update public.catalog_snapshot_adoptions set previous_run_status='cancelled' "
+    for statement in (f"update public.catalog_snapshot_adoptions set adoption_seq=2 "
                       f"where snapshot_id='{snapshot}'",
                       f"delete from public.catalog_snapshot_adoptions where snapshot_id='{snapshot}'"):
         with pytest.raises(AssertionError, match="append-only"):
             db.psql(statement)
 
-    # The adopter continues through the SAME idempotent writes: the stored
-    # prefix collapses, the missing row is written, and the completeness gate
-    # activates exactly the declared count.
-    record_ids = _rec_raw_batch(db, adopter_args, records)
+    # The adopter continues through the SAME idempotent writes, and the
+    # creator can no longer write at all.
+    batch = _rec_raw_batch_answer(db, adopter_args, records)
+    assert (batch["inserted"], batch["already_present"]) == (1, 2)
     assert db.psql(f"select stored_record_count from public.catalog_source_snapshots where id='{snapshot}'") == "3"
+    record_ids = [row["id"] for row in batch["rows"]]
     _rec_candidate_batch(db, adopter_args, _rec_candidates(snapshot, label, record_ids))
-    activated = _rpc_as_service(db, "select validation_state || '|' || (activated_at is not null) "
-                                    "from public.activate_catalog_snapshot_guarded("
-                                    f"{adopter_args}, '{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
-    assert activated == "complete|true"
+    assert _rec_activate(db, adopter_args, snapshot) == "complete|true"
+    assert db.psql(f"select created_by_run_id from public.catalog_source_snapshots where id='{snapshot}'") == owner
     # An ACTIVE snapshot is never adopted, not even from a failed adopter.
     _rec_end(db, adopter, "failed")
-    late, late_args = _wsp_capture_run(db, conversation)
+    _late, late_args = _wsp_capture_run(db, conversation)
     with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ADOPTION_REFUSED"):
         _rec_adopt(db, late_args, payload)
-    del late
+
+
+def test_a_chain_of_adoptions_numbers_itself_and_follows_the_latest_writer(db):
+    _user, _project, conversation = _ws_world(db)
+    label = f"chain-{conversation[:8]}"
+    first, first_args = _wsp_capture_run(db, conversation)
+    snapshot, payload = _rec_pending_snapshot(db, first_args, label, 2, marque=None)
+    _rec_end(db, first, "failed")
+    second, second_args = _wsp_capture_run(db, conversation)
+    _rec_adopt(db, second_args, payload)
+    _rec_end(db, second, "timed_out")
+    third, third_args = _wsp_capture_run(db, conversation)
+    answer = _rec_adopt(db, third_args, payload)
+    assert (answer["adoption"]["adoption_seq"], answer["adoption"]["previous_writer_run_id"]) \
+        == (2, second)
+    assert _rec_writer(db, snapshot) == third
+    # Neither earlier writer may write any more; the latest may.
+    with pytest.raises(AssertionError, match="this catalog snapshot does not belong to this run"):
+        db.psql(f"select public.assert_snapshot_write_authority('{snapshot}', '{second}')")
+    assert db.psql(f"select id from public.assert_snapshot_write_authority('{snapshot}', '{third}')") == snapshot
+    assert db.psql(f"select string_agg(adoption_seq || ':' || previous_writer_run_id || '>' "
+                   f"|| adopted_by_run_id, ',' order by adoption_seq) from public.catalog_snapshot_adoptions "
+                   f"where snapshot_id='{snapshot}'") == f"1:{first}>{second},2:{second}>{third}"
 
 
 def test_a_failed_snapshot_is_never_adopted(db):
@@ -9235,12 +9335,115 @@ def test_a_failed_snapshot_is_never_adopted(db):
     label = f"failed-{conversation[:8]}"
     owner, owner_args = _wsp_capture_run(db, conversation)
     snapshot, payload = _rec_pending_snapshot(db, owner_args, label, 2, marque=None)
-    _rpc_as_service(db, f"select id from public.activate_catalog_snapshot_guarded({owner_args}, "
-                        f"'{json.dumps({'snapshot_id': snapshot, 'validation_state': 'failed'})}'::jsonb)")
+    assert _rec_activate(db, owner_args, snapshot, "failed") == "failed|false"
     _rec_end(db, owner, "timed_out")
     _adopter, adopter_args = _wsp_capture_run(db, conversation)
     with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ADOPTION_REFUSED"):
         _rec_adopt(db, adopter_args, payload)
+
+
+def test_the_incident_replayed_orphan_with_every_raw_record_and_a_candidate_prefix(db):
+    """2026-09-24, in miniature: every raw record durable, only a PREFIX of the
+    candidates, the writer failed and its lease expired. An operator capture
+    run adopts, re-submits EVERYTHING, and activates."""
+    _user, _project, conversation = _ws_world(db)
+    label = f"incident-{conversation[:8]}"
+    owner, owner_args = _wsp_capture_run(db, conversation)
+    total = 12
+    snapshot, payload = _rec_pending_snapshot(db, owner_args, label, total)
+    records = _rec_records(snapshot, label, range(total))
+    record_ids = _rec_raw_batch(db, owner_args, records)
+    candidates = _rec_candidates(snapshot, label, record_ids)
+    _rec_candidate_batch(db, owner_args, candidates[:7])        # then the owner failed
+    before = db.psql(
+        "select string_agg(id || '|' || candidate_key || '|' || raw_record_id || '|' || manufacturer "
+        "|| '|' || commercial_model || '|' || status, ',' order by candidate_key) "
+        f"from public.catalog_candidate_variants where snapshot_id='{snapshot}'")
+    _rec_end(db, owner, "failed")
+
+    adopter, adopter_args = _wsp_capture_run(db, conversation)
+    assert _rec_adopt(db, adopter_args, payload)["adoption"]["previous_writer_run_id"] == owner
+    raw = _rec_raw_batch_answer(db, adopter_args, records)
+    assert (raw["inserted"], raw["already_present"]) == (0, total)
+    assert [row["id"] for row in raw["rows"]] == record_ids
+    assert db.psql(f"select stored_record_count from public.catalog_source_snapshots where id='{snapshot}'") == str(total)
+    written = _rec_candidate_batch_answer(db, adopter_args, candidates)
+    assert (written["inserted"], written["already_present"]) == (total - 7, 7)
+    after = db.psql(
+        "select string_agg(id || '|' || candidate_key || '|' || raw_record_id || '|' || manufacturer "
+        "|| '|' || commercial_model || '|' || status, ',' order by candidate_key) "
+        f"from public.catalog_candidate_variants where snapshot_id='{snapshot}' "
+        f"and candidate_key in ({','.join(repr(c['candidate_key']) for c in candidates[:7])})")
+    assert after == before
+    assert db.psql(f"select count(*) from public.catalog_candidate_variants where snapshot_id='{snapshot}'") == str(total)
+    assert _rec_activate(db, adopter_args, snapshot) == "complete|true"
+    assert db.psql("select stored_record_count || '|' || declared_record_count || '|' || created_by_run_id "
+                   f"from public.catalog_source_snapshots where id='{snapshot}'") == f"{total}|{total}|{owner}"
+    assert db.psql(f"select count(*) from public.catalog_snapshot_adoptions where snapshot_id='{snapshot}'") == "1"
+    assert db.psql(f"select count(*) from public.run_events where run_id='{adopter}' "
+                   "and event_type='catalog_snapshot_adopted'") == "1"
+
+
+def test_a_200_row_batch_is_far_inside_the_statement_and_request_bounds(db, tmp_path):
+    """The batch size is a server constant (200). One 200-row raw-record call
+    and one 200-row candidate call, with register-shaped rows, must stay far
+    below Supabase's statement timeout (8 s for the API roles) and carry a
+    request body of a few hundred kilobytes."""
+    import time as _time
+
+    from backend.catalog.contracts import CATALOG_WRITE_BATCH_SIZE
+    from backend.testing.government_capture import page_document
+
+    _user, _project, conversation = _ws_world(db)
+    _run, args = _wsp_capture_run(db, conversation)
+    label = f"size-{conversation[:8]}"
+    size = CATALOG_WRITE_BATCH_SIZE
+    snapshot, _payload = _rec_pending_snapshot(db, args, label, size, marque=None)
+    template = page_document(0)["result"]["records"][0]
+    records = [{**json.loads(_catalog_record_json(snapshot, f"size-{label}-{i}", upstream=str(90000 + i),
+                                                  payload={**template, "_id": 90000 + i})),
+                "source_locator": {"capture_index": i}} for i in range(size)]
+    body = json.dumps(records)
+
+    def call(function: str, payload: str, name: str) -> tuple[dict, float]:
+        # Through a file: a 200-row body is larger than one command argument.
+        sql = tmp_path / f"{name}.sql"
+        sql.write_text(f"set role service_role;\nselect public.{function}({args}, "
+                       f"$j${payload}$j$::jsonb);\nreset role;\n", encoding="utf-8")
+        started = _time.monotonic()
+        answer = json.loads(db.psql(file=sql))
+        return answer, _time.monotonic() - started
+
+    raw, raw_seconds = call("record_catalog_raw_records_batch_guarded", body, "raw")
+    record_ids = [row["id"] for row in raw["rows"]]
+    candidates = _rec_candidates(snapshot, label, record_ids)
+    written, candidate_seconds = call("record_catalog_candidates_batch_guarded",
+                                      json.dumps(candidates), "candidates")
+    assert written["inserted"] == size
+    print(f"BATCH_MEASURE size={size} raw_request_bytes={len(body.encode())} "
+          f"raw_seconds={raw_seconds:.3f} candidate_request_bytes={len(json.dumps(candidates).encode())} "
+          f"candidate_seconds={candidate_seconds:.3f}")
+    assert len(record_ids) == size
+    assert raw_seconds < 4 and candidate_seconds < 4
+    assert len(body.encode()) < 1_000_000
+
+
+def test_only_the_write_authority_compares_a_snapshot_creator_with_the_caller(db):
+    """The static guard, on the EFFECTIVE definitions: after every migration,
+    exactly one function holds a direct `created_by_run_id` ownership check."""
+    holders = db.psql(
+        "select string_agg(p.proname, ',' order by p.proname) from pg_proc p "
+        "where p.pronamespace = 'public'::regnamespace "
+        r"and p.prosrc ~* 'created_by_run_id\s+is\s+(not\s+)?distinct\s+from\s+p_run_id'")
+    assert holders == "assert_snapshot_write_authority"
+    users = db.psql(
+        "select string_agg(p.proname, ',' order by p.proname) from pg_proc p "
+        "where p.pronamespace = 'public'::regnamespace "
+        "and p.prosrc like '%assert_snapshot_write_authority(%' "
+        "and p.proname <> 'assert_snapshot_write_authority'").split(",")
+    assert set(users) >= {"record_catalog_raw_record_guarded", "activate_catalog_snapshot_guarded",
+                          "record_catalog_raw_records_batch_guarded",
+                          "record_catalog_candidates_batch_guarded"}
 
 
 def test_recovery_objects_are_service_path_only(db):
@@ -9261,14 +9464,20 @@ def test_recovery_objects_are_service_path_only(db):
             with pytest.raises(AssertionError, match="permission denied"):
                 db.psql(f"set role {role}; select public.{rpc}("
                         f"'00000000-0000-4000-8000-000000000001','w',1,'t','[]'::jsonb)")
+    for signature in ("public.assert_snapshot_write_authority(uuid, uuid, boolean)",
+                      "public.catalog_snapshot_current_writer(uuid)"):
+        assert _has_execute(db, "service_role", signature), signature
+        for role in ("anon", "authenticated"):
+            assert not _has_execute(db, role, signature), (role, signature)
 
 
 def test_scoped_readiness_states_an_orphaned_snapshot_before_any_capture(db):
     """work-scope-readiness.sh names an orphan for an UNPREPARED revision:
-    adoptable when its owner failed, a NO while its owner is live."""
+    adoptable when its writer failed, a NO while its writer is live -- and it
+    reads the CURRENT writer, so an adopted snapshot is judged by its adopter."""
     world = _wsp_world(db)
     owner, owner_args = _wsp_capture_run(db, world["conversation"])
-    snapshot, _payload = _rec_pending_snapshot(db, owner_args, f"ready-{world['plan'][:8]}", 4)
+    snapshot, payload = _rec_pending_snapshot(db, owner_args, f"ready-{world['plan'][:8]}", 4)
     key = db.psql(f"select snapshot_key from public.catalog_source_snapshots where id='{snapshot}'")
 
     live = _readiness(db, *_triple(world))
@@ -9279,9 +9488,46 @@ def test_scoped_readiness_states_an_orphaned_snapshot_before_any_capture(db):
 
     _rec_end(db, owner, "failed")
     ended = _readiness(db, *_triple(world))
-    assert f"owner_run={owner} owner_status=failed stored=0 declared=4 adoptable=yes" in ended.stdout
+    assert f"writer_run={owner} writer_status=failed stored=0 declared=4 adoptable=yes" in ended.stdout
     # The shared database may hold other tests' pending snapshots; THIS one is
     # no longer what blocks anything.
     fact = next(line for line in ended.stdout.splitlines() if line.startswith("ORPHANED_SNAPSHOTS="))
     assert key not in fact
     assert "WORK_SCOPE_PREPARED=NO (revision 1 has not been prepared." in ended.stdout
+
+    # Adopted by a live run: that run is now the writer, and it is live.
+    adopter, adopter_args = _wsp_capture_run(db, world["conversation"])
+    _rec_adopt(db, adopter_args, payload)
+    adopted = _readiness(db, *_triple(world))
+    assert f"writer_run={adopter} writer_status=starting" in adopted.stdout
+    assert "adoptable=no" in adopted.stdout
+
+
+def test_year_coverage_states_the_vocabulary_gate_for_every_starting_year(db):
+    """The read-only query the operator uses after a preparation ends
+    `vocabulary_insufficient`: per model year, readable vs ambiguous, and for
+    every "from year Y onward" range whether the gate would pass -- the SAME
+    counts `prepare_work_scope_queue` takes."""
+    _user, _project, conversation = _ws_world(db)
+    _run, args = _wsp_capture_run(db, conversation)
+    rows = ([("ambiguous", 2018)] * 3 + [("candidate", 2018)]
+            + [("ambiguous", 2024)] * 2 + [("candidate", 2024)]
+            + [("candidate", 2025)] * 3 + [("ambiguous", 2025)]
+            + [("ready_for_review", 2026)] * 2)
+    _snapshot, key, _candidates = _wsp_snapshot(db, args, f"years-{conversation[:8]}", rows)
+    result = _readiness(db, "--year-coverage", "--snapshot-key", key)
+    assert result.returncode == 0, result.stdout
+    assert f"SNAPSHOT id={_snapshot} key={key} active=true" in result.stdout
+    lines = [line for line in result.stdout.splitlines() if line.startswith("YEAR ")]
+    assert lines == [
+        "YEAR 2018 readable=1 ambiguous=3 eligible=1 | FROM_2018_ONWARD readable=7 ambiguous=6 eligible=5 gate=passes",
+        "YEAR 2024 readable=1 ambiguous=2 eligible=1 | FROM_2024_ONWARD readable=6 ambiguous=3 eligible=4 gate=passes",
+        "YEAR 2025 readable=3 ambiguous=1 eligible=3 | FROM_2025_ONWARD readable=5 ambiguous=1 eligible=3 gate=passes",
+        "YEAR 2026 readable=2 ambiguous=0 eligible=0 | FROM_2026_ONWARD readable=2 ambiguous=0 eligible=0 gate=passes_but_queues_nothing",
+    ]
+    assert "YEAR_COVERAGE=VERIFIED" in result.stdout
+    # The shape is validated before anything is read.
+    bad = _readiness(db, "--year-coverage", "--snapshot-key", "cs1.x' or '1'='1")
+    assert bad.returncode == 2
+    missing = _readiness(db, "--year-coverage", "--snapshot-key", "cs1." + "0" * 32)
+    assert missing.returncode == 1 and "YEAR_COVERAGE=NO" in missing.stdout

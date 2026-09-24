@@ -1000,7 +1000,7 @@ def test_the_success_report_is_bounded_and_deterministic(wired, capsys, tmp_path
         "stored_record_count", "page_count", "candidate_count", "candidate_status_counts",
         "normalization_contract", "normalized_record_count", "normalization_issue_count",
         "normalization_issues", "normalization_issue_records", "rejected_record_count",
-        "activated", "reused_existing", "adopted_from_run_id"}
+        "activated", "reused_existing", "adopted_from_run_id", "ingestion"}
     assert len(snapshot["content_sha256"]) == 64
     assert snapshot["schema_fingerprint"].startswith("gov.schema.")
     assert len(snapshot["schema_fingerprint"]) <= entrypoint.MAX_REPORT_TEXT_CHARS

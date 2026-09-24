@@ -378,6 +378,46 @@ print(node)
 ' "$1"
 }
 
+# The ingestion measurements of a capture document, one line per phase, so the
+# operator can check the cost directly: database calls, wall time, rows
+# inserted vs already present, and the adoption (if any). Counts, seconds and
+# run ids only -- the document carries nothing else in these fields.
+print_ingestion_metrics() {
+  python3 -c '
+import json, sys
+raw = sys.stdin.read()
+start = raw.find("{")
+try:
+    doc = json.loads(raw[start:]) if start >= 0 else {}
+except Exception:
+    sys.exit(0)
+entries = []
+snapshot = ((doc.get("capture") or {}).get("snapshot") or {})
+if isinstance(snapshot.get("ingestion"), dict):
+    entries.append(("register", snapshot["ingestion"]))
+for unit in (doc.get("work_scope") or {}).get("units") or []:
+    if isinstance(unit, dict) and isinstance(unit.get("ingestion"), dict) \
+            and unit["ingestion"].get("total_calls"):
+        entries.append((str(unit.get("unit_key")), unit["ingestion"]))
+calls = seconds = 0
+for name, metrics in entries:
+    for phase in ("snapshot", "raw", "candidates", "activate"):
+        entry = metrics.get(phase) or {}
+        rows = ""
+        if "inserted" in entry:
+            rows = " inserted=%s already_present=%s" % (entry.get("inserted"), entry.get("already_present"))
+        print("INGESTION unit=%s phase=%s calls=%s seconds=%s%s"
+              % (name, phase, entry.get("calls"), entry.get("seconds"), rows))
+    print("INGESTION unit=%s adoption_seq=%s previous_writer_run_id=%s"
+          % (name, metrics.get("adoption_seq"), metrics.get("previous_writer_run_id") or "none"))
+    calls += int(metrics.get("total_calls") or 0)
+    seconds += float(metrics.get("total_seconds") or 0)
+if entries:
+    print("INGESTION_TOTAL_DB_CALLS=%d" % calls)
+    print("INGESTION_TOTAL_SECONDS=%.3f" % seconds)
+'
+}
+
 # A snapshot key, exactly the database's own shape (the
 # `catalog_source_snapshots_key_shape` constraint, 20260915120000).
 MILO_CAPTURE_SNAPSHOT_KEY_PATTERN='^cs1\.[0-9a-f]{32}$'
@@ -507,6 +547,7 @@ do_prepare_work_scope() {
   document="$(execution_document "$execution")"
   status="$(printf '%s' "$document" | json_field status || true)"
   printf 'WORK_SCOPE_PREPARATION_STATUS=%s\n' "${status:-unknown}"
+  printf '%s' "$document" | print_ingestion_metrics
   if [[ "$status" != "succeeded" ]]; then
     printf '%s\n' "$document" >&2
     report_egress_stop "$document"
@@ -580,6 +621,7 @@ do_capture() {
   document="$(execution_document "$execution")"
   status="$(printf '%s' "$document" | json_field status || true)"
   printf 'CAPTURE_STATUS=%s\n' "${status:-unknown}"
+  printf '%s' "$document" | print_ingestion_metrics
   # The entrypoint's own contract: a capture that did its work reports
   # `succeeded` (operator_capture's envelope). Nothing else is success.
   if [[ "$status" != "succeeded" ]]; then

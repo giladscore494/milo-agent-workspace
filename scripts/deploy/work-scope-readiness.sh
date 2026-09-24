@@ -31,7 +31,7 @@ source "${SCRIPT_DIR}/operator-config.sh"
 source "${SCRIPT_DIR}/deployment-contract.sh"
 
 MODE="scoped" MILO_OPERATOR_CONFIG_PATH="" DB_URL_ENV=""
-WS_ID="" WS_REV="" WS_DIGEST=""
+WS_ID="" WS_REV="" WS_DIGEST="" SNAPSHOT_KEY=""
 
 usage() {
   cat << 'EOF'
@@ -47,6 +47,14 @@ Modes:
   --list          The open Mapping Plans, with their head revision, full
                   digest and whether that head is prepared. Use it to read the
                   three values the other modes need.
+  --year-coverage --snapshot-key <cs1.…>
+                  Per model year of ONE scoped snapshot: readable vs ambiguous
+                  candidates, and for every "from year Y onward" range whether
+                  the preparation's vocabulary gate (a unit is
+                  vocabulary_insufficient when ambiguous > readable in the
+                  plan's range) would pass. Use it to choose a plan range the
+                  reviewed vocabulary can read -- nothing about normalization
+                  changes.
 
 Options:
   --work-scope-id <uuid>
@@ -68,6 +76,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --schema-only) MODE="schema"; shift ;;
     --list) MODE="list"; shift ;;
+    --year-coverage) MODE="years"; shift ;;
+    --snapshot-key) SNAPSHOT_KEY="${2:?}"; shift 2 ;;
     --work-scope-id) WS_ID="${2:?}"; shift 2 ;;
     --work-scope-revision) WS_REV="${2:?}"; shift 2 ;;
     --work-scope-digest) WS_DIGEST="${2:?}"; shift 2 ;;
@@ -82,6 +92,10 @@ if [[ -z "$DB_URL_ENV" ]]; then
   CONFIG_PATH="$(milo_operator_config_path "$REPO_ROOT" "$MILO_OPERATOR_CONFIG_PATH")"
   milo_load_operator_config "$CONFIG_PATH" || exit 2
   DB_URL_ENV="$(milo_op READONLY_DATABASE_URL_ENV)"
+fi
+if [[ "$MODE" == "years" ]]; then
+  [[ "$SNAPSHOT_KEY" =~ ^cs1\.[0-9a-f]{32}$ ]] \
+    || { printf 'FAIL: --year-coverage needs --snapshot-key cs1.<32 hex> (a UNIT line or NEXT_BATCH_SNAPSHOT_KEY names it)\n' >&2; exit 2; }
 fi
 if [[ "$MODE" == "scoped" ]]; then
   [[ "$WS_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
@@ -136,6 +150,7 @@ q() {
   psql "$DB_URL" -X -A -t -F'|' -v ON_ERROR_STOP=1 \
     -v ws_id="$WS_ID" -v ws_rev="$WS_REV" -v ws_digest="$WS_DIGEST" \
     -v prep_id="${PREP_ID:-}" -v resource_id="$MILO_CAPTURE_RESOURCE_ID" \
+    -v snapshot_key="$SNAPSHOT_KEY" \
     -v rpcs="$(IFS=,; printf '%s' "${MILO_WORK_SCOPE_RPCS[*]}")" \
     -v tables="$(IFS=,; printf '%s' "${MILO_WORK_SCOPE_TABLES[*]}")" \
     2> /dev/null <<< "$1"
@@ -211,46 +226,51 @@ check_schema() {
 }
 
 # An ORPHANED scoped snapshot: a Government WLTP capture declaring a scope that
-# was opened and never finished -- pending, not activated -- by a run. Because
-# a snapshot key is derived from content, the next capture of the same
-# register content lands on that very row, so an unprepared revision's
-# preparation either ADOPTS it (its owner ended failed / cancelled / timed_out
-# and holds no live lease: 20260924000200) or fails late with
-# GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN (its owner is still live, or ended any
-# other way). Stated BEFORE a capture is attempted, never discovered after one.
+# was opened and never finished -- pending, not activated. Because a snapshot
+# key is derived from content, the next capture of the same register content
+# lands on that very row, so an unprepared revision's preparation either
+# ADOPTS it (its CURRENT writer -- the latest adopter, else the run that opened
+# it -- ended failed / cancelled / timed_out and holds no live lease:
+# 20260924000200) or fails late with GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN. Stated
+# BEFORE a capture is attempted, never discovered after one. The writer is
+# resolved inline (a read-only role may not execute the service functions).
 check_orphaned_snapshots() {
-  local rows sid skey scope_key owner owner_status stored declared adoptable n=0 blocked=""
+  local rows sid skey scope_key writer writer_status stored declared adoptable n=0 blocked=""
   if ! rows="$(q "
-    select s.id, s.snapshot_key,
-           left(coalesce(s.retrieval_metadata->'capture_scope'->>'scope_key', ''), 16),
-           s.created_by_run_id, coalesce(r.status, 'missing'),
-           s.stored_record_count::text, s.declared_record_count::text,
+    select o.id, o.snapshot_key, o.scope_key, o.writer, coalesce(r.status, 'missing'),
+           o.stored, o.declared,
            (coalesce(r.status in ('failed', 'cancelled', 'timed_out'), false)
             and (r.lease_expires_at is null or r.lease_expires_at <= now()))::text
-      from public.catalog_source_snapshots s
-      left join public.runs r on r.id = s.created_by_run_id
-     where s.source_family = 'government'
-       and s.resource_id = :'resource_id'
-       and s.retrieval_metadata ? 'capture_scope'
-       and s.activated_at is null
-       and s.validation_state = 'pending'
-     order by s.created_at
+      from (select s.id, s.snapshot_key, s.created_at,
+                   left(coalesce(s.retrieval_metadata->'capture_scope'->>'scope_key', ''), 16) as scope_key,
+                   coalesce((select a.adopted_by_run_id from public.catalog_snapshot_adoptions a
+                              where a.snapshot_id = s.id order by a.adoption_seq desc limit 1),
+                            s.created_by_run_id) as writer,
+                   s.stored_record_count::text as stored, s.declared_record_count::text as declared
+              from public.catalog_source_snapshots s
+             where s.source_family = 'government'
+               and s.resource_id = :'resource_id'
+               and s.retrieval_metadata ? 'capture_scope'
+               and s.activated_at is null
+               and s.validation_state = 'pending') o
+      left join public.runs r on r.id = o.writer
+     order by o.created_at
      limit 20;")"; then
     fact ORPHANED_SNAPSHOTS UNVERIFIED "the pending scoped snapshot query failed"
     return
   fi
-  while IFS='|' read -r sid skey scope_key owner owner_status stored declared adoptable; do
+  while IFS='|' read -r sid skey scope_key writer writer_status stored declared adoptable; do
     [[ -n "$sid" ]] || continue
     n=$((n + 1))
-    printf 'ORPHANED_SCOPED_SNAPSHOT id=%s key=%s scope_key=%s owner_run=%s owner_status=%s stored=%s declared=%s adoptable=%s\n' \
-      "$sid" "$skey" "$scope_key" "$owner" "$owner_status" "$stored" "$declared" \
+    printf 'ORPHANED_SCOPED_SNAPSHOT id=%s key=%s scope_key=%s writer_run=%s writer_status=%s stored=%s declared=%s adoptable=%s\n' \
+      "$sid" "$skey" "$scope_key" "$writer" "$writer_status" "$stored" "$declared" \
       "$([[ "$adoptable" == "true" ]] && echo yes || echo no)"
-    [[ "$adoptable" == "true" ]] || blocked+="${skey} (owner ${owner} is ${owner_status}); "
+    [[ "$adoptable" == "true" ]] || blocked+="${skey} (writer ${writer} is ${writer_status}); "
   done <<< "$rows"
   if [[ -n "$blocked" ]]; then
-    fact ORPHANED_SNAPSHOTS NO "a pending scoped snapshot is owned by a run that is still live or did not fail, so a capture of the same content cannot land or adopt it (GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN): ${blocked%; }. Let that run finish, or resolve it through the run lifecycle tools, before preparing"
+    fact ORPHANED_SNAPSHOTS NO "a pending scoped snapshot is written by a run that is still live or did not fail, so a capture of the same content cannot land or adopt it (GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN): ${blocked%; }. Let that run finish, or resolve it through the run lifecycle tools, before preparing"
   elif [[ "$n" -gt 0 ]]; then
-    fact ORPHANED_SNAPSHOTS VERIFIED "${n} orphaned pending scoped snapshot(s), each owned by a run that ended failed/cancelled/timed_out with no live lease: the next preparation ADOPTS one if its capture reproduces that content, and completes it through the same idempotent writes and completeness gate"
+    fact ORPHANED_SNAPSHOTS VERIFIED "${n} orphaned pending scoped snapshot(s), each written by a run that ended failed/cancelled/timed_out with no live lease: the next preparation ADOPTS one if its capture reproduces that content, and completes it through the same idempotent writes and completeness gate"
   else
     fact ORPHANED_SNAPSHOTS VERIFIED "no pending scoped Government snapshot is waiting"
   fi
@@ -284,9 +304,64 @@ list_plans() {
   fact WORK_SCOPE_LIST VERIFIED "${n} open plan(s)"
 }
 
+# The vocabulary gate, year by year, for one snapshot. The same counts
+# `prepare_work_scope_queue` takes over a plan's range (readable = status other
+# than ambiguous, eligible = status candidate), per model_year_start, plus the
+# running totals for every "from year Y onward" range (no upper bound).
+year_coverage() {
+  local head rows sid active vstate total y readable ambiguous eligible cr ca ce verdict
+  if ! head="$(q "
+    select s.id, (s.activated_at is not null)::text, s.validation_state,
+           (select count(*) from public.catalog_candidate_variants c where c.snapshot_id = s.id)::text
+      from public.catalog_source_snapshots s
+     where s.source_family = 'government' and s.snapshot_key = :'snapshot_key';")"; then
+    fact YEAR_COVERAGE UNVERIFIED "the snapshot query failed"
+    return
+  fi
+  if [[ -z "$head" ]]; then
+    fact YEAR_COVERAGE NO "no Government snapshot ${SNAPSHOT_KEY} exists"
+    return
+  fi
+  IFS='|' read -r sid active vstate total <<< "$head"
+  printf 'SNAPSHOT id=%s key=%s active=%s validation_state=%s candidates=%s\n' \
+    "$sid" "$SNAPSHOT_KEY" "$active" "$vstate" "$total"
+  if ! rows="$(q "
+    with per as (
+      select c.model_year_start as y,
+             count(*) filter (where c.status <> 'ambiguous') as readable,
+             count(*) filter (where c.status = 'ambiguous') as ambiguous,
+             count(*) filter (where c.status = 'candidate') as eligible
+        from public.catalog_candidate_variants c
+        join public.catalog_source_snapshots s on s.id = c.snapshot_id
+       where s.snapshot_key = :'snapshot_key' and c.model_year_start is not null
+       group by c.model_year_start)
+    select y::text, readable::text, ambiguous::text, eligible::text,
+           (sum(readable) over w)::text, (sum(ambiguous) over w)::text, (sum(eligible) over w)::text
+      from per
+    window w as (order by y desc rows between unbounded preceding and current row)
+     order by y;")"; then
+    fact YEAR_COVERAGE UNVERIFIED "the per-year query failed"
+    return
+  fi
+  while IFS='|' read -r y readable ambiguous eligible cr ca ce; do
+    [[ -n "$y" ]] || continue
+    if (( ca > cr )); then verdict="vocabulary_insufficient"
+    elif (( ce == 0 )); then verdict="passes_but_queues_nothing"
+    else verdict="passes"; fi
+    printf 'YEAR %s readable=%s ambiguous=%s eligible=%s | FROM_%s_ONWARD readable=%s ambiguous=%s eligible=%s gate=%s\n' \
+      "$y" "$readable" "$ambiguous" "$eligible" "$y" "$cr" "$ca" "$ce" "$verdict"
+  done <<< "$rows"
+  if [[ "$active" != "true" ]]; then
+    fact YEAR_COVERAGE VERIFIED "counted from a snapshot that is NOT active; a preparation reads only an active one, so these counts are what it will see once the snapshot is activated"
+  else
+    fact YEAR_COVERAGE VERIFIED "per-year counts of the active snapshot; a plan range passes the vocabulary gate when its ambiguous count is not above its readable count"
+  fi
+}
+
 case "$MODE" in
   schema) check_schema; finish ;;
   list) list_plans; finish ;;
+  years) year_coverage; finish ;;
 esac
 
 check_schema

@@ -74,7 +74,7 @@ producing an incomplete sequence.
 | ts | `20260922000100_catalog_work_scopes.sql` | Scoped catalog PR1: the canonical, server-owned mapping PLAN. `catalog_work_scopes` (one row per plan, its head revision and digest, at most one OPEN plan per conversation by a partial unique index) and `catalog_work_scope_revisions` (append-only, numbered without gaps, the canonical record stored as TEXT with `digest = sha256(text)` and `scope = text::jsonb` held by CHECK constraints, and the record's shape and hard bounds -- batch size at most 20, limit at most 2000 -- held by `catalog_work_scope_record_valid`). `create_work_scope` and `revise_work_scope` derive the project and digest, re-check membership and the trusted `swarm_v2` workflow, and refuse a revision whose expected head revision or digest is not the current one (`WORK_SCOPE_STALE`). `catalog_canonical_manufacturer_coverage` is a bounded read of exact canonical variant counts per register marque plus the catalog total. Drafts only: no status but `draft`, no snapshot column, no relation to `runs`. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/` |
 | ts | `20260923000100_catalog_work_scope_preparation.sql` | Scoped catalog PR2: a Mapping Plan revision becomes durable WORK. A CHECK on `catalog_source_snapshots` (`catalog_capture_scope_consistent`) holds a scoped snapshot's declared `capture_scope` to the query it recorded (one register marque, `scope_key = sha256(query.filters)`); every existing row declares none and passes. `catalog_work_scope_preparations` (one per revision), `catalog_work_scope_units`, `catalog_work_scope_batches` (1-20 candidates, one unit and so one snapshot each), `catalog_work_scope_queue_items` and `catalog_work_scope_batch_runs` -- all append-only by trigger. `prepare_work_scope_queue` is lease-guarded and accepts ONLY an `operator_capture` run, refuses a stale head (`WORK_SCOPE_STALE`), counts every unit from its snapshot's own rows, records a mostly-`ambiguous` unit as `vocabulary_insufficient`, and materializes the deterministic queue in one transaction. `bind_work_scope_batch_run` is the batch<->run compare-and-set (one live batch per plan, never a stale revision, never a completed batch twice); `work_scope_batch_for_run` is the worker's read of its exact batch. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/preparation.py` |
 | ts | `20260924000100_catalog_work_scope_batch_runs.sql` | Scoped catalog PR3: a prepared batch becomes a RUN, and a plan's progress is read back. `catalog_work_scope_controls` is the plan's append-only pause / resume history (numbered without gaps, alternating from `pause`, held by a BEFORE-INSERT trigger), written only by `set_work_scope_paused`. `create_work_scope_batch_run` is the ONE start of a batch: under the plan's row lock it replays the same idempotency key, refuses a stale head or batch (`WORK_SCOPE_STALE`), a paused plan (`WORK_SCOPE_PAUSED`), a second live batch (`WORK_SCOPE_BATCH_IN_PROGRESS` -- a request for the batch already running answers with that run), a settled batch and any batch but the NEXT one (`WORK_SCOPE_BATCH_NOT_NEXT`), then calls `create_message_and_run_v3` and `bind_work_scope_batch_run` in the same transaction. `bind_work_scope_batch_run` is restated with the same signature: a paused plan binds nothing, batches bind in order, and a batch whose run ended `completed` OR `partial_success` is settled and never bound again. `work_scope_progress` derives each batch's state from its bound runs' durable status and its promoted / refused counts from their promotion events. Service-path only; additive and forward-only. Mirrors `backend/catalog/scope/batches.py` |
-| ts | `20260924000200_catalog_ingestion_recovery.sql` | Catalog ingestion recovery (incident 2026-09-24): `catalog_snapshot_adoptions`, an append-only audit of "run B took over the PENDING snapshot S from run A", admitted by a BEFORE-INSERT trigger only when S is pending (not activated, not `failed`), A is S's owner and ended `failed` / `cancelled` / `timed_out` with no live lease, and B is a live `operator_capture` run. `forbid_catalog_snapshot_rewrite` is restated with exactly one exception: `created_by_run_id` may move to the adopter an adoption row of the SAME transaction names; every other column, and every active or failed snapshot, stays frozen. `adopt_catalog_snapshot_guarded` (lease-guarded, operator capture only, idempotent) holds the caller to the snapshot's identity, declared capture scope and normalization summary. `record_catalog_raw_records_batch_guarded` / `record_catalog_candidates_batch_guarded` apply the unchanged single-row writes to 1-500 rows of ONE snapshot in one transaction (the candidate batch also requires the caller's own pending snapshot). Service-path only; additive and forward-only. Mirrors `backend/catalog/government/ingest.py` |
+| ts | `20260924000200_catalog_ingestion_recovery.sql` | Catalog ingestion recovery (incident 2026-09-24). ONE snapshot write authority: `assert_snapshot_write_authority(snapshot, run)` locks the snapshot, resolves its CURRENT writer (the latest adopter in `catalog_snapshot_adoptions`, else `created_by_run_id`, which stays immutable), refuses anyone else with the existing message `this catalog snapshot does not belong to this run`, and refuses a failed or active snapshot (activation's idempotent replay aside). `record_catalog_raw_record_guarded` and `activate_catalog_snapshot_guarded` are restated over it with unchanged signatures and messages; `record_catalog_candidate_guarded` is untouched. `catalog_snapshot_adoptions(snapshot_id, adoption_seq, adopted_by_run_id, previous_writer_run_id, adopted_at)` is append-only, unique on (snapshot, seq) and (snapshot, adopter), numbered and admitted by a BEFORE-INSERT trigger only for a pending snapshot whose current writer ended `failed` / `cancelled` / `timed_out` with no live lease, adopted by a live `operator_capture` run. `adopt_catalog_snapshot_guarded` (lease-guarded, idempotent) also writes a `catalog_snapshot_adopted` run event. `record_catalog_raw_records_batch_guarded` / `record_catalog_candidates_batch_guarded` apply the unchanged single-row writes to 1-500 rows of one snapshot in one transaction and answer `{rows, inserted, already_present}`. Service-path only; additive and forward-only. Mirrors `backend/catalog/government/ingest.py` |
 
 All migrations are forward-only and data-preserving. Most are additive; Console 6 deliberately removes only superseded RPC definitions so there is one run-creation authority. There are no destructive table/data down-migrations, by policy (`scripts/check_migrations.py` forbids `drop table` and data deletes).
 
@@ -208,19 +208,38 @@ no existing relation depends on them.
 ### Catalog ingestion recovery — migration and rollback impact
 
 `20260924000200_catalog_ingestion_recovery.sql` adds one relation
-(`catalog_snapshot_adoptions`), its two triggers and three RPCs, and restates
-the trigger function `forbid_catalog_snapshot_rewrite` (same trigger, same
-name). It rewrites no row and backfills nothing.
+(`catalog_snapshot_adoptions`), its two triggers, two helper functions
+(`catalog_snapshot_current_writer`, `assert_snapshot_write_authority`) and
+three RPCs, and restates `record_catalog_raw_record_guarded` and
+`activate_catalog_snapshot_guarded` with their signatures, answers and
+messages unchanged. It rewrites no row and backfills nothing.
+`created_by_run_id` and `forbid_catalog_snapshot_rewrite` are not touched.
 
 Why adoption, and not "mark the orphan failed and capture a new snapshot":
 the snapshot key is derived from the captured content and is unique
 (`catalog_source_snapshots_key_uidx`, and `catalog_source_snapshots_natural_uidx`
 on the content digest), so a new snapshot of the same content cannot exist;
 and `failed` is terminal, so marking the orphan failed would make that
-register content unactivatable until the register itself changed. Adoption
-keeps both rules and adds one audited transition: the previous owner is kept
-on the adoption row forever, and the adopter re-submits every row through the
-existing idempotent writes before the existing completeness gate activates it.
+register content unactivatable until the register itself changed.
+
+One write authority: every guarded write that decides who may write a
+snapshot calls `assert_snapshot_write_authority`. `scripts/check_migrations.py`
+refuses a direct `created_by_run_id` ownership comparison anywhere else in
+this or a later migration, and the executable suite checks the same on the
+effective function definitions.
+
+Mixed versions: the migration is applied while the previous release still
+serves. That release lands captures only through the single-row RPCs, whose
+behaviour for a snapshot nobody adopted is unchanged (the current writer IS
+the creator). `tests/test_migrations_postgres.py::test_the_serving_release_single_row_ingestion_still_works_on_the_new_schema`
+runs exactly that path on the migrated schema.
+
+Batch cost (measured on PostgreSQL 16 in the executable suite, local, not on
+Supabase): one 200-row raw-record call with register-shaped rows carries a
+~620 KB request body and took 0.36 s end to end; one 200-row candidate call
+~95 KB and 0.16 s. Supabase's documented statement timeout for the role these
+RPCs run as is 8 s (`service_role` inherits `authenticator`'s). No Supabase
+REST request-size limit is documented; PostgREST sets none by default.
 
 Privileges: RLS on, no policies; `PUBLIC`, `anon` and `authenticated` have
 nothing; `service_role` gets `SELECT, INSERT` on the new relation and never
@@ -230,16 +249,14 @@ new function is `EXECUTE` for `service_role` alone.
 Rerun safety: `create table if not exists`, `create ... index if not exists`,
 `create or replace` and drop-then-create triggers.
 
-Deployment order: apply BEFORE the release that calls the batch and adoption
-RPCs runs a capture. The capture job's ingestion calls them on every write;
-`work-scope-readiness.sh` reports `WORK_SCOPE_SCHEMA=NO` naming them until the
-migration is applied.
+Event registry: `catalog_snapshot_adopted` joins the projection-less
+OPERATIONAL set, which changes the event-registry fingerprint that new run
+identities carry (runs created before this release keep theirs).
 
-Rollback: the previous release keeps working against this schema (the
-single-row RPCs are unchanged). A forward corrective migration could drop the
-three functions and the relation; `created_by_run_id` values moved by an
-adoption stay moved, and the adoption rows are the record of who owned each
-snapshot before.
+Rollback: the previous release keeps working against this schema. A forward
+corrective migration could drop the relation and the new functions and
+restate the two writes without the authority; adoption rows are the record
+of who wrote each snapshot after its creator.
 
 ### Scoped catalog PR3 (batch runs) — migration and rollback impact
 

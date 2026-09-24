@@ -280,8 +280,10 @@ direct insert, and no function or table name assembled from data.
   halfway. An ORPHANED one — pending, its owner ended `failed` / `cancelled` /
   `timed_out` with no live lease — is adopted by an operator capture run and
   finished through the same idempotent writes and completeness gate
-  (`20260924000200_catalog_ingestion_recovery.sql`; the previous owner is kept
-  in `catalog_snapshot_adoptions`).
+  (`20260924000200_catalog_ingestion_recovery.sql`). `created_by_run_id` never
+  changes; the adopter becomes the snapshot's current writer through an
+  append-only `catalog_snapshot_adoptions` row, and every write asks one
+  authority, `assert_snapshot_write_authority`.
 * **Changed content is a new snapshot.** A different capture derives a different
   `content_sha256`, so a different `snapshot_key` and a different row; the
   previous snapshot and all its raw records are untouched.

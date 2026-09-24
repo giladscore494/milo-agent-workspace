@@ -707,7 +707,7 @@ def test_an_adoptable_orphaned_snapshot_is_stated_and_the_preparation_proceeds(t
                            "MILO_TEST_ORPHAN": "adoptable"})
     assert result.returncode == 0, result.stdout + result.stderr
     assert ("ORPHANED_SCOPED_SNAPSHOT id=701ea334-beb6-4e66-afe8-ca3df4be3d2d" in result.stdout)
-    assert "owner_status=failed stored=6368 declared=6368 adoptable=yes" in result.stdout
+    assert "writer_status=failed stored=6368 declared=6368 adoptable=yes" in result.stdout
     assert "ORPHANED_SNAPSHOTS=VERIFIED (1 orphaned pending scoped snapshot(s)" in result.stdout
     assert "PROCEEDING" in result.stdout
 
@@ -718,7 +718,7 @@ def test_an_orphaned_snapshot_owned_by_a_live_run_stops_before_any_capture(tmp_p
     result = tree.run("production-activate.sh", *PREPARE,
                       env={"MILO_TEST_RO_DB_URL": "postgresql://ro@db.test/postgres",
                            "MILO_TEST_ORPHAN": "live"})
-    assert "owner_status=running" in result.stdout and "adoptable=no" in result.stdout
+    assert "writer_status=running" in result.stdout and "adoptable=no" in result.stdout
     assert "ORPHANED_SNAPSHOTS=NO" in result.stdout
     _stopped_before_any_capture(tree, result)
     assert "GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN" in result.stderr

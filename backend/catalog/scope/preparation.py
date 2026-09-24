@@ -46,7 +46,7 @@ vocabulary cannot read stay `ambiguous` and are never queued.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 from uuid import UUID
 
@@ -106,9 +106,15 @@ class UnitCapture:
     #: failed run left for exactly this content and finished it), or `none`
     #: when nothing was captured for the unit.
     capture: str = "none"
-    #: The run the unit's snapshot was adopted from, when `capture` is
-    #: `adopted`; durable in `catalog_snapshot_adoptions` as well.
+    #: The run the unit's snapshot was adopted from (its previous writer),
+    #: when `capture` is `adopted`; durable in `catalog_snapshot_adoptions`
+    #: and as a `catalog_snapshot_adopted` run event as well.
     adopted_from_run_id: str = ""
+    adoption_seq: int = 0
+    #: What landing the unit's capture cost, per phase (counts and seconds
+    #: only; `backend.catalog.government.ingest.new_metrics`). Empty when
+    #: nothing was ingested (unchanged register, unverified marque).
+    ingestion: Mapping[str, Any] = field(default_factory=dict)
 
     def submission(self) -> dict[str, Any]:
         """The unit exactly as `prepare_work_scope_queue` accepts it."""
@@ -195,7 +201,9 @@ def capture_unit(repository: Any, lease: Any, *, client: Any, unit_key: str, pri
         snapshot_key=str(row["snapshot_key"]), reason_code=reason,
         capture=_refresh_state(outcome),
         adopted_from_run_id=(outcome.report.adopted_from_run_id
-                             if outcome.report is not None else ""))
+                             if outcome.report is not None else ""),
+        adoption_seq=outcome.report.adoption_seq if outcome.report is not None else 0,
+        ingestion=dict(outcome.report.ingestion) if outcome.report is not None else {})
 
 
 def prepare_work_scope(repository: Any, lease: Any, *, client: Any, work_scope_id: str,

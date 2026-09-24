@@ -252,14 +252,16 @@ else
 fi
 
 # --- informational: orphaned scoped snapshots ------------------------------
-# A pending scoped Government snapshot whose owning run ended. The next
+# A pending scoped Government snapshot whose writing run ended. The next
 # preparation of the same register content ADOPTS it (20260924000200) when that
 # run ended failed/cancelled/timed_out with no live lease; work-scope-readiness
 # states each one, and refuses a preparation it would collide with.
 if orphaned="$(psql_value "select count(*) || '|' || count(*) filter (where r.status in ('failed','cancelled','timed_out')
             and (r.lease_expires_at is null or r.lease_expires_at <= now()))
        from public.catalog_source_snapshots s
-       left join public.runs r on r.id = s.created_by_run_id
+       left join public.runs r on r.id = coalesce(
+            (select a.adopted_by_run_id from public.catalog_snapshot_adoptions a
+              where a.snapshot_id = s.id order by a.adoption_seq desc limit 1), s.created_by_run_id)
       where s.source_family = 'government' and s.activated_at is null
         and s.validation_state = 'pending' and s.retrieval_metadata ? 'capture_scope'
         and (r.id is null or r.status in ('completed','partial_success','failed','cancelled','timed_out','budget_exhausted'));")"; then

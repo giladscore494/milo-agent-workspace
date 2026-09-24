@@ -22,6 +22,7 @@ contract:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -193,18 +194,79 @@ def _raw_record(index: int) -> dict[str, Any]:
 
 def test_a_raw_record_batch_is_one_bounded_call_answered_row_for_row():
     rows = [{"id": str(uuid4())} for _ in range(3)]
-    client = _ScriptedClient(rows)
+    client = _ScriptedClient({"rows": rows, "inserted": 2, "already_present": 1})
     repository = _repository(client, [])
     assert repository.record_catalog_raw_records(RUN, [_raw_record(i) for i in range(3)],
-                                                 **LEASE) == rows
+                                                 **LEASE) == \
+        {"rows": rows, "inserted": 2, "already_present": 1}
     (name, params), = client.calls
     assert name == "record_catalog_raw_records_batch_guarded"
     assert len(params["p_records"]) == 3
     assert all(record["record_key"].startswith("cr1.") for record in params["p_records"])
-    # A short answer is never taken as a complete batch.
-    short = _repository(_ScriptedClient(rows[:2]), [])
+    # A short or inconsistent answer is never taken as a complete batch.
+    for answer in ({"rows": rows[:2], "inserted": 2, "already_present": 0},
+                   {"rows": rows, "inserted": 3, "already_present": 1},
+                   rows):
+        wrong = _repository(_ScriptedClient(answer), [])
+        with pytest.raises(RepositoryFailure):
+            wrong.record_catalog_raw_records(RUN, [_raw_record(i) for i in range(3)], **LEASE)
+
+
+def test_the_batch_size_is_a_fixed_server_constant():
+    from backend.catalog import contracts
+    assert contracts.CATALOG_WRITE_BATCH_SIZE == 200
+    assert contracts.MAX_CATALOG_WRITE_BATCH == 500
+    # No environment variable or argument can move it: nothing reads one.
+    source = Path(ingest_module.__file__).read_text(encoding="utf-8") + Path(
+        contracts.__file__).read_text(encoding="utf-8")
+    assert "os.environ" not in source and "getenv" not in source
+
+
+def test_a_failed_guarded_rpc_logs_its_class_code_and_status_and_nothing_else(caplog):
+    """Server logs name WHAT failed -- the chained cause's class, its PostgREST
+    code and the HTTP status -- and never the message, details, hint or
+    payload, which can quote SQL, URLs and credentials."""
+    client = _ScriptedClient(*[_api_error("PGRST003")] * CATALOG_WRITE_ATTEMPTS)
+    repository = _repository(client, [])
+    import threading
+    repository._http = threading.local()
+    caplog.set_level("WARNING", logger="milo.repository")
+    original = client.rpc
+
+    def rpc_with_status(name, params):
+        repository._http.status = 504
+        return original(name, params)
+    client.rpc = rpc_with_status
     with pytest.raises(RepositoryFailure):
-        short.record_catalog_raw_records(RUN, [_raw_record(i) for i in range(3)], **LEASE)
+        repository.activate_catalog_snapshot(RUN, ACTIVATION, **LEASE)
+    lines = [record.getMessage() for record in caplog.records]
+    assert len(lines) == CATALOG_WRITE_ATTEMPTS
+    assert lines[0] == ("guarded rpc failed function=activate_catalog_snapshot_guarded "
+                        "cause=APIError code=PGRST003 http_status=504 class=transient "
+                        "attempt=1/4 action=retry")
+    assert lines[-1].endswith("attempt=4/4 action=raise")
+    rendered = "\n".join(lines)
+    for secret in (SQL_SENTINEL, URL_SENTINEL, "LEAKED", "token", "{"):
+        assert secret not in rendered
+
+
+def test_a_transport_failure_is_logged_without_a_code():
+    import logging
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logger = logging.getLogger("milo.repository")
+    logger.addHandler(handler)
+    try:
+        client = _ScriptedClient(httpx.ConnectError("refused " + URL_SENTINEL))
+        with pytest.raises(RepositoryFailure):
+            _repository(client, []).heartbeat(RUN, "w", attempt=1, lease_token="t")
+    finally:
+        logger.removeHandler(handler)
+    (line,) = [record.getMessage() for record in records]
+    assert "cause=ConnectError code=none http_status=none class=transient" in line
+    assert URL_SENTINEL not in line
 
 
 @pytest.mark.parametrize("size", [0, 501])
@@ -401,7 +463,7 @@ class _Counting(MemoryRepository):
         return super().record_catalog_raw_record(*args, **kwargs)
 
 
-def test_ingestion_writes_rows_in_bounded_batches(monkeypatch):
+def test_ingestion_writes_rows_in_bounded_batches_and_measures_them(monkeypatch):
     monkeypatch.setattr(ingest_module, "CATALOG_WRITE_BATCH_SIZE", 5)
     repository = _Counting()
     report = _ingest(repository, _leased(repository), committed_records(12))
@@ -414,10 +476,18 @@ def test_ingestion_writes_rows_in_bounded_batches(monkeypatch):
     positions = sorted((row["source_locator"] or {}).get("capture_index")
                        for row in repository.catalog_raw_records.values())
     assert positions == list(range(12))
+    metrics = report.ingestion
+    assert (metrics["snapshot"]["calls"], metrics["raw"]["calls"],
+            metrics["candidates"]["calls"], metrics["activate"]["calls"]) == (1, 3, 3, 1)
+    assert (metrics["raw"]["inserted"], metrics["raw"]["already_present"]) == (12, 0)
+    assert metrics["candidates"]["inserted"] == len(repository.catalog_candidates)
+    assert metrics["total_calls"] == 8
+    assert (metrics["adoption_seq"], metrics["previous_writer_run_id"]) == (0, "")
+    assert all(metrics[phase]["seconds"] >= 0 for phase in ingest_module.INGESTION_PHASES)
 
 
 # =============================================================================
-# 7. adoption, at the ingestion level
+# 7. adoption, at the ingestion level (memory repository parity)
 # =============================================================================
 
 def _expire(repository: MemoryRepository, run_id: Any, status: str) -> None:
@@ -427,42 +497,112 @@ def _expire(repository: MemoryRepository, run_id: Any, status: str) -> None:
 
 
 class _FailingCandidates(MemoryRepository):
+    """Candidate batches fail from the `fail_on`-th one: the 2026-09-24 shape,
+    every raw record durable and only a PREFIX of the candidates."""
     fail = True
+    fail_on = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.candidate_batches = 0
 
     def record_catalog_candidates(self, run_id, candidates, **kwargs):
-        if self.fail:
+        self.candidate_batches += 1
+        if self.fail and self.candidate_batches >= self.fail_on:
             raise RepositoryFailure("transient")
         return super().record_catalog_candidates(run_id, candidates, **kwargs)
 
 
-def test_an_orphan_is_adopted_and_finished_without_a_duplicate_row():
+def _candidate_identity(row: dict[str, Any]) -> tuple:
+    return tuple(row[field] for field in ("id", "candidate_key", "raw_record_id", "manufacturer",
+                                          "commercial_model", "model_year_start",
+                                          "model_year_end", "official_model_code", "trim"))
+
+
+def test_the_incident_replayed_in_the_memory_repository(monkeypatch):
+    """All raw records and a prefix of the candidates durable, the writer
+    failed with an expired lease: an operator capture run adopts, completes
+    and activates. The pre-existing candidates keep their ids, keys and
+    identity; the missing ones are added; nothing is counted twice; the
+    snapshot's creator never changes; the adoption row and the run event are
+    recorded."""
+    monkeypatch.setattr(ingest_module, "CATALOG_WRITE_BATCH_SIZE", 5)
     repository = _FailingCandidates()
+    repository.fail_on = 3                                  # 2 of 3 batches land
     records = committed_records(12)
     first = _leased(repository)
     with pytest.raises(RepositoryFailure):
         _ingest(repository, first, records)
-    orphan = next(iter(repository.catalog_snapshots.values()))
+    orphan = dict(next(iter(repository.catalog_snapshots.values())))
+    before = {key: _candidate_identity(row) for key, row in repository.catalog_candidates.items()}
     assert orphan["stored_record_count"] == 12 and orphan["activated_at"] is None
+    assert 0 < len(before) < 12
 
     repository.fail = False
     second = _leased(repository)
-    # While the owner is live, nothing is adopted.
+    # While the writer is live, nothing is adopted.
     with pytest.raises(GovernmentIngestionError) as refusal:
         _ingest(repository, second, records)
     assert refusal.value.reason_code == "GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN"
+    assert repository.catalog_snapshot_adoptions == []
 
     _expire(repository, first.run_id, "failed")
     report = _ingest(repository, second, records)
-    assert report.adopted_from_run_id == str(first.run_id)
-    assert report.created_by_run_id == str(second.run_id)
-    assert report.activated and report.stored_record_count == 12
-    assert len(repository.catalog_raw_records) == 12
-    assert len(repository.catalog_snapshots) == 1
-    assert repository.catalog_snapshot_adoptions == [{
-        **repository.catalog_snapshot_adoptions[0],
-        "snapshot_id": orphan["id"], "previous_run_id": str(first.run_id),
-        "adopted_by_run_id": str(second.run_id), "previous_run_status": "failed",
-        "stored_record_count_at_adoption": 12}]
+    snapshot = next(iter(repository.catalog_snapshots.values()))
+    assert report.activated and snapshot["activated_at"] is not None
+    assert report.stored_record_count == snapshot["stored_record_count"] == 12
+    assert len(repository.catalog_raw_records) == 12 and len(repository.catalog_snapshots) == 1
+    # The creator is provenance and never moves; the adoption made `second`
+    # the writer.
+    assert snapshot["created_by_run_id"] == report.created_by_run_id == str(first.run_id)
+    assert report.adopted_from_run_id == str(first.run_id) and report.adoption_seq == 1
+    after = {key: _candidate_identity(row) for key, row in repository.catalog_candidates.items()}
+    assert {key: after[key] for key in before} == before
+    assert len(after) == 12
+    metrics = report.ingestion
+    assert (metrics["raw"]["inserted"], metrics["raw"]["already_present"]) == (0, 12)
+    assert (metrics["candidates"]["inserted"], metrics["candidates"]["already_present"]) == \
+        (12 - len(before), len(before))
+    assert (metrics["adoption_seq"], metrics["previous_writer_run_id"]) == (1, str(first.run_id))
+    (adoption,) = repository.catalog_snapshot_adoptions
+    assert {key: adoption[key] for key in ("snapshot_id", "adoption_seq", "adopted_by_run_id",
+                                           "previous_writer_run_id")} == \
+        {"snapshot_id": snapshot["id"], "adoption_seq": 1,
+         "adopted_by_run_id": str(second.run_id), "previous_writer_run_id": str(first.run_id)}
+    (event,) = [event for event in repository.run_events
+                if event["event_type"] == "catalog_snapshot_adopted"]
+    assert event["run_id"] == str(second.run_id)
+    assert event["payload"]["previous_writer_run_id"] == str(first.run_id)
+    assert event["payload"]["adoption_seq"] == 1
+    # The CREATOR is no longer the writer: the authority names the adopter.
+    with pytest.raises(AppError) as refused:
+        repository._catalog_write_authority(snapshot["id"], first.run_id, allow_decided=True)
+    assert refused.value.message == "this catalog snapshot does not belong to this run"
+    assert repository._catalog_write_authority(snapshot["id"], second.run_id,
+                                               allow_decided=True)["id"] == snapshot["id"]
+
+
+def test_the_write_authority_follows_the_latest_adoption():
+    repository = _FailingCandidates()
+    records = committed_records(4)
+    first = _leased(repository)
+    with pytest.raises(RepositoryFailure):
+        _ingest(repository, first, records)
+    _expire(repository, first.run_id, "failed")
+    second = _leased(repository)
+    with pytest.raises(RepositoryFailure):                 # second fails too
+        _ingest(repository, second, records)
+    _expire(repository, second.run_id, "cancelled")
+    repository.fail = False
+    third = _leased(repository)
+    report = _ingest(repository, third, records)
+    assert report.activated and report.adoption_seq == 2
+    assert report.adopted_from_run_id == str(second.run_id)
+    assert [(row["adoption_seq"], row["previous_writer_run_id"], row["adopted_by_run_id"])
+            for row in repository.catalog_snapshot_adoptions] == [
+        (1, str(first.run_id), str(second.run_id)), (2, str(second.run_id), str(third.run_id))]
+    snapshot = next(iter(repository.catalog_snapshots.values()))
+    assert snapshot["created_by_run_id"] == str(first.run_id)
 
 
 def test_only_an_operator_capture_run_adopts():
@@ -535,3 +675,81 @@ def test_the_incident_replayed_a_failed_capture_is_adopted_by_the_next_one(monke
     assert snapshot["snapshot_key"] == orphan["snapshot_key"]
     assert len(repository.catalog_raw_records) == 12
     assert repository.runs[str(second)]["status"] == "completed"
+    # The measurement the operator reads, counts and seconds only.
+    ingestion = snapshot["ingestion"]
+    assert (ingestion["adoption_seq"], ingestion["previous_writer_run_id"]) == (1, str(first))
+    assert (ingestion["raw"]["inserted"], ingestion["raw"]["already_present"]) == (0, 12)
+    assert ingestion["raw"]["calls"] == 1 and ingestion["activate"]["calls"] == 1
+    assert ingestion["snapshot"]["calls"] == 2              # the snapshot write and the adoption
+    assert ingestion["total_calls"] == sum(ingestion[phase]["calls"]
+                                           for phase in ("snapshot", "raw", "candidates", "activate"))
+
+
+# =============================================================================
+# 9. the static guard: one write authority
+# =============================================================================
+
+def _check_migrations():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "check_migrations.py"
+    spec = importlib.util.spec_from_file_location("check_migrations", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_committed_migrations_decide_snapshot_ownership_in_one_place():
+    module = _check_migrations()
+    migrations = Path(__file__).resolve().parents[1] / "supabase" / "migrations"
+    texts = {path.name: path.read_text(encoding="utf-8").lower()
+             for path in migrations.glob("*.sql")}
+    assert module.ownership_check_problems(texts) == []
+    # The authority itself does hold the check it is the home of.
+    recovery = texts["20260924000200_catalog_ingestion_recovery.sql"]
+    assert "created_by_run_id is distinct from p_run_id" in recovery
+
+
+@pytest.mark.parametrize("check", [
+    "if v_snapshot.created_by_run_id is distinct from p_run_id then",
+    "if v_snapshot.created_by_run_id <> p_run_id then",
+    "if p_run_id is distinct from v_snapshot.created_by_run_id then",
+    "where created_by_run_id = p_run_id",
+])
+def test_a_direct_ownership_check_outside_the_authority_is_refused(check):
+    module = _check_migrations()
+    text = ("create or replace function public.assert_snapshot_write_authority(p uuid)\n"
+            "returns void language plpgsql as $$ begin "
+            "if v_snapshot.created_by_run_id is distinct from p_run_id then null; end if; "
+            "end; $$;\n"
+            "create or replace function public.some_new_write(p uuid) returns void "
+            f"language plpgsql as $$ begin {check} null; end if; end; $$;\n")
+    problems = module.ownership_check_problems({"20260930000100_new.sql": text})
+    assert len(problems) == 1 and "outside assert_snapshot_write_authority" in problems[0]
+    # Migrations before the authority existed are history, not checked.
+    assert module.ownership_check_problems({"20260915120000_old.sql": text}) == []
+
+
+def test_the_real_client_reports_the_http_status_of_a_failed_rpc(caplog):
+    """End to end through supabase-py: the response hook sees the HTTP status
+    PostgREST answered, which its JSON error body does not carry."""
+    class _Settings:
+        supabase_url = "https://abcdefghijklmnopqrst.supabase.co"
+        supabase_service_role_key = "eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.x"
+
+    repository = SupabaseRepository(_Settings())
+    session = repository.client.postgrest.session
+    answers = iter([httpx.Response(503, text="<html>gateway " + URL_SENTINEL + "</html>"),
+                    httpx.Response(400, json={"code": "22023", "message": SQL_SENTINEL,
+                                              "details": URL_SENTINEL, "hint": None})])
+    session._transport = httpx.MockTransport(lambda request: next(answers))
+    session._mounts = {}                  # no proxy between the client and the mock
+    repository._retry_sleep = lambda _seconds: None
+    caplog.set_level("WARNING", logger="milo.repository")
+    with pytest.raises(RepositoryFailure) as failure:
+        repository.activate_catalog_snapshot(RUN, ACTIVATION, **LEASE)
+    assert failure.value.failure_class == "rejected"
+    lines = [record.getMessage() for record in caplog.records]
+    assert "cause=APIError code=503 http_status=503 class=transient attempt=1/4 action=retry" in lines[0]
+    assert "cause=APIError code=22023 http_status=400 class=rejected attempt=2/4 action=raise" in lines[1]
+    assert SQL_SENTINEL not in "\n".join(lines) and URL_SENTINEL not in "\n".join(lines)
