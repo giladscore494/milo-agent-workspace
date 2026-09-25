@@ -1437,14 +1437,15 @@ def test_a_pause_key_carries_a_duration_not_an_absolute_deadline():
 def test_the_profile_states_the_effective_provider_parallelism():
     """A queueing width of 4 is not four simultaneous provider calls."""
     from backend.provider_scheduler import ProviderLimitsConfig
-    from backend.tier2_profile import tier2_first_run_profile
+    from backend.runtime_policy import reviewed_first_run_policy
 
-    engines = tier2_first_run_profile()["active_profile"]["engine_active_concurrency"]
-    assert engines["effective_simultaneous_provider_calls"] == (
-        ProviderLimitsConfig().max_concurrency)
-    assert (engines["effective_simultaneous_provider_calls"]
-            < engines["vehicle_catalog_v1_technical_parallelism"]), (
-        "the profile no longer distinguishes queueing width from provider "
+    # Formerly read through backend/tier2_profile.py, which re-published these
+    # two policy values; asserted on the policy itself now.
+    policy = reviewed_first_run_policy()
+    effective = int(policy["provider_max_concurrency"])
+    assert effective == ProviderLimitsConfig().max_concurrency
+    assert effective < int(policy["v1_technical_parallelism"]), (
+        "the policy no longer distinguishes queueing width from provider "
         "concurrency, so the number can be read as a throughput estimate")
 
 
@@ -1462,7 +1463,6 @@ def test_the_profile_says_the_search_limiter_now_guards_the_v1_path():
 
     from backend.engines.vehicle_catalog_v1 import core as v1_core
     from backend.standalone_search import request_offers_provider_executed_search
-    from backend.tier2_profile import tier2_first_run_profile
 
     # V1 no longer BUILDS a provider-executed tool. The check is structural
     # rather than a text sweep: the module documents at length why the builtin
@@ -1473,12 +1473,13 @@ def test_the_profile_says_the_search_limiter_now_guards_the_v1_path():
     assert not request_offers_provider_executed_search(
         {"tools": v1_core.WEB_SEARCH_TOOL})
 
-    for endpoint in tier2_first_run_profile()["web_search_qps"].values():
-        # Still true, and still worth saying: these buckets never paced the
-        # builtin, which is why it could not be admitted one search at a time.
-        assert endpoint["guards_the_builtin_web_search_path"] is False
-        assert endpoint["builtin_web_search_offered_by_a_production_engine"] is False
-        # And now the part that changed.
-        assert endpoint["called_by_a_production_engine_today"] is True
-        assert endpoint["guards_the_v1_production_search_path"] is True
-        assert endpoint["run_volume_bound_admitted_before_execution"] is True
+    # The profile's statements about the search buckets (they never paced the
+    # builtin; they now guard V1's production search) live in
+    # docs/production-readiness/TIER2_FIRST_RUN_PROFILE.md, formerly
+    # backend/tier2_profile.py.
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "production-readiness"
+           / "TIER2_FIRST_RUN_PROFILE.md").read_text()
+    assert "never paced the provider-executed builtin" in doc
+    assert "nothing in production offers that builtin any more" in doc
+    assert "guard V1's production search path" in doc
+    assert "`max_search_invocations_per_run` before\nit executes" in doc

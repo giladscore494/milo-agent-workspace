@@ -323,79 +323,77 @@ def test_the_envelope_adds_no_route_and_imports_nothing():
 
 # =============================================================================
 # G. the Tier 2 first-run profile
+#
+# These pins used to be asserted through `backend/tier2_profile.py`, a
+# document module that only re-read the values below. The module is gone
+# (its prose is docs/production-readiness/TIER2_FIRST_RUN_PROFILE.md); the
+# same pins are now asserted directly on the authorities that own them: the
+# canonical runtime policy and the provider quota constants.
 # =============================================================================
 
-def test_the_profile_states_both_the_ceiling_and_the_lower_active_profile():
-    from backend.tier2_profile import tier2_first_run_profile
+def test_the_organization_ceiling_and_the_provider_limits_are_pinned():
+    from backend.provider_quota import (KIMI_TIER2_PROVIDER_LIMITS, MAX_INFERENCE_CONCURRENCY,
+                                        MAX_RPM, MAX_TPD, MAX_TPM)
 
-    profile = tier2_first_run_profile()
-    ceiling = profile["milo_organization_ceiling"]
-    active = profile["active_profile"]
-    assert (ceiling["inference_concurrency"], ceiling["rpm"], ceiling["tpm"]) == \
-        (32, 80, 2_400_000)
-    assert profile["provider_limits"] == {
-        "inference_concurrency": 40, "rpm": 100, "tpm": 3_000_000, "tpd": "Unlimited"}
-    # The active profile is deliberately well below the ceiling.
-    assert active["rpm"] < ceiling["rpm"]
-    assert active["tpm"] < ceiling["tpm"]
-    assert active["engine_active_concurrency"]["swarm_v2_max_active_workers"] < \
-        ceiling["inference_concurrency"]
+    assert (MAX_INFERENCE_CONCURRENCY, MAX_RPM, MAX_TPM) == (32, 80, 2_400_000)
+    assert (KIMI_TIER2_PROVIDER_LIMITS["inference_concurrency"], KIMI_TIER2_PROVIDER_LIMITS["rpm"],
+            KIMI_TIER2_PROVIDER_LIMITS["tpm"]) == (40, 100, 3_000_000)
+    # TPD is Unlimited at Tier 2: no provider number, so no MILO ceiling either.
+    assert KIMI_TIER2_PROVIDER_LIMITS["tpd"] is None and MAX_TPD is None
 
 
-def test_the_profile_caps_the_first_paid_run_at_one_worker_execution():
-    from backend.tier2_profile import tier2_first_run_profile
+def test_the_active_profile_stays_well_below_the_ceiling():
+    from backend.provider_quota import MAX_INFERENCE_CONCURRENCY, MAX_RPM, MAX_TPM
+    from backend.runtime_policy import reviewed_first_run_policy
 
-    active = tier2_first_run_profile()["active_profile"]
-    assert active["first_paid_run_execution_cap"] == 1
-    assert active["max_simultaneous_provider_using_worker_executions"] == 1
-    assert active["no_automatic_relaunch_after_terminal_failure"] is True
-
-
-def test_the_profile_keeps_the_hard_money_cap_under_ten_dollars():
-    from backend.tier2_profile import tier2_first_run_profile
-
-    active = tier2_first_run_profile()["active_profile"]
-    assert active["hard_monetary_cap_usd"] < 10
-    assert active["hard_monetary_cap_usd"] == 3.00
-    assert active["recorded_cost_cap_usd"] <= active["hard_monetary_cap_usd"]
+    policy = reviewed_first_run_policy()
+    assert int(policy["provider_rpm_limit"]) < MAX_RPM
+    assert int(policy["provider_tpm_limit"]) < MAX_TPM
+    assert int(policy["v2_max_active_workers"]) < MAX_INFERENCE_CONCURRENCY
 
 
-def test_the_profile_does_not_raise_the_duration_limit_after_the_timeout():
-    from backend.tier2_profile import tier2_first_run_profile
+def test_the_first_paid_run_is_capped_at_one_worker_execution():
+    from backend.runtime_policy import reviewed_first_run_policy
 
-    profile = tier2_first_run_profile()
-    assert profile["evidence"]["duration_limit_raised"] is False
-    assert profile["active_profile"]["max_run_duration_seconds"] == 1800
+    assert int(reviewed_first_run_policy()["first_paid_run_execution_cap"]) == 1
 
 
-def test_the_profile_records_the_web_search_qps_status_honestly():
-    from backend.tier2_profile import tier2_first_run_profile
+def test_the_hard_money_cap_stays_at_three_dollars():
+    from backend.runtime_policy import reviewed_first_run_policy
 
-    search = tier2_first_run_profile()["web_search_qps"]
-    for endpoint in ("search", "search_pro"):
-        assert search[endpoint]["verified"] is False
-        assert search[endpoint]["qps"] == 1
-        assert "FALLBACK" in search[endpoint]["basis"]
-        assert search[endpoint]["consumes_chat_quota"] is False
+    policy = reviewed_first_run_policy()
+    assert float(policy["hard_monetary_cap_usd"]) < 10
+    assert float(policy["hard_monetary_cap_usd"]) == 3.00
+    assert float(policy["max_cost_per_run"]) <= float(policy["hard_monetary_cap_usd"])
 
 
-def test_the_profile_states_that_a_dedicated_key_does_not_prove_isolation():
-    from backend.tier2_profile import tier2_first_run_profile
+def test_the_duration_limit_is_not_raised_after_the_timeout():
+    from backend.runtime_policy import reviewed_first_run_policy
 
-    external = tier2_first_run_profile()["external_usage"]
-    assert external["isolated_per_api_key"] is False
-    assert "does NOT" in external["note"] or "does not" in external["note"]
+    assert int(reviewed_first_run_policy()["max_run_duration_seconds"]) == 1800
 
 
-def test_the_profile_declares_sdk_automatic_retries_off():
-    from backend.tier2_profile import tier2_first_run_profile
+def test_the_web_search_qps_is_the_unverified_one_per_second_fallback():
+    from backend.provider_quota import (SEARCH_BASIC, SEARCH_PRO, SEARCH_QPS_FALLBACK,
+                                        SEARCH_QPS_VERIFIED)
 
-    assert tier2_first_run_profile()["active_profile"]["sdk_automatic_retries"] == 0
+    for endpoint in (SEARCH_BASIC, SEARCH_PRO):
+        assert SEARCH_QPS_VERIFIED[endpoint] is False
+        assert SEARCH_QPS_FALLBACK[endpoint] == 1
 
 
-def test_the_profile_is_json_serializable():
-    import json
+def test_the_profile_document_keeps_the_statements_no_code_can_pin():
+    """The prose half of the old module: facts about the account, not values."""
+    from pathlib import Path
 
-    from backend.tier2_profile import tier2_first_run_profile
-
-    assert json.loads(json.dumps(tier2_first_run_profile()))
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "production-readiness"
+           / "TIER2_FIRST_RUN_PROFILE.md").read_text()
+    for statement in (
+        "does NOT prove quota isolation",          # a dedicated key is not isolation
+        "The duration limit is NOT raised",        # after the 1800s timeout
+        "no automatic relaunch after a terminal failure",
+        "CONSERVATIVE FALLBACK",                   # search QPS basis
+        "does not consume the chat quota",
+        "SDK automatic retries are off",
+    ):
+        assert statement in doc, statement
