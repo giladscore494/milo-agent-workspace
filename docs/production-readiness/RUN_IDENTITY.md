@@ -215,12 +215,14 @@ was authorized.
 
 * `policy_envelope.py run-identity` prints the identity dimensions every run of
   this release must carry, generated from the same policy document;
-* `stage-d-env.sh` pins it as `STAGE_D_EXPECTED_RUN_IDENTITY`;
-* `probe_db.py`'s evidence gate compares the authorized run's PERSISTED
-  identity against that pin and refuses a run that is not a run of this
-  release, an unpinned run, or an unparseable expectation;
+* `stage-d-env.sh` pinned it as `STAGE_D_EXPECTED_RUN_IDENTITY`, and
+  `probe_db.py`'s evidence gate compared the authorized run's PERSISTED
+  identity against that pin (both were part of the Stage D toolkit, removed in
+  cleanup D8);
 * `verify_caps.py` refuses, **before the run is created**, a deployment whose
   `MILO_RELEASE_SHA` is absent or is not the accepted release.
+
+`policy_envelope.py` and `verify_caps.py` are kept in `scripts/release/pins/`.
 
 **PR #103's rule is preserved.** The binding is a statement about policy
 CONTENT, not about which commit is checked out: a reviewed authorization commit
@@ -245,9 +247,9 @@ The inventory is kept as a reviewed literal,
 `scripts/release/pins/required_rpc_args.py` (cleanup D8) — the same
 arrangement as `PINNED_POLICY_FINGERPRINT`. `tests/test_release_inventory.py`
 fails if that literal is not exactly what the current repository requires.
-`probe_db.py` carries a byte-identical copy of it (it is transported into a
-bare pinned image as one SHA-256-pinned file and cannot import the deriving
-module) until the Stage D toolkit is deleted.
+The Stage D probe that also carried it was deleted with the Stage D toolkit
+(cleanup D8), which removed `settle_model_call_budget` from the inventory: that
+probe's cleanup path was its only caller.
 
 Regenerate with:
 

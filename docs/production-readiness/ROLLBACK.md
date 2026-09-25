@@ -120,12 +120,9 @@ Vercel values cannot be read back by the CLI:
 confirm with `scripts/deploy/website-execution-check.sh`. It never enables
 anything, never cancels an execution and never deletes anything.
 
-The historical Stage D kill switch (`scripts/release/stage-d/kill-switch.sh`)
-sets only the Stage D flag set and does not touch `MILO_ENABLE_WORK_SCOPE_*`,
-`MILO_ENABLE_GOVERNMENT_CATALOG_READ`, `MILO_ENABLE_CATALOG_PROMOTION` or any
-Vercel variable; it is not this order (see `docs/cleanup/CLEANUP_INVENTORY.md`,
-decision D5). The Stage C toolkit and its kill switch were removed in cleanup
-item 6.
+The Stage C and Stage D toolkits, with their kill switches (which set only
+their own flag sets, not this order), were removed in cleanup items 6 and D8
+(see `docs/cleanup/CLEANUP_INVENTORY.md`, decision D5).
 
 ## Catalog execution — the independent rollback
 

@@ -187,8 +187,9 @@ reviewable PROPOSAL and has NOT been executed.** The request, the read-only disc
 production baselines, the caps derived from Stage C Attempt 7 evidence and
 the remaining manual operator steps are in
 [STAGE_D_AUTHORIZATION.md](STAGE_D_AUTHORIZATION.md); the operator toolkit
-that would execute it is `scripts/release/stage-d/`, with its executable
-safety proofs in `tests/test_stage_d_toolkit.py`. Neither the document nor
+that would have executed it was `scripts/release/stage-d/`, with its executable
+safety proofs in `tests/test_stage_d_toolkit.py` (both removed in cleanup D8;
+its release verifiers are kept in `scripts/release/pins/`). Neither the document nor
 the toolkit is an authorization, and merging them changes no production
 state.
 
@@ -201,7 +202,7 @@ Attempt 7 values. Raising a limit is a later, separate step.
 
 That toolkit also carries the reviewed resolution for the unused prepared
 Government capture run
-(`scripts/release/stage-d/resolve-government-capture.sh`). Preparing that
+(`scripts/release/stage-d/resolve-government-capture.sh`, removed in cleanup D8). Preparing that
 run was never authorization to capture, and a Stage D model run neither
 executes it nor becomes one: the Stage D gates re-prove on every step that
 it has not been claimed.

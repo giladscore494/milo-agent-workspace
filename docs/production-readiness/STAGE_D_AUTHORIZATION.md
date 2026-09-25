@@ -1,5 +1,11 @@
 # Stage D expansion step 1 — PROPOSED authorization for one bounded paid run
 
+> **HISTORICAL — the Stage D toolkit (`scripts/release/stage-d/`) was removed in
+> cleanup D8.** Its release verifiers and pins (`policy_envelope.py`,
+> `verify_caps.py`, `verify_images.py`, `semantic_acceptance.py`, the RPC
+> inventory) are kept in `scripts/release/pins/`; the paths below are kept as a
+> record.
+
 > ## SUPERSEDED BY A RUNTIME RELEASE. RE-AUTHORIZATION REQUIRED.
 >
 > This document was written on the premise, stated in §7 below, that **no

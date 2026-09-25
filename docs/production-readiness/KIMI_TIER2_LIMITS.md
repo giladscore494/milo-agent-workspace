@@ -401,8 +401,8 @@ floored as below.
 
 The Cloud Run evidence survives as a **floor** on that timer, never a licence
 for one: `--task-timeout 3600` (`scripts/deploy/cloud-run.sh:728`, re-pinned at
-`generate-deployment-plan.sh:297`, asserted live at
-`tests/test_stage_d_toolkit.py:418`) plus no `SIGTERM` handler means a value
+`generate-deployment-plan.sh:297`; the run-duration cap is held below it by
+`tests/test_runtime_policy_caps_history.py::test_run_duration_cap_stays_below_the_cloud_run_job_timeout`) plus no `SIGTERM` handler means a value
 below `4500 s` would reclaim a slot while MILO's *own* process could still be
 running — a defect on top of the assumption it is already making. Both
 `QuotaConfig` and `resolve_coordinator` refuse that.

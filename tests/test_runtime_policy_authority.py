@@ -40,7 +40,6 @@ from backend.runtime_policy import (BUDGET, CAP_ENV_PREFIXES, DIMENSIONS,
 from backend.tools import ToolContext, ToolMode, ToolOperation, ToolRegistry
 
 REPO = Path(__file__).resolve().parents[1]
-STAGE_D = REPO / "scripts" / "release" / "stage-d"
 #: The permanent copies of policy_envelope.py and verify_caps.py (cleanup D8).
 PINS = REPO / "scripts" / "release" / "pins"
 
@@ -339,18 +338,6 @@ def policy_envelope(selector: str) -> str:
 def test_stage_d_generates_its_envelope_from_the_runtime_policy(selector, prefixes):
     rendered = dict(pair.split("=", 1) for pair in policy_envelope(selector).split(","))
     assert rendered == POLICY.env_expectations(prefixes=prefixes)
-
-
-def test_stage_d_keeps_no_hand_written_copy_of_a_policy_value():
-    """A literal cap assignment in the shell file is how the copies started."""
-    import re
-
-    text = (STAGE_D / "stage-d-env.sh").read_text()
-    executable = [line for line in text.splitlines()
-                  if line.strip() and not line.lstrip().startswith("#")]
-    for line in executable:
-        assert not re.search(r"MILO_(MAX|PROVIDER|DAILY|SWARM|V1|ESTIMATED)_[A-Z_]*=", line), (
-            f"stage-d-env.sh assigns a policy value by hand: {line.strip()}")
 
 
 def test_stage_d_refuses_a_pinned_value_that_disagrees_with_the_runtime(tmp_path):
@@ -786,9 +773,6 @@ def test_the_execution_increment_is_the_policys_and_nothing_elses():
 
     assert policy_envelope.authorized_execution_increment() == int(
         POLICY["first_paid_run_execution_cap"]) == 1
-    collect = (STAGE_D / "06-collect-evidence.sh").read_text()
-    assert "STAGE_D_AUTHORIZED_EXECUTION_INCREMENT" in collect
-    assert "STAGE_D_EXPECTED_PRIOR_EXECUTIONS + 1" not in collect
 
 
 # =============================================================================
