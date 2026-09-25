@@ -74,11 +74,26 @@ httpx hands timeouts to a transport). Then:
 
 Together: total ≲ deadline, whatever the peer does, and no single phase can
 borrow another's budget.
+
+Per-request timing (PR-S)
+-------------------------
+
+The client's deadline is the CEILING any request may have -- the one the
+organization lease window is validated against. A caller may tighten it for
+the requests it makes with :func:`request_timing`: Swarm V2 sets each role's
+total deadline there, plus a short inactivity window for its streamed calls,
+which caps every read (header wait and chunk gaps alike). The body check runs
+when a chunk arrives, so a stream that goes silent just before its deadline is
+stopped by the inactivity window instead: the worst-case wall time of one
+streamed request is ``total deadline + inactivity window``.
 """
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 
 
@@ -99,6 +114,58 @@ class ProviderRequestDeadlineExceeded(Exception):
             f"provider request exceeded its {deadline_seconds:g}s total deadline")
         self.deadline_seconds = deadline_seconds
         self.elapsed_seconds = elapsed_seconds
+
+
+#: The longest a STREAMING request may go without a single chunk -- including
+#: the wait for response headers. A streamed reasoning model emits a chunk
+#: every few tokens, so a minute of silence means the provider stopped
+#: producing, not that it is thinking hard (PR-S, `backend.provider_streaming`).
+STREAM_INACTIVITY_SECONDS = 60.0
+
+
+@dataclass(frozen=True)
+class RequestTiming:
+    """How long ONE request may take, as the caller that built it decided.
+
+    Read by the deadline transport on the thread that performs the request.
+    It can only TIGHTEN the client's own deadline, never widen it: the
+    client's deadline is the one the organization lease window was validated
+    against (``assert_request_deadline_safe``). ``inactivity_seconds`` caps
+    every read -- the header wait and each body chunk -- and is only set for a
+    STREAMING request: a non-streaming reasoning request is legitimately
+    silent until its whole answer exists.
+    """
+
+    total_deadline_seconds: float
+    inactivity_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if not float(self.total_deadline_seconds) > 0:
+            raise ValueError("a request's total deadline must be positive")
+        if self.inactivity_seconds is not None and not float(self.inactivity_seconds) > 0:
+            raise ValueError("a request's inactivity window must be positive")
+
+
+_timing: contextvars.ContextVar[RequestTiming | None] = contextvars.ContextVar(
+    "milo_provider_request_timing", default=None)
+
+
+@contextlib.contextmanager
+def request_timing(total_deadline_seconds: float,
+                   inactivity_seconds: float | None = STREAM_INACTIVITY_SECONDS,
+                   ) -> Iterator[RequestTiming]:
+    """Bound every provider request made on this thread inside this block."""
+    timing = RequestTiming(float(total_deadline_seconds),
+                           None if inactivity_seconds is None else float(inactivity_seconds))
+    token = _timing.set(timing)
+    try:
+        yield timing
+    finally:
+        _timing.reset(token)
+
+
+def current_request_timing() -> RequestTiming | None:
+    return _timing.get()
 
 
 def _import_httpx() -> Any:
@@ -124,6 +191,7 @@ _MIN_READ_SECONDS = 0.001
 
 def allocate_request_timeouts(deadline_seconds: float,
                               connect_timeout: float | None = None,
+                              inactivity_seconds: float | None = None,
                               ) -> dict[str, float]:
     """Divide ONE absolute deadline across the phases of ONE request.
 
@@ -134,7 +202,9 @@ def allocate_request_timeouts(deadline_seconds: float,
 
     That is what makes the deadline ABSOLUTE rather than per-operation. A
     caller-supplied ``connect_timeout`` may tighten its phase, never widen it
-    past its share.
+    past its share. ``inactivity_seconds`` (a streaming request) caps ``read``,
+    which httpx applies to the header wait AND to every body read -- the gap
+    between two chunks.
     """
     deadline = float(deadline_seconds)
     if deadline <= 0:
@@ -146,7 +216,10 @@ def allocate_request_timeouts(deadline_seconds: float,
             value = min(value, float(connect_timeout))
         allocation[name] = max(_MIN_READ_SECONDS, value)
     setup = sum(allocation.values())
-    allocation["read"] = max(_MIN_READ_SECONDS, deadline - setup)
+    read = deadline - setup
+    if inactivity_seconds is not None:
+        read = min(read, float(inactivity_seconds))
+    allocation["read"] = max(_MIN_READ_SECONDS, read)
     return allocation
 
 
@@ -155,10 +228,11 @@ def build_deadline_transport(deadline_seconds: float, *, inner: Any = None,
                              clock: Callable[[], float] = time.monotonic) -> Any:
     """An httpx transport that enforces a TOTAL deadline per request."""
     httpx = _import_httpx()
-    deadline = float(deadline_seconds)
-    if deadline <= 0:
+    client_deadline = float(deadline_seconds)
+    if client_deadline <= 0:
         raise ValueError("provider request deadline must be positive")
-    phase_timeouts = allocate_request_timeouts(deadline, connect_timeout)
+    # Validated once here so a bad connect timeout fails at build time.
+    allocate_request_timeouts(client_deadline, connect_timeout)
 
     # Built here rather than at module scope because httpx asserts the stream
     # it is handed really is one of its own -- duck typing is rejected.
@@ -170,10 +244,12 @@ def build_deadline_transport(deadline_seconds: float, *, inner: Any = None,
         time -- which is the exact failure an inactivity timeout misses.
         """
 
-        def __init__(self, wrapped: Any, deadline_at: float, started_at: float):
+        def __init__(self, wrapped: Any, deadline_at: float, started_at: float,
+                     deadline: float):
             self._wrapped = wrapped
             self._deadline_at = deadline_at
             self._started_at = started_at
+            self._deadline = deadline
 
         def __iter__(self) -> Iterator[bytes]:
             for chunk in self._wrapped:
@@ -182,7 +258,7 @@ def build_deadline_transport(deadline_seconds: float, *, inner: Any = None,
                     # nobody is waiting for is the leak this exists to stop.
                     self.close()
                     raise ProviderRequestDeadlineExceeded(
-                        deadline, clock() - self._started_at)
+                        self._deadline, clock() - self._started_at)
                 yield chunk
 
         def close(self) -> None:
@@ -199,6 +275,18 @@ def build_deadline_transport(deadline_seconds: float, *, inner: Any = None,
 
         def handle_request(self, request: Any) -> Any:
             started = clock()
+            # PR-S: the caller's per-request timing (a Swarm V2 role's total
+            # deadline and, for a stream, its inactivity window) may TIGHTEN
+            # the client's deadline and never widen it. Resolved per request,
+            # on the thread that performs it.
+            timing = current_request_timing()
+            deadline = client_deadline
+            inactivity = None
+            if timing is not None:
+                deadline = min(client_deadline, float(timing.total_deadline_seconds))
+                inactivity = timing.inactivity_seconds
+            phase_timeouts = allocate_request_timeouts(deadline, connect_timeout,
+                                                       inactivity)
             deadline_at = started + deadline
             # The allocation REPLACES whatever per-phase timeouts the client
             # was built with. Without this the client's numbers survive, each
@@ -226,7 +314,8 @@ def build_deadline_transport(deadline_seconds: float, *, inner: Any = None,
                 # whole budget; there is no time left to read a body.
                 response.close()
                 raise ProviderRequestDeadlineExceeded(deadline, elapsed)
-            response.stream = _DeadlineStream(response.stream, deadline_at, started)
+            response.stream = _DeadlineStream(response.stream, deadline_at, started,
+                                              deadline)
             return response
 
         def close(self) -> None:
@@ -260,5 +349,6 @@ def build_deadline_http_client(deadline_seconds: float, *, inner: Any = None,
     )
 
 
-__all__ = ["ProviderRequestDeadlineExceeded", "allocate_request_timeouts",
-           "build_deadline_http_client", "build_deadline_transport"]
+__all__ = ["ProviderRequestDeadlineExceeded", "RequestTiming", "STREAM_INACTIVITY_SECONDS",
+           "allocate_request_timeouts", "build_deadline_http_client",
+           "build_deadline_transport", "current_request_timing", "request_timing"]

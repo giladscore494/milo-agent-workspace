@@ -40,7 +40,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from backend.provider_authority import (
     ENGINE_OVERLOADED,
@@ -260,6 +260,18 @@ _WAIT_CHUNK_SECONDS = 1.0
 _SLOT_POLL_SECONDS = 0.05
 
 
+def _probe_failure_detail(exc: BaseException) -> dict[str, str]:
+    """Static, bounded facts about why a probe raised. Class names only."""
+    detail = {"exception_class": type(exc).__name__[:64]}
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None:
+        detail["cause_class"] = type(cause).__name__[:64]
+    kind = getattr(exc, "failure_kind", None)
+    if isinstance(kind, str) and kind:
+        detail["failure_kind"] = kind[:48]
+    return detail
+
+
 class _OwnershipProbe:
     """Handle for one request's read-only ownership probe.
 
@@ -273,6 +285,8 @@ class _OwnershipProbe:
     def __init__(self) -> None:
         self.done = threading.Event()
         self.lost_reason: str | None = None
+        #: Class names and a static store failure kind; never a message.
+        self.failure_detail: dict[str, str] = {}
         self.thread: threading.Thread | None = None
         self.on_lost: Callable[[str], None] | None = None
 
@@ -509,10 +523,17 @@ class ProviderScheduler:
             while not probe.done.wait(interval):
                 try:
                     still_ours = lease.verify_ownership()
-                except BaseException:  # noqa: BLE001 - reported, never re-raised
+                except BaseException as exc:  # noqa: BLE001 - reported, never re-raised
                     # The shared store is unreachable, or refused. Re-raising
                     # here would only kill this daemon thread, which is what
                     # used to make the loss invisible.
+                    #
+                    # PR-S: WHY is recorded too -- the exception CLASS, its
+                    # cause's class and the store's static failure kind, never
+                    # the message (a transport error can quote the store URL).
+                    # This fired at the first probe of every production run
+                    # with nothing to say why.
+                    probe.failure_detail = _probe_failure_detail(exc)
                     probe.mark_lost("PROVIDER_LEASE_PROBE_FAILED")
                     return
                 if not still_ours:
@@ -522,20 +543,30 @@ class ProviderScheduler:
                     probe.mark_lost("PROVIDER_LEASE_OWNERSHIP_LOST")
                     return
 
-        probe.on_lost = lambda reason: self._report_lease_loss(reason, agent, phase)
+        probe.on_lost = lambda reason: self._report_lease_loss(
+            reason, agent, phase, probe.failure_detail)
         probe.thread = threading.Thread(target=watch, name="provider-lease-probe",
                                         daemon=True)
         probe.thread.start()
         return probe
 
-    def _report_lease_loss(self, reason: str, agent: str, phase: str) -> None:
+    def _report_lease_loss(self, reason: str, agent: str, phase: str,
+                           detail: Mapping[str, str] | None = None) -> None:
         """Announce lost permit ownership with a static code and nothing else.
 
         No URL, no credential, no provider body and no exception text: the
         reason is one of two constants, and agent/phase are server-chosen
         identifiers. A diagnostic about losing the limiter must not become the
-        thing that leaks what the limiter is talking to.
+        thing that leaks what the limiter is talking to. ``detail`` (PR-S)
+        adds only exception CLASS names and a static store failure kind.
         """
+        detail = dict(detail or {})
+        from backend.provider_streaming import emit_structured_log, role_label
+
+        # Observability-only, like the probe itself: stdout for Cloud Logging.
+        emit_structured_log({"severity": "WARNING", "event": "provider_lease_probe",
+                             "message": reason.lower(), "reason": reason,
+                             "role": role_label(agent, phase), **detail})
         if self._backpressure_callback:
             self._backpressure_callback(agent, phase, reason.lower(), 0.0)
         coordinator = self._coordinator
@@ -543,7 +574,7 @@ class ProviderScheduler:
         if callable(emit):
             emit("provider_lease_ownership_lost",
                  {"reason": reason, "agent": str(agent or "")[:64],
-                  "phase": str(phase or "")[:64]})
+                  "phase": str(phase or "")[:64], **detail})
 
     # -- the guarded call path -------------------------------------------------
     def execute(self, call: Callable[[], Any], *, estimated_tokens: int = 0, agent: str = "", phase: str = "",

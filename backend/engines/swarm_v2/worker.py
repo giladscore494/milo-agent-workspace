@@ -6,6 +6,7 @@ from typing import Any, Callable, Mapping, Protocol
 from backend.budget import BudgetExceeded
 from backend.errors import AppError
 from backend.provider_scheduler import ProviderBackpressureExceeded
+from backend.provider_streaming import ProviderTransportFailure
 from backend.runtime import CancellationRequested
 from backend.tools import ToolContext, ToolError, ToolRegistry
 from backend.tools.registry import validate_json_schema
@@ -281,6 +282,11 @@ class GenericWorker:
                               error={"code": exc.code, "message": exc.safe_message})
         except ProviderBackpressureExceeded:
             return TaskResult(task.task_id, "failed", error={"code": "PROVIDER_BACKPRESSURE_EXCEEDED", "message": "provider backpressure did not clear"})
+        except ProviderTransportFailure as exc:
+            # PR-S: a transport outcome fails THIS task with its static code
+            # (partial-failure behavior is unchanged: other tasks proceed).
+            return TaskResult(task.task_id, "failed",
+                              error={"code": exc.code, "message": exc.safe_message})
         except DeterministicOutputError as exc:
             # A trusted deterministic strategy raised, or produced output the
             # task's own closed schema rejects. There is deliberately NO

@@ -19,7 +19,12 @@ Every Swarm V2 request is assembled here, from the model's registered
 * structured output is ``json_schema`` with ``strict: true`` only when the
   model supports it, strict output is proven for it
   (``strict_json_schema_verified``) and the schema passes
-  :func:`is_strict_compatible`; otherwise ``json_object``.
+  :func:`is_strict_compatible`; otherwise ``json_object``;
+* every request is STREAMED (PR-S): ``stream: true`` with
+  ``stream_options.include_usage``. A non-streaming reasoning model is silent
+  until its whole answer exists, which is how run 5145ca65's planning call
+  died on a header read timeout with nothing to show for it
+  (``backend.provider_streaming``).
 
 The builder never adds ``reasoning_content`` to a message and never requests
 explicit or 1-hour context caching.
@@ -48,6 +53,13 @@ REQUEST_REFUSAL_CODES = frozenset({
 #: The server-owned reasoning vocabulary, weakest first. ``none`` means "do
 #: not think" and is only honoured by a model whose thinking can be turned off.
 EFFORT_LADDER: tuple[str, ...] = ("none", "low", "high", "max")
+
+#: The total deadline of a role that declares none of its own.
+DEFAULT_ROLE_TOTAL_DEADLINE_SECONDS = 300.0
+
+#: PR-S: every Swarm V2 request is streamed, and asks for the usage block on
+#: the final chunk so the ledger is charged what the provider counted.
+STREAM_FIELDS: Mapping[str, Any] = {"stream": True, "stream_options": {"include_usage": True}}
 
 #: Message keys a Swarm V2 prompt may carry. `reasoning_content` is absent on
 #: purpose: V2 is single-turn and never re-prompts a model's reasoning.
@@ -90,12 +102,20 @@ class RolePolicy:
     min_answer_reserve: int
     #: Whether the role's output has a JSON Schema the provider may enforce.
     structured: bool = True
+    #: PR-S: the TOTAL wall-clock deadline of ONE streamed call of this role.
+    #: The transport enforces it on every chunk; the stream's inactivity
+    #: window (``STREAM_INACTIVITY_SECONDS``) bounds silence separately. It
+    #: can only tighten the client's own deadline, which the organization
+    #: lease window is validated against.
+    total_deadline_seconds: float = DEFAULT_ROLE_TOTAL_DEADLINE_SECONDS
 
     def __post_init__(self) -> None:
         if self.effort not in EFFORT_LADDER:
             raise ValueError("role effort must come from the effort ladder")
         if not (0 < self.min_answer_reserve <= self.max_output):
             raise ValueError("a role's answer reserve must be positive and within its cap")
+        if not float(self.total_deadline_seconds) > 0:
+            raise ValueError("a role's total deadline must be positive")
 
 
 def resolve_effort(profile: ModelProfile, effort: str) -> str:
@@ -220,6 +240,8 @@ def build_provider_request(profile: ModelProfile, policy: RolePolicy,
         "response_format": _response_format(
             profile, schema if policy.structured else None, schema_name),
         **_reasoning_fields(profile, resolved),
+        "stream": STREAM_FIELDS["stream"],
+        "stream_options": dict(STREAM_FIELDS["stream_options"]),
     }
     leaked = set(request) & profile.forbidden_params
     if "extra_body" in request:
@@ -231,7 +253,7 @@ def build_provider_request(profile: ModelProfile, policy: RolePolicy,
     return request
 
 
-__all__ = ["EFFORT_LADDER", "MODEL_EFFORT_UNSUPPORTED", "MODEL_MESSAGE_INVALID",
+__all__ = ["DEFAULT_ROLE_TOTAL_DEADLINE_SECONDS", "EFFORT_LADDER", "STREAM_FIELDS", "MODEL_EFFORT_UNSUPPORTED", "MODEL_MESSAGE_INVALID",
            "MODEL_OUTPUT_CAP_INVALID", "MODEL_PROFILE_UNKNOWN", "MODEL_PARAM_FORBIDDEN",
            "MODEL_RESPONSE_FORMAT_UNSUPPORTED", "ModelRequestRefused", "REQUEST_REFUSAL_CODES",
            "RolePolicy", "build_provider_request", "is_strict_compatible", "lower_effort",

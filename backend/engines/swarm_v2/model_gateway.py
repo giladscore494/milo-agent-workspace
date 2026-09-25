@@ -4,9 +4,13 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Iterable, Mapping
 
-from backend.budget import CallContract, call_contract
+from backend.budget import BudgetExceeded, CallContract, call_contract
+from backend.errors import AppError
 from backend.model_profiles import ModelProfile, UnknownModelProfile, get_profile
 from backend.provider_authority import ProviderAdapter
+from backend.provider_scheduler import ProviderBackpressureExceeded, ProviderQuotaExceeded
+from backend.provider_streaming import (STREAM_INACTIVITY_SECONDS, ProviderTransportFailure,
+                                        request_timing, role_label, transport_failure_code)
 from backend.runtime import CancellationRequested
 from backend.tools import ToolDescriptor
 
@@ -57,13 +61,31 @@ class MissingRoleOutputCap(ValueError):
 #:
 #: A role that is not listed here is a programming error and fails closed
 #: rather than inheriting the run's whole remaining allowance.
+#:
+#: TOTAL DEADLINES (PR-S). Every call is streamed, so a role gets a short
+#: inactivity window between chunks (``STREAM_INACTIVITY_SECONDS``, 60s) and a
+#: TOTAL deadline sized to how long its reasoning may legitimately run. Run
+#: 5145ca65's planning call had 90s in total -- 67.5s for the silent header
+#: wait -- and a K3 plan at high effort with a 32k cap took longer than that.
+#: The largest of these (planning, 600s) is what the reviewed lease TTL is
+#: sized for: ``QuotaConfig().request_deadline_seconds`` must admit it, and
+#: ``runtime_policy.reviewed_policy_violations`` refuses a release where it
+#: does not. The worst-case wall time of one call is its deadline plus one
+#: inactivity window.
 ROLE_POLICIES: Mapping[tuple[str, str], RolePolicy] = {
-    ("commander", "planning"): RolePolicy(effort="high", max_output=32_000, min_answer_reserve=6_000),
+    ("commander", "planning"): RolePolicy(effort="high", max_output=32_000, min_answer_reserve=6_000,
+                                          total_deadline_seconds=600.0),
     ("commander", "replanning"): RolePolicy(effort="high", max_output=16_000, min_answer_reserve=3_000,
-                                            structured=False),
-    ("worker", "execute"): RolePolicy(effort="low", max_output=12_000, min_answer_reserve=3_000),
-    ("verifier", "verification"): RolePolicy(effort="high", max_output=24_000, min_answer_reserve=4_000),
+                                            structured=False, total_deadline_seconds=300.0),
+    ("worker", "execute"): RolePolicy(effort="low", max_output=12_000, min_answer_reserve=3_000,
+                                      total_deadline_seconds=300.0),
+    ("verifier", "verification"): RolePolicy(effort="high", max_output=24_000, min_answer_reserve=4_000,
+                                             total_deadline_seconds=480.0),
 }
+
+#: The longest total deadline any role declares: what the lease TTL must admit.
+MAX_ROLE_TOTAL_DEADLINE_SECONDS: float = max(
+    policy.total_deadline_seconds for policy in ROLE_POLICIES.values())
 
 #: Read-only view kept for surfaces that describe caps (the Tier 2 profile).
 ROLE_OUTPUT_CAPS: Mapping[tuple[str, str], int] = {
@@ -192,9 +214,29 @@ class ModelGateway:
         # (BUDGET_INSUFFICIENT_FOR_ROLE) instead of shrinking it silently.
         contract = CallContract(role=f"{str(agent).split(':', 1)[0]}:{phase}",
                                 min_answer_reserve=min(policy.min_answer_reserve, cap))
-        with call_contract(contract):
-            return self._adapter.chat(request, client=self._client, agent=agent,
-                                      phase=phase)
+        # PR-S: the role's TOTAL deadline and the stream's inactivity window
+        # bound every attempt the authority makes for this call.
+        with call_contract(contract), request_timing(policy.total_deadline_seconds,
+                                                     STREAM_INACTIVITY_SECONDS):
+            try:
+                return self._adapter.chat(request, client=self._client, agent=agent,
+                                          phase=phase)
+            except (CancellationRequested, BudgetExceeded, AppError, ModelRequestRefused,
+                    ProviderBackpressureExceeded, ProviderQuotaExceeded):
+                # Run-level stops, refusals and the scheduler's own verdicts
+                # (which chain the 429 behind them) keep their existing codes.
+                raise
+            except Exception as exc:
+                # The authority has ALREADY settled this attempt -- lease,
+                # ledger, retries -- on the original exception. Only now is a
+                # transport outcome given its static code, so what the run
+                # reports is named for what happened (run 5145ca65 reported a
+                # dropped request as COMMANDER_COMPLETION_FAILED). Anything
+                # that is not a transport outcome keeps its own handling.
+                code = transport_failure_code(exc)
+                if code is None:
+                    raise
+                raise ProviderTransportFailure(code, role=role_label(agent, phase)) from None
 
     def _tool_authorization_instruction(self) -> str:
         """Describe the registered capabilities, and grant none of them.

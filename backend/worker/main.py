@@ -455,8 +455,16 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 return 0 if workflow_key == "swarm_v2" else 1
 
         # Resolved once, from the coordinator that owns the permits.
-        provider_request_deadline = (provider_coordinator.config.request_deadline_seconds
-                                     if provider_coordinator is not None else None)
+        #
+        # PR-S: two numbers from the SAME configuration. Swarm V2's streamed
+        # calls get the CEILING (each role tightens it to its own total
+        # deadline); every non-streaming path -- V1 chat and standalone search
+        # -- keeps the deadline it had before, so V1's timing is unchanged.
+        streaming_request_deadline = (provider_coordinator.config.request_deadline_seconds
+                                      if provider_coordinator is not None else None)
+        provider_request_deadline = (
+            provider_coordinator.config.non_streaming_request_deadline_seconds
+            if provider_coordinator is not None else None)
 
         def emit_budget_event(event_type, payload):
             sink.emit(RunEventRecord(run_id=run_id, type=event_type, message=payload.get("message", event_type), payload=payload.get("payload", payload)))
@@ -748,6 +756,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 client_factory=build_guarded_client_factory(
                     tracker, request_deadline_seconds=provider_request_deadline),
                 request_deadline_seconds=provider_request_deadline,
+                # Server-owned identifiers only, on every structured
+                # provider-call log line (stdout -> Cloud Logging).
+                log_context={"run_id": run_id},
                 # THE internet capability, and the only one an engine has.
                 # It performs exactly one search per admitted invocation and
                 # is reached only through `ProviderAdapter.run_search`, which
@@ -904,7 +915,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # reviewed plan shape, narrowed again to what this run's
                 # agent-step and model-call envelope can actually pay for.
                 limits = policy.plan_limits()
-                gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker, request_deadline_seconds=provider_request_deadline),
+                gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker, request_deadline_seconds=streaming_request_deadline),
                     # The SAME adapter instance V1 is given above.
                     adapter=provider_adapter, api_key=worker_provider_api_key(),
                     base_url=provider_base_url(),
@@ -1186,8 +1197,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 raise
             from backend.engines.swarm_v2 import VALIDATION_REASONS, CommanderPlanFailure
             from backend.engines.swarm_v2.request_builder import ModelRequestRefused
+            from backend.provider_streaming import ProviderTransportFailure
             failure_payload: dict[str, Any]
-            if isinstance(exc, ModelRequestRefused):
+            if isinstance(exc, ProviderTransportFailure):
+                # PR-S: a provider transport outcome with its own static code
+                # (deadline, stream interrupted/inactive, HTTP status only).
+                # The role is `<agent kind>:<phase>`, server-chosen.
+                code, message = exc.code, exc.safe_message
+                failure_payload = {"code": code, "role": exc.role}
+            elif isinstance(exc, ModelRequestRefused):
                 # PR-R: refused before any provider request existed; the code
                 # is static and allowlisted by construction.
                 code, message = exc.code, exc.safe_message

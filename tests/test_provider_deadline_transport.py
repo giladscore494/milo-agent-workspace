@@ -289,10 +289,18 @@ def test_the_shipped_clients_are_built_on_the_deadline_transport():
 
 
 def test_the_deadline_client_carries_the_configured_deadline():
+    """A caller that states no deadline is a NON-streaming one (V1, search).
+
+    PR-S raised the lease window so the CEILING admits Swarm V2's 600s
+    streamed planning call; the non-streaming paths keep the 90s they always
+    had, and never more than the ceiling.
+    """
     from backend.budget import build_provider_http_client, resolved_request_deadline
 
     config = QuotaConfig()
-    assert resolved_request_deadline() == config.request_deadline_seconds
+    assert config.non_streaming_request_deadline_seconds == 90.0
+    assert config.non_streaming_request_deadline_seconds <= config.request_deadline_seconds
+    assert resolved_request_deadline() == config.non_streaming_request_deadline_seconds
     with build_provider_http_client() as client:
-        assert client.timeout.read == config.request_deadline_seconds
+        assert client.timeout.read == config.non_streaming_request_deadline_seconds
         assert client.timeout.connect <= client.timeout.read
