@@ -2,6 +2,10 @@ name: ci
 
 on:
   pull_request:
+  # Manual runs on an exact ref, so the operator can run the same mandatory
+  # jobs on the release SHA itself (runbook A.1: `gh workflow run ci.yml
+  # --ref main`). Still no automatic post-merge push run.
+  workflow_dispatch:
 
 # Release acceptance: every job below is MANDATORY for a commit to be a
 # release candidate (docs/production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md

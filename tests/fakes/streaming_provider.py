@@ -62,6 +62,10 @@ class StreamScript:
     drop_after: int | None = None
     #: Send the [DONE] terminator.
     done: bool = True
+    #: After the final frame(s), go silent for the inactivity window and then
+    #: time out instead of sending [DONE]: only a reader that keeps waiting
+    #: past a finished, measured stream ever sees it.
+    hang_after_final: bool = False
     #: Seconds of silence before the first byte when the request is NOT
     #: streaming: the whole reasoning time, then the whole answer at once.
     @property
@@ -89,6 +93,7 @@ class _SimStream(httpx.SyncByteStream):
     def __init__(self, script: StreamScript, model: str, clock: SimClock) -> None:
         self._script, self._model, self._clock = script, model, clock
         self.closed = False
+        self.read_past_final = False
 
     def __iter__(self) -> Iterator[bytes]:
         script, model = self._script, self._model
@@ -118,6 +123,10 @@ class _SimStream(httpx.SyncByteStream):
         yield emit(_chunk(model, [final_choice]))
         if script.usage_style == "chunk":
             yield emit(_chunk(model, [], usage=_usage(script)))
+        if script.hang_after_final:
+            self.read_past_final = True
+            self._clock.advance(60.0)
+            raise httpx.ReadTimeout("timed out")
         if script.done:
             yield b"data: [DONE]\n\n"
 

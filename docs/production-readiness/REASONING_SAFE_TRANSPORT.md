@@ -36,10 +36,11 @@ That is the signature of the header read timeout, not of the 90 s total.
 
 | | before | now |
 | --- | --- | --- |
-| Swarm V2 request | non-streaming | `stream: true`, `stream_options.include_usage: true` |
+| Swarm V2 request | non-streaming | `stream: true`. `stream_options` is **not** sent: it is not documented for the Kimi models in any source MILO could verify (the Kimi K3 README does not mention it) |
 | answer assembly | `message.content` | `delta.content` only; **`reasoning_content` is never read or stored** |
-| `finish_reason`, `usage` | response body | final chunk: the usage-only chunk (OpenAI) or usage on the final choice (Moonshot) |
+| `finish_reason`, `usage` | response body | final chunk: usage on the final choice (Moonshot, `choices[0].usage`) or a usage-only chunk. Reading stops once the `finish_reason` and a usage block at or after it have both arrived; MILO does not wait for `[DONE]` |
 | a finished stream with no usage | n/a | charged its **whole reservation** (input upper bound + full cap), never 0 |
+| sent, outcome unknown (mid-stream drop, inactivity or total deadline) | 0 tokens, $0 | charged its **whole worst-case reservation** to the run budget and the daily settlement; reasoning and answer counts recorded as null |
 | lease released when | the call returned | the stream **ended with a `finish_reason`**; a dropped stream stays `OUTCOME_UNKNOWN` (quarantined) |
 | silence bound | header read = deadline − setup (67.5 s) | **60 s** between chunks, header wait included (`STREAM_INACTIVITY_SECONDS`) |
 | total bound | 90 s for every call | per role, below |
@@ -71,10 +72,12 @@ next deploy.
 | `MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS` | unset (derived: 600) | Explicit ceiling override. Leave it unset. |
 | `MILO_MAX_RUN_DURATION_SECONDS` | 1800 (**unchanged**) | Checked before each call, so the last admitted call may run up to 660 s past it: 1800 + 660 = 2460 s, inside the 3600 s job timeout. This is now **enforced**: `runtime_policy` refuses a duration cap where cap + 660 ≥ 3600 (so ≥ 2940 s), and refuses a release whose reviewed lease window does not admit the longest role. The policy fingerprint is unchanged. |
 
-**Do not set `MILO_PROVIDER_LEASE_TTL_SECONDS` below 800.** A shorter window is
-accepted, because a deployment may tighten. But every role deadline is then
-**clamped** to the smaller ceiling (0.75 × TTL). At 120 that is 90 s, which
-brings back the deadline that killed run 5145ca65.
+**Do not set `MILO_PROVIDER_LEASE_TTL_SECONDS` below 800** or
+`MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS` below 600. The transport would clamp
+every role deadline to the smaller ceiling (at a TTL of 120 that is 90 s, the
+deadline that killed run 5145ca65). So a paid Swarm V2 run whose ceiling is
+below the longest role deadline is **refused at worker boot** with
+`PROVIDER_DEADLINE_BELOW_ROLE_POLICY`, before any provider call.
 
 ## Failure codes
 

@@ -30,9 +30,13 @@ What the stream is allowed to contribute
 deltas (``reasoning_content``) are never read, never stored and never
 re-sent: the assembled completion has no field that could hold them.
 ``finish_reason`` and ``usage`` are taken from the final chunk(s) -- both the
-OpenAI shape (a trailing chunk with ``usage`` and no choices, requested with
-``stream_options.include_usage``) and Moonshot's (``usage`` on the final
-choice) are read.
+OpenAI shape (a trailing chunk with ``usage`` and no choices) and Moonshot's
+(``usage`` on the final choice) are read. ``stream_options`` is not sent (it
+is not documented for the Kimi models in any source MILO could verify).
+Reading stops as soon as the ``finish_reason`` and a usage block at or after
+it have both arrived: nothing after them can change the answer or the charge,
+and waiting for ``[DONE]`` only risks an inactivity timeout that would
+quarantine a slot for a request that already finished.
 
 When a request counts as FINISHED
 ---------------------------------
@@ -219,6 +223,7 @@ def assemble_chat_stream(stream: Any, *,
             chunk_usage = _get(chunk, "usage")
             if chunk_usage is not None:
                 usage = chunk_usage
+            usage_in_chunk = chunk_usage is not None
             for choice in (_get(chunk, "choices") or ()):
                 index = _get(choice, "index")
                 if index not in (None, 0):
@@ -236,6 +241,13 @@ def assemble_chat_stream(stream: Any, *,
                 choice_usage = _get(choice, "usage")
                 if choice_usage is not None:
                     usage = choice_usage
+                    usage_in_chunk = True
+            if finish_reason is not None and usage_in_chunk:
+                # Finished AND measured (usage on the finishing chunk or a
+                # later one; usage seen only BEFORE the finish_reason may be
+                # partial and does not end the read). Stop here rather than
+                # wait for [DONE]; `_close` below ends the HTTP response.
+                break
     except BaseException as exc:
         try:
             exc.milo_first_chunk_at = first_chunk_at  # type: ignore[attr-defined]

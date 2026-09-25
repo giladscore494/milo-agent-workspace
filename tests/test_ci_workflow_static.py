@@ -134,6 +134,16 @@ def test_ci_runs_on_every_pull_request_without_path_filters_and_not_after_merge(
     assert "push" not in on
 
 
+def test_ci_can_be_dispatched_manually_on_the_release_sha():
+    # Runbook A.1: the operator runs `gh workflow run ci.yml --ref main` to get
+    # the mandatory jobs on the exact release commit. A manual trigger with no
+    # inputs, alongside (never instead of) the pull_request trigger.
+    on = triggers(load(CI))
+    assert "workflow_dispatch" in on
+    assert not (on["workflow_dispatch"] or {}).get("inputs")
+    assert "pull_request" in on
+
+
 def test_no_mandatory_job_or_step_is_conditional_or_allowed_to_fail():
     workflow = load(CI)
     for name in MANDATORY_CI_JOBS:

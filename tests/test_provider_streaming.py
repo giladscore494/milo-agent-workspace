@@ -75,15 +75,17 @@ class Stack(SimpleNamespace):
         return [r for r in self.rows if r["decision"] == "settled"]
 
 
-def build_stack(monkeypatch, scripts, *, status=None, client_deadline=None):
+def build_stack(monkeypatch, scripts, *, status=None, client_deadline=None,
+                budget=None, **tracker_kwargs):
     clock = SimClock()
     monkeypatch.setattr(provider_streaming, "_monotonic", clock)
     kimi = SimulatedKimi(clock=clock, scripts=list(scripts), status=status)
     config = QuotaConfig()
     deadline = config.request_deadline_seconds if client_deadline is None else client_deadline
     rows: list[dict] = []
-    tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=50), kill_switch=lambda: True,
-                            ledger_recorder=rows.append)
+    tracker = BudgetTracker(budget or BudgetConfig(max_model_calls_per_run=50),
+                            kill_switch=lambda: True, ledger_recorder=rows.append,
+                            **tracker_kwargs)
 
     def inner_factory(api_key, base_url):
         return OpenAI(api_key=api_key, base_url=base_url, max_retries=0,
@@ -134,11 +136,13 @@ def assert_sanitized(text):
 
 @pytest.mark.parametrize("model", ["kimi-k3", "kimi-k2.6"])
 @pytest.mark.parametrize("role", sorted(ROLE_POLICIES))
-def test_every_swarm_v2_request_streams_and_asks_for_final_chunk_usage(model, role):
+def test_every_swarm_v2_request_streams_without_undocumented_stream_options(model, role):
     request = build_provider_request(PROFILES[model], ROLE_POLICIES[role],
                                      [{"role": "user", "content": "x"}], None)
     assert request["stream"] is True
-    assert request["stream_options"] == {"include_usage": True}
+    # Not documented for the Kimi models in any source MILO could verify, so
+    # never sent: usage comes from the final choice (or a usage chunk).
+    assert "stream_options" not in request
 
 
 def test_every_role_declares_its_total_deadline():
@@ -165,7 +169,7 @@ def test_slow_reasoning_stream_past_the_old_90s_total_completes_and_releases_the
     elapsed = stack.clock() - started
     assert elapsed > 160.0, "the call really did outlive the old 90s deadline"
     (wire,) = stack.kimi.requests
-    assert wire["stream"] is True and wire["stream_options"] == {"include_usage": True}
+    assert wire["stream"] is True and "stream_options" not in wire
     assert wire["reasoning_effort"] == "high" and wire["max_completion_tokens"] == 32_000
     # The inactivity window, not the whole budget, bounds every read.
     assert stack.kimi.timeouts[0]["read"] == STREAM_INACTIVITY_SECONDS
@@ -242,7 +246,8 @@ def test_the_total_deadline_stops_a_stream_that_never_finishes(monkeypatch, caps
     assert len(stack.held()) == 1
     assert [q["reason"] for q in stack.quarantines()] == ["PROVIDER_REQUEST_DEADLINE_EXCEEDED"]
     released = [r for r in stack.rows if r["decision"] == "settled"]
-    assert released[0]["actual_output_tokens"] == 0
+    # Unknown after send: charged the whole reservation, never zero.
+    assert released[0]["actual_output_tokens"] == 32_000
     out, (record,) = call_logs(capsys)
     assert record["code"] == PROVIDER_REQUEST_DEADLINE_EXCEEDED
     assert record["exception_class"] == "ProviderRequestDeadlineExceeded"
@@ -432,7 +437,7 @@ def _pre_prs_call_path(monkeypatch):
 
     def non_streaming(*args, **kwargs):
         request = original(*args, **kwargs)
-        request.pop("stream"), request.pop("stream_options")
+        request.pop("stream")
         return request
 
     monkeypatch.setattr(model_gateway, "build_provider_request", non_streaming)
@@ -443,8 +448,9 @@ def test_replay_5145ca65_as_it_happened_and_now_named(monkeypatch, capsys):
     """The run as it happened: kimi-k3 planning, effort high, cap 32,000,
     json_object, NON-streaming, 90s deadline, a provider thinking for 150s.
 
-    Unchanged: the request is UNKNOWN, the lease stays quarantined, 0 tokens.
-    Changed: the run is no longer told COMMANDER_COMPLETION_FAILED."""
+    Unchanged: the request is UNKNOWN and the lease stays quarantined.
+    Changed: the run is no longer told COMMANDER_COMPLETION_FAILED, and the
+    call is charged its whole worst-case reservation instead of 0 tokens."""
     _pre_prs_call_path(monkeypatch)
     script = StreamScript(answer=PLAN_JSON, reasoning_chunks=30, reasoning_interval=5.0)
     stack = build_stack(monkeypatch, [script], client_deadline=90.0)
@@ -461,7 +467,8 @@ def test_replay_5145ca65_as_it_happened_and_now_named(monkeypatch, capsys):
     assert [q["reason"] for q in stack.quarantines()] == ["PROVIDER_REQUEST_OUTCOME_UNKNOWN"]
     assert len(stack.held()) == 1
     (row,) = stack.settled()
-    assert row["actual_input_tokens"] == 0 and row["actual_output_tokens"] == 0
+    assert row["actual_input_tokens"] > 0 and row["actual_output_tokens"] == 32_000
+    assert row["actual_cost"] > 0
     # ...and now it is named for what it was.
     assert caught.value.code == PROVIDER_STREAM_INACTIVITY_TIMEOUT
     assert caught.value.code != "COMMANDER_COMPLETION_FAILED"
@@ -617,3 +624,235 @@ def test_the_log_writer_never_raises():
         payload={"model": "kimi-k3"}, agent="worker:secret-task-id", phase="execute",
         started_at=0.0, ended_at=1.0, response=object(), stream=io.StringIO())
     assert record["role"] == "worker:execute"
+
+
+# =============================================================================
+# 7. PR #137 review fixes
+# =============================================================================
+
+def _daily_budget_stack(monkeypatch, scripts, **kwargs):
+    """The stack with a daily budget, so the daily settlement is observable."""
+    settlements: list[tuple] = []
+    stack = build_stack(
+        monkeypatch, scripts,
+        budget=BudgetConfig(max_model_calls_per_run=50, daily_user_budget=100.0),
+        daily_user_reserver=lambda amount, seq: f"reservation-{seq}",
+        daily_user_cost_provider=lambda: 0.0,
+        daily_settler=lambda reservation, cost, status, reason: settlements.append(
+            (reservation.id, cost, status, reason)),
+        **kwargs)
+    stack.settlements = settlements
+    return stack
+
+
+@pytest.mark.parametrize("script, code, reason", [
+    (StreamScript(answer=PLAN_JSON, drop_after=10),
+     PROVIDER_STREAM_INTERRUPTED, "PROVIDER_OUTCOME_UNKNOWN"),
+    (StreamScript(answer=PLAN_JSON, finish_reason=None),
+     PROVIDER_STREAM_INTERRUPTED, "PROVIDER_OUTCOME_UNKNOWN"),
+    (StreamScript(answer=PLAN_JSON, reasoning_chunks=200),
+     PROVIDER_REQUEST_DEADLINE_EXCEEDED, "PROVIDER_DEADLINE_EXCEEDED"),
+], ids=["mid-stream-drop", "no-finish-reason", "total-deadline"])
+def test_an_unknown_outcome_after_send_is_charged_its_whole_worst_case_reservation(
+        monkeypatch, script, code, reason):
+    """MONEY: a request that was sent and cannot be proven finished may have
+    been billed in full. It used to settle 0 tokens / $0 into the run budget
+    and the daily settlement."""
+    stack = _daily_budget_stack(monkeypatch, [script])
+    with pytest.raises(ProviderTransportFailure) as caught:
+        plan(stack)
+    assert caught.value.code == code
+    assert len(stack.held()) == 1, "still quarantined: the charge changes no lease rule"
+
+    (reserved,) = [r for r in stack.rows if r["decision"] == "reserved"]
+    (row,) = stack.settled()
+    worst_case = reserved["estimated_cost"]
+    assert worst_case > 0
+    # Every reserved input token and the full output cap, at the worst case.
+    assert row["actual_output_tokens"] == 32_000
+    assert row["actual_input_tokens"] > 0
+    assert row["actual_cost"] == pytest.approx(worst_case)
+    assert row["actual_cost"] == pytest.approx(float(PROFILES["kimi-k3"].worst_case_cost(
+        row["actual_input_tokens"], 32_000)))
+    # Nothing was measured: the reasoning and answer counts are null, not 0.
+    for name in ("reasoning_tokens", "answer_tokens", "reasoning_tokens_estimated",
+                 "cached_input_tokens", "cache_write_tokens"):
+        assert row[name] is None, name
+    # The run budget...
+    tracker = stack.tracker
+    assert tracker.output_tokens == 32_000
+    assert tracker.input_tokens == row["actual_input_tokens"]
+    assert tracker.actual_cost == pytest.approx(worst_case)
+    assert tracker.reserved_cost == 0 and tracker.reserved_output_tokens == 0
+    assert tracker.reasoning_tokens == 0 and tracker.reasoning_estimated_calls == 0
+    assert tracker.provider_failures == 1
+    # ...and the daily settlement are both charged the worst case.
+    assert stack.settlements == [("reservation-1", pytest.approx(worst_case), "released", reason)]
+
+
+def test_the_5145ca65_inactivity_timeout_is_charged_its_worst_case_too(monkeypatch):
+    """The header/inactivity read timeout of the replay (no response object)."""
+    _pre_prs_call_path(monkeypatch)
+    script = StreamScript(answer=PLAN_JSON, reasoning_chunks=30, reasoning_interval=5.0)
+    stack = _daily_budget_stack(monkeypatch, [script], client_deadline=90.0)
+    with pytest.raises(ProviderTransportFailure) as caught:
+        plan(stack)
+    assert caught.value.code == PROVIDER_STREAM_INACTIVITY_TIMEOUT
+    (reserved,) = [r for r in stack.rows if r["decision"] == "reserved"]
+    (row,) = stack.settled()
+    assert row["actual_output_tokens"] == 32_000
+    assert row["actual_cost"] == pytest.approx(reserved["estimated_cost"])
+    assert row["reasoning_tokens"] is None and row["answer_tokens"] is None
+    assert stack.settlements == [("reservation-1", pytest.approx(reserved["estimated_cost"]),
+                                  "released", "PROVIDER_OUTCOME_UNKNOWN")]
+
+
+def test_a_proven_provider_failure_is_still_charged_nothing(monkeypatch):
+    """An HTTP error carries a provider response: the exchange is over and
+    nothing was generated, so the worst-case rule does not apply."""
+    stack = _daily_budget_stack(monkeypatch, [], status=500)
+    with pytest.raises(ProviderTransportFailure):
+        plan(stack)
+    (row,) = stack.settled()
+    assert row["actual_input_tokens"] == 0 and row["actual_output_tokens"] == 0
+    assert row["actual_cost"] is None
+    assert stack.tracker.actual_cost == 0
+    assert stack.settlements == [("reservation-1", 0.0, "released", "PROVIDER_EXCEPTION")]
+
+
+def _moonshot_chunks(model="kimi-k3"):
+    """Real `openai` ChatCompletionChunk objects in Moonshot's shape: usage on
+    the FINAL CHOICE (`choices[0].usage`), no usage-only chunk."""
+    from openai.types.chat import ChatCompletionChunk
+
+    def chunk(choice):
+        return ChatCompletionChunk.model_validate({
+            "id": "chatcmpl-moonshot", "object": "chat.completion.chunk", "created": 1,
+            "model": model, "choices": [choice]})
+
+    return [
+        chunk({"index": 0, "delta": {"role": "assistant", "content": None,
+                                     "reasoning_content": REASONING_SENTINEL},
+               "finish_reason": None}),
+        chunk({"index": 0, "delta": {"content": PLAN_JSON[:10]}, "finish_reason": None}),
+        chunk({"index": 0, "delta": {"content": PLAN_JSON[10:]}, "finish_reason": None}),
+        chunk({"index": 0, "delta": {}, "finish_reason": "stop",
+               "usage": {"prompt_tokens": 7_000, "completion_tokens": 21_000,
+                         "total_tokens": 28_000, "cached_tokens": 1_000,
+                         "completion_tokens_details": {"reasoning_tokens": 20_000}}}),
+    ]
+
+
+def test_moonshot_choice_usage_on_real_sdk_chunk_objects_is_assembled():
+    chunks = _moonshot_chunks()
+    # The SDK keeps the undeclared `usage` key on the choice.
+    assert chunks[-1].choices[0].usage is not None and chunks[-1].usage is None
+    assembled = assemble_chat_stream(iter(chunks))
+    assert assembled.choices[0].message.content == PLAN_JSON
+    assert assembled.choices[0].finish_reason == "stop"
+    counts = provider_streaming.usage_counts(assembled.usage)
+    assert counts == {"prompt_tokens": 7_000, "completion_tokens": 21_000,
+                      "reasoning_tokens": 20_000, "cached_tokens": 1_000}
+    assert REASONING_SENTINEL not in repr(assembled)
+
+
+def test_moonshot_choice_usage_reaches_the_ledger_without_stream_options():
+    sent: list[dict] = []
+
+    class MoonshotCompletions:
+        def create(self, **kwargs):
+            sent.append(kwargs)
+            return iter(_moonshot_chunks())
+
+    rows: list[dict] = []
+    tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=5), kill_switch=lambda: True,
+                            ledger_recorder=rows.append)
+    client = build_guarded_client_factory(tracker, inner_factory=lambda key, url: SimpleNamespace(
+        chat=SimpleNamespace(completions=MoonshotCompletions())))("k", "https://sim.invalid/v1")
+    request = build_provider_request(PROFILES["kimi-k3"], ROLE_POLICIES[("commander", "planning")],
+                                     [{"role": "user", "content": "x"}], None)
+    response = client.chat.completions.create(**request)
+
+    (wire,) = sent
+    assert wire["stream"] is True and "stream_options" not in wire
+    assert response.choices[0].message.content == PLAN_JSON
+    (row,) = [r for r in rows if r["decision"] == "settled"]
+    assert row["actual_input_tokens"] == 7_000 and row["actual_output_tokens"] == 21_000
+    assert row["reasoning_tokens"] == 20_000 and row["cached_input_tokens"] == 1_000
+
+
+@pytest.mark.parametrize("usage_style", ["choice", "chunk"])
+def test_reading_stops_once_finish_reason_and_usage_are_both_seen(monkeypatch, usage_style):
+    """A provider that goes silent after its final frame instead of sending
+    [DONE] must not turn a finished, measured request into an inactivity
+    timeout that quarantines the slot."""
+    stack = build_stack(monkeypatch, [StreamScript(answer=PLAN_JSON, usage_style=usage_style,
+                                                   hang_after_final=True)])
+    result = plan(stack)
+    assert result.graph.tasks[0].task_id == "t0"
+    (stream,) = stack.kimi.streams
+    assert not stream.read_past_final, "the reader waited past a finished, measured stream"
+    assert stream.closed
+    assert stack.held() == [] and stack.quarantines() == []
+    (row,) = stack.settled()
+    assert row["actual_input_tokens"] == 7_000 and row["actual_output_tokens"] == 21_000
+
+
+def test_usage_seen_only_before_the_finish_reason_does_not_end_the_read():
+    """Usage that precedes the finish_reason may be partial: keep reading for
+    the final one rather than settle on it."""
+    def partial_then_final():
+        yield {"choices": [{"index": 0, "delta": {"content": "{}"}, "finish_reason": None}],
+               "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        yield {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 20}}
+        raise AssertionError("read past the final usage")
+
+    assembled = assemble_chat_stream(partial_then_final())
+    assert assembled.usage == {"prompt_tokens": 10, "completion_tokens": 20}
+
+
+# --- a deployed deadline below the role policy is refused at boot -----------
+
+@pytest.mark.parametrize("override", [
+    {"MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS": "300"},
+    {"MILO_PROVIDER_LEASE_TTL_SECONDS": "400"},
+], ids=["request-timeout", "lease-ttl"])
+def test_paid_swarm_v2_refuses_a_deadline_below_the_longest_role(monkeypatch, override):
+    """The transport would silently clamp Commander planning's 600s to the
+    client ceiling. A paid Swarm V2 run refuses instead, before any call."""
+    from uuid import UUID
+
+    from backend.provider_quota import QuotaConfig as _QuotaConfig
+    from tests import test_swarm_v2_smoke_offline as smoke
+
+    smoke.swarm_env(monkeypatch, **override)
+    assert _QuotaConfig.from_env().request_deadline_seconds < MAX_ROLE_TOTAL_DEADLINE_SECONDS
+    repo, conversation_id = smoke.build_repo()
+    completions = smoke.FakeKimiCompletions()
+    run_id = smoke.run_worker_directly(repo, conversation_id, monkeypatch, completions)
+    from backend.worker import main as worker_main
+
+    assert worker_main.execute_run(UUID(str(run_id)), repo) == 0
+    run = repo.get_run(run_id)
+    assert run["status"] == "failed"
+    assert run["error"]["code"] == "PROVIDER_DEADLINE_BELOW_ROLE_POLICY"
+    assert completions.calls == [], "a provider call was made under a clamped deadline"
+
+
+def test_the_reviewed_deadline_admits_the_longest_role_at_boot(monkeypatch):
+    from backend.provider_quota import QuotaConfig as _QuotaConfig
+    from tests import test_swarm_v2_smoke_offline as smoke
+
+    smoke.swarm_env(monkeypatch, MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS=None,
+                    MILO_PROVIDER_LEASE_TTL_SECONDS=None)
+    assert _QuotaConfig.from_env().request_deadline_seconds >= MAX_ROLE_TOTAL_DEADLINE_SECONDS
+    repo, conversation_id = smoke.build_repo()
+    completions = smoke.FakeKimiCompletions()
+    run_id = smoke.run_worker_directly(repo, conversation_id, monkeypatch, completions)
+    from backend.worker import main as worker_main
+
+    assert worker_main.execute_run(run_id, repo) == 0
+    error = repo.get_run(run_id).get("error") or {}
+    assert error.get("code") != "PROVIDER_DEADLINE_BELOW_ROLE_POLICY"
+    assert completions.calls, "the reviewed configuration must reach the provider"
