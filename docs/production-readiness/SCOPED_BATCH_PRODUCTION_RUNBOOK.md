@@ -135,7 +135,8 @@ CI runs on pull requests only; there is no post-merge run on `main`. So
 From a shell with `gh` authenticated:
 
 ```bash
-PR_HEAD_SHA="$(git rev-parse "$RELEASE_SHA^2")"   # the merged PR's latest commit
+PR_HEAD_SHA="$(git rev-parse --verify --quiet "$RELEASE_SHA^2^{commit}")" \
+  || { echo "NOT A MERGE COMMIT: stop"; PR_HEAD_SHA=""; }      # the merged PR's latest commit
 gh run list --workflow ci --commit "$PR_HEAD_SHA" --repo giladscore494/milo-agent-workspace
 gh run list --workflow "Repo Scan" --commit "$PR_HEAD_SHA" --repo giladscore494/milo-agent-workspace
 test "$(git rev-parse "$RELEASE_SHA^{tree}")" = "$(git rev-parse "$PR_HEAD_SHA^{tree}")" \
@@ -143,8 +144,10 @@ test "$(git rev-parse "$RELEASE_SHA^{tree}")" = "$(git rev-parse "$PR_HEAD_SHA^{
   || echo "TREE DIFFERS: stop"
 ```
 
-The trees are equal only when the PR branch was up to date with `main` when it
-was merged; if they differ, the released code was never tested as a whole.
+The trees are equal when the PR branch was up to date with `main` when it was
+merged; if they differ, the released code was never tested as a whole. A
+squash or rebase merge produces no merge commit, so it is rejected here — merge
+release PRs with a merge commit.
 
 **Stop if** CI is not green for `$PR_HEAD_SHA`, the two trees differ,
 `$RELEASE_SHA` is not a merge commit, or the worktree is dirty.

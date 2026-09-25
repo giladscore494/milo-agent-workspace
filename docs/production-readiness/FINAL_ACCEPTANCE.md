@@ -130,7 +130,7 @@ secrets redacted.
 | Migrations + backfills | Supabase | backup verified | MIGRATIONS.md sequence | `check-migration-state.sh`; validation queries | forward corrective SQL |
 | Redis | Upstash | dedicated prod DB | Conn. 6 | `check-redis-config.sh` | restore endpoint; rotate token |
 | Vercel env + deploy | Vercel | Conn. 3 done | deployment plan steps 10–11 | `check-vercel-config.sh`; smoke tests | `vercel promote <previous>` |
-| Images + Cloud Run | Artifact Registry / Cloud Run | CI green on release SHA | `generate-deployment-plan.sh` output | revision digest verification | ROLLBACK.md |
+| Images + Cloud Run | Artifact Registry / Cloud Run | release SHA accepted per SCOPED_BATCH_PRODUCTION_RUNBOOK.md A.1 (CI green on the merged PR's latest commit, identical tree) | `generate-deployment-plan.sh` output | revision digest verification | ROLLBACK.md |
 | Stage C smoke run | provider | Stages A+B signed off | STAGED_ACTIVATION.md Stage C | acceptance record | kill-switch order |
 | Monitoring | operator's system | signals list | MONITORING_AND_INCIDENTS.md | alert test | n/a |
 | Catalog alert binding | operator's system | catalog signals list | MONITORING_AND_INCIDENTS.md §Catalog signals | alert test | n/a |
