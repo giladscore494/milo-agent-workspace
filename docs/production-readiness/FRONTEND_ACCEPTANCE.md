@@ -173,7 +173,7 @@ new backend event type is inert in the browser until it is added on purpose.
 ### D.1 Merged F4 contracts, re-run
 
 All of F4 is preserved and re-verified on this tree. `RunOutputPanel` still has
-a zero-line diff from `0fdab21`; `redactSecrets` is byte-identical.
+a zero-line diff from `0fdab21`; `redactSecrets` is byte-identical. _(historical: since `2622a5e` V1 renders the typed `VehicleCatalogResultPanel`; the no-longer-rendered `RunOutputPanel` was deleted in cleanup PR-1, set 1d)_.
 
 | Contract | Classification | Evidence |
 | --- | --- | --- |
@@ -186,7 +186,7 @@ a zero-line diff from `0fdab21`; `redactSecrets` is byte-identical.
 | Distinct usable / partial / not-found / no-usable-result states | `IMPLEMENTED_AND_PROVEN` | `tests/finalResultPanel.test.tsx`, E2E F4-1/3/4 |
 | No success presentation for invalid or contradictory payloads | `IMPLEMENTED_AND_PROVEN` | `tests/finalResult.test.ts` status/kind pairing and terminal-status mismatch cases |
 | Deterministic reconstruction after refresh | `IMPLEMENTED_AND_PROVEN` | E2E F4-5 (identical `innerHTML`), `tests/finalResultRouting.test.tsx` 6/6b |
-| V1 keeps its existing sanitized output path | `IMPLEMENTED_AND_PROVEN` | E2E F4-8; `tests/displaySecurity.test.tsx`; `RunOutputPanel` unchanged |
+| V1 keeps its existing sanitized output path | `IMPLEMENTED_AND_PROVEN` | E2E F4-8; `tests/displaySecurity.test.tsx`; `RunOutputPanel` unchanged (historical; deleted in cleanup PR-1) |
 
 **`not_found`.** `IMPLEMENTED_AND_PROVEN` as a **parser and rendering contract**;
 it remains **unreachable in production** because no registered tool returns
@@ -242,7 +242,7 @@ even when the same user signs back in.
 | E5 | Hostile project names, conversation titles, events, errors, task fields, result values and provenance remain inert text | `IMPLEMENTED_AND_PROVEN` | `safeText` at every render site; the closed F4 contract for result values | `tests/displaySecurity.test.tsx` (no element, no attribute created); `tests/swarmRunCard.test.tsx`; `tests/finalResultPanel.test.tsx` hostile payloads | — |
 | E6 | Only approved `NEXT_PUBLIC_*` variables enter the browser | `IMPLEMENTED_AND_PROVEN` (new) | see A9 | `tests/secretBundleCheck.test.ts`; E2E 28 | — |
 | E7 | Service-role/provider/worker secrets absent from source bundles **and served pages** | `IMPLEMENTED_AND_PROVEN` (was `IMPLEMENTED_TEST_GAP`) | `frontend/scripts/no-secret-bundle-check.mjs` now scans `.next*/static` as well as source | `npm run test:secrets`; `tests/secretBundleCheck.test.ts`; E2E 28 scans **every** served script (it previously stopped after ten) | — |
-| E8 | Inspector and legacy JSON surfaces remain redacted | `IMPLEMENTED_AND_PROVEN` (was `IMPLEMENTED_TEST_GAP`) | `components/inspector/RunInspector.tsx` and `components/run/RunOutputPanel.tsx` use `redactSecrets` | `tests/displaySecurity.test.tsx` (Claims and Developer tabs, V1 output panel) | `redactSecrets` is pattern-based; an unrecognised credential format is not redacted, which is why the typed contract exists beside it |
+| E8 | Inspector and legacy JSON surfaces remain redacted | `IMPLEMENTED_AND_PROVEN` (was `IMPLEMENTED_TEST_GAP`) | `components/inspector/RunInspector.tsx` and `components/run/RunOutputPanel.tsx` (historical; deleted in cleanup PR-1) use `redactSecrets` | `tests/displaySecurity.test.tsx` (Claims and Developer tabs, V1 output panel) | `redactSecrets` is pattern-based; an unrecognised credential format is not redacted, which is why the typed contract exists beside it |
 
 ### The four defences, and why none substitutes for another
 
@@ -324,7 +324,7 @@ shape of problem. Twelve of the fifteen tests in
 | G1 | The isolated Playwright suite covers every terminal state | `IMPLEMENTED_AND_PROVEN` | see B7 — all six, each produced through the real transition and outcome code |
 | G2 | Real production state transitions and outcome builders via test-only adapters | `IMPLEMENTED_AND_PROVEN` | `backend/testing/e2e_app.py` uses the shipped `FinalBuilder`, `finalize_product_outcome`, `durable_run_status`, `BudgetTracker` and now the production `JobLaunchUncertain` |
 | G3 | No paid model call, live data source, production Supabase or Cloud Run job | `IMPLEMENTED_AND_PROVEN` | in-process worker, mocked model adapters, `MemoryRepository`, mock auth server; `JOB_LAUNCHER=disabled` in both stacks |
-| G4 | V1 routing and output preserved | `IMPLEMENTED_AND_PROVEN` | E2E F4-8; `tests/finalResultRouting.test.tsx` 2/3; `RunOutputPanel` zero-line diff |
+| G4 | V1 routing and output preserved | `IMPLEMENTED_AND_PROVEN` | E2E F4-8; `tests/finalResultRouting.test.tsx` 2/3; `RunOutputPanel` zero-line diff (historical; deleted in cleanup PR-1) |
 | G5 | Stage C lifecycle, safety flags and provider boundaries preserved | `IMPLEMENTED_AND_PROVEN` | backend suite 2597 passed / 1 skipped; `scripts/check_unsafe_defaults.py`; `scripts/release/production-readiness.sh` |
 | G6 | Gateway allowlists preserved | `IMPLEMENTED_AND_PROVEN` | `tests/gatewayPolicy.test.ts`, `tests/gatewayRoute.test.ts`, E2E 8/11/16 |
 | G7 | Worker/gateway identity separation preserved | `IMPLEMENTED_AND_PROVEN` | E2E identity spec (4 cases); `backend/production_config.py` `SHARED_GATEWAY_WORKER_IDENTITY` |

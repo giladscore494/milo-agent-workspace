@@ -30,14 +30,8 @@ export const ACTIVE_RUN_STATUSES = [
 
 export type ActiveRunStatus = (typeof ACTIVE_RUN_STATUSES)[number];
 
-const ACTIVE_SET: ReadonlySet<string> = new Set<string>(ACTIVE_RUN_STATUSES);
-
 export function isTerminalRunStatus(status?: string | null): status is TerminalRunStatus {
   return typeof status === 'string' && TERMINAL_SET.has(status);
-}
-
-export function isActiveRunStatus(status?: string | null): status is ActiveRunStatus {
-  return typeof status === 'string' && ACTIVE_SET.has(status);
 }
 
 /**

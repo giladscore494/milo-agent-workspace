@@ -71,13 +71,12 @@ INVENTORY=(
   "SUPABASE_URL|shared-api-worker|no|backend/config.py"
   "SUPABASE_SERVICE_ROLE_KEY|shared-api-worker|yes|backend/config.py"
   "SUPABASE_SECRET_KEY|shared-api-worker|yes|backend/config.py"
-  "ENVIRONMENT|shared-api-worker|no|backend/config.py"
+  "ENVIRONMENT|shared-api-worker|no|backend/production_config.py"
   "ALLOWED_CORS_ORIGINS|cloud-run-api-only|no|backend/config.py"
   "JOB_LAUNCHER|cloud-run-api-only|no|backend/config.py"
   "GCP_PROJECT_ID|cloud-run-api-only|no|backend/config.py"
   "GCP_REGION|cloud-run-api-only|no|backend/config.py"
   "CLOUD_RUN_WORKER_JOB|cloud-run-api-only|no|backend/config.py"
-  "RATE_LIMIT_PER_MINUTE|cloud-run-api-only|no|backend/config.py"
   "MILO_GATEWAY_AUDIENCE|cloud-run-api-only|no|backend/gateway_auth.py"
   "MILO_APPROVED_GATEWAY_IDENTITIES|cloud-run-api-only|no|backend/gateway_auth.py"
   "MILO_WORKER_AUDIENCE|cloud-run-api-only|no|backend/worker_auth.py"
@@ -179,7 +178,6 @@ INVENTORY=(
   "MILO_EXPECTED_SUPABASE_PROJECT_REF|shared-api-worker|no|backend/production_config.py"
   "MILO_EXPECTED_REDIS_HOST|staging-only|no|backend/production_config.py"
   "MILO_REQUIRE_PG_TESTS|local-test-only|no|tests/test_migrations_postgres.py"
-  "NEXT_PUBLIC_API_URL|deprecated|no|.github/workflows/ci.yml"
 )
 
 EXECUTION_FLAGS=(

@@ -377,7 +377,7 @@ Done כאשר: כל durable write של V2 כפוף לאותו lease token כמו
 
 מוקדי קוד:
 
-- \`backend/internet_governance.py\` — reuse/extend conservatively.
+- \`backend/internet_governance.py\` — reuse/extend conservatively. _(Historical: the module was never wired into production and was removed in cleanup PR-1, set 1c; see `docs/cleanup/CLEANUP_INVENTORY.md` B3.)_
 
 - \`swarm_v2/evidence.py\`
 
@@ -1307,7 +1307,7 @@ Yeda GitHub branch / PR</th>
 | MILO main — backend/worker/main.py + backend/worker/engine.py                      | Engine Protocol, lifecycle, current hardcoded V1 selection וה־checkpoint routing issue.                  |
 | MILO main — backend/engines/vehicle_catalog_v1/adapter.py + engine.py              | Dependency injection, callbacks, per-run ProviderScheduler, checkpoints.                                 |
 | MILO main — backend/provider_scheduler.py                                          | Concurrency/RPM/TPM/backpressure contract שכבר הוכח.                                                     |
-| MILO main — backend/schemas.py + backend/internet_governance.py + migration 005    | Tool/source/claim/conflict contracts and existing evidence tables.                                       |
+| MILO main — backend/schemas.py + backend/internet_governance.py (historical; removed in cleanup PR-1) + migration 005    | Tool/source/claim/conflict contracts and existing evidence tables.                                       |
 | MILO main — backend/repository/supabase.py                                         | Lease-guarded worker writes הקיימים והפער ב־tool/source/claim/conflict direct inserts.                   |
 | Yeda — reliabilityAIModelsR2/my-flask-app/app/data/model_technical_catalog_il.json | קובץ הקטלוג הקיים שאליו מתחברים בשלב 2.                                                                  |
 | Yeda — vehicle_catalog_service.py                                                  | Root models, technical_variants_il, deterministic variant_id, source/model metadata, catalog hash/cache. |

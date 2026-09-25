@@ -3,6 +3,7 @@
 **Scope: presentation of an existing contract.** F4 adds no endpoint, no
 environment variable, no gateway route, no migration and no backend behaviour.
 It replaces the raw-JSON display Swarm V2 runs used to get in `RunOutputPanel`
+(historical; that panel was deleted in cleanup PR-1)
 with a typed, deterministic, fail-closed product surface, and it changes
 nothing for any other workflow.
 
@@ -19,7 +20,7 @@ two apart:
 | `SwarmRunCard` | execution: lifecycle, tasks, usage, terminal status | `components/swarm/` |
 | **Final Result** | the product answer: verified fields, outstanding items | `components/result/` |
 | `RunInspector` | technical detail, raw events, developer payloads | `components/inspector/` |
-| `RunOutputPanel` | the V1 sanitized-output path, unchanged | `components/run/` |
+| `VehicleCatalogResultPanel` | the typed V1 vehicle-catalog result (replaced the V1 sanitized-output `RunOutputPanel`, deleted in cleanup PR-1) | `components/result/` |
 
 **Workflow identity comes from trusted project state.** `app/page.tsx` selects
 the surface from `project.workflow_key` (via `swarm.isSwarmV2`), exactly as it

@@ -398,7 +398,7 @@ on the strength of a stated decision **and** a named successor — not on absenc
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | FE-01 | F4 | A typed, fail-closed frontend contract for all four result kinds | `frontend/lib/finalResult.ts:47-50,649-790` | 162 F4 unit tests + 10 Playwright cases (PR #89) | UI gated behind `NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI` (default off) | `COMPLETED_IN_CODE_NOT_ACTIVATED` | flag off by default (intended) | `OPERATOR` |
 | FE-02 | F4 | Surface chosen from the trusted `workflow_key`, never from the payload | `frontend/app/page.tsx:181-207`; `swarmViewModel.ts:172` | `frontend/tests/*`, E2E | same | `COMPLETED_AND_CONNECTED` | none | `NONE` |
-| FE-03 | F4 | V1 keeps `RunOutputPanel` byte-for-byte | `app/page.tsx:598` gated on `!swarm.isSwarmV2`; zero-line diff recorded in PR #89 | V1 regression suite | n/a | `COMPLETED_AND_CONNECTED` | none | `NONE` |
+| FE-03 | F4 | V1 keeps `RunOutputPanel` byte-for-byte (historical; superseded by `VehicleCatalogResultPanel` in `2622a5e`, deleted in cleanup PR-1) | `app/page.tsx:598` gated on `!swarm.isSwarmV2`; zero-line diff recorded in PR #89 | V1 regression suite | n/a | `COMPLETED_AND_CONNECTED` | none | `NONE` |
 | FE-04 | F4 | `not_found` is rendered | `finalResult.ts:784`; `outcome.py:134` | unit + fixture | **unreachable in production** — no registered tool emits `TRUSTED_SOURCE_NO_MATCH` (`outcome.py:65,80`; `engine.py:503`) | `INTENTIONALLY_DEFERRED` | a production producer is deliberately absent | `NONE` |
 | FE-05 | F5 | Session/project/conversation/run ownership on every durable browser write | `frontend/lib/ownership.ts`; `app/page.tsx` | `tests/stateOwnership.test.tsx` (13 recorded defects, each with a failing-first test) | isolated stack only | `COMPLETED_AND_CONNECTED` | none | `NONE` |
 | FE-06 | F5 | Closed, application-owned error copy; no upstream prose | `frontend/lib/errorText.ts` `ERROR_COPY`; `supabaseClient.ts` `AuthFailure` from status only | `tests/errorText.test.ts`, `tests/supabaseClient.test.ts` | isolated stack | `COMPLETED_AND_CONNECTED` | none | `NONE` |
@@ -567,7 +567,7 @@ module's own post-write verification.
 outcome while V1 remains isolated?** Yes. `parseFinalResult` is total over the
 four kinds and the four legal `(status, result_kind)` pairs; `FinalResultPanel`
 is mounted only when the *project's trusted* `workflow_key` says `swarm_v2`
-(`app/page.tsx:181-207`), and `RunOutputPanel` renders only when it does not,
+(`app/page.tsx:181-207`), and `RunOutputPanel` (historical; deleted in cleanup PR-1) renders only when it does not,
 with a zero-line diff to V1. The one caveat is by design: `not_found` is
 rendered but unreachable in production, because no registered tool emits
 `TRUSTED_SOURCE_NO_MATCH`. Both surfaces sit behind
