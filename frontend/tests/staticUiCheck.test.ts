@@ -22,7 +22,7 @@ describe('static UI marker coverage after component extraction', () => {
     const app = read('app');
     const components = read('components');
     // These markers moved out of app/page.tsx, so a page-only scan would miss them.
-    for (const marker of ['Live event stream', 'Final artifacts', 'Live run', 'Workflow proposal']) {
+    for (const marker of ['Live event stream', 'Pipeline quality', 'Live run', 'Workflow proposal']) {
       expect(app).not.toContain(marker);
       expect(components).toContain(marker);
     }
@@ -34,10 +34,10 @@ describe('static UI marker coverage after component extraction', () => {
 
   it('fails deterministically and names a marker that disappears from components', () => {
     withWorkspace((workspace) => {
-      rmSync(join(workspace, 'components/run/RunOutputPanel.tsx'));
+      rmSync(join(workspace, 'components/result/VehicleCatalogResultPanel.tsx'));
       const result = spawnSync('node', [SCRIPT], { cwd: workspace, encoding: 'utf8' });
       expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain('Missing UI marker: Final artifacts');
+      expect(result.stderr).toContain('Missing final-result marker: Pipeline quality');
     });
   });
 });

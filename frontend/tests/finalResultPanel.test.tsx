@@ -4,14 +4,12 @@
  * Rendered against the SAME committed backend payloads the parser tests use,
  * so what a reviewer sees here is what the engine actually emits. The
  * assertions cover the product answer, the separation from the execution
- * surface, the five non-result states, hostile input, accessibility and the
- * V1 path that must not change.
+ * surface, the five non-result states, hostile input and accessibility.
  */
 
 import { render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { FinalResultPanel } from '../components/result/FinalResultPanel';
-import { RunOutputPanel } from '../components/run/RunOutputPanel';
 import { NO_USABLE_RESULT_CODE } from '../lib/finalResult';
 import fixtures from './fixtures/swarmV2FinalResult.json';
 import {
@@ -265,19 +263,6 @@ describe('5. surface separation', () => {
     const { container } = renderPanel({ visible: false });
     expect(container).toBeEmptyDOMElement();
   });
-
-  it('5c. V1 keeps its existing sanitized-output panel, unchanged', () => {
-    render(<RunOutputPanel visible output={{ summary: 'V1 mocked output', artifacts: { report: 'body' } }} />);
-    expect(screen.getByRole('heading', { name: 'Final artifacts' })).toBeInTheDocument();
-    expect(screen.getByText(/V1 mocked output/)).toBeInTheDocument();
-    // The V1 panel is deliberately still the raw sanitized dump.
-    expect(document.querySelector('pre.code-block')).toBeInTheDocument();
-  });
-
-  it('5d. the V1 panel still says plainly when nothing was recorded', () => {
-    render(<RunOutputPanel visible output={undefined} />);
-    expect(screen.getByText('The backend has recorded no output payload for this run.')).toBeInTheDocument();
-  });
 });
 
 describe('6. accessibility and responsive structure', () => {
@@ -523,15 +508,6 @@ describe('9. no credential survives into the rendered DOM', () => {
     // The field is still reported; only its content is replaced.
     expect(screen.getByText('Fuel type')).toBeInTheDocument();
     expect(screen.getByText('[REDACTED]')).toBeInTheDocument();
-  });
-
-  it('9d. V1 keeps its own existing sanitized-output behaviour, unchanged', () => {
-    // RunOutputPanel still uses redactSecrets over the whole payload. F4 must
-    // not have altered what V1 shows.
-    render(<RunOutputPanel visible output={{ summary: 'V1 mocked output', note: JWT_SENTINEL }} />);
-    expect(screen.getByRole('heading', { name: 'Final artifacts' })).toBeInTheDocument();
-    expect(screen.getByText(/V1 mocked output/)).toBeInTheDocument();
-    expect(document.querySelector('pre.code-block')).toBeInTheDocument();
   });
 });
 

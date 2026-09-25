@@ -6,12 +6,6 @@ import type { WorkScopeEdit } from './workScope';
 
 const API = '/api/gateway';
 
-export const clientConfig = {
-  apiBaseUrl: API,
-  supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL,
-  supabaseAnonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-};
-
 /**
  * The execution UI flag only controls what the browser renders; it is never
  * a security boundary. The gateway allowlist and the backend execution

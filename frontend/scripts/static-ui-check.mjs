@@ -41,13 +41,15 @@ const reducer = readFileSync('lib/runReducer.ts', 'utf8');
 
 
 /** User-visible surfaces that must survive any refactor of the workspace. */
-const requiredUi = ['Projects', 'Conversations', 'Workflow proposal', 'Live run', 'Live event stream', 'Final artifacts', 'Agents', 'Workflow', 'Sources', 'Claims', 'Conflicts', 'Costs', 'Developer', 'forbidden', 'approved', 'active'];
+const requiredUi = ['Projects', 'Conversations', 'Workflow proposal', 'Live run', 'Live event stream', 'Agents', 'Workflow', 'Sources', 'Claims', 'Conflicts', 'Costs', 'Developer', 'forbidden', 'approved', 'active'];
 /**
- * The F4 product surface. `Final result` is a DIFFERENT surface from `Final
- * artifacts`: both markers are required, so the typed Swarm V2 result and the
- * V1 sanitized-output path can never be collapsed into one panel by a refactor.
+ * The F4 product surface. `Final result` (the typed Swarm V2 result) is a
+ * DIFFERENT surface from `Pipeline quality` (the typed V1 vehicle-catalog
+ * result, which replaced the old sanitized-output panel): both markers are
+ * required, so the two engine result surfaces can never be collapsed into one
+ * panel by a refactor.
  */
-const requiredFinalResult = ['Final result', 'Verified fields', 'Outstanding items', 'Result unavailable', 'parseFinalResult', 'Provenance'];
+const requiredFinalResult = ['Final result', 'Pipeline quality', 'Verified fields', 'Outstanding items', 'Result unavailable', 'parseFinalResult', 'Provenance'];
 /** Security and durable-contract behaviour that must stay wired into the UI. */
 const requiredSecurity = ['safeText', 'redactSecrets', 'milo.activeRun.', 'Run finished with status', 'aria-expanded', 'aria-controls'];
 /**

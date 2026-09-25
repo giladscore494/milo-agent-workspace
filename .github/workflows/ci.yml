@@ -21,7 +21,6 @@ jobs:
       SUPABASE_URL: https://example.supabase.co
       SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
       JOB_LAUNCHER: disabled
-      NEXT_PUBLIC_API_URL: http://localhost:8080
       MILO_REQUIRE_PG_TESTS: '1'
     steps:
       - uses: actions/checkout@v5
@@ -76,7 +75,6 @@ jobs:
       SUPABASE_URL: https://example.supabase.co
       SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
       JOB_LAUNCHER: disabled
-      NEXT_PUBLIC_API_URL: http://localhost:8080
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5

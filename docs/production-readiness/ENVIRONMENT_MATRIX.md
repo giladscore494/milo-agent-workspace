@@ -29,7 +29,6 @@ disabled (Stage A).
 | `ALLOWED_CORS_ORIGINS` | api | no | no | yes (explicit) | yes | production Vercel domain(s) | wildcard rejected (`CORS_WILDCARD`) | localhost only | restore previous origin list |
 | `JOB_LAUNCHER` | api | no | no | yes (`disabled` at Stage A) | must be `disabled` | operator | config check | `disabled` | set `disabled` (kill switch) |
 | `GCP_PROJECT_ID` / `GCP_REGION` / `CLOUD_RUN_WORKER_JOB` | api | no | no | yes when launcher enabled | no | manifest | `check-gcp-resources.sh` | code defaults (overridden in prod) | restore previous values |
-| `RATE_LIMIT_PER_MINUTE` | api | no | no | no | no | operator tuning | code default | 60 | unset |
 | `MILO_GATEWAY_AUDIENCE` | api | no | no | yes | yes | Cloud Run API URL | fail-closed 503 when missing | none (503) | restore previous audience |
 | `MILO_APPROVED_GATEWAY_IDENTITIES` | api | no | no | yes | yes | gateway SA email(s) | fail-closed; disjoint from worker list | none (503) | remove identity to revoke gateway |
 | `MILO_WORKER_AUDIENCE` | api | no | no | yes before Stage B | no | Cloud Run API URL | fail-closed on worker routes | none (worker routes 503) | restore |
@@ -54,7 +53,6 @@ disabled (Stage A).
 | `MILO_EXPECTED_SUPABASE_PROJECT_REF` | api+worker | no | no | yes | yes | approved manifest `supabase.project_ref`; bound by the deployment to BOTH the API service and the worker job | fail-closed startup: required in production (`PRODUCTION_DEPENDENCY_UNPINNED`), rejected if malformed (`PRODUCTION_DEPENDENCY_MALFORMED`) or if `SUPABASE_URL` is not exactly that project's hosted root URL — path, query, fragment, port, credentials and suffix-smuggled hosts all refused (`PRODUCTION_DEPENDENCY_MISMATCH`); same contract in staging under `STAGING_DEPENDENCY_*` | none (startup fails) | update the manifest ref, redeploy both resources |
 | `MILO_EXPECTED_REDIS_HOST` | api+worker (staging only) | no | no | n/a | n/a | required when `ENVIRONMENT=staging`: runtime refuses any other Redis endpoint | fail-closed startup | unset | n/a |
 | `MILO_REQUIRE_PG_TESTS` | test | no | no | n/a (CI only) | n/a | CI | CI job | unset | n/a |
-| `NEXT_PUBLIC_API_URL` | deprecated | yes | no | no | no | legacy CI env only | inventory marks deprecated | unset | remove from CI when convenient |
 
 Notes:
 
