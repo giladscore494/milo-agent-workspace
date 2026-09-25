@@ -221,7 +221,8 @@ is not byte-reproducible:
   python:3.12-slim`, a **mutable** upstream tag that is re-published;
 - `backend/requirements.txt` pins most packages but carries
   `openai>=1.30.0`, an **unpinned floor** that resolves to whatever is
-  newest at build time;
+  newest at build time (at the time of this proposal; `backend/requirements.txt`
+  now pins `openai==3.16.2`);
 - there is no lockfile and no `--require-hashes`, so transitive
   dependencies float as well.
 

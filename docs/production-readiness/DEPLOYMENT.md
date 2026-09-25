@@ -1,8 +1,16 @@
 # Deployment preparation
 
 Status: command plans and validation `COMPLETED_IN_CODE`; every actual
-deployment step is `REQUIRES_MANUAL_OPERATOR_CONFIGURATION`. No CI job and
-no script in this repository deploys anything.
+deployment step is `REQUIRES_MANUAL_OPERATOR_CONFIGURATION`. No CI job
+deploys application images. Operator scripts do change production **when an
+operator runs them with credentials**: `scripts/deploy/cloud-run.sh` in
+`DEPLOY_MODE=apply` (builds and deploys both images),
+`scripts/deploy/production-activate.sh` and
+`scripts/deploy/website-execution-activate.sh`. Database migrations are
+applied only by the SHA-bound `.github/workflows/deploy-supabase-migrations.yml`
+(typed `APPLY_PRODUCTION_MIGRATIONS` dispatch; its push trigger applies
+nothing unless `SUPABASE_MIGRATIONS_AUTO_APPLY` is set, which must stay
+unset). See [MIGRATIONS.md](MIGRATIONS.md).
 
 ## Immutable images
 

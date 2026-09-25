@@ -1,3 +1,5 @@
+> **HISTORICAL — superseded by [`SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](../production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md).** A dated record kept as evidence; do not follow it as current procedure.
+
 # MILO Gap Audit — 2026-09-16
 
 Reconciliation of the original three-stage roadmap with the system that exists

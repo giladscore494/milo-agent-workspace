@@ -18,8 +18,13 @@ automatically.
 5. revoke the worker's provider-secret binding if necessary;
 6. the API remains read-only where safe.
 
-Flags are individual by design; there is no disable-all script either —
-each step is explicit and auditable.
+Flags are individual by design and each step is explicit and auditable. No
+script covers this whole order today: the two historical kill switches
+(`scripts/release/stage-c/kill-switch.sh` and
+`scripts/release/stage-d/kill-switch.sh`) set only the Stage C/D flag set and
+do not touch `MILO_ENABLE_WORK_SCOPE_*`, `MILO_ENABLE_GOVERNMENT_CATALOG_READ`,
+`MILO_ENABLE_CATALOG_PROMOTION` or any Vercel variable (see
+`docs/cleanup/CLEANUP_INVENTORY.md`, decision D5).
 
 ## Catalog execution — the independent rollback
 
@@ -37,10 +42,10 @@ gcloud run jobs update <CLOUD_RUN_WORKER_JOB> \
 **Order.** Reach for this FIRST for a catalog-specific incident — a wrong
 canonical value, an unexpected promotion, a refusal pattern that looks like a
 defect. Escalate to the general order above only if the incident is not
-confined to the catalog. If the general order has already been run, the Stage C
-kill switch (`scripts/release/stage-c/kill-switch.sh`) sets this flag false on
-the worker as part of its shutdown and verifies it afterwards, so the catalog is
-closed either way.
+confined to the catalog. The general order above does not itself set this
+flag; if the Stage C kill switch (`scripts/release/stage-c/kill-switch.sh`) was
+used instead, it sets this flag false on the worker as part of its shutdown and
+verifies it afterwards.
 
 **Verification evidence to capture (all read-only):**
 
