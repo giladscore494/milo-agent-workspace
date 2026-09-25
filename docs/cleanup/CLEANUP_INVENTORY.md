@@ -6,6 +6,13 @@
 > PR until this document is approved. Every merged cleanup PR is
 > **merged-not-deployed (pending Gate 0)**.
 
+> **Deployment status (updated 2026-09-25).** Production (API, worker and
+> capture job) was deployed by the owner at `24ea412` on 2026-09-25 13:50 UTC.
+> PR-0 to PR-3 (#125 `36a7b6d`, #126 `d097b1d`, #127 `d3a1743`, #128
+> `24ea412`) are therefore **live**. The Gate 0 baseline is measured against
+> `24ea412`. Cleanup PRs merged after that commit are merged-not-deployed until
+> the owner's next deploy decision.
+
 Governing plan: `MILO_REAL_RUN_ENABLEMENT_TECHNICAL_PLAN` Revision 2.2, §10
 (PR-CLEAN) and Appendix A. Allowed classes: `ACTIVE | COMPATIBILITY_REQUIRED |
 OPERATOR_ONLY | TEST_ONLY | SUPERSEDED | UNREACHABLE | DUPLICATE |

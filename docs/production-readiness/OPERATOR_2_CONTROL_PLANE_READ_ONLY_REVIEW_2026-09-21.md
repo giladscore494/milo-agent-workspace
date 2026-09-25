@@ -1,3 +1,5 @@
+> **HISTORICAL — superseded by [`SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](SCOPED_BATCH_PRODUCTION_RUNBOOK.md).** A dated record kept as evidence; do not follow it as current procedure.
+
 # Operator 2 — Control-plane Production readiness, read-only review
 
 **Date:** 2026-09-21

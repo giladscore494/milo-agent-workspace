@@ -1,3 +1,5 @@
+> **HISTORICAL — superseded by [`SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](SCOPED_BATCH_PRODUCTION_RUNBOOK.md).** A dated record kept as evidence; do not follow it as current procedure.
+
 # Stage B acceptance report
 
 Date: 2026-08-10 (corrective pre-merge pass: 2026-08-11). Release under

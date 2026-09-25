@@ -8,6 +8,8 @@ this set wins and the older document carries an archive banner.
 
 ## Navigation
 
+### Current
+
 | Document | Contents |
 | --- | --- |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Final architecture, trust boundaries, diagrams |
@@ -33,14 +35,27 @@ this set wins and the older document carries an archive banner.
 | [MONITORING_AND_INCIDENTS.md](MONITORING_AND_INCIDENTS.md) | Signals, alerts, incident response, kill switches |
 | [ROLLBACK.md](ROLLBACK.md) | Forward-safe rollback for every component |
 | [FINAL_ACCEPTANCE.md](FINAL_ACCEPTANCE.md) | Phases 9–11 acceptance audit and classifications |
-| [STATUS.md](STATUS.md) | Live branch/PR/test status |
+| [../catalog-code1-operator-capture.md](../catalog-code1-operator-capture.md) | CODE-1: the guarded operator Government capture entrypoint — arguments, prerequisites, stop conditions, report contract and rollback. Implemented in code; **no live capture has been executed** |
+
+### Historical records
+
+Dated records kept as evidence. Each carries a `HISTORICAL` (or `SUPERSEDED`)
+banner at the top; none of them is a current procedure. The current
+production path is [SCOPED_BATCH_PRODUCTION_RUNBOOK.md](SCOPED_BATCH_PRODUCTION_RUNBOOK.md)
+and recovery is [ROLLBACK.md](ROLLBACK.md).
+
+| Document | Contents |
+| --- | --- |
+| [STATUS.md](STATUS.md) | Branch/PR/test status log (superseded as a statement of the current state since 2026-09-16) |
 | [STAGE_B_ACCEPTANCE.md](STAGE_B_ACCEPTANCE.md) | Stage B acceptance record |
 | [STAGE_C_ACCEPTANCE.md](STAGE_C_ACCEPTANCE.md) | Stage C acceptance record — **PASSED 2026-08-22; the one-run authorization is consumed** |
 | [STAGE_D_AUTHORIZATION.md](STAGE_D_AUTHORIZATION.md) | Stage D expansion step 1 — **attempt 1 executed 2026-09-19 and FAILED (`timed_out`); attempt 2 PROPOSED, NOT authorized and NOT executed** |
-| [../catalog-code1-operator-capture.md](../catalog-code1-operator-capture.md) | CODE-1: the guarded operator Government capture entrypoint — arguments, prerequisites, stop conditions, report contract and rollback. Implemented in code; **no live capture has been executed** |
+| [../roadmap/MILO_GAP_AUDIT_2026-09-16.md](../roadmap/MILO_GAP_AUDIT_2026-09-16.md) | Gap audit after Catalog PR3 / F4 / F5: what is production-connected, what exists but is not activated, what is fixture-only, and what remains missing |
+| [OPERATOR_0_PRODUCTION_SCHEMA_INSPECTION_2026-09-17.md](OPERATOR_0_PRODUCTION_SCHEMA_INSPECTION_2026-09-17.md) | Read-only Production schema inspection (2026-09-17) |
+| [OPERATOR_1_PRODUCTION_MIGRATION_ALIGNMENT_2026-09-18.md](OPERATOR_1_PRODUCTION_MIGRATION_ALIGNMENT_2026-09-18.md) | Production migration alignment (2026-09-18) |
 | [OPERATOR_2_CONTROL_PLANE_READ_ONLY_REVIEW_2026-09-21.md](OPERATOR_2_CONTROL_PLANE_READ_ONLY_REVIEW_2026-09-21.md) | Read-only Production review after Consoles 1-6: required migration/RPC inventory, ACL/RLS posture, catalog state, run baseline. **Four runtime-required migrations were unapplied at review time — applied 2026-09-22, see OPERATOR_3** |
 | [OPERATOR_3_PRODUCTION_ALIGNMENT_2026-09-22.md](OPERATOR_3_PRODUCTION_ALIGNMENT_2026-09-22.md) | Production migration alignment to Console 6 (38/38, head `20260921000200`): SHA-bound backup / dry-run / apply run ids, the 45/45 derived RPC inventory re-proven from `pg_proc`, run identity, ACLs, and the stale-release prerequisite for any future paid run |
-| [../roadmap/MILO_GAP_AUDIT_2026-09-16.md](../roadmap/MILO_GAP_AUDIT_2026-09-16.md) | Gap audit after Catalog PR3 / F4 / F5: what is production-connected, what exists but is not activated, what is fixture-only, and what remains missing |
+| [OPERATOR_4_PRODUCTION_ACTIVATION_AUDIT_2026-09-22.md](OPERATOR_4_PRODUCTION_ACTIVATION_AUDIT_2026-09-22.md) | Production activation audit at Console 6 / #111 (2026-09-22) |
 
 Operator tooling lives in `scripts/release/` (read-only by default; see
 `scripts/release/production-readiness.sh --help`). The non-secret release

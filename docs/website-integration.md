@@ -134,7 +134,9 @@ exportable, and rendered with the identity-unavailable state.
 Transport is authenticated polling (`frontend/lib/useRunRealtime.ts`, 3 s base,
 30 s backoff, `after_event_id` cursor, stops on terminal, Supabase Realtime
 deliberately disabled). Refresh and reconnect rebuild state from
-`GET /runs/{id}` + `GET /runs/{id}/events` through `reconstructRun`.
+`GET /runs/{id}` + `GET /runs/{id}/events`, folding each event through
+`reduceRunEvent` (`frontend/lib/runReducer.ts`; `reconstructRun` is the same
+fold for a whole event list and is exercised by the tests).
 
 `components/run/LiveRunPanel.tsx` renders one view for both engines from
 `buildLiveRunViewModel`:
@@ -190,7 +192,8 @@ payload it did not emit.
 ### Survival across refresh, reconnect, restart and history
 
 * Refresh / reconnect: the run id is in session storage per conversation; the
-  hook re-reads the run and events and `reconstructRun` rebuilds the state.
+  hook re-reads the run and events and folds them through `reduceRunEvent`
+  to rebuild the state.
 * Browser restart / another device: session storage is gone, so the workspace
   now reads `GET /conversations/{id}/runs` (new; `backend/main.py
   list_conversation_runs`, bounded to 50, membership-scoped through the

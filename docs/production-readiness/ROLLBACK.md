@@ -8,18 +8,68 @@ automatically.
 
 ## Execution flags — emergency order
 
-1. `MILO_ENABLE_PAID_EXECUTION` off;
-2. `MILO_ENABLE_RUN_CREATION` off (and at the gateway
-   `GATEWAY_ALLOW_RUN_START_ROUTES` off, which refuses every run start,
-   then `GATEWAY_ALLOW_EXECUTION_ROUTES` off);
-3. worker launch off (`JOB_LAUNCHER=disabled`);
-4. worker route access restricted (verify
-   `MILO_APPROVED_WORKER_IDENTITIES`);
-5. revoke the worker's provider-secret binding if necessary;
-6. the API remains read-only where safe.
+This is the **one canonical** emergency shutdown order (owner decision,
+2026-09-25). Every other runbook that describes a shutdown points here instead
+of restating an order of its own.
 
-Flags are individual by design; there is no disable-all script either —
-each step is explicit and auditable.
+1. **Vercel:** `GATEWAY_ALLOW_RUN_START_ROUTES=false`, then redeploy. The
+   gateway opens run starts only on the value `true` (trimmed, any case), so
+   from the redeploy on every run start is refused at the gateway.
+2. `MILO_ENABLE_PAID_EXECUTION=false` on the worker job and the API service —
+   no provider spend.
+3. On the API: `MILO_ENABLE_RUN_CREATION=false`,
+   `MILO_ENABLE_WORK_SCOPE_BATCHES=false`, `JOB_LAUNCHER=disabled` — no new
+   runs, no new batches, no worker launches.
+4. `MILO_ENABLE_GOVERNMENT_CATALOG_READ=false` on the worker job and the API
+   service.
+5. Remove the provider API key from the worker (`--remove-secrets KIMI_API_KEY`).
+
+```bash
+# 1. Vercel (remove the value, or set it to anything but `true`), then redeploy
+#    the current Production deployment (dashboard → Deployments → Redeploy).
+vercel env rm GATEWAY_ALLOW_RUN_START_ROUTES production --yes
+# 2. Paid execution off on both surfaces.
+gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \
+  --update-env-vars MILO_ENABLE_PAID_EXECUTION=false
+gcloud run services update <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> \
+  --update-env-vars MILO_ENABLE_PAID_EXECUTION=false
+# 3. Run creation, batches and the launcher off on the API.
+gcloud run services update <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> \
+  --update-env-vars '^;^MILO_ENABLE_RUN_CREATION=false;MILO_ENABLE_WORK_SCOPE_BATCHES=false;JOB_LAUNCHER=disabled'
+# 4. Government catalog read off on both surfaces.
+gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \
+  --update-env-vars MILO_ENABLE_GOVERNMENT_CATALOG_READ=false
+gcloud run services update <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> \
+  --update-env-vars MILO_ENABLE_GOVERNMENT_CATALOG_READ=false
+# 5. Remove the provider credential from the worker.
+gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \
+  --remove-secrets KIMI_API_KEY
+```
+
+After step 5, confirm the key is gone: `gcloud run jobs describe
+<CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> --format json` must show neither
+`KIMI_API_KEY` nor `MOONSHOT_API_KEY`, in env or secrets. If the key was bound
+as a plain env var, `--remove-secrets` does nothing; remove it with
+`--remove-env-vars` ([DEPLOYMENT.md](DEPLOYMENT.md) explains the two forms).
+
+The order changes the API and the configuration of the **next** worker
+execution. A worker execution that is already running keeps the environment
+and secrets it started with, so it can still reach the provider after steps 2
+and 5. Stop it by cancelling its run (run or batch cancellation through the
+API), or cancel the execution itself (`gcloud run jobs executions cancel
+<EXECUTION> --region <GCP_REGION>`). Nothing above deletes data.
+
+After the order (not part of it): set `GATEWAY_ALLOW_EXECUTION_ROUTES=false`
+in Vercel if plan writes should close too, and verify
+`MILO_APPROVED_WORKER_IDENTITIES` still names only the worker identity.
+
+Flags are individual by design and each step is explicit and auditable. No
+script covers this whole order today: the two historical kill switches
+(`scripts/release/stage-c/kill-switch.sh` and
+`scripts/release/stage-d/kill-switch.sh`) set only the Stage C/D flag set and
+do not touch `MILO_ENABLE_WORK_SCOPE_*`, `MILO_ENABLE_GOVERNMENT_CATALOG_READ`,
+`MILO_ENABLE_CATALOG_PROMOTION` or any Vercel variable (see
+`docs/cleanup/CLEANUP_INVENTORY.md`, decision D5).
 
 ## Catalog execution — the independent rollback
 
@@ -37,10 +87,10 @@ gcloud run jobs update <CLOUD_RUN_WORKER_JOB> \
 **Order.** Reach for this FIRST for a catalog-specific incident — a wrong
 canonical value, an unexpected promotion, a refusal pattern that looks like a
 defect. Escalate to the general order above only if the incident is not
-confined to the catalog. If the general order has already been run, the Stage C
-kill switch (`scripts/release/stage-c/kill-switch.sh`) sets this flag false on
-the worker as part of its shutdown and verifies it afterwards, so the catalog is
-closed either way.
+confined to the catalog. The general order above does not itself set this
+flag; if the Stage C kill switch (`scripts/release/stage-c/kill-switch.sh`) was
+used instead, it sets this flag false on the worker as part of its shutdown and
+verifies it afterwards.
 
 **Verification evidence to capture (all read-only):**
 
@@ -123,8 +173,8 @@ delete it.
 
 ## Cloud Run worker
 
-1. stop new launches (`JOB_LAUNCHER=disabled`); 2. disable run creation;
-3. `gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --image
+1–2. run the emergency order above first (it disables run creation and new
+launches); 3. `gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --image
 …/worker:<PREVIOUS_SHA>` — previous immutable image; 4. do **not**
 execute the job to test; 5. verify service account and secret mappings
 (`jobs describe`); 6. already-running executions: cancel their runs
@@ -161,8 +211,9 @@ limits recover (`check-redis-config.sh --allow-network`).
 
 ## Provider access
 
-1. `MILO_ENABLE_PAID_EXECUTION` off; 2. remove the worker's
-`secretAccessor` binding on `<PROVIDER_KEY_SECRET_NAME>`; 3. rotate the
+1. the emergency order above (step 2 turns paid execution off, step 5 removes
+the key from the worker); 2. if the key may be compromised, also remove the
+worker's `secretAccessor` binding on `<PROVIDER_KEY_SECRET_NAME>`; 3. rotate the
 provider key manually in the provider console if compromised; 4. verify no
 other service has access (`gcloud secrets get-iam-policy`); 5. inspect
 usage and cost in the provider console (external).

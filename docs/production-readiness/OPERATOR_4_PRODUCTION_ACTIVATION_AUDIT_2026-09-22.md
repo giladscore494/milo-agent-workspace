@@ -1,3 +1,5 @@
+> **HISTORICAL — superseded by [`SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](SCOPED_BATCH_PRODUCTION_RUNBOOK.md).** A dated record kept as evidence; do not follow it as current procedure.
+
 # OPERATOR-4 — Production activation audit at Console 6 / #111 (2026-09-22)
 
 Status: **BLOCKED.** The requested sequence was: final read-only audit →

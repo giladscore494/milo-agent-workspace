@@ -801,32 +801,19 @@ This is a runtime value, so a new deployment picks it up without a rebuild.
 Redeploy the release commit (dashboard → Deployments → the Production
 deployment of `$RELEASE_SHA` → *Redeploy*). Then go straight to Stage F.
 
-### Stage E rollback (emergency order, from [ROLLBACK.md](ROLLBACK.md))
+### Stage E rollback
 
-Close the website first, then the backend:
-
-```bash
-# 1. Vercel: close run starts (remove GATEWAY_ALLOW_RUN_START_ROUTES, or set it
-#    to false) and redeploy. From then on every start is refused at the gateway.
-vercel env rm GATEWAY_ALLOW_RUN_START_ROUTES production --yes
-# 2. Stop paid execution, then run creation and the launcher.
-gcloud run jobs update milo-agent-worker --region us-central1 \
-  --update-env-vars MILO_ENABLE_PAID_EXECUTION=false
-gcloud run services update milo-agent-api --region us-central1 \
-  --update-env-vars '^;^MILO_ENABLE_RUN_CREATION=false;MILO_ENABLE_WORK_SCOPE_BATCHES=false;JOB_LAUNCHER=disabled'
-# 3. Remove the provider credential.
-gcloud run jobs update milo-agent-worker --region us-central1 --remove-secrets KIMI_API_KEY
-# 4. Optionally close plan writes too: set GATEWAY_ALLOW_EXECUTION_ROUTES=false in Vercel and redeploy.
-```
+Use the **canonical emergency order in
+[ROLLBACK.md](ROLLBACK.md#execution-flags--emergency-order)** — it is the only
+place the order and its commands are written (for Stage E the worker job is
+`milo-agent-worker`, the API service `milo-agent-api`, region `us-central1`).
+Do not improvise a different order here.
 
 A batch that is running keeps running until its run ends or is cancelled
 ("Cancel this batch" in the Mapping Plan uses the normal run cancellation).
-Nothing is deleted.
-
-To give Swarm V2 projects their ordinary composer back, turn the Government
-read off on **both** the worker and the API
-(`MILO_ENABLE_GOVERNMENT_CATALOG_READ=false`). With the read off, ordinary
-Swarm V2 runs read no catalog.
+Nothing is deleted. With the Government read off (step 4 of that order),
+Swarm V2 projects get their ordinary composer back and ordinary Swarm V2 runs
+read no catalog.
 
 A later **redeploy** (`cloud-run.sh apply`) returns both surfaces to Stage A.
 Its preflight also refuses while the worker carries the provider key, so
@@ -869,8 +856,8 @@ the plan's conversation, the composer offers **Open the Mapping Plan** and no
 *Send task*, and the Mapping Plan's **Batches** section shows **Start batch 1**.
 
 **Stop if** anything is `NO`, `DISABLED` or `UNVERIFIED`. Each line says what
-is missing. If it fails, close run starts again (step 1 of the Stage E
-rollback) before investigating. The first paid run is **not** a readiness
+is missing. If it fails, close run starts again (step 1 of the emergency order in
+[ROLLBACK.md](ROLLBACK.md#execution-flags--emergency-order)) before investigating. The first paid run is **not** a readiness
 test.
 
 ---

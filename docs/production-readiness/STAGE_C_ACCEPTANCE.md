@@ -1,3 +1,5 @@
+> **HISTORICAL — superseded by [`SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](SCOPED_BATCH_PRODUCTION_RUNBOOK.md).** A dated record kept as evidence; do not follow it as current procedure.
+
 # Stage C acceptance report — one controlled paid smoke run
 
 Status (2026-08-22): **STAGE C PASSED.** Evidence recovery attempt 2

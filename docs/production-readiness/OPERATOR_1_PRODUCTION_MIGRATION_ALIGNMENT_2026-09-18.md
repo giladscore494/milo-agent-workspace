@@ -1,3 +1,5 @@
+> **HISTORICAL — superseded by [`SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](SCOPED_BATCH_PRODUCTION_RUNBOOK.md).** A dated record kept as evidence; do not follow it as current procedure.
+
 # OPERATOR-1 — Production migration alignment (2026-09-18)
 
 Status: **COMPLETE**. Production migration history and the repository

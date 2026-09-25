@@ -8,8 +8,10 @@ repository. All stages are `REQUIRES_MANUAL_OPERATOR_CONFIGURATION`.
 
 Operator actions (in order):
 
-1. apply approved authentication/ownership/lifecycle migrations manually
-   ([MIGRATIONS.md](MIGRATIONS.md));
+1. apply approved authentication/ownership/lifecycle migrations through the
+   SHA-bound workflows only — `backup-supabase-production.yml`, then
+   `deploy-supabase-migrations.yml` ([MIGRATIONS.md](MIGRATIONS.md)); never
+   paste migration SQL into the Supabase SQL editor;
 2. run post-migration validation (`check-migration-state.sh` re-run);
 3. perform the membership backfill (generate → review → apply manually);
 4. perform the proposal backfill where required;

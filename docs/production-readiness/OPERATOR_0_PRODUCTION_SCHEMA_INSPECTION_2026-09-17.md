@@ -1,3 +1,5 @@
+> **HISTORICAL — superseded by [`SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](SCOPED_BATCH_PRODUCTION_RUNBOOK.md).** A dated record kept as evidence; do not follow it as current procedure.
+
 # OPERATOR-0 — production schema inspection (read-only)
 
 **Final outcome: `OPERATOR-0 COMPLETED — NORMAL_ORDERED_APPLY_CANDIDATE, no production mutation authorized`**
