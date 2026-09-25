@@ -1191,8 +1191,8 @@ def test_this_change_widened_no_runtime_policy_or_budget_ceiling():
     assert policy.values["max_cost_per_run"] == pytest.approx(3.00)
     assert policy.values["max_builtin_searches_per_request"] == 4
 
-    stage_d = _Path("scripts/release/stage-d")
-    _sys.path.insert(0, str(stage_d))
+    pins = _Path("scripts/release/pins")
+    _sys.path.insert(0, str(pins))
     import policy_envelope
 
     assert policy_envelope.PINNED_POLICY_FINGERPRINT == policy.fingerprint(), (

@@ -46,6 +46,10 @@ from backend.runtime_policy import (CAP_ENV_PREFIXES, DIMENSIONS, ENGINE_ENV_PRE
 
 REPO = Path(__file__).resolve().parents[1]
 STAGE_D = REPO / "scripts" / "release" / "stage-d"
+# The permanent copies of policy_envelope.py, verify_caps.py and
+# verify_images.py (cleanup D8). Their tests run from here; the Stage D
+# step scripts still call the byte-identical originals in STAGE_D.
+PINS = REPO / "scripts" / "release" / "pins"
 
 RELEASE_SHA = "84cd8696119c24662a954d0f0e23195268dab23f"
 # The commit this checkout is actually at. verify_caps.py REFUSES unless
@@ -574,7 +578,7 @@ def run_verify_caps(tmp_path, worker, api, caps=CAPS, provider_limits=PROVIDER_L
     worker_path.write_text(json.dumps(worker))
     api_path.write_text(json.dumps(api))
     return subprocess.run(
-        [sys.executable, str(STAGE_D / "verify_caps.py"),
+        [sys.executable, str(PINS / "verify_caps.py"),
          "--worker-json", str(worker_path), "--api-json", str(api_path)],
         capture_output=True, text=True,
         env={**os.environ, "STAGE_D_CAPS": caps, "STAGE_D_WORKER_PROVIDER_LIMITS": provider_limits,
@@ -647,7 +651,7 @@ def test_verify_caps_accepts_the_accepted_digest_reference(tmp_path, surface):
 def test_verify_caps_fails_closed_without_the_accepted_digests(tmp_path):
     """The release identity is the digest; without it there is nothing to verify."""
     result = subprocess.run(
-        [sys.executable, str(STAGE_D / "verify_caps.py"),
+        [sys.executable, str(PINS / "verify_caps.py"),
          "--worker-json", str(tmp_path / "w.json"), "--api-json", str(tmp_path / "a.json")],
         capture_output=True, text=True,
         env={**os.environ, "STAGE_D_CAPS": CAPS, "STAGE_D_WORKER_PROVIDER_LIMITS": PROVIDER_LIMITS,
@@ -806,7 +810,7 @@ def test_the_pinned_policy_fingerprint_is_the_checkouts_policy():
     Editing a reviewed value without re-pinning would otherwise be discovered
     by a production gate. It is discovered here instead.
     """
-    sys.path.insert(0, str(STAGE_D))
+    sys.path.insert(0, str(PINS))
     import policy_envelope
 
     assert policy_envelope.PINNED_POLICY_FINGERPRINT == POLICY.fingerprint()
@@ -815,7 +819,7 @@ def test_the_pinned_policy_fingerprint_is_the_checkouts_policy():
 
 def test_a_drifted_checkout_policy_cannot_even_print_an_envelope(monkeypatch):
     """Every selector refuses, so a drifted checkout produces no pins at all."""
-    sys.path.insert(0, str(STAGE_D))
+    sys.path.insert(0, str(PINS))
     import policy_envelope
 
     monkeypatch.setattr(policy_envelope, "PINNED_POLICY_FINGERPRINT", "0" * 64)
@@ -827,7 +831,7 @@ def test_a_drifted_checkout_policy_cannot_even_print_an_envelope(monkeypatch):
 
 def test_the_binding_refuses_when_it_cannot_read_the_checkout(monkeypatch):
     """Cannot prove is a refusal, never a pass: no git, no Stage D."""
-    sys.path.insert(0, str(STAGE_D))
+    sys.path.insert(0, str(PINS))
     import policy_envelope
 
     monkeypatch.setattr(policy_envelope, "_git", lambda *a, **k: None)
@@ -838,7 +842,7 @@ def test_the_binding_refuses_when_it_cannot_read_the_checkout(monkeypatch):
 
 def test_the_binding_refuses_a_policy_imported_from_outside_the_checkout(monkeypatch):
     """The bytes compared must be the bytes in use."""
-    sys.path.insert(0, str(STAGE_D))
+    sys.path.insert(0, str(PINS))
     import policy_envelope
 
     monkeypatch.setattr(policy_envelope, "_imported_policy_source",
@@ -855,7 +859,7 @@ def test_the_binding_accepts_this_checkout_against_its_own_head():
     be generated from a policy that is identical to a released one. CI always
     runs against a clean checkout.
     """
-    sys.path.insert(0, str(STAGE_D))
+    sys.path.insert(0, str(PINS))
     import policy_envelope
 
     assert policy_envelope.release_binding_problems(CHECKOUT_SHA) == []
@@ -912,7 +916,7 @@ def build_release_toolkit_repo(tmp_path, *, policy_at_release=True,
     testable without depending on how deeply the CI runner cloned us.
     """
     root = tmp_path / "release-toolkit"
-    toolkit = root / "scripts" / "release" / "stage-d"
+    toolkit = root / "scripts" / "release" / "pins"
     (root / "backend").mkdir(parents=True)
     toolkit.mkdir(parents=True)
 
@@ -924,7 +928,7 @@ def build_release_toolkit_repo(tmp_path, *, policy_at_release=True,
     run("config", "user.email", "release@invalid")
     run("config", "user.name", "Release")
     for name in ("policy_envelope.py", "verify_caps.py"):
-        (toolkit / name).write_bytes((STAGE_D / name).read_bytes())
+        (toolkit / name).write_bytes((PINS / name).read_bytes())
     (root / "backend" / "__init__.py").write_bytes(
         (REPO / "backend" / "__init__.py").read_bytes())
     policy = root / "backend" / "runtime_policy.py"
@@ -969,7 +973,7 @@ def run_verify_caps_in(root, tmp_path, release_sha, *, caps=CAPS,
         "STAGE_D_WORKER_IMAGE_DIGEST": WORKER_DIGEST,
     })
     return subprocess.run(
-        [sys.executable, str(root / "scripts" / "release" / "stage-d" / "verify_caps.py"),
+        [sys.executable, str(root / "scripts" / "release" / "pins" / "verify_caps.py"),
          "--worker-json", str(worker_path), "--api-json", str(api_path)],
         capture_output=True, text=True, env=env, cwd=str(root), timeout=120)
 
@@ -982,7 +986,7 @@ def test_a_later_authorization_commit_may_reference_an_earlier_release(tmp_path)
     so no authorization commit could ever satisfy its own pin. What has to
     hold is that the POLICY is the released one, and it does here.
     """
-    sys.path.insert(0, str(STAGE_D))
+    sys.path.insert(0, str(PINS))
     import policy_envelope
 
     root, release_sha = build_release_repo(tmp_path)
@@ -991,7 +995,7 @@ def test_a_later_authorization_commit_may_reference_an_earlier_release(tmp_path)
 
 def test_an_authorization_commit_that_changes_the_policy_is_refused(tmp_path):
     """Changing the policy needs a new release, not a new authorization."""
-    sys.path.insert(0, str(STAGE_D))
+    sys.path.insert(0, str(PINS))
     import policy_envelope
 
     root, release_sha = build_release_repo(tmp_path, change_policy_after=True)
@@ -1009,7 +1013,7 @@ def test_an_earlier_real_commit_with_the_same_policy_is_accepted():
     release actually looks like. Skipped only when the policy was changed in
     HEAD itself, in which case no ancestor can carry identical bytes.
     """
-    sys.path.insert(0, str(STAGE_D))
+    sys.path.insert(0, str(PINS))
     import policy_envelope
 
     current = (REPO / "backend" / "runtime_policy.py").read_bytes()
@@ -2443,7 +2447,7 @@ def test_the_toolkit_documents_why_a_rebuild_is_not_a_proof():
     for path, needle in (
         (STAGE_D / "stage-d-env.sh", "openai>=1.30.0"),
         (STAGE_D / "01-verify-release-images.sh", "python:3.12-slim"),
-        (STAGE_D / "verify_images.py", "not reproducible"),
+        (PINS / "verify_images.py", "not reproducible"),
         (STAGE_D / "README.md", "not byte-reproducible"),
         (REPO / "docs/production-readiness/STAGE_D_AUTHORIZATION.md", "openai>=1.30.0"),
     ):
@@ -2614,7 +2618,7 @@ def run_verify_images(tmp_path, *, registry=None, service=None, revision=None, j
         path = tmp_path / f"{label}.json"
         path.write_text(doc if isinstance(doc, str) else json.dumps(doc))
         paths[label] = str(path)
-    argv = [sys.executable, str(STAGE_D / "verify_images.py"),
+    argv = [sys.executable, str(PINS / "verify_images.py"),
             "--registry-json", paths["registry"], "--api-service-json", paths["service"],
             "--api-revision-json", paths["revision"], "--worker-job-json", paths["job"]]
     if execution is not None:
@@ -3378,7 +3382,7 @@ def stage_d_expected_identity() -> dict:
     through `policy_envelope.py run-identity` -- instead of restating the fields
     and drifting from the release they describe.
     """
-    sys.path.insert(0, str(REPO / "scripts" / "release" / "stage-d"))
+    sys.path.insert(0, str(PINS))
     import policy_envelope
 
     return policy_envelope.expected_run_identity(STAGE_D_IDENTITY_RELEASE)

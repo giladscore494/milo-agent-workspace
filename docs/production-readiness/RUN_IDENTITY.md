@@ -241,11 +241,13 @@ runtime depends on **46 across 19 migrations**. A production database missing
 `record_run_usage_guarded` or `finalize_run_guarded` passed every check and
 would then have failed on the first paid model call, after the money was spent.
 
-`probe_db.py` keeps the inventory as a reviewed literal because it is
-transported into a bare pinned image as one SHA-256-pinned file and cannot
-import the deriving module — the same arrangement as
-`PINNED_POLICY_FINGERPRINT`. `tests/test_release_inventory.py` fails if that
-literal is not exactly what the current repository requires.
+The inventory is kept as a reviewed literal,
+`scripts/release/pins/required_rpc_args.py` (cleanup D8) — the same
+arrangement as `PINNED_POLICY_FINGERPRINT`. `tests/test_release_inventory.py`
+fails if that literal is not exactly what the current repository requires.
+`probe_db.py` carries a byte-identical copy of it (it is transported into a
+bare pinned image as one SHA-256-pinned file and cannot import anything) until
+the Stage D toolkit is deleted.
 
 Regenerate with:
 
