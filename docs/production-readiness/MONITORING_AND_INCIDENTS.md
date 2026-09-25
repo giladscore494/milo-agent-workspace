@@ -43,22 +43,20 @@ group chosen in the manifest copy.
 
 ## Severity definitions
 
-- **CRITICAL** — money or data integrity at risk: kill switches first
-  (paid execution off, run creation off, launcher disabled), investigate
-  second.
+- **CRITICAL** — money or data integrity at risk: the emergency order in
+  [ROLLBACK.md](ROLLBACK.md#execution-flags--emergency-order) first,
+  investigate second.
 - **HIGH** — security boundary or availability degraded: respond within
   the operating day; disable the affected surface if in doubt.
 - **MEDIUM** — investigate within days; no immediate flag change.
 - **LOW** — trend review.
 
-## Kill switches (verified order)
+## Kill switches
 
-1. `MILO_ENABLE_PAID_EXECUTION` off — no provider spend;
-2. `MILO_ENABLE_RUN_CREATION` + `GATEWAY_ALLOW_RUN_START_ROUTES` (and
-   `GATEWAY_ALLOW_EXECUTION_ROUTES`) off — no new work;
-3. `JOB_LAUNCHER=disabled` — no worker launches;
-4. remove worker provider-secret binding — no provider access at all;
-5. Cloud Run traffic to a known-good revision — full code rollback.
+The shutdown order is defined once, in
+[ROLLBACK.md](ROLLBACK.md#execution-flags--emergency-order). Beyond it, the
+last resort is moving Cloud Run traffic to a known-good revision (a full code
+rollback, also in ROLLBACK.md).
 
 **Independent catalog kill switch.** `MILO_ENABLE_CATALOG_EXECUTION=false` on
 the worker job closes the catalog path ON ITS OWN, without stopping the product
@@ -151,7 +149,8 @@ deployed environment.
 
 ## Incident response skeleton
 
-Detect (signal above) → freeze (kill-switch order) → snapshot evidence
+Detect (signal above) → freeze (the emergency order in
+[ROLLBACK.md](ROLLBACK.md#execution-flags--emergency-order)) → snapshot evidence
 (revision digests, ledger rows, logs — no secret values) → diagnose →
 forward-fix or roll back per [ROLLBACK.md](ROLLBACK.md) → verify with
 smoke tests → write up with the Stage C acceptance-record fields.

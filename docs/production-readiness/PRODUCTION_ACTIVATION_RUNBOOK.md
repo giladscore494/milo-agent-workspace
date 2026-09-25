@@ -230,20 +230,9 @@ exercising it would create a run, and the first run is yours.
 ## 3. Rollback
 
 Every flag above is independently reversible, and none of it destroys data.
-
-```bash
-# Stop paid execution immediately (the kill switch).
-gcloud run jobs update <WORKER_JOB> --region <REGION> \
-  --update-env-vars MILO_ENABLE_PAID_EXECUTION=false
-
-# Remove the provider credential entirely.
-gcloud run jobs update <WORKER_JOB> --region <REGION> \
-  --remove-secrets KIMI_API_KEY
-
-# Close run creation at the API.
-gcloud run services update <API_SERVICE> --region <REGION> \
-  --update-env-vars MILO_ENABLE_RUN_CREATION=false
-```
+To shut down, follow the **canonical emergency order in
+[ROLLBACK.md](ROLLBACK.md#execution-flags--emergency-order)** — it is the only
+place the order and its commands are written.
 
 Disabling `MILO_ENABLE_CATALOG_EXECUTION` stops the worker reading candidates
 and writing canonical facts; it deletes nothing, so re-enabling resumes from the

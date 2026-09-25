@@ -59,15 +59,15 @@ turn execution flags off (see step 0).
 
 ## 0. Emergency execution-flag order (always first)
 
-1. MILO_ENABLE_PAID_EXECUTION off
-2. MILO_ENABLE_RUN_CREATION off (and GATEWAY_ALLOW_EXECUTION_ROUTES off)
-3. JOB_LAUNCHER=disabled (worker launch off)
-4. Restrict worker route access (verify MILO_APPROVED_WORKER_IDENTITIES)
-5. Revoke worker access to the provider secret if necessary:
-       gcloud secrets remove-iam-policy-binding <PROVIDER_KEY_SECRET> \\
-         --member serviceAccount:<WORKER_SERVICE_ACCOUNT_EMAIL> \\
-         --role roles/secretmanager.secretAccessor
-6. API remains read-only where safe.
+The canonical order and its exact commands are in
+docs/production-readiness/ROLLBACK.md ("Execution flags — emergency order"):
+
+1. Vercel: GATEWAY_ALLOW_RUN_START_ROUTES=false, then redeploy
+2. MILO_ENABLE_PAID_EXECUTION=false (worker job and API service)
+3. API: MILO_ENABLE_RUN_CREATION=false, MILO_ENABLE_WORK_SCOPE_BATCHES=false,
+   JOB_LAUNCHER=disabled
+4. MILO_ENABLE_GOVERNMENT_CATALOG_READ=false (worker job and API service)
+5. Remove the provider API key from the worker (--remove-secrets KIMI_API_KEY)
 
 ### Catalog-only incident — the narrow rollback
 
@@ -168,8 +168,8 @@ is no enable-all or disable-all script by design; each flag is explicit.
 
 ## 7. Provider access
 
-    # disable paid execution (step 0), revoke worker access to the provider
-    # secret (step 0.5), rotate the provider key manually in the provider
+    # disable paid execution and remove the worker's provider key (step 0,
+    # items 2 and 5), rotate the provider key manually in the provider
     # console if compromised, verify no other service has access:
     gcloud secrets get-iam-policy <PROVIDER_KEY_SECRET>
     # inspect usage and cost in the provider console.

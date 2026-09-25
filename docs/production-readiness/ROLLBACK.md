@@ -8,15 +8,50 @@ automatically.
 
 ## Execution flags — emergency order
 
-1. `MILO_ENABLE_PAID_EXECUTION` off;
-2. `MILO_ENABLE_RUN_CREATION` off (and at the gateway
-   `GATEWAY_ALLOW_RUN_START_ROUTES` off, which refuses every run start,
-   then `GATEWAY_ALLOW_EXECUTION_ROUTES` off);
-3. worker launch off (`JOB_LAUNCHER=disabled`);
-4. worker route access restricted (verify
-   `MILO_APPROVED_WORKER_IDENTITIES`);
-5. revoke the worker's provider-secret binding if necessary;
-6. the API remains read-only where safe.
+This is the **one canonical** emergency shutdown order (owner decision,
+2026-09-25). Every other runbook that describes a shutdown points here instead
+of restating an order of its own.
+
+1. **Vercel:** `GATEWAY_ALLOW_RUN_START_ROUTES=false`, then redeploy. The
+   gateway opens run starts only on the exact value `true`, so from the
+   redeploy on every run start is refused at the gateway.
+2. `MILO_ENABLE_PAID_EXECUTION=false` on the worker job and the API service —
+   no provider spend.
+3. On the API: `MILO_ENABLE_RUN_CREATION=false`,
+   `MILO_ENABLE_WORK_SCOPE_BATCHES=false`, `JOB_LAUNCHER=disabled` — no new
+   runs, no new batches, no worker launches.
+4. `MILO_ENABLE_GOVERNMENT_CATALOG_READ=false` on the worker job and the API
+   service.
+5. Remove the provider API key from the worker (`--remove-secrets KIMI_API_KEY`).
+
+```bash
+# 1. Vercel (remove the value, or set it to anything but `true`), then redeploy
+#    the current Production deployment (dashboard → Deployments → Redeploy).
+vercel env rm GATEWAY_ALLOW_RUN_START_ROUTES production --yes
+# 2. Paid execution off on both surfaces.
+gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \
+  --update-env-vars MILO_ENABLE_PAID_EXECUTION=false
+gcloud run services update <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> \
+  --update-env-vars MILO_ENABLE_PAID_EXECUTION=false
+# 3. Run creation, batches and the launcher off on the API.
+gcloud run services update <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> \
+  --update-env-vars '^;^MILO_ENABLE_RUN_CREATION=false;MILO_ENABLE_WORK_SCOPE_BATCHES=false;JOB_LAUNCHER=disabled'
+# 4. Government catalog read off on both surfaces.
+gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \
+  --update-env-vars MILO_ENABLE_GOVERNMENT_CATALOG_READ=false
+gcloud run services update <CLOUD_RUN_API_SERVICE> --region <GCP_REGION> \
+  --update-env-vars MILO_ENABLE_GOVERNMENT_CATALOG_READ=false
+# 5. Remove the provider credential from the worker.
+gcloud run jobs update <CLOUD_RUN_WORKER_JOB> --region <GCP_REGION> \
+  --remove-secrets KIMI_API_KEY
+```
+
+A run already executing keeps its lease until it ends or is cancelled; after
+step 2 it can make no further provider call. Nothing above deletes data.
+
+After the order (not part of it): set `GATEWAY_ALLOW_EXECUTION_ROUTES=false`
+in Vercel if plan writes should close too, and verify
+`MILO_APPROVED_WORKER_IDENTITIES` still names only the worker identity.
 
 Flags are individual by design and each step is explicit and auditable. No
 script covers this whole order today: the two historical kill switches
