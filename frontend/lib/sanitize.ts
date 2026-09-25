@@ -34,7 +34,7 @@ const SECRET_PATTERNS: readonly RegExp[] = [
   /**
    * MODERN Supabase server-side secret key.
    *
-   * `docs/deployment/cloud-run-production.md` mandates this format for the
+   * `docs/production-readiness/DEPLOYMENT.md` (Supabase server-side key policy) mandates this format for the
    * production server-side credential and forbids it ever reaching the
    * browser; `backend/production_config.py` and `scripts/check_unsafe_defaults.py`
    * both blocklist the `sb_secret` substring. A legacy JWT sentinel proves

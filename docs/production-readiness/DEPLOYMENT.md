@@ -307,6 +307,14 @@ plan and the executable script ever disagree about it.
 metadata and verifies the supplied `SUPABASE_URL` against it, printing
 neither value.
 
+### Supabase server-side key policy
+
+The backend supports Supabase's modern server-side secret API keys with the `sb_secret_` prefix through the pinned official `supabase==2.27.2` Python client. Keep the production Secret Manager secret named `SUPABASE_SECRET_KEY` populated with the modern server-side key, and keep the Cloud Run mapping compatible with the existing deployment script: `SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest`. The application also accepts `SUPABASE_SECRET_KEY` directly for local and future runtime configurations, while preserving `SUPABASE_SERVICE_ROLE_KEY` as a backward-compatible alias.
+
+Do not re-enable, restore, or depend on legacy JWT service-role API keys. Server-side Supabase keys must remain only in Google Secret Manager or equivalent protected backend secret stores; never commit them, print them, place them in frontend configuration, or send them to browser bundles. The frontend may use only public Supabase configuration such as an anon or publishable key, and must never receive `SUPABASE_SECRET_KEY` or `SUPABASE_SERVICE_ROLE_KEY`.
+
+_(Moved verbatim from the archived `docs/deployment/cloud-run-production.md` in cleanup PR-2, set 2b.)_
+
 ## Private Cloud Run configuration
 
 Proven by the templates in the generated plan plus

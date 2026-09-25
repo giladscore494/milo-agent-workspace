@@ -77,8 +77,8 @@ rollback commands prepared (`generate-rollback-plan.sh`).
 Actions: 0. leave `MILO_ENABLE_CATALOG_EXECUTION` **off**. Stage C is one
 controlled paid run, not an authorization to write canonical catalog rows;
 `scripts/release/stage-c/verify_caps.py` refuses the run if the flag is enabled
-on either surface, and `parse_env_contract.py` keeps it `false` in the
-smoke-active posture too; 1. enable only the minimum run-creation surface
+on either surface, and the (now removed) Swarm V2 smoke env contract kept it
+`false` in the smoke-active posture too; 1. enable only the minimum run-creation surface
 (`MILO_ENABLE_RUN_CREATION` plus `GATEWAY_ALLOW_EXECUTION_ROUTES`);
 2. restrict access to the operator-controlled test user/project;
 3. keep broad access disabled; 4. execute exactly one controlled run;

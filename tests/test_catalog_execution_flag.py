@@ -493,15 +493,6 @@ def test_the_production_manifest_validator_inventories_the_catalog_flag():
     assert CATALOG_EXECUTION_FLAG in validator.EXECUTION_FLAGS
 
 
-def test_the_smoke_env_contract_keeps_the_catalog_flag_off_in_every_posture():
-    """Including during an ACTIVE paid smoke: Stage C does not open this."""
-    contract = load_script("parse_env_contract",
-                           "scripts/release/swarm-v2-smoke/parse_env_contract.py")
-    assert contract.FLAGS_AT_REST[CATALOG_EXECUTION_FLAG] == "false"
-    assert contract.WORKER_FLAGS_SMOKE[CATALOG_EXECUTION_FLAG] == "false"
-    assert contract.API_FLAGS_SMOKE[CATALOG_EXECUTION_FLAG] == "false"
-
-
 def test_the_execution_disabled_smoke_asserts_the_catalog_flag_is_off():
     """In the flag-posture LOOP, not merely mentioned somewhere in the file."""
     script = (REPO / "scripts/release/smoke-test-execution-disabled.sh").read_text()

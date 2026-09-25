@@ -68,7 +68,7 @@ describe('1. credential shapes are redacted', () => {
 });
 
 describe('2. the MODERN Supabase server-side key, specifically', () => {
-  // `docs/deployment/cloud-run-production.md` mandates `sb_secret_` for
+  // `docs/production-readiness/DEPLOYMENT.md` (Supabase server-side key policy) mandates `sb_secret_` for
   // production and forbids it reaching the browser. It shares no prefix with
   // the legacy JWT, so the legacy sentinel proves nothing about it.
 

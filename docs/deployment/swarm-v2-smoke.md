@@ -1,3 +1,8 @@
+> **HISTORICAL — superseded by [`docs/production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](../production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md).**
+> The smoke ran 2026-08-24/25 and its authorization is spent. The controller
+> `scripts/release/swarm-v2-smoke/` and `tests/test_release_tooling_swarm_smoke.py`
+> were removed in cleanup PR-2 (set 2a); paths below are kept as a record.
+
 # Swarm V2 controlled production smoke
 
 Controller: `scripts/release/swarm-v2-smoke/run-swarm-smoke.sh`

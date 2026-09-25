@@ -23,7 +23,7 @@ export const JWT_SENTINEL = ['eyJhbGciOiJIUzI1NiJ9', 'eyJyb2xlIjoic2VydmljZSJ9',
 /**
  * MODERN Supabase server-side secret key shape (`sb_secret_…`).
  *
- * This is the format `docs/deployment/cloud-run-production.md` mandates for
+ * This is the format `docs/production-readiness/DEPLOYMENT.md` (Supabase server-side key policy) mandates for
  * production and forbids ever reaching the browser. It shares no prefix with
  * the legacy JWT above, so `JWT_SENTINEL` proves nothing about it — the two
  * must be swept independently.
