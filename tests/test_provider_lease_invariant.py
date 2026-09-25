@@ -206,12 +206,20 @@ def test_the_derived_pair_is_always_safe_by_construction():
         assert_request_deadline_safe(deadline, ttl)
 
 
-def test_the_production_default_is_ninety_seconds_inside_a_two_minute_lease():
+def test_the_production_default_admits_the_longest_role_inside_the_lease():
+    """PR-S: the reviewed window is 800s so the derived ceiling is exactly the
+    600s Commander planning deadline (was 120s -> 90s, which killed run
+    5145ca65's planning call). Non-streaming paths keep their 90s."""
+    from backend.engines.swarm_v2.model_gateway import MAX_ROLE_TOTAL_DEADLINE_SECONDS
+
     config = QuotaConfig()
-    assert config.lease_ttl_seconds == 120.0
-    assert config.safety_margin_seconds == 30.0
-    assert config.request_deadline_seconds == 90.0
-    assert config.ownership_probe_interval_seconds == 30.0
+    assert config.lease_ttl_seconds == 800.0
+    assert config.safety_margin_seconds == 200.0
+    assert config.request_deadline_seconds == 600.0
+    assert config.request_deadline_seconds >= MAX_ROLE_TOTAL_DEADLINE_SECONDS
+    assert_request_deadline_safe(MAX_ROLE_TOTAL_DEADLINE_SECONDS, config.lease_ttl_seconds)
+    assert config.non_streaming_request_deadline_seconds == 90.0
+    assert config.ownership_probe_interval_seconds == 200.0
     # Three probes fit inside a full-length request, so a single missed pass
     # is not decisive -- which is all an observability mechanism needs.
     assert config.request_deadline_seconds / config.ownership_probe_interval_seconds >= 3
@@ -265,8 +273,11 @@ def test_the_resolved_client_timeout_sits_inside_the_lease():
 
     timeout = provider_request_timeout()
     config = QuotaConfig()
-    assert timeout.read == config.request_deadline_seconds
+    # A caller that states no deadline is non-streaming (PR-S).
+    assert timeout.read == config.non_streaming_request_deadline_seconds
     assert timeout.read + config.safety_margin_seconds <= config.lease_ttl_seconds
+    ceiling = provider_request_timeout(config.request_deadline_seconds)
+    assert ceiling.read + config.safety_margin_seconds <= config.lease_ttl_seconds
     # Connecting is never worth minutes of a permit nobody else can use.
     assert timeout.connect <= timeout.read
 

@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
@@ -701,8 +702,14 @@ class ProviderAdapter:
                  client_factory: Callable[[str, str], Any] | None = None,
                  request_deadline_seconds: float | None = None,
                  token_counter: TokenCounter | None = None,
-                 search_executor: Callable[..., Any] | None = None) -> None:
+                 search_executor: Callable[..., Any] | None = None,
+                 log_context: Mapping[str, Any] | None = None,
+                 clock: Callable[[], float] | None = None) -> None:
         self._scheduler = scheduler
+        #: Server-owned identifiers (the run id) added to every structured
+        #: provider-call log line. Never request or model material.
+        self._log_context = dict(log_context or {})
+        self._clock = clock or time.monotonic
         self._tracker = tracker
         self._client_factory = client_factory
         self._request_deadline_seconds = request_deadline_seconds
@@ -891,6 +898,8 @@ class ProviderAdapter:
 
         from backend.budget import read_output_cap
 
+        from backend.provider_streaming import ensure_assembled, log_provider_call
+
         cap = read_output_cap(payload)
         if cap is None:
             raise MissingOutputCap(
@@ -914,12 +923,28 @@ class ProviderAdapter:
             # so there stays exactly ONE provider call site.
             reservation = (self._reserve_searches(self.max_builtin_searches_per_request)
                            if searching else None)
+            started = self._clock()
             try:
                 response = target.chat.completions.create(**payload)
+                # PR-S: a raw stream proves nothing (only headers arrived).
+                # The guarded client assembles it; this is the safety net for
+                # any client that does not, so the scheduler can never settle
+                # a lease on a stream nobody read to its finish_reason.
+                response = ensure_assembled(payload, response)
             except BaseException as exc:
+                verdict = classify_outcome(exc)
+                log_provider_call(payload=payload, agent=agent, phase=phase,
+                                  started_at=started, ended_at=self._clock(), exc=exc,
+                                  outcome=verdict.outcome.value,
+                                  completion_proven=verdict.completion_proven,
+                                  context=self._log_context)
                 self._settle_searches(reservation, self._searches_after_failure(exc),
                                       after=exc)
                 raise
+            log_provider_call(payload=payload, agent=agent, phase=phase,
+                              started_at=started, ended_at=self._clock(),
+                              response=response, outcome=ProviderOutcome.SUCCESS.value,
+                              completion_proven=True, context=self._log_context)
             self._settle_searches(reservation, self._searches_performed(response))
             return response
 
@@ -1049,6 +1074,7 @@ def build_provider_adapter(limits: Any = None, *, tracker: Any = None,
                            backpressure_callback: Any = None,
                            token_counter: TokenCounter | None = None,
                            search_executor: Callable[..., Any] | None = None,
+                           log_context: Mapping[str, Any] | None = None,
                            ) -> ProviderAdapter:
     """Build THE adapter for a worker process. One per process, not per engine."""
     from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
@@ -1062,7 +1088,8 @@ def build_provider_adapter(limits: Any = None, *, tracker: Any = None,
     return ProviderAdapter(scheduler, tracker=tracker, client_factory=client_factory,
                            request_deadline_seconds=request_deadline_seconds,
                            token_counter=token_counter,
-                           search_executor=search_executor)
+                           search_executor=search_executor,
+                           log_context=log_context)
 
 
 __all__ = [

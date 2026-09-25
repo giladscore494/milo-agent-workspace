@@ -4,6 +4,7 @@ import inspect
 from typing import Any, Callable, Mapping
 from backend.budget import BudgetExceeded
 from backend.errors import AppError
+from backend.provider_streaming import ProviderTransportFailure
 from backend.runtime import CancellationRequested
 from .adapters import CommanderClient
 from .contracts import CommanderDecision, CommanderPlan
@@ -89,12 +90,16 @@ class Commander:
             inert_json = self._client.create_plan(model=model, objective=objective,
                                                   context=context, **extra)
         except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError,
-                ModelRequestRefused):
+                ModelRequestRefused, ProviderTransportFailure):
             # AppError is the persistence/repository boundary (e.g. a lease
             # or usage write failing inside the guarded client): it must
             # escape as infrastructure, never as a handled Commander failure.
             # ModelRequestRefused is a model-contract refusal decided before
             # any request existed; it keeps its own static code.
+            # ProviderTransportFailure (PR-S) is a transport outcome already
+            # named with its static code (deadline, stream interrupted, HTTP
+            # status); folding it into COMMANDER_COMPLETION_FAILED is what hid
+            # run 5145ca65's cause. It is never repaired here.
             raise
         except Exception:
             raise CommanderPlanFailure("COMMANDER_COMPLETION_FAILED") from None
@@ -125,7 +130,7 @@ class Commander:
             inert = (create(model=model, objective=objective, summary=summary) if create else
                      self._client.create_plan(model=model, objective=objective, context={"status": summary}))
         except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError,
-                ModelRequestRefused):
+                ModelRequestRefused, ProviderTransportFailure):
             raise
         except Exception:
             raise CommanderPlanFailure("COMMANDER_COMPLETION_FAILED") from None

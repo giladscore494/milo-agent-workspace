@@ -23,6 +23,7 @@ this set wins and the older document carries an archive banner.
 | [REASONING_BUDGET.md](REASONING_BUDGET.md) | PR-R: model profiles (fail-closed), reasoning-aware role policies, worst-case cost reservation, truncation codes, Stage E model env, Work plan Revision 2.3 |
 | [TIER2_FIRST_RUN_PROFILE.md](TIER2_FIRST_RUN_PROFILE.md) | The Tier 2 first-run profile: ceiling vs active profile, the evidence behind it, search QPS, the request-lease invariant (formerly `backend/tier2_profile.py`) |
 | [RATE_LIMITING.md](RATE_LIMITING.md) | Shared-store rate limiting (gateway + API) |
+| [REASONING_SAFE_TRANSPORT.md](REASONING_SAFE_TRANSPORT.md) | PR-S runbook: streamed Swarm V2 calls, per-role total deadlines, the 800 s lease window, transport failure codes, structured provider-call logs, the probe diagnosis, reclaiming a quarantined lease |
 | [PROVIDER_AUTHORITY.md](PROVIDER_AUTHORITY.md) | The one provider adapter: outcome taxonomy, retry/admission, token admission, MILO-mediated standalone search, absolute deadline |
 | [ENVIRONMENT_MATRIX.md](ENVIRONMENT_MATRIX.md) | Every production variable, classified |
 | [MIGRATIONS.md](MIGRATIONS.md) | Migration order, states, backfills |

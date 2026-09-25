@@ -295,7 +295,12 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
     _d("max_run_duration_seconds", 1800, env_key="MILO_MAX_RUN_DURATION_SECONDS",
        enforced_by=BUDGET,
        why="NOT raised after run 3772fc84 timed out at 1800s: that timeout was "
-           "throughput, not pacing, and the fix is V1 parallelism"),
+           "throughput, not pacing, and the fix is V1 parallelism. NOT raised "
+           "by PR-S either: the cap is checked before each call, so a Swarm V2 "
+           "call admitted just under it may run its whole role deadline (600s "
+           "for planning) plus one 60s stream inactivity window, ending by "
+           "1800 + 660 = 2460s, inside the 3600s worker job timeout; that "
+           "relationship is enforced, not assumed"),
     _d("max_agent_steps", 56, env_key="MILO_MAX_AGENT_STEPS", enforced_by=BUDGET,
        why="1.75x the 32 steps Attempt 7 used; every guarded gateway call "
            "records exactly one, so it is the tightest binding dimension on "
@@ -926,7 +931,26 @@ def _invariant_violations(values: Mapping[str, int | float | None]) -> list[Poli
         fail("max_run_duration_seconds",
              "the cooperative run duration cap must stay below the worker job "
              "timeout, or the process is killed before it can record a terminal state")
+    elif duration is not None and (int(duration) + longest_provider_call_seconds()
+                                   >= WORKER_JOB_TIMEOUT_SECONDS):
+        # PR-S: the cap is checked BEFORE each call, so the last call admitted
+        # under it may still run for its whole role deadline plus one stream
+        # inactivity window. The process must survive that to record the
+        # terminal state.
+        fail("max_run_duration_seconds",
+             "the cooperative run duration cap plus the longest provider call "
+             "must stay below the worker job timeout")
     return out
+
+
+def longest_provider_call_seconds() -> float:
+    """The longest ONE provider call may keep a worker: the largest Swarm V2
+    role deadline plus one stream inactivity window (PR-S). Imported lazily:
+    this module imports nothing from ``backend`` at module scope."""
+    from backend.engines.swarm_v2.model_gateway import MAX_ROLE_TOTAL_DEADLINE_SECONDS
+    from backend.provider_transport import STREAM_INACTIVITY_SECONDS
+
+    return float(MAX_ROLE_TOTAL_DEADLINE_SECONDS) + float(STREAM_INACTIVITY_SECONDS)
 
 
 def reviewed_policy_violations() -> list[PolicyViolation]:
@@ -967,6 +991,26 @@ def reviewed_policy_violations() -> list[PolicyViolation]:
     # worker could have started under.
     from backend.provider_quota import MAX_INFERENCE_CONCURRENCY, MAX_RPM, MAX_TPM
 
+    # PR-S: the reviewed lease window must admit the longest Swarm V2 role
+    # deadline. The transport clamps a role to the client's ceiling, so a
+    # window too short for it would silently cut planning back to the
+    # deadline that killed run 5145ca65.
+    from backend.engines.swarm_v2.model_gateway import MAX_ROLE_TOTAL_DEADLINE_SECONDS
+    from backend.provider_quota import (REVIEWED_LEASE_TTL_SECONDS, QuotaConfig,
+                                        assert_request_deadline_safe)
+
+    try:
+        assert_request_deadline_safe(MAX_ROLE_TOTAL_DEADLINE_SECONDS,
+                                     REVIEWED_LEASE_TTL_SECONDS)
+        admits = (QuotaConfig().request_deadline_seconds
+                  >= MAX_ROLE_TOTAL_DEADLINE_SECONDS)
+    except ValueError:
+        admits = False
+    if not admits:
+        fail("max_run_duration_seconds",
+             "the reviewed provider lease window does not admit the longest "
+             "Swarm V2 role deadline")
+
     for name, ceiling in (("provider_max_concurrency", MAX_INFERENCE_CONCURRENCY),
                           ("provider_rpm_limit", MAX_RPM),
                           ("provider_tpm_limit", MAX_TPM)):
@@ -998,7 +1042,8 @@ __all__ = [
     "POLICY_ENV_KEYS", "POLICY_SCHEMA_VERSION", "PROVIDER", "PROVIDER_ENV_PREFIXES",
     "POSTURE", "PolicyDimension", "PolicyViolation", "RuntimePolicy",
     "RuntimePolicyError", "SEARCH", "TRUE_VALUES", "WORKER_JOB_TIMEOUT_SECONDS",
-    "catalog_posture_violations", "dimensions_for", "paid_posture",
+    "catalog_posture_violations", "dimensions_for", "longest_provider_call_seconds",
+    "paid_posture",
     "REVIEWED_CATALOG_POSTURE", "policy_failure_code", "policy_violations",
     "resolve_runtime_policy", "resolved_dimension",
     "reviewed_first_run_policy", "reviewed_policy_violations",

@@ -264,6 +264,26 @@ GUARANTEE_TIMED_RECLAIM = (
     "MILO cannot verify")
 
 
+#: THE REVIEWED NOMINAL LEASE WINDOW (``MILO_PROVIDER_LEASE_TTL_SECONDS``).
+#:
+#: PR-S raised it from 120 to 800. Every Swarm V2 call is now streamed with a
+#: per-role TOTAL deadline, the longest of which is Commander planning at 600s
+#: (run 5145ca65: K3 at high effort, a 32k cap, killed ~70s in by a 90s
+#: deadline). The request deadline is derived from this window as
+#: ``ttl - max(15, 0.25 x ttl)``, so 800 gives exactly 600s with a 200s margin
+#: and `assert_request_deadline_safe(600, 800)` holds with equality
+#: (600 + 200 <= 800). It changes no reclaim behaviour -- nothing reclaims on
+#: this clock -- only the deadline ceiling and the probe cadence (800/4 =
+#: 200s). A deployment may set a SHORTER window; the roles' deadlines are then
+#: clamped to the smaller ceiling.
+REVIEWED_LEASE_TTL_SECONDS = 800.0
+
+#: The deadline NON-streaming requests (V1 chat, standalone search) keep: the
+#: value the previous 120s window derived (120 - 30), preserved so the V1
+#: pipeline's timing is unchanged by PR-S.
+NON_STREAMING_REQUEST_DEADLINE_SECONDS = 90.0
+
+
 def lease_safety_margin(window_seconds: float) -> float:
     """The part of a window that is deliberately NOT available to a request.
 
@@ -595,10 +615,24 @@ return {1, active + 1}
 # Read-only by construction: no ZADD, no PEXPIRE, no ZREM. A probe that could
 # write could extend a lease, and extending one is the capacity leak this
 # design removes.
+#
+# PR-S: the score is never parsed in Lua. A held lease's score is +inf, which
+# ZSCORE returns as the STRING "inf"; the previous script compared
+# `tonumber(score)` with the clock, and a Lua whose `tonumber` does not parse
+# "inf" returns nil there, so the comparison is a script error -- on every
+# probe of every held lease. That is the one script in this module that ever
+# converted an infinite score in Lua (acquire, held and recover leave scores
+# to Redis's own range engine, and those work), and it matches the production
+# signature exactly: `provider_lease_probe_failed` at the FIRST probe of every
+# run. The range query below lets Redis compare the scores itself, the same
+# way `_LUA_HELD` already does; a live set holds at most the concurrency
+# ceiling (32), so the scan is bounded.
 _LUA_VERIFY = """
-local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
-if not score or tonumber(score) <= tonumber(ARGV[2]) then return 0 end
-return 1
+local live = redis.call('ZRANGEBYSCORE', KEYS[1], '(' .. ARGV[2], '+inf')
+for _, member in ipairs(live) do
+  if member == ARGV[1] then return 1 end
+end
+return 0
 """
 
 _LUA_RELEASE = """
@@ -697,11 +731,21 @@ class UpstashQuotaBackend:
             raise
         except Exception as exc:  # noqa: BLE001 - transport shapes vary; fail closed
             # Deliberately does not carry the exception text: a transport error
-            # can quote a URL that embeds a credential.
-            raise ProviderQuotaUnavailable() from exc
+            # can quote a URL that embeds a credential. What it DOES carry is
+            # a static kind, so a failing store is diagnosable from a log.
+            unavailable = ProviderQuotaUnavailable()
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            unavailable.failure_kind = (
+                f"store_http_{status}" if isinstance(status, int) and not isinstance(status, bool)
+                else "store_transport")
+            raise unavailable from exc
         if isinstance(result, dict):
             if "error" in result:
-                raise ProviderQuotaUnavailable()
+                # The store refused the command -- for a script, a Lua runtime
+                # error. The error text is not carried (it can quote keys).
+                unavailable = ProviderQuotaUnavailable()
+                unavailable.failure_kind = "store_error_response"
+                raise unavailable
             return result.get("result")
         return result
 
@@ -772,7 +816,12 @@ class QuotaConfig:
     #: The NOMINAL window one request is expected to occupy. It sizes the
     #: request deadline and the ownership-probe interval. It is NOT a reclaim
     #: trigger: nothing frees a slot at this age.
-    lease_ttl_seconds: float = 120.0
+    #:
+    #: PR-S: raised from 120 to 800 so the derived request deadline
+    #: (800 - max(15, 0.25 x 800) = 600s) admits the LONGEST Swarm V2 role
+    #: deadline (Commander planning, 600s) under `assert_request_deadline_safe`
+    #: exactly. See :data:`REVIEWED_LEASE_TTL_SECONDS`.
+    lease_ttl_seconds: float = REVIEWED_LEASE_TTL_SECONDS
     #: The longest ONE provider request may keep a MILO thread waiting. None
     #: means "derive it from the nominal window", which is what every
     #: production path does.
@@ -791,10 +840,26 @@ class QuotaConfig:
 
     @property
     def request_deadline_seconds(self) -> float:
-        """The resolved per-request deadline for this configuration."""
+        """The resolved per-request deadline CEILING for this configuration.
+
+        The longest ANY request may keep a MILO thread. Swarm V2's streamed
+        roles each tighten it to their own total deadline; it is the number
+        the lease window is validated against.
+        """
         if self.provider_request_timeout_seconds is None:
             return default_request_deadline(self.lease_ttl_seconds)
         return float(self.provider_request_timeout_seconds)
+
+    @property
+    def non_streaming_request_deadline_seconds(self) -> float:
+        """The deadline for NON-streaming requests (V1 chat, standalone search).
+
+        Held at the value those paths had before PR-S, so raising the lease
+        window for Swarm V2's streamed reasoning calls does not quietly let a
+        silent non-streaming request wait six times longer. Never above the
+        ceiling.
+        """
+        return min(NON_STREAMING_REQUEST_DEADLINE_SECONDS, self.request_deadline_seconds)
 
     @property
     def reclaims_abandoned_leases(self) -> bool:
@@ -903,7 +968,8 @@ class QuotaConfig:
             max_tpm=_int("MILO_ORG_TPM_LIMIT", MAX_TPM),
             search_qps=(_int("MILO_SEARCH_BASIC_QPS", SEARCH_QPS_FALLBACK[SEARCH_BASIC]),
                         _int("MILO_SEARCH_PRO_QPS", SEARCH_QPS_FALLBACK[SEARCH_PRO])),
-            lease_ttl_seconds=float(_int("MILO_PROVIDER_LEASE_TTL_SECONDS", 120)),
+            lease_ttl_seconds=float(_int("MILO_PROVIDER_LEASE_TTL_SECONDS",
+                                        int(REVIEWED_LEASE_TTL_SECONDS))),
             worker_max_lifetime_seconds=_lifetime(),
             abandoned_lease_reclaim_seconds=_abandoned_reclaim(),
             provider_request_timeout_seconds=(
@@ -1319,6 +1385,7 @@ __all__ = [
     "assert_abandoned_lease_reclaim_safe", "assert_request_deadline_safe",
     "default_request_deadline", "ownership_probe_interval",
     "minimum_abandoned_lease_reclaim",
+    "NON_STREAMING_REQUEST_DEADLINE_SECONDS", "REVIEWED_LEASE_TTL_SECONDS",
     "lease_safety_margin",
     "KIMI_TIER2_PROVIDER_LIMITS", "MAX_INFERENCE_CONCURRENCY", "MAX_RPM", "MAX_TPM",
     "MAX_TPD", "SAFETY_FACTOR", "SEARCH_BASIC", "SEARCH_PRO", "SEARCH_ENDPOINTS",

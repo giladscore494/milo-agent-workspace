@@ -29,7 +29,7 @@ import os
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator
 
 from backend.execution_usage import (LEDGER_AMOUNTS, LEDGER_COUNTERS, LEDGER_SCHEMA_VERSION,
@@ -41,6 +41,7 @@ from backend.model_profiles import (MODEL_PROFILE_UNKNOWN, ModelProfile, Unknown
 from backend.model_usage import USAGE_REASONING_FIELD_ABSENT, UsageBreakdown, read_usage
 from backend.provider_authority import (ProviderOutcome, ProviderVerdict,
                                         classify_outcome, conservative_input_tokens)
+from backend.provider_streaming import ensure_assembled, request_streams
 from backend.runtime import CancellationRequested
 from backend.runtime_policy import BUDGET as _POLICY_BUDGET_SURFACE
 from backend.runtime_policy import dimensions_for as _policy_dimensions_for
@@ -1139,6 +1140,12 @@ class _GuardedCompletions:
         apply_output_cap(kwargs, effective_cap, profile.output_cap_field)
         try:
             response = self._inner.create(**kwargs)
+            # PR-S: a STREAMING request is not answered when `create` returns
+            # -- only its headers are. The stream is consumed here, inside the
+            # same guard, so a stream that drops mid-way is a provider failure
+            # settled exactly like any other, and only a stream that ended
+            # with a finish_reason reaches the usage accounting below.
+            response = ensure_assembled(kwargs, response)
         except Exception as exc:
             # THE SAME classification the scheduler settles on. It used to be
             # a different one, and the difference was a real defect: a 503
@@ -1185,6 +1192,16 @@ class _GuardedCompletions:
         breakdown = read_usage(response)
         input_tokens = breakdown.input_tokens
         output_tokens = breakdown.output_tokens
+        if usage is None and request_streams(kwargs):
+            # A stream that finished but never reported usage (it was asked
+            # for with stream_options.include_usage). An unmeasured amount of
+            # provider spend is not an absence of spend: the call is charged
+            # its whole reservation -- every reserved input token and the full
+            # output cap -- rather than zero.
+            input_tokens = max(input_tokens, int(input_upper_bound or estimated_input))
+            output_tokens = max(output_tokens, int(reserved_output or 0))
+            breakdown = replace(breakdown, input_tokens=input_tokens,
+                                output_tokens=output_tokens)
         if provider_cost is None:
             # A provider-reported cost wins; otherwise the profile prices the
             # breakdown: cached input at the hit price, cache writes at the
@@ -1244,7 +1261,10 @@ def resolved_request_deadline(deadline_seconds: float | None = None) -> float:
     if deadline_seconds is None:
         from backend.provider_quota import QuotaConfig
 
-        deadline_seconds = QuotaConfig.from_env().request_deadline_seconds
+        # A caller that states no deadline is a NON-streaming one (V1, search,
+        # a local client): it keeps the deadline those paths always had.
+        # Swarm V2's streamed calls pass the ceiling explicitly (PR-S).
+        deadline_seconds = QuotaConfig.from_env().non_streaming_request_deadline_seconds
     return float(deadline_seconds)
 
 

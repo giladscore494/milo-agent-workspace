@@ -427,6 +427,14 @@ over `healthy` / `returns_false` / `raises` demonstrates.
 
 ### How the request deadline is still enforced, and what it is for
 
+> **PR-S (2026-09-25).** The reviewed lease window is now **800 s** (was 120 s),
+> so the derived deadline **ceiling** is 600 s. Swarm V2 calls are streamed and
+> each role tightens that ceiling to its own total deadline (planning 600 s,
+> verification 480 s, replanning and execute 300 s) with a 60 s inactivity
+> window between chunks. V1 chat and standalone search keep 90 s. See
+> [REASONING_SAFE_TRANSPORT.md](REASONING_SAFE_TRANSPORT.md). The 120 s / 90 s
+> figures below are the values at the time they were measured.
+
 It is now a **liveness** bound — how long one request may keep a MILO thread —
 not the concurrency bound. An httpx timeout cannot even do that: `read` bounds
 the gap *between bytes*, so a response that keeps producing data never trips
