@@ -1,6 +1,6 @@
 # Current MILO baseline
 
-This document records the existing MILO Streamlit implementation preserved from `MILO-main-original/MILO-main/`, based primarily on `app.py` rather than the older README.
+This document records the existing MILO Streamlit implementation preserved in `legacy/milo-streamlit-v1/` (originally recorded from its byte-identical duplicate `MILO-main-original/MILO-main/`, removed in cleanup D6), based primarily on `app.py` rather than the older README.
 
 ## Project inventory
 
