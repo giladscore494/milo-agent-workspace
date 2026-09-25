@@ -465,6 +465,22 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         provider_request_deadline = (
             provider_coordinator.config.non_streaming_request_deadline_seconds
             if provider_coordinator is not None else None)
+        # The deadline transport only ever TIGHTENS a role's total deadline to
+        # the client ceiling. A deployment whose ceiling is below the longest
+        # role deadline (MILO_PROVIDER_REQUEST_TIMEOUT_SECONDS or
+        # MILO_PROVIDER_LEASE_TTL_SECONDS set lower than reviewed) would
+        # silently cut Commander planning short -- the failure PR-S exists to
+        # prevent. It is refused here, before any provider path exists.
+        if (paid_execution_enabled() and workflow_key == "swarm_v2" and engine is None
+                and engine_registry is None and engine_mode != "mock"
+                and streaming_request_deadline is not None):
+            from backend.engines.swarm_v2.model_gateway import MAX_ROLE_TOTAL_DEADLINE_SECONDS
+
+            if float(streaming_request_deadline) < float(MAX_ROLE_TOTAL_DEADLINE_SECONDS):
+                finalizer.finalize(TerminalClaim.refusal(
+                    workflow_key, "PROVIDER_DEADLINE_BELOW_ROLE_POLICY",
+                    "the provider request deadline is below the longest Swarm V2 role deadline"))
+                return 0
 
         def emit_budget_event(event_type, payload):
             sink.emit(RunEventRecord(run_id=run_id, type=event_type, message=payload.get("message", event_type), payload=payload.get("payload", payload)))

@@ -20,8 +20,10 @@ Every Swarm V2 request is assembled here, from the model's registered
   model supports it, strict output is proven for it
   (``strict_json_schema_verified``) and the schema passes
   :func:`is_strict_compatible`; otherwise ``json_object``;
-* every request is STREAMED (PR-S): ``stream: true`` with
-  ``stream_options.include_usage``. A non-streaming reasoning model is silent
+* every request is STREAMED (PR-S): ``stream: true``. ``stream_options`` is
+  NOT sent: the Kimi K3 documentation MILO could verify does not describe it,
+  and Moonshot reports usage on the final choice (``choices[0].usage``)
+  without it. A non-streaming reasoning model is silent
   until its whole answer exists, which is how run 5145ca65's planning call
   died on a header read timeout with nothing to show for it
   (``backend.provider_streaming``).
@@ -57,9 +59,12 @@ EFFORT_LADDER: tuple[str, ...] = ("none", "low", "high", "max")
 #: The total deadline of a role that declares none of its own.
 DEFAULT_ROLE_TOTAL_DEADLINE_SECONDS = 300.0
 
-#: PR-S: every Swarm V2 request is streamed, and asks for the usage block on
-#: the final chunk so the ledger is charged what the provider counted.
-STREAM_FIELDS: Mapping[str, Any] = {"stream": True, "stream_options": {"include_usage": True}}
+#: PR-S: every Swarm V2 request is streamed. ``stream_options.include_usage``
+#: is deliberately absent: it is not documented for the Kimi models in any
+#: source MILO could verify, and an undocumented parameter is not sent. Usage
+#: is read from the final choice (Moonshot) or a usage chunk when one comes;
+#: a finished stream with no usage is charged its whole reservation.
+STREAM_FIELDS: Mapping[str, Any] = {"stream": True}
 
 #: Message keys a Swarm V2 prompt may carry. `reasoning_content` is absent on
 #: purpose: V2 is single-turn and never re-prompts a model's reasoning.
@@ -241,7 +246,6 @@ def build_provider_request(profile: ModelProfile, policy: RolePolicy,
             profile, schema if policy.structured else None, schema_name),
         **_reasoning_fields(profile, resolved),
         "stream": STREAM_FIELDS["stream"],
-        "stream_options": dict(STREAM_FIELDS["stream_options"]),
     }
     leaked = set(request) & profile.forbidden_params
     if "extra_body" in request:

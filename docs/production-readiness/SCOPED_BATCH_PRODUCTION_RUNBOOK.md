@@ -117,7 +117,8 @@ Every script builds, tags and checks `git rev-parse HEAD`, so **the checkout is
 the release**. Keep this one checkout for the whole rollout.
 
 Check CI for that exact commit through the pull request that produced it.
-CI runs on pull requests only; there is no post-merge run on `main`. So
+CI runs automatically on pull requests only; there is no automatic post-merge
+run on `main`. So
 `$RELEASE_SHA` (the merge commit on `main`) is accepted when **both** hold:
 
 1. CI is green on the merged PR's **latest commit** (`$PR_HEAD_SHA`, the merge
@@ -153,6 +154,19 @@ release PRs with a merge commit.
 
 **Stop if** CI is not green for `$PR_HEAD_SHA`, the two trees differ,
 `$RELEASE_SHA` is not a merge commit, or the worktree is dirty.
+
+`ci` can also be run by hand (`workflow_dispatch`) on the release commit
+itself. Dispatch it on `main`, then check that the run's commit is
+`$RELEASE_SHA` and that all four mandatory jobs are green:
+
+```bash
+gh workflow run ci.yml --ref main --repo giladscore494/milo-agent-workspace
+gh run list --workflow ci --event workflow_dispatch --commit "$RELEASE_SHA" \
+  --repo giladscore494/milo-agent-workspace
+```
+
+`--ref main` runs whatever `main` points at when it is dispatched. If `main`
+has moved past `$RELEASE_SHA`, that run did not test the release: stop.
 
 ### A.2 Operator configuration and the read-only database URL
 

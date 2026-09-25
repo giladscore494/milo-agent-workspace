@@ -36,8 +36,8 @@ from backend.execution_usage import (LEDGER_AMOUNTS, LEDGER_COUNTERS, LEDGER_SCH
                                      LEDGER_SNAPSHOT_FIELDS, PUBLIC_USAGE_FIELDS,
                                      merge_usage_snapshots, public_usage_projection,
                                      validate_usage_snapshot)
-from backend.model_profiles import (MODEL_PROFILE_UNKNOWN, ModelProfile, UnknownModelProfile,
-                                    get_profile)
+from backend.model_profiles import (CACHE_TTL_5M, MODEL_PROFILE_UNKNOWN, ModelProfile,
+                                    UnknownModelProfile, get_profile)
 from backend.model_usage import USAGE_REASONING_FIELD_ABSENT, UsageBreakdown, read_usage
 from backend.provider_authority import (ProviderOutcome, ProviderVerdict,
                                         classify_outcome, conservative_input_tokens)
@@ -1155,12 +1155,32 @@ class _GuardedCompletions:
             # event was counted twice, and a run could die at
             # RETRY_LIMIT_REACHED without any model having misbehaved.
             verdict = classify_outcome(exc)
+            charged_input, charged_output, charged_cost, charged_usage = 0, 0, 0.0, None
+            if contract is not None and not verdict.completion_proven:
+                # The request was SENT and MILO cannot prove it stopped: a
+                # stream that dropped mid-way, an inactivity timeout, a fired
+                # total deadline. The provider may have billed every token it
+                # was allowed, so the call is charged its whole worst-case
+                # reservation -- the same rule as a finished stream that
+                # reported no usage -- to the run budget AND the daily
+                # settlement, never zero. Nothing was measured, so the
+                # reasoning and answer counts are recorded as null.
+                charged_input = int(input_upper_bound or estimated_input)
+                charged_output = int(reserved_output or 0)
+                charged_cost = float(profile.worst_case_cost(charged_input, charged_output))
+                charged_usage = UsageBreakdown(
+                    input_tokens=charged_input, output_tokens=charged_output,
+                    cached_input_tokens=None, cache_write_tokens=None,
+                    cache_write_ttl=CACHE_TTL_5M, reasoning_tokens=None,
+                    answer_tokens=None, answer_tokens_basis="",
+                    reasoning_tokens_estimated=None, reasoning_estimated=False)
             try:
                 self._tracker.settle_call(
-                    estimated_input, reserved_output, 0, 0, 0.0, status="released",
+                    estimated_input, reserved_output, charged_input, charged_output,
+                    charged_cost, status="released",
                     rejection_reason=_settlement_reason(verdict),
-                    call_seq=call_seq,
-                )
+                    call_seq=call_seq, usage=charged_usage,
+                    model=kwargs.get("model", "") if charged_usage is not None else "")
             except BaseException as settlement:
                 # Settling can itself refuse, and that refusal would REPLACE
                 # the provider error the scheduler settles the concurrency
@@ -1193,8 +1213,8 @@ class _GuardedCompletions:
         input_tokens = breakdown.input_tokens
         output_tokens = breakdown.output_tokens
         if usage is None and request_streams(kwargs):
-            # A stream that finished but never reported usage (it was asked
-            # for with stream_options.include_usage). An unmeasured amount of
+            # A stream that finished but never reported usage (neither on
+            # the final choice nor in a usage chunk). An unmeasured amount of
             # provider spend is not an absence of spend: the call is charged
             # its whole reservation -- every reserved input token and the full
             # output cap -- rather than zero.
