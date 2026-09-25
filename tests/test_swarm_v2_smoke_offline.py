@@ -502,8 +502,11 @@ def test_token_budget_trip_produces_durable_budget_terminal(monkeypatch):
     run = repo.get_run(run_id)
     assert run["status"] == "budget_exhausted"
     # Depending on task interleaving the trip is caught either at reserve
-    # (REACHED, before the call) or at settle (EXCEEDED, actual overage).
-    assert run["error"]["code"] in {"TOTAL_TOKEN_LIMIT_REACHED", "TOTAL_TOKEN_LIMIT_EXCEEDED"}
+    # (REACHED, before the call; PR-R: BUDGET_INSUFFICIENT_FOR_ROLE when what
+    # remains cannot grant the next role its minimum answer reserve) or at
+    # settle (EXCEEDED, actual overage).
+    assert run["error"]["code"] in {"TOTAL_TOKEN_LIMIT_REACHED", "TOTAL_TOKEN_LIMIT_EXCEEDED",
+                                    "BUDGET_INSUFFICIENT_FOR_ROLE"}
     assert run["usage"]["model_calls"] >= 1
     assert run["usage"]["total_tokens"] >= 99000
 

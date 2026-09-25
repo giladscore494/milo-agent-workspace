@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Iterable, Mapping
 
+from backend.budget import CallContract, call_contract
 from backend.model_profiles import ModelProfile, UnknownModelProfile, get_profile
 from backend.provider_authority import ProviderAdapter
 from backend.runtime import CancellationRequested
@@ -28,27 +29,38 @@ class MissingRoleOutputCap(ValueError):
 
 
 #: The explicit, server-owned call policy for every Swarm V2 role, keyed by
-#: ``(agent_kind, phase)``: its reasoning effort, its output cap (reasoning
-#: AND answer, which the provider counts together) and whether its output has
-#: a JSON Schema the provider may enforce. The caps are still the V1-derived
-#: per-role numbers:
+#: ``(agent_kind, phase)``: its reasoning effort, its output cap and the
+#: smallest cap the call is still worth making with
+#: (MILO_V2_REASONING_BUDGET_PR_SPEC.md, PR-R 4.2).
+#:
+#: WHY THE CAPS ARE LARGE. They used to be 4000/2000/2500/3500, sized for a
+#: model that did not think. A reasoning model spends its output on thinking
+#: first -- the provider counts reasoning and answer against ONE cap -- and
+#: run 4761a8ce's Commander spent all 4,000 tokens thinking and returned
+#: nothing. The per-call cap is therefore generous and the hard money bound
+#: moves to the run and the day: every call reserves its WORST-CASE cost
+#: (input upper bound x input price + this cap x output price) before it is
+#: sent, so a large cap can never spend past a dollar ceiling. These numbers
+#: are a starting point, to be calibrated from the reasoning_tokens of the
+#: first 2-3 runs.
 #:
 #:   * planning    -- the largest structured output a run produces (a whole
-#:                    task graph), so it gets the most room;
+#:                    task graph), K3 at high effort;
 #:   * replanning  -- a decision plus an optional replacement plan; its
 #:                    CommanderDecision schema carries conditional rules, so it
 #:                    stays on json_object;
-#:   * execute     -- one task's structured output (V1 technical: 2500);
-#:   * verification-- one batch of grounded verdicts (V1 verifier: 3500).
+#:   * execute     -- one task's structured output, the worker model at low
+#:                    effort (kimi-k2.6: thinking enabled);
+#:   * verification-- one batch of grounded verdicts, K3 at high effort.
 #:
 #: A role that is not listed here is a programming error and fails closed
 #: rather than inheriting the run's whole remaining allowance.
 ROLE_POLICIES: Mapping[tuple[str, str], RolePolicy] = {
-    ("commander", "planning"): RolePolicy(effort="high", max_output=4000, min_answer_reserve=4000),
-    ("commander", "replanning"): RolePolicy(effort="high", max_output=2000, min_answer_reserve=2000,
+    ("commander", "planning"): RolePolicy(effort="high", max_output=32_000, min_answer_reserve=6_000),
+    ("commander", "replanning"): RolePolicy(effort="high", max_output=16_000, min_answer_reserve=3_000,
                                             structured=False),
-    ("worker", "execute"): RolePolicy(effort="low", max_output=2500, min_answer_reserve=2500),
-    ("verifier", "verification"): RolePolicy(effort="high", max_output=3500, min_answer_reserve=3500),
+    ("worker", "execute"): RolePolicy(effort="low", max_output=12_000, min_answer_reserve=3_000),
+    ("verifier", "verification"): RolePolicy(effort="high", max_output=24_000, min_answer_reserve=4_000),
 }
 
 #: Read-only view kept for surfaces that describe caps (the Tier 2 profile).
@@ -173,8 +185,14 @@ class ModelGateway:
         request = build_provider_request(profile, policy, messages, schema,
                                          output_cap=cap, effort=effort,
                                          schema_name=schema_name)
-        return self._adapter.chat(request, client=self._client, agent=agent,
-                                  phase=phase)
+        # The role's contract travels with THIS call to the guarded client:
+        # a budget that cannot grant the answer reserve refuses the call
+        # (BUDGET_INSUFFICIENT_FOR_ROLE) instead of shrinking it silently.
+        contract = CallContract(role=f"{str(agent).split(':', 1)[0]}:{phase}",
+                                min_answer_reserve=min(policy.min_answer_reserve, cap))
+        with call_contract(contract):
+            return self._adapter.chat(request, client=self._client, agent=agent,
+                                      phase=phase)
 
     def _tool_authorization_instruction(self) -> str:
         """Describe the registered capabilities, and grant none of them.

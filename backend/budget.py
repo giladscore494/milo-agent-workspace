@@ -23,10 +23,13 @@ The tracker never sees or stores API keys; configuration is numeric only.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from backend.execution_usage import (LEDGER_AMOUNTS, LEDGER_COUNTERS, LEDGER_SCHEMA_VERSION,
                                      LEDGER_SNAPSHOT_FIELDS, PUBLIC_USAGE_FIELDS,
@@ -222,6 +225,53 @@ DailySettlement = Callable[[ModelCallReservation, float, str, str | None], Any]
 
 # Conservative chars-per-token heuristic for pre-call input estimation.
 CHARS_PER_TOKEN = 4
+
+_log = logging.getLogger("milo.budget")
+
+#: Static reason codes of the PR-R role contract.
+BUDGET_INSUFFICIENT_FOR_ROLE = "BUDGET_INSUFFICIENT_FOR_ROLE"
+OUTPUT_CAP_REDUCED_BY_BUDGET = "OUTPUT_CAP_REDUCED_BY_BUDGET"
+
+
+@dataclass(frozen=True)
+class CallContract:
+    """What a Swarm V2 role requires of ONE call, stated by the gateway.
+
+    ``min_answer_reserve`` is the smallest output cap the call is still worth
+    making with. A call whose remaining budget cannot grant it is REFUSED
+    (``BUDGET_INSUFFICIENT_FOR_ROLE``) before anything is sent, instead of
+    being silently shrunk into a guaranteed truncation -- which is what a
+    reasoning model does with a small cap: it spends the whole of it thinking
+    and returns an empty answer.
+
+    Calls without a contract (V1, and any caller that predates PR-R) keep
+    their historical admission exactly.
+    """
+
+    role: str
+    min_answer_reserve: int
+
+
+_CALL_CONTRACT: ContextVar[CallContract | None] = ContextVar("milo_call_contract", default=None)
+
+
+@contextmanager
+def call_contract(contract: CallContract) -> Iterator[None]:
+    """Attach ``contract`` to the guarded calls made inside this block.
+
+    Provider calls are synchronous on the calling thread (gateway -> adapter
+    -> scheduler -> guarded client), so the contract travels with exactly the
+    call it was stated for and never reaches the provider payload.
+    """
+    token = _CALL_CONTRACT.set(contract)
+    try:
+        yield
+    finally:
+        _CALL_CONTRACT.reset(token)
+
+
+def current_call_contract() -> CallContract | None:
+    return _CALL_CONTRACT.get()
 
 # --- the provider output-cap contract ---------------------------------------
 #
@@ -512,7 +562,8 @@ class BudgetTracker:
         """Backwards-compatible reservation returning only the output allowance."""
         return self.open_call(estimated_input_tokens, requested_max_tokens)[1]
 
-    def open_call(self, estimated_input_tokens: int = 0, requested_max_tokens: int | None = None) -> tuple[int, int | None]:
+    def open_call(self, estimated_input_tokens: int = 0, requested_max_tokens: int | None = None,
+                  *, contract: CallContract | None = None) -> tuple[int, int | None]:
         """Atomically reserve capacity for one model call BEFORE it happens.
 
         Checks (in order): paid-execution kill switch, worker lease,
@@ -580,6 +631,20 @@ class BudgetTracker:
             allowed_output = remaining_output
             if requested_max_tokens is not None:
                 allowed_output = requested_max_tokens if allowed_output is None else min(allowed_output, requested_max_tokens)
+            if contract is not None and allowed_output is not None:
+                # PR-R 4.2: a role call is never silently shrunk below the
+                # answer it needs. Below the reserve it is refused, BEFORE the
+                # daily reservation and before anything is sent.
+                if allowed_output < contract.min_answer_reserve:
+                    raise self._reject(BUDGET_INSUFFICIENT_FOR_ROLE,
+                                       "remaining budget cannot grant the role's minimum answer reserve",
+                                       "budget_exhausted", "budget_exhausted")
+                if requested_max_tokens is not None and allowed_output < requested_max_tokens:
+                    # Above the reserve a smaller cap is still a useful call,
+                    # but it is never a SILENT one (spec 4.7).
+                    _log.warning("%s role=%s requested=%d granted=%d",
+                                 OUTPUT_CAP_REDUCED_BY_BUDGET, contract.role,
+                                 int(requested_max_tokens), int(allowed_output))
             # Reserve the capacity this call may consume. Output capacity is
             # held as an in-flight reservation WHENEVER an allowance exists --
             # including when the caller declared no cap of its own.
@@ -982,8 +1047,10 @@ class _GuardedCompletions:
         # be proven finished, and an exception from here proves it never
         # started -- so it must be marked, or an ordinary budget refusal would
         # quarantine a shared slot it never used.
+        contract = current_call_contract()
         try:
-            call_seq, allowed_output = self._tracker.open_call(estimated_input, requested_max)
+            call_seq, allowed_output = self._tracker.open_call(estimated_input, requested_max,
+                                                               contract=contract)
         except BaseException as exc:
             exc.provider_request_completed = True
             raise

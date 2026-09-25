@@ -233,7 +233,9 @@ def test_the_recorded_output_never_overshoots_the_ceiling(width):
 
 
 def test_every_provider_request_carries_a_numeric_output_cap():
-    gateway, _tracker, provider = build_stack(width=4, max_output=50_000)
+    # Enough for every role's full cap (PR-R caps are sized for reasoning).
+    gateway, _tracker, provider = build_stack(
+        width=4, max_output=caps_for(len(V2_ROLES)))
     assert not fire(gateway, V2_ROLES)
     for request in provider.observed:
         cap = request.get(PROVIDER_OUTPUT_CAP_FIELD)
@@ -244,7 +246,9 @@ def test_every_provider_request_carries_a_numeric_output_cap():
 
 
 def test_settlement_releases_everything_and_cannot_double_release():
-    gateway, tracker, provider = build_stack(width=4, max_output=50_000)
+    # Enough for every role's full cap (PR-R caps are sized for reasoning).
+    gateway, tracker, provider = build_stack(
+        width=4, max_output=caps_for(len(V2_ROLES)))
     assert not fire(gateway, V2_ROLES)
     assert tracker.reserved_output_tokens == 0
     assert tracker.reserved_input_tokens == 0

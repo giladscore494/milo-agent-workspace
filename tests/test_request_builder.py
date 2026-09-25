@@ -124,3 +124,75 @@ def test_the_gateway_refuses_a_forbidden_parameter_before_any_provider_request()
         gateway.call(model="kimi-k9", agent="verifier", phase="verification", messages=MESSAGES)
     assert caught.value.code == "MODEL_PROFILE_UNKNOWN"
     assert calls == []
+
+
+# --- PR-R commit 4: role policies and the answer reserve --------------------
+
+from backend.budget import BUDGET_INSUFFICIENT_FOR_ROLE, BudgetExceeded  # noqa: E402
+from backend.engines.swarm_v2.model_gateway import ROLE_POLICIES, role_policy  # noqa: E402
+
+
+def test_role_policies_are_the_reviewed_starting_point():
+    assert {key: (p.effort, p.max_output, p.min_answer_reserve)
+            for key, p in ROLE_POLICIES.items()} == {
+        ("commander", "planning"): ("high", 32_000, 6_000),
+        ("commander", "replanning"): ("high", 16_000, 3_000),
+        ("worker", "execute"): ("low", 12_000, 3_000),
+        ("verifier", "verification"): ("high", 24_000, 4_000),
+    }
+    assert role_policy("worker:any-task-id", "execute") is ROLE_POLICIES[("worker", "execute")]
+
+
+def _budgeted_gateway(calls, **budget):
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            message = SimpleNamespace(content='{"a": "b"}')
+            return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")],
+                                   usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5))
+    tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=10, **budget),
+                            kill_switch=lambda: True)
+    factory = build_guarded_client_factory(
+        tracker, inner_factory=lambda *_: SimpleNamespace(chat=SimpleNamespace(completions=Completions())))
+    gateway = ModelGateway(
+        guarded_client_factory=factory,
+        scheduler=ProviderScheduler(ProviderLimitsConfig(
+            max_concurrency=1, rpm_limit=None, max_rate_limit_retries=0,
+            max_backpressure_wait_seconds=1, backoff_base_seconds=.001, backoff_max_seconds=.001)),
+        api_key="offline", base_url="offline")
+    return gateway, tracker
+
+
+def test_a_budget_below_the_answer_reserve_refuses_instead_of_shrinking_silently():
+    calls = []
+    gateway, tracker = _budgeted_gateway(calls, max_output_tokens_per_run=5_999)
+    with pytest.raises(BudgetExceeded) as caught:
+        gateway.call(model="kimi-k3", agent="commander", phase="planning", messages=MESSAGES)
+    assert caught.value.code == BUDGET_INSUFFICIENT_FOR_ROLE
+    assert calls == []
+    assert tracker.reserved_output_tokens == 0
+
+
+def test_a_budget_above_the_reserve_still_calls_with_a_reduced_cap_and_says_so(caplog):
+    calls = []
+    gateway, _tracker = _budgeted_gateway(calls, max_output_tokens_per_run=8_000)
+    with caplog.at_level("WARNING", logger="milo.budget"):
+        gateway.call(model="kimi-k3", agent="commander", phase="planning", messages=MESSAGES)
+    assert calls[0]["max_completion_tokens"] == 8_000
+    assert "OUTPUT_CAP_REDUCED_BY_BUDGET role=commander:planning requested=32000 granted=8000" \
+        in caplog.text
+
+
+def test_v1_calls_without_a_contract_keep_the_historical_silent_clamp():
+    calls = []
+    tracker = BudgetTracker(BudgetConfig(max_model_calls_per_run=10, max_output_tokens_per_run=100),
+                            kill_switch=lambda: True)
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1))
+    client = build_guarded_client_factory(
+        tracker, lambda *_: SimpleNamespace(chat=SimpleNamespace(completions=Completions())))("k", "u")
+    client.chat.completions.create(model="kimi-k2.6", messages=[{"content": "x"}], max_tokens=5_000)
+    assert calls[0]["max_tokens"] == 100
