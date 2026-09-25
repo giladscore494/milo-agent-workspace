@@ -8,6 +8,7 @@ from backend.runtime import CancellationRequested
 from .adapters import CommanderClient
 from .contracts import CommanderDecision, CommanderPlan
 from .models import CommanderModelResolver
+from .request_builder import ModelRequestRefused
 from .validation import (VALIDATION_REASONS, PlanJsonError, PlanLimitError,
                          PlanSchemaError, PlanValidationError, PlanValidator)
 from .evidence import safe_durable_value
@@ -68,10 +69,13 @@ class Commander:
         try:
             inert_json = self._client.create_plan(model=model, objective=objective,
                                                   context=context, **extra)
-        except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError):
+        except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError,
+                ModelRequestRefused):
             # AppError is the persistence/repository boundary (e.g. a lease
             # or usage write failing inside the guarded client): it must
             # escape as infrastructure, never as a handled Commander failure.
+            # ModelRequestRefused is a model-contract refusal decided before
+            # any request existed; it keeps its own static code.
             raise
         except Exception:
             raise CommanderPlanFailure("COMMANDER_COMPLETION_FAILED") from None
@@ -101,7 +105,8 @@ class Commander:
         try:
             inert = (create(model=model, objective=objective, summary=summary) if create else
                      self._client.create_plan(model=model, objective=objective, context={"status": summary}))
-        except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError):
+        except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError,
+                ModelRequestRefused):
             raise
         except Exception:
             raise CommanderPlanFailure("COMMANDER_COMPLETION_FAILED") from None

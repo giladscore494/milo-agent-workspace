@@ -812,6 +812,32 @@ def parse_verifier_batch(content: Any, expected: Sequence[str], *,
             for claim_id in expected]
 
 
+def verifier_batch_json_schema() -> dict[str, Any]:
+    """The provider-visible schema of ONE verifier batch response (PR-R).
+
+    Derived from the strict internal contract, so the schema the provider may
+    enforce and the parser that decides stay one description. It carries no
+    free-text field, exactly like VerifierResponseVerdict.
+    """
+    def compact(node: Any) -> Any:
+        # Documentation keys carry no constraint; dropping them keeps every
+        # batch request smaller without changing what the schema enforces.
+        if isinstance(node, dict):
+            return {key: compact(value) for key, value in node.items()
+                    if key not in {"description", "title"}}
+        if isinstance(node, list):
+            return [compact(item) for item in node]
+        return node
+
+    return {
+        "type": "object",
+        "properties": {"verdicts": {"type": "array",
+                                    "items": compact(VerifierResponseVerdict.model_json_schema())}},
+        "required": ["verdicts"],
+        "additionalProperties": False,
+    }
+
+
 class Verifier:
     """Grounded verification behind one injected resolver and one gateway.
 
@@ -881,7 +907,7 @@ class Verifier:
             model=self._model, agent="verifier", phase="verification",
             messages=[{"role": "system", "content": _SYSTEM_PROMPT},
                       {"role": "user", "content": serialize_verifier_candidates(ordered)}],
-            response_format={"type": "json_object"})
+            schema=verifier_batch_json_schema(), schema_name="verifier_batch")
         if isinstance(response, (dict, str, bytes, bytearray)):
             content: Any = response
         else:
@@ -910,5 +936,6 @@ __all__ = ["CONFLICT_VERDICT", "GROUNDED_VERDICT_REASONS", "fragment_reference_i
            "VERIFIER_REASONS", "GroundedVerificationPlan", "Verifier",
            "VerifierContractError", "VerifierProgress", "VerifierResponseVerdict",
            "build_verifier_batches", "parse_verifier_batch", "plan_grounded_verification",
+           "verifier_batch_json_schema",
            "serialize_verifier_candidates", "verifier_evidence_chars",
            "verifier_payload_bytes"]

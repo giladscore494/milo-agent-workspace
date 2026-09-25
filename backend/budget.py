@@ -231,8 +231,11 @@ CHARS_PER_TOKEN = 4
 # place that knows how the cap is spelled on the wire, so a test can assert on
 # the exact provider request and a future provider-side rename is one edit.
 #
-# `max_tokens` is what the Moonshot/Kimi OpenAI-compatible endpoint accepts
-# today; `max_completion_tokens` is the newer OpenAI spelling. Callers may use
+# The wire field is a property of the MODEL, not of MILO (PR-R): kimi-k2.6 has
+# always been sent `max_tokens`, and kimi-k3 documents `max_completion_tokens`
+# (`max_tokens` is deprecated there). The guarded client writes the field the
+# model's profile names (`ModelProfile.output_cap_field`); this default is the
+# historical spelling, kept for callers that state no model. Callers may use
 # either name and the wire field is emitted once, never both (sending both is
 # rejected by some OpenAI-compatible servers).
 PROVIDER_OUTPUT_CAP_FIELD = "max_tokens"
@@ -261,11 +264,15 @@ def read_output_cap(kwargs: dict[str, Any]) -> int | None:
     return None
 
 
-def apply_output_cap(kwargs: dict[str, Any], cap: int) -> dict[str, Any]:
-    """Put exactly ONE numeric output cap on the outgoing provider request."""
+def apply_output_cap(kwargs: dict[str, Any], cap: int,
+                     field: str = PROVIDER_OUTPUT_CAP_FIELD) -> dict[str, Any]:
+    """Put exactly ONE numeric output cap on the outgoing provider request,
+    under ``field`` (the model profile's ``output_cap_field``)."""
+    if field not in OUTPUT_CAP_ALIASES:
+        raise ValueError("output cap field must be a known provider spelling")
     for name in OUTPUT_CAP_ALIASES:
         kwargs.pop(name, None)
-    kwargs[PROVIDER_OUTPUT_CAP_FIELD] = int(cap)
+    kwargs[field] = int(cap)
     return kwargs
 
 
@@ -982,7 +989,7 @@ class _GuardedCompletions:
             raise
         effective_cap = allowed_output if allowed_output is not None else requested_max
         reserved_output = effective_cap
-        apply_output_cap(kwargs, effective_cap)
+        apply_output_cap(kwargs, effective_cap, profile.output_cap_field)
         try:
             response = self._inner.create(**kwargs)
         except Exception as exc:

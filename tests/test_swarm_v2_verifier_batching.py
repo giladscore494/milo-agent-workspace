@@ -17,6 +17,7 @@ from copy import deepcopy
 
 import pytest
 
+from backend.engines.swarm_v2.verifier import verifier_batch_json_schema
 from backend.engines.swarm_v2 import (
     MAX_VERIFIER_BATCH_JSON_BYTES, MAX_VERIFIER_CLAIMS_PER_BATCH,
     GROUNDED_VERDICT_REASONS, MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH,
@@ -48,7 +49,7 @@ def refs(count: int, **kwargs: object) -> list[EvidenceReference]:
 
 def verifier(gateway, resolver=None) -> Verifier:
     """A Verifier whose ONLY route to durable evidence is an injected stub."""
-    return Verifier(gateway=gateway, model="fake", resolver=resolver or StubResolver())
+    return Verifier(gateway=gateway, model="kimi-k2.6", resolver=resolver or StubResolver())
 
 
 def grounded(items, resolver=None) -> list[GroundedCandidate]:
@@ -73,7 +74,10 @@ class RecordingGateway:
 
     def call(self, **kwargs):
         assert kwargs["agent"] == "verifier" and kwargs["phase"] == "verification"
-        assert kwargs["response_format"] == {"type": "json_object"}
+        # PR-R: the verifier states its batch schema; the request builder
+        # decides the wire format from the model profile.
+        assert kwargs["schema"] == verifier_batch_json_schema()
+        assert kwargs["schema_name"] == "verifier_batch"
         self._in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self._in_flight)
         try:

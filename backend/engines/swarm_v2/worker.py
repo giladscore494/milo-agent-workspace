@@ -11,6 +11,7 @@ from backend.tools import ToolContext, ToolError, ToolRegistry
 from backend.tools.registry import validate_json_schema
 from .contracts import DynamicTask
 from .model_gateway import ModelGateway
+from .request_builder import ModelRequestRefused
 from .tool_calls import (MAX_TASK_OUTPUT_JSON_BYTES, MAX_TOOL_MATERIAL_JSON_BYTES,
                          MAX_TOOL_OUTPUT_JSON_BYTES, ToolCallError, ToolCallRecord,
                          ToolResultCallback, check_material, resolve_tool_arguments)
@@ -255,6 +256,12 @@ class GenericWorker:
             # Persistence/lease failures from the guarded call path are
             # infrastructure outcomes, never per-task failures.
             raise
+        except ModelRequestRefused:
+            # A model-contract refusal (unknown profile, forbidden parameter,
+            # unsupported effort) is a deployment fault decided before any
+            # request existed. It fails the RUN with its static code: every
+            # other task would be refused identically.
+            raise
         except ToolError as exc:
             return TaskResult(task.task_id, "failed", error=exc.as_dict()["error"])
         except ToolCallError as exc:
@@ -370,7 +377,10 @@ class GenericWorker:
             response = self._gateway.call(model=self._model, agent=f"worker:{task.task_id}", phase="execute",
                 messages=build_worker_request(task, tool_outputs, dependency_outputs,
                                               repair_reason=repair_reason),
-                response_format={"type": "json_object"})
+                # The task's declared output_schema, enforced by the provider
+                # where the model supports strict json_schema (PR-R); the
+                # deterministic validation below stays the authority.
+                schema=task.output_schema, schema_name="worker_output")
             content = response if isinstance(response, dict) else response.choices[0].message.content
             try:
                 return validate_worker_output(content, task.output_schema)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Iterable, Mapping
 
-from backend.budget import apply_output_cap
+from backend.model_profiles import ModelProfile, UnknownModelProfile, get_profile
 from backend.provider_authority import ProviderAdapter
 from backend.runtime import CancellationRequested
 from backend.tools import ToolDescriptor
@@ -14,6 +14,8 @@ from .contracts import (
     commander_plan_json_schema,
 )
 from .commander import CommanderPlanFailure
+from .request_builder import (MODEL_PARAM_FORBIDDEN, ModelRequestRefused, RolePolicy,
+                              build_provider_request)
 from .validation import VALIDATION_REASONS, PlanLimits, provider_plan_policy
 
 
@@ -22,44 +24,63 @@ def _canonical_json(value: Any) -> str:
 
 
 class MissingRoleOutputCap(ValueError):
-    """A Swarm V2 role reached the gateway without a declared output cap."""
+    """A Swarm V2 role reached the gateway without a declared call policy."""
 
 
-#: The explicit, server-owned output cap for every Swarm V2 role, keyed by
-#: ``(agent_kind, phase)``. V1 has required a numeric cap on every model call
-#: since it shipped (``core.moonshot_chat`` raises without one) and sizes it
-#: per agent; these are the V2 equivalents, sized from V1's proven per-role
-#: numbers for the comparable work:
+#: The explicit, server-owned call policy for every Swarm V2 role, keyed by
+#: ``(agent_kind, phase)``: its reasoning effort, its output cap (reasoning
+#: AND answer, which the provider counts together) and whether its output has
+#: a JSON Schema the provider may enforce. The caps are still the V1-derived
+#: per-role numbers:
 #:
 #:   * planning    -- the largest structured output a run produces (a whole
 #:                    task graph), so it gets the most room;
-#:   * replanning  -- a decision plus an optional replacement plan;
+#:   * replanning  -- a decision plus an optional replacement plan; its
+#:                    CommanderDecision schema carries conditional rules, so it
+#:                    stays on json_object;
 #:   * execute     -- one task's structured output (V1 technical: 2500);
 #:   * verification-- one batch of grounded verdicts (V1 verifier: 3500).
 #:
 #: A role that is not listed here is a programming error and fails closed
 #: rather than inheriting the run's whole remaining allowance.
-ROLE_OUTPUT_CAPS: Mapping[tuple[str, str], int] = {
-    ("commander", "planning"): 4000,
-    ("commander", "replanning"): 2000,
-    ("worker", "execute"): 2500,
-    ("verifier", "verification"): 3500,
+ROLE_POLICIES: Mapping[tuple[str, str], RolePolicy] = {
+    ("commander", "planning"): RolePolicy(effort="high", max_output=4000, min_answer_reserve=4000),
+    ("commander", "replanning"): RolePolicy(effort="high", max_output=2000, min_answer_reserve=2000,
+                                            structured=False),
+    ("worker", "execute"): RolePolicy(effort="low", max_output=2500, min_answer_reserve=2500),
+    ("verifier", "verification"): RolePolicy(effort="high", max_output=3500, min_answer_reserve=3500),
 }
 
+#: Read-only view kept for surfaces that describe caps (the Tier 2 profile).
+ROLE_OUTPUT_CAPS: Mapping[tuple[str, str], int] = {
+    key: policy.max_output for key, policy in ROLE_POLICIES.items()}
 
-def role_output_cap(agent: str, phase: str) -> int:
-    """Resolve ONE role's numeric output cap, or refuse the call.
+
+def role_policy(agent: str, phase: str) -> RolePolicy:
+    """Resolve ONE role's call policy, or refuse the call.
 
     ``agent`` carries a task id for workers (``worker:<task_id>``), so the role
-    is the part before the colon: the cap belongs to the ROLE, never to a
+    is the part before the colon: the policy belongs to the ROLE, never to a
     model-chosen identifier, and a task cannot name itself into a bigger cap.
     """
     kind = str(agent or "").split(":", 1)[0]
-    cap = ROLE_OUTPUT_CAPS.get((kind, str(phase or "")))
-    if cap is None:
+    policy = ROLE_POLICIES.get((kind, str(phase or "")))
+    if policy is None:
         raise MissingRoleOutputCap(
-            "no server-owned output cap is declared for this role")
-    return cap
+            "no server-owned call policy is declared for this role")
+    return policy
+
+
+def role_output_cap(agent: str, phase: str) -> int:
+    return role_policy(agent, phase).max_output
+
+
+def model_profile(model: str) -> ModelProfile:
+    """The model's profile, or a static refusal before anything is built."""
+    try:
+        return get_profile(model)
+    except UnknownModelProfile:
+        raise ModelRequestRefused("MODEL_PROFILE_UNKNOWN") from None
 
 
 class ModelGateway:
@@ -119,24 +140,39 @@ class ModelGateway:
         agent: str,
         phase: str,
         max_tokens: int | None = None,
+        schema: Mapping[str, Any] | None = None,
+        schema_name: str = "milo_output",
+        effort: str | None = None,
         **kwargs: Any,
     ) -> Any:
         if self._cancelled and self._cancelled():
             raise CancellationRequested("RUN_CANCELLED")
         if self._agent_step:
             self._agent_step(agent, phase)
+        # Decided before anything is sent: an unknown model, an unknown role
+        # or a parameter the model contract does not allow is a static
+        # refusal, never a provider call.
+        policy = role_policy(agent, phase)
+        profile = model_profile(model)
+        response_format = kwargs.pop("response_format", None)
+        if response_format not in (None, {"type": "json_object"}) or kwargs:
+            # The builder owns every parameter. `{"type": "json_object"}` is
+            # accepted from historical callers because it is what the builder
+            # sends anyway when there is no schema.
+            raise ModelRequestRefused(MODEL_PARAM_FORBIDDEN)
         # EVERY Swarm V2 provider request carries an explicit numeric output
         # cap. A caller may tighten the role's cap but never omit it and never
         # exceed it: the organization admits a request against
         # `input + requested cap`, so a request without one cannot be counted
         # correctly and must not be sent at all.
-        cap = role_output_cap(agent, phase)
+        cap = policy.max_output
         if max_tokens is not None:
             cap = min(cap, int(max_tokens))
             if cap <= 0:
                 raise MissingRoleOutputCap("output cap must be positive")
-        request = {"model": model, "messages": messages, **kwargs}
-        apply_output_cap(request, cap)
+        request = build_provider_request(profile, policy, messages, schema,
+                                         output_cap=cap, effort=effort,
+                                         schema_name=schema_name)
         return self._adapter.chat(request, client=self._client, agent=agent,
                                   phase=phase)
 
@@ -202,7 +238,8 @@ class ModelGateway:
             model=model,
             agent="commander",
             phase="planning",
-            response_format={"type": "json_object"},
+            schema=commander_plan_json_schema(),
+            schema_name="commander_plan",
             messages=[
                 {"role": "system", "content": system},
                 {
@@ -252,7 +289,6 @@ class ModelGateway:
             model=model,
             agent="commander",
             phase="replanning",
-            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system},
                 {

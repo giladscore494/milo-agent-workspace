@@ -89,7 +89,7 @@ def test_external_cancellation_stops_active_tool_and_queued_work_cooperatively()
             return {"answer": "unexpected"}
     registry = ToolRegistry([CooperativeTool()])
     context = ToolContext(scopes=frozenset({"mock:search"}))
-    worker_factory = lambda: GenericWorker(gateway=Gateway(), tools=registry, model="fake",
+    worker_factory = lambda: GenericWorker(gateway=Gateway(), tools=registry, model="kimi-k2.6",
         tool_context=context, cancellation_checker=cancelled.is_set)
     executor = BoundedTaskExecutor(worker_factory=worker_factory, max_active_workers=1,
                                    cancellation_checker=cancelled.is_set)
@@ -185,7 +185,7 @@ def test_generic_worker_sanitizes_internal_exception_text():
     secret = "SECRET_SENTINEL_DO_NOT_EXPOSE"
     class FailingGateway:
         def call(self, **kwargs): raise RuntimeError(secret)
-    worker = GenericWorker(gateway=FailingGateway(), tools=ToolRegistry(), model="fake", tool_context=ToolContext())
+    worker = GenericWorker(gateway=FailingGateway(), tools=ToolRegistry(), model="kimi-k2.6", tool_context=ToolContext())
     task_data = task("safe", "safe", tool="search")
     task_data["tools"] = []
     spec = TaskGraph.model_validate({"tasks": [task_data]}).tasks[0]
@@ -302,7 +302,7 @@ def _valid_provider_plan(*, tool_name=None):
 def _commander_for_gateway(gateway, *, max_tasks=64):
     return Commander(
         client=gateway,
-        resolver=CommanderModelResolver(("fake",), {"fake"}),
+        resolver=CommanderModelResolver(("kimi-k2.6",), {"kimi-k2.6"}),
         validator=PlanValidator(
             allowed_tools=set(), limits=PlanLimits(max_tasks=max_tasks)
         ),
@@ -312,7 +312,7 @@ def _commander_for_gateway(gateway, *, max_tasks=64):
 def test_provider_shaped_json_string_traverses_completion_decode_schema_and_limits():
     gateway, _ = _recording_gateway([_valid_provider_plan()])
     approved = _commander_for_gateway(gateway).plan(
-        requested_model="fake", objective="offline", context={}
+        requested_model="kimi-k2.6", objective="offline", context={}
     )
     assert approved.graph.tasks[0].task_id == "only"
 
@@ -329,7 +329,7 @@ def test_empty_provider_content_has_stable_completion_shape_code(content):
     gateway._client = client
     with pytest.raises(CommanderPlanFailure) as failure:
         _commander_for_gateway(gateway).plan(
-            requested_model="fake", objective="offline", context={}
+            requested_model="kimi-k2.6", objective="offline", context={}
         )
     assert failure.value.code == "COMMANDER_COMPLETION_SHAPE_INVALID"
 
@@ -357,7 +357,7 @@ def test_bad_provider_plan_has_only_stable_safe_code(content, code):
         gateway._client = client
     with pytest.raises(CommanderPlanFailure) as failure:
         _commander_for_gateway(gateway).plan(
-            requested_model="fake", objective="offline", context={}
+            requested_model="kimi-k2.6", objective="offline", context={}
         )
     assert failure.value.code == code
     assert sentinel not in str(failure.value)
@@ -368,7 +368,7 @@ def test_plan_limit_and_provider_exception_codes_are_sanitized():
     gateway, _ = _recording_gateway([_valid_provider_plan(), _valid_provider_plan()])
     with pytest.raises(CommanderPlanFailure) as limited:
         _commander_for_gateway(gateway, max_tasks=0).plan(
-            requested_model="fake", objective="offline", context={}
+            requested_model="kimi-k2.6", objective="offline", context={}
         )
     assert limited.value.code == "COMMANDER_PLAN_LIMIT_EXCEEDED"
     assert limited.value.validation_reason == "TASK_COUNT_LIMIT"
@@ -379,7 +379,7 @@ def test_plan_limit_and_provider_exception_codes_are_sanitized():
             raise RuntimeError(sentinel)
     with pytest.raises(CommanderPlanFailure) as provider:
         _commander_for_gateway(ProviderFailure()).plan(
-            requested_model="fake", objective="offline", context={}
+            requested_model="kimi-k2.6", objective="offline", context={}
         )
     assert provider.value.code == "COMMANDER_COMPLETION_FAILED"
     assert sentinel not in str(provider.value)
@@ -395,7 +395,7 @@ def test_unexpected_completion_shapes_have_stable_safe_code(response):
     gateway._client = client
     with pytest.raises(CommanderPlanFailure) as failure:
         _commander_for_gateway(gateway).plan(
-            requested_model="fake", objective="offline", context={}
+            requested_model="kimi-k2.6", objective="offline", context={}
         )
     assert failure.value.code == "COMMANDER_COMPLETION_SHAPE_INVALID"
 
@@ -406,12 +406,12 @@ def test_real_model_commander_requests_authoritative_contracts_and_tools():
     gateway, completions = _recording_gateway([valid_plan, finish])
 
     plan_payload = gateway.create_plan(
-        model="fake",
+        model="kimi-k2.6",
         objective="offline",
         context={"allowed_tools": ["user.injected"]},
     )
     decision_payload = gateway.create_replan(
-        model="fake",
+        model="kimi-k2.6",
         objective="offline",
         summary={
             "decision_context": {
@@ -444,7 +444,7 @@ def test_model_visible_tool_allowlist_is_sorted_and_validation_stays_fail_closed
         allowed_tools=("mock.zeta", "mock.search"),
     )
     payload = gateway.create_plan(
-        model="fake", objective="offline", context={"allowed_tools": ["evil.write"]}
+        model="kimi-k2.6", objective="offline", context={"allowed_tools": ["evil.write"]}
     )
     system = completions.calls[0]["messages"][0]["content"]
     assert 'Server-authorized tool names: ["mock.search","mock.zeta"]' in system

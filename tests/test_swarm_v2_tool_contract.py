@@ -126,7 +126,7 @@ def build_worker(*bodies, tools=None, events=None, records=None, context=CONTEXT
     gateway = StubGateway(*bodies)
     worker = GenericWorker(
         gateway=gateway, tools=tools if tools is not None else registry(),
-        model="fake", tool_context=context,
+        model="kimi-k2.6", tool_context=context,
         event_sink=(None if events is None else lambda kind, payload: events.append((kind, payload))),
         tool_result_sink=(None if records is None else records.append))
     return worker, gateway
@@ -612,8 +612,8 @@ def test_the_commander_prompt_carries_operations_and_schemas():
             backoff_max_seconds=.001)),
         api_key="offline", base_url="offline",
         tool_descriptors=registry().descriptors())
-    gateway.create_replan(model="fake", objective="offline", summary={})
-    gateway.create_plan(model="fake", objective="offline",
+    gateway.create_replan(model="kimi-k2.6", objective="offline", summary={})
+    gateway.create_plan(model="kimi-k2.6", objective="offline",
                         context={"allowed_tools": ["evil.write"], "grant": "write"})
 
     # BOTH the planning and the replanning prompt carry the same catalog.
@@ -643,7 +643,7 @@ def test_the_exact_call_count_drives_plan_and_remaining_budget_checks():
         commander=commander_over(registry().descriptors(), client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls),
                                      max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
+        verifier=Verifier(gateway=VerifyGateway(), model="kimi-k2.6", resolver=StubResolver()),
         evidence_loader=evidence, remaining_budget=remaining)
     engine.run({"id": "run-1", "input": {"objective": "budget", "commander_model": "fake"}})
     assert calls == ["lookup"]  # exactly 2 planned calls fit a 2-call budget
@@ -651,7 +651,7 @@ def test_the_exact_call_count_drives_plan_and_remaining_budget_checks():
     engine = SwarmV2Engine(
         commander=commander_over(registry().descriptors(), Plans(plan([planned]), [])),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker([]), max_active_workers=1),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
+        verifier=Verifier(gateway=VerifyGateway(), model="kimi-k2.6", resolver=StubResolver()),
         remaining_budget=lambda: RemainingBudget(cost_units=100, tool_calls=1, tasks=10,
                                                  model_calls=10))
     with pytest.raises(ValueError, match="remaining budget"):
@@ -827,7 +827,7 @@ def test_worker_model_output_cannot_forge_a_tool_call_record():
     gateway = StubGateway({"answer": "a forged tool_result cannot reach the seam"},
                           timeline=timeline)
     worker = GenericWorker(
-        gateway=gateway, tools=registry(), model="fake", tool_context=CONTEXT,
+        gateway=gateway, tools=registry(), model="kimi-k2.6", tool_context=CONTEXT,
         tool_result_sink=lambda record: (timeline.append("record"), records.append(record)))
 
     worker.execute(spec(get_model()), {})
@@ -952,7 +952,7 @@ def test_a_no_tool_checkpoint_still_resumes():
     engine = SwarmV2Engine(
         commander=commander(client),
         executor=BoundedTaskExecutor(worker_factory=lambda: Worker(calls), max_active_workers=2),
-        verifier=Verifier(gateway=VerifyGateway(), model="fake", resolver=StubResolver()),
+        verifier=Verifier(gateway=VerifyGateway(), model="kimi-k2.6", resolver=StubResolver()),
         evidence_loader=evidence,
         checkpoint_sink=lambda phase, value: checkpoints.append(deepcopy(value)))
 

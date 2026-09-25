@@ -1182,8 +1182,14 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             if workflow_key != "swarm_v2" or isinstance(exc, AppError) or not holds_lease():
                 raise
             from backend.engines.swarm_v2 import VALIDATION_REASONS, CommanderPlanFailure
+            from backend.engines.swarm_v2.request_builder import ModelRequestRefused
             failure_payload: dict[str, Any]
-            if isinstance(exc, CommanderPlanFailure):
+            if isinstance(exc, ModelRequestRefused):
+                # PR-R: refused before any provider request existed; the code
+                # is static and allowlisted by construction.
+                code, message = exc.code, exc.safe_message
+                failure_payload = {"code": code}
+            elif isinstance(exc, CommanderPlanFailure):
                 code, message = exc.code, exc.safe_message
                 failure_payload = {"code": code}
                 # Bounded diagnostic classification for telemetry only:
