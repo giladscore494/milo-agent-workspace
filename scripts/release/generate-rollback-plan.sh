@@ -102,8 +102,9 @@ activation cannot occur — activation is the last step and is gated on complete
 persistence, so an interrupted capture leaves a non-active snapshot that no
 reader reads.
 
-Flags are changed by updating the Cloud Run service env (see below) — there
-is no enable-all or disable-all script by design; each flag is explicit.
+Flags are changed by updating the Cloud Run service env (see below); each flag
+is explicit, and no script covers the whole emergency order today (see
+docs/production-readiness/ROLLBACK.md).
 
 ## 1. Vercel
 

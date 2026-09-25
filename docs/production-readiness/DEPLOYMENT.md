@@ -3,7 +3,7 @@
 Status: command plans and validation `COMPLETED_IN_CODE`; every actual
 deployment step is `REQUIRES_MANUAL_OPERATOR_CONFIGURATION`. No CI job
 deploys application images. Operator scripts do change production **when an
-operator runs them with credentials**: `scripts/deploy/cloud-run.sh` in
+operator runs them with credentials** — for example `scripts/deploy/cloud-run.sh` in
 `DEPLOY_MODE=apply` (builds and deploys both images),
 `scripts/deploy/production-activate.sh` and
 `scripts/deploy/website-execution-activate.sh`. Database migrations are

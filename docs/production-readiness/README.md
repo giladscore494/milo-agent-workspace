@@ -40,7 +40,7 @@ this set wins and the older document carries an archive banner.
 ### Historical records
 
 Dated records kept as evidence. Each carries a `HISTORICAL` (or `SUPERSEDED`)
-banner on its first line; none of them is a current procedure. The current
+banner at the top; none of them is a current procedure. The current
 production path is [SCOPED_BATCH_PRODUCTION_RUNBOOK.md](SCOPED_BATCH_PRODUCTION_RUNBOOK.md)
 and recovery is [ROLLBACK.md](ROLLBACK.md).
 

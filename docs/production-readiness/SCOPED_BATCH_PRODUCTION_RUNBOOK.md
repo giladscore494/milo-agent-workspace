@@ -856,8 +856,8 @@ the plan's conversation, the composer offers **Open the Mapping Plan** and no
 *Send task*, and the Mapping Plan's **Batches** section shows **Start batch 1**.
 
 **Stop if** anything is `NO`, `DISABLED` or `UNVERIFIED`. Each line says what
-is missing. If it fails, close run starts again (step 1 of the Stage E
-rollback) before investigating. The first paid run is **not** a readiness
+is missing. If it fails, close run starts again (step 1 of the emergency order in
+[ROLLBACK.md](ROLLBACK.md#execution-flags--emergency-order)) before investigating. The first paid run is **not** a readiness
 test.
 
 ---
