@@ -120,11 +120,12 @@ Vercel values cannot be read back by the CLI:
 confirm with `scripts/deploy/website-execution-check.sh`. It never enables
 anything, never cancels an execution and never deletes anything.
 
-The two historical kill switches (`scripts/release/stage-c/kill-switch.sh` and
-`scripts/release/stage-d/kill-switch.sh`) set only the Stage C/D flag set and
-do not touch `MILO_ENABLE_WORK_SCOPE_*`, `MILO_ENABLE_GOVERNMENT_CATALOG_READ`,
-`MILO_ENABLE_CATALOG_PROMOTION` or any Vercel variable; they are not this
-order (see `docs/cleanup/CLEANUP_INVENTORY.md`, decision D5).
+The historical Stage D kill switch (`scripts/release/stage-d/kill-switch.sh`)
+sets only the Stage D flag set and does not touch `MILO_ENABLE_WORK_SCOPE_*`,
+`MILO_ENABLE_GOVERNMENT_CATALOG_READ`, `MILO_ENABLE_CATALOG_PROMOTION` or any
+Vercel variable; it is not this order (see `docs/cleanup/CLEANUP_INVENTORY.md`,
+decision D5). The Stage C toolkit and its kill switch were removed in cleanup
+item 6.
 
 ## Catalog execution — the independent rollback
 
@@ -142,10 +143,10 @@ gcloud run jobs update <CLOUD_RUN_WORKER_JOB> \
 **Order.** Reach for this FIRST for a catalog-specific incident — a wrong
 canonical value, an unexpected promotion, a refusal pattern that looks like a
 defect. Escalate to the general order above only if the incident is not
-confined to the catalog. The general order above does not itself set this
-flag; if the Stage C kill switch (`scripts/release/stage-c/kill-switch.sh`) was
-used instead, it sets this flag false on the worker as part of its shutdown and
-verifies it afterwards.
+confined to the catalog. The five-step order above does not itself set this
+flag; `scripts/deploy/kill-switch.sh` does, in its step 6: it sets this flag
+false on the worker (and on the API and the capture job) and verifies it on the
+worker afterwards.
 
 **Verification evidence to capture (all read-only):**
 

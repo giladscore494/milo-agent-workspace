@@ -1,4 +1,7 @@
 > **HISTORICAL — superseded by [`SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](SCOPED_BATCH_PRODUCTION_RUNBOOK.md).** A dated record kept as evidence; do not follow it as current procedure.
+> The toolkit it cites, `scripts/release/stage-c/`, was removed in cleanup item 6
+> (its kill switch replaced by `scripts/deploy/kill-switch.sh`); it remains in git
+> history, and the paths below are kept as a record.
 
 # Stage C acceptance report — one controlled paid smoke run
 
@@ -92,8 +95,8 @@ Current facts:
   authorize it, and any Stage D work requires its own fresh explicit
   operator authorization.
 
-The complete operator toolkit is in
-[`scripts/release/stage-c/`](../../scripts/release/stage-c/README.md).
+The complete operator toolkit was in `scripts/release/stage-c/` (removed in
+cleanup item 6; see git history).
 (The original pre-toolkit status, kept for history: the first prepared
 session was blocked on operator write access and executed nothing.)
 

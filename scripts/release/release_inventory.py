@@ -82,7 +82,6 @@ RUNTIME_SOURCES: tuple[str, ...] = (
 #: and a cleanup that cannot run leaves the daily budget held.
 TOOLING_SOURCES: tuple[str, ...] = (
     "scripts/release/stage-d/probe_db.py",
-    "scripts/release/stage-c/probe_db.py",
 )
 
 #: RPC call shapes inside the repository layer. `_guarded_rpc` and `_read_rpc`

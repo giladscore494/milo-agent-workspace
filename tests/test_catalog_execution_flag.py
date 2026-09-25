@@ -515,14 +515,31 @@ def test_the_kill_switch_disables_catalog_execution_independently():
     Both halves matter: the switch must SET the flag false on the worker (which
     is where the catalog capability is built) and must VERIFY it afterwards, or
     "the kill switch ran" would not mean "the catalog is closed".
+
+    The switch is scripts/deploy/kill-switch.sh (the Stage C one it replaced
+    is gone); both halves are executed against mocks in
+    tests/test_deploy_kill_switch.py
+    (`test_the_catalog_flag_is_closed_on_the_worker_and_verified`). Here: its
+    dry run sets the flag false on the worker job, and the worker read-back
+    covers the list that flag is closed from.
     """
-    script = (REPO / "scripts/release/stage-c/kill-switch.sh").read_text()
-    set_lines = [line for line in script.splitlines()
-                 if "--update-env-vars" in line and CATALOG_EXECUTION_FLAG in line]
-    assert set_lines, "the kill switch never sets the catalog flag false"
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        config = Path(tmp) / "operator.env"
+        config.write_text("GCP_PROJECT_ID=p\nGCP_REGION=r\nCLOUD_RUN_API_SERVICE=api\n"
+                          "CLOUD_RUN_WORKER_JOB=job\n")
+        result = subprocess.run(
+            ["bash", str(REPO / "scripts/deploy/kill-switch.sh"), "--operator-config", str(config)],
+            capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "HOME": tmp}, timeout=60)
+    assert result.returncode == 0, result.stderr
+    set_lines = [line for line in result.stdout.splitlines()
+                 if line.startswith("+ gcloud run jobs update job") and CATALOG_EXECUTION_FLAG in line]
+    assert set_lines, "the kill switch never sets the catalog flag false on the worker"
     assert all(f"{CATALOG_EXECUTION_FLAG}=false" in line for line in set_lines)
-    worker_verifier = script.split("verify_worker_posture()", 1)[1]
-    assert CATALOG_EXECUTION_FLAG in worker_verifier, \
+    script = (REPO / "scripts/deploy/kill-switch.sh").read_text()
+    assert 'expect_worker+=("${REMAINING_WORKER_FLAGS[@]}")' in script, \
         "the kill switch never verifies the worker's catalog flag"
 
 
