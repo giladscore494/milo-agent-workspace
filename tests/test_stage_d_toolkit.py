@@ -46,7 +46,6 @@ from backend.runtime_policy import (CAP_ENV_PREFIXES, DIMENSIONS, ENGINE_ENV_PRE
 
 REPO = Path(__file__).resolve().parents[1]
 STAGE_D = REPO / "scripts" / "release" / "stage-d"
-STAGE_C = REPO / "scripts" / "release" / "stage-c"
 
 RELEASE_SHA = "84cd8696119c24662a954d0f0e23195268dab23f"
 # The commit this checkout is actually at. verify_caps.py REFUSES unless
@@ -369,17 +368,9 @@ def test_stage_d_never_sources_or_edits_the_consumed_stage_c_toolkit():
                        "release/stage-c", "STAGE_C_WORKER_PROVIDER_LIMITS"):
             offenders = [line for line in code if marker in line]
             assert not offenders, f"{path.name} executable line reuses Stage C: {offenders}"
-    # And the Stage C directory itself is untouched by this change. The
-    # base is the pinned release SHA (this branch's base), not a possibly
-    # stale origin/main.
-    diff = subprocess.run(
-        ["git", "diff", "--name-only", RELEASE_SHA, "--", "scripts/release/stage-c"],
-        cwd=REPO, capture_output=True, text=True, timeout=60,
-    )
-    if diff.returncode == 0:
-        assert diff.stdout.strip() == "", f"Stage C toolkit modified: {diff.stdout}"
-    else:
-        pytest.skip("the pinned release SHA is not available in this checkout")
+    # The consumed Stage C toolkit itself was deleted in cleanup (item 6, after
+    # scripts/deploy/kill-switch.sh replaced its kill switch); its accepted
+    # record is docs/production-readiness/STAGE_C_ACCEPTANCE.md.
 
 
 def test_no_committed_line_enables_an_execution_flag():

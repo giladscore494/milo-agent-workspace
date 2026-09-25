@@ -1,7 +1,10 @@
 > **HISTORICAL — superseded by [`docs/production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](../production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md).**
 > The smoke ran 2026-08-24/25 and its authorization is spent. The controller
 > `scripts/release/swarm-v2-smoke/` and `tests/test_release_tooling_swarm_smoke.py`
-> were removed in cleanup PR-2 (set 2a); paths below are kept as a record.
+> were removed in cleanup PR-2 (set 2a), and the Stage C toolkit it delegated to
+> (`scripts/release/stage-c/`, including its kill switch) in cleanup item 6;
+> paths below are kept as a record. The current kill switch is
+> `scripts/deploy/kill-switch.sh` ([ROLLBACK.md](../production-readiness/ROLLBACK.md)).
 
 # Swarm V2 controlled production smoke
 
