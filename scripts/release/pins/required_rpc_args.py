@@ -6,8 +6,11 @@ migrations (the required arguments of each migration-created function);
 ``tests/test_release_inventory.py`` fails unless this literal is exactly that.
 
 Copied byte-identically from ``scripts/release/stage-d/probe_db.py`` (cleanup
-D8). Optional (defaulted) arguments are excluded, so an ADDED optional
-parameter passes while a missing or renamed required one fails.
+D8). One entry, ``settle_model_call_budget``, is required only by that probe's
+own cleanup path (release_inventory.py ``TOOLING_SOURCES``); it leaves this
+inventory together with its only caller. Optional (defaulted) arguments are
+excluded, so an ADDED optional parameter passes while a missing or renamed
+required one fails.
 
 Regenerate with:
   python3 scripts/release/release_inventory.py rpcs

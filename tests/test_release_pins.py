@@ -14,6 +14,7 @@ with the toolkit.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -67,3 +68,12 @@ def test_the_in_process_policy_envelope_is_the_permanent_copy():
     import policy_envelope
 
     assert Path(policy_envelope.__file__).resolve().parent == PINS.resolve()
+
+
+def test_no_test_puts_the_stage_d_directory_on_the_import_path():
+    """Order-independent half of the check above: a bare ``import
+    policy_envelope`` can only resolve to the Stage D copy if some test puts
+    that directory on ``sys.path``, and none does."""
+    offenders = [path.name for path in (REPO / "tests").glob("test_*.py")
+                 if re.search(r"sys\.path\.insert\([^)]*(STAGE_D|stage-d)", path.read_text())]
+    assert offenders == []

@@ -94,6 +94,13 @@ def test_the_inventory_covers_every_console_1_to_5_runtime_dependency():
     assert not missing, f"the inventory omits runtime dependencies: {missing}"
 
 
+def test_a_missing_tooling_source_is_an_error_not_a_smaller_inventory(monkeypatch):
+    """Deleting a tool must not silently shrink the derived inventory."""
+    monkeypatch.setattr(release_inventory, "TOOLING_SOURCES", ("scripts/release/no-such-tool.py",))
+    with pytest.raises(release_inventory.InventoryError, match="tooling source not found"):
+        release_inventory.runtime_rpc_calls()
+
+
 def test_the_pinned_literal_is_exactly_the_derived_inventory():
     """The pinned RPC inventory is a reviewed literal -- and this is what stops
     that literal falling behind the runtime, which is exactly how it fell

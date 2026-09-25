@@ -246,8 +246,8 @@ The inventory is kept as a reviewed literal,
 arrangement as `PINNED_POLICY_FINGERPRINT`. `tests/test_release_inventory.py`
 fails if that literal is not exactly what the current repository requires.
 `probe_db.py` carries a byte-identical copy of it (it is transported into a
-bare pinned image as one SHA-256-pinned file and cannot import anything) until
-the Stage D toolkit is deleted.
+bare pinned image as one SHA-256-pinned file and cannot import the deriving
+module) until the Stage D toolkit is deleted.
 
 Regenerate with:
 
