@@ -46,7 +46,7 @@ from typing import Any, Iterable, Mapping
 #: NEWER schema is still merged (unknown keys are ignored, known keys are
 #: maximised), so a rollback can never brick a resume; it simply cannot
 #: enforce a dimension it does not know about.
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 
 #: Integer dimensions that only ever grow.
 LEDGER_COUNTERS: tuple[str, ...] = (
@@ -78,6 +78,24 @@ LEDGER_COUNTERS: tuple[str, ...] = (
     "replans",
     # bounded R4 correction rounds started
     "correction_rounds",
+    # --- PR-R reasoning-aware usage (schema_version 2) -----------------------
+    # Sums over settled calls of what the provider REPORTED. A call whose
+    # usage omitted a field adds nothing here; its per-call ledger row keeps
+    # the field NULL, so "not reported" is never rewritten as zero where it
+    # is recorded.
+    # input tokens the provider served from the context cache (hit price)
+    "cached_input_tokens",
+    # input tokens the provider wrote to the context cache (write price)
+    "cache_write_tokens",
+    # provider-reported reasoning tokens (completion_tokens_details)
+    "reasoning_tokens",
+    # ESTIMATED reasoning tokens (completion - answer) for calls whose usage
+    # did not report them; never mixed into `reasoning_tokens`
+    "reasoning_tokens_estimated",
+    # how many settled calls had their reasoning share estimated
+    "reasoning_estimated_calls",
+    # tokens of the final answer (`message.content`) only
+    "answer_tokens",
 )
 
 #: Non-negative amounts that only ever grow. ``elapsed_seconds`` is wall-clock
@@ -103,13 +121,16 @@ LEDGER_SNAPSHOT_FIELDS = frozenset(
     {*LEDGER_COUNTERS, *LEDGER_AMOUNTS, *LEDGER_DERIVED, *LEDGER_METADATA})
 
 #: The bounded public contract of ``runs.usage`` / ``GET /runs/{id}``. It is a
-#: strict subset of the ledger and is NOT widened here: the browser contract
-#: (``backend.schemas.RunUsage``, ``frontend/lib/runUsage.ts``) is a separate,
-#: closed decision.
+#: strict subset of the ledger. PR-R widened it, as one closed decision across
+#: ``backend.schemas.RunUsage``, ``frontend/lib/runUsage.ts``, the database
+#: projection (migration 20260925000100) and the export envelope, by the
+#: reasoning-aware token breakdown -- counts only, never reasoning text.
 PUBLIC_USAGE_FIELDS = frozenset({
     "model_calls", "input_tokens", "output_tokens", "total_tokens",
     "estimated_cost", "actual_cost", "retries", "provider_backpressure_events",
     "agent_steps", "elapsed_seconds",
+    "cached_input_tokens", "cache_write_tokens", "reasoning_tokens",
+    "reasoning_tokens_estimated", "reasoning_estimated_calls", "answer_tokens",
 })
 assert PUBLIC_USAGE_FIELDS <= LEDGER_SNAPSHOT_FIELDS
 

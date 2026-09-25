@@ -8,6 +8,8 @@ from backend.runtime import CancellationRequested
 from .adapters import CommanderClient
 from .contracts import CommanderDecision, CommanderPlan
 from .models import CommanderModelResolver
+from .completion import COMPLETION_MESSAGES, TRUNCATION_CODES
+from .request_builder import ModelRequestRefused
 from .validation import (VALIDATION_REASONS, PlanJsonError, PlanLimitError,
                          PlanSchemaError, PlanValidationError, PlanValidator)
 from .evidence import safe_durable_value
@@ -21,6 +23,12 @@ REPAIRABLE_PLAN_FAILURES = frozenset({
     "COMMANDER_PLAN_JSON_INVALID",
     "COMMANDER_PLAN_SCHEMA_INVALID",
     "COMMANDER_PLAN_LIMIT_EXCEEDED",
+    # PR-R: a completion cut off by the output cap. Repaired once, by
+    # ESCALATION (cap doubled or effort lowered), and only when an escalation
+    # exists; the repair is an ordinary guarded call, so its worst-case
+    # reservation must pass every dollar ceiling before it is sent.
+    "MODEL_REASONING_EXHAUSTED_OUTPUT",
+    "MODEL_OUTPUT_TRUNCATED",
 })
 
 
@@ -41,17 +49,27 @@ class Commander:
         except CommanderPlanFailure as failure:
             if failure.code not in REPAIRABLE_PLAN_FAILURES or not self._supports_repair():
                 raise
+            extra: dict[str, Any] = {}
+            if failure.code in TRUNCATION_CODES:
+                if failure.escalation is None:
+                    # Nothing can change (cap already at the role maximum and
+                    # the effort cannot drop): repeating the call would buy
+                    # the same truncation again.
+                    raise
+                reason = failure.code
+                extra["repair_shape"] = failure.escalation
+            else:
+                reason = failure.validation_reason or "SCHEMA_CONSTRAINT_FAILED"
             # Exactly ONE bounded semantic repair inside the same run. It is
             # a normal guarded model call (budget reservation, scheduler,
             # accounting) and counts as one semantic retry. The model
             # receives only the static safe reason code: the rejected plan
             # and raw validation diagnostics never leave this boundary. A
             # second invalid response escapes below with no third attempt.
-            reason = failure.validation_reason or "SCHEMA_CONSTRAINT_FAILED"
             if self._retry_callback is not None:
                 self._retry_callback("commander", "planning", reason)
             return self._plan_attempt(model=model, objective=objective,
-                                      context=context, repair_reason=reason)
+                                      context=context, repair_reason=reason, **extra)
 
     def _supports_repair(self) -> bool:
         try:
@@ -63,15 +81,20 @@ class Commander:
                    for parameter in parameters)
 
     def _plan_attempt(self, *, model: str, objective: str, context: Mapping[str, Any],
-                      repair_reason: str | None) -> CommanderPlan:
-        extra = {} if repair_reason is None else {"repair_reason": repair_reason}
+                      repair_reason: str | None, repair_shape: Any = None) -> CommanderPlan:
+        extra: dict[str, Any] = {} if repair_reason is None else {"repair_reason": repair_reason}
+        if repair_shape is not None:
+            extra["repair_shape"] = repair_shape
         try:
             inert_json = self._client.create_plan(model=model, objective=objective,
                                                   context=context, **extra)
-        except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError):
+        except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError,
+                ModelRequestRefused):
             # AppError is the persistence/repository boundary (e.g. a lease
             # or usage write failing inside the guarded client): it must
             # escape as infrastructure, never as a handled Commander failure.
+            # ModelRequestRefused is a model-contract refusal decided before
+            # any request existed; it keeps its own static code.
             raise
         except Exception:
             raise CommanderPlanFailure("COMMANDER_COMPLETION_FAILED") from None
@@ -101,7 +124,8 @@ class Commander:
         try:
             inert = (create(model=model, objective=objective, summary=summary) if create else
                      self._client.create_plan(model=model, objective=objective, context={"status": summary}))
-        except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError):
+        except (CancellationRequested, BudgetExceeded, CommanderPlanFailure, AppError,
+                ModelRequestRefused):
             raise
         except Exception:
             raise CommanderPlanFailure("COMMANDER_COMPLETION_FAILED") from None
@@ -142,12 +166,18 @@ class CommanderPlanFailure(RuntimeError):
         "COMMANDER_PLAN_SCHEMA_INVALID": "Commander plan schema is invalid",
         "COMMANDER_PLAN_LIMIT_EXCEEDED": "Commander plan exceeds safety limits",
         "COMMANDER_DECISION_INVALID": "Commander replan decision is invalid",
+        # PR-R completion classification (backend/engines/swarm_v2/completion.py).
+        **COMPLETION_MESSAGES,
     }
 
-    def __init__(self, code: str, *, validation_reason: str | None = None):
+    def __init__(self, code: str, *, validation_reason: str | None = None,
+                 escalation: Any = None):
         self.code = code
         self.safe_message = self.MESSAGES[code]
         if validation_reason is not None and validation_reason not in VALIDATION_REASONS:
             raise ValueError("validation reason must come from the static allowlist")
         self.validation_reason = validation_reason
+        #: The ONE escalated (cap, effort) a truncation may be repaired with;
+        #: None when the failure is not repairable that way.
+        self.escalation = escalation
         super().__init__(self.safe_message)

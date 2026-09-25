@@ -11,6 +11,9 @@ from backend.tools import ToolContext, ToolError, ToolRegistry
 from backend.tools.registry import validate_json_schema
 from .contracts import DynamicTask
 from .model_gateway import ModelGateway
+from .completion import (TRUNCATION_CODES, CallShape, ModelCompletionError,
+                         classify_completion, escalate, initial_shape)
+from .request_builder import ModelRequestRefused
 from .tool_calls import (MAX_TASK_OUTPUT_JSON_BYTES, MAX_TOOL_MATERIAL_JSON_BYTES,
                          MAX_TOOL_OUTPUT_JSON_BYTES, ToolCallError, ToolCallRecord,
                          ToolResultCallback, check_material, resolve_tool_arguments)
@@ -148,7 +151,14 @@ def build_worker_request(task: DynamicTask, tool_outputs: Mapping[str, Any],
     # json_object when no message mentions JSON output.
     system = ("Return only one JSON object that validates exactly against the "
               "provided output_schema. No markdown, no extra fields.")
-    if repair_reason is not None:
+    if repair_reason is not None and repair_reason in TRUNCATION_CODES:
+        # PR-R: the previous completion ran out of output cap. Static code
+        # only; the partial answer is never sent back.
+        system += (" The previous response was cut off by the output limit with "
+                   f"static reason code {repair_reason}. Return one complete, concise "
+                   "JSON value built only from the supplied goal, scope, dependencies "
+                   "and tools material. This is the final attempt.")
+    elif repair_reason is not None:
         if repair_reason not in WORKER_OUTPUT_REASONS:
             raise ValueError("worker repair reason must come from the static allowlist")
         system += (" The previous response was rejected by deterministic server "
@@ -255,6 +265,12 @@ class GenericWorker:
             # Persistence/lease failures from the guarded call path are
             # infrastructure outcomes, never per-task failures.
             raise
+        except ModelRequestRefused:
+            # A model-contract refusal (unknown profile, forbidden parameter,
+            # unsupported effort) is a deployment fault decided before any
+            # request existed. It fails the RUN with its static code: every
+            # other task would be refused identically.
+            raise
         except ToolError as exc:
             return TaskResult(task.task_id, "failed", error=exc.as_dict()["error"])
         except ToolCallError as exc:
@@ -280,6 +296,12 @@ class GenericWorker:
             # tool failure without exposing any provider material.
             return TaskResult(task.task_id, "failed",
                               error={"code": exc.reason_code, "message": exc.safe_message})
+        except ModelCompletionError as exc:
+            # PR-R: a completion with no usable answer (cut off at the output
+            # cap, or empty) that was not -- or could no longer be --
+            # repaired. Named for what happened, with a static code.
+            return TaskResult(task.task_id, "failed",
+                              error={"code": exc.code, "message": exc.safe_message})
         except Exception:
             return TaskResult(task.task_id, "failed", error={"code": "TASK_FAILED", "message": "task execution failed"})
 
@@ -348,6 +370,8 @@ class GenericWorker:
             # no reservation, no provider call and no model usage at all.
             return self._deterministic_output(task, dependency_outputs, tool_outputs)
         repair_reason: str | None = None
+        agent = f"worker:{task.task_id}"
+        shape: CallShape = initial_shape(agent, "execute")
         attempt = 1
         while True:
             if repair_reason is not None:
@@ -367,11 +391,28 @@ class GenericWorker:
                 # as transport backpressure and never charges here.
                 if self._retry_callback is not None:
                     self._retry_callback(f"worker:{task.task_id}", "execute", repair_reason)
-            response = self._gateway.call(model=self._model, agent=f"worker:{task.task_id}", phase="execute",
+            response = self._gateway.call(model=self._model, agent=agent, phase="execute",
                 messages=build_worker_request(task, tool_outputs, dependency_outputs,
                                               repair_reason=repair_reason),
-                response_format={"type": "json_object"})
-            content = response if isinstance(response, dict) else response.choices[0].message.content
+                # The task's declared output_schema, enforced by the provider
+                # where the model supports strict json_schema (PR-R); the
+                # deterministic validation below stays the authority.
+                schema=task.output_schema, schema_name="worker_output",
+                max_tokens=shape.output_cap, effort=shape.effort)
+            try:
+                # PR-R: a truncation is named before any parsing. It shares
+                # the ONE repair with the structural failures below, and is
+                # repaired by ESCALATION -- or not at all when neither the cap
+                # nor the effort can change.
+                content = classify_completion(response)
+            except ModelCompletionError as exc:
+                if attempt >= MAX_WORKER_OUTPUT_MODEL_ATTEMPTS or exc.code not in TRUNCATION_CODES:
+                    raise
+                escalated = escalate(self._model, agent, "execute", shape)
+                if escalated is None:
+                    raise
+                repair_reason, shape, attempt = exc.code, escalated, attempt + 1
+                continue
             try:
                 return validate_worker_output(content, task.output_schema)
             except WorkerOutputValidationError as exc:

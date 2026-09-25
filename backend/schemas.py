@@ -93,6 +93,16 @@ class RunUsage(BaseModel):
     # Backend-counted model-backed steps; NOT a count of UI agents.
     agent_steps: int | None = Field(default=None, ge=0)
     elapsed_seconds: float | None = Field(default=None, ge=0)
+    # PR-R reasoning-aware breakdown (backend.model_usage). Counts only: no
+    # reasoning text ever reaches this contract. `reasoning_tokens` sums what
+    # the provider REPORTED; `reasoning_tokens_estimated` sums estimates for
+    # calls whose usage did not report it (`reasoning_estimated_calls` of them).
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    cache_write_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens: int | None = Field(default=None, ge=0)
+    reasoning_tokens_estimated: int | None = Field(default=None, ge=0)
+    reasoning_estimated_calls: int | None = Field(default=None, ge=0)
+    answer_tokens: int | None = Field(default=None, ge=0)
 
 
 class RunIdentityRecord(BaseModel):

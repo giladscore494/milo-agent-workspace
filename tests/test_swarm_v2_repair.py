@@ -89,7 +89,7 @@ def gateway_with_limits(limits, responses, allowed=()):
 def test_plan_prompt_carries_policy_derived_from_plan_limits():
     limits = PlanLimits(max_tasks=2)
     gateway, completions = gateway_with_limits(limits, [json.dumps(minimal_plan(1))])
-    gateway.create_plan(model="fake", objective="offline", context={})
+    gateway.create_plan(model="kimi-k2.6", objective="offline", context={})
     system = _system_of(completions.calls[0])
     policy = _canonical(provider_plan_policy(limits, ()))
     assert policy in system
@@ -116,7 +116,7 @@ def test_replan_prompt_carries_the_same_policy():
     limits = PlanLimits(max_tasks=5)
     gateway, completions = gateway_with_limits(
         limits, [json.dumps({"decision": "FINISH", "plan": None, "reason": "done"})])
-    gateway.create_replan(model="fake", objective="offline", summary={})
+    gateway.create_replan(model="kimi-k2.6", objective="offline", summary={})
     assert _canonical(provider_plan_policy(limits, ())) in _system_of(completions.calls[0])
 
 
@@ -126,28 +126,28 @@ def test_changing_plan_limits_changes_policy_and_firewall_consistently():
     three_tasks = minimal_plan(num_tasks=3)
 
     gateway, completions = gateway_with_limits(narrow, [json.dumps(minimal_plan(1))])
-    gateway.create_plan(model="fake", objective="offline", context={})
+    gateway.create_plan(model="kimi-k2.6", objective="offline", context={})
     assert '"max_tasks":2' in _system_of(completions.calls[0])
     with pytest.raises(PlanValidationError) as rejected:
         PlanValidator(allowed_tools=set(), limits=narrow).validate(three_tasks)
     assert rejected.value.reason == "TASK_COUNT_LIMIT"
 
     gateway_wide, completions_wide = gateway_with_limits(wide, [json.dumps(minimal_plan(1))])
-    gateway_wide.create_plan(model="fake", objective="offline", context={})
+    gateway_wide.create_plan(model="kimi-k2.6", objective="offline", context={})
     assert '"max_tasks":40' in _system_of(completions_wide.calls[0])
     assert PlanValidator(allowed_tools=set(), limits=wide).validate(three_tasks)
 
 
 def test_empty_tool_registry_forces_empty_tools_and_empty_policy_allowlist():
     gateway, completions = gateway_with_limits(PlanLimits(), [json.dumps(minimal_plan(1))])
-    gateway.create_plan(model="fake", objective="offline", context={})
+    gateway.create_plan(model="kimi-k2.6", objective="offline", context={})
     system = _system_of(completions.calls[0])
     assert "every task must use tools: []" in system
     assert '"allowed_tools":[]' in system
 
     listed, listed_completions = gateway_with_limits(
         PlanLimits(), [json.dumps(minimal_plan(1))], allowed=("mock.search",))
-    listed.create_plan(model="fake", objective="offline", context={})
+    listed.create_plan(model="kimi-k2.6", objective="offline", context={})
     assert '"allowed_tools":["mock.search"]' in _system_of(listed_completions.calls[0])
 
 
@@ -384,7 +384,7 @@ class _RaisingClient:
 def _commander(client, retries):
     return Commander(
         client=client,
-        resolver=CommanderModelResolver(("fake",), {"fake"}),
+        resolver=CommanderModelResolver(("kimi-k2.6",), {"kimi-k2.6"}),
         validator=PlanValidator(allowed_tools=set()),
         retry_callback=lambda agent, phase, reason: retries.append((agent, phase, reason)),
     )
@@ -399,7 +399,7 @@ def test_infrastructure_failures_escape_without_repair(exc):
     client = _RaisingClient(exc)
     retries = []
     with pytest.raises(type(exc)):
-        _commander(client, retries).plan(requested_model="fake", objective="o", context={})
+        _commander(client, retries).plan(requested_model="kimi-k2.6", objective="o", context={})
     assert client.calls == 1
     assert retries == []
 
@@ -413,7 +413,7 @@ def test_provider_completion_failures_are_never_repaired(exc, code):
     client = _RaisingClient(exc)
     retries = []
     with pytest.raises(CommanderPlanFailure) as failure:
-        _commander(client, retries).plan(requested_model="fake", objective="o", context={})
+        _commander(client, retries).plan(requested_model="kimi-k2.6", objective="o", context={})
     assert failure.value.code == code
     assert client.calls == 1
     assert retries == []
@@ -431,7 +431,7 @@ def test_repair_counts_exactly_one_semantic_retry_and_only_on_repair():
     client = InvalidThenValid()
     retries = []
     approved = _commander(client, retries).plan(
-        requested_model="fake", objective="o", context={})
+        requested_model="kimi-k2.6", objective="o", context={})
     assert approved.graph.tasks
     assert client.calls == [None, "SCHEMA_MISSING_FIELD"]
     assert retries == [("commander", "planning", "SCHEMA_MISSING_FIELD")]
@@ -439,5 +439,5 @@ def test_repair_counts_exactly_one_semantic_retry_and_only_on_repair():
     valid_first = InvalidThenValid()
     valid_first.create_plan = lambda **kwargs: minimal_plan()
     no_retries = []
-    _commander(valid_first, no_retries).plan(requested_model="fake", objective="o", context={})
+    _commander(valid_first, no_retries).plan(requested_model="kimi-k2.6", objective="o", context={})
     assert no_retries == []

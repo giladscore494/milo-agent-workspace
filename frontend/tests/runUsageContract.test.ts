@@ -31,6 +31,13 @@ describe('H. the real GET /runs/{id} response parses through lib/runUsage', () =
       providerBackpressureEvents: 0,
       agentSteps: 7,
       elapsedSeconds: 41.5,
+      // PR-R reasoning-aware breakdown: counts only, estimates labelled.
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      reasoningTokensEstimated: 1200,
+      reasoningEstimatedCalls: 7,
+      answerTokens: 2050,
     });
     // The accepted smoke aggregate, straight off the wire.
     expect(usage.inputTokens! + usage.outputTokens!).toBe(10370);
@@ -71,12 +78,18 @@ describe('H. the real GET /runs/{id} response parses through lib/runUsage', () =
     expect(Object.keys(settled.usage as object).sort()).toEqual([
       'actual_cost',
       'agent_steps',
+      'answer_tokens',
+      'cache_write_tokens',
+      'cached_input_tokens',
       'elapsed_seconds',
       'estimated_cost',
       'input_tokens',
       'model_calls',
       'output_tokens',
       'provider_backpressure_events',
+      'reasoning_estimated_calls',
+      'reasoning_tokens',
+      'reasoning_tokens_estimated',
       'retries',
       'total_tokens',
     ]);

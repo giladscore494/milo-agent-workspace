@@ -42,7 +42,7 @@ from backend.provider_quota import (KIMI_TIER2_PROVIDER_LIMITS, MAX_INFERENCE_CO
                                     MAX_RPM, MAX_TPD, MAX_TPM, SAFETY_FACTOR,
                                     SEARCH_BASIC, SEARCH_PRO, SEARCH_QPS_FALLBACK,
                                     SEARCH_QPS_VERIFIED, WINDOW_SECONDS, QuotaConfig)
-from backend.engines.swarm_v2.model_gateway import ROLE_OUTPUT_CAPS
+from backend.engines.swarm_v2.model_gateway import ROLE_OUTPUT_CAPS, ROLE_POLICIES
 from backend.runtime_policy import (CAP_ENV_PREFIXES, ENGINE_ENV_PREFIXES,
                                     MANDATORY_FOR_PAID_EXECUTION, POLICY_ENV_KEYS,
                                     PROVIDER_ENV_PREFIXES, reviewed_first_run_policy)
@@ -320,6 +320,15 @@ def tier2_first_run_profile() -> dict[str, Any]:
             "search_pro_qps": int(_P["search_pro_qps"]),
             "role_output_caps": {f"{kind}:{phase}": cap
                                  for (kind, phase), cap in sorted(ROLE_OUTPUT_CAPS.items())},
+            # PR-R: the cap bounds reasoning AND answer together; a call whose
+            # budget cannot grant `min_answer_reserve` is refused, and every
+            # call reserves its worst-case cost before it is sent.
+            "role_call_policies": {
+                f"{kind}:{phase}": {"effort": policy.effort,
+                                    "max_output": policy.max_output,
+                                    "min_answer_reserve": policy.min_answer_reserve,
+                                    "structured_output": policy.structured}
+                for (kind, phase), policy in sorted(ROLE_POLICIES.items())},
             "max_model_calls_per_run": int(_P["max_model_calls_per_run"]),
             "max_input_tokens_per_run": int(_P["max_input_tokens_per_run"]),
             "max_output_tokens_per_run": int(_P["max_output_tokens_per_run"]),

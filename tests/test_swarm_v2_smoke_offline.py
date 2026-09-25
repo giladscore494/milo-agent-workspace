@@ -343,22 +343,26 @@ class ScriptedCompletions:
         return item
 
 
-@pytest.mark.parametrize("response", [
-    kimi_response(None),                       # null content
-    kimi_response(""),                         # empty content
-    kimi_response(["chunked", "content"]),     # list content
-    kimi_response(None, refusal="I cannot"),  # refusal envelope
-    kimi_response(None, tool_calls=[SimpleNamespace(  # unexpected tool call
+@pytest.mark.parametrize("response,code", [
+    # PR-R 4.6: an answerless completion that finished normally is named for
+    # what it is -- MODEL_EMPTY_COMPLETION, not repairable -- and a broken
+    # structure keeps the historical shape code.
+    (kimi_response(None), "MODEL_EMPTY_COMPLETION"),                       # null content
+    (kimi_response(""), "MODEL_EMPTY_COMPLETION"),                         # empty content
+    (kimi_response(["chunked", "content"]), "COMMANDER_COMPLETION_SHAPE_INVALID"),  # list content
+    (kimi_response(None, refusal="I cannot"), "MODEL_EMPTY_COMPLETION"),  # refusal envelope
+    (kimi_response(None, tool_calls=[SimpleNamespace(  # unexpected tool call
         id="c1", type="builtin_function",
-        function=SimpleNamespace(name="$web_search", arguments="{}"))]),
+        function=SimpleNamespace(name="$web_search", arguments="{}"))]), "MODEL_EMPTY_COMPLETION"),
 ])
-def test_gateway_rejects_non_string_plan_envelopes_with_stable_code(response):
+def test_gateway_rejects_non_string_plan_envelopes_with_stable_code(response, code):
     from backend.engines.swarm_v2 import CommanderPlanFailure
 
     gateway = gateway_for(ScriptedCompletions(response))
     with pytest.raises(CommanderPlanFailure) as failure:
         gateway.create_plan(model="kimi-k2.6", objective="o", context={})
-    assert failure.value.code == "COMMANDER_COMPLETION_SHAPE_INVALID"
+    assert failure.value.code == code
+    assert failure.value.escalation is None
 
 
 @pytest.mark.parametrize("usage", [
@@ -502,8 +506,11 @@ def test_token_budget_trip_produces_durable_budget_terminal(monkeypatch):
     run = repo.get_run(run_id)
     assert run["status"] == "budget_exhausted"
     # Depending on task interleaving the trip is caught either at reserve
-    # (REACHED, before the call) or at settle (EXCEEDED, actual overage).
-    assert run["error"]["code"] in {"TOTAL_TOKEN_LIMIT_REACHED", "TOTAL_TOKEN_LIMIT_EXCEEDED"}
+    # (REACHED, before the call; PR-R: BUDGET_INSUFFICIENT_FOR_ROLE when what
+    # remains cannot grant the next role its minimum answer reserve) or at
+    # settle (EXCEEDED, actual overage).
+    assert run["error"]["code"] in {"TOTAL_TOKEN_LIMIT_REACHED", "TOTAL_TOKEN_LIMIT_EXCEEDED",
+                                    "BUDGET_INSUFFICIENT_FOR_ROLE"}
     assert run["usage"]["model_calls"] >= 1
     assert run["usage"]["total_tokens"] >= 99000
 

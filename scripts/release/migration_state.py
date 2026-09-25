@@ -90,6 +90,8 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20260923000100": ("table", "catalog_work_scope_batch_runs"),
     "20260924000100": ("table", "catalog_work_scope_controls"),
     "20260924000200": ("table", "catalog_snapshot_adoptions"),
+    # PR-R reasoning-aware usage accounting.
+    "20260925000100": ("column", "run_usage_ledger.reasoning_tokens"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")

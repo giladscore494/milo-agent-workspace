@@ -210,7 +210,7 @@ def test_the_budget_trackers_stop_events_are_all_registry_members():
     source = Path("backend/budget.py").read_text()
     emitted = set(re.findall(r'"(budget_exhausted|run_timed_out|token_limit_reached|'
                              r'retry_limit_reached|kill_switch_activated|budget_warning|'
-                             r'model_output_cap_missing)"', source))
+                             r'model_output_cap_missing|model_usage_diagnostic)"', source))
     assert emitted, "the budget rail scan found nothing"
     assert emitted <= EVENT_TYPES
 

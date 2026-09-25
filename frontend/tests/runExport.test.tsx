@@ -41,8 +41,23 @@ describe('parseExportEnvelope', () => {
     });
   });
 
+  it('reads a milo-run-export/2 envelope (this release)', () => {
+    const v2 = { ...ENVELOPE, schema_version: 'milo-run-export/2',
+                 usage: { model_calls: 3, reasoning_tokens: 120, answer_tokens: 40 } };
+    expect(parseExportEnvelope(v2)?.schemaVersion).toBe('milo-run-export/2');
+    expect(parseExportEnvelope(v2)?.runId).toBe(RUN_ID);
+  });
+
+  it('reads a milo-run-export/1 envelope (a server on the previous release)', () => {
+    const v1 = { ...ENVELOPE, schema_version: 'milo-run-export/1', usage: { model_calls: 3 } };
+    expect(parseExportEnvelope(v1)?.schemaVersion).toBe('milo-run-export/1');
+    expect(parseExportEnvelope(v1)?.terminalStatus).toBe('completed');
+  });
+
   it('refuses an unknown schema, a disagreeing identity and a non-terminal status', () => {
-    expect(parseExportEnvelope({ ...ENVELOPE, schema_version: 'milo-run-export/2' })).toBeUndefined();
+    expect(parseExportEnvelope({ ...ENVELOPE, schema_version: 'milo-run-export/3' })).toBeUndefined();
+    expect(parseExportEnvelope({ ...ENVELOPE, schema_version: 'milo-run-export/0' })).toBeUndefined();
+    expect(parseExportEnvelope({ ...ENVELOPE, schema_version: undefined })).toBeUndefined();
     expect(parseExportEnvelope({ ...ENVELOPE, run_identity: { ...ENVELOPE.run_identity, run_id: 'other' } })).toBeUndefined();
     expect(parseExportEnvelope({ ...ENVELOPE, run_identity: { ...ENVELOPE.run_identity, workflow_key: 'swarm_v2' } })).toBeUndefined();
     expect(parseExportEnvelope({ ...ENVELOPE, terminal_status: 'running' })).toBeUndefined();

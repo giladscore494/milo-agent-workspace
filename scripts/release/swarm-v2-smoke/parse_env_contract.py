@@ -55,8 +55,14 @@ WORKER_EXPECTED = {
     "MILO_MAX_CONCURRENT_RUNS_PER_PROJECT": "1",
     "MILO_PROVIDER_MAX_CONCURRENCY": "8",
     "MILO_SWARM_MAX_ACTIVE_WORKERS": "8",
-    "MILO_COMMANDER_MODEL": "kimi-k2.6",
-    "MILO_COMMANDER_MODEL_ALLOWLIST": "kimi-k2.6",
+    # PR-R (MILO_V2_REASONING_BUDGET_PR_SPEC.md 4.9): the MODEL CONTRACT lines
+    # are the one deliberate exception to "kept verbatim" above. They do not
+    # describe the spent envelope; they state which models a deployed Swarm V2
+    # worker must name, and a worker naming any other is now refused at boot
+    # (backend/model_profiles.py). The historical smoke ran kimi-k2.6 for all
+    # three (docs/production-readiness/STAGE_D_AUTHORIZATION.md).
+    "MILO_COMMANDER_MODEL": "kimi-k3",
+    "MILO_COMMANDER_MODEL_ALLOWLIST": "kimi-k3,kimi-k2.6",
     "MILO_SWARM_WORKER_MODEL": "kimi-k2.6",
     "MILO_MODEL_BASE_URL": "https://api.moonshot.ai/v1",
     "JOB_LAUNCHER": "disabled",

@@ -212,9 +212,9 @@ def test_a_provider_failure_stays_an_attempt_and_is_recorded_before_the_retry_is
     client = build_guarded_client_factory(
         tracker, inner_factory=lambda *_: fake_kimi_client(Completions()))("k", "u")
     with pytest.raises(Boom):
-        client.chat.completions.create(model="kimi", messages=[{"role": "user", "content": "x"}],
+        client.chat.completions.create(model="kimi-k2.6", messages=[{"role": "user", "content": "x"}],
                                        max_tokens=16)
-    client.chat.completions.create(model="kimi", messages=[{"role": "user", "content": "x"}],
+    client.chat.completions.create(model="kimi-k2.6", messages=[{"role": "user", "content": "x"}],
                                    max_tokens=16)
     final = tracker.ledger_snapshot()
     assert (final["model_calls"], final["provider_attempts"], final["provider_failures"]) == (2, 2, 1)

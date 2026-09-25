@@ -354,6 +354,24 @@ export function describeSwarmUsage(viewModel: SwarmRunViewModel): SwarmUsageEntr
   if (usage.retries !== undefined) {
     entries.push({ key: 'retries', label: 'Retries', value: formatCount(usage.retries), known: true });
   }
+  // PR-R: the reasoning share of output. Provider-REPORTED reasoning and an
+  // ESTIMATE (completion minus answer, for calls whose usage did not report
+  // it) are labelled differently and never summed into one number.
+  if (usage.reasoningTokens !== undefined && usage.reasoningTokens > 0) {
+    entries.push({ key: 'reasoning-tokens', label: 'Reasoning tokens', value: formatCount(usage.reasoningTokens), known: true });
+  }
+  if (usage.reasoningEstimatedCalls !== undefined && usage.reasoningEstimatedCalls > 0
+      && usage.reasoningTokensEstimated !== undefined) {
+    entries.push({
+      key: 'reasoning-tokens-estimated',
+      label: 'Reasoning tokens (estimated)',
+      value: formatCount(usage.reasoningTokensEstimated),
+      known: true,
+    });
+  }
+  if (usage.cachedInputTokens !== undefined && usage.cachedInputTokens > 0) {
+    entries.push({ key: 'cached-input-tokens', label: 'Cached input tokens', value: formatCount(usage.cachedInputTokens), known: true });
+  }
   return entries;
 }
 

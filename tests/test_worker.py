@@ -374,16 +374,16 @@ def test_default_registry_routes_trusted_swarm_v2_and_reaches_a_truthful_outcome
     client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
     monkeypatch.setattr(worker_main, "build_guarded_client_factory",
                         lambda tracker, **_kw: lambda *_: client)
-    monkeypatch.setenv("MILO_COMMANDER_MODEL_ALLOWLIST", "fake")
-    monkeypatch.setenv("MILO_COMMANDER_MODEL", "fake")
-    monkeypatch.setenv("MILO_SWARM_WORKER_MODEL", "fake")
+    monkeypatch.setenv("MILO_COMMANDER_MODEL_ALLOWLIST", "kimi-k2.6")
+    monkeypatch.setenv("MILO_COMMANDER_MODEL", "kimi-k2.6")
+    monkeypatch.setenv("MILO_SWARM_WORKER_MODEL", "kimi-k2.6")
 
     class SwarmRepo(WorkerRepo):
         def get_project(self, project_id):
             return {"id": project_id, "workflow_key": "swarm_v2"}
         def get_run(self, run_id):
             row = super().get_run(run_id)
-            row["input"] = {"objective": "offline swarm", "commander_model": "fake"}
+            row["input"] = {"objective": "offline swarm", "commander_model": "kimi-k2.6"}
             return row
         def latest_checkpoint(self, run_id, workflow_key=None): return None
     repo = SwarmRepo()

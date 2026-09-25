@@ -23,17 +23,24 @@ The tracker never sees or stores API keys; configuration is numeric only.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from backend.execution_usage import (LEDGER_AMOUNTS, LEDGER_COUNTERS, LEDGER_SCHEMA_VERSION,
                                      LEDGER_SNAPSHOT_FIELDS, PUBLIC_USAGE_FIELDS,
                                      merge_usage_snapshots, public_usage_projection,
                                      validate_usage_snapshot)
+from backend.model_profiles import (MODEL_PROFILE_UNKNOWN, ModelProfile, UnknownModelProfile,
+                                    get_profile)
+from backend.model_usage import USAGE_REASONING_FIELD_ABSENT, UsageBreakdown, read_usage
 from backend.provider_authority import (ProviderOutcome, ProviderVerdict,
-                                        classify_outcome)
+                                        classify_outcome, conservative_input_tokens)
 from backend.runtime import CancellationRequested
 from backend.runtime_policy import BUDGET as _POLICY_BUDGET_SURFACE
 from backend.runtime_policy import dimensions_for as _policy_dimensions_for
@@ -221,6 +228,54 @@ DailySettlement = Callable[[ModelCallReservation, float, str, str | None], Any]
 # Conservative chars-per-token heuristic for pre-call input estimation.
 CHARS_PER_TOKEN = 4
 
+_log = logging.getLogger("milo.budget")
+
+#: Static reason codes of the PR-R role contract.
+BUDGET_INSUFFICIENT_FOR_ROLE = "BUDGET_INSUFFICIENT_FOR_ROLE"
+OUTPUT_CAP_REDUCED_BY_BUDGET = "OUTPUT_CAP_REDUCED_BY_BUDGET"
+COST_RESERVATION_EXCEEDED = "COST_RESERVATION_EXCEEDED"
+
+
+@dataclass(frozen=True)
+class CallContract:
+    """What a Swarm V2 role requires of ONE call, stated by the gateway.
+
+    ``min_answer_reserve`` is the smallest output cap the call is still worth
+    making with. A call whose remaining budget cannot grant it is REFUSED
+    (``BUDGET_INSUFFICIENT_FOR_ROLE``) before anything is sent, instead of
+    being silently shrunk into a guaranteed truncation -- which is what a
+    reasoning model does with a small cap: it spends the whole of it thinking
+    and returns an empty answer.
+
+    Calls without a contract (V1, and any caller that predates PR-R) keep
+    their historical admission exactly.
+    """
+
+    role: str
+    min_answer_reserve: int
+
+
+_CALL_CONTRACT: ContextVar[CallContract | None] = ContextVar("milo_call_contract", default=None)
+
+
+@contextmanager
+def call_contract(contract: CallContract) -> Iterator[None]:
+    """Attach ``contract`` to the guarded calls made inside this block.
+
+    Provider calls are synchronous on the calling thread (gateway -> adapter
+    -> scheduler -> guarded client), so the contract travels with exactly the
+    call it was stated for and never reaches the provider payload.
+    """
+    token = _CALL_CONTRACT.set(contract)
+    try:
+        yield
+    finally:
+        _CALL_CONTRACT.reset(token)
+
+
+def current_call_contract() -> CallContract | None:
+    return _CALL_CONTRACT.get()
+
 # --- the provider output-cap contract ---------------------------------------
 #
 # Kimi admits a request against request tokens PLUS the requested completion
@@ -229,8 +284,11 @@ CHARS_PER_TOKEN = 4
 # place that knows how the cap is spelled on the wire, so a test can assert on
 # the exact provider request and a future provider-side rename is one edit.
 #
-# `max_tokens` is what the Moonshot/Kimi OpenAI-compatible endpoint accepts
-# today; `max_completion_tokens` is the newer OpenAI spelling. Callers may use
+# The wire field is a property of the MODEL, not of MILO (PR-R): kimi-k2.6 has
+# always been sent `max_tokens`, and kimi-k3 documents `max_completion_tokens`
+# (`max_tokens` is deprecated there). The guarded client writes the field the
+# model's profile names (`ModelProfile.output_cap_field`); this default is the
+# historical spelling, kept for callers that state no model. Callers may use
 # either name and the wire field is emitted once, never both (sending both is
 # rejected by some OpenAI-compatible servers).
 PROVIDER_OUTPUT_CAP_FIELD = "max_tokens"
@@ -259,11 +317,15 @@ def read_output_cap(kwargs: dict[str, Any]) -> int | None:
     return None
 
 
-def apply_output_cap(kwargs: dict[str, Any], cap: int) -> dict[str, Any]:
-    """Put exactly ONE numeric output cap on the outgoing provider request."""
+def apply_output_cap(kwargs: dict[str, Any], cap: int,
+                     field: str = PROVIDER_OUTPUT_CAP_FIELD) -> dict[str, Any]:
+    """Put exactly ONE numeric output cap on the outgoing provider request,
+    under ``field`` (the model profile's ``output_cap_field``)."""
+    if field not in OUTPUT_CAP_ALIASES:
+        raise ValueError("output cap field must be a known provider spelling")
     for name in OUTPUT_CAP_ALIASES:
         kwargs.pop(name, None)
-    kwargs[PROVIDER_OUTPUT_CAP_FIELD] = int(cap)
+    kwargs[field] = int(cap)
     return kwargs
 
 
@@ -317,9 +379,21 @@ class BudgetTracker:
     search_cost: float = 0.0
     replans: int = 0
     correction_rounds: int = 0
+    # --- PR-R reasoning-aware usage (backend.model_usage) -------------------
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    reasoning_tokens_estimated: int = 0
+    reasoning_estimated_calls: int = 0
+    answer_tokens: int = 0
     #: The durable record's write sequence number, as last reported by the
     #: recorder. 0 until the first accepted durable write.
     ledger_version: int = 0
+    #: In-flight WORST-CASE dollar reservations (PR-R 4.4) of contract calls
+    #: that have not settled yet. Counted against the run's dollar ceiling
+    #: beside what has been spent. Never durable: a reservation belongs to the
+    #: process that took it, like the token reservations.
+    reserved_cost: float = 0.0
     #: Telemetry only: how many calls reached the gate with no declared cap.
     #: Deliberately NOT a cumulative snapshot field -- it is a code-health
     #: signal, not run capacity, and it must not gate a resume.
@@ -333,6 +407,8 @@ class BudgetTracker:
     #: flight. Popped by settle_call, so a reservation is released exactly once
     #: and by the amount that was actually taken.
     _open_reservations: dict[int, tuple[int, int]] = field(default_factory=dict, init=False)
+    #: call_seq -> worst-case dollars held for that call (contract calls only).
+    _open_cost_reservations: dict[int, float] = field(default_factory=dict, init=False)
     #: search reservations still in flight, keyed by their own sequence.
     #: IN-FLIGHT, never durable: like the token reservations, a reservation
     #: belongs to the process that took it, so a resumed worker starts with
@@ -390,6 +466,12 @@ class BudgetTracker:
             "search_cost": round(self.search_cost, 6),
             "replans": self.replans,
             "correction_rounds": self.correction_rounds,
+            "cached_input_tokens": self.cached_input_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "reasoning_tokens_estimated": self.reasoning_tokens_estimated,
+            "reasoning_estimated_calls": self.reasoning_estimated_calls,
+            "answer_tokens": self.answer_tokens,
             "elapsed_seconds": round(self.clock() - self._started_at, 3),
         }
 
@@ -430,7 +512,7 @@ class BudgetTracker:
             if (any(getattr(self, name) for name in (*LEDGER_COUNTERS, *LEDGER_AMOUNTS)
                     if name != "elapsed_seconds")
                     or self.reserved_input_tokens or self.reserved_output_tokens
-                    or self.reserved_search_invocations):
+                    or self.reserved_search_invocations or self.reserved_cost):
                 raise ValueError("budget usage can only be restored into a fresh tracker")
             for name in LEDGER_COUNTERS:
                 setattr(self, name, int(parsed.get(name, 0)))
@@ -458,6 +540,20 @@ class BudgetTracker:
         self._ledger("rejected", rejection_reason=code)
         return self._stop(code, message, event_type, terminal_status)
 
+    def refuse_call(self, code: str, message: str, *, event_type: str = "run_failed",
+                    terminal_status: str = "failed") -> BudgetExceeded:
+        """Refuse a call BEFORE admission, with a static reason code.
+
+        For refusals that are decided outside the capacity gate but must be
+        recorded and terminal exactly like one -- an unknown model profile is
+        a configuration fault, and a run that cannot price its calls must not
+        make any. The caller raises the returned exception.
+        """
+        with self._lock:
+            if self.stop is not None:
+                return self.stop
+            return self._reject(code, message, event_type, terminal_status)
+
     def _normalize_reservation(self, raw: ModelCallReservation | str | dict[str, Any] | None, call_seq: int, estimated_cost: float) -> ModelCallReservation:
         if isinstance(raw, ModelCallReservation):
             return raw
@@ -476,7 +572,10 @@ class BudgetTracker:
         """Backwards-compatible reservation returning only the output allowance."""
         return self.open_call(estimated_input_tokens, requested_max_tokens)[1]
 
-    def open_call(self, estimated_input_tokens: int = 0, requested_max_tokens: int | None = None) -> tuple[int, int | None]:
+    def open_call(self, estimated_input_tokens: int = 0, requested_max_tokens: int | None = None,
+                  *, contract: CallContract | None = None,
+                  cost_profile: "ModelProfile | None" = None,
+                  input_upper_bound: int = 0) -> tuple[int, int | None]:
         """Atomically reserve capacity for one model call BEFORE it happens.
 
         Checks (in order): paid-execution kill switch, worker lease,
@@ -536,14 +635,71 @@ class BudgetTracker:
             if cfg.daily_project_budget is not None and self.daily_project_cost_provider is not None and self.daily_project_cost_provider() >= cfg.daily_project_budget:
                 raise self._reject("DAILY_PROJECT_BUDGET_REACHED", "daily project budget exhausted", "budget_exhausted", "budget_exhausted")
             next_call_seq = self.model_calls + 1
-            reservation: ModelCallReservation | None = None
-            if cfg.daily_user_budget is not None and self.daily_user_reserver is not None:
-                reservation = self._normalize_reservation(self.daily_user_reserver(cfg.estimated_cost_per_call, next_call_seq), next_call_seq, cfg.estimated_cost_per_call)
-            if cfg.daily_project_budget is not None and self.daily_project_reserver is not None:
-                reservation = self._normalize_reservation(self.daily_project_reserver(cfg.estimated_cost_per_call, next_call_seq), next_call_seq, cfg.estimated_cost_per_call)
             allowed_output = remaining_output
             if requested_max_tokens is not None:
                 allowed_output = requested_max_tokens if allowed_output is None else min(allowed_output, requested_max_tokens)
+            if contract is not None and allowed_output is not None:
+                # PR-R 4.2: a role call is never silently shrunk below the
+                # answer it needs. Below the reserve it is refused, BEFORE the
+                # daily reservation and before anything is sent.
+                if allowed_output < contract.min_answer_reserve:
+                    raise self._reject(BUDGET_INSUFFICIENT_FOR_ROLE,
+                                       "remaining budget cannot grant the role's minimum answer reserve",
+                                       "budget_exhausted", "budget_exhausted")
+                if requested_max_tokens is not None and allowed_output < requested_max_tokens:
+                    # Above the reserve a smaller cap is still a useful call,
+                    # but it is never a SILENT one (spec 4.7).
+                    _log.warning("%s role=%s requested=%d granted=%d",
+                                 OUTPUT_CAP_REDUCED_BY_BUDGET, contract.role,
+                                 int(requested_max_tokens), int(allowed_output))
+            # --- PR-R 4.4: WORST-CASE cost reservation ------------------------
+            # A contract call holds the most it could possibly cost BEFORE it is
+            # sent: every input token (a byte-bounded upper bound, never an
+            # average) at the reserve input rate, plus every output token the
+            # call is allowed -- reasoning included -- at the output rate. The
+            # reservation is checked against EVERY remaining dollar ceiling,
+            # so no single call can spend past one however much it reasons.
+            # A call without a contract (V1) keeps the historical flat
+            # `estimated_cost_per_call` reservation unchanged.
+            reserve_amount = cfg.estimated_cost_per_call
+            worst_case: float | None = None
+            if contract is not None:
+                if cost_profile is None:
+                    raise self._reject(COST_RESERVATION_EXCEEDED,
+                                       "a role call reached the gate without a priced model profile",
+                                       "budget_exhausted", "failed")
+                cap_for_reserve = (allowed_output if allowed_output is not None
+                                   else requested_max_tokens)
+                if cap_for_reserve is None:
+                    raise self._reject(COST_RESERVATION_EXCEEDED,
+                                       "a role call cannot be reserved without an output cap",
+                                       "budget_exhausted", "failed")
+                worst_case = float(cost_profile.worst_case_cost(input_upper_bound, cap_for_reserve))
+                if (cfg.max_cost_per_run is not None
+                        and self.actual_cost + self.reserved_cost + worst_case > cfg.max_cost_per_run):
+                    raise self._reject(COST_RESERVATION_EXCEEDED,
+                                       "the call's worst-case cost exceeds the run's remaining cost budget",
+                                       "budget_exhausted", "budget_exhausted")
+                # The daily sums are read from the durable per-call ledger,
+                # which already carries every in-flight reservation of every
+                # run at its reserved amount; the database reservation below
+                # re-checks atomically across processes.
+                if (cfg.daily_user_budget is not None and self.daily_user_cost_provider is not None
+                        and self.daily_user_cost_provider() + worst_case > cfg.daily_user_budget):
+                    raise self._reject(COST_RESERVATION_EXCEEDED,
+                                       "the call's worst-case cost exceeds the remaining daily user budget",
+                                       "budget_exhausted", "budget_exhausted")
+                if (cfg.daily_project_budget is not None and self.daily_project_cost_provider is not None
+                        and self.daily_project_cost_provider() + worst_case > cfg.daily_project_budget):
+                    raise self._reject(COST_RESERVATION_EXCEEDED,
+                                       "the call's worst-case cost exceeds the remaining daily project budget",
+                                       "budget_exhausted", "budget_exhausted")
+                reserve_amount = worst_case
+            reservation: ModelCallReservation | None = None
+            if cfg.daily_user_budget is not None and self.daily_user_reserver is not None:
+                reservation = self._normalize_reservation(self.daily_user_reserver(reserve_amount, next_call_seq), next_call_seq, reserve_amount)
+            if cfg.daily_project_budget is not None and self.daily_project_reserver is not None:
+                reservation = self._normalize_reservation(self.daily_project_reserver(reserve_amount, next_call_seq), next_call_seq, reserve_amount)
             # Reserve the capacity this call may consume. Output capacity is
             # held as an in-flight reservation WHENEVER an allowance exists --
             # including when the caller declared no cap of its own.
@@ -569,13 +725,19 @@ class BudgetTracker:
             if held_output > 0:
                 self.reserved_output_tokens += held_output
             self._open_reservations[next_call_seq] = (estimated_input_tokens, held_output)
+            if worst_case is not None:
+                self.reserved_cost += worst_case
+                self._open_cost_reservations[next_call_seq] = worst_case
             if reservation is not None:
                 self._reservations[next_call_seq] = reservation
             self._ledger(
                 "reserved",
                 reserved_input_tokens=estimated_input_tokens,
                 reserved_output_tokens=held_output,
-                estimated_cost=round(cfg.estimated_cost_per_call, 6),
+                # What the durable daily sums read for a call still in flight:
+                # its worst case for a contract call, the flat rate otherwise.
+                estimated_cost=round(reserve_amount, 6),
+                **({"model": cost_profile.model} if cost_profile is not None else {}),
             )
             # The admission itself is durable BEFORE the request is sent. A
             # process that dies mid-request may already have been charged for
@@ -584,13 +746,19 @@ class BudgetTracker:
             self._record()
             return next_call_seq, allowed_output
 
-    def settle_call(self, reserved_input_tokens: int = 0, reserved_output_tokens: int | None = None, input_tokens: int = 0, output_tokens: int = 0, cost: float | None = None, status: str = "settled", rejection_reason: str | None = None, call_seq: int | None = None) -> None:
+    def settle_call(self, reserved_input_tokens: int = 0, reserved_output_tokens: int | None = None, input_tokens: int = 0, output_tokens: int = 0, cost: float | None = None, status: str = "settled", rejection_reason: str | None = None, call_seq: int | None = None, usage: "UsageBreakdown | None" = None, model: str = "") -> None:
         """Release the reservation and record actual usage after a call.
 
         ``call_seq`` identifies WHICH reservation settles. Concurrent calls
         must pass the sequence returned by ``open_call``; the fallback to the
         current model-call counter is only correct for strictly sequential
-        callers (the legacy before_call/after_call path)."""
+        callers (the legacy before_call/after_call path).
+
+        ``usage`` is the reasoning-aware breakdown of a SETTLED response
+        (``backend.model_usage.read_usage``). Counts only: nothing in it was
+        read from ``reasoning_content``. Its absent fields stay absent on the
+        per-call ledger row and add nothing to the run's sums."""
+        diagnostic = None
         with self._lock:
             settled_seq = call_seq if call_seq is not None else self.model_calls
             reservation = self._reservations.pop(settled_seq, None)
@@ -616,10 +784,29 @@ class BudgetTracker:
             self.reserved_input_tokens = max(0, self.reserved_input_tokens - held_input)
             if held_output:
                 self.reserved_output_tokens = max(0, self.reserved_output_tokens - held_output)
+            # The worst-case dollars are released on EVERY terminal path and
+            # exactly once, like the tokens; the actual cost replaces them.
+            held_cost = self._open_cost_reservations.pop(settled_seq, 0.0)
+            if held_cost:
+                self.reserved_cost = max(0.0, self.reserved_cost - held_cost)
             self.input_tokens += max(0, int(input_tokens or 0))
             self.output_tokens += max(0, int(output_tokens or 0))
             if cost is not None and cost > 0:
                 self.actual_cost += actual_cost
+            if usage is not None:
+                self.cached_input_tokens += usage.cached_input_tokens or 0
+                self.cache_write_tokens += usage.cache_write_tokens or 0
+                self.reasoning_tokens += usage.reasoning_tokens or 0
+                self.answer_tokens += usage.answer_tokens or 0
+                if usage.reasoning_estimated:
+                    # ONCE per run, not per process: the counter is cumulative
+                    # and restored on resume, so a replacement worker does not
+                    # announce what the run already reported.
+                    if self.reasoning_estimated_calls == 0:
+                        diagnostic = {"code": USAGE_REASONING_FIELD_ABSENT,
+                                      "model": str(model or "")[:64]}
+                    self.reasoning_estimated_calls += 1
+                    self.reasoning_tokens_estimated += usage.reasoning_tokens_estimated or 0
             if status != "settled":
                 # A released or rejected settlement is an attempt that bought
                 # no response; it stays counted, it is never refunded.
@@ -635,8 +822,15 @@ class BudgetTracker:
                 actual_input_tokens=int(input_tokens or 0),
                 actual_output_tokens=int(output_tokens or 0),
                 actual_cost=actual_cost if cost else None,
+                **(usage.ledger_fields() if usage is not None else {}),
+                **({"model": str(model)[:64]} if model else {}),
             )
             self._record()
+            if diagnostic is not None:
+                self._emit("model_usage_diagnostic", {
+                    "message": "provider usage did not report reasoning tokens; "
+                               "the reasoning share is estimated",
+                    "payload": diagnostic})
             if cfg.max_input_tokens_per_run is not None and self.input_tokens > cfg.max_input_tokens_per_run:
                 self._ledger("overage", call_seq=settled_seq, rejection_reason="INPUT_TOKEN_LIMIT_EXCEEDED")
                 raise self._stop("INPUT_TOKEN_LIMIT_EXCEEDED", "actual input token limit exceeded", "token_limit_reached", "budget_exhausted")
@@ -889,6 +1083,17 @@ class _GuardedCompletions:
         self._tracker = tracker
 
     def create(self, **kwargs: Any) -> Any:
+        # FAIL CLOSED on price before anything else: a model with no
+        # registered profile cannot be priced, so it cannot be held to any
+        # dollar ceiling, and it is refused before admission, before the
+        # provider and with a static code. It used to be priced at 0.0.
+        try:
+            profile = get_profile(kwargs.get("model", ""))
+        except UnknownModelProfile:
+            refusal = self._tracker.refuse_call(
+                MODEL_PROFILE_UNKNOWN, "the model has no registered profile")
+            refusal.provider_request_completed = True
+            raise refusal from None
         estimated_input = estimate_message_tokens(kwargs.get("messages"))
         requested_max = read_output_cap(kwargs)
         if requested_max is None:
@@ -908,14 +1113,30 @@ class _GuardedCompletions:
         # be proven finished, and an exception from here proves it never
         # started -- so it must be marked, or an ordinary budget refusal would
         # quarantine a shared slot it never used.
+        contract = current_call_contract()
         try:
-            call_seq, allowed_output = self._tracker.open_call(estimated_input, requested_max)
+            # The byte-bounded input UPPER bound the worst-case reservation is
+            # priced from. Unmeasurable content raises: it fails closed.
+            input_upper_bound = 0
+            if contract is not None:
+                input_upper_bound = conservative_input_tokens(kwargs.get("messages"),
+                                                              kwargs.get("tools"))
+                if kwargs.get("response_format") is not None:
+                    # A json_schema response format is prompt material the
+                    # provider may bill as input; it is bounded by its bytes.
+                    input_upper_bound += len(json.dumps(
+                        kwargs["response_format"], ensure_ascii=False,
+                        separators=(",", ":")).encode("utf-8"))
+            call_seq, allowed_output = self._tracker.open_call(
+                estimated_input, requested_max, contract=contract,
+                cost_profile=profile if contract is not None else None,
+                input_upper_bound=input_upper_bound)
         except BaseException as exc:
             exc.provider_request_completed = True
             raise
         effective_cap = allowed_output if allowed_output is not None else requested_max
         reserved_output = effective_cap
-        apply_output_cap(kwargs, effective_cap)
+        apply_output_cap(kwargs, effective_cap, profile.output_cap_field)
         try:
             response = self._inner.create(**kwargs)
         except Exception as exc:
@@ -959,11 +1180,21 @@ class _GuardedCompletions:
             raise
         usage = getattr(response, "usage", None)
         provider_cost = getattr(usage, "cost", None) or getattr(usage, "total_cost", None) or getattr(response, "cost", None)
-        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-        output_tokens = getattr(usage, "completion_tokens", 0) or 0
+        # Counts only. `read_usage` reads the usage block and message.content;
+        # reasoning_content is never read, stored or re-sent.
+        breakdown = read_usage(response)
+        input_tokens = breakdown.input_tokens
+        output_tokens = breakdown.output_tokens
         if provider_cost is None:
-            from backend.model_pricing import calculate_model_cost
-            provider_cost = calculate_model_cost(kwargs.get("model", ""), input_tokens, output_tokens)
+            # A provider-reported cost wins; otherwise the profile prices the
+            # breakdown: cached input at the hit price, cache writes at the
+            # applicable tier, the rest at the miss price, and ALL output --
+            # reasoning included -- at the output price.
+            provider_cost = profile.usage_cost(
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                cached_input_tokens=breakdown.cached_input_tokens,
+                cache_write_tokens=breakdown.cache_write_tokens,
+                cache_write_ttl=breakdown.cache_write_ttl)
         # Likewise AFTER a response was read to completion: a budget refusal
         # raised here is about accounting, not about a request whose fate is
         # unknown, so it must not hold the permit either.
@@ -975,6 +1206,8 @@ class _GuardedCompletions:
                 output_tokens=output_tokens,
                 cost=float(provider_cost or 0),
                 call_seq=call_seq,
+                usage=breakdown,
+                model=kwargs.get("model", ""),
             )
         except BaseException as exc:
             exc.provider_request_completed = True

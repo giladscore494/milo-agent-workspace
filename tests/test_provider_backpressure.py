@@ -197,7 +197,7 @@ def test_guarded_client_429_increments_backpressure_not_retries():
     guarded = GuardedModelClient(RateLimitedInner(FakeRateLimitError()), tracker)
     for _ in range(5):
         with pytest.raises(FakeRateLimitError):
-            guarded.chat.completions.create(model="mock", messages=[])
+            guarded.chat.completions.create(model="kimi-k2.6", messages=[])
     assert tracker.retries == 0
     assert tracker.provider_backpressure_events == 5
     assert tracker.stop is None  # never trips RETRY_LIMIT_REACHED
@@ -208,7 +208,7 @@ def test_guarded_client_non_rate_limit_error_still_consumes_retries():
     tracker = make_tracker(max_retries=10, estimated_cost_per_call=0.0)
     guarded = GuardedModelClient(RateLimitedInner(RuntimeError("connection reset")), tracker)
     with pytest.raises(RuntimeError):
-        guarded.chat.completions.create(model="mock", messages=[])
+        guarded.chat.completions.create(model="kimi-k2.6", messages=[])
     assert tracker.retries == 1
     assert tracker.provider_backpressure_events == 0
 
@@ -217,7 +217,7 @@ def test_guarded_client_429_releases_the_reservation():
     tracker = make_tracker(max_model_calls_per_run=10, estimated_cost_per_call=0.0)
     guarded = GuardedModelClient(RateLimitedInner(FakeRateLimitError()), tracker)
     with pytest.raises(FakeRateLimitError):
-        guarded.chat.completions.create(model="mock", messages=[{"content": "x" * 40}], max_tokens=50)
+        guarded.chat.completions.create(model="kimi-k2.6", messages=[{"content": "x" * 40}], max_tokens=50)
     assert tracker.reserved_input_tokens == 0
     assert tracker.reserved_output_tokens == 0
     assert tracker.model_calls == 1  # the attempt still counts against call caps

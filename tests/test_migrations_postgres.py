@@ -8773,15 +8773,17 @@ def test_batch_run_relations_are_service_only_and_rerun_safe(db):
 # schemas: a generic Government snapshot, an unprepared revision, a stale
 # revision, a wrong digest, a live batch and a paused plan must never read as
 # ready, and a database missing the ingestion recovery migration (the
-# measured production state after Stage B: 41 of 42 applied) must say so
+# measured production state after Stage B: 41 applied, this release adding
+# the rest) must say so
 # exactly.
 # =============================================================================
 
 READINESS_SCRIPT = REPO_ROOT / "scripts" / "deploy" / "work-scope-readiness.sh"
 MIGRATION_STATE_SCRIPT = REPO_ROOT / "scripts" / "release" / "check-migration-state.sh"
 SCOPED_MIGRATION_VERSIONS = ("20260922000100", "20260923000100", "20260924000100")
-#: What production lacks after the 2026-09-24 incident: only this release's.
-PENDING_MIGRATION_VERSIONS = ("20260924000200",)
+#: What production lacks after the 2026-09-24 incident: the ingestion recovery
+#: migration, and (PR-R) the reasoning-aware usage migration.
+PENDING_MIGRATION_VERSIONS = ("20260924000200", "20260925000100")
 PARTIAL_PG_PORT = "54995"
 
 
@@ -8925,7 +8927,7 @@ def production_shaped_db():
         server.psql(sql=SEED_LEGACY_ROWS)
         server.psql(sql=SUPABASE_AUTH_SHIM)
         applied = [m for m in MIGRATIONS if not m.name.startswith(PENDING_MIGRATION_VERSIONS)]
-        assert len(applied) == 41 and len(MIGRATIONS) == 42
+        assert len(applied) == 41 and len(MIGRATIONS) == 43
         for migration in applied:
             server.psql(file=migration)
         versions = ", ".join(f"('{m.name.split('_', 1)[0]}')" for m in applied)
@@ -8959,15 +8961,15 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as partially-migrated (41/42" in state.stdout, state.stdout
-    assert "1 local migration(s) not present in remote migration history" in state.stdout
+    assert "remote schema classified as partially-migrated (41/43" in state.stdout, state.stdout
+    assert "2 local migration(s) not present in remote migration history" in state.stdout
     for version in PENDING_MIGRATION_VERSIONS:
         assert version in state.stdout
     for version in SCOPED_MIGRATION_VERSIONS:
         assert f"{version}_" not in state.stdout.split("not present in remote migration history", 1)[1]
     assert "fully-migrated" not in state.stdout.split("remote:state", 1)[1].splitlines()[0]
 
-    # Applying exactly the one, in order, makes the schema complete and the
+    # Applying exactly the pending ones, in order, makes the schema complete and the
     # migration set exact -- the post-migration verification of Stage B.
     for migration in MIGRATIONS:
         if migration.name.startswith(PENDING_MIGRATION_VERSIONS):
@@ -8981,7 +8983,7 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as fully-migrated (42/42" in state.stdout, state.stdout
+    assert "remote schema classified as fully-migrated (43/43" in state.stdout, state.stdout
 
 
 
@@ -9744,3 +9746,74 @@ def test_year_coverage_states_the_vocabulary_gate_for_every_starting_year(db):
     assert bad.returncode == 2
     missing = _readiness(db, "--year-coverage", "--snapshot-key", "cs1." + "0" * 32)
     assert missing.returncode == 1 and "YEAR_COVERAGE=NO" in missing.stdout
+
+
+# ---------------------------------------------------------------------------
+# PR-R -- 20260925000100_reasoning_aware_usage: per-call reasoning-aware
+# columns (NULL = not reported), the widened public projection, same ACL.
+# ---------------------------------------------------------------------------
+def _reasoning_usage_migration() -> Path:
+    return Path("supabase/migrations/20260925000100_reasoning_aware_usage.sql")
+
+
+def test_reasoning_aware_ledger_columns_keep_null_as_not_reported(db):
+    # Other tests in this module re-apply OLDER migrations that redefine the
+    # same function; the latest definition is the one under test.
+    db.psql(file=_reasoning_usage_migration())
+    run_id = _seed_stale_worker_run(db)
+    worker, attempt, token = db.psql(
+        f"select worker_id, attempt, lease_token from public.claim_run_lease('{run_id}', 'worker-PRR', 300)").split("|")
+    lease = f"'{run_id}', '{worker}', {attempt}, '{token}'"
+    reported = db.psql(
+        f"select cached_input_tokens, cache_write_tokens, reasoning_tokens, reasoning_tokens_estimated, "
+        f"reasoning_estimated, answer_tokens, model from public.append_usage_ledger_guarded({lease}, "
+        "'{\"model\": \"kimi-k3\", \"call_seq\": 1, \"decision\": \"settled\", \"actual_cost\": 0.2, "
+        "\"cached_input_tokens\": 600, \"cache_write_tokens\": 100, \"reasoning_tokens\": 420, "
+        "\"reasoning_tokens_estimated\": null, \"reasoning_estimated\": false, \"answer_tokens\": 80}'::jsonb)")
+    assert reported == "600|100|420||f|80|kimi-k3"
+    # Absent keys and JSON nulls are both "not reported": NULL, never 0.
+    absent = db.psql(
+        f"select coalesce(cached_input_tokens::text, 'NULL'), coalesce(reasoning_tokens::text, 'NULL'), "
+        f"reasoning_estimated, reasoning_tokens_estimated from public.append_usage_ledger_guarded({lease}, "
+        "'{\"call_seq\": 2, \"decision\": \"settled\", \"reasoning_estimated\": true, "
+        "\"reasoning_tokens_estimated\": 3900}'::jsonb)")
+    assert absent == "NULL|NULL|t|3900"
+    with pytest.raises(AssertionError, match="run_usage_ledger_reasoning_counts_nonnegative"):
+        db.psql(f"select id from public.append_usage_ledger_guarded({lease}, "
+                "'{\"call_seq\": 3, \"decision\": \"settled\", \"answer_tokens\": -1}'::jsonb)")
+
+
+def test_public_projection_carries_the_reasoning_breakdown_and_no_ledger_only_key(db):
+    db.psql(file=_reasoning_usage_migration())
+    projected = json.loads(db.psql(
+        "select public.execution_usage_public_projection('{\"model_calls\": 2, \"reasoning_tokens\": 5, "
+        "\"reasoning_tokens_estimated\": 7, \"reasoning_estimated_calls\": 1, \"cached_input_tokens\": 3, "
+        "\"cache_write_tokens\": 4, \"answer_tokens\": 9, \"tool_calls\": 8}'::jsonb)"))
+    assert projected == {"model_calls": 2, "reasoning_tokens": 5, "reasoning_tokens_estimated": 7,
+                         "reasoning_estimated_calls": 1, "cached_input_tokens": 3,
+                         "cache_write_tokens": 4, "answer_tokens": 9}
+    from backend.execution_usage import PUBLIC_USAGE_FIELDS
+
+    every = {name: 1 for name in PUBLIC_USAGE_FIELDS}
+    assert set(json.loads(db.psql(
+        f"select public.execution_usage_public_projection('{json.dumps(every)}'::jsonb)"))) == PUBLIC_USAGE_FIELDS
+
+
+def test_the_reasoning_usage_migration_is_service_only_and_rerun_safe(db):
+    signature = "public.append_usage_ledger_guarded(uuid, text, integer, text, jsonb)"
+    db.psql(file=_reasoning_usage_migration())
+    db.psql(file=_reasoning_usage_migration())
+    for role in ("anon", "authenticated"):
+        assert not _has_execute(db, role, signature)
+    assert _has_execute(db, "service_role", signature)
+    assert db.psql("select count(*) from pg_constraint "
+                   "where conname='run_usage_ledger_reasoning_counts_nonnegative'") == "1"
+    # Added NOT VALID, then validated: it ends VALID, and it never scanned the
+    # ledger under the ACCESS EXCLUSIVE lock. The migration fails fast on lock
+    # contention instead of queueing appends behind it.
+    assert db.psql("select convalidated from pg_constraint "
+                   "where conname='run_usage_ledger_reasoning_counts_nonnegative'") == "t"
+    text = _reasoning_usage_migration().read_text().lower()
+    assert "set local lock_timeout = '5s';" in text
+    assert ") not valid;" in text
+    assert "validate constraint run_usage_ledger_reasoning_counts_nonnegative" in text

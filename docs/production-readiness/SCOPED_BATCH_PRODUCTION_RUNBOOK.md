@@ -732,6 +732,26 @@ In this order, stopping at the first failure:
    then reads back every value and the secret binding. If this fails, the API
    is **not** touched. With the API's run creation still off, nothing can use
    the armed worker.
+
+   **PR-R model contract (worker only).** The activation script does NOT
+   set the models. The operator must set these three on the worker job
+   manually:
+   `MILO_COMMANDER_MODEL=kimi-k3`,
+   `MILO_COMMANDER_MODEL_ALLOWLIST=kimi-k3,kimi-k2.6` and
+   `MILO_SWARM_WORKER_MODEL=kimi-k2.6`. Boot does **not** catch a worker left
+   on the old values: `kimi-k2.6` is a profiled, allowlisted model, so a worker
+   still carrying `MILO_COMMANDER_MODEL=kimi-k2.6` and
+   `MILO_COMMANDER_MODEL_ALLOWLIST=kimi-k2.6` passes boot and runs the
+   Commander on k2.6. Boot refuses only an unprofiled model
+   (`MODEL_PROFILE_UNKNOWN`), a role model missing from the allowlist
+   (`MODEL_NOT_ALLOWLISTED`) or incomplete model env
+   (`SWARM_MODEL_CONFIG_INVALID`), so read the three values back after
+   setting them. The reviewed RuntimePolicy it applies now carries `MILO_MAX_COST_PER_RUN=3.00`,
+   `MILO_DAILY_USER_BUDGET=10.00`, `MILO_DAILY_PROJECT_BUDGET=10.00`,
+   `MILO_MAX_OUTPUT_TOKENS_PER_RUN=400000` and
+   `MILO_MAX_TOTAL_TOKENS_PER_RUN=900000`. Check the posture with
+   `check-production-config.sh --env-file` (`model-contract` must PASS). See
+   [REASONING_BUDGET.md](REASONING_BUDGET.md).
 4. **The API.** It sets `JOB_LAUNCHER=cloud_run`, the worker identity, the
    concurrency caps and the API flags, then reads them back. Preparation,
    promotion and paid execution on the API stay pinned off.
@@ -874,7 +894,9 @@ this change does not perform it.
      execution** panel, which shows the engine, phase, work and budget from
      durable events;
    - the inspector **Agents** tab, and **Costs** for usage against the reviewed
-     caps (`$1.00` actual per run, `$3.00` estimated, `$4.00` daily);
+     caps (`$3.00` actual per run, held as a worst-case reservation per
+     call, `$3.00` estimated, `$10.00` daily), and the reasoning-token rows
+     (reported or estimated);
    - the Mapping Plan's **Current** line (for example `running`). *"The worker
      for this batch has not been started"* or *"unresolved"* means an operator
      step is needed ([work-scope.md](../work-scope.md#continuation)); the
@@ -888,7 +910,7 @@ this change does not perform it.
    python3 - "$HOME/Downloads/<exported file>.json" "$RELEASE_SHA" << 'PY'
    import json, sys
    doc = json.load(open(sys.argv[1]))
-   assert doc["schema_version"] == "milo-run-export/1", doc["schema_version"]
+   assert doc["schema_version"] == "milo-run-export/2", doc["schema_version"]
    assert doc["engine"] == "swarm_v2" and doc["run_identity"]["workflow_key"] == "swarm_v2"
    assert doc["run_identity"]["release_sha"] == sys.argv[2], "not the release"
    assert doc["terminal_status"] in {"completed", "partial_success", "failed", "cancelled",

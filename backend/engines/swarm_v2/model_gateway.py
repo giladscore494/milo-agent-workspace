@@ -4,7 +4,8 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Iterable, Mapping
 
-from backend.budget import apply_output_cap
+from backend.budget import CallContract, call_contract
+from backend.model_profiles import ModelProfile, UnknownModelProfile, get_profile
 from backend.provider_authority import ProviderAdapter
 from backend.runtime import CancellationRequested
 from backend.tools import ToolDescriptor
@@ -14,6 +15,10 @@ from .contracts import (
     commander_plan_json_schema,
 )
 from .commander import CommanderPlanFailure
+from .completion import (TRUNCATION_CODES, CallShape, CompletionShapeInvalid,
+                         ModelCompletionError, classify_completion, escalate, initial_shape)
+from .request_builder import (MODEL_PARAM_FORBIDDEN, ModelRequestRefused, RolePolicy,
+                              build_provider_request)
 from .validation import VALIDATION_REASONS, PlanLimits, provider_plan_policy
 
 
@@ -22,44 +27,74 @@ def _canonical_json(value: Any) -> str:
 
 
 class MissingRoleOutputCap(ValueError):
-    """A Swarm V2 role reached the gateway without a declared output cap."""
+    """A Swarm V2 role reached the gateway without a declared call policy."""
 
 
-#: The explicit, server-owned output cap for every Swarm V2 role, keyed by
-#: ``(agent_kind, phase)``. V1 has required a numeric cap on every model call
-#: since it shipped (``core.moonshot_chat`` raises without one) and sizes it
-#: per agent; these are the V2 equivalents, sized from V1's proven per-role
-#: numbers for the comparable work:
+#: The explicit, server-owned call policy for every Swarm V2 role, keyed by
+#: ``(agent_kind, phase)``: its reasoning effort, its output cap and the
+#: smallest cap the call is still worth making with
+#: (MILO_V2_REASONING_BUDGET_PR_SPEC.md, PR-R 4.2).
+#:
+#: WHY THE CAPS ARE LARGE. They used to be 4000/2000/2500/3500, sized for a
+#: model that did not think. A reasoning model spends its output on thinking
+#: first -- the provider counts reasoning and answer against ONE cap -- and
+#: run 4761a8ce's Commander spent all 4,000 tokens thinking and returned
+#: nothing. The per-call cap is therefore generous and the hard money bound
+#: moves to the run and the day: every call reserves its WORST-CASE cost
+#: (input upper bound x input price + this cap x output price) before it is
+#: sent, so a large cap can never spend past a dollar ceiling. These numbers
+#: are a starting point, to be calibrated from the reasoning_tokens of the
+#: first 2-3 runs.
 #:
 #:   * planning    -- the largest structured output a run produces (a whole
-#:                    task graph), so it gets the most room;
-#:   * replanning  -- a decision plus an optional replacement plan;
-#:   * execute     -- one task's structured output (V1 technical: 2500);
-#:   * verification-- one batch of grounded verdicts (V1 verifier: 3500).
+#:                    task graph), K3 at high effort;
+#:   * replanning  -- a decision plus an optional replacement plan; its
+#:                    CommanderDecision schema carries conditional rules, so it
+#:                    stays on json_object;
+#:   * execute     -- one task's structured output, the worker model at low
+#:                    effort (kimi-k2.6: thinking enabled);
+#:   * verification-- one batch of grounded verdicts, K3 at high effort.
 #:
 #: A role that is not listed here is a programming error and fails closed
 #: rather than inheriting the run's whole remaining allowance.
-ROLE_OUTPUT_CAPS: Mapping[tuple[str, str], int] = {
-    ("commander", "planning"): 4000,
-    ("commander", "replanning"): 2000,
-    ("worker", "execute"): 2500,
-    ("verifier", "verification"): 3500,
+ROLE_POLICIES: Mapping[tuple[str, str], RolePolicy] = {
+    ("commander", "planning"): RolePolicy(effort="high", max_output=32_000, min_answer_reserve=6_000),
+    ("commander", "replanning"): RolePolicy(effort="high", max_output=16_000, min_answer_reserve=3_000,
+                                            structured=False),
+    ("worker", "execute"): RolePolicy(effort="low", max_output=12_000, min_answer_reserve=3_000),
+    ("verifier", "verification"): RolePolicy(effort="high", max_output=24_000, min_answer_reserve=4_000),
 }
 
+#: Read-only view kept for surfaces that describe caps (the Tier 2 profile).
+ROLE_OUTPUT_CAPS: Mapping[tuple[str, str], int] = {
+    key: policy.max_output for key, policy in ROLE_POLICIES.items()}
 
-def role_output_cap(agent: str, phase: str) -> int:
-    """Resolve ONE role's numeric output cap, or refuse the call.
+
+def role_policy(agent: str, phase: str) -> RolePolicy:
+    """Resolve ONE role's call policy, or refuse the call.
 
     ``agent`` carries a task id for workers (``worker:<task_id>``), so the role
-    is the part before the colon: the cap belongs to the ROLE, never to a
+    is the part before the colon: the policy belongs to the ROLE, never to a
     model-chosen identifier, and a task cannot name itself into a bigger cap.
     """
     kind = str(agent or "").split(":", 1)[0]
-    cap = ROLE_OUTPUT_CAPS.get((kind, str(phase or "")))
-    if cap is None:
+    policy = ROLE_POLICIES.get((kind, str(phase or "")))
+    if policy is None:
         raise MissingRoleOutputCap(
-            "no server-owned output cap is declared for this role")
-    return cap
+            "no server-owned call policy is declared for this role")
+    return policy
+
+
+def role_output_cap(agent: str, phase: str) -> int:
+    return role_policy(agent, phase).max_output
+
+
+def model_profile(model: str) -> ModelProfile:
+    """The model's profile, or a static refusal before anything is built."""
+    try:
+        return get_profile(model)
+    except UnknownModelProfile:
+        raise ModelRequestRefused("MODEL_PROFILE_UNKNOWN") from None
 
 
 class ModelGateway:
@@ -119,26 +154,47 @@ class ModelGateway:
         agent: str,
         phase: str,
         max_tokens: int | None = None,
+        schema: Mapping[str, Any] | None = None,
+        schema_name: str = "milo_output",
+        effort: str | None = None,
         **kwargs: Any,
     ) -> Any:
         if self._cancelled and self._cancelled():
             raise CancellationRequested("RUN_CANCELLED")
         if self._agent_step:
             self._agent_step(agent, phase)
+        # Decided before anything is sent: an unknown model, an unknown role
+        # or a parameter the model contract does not allow is a static
+        # refusal, never a provider call.
+        policy = role_policy(agent, phase)
+        profile = model_profile(model)
+        response_format = kwargs.pop("response_format", None)
+        if response_format not in (None, {"type": "json_object"}) or kwargs:
+            # The builder owns every parameter. `{"type": "json_object"}` is
+            # accepted from historical callers because it is what the builder
+            # sends anyway when there is no schema.
+            raise ModelRequestRefused(MODEL_PARAM_FORBIDDEN)
         # EVERY Swarm V2 provider request carries an explicit numeric output
         # cap. A caller may tighten the role's cap but never omit it and never
         # exceed it: the organization admits a request against
         # `input + requested cap`, so a request without one cannot be counted
         # correctly and must not be sent at all.
-        cap = role_output_cap(agent, phase)
+        cap = policy.max_output
         if max_tokens is not None:
             cap = min(cap, int(max_tokens))
             if cap <= 0:
                 raise MissingRoleOutputCap("output cap must be positive")
-        request = {"model": model, "messages": messages, **kwargs}
-        apply_output_cap(request, cap)
-        return self._adapter.chat(request, client=self._client, agent=agent,
-                                  phase=phase)
+        request = build_provider_request(profile, policy, messages, schema,
+                                         output_cap=cap, effort=effort,
+                                         schema_name=schema_name)
+        # The role's contract travels with THIS call to the guarded client:
+        # a budget that cannot grant the answer reserve refuses the call
+        # (BUDGET_INSUFFICIENT_FOR_ROLE) instead of shrinking it silently.
+        contract = CallContract(role=f"{str(agent).split(':', 1)[0]}:{phase}",
+                                min_answer_reserve=min(policy.min_answer_reserve, cap))
+        with call_contract(contract):
+            return self._adapter.chat(request, client=self._client, agent=agent,
+                                      phase=phase)
 
     def _tool_authorization_instruction(self) -> str:
         """Describe the registered capabilities, and grant none of them.
@@ -176,6 +232,7 @@ class ModelGateway:
         objective: str,
         context: Mapping[str, Any],
         repair_reason: str | None = None,
+        repair_shape: CallShape | None = None,
     ) -> str | bytes | dict[str, Any]:
         system = (
             "Return only one JSON object that validates exactly against the "
@@ -187,7 +244,17 @@ class ModelGateway:
             "validation; every rule and limit is mandatory: "
             f"{self._plan_policy}"
         )
-        if repair_reason is not None:
+        if repair_reason is not None and repair_reason in TRUNCATION_CODES:
+            # PR-R: the previous completion ran out of output cap. The repair
+            # is escalated (cap doubled or effort lowered, `repair_shape`) and
+            # still carries ONLY the static code -- never the partial answer.
+            system += (
+                " The previous response was cut off by the output limit with "
+                f"static reason code {repair_reason}. Return one complete JSON "
+                "object satisfying the schema and every policy rule, as "
+                "concisely as the plan allows. This is the final attempt."
+            )
+        elif repair_reason is not None:
             # The repair prompt carries ONLY a static allowlisted reason
             # code — never the rejected plan or validation diagnostics.
             if repair_reason not in VALIDATION_REASONS:
@@ -198,11 +265,15 @@ class ModelGateway:
                 "one corrected JSON object satisfying the schema and every "
                 "policy rule. This is the final attempt."
             )
+        shape = repair_shape or initial_shape("commander", "planning")
         response = self.call(
             model=model,
             agent="commander",
             phase="planning",
-            response_format={"type": "json_object"},
+            schema=commander_plan_json_schema(),
+            schema_name="commander_plan",
+            max_tokens=shape.output_cap,
+            effort=shape.effort,
             messages=[
                 {"role": "system", "content": system},
                 {
@@ -214,16 +285,17 @@ class ModelGateway:
             ],
         )
         try:
-            content = response.choices[0].message.content
-        except (AttributeError, IndexError, TypeError):
-            if isinstance(response, (str, bytes, dict)):
-                content = response
-            else:
-                raise CommanderPlanFailure(
-                    "COMMANDER_COMPLETION_SHAPE_INVALID"
-                ) from None
-        if content is None or content == "":
-            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID")
+            content = classify_completion(response)
+        except ModelCompletionError as exc:
+            # Named for what happened (run 4761a8ce was reported as a shape
+            # failure). A truncation carries its ONE escalation, or None when
+            # neither the cap nor the effort can change.
+            raise CommanderPlanFailure(
+                exc.code,
+                escalation=(escalate(model, "commander", "planning", shape)
+                            if exc.code in TRUNCATION_CODES else None)) from None
+        except CompletionShapeInvalid:
+            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID") from None
         if not isinstance(content, (str, bytes, dict)):
             raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID")
         return content
@@ -252,7 +324,6 @@ class ModelGateway:
             model=model,
             agent="commander",
             phase="replanning",
-            response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system},
                 {
@@ -263,6 +334,15 @@ class ModelGateway:
                 },
             ],
         )
-        if isinstance(response, (str, bytes, dict)):
-            return response
-        return response.choices[0].message.content
+        # Checked like every other role (it used to return `.content`
+        # unexamined). Replanning has no semantic repair: a truncated or empty
+        # decision fails with its static code.
+        try:
+            content = classify_completion(response)
+        except ModelCompletionError as exc:
+            raise CommanderPlanFailure(exc.code) from None
+        except CompletionShapeInvalid:
+            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID") from None
+        if not isinstance(content, (str, bytes, dict)):
+            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID")
+        return content
