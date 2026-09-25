@@ -1045,7 +1045,10 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     # the Verifier itself never gains database, web or tool
                     # access of its own.
                     verifier=Verifier(gateway=gateway, model=commander_model,
-                                      resolver=RepositoryEvidenceResolver(repo, run_id=run_id)),
+                                      resolver=RepositoryEvidenceResolver(repo, run_id=run_id),
+                                      # PR-R: a truncated batch's ONE escalated
+                                      # repair is a semantic retry.
+                                      retry_callback=record_retry),
                     # Completed tasks only: see `evidence_of_completed_tasks`.
                     evidence_loader=lambda results: evidence_of_completed_tasks(board, results),
                     checkpoint_sink=save_checkpoint, event_sink=forward_event,

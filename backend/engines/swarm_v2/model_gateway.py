@@ -15,6 +15,8 @@ from .contracts import (
     commander_plan_json_schema,
 )
 from .commander import CommanderPlanFailure
+from .completion import (TRUNCATION_CODES, CallShape, CompletionShapeInvalid,
+                         ModelCompletionError, classify_completion, escalate, initial_shape)
 from .request_builder import (MODEL_PARAM_FORBIDDEN, ModelRequestRefused, RolePolicy,
                               build_provider_request)
 from .validation import VALIDATION_REASONS, PlanLimits, provider_plan_policy
@@ -230,6 +232,7 @@ class ModelGateway:
         objective: str,
         context: Mapping[str, Any],
         repair_reason: str | None = None,
+        repair_shape: CallShape | None = None,
     ) -> str | bytes | dict[str, Any]:
         system = (
             "Return only one JSON object that validates exactly against the "
@@ -241,7 +244,17 @@ class ModelGateway:
             "validation; every rule and limit is mandatory: "
             f"{self._plan_policy}"
         )
-        if repair_reason is not None:
+        if repair_reason is not None and repair_reason in TRUNCATION_CODES:
+            # PR-R: the previous completion ran out of output cap. The repair
+            # is escalated (cap doubled or effort lowered, `repair_shape`) and
+            # still carries ONLY the static code -- never the partial answer.
+            system += (
+                " The previous response was cut off by the output limit with "
+                f"static reason code {repair_reason}. Return one complete JSON "
+                "object satisfying the schema and every policy rule, as "
+                "concisely as the plan allows. This is the final attempt."
+            )
+        elif repair_reason is not None:
             # The repair prompt carries ONLY a static allowlisted reason
             # code — never the rejected plan or validation diagnostics.
             if repair_reason not in VALIDATION_REASONS:
@@ -252,12 +265,15 @@ class ModelGateway:
                 "one corrected JSON object satisfying the schema and every "
                 "policy rule. This is the final attempt."
             )
+        shape = repair_shape or initial_shape("commander", "planning")
         response = self.call(
             model=model,
             agent="commander",
             phase="planning",
             schema=commander_plan_json_schema(),
             schema_name="commander_plan",
+            max_tokens=shape.output_cap,
+            effort=shape.effort,
             messages=[
                 {"role": "system", "content": system},
                 {
@@ -269,16 +285,17 @@ class ModelGateway:
             ],
         )
         try:
-            content = response.choices[0].message.content
-        except (AttributeError, IndexError, TypeError):
-            if isinstance(response, (str, bytes, dict)):
-                content = response
-            else:
-                raise CommanderPlanFailure(
-                    "COMMANDER_COMPLETION_SHAPE_INVALID"
-                ) from None
-        if content is None or content == "":
-            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID")
+            content = classify_completion(response)
+        except ModelCompletionError as exc:
+            # Named for what happened (run 4761a8ce was reported as a shape
+            # failure). A truncation carries its ONE escalation, or None when
+            # neither the cap nor the effort can change.
+            raise CommanderPlanFailure(
+                exc.code,
+                escalation=(escalate(model, "commander", "planning", shape)
+                            if exc.code in TRUNCATION_CODES else None)) from None
+        except CompletionShapeInvalid:
+            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID") from None
         if not isinstance(content, (str, bytes, dict)):
             raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID")
         return content
@@ -317,6 +334,15 @@ class ModelGateway:
                 },
             ],
         )
-        if isinstance(response, (str, bytes, dict)):
-            return response
-        return response.choices[0].message.content
+        # Checked like every other role (it used to return `.content`
+        # unexamined). Replanning has no semantic repair: a truncated or empty
+        # decision fails with its static code.
+        try:
+            content = classify_completion(response)
+        except ModelCompletionError as exc:
+            raise CommanderPlanFailure(exc.code) from None
+        except CompletionShapeInvalid:
+            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID") from None
+        if not isinstance(content, (str, bytes, dict)):
+            raise CommanderPlanFailure("COMMANDER_COMPLETION_SHAPE_INVALID")
+        return content

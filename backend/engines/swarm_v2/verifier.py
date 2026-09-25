@@ -37,9 +37,11 @@ Verification is deterministic, bounded, grounded and resumable:
 * each completed batch is handed to the caller through one progress callback
   so durable progress belongs to the engine, not to this module.
 
-There is no verifier repair loop: the single bounded repair in this engine
-belongs to GenericWorker. A batch that violates the verdict or grounding
-contract fails closed.  Only validated VerificationVerdict objects leave this
+There is no verifier repair loop for CONTRACT violations: a batch that
+violates the verdict or grounding contract fails closed. The one exception
+(PR-R) is a batch whose completion was cut off by the output cap before any
+verdict could be read: it is re-asked ONCE with an escalated cap or a lower
+reasoning effort, from the same grounded material.  Only validated VerificationVerdict objects leave this
 module: fragment text, hashes and raw provider material never do.
 """
 from __future__ import annotations
@@ -51,6 +53,8 @@ from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 from pydantic import Field
 
 from .comparison import StructuredComparison, compare_structured
+from .completion import (COMPLETION_MESSAGES, TRUNCATION_CODES, CompletionShapeInvalid,
+                         ModelCompletionError, classify_completion, escalate, initial_shape)
 from .conflict_policy import (ConflictResolution, conflict_groups, is_authoritative,
                               resolve_conflicts)
 from .contracts import EvidenceReference, StrictContract, VerificationVerdict
@@ -88,6 +92,12 @@ MAX_VERIFIER_EVIDENCE_CHARS_PER_BATCH = 12_000
 # collapses into one of these: the offending payload, the decoder message and
 # the schema diagnostic are dropped at the boundary that classifies them.
 VERIFIER_REASONS = frozenset({
+    # PR-R completion classification (.completion): a batch whose completion
+    # had no usable answer. The two truncation codes are repaired ONCE by
+    # escalation before they can surface here.
+    "MODEL_REASONING_EXHAUSTED_OUTPUT",
+    "MODEL_OUTPUT_TRUNCATED",
+    "MODEL_EMPTY_COMPLETION",
     "VERIFIER_CANDIDATE_TOO_LARGE",
     "VERIFIER_EVIDENCE_DUPLICATE_CLAIM",
     "VERIFIER_RESPONSE_INVALID",
@@ -215,6 +225,7 @@ class VerifierContractError(ValueError):
     """
 
     MESSAGES = {
+        **COMPLETION_MESSAGES,
         "VERIFIER_CANDIDATE_TOO_LARGE": "one grounded candidate exceeds the verifier batch bounds",
         "VERIFIER_EVIDENCE_DUPLICATE_CLAIM": "evidence contains a duplicate claim identity",
         "VERIFIER_RESPONSE_INVALID": "verifier response does not satisfy the verdict contract",
@@ -847,8 +858,12 @@ class Verifier:
     retries a malformed completion.
     """
 
-    def __init__(self, *, gateway: ModelGateway, model: str, resolver: EvidenceResolver):
+    def __init__(self, *, gateway: ModelGateway, model: str, resolver: EvidenceResolver,
+                 retry_callback: Callable[[str, str, str], None] | None = None):
         self._gateway, self._model, self._resolver = gateway, model, resolver
+        # PR-R: the ONE escalated repair of a truncated batch is a semantic
+        # retry and consumes the run's retry allowance, like the Commander's.
+        self._retry_callback = retry_callback
 
     def prepare(self, evidence: Iterable[EvidenceReference], *,
                 conflict_claim_ids: set[str] | None = None,
@@ -903,18 +918,34 @@ class Verifier:
     def _verify_batch(self, batch: Sequence[GroundedCandidate]) -> list[VerificationVerdict]:
         """One real semantic model call through the shared guarded gateway."""
         ordered = sorted(batch, key=lambda item: item.claim_id)
-        response = self._gateway.call(
-            model=self._model, agent="verifier", phase="verification",
-            messages=[{"role": "system", "content": _SYSTEM_PROMPT},
-                      {"role": "user", "content": serialize_verifier_candidates(ordered)}],
-            schema=verifier_batch_json_schema(), schema_name="verifier_batch")
-        if isinstance(response, (dict, str, bytes, bytearray)):
-            content: Any = response
-        else:
+        messages = [{"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": serialize_verifier_candidates(ordered)}]
+        shape = initial_shape("verifier", "verification")
+        repaired = False
+        while True:
+            response = self._gateway.call(
+                model=self._model, agent="verifier", phase="verification",
+                messages=messages, schema=verifier_batch_json_schema(),
+                schema_name="verifier_batch",
+                max_tokens=shape.output_cap, effort=shape.effort)
             try:
-                content = response.choices[0].message.content
-            except (AttributeError, IndexError, TypeError):
+                content: Any = classify_completion(response)
+                break
+            except CompletionShapeInvalid:
                 raise VerifierContractError("VERIFIER_RESPONSE_INVALID") from None
+            except ModelCompletionError as exc:
+                # PR-R: a batch cut off by the output cap is repaired ONCE,
+                # by escalation (cap doubled or effort lowered), with the
+                # SAME grounded material -- never the partial answer. The
+                # repair is an ordinary guarded call: its worst-case
+                # reservation must pass before it is sent.
+                escalated = (escalate(self._model, "verifier", "verification", shape)
+                             if exc.code in TRUNCATION_CODES and not repaired else None)
+                if escalated is None:
+                    raise VerifierContractError(exc.code) from None
+                if self._retry_callback is not None:
+                    self._retry_callback("verifier", "verification", exc.code)
+                shape, repaired = escalated, True
         supporting = {item.claim_id: item.source.content_hashes for item in ordered}
         sources = {item.claim_id: item.source for item in ordered}
         by_source = fragment_reference_index(ordered)

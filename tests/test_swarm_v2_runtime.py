@@ -318,7 +318,7 @@ def test_provider_shaped_json_string_traverses_completion_decode_schema_and_limi
 
 
 @pytest.mark.parametrize("content", [None, ""])
-def test_empty_provider_content_has_stable_completion_shape_code(content):
+def test_empty_provider_content_has_stable_completion_code(content):
     class Completions:
         def create(self, **kwargs):
             return SimpleNamespace(choices=[SimpleNamespace(
@@ -331,7 +331,8 @@ def test_empty_provider_content_has_stable_completion_shape_code(content):
         _commander_for_gateway(gateway).plan(
             requested_model="kimi-k2.6", objective="offline", context={}
         )
-    assert failure.value.code == "COMMANDER_COMPLETION_SHAPE_INVALID"
+    # PR-R 4.6: `stop` with no answer is MODEL_EMPTY_COMPLETION, not repaired.
+    assert failure.value.code == "MODEL_EMPTY_COMPLETION"
 
 
 @pytest.mark.parametrize("content,code", [
