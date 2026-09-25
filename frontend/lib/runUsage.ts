@@ -33,6 +33,15 @@ export type RunUsage = {
   /** Backend-counted model-backed steps; NOT a count of UI agents. */
   agent_steps?: number | null;
   elapsed_seconds?: number | null;
+  /** PR-R reasoning-aware breakdown. Counts only; never reasoning text. */
+  cached_input_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  /** Sum of provider-REPORTED reasoning tokens. */
+  reasoning_tokens?: number | null;
+  /** Sum of ESTIMATED reasoning tokens for calls that did not report them. */
+  reasoning_tokens_estimated?: number | null;
+  reasoning_estimated_calls?: number | null;
+  answer_tokens?: number | null;
 };
 
 export type NormalizedRunUsage = {
@@ -47,6 +56,12 @@ export type NormalizedRunUsage = {
   providerBackpressureEvents?: number;
   agentSteps?: number;
   elapsedSeconds?: number;
+  cachedInputTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+  reasoningTokensEstimated?: number;
+  reasoningEstimatedCalls?: number;
+  answerTokens?: number;
 };
 
 export const EMPTY_RUN_USAGE: NormalizedRunUsage = { present: false };
@@ -74,6 +89,12 @@ export function normalizeRunUsage(usage?: RunUsage | null): NormalizedRunUsage {
     providerBackpressureEvents: finiteNumber(usage.provider_backpressure_events),
     agentSteps: finiteNumber(usage.agent_steps),
     elapsedSeconds: finiteNumber(usage.elapsed_seconds),
+    cachedInputTokens: finiteNumber(usage.cached_input_tokens),
+    cacheWriteTokens: finiteNumber(usage.cache_write_tokens),
+    reasoningTokens: finiteNumber(usage.reasoning_tokens),
+    reasoningTokensEstimated: finiteNumber(usage.reasoning_tokens_estimated),
+    reasoningEstimatedCalls: finiteNumber(usage.reasoning_estimated_calls),
+    answerTokens: finiteNumber(usage.answer_tokens),
   };
   return normalized;
 }

@@ -888,7 +888,7 @@ this change does not perform it.
    python3 - "$HOME/Downloads/<exported file>.json" "$RELEASE_SHA" << 'PY'
    import json, sys
    doc = json.load(open(sys.argv[1]))
-   assert doc["schema_version"] == "milo-run-export/1", doc["schema_version"]
+   assert doc["schema_version"] == "milo-run-export/2", doc["schema_version"]
    assert doc["engine"] == "swarm_v2" and doc["run_identity"]["workflow_key"] == "swarm_v2"
    assert doc["run_identity"]["release_sha"] == sys.argv[2], "not the release"
    assert doc["terminal_status"] in {"completed", "partial_success", "failed", "cancelled",

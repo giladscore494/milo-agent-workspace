@@ -61,7 +61,10 @@ from typing import Any, Mapping
 from backend.run_identity import (PRODUCT_WORKFLOW_KEYS, RunIdentity,
                                   RunIdentityError, require_identity)
 
-SCHEMA_VERSION = "milo-run-export/1"
+#: /2 (PR-R): `usage` carries the widened public usage contract -- the
+#: reasoning-aware token breakdown (cached, cache-write, reasoning reported and
+#: estimated, answer) beside the historical aggregate. Counts only.
+SCHEMA_VERSION = "milo-run-export/2"
 
 #: Terminal run states that carry a product result worth exporting.
 USEFUL_TERMINAL_STATES = frozenset({"completed", "partial_success"})

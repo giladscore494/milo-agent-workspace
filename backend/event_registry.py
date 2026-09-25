@@ -189,6 +189,10 @@ OPERATIONAL_EVENT_TYPES = frozenset({
     "provider_lease_ownership_lost",
     # backend/budget.py -- a model call admitted without a usable output cap.
     "model_output_cap_missing",
+    # backend/budget.py -- PR-R usage diagnostic, once per run, static code
+    # only (USAGE_REASONING_FIELD_ABSENT): the provider's usage block did not
+    # report reasoning tokens, so the reasoning share is estimated.
+    "model_usage_diagnostic",
     # supabase/migrations/20260924000200 -- `adopt_catalog_snapshot_guarded`
     # records, on the adopting operator capture run and in the same
     # transaction as the adoption row, that it took over an orphaned pending

@@ -370,6 +370,23 @@ describe('11. missing and partial usage', () => {
     expect(usageValue(container, 'Actual cost')).toBe('Not reported');
   });
 
+  it('labels reported and estimated reasoning tokens separately (PR-R)', () => {
+    const { container } = renderCard(
+      viewModel({
+        events: smokeEventStream(),
+        usage: { ...SMOKE_USAGE, reasoning_tokens: 3_000, reasoning_tokens_estimated: 1_200,
+                 reasoning_estimated_calls: 2, cached_input_tokens: 4_096 },
+      }),
+    );
+    expect(usageValue(container, 'Reasoning tokens')).toBe('3,000');
+    expect(usageValue(container, 'Reasoning tokens (estimated)')).toBe('1,200');
+    expect(usageValue(container, 'Cached input tokens')).toBe('4,096');
+    // A pre-PR-R record carries none of them and shows none of them.
+    const legacy = renderCard(viewModel({ events: smokeEventStream(), usage: { model_calls: 7 } }));
+    expect(usageValue(legacy.container, 'Reasoning tokens')).toBeUndefined();
+    expect(usageValue(legacy.container, 'Reasoning tokens (estimated)')).toBeUndefined();
+  });
+
   it('formats the accepted smoke aggregate deterministically', () => {
     const { container } = renderCard(
       viewModel({ events: smokeEventStream(), status: 'completed', usage: SMOKE_USAGE }),

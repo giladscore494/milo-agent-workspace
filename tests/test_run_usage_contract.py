@@ -36,6 +36,15 @@ SMOKE_USAGE = {
     "provider_backpressure_events": 0,
     "agent_steps": 7,
     "elapsed_seconds": 41.5,
+    # PR-R reasoning-aware breakdown, as a post-PR-R tracker records it. This
+    # part is NOT historical: the smoke predates it. kimi-k2.6 usage reported
+    # no reasoning field, so every call's reasoning share is an estimate.
+    "cached_input_tokens": 0,
+    "cache_write_tokens": 0,
+    "reasoning_tokens": 0,
+    "reasoning_tokens_estimated": 1_200,
+    "reasoning_estimated_calls": 7,
+    "answer_tokens": 2_050,
 }
 
 PUBLIC_USAGE_FIELDS = {
@@ -49,6 +58,13 @@ PUBLIC_USAGE_FIELDS = {
     "provider_backpressure_events",
     "agent_steps",
     "elapsed_seconds",
+    # PR-R reasoning-aware breakdown.
+    "cached_input_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "reasoning_tokens_estimated",
+    "reasoning_estimated_calls",
+    "answer_tokens",
 }
 
 

@@ -8,7 +8,7 @@
  * rendered by this module.
  */
 
-export const EXPORT_SCHEMA_VERSION = 'milo-run-export/1';
+export const EXPORT_SCHEMA_VERSION = 'milo-run-export/2';
 
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
   'completed', 'partial_success', 'failed', 'cancelled', 'timed_out', 'budget_exhausted',

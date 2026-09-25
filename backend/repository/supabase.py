@@ -561,6 +561,10 @@ class SupabaseRepository:
         "run_id", "project_id", "user_id", "provider", "model", "call_seq", "decision",
         "rejection_reason", "reserved_input_tokens", "reserved_output_tokens",
         "actual_input_tokens", "actual_output_tokens", "estimated_cost", "actual_cost",
+        # PR-R reasoning-aware per-call breakdown (migration 20260925000100).
+        # An absent value is dropped below and lands as NULL: "not reported".
+        "cached_input_tokens", "cache_write_tokens", "reasoning_tokens",
+        "reasoning_tokens_estimated", "reasoning_estimated", "answer_tokens",
     )
 
     def append_usage_ledger(self, entry: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:

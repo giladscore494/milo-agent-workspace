@@ -33,6 +33,7 @@
     "launch_failed",
     "launch_requested",
     "model_output_cap_missing",
+    "model_usage_diagnostic",
     "phase_completed",
     "phase_started",
     "provider_backpressure_wait",
@@ -69,7 +70,7 @@
     "verification_completed",
     "worker_output_repair_started"
   ],
-  "fingerprint": "501a1b106fa360bbc12480a59b64e88b641d62b9343ac61f189183bd908f2c36",
+  "fingerprint": "c96c49ed53e1166a9298b94d223cbbb38b1987a9e194806fd702667917f18971",
   "groups": {
     "capture_progress": [
       "catalog_candidates_skipped",
@@ -87,6 +88,7 @@
     "operational": [
       "catalog_snapshot_adopted",
       "model_output_cap_missing",
+      "model_usage_diagnostic",
       "provider_backpressure_wait",
       "provider_lease_operator_reclaimed",
       "provider_lease_ownership_lost",

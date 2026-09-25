@@ -33,6 +33,7 @@ from backend.execution_usage import (LEDGER_AMOUNTS, LEDGER_COUNTERS, LEDGER_SCH
                                      merge_usage_snapshots, public_usage_projection,
                                      validate_usage_snapshot)
 from backend.model_profiles import MODEL_PROFILE_UNKNOWN, UnknownModelProfile, get_profile
+from backend.model_usage import USAGE_REASONING_FIELD_ABSENT, UsageBreakdown, read_usage
 from backend.provider_authority import (ProviderOutcome, ProviderVerdict,
                                         classify_outcome)
 from backend.runtime import CancellationRequested
@@ -318,6 +319,13 @@ class BudgetTracker:
     search_cost: float = 0.0
     replans: int = 0
     correction_rounds: int = 0
+    # --- PR-R reasoning-aware usage (backend.model_usage) -------------------
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
+    reasoning_tokens_estimated: int = 0
+    reasoning_estimated_calls: int = 0
+    answer_tokens: int = 0
     #: The durable record's write sequence number, as last reported by the
     #: recorder. 0 until the first accepted durable write.
     ledger_version: int = 0
@@ -391,6 +399,12 @@ class BudgetTracker:
             "search_cost": round(self.search_cost, 6),
             "replans": self.replans,
             "correction_rounds": self.correction_rounds,
+            "cached_input_tokens": self.cached_input_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "reasoning_tokens_estimated": self.reasoning_tokens_estimated,
+            "reasoning_estimated_calls": self.reasoning_estimated_calls,
+            "answer_tokens": self.answer_tokens,
             "elapsed_seconds": round(self.clock() - self._started_at, 3),
         }
 
@@ -599,13 +613,19 @@ class BudgetTracker:
             self._record()
             return next_call_seq, allowed_output
 
-    def settle_call(self, reserved_input_tokens: int = 0, reserved_output_tokens: int | None = None, input_tokens: int = 0, output_tokens: int = 0, cost: float | None = None, status: str = "settled", rejection_reason: str | None = None, call_seq: int | None = None) -> None:
+    def settle_call(self, reserved_input_tokens: int = 0, reserved_output_tokens: int | None = None, input_tokens: int = 0, output_tokens: int = 0, cost: float | None = None, status: str = "settled", rejection_reason: str | None = None, call_seq: int | None = None, usage: "UsageBreakdown | None" = None, model: str = "") -> None:
         """Release the reservation and record actual usage after a call.
 
         ``call_seq`` identifies WHICH reservation settles. Concurrent calls
         must pass the sequence returned by ``open_call``; the fallback to the
         current model-call counter is only correct for strictly sequential
-        callers (the legacy before_call/after_call path)."""
+        callers (the legacy before_call/after_call path).
+
+        ``usage`` is the reasoning-aware breakdown of a SETTLED response
+        (``backend.model_usage.read_usage``). Counts only: nothing in it was
+        read from ``reasoning_content``. Its absent fields stay absent on the
+        per-call ledger row and add nothing to the run's sums."""
+        diagnostic = None
         with self._lock:
             settled_seq = call_seq if call_seq is not None else self.model_calls
             reservation = self._reservations.pop(settled_seq, None)
@@ -635,6 +655,20 @@ class BudgetTracker:
             self.output_tokens += max(0, int(output_tokens or 0))
             if cost is not None and cost > 0:
                 self.actual_cost += actual_cost
+            if usage is not None:
+                self.cached_input_tokens += usage.cached_input_tokens or 0
+                self.cache_write_tokens += usage.cache_write_tokens or 0
+                self.reasoning_tokens += usage.reasoning_tokens or 0
+                self.answer_tokens += usage.answer_tokens or 0
+                if usage.reasoning_estimated:
+                    # ONCE per run, not per process: the counter is cumulative
+                    # and restored on resume, so a replacement worker does not
+                    # announce what the run already reported.
+                    if self.reasoning_estimated_calls == 0:
+                        diagnostic = {"code": USAGE_REASONING_FIELD_ABSENT,
+                                      "model": str(model or "")[:64]}
+                    self.reasoning_estimated_calls += 1
+                    self.reasoning_tokens_estimated += usage.reasoning_tokens_estimated or 0
             if status != "settled":
                 # A released or rejected settlement is an attempt that bought
                 # no response; it stays counted, it is never refunded.
@@ -650,8 +684,15 @@ class BudgetTracker:
                 actual_input_tokens=int(input_tokens or 0),
                 actual_output_tokens=int(output_tokens or 0),
                 actual_cost=actual_cost if cost else None,
+                **(usage.ledger_fields() if usage is not None else {}),
+                **({"model": str(model)[:64]} if model else {}),
             )
             self._record()
+            if diagnostic is not None:
+                self._emit("model_usage_diagnostic", {
+                    "message": "provider usage did not report reasoning tokens; "
+                               "the reasoning share is estimated",
+                    "payload": diagnostic})
             if cfg.max_input_tokens_per_run is not None and self.input_tokens > cfg.max_input_tokens_per_run:
                 self._ledger("overage", call_seq=settled_seq, rejection_reason="INPUT_TOKEN_LIMIT_EXCEEDED")
                 raise self._stop("INPUT_TOKEN_LIMIT_EXCEEDED", "actual input token limit exceeded", "token_limit_reached", "budget_exhausted")
@@ -985,11 +1026,21 @@ class _GuardedCompletions:
             raise
         usage = getattr(response, "usage", None)
         provider_cost = getattr(usage, "cost", None) or getattr(usage, "total_cost", None) or getattr(response, "cost", None)
-        input_tokens = getattr(usage, "prompt_tokens", 0) or 0
-        output_tokens = getattr(usage, "completion_tokens", 0) or 0
+        # Counts only. `read_usage` reads the usage block and message.content;
+        # reasoning_content is never read, stored or re-sent.
+        breakdown = read_usage(response)
+        input_tokens = breakdown.input_tokens
+        output_tokens = breakdown.output_tokens
         if provider_cost is None:
-            provider_cost = profile.usage_cost(input_tokens=input_tokens,
-                                               output_tokens=output_tokens)
+            # A provider-reported cost wins; otherwise the profile prices the
+            # breakdown: cached input at the hit price, cache writes at the
+            # applicable tier, the rest at the miss price, and ALL output --
+            # reasoning included -- at the output price.
+            provider_cost = profile.usage_cost(
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                cached_input_tokens=breakdown.cached_input_tokens,
+                cache_write_tokens=breakdown.cache_write_tokens,
+                cache_write_ttl=breakdown.cache_write_ttl)
         # Likewise AFTER a response was read to completion: a budget refusal
         # raised here is about accounting, not about a request whose fate is
         # unknown, so it must not hold the permit either.
@@ -1001,6 +1052,8 @@ class _GuardedCompletions:
                 output_tokens=output_tokens,
                 cost=float(provider_cost or 0),
                 call_seq=call_seq,
+                usage=breakdown,
+                model=kwargs.get("model", ""),
             )
         except BaseException as exc:
             exc.provider_request_completed = True

@@ -42,7 +42,8 @@ describe('parseExportEnvelope', () => {
   });
 
   it('refuses an unknown schema, a disagreeing identity and a non-terminal status', () => {
-    expect(parseExportEnvelope({ ...ENVELOPE, schema_version: 'milo-run-export/2' })).toBeUndefined();
+    expect(parseExportEnvelope({ ...ENVELOPE, schema_version: 'milo-run-export/1' })).toBeUndefined();
+    expect(parseExportEnvelope({ ...ENVELOPE, schema_version: 'milo-run-export/3' })).toBeUndefined();
     expect(parseExportEnvelope({ ...ENVELOPE, run_identity: { ...ENVELOPE.run_identity, run_id: 'other' } })).toBeUndefined();
     expect(parseExportEnvelope({ ...ENVELOPE, run_identity: { ...ENVELOPE.run_identity, workflow_key: 'swarm_v2' } })).toBeUndefined();
     expect(parseExportEnvelope({ ...ENVELOPE, terminal_status: 'running' })).toBeUndefined();
