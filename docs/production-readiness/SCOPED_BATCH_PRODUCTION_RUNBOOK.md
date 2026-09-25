@@ -137,11 +137,13 @@ From a shell with `gh` authenticated:
 ```bash
 PR_HEAD_SHA="$(git rev-parse --verify --quiet "$RELEASE_SHA^2^{commit}")" \
   || { echo "NOT A MERGE COMMIT: stop"; PR_HEAD_SHA=""; }      # the merged PR's latest commit
-gh run list --workflow ci --commit "$PR_HEAD_SHA" --repo giladscore494/milo-agent-workspace
-gh run list --workflow "Repo Scan" --commit "$PR_HEAD_SHA" --repo giladscore494/milo-agent-workspace
-test "$(git rev-parse "$RELEASE_SHA^{tree}")" = "$(git rev-parse "$PR_HEAD_SHA^{tree}")" \
-  && echo "tree equal: $RELEASE_SHA == $PR_HEAD_SHA" \
-  || echo "TREE DIFFERS: stop"
+if [ -n "$PR_HEAD_SHA" ]; then
+  gh run list --workflow ci --commit "$PR_HEAD_SHA" --repo giladscore494/milo-agent-workspace
+  gh run list --workflow "Repo Scan" --commit "$PR_HEAD_SHA" --repo giladscore494/milo-agent-workspace
+  test "$(git rev-parse "$RELEASE_SHA^{tree}")" = "$(git rev-parse "$PR_HEAD_SHA^{tree}")" \
+    && echo "tree equal: $RELEASE_SHA == $PR_HEAD_SHA" \
+    || echo "TREE DIFFERS: stop"
+fi
 ```
 
 The trees are equal when the PR branch was up to date with `main` when it was
