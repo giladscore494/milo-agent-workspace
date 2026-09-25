@@ -42,8 +42,8 @@ from backend.engines.swarm_v2 import (
     ToolCallRecord,
     Verifier,
 )
-from backend.tools import (MockSearchTool, MockVehicleCatalogTool, ToolContext, ToolError,
-                           ToolMode, ToolOperation, ToolRegistry)
+from backend.tools import ToolContext, ToolError, ToolMode, ToolOperation, ToolRegistry
+from backend.tools.mock import MockSearchTool, MockVehicleCatalogTool
 
 from test_swarm_v2 import call, plan, task
 from test_swarm_v2_stage1_e2e import (Plans, StubResolver, VerifyGateway, Worker,

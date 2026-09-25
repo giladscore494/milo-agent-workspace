@@ -7,7 +7,7 @@ import pytest
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, build_guarded_client_factory
 from backend.gateway_auth import verify_gateway_token
 from backend.errors import AppError
-from backend.model_pricing import calculate_model_cost
+from backend.model_profiles import get_profile
 from backend.testing.memory_repository import MemoryRepository
 from backend.worker.main import execute_run
 from backend.run_identity import RunIdentity
@@ -108,7 +108,7 @@ def test_actual_cost_calculated_and_settled(monkeypatch):
                     return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=100, completion_tokens=50))
     client = build_guarded_client_factory(tracker, lambda *_: Inner())("k", "u")
     client.chat.completions.create(model="kimi-k2.6", messages=[{"content":"hello"}], max_tokens=100)
-    assert tracker.actual_cost == calculate_model_cost("kimi-k2.6", 100, 50)
+    assert tracker.actual_cost == float(get_profile("kimi-k2.6").usage_cost(input_tokens=100, output_tokens=50))
 
 
 @pytest.mark.parametrize("field,limit", [("max_output_tokens_per_run", 1), ("max_total_tokens_per_run", 2), ("max_cost_per_run", 0.000001)])

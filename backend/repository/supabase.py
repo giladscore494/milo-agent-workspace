@@ -165,7 +165,6 @@ class Repository(Protocol):
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
-    def list_unread_agent_messages(self, run_id: UUID, recipient: str = "supervisor") -> list[dict[str, Any]]: ...
     def create_supervisor_decision(self, run_id: UUID, decision: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def list_supervisor_decisions(self, run_id: UUID) -> list[dict[str, Any]]: ...
 
@@ -1155,9 +1154,6 @@ class SupabaseRepository:
                 "p_message": payload,
             }, "agent_message")
         return self._single(self.client.table("agent_messages").insert(payload).select("*"), "agent_message", "new")
-
-    def list_unread_agent_messages(self, run_id: UUID, recipient: str = "supervisor") -> list[dict[str, Any]]:
-        return self._many(self.client.table("agent_messages").select("*").eq("run_id", str(run_id)).eq("recipient", recipient).is_("read_at", "null").order("created_at"))
 
     def create_supervisor_decision(self, run_id: UUID, decision: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]:
         if worker_id is not None:

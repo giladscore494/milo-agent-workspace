@@ -35,7 +35,8 @@ from backend.engines.swarm_v2 import (
 )
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
-from backend.tools import MockCatalogTool, MockSearchTool, ToolContext, ToolError, ToolRegistry
+from backend.tools import ToolContext, ToolError, ToolRegistry
+from backend.tools.mock import MockCatalogTool, MockSearchTool
 
 from test_swarm_v2_smoke_offline import (
     ScriptedCompletions,

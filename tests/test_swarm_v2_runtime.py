@@ -28,8 +28,8 @@ from backend.engines.swarm_v2.contracts import (
 from backend.engines.swarm_v2.validation import PlanLimits
 from backend.provider_scheduler import ProviderLimitsConfig, ProviderScheduler
 from backend.runtime import CancellationRequested
-from backend.tools import (MockSearchTool, ToolContext, ToolError, ToolMode,
-                           ToolOperation, ToolRegistry)
+from backend.tools import ToolContext, ToolError, ToolMode, ToolOperation, ToolRegistry
+from backend.tools.mock import MockSearchTool
 
 from test_swarm_v2 import call, task, tool_descriptors
 

@@ -325,21 +325,6 @@ class RunCancelResponse(BaseModel):
     status: str
 
 
-class RunCheckpoint(BaseModel):
-    id: UUID
-    run_id: UUID
-    engine_version: str
-    workflow_key: str
-    phase: str
-    completed_tasks: list[str] = Field(default_factory=list)
-    artifacts: dict[str, Any] = Field(default_factory=dict)
-    failures: list[dict[str, Any]] = Field(default_factory=list)
-    token_usage: dict[str, int] = Field(default_factory=dict)
-    last_event: dict[str, Any] | None = None
-    attempt: int = 1
-    created_at: datetime | None = None
-
-
 class ProposalCreate(BaseModel):
     project_id: UUID
     user_request: str = Field(min_length=1)

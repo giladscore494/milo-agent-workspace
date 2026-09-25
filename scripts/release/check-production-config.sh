@@ -60,6 +60,7 @@ INVENTORY=(
   "GCP_WORKLOAD_IDENTITY_POOL_PROVIDER_ID|vercel-server-only|no|frontend/lib/server/cloudRunAuth.ts"
   "GCP_SERVICE_ACCOUNT_EMAIL|vercel-server-only|no|frontend/lib/server/cloudRunAuth.ts"
   "GATEWAY_ALLOW_EXECUTION_ROUTES|vercel-server-only|no|frontend/lib/server/gatewayPolicy.ts"
+  "GATEWAY_ALLOW_RUN_START_ROUTES|vercel-server-only|no|frontend/lib/server/gatewayPolicy.ts"
   # Gateway rate-limit variables are constructed as <PREFIX>_REQUESTS and
   # <PREFIX>_WINDOW_MS from these prefixes (frontend/lib/server/rateLimit.ts).
   "GATEWAY_RATE_LIMIT_UNAUTH|vercel-server-only|no|frontend/lib/server/rateLimit.ts"
@@ -72,6 +73,7 @@ INVENTORY=(
   "SUPABASE_SERVICE_ROLE_KEY|shared-api-worker|yes|backend/config.py"
   "SUPABASE_SECRET_KEY|shared-api-worker|yes|backend/config.py"
   "ENVIRONMENT|shared-api-worker|no|backend/production_config.py"
+  "MILO_RELEASE_SHA|shared-api-worker|no|backend/run_identity.py"
   "ALLOWED_CORS_ORIGINS|cloud-run-api-only|no|backend/config.py"
   "JOB_LAUNCHER|cloud-run-api-only|no|backend/config.py"
   "GCP_PROJECT_ID|cloud-run-api-only|no|backend/config.py"
@@ -129,9 +131,9 @@ INVENTORY=(
   "MILO_PROVIDER_BACKOFF_MAX_SECONDS|cloud-run-worker-only|no|backend/provider_scheduler.py"
   "MILO_V1_TECHNICAL_PARALLELISM|cloud-run-worker-only|no|backend/engines/vehicle_catalog_v1/core.py"
   "MILO_SWARM_MAX_ACTIVE_WORKERS|cloud-run-worker-only|no|backend/engines/swarm_v2/executor.py"
-  "MILO_SWARM_WORKER_MODEL|cloud-run-worker-only|no|backend/worker/main.py"
-  "MILO_COMMANDER_MODEL|cloud-run-worker-only|no|backend/worker/main.py"
-  "MILO_COMMANDER_MODEL_ALLOWLIST|cloud-run-worker-only|no|backend/worker/main.py"
+  "MILO_SWARM_WORKER_MODEL|cloud-run-worker-only|no|backend/model_profiles.py"
+  "MILO_COMMANDER_MODEL|cloud-run-worker-only|no|backend/model_profiles.py"
+  "MILO_COMMANDER_MODEL_ALLOWLIST|cloud-run-worker-only|no|backend/model_profiles.py"
   # The two catalog CAPABILITY flags under the master switch.
   "MILO_ENABLE_GOVERNMENT_CATALOG_READ|cloud-run-worker-only|no|backend/catalog/execution.py"
   "MILO_ENABLE_CATALOG_PROMOTION|cloud-run-worker-only|no|backend/catalog/execution.py"

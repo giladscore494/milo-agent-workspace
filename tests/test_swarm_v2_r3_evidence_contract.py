@@ -50,8 +50,8 @@ from backend.engines.swarm_v2.verifier import serialize_verifier_candidates
 from backend.schemas import ClaimCreate, SourceCreate
 from backend.testing.evidence_mappers import (StructuredRegistryEvidenceMapper,
                                               offline_evidence_mappers)
-from backend.tools import (MockDocumentArchiveTool, MockStructuredRegistryTool, ToolContext,
-                           ToolRegistry)
+from backend.tools import ToolContext, ToolRegistry
+from backend.tools.mock import MockDocumentArchiveTool, MockStructuredRegistryTool
 from tests.worker_fence import FENCE
 
 # --- deterministic offline fixture data --------------------------------------
