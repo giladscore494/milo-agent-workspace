@@ -66,11 +66,13 @@ activation opened: on the API `MILO_ENABLE_WORK_SCOPE_MUTATIONS`,
 and `MILO_ENABLE_CATALOG_EXECUTION`; on the Government capture job, if it
 exists, `MILO_ENABLE_CATALOG_EXECUTION`; in Vercel
 `GATEWAY_ALLOW_EXECUTION_ROUTES` and `NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI`,
-then redeploy. Re-assert the flags the contract pins off
-(`MILO_ENABLE_CATALOG_PROMOTION`, `MILO_ENABLE_WORK_SCOPE_PREPARATION`, and on
-the worker `MILO_ENABLE_WORK_SCOPE_MUTATIONS` / `_BATCHES`) as `false` too. Do this only **after** in-flight runs are cancelled: closing
-`MILO_ENABLE_RUN_CANCELLATION` or `GATEWAY_ALLOW_EXECUTION_ROUTES` also closes
-run and batch cancellation, including from the website. Then verify
+then redeploy. Re-assert every flag the contract pins off as `false` on both
+surfaces too (`MILO_ENABLE_CATALOG_PROMOTION`,
+`MILO_ENABLE_WORK_SCOPE_PREPARATION`, the dormant `MILO_ENABLE_PROPOSAL_*`, and
+the rest of the Stage A list). Do this only **after** in-flight runs are
+cancelled: closing `MILO_ENABLE_RUN_CANCELLATION` or
+`GATEWAY_ALLOW_EXECUTION_ROUTES` also closes run and batch cancellation,
+including from the website. Then verify
 `MILO_APPROVED_WORKER_IDENTITIES` still names only the worker identity.
 
 ### The script: `scripts/deploy/kill-switch.sh`
@@ -78,10 +80,20 @@ run and batch cancellation, including from the website. Then verify
 `scripts/deploy/kill-switch.sh` is this order as commands: steps 1–5 above in
 this order, then the "after the order" flags as step 6. The flag lists come
 from `scripts/deploy/deployment-contract.sh` (the enable arrays
-`scripts/deploy/website-execution-activate.sh` opens, the pinned-off arrays
-and the capture master flag), so every flag the activation opens is one the
-switch closes (`tests/test_deploy_kill_switch.py` pins that). The capture job
-is closed only when `CLOUD_RUN_CAPTURE_JOB` is configured and the job exists.
+`scripts/deploy/website-execution-activate.sh` opens, the pinned-off arrays,
+the Stage A flag list and the capture master flag), so every flag the
+activation opens is one the switch closes (`tests/test_deploy_kill_switch.py`
+pins that). The capture job is closed only when `CLOUD_RUN_CAPTURE_JOB` is
+configured and the job exists.
+
+Every `vercel` command runs in the directory linked to the Vercel project,
+`frontend/` by default (`--vercel-cwd` to change it, `--vercel-scope` for a
+team), the same convention as `scripts/release/check-vercel-config.sh`.
+`--apply` refuses before changing anything unless that directory holds
+`.vercel/project.json` and `vercel whoami` succeeds, and unless the gcloud
+account is logged in to the configured project. `vercel env rm` removes the
+whole variable record, so a value shared with the preview or development
+targets is removed there too (always in the closing direction).
 
 ```bash
 # Default: dry run — prints every command, calls neither gcloud nor vercel.
@@ -97,9 +109,14 @@ MILO_OPERATOR_ACK=I_UNDERSTAND_THIS_CHANGES_PRODUCTION \
 
 A failed step is reported and the later steps still run (every step only
 closes something). It then reads the API service and the worker job back and
-exits non-zero unless every flag is closed, `JOB_LAUNCHER=disabled` and
-neither provider key is bound (and the capture job, when it was closed, reads
-back closed). Vercel values cannot be read back by the CLI:
+exits non-zero unless every flag it closed reads back closed,
+`JOB_LAUNCHER=disabled` and neither provider key is bound (those two are steps
+3 and 5, so
+`--remaining-only` does not check them), the API's traffic is 100% on the
+latest revision (a service pinned to an older revision is not serving the
+closed configuration: route it with `gcloud run services update-traffic
+--to-latest`), and the capture job, when it was closed, reads back closed.
+Vercel values cannot be read back by the CLI:
 confirm with `scripts/deploy/website-execution-check.sh`. It never enables
 anything, never cancels an execution and never deletes anything.
 

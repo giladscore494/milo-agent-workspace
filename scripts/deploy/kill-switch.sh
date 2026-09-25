@@ -25,7 +25,11 @@
 # neither gcloud nor vercel. --apply additionally requires
 # MILO_OPERATOR_ACK=I_UNDERSTAND_THIS_CHANGES_PRODUCTION and the URL of the
 # current production Vercel deployment (--vercel-deployment), because step 1 is
-# not in force until that deployment is redeployed.
+# not in force until that deployment is redeployed. Every vercel command runs in
+# the directory linked to the Vercel project (--vercel-cwd, default frontend/,
+# as scripts/release/check-vercel-config.sh); --apply refuses before any change
+# unless that directory is linked (.vercel/project.json) and `vercel whoami`
+# succeeds.
 #
 # In apply mode every step runs in order; a step that fails is reported and
 # the later steps still run (each one independently reduces exposure), then
@@ -49,6 +53,8 @@ ACK_VALUE="I_UNDERSTAND_THIS_CHANGES_PRODUCTION"
 MODE="dry-run"
 SCOPE="all"
 VERCEL_DEPLOYMENT=""
+VERCEL_CWD=""
+VERCEL_SCOPE=""
 MILO_OPERATOR_CONFIG_PATH=""
 
 usage() {
@@ -65,6 +71,9 @@ Options:
                              and --vercel-deployment.
   --vercel-deployment URL    The current production Vercel deployment, redeployed
                              after each Vercel change (step 1 and step 6).
+  --vercel-cwd PATH          Directory linked to the Vercel project (default
+                             frontend/). Must contain .vercel/project.json.
+  --vercel-scope TEAM        Vercel team scope, passed to every vercel command.
   --order-only               Steps 1-5 only (keeps run cancellation open so runs
                              still executing can be cancelled).
   --remaining-only           Step 6 only (after --order-only and the cancellations).
@@ -81,8 +90,16 @@ while [[ $# -gt 0 ]]; do
     --dry-run) MODE="dry-run"; shift ;;
     --apply) MODE="apply"; shift ;;
     --vercel-deployment) VERCEL_DEPLOYMENT="${2:?--vercel-deployment needs a URL}"; shift 2 ;;
-    --order-only) SCOPE="order"; shift ;;
-    --remaining-only) SCOPE="remaining"; shift ;;
+    --vercel-cwd) VERCEL_CWD="${2:?--vercel-cwd needs a path}"; shift 2 ;;
+    --vercel-scope) VERCEL_SCOPE="${2:?--vercel-scope needs a team}"; shift 2 ;;
+    --order-only | --remaining-only)
+      wanted="order"
+      [[ "$1" == "--remaining-only" ]] && wanted="remaining"
+      if [[ "$SCOPE" != "all" && "$SCOPE" != "$wanted" ]]; then
+        printf 'FAIL: --order-only and --remaining-only are exclusive.\n' >&2
+        exit 2
+      fi
+      SCOPE="$wanted"; shift ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?--operator-config needs a path}"; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     *) printf 'FAIL: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -112,9 +129,21 @@ if [[ "$MODE" == "apply" ]]; then
   fi
   milo_require_gcloud_context "$PROJECT_ID" || exit 2
   if ! command -v vercel > /dev/null 2>&1; then
-    printf 'FAIL: the Vercel CLI is not on PATH (run from a checkout linked to the project).\n' >&2
+    printf 'FAIL: the Vercel CLI is not on PATH.\n' >&2
     exit 2
   fi
+  if [[ ! -f "${VERCEL_CWD:-${REPO_ROOT}/frontend}/.vercel/project.json" ]]; then
+    printf 'FAIL: %s is not linked to a Vercel project (.vercel/project.json missing).\n' "${VERCEL_CWD:-${REPO_ROOT}/frontend}" >&2
+    printf "      Run 'vercel link' in that directory, or pass --vercel-cwd. Nothing was changed.\n" >&2
+    exit 2
+  fi
+fi
+[[ -z "$VERCEL_CWD" ]] && VERCEL_CWD="${REPO_ROOT}/frontend"
+VERCEL_ARGS=()
+[[ -n "$VERCEL_SCOPE" ]] && VERCEL_ARGS=(--scope "$VERCEL_SCOPE")
+if [[ "$MODE" == "apply" ]] && ! (cd "$VERCEL_CWD" && vercel whoami "${VERCEL_ARGS[@]+"${VERCEL_ARGS[@]}"}") > /dev/null 2>&1; then
+  printf "FAIL: 'vercel whoami' failed in %s: log in (vercel login) first. Nothing was changed.\n" "$VERCEL_CWD" >&2
+  exit 2
 fi
 
 DELIM="$MILO_ENV_VAR_DELIMITER"
@@ -148,11 +177,15 @@ unique_minus() {
   printf '%s\n' "${seen[@]+"${seen[@]}"}"
 }
 
+# The enable arrays first, then the pinned-off arrays, then every flag Stage A
+# pins off (MILO_STAGE_A_FLAG_NAMES, which also carries the dormant proposal
+# flags), so a flag drifted open by any path is closed too.
 mapfile -t REMAINING_API_FLAGS < <(unique_minus "${ORDER_API_FLAGS[@]}" -- \
   "${MILO_PLAN_AUTHORING_API_ENABLE_FLAGS[@]}" "${MILO_STAGE2_API_ENABLE_FLAGS[@]}" \
-  "${MILO_STAGE2_API_PINNED_OFF_FLAGS[@]}")
+  "${MILO_STAGE2_API_PINNED_OFF_FLAGS[@]}" "${MILO_STAGE_A_FLAG_NAMES[@]}")
 mapfile -t REMAINING_WORKER_FLAGS < <(unique_minus "${ORDER_WORKER_FLAGS[@]}" -- \
-  "${MILO_STAGE2_WORKER_ENABLE_FLAGS[@]}" "${MILO_STAGE2_WORKER_PINNED_OFF_FLAGS[@]}")
+  "${MILO_STAGE2_WORKER_ENABLE_FLAGS[@]}" "${MILO_STAGE2_WORKER_PINNED_OFF_FLAGS[@]}" \
+  "${MILO_STAGE_A_FLAG_NAMES[@]}")
 CAPTURE_FLAG="$MILO_CAPTURE_MASTER_FLAG_NAME"
 REMAINING_VERCEL_FLAGS=("$MILO_STAGE2_VERCEL_RUNTIME_FLAG" "$MILO_STAGE2_VERCEL_BUILD_FLAG")
 
@@ -183,14 +216,33 @@ run() {
   fi
 }
 
+# Every vercel command runs in the linked project directory, with the scope.
+vercel_in_cwd() {
+  (cd "$VERCEL_CWD" && vercel "$@" "${VERCEL_ARGS[@]+"${VERCEL_ARGS[@]}"}")
+}
+
+run_vercel() {
+  # run_vercel STEP ARGS... — like run, for a vercel command.
+  local step="$1"
+  shift
+  show vercel "$@" "${VERCEL_ARGS[@]+"${VERCEL_ARGS[@]}"}"
+  [[ "$MODE" == "apply" ]] || return 0
+  if ! vercel_in_cwd "$@"; then
+    printf 'STEP %s FAILED: vercel %s\n' "$step" "$*" >&2
+    FAILED_STEPS+=("$step")
+  fi
+}
+
 vercel_close() {
   # Closed = absent or "false": the gateway opens only on the value true.
+  # `env rm` removes the whole record, so a value shared with the preview or
+  # development targets is removed there too (only ever in the closing direction).
   local step="$1" name="$2"
-  show vercel env rm "$name" production --yes
-  printf '+ printf false | vercel env add %s production\n' "$name"
+  show vercel env rm "$name" production --yes "${VERCEL_ARGS[@]+"${VERCEL_ARGS[@]}"}"
+  printf '+ printf false | vercel env add %s production%s\n' "$name" "${VERCEL_SCOPE:+ --scope $VERCEL_SCOPE}"
   [[ "$MODE" == "apply" ]] || return 0
-  vercel env rm "$name" production --yes > /dev/null 2>&1 || true
-  if ! printf 'false' | vercel env add "$name" production; then
+  vercel_in_cwd env rm "$name" production --yes > /dev/null 2>&1 || true
+  if ! printf 'false' | vercel_in_cwd env add "$name" production; then
     printf 'STEP %s FAILED: vercel env add %s production\n' "$step" "$name" >&2
     FAILED_STEPS+=("$step")
   fi
@@ -237,11 +289,12 @@ step_header() { printf '\n## %s\n' "$1"; }
 printf '# MILO kill switch — mode: %s, scope: %s\n' "$MODE" "$SCOPE"
 printf '# API service %s, worker job %s, project %s, region %s\n' "$API_SERVICE" "$WORKER_JOB" "$PROJECT_ID" "$REGION"
 printf '# Order: docs/production-readiness/ROLLBACK.md "Execution flags — emergency order"\n'
+printf '# vercel commands run in: %s\n' "$VERCEL_CWD"
 
 if [[ "$SCOPE" != "remaining" ]]; then
   step_header "1. Vercel: close run starts (GATEWAY_ALLOW_RUN_START_ROUTES=false), then redeploy"
   vercel_close 1 "$MILO_STAGE2_VERCEL_RUN_START_FLAG"
-  run 1 vercel redeploy "${VERCEL_DEPLOYMENT:-<CURRENT_PRODUCTION_DEPLOYMENT_URL>}"
+  run_vercel 1 redeploy "${VERCEL_DEPLOYMENT:-<CURRENT_PRODUCTION_DEPLOYMENT_URL>}"
 
   step_header "2. Paid execution off (worker job and API service)"
   gcloud_job 2 --update-env-vars "MILO_ENABLE_PAID_EXECUTION=${CLOSED}"
@@ -258,10 +311,14 @@ if [[ "$SCOPE" != "remaining" ]]; then
   if [[ "$MODE" == "apply" ]]; then
     if worker_json="$(describe_worker)"; then
       for key in "${PROVIDER_KEY_NAMES[@]}"; do
-        case "$(key_binding_form "$worker_json" "$key")" in
+        form="$(key_binding_form "$worker_json" "$key")" || form="unreadable"
+        case "$form" in
           secret) gcloud_job 5 --remove-secrets "$key" ;;
           env) gcloud_job 5 --remove-env-vars "$key" ;;
-          *) printf '%s is not bound on the worker.\n' "$key" ;;
+          "") printf '%s is not bound on the worker.\n' "$key" ;;
+          *)
+            printf 'STEP 5 FAILED: could not read how %s is bound on the worker\n' "$key" >&2
+            FAILED_STEPS+=(5) ;;
         esac
       done
     else
@@ -305,9 +362,9 @@ if [[ "$SCOPE" != "order" ]]; then
   for name in "${REMAINING_VERCEL_FLAGS[@]}"; do
     vercel_close 6 "$name"
   done
-  run 6 vercel redeploy "${VERCEL_DEPLOYMENT:-<CURRENT_PRODUCTION_DEPLOYMENT_URL>}"
-  printf '%s is inlined at BUILD time: the served bundle changes only after a\n' "$MILO_STAGE2_VERCEL_BUILD_FLAG"
-  printf 'rebuild of the release commit (it hides UI; it is not a security boundary).\n'
+  run_vercel 6 redeploy "${VERCEL_DEPLOYMENT:-<CURRENT_PRODUCTION_DEPLOYMENT_URL>}"
+  printf '%s is inlined at BUILD time: the redeploy above rebuilds with it, so the\n' "$MILO_STAGE2_VERCEL_BUILD_FLAG"
+  printf 'UI hides once that build is live (it hides UI; it is not a security boundary).\n'
 fi
 
 if [[ "$MODE" != "apply" ]]; then
@@ -360,6 +417,13 @@ if keys == "1":
     for name in ("KIMI_API_KEY", "MOONSHOT_API_KEY"):
         if name in env:
             bad.append(f"{name} still bound")
+# A service whose traffic is pinned to an older revision does not serve the
+# revision this update created, so a closed template proves nothing there.
+traffic = (doc.get("status") or {}).get("traffic") if isinstance(doc, dict) else None
+if isinstance(traffic, list) and traffic and not any(
+        entry.get("latestRevision") and int(entry.get("percent") or 0) == 100 for entry in traffic):
+    bad.append("traffic is not 100% on the latest revision, so the closed configuration is not "
+               "serving (gcloud run services update-traffic --to-latest)")
 for problem in bad:
     print(f"NOT CLOSED ({label}): {problem}")
 print(f"{label}: {len(flags)} flag(s) checked, {len(bad)} problem(s)")
