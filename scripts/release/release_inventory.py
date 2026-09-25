@@ -78,8 +78,12 @@ RUNTIME_SOURCES: tuple[str, ...] = (
 
 #: The release tooling's own RPC calls, which reach PostgREST over HTTP rather
 #: than through the repository. They are runtime-required in the same sense:
-#: the Stage D cleanup path releases dangling budget reservations through one,
-#: and a cleanup that cannot run leaves the daily budget held.
+#: the Stage D cleanup path releases dangling budget reservations through one
+#: (`settle_model_call_budget`, called by nothing else), and a cleanup that
+#: cannot run leaves the daily budget held. A listed source that is missing is
+#: an error, never a silently smaller inventory: removing a tool means removing
+#: its entry here and whatever only it required from the pinned inventory
+#: (scripts/release/pins/required_rpc_args.py) in the same reviewed change.
 TOOLING_SOURCES: tuple[str, ...] = (
     "scripts/release/stage-d/probe_db.py",
 )
@@ -250,7 +254,7 @@ def runtime_rpc_calls(repo_root: Path | str | None = None) -> dict[str, set[str]
     for relative in TOOLING_SOURCES:
         path = root / relative
         if not path.is_file():
-            continue
+            raise InventoryError(f"tooling source not found: {relative}")
         for name in _TOOLING_RPC_RE.findall(path.read_text(encoding="utf-8")):
             found.setdefault(name.lower(), set()).add(relative)
 

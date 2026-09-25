@@ -41,6 +41,8 @@ from backend.tools import ToolContext, ToolMode, ToolOperation, ToolRegistry
 
 REPO = Path(__file__).resolve().parents[1]
 STAGE_D = REPO / "scripts" / "release" / "stage-d"
+#: The permanent copies of policy_envelope.py and verify_caps.py (cleanup D8).
+PINS = REPO / "scripts" / "release" / "pins"
 
 POLICY = reviewed_first_run_policy()
 REVIEWED_ENV = POLICY.env_expectations()
@@ -323,7 +325,7 @@ def test_the_gateway_derives_its_visible_policy_from_the_limits_it_is_given():
 # =============================================================================
 
 def policy_envelope(selector: str) -> str:
-    result = subprocess.run([sys.executable, str(STAGE_D / "policy_envelope.py"), selector],
+    result = subprocess.run([sys.executable, str(PINS / "policy_envelope.py"), selector],
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
@@ -352,7 +354,7 @@ def test_stage_d_keeps_no_hand_written_copy_of_a_policy_value():
 
 
 def test_stage_d_refuses_a_pinned_value_that_disagrees_with_the_runtime(tmp_path):
-    sys.path.insert(0, str(STAGE_D))
+    sys.path.insert(0, str(PINS))
     import verify_caps  # noqa: E402  (path bootstrap must run first)
 
     pinned = dict(POLICY.env_expectations(prefixes=PROVIDER_ENV_PREFIXES))
@@ -382,7 +384,7 @@ def test_stage_d_binds_the_policy_by_content_not_by_checkout():
     import inspect
     import sys as _sys
 
-    _sys.path.insert(0, str(STAGE_D))
+    _sys.path.insert(0, str(PINS))
     import policy_envelope
 
     source = inspect.getsource(policy_envelope.release_binding_problems)
@@ -779,7 +781,7 @@ def test_the_execution_increment_is_the_policys_and_nothing_elses():
     """Stage D used to compute `baseline + 1` in shell arithmetic."""
     import sys as _sys
 
-    _sys.path.insert(0, str(STAGE_D))
+    _sys.path.insert(0, str(PINS))
     import policy_envelope
 
     assert policy_envelope.authorized_execution_increment() == int(
@@ -796,12 +798,12 @@ def test_the_execution_increment_is_the_policys_and_nothing_elses():
 def test_the_reviewed_policy_fingerprint_is_pinned_for_the_release():
     import sys as _sys
 
-    _sys.path.insert(0, str(STAGE_D))
+    _sys.path.insert(0, str(PINS))
     import policy_envelope
 
     assert policy_envelope.PINNED_POLICY_FINGERPRINT == POLICY.fingerprint(), (
         "backend/runtime_policy.py changed without re-pinning "
-        "PINNED_POLICY_FINGERPRINT in scripts/release/stage-d/policy_envelope.py")
+        "PINNED_POLICY_FINGERPRINT in scripts/release/pins/policy_envelope.py")
 
 
 def test_a_sub_cent_price_survives_the_canonical_document():

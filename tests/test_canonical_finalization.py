@@ -46,6 +46,8 @@ from backend.worker.main import execute_run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STAGE_D = REPO_ROOT / "scripts" / "release" / "stage-d"
+#: The permanent copy of semantic_acceptance.py (cleanup D8).
+PINS = REPO_ROOT / "scripts" / "release" / "pins"
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +710,7 @@ def test_finalization_never_imports_an_engine_at_module_scope():
 def run_semantic_gate(record, *, args=()):
     lines = "" if record is None else json.dumps(record) + "\n"
     return subprocess.run(
-        [sys.executable, str(STAGE_D / "semantic_acceptance.py"), *args],
+        [sys.executable, str(PINS / "semantic_acceptance.py"), *args],
         input="noise line\n" + lines, capture_output=True, text=True, timeout=120)
 
 

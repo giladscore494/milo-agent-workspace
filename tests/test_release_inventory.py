@@ -44,7 +44,11 @@ def _load(path: Path, name: str):
 
 
 PROBE = _load(RELEASE_DIR / "stage-d" / "probe_db.py", "stage_d_probe_db")
-ENVELOPE = _load(RELEASE_DIR / "stage-d" / "policy_envelope.py", "stage_d_policy_envelope")
+#: The permanent copies (cleanup D8): the pinned RPC inventory and the release
+#: binding. The probe above keeps its own byte-identical literal (its source is
+#: pinned by sha256) until the Stage D toolkit is deleted.
+PINNED_RPCS = _load(RELEASE_DIR / "pins" / "required_rpc_args.py", "pins_required_rpc_args")
+ENVELOPE = _load(RELEASE_DIR / "pins" / "policy_envelope.py", "pins_policy_envelope")
 
 
 # ---------------------------------------------------------------------------
@@ -90,15 +94,23 @@ def test_the_inventory_covers_every_console_1_to_5_runtime_dependency():
     assert not missing, f"the inventory omits runtime dependencies: {missing}"
 
 
-def test_the_probes_pinned_literal_is_exactly_the_derived_inventory():
-    """The probe runs in a bare image and cannot import the deriving module,
-    so it keeps a reviewed literal -- and this is what stops that literal
-    falling behind the runtime, which is exactly how it fell behind before."""
+def test_a_missing_tooling_source_is_an_error_not_a_smaller_inventory(monkeypatch):
+    """Deleting a tool must not silently shrink the derived inventory."""
+    monkeypatch.setattr(release_inventory, "TOOLING_SOURCES", ("scripts/release/no-such-tool.py",))
+    with pytest.raises(release_inventory.InventoryError, match="tooling source not found"):
+        release_inventory.runtime_rpc_calls()
+
+
+def test_the_pinned_literal_is_exactly_the_derived_inventory():
+    """The pinned RPC inventory is a reviewed literal -- and this is what stops
+    that literal falling behind the runtime, which is exactly how it fell
+    behind before."""
     derived = {name: set(args) for name, args in
                release_inventory.required_rpc_args().items()}
-    pinned = {name: set(args) for name, args in PROBE.REQUIRED_RPC_ARGS.items()}
+    pinned = {name: set(args) for name, args in PINNED_RPCS.REQUIRED_RPC_ARGS.items()}
     assert pinned == derived, (
-        "probe_db.py's REQUIRED_RPC_ARGS is not the inventory of current main. "
+        "scripts/release/pins/required_rpc_args.py's REQUIRED_RPC_ARGS is not the "
+        "inventory of current main. "
         "Regenerate with: python3 scripts/release/release_inventory.py rpcs")
 
 
@@ -264,7 +276,7 @@ def test_the_toolkit_may_reference_a_release_without_being_that_commit():
     """PR #103's rule, preserved. The reviewed commit that updates
     STAGE_D_RELEASE_SHA to release R cannot itself be R, so requiring
     HEAD == R would make re-authorization impossible."""
-    source = (RELEASE_DIR / "stage-d" / "policy_envelope.py").read_text()
+    source = (RELEASE_DIR / "pins" / "policy_envelope.py").read_text()
     assert "does **not** have to BE the release commit" in source or \
            "does not have to BE the release commit" in source
     binding = ENVELOPE.release_binding_problems.__doc__ or ""
@@ -273,7 +285,7 @@ def test_the_toolkit_may_reference_a_release_without_being_that_commit():
 
 def test_image_digest_verification_is_not_weakened():
     """A tag match is still never acceptance, on any surface."""
-    verify_images = _load(RELEASE_DIR / "stage-d" / "verify_images.py", "stage_d_verify_images")
+    verify_images = _load(RELEASE_DIR / "pins" / "verify_images.py", "pins_verify_images")
     problems: list[str] = []
     digest, how = verify_images.reference_digest(
         "reg/worker:" + RELEASE, "reg/worker", "sha256:" + "a" * 64, RELEASE,
@@ -296,7 +308,7 @@ def test_the_deployer_states_the_release_on_both_runtime_surfaces():
 
 
 def test_verify_caps_refuses_a_deployment_that_states_no_release_or_the_wrong_one():
-    verify_caps = _load(RELEASE_DIR / "stage-d" / "verify_caps.py", "stage_d_verify_caps")
+    verify_caps = _load(RELEASE_DIR / "pins" / "verify_caps.py", "pins_verify_caps")
 
     problems: list[str] = []
     verify_caps.check_release_identity({"MILO_RELEASE_SHA": RELEASE},

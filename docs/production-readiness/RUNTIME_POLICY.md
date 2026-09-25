@@ -2,7 +2,7 @@
 
 **Authority:** `backend/runtime_policy.py`
 **Schema:** `milo-runtime-policy/1`
-**Print it:** `python3 scripts/release/stage-d/policy_envelope.py document`
+**Print it:** `python3 scripts/release/pins/policy_envelope.py document`
 
 ## What problem this solves
 
@@ -118,8 +118,11 @@ Comparing a checkout against itself proves nothing about what the running
 images enforce. So the policy is bound to the release twice, and both bindings
 fail closed:
 
-1. `PINNED_POLICY_FINGERPRINT` in `policy_envelope.py` is a **literal reviewed
-   constant**, changed in a reviewed commit exactly like an image digest. Every
+1. `PINNED_POLICY_FINGERPRINT` in `scripts/release/pins/policy_envelope.py` is
+   a **literal reviewed constant**, changed in a reviewed commit exactly like
+   an image digest. (Until the Stage D toolkit is deleted, its byte-identical
+   copy in `scripts/release/stage-d/` changes with it;
+   `tests/test_release_pins.py` holds the two equal.) Every
    selector refuses unless the checkout's policy digest matches it, so a
    drifted checkout cannot even print a pin. CI fails if the two diverge.
 2. `release_binding_problems()` proves `backend/runtime_policy.py` **is
