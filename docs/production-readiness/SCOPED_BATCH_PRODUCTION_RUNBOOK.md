@@ -733,12 +733,20 @@ In this order, stopping at the first failure:
    is **not** touched. With the API's run creation still off, nothing can use
    the armed worker.
 
-   **PR-R model contract (worker only).** Since PR-R the worker must also
-   carry `MILO_COMMANDER_MODEL=kimi-k3`,
+   **PR-R model contract (worker only).** The activation script does NOT
+   set the models. The operator must set these three on the worker job
+   manually:
+   `MILO_COMMANDER_MODEL=kimi-k3`,
    `MILO_COMMANDER_MODEL_ALLOWLIST=kimi-k3,kimi-k2.6` and
-   `MILO_SWARM_WORKER_MODEL=kimi-k2.6`. A paid Swarm V2 run is refused at
-   boot (`MODEL_PROFILE_UNKNOWN` / `MODEL_NOT_ALLOWLISTED`) otherwise. The
-   reviewed RuntimePolicy it applies now carries `MILO_MAX_COST_PER_RUN=3.00`,
+   `MILO_SWARM_WORKER_MODEL=kimi-k2.6`. Boot does **not** catch a worker left
+   on the old values: `kimi-k2.6` is a profiled, allowlisted model, so a worker
+   still carrying `MILO_COMMANDER_MODEL=kimi-k2.6` and
+   `MILO_COMMANDER_MODEL_ALLOWLIST=kimi-k2.6` passes boot and runs the
+   Commander on k2.6. Boot refuses only an unprofiled model
+   (`MODEL_PROFILE_UNKNOWN`), a role model missing from the allowlist
+   (`MODEL_NOT_ALLOWLISTED`) or incomplete model env
+   (`SWARM_MODEL_CONFIG_INVALID`), so read the three values back after
+   setting them. The reviewed RuntimePolicy it applies now carries `MILO_MAX_COST_PER_RUN=3.00`,
    `MILO_DAILY_USER_BUDGET=10.00`, `MILO_DAILY_PROJECT_BUDGET=10.00`,
    `MILO_MAX_OUTPUT_TOKENS_PER_RUN=400000` and
    `MILO_MAX_TOTAL_TOKENS_PER_RUN=900000`. Check the posture with
