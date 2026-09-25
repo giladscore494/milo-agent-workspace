@@ -77,16 +77,15 @@ RUNTIME_SOURCES: tuple[str, ...] = (
 )
 
 #: The release tooling's own RPC calls, which reach PostgREST over HTTP rather
-#: than through the repository. They are runtime-required in the same sense:
-#: the Stage D cleanup path releases dangling budget reservations through one
-#: (`settle_model_call_budget`, called by nothing else), and a cleanup that
-#: cannot run leaves the daily budget held. A listed source that is missing is
-#: an error, never a silently smaller inventory: removing a tool means removing
-#: its entry here and whatever only it required from the pinned inventory
-#: (scripts/release/pins/required_rpc_args.py) in the same reviewed change.
-TOOLING_SOURCES: tuple[str, ...] = (
-    "scripts/release/stage-d/probe_db.py",
-)
+#: than through the repository. They are runtime-required in the same sense.
+#: A listed source that is missing is an error, never a silently smaller
+#: inventory: removing a tool means removing its entry here and whatever only it
+#: required from the pinned inventory (scripts/release/pins/required_rpc_args.py)
+#: in the same reviewed change. None remain: the only one, the Stage D probe
+#: (whose cleanup path released dangling budget reservations through
+#: `settle_model_call_budget`), was deleted with the Stage D toolkit (cleanup
+#: D8), and that RPC left the pinned inventory with it.
+TOOLING_SOURCES: tuple[str, ...] = ()
 
 #: RPC call shapes inside the repository layer. `_guarded_rpc` and `_read_rpc`
 #: are this repository's own wrappers; `.rpc(` is the raw client call.

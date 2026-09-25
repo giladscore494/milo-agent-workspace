@@ -14,7 +14,7 @@ maintained by hand and were free to disagree:
 | `backend/tier2_profile.py` (removed in cleanup D10; prose now [TIER2_FIRST_RUN_PROFILE.md](TIER2_FIRST_RUN_PROFILE.md)) | 23 tasks, 56 agent steps, 24 tool calls, 1 replan, $3.00 — and enforced nothing |
 | `backend/budget.py` | enforced model calls, tokens, cost, duration; required **five** of them for paid execution, not including `max_agent_steps` or the recorded-cost cap |
 | `backend/engines/swarm_v2/validation.py` | admitted plans against `PlanLimits` defaults of **64 tasks, 3 replans, 100 tool calls** |
-| `scripts/release/stage-d/stage-d-env.sh` | its own transcription of the whole envelope, including `MILO_PROVIDER_RPM_LIMIT=350` |
+| `scripts/release/stage-d/stage-d-env.sh` (historical; the Stage D toolkit was removed in cleanup D8) | its own transcription of the whole envelope, including `MILO_PROVIDER_RPM_LIMIT=350` |
 | `scripts/release/swarm-v2-smoke/parse_env_contract.py` (historical; removed in cleanup PR-2) | the spent smoke envelope: 200 calls, $4.00, 900,000 tokens, 8 workers |
 
 Two of those disagreements were not theoretical. The plan firewall really did
@@ -82,10 +82,10 @@ Each dimension is declared exactly once, in `POLICY_DIMENSIONS`, with:
                                │
    ┌──────────┬────────────┬───┴────┬─────────────┬──────────────┐
    │          │            │        │             │              │
-BudgetConfig  PlanLimits  Provider  production_   (tests pin     stage-d/
+BudgetConfig  PlanLimits  Provider  production_   (tests pin     pins/
 (budget.py)   (swarm_v2)  LimitsCfg config.py     reviewed vals) policy_envelope.py
    │          │    │                                             │
-BudgetTracker │  ModelGateway (what the model is told)      stage-d-env.sh
+BudgetTracker │  ModelGateway (what the model is told)           │
               │  PlanValidator (what the firewall enforces)  verify_caps.py
               └─ feasibility (what the run can pay for)
 ```
@@ -102,7 +102,7 @@ policy of `max_replans = 1` makes two replans impossible; a policy of
 |---|---|---|
 | Startup / operator check | `backend/production_config.py` | `POLICY_DIMENSION_ABSENT`, `POLICY_WIDER_THAN_REVIEWED`, `POLICY_VALUE_INVALID`, `POLICY_INVARIANT_VIOLATED`, `POLICY_CATALOG_POSTURE_CONTRADICTORY` |
 | Worker, before a run executes | `backend/worker/main.py` | `BUDGET_CONFIG_INVALID`, `PROVIDER_LIMITS_CONFIG_INVALID`, `RUNTIME_POLICY_INVALID` |
-| Release toolkit, before a run is created | `scripts/release/stage-d/verify_caps.py` | refuses on any disagreement with the policy, including the policy fingerprint |
+| Release verifier (kept from the Stage D toolkit) | `scripts/release/pins/verify_caps.py` | refuses on any disagreement with the policy, including the policy fingerprint |
 
 Catalog posture is part of the policy: arming canonical promotion for data a
 deployment is not allowed to **read** is a contradiction, and it is now
@@ -120,9 +120,7 @@ fail closed:
 
 1. `PINNED_POLICY_FINGERPRINT` in `scripts/release/pins/policy_envelope.py` is
    a **literal reviewed constant**, changed in a reviewed commit exactly like
-   an image digest. (Until the Stage D toolkit is deleted, its byte-identical
-   copy in `scripts/release/stage-d/` changes with it;
-   `tests/test_release_pins.py` holds the two equal.) Every
+   an image digest. Every
    selector refuses unless the checkout's policy digest matches it, so a
    drifted checkout cannot even print a pin. CI fails if the two diverge.
 2. `release_binding_problems()` proves `backend/runtime_policy.py` **is

@@ -5,12 +5,10 @@ code (the runtime's RPC call sites and the release tooling's) and from the
 migrations (the required arguments of each migration-created function);
 ``tests/test_release_inventory.py`` fails unless this literal is exactly that.
 
-Copied byte-identically from ``scripts/release/stage-d/probe_db.py`` (cleanup
-D8). One entry, ``settle_model_call_budget``, is required only by that probe's
-own cleanup path (release_inventory.py ``TOOLING_SOURCES``); it leaves this
-inventory together with its only caller. Optional (defaulted) arguments are
-excluded, so an ADDED optional parameter passes while a missing or renamed
-required one fails.
+Moved here from the Stage D probe (cleanup D8). When that probe was deleted,
+``settle_model_call_budget`` left the inventory: the probe's cleanup path was
+its only caller. Optional (defaulted) arguments are excluded, so an ADDED
+optional parameter passes while a missing or renamed required one fails.
 
 Regenerate with:
   python3 scripts/release/release_inventory.py rpcs
@@ -144,7 +142,6 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
         "p_worker_id", "p_workflow_key"
     },
     "set_work_scope_paused": {"p_paused", "p_requested_by", "p_work_scope_id"},
-    "settle_model_call_budget": {"p_actual_cost", "p_reservation_id"},
     "settle_model_call_budget_guarded": {
         "p_actual_cost", "p_attempt", "p_lease_token", "p_reservation_id",
         "p_run_id", "p_worker_id"

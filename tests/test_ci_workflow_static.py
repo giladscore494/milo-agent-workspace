@@ -269,8 +269,7 @@ def test_offline_checks_keeps_the_core_safety_scans():
     shellcheck = [line for s in offline["steps"] for line in command_lines(s)
                   if line.startswith("shellcheck -x -S warning")]
     assert shellcheck, "the release/operator ShellCheck lint is gone"
-    for target in ("scripts/release/*.sh", "scripts/release/stage-d/*.sh",
-                   "scripts/deploy/*.sh", "scripts/catalog/*.sh"):
+    for target in ("scripts/release/*.sh", "scripts/deploy/*.sh", "scripts/catalog/*.sh"):
         assert target in shellcheck[0].split(), target
 
 

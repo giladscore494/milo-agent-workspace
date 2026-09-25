@@ -240,7 +240,7 @@ and `/review-candidates` (`backend/catalog/review.py`, ≤100 items per page) in
 ## 6. Concurrency and provider limits (derived from current code)
 
 Canonical registry: `backend/runtime_policy.py`; rendered by
-`scripts/release/stage-d/policy_envelope.py` (fingerprint
+`scripts/release/pins/policy_envelope.py` (fingerprint
 `8f4ef66c58878468feeb9309eaa540dbaee7fb01f2425d2f65dca66df8476de1`).
 
 The website does not transcribe any of this. `GET /runs/{id}` (and the

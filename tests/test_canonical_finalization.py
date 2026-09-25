@@ -45,7 +45,6 @@ from tests.run_factory import identity_kwargs
 from backend.worker.main import execute_run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-STAGE_D = REPO_ROOT / "scripts" / "release" / "stage-d"
 #: The permanent copy of semantic_acceptance.py (cleanup D8).
 PINS = REPO_ROOT / "scripts" / "release" / "pins"
 
@@ -791,28 +790,6 @@ def test_require_complete_refuses_a_truthful_partial():
         done.stdout.strip().splitlines()[-1])["reason"]
 
 
-def test_the_semantic_gate_is_wired_into_the_evidence_gate_and_is_not_optional():
-    text = (STAGE_D / "06-collect-evidence.sh").read_text()
-    assert "semantic_acceptance.py" in text
-    gate = [line for line in text.splitlines() if "semantic_acceptance.py" in line
-            and not line.lstrip().startswith("#")]
-    assert gate, "the semantic gate is only mentioned in a comment"
-    assert not any("|| true" in line or "|| echo" in line for line in gate)
-
-
-def test_the_semantic_gate_does_not_re_derive_the_outcome_in_the_probe():
-    """The probe COPIES what the finalizer recorded; it never judges.
-
-    A probe that derived its own outcome would be a second implementation of
-    the semantic rule, free to disagree with the one that actually decided the
-    run's terminal status.
-    """
-    probe = (STAGE_D / "probe_db.py").read_text()
-    assert '"product_outcome"' in probe
-    assert "acceptance_problems" not in probe
-    assert "semantic_status" not in probe
-
-
 def test_the_worker_records_the_canonical_outcome_the_stage_d_gate_reads(monkeypatch):
     """End to end: what the worker writes is what the gate accepts."""
     monkeypatch.delenv("MILO_ENABLE_PAID_EXECUTION", raising=False)
@@ -944,9 +921,6 @@ def test_stage_d_cannot_consume_a_superseded_product_outcome(repo_class):
     verdict = json.loads(done.stdout.strip().splitlines()[-1])
     assert verdict["terminal_status"] == "cancelled"
     assert "is not a product outcome" in verdict["reason"]
-    # The mirror above must match the probe's own extraction rule.
-    probe = (STAGE_D / "probe_db.py").read_text()
-    assert 'event.get("event_type") not in ("run_completed", "run_partial_success")' in probe
 
 
 def test_the_atomic_primitive_commits_the_status_and_its_event_in_one_call():

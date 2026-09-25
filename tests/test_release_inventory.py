@@ -43,10 +43,8 @@ def _load(path: Path, name: str):
     return module
 
 
-PROBE = _load(RELEASE_DIR / "stage-d" / "probe_db.py", "stage_d_probe_db")
 #: The permanent copies (cleanup D8): the pinned RPC inventory and the release
-#: binding. The probe above keeps its own byte-identical literal (its source is
-#: pinned by sha256) until the Stage D toolkit is deleted.
+#: binding.
 PINNED_RPCS = _load(RELEASE_DIR / "pins" / "required_rpc_args.py", "pins_required_rpc_args")
 ENVELOPE = _load(RELEASE_DIR / "pins" / "policy_envelope.py", "pins_policy_envelope")
 
@@ -114,14 +112,6 @@ def test_the_pinned_literal_is_exactly_the_derived_inventory():
         "Regenerate with: python3 scripts/release/release_inventory.py rpcs")
 
 
-def test_the_exact_signature_pins_carry_every_parameter_including_defaults():
-    inventory = release_inventory.build()["rpcs"]
-    for name, pinned in PROBE.EXACT_RPC_SIGNATURES.items():
-        assert name in inventory, f"{name} is pinned exactly but is not required"
-        assert set(pinned) == set(inventory[name]["args"]), (
-            f"{name}: the exact pin must be every parameter, defaults included")
-
-
 def test_a_deployment_missing_a_required_rpc_is_blocked():
     observed = {name: entry["args"] for name, entry
                 in release_inventory.build()["rpcs"].items()}
@@ -142,32 +132,6 @@ def test_a_deployment_missing_a_required_rpc_is_blocked():
     renamed = {**observed, "create_message_and_run_v3": ["p_run_id"]}
     problems = release_inventory.missing_from_deployment(renamed)
     assert any("p_run_identity" in problem for problem in problems)
-
-
-def test_the_preflight_blocks_on_a_missing_required_rpc_before_any_run(monkeypatch):
-    """The preflight runs before the authorized run is created, so a missing
-    RPC blocks BEFORE any worker execution."""
-    checks: dict[str, str] = {}
-    problems: list[str] = []
-    paths = {f"/rpc/{name}": {"post": {"parameters": [
-        {"in": "body", "schema": {"properties": {arg: {} for arg in
-                                                 release_inventory.build()["rpcs"][name]["args"]}}}]}}
-        for name in PROBE.REQUIRED_RPC_ARGS}
-    del paths["/rpc/finalize_run_guarded"]
-    monkeypatch.setattr(PROBE, "call", lambda method, path, *a, **k: (200, {"paths": paths}))
-
-    PROBE.check_rpc_surface(checks, problems)
-
-    assert checks["rpc_finalize_run_guarded"] == "MISSING"
-    assert any("finalize_run_guarded" in problem for problem in problems)
-
-
-def test_an_unavailable_rpc_surface_fails_closed(monkeypatch):
-    checks: dict[str, str] = {}
-    problems: list[str] = []
-    monkeypatch.setattr(PROBE, "call", lambda *a, **k: (503, None))
-    PROBE.check_rpc_surface(checks, problems)
-    assert problems and all(value == "UNVERIFIED" for value in checks.values())
 
 
 def test_every_migration_that_creates_a_required_rpc_has_a_drift_marker():
@@ -259,17 +223,6 @@ def test_the_release_must_be_stated_for_the_binding_to_mean_anything(monkeypatch
     monkeypatch.setenv("STAGE_D_WORKFLOW_KEY", "vehicle_catalog_v1")
     problems = ENVELOPE.run_identity_problems(identity)
     assert any("STAGE_D_RELEASE_SHA" in problem for problem in problems)
-
-
-def test_the_probe_refuses_an_unparseable_or_releaseless_expectation(monkeypatch):
-    for raw in ("", "   ", "not json", "[]", '{"release_sha": ""}'):
-        monkeypatch.setenv("STAGE_D_EXPECTED_RUN_IDENTITY", raw)
-        assert PROBE.expected_run_identity() is None, raw
-    monkeypatch.setenv("STAGE_D_EXPECTED_RUN_IDENTITY",
-                       json.dumps({"release_sha": RELEASE, "workflow_key": "swarm_v2",
-                                   "run_id": "ignored"}))
-    record = PROBE.expected_run_identity()
-    assert record == {"release_sha": RELEASE, "workflow_key": "swarm_v2"}
 
 
 def test_the_toolkit_may_reference_a_release_without_being_that_commit():

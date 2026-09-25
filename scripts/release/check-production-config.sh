@@ -121,7 +121,7 @@ INVENTORY=(
   "MILO_MAX_TOOL_CALLS_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
   "MILO_MAX_REPLANS_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
   # Provider scheduling and engine parallelism: WORKER-ONLY, and verified as
-  # worker-only by scripts/release/stage-d/verify_caps.py.
+  # worker-only by scripts/release/pins/verify_caps.py.
   "MILO_PROVIDER_MAX_CONCURRENCY|cloud-run-worker-only|no|backend/provider_scheduler.py"
   "MILO_PROVIDER_RPM_LIMIT|cloud-run-worker-only|no|backend/provider_scheduler.py"
   "MILO_PROVIDER_TPM_LIMIT|cloud-run-worker-only|no|backend/provider_scheduler.py"

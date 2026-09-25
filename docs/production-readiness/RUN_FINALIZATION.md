@@ -177,7 +177,7 @@ the status and the only terminal event agree.
 
 Stage D's existing gates all answer a technical question — did the execution
 terminate cleanly, exactly once, inside its caps, against the accepted digest.
-`scripts/release/stage-d/semantic_acceptance.py` asks the other one, of this
+`scripts/release/pins/semantic_acceptance.py` (formerly in the Stage D toolkit) asks the other one, of this
 same canonical module:
 
 * the worker records the ProductOutcome on the run's terminal event;
