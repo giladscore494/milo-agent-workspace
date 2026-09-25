@@ -1,5 +1,5 @@
 """The CI gate contract: what `.github/workflows/ci.yml` and `repo-scan.yml`
-must keep enforcing on every pull request and every push to main.
+must keep enforcing on every pull request (there is no post-merge run).
 
 Why this exists: the release runbook
 (docs/production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md) accepts a
@@ -122,15 +122,16 @@ def test_every_mandatory_ci_job_exists():
         assert name in jobs, name
 
 
-def test_ci_runs_on_every_pull_request_and_every_push_to_main_without_path_filters():
+def test_ci_runs_on_every_pull_request_without_path_filters_and_not_after_merge():
     on = triggers(load(CI))
     assert "pull_request" in on
     pr = on["pull_request"] or {}
     for key in ("paths", "paths-ignore", "branches", "branches-ignore", "types"):
         assert key not in pr, f"pull_request trigger is narrowed by {key}"
-    push = on["push"]
-    assert push["branches"] == ["main"]
-    assert "paths" not in push and "paths-ignore" not in push
+    # The release gate is CI on the merged PR's latest commit plus tree
+    # equality with the merge commit (SCOPED_BATCH_PRODUCTION_RUNBOOK.md), so
+    # there is deliberately no post-merge push run.
+    assert "push" not in on
 
 
 def test_no_mandatory_job_or_step_is_conditional_or_allowed_to_fail():
@@ -311,7 +312,7 @@ def test_repo_scan_always_reports_and_always_verifies_the_archive():
     workflow = load(REPO_SCAN)
     on = triggers(workflow)
     assert "pull_request" in on and not (on["pull_request"] or {})
-    assert on["push"] == {"branches": ["main"]}
+    assert "push" not in on
     scan = job(workflow, "scan")
     assert scan["name"] == "Lint & Test"
     assert "if" not in scan and not scan.get("continue-on-error")

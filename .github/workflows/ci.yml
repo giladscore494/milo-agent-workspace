@@ -2,8 +2,6 @@ name: ci
 
 on:
   pull_request:
-  push:
-    branches: [main]
 
 # Release acceptance: every job below is MANDATORY for a commit to be a
 # release candidate (docs/production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md

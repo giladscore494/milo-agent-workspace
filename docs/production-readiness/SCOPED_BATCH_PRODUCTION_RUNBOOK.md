@@ -116,20 +116,43 @@ gcloud config set project big-cabinet-457321-t7
 Every script builds, tags and checks `git rev-parse HEAD`, so **the checkout is
 the release**. Keep this one checkout for the whole rollout.
 
-Check CI for that exact commit in GitHub (Actions → `ci` → the run for
-`$RELEASE_SHA`). All four mandatory jobs must be green — `offline-checks`
-(backend suite and static safety scans), `frontend-and-docker` (API and
-worker image builds, frontend build, type check, Vitest, static UI check and
-the served-bundle secret scan), `postgres-checks` (executable migration and
-RPC ACL suites, skips forbidden) and `e2e`. A run in which any of the four is
-failing, skipped, cancelled or still pending is **not** green; three green
-jobs are not enough. From a shell with `gh` authenticated:
+Check CI for that exact commit through the pull request that produced it.
+CI runs on pull requests only; there is no post-merge run on `main`. So
+`$RELEASE_SHA` (the merge commit on `main`) is accepted when **both** hold:
+
+1. CI is green on the merged PR's **latest commit** (`$PR_HEAD_SHA`, the merge
+   commit's second parent). All four mandatory `ci` jobs must be green —
+   `offline-checks` (backend suite and static safety scans),
+   `frontend-and-docker` (API and worker image builds, frontend build, type
+   check, Vitest, static UI check and the served-bundle secret scan),
+   `postgres-checks` (executable migration and RPC ACL suites, skips
+   forbidden) and `e2e` — and so must `Repo Scan` / `Lint & Test`. A run in
+   which any job is failing, skipped, cancelled or still pending is **not**
+   green; three green jobs are not enough.
+2. The merge commit's tree is **identical** to that commit's tree, so the
+   code CI tested is byte-for-byte the code being released.
+
+From a shell with `gh` authenticated:
 
 ```bash
-gh run list --workflow ci --commit "$RELEASE_SHA" --repo giladscore494/milo-agent-workspace
+PR_HEAD_SHA="$(git rev-parse --verify --quiet "$RELEASE_SHA^2^{commit}")" \
+  || { echo "NOT A MERGE COMMIT: stop"; PR_HEAD_SHA=""; }      # the merged PR's latest commit
+if [ -n "$PR_HEAD_SHA" ]; then
+  gh run list --workflow ci --commit "$PR_HEAD_SHA" --repo giladscore494/milo-agent-workspace
+  gh run list --workflow "Repo Scan" --commit "$PR_HEAD_SHA" --repo giladscore494/milo-agent-workspace
+  test "$(git rev-parse "$RELEASE_SHA^{tree}")" = "$(git rev-parse "$PR_HEAD_SHA^{tree}")" \
+    && echo "tree equal: $RELEASE_SHA == $PR_HEAD_SHA" \
+    || echo "TREE DIFFERS: stop"
+fi
 ```
 
-**Stop if** CI is not green for `$RELEASE_SHA`, or the worktree is dirty.
+The trees are equal when the PR branch was up to date with `main` when it was
+merged; if they differ, the released code was never tested as a whole. A
+squash or rebase merge produces no merge commit, so it is rejected here — merge
+release PRs with a merge commit.
+
+**Stop if** CI is not green for `$PR_HEAD_SHA`, the two trees differ,
+`$RELEASE_SHA` is not a merge commit, or the worktree is dirty.
 
 ### A.2 Operator configuration and the read-only database URL
 

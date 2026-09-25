@@ -1,8 +1,6 @@
 name: Repo Scan
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 # MILO-main-original/MILO-main and legacy/milo-streamlit-v1 are IMMUTABLE,
