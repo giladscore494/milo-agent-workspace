@@ -16,14 +16,16 @@ no script in this repository deploys anything.
   always the full SHA and is verified against the registry digest after
   deployment.
 - API and worker are built separately from `Dockerfile.api` and
-  `Dockerfile.worker`, through Cloud Build configs
-  `scripts/deploy/cloudbuild-worker.yaml` (`_WORKER_IMAGE` substitution) and
-  `scripts/deploy/cloudbuild-api.yaml` (`_API_IMAGE` substitution).
-  `cloud-run.sh` requires `run`, `cloudbuild`, `artifactregistry` and
-  `secretmanager` `.googleapis.com` to be enabled before any build:
+  `Dockerfile.worker`:
 
       <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/api:<FULL_SHA>
       <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/worker:<FULL_SHA>
+
+  `cloud-run.sh` builds them through the Cloud Build configs
+  `scripts/deploy/cloudbuild-worker.yaml` (`_WORKER_IMAGE` substitution) and
+  `scripts/deploy/cloudbuild-api.yaml` (`_API_IMAGE` substitution), and its
+  preflight requires `run`, `cloudbuild`, `artifactregistry` and
+  `secretmanager` `.googleapis.com` to be enabled before any build.
 
 - These two repository paths are the single canonical image identity. They
   are defined once in `scripts/deploy/deployment-contract.sh` and sourced by
