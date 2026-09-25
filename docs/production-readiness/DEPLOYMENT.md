@@ -21,6 +21,12 @@ no script in this repository deploys anything.
       <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/api:<FULL_SHA>
       <GCP_REGION>-docker.pkg.dev/<GCP_PROJECT_ID>/<ARTIFACT_REGISTRY_REPOSITORY>/worker:<FULL_SHA>
 
+  `cloud-run.sh` builds them through the Cloud Build configs
+  `scripts/deploy/cloudbuild-worker.yaml` (`_WORKER_IMAGE` substitution) and
+  `scripts/deploy/cloudbuild-api.yaml` (`_API_IMAGE` substitution), and its
+  preflight requires `run`, `cloudbuild`, `artifactregistry` and
+  `secretmanager` `.googleapis.com` to be enabled before any build.
+
 - These two repository paths are the single canonical image identity. They
   are defined once in `scripts/deploy/deployment-contract.sh` and sourced by
   `cloud-run.sh`, `generate-deployment-plan.sh` and
@@ -306,6 +312,14 @@ plan and the executable script ever disagree about it.
 `check-production-config.sh` requires the pin in production environment
 metadata and verifies the supplied `SUPABASE_URL` against it, printing
 neither value.
+
+### Supabase server-side key policy
+
+The backend supports Supabase's modern server-side secret API keys with the `sb_secret_` prefix through the pinned official `supabase==2.27.2` Python client. Keep the production Secret Manager secret named `SUPABASE_SECRET_KEY` populated with the modern server-side key, and keep the Cloud Run mapping compatible with the existing deployment script: `SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SECRET_KEY:latest`. The application also accepts `SUPABASE_SECRET_KEY` directly for local and future runtime configurations, while preserving `SUPABASE_SERVICE_ROLE_KEY` as a backward-compatible alias.
+
+Do not re-enable, restore, or depend on legacy JWT service-role API keys. Server-side Supabase keys must remain only in Google Secret Manager or equivalent protected backend secret stores; never commit them, print them, place them in frontend configuration, or send them to browser bundles. The frontend may use only public Supabase configuration such as an anon or publishable key, and must never receive `SUPABASE_SECRET_KEY` or `SUPABASE_SERVICE_ROLE_KEY`.
+
+_(Moved verbatim from the archived `docs/deployment/cloud-run-production.md` in cleanup PR-2, set 2b.)_
 
 ## Private Cloud Run configuration
 

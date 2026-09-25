@@ -15,7 +15,7 @@ maintained by hand and were free to disagree:
 | `backend/budget.py` | enforced model calls, tokens, cost, duration; required **five** of them for paid execution, not including `max_agent_steps` or the recorded-cost cap |
 | `backend/engines/swarm_v2/validation.py` | admitted plans against `PlanLimits` defaults of **64 tasks, 3 replans, 100 tool calls** |
 | `scripts/release/stage-d/stage-d-env.sh` | its own transcription of the whole envelope, including `MILO_PROVIDER_RPM_LIMIT=350` |
-| `scripts/release/swarm-v2-smoke/parse_env_contract.py` | the spent smoke envelope: 200 calls, $4.00, 900,000 tokens, 8 workers |
+| `scripts/release/swarm-v2-smoke/parse_env_contract.py` (historical; removed in cleanup PR-2) | the spent smoke envelope: 200 calls, $4.00, 900,000 tokens, 8 workers |
 
 Two of those disagreements were not theoretical. The plan firewall really did
 admit 3 replans and 100 tool calls into a profile that advertised 1 and 24.

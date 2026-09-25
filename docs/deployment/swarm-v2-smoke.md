@@ -1,3 +1,8 @@
+> **HISTORICAL — superseded by [`docs/production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md`](../production-readiness/SCOPED_BATCH_PRODUCTION_RUNBOOK.md).**
+> The smoke ran 2026-08-24/25 and its authorization is spent. The controller
+> `scripts/release/swarm-v2-smoke/` and `tests/test_release_tooling_swarm_smoke.py`
+> were removed in cleanup PR-2 (set 2a); paths below are kept as a record.
+
 # Swarm V2 controlled production smoke
 
 Controller: `scripts/release/swarm-v2-smoke/run-swarm-smoke.sh`
@@ -8,7 +13,8 @@ heredoc — the pipe and the heredoc competed for stdin. The committed
 controller makes that impossible: every gcloud JSON output is written to a
 temp file (one `mktemp -d` workspace, removed by an `EXIT` trap) and parsed
 by a committed helper that takes the file as an argument. None of the
-helpers read stdin; `tests/test_release_tooling_swarm_smoke.py` pins this.
+helpers read stdin; `tests/test_release_tooling_swarm_smoke.py` pinned this
+(removed with the controller in cleanup PR-2).
 
 ## Verified environment contract
 

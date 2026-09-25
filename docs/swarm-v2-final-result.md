@@ -210,7 +210,7 @@ result" is never shown for any of them.
   | `-----BEGIN …-----` PEM blocks | the header alone says what follows |
   | `Bearer <token>` | matched whole, before the token shapes, so a redacted token never leaves a bare `Bearer` |
   | `eyJ….….…` | JWTs, including the LEGACY Supabase service-role key |
-  | **`sb_secret_…`** | the **modern** Supabase server-side key. `docs/deployment/cloud-run-production.md` mandates this format for production (`SUPABASE_SECRET_KEY`) and forbids it reaching the browser; `backend/production_config.py` and `scripts/check_unsafe_defaults.py` both blocklist the substring. It shares **no prefix** with the legacy JWT, so a JWT sentinel proves nothing about it and it is matched explicitly |
+  | **`sb_secret_…`** | the **modern** Supabase server-side key. `docs/production-readiness/DEPLOYMENT.md` (Supabase server-side key policy) mandates this format for production (`SUPABASE_SECRET_KEY`) and forbids it reaching the browser; `backend/production_config.py` and `scripts/check_unsafe_defaults.py` both blocklist the substring. It shares **no prefix** with the legacy JWT, so a JWT sentinel proves nothing about it and it is matched explicitly |
   | `sk-…` | provider API keys |
   | `secret = value` and friends | the label is kept, the value replaced |
 
