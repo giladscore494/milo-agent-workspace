@@ -1212,6 +1212,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             if workflow_key != "swarm_v2" or isinstance(exc, AppError) or not holds_lease():
                 raise
             from backend.engines.swarm_v2 import VALIDATION_REASONS, CommanderPlanFailure
+            from backend.engines.swarm_v2.failures import SwarmExecutionFailure
             from backend.engines.swarm_v2.request_builder import ModelRequestRefused
             from backend.provider_streaming import ProviderTransportFailure
             failure_payload: dict[str, Any]
@@ -1235,9 +1236,20 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 reason = getattr(exc, "validation_reason", None)
                 if reason in VALIDATION_REASONS:
                     failure_payload["validation_reason"] = reason
+            elif isinstance(exc, SwarmExecutionFailure):
+                # PR-T: an orchestration refusal with its own static code
+                # (completion criteria, required task, replan rules), so the
+                # run says WHICH rule stopped it instead of a generic failure.
+                code, message = exc.code, exc.safe_message
+                failure_payload = {"code": code}
             else:
                 code, message = "SWARM_V2_EXECUTION_FAILED", "Swarm V2 execution failed"
                 failure_payload = {"code": code}
+            # Operator triage, stdout only: the static code and the exception
+            # CLASS name. Never the exception message, which can quote plan,
+            # tool or provider material.
+            print(f"swarm_v2 run failed: run_id={run_id} code={code} "
+                  f"exception_class={type(exc).__name__}", flush=True)
             finalizer.finalize(TerminalClaim.failure(
                 workflow_key, code, message,
                 event_payload={k: v for k, v in failure_payload.items() if k != "code"}))

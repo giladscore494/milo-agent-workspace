@@ -19,6 +19,11 @@ class SwarmState(StrictContract):
     approved_plan: dict[str, Any] | None = None
     completed_task_ids: list[str] = Field(default_factory=list)
     task_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # PR-T: each completed task's typed per-candidate `resolve_variant`
+    # outcomes (see .resolution), kept beside its output so a resume knows an
+    # ambiguous candidate was an ANSWER without re-running the tool. A
+    # checkpoint written before PR-T lacks the field and loads as {}.
+    task_resolutions: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     evidence_references: list[dict[str, Any]] = Field(default_factory=list)
     replans: list[dict[str, Any]] = Field(default_factory=list)
     verifier_state: dict[str, dict[str, Any]] = Field(default_factory=dict)

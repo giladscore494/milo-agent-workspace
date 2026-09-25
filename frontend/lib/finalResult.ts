@@ -500,6 +500,10 @@ const CONFLICT_REASONS: ReadonlySet<string> = new Set(['unresolved conflict']);
 const COVERAGE_GAP_CODES: ReadonlySet<string> = new Set([
   'REQUIRED_OUTPUT_MISSING',
   'EVIDENCE_REQUIREMENTS_UNMET',
+  // A register candidate the task truthfully could not resolve: an answer,
+  // listed for review, never a task failure.
+  'CANDIDATE_UNRESOLVED_AMBIGUOUS',
+  'CANDIDATE_UNRESOLVED_NOT_FOUND',
 ]);
 
 /** The exact key sets `FinalBuilder` and the engine write. */
@@ -804,6 +808,8 @@ const REVIEW_CODE_LABELS: ReadonlyMap<string, string> = new Map([
   ['NO_USABLE_RESULT', 'No usable result was produced'],
   ['REQUIRED_OUTPUT_MISSING', 'A required output was missing'],
   ['EVIDENCE_REQUIREMENTS_UNMET', 'Evidence requirements were not met'],
+  ['CANDIDATE_UNRESOLVED_AMBIGUOUS', 'The register matched more than one variant; left unresolved'],
+  ['CANDIDATE_UNRESOLVED_NOT_FOUND', 'The register matched no variant'],
   ['TASK_FAILED', 'The task did not complete'],
 ]);
 

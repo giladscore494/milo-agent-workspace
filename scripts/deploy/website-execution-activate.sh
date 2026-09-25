@@ -8,9 +8,11 @@
 #                           Stage A left them (off). Nothing can start.
 #   --apply-runtime-policy  The reviewed RuntimePolicy envelope (plain numeric
 #                           caps from backend/runtime_policy.py) on the worker,
-#                           and the concurrency caps on the API. It ENABLES
-#                           nothing: it is the bounds paid execution will run
-#                           inside, and production-preflight.sh requires them.
+#                           and the SAME per-run, daily and concurrency caps on
+#                           the API, which admits runs and displays the limits
+#                           a run executes under. It ENABLES nothing: it is the
+#                           bounds paid execution will run inside, and
+#                           production-preflight.sh requires them.
 #   --apply-backend         Stage 2. Everything a website-initiated batch run
 #                           needs on the API and the worker -- and ONLY where
 #                           it is needed (deployment-contract.sh names each
@@ -78,8 +80,8 @@ Default --plan changes nothing and prints both stages.
 
 Modes:
   --plan                  Print every change each stage would make. Default.
-  --apply-runtime-policy  Bind the reviewed RuntimePolicy caps (worker) and the
-                          concurrency caps (API). Enables nothing; no gate.
+  --apply-runtime-policy  Bind the reviewed RuntimePolicy envelope (worker) and
+                          its caps (API). Enables nothing; no gate.
   --apply-plan-authoring  Stage P: MILO_ENABLE_WORK_SCOPE_MUTATIONS on the API
                           only. Gate: production-verify.sh --gate deployed.
   --apply-backend         Stage 2: the API + worker flags for batch runs. Gate:
@@ -175,8 +177,13 @@ pairs() {
 
 # The reviewed RuntimePolicy, computed from the ONE canonical registry
 # (backend/runtime_policy.py) at runtime -- never transcribed here. The worker
-# carries the whole envelope; the API admits runs, so it carries the
-# concurrency caps it passes to the run creator.
+# carries the whole envelope. The API carries every CAP (CAP_ENV_PREFIXES: the
+# per-run, daily and concurrency caps -- all shared-api-worker in
+# check-production-config.sh, and verified on BOTH surfaces by verify_caps.py):
+# it admits runs under the concurrency caps and DISPLAYS the per-run limits
+# (`limits` on every run response). Binding only the concurrency caps left the
+# API showing stale 1.00 / 4.00 / 120000 while the worker enforced
+# 3.00 / 10.00 / 400000. Provider and engine settings stay worker-only.
 policy_pairs() {
   (cd "$REPO_ROOT" && python3 -c '
 import sys
@@ -187,7 +194,7 @@ print(sys.argv[1].join("%s=%s" % item for item in sorted(env.items())))
 ' "$MILO_ENV_VAR_DELIMITER" "$@")
 }
 if ! POLICY_JOB_VARS="$(policy_pairs)" || [[ -z "$POLICY_JOB_VARS" ]] \
-   || ! POLICY_API_VARS="$(policy_pairs MILO_MAX_CONCURRENT_RUNS_)" || [[ -z "$POLICY_API_VARS" ]]; then
+   || ! POLICY_API_VARS="$(policy_pairs MILO_MAX_ MILO_DAILY_ MILO_ESTIMATED_COST)" || [[ -z "$POLICY_API_VARS" ]]; then
   printf 'FAIL: the reviewed RuntimePolicy could not be read from backend/runtime_policy.py\n' >&2
   exit 2
 fi
@@ -209,7 +216,8 @@ S2_JOB_VARS+="${MILO_ENV_VAR_DELIMITER}${POLICY_JOB_VARS}"
 print_runtime_policy_commands() {
   cat << EOC
 # --- RuntimePolicy: the reviewed caps (plain config, never Secret Manager).
-# Enables nothing. Worker: the whole envelope. API: the concurrency caps.
+# Enables nothing. Worker: the whole envelope. API: every cap it admits runs
+# under and displays (per-run, daily, concurrency) -- never provider settings.
 gcloud run jobs update ${WORKER_JOB} \\
   --region ${REGION} --project ${PROJECT_ID} \\
   --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${POLICY_JOB_VARS}'

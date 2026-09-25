@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Mapping
 
 from .contracts import StrictContract
+from .resolution import CANDIDATE_OUTCOMES
 
 # --- static vocabulary -------------------------------------------------------
 
@@ -190,6 +191,7 @@ def finalize_product_outcome(*, fields: Mapping[str, Any],
                              conflict_claim_ids: Iterable[str] = (),
                              unverified_claim_ids: Iterable[str] = (),
                              trusted_negative: TrustedNegativeResult | None = None,
+                             candidate_outcomes: Iterable[Mapping[str, Any]] = (),
                              ) -> dict[str, Any]:
     """Assemble THE public Swarm V2 product output. One decision, one place.
 
@@ -203,6 +205,12 @@ def finalize_product_outcome(*, fields: Mapping[str, Any],
     ``needs_review`` preserves its existing composition and order exactly:
     verdict review items first (already ordered by the builder), then task
     failures, then coverage gaps, with the static marker last when it applies.
+
+    PR-T: ``candidate_outcomes`` -- the typed per-candidate register outcomes
+    (``.resolution``) -- is carried as its own key, and ONLY when there is at
+    least one, so every payload without a register resolution is byte-for-byte
+    what it was. It is a listing, not a decision input: an unresolved
+    candidate already reached this function as a soft coverage gap.
     """
     review = [*verdict_review, *task_failures, *coverage_gaps]
     has_blocking_items = bool(review or list(conflict_claim_ids) or list(unverified_claim_ids))
@@ -211,8 +219,12 @@ def finalize_product_outcome(*, fields: Mapping[str, Any],
                              trusted_negative=trusted_negative)
     if outcome.result_kind == "no_usable_result":
         review = _with_marker(review)
-    return {"status": outcome.status, "result_kind": outcome.result_kind,
-            "fields": dict(fields), "needs_review": review}
+    final: dict[str, Any] = {"status": outcome.status, "result_kind": outcome.result_kind,
+                             "fields": dict(fields), "needs_review": review}
+    outcomes = [dict(item) for item in candidate_outcomes]
+    if outcomes:
+        final["candidate_outcomes"] = outcomes
+    return final
 
 
 def validate_product_outcome(result: Any) -> ProductOutcome:
@@ -265,6 +277,16 @@ def validate_product_outcome(result: Any) -> ProductOutcome:
                 "no_usable_result requires exactly one trailing static marker")
     elif markers:
         raise ProductOutcomeError("the empty-result marker contradicts the result kind")
+    # PR-T: the optional per-candidate listing is present only when non-empty,
+    # and every entry names an outcome from the closed vocabulary.
+    if "candidate_outcomes" in result:
+        outcomes = result.get("candidate_outcomes")
+        if (not isinstance(outcomes, list) or not outcomes
+                or any(not isinstance(item, Mapping)
+                       or not isinstance(item.get("outcome"), str)
+                       or item.get("outcome") not in CANDIDATE_OUTCOMES
+                       for item in outcomes)):
+            raise ProductOutcomeError("candidate outcomes are structurally invalid")
     # `partial_result` deliberately has NO review-item requirement: a rejected
     # claim makes a run partial without producing a review entry of its own.
     return ProductOutcome(status, result_kind)

@@ -227,6 +227,16 @@ SOURCE_FIRST_TOOL_POLICY: Mapping[str, tuple[str, ...]] = {
         "Use targeted research only for a gap the register leaves, an enrichment it does not "
         "define, or a contradiction between two sources.",
         "An ambiguous resolution stays ambiguous: plan a targeted task that adds evidence, never a merge.",
+        # PR-T. Run 3c72bfbc's t04 verified two duplicate-signature candidates
+        # with allow_partial=false; the register truthfully answered
+        # "ambiguous" and the run was lost. The engine now records that answer
+        # as a typed per-candidate outcome that satisfies completion whatever
+        # the flag says; this line tells the Commander so up front.
+        "A task that uses resolve_variant to verify or disambiguate duplicate candidates must accept "
+        "ambiguity as a valid answer: set its completion.allow_partial to true. A register answer of "
+        "ambiguous or not found is recorded by the server as a typed per-candidate outcome "
+        "(unresolved_ambiguous / unresolved_not_found) that satisfies that task's completion; it is "
+        "never a failed task.",
         "The register is authority for existence, Israeli model year, official model code, trim and "
         "the coded dimensions it publishes. It is NOT authority for reliability, faults, price or "
         "market value; research those independently.",
