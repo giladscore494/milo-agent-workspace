@@ -65,7 +65,7 @@ what is deployed or enabled in any production environment.
 | --- | --- | --- |
 | Swarm V2 engine: Commander, plan firewall, model gateway, bounded workers, budgets | COMPLETED_IN_CODE | ARCHITECTURE.md, `backend/engines/swarm_v2/` |
 | Trusted engine routing from `project.workflow_key` (never from a payload) | COMPLETED_IN_CODE | `backend/worker/engine.py` |
-| Swarm V2 checkpoint/resume and durable terminal persistence | COMPLETED_IN_CODE | `docs/deployment/swarm-v2-smoke.md` |
+| Swarm V2 checkpoint/resume and durable terminal persistence | COMPLETED_IN_CODE | `backend/engines/swarm_v2/`; `tests/test_swarm_v2_resume_budget.py`, `tests/test_swarm_v2_smoke_offline.py` (the historical production smoke record is `docs/deployment/swarm-v2-smoke.md`) |
 | Bounded read-only Government vehicle Tool (no transport, no credential) | COMPLETED_IN_CODE | `backend/tools/government_vehicle.py` |
 | Registered-operation evidence mapping (one allowlisted operation) | COMPLETED_IN_CODE | `backend/engines/swarm_v2/evidence_mapping.py` |
 | Lease-guarded, idempotent field-level canonical promotion | COMPLETED_IN_CODE | `backend/catalog/pipeline.py` |

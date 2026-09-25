@@ -13,7 +13,8 @@ heredoc — the pipe and the heredoc competed for stdin. The committed
 controller makes that impossible: every gcloud JSON output is written to a
 temp file (one `mktemp -d` workspace, removed by an `EXIT` trap) and parsed
 by a committed helper that takes the file as an argument. None of the
-helpers read stdin; `tests/test_release_tooling_swarm_smoke.py` pins this.
+helpers read stdin; `tests/test_release_tooling_swarm_smoke.py` pinned this
+(removed with the controller in cleanup PR-2).
 
 ## Verified environment contract
 
