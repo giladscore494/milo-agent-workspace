@@ -10,6 +10,17 @@
 
 export const EXPORT_SCHEMA_VERSION = 'milo-run-export/2';
 
+/**
+ * Every envelope version this release reads. `/2` (PR-R) only widened the
+ * `usage` block, which this module never reads, so a `/1` document from a
+ * server still on the previous release parses the same way. Anything else is
+ * refused.
+ */
+export const ACCEPTED_EXPORT_SCHEMA_VERSIONS: ReadonlySet<string> = new Set([
+  'milo-run-export/1',
+  EXPORT_SCHEMA_VERSION,
+]);
+
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
   'completed', 'partial_success', 'failed', 'cancelled', 'timed_out', 'budget_exhausted',
 ]);
@@ -43,7 +54,7 @@ export function parseExportEnvelope(raw: unknown): ExportSummary | undefined {
   const engine = text(record.engine);
   const terminalStatus = text(record.terminal_status);
   const generatedAt = text(record.generated_at);
-  if (schemaVersion !== EXPORT_SCHEMA_VERSION) return undefined;
+  if (!schemaVersion || !ACCEPTED_EXPORT_SCHEMA_VERSIONS.has(schemaVersion)) return undefined;
   if (!runId || !engine || !terminalStatus || !generatedAt) return undefined;
   if (!TERMINAL_STATUSES.has(terminalStatus)) return undefined;
   const identity = record.run_identity;
