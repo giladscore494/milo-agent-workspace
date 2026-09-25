@@ -107,6 +107,11 @@ class ModelProfile:
     #: caller that tries to send one is refused; they are never forwarded.
     forbidden_params: frozenset[str]
     response_formats: frozenset[str]
+    #: Whether strict ``json_schema`` output has been PROVEN against the live
+    #: provider for this model. Off by default: even with ``json_schema`` in
+    #: ``response_formats``, the builder uses it only when this is set AND the
+    #: role's schema passes ``is_strict_compatible``; otherwise json_object.
+    strict_json_schema_verified: bool = False
 
     def cache_write_price(self, ttl: str) -> Decimal:
         """The per-1M price of a cache-written input token at ``ttl``."""
@@ -183,7 +188,13 @@ PROFILES: Mapping[str, ModelProfile] = {
         reasoning_effort_values=("low", "high", "max"),
         output_cap_field="max_completion_tokens",
         forbidden_params=_K3_FORBIDDEN,
-        response_formats=frozenset({"json_object", "json_schema"}),
+        # json_object ONLY until strict json_schema is proven against the
+        # live provider (PR #124 review): Kimi strict mode requires every
+        # property in `required` and additionalProperties:false everywhere,
+        # and the CommanderPlan / verifier-batch schemas satisfy neither. The
+        # json_schema path stays in the builder behind
+        # `strict_json_schema_verified` and `is_strict_compatible`.
+        response_formats=frozenset({"json_object"}),
     ),
     "kimi-k2.6": ModelProfile(
         model="kimi-k2.6", provider="moonshot",

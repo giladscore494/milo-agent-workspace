@@ -242,7 +242,7 @@ def test_verifier_truncated_batch_is_repaired_once_by_escalation():
     assert [v.verdict for v in verdicts] == ["verified", "verified"]
     assert [c["reasoning_effort"] for c in provider.calls] == ["high", "low"]
     assert retries == [("verifier", "verification", MODEL_REASONING_EXHAUSTED_OUTPUT)]
-    assert provider.calls[0]["response_format"]["json_schema"]["name"] == "verifier_batch"
+    assert provider.calls[0]["response_format"] == {"type": "json_object"}
 
 
 def test_verifier_failure_after_the_repair_carries_the_static_code():

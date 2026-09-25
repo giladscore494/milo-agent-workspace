@@ -47,10 +47,20 @@ can have a large cap.
 
 | Role | Effort | `max_output` | `min_answer_reserve` | Structured output |
 |---|---|---|---|---|
-| commander:planning | high | 32,000 | 6,000 | json_schema (strict) when supported |
+| commander:planning | high | 32,000 | 6,000 | json_object (strict json_schema gated, see below) |
 | commander:replanning | high | 16,000 | 3,000 | json_object |
-| worker:execute | low | 12,000 | 3,000 | json_schema (strict) when supported |
-| verifier:verification | high | 24,000 | 4,000 | json_schema (strict) when supported |
+| worker:execute | low | 12,000 | 3,000 | json_object (strict json_schema gated, see below) |
+| verifier:verification | high | 24,000 | 4,000 | json_object (strict json_schema gated, see below) |
+
+Structured output is `json_object` for every role today. The strict
+`json_schema` path is still in the builder, but a request uses it only when
+all three hold: the model's profile lists `json_schema`, the profile's
+`strict_json_schema_verified` is set (strict output proven against the live
+provider), and the role's schema passes `is_strict_compatible` (every property
+required and `additionalProperties: false` at every depth). kimi-k3 is
+`json_object` only. The CommanderPlan and verifier-batch schemas are not yet
+strict-compatible, so even a verified profile falls back to `json_object` for
+them.
 
 These are starting values. Calibrate them from `reasoning_tokens` (or
 `reasoning_tokens_estimated`) after 2–3 runs.

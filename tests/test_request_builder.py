@@ -30,8 +30,8 @@ def test_k3_gets_max_completion_tokens_and_reasoning_effort_and_no_fixed_params(
     for fixed in ("temperature", "top_p", "n", "presence_penalty", "frequency_penalty"):
         assert fixed not in request
     assert "extra_body" not in request and "thinking" not in json.dumps(request)
-    assert request["response_format"] == {
-        "type": "json_schema", "json_schema": {"name": "plan", "strict": True, "schema": SCHEMA}}
+    # PR #124 review: json_object until strict json_schema is proven live.
+    assert request["response_format"] == {"type": "json_object"}
 
 
 def test_k26_always_gets_an_explicit_thinking_setting_and_never_reasoning_effort():
@@ -109,7 +109,7 @@ def test_the_wire_request_through_the_real_guarded_client_keeps_the_k3_contract(
     (sent,) = calls
     assert "max_completion_tokens" in sent and "max_tokens" not in sent
     assert sent["reasoning_effort"] == "low"
-    assert sent["response_format"]["type"] == "json_schema"
+    assert sent["response_format"] == {"type": "json_object"}
     assert "temperature" not in sent
 
 
@@ -196,3 +196,67 @@ def test_v1_calls_without_a_contract_keep_the_historical_silent_clamp():
         tracker, lambda *_: SimpleNamespace(chat=SimpleNamespace(completions=Completions())))("k", "u")
     client.chat.completions.create(model="kimi-k2.6", messages=[{"content": "x"}], max_tokens=5_000)
     assert calls[0]["max_tokens"] == 100
+
+
+# --- PR #124 review: strict json_schema is gated -----------------------------
+
+from dataclasses import replace as _replace  # noqa: E402
+
+from backend.engines.swarm_v2.contracts import commander_plan_json_schema  # noqa: E402
+from backend.engines.swarm_v2.request_builder import is_strict_compatible  # noqa: E402
+from backend.engines.swarm_v2.verifier import verifier_batch_json_schema  # noqa: E402
+
+#: A K3 profile as it would be once strict output is proven on the live provider.
+K3_STRICT = _replace(K3, response_formats=frozenset({"json_object", "json_schema"}),
+                     strict_json_schema_verified=True)
+
+
+def test_k3_profile_is_json_object_only_until_strict_is_proven():
+    assert K3.response_formats == frozenset({"json_object"})
+    assert K3.strict_json_schema_verified is False
+    for schema in (SCHEMA, commander_plan_json_schema(), verifier_batch_json_schema()):
+        request = build_provider_request(K3, HIGH, MESSAGES, schema)
+        assert request["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.parametrize("role,phase,schema", [
+    ("commander", "planning", commander_plan_json_schema()),
+    ("verifier", "verification", verifier_batch_json_schema()),
+    ("worker:t1", "execute", SCHEMA),
+])
+def test_every_k3_role_request_on_the_wire_uses_json_object(role, phase, schema):
+    calls = []
+    _gateway(calls).call(model="kimi-k3", agent=role, phase=phase, messages=MESSAGES,
+                         schema=schema, schema_name="x")
+    assert calls[0]["response_format"] == {"type": "json_object"}
+
+
+def test_is_strict_compatible():
+    assert is_strict_compatible(SCHEMA)
+    assert not is_strict_compatible({"type": "object", "properties": {"a": {"type": "string"}},
+                                     "additionalProperties": False})            # optional property
+    assert not is_strict_compatible({"type": "object", "properties": {"a": {"type": "string"}},
+                                     "required": ["a"]})                          # open object
+    assert not is_strict_compatible({"type": "object", "additionalProperties": True})
+    nested = {"type": "object", "required": ["x"], "additionalProperties": False,
+              "properties": {"x": {"type": "array", "items": {
+                  "type": "object", "properties": {"y": {"type": "integer"}},
+                  "additionalProperties": False}}}}
+    assert not is_strict_compatible(nested)                                       # nested optional
+    # The two role schemas the reviewer flagged are NOT strict-compatible today.
+    assert not is_strict_compatible(commander_plan_json_schema())
+    assert not is_strict_compatible(verifier_batch_json_schema())
+
+
+def test_the_builder_uses_strict_json_schema_only_when_proven_and_compatible():
+    strict = build_provider_request(K3_STRICT, HIGH, MESSAGES, SCHEMA, schema_name="plan")
+    assert strict["response_format"] == {
+        "type": "json_schema", "json_schema": {"name": "plan", "strict": True, "schema": SCHEMA}}
+    # An incompatible schema silently falls back to json_object -- never a refusal.
+    for schema in (commander_plan_json_schema(), verifier_batch_json_schema()):
+        assert build_provider_request(K3_STRICT, HIGH, MESSAGES, schema)["response_format"] == {
+            "type": "json_object"}
+    # Supported but not proven: json_object.
+    unproven = _replace(K3_STRICT, strict_json_schema_verified=False)
+    assert build_provider_request(unproven, HIGH, MESSAGES, SCHEMA)["response_format"] == {
+        "type": "json_object"}

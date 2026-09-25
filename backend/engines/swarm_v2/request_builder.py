@@ -16,8 +16,10 @@ Every Swarm V2 request is assembled here, from the model's registered
   presence_penalty and frequency_penalty) are never sent, and a caller that
   tries to send one -- or any parameter this builder does not own -- is
   refused with a static code before anything reaches the provider;
-* structured output is ``json_schema`` with ``strict: true`` when the model
-  supports it and the caller has a schema, otherwise ``json_object``.
+* structured output is ``json_schema`` with ``strict: true`` only when the
+  model supports it, strict output is proven for it
+  (``strict_json_schema_verified``) and the schema passes
+  :func:`is_strict_compatible`; otherwise ``json_object``.
 
 The builder never adds ``reasoning_content`` to a message and never requests
 explicit or 1-hour context caching.
@@ -141,9 +143,38 @@ def _reasoning_fields(profile: ModelProfile, effort: str) -> dict[str, Any]:
     return {}
 
 
+def is_strict_compatible(schema: Any) -> bool:
+    """Can ``schema`` be sent as a STRICT json_schema without a provider refusal?
+
+    Kimi's strict mode (like OpenAI's) requires, for EVERY object schema at any
+    depth (``$defs`` included): every declared property listed in ``required``
+    and ``additionalProperties: false``. An object that allows arbitrary keys
+    (``additionalProperties`` absent or true) cannot be strict. Anything else
+    is left to the provider; this is a necessary check, not a full validator.
+    """
+    if isinstance(schema, list):
+        return all(is_strict_compatible(item) for item in schema)
+    if not isinstance(schema, Mapping):
+        return True
+    if schema.get("type") == "object" or "properties" in schema:
+        properties = schema.get("properties") or {}
+        if not isinstance(properties, Mapping):
+            return False
+        if schema.get("additionalProperties") is not False:
+            return False
+        if set(properties) - set(schema.get("required") or ()):
+            return False
+    return all(is_strict_compatible(value) for value in schema.values())
+
+
 def _response_format(profile: ModelProfile, schema: Mapping[str, Any] | None,
                      schema_name: str) -> dict[str, Any]:
-    if schema is not None and "json_schema" in profile.response_formats:
+    # Strict json_schema is chosen ONLY when the model supports it, strict
+    # output is proven for it on the live provider, AND this schema is
+    # strict-compatible. Anything short of that falls back to json_object --
+    # never a refusal: the deterministic validators stay the authority either way.
+    if (schema is not None and "json_schema" in profile.response_formats
+            and profile.strict_json_schema_verified and is_strict_compatible(schema)):
         return {"type": "json_schema",
                 "json_schema": {"name": schema_name, "strict": True, "schema": dict(schema)}}
     if "json_object" in profile.response_formats:
@@ -203,4 +234,5 @@ def build_provider_request(profile: ModelProfile, policy: RolePolicy,
 __all__ = ["EFFORT_LADDER", "MODEL_EFFORT_UNSUPPORTED", "MODEL_MESSAGE_INVALID",
            "MODEL_OUTPUT_CAP_INVALID", "MODEL_PROFILE_UNKNOWN", "MODEL_PARAM_FORBIDDEN",
            "MODEL_RESPONSE_FORMAT_UNSUPPORTED", "ModelRequestRefused", "REQUEST_REFUSAL_CODES",
-           "RolePolicy", "build_provider_request", "lower_effort", "resolve_effort"]
+           "RolePolicy", "build_provider_request", "is_strict_compatible", "lower_effort",
+           "resolve_effort"]
