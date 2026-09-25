@@ -126,9 +126,10 @@ fail closed:
 2. `release_binding_problems()` proves `backend/runtime_policy.py` **is
    byte-for-byte the file at `STAGE_D_RELEASE_SHA`** — and, because the
    checkout's digest must also equal the pin, that the reviewed pin is
-   provably a statement about that release's policy. `verify_caps.py`, both
-   step scripts and both enable paths run it before anything is mutated or a
-   run is created. Being unable to prove it — no git metadata, a shallow clone
+   provably a statement about that release's policy. `verify_caps.py` runs it
+   before anything is judged (the Stage D step scripts and enable paths that
+   also ran it before any mutation were removed with the toolkit in cleanup
+   D8). Being unable to prove it — no git metadata, a shallow clone
    lacking the commit, a release without the policy source, an unreadable
    file — is a refusal, never a pass.
 
@@ -152,15 +153,17 @@ does not contain `backend/runtime_policy.py` at all — Stage D now **refuses**,
 which is the correct executable form of the supersession
 `STAGE_D_AUTHORIZATION.md` already documents in prose.
 
-The number of new paid worker executions Stage D will accept is the policy's
-`first_paid_run_execution_cap`, read by `verify_executions.py --baseline`;
-the shell no longer computes `baseline + 1` on its own.
+The number of new paid worker executions Stage D accepted was the policy's
+`first_paid_run_execution_cap` (`policy_envelope.authorized_execution_increment()`),
+read by `verify_executions.py --baseline`; the shell no longer computed
+`baseline + 1` on its own.
 
-`stage-d-env.sh` no longer transcribes anything. It generates
-`STAGE_D_CAPS`, `STAGE_D_WORKER_PROVIDER_LIMITS`,
-`STAGE_D_WORKER_ENGINE_LIMITS` and `STAGE_D_POLICY_FINGERPRINT` from the
-policy, and `verify_caps.py` re-derives all of them and refuses the run if
-what it was handed disagrees. Verifying the live environment against a
+`stage-d-env.sh` transcribed nothing: it generated `STAGE_D_CAPS`,
+`STAGE_D_WORKER_PROVIDER_LIMITS`, `STAGE_D_WORKER_ENGINE_LIMITS` and
+`STAGE_D_POLICY_FINGERPRINT` from the policy (both it and
+`verify_executions.py` were removed with the Stage D toolkit in cleanup D8),
+and `verify_caps.py` re-derives all of them and refuses if what it was handed
+disagrees. Verifying the live environment against a
 transcription only ever proved that the deployment matched the transcription.
 
 ## What this does NOT do

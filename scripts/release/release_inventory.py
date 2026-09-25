@@ -5,7 +5,8 @@ What this replaces
 ------------------
 
 Stage D's preflight carried a hand-written list of the RPCs it considered
-required (``REQUIRED_RPC_ARGS`` in ``scripts/release/stage-d/probe_db.py``),
+required (``REQUIRED_RPC_ARGS`` in the Stage D probe, since deleted; the
+literal now lives in ``scripts/release/pins/required_rpc_args.py``),
 and that list was written when the guarded worker writes landed. Everything
 built since -- the durable execution-usage ledger, atomic guarded
 finalization, the current-verdict authority, the evidence support functions,

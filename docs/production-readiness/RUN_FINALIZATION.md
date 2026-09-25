@@ -177,17 +177,19 @@ the status and the only terminal event agree.
 
 Stage D's existing gates all answer a technical question — did the execution
 terminate cleanly, exactly once, inside its caps, against the accepted digest.
-`scripts/release/pins/semantic_acceptance.py` (formerly in the Stage D toolkit) asks the other one, of this
-same canonical module:
+`scripts/release/pins/semantic_acceptance.py` (formerly in the Stage D
+toolkit) asks the other one, of this same canonical module:
 
 * the worker records the ProductOutcome on the run's terminal event;
-* `probe_db.py` copies that bounded record into its evidence verdict and
-  fails closed if a product terminal state carries none — it never derives or
-  judges an outcome, because a second implementation of the rule could
-  disagree with the one that decided the run's status;
-* `06-collect-evidence.sh` step 5 runs the host-side gate, which rebuilds the
+* the Stage D probe (`probe_db.py`) copied that bounded record into its
+  evidence verdict and failed closed if a product terminal state carried none
+  — it never derived or judged an outcome, because a second implementation of
+  the rule could disagree with the one that decided the run's status;
+* `06-collect-evidence.sh` step 5 ran the host-side gate, which rebuilds the
   record through the canonical reader and applies the canonical acceptance
-  rule.
+  rule. The probe and the step script were removed with the Stage D toolkit
+  (cleanup D8); the gate itself is kept, and reads the same evidence record
+  on stdin.
 
 A technically successful execution whose outcome is `unusable`, `refused`,
 `not_produced` or absent does **not** pass. A truthful `partial` with real
