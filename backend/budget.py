@@ -32,6 +32,7 @@ from backend.execution_usage import (LEDGER_AMOUNTS, LEDGER_COUNTERS, LEDGER_SCH
                                      LEDGER_SNAPSHOT_FIELDS, PUBLIC_USAGE_FIELDS,
                                      merge_usage_snapshots, public_usage_projection,
                                      validate_usage_snapshot)
+from backend.model_profiles import MODEL_PROFILE_UNKNOWN, UnknownModelProfile, get_profile
 from backend.provider_authority import (ProviderOutcome, ProviderVerdict,
                                         classify_outcome)
 from backend.runtime import CancellationRequested
@@ -457,6 +458,20 @@ class BudgetTracker:
     def _reject(self, code: str, message: str, event_type: str, terminal_status: str) -> BudgetExceeded:
         self._ledger("rejected", rejection_reason=code)
         return self._stop(code, message, event_type, terminal_status)
+
+    def refuse_call(self, code: str, message: str, *, event_type: str = "run_failed",
+                    terminal_status: str = "failed") -> BudgetExceeded:
+        """Refuse a call BEFORE admission, with a static reason code.
+
+        For refusals that are decided outside the capacity gate but must be
+        recorded and terminal exactly like one -- an unknown model profile is
+        a configuration fault, and a run that cannot price its calls must not
+        make any. The caller raises the returned exception.
+        """
+        with self._lock:
+            if self.stop is not None:
+                return self.stop
+            return self._reject(code, message, event_type, terminal_status)
 
     def _normalize_reservation(self, raw: ModelCallReservation | str | dict[str, Any] | None, call_seq: int, estimated_cost: float) -> ModelCallReservation:
         if isinstance(raw, ModelCallReservation):
@@ -889,6 +904,17 @@ class _GuardedCompletions:
         self._tracker = tracker
 
     def create(self, **kwargs: Any) -> Any:
+        # FAIL CLOSED on price before anything else: a model with no
+        # registered profile cannot be priced, so it cannot be held to any
+        # dollar ceiling, and it is refused before admission, before the
+        # provider and with a static code. It used to be priced at 0.0.
+        try:
+            profile = get_profile(kwargs.get("model", ""))
+        except UnknownModelProfile:
+            refusal = self._tracker.refuse_call(
+                MODEL_PROFILE_UNKNOWN, "the model has no registered profile")
+            refusal.provider_request_completed = True
+            raise refusal from None
         estimated_input = estimate_message_tokens(kwargs.get("messages"))
         requested_max = read_output_cap(kwargs)
         if requested_max is None:
@@ -962,8 +988,8 @@ class _GuardedCompletions:
         input_tokens = getattr(usage, "prompt_tokens", 0) or 0
         output_tokens = getattr(usage, "completion_tokens", 0) or 0
         if provider_cost is None:
-            from backend.model_pricing import calculate_model_cost
-            provider_cost = calculate_model_cost(kwargs.get("model", ""), input_tokens, output_tokens)
+            provider_cost = profile.usage_cost(input_tokens=input_tokens,
+                                               output_tokens=output_tokens)
         # Likewise AFTER a response was read to completion: a budget refusal
         # raised here is about accounting, not about a request whose fate is
         # unknown, so it must not hold the permit either.

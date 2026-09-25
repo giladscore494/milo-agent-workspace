@@ -241,9 +241,9 @@ def test_guarded_client_stops_mock_model_calls_at_the_limit():
     inner = MockClient()
     guarded = GuardedModelClient(inner, tracker)
     for _ in range(3):
-        guarded.chat.completions.create(model="mock", messages=[])
+        guarded.chat.completions.create(model="kimi-k2.6", messages=[])
     with pytest.raises(BudgetExceeded):
-        guarded.chat.completions.create(model="mock", messages=[])
+        guarded.chat.completions.create(model="kimi-k2.6", messages=[])
     assert inner.chat.completions.calls == 3  # the 4th call never reached the adapter
     assert tracker.input_tokens == 360
     assert tracker.output_tokens == 90
@@ -254,9 +254,9 @@ def test_guarded_factory_wraps_injected_mock_factory():
     made = []
     factory = build_guarded_client_factory(tracker, inner_factory=lambda key, url: made.append((key, url)) or MockClient())
     client = factory("test-key", "https://mock.example")
-    client.chat.completions.create(model="mock", messages=[])
+    client.chat.completions.create(model="kimi-k2.6", messages=[])
     with pytest.raises(BudgetExceeded):
-        client.chat.completions.create(model="mock", messages=[])
+        client.chat.completions.create(model="kimi-k2.6", messages=[])
     assert made == [("test-key", "https://mock.example")]
 
 
@@ -387,7 +387,7 @@ def test_reserve_clamps_max_tokens_to_remaining_allowance():
     inner = MockClient()
     guarded = GuardedModelClient(inner, tracker)
     # First call: usage records 30 output tokens (MockUsage.completion_tokens).
-    guarded.chat.completions.create(model="mock", messages=[{"content": "x" * 40}], max_tokens=500)
+    guarded.chat.completions.create(model="kimi-k2.6", messages=[{"content": "x" * 40}], max_tokens=500)
     # Requested 500 but only 100 were available at reservation time.
     allowed = tracker.reserve_call(10, 500)
     assert allowed == 100 - 30  # remaining after the first call's actuals
@@ -399,12 +399,12 @@ def test_reservation_immediately_rejects_actual_output_overage_and_blocks_next_c
     inner = MockClient()
     guarded = GuardedModelClient(inner, tracker)
     with pytest.raises(BudgetExceeded) as exc:
-        guarded.chat.completions.create(model="mock", messages=[], max_tokens=25)  # settles 30 actual
+        guarded.chat.completions.create(model="kimi-k2.6", messages=[], max_tokens=25)  # settles 30 actual
     assert exc.value.code == "OUTPUT_TOKEN_LIMIT_EXCEEDED"
     assert inner.chat.completions.calls == 1
     assert tracker.stop is not None
     with pytest.raises(BudgetExceeded) as later:
-        guarded.chat.completions.create(model="mock", messages=[], max_tokens=25)
+        guarded.chat.completions.create(model="kimi-k2.6", messages=[], max_tokens=25)
     assert later.value.code == "OUTPUT_TOKEN_LIMIT_EXCEEDED"
     assert inner.chat.completions.calls == 1  # second call never reached the adapter
 
@@ -414,7 +414,7 @@ def test_pre_call_input_estimate_blocks_oversized_prompt_before_the_call():
     inner = MockClient()
     guarded = GuardedModelClient(inner, tracker)
     with pytest.raises(BudgetExceeded) as exc:
-        guarded.chat.completions.create(model="mock", messages=[{"content": "x" * 400}])
+        guarded.chat.completions.create(model="kimi-k2.6", messages=[{"content": "x" * 400}])
     assert exc.value.code == "INPUT_TOKEN_LIMIT_REACHED"
     assert inner.chat.completions.calls == 0  # rejected BEFORE any call
 

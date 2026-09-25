@@ -273,7 +273,7 @@ def test_a_worker_cap_belongs_to_the_role_not_to_the_task_id():
 def test_an_unknown_role_fails_closed_rather_than_taking_the_whole_budget():
     gateway, _tracker, _provider = build_stack(width=1, max_output=50_000)
     with pytest.raises(MissingRoleOutputCap):
-        gateway.call(model="m", agent="mystery", phase="unknown",
+        gateway.call(model="kimi-k2.6", agent="mystery", phase="unknown",
                      messages=[{"role": "user", "content": "hi"}])
 
 
@@ -281,7 +281,7 @@ def test_a_caller_may_tighten_a_role_cap_but_never_widen_it():
     role = ROLE_OUTPUT_CAPS[("verifier", "verification")]
     gateway, _tracker, provider = build_stack(
         width=1, max_output=50_000, provider=HoldingProvider(1))
-    gateway.call(model="m", agent="verifier", phase="verification",
+    gateway.call(model="kimi-k2.6", agent="verifier", phase="verification",
                  messages=[{"role": "user", "content": "hi"}], max_tokens=role * 10)
     assert read_output_cap(provider.observed[-1]) == role
 
@@ -295,7 +295,7 @@ def test_the_guarded_client_applies_a_server_cap_when_a_caller_declares_none():
                             max_run_duration_seconds=60, max_retries=5),
         kill_switch=lambda: True)
     client = build_guarded_client_factory(tracker, lambda k, u: Client(provider))("k", "u")
-    client.chat.completions.create(model="m", messages=[{"role": "user", "content": "hi"}])
+    client.chat.completions.create(model="kimi-k2.6", messages=[{"role": "user", "content": "hi"}])
     assert read_output_cap(provider.observed[-1]) == DEFAULT_OUTPUT_CAP
     assert tracker.missing_output_cap_calls == 1
 
@@ -346,7 +346,7 @@ def test_the_coordinator_is_charged_input_plus_cap_not_actual_output():
     provider = HoldingProvider(1, output_ratio=0.1)
     gateway, _tracker, _p = build_stack(width=1, max_output=100_000,
                                         coordinator=coordinator, provider=provider)
-    gateway.call(model="m", agent="worker:t1", phase="execute",
+    gateway.call(model="kimi-k2.6", agent="worker:t1", phase="execute",
                  messages=[{"role": "user", "content": "x" * 4_000}])
 
     cap = ROLE_OUTPUT_CAPS[("worker", "execute")]

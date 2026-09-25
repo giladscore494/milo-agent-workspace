@@ -131,9 +131,9 @@ def test_retry_cap_blocks_repeated_provider_call(monkeypatch):
     inner = SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
     client = build_guarded_client_factory(tracker, lambda *_: inner)("k", "u")
     with pytest.raises(BudgetExceeded):
-        client.chat.completions.create(model="kimi", messages=[{"content":"x"}], max_tokens=5)
+        client.chat.completions.create(model="kimi-k2.6", messages=[{"content":"x"}], max_tokens=5)
     with pytest.raises(BudgetExceeded):
-        client.chat.completions.create(model="kimi", messages=[{"content":"x"}], max_tokens=5)
+        client.chat.completions.create(model="kimi-k2.6", messages=[{"content":"x"}], max_tokens=5)
     assert calls["n"] == 1
 
 

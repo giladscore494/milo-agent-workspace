@@ -213,7 +213,7 @@ def test_every_call_uses_one_gateway_guard_accounting_and_429_is_not_semantic_re
         max_backpressure_wait_seconds=1, backoff_base_seconds=.001, backoff_max_seconds=.001), sleep_fn=lambda _: None, rng=lambda: 0)
     gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker, lambda *_: inner),
                            scheduler=scheduler, api_key="offline", base_url="offline")
-    gateway.call(model="fake", messages=[{"role": "user", "content": "x"}], agent="worker:a", phase="execute")
+    gateway.call(model="kimi-k2.6", messages=[{"role": "user", "content": "x"}], agent="worker:a", phase="execute")
     assert calls == 2
     assert tracker.model_calls == 2
     assert tracker.provider_backpressure_events == 1

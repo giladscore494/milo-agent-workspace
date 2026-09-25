@@ -242,6 +242,16 @@ def validate(env: dict[str, str] | None = None) -> ConfigReport:
             # Policy messages name variables and reviewed bounds, never the
             # configured value.
             error(violation.code, violation.message)
+        # PR-R: every Swarm V2 model a deployment names must have a registered
+        # profile and both role models must be allowlisted. Only values that
+        # are SET are checked here -- an API deployment carries none of them;
+        # the worker requires them present before a paid Swarm V2 run.
+        from backend.model_profiles import ModelConfigError, validate_swarm_model_contract
+
+        try:
+            validate_swarm_model_contract(env, require_present=False)
+        except ModelConfigError as exc:
+            error(exc.code, exc.safe_message)
 
     # 4b. Catalog capability combinations that cannot be honoured are refused
     # HERE, whatever the paid posture, rather than at worker construction

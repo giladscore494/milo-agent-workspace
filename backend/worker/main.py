@@ -398,11 +398,27 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 "worker provider API key (KIMI_API_KEY/MOONSHOT_API_KEY) is not configured"))
             return 0 if workflow_key == "swarm_v2" else 1
 
+        engine_mode = (os.getenv("MILO_WORKER_ENGINE") or "").strip().lower()
+        # PR-R: the Swarm V2 model contract, checked at worker boot in the
+        # paid posture and BEFORE any provider path exists. Every configured
+        # model must have a registered profile (an unprofiled model cannot be
+        # priced, so no dollar ceiling could hold it) and BOTH role models must
+        # be allowlisted -- the worker model used to be checked against
+        # nothing. The guarded client re-checks the profile on every call.
+        if (paid_execution_enabled() and workflow_key == "swarm_v2" and engine is None
+                and engine_registry is None and engine_mode != "mock"):
+            from backend.model_profiles import ModelConfigError, validate_swarm_model_contract
+
+            try:
+                validate_swarm_model_contract(os.environ, require_present=True)
+            except ModelConfigError as exc:
+                finalizer.finalize(TerminalClaim.refusal(workflow_key, exc.code, exc.safe_message))
+                return 0
+
         # Provider-side scheduling limits (concurrency/RPM/TPM/backpressure
         # bounds) come from the canonical runtime policy resolved above, which
         # validated them fail-closed: an invalid value refuses the run instead
         # of degrading into unlimited capacity.
-        engine_mode = (os.getenv("MILO_WORKER_ENGINE") or "").strip().lower()
         provider_limits = None
         provider_coordinator = None
         # Imported before the try: a ValueError from limit parsing must not
@@ -842,12 +858,16 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     # run reaches the provider only through preparation.
                     raise RuntimeError("Government read is enabled but the run was not prepared")
 
-                allowed = tuple(filter(None, (item.strip() for item in
-                    os.getenv("MILO_COMMANDER_MODEL_ALLOWLIST", "").split(","))))
-                commander_model = os.getenv("MILO_COMMANDER_MODEL", "").strip()
-                worker_model = os.getenv("MILO_SWARM_WORKER_MODEL", "").strip()
-                if not allowed or not commander_model or not worker_model or commander_model not in allowed:
-                    raise ValueError("Swarm V2 model configuration is incomplete or not allowlisted")
+                # Both role models allowlisted and profiled (PR-R); the same
+                # check the paid boot path ran, repeated at construction so an
+                # engine built on any other path cannot skip it.
+                from backend.model_profiles import ModelConfigError, validate_swarm_model_contract
+
+                try:
+                    commander_model, worker_model, allowed = validate_swarm_model_contract(
+                        os.environ, require_present=True)
+                except ModelConfigError as exc:
+                    raise ValueError(exc.safe_message) from None
                 # Catalog PR3 registers the FIRST real production tool: the
                 # bounded, read-only Israeli vehicle register. It reads durable
                 # catalog rows through this worker's own repository and holds
