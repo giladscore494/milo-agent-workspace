@@ -69,6 +69,11 @@ docs/production-readiness/ROLLBACK.md ("Execution flags — emergency order"):
 4. MILO_ENABLE_GOVERNMENT_CATALOG_READ=false (worker job and API service)
 5. Remove the provider API key from the worker (--remove-secrets KIMI_API_KEY)
 
+Scripted: scripts/deploy/kill-switch.sh prints exactly this order (dry run by
+default) and executes it with --apply (MILO_OPERATOR_ACK and
+--vercel-deployment required), then closes the remaining flags and reads the
+result back.
+
 ### Catalog-only incident — the narrow rollback
 
 A defect in the catalog path does NOT require the full order above and does
@@ -103,8 +108,8 @@ persistence, so an interrupted capture leaves a non-active snapshot that no
 reader reads.
 
 Flags are changed by updating the Cloud Run service env (see below); each flag
-is explicit, and no script covers the whole emergency order today (see
-docs/production-readiness/ROLLBACK.md).
+is explicit, and scripts/deploy/kill-switch.sh covers the whole emergency order
+(see docs/production-readiness/ROLLBACK.md).
 
 ## 1. Vercel
 

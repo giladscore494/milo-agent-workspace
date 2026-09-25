@@ -59,17 +59,72 @@ and 5. Stop it by cancelling its run (run or batch cancellation through the
 API), or cancel the execution itself (`gcloud run jobs executions cancel
 <EXECUTION> --region <GCP_REGION>`). Nothing above deletes data.
 
-After the order (not part of it): set `GATEWAY_ALLOW_EXECUTION_ROUTES=false`
-in Vercel if plan writes should close too, and verify
+After the order (not part of it), close every other flag the website
+activation opened: on the API `MILO_ENABLE_WORK_SCOPE_MUTATIONS`,
+`MILO_ENABLE_EXECUTION_CONTROL`, `MILO_ENABLE_RUN_CANCELLATION` and
+`MILO_ENABLE_CATALOG_EXECUTION`; on the worker `MILO_ENABLE_EXECUTION_CONTROL`
+and `MILO_ENABLE_CATALOG_EXECUTION`; on the Government capture job, if it
+exists, `MILO_ENABLE_CATALOG_EXECUTION`; in Vercel
+`GATEWAY_ALLOW_EXECUTION_ROUTES` and `NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI`,
+then redeploy. Re-assert every flag the contract pins off as `false` on both
+surfaces too (`MILO_ENABLE_CATALOG_PROMOTION`,
+`MILO_ENABLE_WORK_SCOPE_PREPARATION`, the dormant `MILO_ENABLE_PROPOSAL_*`, and
+the rest of the Stage A list). Do this only **after** in-flight runs are
+cancelled: closing `MILO_ENABLE_RUN_CANCELLATION` or
+`GATEWAY_ALLOW_EXECUTION_ROUTES` also closes run and batch cancellation,
+including from the website. Then verify
 `MILO_APPROVED_WORKER_IDENTITIES` still names only the worker identity.
 
-Flags are individual by design and each step is explicit and auditable. No
-script covers this whole order today: the two historical kill switches
-(`scripts/release/stage-c/kill-switch.sh` and
+### The script: `scripts/deploy/kill-switch.sh`
+
+`scripts/deploy/kill-switch.sh` is this order as commands: steps 1–5 above in
+this order, then the "after the order" flags as step 6. The flag lists come
+from `scripts/deploy/deployment-contract.sh` (the enable arrays
+`scripts/deploy/website-execution-activate.sh` opens, the pinned-off arrays,
+the Stage A flag list and the capture master flag), so every flag the
+activation opens is one the switch closes (`tests/test_deploy_kill_switch.py`
+pins that). The capture job is closed only when `CLOUD_RUN_CAPTURE_JOB` is
+configured and the job exists.
+
+Every `vercel` command runs in the directory linked to the Vercel project,
+`frontend/` by default (`--vercel-cwd` to change it, `--vercel-scope` for a
+team), the same convention as `scripts/release/check-vercel-config.sh`.
+`--apply` refuses before changing anything unless that directory holds
+`.vercel/project.json` and `vercel whoami` succeeds, and unless the gcloud
+account is logged in to the configured project. `vercel env rm` removes the
+whole variable record, so a value shared with the preview or development
+targets is removed there too (always in the closing direction).
+
+```bash
+# Default: dry run — prints every command, calls neither gcloud nor vercel.
+scripts/deploy/kill-switch.sh
+# Execute. With runs in flight: steps 1-5, cancel them, then step 6.
+MILO_OPERATOR_ACK=I_UNDERSTAND_THIS_CHANGES_PRODUCTION \
+  scripts/deploy/kill-switch.sh --apply --order-only \
+  --vercel-deployment <CURRENT_PRODUCTION_DEPLOYMENT_URL>
+MILO_OPERATOR_ACK=I_UNDERSTAND_THIS_CHANGES_PRODUCTION \
+  scripts/deploy/kill-switch.sh --apply --remaining-only \
+  --vercel-deployment <CURRENT_PRODUCTION_DEPLOYMENT_URL>
+```
+
+A failed step is reported and the later steps still run (every step only
+closes something). It then reads the API service and the worker job back and
+exits non-zero unless every flag it closed reads back closed,
+`JOB_LAUNCHER=disabled` and neither provider key is bound (those two are steps
+3 and 5, so
+`--remaining-only` does not check them), the API's traffic is 100% on the
+latest revision (a service pinned to an older revision is not serving the
+closed configuration: route it with `gcloud run services update-traffic
+--to-latest`), and the capture job, when it was closed, reads back closed.
+Vercel values cannot be read back by the CLI:
+confirm with `scripts/deploy/website-execution-check.sh`. It never enables
+anything, never cancels an execution and never deletes anything.
+
+The two historical kill switches (`scripts/release/stage-c/kill-switch.sh` and
 `scripts/release/stage-d/kill-switch.sh`) set only the Stage C/D flag set and
 do not touch `MILO_ENABLE_WORK_SCOPE_*`, `MILO_ENABLE_GOVERNMENT_CATALOG_READ`,
-`MILO_ENABLE_CATALOG_PROMOTION` or any Vercel variable (see
-`docs/cleanup/CLEANUP_INVENTORY.md`, decision D5).
+`MILO_ENABLE_CATALOG_PROMOTION` or any Vercel variable; they are not this
+order (see `docs/cleanup/CLEANUP_INVENTORY.md`, decision D5).
 
 ## Catalog execution — the independent rollback
 
