@@ -9808,3 +9808,12 @@ def test_the_reasoning_usage_migration_is_service_only_and_rerun_safe(db):
     assert _has_execute(db, "service_role", signature)
     assert db.psql("select count(*) from pg_constraint "
                    "where conname='run_usage_ledger_reasoning_counts_nonnegative'") == "1"
+    # Added NOT VALID, then validated: it ends VALID, and it never scanned the
+    # ledger under the ACCESS EXCLUSIVE lock. The migration fails fast on lock
+    # contention instead of queueing appends behind it.
+    assert db.psql("select convalidated from pg_constraint "
+                   "where conname='run_usage_ledger_reasoning_counts_nonnegative'") == "t"
+    text = _reasoning_usage_migration().read_text().lower()
+    assert "set local lock_timeout = '5s';" in text
+    assert ") not valid;" in text
+    assert "validate constraint run_usage_ledger_reasoning_counts_nonnegative" in text

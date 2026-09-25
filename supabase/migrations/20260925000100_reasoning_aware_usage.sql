@@ -32,6 +32,11 @@
 -- merge and monotonic trigger are defined over every numeric key a record
 -- carries, so the new counters merge and are protected exactly like the old.
 
+-- Fail fast rather than queue behind a long transaction holding a lock on the
+-- ledger (every settled model call appends to it): a blocked ALTER would in
+-- turn block every append queued behind it.
+set local lock_timeout = '5s';
+
 alter table public.run_usage_ledger
   add column if not exists cached_input_tokens integer,
   add column if not exists cache_write_tokens integer,
@@ -50,9 +55,17 @@ begin
         and coalesce(cache_write_tokens, 0) >= 0
         and coalesce(reasoning_tokens, 0) >= 0
         and coalesce(reasoning_tokens_estimated, 0) >= 0
-        and coalesce(answer_tokens, 0) >= 0);
+        and coalesce(answer_tokens, 0) >= 0) not valid;
   end if;
 end $$;
+
+-- Added NOT VALID (no table scan under the ACCESS EXCLUSIVE lock), then
+-- validated separately under a SHARE UPDATE EXCLUSIVE lock that does not
+-- block appends. Existing rows carry only NULLs in the new columns, so the
+-- validation cannot fail; re-running it on an already valid constraint is a
+-- no-op.
+alter table public.run_usage_ledger
+  validate constraint run_usage_ledger_reasoning_counts_nonnegative;
 
 create or replace function public.append_usage_ledger_guarded(
   p_run_id uuid, p_worker_id text, p_attempt integer, p_lease_token text,
