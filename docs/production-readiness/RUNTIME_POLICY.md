@@ -11,7 +11,7 @@ maintained by hand and were free to disagree:
 
 | Surface | What it said |
 |---|---|
-| `backend/tier2_profile.py` | 23 tasks, 56 agent steps, 24 tool calls, 1 replan, $3.00 — and enforced nothing |
+| `backend/tier2_profile.py` (removed in cleanup D10; prose now [TIER2_FIRST_RUN_PROFILE.md](TIER2_FIRST_RUN_PROFILE.md)) | 23 tasks, 56 agent steps, 24 tool calls, 1 replan, $3.00 — and enforced nothing |
 | `backend/budget.py` | enforced model calls, tokens, cost, duration; required **five** of them for paid execution, not including `max_agent_steps` or the recorded-cost cap |
 | `backend/engines/swarm_v2/validation.py` | admitted plans against `PlanLimits` defaults of **64 tasks, 3 replans, 100 tool calls** |
 | `scripts/release/stage-d/stage-d-env.sh` | its own transcription of the whole envelope, including `MILO_PROVIDER_RPM_LIMIT=350` |
@@ -82,8 +82,8 @@ Each dimension is declared exactly once, in `POLICY_DIMENSIONS`, with:
                                │
    ┌──────────┬────────────┬───┴────┬─────────────┬──────────────┐
    │          │            │        │             │              │
-BudgetConfig  PlanLimits  Provider  production_   tier2_profile  stage-d/
-(budget.py)   (swarm_v2)  LimitsCfg config.py     (the document) policy_envelope.py
+BudgetConfig  PlanLimits  Provider  production_   (tests pin     stage-d/
+(budget.py)   (swarm_v2)  LimitsCfg config.py     reviewed vals) policy_envelope.py
    │          │    │                                             │
 BudgetTracker │  ModelGateway (what the model is told)      stage-d-env.sh
               │  PlanValidator (what the firewall enforces)  verify_caps.py

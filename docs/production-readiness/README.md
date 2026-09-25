@@ -21,6 +21,7 @@ this set wins and the older document carries an archive banner.
 | [RUN_IDENTITY.md](RUN_IDENTITY.md) | The immutable run identity, full worker persistence fencing, the canonical event registry, export identity and the release binding chain |
 | [BUDGETS_AND_COSTS.md](BUDGETS_AND_COSTS.md) | Hard budgets, reservations, settlement, costs |
 | [REASONING_BUDGET.md](REASONING_BUDGET.md) | PR-R: model profiles (fail-closed), reasoning-aware role policies, worst-case cost reservation, truncation codes, Stage E model env, Work plan Revision 2.3 |
+| [TIER2_FIRST_RUN_PROFILE.md](TIER2_FIRST_RUN_PROFILE.md) | The Tier 2 first-run profile: ceiling vs active profile, the evidence behind it, search QPS, the request-lease invariant (formerly `backend/tier2_profile.py`) |
 | [RATE_LIMITING.md](RATE_LIMITING.md) | Shared-store rate limiting (gateway + API) |
 | [PROVIDER_AUTHORITY.md](PROVIDER_AUTHORITY.md) | The one provider adapter: outcome taxonomy, retry/admission, token admission, MILO-mediated standalone search, absolute deadline |
 | [ENVIRONMENT_MATRIX.md](ENVIRONMENT_MATRIX.md) | Every production variable, classified |

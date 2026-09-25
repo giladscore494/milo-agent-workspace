@@ -14,7 +14,6 @@ No provider call, no network, no database, no run.
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 from dataclasses import replace
@@ -38,7 +37,6 @@ from backend.runtime_policy import (BUDGET, CAP_ENV_PREFIXES, DIMENSIONS,
                                     dimensions_for, paid_posture, policy_violations,
                                     resolve_runtime_policy, resolved_dimension,
                                     reviewed_first_run_policy, reviewed_policy_violations)
-from backend.tier2_profile import tier2_first_run_profile
 from backend.tools import ToolContext, ToolMode, ToolOperation, ToolRegistry
 
 REPO = Path(__file__).resolve().parents[1]
@@ -395,17 +393,13 @@ def test_stage_d_binds_the_policy_by_content_not_by_checkout():
         REPO / "backend" / "runtime_policy.py").resolve()
 
 
-def test_the_first_run_profile_is_the_policy_rather_than_a_document_about_it():
-    profile = tier2_first_run_profile()
-    active = profile["active_profile"]
-    assert profile["runtime_policy"]["fingerprint"] == POLICY.fingerprint()
-    assert active["max_tasks"] == POLICY["max_tasks"] == 23
-    assert active["max_agent_steps"] == POLICY["max_agent_steps"] == 56
-    assert active["max_tool_calls"] == POLICY["max_tool_calls"] == 24
-    assert active["max_replans"] == POLICY["max_replans"] == 1
-    assert active["rpm"] == POLICY["provider_rpm_limit"]
-    assert active["recorded_cost_cap_usd"] == POLICY["max_cost_per_run"]
-    json.dumps(profile)
+def test_the_reviewed_first_run_plan_shape_is_pinned():
+    # Formerly asserted through backend/tier2_profile.py, which only re-read
+    # these values; asserted on the policy itself now.
+    assert POLICY["max_tasks"] == 23
+    assert POLICY["max_agent_steps"] == 56
+    assert POLICY["max_tool_calls"] == 24
+    assert POLICY["max_replans"] == 1
 
 
 def test_the_policy_fingerprint_is_deterministic():
@@ -793,14 +787,6 @@ def test_the_execution_increment_is_the_policys_and_nothing_elses():
     collect = (STAGE_D / "06-collect-evidence.sh").read_text()
     assert "STAGE_D_AUTHORIZED_EXECUTION_INCREMENT" in collect
     assert "STAGE_D_EXPECTED_PRIOR_EXECUTIONS + 1" not in collect
-
-
-def test_the_first_run_profile_reports_the_same_execution_cap():
-    active = tier2_first_run_profile()["active_profile"]
-    assert active["first_paid_run_execution_cap"] == int(
-        POLICY["first_paid_run_execution_cap"])
-    assert active["max_simultaneous_provider_using_worker_executions"] == active[
-        "first_paid_run_execution_cap"]
 
 
 # =============================================================================

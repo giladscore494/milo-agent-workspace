@@ -492,8 +492,10 @@ that exceeds the ceiling.
 > Both are now refused or clamped; the Stage D pinned envelope must be
 > re-derived before it is used.
 
-The recommended first-run values live in `backend/tier2_profile.py`
-(`TIER2_FIRST_RUN_PROFILE`). Approaching the ceiling is **not** a goal.
+The recommended first-run values live in the reviewed runtime policy
+(`backend/runtime_policy.py`, `reviewed_first_run_policy()`); the profile's
+reasoning is in [TIER2_FIRST_RUN_PROFILE.md](TIER2_FIRST_RUN_PROFILE.md)
+(formerly `backend/tier2_profile.py`). Approaching the ceiling is **not** a goal.
 
 ### Logical parallelism is not provider concurrency
 
