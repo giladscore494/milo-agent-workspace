@@ -41,11 +41,26 @@ atomic pre-call reservation and post-call settlement path:
 Legacy daily-budget RPCs from migration `014` are deprecated with execute
 privileges revoked, so production has exactly one canonical lifecycle.
 
+### Worst-case reservation for Swarm V2 calls (PR-R)
+
+A Swarm V2 call reserves its WORST-CASE cost, not a flat estimate:
+`input_upper_bound × max(miss, 5-minute cache write) + granted_output_cap ×
+output price`, where the output price includes reasoning tokens. The
+reservation is checked against the run's remaining `MILO_MAX_COST_PER_RUN`
+(after actual spend and in-flight reserves) and against the remaining daily
+user and project budgets BEFORE the request is sent
+(`COST_RESERVATION_EXCEEDED`). The same amount is held by the atomic daily
+reservation above. V1 keeps the flat `MILO_ESTIMATED_COST_PER_CALL`. See
+[REASONING_BUDGET.md](REASONING_BUDGET.md).
+
 ## Actual usage and overage
 
 `BudgetTracker` counts tokens and cost from provider responses, falling
-back to `backend/model_pricing.py` for deterministic per-model cost when
-the provider omits cost. Post-call overage checks emit append-only ledger
+back to the fail-closed model profile registry (`backend/model_profiles.py`)
+for deterministic per-model cost when the provider omits cost. A model with
+no profile is refused before any call (`MODEL_PROFILE_UNKNOWN`), never priced
+at zero. Cached input is priced at the hit price, cache writes at their tier,
+and all output, reasoning included, at the output price. Post-call overage checks emit append-only ledger
 `overage` entries (`run_usage_ledger`, migration `013`) and stop the run on
 actual-limit breach — caps are enforced on actuals, not only estimates.
 Aggregate usage is persisted on the run (`runs.usage`, migration `010`).

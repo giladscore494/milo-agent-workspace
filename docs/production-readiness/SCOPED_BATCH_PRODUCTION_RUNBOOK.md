@@ -732,6 +732,18 @@ In this order, stopping at the first failure:
    then reads back every value and the secret binding. If this fails, the API
    is **not** touched. With the API's run creation still off, nothing can use
    the armed worker.
+
+   **PR-R model contract (worker only).** Since PR-R the worker must also
+   carry `MILO_COMMANDER_MODEL=kimi-k3`,
+   `MILO_COMMANDER_MODEL_ALLOWLIST=kimi-k3,kimi-k2.6` and
+   `MILO_SWARM_WORKER_MODEL=kimi-k2.6`. A paid Swarm V2 run is refused at
+   boot (`MODEL_PROFILE_UNKNOWN` / `MODEL_NOT_ALLOWLISTED`) otherwise. The
+   reviewed RuntimePolicy it applies now carries `MILO_MAX_COST_PER_RUN=3.00`,
+   `MILO_DAILY_USER_BUDGET=10.00`, `MILO_DAILY_PROJECT_BUDGET=10.00`,
+   `MILO_MAX_OUTPUT_TOKENS_PER_RUN=400000` and
+   `MILO_MAX_TOTAL_TOKENS_PER_RUN=900000`. Check the posture with
+   `check-production-config.sh --env-file` (`model-contract` must PASS). See
+   [REASONING_BUDGET.md](REASONING_BUDGET.md).
 4. **The API.** It sets `JOB_LAUNCHER=cloud_run`, the worker identity, the
    concurrency caps and the API flags, then reads them back. Preparation,
    promotion and paid execution on the API stay pinned off.
@@ -874,7 +886,9 @@ this change does not perform it.
      execution** panel, which shows the engine, phase, work and budget from
      durable events;
    - the inspector **Agents** tab, and **Costs** for usage against the reviewed
-     caps (`$1.00` actual per run, `$3.00` estimated, `$4.00` daily);
+     caps (`$3.00` actual per run, held as a worst-case reservation per
+     call, `$3.00` estimated, `$10.00` daily), and the reasoning-token rows
+     (reported or estimated);
    - the Mapping Plan's **Current** line (for example `running`). *"The worker
      for this batch has not been started"* or *"unresolved"* means an operator
      step is needed ([work-scope.md](../work-scope.md#continuation)); the
