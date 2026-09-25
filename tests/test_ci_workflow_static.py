@@ -179,7 +179,7 @@ def test_offline_checks_ignores_only_modules_the_strict_gate_runs():
     for path in ignored:
         if path.startswith("tests/"):
             assert path in gate_args, f"{path} is ignored by offline-checks AND not run by postgres-checks"
-    assert "MILO-main-original/MILO-main/test_websearch.py" in ignored  # paid calls; AGENTS.md
+    assert "legacy/milo-streamlit-v1/test_websearch.py" in ignored  # paid calls; AGENTS.md
 
 
 def _modules_that_start_postgres() -> list[str]:
@@ -373,7 +373,7 @@ def test_the_archive_integrity_step_passes_on_the_real_snapshot_and_fails_on_dri
     assert _run_step(root, INTEGRITY_STEP).returncode != 0
 
     root = _snapshot_repo(tmp_path / "second")
-    extra = root / "MILO-main-original" / "MILO-main" / "extra.py"
+    extra = root / "legacy" / "milo-streamlit-v1" / "extra.py"
     extra.write_text("x = 1\n")
     _git(root, "add", str(extra))
     assert _run_step(root, INTEGRITY_STEP).returncode != 0, "an unlisted snapshot file must fail"
@@ -393,7 +393,7 @@ def _scope(root: Path, tmp_path: Path, **env: str) -> str:
 @pytest.mark.parametrize("changed,expected", [
     ("backend/unrelated.py", "false"),
     ("legacy/milo-streamlit-v1/app.py", "true"),
-    ("MILO-main-original/MILO-main/app.py", "true"),
+    ("legacy/milo-streamlit-v1/test_safety_guards.py", "true"),
     ("archive/SHA256SUMS.txt", "true"),
 ])
 def test_the_prototype_checks_run_exactly_when_the_snapshot_can_have_changed(tmp_path, event, changed, expected):
