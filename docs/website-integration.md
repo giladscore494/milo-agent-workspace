@@ -238,7 +238,7 @@ and `/review-candidates` (`backend/catalog/review.py`, ≤100 items per page) in
 
 Canonical registry: `backend/runtime_policy.py`; rendered by
 `scripts/release/stage-d/policy_envelope.py` (fingerprint
-`7ffc0f6d36220ecdd773955ef4e89289d804fa86e2e279ddd93a6bd6c37ed52b`).
+`8f4ef66c58878468feeb9309eaa540dbaee7fb01f2425d2f65dca66df8476de1`).
 
 The website does not transcribe any of this. `GET /runs/{id}` (and the
 history read) carry `limits.concurrency`, computed by

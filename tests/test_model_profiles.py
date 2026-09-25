@@ -136,3 +136,24 @@ def test_paid_worker_boot_refuses_a_swarm_run_whose_model_has_no_profile(monkeyp
     assert run["status"] == "failed"
     assert run["error"]["code"] == MODEL_PROFILE_UNKNOWN
     assert completions.calls == []
+
+
+@pytest.mark.parametrize("commander,allowlist,worker,verdict", [
+    ("kimi-k3", "kimi-k3,kimi-k2.6", "kimi-k2.6", "[PASS] model-contract"),
+    ("kimi-k9", "kimi-k9", "kimi-k2.6", "[BLOCKED] model-contract"),
+    ("kimi-k3", "kimi-k3", "kimi-k2.6", "[BLOCKED] model-contract"),   # worker not allowlisted
+])
+def test_production_config_check_enforces_the_model_contract(tmp_path, commander, allowlist,
+                                                             worker, verdict):
+    import subprocess
+
+    env_file = tmp_path / "worker.env"
+    env_file.write_text(f"ENVIRONMENT=production\nMILO_COMMANDER_MODEL={commander}\n"
+                        f"MILO_COMMANDER_MODEL_ALLOWLIST={allowlist}\n"
+                        f"MILO_SWARM_WORKER_MODEL={worker}\n")
+    result = subprocess.run(["bash", "scripts/release/check-production-config.sh",
+                             "--env-file", str(env_file)],
+                            capture_output=True, text=True, timeout=180)
+    assert verdict in result.stdout + result.stderr
+    # Values are never printed, only the verdict and the static code.
+    assert "kimi-k9" not in result.stdout + result.stderr

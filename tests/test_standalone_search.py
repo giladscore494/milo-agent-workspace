@@ -1186,7 +1186,9 @@ def test_this_change_widened_no_runtime_policy_or_budget_ceiling():
     policy = reviewed_first_run_policy()
     assert policy.values["max_search_invocations_per_run"] == 60
     assert policy.values["search_cost_per_invocation"] == pytest.approx(0.003)
-    assert policy.values["max_cost_per_run"] == pytest.approx(1.00)
+    # PR-R (MILO_V2_REASONING_BUDGET_PR_SPEC.md 4.8) raised the recorded-cost
+    # ceiling to 3.00 for reasoning models; search did not.
+    assert policy.values["max_cost_per_run"] == pytest.approx(3.00)
     assert policy.values["max_builtin_searches_per_request"] == 4
 
     stage_d = _Path("scripts/release/stage-d")

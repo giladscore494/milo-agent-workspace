@@ -343,6 +343,30 @@ else
     fi
   done
 
+  # PR-R: the Swarm V2 model contract. Every model the metadata names must
+  # have a registered profile (an unprofiled model cannot be priced, so no
+  # dollar ceiling could hold it) and both role models must be allowlisted.
+  # Derived from backend/model_profiles.py, never restated here; values are
+  # passed as arguments and never printed.
+  model_contract="$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from backend.model_profiles import ModelConfigError, validate_swarm_model_contract
+env = {"MILO_COMMANDER_MODEL": sys.argv[2], "MILO_SWARM_WORKER_MODEL": sys.argv[3],
+       "MILO_COMMANDER_MODEL_ALLOWLIST": sys.argv[4]}
+try:
+    validate_swarm_model_contract(env, require_present=False)
+except ModelConfigError as exc:
+    print(exc.code)
+    sys.exit(0)
+print("OK")
+' "${REPO_ROOT}" "$(env_meta MILO_COMMANDER_MODEL M)" "$(env_meta MILO_SWARM_WORKER_MODEL M)" "$(env_meta MILO_COMMANDER_MODEL_ALLOWLIST M)" 2> /dev/null || echo "UNREADABLE")"
+  if [[ "${model_contract}" == "OK" ]]; then
+    record_check PASS "model-contract" "every configured Swarm V2 model is profiled and both role models are allowlisted"
+  else
+    record_check BLOCKED "model-contract" "Swarm V2 model contract refused (${model_contract}); see backend/model_profiles.py"
+  fi
+
   # Explicit CORS origins; wildcard forbidden.
   cors="$(env_meta ALLOWED_CORS_ORIGINS M)"
   if [[ -z "${cors}" ]]; then

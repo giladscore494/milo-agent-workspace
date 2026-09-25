@@ -263,23 +263,35 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
     _d("max_input_tokens_per_run", 500_000, env_key="MILO_MAX_INPUT_TOKENS_PER_RUN",
        enforced_by=BUDGET,
        why="1.75x the 277,882 input tokens Attempt 7 consumed"),
-    _d("max_output_tokens_per_run", 120_000, env_key="MILO_MAX_OUTPUT_TOKENS_PER_RUN",
+    _d("max_output_tokens_per_run", 400_000, env_key="MILO_MAX_OUTPUT_TOKENS_PER_RUN",
        enforced_by=BUDGET,
-       why="3.5x rather than 1.75x the observed 34,136: output volume is the "
-           "most variable dimension of the preserved pipeline and one small "
-           "observation is a poor basis for a tight cap"),
-    _d("max_total_tokens_per_run", 600_000, env_key="MILO_MAX_TOTAL_TOKENS_PER_RUN",
+       why="PR-R (MILO_V2_REASONING_BUDGET_PR_SPEC.md 4.8), raised from "
+           "120,000: output now INCLUDES reasoning -- the provider counts "
+           "reasoning and answer against one cap -- and the reasoning-aware "
+           "role caps (32k plan, 24k verifier batch, 12k worker) put a 10-candidate "
+           "K3 batch near ~200k output in the spec's estimate. Money, not this "
+           "count, is the hard bound: every call reserves its worst-case cost. "
+           "(History: 120,000 was 3.5x rather than 1.75x the observed 34,136 "
+           "of Stage C Attempt 7, for a model that did not reason.)"),
+    _d("max_total_tokens_per_run", 900_000, env_key="MILO_MAX_TOTAL_TOKENS_PER_RUN",
        enforced_by=BUDGET,
-       why="deliberately below input+output (620,000) so the joint ceiling "
-           "binds before either component does"),
+       why="PR-R (spec 4.8), raised from 600,000 with the output ceiling; "
+           "equal to input+output (500,000 + 400,000), never above it, so the "
+           "joint ceiling still binds no later than either component"),
     _d("max_estimated_cost_per_run", 3.00, kind=float, fmt=FMT_MONEY,
        env_key="MILO_MAX_ESTIMATED_COST_PER_RUN", enforced_by=BUDGET,
        why="exactly max_model_calls_per_run x estimated_cost_per_call, so the "
            "reservation ceiling admits the call cap and not one call more"),
-    _d("max_cost_per_run", 1.00, kind=float, fmt=FMT_MONEY,
+    _d("max_cost_per_run", 3.00, kind=float, fmt=FMT_MONEY,
        env_key="MILO_MAX_COST_PER_RUN", enforced_by=BUDGET,
-       why="the RECORDED-cost ceiling, tighter than the estimated one because "
-           "the V1 evidence run cost $0.34 and no evidence says more is needed"),
+       why="PR-R (MILO_V2_REASONING_BUDGET_PR_SPEC.md 4.8), raised from 1.00: "
+           "a 10-candidate Swarm V2 batch with kimi-k3 as Commander and "
+           "Verifier is estimated at ~$1.5-1.7 (plan ~$0.34, replan <=$0.20, "
+           "verifier ~$0.60, workers ~$0.55 at the verified prices). It is the "
+           "HARD money bound of the run: every Swarm V2 call reserves its "
+           "worst-case cost against it BEFORE it is sent, so no single call, "
+           "however much it reasons, can spend past it. Equal to, never above, "
+           "hard_monetary_cap_usd"),
     _d("max_run_duration_seconds", 1800, env_key="MILO_MAX_RUN_DURATION_SECONDS",
        enforced_by=BUDGET,
        why="NOT raised after run 3772fc84 timed out at 1800s: that timeout was "
@@ -298,14 +310,18 @@ POLICY_DIMENSIONS: tuple[PolicyDimension, ...] = (
     _d("max_concurrent_runs_per_project", 1, env_key="MILO_MAX_CONCURRENT_RUNS_PER_PROJECT",
        enforced_by=BUDGET,
        why="one controlled paid run means one, per project as well as in total"),
-    _d("daily_user_budget", 4.00, kind=float, fmt=FMT_MONEY,
+    _d("daily_user_budget", 10.00, kind=float, fmt=FMT_MONEY,
        env_key="MILO_DAILY_USER_BUDGET", enforced_by=BUDGET,
-       why="above the 3.00 reservation ceiling so a daily budget never fails "
-           "the run before the per-run cap does"),
-    _d("daily_project_budget", 4.00, kind=float, fmt=FMT_MONEY,
+       why="PR-R (spec 4.8), raised from 4.00: above the 3.00 run ceiling so "
+           "a daily budget never fails the run before the per-run cap does, "
+           "and room for ~3 full K3 runs a day at their worst-case reservations "
+           "(the daily reservation now holds each call's worst case, not $0.02)"),
+    _d("daily_project_budget", 10.00, kind=float, fmt=FMT_MONEY,
        env_key="MILO_DAILY_PROJECT_BUDGET", enforced_by=BUDGET,
-       why="above the 3.00 reservation ceiling so a daily budget never fails "
-           "the run before the per-run cap does"),
+       why="PR-R (spec 4.8), raised from 4.00: above the 3.00 run ceiling so "
+           "a daily budget never fails the run before the per-run cap does, "
+           "and room for ~3 full K3 runs a day at their worst-case reservations "
+           "(the daily reservation now holds each call's worst case, not $0.02)"),
     _d("estimated_cost_per_call", 0.02, kind=float, direction=HIGHER_IS_TIGHTER,
        fmt=FMT_MONEY, env_key="MILO_ESTIMATED_COST_PER_CALL", runtime_default=0.05,
        enforced_by=BUDGET,

@@ -533,8 +533,9 @@ def test_an_unpaid_stack_may_exceed_a_reviewed_value_but_never_silently():
     """
     policy = resolve_runtime_policy(STAGING_ENV)
     assert policy.paid is False
-    assert set(policy.relaxed) == {"daily_user_budget", "daily_project_budget",
-                                   "estimated_cost_per_call"}
+    # PR-R raised the reviewed daily budgets to 10.00, so staging's $5.00 is
+    # now a TIGHTENING; only the per-call reservation rate remains relaxed.
+    assert set(policy.relaxed) == {"estimated_cost_per_call"}
     assert policy.document()["relaxed_by_unpaid_deployment"] == sorted(policy.relaxed)
 
 

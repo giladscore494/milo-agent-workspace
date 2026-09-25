@@ -409,9 +409,29 @@ def test_env_caps_are_the_canonical_runtime_policy_value_for_value():
         prefixes=CAP_ENV_PREFIXES)
 
 
+#: The ONLY caps a reviewed change has raised above Stage C, and the change
+#: that did it: PR-R (MILO_V2_REASONING_BUDGET_PR_SPEC.md 4.8). Reasoning
+#: tokens are output tokens, and the daily reservation now holds each call's
+#: worst-case cost, so these two dimensions were re-sized deliberately. The
+#: dollar ceiling that bounds a RUN (MILO_MAX_COST_PER_RUN) stays at the
+#: Stage C value. Every entry must be justified on its own dimension.
+PR_R_RAISED_ABOVE_STAGE_C = {
+    "MILO_MAX_OUTPUT_TOKENS_PER_RUN": 400_000,
+    "MILO_DAILY_USER_BUDGET": 10.00,
+    "MILO_DAILY_PROJECT_BUDGET": 10.00,
+}
+
+
 @pytest.mark.parametrize("name,stage_c_value", sorted(STAGE_C_CAPS.items()))
 def test_no_stage_d_cap_exceeds_its_stage_c_counterpart(name, stage_c_value):
-    """The core promise: Stage D raises no Stage C limit."""
+    """The core promise: Stage D raises no Stage C limit -- except the ones a
+    reviewed change raised by name, to exactly its value, with its reason."""
+    if name in PR_R_RAISED_ABOVE_STAGE_C:
+        assert stage_d_caps()[name] == PR_R_RAISED_ABOVE_STAGE_C[name]
+        dimension = next(d for d in DIMENSIONS.values() if d.env_key == name)
+        assert "PR-R" in dimension.why and "4.8" in dimension.why, (
+            f"{name} was raised without citing the reviewed change that raised it")
+        return
     assert stage_d_caps()[name] <= stage_c_value, f"{name} was RAISED above the Stage C value"
 
 
@@ -461,8 +481,11 @@ def test_estimated_cost_ceiling_admits_exactly_the_call_cap_and_no_more():
 
 
 def test_joint_token_ceiling_binds_before_the_separate_token_caps():
+    # PR-R (spec 4.8) sets 900,000 = 500,000 + 400,000: the joint ceiling may
+    # bind together with the components, never after them -- the same rule
+    # `reviewed_policy_violations` enforces.
     caps = stage_d_caps()
-    assert caps["MILO_MAX_TOTAL_TOKENS_PER_RUN"] < (
+    assert caps["MILO_MAX_TOTAL_TOKENS_PER_RUN"] <= (
         caps["MILO_MAX_INPUT_TOKENS_PER_RUN"] + caps["MILO_MAX_OUTPUT_TOKENS_PER_RUN"]
     )
 
@@ -703,7 +726,8 @@ def test_verify_caps_refuses_any_provider_variable_on_the_api(tmp_path):
 
 
 @pytest.mark.parametrize("cap,loosened", [
-    ("MILO_MAX_COST_PER_RUN=1.00", "MILO_MAX_COST_PER_RUN=3.00"),
+    # PR-R reviewed 3.00; anything above it is a loosening.
+    ("MILO_MAX_COST_PER_RUN=3.00", "MILO_MAX_COST_PER_RUN=4.00"),
     ("MILO_MAX_MODEL_CALLS_PER_RUN=150", "MILO_MAX_MODEL_CALLS_PER_RUN=200"),
 ])
 def test_verify_caps_refuses_a_loosened_cap_on_either_surface(tmp_path, cap, loosened):

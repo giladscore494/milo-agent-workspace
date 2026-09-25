@@ -96,9 +96,14 @@ def test_every_expected_env_name_is_read_by_the_backend():
 
 def test_expected_values_match_the_production_facts():
     expected = parse_env_contract.WORKER_EXPECTED
-    assert expected["MILO_COMMANDER_MODEL"] == "kimi-k2.6"
+    # PR-R model contract: K3 thinks for Commander and Verifier, k2.6 works.
+    assert expected["MILO_COMMANDER_MODEL"] == "kimi-k3"
     assert expected["MILO_SWARM_WORKER_MODEL"] == "kimi-k2.6"
-    assert expected["MILO_COMMANDER_MODEL_ALLOWLIST"] == "kimi-k2.6"
+    assert expected["MILO_COMMANDER_MODEL_ALLOWLIST"] == "kimi-k3,kimi-k2.6"
+    # ...and it is a contract the worker itself would accept at boot.
+    from backend.model_profiles import validate_swarm_model_contract
+    assert validate_swarm_model_contract(expected, require_present=True) == (
+        "kimi-k3", "kimi-k2.6", ("kimi-k3", "kimi-k2.6"))
     assert expected["MILO_SWARM_MAX_ACTIVE_WORKERS"] == "8"
     assert expected["MILO_PROVIDER_MAX_CONCURRENCY"] == "8"
     assert expected["MILO_MAX_COST_PER_RUN"] == "3.00"

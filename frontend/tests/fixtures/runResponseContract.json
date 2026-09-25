@@ -48,7 +48,7 @@
       "workflow_key": "vehicle_catalog_v1",
       "engine_version": "vehicle_catalog_v1.stage3",
       "policy_version": "milo-runtime-policy/1",
-      "policy_fingerprint": "7ffc0f6d36220ecdd773955ef4e89289d804fa86e2e279ddd93a6bd6c37ed52b",
+      "policy_fingerprint": "8f4ef66c58878468feeb9309eaa540dbaee7fb01f2425d2f65dca66df8476de1",
       "release_sha": "84cd8696119c24662a954d0f0e23195268dab23f",
       "event_registry_version": "milo-event-registry/1",
       "event_registry_fingerprint": "c96c49ed53e1166a9298b94d223cbbb38b1987a9e194806fd702667917f18971"
@@ -102,7 +102,7 @@
       "workflow_key": "vehicle_catalog_v1",
       "engine_version": "vehicle_catalog_v1.stage3",
       "policy_version": "milo-runtime-policy/1",
-      "policy_fingerprint": "7ffc0f6d36220ecdd773955ef4e89289d804fa86e2e279ddd93a6bd6c37ed52b",
+      "policy_fingerprint": "8f4ef66c58878468feeb9309eaa540dbaee7fb01f2425d2f65dca66df8476de1",
       "release_sha": "84cd8696119c24662a954d0f0e23195268dab23f",
       "event_registry_version": "milo-event-registry/1",
       "event_registry_fingerprint": "c96c49ed53e1166a9298b94d223cbbb38b1987a9e194806fd702667917f18971"
