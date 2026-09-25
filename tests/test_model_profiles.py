@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, build_guarded_client_factory
-from backend.model_pricing import PRICING, calculate_model_cost
 from backend.model_profiles import (MODEL_NOT_ALLOWLISTED, MODEL_PROFILE_UNKNOWN, PROFILES,
                                     SWARM_MODEL_CONFIG_INVALID, ModelConfigError,
                                     UnknownModelProfile, get_profile,
@@ -34,15 +33,15 @@ def test_unknown_model_has_no_profile_and_no_zero_price():
             get_profile(name)
         assert caught.value.code == MODEL_PROFILE_UNKNOWN
     with pytest.raises(UnknownModelProfile):
-        calculate_model_cost("unregistered-model", 1000, 1000)
-    assert set(PRICING) == set(PROFILES)
+        get_profile("unregistered-model").usage_cost(input_tokens=1000, output_tokens=1000)
 
 
-def test_k26_price_correction_is_what_the_compat_surface_reports():
+def test_k26_price_correction_is_what_the_registry_charges():
     # 1M in + 1M out at 0.95 + 4.00; the stale table said 0.60 + 2.50.
-    assert calculate_model_cost("kimi-k2.6", 1_000_000, 1_000_000) == pytest.approx(4.95)
-    assert PRICING["kimi-k2.6"].input_per_million == pytest.approx(0.95)
-    assert PRICING["kimi-k2.6"].output_per_million == pytest.approx(4.00)
+    k26 = get_profile("kimi-k2.6")
+    assert float(k26.usage_cost(input_tokens=1_000_000, output_tokens=1_000_000)) == pytest.approx(4.95)
+    assert float(k26.price_input_miss) == pytest.approx(0.95)
+    assert float(k26.price_output) == pytest.approx(4.00)
 
 
 def _guarded(tracker, calls):

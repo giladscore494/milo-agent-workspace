@@ -77,10 +77,6 @@ def _approved_gateway_identities() -> frozenset[str]:
     return frozenset(item.strip().lower() for item in raw.split(",") if item.strip())
 
 
-def gateway_auth_configured() -> bool:
-    return bool(os.getenv("MILO_GATEWAY_AUDIENCE", "").strip()) or bool(_approved_gateway_identities())
-
-
 def _is_production() -> bool:
     return os.getenv("ENVIRONMENT", "local").strip().lower() == "production"
 

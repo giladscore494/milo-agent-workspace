@@ -26,6 +26,7 @@ disabled (Stage A).
 | `SUPABASE_URL` | api+worker | no | no | yes | yes | Supabase project settings | `check-production-config.sh` | none (startup fails) | restore previous value |
 | `SUPABASE_SERVICE_ROLE_KEY` (alias `SUPABASE_SECRET_KEY`) | api+worker | no | **yes** | yes | yes | Supabase → Secret Manager | name-only checks; bundle scan; never printed | none (startup fails) | rotate in Supabase; update secret version; revoke old |
 | `ENVIRONMENT` | api+worker | no | no | yes (`production`) | yes | deployment config | `production_config.validate` | `local` | n/a |
+| `MILO_RELEASE_SHA` | api+worker | no | no | yes | yes | set by `scripts/deploy/cloud-run.sh` to the full image commit SHA | `run_identity` release binding (an absent or mismatched value refuses execution); `production-verify.sh` | none (execution refused) | redeploy the previous release (images and SHA move together) |
 | `ALLOWED_CORS_ORIGINS` | api | no | no | yes (explicit) | yes | production Vercel domain(s) | wildcard rejected (`CORS_WILDCARD`) | localhost only | restore previous origin list |
 | `JOB_LAUNCHER` | api | no | no | yes (`disabled` at Stage A) | must be `disabled` | operator | config check | `disabled` | set `disabled` (kill switch) |
 | `GCP_PROJECT_ID` / `GCP_REGION` / `CLOUD_RUN_WORKER_JOB` | api | no | no | yes when launcher enabled | no | manifest | `check-gcp-resources.sh` | code defaults (overridden in prod) | restore previous values |

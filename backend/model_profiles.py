@@ -5,7 +5,8 @@ its prices, its context window, how it reasons, how its reasoning is
 controlled, which field carries its output cap, which request parameters it
 refuses and which structured-output formats it supports.
 
-It replaces ``backend.model_pricing``'s bare price table, which failed OPEN:
+It replaced ``backend.model_pricing``'s bare price table (that compatibility
+module was removed in cleanup PR-3), which failed OPEN:
 an unrecognised model was priced at 0.0, so a deployment that switched the
 Commander to a model the table did not name would have run with every dollar
 ceiling (per run, per user per day, per project per day) silently disarmed.
@@ -35,7 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Literal, Mapping
 
 #: Static reason codes. Every refusal in this module carries exactly one, and
 #: never the value that was refused.
@@ -259,26 +260,7 @@ def validate_swarm_model_contract(env: Mapping[str, str], *,
     return commander, worker, allowlist
 
 
-def profile_summary(models: Iterable[str] | None = None) -> dict[str, Any]:
-    """A value-safe, JSON-ready description of registered profiles."""
-    names = sorted(PROFILES) if models is None else [m for m in models if m in PROFILES]
-    return {name: {
-        "provider": PROFILES[name].provider,
-        "price_input_miss": str(PROFILES[name].price_input_miss),
-        "price_input_hit": str(PROFILES[name].price_input_hit),
-        "price_cache_write_5m": (None if PROFILES[name].price_cache_write_5m is None
-                                 else str(PROFILES[name].price_cache_write_5m)),
-        "price_cache_write_1h": (None if PROFILES[name].price_cache_write_1h is None
-                                 else str(PROFILES[name].price_cache_write_1h)),
-        "price_output": str(PROFILES[name].price_output),
-        "context_window": PROFILES[name].context_window,
-        "reasoning": PROFILES[name].reasoning,
-        "reasoning_control": PROFILES[name].reasoning_control,
-        "output_cap_field": PROFILES[name].output_cap_field,
-    } for name in names}
-
-
 __all__ = ["CACHE_TTL_1H", "CACHE_TTL_5M", "MODEL_NOT_ALLOWLISTED", "MODEL_PROFILE_UNKNOWN",
            "ModelConfigError", "ModelProfile", "PROFILES", "SWARM_MODEL_CONFIG_INVALID",
-           "UnknownModelProfile", "get_profile", "has_profile", "profile_summary",
+           "UnknownModelProfile", "get_profile", "has_profile",
            "validate_swarm_model_contract"]
