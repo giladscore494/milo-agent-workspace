@@ -393,6 +393,42 @@ def test_stage2_applies_only_behind_the_prepared_gate_and_reads_every_value_back
     assert not any(c.startswith("vercel") for c in tree.calls())
 
 
+def test_apply_runtime_policy_gives_the_api_the_caps_the_worker_enforces(tmp_path):
+    """PR-T: the API displayed 1.00 / 4.00 / 120000 while the worker enforced
+    3.00 / 10.00 / 400000, because --apply-runtime-policy bound only the
+    concurrency caps on the API. Every cap now lands on BOTH surfaces, the
+    API's displayed limits read back equal to the worker's, and no provider or
+    engine setting ever reaches the API."""
+    from backend.budget import BudgetConfig
+    from backend.runtime_policy import (CAP_ENV_PREFIXES, ENGINE_ENV_PREFIXES,
+                                        PROVIDER_ENV_PREFIXES, reviewed_first_run_policy)
+
+    tree, env = _stage2_tree(tmp_path)
+    stale = {"MILO_MAX_COST_PER_RUN": "1.00", "MILO_DAILY_USER_BUDGET": "4.00",
+             "MILO_DAILY_PROJECT_BUDGET": "4.00", "MILO_MAX_OUTPUT_TOKENS_PER_RUN": "120000"}
+    (tmp_path / "state.json").write_text(json.dumps({"service": dict(stale), "job": {}}))
+
+    result = tree.run("website-execution-activate.sh", "--apply-runtime-policy", env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RuntimePolicy bound and read back" in result.stdout
+    state = json.loads((tmp_path / "state.json").read_text())
+    api, job = state["service"], state["job"]
+
+    caps = reviewed_first_run_policy().env_expectations(prefixes=CAP_ENV_PREFIXES)
+    for name, value in caps.items():
+        assert api.get(name) == value == job.get(name), name
+    # The numbers the run page shows come from the API's own BudgetConfig.
+    shown, enforced = BudgetConfig.from_env(api), BudgetConfig.from_env(job)
+    assert (shown.max_cost_per_run, shown.daily_user_budget, shown.max_output_tokens_per_run) \
+        == (enforced.max_cost_per_run, enforced.daily_user_budget,
+            enforced.max_output_tokens_per_run) == (3.0, 10.0, 400_000)
+    # Provider scheduling and engine parallelism stay worker-only.
+    assert not [name for name in api if name.startswith(PROVIDER_ENV_PREFIXES + ENGINE_ENV_PREFIXES)]
+    assert any(name.startswith(PROVIDER_ENV_PREFIXES) for name in job)
+    # Caps only: no flag was enabled anywhere.
+    assert not [name for name in {**api, **job} if name.startswith("MILO_ENABLE_")]
+
+
 @pytest.mark.parametrize("website,why", [
     ("echo 'GATEWAY_RUN_START_ENABLED=VERIFIED (the gateway proxies run starts)'; exit 0", "open"),
     ("echo 'GATEWAY_RUN_START_ENABLED=UNVERIFIED (the run-start posture could not be proved)'; exit 1",

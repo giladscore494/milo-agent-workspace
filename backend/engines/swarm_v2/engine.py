@@ -12,8 +12,12 @@ from .correction import (correction_allowance, correction_issues, correction_pat
                          correction_summary)
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
+from .failures import (SWARM_V2_COMPLETION_CRITERIA_UNMET, SWARM_V2_MAX_REPLANS_EXCEEDED,
+                       SWARM_V2_REPLAN_REQUIRES_GAP, SWARM_V2_REPLAN_REWRITES_COMPLETED,
+                       SWARM_V2_REQUIRED_TASK_FAILED, SwarmExecutionFailure)
 from .feasibility import envelope_supports_a_run, plan_worst_case
 from .grounding import VERIFIER_GROUNDING_VERSION
+from .resolution import CANDIDATE_GAP_CODES, SOFT_GAP_CODES, unresolved_kinds
 from .state import SwarmState
 from .support import VERIFIER_CONTRACT_VERSION
 from .verifier import Verifier, VerifierProgress
@@ -195,8 +199,22 @@ class SwarmV2Engine:
 
     @staticmethod
     def _coverage_gaps(plan: Any, results: Mapping[str, TaskResult],
-                       evidence: Iterable[EvidenceReference]) -> list[dict[str, str]]:
+                       evidence: Iterable[EvidenceReference],
+                       resolutions: Mapping[str, Iterable[Mapping[str, Any]]] | None = None,
+                       ) -> list[dict[str, str]]:
+        """Every coverage gap of the completed tasks, hard and soft.
+
+        PR-T: a typed unresolved register candidate (see .resolution) is a
+        VALID answer for the task that asked. It is reported as its own SOFT
+        gap -- `CANDIDATE_UNRESOLVED_AMBIGUOUS` / `_NOT_FOUND`, never a hard
+        completion failure -- and it is what EXPLAINS that task's unmet
+        evidence requirement: an ambiguous resolution quotes no single row, so
+        it can never produce the evidence a resolved one would. An evidence
+        shortfall with no typed explanation stays the hard
+        `EVIDENCE_REQUIREMENTS_UNMET` it always was.
+        """
         refs = list(evidence)
+        outcomes = resolutions or {}
         gaps: list[dict[str, str]] = []
         for task in plan.graph.tasks:
             result = results.get(task.task_id)
@@ -206,6 +224,9 @@ class SwarmV2Engine:
             if not set(task.completion.required_outputs) <= set(output):
                 gaps.append({"task_id": task.task_id, "code": "REQUIRED_OUTPUT_MISSING"})
                 continue
+            unresolved = unresolved_kinds(outcomes.get(task.task_id, ()))
+            gaps.extend({"task_id": task.task_id, "code": CANDIDATE_GAP_CODES[kind]}
+                        for kind in unresolved)
             if not task.completion.evidence_satisfied:
                 continue
             eligible = [item for item in refs if item.task_id == task.task_id and
@@ -214,9 +235,20 @@ class SwarmV2Engine:
             fields = {item.field for item in eligible}
             if (len(source_ids) < task.evidence.minimum_sources or
                     not set(task.evidence.required_fields) <= fields):
+                if unresolved:
+                    continue
                 gaps.append({"task_id": task.task_id,
                              "code": "EVIDENCE_REQUIREMENTS_UNMET"})
         return gaps
+
+    @staticmethod
+    def _candidate_outcomes(state: SwarmState, plan: Any,
+                            completed: Mapping[str, TaskResult]) -> list[dict[str, Any]]:
+        """The typed per-candidate outcomes of the plan's completed tasks."""
+        task_ids = {task.task_id for task in plan.graph.tasks} & set(completed)
+        return sorted((dict(item) for task_id in sorted(task_ids)
+                       for item in state.task_resolutions.get(task_id, ())),
+                      key=lambda item: (str(item.get("task_id")), str(item.get("call_id"))))
 
     @staticmethod
     def _completed_tasks_unchanged(current: Any, replacement: Any,
@@ -392,7 +424,7 @@ class SwarmV2Engine:
         replacement = decision.plan
         assert replacement is not None
         if not self._completed_tasks_unchanged(plan, replacement, completed):
-            raise ValueError("replan cannot revise or discard completed tasks")
+            raise SwarmExecutionFailure(SWARM_V2_REPLAN_REWRITES_COMPLETED)
         self._check_feasible(replacement, completed)
         # A correction round IS a replan and is charged as one, so it consumes
         # the plan's own replan allowance alongside the one-round allowance.
@@ -453,6 +485,9 @@ class SwarmV2Engine:
                 state.completed_task_ids.append(result.task_id)
                 state.completed_task_ids.sort()
                 state.task_outputs[result.task_id] = output
+                if result.resolutions:
+                    state.task_resolutions[result.task_id] = [
+                        safe_durable_value(dict(item)) for item in result.resolutions]
                 persisted_results[result.task_id] = result
                 self._merge_evidence(
                     state, self._evidence_loader(dict(persisted_results)),
@@ -491,7 +526,8 @@ class SwarmV2Engine:
 
             failed = sorted(k for k, v in execution.tasks.items()
                             if v.status != "completed")
-            gaps = self._coverage_gaps(plan, execution.tasks, evidence)
+            gaps = self._coverage_gaps(plan, execution.tasks, evidence,
+                                       state.task_resolutions)
             unresolved = bool(failed or gaps or conflict_ids)
             summary = {"completed": sorted(completed), "failed": failed,
                 "evidence": [{"claim_id": e.claim_id, "source_id": e.source_id,
@@ -532,13 +568,13 @@ class SwarmV2Engine:
                 )
             if decision is not None and decision.decision in {"ADD_TASKS", "REVISE_TASK"}:
                 if not (failed or gaps or conflict_ids):
-                    raise ValueError("replan requires an unresolved gap or conflict")
+                    raise SwarmExecutionFailure(SWARM_V2_REPLAN_REQUIRES_GAP)
                 if len(state.replans) >= plan.max_replans:
-                    raise ValueError("maximum replans exceeded")
+                    raise SwarmExecutionFailure(SWARM_V2_MAX_REPLANS_EXCEEDED)
                 replacement = decision.plan
                 assert replacement is not None
                 if not self._completed_tasks_unchanged(plan, replacement, completed):
-                    raise ValueError("replan cannot revise or discard completed tasks")
+                    raise SwarmExecutionFailure(SWARM_V2_REPLAN_REWRITES_COMPLETED)
                 self._check_feasible(replacement, completed)
                 state.replans.append({"decision": decision.decision,
                                       "reason": decision.reason})
@@ -555,12 +591,19 @@ class SwarmV2Engine:
             by_id = {task.task_id: task for task in plan.graph.tasks}
             hard_failures = [task_id for task_id in failed
                              if not by_id[task_id].completion.allow_partial]
-            hard_gaps = [gap for gap in gaps
-                         if not by_id[gap["task_id"]].completion.allow_partial]
-            if hard_failures:
-                raise ValueError("required task execution failed")
-            if hard_gaps:
-                raise ValueError("completion criteria not satisfied")
+            hard_gaps = [gap for gap in gaps if gap["code"] not in SOFT_GAP_CODES
+                         and not by_id[gap["task_id"]].completion.allow_partial]
+            # PR-T: completed work is never discarded because ONE task has a
+            # gap. Run 3c72bfbc completed 9/9 tasks with 40 claims and lost
+            # all of it here because one task's typed ambiguity left its
+            # evidence requirement unmet. A required task that failed, or a
+            # hard gap, now fails the run ONLY when nothing usable exists: with
+            # any accepted evidence the run is verified and finalized, and the
+            # failure and the gap are listed in `needs_review`, which makes
+            # the outcome `partial_success` -- never `complete`.
+            if (hard_failures or hard_gaps) and not evidence:
+                raise SwarmExecutionFailure(SWARM_V2_REQUIRED_TASK_FAILED if hard_failures
+                                            else SWARM_V2_COMPLETION_CRITERIA_UNMET)
 
             resolutions, verdicts = self._run_verification(state, evidence, conflict_ids)
             correction = self._start_correction_round(
@@ -583,5 +626,7 @@ class SwarmV2Engine:
             # never inferred from an empty field set (see .outcome).
             final = self._builder.build(evidence, verdicts, task_failures=failures,
                                         coverage_gaps=gaps,
-                                        conflict_claim_ids=sorted(conflict_ids))
+                                        conflict_claim_ids=sorted(conflict_ids),
+                                        candidate_outcomes=self._candidate_outcomes(
+                                            state, plan, completed))
             return safe_durable_value(final)

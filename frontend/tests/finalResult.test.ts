@@ -194,6 +194,23 @@ describe('3. needs_review, conflicts and coverage gaps', () => {
     payload.needs_review[2].code = 'SOMETHING_ELSE';
     expect(ok(payload, 'partial_success').review[2].kind).toBe('task_failure');
   });
+
+  it('3d. an unresolved register candidate is a coverage gap, never a task failure', () => {
+    // PR-T: the engine reports a typed ambiguous / not-found register answer
+    // as a soft gap, with the per-candidate listing beside it.
+    const payload = JSON.parse(JSON.stringify(fixtures.partial_result));
+    payload.candidate_outcomes = [{
+      task_id: 't04', call_id: 'c1', outcome: 'unresolved_ambiguous', match_count: 2,
+      candidate: { manufacturer: 'TOYOTA', commercial_model: '4RUNNER', model_year: 2026 },
+      record_ids: ['37350', '37439'],
+    }];
+    for (const code of ['CANDIDATE_UNRESOLVED_AMBIGUOUS', 'CANDIDATE_UNRESOLVED_NOT_FOUND']) {
+      payload.needs_review[2].code = code;
+      const item = ok(payload, 'partial_success').review[2];
+      expect(item.kind).toBe('coverage_gap');
+      expect(describeReviewCode(code)).toBeDefined();
+    }
+  });
 });
 
 describe('4. the backend invariants, mirrored', () => {

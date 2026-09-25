@@ -48,6 +48,17 @@ payload still renders the V1 panel, and a test pins that.
   `{task_id, code}` (task failure or coverage gap) and the static
   `{code: "NO_USABLE_RESULT"}` marker
 
+PR-T adds ONE optional fifth key, present only when a completed task made a
+`catalog.government_vehicle.resolve_variant` call: `candidate_outcomes`, a list
+of typed per-candidate outcomes (`resolved | unresolved_ambiguous |
+unresolved_not_found`, with `match_count`, the candidate's call arguments and
+the matching register record ids), read from the validated tool result and
+never from model output. An unresolved candidate is reported in `needs_review`
+as the SOFT coverage gap `CANDIDATE_UNRESOLVED_AMBIGUOUS` /
+`CANDIDATE_UNRESOLVED_NOT_FOUND`: the outcome is `partial_success`, never a
+failed run. The surface renders those gaps; it does not render
+`candidate_outcomes` itself (unknown top-level keys are never rendered).
+
 `not_found` is implemented and rendered, and is **unreachable in production**:
 no registered tool can return `TRUSTED_SOURCE_NO_MATCH`, so
 `finalize_product_outcome` always receives `None` from the engine

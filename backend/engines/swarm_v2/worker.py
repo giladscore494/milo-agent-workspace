@@ -15,6 +15,7 @@ from .model_gateway import ModelGateway
 from .completion import (TRUNCATION_CODES, CallShape, ModelCompletionError,
                          classify_completion, escalate, initial_shape)
 from .request_builder import ModelRequestRefused
+from .resolution import candidate_outcome
 from .tool_calls import (MAX_TASK_OUTPUT_JSON_BYTES, MAX_TOOL_MATERIAL_JSON_BYTES,
                          MAX_TOOL_OUTPUT_JSON_BYTES, ToolCallError, ToolCallRecord,
                          ToolResultCallback, check_material, resolve_tool_arguments)
@@ -212,6 +213,11 @@ class TaskResult:
     status: str
     output: Mapping[str, Any] | None = None
     error: Mapping[str, Any] | None = None
+    # PR-T: the typed per-candidate outcomes (see .resolution) this task's
+    # Registry-validated `resolve_variant` results stated. Trusted worker code
+    # writes them from the tool results themselves; the model's completion is
+    # never read for them.
+    resolutions: tuple[Mapping[str, Any], ...] = ()
 
 class GenericWorker:
     def __init__(self, *, gateway: ModelGateway, tools: ToolRegistry, model: str, tool_context: ToolContext,
@@ -245,7 +251,9 @@ class GenericWorker:
 
     def execute(self, task: DynamicTask, dependency_outputs: Mapping[str, Any]) -> TaskResult:
         try:
-            tool_outputs = self._run_planned_calls(task, dependency_outputs)
+            resolutions: list[dict[str, Any]] = []
+            tool_outputs = self._run_planned_calls(task, dependency_outputs,
+                                                   resolutions=resolutions)
             self._check_cancelled()
             # Tool execution is COMPLETE and final at this line. Everything
             # below is the model-output boundary: the bounded repair re-uses
@@ -253,7 +261,8 @@ class GenericWorker:
             # above, so each planned call is invoked exactly once per task
             # execution whether or not a repair happens.
             output = self._resolve_output(task, dependency_outputs, tool_outputs)
-            return TaskResult(task.task_id, "completed", output=output)
+            return TaskResult(task.task_id, "completed", output=output,
+                              resolutions=tuple(resolutions))
         except CancellationRequested:
             raise
         except BudgetExceeded:
@@ -312,7 +321,8 @@ class GenericWorker:
             return TaskResult(task.task_id, "failed", error={"code": "TASK_FAILED", "message": "task execution failed"})
 
     def _run_planned_calls(self, task: DynamicTask,
-                           dependency_outputs: Mapping[str, Any]) -> dict[str, Any]:
+                           dependency_outputs: Mapping[str, Any], *,
+                           resolutions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Execute exactly the approved calls, once each, in declaration order.
 
         There is no fallback payload and no dynamic loop: every call, its
@@ -342,6 +352,14 @@ class GenericWorker:
                                          self._tool_context, arguments)
             check_material(result, MAX_TOOL_OUTPUT_JSON_BYTES, "TOOL_OUTPUT_TOO_LARGE")
             outputs[call.call_id] = result
+            if resolutions is not None:
+                # PR-T: typed from the validated result and the server-resolved
+                # arguments that produced it -- never from the model.
+                outcome = candidate_outcome(task_id=task.task_id, call_id=call.call_id,
+                                            tool=call.name, operation=call.operation,
+                                            arguments=arguments, result=result)
+                if outcome is not None:
+                    resolutions.append(outcome)
             if self._tool_result_sink is not None:
                 # Reached only with a Registry-validated result and
                 # server-resolved identity; the worker model cannot call it.

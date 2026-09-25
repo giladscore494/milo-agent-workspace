@@ -23,7 +23,8 @@ class FinalBuilder:
               task_failures: Iterable[Mapping[str, Any]] = (),
               coverage_gaps: Iterable[Mapping[str, Any]] = (),
               conflict_claim_ids: Iterable[str] = (),
-              trusted_negative: TrustedNegativeResult | None = None) -> dict:
+              trusted_negative: TrustedNegativeResult | None = None,
+              candidate_outcomes: Iterable[Mapping[str, Any]] = ()) -> dict:
         verdict_list = list(verdicts)
         # ONE verdict per claim, resolved by the shared rule rather than by
         # "whichever came last in the list": a stray second verdict must not
@@ -51,4 +52,5 @@ class FinalBuilder:
             # when it produced no review entry of its own.
             unverified_claim_ids=[item.claim_id for item in verdict_list
                                   if item.verdict != "verified"],
-            trusted_negative=trusted_negative)
+            trusted_negative=trusted_negative,
+            candidate_outcomes=candidate_outcomes)

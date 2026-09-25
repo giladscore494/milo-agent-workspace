@@ -247,7 +247,11 @@ def test_the_engine_never_supplies_a_trusted_negative_signal():
 
     result = run_engine(no_evidence_engine(builder=RecordingBuilder()))
     assert seen and all(item.get("trusted_negative") is None for item in seen)
-    assert set(seen[-1]) == {"task_failures", "coverage_gaps", "conflict_claim_ids"}
+    # PR-T: the typed per-candidate register outcomes are one more FACT; a run
+    # with no register read hands the builder none.
+    assert set(seen[-1]) == {"task_failures", "coverage_gaps", "conflict_claim_ids",
+                             "candidate_outcomes"}
+    assert seen[-1]["candidate_outcomes"] == []
     assert result["result_kind"] == "no_usable_result"
 
 
