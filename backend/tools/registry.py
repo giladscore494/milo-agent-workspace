@@ -313,11 +313,19 @@ class ToolOperationDescriptor:
     description: str
     input_schema: Mapping[str, Any]
     output_schema: Mapping[str, Any]
+    #: PR-V: whether a result of this operation can become EVIDENCE. True/False
+    #: only for a tool whose operations the authoritative evidence-mapper
+    #: allowlist governs (`PRODUCTION_EVIDENCE_MAPPER_OPERATIONS`); None -- not
+    #: stated, never guessed -- for every other tool.
+    produces_evidence: bool | None = None
 
     def as_payload(self) -> dict[str, Any]:
-        return {"name": self.name, "description": self.description,
-                "input_schema": dict(self.input_schema),
-                "output_schema": dict(self.output_schema)}
+        payload = {"name": self.name, "description": self.description,
+                   "input_schema": dict(self.input_schema),
+                   "output_schema": dict(self.output_schema)}
+        if self.produces_evidence is not None:
+            payload["produces_evidence"] = self.produces_evidence
+        return payload
 
 
 @dataclass(frozen=True)
@@ -346,7 +354,21 @@ class ToolDescriptor:
                 "operations": [item.as_payload() for item in self.operations]}
 
 
-def _describe(tool: Tool) -> ToolDescriptor:
+def production_evidence_operations() -> frozenset[tuple[str, str]]:
+    """The AUTHORITATIVE (tool, operation) pairs whose results become evidence.
+
+    Read from the production evidence-mapper allowlist itself -- the same
+    literal `production_evidence_mappers()` refuses to drift from -- so a
+    descriptor can never advertise evidence the trusted sink would not
+    produce. Imported lazily: the engine package imports this module.
+    """
+    from backend.engines.swarm_v2.evidence_mapping import PRODUCTION_EVIDENCE_MAPPER_OPERATIONS
+
+    return frozenset(PRODUCTION_EVIDENCE_MAPPER_OPERATIONS)
+
+
+def _describe(tool: Tool,
+              evidence_operations: frozenset[tuple[str, str]] = frozenset()) -> ToolDescriptor:
     if not TOOL_NAME_PATTERN.fullmatch(str(tool.name or "")):
         raise ValueError(f"invalid tool name: {tool.name!r}")
     if not tool.description or len(tool.description) > MAX_TOOL_DESCRIPTION_CHARS:
@@ -357,6 +379,9 @@ def _describe(tool: Tool) -> ToolDescriptor:
     if len(operations) > MAX_OPERATIONS_PER_TOOL:
         raise ValueError(f"too many operations: {tool.name}")
     described: list[ToolOperationDescriptor] = []
+    # PR-V: a tool the evidence allowlist names states, for EVERY operation,
+    # whether it produces evidence; any other tool states nothing.
+    governed = any(name == tool.name for name, _ in evidence_operations)
     for key, operation in operations.items():
         if not isinstance(operation, ToolOperation) or key != operation.name:
             raise ValueError(f"invalid operation contract: {tool.name}")
@@ -369,7 +394,9 @@ def _describe(tool: Tool) -> ToolDescriptor:
         validate_schema(operation.output_schema, f"{tool.name}.{operation.name}.output_schema")
         described.append(ToolOperationDescriptor(
             operation.name, operation.description,
-            _json_copy(operation.input_schema), _json_copy(operation.output_schema)))
+            _json_copy(operation.input_schema), _json_copy(operation.output_schema),
+            produces_evidence=((tool.name, operation.name) in evidence_operations
+                               if governed else None)))
     # Deterministic ordering: identical registrations always produce an
     # identical catalog, so a Commander prompt is byte-stable across processes.
     described.sort(key=lambda item: item.name)
@@ -378,15 +405,20 @@ def _describe(tool: Tool) -> ToolDescriptor:
 
 
 class ToolRegistry:
-    def __init__(self, tools: Iterable[Tool] = ()):
+    def __init__(self, tools: Iterable[Tool] = (), *,
+                 evidence_operations: Iterable[tuple[str, str]] | None = None):
         self._tools: dict[str, Tool] = {}
         self._descriptors: dict[str, ToolDescriptor] = {}
+        # PR-V: which operations produce evidence comes from the authoritative
+        # production allowlist unless trusted wiring states its own.
+        evidence = frozenset(production_evidence_operations() if evidence_operations is None
+                             else evidence_operations)
         for tool in tools:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool: {tool.name}")
             if tool.mode not in (ToolMode.READ, ToolMode.WRITE) or not tool.required_scope:
                 raise ValueError(f"invalid tool contract: {tool.name}")
-            self._descriptors[tool.name] = _describe(tool)
+            self._descriptors[tool.name] = _describe(tool, evidence)
             self._tools[tool.name] = tool
         catalog = json.dumps(self.descriptor_payload(), sort_keys=True,
                              separators=(",", ":"), ensure_ascii=True)
