@@ -1,0 +1,1716 @@
+{
+ "with_placeholder": {
+  "candidate_outcomes": [
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "11111",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "11111111",
+     "trim": "SE"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37363"
+    ],
+    "task_id": "t01"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTSKA",
+     "trim": "SR5"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37254"
+    ],
+    "task_id": "t02"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTLKA",
+     "trim": "LIMITED"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37291"
+    ],
+    "task_id": "t03"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TZNA55L-GKZSZA",
+     "trim": "LIMITED"
+    },
+    "match_count": 2,
+    "outcome": "unresolved_ambiguous",
+    "record_ids": [
+     "37350",
+     "37439"
+    ],
+    "task_id": "t04"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TZNA55L-GKZSZA",
+     "trim": "LIMITED"
+    },
+    "match_count": 2,
+    "outcome": "unresolved_ambiguous",
+    "record_ids": [
+     "37350",
+     "37439"
+    ],
+    "task_id": "t05"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTXKA",
+     "trim": "TRD PRO"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37293"
+    ],
+    "task_id": "t06"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTHKA",
+     "trim": "TRAILHUNTER"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37096"
+    ],
+    "task_id": "t07"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTPKA",
+     "trim": "PLATINUM"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37098"
+    ],
+    "task_id": "t08"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTOKA",
+     "trim": "TRD OFF-ROAD"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37425"
+    ],
+    "task_id": "t09"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTMKA",
+     "trim": "SR5 PREMIUM"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37316"
+    ],
+    "task_id": "t10"
+   }
+  ],
+  "fields": {
+   "identity_dimensions.fuel_type": [
+    {
+     "provenance": {
+      "claim_id": "claim-t01-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.e2f57de63c2385720a0b593bef0fba88:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t01",
+      "task_id": "t01"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t02-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": "petrol"
+    }
+   ],
+   "model_year_end": [
+    {
+     "provenance": {
+      "claim_id": "claim-t01-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.e2f57de63c2385720a0b593bef0fba88:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t01",
+      "task_id": "t01"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t02-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": 2026
+    }
+   ],
+   "model_year_start": [
+    {
+     "provenance": {
+      "claim_id": "claim-t01-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.e2f57de63c2385720a0b593bef0fba88:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t01",
+      "task_id": "t01"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t02-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": 2026
+    }
+   ],
+   "official_model_code": [
+    {
+     "provenance": {
+      "claim_id": "claim-t01-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.e2f57de63c2385720a0b593bef0fba88:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t01",
+      "task_id": "t01"
+     },
+     "value": "11111111"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t02-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": "TRN285L-GKTSKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": "TRN285L-GKTLKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": "TRN285L-GKTXKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": "TRN285L-GKTHKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": "TRN285L-GKTPKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": "TRN285L-GKTOKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": "TRN285L-GKTMKA"
+    }
+   ],
+   "trim": [
+    {
+     "provenance": {
+      "claim_id": "claim-t01-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.e2f57de63c2385720a0b593bef0fba88:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t01",
+      "task_id": "t01"
+     },
+     "value": "SE"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t02-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": "SR5"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": "LIMITED"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": "TRD PRO"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": "TRAILHUNTER"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": "PLATINUM"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": "TRD OFF-ROAD"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": "SR5 PREMIUM"
+    }
+   ]
+  },
+  "needs_review": [
+   {
+    "code": "CANDIDATE_UNRESOLVED_AMBIGUOUS",
+    "task_id": "t04"
+   },
+   {
+    "code": "CANDIDATE_UNRESOLVED_AMBIGUOUS",
+    "task_id": "t05"
+   }
+  ],
+  "result_kind": "partial_result",
+  "status": "partial_success"
+ },
+ "without_placeholder": {
+  "candidate_outcomes": [
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTSKA",
+     "trim": "SR5"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37254"
+    ],
+    "task_id": "t02"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTLKA",
+     "trim": "LIMITED"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37291"
+    ],
+    "task_id": "t03"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TZNA55L-GKZSZA",
+     "trim": "LIMITED"
+    },
+    "match_count": 2,
+    "outcome": "unresolved_ambiguous",
+    "record_ids": [
+     "37350",
+     "37439"
+    ],
+    "task_id": "t04"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TZNA55L-GKZSZA",
+     "trim": "LIMITED"
+    },
+    "match_count": 2,
+    "outcome": "unresolved_ambiguous",
+    "record_ids": [
+     "37350",
+     "37439"
+    ],
+    "task_id": "t05"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTXKA",
+     "trim": "TRD PRO"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37293"
+    ],
+    "task_id": "t06"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTHKA",
+     "trim": "TRAILHUNTER"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37096"
+    ],
+    "task_id": "t07"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTPKA",
+     "trim": "PLATINUM"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37098"
+    ],
+    "task_id": "t08"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTOKA",
+     "trim": "TRD OFF-ROAD"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37425"
+    ],
+    "task_id": "t09"
+   },
+   {
+    "call_id": "c1",
+    "candidate": {
+     "commercial_model": "4RUNNER",
+     "manufacturer": "TOYOTA",
+     "model_year": 2026,
+     "official_model_code": "TRN285L-GKTMKA",
+     "trim": "SR5 PREMIUM"
+    },
+    "match_count": 1,
+    "outcome": "resolved",
+    "record_ids": [
+     "37316"
+    ],
+    "task_id": "t10"
+   }
+  ],
+  "fields": {
+   "identity_dimensions.fuel_type": [
+    {
+     "provenance": {
+      "claim_id": "claim-t02-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": "petrol"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-4",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "identity_dimensions.fuel_type",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": "petrol"
+    }
+   ],
+   "model_year_end": [
+    {
+     "provenance": {
+      "claim_id": "claim-t02-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-1",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_end",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": 2026
+    }
+   ],
+   "model_year_start": [
+    {
+     "provenance": {
+      "claim_id": "claim-t02-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": 2026
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-0",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "model_year_start",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": 2026
+    }
+   ],
+   "official_model_code": [
+    {
+     "provenance": {
+      "claim_id": "claim-t02-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": "TRN285L-GKTSKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": "TRN285L-GKTLKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": "TRN285L-GKTXKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": "TRN285L-GKTHKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": "TRN285L-GKTPKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": "TRN285L-GKTOKA"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-2",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "official_model_code",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": "TRN285L-GKTMKA"
+    }
+   ],
+   "trim": [
+    {
+     "provenance": {
+      "claim_id": "claim-t02-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t02",
+      "task_id": "t02"
+     },
+     "value": "SR5"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t03-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t03",
+      "task_id": "t03"
+     },
+     "value": "LIMITED"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t06-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t06",
+      "task_id": "t06"
+     },
+     "value": "TRD PRO"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t07-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t07",
+      "task_id": "t07"
+     },
+     "value": "TRAILHUNTER"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t08-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t08",
+      "task_id": "t08"
+     },
+     "value": "PLATINUM"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t09-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t09",
+      "task_id": "t09"
+     },
+     "value": "TRD OFF-ROAD"
+    },
+    {
+     "provenance": {
+      "claim_id": "claim-t10-3",
+      "run_id": "6825eb96-1550-4464-8e8a-ecb1eca3e967",
+      "scope": {
+       "entity": "cm1.355c10d9f56f58ef32c3bc3e361aab46:2026",
+       "field": "trim",
+       "geography": "IL",
+       "market": "IL",
+       "time_scope": {
+        "model_year": 2026
+       }
+      },
+      "source_id": "source-t10",
+      "task_id": "t10"
+     },
+     "value": "SR5 PREMIUM"
+    }
+   ]
+  },
+  "needs_review": [
+   {
+    "code": "CANDIDATE_UNRESOLVED_AMBIGUOUS",
+    "task_id": "t04"
+   },
+   {
+    "code": "CANDIDATE_UNRESOLVED_AMBIGUOUS",
+    "task_id": "t05"
+   }
+  ],
+  "result_kind": "partial_result",
+  "status": "partial_success"
+ }
+}
