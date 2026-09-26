@@ -7,6 +7,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable, Protocol, Sequence
 from uuid import UUID
+import httpcore
 import httpx
 from postgrest.exceptions import APIError
 from postgrest.types import CountMethod
@@ -249,6 +250,40 @@ IDEMPOTENT_RPC_JITTER = 0.2
 
 _LOG = logging.getLogger("milo.repository")
 
+try:  # h2 ships with httpx[http2], which supabase's client uses; optional here.
+    from h2.events import ConnectionTerminated as _H2ConnectionTerminated
+    from h2.exceptions import ProtocolError as _H2ProtocolError
+except ImportError:  # pragma: no cover - HTTP/1.1-only installs
+    _H2ConnectionTerminated = _H2ProtocolError = None
+
+#: PR-W: the connection-level protocol failures that mean "the server ended
+#: the connection under this request" -- above all an HTTP/2 GOAWAY
+#: (h2 `ConnectionTerminated`). httpx normally re-raises them as
+#: `httpx.RemoteProtocolError` (a TransportError); these are the SAME failure
+#: when it arrives unmapped, as httpcore's or h2's own type. Attempt 1 of run
+#: 280fc9e5 exited on `<ConnectionTerminated error_code:1, last_stream_id:131>`.
+_TRANSIENT_PROTOCOL_ERRORS: tuple[type[BaseException], ...] = tuple(
+    kind for kind in (httpx.TransportError, httpcore.ProtocolError, _H2ProtocolError)
+    if kind is not None)
+#: How far down `__cause__` / `__context__` a failure is inspected, by TYPE.
+_MAX_CAUSE_DEPTH = 8
+
+
+def _is_connection_failure(exc: BaseException) -> bool:
+    """Whether the failure, or an exception it was raised from, is a transport
+    or connection-protocol failure. Types only: no message is ever read."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(seen) < _MAX_CAUSE_DEPTH:
+        seen.add(id(current))
+        if isinstance(current, _TRANSIENT_PROTOCOL_ERRORS):
+            return True
+        if _H2ConnectionTerminated is not None and any(
+                isinstance(arg, _H2ConnectionTerminated) for arg in current.args):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
 
 def failure_code(exc: BaseException) -> str:
     """The error's CODE -- a SQLSTATE, a PGRSTxxx or an HTTP status -- or ""."""
@@ -280,9 +315,10 @@ def classify_repository_failure(exc: BaseException) -> str:
     Reads the exception TYPE and the error CODE, never the message: a
     PostgREST message or detail can quote SQL values and URLs.
     """
-    if isinstance(exc, httpx.TransportError):
+    if not isinstance(exc, APIError) and _is_connection_failure(exc):
         # Connect/read/write/pool timeouts, network errors and protocol
-        # errors: the request may not have reached the database at all.
+        # errors (an HTTP/2 GOAWAY included, however it is wrapped): the
+        # request may not have reached the database at all.
         return "transient"
     if not isinstance(exc, APIError):
         return "unavailable"
