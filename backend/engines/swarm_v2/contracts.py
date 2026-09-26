@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
-from backend.tools.registry import validate_schema
+from backend.tools.registry import validate_output_schema
 
 from .evidence_bounds import (IDENTITY_DIMENSIONS, MAX_IDENTITY_DIMENSION_CHARS,
                               MAX_LOCATOR_KEY_CHARS, MAX_SOURCE_VERSION_KEY_CHARS,
@@ -27,11 +27,13 @@ def output_schema_is_runtime_valid(schema: Any) -> bool:
     Run 280fc9e5 approved `{"type": "array"}` (no items) and
     `{"type": "object"}` (not closed) as nested output properties; the
     runtime validator then raised KeyError / ValueError on every completion
-    and all eleven tasks failed after they had been paid for. Plan time and
-    run time now apply the SAME registry subset.
+    and all eleven tasks failed after they had been paid for. Plan time now
+    accepts exactly what the runtime validator enforces: the registry's
+    structural subset plus the `enum` / `description` annotations
+    (`validate_output_schema`).
     """
     try:
-        validate_schema(schema, "$output_schema")
+        validate_output_schema(schema, "$output_schema")
     except (ValueError, TypeError, RecursionError):
         return False
     return True

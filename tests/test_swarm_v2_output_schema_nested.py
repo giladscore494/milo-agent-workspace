@@ -36,7 +36,8 @@ from backend.engines.swarm_v2.contracts import (OUTPUT_SCHEMA_NESTED_ERROR_TYPE,
 from backend.engines.swarm_v2.tool_calls import ToolCallError
 from backend.engines.swarm_v2.validation import PlanSchemaError
 from backend.engines.swarm_v2.worker import WorkerOutputValidationError, validate_worker_output
-from backend.tools.registry import validate_json_schema, validate_schema
+from backend.tools.registry import (validate_json_schema, validate_output_schema,
+                                    validate_schema)
 from test_swarm_v2 import plan, task, tool_descriptors
 
 REASON = "OUTPUT_SCHEMA_NESTED_INVALID"
@@ -155,8 +156,23 @@ def test_the_plan_validator_enforces_it_independently_of_the_contract():
     {"type": "object", "properties": {"a": {"type": "string"}}, "required": []},
     {"type": "array", "items": {"type": "object"}},
     {"type": "array", "items": {"type": "array"}},
-    {"type": "string", "description": "free text"},
     {"type": "tuple"},
+    # Keywords outside the enforced subset: the runtime would ignore them.
+    {"type": "string", "pattern": "^[a-z]+$"},
+    {"type": "integer", "minimum": 0},
+    {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    # Malformed annotations.
+    {"type": "string", "description": 7},
+    {"type": "string", "enum": []},
+    {"type": "string", "enum": "resolved"},
+    {"type": "string", "enum": ["a", "a"]},
+    {"type": "string", "enum": ["a", 1]},
+    {"type": "integer", "enum": [1, True]},
+    {"type": "boolean", "enum": [1]},
+    {"type": "null", "enum": [None]},
+    {"type": "array", "items": {"type": "string"}, "enum": [["a"]]},
+    {"type": "object", "properties": {}, "required": [], "additionalProperties": False,
+     "enum": [{}]},
 ])
 def test_every_nested_shape_the_runtime_cannot_enforce_is_rejected(nested):
     candidate = corrected_plan()
@@ -187,6 +203,7 @@ def test_the_rule_reaches_the_provider_visible_policy():
     matching = [rule for rule in rules if "scalar" in rule and '"items"' in rule]
     assert len(matching) == 1
     assert "provenance" in matching[0] and "variants" in matching[0]
+    assert "enum" in matching[0] and "description" in matching[0]
 
 
 # --- the one existing repair path -------------------------------------------
@@ -240,7 +257,15 @@ def _random_schema(rng: random.Random, depth: int = 0):
     roll = rng.random()
     if depth >= 3 or roll < 0.35:
         return rng.choice([{"type": rng.choice(_SCALARS)}, {"type": "tuple"},
-                           {"type": ["string"]}, {}, None, "string", 7])
+                           {"type": ["string"]}, {}, None, "string", 7,
+                           {"type": "string", "enum": ["x", "y"]},
+                           {"type": "integer", "enum": [0, 1]},
+                           {"type": "boolean", "enum": [True]},
+                           {"type": "number", "enum": [1.5]},
+                           {"type": "string", "enum": []},
+                           {"type": "integer", "enum": "0"},
+                           {"type": "string", "description": "d"},
+                           {"type": "string", "minimum": 1}])
     if roll < 0.65:
         schema: dict = {"type": "array"}
         if rng.random() < 0.7:
@@ -303,7 +328,7 @@ def test_plan_time_acceptance_implies_runtime_enforceability(seed):
         schema = _random_schema(rng)
         accepted = output_schema_is_runtime_valid(schema)
         try:
-            validate_schema(schema)
+            validate_output_schema(schema)
         except ValueError:
             assert not accepted
         else:
@@ -313,3 +338,83 @@ def test_plan_time_acceptance_implies_runtime_enforceability(seed):
                 validate_json_schema(schema, _random_value(rng))
             except ValueError:
                 pass
+
+
+# --- S4: the enum / description annotations ----------------------------------
+
+#: The outcome property of run 6825eb96's successful Gate-0 plan.
+RUN_6825EB96_ENUM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "outcome": {"type": "string",
+                    "enum": ["resolved", "unresolved_ambiguous", "unresolved_not_found"]},
+        "resolved": {"type": "boolean"},
+        "match_count": {"type": "integer", "description": "register rows matched"},
+        "candidate_id": {"type": "string"},
+    },
+    "required": ["outcome", "resolved", "match_count", "candidate_id"],
+    "additionalProperties": False,
+}
+
+
+def _enum_plan() -> dict:
+    return plan([_t02_task("t01", CORRECTED_T02_SCHEMA),
+                 _t02_task("t02", RUN_6825EB96_ENUM_SCHEMA | {"required": [
+                     "outcome", "resolved", "match_count", "candidate_id"]})
+                 | {"completion": {"required_outputs": ["outcome"],
+                                   "evidence_satisfied": True, "allow_partial": True}}])
+
+
+def test_the_6825eb96_enum_schema_is_accepted_at_plan_time():
+    assert output_schema_is_runtime_valid(RUN_6825EB96_ENUM_SCHEMA)
+    approved = _validator().validate(_enum_plan())
+    assert approved.graph.tasks[1].output_schema["properties"]["outcome"]["enum"] == \
+        ["resolved", "unresolved_ambiguous", "unresolved_not_found"]
+
+
+def test_an_output_inside_the_enum_validates():
+    output = {"outcome": "resolved", "resolved": True, "match_count": 1, "candidate_id": "c-1"}
+    assert validate_worker_output(json.dumps(output), RUN_6825EB96_ENUM_SCHEMA) == output
+
+
+@pytest.mark.parametrize("outcome", ["other", "RESOLVED", "", 1, None])
+def test_an_output_outside_the_enum_is_worker_output_schema_invalid(outcome):
+    output = {"outcome": outcome, "resolved": True, "match_count": 1, "candidate_id": "c-1"}
+    with pytest.raises(WorkerOutputValidationError) as failure:
+        validate_worker_output(json.dumps(output), RUN_6825EB96_ENUM_SCHEMA)
+    assert failure.value.reason_code == "WORKER_OUTPUT_SCHEMA_INVALID"
+
+
+@pytest.mark.parametrize("schema,value,ok", [
+    ({"type": "integer", "enum": [0, 1]}, 1, True),
+    ({"type": "integer", "enum": [0, 1]}, True, False),
+    ({"type": "integer", "enum": [0, 1]}, 2, False),
+    ({"type": "number", "enum": [1.5, 2]}, 2.0, True),
+    ({"type": "boolean", "enum": [True]}, True, True),
+    ({"type": "boolean", "enum": [True]}, False, False),
+    ({"type": "string", "description": "anything"}, "free", True),
+    ({"type": "string", "enum": "resolved"}, "resolved", False),
+])
+def test_the_runtime_enforces_enum_and_ignores_description(schema, value, ok):
+    if ok:
+        validate_json_schema(schema, value)
+    else:
+        with pytest.raises(ValueError):
+            validate_json_schema(schema, value)
+
+
+def test_the_280fc9e5_schema_is_still_rejected_with_annotations_allowed():
+    assert not output_schema_is_runtime_valid(RUN_280FC9E5_T02_SCHEMA)
+    for nested in ({"type": "array", "description": "variants"},
+                   {"type": "object", "description": "provenance"}):
+        assert not output_schema_is_runtime_valid({
+            "type": "object", "properties": {"x": nested}, "required": [],
+            "additionalProperties": False})
+
+
+def test_tool_schemas_keep_the_strict_registration_subset():
+    """validate_schema (tools) is unchanged: annotations stay refused there."""
+    for schema in ({"type": "string", "enum": ["a"]}, {"type": "string", "description": "d"}):
+        validate_output_schema(schema)
+        with pytest.raises(ValueError):
+            validate_schema(schema)

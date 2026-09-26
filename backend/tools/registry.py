@@ -22,8 +22,42 @@ OPERATION_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,79}$")
 
 
+#: The scalar types an output-schema "enum" may annotate, with the Python types
+#: its values must have (a bool is never an integer or a number here).
+_ENUM_VALUE_TYPES: Mapping[str, tuple[type, ...]] = {
+    "string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,)}
+
+
+def _enum_values_valid(expected: str, values: Any) -> bool:
+    if expected not in _ENUM_VALUE_TYPES or not isinstance(values, list) or not values:
+        return False
+    kinds = _ENUM_VALUE_TYPES[expected]
+    if any(not isinstance(item, kinds) or (expected != "boolean" and isinstance(item, bool))
+           for item in values):
+        return False
+    return len(set(values)) == len(values)
+
+
 def validate_schema(schema: Mapping[str, Any], path: str = "$schema") -> None:
     """Validate the complete supported schema subset before registration."""
+    _check_schema(schema, path, annotations=False)
+
+
+def validate_output_schema(schema: Mapping[str, Any], path: str = "$output_schema") -> None:
+    """Validate a TASK output schema: the tool subset plus two annotations.
+
+    The structure is exactly what `validate_schema` accepts for tools -- arrays
+    need `items`, objects are closed with `properties`/`required` -- and on top
+    of it an output schema may carry `description` (a string, ignored at run
+    time) and `enum` on a string/integer/number/boolean schema (a non-empty
+    list of unique values of that type, ENFORCED by `validate_json_schema`).
+    Run 6825eb96's successful Gate-0 plan used exactly that enum. Tool schemas
+    are unaffected: registration still uses `validate_schema`.
+    """
+    _check_schema(schema, path, annotations=True)
+
+
+def _check_schema(schema: Any, path: str, *, annotations: bool) -> None:
     if not isinstance(schema, Mapping):
         raise ValueError(f"{path} must be an object")
     expected = schema.get("type")
@@ -46,14 +80,22 @@ def validate_schema(schema: Mapping[str, Any], path: str = "$schema") -> None:
         for name, nested in properties.items():
             if not isinstance(name, str) or not name:
                 raise ValueError(f"{path}.properties names must be non-empty strings")
-            validate_schema(nested, f"{path}.properties.{name}")
+            _check_schema(nested, f"{path}.properties.{name}", annotations=annotations)
     elif expected == "array":
         allowed_keys |= {"items", "maxItems"}
         if "items" not in schema:
             raise ValueError(f"{path}.items is required")
-        validate_schema(schema["items"], f"{path}.items")
+        _check_schema(schema["items"], f"{path}.items", annotations=annotations)
         if "maxItems" in schema and (not isinstance(schema["maxItems"], int) or isinstance(schema["maxItems"], bool) or schema["maxItems"] < 0):
             raise ValueError(f"{path}.maxItems must be a non-negative integer")
+    if annotations:
+        allowed_keys.add("description")
+        if "description" in schema and not isinstance(schema["description"], str):
+            raise ValueError(f"{path}.description must be a string")
+        if "enum" in schema:
+            allowed_keys.add("enum")
+            if not _enum_values_valid(expected, schema["enum"]):
+                raise ValueError(f"{path}.enum must be a non-empty list of unique {expected} values")
     unsupported = set(schema) - allowed_keys
     if unsupported:
         raise ValueError(f"unsupported schema keywords at {path}: {sorted(unsupported)}")
@@ -76,6 +118,15 @@ def validate_json_schema(schema: Mapping[str, Any], value: Any, path: str = "$in
         raise ValueError(f"unsupported schema type at {path}")
     if not isinstance(value, types[expected]) or (expected in {"integer", "number"} and isinstance(value, bool)):
         raise ValueError(f"{path} must be {expected}")
+    if "enum" in schema:
+        # Enforced, never merely advertised. A malformed enum is a schema
+        # defect and reported the same way; "description" is ignored here.
+        allowed = schema["enum"]
+        if not _enum_values_valid(expected, allowed):
+            raise ValueError(f"schema at {path} has an invalid enum")
+        if not any(value == item and isinstance(value, bool) == isinstance(item, bool)
+                   for item in allowed):
+            raise ValueError(f"{path} is not one of the allowed values")
     if expected == "object":
         properties = schema.get("properties")
         if not isinstance(properties, Mapping) or schema.get("additionalProperties") is not False:
