@@ -362,3 +362,83 @@ def build_production_run(*, tasks: int | None = None, decisions: list[Any] | Non
                          worker_gateway=worker_gateway, verifier_gateway=verifier_gateway,
                          engine=holder["engine"], checkpoints=checkpoints, events=events,
                          ledger=ledger)
+
+
+# =============================================================================
+# PR-V: the production Toyota snapshot's VOCABULARY, at production scale
+# =============================================================================
+#
+# The distributions of snapshot cs1.e335295707fa8d6935b113bb6a0165f4 (6,374
+# rows), EXACTLY: every marginal of delek, hanaa, technologiat and merkav, and
+# the delek x technologiat joint. What the snapshot does not publish here --
+# how merkav and hanaa fall across the fuel cells, and each row's model year --
+# is a FIXTURE CHOICE: a fixed, coprime-stride interleave, and model years
+# chosen so the 2018+ scope reproduces the counts production reported for it
+# before PR-V (readable 1,645 vs ambiguous 3,023, vocabulary_insufficient).
+
+#: (count, delek_cd, delek_nm, technologiat_hanaa_cd, technologiat_hanaa_nm)
+TOYOTA_FUEL_PROPULSION = (
+    (3741, 1, "בנזין", 1, "היברידי רגיל"),
+    (1382, 1, "בנזין", None, "הנעה רגילה"),
+    (1095, 2, "דיזל", None, "הנעה רגילה"),
+    (66, None, None, None, "הנעה רגילה"),
+    (58, 7, "חשמל/בנזין", 2, "PLUG IN"),
+    (30, 4, "חשמל", 3, "רכב חשמלי"),
+    (2, 2, "דיזל", 1, "היברידי רגיל"),
+)
+#: (count, hanaa_cd, hanaa_nm)
+TOYOTA_DRIVETRAIN = ((4043, 1, "4X2"), (2195, 3, "4X4"), (136, None, None))
+#: (count, merkav)
+TOYOTA_MERKAV = (
+    (2506, "פנאי-שטח"), (1220, "סדאן"), (916, "MPV"), (867, "הצ'בק"), (310, "תא כפול"),
+    (186, "סטיישן"), (141, "משא אחוד"), (96, ""), (40, "קומבי"), (38, "תא בודד"),
+    (37, "קופה"), (10, "קבריולט"), (6, "שדה"), (1, "ואן/נוסעים"),
+)
+#: The 2018+ counts production reported before PR-V.
+TOYOTA_2018_READABLE_BEFORE = 1_645
+TOYOTA_2018_AMBIGUOUS_BEFORE = 3_023
+#: A stride coprime to 6,374 (= 2 x 3,187): a fixed, full permutation.
+_STRIDE = 7_919
+
+
+def _expand(cells) -> list:
+    return [cell[1:] for cell in cells for _ in range(cell[0])]
+
+
+def _read_before_pr_v(fuel_code, propulsion_code, merkav) -> bool:
+    """Whether the PRE-PR-V vocabulary read a row completely (readable)."""
+    return (fuel_code not in (2, 4) and propulsion_code != 3
+            and merkav in ("פנאי-שטח", ""))
+
+
+def toyota_vocabulary_rows() -> list[dict]:
+    """6,374 register rows with the production snapshot's vocabulary distribution."""
+    fuels, drives, bodies = (_expand(TOYOTA_FUEL_PROPULSION), _expand(TOYOTA_DRIVETRAIN),
+                             _expand(TOYOTA_MERKAV))
+    total = len(fuels)
+    assert total == len(drives) == len(bodies) == SNAPSHOT_ROWS
+    base = copy.deepcopy(committed_records(1)[0])
+    base.pop("rank", None)
+    rows, readable_new, ambiguous_new = [], 0, 0
+    for index in range(total):
+        fuel_cd, fuel_nm, tech_cd, tech_nm = fuels[index]
+        hanaa_cd, hanaa_nm = drives[(index * 3_001) % total]
+        merkav = bodies[(index * _STRIDE) % total][0]
+        readable = _read_before_pr_v(fuel_cd, tech_cd, merkav)
+        if readable:
+            recent = readable_new < TOYOTA_2018_READABLE_BEFORE
+            readable_new += recent
+        else:
+            recent = ambiguous_new < TOYOTA_2018_AMBIGUOUS_BEFORE
+            ambiguous_new += recent
+        row = copy.deepcopy(base)
+        row.update({"_id": 200_000 + index, "kinuy_mishari": f"MODEL{index % 41}",
+                    "degem_nm": f"CODE-{index:05d}", "ramat_gimur": f"TRIM {index % 17}",
+                    "shnat_yitzur": 2018 + index % 9 if recent else 2010 + index % 8,
+                    "delek_cd": fuel_cd, "delek_nm": fuel_nm,
+                    "technologiat_hanaa_cd": tech_cd, "technologiat_hanaa_nm": tech_nm,
+                    "hanaa_cd": hanaa_cd, "hanaa_nm": hanaa_nm, "merkav": merkav})
+        rows.append(row)
+    assert readable_new == TOYOTA_2018_READABLE_BEFORE
+    assert ambiguous_new == TOYOTA_2018_AMBIGUOUS_BEFORE
+    return rows

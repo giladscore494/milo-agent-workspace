@@ -79,9 +79,11 @@ def planned_records() -> list[dict[str, Any]]:
     """28 committed Toyota rows, re-read so their canonical order is known.
 
     23 readable rows in 2019 (`MODEL-00`..`MODEL-22`), 2 readable rows in 2016
-    (outside a 2018+ plan), and 3 rows stating fuel code 2 (`דיזל`, diesel) --
-    a code the reviewed vocabulary does NOT name, so they read as `ambiguous`.
-    That is the real vocabulary gap, reproduced on register rows.
+    (outside a 2018+ plan), and 3 rows stating the body name `משא אחוד` -- a
+    name the reviewed vocabulary deliberately leaves unmapped (PR-V), so they
+    read as `ambiguous`. That is a real remaining vocabulary gap, reproduced on
+    register rows. (Before PR-V this used fuel code 2, `דיזל`, which the
+    vocabulary now names.)
     """
     rows = committed_records(28)
     for index, row in enumerate(rows):
@@ -91,7 +93,7 @@ def planned_records() -> list[dict[str, Any]]:
         row["shnat_yitzur"] = 2016
     for row in rows[25:]:
         row["shnat_yitzur"] = 2020
-        row["delek_cd"], row["delek_nm"] = 2, "דיזל"
+        row["merkav"] = "משא אחוד"
     return rows
 
 
@@ -465,13 +467,14 @@ def test_preparation_fails_closed_in_the_mirror(capsys):
 
 
 def test_a_mostly_ambiguous_manufacturer_is_stated_and_queues_nothing(capsys):
-    """The vocabulary gap, on register rows: diesel rows read as `ambiguous`."""
+    """The vocabulary gap, on register rows: rows whose body name the reviewed
+    vocabulary leaves unmapped (`משא אחוד`) read as `ambiguous`."""
     repository = MemoryRepository()
     world = plan_world(repository, units=("toyota",), model_year_from=None)
     lease = capture_lease(repository, capsys)
     rows = committed_records(5)
     for row in rows[:3]:
-        row["delek_cd"], row["delek_nm"] = 2, "דיזל"
+        row["merkav"] = "משא אחוד"
     summary = prepare(repository, lease, world,
                       units(scoped_snapshot(repository, lease, rows))[:1])
     unit = summary["units"][0]

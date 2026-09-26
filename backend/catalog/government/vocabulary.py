@@ -50,15 +50,26 @@ from typing import Any, Mapping
 #: `delek_cd` -> (fuel type, the `delek_nm` that code is paired with). The code
 #: decides; the name is the cross-check that the register's own pairing still
 #: holds. `7` is electricity/petrol -- a PLUG-IN hybrid, not a "hybrid".
+#:
+#: PR-V widened this table with the two codes the production Toyota snapshot
+#: (cs1.e335295707fa8d6935b113bb6a0165f4, 6,374 rows) states with a stable
+#: pairing: `2`/`דיזל` (1,097 rows) and `4`/`חשמל` (30 rows, every one with
+#: propulsion code 3). A row stating no `delek_cd` at all (66 rows there) is
+#: unchanged: an absent code with an absent label is simply not stated.
 FUEL_BY_CODE: Mapping[int, tuple[str, str]] = {
     1: ("petrol", "בנזין"),
+    2: ("diesel", "דיזל"),
+    4: ("electric", "חשמל"),
     7: ("plug_in_hybrid", "חשמל/בנזין"),
 }
 
 #: `technologiat_hanaa_cd` -> (propulsion technology, its paired name).
+#: PR-V: `3`/`רכב חשמלי` ("electric vehicle") -- 30 rows in the production
+#: Toyota snapshot, every one fuel code 4 (`חשמל`).
 PROPULSION_BY_CODE: Mapping[int, tuple[str, str]] = {
     1: ("hybrid", "היברידי רגיל"),
     2: ("plug_in", "PLUG IN"),
+    3: ("battery_electric", "רכב חשמלי"),
 }
 
 #: The propulsion names the register states with NO code at all.
@@ -72,7 +83,9 @@ PROPULSION_BY_CODE: Mapping[int, tuple[str, str]] = {
 #: does not list is left unresolved rather than interpreted.
 PROPULSION_BY_UNCODED_NAME: Mapping[str, str] = {"הנעה רגילה": "conventional"}
 
-#: `hanaa_cd` -> (drivetrain, its paired name).
+#: `hanaa_cd` -> (drivetrain, its paired name). A row with no `hanaa_cd` (136
+#: rows in the production Toyota snapshot, all with no `hanaa_nm` either) is
+#: unchanged by PR-V: the dimension is simply not stated.
 DRIVETRAIN_BY_CODE: Mapping[int, tuple[str, str]] = {
     1: ("two_wheel_drive", "4X2"),
     3: ("awd", "4X4"),
@@ -80,14 +93,57 @@ DRIVETRAIN_BY_CODE: Mapping[int, tuple[str, str]] = {
 
 #: `merkav` (body) -> body style. The register states this one as a name only;
 #: it publishes no body code, so the whole string is matched exactly.
-BODY_STYLE_BY_MERKAV: Mapping[str, str] = {"פנאי-שטח": "suv"}
+#:
+#: PR-V: the eight body names below are read from the production Toyota
+#: snapshot's own distribution. Their English labels are PENDING OWNER
+#: APPROVAL (listed in the PR). Every other name -- and in particular the five
+#: in `UNMAPPED_MERKAV_REASONS` -- stays unread: the row keeps `body_style`
+#: unresolved rather than being given a guessed one.
+BODY_STYLE_BY_MERKAV: Mapping[str, str] = {
+    "פנאי-שטח": "suv",
+    "סדאן": "sedan",
+    "MPV": "mpv",
+    "הצ'בק": "hatchback",
+    "סטיישן": "wagon",
+    "קופה": "coupe",
+    "קבריולט": "convertible",
+    "תא כפול": "pickup_double_cab",
+    "תא בודד": "pickup_single_cab",
+}
+
+#: PR-V: the `merkav` names the production Toyota snapshot states that are
+#: DELIBERATELY left unmapped, with the reviewer's reason. Read by nothing at
+#: run time -- a name absent from `BODY_STYLE_BY_MERKAV` is already unresolved
+#: -- and kept so the decision is written down instead of implied.
+UNMAPPED_MERKAV_REASONS: Mapping[str, str] = {
+    "משא אחוד":
+        "'combined cargo' is a registration/usage class (a passenger-and-goods vehicle), not "
+        "a body style; across Toyota it covers vans, pickups and SUVs alike (141 rows)",
+    "קומבי":
+        "'kombi' names a passenger/cargo configuration that the register applies to vans and "
+        "estates alike; no single body style follows from it (40 rows)",
+    "שדה":
+        "'field' is an off-road/utility class with no reviewed body-style meaning (6 rows)",
+    "ואן/נוסעים":
+        "'van/passengers' is one row whose name combines two body classes; a single body "
+        "style would be a guess (1 row)",
+    "":
+        "an empty body name states nothing; it is an absent value, read as not stated "
+        "(96 rows), never as a body style",
+}
 
 #: Fuel and propulsion are two INDEPENDENT statements about one row, and a row
 #: whose two statements disagree has not stated one coherent propulsion. Only
 #: these pairings occur in the reviewed capture; anything else is a
 #: contradiction and fails closed.
+#:
+#: PR-V adds diesel with no coded propulsion (1,095 production rows) and
+#: electric with a battery-electric propulsion (30). It deliberately does NOT
+#: add ("diesel", "hybrid"): two production rows state it, and it stays a
+#: contradiction.
 CONSISTENT_FUEL_PROPULSION: frozenset[tuple[str, str]] = frozenset({
     ("petrol", "hybrid"), ("petrol", "conventional"), ("plug_in_hybrid", "plug_in"),
+    ("diesel", "conventional"), ("electric", "battery_electric"),
 })
 
 #: The register's OWN marker for "this row states no value for this dimension".
@@ -163,4 +219,5 @@ __all__ = ["BODY_STYLE_BY_MERKAV", "CONSISTENT_FUEL_PROPULSION", "DECLARED_UNKNO
            "DRIVETRAIN_BY_CODE", "FUEL_BY_CODE", "GOVERNMENT_IDENTITY_FIELDS",
            "GOVERNMENT_RECORD_ID_FIELD", "MAX_MODEL_YEAR", "MIN_MODEL_YEAR",
            "PROPULSION_BY_CODE", "PROPULSION_BY_UNCODED_NAME", "UNMAPPED_FIELD_REASONS",
+           "UNMAPPED_MERKAV_REASONS",
            "is_declared_unknown", "unmapped_fields"]
