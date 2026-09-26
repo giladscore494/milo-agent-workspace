@@ -31,6 +31,7 @@ VALIDATION_REASONS = frozenset({
     "DEPENDENCY_CYCLE",
     "ASSIGNMENT_CONTEXT_INCOMPLETE",
     "EVIDENCE_COMPLETION_MISMATCH",
+    "REQUIRED_OUTPUT_NOT_IN_SCHEMA",
     "TOOL_NOT_ALLOWLISTED",
     "TOOL_OPERATION_UNKNOWN",
     "TASK_COUNT_LIMIT",
@@ -187,6 +188,7 @@ PROVIDER_PLAN_RULES = (
     "Each assignment's context_task_ids must contain the COMPLETE direct and transitive dependency closure of its task.",
     "If a task declares evidence.minimum_sources > 0 or any evidence.required_fields, its completion.evidence_satisfied must be true; completion criteria can never disable evidence requirements.",
     "Every output_schema must be a JSON object schema with properties, a non-empty required list of existing properties, and additionalProperties=false.",
+    "Every name in a task's completion.required_outputs must appear both in that task's output_schema.required and in its output_schema.properties; completion may only require outputs the task's own output_schema requires.",
     "Every entry in a task's tools list is ONE exact tool call: it must name a tool from allowed_tools and an operation listed for that tool in the tool catalog; when allowed_tools is empty every task must use tools: [].",
     "Each call_id must be unique within its task, and the call's literal arguments must satisfy the selected operation's input schema.",
     "A dependency_bindings entry may read only a task listed in the SAME task's dependencies, using a literal key/index path; wildcards, filters and expressions are rejected.",
@@ -361,6 +363,19 @@ class PlanValidator:
                 raise PlanValidationError(
                     "evidence requirements cannot be disabled by completion criteria",
                     reason="EVIDENCE_COMPLETION_MISMATCH")
+            # PR-U: a completion criterion may only require what the task's
+            # own output_schema requires. Run 6825eb96 required
+            # "evidence_record" on every task while no schema declared it, so
+            # every completed task failed REQUIRED_OUTPUT_MISSING after it had
+            # already been paid for. Rejected here, it is one repairable plan
+            # failure instead.
+            schema_required = task.output_schema.get("required") or []
+            schema_properties = task.output_schema.get("properties") or {}
+            if any(name not in schema_required or name not in schema_properties
+                   for name in task.completion.required_outputs):
+                raise PlanValidationError(
+                    "completion required_outputs must be required output_schema properties",
+                    reason="REQUIRED_OUTPUT_NOT_IN_SCHEMA")
             # The EXACT call list is what is charged: the number of planned
             # calls is the number the worker executes, so a promise that
             # disagrees with execution is no longer representable.
