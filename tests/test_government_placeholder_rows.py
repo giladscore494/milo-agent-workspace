@@ -28,6 +28,7 @@ from backend.catalog.government.preparation import (ARTIFACT_KEY,
                                                     GovernmentPreparationError,
                                                     is_placeholder_identity,
                                                     prepare_government_work)
+from backend.catalog.government.query import MAX_RESOLUTION_MATCHES
 from backend.testing.memory_repository import MemoryRepository
 from backend.testing.work_scope_seed import (committed_records, seed_prepared_plan,
                                              start_batch_run)
@@ -129,9 +130,9 @@ def test_a_batch_without_placeholders_is_unchanged_and_reads_nothing_more(monkey
     rows = [row for row in register_rows() if row["_id"] != 37363]
     repository, run = seeded_batch(rows)
 
-    def no_projection(*_args, **_kwargs):
+    def no_query(*_args, **_kwargs):
         raise AssertionError("no placeholder, so no extra read")
-    monkeypatch.setattr(prep, "GovernmentCatalogProjection", no_projection)
+    monkeypatch.setattr(prep, "GovernmentCatalogQuery", no_query)
     preparation = prepare_government_work(repository, run_id=run)
     assert len(preparation.queue) == 4
     assert preparation.excluded == () and preparation.excluded_placeholder == 0
@@ -213,22 +214,141 @@ def test_a_corrupt_exclusion_record_is_refused_not_repaired(corrupt):
     assert refused.value.code == "GOVERNMENT_PREPARATION_RECORD_INVALID"
 
 
-def test_the_exclusion_reads_the_register_id_from_the_pinned_snapshot_only():
+def test_the_exclusion_reads_the_register_id_from_the_pinned_snapshot_only(monkeypatch):
     repository, run = seeded_batch(register_rows())
     seen: list[str | None] = []
-    real = prep.GovernmentCatalogProjection
+    real = prep.GovernmentCatalogQuery
 
-    def spy(repo, *, resource_id, snapshot_key):
+    def spy(repo, *, resource_id, snapshot_key, **kwargs):
         seen.append(snapshot_key)
         assert resource_id == src.WLTP_RESOURCE_ID
-        return real(repo, resource_id=resource_id, snapshot_key=snapshot_key)
+        assert kwargs["allow_incomplete"] is False
+        return real(repo, resource_id=resource_id, snapshot_key=snapshot_key, **kwargs)
 
-    prep.GovernmentCatalogProjection = spy
-    try:
-        preparation = prepare_government_work(repository, run_id=run)
-    finally:
-        prep.GovernmentCatalogProjection = real
+    monkeypatch.setattr(prep, "GovernmentCatalogQuery", spy)
+    preparation = prepare_government_work(repository, run_id=run)
     assert seen == [preparation.snapshot_key]
+
+
+def test_a_placeholder_item_whose_candidate_is_not_in_the_pinned_snapshot_is_refused(
+        monkeypatch):
+    repository, run = seeded_batch(register_rows())
+    real = repository.work_scope_batch_for_run
+
+    def tampered(run_id):
+        bound = copy.deepcopy(real(run_id))
+        for item in bound["items"]:
+            if item["commercial_model"] == "11111":
+                item["candidate_id"] = str(uuid4())
+        return bound
+
+    monkeypatch.setattr(repository, "work_scope_batch_for_run", tampered)
+    with pytest.raises(GovernmentPreparationError) as refused:
+        prepare_government_work(repository, run_id=run)
+    assert refused.value.code == "GOVERNMENT_BATCH_INVALID"
+
+
+# =============================================================================
+# PR-U2: a real-size snapshot (run 9e7f0d11)
+# =============================================================================
+
+#: The pinned Toyota snapshot of run 9e7f0d11 (cs1.e335295707fa8d6935b113bb6a0165f4)
+#: holds this many raw records and this many candidates -- more than the
+#: whole-snapshot projection's MAX_PROJECTION_CANDIDATES (5 000) will load.
+REAL_TOYOTA_SNAPSHOT_SIZE = 6_374
+
+
+def real_size_snapshot() -> tuple[MemoryRepository, str]:
+    """The five-row batch of `register_rows`, whose pinned snapshot is then
+    grown in memory to REAL_TOYOTA_SNAPSHOT_SIZE rows of non-placeholder
+    filler. The batch, its binding and its items are exactly as prepared."""
+    repository, run = seeded_batch(register_rows())
+    (snapshot,) = [row for row in repository.catalog_snapshots.values()
+                   if row.get("activated_at")]
+    template_record = next(row for row in repository.catalog_raw_records.values()
+                           if row["snapshot_id"] == snapshot["id"]
+                           and row["upstream_record_id"] != PLACEHOLDER_ID)
+    template_candidate = next(row for row in repository.catalog_candidates.values()
+                              if row["raw_record_id"] == template_record["id"])
+    existing = sum(1 for row in repository.catalog_candidates.values()
+                   if row["snapshot_id"] == snapshot["id"])
+    for index in range(REAL_TOYOTA_SNAPSHOT_SIZE - existing):
+        record = copy.deepcopy(template_record)
+        record.update({"id": str(uuid4()), "record_key": f"cr1.{index:032x}",
+                       "upstream_record_id": str(100_000 + index)})
+        record["payload"]["_id"] = 100_000 + index
+        candidate = copy.deepcopy(template_candidate)
+        candidate.update({"id": str(uuid4()), "candidate_key": f"cc1.{index:032x}",
+                          "raw_record_id": record["id"],
+                          "commercial_model": f"FILLER{index % 97}",
+                          "official_model_code": f"FILL-{index:05d}"})
+        repository.catalog_raw_records[(snapshot["id"], record["record_key"])] = record
+        repository.catalog_candidates[(snapshot["id"], candidate["candidate_key"])] = candidate
+    metadata = snapshot["retrieval_metadata"]
+    for field in ("reported_total", "captured_record_count", "normalized_record_count"):
+        metadata[field] = REAL_TOYOTA_SNAPSHOT_SIZE
+    snapshot["stored_record_count"] = snapshot["declared_record_count"] = \
+        REAL_TOYOTA_SNAPSHOT_SIZE
+    assert sum(1 for row in repository.catalog_candidates.values()
+               if row["snapshot_id"] == snapshot["id"]) == REAL_TOYOTA_SNAPSHOT_SIZE
+    assert sum(1 for row in repository.catalog_raw_records.values()
+               if row["snapshot_id"] == snapshot["id"]) == REAL_TOYOTA_SNAPSHOT_SIZE
+    return repository, run
+
+
+def test_a_real_size_snapshot_prepares_and_excludes_exactly_the_placeholder():
+    repository, run = real_size_snapshot()
+    batch = repository.work_scope_batch_for_run(UUID(run))["items"]
+
+    preparation = prepare_government_work(repository, run_id=run)
+
+    assert preparation.excluded == ((PLACEHOLDER_ID, EXCLUDED_PLACEHOLDER_SOURCE_RECORD),)
+    assert preparation.excluded_placeholder == 1
+    assert len(preparation.queue) == len(batch) - 1
+    assert [item.candidate_id for item in preparation.queue] == \
+        [item["candidate_id"] for item in batch if item["commercial_model"] != "11111"]
+    assert preparation.as_artifact()["excluded_records"] == [
+        {"upstream_record_id": PLACEHOLDER_ID, "reason": EXCLUDED_PLACEHOLDER_SOURCE_RECORD}]
+
+
+class BoundedReadSpy:
+    """A repository that refuses every whole-snapshot read and counts every
+    catalog row the run-preparation path reads through anything else."""
+
+    WHOLE_SNAPSHOT_READS = ("list_catalog_raw_records", "list_catalog_candidates")
+
+    def __init__(self, inner: MemoryRepository) -> None:
+        self._inner = inner
+        self.rows_read = 0
+
+    def __getattr__(self, name: str):
+        attribute = getattr(self._inner, name)
+        if name in self.WHOLE_SNAPSHOT_READS:
+            def refused(*_args, **_kwargs):
+                raise AssertionError(f"run preparation paged the whole snapshot via {name}")
+            return refused
+        if name.startswith("catalog_") and callable(attribute):
+            def counted(*args, **kwargs):
+                result = attribute(*args, **kwargs)
+                if isinstance(result, list):
+                    self.rows_read += len(result)
+                elif result is not None:
+                    self.rows_read += 1
+                return result
+            return counted
+        return attribute
+
+
+def test_run_preparation_never_pages_the_whole_snapshot():
+    repository, run = real_size_snapshot()
+    spy = BoundedReadSpy(repository)
+
+    preparation = prepare_government_work(spy, run_id=run)
+
+    assert preparation.excluded_placeholder == 1
+    # One placeholder item: one bounded variant page and its one raw record.
+    # Nothing near the 6 374 rows of the snapshot is read.
+    assert 0 < spy.rows_read <= MAX_RESOLUTION_MATCHES + 2
 
 
 # =============================================================================
