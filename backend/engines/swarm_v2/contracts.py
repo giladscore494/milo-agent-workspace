@@ -5,12 +5,36 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_core import PydanticCustomError
+
+from backend.tools.registry import validate_schema
 
 from .evidence_bounds import (IDENTITY_DIMENSIONS, MAX_IDENTITY_DIMENSION_CHARS,
                               MAX_LOCATOR_KEY_CHARS, MAX_SOURCE_VERSION_KEY_CHARS,
                               MAX_UNIT_CHARS, MAX_VERIFIER_CONTRACT_VERSION_CHARS)
 from .fragments import MAX_FRAGMENTS_PER_SOURCE
 from .tool_calls import MAX_BINDING_PATH_SEGMENTS, MAX_DEPENDENCY_BINDINGS_PER_CALL
+
+
+#: The pydantic error TYPE a nested output_schema failure carries, so the plan
+#: firewall can classify it by type alone (see validation.classify_schema_failure).
+OUTPUT_SCHEMA_NESTED_ERROR_TYPE = "output_schema_nested_invalid"
+
+
+def output_schema_is_runtime_valid(schema: Any) -> bool:
+    """True when the WHOLE schema, recursively, is one the runtime can enforce.
+
+    Run 280fc9e5 approved `{"type": "array"}` (no items) and
+    `{"type": "object"}` (not closed) as nested output properties; the
+    runtime validator then raised KeyError / ValueError on every completion
+    and all eleven tasks failed after they had been paid for. Plan time and
+    run time now apply the SAME registry subset.
+    """
+    try:
+        validate_schema(schema, "$output_schema")
+    except (ValueError, TypeError, RecursionError):
+        return False
+    return True
 
 
 class StrictContract(BaseModel):
@@ -110,6 +134,11 @@ class DynamicTask(StrictContract):
             raise ValueError("output_schema must define non-empty required fields")
         if any(not isinstance(item, str) for item in required) or not set(required) <= set(value["properties"]):
             raise ValueError("output_schema required fields must exist in properties")
+        if not output_schema_is_runtime_valid(value):
+            # A typed error, never the diagnostic: nested property names are
+            # model output and must not reach a durable reason.
+            raise PydanticCustomError(OUTPUT_SCHEMA_NESTED_ERROR_TYPE,
+                                      "output_schema must be a closed schema the runtime validator supports")
         return value
 
 

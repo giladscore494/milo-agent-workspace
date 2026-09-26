@@ -118,14 +118,14 @@ def validate_worker_output(completion: Any, output_schema: Mapping[str, Any]) ->
     else:
         try:
             parsed = json.loads(completion)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             # `from None`: the decoder exception carries the raw document and
             # must never travel with the safe classification.
             raise WorkerOutputValidationError("WORKER_OUTPUT_JSON_INVALID") from None
     check_material(parsed, MAX_TASK_OUTPUT_JSON_BYTES, "TASK_OUTPUT_TOO_LARGE")
     try:
         validate_json_schema(output_schema, parsed, "$model_output")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
         # Dropped deliberately: the validation message can quote model-chosen
         # property names, so it is provider material, not a safe reason.
         raise WorkerOutputValidationError("WORKER_OUTPUT_SCHEMA_INVALID") from None

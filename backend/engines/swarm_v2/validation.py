@@ -11,7 +11,8 @@ from pydantic import ValidationError
 from backend.tools import ToolDescriptor
 from backend.tools.registry import validate_json_schema
 
-from .contracts import CommanderPlan, DynamicTask, PlannedToolCall
+from .contracts import (OUTPUT_SCHEMA_NESTED_ERROR_TYPE, CommanderPlan, DynamicTask,
+                        PlannedToolCall, output_schema_is_runtime_valid)
 from .tool_calls import (MAX_TOOL_ARGUMENT_KEYS, MAX_TOOL_CALLS_PER_TASK,
                          MAX_TOOL_INPUT_JSON_BYTES, PLAN_TOOL_CALL_REASONS,
                          ToolCallError, check_material, validate_binding_path)
@@ -32,6 +33,7 @@ VALIDATION_REASONS = frozenset({
     "ASSIGNMENT_CONTEXT_INCOMPLETE",
     "EVIDENCE_COMPLETION_MISMATCH",
     "REQUIRED_OUTPUT_NOT_IN_SCHEMA",
+    "OUTPUT_SCHEMA_NESTED_INVALID",
     "TOOL_NOT_ALLOWLISTED",
     "TOOL_OPERATION_UNKNOWN",
     "TASK_COUNT_LIMIT",
@@ -85,6 +87,8 @@ def classify_schema_failure(exc: Exception) -> str:
         kinds = {str(error.get("type", "")) for error in exc.errors()}
     except Exception:
         return "SCHEMA_CONSTRAINT_FAILED"
+    if OUTPUT_SCHEMA_NESTED_ERROR_TYPE in kinds:
+        return "OUTPUT_SCHEMA_NESTED_INVALID"
     if "missing" in kinds:
         return "SCHEMA_MISSING_FIELD"
     if "extra_forbidden" in kinds:
@@ -188,6 +192,7 @@ PROVIDER_PLAN_RULES = (
     "Each assignment's context_task_ids must contain the COMPLETE direct and transitive dependency closure of its task.",
     "If a task declares evidence.minimum_sources > 0 or any evidence.required_fields, its completion.evidence_satisfied must be true; completion criteria can never disable evidence requirements.",
     "Every output_schema must be a JSON object schema with properties, a non-empty required list of existing properties, and additionalProperties=false.",
+    "Every output_schema property must be a scalar (string/integer/number/boolean) or an array of scalars with \"items\", using only the keywords type, properties, required, additionalProperties, items and maxItems; do not copy raw tool material (variants, provenance) into task output: evidence comes from the tool, not from the worker output.",
     "Every name in a task's completion.required_outputs must appear both in that task's output_schema.required and in its output_schema.properties; completion may only require outputs the task's own output_schema requires.",
     "Every entry in a task's tools list is ONE exact tool call: it must name a tool from allowed_tools and an operation listed for that tool in the tool catalog; when allowed_tools is empty every task must use tools: [].",
     "Each call_id must be unique within its task, and the call's literal arguments must satisfy the selected operation's input schema.",
@@ -369,6 +374,14 @@ class PlanValidator:
             # every completed task failed REQUIRED_OUTPUT_MISSING after it had
             # already been paid for. Rejected here, it is one repairable plan
             # failure instead.
+            # PR-W: plan time applies the SAME recursive schema subset the
+            # runtime validator enforces. Run 280fc9e5 approved nested
+            # `{"type": "array"}` / `{"type": "object"}` properties and every
+            # task then failed after its model call.
+            if not output_schema_is_runtime_valid(task.output_schema):
+                raise PlanSchemaError(
+                    "output_schema must be a closed schema the runtime validator supports",
+                    reason="OUTPUT_SCHEMA_NESTED_INVALID")
             schema_required = task.output_schema.get("required") or []
             schema_properties = task.output_schema.get("properties") or {}
             if any(name not in schema_required or name not in schema_properties

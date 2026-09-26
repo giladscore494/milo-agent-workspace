@@ -28,7 +28,7 @@ def validate_schema(schema: Mapping[str, Any], path: str = "$schema") -> None:
         raise ValueError(f"{path} must be an object")
     expected = schema.get("type")
     allowed_types = {"object", "array", "string", "integer", "number", "boolean", "null"}
-    if expected not in allowed_types:
+    if not isinstance(expected, str) or expected not in allowed_types:
         raise ValueError(f"unsupported schema type at {path}")
     allowed_keys = {"type"}
     if expected == "object":
@@ -60,20 +60,30 @@ def validate_schema(schema: Mapping[str, Any], path: str = "$schema") -> None:
 
 
 def validate_json_schema(schema: Mapping[str, Any], value: Any, path: str = "$input") -> None:
-    """Validate the deliberately small JSON-schema subset tools may expose."""
+    """Validate the deliberately small JSON-schema subset tools may expose.
+
+    A malformed SCHEMA is reported exactly like a non-conforming value: as a
+    ValueError, never a KeyError/TypeError/AttributeError. Run 280fc9e5 lost
+    every task to an array schema without "items", which used to escape here
+    as a bare KeyError.
+    """
+    if not isinstance(schema, Mapping):
+        raise ValueError(f"schema at {path} must be an object")
     expected = schema.get("type")
     types = {"object": dict, "array": list, "string": str, "integer": int,
              "number": (int, float), "boolean": bool, "null": type(None)}
-    if expected not in types:
+    if not isinstance(expected, str) or expected not in types:
         raise ValueError(f"unsupported schema type at {path}")
     if not isinstance(value, types[expected]) or (expected in {"integer", "number"} and isinstance(value, bool)):
         raise ValueError(f"{path} must be {expected}")
     if expected == "object":
         properties = schema.get("properties")
-        if not isinstance(properties, dict) or schema.get("additionalProperties") is not False:
+        if not isinstance(properties, Mapping) or schema.get("additionalProperties") is not False:
             raise ValueError(f"{path} must use a closed object schema")
         required = schema.get("required", [])
-        if not isinstance(required, list) or any(key not in value for key in required):
+        if not isinstance(required, list) or any(not isinstance(key, str) for key in required):
+            raise ValueError(f"{path}.required must be a string array")
+        if any(key not in value for key in required):
             raise ValueError(f"{path} is missing required properties")
         unknown = set(value) - set(properties)
         if unknown:
@@ -81,7 +91,12 @@ def validate_json_schema(schema: Mapping[str, Any], value: Any, path: str = "$in
         for key, item in value.items():
             validate_json_schema(properties[key], item, f"{path}.{key}")
     elif expected == "array":
-        if "maxItems" in schema and len(value) > int(schema["maxItems"]):
+        if "items" not in schema:
+            raise ValueError(f"schema at {path} must declare items")
+        max_items = schema.get("maxItems")
+        if "maxItems" in schema and (not isinstance(max_items, int) or isinstance(max_items, bool)):
+            raise ValueError(f"schema at {path} has an invalid maxItems")
+        if max_items is not None and len(value) > max_items:
             raise ValueError(f"{path} exceeds maxItems")
         for index, item in enumerate(value):
             validate_json_schema(schema["items"], item, f"{path}[{index}]")
