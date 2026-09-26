@@ -119,6 +119,7 @@ export const INVALID_RESULT_CODES = [
   'REVIEW_ITEM_INVALID',
   'VALUE_NOT_JSON',
   'PROVENANCE_INVALID',
+  'VEHICLES_INVALID',
 ] as const;
 export type InvalidResultCode = (typeof INVALID_RESULT_CODES)[number];
 
@@ -220,6 +221,62 @@ export type ReviewItem = {
   provenance?: ProvenanceReference;
 };
 
+/**
+ * Phase 2: the vehicle-centric view (`vehicles`, `unresolved_groups`,
+ * `summary`), written by `backend/catalog/result/assembler.py` ONLY when the
+ * run has typed register outcomes. Identity comes from those outcomes and
+ * from evidence provenance — never from model text — and an ambiguous or
+ * not-found candidate is never a vehicle: it has its own group and no values.
+ */
+export type VehicleIdentity = {
+  manufacturer?: string;
+  commercialModel?: string;
+  modelYear?: string;
+  trim?: string;
+  officialModelCode?: string;
+};
+
+export type VehicleFieldVerdict = 'verified' | 'needs_review';
+
+export type VehicleField = {
+  key: string;
+  label: string;
+  value: DisplayValue;
+  verdict: VehicleFieldVerdict;
+  /** Claim, source and task ids only. */
+  provenance: { claimId: string; sourceId: string; taskId: string }[];
+};
+
+export type VehicleReviewCode = { code: string; field?: string; taskId?: string };
+
+export type VehicleView = {
+  /** The register's own upstream record id. */
+  key: string;
+  identity: VehicleIdentity;
+  fields: VehicleField[];
+  verifiedFieldCount: number;
+  review: VehicleReviewCode[];
+  sources: string[];
+};
+
+export type UnresolvedOutcome = 'unresolved_ambiguous' | 'unresolved_not_found';
+
+export type UnresolvedGroupView = {
+  outcome: UnresolvedOutcome;
+  identity: VehicleIdentity;
+  recordIds: string[];
+  taskIds: string[];
+};
+
+export type VehicleResult = {
+  vehicles: VehicleView[];
+  unresolvedGroups: UnresolvedGroupView[];
+  vehiclesResolved: number;
+  vehiclesWithReview: number;
+  unresolvedAmbiguous: number;
+  unresolvedNotFound: number;
+};
+
 export type FinalResult = {
   status: ProductStatus;
   kind: FinalResultKind;
@@ -231,6 +288,8 @@ export type FinalResult = {
   taskFailureCount: number;
   /** Fields carrying more than one verified value, none of them chosen. */
   multiValuedFieldCount: number;
+  /** Present only when the payload carries the vehicle-centric view. */
+  vehicleResult?: VehicleResult;
 };
 
 /** The total outcome of parsing. Exactly one of three shapes. */
@@ -597,6 +656,172 @@ function toVerifiedValue(entry: unknown): VerifiedValue | EntryRefusal {
   return { value, provenance };
 }
 
+// --- the vehicle-centric view (Phase 2) ---------------------------------------
+
+/** The three keys come together or not at all. */
+const VEHICLE_RESULT_KEYS = ['vehicles', 'unresolved_groups', 'summary'] as const;
+const VEHICLE_KEYS = ['vehicle_key', 'identity', 'fields', 'needs_review', 'sources'] as const;
+const VEHICLE_FIELD_KEYS = ['value', 'verdict', 'provenance'] as const;
+const VEHICLE_PROVENANCE_KEYS = ['claim_id', 'source_id', 'task_id'] as const;
+const IDENTITY_KEYS = ['manufacturer', 'commercial_model', 'model_year', 'trim',
+  'official_model_code'] as const;
+const GROUP_KEYS = ['outcome', 'candidate', 'record_ids', 'task_ids'] as const;
+const SUMMARY_KEYS = ['vehicles_resolved', 'vehicles_with_review', 'unresolved_ambiguous',
+  'unresolved_not_found'] as const;
+const UNRESOLVED_OUTCOMES: readonly string[] = ['unresolved_ambiguous', 'unresolved_not_found'];
+/** `MAX_OUTCOME_TEXT_CHARS` / `MAX_OUTCOME_RECORD_IDS` in backend resolution.py. */
+const OUTCOME_TEXT_CHARS = 200;
+const OUTCOME_RECORD_IDS = 8;
+/** Bounds on what the surface will list; a payload past them is refused. */
+const MAX_VEHICLES = 100;
+const MAX_VEHICLE_LIST_ITEMS = 100;
+
+function idList(value: unknown, maxChars: number, maxItems: number): Refusable<string[]> {
+  if (!Array.isArray(value) || value.length > maxItems) return null;
+  const ids: string[] = [];
+  for (const item of value) {
+    const id = requiredId(item, maxChars);
+    if (id === null) return null;
+    ids.push(id);
+  }
+  return ids;
+}
+
+function toIdentity(value: unknown): Refusable<VehicleIdentity> {
+  if (!isObject(value) || !hasExactKeys(value, IDENTITY_KEYS)) return null;
+  const read = (raw: unknown): Refusable<string | undefined> => {
+    if (raw === null) return undefined;
+    if (typeof raw === 'number' && Number.isInteger(raw)) return String(raw);
+    return requiredId(raw, OUTCOME_TEXT_CHARS);
+  };
+  const parts = IDENTITY_KEYS.map((key) => read(value[key]));
+  if (parts.some((part) => part === null)) return null;
+  const [manufacturer, commercialModel, modelYear, trim, officialModelCode] =
+    parts as (string | undefined)[];
+  return { manufacturer, commercialModel, modelYear, trim, officialModelCode };
+}
+
+function toVehicleField(key: string, value: unknown): Refusable<VehicleField> {
+  if (key.length === 0 || key.length > BACKEND_BOUNDS.field) return null;
+  if (!isObject(value) || !hasExactKeys(value, VEHICLE_FIELD_KEYS)) return null;
+  if (value.verdict !== 'verified' && value.verdict !== 'needs_review') return null;
+  const display = toDisplayValue(value.value);
+  if (display === null) return null;
+  if (!Array.isArray(value.provenance) || value.provenance.length === 0 ||
+      value.provenance.length > MAX_VEHICLE_LIST_ITEMS) return null;
+  const provenance: VehicleField['provenance'] = [];
+  for (const entry of value.provenance) {
+    if (!isObject(entry) || !hasExactKeys(entry, VEHICLE_PROVENANCE_KEYS)) return null;
+    const claimId = requiredId(entry.claim_id, BACKEND_BOUNDS.claimId);
+    const sourceId = requiredId(entry.source_id, BACKEND_BOUNDS.sourceId);
+    const taskId = requiredId(entry.task_id, BACKEND_BOUNDS.taskId);
+    if (claimId === null || sourceId === null || taskId === null) return null;
+    provenance.push({ claimId, sourceId, taskId });
+  }
+  const displayKey = safeDurableText(key, BACKEND_BOUNDS.field);
+  return { key: displayKey, label: humanizeKey(displayKey), value: display,
+    verdict: value.verdict, provenance };
+}
+
+function toVehicleReview(value: unknown): Refusable<VehicleReviewCode> {
+  if (!isObject(value) || typeof value.code !== 'string') return null;
+  const keys = Object.keys(value);
+  if (!keys.every((key) => key === 'code' || key === 'field' || key === 'task_id')) return null;
+  const code = requiredId(value.code, MAX_TEXT_CHARS);
+  if (code === null) return null;
+  const entry: VehicleReviewCode = { code };
+  if ('field' in value) {
+    const field = requiredId(value.field, BACKEND_BOUNDS.field);
+    if (field === null) return null;
+    entry.field = field;
+  }
+  if ('task_id' in value) {
+    const taskId = requiredId(value.task_id, BACKEND_BOUNDS.taskId);
+    if (taskId === null) return null;
+    entry.taskId = taskId;
+  }
+  return entry;
+}
+
+function toVehicle(value: unknown): Refusable<VehicleView> {
+  if (!isObject(value) || !hasExactKeys(value, VEHICLE_KEYS)) return null;
+  const key = requiredId(value.vehicle_key, OUTCOME_TEXT_CHARS);
+  const identity = toIdentity(value.identity);
+  const sources = idList(value.sources, BACKEND_BOUNDS.sourceId, MAX_VEHICLE_LIST_ITEMS);
+  if (key === null || identity === null || sources === null) return null;
+  if (!isObject(value.fields) || !Array.isArray(value.needs_review) ||
+      value.needs_review.length > MAX_VEHICLE_LIST_ITEMS) return null;
+  const fields: VehicleField[] = [];
+  for (const [name, entry] of ownEntries(value.fields)) {
+    const field = toVehicleField(name, entry);
+    if (field === null) return null;
+    fields.push(field);
+  }
+  const review: VehicleReviewCode[] = [];
+  for (const item of value.needs_review) {
+    const entry = toVehicleReview(item);
+    if (entry === null) return null;
+    review.push(entry);
+  }
+  return { key, identity, fields, review, sources,
+    verifiedFieldCount: fields.filter((field) => field.verdict === 'verified').length };
+}
+
+function toUnresolvedGroup(value: unknown): Refusable<UnresolvedGroupView> {
+  if (!isObject(value) || !hasExactKeys(value, GROUP_KEYS)) return null;
+  if (typeof value.outcome !== 'string' || !UNRESOLVED_OUTCOMES.includes(value.outcome)) return null;
+  const identity = toIdentity(value.candidate);
+  const recordIds = idList(value.record_ids, OUTCOME_TEXT_CHARS, OUTCOME_RECORD_IDS);
+  const taskIds = idList(value.task_ids, BACKEND_BOUNDS.taskId, MAX_VEHICLE_LIST_ITEMS);
+  if (identity === null || recordIds === null || taskIds === null || taskIds.length === 0) return null;
+  // An ambiguity names the rows it is between; a not-found names none.
+  if ((value.outcome === 'unresolved_ambiguous') !== (recordIds.length > 0)) return null;
+  return { outcome: value.outcome as UnresolvedOutcome, identity, recordIds, taskIds };
+}
+
+function count(value: unknown): Refusable<number> {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * The vehicle-centric view, or `undefined` when the payload carries none, or
+ * `null` to refuse the whole outcome. Closed and self-consistent: the summary
+ * must count exactly what the two lists hold.
+ */
+function toVehicleResult(output: Record<string, unknown>): Refusable<VehicleResult | undefined> {
+  const present = VEHICLE_RESULT_KEYS.filter((key) => key in output);
+  if (present.length === 0) return undefined;
+  if (present.length !== VEHICLE_RESULT_KEYS.length) return null;
+  const { vehicles: rawVehicles, unresolved_groups: rawGroups, summary } = output;
+  if (!Array.isArray(rawVehicles) || rawVehicles.length > MAX_VEHICLES ||
+      !Array.isArray(rawGroups) || rawGroups.length > MAX_VEHICLES ||
+      !isObject(summary) || !hasExactKeys(summary, SUMMARY_KEYS)) return null;
+  const vehicles: VehicleView[] = [];
+  for (const item of rawVehicles) {
+    const vehicle = toVehicle(item);
+    if (vehicle === null) return null;
+    vehicles.push(vehicle);
+  }
+  const unresolvedGroups: UnresolvedGroupView[] = [];
+  for (const item of rawGroups) {
+    const group = toUnresolvedGroup(item);
+    if (group === null) return null;
+    unresolvedGroups.push(group);
+  }
+  const counts = SUMMARY_KEYS.map((key) => count(summary[key]));
+  if (counts.some((value) => value === null)) return null;
+  const [vehiclesResolved, vehiclesWithReview, unresolvedAmbiguous, unresolvedNotFound] =
+    counts as number[];
+  if (vehiclesResolved !== vehicles.length ||
+      vehiclesWithReview !== vehicles.filter((item) => item.review.length > 0).length ||
+      unresolvedAmbiguous !== unresolvedGroups.filter((g) => g.outcome === 'unresolved_ambiguous').length ||
+      unresolvedNotFound !== unresolvedGroups.filter((g) => g.outcome === 'unresolved_not_found').length) {
+    return null;
+  }
+  return { vehicles, unresolvedGroups, vehiclesResolved, vehiclesWithReview,
+    unresolvedAmbiguous, unresolvedNotFound };
+}
+
 // --- the parser --------------------------------------------------------------
 
 export type ParseOptions = {
@@ -720,6 +945,9 @@ export function parseFinalResult(output: unknown, options: ParseOptions = {}): F
 
   const countOf = (kindName: ReviewItemKind) => review.filter((item) => item.kind === kindName).length;
 
+  const vehicleResult = toVehicleResult(output);
+  if (vehicleResult === null) return { state: 'invalid', code: 'VEHICLES_INVALID' };
+
   return {
     state: 'result',
     result: {
@@ -731,6 +959,7 @@ export function parseFinalResult(output: unknown, options: ParseOptions = {}): F
       coverageGapCount: countOf('coverage_gap'),
       taskFailureCount: countOf('task_failure'),
       multiValuedFieldCount: parsedFields.filter((field) => field.values.length > 1).length,
+      ...(vehicleResult === undefined ? {} : { vehicleResult }),
     },
   };
 }

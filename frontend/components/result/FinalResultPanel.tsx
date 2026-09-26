@@ -10,6 +10,10 @@ import {
   REVIEW_GROUPS,
   ReviewItem,
   ReviewItemKind,
+  UnresolvedGroupView,
+  VehicleIdentity,
+  VehicleResult,
+  VehicleView,
   VerifiedField,
   describeOutcome,
   describeReviewCode,
@@ -206,6 +210,8 @@ function ResultBody({ result }: { result: FinalResult }) {
         </p>
       )}
 
+      {result.vehicleResult && <VehicleSection view={result.vehicleResult} />}
+
       {/* A backend-VALID partial result can carry no itemized review rows at
           all: a rejected verdict, an unverified claim and a bare conflict each
           make a run partial without writing one. The payload does not say
@@ -237,6 +243,103 @@ function ResultBody({ result }: { result: FinalResult }) {
           ))}
         </section>
       )}
+    </>
+  );
+}
+
+/**
+ * Phase 2: one row per register row a task RESOLVED, then every unresolved
+ * candidate in its own group. Identity line, verified field count and a
+ * review badge only; the values themselves stay in the Inspector and in the
+ * verified fields above. An unresolved candidate is never listed as a vehicle.
+ */
+function VehicleSection({ view }: { view: VehicleResult }) {
+  return (
+    <section className="final-result-section" aria-labelledby="final-result-vehicles-title">
+      <h4 className="section-title" id="final-result-vehicles-title">
+        Vehicles ({view.vehicles.length})
+      </h4>
+      {view.vehicles.length === 0 ? (
+        <p className="muted">No register row was resolved to exactly one vehicle.</p>
+      ) : (
+        <ul className="final-result-review-items">
+          {view.vehicles.map((vehicle) => (
+            <li className="final-result-review-item" key={vehicle.key}>
+              <VehicleRow vehicle={vehicle} />
+            </li>
+          ))}
+        </ul>
+      )}
+      {view.unresolvedGroups.length > 0 && (
+        <div className="final-result-review-group" data-kind="unresolved">
+          <h5 className="final-result-review-title">
+            Unresolved candidates ({view.unresolvedGroups.length})
+          </h5>
+          <p className="note">
+            The register did not settle these on one row. They are not vehicles and carry no values.
+          </p>
+          <ul className="final-result-review-items">
+            {view.unresolvedGroups.map((group, index) => (
+              <li className="final-result-review-item" key={`${group.outcome}-${index}`}>
+                <UnresolvedRow group={group} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function identityLine(identity: VehicleIdentity): string {
+  const head = [identity.manufacturer, identity.commercialModel, identity.modelYear]
+    .filter((part): part is string => part !== undefined)
+    .join(' ');
+  return [head, identity.trim, identity.officialModelCode]
+    .filter((part): part is string => part !== undefined && part.length > 0)
+    .join(' · ') || 'Identity not stated';
+}
+
+function VehicleRow({ vehicle }: { vehicle: VehicleView }) {
+  const verified = vehicle.verifiedFieldCount;
+  return (
+    <>
+      <span className="final-result-review-subject">{safeText(identityLine(vehicle.identity))}</span>
+      <span className="final-result-review-reason">
+        {verified === 1 ? '1 verified field' : `${verified} verified fields`}
+      </span>
+      {vehicle.review.length > 0 ? (
+        <span className="final-result-review-reason" data-review="true">
+          Needs review ({vehicle.review.length})
+        </span>
+      ) : (
+        <span className="final-result-review-reason" data-review="false">No review items</span>
+      )}
+      <span className="final-result-review-reason">
+        Register record <span className="identifier">{safeText(vehicle.key)}</span>
+      </span>
+    </>
+  );
+}
+
+function UnresolvedRow({ group }: { group: UnresolvedGroupView }) {
+  const ambiguous = group.outcome === 'unresolved_ambiguous';
+  return (
+    <>
+      <span className="final-result-review-subject">{safeText(identityLine(group.identity))}</span>
+      <span className="final-result-review-reason">
+        {ambiguous
+          ? `Ambiguous — matches ${group.recordIds.length} register rows`
+          : 'Not found in the register'}
+      </span>
+      {group.recordIds.length > 0 && (
+        <span className="final-result-review-reason">
+          Register records <span className="identifier">{safeText(group.recordIds.join(', '))}</span>
+        </span>
+      )}
+      <span className="final-result-review-reason">
+        Tasks <span className="identifier">{safeText(group.taskIds.join(', '))}</span>
+      </span>
     </>
   );
 }

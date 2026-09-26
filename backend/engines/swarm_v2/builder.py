@@ -16,6 +16,13 @@ class FinalBuilder:
     failures, coverage gaps and conflicting claims -- into this same call, so
     the final payload is constructed exactly once and never mutated afterwards
     by the engine or re-interpreted by the outer worker.
+
+    Phase 2: when the run has at least one typed register outcome
+    (``candidate_outcomes``), the payload also carries the vehicle-centric
+    view -- ``vehicles``, ``unresolved_groups`` and ``summary`` -- assembled
+    by the pure `VehicleCatalogResultAssembler` from the SAME inputs. Those
+    keys are additive: every existing key keeps its exact shape and value,
+    and a payload without a register outcome is byte-for-byte what it was.
     """
 
     def build(self, evidence: Iterable[EvidenceReference],
@@ -30,6 +37,7 @@ class FinalBuilder:
         # "whichever came last in the list": a stray second verdict must not
         # be able to raise a claim to `verified` by arriving later.
         verdict_by_claim = current_verdict_by_claim(verdict_list)
+        evidence = list(evidence)
         fields, review = {}, []
         for item in sorted(evidence, key=lambda x: (x.field, x.claim_id)):
             verdict = verdict_by_claim.get(item.claim_id)
@@ -43,14 +51,25 @@ class FinalBuilder:
             elif verdict and verdict.verdict == "needs_review":
                 review.append({"field": item.field, "value": item.value,
                                "reason": verdict.reason, "provenance": trace})
-        return finalize_product_outcome(
+        outcomes = [dict(item) for item in candidate_outcomes]
+        failures, gaps = list(task_failures), list(coverage_gaps)
+        final = finalize_product_outcome(
             fields=fields,
             verdict_review=sorted(review, key=lambda x: (x["field"], x["provenance"]["claim_id"])),
-            task_failures=task_failures, coverage_gaps=coverage_gaps,
+            task_failures=failures, coverage_gaps=gaps,
             conflict_claim_ids=conflict_claim_ids,
             # A rejected or needs_review verdict is an unresolved item even
             # when it produced no review entry of its own.
             unverified_claim_ids=[item.claim_id for item in verdict_list
                                   if item.verdict != "verified"],
             trusted_negative=trusted_negative,
-            candidate_outcomes=candidate_outcomes)
+            candidate_outcomes=outcomes)
+        if outcomes:
+            # Imported here: the catalog package reads the engine's contracts,
+            # so a module-level import would make the two initialize each other.
+            from backend.catalog.result.assembler import VehicleCatalogResultAssembler
+
+            final.update(VehicleCatalogResultAssembler().assemble(
+                evidence=evidence, verdicts=verdict_list, candidate_outcomes=outcomes,
+                coverage_gaps=gaps, task_failures=failures))
+        return final
