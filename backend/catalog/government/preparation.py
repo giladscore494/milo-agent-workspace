@@ -68,12 +68,14 @@ queue claiming progress the database does not hold.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
 from backend.catalog.contracts import MAX_PROMOTIONS_PER_RUN
 from backend.catalog.government import source as src
-from backend.catalog.government.projection import (GovernmentProjectionError,
+from backend.catalog.government.projection import (GovernmentCatalogProjection,
+                                                   GovernmentProjectionError,
                                                    resolve_active_snapshot)
 from backend.errors import AppError
 from backend.runtime import CancellationRequested
@@ -104,6 +106,17 @@ QUEUED_CANDIDATE_STATUS = "candidate"
 #: this module free of the pipeline's dependencies.
 _PROMOTABLE_OPERATION: str | None = None
 
+#: PR-U: the ONE placeholder rule. A register row whose commercial model
+#: (`kinuy_mishari`) or official model code (`degem_nm`), trimmed, is a single
+#: digit repeated three or more times -- "111", "11111", "00000000" -- is a
+#: placeholder, not a vehicle. Run 6825eb96 queued register record 37363
+#: (Toyota, kinuy_mishari "11111", degem_nm "11111111") and "resolved" it as a
+#: real vehicle. Such an item is not handed to the run; the raw record and the
+#: candidate row stay exactly as captured.
+PLACEHOLDER_IDENTITY = re.compile(r"^([0-9])\1{2,}$")
+#: The static reason an excluded batch item is recorded under.
+EXCLUDED_PLACEHOLDER_SOURCE_RECORD = "EXCLUDED_PLACEHOLDER_SOURCE_RECORD"
+
 #: Per-item progress states, all DERIVED from durable state.
 PROGRESS_PENDING = "pending"        # no durable trace of work on this item yet
 PROGRESS_EVIDENCED = "evidenced"    # this run holds verified evidence for it
@@ -127,6 +140,9 @@ PREPARATION_REASONS: Mapping[str, str] = {
     "GOVERNMENT_READ_REQUIRED":
         "this run executes a Mapping Plan batch, and the Government catalog read is off in "
         "this deployment",
+    "GOVERNMENT_BATCH_ONLY_PLACEHOLDERS":
+        "every candidate in the Mapping Plan batch bound to this run is a placeholder register "
+        "row, so there is nothing to research",
 }
 
 
@@ -219,6 +235,14 @@ class GovernmentPreparation:
     #: identity only (ids, revision, digest, number, attempt) -- never its
     #: items, which ARE the queue above.
     work_scope_batch: Mapping[str, Any] | None = None
+    #: PR-U: batch items NOT handed to the run, as (upstream_record_id, static
+    #: reason), sorted by the register's own id.
+    excluded: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def excluded_placeholder(self) -> int:
+        return sum(1 for _, reason in self.excluded
+                   if reason == EXCLUDED_PLACEHOLDER_SOURCE_RECORD)
 
     def as_artifact(self) -> dict[str, Any]:
         """The persisted shape, stored under ``artifacts.government``."""
@@ -232,6 +256,9 @@ class GovernmentPreparation:
             "queue": [item.as_record() for item in self.queue],
             "total_candidates": int(self.total_candidates),
             "bounded": bool(self.bounded),
+            "excluded_placeholder": self.excluded_placeholder,
+            "excluded_records": [{"upstream_record_id": record, "reason": reason}
+                                 for record, reason in self.excluded],
         }
         if self.work_scope_batch is not None:
             artifact[BATCH_ARTIFACT_KEY] = dict(self.work_scope_batch)
@@ -393,9 +420,46 @@ def _batch_identity(bound: Mapping[str, Any]) -> dict[str, Any]:
     return identity
 
 
+def is_placeholder_identity(commercial_model: Any, official_model_code: Any) -> bool:
+    """PR-U's one rule: either identity field, trimmed, is one digit repeated 3+ times."""
+    return any(isinstance(value, str) and PLACEHOLDER_IDENTITY.match(value.strip()) is not None
+               for value in (commercial_model, official_model_code))
+
+
+def _placeholder_record_ids(repository: Any, snapshot_key: str,
+                            items: Sequence[GovernmentWorkItem]) -> list[str]:
+    """The register's own `_id` of each placeholder item, read from the pinned snapshot.
+
+    A batch item carries the candidate identity but not the upstream record id,
+    so it is read back through the bounded projection of the SAME pinned
+    snapshot. An item that cannot be found there is an inconsistent batch.
+    """
+    projection = GovernmentCatalogProjection(repository, resource_id=src.WLTP_RESOURCE_ID,
+                                             snapshot_key=snapshot_key)
+    found: list[str] = []
+    try:
+        for item in items:
+            if item.model_year_start is None:
+                raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+            matches = projection.resolve_variant(item.manufacturer, item.commercial_model,
+                                                 item.model_year_start).matches
+            owners = [view.upstream_record_id for view in matches
+                      if view.candidate_id == item.candidate_id]
+            if len(owners) != 1:
+                raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+            found.append(owners[0])
+    except GovernmentProjectionError as refusal:
+        raise GovernmentPreparationError("GOVERNMENT_SNAPSHOT_UNAVAILABLE",
+                                         reason_code=refusal.reason_code) from None
+    return found
+
+
 def _from_batch(repository: Any, bound: Mapping[str, Any],
                 cancellation_checker: Callable[[], bool] | None) -> GovernmentPreparation:
-    """EXACTLY the bound batch: its one snapshot, pinned, and its items in order."""
+    """EXACTLY the bound batch: its one snapshot, pinned, and its items in order.
+
+    PR-U: minus its placeholder items (`is_placeholder_identity`), which are
+    counted in the preparation record instead of being handed to the run."""
     batch = bound["batch"]
     identity = _batch_identity(bound)
     snapshot_key = str(batch.get("snapshot_key") or "")
@@ -422,13 +486,25 @@ def _from_batch(repository: Any, bound: Mapping[str, Any],
             or len(queue) > GOVERNMENT_WORK_QUEUE_LIMIT \
             or len({item.candidate_key for item in queue}) != len(queue):
         raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    placeholders = [item for item in queue
+                    if is_placeholder_identity(item.commercial_model, item.official_model_code)]
+    excluded: tuple[tuple[str, str], ...] = ()
+    if placeholders:
+        excluded = tuple(sorted(
+            (record_id, EXCLUDED_PLACEHOLDER_SOURCE_RECORD)
+            for record_id in _placeholder_record_ids(repository, snapshot_key, placeholders)))
+        _check_cancelled(cancellation_checker)
+        skipped = {item.candidate_key for item in placeholders}
+        queue = [item for item in queue if item.candidate_key not in skipped]
+        if not queue:
+            raise GovernmentPreparationError("GOVERNMENT_BATCH_ONLY_PLACEHOLDERS")
     return GovernmentPreparation(
         snapshot_key=snapshot_key, snapshot_id=str(snapshot["id"]),
         resource_id=src.WLTP_RESOURCE_ID,
         upstream_version=str(snapshot.get("upstream_version") or ""),
         upstream_version_kind=str(snapshot.get("upstream_version_kind") or ""),
         queue=tuple(queue), total_candidates=len(queue), bounded=False, resumed=False,
-        work_scope_batch=identity)
+        work_scope_batch=identity, excluded=excluded)
 
 
 def _resume(repository: Any, record: Mapping[str, Any],
@@ -458,6 +534,7 @@ def _resume(repository: Any, record: Mapping[str, Any],
     queue = tuple(GovernmentWorkItem.from_record(item) for item in queue_records)
     if len({item.candidate_key for item in queue}) != len(queue):
         raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+    excluded = _recorded_exclusions(record)
     try:
         # The EXACT pinned key, through the same usability rule a read applies.
         # A snapshot that has since become unusable refuses the resume rather
@@ -475,7 +552,27 @@ def _resume(repository: Any, record: Mapping[str, Any],
         queue=queue,
         total_candidates=max(len(queue), _optional_int(record.get("total_candidates")) or 0),
         bounded=bool(record.get("bounded")), resumed=True,
-        work_scope_batch=dict(recorded_batch))
+        work_scope_batch=dict(recorded_batch), excluded=excluded)
+
+
+def _recorded_exclusions(record: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    """The exclusions a persisted record states. A record written before PR-U
+    states none; one that states them must state them in exactly this shape."""
+    if "excluded_records" not in record and "excluded_placeholder" not in record:
+        return ()
+    rows = record.get("excluded_records")
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+    excluded: list[tuple[str, str]] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != {"upstream_record_id", "reason"} \
+                or not isinstance(row["upstream_record_id"], str) \
+                or row["reason"] != EXCLUDED_PLACEHOLDER_SOURCE_RECORD:
+            raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+        excluded.append((row["upstream_record_id"], row["reason"]))
+    if record.get("excluded_placeholder") != len(excluded):
+        raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+    return tuple(excluded)
 
 
 def _promotable_operation() -> str:

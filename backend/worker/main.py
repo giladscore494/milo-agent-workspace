@@ -708,7 +708,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                              "remaining": catalog_state["work_context"]["remaining"],
                              "total_candidates": preparation.total_candidates,
                              "bounded": preparation.bounded,
-                             "resumed": preparation.resumed}))
+                             "resumed": preparation.resumed,
+                             "excluded_placeholder": preparation.excluded_placeholder}))
+                if preparation.excluded_placeholder:
+                    print(f"government preparation: run_id={run_id} "
+                          f"queued={len(preparation.queue)} "
+                          f"excluded_placeholder={preparation.excluded_placeholder}")
                 if is_preparation_checkpoint(latest_checkpoint):
                     # The latest checkpoint is the preparation record itself:
                     # the engine has no state to resume and must start fresh.
