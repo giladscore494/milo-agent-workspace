@@ -1,6 +1,7 @@
 """Taxonomy-neutral worker using only injected gateway and tools."""
 from __future__ import annotations
 import json
+import logging
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Mapping, Protocol
 from backend.budget import BudgetExceeded
@@ -19,6 +20,9 @@ from .resolution import candidate_outcome
 from .tool_calls import (MAX_TASK_OUTPUT_JSON_BYTES, MAX_TOOL_MATERIAL_JSON_BYTES,
                          MAX_TOOL_OUTPUT_JSON_BYTES, ToolCallError, ToolCallRecord,
                          ToolResultCallback, check_material, resolve_tool_arguments)
+
+
+_LOG = logging.getLogger("milo.swarm_v2.worker")
 
 
 # One initial worker completion plus AT MOST one bounded semantic repair.
@@ -317,7 +321,13 @@ class GenericWorker:
             # repaired. Named for what happened, with a static code.
             return TaskResult(task.task_id, "failed",
                               error={"code": exc.code, "message": exc.safe_message})
-        except Exception:
+        except Exception as exc:
+            # PR-W: run 280fc9e5 lost 11/11 tasks here with no trace. One
+            # structured line names the task and the exception CLASS only --
+            # never its message, which can quote provider material.
+            _LOG.warning(json.dumps({"event": "task_exception", "task_id": task.task_id,
+                                     "exception_class": type(exc).__name__},
+                                    sort_keys=True))
             return TaskResult(task.task_id, "failed", error={"code": "TASK_FAILED", "message": "task execution failed"})
 
     def _run_planned_calls(self, task: DynamicTask,
