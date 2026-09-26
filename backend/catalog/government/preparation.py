@@ -74,9 +74,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 from backend.catalog.contracts import MAX_PROMOTIONS_PER_RUN
 from backend.catalog.government import source as src
-from backend.catalog.government.projection import (GovernmentCatalogProjection,
-                                                   GovernmentProjectionError,
+from backend.catalog.government.projection import (GovernmentProjectionError,
                                                    resolve_active_snapshot)
+from backend.catalog.government.query import GovernmentCatalogQuery
 from backend.errors import AppError
 from backend.runtime import CancellationRequested
 
@@ -427,24 +427,34 @@ def is_placeholder_identity(commercial_model: Any, official_model_code: Any) -> 
 
 
 def _placeholder_record_ids(repository: Any, snapshot_key: str,
-                            items: Sequence[GovernmentWorkItem]) -> list[str]:
+                            items: Sequence[GovernmentWorkItem],
+                            cancellation_checker: Callable[[], bool] | None = None
+                            ) -> list[str]:
     """The register's own `_id` of each placeholder item, read from the pinned snapshot.
 
     A batch item carries the candidate identity but not the upstream record id,
-    so it is read back through the bounded projection of the SAME pinned
-    snapshot. An item that cannot be found there is an inconsistent batch.
+    so it is read back through the SAME bounded, per-item read the Government
+    Tool's `resolve_variant` answers from (`GovernmentCatalogQuery`: one
+    `catalog_candidate_variant_page` page, plus `catalog_raw_record_by_upstream_id`
+    for a unique match), pinned to the SAME snapshot key. Never the whole-snapshot
+    projection: a real register snapshot is larger than it will hold. An item
+    whose candidate id is not exactly one row there is an inconsistent batch.
     """
-    projection = GovernmentCatalogProjection(repository, resource_id=src.WLTP_RESOURCE_ID,
-                                             snapshot_key=snapshot_key)
+    query = GovernmentCatalogQuery(repository, resource_id=src.WLTP_RESOURCE_ID,
+                                   snapshot_key=snapshot_key, allow_incomplete=False,
+                                   cancellation_checker=cancellation_checker)
     found: list[str] = []
     try:
         for item in items:
             if item.model_year_start is None:
                 raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
-            matches = projection.resolve_variant(item.manufacturer, item.commercial_model,
-                                                 item.model_year_start).matches
+            matches = query.resolve_variant(item.manufacturer, item.commercial_model,
+                                            item.model_year_start, trim=item.trim,
+                                            official_model_code=item.official_model_code
+                                            ).matches
             owners = [view.upstream_record_id for view in matches
-                      if view.candidate_id == item.candidate_id]
+                      if view.candidate_id == item.candidate_id
+                      and view.snapshot_key == snapshot_key]
             if len(owners) != 1:
                 raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
             found.append(owners[0])
@@ -492,7 +502,8 @@ def _from_batch(repository: Any, bound: Mapping[str, Any],
     if placeholders:
         excluded = tuple(sorted(
             (record_id, EXCLUDED_PLACEHOLDER_SOURCE_RECORD)
-            for record_id in _placeholder_record_ids(repository, snapshot_key, placeholders)))
+            for record_id in _placeholder_record_ids(repository, snapshot_key, placeholders,
+                                                     cancellation_checker)))
         _check_cancelled(cancellation_checker)
         skipped = {item.candidate_key for item in placeholders}
         queue = [item for item in queue if item.candidate_key not in skipped]
