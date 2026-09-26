@@ -4,7 +4,7 @@ import json
 from typing import Any, Callable, Iterable, Mapping
 
 from .builder import FinalBuilder
-from .commander import Commander
+from .commander import Commander, CommanderPlanFailure
 from .conflict_policy import ConflictResolution, conflict_groups
 from .contracts import EvidenceReference, RemainingBudget, VerificationVerdict
 from .current_verdict import current_verdict_by_claim
@@ -22,6 +22,24 @@ from .state import SwarmState
 from .support import VERIFIER_CONTRACT_VERSION
 from .verifier import Verifier, VerifierProgress
 from .worker import TaskResult
+
+
+#: PR-X: the Commander answered a replan, and the answer was refused by JSON
+#: decoding, the decision contract or the plan firewall. Only these codes can
+#: be REJECTED instead of failing the run: a completion failure, a transport
+#: outcome, a budget stop or a cancellation keeps its own terminal handling.
+REJECTABLE_REPLAN_CODES = frozenset({
+    "COMMANDER_DECISION_INVALID",
+    "COMMANDER_PLAN_JSON_INVALID",
+    "COMMANDER_PLAN_SCHEMA_INVALID",
+    "COMMANDER_PLAN_LIMIT_EXCEEDED",
+})
+
+#: The static review code a run carries when a replan decision was rejected.
+COMMANDER_REPLAN_REJECTED = "COMMANDER_REPLAN_REJECTED"
+
+#: The `state.replans` decision value that records a rejected replan.
+REJECTED_DECISION = "REJECTED"
 
 
 class SwarmV2Engine:
@@ -258,6 +276,70 @@ class SwarmV2Engine:
         return all(task_id in after and before.get(task_id) == after[task_id]
                    for task_id in completed)
 
+    @staticmethod
+    def _replan_rejected_for_pass(state: SwarmState) -> bool:
+        """Was THIS pass's pre-verification replan decision already REJECTED?
+
+        The entry lives in the checkpoint, so a resume of the same pass (the
+        same graph revision) finalizes instead of asking the Commander -- and
+        paying -- again.
+        """
+        return any(entry.get("decision") == REJECTED_DECISION
+                   and "correction_round" not in entry
+                   and entry.get("graph_revision") == state.graph_revision
+                   for entry in state.replans)
+
+    @staticmethod
+    def _correction_rejected(state: SwarmState) -> bool:
+        """Was the run's correction-round decision REJECTED?
+
+        Like a decline, that is the run's terminal answer about the verifier's
+        findings: the correction path is closed for the rest of the run and
+        across every resume, so the findings are never put to the Commander
+        again through either door.
+        """
+        return any(entry.get("decision") == REJECTED_DECISION and "correction_round" in entry
+                   for entry in state.replans)
+
+    def _replan_or_reject(self, state: SwarmState, evidence: list[EvidenceReference], *,
+                          correction_round: int | None, requested_model: str,
+                          objective: str, summary: Mapping[str, Any]) -> Any:
+        """Ask the Commander for its decision; an invalid answer never discards work.
+
+        Run c4b8bb54 completed 11/11 tasks with evidence and then failed as a
+        whole on COMMANDER_DECISION_INVALID from the post-execution replan. A
+        decision the firewall refuses is now REJECTED -- treated exactly like
+        "no further work" (None) -- whenever the run already holds evidence
+        from a completed task. The rejection is checkpointed and charged as a
+        replan, so it consumes the plan's allowance and can never loop, and
+        the final result carries COMMANDER_REPLAN_REJECTED so the outcome is
+        partial_success at best. With nothing usable the failure escapes
+        exactly as before.
+        """
+        try:
+            return self._commander.replan(requested_model=requested_model,
+                                          objective=objective, summary=summary)
+        except CommanderPlanFailure as failure:
+            if failure.code not in REJECTABLE_REPLAN_CODES or not evidence:
+                raise
+            code = failure.code
+        entry: dict[str, Any] = {"decision": REJECTED_DECISION, "code": code,
+                                 "graph_revision": state.graph_revision}
+        if correction_round is not None:
+            entry["correction_round"] = correction_round
+        state.replans.append(entry)
+        self._consume("replan")
+        state.usage_snapshot = dict(self._usage_snapshot())
+        self._save(state)
+        return None
+
+    @staticmethod
+    def _replan_review(state: SwarmState) -> list[dict[str, str]]:
+        """ONE static review item when any replan decision was rejected."""
+        if any(entry.get("decision") == REJECTED_DECISION for entry in state.replans):
+            return [{"task_id": "commander_replan", "code": COMMANDER_REPLAN_REJECTED}]
+        return []
+
     def _run_verification(self, state: SwarmState, evidence: list[EvidenceReference],
                           conflict_ids: set[str]) -> list[VerificationVerdict]:
         """Verify every claim under an exact, resumable model-call budget.
@@ -393,9 +475,10 @@ class SwarmV2Engine:
         Returning a plan means "execute this and verify again"; returning None
         means "finalize now".
         """
-        if state.correction_declined:
-            # The Commander already looked at these findings and declined. A
-            # resume must not put the same question a second time.
+        if state.correction_declined or self._correction_rejected(state):
+            # The Commander already looked at these findings and declined (or
+            # its answer was REJECTED). A resume must not put the same
+            # question a second time.
             return None
         issues = correction_issues(evidence, verdicts)
         if not issues:
@@ -407,12 +490,16 @@ class SwarmV2Engine:
             self._emit("correction_round_blocked",
                        {"reason": allowance.reason, "issue_count": len(issues)})
             return None
+        round_number = state.correction_rounds + 1
         self._emit("correction_round_started",
-                   {"round": state.correction_rounds + 1, "issue_count": len(issues)})
-        decision = self._commander.replan(
+                   {"round": round_number, "issue_count": len(issues)})
+        decision = self._replan_or_reject(
+            state, evidence, correction_round=round_number,
             requested_model=requested_model, objective=objective,
             summary={**summary, "verification_findings":
                      correction_summary(issues, resolutions=resolutions)})
+        if decision is None:
+            return None
         if decision.decision not in {"ADD_TASKS", "REVISE_TASK"}:
             # The Commander looked at the findings and chose not to research
             # them. That is a terminal answer, not an invitation to ask again,
@@ -556,16 +643,21 @@ class SwarmV2Engine:
             # A round merely blocked by a budget decided nothing and is not
             # closed, and every replan BEFORE the correction round behaves
             # exactly as it did.
-            if correction_path_closed(rounds_used=state.correction_rounds,
-                                      declined=state.correction_declined):
+            if (correction_path_closed(rounds_used=state.correction_rounds,
+                                       declined=state.correction_declined)
+                    or self._correction_rejected(state)):
                 self._emit("correction_round_finalizing",
                            {"round": state.correction_rounds,
                             "declined": state.correction_declined})
                 decision = None
+            elif self._replan_rejected_for_pass(state):
+                # PR-X: this pass's decision was already REJECTED and
+                # checkpointed; a resume never asks the Commander again for it.
+                decision = None
             else:
-                decision = self._commander.replan(
-                    requested_model=requested_model, objective=objective, summary=summary
-                )
+                decision = self._replan_or_reject(
+                    state, evidence, correction_round=None,
+                    requested_model=requested_model, objective=objective, summary=summary)
             if decision is not None and decision.decision in {"ADD_TASKS", "REVISE_TASK"}:
                 if not (failed or gaps or conflict_ids):
                     raise SwarmExecutionFailure(SWARM_V2_REPLAN_REQUIRES_GAP)
@@ -625,7 +717,7 @@ class SwarmV2Engine:
             # typed "no match" signal, so `not_found` is unreachable and is
             # never inferred from an empty field set (see .outcome).
             final = self._builder.build(evidence, verdicts, task_failures=failures,
-                                        coverage_gaps=gaps,
+                                        coverage_gaps=[*gaps, *self._replan_review(state)],
                                         conflict_claim_ids=sorted(conflict_ids),
                                         candidate_outcomes=self._candidate_outcomes(
                                             state, plan, completed))
