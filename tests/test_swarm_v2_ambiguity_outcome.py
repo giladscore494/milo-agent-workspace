@@ -415,7 +415,22 @@ def test_nothing_usable_and_a_hard_gap_fails_completion_criteria_unmet():
 
 # =============================================================================
 # 4. every replan refusal has its own static code
+#
+# PR-X S3: with evidence in hand the refused PROPOSAL is rejected -- recorded
+# in the checkpoint with its static code -- and the run finalizes with its
+# work as partial_success, carrying COMMANDER_REPLAN_REJECTED. With nothing
+# usable it still fails with that same code (tests/test_swarm_v2_degraded_steps.py).
 # =============================================================================
+
+
+def rejected_with(plan: dict, decision: dict) -> tuple[dict, list[dict]]:
+    checkpoints: list = []
+    engine, run, _register, _sink = build(plan, [decision], checkpoints=checkpoints)
+    result = engine.run(run)
+    assert result["status"] == "partial_success"
+    assert {"task_id": "commander_replan", "code": "COMMANDER_REPLAN_REJECTED"} in \
+        result["needs_review"]
+    return result, checkpoints[-1]["artifacts"]["swarm_state"]["replans"]
 
 def two_task_plan(**kwargs) -> dict:
     return gov_plan([gov_task("t01", [gov_call("c1", "COROLLA", "ZWE211L-DEXNBW")]),
@@ -430,10 +445,9 @@ def test_replan_without_any_gap_is_swarm_v2_replan_requires_gap():
     plan = gov_plan([gov_task("t01", [gov_call("c1", "COROLLA", "ZWE211L-DEXNBW")])])
     extended = gov_plan([*plan["graph"]["tasks"],
                          gov_task("t02", [gov_call("c1", "RAV4", "AXAH54L-ANXGBW")])])
-    engine, run, _register, _sink = build(plan, [add_tasks(extended)])
-    with pytest.raises(SwarmExecutionFailure) as caught:
-        engine.run(run)
-    assert caught.value.code == "SWARM_V2_REPLAN_REQUIRES_GAP"
+    _result, replans = rejected_with(plan, add_tasks(extended))
+    assert replans == [{"decision": "REJECTED", "code": "SWARM_V2_REPLAN_REQUIRES_GAP",
+                        "graph_revision": 1}]
 
 
 def test_replan_past_the_plan_allowance_is_swarm_v2_max_replans_exceeded():
@@ -441,20 +455,18 @@ def test_replan_past_the_plan_allowance_is_swarm_v2_max_replans_exceeded():
     extended = gov_plan([*plan["graph"]["tasks"],
                          gov_task("t05", [gov_call("c1", "YARIS", "MXPH10L-AHXNBW")])],
                         max_replans=0)
-    engine, run, _register, _sink = build(plan, [add_tasks(extended)])
-    with pytest.raises(SwarmExecutionFailure) as caught:
-        engine.run(run)
-    assert caught.value.code == "SWARM_V2_MAX_REPLANS_EXCEEDED"
+    _result, replans = rejected_with(plan, add_tasks(extended))
+    assert replans == [{"decision": "REJECTED", "code": "SWARM_V2_MAX_REPLANS_EXCEEDED",
+                        "graph_revision": 1}]
 
 
 def test_replan_that_rewrites_a_completed_task_is_swarm_v2_replan_rewrites_completed():
     plan = two_task_plan()
     rewritten = two_task_plan()
     rewritten["graph"]["tasks"][0]["goal"] = "a different goal for a completed task"
-    engine, run, _register, _sink = build(plan, [add_tasks(rewritten)])
-    with pytest.raises(SwarmExecutionFailure) as caught:
-        engine.run(run)
-    assert caught.value.code == "SWARM_V2_REPLAN_REWRITES_COMPLETED"
+    _result, replans = rejected_with(plan, add_tasks(rewritten))
+    assert replans == [{"decision": "REJECTED", "code": "SWARM_V2_REPLAN_REWRITES_COMPLETED",
+                        "graph_revision": 1}]
 
 
 def test_the_failure_vocabulary_is_closed_and_keeps_the_historical_messages():

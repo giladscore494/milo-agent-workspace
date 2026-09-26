@@ -512,11 +512,16 @@ def budget_after_execution(model_calls: int):
 def test_exact_pre_verifier_feasibility_stops_an_impossible_sequence():
     gateway = RecordingGateway()
     engine, calls = engine_with(gateway, refs(60), remaining=budget_after_execution(2))
-    with pytest.raises(ValueError, match="verification exceeds remaining model-call budget"):
-        engine.run({"id": "run-1", "input": {"objective": "batching",
-                                             "commander_model": "fake"}})
+    # PR-X S3: the impossible sequence is still never started, but the paid
+    # task work is kept: the run finalizes unverified, as partial_success.
+    result = engine.run({"id": "run-1", "input": {"objective": "batching",
+                                                  "commander_model": "fake"}})
     assert calls == ["a"]
     assert gateway.model_calls == 0  # three batches required, two slots left
+    assert result["status"] == "partial_success"
+    assert result["fields"] == {}
+    assert {"task_id": "verification", "code": "VERIFICATION_BUDGET_INSUFFICIENT"} in \
+        result["needs_review"]
 
 
 def test_exact_pre_verifier_feasibility_passes_with_exactly_enough_capacity():
@@ -604,11 +609,14 @@ def test_no_raw_verifier_material_reaches_state_events_or_the_error():
         return {"verdicts": [{"claim_id": f"{SENTINEL}", "verdict": "verified"}]}
     gateway, checkpoints, events = RecordingGateway(responder), [], []
     engine, _ = engine_with(gateway, refs(3), checkpoints=checkpoints, events=events)
-    with pytest.raises(VerifierContractError) as excinfo:
-        engine.run({"id": "run-1", "input": {"objective": "hygiene",
-                                             "commander_model": "fake"}})
-    assert excinfo.value.reason_code == "VERIFIER_RESPONSE_UNKNOWN_CLAIM"
-    assert SENTINEL not in str(excinfo.value)
+    # PR-X S3: the invalid verifier response no longer fails the run; it
+    # degrades to VERIFIER_FAILED with nothing shown as verified.
+    result = engine.run({"id": "run-1", "input": {"objective": "hygiene",
+                                                  "commander_model": "fake"}})
+    assert gateway.model_calls == 1
+    assert result["status"] == "partial_success" and result["fields"] == {}
+    assert {"task_id": "verification", "code": "VERIFIER_FAILED"} in result["needs_review"]
+    assert SENTINEL not in json.dumps(result)
     assert SENTINEL not in json.dumps(checkpoints)
     assert SENTINEL not in json.dumps(events)
     assert all(not c["artifacts"]["swarm_state"]["verifier_state"] for c in checkpoints)

@@ -57,6 +57,12 @@ class SwarmState(StrictContract):
     # that was merely blocked by a budget is deliberately NOT recorded here --
     # a later resume with capacity may legitimately still take it.
     correction_declined: bool = False
+    # PR-X: every run-level step that DEGRADED after paid work completed, as
+    # {"step", "code", "graph_revision"} with static values only (see
+    # outcome.DEGRADED_STEP_CODES). Kept in the checkpoint so a resume does not
+    # pay for the same failed step again and still reports it. A checkpoint
+    # written before PR-X lacks the field and loads as [].
+    degraded_steps: list[dict[str, Any]] = Field(default_factory=list)
     usage_snapshot: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod

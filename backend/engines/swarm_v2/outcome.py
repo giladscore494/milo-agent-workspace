@@ -100,6 +100,45 @@ NO_USABLE_RESULT_CODE = "NO_USABLE_RESULT"
 TRUSTED_NEGATIVE_CODES = frozenset({"TRUSTED_SOURCE_NO_MATCH"})
 
 
+#: PR-X: the static review codes of a run-level step that DEGRADED after paid
+#: work completed, each mapped to the static step id it is reported under.
+#:
+#: Paid, completed work is never discarded: once a run holds evidence from a
+#: completed task, a step that fails after that point is skipped or
+#: neutralized, and the run finalizes with ONE of these codes in
+#: `needs_review` -- which makes it `partial_success` at best, never
+#: `complete`. Each is written as ``{"task_id": <step>, "code": <code>}``: the
+#: task-scoped review shape every reader of the payload already accepts, so no
+#: reader needs a new shape. Neither value ever carries provider material.
+DEGRADED_STEP_CODES: Mapping[str, str] = {
+    # S1: the Commander's replan decision was refused (firewall or replan rule).
+    "COMMANDER_REPLAN_REJECTED": "commander_replan",
+    # The deterministic coverage check over the completed tasks raised.
+    "COVERAGE_CHECK_FAILED": "coverage_check",
+    # Conflict grouping raised; claims were verified without conflict marking.
+    "CONFLICT_DETECTION_FAILED": "conflict_detection",
+    # Final verification failed; claims without a settled verdict stay unverified.
+    "VERIFIER_FAILED": "verification",
+    # Final verification could not be paid for; no verifier call was made.
+    "VERIFICATION_BUDGET_INSUFFICIENT": "verification",
+    # The typed per-candidate outcomes could not be listed.
+    "CANDIDATE_OUTCOMES_FAILED": "candidate_outcomes",
+    # The vehicle-centric view was omitted; every existing key is unchanged.
+    "ASSEMBLER_FAILED": "catalog_assembly",
+    # The canonical payload could not be built; a reduced one was finalized.
+    "FINAL_BUILD_DEGRADED": "final_build",
+    # The trusted catalog promotion raised a non-infrastructure error.
+    "CATALOG_PROMOTION_FAILED": "catalog_promotion",
+}
+
+
+def degraded_review_item(code: str) -> dict[str, str]:
+    """The ONE static review item for a degraded step. Unknown codes are refused."""
+    if code not in DEGRADED_STEP_CODES:
+        raise ValueError("degraded step code must come from the static allowlist")
+    return {"task_id": DEGRADED_STEP_CODES[code], "code": code}
+
+
 class ProductOutcomeError(ValueError):
     """A safe, provider-neutral product-outcome contract violation."""
 
@@ -292,12 +331,39 @@ def validate_product_outcome(result: Any) -> ProductOutcome:
     return ProductOutcome(status, result_kind)
 
 
+def with_degraded_review(result: Any, code: str) -> dict[str, Any]:
+    """Return a VALID product outcome that also carries one degraded-step item.
+
+    For a step that degraded AFTER the payload was finalized (the worker's
+    catalog promotion). The payload is validated first -- an invalid one is
+    refused, never repaired -- and the status and result kind are decided
+    again by the same table, now with an outstanding item: a `complete`
+    outcome becomes `partial_success`, and an empty one keeps its single
+    trailing marker. Every other key is carried through unchanged.
+    """
+    validate_product_outcome(result)
+    item = degraded_review_item(code)
+    review = [dict(entry) for entry in result["needs_review"]
+              if entry.get("code") != NO_USABLE_RESULT_CODE]
+    if item not in review:
+        review.append(item)
+    outcome = decide_outcome(usable_fields=_usable_field_count(result["fields"]) > 0,
+                             has_blocking_items=True)
+    if outcome.result_kind == "no_usable_result":
+        review = _with_marker(review)
+    degraded = {**result, "status": outcome.status, "result_kind": outcome.result_kind,
+                "needs_review": review}
+    validate_product_outcome(degraded)
+    return degraded
+
+
 def durable_run_status(result: Any) -> str:
     """Map a validated Swarm V2 product outcome to its durable run status."""
     return DURABLE_RUN_STATUS[validate_product_outcome(result).status]
 
 
-__all__ = ["ALLOWED_OUTCOMES", "DURABLE_RUN_STATUS", "NO_USABLE_RESULT_CODE",
+__all__ = ["ALLOWED_OUTCOMES", "DEGRADED_STEP_CODES", "DURABLE_RUN_STATUS",
+           "NO_USABLE_RESULT_CODE", "degraded_review_item", "with_degraded_review",
            "USEFUL_TERMINAL_OUTCOMES", "is_useful_outcome",
            "PRODUCT_STATUSES", "RESULT_KINDS", "TRUSTED_NEGATIVE_CODES",
            "ProductOutcome", "ProductOutcomeError", "TrustedNegativeResult",
