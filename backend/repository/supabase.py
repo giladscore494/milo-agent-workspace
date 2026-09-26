@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import re
 import threading
 import time
@@ -215,6 +216,36 @@ CATALOG_BATCH_SPLIT_FLOOR = 25
 CATALOG_WRITE_ATTEMPTS = 4
 CATALOG_WRITE_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
 
+#: PR-U: the guarded RPCs a Swarm V2 run calls that are proven IDEMPOTENT BY
+#: KEY in their latest SQL definition -- an insert `on conflict (run_id,
+#: evidence_key | idempotency_key) do nothing` that reads the stored row back
+#: and checks it is the same logical write, or (the blackboard evidence patch)
+#: a keyed set union. Each key is derived from content by the evidence adapter
+#: and a retry re-sends the byte-identical parameters, so a retry of a write
+#: that DID land returns that row and writes nothing new. The per-function
+#: evidence is the U1 table in the PR-U description.
+#:
+#: Nothing else is retried by this path: plain inserts (events, checkpoints,
+#: usage ledger rows, agent messages), budget and usage writes, and every
+#: lease, transition and finalization RPC stay single-attempt. Run 6825eb96 lost
+#: its first container to ONE RemoteProtocolError on `upsert_source_guarded`.
+IDEMPOTENT_GUARDED_RPCS = frozenset({
+    "upsert_source_guarded",
+    "create_claim_with_source_guarded",
+    "create_conflict_guarded",
+    "record_evidence_fragment_guarded",
+    "create_tool_usage_guarded",
+    "record_claim_verdict_guarded",
+    "record_conflict_resolution_guarded",
+    "patch_run_blackboard_evidence_guarded",
+})
+#: Three attempts in all, and only for a `transient` failure that is not an
+#: HTTP 4xx. The backoff is jittered by +/- IDEMPOTENT_RPC_JITTER so parallel
+#: task writers that failed together do not retry together.
+IDEMPOTENT_RPC_ATTEMPTS = 3
+IDEMPOTENT_RPC_BACKOFF_SECONDS = (0.5, 1.5)
+IDEMPOTENT_RPC_JITTER = 0.2
+
 
 _LOG = logging.getLogger("milo.repository")
 
@@ -295,6 +326,8 @@ def _observe(stats: dict[str, Any] | None, request_bytes: int, seconds: float) -
 class SupabaseRepository:
     #: Seam for tests: the backoff between retried catalog writes.
     _retry_sleep = staticmethod(time.sleep)
+    #: Seam for tests: the jitter factor source of the idempotent-RPC backoff.
+    _retry_jitter = staticmethod(random.uniform)
 
     def __init__(self, settings: Settings):
         self.client = create_client(str(settings.supabase_url), settings.supabase_service_role_key)
@@ -750,6 +783,17 @@ class SupabaseRepository:
     def _is_stale_lease_error(exc: Exception) -> bool:
         return "STALE_WORKER_WRITE" in str(exc)
 
+    def _is_client_error(self, exc: BaseException) -> bool:
+        """An HTTP 4xx, from the response status or the status-shaped code."""
+        status = self._last_http_status()
+        code = failure_code(exc)
+        return (status is not None and 400 <= status < 500) or \
+            (len(code) == 3 and code.isdigit() and code.startswith("4"))
+
+    def _idempotent_backoff(self, attempt: int) -> float:
+        base = IDEMPOTENT_RPC_BACKOFF_SECONDS[attempt - 1]
+        return base * self._retry_jitter(1 - IDEMPOTENT_RPC_JITTER, 1 + IDEMPOTENT_RPC_JITTER)
+
     def _guarded_rpc(self, function: str, params: dict[str, Any], resource: str, *,
                      retry_transient: bool = False,
                      refusals: tuple[str, ...] = (),
@@ -781,11 +825,19 @@ class SupabaseRepository:
         `request_bytes` and `max_call_seconds`.
 
         `diagnostics` is accepted only for the catalog ingestion RPCs, and
-        only reaches the server log (`_log_guarded_failure`)."""
+        only reaches the server log (`_log_guarded_failure`).
+
+        PR-U: a function in `IDEMPOTENT_GUARDED_RPCS` gets up to
+        `IDEMPOTENT_RPC_ATTEMPTS` for a `transient` failure that is not an HTTP
+        4xx, with a jittered backoff. Every attempt is the same lease-guarded
+        call, so the database re-checks the lease each time, and a lost lease,
+        a refusal and a rejection are raised at once exactly as before."""
         if diagnostics is not None and (not isinstance(diagnostics, CatalogWriteDiagnostics)
                                         or function not in CATALOG_INGESTION_RPCS):
             raise ValueError("write diagnostics are accepted only for the catalog ingestion RPCs")
-        attempts = CATALOG_WRITE_ATTEMPTS if retry_transient else 1
+        idempotent = not retry_transient and function in IDEMPOTENT_GUARDED_RPCS
+        attempts = (CATALOG_WRITE_ATTEMPTS if retry_transient
+                    else IDEMPOTENT_RPC_ATTEMPTS if idempotent else 1)
         request_bytes = _request_bytes(params) if stats is not None else 0
         for attempt in range(1, attempts + 1):
             http = getattr(self, "_http", None)
@@ -818,10 +870,15 @@ class SupabaseRepository:
                         raise AppError(marker, "the database refused this operation", 409) from exc
                 failure = classify_repository_failure(exc)
                 retrying = failure == "transient" and attempt < attempts
+                if retrying and idempotent and self._is_client_error(exc):
+                    # 408/425/429 classify as transient, but a 4xx is never
+                    # retried on this path.
+                    retrying = False
                 self._log_guarded_failure(function, exc, failure, attempt, attempts,
                                           retrying=retrying, diagnostics=diagnostics)
                 if retrying:
-                    self._retry_sleep(CATALOG_WRITE_BACKOFF_SECONDS[attempt - 1])
+                    self._retry_sleep(self._idempotent_backoff(attempt) if idempotent
+                                      else CATALOG_WRITE_BACKOFF_SECONDS[attempt - 1])
                     continue
                 # Provider/PostgREST details can contain SQL values, URLs, or
                 # credentials.  Keep the original exception only as an internal
