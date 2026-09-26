@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from collections.abc import Mapping
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 from pydantic_core import PydanticCustomError
 
-from backend.tools.registry import validate_output_schema
+from backend.tools.registry import (OUTPUT_SCHEMA_STRIPPED_KEYWORDS, normalize_output_schema,
+                                    validate_output_schema)
 
 from .evidence_bounds import (IDENTITY_DIMENSIONS, MAX_IDENTITY_DIMENSION_CHARS,
                               MAX_LOCATOR_KEY_CHARS, MAX_SOURCE_VERSION_KEY_CHARS,
@@ -29,8 +33,9 @@ def output_schema_is_runtime_valid(schema: Any) -> bool:
     runtime validator then raised KeyError / ValueError on every completion
     and all eleven tasks failed after they had been paid for. Plan time now
     accepts exactly what the runtime validator enforces: the registry's
-    structural subset plus the `enum` / `description` annotations
-    (`validate_output_schema`).
+    structural subset plus the `enum` / `description` annotations and the
+    simple constraints (`validate_output_schema`). Callers pass the schema
+    AFTER `normalize_output_schema` (the DynamicTask field validator).
     """
     try:
         validate_output_schema(schema, "$output_schema")
@@ -117,12 +122,69 @@ class DynamicTask(StrictContract):
     estimated_cost_units: int = Field(ge=0)
     completion: CompletionCriteria
 
+    #: PR-W S5: the NAMES of the annotation keywords `normalize_output_schema`
+    #: removed from this task's output_schema. Server-derived and persisted
+    #: with the approved plan (it is part of the dump, so a checkpoint -- and
+    #: a resume from it -- keeps it), but hidden from the provider-visible
+    #: plan JSON Schema: the Commander is never asked for it. Only names from
+    #: the static strip list are representable, so no model-chosen text can
+    #: reach durable state through it; see `record_stripped_output_keywords`.
+    stripped_output_keywords: SkipJsonSchema[list[str]] = Field(
+        default_factory=list, max_length=len(OUTPUT_SCHEMA_STRIPPED_KEYWORDS))
+
+    @model_validator(mode="before")
+    @classmethod
+    def record_stripped_output_keywords(cls, data: Any) -> Any:
+        """Merge the names normalization removes from THIS raw schema into the
+        names already recorded (a checkpoint's, whose schema is normalized and
+        strips nothing again). Returns a new mapping; the input is untouched.
+        A schema normalization cannot handle is left for the output_schema
+        field validator to reject with its typed error."""
+        if not isinstance(data, Mapping) or not isinstance(data.get("output_schema"), Mapping):
+            return data
+        try:
+            _, stripped = normalize_output_schema(data["output_schema"])
+        except ValueError:
+            return data
+        recorded = data.get("stripped_output_keywords", [])
+        if not stripped or not isinstance(recorded, list):
+            return data
+        return {**data, "stripped_output_keywords": sorted({*recorded, *stripped})}
+
+    @field_validator("stripped_output_keywords")
+    @classmethod
+    def static_stripped_names(cls, value: list[str]) -> list[str]:
+        if any(name not in OUTPUT_SCHEMA_STRIPPED_KEYWORDS for name in value) or \
+                value != sorted(set(value)):
+            raise ValueError("stripped_output_keywords must be sorted unique static keyword names")
+        return value
+
     @field_validator("dependencies")
     @classmethod
     def unique_dependencies(cls, value: list[str]) -> list[str]:
         if len(set(value)) != len(value):
             raise ValueError("dependencies must be unique")
         return value
+
+    @field_validator("output_schema", mode="before")
+    @classmethod
+    def normalized_output_schema(cls, value: Any) -> Any:
+        """PR-W S5: THE one place a task output schema is normalized.
+
+        Everything downstream -- PlanValidator, checkpoint resume, the stored
+        plan, the provider's strict json_schema and the runtime validator --
+        sees this normalized schema, so they can never disagree about it.
+        Never-enforced annotation keywords are removed; everything else is
+        left for the validator below to accept or reject.
+        """
+        if not isinstance(value, Mapping):
+            return value
+        try:
+            normalized, _ = normalize_output_schema(value)
+        except ValueError:
+            raise PydanticCustomError(OUTPUT_SCHEMA_NESTED_ERROR_TYPE,
+                                      "output_schema exceeds the supported schema bounds") from None
+        return normalized
 
     @field_validator("output_schema")
     @classmethod

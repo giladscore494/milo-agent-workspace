@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
@@ -26,6 +28,106 @@ TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,79}$")
 #: its values must have (a bool is never an integer or a number here).
 _ENUM_VALUE_TYPES: Mapping[str, tuple[type, ...]] = {
     "string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,)}
+
+
+#: PR-W S5: annotation keywords a task OUTPUT schema may carry that are never
+#: enforced. `normalize_output_schema` removes them before validation, so a
+#: plan is never rejected (and never pays a repair) for one of them.
+OUTPUT_SCHEMA_STRIPPED_KEYWORDS = frozenset({
+    "title", "default", "examples", "format", "pattern", "$schema", "$id",
+    "$comment", "readOnly", "writeOnly", "deprecated"})
+#: PR-W S5: simple constraints a task output schema may carry, per type. They
+#: are KEPT, validated by `validate_output_schema` and ENFORCED by
+#: `validate_json_schema`.
+OUTPUT_SCHEMA_CONSTRAINT_KEYWORDS: Mapping[str, frozenset[str]] = {
+    "integer": frozenset({"minimum", "maximum"}),
+    "number": frozenset({"minimum", "maximum"}),
+    "string": frozenset({"minLength", "maxLength"}),
+    "array": frozenset({"minItems"}),
+}
+#: Structural bounds of a task output schema. They mirror the bounds every
+#: task OUTPUT value already passes (`swarm_v2.tool_calls.MAX_TOOL_VALUE_DEPTH`
+#: and `MAX_TOOL_COLLECTION_ITEMS`, pinned equal by a test): a schema nested
+#: deeper than any admissible output, or wider than one, can describe nothing
+#: the runtime would accept. Beyond them the schema is rejected.
+MAX_OUTPUT_SCHEMA_DEPTH = 8
+MAX_OUTPUT_SCHEMA_ITEMS = 200
+
+
+def normalize_output_schema(schema: Any) -> tuple[Any, list[str]]:
+    """Remove never-enforced annotation keywords from a TASK output schema.
+
+    Pure and deterministic: no I/O, the input is never mutated (every mapping
+    and value in the result is a fresh copy), and the walk follows only the
+    structural positions -- `properties` values and `items` -- so a property
+    NAMED like a keyword is never touched. Returns the normalized schema and
+    the sorted, de-duplicated NAMES of the keywords removed (never values).
+
+    Only `OUTPUT_SCHEMA_STRIPPED_KEYWORDS` are removed. Every other keyword is
+    left in place for `validate_output_schema` to judge, so a structural or
+    unsupported keyword (oneOf, $ref, const, ...) is still rejected. A
+    non-mapping node is returned as is, for validation to reject. Idempotent:
+    normalizing a normalized schema changes nothing and strips nothing.
+
+    Raises ValueError beyond MAX_OUTPUT_SCHEMA_DEPTH / MAX_OUTPUT_SCHEMA_ITEMS.
+    Tool schemas never pass through here.
+    """
+    stripped: set[str] = set()
+
+    def walk(node: Any, depth: int) -> Any:
+        if not isinstance(node, Mapping):
+            return copy.deepcopy(node)
+        if depth > MAX_OUTPUT_SCHEMA_DEPTH:
+            raise ValueError("output schema nesting exceeds the output depth bound")
+        if len(node) > MAX_OUTPUT_SCHEMA_ITEMS:
+            raise ValueError("output schema exceeds the output size bound")
+        result: dict[Any, Any] = {}
+        for key, value in node.items():
+            if key in OUTPUT_SCHEMA_STRIPPED_KEYWORDS:
+                stripped.add(key)
+            elif key == "properties" and isinstance(value, Mapping):
+                if len(value) > MAX_OUTPUT_SCHEMA_ITEMS:
+                    raise ValueError("output schema exceeds the output size bound")
+                result[key] = {name: walk(nested, depth + 1) for name, nested in value.items()}
+            elif key == "items":
+                result[key] = walk(value, depth + 1)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
+
+    try:
+        normalized = walk(schema, 0)
+    except RecursionError:
+        raise ValueError("output schema exceeds the output depth bound") from None
+    return normalized, sorted(stripped)
+
+
+def _bound(value: Any, *, integer: bool) -> bool:
+    """A usable constraint value: an int (or, for a numeric bound, a finite
+    float), never a bool."""
+    if isinstance(value, bool):
+        return False
+    if integer:
+        return isinstance(value, int) and value >= 0
+    return isinstance(value, int) or (isinstance(value, float) and math.isfinite(value))
+
+
+def _check_constraints(schema: Mapping[str, Any], expected: str, path: str) -> None:
+    """Type rules of the S5 constraint keywords; a malformed one is a
+    structural defect, never silently dropped."""
+    if expected in {"integer", "number"}:
+        low, high, integer = "minimum", "maximum", False
+    elif expected == "string":
+        low, high, integer = "minLength", "maxLength", True
+    elif expected == "array":
+        low, high, integer = "minItems", "maxItems", True
+    else:
+        return
+    for key in (low, high):
+        if key in schema and not _bound(schema[key], integer=integer):
+            raise ValueError(f"{path}.{key} is not a valid bound")
+    if low in schema and high in schema and schema[low] > schema[high]:
+        raise ValueError(f"{path}.{low} exceeds {high}")
 
 
 def _enum_values_valid(expected: str, values: Any) -> bool:
@@ -53,6 +155,13 @@ def validate_output_schema(schema: Mapping[str, Any], path: str = "$output_schem
     list of unique values of that type, ENFORCED by `validate_json_schema`).
     Run 6825eb96's successful Gate-0 plan used exactly that enum. Tool schemas
     are unaffected: registration still uses `validate_schema`.
+
+    PR-W S5: it also accepts the simple constraints of
+    OUTPUT_SCHEMA_CONSTRAINT_KEYWORDS -- minimum/maximum on integer/number,
+    minLength/maxLength on string, minItems on array -- with their type rules
+    (see `_check_constraints`); `validate_json_schema` enforces them. The
+    annotation keywords of OUTPUT_SCHEMA_STRIPPED_KEYWORDS are not accepted
+    here: `normalize_output_schema` removes them first.
     """
     _check_schema(schema, path, annotations=True)
 
@@ -89,6 +198,8 @@ def _check_schema(schema: Any, path: str, *, annotations: bool) -> None:
         if "maxItems" in schema and (not isinstance(schema["maxItems"], int) or isinstance(schema["maxItems"], bool) or schema["maxItems"] < 0):
             raise ValueError(f"{path}.maxItems must be a non-negative integer")
     if annotations:
+        allowed_keys |= OUTPUT_SCHEMA_CONSTRAINT_KEYWORDS.get(expected, frozenset())
+        _check_constraints(schema, expected, path)
         allowed_keys.add("description")
         if "description" in schema and not isinstance(schema["description"], str):
             raise ValueError(f"{path}.description must be a string")
@@ -127,6 +238,7 @@ def validate_json_schema(schema: Mapping[str, Any], value: Any, path: str = "$in
         if not any(value == item and isinstance(value, bool) == isinstance(item, bool)
                    for item in allowed):
             raise ValueError(f"{path} is not one of the allowed values")
+    _enforce_constraints(schema, expected, value, path)
     if expected == "object":
         properties = schema.get("properties")
         if not isinstance(properties, Mapping) or schema.get("additionalProperties") is not False:
@@ -151,6 +263,32 @@ def validate_json_schema(schema: Mapping[str, Any], value: Any, path: str = "$in
             raise ValueError(f"{path} exceeds maxItems")
         for index, item in enumerate(value):
             validate_json_schema(schema["items"], item, f"{path}[{index}]")
+
+
+def _enforce_constraints(schema: Mapping[str, Any], expected: str, value: Any, path: str) -> None:
+    """PR-W S5: enforce minimum/maximum, minLength/maxLength and minItems.
+
+    Tool schemas can never carry these (`validate_schema` refuses them at
+    registration), so only task output schemas reach a check here. A
+    malformed bound is a schema defect, reported as a ValueError like every
+    other one; maxItems keeps its existing check in `validate_json_schema`.
+    """
+    if expected in {"integer", "number"}:
+        measure, low, high, integer = value, "minimum", "maximum", False
+    elif expected == "string":
+        measure, low, high, integer = len(value), "minLength", "maxLength", True
+    elif expected == "array":
+        measure, low, high, integer = len(value), "minItems", None, True
+    else:
+        return
+    for key in (low, high):
+        if key is None or key not in schema:
+            continue
+        bound = schema[key]
+        if not _bound(bound, integer=integer):
+            raise ValueError(f"schema at {path} has an invalid {key}")
+        if (key == low and measure < bound) or (key == high and measure > bound):
+            raise ValueError(f"{path} violates {key}")
 
 
 def _json_copy(schema: Mapping[str, Any]) -> dict[str, Any]:

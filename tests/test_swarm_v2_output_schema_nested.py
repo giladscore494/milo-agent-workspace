@@ -157,10 +157,11 @@ def test_the_plan_validator_enforces_it_independently_of_the_contract():
     {"type": "array", "items": {"type": "object"}},
     {"type": "array", "items": {"type": "array"}},
     {"type": "tuple"},
-    # Keywords outside the enforced subset: the runtime would ignore them.
-    {"type": "string", "pattern": "^[a-z]+$"},
-    {"type": "integer", "minimum": 0},
-    {"type": "array", "items": {"type": "string"}, "minItems": 1},
+    # Structural keywords outside the enforced subset (S5 strips only
+    # never-enforced annotations; these stay and are rejected).
+    {"type": "string", "oneOf": [{"type": "string"}]},
+    {"type": "integer", "const": 1},
+    {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
     # Malformed annotations.
     {"type": "string", "description": 7},
     {"type": "string", "enum": []},
