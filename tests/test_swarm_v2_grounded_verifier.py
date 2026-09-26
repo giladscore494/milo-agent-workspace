@@ -1028,10 +1028,15 @@ def test_legacy_re_grounding_is_refused_when_the_run_cannot_afford_it():
                                model_calls=100 if len(seen) == 1 else 1)
 
     engine, _ = engine_with(gateway, resolver, items, remaining=remaining)
-    with pytest.raises(ValueError, match="verification exceeds remaining model-call budget"):
-        run_engine(engine, checkpoint=legacy_checkpoint(
-            items, {item.claim_id: "verified" for item in items}))
+    # PR-X S3: the re-grounding is still refused before any call, and the
+    # legacy verdicts are still not trusted -- nothing is shown as verified --
+    # but the run keeps its evidence and finalizes as partial_success.
+    result = run_engine(engine, checkpoint=legacy_checkpoint(
+        items, {item.claim_id: "verified" for item in items}))
     assert gateway.model_calls == 0  # nothing was fabricated and nothing was paid for
+    assert result["status"] == "partial_success" and result["fields"] == {}
+    assert {"task_id": "verification", "code": "VERIFICATION_BUDGET_INSUFFICIENT"} in \
+        result["needs_review"]
 
 
 # --- AF/AG. quoted source material never leaves the model request ------------
@@ -1077,10 +1082,12 @@ def test_no_raw_grounded_response_material_reaches_state_events_or_the_error():
     gateway, checkpoints, events = GroundingJudgeGateway(responder), [], []
     engine, _ = engine_with(gateway, resolver, [engine_ref(1)],
                             checkpoints=checkpoints, events=events)
-    with pytest.raises(VerifierContractError) as excinfo:
-        run_engine(engine)
-    assert excinfo.value.reason_code == "VERIFIER_RESPONSE_UNKNOWN_CLAIM"
-    assert SENTINEL not in str(excinfo.value)
+    # PR-X S3: the invalid response degrades to VERIFIER_FAILED instead of
+    # failing the run; still no raw material anywhere.
+    result = run_engine(engine)
+    assert result["status"] == "partial_success" and result["fields"] == {}
+    assert {"task_id": "verification", "code": "VERIFIER_FAILED"} in result["needs_review"]
+    assert SENTINEL not in json.dumps(result)
     assert SENTINEL not in json.dumps(checkpoints)
     assert SENTINEL not in json.dumps(events)
 

@@ -3,7 +3,9 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping
 from .contracts import EvidenceReference, VerificationVerdict
 from .current_verdict import current_verdict_by_claim
-from .outcome import TrustedNegativeResult, finalize_product_outcome
+from .failures import NOT_DEGRADABLE, log_step_degraded
+from .outcome import (DEGRADED_STEP_CODES, TrustedNegativeResult, degraded_review_item,
+                      finalize_product_outcome)
 
 
 class FinalBuilder:
@@ -53,6 +55,28 @@ class FinalBuilder:
                                "reason": verdict.reason, "provenance": trace})
         outcomes = [dict(item) for item in candidate_outcomes]
         failures, gaps = list(task_failures), list(coverage_gaps)
+        view: dict[str, Any] | None = None
+        if outcomes:
+            # PR-X: the vehicle-centric view is ADDITIVE, so a failure while
+            # assembling it never costs the run its result. The view is simply
+            # omitted -- every existing key keeps its value -- and the run
+            # carries ASSEMBLER_FAILED, which makes it partial_success.
+            try:
+                # Imported here: the catalog package reads the engine's
+                # contracts, so a module-level import would make the two
+                # initialize each other.
+                from backend.catalog.result.assembler import VehicleCatalogResultAssembler
+
+                view = VehicleCatalogResultAssembler().assemble(
+                    evidence=evidence, verdicts=verdict_list, candidate_outcomes=outcomes,
+                    coverage_gaps=gaps, task_failures=failures)
+            except NOT_DEGRADABLE:
+                raise
+            except Exception as exc:
+                log_step_degraded(DEGRADED_STEP_CODES["ASSEMBLER_FAILED"], "ASSEMBLER_FAILED",
+                                  type(exc).__name__)
+                view = None
+                gaps = [*gaps, degraded_review_item("ASSEMBLER_FAILED")]
         final = finalize_product_outcome(
             fields=fields,
             verdict_review=sorted(review, key=lambda x: (x["field"], x["provenance"]["claim_id"])),
@@ -64,12 +88,6 @@ class FinalBuilder:
                                   if item.verdict != "verified"],
             trusted_negative=trusted_negative,
             candidate_outcomes=outcomes)
-        if outcomes:
-            # Imported here: the catalog package reads the engine's contracts,
-            # so a module-level import would make the two initialize each other.
-            from backend.catalog.result.assembler import VehicleCatalogResultAssembler
-
-            final.update(VehicleCatalogResultAssembler().assemble(
-                evidence=evidence, verdicts=verdict_list, candidate_outcomes=outcomes,
-                coverage_gaps=gaps, task_failures=failures))
+        if view is not None:
+            final.update(view)
         return final

@@ -4,7 +4,7 @@ import json
 from typing import Any, Callable, Iterable, Mapping
 
 from .builder import FinalBuilder
-from .commander import Commander
+from .commander import Commander, CommanderPlanFailure
 from .conflict_policy import ConflictResolution, conflict_groups
 from .contracts import EvidenceReference, RemainingBudget, VerificationVerdict
 from .current_verdict import current_verdict_by_claim
@@ -12,16 +12,49 @@ from .correction import (correction_allowance, correction_issues, correction_pat
                          correction_summary)
 from .evidence import safe_durable_value
 from .executor import BoundedTaskExecutor
-from .failures import (SWARM_V2_COMPLETION_CRITERIA_UNMET, SWARM_V2_MAX_REPLANS_EXCEEDED,
-                       SWARM_V2_REPLAN_REQUIRES_GAP, SWARM_V2_REPLAN_REWRITES_COMPLETED,
-                       SWARM_V2_REQUIRED_TASK_FAILED, SwarmExecutionFailure)
+from .failures import (NOT_DEGRADABLE, SWARM_V2_COMPLETION_CRITERIA_UNMET,
+                       SWARM_V2_MAX_REPLANS_EXCEEDED, SWARM_V2_REPLAN_REQUIRES_GAP,
+                       SWARM_V2_REPLAN_REWRITES_COMPLETED, SWARM_V2_REQUIRED_TASK_FAILED,
+                       SwarmExecutionFailure, log_step_degraded)
 from .feasibility import envelope_supports_a_run, plan_worst_case
 from .grounding import VERIFIER_GROUNDING_VERSION
+from .outcome import (DEGRADED_STEP_CODES, degraded_review_item, finalize_product_outcome,
+                      validate_product_outcome)
 from .resolution import CANDIDATE_GAP_CODES, SOFT_GAP_CODES, unresolved_kinds
 from .state import SwarmState
 from .support import VERIFIER_CONTRACT_VERSION
-from .verifier import Verifier, VerifierProgress
+from .verifier import Verifier, VerifierContractError, VerifierProgress
 from .worker import TaskResult
+
+
+#: PR-X: the Commander answered a replan, and the answer was refused by JSON
+#: decoding, the decision contract or the plan firewall. Only these codes can
+#: be REJECTED instead of failing the run: a completion failure, a transport
+#: outcome, a budget stop or a cancellation keeps its own terminal handling.
+REJECTABLE_REPLAN_CODES = frozenset({
+    "COMMANDER_DECISION_INVALID",
+    "COMMANDER_PLAN_JSON_INVALID",
+    "COMMANDER_PLAN_SCHEMA_INVALID",
+    "COMMANDER_PLAN_LIMIT_EXCEEDED",
+})
+
+#: The static review code a run carries when a replan decision was rejected.
+COMMANDER_REPLAN_REJECTED = "COMMANDER_REPLAN_REJECTED"
+
+#: The `state.replans` decision value that records a rejected replan.
+REJECTED_DECISION = "REJECTED"
+
+#: PR-X S3: the `state.replans` code of a replacement plan that does not fit
+#: the remaining budget (the pre-flight `_check_feasible` refusal).
+SWARM_V2_REPLAN_INFEASIBLE = "SWARM_V2_REPLAN_INFEASIBLE"
+
+
+class VerificationBudgetInsufficient(ValueError):
+    """The final verification's batches do not fit the remaining model calls.
+
+    A ValueError with the historical message, so existing callers keep
+    working; its own class lets the engine degrade it instead of failing.
+    """
 
 
 class SwarmV2Engine:
@@ -258,6 +291,115 @@ class SwarmV2Engine:
         return all(task_id in after and before.get(task_id) == after[task_id]
                    for task_id in completed)
 
+    @staticmethod
+    def _replan_rejected_for_pass(state: SwarmState) -> bool:
+        """Was THIS pass's pre-verification replan decision already REJECTED?
+
+        The entry lives in the checkpoint, so a resume of the same pass (the
+        same graph revision) finalizes instead of asking the Commander -- and
+        paying -- again.
+        """
+        return any(entry.get("decision") == REJECTED_DECISION
+                   and "correction_round" not in entry
+                   and entry.get("graph_revision") == state.graph_revision
+                   for entry in state.replans)
+
+    @staticmethod
+    def _correction_rejected(state: SwarmState) -> bool:
+        """Was the run's correction-round decision REJECTED?
+
+        Like a decline, that is the run's terminal answer about the verifier's
+        findings: the correction path is closed for the rest of the run and
+        across every resume, so the findings are never put to the Commander
+        again through either door.
+        """
+        return any(entry.get("decision") == REJECTED_DECISION and "correction_round" in entry
+                   for entry in state.replans)
+
+    def _replan_or_reject(self, state: SwarmState, evidence: list[EvidenceReference], *,
+                          correction_round: int | None, requested_model: str,
+                          objective: str, summary: Mapping[str, Any]) -> Any:
+        """Ask the Commander for its decision; an invalid answer never discards work.
+
+        Run c4b8bb54 completed 11/11 tasks with evidence and then failed as a
+        whole on COMMANDER_DECISION_INVALID from the post-execution replan. A
+        decision the firewall refuses is now REJECTED -- treated exactly like
+        "no further work" (None) -- whenever the run already holds evidence
+        from a completed task. The rejection is checkpointed and charged as a
+        replan, so it consumes the plan's allowance and can never loop, and
+        the final result carries COMMANDER_REPLAN_REJECTED so the outcome is
+        partial_success at best. With nothing usable the failure escapes
+        exactly as before.
+        """
+        try:
+            return self._commander.replan(requested_model=requested_model,
+                                          objective=objective, summary=summary)
+        except CommanderPlanFailure as failure:
+            if failure.code not in REJECTABLE_REPLAN_CODES or not evidence:
+                raise
+            code = failure.code
+        self._reject_replan(state, code, correction_round=correction_round,
+                            exception_class="CommanderPlanFailure")
+        return None
+
+    def _reject_replan(self, state: SwarmState, code: str, *, correction_round: int | None,
+                       exception_class: str) -> None:
+        """Checkpoint ONE rejected replan decision and charge it as a replan.
+
+        PR-X S3: also used for a well-formed decision that a replan RULE
+        refuses (no gap, allowance spent, rewrites completed work, does not
+        fit the remaining budget) once the run holds evidence -- those are
+        refusals of the Commander's proposal, not of the run's own work.
+        """
+        entry: dict[str, Any] = {"decision": REJECTED_DECISION, "code": code,
+                                 "graph_revision": state.graph_revision}
+        if correction_round is not None:
+            entry["correction_round"] = correction_round
+        state.replans.append(entry)
+        log_step_degraded(DEGRADED_STEP_CODES[COMMANDER_REPLAN_REJECTED],
+                          COMMANDER_REPLAN_REJECTED, exception_class)
+        self._consume("replan")
+        state.usage_snapshot = dict(self._usage_snapshot())
+        self._save(state)
+
+    def _replan_refusal(self, plan: Any, replacement: Any,
+                        completed: Mapping[str, TaskResult]) -> tuple[str, BaseException] | None:
+        """The replan rule a replacement plan breaks, as (static code, the error)."""
+        if not self._completed_tasks_unchanged(plan, replacement, completed):
+            return (SWARM_V2_REPLAN_REWRITES_COMPLETED,
+                    SwarmExecutionFailure(SWARM_V2_REPLAN_REWRITES_COMPLETED))
+        try:
+            self._check_feasible(replacement, completed)
+        except ValueError as exc:
+            return SWARM_V2_REPLAN_INFEASIBLE, exc
+        return None
+
+    def _degrade(self, state: SwarmState, code: str, exc: BaseException) -> None:
+        """Record ONE degraded step: checkpointed, logged, reported in needs_review."""
+        step = DEGRADED_STEP_CODES[code]
+        log_step_degraded(step, code, type(exc).__name__)
+        entry = {"step": step, "code": code, "graph_revision": state.graph_revision}
+        if entry not in state.degraded_steps:
+            state.degraded_steps.append(entry)
+
+    @staticmethod
+    def _step_degraded(state: SwarmState, code: str) -> bool:
+        """Did THIS pass already degrade with `code` (so a resume must not pay again)?"""
+        return any(entry.get("code") == code and entry.get("graph_revision") == state.graph_revision
+                   for entry in state.degraded_steps)
+
+    @staticmethod
+    def _degraded_review(state: SwarmState) -> list[dict[str, str]]:
+        """ONE static review item per degraded code, in first-seen order."""
+        codes: list[str] = []
+        if any(entry.get("decision") == REJECTED_DECISION for entry in state.replans):
+            codes.append(COMMANDER_REPLAN_REJECTED)
+        for entry in state.degraded_steps:
+            code = entry.get("code")
+            if code in DEGRADED_STEP_CODES and code not in codes:
+                codes.append(code)
+        return [degraded_review_item(code) for code in codes]
+
     def _run_verification(self, state: SwarmState, evidence: list[EvidenceReference],
                           conflict_ids: set[str]) -> list[VerificationVerdict]:
         """Verify every claim under an exact, resumable model-call budget.
@@ -281,7 +423,7 @@ class SwarmV2Engine:
             evidence, conflict_claim_ids=conflict_ids, existing_verdicts=existing,
             grounding_version=state.verifier_grounding_version)
         if len(plan.batches) > self._remaining_budget().model_calls:
-            raise ValueError("verification exceeds remaining model-call budget")
+            raise VerificationBudgetInsufficient("verification exceeds remaining model-call budget")
         # Legacy ungrounded verdicts are dropped from durable state together
         # with the version bump, so no later resume can mistake one for
         # grounded progress. Under version 1 this is the same map plus the
@@ -325,6 +467,75 @@ class SwarmV2Engine:
         self._emit("verification_completed", {"status": "completed"})
         self._save(state)
         return plan.resolutions, verdicts
+
+    def _verify_or_degrade(self, state: SwarmState, evidence: list[EvidenceReference],
+                           conflict_ids: set[str]) -> tuple[Any, list[VerificationVerdict], bool]:
+        """Final verification that never discards the run's paid work.
+
+        Returns ``(resolutions, verdicts, degraded)``. With evidence in hand, a
+        verifier failure -- an invalid verifier response, a provider failure
+        of a verifier call, a pre-flight that cannot pay for the batches -- is
+        NOT a run failure: the verdicts already settled and checkpointed are
+        kept (and handed to the durable verdict sink), every other claim
+        simply has no verdict (so it is never shown as verified), no verifier
+        call is repeated, and the run carries
+        VERIFIER_FAILED / VERIFICATION_BUDGET_INSUFFICIENT. The degradation is
+        checkpointed, so a resume of the same pass does not pay again.
+
+        Left fatal: the infrastructure faults, and a checkpoint whose stored
+        verifier state contradicts its own evidence (VERIFIER_STATE_*), which
+        is a corrupt resume -- finalizing from it would misrepresent the
+        evidence.
+        """
+        codes = ("VERIFIER_FAILED", "VERIFICATION_BUDGET_INSUFFICIENT")
+        if any(self._step_degraded(state, code) for code in codes):
+            return (), self._settled_verdicts(state, evidence), True
+        try:
+            resolutions, verdicts = self._run_verification(state, evidence, conflict_ids)
+            return resolutions, verdicts, False
+        except NOT_DEGRADABLE:
+            raise
+        except VerifierContractError as exc:
+            if not evidence or exc.reason_code.startswith("VERIFIER_STATE_"):
+                raise
+            self._degrade(state, "VERIFIER_FAILED", exc)
+        except VerificationBudgetInsufficient as exc:
+            if not evidence:
+                raise
+            self._degrade(state, "VERIFICATION_BUDGET_INSUFFICIENT", exc)
+        except Exception as exc:
+            if not evidence:
+                raise
+            self._degrade(state, "VERIFIER_FAILED", exc)
+        verdicts = self._settled_verdicts(state, evidence)
+        # The verdicts settled BEFORE the failing paid step (deterministic,
+        # missing-context, earlier batches) are real decisions: they reach the
+        # durable verdict sink like any other, through its idempotent write.
+        self._persist_verdicts(verdicts)
+        state.usage_snapshot = dict(self._usage_snapshot())
+        self._save(state)
+        return (), verdicts, True
+
+    @staticmethod
+    def _settled_verdicts(state: SwarmState, evidence: list[EvidenceReference],
+                          ) -> list[VerificationVerdict]:
+        """The grounded verdicts already durable for THIS evidence set, if any.
+
+        Only verdicts of the current grounding contract count; anything that
+        does not parse is dropped (the claim is then simply unverified).
+        """
+        if state.verifier_grounding_version != VERIFIER_GROUNDING_VERSION:
+            return []
+        claims = {item.claim_id for item in evidence}
+        verdicts = []
+        for claim_id, raw in sorted(state.verifier_state.items()):
+            if claim_id not in claims:
+                continue
+            try:
+                verdicts.append(VerificationVerdict.model_validate(raw))
+            except Exception:
+                continue
+        return verdicts
 
     def _persist_verdicts(self, verdicts: Iterable[VerificationVerdict]) -> None:
         """Hand every settled verdict, with its support links, to the sink.
@@ -393,9 +604,10 @@ class SwarmV2Engine:
         Returning a plan means "execute this and verify again"; returning None
         means "finalize now".
         """
-        if state.correction_declined:
-            # The Commander already looked at these findings and declined. A
-            # resume must not put the same question a second time.
+        if state.correction_declined or self._correction_rejected(state):
+            # The Commander already looked at these findings and declined (or
+            # its answer was REJECTED). A resume must not put the same
+            # question a second time.
             return None
         issues = correction_issues(evidence, verdicts)
         if not issues:
@@ -407,12 +619,16 @@ class SwarmV2Engine:
             self._emit("correction_round_blocked",
                        {"reason": allowance.reason, "issue_count": len(issues)})
             return None
+        round_number = state.correction_rounds + 1
         self._emit("correction_round_started",
-                   {"round": state.correction_rounds + 1, "issue_count": len(issues)})
-        decision = self._commander.replan(
+                   {"round": round_number, "issue_count": len(issues)})
+        decision = self._replan_or_reject(
+            state, evidence, correction_round=round_number,
             requested_model=requested_model, objective=objective,
             summary={**summary, "verification_findings":
                      correction_summary(issues, resolutions=resolutions)})
+        if decision is None:
+            return None
         if decision.decision not in {"ADD_TASKS", "REVISE_TASK"}:
             # The Commander looked at the findings and chose not to research
             # them. That is a terminal answer, not an invitation to ask again,
@@ -423,9 +639,16 @@ class SwarmV2Engine:
             return None
         replacement = decision.plan
         assert replacement is not None
-        if not self._completed_tasks_unchanged(plan, replacement, completed):
-            raise SwarmExecutionFailure(SWARM_V2_REPLAN_REWRITES_COMPLETED)
-        self._check_feasible(replacement, completed)
+        refusal = self._replan_refusal(plan, replacement, completed)
+        if refusal is not None:
+            # PR-X S3: with evidence in hand the refused proposal is REJECTED
+            # and the run finalizes with what it verified.
+            code, error = refusal
+            if not evidence:
+                raise error
+            self._reject_replan(state, code, correction_round=round_number,
+                                exception_class=type(error).__name__)
+            return None
         # A correction round IS a replan and is charged as one, so it consumes
         # the plan's own replan allowance alongside the one-round allowance.
         state.replans.append({"decision": decision.decision, "reason": decision.reason,
@@ -519,15 +742,38 @@ class SwarmV2Engine:
             # the one shared grouping the verifier also uses. Two claims that
             # differ only by generation, engine, transmission or official code
             # describe two different variants and were never a contradiction.
-            groups = conflict_groups(evidence)
-            conflict_ids = {item.claim_id for claims in groups.values() for item in claims}
+            #
+            # PR-X S3: with evidence in hand a failure of this deterministic
+            # step is not a run failure: every claim is still verified against
+            # its OWN source, only the cross-source marking is missing, and
+            # the run says so (CONFLICT_DETECTION_FAILED, partial_success).
+            try:
+                groups = conflict_groups(evidence)
+                conflict_ids = {item.claim_id for claims in groups.values() for item in claims}
+            except NOT_DEGRADABLE:
+                raise
+            except Exception as exc:
+                if not evidence:
+                    raise
+                self._degrade(state, "CONFLICT_DETECTION_FAILED", exc)
+                conflict_ids = set()
             for claim_id in sorted(conflict_ids):
                 self._emit("conflict_found", {"claim_id": claim_id})
 
             failed = sorted(k for k, v in execution.tasks.items()
                             if v.status != "completed")
-            gaps = self._coverage_gaps(plan, execution.tasks, evidence,
-                                       state.task_resolutions)
+            try:
+                gaps = self._coverage_gaps(plan, execution.tasks, evidence,
+                                           state.task_resolutions)
+            except NOT_DEGRADABLE:
+                raise
+            except Exception as exc:
+                # PR-X S3: the coverage check could not run; nothing is
+                # claimed about coverage, and the run says so.
+                if not evidence:
+                    raise
+                self._degrade(state, "COVERAGE_CHECK_FAILED", exc)
+                gaps = []
             unresolved = bool(failed or gaps or conflict_ids)
             summary = {"completed": sorted(completed), "failed": failed,
                 "evidence": [{"claim_id": e.claim_id, "source_id": e.source_id,
@@ -556,26 +802,47 @@ class SwarmV2Engine:
             # A round merely blocked by a budget decided nothing and is not
             # closed, and every replan BEFORE the correction round behaves
             # exactly as it did.
-            if correction_path_closed(rounds_used=state.correction_rounds,
-                                      declined=state.correction_declined):
+            if (correction_path_closed(rounds_used=state.correction_rounds,
+                                       declined=state.correction_declined)
+                    or self._correction_rejected(state)):
                 self._emit("correction_round_finalizing",
                            {"round": state.correction_rounds,
                             "declined": state.correction_declined})
                 decision = None
+            elif self._replan_rejected_for_pass(state):
+                # PR-X: this pass's decision was already REJECTED and
+                # checkpointed; a resume never asks the Commander again for it.
+                decision = None
             else:
-                decision = self._commander.replan(
-                    requested_model=requested_model, objective=objective, summary=summary
-                )
+                decision = self._replan_or_reject(
+                    state, evidence, correction_round=None,
+                    requested_model=requested_model, objective=objective, summary=summary)
             if decision is not None and decision.decision in {"ADD_TASKS", "REVISE_TASK"}:
+                # PR-X S3: a well-formed proposal that breaks a replan rule is
+                # a refusal of the PROPOSAL. With evidence in hand it is
+                # REJECTED (checkpointed, charged, reported) and the run goes
+                # on to verification with the work it has; with nothing usable
+                # it fails with its own static code exactly as before.
+                refusal: tuple[str, BaseException] | None = None
                 if not (failed or gaps or conflict_ids):
-                    raise SwarmExecutionFailure(SWARM_V2_REPLAN_REQUIRES_GAP)
-                if len(state.replans) >= plan.max_replans:
-                    raise SwarmExecutionFailure(SWARM_V2_MAX_REPLANS_EXCEEDED)
+                    refusal = (SWARM_V2_REPLAN_REQUIRES_GAP,
+                               SwarmExecutionFailure(SWARM_V2_REPLAN_REQUIRES_GAP))
+                elif len(state.replans) >= plan.max_replans:
+                    refusal = (SWARM_V2_MAX_REPLANS_EXCEEDED,
+                               SwarmExecutionFailure(SWARM_V2_MAX_REPLANS_EXCEEDED))
+                else:
+                    assert decision.plan is not None
+                    refusal = self._replan_refusal(plan, decision.plan, completed)
+                if refusal is not None:
+                    code, error = refusal
+                    if not evidence:
+                        raise error
+                    self._reject_replan(state, code, correction_round=None,
+                                        exception_class=type(error).__name__)
+                    decision = None
+            if decision is not None and decision.decision in {"ADD_TASKS", "REVISE_TASK"}:
                 replacement = decision.plan
                 assert replacement is not None
-                if not self._completed_tasks_unchanged(plan, replacement, completed):
-                    raise SwarmExecutionFailure(SWARM_V2_REPLAN_REWRITES_COMPLETED)
-                self._check_feasible(replacement, completed)
                 state.replans.append({"decision": decision.decision,
                                       "reason": decision.reason})
                 state.graph_revision += 1
@@ -605,8 +872,12 @@ class SwarmV2Engine:
                 raise SwarmExecutionFailure(SWARM_V2_REQUIRED_TASK_FAILED if hard_failures
                                             else SWARM_V2_COMPLETION_CRITERIA_UNMET)
 
-            resolutions, verdicts = self._run_verification(state, evidence, conflict_ids)
-            correction = self._start_correction_round(
+            resolutions, verdicts, verification_degraded = self._verify_or_degrade(
+                state, evidence, conflict_ids)
+            # A degraded verification settled nothing new, so there are no
+            # trustworthy findings to research: the correction round is not
+            # offered and no verifier step is paid for twice.
+            correction = None if verification_degraded else self._start_correction_round(
                 state, plan, completed, evidence=evidence, verdicts=verdicts,
                 resolutions=resolutions, summary=summary,
                 requested_model=requested_model, objective=objective)
@@ -617,6 +888,15 @@ class SwarmV2Engine:
                          "code": (result.error or {}).get("code", "TASK_FAILED")}
                         for task_id, result in sorted(execution.tasks.items())
                         if result.status != "completed"]
+            try:
+                candidate_outcomes = self._candidate_outcomes(state, plan, completed)
+            except NOT_DEGRADABLE:
+                raise
+            except Exception as exc:
+                if not evidence:
+                    raise
+                self._degrade(state, "CANDIDATE_OUTCOMES_FAILED", exc)
+                candidate_outcomes = []
             # ONE canonical finalization. Everything the run knows -- verified
             # evidence, verdicts, task failures, coverage gaps and conflicts --
             # is handed to the builder in a single call, and the payload it
@@ -624,9 +904,60 @@ class SwarmV2Engine:
             # trusted negative result: no registered tool can yet return a
             # typed "no match" signal, so `not_found` is unreachable and is
             # never inferred from an empty field set (see .outcome).
-            final = self._builder.build(evidence, verdicts, task_failures=failures,
-                                        coverage_gaps=gaps,
-                                        conflict_claim_ids=sorted(conflict_ids),
-                                        candidate_outcomes=self._candidate_outcomes(
-                                            state, plan, completed))
-            return safe_durable_value(final)
+            return self._finalize(state, evidence, verdicts, failures=failures, gaps=gaps,
+                                  conflict_ids=conflict_ids,
+                                  candidate_outcomes=candidate_outcomes)
+
+    def _finalize(self, state: SwarmState, evidence: list[EvidenceReference],
+                  verdicts: list[VerificationVerdict], *, failures: list[dict[str, Any]],
+                  gaps: list[dict[str, str]], conflict_ids: set[str],
+                  candidate_outcomes: list[dict[str, Any]]) -> dict[str, Any]:
+        """The canonical payload -- or, if it cannot be built, a reduced valid one.
+
+        The payload is validated HERE, by the same contract the worker applies,
+        so a builder defect is caught while the engine can still do something
+        about it. With evidence in hand a failure is FINAL_BUILD_DEGRADED:
+
+        1. the builder runs again without the optional register view
+           (`candidate_outcomes` and the vehicle keys are omitted);
+        2. if that fails too, the verified fields are omitted as well and the
+           outcome is decided from the static review items alone
+           (partial_success / no_usable_result).
+
+        Neither step invents or promotes a value: every field shown is a
+        verified claim, and the evidence itself stays durable on the board and
+        in the checkpoint.
+        """
+        def build(outcomes: list[dict[str, Any]]) -> dict[str, Any]:
+            final = safe_durable_value(self._builder.build(
+                evidence, verdicts, task_failures=failures,
+                coverage_gaps=[*gaps, *self._degraded_review(state)],
+                conflict_claim_ids=sorted(conflict_ids), candidate_outcomes=outcomes))
+            validate_product_outcome(final)
+            return final
+
+        try:
+            return build(candidate_outcomes)
+        except NOT_DEGRADABLE:
+            raise
+        except Exception as exc:
+            if not evidence:
+                raise
+            self._degrade(state, "FINAL_BUILD_DEGRADED", exc)
+        try:
+            return build([])
+        except NOT_DEGRADABLE:
+            raise
+        except Exception:
+            pass
+        review = [*self._degraded_review(state)]
+        try:
+            final = safe_durable_value(finalize_product_outcome(
+                fields={}, task_failures=failures, coverage_gaps=[*gaps, *review]))
+            validate_product_outcome(final)
+            return final
+        except NOT_DEGRADABLE:
+            raise
+        except Exception:
+            # The static items alone: this cannot fail.
+            return finalize_product_outcome(fields={}, coverage_gaps=review)

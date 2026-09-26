@@ -1180,14 +1180,35 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # event is emitted. The catalog path is skipped whole; the run's
             # own outcome and finalization are untouched by the skip.
             if workflow_key == "swarm_v2" and catalog_promotion.get("pipeline") is not None:
-                for attempt in catalog_promotion["pipeline"].promote():
-                    sink.emit(RunEventRecord(
-                        run_id=run_id,
-                        type="catalog_variant_promoted" if attempt.promoted
-                             else "catalog_promotion_refused",
-                        message=("Canonical catalog variant promoted."
-                                 if attempt.promoted else attempt.safe_message),
-                        payload=attempt.as_event()))
+                try:
+                    for attempt in catalog_promotion["pipeline"].promote():
+                        sink.emit(RunEventRecord(
+                            run_id=run_id,
+                            type="catalog_variant_promoted" if attempt.promoted
+                                 else "catalog_promotion_refused",
+                            message=("Canonical catalog variant promoted."
+                                     if attempt.promoted else attempt.safe_message),
+                            payload=attempt.as_event()))
+                except (AppError, CancellationRequested, BudgetExceeded, AssertionError):
+                    raise
+                except Exception as exc:
+                    # PR-X S3: the run's verified result already exists; a
+                    # promotion DEFECT (not a lost lease, not an unreadable
+                    # repository -- those are AppError and escape above) must
+                    # not turn it into a failed run. The result is finalized
+                    # with CATALOG_PROMOTION_FAILED, which makes it
+                    # partial_success; a payload that is itself invalid is not
+                    # repaired here and still fails as SWARM_V2_OUTCOME_INVALID.
+                    from backend.engines.swarm_v2.failures import log_step_degraded
+                    from backend.engines.swarm_v2.outcome import (DEGRADED_STEP_CODES,
+                                                                  ProductOutcomeError,
+                                                                  with_degraded_review)
+                    log_step_degraded(DEGRADED_STEP_CODES["CATALOG_PROMOTION_FAILED"],
+                                      "CATALOG_PROMOTION_FAILED", type(exc).__name__)
+                    try:
+                        result = with_degraded_review(result, "CATALOG_PROMOTION_FAILED")
+                    except ProductOutcomeError:
+                        pass
         except CancellationRequested:
             finalizer.finalize(TerminalClaim.cancelled(workflow_key))
             return 0
