@@ -45,6 +45,18 @@ MILO_STAGE_A_EXECUTION_FLAGS=(
   MILO_ENABLE_WORK_SCOPE_PREPARATION=false
 )
 
+# PR-Y: the replay capture (backend/replay_capture.py). A diagnostic, not an
+# execution flag: when on, the product worker keeps a run's inert provider
+# outputs on that run's own checkpoints for an operator to export. It is
+# pinned OFF by EVERY deploy script on EVERY surface (API, worker job, capture
+# job, staging, the kill switch), and scripts/check_unsafe_defaults.py fails
+# the build if a committed file turns it on or a deploy script stops pinning
+# it. Turning it on is a separate, explicit operator decision.
+MILO_REPLAY_CAPTURE_FLAG_NAME="MILO_CAPTURE_REPLAY"
+MILO_REPLAY_CAPTURE_PINNED_OFF=(
+  MILO_CAPTURE_REPLAY=false
+)
+
 MILO_STAGE_A_FLAG_NAMES=()
 for _milo_flag in "${MILO_STAGE_A_EXECUTION_FLAGS[@]}"; do
   MILO_STAGE_A_FLAG_NAMES+=("${_milo_flag%%=*}")

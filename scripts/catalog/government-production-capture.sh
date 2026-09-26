@@ -190,7 +190,7 @@ build_env_args() {
     "${MILO_SUPABASE_PROJECT_REF_ENV_NAME}=${PROJECT_REF}"
     "${MILO_CAPTURE_MASTER_FLAG_NAME}=${CATALOG_EXECUTION_VALUE:-false}"
   )
-  pairs+=("${MILO_CAPTURE_PINNED_OFF_FLAGS[@]}")
+  pairs+=("${MILO_CAPTURE_PINNED_OFF_FLAGS[@]}" "${MILO_REPLAY_CAPTURE_PINNED_OFF[@]}")
   local joined
   joined="$(IFS="$MILO_ENV_VAR_DELIMITER"; printf '%s' "${pairs[*]}")"
   printf '^%s^%s' "$MILO_ENV_VAR_DELIMITER" "$joined"

@@ -86,7 +86,7 @@ DELIM="${MILO_ENV_VAR_DELIMITER}"
 # deployment contract). The alternate delimiter prefix keeps comma-containing
 # values (CORS origins, identity allowlists) intact as a single value.
 EXECUTION_FLAG_ARGS=""
-for flag in "${MILO_STAGE_A_EXECUTION_FLAGS[@]}"; do
+for flag in "${MILO_STAGE_A_EXECUTION_FLAGS[@]}" "${MILO_REPLAY_CAPTURE_PINNED_OFF[@]}"; do
   EXECUTION_FLAG_ARGS="${EXECUTION_FLAG_ARGS:+${EXECUTION_FLAG_ARGS}${DELIM}}${flag}"
 done
 # JOB_LAUNCHER is an API-only variable; the worker never launches jobs.

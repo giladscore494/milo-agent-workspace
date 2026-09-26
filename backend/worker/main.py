@@ -247,6 +247,10 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         # AFTER the lease and BEFORE any paid provider path is constructed; the
         # Swarm V2 wiring below reads it and never re-decides it.
         catalog_state: dict[str, Any] = {}
+        # PR-Y: the opt-in replay capture (MILO_CAPTURE_REPLAY, default off).
+        # The recorder exists only when the flag is on; off, nothing below
+        # is wrapped and no checkpoint carries a capture.
+        replay_state: dict[str, Any] = {"recorder": None}
 
         def build_default_engine():
             if engine_builder is None:
@@ -346,7 +350,17 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     artifacts = dict(checkpoint.get("artifacts") or {})
                     artifacts.setdefault(GOVERNMENT_ARTIFACT_KEY, preparation.as_artifact())
                     checkpoint = {**checkpoint, "artifacts": artifacts}
-                repo.save_checkpoint(checkpoint, **lease_ctx)
+                recorder = replay_state["recorder"]
+                if recorder is not None:
+                    # PR-Y: the bounded capture rides on the run's own
+                    # checkpoint (service-only table). The shadow observer
+                    # below is handed the checkpoint WITHOUT it, so provider
+                    # text never reaches the blackboard or agent messages.
+                    from backend.replay_capture import with_capture
+                    repo.save_checkpoint({**checkpoint, "artifacts": with_capture(
+                        checkpoint.get("artifacts"), recorder)}, **lease_ctx)
+                else:
+                    repo.save_checkpoint(checkpoint, **lease_ctx)
                 shadow_observe("checkpoint_saved", checkpoint)
         def is_cancelled():
             return repo.get_run(run_id).get("status") == "cancellation_requested"
@@ -924,6 +938,19 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 tools = ToolRegistry(
                     [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)]
                     if government_read_enabled else [])
+                # PR-Y: MILO_CAPTURE_REPLAY, read ONCE here. Off (the default and
+                # every deployed posture): no recorder, nothing wrapped, zero
+                # writes. On: the provider adapter, the tool registry and the
+                # trusted result sink each record what passed through them,
+                # unchanged, into one bounded per-run recorder.
+                from backend.replay_capture import (CapturingAuthority,
+                                                    CapturingTools,
+                                                    ReplayCaptureRecorder, capture_enabled,
+                                                    capturing_result_sink)
+                recorder = ReplayCaptureRecorder() if capture_enabled() else None
+                if recorder is not None:
+                    recorder.set_models(commander=commander_model, worker=worker_model)
+                replay_state["recorder"] = recorder
                 # ONE PlanLimits instance feeds both the provider-visible
                 # policy (ModelGateway) and the deterministic firewall
                 # (PlanValidator): contract parity cannot drift silently.
@@ -937,8 +964,11 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # agent-step and model-call envelope can actually pay for.
                 limits = policy.plan_limits()
                 gateway = ModelGateway(guarded_client_factory=build_guarded_client_factory(tracker, request_deadline_seconds=streaming_request_deadline),
-                    # The SAME adapter instance V1 is given above.
-                    adapter=provider_adapter, api_key=worker_provider_api_key(),
+                    # The SAME adapter instance V1 is given above (wrapped, not
+                    # replaced, only while a replay capture is on).
+                    adapter=(provider_adapter if recorder is None
+                             else CapturingAuthority(provider_adapter, recorder)),
+                    api_key=worker_provider_api_key(),
                     base_url=provider_base_url(),
                     # Sanitized, server-owned descriptors: Commander sees each
                     # registered tool's operations and schemas, and the SAME
@@ -1004,8 +1034,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # stays inert for a chat run instead of being live by accident.
                 if promotion_enabled:
                     catalog_promotion["pipeline"] = CatalogPromotionPipeline(repo, board.lease)
+                worker_tools = tools if recorder is None else CapturingTools(tools, recorder)
+                if recorder is not None:
+                    evidence_sink = capturing_result_sink(evidence_sink, recorder)
                 executor = BoundedTaskExecutor(worker_factory=lambda: GenericWorker(
-                    gateway=gateway, tools=tools, model=worker_model, tool_context=tool_context,
+                    gateway=gateway, tools=worker_tools, model=worker_model,
+                    tool_context=tool_context,
                     cancellation_checker=is_cancelled, event_sink=forward_event,
                     # Every planned Tool invocation is a durable, cumulative
                     # consumption BEFORE it runs: a failed call is still a
@@ -1276,6 +1310,24 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             # tool or provider material.
             print(f"swarm_v2 run failed: run_id={run_id} code={code} "
                   f"exception_class={type(exc).__name__}", flush=True)
+            if replay_state["recorder"] is not None:
+                # PR-Y: a run that fails -- above all one whose plan the
+                # firewall refused before any engine checkpoint existed --
+                # keeps what it captured in ONE capture checkpoint, written
+                # under the lease just before the terminal state. The capture
+                # never changes the outcome: a write that fails is skipped.
+                from backend.replay_capture import CAPTURE_PHASE, with_capture
+                try:
+                    repo.save_checkpoint({
+                        "run_id": str(run_id), "attempt": run.get("attempt", 1),
+                        "engine_version": preclaim_identity.engine_version,
+                        "workflow_key": workflow_key, "phase": CAPTURE_PHASE,
+                        "completed_tasks": [], "failures": [],
+                        "token_usage": tracker.ledger_snapshot(),
+                        "artifacts": with_capture({}, replay_state["recorder"])},
+                        **lease_ctx)
+                except Exception:
+                    pass
             finalizer.finalize(TerminalClaim.failure(
                 workflow_key, code, message,
                 event_payload={k: v for k, v in failure_payload.items() if k != "code"}))
