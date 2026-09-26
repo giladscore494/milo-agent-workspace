@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import json
+import math
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
@@ -22,13 +24,154 @@ OPERATION_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,79}$")
 
 
+#: The scalar types an output-schema "enum" may annotate, with the Python types
+#: its values must have (a bool is never an integer or a number here).
+_ENUM_VALUE_TYPES: Mapping[str, tuple[type, ...]] = {
+    "string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,)}
+
+
+#: PR-W S5: annotation keywords a task OUTPUT schema may carry that are never
+#: enforced. `normalize_output_schema` removes them before validation, so a
+#: plan is never rejected (and never pays a repair) for one of them.
+OUTPUT_SCHEMA_STRIPPED_KEYWORDS = frozenset({
+    "title", "default", "examples", "format", "pattern", "$schema", "$id",
+    "$comment", "readOnly", "writeOnly", "deprecated"})
+#: PR-W S5: simple constraints a task output schema may carry, per type. They
+#: are KEPT, validated by `validate_output_schema` and ENFORCED by
+#: `validate_json_schema`.
+OUTPUT_SCHEMA_CONSTRAINT_KEYWORDS: Mapping[str, frozenset[str]] = {
+    "integer": frozenset({"minimum", "maximum"}),
+    "number": frozenset({"minimum", "maximum"}),
+    "string": frozenset({"minLength", "maxLength"}),
+    "array": frozenset({"minItems"}),
+}
+#: Structural bounds of a task output schema. They mirror the bounds every
+#: task OUTPUT value already passes (`swarm_v2.tool_calls.MAX_TOOL_VALUE_DEPTH`
+#: and `MAX_TOOL_COLLECTION_ITEMS`, pinned equal by a test): a schema nested
+#: deeper than any admissible output, or wider than one, can describe nothing
+#: the runtime would accept. Beyond them the schema is rejected.
+MAX_OUTPUT_SCHEMA_DEPTH = 8
+MAX_OUTPUT_SCHEMA_ITEMS = 200
+
+
+def normalize_output_schema(schema: Any) -> tuple[Any, list[str]]:
+    """Remove never-enforced annotation keywords from a TASK output schema.
+
+    Pure and deterministic: no I/O, the input is never mutated (every mapping
+    and value in the result is a fresh copy), and the walk follows only the
+    structural positions -- `properties` values and `items` -- so a property
+    NAMED like a keyword is never touched. Returns the normalized schema and
+    the sorted, de-duplicated NAMES of the keywords removed (never values).
+
+    Only `OUTPUT_SCHEMA_STRIPPED_KEYWORDS` are removed. Every other keyword is
+    left in place for `validate_output_schema` to judge, so a structural or
+    unsupported keyword (oneOf, $ref, const, ...) is still rejected. A
+    non-mapping node is returned as is, for validation to reject. Idempotent:
+    normalizing a normalized schema changes nothing and strips nothing.
+
+    Raises ValueError beyond MAX_OUTPUT_SCHEMA_DEPTH / MAX_OUTPUT_SCHEMA_ITEMS.
+    Tool schemas never pass through here.
+    """
+    stripped: set[str] = set()
+
+    def walk(node: Any, depth: int) -> Any:
+        if not isinstance(node, Mapping):
+            return copy.deepcopy(node)
+        if depth > MAX_OUTPUT_SCHEMA_DEPTH:
+            raise ValueError("output schema nesting exceeds the output depth bound")
+        if len(node) > MAX_OUTPUT_SCHEMA_ITEMS:
+            raise ValueError("output schema exceeds the output size bound")
+        result: dict[Any, Any] = {}
+        for key, value in node.items():
+            if key in OUTPUT_SCHEMA_STRIPPED_KEYWORDS:
+                stripped.add(key)
+            elif key == "properties" and isinstance(value, Mapping):
+                if len(value) > MAX_OUTPUT_SCHEMA_ITEMS:
+                    raise ValueError("output schema exceeds the output size bound")
+                result[key] = {name: walk(nested, depth + 1) for name, nested in value.items()}
+            elif key == "items":
+                result[key] = walk(value, depth + 1)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
+
+    try:
+        normalized = walk(schema, 0)
+    except RecursionError:
+        raise ValueError("output schema exceeds the output depth bound") from None
+    return normalized, sorted(stripped)
+
+
+def _bound(value: Any, *, integer: bool) -> bool:
+    """A usable constraint value: an int (or, for a numeric bound, a finite
+    float), never a bool."""
+    if isinstance(value, bool):
+        return False
+    if integer:
+        return isinstance(value, int) and value >= 0
+    return isinstance(value, int) or (isinstance(value, float) and math.isfinite(value))
+
+
+def _check_constraints(schema: Mapping[str, Any], expected: str, path: str) -> None:
+    """Type rules of the S5 constraint keywords; a malformed one is a
+    structural defect, never silently dropped."""
+    if expected in {"integer", "number"}:
+        low, high, integer = "minimum", "maximum", False
+    elif expected == "string":
+        low, high, integer = "minLength", "maxLength", True
+    elif expected == "array":
+        low, high, integer = "minItems", "maxItems", True
+    else:
+        return
+    for key in (low, high):
+        if key in schema and not _bound(schema[key], integer=integer):
+            raise ValueError(f"{path}.{key} is not a valid bound")
+    if low in schema and high in schema and schema[low] > schema[high]:
+        raise ValueError(f"{path}.{low} exceeds {high}")
+
+
+def _enum_values_valid(expected: str, values: Any) -> bool:
+    if expected not in _ENUM_VALUE_TYPES or not isinstance(values, list) or not values:
+        return False
+    kinds = _ENUM_VALUE_TYPES[expected]
+    if any(not isinstance(item, kinds) or (expected != "boolean" and isinstance(item, bool))
+           for item in values):
+        return False
+    return len(set(values)) == len(values)
+
+
 def validate_schema(schema: Mapping[str, Any], path: str = "$schema") -> None:
     """Validate the complete supported schema subset before registration."""
+    _check_schema(schema, path, annotations=False)
+
+
+def validate_output_schema(schema: Mapping[str, Any], path: str = "$output_schema") -> None:
+    """Validate a TASK output schema: the tool subset plus two annotations.
+
+    The structure is exactly what `validate_schema` accepts for tools -- arrays
+    need `items`, objects are closed with `properties`/`required` -- and on top
+    of it an output schema may carry `description` (a string, ignored at run
+    time) and `enum` on a string/integer/number/boolean schema (a non-empty
+    list of unique values of that type, ENFORCED by `validate_json_schema`).
+    Run 6825eb96's successful Gate-0 plan used exactly that enum. Tool schemas
+    are unaffected: registration still uses `validate_schema`.
+
+    PR-W S5: it also accepts the simple constraints of
+    OUTPUT_SCHEMA_CONSTRAINT_KEYWORDS -- minimum/maximum on integer/number,
+    minLength/maxLength on string, minItems on array -- with their type rules
+    (see `_check_constraints`); `validate_json_schema` enforces them. The
+    annotation keywords of OUTPUT_SCHEMA_STRIPPED_KEYWORDS are not accepted
+    here: `normalize_output_schema` removes them first.
+    """
+    _check_schema(schema, path, annotations=True)
+
+
+def _check_schema(schema: Any, path: str, *, annotations: bool) -> None:
     if not isinstance(schema, Mapping):
         raise ValueError(f"{path} must be an object")
     expected = schema.get("type")
     allowed_types = {"object", "array", "string", "integer", "number", "boolean", "null"}
-    if expected not in allowed_types:
+    if not isinstance(expected, str) or expected not in allowed_types:
         raise ValueError(f"unsupported schema type at {path}")
     allowed_keys = {"type"}
     if expected == "object":
@@ -46,34 +189,64 @@ def validate_schema(schema: Mapping[str, Any], path: str = "$schema") -> None:
         for name, nested in properties.items():
             if not isinstance(name, str) or not name:
                 raise ValueError(f"{path}.properties names must be non-empty strings")
-            validate_schema(nested, f"{path}.properties.{name}")
+            _check_schema(nested, f"{path}.properties.{name}", annotations=annotations)
     elif expected == "array":
         allowed_keys |= {"items", "maxItems"}
         if "items" not in schema:
             raise ValueError(f"{path}.items is required")
-        validate_schema(schema["items"], f"{path}.items")
+        _check_schema(schema["items"], f"{path}.items", annotations=annotations)
         if "maxItems" in schema and (not isinstance(schema["maxItems"], int) or isinstance(schema["maxItems"], bool) or schema["maxItems"] < 0):
             raise ValueError(f"{path}.maxItems must be a non-negative integer")
+    if annotations:
+        allowed_keys |= OUTPUT_SCHEMA_CONSTRAINT_KEYWORDS.get(expected, frozenset())
+        _check_constraints(schema, expected, path)
+        allowed_keys.add("description")
+        if "description" in schema and not isinstance(schema["description"], str):
+            raise ValueError(f"{path}.description must be a string")
+        if "enum" in schema:
+            allowed_keys.add("enum")
+            if not _enum_values_valid(expected, schema["enum"]):
+                raise ValueError(f"{path}.enum must be a non-empty list of unique {expected} values")
     unsupported = set(schema) - allowed_keys
     if unsupported:
         raise ValueError(f"unsupported schema keywords at {path}: {sorted(unsupported)}")
 
 
 def validate_json_schema(schema: Mapping[str, Any], value: Any, path: str = "$input") -> None:
-    """Validate the deliberately small JSON-schema subset tools may expose."""
+    """Validate the deliberately small JSON-schema subset tools may expose.
+
+    A malformed SCHEMA is reported exactly like a non-conforming value: as a
+    ValueError, never a KeyError/TypeError/AttributeError. Run 280fc9e5 lost
+    every task to an array schema without "items", which used to escape here
+    as a bare KeyError.
+    """
+    if not isinstance(schema, Mapping):
+        raise ValueError(f"schema at {path} must be an object")
     expected = schema.get("type")
     types = {"object": dict, "array": list, "string": str, "integer": int,
              "number": (int, float), "boolean": bool, "null": type(None)}
-    if expected not in types:
+    if not isinstance(expected, str) or expected not in types:
         raise ValueError(f"unsupported schema type at {path}")
     if not isinstance(value, types[expected]) or (expected in {"integer", "number"} and isinstance(value, bool)):
         raise ValueError(f"{path} must be {expected}")
+    if "enum" in schema:
+        # Enforced, never merely advertised. A malformed enum is a schema
+        # defect and reported the same way; "description" is ignored here.
+        allowed = schema["enum"]
+        if not _enum_values_valid(expected, allowed):
+            raise ValueError(f"schema at {path} has an invalid enum")
+        if not any(value == item and isinstance(value, bool) == isinstance(item, bool)
+                   for item in allowed):
+            raise ValueError(f"{path} is not one of the allowed values")
+    _enforce_constraints(schema, expected, value, path)
     if expected == "object":
         properties = schema.get("properties")
-        if not isinstance(properties, dict) or schema.get("additionalProperties") is not False:
+        if not isinstance(properties, Mapping) or schema.get("additionalProperties") is not False:
             raise ValueError(f"{path} must use a closed object schema")
         required = schema.get("required", [])
-        if not isinstance(required, list) or any(key not in value for key in required):
+        if not isinstance(required, list) or any(not isinstance(key, str) for key in required):
+            raise ValueError(f"{path}.required must be a string array")
+        if any(key not in value for key in required):
             raise ValueError(f"{path} is missing required properties")
         unknown = set(value) - set(properties)
         if unknown:
@@ -81,10 +254,41 @@ def validate_json_schema(schema: Mapping[str, Any], value: Any, path: str = "$in
         for key, item in value.items():
             validate_json_schema(properties[key], item, f"{path}.{key}")
     elif expected == "array":
-        if "maxItems" in schema and len(value) > int(schema["maxItems"]):
+        if "items" not in schema:
+            raise ValueError(f"schema at {path} must declare items")
+        max_items = schema.get("maxItems")
+        if "maxItems" in schema and (not isinstance(max_items, int) or isinstance(max_items, bool)):
+            raise ValueError(f"schema at {path} has an invalid maxItems")
+        if max_items is not None and len(value) > max_items:
             raise ValueError(f"{path} exceeds maxItems")
         for index, item in enumerate(value):
             validate_json_schema(schema["items"], item, f"{path}[{index}]")
+
+
+def _enforce_constraints(schema: Mapping[str, Any], expected: str, value: Any, path: str) -> None:
+    """PR-W S5: enforce minimum/maximum, minLength/maxLength and minItems.
+
+    Tool schemas can never carry these (`validate_schema` refuses them at
+    registration), so only task output schemas reach a check here. A
+    malformed bound is a schema defect, reported as a ValueError like every
+    other one; maxItems keeps its existing check in `validate_json_schema`.
+    """
+    if expected in {"integer", "number"}:
+        measure, low, high, integer = value, "minimum", "maximum", False
+    elif expected == "string":
+        measure, low, high, integer = len(value), "minLength", "maxLength", True
+    elif expected == "array":
+        measure, low, high, integer = len(value), "minItems", None, True
+    else:
+        return
+    for key in (low, high):
+        if key is None or key not in schema:
+            continue
+        bound = schema[key]
+        if not _bound(bound, integer=integer):
+            raise ValueError(f"schema at {path} has an invalid {key}")
+        if (key == low and measure < bound) or (key == high and measure > bound):
+            raise ValueError(f"{path} violates {key}")
 
 
 def _json_copy(schema: Mapping[str, Any]) -> dict[str, Any]:
