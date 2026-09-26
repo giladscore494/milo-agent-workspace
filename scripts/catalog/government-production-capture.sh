@@ -379,8 +379,11 @@ raw = sys.stdin.read()
 start = raw.find("{")
 if start < 0:
     sys.exit(1)
+# The FIRST complete object only: Cloud Run appends its own lines (such as
+# "Container called exit(0).") after the document, and json.loads would refuse
+# those as extra data.
 try:
-    doc = json.loads(raw[start:])
+    doc, _end = json.JSONDecoder().raw_decode(raw, start)
 except Exception:
     sys.exit(1)
 node = doc
