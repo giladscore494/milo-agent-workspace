@@ -1,0 +1,173 @@
+{
+ "format": "replay/1",
+ "run_id": "280fc9e5",
+ "description": "11/11 tasks failed TASK_FAILED in production after successful model calls: the runtime validator raised on an items-less array schema the firewall had approved.",
+ "models": {
+  "commander": "kimi-k3",
+  "worker": "kimi-k2.6"
+ },
+ "objective": "Resolve the prepared Mapping Plan batch against the Israeli vehicle register.",
+ "preparation": {
+  "snapshot_key": "cs1.3817235c4b6636a7a614c3882ab36f44",
+  "resource_id": "142afde2-6228-49f9-8a29-9b6c3a0cbe40",
+  "upstream_version": "2026-09-14T02:41:31.842626",
+  "upstream_version_kind": "dataset_version",
+  "queue": [
+   {
+    "candidate_key": "cc1.402bfce103111b632b7f5e93e95c8096",
+    "candidate_id": "cand-38683",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2022,
+    "model_year_end": 2022,
+    "official_model_code": "AXAA54L-CNZVBA",
+    "trim": "ADVENTURE"
+   },
+   {
+    "candidate_key": "cc1.7f59d7ec51c4e9ce8babcfd75d539c8b",
+    "candidate_id": "cand-38694",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2023,
+    "model_year_end": 2023,
+    "official_model_code": "AXAA54L-CNZVBA",
+    "trim": "ADVENTURE"
+   },
+   {
+    "candidate_key": "cc1.cb3342ff505b55af4411f31e62c9e323",
+    "candidate_id": "cand-42733",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2024,
+    "model_year_end": 2024,
+    "official_model_code": "AXAH54L CNXMBA",
+    "trim": "XLE PREMIUM"
+   },
+   {
+    "candidate_key": "cc1.d8d597a31f002e4aea03846d451a8c22",
+    "candidate_id": "cand-42732",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2023,
+    "model_year_end": 2023,
+    "official_model_code": "AXAH54L CNXMBA",
+    "trim": "XLE PREMIUM"
+   },
+   {
+    "candidate_key": "cc1.cac70299bd2962a7d79275515f88b592",
+    "candidate_id": "cand-42755",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2023,
+    "model_year_end": 2023,
+    "official_model_code": "AXAH54L CNXMBA",
+    "trim": "XLE"
+   },
+   {
+    "candidate_key": "cc1.5123ff38b3b2926bcd73a9a32e063806",
+    "candidate_id": "cand-42756",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2024,
+    "model_year_end": 2024,
+    "official_model_code": "AXAH54L CNXMBA",
+    "trim": "XLE"
+   },
+   {
+    "candidate_key": "cc1.a2de9b0d9b3db470db63d266a455db95",
+    "candidate_id": "cand-37168",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2025,
+    "model_year_end": 2025,
+    "official_model_code": "AXAL52L ANXXBW",
+    "trim": "BASIS HYBRID"
+   },
+   {
+    "candidate_key": "cc1.6466ed10cd5a01340067476baf403030",
+    "candidate_id": "cand-37196",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2025,
+    "model_year_end": 2025,
+    "official_model_code": "AXAL52L ANXXBW",
+    "trim": "COMFORT HYRI"
+   },
+   {
+    "candidate_key": "cc1.355e44d53982161ef4600c64bd268acf",
+    "candidate_id": "cand-37197",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2026,
+    "model_year_end": 2026,
+    "official_model_code": "AXAL52L ANXXBW",
+    "trim": "COMFORT HYRI"
+   },
+   {
+    "candidate_key": "cc1.72e695e77e90825cb3412f11b85c9c08",
+    "candidate_id": "cand-37209",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2025,
+    "model_year_end": 2025,
+    "official_model_code": "AXAL52L ANXXBW",
+    "trim": "COMFORT"
+   },
+   {
+    "candidate_key": "cc1.8f0234abf3c83ae0b430356495eca8f4",
+    "candidate_id": "cand-37210",
+    "manufacturer": "טויוטה",
+    "commercial_model": "RAV4",
+    "model_year_start": 2026,
+    "model_year_end": 2026,
+    "official_model_code": "AXAL52L ANXXBW",
+    "trim": "COMFORT"
+   }
+  ],
+  "total_candidates": 11,
+  "bounded": false
+ },
+ "commander": [
+  {
+   "phase": "planning",
+   "content": "{\"version\": \"1\", \"objective\": \"Resolve the prepared Mapping Plan batch against the Israeli vehicle register.\", \"graph\": {\"tasks\": [{\"task_id\": \"t01\", \"goal\": \"resolve register variants t01\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2022, \"trim\": \"ADVENTURE\", \"official_model_code\": \"AXAA54L-CNZVBA\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t02\", \"goal\": \"resolve register variants t02\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2023, \"trim\": \"ADVENTURE\", \"official_model_code\": \"AXAA54L-CNZVBA\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t03\", \"goal\": \"resolve register variants t03\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2024, \"trim\": \"XLE PREMIUM\", \"official_model_code\": \"AXAH54L CNXMBA\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t04\", \"goal\": \"resolve register variants t04\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2023, \"trim\": \"XLE PREMIUM\", \"official_model_code\": \"AXAH54L CNXMBA\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t05\", \"goal\": \"resolve register variants t05\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2023, \"trim\": \"XLE\", \"official_model_code\": \"AXAH54L CNXMBA\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t06\", \"goal\": \"resolve register variants t06\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2024, \"trim\": \"XLE\", \"official_model_code\": \"AXAH54L CNXMBA\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t07\", \"goal\": \"resolve register variants t07\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2025, \"trim\": \"BASIS HYBRID\", \"official_model_code\": \"AXAL52L ANXXBW\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t08\", \"goal\": \"resolve register variants t08\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2025, \"trim\": \"COMFORT HYRI\", \"official_model_code\": \"AXAL52L ANXXBW\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t09\", \"goal\": \"resolve register variants t09\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2026, \"trim\": \"COMFORT HYRI\", \"official_model_code\": \"AXAL52L ANXXBW\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t10\", \"goal\": \"resolve register variants t10\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2025, \"trim\": \"COMFORT\", \"official_model_code\": \"AXAL52L ANXXBW\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}, {\"task_id\": \"t11\", \"goal\": \"resolve register variants t11\", \"scope\": \"Israeli vehicle register, the run's pinned snapshot\", \"dependencies\": [], \"tools\": [{\"call_id\": \"c1\", \"name\": \"catalog.government_vehicle\", \"operation\": \"resolve_variant\", \"arguments\": {\"manufacturer\": \"טויוטה\", \"commercial_model\": \"RAV4\", \"model_year\": 2026, \"trim\": \"COMFORT\", \"official_model_code\": \"AXAL52L ANXXBW\"}, \"dependency_bindings\": []}], \"output_schema\": {\"type\": \"object\", \"properties\": {\"variants\": {\"type\": \"array\"}, \"provenance\": {\"type\": \"object\"}, \"candidate_ids\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}, \"required\": [\"variants\", \"provenance\", \"candidate_ids\"], \"additionalProperties\": false}, \"evidence\": {\"minimum_sources\": 0, \"required_fields\": [], \"min_confidence\": 0.5}, \"priority\": 50, \"recursion_depth\": 0, \"estimated_cost_units\": 5, \"completion\": {\"required_outputs\": [\"candidate_ids\"], \"evidence_satisfied\": true, \"allow_partial\": true}}]}, \"assignments\": [{\"task_id\": \"t01\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t02\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t03\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t04\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t05\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t06\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t07\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t08\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t09\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t10\", \"worker_role\": \"register reader\", \"context_task_ids\": []}, {\"task_id\": \"t11\", \"worker_role\": \"register reader\", \"context_task_ids\": []}], \"max_replans\": 1, \"estimated_cost_units\": 55}",
+   "finish_reason": "stop"
+  }
+ ],
+ "workers": {},
+ "verifier": [],
+ "tool_results": [],
+ "snapshot_rows": [],
+ "provenance": {
+  "commander[0]": {
+   "kind": "reconstructed",
+   "source": "the approved revision-1 plan as durable state describes it: 11 tasks whose output_schema declares 'variants': {'type': 'array'} (no items) and 'provenance': {'type': 'object'} (tests/test_swarm_v2_output_schema_nested.py)"
+  },
+  "preparation": {
+   "kind": "reconstructed",
+   "source": "eleven queued items (the run had 11 tasks); identities are stand-ins from real RAV4 rows of the committed R5 capture"
+  }
+ },
+ "expected": {
+  "terminal": "unrecorded_call",
+  "model_calls": 1,
+  "retry_reasons": [
+   [
+    "commander",
+    "planning",
+    "OUTPUT_SCHEMA_NESTED_INVALID"
+   ]
+  ],
+  "unconsumed": {
+   "completions": 0,
+   "tool_results": 0
+  },
+  "unrecorded_call": {
+   "role": "commander",
+   "phase": "planning",
+   "task_id": null,
+   "index": 1
+  },
+  "note": "On current main the recorded plan fails at plan validation (OUTPUT_SCHEMA_NESTED_INVALID) instead of failing 11/11 tasks at run time; the one repair it asks for was never produced in production. No worker completion or tool result is recorded: the run's failed tasks left none."
+ }
+}
