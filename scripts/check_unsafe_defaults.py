@@ -46,7 +46,26 @@ EXECUTION_FLAGS = [
     # Test-only adapters must never be switched on outside the isolated
     # E2E stacks.
     "MILO_E2E_INPROCESS_WORKER",
+    # PR-Y: the replay capture keeps provider outputs on a run's checkpoints.
+    # Never committed on; an operator turns it on explicitly for one job.
+    "MILO_CAPTURE_REPLAY",
 ]
+
+# PR-Y: the replay capture must be PINNED OFF by every deploy script, on every
+# surface it deploys, through the shared contract array (or literally). A
+# script that stops pinning it fails this scan.
+REPLAY_CAPTURE_FLAG = "MILO_CAPTURE_REPLAY"
+REPLAY_CAPTURE_PIN_ARRAY = "MILO_REPLAY_CAPTURE_PINNED_OFF"
+REPLAY_CAPTURE_PINS = {
+    # script -> how many surfaces it must pin (each is one reference)
+    "scripts/deploy/deployment-contract.sh": 1,
+    "scripts/deploy/cloud-run.sh": 2,
+    "scripts/deploy/staging-cloud-run.sh": 2,
+    "scripts/deploy/website-execution-activate.sh": 2,
+    "scripts/catalog/government-production-capture.sh": 1,
+    "scripts/release/generate-deployment-plan.sh": 1,
+}
+REPLAY_CAPTURE_KILL_SWITCH = "scripts/deploy/kill-switch.sh"
 
 TEST_ADAPTER_RE = re.compile(r"CLOUD_RUN_AUTH_MODE\s*[:=]\s*['\"]?e2e-test", re.I)
 
@@ -84,6 +103,29 @@ def _is_allowed(rel: str) -> bool:
     return any(rel.startswith(prefix) for prefix in ALLOWED_PREFIXES)
 
 
+def replay_capture_pin_problems(repo: Path = REPO) -> list[str]:
+    """Every deploy script that no longer pins MILO_CAPTURE_REPLAY off."""
+    problems: list[str] = []
+    contract = (repo / "scripts/deploy/deployment-contract.sh").read_text(errors="ignore")
+    block = contract.split(f"{REPLAY_CAPTURE_PIN_ARRAY}=(", 1)[-1].split(")", 1)[0]
+    if f"{REPLAY_CAPTURE_FLAG}=false" not in block or "=true" in block:
+        problems.append("scripts/deploy/deployment-contract.sh: "
+                        f"{REPLAY_CAPTURE_PIN_ARRAY} must pin {REPLAY_CAPTURE_FLAG}=false")
+    for rel, surfaces in REPLAY_CAPTURE_PINS.items():
+        text = (repo / rel).read_text(errors="ignore")
+        found = (text.count(f"${{{REPLAY_CAPTURE_PIN_ARRAY}[@]}}")
+                 + text.count(f"${{{REPLAY_CAPTURE_PIN_ARRAY}[*]}}")
+                 + text.count(f"{REPLAY_CAPTURE_FLAG}=false"))
+        if found < surfaces:
+            problems.append(f"{rel}: {REPLAY_CAPTURE_FLAG} is not pinned off on every "
+                            f"surface ({found} of {surfaces})")
+    kill = (repo / REPLAY_CAPTURE_KILL_SWITCH).read_text(errors="ignore")
+    if kill.count("$MILO_REPLAY_CAPTURE_FLAG_NAME") < 2:
+        problems.append(f"{REPLAY_CAPTURE_KILL_SWITCH}: the kill switch must close "
+                        f"{REPLAY_CAPTURE_FLAG} on the API and the worker")
+    return problems
+
+
 def main() -> int:
     problems: list[str] = []
     for path in REPO.rglob("*"):
@@ -111,6 +153,7 @@ def main() -> int:
                 line = text[: match.start()].count("\n") + 1
                 problems.append(f"{rel}:{line}: execution flag {flag} is enabled by default")
 
+    problems.extend(replay_capture_pin_problems())
     if problems:
         print("unsafe default check FAILED:")
         for problem in problems:
