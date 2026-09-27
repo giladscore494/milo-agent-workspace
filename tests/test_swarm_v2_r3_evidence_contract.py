@@ -1037,7 +1037,8 @@ def test_no_yeda_or_web_tool_is_registered_or_mapped_and_the_sink_is_routed():
     # worker in `tests/test_catalog_execution_flag.py`.
     # Pinned to the snapshot the Government preparation stage resolved after
     # the lease: still exactly one READ tool, still the wrapper, never the reader.
-    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)] "
+    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key, "
+            "handed_rows=handed)] "
             "if government_read_enabled else [])") in " ".join(worker_main.split())
     assert "tool_result_sink=evidence_sink" in worker_main
     assert "RegisteredOperationEvidenceSink(" in worker_main

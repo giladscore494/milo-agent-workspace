@@ -832,11 +832,15 @@ def test_no_operation_can_return_a_complete_raw_resource(repository, landed):
     ambiguous = resolve(repository)
     assert ambiguous["ambiguous"] and "source_record" not in ambiguous
     # A unique resolution quotes exactly the reviewed identity fields of ONE
-    # row -- never the register row itself.
+    # row -- never the register row itself -- plus (PR-Z3) that row's three
+    # registration identifiers, as text.
     unique = resolve(repository, code=one_code(repository))
     record = unique["source_record"]
     assert set(record) <= {"upstream_record_id", "tozar", "kinuy_mishari", "shnat_yitzur",
-                           "degem_nm", "ramat_gimur", "delek_cd", "delek_nm"}
+                           "degem_nm", "ramat_gimur", "delek_cd", "delek_nm",
+                           "tozeret_cd", "degem_cd", "sug_degem"}
+    assert all(isinstance(record[name], str)
+               for name in ("tozeret_cd", "degem_cd", "sug_degem") if name in record)
     assert "koah_sus" not in record and "mishkal_kolel" not in record
 
 

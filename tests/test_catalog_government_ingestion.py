@@ -1225,7 +1225,8 @@ def test_the_projection_is_still_not_a_tool_and_the_registration_is_a_wrapper():
     # stage resolved after the lease, so every read of the run answers from
     # one immutable snapshot; it is still the Tool wrapper, never the reader.
     collapsed = " ".join(worker.split())
-    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)] "
+    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key, "
+            "handed_rows=handed)] "
             "if government_read_enabled else [])") in collapsed
     assert "GovernmentCatalogProjection" not in worker
     assert "GovernmentCatalogQuery" not in worker

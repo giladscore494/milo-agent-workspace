@@ -121,6 +121,37 @@ describe('1. parsing the vehicle view', () => {
   });
 });
 
+describe('1e. PR-Z3: a vehicle may name its exact registration', () => {
+  function withRegistration(registration: unknown): Record<string, unknown> {
+    const payload = replay();
+    (payload.vehicles as Record<string, unknown>[])[0].registration = registration;
+    return payload;
+  }
+
+  it('1e-i. the optional registration parses, and a vehicle without one is unchanged', () => {
+    const result = ok(withRegistration({ tozeret_cd: '413', degem_cd: '758', sug_degem: 'P' }));
+    const [first, second] = result.vehicleResult!.vehicles;
+    expect(first.registration).toEqual({ manufacturerCode: '413', modelCode: '758',
+      vehicleTypeCode: 'P' });
+    expect(second.registration).toBeUndefined();
+    expect(ok(withRegistration({ degem_cd: '839' })).vehicleResult!.vehicles[0].registration)
+      .toEqual({ modelCode: '839' });
+  });
+
+  it('1e-ii. a malformed registration fails closed', () => {
+    for (const bad of [{}, { degem_cd: 758 }, { degem_cd: '758', note: 'x' }, 'x', null,
+      { degem_cd: '' }]) {
+      expect(invalidCode(withRegistration(bad))).toBe('VEHICLES_INVALID');
+    }
+  });
+
+  it('1e-iii. the panel shows it on the vehicle line', () => {
+    renderPanel(withRegistration({ tozeret_cd: '413', degem_cd: '758', sug_degem: 'P' }));
+    const section = screen.getByRole('region', { name: 'Final result' });
+    expect(within(section).getByText(/· reg\. 413\/758\/P$/)).toBeInTheDocument();
+  });
+});
+
 describe('2. the Final result panel', () => {
   it('2a. lists each vehicle with an identity line, verified field count and review badge', () => {
     renderPanel(replay());
