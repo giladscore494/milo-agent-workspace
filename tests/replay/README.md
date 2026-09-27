@@ -61,6 +61,19 @@ written by `tests/replay/reconstruct.py` from the durable facts the repository
 records about the run, with stand-in register rows, and each artifact says so.
 `python tests/replay/reconstruct.py --check` proves none was edited by hand.
 
+A **derived** fixture (`aa63369b-v4`) is a recording with ONE stated change:
+the aa63369b plan text with only `register_meta.evidence.minimum_sources`
+changed from 1 to 0, so the plan passes PR-V's V4 firewall. Its changed
+artifact's provenance says `derived from aa63369b (V4)`; every other artifact
+is aa63369b's, unchanged, and a test reverses the substitution byte for byte.
+The original `aa63369b` is kept as recorded; on the current code its plan is
+refused and the replay stops at the Commander repair production never made.
+
+The reconstructed tool results predate PR-V's `match_mode`; `reconstruct.py`
+confirms each is an `exact` match under the current tool and writes it as the
+run recorded it (without the field). A recording that states `match_mode` is
+cross-checked against it.
+
 ## Sanitization
 
 Every fixture must pass `backend.replay_capture.sanitization_findings`: no

@@ -21,7 +21,7 @@ from backend.replay_capture import (CAPTURED, PROVENANCE_KINDS, RECONSTRUCTED, R
 from replay_harness import (artifact_ids, fixture_dirs, fixture_findings, load_manifest,
                             manifest_problems, provenance_summary, referenced_record_ids)
 
-RUNS = {"6825eb96", "280fc9e5", "c4b8bb54", "aa63369b"}
+RUNS = {"6825eb96", "280fc9e5", "c4b8bb54", "aa63369b", "aa63369b-v4"}
 
 
 def _clean() -> dict:

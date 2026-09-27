@@ -130,9 +130,13 @@ def test_a_batch_without_placeholders_is_unchanged_and_reads_nothing_more(monkey
     rows = [row for row in register_rows() if row["_id"] != 37363]
     repository, run = seeded_batch(rows)
 
-    def no_query(*_args, **_kwargs):
+    # PR-V: preparation now reads each distinct identity once, through one
+    # bounded page, to annotate duplicate identities. The PLACEHOLDER rule
+    # still reads nothing more: without a placeholder there is no
+    # `resolve_variant` read at all.
+    def no_resolve(*_args, **_kwargs):
         raise AssertionError("no placeholder, so no extra read")
-    monkeypatch.setattr(prep, "GovernmentCatalogQuery", no_query)
+    monkeypatch.setattr(prep.GovernmentCatalogQuery, "resolve_variant", no_resolve)
     preparation = prepare_government_work(repository, run_id=run)
     assert len(preparation.queue) == 4
     assert preparation.excluded == () and preparation.excluded_placeholder == 0

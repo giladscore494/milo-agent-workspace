@@ -80,6 +80,33 @@ IDENTITY_RECORD_FIELDS: tuple[str, ...] = tuple(IDENTITY_RECORD_FIELD_TYPES)
 #: into a bulk listing.
 MAX_RESOLUTION_MATCHES = 20
 
+#: PR-V: how `resolve_variant` matched the official model code. `exact` is the
+#: register's own spelling; `separator_insensitive` is the ONE retry taken
+#: only when the exact spelling matched nothing (see `separator_key`).
+MATCH_EXACT = "exact"
+MATCH_SEPARATOR_INSENSITIVE = "separator_insensitive"
+MATCH_MODES = (MATCH_EXACT, MATCH_SEPARATOR_INSENSITIVE)
+
+#: The most candidate rows the separator-insensitive retry reads to find its
+#: matches: ONE bounded page of the model-year's rows with the code filter
+#: dropped. A model year stating more rows than this is not scanned at all --
+#: the answer stays the exact one (no match), never a partial guess.
+MAX_SEPARATOR_SCAN_ROWS = 200
+
+
+def separator_key(code: str | None) -> str | None:
+    """An official model code with "-" vs " " and repeated spaces ignored.
+
+    A COMPARISON key only, never stored and never shown: the register writes
+    the same code both ways across rows (`TZNA55L-GKZSZA` and `TZNA55L GKZSZA`
+    are two different register rows), and the key is what lets a request in
+    one spelling find a row stored in the other. Case and every other
+    character are kept exactly.
+    """
+    if not isinstance(code, str):
+        return None
+    return " ".join(code.replace("-", " ").split()) or None
+
 
 @dataclass(frozen=True)
 class ManufacturerCoverage:
@@ -171,6 +198,9 @@ class VariantResolutionResult:
     match_count: int
     provenance: DatasetProvenance
     identity_projection: Mapping[str, Any] = field(default_factory=dict)
+    #: PR-V: `exact`, or `separator_insensitive` when the exact code matched
+    #: nothing and the one separator-insensitive retry answered instead.
+    match_mode: str = MATCH_EXACT
 
     @property
     def variant(self) -> CandidateVariantRow | None:
@@ -375,15 +405,55 @@ class GovernmentCatalogQuery:
                                   official_model_code=official_model_code,
                                   identity_dimensions=identity_dimensions,
                                   limit=MAX_RESOLUTION_MATCHES, offset=0)
-        matches = tuple(page.items)
-        if page.total != 1 or not matches:
-            return VariantResolutionResult(matches=matches, match_count=page.total,
-                                           provenance=page.provenance)
+        matches, total, mode = tuple(page.items), page.total, MATCH_EXACT
+        if total == 0 and official_model_code is not None:
+            # PR-V: ONLY when the exact spelling matched nothing. An exact
+            # answer -- unique or ambiguous -- is never widened by this.
+            retried = self._separator_insensitive(
+                str(manufacturer), str(commercial_model), int(model_year), trim=trim,
+                official_model_code=str(official_model_code),
+                identity_dimensions=identity_dimensions)
+            if retried is not None:
+                matches, total, mode = retried[0], retried[1], MATCH_SEPARATOR_INSENSITIVE
+        if total != 1 or not matches:
+            return VariantResolutionResult(matches=matches, match_count=total,
+                                           provenance=page.provenance, match_mode=mode)
         record = self._raw_record(matches[0].upstream_record_id)
         payload = record.get("payload") if isinstance(record, Mapping) else None
         return VariantResolutionResult(
             matches=matches, match_count=1, provenance=page.provenance,
-            identity_projection=identity_projection(payload if isinstance(payload, Mapping) else {}))
+            identity_projection=identity_projection(payload if isinstance(payload, Mapping) else {}),
+            match_mode=mode)
+
+    def _separator_insensitive(self, manufacturer: str, commercial_model: str,
+                               model_year: int, *, trim: str | None,
+                               official_model_code: str,
+                               identity_dimensions: Mapping[str, str] | None
+                               ) -> tuple[tuple[CandidateVariantRow, ...], int] | None:
+        """The ONE retry: the same stated filters, the code compared by `separator_key`.
+
+        One bounded page of the model year's rows with the code filter dropped
+        (everything else still filtered in the database), compared here by the
+        separator-insensitive key. None -- "no retry answer" -- when the code
+        has no key, when no row's code shares it, or when the model year states
+        more rows than one bounded page holds: a partial scan could miss a
+        match and must not be read as "the only match".
+        """
+        wanted = separator_key(official_model_code)
+        if wanted is None:
+            return None
+        page = self.list_variants(manufacturer=manufacturer, commercial_model=commercial_model,
+                                  model_year=model_year, trim=trim,
+                                  identity_dimensions=identity_dimensions,
+                                  limit=MAX_SEPARATOR_SCAN_ROWS, offset=0)
+        if page.has_more:
+            return None
+        found = tuple(item for item in page.items
+                      if item.official_model_code is not None
+                      and separator_key(item.official_model_code) == wanted)
+        if not found:
+            return None
+        return found[:MAX_RESOLUTION_MATCHES], len(found)
 
     # --- helpers -------------------------------------------------------------
 
@@ -473,8 +543,9 @@ def _whole(value: Any) -> int | None:
 
 
 __all__ = ["IDENTITY_RECORD_FIELDS", "IDENTITY_RECORD_FIELD_TYPES",
-           "MAX_RESOLUTION_MATCHES", "CandidateVariantRow",
+           "MATCH_EXACT", "MATCH_MODES", "MATCH_SEPARATOR_INSENSITIVE",
+           "MAX_RESOLUTION_MATCHES", "MAX_SEPARATOR_SCAN_ROWS", "CandidateVariantRow",
            "GovernmentCatalogQuery", "ManufacturerCoverage", "ModelCoverage", "QueryPage",
            "TOTAL_COUNT_FIELD", "VariantResolutionResult", "bounded_limit",
            "bounded_offset", "is_count_row",
-           "identity_projection"]
+           "identity_projection", "separator_key"]

@@ -190,7 +190,11 @@ OPERATIONS: dict[str, ToolOperation] = {
                 ("manufacturer", "commercial_model", "model_year")),
         _object({"resolved": _BOOL, "ambiguous": _BOOL, "match_count": _INT,
                  "variants": _array(_VARIANT, MAX_RESOLUTION_MATCHES),
-                 "source_record": _IDENTITY_RECORD, "provenance": _PROVENANCE},
+                 "source_record": _IDENTITY_RECORD, "provenance": _PROVENANCE,
+                 # PR-V: "exact" | "separator_insensitive". Optional in the
+                 # schema so a result recorded before it existed stays valid;
+                 # this tool always states it.
+                 "match_mode": _STR},
                 ("resolved", "ambiguous", "match_count", "variants", "provenance"))),
     "search_codes": ToolOperation(
         "search_codes",
@@ -379,7 +383,10 @@ class GovernmentVehicleTool:
                   "ambiguous": resolution.ambiguous,
                   "match_count": resolution.match_count,
                   "variants": [_variant_payload(item) for item in resolution.matches],
-                  "provenance": _provenance_payload(resolution.provenance)}
+                  "provenance": _provenance_payload(resolution.provenance),
+                  # PR-V: how the official model code matched. Every value
+                  # above stays exactly as the register stores it.
+                  "match_mode": resolution.match_mode}
         if resolution.variant is not None and resolution.identity_projection:
             # The identity projection of exactly ONE row, and only for a unique
             # resolution. This is the material the trusted evidence mapper

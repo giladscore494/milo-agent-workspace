@@ -117,6 +117,12 @@ PLACEHOLDER_IDENTITY = re.compile(r"^([0-9])\1{2,}$")
 #: The static reason an excluded batch item is recorded under.
 EXCLUDED_PLACEHOLDER_SOURCE_RECORD = "EXCLUDED_PLACEHOLDER_SOURCE_RECORD"
 
+#: PR-V: the most register rows ONE duplicate-identity read looks at. The read
+#: is the same bounded, per-item database page `resolve_variant` answers from;
+#: an identity whose stated filters match more rows than one page holds is left
+#: unannotated rather than annotated from a partial read.
+MAX_DUPLICATE_SCAN_ROWS = 200
+
 #: Per-item progress states, all DERIVED from durable state.
 PROGRESS_PENDING = "pending"        # no durable trace of work on this item yet
 PROGRESS_EVIDENCED = "evidenced"    # this run holds verified evidence for it
@@ -177,9 +183,15 @@ class GovernmentWorkItem:
     model_year_end: int | None
     official_model_code: str | None
     trim: str | None
+    #: PR-V: the register rows (`upstream_record_id`, sorted) of EVERY
+    #: candidate in the pinned snapshot that states exactly this identity --
+    #: manufacturer, commercial model, model year, official model code, trim
+    #: and identity dimensions -- this item's own row included. Empty when the
+    #: identity is unique. Such a group can only ever resolve as ambiguous.
+    duplicate_identity_record_ids: tuple[str, ...] = ()
 
     def as_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "candidate_key": self.candidate_key,
             "candidate_id": self.candidate_id,
             "manufacturer": self.manufacturer,
@@ -189,6 +201,10 @@ class GovernmentWorkItem:
             "official_model_code": self.official_model_code,
             "trim": self.trim,
         }
+        if self.duplicate_identity_record_ids:
+            # Only when there is one: a unique item's record is unchanged.
+            record["duplicate_identity_record_ids"] = list(self.duplicate_identity_record_ids)
+        return record
 
     @classmethod
     def from_record(cls, record: Any) -> "GovernmentWorkItem":
@@ -203,6 +219,10 @@ class GovernmentWorkItem:
             raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID") from None
         if not key or not candidate_id or not manufacturer or not model:
             raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+        duplicates = record.get("duplicate_identity_record_ids") or ()
+        if not isinstance(duplicates, Sequence) or isinstance(duplicates, (str, bytes)) \
+                or any(not isinstance(item, str) or not item for item in duplicates):
+            raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
         return cls(
             candidate_key=key, candidate_id=candidate_id, manufacturer=manufacturer,
             commercial_model=model,
@@ -210,6 +230,7 @@ class GovernmentWorkItem:
             model_year_end=_optional_int(record.get("model_year_end")),
             official_model_code=_optional_text(record.get("official_model_code")),
             trim=_optional_text(record.get("trim")),
+            duplicate_identity_record_ids=tuple(sorted(duplicates)),
         )
 
 
@@ -277,7 +298,7 @@ class GovernmentPreparation:
             record = item.as_record()
             record["progress"] = progress.get(item.candidate_key, PROGRESS_PENDING)
             items.append(record)
-        return {
+        context = {
             "source": "israel_ministry_of_transport_vehicle_register",
             "snapshot_key": self.snapshot_key,
             "resource_id": self.resource_id,
@@ -287,6 +308,19 @@ class GovernmentPreparation:
             "bounded": bool(self.bounded),
             "remaining": sum(1 for item in items if item["progress"] == PROGRESS_PENDING),
         }
+        if any(item.duplicate_identity_record_ids for item in self.queue):
+            # PR-V: the ONE rule the annotation comes with, stated only when
+            # the queue actually holds a duplicate group.
+            context["duplicate_identity_rule"] = DUPLICATE_IDENTITY_RULE
+        return context
+
+
+#: PR-V: the Commander rule a duplicate-identity annotation travels with.
+DUPLICATE_IDENTITY_RULE = (
+    "Items that carry the same duplicate_identity_record_ids are ONE duplicate identity group: "
+    "the register states that identity on several rows. Resolve the whole group with ONE "
+    "resolve_variant call (one task), never one call per item; its ambiguous answer is a valid "
+    "outcome for the group, not a failure.")
 
 
 def prepared_artifact(checkpoint: Any) -> dict[str, Any] | None:
@@ -426,10 +460,18 @@ def is_placeholder_identity(commercial_model: Any, official_model_code: Any) -> 
                for value in (commercial_model, official_model_code))
 
 
+def _pinned_query(repository: Any, snapshot_key: str,
+                  cancellation_checker: Callable[[], bool] | None) -> GovernmentCatalogQuery:
+    """The ONE bounded reader of the pinned snapshot a preparation uses."""
+    return GovernmentCatalogQuery(repository, resource_id=src.WLTP_RESOURCE_ID,
+                                  snapshot_key=snapshot_key, allow_incomplete=False,
+                                  cancellation_checker=cancellation_checker)
+
+
 def _placeholder_record_ids(repository: Any, snapshot_key: str,
                             items: Sequence[GovernmentWorkItem],
-                            cancellation_checker: Callable[[], bool] | None = None
-                            ) -> list[str]:
+                            cancellation_checker: Callable[[], bool] | None = None,
+                            query: GovernmentCatalogQuery | None = None) -> list[str]:
     """The register's own `_id` of each placeholder item, read from the pinned snapshot.
 
     A batch item carries the candidate identity but not the upstream record id,
@@ -440,9 +482,7 @@ def _placeholder_record_ids(repository: Any, snapshot_key: str,
     projection: a real register snapshot is larger than it will hold. An item
     whose candidate id is not exactly one row there is an inconsistent batch.
     """
-    query = GovernmentCatalogQuery(repository, resource_id=src.WLTP_RESOURCE_ID,
-                                   snapshot_key=snapshot_key, allow_incomplete=False,
-                                   cancellation_checker=cancellation_checker)
+    query = query or _pinned_query(repository, snapshot_key, cancellation_checker)
     found: list[str] = []
     try:
         for item in items:
@@ -462,6 +502,59 @@ def _placeholder_record_ids(repository: Any, snapshot_key: str,
         raise GovernmentPreparationError("GOVERNMENT_SNAPSHOT_UNAVAILABLE",
                                          reason_code=refusal.reason_code) from None
     return found
+
+
+def _annotate_duplicate_identities(repository: Any, snapshot_key: str,
+                                   queue: Sequence[GovernmentWorkItem],
+                                   cancellation_checker: Callable[[], bool] | None = None,
+                                   query: GovernmentCatalogQuery | None = None
+                                   ) -> list[GovernmentWorkItem]:
+    """PR-V: mark every queue item whose exact identity other register rows share.
+
+    Bounded reads only -- never the whole-snapshot projection (plan item O16).
+    For each DISTINCT stated identity: ONE `catalog_candidate_variant_page`
+    page (the read `resolve_variant` answers from) filtered by manufacturer,
+    commercial model, model year, code and trim; the item's own row there
+    supplies its identity dimensions, and every row stating the same model
+    years, code, trim and dimensions is in its group. An identity whose filters
+    match more rows than one page holds is left unannotated. An unreadable
+    snapshot refuses preparation exactly as the placeholder read does.
+    """
+    query = query or _pinned_query(repository, snapshot_key, cancellation_checker)
+    pages: dict[tuple[Any, ...], Any] = {}
+    annotated: list[GovernmentWorkItem] = []
+    try:
+        for item in queue:
+            if item.model_year_start is None:
+                annotated.append(item)
+                continue
+            filters = (item.manufacturer, item.commercial_model, item.model_year_start,
+                       item.official_model_code, item.trim)
+            if filters not in pages:
+                pages[filters] = query.list_variants(
+                    manufacturer=item.manufacturer, commercial_model=item.commercial_model,
+                    model_year=item.model_year_start,
+                    official_model_code=item.official_model_code, trim=item.trim,
+                    limit=MAX_DUPLICATE_SCAN_ROWS, offset=0)
+            page = pages[filters]
+            own = next((row for row in page.items if row.candidate_id == item.candidate_id),
+                       None)
+            if page.has_more or own is None:
+                annotated.append(item)
+                continue
+            group = sorted(
+                {row.upstream_record_id for row in page.items
+                 if (row.model_year_start, row.model_year_end, row.official_model_code,
+                     row.trim, dict(row.identity_dimensions)) ==
+                    (own.model_year_start, own.model_year_end, own.official_model_code,
+                     own.trim, dict(own.identity_dimensions))})
+            annotated.append(item if len(group) < 2 else GovernmentWorkItem(
+                **{**item.__dict__, "duplicate_identity_record_ids": tuple(group)}))
+    except GovernmentProjectionError as refusal:
+        raise GovernmentPreparationError("GOVERNMENT_SNAPSHOT_UNAVAILABLE",
+                                         reason_code=refusal.reason_code) from None
+    _check_cancelled(cancellation_checker)
+    return annotated
 
 
 def _from_batch(repository: Any, bound: Mapping[str, Any],
@@ -499,16 +592,20 @@ def _from_batch(repository: Any, bound: Mapping[str, Any],
     placeholders = [item for item in queue
                     if is_placeholder_identity(item.commercial_model, item.official_model_code)]
     excluded: tuple[tuple[str, str], ...] = ()
+    # ONE bounded reader of the pinned snapshot for both per-item reads below.
+    query = _pinned_query(repository, snapshot_key, cancellation_checker)
     if placeholders:
         excluded = tuple(sorted(
             (record_id, EXCLUDED_PLACEHOLDER_SOURCE_RECORD)
             for record_id in _placeholder_record_ids(repository, snapshot_key, placeholders,
-                                                     cancellation_checker)))
+                                                     cancellation_checker, query=query)))
         _check_cancelled(cancellation_checker)
         skipped = {item.candidate_key for item in placeholders}
         queue = [item for item in queue if item.candidate_key not in skipped]
         if not queue:
             raise GovernmentPreparationError("GOVERNMENT_BATCH_ONLY_PLACEHOLDERS")
+    queue = _annotate_duplicate_identities(repository, snapshot_key, queue,
+                                           cancellation_checker, query=query)
     return GovernmentPreparation(
         snapshot_key=snapshot_key, snapshot_id=str(snapshot["id"]),
         resource_id=src.WLTP_RESOURCE_ID,
@@ -617,6 +714,7 @@ def _optional_text(value: Any) -> str | None:
 
 __all__ = [
     "ARTIFACT_KEY", "ARTIFACT_SCHEMA", "BATCH_ARTIFACT_KEY", "BATCH_IDENTITY_FIELDS",
+    "DUPLICATE_IDENTITY_RULE", "MAX_DUPLICATE_SCAN_ROWS",
     "GOVERNMENT_WORK_QUEUE_LIMIT", "PREPARATION_PHASE",
     "PREPARATION_REASONS", "PROGRESS_EVIDENCED", "PROGRESS_PENDING", "PROGRESS_PROMOTED",
     "PROGRESS_STATES", "QUEUED_CANDIDATE_STATUS", "GovernmentPreparation",

@@ -32,6 +32,9 @@ VALIDATION_REASONS = frozenset({
     "DEPENDENCY_CYCLE",
     "ASSIGNMENT_CONTEXT_INCOMPLETE",
     "EVIDENCE_COMPLETION_MISMATCH",
+    # PR-V: a task whose every planned call is to an operation that can never
+    # produce evidence declared evidence requirements (run aa63369b).
+    "EVIDENCE_REQUIRES_EVIDENCE_TOOL",
     "REQUIRED_OUTPUT_NOT_IN_SCHEMA",
     "OUTPUT_SCHEMA_NESTED_INVALID",
     "TOOL_NOT_ALLOWLISTED",
@@ -191,6 +194,7 @@ PROVIDER_PLAN_RULES = (
     "Every task must have exactly one entry in assignments.",
     "Each assignment's context_task_ids must contain the COMPLETE direct and transitive dependency closure of its task.",
     "If a task declares evidence.minimum_sources > 0 or any evidence.required_fields, its completion.evidence_satisfied must be true; completion criteria can never disable evidence requirements.",
+    "Only an operation the tool catalog marks \"produces_evidence\": true can produce evidence. A task whose every planned call is to an operation marked \"produces_evidence\": false (for example a listing such as get_variants) must declare evidence.minimum_sources 0 and no evidence.required_fields; put the evidence requirement on a task that calls an evidence-producing operation (resolve_variant).",
     "Every output_schema must be a JSON object schema with properties, a non-empty required list of existing properties, and additionalProperties=false.",
     "Every output_schema property must be a scalar (string/integer/number/boolean) or an array of scalars with \"items\". Supported keywords: type, properties, required, additionalProperties, items, description (a string), enum (on a string/integer/number/boolean property: a non-empty list of unique values of that type), minimum/maximum (integer/number), minLength/maxLength (string) and minItems/maxItems (array); enum and the bounds are enforced at run time and every lower bound must not exceed its upper bound. Unsupported annotation keywords (title, default, examples, format, pattern, $schema, $id, $comment, readOnly, writeOnly, deprecated) are removed; any other keyword (oneOf, anyOf, allOf, not, $ref, const, patternProperties, uniqueItems, ...) is rejected. Do not copy raw tool material (variants, provenance) into task output: evidence comes from the tool, not from the worker output.",
     "Every name in a task's completion.required_outputs must appear both in that task's output_schema.required and in its output_schema.properties; completion may only require outputs the task's own output_schema requires.",
@@ -397,6 +401,7 @@ class PlanValidator:
                                      reason="TASK_TOOL_CALL_LIMIT")
             total_tool_calls += len(task.tools)
             self._validate_tool_calls(task)
+            self._validate_evidence_tool(task)
         if total_tool_calls > limits.max_tool_calls:
             raise PlanLimitError("aggregate tool call limit exceeded",
                                  reason="AGGREGATE_TOOL_CALL_LIMIT")
@@ -456,6 +461,29 @@ class PlanValidator:
                     f"tool operation is not registered: {call.name}.{call.operation}",
                     reason="TOOL_OPERATION_UNKNOWN")
             self._validate_call_arguments(task, call, operation.input_schema)
+
+    def _validate_evidence_tool(self, task: DynamicTask) -> None:
+        """PR-V: evidence can only be required of a task that can produce it.
+
+        Run aa63369b planned `register_meta` -- one `get_variants` call -- with
+        evidence.minimum_sources 1. Only `resolve_variant` becomes evidence, so
+        the task was paid for and then reported EVIDENCE_REQUIREMENTS_UNMET.
+        Decided from the descriptors' `produces_evidence`, which only a tool
+        the authoritative evidence allowlist governs states: a task with no
+        planned call, or with any call whose operation states nothing, is left
+        as it was.
+        """
+        if not (task.evidence.minimum_sources > 0 or task.evidence.required_fields) \
+                or not task.tools:
+            return
+        flags = []
+        for call in task.tools:
+            operation = self._tools[call.name].operation(call.operation)
+            flags.append(operation.produces_evidence if operation is not None else None)
+        if all(flag is False for flag in flags):
+            raise PlanValidationError(
+                "evidence requirements need an evidence-producing tool operation",
+                reason="EVIDENCE_REQUIRES_EVIDENCE_TOOL")
 
     def _validate_call_arguments(self, task: DynamicTask, call: PlannedToolCall,
                                  input_schema: Any) -> None:

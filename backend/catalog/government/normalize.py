@@ -121,6 +121,10 @@ GOVERNMENT_NORMALIZATION_REASONS: Mapping[str, str] = {
     "GOV_NORM_IDENTITY_TOO_LONG": "a register row states an identity beyond the durable bound",
     "GOV_NORM_LABEL_CONTRADICTION":
         "a register row pairs a known code with a label that code is not paired with",
+    # PR-V: no longer raised -- an inconsistent fuel/propulsion pair is now an
+    # UNRESOLVED reading (see `read_wltp_record`). Kept in the closed
+    # vocabulary because snapshot summaries stored before PR-V may name it
+    # and `parse_normalization_state` must still read them.
     "GOV_NORM_FUEL_PROPULSION_CONTRADICTION":
         "a register row states a fuel and a propulsion technology that cannot both hold",
 }
@@ -278,12 +282,19 @@ def read_wltp_record(record: Mapping[str, Any], *,
         else:
             dimensions["body_style"] = body_style
 
-    # Fuel and propulsion are two independent statements; both resolved and
-    # incompatible is a contradiction in the ROW, not an unread dimension.
+    # Fuel and propulsion are two independent statements. When each code
+    # matches its own label but the two decoded values cannot both hold, the
+    # row has not stated ONE coherent propulsion: neither value is settled.
+    # PR-V: both dimensions are dropped from the reading and marked
+    # unresolved, so the row is an `ambiguous` candidate -- never a refusal,
+    # which would make the whole snapshot INCOMPLETE. Nothing is guessed and
+    # nothing in the source changes; a code/label mismatch is still refused
+    # above (GOV_NORM_LABEL_CONTRADICTION).
     fuel, propulsion = dimensions.get("fuel_type"), dimensions.get("propulsion_technology")
     if fuel is not None and propulsion is not None \
             and (fuel, propulsion) not in vocab.CONSISTENT_FUEL_PROPULSION:
-        raise GovernmentNormalizationError("GOV_NORM_FUEL_PROPULSION_CONTRADICTION")
+        del dimensions["fuel_type"], dimensions["propulsion_technology"]
+        unresolved.extend(("fuel_type", "propulsion_technology"))
 
     displacement = _whole(record.get("nefah_manoa"))
     return RecordReading(

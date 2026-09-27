@@ -923,11 +923,20 @@ def test_an_uncoded_propulsion_name_is_read_only_from_the_closed_table():
     assert "propulsion_technology" in unknown.unresolved_dimensions
 
 
-def test_a_fuel_and_propulsion_that_cannot_both_hold_is_a_refusal():
+def test_a_fuel_and_propulsion_that_cannot_both_hold_is_unresolved_not_refused():
+    """PR-V: an inconsistent pair (each code matching its own label) settles
+    neither dimension -- the row is an ambiguous candidate, not a refusal."""
+    reading = read_wltp_record(wltp_record(delek_cd=1, delek_nm="בנזין",
+                                           technologiat_hanaa_cd=2,
+                                           technologiat_hanaa_nm="PLUG IN"))
+    assert reading.status == "ambiguous"
+    assert {"fuel_type", "propulsion_technology"} <= set(reading.unresolved_dimensions)
+    assert "fuel_type" not in reading.identity_dimensions
+    assert "propulsion_technology" not in reading.identity_dimensions
+    # A code paired with the WRONG label is still a refusal.
     with pytest.raises(GovernmentNormalizationError) as failure:
-        read_wltp_record(wltp_record(delek_cd=1, delek_nm="בנזין",
-                                     technologiat_hanaa_cd=2, technologiat_hanaa_nm="PLUG IN"))
-    assert failure.value.reason_code == "GOV_NORM_FUEL_PROPULSION_CONTRADICTION"
+        read_wltp_record(wltp_record(delek_cd=1, delek_nm="PLUG IN"))
+    assert failure.value.reason_code == "GOV_NORM_LABEL_CONTRADICTION"
 
 
 def test_koah_sus_is_never_read_as_horsepower():
