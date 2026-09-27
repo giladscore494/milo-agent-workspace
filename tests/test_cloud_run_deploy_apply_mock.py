@@ -73,6 +73,9 @@ EXECUTION_FLAGS = (
     # Mapping Plan preparation (capture job only): pinned false on both
     # product surfaces like every other Stage A execution flag.
     "MILO_ENABLE_WORK_SCOPE_PREPARATION",
+    # E': the website's Prepare route (API only): pinned false on both product
+    # surfaces like every other Stage A execution flag.
+    "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS",
 )
 
 MOCK_GCLOUD = r"""#!/usr/bin/env bash

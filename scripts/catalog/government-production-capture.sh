@@ -230,6 +230,25 @@ ensure_job() {
     --max-retries 0 \
     --task-timeout "$TASK_TIMEOUT" \
     --tasks 1
+  grant_api_run_with_overrides
+}
+
+# E': the API's Prepare route executes THIS job (the same invocation this
+# script's --prepare-work-scope uses, backend/capture_invocation.py). Its
+# identity gets exactly one right, on exactly this job: run it with overrides.
+# No key, no project-level role. Idempotent: adding a binding that exists is a
+# no-op. Skipped (said, not silent) when the configuration names no API
+# identity; the website then cannot prepare, which fails closed.
+grant_api_run_with_overrides() {
+  local api_sa
+  api_sa="$(milo_op API_SERVICE_ACCOUNT)"
+  if [[ -z "$api_sa" ]]; then
+    printf 'NOTE: no API_SERVICE_ACCOUNT configured; the website cannot execute %s.\n' "$CAPTURE_JOB"
+    return 0
+  fi
+  gcloud run jobs add-iam-policy-binding "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
+    --member "serviceAccount:${api_sa}" --role roles/run.jobsExecutorWithOverrides > /dev/null
+  printf 'API identity may run %s with overrides: %s\n' "$CAPTURE_JOB" "$api_sa"
 }
 
 # A Cloud Run execution name: lowercase letters, digits and hyphens, starting
@@ -538,19 +557,21 @@ SQL
 
 [[ -n "$IDEMPOTENCY_KEY" ]] || IDEMPOTENCY_KEY="$(milo_op CAPTURE_IDEMPOTENCY_KEY)"
 PREPARE_ARGS="--prepare,--acknowledge-schema-report-reviewed,${MILO_CAPTURE_SCHEMA_ACK},--project-ref,${PROJECT_REF},--conversation-id,$(milo_op CAPTURE_CONVERSATION_ID),--requested-by,$(milo_op CAPTURE_REQUESTED_BY),--idempotency-key,${IDEMPOTENCY_KEY}"
+# The capture's arguments and the scoped mode's arguments + override come from
+# ONE definition, backend/capture_invocation.py, which the API's Prepare route
+# uses too (tests/test_work_scope_prepare.py holds the two byte for byte). It is
+# run as a plain file: standard library only, no package import. Its values are
+# shape-checked there -- which also keeps them comma-free, because gcloud
+# splits --args on commas.
+CAPTURE_INVOCATION="${REPO_ROOT}/backend/capture_invocation.py"
 capture_args() {
-  printf -- '--execute,--acknowledge-live-government-egress,%s,--acknowledge-schema-report-reviewed,%s,--project-ref,%s,--run-id,%s,--package-id,%s,--resource-id,%s,--page-limit,%s,--max-pages,%s,--max-records,%s' \
-    "$MILO_CAPTURE_EGRESS_ACK" "$MILO_CAPTURE_SCHEMA_ACK" "$PROJECT_REF" "$1" \
-    "$MILO_CAPTURE_PACKAGE_ID" "$MILO_CAPTURE_RESOURCE_ID" \
-    "$MILO_CAPTURE_PAGE_LIMIT" "$MILO_CAPTURE_MAX_PAGES" "$MILO_CAPTURE_MAX_RECORDS"
+  python3 "$CAPTURE_INVOCATION" capture-args --project-ref "$PROJECT_REF" --run-id "$1"
 }
 
-# The scoped mode's arguments: the capture's own, plus the plan. Validated to
-# the entrypoint's exact shapes first -- which also keeps them comma-free,
-# because gcloud splits --args on commas.
-work_scope_args() {
-  printf -- '%s,--work-scope-id,%s,--work-scope-revision,%s,--work-scope-digest,%s' \
-    "$(capture_args "$1")" "$WORK_SCOPE_ID" "$WORK_SCOPE_REVISION" "$WORK_SCOPE_DIGEST"
+work_scope_invocation() {
+  python3 "$CAPTURE_INVOCATION" "$1" --project-ref "$PROJECT_REF" --run-id "$2" \
+    --work-scope-id "$WORK_SCOPE_ID" --work-scope-revision "$WORK_SCOPE_REVISION" \
+    --work-scope-digest "$WORK_SCOPE_DIGEST"
 }
 
 do_prepare_work_scope() {
@@ -564,9 +585,16 @@ do_prepare_work_scope() {
   [[ -n "$WORK_SCOPE_PREPARATION_VALUE" ]] \
     || fail "--enable-work-scope-preparation is required for --prepare-work-scope. The job keeps the scoped-preparation switch pinned off; this execution alone turns it on." 2
   printf '\n== prepare work scope ==\n'
-  local execution document status
-  execution="$(execute_job "$(work_scope_args "$RUN_ID")" \
-    --update-env-vars "${MILO_WORK_SCOPE_PREPARATION_FLAG_NAME}=${WORK_SCOPE_PREPARATION_VALUE}")"
+  local execution document status ws_args ws_env
+  ws_args="$(work_scope_invocation work-scope-args "$RUN_ID")" \
+    || fail "the scoped capture arguments could not be built (above)" 2
+  ws_env="$(work_scope_invocation work-scope-env "$RUN_ID")" \
+    || fail "the scoped capture override could not be built (above)" 2
+  # The ONE override is the shared definition's, and it must name exactly the
+  # switch this script's contract names: anything else is refused, not run.
+  [[ "$ws_env" == "${MILO_WORK_SCOPE_PREPARATION_FLAG_NAME}=${WORK_SCOPE_PREPARATION_VALUE}" ]] \
+    || fail "the shared capture definition's override is not the scoped-preparation switch" 2
+  execution="$(execute_job "$ws_args" --update-env-vars "$ws_env")"
   printf 'Execution: %s\n' "$execution"
   document="$(execution_document "$execution")"
   status="$(printf '%s' "$document" | json_field status || true)"
@@ -639,8 +667,9 @@ do_prepare() {
 do_capture() {
   [[ -n "$RUN_ID" ]] || fail "--capture requires --run-id (or use --all)" 2
   printf '\n== capture ==\n'
-  local execution document status
-  execution="$(execute_job "$(capture_args "$RUN_ID")")"
+  local execution document status args
+  args="$(capture_args "$RUN_ID")" || fail "the capture arguments could not be built (above)" 2
+  execution="$(execute_job "$args")"
   printf 'Execution: %s\n' "$execution"
   document="$(execution_document "$execution")"
   status="$(printf '%s' "$document" | json_field status || true)"

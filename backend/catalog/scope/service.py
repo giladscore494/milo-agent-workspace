@@ -115,7 +115,8 @@ def _not_found() -> AppError:
 # Reads.
 # ---------------------------------------------------------------------------
 
-def capabilities(repo: Any, user_id: UUID, project_id: UUID) -> dict[str, Any]:
+def capabilities(repo: Any, user_id: UUID, project_id: UUID, *,
+                 can_prepare: bool = False) -> dict[str, Any]:
     """What the Mapping Plan may do for this project, from server-owned truth.
 
     `available` is the one answer the browser needs to decide whether to show
@@ -123,8 +124,11 @@ def capabilities(repo: Any, user_id: UUID, project_id: UUID) -> dict[str, Any]:
     browser that renders a batch-size choice renders exactly the server's
     bound.
 
-    `can_prepare` is always false here: a plan is prepared only by the operator
-    capture job, never from the API. `can_start_batches` says whether THIS
+    `can_prepare` (E') says whether THIS server can prepare a revision from the
+    website at all -- `MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS` on and a
+    capture job configured (`web_preparation.server_can_prepare`); whether a
+    given revision may be prepared is the preparation status read's answer,
+    and the database's again at the claim. `can_start_batches` says whether THIS
     server lets a member start a batch at all (`MILO_ENABLE_WORK_SCOPE_BATCHES`
     and `MILO_ENABLE_RUN_CREATION`); whether a given batch may start is the
     progress read's answer, and the database's again at the start itself.
@@ -154,7 +158,7 @@ def capabilities(repo: Any, user_id: UUID, project_id: UUID) -> dict[str, Any]:
             "max_model_year": wsc.MAX_MODEL_YEAR,
             "max_instruction_chars": wi.MAX_INSTRUCTION_CHARS,
         },
-        "can_prepare": False,
+        "can_prepare": bool(can_prepare and supported),
         "can_start_batches": supported and batches,
         # Whether the ordinary composer may create a run here, and if not,
         # why. The API refuses the same request again at creation.

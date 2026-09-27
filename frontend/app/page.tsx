@@ -41,6 +41,7 @@ import {
   WorkScopeDraft,
   WorkScopeEdit,
   WorkScopeNote,
+  WorkScopePreparation,
   WorkScopeProgress,
   WorkScopeState,
   draftEdit,
@@ -51,6 +52,7 @@ import {
   parseDirectory,
   parseOpenWorkScope,
   parsePauseResult,
+  parsePreparation,
   parseProgress,
   parseWorkScopeMutation,
 } from '@/lib/workScope';
@@ -234,6 +236,12 @@ export default function WorkspacePage() {
   const [planProgressError, setPlanProgressError] = useState('');
   const [batchBusy, setBatchBusy] = useState<PendingRequest>();
   const [confirmingBatch, setConfirmingBatch] = useState(false);
+  // E': the head revision's preparation, as the SERVER derives it from durable
+  // state. Polled while it reads `preparing`; the browser infers nothing.
+  const [planPreparation, setPlanPreparation] = useState<WorkScopePreparation>();
+  const [planPreparationLoading, setPlanPreparationLoading] = useState(false);
+  const [planPreparationError, setPlanPreparationError] = useState('');
+  const [preparationBusy, setPreparationBusy] = useState<PendingRequest>();
   // One key per confirmed start of ONE batch. A retry of the same start (a
   // lost answer, a failed launch) reuses it, so the server answers with the
   // run it already created instead of refusing or duplicating it.
@@ -672,6 +680,10 @@ export default function WorkspacePage() {
     setPlanProgressLoading(false);
     setBatchBusy(undefined);
     setConfirmingBatch(false);
+    setPlanPreparation(undefined);
+    setPlanPreparationError('');
+    setPlanPreparationLoading(false);
+    setPreparationBusy(undefined);
   }, []);
 
   /** Show a plan the server returned: its state, and a draft reset to it. */
@@ -748,6 +760,8 @@ export default function WorkspacePage() {
 
   const planAvailable = executionUi && planCapabilities?.available === true;
   const batchesAvailable = planAvailable && planCapabilities?.canStartBatches === true;
+  // E': the Prepare surface exists only where the server says it can prepare.
+  const preparationAvailable = planAvailable && planCapabilities?.canPrepare === true;
 
   /**
    * Where a typed task may go, from the SERVER's capability read, for EVERY
@@ -811,6 +825,60 @@ export default function WorkspacePage() {
     const timer = setInterval(() => loadPlanProgress(planId, scope.current, true), 4000);
     return () => clearInterval(timer);
   }, [batchesAvailable, planOpen, planId, liveBatchRunId, loadPlanProgress]);
+
+  /**
+   * E': the head revision's preparation, applied only while its conversation
+   * is still the selected one AND the answer is for the revision asked about.
+   */
+  const loadPlanPreparation = useCallback((workScopeId: string, head: { revision: number; digest: string },
+                                           owner: WorkspaceScope, keepError = false) => {
+    setPlanPreparationLoading(true);
+    if (!keepError) setPlanPreparationError('');
+    Promise.resolve()
+      .then(() => api.workScopePreparation(workScopeId, head))
+      .then(body => {
+        if (!ownsConversation(owner, scope.current)) return;
+        const parsed = parsePreparation(body);
+        if (parsed === undefined || parsed.revision !== head.revision || parsed.digest !== head.digest) {
+          setPlanPreparation(undefined);
+          setPlanPreparationError('The preparation status could not be read.');
+          return;
+        }
+        setPlanPreparation(parsed);
+      })
+      .catch(error => {
+        if (!ownsConversation(owner, scope.current)) return;
+        setPlanPreparationError(safeErrorText(error, 'The preparation status could not be read.'));
+      })
+      .finally(() => {
+        if (!ownsConversation(owner, scope.current)) return;
+        setPlanPreparationLoading(false);
+      });
+  }, []);
+
+  // Read when the panel is open on a plan, and again whenever its head changes.
+  const planDigest = planState?.digest;
+  useEffect(() => {
+    if (!preparationAvailable || !planOpen || !planId || planRevision === undefined || !planDigest) return;
+    loadPlanPreparation(planId, { revision: planRevision, digest: planDigest }, scope.current);
+  }, [preparationAvailable, planOpen, planId, planRevision, planDigest, loadPlanPreparation]);
+
+  // Polled while the server says `preparing` -- the same bounded read, only
+  // while the panel is open. Once it reads `prepared`, the batches are read
+  // again (their start depends on the preparation).
+  const preparationState = planPreparation?.state;
+  useEffect(() => {
+    if (!preparationAvailable || !planOpen || !planId || planRevision === undefined || !planDigest) return;
+    if (preparationState !== 'preparing') return;
+    const timer = setInterval(() => loadPlanPreparation(
+      planId, { revision: planRevision, digest: planDigest }, scope.current, true), 5000);
+    return () => clearInterval(timer);
+  }, [preparationAvailable, planOpen, planId, planRevision, planDigest, preparationState, loadPlanPreparation]);
+  useEffect(() => {
+    if (preparationState === 'prepared' && batchesAvailable && planOpen && planId) {
+      loadPlanProgress(planId, scope.current, true);
+    }
+  }, [preparationState, batchesAvailable, planOpen, planId, loadPlanProgress]);
 
   // The plan is read once the capability read says it applies and a
   // conversation is selected -- in either order, since both arrive async.
@@ -1098,6 +1166,40 @@ export default function WorkspacePage() {
    * Whatever the answer, the progress is read back so the screen shows what is
    * really there now.
    */
+  /**
+   * E': ask the server to prepare the head revision on screen. The server
+   * answers a second request with the preparation already in flight, so a
+   * double click can never start two captures; the status shown afterwards is
+   * always a fresh read of durable state.
+   */
+  async function prepareRevision() {
+    const state = planState;
+    const current = planPreparation;
+    if (!state || !current || preparationBusy || current.canPrepare !== true
+        || current.revision !== state.revision || current.digest !== state.digest) return;
+    const owner = scope.current;
+    const head = { revision: state.revision, digest: state.digest };
+    const pending = beginPending(owner);
+    setPreparationBusy(pending);
+    setPlanPreparationError('');
+    try {
+      const body = await api.prepareWorkScope(state.id, head);
+      if (!ownsConversation(owner, scope.current)) return;
+      const parsed = parsePreparation(body);
+      if (parsed !== undefined && parsed.revision === head.revision && parsed.digest === head.digest) {
+        setPlanPreparation(parsed);
+      } else {
+        loadPlanPreparation(state.id, head, owner, true);
+      }
+    } catch (error) {
+      if (!ownsConversation(owner, scope.current)) return;
+      setPlanPreparationError(safeErrorText(error, 'The revision could not be prepared.'));
+      loadPlanPreparation(state.id, head, owner, true);
+    } finally {
+      setPreparationBusy(current => settlePending(current, pending));
+    }
+  }
+
   async function confirmBatchStart() {
     const progress = planProgress;
     const batch = progress?.controls.start.batch;
@@ -1310,7 +1412,7 @@ export default function WorkspacePage() {
           instruction={planInstruction}
           onInstructionChange={setPlanInstruction}
           onSubmitInstruction={submitPlanInstruction}
-          draft={planDraft ?? (planCapabilities ? emptyDraft(planCapabilities.limits) : { units: [], modelYearFrom: '', modelYearTo: '', maxItems: '', batchSize: 1 })}
+          draft={planDraft ?? (planCapabilities ? emptyDraft(planCapabilities.limits) : { units: [], modelYearFrom: '', modelYearTo: '', maxItems: '', batchSize: 1, includeUnresolved: false })}
           onDraftChange={setPlanDraft}
           onSaveDraft={savePlanDraft}
           onDiscardDraft={() => setPlanDraft(planState ? draftFromPlan(planState.plan) : undefined)}
@@ -1329,6 +1431,18 @@ export default function WorkspacePage() {
             onCancelBatch: cancelLiveBatch,
             onOpenRun: selectHistoricalRun,
             onRefresh: () => { if (planState) loadPlanProgress(planState.id, scope.current); },
+          } : undefined}
+          preparation={preparationAvailable ? {
+            preparation: planPreparation,
+            loading: planPreparationLoading,
+            busy: preparationBusy !== undefined,
+            error: planPreparationError,
+            onPrepare: prepareRevision,
+            onRefresh: () => {
+              if (planState) {
+                loadPlanPreparation(planState.id, { revision: planState.revision, digest: planState.digest }, scope.current);
+              }
+            },
           } : undefined}
         />
         {swarmCardRunId ? (

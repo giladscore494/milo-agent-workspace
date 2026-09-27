@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     gcp_project_id: str = Field(default="big-cabinet-457321-t7", alias="GCP_PROJECT_ID")
     gcp_region: str = Field(default="us-central1", alias="GCP_REGION")
     cloud_run_worker_job: str = Field(default="milo-agent-worker", alias="CLOUD_RUN_WORKER_JOB")
+    # E': the capture job the website's Prepare route executes. Empty (the
+    # default) means this API has no capture job, so it can prepare nothing.
+    cloud_run_capture_job: str = Field(default="", alias="CLOUD_RUN_CAPTURE_JOB")
 
     @property
     def cors_origin_list(self) -> list[str]:

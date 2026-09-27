@@ -40,6 +40,9 @@ EXECUTION_FLAGS = [
     # Mapping Plan preparation: scoped Government captures. Capture job only,
     # turned on per execution by an explicit operator command, never a default.
     "MILO_ENABLE_WORK_SCOPE_PREPARATION",
+    # E': the website's Prepare route (executes the capture job once for one
+    # plan revision). Never a default; one explicit activation step turns it on.
+    "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
     "GATEWAY_ALLOW_RUN_START_ROUTES",
     "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI",

@@ -168,6 +168,12 @@ UNFENCED_BY_DESIGN = {
     # present yet. Membership, the head revision and every continuation rule
     # are re-checked in the database under the plan's row lock.
     "create_work_scope_batch_run",
+    # E': a web preparation request belongs to a PLAN REVISION, and the API
+    # records what it triggered BEFORE any capture claims the run -- there is
+    # no lease yet. It is a compare-and-set on the request's own attempt, under
+    # the request's row lock, and it can bind only an operator capture run of
+    # the plan's own conversation.
+    "record_work_scope_preparation_trigger",
     # Lease-optional by contract, checked completely whenever one IS supplied:
     # these predate the lease contract and the worker always passes one.
     "append_run_event", "save_checkpoint", "update_run_usage",

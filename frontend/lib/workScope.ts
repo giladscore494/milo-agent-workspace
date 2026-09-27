@@ -106,6 +106,8 @@ export type WorkScopePlan = {
   modelYearTo: number | null;
   maxItems: number;
   batchSize: number;
+  /** PR-Z / E'-5: queue again the variants the ledger records as unresolved. */
+  includeUnresolved: boolean;
 };
 
 export type WorkScopeRevision = {
@@ -334,7 +336,12 @@ function plan(value: unknown): WorkScopePlan | undefined {
       || batchSize === undefined || directoryVersion === undefined) {
     return undefined;
   }
-  return { directoryVersion, units: unitKeys, modelYearFrom: from, modelYearTo: to, maxItems, batchSize };
+  // Absent is false (the server states it only when true); anything but an
+  // explicit `true` is false, never a guess.
+  return {
+    directoryVersion, units: unitKeys, modelYearFrom: from, modelYearTo: to, maxItems, batchSize,
+    includeUnresolved: source.include_unresolved === true,
+  };
 }
 
 export function parseWorkScopeState(body: unknown): WorkScopeState | undefined {
@@ -389,6 +396,8 @@ export type WorkScopeDraft = {
   modelYearTo: string;
   maxItems: string;
   batchSize: number;
+  /** "Retry known-unresolved variants". Default off. */
+  includeUnresolved: boolean;
 };
 
 export function draftFromPlan(source: WorkScopePlan): WorkScopeDraft {
@@ -398,11 +407,15 @@ export function draftFromPlan(source: WorkScopePlan): WorkScopeDraft {
     modelYearTo: source.modelYearTo === null ? '' : String(source.modelYearTo),
     maxItems: String(source.maxItems),
     batchSize: source.batchSize,
+    includeUnresolved: source.includeUnresolved,
   };
 }
 
 export function emptyDraft(limits: WorkScopeLimits): WorkScopeDraft {
-  return { units: [], modelYearFrom: '', modelYearTo: '', maxItems: String(limits.defaultMaxItems), batchSize: limits.defaultBatchSize };
+  return {
+    units: [], modelYearFrom: '', modelYearTo: '', maxItems: String(limits.defaultMaxItems),
+    batchSize: limits.defaultBatchSize, includeUnresolved: false,
+  };
 }
 
 export type DraftProblem = 'units' | 'years' | 'maxItems' | 'batchSize';
@@ -413,6 +426,11 @@ export type WorkScopeEdit = {
   model_year_to: number | null;
   max_items: number;
   batch_size: number;
+  /**
+   * Stated ONLY when on. Absent means off, and an edit without it produces
+   * exactly the record -- and digest -- every earlier revision had.
+   */
+  include_unresolved?: true;
 };
 
 function wholeText(value: string): number | null | undefined {
@@ -445,7 +463,12 @@ export function draftEdit(draft: WorkScopeDraft, limits: WorkScopeLimits):
   if (!Number.isSafeInteger(draft.batchSize) || draft.batchSize < 1 || draft.batchSize > limits.maxBatchSize) {
     return { problem: 'batchSize' };
   }
-  return { edit: { units: [...draft.units], model_year_from: from, model_year_to: to, max_items: maxItems, batch_size: draft.batchSize } };
+  return {
+    edit: {
+      units: [...draft.units], model_year_from: from, model_year_to: to, max_items: maxItems,
+      batch_size: draft.batchSize, ...(draft.includeUnresolved === true ? { include_unresolved: true } : {}),
+    },
+  };
 }
 
 export function draftMatchesPlan(draft: WorkScopeDraft, source: WorkScopePlan | undefined): boolean {
@@ -455,7 +478,8 @@ export function draftMatchesPlan(draft: WorkScopeDraft, source: WorkScopePlan | 
     && saved.modelYearFrom === draft.modelYearFrom.trim()
     && saved.modelYearTo === draft.modelYearTo.trim()
     && saved.maxItems === draft.maxItems.trim()
-    && saved.batchSize === draft.batchSize;
+    && saved.batchSize === draft.batchSize
+    && saved.includeUnresolved === (draft.includeUnresolved === true);
 }
 
 export function addUnit(draft: WorkScopeDraft, key: string): WorkScopeDraft {
@@ -866,4 +890,160 @@ export function parsePauseResult(body: unknown): PauseResult | undefined {
 /** "Candidate" or "candidates", for a count a person reads. */
 export function candidatesLabel(total: number): string {
   return `${total} candidate${total === 1 ? '' : 's'}`;
+}
+
+// ---------------------------------------------------------------------------
+// Preparation (E'): prepare ONE plan revision from the website.
+// ---------------------------------------------------------------------------
+//
+// `GET /work-scopes/{id}/preparation` answers with the state the SERVER derives
+// from durable database state only: the revision's preparation, its one
+// request and the capture run's durable status. The browser never infers a
+// state -- not from a timer, not from an HTTP status -- and never decides
+// whether Prepare is allowed: `canPrepare` is the server's answer, and the
+// database re-checks it under the plan's row lock.
+
+export type PreparationState = 'not_requested' | 'preparing' | 'prepared' | 'failed' | 'stale';
+export type PreparationBlocker =
+  'preparation_disabled' | 'workflow_not_supported' | 'stale' | 'prepared' | 'in_flight' | 'needs_operator';
+
+export type PreparationUnit = {
+  unitKey: string;
+  name: string;
+  state: ProgressUnit['state'];
+  queuedCount: number;
+  coverage?: UnitCoverage;
+};
+
+export type WorkScopePreparation = {
+  workScopeId: string;
+  revision: number;
+  digest: string;
+  state: PreparationState;
+  /** A static code, stated only for `failed`. */
+  reasonCode?: string;
+  attempt: number;
+  canPrepare: boolean;
+  blockedBy?: PreparationBlocker;
+  figures?: { unitCount: number; preparedUnitCount: number; queuedItemCount: number; batchCount: number; preparedAt?: string };
+  units: PreparationUnit[];
+  /** What the plan's LATEST preparation left out as known-unresolved. */
+  knownUnresolved?: { revision: number; count: number };
+};
+
+export const PREPARATION_STATE_COPY: Readonly<Record<PreparationState, string>> = {
+  not_requested: 'Not prepared yet',
+  preparing: 'Preparing',
+  prepared: 'Prepared',
+  failed: 'Failed',
+  stale: 'Stale — the plan changed since this revision',
+};
+
+export const PREPARATION_BLOCKER_COPY: Readonly<Record<PreparationBlocker, string>> = {
+  preparation_disabled: 'Preparing from the website is not enabled on this server.',
+  workflow_not_supported: 'This project’s engine does not read a mapping plan.',
+  stale: 'The plan changed since this revision; prepare its current revision instead.',
+  prepared: 'This revision is prepared.',
+  in_flight: 'This revision is being prepared. This page checks again on its own.',
+  needs_operator: 'The last preparation stopped part way. An operator must reconcile it before it can be prepared again.',
+};
+
+/** What a person reads for a failure. A code outside this record is shown as itself. */
+export const PREPARATION_REASON_COPY: Readonly<Record<string, string>> = {
+  PREPARATION_TRIGGER_FAILED: 'The capture job could not be started.',
+  PREPARATION_NOT_STARTED: 'The capture job never started this preparation.',
+  PREPARATION_INTERRUPTED: 'The capture stopped without finishing.',
+  PREPARATION_CANCELLED: 'The preparation was cancelled.',
+  PREPARATION_INCOMPLETE: 'The capture finished without preparing this revision.',
+  PREPARATION_FAILED: 'The preparation failed.',
+  GOV_TRANSPORT_FAILED: 'The Government register could not be reached.',
+  CAPTURE_LEASE_LOST: 'The capture lost its lease before finishing.',
+};
+
+const PREPARATION_STATES: ReadonlySet<string> = new Set(Object.keys(PREPARATION_STATE_COPY));
+const PREPARATION_BLOCKERS: ReadonlySet<string> = new Set(Object.keys(PREPARATION_BLOCKER_COPY));
+const REASON_CODE = /^[A-Z][A-Z0-9_]{2,79}$/;
+
+function preparationUnit(value: unknown): PreparationUnit | undefined {
+  const source = asObject(value);
+  const unitKey = typeof source.unit_key === 'string' && UNIT_KEY.test(source.unit_key) ? source.unit_key : undefined;
+  const name = text(source.name, MAX_NAME_CHARS);
+  const queuedCount = count(source.queued_count);
+  if (unitKey === undefined || name === undefined || queuedCount === undefined
+      || typeof source.state !== 'string' || !UNIT_STATES.has(source.state)) {
+    return undefined;
+  }
+  const coverage = unitCoverage(source.coverage);
+  if (coverage === undefined) return undefined;
+  return {
+    unitKey, name, state: source.state as ProgressUnit['state'], queuedCount,
+    ...(coverage === null ? {} : { coverage }),
+  };
+}
+
+/**
+ * One revision's preparation, or `undefined` when any part of it cannot be
+ * read. STRICT: an unknown state, a malformed count, a unit that does not
+ * parse, or a state that disagrees with itself refuses the whole answer --
+ * a status shown wrong is worse than a status not shown.
+ */
+export function parsePreparation(body: unknown): WorkScopePreparation | undefined {
+  const source = asObject(body);
+  const workScopeId = uuid(source.work_scope_id);
+  const revisionNumber = whole(source.revision);
+  const digest = typeof source.digest === 'string' && DIGEST.test(source.digest) ? source.digest : undefined;
+  const attempt = count(source.attempt);
+  if (workScopeId === undefined || revisionNumber === undefined || revisionNumber < 1
+      || digest === undefined || attempt === undefined
+      || typeof source.state !== 'string' || !PREPARATION_STATES.has(source.state)
+      || typeof source.can_prepare !== 'boolean') {
+    return undefined;
+  }
+  const state = source.state as PreparationState;
+  let blockedBy: PreparationBlocker | undefined;
+  if (source.blocked_by !== null && source.blocked_by !== undefined) {
+    if (typeof source.blocked_by !== 'string' || !PREPARATION_BLOCKERS.has(source.blocked_by)) return undefined;
+    blockedBy = source.blocked_by as PreparationBlocker;
+  }
+  let reasonCode: string | undefined;
+  if (source.reason_code !== null && source.reason_code !== undefined) {
+    if (typeof source.reason_code !== 'string' || !REASON_CODE.test(source.reason_code)) return undefined;
+    reasonCode = source.reason_code;
+  }
+  // Self-consistency: a reason only for a failure, a failure always has one,
+  // and Prepare is never offered beside a stated blocker.
+  if ((state === 'failed') !== (reasonCode !== undefined)) return undefined;
+  if (source.can_prepare === true && blockedBy !== undefined) return undefined;
+  let figures: WorkScopePreparation['figures'];
+  if (source.preparation !== null && source.preparation !== undefined) {
+    const raw = asObject(source.preparation);
+    const read = {
+      unitCount: count(raw.unit_count), preparedUnitCount: count(raw.prepared_unit_count),
+      queuedItemCount: count(raw.queued_item_count), batchCount: count(raw.batch_count),
+    };
+    if (Object.values(read).some((item) => item === undefined)) return undefined;
+    figures = { ...(read as Omit<NonNullable<WorkScopePreparation['figures']>, 'preparedAt'>),
+      preparedAt: text(raw.prepared_at, 64) };
+  }
+  if ((state === 'prepared') !== (figures !== undefined)) return undefined;
+  if (!Array.isArray(source.units)) return undefined;
+  const units = source.units.map(preparationUnit);
+  if (units.some((unit) => unit === undefined)) return undefined;
+  let knownUnresolved: WorkScopePreparation['knownUnresolved'];
+  if (source.known_unresolved !== null && source.known_unresolved !== undefined) {
+    const read = totals(source.known_unresolved, ['revision', 'count'] as const);
+    if (read === undefined || read.revision < 1) return undefined;
+    knownUnresolved = read;
+  }
+  return {
+    workScopeId, revision: revisionNumber, digest, state, reasonCode, attempt,
+    canPrepare: source.can_prepare, blockedBy, figures,
+    units: units as PreparationUnit[], knownUnresolved,
+  };
+}
+
+/** What a person reads for a failure's static code. */
+export function preparationReasonText(code: string | undefined): string {
+  if (code === undefined) return '';
+  return PREPARATION_REASON_COPY[code] ?? `The preparation failed (${code}).`;
 }

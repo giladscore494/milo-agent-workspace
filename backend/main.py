@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -14,9 +14,10 @@ from backend.budget import BudgetConfig
 from backend.catalog import review as catalog_review
 from backend.catalog.scope import batches as work_scope_batches
 from backend.catalog.scope import service as work_scopes
+from backend.catalog.scope import web_preparation as work_scope_preparation
 from backend.config import get_settings
 from backend.auth import AuthenticatedUser, get_authenticated_user
-from backend.dependencies import get_job_launcher, get_repository
+from backend.dependencies import get_capture_trigger, get_job_launcher, get_repository
 from backend.execution_guard import ExecutionSurfaceGuardMiddleware, is_stage_enabled
 from backend.job_launcher import JobLauncher, JobLaunchUncertain
 from backend.errors import AppError, install_error_handlers
@@ -48,7 +49,8 @@ from backend.schemas import (
     WorkerRunCompleteRequest, WorkerRunEventCreate, WorkerRunFailRequest,
     WorkScopeBatchRunCreated, WorkScopeBatchStart, WorkScopeCapabilities,
     WorkScopeControlResult, WorkScopeCreate, WorkScopeDirectory, WorkScopeMutationResult,
-    WorkScopeOpen, WorkScopeProgress, WorkScopeRevise, WorkScopeState,
+    WorkScopeOpen, WorkScopePreparationRequest, WorkScopePreparationStatus, WorkScopeProgress,
+    WorkScopeRevise, WorkScopeState,
 )
 from backend.rate_limit import enforce_rate_limit
 from backend.event_registry import is_known_event_type
@@ -664,8 +666,9 @@ def get_catalog_review_candidates(
 
 
 @app.get("/projects/{project_id}/work-scope/capabilities", response_model=WorkScopeCapabilities)
-def get_work_scope_capabilities(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
-    return work_scopes.capabilities(repo, user.user_id, project_id)
+def get_work_scope_capabilities(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+    return work_scopes.capabilities(repo, user.user_id, project_id,
+                                    can_prepare=work_scope_preparation.server_can_prepare(trigger))
 
 
 @app.get("/projects/{project_id}/work-scope/directory", response_model=WorkScopeDirectory)
@@ -739,6 +742,29 @@ def start_work_scope_batch(work_scope_id: UUID, request: WorkScopeBatchStart, us
     return {"run_id": launched.run_id, "status": launched.status,
             "work_scope_id": work_scope_id, "batch_id": binding["batch_id"],
             "attempt": binding["attempt"], "created": bool(created.get("created"))}
+
+
+# E': prepare ONE plan revision from the website. The write executes the
+# EXISTING capture job with the shared invocation (`backend/capture_invocation.py`)
+# and is idempotent per revision under the plan's row lock; the read derives
+# the status from durable state only. Gated by
+# MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS (ExecutionSurfaceGuardMiddleware,
+# and again here). Neither starts a batch, a product run or a model call.
+@app.post("/work-scopes/{work_scope_id}/preparations", response_model=WorkScopePreparationStatus)
+def request_work_scope_preparation(work_scope_id: UUID, request: WorkScopePreparationRequest, response: Response, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+    require_stage_enabled(work_scope_preparation.PREPARATION_REQUESTS_FLAG, "work scope preparation")
+    enforce_rate_limit("run_creation_user", str(user.user_id))
+    view, started = work_scope_preparation.request_preparation(
+        repo, user.user_id, work_scope_id, expected_revision=request.expected_revision,
+        expected_digest=request.expected_digest, trigger=trigger)
+    response.status_code = 202 if started else 200
+    return view
+
+
+@app.get("/work-scopes/{work_scope_id}/preparation", response_model=WorkScopePreparationStatus)
+def get_work_scope_preparation(work_scope_id: UUID, revision: int = Query(ge=1, le=999999999), digest: str = Query(pattern=r"^[0-9a-f]{64}$"), user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+    return work_scope_preparation.status(repo, user.user_id, work_scope_id, revision, digest,
+                                         trigger=trigger)
 
 
 @app.post("/work-scopes/{work_scope_id}/pause", response_model=WorkScopeControlResult)

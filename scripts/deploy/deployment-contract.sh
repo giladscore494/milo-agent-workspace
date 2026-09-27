@@ -43,6 +43,7 @@ MILO_STAGE_A_EXECUTION_FLAGS=(
   MILO_ENABLE_WORK_SCOPE_MUTATIONS=false
   MILO_ENABLE_WORK_SCOPE_BATCHES=false
   MILO_ENABLE_WORK_SCOPE_PREPARATION=false
+  MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS=false
 )
 
 # PR-Y: the replay capture (backend/replay_capture.py). A diagnostic, not an
@@ -263,6 +264,16 @@ MILO_PLAN_AUTHORING_API_ENABLE_FLAGS=(
   MILO_ENABLE_WORK_SCOPE_MUTATIONS
 )
 
+# E' — preparing ONE plan revision from the website. API only: the Prepare
+# route, which executes the EXISTING capture job once per revision (the job
+# turns scoped preparation on for that one execution; the API never carries
+# MILO_ENABLE_WORK_SCOPE_PREPARATION). Applied by
+# website-execution-activate.sh --apply-web-preparation, closed by the kill
+# switch like every other opened flag.
+MILO_WEB_PREPARATION_API_ENABLE_FLAGS=(
+  MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS
+)
+
 # Stage 2 (website execution), API service.
 #
 #   RUN_CREATION + WORK_SCOPE_BATCHES  starting ONE prepared batch
@@ -336,7 +347,9 @@ MILO_STAGE2_VERCEL_RUN_START_FLAG="GATEWAY_ALLOW_RUN_START_ROUTES"
 # orphaned pending snapshot), and by the variant coverage migration
 # (20260927000100: the run preparation's paid-work claim, the finalize path's
 # ledger write, the automatic settlement sweep's listing and the Mapping
-# Plan's per-unit counts). Each must exist and be
+# Plan's per-unit counts), and by the web preparation migration
+# (20260928000100: the website Prepare route's claim, its trigger record and
+# the status facts). Each must exist and be
 # EXECUTE-able by service_role and by neither anon nor authenticated.
 # tests/test_scoped_rollout_contract.py holds this list to the migrations and
 # to the repository's own RPC calls.
@@ -359,6 +372,9 @@ MILO_WORK_SCOPE_RPCS=(
   acquire_catalog_variant_reservations_guarded
   catalog_variant_reservations_settling
   rebuild_catalog_variant_coverage
+  request_work_scope_preparation
+  record_work_scope_preparation_trigger
+  work_scope_preparation_state
 )
 MILO_WORK_SCOPE_TABLES=(
   catalog_work_scopes
@@ -373,6 +389,7 @@ MILO_WORK_SCOPE_TABLES=(
   catalog_variant_coverage
   catalog_work_scope_unit_coverage
   catalog_variant_reservations
+  catalog_work_scope_preparation_requests
 )
 # The migrations that create that surface, named in the readiness remedy.
-MILO_WORK_SCOPE_MIGRATIONS="20260922000100, 20260923000100, 20260924000100, 20260924000200, 20260927000100"
+MILO_WORK_SCOPE_MIGRATIONS="20260922000100, 20260923000100, 20260924000100, 20260924000200, 20260927000100, 20260928000100"

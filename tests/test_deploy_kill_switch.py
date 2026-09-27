@@ -114,6 +114,7 @@ def contract_scalar(name: str) -> str:
 
 
 API_OPENED = sorted(set(contract_array("MILO_PLAN_AUTHORING_API_ENABLE_FLAGS")
+                        + contract_array("MILO_WEB_PREPARATION_API_ENABLE_FLAGS")
                         + contract_array("MILO_STAGE2_API_ENABLE_FLAGS")))
 WORKER_OPENED = sorted(set(contract_array("MILO_STAGE2_WORKER_ENABLE_FLAGS")))
 API_PINNED_OFF = contract_array("MILO_STAGE2_API_PINNED_OFF_FLAGS")

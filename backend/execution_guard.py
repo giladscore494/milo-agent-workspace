@@ -30,6 +30,9 @@ without a separately approved execution stage:
 - ``MILO_ENABLE_WORK_SCOPE_BATCHES`` gates starting ONE batch of a prepared
   Mapping Plan (together with ``MILO_ENABLE_RUN_CREATION``: a batch run is a
   run) and pausing / resuming the plan. Nothing starts a batch automatically.
+- ``MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS`` gates preparing ONE Mapping
+  Plan revision from the website: the API executes the existing capture job
+  once for that revision. It starts no batch, no product run and no model call.
 """
 
 import os
@@ -57,6 +60,8 @@ SURFACE_RULES: tuple[tuple[str, str, re.Pattern[str], str], ...] = (
     ("POST", "MILO_ENABLE_RUN_CREATION", re.compile(rf"^/work-scopes/{_SEGMENT}/runs/?$"), "work scope batch run creation"),
     ("POST", "MILO_ENABLE_WORK_SCOPE_BATCHES", re.compile(rf"^/work-scopes/{_SEGMENT}/runs/?$"), "work scope batch run creation"),
     ("POST", "MILO_ENABLE_WORK_SCOPE_BATCHES", re.compile(rf"^/work-scopes/{_SEGMENT}/(pause|resume)/?$"), "work scope pause and resume"),
+    # E': preparing ONE plan revision from the website executes the capture job.
+    ("POST", "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS", re.compile(rf"^/work-scopes/{_SEGMENT}/preparations/?$"), "work scope preparation"),
 )
 
 

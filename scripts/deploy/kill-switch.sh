@@ -181,7 +181,8 @@ unique_minus() {
 # pins off (MILO_STAGE_A_FLAG_NAMES, which also carries the dormant proposal
 # flags), so a flag drifted open by any path is closed too.
 mapfile -t REMAINING_API_FLAGS < <(unique_minus "${ORDER_API_FLAGS[@]}" -- \
-  "${MILO_PLAN_AUTHORING_API_ENABLE_FLAGS[@]}" "${MILO_STAGE2_API_ENABLE_FLAGS[@]}" \
+  "${MILO_PLAN_AUTHORING_API_ENABLE_FLAGS[@]}" "${MILO_WEB_PREPARATION_API_ENABLE_FLAGS[@]}" \
+  "${MILO_STAGE2_API_ENABLE_FLAGS[@]}" \
   "${MILO_STAGE2_API_PINNED_OFF_FLAGS[@]}" "${MILO_STAGE_A_FLAG_NAMES[@]}" \
   "$MILO_REPLAY_CAPTURE_FLAG_NAME")
 mapfile -t REMAINING_WORKER_FLAGS < <(unique_minus "${ORDER_WORKER_FLAGS[@]}" -- \

@@ -1315,11 +1315,23 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     so no worker is ever launched for it, and `_run_is_eligible` refuses it,
     so it is not capturable either. It is inert, and it is not a model run.
     """
-    from backend.budget import BudgetConfig
+    return prepare_capture_run(
+        _open_repository(), conversation_id=UUID(str(args.conversation_id)),
+        requested_by=UUID(str(args.requested_by)),
+        idempotency_key=str(args.idempotency_key) if args.idempotency_key else None, env=env)
 
-    repository = _open_repository()
-    conversation_id = UUID(str(args.conversation_id))
-    requested_by = UUID(str(args.requested_by))
+
+def prepare_capture_run(repository: Any, *, conversation_id: UUID, requested_by: UUID,
+                        idempotency_key: str | None,
+                        env: Mapping[str, str]) -> tuple[int, dict[str, Any]]:
+    """`--prepare`'s whole contract, callable with any repository.
+
+    The operator entrypoint calls it with the service-role repository it opens
+    itself; the API's Prepare route (`backend/catalog/scope/web_preparation.py`)
+    calls it with the API's own repository, so the website makes an operator
+    capture run through exactly these steps and no other. See `_prepare`.
+    """
+    from backend.budget import BudgetConfig
 
     try:
         repository.get_conversation(conversation_id, requested_by)
@@ -1329,7 +1341,6 @@ def _prepare(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         # whether a conversation this operator cannot see exists.
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_CONVERSATION_UNAVAILABLE")
 
-    idempotency_key = str(args.idempotency_key) if args.idempotency_key else None
     # The product's own admission limits, read the same way the API reads
     # them. An operator preparation is a real run and does not get to skip the
     # concurrency ceiling the product enforces.
@@ -1579,7 +1590,7 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
     return status
 
 
-__all__ = ["CAPTURE_ENTRYPOINT", "CAPTURE_MAX_PAGES", "CAPTURE_MAX_RECORDS",
+__all__ = ["CAPTURE_ENTRYPOINT", "prepare_capture_run", "CAPTURE_MAX_PAGES", "CAPTURE_MAX_RECORDS",
            "CAPTURE_ONLY_ARGUMENTS", "PREPARE_ONLY_ARGUMENTS",
            "CAPTURE_PAGE_LIMIT", "CAPTURE_REASONS", "EGRESS_ACKNOWLEDGEMENT",
            "ELIGIBLE_RUN_STATUS", "EXIT_FAILED", "EXIT_OK", "EXIT_REFUSED",

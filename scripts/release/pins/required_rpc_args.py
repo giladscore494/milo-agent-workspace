@@ -132,6 +132,12 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "record_run_usage_guarded": {
         "p_attempt", "p_lease_token", "p_ledger", "p_run_id", "p_worker_id"
     },
+    "record_work_scope_preparation_trigger": {
+        "p_attempt", "p_execution_name", "p_request_id", "p_run_id", "p_trigger_state"
+    },
+    "request_work_scope_preparation": {
+        "p_digest", "p_grace_seconds", "p_requested_by", "p_revision", "p_work_scope_id"
+    },
     "reserve_daily_project_budget": {"p_amount", "p_daily_limit", "p_project_id", "p_run_id"},
     "reserve_daily_user_budget": {"p_amount", "p_daily_limit", "p_run_id", "p_user_id"},
     "reserve_model_call_budget_guarded": {
@@ -171,6 +177,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
         "p_attempt", "p_lease_token", "p_run_id", "p_source", "p_worker_id"
     },
     "work_scope_batch_for_run": {"p_run_id"},
+    "work_scope_preparation_state": {"p_digest", "p_revision", "p_work_scope_id"},
     "work_scope_progress": {"p_work_scope_id"},
     "work_scope_unit_coverage": {"p_preparation_id"},
 }

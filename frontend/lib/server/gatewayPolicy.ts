@@ -110,6 +110,15 @@ const SAFE_RULES: GatewayRule[] = [
     method: 'GET',
     path: new RegExp(`^/work-scopes/${UUID}/progress$`, 'i'),
   },
+  /**
+   * E': one plan revision's preparation status, derived by the server from
+   * durable state. A membership-gated READ, GET only; the Prepare WRITE is an
+   * execution rule below.
+   */
+  {
+    method: 'GET',
+    path: new RegExp(`^/work-scopes/${UUID}/preparation$`, 'i'),
+  },
 ];
 
 const EXECUTION_RULES: GatewayRule[] = [
@@ -134,6 +143,10 @@ const EXECUTION_RULES: GatewayRule[] = [
   // (MILO_ENABLE_WORK_SCOPE_BATCHES, and MILO_ENABLE_RUN_CREATION for a start).
   { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/runs$`, 'i') },
   { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/(pause|resume)$`, 'i') },
+  // E': prepare ONE plan revision. The API executes the capture job once for
+  // that revision; it starts no run, so it is NOT a run-start rule. The
+  // backend gates it again (MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS).
+  { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/preparations$`, 'i') },
 ];
 
 const RUN_CREATION_RULES = [
