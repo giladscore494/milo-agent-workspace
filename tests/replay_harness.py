@@ -267,6 +267,14 @@ class ReplayGovernmentTool(GovernmentVehicleTool):
                                       "match_count": result["match_count"],
                                       "rows": ids(result),
                                       "source_record": result.get("source_record")}
+            if "match_mode" in recorded:
+                # A recording that states how its code matched (PR-V) must
+                # match the same way now; older recordings predate the field.
+                if recorded["match_mode"] != real.get("match_mode"):
+                    raise ReplayDivergence("TOOL_RESULT_CROSS_CHECK_FAILED",
+                                           operation=operation,
+                                           recorded={"match_mode": recorded["match_mode"]},
+                                           real={"match_mode": real.get("match_mode")})
             if summary(real) != summary(recorded):
                 raise ReplayDivergence("TOOL_RESULT_CROSS_CHECK_FAILED", operation=operation,
                                        recorded=summary(recorded), real=summary(real))

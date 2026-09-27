@@ -153,6 +153,14 @@ class Register:
 
     def answer(self, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = copy.deepcopy(self.tool.execute(ToolContext(), operation, arguments))
+        # PR-V added `match_mode` to resolve_variant. These runs PREDATE it, so
+        # their recorded results never stated it (it is optional in the output
+        # schema). Every recorded answer is confirmed here to be an EXACT code
+        # match under the current tool, then written as the run recorded it.
+        if "match_mode" in result:
+            if result["match_mode"] != "exact":
+                raise AssertionError("a reconstructed answer is not an exact code match")
+            del result["match_mode"]
         for variant in result.get("variants") or []:
             variant["candidate_id"] = f"cand-{variant['upstream_record_id']}"
         if "provenance" in result:
@@ -549,17 +557,18 @@ def run_aa63369b() -> dict[str, Any]:
                                                         *TRAILHUNTER_PAIR[:2])}}
     provenance.update(row_provenance(rows, sources))
     expected = {
-        "terminal": "result", "model_calls": 13, "retry_reasons": [],
-        "status": "partial_success", "result_kind": "partial_result",
-        "vehicles": 8, "unresolved_groups": 2,
-        "needs_review": [
-            {"task_id": "t09", "code": "CANDIDATE_UNRESOLVED_AMBIGUOUS"},
-            {"task_id": "t10", "code": "CANDIDATE_UNRESOLVED_AMBIGUOUS"},
-            {"task_id": "register_meta", "code": "EVIDENCE_REQUIREMENTS_UNMET"},
-        ],
-        "summary": {"unresolved_ambiguous": 2, "unresolved_not_found": 0,
-                    "vehicles_resolved": 8, "vehicles_with_review": 0},
-        "unconsumed": {"completions": 0, "tool_results": 0},
+        "terminal": "unrecorded_call", "model_calls": 1,
+        "retry_reasons": [["commander", "planning", "EVIDENCE_REQUIRES_EVIDENCE_TOOL"]],
+        "unconsumed": {"completions": 12, "tool_results": 11},
+        "unrecorded_call": {"role": "commander", "phase": "planning", "task_id": None,
+                            "index": 1},
+        "note": ("PR-V V4: the recorded plan's get_variants-only register_meta task declares "
+                 "evidence.minimum_sources 1, so the firewall now refuses the plan "
+                 "(EVIDENCE_REQUIRES_EVIDENCE_TOOL) and asks the Commander for its ONE "
+                 "repair. Production never produced that repair, so the replay stops at "
+                 "that call after one model call; nothing past the plan is paid for. This "
+                 "is not a completed or failed run. The accepted-plan path is "
+                 "tests/replay/aa63369b-v4."),
     }
     return manifest(run_id="aa63369b", description=(
         "partial_success in production: 8 vehicles, 2 ambiguous groups, and a "
@@ -569,8 +578,66 @@ def run_aa63369b() -> dict[str, Any]:
         workers=workers, tool_results=results, provenance=provenance, expected=expected)
 
 
+# =============================================================================
+# aa63369b-v4: the SAME recording with ONE field of the plan changed
+# =============================================================================
+
+#: The one substitution, applied to register_meta's evidence in the plan TEXT.
+V4_ORIGINAL = '"minimum_sources": 1'
+V4_DERIVED = '"minimum_sources": 0'
+V4_PROVENANCE = "derived from aa63369b (V4)"
+
+
+def derive_v4_plan_text(original: str) -> tuple[str, int]:
+    """The original plan text with register_meta.evidence.minimum_sources 1 -> 0.
+
+    A TEXT substitution at exactly one position -- the first
+    `"minimum_sources": 1` after register_meta's task id -- so every other
+    byte of what the Commander wrote is unchanged. Returns the text and the
+    position, so the substitution can be reversed byte for byte.
+    """
+    anchor = original.index('"task_id": "register_meta"')
+    position = original.index(V4_ORIGINAL, anchor)
+    derived = original[:position] + V4_DERIVED + original[position + len(V4_ORIGINAL):]
+    return derived, position
+
+
+def reverse_v4_plan_text(derived: str, position: int) -> str:
+    return derived[:position] + V4_ORIGINAL + derived[position + len(V4_DERIVED):]
+
+
+def run_aa63369b_v4() -> dict[str, Any]:
+    original = run_aa63369b()
+    document = copy.deepcopy(original)
+    derived, _position = derive_v4_plan_text(original["commander"][0]["content"])
+    document["commander"][0]["content"] = derived
+    document["description"] = (
+        "DERIVED from the aa63369b recording: ONE field of the Commander plan changed "
+        "(register_meta.evidence.minimum_sources 1 -> 0), so the plan passes the PR-V V4 "
+        "firewall. Every other artifact is aa63369b's, unchanged.")
+    document["provenance"]["commander[0]"] = {"kind": RECONSTRUCTED, "source": (
+        f"{V4_PROVENANCE}: the aa63369b plan text with ONLY "
+        "register_meta.evidence.minimum_sources changed from 1 to 0 "
+        "(tests/replay/reconstruct.py derive_v4_plan_text); reversing that one "
+        "substitution restores the aa63369b text byte for byte. Not a model output.")}
+    document["expected"] = {
+        "terminal": "result", "model_calls": 13, "retry_reasons": [],
+        "unconsumed": {"completions": 0, "tool_results": 0},
+        "status": "partial_success", "result_kind": "partial_result",
+        "vehicles": 8, "unresolved_groups": 2,
+        "needs_review": [
+            {"task_id": "t09", "code": "CANDIDATE_UNRESOLVED_AMBIGUOUS"},
+            {"task_id": "t10", "code": "CANDIDATE_UNRESOLVED_AMBIGUOUS"},
+        ],
+        "summary": {"unresolved_ambiguous": 2, "unresolved_not_found": 0,
+                    "vehicles_resolved": 8, "vehicles_with_review": 0},
+    }
+    return document
+
+
 BUILDERS = {"6825eb96": run_6825eb96, "280fc9e5": run_280fc9e5,
-            "c4b8bb54": run_c4b8bb54, "aa63369b": run_aa63369b}
+            "c4b8bb54": run_c4b8bb54, "aa63369b": run_aa63369b,
+            "aa63369b-v4": run_aa63369b_v4}
 
 
 def render(document: dict[str, Any]) -> str:

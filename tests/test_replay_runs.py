@@ -16,6 +16,7 @@ PR, saying why.
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
 
@@ -44,16 +45,66 @@ def test_the_recorded_run_replays_to_its_expected_outcome(name):
         assert report.unconsumed_tool_results == []
 
 
-def test_aa63369b_is_partial_success_with_eight_vehicles_and_two_groups():
+def test_the_original_aa63369b_plan_is_rejected_at_plan_time():
+    """PR-V V4: register_meta (get_variants only) declares evidence, so the
+    recorded plan is refused and the Commander is asked for its ONE repair --
+    which production never produced. The replay stops at that call: nothing
+    past the plan is paid for, and this is not a completed (or failed) run."""
     report = replay(load_manifest(FIXTURES["aa63369b"]))
+    assert report.terminal == "unrecorded_call"
+    assert report.result is None
+    assert report.model_calls == 1
+    assert report.retry_reasons == [["commander", "planning",
+                                     "EVIDENCE_REQUIRES_EVIDENCE_TOOL"]]
+    assert report.divergence == {"role": "commander", "phase": "planning",
+                                 "task_id": None, "index": 1}
+    assert [item["role"] for item in report.served] == ["commander"]
+    assert report.catalog_reads == []
+
+
+def test_the_v4_plan_differs_from_the_original_by_one_reversible_substitution():
+    from replay.reconstruct import (V4_PROVENANCE, derive_v4_plan_text,
+                                    reverse_v4_plan_text)
+
+    original = load_manifest(FIXTURES["aa63369b"])
+    derived = load_manifest(FIXTURES["aa63369b-v4"])
+    text, position = derive_v4_plan_text(original["commander"][0]["content"])
+    assert derived["commander"][0]["content"] == text
+    # Reversing the one substitution restores the recorded text byte for byte.
+    assert reverse_v4_plan_text(text, position).encode("utf-8") == \
+        original["commander"][0]["content"].encode("utf-8")
+    before, after = (json.loads(item["commander"][0]["content"])
+                     for item in (original, derived))
+    changed = [(a["task_id"], a["evidence"], b["evidence"])
+               for a, b in zip(before["graph"]["tasks"], after["graph"]["tasks"]) if a != b]
+    assert changed == [("register_meta",
+                        {"minimum_sources": 1, "required_fields": [], "min_confidence": 0.5},
+                        {"minimum_sources": 0, "required_fields": [], "min_confidence": 0.5})]
+    assert {key for key in before if before[key] != after[key]} == {"graph"}
+    # Every other recorded artifact, and its provenance, is aa63369b's.
+    for key in ("preparation", "workers", "verifier", "tool_results", "snapshot_rows",
+                "models", "objective"):
+        assert derived[key] == original[key], key
+    assert derived["commander"][1:] == original["commander"][1:]
+    assert {name: entry for name, entry in derived["provenance"].items()
+            if name != "commander[0]"} == {name: entry for name, entry
+                                           in original["provenance"].items()
+                                           if name != "commander[0]"}
+    assert derived["provenance"]["commander[0]"]["source"].startswith(V4_PROVENANCE)
+
+
+def test_the_v4_plan_is_accepted_and_the_run_completes_partially():
+    """The ENGINE's result for the one-field-changed plan, asserted directly."""
+    report = replay(load_manifest(FIXTURES["aa63369b-v4"]))
     result = report.result
+    assert report.terminal == "result"
     assert result["status"] == "partial_success"
     assert len(result["vehicles"]) == 8 and len(result["unresolved_groups"]) == 2
+    assert report.model_calls == 13
     codes = sorted(item["code"] for item in result["needs_review"])
-    assert codes == ["CANDIDATE_UNRESOLVED_AMBIGUOUS", "CANDIDATE_UNRESOLVED_AMBIGUOUS",
-                     "EVIDENCE_REQUIREMENTS_UNMET"]
-    assert {"task_id": "register_meta", "code": "EVIDENCE_REQUIREMENTS_UNMET"} in \
-        result["needs_review"]
+    assert codes == ["CANDIDATE_UNRESOLVED_AMBIGUOUS", "CANDIDATE_UNRESOLVED_AMBIGUOUS"]
+    assert "EVIDENCE_REQUIREMENTS_UNMET" not in codes
+    assert report.unconsumed_completions == {} and report.unconsumed_tool_results == []
     # Each vehicle carries exactly its own register row.
     rows = sorted(vehicle["vehicle_key"] for vehicle in result["vehicles"])
     assert rows == sorted(["37254", "37291", "37293", "37096", "37098", "37425", "37316",
@@ -85,7 +136,8 @@ def test_the_broken_plans_now_stop_at_plan_validation(name, reason):
 # --- the replay is strict ------------------------------------------------------
 
 def _aa() -> dict:
-    return copy.deepcopy(load_manifest(FIXTURES["aa63369b"]))
+    """The strictness tests need an ACCEPTED plan: the derived V4 fixture."""
+    return copy.deepcopy(load_manifest(FIXTURES["aa63369b-v4"]))
 
 
 def test_an_unrecorded_worker_call_diverges_instead_of_being_answered():
@@ -156,3 +208,18 @@ def test_a_whole_snapshot_read_is_refused(monkeypatch):
 
 def test_divergence_is_not_foldable_into_an_ordinary_failure():
     assert not issubclass(ReplayDivergence, Exception)
+
+
+@pytest.mark.parametrize("mode,diverges", [("exact", False), ("separator_insensitive", True)])
+def test_a_recorded_match_mode_must_match_the_real_tool(mode, diverges):
+    """Recordings made before PR-V state no match_mode; one that states it is
+    held to it by the cross-check."""
+    manifest = _aa()
+    for item in manifest["tool_results"]:
+        if item["operation"] == "resolve_variant":
+            item["result"]["match_mode"] = mode
+    report = replay(manifest)
+    if diverges:
+        assert report.divergence["code"] == "TOOL_RESULT_CROSS_CHECK_FAILED"
+    else:
+        assert report.outcome() == _expected(manifest)
