@@ -44,7 +44,7 @@ PRE_PR_V = {
                                              ("plug_in_hybrid", "plug_in")}),
 }
 
-#: Every English label PR-V adds -- PENDING OWNER APPROVAL.
+#: Every English label PR-V adds (owner-approved).
 PR_V_LABELS = {"diesel", "electric", "battery_electric", "sedan", "mpv", "hatchback",
                "wagon", "coupe", "convertible", "pickup_double_cab", "pickup_single_cab"}
 
@@ -108,7 +108,7 @@ def test_the_widened_tables_are_exactly_the_reviewed_additions():
         "תא כפול": "pickup_double_cab", "תא בודד": "pickup_single_cab"}
 
 
-def test_every_new_english_label_is_the_pending_approval_list():
+def test_every_new_english_label_is_the_approved_list():
     labels = ({value for value, _name in vocab.FUEL_BY_CODE.values()}
               | {value for value, _name in vocab.PROPULSION_BY_CODE.values()}
               | set(vocab.BODY_STYLE_BY_MERKAV.values()))
@@ -156,10 +156,33 @@ def test_an_empty_body_name_states_nothing_and_is_unchanged():
     assert vocab.UNMAPPED_MERKAV_REASONS[""].strip()
 
 
-def test_diesel_with_a_hybrid_propulsion_stays_a_contradiction():
-    row = _row(delek_cd=2, delek_nm="דיזל", technologiat_hanaa_cd=1,
-               technologiat_hanaa_nm="היברידי רגיל")
-    assert _outcome(row) == "GOV_NORM_FUEL_PROPULSION_CONTRADICTION"
+def test_diesel_with_a_hybrid_propulsion_stays_inconsistent_and_is_unresolved():
+    """(diesel, hybrid) is NOT a consistent pair. Each code matches its own
+    label, so the row is not refused: neither value is settled, both
+    dimensions are unresolved, and the row is an ambiguous candidate."""
+    assert ("diesel", "hybrid") not in vocab.CONSISTENT_FUEL_PROPULSION
+    reading = read_wltp_record(_row(delek_cd=2, delek_nm="דיזל", technologiat_hanaa_cd=1,
+                                    technologiat_hanaa_nm="היברידי רגיל"))
+    assert reading.status == "ambiguous"
+    assert {"fuel_type", "propulsion_technology"} <= set(reading.unresolved_dimensions)
+    assert not {"fuel_type", "propulsion_technology"} & set(reading.identity_dimensions)
+    # The other dimensions the row states are still read.
+    assert reading.identity_dimensions["drivetrain"] == "awd"
+    assert reading.identity_dimensions["body_style"] == "suv"
+
+
+@pytest.mark.parametrize("changes", [
+    {"delek_cd": 1, "delek_nm": "בנזין", "technologiat_hanaa_cd": 3,
+     "technologiat_hanaa_nm": "רכב חשמלי"},
+    {"delek_cd": 4, "delek_nm": "חשמל", "technologiat_hanaa_cd": 1,
+     "technologiat_hanaa_nm": "היברידי רגיל"},
+    {"delek_cd": 7, "delek_nm": "חשמל/בנזין", "technologiat_hanaa_cd": None,
+     "technologiat_hanaa_nm": "הנעה רגילה"},
+])
+def test_every_inconsistent_pair_is_unresolved_never_a_special_case(changes):
+    reading = read_wltp_record(_row(**changes))
+    assert reading.status == "ambiguous"
+    assert {"fuel_type", "propulsion_technology"} <= set(reading.unresolved_dimensions)
 
 
 @pytest.mark.parametrize("changes", [
@@ -251,11 +274,52 @@ def test_readable_and_ambiguous_counts_before_and_after(pre_pr_v):
     # names across fuel cells, which the snapshot's published marginals do
     # not fix; the 2018+ split above is the one production reported.)
     assert before_all == Counter({"candidate": 2_141, "ambiguous": 4_233})
-    # After: only the four unmapped body names stay unresolved (188 rows), and
-    # the 2 diesel+hybrid rows are refused as a contradiction.
-    assert after_all == Counter({"candidate": 6_184, "ambiguous": 188,
-                                 "GOV_NORM_FUEL_PROPULSION_CONTRADICTION": 2})
+    # After: the four unmapped body names stay unresolved (188 rows) and the
+    # 2 diesel+hybrid rows are unresolved in fuel and propulsion: 6,184 +
+    # 190 = 6,374, nothing refused.
+    assert after_all == Counter({"candidate": 6_184, "ambiguous": 190})
+    assert sum(after_all.values()) == SNAPSHOT_ROWS
+    # (In this fixture both diesel+hybrid rows fall before 2018.)
     assert after_recent == Counter({"candidate": 4_517, "ambiguous": 151})
+
+
+def _reading_without_the_pair_rule(row, monkeypatch):
+    """The reading the CONSISTENCY rule starts from (every pair allowed)."""
+    with monkeypatch.context() as patch:
+        patch.setattr(vocab, "CONSISTENT_FUEL_PROPULSION", _EveryPair())
+        return read_wltp_record(row)
+
+
+class _EveryPair(frozenset):
+    def __contains__(self, _item) -> bool:
+        return True
+
+
+def test_only_the_two_diesel_hybrid_readings_change(monkeypatch):
+    """Against the previous rule (an inconsistent pair REFUSED the row):
+    exactly the two rows stating diesel with a hybrid propulsion change --
+    from a refusal to an ambiguous candidate -- and every other reading is
+    identical. The two rows are found by what they STATE, not by record id."""
+    rows = toyota_vocabulary_rows()
+    stating = {row["_id"] for row in rows
+               if (row["delek_cd"], row["technologiat_hanaa_cd"]) == (2, 1)}
+    assert len(stating) == 2
+    changed = set()
+    for row in rows:
+        base = _reading_without_the_pair_rule(row, monkeypatch)
+        pair = (base.identity_dimensions.get("fuel_type"),
+                base.identity_dimensions.get("propulsion_technology"))
+        previously_refused = None not in pair and pair not in vocab.CONSISTENT_FUEL_PROPULSION
+        now = read_wltp_record(row)
+        if previously_refused:
+            changed.add(row["_id"])
+            assert now.status == "ambiguous"
+            assert {name: value for name, value in now.identity_dimensions.items()} == {
+                name: value for name, value in base.identity_dimensions.items()
+                if name not in ("fuel_type", "propulsion_technology")}
+        else:
+            assert now == base
+    assert changed == stating
 
 
 # --- the vocabulary gate, through the real repository gate ---------------------
@@ -349,28 +413,24 @@ def test_before_pr_v_the_2018_scope_was_vocabulary_insufficient(pre_pr_v):
         "vocabulary_insufficient", TOYOTA_2018_READABLE_BEFORE, TOYOTA_2018_AMBIGUOUS_BEFORE)
 
 
-def test_after_pr_v_the_2018_scope_passes_the_vocabulary_gate():
-    """The gate itself: readable 4,517 vs ambiguous 151. The two diesel+hybrid
-    rows are left out HERE, because with them the snapshot never reaches the
-    gate (next test)."""
-    rows = [row for row in toyota_vocabulary_rows()
-            if _outcome(row) != "GOV_NORM_FUEL_PROPULSION_CONTRADICTION"]
-    repository, plan, lease, snapshot = _land(rows)
+@pytest.mark.parametrize("model_year_from,readable,ambiguous", [
+    (2018, 4_517, 151),   # the 2018+ scope production refused
+    (None, 6_184, 190),   # every year: the two diesel+hybrid rows included
+])
+def test_after_pr_v_the_complete_fixture_is_complete_and_passes_the_gate(
+        model_year_from, readable, ambiguous):
+    """The COMPLETE 6,374-row fixture, both diesel+hybrid rows included: no row
+    is refused, the snapshot is complete, and preparation passes its
+    vocabulary gate. (A reconstructed fixture with production's distribution,
+    not a fresh production capture.)"""
+    rows = toyota_vocabulary_rows()
+    assert len(rows) == SNAPSHOT_ROWS
+    repository, plan, lease, snapshot = _land(rows, model_year_from=model_year_from)
+    metadata = snapshot["retrieval_metadata"]
+    assert metadata["normalization_issue_count"] == 0
+    assert metadata["normalized_record_count"] == SNAPSHOT_ROWS
+    assert snapshot_usability(snapshot) is None
     (unit,) = _prepare(repository, plan, lease, snapshot)["units"]
     assert (unit["state"], unit["readable_count"], unit["ambiguous_count"]) == (
-        "prepared", 4_517, 151)
+        "prepared", readable, ambiguous)
     assert unit["queued_count"] == 25
-
-
-def test_the_two_diesel_hybrid_contradictions_make_a_fresh_capture_incomplete():
-    """PENDING OWNER DECISION, pinned so it cannot go unnoticed: kept as a
-    contradiction, the 2 production rows are normalization REFUSALS, and a
-    snapshot with any refusal is INCOMPLETE -- refused by preparation before
-    the vocabulary gate is reached, unless an operator acknowledges it."""
-    repository, plan, lease, snapshot = _land(toyota_vocabulary_rows())
-    assert snapshot["retrieval_metadata"]["normalization_issue_count"] == 2
-    assert snapshot_usability(snapshot) == "GOV_PROJECTION_SNAPSHOT_INCOMPLETE"
-    from backend.errors import AppError
-
-    with pytest.raises(AppError):
-        _prepare(repository, plan, lease, snapshot)

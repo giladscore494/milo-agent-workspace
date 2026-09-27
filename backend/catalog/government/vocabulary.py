@@ -95,8 +95,8 @@ DRIVETRAIN_BY_CODE: Mapping[int, tuple[str, str]] = {
 #: it publishes no body code, so the whole string is matched exactly.
 #:
 #: PR-V: the eight body names below are read from the production Toyota
-#: snapshot's own distribution. Their English labels are PENDING OWNER
-#: APPROVAL (listed in the PR). Every other name -- and in particular the five
+#: snapshot's own distribution; their English labels are owner-approved.
+#: Every other name -- and in particular the five
 #: in `UNMAPPED_MERKAV_REASONS` -- stays unread: the row keeps `body_style`
 #: unresolved rather than being given a guessed one.
 BODY_STYLE_BY_MERKAV: Mapping[str, str] = {
@@ -134,13 +134,14 @@ UNMAPPED_MERKAV_REASONS: Mapping[str, str] = {
 
 #: Fuel and propulsion are two INDEPENDENT statements about one row, and a row
 #: whose two statements disagree has not stated one coherent propulsion. Only
-#: these pairings occur in the reviewed capture; anything else is a
-#: contradiction and fails closed.
+#: these pairings occur in the reviewed capture; anything else is
+#: inconsistent and settles neither dimension (fails closed to unresolved).
 #:
 #: PR-V adds diesel with no coded propulsion (1,095 production rows) and
 #: electric with a battery-electric propulsion (30). It deliberately does NOT
-#: add ("diesel", "hybrid"): two production rows state it, and it stays a
-#: contradiction.
+#: add ("diesel", "hybrid"): two production rows state it, and it stays an
+#: inconsistent pair -- such a row reads with BOTH dimensions unresolved (an
+#: ambiguous candidate, see `normalize.read_wltp_record`), never refused.
 CONSISTENT_FUEL_PROPULSION: frozenset[tuple[str, str]] = frozenset({
     ("petrol", "hybrid"), ("petrol", "conventional"), ("plug_in_hybrid", "plug_in"),
     ("diesel", "conventional"), ("electric", "battery_electric"),
