@@ -17,6 +17,9 @@ Regenerate with:
 from __future__ import annotations
 
 REQUIRED_RPC_ARGS: dict[str, set[str]] = {
+    "acquire_catalog_variant_reservations_guarded": {
+        "p_attempt", "p_candidate_ids", "p_lease_token", "p_level", "p_run_id", "p_worker_id"
+    },
     "activate_catalog_snapshot_guarded": {
         "p_activation", "p_attempt", "p_lease_token", "p_run_id", "p_worker_id"
     },
@@ -43,6 +46,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_snapshot_candidate_diff": {"p_previous_snapshot_id", "p_snapshot_id"},
     "catalog_variant_coverage_for_batch": {"p_batch_id", "p_level"},
     "catalog_variant_coverage_runs": {"p_after_finished_at", "p_after_run_id", "p_limit"},
+    "catalog_variant_reservations_settling": {"p_limit"},
     "claim_current_verdict_states": {"p_run_id"},
     "claim_run_lease": {"p_run_id", "p_worker_id"},
     "create_agent_message_guarded": {

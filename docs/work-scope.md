@@ -473,9 +473,10 @@ changes nothing about the run: the ledger is rebuildable from run history.
   left out BEFORE the plan's limit is spent. Each prepared unit records its
   exclusions (counts and register ids) in `catalog_work_scope_unit_coverage`,
   immutable like the preparation.
-- **Run preparation** (`_from_batch`): one bounded read of the batch's own
-  items (`catalog_variant_coverage_for_batch`) leaves out what the ledger
-  settled since the queue was built. The preparation record states
+- **Run preparation** (`_from_batch`): the worker's paid-work claim (below)
+  leaves out what the ledger settled since the queue was built, in the same
+  atomic step (without a lease -- tests, reads -- the read-only
+  `catalog_variant_coverage_for_batch`). The preparation record states
   `excluded_already_enriched`, `excluded_known_unresolved` and each excluded
   register id, beside PR-U's `excluded_placeholder`. A batch the ledger
   settles whole is refused before any paid call with
@@ -487,6 +488,47 @@ changes nothing about the run: the ledger is rebuildable from run history.
 `true`, so every earlier plan keeps its canonical text and digest. An edit
 may state it (`{"include_unresolved": true}`); the Mapping Plan has no control
 for it.
+
+### The paid-work claim: concurrency and crashes
+
+The ledger alone cannot stop two plans paying for one variant at the same
+time -- both read "not settled", both pass preparation -- nor a second plan
+paying while a FINISHED run's settlement is still missing (the worker died
+after finalizing, or the ledger write failed). So the paid work itself is
+claimed, in `catalog_variant_reservations`, ONE row per (key, level) across
+every plan and run:
+
+1. **Claim before paying.** Run preparation, under the worker's live lease,
+   calls `acquire_catalog_variant_reservations_guarded` for the batch's items
+   (at most 20) before any provider path exists. For each item, in
+   identity-key order, it inserts or locks the claim row and only then reads
+   the ledger, so two concurrent claimants serialize on the row: exactly one
+   owns it. The answer per item is `reserved`, a ledger exclusion,
+   `reserved_by_other` or `settlement_pending`; only `reserved` items are
+   handed to the engine. Anything else is recorded like a placeholder
+   (`EXCLUDED_RESERVED_BY_ANOTHER_RUN`, count `excluded_reserved`); a batch
+   left with nothing is refused with `GOVERNMENT_BATCH_RESERVED`.
+2. **Who blocks.** A claim blocks while its owner is running (lease live, or
+   expired for less than 15 minutes) and -- the crash window -- while its
+   owner FINISHED `completed` / `partial_success` and is not settled yet: a
+   finished run's claim never goes dead. It is DEAD, and taken over
+   atomically by the next claimant, once its owner ended `failed` /
+   `cancelled` / `timed_out` / `budget_exhausted`, or its lease has been
+   expired for more than 15 minutes (a worker cannot renew an expired lease,
+   and its budget tracker refuses every model call once the lease is gone).
+3. **Stale attempts.** Claiming is lease-guarded and a finished run's
+   settlement is accepted from the finalizing attempt only; an older attempt
+   can neither claim, settle nor release. A resumed attempt re-claims its
+   recorded queue before its first paid call; if a claim moved on meanwhile
+   it is refused with `GOVERNMENT_RESERVATION_LOST`.
+4. **Settlement.** The ledger write releases the run's claims in the same
+   transaction. The finalize path settles first. When that fails, recovery is
+   automatic: a run preparation that meets `settlement_pending` settles the
+   finished owner from its own durable output (`coverage.settle_run`) and
+   asks once more, and every operator queue build first sweeps one bounded
+   page of unsettled finished runs (`reconcile_pending_settlements`). Both are
+   idempotent and converge on the state the finalize path would have written.
+   The backfill script remains an operator repair tool, not the mechanism.
 
 ### What the Mapping Plan shows
 

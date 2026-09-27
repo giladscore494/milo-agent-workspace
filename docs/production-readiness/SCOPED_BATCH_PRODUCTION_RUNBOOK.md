@@ -359,7 +359,7 @@ bash scripts/deploy/production-verify.sh --gate database
 ```
 
 **Expected evidence:** `remote schema classified as fully-migrated (44/44 …)`,
-then `WORK_SCOPE_SCHEMA=VERIFIED (11 tables with RLS, 15 RPCs service_role-only)`
+then `WORK_SCOPE_SCHEMA=VERIFIED (12 tables with RLS, 18 RPCs service_role-only)`
 (neither `anon` nor `authenticated` can execute any of them), then
 `DATABASE_READY=VERIFIED` and `RESULT: OK`.
 

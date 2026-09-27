@@ -170,6 +170,8 @@ class Repository(Protocol):
     def rebuild_catalog_variant_coverage(self, run_id: UUID, level: str, entries: list[dict[str, Any]]) -> dict[str, Any]: ...
     def catalog_variant_coverage_runs(self, *, after_finished_at: Any = None, after_run_id: Any = None, limit: int = 50) -> list[dict[str, Any]]: ...
     def work_scope_unit_coverage(self, preparation_id: Any) -> list[dict[str, Any]]: ...
+    def acquire_catalog_variant_reservations(self, run_id: UUID, level: str, candidate_ids: list[str], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def catalog_variant_reservations_settling(self, *, limit: int = 50) -> list[dict[str, Any]]: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -2169,6 +2171,7 @@ class SupabaseRepository:
     _COVERAGE_REFUSALS = (
         ("CATALOG_COVERAGE_INVALID", "invalid coverage ledger request", 422),
         ("CATALOG_COVERAGE_RUN_NOT_FINISHED", "the run has not finished with a result", 409),
+        ("CATALOG_COVERAGE_RUN_FINISHED", "the run already finished", 409),
         ("CATALOG_COVERAGE_RUN_UNBOUND", "the run executes no mapping plan batch", 422),
         ("CATALOG_COVERAGE_CANDIDATE_INVALID",
          "a coverage entry names no candidate of the run's snapshot", 422),
@@ -2223,6 +2226,24 @@ class SupabaseRepository:
             "p_after_finished_at": None if after_finished_at is None else str(after_finished_at),
             "p_after_run_id": None if after_run_id is None else str(after_run_id),
             "p_limit": max(1, min(int(limit), 50))})
+
+    def acquire_catalog_variant_reservations(self, run_id: UUID, level: str, candidate_ids: list[str], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        """Claim the paid work on this run's batch items, under its live lease."""
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_level": str(level), "p_candidate_ids": [str(item) for item in candidate_ids]}
+        data = self._coverage_call(
+            lambda: self.client.rpc("acquire_catalog_variant_reservations_guarded", params),
+            guarded=True)
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise AppError("REPOSITORY_ERROR", "claim returned an unreadable row", 502)
+        return data
+
+    def catalog_variant_reservations_settling(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """One bounded page (at most 50) of finished runs whose claims await settlement."""
+        return self._read_rpc("catalog_variant_reservations_settling",
+                              {"p_limit": max(1, min(int(limit), 50))})
 
     def work_scope_unit_coverage(self, preparation_id: Any) -> list[dict[str, Any]]:
         """One preparation's per-unit ledger counts (never its register ids)."""

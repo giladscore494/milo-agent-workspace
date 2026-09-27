@@ -157,20 +157,30 @@ class World:
                   if row["preparation_id"] == plan["preparation"]["id"]]
         return row
 
-    def finish_batch(self, plan: dict[str, Any], result: dict[str, Any], *,
-                     write_ledger: bool = True) -> tuple[str, Any, dict[str, Any] | None]:
-        """Run ONE batch the way the worker does, minus the models: claim,
-        prepare, checkpoint the preparation record, finalize the product, and
-        write the ledger through the finalize path's own function."""
+    def start(self, plan: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """ONE batch run, claimed by a worker and running: (run id, its lease)."""
         run = start_batch_run(self.repository, plan)["run"]["id"]
-        worker = f"worker-{run[:8]}"
+        return run, self.claim(run)
+
+    def claim(self, run: str, worker: str | None = None) -> dict[str, Any]:
+        worker = worker or f"worker-{run[:8]}"
         claimed = self.repository.claim_run(UUID(run), worker)
         lease = {"worker_id": worker, "attempt": claimed["attempt"],
                  "lease_token": claimed["lease_token"]}
-        self.repository.transition_run(UUID(run), "running", expected_worker_id=worker,
-                                       expected_attempt=claimed["attempt"],
-                                       expected_lease_token=claimed["lease_token"])
-        preparation = prepare_government_work(self.repository, run_id=run)
+        if claimed["status"] != "running":
+            self.repository.transition_run(UUID(run), "running", expected_worker_id=worker,
+                                           expected_attempt=claimed["attempt"],
+                                           expected_lease_token=claimed["lease_token"])
+        return lease
+
+    def finish_batch(self, plan: dict[str, Any], result: dict[str, Any], *,
+                     write_ledger: bool = True) -> tuple[str, Any, dict[str, Any] | None]:
+        """Run ONE batch the way the worker does, minus the models: claim the
+        run, prepare it under its lease (which claims the paid work on every
+        item), checkpoint the preparation record, finalize the product, and
+        settle through the finalize path's own function."""
+        run, lease = self.start(plan)
+        preparation = prepare_government_work(self.repository, run_id=run, lease=lease)
         self.repository.save_checkpoint(
             {"run_id": run, "phase": PREPARATION_PHASE, "workflow_key": "swarm_v2",
              "completed_tasks": [], "failures": [],
@@ -398,7 +408,7 @@ def test_the_ledger_refuses_what_durable_state_does_not_support():
         world.repository.rebuild_catalog_variant_coverage(
             run, "register", [{"candidate_id": foreign, "status": ENRICHED}])
     assert outside.value.code == "CATALOG_COVERAGE_CANDIDATE_INVALID"
-    for entries in ([], [{"candidate_id": candidate, "status": "done"}],
+    for entries in ([{"candidate_id": candidate, "status": "done"}],
                     [{"candidate_id": candidate, "status": ENRICHED, "x": 1}]):
         with pytest.raises(AppError) as invalid:
             world.repository.rebuild_catalog_variant_coverage(run, "register", entries)
@@ -887,6 +897,9 @@ def test_the_worker_writes_the_ledger_after_the_run_is_finalized(monkeypatch):
     candidates = {row["id"]: row for row in repository.catalog_candidates.values()}
     assert {row["variant_identity_key"] for row in rows} == \
         {candidate_identity_key(candidates[candidate]) for candidate in handed}
+    # The worker claimed all four before its first model call, and the
+    # settlement released every claim with the ledger write.
+    assert repository.catalog_variant_reservations == {}
 
 
 def test_a_failed_ledger_write_in_the_worker_leaves_the_run_exactly_as_finalized(
@@ -902,3 +915,283 @@ def test_a_failed_ledger_write_in_the_worker_leaves_the_run_exactly_as_finalized
     assert repository.catalog_variant_coverage == {}
     assert (f"catalog coverage ledger write failed: run_id={run_id} "
             "exception_class=AppError") in capsys.readouterr().out
+    # PR-Z (strengthened): the finished run's claims were NOT released with
+    # the failed write -- they keep blocking every other run ...
+    claims = repository.catalog_variant_reservations
+    assert len(claims) == 4 and {row["run_id"] for row in claims.values()} == {str(run_id)}
+    assert [row["run_id"] for row in repository.catalog_variant_reservations_settling()] == \
+        [str(run_id)]
+    # ... until the automatic reconciliation settles the run from its durable
+    # output: the same ledger the finalize path would have written.
+    assert reconcile_pending_settlements(repository) == {"settled": 1, "deferred": 0}
+    assert repository.catalog_variant_reservations == {}
+    assert sorted(row["status"] for row in repository.catalog_variant_coverage.values()) == \
+        [FAILED] * 4
+    assert {row["last_run_id"] for row in repository.catalog_variant_coverage.values()} == \
+        {str(run_id)}
+
+
+# =============================================================================
+# The paid-work claim: two plans, crashes and stale attempts never pay twice
+# =============================================================================
+
+from datetime import UTC, datetime, timedelta  # noqa: E402
+
+from backend.catalog.coverage import (RESERVATION_TAKEOVER_GRACE_SECONDS,  # noqa: E402
+                                      reconcile_pending_settlements, settle_run)
+from backend.catalog.government.preparation import EXCLUDED_RESERVED_BY_ANOTHER_RUN  # noqa: E402
+
+
+def _expire(world: World, run: str, *, seconds_ago: int) -> None:
+    """The run's lease lapsed `seconds_ago` (its worker died, nothing renewed it)."""
+    world.repository.runs[run]["lease_expires_at"] = \
+        (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+
+
+def _claims(world: World) -> dict[str, str]:
+    """variant identity key -> owning run, for every live claim row."""
+    return {key: row["run_id"] for (key, _level), row
+            in world.repository.catalog_variant_reservations.items()}
+
+
+def _fail(world: World, run: str, lease: dict[str, Any]) -> None:
+    RunFinalizer(world.repository, UUID(run), "swarm_v2", lease).finalize(
+        TerminalClaim.failure("swarm_v2", "SWARM_V2_EXECUTION_FAILED", "failed"))
+
+
+def test_two_plans_racing_for_one_variant_only_one_may_pay():
+    world = World()
+    first, second = world.plan(AA["snapshot_rows"]), world.plan(AA["snapshot_rows"])
+    run_a, lease_a = world.start(first)
+    run_b, lease_b = world.start(second)
+    # Both plans queued all twelve: neither is settled in the ledger.
+    assert len(world.queued_records(first)) == len(world.queued_records(second)) == 12
+    a = prepare_government_work(world.repository, run_id=run_a, lease=lease_a)
+    assert len(a.queue) == 12 and a.excluded == ()
+    assert set(_claims(world).values()) == {run_a} and len(_claims(world)) == 10
+    # B reaches preparation while A is still paying: B pays for nothing.
+    with pytest.raises(GovernmentPreparationError) as refused:
+        prepare_government_work(world.repository, run_id=run_b, lease=lease_b)
+    assert refused.value.code == "GOVERNMENT_BATCH_RESERVED"
+    assert set(_claims(world).values()) == {run_a}          # B took no claim
+    # Claiming again is idempotent: the same answer, the same owner.
+    again = prepare_government_work(world.repository, run_id=run_a, lease=lease_a)
+    assert [item.candidate_id for item in again.queue] == [item.candidate_id for item in a.queue]
+
+
+def test_a_second_plan_keeps_only_what_no_other_run_owns():
+    world = World()
+    first = world.plan(AA["snapshot_rows"])
+    others = extra_rows(3)
+    second = world.plan([*AA["snapshot_rows"], *others])
+    run_a, lease_a = world.start(first)
+    prepare_government_work(world.repository, run_id=run_a, lease=lease_a)
+    run_b, lease_b = world.start(second)
+    b = prepare_government_work(world.repository, run_id=run_b, lease=lease_b)
+    assert sorted(item.commercial_model for item in b.queue) == \
+        sorted(row["kinuy_mishari"] for row in others)
+    assert b.excluded_reserved == 12
+    assert {reason for _, reason in b.excluded} == {EXCLUDED_RESERVED_BY_ANOTHER_RUN}
+    assert b.as_artifact()["excluded_reserved"] == 12
+
+
+def test_different_variants_are_claimed_independently():
+    world = World()
+    run_a, lease_a = world.start(world.plan(extra_rows(3, start=70_000)))
+    run_b, lease_b = world.start(world.plan(extra_rows(3, start=80_000, year=2021)))
+    a = prepare_government_work(world.repository, run_id=run_a, lease=lease_a)
+    b = prepare_government_work(world.repository, run_id=run_b, lease=lease_b)
+    assert (len(a.queue), len(b.queue)) == (3, 3)
+    assert sorted(_claims(world).values()) == sorted([run_a] * 3 + [run_b] * 3)
+
+
+def test_a_claim_at_another_level_does_not_collide():
+    world = World()
+    plan = world.plan(AA["snapshot_rows"])
+    other, _ = world.start(world.plan(extra_rows(1)))
+    key = world.key_of("37254", plan["snapshot_key"])
+    # A LIVE run's claim on the same variant at a different level of work.
+    world.repository.catalog_variant_reservations[(key, "web")] = {
+        "id": str(uuid4()), "variant_identity_key": key, "level": "web", "run_id": other,
+        "attempt": 1, "batch_id": "x", "candidate_id": "x", "content_sha256": "c" * 64,
+        "previous_run_id": None, "reserved_at": "", "updated_at": ""}
+    run, lease = world.start(plan)
+    prepared = prepare_government_work(world.repository, run_id=run, lease=lease)
+    assert len(prepared.queue) == 12
+    assert world.repository.catalog_variant_reservations[(key, "register")]["run_id"] == run
+    assert world.repository.catalog_variant_reservations[(key, "web")]["run_id"] == other
+
+
+def test_a_stale_attempt_can_neither_claim_settle_nor_steal():
+    world = World()
+    plan = world.plan(AA["snapshot_rows"])
+    run, first = world.start(plan)
+    ids = [item["candidate_id"]
+           for item in world.repository.work_scope_batch_for_run(UUID(run))["items"]]
+    world.repository.acquire_catalog_variant_reservations(run, "register", ids, **first)
+    # The first attempt's worker dies; a second attempt reclaims the run.
+    _expire(world, run, seconds_ago=5)
+    second = world.claim(run, worker="worker-retry")
+    assert second["attempt"] == first["attempt"] + 1
+    for call in (lambda: world.repository.acquire_catalog_variant_reservations(
+                     run, "register", ids, **first),
+                 lambda: world.repository.record_catalog_variant_coverage(
+                     run, "register", [], **first)):
+        with pytest.raises(AppError) as stale:
+            call()
+        assert stale.value.code == "RUN_LEASE_LOST"
+    # The current attempt takes over its own run's claims ...
+    answer = world.repository.acquire_catalog_variant_reservations(run, "register", ids, **second)
+    assert {item["decision"] for item in answer["items"]} == {"reserved"}
+    assert {row["attempt"] for row in world.repository.catalog_variant_reservations.values()} \
+        == {second["attempt"]}
+    # ... and another plan's run cannot steal them while it is live.
+    other, other_lease = world.start(world.plan(AA["snapshot_rows"]))
+    with pytest.raises(GovernmentPreparationError) as refused:
+        prepare_government_work(world.repository, run_id=other, lease=other_lease)
+    assert refused.value.code == "GOVERNMENT_BATCH_RESERVED"
+
+
+def test_an_interrupted_run_becomes_retryable_by_one_explicit_rule():
+    world = World()
+    run_a, lease_a = world.start(world.plan(AA["snapshot_rows"]))
+    prepare_government_work(world.repository, run_id=run_a, lease=lease_a)
+    run_b, lease_b = world.start(world.plan(AA["snapshot_rows"]))
+    # A's worker died: within the takeover grace the claim still blocks ...
+    _expire(world, run_a, seconds_ago=RESERVATION_TAKEOVER_GRACE_SECONDS - 60)
+    with pytest.raises(GovernmentPreparationError) as held:
+        prepare_government_work(world.repository, run_id=run_b, lease=lease_b)
+    assert held.value.code == "GOVERNMENT_BATCH_RESERVED"
+    # ... and past it the claim is dead and passes to B, atomically.
+    _expire(world, run_a, seconds_ago=RESERVATION_TAKEOVER_GRACE_SECONDS + 60)
+    b = prepare_government_work(world.repository, run_id=run_b, lease=lease_b)
+    assert len(b.queue) == 12 and set(_claims(world).values()) == {run_b}
+    claims = world.repository.catalog_variant_reservations.values()
+    assert {row["previous_run_id"] for row in claims} == {run_a}
+    # A is reclaimed later: its resumed attempt re-claims before any paid call
+    # and is refused, because the paid work is B's now.
+    checkpoint = {"phase": PREPARATION_PHASE, "artifacts": {ARTIFACT_KEY: prepare_government_work(
+        world.repository, run_id=run_a).as_artifact()}}
+    lease_a2 = world.claim(run_a, worker="worker-a-retry")
+    with pytest.raises(GovernmentPreparationError) as lost:
+        prepare_government_work(world.repository, run_id=run_a, lease=lease_a2,
+                                checkpoint=checkpoint)
+    assert lost.value.code == "GOVERNMENT_RESERVATION_LOST"
+    assert set(_claims(world).values()) == {run_b}
+
+
+def test_a_failed_run_releases_its_claim_to_the_next_claimant_at_once():
+    world = World()
+    run_a, lease_a = world.start(world.plan(AA["snapshot_rows"]))
+    prepare_government_work(world.repository, run_id=run_a, lease=lease_a)
+    _fail(world, run_a, lease_a)
+    run_b, lease_b = world.start(world.plan(AA["snapshot_rows"]))
+    assert len(prepare_government_work(world.repository, run_id=run_b, lease=lease_b).queue) == 12
+
+
+def test_a_resumed_attempt_keeps_its_own_claims():
+    world = World()
+    run, lease = world.start(world.plan(AA["snapshot_rows"]))
+    prepared = prepare_government_work(world.repository, run_id=run, lease=lease)
+    checkpoint = {"phase": PREPARATION_PHASE, "artifacts": {ARTIFACT_KEY: prepared.as_artifact()}}
+    _expire(world, run, seconds_ago=RESERVATION_TAKEOVER_GRACE_SECONDS + 60)
+    retry = world.claim(run, worker="worker-retry")
+    resumed = prepare_government_work(world.repository, run_id=run, lease=retry,
+                                      checkpoint=checkpoint)
+    assert resumed.resumed and len(resumed.queue) == 12
+    assert set(_claims(world).values()) == {run}
+
+
+def test_a_finished_run_whose_settlement_failed_still_blocks_and_recovers_automatically():
+    # Paid work completed, the run is durably finalized, and the settlement
+    # write never lands (the worker dies, or the write fails).
+    world = World()
+    run_a, _preparation, _ = world.finish_batch(world.plan(AA["snapshot_rows"]),
+                                                production_result(AA), write_ledger=False)
+    assert world.repository.get_run(run_a)["status"] == "partial_success"
+    assert world.ledger() == {} and set(_claims(world).values()) == {run_a}
+    assert world.repository.catalog_variant_reservations_settling(limit=50) == [
+        {"run_id": run_a, "finished_at": world.repository.get_run(run_a)["finished_at"]}]
+
+    # A second plan's run: its preparation meets A's unsettled claims, settles
+    # A from A's own durable output, and then pays for nothing.
+    second = world.plan(AA["snapshot_rows"])
+    run_b, lease_b = world.start(second)
+    with pytest.raises(GovernmentPreparationError) as refused:
+        prepare_government_work(world.repository, run_id=run_b, lease=lease_b)
+    assert refused.value.code == "GOVERNMENT_BATCH_ALREADY_COVERED"
+    assert _claims(world) == {}
+    assert world.repository.catalog_variant_reservations_settling(limit=50) == []
+    # The ledger is exactly what a normal settlement writes.
+    normal, normal_plan, _ = aa_world()
+    fields = ("status", "content_sha256", "level", "vocabulary_version")
+    assert {key: tuple(row[name] for name in fields) for key, row in world.ledger().items()} == \
+        {key: tuple(row[name] for name in fields) for key, row in normal.ledger().items()}
+    assert {row["last_run_id"] for row in world.ledger().values()} == {run_a}
+
+
+def test_while_settlement_keeps_failing_the_finished_run_keeps_blocking():
+    world = World()
+    run_a, _preparation, _ = world.finish_batch(world.plan(AA["snapshot_rows"]),
+                                                production_result(AA), write_ledger=False)
+
+    class NoSettlement:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            if name == "rebuild_catalog_variant_coverage":
+                def refuse(*_args, **_kwargs):
+                    raise AppError("REPOSITORY_ERROR", "coverage ledger call failed", 502)
+                return refuse
+            return getattr(self._inner, name)
+
+    run_b, lease_b = world.start(world.plan(AA["snapshot_rows"]))
+    with pytest.raises(GovernmentPreparationError) as refused:
+        prepare_government_work(NoSettlement(world.repository), run_id=run_b, lease=lease_b)
+    assert refused.value.code == "GOVERNMENT_BATCH_RESERVED"
+    assert set(_claims(world).values()) == {run_a} and world.ledger() == {}
+    # Even past any takeover grace: a FINISHED run's claim never goes dead.
+    _expire(world, run_a, seconds_ago=RESERVATION_TAKEOVER_GRACE_SECONDS * 10)
+    with pytest.raises(GovernmentPreparationError):
+        prepare_government_work(NoSettlement(world.repository), run_id=run_b, lease=lease_b)
+    assert set(_claims(world).values()) == {run_a}
+
+
+def test_the_queue_build_sweep_settles_unsettled_runs_and_is_idempotent():
+    world = World()
+    run_a, _preparation, _ = world.finish_batch(world.plan(AA["snapshot_rows"]),
+                                                production_result(AA), write_ledger=False)
+    assert reconcile_pending_settlements(world.repository) == {"settled": 1, "deferred": 0}
+    settled = world.ledger()
+    assert len(settled) == 10 and _claims(world) == {}
+    # Converges: sweeping, settling and settling again change nothing.
+    assert reconcile_pending_settlements(world.repository) == {"settled": 0, "deferred": 0}
+    assert settle_run(world.repository, run_a) is True
+    assert world.ledger() == settled
+    # The next queue build is built from that ledger.
+    assert world.queued_records(world.plan(AA["snapshot_rows"])) == []
+
+
+def test_the_operator_preparation_settles_before_it_builds_the_queue(monkeypatch):
+    from backend.catalog.scope import preparation as scope_preparation
+
+    calls: list[str] = []
+    monkeypatch.setattr(scope_preparation.catalog_coverage, "reconcile_pending_settlements",
+                        lambda repository, **_kwargs: calls.append("reconcile") or {})
+
+    class Stop(Exception):
+        pass
+
+    def stop(*_args, **_kwargs):
+        calls.append("capture")
+        raise Stop()
+
+    monkeypatch.setattr(scope_preparation, "read_prepared_revision",
+                        lambda *_args, **_kwargs: SimpleNamespace(units=("toyota",)))
+    monkeypatch.setattr(scope_preparation, "capture_unit", stop)
+    with pytest.raises(Stop):
+        scope_preparation.prepare_work_scope(object(), SimpleNamespace(run_id="r"), client=None,
+                                             work_scope_id=str(uuid4()), revision=1,
+                                             digest="a" * 64)
+    assert calls == ["reconcile", "capture"]

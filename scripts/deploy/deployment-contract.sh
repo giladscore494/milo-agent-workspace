@@ -334,8 +334,9 @@ MILO_STAGE2_VERCEL_RUN_START_FLAG="GATEWAY_ALLOW_RUN_START_ROUTES"
 # recovery migration (20260924000200: the batched raw-record and candidate
 # writes a preparation's scoped capture lands through, and the adoption of an
 # orphaned pending snapshot), and by the variant coverage migration
-# (20260927000100: the run preparation's ledger read, the finalize path's
-# ledger write and the Mapping Plan's per-unit counts). Each must exist and be
+# (20260927000100: the run preparation's paid-work claim, the finalize path's
+# ledger write, the automatic settlement sweep's listing and the Mapping
+# Plan's per-unit counts). Each must exist and be
 # EXECUTE-able by service_role and by neither anon nor authenticated.
 # tests/test_scoped_rollout_contract.py holds this list to the migrations and
 # to the repository's own RPC calls.
@@ -355,6 +356,9 @@ MILO_WORK_SCOPE_RPCS=(
   catalog_variant_coverage_for_batch
   record_catalog_variant_coverage_guarded
   work_scope_unit_coverage
+  acquire_catalog_variant_reservations_guarded
+  catalog_variant_reservations_settling
+  rebuild_catalog_variant_coverage
 )
 MILO_WORK_SCOPE_TABLES=(
   catalog_work_scopes
@@ -368,6 +372,7 @@ MILO_WORK_SCOPE_TABLES=(
   catalog_snapshot_adoptions
   catalog_variant_coverage
   catalog_work_scope_unit_coverage
+  catalog_variant_reservations
 )
 # The migrations that create that surface, named in the readiness remedy.
 MILO_WORK_SCOPE_MIGRATIONS="20260922000100, 20260923000100, 20260924000100, 20260924000200, 20260927000100"

@@ -35,6 +35,26 @@ The ledger is an INDEX, not evidence: every status in it can be rebuilt from
 run history (`backfill`), so a ledger write that fails never changes a run's
 outcome, and source values are never touched.
 
+The paid-work claim (`catalog_variant_reservations`)
+----------------------------------------------------
+
+The ledger alone cannot stop two plans paying for one variant at once, nor
+stop a second plan paying while a FINISHED run's settlement is still missing.
+So before its first paid call a run CLAIMS every variant it is handed
+(`acquire_catalog_variant_reservations_guarded`, lease-guarded and atomic on
+the (identity key, level) row). A claim blocks every other run while its owner
+is running, and -- the crash window -- while its owner has FINISHED
+`completed` / `partial_success` and is not yet settled. Settlement (the ledger
+upsert of `derive_coverage`'s entries) releases the claims in the same
+transaction. It happens on the finalize path; when that write fails or the
+worker dies, it happens AUTOMATICALLY the next time anything needs the
+variant: the run preparation that meets a `settlement_pending` claim, and the
+queue build's bounded sweep (`reconcile_pending_settlements`), both settle the
+finished run from its own durable output with `settle_run`. The operator
+backfill stays a repair tool only. A claim whose owner ended without a result,
+or whose lease has been expired longer than the takeover grace, is dead and is
+taken over atomically by the next claimant.
+
 The variant identity key
 ------------------------
 
@@ -94,6 +114,20 @@ DECISION_QUEUE = "queue"
 EXCLUDED_ALREADY_ENRICHED = "excluded_already_enriched"
 EXCLUDED_KNOWN_UNRESOLVED = "excluded_known_unresolved"
 COVERAGE_DECISIONS = (DECISION_QUEUE, EXCLUDED_ALREADY_ENRICHED, EXCLUDED_KNOWN_UNRESOLVED)
+
+#: What claiming one candidate answers (`acquire_catalog_variant_reservations_
+#: guarded`): the run owns the paid work on it, the ledger already settles it,
+#: another live run owns it, or another run FINISHED it and awaits settlement.
+RESERVED = "reserved"
+RESERVED_BY_OTHER = "reserved_by_other"
+SETTLEMENT_PENDING = "settlement_pending"
+CLAIM_DECISIONS = (RESERVED, EXCLUDED_ALREADY_ENRICHED, EXCLUDED_KNOWN_UNRESOLVED,
+                   RESERVED_BY_OTHER, SETTLEMENT_PENDING)
+#: How long an owner's lease must have been expired before its claim is dead
+#: and may be taken over. Mirrors `catalog_variant_reservation_grace()`.
+RESERVATION_TAKEOVER_GRACE_SECONDS = 15 * 60
+#: The most runs one reconciliation pass settles.
+MAX_RECONCILE_RUNS = 50
 
 #: The most entries one ledger write carries. A batch run is handed at most
 #: `MAX_PROMOTIONS_PER_RUN` candidates; a duplicate group can name a few rows
@@ -374,9 +408,12 @@ def record_run_coverage(repository: Any, run_id: Any, preparation: Any,
     Called by the worker right after the run's terminal state is durable as
     ``completed`` or ``partial_success``, under the same lease identity that
     finalized it (`record_catalog_variant_coverage_guarded` accepts nothing
-    else). NEVER raises: the ledger is rebuildable from run history, so a
-    failure here is logged -- a static line, the exception CLASS only -- and
-    the run's outcome is exactly what it already is.
+    else). The same write releases the run's paid-work claims -- with no
+    entries at all, too, so a finished run never keeps a claim it earned
+    nothing on. NEVER raises: a failure here is logged -- a static line, the
+    exception CLASS only -- and the run's outcome is exactly what it already
+    is. The claims then keep blocking as `settlement_pending` until
+    `settle_run` settles the run from its durable output.
     """
     write = getattr(repository, "record_catalog_variant_coverage", None)
     if not callable(write) or preparation is None or not isinstance(result, Mapping):
@@ -384,8 +421,6 @@ def record_run_coverage(repository: Any, run_id: Any, preparation: Any,
     try:
         derived = derive_coverage(result, tuple(preparation.queue),
                                   _pinned_query(repository, preparation.snapshot_key))
-        if not derived.entries:
-            return None
         answer = write(run_id, level, [dict(entry) for entry in derived.entries],
                        worker_id=lease.get("worker_id"), attempt=lease.get("attempt"),
                        lease_token=lease.get("lease_token"))
@@ -408,7 +443,7 @@ MAX_BACKFILL_PAGE = 50
 
 #: The static reasons a run is skipped by the backfill, each counted.
 BACKFILL_SKIP_REASONS = ("NO_OUTPUT", "NO_PREPARATION", "PREPARATION_UNREADABLE",
-                         "SNAPSHOT_UNAVAILABLE", "NOTHING_TO_RECORD", "WRITE_REFUSED")
+                         "SNAPSHOT_UNAVAILABLE", "WRITE_REFUSED")
 
 
 @dataclass
@@ -465,9 +500,6 @@ def backfill_run(repository: Any, run: Mapping[str, Any], report: BackfillReport
     except Exception:
         report.skip("SNAPSHOT_UNAVAILABLE")
         return
-    if not derived.entries:
-        report.skip("NOTHING_TO_RECORD")
-        return
     report.by_run[run_id] = dict(derived.counts)
     if not dry_run:
         try:
@@ -509,7 +541,64 @@ def backfill(repository: Any, *, level: str = BATCH_COVERAGE_LEVEL,
         after = (page[-1]["finished_at"], page[-1]["run_id"])
 
 
-__all__ = ["BACKFILL_SKIP_REASONS", "BATCH_COVERAGE_LEVEL", "BackfillReport",
+def settle_run(repository: Any, run_id: Any, *, level: str = BATCH_COVERAGE_LEVEL,
+               log: Callable[[str], None] = _log) -> bool:
+    """Settle ONE finished run from its own durable data. Never raises.
+
+    The same derivation and the same write as the operator backfill
+    (`rebuild_catalog_variant_coverage`), which upserts the ledger and releases
+    the run's claims in one transaction; idempotent, so a crash before or after
+    it, or two callers at once, converge on the same state. The database
+    refuses a run that did not finish `completed` / `partial_success`. False
+    (logged) when the run could not be settled now -- its claims then keep
+    blocking, which is the safe side.
+    """
+    report = BackfillReport()
+    try:
+        backfill_run(repository, {"run_id": str(run_id)}, report, level=level)
+    except Exception as exc:
+        log(f"catalog coverage settlement failed: run_id={run_id} "
+            f"exception_class={type(exc).__name__}")
+        return False
+    if report.runs_recorded != 1:
+        log(f"catalog coverage settlement deferred: run_id={run_id} "
+            f"reason={','.join(sorted(report.skipped)) or 'UNKNOWN'}")
+        return False
+    return True
+
+
+def reconcile_pending_settlements(repository: Any, *, run_ids: Iterable[Any] | None = None,
+                                  level: str = BATCH_COVERAGE_LEVEL,
+                                  limit: int = MAX_RECONCILE_RUNS,
+                                  log: Callable[[str], None] = _log) -> dict[str, int]:
+    """Settle finished runs whose claims still await settlement. Never raises.
+
+    With `run_ids`: exactly those runs (the owners a claim answered
+    `settlement_pending` for). Without: ONE bounded page of them
+    (`catalog_variant_reservations_settling`, oldest first). This is the
+    AUTOMATIC recovery of the finalize path's ledger write: no operator runs
+    it.
+    """
+    bound = max(1, min(int(limit), MAX_RECONCILE_RUNS))
+    if run_ids is None:
+        listing = getattr(repository, "catalog_variant_reservations_settling", None)
+        if not callable(listing):
+            return {"settled": 0, "deferred": 0}
+        try:
+            run_ids = [row["run_id"] for row in listing(limit=bound)]
+        except Exception as exc:
+            log(f"catalog coverage reconciliation listing failed: "
+                f"exception_class={type(exc).__name__}")
+            return {"settled": 0, "deferred": 0}
+    wanted = list(dict.fromkeys(str(run) for run in run_ids))[:bound]
+    settled = sum(1 for run in wanted if settle_run(repository, run, level=level, log=log))
+    return {"settled": settled, "deferred": len(wanted) - settled}
+
+
+__all__ = ["BACKFILL_SKIP_REASONS", "CLAIM_DECISIONS", "MAX_RECONCILE_RUNS",
+           "RESERVATION_TAKEOVER_GRACE_SECONDS", "RESERVED", "RESERVED_BY_OTHER",
+           "SETTLEMENT_PENDING", "reconcile_pending_settlements", "settle_run",
+           "BATCH_COVERAGE_LEVEL", "BackfillReport",
            "COVERAGE_DECISIONS", "COVERAGE_LEVELS", "COVERAGE_STATUSES", "CoverageDerivation",
            "DECISION_QUEUE", "ENRICHED", "EXCLUDED_ALREADY_ENRICHED",
            "EXCLUDED_KNOWN_UNRESOLVED", "FAILED", "LEVEL_REGISTER", "MAX_BACKFILL_PAGE",

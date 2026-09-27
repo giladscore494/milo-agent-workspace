@@ -43,6 +43,17 @@
 --                                    (scripts/catalog/backfill_variant_coverage.py)
 --   work_scope_unit_coverage()       the Mapping Plan's per-unit counts
 --
+--   catalog_variant_reservations     the PAID-WORK CLAIM: at most one run
+--                                    owns (variant identity key, level)
+--                                    between run preparation and settlement
+--   acquire_catalog_variant_reservations_guarded()
+--                                    the worker's atomic check-and-claim,
+--                                    before any paid call (see section 6b)
+--   catalog_variant_reservations_settling()
+--                                    finished runs whose claims still await
+--                                    settlement: the automatic reconciliation
+--                                    sweep's bounded listing
+--
 -- Mirrors `backend/catalog/coverage.py` (the key, the rule, the ranks) and
 -- `backend/catalog/government/vocabulary.VOCABULARY_VERSION`.
 --
@@ -51,7 +62,7 @@
 --
 -- It changes no source value and no existing row: the ledger is an INDEX over
 -- run history, rebuildable at any time, and a run's evidence, verdicts and
--- output stay exactly as they were written. Additive and forward-only: two new
+-- output stay exactly as they were written. Additive and forward-only: three new
 -- relations, new functions, and three restated ones -- the plan record check
 -- (which additionally admits the optional `"include_unresolved": true`, so
 -- every stored revision still satisfies it), the queue build and its summary
@@ -235,6 +246,47 @@ create unique index if not exists catalog_work_scope_unit_coverage_unit_uidx
   on public.catalog_work_scope_unit_coverage(unit_id);
 create index if not exists catalog_work_scope_unit_coverage_preparation_idx
   on public.catalog_work_scope_unit_coverage(preparation_id);
+
+-- The paid-work claim. ONE row per (variant identity key, level) while a run
+-- owns the paid work on that variant: from the run's preparation until the
+-- run's result is settled into `catalog_variant_coverage` (the row is then
+-- deleted, in the same transaction as the ledger upsert). Whether a row still
+-- BLOCKS is derived from its owner run, never stored
+-- (`catalog_variant_reservation_state`), so a crash can never leave a claim
+-- in a state nobody can read.
+create table if not exists public.catalog_variant_reservations (
+  id uuid primary key default gen_random_uuid(),
+  variant_identity_key text not null,
+  level text not null,
+  -- The owning run and the attempt that last acquired the claim. A stale
+  -- attempt cannot act on it: every write is lease-guarded against the run
+  -- row, which names the CURRENT attempt only.
+  run_id uuid not null references public.runs(id) on delete restrict,
+  attempt integer not null,
+  batch_id uuid not null references public.catalog_work_scope_batches(id) on delete restrict,
+  candidate_id uuid not null references public.catalog_candidate_variants(id) on delete restrict,
+  content_sha256 text not null,
+  -- The run whose dead claim this row took over, when it did (audit only).
+  previous_run_id uuid references public.runs(id) on delete restrict,
+  reserved_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint catalog_variant_reservations_key_shape
+    check (variant_identity_key ~ '^[0-9a-f]{64}$'),
+  constraint catalog_variant_reservations_level check (level in ('register')),
+  constraint catalog_variant_reservations_attempt check (attempt >= 1),
+  constraint catalog_variant_reservations_content_shape check (content_sha256 ~ '^[0-9a-f]{64}$')
+);
+-- ONE owner per variant and level, across every plan and every run.
+create unique index if not exists catalog_variant_reservations_key_level_uidx
+  on public.catalog_variant_reservations(variant_identity_key, level);
+create index if not exists catalog_variant_reservations_run_idx
+  on public.catalog_variant_reservations(run_id);
+create index if not exists catalog_variant_reservations_batch_idx
+  on public.catalog_variant_reservations(batch_id);
+create index if not exists catalog_variant_reservations_candidate_idx
+  on public.catalog_variant_reservations(candidate_id);
+create index if not exists catalog_variant_reservations_previous_run_idx
+  on public.catalog_variant_reservations(previous_run_id);
 
 -- A preparation's record is a decision already made: never rewritten.
 drop trigger if exists catalog_work_scope_unit_coverage_append_only
@@ -805,7 +857,7 @@ $$;
 -- 6. Writing the ledger.
 -- ---------------------------------------------------------------------------
 --
--- `p_entries` is [{"candidate_id": uuid, "status": s}, ...] (1..200): which
+-- `p_entries` is [{"candidate_id": uuid, "status": s}, ...] (0..200): which
 -- candidate of the run's pinned snapshot earned which status, as derived from
 -- the run's durable output by `backend/catalog/coverage.derive_coverage`.
 -- Everything else is the database's own: the run must have FINISHED
@@ -818,6 +870,12 @@ $$;
 -- content a weaker status never replaces a stronger one (a later failure does
 -- not erase an enrichment); a changed register row replaces whatever was
 -- recorded. Applying the same run twice changes nothing.
+--
+-- SETTLEMENT: in the same transaction, every paid-work claim the run still
+-- holds at this level is released (deleted). The ledger rows and the claims'
+-- release commit together, so a variant is never left neither settled nor
+-- claimed; and since a claim is released only here, a run that finished but
+-- was not yet settled keeps blocking (`settling`) until it is.
 create or replace function public.catalog_variant_coverage_apply(
   p_run_id uuid, p_level text, p_entries jsonb
 ) returns jsonb
@@ -830,12 +888,13 @@ declare
   v_snapshot_key text;
   v_count integer;
   v_written integer;
+  v_released integer;
 begin
   if p_level is distinct from 'register' then
     raise exception 'CATALOG_COVERAGE_INVALID' using errcode = '22023';
   end if;
   if p_entries is null or jsonb_typeof(p_entries) <> 'array'
-     or jsonb_array_length(p_entries) not between 1 and 200
+     or jsonb_array_length(p_entries) not between 0 and 200
      or exists (select 1 from jsonb_array_elements(p_entries) as e
                  where jsonb_typeof(e) <> 'object'
                     or (select array_agg(k order by k collate "C") from jsonb_object_keys(e) as k)
@@ -901,9 +960,13 @@ begin
               is distinct from (excluded.status, excluded.last_run_id, excluded.snapshot_key,
                                 excluded.vocabulary_version));
   get diagnostics v_written = row_count;
+  delete from public.catalog_variant_reservations
+   where run_id = p_run_id and level = p_level;
+  get diagnostics v_released = row_count;
   return jsonb_build_object(
     'run_id', p_run_id, 'level', p_level, 'snapshot_key', v_snapshot_key,
-    'entries', jsonb_array_length(p_entries), 'written', v_written);
+    'entries', jsonb_array_length(p_entries), 'written', v_written,
+    'released', v_released);
 end;
 $$;
 
@@ -967,6 +1030,213 @@ as $$
    limit greatest(1, least(coalesce(p_limit, 50), 50));
 $$;
 
+-- ---------------------------------------------------------------------------
+-- 6b. The paid-work claim.
+-- ---------------------------------------------------------------------------
+--
+-- Filtering against the LEDGER alone cannot stop two plans paying for the
+-- same variant at once: both read "not settled", both pass preparation, both
+-- reach the provider before either settles. The claim closes that window.
+--
+-- What a claim's owner run says about it (`catalog_variant_reservation_state`):
+--
+--   active    the owner is not terminal and its lease is live, or expired for
+--             less than the takeover grace: it may still be paying
+--   settling  the owner finished `completed` / `partial_success` and has not
+--             been settled yet: its result EXISTS, so the variant must not be
+--             paid for again -- it blocks until settlement converts it
+--   dead      the owner ended `failed` / `cancelled` / `timed_out` /
+--             `budget_exhausted`, or is not terminal and its lease expired
+--             more than the takeover grace ago
+--
+-- The takeover grace (15 minutes, the same quiet period `reconcile_lost_launch`
+-- requires) is the explicit, deterministic rule that makes an interrupted
+-- run's claim retryable. It is safe: a worker whose lease expired cannot extend
+-- it (`heartbeat_run_guarded` refuses an expired lease), its budget tracker
+-- refuses every further model call once the run row's lease is expired
+-- (`holds_lease`), and a NEW attempt of the same run must re-acquire before its
+-- first paid call -- and is refused if the claim moved on meanwhile.
+create or replace function public.catalog_variant_reservation_grace()
+returns interval
+language sql
+immutable
+set search_path = pg_catalog
+as $$
+  select interval '15 minutes';
+$$;
+
+create or replace function public.catalog_variant_reservation_state(p_run_id uuid)
+returns text
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  select case
+    when r.id is null then 'dead'
+    when r.status in ('completed', 'partial_success') then 'settling'
+    when r.status in ('failed', 'cancelled', 'timed_out', 'budget_exhausted') then 'dead'
+    when coalesce(r.lease_expires_at, '-infinity'::timestamptz)
+         > now() - public.catalog_variant_reservation_grace() then 'active'
+    else 'dead' end
+    from (select p_run_id as id) as wanted
+    left join public.runs r on r.id = wanted.id;
+$$;
+
+-- The worker's claim, under its LIVE lease, before any paid call. For each
+-- named item of the run's own batch (1..20), in identity-key order so two
+-- overlapping claims never deadlock:
+--
+--   1. claim the (key, level) row -- insert it, or lock the existing one;
+--   2. with the row LOCKED, read the ledger (so a settlement that committed
+--      while this call waited is seen) and apply the ONE rule under the
+--      batch's own revision: an item the ledger settles is not claimed, and a
+--      claim just taken for it is given back;
+--   3. otherwise keep the row if this run owns it (a resumed attempt takes it
+--      over from the run's earlier attempt), take it over if its owner is
+--      `dead`, and leave it if its owner is `active` or `settling`.
+--
+-- Answers per item: `reserved`, `excluded_already_enriched`,
+-- `excluded_known_unresolved`, `reserved_by_other` or `settlement_pending`
+-- (with the owning run). Idempotent: the same run asking again gets the same
+-- answer. The unique index is the authority: two concurrent callers
+-- serialize on the row, and exactly one owns it.
+create or replace function public.acquire_catalog_variant_reservations_guarded(
+  p_run_id uuid, p_worker_id text, p_attempt integer, p_lease_token text, p_level text,
+  p_candidate_ids jsonb
+) returns jsonb
+language plpgsql
+set search_path = pg_catalog
+as $$
+declare
+  v_status text;
+  v_batch public.catalog_work_scope_batches;
+  v_include boolean;
+  v_item record;
+  v_row public.catalog_variant_reservations;
+  v_ledger public.catalog_variant_coverage;
+  v_decision text;
+  v_owner text;
+  v_answer jsonb := '[]'::jsonb;
+begin
+  perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);
+  if p_level is distinct from 'register' then
+    raise exception 'CATALOG_COVERAGE_INVALID' using errcode = '22023';
+  end if;
+  select r.status into v_status from public.runs r where r.id = p_run_id;
+  if v_status in ('completed', 'partial_success', 'failed', 'cancelled', 'timed_out',
+                  'budget_exhausted') then
+    raise exception 'CATALOG_COVERAGE_RUN_FINISHED' using errcode = '55000';
+  end if;
+  if p_candidate_ids is null or jsonb_typeof(p_candidate_ids) <> 'array'
+     or jsonb_array_length(p_candidate_ids) not between 1 and 20
+     or exists (select 1 from jsonb_array_elements(p_candidate_ids) as e
+                 where jsonb_typeof(e) <> 'string'
+                    or e #>> '{}' !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+     or (select count(distinct e #>> '{}') from jsonb_array_elements(p_candidate_ids) as e)
+          <> jsonb_array_length(p_candidate_ids) then
+    raise exception 'CATALOG_COVERAGE_INVALID' using errcode = '22023';
+  end if;
+  select b.* into v_batch
+    from public.catalog_work_scope_batch_runs br
+    join public.catalog_work_scope_batches b on b.id = br.batch_id
+   where br.run_id = p_run_id;
+  if v_batch.id is null then
+    raise exception 'CATALOG_COVERAGE_RUN_UNBOUND' using errcode = '22023';
+  end if;
+  -- Every named item must be an item of the run's own batch.
+  if (select count(*) from jsonb_array_elements(p_candidate_ids) as e
+        join public.catalog_work_scope_queue_items i
+          on i.batch_id = v_batch.id and i.candidate_id = (e #>> '{}')::uuid)
+     <> jsonb_array_length(p_candidate_ids) then
+    raise exception 'CATALOG_COVERAGE_CANDIDATE_INVALID' using errcode = '22023';
+  end if;
+  select coalesce(rev.scope->'include_unresolved' = 'true'::jsonb, false) into v_include
+    from public.catalog_work_scope_revisions rev
+   where rev.work_scope_id = v_batch.work_scope_id and rev.revision = v_batch.revision;
+  v_include := coalesce(v_include, false);
+
+  for v_item in
+    select x.* from (
+      select c.id as candidate_id, r.upstream_record_id,
+             public.catalog_variant_identity_key(
+               c.manufacturer, c.commercial_model, c.model_year_start, c.model_year_end,
+               c.official_model_code, c.trim, c.identity_dimensions) as identity_key,
+             public.catalog_variant_content_sha256(r.payload) as content
+        from jsonb_array_elements(p_candidate_ids) as e
+        join public.catalog_candidate_variants c on c.id = (e #>> '{}')::uuid
+        join public.catalog_raw_records r on r.id = c.raw_record_id) as x
+     order by x.identity_key collate "C", x.candidate_id
+  loop
+    -- 1. The row, claimed or locked. A concurrent claim of the same key waits
+    --    here for the other transaction and then sees its committed row.
+    insert into public.catalog_variant_reservations
+      (variant_identity_key, level, run_id, attempt, batch_id, candidate_id, content_sha256)
+    values (v_item.identity_key, p_level, p_run_id, p_attempt, v_batch.id,
+            v_item.candidate_id, v_item.content)
+    on conflict (variant_identity_key, level) do nothing;
+    select * into v_row from public.catalog_variant_reservations
+     where variant_identity_key = v_item.identity_key and level = p_level
+       for update;
+    -- 2. The ledger, read with the row locked.
+    select * into v_ledger from public.catalog_variant_coverage
+     where variant_identity_key = v_item.identity_key and level = p_level;
+    v_decision := public.catalog_variant_coverage_decision(
+      v_ledger.status, v_ledger.content_sha256, v_ledger.vocabulary_version, v_item.content,
+      v_include);
+    v_owner := null;
+    if v_decision <> 'queue' then
+      -- Settled: nothing to claim. A claim this run holds on it is given back.
+      delete from public.catalog_variant_reservations
+       where id = v_row.id and run_id = p_run_id;
+    elsif v_row.run_id = p_run_id then
+      update public.catalog_variant_reservations
+         set attempt = p_attempt, updated_at = now()
+       where id = v_row.id;
+      v_decision := 'reserved';
+    else
+      v_owner := public.catalog_variant_reservation_state(v_row.run_id);
+      if v_owner = 'dead' then
+        update public.catalog_variant_reservations
+           set previous_run_id = v_row.run_id, run_id = p_run_id, attempt = p_attempt,
+               batch_id = v_batch.id, candidate_id = v_item.candidate_id,
+               content_sha256 = v_item.content, reserved_at = now(), updated_at = now()
+         where id = v_row.id;
+        v_decision := 'reserved';
+      elsif v_owner = 'settling' then
+        v_decision := 'settlement_pending';
+      else
+        v_decision := 'reserved_by_other';
+      end if;
+    end if;
+    v_answer := v_answer || jsonb_build_object(
+      'candidate_id', v_item.candidate_id, 'upstream_record_id', v_item.upstream_record_id,
+      'variant_identity_key', v_item.identity_key, 'decision', v_decision,
+      'owner_run_id', case when v_decision in ('reserved_by_other', 'settlement_pending')
+                           then v_row.run_id end);
+  end loop;
+  return jsonb_build_object('run_id', p_run_id, 'level', p_level, 'batch_id', v_batch.id,
+                            'items', v_answer);
+end;
+$$;
+
+-- The automatic reconciliation sweep's listing: runs that FINISHED
+-- `completed` / `partial_success` and still hold claims (their settlement never
+-- ran, or failed), oldest first, 1..50 per page. Each is settled from its own
+-- durable output by `backend/catalog/coverage.settle_run`.
+create or replace function public.catalog_variant_reservations_settling(p_limit integer)
+returns table (run_id uuid, finished_at timestamptz)
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  select r.id, r.finished_at
+    from public.runs r
+   where r.status in ('completed', 'partial_success')
+     and exists (select 1 from public.catalog_variant_reservations v where v.run_id = r.id)
+   order by r.finished_at nulls first, r.id
+   limit greatest(1, least(coalesce(p_limit, 50), 50));
+$$;
+
 -- The Mapping Plan's per-unit counts of one preparation (never the register
 -- ids, which stay in the durable row). Empty for a preparation written before
 -- this migration: the website then renders the unit without them.
@@ -990,6 +1260,7 @@ $$;
 -- ---------------------------------------------------------------------------
 alter table public.catalog_variant_coverage enable row level security;
 alter table public.catalog_work_scope_unit_coverage enable row level security;
+alter table public.catalog_variant_reservations enable row level security;
 
 do $$
 declare fn text; relation text;
@@ -1011,7 +1282,11 @@ begin
     'public.record_catalog_variant_coverage_guarded(uuid,text,integer,text,text,jsonb)',
     'public.rebuild_catalog_variant_coverage(uuid,text,jsonb)',
     'public.catalog_variant_coverage_runs(timestamptz,uuid,integer)',
-    'public.work_scope_unit_coverage(uuid)'
+    'public.work_scope_unit_coverage(uuid)',
+    'public.catalog_variant_reservation_grace()',
+    'public.catalog_variant_reservation_state(uuid)',
+    'public.acquire_catalog_variant_reservations_guarded(uuid,text,integer,text,text,jsonb)',
+    'public.catalog_variant_reservations_settling(integer)'
   ] loop
     execute format('revoke execute on function %s from public', fn);
     if exists (select 1 from pg_roles where rolname='anon') then
@@ -1026,7 +1301,8 @@ begin
   end loop;
 
   foreach relation in array array[
-    'public.catalog_variant_coverage', 'public.catalog_work_scope_unit_coverage'
+    'public.catalog_variant_coverage', 'public.catalog_work_scope_unit_coverage',
+    'public.catalog_variant_reservations'
   ] loop
     execute format('revoke all on table %s from public', relation);
     if exists (select 1 from pg_roles where rolname='anon') then
@@ -1043,5 +1319,7 @@ begin
     execute 'revoke delete on table public.catalog_variant_coverage from service_role';
     execute 'grant select, insert on table public.catalog_work_scope_unit_coverage to service_role';
     execute 'revoke update, delete on table public.catalog_work_scope_unit_coverage from service_role';
+    -- A claim is taken, moved on and released (at settlement) by the RPCs.
+    execute 'grant select, insert, update, delete on table public.catalog_variant_reservations to service_role';
   end if;
 end $$;

@@ -31,6 +31,7 @@ import re
 import uuid
 import shutil
 import subprocess
+import time
 import tempfile
 from pathlib import Path
 
@@ -3678,11 +3679,14 @@ CATALOG_RPCS = ("record_catalog_snapshot_guarded", "record_catalog_raw_record_gu
 CATALOG_RECOVERY_TABLES = ("catalog_snapshot_adoptions",)
 #: PR-Z (20260927000100): the variant coverage ledger and each prepared unit's
 #: ledger exclusions.
-CATALOG_COVERAGE_TABLES = ("catalog_variant_coverage", "catalog_work_scope_unit_coverage")
+CATALOG_COVERAGE_TABLES = ("catalog_variant_coverage", "catalog_work_scope_unit_coverage",
+                           "catalog_variant_reservations")
 CATALOG_COVERAGE_RPCS = ("catalog_variant_coverage_for_batch",
                          "record_catalog_variant_coverage_guarded",
                          "rebuild_catalog_variant_coverage", "catalog_variant_coverage_runs",
-                         "work_scope_unit_coverage")
+                         "work_scope_unit_coverage",
+                         "acquire_catalog_variant_reservations_guarded",
+                         "catalog_variant_reservations_settling")
 CATALOG_RECOVERY_RPCS = ("adopt_catalog_snapshot_guarded",
                          "record_catalog_raw_records_batch_guarded",
                          "record_catalog_candidates_batch_guarded")
@@ -7708,16 +7712,19 @@ def _wsp_units(toyota_snapshot: str | None, *, state: str = "captured",
              "register_marque": None, "snapshot_id": None, "reason_code": None}]
 
 
-def _wsp_world(db, **scope_overrides) -> dict:
+def _wsp_world(db, make: str = WSP_TOYOTA, **scope_overrides) -> dict:
     """A swarm_v2 plan at revision 1, its operator capture lease, and a scoped
-    Toyota snapshot whose candidates straddle the plan's model years."""
+    Toyota snapshot whose candidates straddle the plan's model years. `make`
+    is the candidates' stated marque: every world stating the same one states
+    the same variant identities."""
     user, _project, conversation = _ws_world(db)
     scope = _ws_scope(**{"max_items": 25, "batch_size": 10, **scope_overrides})
     created = _ws_create(db, conversation, user, scope)
     capture_run, args = _wsp_capture_run(db, conversation)
     rows = ([("candidate", 2019)] * 23 + [("candidate", 2016)] * 2
             + [("ambiguous", 2020)] * 3 + [("ready_for_review", 2021)])
-    snapshot, key, candidates = _wsp_snapshot(db, args, f"toyota-{conversation[:8]}", rows)
+    snapshot, key, candidates = _wsp_snapshot(db, args, f"toyota-{conversation[:8]}", rows,
+                                              make=make)
     return {"user": user, "conversation": conversation, "scope": scope,
             "plan": created["work_scope"]["id"], "digest": scope.digest(),
             "capture_run": capture_run, "args": args, "snapshot": snapshot,
@@ -8062,9 +8069,9 @@ def _wsb_migration():
     return next(m for m in MIGRATIONS if m.name.startswith("20260924000100"))
 
 
-def _wsb_world(db, **scope_overrides) -> dict:
+def _wsb_world(db, make: str = WSP_TOYOTA, **scope_overrides) -> dict:
     """A prepared plan: batches 1-3 of the Toyota unit (10, 10, 3 candidates)."""
-    world = _wsp_world(db, **scope_overrides)
+    world = _wsp_world(db, make=make, **scope_overrides)
     summary = _wsp_prepare(db, world["args"], world["plan"], 1, world["digest"],
                            _wsp_units(world["snapshot"]))
     world["batches"] = [batch["id"] for batch in summary["batches"]]
@@ -8989,7 +8996,7 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
                 f"('{migration.name.split('_', 1)[0]}')")
     schema = _readiness(production_shaped_db, "--schema-only")
     assert schema.returncode == 0, schema.stdout
-    assert "WORK_SCOPE_SCHEMA=VERIFIED (11 tables with RLS, 15 RPCs service_role-only)" in schema.stdout
+    assert "WORK_SCOPE_SCHEMA=VERIFIED (12 tables with RLS, 18 RPCs service_role-only)" in schema.stdout
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
@@ -9847,9 +9854,11 @@ def ledger_db(db):
     """The shared database with an EMPTY ledger, before and after: every
     `_wsp_world` states the same candidate identities, and the ledger is
     global by design, so one test's rows would settle the next test's queue."""
-    db.psql("delete from public.catalog_variant_coverage")
+    db.psql("delete from public.catalog_variant_coverage; "
+            "delete from public.catalog_variant_reservations")
     yield db
-    db.psql("delete from public.catalog_variant_coverage")
+    db.psql("delete from public.catalog_variant_coverage; "
+            "delete from public.catalog_variant_reservations")
 
 
 def _sql_text(value) -> str:
@@ -10033,7 +10042,7 @@ def test_pr_z_the_batch_read_and_the_ledger_write(ledger_db):
     for bad, code in (
             ([{"candidate_id": foreign, "status": "enriched"}], "CATALOG_COVERAGE_CANDIDATE_INVALID"),
             ([{"candidate_id": items[0]["candidate_id"], "status": "done"}], "CATALOG_COVERAGE_INVALID"),
-            ([], "CATALOG_COVERAGE_INVALID")):
+            ([{"candidate_id": items[0]["candidate_id"]}], "CATALOG_COVERAGE_INVALID")):
         with pytest.raises(AssertionError, match=code):
             _rpc_as_service(db, "select public.rebuild_catalog_variant_coverage("
                                 f"'{run}', 'register', $e${json.dumps(bad)}$e$::jsonb)")
@@ -10046,14 +10055,17 @@ def test_pr_z_the_batch_read_and_the_ledger_write(ledger_db):
 
 
 def test_pr_z_relations_and_functions_are_service_only(db):
-    for table in ("catalog_variant_coverage", "catalog_work_scope_unit_coverage"):
+    for table in ("catalog_variant_coverage", "catalog_work_scope_unit_coverage",
+                  "catalog_variant_reservations"):
         assert db.psql(f"select relrowsecurity from pg_class where oid='public.{table}'::regclass") == "t"
         assert db.psql(f"select count(*) from pg_policies where tablename='{table}'") == "0"
         for role in ("anon", "authenticated"):
             for privilege in ("select", "insert", "update", "delete"):
                 assert db.psql(f"select has_table_privilege('{role}', 'public.{table}', "
                                f"'{privilege}')") == "f"
-        assert db.psql(f"select has_table_privilege('service_role', 'public.{table}', 'delete')") == "f"
+        # A claim is released (deleted) at settlement; nothing else is deleted.
+        assert db.psql(f"select has_table_privilege('service_role', 'public.{table}', "
+                       "'delete')") == ("t" if table == "catalog_variant_reservations" else "f")
     assert db.psql("select has_table_privilege('service_role', 'public.catalog_variant_coverage', "
                    "'update')") == "t"
     assert db.psql("select has_table_privilege('service_role', "
@@ -10063,9 +10075,280 @@ def test_pr_z_relations_and_functions_are_service_only(db):
                       "public.catalog_variant_coverage_for_batch(uuid,text)",
                       "public.catalog_variant_coverage_runs(timestamptz,uuid,integer)",
                       "public.work_scope_unit_coverage(uuid)",
-                      "public.prepare_work_scope_queue(uuid,text,integer,text,jsonb)"):
+                      "public.prepare_work_scope_queue(uuid,text,integer,text,jsonb)",
+                      "public.acquire_catalog_variant_reservations_guarded(uuid,text,integer,text,text,jsonb)",
+                      "public.catalog_variant_reservations_settling(integer)",
+                      "public.catalog_variant_reservation_state(uuid)"):
         for role in ("anon", "authenticated"):
             assert db.psql(f"select has_function_privilege('{role}', '{signature}', 'execute')") == "f"
         assert db.psql(f"select has_function_privilege('service_role', '{signature}', 'execute')") == "t"
     # Rerun-safe.
     db.psql(file=_coverage_migration())
+
+
+# -----------------------------------------------------------------------------
+# PR-Z: the paid-work claim (`catalog_variant_reservations`). Two plans racing
+# for one variant, stale attempts, interrupted runs and a finished run whose
+# settlement never landed -- in real PostgreSQL, with real concurrent sessions.
+# -----------------------------------------------------------------------------
+
+def _psql_cmd(db, *statements: str) -> list[str]:
+    """ONE psql session running `statements` in order (so a transaction a
+    statement opens is held across the ones after it)."""
+    cmd = ["psql", "-h", db.dir, "-p", db.port, "-U", "postgres", "-d", "milo",
+           "-v", "ON_ERROR_STOP=1", "-X", "-q", "-t", "-A"]
+    for statement in statements:
+        cmd += ["-c", statement]
+    return cmd
+
+
+def _json_lines(output: str) -> list[dict]:
+    return [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+
+
+def _claim_run(db, world: dict, *, key: str, batch: int = 0) -> dict:
+    """ONE batch run of the world's plan, claimed by a worker: its lease and items."""
+    started = _wsb_start(db, world, world["batches"][batch], key=key)
+    run = started["run"]["id"]
+    worker = f"w-{run[:8]}"
+    attempt, token = db.psql(
+        f"select attempt, lease_token from public.claim_run_lease('{run}', '{worker}', 300)"
+    ).split("|")
+    items = json.loads(db.psql(
+        "select json_agg(candidate_id order by batch_position) from "
+        f"public.catalog_work_scope_queue_items where batch_id='{world['batches'][batch]}'"))
+    return {"run": run, "worker": worker, "attempt": int(attempt), "token": token,
+            "items": items}
+
+
+def _acquire_sql(claim: dict, *, level: str = "register", attempt: int | None = None,
+                 token: str | None = None, worker: str | None = None) -> str:
+    return ("select public.acquire_catalog_variant_reservations_guarded("
+            f"'{claim['run']}', '{worker or claim['worker']}', {attempt or claim['attempt']}, "
+            f"'{token or claim['token']}', '{level}', "
+            f"$c${json.dumps(claim['items'])}$c$::jsonb)")
+
+
+def _acquire(db, claim: dict, **kwargs) -> dict:
+    return json.loads(_rpc_as_service(db, _acquire_sql(claim, **kwargs)))
+
+
+def _decisions(answer: dict) -> list[str]:
+    return [item["decision"] for item in answer["items"]]
+
+
+def _owners(db) -> dict[str, str]:
+    rows = db.psql("select variant_identity_key || '=' || run_id from "
+                   "public.catalog_variant_reservations where level = 'register'")
+    return dict(row.split("=") for row in rows.splitlines() if row)
+
+
+def test_pr_z_two_plans_claiming_one_variant_concurrently_only_one_owns_it(ledger_db):
+    db = ledger_db
+    first, second = _wsb_world(db), _wsb_world(db)
+    a = _claim_run(db, first, key=f"race-a-{first['plan'][:8]}")
+    b = _claim_run(db, second, key=f"race-b-{second['plan'][:8]}")
+    # Both batches hold the SAME ten variant identities, and the ledger is empty.
+    assert db.psql("select count(*) from public.catalog_variant_coverage") == "0"
+
+    # A claims inside an open transaction and holds it; B claims meanwhile.
+    holder = subprocess.Popen(_psql_cmd(db, "begin", "set role service_role", _acquire_sql(a),
+                                        "select pg_sleep(3)", "commit"),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 30
+    while db.psql("select count(*) from pg_stat_activity where state = 'active' "
+                  "and query = 'select pg_sleep(3)'") != "1":
+        assert time.monotonic() < deadline and holder.poll() is None, holder.stderr.read()
+        time.sleep(0.05)
+    # B blocks on A's uncommitted rows, then sees them committed and live.
+    b_answer = _acquire(db, b)
+    out, err = holder.communicate(timeout=60)
+    assert holder.returncode == 0, err
+    (a_answer,) = _json_lines(out)
+    assert _decisions(a_answer) == ["reserved"] * 10
+    assert set(_decisions(b_answer)) == {"reserved_by_other"}
+    assert {item["owner_run_id"] for item in b_answer["items"]} == {a["run"]}
+    assert set(_owners(db).values()) == {a["run"]} and len(_owners(db)) == 10
+
+    # No interleaving lets both win: the same two claims, fired at once.
+    for _round in range(5):
+        db.psql("delete from public.catalog_variant_reservations")
+        racers = [subprocess.Popen(_psql_cmd(db, "set role service_role", _acquire_sql(claim)),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  for claim in (a, b)]
+        answers = []
+        for racer in racers:
+            out, err = racer.communicate(timeout=60)
+            assert racer.returncode == 0, err
+            answers.append(_json_lines(out)[0])
+        by_key: dict[str, list[str]] = {}
+        for answer in answers:
+            for item in answer["items"]:
+                by_key.setdefault(item["variant_identity_key"], []).append(item["decision"])
+        assert len(by_key) == 10
+        for decisions in by_key.values():
+            assert sorted(decisions) == ["reserved", "reserved_by_other"], decisions
+        owners = _owners(db)
+        for answer in answers:
+            for item in answer["items"]:
+                assert (owners[item["variant_identity_key"]] == answer["run_id"]) \
+                    == (item["decision"] == "reserved")
+
+
+def test_pr_z_different_variants_are_claimed_independently(ledger_db):
+    db = ledger_db
+    a = _claim_run(db, (first := _wsb_world(db, make="טויוטה-A")), key=f"ind-a-{first['plan'][:8]}")
+    b = _claim_run(db, (second := _wsb_world(db, make="טויוטה-B")), key=f"ind-b-{second['plan'][:8]}")
+    assert _decisions(_acquire(db, a)) == ["reserved"] * 10
+    assert _decisions(_acquire(db, b)) == ["reserved"] * 10
+    assert sorted(_owners(db).values()) == sorted([a["run"]] * 10 + [b["run"]] * 10)
+
+
+def test_pr_z_a_claim_is_scoped_by_level(ledger_db):
+    db = ledger_db
+    first, second = _wsb_world(db), _wsb_world(db)
+    a = _claim_run(db, first, key=f"lvl-a-{first['plan'][:8]}")
+    b = _claim_run(db, second, key=f"lvl-b-{second['plan'][:8]}")
+    # A LIVE run's claim on every one of these variants at ANOTHER level (the
+    # level CHECK is widened inside the transaction only; it is rolled back).
+    out = subprocess.run(_psql_cmd(
+        db, "begin",
+        "alter table public.catalog_variant_reservations "
+        "drop constraint catalog_variant_reservations_level",
+        "insert into public.catalog_variant_reservations (variant_identity_key, level, run_id, "
+        "attempt, batch_id, candidate_id, content_sha256) "
+        "select public.catalog_variant_identity_key(c.manufacturer, c.commercial_model, "
+        "c.model_year_start, c.model_year_end, c.official_model_code, c.trim, "
+        f"c.identity_dimensions), 'web', '{b['run']}', 1, i.batch_id, c.id, repeat('c', 64) "
+        "from public.catalog_work_scope_queue_items i join public.catalog_candidate_variants c "
+        f"on c.id = i.candidate_id where i.batch_id = '{second['batches'][0]}'",
+        _acquire_sql(a), "rollback"), capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    (answer,) = _json_lines(out.stdout)
+    assert _decisions(answer) == ["reserved"] * 10
+    with pytest.raises(AssertionError, match="CATALOG_COVERAGE_INVALID"):
+        _acquire(db, a, level="web")
+
+
+def test_pr_z_a_stale_attempt_can_neither_claim_settle_nor_steal(ledger_db):
+    db = ledger_db
+    world = _wsb_world(db)
+    a = _claim_run(db, world, key=f"stale-{world['plan'][:8]}")
+    assert _decisions(_acquire(db, a)) == ["reserved"] * 10
+    # Attempt 1's worker dies; attempt 2 reclaims the run.
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '1 second' "
+            f"where id = '{a['run']}'")
+    attempt, token = db.psql(f"select attempt, lease_token from public.claim_run_lease("
+                             f"'{a['run']}', 'w-retry', 300)").split("|")
+    assert int(attempt) == a["attempt"] + 1
+    with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+        _acquire(db, a)                                        # attempt 1: refused
+    retry = {**a, "worker": "w-retry", "attempt": int(attempt), "token": token}
+    assert _decisions(_acquire(db, retry)) == ["reserved"] * 10
+    assert db.psql("select string_agg(distinct attempt::text, ',') from "
+                   f"public.catalog_variant_reservations where run_id = '{a['run']}'") == attempt
+    # Another plan's run cannot steal them while attempt 2 is live.
+    other = _wsb_world(db)
+    b = _claim_run(db, other, key=f"stale-b-{other['plan'][:8]}")
+    assert set(_decisions(_acquire(db, b))) == {"reserved_by_other"}
+    # Nor can attempt 1 settle the run once attempt 2 finished it.
+    _wsb_finish(db, a["run"], "partial_success")
+    entries = json.dumps([{"candidate_id": item, "status": "enriched"} for item in a["items"]])
+    with pytest.raises(AssertionError, match="STALE_WORKER_WRITE"):
+        _rpc_as_service(db, "select public.record_catalog_variant_coverage_guarded("
+                            f"'{a['run']}', '{a['worker']}', {a['attempt']}, '{a['token']}', "
+                            f"'register', $e${entries}$e$::jsonb)")
+    assert set(_owners(db).values()) == {a["run"]}
+    # A finished run can no longer claim anything.
+    with pytest.raises(AssertionError, match="CATALOG_COVERAGE_RUN_FINISHED"):
+        _acquire(db, retry)
+
+
+def test_pr_z_an_interrupted_run_becomes_retryable_by_one_explicit_rule(ledger_db):
+    db = ledger_db
+    first, second = _wsb_world(db), _wsb_world(db)
+    a = _claim_run(db, first, key=f"int-a-{first['plan'][:8]}")
+    b = _claim_run(db, second, key=f"int-b-{second['plan'][:8]}")
+    assert _decisions(_acquire(db, a)) == ["reserved"] * 10
+    # Lease lapsed, but within the takeover grace: still A's.
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '14 minutes' "
+            f"where id = '{a['run']}'")
+    assert set(_decisions(_acquire(db, b))) == {"reserved_by_other"}
+    # Past the grace: dead, and taken over atomically.
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '16 minutes' "
+            f"where id = '{a['run']}'")
+    assert _decisions(_acquire(db, b)) == ["reserved"] * 10
+    assert set(_owners(db).values()) == {b["run"]}
+    assert db.psql("select string_agg(distinct previous_run_id::text, ',') from "
+                   "public.catalog_variant_reservations") == a["run"]
+    # A reclaimed later re-claims before any paid call, and gets nothing.
+    attempt, token = db.psql(f"select attempt, lease_token from public.claim_run_lease("
+                             f"'{a['run']}', 'w-a-retry', 300)").split("|")
+    resumed = _acquire(db, {**a, "worker": "w-a-retry", "attempt": int(attempt), "token": token})
+    assert set(_decisions(resumed)) == {"reserved_by_other"}
+    # A run that ENDED without a result releases at once.
+    third = _wsb_world(db)
+    c = _claim_run(db, third, key=f"int-c-{third['plan'][:8]}")
+    _wsb_finish(db, b["run"], "failed")
+    assert _decisions(_acquire(db, c)) == ["reserved"] * 10
+
+
+def test_pr_z_a_finished_unsettled_run_blocks_until_settlement_converges(ledger_db):
+    db = ledger_db
+    first, second = _wsb_world(db), _wsb_world(db)
+    a = _claim_run(db, first, key=f"set-a-{first['plan'][:8]}")
+    b = _claim_run(db, second, key=f"set-b-{second['plan'][:8]}")
+    assert _decisions(_acquire(db, a)) == ["reserved"] * 10
+    # Paid work done, the run durably finalized -- and settlement never ran.
+    db.psql(f"update public.runs set status = 'partial_success', finished_at = now() "
+            f"where id = '{a['run']}'")
+    blocked = _acquire(db, b)
+    assert set(_decisions(blocked)) == {"settlement_pending"}
+    assert {item["owner_run_id"] for item in blocked["items"]} == {a["run"]}
+    # Even past any takeover grace: a FINISHED run's claim never goes dead.
+    db.psql(f"update public.runs set lease_expires_at = now() - interval '2 hours' "
+            f"where id = '{a['run']}'")
+    assert set(_decisions(_acquire(db, b))) == {"settlement_pending"}
+    listed = _rpc_as_service(db, "select string_agg(run_id::text, ',') from "
+                                 "public.catalog_variant_reservations_settling(50)")
+    assert listed == a["run"]
+
+    # The recovery: settle A from its result. Ledger and release, one step.
+    entries = json.dumps([{"candidate_id": item, "status": "enriched"} for item in a["items"][:6]]
+                         + [{"candidate_id": item, "status": "failed"} for item in a["items"][6:]])
+    settle = f"select public.rebuild_catalog_variant_coverage('{a['run']}', 'register', $e${entries}$e$::jsonb)"
+    settled = json.loads(_rpc_as_service(db, settle))
+    assert (settled["written"], settled["released"]) == (10, 10)
+    assert _owners(db) == {}
+    assert _rpc_as_service(db, "select count(*) from "
+                               "public.catalog_variant_reservations_settling(50)") == "0"
+    ledger = db.psql("select string_agg(status, ',' order by status) from "
+                     "public.catalog_variant_coverage")
+    # Converges: settling again, from any caller, changes nothing.
+    again = json.loads(_rpc_as_service(db, settle))
+    assert (again["written"], again["released"]) == (0, 0)
+    assert db.psql("select string_agg(status, ',' order by status) from "
+                   "public.catalog_variant_coverage") == ledger
+    # B now pays only for what A did not settle: the four `failed`.
+    after = _acquire(db, b)
+    assert _decisions(after).count("excluded_already_enriched") == 6
+    assert _decisions(after).count("reserved") == 4
+    assert _decisions(_acquire(db, b)) == _decisions(after)          # idempotent
+    # A settlement with no entries still releases the run's claims.
+    assert set(_owners(db).values()) == {b["run"]}
+    _wsb_finish(db, b["run"], "completed")
+    released = json.loads(_rpc_as_service(
+        db, f"select public.rebuild_catalog_variant_coverage('{b['run']}', 'register', '[]'::jsonb)"))
+    assert (released["entries"], released["released"]) == (0, 4) and _owners(db) == {}
+
+
+def test_pr_z_a_claim_is_given_back_when_the_ledger_already_settles_it(ledger_db):
+    db = ledger_db
+    world = _wsb_world(db)
+    a = _claim_run(db, world, key=f"give-{world['plan'][:8]}")
+    for index, candidate in enumerate(a["items"][:3]):
+        world["candidates"][index] = candidate
+        _coverage_seed(db, world, index, "enriched")
+    answer = _acquire(db, a)
+    assert _decisions(answer).count("excluded_already_enriched") == 3
+    assert len(_owners(db)) == 7

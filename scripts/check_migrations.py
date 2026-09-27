@@ -185,6 +185,16 @@ REQUIRED_PER_FILE["20260927000100_catalog_variant_coverage.sql"] = [
     "stale_worker_write: coverage write rejected",
     "public.catalog_variant_coverage_rank(excluded.status)",
     "create trigger catalog_work_scope_unit_coverage_append_only",
+    # The paid-work claim: ONE owner per variant and level, claimed with the
+    # row locked BEFORE the ledger is read, released only by settlement, and
+    # never taken from a FINISHED run.
+    "create table if not exists public.catalog_variant_reservations (",
+    "create unique index if not exists catalog_variant_reservations_key_level_uidx",
+    "on conflict (variant_identity_key, level) do nothing;",
+    "for update;",
+    "when r.status in ('completed', 'partial_success') then 'settling'",
+    "delete from public.catalog_variant_reservations\n   where run_id = p_run_id and level = p_level;",
+    "create or replace function public.catalog_variant_reservations_settling(",
 ]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the

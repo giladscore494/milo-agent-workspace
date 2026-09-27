@@ -693,9 +693,12 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     return 0
             if catalog_state["posture"]["government_read"]:
                 try:
+                    # PR-Z: under this attempt's lease, so preparation CLAIMS
+                    # the paid work on every item it hands the engine (and a
+                    # resume re-claims it) before any provider path exists.
                     preparation = prepare_government_work(
                         repo, checkpoint=latest_checkpoint, cancellation_checker=is_cancelled,
-                        run_id=run_id)
+                        run_id=run_id, lease=lease_ctx)
                 except GovernmentPreparationError as exc:
                     finalizer.finalize(TerminalClaim.refusal(
                         workflow_key, exc.code, exc.safe_message,
@@ -734,13 +737,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                              "resumed": preparation.resumed,
                              "excluded_placeholder": preparation.excluded_placeholder,
                              "excluded_already_enriched": preparation.excluded_already_enriched,
-                             "excluded_known_unresolved": preparation.excluded_known_unresolved}))
+                             "excluded_known_unresolved": preparation.excluded_known_unresolved,
+                             "excluded_reserved": preparation.excluded_reserved}))
                 if preparation.excluded:
                     print(f"government preparation: run_id={run_id} "
                           f"queued={len(preparation.queue)} "
                           f"excluded_placeholder={preparation.excluded_placeholder} "
                           f"excluded_already_enriched={preparation.excluded_already_enriched} "
-                          f"excluded_known_unresolved={preparation.excluded_known_unresolved}")
+                          f"excluded_known_unresolved={preparation.excluded_known_unresolved} "
+                          f"excluded_reserved={preparation.excluded_reserved}")
                 if is_preparation_checkpoint(latest_checkpoint):
                     # The latest checkpoint is the preparation record itself:
                     # the engine has no state to resume and must start fresh.
@@ -1401,11 +1406,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
         if workflow_key == "swarm_v2" and decision.wrote \
                 and decision.status in ("completed", "partial_success") \
                 and catalog_state.get("preparation") is not None:
-            # PR-Z: the coverage ledger, written by the same finalize path that
-            # wrote the result, AFTER that result is durable and under the
-            # lease identity that finalized it. `record_run_coverage` never
-            # raises: the ledger is rebuildable from run history, so a failed
-            # write is logged and the run's outcome stays what it is.
+            # PR-Z: settlement -- the coverage ledger, written by the same
+            # finalize path that wrote the result, AFTER that result is durable
+            # and under the lease identity that finalized it, releasing this
+            # run's paid-work claims in the same transaction.
+            # `record_run_coverage` never raises: a failed write is logged and
+            # the run's outcome stays what it is, while its claims keep
+            # blocking every other run (`settlement_pending`) until the next
+            # run preparation or queue build that meets them settles this run
+            # from its durable output (`coverage.reconcile_pending_settlements`).
             from backend.catalog.coverage import record_run_coverage
             record_run_coverage(repo, run_id, catalog_state["preparation"],
                                 (decision.claim or claim).output, lease_ctx)
