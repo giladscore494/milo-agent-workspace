@@ -213,9 +213,11 @@ bash scripts/deploy/work-scope-readiness.sh --schema-only
 **Expected evidence** (Production after the 2026-09-24 Stage B apply, with
 this release checked out):
 
-- `remote schema classified as partially-migrated (41/42 …)`
-- `1 local migration(s) not present in remote migration history:` naming
-  `20260924000200 …catalog_ingestion_recovery.sql`
+- `remote schema classified as partially-migrated (41/44 …)`
+- `3 local migration(s) not present in remote migration history:` naming
+  `20260924000200 …catalog_ingestion_recovery.sql`,
+  `20260925000100 …reasoning_aware_usage.sql` and
+  `20260927000100 …catalog_variant_coverage.sql`
 - `WORK_SCOPE_SCHEMA=NO (missing tables: catalog_snapshot_adoptions; missing RPCs:
   record_catalog_raw_records_batch_guarded record_catalog_candidates_batch_guarded
   adopt_catalog_snapshot_guarded …)`
@@ -356,8 +358,8 @@ bash scripts/deploy/work-scope-readiness.sh --schema-only
 bash scripts/deploy/production-verify.sh --gate database
 ```
 
-**Expected evidence:** `remote schema classified as fully-migrated (42/42 …)`,
-then `WORK_SCOPE_SCHEMA=VERIFIED (9 tables with RLS, 12 RPCs service_role-only)`
+**Expected evidence:** `remote schema classified as fully-migrated (44/44 …)`,
+then `WORK_SCOPE_SCHEMA=VERIFIED (11 tables with RLS, 15 RPCs service_role-only)`
 (neither `anon` nor `authenticated` can execute any of them), then
 `DATABASE_READY=VERIFIED` and `RESULT: OK`.
 

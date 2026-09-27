@@ -1302,6 +1302,12 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # transport: its only caller is `operator_capture.py` (listed above),
         # which hands it the client, inside the capture job.
         "backend/catalog/scope/preparation.py",
+        # PR-Z: the variant coverage ledger reads the vocabulary version and
+        # the record-id field name (constants), maps a finished run's result
+        # back to candidates through the bounded `GovernmentCatalogQuery`, and
+        # reads a run's own preparation record. It constructs no client and no
+        # transport and captures nothing.
+        "backend/catalog/coverage.py",
     }
     # An IMPORT is the seam this guards. A bare occurrence of the dotted name
     # is not: `backend/testing/memory_repository.py` has to know the capture

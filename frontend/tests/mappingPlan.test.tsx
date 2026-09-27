@@ -326,6 +326,21 @@ describe('the Mapping Plan batches', () => {
     expect(recent.textContent).toContain('3 promoted, 1 refused, 6 unresolved');
   });
 
+  it('shows each unit’s ledger counts when its preparation recorded them', async () => {
+    const body = progressBody();
+    const [toyota, lexus] = body.preparation.units;
+    apiMocks.api.workScopeProgress.mockResolvedValue(progressBody({ preparation: {
+      ...body.preparation,
+      units: [{ ...toyota, coverage: { enriched: 8, ambiguous: 4, pending: 2, queued: 25 } }, lexus] } }));
+    const batches = await openBatches();
+    const units = within(batches).getByRole('list', { name: 'Manufacturers in priority order' });
+    const [toyotaRow, lexusRow] = within(units).getAllByRole('listitem');
+    expect(within(toyotaRow).getByLabelText('Variant coverage').textContent)
+      .toContain('8 enriched, 4 ambiguous, 2 pending, 25 queued');
+    // A unit whose preparation recorded no counts renders exactly as before.
+    expect(within(lexusRow).queryByLabelText('Variant coverage')).toBeNull();
+  });
+
   it('starts exactly the batch the server named, only after confirmation', async () => {
     apiMocks.api.startWorkScopeBatch.mockResolvedValue({
       run_id: BATCH_RUN, status: 'queued', work_scope_id: PLAN, batch_id: BATCH_TWO, attempt: 1, created: true });

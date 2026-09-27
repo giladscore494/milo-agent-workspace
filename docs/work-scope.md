@@ -412,3 +412,96 @@ Turn `MILO_ENABLE_WORK_SCOPE_BATCHES` off: no batch starts, pauses or resumes;
 the progress read keeps answering; a running batch is untouched and can still
 be cancelled. Nothing is deleted or rewritten.
 
+
+## The variant coverage ledger (PR-Z)
+
+Never pay twice for the same variant at the same level. Before every run, the
+queue holds only variants not yet settled at the requested level, and the
+Mapping Plan shows per-unit counts.
+
+- Code: `backend/catalog/coverage.py` (the key, the rule, the derivation, the
+  backfill), `backend/catalog/government/preparation.py` (run preparation),
+  `backend/worker/main.py` (the finalize path's write).
+- Schema: `supabase/migrations/20260927000100_catalog_variant_coverage.sql`.
+- Backfill: `scripts/catalog/backfill_variant_coverage.py` (operator-run,
+  idempotent, `--dry-run`).
+
+### The variant identity key
+
+`variant_identity_key` is the SHA-256 of a length-prefixed rendering of the
+candidate's marque (`tozar`), commercial model (`kinuy_mishari`), model years,
+official model code (`degem_nm`), trim (`ramat_gimur`) and every identity
+dimension, exactly as the reviewed normalization stored them -- never a
+model's value, and never the register's `_id`, which the register reuses
+across captures. Two captures of the same row share a key; a duplicate
+identity group (37350 / 37439) is ONE key. The database
+(`catalog_variant_identity_key`) and the backend compute the same key; the
+PostgreSQL suite holds them to it.
+
+### The ledger
+
+`catalog_variant_coverage`: one row per (key, level), with `status`,
+`last_run_id`, `snapshot_key`, `content_sha256` (the stored register row minus
+`_id`), `vocabulary_version` and `updated_at`. The only level today is
+`register` (a Mapping Plan batch's Government register resolution).
+
+| Status | Derived from the run's durable output |
+| --- | --- |
+| `enriched` | a resolved row with at least one `verified` field |
+| `unresolved_ambiguous` / `unresolved_not_found` | the register matched several rows / none |
+| `pending` | resolved, nothing verified yet (awaiting review) |
+| `failed` | handed to the run, settled nothing |
+
+Only runs that ended `completed` or `partial_success` write it, through
+`record_catalog_variant_coverage_guarded`, right after the run's terminal state
+is durable and only under the lease identity that finalized it. The write is
+idempotent and never weakens what it knows: for the same content a weaker
+status never replaces a stronger one; a changed register row replaces
+whatever was recorded. A ledger write that fails is logged
+(`catalog coverage ledger write failed: run_id=... exception_class=...`) and
+changes nothing about the run: the ledger is rebuildable from run history.
+
+### The rule, at both points
+
+| Ledger says | Decision |
+| --- | --- |
+| `enriched`, same `content_sha256` | left out: `excluded_already_enriched` |
+| `unresolved_*`, same content, same vocabulary, no `include_unresolved` | left out: `excluded_known_unresolved` |
+| `failed`, `pending`, changed content, changed vocabulary, nothing | queued |
+
+- **Queue build** (`prepare_work_scope_queue`): what the ledger settles is
+  left out BEFORE the plan's limit is spent. Each prepared unit records its
+  exclusions (counts and register ids) in `catalog_work_scope_unit_coverage`,
+  immutable like the preparation.
+- **Run preparation** (`_from_batch`): one bounded read of the batch's own
+  items (`catalog_variant_coverage_for_batch`) leaves out what the ledger
+  settled since the queue was built. The preparation record states
+  `excluded_already_enriched`, `excluded_known_unresolved` and each excluded
+  register id, beside PR-U's `excluded_placeholder`. A batch the ledger
+  settles whole is refused before any paid call with
+  `GOVERNMENT_BATCH_ALREADY_COVERED`; a read that fails refuses the run
+  (`GOVERNMENT_QUEUE_UNAVAILABLE`), because assuming "nothing is covered"
+  could pay twice.
+
+`include_unresolved` is the ONE optional key of a plan record, stated only as
+`true`, so every earlier plan keeps its canonical text and digest. An edit
+may state it (`{"include_unresolved": true}`); the Mapping Plan has no control
+for it.
+
+### What the Mapping Plan shows
+
+Each unit row of a preparation that recorded them shows
+`N enriched, N ambiguous, N pending, N queued` (enriched and ambiguous: left
+out by the ledger; pending: queueable, beyond the plan's limit). A preparation
+written before the ledger renders without them. Read-only: there is no new
+write path.
+
+### Backfill
+
+`python scripts/catalog/backfill_variant_coverage.py [--dry-run] [--run-id ...]`
+replays every finished batch run, oldest first, in keyset pages of 50, one
+run's output and latest checkpoint at a time and bounded snapshot pages per
+run -- never the whole ledger or a whole snapshot. A second run changes
+nothing. Offline, it reproduces runs 6825eb96 (8 enriched, one ambiguous
+group) and aa63369b (8 enriched, two ambiguous groups) from their recorded
+tool results (`tests/test_catalog_variant_coverage.py`).

@@ -196,6 +196,16 @@ GOVERNMENT_RECORD_ID_FIELD = "_id"
 MIN_MODEL_YEAR = 1900
 MAX_MODEL_YEAR = 2100
 
+#: PR-Z: the version of the reviewed vocabulary above. A register row the run
+#: could not settle (`unresolved_ambiguous` / `unresolved_not_found` in the
+#: coverage ledger) is queued again once this changes, because a wider
+#: vocabulary may read it differently. `1` is the vocabulary Catalog PR2
+#: shipped; `2` is PR-V's widening from the production Toyota snapshot. Bump it
+#: with every change to a table above, together with
+#: `public.catalog_vocabulary_version()` (the database's copy, pinned to this
+#: one by tests/test_catalog_variant_coverage.py).
+VOCABULARY_VERSION = "gov.wltp.vocabulary.2"
+
 
 def unmapped_fields(*fields: str) -> tuple[tuple[str, str], ...]:
     """The `(field, reason)` pairs for an explicit, ordered selection.
@@ -220,5 +230,5 @@ __all__ = ["BODY_STYLE_BY_MERKAV", "CONSISTENT_FUEL_PROPULSION", "DECLARED_UNKNO
            "DRIVETRAIN_BY_CODE", "FUEL_BY_CODE", "GOVERNMENT_IDENTITY_FIELDS",
            "GOVERNMENT_RECORD_ID_FIELD", "MAX_MODEL_YEAR", "MIN_MODEL_YEAR",
            "PROPULSION_BY_CODE", "PROPULSION_BY_UNCODED_NAME", "UNMAPPED_FIELD_REASONS",
-           "UNMAPPED_MERKAV_REASONS",
+           "UNMAPPED_MERKAV_REASONS", "VOCABULARY_VERSION",
            "is_declared_unknown", "unmapped_fields"]

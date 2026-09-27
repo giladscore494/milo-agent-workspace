@@ -732,11 +732,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                              "total_candidates": preparation.total_candidates,
                              "bounded": preparation.bounded,
                              "resumed": preparation.resumed,
-                             "excluded_placeholder": preparation.excluded_placeholder}))
-                if preparation.excluded_placeholder:
+                             "excluded_placeholder": preparation.excluded_placeholder,
+                             "excluded_already_enriched": preparation.excluded_already_enriched,
+                             "excluded_known_unresolved": preparation.excluded_known_unresolved}))
+                if preparation.excluded:
                     print(f"government preparation: run_id={run_id} "
                           f"queued={len(preparation.queue)} "
-                          f"excluded_placeholder={preparation.excluded_placeholder}")
+                          f"excluded_placeholder={preparation.excluded_placeholder} "
+                          f"excluded_already_enriched={preparation.excluded_already_enriched} "
+                          f"excluded_known_unresolved={preparation.excluded_known_unresolved}")
                 if is_preparation_checkpoint(latest_checkpoint):
                     # The latest checkpoint is the preparation record itself:
                     # the engine has no state to resume and must start fresh.
@@ -1394,6 +1398,17 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 workflow_key, error.get("code", "ENGINE_FAILED"),
                 error.get("message", f"{workflow_key} engine failed"))
         decision = finalizer.finalize(claim)
+        if workflow_key == "swarm_v2" and decision.wrote \
+                and decision.status in ("completed", "partial_success") \
+                and catalog_state.get("preparation") is not None:
+            # PR-Z: the coverage ledger, written by the same finalize path that
+            # wrote the result, AFTER that result is durable and under the
+            # lease identity that finalized it. `record_run_coverage` never
+            # raises: the ledger is rebuildable from run history, so a failed
+            # write is logged and the run's outcome stays what it is.
+            from backend.catalog.coverage import record_run_coverage
+            record_run_coverage(repo, run_id, catalog_state["preparation"],
+                                (decision.claim or claim).output, lease_ctx)
         # Cloud Run reads a non-zero exit as a failed task and relaunches it,
         # so only V1's engine-reported failure keeps its historical exit code.
         return 0 if (workflow_key == "swarm_v2" or decision.status != "failed") else 1

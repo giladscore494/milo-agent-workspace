@@ -95,16 +95,21 @@ def seed_prepared_plan(repository: MemoryRepository, *, user_id: str, conversati
                        units: Sequence[str] = ("toyota", "lexus"),
                        model_year_from: int | None = None, model_year_to: int | None = None,
                        max_items: int = 25, batch_size: int = 10,
-                       records: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+                       records: Sequence[Mapping[str, Any]] | None = None,
+                       include_unresolved: bool = False) -> dict[str, Any]:
     """A plan at revision 1, prepared into a durable queue and batches.
 
     Toyota -- the one verified register marque -- is captured from committed
     rows; every other unit is `register_unverified`, exactly as the capture job
     records it. Returns the plan id, its digest and the preparation summary.
+    `include_unresolved` sets PR-Z's optional plan flag.
     """
-    scope = wsc.scope_from_fields({"units": list(units), "model_year_from": model_year_from,
-                                   "model_year_to": model_year_to, "max_items": max_items,
-                                   "batch_size": batch_size})
+    fields: dict[str, Any] = {"units": list(units), "model_year_from": model_year_from,
+                              "model_year_to": model_year_to, "max_items": max_items,
+                              "batch_size": batch_size}
+    if include_unresolved:
+        fields[wsc.INCLUDE_UNRESOLVED_KEY] = True
+    scope = wsc.scope_from_fields(fields)
     plan = repository.create_work_scope(
         UUID(conversation_id), UUID(user_id),
         {"scope_text": scope.canonical_text(), "input_kind": "edit", "instruction": None,

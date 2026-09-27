@@ -164,6 +164,12 @@ class Repository(Protocol):
     def create_work_scope_batch_run(self, work_scope_id: UUID, batch_id: UUID, expected_revision: int, expected_digest: str, *, run_id: UUID, run_identity: dict[str, Any], content: str, metadata: dict[str, Any], requested_by: UUID, idempotency_key: str, request_fingerprint: str, max_user_active: int | None = None, max_project_active: int | None = None) -> dict[str, Any]: ...
     def set_work_scope_paused(self, work_scope_id: UUID, paused: bool, requested_by: UUID) -> dict[str, Any]: ...
     def work_scope_progress(self, work_scope_id: UUID) -> dict[str, Any] | None: ...
+    # The variant coverage ledger (20260927000100_catalog_variant_coverage.sql).
+    def catalog_variant_coverage_for_batch(self, batch_id: UUID, level: str) -> dict[str, Any] | None: ...
+    def record_catalog_variant_coverage(self, run_id: UUID, level: str, entries: list[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def rebuild_catalog_variant_coverage(self, run_id: UUID, level: str, entries: list[dict[str, Any]]) -> dict[str, Any]: ...
+    def catalog_variant_coverage_runs(self, *, after_finished_at: Any = None, after_run_id: Any = None, limit: int = 50) -> list[dict[str, Any]]: ...
+    def work_scope_unit_coverage(self, preparation_id: Any) -> list[dict[str, Any]]: ...
 
     def upsert_run_blackboard(self, run_id: UUID, blackboard: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
     def create_agent_message(self, message: dict[str, Any], worker_id: str | None = None, attempt: int | None = None, lease_token: str | None = None) -> dict[str, Any]: ...
@@ -2153,6 +2159,74 @@ class SupabaseRepository:
         if not isinstance(data, dict) or not data.get("work_scope_id"):
             raise AppError("REPOSITORY_ERROR", "mapping plan progress returned an unreadable row", 502)
         return data
+
+    # -- the variant coverage ledger (PR-Z) --------------------------------------
+    #
+    # `20260927000100_catalog_variant_coverage.sql`. Two bounded reads, the
+    # finalize path's guarded write and the operator backfill's write. Every
+    # refusal the SQL raises by name maps to the code the in-memory mirror
+    # raises; anything else is one sanitized classification.
+    _COVERAGE_REFUSALS = (
+        ("CATALOG_COVERAGE_INVALID", "invalid coverage ledger request", 422),
+        ("CATALOG_COVERAGE_RUN_NOT_FINISHED", "the run has not finished with a result", 409),
+        ("CATALOG_COVERAGE_RUN_UNBOUND", "the run executes no mapping plan batch", 422),
+        ("CATALOG_COVERAGE_CANDIDATE_INVALID",
+         "a coverage entry names no candidate of the run's snapshot", 422),
+    )
+
+    def _coverage_call(self, call: Any, *, guarded: bool) -> Any:
+        """Run one coverage-ledger RPC and map what it refuses.
+
+        `call` is the RPC itself, spelled out at the method below with its
+        literal name, so the release inventory sees each one."""
+        try:
+            data = call().execute().data
+        except Exception as exc:
+            if guarded and self._is_stale_lease_error(exc):
+                raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409) from None
+            message = str(exc)
+            for code, safe, status in self._COVERAGE_REFUSALS:
+                if code in message:
+                    raise AppError(code, safe, status) from None
+            raise AppError("REPOSITORY_ERROR", "coverage ledger call failed", 502) from None
+        return data
+
+    def catalog_variant_coverage_for_batch(self, batch_id: UUID, level: str) -> dict[str, Any] | None:
+        """Every item of one batch with the ledger's decision; None for no such batch."""
+        params = {"p_batch_id": str(batch_id), "p_level": str(level)}
+        data = self._coverage_call(
+            lambda: self.client.rpc("catalog_variant_coverage_for_batch", params), guarded=False)
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if data is None:
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise AppError("REPOSITORY_ERROR", "coverage read returned an unreadable row", 502)
+        return data
+
+    def record_catalog_variant_coverage(self, run_id: UUID, level: str, entries: list[dict[str, Any]], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        params = {**self._lease_params(run_id, worker_id, attempt, lease_token),
+                  "p_level": str(level), "p_entries": list(entries)}
+        data = self._coverage_call(
+            lambda: self.client.rpc("record_catalog_variant_coverage_guarded", params), guarded=True)
+        return data if isinstance(data, dict) else {}
+
+    def rebuild_catalog_variant_coverage(self, run_id: UUID, level: str, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        params = {"p_run_id": str(run_id), "p_level": str(level), "p_entries": list(entries)}
+        data = self._coverage_call(
+            lambda: self.client.rpc("rebuild_catalog_variant_coverage", params), guarded=False)
+        return data if isinstance(data, dict) else {}
+
+    def catalog_variant_coverage_runs(self, *, after_finished_at: Any = None, after_run_id: Any = None, limit: int = 50) -> list[dict[str, Any]]:
+        """One keyset page (at most 50) of finished batch runs, oldest first."""
+        return self._read_rpc("catalog_variant_coverage_runs", {
+            "p_after_finished_at": None if after_finished_at is None else str(after_finished_at),
+            "p_after_run_id": None if after_run_id is None else str(after_run_id),
+            "p_limit": max(1, min(int(limit), 50))})
+
+    def work_scope_unit_coverage(self, preparation_id: Any) -> list[dict[str, Any]]:
+        """One preparation's per-unit ledger counts (never its register ids)."""
+        return self._read_rpc("work_scope_unit_coverage", {"p_preparation_id": str(preparation_id)})
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_resolution": resolution}

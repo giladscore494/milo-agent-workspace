@@ -170,6 +170,22 @@ REQUIRED_PER_FILE["20260924000200_catalog_ingestion_recovery.sql"] = [
     "raise exception 'catalog raw record idempotency conflict'",
     "raise exception 'catalog candidate idempotency conflict'",
 ]
+REQUIRED_PER_FILE["20260927000100_catalog_variant_coverage.sql"] = [
+    # PR-Z: ONE ledger row per variant and level, service-path only; the queue
+    # build filters through it BEFORE the plan's limit is spent; its write is
+    # the finalizing lease's only, from a FINISHED run, and never weakens.
+    "enable row level security",
+    "create table if not exists public.catalog_variant_coverage (",
+    "create unique index if not exists catalog_variant_coverage_key_level_uidx",
+    "create or replace function public.catalog_variant_identity_key(",
+    "create or replace function public.catalog_variant_coverage_decision(",
+    "create or replace function public.prepare_work_scope_queue(",
+    "v_take := least(v_eligible - v_enriched - v_unresolved, v_budget);",
+    "raise exception 'catalog_coverage_run_not_finished'",
+    "stale_worker_write: coverage write rejected",
+    "public.catalog_variant_coverage_rank(excluded.status)",
+    "create trigger catalog_work_scope_unit_coverage_append_only",
+]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the
     # preparation it feeds is written once, by an operator capture run only.
