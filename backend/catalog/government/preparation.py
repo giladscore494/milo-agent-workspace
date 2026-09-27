@@ -60,6 +60,31 @@ authority, read from the database; a browser, the run input and the model can
 supply none of it. The record carries the batch's identity, and a resume
 refuses unless the binding still names the same batch.
 
+The coverage ledger (PR-Z)
+--------------------------
+Before the run is handed its batch, the batch's items are read against the
+variant coverage ledger (`catalog_variant_coverage_for_batch`, one bounded read
+of at most 20 items). An item the ledger already settles at the `register`
+level -- enriched from the same register content, or known unresolved under
+the same content and vocabulary while the plan revision does not set
+`include_unresolved` -- is left out of the queue and recorded like a
+placeholder: its register id under `EXCLUDED_ALREADY_ENRICHED` or
+`EXCLUDED_KNOWN_UNRESOLVED`, and the two counts. A batch the ledger settles
+whole is refused before any paid call (`GOVERNMENT_BATCH_ALREADY_COVERED`).
+
+With the run's lease (the worker always passes it), that read is the CLAIM
+itself (`acquire_catalog_variant_reservations_guarded`): the database checks
+the ledger and takes the paid-work claim on each item in one atomic step, so
+two plans can never both pass preparation for the same variant. An item
+another live run owns, or another run finished and has not settled, is left
+out too, under `EXCLUDED_RESERVED_BY_ANOTHER_RUN` (count
+`excluded_reserved`); a finished-but-unsettled owner is first settled from
+its own durable output (`coverage.reconcile_pending_settlements`) and the item
+asked about once more. A batch left with nothing is refused before any paid
+call (`GOVERNMENT_BATCH_RESERVED` when a claim held any of it). A RESUMED
+attempt re-claims its recorded queue before its first paid call and is
+refused (`GOVERNMENT_RESERVATION_LOST`) if any item's claim moved on.
+
 Per-item progress is not stored at all: it is reconstructed from durable state
 -- the run's own verified evidence rows (`catalog_run_pending_promotions`) and
 its durable promotion events -- so a crash between two writes cannot leave the
@@ -72,6 +97,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
+from backend.catalog import coverage as catalog_coverage
 from backend.catalog.contracts import MAX_PROMOTIONS_PER_RUN
 from backend.catalog.government import source as src
 from backend.catalog.government.projection import (GovernmentProjectionError,
@@ -116,6 +142,32 @@ _PROMOTABLE_OPERATION: str | None = None
 PLACEHOLDER_IDENTITY = re.compile(r"^([0-9])\1{2,}$")
 #: The static reason an excluded batch item is recorded under.
 EXCLUDED_PLACEHOLDER_SOURCE_RECORD = "EXCLUDED_PLACEHOLDER_SOURCE_RECORD"
+#: PR-Z: the coverage ledger already records the item enriched at this level
+#: from the same register content.
+EXCLUDED_ALREADY_ENRICHED = "EXCLUDED_ALREADY_ENRICHED"
+#: PR-Z: the ledger records the item unresolved, and neither its content, the
+#: vocabulary nor the plan revision (`include_unresolved`) says to try again.
+EXCLUDED_KNOWN_UNRESOLVED = "EXCLUDED_KNOWN_UNRESOLVED"
+#: PR-Z: another run owns the paid work on the item: it is running, or it
+#: finished and its result awaits settlement.
+EXCLUDED_RESERVED_BY_ANOTHER_RUN = "EXCLUDED_RESERVED_BY_ANOTHER_RUN"
+#: Every reason a batch item can be left out under, and the count key each is
+#: recorded with in the preparation record.
+EXCLUSION_COUNT_KEYS: Mapping[str, str] = {
+    EXCLUDED_PLACEHOLDER_SOURCE_RECORD: "excluded_placeholder",
+    EXCLUDED_ALREADY_ENRICHED: "excluded_already_enriched",
+    EXCLUDED_KNOWN_UNRESOLVED: "excluded_known_unresolved",
+    EXCLUDED_RESERVED_BY_ANOTHER_RUN: "excluded_reserved",
+}
+#: The ledger's decision -> the reason the item is recorded under.
+_COVERAGE_EXCLUSIONS: Mapping[str, str] = {
+    catalog_coverage.EXCLUDED_ALREADY_ENRICHED: EXCLUDED_ALREADY_ENRICHED,
+    catalog_coverage.EXCLUDED_KNOWN_UNRESOLVED: EXCLUDED_KNOWN_UNRESOLVED,
+    catalog_coverage.RESERVED_BY_OTHER: EXCLUDED_RESERVED_BY_ANOTHER_RUN,
+    catalog_coverage.SETTLEMENT_PENDING: EXCLUDED_RESERVED_BY_ANOTHER_RUN,
+}
+#: The level of work a batch run performs, as the ledger names it.
+COVERAGE_LEVEL = catalog_coverage.BATCH_COVERAGE_LEVEL
 
 #: PR-V: the most register rows ONE duplicate-identity read looks at. The read
 #: is the same bounded, per-item database page `resolve_variant` answers from;
@@ -149,6 +201,14 @@ PREPARATION_REASONS: Mapping[str, str] = {
     "GOVERNMENT_BATCH_ONLY_PLACEHOLDERS":
         "every candidate in the Mapping Plan batch bound to this run is a placeholder register "
         "row, so there is nothing to research",
+    "GOVERNMENT_BATCH_ALREADY_COVERED":
+        "every candidate in the Mapping Plan batch bound to this run is already enriched or "
+        "known unresolved at this level, so there is nothing to pay for",
+    "GOVERNMENT_BATCH_RESERVED":
+        "every candidate left in the Mapping Plan batch bound to this run is owned by another "
+        "run's paid work, so this run would pay for it twice",
+    "GOVERNMENT_RESERVATION_LOST":
+        "a resumed run no longer owns the paid work on every candidate it was handed",
 }
 
 
@@ -260,10 +320,24 @@ class GovernmentPreparation:
     #: reason), sorted by the register's own id.
     excluded: tuple[tuple[str, str], ...] = ()
 
+    def excluded_count(self, reason: str) -> int:
+        return sum(1 for _, excluded in self.excluded if excluded == reason)
+
     @property
     def excluded_placeholder(self) -> int:
-        return sum(1 for _, reason in self.excluded
-                   if reason == EXCLUDED_PLACEHOLDER_SOURCE_RECORD)
+        return self.excluded_count(EXCLUDED_PLACEHOLDER_SOURCE_RECORD)
+
+    @property
+    def excluded_already_enriched(self) -> int:
+        return self.excluded_count(EXCLUDED_ALREADY_ENRICHED)
+
+    @property
+    def excluded_known_unresolved(self) -> int:
+        return self.excluded_count(EXCLUDED_KNOWN_UNRESOLVED)
+
+    @property
+    def excluded_reserved(self) -> int:
+        return self.excluded_count(EXCLUDED_RESERVED_BY_ANOTHER_RUN)
 
     def as_artifact(self) -> dict[str, Any]:
         """The persisted shape, stored under ``artifacts.government``."""
@@ -278,6 +352,9 @@ class GovernmentPreparation:
             "total_candidates": int(self.total_candidates),
             "bounded": bool(self.bounded),
             "excluded_placeholder": self.excluded_placeholder,
+            "excluded_already_enriched": self.excluded_already_enriched,
+            "excluded_known_unresolved": self.excluded_known_unresolved,
+            "excluded_reserved": self.excluded_reserved,
             "excluded_records": [{"upstream_record_id": record, "reason": reason}
                                  for record, reason in self.excluded],
         }
@@ -343,6 +420,7 @@ def prepare_government_work(repository: Any, *,
                             checkpoint: Mapping[str, Any] | None = None,
                             cancellation_checker: Callable[[], bool] | None = None,
                             run_id: Any = None,
+                            lease: Mapping[str, Any] | None = None,
                             ) -> GovernmentPreparation:
     """Resolve the pinned snapshot and the work queue for ONE batch-bound run.
 
@@ -354,6 +432,10 @@ def prepare_government_work(repository: Any, *,
     A run bound to no batch is refused (`GOVERNMENT_BATCH_REQUIRED`) before any
     snapshot is read. Refusals are static and total; a repository failure while
     reading the binding is a refusal too, never "unbound".
+
+    `lease` (the worker's `worker_id` / `attempt` / `lease_token`) makes the
+    coverage read the paid-work CLAIM; without one (tests, reads) it is the
+    read-only ledger check.
     """
     _check_cancelled(cancellation_checker)
     batch = _bound_batch(repository, run_id)
@@ -361,8 +443,9 @@ def prepare_government_work(repository: Any, *,
         raise GovernmentPreparationError("GOVERNMENT_BATCH_REQUIRED")
     record = prepared_artifact(checkpoint)
     if record is not None:
-        return _resume(repository, record, cancellation_checker, batch=batch)
-    return _from_batch(repository, batch, cancellation_checker)
+        return _resume(repository, record, cancellation_checker, batch=batch, run_id=run_id,
+                       lease=lease)
+    return _from_batch(repository, batch, cancellation_checker, run_id=run_id, lease=lease)
 
 
 def refuse_bound_run_without_read(repository: Any, run_id: Any) -> None:
@@ -504,6 +587,106 @@ def _placeholder_record_ids(repository: Any, snapshot_key: str,
     return found
 
 
+def _coverage_exclusions(repository: Any, batch_id: str,
+                         queue: Sequence[GovernmentWorkItem]) -> dict[str, tuple[str, str]]:
+    """PR-Z: the queue items the coverage ledger already settles.
+
+    candidate id -> (upstream_record_id, static reason). ONE bounded read
+    (`catalog_variant_coverage_for_batch`: the batch's own items, at most 20),
+    in which the database derives each item's identity key, its content hash
+    and the ONE rule's decision under the batch's own plan revision. A
+    repository with no such read has no ledger behind it and leaves nothing
+    out; a read that FAILS refuses the run, because "nothing is covered" is
+    not something an absent answer says -- and assuming it could pay twice.
+    """
+    read = getattr(repository, "catalog_variant_coverage_for_batch", None)
+    if not callable(read) or not queue:
+        return {}
+    try:
+        answer = read(batch_id, COVERAGE_LEVEL)
+    except AppError:
+        raise GovernmentPreparationError("GOVERNMENT_QUEUE_UNAVAILABLE") from None
+    items = answer.get("items") if isinstance(answer, Mapping) else None
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    wanted = {item.candidate_id for item in queue}
+    excluded: dict[str, tuple[str, str]] = {}
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, Mapping):
+            raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+        candidate, decision = str(item.get("candidate_id") or ""), item.get("decision")
+        record = item.get("upstream_record_id")
+        if not candidate or not isinstance(record, str) or not record \
+                or decision not in (catalog_coverage.DECISION_QUEUE, *_COVERAGE_EXCLUSIONS):
+            raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+        seen.add(candidate)
+        if candidate in wanted and decision != catalog_coverage.DECISION_QUEUE:
+            excluded[candidate] = (record, _COVERAGE_EXCLUSIONS[str(decision)])
+    if not wanted <= seen:
+        # The ledger answered for a different batch than the one bound.
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    return excluded
+
+
+def _claims_available(repository: Any, run_id: Any, lease: Mapping[str, Any] | None) -> bool:
+    return (run_id is not None and lease is not None
+            and callable(getattr(repository, "acquire_catalog_variant_reservations", None)))
+
+
+def _claim(repository: Any, run_id: Any, lease: Mapping[str, Any],
+           queue: Sequence[GovernmentWorkItem]) -> list[Mapping[str, Any]]:
+    """PR-Z: claim the paid work on every queue item; the answer per item.
+
+    ONE atomic database call for the whole (at most 20-item) queue. An item a
+    FINISHED run holds unsettled (`settlement_pending`) is settled from that
+    run's own durable output first -- the automatic recovery of a finalize
+    path whose ledger write never landed -- and the queue is claimed once
+    more; an item still held after that stays excluded. A repository failure
+    refuses the run: an absent answer is not a claim.
+    """
+    ids = [item.candidate_id for item in queue]
+    acquire = repository.acquire_catalog_variant_reservations
+    kwargs = {"worker_id": lease.get("worker_id"), "attempt": lease.get("attempt"),
+              "lease_token": lease.get("lease_token")}
+    try:
+        items = _claim_items(acquire(run_id, COVERAGE_LEVEL, ids, **kwargs), ids)
+        pending = sorted({str(item.get("owner_run_id")) for item in items
+                          if item.get("decision") == catalog_coverage.SETTLEMENT_PENDING})
+        if pending:
+            catalog_coverage.reconcile_pending_settlements(repository, run_ids=pending)
+            items = _claim_items(acquire(run_id, COVERAGE_LEVEL, ids, **kwargs), ids)
+    except AppError:
+        raise GovernmentPreparationError("GOVERNMENT_QUEUE_UNAVAILABLE") from None
+    return items
+
+
+def _claim_items(answer: Any, ids: Sequence[str]) -> list[Mapping[str, Any]]:
+    items = answer.get("items") if isinstance(answer, Mapping) else None
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    for item in items:
+        if not isinstance(item, Mapping) \
+                or item.get("decision") not in catalog_coverage.CLAIM_DECISIONS \
+                or not isinstance(item.get("upstream_record_id"), str) \
+                or not item.get("upstream_record_id"):
+            raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    if sorted(str(item.get("candidate_id")) for item in items) != sorted(map(str, ids)):
+        raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
+    return list(items)
+
+
+def _claim_exclusions(repository: Any, run_id: Any, lease: Mapping[str, Any],
+                      queue: Sequence[GovernmentWorkItem]) -> dict[str, tuple[str, str]]:
+    """The queue items this run may NOT pay for, as `_coverage_exclusions` states them."""
+    if not queue:
+        return {}
+    return {str(item["candidate_id"]): (str(item["upstream_record_id"]),
+                                        _COVERAGE_EXCLUSIONS[str(item["decision"])])
+            for item in _claim(repository, run_id, lease, queue)
+            if item["decision"] != catalog_coverage.RESERVED}
+
+
 def _annotate_duplicate_identities(repository: Any, snapshot_key: str,
                                    queue: Sequence[GovernmentWorkItem],
                                    cancellation_checker: Callable[[], bool] | None = None,
@@ -558,11 +741,16 @@ def _annotate_duplicate_identities(repository: Any, snapshot_key: str,
 
 
 def _from_batch(repository: Any, bound: Mapping[str, Any],
-                cancellation_checker: Callable[[], bool] | None) -> GovernmentPreparation:
+                cancellation_checker: Callable[[], bool] | None, *, run_id: Any = None,
+                lease: Mapping[str, Any] | None = None) -> GovernmentPreparation:
     """EXACTLY the bound batch: its one snapshot, pinned, and its items in order.
 
     PR-U: minus its placeholder items (`is_placeholder_identity`), which are
-    counted in the preparation record instead of being handed to the run."""
+    counted in the preparation record instead of being handed to the run.
+    PR-Z: minus the items the coverage ledger already settles, recorded the
+    same way (`_coverage_exclusions`) -- and, under the worker's lease, minus
+    what another run's paid-work claim holds, while this run claims the rest
+    (`_claim_exclusions`)."""
     batch = bound["batch"]
     identity = _batch_identity(bound)
     snapshot_key = str(batch.get("snapshot_key") or "")
@@ -591,19 +779,30 @@ def _from_batch(repository: Any, bound: Mapping[str, Any],
         raise GovernmentPreparationError("GOVERNMENT_BATCH_INVALID")
     placeholders = [item for item in queue
                     if is_placeholder_identity(item.commercial_model, item.official_model_code)]
-    excluded: tuple[tuple[str, str], ...] = ()
+    excluded: list[tuple[str, str]] = []
     # ONE bounded reader of the pinned snapshot for both per-item reads below.
     query = _pinned_query(repository, snapshot_key, cancellation_checker)
     if placeholders:
-        excluded = tuple(sorted(
+        excluded.extend(
             (record_id, EXCLUDED_PLACEHOLDER_SOURCE_RECORD)
             for record_id in _placeholder_record_ids(repository, snapshot_key, placeholders,
-                                                     cancellation_checker, query=query)))
+                                                     cancellation_checker, query=query))
         _check_cancelled(cancellation_checker)
         skipped = {item.candidate_key for item in placeholders}
         queue = [item for item in queue if item.candidate_key not in skipped]
-        if not queue:
-            raise GovernmentPreparationError("GOVERNMENT_BATCH_ONLY_PLACEHOLDERS")
+    covered = (_claim_exclusions(repository, run_id, lease, queue)
+               if _claims_available(repository, run_id, lease)
+               else _coverage_exclusions(repository, identity["batch_id"], queue))
+    if covered:
+        _check_cancelled(cancellation_checker)
+        excluded.extend(covered.values())
+        queue = [item for item in queue if item.candidate_id not in covered]
+    if not queue:
+        reasons = {reason for _, reason in covered.values()}
+        raise GovernmentPreparationError(
+            "GOVERNMENT_BATCH_RESERVED" if EXCLUDED_RESERVED_BY_ANOTHER_RUN in reasons
+            else "GOVERNMENT_BATCH_ALREADY_COVERED" if covered
+            else "GOVERNMENT_BATCH_ONLY_PLACEHOLDERS")
     queue = _annotate_duplicate_identities(repository, snapshot_key, queue,
                                            cancellation_checker, query=query)
     return GovernmentPreparation(
@@ -612,12 +811,13 @@ def _from_batch(repository: Any, bound: Mapping[str, Any],
         upstream_version=str(snapshot.get("upstream_version") or ""),
         upstream_version_kind=str(snapshot.get("upstream_version_kind") or ""),
         queue=tuple(queue), total_candidates=len(queue), bounded=False, resumed=False,
-        work_scope_batch=identity, excluded=excluded)
+        work_scope_batch=identity, excluded=tuple(sorted(excluded)))
 
 
 def _resume(repository: Any, record: Mapping[str, Any],
             cancellation_checker: Callable[[], bool] | None, *,
-            batch: Mapping[str, Any] | None = None) -> GovernmentPreparation:
+            batch: Mapping[str, Any] | None = None, run_id: Any = None,
+            lease: Mapping[str, Any] | None = None) -> GovernmentPreparation:
     if record.get("schema") != ARTIFACT_SCHEMA:
         raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
     # A record resumes only while the binding still names the SAME batch: the
@@ -653,6 +853,15 @@ def _resume(repository: Any, record: Mapping[str, Any],
         raise GovernmentPreparationError("GOVERNMENT_SNAPSHOT_UNAVAILABLE",
                                          reason_code=refusal.reason_code) from None
     _check_cancelled(cancellation_checker)
+    if queue and _claims_available(repository, run_id, lease):
+        # PR-Z: a resumed attempt re-claims EXACTLY its recorded queue before
+        # its first paid call. The earlier attempt's claims pass to it; a claim
+        # another run took over after this run's lease lapsed, or a variant
+        # settled meanwhile, refuses the attempt rather than pay twice.
+        if any(item["decision"] != catalog_coverage.RESERVED
+               for item in _claim(repository, run_id, lease, queue)):
+            raise GovernmentPreparationError("GOVERNMENT_RESERVATION_LOST")
+        _check_cancelled(cancellation_checker)
     return GovernmentPreparation(
         snapshot_key=snapshot_key, snapshot_id=str(snapshot["id"]), resource_id=resource_id,
         upstream_version=str(snapshot.get("upstream_version") or ""),
@@ -665,7 +874,9 @@ def _resume(repository: Any, record: Mapping[str, Any],
 
 def _recorded_exclusions(record: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
     """The exclusions a persisted record states. A record written before PR-U
-    states none; one that states them must state them in exactly this shape."""
+    states none; one that states them must state them in exactly this shape.
+    A record written before PR-Z states no ledger counts, and then holds no
+    ledger exclusion; one that states a count must state it exactly."""
     if "excluded_records" not in record and "excluded_placeholder" not in record:
         return ()
     rows = record.get("excluded_records")
@@ -675,11 +886,16 @@ def _recorded_exclusions(record: Mapping[str, Any]) -> tuple[tuple[str, str], ..
     for row in rows:
         if not isinstance(row, Mapping) or set(row) != {"upstream_record_id", "reason"} \
                 or not isinstance(row["upstream_record_id"], str) \
-                or row["reason"] != EXCLUDED_PLACEHOLDER_SOURCE_RECORD:
+                or row["reason"] not in EXCLUSION_COUNT_KEYS:
             raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
         excluded.append((row["upstream_record_id"], row["reason"]))
-    if record.get("excluded_placeholder") != len(excluded):
-        raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+    for reason, key in EXCLUSION_COUNT_KEYS.items():
+        stated = sum(1 for _, excluded_reason in excluded if excluded_reason == reason)
+        if key in record or reason == EXCLUDED_PLACEHOLDER_SOURCE_RECORD:
+            if record.get(key) != stated or isinstance(record.get(key), bool):
+                raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+        elif stated:
+            raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
     return tuple(excluded)
 
 
@@ -714,7 +930,10 @@ def _optional_text(value: Any) -> str | None:
 
 __all__ = [
     "ARTIFACT_KEY", "ARTIFACT_SCHEMA", "BATCH_ARTIFACT_KEY", "BATCH_IDENTITY_FIELDS",
-    "DUPLICATE_IDENTITY_RULE", "MAX_DUPLICATE_SCAN_ROWS",
+    "COVERAGE_LEVEL", "DUPLICATE_IDENTITY_RULE", "EXCLUDED_ALREADY_ENRICHED",
+    "EXCLUDED_KNOWN_UNRESOLVED", "EXCLUDED_PLACEHOLDER_SOURCE_RECORD",
+    "EXCLUDED_RESERVED_BY_ANOTHER_RUN", "EXCLUSION_COUNT_KEYS",
+    "MAX_DUPLICATE_SCAN_ROWS",
     "GOVERNMENT_WORK_QUEUE_LIMIT", "PREPARATION_PHASE",
     "PREPARATION_REASONS", "PROGRESS_EVIDENCED", "PROGRESS_PENDING", "PROGRESS_PROMOTED",
     "PROGRESS_STATES", "QUEUED_CANDIDATE_STATUS", "GovernmentPreparation",

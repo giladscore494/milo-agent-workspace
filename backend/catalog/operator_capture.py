@@ -1052,6 +1052,7 @@ def work_scope_document(preparation: WorkScopePreparation) -> dict[str, Any]:
     units = []
     for capture in preparation.captures[:MAX_REPORT_WORK_SCOPE_UNITS]:
         unit = decided.get(capture.unit_key, {})
+        coverage = unit.get("coverage") if isinstance(unit.get("coverage"), Mapping) else {}
         units.append({
             "unit_key": _text(capture.unit_key),
             "priority": int(capture.priority),
@@ -1065,6 +1066,10 @@ def work_scope_document(preparation: WorkScopePreparation) -> dict[str, Any]:
             "ambiguous_count": int(unit.get("ambiguous_count") or 0),
             "eligible_count": int(unit.get("eligible_count") or 0),
             "queued_count": int(unit.get("queued_count") or 0),
+            # PR-Z: what the variant coverage ledger left out of the unit's
+            # queue (zero where it recorded nothing).
+            "excluded_already_enriched": int(coverage.get("excluded_already_enriched") or 0),
+            "excluded_known_unresolved": int(coverage.get("excluded_known_unresolved") or 0),
         })
     batches = [{"batch_number": int(batch.get("batch_number") or 0),
                 "unit_key": _text(batch.get("unit_key")),

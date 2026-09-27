@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 from uuid import UUID
 
+from backend.catalog import coverage as catalog_coverage
 from backend.catalog.government import source as src
 from backend.catalog.government.capture_scope import (CaptureScope, CaptureScopeError,
                                                       declared_scope)
@@ -213,6 +214,11 @@ def prepare_work_scope(repository: Any, lease: Any, *, client: Any, work_scope_i
                        ) -> WorkScopePreparation:
     """Prepare one exact head revision. See the module docstring for the order."""
     scope = read_prepared_revision(repository, work_scope_id, revision, digest)
+    # PR-Z: settle finished runs whose ledger write never landed (one bounded
+    # page), so the queue below is built from the ledger their results earned.
+    # Never raises; a run it cannot settle keeps its claims, and run
+    # preparation still refuses to pay for them.
+    catalog_coverage.reconcile_pending_settlements(repository)
     captures = tuple(
         capture_unit(repository, lease, client=client, unit_key=key, priority=priority,
                      cancellation_checker=cancellation_checker, event_sink=event_sink)

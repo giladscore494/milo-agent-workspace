@@ -129,7 +129,8 @@ def test_the_readiness_rpc_inventory_is_the_migrations_and_the_repositorys():
                            for name in ("20260922000100_catalog_work_scopes.sql",
                                         "20260923000100_catalog_work_scope_preparation.sql",
                                         "20260924000100_catalog_work_scope_batch_runs.sql",
-                                        "20260924000200_catalog_ingestion_recovery.sql"))
+                                        "20260924000200_catalog_ingestion_recovery.sql",
+                                        "20260927000100_catalog_variant_coverage.sql"))
     repository = (REPO / "backend" / "repository" / "supabase.py").read_text(encoding="utf-8")
     for rpc in rpcs:
         assert f"create or replace function public.{rpc}(" in migrations, rpc

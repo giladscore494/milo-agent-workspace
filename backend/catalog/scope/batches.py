@@ -102,6 +102,26 @@ def progress(repo: Any, user_id: UUID, work_scope_id: UUID) -> dict[str, Any]:
     return _progress_view(_read_progress(repo, work_scope_id))
 
 
+def _unit_coverage(repo: Any, preparation: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    """PR-Z: the ledger's per-unit counts of ONE preparation, by unit key.
+
+    One bounded read (`work_scope_unit_coverage`). Empty -- and the units then
+    render without the counts -- when the repository has no such read, the
+    preparation was written before the ledger existed, or the read fails: the
+    counts are an addition to the progress, never a reason to withhold it.
+    """
+    read = getattr(repo, "work_scope_unit_coverage", None)
+    preparation_id = preparation.get("id")
+    if not callable(read) or not preparation_id:
+        return {}
+    try:
+        rows = read(preparation_id)
+    except AppError:
+        return {}
+    return {str(row.get("unit_key")): row for row in rows or ()
+            if isinstance(row, Mapping)}
+
+
 def _read_progress(repo: Any, work_scope_id: UUID) -> Mapping[str, Any]:
     read = getattr(repo, "work_scope_progress", None)
     if not callable(read):
@@ -111,6 +131,14 @@ def _read_progress(repo: Any, work_scope_id: UUID) -> Mapping[str, Any]:
         raise NotFoundError("work_scope", "requested")
     if not isinstance(raw, Mapping):
         raise _refusal("WORK_SCOPE_PROGRESS_UNAVAILABLE", 502)
+    preparation = raw.get("preparation")
+    if isinstance(preparation, Mapping) and isinstance(preparation.get("units"), list):
+        coverage = _unit_coverage(repo, preparation)
+        if coverage:
+            units = [({**unit, "coverage": coverage[str(unit.get("unit_key"))]}
+                      if isinstance(unit, Mapping) and str(unit.get("unit_key")) in coverage
+                      else unit) for unit in preparation["units"]]
+            raw = {**raw, "preparation": {**preparation, "units": units}}
     return raw
 
 
@@ -233,6 +261,28 @@ def _text(value: Any, limit: int = 80) -> str | None:
     return str(value)[:limit] if isinstance(value, str) and value else None
 
 
+def _coverage_view(unit: Mapping[str, Any], coverage: Any) -> dict[str, int] | None:
+    """PR-Z: the unit's enriched / ambiguous / pending / queued counts, or None.
+
+    ``enriched`` and ``ambiguous`` are the candidates the ledger left out of
+    this preparation (already enriched; known unresolved), ``queued`` is what
+    the preparation queued, and ``pending`` the queueable rest the plan's
+    limit did not reach. Strict: stated counts that do not add up refuse the
+    progress whole.
+    """
+    if coverage is None:
+        return None
+    if not isinstance(coverage, Mapping):
+        raise ValueError("unreadable unit coverage")
+    enriched = _int(coverage.get("excluded_already_enriched"))
+    ambiguous = _int(coverage.get("excluded_known_unresolved"))
+    queued = _int(unit.get("queued_count"))
+    pending = _int(unit.get("eligible_count")) - enriched - ambiguous - queued
+    if pending < 0:
+        raise ValueError("unit coverage exceeds the unit's queueable candidates")
+    return {"enriched": enriched, "ambiguous": ambiguous, "pending": pending, "queued": queued}
+
+
 def _unit_view(unit: Mapping[str, Any]) -> dict[str, Any]:
     state = unit.get("state")
     if state not in UNIT_STATES:
@@ -253,7 +303,7 @@ def _unit_view(unit: Mapping[str, Any]) -> dict[str, Any]:
     else:
         progress_state = "pending"
     entry = mdir.entry_for(str(unit.get("unit_key") or ""))
-    return {
+    view = {
         "unit_key": str(unit.get("unit_key")),
         "name": entry.name if entry is not None else str(unit.get("unit_key")),
         "priority": _int(unit.get("priority")),
@@ -271,6 +321,11 @@ def _unit_view(unit: Mapping[str, Any]) -> dict[str, Any]:
         "refused": _int(unit.get("refused")),
         "unresolved": _int(unit.get("unresolved")),
     }
+    # PR-Z: stated only for a preparation that recorded the ledger's counts.
+    coverage = _coverage_view(unit, unit.get("coverage"))
+    if coverage is not None:
+        view["coverage"] = coverage
+    return view
 
 
 def _batch_view(batch: Mapping[str, Any], *, with_outcome: bool) -> dict[str, Any]:

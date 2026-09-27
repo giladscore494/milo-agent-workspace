@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
+from backend.catalog import coverage as catalog_coverage
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
                                        CANONICAL_DIMENSION_PREFIX,
                                        MAX_CATALOG_WRITE_BATCH,
@@ -178,6 +179,16 @@ class MemoryRepository:
         # Pause / resume (`20260924000100_catalog_work_scope_batch_runs.sql`):
         # append-only, alternating, written only by `set_work_scope_paused`.
         self.work_scope_controls: list[dict[str, Any]] = []
+        # PR-Z (`20260927000100_catalog_variant_coverage.sql`): the coverage
+        # ledger, one row per (variant identity key, level), written only by
+        # the mirror of `catalog_variant_coverage_apply`; and each prepared
+        # unit's exclusions, append-only, written only by the queue build.
+        self.catalog_variant_coverage: dict[tuple[str, str], dict[str, Any]] = {}
+        self.work_scope_unit_coverages: list[dict[str, Any]] = []
+        # The paid-work claims, one per (variant identity key, level), taken by
+        # the mirror of `acquire_catalog_variant_reservations_guarded` and
+        # released by the settlement (`_apply_catalog_variant_coverage`).
+        self.catalog_variant_reservations: dict[tuple[str, str], dict[str, Any]] = {}
 
     # -- seeding -------------------------------------------------------------
     def seed_user(self, user_id: str) -> None:
@@ -2865,6 +2876,14 @@ class MemoryRepository:
         units = sorted((dict(row) for row in self.work_scope_units
                         if row["preparation_id"] == preparation["id"]),
                        key=lambda row: row["priority"])
+        coverage = {row["unit_id"]: row for row in self.work_scope_unit_coverages
+                    if row["preparation_id"] == preparation["id"]}
+        for unit in units:
+            row = coverage.get(unit["id"])
+            unit["coverage"] = None if row is None else {
+                key: row[key] for key in ("level", "vocabulary_version", "include_unresolved",
+                                          "excluded_already_enriched",
+                                          "excluded_known_unresolved")}
         batches = sorted((row for row in self.work_scope_batches
                           if row["preparation_id"] == preparation["id"]),
                          key=lambda row: row["batch_number"])
@@ -2923,6 +2942,7 @@ class MemoryRepository:
             year_from = scope["model_years"]["from"]
             year_to = scope["model_years"]["to"]
             size = int(scope["batch_size"])
+            include = scope.get("include_unresolved") is True
             if len(units) != len(plan_units):
                 raise invalid
 
@@ -2963,6 +2983,8 @@ class MemoryRepository:
                 marque = entry["register_marque"] if isinstance(entry["register_marque"], str) \
                     else None
                 readable = ambiguous = eligible = take = 0
+                enriched = unresolved = 0
+                excluded: list[dict[str, str]] = []
                 reason: str | None = None
                 snapshot: dict[str, Any] | None = None
                 if state == "register_unverified":
@@ -3012,7 +3034,18 @@ class MemoryRepository:
                                 "WORK_SCOPE_VOCABULARY_INSUFFICIENT"
                         else:
                             state = "prepared"
-                            take = min(eligible, budget)
+                            # PR-Z: what the coverage ledger already settles
+                            # is left out before the limit is spent.
+                            excluded = sorted(
+                                ({"upstream_record_id": upstream, "reason": decision}
+                                 for _, upstream, decision in self._coverage_decisions(
+                                     snapshot["id"], year_from, year_to, include)
+                                 if decision != catalog_coverage.DECISION_QUEUE),
+                                key=lambda entry: entry["upstream_record_id"].encode())
+                            enriched = sum(1 for entry in excluded if entry["reason"]
+                                           == catalog_coverage.EXCLUDED_ALREADY_ENRICHED)
+                            unresolved = len(excluded) - enriched
+                            take = min(eligible - enriched - unresolved, budget)
                             budget -= take
                             prepared += 1
                             queued += take
@@ -3027,7 +3060,8 @@ class MemoryRepository:
                     "capture_scope_key": (snapshot["retrieval_metadata"]["capture_scope"]
                                           .get("scope_key") if snapshot else None),
                     "readable": readable, "ambiguous": ambiguous, "eligible": eligible,
-                    "take": take})
+                    "take": take, "enriched": enriched, "unresolved": unresolved,
+                    "excluded": excluded})
 
             # Pass 2: write the whole decision.
             now = _now()
@@ -3049,12 +3083,25 @@ class MemoryRepository:
                        "eligible_count": unit["eligible"], "queued_count": unit["take"],
                        "created_at": now}
                 self.work_scope_units.append(row)
+                if unit["state"] == "prepared":
+                    self.work_scope_unit_coverages.append({
+                        "id": str(uuid4()), "preparation_id": record["id"], "unit_id": row["id"],
+                        "unit_key": row["unit_key"], "level": catalog_coverage.LEVEL_REGISTER,
+                        "vocabulary_version": catalog_coverage.VOCABULARY_VERSION,
+                        "include_unresolved": include,
+                        "excluded_already_enriched": unit["enriched"],
+                        "excluded_known_unresolved": unit["unresolved"],
+                        "excluded_records": [dict(entry) for entry in unit["excluded"]],
+                        "created_at": now})
                 if not unit["take"]:
                     continue
+                queueable = {candidate["id"] for candidate, _, decision
+                             in self._coverage_decisions(unit["snapshot_id"], year_from,
+                                                         year_to, include)
+                             if decision == catalog_coverage.DECISION_QUEUE}
                 chosen = sorted((candidate for candidate
                                  in self._snapshot_candidates(unit["snapshot_id"])
-                                 if candidate["status"] == "candidate"
-                                 and self._in_plan_years(candidate, year_from, year_to)),
+                                 if candidate["id"] in queueable),
                                 key=_variant_page_key)[:unit["take"]]
                 for start in range(0, len(chosen), size):
                     batch_number += 1
@@ -3457,6 +3504,313 @@ class MemoryRepository:
                     "trim": candidate.get("trim"), "status": candidate["status"],
                     "snapshot_id": candidate["snapshot_id"]})
             return {"binding": dict(binding), "batch": dict(batch), "items": items}
+
+    # -- the coverage ledger (20260927000100) -----------------------------------
+    #
+    # Mirrors `catalog_variant_coverage_decision` / `_apply` / `_for_batch`:
+    # the identity key and the content hash are derived from the stored rows
+    # (`backend/catalog/coverage.py`, the same rule the SQL states), the
+    # decision is the ONE rule, and the upsert never weakens what it knows.
+
+    _COVERAGE_FINISHED = frozenset({"completed", "partial_success"})
+
+    def _raw_records_by_id(self) -> dict[str, dict[str, Any]]:
+        return {row["id"]: row for row in self.catalog_raw_records.values()}
+
+    def _coverage_facts(self, candidate: Mapping[str, Any],
+                        records: Mapping[str, dict[str, Any]] | None = None
+                        ) -> tuple[str, str, dict[str, Any]]:
+        """(identity key, content hash, raw record) of one stored candidate."""
+        records = self._raw_records_by_id() if records is None else records
+        record = records[candidate["raw_record_id"]]
+        return (catalog_coverage.candidate_identity_key(candidate),
+                catalog_coverage.variant_content_sha256(record["payload"]), record)
+
+    def _coverage_decision(self, key: str, content: str, level: str,
+                           include: bool) -> tuple[str, dict[str, Any] | None]:
+        row = self.catalog_variant_coverage.get((key, level))
+        decision = catalog_coverage.coverage_decision(
+            row["status"] if row else None, row["content_sha256"] if row else None,
+            row["vocabulary_version"] if row else None, content, include_unresolved=include)
+        return decision, row
+
+    def _coverage_decisions(self, snapshot_id: Any, year_from: Any, year_to: Any,
+                            include: bool) -> list[tuple[dict[str, Any], str, str]]:
+        """Mirrors `catalog_work_scope_coverage_decisions`."""
+        decided = []
+        records = self._raw_records_by_id()
+        for candidate in self._snapshot_candidates(snapshot_id):
+            if candidate["status"] != "candidate" \
+                    or not self._in_plan_years(candidate, year_from, year_to):
+                continue
+            key, content, record = self._coverage_facts(candidate, records)
+            decision, _ = self._coverage_decision(key, content,
+                                                  catalog_coverage.LEVEL_REGISTER, include)
+            decided.append((candidate, str(record["upstream_record_id"]), decision))
+        return decided
+
+    @staticmethod
+    def _coverage_level(level: Any) -> str:
+        if level not in catalog_coverage.COVERAGE_LEVELS:
+            raise AppError("CATALOG_COVERAGE_INVALID", "invalid coverage ledger request", 422)
+        return str(level)
+
+    def catalog_variant_coverage_for_batch(self, batch_id: UUID, level: str) -> dict[str, Any] | None:
+        """Mirrors `catalog_variant_coverage_for_batch`: None for an unknown batch."""
+        with self.lock:
+            level = self._coverage_level(level)
+            batch = next((row for row in self.work_scope_batches if row["id"] == str(batch_id)),
+                         None)
+            if batch is None:
+                return None
+            revision = next((row for row in self.work_scope_revisions
+                             if row["work_scope_id"] == batch["work_scope_id"]
+                             and row["revision"] == batch["revision"]), None)
+            include = bool(revision) and revision["scope"].get("include_unresolved") is True
+            candidates = {row["id"]: row for row in self.catalog_candidates.values()}
+            records = self._raw_records_by_id()
+            items = []
+            for item in sorted((row for row in self.work_scope_queue_items
+                                if row["batch_id"] == batch["id"]),
+                               key=lambda row: row["batch_position"]):
+                candidate = candidates[item["candidate_id"]]
+                key, content, record = self._coverage_facts(candidate, records)
+                decision, ledger = self._coverage_decision(key, content, level, include)
+                items.append({"batch_position": item["batch_position"],
+                              "candidate_id": candidate["id"],
+                              "candidate_key": candidate["candidate_key"],
+                              "upstream_record_id": record["upstream_record_id"],
+                              "variant_identity_key": key, "content_sha256": content,
+                              "status": ledger["status"] if ledger else None,
+                              "last_run_id": ledger["last_run_id"] if ledger else None,
+                              "decision": decision})
+            return {"batch_id": batch["id"], "level": level, "include_unresolved": include,
+                    "vocabulary_version": catalog_coverage.VOCABULARY_VERSION, "items": items}
+
+    def _apply_catalog_variant_coverage(self, run_id: UUID, level: Any,
+                                        entries: Any) -> dict[str, Any]:
+        """Mirrors `catalog_variant_coverage_apply` (under the lock)."""
+        invalid = AppError("CATALOG_COVERAGE_INVALID", "invalid coverage ledger request", 422)
+        level = self._coverage_level(level)
+        if not isinstance(entries, list) \
+                or not 0 <= len(entries) <= catalog_coverage.MAX_COVERAGE_ENTRIES:
+            raise invalid
+        for entry in entries:
+            if not isinstance(entry, Mapping) or set(entry) != {"candidate_id", "status"} \
+                    or not isinstance(entry["candidate_id"], str) \
+                    or entry["status"] not in catalog_coverage.COVERAGE_STATUSES:
+                raise invalid
+            try:
+                if str(UUID(entry["candidate_id"])) != entry["candidate_id"]:
+                    raise invalid
+            except ValueError:
+                raise invalid from None
+        run = self.runs.get(str(run_id))
+        if run is None or run.get("status") not in self._COVERAGE_FINISHED:
+            raise AppError("CATALOG_COVERAGE_RUN_NOT_FINISHED",
+                           "the run has not finished with a result", 409)
+        binding = next((row for row in self.work_scope_batch_runs
+                        if row["run_id"] == str(run_id)), None)
+        if binding is None:
+            raise AppError("CATALOG_COVERAGE_RUN_UNBOUND",
+                           "the run executes no mapping plan batch", 422)
+        batch = next(row for row in self.work_scope_batches if row["id"] == binding["batch_id"])
+        candidates = {row["id"]: row for row in self.catalog_candidates.values()
+                      if row["snapshot_id"] == batch["snapshot_id"]}
+        if any(entry["candidate_id"] not in candidates for entry in entries):
+            raise AppError("CATALOG_COVERAGE_CANDIDATE_INVALID",
+                           "a coverage entry names no candidate of the run's snapshot", 422)
+        strongest: dict[str, tuple[str, str]] = {}
+        records = self._raw_records_by_id()
+        for entry in entries:
+            key, content, _ = self._coverage_facts(candidates[entry["candidate_id"]], records)
+            current = strongest.get(key)
+            candidate = (entry["status"], content)
+            rank = catalog_coverage.STATUS_RANK
+            if current is None or (-rank[candidate[0]], candidate[0].encode(), content) \
+                    < (-rank[current[0]], current[0].encode(), current[1]):
+                strongest[key] = candidate
+        written = 0
+        vocabulary = catalog_coverage.VOCABULARY_VERSION
+        for key, (status, content) in strongest.items():
+            row = self.catalog_variant_coverage.get((key, level))
+            incoming = {"status": status, "last_run_id": str(run_id),
+                        "snapshot_key": batch["snapshot_key"], "content_sha256": content,
+                        "vocabulary_version": vocabulary}
+            if row is None:
+                now = _now()
+                self.catalog_variant_coverage[(key, level)] = {
+                    "id": str(uuid4()), "variant_identity_key": key, "level": level,
+                    **incoming, "created_at": now, "updated_at": now}
+                written += 1
+                continue
+            rank = catalog_coverage.STATUS_RANK
+            replace = (row["content_sha256"] != content
+                       or rank[status] > rank[row["status"]]
+                       or (rank[status] == rank[row["status"]]
+                           and any(row[name] != incoming[name]
+                                   for name in ("status", "last_run_id", "snapshot_key",
+                                                "vocabulary_version"))))
+            if replace:
+                row.update(incoming, updated_at=_now())
+                written += 1
+        # Settlement releases the run's claims in the same step.
+        held = [key for key, row in self.catalog_variant_reservations.items()
+                if row["run_id"] == str(run_id) and row["level"] == level]
+        for key in held:
+            del self.catalog_variant_reservations[key]
+        return {"run_id": str(run_id), "level": level, "snapshot_key": batch["snapshot_key"],
+                "entries": len(entries), "written": written, "released": len(held)}
+
+    def _reservation_state(self, run_id: str) -> str:
+        """Mirrors `catalog_variant_reservation_state`."""
+        from datetime import UTC, datetime, timedelta
+        run = self.runs.get(str(run_id))
+        if run is None:
+            return "dead"
+        if run.get("status") in self._COVERAGE_FINISHED:
+            return "settling"
+        if run.get("status") in self._WORK_SCOPE_TERMINAL_RUN_STATES:
+            return "dead"
+        expires = run.get("lease_expires_at")
+        if not expires:
+            return "dead"
+        grace = timedelta(seconds=catalog_coverage.RESERVATION_TAKEOVER_GRACE_SECONDS)
+        expiry = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+        return "active" if expiry > datetime.now(UTC) - grace else "dead"
+
+    def acquire_catalog_variant_reservations(self, run_id: UUID, level: str,
+                                             candidate_ids: list[str], *, worker_id: str,
+                                             attempt: int, lease_token: str) -> dict[str, Any]:
+        """Mirrors `acquire_catalog_variant_reservations_guarded`."""
+        invalid = AppError("CATALOG_COVERAGE_INVALID", "invalid coverage ledger request", 422)
+        with self.lock:
+            run = self.runs.get(str(run_id))
+            if run is None or not worker_id or attempt is None or not lease_token \
+                    or run.get("worker_id") != worker_id or run.get("attempt") != attempt \
+                    or run.get("lease_token") != lease_token \
+                    or not run.get("lease_expires_at") or run["lease_expires_at"] <= _now():
+                raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409)
+            level = self._coverage_level(level)
+            if run.get("status") in self._WORK_SCOPE_TERMINAL_RUN_STATES:
+                raise AppError("CATALOG_COVERAGE_RUN_FINISHED",
+                               "the run already finished", 409)
+            if not isinstance(candidate_ids, list) or not 1 <= len(candidate_ids) <= 20 \
+                    or len(set(map(str, candidate_ids))) != len(candidate_ids):
+                raise invalid
+            binding = next((row for row in self.work_scope_batch_runs
+                            if row["run_id"] == str(run_id)), None)
+            if binding is None:
+                raise AppError("CATALOG_COVERAGE_RUN_UNBOUND",
+                               "the run executes no mapping plan batch", 422)
+            batch = next(row for row in self.work_scope_batches
+                         if row["id"] == binding["batch_id"])
+            items = {row["candidate_id"] for row in self.work_scope_queue_items
+                     if row["batch_id"] == batch["id"]}
+            if any(str(candidate) not in items for candidate in candidate_ids):
+                raise AppError("CATALOG_COVERAGE_CANDIDATE_INVALID",
+                               "a coverage entry names no candidate of the run's snapshot", 422)
+            revision = next((row for row in self.work_scope_revisions
+                             if row["work_scope_id"] == batch["work_scope_id"]
+                             and row["revision"] == batch["revision"]), None)
+            include = bool(revision) and revision["scope"].get("include_unresolved") is True
+            candidates = {row["id"]: row for row in self.catalog_candidates.values()}
+            records = self._raw_records_by_id()
+            facts = []
+            for candidate_id in candidate_ids:
+                key, content, record = self._coverage_facts(candidates[str(candidate_id)],
+                                                            records)
+                facts.append((key, str(candidate_id), content, record["upstream_record_id"]))
+            answer = []
+            for key, candidate_id, content, upstream in sorted(facts):
+                row = self.catalog_variant_reservations.get((key, level))
+                if row is None:
+                    row = {"id": str(uuid4()), "variant_identity_key": key, "level": level,
+                           "run_id": str(run_id), "attempt": attempt, "batch_id": batch["id"],
+                           "candidate_id": candidate_id, "content_sha256": content,
+                           "previous_run_id": None, "reserved_at": _now(),
+                           "updated_at": _now()}
+                    self.catalog_variant_reservations[(key, level)] = row
+                decision, _ = self._coverage_decision(key, content, level, include)
+                owner = None
+                if decision != catalog_coverage.DECISION_QUEUE:
+                    if row["run_id"] == str(run_id):
+                        del self.catalog_variant_reservations[(key, level)]
+                elif row["run_id"] == str(run_id):
+                    row.update(attempt=attempt, updated_at=_now())
+                    decision = catalog_coverage.RESERVED
+                else:
+                    state = self._reservation_state(row["run_id"])
+                    if state == "dead":
+                        row.update(previous_run_id=row["run_id"], run_id=str(run_id),
+                                   attempt=attempt, batch_id=batch["id"],
+                                   candidate_id=candidate_id, content_sha256=content,
+                                   reserved_at=_now(), updated_at=_now())
+                        decision = catalog_coverage.RESERVED
+                    else:
+                        owner = row["run_id"]
+                        decision = (catalog_coverage.SETTLEMENT_PENDING if state == "settling"
+                                    else catalog_coverage.RESERVED_BY_OTHER)
+                answer.append({"candidate_id": candidate_id, "upstream_record_id": upstream,
+                               "variant_identity_key": key, "decision": decision,
+                               "owner_run_id": owner})
+            return {"run_id": str(run_id), "level": level, "batch_id": batch["id"],
+                    "items": answer}
+
+    def catalog_variant_reservations_settling(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Mirrors `catalog_variant_reservations_settling`: finished runs still
+        holding claims, oldest first, one bounded page."""
+        with self.lock:
+            owners = {row["run_id"] for row in self.catalog_variant_reservations.values()}
+            rows = sorted((str(self.runs[run]["finished_at"] or ""), run) for run in owners
+                          if run in self.runs
+                          and self.runs[run].get("status") in self._COVERAGE_FINISHED)
+            return [{"run_id": run, "finished_at": finished or None}
+                    for finished, run in rows[:max(1, min(int(limit), 50))]]
+
+    def record_catalog_variant_coverage(self, run_id: UUID, level: str, entries: list[dict[str, Any]],
+                                        *, worker_id: str, attempt: int,
+                                        lease_token: str) -> dict[str, Any]:
+        """Mirrors `record_catalog_variant_coverage_guarded`."""
+        with self.lock:
+            run = self.runs.get(str(run_id))
+            if run is None or not worker_id or attempt is None or not lease_token \
+                    or run.get("worker_id") != worker_id or run.get("attempt") != attempt \
+                    or run.get("lease_token") != lease_token:
+                raise AppError("RUN_LEASE_LOST", "run lease is held by another worker", 409)
+            return self._apply_catalog_variant_coverage(run_id, level, entries)
+
+    def rebuild_catalog_variant_coverage(self, run_id: UUID, level: str,
+                                         entries: list[dict[str, Any]]) -> dict[str, Any]:
+        """Mirrors `rebuild_catalog_variant_coverage` (the operator backfill)."""
+        with self.lock:
+            return self._apply_catalog_variant_coverage(run_id, level, entries)
+
+    def catalog_variant_coverage_runs(self, *, after_finished_at: Any = None,
+                                      after_run_id: Any = None,
+                                      limit: int = 50) -> list[dict[str, Any]]:
+        """Mirrors `catalog_variant_coverage_runs`: one keyset page, oldest first."""
+        with self.lock:
+            bound = {row["run_id"] for row in self.work_scope_batch_runs}
+            rows = sorted(((str(run.get("finished_at")), run_id, run["status"])
+                           for run_id, run in self.runs.items()
+                           if run_id in bound and run.get("status") in self._COVERAGE_FINISHED
+                           and run.get("finished_at")))
+            if after_finished_at is not None:
+                cursor = (str(after_finished_at), str(after_run_id or ""))
+                rows = [row for row in rows if (row[0], row[1]) > cursor]
+            return [{"run_id": run_id, "finished_at": finished, "status": status}
+                    for finished, run_id, status in rows[:max(1, min(int(limit), 50))]]
+
+    def work_scope_unit_coverage(self, preparation_id: Any) -> list[dict[str, Any]]:
+        """Mirrors `work_scope_unit_coverage`: counts only, never the register ids."""
+        with self.lock:
+            return [{key: row[key] for key in ("unit_key", "level", "include_unresolved",
+                                               "excluded_already_enriched",
+                                               "excluded_known_unresolved")}
+                    for row in sorted((row for row in self.work_scope_unit_coverages
+                                       if row["preparation_id"] == str(preparation_id)),
+                                      key=lambda row: row["unit_key"].encode())]
 
     def catalog_canonical_manufacturer_coverage(self, manufacturers: list[str]) -> list[dict[str, Any]]:
         """Mirrors `catalog_canonical_manufacturer_coverage`: an exact count per

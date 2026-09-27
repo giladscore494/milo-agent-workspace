@@ -289,6 +289,26 @@ describe('reading a plan’s batch progress', () => {
     expect(empty?.controls.start.available).toBe(false);
   });
 
+  it('reads a unit’s ledger counts when the preparation recorded them, and renders without them otherwise', () => {
+    const body = progressBody();
+    const [toyota, lexus] = body.preparation.units;
+    const withCounts = parseProgress({ ...body, preparation: { ...body.preparation, units: [
+      { ...toyota, coverage: { enriched: 8, ambiguous: 4, pending: 2, queued: 25 } }, lexus] } });
+    expect(withCounts?.preparation?.units[0].coverage).toEqual(
+      { enriched: 8, ambiguous: 4, pending: 2, queued: 25 });
+    expect(withCounts?.preparation?.units[1].coverage).toBeUndefined();
+    // An older preparation states no counts at all: still readable.
+    expect(parseProgress(body)?.preparation?.units[0].coverage).toBeUndefined();
+    expect(parseProgress({ ...body, preparation: { ...body.preparation, units: [
+      { ...toyota, coverage: null }, lexus] } })?.preparation?.units[0].coverage).toBeUndefined();
+    // Stated but unreadable counts refuse the whole answer.
+    for (const coverage of [{ enriched: 8 }, { enriched: -1, ambiguous: 0, pending: 0, queued: 0 },
+                            { enriched: '8', ambiguous: 0, pending: 0, queued: 0 }, [], 'many']) {
+      expect(parseProgress({ ...body, preparation: { ...body.preparation, units: [
+        { ...toyota, coverage }, lexus] } })).toBeUndefined();
+    }
+  });
+
   it('keeps "not prepared" apart from "unreadable"', () => {
     const progress = parseProgress(progressBody({ preparation: null, status: 'not_prepared',
       controls: { ...progressBody().controls, start: { available: false, blocked_by: 'not_prepared',

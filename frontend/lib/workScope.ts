@@ -524,6 +524,15 @@ export type ProgressBatch = {
   unresolved?: number;
 };
 
+/**
+ * PR-Z: what the variant coverage ledger did to a unit's queue when the
+ * revision was prepared. `enriched` and `ambiguous` were left out (already
+ * enriched; known unresolved), `queued` is what was queued, and `pending` the
+ * queueable rest the plan's limit did not reach. Absent for a preparation
+ * written before the ledger existed.
+ */
+export type UnitCoverage = { enriched: number; ambiguous: number; pending: number; queued: number };
+
 export type ProgressUnit = {
   unitKey: string;
   name: string;
@@ -538,6 +547,7 @@ export type ProgressUnit = {
   promoted: number;
   refused: number;
   unresolved: number;
+  coverage?: UnitCoverage;
 };
 
 export type ProgressLive = {
@@ -679,6 +689,18 @@ function batch(value: unknown, withOutcome: boolean): ProgressBatch | undefined 
   return parsed;
 }
 
+/**
+ * Strict and optional: an absent `coverage` is an older preparation and reads
+ * as `null` (render without it); a present one must state all four counts, or
+ * the unit is unreadable (`undefined`).
+ */
+function unitCoverage(value: unknown): UnitCoverage | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const read = totals(value, ['enriched', 'ambiguous', 'pending', 'queued'] as const);
+  return read === undefined ? undefined : read;
+}
+
 function progressUnit(value: unknown): ProgressUnit | undefined {
   const source = asObject(value);
   const unitKey = typeof source.unit_key === 'string' && UNIT_KEY.test(source.unit_key) ? source.unit_key : undefined;
@@ -695,10 +717,13 @@ function progressUnit(value: unknown): ProgressUnit | undefined {
   }
   const reason = typeof source.reason_code === 'string' && /^[A-Z][A-Z0-9_]{2,79}$/.test(source.reason_code)
     ? source.reason_code : undefined;
+  const coverage = unitCoverage(source.coverage);
+  if (coverage === undefined) return undefined;
   return {
     unitKey, name, state: source.state as ProgressUnit['state'], reasonCode: reason,
     progress: source.progress as UnitProgressState, active: source.active === true,
-    ...(numbers as Omit<ProgressUnit, 'unitKey' | 'name' | 'state' | 'reasonCode' | 'progress' | 'active'>),
+    ...(numbers as Omit<ProgressUnit, 'unitKey' | 'name' | 'state' | 'reasonCode' | 'progress' | 'active' | 'coverage'>),
+    ...(coverage === null ? {} : { coverage }),
   };
 }
 

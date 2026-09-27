@@ -846,6 +846,17 @@ class WorkScopeBatchRunCreated(RunCreated):
     created: bool
 
 
+class WorkScopeUnitCoverage(BaseModel):
+    """PR-Z: what the variant coverage ledger did to one unit's queue."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enriched: int
+    ambiguous: int
+    pending: int
+    queued: int
+
+
 class WorkScopeProgressUnit(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -865,6 +876,8 @@ class WorkScopeProgressUnit(BaseModel):
     promoted: int
     refused: int
     unresolved: int
+    #: Absent (null) for a preparation written before the ledger existed.
+    coverage: WorkScopeUnitCoverage | None = None
 
 
 class WorkScopeProgressBatch(BaseModel):

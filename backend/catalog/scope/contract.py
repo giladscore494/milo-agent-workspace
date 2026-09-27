@@ -115,10 +115,20 @@ RECORD_KEYS = frozenset({"batch_size", "contract", "directory_version", "max_ite
                          "model_years", "source", "units"})
 MODEL_YEAR_KEYS = frozenset({"from", "to"})
 
+#: PR-Z: the ONE optional record key. `"include_unresolved": true` asks the
+#: preparation of this revision (and every run of its batches) to queue again
+#: the variants the coverage ledger records as unresolved. It is stated only
+#: when true -- absent means false -- so every plan written before it keeps
+#: its canonical text and digest byte for byte.
+INCLUDE_UNRESOLVED_KEY = "include_unresolved"
+OPTIONAL_RECORD_KEYS = frozenset({INCLUDE_UNRESOLVED_KEY})
+
 #: The closed key set of an EDIT: exactly the four editable facts, the years as
-#: two keys. An edit cannot name a contract, a source, a directory version or a
-#: digest -- those are the server's.
+#: two keys, plus (PR-Z) the optional `include_unresolved` boolean. An edit
+#: cannot name a contract, a source, a directory version or a digest -- those
+#: are the server's.
 FIELD_KEYS = frozenset({"units", "model_year_from", "model_year_to", "max_items", "batch_size"})
+OPTIONAL_FIELD_KEYS = frozenset({INCLUDE_UNRESOLVED_KEY})
 
 #: The closed vocabulary of refusals. Each names the FIELD that failed and
 #: carries no value, so a message can be shown and logged without echoing what
@@ -159,9 +169,11 @@ class WorkScope:
     max_items: int
     batch_size: int
     directory_version: str = mdir.DIRECTORY_VERSION
+    #: PR-Z: queue again what the coverage ledger records as unresolved.
+    include_unresolved: bool = False
 
     def as_record(self) -> dict[str, Any]:
-        return {
+        record = {
             "batch_size": self.batch_size,
             "contract": WORK_SCOPE_CONTRACT,
             "directory_version": self.directory_version,
@@ -170,6 +182,9 @@ class WorkScope:
             "source": dict(WORK_SCOPE_SOURCE),
             "units": list(self.units),
         }
+        if self.include_unresolved:
+            record[INCLUDE_UNRESOLVED_KEY] = True
+        return record
 
     def canonical_text(self) -> str:
         return canonical_text(self.as_record())
@@ -183,10 +198,15 @@ class WorkScope:
         return self.directory_version == mdir.DIRECTORY_VERSION
 
     def fields(self) -> dict[str, Any]:
-        """The four editable fields, as `scope_from_fields` accepts them."""
-        return {"units": list(self.units), "model_year_from": self.model_year_from,
-                "model_year_to": self.model_year_to, "max_items": self.max_items,
-                "batch_size": self.batch_size}
+        """The editable fields, as `scope_from_fields` accepts them.
+
+        `include_unresolved` is stated only when set, like the record."""
+        fields = {"units": list(self.units), "model_year_from": self.model_year_from,
+                  "model_year_to": self.model_year_to, "max_items": self.max_items,
+                  "batch_size": self.batch_size}
+        if self.include_unresolved:
+            fields[INCLUDE_UNRESOLVED_KEY] = True
+        return fields
 
 
 def canonical_text(record: Mapping[str, Any]) -> str:
@@ -231,7 +251,11 @@ def scope_from_fields(fields: Mapping[str, Any]) -> WorkScope:
     is a refusal naming its field, because a quietly repaired plan is a plan
     nobody asked for.
     """
-    if not isinstance(fields, Mapping) or set(fields) != FIELD_KEYS:
+    if not isinstance(fields, Mapping) or not FIELD_KEYS <= set(fields) \
+            or not set(fields) <= FIELD_KEYS | OPTIONAL_FIELD_KEYS:
+        raise WorkScopeError("WORK_SCOPE_FIELDS_INVALID")
+    include_unresolved = fields.get(INCLUDE_UNRESOLVED_KEY, False)
+    if not isinstance(include_unresolved, bool):
         raise WorkScopeError("WORK_SCOPE_FIELDS_INVALID")
     units = _units(fields.get("units"))
     year_from = _year(fields.get("model_year_from"))
@@ -245,7 +269,8 @@ def scope_from_fields(fields: Mapping[str, Any]) -> WorkScope:
     if not _whole(batch_size) or not 1 <= batch_size <= MAX_BATCH_SIZE:
         raise WorkScopeError("WORK_SCOPE_BATCH_SIZE_INVALID")
     return WorkScope(units=units, model_year_from=year_from, model_year_to=year_to,
-                     max_items=max_items, batch_size=batch_size)
+                     max_items=max_items, batch_size=batch_size,
+                     include_unresolved=include_unresolved)
 
 
 #: A unit key's SHAPE, as the database checks it. Which keys EXIST is the
@@ -257,6 +282,13 @@ _UNIT_KEY = re.compile(r"[a-z][a-z0-9_]{0,39}")
 MAX_STORED_UNITS = 64
 
 
+def _record_keys_valid(record: Mapping[str, Any]) -> bool:
+    """The closed key set, plus the optional key -- stated only as `true`."""
+    if set(record) - OPTIONAL_RECORD_KEYS != RECORD_KEYS:
+        return False
+    return INCLUDE_UNRESOLVED_KEY not in record or record[INCLUDE_UNRESOLVED_KEY] is True
+
+
 def stored_record_valid(record: Any) -> bool:
     """The Python twin of `public.catalog_work_scope_record_valid`.
 
@@ -266,7 +298,7 @@ def stored_record_valid(record: Any) -> bool:
     to be a directory entry and the text to be canonical: the database cannot
     know the directory, and does not pretend to.
     """
-    if not isinstance(record, dict) or set(record) != RECORD_KEYS:
+    if not isinstance(record, dict) or not _record_keys_valid(record):
         return False
     if record["contract"] != WORK_SCOPE_CONTRACT or record["source"] != dict(WORK_SCOPE_SOURCE):
         return False
@@ -310,7 +342,7 @@ def scope_from_text(text: Any) -> WorkScope:
         record = json.loads(text)
     except ValueError:
         raise WorkScopeError("WORK_SCOPE_RECORD_INVALID") from None
-    if not isinstance(record, dict) or set(record) != RECORD_KEYS:
+    if not isinstance(record, dict) or not _record_keys_valid(record):
         raise WorkScopeError("WORK_SCOPE_RECORD_INVALID")
     if record["contract"] != WORK_SCOPE_CONTRACT or record["source"] != dict(WORK_SCOPE_SOURCE):
         raise WorkScopeError("WORK_SCOPE_RECORD_INVALID")
@@ -328,13 +360,15 @@ def scope_from_text(text: Any) -> WorkScope:
         raise WorkScopeError("WORK_SCOPE_RECORD_INVALID") from None
     scope = WorkScope(units=scope.units, model_year_from=scope.model_year_from,
                       model_year_to=scope.model_year_to, max_items=scope.max_items,
-                      batch_size=scope.batch_size, directory_version=version)
+                      batch_size=scope.batch_size, directory_version=version,
+                      include_unresolved=record.get(INCLUDE_UNRESOLVED_KEY) is True)
     if scope.canonical_text() != text:
         raise WorkScopeError("WORK_SCOPE_RECORD_INVALID")
     return scope
 
 
-__all__ = ["DEFAULT_BATCH_SIZE", "DEFAULT_MAX_ITEMS", "FIELD_KEYS", "MAX_BATCH_SIZE",
+__all__ = ["DEFAULT_BATCH_SIZE", "DEFAULT_MAX_ITEMS", "FIELD_KEYS", "INCLUDE_UNRESOLVED_KEY",
+           "MAX_BATCH_SIZE", "OPTIONAL_FIELD_KEYS", "OPTIONAL_RECORD_KEYS",
            "MAX_MODEL_YEAR", "MAX_SCOPE_TEXT_CHARS", "MAX_STORED_UNITS", "MAX_UNITS",
            "MAX_WORK_SCOPE_ITEMS", "MIN_MODEL_YEAR", "MODEL_YEAR_KEYS", "RECORD_KEYS",
            "WORK_SCOPE_CONTRACT", "WORK_SCOPE_REASONS", "WORK_SCOPE_SOURCE", "WorkScope",

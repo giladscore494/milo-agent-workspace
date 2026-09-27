@@ -17,6 +17,9 @@ Regenerate with:
 from __future__ import annotations
 
 REQUIRED_RPC_ARGS: dict[str, set[str]] = {
+    "acquire_catalog_variant_reservations_guarded": {
+        "p_attempt", "p_candidate_ids", "p_lease_token", "p_level", "p_run_id", "p_worker_id"
+    },
     "activate_catalog_snapshot_guarded": {
         "p_activation", "p_attempt", "p_lease_token", "p_run_id", "p_worker_id"
     },
@@ -41,6 +44,9 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_raw_record_by_upstream_id": {"p_snapshot_id", "p_upstream_record_id"},
     "catalog_run_pending_promotions": {"p_run_id", "p_tool_operation"},
     "catalog_snapshot_candidate_diff": {"p_previous_snapshot_id", "p_snapshot_id"},
+    "catalog_variant_coverage_for_batch": {"p_batch_id", "p_level"},
+    "catalog_variant_coverage_runs": {"p_after_finished_at", "p_after_run_id", "p_limit"},
+    "catalog_variant_reservations_settling": {"p_limit"},
     "claim_current_verdict_states": {"p_run_id"},
     "claim_run_lease": {"p_run_id", "p_worker_id"},
     "create_agent_message_guarded": {
@@ -95,6 +101,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "prepare_work_scope_queue": {
         "p_attempt", "p_lease_token", "p_preparation", "p_run_id", "p_worker_id"
     },
+    "rebuild_catalog_variant_coverage": {"p_entries", "p_level", "p_run_id"},
     "record_catalog_candidates_batch_guarded": {
         "p_attempt", "p_candidates", "p_lease_token", "p_run_id", "p_worker_id"
     },
@@ -109,6 +116,9 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     },
     "record_catalog_snapshot_guarded": {
         "p_attempt", "p_lease_token", "p_run_id", "p_snapshot", "p_worker_id"
+    },
+    "record_catalog_variant_coverage_guarded": {
+        "p_attempt", "p_entries", "p_lease_token", "p_level", "p_run_id", "p_worker_id"
     },
     "record_claim_verdict_guarded": {
         "p_attempt", "p_lease_token", "p_run_id", "p_verdict", "p_worker_id"
@@ -162,4 +172,5 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     },
     "work_scope_batch_for_run": {"p_run_id"},
     "work_scope_progress": {"p_work_scope_id"},
+    "work_scope_unit_coverage": {"p_preparation_id"},
 }

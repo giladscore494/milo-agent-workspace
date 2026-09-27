@@ -220,6 +220,12 @@ export function MappingPlanProgress({
                         ? UNIT_REASON_COPY[unit.reasonCode] : 'Nothing was queued for it.'}
                     </span>
                   )}
+                  {unit.coverage !== undefined && (
+                    <span className="note mapping-plan-unit-coverage" aria-label="Variant coverage">
+                      {' '}· {unit.coverage.enriched} enriched, {unit.coverage.ambiguous} ambiguous,
+                      {' '}{unit.coverage.pending} pending, {unit.coverage.queued} queued
+                    </span>
+                  )}
                 </li>
               ))}
             </ol>
