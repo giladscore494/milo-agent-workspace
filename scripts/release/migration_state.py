@@ -94,6 +94,8 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20260925000100": ("column", "run_usage_ledger.reasoning_tokens"),
     # PR-Z variant coverage ledger.
     "20260927000100": ("table", "catalog_variant_coverage"),
+    # E' web preparation requests.
+    "20260928000100": ("table", "catalog_work_scope_preparation_requests"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")

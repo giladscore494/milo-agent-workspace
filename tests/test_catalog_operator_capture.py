@@ -1826,7 +1826,10 @@ def test_preparation_uses_the_transactional_creation_contract(monkeypatch, repos
     # it names neither half itself. (The in-memory mirror calls them inside
     # its own transaction, which is why this is a source assertion and not a
     # patched-method one.)
-    body = entrypoint_code().split("def _prepare(")[1].split("\ndef ")[0]
+    # Since E' the steps live in `prepare_capture_run`, which `_prepare` and
+    # the API's Prepare route both call.
+    assert "return prepare_capture_run(" in entrypoint_code().split("def _prepare(")[1].split("\ndef ")[0]
+    body = entrypoint_code().split("def prepare_capture_run(")[1].split("\ndef ")[0]
     assert "create_message_and_run" in body
     assert "create_queued_run" not in body
     assert "create_user_message" not in body

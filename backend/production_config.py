@@ -182,6 +182,11 @@ EXECUTION_FLAGS = (
     # definition pins it false; one explicit operator execution turns it on.
     # Pinned off on the API and the product worker like every other stage flag.
     "MILO_ENABLE_WORK_SCOPE_PREPARATION",
+    # API-only (E'): the website's Prepare route, which executes the EXISTING
+    # capture job once for one plan revision. It starts no batch, no product
+    # run and no model call; pinned off here like every other stage flag, and
+    # turned on only by `website-execution-activate.sh --apply-web-preparation`.
+    "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS",
 )
 
 # NEXT_PUBLIC_* values ship to the browser bundle: secret material is banned.

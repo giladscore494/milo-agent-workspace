@@ -3682,6 +3682,8 @@ CATALOG_RECOVERY_TABLES = ("catalog_snapshot_adoptions",)
 #: ledger exclusions.
 CATALOG_COVERAGE_TABLES = ("catalog_variant_coverage", "catalog_work_scope_unit_coverage",
                            "catalog_variant_reservations")
+#: E' (20260928000100): the web preparation request.
+CATALOG_PREPARATION_REQUEST_TABLES = ("catalog_work_scope_preparation_requests",)
 CATALOG_COVERAGE_RPCS = ("catalog_variant_coverage_for_batch",
                          "record_catalog_variant_coverage_guarded",
                          "rebuild_catalog_variant_coverage", "catalog_variant_coverage_runs",
@@ -3833,7 +3835,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
         "20260923000100_catalog_work_scope_preparation.sql",
         "20260924000100_catalog_work_scope_batch_runs.sql",
         "20260924000200_catalog_ingestion_recovery.sql",
-        "20260927000100_catalog_variant_coverage.sql"]
+        "20260927000100_catalog_variant_coverage.sql",
+        "20260928000100_catalog_work_scope_preparation_requests.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
@@ -3845,7 +3848,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
                          + len(CATALOG_WORK_SCOPE_PREPARATION_TABLES)
                          + len(CATALOG_WORK_SCOPE_CONTROL_TABLES)
                          + len(CATALOG_RECOVERY_TABLES)
-                         + len(CATALOG_COVERAGE_TABLES))
+                         + len(CATALOG_COVERAGE_TABLES)
+                         + len(CATALOG_PREPARATION_REQUEST_TABLES))
     _reapply_catalog_migrations(db)
     _reapply_catalog_migrations(db)
     assert db.psql(
@@ -8800,8 +8804,9 @@ MIGRATION_STATE_SCRIPT = REPO_ROOT / "scripts" / "release" / "check-migration-st
 SCOPED_MIGRATION_VERSIONS = ("20260922000100", "20260923000100", "20260924000100")
 #: What production lacks after the 2026-09-24 incident: the ingestion recovery
 #: migration, (PR-R) the reasoning-aware usage migration, and (PR-Z) the
-#: variant coverage migration.
-PENDING_MIGRATION_VERSIONS = ("20260924000200", "20260925000100", "20260927000100")
+#: variant coverage migration, and (E') the web preparation request migration.
+PENDING_MIGRATION_VERSIONS = ("20260924000200", "20260925000100", "20260927000100",
+                              "20260928000100")
 PARTIAL_PG_PORT = "54995"
 
 
@@ -8945,7 +8950,7 @@ def production_shaped_db():
         server.psql(sql=SEED_LEGACY_ROWS)
         server.psql(sql=SUPABASE_AUTH_SHIM)
         applied = [m for m in MIGRATIONS if not m.name.startswith(PENDING_MIGRATION_VERSIONS)]
-        assert len(applied) == 41 and len(MIGRATIONS) == 44
+        assert len(applied) == 41 and len(MIGRATIONS) == 45
         for migration in applied:
             server.psql(file=migration)
         versions = ", ".join(f"('{m.name.split('_', 1)[0]}')" for m in applied)
@@ -8979,8 +8984,8 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as partially-migrated (41/44" in state.stdout, state.stdout
-    assert "3 local migration(s) not present in remote migration history" in state.stdout
+    assert "remote schema classified as partially-migrated (41/45" in state.stdout, state.stdout
+    assert "4 local migration(s) not present in remote migration history" in state.stdout
     for version in PENDING_MIGRATION_VERSIONS:
         assert version in state.stdout
     for version in SCOPED_MIGRATION_VERSIONS:
@@ -8997,11 +9002,11 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
                 f"('{migration.name.split('_', 1)[0]}')")
     schema = _readiness(production_shaped_db, "--schema-only")
     assert schema.returncode == 0, schema.stdout
-    assert "WORK_SCOPE_SCHEMA=VERIFIED (12 tables with RLS, 18 RPCs service_role-only)" in schema.stdout
+    assert "WORK_SCOPE_SCHEMA=VERIFIED (13 tables with RLS, 21 RPCs service_role-only)" in schema.stdout
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as fully-migrated (44/44" in state.stdout, state.stdout
+    assert "remote schema classified as fully-migrated (45/45" in state.stdout, state.stdout
 
 
 
@@ -10598,3 +10603,203 @@ def test_pr_z_a_claim_is_given_back_when_the_ledger_already_settles_it(ledger_db
     answer = _acquire(db, a)
     assert _decisions(answer).count("excluded_already_enriched") == 3
     assert len(_owners(db)) == 7
+
+
+# =============================================================================
+# E' (20260928000100): the web preparation request -- one claim per revision
+# =============================================================================
+#
+# The Prepare route's idempotency is the database's: ONE request row per
+# (plan, revision), claimed under the plan's row lock, so exactly one caller
+# may execute the capture job for an attempt; a retry happens only when the
+# attempt can no longer prepare; the claimer's record is a compare-and-set on
+# ITS attempt; and the status facts are bounded durable state.
+
+def _wpr_migration():
+    return next(m for m in MIGRATIONS if m.name.startswith("20260928000100"))
+
+
+def _wpr_plan(db) -> tuple[str, str, str, str]:
+    """(user, conversation, plan id, revision-1 digest)."""
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope()
+    plan = _ws_create(db, conversation, user, scope)["work_scope"]["id"]
+    return user, conversation, plan, scope.digest()
+
+
+def _wpr_claim(db, plan: str, digest: str, user: str, *, revision: int = 1,
+               grace: int = 900) -> dict:
+    return json.loads(_rpc_as_service(
+        db, f"select public.request_work_scope_preparation('{plan}', {revision}, '{digest}', "
+            f"'{user}', {grace})"))
+
+
+def _wpr_record(db, request: str, attempt: int, run: str | None, state: str,
+                execution: str | None = None) -> dict:
+    run_sql = f"'{run}'" if run else "null"
+    execution_sql = f"'{execution}'" if execution else "null"
+    return json.loads(_rpc_as_service(
+        db, f"select public.record_work_scope_preparation_trigger('{request}', {attempt}, "
+            f"{run_sql}, '{state}', {execution_sql})"))
+
+
+def _wpr_capture_run(db, conversation: str) -> str:
+    """An UNCLAIMED operator capture run, as `prepare_capture_run` leaves it."""
+    return db.psql(born_with_identity(
+        f"insert into public.runs (conversation_id, status, input, launch_state) values "
+        f"('{conversation}', 'queued', "
+        f"""'{{"metadata": {{"milo_operation": "catalog.government.capture"}}}}'::jsonb, """
+        f"'none') returning id", workflow_key="operator_capture"))
+
+
+def test_web_preparation_requests_are_service_only_and_rerun_safe(db):
+    table = "catalog_work_scope_preparation_requests"
+    assert db.psql(f"select relrowsecurity from pg_class where oid='public.{table}'::regclass") == "t"
+    assert db.psql(f"select count(*) from pg_policies where tablename='{table}'") == "0"
+    for role in ("anon", "authenticated"):
+        for privilege in ("select", "insert", "update", "delete"):
+            assert db.psql(f"select has_table_privilege('{role}', 'public.{table}', '{privilege}')") == "f"
+    assert db.psql(f"select has_table_privilege('service_role', 'public.{table}', 'delete')") == "f"
+    for signature in ("public.request_work_scope_preparation(uuid, integer, text, uuid, integer)",
+                      "public.record_work_scope_preparation_trigger(uuid, integer, uuid, text, text)",
+                      "public.work_scope_preparation_state(uuid, integer, text)"):
+        for role in ("anon", "authenticated"):
+            assert not _has_execute(db, role, signature), signature
+        assert _has_execute(db, "service_role", signature), signature
+    db.psql(file=_wpr_migration())
+    db.psql(file=_wpr_migration())
+    assert db.psql("select count(*) from pg_indexes where indexname="
+                   "'catalog_work_scope_preparation_requests_revision_uidx'") == "1"
+
+
+def test_the_first_claim_wins_and_every_other_caller_is_answered_with_it(db):
+    user, _conversation, plan, digest = _wpr_plan(db)
+    first = _wpr_claim(db, plan, digest, user)
+    assert first["decision"] == "claimed" and first["request"]["attempt"] == 1
+    again = _wpr_claim(db, plan, digest, user)
+    assert again["decision"] == "existing"
+    assert again["request"]["id"] == first["request"]["id"]
+    assert db.psql("select count(*) from public.catalog_work_scope_preparation_requests "
+                   f"where work_scope_id='{plan}'") == "1"
+
+
+def test_concurrent_claims_serialize_on_the_plan_row(db):
+    user, _conversation, plan, digest = _wpr_plan(db)
+    statement = (f"set role service_role; select public.request_work_scope_preparation("
+                 f"'{plan}', 1, '{digest}', '{user}', 900)->>'decision'; "
+                 "select pg_sleep(0.5); reset role")
+    commands = [["psql", "-h", db.dir, "-p", db.port, "-U", "postgres", "-d", "milo",
+                 "-v", "ON_ERROR_STOP=1", "-X", "-q", "-t", "-A", "-1", "-c", statement]
+                for _ in range(2)]
+    processes = [subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for cmd in commands]
+    answers = []
+    for process in processes:
+        out, err = process.communicate(timeout=60)
+        assert process.returncode == 0, err
+        answers.append(out.strip().splitlines()[0])
+    assert sorted(answers) == ["claimed", "existing"]
+    assert db.psql("select count(*) from public.catalog_work_scope_preparation_requests "
+                   f"where work_scope_id='{plan}'") == "1"
+
+
+def test_a_stale_or_prepared_revision_is_never_claimed(db):
+    user, _conversation, plan, digest = _wpr_plan(db)
+    assert _wpr_claim(db, plan, "0" * 64, user)["decision"] == "stale"
+    assert _wpr_claim(db, plan, digest, user, revision=2)["decision"] == "stale"
+    second = _ws_scope(units=["toyota"])
+    db.psql(f"select public.revise_work_scope('{plan}', 1, '{digest}', '{user}', "
+            f"{_ws_revision(second)})")
+    assert _wpr_claim(db, plan, digest, user)["decision"] == "stale"
+    with pytest.raises(AssertionError, match="WORK_SCOPE_NOT_FOUND"):
+        _wpr_claim(db, str(uuid.uuid4()), digest, user)
+    for grace in (0, 299, 86401):
+        with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_REQUEST_INVALID"):
+            _wpr_claim(db, plan, second.digest(), user, revision=2, grace=grace)
+    assert db.psql("select count(*) from public.catalog_work_scope_preparation_requests "
+                   f"where work_scope_id='{plan}'") == "0"
+
+
+def test_the_trigger_record_is_a_compare_and_set_on_the_claimed_attempt(db):
+    user, conversation, plan, digest = _wpr_plan(db)
+    request = _wpr_claim(db, plan, digest, user)["request"]
+    run = _wpr_capture_run(db, conversation)
+    bound = _wpr_record(db, request["id"], 1, run, "claimed")
+    assert (bound["run_id"], bound["trigger_state"]) == (run, "claimed")
+    triggered = _wpr_record(db, request["id"], 1, run, "triggered", "milo-catalog-capture-abc12")
+    assert (triggered["trigger_state"], triggered["execution_name"]) == \
+        ("triggered", "milo-catalog-capture-abc12")
+    assert triggered["triggered_at"] is not None
+    # Recorded once: the attempt is no longer `claimed`.
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_REQUEST_STALE"):
+        _wpr_record(db, request["id"], 1, run, "triggered")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_REQUEST_STALE"):
+        _wpr_record(db, request["id"], 2, run, "trigger_failed")
+    # Only an operator capture run of the plan's own conversation.
+    user2, conversation2, plan2, digest2 = _wpr_plan(db)
+    other = _wpr_claim(db, plan2, digest2, user2)["request"]
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_REQUEST_INVALID"):
+        _wpr_record(db, other["id"], 1, run, "claimed")
+    swarm = db.psql(born_with_identity(
+        f"insert into public.runs (conversation_id, status, input) values "
+        f"('{conversation2}', 'queued', '{{}}'::jsonb) returning id", workflow_key="swarm_v2"))
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_REQUEST_INVALID"):
+        _wpr_record(db, other["id"], 1, swarm, "claimed")
+    with pytest.raises(AssertionError, match="WORK_SCOPE_PREPARATION_REQUEST_INVALID"):
+        _wpr_record(db, other["id"], 1, None, "triggered")
+
+
+def test_an_attempt_is_retried_only_when_it_can_no_longer_prepare(db):
+    user, conversation, plan, digest = _wpr_plan(db)
+    request = _wpr_claim(db, plan, digest, user)["request"]
+    # A trigger that definitely failed: retried, attempt 2.
+    _wpr_record(db, request["id"], 1, None, "trigger_failed")
+    retry = _wpr_claim(db, plan, digest, user)
+    assert (retry["decision"], retry["request"]["attempt"]) == ("claimed", 2)
+    # Triggered a moment ago, run never claimed yet: in flight.
+    run = _wpr_capture_run(db, conversation)
+    _wpr_record(db, request["id"], 2, run, "triggered")
+    assert _wpr_claim(db, plan, digest, user)["decision"] == "existing"
+    # ...until the grace passes: retried, and the unclaimed run is KEPT.
+    db.psql("update public.catalog_work_scope_preparation_requests "
+            f"set triggered_at = now() - interval '20 minutes' where id='{request['id']}'")
+    kept = _wpr_claim(db, plan, digest, user)
+    assert (kept["decision"], kept["request"]["attempt"], kept["request"]["run_id"]) == \
+        ("claimed", 3, run)
+    _wpr_record(db, request["id"], 3, run, "triggered")
+    # A run a capture claimed and still holds is never retried beside itself.
+    db.psql(f"update public.runs set worker_id='capture', status='running', "
+            f"lease_expires_at = now() - interval '1 hour' where id='{run}'")
+    db.psql("update public.catalog_work_scope_preparation_requests "
+            f"set triggered_at = now() - interval '2 hours' where id='{request['id']}'")
+    assert _wpr_claim(db, plan, digest, user)["decision"] == "existing"
+    # A run that ENDED without preparing: retried, with a new run to come.
+    db.psql(f"update public.runs set status='failed', finished_at=now(), "
+            f"error='{{\"code\": \"GOV_TRANSPORT_FAILED\", \"message\": \"x\"}}'::jsonb "
+            f"where id='{run}'")
+    ended = _wpr_claim(db, plan, digest, user)
+    assert (ended["decision"], ended["request"]["attempt"], ended["request"]["run_id"]) == \
+        ("claimed", 4, None)
+
+
+def test_the_status_facts_are_bounded_durable_state(db):
+    user, conversation, plan, digest = _wpr_plan(db)
+    empty = json.loads(_rpc_as_service(
+        db, f"select public.work_scope_preparation_state('{plan}', 1, '{digest}')"))
+    assert (empty["head_revision"], empty["request"], empty["run"], empty["preparation"],
+            empty["known_unresolved"]) == (1, None, None, None, None)
+    request = _wpr_claim(db, plan, digest, user)["request"]
+    run = _wpr_capture_run(db, conversation)
+    _wpr_record(db, request["id"], 1, run, "triggered", "milo-catalog-capture-abc12")
+    db.psql(f"update public.runs set status='failed', finished_at=now(), "
+            f"error='{{\"code\": \"GOV_TRANSPORT_FAILED\", \"message\": \"select * from x\"}}'::jsonb "
+            f"where id='{run}'")
+    facts = json.loads(_rpc_as_service(
+        db, f"select public.work_scope_preparation_state('{plan}', 1, '{digest}')"))
+    assert facts["request"]["trigger_state"] == "triggered"
+    assert facts["run"] == {"status": "failed", "launch_state": "none", "claimed": False,
+                            "lease_expired_seconds": None, "error_code": "GOV_TRANSPORT_FAILED"}
+    assert "select * from x" not in json.dumps(facts)
+    assert _rpc_as_service(
+        db, f"select coalesce(public.work_scope_preparation_state('{uuid.uuid4()}', 1, "
+            f"'{digest}')::text, 'null')") == "null"

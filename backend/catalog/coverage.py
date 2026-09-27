@@ -578,6 +578,74 @@ def _preparation_queue(checkpoint: Any) -> tuple[str, tuple[Any, ...]] | None:
                                               for item in record["queue"])
 
 
+def _checkpoint_evidence(checkpoint: Any) -> tuple[list[Any], list[Any]]:
+    """The evidence and verdicts a run's LAST engine checkpoint carries.
+
+    The same `swarm_state` the engine finalized from: its evidence references,
+    and its verifier state under the same grounding rule the engine applies
+    (`SwarmV2Engine._verdicts_from_state`: a state written under another
+    grounding version contributes no verdict, so its claims stay unverified).
+    Anything unreadable is left out, never repaired -- a claim with no
+    readable verdict is simply not verified.
+    """
+    from backend.engines.swarm_v2.contracts import EvidenceReference, VerificationVerdict
+    from backend.engines.swarm_v2.grounding import VERIFIER_GROUNDING_VERSION
+
+    artifacts = checkpoint.get("artifacts") if isinstance(checkpoint, Mapping) else None
+    state = artifacts.get("swarm_state") if isinstance(artifacts, Mapping) else None
+    if not isinstance(state, Mapping):
+        return [], []
+    evidence = []
+    for raw in state.get("evidence_references") or []:
+        try:
+            evidence.append(EvidenceReference.model_validate(raw))
+        except Exception:
+            continue
+    verdicts = []
+    stored = state.get("verifier_state")
+    if state.get("verifier_grounding_version") == VERIFIER_GROUNDING_VERSION \
+            and isinstance(stored, Mapping):
+        claims = {item.claim_id for item in evidence}
+        for claim_id, raw in sorted(stored.items()):
+            if claim_id not in claims:
+                continue
+            try:
+                verdicts.append(VerificationVerdict.model_validate(raw))
+            except Exception:
+                continue
+    return evidence, verdicts
+
+
+def assembled_output(output: Mapping[str, Any], checkpoint: Any) -> Mapping[str, Any]:
+    """E'-6: a pre-PR-2 output, given the vehicle view the finalize path adds today.
+
+    Runs that finished before PR-2 (6825eb96 among them) stored
+    ``candidate_outcomes`` but no ``vehicles`` / ``unresolved_groups`` -- the
+    only keys `derive_coverage` reads -- so every item they were handed read as
+    ``failed``. This builds those two keys with the SAME
+    `VehicleCatalogResultAssembler` the finalize path (`FinalBuilder`) runs,
+    from the SAME inputs it had: the typed outcomes stored in the output, the
+    evidence and verdicts of the run's last engine checkpoint, and the output's
+    own task codes. No new rule: pure assembly. An output that already carries
+    either key, or has no outcomes, is returned unchanged.
+    """
+    if "vehicles" in output or "unresolved_groups" in output:
+        return output
+    outcomes = output.get("candidate_outcomes")
+    if not isinstance(outcomes, list) or not outcomes:
+        return output
+    from backend.catalog.result.assembler import VehicleCatalogResultAssembler
+
+    evidence, verdicts = _checkpoint_evidence(checkpoint)
+    codes = [item for item in output.get("needs_review") or []
+             if isinstance(item, Mapping) and _text(item.get("task_id")) and _text(item.get("code"))]
+    view = VehicleCatalogResultAssembler().assemble(
+        evidence=evidence, verdicts=verdicts,
+        candidate_outcomes=[item for item in outcomes if isinstance(item, Mapping)],
+        coverage_gaps=codes)
+    return {**output, "vehicles": view["vehicles"], "unresolved_groups": view["unresolved_groups"]}
+
+
 def backfill_run(repository: Any, run: Mapping[str, Any], report: BackfillReport, *,
                  level: str = BATCH_COVERAGE_LEVEL, dry_run: bool = False) -> None:
     """Rebuild the ledger rows of ONE finished batch run. Idempotent."""
@@ -588,7 +656,8 @@ def backfill_run(repository: Any, run: Mapping[str, Any], report: BackfillReport
         report.skip("NO_OUTPUT")
         return
     try:
-        prepared = _preparation_queue(repository.latest_checkpoint(run_id))
+        checkpoint = repository.latest_checkpoint(run_id)
+        prepared = _preparation_queue(checkpoint)
     except Exception:
         report.skip("PREPARATION_UNREADABLE")
         return
@@ -597,6 +666,9 @@ def backfill_run(repository: Any, run: Mapping[str, Any], report: BackfillReport
         return
     snapshot_key, queue = prepared
     try:
+        # E'-6: an output written before PR-2 gets its vehicle view from the
+        # finalize path's own assembler first (unchanged when it has one).
+        output = assembled_output(output, checkpoint)
         derived = derive_coverage(output, queue, _pinned_query(repository, snapshot_key))
     except Exception:
         report.skip("SNAPSHOT_UNAVAILABLE")
@@ -705,7 +777,8 @@ __all__ = ["BACKFILL_SKIP_REASONS", "CLAIM_DECISIONS", "MAX_RECONCILE_RUNS",
            "EXCLUDED_KNOWN_UNRESOLVED", "FAILED", "LEVEL_REGISTER", "MAX_BACKFILL_PAGE",
            "MAX_COVERAGE_ENTRIES", "MAX_IDENTITY_SCAN_ROWS", "PENDING", "STATUS_RANK",
            "UNRESOLVED_AMBIGUOUS", "UNRESOLVED_NOT_FOUND", "UNRESOLVED_STATUSES",
-           "VARIANT_IDENTITY_CONTRACT", "VOLATILE_PAYLOAD_FIELDS", "backfill", "backfill_run",
+           "VARIANT_IDENTITY_CONTRACT", "VOLATILE_PAYLOAD_FIELDS", "assembled_output",
+           "backfill", "backfill_run",
            "candidate_identity_key", "coverage_decision", "derive_coverage",
            "record_run_coverage", "variant_content_sha256", "variant_identity_key",
            "variant_identity_text", "KEY_COLLISION", "KeySettlement",

@@ -208,6 +208,18 @@ REQUIRED_PER_FILE["20260927000100_catalog_variant_coverage.sql"] = [
     "or r.payload->>'degem_cd' = p_register_model_code)",
     "or r.payload->>'sug_degem' = p_vehicle_type_code)",
 ]
+REQUIRED_PER_FILE["20260928000100_catalog_work_scope_preparation_requests.sql"] = [
+    # E': ONE web preparation request per (plan, revision), claimed under the
+    # PLAN's row lock, moved on only by a compare-and-set on its own attempt,
+    # and service-path only.
+    "enable row level security",
+    "create table if not exists public.catalog_work_scope_preparation_requests (",
+    "create unique index if not exists catalog_work_scope_preparation_requests_revision_uidx",
+    "select * into v_plan from public.catalog_work_scopes where id = p_work_scope_id for update;",
+    "if not found or v_request.attempt <> p_attempt or v_request.trigger_state <> 'claimed' then",
+    "coalesce(v_run.run_identity->>'workflow_key', '') <> 'operator_capture'",
+    "revoke delete on table public.catalog_work_scope_preparation_requests from service_role",
+]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the
     # preparation it feeds is written once, by an operator capture run only.

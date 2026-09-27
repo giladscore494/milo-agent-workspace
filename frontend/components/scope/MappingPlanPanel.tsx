@@ -17,6 +17,7 @@ import {
   preparableUnits,
   removeUnit,
 } from '@/lib/workScope';
+import { MappingPlanPreparation, MappingPlanPreparationProps } from './MappingPlanPreparation';
 import { MappingPlanProgress, MappingPlanProgressProps } from './MappingPlanProgress';
 
 export type MappingPlanPanelProps = {
@@ -45,6 +46,8 @@ export type MappingPlanPanelProps = {
   onRetry: () => void;
   /** The plan's batches, when this server lets a member start them. */
   batches?: Omit<MappingPlanProgressProps, 'unitName'>;
+  /** E': the head revision's preparation, read from the server. */
+  preparation?: Omit<MappingPlanPreparationProps, 'unitName' | 'revision' | 'serverCanPrepare'>;
 };
 
 const PROBLEM_COPY = {
@@ -98,6 +101,7 @@ export function MappingPlanPanel({
   onDiscardDraft,
   onRetry,
   batches,
+  preparation,
 }: MappingPlanPanelProps) {
   const [filter, setFilter] = useState('');
   if (!visible || capabilities === undefined) return null;
@@ -128,6 +132,9 @@ export function MappingPlanPanel({
   // only a unit with a VERIFIED register spelling is captured and queued.
   const preparable = directory !== undefined ? preparableUnits(draft.units, directory) : undefined;
   const verifiedInDirectory = (directory?.entries ?? []).filter((entry) => entry.registerMarqueVerified);
+  // E'-5: the count the toggle would re-queue, from the server's bounded read
+  // of the plan's latest preparation. Never computed here.
+  const knownUnresolved = preparation?.preparation?.knownUnresolved;
 
   return (
     <section className="panel mapping-plan" aria-labelledby="mapping-plan-title">
@@ -152,8 +159,10 @@ export function MappingPlanPanel({
           <div className="panel-body">
             <p className="note">
               {capabilities.canStartBatches
-                ? 'Each batch starts only when you start it, one at a time, and runs as one paid run. Preparing a revision’s Government data is an operator step.'
-                : 'Planning only: preparing Government data and starting batches are not available yet. Nothing here runs or spends anything.'}
+                ? `Each batch starts only when you start it, one at a time, and runs as one paid run. ${capabilities.canPrepare ? 'Prepare a revision below before its first batch.' : 'Preparing a revision’s Government data is an operator step.'}`
+                : capabilities.canPrepare
+                  ? 'Starting batches is not available yet. You can prepare a revision’s Government data below; preparing starts no run and spends nothing on models.'
+                  : 'Planning only: preparing Government data and starting batches are not available yet. Nothing here runs or spends anything.'}
             </p>
             {error && <p className="alert" role="alert">{safeText(error)}</p>}
             {loading && <p className="muted">Loading the mapping plan…</p>}
@@ -161,6 +170,11 @@ export function MappingPlanPanel({
               <div className="button-row">
                 <button type="button" className="button button--quiet" onClick={onRetry}>Reload plan</button>
               </div>
+            )}
+
+            {hasPlan && preparation !== undefined && (
+              <MappingPlanPreparation {...preparation} revision={state.revision}
+                serverCanPrepare={capabilities.canPrepare} unitName={unitLabel} />
             )}
 
             {hasPlan && capabilities.canStartBatches && batches !== undefined && (
@@ -294,6 +308,19 @@ export function MappingPlanPanel({
                   ))}
                 </select>
               </div>
+            </div>
+            <div className="field mapping-plan-include-unresolved">
+              <label className="field-label" htmlFor="mapping-plan-include-unresolved">
+                <input id="mapping-plan-include-unresolved" type="checkbox" checked={draft.includeUnresolved === true}
+                  disabled={locked}
+                  onChange={(event) => onDraftChange({ ...draft, includeUnresolved: event.target.checked })} />
+                {' '}Retry known-unresolved variants
+              </label>
+              <p className="note" aria-label="Known-unresolved variants">
+                {knownUnresolved === undefined
+                  ? 'Off by default. When on, the next revision queues again the variants earlier runs could not resolve. How many is known once the plan has been prepared.'
+                  : `Off by default. When on, the next revision queues again the ${knownUnresolved.count} known-unresolved variant${knownUnresolved.count === 1 ? '' : 's'} the preparation of revision ${knownUnresolved.revision} left out.`}
+              </p>
             </div>
             {dirty && problem && <p className="muted">{PROBLEM_COPY[problem]}</p>}
             <div className="button-row">

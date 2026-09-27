@@ -204,6 +204,10 @@ class MemoryRepository:
         # the mirror of `acquire_catalog_variant_reservations_guarded` and
         # released by the settlement (`_apply_catalog_variant_coverage`).
         self.catalog_variant_reservations: dict[tuple[str, str], dict[str, Any]] = {}
+        # E' (`20260928000100_catalog_work_scope_preparation_requests.sql`): ONE
+        # web preparation request per (plan, revision), claimed and moved on
+        # only by the mirrors of its two RPCs.
+        self.work_scope_preparation_requests: dict[tuple[str, int], dict[str, Any]] = {}
 
     # -- seeding -------------------------------------------------------------
     def seed_user(self, user_id: str) -> None:
@@ -3862,6 +3866,151 @@ class MemoryRepository:
                     for row in sorted((row for row in self.work_scope_unit_coverages
                                        if row["preparation_id"] == str(preparation_id)),
                                       key=lambda row: row["unit_key"].encode())]
+
+    # -- web preparation requests (20260928000100) -------------------------------
+
+    _TERMINAL_RUN_STATES = frozenset({"completed", "partial_success", "failed", "cancelled",
+                                      "timed_out", "budget_exhausted"})
+    _EXECUTION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9/._-]*$")
+
+    @staticmethod
+    def _age_seconds(stamp: Any) -> int:
+        return max(0, int((datetime.now(UTC) - datetime.fromisoformat(str(stamp))).total_seconds()))
+
+    def request_work_scope_preparation(self, work_scope_id: UUID, revision: int, digest: str,
+                                       requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]:
+        """Mirrors `request_work_scope_preparation`: the claim, under one lock."""
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1 \
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) \
+                or not isinstance(grace_seconds, int) or not 300 <= grace_seconds <= 86400:
+            raise AppError("WORK_SCOPE_PREPARATION_REQUEST_INVALID", "invalid preparation request", 422)
+        with self.lock:
+            plan = self.work_scopes.get(str(work_scope_id))
+            if plan is None:
+                raise NotFoundError("work_scope", str(work_scope_id))
+            if plan.get("closed_at") is not None or plan["head_revision"] != revision \
+                    or plan["head_digest"] != digest:
+                return {"decision": "stale", "request": None}
+            if any(row["work_scope_id"] == plan["id"] and row["revision"] == revision
+                   for row in self.work_scope_preparations.values()):
+                return {"decision": "prepared", "request": None}
+            requests = self.work_scope_preparation_requests
+            request = requests.get((plan["id"], revision))
+            if request is None:
+                request = {"id": str(uuid4()), "work_scope_id": plan["id"], "revision": revision,
+                           "scope_digest": digest, "attempt": 1, "requested_by": str(requested_by),
+                           "run_id": None, "trigger_state": "claimed", "execution_name": None,
+                           "claimed_at": _now(), "triggered_at": None, "created_at": _now(),
+                           "updated_at": _now()}
+                requests[(plan["id"], revision)] = request
+                return {"decision": "claimed", "request": dict(request)}
+            run = self.runs.get(str(request["run_id"])) if request["run_id"] else None
+            if request["trigger_state"] == "trigger_failed":
+                retry = True
+            elif request["trigger_state"] == "claimed":
+                retry = self._age_seconds(request["claimed_at"]) > grace_seconds
+            elif run is None:
+                retry = False
+            elif run["status"] in self._TERMINAL_RUN_STATES:
+                retry = True
+            else:
+                retry = (run["status"] == "queued" and not run.get("worker_id")
+                         and self._age_seconds(request["triggered_at"] or request["claimed_at"])
+                         > grace_seconds)
+            if not retry:
+                return {"decision": "existing", "request": dict(request)}
+            keep = (run is not None and run["status"] == "queued" and not run.get("worker_id")
+                    and run.get("launch_state") == "none")
+            request.update(attempt=request["attempt"] + 1, requested_by=str(requested_by),
+                           run_id=request["run_id"] if keep else None, trigger_state="claimed",
+                           execution_name=None, claimed_at=_now(), triggered_at=None,
+                           updated_at=_now())
+            return {"decision": "claimed", "request": dict(request)}
+
+    def record_work_scope_preparation_trigger(self, request_id: Any, attempt: int, *, run_id: Any,
+                                              trigger_state: str,
+                                              execution_name: str | None) -> dict[str, Any]:
+        """Mirrors `record_work_scope_preparation_trigger`: the claimer's CAS."""
+        if trigger_state not in ("claimed", "triggered", "trigger_failed", "trigger_unknown") \
+                or (trigger_state != "trigger_failed" and run_id is None) \
+                or (execution_name is not None
+                    and (not 1 <= len(execution_name) <= 300
+                         or not self._EXECUTION_NAME.fullmatch(execution_name))):
+            raise AppError("WORK_SCOPE_PREPARATION_REQUEST_INVALID", "invalid preparation request", 422)
+        with self.lock:
+            requests = self.work_scope_preparation_requests
+            request = next((row for row in requests.values() if row["id"] == str(request_id)), None)
+            if request is None or request["attempt"] != attempt \
+                    or request["trigger_state"] != "claimed":
+                raise AppError("WORK_SCOPE_PREPARATION_REQUEST_STALE",
+                               "the preparation attempt moved on", 409)
+            if run_id is not None:
+                plan = self.work_scopes[request["work_scope_id"]]
+                run = self.runs.get(str(run_id))
+                if run is None or run["conversation_id"] != plan["conversation_id"] \
+                        or (run.get("run_identity") or {}).get("workflow_key") != "operator_capture" \
+                        or (request["run_id"] is not None and request["run_id"] != str(run_id)):
+                    raise AppError("WORK_SCOPE_PREPARATION_REQUEST_INVALID",
+                                   "invalid preparation request", 422)
+                request["run_id"] = str(run_id)
+            request["trigger_state"] = trigger_state
+            if trigger_state != "claimed":
+                request["execution_name"] = execution_name
+            if trigger_state in ("triggered", "trigger_unknown"):
+                request["triggered_at"] = _now()
+            request["updated_at"] = _now()
+            return dict(request)
+
+    def work_scope_preparation_state(self, work_scope_id: UUID, revision: int,
+                                     digest: str) -> dict[str, Any] | None:
+        """Mirrors `work_scope_preparation_state`: bounded durable facts."""
+        with self.lock:
+            plan = self.work_scopes.get(str(work_scope_id))
+            if plan is None:
+                return None
+            preparations = [row for row in self.work_scope_preparations.values()
+                            if row["work_scope_id"] == plan["id"]]
+            preparation = next((row for row in preparations if row["revision"] == revision
+                                and row["scope_digest"] == digest), None)
+            request = self.work_scope_preparation_requests.get((plan["id"], revision))
+            if request is not None and request["scope_digest"] != digest:
+                request = None
+            run = self.runs.get(str(request["run_id"])) if request and request["run_id"] else None
+            latest = max(preparations, key=lambda row: row["revision"], default=None)
+            unresolved = None
+            if latest is not None:
+                unresolved = sum(row["excluded_known_unresolved"]
+                                 for row in self.work_scope_unit_coverages
+                                 if row["preparation_id"] == latest["id"])
+            lease_expired = None
+            if run is not None and run.get("lease_expires_at") \
+                    and str(run["lease_expires_at"]) <= _now():
+                lease_expired = self._age_seconds(run["lease_expires_at"])
+            error = run.get("error") if run is not None else None
+            code = error.get("code") if isinstance(error, Mapping) else None
+            return {
+                "work_scope_id": plan["id"], "head_revision": plan["head_revision"],
+                "head_digest": plan["head_digest"], "closed": plan.get("closed_at") is not None,
+                "revision": revision, "digest": digest,
+                "preparation": None if preparation is None else {
+                    key: preparation[key] for key in ("id", "revision", "unit_count",
+                                                      "prepared_unit_count", "queued_item_count",
+                                                      "batch_count", "created_at")},
+                "request": None if request is None else {
+                    "id": request["id"], "attempt": request["attempt"],
+                    "trigger_state": request["trigger_state"], "run_id": request["run_id"],
+                    "claimed_seconds": self._age_seconds(request["claimed_at"]),
+                    "triggered_seconds": (None if request["triggered_at"] is None
+                                          else self._age_seconds(request["triggered_at"]))},
+                "run": None if run is None else {
+                    "status": run["status"], "launch_state": run.get("launch_state"),
+                    "claimed": bool(run.get("worker_id")),
+                    "lease_expired_seconds": lease_expired,
+                    "error_code": code if isinstance(code, str)
+                    and re.fullmatch(r"[A-Z][A-Z0-9_]{2,79}", code) else None},
+                "known_unresolved": None if latest is None else {
+                    "revision": latest["revision"], "count": unresolved},
+            }
 
     def catalog_canonical_manufacturer_coverage(self, manufacturers: list[str]) -> list[dict[str, Any]]:
         """Mirrors `catalog_canonical_manufacturer_coverage`: an exact count per

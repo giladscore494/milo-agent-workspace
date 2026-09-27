@@ -80,6 +80,14 @@ def production_result(recording: dict[str, Any]) -> dict[str, Any]:
     real trusted Government evidence mapper; every mapped fact is verified (as
     the register's own statement is); the real FinalBuilder assembles it.
     """
+    inputs = production_inputs(recording)
+    return FinalBuilder().build(inputs["evidence"], inputs["verdicts"],
+                                coverage_gaps=inputs["gaps"],
+                                candidate_outcomes=inputs["outcomes"])
+
+
+def production_inputs(recording: dict[str, Any]) -> dict[str, Any]:
+    """The inputs FinalBuilder has at the end of the recorded run."""
     mapper = GovernmentVariantEvidenceMapper()
     outcomes: list[dict[str, Any]] = []
     evidence: list[EvidenceReference] = []
@@ -109,8 +117,7 @@ def production_result(recording: dict[str, Any]) -> dict[str, Any]:
                 for item in evidence]
     gaps = [{"task_id": item["task_id"], "code": "CANDIDATE_UNRESOLVED_AMBIGUOUS"}
             for item in outcomes if item["outcome"] == UNRESOLVED_AMBIGUOUS]
-    return FinalBuilder().build(evidence, verdicts, coverage_gaps=gaps,
-                                candidate_outcomes=outcomes)
+    return {"evidence": evidence, "verdicts": verdicts, "gaps": gaps, "outcomes": outcomes}
 
 
 def extra_rows(count: int, *, start: int = 50_000, year: int = 2020) -> list[dict[str, Any]]:

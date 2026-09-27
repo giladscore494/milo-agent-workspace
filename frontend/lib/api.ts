@@ -261,6 +261,24 @@ export const api = {
 
   resumeWorkScope: (workScopeId: string) =>
     request<unknown>(`/work-scopes/${workScopeId}/resume`, { method: 'POST' }),
+
+  /**
+   * E': one plan revision's preparation. The GET is the server's status,
+   * derived from durable state only; the POST asks the server to prepare
+   * exactly the head it names (revision AND digest). The server answers a
+   * second request with the preparation already in flight -- it never starts
+   * a second capture -- and it starts no batch and no run.
+   */
+  workScopePreparation: (workScopeId: string, head: { revision: number; digest: string }) =>
+    request<unknown>(
+      `/work-scopes/${workScopeId}/preparation?revision=${encodeURIComponent(String(head.revision))}`
+      + `&digest=${encodeURIComponent(head.digest)}`),
+
+  prepareWorkScope: (workScopeId: string, head: { revision: number; digest: string }) =>
+    request<unknown>(`/work-scopes/${workScopeId}/preparations`, {
+      method: 'POST',
+      body: JSON.stringify({ expected_revision: head.revision, expected_digest: head.digest }),
+    }),
 };
 
 /** A Mapping Plan write states the person's words OR a complete edit. */

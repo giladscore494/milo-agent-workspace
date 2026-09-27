@@ -210,22 +210,18 @@ bash scripts/release/check-migration-state.sh --database-url-env MILO_READONLY_D
 bash scripts/deploy/work-scope-readiness.sh --schema-only
 ```
 
-**Expected evidence** (Production after the 2026-09-24 Stage B apply, with
-this release checked out):
+**Expected evidence** (Production at 44/44 after the PR-Z apply, with this
+release -- E' -- checked out):
 
-- `remote schema classified as partially-migrated (41/44 …)`
-- `3 local migration(s) not present in remote migration history:` naming
-  `20260924000200 …catalog_ingestion_recovery.sql`,
-  `20260925000100 …reasoning_aware_usage.sql` and
-  `20260927000100 …catalog_variant_coverage.sql`
-- `WORK_SCOPE_SCHEMA=NO (missing tables: catalog_snapshot_adoptions; missing RPCs:
-  record_catalog_raw_records_batch_guarded record_catalog_candidates_batch_guarded
-  adopt_catalog_snapshot_guarded …)`
+- `remote schema classified as partially-migrated (44/45 …)`
+- `1 local migration(s) not present in remote migration history:` naming
+  `20260928000100 …catalog_work_scope_preparation_requests.sql`
+- `WORK_SCOPE_SCHEMA=NO (missing tables: catalog_work_scope_preparation_requests;
+  missing RPCs: request_work_scope_preparation record_work_scope_preparation_trigger
+  work_scope_preparation_state)`
 
-(A database that never had Stage B applied shows `38/42` and four pending:
-the three scoped-catalog migrations `20260922000100`, `20260923000100`,
-`20260924000100`, then `20260924000200`. Stage B applies whatever is pending,
-in order.)
+(Older databases show more pending versions; Stage B applies whatever is
+pending, in order.)
 
 **Stop if** any other version is missing or unexpected, the history is not an
 exact prefix (`drift`), or a marker disagrees. Those are drift. Do not apply
@@ -747,6 +743,58 @@ proceed): the heartbeat history of the failed run --
 **Rollback.** Preparation writes only append-only rows and executes nothing.
 To stop, do not continue to Stage E. A wrong plan is fixed by revising it in
 the website (the new head is unprepared) and preparing that revision.
+
+---
+
+### D.5 Prepare from the website instead of Cloud Shell (E')
+
+The Prepare button in the Mapping Plan executes **the same capture job with the
+same arguments and the same one override** as D.4's
+`production-activate.sh --prepare-work-scope` (both are built by
+`backend/capture_invocation.py`). It never starts a batch, never creates a
+product run, never calls a model and never enables paid execution or
+promotion.
+
+One-time enablement, after the release is deployed (Stage C) and the capture
+job is ensured on the release image
+(`government-production-capture.sh --ensure-job --enable-catalog-execution`,
+which also grants the API identity `roles/run.jobsExecutorWithOverrides` on
+**that job only**, idempotently):
+
+```bash
+bash scripts/deploy/website-execution-activate.sh --apply-web-preparation
+```
+
+It stops unless `production-verify.sh --gate deployed` passes and the capture
+job runs the image the worker runs; then it re-applies the job binding, sets
+`MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS=true` and
+`CLOUD_RUN_CAPTURE_JOB=<CLOUD_RUN_CAPTURE_JOB>` on the API, and reads back that
+paid execution and scoped preparation are still off on the API. The website
+also needs the execution routes open (`GATEWAY_ALLOW_EXECUTION_ROUTES`, as at
+Stage P); run starts stay closed.
+
+What the website shows, per revision, is derived from durable database state
+only (`catalog_work_scope_preparation_requests`, the capture run's durable
+status, `catalog_work_scope_preparations`), never from an exit code or a log:
+
+| State | Meaning |
+|---|---|
+| Preparing | the one request for this revision was triggered and has not ended |
+| Prepared | the revision's preparation row exists (per-unit enriched / ambiguous / pending / queued shown) |
+| Failed | a static reason code: `PREPARATION_TRIGGER_FAILED`, `PREPARATION_NOT_STARTED` (no capture claimed the run within 15 minutes), `PREPARATION_INCOMPLETE`, `PREPARATION_CANCELLED`, `PREPARATION_INTERRUPTED` (needs an operator), or the capture's own code |
+| Stale | the plan's head or digest moved since this revision |
+
+A second click, a second member or two concurrent requests are answered with
+the preparation in flight: the database claims ONE request per revision under
+the plan's row lock. The API refuses (`WORK_SCOPE_PREPARATION_JOB_NOT_RELEASE`)
+if the capture job does not run the deployed release image.
+
+The prepared gate is unchanged: `production-verify.sh --gate prepared
+$WS_ARGS` (or the `gates` workflow) still decides readiness for Stage E.
+
+**Rollback:** `gcloud run services update milo-agent-api --region us-central1
+--update-env-vars MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS=false` (the kill
+switch closes it too, with every other Stage A flag).
 
 ---
 

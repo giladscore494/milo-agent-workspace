@@ -769,6 +769,9 @@ class WorkScopePlan(BaseModel):
     model_year_to: int | None = None
     max_items: int
     batch_size: int
+    # PR-Z / E'-5: queue again what the ledger records as unresolved. Stored
+    # only when true (so every earlier digest is unchanged); always stated here.
+    include_unresolved: bool = False
 
 
 class WorkScopeRevisionView(BaseModel):
@@ -832,6 +835,71 @@ class WorkScopeBatchStart(BaseModel):
     expected_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     batch_id: UUID
     idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+class WorkScopePreparationRequest(BaseModel):
+    """E': prepare exactly this revision. Both must still be the plan's head."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1, strict=True)
+    expected_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class WorkScopePreparationFigures(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    unit_count: int
+    prepared_unit_count: int
+    queued_item_count: int
+    batch_count: int
+    prepared_at: str | None = None
+
+
+class WorkScopePreparationUnitCoverage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enriched: int
+    ambiguous: int
+    pending: int
+    queued: int
+
+
+class WorkScopePreparationUnit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    unit_key: str
+    name: str
+    state: str
+    queued_count: int
+    coverage: WorkScopePreparationUnitCoverage | None = None
+
+
+class WorkScopeKnownUnresolved(BaseModel):
+    """What the latest preparation of the plan left out as known-unresolved."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    revision: int
+    count: int
+
+
+class WorkScopePreparationStatus(BaseModel):
+    """One revision's preparation, derived from durable state only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    work_scope_id: str
+    revision: int
+    digest: str
+    state: str
+    reason_code: str | None = None
+    attempt: int
+    can_prepare: bool
+    blocked_by: str | None = None
+    preparation: WorkScopePreparationFigures | None = None
+    units: list[WorkScopePreparationUnit] = Field(default_factory=list)
+    known_unresolved: WorkScopeKnownUnresolved | None = None
 
 
 class WorkScopeBatchRunCreated(RunCreated):

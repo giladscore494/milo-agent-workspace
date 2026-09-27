@@ -130,7 +130,8 @@ def test_the_readiness_rpc_inventory_is_the_migrations_and_the_repositorys():
                                         "20260923000100_catalog_work_scope_preparation.sql",
                                         "20260924000100_catalog_work_scope_batch_runs.sql",
                                         "20260924000200_catalog_ingestion_recovery.sql",
-                                        "20260927000100_catalog_variant_coverage.sql"))
+                                        "20260927000100_catalog_variant_coverage.sql",
+                                        "20260928000100_catalog_work_scope_preparation_requests.sql"))
     repository = (REPO / "backend" / "repository" / "supabase.py").read_text(encoding="utf-8")
     for rpc in rpcs:
         assert f"create or replace function public.{rpc}(" in migrations, rpc
@@ -331,6 +332,8 @@ if kind and args[2] == "describe":
                 for k, v in state["secrets"][kind].items()]
         doc = {"spec": {"template": {"spec": {"containers": [{"env": env}]}}}}
         print(json.dumps(doc)); sys.exit(0)
+    if any(arg.startswith("--format=value(") and "image" in arg for arg in args):
+        print(state.get("images", {}).get(args[3], "")); sys.exit(0)
     sys.exit(0)
 sys.exit(0)
 '''
@@ -526,6 +529,42 @@ def test_stage_p_opens_plan_writes_and_proves_run_creation_is_still_off(tmp_path
     assert "vercel env add GATEWAY_ALLOW_EXECUTION_ROUTES production" in ok.stdout
     assert "vercel env rm GATEWAY_ALLOW_RUN_START_ROUTES production --yes" in ok.stdout
     assert "vercel env add GATEWAY_ALLOW_RUN_START_ROUTES" not in ok.stdout
+
+
+def test_web_preparation_needs_the_release_image_and_opens_only_the_prepare_route(tmp_path):
+    """E': --apply-web-preparation binds the API identity to run THE capture
+    job with overrides, and opens the Prepare route on the API -- nothing else."""
+    tree, env = _stage2_tree(tmp_path)
+    state = tmp_path / "state.json"
+    release = "test-region-docker.pkg.dev/test-project/test-repo/worker:" + "a" * 40
+    closed = {"MILO_ENABLE_PAID_EXECUTION": "false", "MILO_ENABLE_WORK_SCOPE_PREPARATION": "false"}
+    # The capture job on another image: refused, nothing changed.
+    state.write_text(json.dumps({"service": dict(closed), "job": {},
+                                 "images": {"test-worker": release,
+                                            "test-capture": release.replace("a" * 40, "b" * 40)}}))
+    refused = tree.run("website-execution-activate.sh", "--apply-web-preparation", env=env)
+    assert refused.returncode == 1 and "Nothing was changed" in refused.stderr
+    assert not [c for c in tree.calls() if " update " in c or "add-iam-policy-binding" in c]
+    # On the release image: the binding on the capture job only, then the API.
+    state.write_text(json.dumps({"service": dict(closed), "job": {},
+                                 "images": {"test-worker": release, "test-capture": release}}))
+    applied = tree.run("website-execution-activate.sh", "--apply-web-preparation", env=env)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert "--gate deployed" in next(c for c in tree.calls() if c.startswith("production-verify.sh"))
+    (binding,) = [c for c in tree.calls() if "add-iam-policy-binding" in c]
+    assert binding.startswith("gcloud run jobs add-iam-policy-binding test-capture ")
+    assert "--member serviceAccount:api@test.iam.gserviceaccount.com" in binding
+    assert "--role roles/run.jobsExecutorWithOverrides" in binding
+    updates = [c for c in tree.calls() if " update " in c]
+    assert len(updates) == 1 and updates[0].startswith("gcloud run services update test-api")
+    after = json.loads(state.read_text())
+    assert after["service"]["MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS"] == "true"
+    assert after["service"]["CLOUD_RUN_CAPTURE_JOB"] == "test-capture"
+    # Nothing else moved: preparation and paid execution stay off on the API,
+    # and the worker was never touched.
+    assert after["service"]["MILO_ENABLE_PAID_EXECUTION"] == "false"
+    assert after["service"]["MILO_ENABLE_WORK_SCOPE_PREPARATION"] == "false"
+    assert after["job"] == {}
 
 
 # =============================================================================

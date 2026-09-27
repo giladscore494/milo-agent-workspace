@@ -360,6 +360,24 @@ GATE_CHAIN: tuple[Gate, ...] = (
         stage=2,
     ),
     Gate(
+        name="MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS",
+        surface=API_RUNTIME,
+        current_default="false",
+        required_for_first_run=(
+            "NO — it lets a project member PREPARE one Mapping Plan revision from "
+            "the website instead of Cloud Shell (the API executes the existing "
+            "capture job once for that revision)"),
+        when_to_enable=(
+            "After the release is deployed and the capture job is ensured on the "
+            "release image (website-execution-activate.sh --apply-web-preparation)"),
+        requires_redeploy=UPDATE_SERVICE,
+        failure_behavior_when_off=(
+            "POST /work-scopes/{id}/preparations is rejected by the surface guard "
+            "and the Prepare button is not offered (can_prepare false). The status "
+            "read keeps answering; the operator path in Cloud Shell is untouched."),
+        stage=2,
+    ),
+    Gate(
         name="MILO_ENABLE_RUN_CANCELLATION",
         surface=API_RUNTIME,
         current_default="false",

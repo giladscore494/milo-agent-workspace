@@ -88,6 +88,74 @@ class Repository(Protocol):
     def list_structured_facts_for_sources(self, run_id: UUID, source_ids: Iterable[Any], *, limit: int = 200) -> list[dict[str, Any]]: ...
     def record_claim_verdict(self, run_id: UUID, verdict: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def claim_current_verdict_states(self, run_id: UUID, claim_ids: Iterable[Any] | None = None, *, limit: int = 200) -> list[dict[str, Any]]: ...
+    # -- web preparation requests (E') -----------------------------------------
+    #
+    # `20260928000100_catalog_work_scope_preparation_requests.sql`. The claim
+    # that lets exactly one Prepare request trigger the capture job for a
+    # revision, the claimer's compare-and-set of what it did, and the durable
+    # facts the website's status is derived from.
+    _PREPARATION_REQUEST_REFUSALS = (
+        ("WORK_SCOPE_PREPARATION_REQUEST_STALE", "the preparation attempt moved on", 409),
+        ("WORK_SCOPE_PREPARATION_REQUEST_INVALID", "invalid preparation request", 422),
+    )
+
+    def _preparation_request_call(self, call: Any, identifier: str) -> Any:
+        """Run one preparation-request RPC and map what it refuses.
+
+        `call` is the RPC itself, spelled out at the method below with its
+        literal name, so the release inventory sees each one."""
+        try:
+            data = call().execute().data
+        except Exception as exc:
+            message = str(exc)
+            if "WORK_SCOPE_NOT_FOUND" in message:
+                raise NotFoundError("work_scope", identifier) from None
+            for code, safe, status in self._PREPARATION_REQUEST_REFUSALS:
+                if code in message:
+                    raise AppError(code, safe, status) from None
+            raise AppError("REPOSITORY_ERROR", "mapping plan preparation request failed", 502) from None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data
+
+    def request_work_scope_preparation(self, work_scope_id: UUID, revision: int, digest: str, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]:
+        """Claim (or be answered with) the ONE preparation request of a revision."""
+        data = self._preparation_request_call(
+            lambda: self.client.rpc("request_work_scope_preparation", {
+                "p_work_scope_id": str(work_scope_id), "p_revision": int(revision),
+                "p_digest": str(digest), "p_requested_by": str(requested_by),
+                "p_grace_seconds": int(grace_seconds)}),
+            str(work_scope_id))
+        if not isinstance(data, dict) or data.get("decision") not in (
+                "stale", "prepared", "existing", "claimed"):
+            raise AppError("REPOSITORY_ERROR", "preparation request returned an unreadable row", 502)
+        return data
+
+    def record_work_scope_preparation_trigger(self, request_id: Any, attempt: int, *, run_id: Any, trigger_state: str, execution_name: str | None) -> dict[str, Any]:
+        """The claimer's compare-and-set for ITS attempt."""
+        data = self._preparation_request_call(
+            lambda: self.client.rpc("record_work_scope_preparation_trigger", {
+                "p_request_id": str(request_id), "p_attempt": int(attempt),
+                "p_run_id": None if run_id is None else str(run_id),
+                "p_trigger_state": str(trigger_state), "p_execution_name": execution_name}),
+            str(request_id))
+        if not isinstance(data, dict) or not data.get("id"):
+            raise AppError("REPOSITORY_ERROR", "preparation trigger record returned no row", 502)
+        return data
+
+    def work_scope_preparation_state(self, work_scope_id: UUID, revision: int, digest: str) -> dict[str, Any] | None:
+        """The durable facts of one revision's preparation; None for no plan."""
+        data = self._preparation_request_call(
+            lambda: self.client.rpc("work_scope_preparation_state", {
+                "p_work_scope_id": str(work_scope_id), "p_revision": int(revision),
+                "p_digest": str(digest)}),
+            str(work_scope_id))
+        if data is None:
+            return None
+        if not isinstance(data, dict) or not data.get("work_scope_id"):
+            raise AppError("REPOSITORY_ERROR", "preparation state returned an unreadable row", 502)
+        return data
+
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def patch_run_blackboard_evidence(self, run_id: UUID, summary: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def record_run_invocation(self, run_id: UUID, invocation: dict[str, Any]) -> dict[str, Any]: ...
@@ -170,6 +238,10 @@ class Repository(Protocol):
     def rebuild_catalog_variant_coverage(self, run_id: UUID, level: str, entries: list[dict[str, Any]]) -> dict[str, Any]: ...
     def catalog_variant_coverage_runs(self, *, after_finished_at: Any = None, after_run_id: Any = None, limit: int = 50) -> list[dict[str, Any]]: ...
     def work_scope_unit_coverage(self, preparation_id: Any) -> list[dict[str, Any]]: ...
+    # Web preparation requests (20260928000100_catalog_work_scope_preparation_requests.sql).
+    def request_work_scope_preparation(self, work_scope_id: UUID, revision: int, digest: str, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]: ...
+    def record_work_scope_preparation_trigger(self, request_id: Any, attempt: int, *, run_id: Any, trigger_state: str, execution_name: str | None) -> dict[str, Any]: ...
+    def work_scope_preparation_state(self, work_scope_id: UUID, revision: int, digest: str) -> dict[str, Any] | None: ...
     def acquire_catalog_variant_reservations(self, run_id: UUID, level: str, candidate_ids: list[str], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def catalog_variant_reservations_settling(self, *, limit: int = 50) -> list[dict[str, Any]]: ...
 
@@ -2255,6 +2327,74 @@ class SupabaseRepository:
     def work_scope_unit_coverage(self, preparation_id: Any) -> list[dict[str, Any]]:
         """One preparation's per-unit ledger counts (never its register ids)."""
         return self._read_rpc("work_scope_unit_coverage", {"p_preparation_id": str(preparation_id)})
+
+    # -- web preparation requests (E') -----------------------------------------
+    #
+    # `20260928000100_catalog_work_scope_preparation_requests.sql`. The claim
+    # that lets exactly one Prepare request trigger the capture job for a
+    # revision, the claimer's compare-and-set of what it did, and the durable
+    # facts the website's status is derived from.
+    _PREPARATION_REQUEST_REFUSALS = (
+        ("WORK_SCOPE_PREPARATION_REQUEST_STALE", "the preparation attempt moved on", 409),
+        ("WORK_SCOPE_PREPARATION_REQUEST_INVALID", "invalid preparation request", 422),
+    )
+
+    def _preparation_request_call(self, call: Any, identifier: str) -> Any:
+        """Run one preparation-request RPC and map what it refuses.
+
+        `call` is the RPC itself, spelled out at the method below with its
+        literal name, so the release inventory sees each one."""
+        try:
+            data = call().execute().data
+        except Exception as exc:
+            message = str(exc)
+            if "WORK_SCOPE_NOT_FOUND" in message:
+                raise NotFoundError("work_scope", identifier) from None
+            for code, safe, status in self._PREPARATION_REQUEST_REFUSALS:
+                if code in message:
+                    raise AppError(code, safe, status) from None
+            raise AppError("REPOSITORY_ERROR", "mapping plan preparation request failed", 502) from None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data
+
+    def request_work_scope_preparation(self, work_scope_id: UUID, revision: int, digest: str, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]:
+        """Claim (or be answered with) the ONE preparation request of a revision."""
+        data = self._preparation_request_call(
+            lambda: self.client.rpc("request_work_scope_preparation", {
+                "p_work_scope_id": str(work_scope_id), "p_revision": int(revision),
+                "p_digest": str(digest), "p_requested_by": str(requested_by),
+                "p_grace_seconds": int(grace_seconds)}),
+            str(work_scope_id))
+        if not isinstance(data, dict) or data.get("decision") not in (
+                "stale", "prepared", "existing", "claimed"):
+            raise AppError("REPOSITORY_ERROR", "preparation request returned an unreadable row", 502)
+        return data
+
+    def record_work_scope_preparation_trigger(self, request_id: Any, attempt: int, *, run_id: Any, trigger_state: str, execution_name: str | None) -> dict[str, Any]:
+        """The claimer's compare-and-set for ITS attempt."""
+        data = self._preparation_request_call(
+            lambda: self.client.rpc("record_work_scope_preparation_trigger", {
+                "p_request_id": str(request_id), "p_attempt": int(attempt),
+                "p_run_id": None if run_id is None else str(run_id),
+                "p_trigger_state": str(trigger_state), "p_execution_name": execution_name}),
+            str(request_id))
+        if not isinstance(data, dict) or not data.get("id"):
+            raise AppError("REPOSITORY_ERROR", "preparation trigger record returned no row", 502)
+        return data
+
+    def work_scope_preparation_state(self, work_scope_id: UUID, revision: int, digest: str) -> dict[str, Any] | None:
+        """The durable facts of one revision's preparation; None for no plan."""
+        data = self._preparation_request_call(
+            lambda: self.client.rpc("work_scope_preparation_state", {
+                "p_work_scope_id": str(work_scope_id), "p_revision": int(revision),
+                "p_digest": str(digest)}),
+            str(work_scope_id))
+        if data is None:
+            return None
+        if not isinstance(data, dict) or not data.get("work_scope_id"):
+            raise AppError("REPOSITORY_ERROR", "preparation state returned an unreadable row", 502)
+        return data
 
     def record_conflict_resolution(self, run_id: UUID, resolution: dict[str, Any], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         params = {**self._lease_params(run_id, worker_id, attempt, lease_token), "p_resolution": resolution}

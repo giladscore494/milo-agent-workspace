@@ -13,6 +13,13 @@
 #                           a run executes under. It ENABLES nothing: it is the
 #                           bounds paid execution will run inside, and
 #                           production-preflight.sh requires them.
+#   --apply-web-preparation E'. The website's Prepare button: the API may
+#                           execute the EXISTING capture job once per plan
+#                           revision (MILO_WEB_PREPARATION_API_ENABLE_FLAGS
+#                           and CLOUD_RUN_CAPTURE_JOB on the API, and the API
+#                           identity's run-with-overrides binding on THAT job
+#                           only). Starts nothing, creates no product run and
+#                           enables no paid execution or promotion.
 #   --apply-backend         Stage 2. Everything a website-initiated batch run
 #                           needs on the API and the worker -- and ONLY where
 #                           it is needed (deployment-contract.sh names each
@@ -74,7 +81,7 @@ WS_ARGS=()
 
 usage() {
   cat << 'EOF'
-Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-backend] [options]
+Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-web-preparation|--apply-backend] [options]
 
 Default --plan changes nothing and prints both stages.
 
@@ -84,6 +91,10 @@ Modes:
                           its caps (API). Enables nothing; no gate.
   --apply-plan-authoring  Stage P: MILO_ENABLE_WORK_SCOPE_MUTATIONS on the API
                           only. Gate: production-verify.sh --gate deployed.
+  --apply-web-preparation E': the website's Prepare button (API only), and the
+                          API identity's run-with-overrides binding on the
+                          capture job only. Gate: production-verify.sh --gate
+                          deployed, and the capture job on the release image.
   --apply-backend         Stage 2: the API + worker flags for batch runs. Gate:
                           production-verify.sh --gate prepared for the named
                           plan revision. The Vercel half is printed, never
@@ -108,6 +119,7 @@ while [[ $# -gt 0 ]]; do
     --plan) MODE="plan"; shift ;;
     --apply-runtime-policy) MODE="apply-runtime-policy"; shift ;;
     --apply-plan-authoring) MODE="apply-plan-authoring"; shift ;;
+    --apply-web-preparation) MODE="apply-web-preparation"; shift ;;
     --apply-backend) MODE="apply-backend"; shift ;;
     --work-scope-id | --work-scope-revision | --work-scope-digest) WS_ARGS+=("$1" "${2:?}"); shift 2 ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?}"; shift 2 ;;
@@ -202,6 +214,12 @@ fi
 # Stage P: the Mapping Plan writes on the API, nothing else.
 PLAN_API_VARS="$(pairs "$ENABLED" "${MILO_PLAN_AUTHORING_API_ENABLE_FLAGS[@]}")"
 
+# E': the website's Prepare route on the API, and the capture job it executes.
+CAPTURE_JOB="$(milo_op CLOUD_RUN_CAPTURE_JOB)"
+API_SA="$(milo_op API_SERVICE_ACCOUNT)"
+WEB_PREP_API_VARS="$(pairs "$ENABLED" "${MILO_WEB_PREPARATION_API_ENABLE_FLAGS[@]}")"
+WEB_PREP_API_VARS+="${MILO_ENV_VAR_DELIMITER}CLOUD_RUN_CAPTURE_JOB=${CAPTURE_JOB}"
+
 # Stage 2.
 S2_API_VARS="$(pairs "$ENABLED" "${MILO_STAGE2_API_ENABLE_FLAGS[@]}")"
 S2_API_VARS+="${MILO_ENV_VAR_DELIMITER}$(pairs "$DISABLED" "${MILO_STAGE2_API_PINNED_OFF_FLAGS[@]}")"
@@ -235,6 +253,21 @@ print_plan_authoring_commands() {
 gcloud run services update ${API_SERVICE} \\
   --region ${REGION} --project ${PROJECT_ID} \\
   --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${PLAN_API_VARS}'
+EOC
+}
+
+print_web_preparation_commands() {
+  cat << EOC
+# --- E', capture job: the API identity may run THIS job with overrides (the
+# scoped arguments and the one preparation switch), and nothing else.
+gcloud run jobs add-iam-policy-binding ${CAPTURE_JOB:-<CLOUD_RUN_CAPTURE_JOB>} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --member serviceAccount:${API_SA:-<API_SERVICE_ACCOUNT>} --role roles/run.jobsExecutorWithOverrides
+# --- E', API only: the Prepare route and the job it executes. Run creation,
+# batches, paid execution and promotion stay exactly as they are.
+gcloud run services update ${API_SERVICE} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${WEB_PREP_API_VARS}'
 EOC
 }
 
@@ -392,6 +425,8 @@ if [[ "$MODE" == "plan" ]]; then
   print_runtime_policy_commands
   printf '\n== Stage P — plan authoring (Cloud Run API only) ==\n'
   print_plan_authoring_commands
+  printf '\n== E'"'"' — preparing from the website (Cloud Run API + capture job IAM) ==\n'
+  print_web_preparation_commands
   printf '\n== Stage 2 — backend (Cloud Run) ==\n'
   print_backend_commands
   printf '\n== Frontend (Vercel) — printed only, never applied from here ==\n'
@@ -453,6 +488,50 @@ if [[ "$MODE" == "apply-plan-authoring" ]]; then
   printf 'Next: apply the Vercel half below so a person can author the plan in the website.\n\n'
   print_frontend_commands
   printf '\nNo run was started and no provider call was made.\n'
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# --apply-web-preparation (E')
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "apply-web-preparation" ]]; then
+  if [[ -z "$CAPTURE_JOB" || -z "$API_SA" ]]; then
+    printf 'FAIL: --apply-web-preparation needs CLOUD_RUN_CAPTURE_JOB and API_SERVICE_ACCOUNT in %s.\n' "$CONFIG_PATH" >&2
+    exit 2
+  fi
+  printf '== Gate: the release is deployed and the database carries the exact migration set ==\n'
+  if ! bash "${SCRIPT_DIR}/production-verify.sh" --operator-config "$CONFIG_PATH" --gate deployed; then
+    printf '\nFAIL: the deployed gate did not pass; nothing was changed.\n' >&2
+    exit 1
+  fi
+  printf '\n== Gate: the capture job runs the deployed release image ==\n'
+  worker_image="$(gcloud run jobs describe "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" \
+    --format='value(spec.template.spec.template.spec.containers[0].image)' 2> /dev/null || true)"
+  capture_image="$(gcloud run jobs describe "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
+    --format='value(spec.template.spec.template.spec.containers[0].image)' 2> /dev/null || true)"
+  printf 'worker job:  %s\ncapture job: %s\n' "${worker_image:-<unreadable>}" "${capture_image:-<missing>}"
+  if [[ -z "$worker_image" || "$capture_image" != "$worker_image" ]]; then
+    printf '\nFAIL: the capture job does not run the release image the worker runs. Ensure it\n' >&2
+    printf '      first (government-production-capture.sh --ensure-job --enable-catalog-execution).\n' >&2
+    printf '      Nothing was changed.\n' >&2
+    exit 1
+  fi
+  printf '\n== Applying E'"'"' (capture job IAM, then the API) ==\n'
+  print_web_preparation_commands
+  gcloud run jobs add-iam-policy-binding "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
+    --member "serviceAccount:${API_SA}" --role roles/run.jobsExecutorWithOverrides > /dev/null
+  gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+    --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${WEB_PREP_API_VARS}"
+  split_pairs "$WEB_PREP_API_VARS"
+  # Paid execution and scoped preparation stay OFF on the API: the API only
+  # EXECUTES the capture job; the job turns preparation on for one execution.
+  if ! readback service "$API_SERVICE" "${SPLIT[@]}" "MILO_ENABLE_PAID_EXECUTION=${DISABLED}" \
+       "${MILO_WORK_SCOPE_PREPARATION_FLAG_NAME}=${DISABLED}"; then
+    printf 'FAIL: the API does not carry the E'"'"' posture (above).\n' >&2
+    exit 1
+  fi
+  printf '\nPreparing from the website is enabled and read back. Nothing was prepared,\n'
+  printf 'no run was started and no provider call was made.\n'
   exit 0
 fi
 
