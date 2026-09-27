@@ -206,7 +206,7 @@ else
       # 1. Applied migration history — the authoritative applied side.
       #    Whether the relation exists is itself a question that can fail,
       #    and a failure to answer it is not an answer of "no history".
-      if ! run_sql_to "select 1 from information_schema.tables where table_schema='supabase_migrations' and table_name='schema_migrations'"; then
+      if ! run_sql_to "select 1 where pg_catalog.to_regclass('supabase_migrations.schema_migrations') is not null"; then
         probe_failed "history-probe" "could not determine whether supabase_migrations.schema_migrations exists; migration state is not classified from an inspection that did not complete"
       elif [[ -s "${SQL_OUT}" ]]; then
         printf 'history_available\t1\n' >> "${observation}"
@@ -226,15 +226,18 @@ else
         printf 'history_available\t0\n' >> "${observation}"
       fi
 
-      # 2. Public schema shape.
-      if ! run_sql_to "select count(*) from information_schema.tables where table_schema='public'"; then
+      # 2. Public schema shape -- from pg_catalog, which lists every relation
+      #    whatever this role may read. information_schema lists only the
+      #    relations the role holds SOME privilege on, so a read-only role
+      #    missing a grant made an applied migration look absent (O-4).
+      if ! run_sql_to "select count(*) from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind in ('r', 'p', 'v', 'f')"; then
         probe_failed "schema-shape" "could not count the relations in the public schema"
       else
         table_count="$(tr -d '[:space:]' < "${SQL_OUT}")"
         printf 'public_table_count\t%s\n' "${table_count:-0}" >> "${observation}"
       fi
       for t in "${LEGACY_BASELINE_TABLES[@]}"; do
-        if ! run_sql_to "select 1 from information_schema.tables where table_schema='public' and table_name='${t}'"; then
+        if ! run_sql_to "select 1 from pg_catalog.pg_class where oid = pg_catalog.to_regclass('public.${t}') and relkind in ('r', 'p')"; then
           probe_failed "baseline-probe" "could not determine whether the legacy baseline table '${t}' exists"
         elif [[ -s "${SQL_OUT}" ]]; then
           printf 'legacy_baseline\t%s\n' "${t}" >> "${observation}"
@@ -246,13 +249,20 @@ else
       #    A probe that FAILED is not an observed absence: recording it as
       #    absent would manufacture drift, and dropping it silently would let
       #    a green classification rest on an inspection that did not finish.
+      #
+      #    Every probe reads pg_catalog (to_regclass, pg_attribute, pg_proc),
+      #    which answers whether an object EXISTS independently of what this
+      #    role may read. A role without SELECT on a table a migration created
+      #    is a PRIVILEGE problem, reported on its own in step 3b -- never a
+      #    missing migration. (Function markers name a function, not a
+      #    signature, so pg_proc stands in for to_regprocedure.)
       while IFS=$'\t' read -r mversion mkind mobj; do
         [[ -n "${mversion}" ]] || continue
         case "${mkind}" in
-          table) q="select 1 from information_schema.tables where table_schema='public' and table_name='${mobj}'" ;;
-          view) q="select 1 from information_schema.views where table_schema='public' and table_name='${mobj}'" ;;
-          column) q="select 1 from information_schema.columns where table_schema='public' and table_name='${mobj%%.*}' and column_name='${mobj##*.}'" ;;
-          function) q="select 1 from pg_proc p join pg_namespace n on n.oid=p.pronamespace where n.nspname='public' and p.proname='${mobj}'" ;;
+          table) q="select 1 from pg_catalog.pg_class where oid = pg_catalog.to_regclass('public.${mobj}') and relkind in ('r', 'p')" ;;
+          view) q="select 1 from pg_catalog.pg_class where oid = pg_catalog.to_regclass('public.${mobj}') and relkind in ('v', 'm')" ;;
+          column) q="select 1 from pg_catalog.pg_attribute where attrelid = pg_catalog.to_regclass('public.${mobj%%.*}') and attname = '${mobj##*.}' and attnum > 0 and not attisdropped" ;;
+          function) q="select 1 from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' and p.proname = '${mobj}'" ;;
           *) continue ;;
         esac
         if ! run_sql_to "${q}"; then
@@ -264,9 +274,27 @@ else
         fi
       done < <(python3 "${STATE_HELPER}" markers --migrations-dir "${MIGRATIONS_DIR}")
 
+      # 3b. Privileges. A read-only role that cannot SELECT a public table or
+      #     view cannot verify what that relation holds -- a BLOCKED finding of
+      #     its own (READONLY_ROLE_LACKS_SELECT), which is never folded into
+      #     the migration classification: the migration IS applied.
+      if ! run_sql_to "select c.relname from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind in ('r', 'p', 'v', 'm') and not pg_catalog.has_table_privilege(c.oid, 'SELECT') order by c.relname limit 200"; then
+        probe_failed "privilege-probe" "could not determine which public relations this role may SELECT"
+      else
+        no_select=0
+        while IFS= read -r relation; do
+          [[ -n "${relation}" ]] || continue
+          no_select=$((no_select + 1))
+          record_check BLOCKED "remote:privilege:${relation}" "READONLY_ROLE_LACKS_SELECT on ${relation}: the read-only role cannot read it, so it cannot be verified. Grant SELECT to the role (and default privileges for later migrations); this is not a missing migration"
+        done < "${SQL_OUT}"
+        if [[ "${no_select}" -eq 0 ]]; then
+          record_check PASS "remote:privilege" "the read-only role may SELECT every public table and view"
+        fi
+      fi
+
       # 4. Remote objects that no local migration creates (advisory, but an
       #    unanswered question is still an unanswered question).
-      if ! run_sql_to "select string_agg(table_name, ',') from information_schema.tables where table_schema='public' and table_name like 'milo_%'"; then
+      if ! run_sql_to "select string_agg(c.relname, ',') from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind in ('r', 'p', 'v') and c.relname like 'milo_%'"; then
         probe_failed "unexpected-probe" "could not inspect the public schema for relations with no matching local migration"
       else
         unexpected_tables="$(tr -d '[:space:]' < "${SQL_OUT}")"

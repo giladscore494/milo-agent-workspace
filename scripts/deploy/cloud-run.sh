@@ -14,6 +14,15 @@ API_SERVICE_ACCOUNT=${API_SERVICE_ACCOUNT:-milo-api-runtime@big-cabinet-457321-t
 WORKER_SERVICE_ACCOUNT=${WORKER_SERVICE_ACCOUNT:-milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com}
 DEPLOY_MODE=${DEPLOY_MODE:-check}
 JOB_LAUNCHER_MODE=${JOB_LAUNCHER_MODE:-disabled}
+# Permanent operating mode (plan decision 23; scripts/ops/deploy.sh with the
+# repository variable MILO_PERMANENT_MODE=true). 1 = replace the images and the
+# release identity ONLY and keep whatever stage the live API and worker are at:
+# no execution flag and no JOB_LAUNCHER is written, the worker may keep its
+# provider-key binding, and the deploy FAILS unless every execution flag and
+# JOB_LAUNCHER reads back exactly as it was before. 0 (the default) is the
+# ordinary Stage A deploy. It is never a default anywhere: an operator turns it
+# on, and only after two or three consecutive clean runs.
+DEPLOY_PRESERVE_STAGE=${DEPLOY_PRESERVE_STAGE:-0}
 API_SERVICE=${API_SERVICE:-milo-agent-api}
 WORKER_JOB=${WORKER_JOB:-milo-agent-worker}
 # Immutable image identity: the FULL 40-character commit SHA. Short SHAs are
@@ -285,8 +294,8 @@ API runtime service account: $API_SERVICE_ACCOUNT
 Worker runtime service account: $WORKER_SERVICE_ACCOUNT
 API image: $API_IMAGE
 Worker image: $WORKER_IMAGE
-Stage A execution flags: ${STAGE_A_FLAG_NAMES[*]} (all false)
-Stage A provider keys: ${MILO_PROVIDER_KEY_ENV_NAMES[*]} bound to NOTHING (Stage C introduces them)
+Stage A execution flags: ${STAGE_A_FLAG_NAMES[*]} ($([[ "$DEPLOY_PRESERVE_STAGE" == "1" ]] && printf 'PRESERVED as they are: permanent operating mode' || printf 'all false'))
+Stage A provider keys: ${MILO_PROVIDER_KEY_ENV_NAMES[*]} ($([[ "$DEPLOY_PRESERVE_STAGE" == "1" ]] && printf 'never on the API; the worker binding is PRESERVED' || printf 'bound to NOTHING (Stage C introduces them)'))
 Supabase target pin: $MILO_SUPABASE_PROJECT_REF_ENV_NAME set (approved project ref; value not shown)
 Gateway audience: $MILO_GATEWAY_AUDIENCE
 Approved gateway identities: $MILO_APPROVED_GATEWAY_IDENTITIES
@@ -448,7 +457,11 @@ describe_live_json() {
 require_no_live_provider_key_bindings() {
   local target kind name label json status record_kind record_name found="" reported
   LIVE_DESCRIBE_ERROR_FILE=$(mktemp)
-  for target in "service:$API_SERVICE" "job:$WORKER_JOB"; do
+  local targets=("service:$API_SERVICE" "job:$WORKER_JOB")
+  # Preserve mode keeps a Stage 2 worker exactly as it is, provider key
+  # included: only the API (which never carries one) is held to Stage A here.
+  [[ "$DEPLOY_PRESERVE_STAGE" == "1" ]] && targets=("service:$API_SERVICE")
+  for target in "${targets[@]}"; do
     kind="${target%%:*}"
     name="${target#*:}"
     case "$kind" in
@@ -724,6 +737,42 @@ case "$JOB_LAUNCHER_MODE" in
   *) fail "JOB_LAUNCHER_MODE must be 'disabled' or 'cloud_run'. Default is 'disabled'." ;;
 esac
 
+case "$DEPLOY_PRESERVE_STAGE" in
+  0|1) ;;
+  *) fail "DEPLOY_PRESERVE_STAGE must be 0 or 1. Default is 0 (the Stage A deploy)." ;;
+esac
+
+# stage_flag_pairs REPORT -> "NAME=VALUE" per line for JOB_LAUNCHER and every
+# execution flag the resource carries, sorted. Values, never secrets.
+stage_flag_pairs() {
+  awk -F'\t' '$1 == "flag" && ($2 == "JOB_LAUNCHER" || $2 ~ /^MILO_ENABLE_/) { print $2 "=" $3 }' <<<"$1" | LC_ALL=C sort
+}
+
+verify_stage_preserved() {
+  local label="$1" before="$2" after="$3"
+  if [[ "$before" != "$after" ]]; then
+    fail "$label changed an execution flag or JOB_LAUNCHER during a preserve-stage deploy (permanent operating mode must leave the live stage exactly as it was)."
+  fi
+  echo "  stage preserved: JOB_LAUNCHER and every execution flag read back unchanged"
+}
+
+if [[ "$DEPLOY_PRESERVE_STAGE" == "1" ]]; then
+  # Replace the image and the release identity only: no execution flag and no
+  # JOB_LAUNCHER is written, so a Stage 2 posture survives the deploy.
+  keep_non_stage() {
+    local pair name
+    for pair in "$@"; do
+      name="${pair%%=*}"
+      [[ "$name" == "JOB_LAUNCHER" ]] && continue
+      milo_contains "$name" "${STAGE_A_FLAG_NAMES[@]}" && continue
+      printf '%s\n' "$pair"
+    done
+  }
+  mapfile -t API_ENV_VARS < <(keep_non_stage "${API_ENV_VARS[@]}")
+  mapfile -t WORKER_ENV_VARS < <(keep_non_stage "${WORKER_ENV_VARS[@]}")
+  echo "PRESERVE-STAGE deploy (permanent operating mode): images and release identity only; the live stage is kept and verified unchanged." >&2
+fi
+
 preflight
 print_targets
 
@@ -740,8 +789,15 @@ fi
 
 # Snapshot the live configuration first so the post-deploy verification can
 # prove that no pre-existing environment variable or secret binding was lost.
-API_BINDINGS_BEFORE=$(binding_identities "$(binding_report service "$API_SERVICE")")
-WORKER_BINDINGS_BEFORE=$(binding_identities "$(binding_report job "$WORKER_JOB")")
+API_REPORT_BEFORE=$(binding_report service "$API_SERVICE")
+WORKER_REPORT_BEFORE=$(binding_report job "$WORKER_JOB")
+API_BINDINGS_BEFORE=$(binding_identities "$API_REPORT_BEFORE")
+WORKER_BINDINGS_BEFORE=$(binding_identities "$WORKER_REPORT_BEFORE")
+if [[ "$DEPLOY_PRESERVE_STAGE" == "1" ]]; then
+  # A stage can only be preserved on resources that exist and state one.
+  [[ -n "$(report_field "$API_REPORT_BEFORE" image)" && -n "$(report_field "$WORKER_REPORT_BEFORE" image)" ]] || \
+    fail "A preserve-stage deploy needs the API service and the worker job to exist already. Deploy at Stage A first."
+fi
 WORKER_EXECUTIONS_BEFORE=$(worker_execution_count)
 
 gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --config scripts/deploy/cloudbuild-worker.yaml --substitutions "_WORKER_IMAGE=$WORKER_IMAGE" .
@@ -773,8 +829,12 @@ verify_image_digest "Worker job '$WORKER_JOB'" "$WORKER_REPORT" "$WORKER_IMAGE"
 verify_service_account "Worker job '$WORKER_JOB'" "$WORKER_REPORT" "$WORKER_SERVICE_ACCOUNT"
 verify_env_names "Worker job '$WORKER_JOB'" "$WORKER_REPORT" "${MILO_WORKER_REQUIRED_ENV_NAMES[@]}" "${STAGE_A_FLAG_NAMES[@]}"
 verify_secret_refs "Worker job '$WORKER_JOB'" "$WORKER_REPORT" "${WORKER_SECRETS[@]}"
-verify_no_provider_key "Worker job '$WORKER_JOB'" "$WORKER_REPORT"
-verify_stage_a_flags "Worker job '$WORKER_JOB'" "$WORKER_REPORT"
+if [[ "$DEPLOY_PRESERVE_STAGE" == "1" ]]; then
+  verify_stage_preserved "Worker job '$WORKER_JOB'" "$(stage_flag_pairs "$WORKER_REPORT_BEFORE")" "$(stage_flag_pairs "$WORKER_REPORT")"
+else
+  verify_no_provider_key "Worker job '$WORKER_JOB'" "$WORKER_REPORT"
+  verify_stage_a_flags "Worker job '$WORKER_JOB'" "$WORKER_REPORT"
+fi
 verify_supabase_project_pin "Worker job '$WORKER_JOB'" "$WORKER_REPORT"
 assert_bindings_preserved "Worker job '$WORKER_JOB'" "$WORKER_BINDINGS_BEFORE" "$(binding_identities "$WORKER_REPORT")"
 verify_no_public_access job "$WORKER_JOB"
@@ -786,7 +846,11 @@ verify_env_names "API service '$API_SERVICE'" "$API_REPORT" "${MILO_API_REQUIRED
 verify_secret_refs "API service '$API_SERVICE'" "$API_REPORT" "${API_SECRETS[@]}"
 verify_no_provider_key "API service '$API_SERVICE'" "$API_REPORT"
 verify_gateway_identity "API service '$API_SERVICE'" "$API_REPORT"
-verify_stage_a_flags "API service '$API_SERVICE'" "$API_REPORT"
+if [[ "$DEPLOY_PRESERVE_STAGE" == "1" ]]; then
+  verify_stage_preserved "API service '$API_SERVICE'" "$(stage_flag_pairs "$API_REPORT_BEFORE")" "$(stage_flag_pairs "$API_REPORT")"
+else
+  verify_stage_a_flags "API service '$API_SERVICE'" "$API_REPORT"
+fi
 verify_supabase_project_pin "API service '$API_SERVICE'" "$API_REPORT"
 assert_bindings_preserved "API service '$API_SERVICE'" "$API_BINDINGS_BEFORE" "$(binding_identities "$API_REPORT")"
 verify_no_public_access service "$API_SERVICE"

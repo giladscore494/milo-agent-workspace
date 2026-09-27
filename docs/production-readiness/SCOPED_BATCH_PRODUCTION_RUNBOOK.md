@@ -95,6 +95,10 @@ looser normalization. Stage D stops on it.
 
 ## Stage A — read-only checks
 
+> Every Cloud Shell step below also exists as a GitHub Actions workflow
+> (`deploy`, `gates`, `arm`, `capture-flag`, `kill-switch`), keyless through
+> Workload Identity Federation: see [OPERATE_FROM_PHONE.md](OPERATE_FROM_PHONE.md).
+
 Nothing in this stage changes anything.
 
 ### A.1 Cloud Shell and the release commit

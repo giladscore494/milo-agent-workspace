@@ -1062,3 +1062,72 @@ def test_an_early_public_member_in_a_large_iam_policy_is_refused(deployment, pol
     result = deployment.run()
     assert result.returncode != 0
     assert "grants access to allUsers/allAuthenticatedUsers" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# O-3: permanent operating mode -- a deploy that keeps the live stage
+# ---------------------------------------------------------------------------
+
+def stage2_docs(deployment: Deployment) -> None:
+    """A live API and worker at Stage 2: flags on, the launcher on, and the
+    provider key bound to the worker -- before AND after (a preserve deploy
+    writes none of them)."""
+    for doc in (deployment.service_before, deployment.service_after):
+        env = doc["spec"]["template"]["spec"]["containers"][0]["env"]
+        for entry in env:
+            if entry["name"] in ("MILO_ENABLE_RUN_CREATION", "MILO_ENABLE_WORK_SCOPE_BATCHES"):
+                entry["value"] = "true"
+            if entry["name"] == "JOB_LAUNCHER":
+                entry["value"] = "cloud_run"
+    for doc in (deployment.job_before, deployment.job_after):
+        env = doc["spec"]["template"]["spec"]["template"]["spec"]["containers"][0]["env"]
+        for entry in env:
+            if entry["name"] == "MILO_ENABLE_PAID_EXECUTION":
+                entry["value"] = "true"
+        env.append(secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
+
+
+def test_the_default_deploy_still_refuses_a_live_provider_key(deployment):
+    stage2_docs(deployment)
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "A provider API key is already bound to live Cloud Run configuration" in result.stderr
+    assert not [line for line in deployment.invocations() if "builds submit" in line]
+
+
+def test_a_preserve_stage_deploy_writes_no_flag_and_keeps_the_live_stage(deployment):
+    stage2_docs(deployment)
+    result = deployment.run(DEPLOY_PRESERVE_STAGE="1")
+    assert result.returncode == 0, result.stdout + result.stderr
+    for resource in ("run deploy ", "run jobs deploy"):
+        command = deployment.command(resource)
+        assert "MILO_RELEASE_SHA=" in command
+        assert "MILO_ENABLE_" not in command
+        assert "JOB_LAUNCHER=" not in command
+        assert "KIMI_API_KEY" not in command
+        # The replay capture stays pinned off on every surface, in every mode.
+        assert "MILO_CAPTURE_REPLAY=false" in command
+    assert "stage preserved: JOB_LAUNCHER and every execution flag read back unchanged" in result.stdout
+
+
+def test_a_preserve_stage_deploy_fails_when_the_stage_moved(deployment):
+    stage2_docs(deployment)
+    env = deployment.service_after["spec"]["template"]["spec"]["containers"][0]["env"]
+    next(entry for entry in env if entry["name"] == "MILO_ENABLE_RUN_CREATION")["value"] = "false"
+    result = deployment.run(DEPLOY_PRESERVE_STAGE="1")
+    assert result.returncode != 0
+    assert "changed an execution flag or JOB_LAUNCHER during a preserve-stage deploy" in result.stderr
+
+
+def test_a_preserve_stage_deploy_still_refuses_a_provider_key_on_the_api(deployment):
+    deployment.service_before["spec"]["template"]["spec"]["containers"][0]["env"].append(
+        secret_entry("KIMI_API_KEY", "KIMI_API_KEY"))
+    result = deployment.run(DEPLOY_PRESERVE_STAGE="1")
+    assert result.returncode != 0
+    assert "API service" in result.stderr and "KIMI_API_KEY" in result.stderr
+
+
+def test_the_preserve_flag_accepts_only_zero_or_one(deployment):
+    result = deployment.run(DEPLOY_PRESERVE_STAGE="yes")
+    assert result.returncode != 0
+    assert "DEPLOY_PRESERVE_STAGE must be 0 or 1" in result.stderr

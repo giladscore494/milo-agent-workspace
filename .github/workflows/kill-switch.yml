@@ -1,0 +1,116 @@
+name: Kill switch
+
+# EMERGENCY: the canonical emergency order (scripts/deploy/kill-switch.sh,
+# docs/production-readiness/ROLLBACK.md) from a phone. It runs in the
+# `production-kill-switch` environment, which has NO required reviewer -- an
+# emergency must not wait -- but, like every other operation, it is reachable
+# only from this repository's main branch: the Workload Identity provider's
+# attribute condition admits nothing else. Its own concurrency group, so it
+# never waits behind a deploy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      vercel_deployment:
+        description: "https URL of the CURRENT production Vercel deployment"
+        required: true
+        type: string
+      confirm:
+        description: "Type KILL to apply (not needed for a dry run)"
+        required: false
+        type: string
+      scope:
+        description: "all, order-only (steps 1-5) or remaining-only (step 6)"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - order-only
+          - remaining-only
+      dry_run:
+        description: "Print the emergency order and change nothing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: milo-production-kill-switch
+  cancel-in-progress: false
+
+jobs:
+  kill-switch:
+    name: Kill switch
+    runs-on: ubuntu-latest
+    environment: production-kill-switch
+    timeout-minutes: 30
+    steps:
+      - name: Refuse anything but main, and an unconfirmed apply
+        env:
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Dispatch this workflow from main only."
+            exit 1
+          fi
+          if [[ "${DRY_RUN_INPUT}" != "true" && "${CONFIRM_INPUT}" != "KILL" ]]; then
+            echo "Type KILL in confirm to apply the kill switch."
+            exit 1
+          fi
+
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Operator configuration (identifiers only)
+        env:
+          MILO_OPERATOR_CONFIG_TEXT: ${{ vars.MILO_OPERATOR_CONFIG }}
+        run: bash scripts/ops/write-operator-config.sh
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Vercel CLI, linked to the production project
+        env:
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+          VERCEL_CLI_VERSION: ${{ vars.VERCEL_CLI_VERSION }}
+        run: bash scripts/ops/link-vercel.sh
+
+      - name: Kill switch
+        env:
+          DEPLOYMENT_INPUT: ${{ inputs.vercel_deployment }}
+          SCOPE_INPUT: ${{ inputs.scope }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          set -euo pipefail
+          args=(--vercel-deployment "${DEPLOYMENT_INPUT}")
+          case "${SCOPE_INPUT}" in
+            order-only) args+=(--order-only) ;;
+            remaining-only) args+=(--remaining-only) ;;
+          esac
+          if [[ "${DRY_RUN_INPUT}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bash scripts/ops/kill-switch.sh "${args[@]}"

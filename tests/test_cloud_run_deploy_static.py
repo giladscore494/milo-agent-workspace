@@ -374,7 +374,11 @@ def test_live_provider_key_check_runs_before_the_first_build():
 
 def test_live_provider_key_check_inspects_both_resources_in_both_forms():
     body = SCRIPT.split("require_no_live_provider_key_bindings() {", 1)[1]
-    assert 'for target in "service:$API_SERVICE" "job:$WORKER_JOB"' in body
+    # Both resources -- except in a preserve-stage deploy (permanent operating
+    # mode), which holds only the API to "no provider key".
+    assert 'local targets=("service:$API_SERVICE" "job:$WORKER_JOB")' in body
+    assert '[[ "$DEPLOY_PRESERVE_STAGE" == "1" ]] && targets=("service:$API_SERVICE")' in body
+    assert 'for target in "${targets[@]}"; do' in body
     # Secret-backed and plain bindings both count.
     assert 'case "$record_kind" in env | secret' in body
     assert "Secret Manager-backed binding" in body

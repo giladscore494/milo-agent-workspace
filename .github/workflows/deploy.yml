@@ -1,0 +1,112 @@
+name: Deploy production
+
+# Plan decision 23: operate production from a phone. The operator R block as
+# ONE workflow run: CI green on the exact SHA, the complete migration set
+# applied, Vercel built that SHA with run starts closed, 0 live runs, the Stage
+# 2 reset (unless permanent operating mode), production-activate.sh --all, the
+# reviewed worker model env, the worker contract, and the deployed gate. Every
+# step is scripts/ops/deploy.sh, which wraps the canonical tools unchanged and
+# writes SUMMARY| lines to the job summary.
+#
+# Google Cloud is reached through Workload Identity Federation only
+# (scripts/ops/setup-wif.sh): no key exists. The read-only database URL is the
+# `production` environment secret MILO_READONLY_DB_URL, handed to the one step
+# that needs it and never printed. Nothing here starts a run, prepares a plan
+# or arms Stage 2.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Exact 40-character release SHA (a commit on main)"
+        required: true
+        type: string
+      dry_run:
+        description: "Print every command and call nothing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+  checks: read
+
+concurrency:
+  group: milo-production-operations
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy production
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 120
+    steps:
+      - name: Refuse anything but main and a full SHA
+        env:
+          SHA_INPUT: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Dispatch this workflow from main only."
+            exit 1
+          fi
+          if [[ ! "${SHA_INPUT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "sha must be exactly 40 lowercase hexadecimal characters."
+            exit 1
+          fi
+
+      - name: Check out the release
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: The release is a commit on main
+        env:
+          SHA_INPUT: ${{ inputs.sha }}
+        run: git merge-base --is-ancestor "${SHA_INPUT}" origin/main
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Operator configuration (identifiers only)
+        env:
+          MILO_OPERATOR_CONFIG_TEXT: ${{ vars.MILO_OPERATOR_CONFIG }}
+        run: bash scripts/ops/write-operator-config.sh
+
+      - name: Set up Python (the preflight and gates import backend/)
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: PostgreSQL client
+        run: command -v psql > /dev/null || { sudo apt-get update && sudo apt-get install -y postgresql-client; }
+
+      - name: Deploy
+        env:
+          SHA_INPUT: ${{ inputs.sha }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          PERMANENT_MODE: ${{ vars.MILO_PERMANENT_MODE || 'false' }}
+          GH_TOKEN: ${{ github.token }}
+          MILO_READONLY_DB_URL: ${{ secrets.MILO_READONLY_DB_URL }}
+        run: |
+          set -euo pipefail
+          args=(--sha "${SHA_INPUT}" --permanent-mode "${PERMANENT_MODE}")
+          if [[ "${DRY_RUN_INPUT}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bash scripts/ops/deploy.sh "${args[@]}"
