@@ -195,6 +195,12 @@ REQUIRED_PER_FILE["20260927000100_catalog_variant_coverage.sql"] = [
     "when r.status in ('completed', 'partial_success') then 'settling'",
     "delete from public.catalog_variant_reservations\n   where run_id = p_run_id and level = p_level;",
     "create or replace function public.catalog_variant_reservations_settling(",
+    # PR-Z2: the key carries the Government's registration identifiers
+    # verbatim, and a key whose rows differ is a collision -- recorded
+    # `failed`, never settled by picking one of them.
+    "select 'milo-variant-identity/2'",
+    "r.payload->>'tozeret_cd', r.payload->>'degem_cd',",
+    "then 'catalog_coverage_key_collision' end as reason_code",
 ]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the

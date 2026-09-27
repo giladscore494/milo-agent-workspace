@@ -428,21 +428,42 @@ Mapping Plan shows per-unit counts.
 
 ### The variant identity key
 
-`variant_identity_key` is the SHA-256 of a length-prefixed rendering of the
-candidate's marque (`tozar`), commercial model (`kinuy_mishari`), model years,
-official model code (`degem_nm`), trim (`ramat_gimur`) and every identity
-dimension, exactly as the reviewed normalization stored them -- never a
-model's value, and never the register's `_id`, which the register reuses
-across captures. Two captures of the same row share a key; a duplicate
-identity group (37350 / 37439) is ONE key. The database
+`variant_identity_key` (contract `milo-variant-identity/2`) is the SHA-256 of a
+length-prefixed rendering of the candidate's marque (`tozar`), commercial
+model (`kinuy_mishari`), model years, official model code (`degem_nm`) and
+trim (`ramat_gimur`), exactly as the reviewed normalization stored them; the
+Government's registration identifiers -- manufacturer code (`tozeret_cd`),
+model code (`degem_cd`) and vehicle type code (`sug_degem`) -- verbatim from
+the stored raw payload (as PostgreSQL's `payload->>'field'` renders them, no
+normalization); and every identity dimension. Never a model's value, and
+never the register's `_id`, which the register reuses across captures. Two
+captures of the same row share a key. The database
 (`catalog_variant_identity_key`) and the backend compute the same key; the
-PostgreSQL suite holds them to it.
+PostgreSQL suite holds them to it, row by row over real production payloads.
+
+Why `/2`: version 1 left the registration identifiers out. In production
+Toyota that put 6,374 rows under 4,190 keys, 1,175 of them shared by rows with
+DIFFERENT content (2018+: 4,668 rows, 3,020 keys, 835 such groups) -- among
+them 37350 / 37439 and 37309 / 37345, which are different vehicles (different
+`degem_cd`). Under `/2` every Toyota row has its own key (6,374 keys, no
+group).
+
+A duplicate is ONLY rows whose content minus `_id` is identical: they share a
+key and are one variant. Rows that share a key while their content differs
+are a KEY COLLISION: the ledger never picks one of them. The key is recorded
+`failed` with `reason_code = CATALOG_COVERAGE_KEY_COLLISION` and the hash of
+every content involved (so it is queued again), whether the other row was
+named by the run or only sits in the same snapshot. The ledger write itself
+succeeds and never changes the run. PR-V's `duplicate_identity_record_ids`
+follows the same definition: only rows with the same key AND identical
+content are told to the Commander as one duplicate group.
 
 ### The ledger
 
 `catalog_variant_coverage`: one row per (key, level), with `status`,
 `last_run_id`, `snapshot_key`, `content_sha256` (the stored register row minus
-`_id`), `vocabulary_version` and `updated_at`. The only level today is
+`_id`), `vocabulary_version`, `reason_code` (only
+`CATALOG_COVERAGE_KEY_COLLISION`, only on a `failed` row) and `updated_at`. The only level today is
 `register` (a Mapping Plan batch's Government register resolution).
 
 | Status | Derived from the run's durable output |

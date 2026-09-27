@@ -3523,8 +3523,26 @@ class MemoryRepository:
         """(identity key, content hash, raw record) of one stored candidate."""
         records = self._raw_records_by_id() if records is None else records
         record = records[candidate["raw_record_id"]]
-        return (catalog_coverage.candidate_identity_key(candidate),
+        return (catalog_coverage.candidate_identity_key(candidate, record["payload"]),
                 catalog_coverage.variant_content_sha256(record["payload"]), record)
+
+    _IDENTITY_COLUMNS = ("manufacturer", "commercial_model", "model_year_start",
+                         "model_year_end", "official_model_code", "trim")
+
+    def _snapshot_key_contents(self, snapshot_id: Any, entries: list[Mapping[str, Any]],
+                               keys: set[str], records: Mapping[str, dict[str, Any]]
+                               ) -> dict[str, set[str]]:
+        """Mirrors the apply step's peer read: every row of the snapshot that states
+        an entry's identity columns, keyed, for the keys the entries name."""
+        wanted = {tuple(entry.get(name) for name in self._IDENTITY_COLUMNS) for entry in entries}
+        contents: dict[str, set[str]] = {}
+        for candidate in self._snapshot_candidates(snapshot_id):
+            if tuple(candidate.get(name) for name in self._IDENTITY_COLUMNS) not in wanted:
+                continue
+            key, content, _ = self._coverage_facts(candidate, records)
+            if key in keys:
+                contents.setdefault(key, set()).add(content)
+        return contents
 
     def _coverage_decision(self, key: str, content: str, level: str,
                            include: bool) -> tuple[str, dict[str, Any] | None]:
@@ -3582,6 +3600,7 @@ class MemoryRepository:
                               "upstream_record_id": record["upstream_record_id"],
                               "variant_identity_key": key, "content_sha256": content,
                               "status": ledger["status"] if ledger else None,
+                              "reason_code": ledger.get("reason_code") if ledger else None,
                               "last_run_id": ledger["last_run_id"] if ledger else None,
                               "decision": decision})
             return {"batch_id": batch["id"], "level": level, "include_unresolved": include,
@@ -3620,23 +3639,26 @@ class MemoryRepository:
         if any(entry["candidate_id"] not in candidates for entry in entries):
             raise AppError("CATALOG_COVERAGE_CANDIDATE_INVALID",
                            "a coverage entry names no candidate of the run's snapshot", 422)
-        strongest: dict[str, tuple[str, str]] = {}
         records = self._raw_records_by_id()
+        keyed = []
         for entry in entries:
             key, content, _ = self._coverage_facts(candidates[entry["candidate_id"]], records)
-            current = strongest.get(key)
-            candidate = (entry["status"], content)
-            rank = catalog_coverage.STATUS_RANK
-            if current is None or (-rank[candidate[0]], candidate[0].encode(), content) \
-                    < (-rank[current[0]], current[0].encode(), current[1]):
-                strongest[key] = candidate
+            keyed.append((key, content, entry["status"]))
+        # A duplicate is ONLY identical content: a key whose rows (of the entries
+        # or of the rest of the snapshot) differ is a collision, never a pick.
+        settled = catalog_coverage.settle_keys(
+            keyed, self._snapshot_key_contents(
+                batch["snapshot_id"], [candidates[entry["candidate_id"]] for entry in entries],
+                {key for key, _, _ in keyed}, records))
         written = 0
         vocabulary = catalog_coverage.VOCABULARY_VERSION
-        for key, (status, content) in strongest.items():
+        for key, settlement in sorted(settled.items()):
+            status, content = settlement.status, settlement.content_sha256
             row = self.catalog_variant_coverage.get((key, level))
             incoming = {"status": status, "last_run_id": str(run_id),
                         "snapshot_key": batch["snapshot_key"], "content_sha256": content,
-                        "vocabulary_version": vocabulary}
+                        "vocabulary_version": vocabulary,
+                        "reason_code": settlement.reason_code}
             if row is None:
                 now = _now()
                 self.catalog_variant_coverage[(key, level)] = {
@@ -3648,9 +3670,9 @@ class MemoryRepository:
             replace = (row["content_sha256"] != content
                        or rank[status] > rank[row["status"]]
                        or (rank[status] == rank[row["status"]]
-                           and any(row[name] != incoming[name]
+                           and any(row.get(name) != incoming[name]
                                    for name in ("status", "last_run_id", "snapshot_key",
-                                                "vocabulary_version"))))
+                                                "vocabulary_version", "reason_code"))))
             if replace:
                 row.update(incoming, updated_at=_now())
                 written += 1
@@ -3660,7 +3682,9 @@ class MemoryRepository:
         for key in held:
             del self.catalog_variant_reservations[key]
         return {"run_id": str(run_id), "level": level, "snapshot_key": batch["snapshot_key"],
-                "entries": len(entries), "written": written, "released": len(held)}
+                "entries": len(entries), "written": written, "released": len(held),
+                "collisions": sum(1 for item in settled.values()
+                                  if item.reason_code == catalog_coverage.KEY_COLLISION)}
 
     def _reservation_state(self, run_id: str) -> str:
         """Mirrors `catalog_variant_reservation_state`."""
