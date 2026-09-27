@@ -46,7 +46,9 @@ from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander, CommanderM
                                       EvidenceReference, FinalBuilder, GenericWorker,
                                       ModelGateway, PlanValidator, RemainingBudget,
                                       SwarmV2Engine, Verifier)
+from backend.engines.swarm_v2.commander import CommanderPlanFailure
 from backend.engines.swarm_v2.evidence import EvidenceBoard, WorkerLease
+from backend.engines.swarm_v2.failures import SwarmExecutionFailure
 from backend.engines.swarm_v2.evidence_mapping import (RegisteredOperationEvidenceSink,
                                                        TrustedEvidenceAcquisition,
                                                        production_evidence_mappers)
@@ -139,7 +141,7 @@ def manifest_problems(manifest: Mapping[str, Any]) -> list[str]:
             problems.append(f"TOOL_RESULT_DUPLICATE {identity}")
         seen.add(identity)
     expected = manifest.get("expected") or {}
-    if expected.get("terminal") not in {"result", "unrecorded_call"}:
+    if expected.get("terminal") not in {"result", "unrecorded_call", "failed"}:
         problems.append("EXPECTED_TERMINAL_INVALID")
     return problems
 
@@ -401,7 +403,7 @@ class ReplayReport:
                 "summary": {key: summary[key] for key in sorted(summary)},
             })
         if self.divergence is not None:
-            out["unrecorded_call"] = self.divergence
+            out["failure" if self.terminal == "failed" else "unrecorded_call"] = self.divergence
         return out
 
 
@@ -517,6 +519,11 @@ def replay(manifest: Mapping[str, Any]) -> ReplayReport:
     try:
         result = engine.run(payload)
         terminal = "result"
+    except (CommanderPlanFailure, SwarmExecutionFailure) as exc:
+        # The engine's own static, terminal refusal of the run: a recorded
+        # run that FAILED replays to that failure, named by its code.
+        terminal = "failed"
+        divergence = {"code": exc.code}
     except ReplayDivergence as exc:
         terminal = "unrecorded_call" if exc.code == "UNRECORDED_MODEL_CALL" else "divergence"
         divergence = {"code": exc.code, **exc.detail} if exc.code != "UNRECORDED_MODEL_CALL" \

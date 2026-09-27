@@ -46,10 +46,11 @@ matched deterministically.
 `content` is always the provider's text, inert, BEFORE any validation.
 
 `expected.terminal` is `result` (the run finalized: `status`, `result_kind`,
-`vehicles`, `unresolved_groups`, `needs_review`, `summary`) or
-`unrecorded_call` (the current code asks for a completion production never
-produced -- e.g. the Commander repair of a plan the firewall now refuses; the
-call is named). `model_calls`, `retry_reasons` and `unconsumed` (recorded
+`vehicles`, `unresolved_groups`, `needs_review`, `summary`), `failed` (the
+engine refused the run with its own static code, e.g. a plan refused twice --
+`failure.code`), or `unrecorded_call` (the current code asks for a completion
+production never produced -- e.g. the Commander repair of a plan the firewall
+now refuses; the call is named). `model_calls`, `retry_reasons` and `unconsumed` (recorded
 completions / tool results the current code never reached) are always stated.
 `note` is free text and is not compared.
 
@@ -78,8 +79,12 @@ committed fixture; the export refuses to write anything that fails it.
    With it on, the worker keeps the run's completions (answer `content` and
    `finish_reason` only, never reasoning) and tool results, bounded, on the
    run's own checkpoints (`artifacts.replay_capture`; `run_checkpoints` is
-   service-only). A run refused at planning keeps its capture in one
-   `replay_capture` checkpoint.
+   service-only). A run that fails -- at planning or after its first engine
+   checkpoint -- keeps its capture in one final `replay_capture` checkpoint.
+   Every checkpoint of a prepared run, that one included, carries the run's OWN
+   preparation record (`artifacts.government`); the export reads both from the
+   same latest checkpoint and refuses when the record is missing or a recorded
+   tool result names another snapshot.
 2. Export it (read-only; service credentials in the environment):
 
    ```

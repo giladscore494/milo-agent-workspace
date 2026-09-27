@@ -330,6 +330,23 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
             repo.transition_run(run_id, "running", expected_worker_id=worker_id, expected_attempt=run.get("attempt"), expected_lease_token=run.get("lease_token"), started_at=run.get("started_at") or datetime.now(UTC).isoformat())
         if hasattr(repo, "heartbeat"):
             repo.heartbeat(run_id, worker_id, lease_seconds=lease_seconds, attempt=run.get("attempt"), lease_token=run.get("lease_token"))
+        def with_run_artifacts(checkpoint):
+            """The run's own durable records every checkpoint carries.
+
+            The Government preparation record rides on EVERY later checkpoint
+            of a prepared run, so `latest_checkpoint` always carries the pinned
+            snapshot and the queue whichever phase wrote it, and an engine
+            checkpoint can never displace them. It is THIS run's preparation,
+            held in this process since it was read under this lease -- never
+            looked up elsewhere.
+            """
+            preparation = catalog_state.get("preparation")
+            if preparation is None:
+                return checkpoint
+            artifacts = dict(checkpoint.get("artifacts") or {})
+            artifacts.setdefault(GOVERNMENT_ARTIFACT_KEY, preparation.as_artifact())
+            return {**checkpoint, "artifacts": artifacts}
+
         def save_checkpoint(_phase, checkpoint):
             if hasattr(repo, "save_checkpoint"):
                 # A checkpoint's token_usage is CONSOLIDATED from the ledger
@@ -341,15 +358,7 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # never carry less usage than the run has durably spent.
                 checkpoint = {**checkpoint, "run_id": str(run_id), "attempt": run.get("attempt", 1), "workflow_key": workflow_key,
                               "token_usage": merge_usage_snapshots(checkpoint.get("token_usage"), tracker.ledger_snapshot())}
-                # The Government preparation record rides on EVERY later
-                # checkpoint of a prepared run, so `latest_checkpoint` always
-                # carries the pinned snapshot and the queue whichever phase
-                # wrote it, and an engine checkpoint can never displace them.
-                preparation = catalog_state.get("preparation")
-                if preparation is not None:
-                    artifacts = dict(checkpoint.get("artifacts") or {})
-                    artifacts.setdefault(GOVERNMENT_ARTIFACT_KEY, preparation.as_artifact())
-                    checkpoint = {**checkpoint, "artifacts": artifacts}
+                checkpoint = with_run_artifacts(checkpoint)
                 recorder = replay_state["recorder"]
                 if recorder is not None:
                     # PR-Y: the bounded capture rides on the run's own
@@ -1314,17 +1323,21 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # PR-Y: a run that fails -- above all one whose plan the
                 # firewall refused before any engine checkpoint existed --
                 # keeps what it captured in ONE capture checkpoint, written
-                # under the lease just before the terminal state. The capture
-                # never changes the outcome: a write that fails is skipped.
+                # under the lease just before the terminal state. Like every
+                # checkpoint of a prepared run it carries the run's OWN
+                # preparation record (the pinned snapshot and queue), so the
+                # latest checkpoint is always exportable. The capture never
+                # changes the outcome: a write that fails is skipped.
                 from backend.replay_capture import CAPTURE_PHASE, with_capture
                 try:
-                    repo.save_checkpoint({
+                    capture_checkpoint = with_run_artifacts({
                         "run_id": str(run_id), "attempt": run.get("attempt", 1),
                         "engine_version": preclaim_identity.engine_version,
                         "workflow_key": workflow_key, "phase": CAPTURE_PHASE,
                         "completed_tasks": [], "failures": [],
-                        "token_usage": tracker.ledger_snapshot(),
-                        "artifacts": with_capture({}, replay_state["recorder"])},
+                        "token_usage": tracker.ledger_snapshot(), "artifacts": {}})
+                    repo.save_checkpoint({**capture_checkpoint, "artifacts": with_capture(
+                        capture_checkpoint["artifacts"], replay_state["recorder"])},
                         **lease_ctx)
                 except Exception:
                     pass

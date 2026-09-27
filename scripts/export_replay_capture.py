@@ -59,14 +59,22 @@ def build_manifest(repository: Any, run_id: str, *, name: str,
                    today: str | None = None) -> dict[str, Any]:
     """The replay/1 manifest for one captured run (no `expected` outcome yet)."""
     checkpoint = repository.latest_checkpoint(run_id)
+    if checkpoint is not None and str(checkpoint.get("run_id")) != str(run_id):
+        # Never another run's material, whatever the repository returned.
+        raise ExportRefused("CHECKPOINT_RUN_MISMATCH")
     artifacts = (checkpoint or {}).get("artifacts") or {}
     capture = artifacts.get(CAPTURE_ARTIFACT_KEY)
     if not isinstance(capture, Mapping) or capture.get("format") != CAPTURE_FORMAT:
         raise ExportRefused("REPLAY_CAPTURE_MISSING")
     if capture.get("truncated"):
         raise ExportRefused("REPLAY_CAPTURE_TRUNCATED")
+    # The preparation record rides on the SAME checkpoint as the capture (the
+    # worker attaches this run's own record to every checkpoint, the failure
+    # capture included). It is never looked up anywhere else and never
+    # reconstructed: a checkpoint without one is refused.
     record = artifacts.get(PREPARATION_KEY)
-    if not isinstance(record, Mapping):
+    if not isinstance(record, Mapping) or any(
+            key not in record for key in (*PREPARATION_FIELDS, "snapshot_id")):
         raise ExportRefused("PREPARATION_RECORD_MISSING")
     stamp = today or dt.date.today().isoformat()
     origin = f"MILO_CAPTURE_REPLAY capture of run {name}, exported {stamp}"
@@ -86,6 +94,11 @@ def build_manifest(repository: Any, run_id: str, *, name: str,
                     for entry in capture.get("tool_calls") or []]
     if any(item["arguments"] is None for item in tool_results):
         raise ExportRefused("TOOL_ARGUMENTS_NOT_CAPTURED")
+    # Every recorded register answer must come from the preparation's pinned
+    # snapshot; rows are then read from exactly that snapshot.
+    if any((item["result"].get("provenance") or {}).get("snapshot_key")
+           != record["snapshot_key"] for item in tool_results):
+        raise ExportRefused("PREPARATION_SNAPSHOT_MISMATCH")
 
     referenced = sorted({str(variant["upstream_record_id"])
                          for item in tool_results

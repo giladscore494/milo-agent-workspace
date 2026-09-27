@@ -176,7 +176,7 @@ class ReasoningCompletions(FakeKimiCompletions):
         return response
 
 
-def _run(monkeypatch, *, capture: bool, plan_body=None):
+def _run(monkeypatch, *, capture: bool, plan_body=None, worker_body=None):
     swarm_env(monkeypatch, **{CATALOG_EXECUTION_FLAG: "true", GOVERNMENT_READ_FLAG: "true",
                               CATALOG_PROMOTION_FLAG: "false",
                               CAPTURE_FLAG: "true" if capture else None})
@@ -188,6 +188,7 @@ def _run(monkeypatch, *, capture: bool, plan_body=None):
     item = repository.work_scope_batch_for_run(run_id)["items"][0]
     completions = ReasoningCompletions(
         plan_body=plan_body if plan_body is not None else json.dumps(_government_plan(item)),
+        worker_body=worker_body,
         decision_body=json.dumps({"decision": "REQUEST_VERIFICATION", "plan": None,
                                   "reason": "done"}))
     patch_client(monkeypatch, completions)
@@ -376,3 +377,95 @@ def test_the_offline_ci_job_runs_the_replay_suite():
     command = job.split("Backend offline tests", 1)[1].split("- name:", 1)[0]
     assert "pytest -q -rs tests" in command
     assert "replay" not in command  # nothing about the replay suite is ignored
+
+
+# =============================================================================
+# failed runs: worker -> export -> replay (the latest checkpoint is exportable)
+# =============================================================================
+
+def _preparation_of(checkpoints):
+    (prepared,) = [row for row in checkpoints if row["phase"] == "government_prepared"]
+    return prepared["artifacts"]["government"]
+
+
+def _export_and_replay(repository, run_id, tmp_path):
+    from replay_harness import fixture_findings, replay
+
+    export = _export_module()
+    manifest = export.build_manifest(repository, str(run_id), name="failed-run",
+                                     today="2026-09-27")
+    assert sanitization_findings(manifest) == []
+    target = export.write_manifest(manifest, tmp_path / "failed-run", write_expected=True)
+    written = json.loads(target.read_text(encoding="utf-8"))
+    assert fixture_findings(written) == []
+    report = replay(written)
+    assert report.outcome() == written["expected"]
+    assert report.unconsumed_completions == {} and report.unconsumed_tool_results == []
+    assert report.whole_snapshot_reads == []
+    return manifest, report
+
+
+def test_a_planning_failure_before_any_engine_checkpoint_exports_and_replays(
+        monkeypatch, tmp_path):
+    repository, run_id, checkpoints, _ = _run(monkeypatch, capture=True,
+                                              plan_body="not json at all")
+    # No ordinary engine checkpoint was ever written...
+    assert [row["phase"] for row in checkpoints] == ["government_prepared", CAPTURE_PHASE]
+    # ...and the final capture checkpoint carries THIS run's own preparation.
+    latest = checkpoints[-1]
+    assert str(latest["run_id"]) == str(run_id)
+    assert latest["artifacts"]["government"] == _preparation_of(checkpoints)
+    manifest, report = _export_and_replay(repository, run_id, tmp_path)
+    assert manifest["preparation"]["snapshot_key"] == _preparation_of(checkpoints)["snapshot_key"]
+    assert report.terminal == "failed"
+    assert report.divergence == {"code": "COMMANDER_PLAN_JSON_INVALID"}
+    assert [(item["role"], item["phase"]) for item in report.served] == [
+        ("commander", "planning"), ("commander", "planning")]
+    assert repository.runs[str(run_id)]["status"] == "failed"
+
+
+def test_a_failure_after_an_engine_checkpoint_exports_and_replays(monkeypatch, tmp_path):
+    repository, run_id, checkpoints, _ = _run(monkeypatch, capture=True,
+                                              worker_body="not json at all")
+    phases = [row["phase"] for row in checkpoints]
+    assert phases[0] == "government_prepared" and "swarm_v2" in phases
+    assert phases[-1] == CAPTURE_PHASE
+    assert checkpoints[-1]["artifacts"]["government"] == _preparation_of(checkpoints)
+    manifest, report = _export_and_replay(repository, run_id, tmp_path)
+    assert report.terminal == "failed"
+    assert report.divergence == {"code": "SWARM_V2_REQUIRED_TASK_FAILED"}
+    # The planned register read, its one recorded row, and both worker attempts.
+    assert [row["_id"] for row in manifest["snapshot_rows"]] == [37254]
+    assert len(manifest["workers"]["t01"]) == 2
+    assert report.cross_checked == 1
+    assert repository.runs[str(run_id)]["status"] == "failed"
+
+
+def test_the_export_never_fabricates_a_missing_preparation(monkeypatch):
+    export = _export_module()
+    repository, run_id, checkpoints, _ = _run(monkeypatch, capture=True,
+                                              plan_body="not json at all")
+    checkpoints[-1]["artifacts"].pop("government")
+    with pytest.raises(export.ExportRefused, match="PREPARATION_RECORD_MISSING"):
+        export.build_manifest(repository, str(run_id), name="x")
+
+
+def test_the_export_refuses_a_tool_result_from_another_snapshot(monkeypatch):
+    export = _export_module()
+    repository, run_id, checkpoints, _ = _run(monkeypatch, capture=True)
+    capture = checkpoints[-1]["artifacts"][CAPTURE_ARTIFACT_KEY]
+    capture["tool_calls"][0]["result"]["provenance"]["snapshot_key"] = "cs1." + "0" * 32
+    with pytest.raises(export.ExportRefused, match="PREPARATION_SNAPSHOT_MISMATCH"):
+        export.build_manifest(repository, str(run_id), name="x")
+
+
+def test_the_export_refuses_another_runs_checkpoint(monkeypatch):
+    export = _export_module()
+    repository, run_id, checkpoints, _ = _run(monkeypatch, capture=True)
+
+    class Mislabelled:
+        def latest_checkpoint(self, _run_id):
+            return {**checkpoints[-1], "run_id": "00000000-0000-4000-8000-000000000000"}
+
+    with pytest.raises(export.ExportRefused, match="CHECKPOINT_RUN_MISMATCH"):
+        export.build_manifest(Mislabelled(), str(run_id), name="x")
