@@ -133,7 +133,7 @@ class Repository(Protocol):
     def catalog_candidate_manufacturers(self, snapshot_id: Any, *, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
     def catalog_candidate_models(self, snapshot_id: Any, *, manufacturer: str, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
     def catalog_candidate_model_years(self, snapshot_id: Any, *, manufacturer: str, commercial_model: str, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
-    def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, official_model_code: str | None = None, trim: str | None = None, identity_dimensions: dict[str, Any] | None = None, status: str | None = None, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
+    def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, official_model_code: str | None = None, trim: str | None = None, identity_dimensions: dict[str, Any] | None = None, status: str | None = None, limit: int = 50, offset: int = 0, allow_incomplete: bool = False, register_manufacturer_code: str | None = None, register_model_code: str | None = None, vehicle_type_code: str | None = None) -> list[dict[str, Any]]: ...
     def catalog_raw_record_by_upstream_id(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None: ...
     def catalog_snapshot_candidate_diff(self, previous_snapshot_id: Any, snapshot_id: Any, *, limit: int = MAX_DIFF_ITEMS, allow_incomplete: bool = False) -> list[dict[str, Any]]: ...
     def catalog_run_pending_promotions(self, run_id: UUID, tool_operation: str, *, limit: int = 25) -> list[dict[str, Any]]: ...
@@ -1755,7 +1755,14 @@ class SupabaseRepository:
                                "p_manufacturer": str(manufacturer),
                                "p_commercial_model": str(commercial_model)})
 
-    def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, official_model_code: str | None = None, trim: str | None = None, identity_dimensions: dict[str, Any] | None = None, status: str | None = None, limit: int = 50, offset: int = 0, allow_incomplete: bool = False) -> list[dict[str, Any]]:
+    def catalog_candidate_variant_page(self, snapshot_id: Any, *, manufacturer: str | None = None, commercial_model: str | None = None, model_year: int | None = None, official_model_code: str | None = None, trim: str | None = None, identity_dimensions: dict[str, Any] | None = None, status: str | None = None, limit: int = 50, offset: int = 0, allow_incomplete: bool = False, register_manufacturer_code: str | None = None, register_model_code: str | None = None, vehicle_type_code: str | None = None) -> list[dict[str, Any]]:
+        # PR-Z3: the register's own identifiers, compared verbatim in the
+        # database (`payload->>'field'`). Sent only when stated, so a call
+        # that states none names exactly the parameters it always named.
+        codes = {name: str(value) for name, value in (
+            ("p_register_manufacturer_code", register_manufacturer_code),
+            ("p_register_model_code", register_model_code),
+            ("p_vehicle_type_code", vehicle_type_code)) if value is not None}
         return self._read_rpc("catalog_candidate_variant_page", {
             **self._page_params(snapshot_id, limit, offset, allow_incomplete),
             "p_manufacturer": None if manufacturer is None else str(manufacturer),
@@ -1764,7 +1771,7 @@ class SupabaseRepository:
             "p_official_model_code": None if official_model_code is None else str(official_model_code),
             "p_trim": None if trim is None else str(trim),
             "p_identity_dimensions": dict(identity_dimensions) if identity_dimensions else None,
-            "p_status": None if status is None else str(status)})
+            "p_status": None if status is None else str(status), **codes})
 
     def catalog_run_pending_promotions(self, run_id: UUID, tool_operation: str, *, limit: int = 25) -> list[dict[str, Any]]:
         """What one RUN still has to promote, reconstructed from durable state.

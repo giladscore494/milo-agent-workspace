@@ -161,6 +161,12 @@ class Register:
             if result["match_mode"] != "exact":
                 raise AssertionError("a reconstructed answer is not an exact code match")
             del result["match_mode"]
+        # PR-Z3 added the register codes to a resolved row's source record and
+        # the per-match `distinguishing` fields to an ambiguous answer. These
+        # runs PREDATE both, so their recorded answers never stated them.
+        result.pop("distinguishing", None)
+        for field in ("tozeret_cd", "degem_cd", "sug_degem"):
+            (result.get("source_record") or {}).pop(field, None)
         for variant in result.get("variants") or []:
             variant["candidate_id"] = f"cand-{variant['upstream_record_id']}"
         if "provenance" in result:

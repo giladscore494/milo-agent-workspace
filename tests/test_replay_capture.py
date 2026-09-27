@@ -22,6 +22,7 @@ import pytest
 
 import backend.replay_capture as capture_module
 import backend.worker.main as worker_main
+from backend.catalog.coverage import register_codes
 from backend.catalog.execution import (CATALOG_EXECUTION_FLAG, CATALOG_PROMOTION_FLAG,
                                        GOVERNMENT_READ_FLAG)
 from backend.replay_capture import (CAPTURE_ARTIFACT_KEY, CAPTURE_FLAG, CAPTURE_PHASE,
@@ -146,11 +147,14 @@ ANSWER_SCHEMA = {"type": "object", "properties": {"answer": {"type": "string"}},
                  "required": ["answer"], "additionalProperties": False}
 
 
-def _government_plan(item: dict) -> dict:
+def _government_plan(item: dict, codes: dict | None = None) -> dict:
+    # PR-Z3: a resolve_variant call for a handed item states the item's
+    # register codes, as the Commander is told to (and the firewall requires).
     arguments = {"manufacturer": item["manufacturer"],
                  "commercial_model": item["commercial_model"],
                  "model_year": item["model_year_start"],
-                 "official_model_code": item["official_model_code"], "trim": item["trim"]}
+                 "official_model_code": item["official_model_code"], "trim": item["trim"],
+                 **(codes or {})}
     task = {"task_id": "t01", "goal": "resolve one register candidate", "scope": "register",
             "dependencies": [],
             "tools": [{"call_id": "c1", "name": GOVERNMENT_TOOL_NAME,
@@ -186,8 +190,11 @@ def _run(monkeypatch, *, capture: bool, plan_body=None, worker_body=None):
                               units=("toyota",), max_items=5, batch_size=5, records=rows)
     run_id = UUID(start_batch_run(repository, plan)["run"]["id"])
     item = repository.work_scope_batch_for_run(run_id)["items"][0]
+    codes = dict(zip(("register_manufacturer_code", "register_model_code",
+                      "vehicle_type_code"), register_codes(rows[0])))
     completions = ReasoningCompletions(
-        plan_body=plan_body if plan_body is not None else json.dumps(_government_plan(item)),
+        plan_body=plan_body if plan_body is not None
+        else json.dumps(_government_plan(item, {k: v for k, v in codes.items() if v})),
         worker_body=worker_body,
         decision_body=json.dumps({"decision": "REQUEST_VERIFICATION", "plan": None,
                                   "reason": "done"}))

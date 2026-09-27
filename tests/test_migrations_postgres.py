@@ -10227,6 +10227,77 @@ def test_pr_z2_a_key_collision_is_recorded_failed_never_picked(ledger_db):
                 "where status = 'failed'")
 
 
+# PR-Z3: the bounded variant page narrows by the register's own identifiers,
+# compared as `payload->>'field'` -- the rendering `register_codes.register_code`
+# gives -- in the database, on the page's existing raw-record join.
+
+def _z3_page(db, snapshot: str, **codes: str) -> list[tuple[str, str, str, str]]:
+    named = "".join(f", p_{name} => $c${value}$c$" for name, value in codes.items())
+    rows = db.psql(
+        "select upstream_record_id || '|' || coalesce(register_manufacturer_code, '<null>') "
+        "|| '|' || coalesce(register_model_code, '<null>') || '|' "
+        "|| coalesce(vehicle_type_code, '<null>') "
+        f"from public.catalog_candidate_variant_page('{snapshot}'{named}) "
+        "where upstream_record_id is not null")
+    return sorted(tuple(line.split("|")) for line in rows.splitlines() if line)
+
+
+def test_pr_z3_the_register_code_filter_is_the_python_rendering(ledger_db):
+    from backend.catalog.register_codes import register_code
+
+    db = ledger_db
+    real = Z2_ROWS["37350"]
+    rows = [
+        copy.deepcopy(real),                                         # int, int, text
+        {**copy.deepcopy(real), "_id": 92001, "degem_cd": "0758"},   # a text model code
+        {**copy.deepcopy(real), "_id": 92002, "sug_degem": None},    # JSON null
+        {key: value for key, value in copy.deepcopy(real).items()
+         if key != "sug_degem"} | {"_id": 92003},                   # absent
+        {**copy.deepcopy(real), "_id": 92004, "tozeret_cd": " 413"},  # verbatim spaces
+    ]
+    world = _z2_world(db, rows)
+    payloads = {str(row["_id"]): row for row in rows}
+
+    def rendered(payload):
+        return tuple("<null>" if value is None else value for value in (
+            register_code(payload, "tozeret_cd"), register_code(payload, "degem_cd"),
+            register_code(payload, "sug_degem")))
+
+    # Every row states its codes exactly as Python renders them.
+    assert _z3_page(db, world["snapshot"]) == sorted(
+        (record, *rendered(payload)) for record, payload in payloads.items())
+    for codes in ({"register_model_code": "758"}, {"register_model_code": "0758"},
+                  {"vehicle_type_code": "P"}, {"register_manufacturer_code": "413"},
+                  {"register_manufacturer_code": " 413"},
+                  {"register_manufacturer_code": "413", "register_model_code": "758",
+                   "vehicle_type_code": "P"},
+                  {"register_model_code": "999"}):
+        fields = {"register_manufacturer_code": "tozeret_cd",
+                  "register_model_code": "degem_cd", "vehicle_type_code": "sug_degem"}
+        expected = sorted(record for record, payload in payloads.items()
+                          if all(register_code(payload, fields[name]) == value
+                                 for name, value in codes.items()))
+        assert [row[0] for row in _z3_page(db, world["snapshot"], **codes)] == expected, codes
+    # The count row still carries the exact total of a filtered read.
+    assert db.psql("select total_count from public.catalog_candidate_variant_page("
+                   f"'{world['snapshot']}', p_register_model_code => '758', p_limit => 1) "
+                   "limit 1") == "4"          # 37350, 92002, 92003, 92004
+    # ONE function: the eleven-argument signature is gone, the new one is
+    # service-only, and a call naming only the old parameters is answered.
+    assert db.psql("select count(*) from pg_proc where proname = "
+                   "'catalog_candidate_variant_page'") == "1"
+    signature = ("public.catalog_candidate_variant_page(uuid,text,text,integer,text,text,"
+                 "jsonb,text,integer,integer,boolean,text,text,text)")
+    for role in ("anon", "authenticated"):
+        assert db.psql(f"select has_function_privilege('{role}', '{signature}', "
+                       "'execute')") == "f"
+    assert db.psql(f"select has_function_privilege('service_role', '{signature}', "
+                   "'execute')") == "t"
+    assert db.psql("select count(*) from public.catalog_candidate_variant_page("
+                   f"p_snapshot_id => '{world['snapshot']}', p_limit => 50, p_offset => 0, "
+                   "p_allow_incomplete => false) where upstream_record_id is not null") == "5"
+
+
 def test_pr_z_relations_and_functions_are_service_only(db):
     for table in ("catalog_variant_coverage", "catalog_work_scope_unit_coverage",
                   "catalog_variant_reservations"):

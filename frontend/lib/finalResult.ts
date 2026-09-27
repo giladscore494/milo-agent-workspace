@@ -249,10 +249,21 @@ export type VehicleField = {
 
 export type VehicleReviewCode = { code: string; field?: string; taskId?: string };
 
+/**
+ * PR-Z3: the resolved row's exact registration, as the register states it
+ * (`tozeret_cd` / `degem_cd` / `sug_degem`). Present only when stated.
+ */
+export type VehicleRegistration = {
+  manufacturerCode?: string;
+  modelCode?: string;
+  vehicleTypeCode?: string;
+};
+
 export type VehicleView = {
   /** The register's own upstream record id. */
   key: string;
   identity: VehicleIdentity;
+  registration?: VehicleRegistration;
   fields: VehicleField[];
   verifiedFieldCount: number;
   review: VehicleReviewCode[];
@@ -661,6 +672,9 @@ function toVerifiedValue(entry: unknown): VerifiedValue | EntryRefusal {
 /** The three keys come together or not at all. */
 const VEHICLE_RESULT_KEYS = ['vehicles', 'unresolved_groups', 'summary'] as const;
 const VEHICLE_KEYS = ['vehicle_key', 'identity', 'fields', 'needs_review', 'sources'] as const;
+/** PR-Z3: the one optional vehicle key, and the fields it may state. */
+const VEHICLE_REGISTRATION_KEY = 'registration';
+const REGISTRATION_KEYS = ['tozeret_cd', 'degem_cd', 'sug_degem'] as const;
 const VEHICLE_FIELD_KEYS = ['value', 'verdict', 'provenance'] as const;
 const VEHICLE_PROVENANCE_KEYS = ['claim_id', 'source_id', 'task_id'] as const;
 const IDENTITY_KEYS = ['manufacturer', 'commercial_model', 'model_year', 'trim',
@@ -743,12 +757,35 @@ function toVehicleReview(value: unknown): Refusable<VehicleReviewCode> {
   return entry;
 }
 
+function toRegistration(value: unknown): Refusable<VehicleRegistration> {
+  if (!isObject(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length === 0 || !keys.every((key) => (REGISTRATION_KEYS as readonly string[]).includes(key))) {
+    return null;
+  }
+  const read = (raw: unknown): Refusable<string | undefined> =>
+    raw === undefined ? undefined : requiredId(raw, OUTCOME_TEXT_CHARS);
+  const [manufacturerCode, modelCode, vehicleTypeCode] = REGISTRATION_KEYS.map((key) => read(value[key]));
+  if (manufacturerCode === null || modelCode === null || vehicleTypeCode === null) return null;
+  const registration: VehicleRegistration = {};
+  if (manufacturerCode !== undefined) registration.manufacturerCode = manufacturerCode;
+  if (modelCode !== undefined) registration.modelCode = modelCode;
+  if (vehicleTypeCode !== undefined) registration.vehicleTypeCode = vehicleTypeCode;
+  return registration;
+}
+
 function toVehicle(value: unknown): Refusable<VehicleView> {
-  if (!isObject(value) || !hasExactKeys(value, VEHICLE_KEYS)) return null;
+  if (!isObject(value)) return null;
+  const hasRegistration = VEHICLE_REGISTRATION_KEY in value;
+  if (!hasExactKeys(value, hasRegistration ? [...VEHICLE_KEYS, VEHICLE_REGISTRATION_KEY] : VEHICLE_KEYS)) {
+    return null;
+  }
   const key = requiredId(value.vehicle_key, OUTCOME_TEXT_CHARS);
   const identity = toIdentity(value.identity);
   const sources = idList(value.sources, BACKEND_BOUNDS.sourceId, MAX_VEHICLE_LIST_ITEMS);
   if (key === null || identity === null || sources === null) return null;
+  const registration = hasRegistration ? toRegistration(value.registration) : undefined;
+  if (registration === null) return null;
   if (!isObject(value.fields) || !Array.isArray(value.needs_review) ||
       value.needs_review.length > MAX_VEHICLE_LIST_ITEMS) return null;
   const fields: VehicleField[] = [];
@@ -763,7 +800,7 @@ function toVehicle(value: unknown): Refusable<VehicleView> {
     if (entry === null) return null;
     review.push(entry);
   }
-  return { key, identity, fields, review, sources,
+  return { key, identity, ...(registration ? { registration } : {}), fields, review, sources,
     verifiedFieldCount: fields.filter((field) => field.verdict === 'verified').length };
 }
 

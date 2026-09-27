@@ -44,7 +44,8 @@ stops between pages rather than after the last one.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Mapping
 
 from backend.catalog.government import source as src
 from backend.catalog.government.projection import (DEFAULT_RESULT_ITEMS, MAX_RESULT_ITEMS,
@@ -52,7 +53,8 @@ from backend.catalog.government.projection import (DEFAULT_RESULT_ITEMS, MAX_RES
                                                    GovernmentProjectionError)
 from backend.catalog.contracts import CANDIDATE_IDENTITY_DIMENSIONS
 from backend.catalog.government.query import (IDENTITY_RECORD_FIELD_TYPES,
-                                              MAX_RESOLUTION_MATCHES, CandidateVariantRow,
+                                              MAX_RESOLUTION_MATCHES, REGISTER_CODE_FIELDS,
+                                              REGISTER_CODE_FILTERS, CandidateVariantRow,
                                               GovernmentCatalogQuery)
 
 from .contracts import ToolContext, ToolError, ToolMode, ToolOperation
@@ -113,13 +115,30 @@ _VARIANT = _object({
     "model_year_end", "upstream_record_id", "resource_id"))
 
 #: The bounded, server-selected identity projection of ONE register row.
-#: Exactly `IDENTITY_RECORD_FIELDS`; a field the row does not state is an
-#: ABSENT key, never a null.
+#: Exactly `IDENTITY_RECORD_FIELDS` plus (PR-Z3) the register's own
+#: identifiers as text; a field the row does not state is an ABSENT key, never
+#: a null.
 _IDENTITY_RECORD = _object({
     "upstream_record_id": _STR,
     **{name: (_INT if expected is int else _STR)
        for name, expected in IDENTITY_RECORD_FIELD_TYPES.items()},
+    **{field: _STR for _name, field in REGISTER_CODE_FIELDS},
 }, ("upstream_record_id",))
+
+#: PR-Z3: what an AMBIGUOUS answer states per match -- the fields that tell the
+#: matches apart, and nothing else: the row's register id and its three
+#: registration identifiers as text. No identity projection is quoted and
+#: nothing is resolved: it only shows which codes a queued item would state.
+_DISTINGUISHING = _object({
+    "upstream_record_id": _STR, **{field: _STR for _name, field in REGISTER_CODE_FIELDS},
+}, ("upstream_record_id",))
+
+#: PR-Z3: the refusal of a `resolve_variant` call whose register codes name no
+#: row the server handed this run. A TOOL error -- the task fails, the run does
+#: not -- and a static one: it quotes no code and no row.
+REGISTER_CODE_NOT_IN_BATCH = "GOVERNMENT_REGISTER_CODE_NOT_IN_BATCH"
+REGISTER_CODE_NOT_IN_BATCH_MESSAGE = ("the stated register codes name no row this run was "
+                                      "handed")
 
 _PAGE_INPUT = {"limit": _INT, "offset": _INT}
 _PAGE_OUTPUT = {"total": _INT, "offset": _INT, "limit": _INT, "has_more": _BOOL,
@@ -186,7 +205,11 @@ OPERATIONS: dict[str, ToolOperation] = {
         "resolve_variant",
         "Resolve ONE register variant, or report every match. An ambiguity is never resolved here.",
         _object({"manufacturer": _STR, "commercial_model": _STR, "model_year": _INT,
-                 "trim": _STR, "official_model_code": _STR},
+                 "trim": _STR, "official_model_code": _STR,
+                 # PR-Z3: the register's own identifiers of a HANDED queue
+                 # item, exactly as the item states them. Optional; accepted
+                 # only when they name a row this run was handed.
+                 **{name: _STR for name in REGISTER_CODE_FILTERS}},
                 ("manufacturer", "commercial_model", "model_year")),
         _object({"resolved": _BOOL, "ambiguous": _BOOL, "match_count": _INT,
                  "variants": _array(_VARIANT, MAX_RESOLUTION_MATCHES),
@@ -194,7 +217,11 @@ OPERATIONS: dict[str, ToolOperation] = {
                  # PR-V: "exact" | "separator_insensitive". Optional in the
                  # schema so a result recorded before it existed stays valid;
                  # this tool always states it.
-                 "match_mode": _STR},
+                 "match_mode": _STR,
+                 # PR-Z3: an ambiguous answer's per-match distinguishing
+                 # fields. Optional: absent on every other answer, and on
+                 # every result recorded before it existed.
+                 "distinguishing": _array(_DISTINGUISHING, MAX_RESOLUTION_MATCHES)},
                 ("resolved", "ambiguous", "match_count", "variants", "provenance"))),
     "search_codes": ToolOperation(
         "search_codes",
@@ -240,6 +267,101 @@ def _variant_payload(row: CandidateVariantRow) -> dict[str, Any]:
     return payload
 
 
+@dataclass(frozen=True)
+class HandedRegisterRow:
+    """PR-Z3: ONE queue item the server handed the run, as the binding checks it.
+
+    Built by trusted wiring from the run's own preparation record, never from
+    a plan or a model: it is what a `resolve_variant` call stating register
+    codes must describe.
+    """
+
+    manufacturer: str
+    commercial_model: str
+    model_year_start: int | None
+    model_year_end: int | None
+    official_model_code: str | None
+    trim: str | None
+    register_codes: Mapping[str, str]
+
+    def describes(self, payload: Mapping[str, Any]) -> bool:
+        """Whether a call's stated identity and stated codes are THIS row's.
+
+        Every filter the call states is one this row satisfies, so the row is
+        always among the call's matches: a UNIQUE answer can only ever be this
+        handed row, and anything else comes back ambiguous -- never a row the
+        server did not hand the run.
+        """
+        stated = {name: payload[name] for name in REGISTER_CODE_FILTERS if name in payload}
+        if not stated or any(self.register_codes.get(name) != value
+                             for name, value in stated.items()):
+            return False
+        if any(name not in payload
+               for name in ("manufacturer", "commercial_model", "model_year")):
+            return False
+        return self.could_answer(payload)
+
+    def could_answer(self, payload: Mapping[str, Any]) -> bool:
+        """Whether a call's STATED identity arguments are consistent with this row."""
+        for name in ("manufacturer", "commercial_model", "trim", "official_model_code"):
+            if name in payload and payload[name] != getattr(self, name):
+                return False
+        if "model_year" not in payload:
+            return True
+        year = payload["model_year"]
+        return (self.model_year_start is not None and self.model_year_end is not None
+                and not isinstance(year, bool) and isinstance(year, int)
+                and self.model_year_start <= year <= self.model_year_end)
+
+
+def handed_register_rows(items: Iterable[Any]) -> tuple[HandedRegisterRow, ...]:
+    """The binding for one run: every handed item that states register codes."""
+    rows = []
+    for item in items:
+        codes = {name: getattr(item, name) for name in REGISTER_CODE_FILTERS
+                 if isinstance(getattr(item, name, None), str)}
+        if codes:
+            rows.append(HandedRegisterRow(
+                manufacturer=str(item.manufacturer), commercial_model=str(item.commercial_model),
+                model_year_start=item.model_year_start, model_year_end=item.model_year_end,
+                official_model_code=item.official_model_code, trim=item.trim,
+                register_codes=codes))
+    return tuple(rows)
+
+
+def register_code_plan_rule(handed_rows: Iterable[HandedRegisterRow]
+                            ) -> Callable[[Any], str | None]:
+    """PR-Z3: the plan firewall's rule for `resolve_variant`, over the handed rows.
+
+    *   a call that states register codes must describe a handed row
+        (``REGISTER_CODE_NOT_IN_BATCH``) -- the same test the tool applies;
+    *   a call whose stated identity could answer a handed row that carries
+        codes must state them (``REGISTER_CODES_REQUIRED``), so a queued item
+        is never resolved by an identity the register cannot tell apart from
+        its neighbours. Codes a dependency binding supplies are decided at
+        execution time, by the tool.
+
+    A run whose handed rows carry no codes -- every preparation recorded
+    before PR-Z3 -- has no rows here, and the rule states nothing.
+    """
+    rows = tuple(handed_rows)
+
+    def rule(call: Any) -> str | None:
+        if (call.name, call.operation) != (GOVERNMENT_TOOL_NAME, "resolve_variant") or not rows:
+            return None
+        arguments = dict(call.arguments)
+        if any(name in arguments for name in REGISTER_CODE_FILTERS):
+            return None if any(row.describes(arguments) for row in rows) \
+                else "REGISTER_CODE_NOT_IN_BATCH"
+        if {binding.argument for binding in call.dependency_bindings} & set(REGISTER_CODE_FILTERS):
+            return None
+        if any(row.could_answer(arguments) for row in rows):
+            return "REGISTER_CODES_REQUIRED"
+        return None
+
+    return rule
+
+
 class GovernmentVehicleTool:
     """The registered read capability over the durable Government catalog."""
 
@@ -253,7 +375,8 @@ class GovernmentVehicleTool:
 
     def __init__(self, repository: Any, *, resource_id: str = src.WLTP_RESOURCE_ID,
                  snapshot_key: str | None = None, allow_incomplete: bool = False,
-                 query_factory: Callable[..., GovernmentCatalogQuery] | None = None) -> None:
+                 query_factory: Callable[..., GovernmentCatalogQuery] | None = None,
+                 handed_rows: Iterable[HandedRegisterRow] | None = None) -> None:
         """Bind the tool to a repository and ONE reviewed resource.
 
         The resource, the pinned snapshot and the incompleteness
@@ -261,12 +384,19 @@ class GovernmentVehicleTool:
         and are deliberately NOT operation inputs: a model that could name its
         own resource or acknowledge its own gap would be granting itself
         something the server decides.
+
+        PR-Z3: `handed_rows` is the same kind of wiring -- the run's own
+        handed queue items and their register codes (`handed_register_rows`).
+        A `resolve_variant` call that states any register code is answered
+        only when it describes one of them; a tool built without them
+        refuses every such call.
         """
         self._repository = repository
         self._resource_id = src.require_allowed_resource(resource_id)
         self._snapshot_key = snapshot_key
         self._allow_incomplete = bool(allow_incomplete)
         self._query_factory = query_factory or GovernmentCatalogQuery
+        self._handed_rows = tuple(handed_rows or ())
 
     def execute(self, context: ToolContext, operation: str,
                 payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -375,10 +505,18 @@ class GovernmentVehicleTool:
 
     def _op_resolve_variant(self, query: GovernmentCatalogQuery,
                             payload: Mapping[str, Any]) -> dict[str, Any]:
+        codes = {name: payload[name] for name in REGISTER_CODE_FILTERS if name in payload}
+        if codes and not any(row.describes(payload) for row in self._handed_rows):
+            # PR-Z3: a caller never breaks a tie by fiat. Register codes are
+            # the tie-breaker only because the SERVER handed the row that
+            # states them; codes naming any other row are refused before any
+            # read, and quote nothing back.
+            raise ToolError(REGISTER_CODE_NOT_IN_BATCH, REGISTER_CODE_NOT_IN_BATCH_MESSAGE,
+                            tool=self.name)
         resolution = query.resolve_variant(
             str(payload["manufacturer"]), str(payload["commercial_model"]),
             int(payload["model_year"]), trim=payload.get("trim"),
-            official_model_code=payload.get("official_model_code"))
+            official_model_code=payload.get("official_model_code"), **codes)
         result = {"resolved": resolution.variant is not None,
                   "ambiguous": resolution.ambiguous,
                   "match_count": resolution.match_count,
@@ -395,6 +533,15 @@ class GovernmentVehicleTool:
             result["source_record"] = {
                 "upstream_record_id": resolution.variant.upstream_record_id,
                 **dict(resolution.identity_projection)}
+        if resolution.ambiguous and any(item.register_codes for item in resolution.matches):
+            # PR-Z3: per match, ONLY what tells the matches apart. Not an
+            # identity projection and not a resolution: which row a queued
+            # item is stays the server's to say, through the handed codes.
+            result["distinguishing"] = [
+                {"upstream_record_id": item.upstream_record_id,
+                 **{field: item.register_codes[name] for name, field in REGISTER_CODE_FIELDS
+                    if name in item.register_codes}}
+                for item in resolution.matches]
         return result
 
 
@@ -405,4 +552,6 @@ def _page_payload(page: Any) -> dict[str, Any]:
 
 
 __all__ = ["DEFAULT_TOOL_PAGE_ITEMS", "GOVERNMENT_TOOL_NAME", "GOVERNMENT_TOOL_SCOPE",
-           "MAX_TOOL_PAGE_ITEMS", "OPERATIONS", "GovernmentVehicleTool"]
+           "MAX_TOOL_PAGE_ITEMS", "OPERATIONS", "REGISTER_CODE_NOT_IN_BATCH",
+           "GovernmentVehicleTool", "HandedRegisterRow", "handed_register_rows",
+           "register_code_plan_rule"]

@@ -256,6 +256,19 @@ class GovernmentWorkItem:
     #: vehicles and are never grouped. Empty when the variant is unique. Such
     #: a group can only ever resolve as ambiguous.
     duplicate_identity_record_ids: tuple[str, ...] = ()
+    #: PR-Z3: the item's own register row's registration identifiers --
+    #: `tozeret_cd`, `degem_cd`, `sug_degem` -- verbatim (`payload->>'field'`),
+    #: read by the server from the preparation's own bounded page. None when
+    #: the row states none, or the record predates PR-Z3.
+    register_manufacturer_code: str | None = None
+    register_model_code: str | None = None
+    vehicle_type_code: str | None = None
+
+    @property
+    def register_codes(self) -> dict[str, str]:
+        """The register codes this item states, by `resolve_variant` input name."""
+        return {name: getattr(self, name) for name in REGISTER_CODE_ITEM_FIELDS
+                if getattr(self, name) is not None}
 
     def as_record(self) -> dict[str, Any]:
         record = {
@@ -271,6 +284,9 @@ class GovernmentWorkItem:
         if self.duplicate_identity_record_ids:
             # Only when there is one: a unique item's record is unchanged.
             record["duplicate_identity_record_ids"] = list(self.duplicate_identity_record_ids)
+        # PR-Z3: only the codes the row states, so a record with none -- every
+        # record written before PR-Z3 -- is unchanged.
+        record.update(self.register_codes)
         return record
 
     @classmethod
@@ -290,6 +306,9 @@ class GovernmentWorkItem:
         if not isinstance(duplicates, Sequence) or isinstance(duplicates, (str, bytes)) \
                 or any(not isinstance(item, str) or not item for item in duplicates):
             raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
+        codes = {name: record[name] for name in REGISTER_CODE_ITEM_FIELDS if name in record}
+        if any(not isinstance(value, str) for value in codes.values()):
+            raise GovernmentPreparationError("GOVERNMENT_PREPARATION_RECORD_INVALID")
         return cls(
             candidate_key=key, candidate_id=candidate_id, manufacturer=manufacturer,
             commercial_model=model,
@@ -298,6 +317,7 @@ class GovernmentWorkItem:
             official_model_code=_optional_text(record.get("official_model_code")),
             trim=_optional_text(record.get("trim")),
             duplicate_identity_record_ids=tuple(sorted(duplicates)),
+            **codes,
         )
 
 
@@ -396,8 +416,25 @@ class GovernmentPreparation:
             # PR-V: the ONE rule the annotation comes with, stated only when
             # the queue actually holds a duplicate group.
             context["duplicate_identity_rule"] = DUPLICATE_IDENTITY_RULE
+        if any(item.register_codes for item in self.queue):
+            # PR-Z3: likewise, stated only when an item carries its codes.
+            context["register_code_rule"] = REGISTER_CODE_RULE
         return context
 
+
+#: PR-Z3: the `resolve_variant` inputs a work item carries its register row's
+#: own identifiers under -- the same names the tool accepts them as.
+REGISTER_CODE_ITEM_FIELDS = ("register_manufacturer_code", "register_model_code",
+                             "vehicle_type_code")
+
+#: PR-Z3: the Commander rule register codes travel with.
+REGISTER_CODE_RULE = (
+    "Each item states its register row's own identifiers: register_manufacturer_code, "
+    "register_model_code and vehicle_type_code. A resolve_variant call for an item states "
+    "them exactly as the item gives them, together with that item's manufacturer, "
+    "commercial_model, model_year, trim and official_model_code. They are how the register "
+    "tells apart rows that share every other identity field; codes that do not name an "
+    "item of this queue are refused.")
 
 #: PR-V: the Commander rule a duplicate-identity annotation travels with.
 DUPLICATE_IDENTITY_RULE = (
@@ -749,6 +786,11 @@ def _annotate_duplicate_identities(repository: Any, snapshot_key: str,
     `MAX_DUPLICATE_GROUP_READS` single-row reads; a larger candidate group is
     left unannotated. An unreadable snapshot refuses preparation exactly as
     the placeholder read does.
+
+    PR-Z3: the same page states the item's own row's register codes
+    (`payload->>'tozeret_cd' / 'degem_cd' / 'sug_degem'`), and the item
+    carries them -- no further read. An item whose page could not be read
+    whole still carries them when its own row is on it.
     """
     query = query or _pinned_query(repository, snapshot_key, cancellation_checker)
     pages: dict[tuple[Any, ...], Any] = {}
@@ -770,6 +812,8 @@ def _annotate_duplicate_identities(repository: Any, snapshot_key: str,
             page = pages[filters]
             own = next((row for row in page.items if row.candidate_id == item.candidate_id),
                        None)
+            if own is not None and own.register_codes:
+                item = GovernmentWorkItem(**{**item.__dict__, **own.register_codes})
             if page.has_more or own is None:
                 annotated.append(item)
                 continue

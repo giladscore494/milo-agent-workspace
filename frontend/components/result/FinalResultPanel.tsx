@@ -12,6 +12,7 @@ import {
   ReviewItemKind,
   UnresolvedGroupView,
   VehicleIdentity,
+  VehicleRegistration,
   VehicleResult,
   VehicleView,
   VerifiedField,
@@ -291,11 +292,15 @@ function VehicleSection({ view }: { view: VehicleResult }) {
   );
 }
 
-function identityLine(identity: VehicleIdentity): string {
+function identityLine(identity: VehicleIdentity, registration?: VehicleRegistration): string {
   const head = [identity.manufacturer, identity.commercialModel, identity.modelYear]
     .filter((part): part is string => part !== undefined)
     .join(' ');
-  return [head, identity.trim, identity.officialModelCode]
+  const codes = registration === undefined ? '' :
+    [registration.manufacturerCode, registration.modelCode, registration.vehicleTypeCode]
+      .filter((part): part is string => part !== undefined)
+      .join('/');
+  return [head, identity.trim, identity.officialModelCode, codes ? `reg. ${codes}` : undefined]
     .filter((part): part is string => part !== undefined && part.length > 0)
     .join(' · ') || 'Identity not stated';
 }
@@ -304,7 +309,9 @@ function VehicleRow({ vehicle }: { vehicle: VehicleView }) {
   const verified = vehicle.verifiedFieldCount;
   return (
     <>
-      <span className="final-result-review-subject">{safeText(identityLine(vehicle.identity))}</span>
+      <span className="final-result-review-subject">
+        {safeText(identityLine(vehicle.identity, vehicle.registration))}
+      </span>
       <span className="final-result-review-reason">
         {verified === 1 ? '1 verified field' : `${verified} verified fields`}
       </span>

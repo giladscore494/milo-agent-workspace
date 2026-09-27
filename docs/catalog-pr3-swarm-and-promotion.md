@@ -96,9 +96,9 @@ catalog_canonical_variant_current          (the authoritative read model)
 | Totals | every page carries the EXACT total of the filtered set, so `has_more` is a fact |
 | Ordering | manufacturer, commercial model, year range, code, trim, candidate key — `collate "C"` in SQL and codepoint order in Python, so the two agree on any cluster |
 | Provenance | every factual result carries the snapshot key, resource, package, publisher, market scope, upstream version and kind, content hash, schema fingerprint, activation time, stored record count, normalization contract and issue count |
-| Raw material | `resolve_variant` alone quotes register FIELDS, only on a unique resolution, and only the seven reviewed identity fields of ONE row |
+| Raw material | `resolve_variant` alone quotes register FIELDS, only on a unique resolution, and only the seven reviewed identity fields of ONE row -- plus, since PR-Z3, its registration identifiers `tozeret_cd` / `degem_cd` / `sug_degem` as text. An ambiguous answer lists only each match's register id and those three codes (`distinguishing`) |
 | Network | none. The tool holds a repository, not a `DataGovClient`; it cannot construct a transport |
-| Descriptor size | 15 354 bytes against the 24 576-byte Commander prompt bound |
+| Descriptor size | 16 088 bytes (PR-Z3) against the 24 576-byte Commander prompt bound |
 
 **No operation can return a complete raw resource.** There is no dump, no
 "list every record", no free-text query, no caller-chosen ordering and no

@@ -568,3 +568,32 @@ run -- never the whole ledger or a whole snapshot. A second run changes
 nothing. Offline, it reproduces runs 6825eb96 (8 enriched, one ambiguous
 group) and aa63369b (8 enriched, two ambiguous groups) from their recorded
 tool results (`tests/test_catalog_variant_coverage.py`).
+
+## Resolving by the register's own identifiers (PR-Z3)
+
+The identity key (PR-Z2) gives every Toyota row its own key, but
+`resolve_variant` narrowed only by marque, model, year, trim, official model
+code and dimensions. So rows that differ only in the Government's
+registration identifiers -- `tozeret_cd`, `degem_cd`, `sug_degem` -- always
+came back ambiguous, and runs paid for an answer the register already gives.
+In aa63369b, LIMITED 37350 / 37439 (`degem_cd` 758 / 839) and TRAILHUNTER
+37309 / 37345 (722 / 753) were such groups.
+
+| Piece | What it does |
+| --- | --- |
+| The read | `catalog_candidate_variant_page` takes three optional exact filters (`p_register_manufacturer_code`, `p_register_model_code`, `p_vehicle_type_code`), compared verbatim with `payload->>'tozeret_cd' / 'degem_cd' / 'sug_degem'` in the same bounded read, on the page's existing raw-record join. It returns the three values per row. `GovernmentCatalogQuery.list_variants` / `resolve_variant` pass them through. |
+| Why a join, not a column | The page already joins each matched candidate to its raw record by primary key after the indexed identity filters, so the filter adds no scan. The codes live verbatim in the payload the identity key reads, and candidate rows are append-only (a column would need a backfill of existing rows). |
+| Work items | Each handed queue item carries `register_manufacturer_code`, `register_model_code`, `vehicle_type_code`, read by the server from its own row on the page preparation already reads. A record without codes (every record before PR-Z3) is unchanged, and so is its plan digest. |
+| The binding | The tool is wired with the run's handed items. A `resolve_variant` call that states any code is answered only when a handed item satisfies every filter the call states. So a unique answer can only be that handed row. Anything else is refused with `GOVERNMENT_REGISTER_CODE_NOT_IN_BATCH`: a tool error, so the task fails and the run does not. A tool bound to no queue refuses every code. |
+| The plan rule | The firewall refuses a `resolve_variant` call whose identity could answer a handed item that carries codes, unless it states them (`REGISTER_CODES_REQUIRED`), and a call whose codes name no handed item (`REGISTER_CODE_NOT_IN_BATCH`). The Commander is told the same rule (`register_code_rule` in the work context). |
+| Ambiguous answers | They list, per match, only `upstream_record_id`, `tozeret_cd`, `degem_cd`, `sug_degem` (`distinguishing`, at most 20). They quote no identity projection and resolve nothing. |
+| Unique answers | The identity projection (`source_record`) states the three codes as text. The typed outcome and the vehicle carry them as `registration`. The evidence facts are unchanged. |
+
+The only remaining ambiguity is rows identical in content minus `_id`: PR-Z2's
+duplicate group. The codes cannot split it, and must not.
+
+Production snapshot `3c3754fb`, Toyota 2018+ (read-only): of 1,645 queueable
+items, 812 resolved uniquely before and 833 were ambiguous, in 295 match
+groups, every one split by `degem_cd`. With the codes stated, all 1,645
+resolve uniquely and none remains ambiguous. Replays are history: a recorded
+tool output never gains a code filter, and the five replays pass unchanged.

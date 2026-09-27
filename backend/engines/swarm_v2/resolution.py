@@ -65,6 +65,11 @@ SOFT_GAP_CODES = frozenset(CANDIDATE_GAP_CODES.values())
 CANDIDATE_KEYS = ("manufacturer", "commercial_model", "model_year", "trim",
                   "official_model_code")
 
+#: PR-Z3: the register's own identifiers a RESOLVED outcome names its row's
+#: registration by, as the tool's server-built `source_record` states them
+#: (`payload->>'field'` text). Never taken from the call's arguments.
+REGISTRATION_FIELDS = ("tozeret_cd", "degem_cd", "sug_degem")
+
 #: Bounds on what one outcome can carry into durable state and the payload.
 MAX_OUTCOME_RECORD_IDS = 8
 MAX_OUTCOME_TEXT_CHARS = 200
@@ -108,10 +113,21 @@ def candidate_outcome(*, task_id: str, call_id: str, tool: str, operation: str,
                          for item in (variants if isinstance(variants, list) else [])
                          if isinstance(item, Mapping)
                          and isinstance(item.get("upstream_record_id"), str)})
-    return {"task_id": str(task_id), "call_id": str(call_id), "outcome": outcome,
-            "match_count": count,
-            "candidate": {key: value for key, value in candidate.items() if value is not None},
-            "record_ids": record_ids[:MAX_OUTCOME_RECORD_IDS]}
+    typed = {"task_id": str(task_id), "call_id": str(call_id), "outcome": outcome,
+             "match_count": count,
+             "candidate": {key: value for key, value in candidate.items() if value is not None},
+             "record_ids": record_ids[:MAX_OUTCOME_RECORD_IDS]}
+    record = result.get("source_record")
+    if outcome == RESOLVED and isinstance(record, Mapping):
+        # PR-Z3: the exact registration of the ONE resolved row, only when the
+        # server-built source record states it (a recorded result that
+        # predates PR-Z3 does not, and its outcome is unchanged).
+        registration = {name: record[name][:MAX_OUTCOME_TEXT_CHARS]
+                        for name in REGISTRATION_FIELDS
+                        if isinstance(record.get(name), str) and record[name]}
+        if registration:
+            typed["registration"] = registration
+    return typed
 
 
 def unresolved_kinds(outcomes: Iterable[Mapping[str, Any]]) -> list[str]:
@@ -121,6 +137,7 @@ def unresolved_kinds(outcomes: Iterable[Mapping[str, Any]]) -> list[str]:
 
 
 __all__ = ["CANDIDATE_GAP_CODES", "CANDIDATE_KEYS", "CANDIDATE_OUTCOMES",
-           "MAX_OUTCOME_RECORD_IDS", "RESOLVED", "RESOLVE_VARIANT_OPERATION",
+           "MAX_OUTCOME_RECORD_IDS", "REGISTRATION_FIELDS", "RESOLVED",
+           "RESOLVE_VARIANT_OPERATION",
            "SOFT_GAP_CODES", "UNRESOLVED_AMBIGUOUS", "UNRESOLVED_NOT_FOUND",
            "UNRESOLVED_OUTCOMES", "candidate_outcome", "unresolved_kinds"]
